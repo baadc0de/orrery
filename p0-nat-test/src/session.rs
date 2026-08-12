@@ -6,6 +6,7 @@
 //! datagram loop identical on both sides — matching how P0 treats the transport
 //! as a drop-in symmetric layer (docs/02-networking.md §4).
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -261,18 +262,25 @@ async fn run_datagram_loop_for(
     // from pongs; the stats logic drains them for percentiles.
     let rtt_samples: Arc<Mutex<Vec<u64>>> = Arc::new(Mutex::new(Vec::new()));
 
+    // Tracks whether a direct path is active, so RTT samples reflect
+    // direct-path latency only (relay-standby pings during path re-selection
+    // are excluded from the percentiles).
+    let direct_active = Arc::new(AtomicBool::new(false));
+
     // Receiver task: count datagrams, echo pings, record RTTs from pongs.
     let (recv_tx, mut recv_rx) = mpsc::channel(1024);
     let recv_task = tokio::spawn(receiver_task(
         conn.clone(),
         recv_tx,
         rtt_samples.clone(),
+        direct_active.clone(),
         frame_len,
     ));
 
-    // Path monitor: report relay -> direct migration (the P0 punch signal).
+    // Path monitor: report relay -> direct migration (the P0 punch signal) and
+    // update the direct-path flag.
     let (path_tx, mut path_rx) = mpsc::channel(64);
-    let path_task = tokio::spawn(path_monitor_task(conn.clone(), path_tx));
+    let path_task = tokio::spawn(path_monitor_task(conn.clone(), path_tx, direct_active));
 
     // Windowed statistics.
     let mut window = DeliveryWindow::default();
@@ -456,6 +464,7 @@ async fn receiver_task(
     conn: Connection,
     tx: mpsc::Sender<RecvEvent>,
     rtt_samples: Arc<Mutex<Vec<u64>>>,
+    direct_active: Arc<AtomicBool>,
     frame_len: usize,
 ) {
     loop {
@@ -483,7 +492,10 @@ async fn receiver_task(
                                 tracing::debug!(%e, "pong send failed");
                             }
                         }
-                        TAG_PONG => {
+                        TAG_PONG if direct_active.load(Ordering::Relaxed) => {
+                            // Only record RTT once a direct path is active, so
+                            // the percentiles reflect direct-path latency rather
+                            // than relay-standby pings.
                             let rtt = now_us().saturating_sub(ts);
                             if let Ok(mut samples) = rtt_samples.lock() {
                                 samples.push(rtt);
@@ -521,7 +533,11 @@ fn drain_rtt_percentiles(samples: &Arc<Mutex<Vec<u64>>>) -> (Option<u64>, Option
 /// punch signal is the migration from a relay path to a direct (IP) path
 /// (docs/02-networking.md §1); a session that never leaves the relay path is
 /// the expected ~10% tail (docs/02-networking.md §8).
-async fn path_monitor_task(conn: Connection, tx: mpsc::Sender<PathState>) {
+async fn path_monitor_task(
+    conn: Connection,
+    tx: mpsc::Sender<PathState>,
+    direct_active: Arc<AtomicBool>,
+) {
     use tokio_stream::StreamExt;
 
     let mut events = conn.path_events();
@@ -538,6 +554,8 @@ async fn path_monitor_task(conn: Connection, tx: mpsc::Sender<PathState>) {
             }
             _ => continue,
         };
+        // Keep the RTT filter in sync with the active path.
+        direct_active.store(state == PathState::Direct, Ordering::Relaxed);
         if tx.send(state).await.is_err() {
             break;
         }
