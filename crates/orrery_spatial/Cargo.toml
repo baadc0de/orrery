@@ -1,0 +1,32 @@
+[package]
+name = "orrery_spatial"
+version = "0.1.0"
+edition = "2021"
+description = "Orrery spatial model: CellId math, AOI, big_space integration, replicon visibility mapping"
+license = "MIT OR Apache-2.0"
+
+# Bevy plugin (D15). `CellId` assignment from big_space grid coordinates, the
+# 27-cell AOI subscription, mapping cell membership onto bevy_replicon
+# per-client visibility, high-rate interest-set selection, cell-crossing
+# hysteresis, and 1-4 Hz extrapolated proxies.
+[features]
+# Gates integration with the big_space 0.19 port so a port delay degrades to
+# manual origin management instead of blocking the workspace (docs/10-crates.md
+# §5).
+big_space = ["dep:big_space"]
+
+[dependencies]
+orrery_protocol = { path = "../orrery_protocol" }
+orrery_net = { path = "../orrery_net" }
+bevy_app = { workspace = true }
+bevy_ecs = { workspace = true }
+bevy_math = { workspace = true }
+bevy_reflect = { workspace = true }
+bevy_replicon = { workspace = true }
+glam = { workspace = true }
+big_space = { workspace = true, optional = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+bevy = { workspace = true }
+proptest = { workspace = true }

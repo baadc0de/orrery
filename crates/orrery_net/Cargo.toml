@@ -1,0 +1,32 @@
+[package]
+name = "orrery_net"
+version = "0.1.0"
+edition = "2021"
+description = "Orrery session lifecycle: endpoint bootstrapping, peer connect/disconnect, channel policy, relay-path telemetry"
+license = "MIT OR Apache-2.0"
+
+# Bevy plugin (D15). Owns everything about being *on the network* that is not
+# replication: bootstrapping the endpoint via `orrery_aeronet_iroh`, the
+# coordinator client, island membership, peer connect/disconnect tracking,
+# channel policy (datagrams = state, streams = control/bulk — D3), and
+# relay-path telemetry aggregation.
+[features]
+otel = []
+
+[dependencies]
+orrery_protocol = { path = "../orrery_protocol" }
+aeronet_io = { workspace = true }
+aeronet_iroh = { workspace = true }
+aeronet_tokio_runtime = { workspace = true }
+bevy_app = { workspace = true }
+bevy_ecs = { workspace = true }
+bevy_platform = { workspace = true }
+bevy_reflect = { workspace = true }
+iroh = { workspace = true }
+bytes = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+bevy = { workspace = true }
+tokio = { workspace = true }
+tracing-subscriber = { workspace = true }

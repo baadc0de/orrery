@@ -1,0 +1,10 @@
+allow-unwrap-in-tests = true
+doc-valid-idents = [
+  "WebTransport",
+  "WebSocket",
+  "WebSockets",
+  "LibreWolf",
+  "MacOS",
+  "WiFi",
+  "..",
+]

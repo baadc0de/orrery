@@ -3,7 +3,7 @@
 
 use anyhow::{Context, Result};
 use iroh::endpoint::presets::Minimal;
-use iroh::{Endpoint, EndpointId, RelayMap, RelayMode, RelayUrl};
+use iroh::{Endpoint, EndpointId, RelayMap, RelayMode, RelayUrl, SecretKey};
 
 /// A handle to the iroh endpoint, kept alive for the lifetime of the process.
 #[derive(Clone)]
@@ -14,7 +14,9 @@ pub struct EndpointHandle {
 
 impl EndpointHandle {
     /// Build a new iroh endpoint configured to use `relay` as its home relay.
-    pub async fn new(relay: String) -> Result<Self> {
+    /// If `secret_key` is given, the endpoint keeps that stable identity
+    /// (NodeId) instead of generating a fresh one.
+    pub async fn new(relay: String, secret_key: Option<String>) -> Result<Self> {
         // The relay map is the address book: our self-hosted relay doubles as
         // the punch rendezvous and the fallback path (docs/02-networking.md §8).
         let relay_url: RelayUrl = relay
@@ -23,9 +25,16 @@ impl EndpointHandle {
         let relay_map = RelayMap::try_from_iter([relay.as_str()])
             .with_context(|| format!("invalid relay URL: {relay}"))?;
 
-        let endpoint = Endpoint::builder(Minimal)
+        let mut builder = Endpoint::builder(Minimal)
             .relay_mode(RelayMode::Custom(relay_map))
-            .alpns(vec![b"p0-nat-test".to_vec()])
+            .alpns(vec![b"p0-nat-test".to_vec()]);
+        if let Some(sk) = secret_key {
+            let sk: SecretKey = sk
+                .parse()
+                .with_context(|| "invalid --secret-key (expected hex)")?;
+            builder = builder.secret_key(sk);
+        }
+        let endpoint = builder
             .bind()
             .await
             .context("failed to bind iroh endpoint")?;

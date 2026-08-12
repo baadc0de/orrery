@@ -1,0 +1,80 @@
+[workspace]
+resolver = "3"
+members = [
+    "vendor/aeronet_iroh",
+    "vendor/aeronet_tokio_runtime",
+    "crates/orrery_protocol",
+    "crates/orrery_net",
+    "crates/orrery_spatial",
+]
+
+# Pinned versions per D14 (docs/DECISIONS.md), ecosystem as of Aug 2026.
+# Re-validate when implementation of each dependent crate starts; don't bump
+# casually.
+[workspace.dependencies]
+# Bevy
+bevy = "0.19"
+bevy_app = { version = "0.19", default-features = false }
+bevy_ecs = { version = "0.19", default-features = false }
+bevy_math = { version = "0.19", default-features = false }
+bevy_platform = { version = "0.19", default-features = false }
+bevy_reflect = { version = "0.19", default-features = false }
+
+# Netcode stack (D4)
+aeronet_io = "0.21"
+# `aeronet_iroh` / `aeronet_tokio_runtime` are not published on crates.io as
+# of Aug 2026; vendored under vendor/ until the upstreaming PR lands.
+aeronet_iroh = { path = "vendor/aeronet_iroh", version = "0.21.0" }
+aeronet_tokio_runtime = { path = "vendor/aeronet_tokio_runtime", version = "0.21.0" }
+iroh = "1.0.3"
+# Identity / signature types for `orrery_protocol` (D3: iroh ed25519 key =
+# transport identity). `key` enables `PublicKey`/`EndpointId` + `Signature`.
+iroh-base = { version = "1.0.3", default-features = false, features = ["key"] }
+
+# Protocol encoding (D15: postcard default)
+postcard = { version = "1.1", default-features = false }
+serde = { version = "1", features = ["derive"] }
+glam = { version = "0.32", features = ["serde"] }
+
+# Replication stack (P1, D4): bevy_replicon 0.42 visibility mapping.
+bevy_replicon = "0.42"
+# big_space 0.13 (Bevy 0.19) is not yet on crates.io; the WIP `bevy-0.19`
+# branch is the tracked P1 risk (docs/11-roadmap.md §P1). Pinned to the branch
+# commit so the workspace builds reproducibly; swap to the crates.io release
+# when it lands.
+big_space = { git = "https://github.com/aevyrie/big_space", branch = "bevy-0.19" }
+
+# Async / utility
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+bytes = "1"
+clap = { version = "4", features = ["derive"] }
+futures = "0.3"
+gloo-timers = { version = "0.3", features = ["futures"] }
+tracing = "0.1"
+derive_more = { version = "2", default-features = false }
+wasm-bindgen-futures = "0.4"
+
+# Dev / test
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+proptest = "1.11"
+anyhow = "1"
+
+# Lint config mirrored from the upstream aeronet workspace so the vendored
+# crates stay upstream-clean.
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+alloc_instead_of_core = "warn"
+module_name_repetitions = "allow"
+needless_pass_by_value = "allow"
+nursery = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+similar_names = "allow"
+std_instead_of_alloc = "warn"
+std_instead_of_core = "warn"
+too_many_arguments = "allow"
+type_complexity = "allow"
+unwrap_used = "warn"
+
+[workspace.lints.rust]
+missing_docs = "warn"
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(fuzzing)", "cfg(docsrs_aeronet)"] }

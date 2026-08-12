@@ -67,6 +67,33 @@ To stand up a host plus several clients on one box (e.g. the P0 8-peer mesh):
 The host logs each connection as `peer=N`, and every peer punches to a direct
 path and exchanges datagrams independently.
 
+### Full mesh (`--mesh`)
+
+To exercise a true full mesh (every peer paired with every other), build a
+**roster file** listing every node's NodeId (one hex NodeId per line; blank and
+`#` comment lines ignored), then launch each node with its index:
+
+```sh
+# roster.txt — one NodeId per line, this node included
+# node at index 0:
+./p0-nat-test --mesh roster.txt --mesh-index 0 --json > node0.jsonl
+# node at index 1:
+./p0-nat-test --mesh roster.txt --mesh-index 1 --json > node1.jsonl
+# ...
+```
+
+Node `i` dials every node `j > i` and accepts every node `j < i`, so each
+unordered pair connects **exactly once** — a true full mesh with no double
+connections. Telemetry for a pair to roster position `j` is reported under
+`peer = j` on every node, so you can correlate both sides of each pair across
+`.jsonl` files.
+
+Get each node's NodeId with `--print-id` to build the roster:
+
+```sh
+./p0-nat-test --print-id   # prints this node's NodeId
+```
+
 ### Options
 
 | Flag | Default | Meaning |
@@ -79,6 +106,8 @@ path and exchanges datagrams independently.
 | `--ping-hz <N>` | `1` | Roundtrip ping rate (for P50/P95 latency) |
 | `--duration-secs <N>` | `30` | Test window |
 | `--print-id` | — | Print NodeId and exit (host helper) |
+| `--mesh <file>` | — | Full-mesh mode: roster file (one NodeId per line) |
+| `--mesh-index <N>` | — | This node's index in the roster (required if self-match fails) |
 | `--json` | off | Emit telemetry as one JSON object per line on stdout (tracing → stderr) |
 
 ### Machine-readable telemetry (`--json`)

@@ -5,6 +5,10 @@ edition = "2021"
 description = "P0 transport spike: standalone NAT hole-punching test tool for Orrery's iroh-based transport"
 license = "MIT"
 
+# Standalone tool: not part of the orrery workspace (which pins D14 versions
+# for the netcode stack).
+[workspace]
+
 [[bin]]
 name = "p0-nat-test"
 path = "src/main.rs"

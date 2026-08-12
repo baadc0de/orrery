@@ -1,5 +1,6 @@
 //! Command-line interface for the P0 NAT test tool.
 
+use std::path::PathBuf;
 use std::time::Duration;
 
 use clap::Parser;
@@ -55,6 +56,24 @@ pub struct Cli {
     /// Print the NodeId and exit without dialing or sending (host helper).
     #[arg(long, global = true)]
     pub print_id: bool,
+
+    /// Full-mesh mode: path to a roster file (one NodeId per line, this node
+    /// included). Dials every node after us in the list, accepts every node
+    /// before us, so each pair connects exactly once. Combine with
+    /// `--mesh-index` to identify this node's position.
+    #[arg(long, global = true)]
+    pub mesh: Option<PathBuf>,
+
+    /// This node's index in the `--mesh` roster (0-based). Required with
+    /// `--mesh` if the roster cannot be matched to the local NodeId.
+    #[arg(long, global = true)]
+    pub mesh_index: Option<usize>,
+
+    /// A stable secret key (hex) so this node keeps the same NodeId across
+    /// runs. Without it, every invocation generates a fresh NodeId, which
+    /// breaks `--mesh` rosters (NodeIds are ephemeral).
+    #[arg(long, global = true)]
+    pub secret_key: Option<String>,
 
     /// Emit telemetry as one JSON object per line on stdout (machine-parseable
     /// for the punch-rate dashboard). Tracing logs go to stderr.

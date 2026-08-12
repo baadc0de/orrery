@@ -111,7 +111,7 @@ impl SessionHandle {
 }
 
 /// A handle to a host that accepts several simultaneous connections (local
-/// mesh test). One datagram loop runs per connection.
+/// star test). One datagram loop runs per connection.
 pub struct HostHandle {
     shutdown_tx: oneshot::Sender<()>,
 }
@@ -135,6 +135,151 @@ impl HostHandle {
         let _ = self.shutdown_tx.send(());
         Ok(())
     }
+}
+
+/// A handle to a running full-mesh run.
+#[derive(Clone)]
+pub struct MeshHandle {
+    shutdown_tx: Arc<Mutex<Option<oneshot::Sender<()>>>>,
+}
+
+impl MeshHandle {
+    /// Spawn a full-mesh run. `roster` is the ordered list of every node's
+    /// NodeId; `self_index` is this node's position in it. Each pair connects
+    /// exactly once (we dial everyone after us, accept everyone before us),
+    /// and telemetry for a connection to roster position `j` is reported under
+    /// `peer = j`, so every node labels the same remote the same way.
+    pub fn spawn(
+        endpoint: EndpointHandle,
+        roster: Vec<EndpointId>,
+        self_index: usize,
+        options: SessionOptions,
+        events: mpsc::Sender<SessionEvent>,
+    ) -> Self {
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        tokio::spawn(mesh_task(
+            endpoint,
+            roster,
+            self_index,
+            options,
+            events,
+            shutdown_rx,
+        ));
+        Self {
+            shutdown_tx: Arc::new(Mutex::new(Some(shutdown_tx))),
+        }
+    }
+
+    /// Ask the mesh to stop and wait for all peer tasks to finish.
+    pub async fn shutdown(self) -> Result<()> {
+        if let Some(tx) = self.shutdown_tx.lock().unwrap().take() {
+            let _ = tx.send(());
+        }
+        Ok(())
+    }
+}
+
+/// Run the full mesh. Node at roster index `i` dials every node `j > i` and
+/// accepts every node `j < i`, so each unordered pair gets exactly one
+/// connection and no node double-dials another. Every per-pair connection runs
+/// its own datagram loop and reports telemetry under `peer = j` (the remote's
+/// roster position).
+async fn mesh_task(
+    endpoint: EndpointHandle,
+    roster: Vec<EndpointId>,
+    self_index: usize,
+    options: SessionOptions,
+    events: mpsc::Sender<SessionEvent>,
+    shutdown_rx: oneshot::Receiver<()>,
+) {
+    let shutdown_rx = shutdown_rx;
+    let mut shutdown_txs = Vec::new();
+
+    // Dial everyone after us in the roster (peer index = their position).
+    for j in (self_index + 1)..roster.len() {
+        let target = roster[j];
+        let events = events.clone();
+        let options = options.clone();
+        let endpoint = endpoint.clone();
+        let (tx, rx) = oneshot::channel();
+        shutdown_txs.push(tx);
+        tokio::spawn(async move {
+            let _ = run_mesh_dial_task(endpoint, target, j, options, events, rx).await;
+        });
+    }
+
+    // Accept everyone before us in the roster (peer index = their position).
+    for j in 0..self_index {
+        let events = events.clone();
+        let options = options.clone();
+        let endpoint = endpoint.clone();
+        let (tx, rx) = oneshot::channel();
+        shutdown_txs.push(tx);
+        tokio::spawn(async move {
+            let _ = run_mesh_accept_task(endpoint, j, options, events, rx).await;
+        });
+    }
+
+    // Wait for shutdown, then signal every child task.
+    let _ = shutdown_rx.await;
+    for tx in shutdown_txs {
+        let _ = tx.send(());
+    }
+}
+
+async fn run_mesh_dial_task(
+    endpoint: EndpointHandle,
+    target: EndpointId,
+    peer: usize,
+    options: SessionOptions,
+    events: mpsc::Sender<SessionEvent>,
+    shutdown_rx: oneshot::Receiver<()>,
+) -> Result<()> {
+    // A single dial can fail transiently (e.g. relay path not yet negotiated
+    // under simultaneous-all-at-once mesh bring-up, or a relay hiccup). Retry
+    // with backoff until the session window elapses so the mesh self-heals
+    // instead of orphaning a peer. The P0 demo criterion is zero session drops
+    // over 30 min, so a robust dial is load-bearing.
+    let started = Instant::now();
+    let mut attempt = 0u32;
+    let mut shutdown_rx = shutdown_rx;
+    let conn = loop {
+        match dial(endpoint.inner(), endpoint.relay(), target).await {
+            Ok(conn) => break conn,
+            Err(e) => {
+                // Bail if the test window is over.
+                if started.elapsed() >= options.duration {
+                    return Err(e);
+                }
+                attempt += 1;
+                let backoff = Duration::from_millis(500 * (attempt as u64).min(8));
+                tracing::warn!(peer, attempt, %e, "dial failed; retrying");
+                tokio::select! {
+                    _ = tokio::time::sleep(backoff) => {}
+                    _ = &mut shutdown_rx => return Ok(()),
+                }
+            }
+        }
+    };
+    let _ = events
+        .send(SessionEvent::Connected { peer, remote: target })
+        .await;
+    run_datagram_loop_for(conn, peer, options, events, shutdown_rx).await
+}
+
+async fn run_mesh_accept_task(
+    endpoint: EndpointHandle,
+    peer: usize,
+    options: SessionOptions,
+    events: mpsc::Sender<SessionEvent>,
+    shutdown_rx: oneshot::Receiver<()>,
+) -> Result<()> {
+    let conn = accept(endpoint.inner()).await?;
+    let remote = conn.remote_id();
+    let _ = events
+        .send(SessionEvent::Connected { peer, remote })
+        .await;
+    run_datagram_loop_for(conn, peer, options, events, shutdown_rx).await
 }
 
 async fn session_task(

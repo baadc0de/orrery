@@ -1,0 +1,28 @@
+[package]
+name = "orrery_protocol"
+version = "0.1.0"
+edition = "2021"
+description = "Orrery wire and data types: CellId, intents, leases, attestations, evidence, protocol version"
+license = "MIT OR Apache-2.0"
+
+# Engine-agnostic (D15): no Bevy, no tokio. Servers, tools, and tests link it
+# without an engine. Wire types are defined once, here, and every other crate
+# depends on this one (docs/10-crates.md §Dependency spine).
+[features]
+default = ["postcard"]
+# Default wire encoding (D15).
+postcard = ["dep:postcard"]
+# Alternative encoding, benchmarked per release (D15).
+bitcode = ["dep:bitcode"]
+# Extended-range CellId (D5) — wire-incompatible with the default 64-bit form.
+u128-cells = []
+
+[dependencies]
+glam = { workspace = true }
+iroh-base = { workspace = true }
+serde = { workspace = true }
+postcard = { workspace = true, optional = true }
+bitcode = { version = "0.6", optional = true }
+
+[dev-dependencies]
+proptest = { workspace = true }

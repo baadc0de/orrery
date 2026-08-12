@@ -1,0 +1,53 @@
+[package]
+name = "aeronet_iroh"
+version = "0.21.0"
+edition = "2024"
+rust-version = "1.95.0"
+description = "Iroh IO layer implementation for `aeronet`"
+repository = "https://github.com/aecsocket/aeronet"
+license = "MIT OR Apache-2.0"
+keywords = ["bevy", "gamedev", "network"]
+categories = ["game-development", "network-programming"]
+
+# Vendored copy of the (unpublished on crates.io) upstream `aeronet_iroh`
+# from github.com/aecsocket/aeronet @ main, with orrery's additions:
+# - `PathReport` component: relay-vs-direct path kind, RTT, time-to-direct
+# - prompt relay→direct migration reporting via `Connection::path_events()`
+# Upstreaming intent (orrery D4): keep this diff minimal so it can become a
+# PR against the aeronet repo.
+
+[[example]]
+name = "iroh_peer"
+path = "examples/iroh_peer.rs"
+
+[features]
+default = []
+# Per-session path/RTT counters (orrery D15): forwards to iroh's metrics
+# registry wiring.
+metrics = ["iroh/metrics"]
+# Test helpers (`test_utils::run_test_relay`): spins up an in-process loopback
+# Iroh relay for integration tests. Pulls in `iroh-relay`'s server.
+test-utils = ["dep:iroh-relay", "iroh-relay/server", "iroh-relay/test-utils"]
+
+[dependencies]
+aeronet_io = { workspace = true }
+aeronet_tokio_runtime = { workspace = true }
+bevy_app = { workspace = true }
+bevy_ecs = { workspace = true }
+bevy_platform = { workspace = true }
+bytes = { workspace = true }
+derive_more = { workspace = true, features = ["display", "error"] }
+futures = { workspace = true }
+iroh = { workspace = true }
+# optional, behind `test-utils`
+iroh-relay = { version = "1.0.3", optional = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+bevy = { workspace = true }
+clap = { workspace = true }
+tokio = { workspace = true }
+aeronet_iroh = { path = ".", features = ["test-utils"] }
+
+[lints]
+workspace = true
