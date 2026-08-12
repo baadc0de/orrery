@@ -16,3 +16,7 @@ Cargo.lock
 
 # Device-local agent memory (never committed — lives only on this machine)
 .agents/memory/
+
+# Local single-node FoundationDB dev cluster (slice 3 test harness).
+# Never committed. See .fdb-dev/README.md.
+.fdb-dev/

@@ -1,15 +1,17 @@
 //! The `OrrerySpatialPlugin` — P1 core (docs/11-roadmap.md §P1).
 //!
 //! `CellId` assignment from `big_space` grid coordinates, the 27-cell AOI
-//! subscription, and mapping cell membership onto bevy_replicon per-client
-//! visibility. The high-rate interest-set selection and hysteresis land with
-//! the full P1 integration.
+//! subscription, mapping cell membership onto bevy_replicon per-client
+//! visibility, cell-crossing hysteresis (the 10% overlap zone), and the bounded
+//! high-rate interest set with 1-4 Hz proxies.
 
 use bevy_app::prelude::*;
 use bevy_ecs::prelude::*;
 
 use orrery_protocol::CellId;
 
+use crate::hysteresis::update_cell_commit;
+use crate::interest::{update_interest_set, InterestSelection};
 use crate::SpatialConfig;
 
 /// The `orrery_spatial` plugin.
@@ -23,12 +25,18 @@ impl Plugin for OrrerySpatialPlugin {
     fn build(&self, app: &mut App) {
         app.insert_resource(self.config.clone())
             .init_resource::<AoiSubscription>()
-            .add_systems(Update, update_aoi);
+            .init_resource::<InterestSelection>()
+            .add_systems(
+                Update,
+                // Hysteresis first (commit the cell), then the AOI from the
+                // committed cell, then the interest set from positions.
+                (update_cell_commit, update_aoi, update_interest_set).chain(),
+            );
     }
 }
 
 /// An entity's hysteresis-stable current cell (D5).
-#[derive(Debug, Clone, Copy, Component)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Component)]
 pub struct Cell(pub CellId);
 
 /// The local client's 27-cell AOI subscription (D5).

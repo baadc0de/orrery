@@ -13,12 +13,19 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
-mod cell;
+pub mod cell;
+pub mod coord;
 mod grid;
 mod identity;
+mod persist;
 mod protocol;
 
 pub use cell::{CellId, CellRangeError};
+pub use coord::{CoordMsg, IslandId, IslandManifest, PeerEntry, TopologyRegime};
 pub use grid::GridId;
 pub use identity::{NodeId, Signature};
+pub use persist::{
+    Attestation, Checkpoint, Epoch, Intent, IntentOp, IntentOutcome, JournalRecord, Lsn, PersistId,
+    RecordKind, Tick,
+};
 pub use protocol::PROTOCOL_VERSION;

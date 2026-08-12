@@ -13,6 +13,8 @@ use aeronet_iroh::session::{PathKind, PathReport, SessionRequest, SessionRespons
 use aeronet_iroh::{IrohPlugin, IrohRuntime};
 use iroh::endpoint::Builder;
 
+use crate::island::{update_island_membership, IslandMembership};
+
 /// The application protocol this endpoint advertises and accepts (D3). Matches
 /// the ALPN the coordinator and peers use.
 pub const ALPN: &[u8] = b"orrery/0";
@@ -77,8 +79,9 @@ impl Plugin for OrreryNetPlugin {
             .init_resource::<IrohRuntime>()
             .insert_resource(self.config.clone())
             .init_resource::<PeerRegistry>()
+            .init_resource::<IslandMembership>()
             .add_systems(Startup, open_endpoint)
-            .add_systems(Update, (track_peers, track_paths))
+            .add_systems(Update, (track_peers, track_paths, update_island_membership))
             .add_observer(on_session_request);
     }
 }

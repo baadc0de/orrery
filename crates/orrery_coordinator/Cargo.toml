@@ -1,0 +1,24 @@
+[package]
+name = "orrery_coordinator"
+version = "0.1.0"
+edition = "2021"
+description = "Orrery coordinator: coarse presence, island formation, NodeId handout (P1 stub)"
+license = "MIT OR Apache-2.0"
+
+# Bevy-free binary (D15): coarse presence tracking, island form/merge/split/
+# drain, NodeId handout for island bootstrap. State is in-memory and
+# reconstructible from presence announcements (docs/10-crates.md §12).
+[features]
+# Durable witness-seed epochs / island generation counters via FoundationDB.
+# Not implemented in P1; the in-memory state is reconstructible from presence.
+fdb-state = []
+
+[dependencies]
+orrery_protocol = { path = "../orrery_protocol" }
+serde = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+postcard = { workspace = true }
+glam = { workspace = true }
+iroh-base = { workspace = true }

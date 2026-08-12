@@ -1,0 +1,25 @@
+[package]
+name = "orrery_predict"
+version = "0.1.0"
+edition = "2021"
+description = "Orrery prediction and rollback: lightyear config, reconciliation monitor, rollback budget"
+license = "MIT OR Apache-2.0"
+
+# Bevy plugin (D15). The lightyear 0.29 configuration layer for per-entity
+# authority (D8): fixed tick, send rate, rollback window, interpolation buffer,
+# hit-rewind cap. Also home to the reconciliation-error monitor (the witness
+# signal, D10) and the rollback budget guard. **The only crate whose internals
+# name lightyear types** — the plan-B seam (docs/10-crates.md §7).
+[features]
+# avian3d 0.7 integration per D13. Not wired in P1.
+avian = []
+
+[dependencies]
+orrery_protocol = { path = "../orrery_protocol" }
+bevy_app = { workspace = true }
+bevy_ecs = { workspace = true }
+bevy_math = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+bevy = { workspace = true }

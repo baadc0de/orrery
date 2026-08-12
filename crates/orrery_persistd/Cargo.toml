@@ -1,0 +1,49 @@
+[package]
+name = "orrery_persistd"
+version = "0.1.0"
+edition = "2021"
+description = "Orrery persistence cluster harness: cell actors, segmented journal, group commit (P2 slice 2)"
+license = "MIT OR Apache-2.0"
+
+# Bevy-free (D15). Library harness for the persistence cluster (docs/10-crates.md
+# §11). Slice 2 covers the single-writer cell-actor runtime and the fjall-backed
+# segmented append-only journal with adaptive group commit — testable in
+# isolation, no FoundationDB. Gateway, FDB checkpoint/restore, chain replication,
+# and the Ruleset-linked intent/adjudication paths land in later slices.
+[features]
+default = ["journal-fjall"]
+# Journal backing store. `journal-fjall` (default) uses fjall 3.x as a keyed
+# append-only log; `journal-raw` (planned) will use raw 128 MiB segment files
+# with a sparse footer index (docs/08-persistence.md §4). Only one may be set.
+journal-fjall = ["dep:fjall"]
+journal-raw = []
+# Chain replication of the journal to one async follower (D11, RPO ≤ ~100 ms).
+# Declared but not implemented in slice 2 — see crate docs.
+chain-replication = []
+# FoundationDB checkpoint/restore store (slice 3). Enables `FdbCheckpointStore`
+# and links the C client (`libfdb_c`). Tests that need a live cluster are
+# compiled here and self-skip when no cluster is reachable.
+fdb = ["dep:foundationdb"]
+
+[dependencies]
+orrery_protocol = { path = "../orrery_protocol" }
+bytes = { workspace = true }
+postcard = { workspace = true }
+serde = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+async-trait = "0.1"
+fjall = { version = "3.1", features = ["bytes_1"], optional = true }
+# FoundationDB 7.3.x system-of-record (D11, D14). Optional: only built when the
+# `fdb` feature is on (requires the C client at link time).
+foundationdb = { version = "0.11", default-features = false, features = ["fdb-7_3"], optional = true }
+
+[[bench]]
+name = "journal_latency"
+harness = false
+
+[dev-dependencies]
+tempfile = "3"
+proptest = { workspace = true }
+glam = { workspace = true }
+iroh-base = { workspace = true }

@@ -6,6 +6,9 @@ members = [
     "crates/orrery_protocol",
     "crates/orrery_net",
     "crates/orrery_spatial",
+    "crates/orrery_coordinator",
+    "crates/orrery_predict",
+    "crates/orrery_persistd",
 ]
 
 # Pinned versions per D14 (docs/DECISIONS.md), ecosystem as of Aug 2026.
@@ -31,8 +34,9 @@ iroh = "1.0.3"
 # transport identity). `key` enables `PublicKey`/`EndpointId` + `Signature`.
 iroh-base = { version = "1.0.3", default-features = false, features = ["key"] }
 
-# Protocol encoding (D15: postcard default)
-postcard = { version = "1.1", default-features = false }
+# Protocol encoding (D15: postcard default). `use-std` enables `to_stdvec`/
+# `from_bytes`, used by the protocol crate's roundtrip tests.
+postcard = { version = "1.1", default-features = false, features = ["use-std"] }
 serde = { version = "1", features = ["derive"] }
 glam = { version = "0.32", features = ["serde"] }
 

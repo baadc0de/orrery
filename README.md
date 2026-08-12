@@ -6,7 +6,7 @@ Normative source: [DECISIONS.md](docs/DECISIONS.md) D1–D17 (the ADR is normati
 
 ## Status
 
-**Architecture and design phase. No code exists yet.** This repository currently contains only the architecture decision record and its expansion documents. The `orrery` name and crate prefix are provisional and mechanically replaceable; all pinned dependency versions (DECISIONS.md D14) reflect the ecosystem as of August 2026 and will be re-validated when implementation starts.
+**Design + early implementation.** The architecture decision record and its expansion documents are normative. Implementation has begun on the P0→P1 track: the first `orrery_*` crates exist under `crates/` and build clean (workspace + clippy + tests). Landed so far: `orrery_protocol` (the 64-bit `CellId` with its property suite, wire types, coordinator message set), `orrery_net` (session lifecycle, channel policy, island membership), `orrery_spatial` (big_space→replicon visibility, cell-crossing hysteresis, bounded high-rate interest set + 1–4 Hz proxies), `orrery_coordinator` (island-formation registry), and `orrery_predict` (lightyear config, reconciliation monitor, rollback budget). See [docs/11-roadmap.md](docs/11-roadmap.md) for the phase plan and the demo criteria that gate each phase. The `orrery` name and crate prefix are provisional and mechanically replaceable; all pinned dependency versions (DECISIONS.md D14) reflect the ecosystem as of August 2026 and are re-validated as each crate's implementation starts.
 
 ## Features (as designed)
 
