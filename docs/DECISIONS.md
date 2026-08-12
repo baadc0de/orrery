@@ -215,6 +215,7 @@ Dependency spine: `protocol` ← everything; `core` ← {witness, persistd, fiel
 4. **FDB ops learning curve** for a small team; hotspot pre-splitting under crowd events (FDB issue #11510 pattern) needs load-shedding design.
 5. **Field-host cost model:** promotion threshold vs. infrastructure spend is a live-ops dial; worst case (every cell hot) converges to client-server economics by design.
 6. **Open:** cross-island consistency for fast travelers (island merge latency); parked-cell catch-up semantics (lazy vs. scheduled); economy-wide invariant auditing cadence; mod/plugin distribution of `Ruleset` to cluster (games recompile `persistd` — acceptable?).
+7. **Open — D18 (terrain↔entity promotion):** the lazy terrain↔entity promotion specification ([08-persistence.md](08-persistence.md) §10.1; [06-verifiable-core.md](06-verifiable-core.md) §6/§9; [05-prediction-rollback.md](05-prediction-rollback.md) §7.2; [03-replication.md](03-replication.md) §9.7) is written but **not yet ratified as a decision**. If adopted, anchor it as **D18** — it amends D9 (adds the `TerrainPromotion` record source to the tamper-evident log) and D11 (adds journal record kinds, the `section_pin/` keyspace family, and id-stability minting); the escrowed-release variant (08 §10.1.7) would touch D7 (it is deliberately **excluded** from the base mechanism). Until then it is a **non-normative proposal** and the README status line is unchanged.
 
 ## Document map
 

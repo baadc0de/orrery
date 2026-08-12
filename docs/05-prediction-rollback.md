@@ -220,6 +220,27 @@ This is "favor the shooter" with the trust inverted from Source's server-side la
 
 The guided missile's mid-flight transfer is the hardest case: guidance depends on the target's *current* position, which is authoritative only on the target's peer. At RTT < 150 ms the shooter can predict guidance using the target's interpolated pose; at RTT > 250 ms the missile stays Interpolated on the shooter and the target's authority simulates the terminal phase entirely (§8 latency bands).
 
+### 7.2 A shot blocked by promotable terrain (the asteroid, end-to-end)
+
+*Specifies the seam behavior of the terrain↔entity promotion mechanism ([08-persistence.md](08-persistence.md) §10.1 — non-normative proposal, pending D18).*
+
+Two ships fire at each other across an inert, stationary, **destructible** asteroid. The block decision is made twice, per §7's contract: the shooter predicts against its interpolated view (presentation only), and the target's authority re-derives the ray against its own 32-tick pose ring **and its own terrain copy** — authoritative. Which tier of verifiability the block gets depends on what the asteroid *is* at the fire tick:
+
+- **Static, shipped geometry** → content-hash-pinned, part of the build (VC-8): fully adjudicable for free.
+- **Mutable terrain, unpinned** → the LOS check is a non-core `invariants()` matter ([06-verifiable-core.md](06-verifiable-core.md) §3): the target's authority validates honestly, witnesses spot-check, but a dispute is *not* replay-adjudicated.
+- **Pinned (promoted or pin-pending)** → the asteroid is a Core entity; the block resolves through `NeighborFrame` reads of its state and the damage is a logged, witness-checked core rule — fully adjudicable.
+
+The promotion machinery is what moves the block from tier 2 to tier 3 **exactly when the shot makes it matter**:
+
+1. **Shooter fires, predicts locally.** Ray against interpolated asteroid (a terrain section): predicted sparks. If the `Ruleset` classifies this section class as promotable-on-damage, the shooter's core step emits the promotion event and its `orrery_persist_client` submits the **Pin intent** with witness co-signatures — concurrently with the `HitClaim` to the target's authority. The shooter's own log records the seam (`TerrainPromotion{Pin}`) in its step's tick.
+2. **Target's authority validates.** Three cases:
+   - **`Promote` already committed** (typical under sustained fire — the first volley pinned it): the asteroid is an entity in its interest set; the authority re-derives the ray against the entity's replicated state, damage applies as a logged core rule. Fully adjudicable end-to-end.
+   - **`pin_pending`** (claim outran the intent, first-shot case): the authority **parks the claim** — it does not guess which geometry epoch to validate against, because the section's read type is mid-transition. It waits for the `Promote` broadcast on the per-cell stream (bounded wait: the intent commits in < 10 ms p99 or fails), then applies the committed state and issues the verdict. The shooter sees a delayed `HitVerdict`, never a wrong one.
+   - **Pin intent rejected** (rate limit, policy): the section stays terrain; the claim validates as tier-2 invariant LOS, honestly but non-adjudicated — the pre-promotion status quo, deliberately.
+3. **Adjudication later** (a dispute over the kill): the evidence spans the seam exactly as [06-verifiable-core.md](06-verifiable-core.md) §9 specifies — pre-pin geometry cross-checked against journaled terrain, post-pin reads against the asteroid's own chain, the seam record's `intent_id` checked against the FDB `intent/` row. A window *may* span the seam; a claimed seam without a committed intent is a discrete mismatch.
+
+The asteroid itself is never an authority in the hit-claim sense — the two decision points stay exactly where §7 puts them (shooter's presentation, target's authority). Promotion changes only the *verifiability tier of the geometry evidence*, and only from the first interaction onward.
+
 ## 8. Latency-regime behavior
 
 RTT in Orrery is **per authority pair**, not global: the local player is always RTT-free (§2), so degradation applies only to interactions with a given remote authority. Thresholds follow D8, with Overwatch's ~220 ms hit-prediction cutoff as the precedent for the top band.

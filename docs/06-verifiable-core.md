@@ -237,6 +237,39 @@ pub enum RecordSource {
     /// the new basis. Without this record a basis change is indistinguishable
     /// from a teleport cheat.
     FrameChange { from: GridId, to: GridId, tick: Tick, transform: FrameTransform },
+    /// Terrain↔entity class transition binding record
+    /// ([08-persistence.md](08-persistence.md) §10.1). `key` is a stable `SectionKey`
+    /// (grid-anchored, `PersistId`-derived — §10.1.3) or a
+    /// `TerrainChunkRef` listing a multi-chunk extent; the payload is one of
+    /// `Pin{ mint: PersistId, intent_id, hash_in, tick }`,
+    /// `Promote{ section, intent_id, seed_state_hash, tick }`, or
+    /// `Demote{ section, intent_id, tick }`.
+    ///
+    /// It appears in TWO logs: the interactor's (its step emitted the
+    /// event, so the record is part of that entity's closed input set) and
+    /// the promoted entity's own chain (the entity has a `PersistId` from
+    /// `tick_pin` onward; ticks at which it is pinned-but-not-promoted it
+    /// logs the seam record and nothing else). Replay semantics per
+    /// direction:
+    ///
+    /// - Before `Pin`: the section is geometry. Reads at those ticks are
+    ///   recorded as `GeometryFrame`; the adjudicator cross-checks them
+    ///   against journaled terrain, exactly as today.
+    /// - Pinned but not yet `Promote`d: the section's `section_pin/` row
+    ///   forbids further geometry mutation; core rules that would read or
+    ///   mutate it MUST resolve through `NeighborFrame { neighbor: section }`
+    ///   reads of the entity instead. The adjudicator cross-checks those
+    ///   reads against the section's own chain.
+    /// - At/after `Promote` (until `Demote`): the entity's chain carries
+    ///   ordinary records; `seed_state_hash` binds the chain to the
+    ///   journaled `TerrainPromotion` checkpoint image — the adjudicator
+    ///   verifies the image hash against the `world/` row, and pre-promote
+    ///   geometry against `GeometryFrame` hashes. A window may span the
+    ///   seam: the seam record switches read type and evidence source at a
+    ///   known tick.
+    /// - `Demote` folds the entity back to geometry (§10.1.8); ticks after
+    ///   it read as `GeometryFrame` again.
+    TerrainPromotion { key: SectionRef },
     /// Chain-epoch boundary: embeds prior head + lease proof (§9).
     AuthorityChange { prev_head: ChainHash, lease_seq: u64 },
 }
@@ -404,6 +437,8 @@ Determinism is a property you lose silently; the test program is designed around
 
 - **Authority handoff mid-chain.** Handoff (§D7, [04-authority.md](04-authority.md)) increments `chain_epoch`; the new authority's first record is `AuthorityChange { prev_head, lease_seq }`, binding the new chain to the old head and the registrar's lease sequence. Adjudication windows never span epochs — each authority answers only for its own segment.
 - **Frame migration mid-chain.** A nested-grid crossing (EVA, docking — [01-spatial-model.md](01-spatial-model.md) §13.3) changes the coordinate basis without changing authority: the `FrameChange` record (§6) carries the composed transform, and the replay harness applies it at that tick before continuing comparison. A window *may* span a frame change (unlike an authority change) — the transform is part of the evidence, and witnesses cross-check it against the carrier grid-root's replicated state at that tick. A claimed migration whose transform disagrees with the carrier's signed state is a discrete mismatch.
+- **Promotion/demotion mid-chain.** A terrain↔entity class transition ([08-persistence.md](08-persistence.md) §10.1) changes the *read type* of a section's state without changing its identity: the `TerrainPromotion` record (§6) is the seam, and the replay harness switches the section's resolution from geometry-hash cross-check (before `Pin`) to neighbor-read cross-check against the section's own chain (pinned onward), and back at `Demote`. A window *may* span the seam: the harness consumes the interactor's frames, the section's own chain (existence proven by the seam records' `intent_id`s — the adjudicator confirms each against FDB `intent/` rows), and the journaled `TerrainDelta` history up to `tick_pin` for geometry cross-checks. The transition intents are the same tamper-evident substrate as the logs themselves (witness-attested, FDB-committed), so a fabricated seam record — one without a committed intent — is a discrete mismatch, and a suppressed seam (an authority claiming damage it never pinned) fails at the interactor's own log. Retention asymmetry: the interactor's log covers only its own window; the section's history lives in the journal (deltas up to `tick_pin`), its own chain frames (from `tick_pin`, 10 s default retention like any core entity), and FDB `world/` + `section_pin/` rows. A dispute window older than the section's live retention is replayable from journal + FDB state — the seam design keeps every epoch of a section's history in *some* durable, hash-checkable store.
+- **A shot straddling the seam.** The common case (fire before pin, damage after) resolves to two independent windows — pre-pin the target's authority validated LOS as an ordinary invariant against its terrain copy ([05-prediction-rollback.md](05-prediction-rollback.md) §7); post-pin the damage is logged core state on the entity, fully adjudicable ([05-prediction-rollback.md](05-prediction-rollback.md) §7.2 worked example). The rare case (claim arrives with `pin_pending`) is governed by the §7.2 barrier: the target's authority parks the claim rather than guessing at the geometry epoch, and the verdict lands after `Promote` commits.
 - **Withheld or missing log.** Retention (§6) guarantees a compliant authority can serve any ≤ 180-tick window. Timeout or refusal on a `LogRangeRequest` is PeerReview's *verifiable omission*: the request and non-response are themselves reportable, escalating per [07-witnessing.md](07-witnessing.md) — silence is not an escape hatch.
 - **Equivocation.** Two signed frames or claims at the same chain position with different contents constitute a complete evidence bundle by themselves; no replay needed.
 - **Ruleset version skew.** Bundles pin their `RulesetId`; the adjudicator must execute that exact build. The cluster retains the last **3** ruleset builds as version-keyed sidecar adjudication workers (§D12), and the adjudication executor routes each bundle to the worker matching its `RulesetId` — evidence pinned to older rules stays adjudicable across hotfixes. A bundle older than retention yields `Verdict::Unadjudicable` → in-session quorum correction still applies, but no strike (rate-limited per reporting account, §7). (Distribution of game `Ruleset`s to the cluster is §D17 open question 6.)
