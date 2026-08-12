@@ -123,7 +123,7 @@ Channel mapping (designed here): aeronet lanes with unreliable semantics map ont
 
 ## 5. Islands and the coordinator
 
-An **island** is one replication session: a connected set of populated cells plus the peers in them (D6) — Elite Dangerous's pattern of [central servers commanding P2P instances](https://www.lavewiki.com/network) into existence. The coordinator (`orrery_coordinator`, the [edServer](https://forums.frontier.co.uk/threads/elite-dangerous-systems-architecture.43546/) role) tracks coarse presence (cell-level, not per-tick positions), forms islands, and manages their lifecycle:
+An **island** is one replication session: a connected set of populated cells plus the peers in them (D6) — Elite Dangerous's pattern of [central servers commanding P2P instances](https://www.lavewiki.com/network) into existence. With nested grids, islands form **per grid** — a ship's interior is an island over ship-grid cells, independent of the system-grid island its hull drifts through ([01-spatial-model.md](01-spatial-model.md) §13.5). The coordinator (`orrery_coordinator`, the [edServer](https://forums.frontier.co.uk/threads/elite-dangerous-systems-architecture.43546/) role) tracks coarse presence (cell-level, not per-tick positions), forms islands, and manages their lifecycle:
 
 ```mermaid
 stateDiagram-v2

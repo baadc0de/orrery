@@ -211,11 +211,13 @@ A parked entity has **no live authority anywhere**: `holder = None`, `PARKED` fl
 Not everything should wait to be bumped: the `Ruleset` can flag entity classes as **active** — NPCs, wandering creatures, anything that must be *simulated* whenever its cell is live, not merely rendered from the hot tier. In a promoted cell the field host holds them as a matter of course (§8); in an unpromoted island somebody's machine has to, and the registrar assigns that somebody instead of waiting for a `Contact` claim:
 
 - **On area load or unpark** of a `Ruleset`-flagged active entity, the registrar grants **weak authority** unsolicited (the §4.3 mechanism) to a deterministic candidate: the **nearest cell-subscribed peer with headroom**, chosen by the same candidate scoring as orphan pickup (recent-contact telemetry first, then proximity).
-- **Per-peer load cap** — default **64 active entities** per peer: a peer at cap is skipped by the scorer and the grant falls to the next candidate.
+- **Per-peer load caps, split by class** — the cap is not one number, because the two classes cost different things (see below): default **16 core-class** active entities and **256 bulk-class** active entities per peer. A peer at either cap is skipped by the scorer for that class and the grant falls to the next candidate.
 - **Decline** uses the ordinary `Divest{to: None}`: the registrar moves down the candidate list; when no eligible candidate remains, the entity stays parked (rendered, not simulated) until the population changes.
 - The grant is plain weak authority: gameplay interaction steals it normally (INV-4), and it decays like any weak claim — sleep + cell-exit divests, and expiry/redistribution follow §4.3.
 
-An active entity hosted this way is simulated on an untrusted machine: its state is bulk-class — invariant-checked and witnessed like any peer-authored state — not adjudicable core unless the `Ruleset` classifies it so. Games that need **trusted NPC simulation** (bosses with loot tables, vendors, quest-critical actors) should not stretch this mechanism; the supported answer is to **lower the promotion threshold for those cell classes**, so a field host (§8) takes authority there even below the default > 32 population.
+**Why the cap splits.** The scarce resource is not "entities" but the per-entity machinery only *core-class* entities carry: every core entity a peer authors rides that peer's signed, hash-chained input log streamed to the ≤7-link witness set (§D9) — the priced worst case is 8 authored core entities at ~60 kb/s per witness link (~0.4 Mb/s against the ≤ 1 Mbps upload budget, [06-verifiable-core.md](06-verifiable-core.md) §10) — plus a share of the ≈1 ms predicted-subset step that bounds rollback cost (§D8). Bulk-class active entities carry none of that: no log records, no state claims, just ordinary 1–4 Hz bulk uplinks (~25 B deltas — 200 NPCs at 1 Hz ≈ 20 kbps), so their cap is set by client CPU and uplink scheduling, not by the witness budget. A single 64-entity cap conflates the two and starves exactly the wrong case: a dense but value-free crowd (ship crew, ambient wildlife) is capped by a budget it never touches.
+
+An active entity hosted this way is simulated on an untrusted machine: bulk-class state is invariant-checked and witnessed like any peer-authored state — not adjudicable core unless the `Ruleset` classifies it so. The classification is the trust boundary and the cost boundary at once: **crew that decorates and does chores is bulk-class and plentiful; crew that can be robbed, bribed, or murdered for loot is core-class, few per cell** — and when a location needs many *trusted* NPCs (bosses with loot tables, vendors, quest-critical actors), the supported answer is not to raise the core cap on player machines but to **lower the promotion threshold for those cell classes**, so a field host (§8) takes authority there even below the default > 32 population.
 
 ## 8. Field-host promotion interplay
 
@@ -233,7 +235,7 @@ To clients the host is just another peer with a lot of leases — no special-cas
 Leases are **entity-keyed, not cell-keyed**: an entity crossing a cell boundary keeps its holder and its `lease_id`. What moves is registrar-internal bookkeeping:
 
 - **Hysteresis** (§D5): the entity's cell assignment flips only after it exits the overlap zone — **10 % of the cell edge** (12.8 m at the default 128 m edge) — so an entity dribbled along a boundary does not thrash leases, storage, or interest sets (the SpatialOS lesson).
-- On the *committed* cell change, the storage row re-keys `world/{old_cell}/{entity}` → `world/{new_cell}/{entity}` in one journal record (one FDB transaction at checkpoint), and the lease row migrates between cell actors as part of the same handoff — invisible on the wire; `lease_id` and `seq` are preserved.
+- On the *committed* cell change, the storage row re-keys `world/{old_cell}/{entity}` → `world/{new_cell}/{entity}` in one journal record (one FDB transaction at checkpoint), and the lease row migrates between cell actors as part of the same handoff — invisible on the wire; `lease_id` and `seq` are preserved. The same applies when the committed change is a *frame migration* between nested grids ([01-spatial-model.md](01-spatial-model.md) §13.3): the row re-keys from the source grid's keyspace to the destination's, and the lease — entity-keyed, not cell- or grid-keyed — is untouched.
 - If the destination cell belongs to another island, the coordinator's island merge/handoff governs (see [02-networking.md](02-networking.md)); if the destination is *promoted*, the entity's holder receives a `Divest{to: field_host}` on entry — the warrant covers entities that migrate in.
 - Heartbeats are unaffected: they are batched per peer, not per cell.
 
@@ -291,5 +293,5 @@ Design-elaborated defaults introduced by this document (configurable, subject to
 | Claim rate limit | 20/s sustained, burst 64 |
 | Deny re-claim cooldown | 250 ms → 2 s exponential |
 | Contact-propagation batch cap | 64 entities/tick |
-| Active-entity load cap (per peer, §7.1) | 64 |
+| Active-entity load cap (per peer, §7.1) | 16 core-class / 256 bulk-class |
 | Holder-side uncertainty margin | 1 heartbeat (2.5 s) before nominal expiry |

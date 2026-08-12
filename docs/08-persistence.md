@@ -253,7 +253,8 @@ Hot-key conflict retries are application responsibility under optimistic concurr
 
 | Subspace / key | Value | Writer | Notes |
 |---|---|---|---|
-| `world/{cell_id}/{entity_id}` | component bag (postcard), per-component slots | cell actor (checkpoint) | primary bulk state; row split `.../{k}` if > 100 KB |
+| `world/{cell_id}/{entity_id}` | component bag (postcard), per-component slots | cell actor (checkpoint) | primary bulk state; row split `.../{k}` if > 100 KB; `cell_id` is grid-relative — interpreted within its grid's `CellId` space (see `grid/` row) |
+| `grid/{grid_id}` | `(parent GridId, origin transform, velocity, status)` | cell actor (checkpoint) | nested-grid frame registry ([01-spatial-model.md](01-spatial-model.md) §13): a carrier's motion re-keys *this one row*, never its contents; `world/` keys are read per-grid |
 | `world/{cell_id}/{entity_id}` *(tombstone)* | despawn marker w/ GC deadline | cell actor | cleared by checkpoint GC pass |
 | `player/{account_id}` | profile, progression, settings | intent path | critical-class |
 | `player/{account_id}/loc` | `(cell_id, entity_id)` | cell actor on rekey | login placement pointer |
@@ -317,7 +318,7 @@ Cell actors checkpoint **copy-on-update**: applying a diff to a dirty-flagged en
 
 ## 9. Area load
 
-Client enters an area → `orrery_persist_client` requests the 27-cell neighborhood (D5) over a reliable stream. The gateway partitions the cells: **live cells** (an actor holds them) are served from actor memory — authoritative, ≥ checkpoint freshness; **cold cells** are served by FDB range scans over `world/{cell_id}/…` + `chunk/{cell_id}/…` (contiguous by Morton prefix). Pages stream **nearest-first** (center cell, then face/edge/corner neighbors by distance), so the client can spawn-in against page one; target **< 50 ms to first page-in** (one actor snapshot or one in-region range scan — FDB reads are 0.1–1 ms — plus serialization and one RTT). Subsequent motion turns loads into incremental single-cell fetches at the AOI leading edge, and live diffs flow via replication (03-replication.md), not the load path.
+Client enters an area → `orrery_persist_client` requests the 27-cell neighborhood (D5) over a reliable stream. The gateway partitions the cells: **live cells** (an actor holds them) are served from actor memory — authoritative, ≥ checkpoint freshness; **cold cells** are served by FDB range scans over `world/{cell_id}/…` + `chunk/{cell_id}/…` (contiguous by Morton prefix). Pages stream **nearest-first** (center cell, then face/edge/corner neighbors by distance), so the client can spawn-in against page one; target **< 50 ms to first page-in** (one actor snapshot or one in-region range scan — FDB reads are 0.1–1 ms — plus serialization and one RTT). Subsequent motion turns loads into incremental single-cell fetches at the AOI leading edge, and live diffs flow via replication (03-replication.md), not the load path. For a nested-grid area (a ship's interior, [01-spatial-model.md](01-spatial-model.md) §13) the load is one `grid/{grid_id}` frame read plus the normal 27-cell scans *in the ship's grid* — the frame row tells the client where the ship is; the contents come from the ship's own `CellId` space.
 
 ## 10. Terrain and bulk edits
 

@@ -130,7 +130,7 @@ impl CellId {
 | 19–20 | 512 / 256 m | Intermediate: split targets for hot shard cells |
 | **21** | **128 m** | **Interest level** (finest, default): AOI groups, leases/handoff, storage row prefix |
 
-Defaults per D16: interest cell edge **128 m** ≈ AOI radius; shard cell = **8×8×8 interest cells**. The interest level is configurable (`interest_level`, default 21 = finest); games that want sub-interest key granularity (e.g. finer terrain chunk keys) set `interest_level < 21` and keep the finer levels for storage only. At the defaults the addressable volume is 2²¹ × 128 m ≈ 268,435 km per axis; games needing more use nested `big_space` grids (one `CellId` space per grid, grid id carried alongside) or the `u128` feature (D5).
+Defaults per D16: interest cell edge **128 m** ≈ AOI radius; shard cell = **8×8×8 interest cells**. The interest level is configurable (`interest_level`, default 21 = finest); games that want sub-interest key granularity (e.g. finer terrain chunk keys) set `interest_level < 21` and keep the finer levels for storage only. At the defaults the addressable volume is 2²¹ × 128 m ≈ 268,435 km per axis; games needing more range use nested `big_space` grids (one `CellId` space per grid, grid id carried alongside — see §13) or the `u128` feature (D5).
 
 ## 5. Triple duty: one ID, three systems
 
@@ -225,10 +225,10 @@ These structures are **process-local, ephemeral, and invisible**: they have no n
 
 ## 10. Edge cases and failure modes
 
-- **Fast movers.** An entity faster than ~one cell edge per second (128 m/s default; threshold = `edge × send_rate / hysteresis_ticks`, tunable) gets *predictive subscription*: `orrery_spatial` subscribes cells along the velocity vector one crossing early, so content is paged in before arrival (the VAST literature's missed-fast-mover failure, avoided by prefetch). The set-diff mechanics already handle multi-cell-per-tick motion; hysteresis still applies at each commit.
+- **Fast movers.** An entity faster than ~one cell edge per second (128 m/s default; threshold = `edge × send_rate / hysteresis_ticks`, tunable) gets *predictive subscription*: `orrery_spatial` subscribes cells along the velocity vector one crossing early, so content is paged in before arrival (the VAST literature's missed-fast-mover failure, avoided by prefetch). The set-diff mechanics already handle multi-cell-per-tick motion; hysteresis still applies at each commit. **A fast *carrier* — a ship with contents — must not move its contents through cells at all**: it becomes a nested grid whose velocity lives at the grid root (§13), so only one entity crosses cells, not hundreds.
 - **Teleports.** A teleport (Ruleset-sanctioned, else the D10 invariant validators flag it) skips hysteresis entirely: full 27-set replacement, treated as an area load (D11 `< 50 ms` first page-in), possible island change via the coordinator, lease retained, storage re-key immediate. Presentation should expect up to one page-in latency of missing surroundings.
 - **Boundary exactness.** Cell assignment is `floor(p / edge)` in `big_space` integer space — an entity exactly on a face belongs to the higher cell deterministically on every platform (integer math only; no float epsilon disagreements).
-- **Coordinate range exhaustion.** `from_coords` outside ±2²⁰ (level 21) returns `CellRangeError`; `orrery_spatial` saturates the committed cell at the volume edge and raises telemetry. Bigger universes: nested `big_space` grids or the `u128` feature (D5), decided at game-config time, not dynamically.
+- **Coordinate range exhaustion.** `from_coords` outside ±2²⁰ (level 21) returns `CellRangeError`; `orrery_spatial` saturates the committed cell at the volume edge and raises telemetry. Bigger universes: nested `big_space` grids (§13) or the `u128` feature (D5), decided at game-config time, not dynamically.
 - **Entities larger than a cell** (stations, capital ships). Committed cell = anchor point; the entity is *replicated into* every cell its bounds intersect (visibility union), but leased, keyed, and handed off by its anchor only. Games with many such entities should raise the interest edge or model them as multi-entity assemblies.
 - **Cell-actor split during crossing.** A `CellCrossing` racing a shard split can reach the old actor; rendezvous-hash routing at the gateway retries against the current owner — idempotent because re-key is keyed by `(entity, tick)`.
 - **Morton locality discontinuities.** Neighbor cells across power-of-two boundaries can be numerically distant. Never scan "nearby" as one raw key range: neighborhoods are always the explicit 27 ids → 27 range scans (or fewer after prefix coalescing). Discontinuities then cost nothing correctness-wise and only marginal scan locality (§12).
@@ -242,7 +242,7 @@ These structures are **process-local, ephemeral, and invisible**: they have no n
 | Shard level delta | −3 (8×8×8) | Larger shard cells → fewer, hotter actors; smaller → more placement churn. 8×8×8 ≈ 1 km³ at defaults fits the "handful of contiguous scans" goal. |
 | Hysteresis margin | 10% of edge | Below ~5% boundary fights thrash again; above ~20% the coverage guarantee visibly erodes (`edge − m`) and handoff feels laggy for fast movers. |
 
-Per-genre starting points: close-quarters shooter (interactions ≤ 60 m): edge 64–128 m; open-world vehicular (engagements ~300 m): edge 256 m and accept larger page-ins; space sim: nested grids — e.g. a planetary grid at 128 m inside a system grid at 128 km — each with its own `CellId` space. Expected occupancy math for capacity planning: entities-in-interest ≈ 27 · ρ · edge³ for density ρ; keep the *typical* value within a small multiple of the 24-entity high-rate set so the precise filter, not the cell filter, is the effective selector.
+Per-genre starting points: close-quarters shooter (interactions ≤ 60 m): edge 64–128 m; open-world vehicular (engagements ~300 m): edge 256 m and accept larger page-ins; space sim: nested grids — e.g. a planetary grid at 128 m inside a system grid at 128 km — each with its own `CellId` space (§13). Expected occupancy math for capacity planning: entities-in-interest ≈ 27 · ρ · edge³ for density ρ; keep the *typical* value within a small multiple of the 24-entity high-rate set so the precise filter, not the cell filter, is the effective selector.
 
 ## 12. Morton vs. Hilbert at the storage layer
 
@@ -250,6 +250,44 @@ The runtime/network `CellId` is **Morton, permanently**: it is the cheapest to c
 
 Accordingly, `orrery_persistd` owns a single pluggable key-mapping function `storage_key(CellId) -> u64` (default: identity). If scan telemetry on real workloads shows FDB range-read locality is a measurable cost, the Hilbert mapping via `lindel` can be enabled *behind that function only* — the wire, the rooms, the leases, and every peer-visible surface keep Morton ids. A Hilbert index built the S2 way retains the parent-prefix property, so subtree-range scans survive the swap; the mapping choice is per-deployment and recorded in the store's metadata row to keep scans and writers consistent. Default is off: measure first (TiKV and FDB both split ranges adaptively, which absorbs much of the theoretical difference).
 
+## 13. Nested grids: moving reference frames
+
+Everything above describes one grid. A moving *carrier* — a ship with crew, a station with a docked ship, a planet with a settlement — breaks the single-grid assumption twice over: its contents would cross cells at the carrier's velocity (a 500 m/s cruiser re-keys hundreds of entities every ~256 ms at the 128 m default), and its contents' local velocities would be dwarfed by the frame's velocity (a player walking a corridor at 5 m/s inside a 500 m/s hull is, in universe space, a 505 m/s entity — flagged by every speed-cap invariant validator in §D10). The resolution is big_space's nested grids, promoted from a rendering convenience to a first-class partition concept: **the carrier is a nested grid, and its velocity lives at the grid root, never in its contents.**
+
+The rule for when to nest: **a nested grid is justified when (a) its contents move together as a frame, and (b) contents interact with each other far more than with the parent frame.** A crewed ship and an inhabited planet qualify on both counts; a drifting asteroid does not — it is an ordinary entity in its parent grid. Do not nest for organization: every level is another `CellId` space, another teleport boundary, another interest boundary.
+
+### 13.1 Grid identity and the frame stack
+
+Each nested grid is its own `CellId` space (§3 encoding unchanged), identified by a **`GridId`** carried alongside every `CellId` wherever a cell reference can cross frames: wire messages, journal records, storage keys, leases, and log records. A full spatial reference is `(GridId, CellId)`; within a single-frame context the `GridId` is implicit. The root grid (the universe/system grid) has the well-known `GridId` 0. A grid's *frame* — its origin transform and velocity relative to its parent — is stored on the grid-root entity's row (`grid/{grid_id}`, [08-persistence.md](08-persistence.md) §6) and replicated to anyone the frame is visible to.
+
+The frame stack for a player in a ship on a planet is `universe > planet > ship`. Composition is exact: each level is integer `GridCell` arithmetic plus one f32 transform compose at the leaf (§2), so a contents-to-parent transform never accumulates the frame's velocity into float error — the player's ship-local f32 coordinates stay in the ~7.6 µm-ulp regime at any carrier speed.
+
+### 13.2 Interest across frames
+
+AOI subscription is computed **in the observer's own grid only**. An observer outside the ship never subscribes to ship-grid cells: they receive the ship root as one replicated entity (high-rate if in their 24-entity set, a 1–4 Hz proxy otherwise), and the ship's interior stays cluster-side until revealed — the D10 exposure-minimization posture falls out of the frame boundary for free. The frame boundary *is* an interest boundary.
+
+The one exception is the **crossing window**: an entity mid-transition (the EVA case, §13.3) holds a transient **dual subscription** — its committed cell in the destination grid plus a shrinking tail of source-grid cells (the airlock it just left), bounded by a short timer (default 5 s), so the crossing doesn't pop content at the threshold. The carrier root itself is pinned in the crossing entity's high-rate set for the duration: the departing player watches the ship recede as one entity, not as its contents.
+
+### 13.3 Frame migration (EVA, docking, landing)
+
+Crossing between grids comes in two kinds, and they are different mechanisms:
+
+- **Teleport-class** (boarding a docked ship, landing): the frames are stationary relative to each other, so the crossing is the §10 teleport path — Ruleset-sanctioned, full 27-set replacement, area-load page-in, lease retained, storage re-key immediate.
+- **Continuous-class** (EVA, undocking thrust, being flung): relative velocity is nonzero and must be *preserved* across the reparenting. This is a **frame migration**, not a teleport:
+
+  1. **Transform.** The entity's state converts exactly: `parent_transform = grid_origin ∘ local_transform` (integer cell math + one f32 compose), `parent_velocity = frame_velocity + rotated(local_velocity)`. The result is a clean `(GridCell, f32 local)` pair in the destination grid with a large but representable velocity.
+  2. **Destination.** Reparent to the **innermost enclosing frame whose velocity the entity will now share**: deep-space EVA → the universe grid; jumping out in atmosphere → the planet grid; undocking from a station → the station's parent grid.
+  3. **Log continuity.** The authority (for a player, the player — the `PLAYER_BOUND` lease is entity-keyed and survives migration untouched, §D7) appends a **`FrameChange` record** to the signed input log at the migration tick, binding the chain to the new coordinate basis ([06-verifiable-core.md](06-verifiable-core.md) §6). Replay and tolerance-band comparison apply *after* the recorded transform, so the 500 m/s basis change is evidence, not a false positive.
+  4. **Storage.** The entity's `world/` row re-keys from the source grid's keyspace to the destination's at the next commit — one row, same `PersistId`.
+
+### 13.4 Cross-frame interaction
+
+The hit-validation path ([05-prediction-rollback.md](05-prediction-rollback.md) §7) assumes one coordinate basis per interaction, so the rule is: **interaction requires frame coincidence.** You can hit-validate what shares your grid; everything in another grid is visible only through its frame root's replicated/proxy representation. Long-range fire at a moving ship targets *the ship* (one entity, one pose history), not its crew — per-crew effects become possible only after a boarding action establishes frame coincidence. Games that need cross-frame weapons fire (orbital bombardment) model the effect as the *target frame's* Ruleset event (a `GeometryFrame`-checked terrain/structure impact), not as a cross-frame hit claim.
+
+### 13.5 Islands and presence across frames
+
+Islands (D6) form over populated cells **per grid**: the ship's interior is an island over ship-grid cells (a lone crew member is an island of one), independent of the system-grid island the ship root drifts through. The coordinator tracks coarse presence per grid and evaluates merge/split within each; a carrier approaching a station is two grids in proximity, and the dock/merge handshake is where the fast-traveler open question (D17.6) concentrates. Field-host promotion applies per grid-island as usual — a busy ship can be promoted exactly like a busy ground cell.
+
 ## Cross-references
 
-[02-networking.md](02-networking.md) (islands, topology regimes over these cells) · [03-replication.md](03-replication.md) (visibility/rooms, priority accumulation) · [04-authority.md](04-authority.md) (leases, handoff on crossing) · [08-persistence.md](08-persistence.md) (cell actors, keyspace, checkpoints) · [09-services-and-ops.md](09-services-and-ops.md) (telemetry, hotspot ops).
+[02-networking.md](02-networking.md) (islands, topology regimes over these cells) · [03-replication.md](03-replication.md) (visibility/rooms, priority accumulation) · [04-authority.md](04-authority.md) (leases, handoff on crossing) · [06-verifiable-core.md](06-verifiable-core.md) (`FrameChange` log record, replay across bases) · [08-persistence.md](08-persistence.md) (cell actors, keyspace, checkpoints, `grid/` rows) · [09-services-and-ops.md](09-services-and-ops.md) (telemetry, hotspot ops).

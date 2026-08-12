@@ -209,6 +209,11 @@ Per §D9, every authority maintains a [PeerReview](https://www.cis.upenn.edu/~ah
 pub struct ChainHash(pub [u8; 32]);  // blake3
 pub struct RollingHead(pub [u8; 8]); // truncated ChainHash — gap detection only
 
+/// A nested-grid frame transform (01-spatial-model.md §13): the carrier
+/// grid-root's origin and velocity relative to the destination grid at the
+/// migration tick, quantized. Wire type in `orrery_protocol`.
+pub struct FrameTransform { pub origin: QuantizedTransform, pub velocity: QVel }
+
 pub enum RecordSource {
     /// A player/system command, with the source's own sequence number.
     Player { node: NodeId, input_seq: u32 },
@@ -219,6 +224,14 @@ pub enum RecordSource {
     /// Geometry sections consulted via StateView::geometry() this tick (§3):
     /// quantized section keys + the content hashes actually read.
     GeometryFrame { sections: Vec<(SectionKey, [u8; 32])> },
+    /// Frame migration (nested grids, [01-spatial-model.md](01-spatial-model.md)
+    /// §13.3): the coordinate basis changed at this tick. `transform` is the
+    /// composed frame transform applied (derived from the carrier grid-root's
+    /// replicated state at `tick`, which witnesses hold or can fetch); replay
+    /// applies it before continuing, so tolerance-band comparison resumes in
+    /// the new basis. Without this record a basis change is indistinguishable
+    /// from a teleport cheat.
+    FrameChange { from: GridId, to: GridId, tick: Tick, transform: FrameTransform },
     /// Chain-epoch boundary: embeds prior head + lease proof (§9).
     AuthorityChange { prev_head: ChainHash, lease_seq: u64 },
 }
@@ -385,6 +398,7 @@ Determinism is a property you lose silently; the test program is designed around
 ## 9. Failure modes and edge cases
 
 - **Authority handoff mid-chain.** Handoff (§D7, [04-authority.md](04-authority.md)) increments `chain_epoch`; the new authority's first record is `AuthorityChange { prev_head, lease_seq }`, binding the new chain to the old head and the registrar's lease sequence. Adjudication windows never span epochs — each authority answers only for its own segment.
+- **Frame migration mid-chain.** A nested-grid crossing (EVA, docking — [01-spatial-model.md](01-spatial-model.md) §13.3) changes the coordinate basis without changing authority: the `FrameChange` record (§6) carries the composed transform, and the replay harness applies it at that tick before continuing comparison. A window *may* span a frame change (unlike an authority change) — the transform is part of the evidence, and witnesses cross-check it against the carrier grid-root's replicated state at that tick. A claimed migration whose transform disagrees with the carrier's signed state is a discrete mismatch.
 - **Withheld or missing log.** Retention (§6) guarantees a compliant authority can serve any ≤ 180-tick window. Timeout or refusal on a `LogRangeRequest` is PeerReview's *verifiable omission*: the request and non-response are themselves reportable, escalating per [07-witnessing.md](07-witnessing.md) — silence is not an escape hatch.
 - **Equivocation.** Two signed frames or claims at the same chain position with different contents constitute a complete evidence bundle by themselves; no replay needed.
 - **Ruleset version skew.** Bundles pin their `RulesetId`; the adjudicator must execute that exact build. The cluster retains the last **3** ruleset builds as version-keyed sidecar adjudication workers (§D12), and the adjudication executor routes each bundle to the worker matching its `RulesetId` — evidence pinned to older rules stays adjudicable across hotfixes. A bundle older than retention yields `Verdict::Unadjudicable` → in-session quorum correction still applies, but no strike (rate-limited per reporting account, §7). (Distribution of game `Ruleset`s to the cluster is §D17 open question 6.)

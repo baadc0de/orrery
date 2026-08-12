@@ -229,6 +229,8 @@ Each sibling doc has its own failure-mode section; these are the cross-cutting o
 | **Island** | One replication session: a connected set of populated cells plus the peers in them; formed/merged/split/drained by the coordinator (D6). |
 | **Cell** | One node of the hierarchical uniform grid; the interest-level cell (edge ≈ 128 m) is the unit of AOI, authority, and handoff (D5). |
 | **`CellId`** | Sortable 64-bit cell identifier (`NonZeroU64`; Morton-interleaved, S2-style prefix hierarchy) serving as interest group, storage shard prefix, and authority unit (D5). |
+| **`GridId`** | Identity of one nested-grid `CellId` space (universe root = 0); a moving reference frame (ship, planet) whose velocity lives at the grid root, never in its contents ([01-spatial-model.md](01-spatial-model.md) §13). |
+| **Frame migration** | Continuous reparenting of an entity between nested grids with velocity preserved (EVA, undocking); logged as a `FrameChange` record so replay stays closed across the basis change ([01-spatial-model.md](01-spatial-model.md) §13.3, [06-verifiable-core.md](06-verifiable-core.md) §6). |
 | **`PersistId`** | Stable 64-bit persistent entity id (`u64`), cluster-minted (intent commit receipts, or journaled per-session block grants usable offline); never a Bevy `Entity` (D11, D15). |
 | **`Tick`** | Universe-global 60 Hz tick counter (`u64`), anchored to a coordinator-issued universe epoch; all islands share absolute ticks and merges never re-base (D8). |
 | **Shard cell** | Coarser cell (8×8×8 interest cells) used as the placement/sharding unit for cell actors (D5, D11). |

@@ -143,6 +143,13 @@ impl CellId {
     pub fn to_hilbert(self) -> u64;                     // storage layer only (D5)
 }
 
+/// Nested-grid identity (01-spatial-model.md §13): each moving reference
+/// frame (ship, planet, station) is its own `CellId` space. Carried alongside
+/// `CellId` wherever a cell reference can cross frames — wire messages,
+/// journal records, storage keys, log records. The root universe grid is 0.
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct GridId(pub u32);
+
 pub struct Lease {                       // D7 registrar row
     pub entity: PersistId,
     pub holder: NodeId,                  // iroh ed25519 key = transport identity (D3)
