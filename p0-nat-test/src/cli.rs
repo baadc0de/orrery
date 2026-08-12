@@ -44,6 +44,10 @@ pub struct Cli {
     #[arg(long, global = true, default_value_t = 64)]
     pub payload_bytes: usize,
 
+    /// Roundtrip ping rate, in pings per second (for P50/P95 latency).
+    #[arg(long, global = true, default_value_t = 1)]
+    pub ping_hz: u32,
+
     /// Total test window, in seconds.
     #[arg(long, global = true, default_value_t = DEFAULT_DURATION_SECS)]
     pub duration_secs: u64,

@@ -19,7 +19,7 @@ mod net;
 mod session;
 mod telemetry;
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use clap::Parser;
@@ -91,6 +91,7 @@ async fn main() -> Result<()> {
         tick_hz: cli.tick_hz,
         payload_bytes: cli.payload_bytes,
         duration: cli.duration(),
+        ping_interval: Duration::from_secs_f64(1.0 / cli.ping_hz as f64),
     };
 
     let (tx, mut rx) = mpsc::channel(256);
@@ -149,6 +150,8 @@ async fn main() -> Result<()> {
                 sent,
                 received,
                 dropped,
+                rtt_p50_us,
+                rtt_p95_us,
             })) => {
                 if cli.json {
                     emit(
@@ -159,11 +162,30 @@ async fn main() -> Result<()> {
                             sent,
                             received,
                             dropped,
+                            rtt_p50_us,
+                            rtt_p95_us,
                         },
                         None,
                     );
                 } else {
-                    tracing::info!(peer, sent, received, dropped, "datagram stats (10s window)");
+                    match (rtt_p50_us, rtt_p95_us) {
+                        (Some(p50), Some(p95)) => tracing::info!(
+                            peer,
+                            sent,
+                            received,
+                            dropped,
+                            rtt_p50_us = p50,
+                            rtt_p95_us = p95,
+                            "datagram stats (10s window)"
+                        ),
+                        _ => tracing::info!(
+                            peer,
+                            sent,
+                            received,
+                            dropped,
+                            "datagram stats (10s window, no RTT samples yet)"
+                        ),
+                    }
                 }
             }
             Ok(Some(SessionEvent::Error { peer, error })) => {

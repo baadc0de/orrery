@@ -44,6 +44,8 @@ enum Event<'a> {
         sent: u64,
         received: u64,
         dropped: u64,
+        rtt_p50_us: Option<u64>,
+        rtt_p95_us: Option<u64>,
     },
     Error {
         error: &'a str,
@@ -80,11 +82,15 @@ pub fn emit(ctx: &TelemetryContext, peer: usize, event: &SessionEvent, ttd_ms: O
             sent,
             received,
             dropped,
+            rtt_p50_us,
+            rtt_p95_us,
             ..
         } => Event::Stats {
             sent: *sent,
             received: *received,
             dropped: *dropped,
+            rtt_p50_us: *rtt_p50_us,
+            rtt_p95_us: *rtt_p95_us,
         },
         SessionEvent::Error { error, .. } => Event::Error { error },
     };

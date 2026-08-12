@@ -76,6 +76,7 @@ path and exchanges datagrams independently.
 | `--peers <N>` | `1` | Host mode: accept N simultaneous connections (local mesh test) |
 | `--tick-hz <N>` | `60` | State datagram send rate (P0 stress) |
 | `--payload-bytes <N>` | `64` | Datagram payload size |
+| `--ping-hz <N>` | `1` | Roundtrip ping rate (for P50/P95 latency) |
 | `--duration-secs <N>` | `30` | Test window |
 | `--print-id` | — | Print NodeId and exit (host helper) |
 | `--json` | off | Emit telemetry as one JSON object per line on stdout (tracing → stderr) |
@@ -92,13 +93,14 @@ Each line is one record, e.g.:
 
 ```json
 {"ts":1786532620521,"node":"c132…","role":"host","peer":0,"type":"path","path":"direct","ttd_ms":55}
-{"ts":1786532625576,"node":"0c9c…","role":"peer","peer":0,"type":"stats","sent":310,"received":304,"dropped":0}
+{"ts":1786533718454,"node":"0c9c…","role":"peer","peer":0,"type":"stats","sent":310,"received":310,"dropped":0,"rtt_p50_us":72,"rtt_p95_us":95}
 ```
 
 Record types: `connected` (remote NodeId), `path` (relay/direct/mixed +
 `ttd_ms` = time-to-direct-path), `stats` (sent/received/dropped per 10s
-window), `error`. Correlate host and peer sides of a pair by `node`/`remote`.
-The direct-path rate and `ttd_ms` distribution are the P0 punch metrics
+window + `rtt_p50_us`/`rtt_p95_us` roundtrip latency percentiles), `error`.
+Correlate host and peer sides of a pair by `node`/`remote`. The direct-path
+rate, `ttd_ms` distribution, and RTT percentiles are the P0 punch metrics
 ([docs/11-roadmap.md](../docs/11-roadmap.md) §P0).
 
 ## Reading the results
