@@ -210,6 +210,16 @@ Validation on the target's authority is a **pose-history lookup, never a resimul
 
 This is "favor the shooter" with the trust inverted from Source's server-side lag compensation: the look-back bound is enforced by the *victim's* authority against its own pose history, so the worst-case "shot behind cover" experience is capped at 200 ms plus transit, and no peer can retro-date further than the cap.
 
+### 7.1 Weapon archetypes and prediction regimes
+
+| Weapon | Entity? | Prediction model | Authority transfer | Attestation cost |
+|---|---|---|---|---|
+| **Hitscan** | No — pure event | Shooter predicts presentation only; damage never predicted | N/A | One raycast + log replay |
+| **Dumb projectile** | Yes — ephemeral | Shooter predicts spawn + ballistic flight; deterministic = spawn-params-only replication | On impact (contact) | Spawn log + one integration |
+| **Guided missile** | Yes — ephemeral | Shooter predicts kinematics; guidance corrections from target's authority (RTT-dependent, §8) | Mid-flight (proximity) + on impact | Full guidance trace replay |
+
+The guided missile's mid-flight transfer is the hardest case: guidance depends on the target's *current* position, which is authoritative only on the target's peer. At RTT < 150 ms the shooter can predict guidance using the target's interpolated pose; at RTT > 250 ms the missile stays Interpolated on the shooter and the target's authority simulates the terminal phase entirely (§8 latency bands).
+
 ## 8. Latency-regime behavior
 
 RTT in Orrery is **per authority pair**, not global: the local player is always RTT-free (§2), so degradation applies only to interactions with a given remote authority. Thresholds follow D8, with Overwatch's ~220 ms hit-prediction cutoff as the precedent for the top band.

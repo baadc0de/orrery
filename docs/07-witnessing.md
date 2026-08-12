@@ -35,6 +35,14 @@ The pipeline runs in `orrery_witness` (client side), `orrery_core` (replay), and
 4. **Adjudication.** `orrery_persistd`'s adjudication executor routes the bundle by its pinned `RulesetId` to the matching **version-keyed sidecar worker** (the cluster retains the last 3 ruleset builds, D12) and re-runs the window. Discrete-outcome mismatch (damage, currency, loot) is a binary verdict; continuous-state deviation uses the same ε bands and sustained-error window. Failed evidence splits two ways (D10): **`EvidenceForged`** — provable fabrication, e.g. a subject signature the reporter attested as verified fails verification — strikes the *reporter*; **`Unadjudicable`** — adjudicator-side causes (ruleset build older than the 3 retained, retention miss, oversize window) — is **never a strike**; unadjudicable submissions are merely rate-limited per account.
 5. **Responses**, on a guilty verdict, in order: (a) **in-session authority correction** — the cluster revokes the offender's leases at the registrar (D7, which it already owns) and broadcasts a signed `AuthorityCorrection` to the island; peers reconcile to the adjudicated state through the normal rollback path; (b) **durable refusal/annulment** — pending intents from the offender in the disputed window are refused, and already-journaled bulk writes are annulled by appending compensating inverse-op entries to the event journal (D11's journal is the event source; see [08-persistence.md](08-persistence.md)); (c) an **account strike** filed with `orrery_identity` (§5).
 
+**Attestation cost by weapon type.** The pipeline above is weapon-agnostic, but the *cost* of stage-4 adjudication varies:
+
+- **Hitscan:** one raycast against the pose ring — trivial.
+- **Dumb projectile:** replay the spawn event and integrate the ballistic trajectory — cheap.
+- **Guided missile:** re-execute the full guidance trace (per-tick target states, seeker logic, countermeasure interactions) — ~µs/tick × flight duration, bounded by the 3 s adjudication window cap.
+
+Ruleset authors should budget witness-set re-execution capacity accordingly: a missile-heavy game needs more witness headroom than a hitscan-heavy one.
+
 ```mermaid
 sequenceDiagram
     participant A as Suspect authority (peer)

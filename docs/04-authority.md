@@ -202,6 +202,17 @@ For contested physics per §D13: when a body under peer P's authority contacts a
 
 Projectiles, VFX, debris, and other non-persistent spawns never touch the registrar. Authority is the spawner's, in-island, by construction (Fusion's spawner-gets-initial-authority rule); IDs come from an island-scoped namespace; transfer, if ever needed, is an in-island claim under the same seq-pair comparison with no `Grant` round-trip. If an ephemeral entity causes a durable consequence (a rocket destroys a placed structure), the *consequence* travels the witness-attested intent path (§D11) — the projectile itself is never persisted.
 
+### 6.1 Worked example: projectile authority lifecycle
+
+A dumb projectile (cannon shell, torpedo) is the canonical ephemeral entity:
+
+1. **Spawn.** The firing ship's peer spawns it with weak authority (spawner-gets-initial-authority). No registrar round-trip; the ID comes from the island-scoped namespace.
+2. **Flight.** Ballistic = deterministic. The spawner replicates `(spawn_tick, origin, velocity)` once; every peer integrates the trajectory locally. No continuous state replication.
+3. **Impact.** Contact with the target transfers weak authority to the target's peer (§5). The target's authority validates the impact against its pose ring (§D8), applies damage, and replicates the result.
+4. **Durable consequence.** If the projectile destroys a placed structure, the *consequence* travels the witness-attested intent path (§D11) — the projectile itself is never persisted.
+
+A guided missile adds one wrinkle: mid-flight authority transfer. When the missile enters the target's contact island (proximity threshold, ruleset-defined), the target's peer files a weak claim. The registrar grants it (higher `auth_seq` wins). From that point, the target's authority simulates the terminal phase — evasion, countermeasure interaction, impact. The shooter retains *attribution* (kill credit) but loses *simulation authority*.
+
 ## 7. Parked entities
 
 A parked entity has **no live authority anywhere**: `holder = None`, `PARKED` flag set, state served read-only from the hot tier / FDB. Entering players receive parked state in the normal area-load stream and simply render it; the first `Claim` (usually a `Contact` when someone bumps it) unparks it through the ordinary CAS path. Optional **lazy catch-up** on load — advancing a parked cell's `Ruleset`-relevant state through elapsed time (crops grow, furnaces smelt) — is executed cluster-side by `orrery_field_host` in its parked-cell catch-up role before the state is served; semantics (lazy vs. scheduled) are an open question tracked in §D17.6 and detailed in [08-persistence.md](08-persistence.md).
