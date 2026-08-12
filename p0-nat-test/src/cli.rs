@@ -31,6 +31,11 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub peer: Option<PublicKey>,
 
+    /// Host mode: accept this many simultaneous connections (local mesh test).
+    /// Defaults to 1; only meaningful when `--peer` is absent.
+    #[arg(long, global = true, default_value_t = 1)]
+    pub peers: u32,
+
     /// State datagram send rate, in ticks per second (P0 stress = 60).
     #[arg(long, global = true, default_value_t = 60)]
     pub tick_hz: u32,

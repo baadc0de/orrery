@@ -52,12 +52,28 @@ Copy the `node_id=...` it prints (or run `./p0-nat-test --print-id`).
 Both sides log `path state changed path=direct` when the punch lands and
 `datagram stats ... dropped=0` while datagrams flow.
 
+### Local mesh test (one machine)
+
+To stand up a host plus several clients on one box (e.g. the P0 8-peer mesh):
+
+```sh
+# terminal 1 — host accepting 8 connections
+./p0-nat-test --peers 8 --duration-secs 1800
+
+# terminals 2..9 — each a client
+./p0-nat-test --peer <host-node-id> --duration-secs 1800
+```
+
+The host logs each connection as `peer=N`, and every peer punches to a direct
+path and exchanges datagrams independently.
+
 ### Options
 
 | Flag | Default | Meaning |
 |---|---|---|
 | `--relay <URL>` | `https://iroh-relay.distopik.com` | The self-hosted iroh relay: punch rendezvous + fallback path |
 | `--peer <NodeId>` | *(host mode)* | Remote NodeId to dial |
+| `--peers <N>` | `1` | Host mode: accept N simultaneous connections (local mesh test) |
 | `--tick-hz <N>` | `60` | State datagram send rate (P0 stress) |
 | `--payload-bytes <N>` | `64` | Datagram payload size |
 | `--duration-secs <N>` | `30` | Test window |

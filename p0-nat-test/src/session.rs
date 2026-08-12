@@ -28,21 +28,24 @@ pub struct SessionOptions {
     pub duration: Duration,
 }
 
-/// Events a session reports to the main loop for logging.
+/// Events a session reports to the main loop for logging. In host mode a
+/// session is one of several simultaneous connections, so events carry the
+/// peer index they belong to.
 #[derive(Debug)]
 pub enum SessionEvent {
     /// The QUIC connection to the remote peer is up.
-    Connected { remote: EndpointId },
+    Connected { peer: usize, remote: EndpointId },
     /// The active path (relay vs direct) changed.
-    Path { path: PathState },
+    Path { peer: usize, path: PathState },
     /// Aggregated datagram delivery for the last reporting window.
     Stats {
+        peer: usize,
         sent: u64,
         received: u64,
         dropped: u64,
     },
     /// A recoverable error inside the session.
-    Error { error: String },
+    Error { peer: usize, error: String },
 }
 
 /// Current path of a session, mirroring the design's `PathState`
@@ -76,7 +79,7 @@ impl SessionHandle {
     /// Spawn a session task that dials `target`, then runs the datagram loop.
     pub fn spawn(
         endpoint: EndpointHandle,
-        target: Option<EndpointId>,
+        target: EndpointId,
         options: SessionOptions,
         events: mpsc::Sender<SessionEvent>,
     ) -> Self {
@@ -92,27 +95,110 @@ impl SessionHandle {
     }
 }
 
+/// A handle to a host that accepts several simultaneous connections (local
+/// mesh test). One datagram loop runs per connection.
+pub struct HostHandle {
+    shutdown_tx: oneshot::Sender<()>,
+}
+
+impl HostHandle {
+    /// Spawn a host task that accepts `count` connections and runs a datagram
+    /// loop per connection, tagging events with the peer index.
+    pub fn spawn(
+        endpoint: EndpointHandle,
+        count: u32,
+        options: SessionOptions,
+        events: mpsc::Sender<SessionEvent>,
+    ) -> Self {
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        tokio::spawn(host_task(endpoint, count, options, events, shutdown_rx));
+        Self { shutdown_tx }
+    }
+
+    /// Ask the host to stop and wait for it to finish.
+    pub async fn shutdown(self) -> Result<()> {
+        let _ = self.shutdown_tx.send(());
+        Ok(())
+    }
+}
+
 async fn session_task(
     endpoint: EndpointHandle,
-    target: Option<EndpointId>,
+    target: EndpointId,
     options: SessionOptions,
     events: mpsc::Sender<SessionEvent>,
     shutdown_rx: oneshot::Receiver<()>,
 ) {
-    let run = run_session(endpoint, target, options, events.clone(), shutdown_rx).await;
+    let run = run_session(endpoint, target, 0, options, events.clone(), shutdown_rx).await;
     if let Err(e) = run {
         // If the channel is closed the consumer is gone; the error is moot.
         let _ = events
             .send(SessionEvent::Error {
+                peer: 0,
                 error: e.to_string(),
             })
             .await;
     }
 }
 
+/// Accept `count` connections, spawning a datagram loop per connection.
+async fn host_task(
+    endpoint: EndpointHandle,
+    count: u32,
+    options: SessionOptions,
+    events: mpsc::Sender<SessionEvent>,
+    shutdown_rx: oneshot::Receiver<()>,
+) {
+    let mut shutdown_rx = shutdown_rx;
+    let mut handles = Vec::new();
+
+    for peer in 0..count {
+        // Accept one connection, then hand it to its own datagram loop task.
+        let accepted = tokio::select! {
+            _ = &mut shutdown_rx => break,
+            res = accept(endpoint.inner()) => res,
+        };
+        let conn = match accepted {
+            Ok(conn) => conn,
+            Err(e) => {
+                let _ = events
+                    .send(SessionEvent::Error {
+                        peer: peer as usize,
+                        error: format!("accept failed: {e}"),
+                    })
+                    .await;
+                continue;
+            }
+        };
+        let remote = conn.remote_id();
+        let _ = events
+            .send(SessionEvent::Connected {
+                peer: peer as usize,
+                remote,
+            })
+            .await;
+
+        let (tx, rx) = oneshot::channel();
+        handles.push(tx);
+        let events = events.clone();
+        let options = options.clone();
+        let peer = peer as usize;
+        tokio::spawn(async move {
+            let _ = run_datagram_loop_for(conn, peer, options, events, rx).await;
+        });
+    }
+
+    // Wait for shutdown or until all per-peer loops finish.
+    let _ = shutdown_rx.await;
+    for tx in handles {
+        let _ = tx.send(());
+    }
+}
+
 async fn run_session(
     endpoint: EndpointHandle,
-    target: Option<EndpointId>,
+    target: EndpointId,
+    peer: usize,
     options: SessionOptions,
     events: mpsc::Sender<SessionEvent>,
     shutdown_rx: oneshot::Receiver<()>,
@@ -120,18 +206,10 @@ async fn run_session(
     // Dial by key, not by address (docs/02-networking.md §1). The peer dials
     // the host by NodeId; the host (no target) accepts an incoming connection.
     // Both then run the same datagram loop.
-    let (conn, remote) = match target {
-        Some(id) => {
-            let conn = dial(endpoint.inner(), endpoint.relay(), id).await?;
-            (conn, id)
-        }
-        None => {
-            let conn = accept(endpoint.inner()).await?;
-            let remote = conn.remote_id();
-            (conn, remote)
-        }
-    };
-    let _ = events.send(SessionEvent::Connected { remote }).await;
+    let conn = dial(endpoint.inner(), endpoint.relay(), target).await?;
+    let _ = events
+        .send(SessionEvent::Connected { peer, remote: target })
+        .await;
 
     run_datagram_loop(conn, options, events, shutdown_rx).await
 }
@@ -139,6 +217,17 @@ async fn run_session(
 /// The per-tick state datagram loop shared by host and peer.
 async fn run_datagram_loop(
     conn: Connection,
+    options: SessionOptions,
+    events: mpsc::Sender<SessionEvent>,
+    shutdown_rx: oneshot::Receiver<()>,
+) -> Result<()> {
+    run_datagram_loop_for(conn, 0, options, events, shutdown_rx).await
+}
+
+/// The per-tick state datagram loop, attributed to peer index `peer`.
+async fn run_datagram_loop_for(
+    conn: Connection,
+    peer: usize,
     options: SessionOptions,
     events: mpsc::Sender<SessionEvent>,
     shutdown_rx: oneshot::Receiver<()>,
@@ -193,7 +282,7 @@ async fn run_datagram_loop(
             path = path_rx.recv() => {
                 match path {
                     Some(path) => {
-                        let _ = events.send(SessionEvent::Path { path }).await;
+                        let _ = events.send(SessionEvent::Path { peer, path }).await;
                     }
                     None => break,
                 }
@@ -208,6 +297,7 @@ async fn run_datagram_loop(
         if last_stats.elapsed() >= stats_every {
             let _ = events
                 .send(SessionEvent::Stats {
+                    peer,
                     sent: window.sent,
                     received: window.received,
                     dropped: window.dropped,
@@ -228,6 +318,7 @@ async fn run_datagram_loop(
     // Final stats flush.
     let _ = events
         .send(SessionEvent::Stats {
+            peer,
             sent: window.sent,
             received: window.received,
             dropped: window.dropped,

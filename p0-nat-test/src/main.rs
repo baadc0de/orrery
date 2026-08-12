@@ -25,7 +25,23 @@ use tracing_subscriber::EnvFilter;
 
 use crate::cli::Cli;
 use crate::net::EndpointHandle;
-use crate::session::{SessionEvent, SessionHandle, SessionOptions};
+use crate::session::{HostHandle, PathState, SessionEvent, SessionHandle, SessionOptions};
+
+/// A running test session: either a host accepting connections or a peer
+/// dialing one. Both expose the same `shutdown`.
+enum Session {
+    Host(HostHandle),
+    Peer(SessionHandle),
+}
+
+impl Session {
+    async fn shutdown(self) -> Result<()> {
+        match self {
+            Session::Host(h) => h.shutdown().await,
+            Session::Peer(p) => p.shutdown().await,
+        }
+    }
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -55,44 +71,57 @@ async fn main() -> Result<()> {
     }
 
     // A session is one iroh connection to one peer. The peer dials the host by
-    // NodeId; the host (no `--peer`) accepts an incoming connection. Both then
-    // run the same datagram loop.
-    let (tx, mut rx) = mpsc::channel(256);
-    let session = SessionHandle::spawn(
-        endpoint.clone(),
-        cli.peer,
-        SessionOptions {
-            tick_hz: cli.tick_hz,
-            payload_bytes: cli.payload_bytes,
-            duration: cli.duration(),
-        },
-        tx,
-    );
+    // NodeId; the host (no `--peer`) accepts incoming connections. With
+    // `--peers N` the host accepts N simultaneous connections (local mesh test);
+    // otherwise it accepts one. Both sides run the same datagram loop per
+    // connection.
+    let options = SessionOptions {
+        tick_hz: cli.tick_hz,
+        payload_bytes: cli.payload_bytes,
+        duration: cli.duration(),
+    };
 
-    let mut last_path = None;
+    let (tx, mut rx) = mpsc::channel(256);
+    let host_mode = cli.peer.is_none();
+    let peers = if host_mode { cli.peers } else { 1 };
+
+    // In host mode we accept `peers` connections; in peer mode we dial one.
+    let session = if host_mode {
+        Session::Host(HostHandle::spawn(endpoint.clone(), peers, options, tx))
+    } else {
+        Session::Peer(SessionHandle::spawn(
+            endpoint.clone(),
+            cli.peer.unwrap(),
+            options,
+            tx,
+        ))
+    };
+
+    let mut last_path: Vec<Option<PathState>> = vec![None; peers as usize];
 
     let deadline = tokio::time::Instant::now() + cli.duration();
     while tokio::time::Instant::now() < deadline {
         let recv = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv()).await;
         match recv {
-            Ok(Some(SessionEvent::Connected { remote })) => {
-                tracing::info!(%remote, "session connected");
+            Ok(Some(SessionEvent::Connected { peer, remote })) => {
+                tracing::info!(peer, %remote, "session connected");
             }
-            Ok(Some(SessionEvent::Path { path })) => {
-                if last_path.as_ref() != Some(&path) {
-                    tracing::info!(%path, "path state changed");
-                    last_path = Some(path);
+            Ok(Some(SessionEvent::Path { peer, path })) => {
+                if last_path.get(peer) != Some(&Some(path.clone())) {
+                    tracing::info!(peer, %path, "path state changed");
+                    last_path[peer] = Some(path);
                 }
             }
             Ok(Some(SessionEvent::Stats {
+                peer,
                 sent,
                 received,
                 dropped,
             })) => {
-                tracing::info!(sent, received, dropped, "datagram stats (10s window)");
+                tracing::info!(peer, sent, received, dropped, "datagram stats (10s window)");
             }
-            Ok(Some(SessionEvent::Error { error })) => {
-                tracing::warn!(%error, "session error");
+            Ok(Some(SessionEvent::Error { peer, error })) => {
+                tracing::warn!(peer, %error, "session error");
             }
             Ok(None) => {
                 // The session task finished (normal shutdown); nothing more to do.
