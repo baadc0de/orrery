@@ -51,6 +51,11 @@ pub struct Cli {
     /// Print the NodeId and exit without dialing or sending (host helper).
     #[arg(long, global = true)]
     pub print_id: bool,
+
+    /// Emit telemetry as one JSON object per line on stdout (machine-parseable
+    /// for the punch-rate dashboard). Tracing logs go to stderr.
+    #[arg(long, global = true)]
+    pub json: bool,
 }
 
 impl Cli {

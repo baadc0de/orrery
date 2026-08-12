@@ -17,6 +17,9 @@
 mod cli;
 mod net;
 mod session;
+mod telemetry;
+
+use std::time::Instant;
 
 use anyhow::Result;
 use clap::Parser;
@@ -26,6 +29,7 @@ use tracing_subscriber::EnvFilter;
 use crate::cli::Cli;
 use crate::net::EndpointHandle;
 use crate::session::{HostHandle, PathState, SessionEvent, SessionHandle, SessionOptions};
+use crate::telemetry::{emit, TelemetryContext};
 
 /// A running test session: either a host accepting connections or a peer
 /// dialing one. Both expose the same `shutdown`.
@@ -47,7 +51,15 @@ impl Session {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
+    // In JSON mode, tracing logs go to stderr so stdout stays machine-parseable
+    // (one JSON record per line).
+    let writer = if cli.json {
+        tracing_subscriber::fmt::writer::BoxMakeWriter::new(std::io::stderr)
+    } else {
+        tracing_subscriber::fmt::writer::BoxMakeWriter::new(std::io::stdout)
+    };
     tracing_subscriber::fmt()
+        .with_writer(writer)
         .with_env_filter(
             EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| EnvFilter::new("info,p0_nat_test=info")),
@@ -97,17 +109,37 @@ async fn main() -> Result<()> {
         ))
     };
 
+    // Telemetry: in JSON mode we emit records; in human mode we log. We track
+    // per-peer connect time so we can report time-to-direct-path (the P0
+    // criterion's direct-path metric).
+    let ctx = TelemetryContext {
+        node: endpoint.node_id(),
+        role: if host_mode { "host" } else { "peer" },
+    };
     let mut last_path: Vec<Option<PathState>> = vec![None; peers as usize];
+    let mut connected_at: Vec<Option<Instant>> = vec![None; peers as usize];
 
     let deadline = tokio::time::Instant::now() + cli.duration();
     while tokio::time::Instant::now() < deadline {
         let recv = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv()).await;
         match recv {
             Ok(Some(SessionEvent::Connected { peer, remote })) => {
-                tracing::info!(peer, %remote, "session connected");
+                connected_at[peer] = Some(Instant::now());
+                if cli.json {
+                    emit(&ctx, peer, &SessionEvent::Connected { peer, remote }, None);
+                } else {
+                    tracing::info!(peer, %remote, "session connected");
+                }
             }
             Ok(Some(SessionEvent::Path { peer, path })) => {
-                if last_path.get(peer) != Some(&Some(path.clone())) {
+                let ttd_ms = if path == PathState::Direct {
+                    connected_at[peer].map(|t| t.elapsed().as_millis() as u64)
+                } else {
+                    None
+                };
+                if cli.json {
+                    emit(&ctx, peer, &SessionEvent::Path { peer, path }, ttd_ms);
+                } else if last_path.get(peer) != Some(&Some(path.clone())) {
                     tracing::info!(peer, %path, "path state changed");
                     last_path[peer] = Some(path);
                 }
@@ -118,10 +150,28 @@ async fn main() -> Result<()> {
                 received,
                 dropped,
             })) => {
-                tracing::info!(peer, sent, received, dropped, "datagram stats (10s window)");
+                if cli.json {
+                    emit(
+                        &ctx,
+                        peer,
+                        &SessionEvent::Stats {
+                            peer,
+                            sent,
+                            received,
+                            dropped,
+                        },
+                        None,
+                    );
+                } else {
+                    tracing::info!(peer, sent, received, dropped, "datagram stats (10s window)");
+                }
             }
             Ok(Some(SessionEvent::Error { peer, error })) => {
-                tracing::warn!(peer, %error, "session error");
+                if cli.json {
+                    emit(&ctx, peer, &SessionEvent::Error { peer, error }, None);
+                } else {
+                    tracing::warn!(peer, %error, "session error");
+                }
             }
             Ok(None) => {
                 // The session task finished (normal shutdown); nothing more to do.

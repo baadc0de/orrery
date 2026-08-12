@@ -78,6 +78,28 @@ path and exchanges datagrams independently.
 | `--payload-bytes <N>` | `64` | Datagram payload size |
 | `--duration-secs <N>` | `30` | Test window |
 | `--print-id` | — | Print NodeId and exit (host helper) |
+| `--json` | off | Emit telemetry as one JSON object per line on stdout (tracing → stderr) |
+
+### Machine-readable telemetry (`--json`)
+
+For the punch-rate dashboard, run with `--json` and capture stdout:
+
+```sh
+./p0-nat-test --json --duration-secs 1800 > host.jsonl
+```
+
+Each line is one record, e.g.:
+
+```json
+{"ts":1786532620521,"node":"c132…","role":"host","peer":0,"type":"path","path":"direct","ttd_ms":55}
+{"ts":1786532625576,"node":"0c9c…","role":"peer","peer":0,"type":"stats","sent":310,"received":304,"dropped":0}
+```
+
+Record types: `connected` (remote NodeId), `path` (relay/direct/mixed +
+`ttd_ms` = time-to-direct-path), `stats` (sent/received/dropped per 10s
+window), `error`. Correlate host and peer sides of a pair by `node`/`remote`.
+The direct-path rate and `ttd_ms` distribution are the P0 punch metrics
+([docs/11-roadmap.md](../docs/11-roadmap.md) §P0).
 
 ## Reading the results
 
