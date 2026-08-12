@@ -1,0 +1,18 @@
+# Rust / Cargo
+/target
+**/*.rs.bk
+Cargo.lock
+
+# Editor / OS
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+
+# Logs / telemetry
+*.log
+*.tmp
+
+# Device-local agent memory (never committed — lives only on this machine)
+.agents/memory/
