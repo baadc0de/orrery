@@ -1,0 +1,177 @@
+# Roadmap & Risk Register
+
+This document turns the Orrery architecture into a phased build plan: seven phases (P0–P6), each with explicit goals, the crates it touches, deliverables, an upstream-contribution milestone, and — non-negotiably — a **demo criterion**: something runnable and observable that proves the phase, becomes a permanent regression harness, and gates entry to the next phase. It then expands the ADR's known risks into a full register (likelihood, impact, early-warning triggers, mitigations, plan B) and restates the open questions with proposed resolution paths and decision deadlines.
+
+Normative source: [DECISIONS.md](DECISIONS.md) D17 (risks and open questions), with D14–D16 governing every version, crate name, and numeric parameter cited here, and D3–D13 governing phase content.
+
+## Sequencing principles
+
+1. **Riskiest integration first.** The two things nobody has shipped in this ecosystem — an iroh IO layer for aeronet ([verified absent from crates.io as of Aug 2026](https://crates.io/crates/aeronet)) and the persistence tier (every surveyed netcode crate assumes transient in-memory state) — are P0 and P2. Everything else composes existing crates.
+2. **Two parallel tracks.** The network track (P0→P1→P3) and the persistence track (P2) meet at P3, where the lease registrar makes the cluster the authority arbiter. `orrery_core` is engine-agnostic and headless (D9) and is built as a side track feeding P4.
+3. **Demo-or-it-didn't-happen.** Each demo criterion is scripted, telemetry-instrumented (OpenTelemetry from P0 onward, per D12), and kept green in CI thereafter. Numbers in demo criteria are the D16 defaults — the demo *is* the parameter-table acceptance test.
+4. **Trust features ship dark first.** Witnessing runs in shadow mode (telemetry only, no enforcement) for a full phase before any strike is issued, per D17.3.
+
+```mermaid
+flowchart LR
+    P0["P0 Transport spike"] --> P1["P1 Spatial + replication"]
+    P0 --> P2["P2 Persistence MVP"]
+    P1 --> P3["P3 Authority"]
+    P2 --> P3
+    CORE["orrery_core (headless side track)"] -.-> P4
+    P3 --> P4["P4 Verifiable core + shadow witnessing"]
+    P4 --> P5["P5 Intents + attestation + enforcement"]
+    P5 --> P6["P6 Scale & hardening"]
+```
+
+Indicative calendar (planning estimate, not normative): P0 Q3 2026 · P1 Q4 2026 · P2 Q4 2026–Q1 2027 (overlaps P1; depends only on `orrery_protocol`) · P3 Q1 2027 · P4 Q2 2027 · P5 Q3 2027 · P6 Q4 2027.
+
+---
+
+## P0 — Transport spike
+
+**Goal.** Prove the single biggest bet: iroh 1.0.x as the universal transport (D3), surfaced through `aeronet_io` so the whole upper stack inherits it. No replication, no game — raw sessions, datagrams, streams, and NAT telemetry.
+
+**Crates.** `orrery_aeronet_iroh` (the deliverable), `orrery_protocol` (skeleton: `CellId` newtype, wire versioning), `orrery_net` (minimal: static peer list, channel policy datagrams=state / streams=control), plus ops config for one self-hosted `iroh-relay`.
+
+**Deliverables.**
+- `aeronet_io` implementation over iroh connections: unreliable datagrams for state, reliable streams for control/bulk, no head-of-line blocking between them; relay-vs-direct path surfaced as session telemetry (path type, time-to-direct-path, relayed-bytes fraction).
+- A NAT test matrix exercised with real networks: full-cone, port-restricted, symmetric/hard NAT, CGNAT, and one deliberately UDP-blocked network (forced-relay case). Hard-NAT↔hard-NAT pairs are expected to relay permanently — [Tailscale's data](https://tailscale.com/blog/how-nat-traversal-works) shows CGNAT↔CGNAT pairs are effectively un-punchable — and D3 treats that tail as a product requirement.
+- Punch-rate dashboard with the iroh production baseline (~90% direct connections, ~95% of bytes on direct paths) as the reference line ([iroh FAQ](https://docs.iroh.computer/about/faq), [holepunching docs](https://www.iroh.computer/docs/protocols/net/holepunching)).
+
+**Demo criterion.** 8 peers on real, heterogeneous NATs (≥4 distinct NAT types, ≥2 ISPs, including the forced-relay peer) form a full mesh and exchange per-tick 60 Hz state datagrams for 30 minutes with zero session drops; the dashboard shows direct-path rate consistent with the ~90% baseline, the relayed peer's traffic flowing, and added relay latency quantified per pair. (60 Hz here is a deliberate transport stress at sim-tick rate; the production replication default is 20 Hz, D16.)
+
+**Upstream milestone.** PR `orrery_aeronet_iroh` to aeronet as `aeronet_iroh`, mirroring the unpublished in-repo prototype (D4); file punch-rate findings against iroh where they diverge from the published numbers.
+
+## P1 — Spatial model + replication
+
+**Goal.** The 64-bit `CellId` doing its first duty (replication interest group, D5), on top of the consolidated stack (D4): bevy_replicon 0.42 visibility driven by cell membership, lightyear 0.29 bring-up for baseline prediction.
+
+**Crates.** `orrery_spatial` (CellId Morton encoding, big_space integration, 27-cell AOI, hysteresis, interest-set selection, proxy extrapolation), `orrery_coordinator` (stub: coarse presence, island formation, NodeId handout), `orrery_net` (island membership lifecycle), `orrery_predict` (initial lightyear configuration: own-player prediction, 9-tick rollback window), `orrery_protocol` (final `CellId` encoding: offset-binary, Morton-interleaved, sentinel-bit level marker).
+
+**Deliverables.**
+- `CellId` property-test suite: sort order = spatial locality, parent = prefix range, level round-trips.
+- big_space 0.12 ported to Bevy 0.19 (tracked risk, D14) and integrated: `GridCell` ↔ interest-level `CellId` (128 m edge).
+- Replicon visibility mapped from the 3×3×3 neighborhood; bounded high-rate interest set (24 entities) with 1–4 Hz extrapolated proxies beyond it — the Donnybrook pattern, whose measured ~12·n kb/s receive scaling is why the set is bounded ([Donnybrook, SIGCOMM 2008](https://www.microsoft.com/en-us/research/wp-content/uploads/2016/02/donnybrook.pdf)).
+- Handoff hysteresis (10% of cell edge) verified against oscillation on the cell boundary.
+
+**Demo criterion.** 32 synthetic peers (headless bot harness, scripted roaming across ≥64 interest cells) run for one hour: every peer's sustained upload stays ≤ 1 Mbps; interest-set membership churn is absorbed without visible proxy pops; no entity thrashes cells at a boundary; a late-joining peer receives only its 27-cell neighborhood.
+
+**Upstream milestone.** big_space 0.19 port PR upstream; visibility-API ergonomics feedback/patches to bevy_replicon.
+
+## P2 — Persistence MVP
+
+**Goal.** The "really really fast" tier (D11): cell actors, journal, FoundationDB checkpoints, area load — proven against synthetic load before real gameplay needs it. Starts during P1 (depends only on `orrery_protocol`).
+
+**Crates.** `orrery_persistd` (gateway, cell actors, segmented journal on fjall 3.x or raw segments, FDB checkpoint/restore), `orrery_persist_client` (gateway session, diff uplink scheduler at 1–4 Hz per entity, area load/subscribe), `orrery_protocol` (intent, journal-record, checkpoint types).
+
+**Deliverables.**
+- Single-writer cell actor runtime with rendezvous-hash placement over shard cells (8×8×8 interest cells per shard).
+- Journal with adaptive group commit (fsync immediately when the disk is idle, ~0.5 ms batching under load; commit < 2 ms server-internal); optional chain replication to one async follower (default on, RPO ≤ ~100 ms for bulk on node loss).
+- FDB 7.3.x checkpointing on the 20 s jittered cadence, immediate on cell quiesce; keyspace exactly as D11 (`world/{cell_id}/{entity_id}`, `player/…`, `ledger/…`, `lease/…`, `chunk/…`).
+- Area load: 27-cell FDB range scans + live actor deltas, streamed nearest-first.
+- Offline world-seed import tool on the persistd harness (D11): bulk-writes designed content into `world/`/`chunk/` rows, mints `PersistId`s, and records a content-version row so later deploys can diff/patch designed content.
+- The intent *execution* path (signature check → `Ruleset` validation stub → FDB serializable optimistic transaction) without witness attestation, so commit latency is measurable now; attestation arrives in P5.
+- Latency rig: gateway-colocated load generator producing calibrated diff and intent mixes.
+
+**Demo criterion.** With 10k entities across 100+ cells under synthetic load: `kill -9` the entire cluster, restart it, and the world resumes — zero acked intents lost (RPO 0), bulk loss bounded by the journal/replication window, clients (netsplit posture, D12) having queued intents and continued simulating. Measured against D16 targets in-region: journal commit < 2 ms server-internal, client-observed bulk ack p99 < 5 ms, intent commit p99 < 10 ms, area first page-in < 50 ms.
+
+**Upstream milestone.** Issues/patches to `foundationdb-rs` 0.11 and fjall as encountered; publish the FDB layer-schema notes.
+
+## P3 — Authority
+
+**Goal.** The two-tier claim model with cluster-arbitered leases (D7): the tracks merge — the persistence cluster becomes the authority arbiter for live simulation.
+
+**Crates.** `orrery_authority` (weak/strong claims, `auth_seq`/`own_seq`, optimistic lease client, contact-island propagation, handoff, orphan recovery), `orrery_persistd` (lease registrar: CAS on `lease/{entity_id}` rows), `orrery_predict` (per-entity-authority prediction hardening; reconciliation-error monitor scaffolding for P4), `orrery_coordinator` (island merge/split/drain driven by movement).
+
+**Deliverables.**
+- Lease rows `(entity_id → holder NodeId, auth_seq, own_seq, expiry)`; TTL 10 s, heartbeat 2.5 s; optimistic claim (simulate immediately, roll back on CAS loss).
+- Cooperative handoff (negotiated divestiture with holder ack) and crash handoff (lease expiry → orphan → reassign to nearest interacting peer, else park in cluster).
+- Cross-cell movement keeping the holder under hysteresis; storage row re-keyed on commit.
+- Ephemeral entities (projectiles, VFX) on in-island claims only, never touching the registrar.
+- Single-writer invariant checker: telemetry that flags any tick where two peers both believed they held authority.
+
+**Demo criterion.** An 8-peer island with contested physics objects: `kill -9` one peer holding ~50 entities → every entity is reassigned or parked within the 10 s lease TTL, with no duplicate-authority tick recorded and no lost entity; separately, a scripted cooperative handoff chain (player A grabs, throws to B's contact island) completes with zero registrar-visible conflicts and no visible pop. This is the anti-host-migration proof: authority moves per entity, so no session-wide stall — the failure mode that [drove For Honor off P2P](https://www.ubisoft.com/en-us/game/for-honor/news-updates/2HayRoZjbJzSEJAhJMpeF7/for-honor-now-on-dedicated-servers-on-all-platforms) cannot occur by construction.
+
+**Upstream milestone.** Authority-model hardening PRs to lightyear (its authority handling is self-described as ["somewhat in flux"](https://github.com/cBournhonesque/lightyear/releases), and the `distributed_authority` example is outdated) — contribution, not fork, per D4.
+
+## P4 — Verifiable core + witnessing in shadow mode
+
+**Goal.** Scoped determinism (D9) and passive witnessing (D10) with **no enforcement**: logs, replay, adjudication, and discrepancy telemetry only. This phase exists to calibrate tolerance bands against reality before anyone can be striked.
+
+**Crates.** `orrery_core` (`Ruleset` trait, fixed-tick executor, `rand_chacha` seeded per `(universe_seed, entity, tick)`, quantization, tolerance comparators, signed hash-chained input logs, headless replay harness), `orrery_witness` (invariant validators, discrepancy detection, evidence assembly), `orrery_persistd` (adjudication executor linking the same `Ruleset`), reference game (kinematic movement + integer combat core).
+
+**Deliverables.**
+- PeerReview-style tamper-evident logs streamed to the cell-epoch witness set (piggybacked on the 20 Hz replication datagrams, gap repair over the reliable control stream); any holder of a segment + t₀ claim can re-execute a window ≤ 3 s (180 ticks) and produce self-verifying evidence.
+- Continuous cheap checks: speed/acceleration caps, teleport detection, rate limits, impossible values, plus the reconciliation-error monitor.
+- Discrepancy pipeline end-to-end: escalation → log-segment request → observer replay → evidence bundle → cluster re-execution → verdict — terminating in telemetry, not enforcement.
+- Rules-version skew handled from the start: the adjudication executor retains the last 3 ruleset builds as version-keyed sidecar workers and routes evidence bundles by `RulesetId`; bundles older than retention resolve as unadjudicable — never a strike (D11, D12).
+- Cross-platform determinism CI: identical core replays on Windows/Linux/macOS binaries every commit (ε_pos 1 cm, ε_vel 1 cm/s, 250 ms sustained-error window for continuous state; bit-exact for discrete outcomes).
+
+**Demo criterion.** A modified client applying a 1.5× speed multiplier joins an 8-peer island: detected, escalated, replay-adjudicated with a deviation verdict within one adjudication window of the violation. Simultaneously, ≥ 500 honest player-hours (bot + human mix) across all three platforms under injected impairment (3–5% packet loss, 100 ms jitter spikes) produce **zero** false-positive discrepancy reports. False-positive rate is the phase's primary tunable; the phase does not exit until it holds.
+
+**Upstream milestone.** Publish the determinism conformance suite (quantization + `libm` math corpus) as a standalone repo; upstream any platform-drift fixes it surfaces.
+
+## P5 — Intents + attestation + enforcement
+
+**Goal.** Close the durable-truth loop (D10.4, D11): witness-attested intents, strike pipeline live, cluster as sole writer of value. The Diablo II closed-realm lesson, mechanized: [server-side storage + validation is the effective anti-duping control](https://gist.github.com/amtal/bf941bde443eefc7d4626fd439d7f480), and [GTA Online's post-hoc correction](https://www.sportskeeda.com/gta/gta-online-money-generators-illegal-will-get-account-wiped-reset) is the cautionary tale for validating too late.
+
+**Crates.** `orrery_witness` (attestation co-signing), `orrery_coordinator` (witness-set seeding per cell-epoch — never self-chosen), `orrery_persistd` (attestation verification, quarantine-mode full validation, provisional commits, annulment), `orrery_identity` (accounts, NodeId binding, strike ledger with 14-day half-life, quarantine → cooldown → ban thresholds), `orrery_field_host` (witness-fallback mode only), `orrery_persist_client` (intent outcome prediction, offline queue).
+
+**Deliverables.**
+- K-of-N co-signatures (default K=3 of N≥5) on `Ruleset`-classified critical operations; low-population fallbacks: field-host witness or provisional commit finalized by cluster-side spot replay.
+- Two-party trade flow as the reference intent (read-check-write across both parties' `ledger` rows in one FDB serializable transaction).
+- Enforcement switches: write refusal/annulment, in-session authority correction broadcast, strikes — each independently feature-flagged, ramped from shadow to live per D17.3.
+- At-rest schema versioning (D11): per-component schema versions in the component bag; `Ruleset`-registered migrations applied lazily on checkpoint-load/area-read plus an optional background sweep; journal/archive records carry their encoding version; migrations span ≥ 2 adjacent versions.
+
+**Demo criterion.** The dupe gauntlet, all provably refused with machine-checkable audit trails: (a) replayed intent (idempotency key rejected); (b) double-spend race — the same item offered in two trades through two gateway nodes simultaneously (one FDB transaction conflicts and the retry fails validation); (c) forged/self-chosen attestation (signature/witness-set check fails); (d) trade during quarantine (full cluster-side validation path exercised). Honest trades sustain intent commit p99 < 10 ms with attestation overhead included.
+
+**Upstream milestone.** Publish `orrery_protocol` intent/attestation wire spec with test vectors, inviting third-party audit.
+
+## P6 — Scale & hardening
+
+**Goal.** The population-adaptive topology completed (D6), the full R7 persistence surface, and production ops posture.
+
+**Crates.** `orrery_field_host` (promoted-cell authority, parked-cell catch-up execution), `orrery_coordinator` (promotion at > 32 sustained with hysteresis, elastic scheduling), `orrery_persistd` (hotspot cell splitting, terrain chunk compaction, journal→archive tailer, griefing rollback), `orrery_net` (multi-region relay/gateway routing), ops (≥3 relay regions, fdb-kubernetes-operator or systemd deployment, dashboards, runbooks).
+
+**Deliverables.**
+- Field-host promotion/demotion: coordinator spins up a headless Bevy instance that assumes cell-entity authority; peers keep authority over their own players; clients experience it as just another authority peer (the Destiny 2 lesson — [move the host into the datacenter, never onto a player](https://edgegap.com/blog/multiplayer-game-hosting-deep-dive-exploring-how-destiny-2-uses-both-peer-to-peer-authoritative-servers)).
+- Terrain pipeline: cell-aligned chunk deltas in the journal, compacted to ≤ 100 KB snapshot shards.
+- Event archive (Parquet on object storage) with retention config; griefing rollback via inverse-op replay by cell/actor/time-range.
+- Chaos suite: netsplit (cluster unreachable → intents queue, sim continues), relay-region loss, FDB node loss, coordinator restart.
+
+**Demo criterion.** A scripted 128-player crowd event (R6 upper bound) in one region: the hot cell is promoted within the hysteresis window, per-peer bandwidth stays within the ≤ 1 Mbps uplink budget and field-host egress within the ≤ 35 Mbps hot-cell budget (D6; the modeled n=128 load is ~25.6+ Mbps, inside budget) throughout, and demotion follows dispersal cleanly. Then the rollback demo: a griefer bulldozes a player town; an operator restores it to a timestamp via archive inverse-op replay, with the ledger untouched. Multi-region: EU-based peers joining a US island get relay/gateway routing that keeps added latency within the measured relay penalty from P0.
+
+**Upstream milestone.** Open-source the load/chaos harness and `iroh-relay` fleet deployment tooling.
+
+---
+
+## Risk register
+
+Expands D17. Likelihood/impact: L/M/H. "Trigger" = the early-warning signal that activates the mitigation review.
+
+| # | Risk | Likelihood | Impact | Trigger / early warning | Mitigation | Plan B |
+|---|---|---|---|---|---|---|
+| R-1 | **lightyear API churn** — 4 breaking releases in 10 months; migrations land mid-phase | H | M | New lightyear minor with breaking notes; CI on a canary branch tracking latest goes red | Pin per Orrery release (D14); confine lightyear types to `orrery_predict` so churn is one crate's problem; budget migration time each phase | Freeze on last-good version for a full release cycle; accelerate R-2's plan B if frozen > 6 months |
+| R-2 | **Single-maintainer bus factor** (lightyear, aeronet; authority "in flux") | M | H | Maintainer inactivity > 60 days; stalled review on our P3 upstream PRs | Upstream authority hardening early (P3 milestone) so our needs live in-tree; maintain contributor relationship, not a fork | Documented D17 fallback: bevy_replicon-direct + own prediction layer (replicon visibility/diffs already the substrate; bevy_ggrs/bevy_rewind studied as rollback-schedule references) |
+| R-3 | **big_space port lag** — 0.12 targets Bevy 0.18; we need 0.19, and every future Bevy bump repeats this | H (known work) | L–M | Port estimate exceeds 2 weeks; upstream unresponsive to the P1 PR | Budgeted P1 deliverable; integration isolated inside `orrery_spatial` | Maintain a patch fork of the `GridCell` subset we use (small, stable surface) |
+| R-4 | **noq drift from quinn** — iroh's QUIC stack diverging from mainline fixes | M | M | quinn CVE/congestion-control fix absent from noq after one iroh release cycle | Track both changelogs; P0's raw-quinn `aeronet_io` backend (D3 hedge) stays green in CI as a permanent alternative path | Swap LAN/dedicated/test traffic to the quinn backend; escalate with n0 (commercially backed); noq is usable standalone if iroh's identity layer chafes |
+| R-5 | **Relay economics** — the 5–10% permanently-relayed tail (CGNAT↔CGNAT effectively always relays) under-provisioned or costlier than modeled | H (tail is certain) | M | P0/P1 telemetry: relayed-bytes fraction > 10%, or per-relayed-peer bandwidth cost exceeding model; regional relay saturation | Treat the tail as a product requirement (D3): capacity-plan from P0 punch-rate telemetry; ≥3 self-hosted regions; relays are stateless and cheap to scale horizontally | Rate-tier relayed traffic (proxy rates for relayed peers), add regions, or steer relayed peers preferentially toward field-hosted cells where uplink burden is server-side |
+| R-6 | **Witness false positives** — tolerance bands vs. packet loss/platform drift strike honest players | H (untuned) | H | Any false positive in P4 shadow telemetry; discrepancy-report rate correlating with peer RTT/loss rather than accounts | Shadow mode for all of P4 with an explicit zero-FP exit gate; ε/window as configurable parameters; "multiple rollbacks" thresholds; strike decay (14-day half-life) bounds worst-case harm | Keep enforcement at quarantine (cluster-side full validation) indefinitely — never auto-ban on replay evidence alone until FP rate is provably zero over months |
+| R-7 | **FDB ops learning curve**; hotspot writes under crowd events (the [FDB #11510](https://github.com/apple/foundationdb/issues/11510) pattern) | M | H | Commit p99 drifting toward the 10 ms budget at < 75% cluster load; range-write hotspots on crowd cells in P2 load runs | fdb-kubernetes-operator or systemd for a 3–5 node cluster; P2 latency rig doubles as a capacity model; hotspot pre-splitting + load shedding designed in P6; Morton-prefix keyspace spreads adjacent cells | ScyllaDB is the named runner-up (D11) if sustained writes outgrow a modest FDB cluster — but its LWTs never take over trade safety; intents stay on a serializable store |
+| R-8 | **Field-host cost model** — promotion threshold vs. spend; worst case (every cell hot) is client-server economics | M | M | Coordinator telemetry: promoted-cell-hours trending up; cost per promoted cell-hour exceeding live-ops budget | Threshold (>32 sustained) and hysteresis are live-ops dials; elastic scheduling; demotion aggressiveness tunable | Accept the convergence by design (D17.5): a fully-hot world running field hosts everywhere is a functioning client-server game, not a failure |
+| R-9 | **Schedule: persistence tier is greenfield** — no prior art in the ecosystem to lean on; P2 is the critical path | M | H | P2 slipping > 4 weeks; latency targets missed on first rig runs | P2 starts during P1 (only needs `orrery_protocol`); custom layer kept thin and single-purpose (D11); demo rig built before features | Ship P3 against FDB-only persistence (no cell actors/journal; bulk writes straight to FDB at relaxed ack targets) and retrofit the hot tier — targets degrade, architecture doesn't change |
+| R-10 | **Schedule: Bevy 0.20 lands mid-roadmap**, dragging the whole pinned stack | H | M | Bevy release announcement; ecosystem crates starting migration | Pin everything per D14; re-pin only at phase boundaries; canary branch measures migration cost before committing | Skip a Bevy release entirely — nothing in Orrery requires engine-latest |
+| R-11 | **Schedule: demo criteria need real-NAT diversity** — lab results won't reproduce home-network pathologies | M | M | P0 matrix missing NAT types; punch rate in lab ≫ punch rate in the wild | Recruit a standing remote test cohort on real ISPs (incl. CGNAT mobile links) from P0; keep the forced-relay peer in every CI-adjacent soak | Rent consumer-ISP endpoints / mobile-tether rigs; treat [Tailscale's published NAT taxonomy](https://tailscale.com/blog/how-nat-traversal-works) as the coverage checklist |
+
+## Open questions (D17.6) — resolution paths and deadlines
+
+| Question | Proposed resolution path | Decision by |
+|---|---|---|
+| **Cross-island consistency for fast travelers** — island merge latency when a player outruns coordinator merge/drain | Instrument island merge/drain latency from the P1 coordinator stub; prototype *corridor pre-merge* in P3: coordinator predicts trajectory from coarse presence and pre-warms destination-island connections (dial-ahead) before arrival, so the traveler joins an already-connected set; fall back to a brief interpolation-only window (no interaction) on arrival if pre-merge missed | P3 exit |
+| **Parked-cell catch-up semantics** — lazy (on next load) vs. scheduled background simulation | Ship lazy catch-up as the P2/P3 default (matches D7's "optional lazy catch-up on next load"); measure catch-up wall-time distribution vs. parked duration from archive data; if p99 catch-up threatens the < 50 ms first-page-in budget, add scheduled catch-up on `orrery_field_host` (it already links the `Ruleset`, D15) for cells parked > threshold | P6 entry |
+| **Economy-wide invariant auditing cadence** — how often to sweep for conservation violations the per-intent checks can't see | Build the auditor as a journal-archive consumer (the event source already exists, D11); start with a daily full conservation sweep + hourly incremental over hot ledgers; calibrate cadence from measured archive scan cost and time-to-detection targets. Must be live before enforcement is fully on — post-hoc-only correction is the documented GTA Online failure | P5 exit |
+| **`Ruleset` distribution to cluster** — games recompile `persistd`: acceptable? | Keep link-time composition as the answer for 1.0 (`orrery_persistd` is a library harness by design, D12); the alternative (WASM-sandboxed `Ruleset`) costs determinism guarantees and adjudication performance for a modding scenario no launch title needs. Revisit only on concrete demand; the harness API is frozen at P2 exit, which is the cheap moment to decide | P2 exit |
+
+## Cross-references
+
+[00-overview.md](00-overview.md) for the system tour · [02-networking.md](02-networking.md) (P0/P1 transport and topology detail) · [01-spatial-model.md](01-spatial-model.md) (P1) · [08-persistence.md](08-persistence.md) (P2/P5) · [04-authority.md](04-authority.md) (P3) · [06-verifiable-core.md](06-verifiable-core.md), [07-witnessing.md](07-witnessing.md) (P4/P5) · [09-services-and-ops.md](09-services-and-ops.md) (P6 ops posture) · [10-crates.md](10-crates.md) (crate boundaries assumed by every phase).

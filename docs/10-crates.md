@@ -1,0 +1,588 @@
+# Crate architecture
+
+This document expands the ADR's crate set into a concrete Cargo workspace: the layout tree, the dependency spine and its layering rules, a per-crate reference (purpose, public API sketch, dependencies, feature flags, Bevy status) for all thirteen `orrery_*` crates, the games-bring-rules linking pattern, client app composition, the lockstep versioning/release policy, and the upstreaming plan plus the replicon-direct plan B. All code below is **sketch-grade**: signatures are indicative of shape and naming, not guaranteed to compile.
+
+Normative source: [DECISIONS.md](DECISIONS.md) D15, drawing on D4 (netcode stack), D12 (service inventory), D14 (pinned versions), and D17 (risks).
+
+## Workspace layout
+
+One workspace, one version number, one lockfile. Server crates and client crates live together so protocol changes are atomic across both sides.
+
+```
+orrery/
+├── Cargo.toml                  # [workspace] + [workspace.dependencies] pin table (D14)
+├── rust-toolchain.toml
+├── crates/
+│   ├── orrery_protocol/        # lib · engine-agnostic · wire & data types
+│   ├── orrery_core/            # lib · engine-agnostic · verifiable core / Ruleset
+│   ├── orrery_aeronet_iroh/    # lib · aeronet IO layer over iroh (upstream candidate)
+│   ├── orrery_net/             # Bevy plugin · sessions, coordinator client, channels
+│   ├── orrery_spatial/         # Bevy plugin · CellId math, AOI, visibility mapping
+│   ├── orrery_authority/       # Bevy plugin · claims, leases, handoff
+│   ├── orrery_predict/         # Bevy plugin · lightyear config, rollback guard
+│   ├── orrery_witness/         # Bevy plugin · validators, evidence, attestation
+│   ├── orrery_persist_client/  # Bevy plugin · area load, diff uplink, intents
+│   ├── orrery/                 # lib · facade: OrreryClientPlugins + prelude
+│   ├── orrery_persistd/        # lib + reference bin · persistence cluster harness
+│   ├── orrery_coordinator/     # bin · presence, islands, promotion
+│   ├── orrery_identity/        # bin · accounts, tokens, strikes
+│   └── orrery_field_host/      # bin + lib target · headless Bevy authority host
+├── examples/
+│   └── mygame/
+│       ├── mygame_rules/       # Ruleset impl — no Bevy dependency
+│       ├── mygame_client/      # Bevy app composing OrreryClientPlugins
+│       ├── mygame_persistd/    # MyRules linked into the persistd harness
+│       └── mygame_field_host/  # MyRules + gameplay plugins on FieldHostPlugins
+├── deploy/                     # iroh-relay config, FDB manifests, otel collector
+└── xtask/                      # lockstep release tooling, wire-corpus compat tests
+```
+
+The `orrery` facade is a fourteenth, purely compositional workspace member: it defines the `OrreryClientPlugins` plugin group named in D15 and a `prelude`. It contains no logic; a `PluginGroup` must live in a crate that depends on every member plugin, and none of the thirteen functional crates can do that without inverting the spine.
+
+## Dependency spine
+
+Arrows read "depends on". Transitive edges are elided; **every crate except `orrery_aeronet_iroh` depends on `orrery_protocol`** (the IO layer stays orrery-free so it can be upstreamed verbatim, see [Upstreaming](#upstreaming-plan)).
+
+```mermaid
+graph BT
+    subgraph agnostic["Engine-agnostic — no Bevy (D15)"]
+        protocol["orrery_protocol"]
+        core["orrery_core"]
+    end
+    subgraph client["Client plugin stack — Bevy 0.19"]
+        iroh_io["orrery_aeronet_iroh"]
+        net["orrery_net"]
+        spatial["orrery_spatial"]
+        authority["orrery_authority"]
+        predict["orrery_predict"]
+        witness["orrery_witness"]
+        pclient["orrery_persist_client"]
+        facade["orrery — facade: OrreryClientPlugins"]
+    end
+    subgraph services["Services — Bevy-free except field_host"]
+        persistd["orrery_persistd"]
+        coord["orrery_coordinator"]
+        identity["orrery_identity"]
+        fhost["orrery_field_host"]
+    end
+    game["game crates: rules, client, binaries"]
+
+    core --> protocol
+    net --> protocol
+    net --> iroh_io
+    spatial --> net
+    authority --> spatial
+    predict --> authority
+    witness --> core
+    witness --> predict
+    pclient --> spatial
+    facade --> predict
+    facade --> witness
+    facade --> pclient
+    persistd --> core
+    coord --> protocol
+    identity --> protocol
+    fhost --> facade
+    fhost --> core
+    game --> facade
+    game --> core
+    game --> persistd
+    game --> fhost
+```
+
+Layering rules (the first two are normative from D15; the rest are containment rules this doc establishes):
+
+1. `orrery_protocol` ← everything. Wire types are defined once, engine-free.
+2. `orrery_core` ← {`orrery_witness`, `orrery_persistd`, `orrery_field_host`, game}. The same `Ruleset` executes on peers, field hosts, and the cluster (D9).
+3. **lightyear types appear only inside `orrery_predict`.** No other crate names a lightyear type in its public API. This is the plan-B blast radius (see below).
+4. **replicon types appear only in `orrery_spatial`** (visibility mapping) **and `orrery_persist_client`** (change-detection uplink). **aeronet types appear only in `orrery_aeronet_iroh` and `orrery_net`.**
+5. `orrery_witness` and `orrery_persist_client` do not depend on each other: the witness emits `orrery_protocol` event types (`EvidenceBundle`, `AttestationGrant`) as Bevy messages; the persist client drains and transmits them.
+6. Bevy-free services speak iroh directly (tokio-native endpoints); `orrery_aeronet_iroh` exists only for Bevy processes, because [`aeronet_io`](https://github.com/aecsocket/aeronet) is `bevy_ecs`-based. Both sides interoperate because framing lives in `orrery_protocol`, not in the IO layer.
+
+## Crate reference
+
+| Crate | Kind | Bevy | Key upstream deps |
+|---|---|---|---|
+| `orrery_protocol` | lib | none | postcard/bitcode, serde, glam, iroh-base, lindel (opt) |
+| `orrery_core` | lib | none | rand_chacha 0.9, libm, blake3, ed25519 (iroh-base) |
+| `orrery_aeronet_iroh` | lib | via `aeronet_io` | aeronet 0.21, iroh 1.0.x, tokio |
+| `orrery_net` | plugin | yes | aeronet 0.21, iroh 1.0.x, tokio |
+| `orrery_spatial` | plugin | yes | big_space 0.12 (0.19 port), bevy_replicon 0.42, kiddo 6.x |
+| `orrery_authority` | plugin | yes | — |
+| `orrery_predict` | plugin | yes | lightyear 0.29, avian3d 0.7 (opt) |
+| `orrery_witness` | plugin | yes | blake3 |
+| `orrery_persist_client` | plugin | yes | bevy_replicon 0.42 |
+| `orrery` (facade) | lib | yes | all six client plugins |
+| `orrery_persistd` | lib+bin | **none** | foundationdb-rs 0.11, fjall 3.x, iroh, tokio, tonic |
+| `orrery_coordinator` | bin | **none** | iroh, tokio, tonic |
+| `orrery_identity` | bin | **none** | iroh, tokio, foundationdb-rs 0.11, argon2 |
+| `orrery_field_host` | bin+lib | **headless** (MinimalPlugins) | bevy 0.19 (no render/winit) |
+
+### 1. `orrery_protocol` — wire and data types
+
+Every serialized thing crosses this crate: `CellId`, intents, leases, attestations, evidence bundles, input-log records, coordinator/identity/gateway message enums, and the protocol version constant. It is engine-agnostic (glam for vector math, `iroh-base` for `NodeId`/signature types — no Bevy, no tokio) so servers, tools, and tests link it without an engine.
+
+**Features:** `postcard` (default encoding), `bitcode` (alternative, benchmarked per release), `u128-cells` (extended-range `CellId`, D5 — wire-incompatible, see [Edge cases](#edge-cases-and-failure-modes)), `hilbert` (storage-side Hilbert index via [lindel](https://crates.io/crates/lindel), D5).
+
+```rust
+/// D5: offset-binary coords (21 bits/axis), Morton-interleaved into 63 bits,
+/// truncated to 3·level bits, then a single 1 sentinel bit, then zeros.
+/// Sorted order = spatial locality; a parent's subtree is one key range.
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct CellId(pub u64);
+
+impl CellId {
+    pub const MAX_LEVEL: u8 = 21;                       // ±2^20 cells per axis
+    pub fn from_cell_coords(xyz: glam::IVec3, level: u8) -> Self;
+    pub fn level(self) -> u8;
+    pub fn parent(self) -> Option<Self>;                // drop 3 bits, re-sentinel
+    pub fn children(self) -> [Self; 8];
+    pub fn neighbors27(self) -> [Self; 27];             // 3×3×3 AOI set, self included (D5)
+    pub fn subtree_range(self) -> RangeInclusive<u64>;  // storage range-scan key span
+    #[cfg(feature = "hilbert")]
+    pub fn to_hilbert(self) -> u64;                     // storage layer only (D5)
+}
+
+pub struct Lease {                       // D7 registrar row
+    pub entity: PersistId,
+    pub holder: NodeId,                  // iroh ed25519 key = transport identity (D3)
+    pub auth_seq: u32,
+    pub own_seq: u32,
+    pub expires_at: UnixMillis,          // TTL 10 s, heartbeat 2.5 s (D16)
+}
+
+pub struct Intent {                      // D11 critical-write envelope
+    pub intent_id: IntentId,             // ULID; idempotency key across retries
+    pub issuer: NodeId,
+    pub cell_epoch: CellEpoch,           // binds the seeded witness set (D10)
+    pub ops: SmallVec<[IntentOp; 2]>,
+    pub attestations: Vec<Attestation>,  // K=3 of N≥5 co-signatures (D16)
+    pub signature: Signature,
+}
+
+pub struct InputLogRecord {              // D9 tamper-evident log entry
+    pub tick: Tick,                      // u32
+    pub entity: PersistId,
+    pub inputs: Bytes,                   // encoded Ruleset::Input
+    pub prev_hash: Hash,                 // hash chain
+    pub state_claim: Option<Hash>,       // periodic state-claim hash
+    pub sig: Signature,
+}
+
+pub struct EvidenceBundle {              // D10 discrepancy report payload
+    pub window: RangeInclusive<Tick>,    // ≤ 180 ticks / 3 s (D16)
+    pub t0_claim: StateClaim,
+    pub log_segment: Vec<InputLogRecord>,
+    pub claimed: Hash,
+    pub computed: Hash,
+    pub observer: NodeId,
+}
+
+pub const PROTOCOL_VERSION: u16 = 1;     // services accept N and N−1 (rolling upgrade)
+```
+
+### 2. `orrery_core` — verifiable core
+
+The engine-agnostic deterministic kernel (D9): the `Ruleset` trait games implement, the fixed-tick executor, seeded RNG, quantization and tolerance comparators, signed hash-chained input logs, and the headless replay harness. Linked identically by peers (witness re-execution), field hosts (parked-cell catch-up), and `persistd` (adjudication). No Bevy, no tokio, no float nondeterminism: `libm`-backed math with tolerance bands for continuous state, integer/fixed-point for discrete outcomes.
+
+**Features:** `fixed-point` (helper types for discrete-outcome math), `replay-cli` (dev tool for offline log replay).
+
+```rust
+pub trait Ruleset: Send + Sync + 'static {
+    /// Hash over rules version + protocol feature set; checked at gateway handshake.
+    const RULES_DIGEST: RulesDigest;
+    type State: CoreState;               // quantized at tick boundaries (D9)
+    type Input: CoreInput;
+
+    /// Pure step function, headless-runnable (D9): 60 Hz, inputs totally ordered
+    /// per entity per tick.
+    fn step(
+        &self,
+        view: &StateView<Self::State>,
+        inputs: &TickInputs<Self::Input>,
+        rng: &mut CoreRng,
+    ) -> (Self::State, SmallVec<[CoreEvent; 4]>);
+
+    /// D11 write classification: Bulk (diff uplink) vs Critical (attested intent).
+    fn classify(&self, op: &IntentOp) -> WriteClass;
+    /// Cluster-side validation of a critical intent against hot state.
+    fn validate_intent(&self, intent: &Intent, hot: &dyn HotStateRead) -> Result<(), IntentReject>;
+    /// Game-specific stateless invariants, executed by orrery_witness (D10).
+    fn invariants(&self) -> Vec<Arc<dyn InvariantValidator>>;
+}
+
+/// rand_chacha seeded from (universe_seed, entity, tick) — D9.
+pub fn core_rng(universe_seed: u64, entity: PersistId, tick: Tick) -> CoreRng;
+
+pub struct Tolerance { pub eps_pos: f32, pub eps_vel: f32, pub window: Duration }
+impl Default for Tolerance { /* 1 cm, 1 cm/s, 250 ms (D16) */ }
+
+pub struct InputLog;                     // append, sign, chain, segment export
+
+pub struct ReplayHarness<R: Ruleset> { /* … */ }
+impl<R: Ruleset> ReplayHarness<R> {
+    pub fn new(rules: R) -> Self;
+    pub fn verify(&self, t0: Snapshot<R::State>, segment: &[InputLogRecord]) -> ReplayVerdict;
+}
+pub enum ReplayVerdict { Match, Deviation { first_bad_tick: Tick, computed: Hash } }
+```
+
+Full treatment: [06-verifiable-core.md](06-verifiable-core.md).
+
+### 3. `orrery_aeronet_iroh` — iroh IO layer
+
+The missing ecosystem piece (verified [absent from crates.io as of Aug 2026](https://crates.io/crates/aeronet)): an [`aeronet_io`](https://github.com/aecsocket/aeronet) implementation over [iroh 1.0](https://github.com/n0-computer/iroh) — QUIC dialed by `NodeId`, [~90% direct hole-punch success](https://www.iroh.computer/docs/protocols/net/holepunching), relay fallback, relay→direct path migration via QUIC multipath (D3). One implementation serves the entire upper stack: lightyear sits on aeronet, and raw replicon consumes it via [`aeronet_replicon`](https://crates.io/crates/aeronet_replicon). Deliberately depends on **no other orrery crate** so it can be published upstream as `aeronet_iroh` unchanged; an unpublished in-repo prototype in the aeronet repo is the structure to mirror (D4).
+
+**Features:** `metrics` (per-session path/RTT counters).
+
+```rust
+/// Registers the iroh IO layer with aeronet_io. One endpoint per app.
+pub struct OrreryTransportPlugin {
+    pub secret_key: iroh::SecretKey,     // this process's NodeId (D3)
+    pub relays: RelayMode,               // SelfHosted(RelayMap) | Custom | Disabled
+    pub runtime: RuntimeHandle,          // shared tokio runtime, or Owned
+}
+
+#[derive(Component)] pub struct IrohEndpoint { /* wraps iroh::Endpoint */ }
+#[derive(Component)] pub struct IrohSessionIo;   // marker on aeronet session entities
+
+/// Spawn-to-connect, aeronet-style: insert on a new entity under the endpoint.
+pub fn connect(peer: NodeAddr) -> impl Bundle;
+
+#[derive(Component)]
+pub struct PathReport { pub kind: PathKind, pub rtt: Duration }  // relay-path telemetry (D15)
+pub enum PathKind { Direct, Relayed { relay: RelayUrl } }
+```
+
+### 4. `orrery_net` — session lifecycle
+
+Owns everything about being *on the network* that is not replication: bootstrapping the endpoint via `OrreryTransportPlugin`, authenticating with `orrery_identity`, the coordinator client, island membership, peer connect/disconnect tracking, channel policy (datagrams = state, streams = control/bulk — D3), and relay-path telemetry aggregation. Enforces the ≤ 1 Mbps peer upload budget (D16) as the input to the priority accumulator configured by `orrery_predict`.
+
+**Features:** `otel` (span + metric export).
+
+```rust
+pub struct OrreryNetPlugin { pub config: NetConfig }
+pub struct NetConfig {
+    pub coordinator: NodeAddr,
+    pub session_token: SessionToken,       // from orrery_identity login
+    pub upload_budget: Bandwidth,          // default 1 Mbps sustained (D16)
+}
+
+#[derive(SystemParam)]
+pub struct CoordinatorClient<'w, 's> { /* … */ }
+impl CoordinatorClient<'_, '_> {
+    pub fn report_presence(&mut self, cell: CellId);          // coarse, rate-limited (D12)
+    pub fn island(&self) -> Option<&IslandAssignment>;        // membership + regime
+    pub fn witness_set(&self, cell: CellId) -> Option<&WitnessSet>; // per cell-epoch seed (D10)
+}
+
+#[derive(Resource)]
+pub struct IslandMembership { pub island: IslandId, pub peers: Vec<PeerInfo>, pub regime: TopologyRegime }
+pub enum TopologyRegime { Mesh, InterestMesh, Promoted }      // ≤8 / 9–32 / >32 sustained (D6)
+
+#[derive(Event)]
+pub enum NetEvent { PeerJoined(PeerInfo), PeerLeft(NodeId), IslandChanged(IslandAssignment) }
+```
+
+### 5. `orrery_spatial` — cells, AOI, visibility
+
+`CellId` assignment from [`big_space`](https://github.com/aevyrie/big_space) grid coordinates, the 27-cell AOI subscription, mapping cell membership onto [bevy_replicon](https://github.com/simgine/bevy_replicon) per-client visibility, high-rate interest-set selection (bounded at 24 entities, Donnybrook pattern — D6), cell-crossing hysteresis, and 1–4 Hz extrapolated proxies for out-of-set entities. [kiddo](https://crates.io/crates/kiddo) k-d trees serve per-cell proximity queries (D5: in-memory query structure only, never the partition unit).
+
+**Features:** `big_space` (default; gates integration with the 0.19 port so a port delay degrades to manual origin management instead of blocking the workspace).
+
+```rust
+pub struct OrrerySpatialPlugin { pub config: SpatialConfig }
+pub struct SpatialConfig {
+    pub cell_edge_m: f32,          // 128.0 (D16)
+    pub hysteresis_frac: f32,      // 0.10 of cell edge (D16)
+    pub high_rate_cap: usize,      // 24 entities (D16)
+    pub proxy_hz: RangeInclusive<f32>, // 1.0..=4.0 (D16)
+}
+
+#[derive(Component)] pub struct Cell(pub CellId);      // hysteresis-stable current cell
+#[derive(Resource)]  pub struct AoiSubscription { pub cells: [CellId; 27] }
+#[derive(Component)] pub struct HighRate;              // in the bounded interest set
+#[derive(Component)] pub struct Proxy { pub rate_hz: f32 }
+
+pub fn cell_of(grid: &big_space::GridCell, cfg: &SpatialConfig) -> CellId;
+```
+
+### 6. `orrery_authority` — claims, leases, handoff
+
+Implements D7 on the client: weak claims propagated through contact islands, strong ownership, monotonic `auth_seq`/`own_seq`, the optimistic lease client against the cluster registrar, cooperative divestiture, and orphan recovery. Ephemeral entities use in-island claims and never touch the registrar.
+
+```rust
+pub struct OrreryAuthorityPlugin;
+
+#[derive(Component)] pub struct Authority { pub holder: NodeId, pub auth_seq: u32, pub own_seq: u32 }
+#[derive(Component)] pub struct LocallyAuthoritative;   // simulate + uplink this entity
+
+pub enum ClaimKind { Weak, Strong }                     // ownership beats authority (D7)
+
+#[derive(SystemParam)]
+pub struct LeaseClient<'w, 's> { /* pending-CAS table, heartbeat timers */ }
+impl LeaseClient<'_, '_> {
+    /// Optimistic (D7): local authority granted immediately; registrar CAS races in
+    /// the background; on CAS loss the claim rolls back (AuthorityEvent::ClaimLost).
+    pub fn claim(&mut self, entity: Entity, kind: ClaimKind) -> ClaimTicket;
+    /// Cooperative handoff: resolves after holder ack + registrar row rewrite.
+    pub fn divest(&mut self, entity: Entity, to: NodeId) -> DivestTicket;
+    /// Drop the lease: entity is orphan-reassigned or parked cluster-side (D7).
+    pub fn release(&mut self, entity: Entity);
+    // internal: heartbeats every 2.5 s against the 10 s TTL (D16)
+}
+
+#[derive(Event)]
+pub enum AuthorityEvent {
+    ClaimLost { entity: Entity, winner: NodeId },
+    Orphaned { entity: Entity },
+    HandoffComplete { entity: Entity, to: NodeId },
+}
+```
+
+### 7. `orrery_predict` — prediction and rollback
+
+The lightyear 0.29 configuration layer for per-entity authority (D8): fixed 60 Hz tick, 20 Hz send (≤ 30), 9-tick rollback window, 100 ms interpolation buffer, 200 ms hit-rewind cap, delta compression against acked baselines, priority accumulation within the `orrery_net` upload budget. Also home to the reconciliation-error monitor (the witness signal, D10) and the rollback budget guard (resim amortized over ≤ 2 render frames). **The only crate whose internals name lightyear types** — the plan-B seam.
+
+**Features:** `avian` (default; avian3d 0.7 integration per D13).
+
+```rust
+pub struct OrreryPredictPlugin { pub config: PredictConfig }
+pub struct PredictConfig {
+    pub tick_hz: u32,              // 60 (D16)
+    pub send_hz: u32,              // 20, ≤30 for small islands (D16)
+    pub rollback_ticks: u16,       // 9 (~150 ms) (D16)
+    pub interp_buffer: Duration,   // 100 ms (D16)
+    pub hit_rewind_cap: Duration,  // 200 ms (D16)
+}
+
+#[derive(Resource)]
+pub struct ReconciliationMonitor { /* per-entity error stats vs Tolerance bands */ }
+impl ReconciliationMonitor {
+    pub fn sustained_violation(&self, e: Entity) -> Option<ViolationWindow>; // feeds witness
+}
+
+#[derive(Resource)] pub struct RollbackBudget { pub resim_budget: Duration /* ≈1 ms */ }
+```
+
+### 8. `orrery_witness` — validation and evidence
+
+Runs the game's `InvariantValidator`s over received state, watches `ReconciliationMonitor` for sustained tolerance-band violations, fetches disputed log segments, re-executes them in `ReplayHarness<R>`, and assembles `EvidenceBundle`s. Also services attestation requests: co-signing intents when this peer is in the cluster-seeded witness set. Emits protocol event types; `orrery_persist_client` transmits them (rule 5 above).
+
+```rust
+pub struct OrreryWitnessPlugin<R: Ruleset> { pub config: WitnessConfig, pub rules: R }
+pub struct WitnessConfig {
+    pub quorum_k: u8,              // 3 (D16)
+    pub quorum_n_min: u8,          // 5 (D16)
+    pub tolerance: Tolerance,      // 1 cm / 1 cm·s⁻¹ / 250 ms (D16)
+    pub shadow_mode: bool,         // default true at launch: telemetry only (D17)
+}
+
+pub trait InvariantValidator: Send + Sync {
+    fn check(&self, observed: &ReceivedState) -> Option<Violation>; // speed caps, teleports…
+}
+
+#[derive(Event)] pub struct DiscrepancyDetected { pub entity: Entity, pub evidence: EvidenceBundle }
+#[derive(Event)] pub struct AttestationGranted { pub intent: IntentId, pub sig: Attestation }
+```
+
+### 9. `orrery_persist_client` — the cluster from the client's side
+
+Gateway session over iroh, area load (27-cell neighborhood streamed nearest-first, < 50 ms first page-in target — D16), the bulk diff uplink (replicon change-detection diffs for locally-authoritative entities, 1–4 Hz per entity, priority-scheduled — D11), and the intent pipeline with durable offline queueing (netsplit posture, D12: sim continues, durable commits pause). Predicts intent outcomes locally so UI does not wait for the < 10 ms commit.
+
+```rust
+pub struct OrreryPersistClientPlugin { pub config: PersistClientConfig }
+
+#[derive(SystemParam)]
+pub struct IntentQueue<'w, 's> { /* … */ }
+impl IntentQueue<'_, '_> {
+    /// Sign, gather K-of-N attestations from the seeded witness set, transmit.
+    /// While the gateway is unreachable, persists to a local append-only queue.
+    pub fn submit(&mut self, draft: IntentDraft) -> IntentTicket;
+    pub fn status(&self, t: IntentTicket) -> IntentStatus;
+    /// Optimistic local effects, rolled back on Rejected (D8: intents are the
+    /// only path for durable consequences).
+    pub fn predicted_outcome(&self, t: IntentTicket) -> Option<&PredictedEffects>;
+}
+pub enum IntentStatus { Draft, AwaitingAttestation, Queued, InFlight, Committed(Tick), Rejected(IntentReject) }
+
+#[derive(SystemParam)]
+pub struct AreaLoader<'w, 's> { /* … */ }
+impl AreaLoader<'_, '_> {
+    pub fn subscribe(&mut self, aoi: &AoiSubscription);   // range scans + live actor deltas
+}
+
+#[derive(Resource)] pub struct UplinkScheduler { /* per-entity Hz, priority accumulator */ }
+```
+
+### 10. `orrery` — client facade
+
+Re-exports the six client plugins, defines `OrreryClientPlugins<R: Ruleset>` (a Bevy `PluginGroup` in dependency order: transport → net → spatial → authority → predict → witness → persist_client) and `OrreryConfig` aggregating the per-plugin configs. Games depend on this one crate for the client side; individual plugins remain overridable through the standard `PluginGroupBuilder` (`.set(…)`, `.disable::<…>()`).
+
+### 11. `orrery_persistd` — persistence cluster harness
+
+**Bevy-free** (D15). A library harness plus a reference binary: gateway (iroh endpoint at a well-known address), single-writer cell actors, the segmented append-only journal (group commit, ~2 ms fsync — via [fjall 3.x](https://github.com/fjall-rs/fjall) or raw segment files), FoundationDB checkpoint/restore on the 20 s jittered cadence, the lease registrar (CAS rows), intent validation (`Ruleset::validate_intent` + FDB serializable transactions, < 10 ms p99), the adjudication executor (`ReplayHarness<R>`), and hotspot cell splitting. Internal service-to-service traffic uses tonic/gRPC where boring is better (D12). Games do not run this binary — they link their rules into their own (next section).
+
+**Features:** `journal-fjall` (default) / `journal-raw`, `chain-replication` (default on — D11: journal follower, RPO ≤ ~100 ms), `hilbert` (storage keys via `orrery_protocol/hilbert`), `otel` (default).
+
+```rust
+pub struct PersistdHarness<R: Ruleset> { /* … */ }
+impl<R: Ruleset> PersistdHarness<R> {
+    pub fn new(rules: R, cfg: PersistdConfig) -> anyhow::Result<Self>;
+    /// Runs gateway, cell actors, journal, registrar, checkpointer, intent
+    /// validator, and adjudicator until shutdown signal.
+    pub async fn run(self) -> anyhow::Result<()>;
+    pub fn handle(&self) -> ClusterHandle;   // health, cell census, drain, split
+}
+
+pub struct PersistdConfig {
+    pub listen: IrohListenConfig,            // well-known NodeAddr, no punching (D3)
+    pub fdb_cluster_file: PathBuf,           // FDB 7.3/7.4 (D11)
+    pub journal: JournalConfig,              // dir, fsync_group: ~2 ms, chain follower
+    pub checkpoint: CheckpointConfig,        // cadence: 20 s jittered (D16)
+    pub region: RegionId,
+}
+
+pub struct LeaseRegistrar;                   // CAS over lease/{entity_id} rows (D7/D11)
+pub struct CellActorHandle;                  // apply_diff → journal append → ack (<2 ms p99)
+```
+
+### 12. `orrery_coordinator` — islands and orchestration
+
+**Bevy-free** binary. Coarse presence tracking, island form/merge/split/drain, `NodeId` handout for island bootstrap, witness-set seeding per cell-epoch (never self-chosen — D10), and field-host orchestration: promotion when a cell sustains > 32 players (with hysteresis), despawn on quiesce (D6). State is in-memory, reconstructible from presence announcements; witness-seed epochs and island generation counters are durably journaled to FDB (feature `fdb-state`) so a coordinator restart cannot reissue an epoch.
+
+```rust
+pub struct CoordinatorConfig {
+    pub listen: IrohListenConfig,
+    pub promotion_threshold: u32,        // >32 sustained, hysteresis (D16)
+    pub field_host_pool: SchedulerConfig, // k8s / nomad / systemd adapters
+}
+
+// Wire surface lives in orrery_protocol::coord:
+pub enum CoordMsg {
+    Hello { token: SessionToken, node: NodeId },
+    Presence { cell: CellId },
+    IslandAssignment { island: IslandId, peers: Vec<PeerAddr>, regime: TopologyRegime },
+    WitnessSeed { cell: CellId, epoch: CellEpoch, set: Vec<NodeId> },
+    Promote { cell: CellId, host: PeerAddr },
+    Drain { island: IslandId, deadline: UnixMillis },
+}
+```
+
+### 13. `orrery_identity` — accounts and reputation
+
+**Bevy-free** binary. Accounts, NodeId binding, session-token issuance, the strike/reputation ledger with 14-day half-life decay, and the quarantine → cooldown → ban escalation (D10). Backing store is the same FoundationDB cluster (its own `account/` keyspace beside `player/{account_id}` from D11); credential hashing via argon2. Consumed by `orrery_net` at login and by `orrery_persistd` when adjudication verdicts file strikes.
+
+```rust
+// Wire surface in orrery_protocol::identity:
+pub enum IdentityMsg {
+    Login { account: AccountId, proof: AuthProof },
+    SessionToken { token: SessionToken, binds: NodeId, expires: UnixMillis },
+    Strike { account: AccountId, weight: f32, evidence: EvidenceRef }, // decay t½ = 14 d (D16)
+    EnforcementStatus { account: AccountId, level: Enforcement },
+}
+pub enum Enforcement { Clear, Quarantined, Cooldown(UnixMillis), Banned }
+```
+
+### 14. `orrery_field_host` — headless authority host
+
+The only Bevy-dependent service (D15): a headless Bevy app (`MinimalPlugins`, no render/winit/audio) that assumes cell-entity authority for promoted cells, acts as low-population witness fallback, and executes parked-cell catch-up via the `Ruleset` (D7). Architecturally it is *just another authority peer* (D6): it composes the same `OrreryClientPlugins` in headless mode, claims leases through the same registrar, and uplinks bulk state through the same persist client. The crate ships a lib target (`FieldHostPlugins<R>`) plus a reference binary that runs core-rules-only simulation; games whose hosted cells need full gameplay systems build `mygame_field_host` adding their plugins — the same bring-your-rules pattern as `persistd`.
+
+```rust
+pub struct FieldHostPlugins<R: Ruleset> { pub config: FieldHostConfig, pub rules: R }
+pub struct FieldHostConfig {
+    pub coordinator: NodeAddr,           // receives Promote/Drain assignments
+    pub gateway: NodeAddr,
+    pub witness_fallback: bool,          // low-pop attestation duty (D10)
+}
+
+// Reference binary:
+fn main() {
+    App::new()
+        .add_plugins(MinimalPlugins)
+        .add_plugins(FieldHostPlugins::from_env(CoreOnlyRules::default()))
+        .run();
+}
+```
+
+## Games bring the rules
+
+The cluster re-executes the same rules it stores (D9–D11), so a game's `Ruleset` must be *linked into* the persistence binary — there is no dynamic rules loading (recompiling `persistd` is the accepted answer per D17.6). The rules crate itself must be engine-agnostic (it depends only on `orrery_core`/`orrery_protocol`), which the dependency spine enforces mechanically: `orrery_core` has no Bevy dependency to leak.
+
+```rust
+//! examples/mygame/mygame_persistd/src/main.rs
+use mygame_rules::MyRules;               // impl Ruleset — no Bevy anywhere below
+use orrery_persistd::{PersistdConfig, PersistdHarness};
+
+fn main() -> anyhow::Result<()> {
+    orrery_persistd::telemetry::init()?;                 // OpenTelemetry (D12)
+    let cfg = PersistdConfig::load("persistd.toml")?;
+    let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
+    rt.block_on(PersistdHarness::new(MyRules::default(), cfg)?.run())
+}
+```
+
+The same `MyRules` value is linked into three other places: the client (witness re-execution inside `OrreryClientPlugins::<MyRules>`), the game's field host, and offline tooling (`ReplayHarness` CLI). `Ruleset::RULES_DIGEST` is exchanged at every gateway and coordinator handshake; a digest mismatch refuses the session — adjudication is meaningless across differing rules builds.
+
+## Client app composition
+
+```rust
+//! examples/mygame/mygame_client/src/main.rs
+use bevy::prelude::*;
+use orrery::prelude::*;
+use mygame_rules::MyRules;
+
+fn main() {
+    App::new()
+        .add_plugins(DefaultPlugins)
+        .add_plugins(
+            OrreryClientPlugins::<MyRules>::new(OrreryConfig {
+                universe: UniverseId::parse("…"),
+                coordinator: NodeAddr::from_env("ORRERY_COORD"),
+                session_token: SessionToken::from_env("ORRERY_TOKEN"),
+                spatial: SpatialConfig::default(),  // 128 m cells, 10% hysteresis, 27-cell AOI
+                predict: PredictConfig::default(),  // 60 Hz tick, 20 Hz send, 9-tick rollback
+                witness: WitnessConfig::default(),  // K=3/N≥5, shadow-mode strikes
+                persist: PersistClientConfig::default(),
+            })
+            .build()
+            // ordinary Bevy PluginGroup surgery still applies:
+            .set(OrrerySpatialPlugin { config: SpatialConfig { cell_edge_m: 256.0, ..default() } }),
+        )
+        .add_plugins(MyGamePlugins)
+        .run();
+}
+```
+
+## Versioning and release policy
+
+- **Lockstep versions.** All `orrery_*` crates (facade included) share one version and are released together, Bevy-style; pre-1.0, a minor bump is the breaking-change unit. `xtask release` bumps the workspace atomically and runs the wire-corpus tests.
+- **Pinned upstreams per release.** `[workspace.dependencies]` carries the D14 pin table; the churn-prone trio is pinned exactly — `lightyear = "=0.29.0"`, `bevy_replicon = "=0.42.1"`, `aeronet = "=0.21.0"` — because [lightyear shipped four breaking releases in ten months](https://github.com/cBournhonesque/lightyear/releases) (0.25→0.29: Predicted/Confirmed entity merge, timeline refactor, tick `u16`→`u32`). [iroh is semver-stable since 1.0](https://crates.io/crates/iroh) and gets a caret req. Upstream upgrades land only at Orrery minor releases, each with a migration note.
+- **Wire compatibility is decoupled from crate versions.** `orrery_protocol::PROTOCOL_VERSION` governs interop; services accept version N and N−1 so the cluster always deploys ahead of clients. A golden corpus of encoded messages in `xtask` guards decode compatibility across releases.
+- **`RULES_DIGEST` is exact-match**, versioned by the game, orthogonal to both of the above.
+- **big_space exception:** until the 0.19 port is merged upstream (D14 tracked risk), the workspace pins a git revision of our port branch — the only non-crates.io dependency allowed.
+
+## Upstreaming plan
+
+Contributions upstream are the mitigation for single-maintainer bus factor (D17.1) — never forks.
+
+| What | Target | Precondition / status |
+|---|---|---|
+| `orrery_aeronet_iroh` → `aeronet_iroh` | [aeronet](https://github.com/aecsocket/aeronet) | No `aeronet_iroh` exists on crates.io (verified 2026-08-11); an unpublished in-repo prototype exists to mirror (D4). Crate already has zero orrery dependencies; publish once soak-tested against the relay fleet. |
+| big_space 0.19 port | [big_space](https://github.com/aevyrie/big_space) | 0.12 targets Bevy 0.18 (D5 risk); small port, PR upstream, carry a git pin until merged. |
+| Authority-model hardening | [lightyear](https://github.com/cBournhonesque/lightyear) | Authority transfer is self-described as ["somewhat in flux"; the `distributed_authority` example is outdated](https://github.com/cBournhonesque/lightyear/releases). Contribute: lease-backed authority transfer hooks, divestiture acks, multi-writer conflict tests from our D7 suite. Maintainer is highly responsive (weekly releases). |
+
+**Plan B — replicon-direct.** If lightyear's abstractions fight the P2P per-entity-authority model harder than upstream contributions can fix, we drop one level (per the research recommendation): [bevy_replicon 0.42](https://github.com/simgine/bevy_replicon) directly — its per-client visibility API and change-detection diffs are already our substrate for interest management and the persistence uplink — plus our own prediction/rollback inside `orrery_predict`, studying [bevy_ggrs](https://github.com/gschup/bevy_ggrs)'s snapshot/rollback-schedule design and the abandoned [bevy_rewind](https://crates.io/crates/bevy_rewind) for mechanics while **not** building on ggrs itself (deterministic whole-world lockstep is incompatible with a streaming universe — D2). Layering rule 3 makes the blast radius exactly one crate: `orrery_predict`'s internals are rewritten; its `PredictConfig` surface, `orrery_spatial`'s replicon visibility mapping, `orrery_persist_client`'s replicon diff consumption, and every engine-agnostic crate are untouched.
+
+## Edge cases and failure modes
+
+- **Feature unification vs. wire format.** `u128-cells` changes `CellId`'s width and therefore every key and message containing one. Cargo feature unification could silently enable it workspace-wide from one stray dependency edge. Mitigation: the feature set is folded into `RULES_DIGEST` and `PROTOCOL_VERSION` negotiation — mixed builds refuse to connect rather than corrupt keyspaces. `hilbert` is safe: storage-side only, never on the wire (D5).
+- **Rules/protocol skew.** Cluster deploys before clients (N/N−1 protocol acceptance) but `RULES_DIGEST` is exact: during a game hotfix window, old clients are refused at the gateway with an update-required error rather than adjudicated against different rules. Intents queued offline under an old digest are replayed through `Ruleset::validate_intent` on the new build — idempotency via `intent_id`, rejection is normal and surfaced to the player.
+- **Tokio-in-Bevy boundary.** iroh is tokio-based; `OrreryTransportPlugin` owns (or borrows via `RuntimeHandle`) a single shared runtime so games embedding their own tokio don't end up with two. Bevy-free services are plain tokio binaries and never touch this seam.
+- **Upstream breaking release mid-cycle.** Exact pins mean a lightyear/replicon/aeronet release can never break a build; the cost is deliberate upgrade work each Orrery minor. If an upstream *security* fix forces an off-cycle bump, layering rules 3–4 bound which crates can be affected.
+- **Cyclic-dependency pressure.** The witness→persist_client submission path is the recurring temptation; the event-type decoupling (rule 5) is load-bearing. New cross-plugin flows must route through `orrery_protocol` types or move down a layer.
+- **Facade drift.** `OrreryClientPlugins` must keep plugin registration order = dependency order (transport before net before spatial…); a CI test builds a headless `App` with the group and asserts each plugin's required resources exist.
+
+## See also
+
+[00-overview.md](00-overview.md) for the system tour; [02-networking.md](02-networking.md) (iroh, channels, budgets); [03-replication.md](03-replication.md) (replicon/lightyear stack); [04-authority.md](04-authority.md) (leases in depth); [06-verifiable-core.md](06-verifiable-core.md) (`Ruleset` contract); [08-persistence.md](08-persistence.md) (cell actors, journal, FDB schema); [09-services-and-ops.md](09-services-and-ops.md) (deployment of the four services); [11-roadmap.md](11-roadmap.md) (build order and D17 risks).
