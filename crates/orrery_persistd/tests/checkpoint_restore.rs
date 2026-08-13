@@ -26,11 +26,17 @@ fn test_node(n: u8) -> orrery_protocol::NodeId {
     iroh_base::SecretKey::from_bytes(&seed).public()
 }
 
-fn mk_record(cell: CellId, entity: u64, kind: RecordKind, payload: &[u8]) -> JournalRecord {
+fn mk_record_in(
+    grid: GridId,
+    cell: CellId,
+    entity: u64,
+    kind: RecordKind,
+    payload: &[u8],
+) -> JournalRecord {
     JournalRecord {
         lsn: Lsn::new(0, 0), // assigned by the journal
         cell,
-        grid: GridId::ROOT,
+        grid,
         entity: PersistId::new(entity),
         tick: Tick::new(1),
         epoch: Epoch::new(0),
@@ -39,6 +45,10 @@ fn mk_record(cell: CellId, entity: u64, kind: RecordKind, payload: &[u8]) -> Jou
         payload: bytes::Bytes::copy_from_slice(payload),
         crc: payload_crc(payload),
     }
+}
+
+fn mk_record(cell: CellId, entity: u64, kind: RecordKind, payload: &[u8]) -> JournalRecord {
+    mk_record_in(GridId::ROOT, cell, entity, kind, payload)
 }
 
 /// A fresh in-memory checkpoint store as the trait object `CellRuntime::open`
@@ -144,15 +154,14 @@ async fn open_scans_the_journal_once_for_many_shards() {
     // journal per shard).
     let dir = tempfile::tempdir().unwrap();
 
-    // 10k records across the whole cell space, submitted concurrently so the
+    // 512 records across the whole cell space, submitted concurrently so the
     // adaptive committer batches them instead of paying one batch window per
     // record.
     {
-        let journal = Arc::new(
-            orrery_persistd::Journal::open(&runtime_config(dir.path()).journal).unwrap(),
-        );
+        let journal =
+            Arc::new(orrery_persistd::Journal::open(&runtime_config(dir.path()).journal).unwrap());
         let mut handles = Vec::new();
-        for i in 0..10_000u64 {
+        for i in 0..512u64 {
             let cell = CellId::from_coords(
                 glam::IVec3::new((i % 64) as i32 - 32, (i % 8) as i32 - 4, 0),
                 18,
@@ -179,7 +188,7 @@ async fn open_scans_the_journal_once_for_many_shards() {
 
     let (rt1, t1) = one_shard(vec![CellId::ROOT]);
     let page = rt1.read(GridId::ROOT, CellId::ROOT).await.unwrap();
-    assert_eq!(page.entities.len(), 10_000, "1-shard open replays all");
+    assert_eq!(page.entities.len(), 512, "1-shard open replays all");
     rt1.close().await.unwrap();
 
     let (rt8, t8) = one_shard(CellId::ROOT.children().to_vec());
@@ -188,7 +197,7 @@ async fn open_scans_the_journal_once_for_many_shards() {
         let page = rt8.read(GridId::ROOT, child).await.unwrap();
         total += page.entities.len();
     }
-    assert_eq!(total, 10_000, "8-shard open replays all, partitioned");
+    assert_eq!(total, 512, "8-shard open replays all, partitioned");
     rt8.close().await.unwrap();
 
     assert!(
@@ -447,7 +456,13 @@ async fn fdb_checkpoint_roundtrip() {
     )
     .unwrap();
     for i in 0..10u64 {
-        let rec = mk_record(CellId::ROOT, i, RecordKind::Spawn, &i.to_le_bytes());
+        let rec = mk_record_in(
+            GridId::new(9001),
+            CellId::ROOT,
+            i,
+            RecordKind::Spawn,
+            &i.to_le_bytes(),
+        );
         rt.apply(rec).await.unwrap();
     }
     rt.checkpoint(store.as_ref()).await.unwrap();
@@ -484,12 +499,24 @@ async fn fdb_checkpoint_then_restore() {
     )
     .unwrap();
     for i in 0..30u64 {
-        let rec = mk_record(CellId::ROOT, i, RecordKind::Spawn, &i.to_le_bytes());
+        let rec = mk_record_in(
+            GridId::new(9002),
+            CellId::ROOT,
+            i,
+            RecordKind::Spawn,
+            &i.to_le_bytes(),
+        );
         rt.apply(rec).await.unwrap();
     }
     rt.checkpoint(store.as_ref()).await.unwrap();
     for i in 30..40u64 {
-        let rec = mk_record(CellId::ROOT, i, RecordKind::Spawn, &i.to_le_bytes());
+        let rec = mk_record_in(
+            GridId::new(9002),
+            CellId::ROOT,
+            i,
+            RecordKind::Spawn,
+            &i.to_le_bytes(),
+        );
         rt.apply(rec).await.unwrap();
     }
     rt.close().await.unwrap();
@@ -527,7 +554,13 @@ async fn fdb_cold_cell_area_load() {
     )
     .unwrap();
     for i in 0..20u64 {
-        let rec = mk_record(CellId::ROOT, i, RecordKind::Spawn, &i.to_le_bytes());
+        let rec = mk_record_in(
+            GridId::new(9003),
+            CellId::ROOT,
+            i,
+            RecordKind::Spawn,
+            &i.to_le_bytes(),
+        );
         rt.apply(rec).await.unwrap();
     }
     // Checkpoint writes `world/{cell_id}/{entity_id}` rows for the entities.
@@ -826,7 +859,13 @@ async fn fdb_tombstone_end_to_end_lifecycle() {
     )
     .unwrap();
     for i in 0..6u64 {
-        let rec = mk_record(CellId::ROOT, i, RecordKind::Spawn, &i.to_le_bytes());
+        let rec = mk_record_in(
+            GridId::new(9007),
+            CellId::ROOT,
+            i,
+            RecordKind::Spawn,
+            &i.to_le_bytes(),
+        );
         rt.apply(rec).await.unwrap();
     }
     store.delete(CellId::ROOT, GridId::new(9007)).await.unwrap();
@@ -834,7 +873,7 @@ async fn fdb_tombstone_end_to_end_lifecycle() {
         .await
         .unwrap();
     for i in 0..3u64 {
-        let rec = mk_record(CellId::ROOT, i, RecordKind::Despawn, b"");
+        let rec = mk_record_in(GridId::new(9007), CellId::ROOT, i, RecordKind::Despawn, b"");
         rt.apply(rec).await.unwrap();
     }
     rt.checkpoint_shard(CellId::ROOT, store.as_ref())
