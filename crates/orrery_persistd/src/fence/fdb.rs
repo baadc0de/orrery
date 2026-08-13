@@ -2,8 +2,8 @@
 
 //! FoundationDB-backed fence store (`fdb` feature, D11 §6, §3.4/§3.5).
 //!
-//! Maps the `actor/{shard}` keyspace onto FDB as specified in
-//! docs/08-persistence.md §6: `actor/{shard_cell_id}` → `(owner, epoch,
+//! Maps the `actor/{grid}/{shard}` keyspace onto FDB as specified in
+//! docs/08-persistence.md §6: `actor/{grid}/{shard_cell_id}` → `(owner, epoch,
 //! status)`. Fencing and split are written in **serializable** `db.run`
 //! transactions so the read-compare-set is atomic — a zombie actor's stale
 //! checkpoint commit conflicts with the CAS, and a split's parent-status
@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 use foundationdb::Database;
 
-use orrery_protocol::CellId;
+use orrery_protocol::{CellId, GridId};
 
 use crate::fence::{FenceError, FenceOutcome, FenceRow, FenceStatus, FenceStore};
 use crate::keyspace;
@@ -68,9 +68,9 @@ impl FdbFenceStore {
 
 #[async_trait::async_trait]
 impl FenceStore for FdbFenceStore {
-    async fn read(&self, shard: CellId) -> Result<Option<FenceRow>, FenceError> {
+    async fn read(&self, grid: GridId, shard: CellId) -> Result<Option<FenceRow>, FenceError> {
         let db = Arc::clone(&self.db);
-        let key = keyspace::fence_key(shard);
+        let key = keyspace::fence_key(grid, shard);
         db.run(move |trx, _| async move {
             let raw = trx.get(&key, false).await?;
             match raw {
@@ -89,12 +89,13 @@ impl FenceStore for FdbFenceStore {
 
     async fn fence(
         &self,
+        grid: GridId,
         shard: CellId,
         expected: Option<&FenceRow>,
         new: &FenceRow,
     ) -> Result<FenceOutcome, FenceError> {
         let db = Arc::clone(&self.db);
-        let key = keyspace::fence_key(shard);
+        let key = keyspace::fence_key(grid, shard);
         let expected = expected.copied();
         let new = *new;
         db.run(move |trx, _| async move {
@@ -120,17 +121,18 @@ impl FenceStore for FdbFenceStore {
 
     async fn begin_split(
         &self,
+        grid: GridId,
         parent: CellId,
         parent_expected: &FenceRow,
         children: &[(CellId, FenceRow)],
     ) -> Result<FenceOutcome, FenceError> {
         let db = Arc::clone(&self.db);
-        let parent_key = keyspace::fence_key(parent);
+        let parent_key = keyspace::fence_key(grid, parent);
         let parent_expected = *parent_expected;
         let children: Vec<(Vec<u8>, Vec<u8>)> = children
             .iter()
             .map(|(c, row)| {
-                let key = keyspace::fence_key(*c);
+                let key = keyspace::fence_key(grid, *c);
                 let encoded = encode_row(row).expect("row encodes");
                 (key.to_vec(), encoded)
             })
@@ -166,9 +168,9 @@ impl FenceStore for FdbFenceStore {
         .map_err(|e: foundationdb::FdbBindingError| FenceError::Store(format!("split txn: {e}")))
     }
 
-    async fn retire(&self, shard: CellId) -> Result<(), FenceError> {
+    async fn retire(&self, grid: GridId, shard: CellId) -> Result<(), FenceError> {
         let db = Arc::clone(&self.db);
-        let key = keyspace::fence_key(shard);
+        let key = keyspace::fence_key(grid, shard);
         db.run(move |trx, _| async move {
             trx.clear(&key);
             Ok(())

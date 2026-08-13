@@ -56,11 +56,12 @@ pub async fn run(
     for grid in &grid_ids {
         let live = db
             .run(|trx, _| {
-                let begin = keyspace::fence_key(CellId::ROOT);
+                let begin = keyspace::fence_grid_range_start(*grid);
+                let end = keyspace::fence_grid_range_end(*grid);
                 async move {
                     let opt = foundationdb::RangeOption {
                         begin: foundationdb::KeySelector::first_greater_or_equal(begin.as_slice()),
-                        end: foundationdb::KeySelector::first_greater_or_equal(b"b"),
+                        end: foundationdb::KeySelector::first_greater_or_equal(end.as_slice()),
                         ..foundationdb::RangeOption::default()
                     };
                     let mut stream = trx.get_ranges_keyvalues(opt, false);

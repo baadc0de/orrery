@@ -179,7 +179,7 @@ async fn fence_shard_from_absent_fences_and_spawns_actor() {
     assert!(lsn >= Lsn::new(0, 0));
 
     // The fence row records this node + epoch.
-    let row = rt.fence().read(shard).await.unwrap().unwrap();
+    let row = rt.fence().read(GridId::ROOT, shard).await.unwrap().unwrap();
     assert_eq!(row.owner, 7);
     assert_eq!(row.epoch, Epoch::new(1));
     assert_eq!(row.status, FenceStatus::Active);
@@ -269,7 +269,7 @@ async fn split_partitions_entities_and_retires_parent() {
     rt.fence_shard(shard, None, mem_store().as_ref())
         .await
         .unwrap();
-    let parent_row = rt.fence().read(shard).await.unwrap().unwrap();
+    let parent_row = rt.fence().read(GridId::ROOT, shard).await.unwrap().unwrap();
 
     // Seed entities across the shard's children. Each child is a shard cell at
     // level 19; pick one interest cell inside each child.
@@ -289,9 +289,19 @@ async fn split_partitions_entities_and_retires_parent() {
     }
 
     // Parent row retired; children active.
-    assert!(rt.fence().read(shard).await.unwrap().is_none());
+    assert!(rt
+        .fence()
+        .read(GridId::ROOT, shard)
+        .await
+        .unwrap()
+        .is_none());
     for (child, _) in &child_rows {
-        let row = rt.fence().read(*child).await.unwrap().unwrap();
+        let row = rt
+            .fence()
+            .read(GridId::ROOT, *child)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(row.epoch, Epoch::new(2));
     }
 
@@ -350,7 +360,7 @@ async fn split_after_checkpoint_restore_partitions_correctly() {
         .await
         .unwrap();
     rt.restore(shard, &store).await.unwrap();
-    let parent_row = rt.fence().read(shard).await.unwrap().unwrap();
+    let parent_row = rt.fence().read(GridId::ROOT, shard).await.unwrap().unwrap();
 
     let child_rows = rt.split(shard, &parent_row).await.unwrap();
     assert_eq!(child_rows.len(), 8);
@@ -381,7 +391,7 @@ async fn second_level_split_partitions_correctly() {
     rt.fence_shard(shard, None, mem_store().as_ref())
         .await
         .unwrap();
-    let parent_row = rt.fence().read(shard).await.unwrap().unwrap();
+    let parent_row = rt.fence().read(GridId::ROOT, shard).await.unwrap().unwrap();
 
     // Seed entities in two grandchildren of the same child.
     let child = shard.children()[2];
@@ -399,7 +409,7 @@ async fn second_level_split_partitions_correctly() {
     assert_eq!(child_rows.len(), 8);
 
     // Second split: the child that holds both entities -> grandchildren.
-    let child_row = rt.fence().read(child).await.unwrap().unwrap();
+    let child_row = rt.fence().read(GridId::ROOT, child).await.unwrap().unwrap();
     let grand_rows = rt.split(child, &child_row).await.unwrap();
     assert_eq!(grand_rows.len(), 8);
 
@@ -442,7 +452,12 @@ async fn split_conflicts_on_stale_parent_row() {
     assert!(rt.actor(GridId::ROOT, shard).is_some());
     for child in shard.children() {
         // No child fence row was written.
-        assert!(rt.fence().read(child).await.unwrap().is_none());
+        assert!(rt
+            .fence()
+            .read(GridId::ROOT, child)
+            .await
+            .unwrap()
+            .is_none());
     }
 
     rt.close().await.unwrap();
@@ -460,10 +475,10 @@ async fn fence_outcome_is_exposed() {
         status: FenceStatus::Active,
     };
     assert_eq!(
-        store.fence(shard, None, &row).await.unwrap(),
+        store.fence(GridId::ROOT, shard, None, &row).await.unwrap(),
         FenceOutcome::Fenced
     );
-    let conflict = store.fence(shard, None, &row).await.unwrap();
+    let conflict = store.fence(GridId::ROOT, shard, None, &row).await.unwrap();
     assert!(matches!(conflict, FenceOutcome::Conflict { current } if current == Some(row)));
 }
 
@@ -483,7 +498,7 @@ async fn fdb_fence_cas_roundtrip() {
     // A distinct shard per test avoids parallel collisions on the shared FDB
     // keyspace; retire first so "fence from absent" is idempotent across runs.
     let shard = shard_cell(1, 0, 0);
-    store.retire(shard).await.unwrap();
+    store.retire(GridId::ROOT, shard).await.unwrap();
     let row = FenceRow {
         owner: 1,
         epoch: Epoch::new(3),
@@ -492,19 +507,22 @@ async fn fdb_fence_cas_roundtrip() {
 
     // Fence from absent, read back.
     assert_eq!(
-        store.fence(shard, None, &row).await.unwrap(),
+        store.fence(GridId::ROOT, shard, None, &row).await.unwrap(),
         FenceOutcome::Fenced
     );
-    assert_eq!(store.read(shard).await.unwrap(), Some(row));
+    assert_eq!(store.read(GridId::ROOT, shard).await.unwrap(), Some(row));
 
     // Stale expected (wrong epoch) -> conflict, row unchanged.
     let stale = FenceRow {
         epoch: Epoch::new(2),
         ..row
     };
-    let conflict = store.fence(shard, Some(&stale), &row).await.unwrap();
+    let conflict = store
+        .fence(GridId::ROOT, shard, Some(&stale), &row)
+        .await
+        .unwrap();
     assert!(matches!(conflict, FenceOutcome::Conflict { current } if current == Some(row)));
-    assert_eq!(store.read(shard).await.unwrap(), Some(row));
+    assert_eq!(store.read(GridId::ROOT, shard).await.unwrap(), Some(row));
 
     // Correct expected -> advances to a new epoch.
     let new = FenceRow {
@@ -513,13 +531,16 @@ async fn fdb_fence_cas_roundtrip() {
         status: FenceStatus::Active,
     };
     assert_eq!(
-        store.fence(shard, Some(&row), &new).await.unwrap(),
+        store
+            .fence(GridId::ROOT, shard, Some(&row), &new)
+            .await
+            .unwrap(),
         FenceOutcome::Fenced
     );
-    assert_eq!(store.read(shard).await.unwrap(), Some(new));
+    assert_eq!(store.read(GridId::ROOT, shard).await.unwrap(), Some(new));
 
-    store.retire(shard).await.unwrap();
-    assert_eq!(store.read(shard).await.unwrap(), None);
+    store.retire(GridId::ROOT, shard).await.unwrap();
+    assert_eq!(store.read(GridId::ROOT, shard).await.unwrap(), None);
 }
 
 #[cfg(feature = "fdb")]
@@ -536,11 +557,14 @@ async fn fdb_begin_split_atomic() {
         status: FenceStatus::Active,
     };
     // Retire any prior state so the "from absent" fence is idempotent.
-    store.retire(parent).await.unwrap();
+    store.retire(GridId::ROOT, parent).await.unwrap();
     for c in parent.children() {
-        store.retire(c).await.unwrap();
+        store.retire(GridId::ROOT, c).await.unwrap();
     }
-    store.fence(parent, None, &parent_row).await.unwrap();
+    store
+        .fence(GridId::ROOT, parent, None, &parent_row)
+        .await
+        .unwrap();
 
     let children: Vec<(CellId, FenceRow)> = parent
         .children()
@@ -560,27 +584,30 @@ async fn fdb_begin_split_atomic() {
     // Split writes parent -> Splitting and all 8 child rows in one txn.
     assert_eq!(
         store
-            .begin_split(parent, &parent_row, &children)
+            .begin_split(GridId::ROOT, parent, &parent_row, &children)
             .await
             .unwrap(),
         FenceOutcome::Fenced
     );
-    let parent_after = store.read(parent).await.unwrap().unwrap();
+    let parent_after = store.read(GridId::ROOT, parent).await.unwrap().unwrap();
     assert_eq!(parent_after.status, FenceStatus::Splitting);
     assert_eq!(parent_after.epoch, Epoch::new(1));
     for (child, row) in &children {
-        assert_eq!(store.read(*child).await.unwrap(), Some(*row));
+        assert_eq!(store.read(GridId::ROOT, *child).await.unwrap(), Some(*row));
     }
 
     // Stale parent -> conflict, nothing changes.
-    let conflict = store.begin_split(parent, &parent_row, &[]).await.unwrap();
+    let conflict = store
+        .begin_split(GridId::ROOT, parent, &parent_row, &[])
+        .await
+        .unwrap();
     assert!(
         matches!(conflict, FenceOutcome::Conflict { current } if current == Some(parent_after))
     );
 
-    store.retire(parent).await.unwrap();
+    store.retire(GridId::ROOT, parent).await.unwrap();
     for (child, _) in &children {
-        store.retire(*child).await.unwrap();
+        store.retire(GridId::ROOT, *child).await.unwrap();
     }
 }
 
@@ -597,9 +624,9 @@ async fn fdb_runtime_split_end_to_end() {
     let dir = tempfile::tempdir().unwrap();
     let shard = shard_cell(3, 0, 0);
     // Idempotent across runs: clear any prior row for this shard and its kids.
-    store.retire(shard).await.unwrap();
+    store.retire(GridId::ROOT, shard).await.unwrap();
     for c in shard.children() {
-        store.retire(c).await.unwrap();
+        store.retire(GridId::ROOT, c).await.unwrap();
     }
     let mut rt = CellRuntime::open(
         &runtime_config_dyn_fence(dir.path(), 3, vec![shard], Arc::new(store)),
@@ -610,7 +637,7 @@ async fn fdb_runtime_split_end_to_end() {
     rt.fence_shard(shard, None, mem_store().as_ref())
         .await
         .unwrap();
-    let parent_row = rt.fence().read(shard).await.unwrap().unwrap();
+    let parent_row = rt.fence().read(GridId::ROOT, shard).await.unwrap().unwrap();
 
     let children = shard.children();
     for (i, child) in children.iter().enumerate() {
@@ -620,7 +647,12 @@ async fn fdb_runtime_split_end_to_end() {
 
     let child_rows = rt.split(shard, &parent_row).await.unwrap();
     assert_eq!(child_rows.len(), 8);
-    assert!(rt.fence().read(shard).await.unwrap().is_none());
+    assert!(rt
+        .fence()
+        .read(GridId::ROOT, shard)
+        .await
+        .unwrap()
+        .is_none());
     for (i, child) in children.iter().enumerate() {
         let page = rt.read(GridId::ROOT, *child).await.unwrap();
         assert_eq!(page.entities.len(), 1, "child {child:?}");
