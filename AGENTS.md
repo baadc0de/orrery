@@ -56,3 +56,18 @@ Durable, machine-local agent context lives in
 Check its `INDEX.md` for notes on decisions, project state, environment quirks,
 and open threads. Add or update entries there (dated, one file per topic) rather
 than losing context between sessions. Never store secrets in it.
+
+## Device-local agent protocol (if present)
+
+Some machines carry a local protocol for delegating work to other coding agents.
+It is **not** part of this repository — like `.agents/memory/`, it is git-ignored
+and machine-specific, and most checkouts will not have it.
+
+**If `.agents/protocol.md` exists, read it before delegating any task**; it is
+authoritative for how work is handed off on that machine. It typically defines
+a driver under `.agents/bin/`, a worktree-per-task layout, a document bus for
+briefs and reports, and the rule that a delegated agent's self-reported
+verification is re-run by the orchestrator rather than trusted.
+
+If it is absent, there is nothing to do — do the work directly, and do not
+invent a protocol or create `.agents/` scaffolding to imitate one.
