@@ -11,6 +11,7 @@ members = [
     "crates/orrery_predict",
     "crates/orrery_persist_client",
     "crates/orrery_persistd",
+    "crates/orrery_seed",
 ]
 
 # Pinned versions per D14 (docs/DECISIONS.md), ecosystem as of Aug 2026.

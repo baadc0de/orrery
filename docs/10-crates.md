@@ -114,6 +114,7 @@ Layering rules (the first two are normative from D15; the rest are containment r
 | `orrery_persist_client` | plugin | yes | bevy_replicon 0.42 |
 | `orrery` (facade) | lib | yes | all six client plugins |
 | `orrery_persistd` | lib+bin | **none** | foundationdb-rs 0.11, fjall 3.x, iroh, tokio, tonic |
+| `orrery_seed` | lib+bin | **none** | toml, serde, blake3, rand_chacha 0.9, postcard, foundationdb-rs 0.11 (opt, `fdb` feature) |
 | `orrery_coordinator` | bin | **none** | iroh, tokio, tonic |
 | `orrery_identity` | bin | **none** | iroh, tokio, foundationdb-rs 0.11, argon2 |
 | `orrery_field_host` | bin+lib | **headless** (MinimalPlugins) | bevy 0.19 (no render/winit) |
