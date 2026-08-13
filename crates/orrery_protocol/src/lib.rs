@@ -22,7 +22,10 @@ mod identity;
 mod persist;
 mod protocol;
 
-pub use cell::{CellId, CellRangeError};
+pub use cell::{
+    cell_id_from_metres, metres_from_cell_id, shard_of, CellId, CellRangeError,
+    DEFAULT_CELL_EDGE_M, INTEREST_LEVEL, SHARD_LEVEL,
+};
 pub use coord::{CoordMsg, IslandId, IslandManifest, PeerEntry, TopologyRegime};
 pub use gateway::{AreaPage, DiffUplink, GatewayMsg, GatewayReply};
 pub use grid::GridId;

@@ -4,6 +4,8 @@ use std::ops::RangeInclusive;
 
 use bevy_ecs::prelude::*;
 
+use orrery_protocol::DEFAULT_CELL_EDGE_M;
+
 /// Spatial configuration for the [`OrrerySpatialPlugin`](crate::OrrerySpatialPlugin).
 ///
 /// Defaults are the D16 parameter-table values (docs/DECISIONS.md D16).
@@ -22,7 +24,7 @@ pub struct SpatialConfig {
 impl Default for SpatialConfig {
     fn default() -> Self {
         Self {
-            cell_edge_m: 128.0,
+            cell_edge_m: DEFAULT_CELL_EDGE_M as f32,
             hysteresis_frac: 0.10,
             high_rate_cap: 24,
             proxy_hz: 1.0..=4.0,

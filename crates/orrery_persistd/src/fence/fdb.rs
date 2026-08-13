@@ -20,6 +20,7 @@ use foundationdb::Database;
 use orrery_protocol::CellId;
 
 use crate::fence::{FenceError, FenceOutcome, FenceRow, FenceStatus, FenceStore};
+use crate::keyspace;
 
 /// Boot the FoundationDB network once per process and leak the stop guard.
 ///
@@ -38,16 +39,6 @@ fn fdb_network() -> Result<(), FenceError> {
         std::mem::forget(guard);
     });
     Ok(())
-}
-
-/// Key for the fence row: `actor/{shard_cell_id}`.
-///
-/// `shard_cell_id` is the 8-byte big-endian Morton `CellId` (D11 §6).
-fn fence_key(shard: CellId) -> [u8; 9] {
-    let mut key = [0u8; 9];
-    key[0] = b'a';
-    key[1..9].copy_from_slice(&shard.to_bits().to_be_bytes());
-    key
 }
 
 /// Encode a fence row (postcard, matching the in-memory store's wire format).
@@ -79,7 +70,7 @@ impl FdbFenceStore {
 impl FenceStore for FdbFenceStore {
     async fn read(&self, shard: CellId) -> Result<Option<FenceRow>, FenceError> {
         let db = Arc::clone(&self.db);
-        let key = fence_key(shard);
+        let key = keyspace::fence_key(shard);
         db.run(move |trx, _| async move {
             let raw = trx.get(&key, false).await?;
             match raw {
@@ -103,7 +94,7 @@ impl FenceStore for FdbFenceStore {
         new: &FenceRow,
     ) -> Result<FenceOutcome, FenceError> {
         let db = Arc::clone(&self.db);
-        let key = fence_key(shard);
+        let key = keyspace::fence_key(shard);
         let expected = expected.copied();
         let new = *new;
         db.run(move |trx, _| async move {
@@ -134,12 +125,12 @@ impl FenceStore for FdbFenceStore {
         children: &[(CellId, FenceRow)],
     ) -> Result<FenceOutcome, FenceError> {
         let db = Arc::clone(&self.db);
-        let parent_key = fence_key(parent);
+        let parent_key = keyspace::fence_key(parent);
         let parent_expected = *parent_expected;
         let children: Vec<(Vec<u8>, Vec<u8>)> = children
             .iter()
             .map(|(c, row)| {
-                let key = fence_key(*c);
+                let key = keyspace::fence_key(*c);
                 let encoded = encode_row(row).expect("row encodes");
                 (key.to_vec(), encoded)
             })
@@ -177,7 +168,7 @@ impl FenceStore for FdbFenceStore {
 
     async fn retire(&self, shard: CellId) -> Result<(), FenceError> {
         let db = Arc::clone(&self.db);
-        let key = fence_key(shard);
+        let key = keyspace::fence_key(shard);
         db.run(move |trx, _| async move {
             trx.clear(&key);
             Ok(())

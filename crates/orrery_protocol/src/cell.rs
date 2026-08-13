@@ -29,6 +29,86 @@ use core::ops::RangeInclusive;
 
 use glam::IVec3;
 
+/// The interest level (finest, default) — grid cells with 128 m edge at the
+/// default config. The [`CellId`] encoding supports levels 0..=21; the interest
+/// level is 21.
+///
+/// Moved from `orrery_spatial` (engine-agnostic so the world seeder and
+/// persistence tools can use it without linking Bevy).
+pub const INTEREST_LEVEL: u8 = CellId::MAX_LEVEL;
+
+/// The shard level = interest − 3 (one shard cell = 8×8×8 interest cells, D5).
+///
+/// Moved from `orrery_spatial` for the same reason as [`INTEREST_LEVEL`].
+pub const SHARD_LEVEL: u8 = INTEREST_LEVEL - 3;
+
+/// The default interest-cell edge in metres, 128.0 (D16).
+///
+/// `f64` because the metre conversions must maintain precision up to the
+/// level-21 extent — ±4.3×10¹² m at the solar-grid edge of 4 096 000 m/edge
+/// (docs/12-world-seeding.md §5.1). `f32`'s 24-bit mantissa silently discards
+/// the low bits of coordinates near that range, which the no-clamping rule
+/// must prevent.
+///
+/// Moved from `orrery_spatial::config::SpatialConfig::default().cell_edge_m` so
+/// the world seeder and persistence tools have access to the canonical default
+/// without linking Bevy. The engine-side `SpatialConfig` keeps its `f32` field
+/// (a running client is always near its own origin and never needs the
+/// precision).
+pub const DEFAULT_CELL_EDGE_M: f64 = 128.0;
+
+/// The shard cell containing an interest cell: its level-18 ancestor.
+///
+/// Moved from `orrery_spatial` (engine-agnostic).
+#[must_use]
+pub fn shard_of(cell: CellId) -> CellId {
+    cell.ancestor_at(SHARD_LEVEL)
+}
+
+/// Convert grid-local metres to an interest-level [`CellId`] for a given
+/// `cell_edge_m`.
+///
+/// The conversion is `(m ÷ cell_edge_m).floor()` for each axis, then passed to
+/// [`CellId::from_coords`] at [`INTEREST_LEVEL`].
+///
+/// # Errors
+///
+/// Returns [`CellRangeError`] if any coordinate (in cell units) is outside the
+/// representable range `[−2^(L−1), 2^(L−1))` at [`INTEREST_LEVEL`], naming the
+/// offending value and the grid's half-extent in metres
+/// (`2^20 × cell_edge_m`). Unlike [`clamp_coord`] in `orrery_spatial`, this
+/// never silently clamps — the seeder must know it is out of range (see
+/// docs/12-world-seeding.md §5.1).
+pub fn cell_id_from_metres(
+    metres: glam::DVec3,
+    cell_edge_m: f64,
+) -> Result<CellId, CellRangeError> {
+    let cell_coords = glam::IVec3::new(
+        (metres.x / cell_edge_m).floor() as i32,
+        (metres.y / cell_edge_m).floor() as i32,
+        (metres.z / cell_edge_m).floor() as i32,
+    );
+    CellId::from_coords(cell_coords, INTEREST_LEVEL)
+}
+
+/// Convert an interest-level [`CellId`] back to the **minimum corner** of that
+/// cell in grid-local metres.
+///
+/// Returns the metre-space corner as `cell_coord × cell_edge_m` for each axis.
+/// This is the *min* corner (the lowest metre value in the cell's volume);
+/// the cell's centre is `min_corner + (cell_edge_m / 2, cell_edge_m / 2, cell_edge_m / 2)`.
+///
+/// The conversion uses `f64` for the same precision reason as
+/// [`cell_id_from_metres`].
+pub fn metres_from_cell_id(cell: CellId, cell_edge_m: f64) -> glam::DVec3 {
+    let (coords, _level) = cell.coords();
+    glam::DVec3::new(
+        coords.x as f64 * cell_edge_m,
+        coords.y as f64 * cell_edge_m,
+        coords.z as f64 * cell_edge_m,
+    )
+}
+
 /// Error returned when a cell coordinate or level is out of range.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CellRangeError {
@@ -453,6 +533,183 @@ mod tests {
         assert!(n.contains(&cell));
         for c in n {
             assert_eq!(c.level(), 21);
+        }
+    }
+
+    #[test]
+    fn interest_and_shard_level_constants() {
+        assert_eq!(INTEREST_LEVEL, CellId::MAX_LEVEL);
+        assert_eq!(INTEREST_LEVEL, 21);
+        assert_eq!(SHARD_LEVEL, 18);
+        assert_eq!(INTEREST_LEVEL - SHARD_LEVEL, 3);
+    }
+
+    #[test]
+    fn shard_of_at_interest_level() {
+        let cell = CellId::from_coords(IVec3::new(2, -1, 8), INTEREST_LEVEL).unwrap();
+        let s = shard_of(cell);
+        assert_eq!(s.level(), SHARD_LEVEL);
+        assert!(s.is_prefix_of(cell));
+    }
+
+    #[test]
+    fn default_cell_edge_is_128() {
+        assert_eq!(DEFAULT_CELL_EDGE_M, 128.0);
+    }
+
+    #[test]
+    fn metres_conversion_roundtrip_at_origin() {
+        // The origin cell at (0,0,0) should give metre-space min corner (0,0,0)
+        // and its centre is at (64, 64, 64).
+        let cell = cell_id_from_metres(glam::DVec3::ZERO, DEFAULT_CELL_EDGE_M).unwrap();
+        assert_eq!(cell.coords(), (IVec3::ZERO, INTEREST_LEVEL));
+        let min_corner = metres_from_cell_id(cell, DEFAULT_CELL_EDGE_M);
+        assert_eq!(min_corner, glam::DVec3::ZERO);
+    }
+
+    #[test]
+    fn metres_conversion_known_cell() {
+        // The worked example at (312.7, −45.2, 1024.0) m with 128 m edge
+        // → cell coords (2, -1, 8).
+        let cell = cell_id_from_metres(glam::DVec3::new(312.7, -45.2, 1024.0), DEFAULT_CELL_EDGE_M)
+            .unwrap();
+        assert_eq!(cell.coords(), (IVec3::new(2, -1, 8), INTEREST_LEVEL));
+
+        // Min corner: (2*128, -1*128, 8*128) = (256, -128, 1024).
+        let min_corner = metres_from_cell_id(cell, DEFAULT_CELL_EDGE_M);
+        assert_eq!(min_corner, glam::DVec3::new(256.0, -128.0, 1024.0));
+    }
+
+    #[test]
+    fn metres_conversion_rejects_too_large() {
+        // At level 21, the range is [−2^20, 2^20) per axis = [−1_048_576, 1_048_576).
+        // At 128 m/edge: [−134_217_728, 134_217_728) m.
+        // A value at the far end should produce an error naming the offending
+        // value and the representable extent.
+        let too_far = 150_000_000_f64;
+        let err = cell_id_from_metres(glam::DVec3::new(too_far, 0.0, 0.0), DEFAULT_CELL_EDGE_M)
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                CellRangeError::CoordOutOfRange {
+                    coord: 1_171_875,
+                    level: 21
+                }
+            ),
+            "expected CoordOutOfRange near cell coord 1_171_875, got {err:?}"
+        );
+
+        // Negative side.
+        let err = cell_id_from_metres(glam::DVec3::new(0.0, -too_far, 0.0), DEFAULT_CELL_EDGE_M)
+            .unwrap_err();
+        assert!(
+            matches!(err, CellRangeError::CoordOutOfRange { .. }),
+            "expected CoordOutOfRange for negative value, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn metres_conversion_rejects_negative_extreme() {
+        // Just past the negative bound: -134_217_728 m is exactly at
+        // -1_048_576 cells which is the half-exclusive lower bound.
+        // At 128 m/edge: -134_217_728 / 128 = -1_048_576 which is exclusive.
+        // So -134_217_729 m → cell coord -1_048_577 which is out of range.
+        let negative_extreme = -134_217_729_f64;
+        let err = cell_id_from_metres(
+            glam::DVec3::new(0.0, 0.0, negative_extreme),
+            DEFAULT_CELL_EDGE_M,
+        )
+        .unwrap_err();
+        // cell coord = floor(-1_048_576.0078) = -1_048_577
+        assert!(
+            matches!(
+                err,
+                CellRangeError::CoordOutOfRange {
+                    coord: -1_048_577,
+                    level: 21
+                }
+            ),
+            "expected CoordOutOfRange(-1_048_577), got {err:?}"
+        );
+    }
+
+    #[test]
+    fn metres_conversion_error_naming_convention() {
+        // The error message should name the offending value.
+        let err = cell_id_from_metres(
+            glam::DVec3::new(999_999_999.0, 0.0, 0.0),
+            DEFAULT_CELL_EDGE_M,
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("7812499"),
+            "error message should name the offending cell coord, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn shard_level_is_interest_minus_three() {
+        assert_eq!(SHARD_LEVEL, 18);
+        assert_eq!(INTEREST_LEVEL - SHARD_LEVEL, 3);
+    }
+
+    #[test]
+    fn metres_from_cell_id_is_min_corner() {
+        // Cell at (1, 2, 3) at level 21 with default edge: min corner is
+        // (128, 256, 384).
+        let cell = CellId::from_coords(IVec3::new(1, 2, 3), 21).unwrap();
+        let m = metres_from_cell_id(cell, DEFAULT_CELL_EDGE_M);
+        assert_eq!(m, glam::DVec3::new(128.0, 256.0, 384.0));
+
+        // Centre would be (128+64, 256+64, 384+64) = (192, 320, 448).
+        // Document that we return the min corner.
+        let centre = m + glam::DVec3::splat(DEFAULT_CELL_EDGE_M / 2.0);
+        assert_eq!(centre, glam::DVec3::new(192.0, 320.0, 448.0));
+    }
+
+    #[test]
+    fn metres_reject_at_non_default_edge() {
+        // With a larger cell edge (1 km), the extent is much larger.
+        let cell_edge = 1_024_000_f64; // ~7.18 AU half-extent
+                                       // This should still be in range.
+        let in_range = cell_id_from_metres(glam::DVec3::new(1e11, 0.0, 0.0), cell_edge).unwrap();
+        assert_eq!(in_range.level(), INTEREST_LEVEL);
+
+        // But ~1 AU extra might still be in range with this edge size.
+        // The half-extent is 2^20 * 1_024_000 ≈ 1.07e12 m. 1e11 is fine.
+        // Let's try something well beyond: 2e12 m should exceed it.
+        let out = cell_id_from_metres(glam::DVec3::new(2e12, 0.0, 0.0), cell_edge);
+        assert!(out.is_err(), "2e12 m should exceed even 1 km/edge extent");
+    }
+
+    #[test]
+    fn f64_precision_roundtrips_near_extent() {
+        // At the solar-grid edge (cell_edge_m = 4_096_000, half-extent
+        // = 2^20 * 4_096_000 = 4.3e12 m), an f32 Vec3 would lose the
+        // low bits of the coordinate — the no-clamping failure mode.
+        // With f64 the conversion must round-trip correctly.
+        let solar_edge = 4_096_000_f64;
+        // A metre value near the extent: 4 trillion metres on x, specific
+        // low bits on y and z to test precision.
+        let metres = glam::DVec3::new(4_000_000_000_000.0, 123_456.789, -987_654.321);
+        let cell = cell_id_from_metres(metres, solar_edge).unwrap();
+        let back = metres_from_cell_id(cell, solar_edge);
+        // The round-trip lands on the cell's min corner. The original metre
+        // value might be anywhere inside the cell, but min corner should be
+        // at most one cell edge below the original.
+        for axis in 0..3 {
+            let orig = metres.to_array()[axis];
+            let min_corner = back.to_array()[axis];
+            assert!(
+                min_corner <= orig,
+                "min corner {min_corner} must not exceed original {orig} for axis {axis}"
+            );
+            assert!(
+                orig - min_corner < solar_edge,
+                "original {orig} must be less than one cell edge ({solar_edge}) above min corner {min_corner}"
+            );
         }
     }
 }
