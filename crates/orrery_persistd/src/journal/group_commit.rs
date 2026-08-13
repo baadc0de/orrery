@@ -18,9 +18,9 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use tokio::sync::Notify;
+use tokio::sync::{broadcast, Notify};
 
-use orrery_protocol::Lsn;
+use orrery_protocol::{JournalRecord, Lsn};
 
 use crate::journal::{AppendHandle, JournalError};
 
@@ -64,6 +64,9 @@ impl Default for GroupCommitConfig {
 struct Pending {
     handle: Arc<AppendHandle>,
     bytes: usize,
+    /// The record itself, published to chain-replication subscribers once the
+    /// batch is durably flushed (§4).
+    record: JournalRecord,
 }
 
 /// Shared commit queue between the journal and the committer task.
@@ -106,6 +109,10 @@ pub(crate) struct CommitterState {
     flushing: AtomicBool,
     committed: Mutex<Lsn>,
     flush_count: AtomicUsize,
+    /// Committed records, published for chain replication (§4). Subscribers
+    /// that fall behind rescan the journal from their watermark, so a bounded
+    /// channel here is a lag signal, not a loss.
+    published: broadcast::Sender<JournalRecord>,
 }
 
 impl CommitterState {
@@ -136,10 +143,16 @@ pub(crate) struct CommitterHandle {
 
 impl CommitterHandle {
     /// Submit an append for group commit. The caller awaits [`AppendHandle::committed`].
-    pub(crate) fn submit(&self, handle: Arc<AppendHandle>, payload_bytes: usize) {
+    pub(crate) fn submit(
+        &self,
+        handle: Arc<AppendHandle>,
+        payload_bytes: usize,
+        record: JournalRecord,
+    ) {
         self.state.queue.push(Pending {
             handle,
             bytes: payload_bytes,
+            record,
         });
     }
 
@@ -174,7 +187,12 @@ pub(crate) type FlushFn = Arc<dyn Fn() -> Result<(), JournalError> + Send + Sync
 ///
 /// `flush` must durably persist every payload already inserted into the store.
 /// `flush` runs on a blocking thread so it never blocks the async runtime.
-pub(crate) fn spawn_committer(config: GroupCommitConfig, flush: FlushFn) -> CommitterHandle {
+/// `published` receives each durably-flushed record (for chain replication).
+pub(crate) fn spawn_committer(
+    config: GroupCommitConfig,
+    flush: FlushFn,
+    published: broadcast::Sender<JournalRecord>,
+) -> CommitterHandle {
     let state = Arc::new(CommitterState {
         config,
         queue: CommitQueue::new(),
@@ -184,6 +202,7 @@ pub(crate) fn spawn_committer(config: GroupCommitConfig, flush: FlushFn) -> Comm
         flushing: AtomicBool::new(false),
         committed: Mutex::new(Lsn::new(0, 0)),
         flush_count: AtomicUsize::new(0),
+        published,
     });
 
     let task_state = Arc::clone(&state);
@@ -244,6 +263,9 @@ async fn run_committer(state: Arc<CommitterState>, flush: FlushFn) {
                 state.set_committed(max_lsn);
                 for p in batch {
                     p.handle.resolve(Ok(max_lsn));
+                    // Publish for chain replication. A full channel is a lag
+                    // signal (the subscriber rescans from its watermark).
+                    let _ = state.published.send(p.record);
                 }
             }
             Err(e) => {

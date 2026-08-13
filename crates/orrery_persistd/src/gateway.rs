@@ -34,19 +34,19 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use iroh::{Endpoint, EndpointAddr, RelayMode};
-use tokio::sync::{oneshot, Mutex};
+use tokio::sync::oneshot;
 use tracing::debug;
 
 use orrery_protocol::channels::{
     decode_datagram, decode_stream_frame, encode_datagram, encode_stream_frame, untag, Channel,
 };
 use orrery_protocol::{
-    AreaPage, CellId, DiffUplink, GatewayMsg, GatewayReply, IntentOutcome, JournalRecord, Lsn,
-    NodeId, Tick, PROTOCOL_VERSION,
+    AreaPage, CellId, DiffUplink, Epoch, GatewayMsg, GatewayReply, IntentOutcome, JournalRecord,
+    Lsn, NodeId, Tick, PROTOCOL_VERSION,
 };
 
+use crate::cluster::Router;
 use crate::payload_crc;
-use crate::runtime::CellRuntime;
 
 /// The ALPN the gateway advertises and accepts. Matches the client's
 /// `orrery_persist_client::gateway::GATEWAY_ALPN`.
@@ -105,7 +105,7 @@ impl core::fmt::Display for GatewayError {
 impl core::error::Error for GatewayError {}
 
 /// A running gateway: an iroh endpoint that accepts client sessions and routes
-/// them onto a shared [`CellRuntime`].
+/// them onto a [`Router`] (a single runtime or a multi-node cluster).
 pub struct GatewayServer {
     endpoint: Arc<Endpoint>,
     shutdown: oneshot::Sender<()>,
@@ -114,10 +114,10 @@ pub struct GatewayServer {
 
 impl GatewayServer {
     /// Bind an iroh endpoint from `config` and spawn the accept loop against
-    /// `runtime`.
+    /// `router`.
     pub async fn spawn(
         config: GatewayConfig,
-        runtime: Arc<Mutex<CellRuntime>>,
+        router: Arc<dyn Router>,
     ) -> Result<Self, GatewayError> {
         let mut builder = iroh::endpoint::Builder::new(iroh::endpoint::presets::N0);
         builder = builder
@@ -136,7 +136,7 @@ impl GatewayServer {
         let tick = Arc::new(AtomicU64::new(0));
         let join = tokio::spawn(accept_loop(
             endpoint.clone(),
-            runtime,
+            router,
             gateway,
             protocol,
             tick,
@@ -174,7 +174,7 @@ impl GatewayServer {
 /// until `shutdown` resolves or the endpoint closes.
 async fn accept_loop(
     endpoint: Arc<Endpoint>,
-    runtime: Arc<Mutex<CellRuntime>>,
+    router: Arc<dyn Router>,
     gateway: NodeId,
     protocol: u16,
     tick: Arc<AtomicU64>,
@@ -185,9 +185,9 @@ async fn accept_loop(
             _ = &mut shutdown => break,
             incoming = endpoint.accept() => {
                 let Some(incoming) = incoming else { break };
-                let runtime = Arc::clone(&runtime);
+                let router = Arc::clone(&router);
                 let tick = Arc::clone(&tick);
-                tokio::spawn(handle_connection(incoming, runtime, gateway, protocol, tick));
+                tokio::spawn(handle_connection(incoming, router, gateway, protocol, tick));
             }
         }
     }
@@ -197,7 +197,7 @@ async fn accept_loop(
 /// uni-stream, then read tagged datagrams and route each [`GatewayMsg`].
 async fn handle_connection(
     incoming: iroh::endpoint::Incoming,
-    runtime: Arc<Mutex<CellRuntime>>,
+    router: Arc<dyn Router>,
     gateway: NodeId,
     protocol: u16,
     tick: Arc<AtomicU64>,
@@ -256,8 +256,8 @@ async fn handle_connection(
                 let reply = GatewayReply::HelloAck { gateway, protocol };
                 send(Bytes::from(encode_stream_frame(&reply)));
             }
-            GatewayMsg::Diff { diff } => route_diff(&send, diff, remote, &runtime).await,
-            GatewayMsg::Subscribe { cells } => route_subscribe(&send, cells, &runtime).await,
+            GatewayMsg::Diff { diff } => route_diff(&send, diff, remote, &router).await,
+            GatewayMsg::Subscribe { cells } => route_subscribe(&send, cells, &router).await,
             GatewayMsg::SubmitIntent { intent } => {
                 let t = Tick::new(tick.fetch_add(1, Ordering::Relaxed) + 1);
                 let reply = GatewayReply::IntentAck {
@@ -295,29 +295,26 @@ async fn route_diff(
     send: &(dyn Fn(Bytes) + Send + Sync),
     diff: DiffUplink,
     author: NodeId,
-    runtime: &Arc<Mutex<CellRuntime>>,
+    router: &Arc<dyn Router>,
 ) {
     let entity = diff.entity;
     let tick = diff.tick;
     let crc = payload_crc(&diff.payload);
 
-    let rt = runtime.lock().await;
-    let epoch = rt.epoch();
-    let result = rt
+    let result = router
         .apply(JournalRecord {
             lsn: Lsn::new(0, 0),
             cell: diff.cell,
             grid: diff.grid,
             entity,
             tick,
-            epoch,
+            epoch: Epoch::new(0),
             author,
             kind: diff.kind,
             payload: diff.payload,
             crc,
         })
         .await;
-    drop(rt);
 
     match result {
         Ok(lsn) => {
@@ -346,13 +343,20 @@ async fn route_diff(
 async fn route_subscribe(
     send: &(dyn Fn(Bytes) + Send + Sync),
     cells: Vec<CellId>,
-    runtime: &Arc<Mutex<CellRuntime>>,
+    router: &Arc<dyn Router>,
 ) {
-    let rt = runtime.lock().await;
     let mut frames = Vec::new();
     for cell in cells {
-        let live = rt.actor(cell).is_some();
-        if let Ok(page) = rt.read(cell).await {
+        // Live cells come from actor memory (authoritative, ≥ checkpoint
+        // freshness); cold cells from the durable tier range scan
+        // (docs/08-persistence.md §9).
+        let live = router.has_actor(cell).await;
+        let page = if live {
+            router.read(cell).await.ok()
+        } else {
+            router.read_cold(cell).await.ok().flatten()
+        };
+        if let Some(page) = page {
             let mut entities = Vec::with_capacity(page.entities.len());
             let mut payloads = Vec::with_capacity(page.entities.len());
             for (id, record) in page.entities {
@@ -370,7 +374,6 @@ async fn route_subscribe(
             }));
         }
     }
-    drop(rt);
 
     for frame in frames {
         send(Bytes::from(frame));

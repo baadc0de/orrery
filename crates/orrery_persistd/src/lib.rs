@@ -17,9 +17,8 @@
 //! bulk ack **p99 < 5 ms in-region**. This slice measures the former; the
 //! latter is the latency rig's job later.
 //!
-//! Not in this slice (later P2 slices): FDB checkpoint/restore, chain
-//! replication to a follower, the gateway/iroh/tonic surface, the `Ruleset`-
-//! linked intent validator and adjudication executor.
+//! Later P2 slices: the gateway/iroh/tonic surface, the `Ruleset`-linked
+//! intent validator and adjudication executor.
 
 #![deny(unsafe_code)]
 // `deny`, not `forbid`, so the `fdb`-feature module can allow the one unsafe call in `foundationdb::boot()`.
@@ -27,6 +26,7 @@
 
 pub mod actor;
 pub mod checkpoint;
+pub mod cluster;
 mod crc;
 pub mod fence;
 pub mod gateway;
@@ -35,9 +35,16 @@ pub mod placement;
 pub mod runtime;
 
 pub use actor::{CellActorHandle, CellMsg, EntityRecord, Reject, SnapshotPage};
-pub use checkpoint::{CheckpointData, CheckpointError, CheckpointStore, MemCheckpointStore};
+pub use checkpoint::{
+    spawn_checkpoint_scheduler, CheckpointConfig, CheckpointData, CheckpointError,
+    CheckpointScheduler, CheckpointStore, ColdCellReader, MemCheckpointStore, QuiesceSignal,
+};
+pub use cluster::{Cluster, ColdFallbackRouter, Router};
 pub use fence::{FenceError, FenceOutcome, FenceRow, FenceStatus, FenceStore, MemFenceStore};
 pub use gateway::{GatewayConfig, GatewayError, GatewayServer, GATEWAY_ALPN};
-pub use journal::{AppendHandle, Journal, JournalConfig, JournalError, JournalScan, StoredRecord};
+pub use journal::{
+    spawn_chain, AppendHandle, ChainConfig, ChainReplicator, ChainSink, ChainTransport, Journal,
+    JournalChainSink, JournalConfig, JournalError, JournalScan, MemChainTransport, StoredRecord,
+};
 pub use placement::{RendezvousHasher, RendezvousNode, RendezvousWeight};
 pub use runtime::{payload_crc, CellRuntime, RuntimeConfig};

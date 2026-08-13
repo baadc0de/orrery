@@ -6,12 +6,17 @@
 //! only after an adaptive group fsync (§4, D16: journal commit < 2 ms
 //! server-internal).
 
+pub mod chain;
 pub mod fjall;
 mod group_commit;
 
 use orrery_protocol::JournalRecord;
 use orrery_protocol::Lsn;
 
+pub use chain::{
+    spawn_chain, ChainConfig, ChainReplicator, ChainSink, ChainTransport, JournalChainSink,
+    MemChainTransport,
+};
 pub use fjall::Journal;
 pub use group_commit::{AdaptiveCommitMode, GroupCommitConfig};
 

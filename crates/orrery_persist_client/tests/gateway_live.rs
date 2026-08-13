@@ -15,6 +15,7 @@ use orrery_persist_client::{
     GatewayConfig, GatewaySession, GatewayState, OrreryPersistClientPlugin, PersistClientConfig,
     UplinkScheduler,
 };
+use orrery_persistd::Router;
 use orrery_protocol::{DiffUplink, GridId, PersistId, RecordKind, Tick};
 use tokio::sync::Mutex;
 
@@ -75,10 +76,11 @@ fn client_connects_hellos_and_uplinks_to_real_gateway() {
         rt.block_on(async { orrery_persistd::CellRuntime::open(&runtime_config(dir.path())) })
             .unwrap(),
     ));
+    let router: Arc<dyn Router> = runtime.clone();
     let server = rt
         .block_on(orrery_persistd::GatewayServer::spawn(
             orrery_persistd::GatewayConfig::default(),
-            Arc::clone(&runtime),
+            router,
         ))
         .unwrap();
 

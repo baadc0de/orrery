@@ -5,13 +5,20 @@
 //! **self-skip** when no cluster is reachable — so a bare checkout stays green
 //! and a machine with the dev cluster up exercises the real FDB path.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use orrery_persistd::checkpoint::{CheckpointStore, MemCheckpointStore};
 use orrery_persistd::journal::{AdaptiveCommitMode, GroupCommitConfig};
-use orrery_persistd::{payload_crc, CellRuntime, JournalConfig, RuntimeConfig};
+use orrery_persistd::{
+    payload_crc, spawn_checkpoint_scheduler, CellRuntime, CheckpointConfig, JournalConfig,
+    RuntimeConfig,
+};
 
 use orrery_protocol::{CellId, Epoch, GridId, JournalRecord, Lsn, PersistId, RecordKind, Tick};
+
+#[cfg(feature = "fdb")]
+use orrery_persistd::checkpoint::ColdCellReader;
 
 fn test_node(n: u8) -> orrery_protocol::NodeId {
     let mut seed = [0u8; 32];
@@ -126,6 +133,64 @@ async fn restore_with_no_checkpoint_replays_all() {
     rt2.close().await.unwrap();
 }
 
+#[tokio::test]
+async fn scheduler_checkpoints_on_cadence_and_quiesce() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(MemCheckpointStore::new());
+    let runtime = Arc::new(tokio::sync::Mutex::new(
+        CellRuntime::open(&runtime_config(dir.path())).unwrap(),
+    ));
+
+    // Write an entity so there is something to checkpoint.
+    {
+        let rt = runtime.lock().await;
+        let rec = mk_record(CellId::ROOT, 1, RecordKind::Spawn, b"hp=100");
+        rt.apply(rec).await.unwrap();
+    }
+
+    // A fast cadence so the test is not slow.
+    let scheduler = spawn_checkpoint_scheduler(
+        Arc::clone(&runtime),
+        store.clone(),
+        &CheckpointConfig {
+            interval: Duration::from_millis(50),
+            jitter: Duration::from_millis(10),
+        },
+    );
+
+    // Quiesce-flush: an immediate checkpoint on demand.
+    scheduler.quiesce_signal().quiesce(CellId::ROOT).await;
+
+    // Wait for the cadence timer to fire a checkpoint too.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if store.load(CellId::ROOT).await.unwrap().is_some() {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "scheduler never checkpointed"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    // The checkpoint reflects the entity.
+    let ckpt = store.load(CellId::ROOT).await.unwrap().unwrap();
+    assert_eq!(ckpt.entities.len(), 1);
+    assert_eq!(
+        ckpt.entities[&PersistId::new(1)].components.as_ref(),
+        b"hp=100"
+    );
+
+    scheduler.shutdown().await;
+    // After shutdown the scheduler no longer holds the runtime Arc; take it
+    // back so we can close the journal cleanly.
+    let rt = Arc::try_unwrap(runtime)
+        .unwrap_or_else(|_| panic!("scheduler released the runtime"))
+        .into_inner();
+    rt.close().await.unwrap();
+}
+
 /// The cluster file for the FDB-gated tests, or `None` if not configured.
 ///
 /// Honors `ORRERY_FDB_CLUSTER_FILE`; otherwise walks up from the crate dir to
@@ -199,4 +264,46 @@ async fn fdb_checkpoint_then_restore() {
     let page = rt2.read(CellId::ROOT).await.unwrap();
     assert_eq!(page.entities.len(), 40);
     rt2.close().await.unwrap();
+}
+
+#[cfg(feature = "fdb")]
+#[tokio::test]
+async fn fdb_cold_cell_area_load() {
+    // Cold-cell area load (gap #4): a cell with no live actor is served by an
+    // FDB range scan over `world/{cell_id}/…`, not from actor memory. The
+    // checkpoint writes the entity rows; `read_cold` reads them back.
+    let Some(cluster) = fdb_cluster_file() else {
+        eprintln!("skipping: ORRERY_FDB_CLUSTER_FILE not set and no .fdb-dev/fdb.cluster");
+        return;
+    };
+    let store = orrery_persistd::checkpoint::FdbCheckpointStore::connect(&cluster).unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    let rt = CellRuntime::open(&runtime_config(dir.path())).unwrap();
+    for i in 0..20u64 {
+        let rec = mk_record(CellId::ROOT, i, RecordKind::Spawn, &i.to_le_bytes());
+        rt.apply(rec).await.unwrap();
+    }
+    // Checkpoint writes `world/{cell_id}/{entity_id}` rows for the entities.
+    rt.checkpoint(&store).await.unwrap();
+    rt.close().await.unwrap();
+
+    // Read the cold cell back from FDB (no live actor involved).
+    let cold = store
+        .read_cold(CellId::ROOT)
+        .await
+        .unwrap()
+        .expect("cold cell has rows");
+    assert_eq!(
+        cold.entities.len(),
+        20,
+        "cold scan returned all 20 entities"
+    );
+    for i in 0..20u64 {
+        let e = &cold.entities[&PersistId::new(i)];
+        assert_eq!(e.components.as_ref(), &i.to_le_bytes());
+    }
+
+    store.delete(CellId::ROOT).await.unwrap();
+    assert!(store.read_cold(CellId::ROOT).await.unwrap().is_none());
 }

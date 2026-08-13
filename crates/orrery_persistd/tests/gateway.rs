@@ -15,7 +15,7 @@ use bytes::Bytes;
 use iroh::RelayMode;
 use orrery_persistd::journal::{AdaptiveCommitMode, GroupCommitConfig};
 use orrery_persistd::{
-    CellRuntime, GatewayConfig, GatewayServer, JournalConfig, MemFenceStore, RuntimeConfig,
+    CellRuntime, GatewayConfig, GatewayServer, JournalConfig, MemFenceStore, Router, RuntimeConfig,
     GATEWAY_ALPN,
 };
 use orrery_protocol::channels::{
@@ -82,7 +82,10 @@ fn gateway_closes_the_client_to_actor_path() {
             CellRuntime::open(&runtime_config(dir.path())).unwrap(),
         ));
 
-        let server = GatewayServer::spawn(GatewayConfig::default(), Arc::clone(&runtime))
+        // Coerce the single-node runtime into the routing surface the gateway
+        // uses. `Mutex<CellRuntime>` implements `Router`.
+        let router: Arc<dyn Router> = runtime.clone();
+        let server = GatewayServer::spawn(GatewayConfig::default(), router)
             .await
             .unwrap();
         let server_addr = server.addr();

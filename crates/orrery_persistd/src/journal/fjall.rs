@@ -17,12 +17,18 @@
 use std::sync::Arc;
 
 use fjall::{Database, Keyspace, PersistMode};
+use tokio::sync::broadcast;
 
 use orrery_protocol::JournalRecord;
 use orrery_protocol::Lsn;
 
 use crate::journal::group_commit::{spawn_committer, CommitterHandle};
 use crate::journal::{AppendHandle, JournalConfig, JournalError, JournalScan, StoredRecord};
+
+/// The number of committed records buffered for chain-replication subscribers
+/// before the channel reports lag. Subscribers that fall behind rescan the
+/// journal from their watermark, so this bounds memory, not correctness.
+const PUBLISH_CAPACITY: usize = 4096;
 
 /// The fjall keyspace holding LSN-keyed journal records.
 const RECORDS_KS: &str = "records";
@@ -38,6 +44,8 @@ pub struct Journal {
     segment_size: u64,
     committer: CommitterHandle,
     closed: std::sync::atomic::AtomicBool,
+    /// Committed records, published for chain replication (§4).
+    published: broadcast::Sender<JournalRecord>,
 }
 
 impl Journal {
@@ -67,7 +75,8 @@ impl Journal {
             }
         });
 
-        let committer = spawn_committer(config.commit.clone(), db_flush);
+        let (published, _) = broadcast::channel(PUBLISH_CAPACITY);
+        let committer = spawn_committer(config.commit.clone(), db_flush, published.clone());
 
         Ok(Self {
             db,
@@ -76,6 +85,7 @@ impl Journal {
             segment_size: 128 * 1024 * 1024,
             committer,
             closed: std::sync::atomic::AtomicBool::new(false),
+            published,
         })
     }
 
@@ -108,7 +118,7 @@ impl Journal {
             .map_err(|e| JournalError::Store(format!("insert record: {e}")))?;
 
         let handle = Arc::new(AppendHandle::new(lsn));
-        self.committer.submit(handle.clone(), payload_bytes);
+        self.committer.submit(handle.clone(), payload_bytes, record);
         Ok(handle)
     }
 
@@ -121,6 +131,15 @@ impl Journal {
     #[cfg(test)]
     pub fn flush_count(&self) -> usize {
         self.committer.flush_count()
+    }
+
+    /// Subscribe to durably-flushed records, for chain replication (§4).
+    ///
+    /// The receiver yields each committed record in LSN order. If the receiver
+    /// falls behind the bounded channel, it is notified of the gap and must
+    /// rescan the journal from its watermark (see [`Journal::scan_from`]).
+    pub fn subscribe(&self) -> broadcast::Receiver<JournalRecord> {
+        self.published.subscribe()
     }
 
     /// Scan records with `lsn >= from` in LSN order.

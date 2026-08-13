@@ -55,7 +55,7 @@ bevy_replicon = { path = "vendor/bevy_replicon", version = "0.42.1" }
 big_space = { git = "https://github.com/aevyrie/big_space", branch = "bevy-0.19" }
 
 # Async / utility
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "signal"] }
 bytes = "1"
 clap = { version = "4", features = ["derive"] }
 futures = "0.3"

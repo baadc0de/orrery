@@ -15,13 +15,19 @@ use std::sync::Mutex;
 
 use orrery_protocol::{CellId, Epoch, Lsn, PersistId};
 
-use crate::actor::EntityRecord;
+use crate::actor::{EntityRecord, SnapshotPage};
 
 #[cfg(feature = "fdb")]
 pub mod fdb;
 
 #[cfg(feature = "fdb")]
 pub use fdb::FdbCheckpointStore;
+
+mod scheduler;
+
+pub use scheduler::{
+    spawn_checkpoint_scheduler, CheckpointConfig, CheckpointScheduler, QuiesceSignal,
+};
 
 /// The durable payload of one shard cell's checkpoint (§8, `ckpt/{shard}` row).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -55,6 +61,17 @@ pub trait CheckpointStore: Send + Sync {
 
     /// Delete the checkpoint for `shard`.
     async fn delete(&self, shard: CellId) -> Result<(), CheckpointError>;
+}
+
+/// A durable cold-cell reader: serves a cell's entities from the durable tier
+/// (an FDB range scan over `world/{cell_id}/…`), used by area load for cells no
+/// live actor holds (docs/08-persistence.md §9).
+#[async_trait::async_trait]
+pub trait ColdCellReader: Send + Sync {
+    /// Read every entity row in `cell`'s subtree from the durable tier.
+    ///
+    /// Returns `None` when there is no cold store or the cell has no rows.
+    async fn read_cold(&self, cell: CellId) -> Result<Option<SnapshotPage>, CheckpointError>;
 }
 
 /// Errors from a [`CheckpointStore`].

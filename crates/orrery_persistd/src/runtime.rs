@@ -109,6 +109,11 @@ impl CellRuntime {
         self.epoch
     }
 
+    /// The shard cells this runtime hosts.
+    pub fn shards(&self) -> impl Iterator<Item = &CellId> {
+        self.actors.keys()
+    }
+
     /// The fence store backing `actor/{shard}` rows.
     pub fn fence(&self) -> &std::sync::Arc<dyn FenceStore> {
         &self.fence
@@ -261,26 +266,42 @@ impl CellRuntime {
         &self,
         store: &dyn CheckpointStore,
     ) -> Result<(), crate::checkpoint::CheckpointError> {
+        for shard in self.actors.keys().copied().collect::<Vec<_>>() {
+            self.checkpoint_shard(shard, store).await?;
+        }
+        Ok(())
+    }
+
+    /// Write a checkpoint of the actor owning `shard` to `store` (§8).
+    ///
+    /// Used by the checkpoint scheduler's per-shard jittered cadence and by
+    /// quiesce-flush. Copy-on-update: the snapshot is cloned inside the actor's
+    /// mailbox, so it does not block concurrent appends.
+    pub async fn checkpoint_shard(
+        &self,
+        shard: CellId,
+        store: &dyn CheckpointStore,
+    ) -> Result<(), crate::checkpoint::CheckpointError> {
+        let handle = self.actor(shard).ok_or_else(|| {
+            crate::checkpoint::CheckpointError::Store(format!("no actor for shard {shard}"))
+        })?;
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
-        for handle in self.actors.values() {
-            let snap = handle
-                .checkpoint_snapshot()
-                .await
-                .map_err(|_| crate::checkpoint::CheckpointError::Store("actor gone".into()))?;
-            let data = CheckpointData {
-                shard: snap.shard,
-                epoch: snap.epoch,
-                watermark: snap.ckpt_watermark,
-                entities: snap.entities,
-                by_cell: snap.by_cell,
-                taken_at_ms: now,
-            };
-            store.checkpoint(&data).await?;
-        }
-        Ok(())
+        let snap = handle
+            .checkpoint_snapshot()
+            .await
+            .map_err(|_| crate::checkpoint::CheckpointError::Store("actor gone".into()))?;
+        let data = CheckpointData {
+            shard: snap.shard,
+            epoch: snap.epoch,
+            watermark: snap.ckpt_watermark,
+            entities: snap.entities,
+            by_cell: snap.by_cell,
+            taken_at_ms: now,
+        };
+        store.checkpoint(&data).await
     }
 
     /// Restore an actor's state from `store`, then replay the journal tail.

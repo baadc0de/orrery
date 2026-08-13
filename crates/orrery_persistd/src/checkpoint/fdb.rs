@@ -11,13 +11,16 @@
 //! It needs a **live cluster** to actually run; tests that use it self-skip when
 //! no cluster is reachable.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
-use foundationdb::Database;
+use foundationdb::{Database, KeySelector, RangeOption};
+use futures::TryStreamExt;
 
 use orrery_protocol::{CellId, PersistId};
 
-use crate::checkpoint::{CheckpointData, CheckpointError, CheckpointStore};
+use crate::actor::{EntityRecord, SnapshotPage};
+use crate::checkpoint::{CheckpointData, CheckpointError, CheckpointStore, ColdCellReader};
 
 /// Boot the FoundationDB network once per process and leak the stop guard.
 ///
@@ -64,6 +67,19 @@ fn world_range_start(shard: CellId) -> [u8; 9] {
     let mut key = [0u8; 9];
     key[0] = b'w';
     key[1..9].copy_from_slice(&shard.to_bits().to_be_bytes());
+    key
+}
+
+/// The exclusive end of the `world/{cell_id}/…` range for a shard.
+///
+/// `world/{cell_id}` rows are keyed by the 8-byte cell then the 8-byte entity,
+/// so the subtree is the contiguous span from `w + cell + 0` to `w + (cell+1)`.
+/// The cell id is a `NonZeroU64`; adding one to the raw bits advances past the
+/// whole subtree (the sentinel bit guarantees no carry into the prefix).
+fn world_range_end(shard: CellId) -> [u8; 9] {
+    let mut key = [0u8; 9];
+    key[0] = b'w';
+    key[1..9].copy_from_slice(&shard.to_bits().wrapping_add(1).to_be_bytes());
     key
 }
 
@@ -141,18 +157,53 @@ impl CheckpointStore for FdbCheckpointStore {
             trx.clear(&ckpt_key(shard));
             // Also clear the entity rows for this shard's subtree.
             let start = world_range_start(shard);
-            let end = {
-                let mut k = start;
-                // Exclusive end: one past the 9-byte prefix.
-                k[8] = k[8].wrapping_add(1);
-                k
-            };
+            let end = world_range_end(shard);
             trx.clear_range(&start, &end);
             Ok(())
         })
         .await
         .map_err(|e: foundationdb::FdbBindingError| {
             CheckpointError::Store(format!("delete txn: {e}"))
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl ColdCellReader for FdbCheckpointStore {
+    async fn read_cold(&self, cell: CellId) -> Result<Option<SnapshotPage>, CheckpointError> {
+        let db = Arc::clone(&self.db);
+        db.run(|trx, _| async move {
+            let start = world_range_start(cell);
+            let end = world_range_end(cell);
+            let opt = RangeOption {
+                begin: KeySelector::first_greater_or_equal(start.as_ref()),
+                end: KeySelector::first_greater_or_equal(end.as_ref()),
+                ..RangeOption::default()
+            };
+            let mut entities = HashMap::new();
+            let mut stream = trx.get_ranges_keyvalues(opt, false);
+            while let Some(kv) = stream.try_next().await? {
+                // Key: w + cell(8) + entity(8). The entity id is the last 8 bytes.
+                let raw = kv.key();
+                if raw.len() != 17 {
+                    continue;
+                }
+                let mut ent = [0u8; 8];
+                ent.copy_from_slice(&raw[9..17]);
+                let entity = PersistId::new(u64::from_be_bytes(ent));
+                entities.insert(
+                    entity,
+                    EntityRecord {
+                        components: bytes::Bytes::copy_from_slice(kv.value()),
+                        dirty: false,
+                    },
+                );
+            }
+            Ok(Some(SnapshotPage { entities }))
+        })
+        .await
+        .map_err(|e: foundationdb::FdbBindingError| {
+            CheckpointError::Store(format!("cold read txn: {e}"))
         })
     }
 }

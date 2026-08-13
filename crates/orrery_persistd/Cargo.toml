@@ -18,7 +18,9 @@ default = ["journal-fjall"]
 journal-fjall = ["dep:fjall"]
 journal-raw = []
 # Chain replication of the journal to one async follower (D11, RPO ≤ ~100 ms).
-# Declared but not implemented in slice 2 — see crate docs.
+# Implemented in `journal::chain`; this feature is a placeholder for future
+# transport options (tonic/gRPC per D12). The in-process transport is always
+# available.
 chain-replication = []
 # FoundationDB checkpoint/restore store (slice 3). Enables `FdbCheckpointStore`
 # and links the C client (`libfdb_c`). Tests that need a live cluster are
@@ -34,6 +36,10 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 iroh = { workspace = true }
 async-trait = "0.1"
+clap = { workspace = true }
+anyhow = { workspace = true }
+tracing-subscriber = { workspace = true }
+futures = { workspace = true }
 fjall = { version = "3.1", features = ["bytes_1"], optional = true }
 # FoundationDB 7.3.x system-of-record (D11, D14). Optional: only built when the
 # `fdb` feature is on (requires the C client at link time).
