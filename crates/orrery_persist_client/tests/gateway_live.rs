@@ -22,6 +22,7 @@ use tokio::sync::Mutex;
 fn runtime_config(dir: &std::path::Path) -> orrery_persistd::RuntimeConfig {
     orrery_persistd::RuntimeConfig {
         shards: vec![orrery_protocol::CellId::ROOT],
+        grid: GridId::ROOT,
         journal: orrery_persistd::JournalConfig {
             dir: dir.to_path_buf(),
             commit: orrery_persistd::journal::GroupCommitConfig {

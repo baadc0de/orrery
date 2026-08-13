@@ -42,9 +42,21 @@ fn mk_record(cell: CellId, entity: u64, kind: RecordKind, payload: &[u8]) -> Jou
 }
 
 fn runtime_config(dir: &std::path::Path) -> RuntimeConfig {
+    runtime_config_in(dir, GridId::ROOT)
+}
+
+/// A runtime pinned to `grid`.
+///
+/// The fdb-gated tests below share one real database, and after P-3 a
+/// `read_cold`/`delete` on `CellId::ROOT` covers that grid's whole subtree —
+/// so tests keyed to the root cell in the root grid see each other's rows and
+/// fail depending on order and `--test-threads`. P-7 made `GridId` a keyspace
+/// discriminator, so each fdb test gets its own grid and they are disjoint by
+/// construction.
+fn runtime_config_in(dir: &std::path::Path, grid: GridId) -> RuntimeConfig {
     RuntimeConfig {
         shards: vec![CellId::ROOT],
-        grid: GridId::ROOT,
+        grid,
         journal: JournalConfig {
             dir: dir.to_path_buf(),
             commit: GroupCommitConfig {
@@ -295,21 +307,21 @@ async fn fdb_checkpoint_roundtrip() {
     let store = orrery_persistd::checkpoint::FdbCheckpointStore::connect(&cluster).unwrap();
 
     let dir = tempfile::tempdir().unwrap();
-    let rt = CellRuntime::open(&runtime_config(dir.path())).unwrap();
+    let rt = CellRuntime::open(&runtime_config_in(dir.path(), GridId::new(9001))).unwrap();
     for i in 0..10u64 {
         let rec = mk_record(CellId::ROOT, i, RecordKind::Spawn, &i.to_le_bytes());
         rt.apply(rec).await.unwrap();
     }
     rt.checkpoint(&store).await.unwrap();
     let ckpt = store
-        .load(CellId::ROOT, GridId::ROOT)
+        .load(CellId::ROOT, GridId::new(9001))
         .await
         .unwrap()
         .unwrap();
     assert_eq!(ckpt.entities.len(), 10);
-    store.delete(CellId::ROOT, GridId::ROOT).await.unwrap();
+    store.delete(CellId::ROOT, GridId::new(9001)).await.unwrap();
     assert!(store
-        .load(CellId::ROOT, GridId::ROOT)
+        .load(CellId::ROOT, GridId::new(9001))
         .await
         .unwrap()
         .is_none());
@@ -326,7 +338,7 @@ async fn fdb_checkpoint_then_restore() {
     let store = orrery_persistd::checkpoint::FdbCheckpointStore::connect(&cluster).unwrap();
 
     let dir = tempfile::tempdir().unwrap();
-    let rt = CellRuntime::open(&runtime_config(dir.path())).unwrap();
+    let rt = CellRuntime::open(&runtime_config_in(dir.path(), GridId::new(9002))).unwrap();
     for i in 0..30u64 {
         let rec = mk_record(CellId::ROOT, i, RecordKind::Spawn, &i.to_le_bytes());
         rt.apply(rec).await.unwrap();
@@ -338,7 +350,7 @@ async fn fdb_checkpoint_then_restore() {
     }
     rt.close().await.unwrap();
 
-    let rt2 = CellRuntime::open(&runtime_config(dir.path())).unwrap();
+    let rt2 = CellRuntime::open(&runtime_config_in(dir.path(), GridId::new(9002))).unwrap();
     let replayed = rt2.restore(CellId::ROOT, &store).await.unwrap();
     assert!(replayed >= 10, "replayed {replayed} tail records");
     let page = rt2.read(CellId::ROOT).await.unwrap();
@@ -359,7 +371,7 @@ async fn fdb_cold_cell_area_load() {
     let store = orrery_persistd::checkpoint::FdbCheckpointStore::connect(&cluster).unwrap();
 
     let dir = tempfile::tempdir().unwrap();
-    let rt = CellRuntime::open(&runtime_config(dir.path())).unwrap();
+    let rt = CellRuntime::open(&runtime_config_in(dir.path(), GridId::new(9003))).unwrap();
     for i in 0..20u64 {
         let rec = mk_record(CellId::ROOT, i, RecordKind::Spawn, &i.to_le_bytes());
         rt.apply(rec).await.unwrap();
@@ -370,7 +382,7 @@ async fn fdb_cold_cell_area_load() {
 
     // Read the cold cell back from FDB (no live actor involved).
     let cold = store
-        .read_cold(GridId::ROOT, CellId::ROOT)
+        .read_cold(GridId::new(9003), CellId::ROOT)
         .await
         .unwrap()
         .expect("cold cell has rows");
@@ -384,9 +396,9 @@ async fn fdb_cold_cell_area_load() {
         assert_eq!(e.components.as_ref(), &i.to_le_bytes());
     }
 
-    store.delete(CellId::ROOT, GridId::ROOT).await.unwrap();
+    store.delete(CellId::ROOT, GridId::new(9003)).await.unwrap();
     assert!(store
-        .read_cold(GridId::ROOT, CellId::ROOT)
+        .read_cold(GridId::new(9003), CellId::ROOT)
         .await
         .unwrap()
         .is_none());
@@ -440,7 +452,7 @@ async fn fdb_subtree_keying_and_watermark_only_checkpoint() {
     ]);
     let data = CheckpointData {
         shard,
-        grid: GridId::ROOT,
+        grid: GridId::new(9004),
         node_id: 11,
         epoch: Epoch::new(5),
         watermark: Lsn::new(2, 4096),
@@ -454,7 +466,7 @@ async fn fdb_subtree_keying_and_watermark_only_checkpoint() {
 
     // P-8: load rebuilds the bag from rows; the watermark fields round-trip.
     let loaded = store
-        .load(shard, GridId::ROOT)
+        .load(shard, GridId::new(9004))
         .await
         .unwrap()
         .expect("checkpoint present");
@@ -472,7 +484,7 @@ async fn fdb_subtree_keying_and_watermark_only_checkpoint() {
 
     // P-2: a cold read of one interest cell returns exactly that cell's rows.
     let page_c1 = store
-        .read_cold(GridId::ROOT, c1)
+        .read_cold(GridId::new(9004), c1)
         .await
         .unwrap()
         .expect("c1 has rows");
@@ -484,31 +496,31 @@ async fn fdb_subtree_keying_and_watermark_only_checkpoint() {
 
     // P-3: reading the shard serves the whole subtree, spanning both cells.
     let page_shard = store
-        .read_cold(GridId::ROOT, shard)
+        .read_cold(GridId::new(9004), shard)
         .await
         .unwrap()
         .expect("shard subtree has rows");
     assert_eq!(page_shard.entities.len(), 2);
 
     // P-3: delete clears the shard's subtree but not the foreign row.
-    store.delete(shard, GridId::ROOT).await.unwrap();
-    assert!(store.load(shard, GridId::ROOT).await.unwrap().is_none());
+    store.delete(shard, GridId::new(9004)).await.unwrap();
+    assert!(store.load(shard, GridId::new(9004)).await.unwrap().is_none());
     assert!(store
-        .read_cold(GridId::ROOT, shard)
+        .read_cold(GridId::new(9004), shard)
         .await
         .unwrap()
         .is_none());
     let foreign_page = store
-        .read_cold(GridId::ROOT, foreign)
+        .read_cold(GridId::new(9004), foreign)
         .await
         .unwrap()
         .expect("foreign row survives shard delete");
     assert_eq!(foreign_page.entities.len(), 1);
     assert!(foreign_page.entities.contains_key(&PersistId::new(3)));
 
-    store.delete(foreign, GridId::ROOT).await.unwrap();
+    store.delete(foreign, GridId::new(9004)).await.unwrap();
     assert!(store
-        .read_cold(GridId::ROOT, foreign)
+        .read_cold(GridId::new(9004), foreign)
         .await
         .unwrap()
         .is_none());
@@ -547,7 +559,7 @@ async fn fdb_tombstones_write_gc_and_isolate_grids() {
     // P-6: a live entity plus an unexpired and an expired tombstone.
     let data = CheckpointData {
         shard,
-        grid: GridId::ROOT,
+        grid: GridId::new(9005),
         node_id: 1,
         epoch: Epoch::new(1),
         watermark: Lsn::new(2, 4096),
@@ -563,7 +575,7 @@ async fn fdb_tombstones_write_gc_and_isolate_grids() {
 
     // The cold scan serves only the live entity; neither tombstone leaks.
     let page = store
-        .read_cold(GridId::ROOT, cell)
+        .read_cold(GridId::new(9005), cell)
         .await
         .unwrap()
         .expect("live row present");
@@ -575,7 +587,7 @@ async fn fdb_tombstones_write_gc_and_isolate_grids() {
 
     // load rebuilds the tombstone set (the expired row was GC'd by the pass).
     let loaded = store
-        .load(shard, GridId::ROOT)
+        .load(shard, GridId::new(9005))
         .await
         .unwrap()
         .expect("checkpoint present");
@@ -595,7 +607,7 @@ async fn fdb_tombstones_write_gc_and_isolate_grids() {
 
     // P-7: the identical (cell, entity) in another grid is a separate row, and
     // deleting grid 0's shard leaves grid 2's row untouched.
-    let g2 = GridId::new(2);
+    let g2 = GridId::new(9006);
     let data2 = CheckpointData {
         shard,
         grid: g2,
@@ -615,8 +627,8 @@ async fn fdb_tombstones_write_gc_and_isolate_grids() {
         .expect("grid 2 row");
     assert!(page2.entities.contains_key(&PersistId::new(3)));
 
-    store.delete(shard, GridId::ROOT).await.unwrap();
-    assert!(store.load(shard, GridId::ROOT).await.unwrap().is_none());
+    store.delete(shard, GridId::new(9005)).await.unwrap();
+    assert!(store.load(shard, GridId::new(9005)).await.unwrap().is_none());
     let page2_after = store
         .read_cold(g2, cell)
         .await
@@ -640,12 +652,12 @@ async fn fdb_tombstone_end_to_end_lifecycle() {
     let store = orrery_persistd::checkpoint::FdbCheckpointStore::connect(&cluster).unwrap();
 
     let dir = tempfile::tempdir().unwrap();
-    let rt = CellRuntime::open(&runtime_config(dir.path())).unwrap();
+    let rt = CellRuntime::open(&runtime_config_in(dir.path(), GridId::new(9007))).unwrap();
     for i in 0..6u64 {
         let rec = mk_record(CellId::ROOT, i, RecordKind::Spawn, &i.to_le_bytes());
         rt.apply(rec).await.unwrap();
     }
-    store.delete(CellId::ROOT, GridId::ROOT).await.unwrap();
+    store.delete(CellId::ROOT, GridId::new(9007)).await.unwrap();
     rt.checkpoint_shard(CellId::ROOT, &store).await.unwrap();
     for i in 0..3u64 {
         let rec = mk_record(CellId::ROOT, i, RecordKind::Despawn, b"");
@@ -654,7 +666,7 @@ async fn fdb_tombstone_end_to_end_lifecycle() {
     rt.checkpoint_shard(CellId::ROOT, &store).await.unwrap();
 
     let ckpt = store
-        .load(CellId::ROOT, GridId::ROOT)
+        .load(CellId::ROOT, GridId::new(9007))
         .await
         .unwrap()
         .expect("checkpoint present");
@@ -668,7 +680,7 @@ async fn fdb_tombstone_end_to_end_lifecycle() {
 
     // Restore: the actor comes back with three live entities and three
     // markers, and a cold read serves only the live ones (no resurrection).
-    let rt2 = CellRuntime::open(&runtime_config(dir.path())).unwrap();
+    let rt2 = CellRuntime::open(&runtime_config_in(dir.path(), GridId::new(9007))).unwrap();
     rt2.restore(CellId::ROOT, &store).await.unwrap();
     let page = rt2.read(CellId::ROOT).await.unwrap();
     assert_eq!(page.entities.len(), 3);
@@ -681,12 +693,12 @@ async fn fdb_tombstone_end_to_end_lifecycle() {
     let snap = rt2.actor_snapshot(CellId::ROOT).await.unwrap();
     assert_eq!(snap.tombstones.len(), 3);
     let cold = store
-        .read_cold(GridId::ROOT, CellId::ROOT)
+        .read_cold(GridId::new(9007), CellId::ROOT)
         .await
         .unwrap()
         .expect("live rows present");
     assert_eq!(cold.entities.len(), 3, "cold scan skips tombstone rows");
     rt2.close().await.unwrap();
 
-    store.delete(CellId::ROOT, GridId::ROOT).await.unwrap();
+    store.delete(CellId::ROOT, GridId::new(9007)).await.unwrap();
 }
