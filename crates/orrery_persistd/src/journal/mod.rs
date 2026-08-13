@@ -46,37 +46,67 @@ impl Default for JournalConfig {
 #[derive(Debug)]
 pub struct AppendHandle {
     lsn: Lsn,
-    /// Resolved by the committer after flush. `Err` means the write never
-    /// became durable (e.g. the journal is shutting down).
-    done: std::sync::Arc<tokio::sync::Notify>,
+    /// Completion state, shared with the committer: `Some(result)` once the
+    /// record's batch is durably flushed (`Err` means the write never became
+    /// durable, e.g. the journal is shutting down).
+    state: std::sync::Arc<AppendHandleState>,
+}
+
+#[derive(Debug)]
+struct AppendHandleState {
+    /// Set by the committer's `resolve`, read by `committed`.
     result: std::sync::Mutex<Option<Result<Lsn, JournalError>>>,
+    /// Wakes the waiter. `notify_one` (not `notify_waiters`) stores a permit
+    /// when no waiter is registered, so a resolve that lands before the
+    /// waiter suspends is never lost.
+    done: tokio::sync::Notify,
 }
 
 impl AppendHandle {
     pub(crate) fn new(lsn: Lsn) -> Self {
         Self {
             lsn,
-            done: std::sync::Arc::new(tokio::sync::Notify::new()),
-            result: std::sync::Mutex::new(None),
+            state: std::sync::Arc::new(AppendHandleState {
+                result: std::sync::Mutex::new(None),
+                done: tokio::sync::Notify::new(),
+            }),
         }
     }
 
     fn resolve(&self, result: Result<Lsn, JournalError>) {
-        *self.result.lock().expect("handle lock") = Some(result);
-        self.done.notify_waiters();
+        *self.state.result.lock().expect("handle lock") = Some(result);
+        self.state.done.notify_one();
     }
 
     /// Wait until this append is durably flushed.
+    ///
+    /// The lost-wakeup window of the previous `Mutex + Notify` pair is closed
+    /// by construction: the `Notified` future is created (and thus registered
+    /// with the `Notify`) **before** the result is re-checked, so a `resolve`
+    /// landing between the check and the suspend either finds the future
+    /// already registered or leaves the `notify_one` permit for it. Either
+    /// way the waiter wakes and observes the stored result.
     pub async fn committed(&self) -> Result<Lsn, JournalError> {
-        loop {
-            {
-                let guard = self.result.lock().expect("handle lock");
-                if let Some(r) = guard.as_ref() {
-                    return r.clone();
-                }
-            }
-            self.done.notified().await;
+        // 1. Fast path: already resolved.
+        if let Some(r) = self.state.result.lock().expect("handle lock").as_ref() {
+            return r.clone();
         }
+        // 2. Register interest, THEN re-check. Any resolve after the
+        //    registration notifies this future (or stores the permit it will
+        //    consume); any resolve before it is visible in the re-check.
+        //    `pin!` gives the `Notified` an address so it stays registered
+        //    across the re-check and the await.
+        let notified = std::pin::pin!(self.state.done.notified());
+        if let Some(r) = self.state.result.lock().expect("handle lock").as_ref() {
+            return r.clone();
+        }
+        notified.await;
+        self.state
+            .result
+            .lock()
+            .expect("handle lock")
+            .clone()
+            .unwrap_or(Err(JournalError::Closed))
     }
 
     /// The LSN assigned to this append (before durability).

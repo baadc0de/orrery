@@ -280,7 +280,9 @@ async fn apply_diff(
     record: &JournalRecord,
     now_ms: u64,
 ) -> Result<Lsn, Reject> {
-    // Journal first; the append resolves only after the group fsync.
+    // Journal first; the append resolves only after the group fsync. The
+    // journal takes the record by value (it stamps the assigned LSN into the
+    // encoded bytes), so clone the caller's copy.
     let handle = env
         .journal
         .append(record.clone())

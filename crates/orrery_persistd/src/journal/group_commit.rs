@@ -19,6 +19,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tokio::sync::{broadcast, Notify};
+use tokio::time::Instant;
 
 use orrery_protocol::{JournalRecord, Lsn};
 
@@ -65,8 +66,16 @@ struct Pending {
     handle: Arc<AppendHandle>,
     bytes: usize,
     /// The record itself, published to chain-replication subscribers once the
-    /// batch is durably flushed (§4).
+    /// batch is durably flushed (§4) — unless `publish` is false (the record
+    /// arrived via chain replication, so re-broadcasting it would echo it back
+    /// to its origin and amplify without bound).
     record: JournalRecord,
+    /// Whether the committer publishes this record on flush (§4).
+    publish: bool,
+    /// When this append entered the queue: the batch window is measured from
+    /// the batch's *first* arrival, not from when the committer happens to
+    /// notice the work.
+    arrived: Instant,
 }
 
 /// Shared commit queue between the journal and the committer task.
@@ -148,11 +157,14 @@ impl CommitterHandle {
         handle: Arc<AppendHandle>,
         payload_bytes: usize,
         record: JournalRecord,
+        publish: bool,
     ) {
         self.state.queue.push(Pending {
             handle,
             bytes: payload_bytes,
             record,
+            publish,
+            arrived: Instant::now(),
         });
     }
 
@@ -235,9 +247,40 @@ async fn run_committer(state: Arc<CommitterState>, flush: FlushFn) {
             && !state.is_flushing();
 
         if !idle_fast_path && state.config.mode != AdaptiveCommitMode::AlwaysIdle {
-            tokio::select! {
-                _ = state.queue.wake.notified() => {}
-                _ = tokio::time::sleep(state.config.batch_window) => {}
+            // Batch: hold the fsync until the oldest pending append has been
+            // waiting `batch_window`. The window is measured from the batch's
+            // first arrival, not by a fresh `sleep(batch_window)` raced against
+            // the wake `Notify` — under load the queue's `notify_one` permit
+            // is always buffered (N pushes, 1 waiter), so the old select
+            // resolved through the permit branch instantly and every batch
+            // flushed after ~0 ms of accumulation.
+            let deadline = {
+                let queue = state.queue.inner.lock().expect("commit queue lock");
+                queue
+                    .front()
+                    .map_or_else(Instant::now, |oldest| oldest.arrived)
+                    + state.config.batch_window
+            };
+            loop {
+                // A size cap already reached flushes early.
+                let (qlen, qbytes) = {
+                    let queue = state.queue.inner.lock().expect("commit queue lock");
+                    (queue.len(), queue.iter().map(|p| p.bytes).sum::<usize>())
+                };
+                if qlen >= state.config.batch_max_records || qbytes >= state.config.batch_max_bytes
+                {
+                    break;
+                }
+                let now = Instant::now();
+                if now >= deadline {
+                    break;
+                }
+                tokio::select! {
+                    // New work: re-check the caps (and possibly the queue's
+                    // first-arrival time is unchanged, so the deadline is).
+                    _ = state.queue.wake.notified() => {}
+                    _ = tokio::time::sleep_until(deadline) => break,
+                }
             }
         }
 
@@ -263,9 +306,14 @@ async fn run_committer(state: Arc<CommitterState>, flush: FlushFn) {
                 state.set_committed(max_lsn);
                 for p in batch {
                     p.handle.resolve(Ok(max_lsn));
-                    // Publish for chain replication. A full channel is a lag
-                    // signal (the subscriber rescans from its watermark).
-                    let _ = state.published.send(p.record);
+                    // Publish for chain replication — except records that
+                    // arrived via chain replication themselves (`!publish`),
+                    // which must not echo back to their origin (§4). A full
+                    // channel is a lag signal (the subscriber rescans from its
+                    // watermark).
+                    if p.publish {
+                        let _ = state.published.send(p.record);
+                    }
                 }
             }
             Err(e) => {
@@ -320,4 +368,114 @@ fn drain_batch(state: &CommitterState) -> Vec<Pending> {
         batch.push(pending);
     }
     batch
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::journal::{Journal, JournalConfig};
+
+    fn test_node(n: u8) -> orrery_protocol::NodeId {
+        let mut seed = [0u8; 32];
+        seed[0] = n;
+        iroh_base::SecretKey::from_bytes(&seed).public()
+    }
+
+    fn mk_record(entity: u64) -> JournalRecord {
+        let payload = entity.to_le_bytes();
+        JournalRecord {
+            lsn: Lsn::new(0, 0), // assigned by the journal
+            cell: orrery_protocol::CellId::ROOT,
+            grid: orrery_protocol::GridId::ROOT,
+            entity: orrery_protocol::PersistId::new(entity),
+            tick: orrery_protocol::Tick::new(1),
+            epoch: orrery_protocol::Epoch::new(0),
+            author: test_node(1),
+            kind: orrery_protocol::RecordKind::Spawn,
+            payload: bytes::Bytes::copy_from_slice(&payload),
+            crc: crate::payload_crc(&payload),
+        }
+    }
+
+    #[tokio::test]
+    async fn committed_resolves_when_resolve_races_the_await() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let journal = std::sync::Arc::new(
+            Journal::open(&JournalConfig {
+                dir: dir.path().to_path_buf(),
+                commit: GroupCommitConfig::default(),
+            })
+            .expect("open journal"),
+        );
+
+        // 1000 appends, each awaited from its own task while the committer
+        // resolves from the committer task: the old `Notify + Mutex<Option>`
+        // pair could lose the wakeup between the result check and the
+        // `notified().await`; the oneshot channel carries the result so no
+        // waiter can ever wedge.
+        let mut waiters = Vec::new();
+        for i in 0..1000u64 {
+            let handle = journal.append(mk_record(i)).expect("append");
+            waiters.push(tokio::spawn(async move { handle.committed().await }));
+        }
+        let all = tokio::time::timeout(Duration::from_secs(5), async {
+            for w in waiters {
+                w.await.expect("waiter task").expect("commit");
+            }
+        })
+        .await;
+        assert!(all.is_ok(), "1000 appends all resolved within 5 s");
+
+        journal.close().await.expect("close");
+    }
+
+    #[tokio::test]
+    async fn batch_window_is_honored_under_load() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let journal = std::sync::Arc::new(
+            Journal::open(&JournalConfig {
+                dir: dir.path().to_path_buf(),
+                commit: GroupCommitConfig {
+                    mode: AdaptiveCommitMode::Adaptive,
+                    batch_window: Duration::from_millis(200),
+                    batch_max_records: 8192,
+                    batch_max_bytes: 1 << 20,
+                },
+            })
+            .expect("open journal"),
+        );
+
+        // Submit 8 appends concurrently and time the first commit.
+        let t0 = Instant::now();
+        let mut waiters = Vec::new();
+        for i in 0..8u64 {
+            let j = std::sync::Arc::clone(&journal);
+            waiters.push(tokio::spawn(async move {
+                let handle = j.append(mk_record(i)).expect("append");
+                handle.committed().await.expect("commit");
+                t0.elapsed()
+            }));
+        }
+        let mut elapsed = Vec::new();
+        for w in waiters {
+            elapsed.push(w.await.expect("waiter task"));
+        }
+        elapsed.sort_unstable();
+
+        // Under the broken committer every append flushed on arrival (~177 us,
+        // 8 fsyncs). With the window measured from the batch's first arrival,
+        // the 8 concurrent appends accumulate into ONE batch.
+        assert_eq!(
+            journal.flush_count(),
+            1,
+            "8 concurrent appends must share one fsync"
+        );
+        assert!(
+            elapsed[0] >= Duration::from_millis(150),
+            "first commit waited the batch window: {:?}",
+            elapsed[0]
+        );
+
+        journal.close().await.expect("close");
+    }
 }

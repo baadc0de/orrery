@@ -91,7 +91,36 @@ impl Journal {
 
     /// Append a record and return a handle that resolves once the record is
     /// durably flushed (the ack; §2.1).
+    ///
+    /// Takes the record by value: its `lsn` field is meaningless on entry
+    /// (callers conventionally pass `Lsn::new(0, 0)`) and is **assigned here**
+    /// — the stored record is encoded *after* stamping, so the encoded bytes
+    /// and the record's key agree and a replayed record knows its own LSN.
     pub fn append(&self, record: JournalRecord) -> Result<Arc<AppendHandle>, JournalError> {
+        self.append_inner(record, true)
+    }
+
+    /// Append a record that arrived via chain replication from another node
+    /// (docs/08-persistence.md §4, D11).
+    ///
+    /// Identical to [`Journal::append`] (durable, group-fsynced, resolves with
+    /// the follower's local LSN) except the committed record is **not**
+    /// published to this journal's replication broadcast: without this, a
+    /// 2-node ring echoes every replicated record back to its origin forever.
+    /// The record's *origin* LSN is preserved in the record itself, which the
+    /// replicator echoes to the origin as the follower watermark.
+    pub fn append_replicated(
+        &self,
+        record: JournalRecord,
+    ) -> Result<Arc<AppendHandle>, JournalError> {
+        self.append_inner(record, false)
+    }
+
+    fn append_inner(
+        &self,
+        mut record: JournalRecord,
+        publish: bool,
+    ) -> Result<Arc<AppendHandle>, JournalError> {
         if self.closed.load(std::sync::atomic::Ordering::Acquire) {
             return Err(JournalError::Closed);
         }
@@ -103,10 +132,14 @@ impl Journal {
 
         // Assign the next LSN and encode the record under a single lock so LSN
         // assignment, segment advance, and the on-disk key stay consistent.
+        // The assigned LSN is stamped into the record *before* encoding, so
+        // the stored bytes and the key agree (checkpoint watermarks and chain
+        // lag both read `record.lsn`).
         let (lsn, key, encoded) = {
             let mut cursor = self.cursor.lock().expect("journal cursor lock");
             let span = encoded_len(&record);
             let lsn = advance(&mut cursor, span, self.segment_size);
+            record.lsn = lsn;
             let key = lsn_key(lsn);
             let encoded = postcard::to_stdvec(&record)
                 .map_err(|e| JournalError::Store(format!("encode record: {e}")))?;
@@ -118,7 +151,8 @@ impl Journal {
             .map_err(|e| JournalError::Store(format!("insert record: {e}")))?;
 
         let handle = Arc::new(AppendHandle::new(lsn));
-        self.committer.submit(handle.clone(), payload_bytes, record);
+        self.committer
+            .submit(handle.clone(), payload_bytes, record, publish);
         Ok(handle)
     }
 
@@ -261,4 +295,66 @@ fn decode_kv(kv: fjall::Guard) -> Result<StoredRecord, JournalError> {
             msg: format!("decode: {e}"),
         })?;
     Ok(StoredRecord { lsn, record })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::journal::GroupCommitConfig;
+
+    fn test_node(n: u8) -> orrery_protocol::NodeId {
+        let mut seed = [0u8; 32];
+        seed[0] = n;
+        iroh_base::SecretKey::from_bytes(&seed).public()
+    }
+
+    fn mk_record(entity: u64) -> JournalRecord {
+        let payload = entity.to_le_bytes();
+        JournalRecord {
+            lsn: Lsn::new(0, 0), // assigned by the journal
+            cell: orrery_protocol::CellId::ROOT,
+            grid: orrery_protocol::GridId::ROOT,
+            entity: orrery_protocol::PersistId::new(entity),
+            tick: orrery_protocol::Tick::new(1),
+            epoch: orrery_protocol::Epoch::new(0),
+            author: test_node(1),
+            kind: orrery_protocol::RecordKind::Spawn,
+            payload: bytes::Bytes::copy_from_slice(&payload),
+            crc: crate::payload_crc(&payload),
+        }
+    }
+
+    #[tokio::test]
+    async fn appended_record_carries_its_own_lsn() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let journal = Journal::open(&JournalConfig {
+            dir: dir.path().to_path_buf(),
+            commit: GroupCommitConfig::default(),
+        })
+        .expect("open journal");
+
+        for i in 0..3u64 {
+            let handle = journal.append(mk_record(i)).expect("append");
+            handle.committed().await.expect("commit");
+        }
+
+        let stored: Vec<StoredRecord> = journal
+            .scan_from(Lsn::new(0, 0))
+            .collect::<Result<_, _>>()
+            .expect("scan");
+        assert_eq!(stored.len(), 3);
+        for item in &stored {
+            assert_eq!(
+                item.record.lsn, item.lsn,
+                "encoded record lsn must match its key"
+            );
+        }
+        assert!(
+            stored[0].lsn < stored[1].lsn && stored[1].lsn < stored[2].lsn,
+            "LSNs strictly increasing: {:?}",
+            stored.iter().map(|s| s.lsn).collect::<Vec<_>>()
+        );
+
+        journal.close().await.expect("close");
+    }
 }
