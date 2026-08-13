@@ -20,8 +20,8 @@
 //! anywhere else in the world.
 
 use orrery_protocol::CellId;
-use rand_chacha::ChaCha8Rng;
 use rand::SeedableRng;
+use rand_chacha::ChaCha8Rng;
 
 /// The default derivation context (D-D, docs/12 §8): a domain tag for
 /// `blake3::derive_key`, never a seed itself. `[seed] context` may override

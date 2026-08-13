@@ -396,10 +396,8 @@ impl CellRef {
     /// Returns [`CellRangeError`] for an out-of-range coordinate or level.
     pub fn resolve(&self, cell_edge_m: f64) -> Result<CellId, CellRangeError> {
         match *self {
-            CellRef::Bits(bits) => CellId::from_bits(bits).ok_or(CellRangeError::CoordOutOfRange {
-                coord: 0,
-                level: 0,
-            }),
+            CellRef::Bits(bits) => CellId::from_bits(bits)
+                .ok_or(CellRangeError::CoordOutOfRange { coord: 0, level: 0 }),
             CellRef::Xyz { level, xyz } => {
                 CellId::from_cell_coords(glam::IVec3::new(xyz[0], xyz[1], xyz[2]), level)
             }
@@ -650,7 +648,7 @@ impl ResolvedBounds {
         let shift = u32::from(self.level - level);
         let mut count = 1u128;
         let c = [coords.x, coords.y, coords.z];
-        for axis in 0..3 {
+        for (axis, &ca) in c.iter().enumerate() {
             // The subtree of `cell` spans [c*2^shift, (c+1)*2^shift − 1] in
             // level-N coords… except at level 0, whose subtree is the whole
             // volume. `CellId::coords` reports the root as (0,0,0) at level
@@ -658,7 +656,7 @@ impl ResolvedBounds {
             let (lo, hi) = if level == 0 {
                 (i64::MIN / 2, i64::MAX / 2) // handled below by clamping to the box
             } else {
-                let base = i64::from(c[axis]) << shift;
+                let base = i64::from(ca) << shift;
                 (base, base + (1i64 << shift) - 1)
             };
             let lo = lo.max(i64::from(self.min[axis]));
@@ -917,16 +915,9 @@ impl Scenario {
             }
             let into = layer.into.clone().unwrap_or_else(|| "main".to_string());
             let level = layer.level.unwrap_or(orrery_protocol::INTEREST_LEVEL);
-            let grid = grids
-                .get(&0)
-                .copied()
-                .expect("grid 0 is implicit");
-            let bounds = resolve_bounds(
-                layer.bounds.as_ref(),
-                level,
-                grid.cell_edge_m,
-                &layer.name,
-            )?;
+            let grid = grids.get(&0).copied().expect("grid 0 is implicit");
+            let bounds =
+                resolve_bounds(layer.bounds.as_ref(), level, grid.cell_edge_m, &layer.name)?;
             let intensity_raw = layer
                 .params
                 .as_ref()
@@ -1248,7 +1239,10 @@ archetypes = { prop = 1.0 }
     fn unknown_key_is_an_error() {
         // V1 (docs/12 §10): unknown keys are errors, not warnings — a typo'd
         // generator param must not silently take a default.
-        let bad = SMOKE.replace("kind   = \"uniform\"", "kind   = \"uniform\"\nintensty = 1.0");
+        let bad = SMOKE.replace(
+            "kind   = \"uniform\"",
+            "kind   = \"uniform\"\nintensty = 1.0",
+        );
         // The typo sits in [[layer]], which denies unknown fields.
         let err = Scenario::parse(&bad).unwrap_err();
         let msg = err.to_string();
@@ -1284,7 +1278,9 @@ archetypes = { prop = 1.0 }
         let layer = &sc.layer[0];
         let bounds = layer.bounds.as_ref().expect("bounds present");
         match bounds {
-            BoundsSpec::Subtree { cell: CellRef::Bits(bits) } => {
+            BoundsSpec::Subtree {
+                cell: CellRef::Bits(bits),
+            } => {
                 assert_eq!(*bits, 0xA924_9249_2492_4D65);
             }
             other => panic!("expected hex subtree cell, got {other:?}"),
@@ -1292,8 +1288,8 @@ archetypes = { prop = 1.0 }
         // Round-trip: Display prints the canonical hex, which re-parses to
         // the same bits.
         let printed = cell.to_string();
-        let back: u64 = u64::from_str_radix(printed.strip_prefix("0x").expect("0x"), 16)
-            .expect("hex parses");
+        let back: u64 =
+            u64::from_str_radix(printed.strip_prefix("0x").expect("0x"), 16).expect("hex parses");
         assert_eq!(back, cell.to_bits());
         // And resolving the ref lands the same cell.
         let resolved = CellRef::Bits(cell.to_bits())
@@ -1407,8 +1403,7 @@ declared_size = "256B"
         assert!(err.to_string().contains("noise"), "{err}");
         assert!(err.to_string().contains("unsupported in v1"), "{err}");
         // A non-union fold names itself.
-        let err =
-            parse("name=\"l\"\nkind=\"uniform\"\nop=\"mask\"\nbounds=\"all\"").unwrap_err();
+        let err = parse("name=\"l\"\nkind=\"uniform\"\nop=\"mask\"\nbounds=\"all\"").unwrap_err();
         assert!(err.to_string().contains("mask"), "{err}");
         // Stratified placement names itself.
         let mut src = Scenario::parse(
@@ -1465,7 +1460,10 @@ declared_size = "256B"
             parse_byte_size("40GiB").expect("ok"),
             40 * 1024 * 1024 * 1024
         );
-        assert!(parse_byte_size("256").is_err(), "a bare integer has no unit");
+        assert!(
+            parse_byte_size("256").is_err(),
+            "a bare integer has no unit"
+        );
         assert!(parse_byte_size("10QB").is_err(), "unknown unit");
     }
 
@@ -1497,10 +1495,16 @@ declared_size = "256B"
         assert_eq!(mass, 8 * 65_536, "8 cells at intensity 1.0 (Q16.16)");
         // A level-21 cell inside: exactly one cell's mass.
         let leaf = CellId::from_cell_coords(glam::IVec3::new(1, 1, 1), 21).expect("ok");
-        assert_eq!(bounds.field_mass_under(leaf, crate::field::Q16_16::ONE), 65_536);
+        assert_eq!(
+            bounds.field_mass_under(leaf, crate::field::Q16_16::ONE),
+            65_536
+        );
         // A level-21 cell outside: zero.
         let outside = CellId::from_cell_coords(glam::IVec3::new(5, 5, 5), 21).expect("ok");
-        assert_eq!(bounds.field_mass_under(outside, crate::field::Q16_16::ONE), 0);
+        assert_eq!(
+            bounds.field_mass_under(outside, crate::field::Q16_16::ONE),
+            0
+        );
         // The root covers the whole box.
         assert_eq!(
             bounds.field_mass_under(CellId::ROOT, crate::field::Q16_16::ONE),

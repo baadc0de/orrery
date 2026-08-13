@@ -234,7 +234,7 @@ impl SeedEncoder for OpaqueEncoder {
 /// written — this is how a regression test authors one fixed row.
 pub fn encode_hex_escape(hex: &str) -> Result<Bytes, EncodeError> {
     let hex = hex.strip_prefix("0x").unwrap_or(hex);
-    if hex.len() % 2 != 0 {
+    if !hex.len().is_multiple_of(2) {
         return Err(EncodeError(format!(
             "hex escape has an odd digit count ({})",
             hex.len()
@@ -264,10 +264,7 @@ mod tests {
     use crate::seedtree::SeedRoot;
     use orrery_protocol::CellId;
 
-    fn ctx<'a>(
-        fields: &'a ArchetypeFields,
-        rng: &'a mut ChaCha8Rng,
-    ) -> EncodeCtx<'a> {
+    fn ctx<'a>(fields: &'a ArchetypeFields, rng: &'a mut ChaCha8Rng) -> EncodeCtx<'a> {
         EncodeCtx {
             archetype: "prop",
             fields,
@@ -295,7 +292,9 @@ mod tests {
             bytes_hex: None,
             table: toml::Table::new(),
         };
-        let bag = OpaqueEncoder.encode(&ctx(&fields, &mut rng)).expect("encodes");
+        let bag = OpaqueEncoder
+            .encode(&ctx(&fields, &mut rng))
+            .expect("encodes");
         assert_eq!(bag.len(), 256, "the bag is exactly the declared size");
         assert_ne!(
             bag[0],
@@ -354,6 +353,9 @@ mod tests {
         let err = encode_hex_escape(&too_big).unwrap_err();
         assert!(err.to_string().contains("cap"), "names the cap: {err}");
         let at_cap = format!("0x{}", "00".repeat(HEX_ESCAPE_CAP));
-        assert!(encode_hex_escape(&at_cap).is_ok(), "exactly at the cap is fine");
+        assert!(
+            encode_hex_escape(&at_cap).is_ok(),
+            "exactly at the cap is fine"
+        );
     }
 }

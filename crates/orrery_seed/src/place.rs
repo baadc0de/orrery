@@ -71,7 +71,11 @@ pub struct ArchetypeWeight {
 /// `count > 0` — the scenario validator rejects both first, so reaching this
 /// is a caller bug.
 #[must_use]
-pub fn apportion_archetypes(count: u64, weights: &[ArchetypeWeight], cell_key: [u8; 32]) -> Vec<u32> {
+pub fn apportion_archetypes(
+    count: u64,
+    weights: &[ArchetypeWeight],
+    cell_key: [u8; 32],
+) -> Vec<u32> {
     assert!(
         !weights.is_empty(),
         "an emit's archetype mix is never empty (validated)"
@@ -238,5 +242,60 @@ mod tests {
         let assignment = apportion_archetypes(64, &mix, [3u8; 32]);
         assert!(assignment.iter().all(|&a| a == 0));
         assert_eq!(assignment.len(), 64);
+    }
+
+    /// The brief's named test: a 0.7/0.3 mix over 100 cells yields per-cell
+    /// integer counts summing to the cell count, and a neighbouring cell's
+    /// count does not change this cell's assignment (docs/12 §5.5, D-C).
+    #[test]
+    fn archetype_mix_is_per_cell_and_integral() {
+        let mix = weights(&[("crate", 0.7), ("barrel", 0.3)]);
+        let root = SeedRoot::derive("orrery.seeder.v1", b"per-cell-mix");
+        let layer_key = root.layer_key("world");
+
+        // 100 distinct cells, each dealt a count of 7 (so the exact shares
+        // are [4.9, 2.1] — fractional, exercising largest remainder).
+        let mut assignments = Vec::new();
+        for i in 0..100u64 {
+            let cell = CellId::from_bits(0xA924_9249_2492_4D65 + i * 8).expect("nonzero");
+            let cell_key = SeedRoot::cell_key(&layer_key, cell);
+            let a = apportion_archetypes(7, &mix, cell_key);
+            // Integral and summing to the cell count.
+            assert_eq!(a.len(), 7, "per-cell assignment covers every slot");
+            let crates = a.iter().filter(|&&x| x == 0).count();
+            let barrels = a.iter().filter(|&&x| x == 1).count();
+            assert_eq!(crates + barrels, 7);
+            // The multiset is the largest-remainder apportionment of 7 over
+            // [0.7, 0.3]: floors [4, 2], remainder 1, residue 0.9 (crate) →
+            // [5, 2] in EVERY cell (the multiset is count-determined, so it
+            // is identical across cells).
+            assert_eq!(
+                (crates, barrels),
+                (5, 2),
+                "every cell apportions the mix to [5, 2]"
+            );
+            assignments.push(a);
+        }
+
+        // D-C: changing a NEIGHBOURING cell's count does not change this
+        // cell's assignment. The assignment is a function of (own count, mix,
+        // own cell key); recompute cell 0 with its neighbours hypothetically
+        // dealt different counts (which the function cannot see) and assert
+        // identity.
+        let cell0 = CellId::from_bits(0xA924_9249_2492_4D65).expect("nonzero");
+        let key0 = SeedRoot::cell_key(&layer_key, cell0);
+        let recomputed = apportion_archetypes(7, &mix, key0);
+        assert_eq!(
+            assignments[0], recomputed,
+            "this cell's assignment is independent of any neighbour's count"
+        );
+
+        // But the permutation DOES vary by cell key (assignments are not all
+        // identical across cells, though the multiset is).
+        let all_identical = assignments.iter().all(|a| *a == assignments[0]);
+        assert!(
+            !all_identical,
+            "the cell-key-seeded permutation varies the order across cells"
+        );
     }
 }

@@ -255,7 +255,7 @@ mod tests {
                     total += u128::from(m);
                 }
             }
-            Q16_16(u32::try_from(total.min(u128::from(u32::MAX)).max(0)).unwrap_or(0) as i32)
+            Q16_16(u32::try_from(total.min(u128::from(u32::MAX))).unwrap_or(0) as i32)
         }
     }
 
@@ -306,7 +306,9 @@ mod tests {
             }
         }
         let mut out = Vec::new();
-        split_cell(&Zero, CellId::ROOT, 7, 21, &mut |cell, count| out.push((cell, count)));
+        split_cell(&Zero, CellId::ROOT, 7, 21, &mut |cell, count| {
+            out.push((cell, count))
+        });
         assert_eq!(out, vec![(CellId::ROOT, 7)]);
     }
 }

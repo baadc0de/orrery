@@ -1,0 +1,26 @@
+schema = 1
+
+[scenario]
+name          = "smoke"
+content_build = "smoke-2026-08-13"
+description   = "1k entities in a 4-shard box. CI's canary; runs in 20 ms."
+
+[seed]
+scenario = "smoke-v1"
+
+[payload]
+class = "opaque"          # no Ruleset linked; bags are declared-size filler
+
+[archetype.prop]
+declared_size = "256B"
+
+[[layer]]
+name   = "flat"
+kind   = "uniform"
+bounds = { kind = "box", center = { level = 21, xyz = [0, 0, 0] }, extent_cells = [8, 1, 8] }
+
+[[emit]]
+name       = "props"
+from       = "main"
+count      = 1_000
+archetypes = { prop = 1.0 }

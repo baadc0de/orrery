@@ -1,7 +1,7 @@
 //! Orrery offline world seeder (docs/12-world-seeding.md).
 //!
 //! A **TOML-configured scenario runner**: it reads a scenario file describing
-//! density *fields* over [`CellId`] space, realizes them into entities with an
+//! density *fields* over `CellId` space, realizes them into entities with an
 //! exact declared count, and — in this first slice — reports the analytic dry
 //! run (`plan`) without any cluster. The write path (`apply`/`verify`/`wipe`)
 //! sits behind the `fdb` feature and is out of scope for v1 of this crate's
