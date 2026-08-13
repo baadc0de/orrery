@@ -28,20 +28,22 @@ use orrery_protocol::{
 use tokio::sync::Mutex;
 
 fn node(n: u8) -> orrery_protocol::NodeId {
+    secret(n).public()
+}
+
+fn secret(n: u8) -> iroh_base::SecretKey {
     let mut seed = [0u8; 32];
     seed[0] = n;
-    iroh_base::SecretKey::from_bytes(&seed).public()
+    iroh_base::SecretKey::from_bytes(&seed)
 }
 
-fn sig() -> orrery_protocol::Signature {
-    let seed = [0u8; 32];
-    iroh_base::SecretKey::from_bytes(&seed).sign(b"test")
-}
-
-fn intent(id: u128) -> Intent {
-    Intent {
+/// A properly-signed intent from `key` — the gateway now verifies the issuer
+/// signature and binds it to the connection's id (D11 §2.2), so the old
+/// `b"test"`-signed fixture no longer commits.
+fn signed_intent(id: u128, key: &iroh_base::SecretKey) -> Intent {
+    let mut intent = Intent {
         intent_id: id,
-        issuer: node(1),
+        issuer: key.public(),
         cell_epoch: Epoch::new(0),
         ops: vec![IntentOp {
             op: 1,
@@ -49,10 +51,12 @@ fn intent(id: u128) -> Intent {
         }],
         attestations: vec![Attestation {
             witness: node(2),
-            signature: sig(),
+            signature: secret(2).sign(b"test"),
         }],
-        signature: sig(),
-    }
+        signature: key.sign(b"placeholder"),
+    };
+    intent.sign(key);
+    intent
 }
 
 fn runtime_config(dir: &std::path::Path) -> RuntimeConfig {
@@ -126,8 +130,10 @@ fn gateway_closes_the_client_to_actor_path() {
         })))
         .unwrap();
 
-        // Intent.
-        let intent = intent(7);
+        // Intent — signed by the gateway's own identity (the fixture has no
+        // executor configured, so the honest outcome is a rejection, never a
+        // fake commit; the commit path is covered by tests/intent_commit.rs).
+        let intent = signed_intent(7, &secret(1));
         conn.send_datagram(Bytes::from(encode_stream_frame(
             &GatewayMsg::SubmitIntent {
                 intent: intent.clone(),
@@ -163,7 +169,10 @@ fn gateway_closes_the_client_to_actor_path() {
             }
             if let Some(GatewayReply::IntentAck { intent_id, outcome }) = decode_stream_frame(&pkt)
             {
-                got_intent = intent_id == 7 && matches!(outcome, IntentOutcome::Committed { .. });
+                // The gateway has no executor configured: the honest ack is a
+                // rejection (never a fake commit). The commit path is covered
+                // by tests/intent_commit.rs against a configured executor.
+                got_intent = intent_id == 7 && matches!(outcome, IntentOutcome::Rejected { .. });
             }
         }
         assert!(got_ack, "expected a bulk ack for the diff");

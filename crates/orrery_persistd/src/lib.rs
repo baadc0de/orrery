@@ -30,6 +30,7 @@ pub mod cluster;
 mod crc;
 pub mod fence;
 pub mod gateway;
+pub mod intent;
 pub mod journal;
 pub mod keyspace;
 pub mod placement;
@@ -43,6 +44,12 @@ pub use checkpoint::{
 pub use cluster::{Cluster, ColdFallbackRouter, Router};
 pub use fence::{FenceError, FenceOutcome, FenceRow, FenceStatus, FenceStore, MemFenceStore};
 pub use gateway::{GatewayConfig, GatewayError, GatewayServer, GATEWAY_ALPN};
+#[cfg(feature = "fdb")]
+pub use intent::FdbIntentExecutor;
+pub use intent::{
+    IntentError, IntentExecutor, IntentPrecheck, IntentValidator, IntentVerdict, MemIntentExecutor,
+    PermissiveValidator,
+};
 pub use journal::{
     spawn_chain, AppendHandle, ChainConfig, ChainReplicator, ChainSink, ChainTransport, Journal,
     JournalChainSink, JournalConfig, JournalError, JournalScan, MemChainTransport, StoredRecord,

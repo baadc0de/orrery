@@ -31,7 +31,9 @@ pub use gateway::{AreaPage, DiffUplink, GatewayMsg, GatewayReply};
 pub use grid::GridId;
 pub use identity::{NodeId, Signature};
 pub use persist::{
-    Attestation, Checkpoint, Epoch, Intent, IntentOp, IntentOutcome, JournalRecord, Lsn, PersistId,
-    RecordKind, Tick,
+    AccountId, AssetId, Attestation, Checkpoint, Epoch, Intent, IntentOp, IntentOutcome, ItemUid,
+    JournalRecord, Lsn, PersistId, RecordKind, Tick, INTENT_PREIMAGE_TAG, REASON_BAD_SIGNATURE,
+    REASON_CONTENTION_EXHAUSTED, REASON_EXECUTOR_ERROR, REASON_ISSUER_MISMATCH, REASON_NO_EXECUTOR,
+    REASON_VALIDATION_FAILED,
 };
 pub use protocol::PROTOCOL_VERSION;
