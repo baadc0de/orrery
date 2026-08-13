@@ -294,7 +294,14 @@ impl CellRuntime {
                 // the base the checkpoint guarantees, the live actor the tail
                 // it may not yet have checkpointed.
                 let (mut state, mut by_cell, mut tombstones, mut watermark) = ckpt.map_or_else(
-                    || (HashMap::new(), HashMap::new(), HashMap::new(), Lsn::new(0, 0)),
+                    || {
+                        (
+                            HashMap::new(),
+                            HashMap::new(),
+                            HashMap::new(),
+                            Lsn::new(0, 0),
+                        )
+                    },
                     |c| (c.entities, c.by_cell, c.tombstones, c.watermark),
                 );
                 if let Some(old) = self.actors.remove(&shard) {
@@ -534,12 +541,9 @@ impl CellRuntime {
                 .map_err(|_| {
                     crate::checkpoint::CheckpointError::Store("actor gone during restore".into())
                 })?;
-            handle
-                .set_watermark(ckpt.watermark)
-                .await
-                .map_err(|_| {
-                    crate::checkpoint::CheckpointError::Store("actor gone during restore".into())
-                })?;
+            handle.set_watermark(ckpt.watermark).await.map_err(|_| {
+                crate::checkpoint::CheckpointError::Store("actor gone during restore".into())
+            })?;
         }
 
         // Replay the journal tail, tracking the running maximum epoch (C-2)

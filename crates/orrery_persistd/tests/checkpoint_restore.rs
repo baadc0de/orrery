@@ -83,7 +83,6 @@ fn runtime_config_in(dir: &std::path::Path, grid: GridId) -> RuntimeConfig {
     }
 }
 
-
 #[tokio::test]
 async fn actor_serves_rows_present_only_in_the_checkpoint() {
     // The durable tier is the system of record (D11): a restart must serve at
@@ -145,9 +144,14 @@ async fn open_scans_the_journal_once_for_many_shards() {
     // journal per shard).
     let dir = tempfile::tempdir().unwrap();
 
-    // 10k records across the whole cell space.
+    // 10k records across the whole cell space, submitted concurrently so the
+    // adaptive committer batches them instead of paying one batch window per
+    // record.
     {
-        let journal = orrery_persistd::Journal::open(&runtime_config(dir.path()).journal).unwrap();
+        let journal = Arc::new(
+            orrery_persistd::Journal::open(&runtime_config(dir.path()).journal).unwrap(),
+        );
+        let mut handles = Vec::new();
         for i in 0..10_000u64 {
             let cell = CellId::from_coords(
                 glam::IVec3::new((i % 64) as i32 - 32, (i % 8) as i32 - 4, 0),
@@ -155,9 +159,13 @@ async fn open_scans_the_journal_once_for_many_shards() {
             )
             .unwrap();
             let rec = mk_record(cell, i, RecordKind::Spawn, &i.to_le_bytes());
-            journal.append(rec).unwrap().committed().await.unwrap();
+            handles.push(journal.append(rec).unwrap());
+        }
+        for h in handles {
+            h.committed().await.unwrap();
         }
         journal.close().await.unwrap();
+        drop(journal);
     }
 
     let one_shard = |shards: Vec<CellId>| {
@@ -218,7 +226,10 @@ async fn checkpoint_then_replay_zero_loss() {
     // Simulate node loss: fresh runtime, restore from checkpoint + journal tail.
     let rt2 = CellRuntime::open(&runtime_config(dir.path()), &store_dyn(&store)).unwrap();
     let replayed = rt2.restore(CellId::ROOT, store.as_ref()).await.unwrap();
-    assert_eq!(replayed, 50, "restore replays exactly the tail past the watermark");
+    assert_eq!(
+        replayed, 50,
+        "restore replays exactly the tail past the watermark"
+    );
 
     let page = rt2.read(GridId::ROOT, CellId::ROOT).await.unwrap();
     assert_eq!(page.entities.len(), 100, "all 100 entities recovered");
@@ -425,10 +436,16 @@ async fn fdb_checkpoint_roundtrip() {
         eprintln!("skipping: ORRERY_FDB_CLUSTER_FILE not set and no .fdb-dev/fdb.cluster");
         return;
     };
-    let store = std::sync::Arc::new(orrery_persistd::checkpoint::FdbCheckpointStore::connect(&cluster).unwrap());
+    let store = std::sync::Arc::new(
+        orrery_persistd::checkpoint::FdbCheckpointStore::connect(&cluster).unwrap(),
+    );
 
     let dir = tempfile::tempdir().unwrap();
-    let rt = CellRuntime::open(&runtime_config_in(dir.path(), GridId::new(9001)), &store_dyn(&store)).unwrap();
+    let rt = CellRuntime::open(
+        &runtime_config_in(dir.path(), GridId::new(9001)),
+        &store_dyn(&store),
+    )
+    .unwrap();
     for i in 0..10u64 {
         let rec = mk_record(CellId::ROOT, i, RecordKind::Spawn, &i.to_le_bytes());
         rt.apply(rec).await.unwrap();
@@ -456,10 +473,16 @@ async fn fdb_checkpoint_then_restore() {
         eprintln!("skipping: ORRERY_FDB_CLUSTER_FILE not set and no .fdb-dev/fdb.cluster");
         return;
     };
-    let store = std::sync::Arc::new(orrery_persistd::checkpoint::FdbCheckpointStore::connect(&cluster).unwrap());
+    let store = std::sync::Arc::new(
+        orrery_persistd::checkpoint::FdbCheckpointStore::connect(&cluster).unwrap(),
+    );
 
     let dir = tempfile::tempdir().unwrap();
-    let rt = CellRuntime::open(&runtime_config_in(dir.path(), GridId::new(9002)), &store_dyn(&store)).unwrap();
+    let rt = CellRuntime::open(
+        &runtime_config_in(dir.path(), GridId::new(9002)),
+        &store_dyn(&store),
+    )
+    .unwrap();
     for i in 0..30u64 {
         let rec = mk_record(CellId::ROOT, i, RecordKind::Spawn, &i.to_le_bytes());
         rt.apply(rec).await.unwrap();
@@ -471,7 +494,11 @@ async fn fdb_checkpoint_then_restore() {
     }
     rt.close().await.unwrap();
 
-    let rt2 = CellRuntime::open(&runtime_config_in(dir.path(), GridId::new(9002)), &store_dyn(&store)).unwrap();
+    let rt2 = CellRuntime::open(
+        &runtime_config_in(dir.path(), GridId::new(9002)),
+        &store_dyn(&store),
+    )
+    .unwrap();
     let replayed = rt2.restore(CellId::ROOT, store.as_ref()).await.unwrap();
     assert!(replayed >= 10, "replayed {replayed} tail records");
     let page = rt2.read(GridId::ROOT, CellId::ROOT).await.unwrap();
@@ -489,10 +516,16 @@ async fn fdb_cold_cell_area_load() {
         eprintln!("skipping: ORRERY_FDB_CLUSTER_FILE not set and no .fdb-dev/fdb.cluster");
         return;
     };
-    let store = std::sync::Arc::new(orrery_persistd::checkpoint::FdbCheckpointStore::connect(&cluster).unwrap());
+    let store = std::sync::Arc::new(
+        orrery_persistd::checkpoint::FdbCheckpointStore::connect(&cluster).unwrap(),
+    );
 
     let dir = tempfile::tempdir().unwrap();
-    let rt = CellRuntime::open(&runtime_config_in(dir.path(), GridId::new(9003)), &store_dyn(&store)).unwrap();
+    let rt = CellRuntime::open(
+        &runtime_config_in(dir.path(), GridId::new(9003)),
+        &store_dyn(&store),
+    )
+    .unwrap();
     for i in 0..20u64 {
         let rec = mk_record(CellId::ROOT, i, RecordKind::Spawn, &i.to_le_bytes());
         rt.apply(rec).await.unwrap();
@@ -582,7 +615,9 @@ async fn fdb_subtree_keying_and_watermark_only_checkpoint() {
         tombstones: HashMap::new(),
         taken_at_ms: 1_700_000_000_000,
     };
-    let store = std::sync::Arc::new(orrery_persistd::checkpoint::FdbCheckpointStore::connect(&cluster).unwrap());
+    let store = std::sync::Arc::new(
+        orrery_persistd::checkpoint::FdbCheckpointStore::connect(&cluster).unwrap(),
+    );
     store.checkpoint(&data).await.unwrap();
 
     // P-8: load rebuilds the bag from rows; the watermark fields round-trip.
@@ -670,7 +705,9 @@ async fn fdb_tombstones_write_gc_and_isolate_grids() {
 
     let shard = CellId::from_bits(0xA924_9249_2492_4E00).unwrap();
     let cell = CellId::from_bits(0xA924_9249_2492_4D65).unwrap();
-    let store = std::sync::Arc::new(orrery_persistd::checkpoint::FdbCheckpointStore::connect(&cluster).unwrap());
+    let store = std::sync::Arc::new(
+        orrery_persistd::checkpoint::FdbCheckpointStore::connect(&cluster).unwrap(),
+    );
     let rec = |bytes: u64| EntityRecord {
         components: bytes::Bytes::copy_from_slice(&bytes.to_le_bytes()),
         dirty: false,
@@ -778,21 +815,31 @@ async fn fdb_tombstone_end_to_end_lifecycle() {
         eprintln!("skipping: ORRERY_FDB_CLUSTER_FILE not set and no .fdb-dev/fdb.cluster");
         return;
     };
-    let store = std::sync::Arc::new(orrery_persistd::checkpoint::FdbCheckpointStore::connect(&cluster).unwrap());
+    let store = std::sync::Arc::new(
+        orrery_persistd::checkpoint::FdbCheckpointStore::connect(&cluster).unwrap(),
+    );
 
     let dir = tempfile::tempdir().unwrap();
-    let rt = CellRuntime::open(&runtime_config_in(dir.path(), GridId::new(9007)), &store_dyn(&store)).unwrap();
+    let rt = CellRuntime::open(
+        &runtime_config_in(dir.path(), GridId::new(9007)),
+        &store_dyn(&store),
+    )
+    .unwrap();
     for i in 0..6u64 {
         let rec = mk_record(CellId::ROOT, i, RecordKind::Spawn, &i.to_le_bytes());
         rt.apply(rec).await.unwrap();
     }
     store.delete(CellId::ROOT, GridId::new(9007)).await.unwrap();
-    rt.checkpoint_shard(CellId::ROOT, store.as_ref()).await.unwrap();
+    rt.checkpoint_shard(CellId::ROOT, store.as_ref())
+        .await
+        .unwrap();
     for i in 0..3u64 {
         let rec = mk_record(CellId::ROOT, i, RecordKind::Despawn, b"");
         rt.apply(rec).await.unwrap();
     }
-    rt.checkpoint_shard(CellId::ROOT, store.as_ref()).await.unwrap();
+    rt.checkpoint_shard(CellId::ROOT, store.as_ref())
+        .await
+        .unwrap();
 
     let ckpt = store
         .load(CellId::ROOT, GridId::new(9007))
@@ -809,7 +856,11 @@ async fn fdb_tombstone_end_to_end_lifecycle() {
 
     // Restore: the actor comes back with three live entities and three
     // markers, and a cold read serves only the live ones (no resurrection).
-    let rt2 = CellRuntime::open(&runtime_config_in(dir.path(), GridId::new(9007)), &store_dyn(&store)).unwrap();
+    let rt2 = CellRuntime::open(
+        &runtime_config_in(dir.path(), GridId::new(9007)),
+        &store_dyn(&store),
+    )
+    .unwrap();
     rt2.restore(CellId::ROOT, store.as_ref()).await.unwrap();
     let page = rt2.read(GridId::ROOT, CellId::ROOT).await.unwrap();
     assert_eq!(page.entities.len(), 3);

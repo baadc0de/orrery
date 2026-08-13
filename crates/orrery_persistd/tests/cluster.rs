@@ -198,7 +198,10 @@ async fn has_actor_means_live_actor_not_placement_answer() {
         )]),
     });
     let router: Arc<dyn Router> = Arc::new(ColdFallbackRouter::new(cluster, Arc::clone(&cold)));
-    assert!(!router.has_actor(GridId::ROOT, cell).await, "no live actor for the cell");
+    assert!(
+        !router.has_actor(GridId::ROOT, cell).await,
+        "no live actor for the cell"
+    );
     let page = router
         .read_cold(GridId::ROOT, cell)
         .await
@@ -221,7 +224,10 @@ async fn has_actor_means_live_actor_not_placement_answer() {
         .await
         .unwrap();
     let router2: Arc<dyn Router> = Arc::new(ColdFallbackRouter::new(cluster2, cold));
-    assert!(router2.has_actor(GridId::ROOT, CellId::ROOT).await, "live actor present");
+    assert!(
+        router2.has_actor(GridId::ROOT, CellId::ROOT).await,
+        "live actor present"
+    );
     let page = router2.read(GridId::ROOT, CellId::ROOT).await.unwrap();
     assert_eq!(
         page.entities[&PersistId::new(7)].components.as_ref(),

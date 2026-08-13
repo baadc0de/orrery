@@ -446,7 +446,9 @@ mod tests {
         // Fence ROOT first so the fence store has a row for it, then split.
         {
             let mut rt = runtime.lock().await;
-            rt.fence_shard(CellId::ROOT, None, store.as_ref()).await.unwrap();
+            rt.fence_shard(CellId::ROOT, None, store.as_ref())
+                .await
+                .unwrap();
             let root_row = rt.fence().read(CellId::ROOT).await.unwrap();
             let parent_row = root_row.unwrap();
             let children = rt.split(CellId::ROOT, &parent_row).await.unwrap();
@@ -523,11 +525,13 @@ mod tests {
         };
 
         let scheduler = spawn_checkpoint_scheduler(Arc::clone(&runtime), store.clone(), &config);
-        
+
         // Split ROOT into children, retiring the parent.
         {
             let mut rt = runtime.lock().await;
-            rt.fence_shard(CellId::ROOT, None, store.as_ref()).await.unwrap();
+            rt.fence_shard(CellId::ROOT, None, store.as_ref())
+                .await
+                .unwrap();
             let root_row = rt.fence().read(CellId::ROOT).await.unwrap();
             let parent_row = root_row.unwrap();
             rt.split(CellId::ROOT, &parent_row).await.unwrap();

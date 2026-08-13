@@ -328,7 +328,11 @@ fn apply_diff(
         // `committed` resolves with the batch's max LSN; the ack must carry
         // THIS append's LSN, so checkpoint watermarks compare against the
         // right position.
-        let result = handle.committed().await.map(|_| lsn).map_err(|_| Reject::JournalClosed);
+        let result = handle
+            .committed()
+            .await
+            .map(|_| lsn)
+            .map_err(|_| Reject::JournalClosed);
         let _ = reply.send(result);
     });
 }

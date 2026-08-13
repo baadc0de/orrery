@@ -6,6 +6,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use orrery_persistd::checkpoint::{CheckpointStore, MemCheckpointStore};
 use orrery_persistd::fence::{FenceError, FenceOutcome, FenceRow, FenceStatus, MemFenceStore};
 use orrery_persistd::journal::{AdaptiveCommitMode, GroupCommitConfig};
 use orrery_persistd::{payload_crc, CellRuntime, FenceStore, JournalConfig, RuntimeConfig};
@@ -16,6 +17,13 @@ fn test_node(n: u8) -> orrery_protocol::NodeId {
     let mut seed = [0u8; 32];
     seed[0] = n;
     iroh_base::SecretKey::from_bytes(&seed).public()
+}
+
+/// A fresh in-memory checkpoint store as the trait object `CellRuntime::open`
+/// and `fence_shard` take. These tests never checkpoint; the store only has
+/// to exist so an actor can be seeded from it at open.
+fn mem_store() -> Arc<dyn CheckpointStore> {
+    Arc::new(MemCheckpointStore::new())
 }
 
 fn mk_record(cell: CellId, entity: u64, kind: RecordKind, payload: &[u8]) -> JournalRecord {
@@ -98,20 +106,6 @@ fn runtime_config_shards(
     }
 }
 
-/// A fresh in-memory checkpoint store as the trait object `CellRuntime::open`
-/// takes.
-fn mem_store() -> Arc<dyn orrery_persistd::checkpoint::CheckpointStore> {
-    Arc::new(orrery_persistd::checkpoint::MemCheckpointStore::new())
-}
-
-/// Coerce a concrete store `Arc` into the trait object `CellRuntime::open`
-/// takes.
-fn as_store(
-    store: &Arc<orrery_persistd::checkpoint::MemCheckpointStore>,
-) -> Arc<dyn orrery_persistd::checkpoint::CheckpointStore> {
-    store.clone()
-}
-
 /// A shard cell at the shard level (one level coarser than interest), so its
 /// children are real shard cells with distinct subtrees.
 fn shard_cell(x: i32, y: i32, z: i32) -> CellId {
@@ -173,7 +167,10 @@ async fn fence_shard_from_absent_fences_and_spawns_actor() {
     let mut rt = CellRuntime::open(&runtime_config(dir.path(), 7), &mem_store()).unwrap();
 
     let shard = shard_cell(1, 0, 0);
-    let epoch = rt.fence_shard(shard, None, mem_store().as_ref()).await.unwrap();
+    let epoch = rt
+        .fence_shard(shard, None, mem_store().as_ref())
+        .await
+        .unwrap();
     assert_eq!(epoch, Epoch::new(1));
 
     // The actor exists and can serve writes at the new epoch.
@@ -196,7 +193,9 @@ async fn fence_shard_conflicts_on_stale_expected() {
     let mut rt = CellRuntime::open(&runtime_config(dir.path(), 7), &mem_store()).unwrap();
 
     let shard = shard_cell(1, 0, 0);
-    rt.fence_shard(shard, None, mem_store().as_ref()).await.unwrap();
+    rt.fence_shard(shard, None, mem_store().as_ref())
+        .await
+        .unwrap();
 
     // A second fence with a stale expected row (epoch 0) must conflict.
     let stale = FenceRow {
@@ -204,7 +203,10 @@ async fn fence_shard_conflicts_on_stale_expected() {
         epoch: Epoch::new(0),
         status: FenceStatus::Active,
     };
-    let err = rt.fence_shard(shard, Some(&stale), mem_store().as_ref()).await.unwrap_err();
+    let err = rt
+        .fence_shard(shard, Some(&stale), mem_store().as_ref())
+        .await
+        .unwrap_err();
     match err {
         FenceError::Conflict { current } => {
             let cur = current.unwrap();
@@ -237,8 +239,13 @@ async fn fence_shard_second_node_conflicts() {
     .unwrap();
 
     let shard = shard_cell(2, 0, 0);
-    rt_a.fence_shard(shard, None, mem_store().as_ref()).await.unwrap();
-    let err = rt_b.fence_shard(shard, None, mem_store().as_ref()).await.unwrap_err();
+    rt_a.fence_shard(shard, None, mem_store().as_ref())
+        .await
+        .unwrap();
+    let err = rt_b
+        .fence_shard(shard, None, mem_store().as_ref())
+        .await
+        .unwrap_err();
     match err {
         FenceError::Conflict { current } => {
             assert_eq!(current.unwrap().owner, 1);
@@ -254,8 +261,14 @@ async fn fence_shard_second_node_conflicts() {
 async fn split_partitions_entities_and_retires_parent() {
     let dir = tempfile::tempdir().unwrap();
     let shard = shard_cell(0, 0, 0);
-    let mut rt = CellRuntime::open(&runtime_config_shards(dir.path(), 3, vec![shard]), &mem_store()).unwrap();
-    rt.fence_shard(shard, None, mem_store().as_ref()).await.unwrap();
+    let mut rt = CellRuntime::open(
+        &runtime_config_shards(dir.path(), 3, vec![shard]),
+        &mem_store(),
+    )
+    .unwrap();
+    rt.fence_shard(shard, None, mem_store().as_ref())
+        .await
+        .unwrap();
     let parent_row = rt.fence().read(shard).await.unwrap().unwrap();
 
     // Seed entities across the shard's children. Each child is a shard cell at
@@ -301,7 +314,7 @@ async fn split_after_checkpoint_restore_partitions_correctly() {
     // checkpoint+restore still partitions entities into the right children
     // (§3.5, §8).
     let dir = tempfile::tempdir().unwrap();
-    let store = std::sync::Arc::new(orrery_persistd::checkpoint::MemCheckpointStore::new());
+    let store = orrery_persistd::checkpoint::MemCheckpointStore::new();
     let shard = shard_cell(0, 0, 0);
 
     let child = shard.children()[3];
@@ -311,25 +324,32 @@ async fn split_after_checkpoint_restore_partitions_correctly() {
     {
         let mut rt = CellRuntime::open(
             &runtime_config_shards(dir.path(), 3, vec![shard]),
-            &as_store(&store),
+            &mem_store(),
         )
         .unwrap();
-        rt.fence_shard(shard, None, store.as_ref()).await.unwrap();
+        rt.fence_shard(shard, None, mem_store().as_ref())
+            .await
+            .unwrap();
         rt.apply(mk_record(child, 1, RecordKind::Spawn, b"a"))
             .await
             .unwrap();
         rt.apply(mk_record(child2, 2, RecordKind::Spawn, b"b"))
             .await
             .unwrap();
-        rt.checkpoint(store.as_ref()).await.unwrap();
+        rt.checkpoint(&store).await.unwrap();
         rt.close().await.unwrap();
     }
 
     // Phase 2: reopen, restore from checkpoint + journal, then split.
-    let mut rt = CellRuntime::open(&runtime_config_shards(dir.path(), 3, vec![shard]), &as_store(&store))
+    let mut rt = CellRuntime::open(
+        &runtime_config_shards(dir.path(), 3, vec![shard]),
+        &mem_store(),
+    )
+    .unwrap();
+    rt.fence_shard(shard, None, mem_store().as_ref())
+        .await
         .unwrap();
-    rt.fence_shard(shard, None, store.as_ref()).await.unwrap();
-    rt.restore(shard, store.as_ref()).await.unwrap();
+    rt.restore(shard, &store).await.unwrap();
     let parent_row = rt.fence().read(shard).await.unwrap().unwrap();
 
     let child_rows = rt.split(shard, &parent_row).await.unwrap();
@@ -353,8 +373,14 @@ async fn second_level_split_partitions_correctly() {
     // grandchildren (§3.5).
     let dir = tempfile::tempdir().unwrap();
     let shard = shard_cell(0, 0, 0);
-    let mut rt = CellRuntime::open(&runtime_config_shards(dir.path(), 3, vec![shard]), &mem_store()).unwrap();
-    rt.fence_shard(shard, None, mem_store().as_ref()).await.unwrap();
+    let mut rt = CellRuntime::open(
+        &runtime_config_shards(dir.path(), 3, vec![shard]),
+        &mem_store(),
+    )
+    .unwrap();
+    rt.fence_shard(shard, None, mem_store().as_ref())
+        .await
+        .unwrap();
     let parent_row = rt.fence().read(shard).await.unwrap().unwrap();
 
     // Seed entities in two grandchildren of the same child.
@@ -394,7 +420,9 @@ async fn split_conflicts_on_stale_parent_row() {
     let mut rt = CellRuntime::open(&runtime_config(dir.path(), 3), &mem_store()).unwrap();
 
     let shard = shard_cell(0, 0, 0);
-    rt.fence_shard(shard, None, mem_store().as_ref()).await.unwrap();
+    rt.fence_shard(shard, None, mem_store().as_ref())
+        .await
+        .unwrap();
 
     // A stale parent row (wrong epoch) must not split.
     let stale = FenceRow {
@@ -467,7 +495,7 @@ async fn fdb_fence_cas_roundtrip() {
         store.fence(shard, None, &row).await.unwrap(),
         FenceOutcome::Fenced
     );
-    assert_eq!(store.read(GridId::ROOT, shard).await.unwrap(), Some(row));
+    assert_eq!(store.read(shard).await.unwrap(), Some(row));
 
     // Stale expected (wrong epoch) -> conflict, row unchanged.
     let stale = FenceRow {
@@ -476,7 +504,7 @@ async fn fdb_fence_cas_roundtrip() {
     };
     let conflict = store.fence(shard, Some(&stale), &row).await.unwrap();
     assert!(matches!(conflict, FenceOutcome::Conflict { current } if current == Some(row)));
-    assert_eq!(store.read(GridId::ROOT, shard).await.unwrap(), Some(row));
+    assert_eq!(store.read(shard).await.unwrap(), Some(row));
 
     // Correct expected -> advances to a new epoch.
     let new = FenceRow {
@@ -488,10 +516,10 @@ async fn fdb_fence_cas_roundtrip() {
         store.fence(shard, Some(&row), &new).await.unwrap(),
         FenceOutcome::Fenced
     );
-    assert_eq!(store.read(GridId::ROOT, shard).await.unwrap(), Some(new));
+    assert_eq!(store.read(shard).await.unwrap(), Some(new));
 
     store.retire(shard).await.unwrap();
-    assert_eq!(store.read(GridId::ROOT, shard).await.unwrap(), None);
+    assert_eq!(store.read(shard).await.unwrap(), None);
 }
 
 #[cfg(feature = "fdb")]
@@ -541,7 +569,7 @@ async fn fdb_begin_split_atomic() {
     assert_eq!(parent_after.status, FenceStatus::Splitting);
     assert_eq!(parent_after.epoch, Epoch::new(1));
     for (child, row) in &children {
-        assert_eq!(store.read(GridId::ROOT, *child).await.unwrap(), Some(*row));
+        assert_eq!(store.read(*child).await.unwrap(), Some(*row));
     }
 
     // Stale parent -> conflict, nothing changes.
@@ -579,7 +607,9 @@ async fn fdb_runtime_split_end_to_end() {
     )
     .unwrap();
 
-    rt.fence_shard(shard, None, mem_store().as_ref()).await.unwrap();
+    rt.fence_shard(shard, None, mem_store().as_ref())
+        .await
+        .unwrap();
     let parent_row = rt.fence().read(shard).await.unwrap().unwrap();
 
     let children = shard.children();

@@ -83,13 +83,11 @@ fn gateway_closes_the_client_to_actor_path() {
     let rt = tokio::runtime::Runtime::new().unwrap();
     rt.block_on(async {
         let dir = tempfile::tempdir().unwrap();
-        let runtime = Arc::new(Mutex::new(
-            {
-                let store: std::sync::Arc<dyn orrery_persistd::checkpoint::CheckpointStore> =
-                    std::sync::Arc::new(orrery_persistd::checkpoint::MemCheckpointStore::new());
-                CellRuntime::open(&runtime_config(dir.path()), &store).unwrap()
-            },
-        ));
+        let runtime = Arc::new(Mutex::new({
+            let store: std::sync::Arc<dyn orrery_persistd::checkpoint::CheckpointStore> =
+                std::sync::Arc::new(orrery_persistd::checkpoint::MemCheckpointStore::new());
+            CellRuntime::open(&runtime_config(dir.path()), &store).unwrap()
+        }));
 
         // Coerce the single-node runtime into the routing surface the gateway
         // uses. `Mutex<CellRuntime>` implements `Router`.

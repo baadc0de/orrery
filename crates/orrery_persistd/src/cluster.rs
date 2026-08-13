@@ -72,7 +72,10 @@ impl Router for tokio::sync::Mutex<CellRuntime> {
             let rt = self.lock().await;
             rt.actor(record.grid, record.cell).cloned()
         };
-        handle.ok_or(Reject::JournalClosed)?.apply_diff(record).await
+        handle
+            .ok_or(Reject::JournalClosed)?
+            .apply_diff(record)
+            .await
     }
 
     async fn read(&self, grid: GridId, cell: CellId) -> Result<SnapshotPage, Reject> {
@@ -268,7 +271,10 @@ impl Router for Cluster {
             let rt = rt.lock().await;
             rt.actor(record.grid, record.cell).cloned()
         };
-        handle.ok_or(Reject::JournalClosed)?.apply_diff(record).await
+        handle
+            .ok_or(Reject::JournalClosed)?
+            .apply_diff(record)
+            .await
     }
 
     async fn read(&self, grid: GridId, cell: CellId) -> Result<SnapshotPage, Reject> {

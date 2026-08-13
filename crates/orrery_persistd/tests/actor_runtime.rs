@@ -212,9 +212,14 @@ async fn concurrent_diffs_stay_last_writer_wins() {
     rt.apply(mk_record(CellId::ROOT, 7, RecordKind::Spawn, b"first"))
         .await
         .unwrap();
-    rt.apply(mk_record(CellId::ROOT, 7, RecordKind::ComponentDiff, b"second"))
-        .await
-        .unwrap();
+    rt.apply(mk_record(
+        CellId::ROOT,
+        7,
+        RecordKind::ComponentDiff,
+        b"second",
+    ))
+    .await
+    .unwrap();
     let page = rt.read(GridId::ROOT, CellId::ROOT).await.unwrap();
     assert_eq!(
         page.entities[&PersistId::new(7)].components.as_ref(),
@@ -254,7 +259,6 @@ async fn concurrent_diffs_stay_last_writer_wins() {
 
     rt.close().await.unwrap();
 }
-
 
 #[test]
 fn records_from_prior_epoch_survive_a_fence_bump() {
