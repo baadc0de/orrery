@@ -88,6 +88,18 @@ The alternatives, and why not: *a subcommand of `persistd`* couples a batch tool
 
 **Dependencies.** `orrery_protocol` (types), `orrery_persistd` (keyspace helpers and `FenceStore`, see below), `toml` + `serde`, `blake3`, `rand_chacha`, `foundationdb` behind the `fdb` feature. It must **not** depend on `orrery_spatial`, which is a Bevy crate — so `INTEREST_LEVEL`/`SHARD_LEVEL` (currently `orrery_spatial/src/cell.rs:14,17`) and the metres↔cells conversion move to `orrery_protocol` as a spec delta (§16).
 
+**Dependency posture — a knowing deviation (P2 decision, 2026-08-13).** The
+paragraph above rejects the persistd-subcommand shape partly because it "drags
+the gateway/iroh surface into a job that never opens a socket". Depending on
+`orrery_persistd` as a library currently has the same effect: `journal/mod.rs`
+declares `pub mod fjall` unconditionally and `gateway.rs` uses iroh
+unconditionally, so `default-features = false` does not compile and the only
+buildable form links an LSM store and iroh into a batch tool. P2 accepts that
+— it costs build time, not correctness, and the alternative (feature-gating
+`journal::fjall` and `gateway`) touches `lib.rs` and `journal/mod.rs` while
+several other P2 workstreams own those files. Revisit at P3, when the crate is
+quiet enough to gate cleanly.
+
 **Keyspace helpers.** `world_key`, `ckpt_key`, `world_range_start`/`_end` are private free functions in `orrery_persistd/src/checkpoint/fdb.rs`. They become a public `orrery_persistd::keyspace` module — one definition of the keyspace, used by the checkpointer, the cold reader and the seeder alike. This is what stops P-2/P-3 from recurring as a seeder-vs-checkpointer disagreement.
 
 ### 4.1 The component-bag seam
@@ -539,7 +551,15 @@ One entry per seeded row:
 (ContentKey, PersistId, grid, cell, value_digest, byte_len, archetype, layer, emit)
 ```
 
-**`value_digest` covers the value bytes only** — never the key. A digest over the key would be a function of the minted `PersistId` and the `CellId`, which makes the "same content, moved cell" case (a `Rekey`) arithmetically undetectable and makes manifests non-reproducible across clusters that allocated ids in a different order. Location lives in its own `(grid, cell)` field, so a move is a location diff with an unchanged digest, which is exactly what the patcher needs to see.
+**`value_digest` covers the component bag only** — never the key, and never the
+storage value's one-byte live/tombstone tag (P-6). The tag is storage framing,
+not content: a tombstone carries no bag at all, so a retire shows up in the
+manifest as a *presence* change rather than a digest change, and the seeder can
+compute the digest from `SeedEncoder`'s output before it knows anything about
+how the row will be framed. Pinning it on this side is what makes gate A4
+("identical manifest digest, zero rows changed") mean the same thing to the
+seeder, to `verify --full`, and to a cell actor re-checkpointing an untouched
+row. A digest over the key would be a function of the minted `PersistId` and the `CellId`, which makes the "same content, moved cell" case (a `Rekey`) arithmetically undetectable and makes manifests non-reproducible across clusters that allocated ids in a different order. Location lives in its own `(grid, cell)` field, so a move is a location diff with an unchanged digest, which is exactly what the patcher needs to see.
 
 Canonical order is **`(grid, cell, ContentKey)` ascending** — generation order, so the manifest streams out without a sort pass. (Sorting by `ContentKey`, which is uniformly random, would require an external sort: 470 MB at 10 M entities.)
 
@@ -615,7 +635,7 @@ error: noise.octaves = 8 exceeds the sub-cell cap of 4
 |---|---|---|
 | FDB transaction size | 10 MB | target **768 KiB** per transaction: well inside the limit, and small enough that a retry is cheap |
 | FDB transaction duration | 5 s | a 768 KiB batch commits in single-digit ms; never at risk |
-| FDB value size | 100 KB | `world/` rows above it split as `world/{cell}/{entity}/{k}`, `k` a big-endian `u16` suffix, read as one range; the suffix is **absent** for the common case, so the 17-byte key is unchanged |
+| FDB value size | 100 KB | **a hard error, not a split row** (P2 decision, → [08-persistence.md](08-persistence.md) §6): the reader identifies a `world/` row by its exact 21-byte key length, so a suffixed row would be invisible to `load` and `read_cold`. `plan` rejects an over-limit projection at V9; nothing writes one. Split rows are a P3 item |
 | Writes are blind | — | no reads, so no conflict ranges: the loader is `set`-only and transactions never conflict with each other |
 
 Concurrency is latency-governed: start at 8 in-flight transactions, additively increase while commit p99 stays under 20 ms, multiplicatively back off above it. Measured throughput is reported, never assumed.
@@ -732,7 +752,7 @@ Stated assumptions, because every number below moves with them:
 | Term | Value | Note |
 |---|---|---|
 | component bag | **256 B** | the sensitivity is linear; §13.2 restates the binding constraints at 128 B and 512 B |
-| `world/` key | 17 B | `b'w' ‖ cell(8) ‖ entity(8)` |
+| `world/` key | 21 B | `b'w' ‖ grid(4) ‖ cell(8) ‖ entity(8)` (P-7 landed; the pre-P-7 key was 17 B) |
 | FDB per-row overhead | ~40 B | key + value framing, conservative |
 | FDB replication | ×3, plus ~1.3 storage amplification | |
 | write throughput | 60 000 rows/s | measured on the 3-node dev posture; reported, not assumed |
@@ -807,7 +827,18 @@ What the seeder must prove for P2, and which prerequisite each gate depends on.
 | **A5** | Changing one layer param changes only the cells the plan predicted; `plan --diff` blast radius matches the applied diff | — |
 | **A6** | A row modified out-of-band is **kept**, not clobbered, by a subsequent patch, and is reported as a merge outcome | P-6 |
 | **A7** | `kill -9` the cluster on a seeded world under rig load, restart, and every pre-kill acked `ContentKey` is present with an identical digest | **P-1**, P-8 |
-| **A8** | `demo-hotspot` reproduces the `ckpt/{shard}` overflow deterministically, and passes once P-8 lands | P-8 |
+| **A8** | `demo-hotspot` reproduces the hot-shard skew deterministically — hottest shard ≥ 800 entities, shard Gini ≈ 0.095, max/mean ≈ 5.1× — and the `ckpt/{grid}/{shard}` row stays under 128 B **at that skew**, proving P-8 stays fixed | P-8 (landed) |
+
+**A8 was restated (2026-08-13).** As originally written it asserted that
+`demo-hotspot` *reproduces* a `ckpt/{shard}` value overflow, which was true of
+the pre-P-8 tree: the whole entity bag lived inside that one value, so 800
+entities on the hottest shard blew past FDB's 100 KB limit. The P-8 fix made
+`ckpt/` watermark-only, so the overflow is no longer reachable and the gate as
+written can never pass. Its value was never the overflow itself but the
+deterministic skew that produced it — so A8 now asserts the skew is still
+reproducible and that the watermark row stays small under it. That turns a gate
+which self-destructed on being satisfied into a permanent regression guard,
+which is what §14's gates are for.
 
 A1–A5 are the seeder's own; A6–A8 are the seeder proving the *cluster* works, which is what makes it a demo requirement rather than a tool.
 

@@ -254,28 +254,52 @@ Hot-key conflict retries are application responsibility under optimistic concurr
 
 | Subspace / key | Value | Writer | Notes |
 |---|---|---|---|
-| `world/{cell_id}/{entity_id}` | component bag (postcard), per-component slots | cell actor (checkpoint) | primary bulk state; row split `.../{k}` if > 100 KB; `cell_id` is grid-relative — interpreted within its grid's `CellId` space (see `grid/` row) |
+| `world/{grid_id}/{cell_id}/{entity_id}` | `0x00 ‖ component bag` (postcard) | cell actor (checkpoint) · offline import tool | primary bulk state. `cell_id` is the entity's **own interest cell**, grid-relative; `grid_id` is an explicit key field, not context (P-7). Values > 100 KB are a **hard error**, not a split row — see the note below the table |
 | `grid/{grid_id}` | `(parent GridId, origin transform, velocity, status)` | cell actor (checkpoint) | nested-grid frame registry ([01-spatial-model.md](01-spatial-model.md) §13): a carrier's motion re-keys *this one row*, never its contents; `world/` keys are read per-grid |
-| `world/{cell_id}/{entity_id}` *(tombstone)* | despawn marker w/ GC deadline | cell actor | cleared by checkpoint GC pass |
+| `world/{grid_id}/{cell_id}/{entity_id}` *(tombstone)* | `0x01 ‖ (tick, gc_deadline_ms)` | cell actor | same key family as the live row, distinguished by the value's first byte; cleared by the checkpoint GC pass past its deadline (P-6) |
 | `player/{account_id}` | profile, progression, settings | intent path | critical-class |
 | `player/{account_id}/loc` | `(cell_id, entity_id)` | cell actor on rekey | login placement pointer |
 | `ledger/bal/{account_id}/{asset_id}` | integer balance | **FDB txn only** | currency; integer math (D9) |
 | `ledger/item/{item_uid}` | `(owner_ref, item_state)` | **FDB txn only** | unique items; single ownership row = anti-dupe invariant |
 | `ledger/receipt/{versionstamp}` | `(intent_id, parties, ops)` | FDB txn (versionstamped key) | trade audit trail, strictly ordered |
-| `intent/{intent_id}` | outcome digest | FDB txn | idempotency: duplicate submission returns recorded outcome |
+| `intent/{intent_id}` | `(outcome, gc_deadline_ms)` | FDB txn | idempotency: a duplicate submission returns the recorded outcome. Retention is bounded — default **1 h**, swept by the same checkpoint pass that GCs despawn tombstones. A client's offline intent queue TTL must be shorter than this, or a replay after a long netsplit can double-apply |
 | `lease/{entity_id}` | `(holder NodeId, seq: SeqPair(auth_seq, own_seq), lease_id, expires_at, flags, group)` | lease registrar (CAS) | D7; TTL 10 s, heartbeat 2.5 s; `lease_id` = monotonic fencing token (gateway drops stale-`lease_id` uplinks); `flags`: `PLAYER_BOUND`/`STRONG_HELD`/`PROVISIONAL`/`PARKED`; `group` = attached children; full field semantics in [04-authority.md](04-authority.md) (canonical) |
-| `chunk/{cell_id}/{n}` | terrain shard ≤ 100 KB | cell actor (compaction) | §8 |
-| `chunk/{cell_id}/meta` | `(shard_count, base_version, encoding)` | cell actor | |
+| `chunk/{grid_id}/{cell_id}/{n}` | terrain shard ≤ 100 KB | cell actor (compaction) · offline import tool | §8; `n` is a big-endian `u16` so a cell's sections sort together |
+| `chunk/{grid_id}/{cell_id}/meta` | `(shard_count, base_version, encoding)` | cell actor | |
 | `section_pin/{section_key}` | `(entity PersistId, cell, status: pin_pending\|live\|dormant\|cooling(until), tick_pin, tick_promote, tick_demote, demote_image_hash, demote_chunk_ref)` | transition intents (§10.1) | terrain↔entity promotion anchor — D17.7, pending D18 |
 | `actor/{shard_cell_id}` | `(owner node, epoch, status)` | split/fence protocol | placement + fencing (§3.4) |
-| `ckpt/{shard_cell_id}` | `(node_id, journal lsn, epoch, time)` | cell actor | recovery watermark |
+| `ckpt/{grid_id}/{shard_cell_id}` | `(node_id, journal lsn, epoch, time)` | cell actor | recovery watermark, and **nothing else** — the entity bag lives in `world/` rows only (P-8) |
 | `jarchive/{node_id}/{segment_seq}` | `(object key, cell ranges, lsn span, checksum)` | archive tailer | journal-archive metadata |
 | `id/{account_id}` | account record, bound NodeIds, tokens | `orrery_identity` | canonical identity subspace; Sybil cost anchor (D10) |
 | `strike/{account_id}/{versionstamp}` | `(weight, decay t½=14 d, evidence ref)` | adjudication executor | read by identity for quarantine/ban thresholds |
 | `epoch/{cell_id}` | witness-epoch record: seed-key commitment (blake3), epoch bounds, revealed key at epoch end | coordinator (via gateway) | D10 witness-set seeding; commitment published in the epoch announcement, key revealed for retroactive verifiability |
 | `coord/leader` | coordinator leader lease (TTL) | coordinator (CAS) | active + warm-standby failover ([09-services-and-ops.md](09-services-and-ops.md)) |
 | `pid/next` | next unallocated `PersistId` (atomic add) | gateway (block grants) · intent path | block grants: contiguous ranges (default **4096**) leased per session, journaled, usable offline (§4) |
-| `content/version` | `(content build id, manifest digest)` | offline import tool | designed-content diff/patch on later deploys (§17) |
+| `content/version` | `(content build id, manifest digest, scenario seed, config digest, toolchain, seeded_at)` | offline import tool | designed-content diff/patch on later deploys (§17, [12-world-seeding.md](12-world-seeding.md) §9.3) |
+| `seedmap/{content_key}` | `(PersistId, grid, cell, first_seen_build)` | offline import tool | the idmap that makes a re-seed keep its `PersistId`s ([12-world-seeding.md](12-world-seeding.md) §9.2) |
+| `seedprog/{emit}/{grid}/{cell}` | subtree completion marker | offline import tool | resume marker for an interrupted bulk load ([12-world-seeding.md](12-world-seeding.md) §11.1) |
+
+**Implementation.** The byte layout of every row above is defined once, in
+`orrery_persistd::keyspace` — one module used by the checkpointer, the cold
+reader, the intent path and the offline seeder alike, so a key convention
+cannot drift between its writers. Each family carries a one-byte discriminator
+in place of the logical string prefix (`w` world, `c` ckpt, `k` chunk, `a`
+actor, `i` intent, `s` seedmap, `p` seedprog, `v` content/version); the
+families are provably range-disjoint and a test asserts it pairwise.
+
+**No split rows (P2 decision, 2026-08-13).** An earlier revision of this table
+specified that a `world/` value above FDB's 100 KB limit splits into
+`world/…/{k}` rows with a `u16` suffix, read back as one range. That is not
+implemented and P2 does not implement it: the reader identifies a `world/` row
+by its exact key length, so a split row would be invisible to both `load` and
+`read_cold`, and making it visible complicates the cold reader, the checkpoint
+writer, the seeder's manifest and its `verify` pass simultaneously. Instead an
+over-limit value is a **hard error** — the seeder rejects it at plan time
+(V9, [12-world-seeding.md](12-world-seeding.md) §10) and the checkpointer
+refuses rather than writing a value it could never read back. At the 256 B
+component bag the cost model assumes, the limit is ~390× the largest bag any
+P2 profile produces; split rows are a P3 item, to be revisited if a real game's
+bag approaches the limit.
 
 ## 7. Worked example: item trade
 

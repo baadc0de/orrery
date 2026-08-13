@@ -90,6 +90,20 @@ Indicative calendar (planning estimate, not normative): P0 Q3 2026 · P1 Q4 2026
 
 P-1 and P-8 block the demo criterion on their own. P-2, P-3, P-5 and P-6 block *seeded* worlds specifically; P-4 gates the latency numbers; P-7 gates nested grids. **All eight are fixed as of 2026-08-13** — P-1/P-4 in `actor.rs`/`runtime.rs`, P-2/P-3/P-6/P-7/P-8 in `checkpoint/fdb.rs`, P-5 in `cluster.rs` — each with a regression test; the seeder's acceptance gates (§14) can be built on the current tree.
 
+**Implementation decisions taken during the P2 build (2026-08-13).** Each of
+these binds more than one workstream, so it is recorded here rather than being
+settled independently inside a single change.
+
+| # | Decision | Why |
+|---|---|---|
+| **C-1** | **The reliable-stream class is not realized in P2.** Area loads and intents ride the packet lane, not a QUIC stream. Pages are chunked under a conservative datagram budget with sequenced continuation markers and send errors are logged rather than swallowed; intents are made safe by at-least-once delivery plus the `intent/{intent_id}` idempotency row and a client-side in-flight retransmit timeout. | [08-persistence.md](08-persistence.md) §2/§2.1 assign these to a reliable-stream class, but no such lane exists in this build: the client talks through `aeronet_io` 0.21's `Session`, whose surface is packet-only, and the server side is raw iroh datagrams. A true stream lane is a change to the vendored `aeronet_iroh` IO layer, which is P3 work. At-least-once plus an idempotency row is a legitimate route to exactly-once *outcomes*, and the keyspace already anticipated it. |
+| **C-2** | **Journal replay drops only records superseded at write time.** Recovery scans in LSN order maintaining the running maximum epoch and discards a record iff its epoch is **below** that running maximum — not below the runtime's current epoch. | The naive predicate (`rec.epoch < current_epoch`) is inert only while the binary pins `Epoch::new(0)` and nothing fences. The moment startup fencing lands, it discards every legitimately acked record on every restart — the demo's exact failure mode, in a form that reads as success until someone counts entities. Zombie protection comes from the `actor/{shard}` fence CAS and the checkpoint's epoch read, not from filtering a node's own journal. |
+| **C-3** | **`world/` values over 100 KB are a hard error, not a split row.** | → [08-persistence.md](08-persistence.md) §6. The reader identifies a row by exact key length; a suffixed row would be invisible to `load` and `read_cold`. |
+| **C-4** | **The manifest's `value_digest` covers the component bag only**, excluding the storage value's live/tombstone tag byte. | → [12-world-seeding.md](12-world-seeding.md) §9.3. One decision with three consumers; if they disagree, gate A4 fails for a reason nobody can localize. |
+| **C-5** | **`--profile <name>` selects an in-file `[profile.<name>]` overlay; the five ladder rungs are separate scenario files.** `apply --profile demo` therefore names a scenario file too, and `scenarios/p2demo.toml` ships with a baseline `[profile.demo]` and a 1000×-smaller `[profile.ci]`. | [12-world-seeding.md](12-world-seeding.md) §13.2 calls `apply --profile demo` "the entire P2 demo runbook line" while §5.2 defines `[profile.<name>]` as a file-local overlay. Binding profiles to files rather than to a global rung table keeps the ladder extensible without a registry, at the cost of one extra argument on the runbook line. |
+| **C-6** | **`orrery_seed` depends on `orrery_persistd` with default features**, linking fjall and iroh into a batch tool. | → [12-world-seeding.md](12-world-seeding.md) §4. A knowing deviation from that section's own rationale; costs build time, not correctness. Revisit at P3. |
+| **C-7** | **Gate A8 is restated** as a skew-reproduction and watermark-size regression guard. | → [12-world-seeding.md](12-world-seeding.md) §14. The gate as written self-destructed when P-8 was fixed. |
+
 **Upstream milestone.** Issues/patches to `foundationdb-rs` 0.11 and fjall as encountered; publish the FDB layer-schema notes.
 
 ## P3 — Authority
