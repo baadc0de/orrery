@@ -261,18 +261,35 @@ async fn handle_connection(
                 route_subscribe(&send, grid, cells, &router).await
             }
             GatewayMsg::SubmitIntent { intent } => {
-                let t = Tick::new(tick.fetch_add(1, Ordering::Relaxed) + 1);
-                let reply = GatewayReply::IntentAck {
-                    intent_id: intent.intent_id,
-                    outcome: IntentOutcome::Committed {
-                        tick: t,
-                        minted: Vec::new(),
-                    },
-                };
-                send(Bytes::from(encode_stream_frame(&reply)));
+                route_intent(&send, intent, &tick, &router).await
             }
         }
     }
+}
+
+/// Execute one submitted intent and reply with its outcome.
+///
+/// **Stub.** Accepts the wire shape and commits optimistically without
+/// validating the signature, without a `Ruleset` check, and without an FDB
+/// transaction. The P2 deliverable is signature check → `Ruleset` validation
+/// stub → FDB serializable optimistic transaction (docs/11-roadmap.md §P2);
+/// witness attestation is P5.
+async fn route_intent(
+    send: &(dyn Fn(Bytes) + Send + Sync),
+    intent: orrery_protocol::Intent,
+    tick: &AtomicU64,
+    router: &Arc<dyn Router>,
+) {
+    let _ = router;
+    let t = Tick::new(tick.fetch_add(1, Ordering::Relaxed) + 1);
+    let reply = GatewayReply::IntentAck {
+        intent_id: intent.intent_id,
+        outcome: IntentOutcome::Committed {
+            tick: t,
+            minted: Vec::new(),
+        },
+    };
+    send(Bytes::from(encode_stream_frame(&reply)));
 }
 
 /// Send the `[ACCEPTED]` admission response on a fresh uni stream.

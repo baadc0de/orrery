@@ -504,7 +504,11 @@ async fn fdb_subtree_keying_and_watermark_only_checkpoint() {
 
     // P-3: delete clears the shard's subtree but not the foreign row.
     store.delete(shard, GridId::new(9004)).await.unwrap();
-    assert!(store.load(shard, GridId::new(9004)).await.unwrap().is_none());
+    assert!(store
+        .load(shard, GridId::new(9004))
+        .await
+        .unwrap()
+        .is_none());
     assert!(store
         .read_cold(GridId::new(9004), shard)
         .await
@@ -628,7 +632,11 @@ async fn fdb_tombstones_write_gc_and_isolate_grids() {
     assert!(page2.entities.contains_key(&PersistId::new(3)));
 
     store.delete(shard, GridId::new(9005)).await.unwrap();
-    assert!(store.load(shard, GridId::new(9005)).await.unwrap().is_none());
+    assert!(store
+        .load(shard, GridId::new(9005))
+        .await
+        .unwrap()
+        .is_none());
     let page2_after = store
         .read_cold(g2, cell)
         .await
