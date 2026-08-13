@@ -178,36 +178,52 @@ mod tests {
 
     #[test]
     fn content_key_is_position_and_pid_independent() {
-        // D-C: the key commits to the derivation path only. Neither
-        // `local_pos` nor the minted `PersistId` appears in the preimage
-        // type at all, so this test varies them at the call site and asserts
-        // the key derivation has no input to consume: the preimage built for
-        // two different (position, PersistId) pairs is byte-identical.
+        // D-C: the key commits to the derivation path only. The strongest
+        // form of this assertion is not "two calls with equal preimages
+        // agree" (tautological) but: the preimage TYPE has no field for
+        // position or PersistId, so the only way to feed them in is to hash
+        // them separately and show the key does not move. We do exactly
+        // that: derive the key, then confirm that a key built from a
+        // preimage that DID mix in (local_pos, persist_id) bytes differs —
+        // proving the canonical preimage excludes them by construction.
         let pre = preimage("p2demo", "crate");
-        let key_a = ContentKey::derive(&pre);
+        let key = ContentKey::derive(&pre);
 
-        let local_pos_a = [12.5f32, -3.25, 100.0];
-        let local_pos_b = [127.9f32, 0.0, 1.0];
-        let pid_a = PersistId::new(1);
-        let pid_b = PersistId::new(9_999_999);
+        let local_pos = [12.5f32, -3.25, 100.0];
+        let pid = PersistId::new(9_999_999);
 
-        // Rebuild the preimage "after" a position/PersistId assignment: the
-        // struct has no field to change, which is the point — assert the
-        // derived key is unchanged and that the two (pos, pid) pairs are
-        // genuinely different inputs at the call site.
-        let pre_b = ContentKeyPreimage {
-            scenario: pre.scenario,
-            emit: pre.emit,
-            layer: pre.layer,
-            grid: pre.grid,
-            cell: pre.cell,
-            index: pre.index,
-            archetype: pre.archetype,
-        };
-        let key_b = ContentKey::derive(&pre_b);
-        assert_ne!(local_pos_a, local_pos_b);
-        assert_ne!(pid_a, pid_b);
-        assert_eq!(key_a, key_b, "position and PersistId never enter the key");
+        // Independent construction: the same derivation path, then WITH
+        // position/PersistId bytes appended. If the canonical key equals the
+        // plain path-derived digest and differs from the adulterated one,
+        // position and PersistId are provably outside the preimage.
+        let mut canonical = Vec::new();
+        canonical.extend_from_slice(b"orrery.ck.v1");
+        canonical.extend_from_slice(b"p2demo");
+        canonical.extend_from_slice(b"props");
+        canonical.extend_from_slice(b"world");
+        canonical.extend_from_slice(&0u32.to_be_bytes());
+        canonical.extend_from_slice(&0xA924_9249_2492_4D65u64.to_be_bytes());
+        canonical.extend_from_slice(&42u64.to_le_bytes());
+        canonical.extend_from_slice(b"crate");
+        let expected = blake3::hash(&canonical);
+        assert_eq!(
+            &key.0,
+            &expected.as_bytes()[..16],
+            "the key is exactly the derivation-path digest"
+        );
+
+        let mut adulterated = canonical.clone();
+        for f in local_pos {
+            adulterated.extend_from_slice(&f.to_le_bytes());
+        }
+        adulterated.extend_from_slice(&pid.0.to_be_bytes());
+        let adulterated_digest = blake3::hash(&adulterated);
+        assert_ne!(
+            key.0,
+            adulterated_digest.as_bytes()[..16],
+            "mixing (local_pos, PersistId) into the preimage changes the digest — \
+             and the canonical key has no such bytes"
+        );
     }
 
     #[test]
