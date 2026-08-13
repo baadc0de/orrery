@@ -19,7 +19,10 @@
 //! - **Intent queue** — signed, witness-attested critical writes (D11 §2.2)
 //!   with the netsplit posture (D12): while the gateway is unreachable the
 //!   queue persists locally and durable commits pause; on reconnect, queued
-//!   intents replay (idempotency keys make this safe).
+//!   intents replay (idempotency keys make this safe). In-flight intents are
+//!   requeued on disconnect or in-flight timeout.
+//! - **Latency sampling** — bounded-memory histograms (D16) for bulk-ack and
+//!   intent-commit latency, readable from the scheduler and queue resources.
 //!
 //! The gateway wire surface lives in `orrery_protocol` (engine-agnostic, D15),
 //! so `orrery_persistd` and this crate share one message set. The transport is
@@ -40,6 +43,7 @@ pub mod config;
 pub mod feed;
 pub mod gateway;
 pub mod intents;
+pub mod latency;
 pub mod plugin;
 pub mod queue_store;
 pub mod replies;
@@ -50,5 +54,6 @@ pub use config::PersistClientConfig;
 pub use feed::{feed_uplink, LocallyAuthoritative, PersistId, UplinkSeq};
 pub use gateway::{GatewayConfig, GatewaySession, GatewayState, SessionEvent};
 pub use intents::{IntentQueue, IntentStatus, IntentTicket, PredictedEffects};
+pub use latency::LatencyHistogram;
 pub use plugin::{OrreryPersistClientPlugin, PersistClientSet};
 pub use uplink::UplinkScheduler;

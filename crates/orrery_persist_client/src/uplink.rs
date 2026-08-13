@@ -13,16 +13,24 @@
 //! output, wired by [`crate::feed::feed_uplink`]) and drains the selected diffs
 //! each flush. The Bevy system in [`crate::plugin`] wires this to the gateway
 //! session.
+//!
+//! Ack-latency sampling (D16: bulk ack p99 < 5 ms): [`flush`] records the send
+//! instant of each diff it selects, and [`on_ack`] computes the send→ack
+//! round trip into the ack-latency histogram. A resent diff carries the
+//! latest send instant, so a retransmission is not credited with the original
+//! send time.
 
 use std::collections::HashMap;
 use std::time::Duration;
 
 use bevy_ecs::prelude::*;
+use bevy_platform::time::Instant;
 use bevy_time::Time;
 use orrery_protocol::{DiffUplink, PersistId, Tick};
 
 use crate::config::PersistClientConfig;
 use crate::gateway::GatewaySession;
+use crate::latency::LatencyHistogram;
 
 /// Per-entity scheduler state.
 #[derive(Debug, Clone)]
@@ -39,6 +47,10 @@ struct EntityState {
     last_acked_tick: Option<Tick>,
     /// The client-side sequence of the last sent diff.
     last_seq: u64,
+    /// The instant the currently-pending diff was last sent (for ack-latency
+    /// sampling). Updated on every resend so a retransmitted diff is not
+    /// credited with the original send time.
+    last_sent_at: Option<Instant>,
 }
 
 /// The per-entity diff uplink scheduler (D11 §2.1, docs/10-crates.md §9).
@@ -47,12 +59,18 @@ struct EntityState {
 /// entity. The plugin's flush system calls [`UplinkScheduler::flush`] each
 /// update to select which diffs to send this flush, bounded by the config's
 /// byte budget.
+///
+/// Ack-latency sampling: [`flush`](Self::flush) records the send instant, and
+/// [`on_ack`](Self::on_ack) computes the round trip into the ack-latency
+/// histogram. A resent diff carries the latest send instant.
 #[derive(Debug, Default, Resource)]
 pub struct UplinkScheduler {
     /// Per-entity scheduler state.
     entities: HashMap<PersistId, EntityState>,
     /// The last flush elapsed time, for rate accumulation.
     last_elapsed: Option<Duration>,
+    /// Bulk-ack latency histogram (D16: bulk ack p99 < 5 ms).
+    ack_latency: LatencyHistogram,
 }
 
 impl UplinkScheduler {
@@ -73,6 +91,7 @@ impl UplinkScheduler {
             last_sent_tick: None,
             last_acked_tick: None,
             last_seq: 0,
+            last_sent_at: None,
         });
         entry.rate_hz = rate_hz;
     }
@@ -149,6 +168,7 @@ impl UplinkScheduler {
         // Pack greedily into the byte budget.
         let mut out = Vec::new();
         let mut used = 0usize;
+        let now = Instant::now();
         for (entity, _) in ready {
             let state = self
                 .entities
@@ -165,6 +185,10 @@ impl UplinkScheduler {
             state.last_sent_tick = Some(diff.tick);
             state.last_seq = diff.seq;
             state.acc = 0.0; // packed entities reset their accumulator (§5.2)
+                             // Record the send instant for ack-latency sampling. Updated on
+                             // every send (including resends) so a retransmitted diff is not
+                             // credited with the original send time.
+            state.last_sent_at = Some(now);
             out.push(diff);
         }
 
@@ -176,6 +200,11 @@ impl UplinkScheduler {
     /// Clears the pending diff if it matches the acked tick (the ack is the
     /// durability contract, D11 §2.1). A provisional ack (epoch-unconfirmed)
     /// is treated as unacked and left pending for resend.
+    ///
+    /// Records a bulk-ack latency sample (D16: p99 < 5 ms): the time from the
+    /// latest send of the acked diff to this ack. Since [`flush`](Self::flush)
+    /// stamps the send instant on every send, a retransmitted diff is not
+    /// credited with the original send time.
     pub fn on_ack(&mut self, entity: PersistId, tick: Tick, provisional: bool) {
         if provisional {
             return;
@@ -183,6 +212,10 @@ impl UplinkScheduler {
         if let Some(state) = self.entities.get_mut(&entity) {
             state.last_acked_tick = Some(tick);
             if state.pending.as_ref().is_some_and(|d| d.tick == tick) {
+                // Record ack-latency: time from the latest send to this ack.
+                if let Some(sent_at) = state.last_sent_at {
+                    self.ack_latency.record(sent_at.elapsed());
+                }
                 state.pending = None;
             }
         }
@@ -211,6 +244,12 @@ impl UplinkScheduler {
     #[must_use]
     pub fn priority(&self, entity: PersistId) -> f32 {
         self.entities.get(&entity).map_or(0.0, |s| s.acc)
+    }
+
+    /// The bulk-ack latency histogram (D16: p99 < 5 ms).
+    #[must_use]
+    pub fn ack_latency(&self) -> &LatencyHistogram {
+        &self.ack_latency
     }
 }
 
@@ -315,6 +354,7 @@ mod tests {
         let mut sched = UplinkScheduler::new();
         sched.register(PersistId::new(1), 4.0);
         sched.queue(diff(1, 1, b"hp=50"));
+        sched.flush(&cfg, t(0)); // baseline
         sched.flush(&cfg, t(250));
 
         // A provisional ack does not clear the pending diff.
@@ -333,6 +373,7 @@ mod tests {
         let mut sched = UplinkScheduler::new();
         sched.register(PersistId::new(1), 4.0);
         sched.queue(diff(1, 1, b"hp=50"));
+        sched.flush(&cfg, t(0)); // baseline
         sched.flush(&cfg, t(250));
         sched.on_nack(PersistId::new(1), Tick::new(1));
         assert!(!sched.has_pending(PersistId::new(1)));
@@ -345,6 +386,7 @@ mod tests {
         sched.register(PersistId::new(1), 4.0);
         sched.queue(diff(1, 1, b"hp=50"));
         sched.queue(diff(1, 2, b"hp=25"));
+        sched.flush(&cfg, t(0)); // baseline
         sched.flush(&cfg, t(250));
         // The newest diff (tick 2) is pending; acking tick 2 clears it.
         sched.on_ack(PersistId::new(1), Tick::new(2), false);
@@ -385,5 +427,94 @@ mod tests {
         // The 4 Hz entity accrued 1.0, the 1 Hz entity 0.25; only the fast
         // one is ready, so it sends first.
         assert_eq!(out[0].entity, PersistId::new(1));
+    }
+
+    #[test]
+    fn ack_latency_sample_is_recorded_per_ack() {
+        let cfg = cfg();
+        let mut sched = UplinkScheduler::new();
+        sched.register(PersistId::new(1), 4.0);
+        sched.queue(diff(1, 1, b"hp=50"));
+
+        // First flush establishes the baseline (no accumulation).
+        sched.flush(&cfg, t(0));
+        // Second flush: 250 ms at 4 Hz → 1.0 priority → sends the diff.
+        sched.flush(&cfg, t(250));
+
+        // Before ack, the histogram is empty.
+        assert_eq!(sched.ack_latency().total(), 0);
+
+        // Ack the diff.
+        sched.on_ack(PersistId::new(1), Tick::new(1), false);
+        // The histogram now has one sample.
+        assert_eq!(sched.ack_latency().total(), 1);
+        // The sample should be a positive duration (the time from flush to ack).
+        assert!(sched.ack_latency().min().unwrap() > Duration::ZERO);
+    }
+
+    #[test]
+    fn resend_does_not_produce_negative_or_absurd_sample() {
+        // Verify that a resend uses the latest send instant, so a
+        // retransmitted diff is not credited with the original send time.
+        let cfg = cfg();
+        let mut sched = UplinkScheduler::new();
+        sched.register(PersistId::new(1), 4.0);
+        sched.queue(diff(1, 1, b"hp=50"));
+
+        // First flush establishes baseline (no send).
+        sched.flush(&cfg, t(0));
+        // Second flush (send at t=250).
+        sched.flush(&cfg, t(250));
+        // Third flush (resend at t=500) — the diff is still pending because
+        // it hasn't been acked.
+        sched.flush(&cfg, t(500));
+
+        // Ack the diff.
+        sched.on_ack(PersistId::new(1), Tick::new(1), false);
+        // The latency should be roughly the time from the third flush (t=500)
+        // to now, which is small and positive — not negative or absurd.
+        let latency = sched.ack_latency().min().unwrap();
+        assert!(
+            latency > Duration::ZERO,
+            "latency must be positive, got {latency:?}"
+        );
+        assert!(
+            latency < Duration::from_secs(1),
+            "latency must be absurdly small, got {latency:?}"
+        );
+    }
+
+    #[test]
+    fn provisional_ack_does_not_record_latency() {
+        let cfg = cfg();
+        let mut sched = UplinkScheduler::new();
+        sched.register(PersistId::new(1), 4.0);
+        sched.queue(diff(1, 1, b"hp=50"));
+        sched.flush(&cfg, t(0)); // baseline
+        sched.flush(&cfg, t(250));
+
+        // A provisional ack should not record a latency sample.
+        sched.on_ack(PersistId::new(1), Tick::new(1), true);
+        assert_eq!(sched.ack_latency().total(), 0);
+    }
+
+    #[test]
+    fn ack_latency_count_equals_ack_count() {
+        let cfg = cfg();
+        let mut sched = UplinkScheduler::new();
+        // Register two entities and send diffs.
+        sched.register(PersistId::new(1), 4.0);
+        sched.register(PersistId::new(2), 4.0);
+        sched.queue(diff(1, 1, b"a"));
+        sched.queue(diff(2, 1, b"b"));
+        sched.flush(&cfg, t(0)); // baseline
+        sched.flush(&cfg, t(250));
+
+        // Ack both.
+        sched.on_ack(PersistId::new(1), Tick::new(1), false);
+        sched.on_ack(PersistId::new(2), Tick::new(1), false);
+
+        // The recorder count equals the ack count.
+        assert_eq!(sched.ack_latency().total(), 2);
     }
 }

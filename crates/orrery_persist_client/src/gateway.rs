@@ -5,6 +5,13 @@
 //! area load + intents ride reliable streams. This module tracks the session
 //! lifecycle and exposes the two channels, plus the session event stream that
 //! drives the uplink scheduler's reconnect/resend behavior.
+//!
+//! Exponential backoff (D3): on disconnect, the reconnect delay starts at
+//! `INITIAL_RECONNECT_DELAY` and doubles each attempt up to
+//! `MAX_RECONNECT_DELAY`, reset on successful connect. This prevents
+//! reconnect storms during a netsplit.
+
+use std::time::Duration;
 
 use bevy_ecs::prelude::*;
 use bevy_platform::time::Instant;
@@ -13,6 +20,14 @@ use bytes::Bytes;
 use aeronet_iroh::iroh;
 use orrery_net::channels::{tag, Channel};
 use orrery_protocol::{GatewayMsg, GatewayReply, NodeId, PROTOCOL_VERSION};
+
+use crate::intents::IntentQueue;
+
+/// The minimum delay before the first reconnect attempt.
+const INITIAL_RECONNECT_DELAY: Duration = Duration::from_millis(100);
+
+/// The maximum delay between reconnect attempts.
+const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(10);
 
 /// The ALPN the gateway session negotiates (D3). Matches the coordinator/peer
 /// ALPN so the same endpoint can dial the gateway.
@@ -44,6 +59,10 @@ pub enum SessionEvent {
 /// Tracks the aeronet session entity, the negotiated state, and the last
 /// connect/disconnect timestamps. The actual bytes flow through the session's
 /// datagram buffer; this resource is the bookkeeping on top.
+///
+/// Reconnect uses exponential backoff (D3): after disconnect, the delay starts
+/// at [`INITIAL_RECONNECT_DELAY`] and doubles each attempt up to
+/// [`MAX_RECONNECT_DELAY`], reset on successful connection.
 #[derive(Debug, Resource)]
 pub struct GatewaySession {
     /// The aeronet session entity, if connected.
@@ -66,6 +85,8 @@ pub struct GatewaySession {
     /// Whether the hello has been sent on the current session (prevents
     /// resending it every frame while the gateway has not yet acknowledged).
     pub hello_sent: bool,
+    /// The current exponential-backoff reconnect delay.
+    reconnect_delay: Duration,
 }
 
 impl Default for GatewaySession {
@@ -80,6 +101,7 @@ impl Default for GatewaySession {
             token: Vec::new(),
             node: NodeId::from_bytes(&[0u8; 32]).expect("zero node id is valid"),
             hello_sent: false,
+            reconnect_delay: INITIAL_RECONNECT_DELAY,
         }
     }
 }
@@ -98,6 +120,12 @@ impl GatewaySession {
     #[must_use]
     pub fn is_connected(&self) -> bool {
         self.state == GatewayState::Connected
+    }
+
+    /// Reset the exponential-backoff reconnect delay (called on successful
+    /// connection, so the next disconnect starts fresh).
+    pub fn reset_backoff(&mut self) {
+        self.reconnect_delay = INITIAL_RECONNECT_DELAY;
     }
 
     /// Encode a gateway message as a tagged datagram for the bulk channel.
@@ -169,6 +197,10 @@ impl GatewayConfig {
 /// Spawns an aeronet session dialing [`GatewayConfig`], records its entity and
 /// the local node id (D3: transport identity) on [`GatewaySession`], and enters
 /// [`GatewayState::Connecting`].
+///
+/// Exponential backoff (D3): after a disconnect, the reconnect delay increases
+/// from [`INITIAL_RECONNECT_DELAY`] up to [`MAX_RECONNECT_DELAY`], and resets on
+/// successful connection. This prevents reconnect storms during a netsplit.
 pub fn connect_gateway(
     mut commands: Commands,
     mut session: ResMut<GatewaySession>,
@@ -182,6 +214,14 @@ pub fn connect_gateway(
     else {
         return;
     };
+
+    // Exponential backoff: wait before re-dialling.
+    if let Some(since) = session.disconnected_at {
+        let elapsed = since.elapsed();
+        if elapsed < session.reconnect_delay {
+            return;
+        }
+    }
 
     let session_entity = commands.spawn_empty().id();
     commands
@@ -225,9 +265,14 @@ pub fn hello_gateway(
 /// layer (connect failed, or the connection dropped), so the next frame
 /// re-dials. Unacked buffered diffs stay in the scheduler and are resent on the
 /// new connect (records are idempotent, keyed by `(entity, tick)`).
+///
+/// Calls [`IntentQueue::requeue_all_inflight`] so intents that were mid-flight
+/// when the connection dropped return to `Queued` and retransmit on reconnect
+/// (netsplit posture, D11 §2.2, D12).
 pub fn disconnect_gateway(
     mut session: ResMut<GatewaySession>,
     mut removed: RemovedComponents<aeronet_io::Session>,
+    mut queue: ResMut<IntentQueue>,
 ) {
     let Some(entity) = session.session else {
         return;
@@ -239,11 +284,17 @@ pub fn disconnect_gateway(
     session.session = None;
     session.hello_sent = false;
     session.disconnected_at = Some(Instant::now());
+    // Exponential backoff: double the delay each disconnect, capped at max.
+    session.reconnect_delay = (session.reconnect_delay * 2).min(MAX_RECONNECT_DELAY);
+    // Netsplit posture (D12): requeue in-flight intents so they replay on
+    // the next drain after reconnect.
+    queue.requeue_all_inflight();
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::intents::{IntentStatus, IntentTicket};
     use orrery_protocol::{DiffUplink, GatewayMsg, GridId, PersistId, RecordKind, Tick};
 
     #[allow(clippy::needless_pass_by_value)]
@@ -356,6 +407,7 @@ mod tests {
     fn disconnect_resets_to_disconnected() {
         let mut app = bevy_app::App::new();
         app.init_resource::<GatewaySession>()
+            .init_resource::<IntentQueue>()
             .add_systems(bevy_app::Update, disconnect_gateway);
         let session_entity = app
             .world_mut()
@@ -379,5 +431,121 @@ mod tests {
         assert_eq!(session.state, GatewayState::Disconnected);
         assert!(session.session.is_none());
         assert!(!session.hello_sent);
+    }
+
+    #[test]
+    fn disconnect_doubles_backoff() {
+        let mut app = bevy_app::App::new();
+        app.init_resource::<GatewaySession>()
+            .init_resource::<IntentQueue>()
+            .add_systems(bevy_app::Update, disconnect_gateway);
+        let session_entity = app
+            .world_mut()
+            .spawn(aeronet_io::Session::new(
+                bevy_platform::time::Instant::now(),
+                1024,
+            ))
+            .id();
+        {
+            let mut session = app.world_mut().resource_mut::<GatewaySession>();
+            // Start at the initial delay.
+            session.reconnect_delay = INITIAL_RECONNECT_DELAY;
+            session.state = GatewayState::Connected;
+            session.session = Some(session_entity);
+        }
+
+        app.world_mut().despawn(session_entity);
+        app.update();
+
+        let session = app.world().resource::<GatewaySession>();
+        assert_eq!(session.state, GatewayState::Disconnected);
+        // Backoff should have doubled.
+        assert_eq!(
+            session.reconnect_delay,
+            (INITIAL_RECONNECT_DELAY * 2).min(MAX_RECONNECT_DELAY)
+        );
+    }
+
+    #[test]
+    fn disconnect_requeues_inflight_intents() {
+        let mut app = bevy_app::App::new();
+        app.init_resource::<GatewaySession>()
+            .init_resource::<IntentQueue>()
+            .add_systems(bevy_app::Update, disconnect_gateway);
+
+        // Submit an intent and drain it so it's InFlight.
+        {
+            let mut queue = app.world_mut().resource_mut::<IntentQueue>();
+            queue.submit(intent(1)).unwrap();
+        }
+        {
+            let mut queue = app.world_mut().resource_mut::<IntentQueue>();
+            queue.drain();
+            assert_eq!(queue.status(IntentTicket(1)), IntentStatus::InFlight);
+        }
+
+        let session_entity = app
+            .world_mut()
+            .spawn(aeronet_io::Session::new(
+                bevy_platform::time::Instant::now(),
+                1024,
+            ))
+            .id();
+        {
+            let mut session = app.world_mut().resource_mut::<GatewaySession>();
+            session.state = GatewayState::Connected;
+            session.session = Some(session_entity);
+        }
+
+        // Despawn to trigger disconnect.
+        app.world_mut().despawn(session_entity);
+        app.update();
+
+        // The in-flight intent should be requeued.
+        let queue = app.world().resource::<IntentQueue>();
+        assert_eq!(queue.status(IntentTicket(1)), IntentStatus::Queued);
+    }
+
+    #[test]
+    fn connect_gateway_respects_backoff() {
+        let mut app = bevy_app::App::new();
+        app.init_resource::<GatewaySession>()
+            .add_systems(bevy_app::Update, connect_gateway);
+
+        // Set the session as recently disconnected so the backoff is active.
+        {
+            let mut session = app.world_mut().resource_mut::<GatewaySession>();
+            session.state = GatewayState::Disconnected;
+            session.disconnected_at = Some(Instant::now());
+            session.reconnect_delay = Duration::from_secs(60); // very long delay
+        }
+
+        // connect_gateway must not attempt a connect because the backoff delay
+        // has not elapsed.
+        app.update();
+        let session = app.world().resource::<GatewaySession>();
+        assert_eq!(session.state, GatewayState::Disconnected);
+    }
+
+    fn intent(id: u128) -> orrery_protocol::Intent {
+        orrery_protocol::Intent {
+            intent_id: id,
+            issuer: node(1),
+            cell_epoch: orrery_protocol::Epoch::new(0),
+            ops: vec![],
+            attestations: vec![],
+            signature: sig(),
+        }
+    }
+
+    fn node(n: u8) -> orrery_protocol::NodeId {
+        let mut seed = [0u8; 32];
+        seed[0] = n;
+        iroh_base::SecretKey::from_bytes(&seed).public()
+    }
+
+    fn sig() -> orrery_protocol::Signature {
+        let seed = [0u8; 32];
+        iroh_base::SecretKey::from_bytes(&seed).sign(b"test")
     }
 }

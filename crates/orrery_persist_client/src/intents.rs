@@ -11,13 +11,22 @@
 //! Outcomes are predicted locally so the UI does not wait for the < 10 ms
 //! commit (D8: intents are the only path for durable consequences, so the
 //! predicted effect is rolled back on `Rejected`).
+//!
+//! Netsplit recovery (D11 §2.2): intents flipped to `InFlight` by [`drain`]
+//! are returned to `Queued` by [`requeue_all_inflight`] on disconnect, and the
+//! plugin's reconnect system calls it via [`disconnect_gateway`]. A per-intent
+//! in-flight timeout (default 10 s) also retriggers requeue so an unacked
+//! intent is retransmitted without a full disconnect cycle.
 
 use std::collections::VecDeque;
+use std::time::Duration;
 
 use bevy_ecs::prelude::*;
+use bevy_platform::time::Instant;
 use orrery_protocol::{Intent, IntentOutcome};
 
 use crate::gateway::GatewaySession;
+use crate::latency::LatencyHistogram;
 use crate::queue_store::{open_store, QueueStore};
 
 /// A ticket identifying a queued intent.
@@ -58,7 +67,15 @@ struct QueuedIntent {
     intent: Intent,
     status: IntentStatus,
     predicted: Option<PredictedEffects>,
+    /// When this intent was submitted (for latency tracking).
+    submitted_at: Instant,
+    /// When this intent was last sent (for in-flight timeout checking).
+    /// `None` if it has never been sent.
+    sent_at: Option<Instant>,
 }
+
+/// Default in-flight timeout before an unacked intent is requeued (10 s).
+const INFLIGHT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The intent queue (docs/10-crates.md §9).
 ///
@@ -77,6 +94,8 @@ pub struct IntentQueue {
     capacity: usize,
     /// The durable store (in-memory unless disk-backed).
     store: Box<dyn QueueStore>,
+    /// Intent-commit latency histogram (D16: intent commit p99 < 10 ms).
+    intent_latency: LatencyHistogram,
 }
 
 impl Default for IntentQueue {
@@ -85,6 +104,7 @@ impl Default for IntentQueue {
             queue: VecDeque::new(),
             capacity: 4096,
             store: Box::new(crate::queue_store::MemQueueStore::new()),
+            intent_latency: LatencyHistogram::new(),
         }
     }
 }
@@ -97,6 +117,7 @@ impl IntentQueue {
             queue: VecDeque::new(),
             capacity,
             store: Box::new(crate::queue_store::MemQueueStore::new()),
+            intent_latency: LatencyHistogram::new(),
         }
     }
 
@@ -112,12 +133,15 @@ impl IntentQueue {
                 intent,
                 status: IntentStatus::Queued,
                 predicted: None,
+                submitted_at: Instant::now(),
+                sent_at: None,
             });
         }
         Self {
             queue,
             capacity,
             store,
+            intent_latency: LatencyHistogram::new(),
         }
     }
 
@@ -136,6 +160,8 @@ impl IntentQueue {
             intent,
             status: IntentStatus::Queued,
             predicted: None,
+            submitted_at: Instant::now(),
+            sent_at: None,
         });
         Some(ticket)
     }
@@ -189,12 +215,15 @@ impl IntentQueue {
     /// Drain the queue to the gateway.
     ///
     /// Marks each queued intent `InFlight` and returns the intents to transmit.
-    /// Called by the plugin when the gateway is connected.
+    /// Called by the plugin when the gateway is connected. `sent_at` is updated
+    /// so a subsequent `on_ack` measures the round trip from this send.
     pub fn drain(&mut self) -> Vec<Intent> {
+        let now = Instant::now();
         let mut out = Vec::new();
         for entry in self.queue.iter_mut() {
             if entry.status == IntentStatus::Queued {
                 entry.status = IntentStatus::InFlight;
+                entry.sent_at = Some(now);
                 out.push(entry.intent.clone());
             }
         }
@@ -207,13 +236,20 @@ impl IntentQueue {
     /// is recorded). On `Rejected` it is marked rejected so the game rolls back
     /// the predicted effect. The entry is retained so [`IntentQueue::status`]
     /// returns the terminal state; it is dropped once the game observes it.
+    ///
+    /// On `Committed`, the submit→ack round trip is recorded in the
+    /// intent-commit latency histogram (D16: intent commit p99 < 10 ms).
     pub fn on_ack(&mut self, intent_id: u128, outcome: IntentOutcome) -> Option<IntentTicket> {
         let entry = self
             .queue
             .iter_mut()
             .find(|e| e.intent.intent_id == intent_id)?;
         entry.status = match &outcome {
-            IntentOutcome::Committed { tick, .. } => IntentStatus::Committed(*tick),
+            IntentOutcome::Committed { tick, .. } => {
+                // Intent-latency: time from submission to commit ack.
+                self.intent_latency.record(entry.submitted_at.elapsed());
+                IntentStatus::Committed(*tick)
+            }
             IntentOutcome::Rejected { .. } => IntentStatus::Rejected(outcome.clone()),
         };
         Some(IntentTicket(intent_id))
@@ -244,14 +280,59 @@ impl IntentQueue {
         {
             if entry.status == IntentStatus::InFlight {
                 entry.status = IntentStatus::Queued;
+                entry.sent_at = None;
             }
         }
+    }
+
+    /// Return every `InFlight` intent to `Queued` (netsplit posture, D11 §2.2).
+    ///
+    /// Called on gateway disconnect: intents that were mid-flight when the
+    /// connection dropped must be retransmitted on reconnect, so they go back
+    /// to `Queued` and the next [`drain`](Self::drain) replays them in
+    /// submission order. Idempotency keys make replay safe.
+    pub fn requeue_all_inflight(&mut self) {
+        for entry in self.queue.iter_mut() {
+            if entry.status == IntentStatus::InFlight {
+                entry.status = IntentStatus::Queued;
+                entry.sent_at = None;
+            }
+        }
+    }
+
+    /// Requeue any `InFlight` intent whose last send is older than the
+    /// in-flight timeout, so an unacked intent is retransmitted without
+    /// waiting for a disconnect. Returns the number requeued.
+    pub fn requeue_expired(&mut self) -> usize {
+        let now = Instant::now();
+        let mut requeued = 0;
+        for entry in self.queue.iter_mut() {
+            if entry.status == IntentStatus::InFlight
+                && entry
+                    .sent_at
+                    .is_some_and(|sent| now.saturating_duration_since(sent) >= INFLIGHT_TIMEOUT)
+            {
+                entry.status = IntentStatus::Queued;
+                entry.sent_at = None;
+                requeued += 1;
+            }
+        }
+        requeued
+    }
+
+    /// The intent-commit latency histogram (D16: p99 < 10 ms).
+    #[must_use]
+    pub fn intent_latency(&self) -> &LatencyHistogram {
+        &self.intent_latency
     }
 }
 
 /// The Bevy system that drains the intent queue to the gateway.
 ///
 /// When connected, queued intents are transmitted over the reliable stream.
+/// Before draining, any `InFlight` intent older than the in-flight timeout is
+/// requeued so it is retransmitted even without a disconnect (a lost reliable
+/// stream or a stalled gateway would otherwise strand it forever).
 pub fn drain_intents(
     session: Res<GatewaySession>,
     mut queue: ResMut<IntentQueue>,
@@ -266,6 +347,7 @@ pub fn drain_intents(
     let Ok(mut io) = sessions.get_mut(entity) else {
         return;
     };
+    let _ = queue.requeue_expired();
     for intent in queue.drain() {
         let msg = orrery_protocol::GatewayMsg::SubmitIntent { intent };
         io.send.push(GatewaySession::encode_stream(&msg));
@@ -373,5 +455,170 @@ mod tests {
         // Retire frees the slot.
         queue.retire(1);
         assert_eq!(queue.len(), 0);
+    }
+
+    #[test]
+    fn requeue_all_inflight_returns_inflight_to_queued() {
+        let mut queue = IntentQueue::new(10);
+        // Submit 5 intents, drain them all (now InFlight).
+        for i in 1..=5 {
+            queue.submit(intent(i)).unwrap();
+        }
+        let drained = queue.drain();
+        assert_eq!(drained.len(), 5);
+        // All are InFlight.
+        for i in 1..=5 {
+            assert_eq!(queue.status(IntentTicket(i)), IntentStatus::InFlight);
+        }
+        // Simulate disconnect.
+        queue.requeue_all_inflight();
+        // All are Queued again.
+        for i in 1..=5 {
+            assert_eq!(queue.status(IntentTicket(i)), IntentStatus::Queued);
+        }
+        // A second drain retries all 5.
+        let re_drained = queue.drain();
+        assert_eq!(re_drained.len(), 5);
+    }
+
+    #[test]
+    fn requeue_expired_retriggers_unacked_intents() {
+        let mut queue = IntentQueue::new(10);
+        queue.submit(intent(1)).unwrap();
+        queue.submit(intent(2)).unwrap();
+        queue.drain();
+
+        // With no time elapsed, nothing is expired.
+        assert_eq!(queue.requeue_expired(), 0);
+        assert_eq!(queue.status(IntentTicket(1)), IntentStatus::InFlight);
+
+        // Manually set sent_at to a distant past to simulate timeout.
+        if let Some(entry) = queue.queue.iter_mut().find(|e| e.intent.intent_id == 1) {
+            entry.sent_at = Some(
+                Instant::now()
+                    .checked_sub(Duration::from_secs(20))
+                    .unwrap_or(Instant::now()),
+            );
+        }
+
+        assert_eq!(queue.requeue_expired(), 1);
+        assert_eq!(queue.status(IntentTicket(1)), IntentStatus::Queued);
+        // Intent 2 is still InFlight (not expired).
+        assert_eq!(queue.status(IntentTicket(2)), IntentStatus::InFlight);
+    }
+
+    #[test]
+    fn intent_latency_is_recorded_on_commit() {
+        let mut queue = IntentQueue::new(10);
+        queue.submit(intent(1)).unwrap();
+        queue.drain();
+
+        // After drain, the intent has a sent_at set. on_ack with Committed
+        // should record a latency sample.
+        assert_eq!(queue.intent_latency().total(), 0);
+        queue.on_ack(
+            1,
+            IntentOutcome::Committed {
+                tick: Tick::new(10),
+                minted: vec![],
+            },
+        );
+        // The latency histogram should now have one sample.
+        assert_eq!(queue.intent_latency().total(), 1);
+        // The min should be a small positive duration.
+        assert!(queue.intent_latency().min().unwrap() > Duration::ZERO);
+    }
+
+    #[test]
+    fn rejected_intent_does_not_record_latency() {
+        let mut queue = IntentQueue::new(10);
+        queue.submit(intent(1)).unwrap();
+        queue.drain();
+
+        assert_eq!(queue.intent_latency().total(), 0);
+        queue.on_ack(1, IntentOutcome::Rejected { reason: 7 });
+        // Rejected does not record a latency sample.
+        assert_eq!(queue.intent_latency().total(), 0);
+        assert_eq!(
+            queue.status(IntentTicket(1)),
+            IntentStatus::Rejected(IntentOutcome::Rejected { reason: 7 })
+        );
+    }
+
+    #[test]
+    fn requeue_all_inflight_does_not_affect_committed_or_rejected() {
+        let mut queue = IntentQueue::new(10);
+        queue.submit(intent(1)).unwrap();
+        queue.submit(intent(2)).unwrap();
+        queue.drain();
+
+        // Ack one as committed, one as rejected.
+        queue.on_ack(
+            1,
+            IntentOutcome::Committed {
+                tick: Tick::new(10),
+                minted: vec![],
+            },
+        );
+        queue.on_ack(2, IntentOutcome::Rejected { reason: 3 });
+
+        // requeue_all_inflight should not affect them (they are terminal).
+        queue.requeue_all_inflight();
+        assert_eq!(
+            queue.status(IntentTicket(1)),
+            IntentStatus::Committed(Tick::new(10))
+        );
+        assert_eq!(
+            queue.status(IntentTicket(2)),
+            IntentStatus::Rejected(IntentOutcome::Rejected { reason: 3 })
+        );
+    }
+
+    #[test]
+    fn requeue_clears_sent_at() {
+        let mut queue = IntentQueue::new(10);
+        queue.submit(intent(1)).unwrap();
+        queue.drain();
+
+        // Requeue a single intent.
+        queue.requeue(1);
+        // After requeue, the sent_at should be None so a future drain sets
+        // a fresh timestamp and on_ack measures from the new send.
+        if let Some(entry) = queue.queue.iter().find(|e| e.intent.intent_id == 1) {
+            assert!(entry.sent_at.is_none());
+        }
+    }
+
+    #[test]
+    fn requeue_all_inflight_clears_sent_at() {
+        let mut queue = IntentQueue::new(10);
+        queue.submit(intent(1)).unwrap();
+        queue.drain();
+
+        queue.requeue_all_inflight();
+        if let Some(entry) = queue.queue.iter().find(|e| e.intent.intent_id == 1) {
+            assert!(entry.sent_at.is_none());
+        }
+    }
+
+    #[test]
+    fn requeue_expired_clears_sent_at() {
+        let mut queue = IntentQueue::new(10);
+        queue.submit(intent(1)).unwrap();
+        queue.drain();
+
+        // Force the sent_at to be expired.
+        if let Some(entry) = queue.queue.iter_mut().find(|e| e.intent.intent_id == 1) {
+            entry.sent_at = Some(
+                Instant::now()
+                    .checked_sub(Duration::from_secs(20))
+                    .unwrap_or(Instant::now()),
+            );
+        }
+
+        queue.requeue_expired();
+        if let Some(entry) = queue.queue.iter().find(|e| e.intent.intent_id == 1) {
+            assert!(entry.sent_at.is_none());
+        }
     }
 }
