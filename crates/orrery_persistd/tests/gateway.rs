@@ -159,7 +159,10 @@ fn gateway_closes_the_client_to_actor_path() {
                 got_ack = entity == PersistId::new(1) && tick == Tick::new(1);
             }
             if let Some(GatewayReply::AreaPage { cell, page }) = decode_stream_frame(&pkt) {
-                got_page = cell == CellId::ROOT && page.entities == vec![PersistId::new(1)];
+                got_page = cell == CellId::ROOT
+                    && page.total_chunks == 1
+                    && page.chunk_index == 0
+                    && page.entities == vec![PersistId::new(1)];
             }
             if let Some(GatewayReply::IntentAck { intent_id, outcome }) = decode_stream_frame(&pkt)
             {

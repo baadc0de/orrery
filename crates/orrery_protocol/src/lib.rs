@@ -24,7 +24,10 @@ mod protocol;
 
 pub use cell::{CellId, CellRangeError};
 pub use coord::{CoordMsg, IslandId, IslandManifest, PeerEntry, TopologyRegime};
-pub use gateway::{AreaPage, DiffUplink, GatewayMsg, GatewayReply};
+pub use gateway::{
+    AreaPage, DiffUplink, GatewayMsg, GatewayReply, AREA_LOAD_ERR_COLD, AREA_LOAD_ERR_LIVE,
+    MAX_AREA_PAGE_FRAME_BYTES,
+};
 pub use grid::GridId;
 pub use identity::{NodeId, Signature};
 pub use persist::{

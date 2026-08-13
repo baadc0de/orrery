@@ -99,6 +99,19 @@ pub enum GatewayReply {
         /// The page contents.
         page: AreaPage,
     },
+    /// A cell's area-load read failed on the gateway — distinct from an empty
+    /// cell (which is an [`AreaPage`] with no entities) so a failed FDB scan is
+    /// diagnosable rather than indistinguishable from "nothing there"
+    /// (docs/08-persistence.md §9).
+    AreaLoadError {
+        /// The cell whose read failed.
+        cell: CellId,
+        /// The failure class ([`AREA_LOAD_ERR_LIVE`]: the owning actor is
+        /// gone; [`AREA_LOAD_ERR_COLD`]: the durable-tier scan errored). A
+        /// `u8`, not a `&str`, so `GatewayReply` stays borrow-free and
+        /// deserializable from any buffer lifetime.
+        kind: u8,
+    },
     /// An intent committed or was rejected (D11 §2.2).
     IntentAck {
         /// The intent's idempotency key.
@@ -132,16 +145,59 @@ pub struct DiffUplink {
     pub seq: u64,
 }
 
+/// [`GatewayReply::AreaLoadError`] kind: the live read failed (the owning
+/// actor is gone — e.g. it crashed between the liveness check and the read).
+pub const AREA_LOAD_ERR_LIVE: u8 = 1;
+/// [`GatewayReply::AreaLoadError`] kind: the cold durable-tier scan errored
+/// (e.g. an FDB transaction failure).
+pub const AREA_LOAD_ERR_COLD: u8 = 2;
+
+/// The maximum size of one encoded area-page frame on the wire, in bytes.
+///
+/// The lane is packet-only (D3 datagrams; the reliable-stream class of
+/// docs/08-persistence.md §2.1 does not exist in this build), so every frame
+/// must fit one datagram. The budget derives from the 1280-byte IPv6 minimum
+/// MTU minus QUIC/UDP/IP headers and the channel tag — deliberately
+/// conservative so it holds on any path QUIC will run over. A cell whose
+/// entities do not fit is split across as many sequenced [`AreaPage`] frames
+/// as needed (`page_seq`/`chunk_index`/`total_chunks`); tune the budget here,
+/// in one place.
+pub const MAX_AREA_PAGE_FRAME_BYTES: usize = 1100;
+
 /// A page of an area load (D11 §9).
 ///
 /// `entities` and `payloads` are parallel: `payloads[i]` is the component bag
 /// for `entities[i]`. `live` distinguishes actor-memory pages (authoritative,
 /// ≥ checkpoint freshness) from cold FDB range-scan pages.
+///
+/// A cell whose entities exceed [`MAX_AREA_PAGE_FRAME_BYTES`] is split across
+/// several sequenced chunks. The wire is unordered datagrams (D3), so a chunk
+/// carries the full identity of its page, not just an intra-page index:
+///
+/// - `page_seq` is the gateway's per-send counter for the page (a retried send
+///   has a different `page_seq`, so stale chunks of an old send never mix with
+///   the retry);
+/// - `chunk_index` is this chunk's index within the page;
+/// - `total_chunks` is the page's chunk count (every chunk carries it, so any
+///   arrival order completes the set — a page is complete when all
+///   `0..total_chunks` chunk indices for one `page_seq` are held).
+///
+/// A single-chunk page is `chunk_index: 0, total_chunks: 1`. The client
+/// reassembles all chunks of a page before presenting it; a partial set is
+/// held (never surfaced as complete) until the client's retry floor leads to
+/// a re-request.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AreaPage {
     /// The cell this page covers.
     pub cell: CellId,
-    /// The entities in this cell.
+    /// The page sequence number (per gateway send; distinguishes a retry from
+    /// the original send's chunks).
+    pub page_seq: u32,
+    /// This chunk's index within the page (0-based).
+    pub chunk_index: u32,
+    /// The page's chunk count; the final chunk has `chunk_index == total_chunks - 1`.
+    pub total_chunks: u32,
+    /// The entities in this chunk of the cell's page.
     pub entities: Vec<PersistId>,
     /// The component payload for each entity, parallel to `entities`.
     pub payloads: Vec<bytes::Bytes>,
@@ -210,6 +266,9 @@ mod tests {
             cell: CellId::ROOT,
             page: AreaPage {
                 cell: CellId::ROOT,
+                page_seq: 0,
+                chunk_index: 0,
+                total_chunks: 1,
                 entities: vec![PersistId::new(1), PersistId::new(2)],
                 payloads: vec![
                     bytes::Bytes::from_static(b"a"),
@@ -221,6 +280,40 @@ mod tests {
         let bytes = postcard::to_stdvec(&page).unwrap();
         let back: GatewayReply = postcard::from_bytes(&bytes).unwrap();
         assert_eq!(back, page);
+    }
+
+    #[test]
+    fn area_load_error_roundtrips() {
+        // A failed scan is a distinct reply, not an empty page
+        // (docs/08-persistence.md §9).
+        let reply = GatewayReply::AreaLoadError {
+            cell: CellId::ROOT,
+            kind: AREA_LOAD_ERR_COLD,
+        };
+        let bytes = postcard::to_stdvec(&reply).unwrap();
+        let back: GatewayReply = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(back, reply);
+    }
+
+    #[test]
+    fn single_frame_page_fits_the_datagram_budget() {
+        // The budget constant is what the gateway chunks against; a minimal
+        // single-frame page must fit well under it (the chunked path is
+        // exercised end-to-end in orrery_persistd/tests/area_load.rs).
+        let page = GatewayReply::AreaPage {
+            cell: CellId::ROOT,
+            page: AreaPage {
+                cell: CellId::ROOT,
+                page_seq: 0,
+                chunk_index: 0,
+                total_chunks: 1,
+                entities: vec![PersistId::new(1)],
+                payloads: vec![bytes::Bytes::from_static(b"x")],
+                live: true,
+            },
+        };
+        let encoded = crate::channels::encode_stream_frame(&page);
+        assert!(encoded.len() <= MAX_AREA_PAGE_FRAME_BYTES);
     }
 
     #[test]

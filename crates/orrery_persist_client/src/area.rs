@@ -7,9 +7,11 @@
 //! by distance) so the client can spawn-in against page one (D16: < 50 ms to
 //! first page-in).
 
+use std::collections::{HashMap, HashSet};
+
 use bevy_ecs::prelude::*;
 use bevy_platform::time::Instant;
-use orrery_protocol::{CellId, GridId, PersistId};
+use orrery_protocol::{AreaPage, CellId, GridId, PersistId};
 
 use crate::config::PersistClientConfig;
 use crate::gateway::GatewaySession;
@@ -27,6 +29,24 @@ pub struct LoadedPage {
     pub live: bool,
 }
 
+/// An incomplete multi-chunk page for one cell, held until every chunk of its
+/// sequence arrives.
+///
+/// The lane is unreliable and unordered (D3 datagrams), so a partial set is
+/// **held, never surfaced as a complete [`LoadedPage`]** — a client holding
+/// chunks 0 and 2 of a 3-chunk page must not present a partial page. The
+/// loader's retry floor re-requests the cell set, and a re-sent page (a new
+/// `page_seq`) supersedes the stale partial.
+#[derive(Debug, Default)]
+struct PartialPage {
+    /// The page sequence these chunks belong to.
+    seq: u32,
+    /// The page's chunk count (every chunk carries it).
+    total: u32,
+    /// Chunks received so far, keyed by `chunk_index`.
+    chunks: HashMap<u32, AreaPage>,
+}
+
 /// The area loader: tracks the subscribed neighborhood and the pages received.
 ///
 /// A [`Resource`] holding the current AOI subscription and the pages loaded so
@@ -41,11 +61,19 @@ pub struct AreaLoader {
     pub cells: Vec<CellId>,
     /// Pages received so far, keyed by cell.
     pub pages: Vec<LoadedPage>,
-    /// The time the last subscribe round was issued (for rate-limiting).
+    /// The time the last subscribe round was issued (the retry floor, not the
+    /// subscribe trigger — see [`drive_area_loader`]).
     pub last_subscribe: Option<Instant>,
+    /// The cell set of the last issued subscribe round. A subscribe is issued
+    /// only when the current set differs from this (plus the retry floor).
+    pub last_sent: Vec<CellId>,
     /// The time the first page of the current area arrived (for the < 50 ms
-    /// first-page-in target, D16).
+    /// first-page-in target, D16). Cleared when the subscribed cell set
+    /// changes, so each area round measures its own request-to-first-page
+    /// duration.
     pub first_page_at: Option<Instant>,
+    /// Incomplete multi-frame pages (see [`PartialPage`]).
+    partials: HashMap<CellId, PartialPage>,
 }
 
 impl AreaLoader {
@@ -77,9 +105,90 @@ impl AreaLoader {
     }
 
     /// Record a received page, replacing any prior page for the same cell.
+    ///
+    /// Sets [`AreaLoader::first_page_at`] when it is `None` — the first page
+    /// of a round starts the D16 < 50 ms first-page-in measurement, and later
+    /// pages of the same round do not move it. Done here (not in the reply
+    /// handler) so every page-arrival path is timed identically.
     pub fn record(&mut self, page: LoadedPage) {
+        if self.first_page_at.is_none() {
+            self.first_page_at = Some(Instant::now());
+        }
         self.pages.retain(|p| p.cell != page.cell);
         self.pages.push(page);
+    }
+
+    /// Record one chunk of a (possibly multi-chunk) area page.
+    ///
+    /// Single-chunk pages (`total_chunks: 1`) record immediately. Multi-chunk
+    /// pages accumulate until every chunk of the page's `page_seq` has
+    /// arrived; only the complete page is recorded — a partial set is never
+    /// presented as complete (the lane is unreliable, D3). Chunks are keyed by
+    /// `(page_seq, chunk_index)` and every chunk carries `total_chunks`, so
+    /// any arrival order completes the set; a re-sent page (a new `page_seq`)
+    /// supersedes the stale partial.
+    pub fn record_frame(&mut self, page: AreaPage) {
+        let cell = page.cell;
+        if page.total_chunks == 1 {
+            self.partials.remove(&cell);
+            self.record(LoadedPage {
+                cell,
+                entities: page.entities,
+                payloads: page.payloads,
+                live: page.live,
+            });
+            return;
+        }
+        let partial = self.partials.entry(cell).or_insert_with(|| PartialPage {
+            seq: page.page_seq,
+            total: page.total_chunks,
+            chunks: HashMap::new(),
+        });
+        if partial.seq != page.page_seq {
+            // A re-sent page supersedes the stale partial.
+            partial.seq = page.page_seq;
+            partial.total = page.total_chunks;
+            partial.chunks.clear();
+        }
+        partial.chunks.insert(page.chunk_index, page);
+        #[allow(clippy::cast_possible_truncation)]
+        let total = partial.total as usize;
+        if partial.chunks.len() < total {
+            // Missing chunks: hold the partial (the retry floor re-requests).
+            return;
+        }
+        // Complete: assemble in chunk-index order and record.
+        let mut entities = Vec::new();
+        let mut payloads = Vec::new();
+        let mut live = false;
+        for index in 0..partial.total {
+            let chunk = partial
+                .chunks
+                .remove(&index)
+                .expect("count matches: chunk present");
+            live = chunk.live;
+            entities.extend(chunk.entities);
+            payloads.extend(chunk.payloads);
+        }
+        self.partials.remove(&cell);
+        self.record(LoadedPage {
+            cell,
+            entities,
+            payloads,
+            live,
+        });
+    }
+
+    /// Begin a new subscription round: replace the subscribed cell set, drop
+    /// every page and partial whose cell left the subscription, and clear
+    /// [`AreaLoader::first_page_at`] so the new round measures its own
+    /// request-to-first-page duration (D16).
+    pub fn begin_round(&mut self, cells: Vec<CellId>) {
+        let keep: HashSet<CellId> = cells.iter().copied().collect();
+        self.pages.retain(|p| keep.contains(&p.cell));
+        self.partials.retain(|cell, _| keep.contains(cell));
+        self.cells = cells;
+        self.first_page_at = None;
     }
 }
 
@@ -90,7 +199,9 @@ impl Default for AreaLoader {
             cells: Vec::new(),
             pages: Vec::new(),
             last_subscribe: None,
+            last_sent: Vec::new(),
             first_page_at: None,
+            partials: HashMap::new(),
         }
     }
 }
@@ -98,9 +209,12 @@ impl Default for AreaLoader {
 /// Order the 27-cell neighborhood nearest-first from `center`.
 ///
 /// The center cell first, then face neighbors (Manhattan distance 1), then
-/// edge (2), then corner (3). Ties are broken deterministically by cell id.
-/// This is the ordering the client requests and the gateway streams, so the
-/// client can spawn-in against page one.
+/// edge (2), then corner (3). Manhattan distance (not Chebyshev) separates the
+/// three tiers: Chebyshev collapses all 26 neighbors into one tier, which
+/// would let a corner page land before a face page and delay spawn-in (D16).
+/// Ties are broken deterministically by cell id. This is the ordering the
+/// client requests and the gateway streams, so the client can spawn-in against
+/// page one.
 #[must_use]
 pub fn order_nearest_first(center: CellId, cells: Vec<CellId>) -> Vec<CellId> {
     let (c, _) = center.coords();
@@ -108,7 +222,7 @@ pub fn order_nearest_first(center: CellId, cells: Vec<CellId>) -> Vec<CellId> {
         .into_iter()
         .map(|cell| {
             let (coords, _) = cell.coords();
-            let dist = (coords - c).abs().max_element();
+            let dist = (coords - c).abs().element_sum();
             (cell, dist)
         })
         .collect();
@@ -117,11 +231,23 @@ pub fn order_nearest_first(center: CellId, cells: Vec<CellId>) -> Vec<CellId> {
     ranked.into_iter().map(|(cell, _)| cell).collect()
 }
 
+/// The retry floor between subscribe rounds, in milliseconds.
+///
+/// This is a **floor, not the trigger**: a subscribe is issued when the cell
+/// set changes ([`drive_area_loader`]); the floor only rate-limits re-issues
+/// of an unchanged set (the retry that re-requests pages lost on the
+/// unreliable lane) and back-to-back crossings. 50 ms matches the D16
+/// first-page-in budget so a lost page is retried within one measurement
+/// window.
+const SUBSCRIBE_RETRY_FLOOR_MS: u64 = 50;
+
 /// The Bevy system that drives the area loader.
 ///
-/// When the subscribed neighborhood changes, it requests the new cells
-/// (nearest-first, bounded by `area_cells_per_round`) over the gateway's
-/// reliable stream. Pages are recorded as they arrive.
+/// Issues a [`GatewayMsg::Subscribe`] when the subscribed cell set differs
+/// from the last-sent set (the AOI system updates `loader.cells` on a
+/// crossing), or when the retry floor has elapsed since the last issue — the
+/// retry re-requests pages that never completed on the unreliable lane.
+/// Pages are recorded as they arrive.
 pub fn drive_area_loader(
     cfg: Res<PersistClientConfig>,
     session: Res<GatewaySession>,
@@ -138,23 +264,25 @@ pub fn drive_area_loader(
         return;
     };
 
-    // The caller (the spatial plugin) updates `loader.cells`; here we detect a
-    // change and issue a subscribe. To keep this self-contained, we re-request
-    // whenever the set differs from what we have pages for — the caller sets
-    // `cells` before this runs.
+    // The AOI system updates `loader.cells` on a crossing; here we detect the
+    // change and issue the subscribe. An unchanged set is only re-issued past
+    // the retry floor (lost-page retry), never per-update.
     let subscribed = loader.cells.clone();
     if subscribed.is_empty() {
         return;
     }
-
-    // Rate-limit: only issue a subscribe round if we haven't just done one.
     let now = Instant::now();
-    if let Some(last) = loader.last_subscribe {
-        if now.saturating_duration_since(last) < std::time::Duration::from_millis(50) {
+    if subscribed == loader.last_sent {
+        let retry_due = loader.last_subscribe.is_none_or(|last| {
+            now.saturating_duration_since(last)
+                >= std::time::Duration::from_millis(SUBSCRIBE_RETRY_FLOOR_MS)
+        });
+        if !retry_due {
             return;
         }
     }
     loader.last_subscribe = Some(now);
+    loader.last_sent = subscribed.clone();
 
     let round: Vec<CellId> = subscribed
         .iter()
@@ -168,6 +296,38 @@ pub fn drive_area_loader(
     io.send.push(GatewaySession::encode_stream(&msg));
 }
 
+/// Wire the spatial AOI into the area loader (D5 → D11 §9).
+///
+/// On an [`AoiSubscription`] change, sets `loader.cells` to the neighborhood
+/// ordered nearest-first from the local player's committed [`Cell`] (so the
+/// gateway streams the centre page first, D16) and drops every page whose
+/// cell left the subscription ([`AreaLoader::begin_round`]). Runs before
+/// [`drive_area_loader`] in [`PersistClientSet::Flush`](crate::PersistClientSet)
+/// so a crossing costs at most one update of latency.
+///
+/// The loader's `grid` (P-7) is set by the game from the player's reference
+/// frame; this system only reorders the cells the spatial plugin computed.
+pub fn sync_aoi_to_loader(
+    aoi: Option<Res<orrery_spatial::plugin::AoiSubscription>>,
+    player: Query<&orrery_spatial::plugin::Cell, With<orrery_spatial::plugin::LocalPlayer>>,
+    mut loader: ResMut<AreaLoader>,
+) {
+    // Optional: a client without the spatial plugin installed (tests, harness
+    // tools) drives `loader.cells` directly and this system stays a no-op.
+    let Some(aoi) = aoi else { return };
+    if !aoi.is_changed() {
+        return;
+    }
+    let Ok(center) = player.single() else {
+        return;
+    };
+    let cells = order_nearest_first(center.0, aoi.cells.clone());
+    if cells == loader.cells {
+        return;
+    }
+    loader.begin_round(cells);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -178,19 +338,30 @@ mod tests {
         CellId::from_coords(IVec3::new(x, y, z), CellId::MAX_LEVEL).unwrap()
     }
 
+    fn manhattan(cell: CellId) -> i32 {
+        let (c, _) = cell.coords();
+        c.abs().element_sum()
+    }
+
     #[test]
-    fn nearest_first_orders_center_then_faces() {
+    fn neighbour_tiers_are_contiguous() {
+        // Manhattan distance tiers: index 0 is the centre, 1..7 the 6 face
+        // cells (distance 1), 7..19 the 12 edge cells (distance 2), 19..27
+        // the 8 corner cells (distance 3) — 1 + 6 + 12 + 8 = 27.
         let center = cell(0, 0, 0);
         let mut cells = center.neighbors27();
         // Shuffle to prove ordering is deterministic.
         cells.reverse();
         let ordered = order_nearest_first(center, cells);
-        assert_eq!(ordered[0], center);
-        // The next six are the face neighbors (Manhattan distance 1).
-        let faces = ordered[1..7].to_vec();
-        for f in &faces {
-            let (c, _) = f.coords();
-            assert_eq!((c - IVec3::ZERO).abs().max_element(), 1, "{f:?}");
+        assert_eq!(ordered.len(), 27);
+        assert_eq!(ordered[0], center, "index 0 is the centre");
+        for (i, c) in ordered.iter().enumerate().skip(1) {
+            let expected = match i {
+                1..=6 => 1,
+                7..=18 => 2,
+                _ => 3,
+            };
+            assert_eq!(manhattan(*c), expected, "index {i} tier {expected}");
         }
         // All 27 present, no duplicates.
         let mut seen = std::collections::HashSet::new();
@@ -228,5 +399,133 @@ mod tests {
         loader.cells = vec![cell(0, 0, 0)];
         assert!(loader.contains(cell(0, 0, 0)));
         assert!(!loader.contains(cell(1, 0, 0)));
+    }
+
+    #[test]
+    fn first_page_at_is_set_on_the_first_page_of_a_round() {
+        let mut loader = AreaLoader::new();
+        assert!(loader.first_page_at.is_none(), "None before any page");
+        let page = |id: u64| LoadedPage {
+            cell: cell(id as i32, 0, 0),
+            entities: vec![PersistId::new(id)],
+            payloads: vec![bytes::Bytes::from_static(b"x")],
+            live: true,
+        };
+        loader.record(page(0));
+        let first = loader.first_page_at.expect("Some after the first page");
+        loader.record(page(1));
+        assert_eq!(
+            loader.first_page_at,
+            Some(first),
+            "unchanged by the second page"
+        );
+    }
+
+    fn chunk(cell: CellId, seq: u32, index: u32, total: u32, ids: &[u64]) -> AreaPage {
+        AreaPage {
+            cell,
+            page_seq: seq,
+            chunk_index: index,
+            total_chunks: total,
+            entities: ids.iter().map(|&id| PersistId::new(id)).collect(),
+            payloads: ids
+                .iter()
+                .map(|&id| bytes::Bytes::from(id.to_le_bytes().to_vec()))
+                .collect(),
+            live: true,
+        }
+    }
+
+    #[test]
+    fn partial_sequence_is_never_presented_as_complete() {
+        let mut loader = AreaLoader::new();
+        let c = cell(0, 0, 0);
+        // Chunks 0 and 2 of a 3-chunk page: nothing is recorded.
+        loader.record_frame(chunk(c, 1, 0, 3, &[1, 2]));
+        loader.record_frame(chunk(c, 1, 2, 3, &[5, 6]));
+        assert_eq!(loader.page_count(), 0, "partial page held, not recorded");
+        // Chunk 1 completes the sequence; the full page lands.
+        loader.record_frame(chunk(c, 1, 1, 3, &[3, 4]));
+        assert_eq!(loader.page_count(), 1);
+        let ids: Vec<PersistId> = loader.pages[0].entities.clone();
+        assert_eq!(
+            ids,
+            vec![
+                PersistId::new(1),
+                PersistId::new(2),
+                PersistId::new(3),
+                PersistId::new(4),
+                PersistId::new(5),
+                PersistId::new(6),
+            ],
+            "chunks applied in chunk-index order"
+        );
+    }
+
+    #[test]
+    fn restarted_sequence_supersedes_stale_partial() {
+        let mut loader = AreaLoader::new();
+        let c = cell(0, 0, 0);
+        // A 3-chunk page (seq 1) stalls after chunk 0.
+        loader.record_frame(chunk(c, 1, 0, 3, &[1]));
+        // The retry re-sends the page under a new seq, superseding the
+        // partial — here as a single-chunk page.
+        loader.record_frame(chunk(c, 2, 0, 1, &[9]));
+        assert_eq!(loader.page_count(), 1);
+        assert_eq!(loader.pages[0].entities, vec![PersistId::new(9)]);
+    }
+
+    #[test]
+    fn stale_seq_never_mixes_with_a_retry() {
+        let mut loader = AreaLoader::new();
+        let c = cell(0, 0, 0);
+        // Seq 1 arrives in part; the retry (seq 2) completes fully; a late
+        // chunk of seq 1 afterwards must not corrupt the recorded page.
+        loader.record_frame(chunk(c, 1, 0, 2, &[1]));
+        loader.record_frame(chunk(c, 2, 0, 2, &[7]));
+        loader.record_frame(chunk(c, 2, 1, 2, &[8]));
+        assert_eq!(loader.page_count(), 1);
+        assert_eq!(
+            loader.pages[0].entities,
+            vec![PersistId::new(7), PersistId::new(8)]
+        );
+        loader.record_frame(chunk(c, 1, 1, 2, &[2]));
+        assert_eq!(loader.page_count(), 1, "the stale chunk did not replace");
+        assert_eq!(
+            loader.pages[0].entities,
+            vec![PersistId::new(7), PersistId::new(8)]
+        );
+    }
+
+    #[test]
+    fn begin_round_evicts_departed_pages_and_clears_first_page_at() {
+        let mut loader = AreaLoader::new();
+        let center = cell(0, 0, 0);
+        let round_a = order_nearest_first(center, center.neighbors27());
+        loader.begin_round(round_a.clone());
+        loader.record(LoadedPage {
+            cell: center,
+            entities: vec![PersistId::new(1)],
+            payloads: vec![bytes::Bytes::from_static(b"x")],
+            live: true,
+        });
+        assert!(loader.first_page_at.is_some());
+
+        // Cross one cell east: the new neighborhood keeps 18 of the 27 cells.
+        let east = cell(1, 0, 0);
+        let round_b = order_nearest_first(east, east.neighbors27());
+        loader.begin_round(round_b.clone());
+        assert!(
+            loader.first_page_at.is_none(),
+            "new round re-arms the timer"
+        );
+        assert!(
+            loader.pages.iter().all(|p| round_b.contains(&p.cell)),
+            "every kept page is in the new subscription"
+        );
+        assert!(
+            loader.page_count() <= round_b.len(),
+            "page count bounded by the subscription"
+        );
     }
 }
