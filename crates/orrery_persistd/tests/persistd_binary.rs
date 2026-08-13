@@ -75,7 +75,8 @@ fn run_persistd(args: &[&str]) -> (String, String) {
         .expect("endpoint_addr field present and is a string")
         .to_string();
 
-    // Send SIGTERM to shut down gracefully.
+    // SIGKILL: we already have what we came for, and the graceful SIGTERM path
+    // is not what these tests cover.
     let _ = child.kill();
     let _ = child.wait();
 
