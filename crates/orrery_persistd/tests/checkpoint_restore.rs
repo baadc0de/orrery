@@ -528,7 +528,7 @@ async fn fdb_checkpoint_then_restore() {
     .unwrap();
     let replayed = rt2.restore(CellId::ROOT, store.as_ref()).await.unwrap();
     assert!(replayed >= 10, "replayed {replayed} tail records");
-    let page = rt2.read(GridId::ROOT, CellId::ROOT).await.unwrap();
+    let page = rt2.read(GridId::new(9002), CellId::ROOT).await.unwrap();
     assert_eq!(page.entities.len(), 40);
     rt2.close().await.unwrap();
 }
@@ -901,7 +901,7 @@ async fn fdb_tombstone_end_to_end_lifecycle() {
     )
     .unwrap();
     rt2.restore(CellId::ROOT, store.as_ref()).await.unwrap();
-    let page = rt2.read(GridId::ROOT, CellId::ROOT).await.unwrap();
+    let page = rt2.read(GridId::new(9007), CellId::ROOT).await.unwrap();
     assert_eq!(page.entities.len(), 3);
     for i in 0..3u64 {
         assert!(
