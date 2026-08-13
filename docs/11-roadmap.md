@@ -69,11 +69,26 @@ Indicative calendar (planning estimate, not normative): P0 Q3 2026 · P1 Q4 2026
 - Journal with adaptive group commit (fsync immediately when the disk is idle, ~0.5 ms batching under load; commit < 2 ms server-internal); optional chain replication to one async follower (default on, RPO ≤ ~100 ms for bulk on node loss).
 - FDB 7.3.x checkpointing on the 20 s jittered cadence, immediate on cell quiesce; keyspace exactly as D11 (`world/{cell_id}/{entity_id}`, `player/…`, `ledger/…`, `lease/…`, `chunk/…`).
 - Area load: 27-cell FDB range scans + live actor deltas, streamed nearest-first.
-- Offline world-seed import tool on the persistd harness (D11): bulk-writes designed content into `world/`/`chunk/` rows, mints `PersistId`s, and records a content-version row so later deploys can diff/patch designed content.
+- Offline world-seed import tool on the persistd harness (D11): bulk-writes designed content into `world/`/`chunk/` rows, mints `PersistId`s, and records a content-version row so later deploys can diff/patch designed content. Specified as a TOML scenario runner in [12-world-seeding.md](12-world-seeding.md); not yet implemented.
 - The intent *execution* path (signature check → `Ruleset` validation stub → FDB serializable optimistic transaction) without witness attestation, so commit latency is measurable now; attestation arrives in P5.
 - Latency rig: gateway-colocated load generator producing calibrated diff and intent mixes.
 
 **Demo criterion.** With 10k entities across 100+ cells under synthetic load: `kill -9` the entire cluster, restart it, and the world resumes — zero acked intents lost (RPO 0), bulk loss bounded by the journal/replication window, clients (netsplit posture, D12) having queued intents and continued simulating. Measured against D16 targets in-region: journal commit < 2 ms server-internal, client-observed bulk ack p99 < 5 ms, intent commit p99 < 10 ms, area first page-in < 50 ms.
+
+**Open defects blocking the demo criterion.** Found 2026-08-13 by tracing the seeder's read/write path through the landed code; each was read at the cited location, not inferred. Full detail, consequences and acceptance-gate mapping in [12-world-seeding.md](12-world-seeding.md) §2.
+
+| # | Location | Defect |
+|---|---|---|
+| **P-1** | `orrery_persistd/src/runtime.rs` — `CellRuntime::open`, `::restore` | Journal replay filters `rec.cell != shard` (**equality**) while writes route via `shard.is_prefix_of(cell)` and clients uplink the entity's *interest* cell (`orrery_persist_client/src/feed.rs:87`). **Every real diff is discarded at recovery — the `kill -9` criterion cannot pass.** Fix: `shard.is_prefix_of(rec.cell)`. |
+| **P-8** | `orrery_persistd/src/checkpoint/fdb.rs:126` | `checkpoint` postcards the whole `CheckpointData` — entity bag included — into the single `ckpt/{shard}` value, which D11 §6 fixes as `(node_id, lsn, epoch, time)`. Ceiling is `100 000/(bag+34)` = **344 entities/shard** at a 256 B bag; a 10k-entity world with any hotspot exceeds FDB's 100 KB value limit. |
+| **P-2** | `checkpoint/fdb.rs:118` | Writes `world_key(data.shard, entity)` — keyed by the shard, not the entity's cell as D11 §6 specifies. `CheckpointData::by_cell` carries the right value and is unused for keying. |
+| **P-3** | `checkpoint/fdb.rs` — `world_range_start`/`_end` | Compute `[w‖bits, w‖bits+1)`, the *exact-cell* span, though the doc comment claims it is the subtree (`CellId::subtree_range()` = `[bits−lsb+1, bits+lsb−1]`). Breaks subtree scans and `delete(shard)`. Masked in `tests/checkpoint_restore.rs:293`, which reads `CellId::ROOT` — also the shard. |
+| **P-4** | `orrery_persistd/src/actor.rs:247` | `read_snapshot` opens `let _ = cells;` and returns the whole actor bag, so an area load for one interest cell returns up to 512 cells' entities. The < 50 ms first-page-in target is unmeasurable until it filters by `by_cell`. |
+| **P-5** | `orrery_persistd/src/cluster.rs:236` | `Cluster::has_actor` returns `true` for every cell (`RendezvousHasher::owner` always answers), so the cold-store fallback never fires under a multi-node `Cluster`. |
+| **P-6** | `checkpoint/fdb.rs` | `checkpoint` only ever `set`s rows for live entities; nothing clears removed ones, and the D11 §6 despawn tombstone is unimplemented. |
+| **P-7** | `checkpoint/fdb.rs` — `world_key` | The 17-byte key carries no `GridId`, though `JournalRecord`, `DiffUplink` and the `grid/` rows all do and D11 §6 calls `cell_id` "grid-relative". Nested-grid content has nowhere to live. |
+
+P-1 and P-8 block the demo criterion on their own. P-2, P-3, P-5 and P-6 block *seeded* worlds specifically; P-4 gates the latency numbers; P-7 gates nested grids.
 
 **Upstream milestone.** Issues/patches to `foundationdb-rs` 0.11 and fjall as encountered; publish the FDB layer-schema notes.
 

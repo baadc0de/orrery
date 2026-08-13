@@ -30,7 +30,8 @@ every numbered doc:
 | 11 | [docs/09-services-and-ops.md](docs/09-services-and-ops.md) | Service inventory, deployment, scaling, failure modes, telemetry |
 | 12 | [docs/10-crates.md](docs/10-crates.md) | Workspace layout, per-crate API sketches, dependency graph |
 | 13 | [docs/11-roadmap.md](docs/11-roadmap.md) | Build phases (P0–P6), milestones, tracked risks |
-| 14 | [docs/references.md](docs/references.md) | Annotated bibliography, organized by topic |
+| 14 | [docs/12-world-seeding.md](docs/12-world-seeding.md) | World seeder: TOML scenario runner, generator bank, content diff/patch (expands 08 §17) |
+| 15 | [docs/references.md](docs/references.md) | Annotated bibliography, organized by topic |
 
 Also read [README.md](README.md) — it summarizes the architecture, the status,
 and the feature set.
