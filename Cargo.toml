@@ -13,6 +13,19 @@ members = [
     "crates/orrery_persistd",
 ]
 
+# The P2 latency rig and gate are standalone tools (the p0-nat-test /
+# p0-dashboard precedent): each carries its own `[workspace]` table so it
+# builds against its own lockfile and does not inherit this workspace's
+# members, while still path-depending on `orrery_protocol` and
+# `orrery_persist_client`. Excluded here so a workspace-level command does
+# not try to build them as members.
+exclude = [
+    "p0-nat-test",
+    "p0-dashboard",
+    "p2-load",
+    "p2-dashboard",
+]
+
 # Pinned versions per D14 (docs/DECISIONS.md), ecosystem as of Aug 2026.
 # Re-validate when implementation of each dependent crate starts; don't bump
 # casually.
