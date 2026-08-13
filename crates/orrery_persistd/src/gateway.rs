@@ -454,9 +454,9 @@ async fn route_subscribe(
         // Live cells come from actor memory (authoritative, ≥ checkpoint
         // freshness); cold cells from the durable tier range scan
         // (docs/08-persistence.md §9).
-        let live = router.has_actor(cell).await;
+        let live = router.has_actor(grid, cell).await;
         let page = if live {
-            router.read(cell).await.ok()
+            router.read(grid, cell).await.ok()
         } else {
             router.read_cold(grid, cell).await.ok().flatten()
         };

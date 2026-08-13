@@ -90,7 +90,11 @@ struct Session {
 async fn connect(config: GatewayConfig, key: &iroh_base::SecretKey) -> Session {
     let dir = tempfile::tempdir().unwrap();
     let runtime = Arc::new(Mutex::new(
-        CellRuntime::open(&runtime_config(dir.path())).unwrap(),
+        {
+            let store: std::sync::Arc<dyn orrery_persistd::checkpoint::CheckpointStore> =
+                std::sync::Arc::new(orrery_persistd::checkpoint::MemCheckpointStore::new());
+            CellRuntime::open(&runtime_config(dir.path()), &store).unwrap()
+        },
     ));
     let router: Arc<dyn Router> = runtime.clone();
     let server = GatewayServer::spawn(config, router).await.unwrap();

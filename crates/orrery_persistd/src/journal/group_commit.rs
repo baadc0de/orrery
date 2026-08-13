@@ -137,7 +137,6 @@ impl CommitterState {
         *self.committed.lock().expect("committed lock") = lsn;
     }
 
-    #[cfg(test)]
     fn flush_count(&self) -> usize {
         self.flush_count.load(Ordering::Acquire)
     }
@@ -173,8 +172,7 @@ impl CommitterHandle {
         self.state.committed()
     }
 
-    /// The number of fsyncs issued (test hook).
-    #[cfg(test)]
+    /// The number of fsyncs issued (§4 group-commit observability).
     pub(crate) fn flush_count(&self) -> usize {
         self.state.flush_count()
     }

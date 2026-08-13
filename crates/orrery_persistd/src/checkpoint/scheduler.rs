@@ -240,6 +240,11 @@ mod tests {
         }
     }
 
+    /// The checkpoint store as the trait object `CellRuntime::open` takes.
+    fn ckpt_store(store: &Arc<MemCheckpointStore>) -> Arc<dyn CheckpointStore> {
+        store.clone()
+    }
+
     #[test]
     fn jitter_is_two_sided() {
         // The jitter must be a SIGNED offset: at least one draw must be
@@ -326,7 +331,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(MemCheckpointStore::new());
         let runtime = Arc::new(tokio::sync::Mutex::new(
-            CellRuntime::open(&test_runtime_config(dir.path())).unwrap(),
+            CellRuntime::open(&test_runtime_config(dir.path()), &ckpt_store(&store)).unwrap(),
         ));
 
         // Write an entity so there is something to checkpoint.
@@ -411,7 +416,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(MemCheckpointStore::new());
         let runtime = Arc::new(tokio::sync::Mutex::new(
-            CellRuntime::open(&test_runtime_config(dir.path())).unwrap(),
+            CellRuntime::open(&test_runtime_config(dir.path()), &ckpt_store(&store)).unwrap(),
         ));
 
         // Write entities at child-cell positions so they partition cleanly
@@ -441,7 +446,7 @@ mod tests {
         // Fence ROOT first so the fence store has a row for it, then split.
         {
             let mut rt = runtime.lock().await;
-            rt.fence_shard(CellId::ROOT, None).await.unwrap();
+            rt.fence_shard(CellId::ROOT, None, store.as_ref()).await.unwrap();
             let root_row = rt.fence().read(CellId::ROOT).await.unwrap();
             let parent_row = root_row.unwrap();
             let children = rt.split(CellId::ROOT, &parent_row).await.unwrap();
@@ -508,7 +513,7 @@ mod tests {
         // rt.shards()) loses its timer after reconcile by checking that it
         // is no longer checkpointed.
         let runtime = Arc::new(tokio::sync::Mutex::new(
-            CellRuntime::open(&test_runtime_config(dir.path())).unwrap(),
+            CellRuntime::open(&test_runtime_config(dir.path()), &ckpt_store(&store)).unwrap(),
         ));
 
         let interval = Duration::from_millis(50);
@@ -518,12 +523,11 @@ mod tests {
         };
 
         let scheduler = spawn_checkpoint_scheduler(Arc::clone(&runtime), store.clone(), &config);
-
+        
         // Split ROOT into children, retiring the parent.
         {
             let mut rt = runtime.lock().await;
-            // Fence ROOT first to create a fence row.
-            rt.fence_shard(CellId::ROOT, None).await.unwrap();
+            rt.fence_shard(CellId::ROOT, None, store.as_ref()).await.unwrap();
             let root_row = rt.fence().read(CellId::ROOT).await.unwrap();
             let parent_row = root_row.unwrap();
             rt.split(CellId::ROOT, &parent_row).await.unwrap();

@@ -209,8 +209,10 @@ async fn follower_serves_as_recovery_source() {
     drop(follower);
 
     // Recover the world from the follower journal alone.
-    let rt = CellRuntime::open(&runtime_config(follower_dir.path(), 2)).unwrap();
-    let page = rt.read(CellId::ROOT).await.unwrap();
+    let store: std::sync::Arc<dyn orrery_persistd::checkpoint::CheckpointStore> =
+        std::sync::Arc::new(orrery_persistd::checkpoint::MemCheckpointStore::new());
+    let rt = CellRuntime::open(&runtime_config(follower_dir.path(), 2), &store).unwrap();
+    let page = rt.read(GridId::ROOT, CellId::ROOT).await.unwrap();
     assert_eq!(
         page.entities.len(),
         100,

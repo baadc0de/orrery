@@ -37,11 +37,13 @@ pub trait Router: Send + Sync {
     /// durable LSN.
     async fn apply(&self, record: JournalRecord) -> Result<orrery_protocol::Lsn, Reject>;
 
-    /// Read a snapshot of `cell` from its owning actor.
-    async fn read(&self, cell: CellId) -> Result<SnapshotPage, Reject>;
+    /// Read a snapshot of `cell` in `grid` from its owning actor (P-7:
+    /// storage cell ids are grid-relative, so the grid scopes which universe
+    /// the cell id names).
+    async fn read(&self, grid: GridId, cell: CellId) -> Result<SnapshotPage, Reject>;
 
-    /// Whether a live actor holds `cell` (vs a cold FDB scan).
-    async fn has_actor(&self, cell: CellId) -> bool;
+    /// Whether a live actor holds `cell` in `grid` (vs a cold FDB scan).
+    async fn has_actor(&self, grid: GridId, cell: CellId) -> bool;
 
     /// Read a cold cell from the durable tier (an FDB range scan), if this
     /// router has a cold-store fallback. Returns `None` when there is no cold
@@ -58,21 +60,35 @@ pub trait Router: Send + Sync {
 }
 
 /// A router over a single runtime (one-node deployment).
+///
+/// The guard is never held across an actor await: the handle is resolved
+/// under the lock, the lock is dropped, and the actor mailbox is awaited
+/// outside it — so concurrent applies pipeline into the journal's commit
+/// queue instead of serializing the whole node behind one fsync (§4).
 #[async_trait::async_trait]
 impl Router for tokio::sync::Mutex<CellRuntime> {
     async fn apply(&self, record: JournalRecord) -> Result<orrery_protocol::Lsn, Reject> {
-        let rt = self.lock().await;
-        rt.apply(record).await
+        let handle = {
+            let rt = self.lock().await;
+            rt.actor(record.grid, record.cell).cloned()
+        };
+        handle.ok_or(Reject::JournalClosed)?.apply_diff(record).await
     }
 
-    async fn read(&self, cell: CellId) -> Result<SnapshotPage, Reject> {
-        let rt = self.lock().await;
-        rt.read(cell).await
+    async fn read(&self, grid: GridId, cell: CellId) -> Result<SnapshotPage, Reject> {
+        let handle = {
+            let rt = self.lock().await;
+            rt.actor(grid, cell).cloned()
+        };
+        handle
+            .ok_or(Reject::JournalClosed)?
+            .read_snapshot(vec![cell])
+            .await
     }
 
-    async fn has_actor(&self, cell: CellId) -> bool {
+    async fn has_actor(&self, grid: GridId, cell: CellId) -> bool {
         let rt = self.lock().await;
-        rt.actor(cell).is_some()
+        rt.actor(grid, cell).is_some()
     }
 }
 
@@ -103,12 +119,12 @@ impl<R: Router + Send + Sync> Router for ColdFallbackRouter<R> {
         self.live.apply(record).await
     }
 
-    async fn read(&self, cell: CellId) -> Result<SnapshotPage, Reject> {
-        self.live.read(cell).await
+    async fn read(&self, grid: GridId, cell: CellId) -> Result<SnapshotPage, Reject> {
+        self.live.read(grid, cell).await
     }
 
-    async fn has_actor(&self, cell: CellId) -> bool {
-        self.live.has_actor(cell).await
+    async fn has_actor(&self, grid: GridId, cell: CellId) -> bool {
+        self.live.has_actor(grid, cell).await
     }
 
     async fn read_cold(&self, grid: GridId, cell: CellId) -> Result<Option<SnapshotPage>, Reject> {
@@ -179,11 +195,26 @@ impl Cluster {
         RendezvousHasher::new(self.nodes.clone()).owner(cell)
     }
 
-    /// The runtime owning `cell`, if this cluster hosts it.
+    /// The runtime owning `(grid, cell)`, if this cluster hosts it.
+    ///
+    /// Placement is keyed by `(grid, cell)` (P-7: storage cell ids are
+    /// grid-relative). Today each cluster serves exactly one grid — a nested
+    /// deployment runs one cluster per grid — so a mismatched grid has no
+    /// runtime to route to and this returns `None`. The grid check is the
+    /// routing half of the P-7 guard; the runtime's own `actor()` guard is
+    /// the enforcement half.
     #[must_use]
-    pub fn runtime_for(&self, cell: CellId) -> Option<&Arc<tokio::sync::Mutex<CellRuntime>>> {
+    pub fn runtime_for(
+        &self,
+        grid: GridId,
+        cell: CellId,
+    ) -> Option<&Arc<tokio::sync::Mutex<CellRuntime>>> {
         let owner = self.owner(cell)?;
-        self.runtimes.get(&owner)
+        let rt = self.runtimes.get(&owner)?;
+        if rt.try_lock().ok()?.grid() != grid {
+            return None;
+        }
+        Some(rt)
     }
 
     /// The node set (for diagnostics).
@@ -230,22 +261,33 @@ fn journal_of(rt: &Arc<tokio::sync::Mutex<CellRuntime>>) -> Arc<crate::journal::
 #[async_trait::async_trait]
 impl Router for Cluster {
     async fn apply(&self, record: JournalRecord) -> Result<orrery_protocol::Lsn, Reject> {
-        let rt = self.runtime_for(record.cell).ok_or(Reject::JournalClosed)?;
-        let rt = rt.lock().await;
-        rt.apply(record).await
+        let rt = self
+            .runtime_for(record.grid, record.cell)
+            .ok_or(Reject::JournalClosed)?;
+        let handle = {
+            let rt = rt.lock().await;
+            rt.actor(record.grid, record.cell).cloned()
+        };
+        handle.ok_or(Reject::JournalClosed)?.apply_diff(record).await
     }
 
-    async fn read(&self, cell: CellId) -> Result<SnapshotPage, Reject> {
-        let rt = self.runtime_for(cell).ok_or(Reject::JournalClosed)?;
-        let rt = rt.lock().await;
-        rt.read(cell).await
+    async fn read(&self, grid: GridId, cell: CellId) -> Result<SnapshotPage, Reject> {
+        let rt = self.runtime_for(grid, cell).ok_or(Reject::JournalClosed)?;
+        let handle = {
+            let rt = rt.lock().await;
+            rt.actor(grid, cell).cloned()
+        };
+        handle
+            .ok_or(Reject::JournalClosed)?
+            .read_snapshot(vec![cell])
+            .await
     }
 
-    async fn has_actor(&self, cell: CellId) -> bool {
-        let Some(rt) = self.runtime_for(cell) else {
+    async fn has_actor(&self, grid: GridId, cell: CellId) -> bool {
+        let Some(rt) = self.runtime_for(grid, cell) else {
             return false;
         };
         let rt = rt.lock().await;
-        rt.actor(cell).is_some()
+        rt.actor(grid, cell).is_some()
     }
 }
