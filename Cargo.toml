@@ -11,6 +11,7 @@ members = [
     "crates/orrery_predict",
     "crates/orrery_persist_client",
     "crates/orrery_persistd",
+    "crates/orrery_seed",
 ]
 
 # The P2 latency rig and gate are standalone tools (the p0-nat-test /

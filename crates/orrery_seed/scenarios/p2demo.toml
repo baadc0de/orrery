@@ -1,0 +1,101 @@
+schema = 1
+
+[scenario]
+name          = "p2demo"
+content_build = "demo-2026-08-13"
+description   = """
+The P2 demo criterion: 10k entities across 100+ cells (this delivers ~8.6k
+occupied cells across 64 shards). Uniform control arm — structurally cannot
+produce a hotspot, so any variance the rig measures is the rig's own.
+"""
+
+[seed]
+scenario = "p2demo-2026-08-13"
+context  = "orrery.seeder.v1"
+
+[payload]
+class          = "opaque"
+schema_version = 1
+
+[[grid]]
+id          = 0
+cell_edge_m = 128.0
+
+[archetype.crate]
+declared_size = "256B"
+[archetype.crate.fields]
+model = "crate_wood_01"
+
+[archetype.barrel]
+declared_size = "224B"
+
+# One flat field over the demo extent.
+#
+# CORRECTION (seed-crate-generation, 2026-08-13): docs/12 §18.2 writes
+# `extent_cells = [64, 8, 64]` with the comment "64x8x64 half-extent =
+# 128x16x128 cells". That is internally inconsistent with the normative
+# §13.2 ladder and A.3.3's [verified] occupancy table, which pin the demo at
+# C = 32 768 candidate interest cells (64×8×64), λ = 0.305, giving 8 618
+# occupied / 26.3% — the figure `[target] occupied_fraction = 0.30` is
+# checked against. With `extent_cells` as a half-extent (§5.1), [64,8,64]
+# yields 128×16×128 = 262 144 cells and an occupied fraction of 0.038, which
+# misses the 0.30 ± 0.05 target by 7×. The half-extent semantics is the
+# normative convention (§5.1, and the smoke scenario verifies it:
+# [8,1,8] → 16×2×16 = 512), so the extent here is corrected to [32,4,32],
+# which yields exactly 64×8×64 = 32 768 cells and reproduces the ladder.
+[[layer]]
+name   = "world"
+kind   = "uniform"
+level  = 21
+bounds = { kind = "box", center = { level = 21, xyz = [0, 0, 0] }, extent_cells = [32, 4, 32] }
+
+[[emit]]
+name       = "props"
+from       = "main"
+kind       = "entity"
+count      = 10_000
+level      = 21
+placement  = "hash"
+archetypes = { crate = 0.7, barrel = 0.3 }
+
+[target]
+count             = 10_000
+occupied_fraction = 0.30
+tolerance         = 0.05
+
+[limits]
+max_entities   = 20_000
+max_bytes      = "128MiB"
+max_wall_clock = "60s"
+
+[load]
+mode        = "offline"      # refuse if any actor/{shard} in range is live
+txn_bytes   = "768KiB"
+concurrency = 8
+dispatch    = "shuffled"     # sorted generation, shuffled dispatch (#11510)
+
+[[workload]]
+name     = "p2demo"
+entities = { from_emit = "props", fraction = 0.4 }
+motion   = { kind = "boids", flocks = 20, agents_per_flock = 20, speed_ms = 12.0 }
+diff_hz  = 4
+duration = "30m"
+
+# C-5 (docs/11-roadmap.md §P2): the runbook line names a profile, and the
+# profile is an in-file overlay — `plan --profile demo` selects this one.
+# The baseline `demo` overlay restates the ladder rung so the runbook line
+# `orrery-seed plan --profile demo` resolves; it is deliberately an identity
+# overlay (the file IS the demo rung).
+[profile.demo]
+
+# CI runs the same topology 100x smaller:  --profile ci
+# Arrays of tables replace wholesale (§18.6), so the emit is restated in
+# full at count = 100.
+[profile.ci]
+emit = [
+  { name = "props", from = "main", kind = "entity", count = 100, level = 21,
+    placement = "hash", archetypes = { crate = 0.7, barrel = 0.3 } },
+]
+target = { count = 100, occupied_fraction = 0.30, tolerance = 0.05 }
+limits = { max_entities = 200, max_bytes = "1MiB", max_wall_clock = "10s" }
+
