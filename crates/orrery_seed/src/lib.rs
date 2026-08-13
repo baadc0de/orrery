@@ -31,6 +31,22 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+/// Start the FoundationDB client network thread.
+///
+/// Delegates to [`orrery_persistd::checkpoint::fdb::fdb_network`], which owns
+/// the **one** boot this process is allowed: `foundationdb::boot()` selects the
+/// client API version and the C client permits that exactly once per process,
+/// so a second `Once` in this crate would panic the moment a binary or test
+/// links both crates — and then poison the guard for every later caller.
+///
+/// Every entry point here that opens a `Database` calls this first; without it
+/// the C client rejects the connection with `network_not_setup`
+/// (`error_code: 2008`).
+#[cfg(feature = "fdb")]
+pub fn fdb_network() {
+    let _ = orrery_persistd::checkpoint::fdb::fdb_network();
+}
+
 pub mod apply;
 pub mod content;
 pub mod encode;

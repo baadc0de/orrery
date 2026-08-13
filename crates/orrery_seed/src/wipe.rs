@@ -47,9 +47,10 @@ pub async fn run(
     }
     let cluster_file = std::env::var("ORRERY_FDB_CLUSTER_FILE")
         .map_err(|_| "set ORRERY_FDB_CLUSTER_FILE to the FDB cluster file".to_string())?;
-    let db = std::sync::Arc::new(
-        foundationdb::Database::from_path(&cluster_file).map_err(|e| format!("connect: {e}"))?,
-    );
+    let db = std::sync::Arc::new({
+        crate::fdb_network();
+        foundationdb::Database::from_path(&cluster_file).map_err(|e| format!("connect: {e}"))?
+    });
 
     let grid_ids: BTreeSet<GridId> = scenario.grids.keys().copied().map(GridId::new).collect();
     for grid in &grid_ids {

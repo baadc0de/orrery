@@ -118,9 +118,10 @@ pub async fn run(
 
     let cluster_file = std::env::var("ORRERY_FDB_CLUSTER_FILE")
         .map_err(|_| "set ORRERY_FDB_CLUSTER_FILE to the FDB cluster file".to_string())?;
-    let db = Arc::new(
-        foundationdb::Database::from_path(&cluster_file).map_err(|e| format!("connect: {e}"))?,
-    );
+    let db = Arc::new({
+        crate::fdb_network();
+        foundationdb::Database::from_path(&cluster_file).map_err(|e| format!("connect: {e}"))?
+    });
 
     let existing_seedmap = idmap::read_seedmap(&db).await?;
     let desired = build_desired_rows(
@@ -257,6 +258,14 @@ pub async fn build_desired_rows(
                 ));
             }
         }
+
+        // §9.3's canonical order is `(grid, cell, ContentKey)` ascending. Cells
+        // already arrive ascending from the splitter, but within a cell the
+        // descriptors are in *slot index* order and `ContentKey` is a blake3
+        // hash of the derivation path — so index order is not key order. Sort
+        // each cell's slice before emitting. This is not the global sort §9.3
+        // rules out: it is bounded by one cell's population.
+        descriptors.sort_by(|a, b| (a.0, a.4).cmp(&(b.0, b.4)));
 
         for (cell, _index, archetype, slot_key, content_key, local_pos) in descriptors {
             let seed_row = existing_seedmap.get(&content_key).cloned();

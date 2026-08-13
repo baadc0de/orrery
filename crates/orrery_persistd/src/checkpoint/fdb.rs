@@ -82,7 +82,15 @@ impl From<&CheckpointData> for CheckpointMeta {
 /// first use and intentionally leak the [`NetworkAutoStop`] so the network stays
 /// alive for the process lifetime; the OS reclaims it at exit. Safe because this
 /// is only ever called once (guarded by `OnceLock`).
-fn fdb_network() -> Result<(), CheckpointError> {
+///
+/// **This is the one boot for the whole process.** `foundationdb::boot()`
+/// selects the client API version, which the C client permits exactly once per
+/// process — so every crate in the workspace that opens a `Database` must call
+/// *this* function rather than booting again. A second boot panics with "the
+/// fdb select api version can only be run once per process" and poisons the
+/// guard, which then surfaces as "Once instance has previously been poisoned"
+/// in every later caller.
+pub fn fdb_network() -> Result<(), CheckpointError> {
     static ONCE: std::sync::Once = std::sync::Once::new();
     // `foundationdb::boot()` panics on failure, so once we get here the network
     // is up. We leak the guard so the network lives for the process lifetime.

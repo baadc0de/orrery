@@ -200,6 +200,7 @@ async fn fdb_reseed_preserves_persist_ids() {
     let source = std::fs::read_to_string(&root).expect("read scenario");
     let temp = write_temp_scenario("scenario", &source);
 
+    orrery_seed::fdb_network();
     let db = Database::from_path(&fdb_cluster_file().unwrap()).expect("db");
     let first = run_seed(
         &["apply", "--profile", "demo", "--allow-opaque"],
@@ -247,6 +248,7 @@ async fn every_written_value_carries_the_live_tag() {
     let output = run_seed(&["apply", "--allow-opaque"], temp.path()).await;
     maybe_assert_success(&output, "smoke apply");
 
+    orrery_seed::fdb_network();
     let db = Database::from_path(&fdb_cluster_file().unwrap()).expect("db");
     let rows = scan_world_rows(&db, GridId::ROOT)
         .await
@@ -306,6 +308,7 @@ async fn fdb_content_version_roundtrips() {
     .await;
     maybe_assert_success(&output, "demo apply");
 
+    orrery_seed::fdb_network();
     let db = Database::from_path(&fdb_cluster_file().unwrap()).expect("db");
     let version = read_content_version(&db).await.expect("content version");
     assert_eq!(version.content_build, "demo-2026-08-13");
@@ -319,6 +322,7 @@ async fn wipe_leaves_ckpt_rows_intact() {
         return;
     };
     let _ = cluster;
+    orrery_seed::fdb_network();
     let db = Database::from_path(&fdb_cluster_file().unwrap()).expect("db");
     let store = Arc::new(FdbCheckpointStore::connect(&fdb_cluster_file().unwrap()).expect("store"));
     let store: Arc<dyn CheckpointStore> = store.clone();
