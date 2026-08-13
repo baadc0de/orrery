@@ -180,6 +180,14 @@ bounds = { kind = "sphere", center = { level = 21, m = [0,0,0] }, radius_m = 819
 
 `box`/`sphere` snap **outward** to whole cells and the snap is reported. `extent_cells` is a half-extent, so `[64,8,64]` is 128×16×128 = 262 144 cells.
 
+**Do not read §13.2's "Extent (cells)" column as an `extent_cells` value.** That
+column is the *full* extent — `demo`'s 64×8×64 is 32 768 interest cells, which
+is exactly its metre extent (8 192 m ÷ 128 m) — while `extent_cells` here is a
+**half**-extent. Writing the ladder's figure straight into a scenario doubles
+every axis and multiplies the cell count by eight: `demo` would get `soak`'s
+262 144 cells and miss its occupancy target by 7×. The demo scenario's correct
+value is `[32, 4, 32]`.
+
 **`bounds = "all"` is only legal for operators that do not need a normalization sweep.** At level 21 "all" is 2^63 cells; `mask` with `normalize = "max"` would have to scan it. Combining them is a static error (§10, V6) naming the bounded alternative.
 
 **Suffixed scalars.** `"768KiB"`, `"40GiB"`, `"30s"` — the value carries its unit, never the key.
@@ -779,6 +787,20 @@ Five named profiles. `orrery-seed apply --profile demo` is the entire P2 demo ru
 | **stress** | 10 000 000 | 2.54 GiB | 11.66 GiB | **675 KiB** | ✗ 6.7× | 4 084 | 2.8 min |
 | **absurd** | 100 000 000 | 25.4 GiB | 116.6 GiB | **843 KiB** | ✗ 8.4× | 40 837 | 27.8 min |
 
+**The occupied-cell column is a Poisson expectation, not what the seeder
+realizes.** It is derived in A.3.3 as `C·(1 − e^(−λ))`, which is the occupancy
+you get if entities are *scattered* independently. The seeder does not scatter
+them: §7.1 chooses **systematic** allocation precisely because it holds per-cell
+deviation to ≤ 1 entity (measured max |count − N·w| of 0.995 against 6.2 for
+multinomial). At λ < 1 that deals one entity to each of `N` distinct cells, so
+the realized occupancy is `N/C` — for `demo`, 10 000 / 32 768 = **30.5%**, not
+the 26.3% the Poisson column predicts, and every occupied cell holds exactly 1.
+Both numbers are right about different things; a scenario's `occupied_fraction`
+target is checked against the realized figure. The Poisson column remains the
+correct guide for *storage* questions, where what matters is the expected
+distribution of a scattered world, and for the iterative generators whose
+fields are not evaluated by the splitter.
+
 **`demo` satisfies the P2 criterion with two orders of magnitude of headroom**: 10 000 entities across 8 618 occupied cells against "10k entities across 100+ cells".
 
 **The ladder is calibrated so `smoke` and `demo` pass on today's code and `soak` is the first rung that forces the P-8 fix.** That is intentional: the P2 demo can ship, and the very next rung produces the bug report with a number attached. The sensitivity is worth stating exactly, because it is what makes P-8 a prerequisite rather than a tuning exercise: the ceiling is `100 000 / (bag + 34)` entities per shard — 617 at a 128 B bag, 344 at 256 B, 183 at 512 B — while `soak` needs 1 953 and `demo` needs 156. So `soak` fails at every plausible bag size, and `demo` passes at every plausible bag size. But `demo-hotspot`'s hottest shard holds 800 entities, which exceeds the limit for **any bag larger than 91 B**. The binding constraint is the `ckpt/` row, not the bag.
@@ -964,7 +986,7 @@ declared_size = "224B"
 name   = "world"
 kind   = "uniform"
 level  = 21
-bounds = { kind = "box", center = { level = 21, xyz = [0, 0, 0] }, extent_cells = [64, 8, 64] }
+bounds = { kind = "box", center = { level = 21, xyz = [0, 0, 0] }, extent_cells = [32, 4, 32] }
 
 [[emit]]
 name       = "props"
