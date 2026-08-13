@@ -26,6 +26,7 @@ use crate::manifest::{value_digest, ManifestWriter, ToolchainStamp};
 use crate::scenario::{ResolvedEmit, ResolvedLayer, ResolvedScenario};
 use crate::seedtree::SeedRoot;
 use crate::split::{split_cell, FieldOracle};
+use orrery_persistd::keyspace::encode_live_value;
 
 /// The landed per-row overhead: 21-byte `world/` key + 1-byte value tag
 /// (`orrery_persistd::keyspace::world_key`, `LIVE_TAG`). See the module
@@ -89,6 +90,18 @@ pub struct EmitPlan {
     pub logical_bytes: u64,
     /// `world/` rows written (entity rows; v1 has no `chunk/` rows).
     pub world_rows: u64,
+}
+
+/// One realized entity row, including the storage value written by the
+/// seeder. The manifest entry stays separate so dry-run reporting and write
+/// path batching can share the same deterministic ordering without re-encoding
+/// the scenario twice.
+#[derive(Debug, Clone)]
+pub struct PlannedRow {
+    /// The manifest entry for the row.
+    pub entry: crate::manifest::ManifestEntry,
+    /// The landed `world/` value: `LIVE_TAG || bag`.
+    pub value: Vec<u8>,
 }
 
 /// The whole plan report (§12.1): machine-readable JSON plus what the
@@ -408,6 +421,23 @@ pub fn emit_manifest_entries(
     layer: &ResolvedLayer,
     root: &SeedRoot,
 ) -> Vec<crate::manifest::ManifestEntry> {
+    emit_rows(scenario, emit, layer, root)
+        .into_iter()
+        .map(|row| row.entry)
+        .collect()
+}
+
+/// Build the deterministic entity rows for one emit, including the landed
+/// `world/` value. This is the shared seam used by the writer and by
+/// verification; the dry-run manifest is just the entry side of the same
+/// stream.
+#[must_use]
+pub fn emit_rows(
+    scenario: &ResolvedScenario,
+    emit: &ResolvedEmit,
+    layer: &ResolvedLayer,
+    root: &SeedRoot,
+) -> Vec<PlannedRow> {
     let oracle = UniformOracle { layer };
     let mut cell_counts: BTreeMap<CellId, u64> = BTreeMap::new();
     split_cell(
@@ -442,7 +472,7 @@ pub fn emit_manifest_entries(
         // (grid, cell, ContentKey)), which is NOT slot-index order —
         // ContentKey is a hash. Build the cell's rows, sort by ContentKey,
         // then append. Cells are few-entity, so the per-cell sort is tiny.
-        let mut rows: Vec<crate::manifest::ManifestEntry> = Vec::with_capacity(count as usize);
+        let mut rows: Vec<PlannedRow> = Vec::with_capacity(count as usize);
         for (index, &arch_idx) in assignments.iter().enumerate() {
             let archetype = &emit.archetypes[arch_idx as usize].0;
             let slot_key = SeedRoot::slot_key(&cell_key, index as u64);
@@ -456,15 +486,18 @@ pub fn emit_manifest_entries(
                 archetype,
             });
             let local_pos = crate::place::hash_local_pos(slot_key, cell_edge as f32);
-            let bag = encode_bag(scenario, emit, archetype, cell, local_pos, slot_key);
-            rows.push(crate::manifest::ManifestEntry {
+            let persist_id = orrery_protocol::PersistId::new(
+                // Deterministic plan-mode id stream: cell low bits folded
+                // with the slot index. The writer mints real ids from
+                // pid/next block grants (§9.2); plan ids fill the row.
+                (cell.to_bits() & 0xFFFF_FFFF) << 16 | (index as u64 & 0xFFFF),
+            );
+            let bag = encode_bag(
+                scenario, emit, archetype, cell, local_pos, slot_key, ck, persist_id,
+            );
+            let entry = crate::manifest::ManifestEntry {
                 content_key: ck,
-                persist_id: orrery_protocol::PersistId::new(
-                    // Deterministic plan-mode id stream: cell low bits folded
-                    // with the slot index. The writer mints real ids from
-                    // pid/next block grants (§9.2); plan ids fill the row.
-                    (cell.to_bits() & 0xFFFF_FFFF) << 16 | (index as u64 & 0xFFFF),
-                ),
+                persist_id: persist_id,
                 grid: emit.grid,
                 cell,
                 value_digest: value_digest(&bag),
@@ -472,23 +505,29 @@ pub fn emit_manifest_entries(
                 archetype: archetype.clone(),
                 layer: layer.name.clone(),
                 emit: emit.name.clone(),
+            };
+            rows.push(PlannedRow {
+                entry,
+                value: encode_live_value(&bag),
             });
         }
-        rows.sort_by_key(|e| e.content_key);
+        rows.sort_by_key(|e| e.entry.content_key);
         out.extend(rows);
     }
     out
 }
 
-/// Encode one bag for the manifest digest (opaque path; the hex escape when
-/// the archetype declares one).
-fn encode_bag(
+/// Encode one bag for the manifest digest or the write path (opaque path; the
+/// hex escape when the archetype declares one).
+pub fn encode_bag(
     scenario: &ResolvedScenario,
     emit: &ResolvedEmit,
     archetype: &str,
     cell: CellId,
     local_pos: [f32; 3],
     slot_key: [u8; 32],
+    content_key: ContentKey,
+    persist_id: orrery_protocol::PersistId,
 ) -> bytes::Bytes {
     let fields = scenario
         .archetypes
@@ -504,8 +543,8 @@ fn encode_bag(
         cell,
         grid: emit.grid,
         local_pos,
-        content_key: ContentKey([0; 16]),
-        persist_id: orrery_protocol::PersistId::new(0),
+        content_key,
+        persist_id,
         rng: &mut rng,
     };
     OpaqueEncoder

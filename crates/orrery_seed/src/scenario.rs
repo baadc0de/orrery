@@ -838,6 +838,13 @@ impl Scenario {
                 },
             );
         }
+        let primary_grid = {
+            let mut explicit = self.grid.iter().map(|g| g.id).filter(|&id| id != 0);
+            match (explicit.next(), explicit.next()) {
+                (Some(id), None) => GridId::new(id),
+                _ => GridId::ROOT,
+            }
+        };
 
         let payload_class = self.payload.class.as_deref().unwrap_or("opaque");
         if payload_class != "opaque" && payload_class != "ruleset" {
@@ -915,7 +922,10 @@ impl Scenario {
             }
             let into = layer.into.clone().unwrap_or_else(|| "main".to_string());
             let level = layer.level.unwrap_or(orrery_protocol::INTEREST_LEVEL);
-            let grid = grids.get(&0).copied().expect("grid 0 is implicit");
+            let grid = grids
+                .get(&primary_grid.0)
+                .copied()
+                .unwrap_or_else(|| grids.get(&0).copied().expect("grid 0 is implicit"));
             let bounds =
                 resolve_bounds(layer.bounds.as_ref(), level, grid.cell_edge_m, &layer.name)?;
             let intensity_raw = layer
@@ -996,7 +1006,7 @@ impl Scenario {
                 count,
                 level: emit.level.unwrap_or(orrery_protocol::INTEREST_LEVEL),
                 archetypes: mix,
-                grid: GridId::ROOT,
+                grid: primary_grid,
             });
         }
 

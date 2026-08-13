@@ -28,7 +28,9 @@ pub const CONTENT_KEY_DOMAIN: &[u8] = b"orrery.ck.v1";
 ///
 /// `Ord` so manifest entries stream in `(grid, cell, ContentKey)` order and
 /// `BTreeMap`/`BTreeSet` membership is total (§8.4).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
 pub struct ContentKey(pub [u8; 16]);
 
 /// Everything the key commits to (docs/12 §9.1). All fields are part of the
