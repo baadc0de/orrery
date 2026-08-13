@@ -155,18 +155,54 @@ pub fn ckpt_key(grid: GridId, shard: CellId) -> [u8; 13] {
 }
 
 // ---------------------------------------------------------------------------
-// Fence / actor family: `actor/{shard_cell_id}`
+// Fence / actor family: `actor/{grid}/{shard_cell_id}`
 // ---------------------------------------------------------------------------
 
-/// Key for the fence row: `actor/{shard_cell_id}`.
+/// Key for the fence row: `actor/{grid}/{shard_cell_id}`.
 ///
-/// `shard_cell_id` is the 8-byte big-endian Morton `CellId` (D11 §6).
+/// `grid` scopes the shard to one nested-grid `CellId` space (P-7 / C-8),
+/// and `shard_cell_id` is the 8-byte big-endian Morton `CellId` (D11 §6).
 #[must_use]
-pub fn fence_key(shard: CellId) -> [u8; 9] {
-    let mut key = [0u8; 9];
+pub fn fence_key(grid: GridId, shard: CellId) -> [u8; 13] {
+    let mut key = [0u8; 13];
     key[0] = b'a';
-    key[1..9].copy_from_slice(&shard.to_bits().to_be_bytes());
+    key[1..5].copy_from_slice(&grid.0.to_be_bytes());
+    key[5..13].copy_from_slice(&shard.to_bits().to_be_bytes());
     key
+}
+
+/// The first key of the `actor/{grid}/…` family span.
+#[must_use]
+pub fn fence_range_start() -> Vec<u8> {
+    vec![b'a']
+}
+
+/// The exclusive end of the `actor/{grid}/…` family span.
+#[must_use]
+pub fn fence_range_end() -> Vec<u8> {
+    vec![b'b']
+}
+
+/// The first key of the `actor/{grid}/…` span for one grid.
+#[must_use]
+pub fn fence_grid_range_start(grid: GridId) -> Vec<u8> {
+    let mut key = Vec::with_capacity(5);
+    key.push(b'a');
+    key.extend_from_slice(&grid.0.to_be_bytes());
+    key
+}
+
+/// The exclusive end of the `actor/{grid}/…` span for one grid.
+#[must_use]
+pub fn fence_grid_range_end(grid: GridId) -> Vec<u8> {
+    if grid.0 < u32::MAX {
+        let mut key = Vec::with_capacity(5);
+        key.push(b'a');
+        key.extend_from_slice(&(grid.0 + 1).to_be_bytes());
+        key
+    } else {
+        vec![b'b']
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1012,7 +1048,7 @@ mod tests {
         let existing = [
             world_key(GRID, shard, PersistId::new(1)).to_vec(),
             ckpt_key(GRID, shard).to_vec(),
-            fence_key(shard).to_vec(),
+            fence_key(GRID, shard).to_vec(),
             intent_key(42).to_vec(),
         ];
         let new = [
@@ -1159,7 +1195,7 @@ mod tests {
         // a fixed one-byte prefix, the full-family range is [prefix, prefix+1),
         // so distinct prefixes guarantee disjoint ranges.
         let keys: [Vec<u8>; 11] = [
-            fence_key(shard).to_vec(),                                   // 'a'
+            fence_key(GRID, shard).to_vec(),                             // 'a'
             ckpt_key(GRID, shard).to_vec(),                              // 'c'
             intent_key(42).to_vec(),                                     // 'i'
             chunk_key(GRID, shard, 0).to_vec(),                          // 'k'
@@ -1182,6 +1218,39 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn fence_keys_are_grid_scoped_and_ranges_do_not_overlap() {
+        let shard = CellId::from_bits(SHARD).unwrap();
+        let grid_a = GridId::new(7);
+        let grid_b = GridId::new(9);
+
+        let key_a = fence_key(grid_a, shard);
+        let key_b = fence_key(grid_b, shard);
+        let expected_a = [
+            b'a', 0x00, 0x00, 0x00, 0x07, 0xA9, 0x24, 0x92, 0x49, 0x24, 0x92, 0x4E, 0x00,
+        ];
+        let expected_b = [
+            b'a', 0x00, 0x00, 0x00, 0x09, 0xA9, 0x24, 0x92, 0x49, 0x24, 0x92, 0x4E, 0x00,
+        ];
+        assert_eq!(key_a.as_slice(), expected_a.as_slice());
+        assert_eq!(key_b.as_slice(), expected_b.as_slice());
+        assert_ne!(key_a, key_b);
+
+        let grid_a_start = fence_grid_range_start(grid_a);
+        let grid_a_end = fence_grid_range_end(grid_a);
+        let grid_b_start = fence_grid_range_start(grid_b);
+        let grid_b_end = fence_grid_range_end(grid_b);
+        assert_eq!(grid_a_start.as_slice(), [b'a', 0x00, 0x00, 0x00, 0x07]);
+        assert_eq!(grid_a_end.as_slice(), [b'a', 0x00, 0x00, 0x00, 0x08]);
+        assert_eq!(grid_b_start.as_slice(), [b'a', 0x00, 0x00, 0x00, 0x09]);
+        assert_eq!(grid_b_end.as_slice(), [b'a', 0x00, 0x00, 0x00, 0x0A]);
+        assert!(grid_a_end.as_slice() <= grid_b_start.as_slice());
+        assert!(grid_b_end.as_slice() > grid_b_start.as_slice());
+
+        assert_eq!(fence_range_start(), vec![b'a']);
+        assert_eq!(fence_range_end(), vec![b'b']);
     }
 
     #[test]

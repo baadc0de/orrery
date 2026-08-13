@@ -449,7 +449,7 @@ mod tests {
             rt.fence_shard(CellId::ROOT, None, store.as_ref())
                 .await
                 .unwrap();
-            let root_row = rt.fence().read(CellId::ROOT).await.unwrap();
+            let root_row = rt.fence().read(rt.grid(), CellId::ROOT).await.unwrap();
             let parent_row = root_row.unwrap();
             let children = rt.split(CellId::ROOT, &parent_row).await.unwrap();
             assert_eq!(children.len(), 8, "root splits into 8 children");
@@ -532,7 +532,7 @@ mod tests {
             rt.fence_shard(CellId::ROOT, None, store.as_ref())
                 .await
                 .unwrap();
-            let root_row = rt.fence().read(CellId::ROOT).await.unwrap();
+            let root_row = rt.fence().read(rt.grid(), CellId::ROOT).await.unwrap();
             let parent_row = root_row.unwrap();
             rt.split(CellId::ROOT, &parent_row).await.unwrap();
         }

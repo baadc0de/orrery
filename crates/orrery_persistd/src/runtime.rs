@@ -276,7 +276,7 @@ impl CellRuntime {
             epoch: new_epoch,
             status: FenceStatus::Active,
         };
-        match self.fence.fence(shard, expected, &new).await {
+        match self.fence.fence(self.grid, shard, expected, &new).await {
             Ok(FenceOutcome::Fenced) => {
                 let ckpt = checkpoints
                     .load(shard, self.grid)
@@ -380,7 +380,7 @@ impl CellRuntime {
 
         match self
             .fence
-            .begin_split(parent, parent_row, &child_rows)
+            .begin_split(self.grid, parent, parent_row, &child_rows)
             .await
         {
             Ok(FenceOutcome::Fenced) => {}
@@ -412,7 +412,7 @@ impl CellRuntime {
         }
 
         // Retire the parent row and drop the parent actor.
-        let _ = self.fence.retire(parent).await;
+        let _ = self.fence.retire(self.grid, parent).await;
         if let Some(old) = self.actors.remove(&parent) {
             old.shutdown().await;
         }

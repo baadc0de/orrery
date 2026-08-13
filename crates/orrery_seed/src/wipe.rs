@@ -52,15 +52,22 @@ pub async fn run(
         foundationdb::Database::from_path(&cluster_file).map_err(|e| format!("connect: {e}"))?
     });
 
-    let grid_ids: BTreeSet<GridId> = scenario.grids.keys().copied().map(GridId::new).collect();
+    // The grids this scenario actually realizes into — not every declared
+    // `[[grid]]`. A scenario may declare a grid it never emits to (the demo
+    // scenarios declare grid 0 implicitly while emitting into an isolation
+    // grid), and guarding — let alone clearing — a grid we never wrote is
+    // wrong twice over: it blocks on unrelated fence rows, and `wipe` would
+    // clear another world's rows.
+    let grid_ids: BTreeSet<GridId> = scenario.emits.iter().map(|e| e.grid).collect();
     for grid in &grid_ids {
         let live = db
             .run(|trx, _| {
-                let begin = keyspace::fence_key(CellId::ROOT);
+                let begin = keyspace::fence_grid_range_start(*grid);
+                let end = keyspace::fence_grid_range_end(*grid);
                 async move {
                     let opt = foundationdb::RangeOption {
                         begin: foundationdb::KeySelector::first_greater_or_equal(begin.as_slice()),
-                        end: foundationdb::KeySelector::first_greater_or_equal(b"b"),
+                        end: foundationdb::KeySelector::first_greater_or_equal(end.as_slice()),
                         ..foundationdb::RangeOption::default()
                     };
                     let mut stream = trx.get_ranges_keyvalues(opt, false);
