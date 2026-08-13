@@ -31,12 +31,18 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod apply;
 pub mod content;
 pub mod encode;
 pub mod field;
+pub mod idmap;
 pub mod manifest;
 pub mod place;
 pub mod plan;
 pub mod scenario;
 pub mod seedtree;
 pub mod split;
+pub mod validate;
+pub mod verify;
+pub mod wipe;
+pub mod write;

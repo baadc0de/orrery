@@ -15,7 +15,7 @@ license = "MIT OR Apache-2.0"
 default = []
 # FoundationDB write path (`apply`/`verify`, gated per docs/12 §11). Mirrors
 # the persistd feature posture so `plan` builds with NO C client.
-fdb = ["dep:foundationdb"]
+fdb = ["dep:foundationdb", "orrery_persistd/fdb"]
 
 [dependencies]
 orrery_protocol = { path = "../orrery_protocol" }
@@ -36,6 +36,8 @@ postcard = { workspace = true }
 bytes = { workspace = true }
 clap = { workspace = true }
 glam = { workspace = true }
+tokio = { workspace = true }
+futures = { workspace = true }
 # FoundationDB 7.3.x (D11, D14). Optional: only built with `--features fdb`
 # (requires the C client at link time).
 foundationdb = { version = "0.11", default-features = false, features = ["fdb-7_3"], optional = true }

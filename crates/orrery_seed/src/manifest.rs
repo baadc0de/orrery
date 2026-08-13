@@ -26,7 +26,7 @@ use orrery_protocol::{CellId, GridId, PersistId};
 use crate::content::ContentKey;
 
 /// One manifest row (docs/12 §9.3).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ManifestEntry {
     /// The derivation-path identity (§9.1).
     pub content_key: ContentKey,
