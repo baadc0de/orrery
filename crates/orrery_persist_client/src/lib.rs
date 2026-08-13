@@ -49,7 +49,7 @@ pub mod queue_store;
 pub mod replies;
 pub mod uplink;
 
-pub use area::{order_nearest_first, AreaLoader, LoadedPage};
+pub use area::{order_nearest_first, sync_aoi_to_loader, AreaLoader, LoadedPage};
 pub use config::PersistClientConfig;
 pub use feed::{feed_uplink, LocallyAuthoritative, PersistId, UplinkSeq};
 pub use gateway::{GatewayConfig, GatewaySession, GatewayState, SessionEvent};

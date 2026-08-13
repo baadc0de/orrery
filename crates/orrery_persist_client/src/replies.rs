@@ -12,7 +12,7 @@ use bevy_platform::time::Instant;
 
 use orrery_protocol::GatewayReply;
 
-use crate::area::{AreaLoader, LoadedPage};
+use crate::area::AreaLoader;
 use crate::gateway::{GatewayConfig, GatewaySession, GatewayState};
 use crate::intents::IntentQueue;
 use crate::uplink::UplinkScheduler;
@@ -79,12 +79,12 @@ pub fn process_replies(
                 ..
             } => scheduler.on_ack(entity, tick, provisional),
             GatewayReply::BulkNack { entity, tick, .. } => scheduler.on_nack(entity, tick),
-            GatewayReply::AreaPage { cell, page } => loader.record(LoadedPage {
-                cell,
-                entities: page.entities,
-                payloads: page.payloads,
-                live: page.live,
-            }),
+            GatewayReply::AreaPage { page, .. } => loader.record_frame(page),
+            GatewayReply::AreaLoadError { cell, kind } => {
+                // A failed scan is diagnosable (distinct from an empty cell);
+                // the retry floor re-requests the cell set.
+                tracing::warn!(?cell, kind, "gateway: area-load cell failed");
+            }
             GatewayReply::IntentAck { intent_id, outcome } => {
                 queue.on_ack(intent_id, outcome);
             }
@@ -115,7 +115,128 @@ pub fn process_replies(
 mod tests {
     use super::*;
     use aeronet_iroh::iroh;
+    use bytes::Bytes;
     use orrery_protocol::{DiffUplink, GridId, Lsn, PersistId, RecordKind, Tick};
+
+    /// An app with the reply path wired and a connected session entity.
+    fn reply_app() -> (bevy_app::App, bevy_ecs::entity::Entity) {
+        let mut app = bevy_app::App::new();
+        app.init_resource::<GatewaySession>()
+            .init_resource::<UplinkScheduler>()
+            .init_resource::<AreaLoader>()
+            .init_resource::<IntentQueue>();
+        let session_entity = app
+            .world_mut()
+            .spawn(aeronet_io::Session::new(
+                bevy_platform::time::Instant::now(),
+                1024,
+            ))
+            .id();
+        {
+            let mut session = app.world_mut().resource_mut::<GatewaySession>();
+            session.session = Some(session_entity);
+            session.state = GatewayState::Connected;
+        }
+        app.add_systems(bevy_app::Update, process_replies);
+        (app, session_entity)
+    }
+
+    fn push_reply(app: &mut bevy_app::App, session_entity: bevy_ecs::entity::Entity, bytes: Bytes) {
+        app.world_mut()
+            .get_mut::<aeronet_io::Session>(session_entity)
+            .unwrap()
+            .recv
+            .push(aeronet_io::packet::RecvPacket {
+                recv_at: bevy_platform::time::Instant::now(),
+                payload: bytes,
+            });
+    }
+
+    #[test]
+    fn oversized_cell_arrives_intact() {
+        // One cell with 200 entities × 256-byte bags, chunked by hand exactly
+        // as the gateway does (sequenced frames under the 1100-byte datagram
+        // budget, orrery_protocol::MAX_AREA_PAGE_FRAME_BYTES): the client's
+        // `LoadedPage` for the cell must hold all 200 PersistIds.
+        let cell = orrery_protocol::CellId::ROOT;
+        let bag = bytes::Bytes::from(vec![0xAB; 256]);
+        let mut frames: Vec<orrery_protocol::AreaPage> = Vec::new();
+        let mut chunk: Vec<u64> = Vec::new();
+        for i in 0..200u64 {
+            chunk.push(i);
+            // 4 entities × (8 B id + ~266 B bag) ≈ 1096 B — just under the
+            // budget once the framing overhead is added; 5 would exceed it.
+            if chunk.len() == 4 {
+                frames.push(chunk_frame(cell, frames.len() as u32, &chunk, &bag));
+                chunk.clear();
+            }
+        }
+        if !chunk.is_empty() {
+            let index = frames.len() as u32;
+            frames.push(chunk_frame(cell, index, &chunk, &bag));
+        }
+        assert_eq!(frames.len(), 50, "200 entities / 4 per chunk");
+        // Every chunk carries the total; every encoded frame is under the
+        // budget.
+        let total = frames.len() as u32;
+        for frame in &mut frames {
+            frame.total_chunks = total;
+            let encoded = GatewaySession::encode_stream(&GatewayReply::AreaPage {
+                cell,
+                page: frame.clone(),
+            });
+            assert!(
+                encoded.len() <= orrery_protocol::MAX_AREA_PAGE_FRAME_BYTES,
+                "chunk {} is {} B",
+                frame.chunk_index,
+                encoded.len()
+            );
+        }
+
+        let (mut app, session_entity) = reply_app();
+        // Deliver the frames out of order (the lane is unreliable and
+        // unordered, D3): reassembly must hold partials in any arrival order
+        // and complete on the full set.
+        let mut shuffled = frames.clone();
+        shuffled.reverse();
+        for frame in shuffled {
+            push_reply(
+                &mut app,
+                session_entity,
+                GatewaySession::encode_stream(&GatewayReply::AreaPage { cell, page: frame }),
+            );
+        }
+        app.update();
+
+        let loader = app.world().resource::<AreaLoader>();
+        assert_eq!(loader.page_count(), 1, "the chunked page reassembled");
+        let page = &loader.pages[0];
+        assert_eq!(page.cell, cell);
+        let mut ids: Vec<u64> = page.entities.iter().map(|p| p.0).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), 200, "all 200 PersistIds arrived intact");
+        assert_eq!(page.payloads.len(), 200);
+        assert!(page.payloads.iter().all(|p| p.len() == 256));
+    }
+
+    fn chunk_frame(
+        cell: orrery_protocol::CellId,
+        index: u32,
+        ids: &[u64],
+        bag: &Bytes,
+    ) -> orrery_protocol::AreaPage {
+        orrery_protocol::AreaPage {
+            cell,
+            page_seq: 1,
+            chunk_index: index,
+            // Set by the caller once the chunk count is known.
+            total_chunks: 0,
+            entities: ids.iter().map(|&id| PersistId::new(id)).collect(),
+            payloads: ids.iter().map(|_| bag.clone()).collect(),
+            live: true,
+        }
+    }
 
     #[test]
     fn bulk_ack_routes_to_scheduler() {

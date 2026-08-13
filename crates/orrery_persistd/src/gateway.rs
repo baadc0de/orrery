@@ -32,20 +32,21 @@
 //! would route by rendezvous placement instead (docs/08-persistence.md §3).
 
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use bytes::Bytes;
 use iroh::{Endpoint, EndpointAddr, RelayMode};
-use tokio::sync::oneshot;
-use tracing::debug;
+use tokio::sync::{oneshot, Semaphore};
+use tracing::{debug, warn};
 
 use orrery_protocol::channels::{
     decode_datagram, decode_stream_frame, encode_datagram, encode_stream_frame, untag, Channel,
 };
 use orrery_protocol::{
     AreaPage, CellId, DiffUplink, Epoch, GatewayMsg, GatewayReply, GridId, Intent, IntentOutcome,
-    JournalRecord, Lsn, NodeId, PROTOCOL_VERSION, REASON_BAD_SIGNATURE, REASON_ISSUER_MISMATCH,
-    REASON_NO_EXECUTOR,
+    JournalRecord, Lsn, NodeId, PersistId, MAX_AREA_PAGE_FRAME_BYTES, PROTOCOL_VERSION,
+    REASON_BAD_SIGNATURE, REASON_ISSUER_MISMATCH, REASON_NO_EXECUTOR,
 };
 
 use crate::cluster::Router;
@@ -60,6 +61,14 @@ pub const GATEWAY_ALPN: &[u8] = b"orrery/gateway/0";
 
 /// The admission response byte, mirroring `aeronet_iroh`'s `ACCEPTED`.
 const ACCEPTED: u8 = 0;
+
+/// How many client messages one connection routes concurrently.
+///
+/// Per-message routing is spawned (`tokio::spawn`) with this semaphore bounding
+/// the in-flight routes per connection, so a slow 27-cell subscribe (FDB cold
+/// scans) does not head-of-line block diffs — and their acks — on the same
+/// connection (D16: the ack *is* the client-observed durability contract).
+const MAX_INFLIGHT_ROUTES_PER_CONN: usize = 8;
 
 /// Configuration for the [`GatewayServer`].
 #[derive(Clone)]
@@ -125,6 +134,7 @@ impl core::error::Error for GatewayError {}
 /// them onto a [`Router`] (a single runtime or a multi-node cluster).
 pub struct GatewayServer {
     endpoint: Arc<Endpoint>,
+    send_failures: Arc<AtomicU64>,
     shutdown: oneshot::Sender<()>,
     join: tokio::task::JoinHandle<()>,
 }
@@ -152,6 +162,7 @@ impl GatewayServer {
         let executor = config.executor;
         let validator = config.validator;
         let (shutdown, rx) = oneshot::channel();
+        let send_failures = Arc::new(AtomicU64::new(0));
         let join = tokio::spawn(accept_loop(
             endpoint.clone(),
             router,
@@ -159,10 +170,12 @@ impl GatewayServer {
             protocol,
             executor,
             validator,
+            Arc::clone(&send_failures),
             rx,
         ));
         Ok(Self {
             endpoint,
+            send_failures,
             shutdown,
             join,
         })
@@ -181,6 +194,16 @@ impl GatewayServer {
         self.endpoint.addr()
     }
 
+    /// The number of reply datagram sends that failed since startup (e.g. an
+    /// oversize frame rejected by QUIC). Every failure is also logged with the
+    /// remote and the byte length; this counter is the always-on signal that a
+    /// page exceeded the datagram budget or the connection tore mid-send
+    /// (docs/08-persistence.md §9).
+    #[must_use]
+    pub fn area_page_send_failures(&self) -> u64 {
+        self.send_failures.load(Ordering::Relaxed)
+    }
+
     /// Stop the accept loop and close the endpoint, awaiting the accept task.
     pub async fn shutdown(self) {
         let _ = self.shutdown.send(());
@@ -191,6 +214,7 @@ impl GatewayServer {
 
 /// Accept client connections forever, spawning one handler task per connection,
 /// until `shutdown` resolves or the endpoint closes.
+#[allow(clippy::too_many_arguments)]
 async fn accept_loop(
     endpoint: Arc<Endpoint>,
     router: Arc<dyn Router>,
@@ -198,6 +222,7 @@ async fn accept_loop(
     protocol: u16,
     executor: Option<SharedExecutor>,
     validator: SharedValidator,
+    send_failures: Arc<AtomicU64>,
     mut shutdown: oneshot::Receiver<()>,
 ) {
     loop {
@@ -208,8 +233,15 @@ async fn accept_loop(
                 let router = Arc::clone(&router);
                 let executor = executor.clone();
                 let validator = Arc::clone(&validator);
+                let send_failures = Arc::clone(&send_failures);
                 tokio::spawn(handle_connection(
-                    incoming, router, gateway, protocol, executor, validator,
+                    incoming,
+                    router,
+                    gateway,
+                    protocol,
+                    executor,
+                    validator,
+                    send_failures,
                 ));
             }
         }
@@ -218,6 +250,13 @@ async fn accept_loop(
 
 /// Drive one client session: complete the iroh handshake, send the admission
 /// uni-stream, then read tagged datagrams and route each [`GatewayMsg`].
+///
+/// Each decoded message is routed on its own spawned task (bounded by
+/// [`MAX_INFLIGHT_ROUTES_PER_CONN`] per connection) so a slow 27-cell
+/// subscribe — FDB cold scans — never head-of-line blocks diffs on the same
+/// connection: the bulk ack is the client-observed durability contract
+/// (docs/08-persistence.md §2.1, D16 p99 < 5 ms) and must not queue behind an
+/// area load.
 async fn handle_connection(
     incoming: iroh::endpoint::Incoming,
     router: Arc<dyn Router>,
@@ -225,6 +264,7 @@ async fn handle_connection(
     protocol: u16,
     executor: Option<SharedExecutor>,
     validator: SharedValidator,
+    send_failures: Arc<AtomicU64>,
 ) {
     let conn = match incoming.accept() {
         Ok(accepting) => match accepting.await {
@@ -249,12 +289,19 @@ async fn handle_connection(
         return;
     }
 
-    let send = {
+    let send: Arc<dyn Fn(Bytes) + Send + Sync> = {
         let conn = Arc::clone(&conn);
-        move |bytes: Bytes| {
-            let _ = conn.send_datagram(bytes);
-        }
+        Arc::new(move |bytes: Bytes| {
+            let len = bytes.len();
+            if let Err(e) = conn.send_datagram(bytes) {
+                // Never swallow a failed send: an oversize page or a torn
+                // connection is counted and logged, not silently dropped.
+                send_failures.fetch_add(1, Ordering::Relaxed);
+                warn!(?e, %remote, len, "gateway: reply datagram send failed");
+            }
+        })
     };
+    let inflight = Arc::new(Semaphore::new(MAX_INFLIGHT_ROUTES_PER_CONN));
 
     loop {
         let pkt = match conn.read_datagram().await {
@@ -280,12 +327,36 @@ async fn handle_connection(
                 let reply = GatewayReply::HelloAck { gateway, protocol };
                 send(Bytes::from(encode_stream_frame(&reply)));
             }
-            GatewayMsg::Diff { diff } => route_diff(&send, diff, remote, &router).await,
+            GatewayMsg::Diff { diff } => {
+                let send = Arc::clone(&send);
+                let router = Arc::clone(&router);
+                let permit = Arc::clone(&inflight).acquire_owned().await;
+                match permit {
+                    Ok(permit) => {
+                        tokio::spawn(async move {
+                            let _permit = permit;
+                            route_diff(send.as_ref(), diff, remote, &router).await;
+                        });
+                    }
+                    Err(_) => route_diff(send.as_ref(), diff, remote, &router).await,
+                }
+            }
             GatewayMsg::Subscribe { grid, cells } => {
-                route_subscribe(&send, grid, cells, &router).await
+                let send = Arc::clone(&send);
+                let router = Arc::clone(&router);
+                let permit = Arc::clone(&inflight).acquire_owned().await;
+                match permit {
+                    Ok(permit) => {
+                        tokio::spawn(async move {
+                            let _permit = permit;
+                            route_subscribe(send.as_ref(), grid, cells, remote, &router).await;
+                        });
+                    }
+                    Err(_) => route_subscribe(send.as_ref(), grid, cells, remote, &router).await,
+                }
             }
             GatewayMsg::SubmitIntent { intent } => {
-                route_intent(&send, intent, remote, &executor, &validator).await
+                route_intent(send.as_ref(), intent, remote, &executor, &validator).await;
             }
         }
     }
@@ -440,46 +511,167 @@ async fn route_diff(
 }
 
 /// Serve an area load: read each requested cell from its owning actor and
-/// stream an [`AreaPage`] back. `live` reports whether a live actor held the
-/// cell (vs a cold FDB scan). `grid` scopes the cold scans (P-7: storage cell
-/// ids are grid-relative).
+/// stream an [`AreaPage`] back **as the cell resolves** — never buffered for a
+/// trailing flush, so the centre cell's page lands before the 27th cell is
+/// scanned (D16: < 50 ms to first page-in). `live` reports whether a live
+/// actor held the cell (vs a cold FDB scan). `grid` scopes the cold scans
+/// (P-7: storage cell ids are grid-relative).
+///
+/// Every requested cell gets a reply: an empty cell is an empty page, and a
+/// failed read is a logged [`GatewayReply::AreaLoadError`] — never silent, so
+/// a failed FDB scan is diagnosable rather than indistinguishable from an
+/// empty cell (docs/08-persistence.md §9).
 async fn route_subscribe(
     send: &(dyn Fn(Bytes) + Send + Sync),
     grid: GridId,
     cells: Vec<CellId>,
+    remote: NodeId,
     router: &Arc<dyn Router>,
 ) {
-    let mut frames = Vec::new();
+    // A per-send page counter: each cell's page (and each chunk of it) is
+    // stamped with a distinct `page_seq`, so a client's reassembly never mixes
+    // chunks of two sends of the same cell (a retried subscribe re-sends the
+    // page under a new seq).
+    let mut page_seq = 0u32;
     for cell in cells {
         // Live cells come from actor memory (authoritative, ≥ checkpoint
         // freshness); cold cells from the durable tier range scan
         // (docs/08-persistence.md §9).
         let live = router.has_actor(cell).await;
-        let page = if live {
-            router.read(cell).await.ok()
+        let read = if live {
+            router.read(cell).await.map(Some)
         } else {
-            router.read_cold(grid, cell).await.ok().flatten()
+            router.read_cold(grid, cell).await
         };
-        if let Some(page) = page {
-            let mut entities = Vec::with_capacity(page.entities.len());
-            let mut payloads = Vec::with_capacity(page.entities.len());
-            for (id, record) in page.entities {
-                entities.push(id);
-                payloads.push(record.components.clone());
+        match read {
+            Ok(page) => {
+                let page = page.unwrap_or_default();
+                let mut entities = Vec::with_capacity(page.entities.len());
+                let mut payloads = Vec::with_capacity(page.entities.len());
+                for (id, record) in page.entities {
+                    entities.push(id);
+                    payloads.push(record.components);
+                }
+                page_seq = page_seq.wrapping_add(1);
+                for frame in chunk_area_page(cell, entities, payloads, live, page_seq) {
+                    send(Bytes::from(frame));
+                }
             }
-            frames.push(encode_stream_frame(&GatewayReply::AreaPage {
-                cell,
-                page: AreaPage {
-                    cell,
-                    entities,
-                    payloads,
-                    live,
-                },
-            }));
+            Err(e) => {
+                let kind = if live {
+                    orrery_protocol::AREA_LOAD_ERR_LIVE
+                } else {
+                    orrery_protocol::AREA_LOAD_ERR_COLD
+                };
+                warn!(?e, ?cell, %grid, %remote, kind, "gateway: area-load cell read failed");
+                send(Bytes::from(encode_stream_frame(
+                    &GatewayReply::AreaLoadError { cell, kind },
+                )));
+            }
         }
     }
+}
 
-    for frame in frames {
-        send(Bytes::from(frame));
+/// Split one cell's page into as many sequenced [`AreaPage`] frames as needed
+/// to keep every encoded frame under [`MAX_AREA_PAGE_FRAME_BYTES`].
+///
+/// The lane is packet-only (D3 datagrams; the reliable-stream class of
+/// docs/08-persistence.md §2.1 does not exist in this build), so an oversized
+/// frame is rejected by QUIC and lost — chunking is the P2 answer: sequence
+/// the frames (`page_index`/`last`) and let the client reassemble. The frame
+/// cap is conservative; if one entity's bag alone cannot fit, its frame is
+/// emitted oversize and the send is counted (an entity that big is a Ruleset
+/// bug, not a transport problem).
+fn chunk_area_page(
+    cell: CellId,
+    entities: Vec<PersistId>,
+    payloads: Vec<Bytes>,
+    live: bool,
+    page_seq: u32,
+) -> Vec<Vec<u8>> {
+    debug_assert_eq!(entities.len(), payloads.len());
+    let total = entities.len();
+
+    // Greedy chunking: grow each chunk while the *encoded* frame stays under
+    // the budget — measure the real bytes, never guess at postcard's per-item
+    // overhead.
+    let mut chunks: Vec<(usize, usize)> = Vec::new();
+    let mut start = 0;
+    while start < total {
+        let mut end = start + 1;
+        while end < total {
+            #[allow(clippy::cast_possible_truncation)]
+            let frame = encode_chunk(
+                cell,
+                &entities,
+                &payloads,
+                start,
+                end + 1,
+                live,
+                page_seq,
+                0,
+                1,
+            );
+            if frame.len() > MAX_AREA_PAGE_FRAME_BYTES {
+                break;
+            }
+            end += 1;
+        }
+        chunks.push((start, end));
+        start = end;
     }
+    if chunks.is_empty() {
+        // An empty cell is still a page: one empty chunk
+        // (docs/08-persistence.md §9 — every requested cell gets a reply).
+        chunks.push((0, 0));
+    }
+
+    #[allow(clippy::cast_possible_truncation)]
+    let total_chunks = chunks.len() as u32;
+    chunks
+        .iter()
+        .enumerate()
+        .map(|(i, &(start, end))| {
+            #[allow(clippy::cast_possible_truncation)]
+            encode_chunk(
+                cell,
+                &entities,
+                &payloads,
+                start,
+                end,
+                live,
+                page_seq,
+                i as u32,
+                total_chunks,
+            )
+        })
+        .collect()
+}
+
+/// Encode one chunk of a cell's page: `entities[start..end]` with its chunk
+/// coordinates (`page_seq`/`chunk_index`/`total_chunks`).
+#[allow(clippy::too_many_arguments)]
+fn encode_chunk(
+    cell: CellId,
+    entities: &[PersistId],
+    payloads: &[Bytes],
+    start: usize,
+    end: usize,
+    live: bool,
+    page_seq: u32,
+    chunk_index: u32,
+    total_chunks: u32,
+) -> Vec<u8> {
+    encode_stream_frame(&GatewayReply::AreaPage {
+        cell,
+        page: AreaPage {
+            cell,
+            page_seq,
+            chunk_index,
+            total_chunks,
+            entities: entities[start..end].to_vec(),
+            payloads: payloads[start..end].to_vec(),
+            live,
+        },
+    })
 }
