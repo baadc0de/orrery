@@ -40,6 +40,8 @@ clap = { workspace = true }
 anyhow = { workspace = true }
 tracing-subscriber = { workspace = true }
 futures = { workspace = true }
+serde_json = "1"
+glam = { workspace = true }
 fjall = { version = "3.1", features = ["bytes_1"], optional = true }
 # FoundationDB 7.3.x system-of-record (D11, D14). Optional: only built when the
 # `fdb` feature is on (requires the C client at link time).
@@ -52,5 +54,4 @@ harness = false
 [dev-dependencies]
 tempfile = "3"
 proptest = { workspace = true }
-glam = { workspace = true }
 iroh-base = { workspace = true }
