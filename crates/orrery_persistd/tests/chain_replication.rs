@@ -52,6 +52,7 @@ fn journal_config(dir: &std::path::Path) -> JournalConfig {
 fn runtime_config(dir: &std::path::Path, node_id: u64) -> RuntimeConfig {
     RuntimeConfig {
         shards: vec![CellId::ROOT],
+        grid: GridId::ROOT,
         journal: journal_config(dir),
         node_id,
         epoch: Epoch::new(0),

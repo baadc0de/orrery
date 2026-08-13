@@ -5,9 +5,11 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use orrery_protocol::{CellId, Epoch, JournalRecord, Lsn, PersistId, RecordKind};
+use orrery_protocol::{CellId, Epoch, GridId, JournalRecord, Lsn, PersistId, RecordKind};
 
-use crate::actor::{self, CellActorHandle, EntityRecord, SnapshotPage};
+use crate::actor::{
+    self, CellActorHandle, EntityRecord, SnapshotPage, Tombstone, TOMBSTONE_RETENTION_MS,
+};
 use crate::checkpoint::{CheckpointData, CheckpointStore};
 use crate::crc::crc32c;
 use crate::fence::{FenceOutcome, FenceRow, FenceStatus, FenceStore, MemFenceStore};
@@ -19,6 +21,10 @@ use crate::placement::{RendezvousHasher, RendezvousNode};
 pub struct RuntimeConfig {
     /// The shard cells this runtime hosts.
     pub shards: Vec<CellId>,
+    /// The grid the shards' `CellId` space belongs to (P-7, D11 §6: storage
+    /// cell ids are grid-relative). A nested-grid deployment runs one runtime
+    /// (or one set of shards) per grid.
+    pub grid: GridId,
     /// Journal configuration.
     pub journal: JournalConfig,
     /// The node id of this runtime instance (for placement/HRW).
@@ -36,6 +42,7 @@ impl Default for RuntimeConfig {
     fn default() -> Self {
         Self {
             shards: vec![CellId::ROOT],
+            grid: GridId::ROOT,
             journal: JournalConfig::default(),
             node_id: 0,
             epoch: Epoch::new(0),
@@ -49,6 +56,7 @@ pub struct CellRuntime {
     journal: Arc<Journal>,
     actors: HashMap<CellId, CellActorHandle>,
     epoch: Epoch,
+    grid: GridId,
     fence: std::sync::Arc<dyn FenceStore>,
     node_id: u64,
 }
@@ -59,32 +67,38 @@ impl CellRuntime {
     /// superseded epochs, re-verifying crc).
     pub fn open(config: &RuntimeConfig) -> Result<Self, crate::journal::JournalError> {
         let journal = Arc::new(Journal::open(&config.journal)?);
+        // The replay below mints tombstone GC deadlines (P-6); one clock read
+        // for the whole replay keeps it consistent.
+        let now_ms = now_ms();
 
         let mut actors = HashMap::new();
         for &shard in &config.shards {
             // Rebuild state by replaying this shard's records (crc-checked).
             let mut state = HashMap::new();
             let mut by_cell = HashMap::new();
+            let mut tombstones = HashMap::new();
             let mut watermark = Lsn::new(0, 0);
             for item in journal.scan_from(Lsn::new(0, 0)) {
                 let stored = item?;
                 let rec = &stored.record;
-                if rec.cell != shard {
+                if !shard.is_prefix_of(rec.cell) {
                     continue;
                 }
                 if rec.epoch < config.epoch {
                     continue;
                 }
                 verify_crc(rec)?;
-                fold(&mut state, &mut by_cell, rec);
+                fold(&mut state, &mut by_cell, &mut tombstones, rec, now_ms);
                 watermark = watermark.max(rec.lsn);
             }
             let handle = actor::spawn_preloaded(
                 shard,
+                config.grid,
                 config.epoch,
                 Arc::clone(&journal),
                 state,
                 by_cell,
+                tombstones,
                 watermark,
             );
             actors.insert(shard, handle);
@@ -94,6 +108,7 @@ impl CellRuntime {
             journal,
             actors,
             epoch: config.epoch,
+            grid: config.grid,
             fence: Arc::clone(&config.fence),
             node_id: config.node_id,
         })
@@ -117,6 +132,12 @@ impl CellRuntime {
     /// The fence store backing `actor/{shard}` rows.
     pub fn fence(&self) -> &std::sync::Arc<dyn FenceStore> {
         &self.fence
+    }
+
+    /// The grid this runtime's shards live in (P-7: storage cell ids are
+    /// grid-relative, and the actors write rows under this grid).
+    pub fn grid(&self) -> GridId {
+        self.grid
     }
 
     /// The actor owning `cell`: the **deepest** shard actor whose subtree
@@ -153,7 +174,7 @@ impl CellRuntime {
             Ok(FenceOutcome::Fenced) => {
                 self.actors.insert(
                     shard,
-                    actor::spawn(shard, new_epoch, Arc::clone(&self.journal)),
+                    actor::spawn(shard, self.grid, new_epoch, Arc::clone(&self.journal)),
                 );
                 Ok(new_epoch)
             }
@@ -220,14 +241,17 @@ impl CellRuntime {
         for (child, _) in &child_rows {
             let partition = snap.children.get(child).cloned().unwrap_or_default();
             let child_by_cell = snap.by_cell.get(child).cloned().unwrap_or_default();
+            let child_tombstones = snap.tombstones.get(child).cloned().unwrap_or_default();
             self.actors.insert(
                 *child,
                 actor::spawn_preloaded(
                     *child,
+                    self.grid,
                     new_epoch,
                     Arc::clone(&self.journal),
                     partition,
                     child_by_cell,
+                    child_tombstones,
                     snap.ckpt_watermark,
                 ),
             );
@@ -254,6 +278,16 @@ impl CellRuntime {
     pub async fn read(&self, cell: CellId) -> Result<SnapshotPage, actor::Reject> {
         let handle = self.actor(cell).ok_or(actor::Reject::JournalClosed)?;
         handle.read_snapshot(vec![cell]).await
+    }
+
+    /// Capture a copy-on-update snapshot of the actor owning `cell`
+    /// (entities, per-entity cells, and despawn markers).
+    pub async fn actor_snapshot(
+        &self,
+        cell: CellId,
+    ) -> Result<crate::actor::CheckpointSnapshot, actor::Reject> {
+        let handle = self.actor(cell).ok_or(actor::Reject::JournalClosed)?;
+        handle.checkpoint_snapshot().await
     }
 
     /// Write a checkpoint of every actor's current state to `store` (§8).
@@ -295,13 +329,24 @@ impl CellRuntime {
             .map_err(|_| crate::checkpoint::CheckpointError::Store("actor gone".into()))?;
         let data = CheckpointData {
             shard: snap.shard,
+            grid: snap.grid,
+            node_id: self.node_id,
             epoch: snap.epoch,
             watermark: snap.ckpt_watermark,
             entities: snap.entities,
             by_cell: snap.by_cell,
+            tombstones: snap.tombstones,
             taken_at_ms: now,
         };
-        store.checkpoint(&data).await
+        store.checkpoint(&data).await?;
+        // The store's GC pass cleared the expired tombstone rows (D11 §6,
+        // P-6); drop them from the actor now so the next checkpoint does not
+        // rewrite them. Safe on failure: an interrupted checkpoint re-runs and
+        // clears them again, so a stale actor entry cannot resurrect a row.
+        handle.prune_tombstones(now).await.map_err(|_| {
+            crate::checkpoint::CheckpointError::Store("actor gone after checkpoint".into())
+        })?;
+        Ok(())
     }
 
     /// Restore an actor's state from `store`, then replay the journal tail.
@@ -320,10 +365,11 @@ impl CellRuntime {
             crate::checkpoint::CheckpointError::Store("no actor for shard".into())
         })?;
 
-        // Load the checkpoint and fold its entity bag into the actor.
-        if let Some(ckpt) = store.load(shard).await? {
+        // Load the checkpoint and fold its entity bag and despawn markers
+        // into the actor.
+        if let Some(ckpt) = store.load(shard, self.grid).await? {
             handle
-                .restore_entities(ckpt.entities, ckpt.by_cell)
+                .restore_entities(ckpt.entities, ckpt.by_cell, ckpt.tombstones)
                 .await
                 .map_err(|_| {
                     crate::checkpoint::CheckpointError::Store("actor gone during restore".into())
@@ -341,7 +387,7 @@ impl CellRuntime {
             let stored =
                 item.map_err(|e| crate::checkpoint::CheckpointError::Store(format!("{e}")))?;
             let rec = &stored.record;
-            if rec.cell != shard {
+            if !shard.is_prefix_of(rec.cell) {
                 continue;
             }
             if rec.epoch < self.epoch {
@@ -390,11 +436,24 @@ fn verify_crc(record: &JournalRecord) -> Result<(), crate::journal::JournalError
     Ok(())
 }
 
-/// Fold a record into an entity map (last-writer-wins per entity).
+/// The current wall-clock time as unix milliseconds.
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Fold a record into an entity map and tombstone set (last-writer-wins per
+/// entity). Mirrors the actor's fold logic for the `open`-time replay, which
+/// runs before any actor exists; `now_ms` seeds the despawn markers' GC
+/// deadlines (P-6).
 fn fold(
     state: &mut HashMap<PersistId, EntityRecord>,
     by_cell: &mut HashMap<PersistId, CellId>,
+    tombstones: &mut HashMap<PersistId, Tombstone>,
     record: &JournalRecord,
+    now_ms: u64,
 ) {
     match record.kind {
         RecordKind::Spawn | RecordKind::ComponentDiff => {
@@ -402,10 +461,19 @@ fn fold(
             entry.components = record.payload.clone();
             entry.dirty = true;
             by_cell.insert(record.entity, record.cell);
+            tombstones.remove(&record.entity);
         }
         RecordKind::Despawn => {
             state.remove(&record.entity);
             by_cell.remove(&record.entity);
+            tombstones.insert(
+                record.entity,
+                Tombstone {
+                    cell: record.cell,
+                    tick: record.tick,
+                    gc_deadline_ms: now_ms + TOMBSTONE_RETENTION_MS,
+                },
+            );
         }
         RecordKind::TerrainDelta | RecordKind::Rekey | RecordKind::CheckpointMark => {}
     }

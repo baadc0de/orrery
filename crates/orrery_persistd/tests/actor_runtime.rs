@@ -39,6 +39,7 @@ fn runtime_config(dir: &std::path::Path, batch: bool) -> RuntimeConfig {
     };
     RuntimeConfig {
         shards: vec![CellId::ROOT],
+        grid: GridId::ROOT,
         journal: JournalConfig {
             dir: dir.to_path_buf(),
             commit: GroupCommitConfig {
@@ -75,6 +76,42 @@ async fn actor_applies_and_snapshot_reflects() {
     let e = &page2.entities[&PersistId::new(7)];
     assert_eq!(e.components.as_ref(), b"hp=50");
     let _ = page;
+
+    rt.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn read_snapshot_filters_to_requested_cells() {
+    let dir = tempfile::tempdir().unwrap();
+    let rt = CellRuntime::open(&runtime_config(dir.path(), true)).unwrap();
+
+    let cell_a = CellId::from_coords(glam::IVec3::new(2, -1, 8), 21).unwrap();
+    let cell_b = cell_a
+        .neighbor(glam::IVec3::new(1, 0, 0))
+        .expect("within the volume");
+
+    // Two entities in neighbouring interest cells, both under the ROOT shard.
+    rt.apply(mk_record(cell_a, 1, RecordKind::Spawn, b"a"))
+        .await
+        .unwrap();
+    rt.apply(mk_record(cell_b, 2, RecordKind::Spawn, b"b"))
+        .await
+        .unwrap();
+
+    // Reading one interest cell returns exactly that cell's entity (P-4).
+    let page = rt.read(cell_a).await.unwrap();
+    assert_eq!(page.entities.len(), 1, "one interest cell reads one entity");
+    assert!(page.entities.contains_key(&PersistId::new(1)));
+    assert!(!page.entities.contains_key(&PersistId::new(2)));
+
+    // Reading the covering shard serves the whole subtree, mirroring read_cold.
+    let shard = cell_a
+        .parent()
+        .and_then(|p| p.parent())
+        .and_then(|p| p.parent())
+        .expect("interest cell has a level-18 shard ancestor");
+    let subtree = rt.read(shard).await.unwrap();
+    assert_eq!(subtree.entities.len(), 2, "shard read serves its subtree");
 
     rt.close().await.unwrap();
 }

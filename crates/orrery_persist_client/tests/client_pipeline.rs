@@ -97,7 +97,9 @@ fn pump(app: &mut App, gateway: &mut FakeGateway) {
                     let len = u32::from_le_bytes(payload[..4].try_into().unwrap()) as usize;
                     let msg: GatewayMsg = postcard::from_bytes(&payload[4..4 + len]).unwrap();
                     match msg {
-                        GatewayMsg::Subscribe { cells } => {
+                        // Subscribe carries the grid (P-7); the driver asserts it stays ROOT in v1.
+                        GatewayMsg::Subscribe { grid, cells } => {
+                            assert_eq!(grid, GridId::ROOT);
                             gateway.subscribes.extend(cells);
                         }
                         GatewayMsg::SubmitIntent { intent } => {

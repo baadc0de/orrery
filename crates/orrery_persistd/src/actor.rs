@@ -11,9 +11,35 @@ use std::sync::Arc;
 
 use tokio::sync::{mpsc, oneshot};
 
-use orrery_protocol::{Epoch, JournalRecord, Lsn, PersistId, RecordKind};
+use orrery_protocol::{CellId, Epoch, GridId, JournalRecord, Lsn, PersistId, RecordKind, Tick};
 
 use crate::journal::Journal;
+
+/// How long a despawned entity's `world/` tombstone persists before the
+/// checkpoint GC pass clears it (D11 §6). Must comfortably exceed the 20 s
+/// checkpoint cadence (D16) so a tombstone is at least one full checkpoint
+/// cycle old before it can disappear. An implementation default, not a D16
+/// parameter.
+pub const TOMBSTONE_RETENTION_MS: u64 = 300_000;
+
+/// A despawn marker (D11 §6 `world/{cell_id}/{entity_id}` *tombstone*).
+///
+/// When an entity despawns, the actor keeps a tombstone so the next checkpoint
+/// overwrites the entity's `world/` row with the marker (never silently
+/// leaving the stale live row to be resurrected by a cold scan), and so the
+/// checkpoint GC pass knows when the row can be cleared. The tombstone
+/// outlives the entity in the actor map, but only until its GC deadline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Tombstone {
+    /// The cell the entity lived in when it despawned — the key scope of the
+    /// `world/` row (grid-relative, grid carried by the checkpoint).
+    pub cell: CellId,
+    /// The universe tick the entity despawned at.
+    pub tick: Tick,
+    /// Wall-clock time past which the checkpoint GC pass clears the row,
+    /// as unix milliseconds.
+    pub gc_deadline_ms: u64,
+}
 
 /// An opaque entity record: component bytes plus a dirty flag (§3.1).
 ///
@@ -53,12 +79,16 @@ pub struct SnapshotPage {
 pub struct CheckpointSnapshot {
     /// The shard cell this actor owns.
     pub shard: orrery_protocol::CellId,
+    /// The grid the shard's `CellId` space belongs to (P-7, D11 §6).
+    pub grid: GridId,
     /// The shard-ownership epoch.
     pub epoch: Epoch,
     /// The entity bag.
     pub entities: HashMap<PersistId, EntityRecord>,
     /// The cell each entity currently lives in (split partitioning, §3.5).
     pub by_cell: HashMap<PersistId, orrery_protocol::CellId>,
+    /// Despawn markers not yet past their GC deadline (D11 §6).
+    pub tombstones: HashMap<PersistId, Tombstone>,
     /// The journal LSN covered by the last checkpoint.
     pub ckpt_watermark: Lsn,
 }
@@ -72,6 +102,8 @@ pub struct CheckpointSnapshot {
 pub struct SplitSnapshot {
     /// The shard cell being split.
     pub shard: orrery_protocol::CellId,
+    /// The grid the shard's `CellId` space belongs to (P-7).
+    pub grid: GridId,
     /// The shard-ownership epoch.
     pub epoch: Epoch,
     /// Entities partitioned by which child cell they belong to.
@@ -79,6 +111,9 @@ pub struct SplitSnapshot {
     /// Each partition's per-entity cell map (so a child actor is fully
     /// initialized for a subsequent split, §3.5).
     pub by_cell: HashMap<orrery_protocol::CellId, HashMap<PersistId, orrery_protocol::CellId>>,
+    /// Each partition's despawn markers (a child actor inherits the tombstones
+    /// of the entities that lived in its subtree).
+    pub tombstones: HashMap<orrery_protocol::CellId, HashMap<PersistId, Tombstone>>,
     /// The journal LSN covered by the last checkpoint.
     pub ckpt_watermark: Lsn,
 }
@@ -118,6 +153,8 @@ pub enum CellMsg {
         entities: HashMap<PersistId, EntityRecord>,
         /// The cell each entity lives in (split partitioning, §3.5).
         by_cell: HashMap<PersistId, orrery_protocol::CellId>,
+        /// Despawn markers carried by the checkpoint (D11 §6).
+        tombstones: HashMap<PersistId, Tombstone>,
         /// The new checkpoint watermark.
         watermark: Lsn,
         /// Reply channel.
@@ -140,6 +177,16 @@ pub enum CellMsg {
         /// Reply channel.
         reply: oneshot::Sender<()>,
     },
+    /// Drop tombstones whose GC deadline has passed (D11 §6, checkpoint GC
+    /// pass). The durable rows were cleared by the checkpoint that just
+    /// committed; dropping them here stops the next checkpoint from rewriting
+    /// them.
+    PruneTombstones {
+        /// Wall-clock "now", as unix milliseconds.
+        now_ms: u64,
+        /// Reply channel.
+        reply: oneshot::Sender<()>,
+    },
     /// Shut the actor down after draining the mailbox.
     Shutdown,
 }
@@ -149,12 +196,16 @@ pub enum CellMsg {
 pub struct CellActorState {
     /// The shard cell this actor owns.
     pub shard: orrery_protocol::CellId,
+    /// The grid the shard's `CellId` space belongs to (P-7).
+    pub grid: GridId,
     /// The shard-ownership epoch (fencing token, §3.4).
     pub epoch: Epoch,
     /// Entities in this actor's cells, keyed by `PersistId`.
     pub entities: HashMap<PersistId, EntityRecord>,
     /// The cell each entity currently lives in (split partitioning, §3.5).
     pub by_cell: HashMap<PersistId, orrery_protocol::CellId>,
+    /// Despawn markers not yet past their GC deadline (D11 §6).
+    pub tombstones: HashMap<PersistId, Tombstone>,
     /// The journal LSN covered by the last checkpoint.
     pub ckpt_watermark: Lsn,
 }
@@ -170,7 +221,8 @@ async fn actor_loop(env: &mut ActorEnv, mut rx: mpsc::Receiver<CellMsg>) {
     while let Some(msg) = rx.recv().await {
         match msg {
             CellMsg::ApplyDiff { record, reply } => {
-                let result = apply_diff(env, &record).await;
+                let now_ms = now_ms();
+                let result = apply_diff(env, &record, now_ms).await;
                 let _ = reply.send(result);
             }
             CellMsg::ReadSnapshot { cells, reply } => {
@@ -185,11 +237,13 @@ async fn actor_loop(env: &mut ActorEnv, mut rx: mpsc::Receiver<CellMsg>) {
             CellMsg::Restore {
                 entities,
                 by_cell,
+                tombstones,
                 watermark,
                 reply,
             } => {
                 env.state.entities = entities;
                 env.state.by_cell = by_cell;
+                env.state.tombstones = tombstones;
                 env.state.ckpt_watermark = watermark;
                 let _ = reply.send(());
             }
@@ -198,7 +252,13 @@ async fn actor_loop(env: &mut ActorEnv, mut rx: mpsc::Receiver<CellMsg>) {
                 let _ = reply.send(());
             }
             CellMsg::RestoreRecord { record, reply } => {
-                fold(env, &record);
+                fold(env, &record, now_ms());
+                let _ = reply.send(());
+            }
+            CellMsg::PruneTombstones { now_ms, reply } => {
+                env.state
+                    .tombstones
+                    .retain(|_, t| t.gc_deadline_ms > now_ms);
                 let _ = reply.send(());
             }
             CellMsg::Shutdown => break,
@@ -206,8 +266,20 @@ async fn actor_loop(env: &mut ActorEnv, mut rx: mpsc::Receiver<CellMsg>) {
     }
 }
 
+/// The current wall-clock time as unix milliseconds.
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 /// Apply a diff: journal it durably, then fold it into in-memory state.
-async fn apply_diff(env: &mut ActorEnv, record: &JournalRecord) -> Result<Lsn, Reject> {
+async fn apply_diff(
+    env: &mut ActorEnv,
+    record: &JournalRecord,
+    now_ms: u64,
+) -> Result<Lsn, Reject> {
     // Journal first; the append resolves only after the group fsync.
     let handle = env
         .journal
@@ -220,22 +292,35 @@ async fn apply_diff(env: &mut ActorEnv, record: &JournalRecord) -> Result<Lsn, R
 
     // Fold into state. Idempotent (last-writer-wins per entity), keyed by
     // (entity, tick): replay is safe because re-applying a record is a no-op.
-    fold(env, record);
+    fold(env, record, now_ms);
     Ok(lsn)
 }
 
 /// Fold a journal record into in-memory state (no durability work).
-fn fold(env: &mut ActorEnv, record: &JournalRecord) {
+fn fold(env: &mut ActorEnv, record: &JournalRecord, now_ms: u64) {
     match record.kind {
         RecordKind::Spawn | RecordKind::ComponentDiff => {
             let entry = env.state.entities.entry(record.entity).or_default();
             entry.components = record.payload.clone();
             entry.dirty = true;
             env.state.by_cell.insert(record.entity, record.cell);
+            // A re-spawn (id reuse across a despawn) cancels the marker.
+            env.state.tombstones.remove(&record.entity);
         }
         RecordKind::Despawn => {
             env.state.entities.remove(&record.entity);
             env.state.by_cell.remove(&record.entity);
+            // Tombstone, never plain deletion: the `world/` row must be
+            // overwritten by the marker at the next checkpoint, not left to
+            // resurrect a dead entity on the next cold scan (D11 §6, P-6).
+            env.state.tombstones.insert(
+                record.entity,
+                Tombstone {
+                    cell: record.cell,
+                    tick: record.tick,
+                    gc_deadline_ms: now_ms + TOMBSTONE_RETENTION_MS,
+                },
+            );
         }
         // Terrain, Rekey, CheckpointMark are recognized but not folded into the
         // entity map in this slice.
@@ -245,10 +330,19 @@ fn fold(env: &mut ActorEnv, record: &JournalRecord) {
 }
 
 fn read_snapshot(env: &ActorEnv, cells: &[orrery_protocol::CellId]) -> SnapshotPage {
-    let _ = cells;
-    SnapshotPage {
-        entities: env.state.entities.clone(),
+    let mut entities = HashMap::new();
+    for (id, record) in &env.state.entities {
+        let entity_cell = env
+            .state
+            .by_cell
+            .get(id)
+            .copied()
+            .unwrap_or(env.state.shard);
+        if cells.iter().any(|c| c.is_prefix_of(entity_cell)) {
+            entities.insert(*id, record.clone());
+        }
     }
+    SnapshotPage { entities }
 }
 
 /// Capture the actor's full state for a checkpoint (§8, copy-on-update posture:
@@ -257,9 +351,11 @@ fn read_snapshot(env: &ActorEnv, cells: &[orrery_protocol::CellId]) -> SnapshotP
 fn checkpoint_snapshot(env: &ActorEnv) -> CheckpointSnapshot {
     CheckpointSnapshot {
         shard: env.state.shard,
+        grid: env.state.grid,
         epoch: env.state.epoch,
         entities: env.state.entities.clone(),
         by_cell: env.state.by_cell.clone(),
+        tombstones: env.state.tombstones.clone(),
         ckpt_watermark: env.state.ckpt_watermark,
     }
 }
@@ -271,6 +367,8 @@ fn split_snapshot(env: &ActorEnv) -> SplitSnapshot {
     let mut out: HashMap<_, HashMap<_, _>> =
         children.iter().map(|&c| (c, HashMap::new())).collect();
     let mut by_cell: HashMap<_, HashMap<_, _>> =
+        children.iter().map(|&c| (c, HashMap::new())).collect();
+    let mut tombstones: HashMap<_, HashMap<_, _>> =
         children.iter().map(|&c| (c, HashMap::new())).collect();
     for (entity, record) in &env.state.entities {
         let cell = env
@@ -293,11 +391,25 @@ fn split_snapshot(env: &ActorEnv) -> SplitSnapshot {
             .expect("child present")
             .insert(*entity, cell);
     }
+    for (entity, tomb) in &env.state.tombstones {
+        // The entity's cell is a descendant of exactly one child.
+        let child = children
+            .iter()
+            .find(|c| c.is_prefix_of(tomb.cell))
+            .copied()
+            .unwrap_or(env.state.shard);
+        tombstones
+            .get_mut(&child)
+            .expect("child present")
+            .insert(*entity, *tomb);
+    }
     SplitSnapshot {
         shard: env.state.shard,
+        grid: env.state.grid,
         epoch: env.state.epoch,
         children: out,
         by_cell,
+        tombstones,
         ckpt_watermark: env.state.ckpt_watermark,
     }
 }
@@ -307,6 +419,7 @@ fn split_snapshot(env: &ActorEnv) -> SplitSnapshot {
 pub struct CellActorHandle {
     tx: mpsc::Sender<CellMsg>,
     shard: orrery_protocol::CellId,
+    grid: GridId,
     epoch: Epoch,
     /// The actor task; awaited on shutdown so the journal Arc is released.
     join: tokio::task::JoinHandle<()>,
@@ -369,18 +482,20 @@ impl CellActorHandle {
         self.epoch
     }
 
-    /// Restore the entity bag, per-entity cell map, and watermark into the
-    /// actor (recovery, §3.4).
+    /// Restore the entity bag, per-entity cell map, despawn markers, and
+    /// watermark into the actor (recovery, §3.4).
     pub async fn restore_entities(
         &self,
         entities: HashMap<PersistId, EntityRecord>,
         by_cell: HashMap<PersistId, orrery_protocol::CellId>,
+        tombstones: HashMap<PersistId, Tombstone>,
     ) -> Result<(), Reject> {
         let (reply, rx) = oneshot::channel();
         self.tx
             .send(CellMsg::Restore {
                 entities,
                 by_cell,
+                tombstones,
                 watermark: Lsn::new(0, 0),
                 reply,
             })
@@ -409,46 +524,73 @@ impl CellActorHandle {
         rx.await.map_err(|_| Reject::JournalClosed)
     }
 
+    /// Drop tombstones past `now_ms`, after the checkpoint cleared their rows
+    /// (D11 §6 checkpoint GC pass). Awaiting this before the next checkpoint is
+    /// what stops the marker from being rewritten forever.
+    pub async fn prune_tombstones(&self, now_ms: u64) -> Result<(), Reject> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(CellMsg::PruneTombstones { now_ms, reply })
+            .await
+            .map_err(|_| Reject::JournalClosed)?;
+        rx.await.map_err(|_| Reject::JournalClosed)
+    }
+
     /// The shard cell this actor owns.
     #[must_use]
     pub fn shard(&self) -> orrery_protocol::CellId {
         self.shard
     }
+
+    /// The grid this actor's shard lives in (P-7).
+    #[must_use]
+    pub fn grid(&self) -> GridId {
+        self.grid
+    }
 }
 
-/// Spawn a cell actor for `shard` at `epoch`, sharing `journal`, starting empty.
+/// Spawn a cell actor for `shard` in `grid` at `epoch`, sharing `journal`,
+/// starting empty.
 pub fn spawn(
     shard: orrery_protocol::CellId,
+    grid: GridId,
     epoch: Epoch,
     journal: Arc<Journal>,
 ) -> CellActorHandle {
     spawn_preloaded(
         shard,
+        grid,
         epoch,
         journal,
+        HashMap::new(),
         HashMap::new(),
         HashMap::new(),
         Lsn::new(0, 0),
     )
 }
 
-/// Spawn a cell actor for `shard` at `epoch`, sharing `journal`, preloaded with
-/// recovered state (used by restart/recovery, §3.4).
+/// Spawn a cell actor for `shard` in `grid` at `epoch`, sharing `journal`,
+/// preloaded with recovered state (used by restart/recovery, §3.4).
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_preloaded(
     shard: orrery_protocol::CellId,
+    grid: GridId,
     epoch: Epoch,
     journal: Arc<Journal>,
     entities: HashMap<PersistId, EntityRecord>,
     by_cell: HashMap<PersistId, orrery_protocol::CellId>,
+    tombstones: HashMap<PersistId, Tombstone>,
     ckpt_watermark: Lsn,
 ) -> CellActorHandle {
     let (tx, rx) = mpsc::channel(64);
     let mut env = ActorEnv {
         state: CellActorState {
             shard,
+            grid,
             epoch,
             entities,
             by_cell,
+            tombstones,
             ckpt_watermark,
         },
         journal,
@@ -459,6 +601,7 @@ pub fn spawn_preloaded(
     CellActorHandle {
         tx,
         shard,
+        grid,
         epoch,
         join,
     }

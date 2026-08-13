@@ -41,8 +41,8 @@ use orrery_protocol::channels::{
     decode_datagram, decode_stream_frame, encode_datagram, encode_stream_frame, untag, Channel,
 };
 use orrery_protocol::{
-    AreaPage, CellId, DiffUplink, Epoch, GatewayMsg, GatewayReply, IntentOutcome, JournalRecord,
-    Lsn, NodeId, Tick, PROTOCOL_VERSION,
+    AreaPage, CellId, DiffUplink, Epoch, GatewayMsg, GatewayReply, GridId, IntentOutcome,
+    JournalRecord, Lsn, NodeId, Tick, PROTOCOL_VERSION,
 };
 
 use crate::cluster::Router;
@@ -257,7 +257,9 @@ async fn handle_connection(
                 send(Bytes::from(encode_stream_frame(&reply)));
             }
             GatewayMsg::Diff { diff } => route_diff(&send, diff, remote, &router).await,
-            GatewayMsg::Subscribe { cells } => route_subscribe(&send, cells, &router).await,
+            GatewayMsg::Subscribe { grid, cells } => {
+                route_subscribe(&send, grid, cells, &router).await
+            }
             GatewayMsg::SubmitIntent { intent } => {
                 let t = Tick::new(tick.fetch_add(1, Ordering::Relaxed) + 1);
                 let reply = GatewayReply::IntentAck {
@@ -339,9 +341,11 @@ async fn route_diff(
 
 /// Serve an area load: read each requested cell from its owning actor and
 /// stream an [`AreaPage`] back. `live` reports whether a live actor held the
-/// cell (vs a cold FDB scan, which this slice does not implement).
+/// cell (vs a cold FDB scan). `grid` scopes the cold scans (P-7: storage cell
+/// ids are grid-relative).
 async fn route_subscribe(
     send: &(dyn Fn(Bytes) + Send + Sync),
+    grid: GridId,
     cells: Vec<CellId>,
     router: &Arc<dyn Router>,
 ) {
@@ -354,7 +358,7 @@ async fn route_subscribe(
         let page = if live {
             router.read(cell).await.ok()
         } else {
-            router.read_cold(cell).await.ok().flatten()
+            router.read_cold(grid, cell).await.ok().flatten()
         };
         if let Some(page) = page {
             let mut entities = Vec::with_capacity(page.entities.len());

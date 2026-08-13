@@ -13,9 +13,9 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-use orrery_protocol::{CellId, Epoch, Lsn, PersistId};
+use orrery_protocol::{CellId, Epoch, GridId, Lsn, PersistId};
 
-use crate::actor::{EntityRecord, SnapshotPage};
+use crate::actor::{EntityRecord, SnapshotPage, Tombstone};
 
 #[cfg(feature = "fdb")]
 pub mod fdb;
@@ -34,6 +34,11 @@ pub use scheduler::{
 pub struct CheckpointData {
     /// The shard cell this checkpoint covers.
     pub shard: CellId,
+    /// The grid the shard's `CellId` space belongs to (P-7, D11 §6:
+    /// `world/{cell_id}/…` cell ids are grid-relative).
+    pub grid: GridId,
+    /// The node that took the checkpoint (recovery watermark, D11 §6).
+    pub node_id: u64,
     /// The shard-ownership epoch the checkpoint was taken under (§3.4 fence).
     pub epoch: Epoch,
     /// The journal LSN covered by this checkpoint (recovery replays `> this`).
@@ -42,6 +47,10 @@ pub struct CheckpointData {
     pub entities: HashMap<PersistId, EntityRecord>,
     /// The cell each entity lives in at checkpoint time (split partitioning, §3.5).
     pub by_cell: HashMap<PersistId, CellId>,
+    /// Despawn markers (D11 §6 tombstones) whose GC deadline has not passed.
+    /// The store writes these as tombstone rows and clears rows whose deadline
+    /// has passed (the checkpoint GC pass).
+    pub tombstones: HashMap<PersistId, Tombstone>,
     /// Wall-clock time the checkpoint was taken, as unix milliseconds.
     pub taken_at_ms: u64,
 }
@@ -53,14 +62,18 @@ pub struct CheckpointData {
 /// so the runtime can hold `&dyn CheckpointStore`.
 #[async_trait::async_trait]
 pub trait CheckpointStore: Send + Sync {
-    /// Persist a checkpoint for `shard`, overwriting any prior one.
+    /// Persist a checkpoint for its shard, overwriting any prior one.
     async fn checkpoint(&self, data: &CheckpointData) -> Result<(), CheckpointError>;
 
-    /// Load the checkpoint for `shard`, or `None` if none exists.
-    async fn load(&self, shard: CellId) -> Result<Option<CheckpointData>, CheckpointError>;
+    /// Load the checkpoint for `shard` in `grid`, or `None` if none exists.
+    async fn load(
+        &self,
+        shard: CellId,
+        grid: GridId,
+    ) -> Result<Option<CheckpointData>, CheckpointError>;
 
-    /// Delete the checkpoint for `shard`.
-    async fn delete(&self, shard: CellId) -> Result<(), CheckpointError>;
+    /// Delete the checkpoint for `shard` in `grid`.
+    async fn delete(&self, shard: CellId, grid: GridId) -> Result<(), CheckpointError>;
 }
 
 /// A durable cold-cell reader: serves a cell's entities from the durable tier
@@ -68,10 +81,15 @@ pub trait CheckpointStore: Send + Sync {
 /// live actor holds (docs/08-persistence.md §9).
 #[async_trait::async_trait]
 pub trait ColdCellReader: Send + Sync {
-    /// Read every entity row in `cell`'s subtree from the durable tier.
+    /// Read every entity row in `cell`'s subtree within `grid` from the
+    /// durable tier. Tombstone rows are excluded (P-6).
     ///
     /// Returns `None` when there is no cold store or the cell has no rows.
-    async fn read_cold(&self, cell: CellId) -> Result<Option<SnapshotPage>, CheckpointError>;
+    async fn read_cold(
+        &self,
+        grid: GridId,
+        cell: CellId,
+    ) -> Result<Option<SnapshotPage>, CheckpointError>;
 }
 
 /// Errors from a [`CheckpointStore`].
@@ -97,13 +115,13 @@ impl From<postcard::Error> for CheckpointError {
     }
 }
 
-/// An in-process checkpoint store, keyed by shard cell.
+/// An in-process checkpoint store, keyed by (grid, shard cell).
 ///
 /// Used as the default so checkpoint/restore is testable with no external
 /// service. It is not durable across process death (that is FDB's job).
 #[derive(Debug, Default)]
 pub struct MemCheckpointStore {
-    map: Mutex<HashMap<CellId, Vec<u8>>>,
+    map: Mutex<HashMap<(GridId, CellId), Vec<u8>>>,
 }
 
 impl MemCheckpointStore {
@@ -121,20 +139,27 @@ impl CheckpointStore for MemCheckpointStore {
         self.map
             .lock()
             .expect("mem store lock")
-            .insert(data.shard, bytes);
+            .insert((data.grid, data.shard), bytes);
         Ok(())
     }
 
-    async fn load(&self, shard: CellId) -> Result<Option<CheckpointData>, CheckpointError> {
+    async fn load(
+        &self,
+        shard: CellId,
+        grid: GridId,
+    ) -> Result<Option<CheckpointData>, CheckpointError> {
         let map = self.map.lock().expect("mem store lock");
-        match map.get(&shard) {
+        match map.get(&(grid, shard)) {
             Some(bytes) => Ok(Some(postcard::from_bytes(bytes)?)),
             None => Ok(None),
         }
     }
 
-    async fn delete(&self, shard: CellId) -> Result<(), CheckpointError> {
-        self.map.lock().expect("mem store lock").remove(&shard);
+    async fn delete(&self, shard: CellId, grid: GridId) -> Result<(), CheckpointError> {
+        self.map
+            .lock()
+            .expect("mem store lock")
+            .remove(&(grid, shard));
         Ok(())
     }
 }
@@ -156,10 +181,13 @@ mod tests {
         }
         CheckpointData {
             shard,
+            grid: GridId::ROOT,
+            node_id: 0,
             epoch: Epoch::new(3),
             watermark: Lsn::new(2, 4096),
             entities,
             by_cell: HashMap::new(),
+            tombstones: HashMap::new(),
             taken_at_ms: 1_700_000_000_000,
         }
     }
@@ -169,21 +197,33 @@ mod tests {
         let store = MemCheckpointStore::new();
         let d = data(CellId::ROOT, 10);
         store.checkpoint(&d).await.unwrap();
-        let loaded = store.load(CellId::ROOT).await.unwrap().unwrap();
+        let loaded = store
+            .load(CellId::ROOT, GridId::ROOT)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(loaded, d);
     }
 
     #[tokio::test]
     async fn mem_store_missing_is_none() {
         let store = MemCheckpointStore::new();
-        assert!(store.load(CellId::ROOT).await.unwrap().is_none());
+        assert!(store
+            .load(CellId::ROOT, GridId::ROOT)
+            .await
+            .unwrap()
+            .is_none());
     }
 
     #[tokio::test]
     async fn mem_store_delete() {
         let store = MemCheckpointStore::new();
         store.checkpoint(&data(CellId::ROOT, 1)).await.unwrap();
-        store.delete(CellId::ROOT).await.unwrap();
-        assert!(store.load(CellId::ROOT).await.unwrap().is_none());
+        store.delete(CellId::ROOT, GridId::ROOT).await.unwrap();
+        assert!(store
+            .load(CellId::ROOT, GridId::ROOT)
+            .await
+            .unwrap()
+            .is_none());
     }
 }

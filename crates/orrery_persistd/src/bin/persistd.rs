@@ -21,7 +21,7 @@ use orrery_persistd::journal::{AdaptiveCommitMode, GroupCommitConfig};
 use orrery_persistd::{
     CellRuntime, Cluster, GatewayConfig, GatewayServer, JournalConfig, Router, RuntimeConfig,
 };
-use orrery_protocol::{CellId, Epoch};
+use orrery_protocol::{CellId, Epoch, GridId};
 
 /// Command-line configuration for the `persistd` binary.
 #[derive(Debug, Parser)]
@@ -59,6 +59,7 @@ async fn main() -> anyhow::Result<()> {
         std::fs::create_dir_all(&node_dir)?;
         let config = RuntimeConfig {
             shards: vec![shard],
+            grid: GridId::ROOT,
             journal: JournalConfig {
                 dir: node_dir,
                 commit: GroupCommitConfig {

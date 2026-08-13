@@ -9,7 +9,7 @@
 
 use bevy_ecs::prelude::*;
 use bevy_platform::time::Instant;
-use orrery_protocol::{CellId, PersistId};
+use orrery_protocol::{CellId, GridId, PersistId};
 
 use crate::config::PersistClientConfig;
 use crate::gateway::GatewaySession;
@@ -32,8 +32,11 @@ pub struct LoadedPage {
 /// A [`Resource`] holding the current AOI subscription and the pages loaded so
 /// far. The plugin's system requests the neighborhood when it changes and
 /// records pages as they arrive.
-#[derive(Debug, Default, Resource)]
+#[derive(Debug, Resource)]
 pub struct AreaLoader {
+    /// The grid the subscription is in (P-7). Nested-grid clients set this to
+    /// the frame's `GridId`; the default is the root universe grid.
+    pub grid: GridId,
     /// The cells currently subscribed, nearest-first.
     pub cells: Vec<CellId>,
     /// Pages received so far, keyed by cell.
@@ -46,10 +49,19 @@ pub struct AreaLoader {
 }
 
 impl AreaLoader {
-    /// A new, empty loader.
+    /// A new, empty loader in the root universe grid.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A new, empty loader for a nested grid (`GridId::ROOT` for the universe).
+    #[must_use]
+    pub fn in_grid(grid: GridId) -> Self {
+        Self {
+            grid,
+            ..Self::default()
+        }
     }
 
     /// Whether `cell` is in the current subscription.
@@ -68,6 +80,18 @@ impl AreaLoader {
     pub fn record(&mut self, page: LoadedPage) {
         self.pages.retain(|p| p.cell != page.cell);
         self.pages.push(page);
+    }
+}
+
+impl Default for AreaLoader {
+    fn default() -> Self {
+        Self {
+            grid: GridId::ROOT,
+            cells: Vec::new(),
+            pages: Vec::new(),
+            last_subscribe: None,
+            first_page_at: None,
+        }
     }
 }
 
@@ -137,7 +161,10 @@ pub fn drive_area_loader(
         .take(cfg.area_cells_per_round)
         .copied()
         .collect();
-    let msg = orrery_protocol::GatewayMsg::Subscribe { cells: round };
+    let msg = orrery_protocol::GatewayMsg::Subscribe {
+        grid: loader.grid,
+        cells: round,
+    };
     io.send.push(GatewaySession::encode_stream(&msg));
 }
 

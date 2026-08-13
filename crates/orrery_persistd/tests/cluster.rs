@@ -11,7 +11,8 @@ use std::time::Duration;
 
 use orrery_persistd::journal::{AdaptiveCommitMode, GroupCommitConfig};
 use orrery_persistd::{
-    payload_crc, CellRuntime, Cluster, JournalConfig, MemFenceStore, Router, RuntimeConfig,
+    payload_crc, CellRuntime, CheckpointError, Cluster, ColdCellReader, ColdFallbackRouter,
+    EntityRecord, JournalConfig, MemFenceStore, Router, RuntimeConfig, SnapshotPage,
 };
 use orrery_protocol::{CellId, Epoch, GridId, JournalRecord, Lsn, PersistId, RecordKind, Tick};
 
@@ -51,6 +52,7 @@ fn journal_config(dir: &std::path::Path) -> JournalConfig {
 fn runtime_config(dir: &std::path::Path, node_id: u64) -> RuntimeConfig {
     RuntimeConfig {
         shards: vec![CellId::ROOT],
+        grid: GridId::ROOT,
         journal: journal_config(dir),
         node_id,
         epoch: Epoch::new(0),
@@ -141,4 +143,81 @@ async fn cluster_restart_resumes_world() {
         let e = &page.entities[&PersistId::new(i)];
         assert_eq!(e.components.as_ref(), &i.to_le_bytes());
     }
+}
+
+/// A cold-store stub for the P-5 regression: serves a fixed durable page.
+struct StubCold {
+    entities: HashMap<PersistId, EntityRecord>,
+}
+
+#[async_trait::async_trait]
+impl ColdCellReader for StubCold {
+    async fn read_cold(
+        &self,
+        _grid: GridId,
+        _cell: CellId,
+    ) -> Result<Option<SnapshotPage>, CheckpointError> {
+        Ok(Some(SnapshotPage {
+            entities: self.entities.clone(),
+        }))
+    }
+}
+
+#[tokio::test]
+async fn has_actor_means_live_actor_not_placement_answer() {
+    // P-5: `Cluster::has_actor` must test for a live actor, not a rendezvous
+    // placement answer. A node hosting no shards is still named owner of every
+    // cell — but no actor covers it, so `has_actor` is false and an area load
+    // falls through to the cold store.
+    let base = tempfile::tempdir().unwrap();
+    let dir = base.path().join("node-0");
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut cfg = runtime_config(&dir, 0);
+    cfg.shards = Vec::new();
+    let rt = CellRuntime::open(&cfg).unwrap();
+    let runtimes = HashMap::from([(0u64, Arc::new(tokio::sync::Mutex::new(rt)))]);
+    let cluster = Cluster::new(runtimes, None);
+
+    let cell = CellId::ROOT;
+    assert_eq!(cluster.owner(cell), Some(0), "placement still answers");
+
+    let cold: Arc<dyn ColdCellReader> = Arc::new(StubCold {
+        entities: HashMap::from([(
+            PersistId::new(7),
+            EntityRecord {
+                components: bytes::Bytes::copy_from_slice(b"seeded"),
+                dirty: false,
+            },
+        )]),
+    });
+    let router: Arc<dyn Router> = Arc::new(ColdFallbackRouter::new(cluster, Arc::clone(&cold)));
+    assert!(!router.has_actor(cell).await, "no live actor for the cell");
+    let page = router
+        .read_cold(GridId::ROOT, cell)
+        .await
+        .unwrap()
+        .expect("cold fallback serves the cell");
+    assert_eq!(
+        page.entities[&PersistId::new(7)].components.as_ref(),
+        b"seeded"
+    );
+
+    // A node hosting the ROOT shard has a live actor: `has_actor` is true and
+    // the read is served from actor memory, not the cold store.
+    let dir2 = base.path().join("node-1");
+    std::fs::create_dir_all(&dir2).unwrap();
+    let rt2 = CellRuntime::open(&runtime_config(&dir2, 1)).unwrap();
+    let runtimes2 = HashMap::from([(1u64, Arc::new(tokio::sync::Mutex::new(rt2)))]);
+    let cluster2 = Cluster::new(runtimes2, None);
+    cluster2
+        .apply(mk_record(CellId::ROOT, 7, RecordKind::Spawn, b"live"))
+        .await
+        .unwrap();
+    let router2: Arc<dyn Router> = Arc::new(ColdFallbackRouter::new(cluster2, cold));
+    assert!(router2.has_actor(CellId::ROOT).await, "live actor present");
+    let page = router2.read(CellId::ROOT).await.unwrap();
+    assert_eq!(
+        page.entities[&PersistId::new(7)].components.as_ref(),
+        b"live"
+    );
 }

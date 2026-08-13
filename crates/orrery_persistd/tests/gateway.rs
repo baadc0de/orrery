@@ -58,6 +58,7 @@ fn intent(id: u128) -> Intent {
 fn runtime_config(dir: &std::path::Path) -> RuntimeConfig {
     RuntimeConfig {
         shards: vec![CellId::ROOT],
+        grid: GridId::ROOT,
         journal: JournalConfig {
             dir: dir.to_path_buf(),
             commit: GroupCommitConfig {
@@ -136,6 +137,7 @@ fn gateway_closes_the_client_to_actor_path() {
 
         // Subscribe to the (single) shard cell.
         conn.send_datagram(Bytes::from(encode_stream_frame(&GatewayMsg::Subscribe {
+            grid: GridId::ROOT,
             cells: vec![CellId::ROOT],
         })))
         .unwrap();

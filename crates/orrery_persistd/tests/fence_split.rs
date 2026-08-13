@@ -36,6 +36,7 @@ fn mk_record(cell: CellId, entity: u64, kind: RecordKind, payload: &[u8]) -> Jou
 fn runtime_config(dir: &std::path::Path, node_id: u64) -> RuntimeConfig {
     RuntimeConfig {
         shards: vec![CellId::ROOT],
+        grid: GridId::ROOT,
         journal: JournalConfig {
             dir: dir.to_path_buf(),
             commit: GroupCommitConfig {
@@ -58,6 +59,7 @@ fn runtime_config_with_fence(
 ) -> RuntimeConfig {
     RuntimeConfig {
         shards: vec![CellId::ROOT],
+        grid: GridId::ROOT,
         journal: JournalConfig {
             dir: dir.to_path_buf(),
             commit: GroupCommitConfig {
@@ -80,6 +82,7 @@ fn runtime_config_shards(
 ) -> RuntimeConfig {
     RuntimeConfig {
         shards,
+        grid: GridId::ROOT,
         journal: JournalConfig {
             dir: dir.to_path_buf(),
             commit: GroupCommitConfig {
@@ -112,6 +115,7 @@ fn runtime_config_dyn_fence(
 ) -> RuntimeConfig {
     RuntimeConfig {
         shards,
+        grid: GridId::ROOT,
         journal: JournalConfig {
             dir: dir.to_path_buf(),
             commit: GroupCommitConfig {

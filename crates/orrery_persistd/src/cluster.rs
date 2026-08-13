@@ -16,6 +16,8 @@ use std::sync::Arc;
 
 use orrery_protocol::CellId;
 
+use orrery_protocol::GridId;
+
 use orrery_protocol::JournalRecord;
 
 use crate::actor::{Reject, SnapshotPage};
@@ -47,9 +49,10 @@ pub trait Router: Send + Sync {
     ///
     /// Area load serves **live cells** from actor memory (authoritative, ≥
     /// checkpoint freshness) and **cold cells** from this scan
-    /// (docs/08-persistence.md §9).
-    async fn read_cold(&self, cell: CellId) -> Result<Option<SnapshotPage>, Reject> {
-        let _ = cell;
+    /// (docs/08-persistence.md §9). `grid` scopes the scan: storage cell ids
+    /// are grid-relative (P-7, D11 §6).
+    async fn read_cold(&self, grid: GridId, cell: CellId) -> Result<Option<SnapshotPage>, Reject> {
+        let _ = (grid, cell);
         Ok(None)
     }
 }
@@ -108,9 +111,9 @@ impl<R: Router + Send + Sync> Router for ColdFallbackRouter<R> {
         self.live.has_actor(cell).await
     }
 
-    async fn read_cold(&self, cell: CellId) -> Result<Option<SnapshotPage>, Reject> {
+    async fn read_cold(&self, grid: GridId, cell: CellId) -> Result<Option<SnapshotPage>, Reject> {
         self.cold
-            .read_cold(cell)
+            .read_cold(grid, cell)
             .await
             .map_err(|_| Reject::JournalClosed)
     }
@@ -239,6 +242,10 @@ impl Router for Cluster {
     }
 
     async fn has_actor(&self, cell: CellId) -> bool {
-        self.runtime_for(cell).is_some()
+        let Some(rt) = self.runtime_for(cell) else {
+            return false;
+        };
+        let rt = rt.lock().await;
+        rt.actor(cell).is_some()
     }
 }

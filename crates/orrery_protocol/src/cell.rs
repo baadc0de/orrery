@@ -93,6 +93,20 @@ impl CellId {
         self.0.get()
     }
 
+    /// Reconstruct a `CellId` from its raw u64 encoding — the inverse of
+    /// [`CellId::to_bits`], used to decode cell ids out of storage keys.
+    ///
+    /// Returns `None` for `0` (the invalid id); mirrors the `serde` guard. The
+    /// bits are trusted to be a well-formed offset-binary/Morton/sentinel
+    /// encoding, since every key is written by `to_bits`.
+    #[must_use]
+    pub const fn from_bits(raw: u64) -> Option<Self> {
+        match core::num::NonZeroU64::new(raw) {
+            Some(v) => Some(Self(v)),
+            None => None,
+        }
+    }
+
     /// Construct a `CellId` from signed cell coordinates at the given level.
     ///
     /// Returns [`CellRangeError`] if `level > MAX_LEVEL` or any coordinate is

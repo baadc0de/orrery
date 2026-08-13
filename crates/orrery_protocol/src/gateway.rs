@@ -42,6 +42,10 @@ pub enum GatewayMsg {
     },
     /// Area load: subscribe to a 27-cell neighborhood (D11 §9).
     Subscribe {
+        /// The grid the cells live in (root universe grid is 0). The load is
+        /// one `grid/{grid_id}` frame read plus the 27-cell scans in that
+        /// grid's `CellId` space (docs/08-persistence.md §9, P-7).
+        grid: GridId,
         /// The cells to load, ordered nearest-first by the client.
         cells: Vec<CellId>,
     },
@@ -168,6 +172,19 @@ mod tests {
                 payload: bytes::Bytes::from_static(b"\x01\x02\x03"),
                 seq: 42,
             },
+        };
+        let bytes = postcard::to_stdvec(&msg).unwrap();
+        let back: GatewayMsg = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(back, msg);
+    }
+
+    #[test]
+    fn subscribe_carries_grid() {
+        // P-7: the area-load request names the grid its cells are relative to,
+        // so a nested-grid load never reaches for root-grid rows.
+        let msg = GatewayMsg::Subscribe {
+            grid: GridId::new(7),
+            cells: vec![CellId::ROOT],
         };
         let bytes = postcard::to_stdvec(&msg).unwrap();
         let back: GatewayMsg = postcard::from_bytes(&bytes).unwrap();

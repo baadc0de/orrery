@@ -34,7 +34,7 @@ pub mod journal;
 pub mod placement;
 pub mod runtime;
 
-pub use actor::{CellActorHandle, CellMsg, EntityRecord, Reject, SnapshotPage};
+pub use actor::{CellActorHandle, CellMsg, EntityRecord, Reject, SnapshotPage, Tombstone};
 pub use checkpoint::{
     spawn_checkpoint_scheduler, CheckpointConfig, CheckpointData, CheckpointError,
     CheckpointScheduler, CheckpointStore, ColdCellReader, MemCheckpointStore, QuiesceSignal,
