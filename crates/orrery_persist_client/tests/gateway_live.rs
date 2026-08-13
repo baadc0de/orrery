@@ -74,8 +74,14 @@ fn client_connects_hellos_and_uplinks_to_real_gateway() {
 
     let dir = tempfile::tempdir().unwrap();
     let runtime = Arc::new(Mutex::new(
-        rt.block_on(async { orrery_persistd::CellRuntime::open(&runtime_config(dir.path())) })
-            .unwrap(),
+        rt.block_on(async {
+            orrery_persistd::CellRuntime::open(
+                &runtime_config(dir.path()),
+                &(Arc::new(orrery_persistd::checkpoint::MemCheckpointStore::new())
+                    as Arc<dyn orrery_persistd::checkpoint::CheckpointStore>),
+            )
+        })
+        .unwrap(),
     ));
     let router: Arc<dyn Router> = runtime.clone();
     let server = rt
@@ -141,7 +147,9 @@ fn client_connects_hellos_and_uplinks_to_real_gateway() {
     {
         let page = rt.block_on(async {
             let rt = runtime.lock().await;
-            rt.read(orrery_protocol::CellId::ROOT).await.unwrap()
+            rt.read(orrery_protocol::GridId::ROOT, orrery_protocol::CellId::ROOT)
+                .await
+                .unwrap()
         });
         let entity = page
             .entities

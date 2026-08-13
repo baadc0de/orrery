@@ -28,6 +28,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use iroh::RelayMode;
 use orrery_persistd::actor::{EntityRecord, Reject, SnapshotPage};
+use orrery_persistd::checkpoint::{CheckpointStore, MemCheckpointStore};
 use orrery_persistd::journal::{AdaptiveCommitMode, GroupCommitConfig};
 use orrery_persistd::{
     payload_crc, CellRuntime, GatewayConfig, GatewayServer, JournalConfig, MemFenceStore, Router,
@@ -155,7 +156,7 @@ impl Router for ScriptedRouter {
         Ok(Lsn::new(1, 0))
     }
 
-    async fn read(&self, cell: CellId) -> Result<SnapshotPage, Reject> {
+    async fn read(&self, _grid: GridId, cell: CellId) -> Result<SnapshotPage, Reject> {
         self.started.lock().await.push(cell);
         if self.gated.contains(&cell) {
             self.barrier.wait().await;
@@ -171,7 +172,7 @@ impl Router for ScriptedRouter {
         Ok(self.pages.get(&cell).cloned())
     }
 
-    async fn has_actor(&self, cell: CellId) -> bool {
+    async fn has_actor(&self, _grid: GridId, cell: CellId) -> bool {
         self.pages.contains_key(&cell) || self.all_live
     }
 }
@@ -189,11 +190,11 @@ impl Router for BlockingApplyRouter {
         unreachable!("pending never resolves")
     }
 
-    async fn read(&self, _cell: CellId) -> Result<SnapshotPage, Reject> {
+    async fn read(&self, _grid: GridId, _cell: CellId) -> Result<SnapshotPage, Reject> {
         Ok(SnapshotPage::default())
     }
 
-    async fn has_actor(&self, _cell: CellId) -> bool {
+    async fn has_actor(&self, _grid: GridId, _cell: CellId) -> bool {
         true
     }
 }
@@ -207,11 +208,11 @@ impl Router for FailingColdRouter {
         Ok(Lsn::new(1, 0))
     }
 
-    async fn read(&self, _cell: CellId) -> Result<SnapshotPage, Reject> {
+    async fn read(&self, _grid: GridId, _cell: CellId) -> Result<SnapshotPage, Reject> {
         Ok(SnapshotPage::default())
     }
 
-    async fn has_actor(&self, _cell: CellId) -> bool {
+    async fn has_actor(&self, _grid: GridId, _cell: CellId) -> bool {
         false
     }
 
@@ -581,7 +582,11 @@ async fn subscribe_does_not_block_diffs() {
 async fn area_load_end_to_end_live_cells() {
     let dir = tempfile::tempdir().unwrap();
     let runtime = Arc::new(Mutex::new(
-        CellRuntime::open(&runtime_config(dir.path())).unwrap(),
+        CellRuntime::open(
+            &runtime_config(dir.path()),
+            &(Arc::new(MemCheckpointStore::new()) as Arc<dyn CheckpointStore>),
+        )
+        .unwrap(),
     ));
     // Seed live entities into three cells (all under the ROOT shard).
     for (i, c) in [cell(0, 0, 0), cell(1, 0, 0), cell(1, 1, 1)]
@@ -705,7 +710,11 @@ async fn area_load_end_to_end_cold_cell_served() {
     let cold_cell = cell(4, 0, 0);
     let dir = tempfile::tempdir().unwrap();
     {
-        let rt = CellRuntime::open(&runtime_config_in(dir.path(), grid)).unwrap();
+        let rt = CellRuntime::open(
+            &runtime_config_in(dir.path(), grid),
+            &(store.clone() as Arc<dyn CheckpointStore>),
+        )
+        .unwrap();
         let rec = JournalRecord {
             lsn: Lsn::new(0, 0),
             cell: cold_cell,
@@ -732,10 +741,10 @@ async fn area_load_end_to_end_cold_cell_served() {
         async fn apply(&self, _record: JournalRecord) -> Result<Lsn, Reject> {
             Err(Reject::JournalClosed)
         }
-        async fn read(&self, _cell: CellId) -> Result<SnapshotPage, Reject> {
+        async fn read(&self, _grid: GridId, _cell: CellId) -> Result<SnapshotPage, Reject> {
             Err(Reject::JournalClosed)
         }
-        async fn has_actor(&self, _cell: CellId) -> bool {
+        async fn has_actor(&self, _grid: GridId, _cell: CellId) -> bool {
             false
         }
     }

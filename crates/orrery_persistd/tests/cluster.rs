@@ -61,13 +61,19 @@ fn runtime_config(dir: &std::path::Path, node_id: u64) -> RuntimeConfig {
     }
 }
 
+/// A fresh in-memory checkpoint store as the trait object `CellRuntime::open`
+/// takes.
+fn mem_store() -> Arc<dyn orrery_persistd::checkpoint::CheckpointStore> {
+    Arc::new(orrery_persistd::checkpoint::MemCheckpointStore::new())
+}
+
 /// Build a `nodes`-node cluster, each with its own journal dir under `base`.
 fn build_cluster(base: &std::path::Path, nodes: usize) -> Cluster {
     let mut runtimes = HashMap::new();
     for i in 0..nodes {
         let dir = base.join(format!("node-{i}"));
         std::fs::create_dir_all(&dir).unwrap();
-        let rt = CellRuntime::open(&runtime_config(&dir, i as u64)).unwrap();
+        let rt = CellRuntime::open(&runtime_config(&dir, i as u64), &mem_store()).unwrap();
         runtimes.insert(i as u64, Arc::new(tokio::sync::Mutex::new(rt)));
     }
     Cluster::new(runtimes, Some(&orrery_persistd::ChainConfig::default()))
@@ -90,7 +96,7 @@ async fn cluster_routes_by_placement_and_replicates() {
     assert!(lsn >= Lsn::new(0, 0));
 
     // The owning node's runtime reflects the write.
-    let page = router.read(CellId::ROOT).await.unwrap();
+    let page = router.read(GridId::ROOT, CellId::ROOT).await.unwrap();
     assert_eq!(
         page.entities[&PersistId::new(7)].components.as_ref(),
         b"hp=100"
@@ -114,7 +120,7 @@ async fn cluster_restart_resumes_world() {
     {
         let mut runtimes = HashMap::new();
         for (i, dir) in dirs.iter().enumerate() {
-            let rt = CellRuntime::open(&runtime_config(dir, i as u64)).unwrap();
+            let rt = CellRuntime::open(&runtime_config(dir, i as u64), &mem_store()).unwrap();
             runtimes.insert(i as u64, Arc::new(tokio::sync::Mutex::new(rt)));
         }
         let cluster = Cluster::new(runtimes, Some(&orrery_persistd::ChainConfig::default()));
@@ -131,14 +137,14 @@ async fn cluster_restart_resumes_world() {
     // Phase 2: restart from the same journals.
     let mut runtimes = HashMap::new();
     for (i, dir) in dirs.iter().enumerate() {
-        let rt = CellRuntime::open(&runtime_config(dir, i as u64)).unwrap();
+        let rt = CellRuntime::open(&runtime_config(dir, i as u64), &mem_store()).unwrap();
         runtimes.insert(i as u64, Arc::new(tokio::sync::Mutex::new(rt)));
     }
     let cluster = Cluster::new(runtimes, Some(&orrery_persistd::ChainConfig::default()));
     let router: Arc<dyn Router> = Arc::new(cluster);
 
     // The world resumes: all 100 entities are present.
-    let page = router.read(CellId::ROOT).await.unwrap();
+    let page = router.read(GridId::ROOT, CellId::ROOT).await.unwrap();
     assert_eq!(page.entities.len(), 100, "world resumed after restart");
     for i in 0..100u64 {
         let e = &page.entities[&PersistId::new(i)];
@@ -175,7 +181,7 @@ async fn has_actor_means_live_actor_not_placement_answer() {
     std::fs::create_dir_all(&dir).unwrap();
     let mut cfg = runtime_config(&dir, 0);
     cfg.shards = Vec::new();
-    let rt = CellRuntime::open(&cfg).unwrap();
+    let rt = CellRuntime::open(&cfg, &mem_store()).unwrap();
     let runtimes = HashMap::from([(0u64, Arc::new(tokio::sync::Mutex::new(rt)))]);
     let cluster = Cluster::new(runtimes, None);
 
@@ -192,7 +198,10 @@ async fn has_actor_means_live_actor_not_placement_answer() {
         )]),
     });
     let router: Arc<dyn Router> = Arc::new(ColdFallbackRouter::new(cluster, Arc::clone(&cold)));
-    assert!(!router.has_actor(cell).await, "no live actor for the cell");
+    assert!(
+        !router.has_actor(GridId::ROOT, cell).await,
+        "no live actor for the cell"
+    );
     let page = router
         .read_cold(GridId::ROOT, cell)
         .await
@@ -207,7 +216,7 @@ async fn has_actor_means_live_actor_not_placement_answer() {
     // the read is served from actor memory, not the cold store.
     let dir2 = base.path().join("node-1");
     std::fs::create_dir_all(&dir2).unwrap();
-    let rt2 = CellRuntime::open(&runtime_config(&dir2, 1)).unwrap();
+    let rt2 = CellRuntime::open(&runtime_config(&dir2, 1), &mem_store()).unwrap();
     let runtimes2 = HashMap::from([(1u64, Arc::new(tokio::sync::Mutex::new(rt2)))]);
     let cluster2 = Cluster::new(runtimes2, None);
     cluster2
@@ -215,8 +224,11 @@ async fn has_actor_means_live_actor_not_placement_answer() {
         .await
         .unwrap();
     let router2: Arc<dyn Router> = Arc::new(ColdFallbackRouter::new(cluster2, cold));
-    assert!(router2.has_actor(CellId::ROOT).await, "live actor present");
-    let page = router2.read(CellId::ROOT).await.unwrap();
+    assert!(
+        router2.has_actor(GridId::ROOT, CellId::ROOT).await,
+        "live actor present"
+    );
+    let page = router2.read(GridId::ROOT, CellId::ROOT).await.unwrap();
     assert_eq!(
         page.entities[&PersistId::new(7)].components.as_ref(),
         b"live"

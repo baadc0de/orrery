@@ -165,7 +165,10 @@ async fn main() -> anyhow::Result<()> {
             epoch: Epoch::new(0),
             fence: Arc::clone(&fence_store),
         };
-        let rt = CellRuntime::open(&config)?;
+        // Recovery seeds actors from the same durable tier the checkpoint
+        // scheduler writes: the checkpoint is the base, the journal the
+        // delta (§3.4).
+        let rt = CellRuntime::open(&config, &checkpoint_store)?;
         let rt_arc = Arc::new(Mutex::new(rt));
 
         // Spawn one checkpoint scheduler per runtime, using the default 20 s

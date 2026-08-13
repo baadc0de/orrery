@@ -161,8 +161,8 @@ impl Journal {
         self.committer.committed()
     }
 
-    /// The number of fsyncs issued since open (test hook).
-    #[cfg(test)]
+    /// The number of fsyncs issued since open (§4 group-commit observability:
+    /// the count that proves adaptive batching is engaging).
     pub fn flush_count(&self) -> usize {
         self.committer.flush_count()
     }

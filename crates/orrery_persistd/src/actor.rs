@@ -122,6 +122,16 @@ pub struct SplitSnapshot {
 #[derive(Debug)]
 pub enum CellMsg {
     /// Apply a diff and return the durable LSN.
+    ///
+    /// The actor stamps its ownership epoch into the record (it is the epoch
+    /// authority — the gateway's `Epoch::new(0)` is a placeholder, D11 §2.1),
+    /// appends it to the journal and folds it into hot state **synchronously**
+    /// (so LSN assignment order, hot-state order, and mailbox order agree,
+    /// §3.1), then hands only the durability wait to a per-append resolver
+    /// task. The mailbox returns to `rx.recv()` immediately; the client's
+    /// ack resolves only after the group fsync, so the ack still *is* the
+    /// durability contract (§2.1) — and because the fold precedes the ack,
+    /// an acked write is always reflected in state.
     ApplyDiff {
         /// The record to apply.
         record: JournalRecord,
@@ -221,9 +231,7 @@ async fn actor_loop(env: &mut ActorEnv, mut rx: mpsc::Receiver<CellMsg>) {
     while let Some(msg) = rx.recv().await {
         match msg {
             CellMsg::ApplyDiff { record, reply } => {
-                let now_ms = now_ms();
-                let result = apply_diff(env, &record, now_ms).await;
-                let _ = reply.send(result);
+                apply_diff(env, record, reply);
             }
             CellMsg::ReadSnapshot { cells, reply } => {
                 let _ = reply.send(read_snapshot(env, &cells));
@@ -274,28 +282,59 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-/// Apply a diff: journal it durably, then fold it into in-memory state.
-async fn apply_diff(
+/// Apply a diff: stamp the epoch, journal the record, fold it into hot state,
+/// and hand only the durability wait to a resolver task — so the mailbox
+/// returns to `rx.recv()` immediately instead of serializing on the fsync.
+///
+/// The record is stamped, journaled, and folded synchronously (this is the
+/// serial single-writer section — LSN assignment order and hot-state order
+/// are both mailbox order, §3.1), then the [`AppendHandle`] plus the reply
+/// oneshot move to a spawned resolver. The resolver awaits the group fsync
+/// and only then sends the ack, so the ack still *is* the durability
+/// contract (§2.1: an acked write survives a crash even if the Fold had been
+/// deferred), while many appends from one actor coexist in the commit queue
+/// and share fsyncs (§4 adaptive group commit, D16).
+fn apply_diff(
     env: &mut ActorEnv,
-    record: &JournalRecord,
-    now_ms: u64,
-) -> Result<Lsn, Reject> {
-    // Journal first; the append resolves only after the group fsync. The
-    // journal takes the record by value (it stamps the assigned LSN into the
-    // encoded bytes), so clone the caller's copy.
-    let handle = env
-        .journal
-        .append(record.clone())
-        .map_err(|_| Reject::JournalClosed)?;
-    let lsn = handle
-        .committed()
-        .await
-        .map_err(|_| Reject::JournalClosed)?;
+    mut record: JournalRecord,
+    reply: oneshot::Sender<Result<Lsn, Reject>>,
+) {
+    // The actor is the epoch authority: the record is durably stamped with
+    // the shard-ownership epoch here (§3.4), overwriting the gateway's
+    // placeholder `Epoch::new(0)` (D11 §2.1: the server assigns epoch/lsn).
+    // The stamping must precede the append so the journaled bytes carry it.
+    record.epoch = env.state.epoch;
+    let handle = match env.journal.append(record.clone()) {
+        Ok(handle) => handle,
+        Err(_) => {
+            let _ = reply.send(Err(Reject::JournalClosed));
+            return;
+        }
+    };
+    // `append` stamped the assigned LSN into the stored bytes but not into
+    // `record` (it took a clone); stamp it from the handle so the fold below
+    // advances the actor's `ckpt_watermark` past this record.
+    record.lsn = handle.lsn();
 
-    // Fold into state. Idempotent (last-writer-wins per entity), keyed by
-    // (entity, tick): replay is safe because re-applying a record is a no-op.
-    fold(env, record, now_ms);
-    Ok(lsn)
+    // Fold into hot state now, before the resolver exists: an ack resolves
+    // only after the record is BOTH durably journaled and reflected in the
+    // snapshot, so a kill between commit and fold cannot lose the fold (the
+    // fold precedes the ack). Last-writer-wins per entity, keyed by
+    // (entity, tick), so replay of the same record is a no-op.
+    fold(env, &record, now_ms());
+
+    tokio::spawn(async move {
+        let lsn = handle.lsn();
+        // `committed` resolves with the batch's max LSN; the ack must carry
+        // THIS append's LSN, so checkpoint watermarks compare against the
+        // right position.
+        let result = handle
+            .committed()
+            .await
+            .map(|_| lsn)
+            .map_err(|_| Reject::JournalClosed);
+        let _ = reply.send(result);
+    });
 }
 
 /// Fold a journal record into in-memory state (no durability work).
@@ -417,14 +456,55 @@ fn split_snapshot(env: &ActorEnv) -> SplitSnapshot {
 }
 
 /// A handle to a running cell actor (sender + shared config).
-#[derive(Debug)]
+///
+/// Cloneable (the mailbox is multi-producer by design): every clone talks to
+/// the same actor task. The task's join handle lives in the shared
+/// [`ActorJoinSet`] handed to [`spawn_preloaded`], so a runtime shutting down
+/// awaits all of its actors from one place instead of consuming handles one
+/// by one.
+#[derive(Debug, Clone)]
 pub struct CellActorHandle {
     tx: mpsc::Sender<CellMsg>,
     shard: orrery_protocol::CellId,
     grid: GridId,
     epoch: Epoch,
-    /// The actor task; awaited on shutdown so the journal Arc is released.
-    join: tokio::task::JoinHandle<()>,
+}
+
+/// The join handles of a runtime's actor tasks.
+///
+/// Spawn registers each actor's task here; [`CellRuntime::close`] drains the
+/// set after sending every actor its `Shutdown`, releasing their
+/// `Arc<Journal>`s (and the journal's file lock) before returning.
+#[derive(Debug, Default)]
+pub struct ActorJoinSet {
+    joins: std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
+}
+
+impl ActorJoinSet {
+    /// A new, empty join set.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Register an actor task's join handle.
+    pub(crate) fn add(&self, join: tokio::task::JoinHandle<()>) {
+        self.joins.lock().expect("actor join set lock").push(join);
+    }
+
+    /// Await every registered actor task (after their mailboxes were shut
+    /// down), releasing each task's `Arc<Journal>`.
+    pub async fn join_all(&self) {
+        let joins: Vec<_> = self
+            .joins
+            .lock()
+            .expect("actor join set lock")
+            .drain(..)
+            .collect();
+        for join in joins {
+            let _ = join.await;
+        }
+    }
 }
 
 impl CellActorHandle {
@@ -451,11 +531,12 @@ impl CellActorHandle {
         rx.await.map_err(|_| Reject::JournalClosed)
     }
 
-    /// Ask the actor to shut down after draining its mailbox, then await the
-    /// task so its `Arc<Journal>` (and the journal's file lock) is released.
-    pub async fn shutdown(self) {
+    /// Ask the actor to shut down after draining its mailbox. The task itself
+    /// is awaited via the runtime's [`ActorJoinSet`] (`CellRuntime::close` or
+    /// `split`), which releases its `Arc<Journal>` (and the journal's file
+    /// lock).
+    pub async fn shutdown(&self) {
         let _ = self.tx.send(CellMsg::Shutdown).await;
-        let _ = self.join.await;
     }
 
     /// Capture the actor's full state for a checkpoint (§8).
@@ -552,12 +633,13 @@ impl CellActorHandle {
 }
 
 /// Spawn a cell actor for `shard` in `grid` at `epoch`, sharing `journal`,
-/// starting empty.
+/// starting empty. The task's join handle is registered in `joins`.
 pub fn spawn(
     shard: orrery_protocol::CellId,
     grid: GridId,
     epoch: Epoch,
     journal: Arc<Journal>,
+    joins: &Arc<ActorJoinSet>,
 ) -> CellActorHandle {
     spawn_preloaded(
         shard,
@@ -568,11 +650,13 @@ pub fn spawn(
         HashMap::new(),
         HashMap::new(),
         Lsn::new(0, 0),
+        joins,
     )
 }
 
 /// Spawn a cell actor for `shard` in `grid` at `epoch`, sharing `journal`,
-/// preloaded with recovered state (used by restart/recovery, §3.4).
+/// preloaded with recovered state (used by restart/recovery, §3.4). The
+/// task's join handle is registered in `joins`.
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_preloaded(
     shard: orrery_protocol::CellId,
@@ -583,6 +667,7 @@ pub fn spawn_preloaded(
     by_cell: HashMap<PersistId, orrery_protocol::CellId>,
     tombstones: HashMap<PersistId, Tombstone>,
     ckpt_watermark: Lsn,
+    joins: &Arc<ActorJoinSet>,
 ) -> CellActorHandle {
     let (tx, rx) = mpsc::channel(64);
     let mut env = ActorEnv {
@@ -600,11 +685,11 @@ pub fn spawn_preloaded(
     let join = tokio::spawn(async move {
         actor_loop(&mut env, rx).await;
     });
+    joins.add(join);
     CellActorHandle {
         tx,
         shard,
         grid,
         epoch,
-        join,
     }
 }
