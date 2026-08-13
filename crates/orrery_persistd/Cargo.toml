@@ -32,6 +32,7 @@ postcard = { workspace = true }
 serde = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
+iroh = { workspace = true }
 async-trait = "0.1"
 fjall = { version = "3.1", features = ["bytes_1"], optional = true }
 # FoundationDB 7.3.x system-of-record (D11, D14). Optional: only built when the

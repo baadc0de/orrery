@@ -14,7 +14,9 @@
 #![warn(missing_docs)]
 
 pub mod cell;
+pub mod channels;
 pub mod coord;
+mod gateway;
 mod grid;
 mod identity;
 mod persist;
@@ -22,6 +24,7 @@ mod protocol;
 
 pub use cell::{CellId, CellRangeError};
 pub use coord::{CoordMsg, IslandId, IslandManifest, PeerEntry, TopologyRegime};
+pub use gateway::{AreaPage, DiffUplink, GatewayMsg, GatewayReply};
 pub use grid::GridId;
 pub use identity::{NodeId, Signature};
 pub use persist::{

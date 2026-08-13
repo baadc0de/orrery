@@ -1,0 +1,67 @@
+[package]
+name = "bevy_replicon"
+version = "0.42.1"
+edition = "2024"
+description = "A server-authoritative replication crate for Bevy"
+repository = "https://github.com/simgine/bevy_replicon"
+license = "MIT OR Apache-2.0"
+keywords = ["bevy", "multiplayer", "netcode", "replication", "server-authoritative"]
+categories = ["game-development", "network-programming"]
+
+# Vendored copy of the upstream `bevy_replicon` 0.42.1 (crates.io) with orrery's
+# additions:
+# - `server::uplink` module: surfaces the change-detection + serialization
+#   internals that `collect_changes` already computes (which components changed
+#   this tick, and their postcard-encoded payloads) as a public message, so
+#   `orrery_persist_client` can feed `DiffUplink`s from replicon diffs.
+# Upstreaming intent (orrery D4): keep this diff minimal so it can become a
+# PR against the simgine/bevy_replicon repo.
+
+[features]
+client = []
+client_diagnostics = ["client"]
+default = [
+    "client",
+    "server",
+    "world_serialization",
+]
+scene = ["bevy/bevy_world_serialization"]
+server = []
+# Orrery addition: surfaces the change-detection + serialization internals as
+# a public `server::uplink::ComponentDiff` message so downstream persistence
+# crates can feed `DiffUplink`s from replicon diffs (orrery D11).
+uplink = []
+world_serialization = ["bevy/bevy_world_serialization"]
+
+[lib]
+name = "bevy_replicon"
+path = "src/lib.rs"
+
+[dependencies]
+# `bevy` is declared directly (not inherited) so we can turn default features
+# off and pull only `bevy_state`, matching upstream's lean dependency.
+bevy = { version = "0.19", default-features = false, features = ["bevy_state"] }
+bevy_app = { workspace = true }
+bevy_ecs = { workspace = true }
+bevy_reflect = { workspace = true }
+bytes = { workspace = true }
+# Declared directly (not inherited) to add `experimental-derive` (for
+# `postcard::experimental::max_size`), which the workspace postcard dep lacks.
+postcard = { version = "1.1", default-features = false, features = ["use-std", "experimental-derive"] }
+serde = { workspace = true }
+bitflags = { version = "2.6", features = ["serde"] }
+deterministic-hash = "1.0.2"
+log = "0.4"
+petgraph = { version = "0.8", features = ["stable_graph"], default-features = false }
+smallbitvec = "2.6"
+smallvec = "1.15"
+typeid = "1.0"
+variadics_please = "2.0"
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+
+[dev-dependencies]
+# Upstream test helper used by replicon's own unit tests.
+test-log = "0.2"
+
+[lints]
+workspace = true

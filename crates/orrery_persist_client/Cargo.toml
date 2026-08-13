@@ -1,0 +1,50 @@
+[package]
+name = "orrery_persist_client"
+version = "0.1.0"
+edition = "2021"
+description = "Orrery gateway session, diff uplink scheduler, area load/subscribe, intent queue (P2)"
+license = "MIT OR Apache-2.0"
+
+# Bevy plugin (D15). The client side of the "really really fast" tier
+# (docs/10-crates.md §9): the gateway session, the 1-4 Hz per-entity diff
+# uplink scheduler, and area load/subscribe (27-cell range scans + live actor
+# deltas, streamed nearest-first). Without it nothing feeds the cell actors
+# from a live client — the runtime is only exercised by synthetic tests.
+#
+# The gateway wire surface lives in `orrery_protocol` (engine-agnostic, D15),
+# so `orrery_persistd` and this crate share one message set. The transport is
+# aeronet_io sessions (datagrams = bulk diffs, streams = area load + intents,
+# D3); the actual iroh dialing and session lifecycle live in `orrery_net`.
+[features]
+# Persist the offline intent queue to disk (netsplit posture, D12). Without
+# this the queue is in-memory only and is lost on process exit.
+disk-queue = ["dep:fjall"]
+
+[dependencies]
+orrery_protocol = { path = "../orrery_protocol" }
+orrery_net = { path = "../orrery_net" }
+orrery_spatial = { path = "../orrery_spatial" }
+aeronet_io = { workspace = true }
+aeronet_iroh = { workspace = true }
+bevy_app = { workspace = true }
+bevy_ecs = { workspace = true }
+bevy_platform = { workspace = true }
+bevy_reflect = { workspace = true }
+bevy_time = { workspace = true }
+# The `uplink` feature surfaces replicon's change-detection stream as
+# `ComponentDiff` messages, which this crate turns into `DiffUplink`s (D11).
+bevy_replicon = { workspace = true, features = ["uplink"] }
+bytes = { workspace = true }
+postcard = { workspace = true }
+serde = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+iroh-base = { workspace = true }
+fjall = { version = "3.1", features = ["bytes_1"], optional = true }
+
+[dev-dependencies]
+bevy = { workspace = true }
+glam = { workspace = true }
+tempfile = "3"
+# The real gateway server, to prove the client connect/hello path end-to-end.
+orrery_persistd = { path = "../orrery_persistd" }

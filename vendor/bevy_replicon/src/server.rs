@@ -1,0 +1,1120 @@
+pub mod message;
+pub mod related_entities;
+pub(super) mod removal_buffer;
+pub mod replicated_archetypes;
+pub(super) mod replication_messages;
+mod replication_query;
+pub mod server_tick;
+pub mod visibility;
+
+#[cfg(feature = "uplink")]
+pub mod uplink;
+
+use core::time::Duration;
+
+use bevy::{
+    ecs::{
+        archetype::Archetypes,
+        change_detection::{CheckChangeTicks, Tick},
+        entity::{Entities, EntityHash, EntityHashMap},
+        intern::Interned,
+        schedule::ScheduleLabel,
+        system::SystemChangeTick,
+    },
+    platform::collections::{HashSet, hash_map::Entry},
+    prelude::*,
+    time::common_conditions::on_timer,
+};
+use bytes::Buf;
+use log::{Level, debug, log_enabled, trace, warn};
+
+use crate::{
+    postcard_utils,
+    prelude::*,
+    server::{
+        replicated_archetypes::ReplicatedArchetypes,
+        replication_messages::{mutations::MutationsSplit, serialized_data::ErasedComponent},
+        visibility::registry::FilterRegistry,
+    },
+    shared::{
+        backend::channels::ClientChannel,
+        message::server_message::message_buffer::MessageBuffer,
+        replication::{
+            client_ticks::{ClientTicks, EntityTicks},
+            registry::{
+                ComponentIndex, ReplicationRegistry, component_mask::ComponentMask,
+                ctx::SerializeCtx,
+            },
+            rules::ReplicationRules,
+            storage::ReplicationStorage,
+            visibility::VisibilityScope,
+        },
+    },
+};
+use related_entities::RelatedEntities;
+use removal_buffer::RemovalBuffer;
+use replication_messages::{
+    mutations::Mutations, serialized_data::SerializedData, updates::Updates,
+};
+use replication_query::ReplicationQuery;
+use server_tick::ServerTick;
+use visibility::client_visibility::ClientVisibility;
+
+pub struct ServerPlugin {
+    /// Schedule in which [`ServerTick`] is incremented.
+    ///
+    /// By default it's set to [`FixedPostUpdate`].
+    /// Use [`Self::new`] to avoid calling [`ScheduleLabel::intern`].
+    ///
+    /// You can also set it to `None` to trigger replication by manually
+    /// incrementing [`ServerTick`] or scheduling [`increment_tick`].
+    ///
+    /// # Examples
+    ///
+    /// Run every frame.
+    ///
+    /// ```
+    /// use bevy::{ecs::schedule::ScheduleLabel, prelude::*, state::app::StatesPlugin};
+    /// use bevy_replicon::prelude::*;
+    ///
+    /// # let mut app = App::new();
+    /// app.add_plugins((
+    ///     MinimalPlugins,
+    ///     StatesPlugin,
+    ///     RepliconPlugins.build().set(ServerPlugin {
+    ///         // `ScheduleLabel` needs to be imported to call `intern`.
+    ///         tick_schedule: Some(PostUpdate.intern()),
+    ///         ..Default::default()
+    ///     }),
+    /// ));
+    /// ```
+    pub tick_schedule: Option<Interned<dyn ScheduleLabel>>,
+
+    /// The time after which mutations will be considered lost if an acknowledgment is not received for them.
+    ///
+    /// In practice mutations will live at least `mutations_timeout`, and at most `2*mutations_timeout`.
+    pub mutations_timeout: Duration,
+
+    /// Enables mutate messages tracking.
+    ///
+    /// Server will start sending mutate messages each tick even if they empty
+    /// and include the amount of the messages for each header.
+    ///
+    /// Client will track the received messages using
+    /// [`ServerMutateTicks`](crate::client::server_mutate_ticks::ServerMutateTicks).
+    ///
+    /// By default set to `false`. Needs to be set by rollback crates to assume that the
+    /// entity value didn't change on a tick if all updates were received and
+    /// [`ConfirmHistory`](crate::client::confirm_history::ConfirmHistory) don't have this tick confirmed.
+    pub track_mutate_messages: bool,
+}
+
+impl ServerPlugin {
+    /// Creates a plugin with the given [`Self::tick_schedule`].
+    pub fn new(tick_schedule: impl ScheduleLabel) -> Self {
+        Self {
+            tick_schedule: Some(tick_schedule.intern()),
+            mutations_timeout: Duration::from_secs(10),
+            track_mutate_messages: false,
+        }
+    }
+}
+
+impl Default for ServerPlugin {
+    fn default() -> Self {
+        Self::new(FixedPostUpdate)
+    }
+}
+
+/// Server functionality and replication sending.
+///
+/// Can be disabled for client-only apps.
+impl Plugin for ServerPlugin {
+    fn build(&self, app: &mut App) {
+        app.init_resource::<DespawnBuffer>()
+            .init_resource::<RemovalBuffer>()
+            .init_resource::<SerializedData>()
+            .init_resource::<ServerMessages>()
+            .init_resource::<ServerTick>()
+            .init_resource::<ServerChangeTick>()
+            .init_resource::<ReplicatedArchetypes>()
+            .init_resource::<ReplicationUserdata>()
+            .init_resource::<MessageBuffer>()
+            .init_resource::<RelatedEntities>()
+            .init_resource::<FilterRegistry>()
+            .register_required_components::<Replicated, TicksTracked>()
+            .insert_resource(TrackMutateMessages(self.track_mutate_messages))
+            .configure_sets(
+                PreUpdate,
+                (ServerSystems::ReceivePackets, ServerSystems::Receive).chain(),
+            )
+            .configure_sets(
+                PostUpdate,
+                (
+                    ServerSystems::IncrementTick,
+                    ServerSystems::Send,
+                    ServerSystems::SendPackets,
+                )
+                    .chain(),
+            )
+            .add_observer(handle_connect)
+            .add_observer(handle_disconnect)
+            .add_observer(check_mutation_ticks)
+            .add_observer(buffer_despawn)
+            .add_observer(cleanup_unreplicated)
+            .add_observer(cleanup_storage)
+            .add_systems(
+                PreUpdate,
+                (
+                    receive_acks,
+                    cleanup_acks(self.mutations_timeout).run_if(on_timer(self.mutations_timeout)),
+                )
+                    .chain()
+                    .in_set(ServerSystems::Receive)
+                    .run_if(in_state(ServerState::Running)),
+            )
+            .add_systems(OnExit(ServerState::Running), reset)
+            .add_systems(
+                PostUpdate,
+                (
+                    prepare_messages,
+                    collect_mappings,
+                    collect_despawns,
+                    collect_removals,
+                    collect_changes,
+                    send_messages,
+                )
+                    .chain()
+                    .run_if(resource_changed::<ServerTick>)
+                    .in_set(ServerSystems::Send)
+                    .run_if(in_state(ServerState::Running)),
+            );
+
+        if let Some(tick_schedule) = self.tick_schedule {
+            debug!("using tick schedule `{tick_schedule:?}`");
+            app.add_systems(
+                tick_schedule,
+                increment_tick
+                    .in_set(ServerSystems::IncrementTick)
+                    .run_if(in_state(ServerState::Running)),
+            );
+        }
+
+        #[cfg(feature = "uplink")]
+        {
+            // Emit `ComponentDiff` for every changed replicated component each
+            // tick (owner-side), feeding the persistence uplink (orrery D11).
+            app.add_message::<uplink::ComponentDiff>();
+            app.add_systems(
+                PostUpdate,
+                uplink::collect_uplink_diffs
+                    .after(collect_changes)
+                    .in_set(ServerSystems::Send)
+                    .run_if(resource_changed::<ServerTick>)
+                    .run_if(in_state(ServerState::Running)),
+            );
+        }
+
+        let auth_method = app.world().resource::<AuthMethod>();
+        debug!("using authorization method `{auth_method:?}`");
+        match auth_method {
+            AuthMethod::ProtocolCheck => {
+                app.add_observer(check_protocol);
+            }
+            AuthMethod::None => {
+                app.register_required_components::<ConnectedClient, AuthorizedClient>();
+            }
+            AuthMethod::Custom => (),
+        }
+
+        if log_enabled!(Level::Debug) {
+            app.add_systems(OnEnter(ServerState::Running), || debug!("running"))
+                .add_systems(OnEnter(ServerState::Stopped), || debug!("stopped"));
+        }
+    }
+
+    fn finish(&self, app: &mut App) {
+        // Multiple rules can include components with the same ID,
+        // we collect them here to deduplicate.
+        let rules = app.world().resource::<ReplicationRules>();
+        let replicated_ids: HashSet<_> = rules
+            .iter()
+            .flat_map(|rule| &rule.components)
+            .map(|component| component.id)
+            .collect();
+
+        // Removal observer without any components will trigger on any removal.
+        if !replicated_ids.is_empty() {
+            let mut remove_observer = Observer::new(buffer_removals);
+            for id in replicated_ids {
+                remove_observer = remove_observer.with_component(id);
+            }
+            app.world_mut().spawn(remove_observer);
+        }
+
+        app.world_mut()
+            .resource_scope(|world, mut messages: Mut<ServerMessages>| {
+                let channels = world.resource::<RepliconChannels>();
+                messages.setup_client_channels(channels.client_channels().len());
+            });
+    }
+}
+
+fn handle_connect(add: On<Add, ConnectedClient>, mut message_buffer: ResMut<MessageBuffer>) {
+    debug!("client `{}` connected", add.entity);
+    message_buffer.exclude_client(add.entity);
+}
+
+fn handle_disconnect(remove: On<Remove, ConnectedClient>, mut messages: ResMut<ServerMessages>) {
+    debug!("client `{}` disconnected", remove.entity);
+    messages.remove_client(remove.entity);
+}
+
+fn check_protocol(
+    client_protocol: On<FromClient<ProtocolHash>>,
+    mut commands: Commands,
+    mut disconnects: MessageWriter<DisconnectRequest>,
+    protocol: Res<ProtocolHash>,
+) {
+    let client = client_protocol
+        .client_id
+        .entity()
+        .expect("protocol hash sent only from clients");
+
+    if **client_protocol == *protocol {
+        debug!("marking client `{client}` as authorized");
+        commands.entity(client).insert(AuthorizedClient);
+    } else {
+        debug!(
+            "disconnecting client `{client}` due to protocol mismatch (client: `{:?}`, server: `{:?}`)",
+            **client_protocol, *protocol
+        );
+        commands.server_trigger(ToClients {
+            targets: SendTargets::Single(client_protocol.client_id),
+            message: ProtocolMismatch,
+        });
+        disconnects.write(DisconnectRequest { client });
+    }
+}
+
+fn check_mutation_ticks(check: On<CheckChangeTicks>, mut clients: Query<&mut ClientTicks>) {
+    debug!(
+        "checking mutation ticks for overflow for {:?}",
+        check.present_tick()
+    );
+    for mut ticks in &mut clients {
+        for entity_ticks in ticks.entities.values_mut() {
+            entity_ticks.system_tick.check_tick(*check);
+        }
+    }
+}
+
+/// Increments current server tick which causes the server to replicate this frame.
+pub fn increment_tick(mut server_tick: ResMut<ServerTick>) {
+    trace!("incrementing `{:?}`", *server_tick);
+    server_tick.increment();
+}
+
+fn buffer_removals(
+    remove: On<Remove>,
+    entities: &Entities,
+    archetypes: &Archetypes,
+    state: Res<State<ServerState>>,
+    mut replicated_archetypes: ResMut<ReplicatedArchetypes>,
+    rules: Res<ReplicationRules>,
+    registry: Option<Res<ReplicationRegistry>>,
+    mut removals: ResMut<RemovalBuffer>,
+) {
+    if *state != ServerState::Running {
+        return;
+    }
+
+    let components = remove.trigger().components;
+    if components.contains(&replicated_archetypes.marker_id()) {
+        trace!("ignoring removals for despawned `{}`", remove.entity);
+        return;
+    }
+
+    // Observers can't use run conditions. We return early on the client, but system parameters
+    // are validated before the observer runs. Because of this, the registry may not be present
+    // in the world during replication receive, so it needs to be optional.
+    let registry = registry.expect("registry should always exist on the server");
+
+    replicated_archetypes.update(archetypes, &rules);
+    let location = entities.get_spawned(remove.entity).unwrap();
+    let Some(archetype) = replicated_archetypes.get(location.archetype_id) else {
+        // `Replicated` component is missing.
+        trace!(
+            "ignoring `{components:?}` removal for non-replicated `{}`",
+            remove.entity
+        );
+        return;
+    };
+
+    removals.insert(remove.entity, components, archetype, &registry);
+}
+
+fn buffer_despawn(
+    despawn: On<Despawn, Replicated>,
+    mut despawn_buffer: ResMut<DespawnBuffer>,
+    state: Res<State<ServerState>>,
+) {
+    if *state == ServerState::Running {
+        trace!("buffering despawn of `{}`", despawn.entity);
+        despawn_buffer.push(despawn.entity);
+    }
+}
+
+fn cleanup_unreplicated(
+    despawn: On<Despawn, TicksTracked>,
+    state: Res<State<ServerState>>,
+    replicated: Query<&Replicated>,
+    mut clients: Query<&mut ClientTicks>,
+) {
+    if *state == ServerState::Running && !replicated.contains(despawn.entity) {
+        trace!("cleaning up ticks for despawned `{}`", despawn.entity);
+        for mut ticks in &mut clients {
+            ticks.entities.remove(&despawn.entity);
+        }
+    }
+}
+
+fn cleanup_acks(
+    mutations_timeout: Duration,
+) -> impl FnMut(Query<&mut ClientTicks>, Res<Time<Real>>) {
+    move |mut clients: Query<&mut ClientTicks>, time: Res<Time<Real>>| {
+        let min_timestamp = time.elapsed().saturating_sub(mutations_timeout);
+        for mut ticks in &mut clients {
+            ticks.cleanup_older_mutations(min_timestamp);
+        }
+    }
+}
+
+fn receive_acks(mut messages: ResMut<ServerMessages>, mut clients: Query<&mut ClientTicks>) {
+    for (client, mut message) in messages.drain_received(ClientChannel::MutationAcks) {
+        let Ok(mut ticks) = clients.get_mut(client) else {
+            debug!("ignoring acks for disconnected client `{client}`");
+            continue;
+        };
+        while message.has_remaining() {
+            match postcard_utils::from_buf(&mut message) {
+                Ok(mutate_index) => {
+                    ticks.ack_mutate_message(client, mutate_index);
+                }
+                Err(e) => {
+                    debug!("unable to deserialize mutate index from client `{client}`: {e}")
+                }
+            }
+        }
+    }
+}
+
+fn prepare_messages(
+    change_tick: SystemChangeTick,
+    mut related_entities: ResMut<RelatedEntities>,
+    mut server_change_tick: ResMut<ServerChangeTick>,
+    clients: Query<(&mut Updates, &mut Mutations)>,
+) {
+    **server_change_tick = change_tick.this_run();
+    related_entities.rebuild_graphs();
+
+    for (mut updates, mut mutations) in clients {
+        updates.clear();
+        mutations.reset(related_entities.graphs_count());
+    }
+}
+
+/// Collects and writes any new entity mappings that happened in this tick.
+fn collect_mappings(
+    despawn_buffer: Res<DespawnBuffer>,
+    registry: Res<FilterRegistry>,
+    mut serialized: ResMut<SerializedData>,
+    entities: Query<(Entity, &Signature), With<Replicated>>,
+    mut clients: Query<(
+        Entity,
+        &mut Updates,
+        &mut ClientTicks,
+        &mut ClientVisibility,
+    )>,
+) -> Result<()> {
+    for (entity, signature) in entities {
+        let hash = signature.hash();
+        let mut mapping_range = None;
+
+        if let Some(client) = signature.client() {
+            let Ok((_, mut message, ticks, visibility)) = clients.get_mut(client) else {
+                continue;
+            };
+            if should_send_mapping(entity, &despawn_buffer, &registry, &visibility, &ticks) {
+                trace!(
+                    "writing mapping `{entity}` to 0x{hash:016x} dedicated for client `{client}`"
+                );
+                let mapping_range =
+                    serialized.write_cached_mapping(&mut mapping_range, entity, hash)?;
+                message.add_mapping(mapping_range);
+            }
+        } else {
+            for (client, mut message, ticks, visibility) in &mut clients {
+                if should_send_mapping(entity, &despawn_buffer, &registry, &visibility, &ticks) {
+                    trace!("writing mapping `{entity}` to 0x{hash:016x} for client `{client}`");
+                    let mapping_range =
+                        serialized.write_cached_mapping(&mut mapping_range, entity, hash)?;
+                    message.add_mapping(mapping_range);
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn should_send_mapping(
+    entity: Entity,
+    despawn_buffer: &DespawnBuffer,
+    registry: &FilterRegistry,
+    visibility: &ClientVisibility,
+    ticks: &ClientTicks,
+) -> bool {
+    // Since despawns processed later, we need to explicitly check for them.
+    if visibility
+        .get(entity)
+        .hides_entity(registry, ScopeLifetime::AfterFirstVisibility)
+        || despawn_buffer.contains(&entity)
+    {
+        return false;
+    }
+
+    // Check if the client already received the entity.
+    !ticks.entities.contains_key(&entity)
+}
+
+/// Collect entity despawns from this tick into update messages.
+fn collect_despawns(
+    registry: Res<FilterRegistry>,
+    mut serialized: ResMut<SerializedData>,
+    mut despawn_buffer: ResMut<DespawnBuffer>,
+    mut clients: Query<(
+        Entity,
+        &mut Updates,
+        &mut ClientTicks,
+        &mut PriorityMap,
+        &mut ClientVisibility,
+    )>,
+) -> Result<()> {
+    for entity in despawn_buffer.drain(..) {
+        let entity_range = serialized.write_entity(entity)?;
+        for (client, mut message, mut ticks, mut priority, mut visibility) in &mut clients {
+            let hidden_lifetime = visibility.get(entity).hidden_entity_lifetime(&registry);
+            if ticks.entities.remove(&entity).is_some() && hidden_lifetime.is_none() {
+                // Write despawn only if the entity is not currently hidden and was
+                // previously sent because spawn and despawn could happen during the same tick.
+                trace!("writing despawn for `{entity}` for client `{client}`");
+                message.add_despawn(entity_range.clone());
+            }
+            visibility.remove_despawned(entity);
+            priority.remove(&entity);
+        }
+    }
+
+    for (client, mut message, mut ticks, mut priority, visibility) in clients {
+        for (entity, filter_mask) in visibility.iter_lost() {
+            // Skip visibility changes that hide only components.
+            if !filter_mask.hides_entity(&registry, ScopeLifetime::WhileVisible) {
+                continue;
+            }
+
+            if ticks.entities.remove(&entity).is_some() {
+                trace!("writing visibility lost for `{entity}` for client `{client}`");
+                let entity_range = serialized.write_entity(entity)?;
+                message.add_despawn(entity_range);
+            }
+            priority.remove(&entity);
+        }
+    }
+
+    Ok(())
+}
+
+/// Collects component removals from this tick into update messages.
+///
+/// The removal buffer will be cleaned later in [`collect_changes`].
+fn collect_removals(
+    archetypes: &Archetypes,
+    entities: &Entities,
+    removal_buffer: Res<RemovalBuffer>,
+    rules: Res<ReplicationRules>,
+    registry: Res<ReplicationRegistry>,
+    filter_registry: Res<FilterRegistry>,
+    mut replicated_archetypes: ResMut<ReplicatedArchetypes>,
+    mut serialized: ResMut<SerializedData>,
+    mut lost_buffer: Local<Vec<ComponentIndex>>,
+    mut clients: Query<(
+        Entity,
+        &mut Updates,
+        &mut ClientTicks,
+        &mut ClientVisibility,
+    )>,
+) -> Result<()> {
+    replicated_archetypes.update(archetypes, &rules);
+
+    for (&entity, remove_ids) in removal_buffer.iter() {
+        let mut entity_range = None;
+        for (_, mut message, _, _) in &mut clients {
+            message.start_entity_removals();
+        }
+
+        for &(component_index, fns_id) in remove_ids {
+            let mut fns_id_range = None;
+            for (client, mut message, mut ticks, visibility) in &mut clients {
+                let hidden_lifetime = visibility
+                    .get(entity)
+                    .hidden_component_lifetime(&filter_registry, component_index);
+                if hidden_lifetime.is_some() {
+                    // Ignore hidden entities.
+                    continue;
+                }
+
+                // Only send removals for components that were previously sent
+                // because insertion and removal could happen during the same tick
+                // If the entity was despawned or lost visibility, it was removed
+                // from ticks earlier during despawn collection.
+                let Some(entity_ticks) = ticks.entities.get_mut(&entity) else {
+                    continue;
+                };
+                if !entity_ticks.components.contains(component_index) {
+                    continue;
+                }
+
+                trace!("writing `{fns_id:?}` removal for `{entity}` for client `{client}`");
+                if !message.removals_entity_added() {
+                    let entity_range = serialized.write_cached_entity(&mut entity_range, entity)?;
+                    message.add_removals_entity(entity_range);
+                }
+                let fns_id_range = serialized.write_cached_fns_id(&mut fns_id_range, fns_id)?;
+                message.add_removal(fns_id_range);
+                entity_ticks.remove_component(component_index);
+            }
+        }
+    }
+
+    for (client, mut message, mut ticks, mut visibility) in &mut clients {
+        for (entity, filter_mask) in visibility.drain_lost() {
+            if filter_mask.hides_entity(&filter_registry, ScopeLifetime::WhileVisible) {
+                // Was processed earlier during collecting despawns.
+                continue;
+            }
+            let Some(entity_ticks) = ticks.entities.get_mut(&entity) else {
+                // The client didn't see this entity.
+                continue;
+            };
+            let Ok(location) = entities.get_spawned(entity) else {
+                warn!(
+                    "`{entity}` was despawned after despawn processing but before sending, \
+                     so the despawn will be sent on the next tick; \
+                     consider ordering your despawn before `{:?}`",
+                    ServerSystems::Send
+                );
+                continue;
+            };
+            let archetype = replicated_archetypes
+                .get(location.archetype_id)
+                .unwrap_or_else(|| {
+                    panic!("`{entity}` should be replicated because the client knows about it")
+                });
+
+            let mut entity_range = None;
+            message.start_entity_removals();
+
+            // Writes a removal for a lost component and drops it from the client's ticks.
+            let mut write_lost = |component_index, entity_ticks: &mut EntityTicks| -> Result<()> {
+                let &(id, _) = registry.get_by_index(component_index).unwrap_or_else(|| {
+                    panic!("`{component_index:?}` should've been registered to be marked as lost")
+                });
+                let rule = archetype.find_rule(id).unwrap_or_else(|| {
+                    panic!("`{id:?}` should match a rule since the client knows about it")
+                });
+
+                trace!(
+                    "writing `{:?}` lost for `{entity}` for client `{client}`",
+                    rule.fns_id
+                );
+                if !message.removals_entity_added() {
+                    let entity_range = serialized.write_cached_entity(&mut entity_range, entity)?;
+                    message.add_removals_entity(entity_range);
+                }
+                let fns_id_range = serialized.write_fns_id(rule.fns_id)?;
+                message.add_removal(fns_id_range);
+                entity_ticks.remove_component(component_index);
+
+                Ok(())
+            };
+
+            for scope in filter_mask.scopes(&filter_registry, ScopeLifetime::WhileVisible) {
+                match scope {
+                    VisibilityScope::Entity => {
+                        unreachable!("entity filters are processed during despawn collection")
+                    }
+                    VisibilityScope::Components(mask) => {
+                        for component_index in mask.iter() {
+                            if entity_ticks.components.contains(component_index) {
+                                write_lost(component_index, entity_ticks)?;
+                            }
+                        }
+                    }
+                    VisibilityScope::AllExcept(mask) => {
+                        // Buffered to release the borrow before removing.
+                        lost_buffer.extend(
+                            entity_ticks
+                                .components
+                                .iter()
+                                .filter(|&component_index| !mask.contains(component_index)),
+                        );
+                        for component_index in lost_buffer.drain(..) {
+                            write_lost(component_index, entity_ticks)?;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Collects component changes from this tick into update and mutate messages since the last entity tick.
+fn collect_changes(
+    archetypes: &Archetypes,
+    query: ReplicationQuery,
+    server_tick: Res<ServerTick>,
+    change_tick: Res<ServerChangeTick>,
+    registry: Res<ReplicationRegistry>,
+    filter_registry: Res<FilterRegistry>,
+    type_registry: Res<AppTypeRegistry>,
+    related_entities: Res<RelatedEntities>,
+    rules: Res<ReplicationRules>,
+    mut replication_storage: ResMut<ReplicationStorage>,
+    mut replicated_archetypes: ResMut<ReplicatedArchetypes>,
+    mut serialized: ResMut<SerializedData>,
+    mut removal_buffer: ResMut<RemovalBuffer>,
+    mut clients: Query<(
+        Entity,
+        &mut Updates,
+        &mut Mutations,
+        &mut ClientTicks,
+        &mut PriorityMap,
+        &mut ClientVisibility,
+    )>,
+) -> Result<()> {
+    replicated_archetypes.update(archetypes, &rules);
+
+    for replicated_archetype in replicated_archetypes.iter() {
+        // SAFETY: all IDs from replicated archetypes obtained from real archetypes.
+        let archetype = unsafe { archetypes.get(replicated_archetype.id).unwrap_unchecked() };
+
+        for entity in archetype.entities() {
+            let mut entity_range = None;
+            let entity_priority = query.get_priority(entity, archetype.table_id());
+            for (_, mut updates, mut mutations, ..) in &mut clients {
+                updates.start_entity_changes();
+                mutations.start_entity();
+            }
+
+            for &(rule, storage) in &replicated_archetype.components {
+                let (component_index, component_id, fns) = registry.get(rule.fns_id);
+
+                // SAFETY: component and storage were obtained from this archetype.
+                let (ptr, ticks) = unsafe {
+                    query.get_component_unchecked(
+                        entity,
+                        archetype.table_id(),
+                        storage,
+                        component_id,
+                    )
+                };
+
+                // SAFETY: `fns` and `ptr` were created for the same component type.
+                let mut component = unsafe { ErasedComponent::new(fns, ptr, rule.fns_id) };
+
+                let mut ctx = SerializeCtx {
+                    entity: entity.id(),
+                    component_id,
+                    last_changed: ticks.changed,
+                    server_tick: **server_tick,
+                    diff_cursor: None,
+                    type_registry: &type_registry,
+                    storage: &mut replication_storage,
+                };
+
+                let mut component_range = None;
+                for (client, mut updates, mut mutations, client_ticks, priority_map, visibility) in
+                    &mut clients
+                {
+                    let hidden_lifetime = visibility
+                        .get(entity.id())
+                        .hidden_component_lifetime(&filter_registry, component_index);
+                    if hidden_lifetime == Some(ScopeLifetime::WhileVisible) {
+                        continue;
+                    }
+
+                    let entity_ticks = client_ticks.entities.get(&entity.id());
+                    let new_for_client = entity_ticks.is_none();
+
+                    if let Some(entity_ticks) = entity_ticks
+                        && entity_ticks.components.contains(component_index)
+                    {
+                        let base_priority = priority_map
+                            .get(&entity.id())
+                            .copied()
+                            .or(entity_priority)
+                            .unwrap_or(1.0);
+
+                        let tick_diff = **server_tick - entity_ticks.server_tick;
+                        if hidden_lifetime.is_none()
+                            && rule.mode != ReplicationMode::Once
+                            && base_priority * tick_diff as f32 >= 1.0
+                            && ticks.is_changed(entity_ticks.system_tick, **change_tick)
+                        {
+                            trace!(
+                                "writing `{:?}` mutation for `{}` for client `{client}`",
+                                rule.fns_id,
+                                entity.id(),
+                            );
+
+                            if !mutations.entity_added() {
+                                let graph_index = related_entities.graph_index(entity.id());
+                                let entity_range = serialized
+                                    .write_cached_entity(&mut entity_range, entity.id())?;
+                                mutations.add_entity(entity.id(), graph_index, entity_range);
+                            }
+
+                            let diff_cursor = entity_ticks.diff_cursor(component_index);
+                            let component_range = if diff_cursor.is_none() {
+                                // Cache only full component snapshots.
+                                serialized.write_cached_component(
+                                    &mut ctx,
+                                    &mut component_range,
+                                    &mut component,
+                                )?
+                            } else {
+                                ctx.diff_cursor = diff_cursor;
+                                let range = serialized.write_component(&mut ctx, &mut component)?;
+                                if let Some(cursor) = ctx.diff_cursor.take() {
+                                    mutations.add_diff_cursor(component_index, cursor);
+                                }
+                                range
+                            };
+                            mutations.add_component(component_range);
+                        }
+                    } else if hidden_lifetime
+                        .is_none_or(|l| l == ScopeLifetime::AlwaysPresent && new_for_client)
+                    {
+                        trace!(
+                            "writing `{:?}` insertion for `{}` for client `{client}`",
+                            rule.fns_id,
+                            entity.id(),
+                        );
+
+                        if !updates.changed_entity_added() {
+                            let entity_range =
+                                serialized.write_cached_entity(&mut entity_range, entity.id())?;
+                            updates.add_changed_entity(entity_range);
+                        }
+                        let component_range = serialized.write_cached_component(
+                            &mut ctx,
+                            &mut component_range,
+                            &mut component,
+                        )?;
+                        updates.add_inserted_component(component_range, component_index);
+                    }
+                }
+            }
+
+            for (client, mut updates, mut mutations, mut ticks, _, visibility) in &mut clients {
+                let hidden_lifetime = visibility
+                    .get(entity.id())
+                    .hidden_entity_lifetime(&filter_registry);
+                if hidden_lifetime == Some(ScopeLifetime::WhileVisible) {
+                    continue;
+                }
+
+                let entity_ticks = ticks.entities.entry(entity.id());
+                let new_for_client = matches!(entity_ticks, Entry::Vacant(_));
+                let has_insertions = updates.changed_entity_added();
+                let has_removals = removal_buffer.contains_key(&entity.id());
+                let starts_replication = new_for_client
+                    && hidden_lifetime.is_none_or(|l| l == ScopeLifetime::AlwaysPresent);
+
+                if starts_replication || has_insertions || has_removals {
+                    // If there is any insertion, removal, or it's a new entity for a client, include all mutations
+                    // into update message and bump the last acknowledged tick to keep entity updates atomic.
+                    if mutations.entity_added() {
+                        trace!(
+                            "merging mutations for `{}` with updates for client `{client}`",
+                            entity.id()
+                        );
+                        updates.take_added_entity(&mut mutations);
+                    }
+
+                    update_ticks(
+                        entity_ticks,
+                        **change_tick,
+                        **server_tick,
+                        updates.take_changed_components(),
+                    );
+                }
+
+                if starts_replication && !has_insertions {
+                    trace!("writing empty `{}` for client `{client}`", entity.id());
+
+                    // Force-write new entity even if it doesn't have any components.
+                    let entity_range =
+                        serialized.write_cached_entity(&mut entity_range, entity.id())?;
+                    updates.add_changed_entity(entity_range);
+                }
+            }
+        }
+    }
+
+    removal_buffer.clear();
+
+    Ok(())
+}
+
+fn update_ticks(
+    entity_ticks: Entry<Entity, EntityTicks, EntityHash>,
+    system_tick: Tick,
+    server_tick: RepliconTick,
+    components: ComponentMask,
+) {
+    match entity_ticks {
+        Entry::Occupied(entry) => {
+            let entity_ticks = entry.into_mut();
+            entity_ticks.system_tick = system_tick;
+            entity_ticks.server_tick = server_tick;
+            entity_ticks.components |= &components;
+        }
+        Entry::Vacant(entry) => {
+            entry.insert(EntityTicks::new(server_tick, system_tick, components));
+        }
+    }
+}
+
+/// Sends previously constructed [`Updates`] and [`Mutations`].
+fn send_messages(
+    mut split_buffer: Local<Vec<MutationsSplit>>,
+    time: Res<Time<Real>>,
+    server_tick: Res<ServerTick>,
+    change_tick: Res<ServerChangeTick>,
+    track_mutate_messages: Res<TrackMutateMessages>,
+    userdata: Res<ReplicationUserdata>,
+    mut serialized: ResMut<SerializedData>,
+    mut messages: ResMut<ServerMessages>,
+    mut clients: Query<(
+        Entity,
+        &mut Updates,
+        &mut Mutations,
+        &ConnectedClient,
+        &mut ClientTicks,
+    )>,
+) -> Result<()> {
+    let mut server_tick_range = None;
+    for (client, updates, mut mutations, connected, mut ticks) in &mut clients {
+        if !updates.is_empty() {
+            ticks.update_tick = **server_tick;
+            let server_tick_range =
+                serialized.write_cached_tick(&mut server_tick_range, **server_tick)?;
+
+            updates.send(
+                &mut messages,
+                client,
+                &serialized,
+                &userdata,
+                server_tick_range,
+            )?;
+        }
+
+        if !mutations.is_empty() || **track_mutate_messages {
+            let server_tick_range =
+                serialized.write_cached_tick(&mut server_tick_range, **server_tick)?;
+
+            mutations.send(
+                &mut messages,
+                client,
+                &mut ticks,
+                &mut split_buffer,
+                &serialized,
+                **track_mutate_messages,
+                &userdata,
+                server_tick_range,
+                **server_tick,
+                **change_tick,
+                time.elapsed(),
+                connected.max_size,
+            )?;
+        }
+    }
+
+    serialized.clear();
+
+    Ok(())
+}
+
+// The storage resource may be unavailable while receiving replication, and the
+// client may have marked `Replicated` as a required component for `Remote`.
+// Cleanup is handled manually in the receive logic.
+fn cleanup_storage(remove: On<Remove, Replicated>, mut storage: If<ResMut<ReplicationStorage>>) {
+    storage.entities.remove(&remove.entity);
+}
+
+fn reset(
+    mut commands: Commands,
+    mut messages: ResMut<ServerMessages>,
+    mut server_tick: ResMut<ServerTick>,
+    mut related_entities: ResMut<RelatedEntities>,
+    clients: Query<Entity, With<ConnectedClient>>,
+    mut message_buffer: ResMut<MessageBuffer>,
+) {
+    messages.clear();
+    *server_tick = Default::default();
+    message_buffer.clear();
+    related_entities.clear();
+    for client in &clients {
+        commands.entity(client).despawn();
+    }
+}
+
+/// Set with replication and event systems related to server.
+#[derive(SystemSet, Debug, Hash, PartialEq, Eq, Clone, Copy)]
+pub enum ServerSystems {
+    /// Systems that receive packets from the messaging backend and update [`ServerState`].
+    ///
+    /// Used by the messaging backend.
+    ///
+    /// Runs in [`PreUpdate`].
+    ReceivePackets,
+    /// Systems that read data from [`ServerMessages`].
+    ///
+    /// Runs in [`PreUpdate`].
+    Receive,
+    /// Systems that build the initial graph with all related entities registered via
+    /// [`SyncRelatedAppExt::sync_related_entities`].
+    ///
+    /// The graph is kept in sync with observers.
+    ///
+    /// Runs in [`OnEnter`] for [`ServerState::Running`].
+    ReadRelations,
+    /// System that increments [`ServerTick`].
+    ///
+    /// Runs in [`ServerPlugin::tick_schedule`].
+    IncrementTick,
+    /// Systems that write data to [`ServerMessages`].
+    ///
+    /// Runs in [`PostUpdate`] if [`ServerTick`] changes.
+    Send,
+    /// Systems that send packets to the messaging backend.
+    ///
+    /// Used by the messaging backend.
+    ///
+    /// Runs in [`PostUpdate`] if [`ServerTick`] changes.
+    SendPackets,
+}
+
+/// System tick used for change detection as the current tick.
+///
+/// Used to share the same tick in [`collect_changes`] and [`send_messages`].
+#[derive(Resource, Deref, DerefMut, Default)]
+struct ServerChangeTick(Tick);
+
+/// Buffer with all despawned entities.
+#[derive(Resource, Deref, DerefMut, Default)]
+struct DespawnBuffer(Vec<Entity>);
+
+/// Marker that enables replication and all events for a client.
+///
+/// Until authorization happened, the client and server can still exchange network events that are marked as
+/// independent via [`ServerMessageAppExt::make_message_independent`] or [`ServerEventAppExt::make_event_independent`].
+/// **All other events will be ignored**.
+///
+/// See also [`ConnectedClient`] and [`RepliconSharedPlugin::auth_method`].
+#[derive(Component, Reflect, Default)]
+#[component(immutable)]
+#[require(ClientTicks, ClientVisibility, PriorityMap, Updates, Mutations)]
+pub struct AuthorizedClient;
+
+/// Controls how often mutations are sent for a replicated entity.
+///
+/// Applies to all authorized clients unless overridden by the client's [`PriorityMap`].
+///
+/// This priority is unrelated to the replication rule priority from methods like [`AppRuleExt::replicate_with_priority`].
+///
+/// During replication, we multiply the difference between the last acknowledged tick
+/// and [`ServerTick`] by the priority. If the result is greater than or equal to 1.0,
+/// we send mutations for this entity.
+///
+/// This means the priority accumulates across server ticks until an entity is acknowledged,
+/// at which point its priority is reset. As a result, even low-priority objects eventually
+/// reach a high enough priority to be considered for replication.
+///
+/// For example, if the base priority is 0.5, mutations for an entity will be sent
+/// no more often than once every 2 ticks. With the default priority of 1.0,
+/// all unacknowledged mutations will be sent every tick.
+///
+/// All of this only affects mutations. For any component insertion or removal, the changes
+/// will be sent using [`ServerChannel::Updates`](crate::shared::backend::channels::ServerChannel::Updates).
+/// See its documentation for more details.
+#[derive(Component, Reflect, Deref, DerefMut, Default, Debug, Clone, Copy)]
+pub struct ReplicatePriority(pub f32);
+
+/// Controls how often mutations are sent for an authorized client.
+///
+/// Associates entities with a priority number configurable by the user.
+///
+/// If the priority is not set, the entity's [`ReplicatePriority`] will be used (if present),
+/// otherwise it defaults to 1.0.
+///
+/// During replication, we multiply the difference between the last acknowledged tick
+/// and [`ServerTick`] by the priority. If the result is greater than or equal to 1.0,
+/// we send mutations for this entity.
+///
+/// This means the priority accumulates across server ticks until an entity is acknowledged,
+/// at which point its priority is reset. As a result, even low-priority objects eventually
+/// reach a high enough priority to be considered for replication.
+///
+/// For example, if the base priority is 0.5, mutations for an entity will be sent
+/// no more often than once every 2 ticks. With the default priority of 1.0,
+/// all unacknowledged mutations will be sent every tick.
+///
+/// All of this only affects mutations. For any component insertion or removal, the changes
+/// will be sent using [`ServerChannel::Updates`](crate::shared::backend::channels::ServerChannel::Updates).
+/// See its documentation for more details.
+#[derive(Component, Reflect, Deref, DerefMut, Default, Debug, Clone)]
+pub struct PriorityMap(EntityHashMap<f32>);
+
+/// Marker for entities stored in [`ClientTicks`].
+///
+/// Marked as required for [`Replicated`] by [`ServerPlugin`].
+///
+/// Despawned entities with [`Replicated`] are automatically removed
+/// from all [`ClientTicks`] during [`collect_despawns`].
+///
+/// If [`Replicated`] was removed before despawning, the despawn is not
+/// replicated, so this marker is used to clean up [`ClientTicks`].
+#[derive(Component, Default)]
+struct TicksTracked;
+
+/// Value of the [`ServerPlugin::track_mutate_messages`].
+#[derive(Resource, Deref, Default, Debug, Clone, Copy)]
+struct TrackMutateMessages(bool);
+
+/// User-defined bytes appended to outgoing replication messages.
+///
+/// When this resource is non-empty, its contents are sent with every replication
+/// update and mutate message. On the client, the bytes are triggered as a
+/// [`UserdataReceived`](crate::client::UserdataReceived) before the rest of
+/// the message is applied.
+///
+/// This could be useful to store the game tick for prediction/interpolaton.
+///
+/// The bytes are not cleared after being sent.
+#[derive(Resource, Deref, DerefMut, Default)]
+pub struct ReplicationUserdata(pub Vec<u8>);

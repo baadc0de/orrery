@@ -3,11 +3,13 @@ resolver = "3"
 members = [
     "vendor/aeronet_iroh",
     "vendor/aeronet_tokio_runtime",
+    "vendor/bevy_replicon",
     "crates/orrery_protocol",
     "crates/orrery_net",
     "crates/orrery_spatial",
     "crates/orrery_coordinator",
     "crates/orrery_predict",
+    "crates/orrery_persist_client",
     "crates/orrery_persistd",
 ]
 
@@ -22,6 +24,7 @@ bevy_ecs = { version = "0.19", default-features = false }
 bevy_math = { version = "0.19", default-features = false }
 bevy_platform = { version = "0.19", default-features = false }
 bevy_reflect = { version = "0.19", default-features = false }
+bevy_time = { version = "0.19", default-features = false }
 
 # Netcode stack (D4)
 aeronet_io = "0.21"
@@ -41,7 +44,10 @@ serde = { version = "1", features = ["derive"] }
 glam = { version = "0.32", features = ["serde"] }
 
 # Replication stack (P1, D4): bevy_replicon 0.42 visibility mapping.
-bevy_replicon = "0.42"
+# Vendored under vendor/bevy_replicon to surface the change-detection
+# internals (`server::uplink`) that feed the persistence uplink (D11);
+# upstreaming intent is a PR against simgine/bevy_replicon.
+bevy_replicon = { path = "vendor/bevy_replicon", version = "0.42.1" }
 # big_space 0.13 (Bevy 0.19) is not yet on crates.io; the WIP `bevy-0.19`
 # branch is the tracked P1 risk (docs/11-roadmap.md §P1). Pinned to the branch
 # commit so the workspace builds reproducibly; swap to the crates.io release
