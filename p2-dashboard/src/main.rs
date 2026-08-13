@@ -441,6 +441,11 @@ fn print_human(r: &Report) {
         );
     }
     println!();
+    // p50/p99 are histogram bucket *upper bounds*; max is the exact observed
+    // value. So `max` legitimately reads below `p99` whenever every sample sat
+    // low inside its bucket. Say so, or the table looks impossible.
+    println!("p50/p99 are bucket upper bounds; max is exact, so max < p99 is normal.");
+    println!();
     println!(
         "GATE: {}",
         if r.gate == GateVerdict::Pass {
