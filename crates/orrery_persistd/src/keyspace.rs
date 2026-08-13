@@ -9,7 +9,7 @@
 //! Normative source: docs/08-persistence.md §6, docs/12-world-seeding.md §9.2,
 //! §9.3, §11.1, and docs/DECISIONS.md D11.
 
-use orrery_protocol::{CellId, GridId, PersistId};
+use orrery_protocol::{AccountId, AssetId, CellId, GridId, ItemUid, PersistId};
 
 use crate::actor::Tombstone;
 use crate::checkpoint::CheckpointError;
@@ -381,6 +381,129 @@ pub fn intent_range_start() -> Vec<u8> {
 #[must_use]
 pub fn intent_range_end() -> Vec<u8> {
     vec![b'j']
+}
+
+/// The value stored at [`intent_key`]: the recorded outcome plus the GC
+/// deadline (docs/08-persistence.md §6 — `(outcome, gc_deadline_ms)`, default
+/// 1 h retention, swept by the same checkpoint pass that GCs despawn
+/// tombstones). The deadline is carried on the row, not re-derived, so the
+/// sweep is a pure deadline comparison.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct IntentRow {
+    /// The outcome the intent committed (or was rejected) with.
+    pub outcome: orrery_protocol::IntentOutcome,
+    /// Unix-millisecond deadline after which the checkpoint pass may clear
+    /// the row.
+    pub gc_deadline_ms: u64,
+}
+
+// ---------------------------------------------------------------------------
+// Player family: `player/{account_id}` (+ `/loc` placement pointer)
+// ---------------------------------------------------------------------------
+//
+// Critical-class rows written by the intent path (docs/08-persistence.md §6):
+// the profile row and the login placement pointer. The account id is the
+// 8-byte big-endian `AccountId`.
+
+/// Key for the account profile row: `player/{account_id}` (§6). Critical-class;
+/// written inside intent transactions only.
+#[must_use]
+pub fn player_key(account: AccountId) -> [u8; 9] {
+    let mut key = [0u8; 9];
+    key[0] = b'u';
+    key[1..9].copy_from_slice(&account.0.to_be_bytes());
+    key
+}
+
+/// Key for the login placement pointer: `player/{account_id}/loc` →
+/// `(cell_id, entity_id)` (§6). Written by the cell actor on rekey, read at
+/// login. The trailing 0x01 keeps it inside the account's span without
+/// colliding with the profile row.
+#[must_use]
+pub fn player_loc_key(account: AccountId) -> [u8; 10] {
+    let mut key = [0u8; 10];
+    key[0] = b'u';
+    key[1..9].copy_from_slice(&account.0.to_be_bytes());
+    key[9] = 0x01; // "loc" suffix inside the account span
+    key
+}
+
+// ---------------------------------------------------------------------------
+// PersistId allocator family: `pid/next`
+// ---------------------------------------------------------------------------
+//
+// The cluster-minted id counter (docs/08-persistence.md §6 `pid/next`,
+// §7 "Id minting in the receipt"): intents allocate `PersistId`s inside the
+// transaction via `MutationType::Add`, so concurrent intents never serialize
+// on the counter beyond the atomic op itself. The value is an 8-byte
+// little-endian u64 — little-endian because that is the representation
+// `MutationType::Add` requires.
+
+/// Key for the `PersistId` counter: `pid/{grid_id}/next` (§6 `pid/next`).
+///
+/// Grid-scoped so tests (and nested grids) allocate from independent counters;
+/// the production grid is [`GridId::ROOT`]. Mutated **only** via
+/// `MutationType::Add`; its value is 8-byte little-endian.
+#[must_use]
+pub fn pid_next_key(grid: GridId) -> [u8; 9] {
+    let mut key = [0u8; 9];
+    key[0] = b'n';
+    key[1..5].copy_from_slice(&grid.0.to_be_bytes());
+    key[5..9].copy_from_slice(b"next");
+    key
+}
+
+// ---------------------------------------------------------------------------
+// Ledger family: `ledger/bal/…`, `ledger/item/…`, `ledger/receipt/…`
+// ---------------------------------------------------------------------------
+//
+// Critical-class rows, FDB-transaction-only writers (docs/08-persistence.md
+// §6, §7). All three families share the `b'l'` prefix, discriminated by the
+// second byte so range scans of one kind never see another. Balances encode
+// **little-endian** so `MutationType::Add` applies directly (§7: the credit
+// side is a blind atomic increment).
+
+/// Key for a balance row: `ledger/bal/{account_id}/{asset_id}` → integer
+/// balance (§6). Ids are big-endian so accounts and assets sort by id; the
+/// **value** is a 16-byte little-endian i128 (or an 8-byte LE i64 prefix of
+/// it) so `MutationType::Add` works (§7).
+#[must_use]
+pub fn ledger_bal_key(account: AccountId, asset: AssetId) -> [u8; 18] {
+    let mut key = [0u8; 18];
+    key[0] = b'l';
+    key[1] = b'b';
+    key[2..10].copy_from_slice(&account.0.to_be_bytes());
+    key[10..18].copy_from_slice(&asset.0.to_be_bytes());
+    key
+}
+
+/// Key for a unique item row: `ledger/item/{item_uid}` →
+/// `(owner_ref, item_state)` (§6). One ownership row per unique item — the
+/// single-ownership row is the anti-dupe invariant (§7).
+#[must_use]
+pub fn ledger_item_key(item: ItemUid) -> [u8; 10] {
+    let mut key = [0u8; 10];
+    key[0] = b'l';
+    key[1] = b'i';
+    key[2..10].copy_from_slice(&item.0.to_be_bytes());
+    key
+}
+
+/// Key for a trade receipt row: `ledger/receipt/{versionstamp}` →
+/// `(intent_id, parties, ops)` (§6) — the strictly-ordered audit trail.
+///
+/// The returned key carries 10 zero bytes at the versionstamp position (byte
+/// offset 2, right after the two prefix bytes); write it with
+/// `MutationType::SetVersionstampedKey` and a parameter whose final 4 bytes
+/// encode that offset little-endian, so FDB substitutes the commit
+/// versionstamp (the strict ordering comes from commit order itself).
+#[must_use]
+pub fn ledger_receipt_key() -> [u8; 12] {
+    let mut key = [0u8; 12];
+    key[0] = b'l';
+    key[1] = b'r';
+    // bytes 2..12: the zero placeholder the versionstamp is written into.
+    key
 }
 
 // ---------------------------------------------------------------------------
@@ -796,6 +919,132 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // Intent-adjacent families: player, pid, ledger
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn player_keys_share_the_account_span() {
+        let account = AccountId::new(0x0102_0304_0506_0708);
+        let profile = player_key(account);
+        let loc = player_loc_key(account);
+        assert_eq!(profile.len(), 9);
+        assert_eq!(loc.len(), 10);
+        assert_eq!(profile[0], b'u');
+        // Hand-computed: 'u' ‖ big-endian account id.
+        let mut expected = [0u8; 9];
+        expected[0] = b'u';
+        expected[1..9].copy_from_slice(&0x0102_0304_0506_0708u64.to_be_bytes());
+        assert_eq!(profile, expected);
+        // The loc row sorts inside the account's span, after the profile row.
+        assert_eq!(loc[..9], profile[..]);
+        assert_eq!(loc[9], 0x01);
+        assert!(loc.as_slice() > profile.as_slice());
+        // A different account is a different span.
+        assert_ne!(player_key(AccountId::new(2)), profile);
+    }
+
+    #[test]
+    fn pid_next_key_is_grid_scoped() {
+        let root = pid_next_key(GridId::ROOT);
+        let g9 = pid_next_key(GridId::new(9));
+        assert_eq!(root.len(), 9);
+        assert_eq!(root[0], b'n');
+        assert_eq!(&root[5..9], b"next");
+        // Hand-computed: 'n' ‖ big-endian grid ‖ "next".
+        let mut expected = [0u8; 9];
+        expected[0] = b'n';
+        expected[5..9].copy_from_slice(b"next");
+        assert_eq!(root, expected);
+        assert_ne!(root, g9, "each grid allocates from its own counter");
+        assert!(root.as_slice() < g9.as_slice(), "grids sort by id");
+    }
+
+    #[test]
+    fn ledger_keys_share_one_prefix_and_discriminate() {
+        let account = AccountId::new(7);
+        let asset = AssetId::new(3);
+        let item = ItemUid::new(0x0102_0304_0506_0708);
+
+        let bal = ledger_bal_key(account, asset);
+        assert_eq!(bal.len(), 18);
+        assert_eq!(&bal[..2], b"lb");
+        assert_eq!(
+            u64::from_be_bytes(bal[2..10].try_into().unwrap()),
+            7,
+            "big-endian account id"
+        );
+        assert_eq!(
+            u64::from_be_bytes(bal[10..18].try_into().unwrap()),
+            3,
+            "big-endian asset id"
+        );
+
+        let item_key = ledger_item_key(item);
+        assert_eq!(item_key.len(), 10);
+        assert_eq!(&item_key[..2], b"li");
+        assert_eq!(
+            u64::from_be_bytes(item_key[2..10].try_into().unwrap()),
+            item.0
+        );
+
+        let receipt = ledger_receipt_key();
+        assert_eq!(receipt.len(), 12);
+        assert_eq!(&receipt[..2], b"lr");
+        assert_eq!(
+            receipt[2..],
+            [0u8; 10],
+            "the versionstamp placeholder is ten zero bytes"
+        );
+
+        // All three share the ledger prefix but live in disjoint sub-spans:
+        // 'b' < 'i' < 'r', so a balance range scan never touches item or
+        // receipt rows.
+        assert!(bal.as_slice() < item_key.as_slice());
+        assert!(item_key.as_slice() < receipt.as_slice());
+    }
+
+    #[test]
+    fn new_families_do_not_collide_with_w_c_a_or_i() {
+        // The brief's disjointness requirement: the ledger/player/pid
+        // prefixes must not collide with world ('w'), ckpt ('c'), actor
+        // ('a') — or the already-landed intent ('i').
+        let shard = CellId::from_bits(SHARD).unwrap();
+        let existing = [
+            world_key(GRID, shard, PersistId::new(1)).to_vec(),
+            ckpt_key(GRID, shard).to_vec(),
+            fence_key(shard).to_vec(),
+            intent_key(42).to_vec(),
+        ];
+        let new = [
+            ledger_bal_key(AccountId::new(1), AssetId::new(1)).to_vec(),
+            ledger_item_key(ItemUid::new(1)).to_vec(),
+            ledger_receipt_key().to_vec(),
+            player_key(AccountId::new(1)).to_vec(),
+            player_loc_key(AccountId::new(1)).to_vec(),
+            pid_next_key(GridId::ROOT).to_vec(),
+        ];
+        for e in &existing {
+            for n in &new {
+                assert_ne!(
+                    e[0], n[0],
+                    "prefix byte collision between existing and new family"
+                );
+            }
+        }
+        // And among themselves the new first bytes are distinct from every
+        // existing family byte: l, u, n.
+        let mut bytes: Vec<u8> = new.iter().map(|k| k[0]).collect();
+        bytes.extend(existing.iter().map(|k| k[0]));
+        bytes.sort();
+        bytes.dedup();
+        assert_eq!(
+            bytes.len(),
+            4 + 3,
+            "the seven first bytes are distinct (l, u, n against w, c, a, i)"
+        );
+    }
+
+    // -----------------------------------------------------------------------
     // decode_world_key
     // -----------------------------------------------------------------------
 
@@ -886,8 +1135,11 @@ mod tests {
             Family { prefix: b'c' }, // ckpt
             Family { prefix: b'i' }, // intent
             Family { prefix: b'k' }, // chunk
+            Family { prefix: b'l' }, // ledger (bal/item/receipt)
+            Family { prefix: b'n' }, // pid/next
             Family { prefix: b'p' }, // seedprog
             Family { prefix: b's' }, // seedmap
+            Family { prefix: b'u' }, // player
             Family { prefix: b'v' }, // content/version
             Family { prefix: b'w' }, // world
         ];
@@ -899,22 +1151,25 @@ mod tests {
         assert_eq!(
             prefixes.len(),
             families.len(),
-            "all eight family prefixes must be distinct"
+            "all eleven family prefixes must be distinct"
         );
 
         // For each pair (a, b), verify that a key from family A sorts before
         // a key from family B when prefix_a < prefix_b. Since each family has
         // a fixed one-byte prefix, the full-family range is [prefix, prefix+1),
         // so distinct prefixes guarantee disjoint ranges.
-        let keys: [Vec<u8>; 8] = [
-            fence_key(shard).to_vec(),                          // 'a'
-            ckpt_key(GRID, shard).to_vec(),                     // 'c'
-            intent_key(42).to_vec(),                            // 'i'
-            chunk_key(GRID, shard, 0).to_vec(),                 // 'k'
-            seedprog_key([0xDE; 8], GRID, shard).to_vec(),      // 'p'
-            seedmap_key([0xAB; 16]).to_vec(),                   // 's'
-            content_version_key().to_vec(),                     // 'v'
-            world_key(GRID, shard, PersistId::new(1)).to_vec(), // 'w'
+        let keys: [Vec<u8>; 11] = [
+            fence_key(shard).to_vec(),                                   // 'a'
+            ckpt_key(GRID, shard).to_vec(),                              // 'c'
+            intent_key(42).to_vec(),                                     // 'i'
+            chunk_key(GRID, shard, 0).to_vec(),                          // 'k'
+            ledger_bal_key(AccountId::new(1), AssetId::new(1)).to_vec(), // 'l'
+            pid_next_key(GridId::ROOT).to_vec(),                         // 'n'
+            seedprog_key([0xDE; 8], GRID, shard).to_vec(),               // 'p'
+            seedmap_key([0xAB; 16]).to_vec(),                            // 's'
+            player_key(AccountId::new(1)).to_vec(),                      // 'u'
+            content_version_key().to_vec(),                              // 'v'
+            world_key(GRID, shard, PersistId::new(1)).to_vec(),          // 'w'
         ];
         for (i, ka) in keys.iter().enumerate() {
             for (j, kb) in keys.iter().enumerate() {
@@ -940,8 +1195,11 @@ mod tests {
             (b'c', "ckpt"),
             (b'i', "intent"),
             (b'k', "chunk"),
+            (b'l', "ledger"),
+            (b'n', "pid/next"),
             (b'p', "seedprog"),
             (b's', "seedmap"),
+            (b'u', "player"),
             (b'v', "content/version"),
             (b'w', "world"),
         ];

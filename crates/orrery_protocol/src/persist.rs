@@ -118,6 +118,52 @@ pub enum RecordKind {
     CheckpointMark,
 }
 
+/// An account identity on the ledger/player rows (D11 §6).
+///
+/// Distinct from [`NodeId`]: a `NodeId` is a transport identity (D3), an
+/// `AccountId` is the durable identity ledger balances, item ownership, and
+/// profile rows are keyed by (`id/{account_id}` binds the two, D10).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct AccountId(pub u64);
+
+impl AccountId {
+    /// An `AccountId` from a raw u64.
+    #[must_use]
+    pub const fn new(id: u64) -> Self {
+        Self(id)
+    }
+}
+
+/// A currency/asset class on the `ledger/bal/` rows (D11 §6).
+///
+/// `Ruleset`-defined (gold, crafting materials, …); the wire type only
+/// carries the id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct AssetId(pub u64);
+
+impl AssetId {
+    /// An `AssetId` from a raw u64.
+    #[must_use]
+    pub const fn new(id: u64) -> Self {
+        Self(id)
+    }
+}
+
+/// A unique item instance id on the `ledger/item/` rows (D11 §6).
+///
+/// Unique items get exactly one ownership row each — the single-ownership row
+/// *is* the anti-dupe invariant (§7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct ItemUid(pub u64);
+
+impl ItemUid {
+    /// An `ItemUid` from a raw u64.
+    #[must_use]
+    pub const fn new(id: u64) -> Self {
+        Self(id)
+    }
+}
+
 /// A single append-only journal record (D11 §4).
 ///
 /// One fsync stream per node is shared by all cell actors on that node; the
@@ -192,6 +238,59 @@ pub struct Intent {
     pub signature: Signature,
 }
 
+/// The domain separation tag for [`Intent::signing_preimage`]. Versioned so a
+/// future preimage change can never collide with a signature made under this
+/// one.
+pub const INTENT_PREIMAGE_TAG: &[u8] = b"orrery/intent/v1";
+
+impl Intent {
+    /// The canonical byte string the issuer signs: domain-separated and
+    /// **attestation-excluding** — it covers exactly `(intent_id, issuer,
+    /// cell_epoch, ops)`, so a witness pushing an [`Attestation`] onto a
+    /// signed intent can never invalidate the author's signature (the D10
+    /// flow: the peer signs, *then* collects K-of-N co-signatures).
+    ///
+    /// This is the one canonical function used by both signer
+    /// ([`Intent::sign`]) and verifier ([`Intent::verify_issuer`]) — a
+    /// preimage computed in two places would drift. Lengths and counts are
+    /// fixed-width little-endian so the encoding is unambiguous.
+    #[must_use]
+    pub fn signing_preimage(&self) -> Vec<u8> {
+        let ops_len: usize = self.ops.iter().map(|op| 2 + 4 + op.args.len()).sum();
+        let mut buf = Vec::with_capacity(INTENT_PREIMAGE_TAG.len() + 16 + 32 + 8 + 4 + ops_len);
+        buf.extend_from_slice(INTENT_PREIMAGE_TAG);
+        buf.extend_from_slice(&self.intent_id.to_le_bytes());
+        buf.extend_from_slice(self.issuer.as_bytes());
+        buf.extend_from_slice(&self.cell_epoch.0.to_le_bytes());
+        buf.extend_from_slice(&(self.ops.len() as u32).to_le_bytes());
+        for op in &self.ops {
+            buf.extend_from_slice(&op.op.to_le_bytes());
+            buf.extend_from_slice(&(op.args.len() as u32).to_le_bytes());
+            buf.extend_from_slice(&op.args);
+        }
+        buf
+    }
+
+    /// Sign [`Intent::signing_preimage`] with `key`, replacing any previous
+    /// signature. Call this **after** `intent_id`, `issuer`, `cell_epoch` and
+    /// `ops` are final; attestations may be pushed afterwards (they are not
+    /// covered).
+    pub fn sign(&mut self, key: &iroh_base::SecretKey) {
+        self.signature = key.sign(&self.signing_preimage());
+    }
+
+    /// Verify the issuer's ed25519 signature over
+    /// [`Intent::signing_preimage`]. The gateway runs this before anything
+    /// else (docs/08-persistence.md §2.2: signature checks happen at the edge,
+    /// before any transaction work).
+    #[must_use]
+    pub fn verify_issuer(&self) -> bool {
+        self.issuer
+            .verify(&self.signing_preimage(), &self.signature)
+            .is_ok()
+    }
+}
+
 /// The outcome of an [`Intent`] execution (D11 §7).
 ///
 /// Recorded in the `intent/{intent_id}` idempotency row so duplicate
@@ -213,6 +312,24 @@ pub enum IntentOutcome {
         reason: u16,
     },
 }
+
+/// The issuer's ed25519 signature did not verify (gateway edge check, §2.2).
+pub const REASON_BAD_SIGNATURE: u16 = 1;
+/// The intent's `issuer` does not match the connection's authenticated
+/// transport identity — a peer may not submit intents in another's name.
+pub const REASON_ISSUER_MISMATCH: u16 = 2;
+/// The gateway has no intent executor configured: intents cannot be committed
+/// durably, so the honest reply is a rejection, never a fake commit (the
+/// inverted RPO-0 the gateway stub had before the intent execution path).
+pub const REASON_NO_EXECUTOR: u16 = 3;
+/// The `Ruleset` admission check rejected the intent (validator verdict).
+pub const REASON_VALIDATION_FAILED: u16 = 4;
+/// The executor's serializable transaction exhausted its bounded retries
+/// (docs/08-persistence.md §7: after 5 conflict retries the gateway returns a
+/// definitive refusal and the client's predicted outcome rolls back).
+pub const REASON_CONTENTION_EXHAUSTED: u16 = 5;
+/// The executor failed for a non-conflict reason (store unavailable, …).
+pub const REASON_EXECUTOR_ERROR: u16 = 6;
 
 /// A checkpoint watermark (D11 §3.4, §6 `ckpt/{shard}` row).
 ///
@@ -299,6 +416,74 @@ mod tests {
         let bytes = postcard::to_stdvec(&ckpt).unwrap();
         let back: Checkpoint = postcard::from_bytes(&bytes).unwrap();
         assert_eq!(back, ckpt);
+    }
+
+    #[test]
+    fn preimage_is_stable_and_attestation_independent() {
+        // D10 flow: the peer signs, *then* collects witness co-signatures — so
+        // pushing an Attestation must not change the bytes the author signed.
+        let mut intent = Intent {
+            intent_id: 0x1122_3344_5566_7788_99aa_bbcc_ddee_ff00,
+            issuer: node(1),
+            cell_epoch: Epoch::new(7),
+            ops: vec![IntentOp {
+                op: 3,
+                args: bytes::Bytes::from_static(b"trade"),
+            }],
+            attestations: Vec::new(),
+            signature: sig(),
+        };
+        let before = intent.signing_preimage();
+        intent.attestations.push(Attestation {
+            witness: node(2),
+            signature: sig(),
+        });
+        let after = intent.signing_preimage();
+        assert_eq!(
+            before, after,
+            "pushing a co-signature must not move the author's preimage"
+        );
+
+        // Independent derivation: the preimage is the domain tag followed by
+        // the fixed-width fields, with no attestation bytes in it.
+        let mut expected = INTENT_PREIMAGE_TAG.to_vec();
+        expected.extend_from_slice(&intent.intent_id.to_le_bytes());
+        expected.extend_from_slice(intent.issuer.as_bytes());
+        expected.extend_from_slice(&intent.cell_epoch.0.to_le_bytes());
+        expected.extend_from_slice(&1u32.to_le_bytes()); // ops count
+        expected.extend_from_slice(&3u16.to_le_bytes()); // op id
+        expected.extend_from_slice(&5u32.to_le_bytes()); // args len
+        expected.extend_from_slice(b"trade");
+        assert_eq!(before, expected, "canonical layout, derived by hand");
+    }
+
+    #[test]
+    fn signature_roundtrips() {
+        let mut intent = Intent {
+            intent_id: 42,
+            issuer: node(1),
+            cell_epoch: Epoch::new(0),
+            ops: vec![IntentOp {
+                op: 1,
+                args: bytes::Bytes::from_static(b"buy"),
+            }],
+            attestations: Vec::new(),
+            signature: sig(), // overwritten by sign()
+        };
+        let key = iroh_base::SecretKey::from_bytes(&{
+            let mut seed = [0u8; 32];
+            seed[0] = 1;
+            seed
+        });
+        intent.sign(&key);
+        assert!(intent.verify_issuer(), "sign-then-verify_issuer is true");
+
+        // Mutating any ops byte invalidates the author signature.
+        intent.ops[0].args = bytes::Bytes::from_static(b"buz");
+        assert!(
+            !intent.verify_issuer(),
+            "a mutated ops byte must fail verification"
+        );
     }
 
     #[test]

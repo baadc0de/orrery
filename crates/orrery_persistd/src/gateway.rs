@@ -12,9 +12,12 @@
 //! - [`GatewayMsg::Subscribe`] → read the requested cells from the owning
 //!   actors and stream [`AreaPage`]s back (D11 §9; the client orders
 //!   nearest-first so it can spawn-in against page one, D16).
-//! - [`GatewayMsg::SubmitIntent`] → the intent-validator **stub**: accepts the
-//!   wire shape and commits optimistically without minting entities. Real
-//!   signature/K-of-N/`Ruleset` validation lands in P5.
+//! - [`GatewayMsg::SubmitIntent`] → the intent execution path (D11 §2.2):
+//!   verify the issuer signature, bind `intent.issuer` to the connection's
+//!   authenticated id, run the [`IntentValidator`] admission check, then hand
+//!   the intent to the configured [`IntentExecutor`] and ack **only after**
+//!   its future resolves — a `Committed` ack implies a durable commit (RPO 0).
+//!   With no executor configured the reply is `Rejected`, never a fake commit.
 //! - [`GatewayMsg::Hello`] → acknowledge with the gateway node id + protocol
 //!   version.
 //!
@@ -29,7 +32,6 @@
 //! would route by rendezvous placement instead (docs/08-persistence.md §3).
 
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -41,11 +43,15 @@ use orrery_protocol::channels::{
     decode_datagram, decode_stream_frame, encode_datagram, encode_stream_frame, untag, Channel,
 };
 use orrery_protocol::{
-    AreaPage, CellId, DiffUplink, Epoch, GatewayMsg, GatewayReply, GridId, IntentOutcome,
-    JournalRecord, Lsn, NodeId, Tick, PROTOCOL_VERSION,
+    AreaPage, CellId, DiffUplink, Epoch, GatewayMsg, GatewayReply, GridId, Intent, IntentOutcome,
+    JournalRecord, Lsn, NodeId, PROTOCOL_VERSION, REASON_BAD_SIGNATURE, REASON_ISSUER_MISMATCH,
+    REASON_NO_EXECUTOR,
 };
 
 use crate::cluster::Router;
+use crate::intent::{
+    error_outcome, IntentVerdict, PermissiveValidator, SharedExecutor, SharedValidator,
+};
 use crate::payload_crc;
 
 /// The ALPN the gateway advertises and accepts. Matches the client's
@@ -56,7 +62,7 @@ pub const GATEWAY_ALPN: &[u8] = b"orrery/gateway/0";
 const ACCEPTED: u8 = 0;
 
 /// Configuration for the [`GatewayServer`].
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct GatewayConfig {
     /// The application protocol to advertise/accept. Defaults to
     /// [`GATEWAY_ALPN`].
@@ -70,6 +76,15 @@ pub struct GatewayConfig {
     /// The protocol version reported in [`GatewayReply::HelloAck`]. Defaults to
     /// [`PROTOCOL_VERSION`].
     pub protocol_version: u16,
+    /// The intent executor (D11 §2.2, second stage). `None` means intents
+    /// cannot commit durably, so the gateway rejects them honestly
+    /// ([`REASON_NO_EXECUTOR`]) rather than acking a commit that never
+    /// happened — the inverted RPO-0 the stub had.
+    pub executor: Option<SharedExecutor>,
+    /// The intent admission validator (D11 §2.2, first stage). Defaults to
+    /// the permissive stub so the harness runs unconfigured; a linked
+    /// `Ruleset` swaps in real validation.
+    pub validator: SharedValidator,
 }
 
 impl Default for GatewayConfig {
@@ -80,6 +95,8 @@ impl Default for GatewayConfig {
             secret_key: None,
             bind: "127.0.0.1:0".parse().expect("static valid loopback addr"),
             protocol_version: PROTOCOL_VERSION,
+            executor: None,
+            validator: Arc::new(PermissiveValidator),
         }
     }
 }
@@ -132,14 +149,16 @@ impl GatewayServer {
 
         let gateway = endpoint.id();
         let protocol = config.protocol_version;
+        let executor = config.executor;
+        let validator = config.validator;
         let (shutdown, rx) = oneshot::channel();
-        let tick = Arc::new(AtomicU64::new(0));
         let join = tokio::spawn(accept_loop(
             endpoint.clone(),
             router,
             gateway,
             protocol,
-            tick,
+            executor,
+            validator,
             rx,
         ));
         Ok(Self {
@@ -177,7 +196,8 @@ async fn accept_loop(
     router: Arc<dyn Router>,
     gateway: NodeId,
     protocol: u16,
-    tick: Arc<AtomicU64>,
+    executor: Option<SharedExecutor>,
+    validator: SharedValidator,
     mut shutdown: oneshot::Receiver<()>,
 ) {
     loop {
@@ -186,8 +206,11 @@ async fn accept_loop(
             incoming = endpoint.accept() => {
                 let Some(incoming) = incoming else { break };
                 let router = Arc::clone(&router);
-                let tick = Arc::clone(&tick);
-                tokio::spawn(handle_connection(incoming, router, gateway, protocol, tick));
+                let executor = executor.clone();
+                let validator = Arc::clone(&validator);
+                tokio::spawn(handle_connection(
+                    incoming, router, gateway, protocol, executor, validator,
+                ));
             }
         }
     }
@@ -200,7 +223,8 @@ async fn handle_connection(
     router: Arc<dyn Router>,
     gateway: NodeId,
     protocol: u16,
-    tick: Arc<AtomicU64>,
+    executor: Option<SharedExecutor>,
+    validator: SharedValidator,
 ) {
     let conn = match incoming.accept() {
         Ok(accepting) => match accepting.await {
@@ -261,34 +285,93 @@ async fn handle_connection(
                 route_subscribe(&send, grid, cells, &router).await
             }
             GatewayMsg::SubmitIntent { intent } => {
-                route_intent(&send, intent, &tick, &router).await
+                route_intent(&send, intent, remote, &executor, &validator).await
             }
         }
     }
 }
 
-/// Execute one submitted intent and reply with its outcome.
+/// Execute one submitted intent and reply with its outcome (D11 §2.2).
 ///
-/// **Stub.** Accepts the wire shape and commits optimistically without
-/// validating the signature, without a `Ruleset` check, and without an FDB
-/// transaction. The P2 deliverable is signature check → `Ruleset` validation
-/// stub → FDB serializable optimistic transaction (docs/11-roadmap.md §P2);
-/// witness attestation is P5.
+/// The checks run in edge-to-authority order, each rejection a definitive
+/// `Rejected` ack carrying its reason code:
+///
+/// 1. **Signature** — [`Intent::verify_issuer`] over the canonical,
+///    attestation-excluding preimage. Failed signatures never reach the
+///    validator.
+/// 2. **Issuer binding** — `intent.issuer` must be the connection's
+///    authenticated `remote` id: a peer may not submit intents in another's
+///    name.
+/// 3. **Admission** — the [`PermissiveValidator`] default admits everything;
+///    a linked `Ruleset` rejects with its own reason code.
+/// 4. **Execution** — the configured [`IntentExecutor`]'s future must resolve
+///    before the ack is sent, so a `Committed` outcome implies a durable
+///    commit (RPO 0). With no executor configured the reply is
+///    [`REASON_NO_EXECUTOR`] — the gateway never acks a commit that did not
+///    happen (the pre-existing stub's inverted RPO-0).
 async fn route_intent(
     send: &(dyn Fn(Bytes) + Send + Sync),
-    intent: orrery_protocol::Intent,
-    tick: &AtomicU64,
-    router: &Arc<dyn Router>,
+    intent: Intent,
+    remote: NodeId,
+    executor: &Option<SharedExecutor>,
+    validator: &SharedValidator,
 ) {
-    let _ = router;
-    let t = Tick::new(tick.fetch_add(1, Ordering::Relaxed) + 1);
-    let reply = GatewayReply::IntentAck {
-        intent_id: intent.intent_id,
-        outcome: IntentOutcome::Committed {
-            tick: t,
-            minted: Vec::new(),
+    let intent_id = intent.intent_id;
+
+    // 1. Signature (docs/08-persistence.md §2.2: signature checks at the
+    //    edge, before any transaction work).
+    if !intent.verify_issuer() {
+        let reply = GatewayReply::IntentAck {
+            intent_id,
+            outcome: IntentOutcome::Rejected {
+                reason: REASON_BAD_SIGNATURE,
+            },
+        };
+        send(Bytes::from(encode_stream_frame(&reply)));
+        return;
+    }
+
+    // 2. Issuer binding (the connection's authenticated id is the only
+    //    identity the gateway can trust).
+    if intent.issuer != remote {
+        let reply = GatewayReply::IntentAck {
+            intent_id,
+            outcome: IntentOutcome::Rejected {
+                reason: REASON_ISSUER_MISMATCH,
+            },
+        };
+        send(Bytes::from(encode_stream_frame(&reply)));
+        return;
+    }
+
+    // 3. Admission (the Ruleset stub for now).
+    let precheck = match validator.validate(&intent) {
+        IntentVerdict::Admit(precheck) => precheck,
+        IntentVerdict::Reject { reason } => {
+            let reply = GatewayReply::IntentAck {
+                intent_id,
+                outcome: IntentOutcome::Rejected { reason },
+            };
+            send(Bytes::from(encode_stream_frame(&reply)));
+            return;
+        }
+    };
+    // The FDB executor derives its read set from the intent's ops; the
+    // precheck's named keys are reserved for a Ruleset-linked executor.
+    let _ = precheck;
+
+    // 4. Execution — ack only after the future resolves. An executor error
+    //    becomes a definitive rejection (bounded-retry refusal, §7).
+    let outcome = match executor {
+        None => IntentOutcome::Rejected {
+            reason: REASON_NO_EXECUTOR,
+        },
+        Some(exec) => match exec.execute(&intent).await {
+            Ok(outcome) => outcome,
+            Err(err) => error_outcome(&err),
         },
     };
+    let reply = GatewayReply::IntentAck { intent_id, outcome };
     send(Bytes::from(encode_stream_frame(&reply)));
 }
 

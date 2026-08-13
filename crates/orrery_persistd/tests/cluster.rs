@@ -1,9 +1,10 @@
 //! Multi-node cluster integration tests (P2 gaps #2/#7).
 //!
-//! Exercises the rendezvous-routed multi-node cluster: diffs and reads route to
-//! the node placement assigns, chain replication covers node loss, and the
-//! kill-9 → restart → world-resumes demo path works (RPO 0 intents, bulk
-//! bounded by the journal/replication window).
+//! Exercises the rendezvous-routed multi-node cluster: diffs and reads route
+//! to the node placement assigns, chain replication covers node loss, and the
+//! kill-9 → restart → world-resumes demo path works for the bulk journal.
+//! Intent RPO 0 coverage lives in `tests/intent_commit.rs` — this file has no
+//! intent path (grep `Intent` returns 0 hits here).
 
 use std::collections::HashMap;
 use std::sync::Arc;
