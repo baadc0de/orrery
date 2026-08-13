@@ -71,6 +71,16 @@ async fn run_seed(args: &[&str], scenario: &std::path::Path) -> std::process::Ou
 }
 
 #[cfg(feature = "fdb")]
+async fn wipe_scenario(scenario: &std::path::Path, content_build: &str) {
+    let output = run_seed(
+        &["wipe", "--yes", "--content-build", content_build],
+        scenario,
+    )
+    .await;
+    maybe_assert_success(&output, "pre-wipe");
+}
+
+#[cfg(feature = "fdb")]
 async fn scan_world_rows(db: &Database, grid: GridId) -> Result<Vec<(Vec<u8>, Vec<u8>)>, String> {
     let start = keyspace::world_range_start(grid, CellId::ROOT);
     let end = keyspace::world_range_end(grid, CellId::ROOT);
@@ -198,7 +208,8 @@ async fn fdb_reseed_preserves_persist_ids() {
         .join("scenarios")
         .join("p2demo.toml");
     let source = std::fs::read_to_string(&root).expect("read scenario");
-    let temp = write_temp_scenario("scenario", &source);
+    let temp = write_temp_scenario("scenario", &with_grid(&source, GridId::new(9402), false));
+    wipe_scenario(temp.path(), "demo-2026-08-13").await;
 
     orrery_seed::fdb_network();
     let db = Database::from_path(&fdb_cluster_file().unwrap()).expect("db");
@@ -208,7 +219,9 @@ async fn fdb_reseed_preserves_persist_ids() {
     )
     .await;
     maybe_assert_success(&first, "first apply");
-    let rows1 = scan_world_rows(&db, GridId::ROOT).await.expect("scan1");
+    let rows1 = scan_world_rows(&db, GridId::new(9402))
+        .await
+        .expect("scan1");
     let ids1: Vec<_> = rows1
         .iter()
         .filter_map(|(k, _)| keyspace::decode_world_key(k).map(|(_, _, pid)| pid))
@@ -220,7 +233,9 @@ async fn fdb_reseed_preserves_persist_ids() {
     )
     .await;
     maybe_assert_success(&second, "second apply");
-    let rows2 = scan_world_rows(&db, GridId::ROOT).await.expect("scan2");
+    let rows2 = scan_world_rows(&db, GridId::new(9402))
+        .await
+        .expect("scan2");
     let ids2: Vec<_> = rows2
         .iter()
         .filter_map(|(k, _)| keyspace::decode_world_key(k).map(|(_, _, pid)| pid))
@@ -244,13 +259,14 @@ async fn every_written_value_carries_the_live_tag() {
         .join("smoke.toml");
     let source = std::fs::read_to_string(&root).expect("read scenario");
     let temp = write_temp_scenario("scenario", &with_grid(&source, GridId::new(9401), true));
+    wipe_scenario(temp.path(), "smoke-2026-08-13").await;
 
     let output = run_seed(&["apply", "--allow-opaque"], temp.path()).await;
     maybe_assert_success(&output, "smoke apply");
 
     orrery_seed::fdb_network();
     let db = Database::from_path(&fdb_cluster_file().unwrap()).expect("db");
-    let rows = scan_world_rows(&db, GridId::ROOT)
+    let rows = scan_world_rows(&db, GridId::new(9401))
         .await
         .expect("scan world");
     assert_eq!(rows.len(), 1_000, "smoke writes exactly 1000 world rows");
@@ -284,8 +300,8 @@ async fn oversize_value_is_rejected_at_plan_time() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(
-        String::from_utf8_lossy(&output.stderr).contains("below"),
-        "expected a plan-time size rejection"
+        String::from_utf8_lossy(&output.stderr).contains("100 KB"),
+        "expected a plan-time size rejection naming the 100 KB limit"
     );
 }
 
@@ -300,7 +316,8 @@ async fn fdb_content_version_roundtrips() {
         .join("scenarios")
         .join("p2demo.toml");
     let source = std::fs::read_to_string(&root).expect("read scenario");
-    let temp = write_temp_scenario("scenario", &source);
+    let temp = write_temp_scenario("scenario", &with_grid(&source, GridId::new(9404), false));
+    wipe_scenario(temp.path(), "demo-2026-08-13").await;
     let output = run_seed(
         &["apply", "--profile", "demo", "--allow-opaque"],
         temp.path(),
@@ -327,6 +344,13 @@ async fn wipe_leaves_ckpt_rows_intact() {
     let store = Arc::new(FdbCheckpointStore::connect(&fdb_cluster_file().unwrap()).expect("store"));
     let store: Arc<dyn CheckpointStore> = store.clone();
     let dir = tempfile::tempdir().expect("tempdir");
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("scenarios")
+        .join("p2demo.toml");
+    let source = std::fs::read_to_string(&root).expect("read scenario");
+    let temp = write_temp_scenario("scenario", &with_grid(&source, GridId::new(9406), false));
+    wipe_scenario(temp.path(), "demo-2026-08-13").await;
+
     let rt = CellRuntime::open(&runtime_config(dir.path(), GridId::new(9406)), &store).unwrap();
     for i in 0..4u64 {
         rt.apply(record(GridId::new(9406), CellId::ROOT, i))
@@ -346,11 +370,6 @@ async fn wipe_leaves_ckpt_rows_intact() {
         .unwrap();
     assert!(before.is_some(), "checkpoint row exists before wipe");
 
-    let source = std::fs::read_to_string(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("scenarios/p2demo.toml"),
-    )
-    .expect("read scenario");
-    let temp = write_temp_scenario("scenario", &source);
     let output = run_seed(
         &["wipe", "--yes", "--content-build", "demo-2026-08-13"],
         temp.path(),
@@ -380,8 +399,13 @@ async fn cold_area_load_returns_seeded_entities() {
     let dir = tempfile::tempdir().expect("tempdir");
     let grid = GridId::new(9403);
     let centre = cell(4, 0, 0);
-    let mut cells = centre.neighbors27();
-    cells.push(centre);
+    let cells = centre.neighbors27();
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("scenarios")
+        .join("p2demo.toml");
+    let source = std::fs::read_to_string(&root).expect("read scenario");
+    let temp = write_temp_scenario("scenario", &with_grid(&source, grid, false));
+    wipe_scenario(temp.path(), "demo-2026-08-13").await;
 
     let rt = CellRuntime::open(&runtime_config(dir.path(), grid), &store_ckpt).unwrap();
     for (i, cell) in cells.iter().copied().enumerate() {

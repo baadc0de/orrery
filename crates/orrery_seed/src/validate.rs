@@ -49,7 +49,6 @@ pub fn validate(
     mode: ValidationMode,
 ) -> Result<(), ValidationError> {
     let seed_display = String::from_utf8_lossy(&scenario.seed_material).to_string();
-    let report = plan(scenario, &seed_display);
 
     if scenario.raw.target.count.is_some()
         && scenario.raw.target.gini.is_some()
@@ -62,6 +61,36 @@ pub fn validate(
             "target over-constrained: count + gini + occupied_fraction need more than one knob; remove one or add another solve knob (V8)".to_string(),
         ));
     }
+
+    for (name, decl) in &scenario.raw.archetype {
+        if let Some(size) = decl.declared_size.as_deref() {
+            if let Ok(bytes) = crate::scenario::parse_byte_size(size) {
+                if bytes > 100 * 1024 {
+                    return Err(snippet_error(
+                        source,
+                        size,
+                        format!(
+                            "archetype {name:?} projects a world value of {bytes} B, exceeding the 100 KB hard limit (V9)"
+                        ),
+                    ));
+                }
+            }
+        }
+        if let Some(hex) = decl.bytes.as_deref() {
+            let body = hex.strip_prefix("0x").unwrap_or(hex);
+            if body.len() / 2 > 100 * 1024 {
+                return Err(snippet_error(
+                source,
+                "bytes",
+                format!(
+                    "archetype {name:?} hex escape projects a world value above the 100 KB hard limit (V9)"
+                ),
+            ));
+            }
+        }
+    }
+
+    let report = plan(scenario, &seed_display);
 
     if let Some(max) = scenario.raw.limits.max_entities {
         if report.total_entities > max {
@@ -100,34 +129,6 @@ pub fn validate(
         ));
     }
 
-    for (name, decl) in &scenario.raw.archetype {
-        if let Some(size) = decl.declared_size.as_deref() {
-            if let Ok(bytes) = crate::scenario::parse_byte_size(size) {
-                if bytes > 100 * 1024 {
-                    return Err(snippet_error(
-                        source,
-                        size,
-                        format!(
-                            "archetype {name:?} projects a world value of {bytes} B, above the 100 KB hard limit (V9)"
-                        ),
-                    ));
-                }
-            }
-        }
-        if let Some(hex) = decl.bytes.as_deref() {
-            let body = hex.strip_prefix("0x").unwrap_or(hex);
-            if body.len() / 2 > 100 * 1024 {
-                return Err(snippet_error(
-                    source,
-                    "bytes",
-                    format!(
-                        "archetype {name:?} hex escape projects above the 100 KB world-value limit (V9)"
-                    ),
-                ));
-            }
-        }
-    }
-
     Ok(())
 }
 
@@ -161,4 +162,48 @@ fn find_snippet(source: &str, needle: &str) -> Option<String> {
         return Some(snippet);
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::scenario::Scenario;
+
+    #[test]
+    fn oversize_declared_size_is_rejected_before_plan() {
+        let source = r#"
+schema = 1
+
+[scenario]
+name = "t"
+
+[seed]
+scenario = "t"
+
+[payload]
+class = "opaque"
+
+[archetype.big]
+declared_size = "200KiB"
+
+[[layer]]
+name = "l"
+kind = "uniform"
+bounds = { kind = "box", center = { level = 21, xyz = [0, 0, 0] }, extent_cells = [1, 1, 1] }
+
+[[emit]]
+name = "e"
+count = 1
+archetypes = { big = 1.0 }
+"#;
+        let scenario = Scenario::parse(source)
+            .expect("parses")
+            .resolve(b"t".to_vec())
+            .expect("resolves");
+        let err =
+            validate(source, &scenario, ValidationMode::Plan).expect_err("oversize is rejected");
+        let msg = err.to_string();
+        assert!(msg.contains("200KiB") || msg.contains("204800"), "{msg}");
+        assert!(msg.contains("100 KB"), "{msg}");
+    }
 }
