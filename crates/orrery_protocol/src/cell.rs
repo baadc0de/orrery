@@ -673,7 +673,7 @@ mod tests {
     fn metres_reject_at_non_default_edge() {
         // With a larger cell edge (1 km), the extent is much larger.
         let cell_edge = 1_024_000_f64; // ~7.18 AU half-extent
-                                      // This should still be in range.
+                                       // This should still be in range.
         let in_range = cell_id_from_metres(glam::DVec3::new(1e11, 0.0, 0.0), cell_edge).unwrap();
         assert_eq!(in_range.level(), INTEREST_LEVEL);
 
