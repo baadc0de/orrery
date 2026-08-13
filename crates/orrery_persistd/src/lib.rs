@@ -31,6 +31,7 @@ mod crc;
 pub mod fence;
 pub mod gateway;
 pub mod journal;
+pub mod keyspace;
 pub mod placement;
 pub mod runtime;
 

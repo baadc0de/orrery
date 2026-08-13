@@ -3,18 +3,17 @@
 //! The engine-independent `CellId` encoding lives in `orrery_protocol`; this
 //! module bridges it to `big_space`'s [`Grid`]/[`CellCoord`] so an entity's
 //! interest cell (the replication group) is derived from its grid position.
+//!
+//! Constants and engine-free helpers are re-exported from `orrery_protocol`
+//! so existing callers keep compiling unchanged.
 
-use orrery_protocol::CellId;
+pub use orrery_protocol::{
+    cell_id_from_metres, metres_from_cell_id, shard_of, CellId, DEFAULT_CELL_EDGE_M,
+    INTEREST_LEVEL, SHARD_LEVEL,
+};
 
 #[cfg(feature = "big_space")]
 use crate::SpatialConfig;
-
-/// The interest level (finest, default) — 128 m edge at the default config.
-/// The `CellId` encoding supports levels 0..=21; the interest level is 21.
-pub const INTEREST_LEVEL: u8 = CellId::MAX_LEVEL;
-
-/// The shard level = interest − 3 (one shard cell = 8×8×8 interest cells, D5).
-pub const SHARD_LEVEL: u8 = INTEREST_LEVEL - 3;
 
 /// Convert a `big_space` [`CellCoord`] (the integer grid cell index) into an
 /// interest-level [`CellId`].
@@ -38,12 +37,6 @@ pub fn cell_of(coord: &big_space::prelude::CellCoord, _cfg: &SpatialConfig) -> C
 fn clamp_coord(c: big_space::prelude::GridPrecision) -> i32 {
     let half = 1i64 << (INTEREST_LEVEL - 1);
     c.clamp(-half, half - 1) as i32
-}
-
-/// The shard cell containing an interest cell: its level-18 ancestor.
-#[must_use]
-pub fn shard_of(cell: CellId) -> CellId {
-    cell.ancestor_at(SHARD_LEVEL)
 }
 
 #[cfg(test)]
