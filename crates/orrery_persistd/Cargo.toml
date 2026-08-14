@@ -11,7 +11,7 @@ license = "MIT OR Apache-2.0"
 # isolation, no FoundationDB. Gateway, FDB checkpoint/restore, chain replication,
 # and the Ruleset-linked intent/adjudication paths land in later slices.
 [features]
-default = ["journal-fjall"]
+default = ["journal-fjall", "chain-grpc"]
 # Journal backing store. `journal-fjall` (default) uses fjall 3.x as a keyed
 # append-only log; `journal-raw` (planned) will use raw 128 MiB segment files
 # with a sparse footer index (docs/08-persistence.md §4). Only one may be set.

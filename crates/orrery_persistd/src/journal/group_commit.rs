@@ -116,7 +116,9 @@ pub(crate) struct CommitterState {
     /// Notified once the committer task has exited (releasing its store clone).
     exited: Notify,
     flushing: AtomicBool,
-    committed: Mutex<Lsn>,
+    /// `None` distinguishes a fresh journal from one whose first record at
+    /// LSN 0 has crossed the durability boundary.
+    committed: Mutex<Option<Lsn>>,
     flush_count: AtomicUsize,
     /// Committed records, published for chain replication (§4). Subscribers
     /// that fall behind rescan the journal from their watermark, so a bounded
@@ -129,12 +131,12 @@ impl CommitterState {
         self.flushing.load(Ordering::Acquire)
     }
 
-    fn committed(&self) -> Lsn {
+    fn committed(&self) -> Option<Lsn> {
         *self.committed.lock().expect("committed lock")
     }
 
     fn set_committed(&self, lsn: Lsn) {
-        *self.committed.lock().expect("committed lock") = lsn;
+        *self.committed.lock().expect("committed lock") = Some(lsn);
     }
 
     fn flush_count(&self) -> usize {
@@ -168,7 +170,7 @@ impl CommitterHandle {
     }
 
     /// The highest LSN durably flushed so far.
-    pub(crate) fn committed(&self) -> Lsn {
+    pub(crate) fn committed(&self) -> Option<Lsn> {
         self.state.committed()
     }
 
@@ -202,6 +204,7 @@ pub(crate) fn spawn_committer(
     config: GroupCommitConfig,
     flush: FlushFn,
     published: broadcast::Sender<JournalRecord>,
+    recovered_committed: Option<Lsn>,
 ) -> CommitterHandle {
     let state = Arc::new(CommitterState {
         config,
@@ -210,7 +213,7 @@ pub(crate) fn spawn_committer(
         shutdown: Notify::new(),
         exited: Notify::new(),
         flushing: AtomicBool::new(false),
-        committed: Mutex::new(Lsn::new(0, 0)),
+        committed: Mutex::new(recovered_committed),
         flush_count: AtomicUsize::new(0),
         published,
     });

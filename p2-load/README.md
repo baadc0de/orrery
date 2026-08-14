@@ -84,9 +84,9 @@ agree bucket-for-bucket with the rig's live view. `CellId`, `PersistId` and
 ## Usage
 
 ```sh
-# Start a gateway (in-memory stores for a smoke run; add
+# Start a single-node gateway (in-memory stores for a smoke run; add
 # --fdb-cluster-file for the durable tier):
-persistd --nodes 1 --dir /tmp/p2-node --secret-key <hex>
+persistd --dir /tmp/p2-node --secret-key <hex>
 # …prints {"node_id":"…","endpoint_addr":"EndpointAddr { … }"} on stdout.
 
 # Run the load (values from the persistd line above):
@@ -97,6 +97,22 @@ p2-load --gateway <node_id> --addr 127.0.0.1:7777 \
 # Gate it:
 p2-dashboard --gate run.jsonl
 ```
+
+For the P2 static mirror topology, start the follower first, then the primary
+with the follower's reported `chain_addr` (both sides must use the same shard
+list, if supplied):
+
+```sh
+persistd --dir /tmp/p2-follower --node-id 2 --chain-epoch 1 \
+  --chain-primary 1 --chain-listen 127.0.0.1:7002
+persistd --dir /tmp/p2-primary --node-id 1 --chain-epoch 1 \
+  --chain-follower 2@127.0.0.1:7002
+```
+
+The primary still acknowledges bulk writes from its own journal; the follower
+is asynchronous and never exposes a client gateway. The topology improves
+recovery coverage but does not yet implement primary promotion or the full P2
+kill-9 comparator.
 
 The default `--entities 10000 --diff-hz 2` needs ≥ 125 sessions at the
 default 64-byte payload (10 000 × 2 Hz = 20 000 diffs/s vs 160 diffs/s per

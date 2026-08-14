@@ -14,6 +14,8 @@
 //! 128 MiB file in this slice — the `journal-raw` feature is the planned
 //! hand-rolled segment-file backend (D11 offers either).
 
+#[cfg(feature = "chain-grpc")]
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use fjall::{Database, Keyspace, PersistMode};
@@ -36,6 +38,14 @@ const CHAIN_STATE_KS: &str = "chain_state";
 
 /// The fjall keyspace holding LSN-keyed journal records.
 const RECORDS_KS: &str = "records";
+/// LSN keys for records authored by this journal (and therefore eligible for
+/// outbound chain replication). Mirrored records are deliberately absent.
+const ORIGINATED_RECORDS_KS: &str = "originated_records";
+/// Journal-local schema metadata. Kept separate from record data so an
+/// interrupted migration can be retried idempotently on the next open.
+const JOURNAL_META_KS: &str = "journal_meta";
+const ORIGINATED_INDEX_VERSION_KEY: &[u8] = b"originated_records_version";
+const ORIGINATED_INDEX_VERSION: &[u8] = b"1";
 /// The fjall keyspace holding per-segment metadata (future: cell index footers).
 const SEGMENTS_KS: &str = "segments";
 
@@ -43,6 +53,7 @@ const SEGMENTS_KS: &str = "segments";
 pub struct Journal {
     db: Database,
     records: Keyspace,
+    originated_records: Keyspace,
     /// Monotonic next-LSN cursor, guarded by a mutex (segment advances too).
     cursor: std::sync::Mutex<Lsn>,
     segment_size: u64,
@@ -63,12 +74,20 @@ impl Journal {
         let records = db
             .keyspace(RECORDS_KS, fjall::KeyspaceCreateOptions::default)
             .map_err(|e| JournalError::Store(format!("open records ks: {e}")))?;
+        let originated_records = db
+            .keyspace(ORIGINATED_RECORDS_KS, fjall::KeyspaceCreateOptions::default)
+            .map_err(|e| JournalError::Store(format!("open originated records ks: {e}")))?;
+        let metadata = db
+            .keyspace(JOURNAL_META_KS, fjall::KeyspaceCreateOptions::default)
+            .map_err(|e| JournalError::Store(format!("open journal metadata ks: {e}")))?;
         let _segments = db
             .keyspace(SEGMENTS_KS, fjall::KeyspaceCreateOptions::default)
             .map_err(|e| JournalError::Store(format!("open segments ks: {e}")))?;
 
         // Recover the next LSN from the last stored record so a reopened
         // journal continues without collisions and replay starts correctly.
+        migrate_originated_index(&db, &records, &originated_records, &metadata)?;
+        let recovered_committed = last_stored_lsn(&records)?;
         let next_lsn = next_lsn_after(&records)?;
 
         let db_flush = Arc::new({
@@ -80,11 +99,17 @@ impl Journal {
         });
 
         let (published, _) = broadcast::channel(PUBLISH_CAPACITY);
-        let committer = spawn_committer(config.commit.clone(), db_flush, published.clone());
+        let committer = spawn_committer(
+            config.commit.clone(),
+            db_flush,
+            published.clone(),
+            recovered_committed,
+        );
 
         Ok(Self {
             db,
             records,
+            originated_records,
             cursor: std::sync::Mutex::new(next_lsn),
             segment_size: 128 * 1024 * 1024,
             committer,
@@ -198,23 +223,18 @@ impl Journal {
             (lsn, key, encoded)
         };
 
+        let mut batch = self.db.batch();
+        batch.insert(&self.records, key, encoded);
+        if publish {
+            batch.insert(&self.originated_records, key, b"");
+        }
         #[cfg(feature = "chain-grpc")]
         if let Some((index, index_key, provenance)) = index {
-            let mut batch = self.db.batch();
-            batch.insert(&self.records, key, encoded);
             batch.insert(&index, index_key, provenance);
-            batch
-                .commit()
-                .map_err(|e| JournalError::Store(format!("insert mirrored record: {e}")))?;
-        } else {
-            self.records
-                .insert(key, encoded)
-                .map_err(|e| JournalError::Store(format!("insert record: {e}")))?;
         }
-        #[cfg(not(feature = "chain-grpc"))]
-        self.records
-            .insert(key, encoded)
-            .map_err(|e| JournalError::Store(format!("insert record: {e}")))?;
+        batch
+            .commit()
+            .map_err(|e| JournalError::Store(format!("insert journal record: {e}")))?;
 
         let handle = Arc::new(AppendHandle::new(lsn));
         self.committer
@@ -224,6 +244,11 @@ impl Journal {
 
     /// The highest LSN durably flushed so far.
     pub fn committed(&self) -> Lsn {
+        self.committer.committed().unwrap_or(Lsn::new(0, 0))
+    }
+
+    /// The actual durable boundary, preserving `None` for an empty journal.
+    pub(crate) fn committed_watermark(&self) -> Option<Lsn> {
         self.committer.committed()
     }
 
@@ -249,6 +274,32 @@ impl Journal {
     pub fn scan_from<'a>(&'a self, from: Lsn) -> JournalScan<'a> {
         let start = lsn_key(from);
         let iter = self.records.range(start..).map(decode_kv);
+        JournalScan {
+            iter: Box::new(iter),
+        }
+    }
+
+    /// Scan only records authored by this journal, in local LSN order.
+    ///
+    /// Outbound chain catch-up uses this index instead of the complete replay
+    /// journal so a node that also mirrors another primary never sends those
+    /// mirrored records back around a replication ring.
+    pub(crate) fn scan_originated_from<'a>(&'a self, from: Lsn) -> JournalScan<'a> {
+        let start = lsn_key(from);
+        let records = &self.records;
+        let iter = self.originated_records.range(start..).map(move |entry| {
+            let key = entry
+                .key()
+                .map_err(|e| JournalError::Store(format!("scan originated records: {e}")))?;
+            let value = records
+                .get(&key)
+                .map_err(|e| JournalError::Store(format!("read originated record: {e}")))?
+                .ok_or_else(|| JournalError::Corrupt {
+                    lsn: parse_lsn_key(&key).unwrap_or(Lsn::new(0, 0)),
+                    msg: "originated record index points to a missing record".into(),
+                })?;
+            decode_pair(&key, &value)
+        });
         JournalScan {
             iter: Box::new(iter),
         }
@@ -381,14 +432,121 @@ fn prefix_successor(prefix: &[u8]) -> Option<Vec<u8>> {
     Some(end)
 }
 
+/// Upgrade journals written before the originated-record index existed.
+///
+/// Locally authored rows have always stored the same LSN in their key and in
+/// the encoded record. Replicated rows preserve the origin LSN in the encoded
+/// record while receiving an independent local key, so that equality is the
+/// compatibility discriminator. The durable gRPC provenance index resolves
+/// the one ambiguous case where an origin LSN happens to equal the follower's
+/// local key; an already-present originated row is always trusted because new
+/// writes create it atomically with the journal row.
+fn migrate_originated_index(
+    db: &Database,
+    records: &Keyspace,
+    originated_records: &Keyspace,
+    metadata: &Keyspace,
+) -> Result<(), JournalError> {
+    if metadata
+        .get(ORIGINATED_INDEX_VERSION_KEY)
+        .map_err(|e| JournalError::Store(format!("read originated index version: {e}")))?
+        .is_some_and(|value| value.as_ref() == ORIGINATED_INDEX_VERSION)
+    {
+        return Ok(());
+    }
+
+    #[cfg(feature = "chain-grpc")]
+    let unresolved_provenance = {
+        let chain_records = db
+            .keyspace(CHAIN_RECORDS_KS, fjall::KeyspaceCreateOptions::default)
+            .map_err(|e| JournalError::Store(format!("open chain record index: {e}")))?;
+        let mut provenance_counts = HashMap::<Lsn, usize>::new();
+        for entry in chain_records.iter() {
+            let entry = entry
+                .into_inner()
+                .map_err(|e| JournalError::Store(format!("scan chain record index: {e}")))?;
+            let key = entry.0.as_ref();
+            if key.len() < 16 {
+                return Err(JournalError::Corrupt {
+                    lsn: Lsn::new(0, 0),
+                    msg: "chain provenance key is shorter than an LSN".into(),
+                });
+            }
+            let origin =
+                parse_lsn_key(&key[key.len() - 16..]).ok_or_else(|| JournalError::Corrupt {
+                    lsn: Lsn::new(0, 0),
+                    msg: "invalid origin LSN in chain provenance key".into(),
+                })?;
+            *provenance_counts.entry(origin).or_default() += 1;
+        }
+
+        // A mirrored row whose local key differs from its embedded origin is
+        // already unambiguous. Consume its provenance count so a distinct
+        // locally-authored row at the same LSN is not accidentally excluded.
+        for entry in records.iter() {
+            let stored = decode_kv(entry)?;
+            if stored.lsn != stored.record.lsn {
+                if let Some(count) = provenance_counts.get_mut(&stored.record.lsn) {
+                    *count = count.saturating_sub(1);
+                }
+            }
+        }
+        provenance_counts
+    };
+
+    for entry in records.iter() {
+        let stored = decode_kv(entry)?;
+        let key = lsn_key(stored.lsn);
+        if originated_records
+            .contains_key(key)
+            .map_err(|e| JournalError::Store(format!("read originated record index: {e}")))?
+        {
+            continue;
+        }
+        if stored.lsn != stored.record.lsn {
+            continue;
+        }
+        #[cfg(feature = "chain-grpc")]
+        if unresolved_provenance
+            .get(&stored.record.lsn)
+            .is_some_and(|count| *count > 0)
+        {
+            continue;
+        }
+        originated_records
+            .insert(key, b"")
+            .map_err(|e| JournalError::Store(format!("backfill originated record: {e}")))?;
+    }
+
+    metadata
+        .insert(ORIGINATED_INDEX_VERSION_KEY, ORIGINATED_INDEX_VERSION)
+        .map_err(|e| JournalError::Store(format!("write originated index version: {e}")))?;
+    db.persist(PersistMode::SyncData)
+        .map_err(|e| JournalError::Store(format!("persist originated index migration: {e}")))
+}
+
 /// Recover the next LSN from the last record stored, or a fresh start.
 ///
 /// This is an approximation: it advances past the last record's value length.
 /// Segment boundaries are not correctness-critical — only monotonicity of the
 /// LSN is — so the next append recomputes the exact position.
 fn next_lsn_after(records: &Keyspace) -> Result<Lsn, JournalError> {
-    let Some(last) = records.iter().next_back() else {
+    let Some(lsn) = last_stored_lsn(records)? else {
         return Ok(Lsn::new(0, 0));
+    };
+    let last = records
+        .get(lsn_key(lsn))
+        .map_err(|e| JournalError::Store(format!("last record: {e}")))?
+        .ok_or_else(|| JournalError::Corrupt {
+            lsn,
+            msg: "last record disappeared during open".into(),
+        })?;
+    Ok(advance_from(lsn, last.len() as u64))
+}
+
+fn last_stored_lsn(records: &Keyspace) -> Result<Option<Lsn>, JournalError> {
+    let Some(last) = records.iter().next_back() else {
+        return Ok(None);
     };
     let kv = last
         .into_inner()
@@ -397,7 +555,7 @@ fn next_lsn_after(records: &Keyspace) -> Result<Lsn, JournalError> {
         lsn: Lsn::new(0, 0),
         msg: "unparseable last record key".into(),
     })?;
-    Ok(advance_from(lsn, kv.1.len() as u64))
+    Ok(Some(lsn))
 }
 
 /// Encode an LSN as a 16-byte big-endian key (byte order == LSN order).
@@ -457,15 +615,18 @@ fn decode_kv(kv: fjall::Guard) -> Result<StoredRecord, JournalError> {
     let kv = kv
         .into_inner()
         .map_err(|e| JournalError::Store(format!("scan: {e}")))?;
-    let lsn = parse_lsn_key(kv.0.as_ref()).ok_or_else(|| JournalError::Corrupt {
+    decode_pair(kv.0.as_ref(), kv.1.as_ref())
+}
+
+fn decode_pair(key: &[u8], value: &[u8]) -> Result<StoredRecord, JournalError> {
+    let lsn = parse_lsn_key(key).ok_or_else(|| JournalError::Corrupt {
         lsn: Lsn::new(0, 0),
         msg: "unparseable key in scan".into(),
     })?;
-    let record: JournalRecord =
-        postcard::from_bytes(kv.1.as_ref()).map_err(|e| JournalError::Corrupt {
-            lsn,
-            msg: format!("decode: {e}"),
-        })?;
+    let record: JournalRecord = postcard::from_bytes(value).map_err(|e| JournalError::Corrupt {
+        lsn,
+        msg: format!("decode: {e}"),
+    })?;
     Ok(StoredRecord { lsn, record })
 }
 
@@ -528,5 +689,120 @@ mod tests {
         );
 
         journal.close().await.expect("close");
+    }
+
+    #[cfg(feature = "chain-grpc")]
+    #[tokio::test]
+    async fn legacy_journal_backfills_only_originated_records_for_catch_up() {
+        let primary_dir = tempfile::tempdir().expect("primary tempdir");
+        let follower_dir = tempfile::tempdir().expect("follower tempdir");
+
+        // Reproduce the on-disk shape left by a version that had records and
+        // an empty originated_records keyspace but no migration marker.
+        let db = Database::builder(primary_dir.path())
+            .manual_journal_persist(true)
+            .open()
+            .expect("open legacy db");
+        let records = db
+            .keyspace(RECORDS_KS, fjall::KeyspaceCreateOptions::default)
+            .expect("legacy records");
+        db.keyspace(ORIGINATED_RECORDS_KS, fjall::KeyspaceCreateOptions::default)
+            .expect("empty legacy originated index");
+
+        let mut local = mk_record(1);
+        local.lsn = Lsn::new(0, 0);
+        records
+            .insert(lsn_key(local.lsn), postcard::to_stdvec(&local).unwrap())
+            .unwrap();
+
+        let mut mirrored = mk_record(2);
+        mirrored.lsn = Lsn::new(7, 700);
+        records
+            .insert(
+                lsn_key(Lsn::new(0, 100)),
+                postcard::to_stdvec(&mirrored).unwrap(),
+            )
+            .unwrap();
+
+        // Exercise the otherwise ambiguous collision: the mirrored origin LSN
+        // equals its follower-local key. Durable gRPC provenance identifies it
+        // as mirrored, so migration must still exclude it.
+        let mut colliding_mirror = mk_record(3);
+        colliding_mirror.lsn = Lsn::new(0, 200);
+        records
+            .insert(
+                lsn_key(colliding_mirror.lsn),
+                postcard::to_stdvec(&colliding_mirror).unwrap(),
+            )
+            .unwrap();
+        let chain_records = db
+            .keyspace(CHAIN_RECORDS_KS, fjall::KeyspaceCreateOptions::default)
+            .expect("legacy chain provenance");
+        chain_records
+            .insert(
+                chain_record_key(b"legacy-chain", colliding_mirror.lsn),
+                b"provenance",
+            )
+            .unwrap();
+        db.persist(PersistMode::SyncData)
+            .expect("persist legacy db");
+        drop(chain_records);
+        drop(records);
+        drop(db);
+
+        let primary = Arc::new(
+            Journal::open(&JournalConfig {
+                dir: primary_dir.path().to_path_buf(),
+                commit: GroupCommitConfig::default(),
+            })
+            .expect("upgrade legacy journal"),
+        );
+        let originated = primary
+            .scan_originated_from(Lsn::new(0, 0))
+            .collect::<Result<Vec<_>, _>>()
+            .expect("scan migrated originated index");
+        assert_eq!(
+            originated
+                .iter()
+                .map(|stored| stored.record.entity)
+                .collect::<Vec<_>>(),
+            vec![orrery_protocol::PersistId::new(1)],
+            "migration must backfill local history without amplifying mirrors"
+        );
+
+        let follower = Arc::new(
+            Journal::open(&JournalConfig {
+                dir: follower_dir.path().to_path_buf(),
+                commit: GroupCommitConfig::default(),
+            })
+            .expect("open follower"),
+        );
+        let sink = Arc::new(crate::journal::JournalChainSink::new(Arc::clone(&follower)));
+        let transport = Arc::new(crate::journal::MemChainTransport::new(sink));
+        let replicator = crate::journal::spawn_chain(
+            Arc::clone(&primary),
+            transport,
+            &crate::journal::ChainConfig::default(),
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while follower.scan_from(Lsn::new(0, 0)).count() != 1 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "migrated local history did not catch up"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let caught_up = follower
+            .scan_from(Lsn::new(0, 0))
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            caught_up[0].record.entity,
+            orrery_protocol::PersistId::new(1)
+        );
+
+        replicator.shutdown().await;
+        primary.close().await.unwrap();
+        follower.close().await.unwrap();
     }
 }
