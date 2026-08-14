@@ -375,76 +375,120 @@ fn parse_lsn(raw: &str) -> Result<orrery_protocol::Lsn> {
 async fn read_gateway_state(cli: &Cli, expected: &[DiffEvidence]) -> Result<Vec<RecoveredDiff>> {
     let (endpoint, _) = bind_endpoint(None).await?;
     let conn = dial(&endpoint, cli.addr, cli.gateway).await?;
-    let wanted_ids = expected.iter().map(|diff| diff.entity).collect();
+    let wanted_ids: BTreeSet<_> = expected.iter().map(|diff| diff.entity).collect();
 
-    // `CellId::ROOT` is a covering storage read: cold reads scan its whole
-    // subtree (every root-grid cell).  Do this once rather than querying only
-    // the cells named by pre-kill acknowledgements. An entity may have moved
-    // to a different cell in a later valid write, and that successor is the
-    // authoritative state recovery must compare. AreaPage does not encode a
-    // source cell per entity, so the returned page cell (ROOT) is retained as
-    // the snapshot scope rather than guessed from stale evidence.
-    let cell = CellId::ROOT;
+    // ROOT is only a covering discovery scan; its reply cell is not evidence
+    // of the storage cell for every returned row.
+    let root = read_snapshot_pages(&conn, &[CellId::ROOT]).await?;
+    let root_diffs = recovered_snapshot_diffs(wanted_ids.clone(), root)?;
+
+    // The rig's closed-form trajectory maps a recovered synthetic
+    // `(entity,tick)` to precisely one storage leaf. Re-read those leaves so
+    // the AreaPage cell retained below is a physical identity assertion. This
+    // admits valid successors that moved after their last pre-kill ack without
+    // treating the enclosing ROOT page as their cell.
+    let inventory: BTreeMap<_, _> = recovery_inventory(cli)?
+        .into_iter()
+        .map(|placement| (placement.entity, placement))
+        .collect();
+    let cells: Vec<_> = root_diffs
+        .iter()
+        .map(|diff| {
+            let placement = inventory.get(&diff.entity).with_context(|| {
+                format!("recovered entity {:?} is absent from P2 inventory", diff.entity)
+            })?;
+            Ok(moved_cell(placement, diff.tick.0))
+        })
+        .collect::<Result<BTreeSet<_>>>()?
+        .into_iter()
+        .collect();
+    let leaves = read_snapshot_pages(&conn, &cells).await?;
+    endpoint.close().await;
+    recovered_snapshot_diffs(wanted_ids, leaves)
+}
+
+/// Load the same inventory used by the P2 traffic generator.
+fn recovery_inventory(cli: &Cli) -> Result<Inventory> {
+    match &cli.manifest {
+        Some(path) => Ok(ManifestInventory::load(path)
+            .with_context(|| format!("load manifest {}", path.display()))?
+            .inventory),
+        None => Ok(synthetic_inventory(cli.entities, cli.cells)),
+    }
+}
+
+/// Read complete area pages for the requested physical cells.
+async fn read_snapshot_pages(
+    conn: &Connection,
+    cells: &[CellId],
+) -> Result<BTreeMap<CellId, BTreeMap<u32, (Vec<PersistId>, Vec<Bytes>)>>> {
+    let wanted: BTreeSet<_> = cells.iter().copied().collect();
+    if wanted.is_empty() {
+        return Ok(BTreeMap::new());
+    }
     send_msg(
-        &conn,
+        conn,
         &GatewayMsg::Subscribe {
             grid: GridId::ROOT,
-            cells: vec![cell],
+            cells: cells.to_vec(),
         },
     );
     let mut chunks = BTreeMap::new();
-    let mut total = None;
-    while total.map_or(true, |n| chunks.len() < n as usize) {
-        match recv_reply(&conn, Duration::from_secs(10)).await? {
-            GatewayReply::AreaPage {
-                cell: reply_cell,
-                page,
-            } if reply_cell == cell => {
-                total = Some(page.total_chunks);
-                chunks.insert(page.chunk_index, (page.entities, page.payloads));
+    let mut totals = BTreeMap::new();
+    while wanted.iter().any(|cell| {
+        totals
+            .get(cell)
+            .is_none_or(|total| chunks.get(cell).map_or(0, BTreeMap::len) < *total as usize)
+    }) {
+        match recv_reply(conn, Duration::from_secs(10)).await? {
+            GatewayReply::AreaPage { cell, page } if wanted.contains(&cell) => {
+                totals.insert(cell, page.total_chunks);
+                chunks
+                    .entry(cell)
+                    .or_insert_with(BTreeMap::new)
+                    .insert(page.chunk_index, (page.entities, page.payloads));
             }
-            GatewayReply::AreaLoadError { cell: bad, .. } if bad == cell => {
+            GatewayReply::AreaLoadError { cell, .. } if wanted.contains(&cell) => {
                 bail!("gateway recovery read failed for {cell}")
             }
             _ => {}
         }
     }
-    endpoint.close().await;
-    recovered_snapshot_diffs(wanted_ids, cell, chunks)
+    Ok(chunks)
 }
 
-/// Decode and filter one covering root-grid snapshot.
+/// Decode and filter physical-cell pages, retaining each response cell.
 ///
-/// The protocol tags the whole page with the requested cell, not each row's
-/// storage cell. Callers therefore pass the snapshot scope (`CellId::ROOT`)
-/// rather than attempting to recover a row cell from acknowledgement history.
+/// Callers must use leaf pages for a storage-cell identity proof; ROOT pages
+/// are suitable only for discovery.
 fn recovered_snapshot_diffs(
     wanted_ids: BTreeSet<PersistId>,
-    snapshot_cell: CellId,
-    chunks: BTreeMap<u32, (Vec<PersistId>, Vec<Bytes>)>,
+    pages: BTreeMap<CellId, BTreeMap<u32, (Vec<PersistId>, Vec<Bytes>)>>,
 ) -> Result<Vec<RecoveredDiff>> {
     let mut actual = BTreeMap::new();
-    for (_, (ids, payloads)) in chunks {
-        for (entity, payload) in ids.into_iter().zip(payloads) {
-            if !wanted_ids.contains(&entity) {
-                continue;
-            }
-            if payload.len() < 16 {
-                bail!("recovered payload for {entity:?} lacks synthetic tick");
-            }
-            let tick = Tick::new(u64::from_le_bytes(
-                payload[8..16].try_into().expect("length checked"),
-            ));
-            actual.insert(
-                entity,
-                RecoveredDiff {
-                    grid: GridId::ROOT,
-                    cell: snapshot_cell,
+    for (cell, chunks) in pages {
+        for (_, (ids, payloads)) in chunks {
+            for (entity, payload) in ids.into_iter().zip(payloads) {
+                if !wanted_ids.contains(&entity) {
+                    continue;
+                }
+                if payload.len() < 16 {
+                    bail!("recovered payload for {entity:?} lacks synthetic tick");
+                }
+                let tick = Tick::new(u64::from_le_bytes(
+                    payload[8..16].try_into().expect("length checked"),
+                ));
+                actual.insert(
                     entity,
-                    tick,
-                    payload_digest: blake3::hash(&payload).to_hex().to_string(),
-                },
-            );
+                    RecoveredDiff {
+                        grid: GridId::ROOT,
+                        cell,
+                        entity,
+                        tick,
+                        payload_digest: blake3::hash(&payload).to_hex().to_string(),
+                    },
+                );
+            }
         }
     }
     Ok(actual.into_values().collect())
@@ -1721,23 +1765,24 @@ mod tests {
                 .to_string(),
         };
 
-        // The recovery reader receives a single root-subtree page. The
-        // successor row lives in `successor_cell`, which is deliberately not
-        // among the historical acknowledgement cells; the page protocol
-        // reports ROOT as its enclosing snapshot scope.
+        // The leaf re-read is deliberately not limited to the historical ack
+        // cell: a valid successor may have moved, but its returned page cell
+        // is still retained as strict storage-cell evidence.
         assert_ne!(acknowledged_cell, successor_cell);
         let recovered = recovered_snapshot_diffs(
             [expected.entity].into_iter().collect(),
-            CellId::ROOT,
             BTreeMap::from([(
-                0,
-                (
-                    vec![entity, PersistId::new(999)],
-                    vec![
-                        synthetic_payload(entity, 266, 64),
-                        synthetic_payload(PersistId::new(999), 266, 64),
-                    ],
-                ),
+                successor_cell,
+                BTreeMap::from([(
+                    0,
+                    (
+                        vec![entity, PersistId::new(999)],
+                        vec![
+                            synthetic_payload(entity, 266, 64),
+                            synthetic_payload(PersistId::new(999), 266, 64),
+                        ],
+                    ),
+                )]),
             )]),
         )
         .unwrap();
@@ -1745,7 +1790,7 @@ mod tests {
         assert_eq!(recovered.len(), 1, "unwanted rows are filtered");
         assert_eq!(recovered[0].entity, entity);
         assert_eq!(recovered[0].tick, Tick::new(266));
-        assert_eq!(recovered[0].cell, CellId::ROOT);
+        assert_eq!(recovered[0].cell, successor_cell);
         assert_ne!(recovered[0].payload_digest, expected.payload_digest);
     }
 
