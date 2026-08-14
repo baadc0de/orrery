@@ -120,16 +120,34 @@ default 64-byte payload (10 000 × 2 Hz = 20 000 diffs/s vs 160 diffs/s per
 session); the startup assert enforces this rather than letting you measure a
 queue. For a quick smoke, `--entities 1000 --sessions 13` clears the bar.
 
-## Kill-9 restart slice
+## Two-process kill-9 gate
 
-Set `ORRERY_FDB_CLUSTER_FILE`, `PERSISTD_BIN`, and `P2_LOAD_BIN`, then run
-`scripts/p2-kill9-gate.sh`. It runs the calibrated 10k/128-cell load, kills a
-single FDB-backed persistd with `SIGKILL`, restarts it on the same journal and
-writes an artifact JSON file. `--self-test` verifies its prerequisite guard.
-It exits non-zero after the slice because no checked-in reader can compare all
-pre-kill acknowledgements after restart; it never claims the full P2 gate.
-Append `journal_commit_ms` from persistd metrics before dashboard gating. This
-is not distributed chain replication or failover coverage.
+`scripts/p2-kill9-gate.sh` is the P2 crash/recovery regression harness. It
+requires an FDB-enabled `persistd`, `p2-load`, `p2-evidence-verify`, and
+`p2-dashboard` binary plus `ORRERY_FDB_CLUSTER_FILE`:
+
+```sh
+ORRERY_FDB_CLUSTER_FILE=/path/to/fdb.cluster \
+PERSISTD_BIN=target/release/persistd \
+P2_LOAD_BIN=p2-load/target/release/p2-load \
+P2_DASHBOARD_BIN=p2-dashboard/target/release/p2-dashboard \
+scripts/p2-kill9-gate.sh
+```
+
+The harness starts a passive static follower before the fenced primary, drives
+the calibrated 10k-entity/128-cell load and durable ack log, sends the primary
+`SIGKILL`, and starts the follower with `--promote-from 1`. The verifier
+compares the promoted gateway/FDB state to the eligible acknowledgements at the
+reported recovery cutoff: final bulk write per entity and every intent outcome.
+It then proves a new process carrying the old primary identity cannot pass FDB
+fence admission. Finally it folds the primary/promoted `--metrics-jsonl`
+records into the load JSONL and invokes `p2-dashboard --gate` for all four D16
+series. Only then does it write `artifact.json` with `"result": "pass"`.
+
+The script will never overwrite an existing output directory (`P2_GATE_OUT`)
+and its exit trap terminates surviving child processes. `--self-test` is an
+offline structural test for the required proof stages; it is not a durability
+claim.
 
 ## Options
 

@@ -128,6 +128,22 @@ pub struct Cli {
     #[arg(long)]
     pub ack_log: Option<PathBuf>,
 
+    /// Verify an ack log against the promoted gateway and durable intent rows.
+    #[arg(long)]
+    pub verify_recovery: bool,
+
+    /// FoundationDB cluster file for `--verify-recovery`.
+    #[arg(long)]
+    pub fdb_cluster_file: Option<PathBuf>,
+
+    /// Adopted journal watermark reported by the promoted follower.
+    #[arg(long)]
+    pub recovery_cutoff: Option<String>,
+
+    /// Machine-readable report path for `--verify-recovery`.
+    #[arg(long)]
+    pub output: Option<PathBuf>,
+
     /// Diff payload size in bytes. 64 matches the D16 flush-budget math in
     /// `UplinkScheduler::flush` (`size = payload + 64`).
     #[arg(long, default_value_t = DEFAULT_DIFF_PAYLOAD_BYTES)]

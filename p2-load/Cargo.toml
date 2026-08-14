@@ -21,6 +21,8 @@ path = "src/main.rs"
 [dependencies]
 orrery_protocol = { path = "../crates/orrery_protocol" }
 orrery_persist_client = { path = "../crates/orrery_persist_client" }
+orrery_persistd = { path = "../crates/orrery_persistd", features = ["fdb"] }
+foundationdb = { version = "0.11", default-features = false, features = ["fdb-7_3"] }
 # Versions mirror the root workspace's D14 pins exactly (a standalone
 # `[workspace]` cannot inherit `workspace.dependencies`).
 iroh = "1.0.3"

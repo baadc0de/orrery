@@ -49,28 +49,31 @@ use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::net::SocketAddr;
 use std::path::Path;
 use std::process::ExitCode;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use bytes::Bytes;
 use clap::Parser;
 use futures::FutureExt;
 use iroh::endpoint::Connection;
 use iroh::{Endpoint, EndpointAddr, SecretKey};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use orrery_persist_client::config::PersistClientConfig;
 use orrery_persist_client::{IntentQueue, UplinkScheduler};
-use orrery_protocol::channels::{Channel, encode_datagram, encode_stream_frame, untag};
+use orrery_protocol::channels::{encode_datagram, encode_stream_frame, untag, Channel};
 use orrery_protocol::{
     Attestation, CellId, DiffUplink, Epoch, GatewayMsg, GatewayReply, GridId, Intent, IntentOp,
     IntentOutcome, NodeId, PersistId, RecordKind, Tick,
 };
 
 use cli::Cli;
-use evidence::{AckRecord, DiffEvidence, IntentOutcomeEvidence};
+use evidence::{
+    compare_recovery, AckRecord, DiffEvidence, IntentOutcomeEvidence, RecoveredDiff,
+    RecoveredEvidence,
+};
 use telemetry::{RunContext, TelemetrySink};
 
 /// The gateway ALPN (matches `orrery_persistd::gateway::GATEWAY_ALPN` and the
@@ -129,6 +132,10 @@ async fn run() -> Result<()> {
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
         .init();
+
+    if cli.verify_recovery {
+        return verify_recovery(&cli).await;
+    }
 
     // ── Inventory: manifest or deterministic synthetic placement ─────────
     let inventory = match &cli.manifest {
@@ -246,6 +253,207 @@ async fn run() -> Result<()> {
     // drop time.
     rig_endpoint.close().await;
     Ok(())
+}
+
+#[derive(Debug, Serialize)]
+struct RecoveryVerificationReport {
+    pass: bool,
+    recovery_cutoff: String,
+    ack_records: usize,
+    eligible_bulk_acks: usize,
+    bulk_checked: usize,
+    intents_checked: usize,
+    mismatches: Vec<String>,
+}
+
+async fn verify_recovery(cli: &Cli) -> Result<()> {
+    let ack_path = cli
+        .ack_log
+        .as_ref()
+        .context("--verify-recovery requires --ack-log")?;
+    let cluster = cli
+        .fdb_cluster_file
+        .as_ref()
+        .context("--verify-recovery requires --fdb-cluster-file")?;
+    let cutoff_text = cli
+        .recovery_cutoff
+        .as_ref()
+        .context("--verify-recovery requires --recovery-cutoff")?;
+    let output = cli
+        .output
+        .as_ref()
+        .context("--verify-recovery requires --output")?;
+    let cutoff = parse_lsn(cutoff_text)?;
+    let records = read_ack_records(ack_path)?;
+    let eligible: Vec<AckRecord> = records
+        .iter()
+        .filter(|r| match r {
+            AckRecord::Diff(d) => d.lsn <= cutoff,
+            AckRecord::Intent { .. } => true,
+        })
+        .cloned()
+        .collect();
+    let expected: Vec<DiffEvidence> = eligible
+        .iter()
+        .filter_map(|r| match r {
+            AckRecord::Diff(d) => Some(d.clone()),
+            _ => None,
+        })
+        .collect();
+    let diffs = read_gateway_state(cli, &expected).await?;
+    let intents = read_intent_rows(cluster, &eligible).await?;
+    let compared = compare_recovery(&eligible, &RecoveredEvidence { diffs, intents });
+    let report = RecoveryVerificationReport {
+        pass: compared.passes(),
+        recovery_cutoff: cutoff.to_string(),
+        ack_records: records.len(),
+        eligible_bulk_acks: expected.len(),
+        bulk_checked: compared.bulk_checked,
+        intents_checked: compared.intents_checked,
+        mismatches: compared
+            .mismatches
+            .iter()
+            .map(|m| format!("{m:?}"))
+            .collect(),
+    };
+    let tmp = output.with_extension("tmp");
+    std::fs::write(&tmp, serde_json::to_vec_pretty(&report)?)?;
+    std::fs::rename(tmp, output)?;
+    if !report.pass {
+        bail!("recovery verification failed; see {}", output.display());
+    }
+    Ok(())
+}
+
+fn read_ack_records(path: &Path) -> Result<Vec<AckRecord>> {
+    BufReader::new(std::fs::File::open(path)?)
+        .lines()
+        .enumerate()
+        .filter_map(|(n, line)| match line {
+            Ok(s) if s.trim().is_empty() => None,
+            Ok(s) => Some(
+                serde_json::from_str(&s)
+                    .with_context(|| format!("parse {}:{}", path.display(), n + 1)),
+            ),
+            Err(e) => Some(Err(e.into())),
+        })
+        .collect()
+}
+
+fn parse_lsn(raw: &str) -> Result<orrery_protocol::Lsn> {
+    if let Some((s, o)) = raw.split_once(':') {
+        return Ok(orrery_protocol::Lsn::new(
+            s.trim().parse()?,
+            o.trim().parse()?,
+        ));
+    }
+    let values: Vec<u64> = raw
+        .split(|c: char| !c.is_ascii_digit())
+        .filter(|s| !s.is_empty())
+        .map(str::parse)
+        .collect::<std::result::Result<_, _>>()?;
+    if values.len() == 2 {
+        Ok(orrery_protocol::Lsn::new(values[0], values[1]))
+    } else {
+        bail!("invalid --recovery-cutoff {raw:?}; expected segment:offset")
+    }
+}
+
+async fn read_gateway_state(cli: &Cli, expected: &[DiffEvidence]) -> Result<Vec<RecoveredDiff>> {
+    let endpoint = bind_endpoint(None).await?;
+    let conn = dial(&endpoint, cli.addr, cli.gateway).await?;
+    let mut wanted = BTreeMap::<CellId, Vec<PersistId>>::new();
+    for d in expected {
+        wanted.entry(d.cell).or_default().push(d.entity);
+    }
+    let mut actual = BTreeMap::new();
+    for (cell, wanted_ids) in wanted {
+        send_msg(
+            &conn,
+            &GatewayMsg::Subscribe {
+                grid: GridId::ROOT,
+                cells: vec![cell],
+            },
+        );
+        let mut chunks = BTreeMap::new();
+        let mut total = None;
+        while total.map_or(true, |n| chunks.len() < n as usize) {
+            match recv_reply(&conn, Duration::from_secs(10)).await? {
+                GatewayReply::AreaPage {
+                    cell: reply_cell,
+                    page,
+                } if reply_cell == cell => {
+                    total = Some(page.total_chunks);
+                    chunks.insert(page.chunk_index, (page.entities, page.payloads));
+                }
+                GatewayReply::AreaLoadError { cell: bad, .. } if bad == cell => {
+                    bail!("gateway recovery read failed for {cell}")
+                }
+                _ => {}
+            }
+        }
+        for (_, (ids, payloads)) in chunks {
+            for (entity, payload) in ids.into_iter().zip(payloads) {
+                if !wanted_ids.contains(&entity) {
+                    continue;
+                }
+                if payload.len() < 16 {
+                    bail!("recovered payload for {entity:?} lacks synthetic tick");
+                }
+                let tick = Tick::new(u64::from_le_bytes(
+                    payload[8..16].try_into().expect("length checked"),
+                ));
+                actual.insert(
+                    entity,
+                    RecoveredDiff {
+                        grid: GridId::ROOT,
+                        cell,
+                        entity,
+                        tick,
+                        payload_digest: blake3::hash(&payload).to_hex().to_string(),
+                    },
+                );
+            }
+        }
+    }
+    endpoint.close().await;
+    Ok(actual.into_values().collect())
+}
+
+async fn read_intent_rows(
+    cluster: &Path,
+    records: &[AckRecord],
+) -> Result<BTreeMap<String, IntentOutcomeEvidence>> {
+    let ctx = orrery_persistd::FdbContext::connect(&cluster.display().to_string())
+        .map_err(|e| anyhow::anyhow!("open FDB: {e}"))?;
+    let db = ctx.database();
+    let mut result = BTreeMap::new();
+    for id_text in records.iter().filter_map(|r| match r {
+        AckRecord::Intent { intent_id, .. } => Some(intent_id),
+        _ => None,
+    }) {
+        let key = orrery_persistd::keyspace::intent_key(id_text.parse()?);
+        let raw = db
+            .run(|trx, _| async move { Ok(trx.get(&key, false).await?) })
+            .await
+            .map_err(|e: foundationdb::FdbBindingError| {
+                anyhow::anyhow!("read intent {id_text}: {e}")
+            })?;
+        let Some(raw) = raw else {
+            continue;
+        };
+        let row: orrery_persistd::keyspace::IntentRow = postcard::from_bytes(&raw)?;
+        result.insert(
+            id_text.clone(),
+            match row.outcome {
+                IntentOutcome::Committed { tick, minted } => {
+                    IntentOutcomeEvidence::Committed { tick, minted }
+                }
+                IntentOutcome::Rejected { reason } => IntentOutcomeEvidence::Rejected { reason },
+            },
+        );
+    }
+    Ok(result)
 }
 
 /// The parsed `--intent-mix`: `kind=fraction` pairs, fractions in `[0, 1]`.
@@ -1226,6 +1434,10 @@ mod tests {
             scenario: None,
             json: false,
             ack_log: None,
+            verify_recovery: false,
+            fdb_cluster_file: None,
+            recovery_cutoff: None,
+            output: None,
             diff_payload_bytes: 64,
             secret_key: None,
         };
@@ -1287,6 +1499,10 @@ mod tests {
             scenario: None,
             json: false,
             ack_log: None,
+            verify_recovery: false,
+            fdb_cluster_file: None,
+            recovery_cutoff: None,
+            output: None,
             diff_payload_bytes: 64,
             secret_key: None,
         };
