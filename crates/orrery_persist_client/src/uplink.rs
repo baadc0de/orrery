@@ -47,6 +47,10 @@ struct EntityState {
     last_acked_tick: Option<Tick>,
     /// The client-side sequence of the last sent diff.
     last_seq: u64,
+    /// Whether this entity has entered its rate schedule. Before its first
+    /// pending diff it must not accrue credit, which preserves phased cold
+    /// startup; afterward credit accrues independently of reply timing.
+    has_sent: bool,
 }
 
 /// Upper bound on send timestamps retained by one scheduler shard. The P2
@@ -104,6 +108,7 @@ impl UplinkScheduler {
             last_sent_tick: None,
             last_acked_tick: None,
             last_seq: 0,
+            has_sent: false,
         });
         entry.rate_hz = rate_hz;
     }
@@ -160,16 +165,17 @@ impl UplinkScheduler {
         };
         self.last_elapsed = Some(elapsed);
 
-        // Accumulate priority for every entity with a pending diff. An entity
-        // becomes ready once it has accrued one "send credit" (acc >= 1.0), so
-        // each entity sends at most its configured rate (1-4 Hz, D16).
+        // Accumulate one bounded send credit for every registered entity,
+        // including while it has no pending diff. Change generation is
+        // independent of acknowledgement timing: an entity that becomes dirty
+        // on its next rate cohort may spend its accrued credit immediately,
+        // while the cap prevents idle time from creating a catch-up burst.
         let mut ready: Vec<(PersistId, f32)> = Vec::new();
         for (entity, state) in self.entities.iter_mut() {
-            if state.pending.is_none() {
-                continue;
+            if state.pending.is_some() || state.has_sent {
+                state.acc = (state.acc + state.rate_hz * cfg.priority_gain * dt).min(1.0);
             }
-            state.acc += state.rate_hz * cfg.priority_gain * dt;
-            if state.acc >= 1.0 {
+            if state.pending.is_some() && state.acc >= 1.0 {
                 ready.push((*entity, state.acc));
             }
         }
@@ -196,7 +202,9 @@ impl UplinkScheduler {
             used += size;
             state.last_sent_tick = Some(diff.tick);
             state.last_seq = diff.seq;
-            state.acc = 0.0; // packed entities reset their accumulator (§5.2)
+            state.has_sent = true;
+            // Packed entities reset their accumulator (§5.2).
+            state.acc = 0.0;
             // Record the send instant for ack-latency sampling. Updated on
             // every send (including resends) so a retransmitted diff is not
             // credited with the original send time.

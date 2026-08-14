@@ -49,13 +49,12 @@ use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::net::SocketAddr;
 use std::path::Path;
 use std::process::ExitCode;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use bytes::Bytes;
 use clap::Parser;
+use futures::FutureExt;
 use iroh::endpoint::Connection;
 use iroh::{Endpoint, EndpointAddr, SecretKey};
 use serde::{Deserialize, Serialize};
@@ -63,7 +62,7 @@ use serde::{Deserialize, Serialize};
 use orrery_persist_client::config::PersistClientConfig;
 use orrery_persist_client::latency::LatencyHistogram;
 use orrery_persist_client::{IntentQueue, UplinkScheduler};
-use orrery_protocol::channels::{Channel, encode_datagram, encode_stream_frame, untag};
+use orrery_protocol::channels::{encode_datagram, encode_stream_frame, untag, Channel};
 use orrery_protocol::{
     Attestation, CellId, DiffUplink, Epoch, GatewayMsg, GatewayReply, GridId, Intent, IntentOp,
     IntentOutcome, NodeId, PersistId, RecordKind, Tick,
@@ -71,8 +70,8 @@ use orrery_protocol::{
 
 use cli::Cli;
 use evidence::{
-    AckRecord, DiffEvidence, IntentOutcomeEvidence, RecoveredDiff, RecoveredEvidence,
-    compare_recovery,
+    compare_recovery, AckRecord, DiffEvidence, IntentOutcomeEvidence, RecoveredDiff,
+    RecoveredEvidence,
 };
 use telemetry::{RunContext, TelemetrySink};
 
@@ -645,16 +644,20 @@ fn registration_phase(index: usize, sessions: usize, phase_slots: usize) -> u64 
     ((index / sessions) % phase_slots) as u64
 }
 
-/// Whether an entity's phased registration has begun. Once begun, the caller
-/// allocates a successor only when its scheduler no longer has a pending diff
-/// (that is, after the preceding durable reply).
-fn registration_is_due(
+/// Whether this flush owns an entity's next open-loop generation cohort.
+///
+/// Generation is deliberately independent of acknowledgement timing. At the
+/// default 10k @ 2 Hz profile, ten phase slots select exactly 1,000 entities
+/// per 50 ms frame. Queueing retains the scheduler's newest-wins behavior if
+/// an older tick is still pending.
+fn generation_cohort_is_due(
     index: usize,
     sessions: usize,
     phase_slots: usize,
     flush_index: u64,
 ) -> bool {
-    flush_index >= registration_phase(index, sessions, phase_slots)
+    let phase = registration_phase(index, sessions, phase_slots);
+    flush_index >= phase && (flush_index - phase).is_multiple_of(phase_slots as u64)
 }
 
 /// The intra-frame flush phase for a connection-local scheduler.
@@ -801,49 +804,39 @@ enum InboundEvent {
     },
 }
 
-/// Give every connection a dedicated receive future. The timestamp is taken
-/// immediately after QUIC yields the datagram, before the load loop scans
-/// other sessions, allocates payloads, or writes evidence.
-fn spawn_receivers(
-    sessions: &[Connection],
-) -> (
-    tokio::sync::mpsc::UnboundedReceiver<InboundEvent>,
-    Vec<tokio::task::JoinHandle<()>>,
-) {
-    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-    let tasks = sessions
-        .iter()
-        .cloned()
-        .enumerate()
-        .map(|(session, conn)| {
-            let tx = tx.clone();
-            tokio::spawn(async move {
-                loop {
-                    match conn.read_datagram().await {
-                        Ok(packet) => {
-                            let event = InboundEvent::Datagram {
-                                session,
-                                packet,
-                                received_at: Instant::now(),
-                            };
-                            if tx.send(event).is_err() {
-                                break;
-                            }
-                        }
-                        Err(error) => {
-                            let _ = tx.send(InboundEvent::Closed {
-                                session,
-                                error: error.to_string(),
-                            });
-                            break;
-                        }
-                    }
+/// Drain every currently-ready connection on the load-loop task.
+///
+/// The timestamp is taken immediately when QUIC yields each datagram, before
+/// later packets are handled. This retains wire-receipt semantics without a
+/// receiver task and unbounded-channel wakeup for every live connection.
+fn scan_inbound(sessions: &[Connection], closed: &mut [bool]) -> Vec<InboundEvent> {
+    let mut events = Vec::new();
+    for (session, conn) in sessions.iter().enumerate() {
+        if closed[session] {
+            continue;
+        }
+        loop {
+            match conn.read_datagram().now_or_never() {
+                Some(Ok(packet)) => events.push(InboundEvent::Datagram {
+                    session,
+                    packet,
+                    // Stamp at the point the QUIC read resolves, before this
+                    // packet waits behind later scans or reply handling.
+                    received_at: Instant::now(),
+                }),
+                Some(Err(error)) => {
+                    closed[session] = true;
+                    events.push(InboundEvent::Closed {
+                        session,
+                        error: error.to_string(),
+                    });
+                    break;
                 }
-            })
-        })
-        .collect();
-    drop(tx);
-    (rx, tasks)
+                None => break,
+            }
+        }
+    }
+    events
 }
 
 /// Send one `GatewayMsg` on the packet lane. Bulk diffs are tagged datagrams;
@@ -1206,10 +1199,10 @@ impl Rig<'_> {
         let mut schedulers = scheduler_shards(&self.inventory, sessions, self.diff_hz);
 
         // Per-session state: scheduler shards, send counters, tick clock.
-        let tick = Arc::new(AtomicU64::new(0));
+        let mut flush_index = 0_u64;
         let mut stats = RunStats::default();
         let sink = TelemetrySink::new();
-        let (mut inbound, receiver_tasks) = spawn_receivers(&self.sessions);
+        let mut closed_sessions = vec![false; sessions];
 
         // Area load: one 27-cell subscribe per session at startup, measuring
         // time-to-first-page per session (D16: area first page-in < 50 ms).
@@ -1242,8 +1235,10 @@ impl Rig<'_> {
             .collect::<Vec<_>>();
 
         while start.elapsed() < self.duration {
-            // ── Receive: drain replies already timestamped by receiver tasks
-            while let Ok(event) = inbound.try_recv() {
+            // ── Receive: one inline nonblocking connection scan. Keeping
+            // receipt work on this task avoids 125 receiver tasks and ~19k
+            // cross-task channel wakeups/s on the colocated test rig.
+            for event in scan_inbound(&self.sessions, &mut closed_sessions) {
                 self.handle_inbound(
                     event,
                     &mut schedulers,
@@ -1264,12 +1259,9 @@ impl Rig<'_> {
                 // immediately before the scheduler can spend its next credit.
                 // This preserves trajectory ticks and session budgets while
                 // avoiding 10x throwaway payload construction at 2 Hz.
-                let flush_index = tick.load(Ordering::Relaxed);
                 for (index, p) in self.inventory.iter().enumerate() {
                     let shard = scheduler_shard(index, sessions);
-                    if !registration_is_due(index, sessions, phase_slots, flush_index)
-                        || schedulers[shard].has_pending(p.entity)
-                    {
+                    if !generation_cohort_is_due(index, sessions, phase_slots, flush_index) {
                         continue;
                     }
                     let tick_now = flush_index;
@@ -1284,9 +1276,12 @@ impl Rig<'_> {
                         seq: tick_now,
                     });
                 }
-                tick.fetch_add(1, Ordering::Relaxed);
+                flush_index += 1;
 
-                next_queue += flush_period;
+                // Do not replay missed generation frames after a runtime
+                // stall: resume the 20 Hz open-loop clock without turning a
+                // pause into a catch-up burst on this colocated rig.
+                next_queue = Instant::now() + flush_period;
             }
 
             // Flush each connection at 20 Hz, offset within the global frame.
@@ -1370,19 +1365,20 @@ impl Rig<'_> {
             if remaining.is_zero() {
                 break;
             }
-            match tokio::time::timeout(remaining, inbound.recv()).await {
-                Ok(Some(event)) => self.handle_inbound(
+            let events = scan_inbound(&self.sessions, &mut closed_sessions);
+            let had_events = !events.is_empty();
+            for event in events {
+                self.handle_inbound(
                     event,
                     &mut schedulers,
                     &mut intents,
                     &mut stats,
                     &mut area_pending,
-                ),
-                Ok(None) | Err(_) => break,
+                );
             }
-        }
-        for task in receiver_tasks {
-            task.abort();
+            if !had_events {
+                tokio::time::sleep(remaining.min(Duration::from_millis(1))).await;
+            }
         }
 
         if self.emit_json {
@@ -1763,7 +1759,7 @@ mod tests {
     }
 
     #[test]
-    fn cold_profile_is_rate_limited_and_reaches_two_hz_after_warmup() {
+    fn cold_profile_is_rate_limited_and_ack_independent() {
         // Reproduce the load driver's registration, queue, flush, and ack
         // flow with a deterministic clock. A fresh UplinkScheduler starts
         // with zero credit, so an entity's first 2 Hz send is one 500 ms
@@ -1775,63 +1771,84 @@ mod tests {
         let entities = 1_000_usize;
         let sessions = 13;
         let inventory = synthetic_inventory(entities as u64, 100);
-        let mut schedulers = scheduler_shards(&inventory, sessions, 2.0);
-        let cfg = PersistClientConfig {
-            flush_budget_bytes: FLUSH_BUDGET_BYTES,
-            ..PersistClientConfig::default()
-        };
         let phase_slots = registration_phase_slots(2.0);
-        let frame = Duration::from_secs_f64(1.0 / FLUSH_HZ as f64);
-        let mut sent_per_second = [0_usize; 30];
-        let mut total = 0_usize;
-        let mut payloads_allocated = 0_usize;
+        let simulate = |ack_delay_frames: Option<u64>| {
+            let mut schedulers = scheduler_shards(&inventory, sessions, 2.0);
+            let cfg = PersistClientConfig {
+                flush_budget_bytes: FLUSH_BUDGET_BYTES,
+                ..PersistClientConfig::default()
+            };
+            let frame = Duration::from_secs_f64(1.0 / FLUSH_HZ as f64);
+            let mut sent_per_second = [0_usize; 30];
+            let mut pending_acks: Vec<(u64, usize, PersistId, Tick)> = Vec::new();
+            let mut payloads_allocated = 0_usize;
 
-        for frame_index in 0..(30 * FLUSH_HZ) {
-            for (index, placement) in inventory.iter().enumerate() {
-                let shard = scheduler_shard(index, sessions);
-                if !registration_is_due(index, sessions, phase_slots, frame_index)
-                    || schedulers[shard].has_pending(placement.entity)
-                {
-                    continue;
+            for frame_index in 0..(30 * FLUSH_HZ) {
+                let mut retained = Vec::new();
+                for (due, shard, entity, tick) in pending_acks.drain(..) {
+                    if due <= frame_index {
+                        schedulers[shard].on_ack(entity, tick, false);
+                    } else {
+                        retained.push((due, shard, entity, tick));
+                    }
                 }
-                payloads_allocated += 1;
-                let tick = frame_index;
-                schedulers[shard].queue(DiffUplink {
-                    cell: moved_cell(placement, tick),
-                    grid: GridId::ROOT,
-                    entity: placement.entity,
-                    tick: Tick::new(tick),
-                    kind: RecordKind::ComponentDiff,
-                    payload: synthetic_payload(placement.entity, tick, 64),
-                    seq: tick,
-                });
-            }
+                pending_acks = retained;
 
-            let elapsed = frame * frame_index as u32;
-            for scheduler in &mut schedulers {
-                for diff in scheduler.flush(&cfg, elapsed) {
-                    total += 1;
-                    sent_per_second[(frame_index / FLUSH_HZ) as usize] += 1;
-                    scheduler.on_ack(diff.entity, diff.tick, false);
+                for (index, placement) in inventory.iter().enumerate() {
+                    if !generation_cohort_is_due(index, sessions, phase_slots, frame_index) {
+                        continue;
+                    }
+                    payloads_allocated += 1;
+                    schedulers[scheduler_shard(index, sessions)].queue(DiffUplink {
+                        cell: moved_cell(placement, frame_index),
+                        grid: GridId::ROOT,
+                        entity: placement.entity,
+                        tick: Tick::new(frame_index),
+                        kind: RecordKind::ComponentDiff,
+                        payload: synthetic_payload(placement.entity, frame_index, 64),
+                        seq: frame_index,
+                    });
+                }
+
+                let elapsed = frame * frame_index as u32;
+                for (shard, scheduler) in schedulers.iter_mut().enumerate() {
+                    for diff in scheduler.flush(&cfg, elapsed) {
+                        sent_per_second[(frame_index / FLUSH_HZ) as usize] += 1;
+                        if let Some(delay) = ack_delay_frames {
+                            pending_acks.push((frame_index + delay, shard, diff.entity, diff.tick));
+                        }
+                    }
                 }
             }
-        }
+            (sent_per_second, payloads_allocated)
+        };
 
-        assert_eq!(total, entities * (30 * 2 - 1));
-        assert!(
-            (total..=total + entities).contains(&payloads_allocated),
-            "allocations ({payloads_allocated}) must track sends ({total}) plus at most one pending cohort"
-        );
-        assert!(
-            payloads_allocated < entities * 30 * FLUSH_HZ as usize / 9,
-            "generator regressed toward allocating every entity every frame"
-        );
-        assert_eq!(sent_per_second[0], entities);
-        assert!(
-            sent_per_second[1..]
-                .iter()
-                .all(|&count| count == entities * 2)
-        );
+        let immediate = simulate(Some(0));
+        let delayed = simulate(Some(7));
+        let lost = simulate(None);
+        assert_eq!(immediate.0, delayed.0, "delayed acks changed offered rate");
+        assert_eq!(immediate.0, lost.0, "lost acks changed offered rate");
+        assert_eq!(immediate.1, entities * 30 * 2);
+        assert_eq!(immediate.1, delayed.1);
+        assert_eq!(immediate.1, lost.1);
+        assert_eq!(immediate.0.iter().sum::<usize>(), entities * (30 * 2 - 1));
+        assert_eq!(immediate.0[0], entities);
+        assert!(immediate.0[1..].iter().all(|&count| count == entities * 2));
+    }
+
+    #[test]
+    fn default_open_loop_cohorts_are_exactly_one_thousand_per_frame() {
+        let entities = 10_000;
+        let sessions = 125;
+        let slots = registration_phase_slots(2.0);
+        let counts = (0..slots as u64)
+            .map(|flush_index| {
+                (0..entities)
+                    .filter(|&index| generation_cohort_is_due(index, sessions, slots, flush_index))
+                    .count()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(counts, vec![1_000; slots]);
     }
 
     #[test]
