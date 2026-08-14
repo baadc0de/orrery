@@ -485,8 +485,9 @@ pub fn player_loc_key(account: AccountId) -> [u8; 10] {
 //
 // The cluster-minted id counter (docs/08-persistence.md §6 `pid/next`,
 // §7 "Id minting in the receipt"): intents allocate `PersistId`s inside the
-// transaction via `MutationType::Add`, so concurrent intents never serialize
-// on the counter beyond the atomic op itself. The value is an 8-byte
+// block grants. Reserving a block reads then atomically increments this key;
+// that serializes only grant replenishment, while individual intents use the
+// locally held durable grant. The value is an 8-byte
 // little-endian u64 — little-endian because that is the representation
 // `MutationType::Add` requires.
 
@@ -494,7 +495,9 @@ pub fn player_loc_key(account: AccountId) -> [u8; 10] {
 ///
 /// Grid-scoped so tests (and nested grids) allocate from independent counters;
 /// the production grid is [`GridId::ROOT`]. Mutated **only** via
-/// `MutationType::Add`; its value is 8-byte little-endian.
+/// `MutationType::Add`; its value is 8-byte little-endian. A grant can be
+/// abandoned after a crash, so callers must tolerate permanent gaps and must
+/// never attempt to reclaim them.
 #[must_use]
 pub fn pid_next_key(grid: GridId) -> [u8; 9] {
     let mut key = [0u8; 9];

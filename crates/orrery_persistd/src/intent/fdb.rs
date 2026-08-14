@@ -9,14 +9,15 @@
 //!    what converts at-least-once delivery (C-1: intents ride the packet lane
 //!    with client retransmit) into exactly-once outcomes.
 //! 1. **Reads register conflict ranges.** Every durable key the executor
-//!    touches (the idempotency row, the `pid/next` counter, the ledger rows
-//!    its ops name) is read before any write, so a concurrent commit
+//!    touches (the idempotency row and the ledger rows its ops name) is read
+//!    before any write, so a concurrent commit
 //!    intersecting the read set aborts this transaction with `not_committed`
 //!    and the retry loop re-checks honestly (§7).
 //! 2. **Writes.** `set`/`atomic_op` apply the ledger effects; balances are
 //!    little-endian `MutationType::Add` so the credit side is a blind
-//!    increment. `PersistId`s are minted by `atomic_op(pid/next, Add)` — the
-//!    counter never serializes concurrent intents beyond the atomic op.
+//!    increment. `PersistId`s are drawn from durable, process-local block
+//!    grants. Reserving a block serializes on `pid/next` only once per block;
+//!    individual intent transactions never read that hot key.
 //! 3. **The outcome row.** The `IntentOutcome` is written to
 //!    `intent/{intent_id}` in the same transaction, so the ack the gateway
 //!    sends after `db.run` resolves implies a durable commit (RPO 0).
@@ -52,6 +53,26 @@ const NOT_COMMITTED: i32 = 1020;
 /// default **1 h**, swept by the checkpoint GC pass).
 const INTENT_ROW_RETENTION_MS: u64 = 60 * 60 * 1000;
 
+/// Number of ids held by one executor after it must replenish its local
+/// grant.  An executor may crash with unused ids in its grant; that is an
+/// intentional permanent gap, which is the only safe outcome because a
+/// crashed process could have committed an intent carrying one of those ids.
+const PERSIST_ID_BLOCK_GRANT: u64 = 4_096;
+
+/// A durable block has been reserved in FDB and may be handed out locally.
+/// `next` and `end` are 1-based, with `end` exclusive.
+#[derive(Debug, Default)]
+struct PersistIdAllocator {
+    next: u64,
+    end: u64,
+}
+
+impl PersistIdAllocator {
+    fn remaining(&self) -> u64 {
+        self.end.saturating_sub(self.next)
+    }
+}
+
 /// An FDB-backed intent executor.
 ///
 /// The grid scopes the `pid/next` counter the executor mints from
@@ -61,6 +82,7 @@ pub struct FdbIntentExecutor {
     db: Arc<Database>,
     grid: GridId,
     fence: Option<IntentFence>,
+    allocator: Arc<tokio::sync::Mutex<PersistIdAllocator>>,
 }
 
 /// The active shard ownership an intent executor is allowed to write under.
@@ -88,6 +110,7 @@ impl FdbIntentExecutor {
             db,
             grid,
             fence: None,
+            allocator: Arc::new(tokio::sync::Mutex::new(PersistIdAllocator::default())),
         }
     }
 
@@ -104,6 +127,7 @@ impl FdbIntentExecutor {
             db,
             grid,
             fence: Some(fence),
+            allocator: Arc::new(tokio::sync::Mutex::new(PersistIdAllocator::default())),
         }
     }
 
@@ -122,6 +146,61 @@ impl FdbIntentExecutor {
     #[must_use]
     pub fn database(&self) -> &Arc<Database> {
         &self.db
+    }
+
+    /// Allocate ids before entering the intent transaction.
+    ///
+    /// A lease is committed before any of its ids are exposed to an intent.
+    /// Thus an executor crash or a failed intent can leave holes, but never
+    /// reuse an id.  Keeping this counter read outside the per-intent
+    /// transaction is essential: reading `pid/next` in every intent creates
+    /// a shared read conflict range and makes otherwise independent intents
+    /// repeatedly abort under load.
+    async fn allocate_ids(&self, count: u64) -> Result<Vec<PersistId>, IntentError> {
+        if count == 0 {
+            return Ok(Vec::new());
+        }
+
+        let mut allocator = self.allocator.lock().await;
+        if allocator.remaining() < count {
+            // Do not recycle an incomplete grant. Its ids remain permanently
+            // reserved, including when this executor is dropped mid-flight.
+            let len = PERSIST_ID_BLOCK_GRANT.max(count);
+            let start = reserve_id_block(&self.db, self.grid, len).await?;
+            allocator.next = start;
+            allocator.end = start
+                .checked_add(len)
+                .ok_or_else(|| IntentError::Store("PersistId allocator overflow".to_owned()))?;
+        }
+
+        let start = allocator.next;
+        allocator.next = start
+            .checked_add(count)
+            .ok_or_else(|| IntentError::Store("PersistId allocator overflow".to_owned()))?;
+        Ok((start..allocator.next).map(PersistId::new).collect())
+    }
+
+    /// Fast path for an already-committed idempotency row. The transaction
+    /// below repeats this read for correctness; this one simply avoids
+    /// consuming a fresh local grant for the overwhelmingly common replay
+    /// case after a client reconnect.
+    async fn recorded_outcome(
+        &self,
+        intent_id: u128,
+    ) -> Result<Option<IntentOutcome>, IntentError> {
+        let key = keyspace::intent_key(intent_id);
+        let result: Result<Option<IntentOutcome>, FdbBindingError> = self
+            .db
+            .run(|trx, _maybe_committed| async move {
+                let Some(value) = trx.get(&key, false).await? else {
+                    return Ok(None);
+                };
+                let row: keyspace::IntentRow =
+                    postcard::from_bytes(&value).map_err(store_err("intent row decode"))?;
+                Ok(Some(row.outcome))
+            })
+            .await;
+        result.map_err(unwrap_binding_error)
     }
 }
 
@@ -169,9 +248,16 @@ async fn require_intent_fence(
 #[async_trait::async_trait]
 impl IntentExecutor for FdbIntentExecutor {
     async fn execute(&self, intent: &Intent) -> Result<IntentOutcome, IntentError> {
+        if let Some(outcome) = self.recorded_outcome(intent.intent_id).await? {
+            return Ok(outcome);
+        }
         let intent = intent.clone();
         let grid = self.grid;
         let fence = self.fence;
+        // The block is durably reserved before the transaction. Reusing this
+        // exact vector across FDB retries makes retries safe, while a failed
+        // overall attempt merely leaves a permanent, harmless gap.
+        let minted = self.allocate_ids(intent.ops.len() as u64).await?;
         // `db.run` is the retry loop (§7: "retry loop is db.run's"). We bound
         // the `not_committed` retries with an interior-mutable attempt counter:
         // past the limit the closure returns `ContentionExhausted` as a custom
@@ -182,6 +268,7 @@ impl IntentExecutor for FdbIntentExecutor {
             .db
             .run(|trx, _maybe_committed| {
                 let intent = intent.clone();
+                let minted = minted.clone();
                 let attempt = attempts.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
                 async move {
                     if attempt > MAX_CONFLICT_RETRIES + 1 {
@@ -214,11 +301,9 @@ impl IntentExecutor for FdbIntentExecutor {
                     let read_version = trx.get_read_version().await?;
                     let tick = orrery_protocol::Tick::new(read_version as u64);
 
-                    // Step 2: mint one `PersistId` per op from `pid/next`
-                    // (§7 "Id minting in the receipt"). The harness mints one
-                    // id per op; a linked Ruleset names the real allocation.
-                    let pid_key = keyspace::pid_next_key(grid);
-                    let minted = mint_ids(&trx, &pid_key, intent.ops.len() as u64).await?;
+                    // Step 2: use ids from the executor's already-durable
+                    // grant. The harness mints one id per op; a linked
+                    // Ruleset names the real allocation.
 
                     // Step 3: apply the ops' ledger effects (see `apply_ops`).
                     apply_ops(&trx, &intent)?;
@@ -279,32 +364,42 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-/// Mint `count` `PersistId`s from the `pid/next` counter via `MutationType::Add`.
-///
-/// The counter is read **before** the atomic add so the read registers a
-/// conflict range and the returned base is this transaction's own view of the
-/// pre-add value; the add itself is blind, so concurrent intents do not
-/// serialize on the counter beyond the atomic op (§7). Ids are 1-based — id 0
-/// is never minted (a `PersistId` of 0 reads as "unset" downstream).
-async fn mint_ids(
-    trx: &foundationdb::Transaction,
-    pid_key: &[u8],
-    count: u64,
-) -> Result<Vec<PersistId>, FdbBindingError> {
-    if count == 0 {
-        return Ok(Vec::new());
+/// Reserve `count` ids from the global grid counter. This is the only path
+/// that reads `pid/next`, so its conflict serialization is amortized over a
+/// block rather than paid by every intent.
+async fn reserve_id_block(db: &Database, grid: GridId, count: u64) -> Result<u64, IntentError> {
+    debug_assert!(count > 0);
+    let result: Result<u64, FdbBindingError> = db
+        .run(|trx, _maybe_committed| async move {
+            let key = keyspace::pid_next_key(grid);
+            let base = match trx.get(&key, false).await? {
+                Some(v) => decode_pid_counter(&v)?,
+                None => 0,
+            };
+            let start = base.checked_add(1).ok_or_else(pid_overflow_error)?;
+            base.checked_add(count).ok_or_else(pid_overflow_error)?;
+            trx.atomic_op(&key, &count.to_le_bytes(), MutationType::Add);
+            Ok(start)
+        })
+        .await;
+    result.map_err(unwrap_binding_error)
+}
+
+fn decode_pid_counter(value: &[u8]) -> Result<u64, FdbBindingError> {
+    if value.len() > 8 {
+        return Err(FdbBindingError::new_custom_error(Box::new(
+            IntentError::Store("pid/next counter is wider than u64".to_owned()),
+        )));
     }
-    let base = match trx.get(pid_key, false).await? {
-        Some(v) => {
-            let mut buf = [0u8; 8];
-            let n = v.len().min(8);
-            buf[..n].copy_from_slice(&v[..n]);
-            u64::from_le_bytes(buf)
-        }
-        None => 0,
-    };
-    trx.atomic_op(pid_key, &count.to_le_bytes(), MutationType::Add);
-    Ok((base + 1..=base + count).map(PersistId::new).collect())
+    let mut buf = [0u8; 8];
+    buf[..value.len()].copy_from_slice(value);
+    Ok(u64::from_le_bytes(buf))
+}
+
+fn pid_overflow_error() -> FdbBindingError {
+    FdbBindingError::new_custom_error(Box::new(IntentError::Store(
+        "PersistId allocator exhausted".to_owned(),
+    )))
 }
 
 /// Apply the harness default op semantics.

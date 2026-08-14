@@ -341,6 +341,49 @@ async fn fdb_replayed_intent_returns_recorded_outcome() {
 
 #[cfg(feature = "fdb")]
 #[tokio::test]
+async fn fdb_concurrent_independent_intents_use_unique_block_granted_ids() {
+    use std::collections::BTreeSet;
+
+    use orrery_persistd::{FdbIntentExecutor, IntentExecutor};
+
+    let Some(cluster) = fdb_cluster_file() else {
+        eprintln!("skipping: ORRERY_FDB_CLUSTER_FILE not set and no .fdb-dev/fdb.cluster");
+        return;
+    };
+    // One shared executor is the P2 gateway shape: many concurrently arriving
+    // independent intents must not all read-conflict on pid/next. This grid is
+    // deliberately isolated from the durability tests above and from seeded
+    // content in the shared development cluster.
+    let exec = Arc::new(FdbIntentExecutor::connect(&cluster, GridId::new(9310)).unwrap());
+    let key = secret(13);
+    let mut tasks = tokio::task::JoinSet::new();
+    for n in 0..32u64 {
+        let exec = Arc::clone(&exec);
+        let intent = signed_intent(
+            0x9310_0000 + u128::from(n),
+            &key,
+            0,
+            &credit_args(510_000 + n, 1, 1),
+        );
+        tasks.spawn(async move { exec.execute(&intent).await });
+    }
+
+    let mut minted = BTreeSet::new();
+    while let Some(result) = tasks.join_next().await {
+        let outcome = result
+            .expect("intent task did not panic")
+            .expect("independent intents must not exhaust conflict retries on pid/next");
+        let IntentOutcome::Committed { minted: ids, .. } = outcome else {
+            panic!("concurrent signed intent was not committed");
+        };
+        assert_eq!(ids.len(), 1);
+        assert!(minted.insert(ids[0]), "PersistId must not be reused");
+    }
+    assert_eq!(minted.len(), 32, "every committed intent received one id");
+}
+
+#[cfg(feature = "fdb")]
+#[tokio::test]
 async fn fdb_committed_intent_survives_restart() {
     use orrery_persistd::{FdbIntentExecutor, IntentExecutor};
 
