@@ -105,8 +105,8 @@ fn run_persistd_exit(args: &[&str]) -> (std::process::ExitStatus, String) {
 fn gateway_node_id_is_stable_across_restart() {
     // The same --secret-key must produce the same NodeId across two runs.
     let secret_hex = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
-    let (id1, _) = run_persistd(&["--secret-key", secret_hex, "--nodes", "1"]);
-    let (id2, _) = run_persistd(&["--secret-key", secret_hex, "--nodes", "1"]);
+    let (id1, _) = run_persistd(&["--secret-key", secret_hex]);
+    let (id2, _) = run_persistd(&["--secret-key", secret_hex]);
 
     assert_eq!(
         id1, id2,
@@ -118,8 +118,8 @@ fn gateway_node_id_is_stable_across_restart() {
 fn different_secret_keys_produce_different_node_ids() {
     let secret_a = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
     let secret_b = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
-    let (id_a, _) = run_persistd(&["--secret-key", secret_a, "--nodes", "1"]);
-    let (id_b, _) = run_persistd(&["--secret-key", secret_b, "--nodes", "1"]);
+    let (id_a, _) = run_persistd(&["--secret-key", secret_a]);
+    let (id_b, _) = run_persistd(&["--secret-key", secret_b]);
 
     assert_ne!(
         id_a, id_b,
@@ -131,7 +131,7 @@ fn different_secret_keys_produce_different_node_ids() {
 fn stdout_contains_json_address_line() {
     // Verify the output format: a single-line JSON object with endpoint_addr
     // and node_id fields.
-    let (node_id, endpoint_addr) = run_persistd(&["--nodes", "1"]);
+    let (node_id, endpoint_addr) = run_persistd(&[]);
     assert!(!node_id.is_empty(), "node_id must be non-empty");
     assert!(!endpoint_addr.is_empty(), "endpoint_addr must be non-empty");
 }
@@ -140,29 +140,67 @@ fn stdout_contains_json_address_line() {
 fn stdout_lines_are_json_only() {
     // Assert that the first stdout line is JSON (starts with '{') even when
     // no --secret-key is used (ephemeral identity).
-    let (_, _) = run_persistd(&["--nodes", "1"]);
+    let (_, _) = run_persistd(&[]);
 }
 
 #[test]
-fn shard_level_flag_is_accepted() {
-    // --shard-level 18 should be accepted (produces a valid shard cell).
-    let (_, _) = run_persistd(&["--nodes", "1", "--shard-level", "18"]);
+fn raw_shard_flag_is_accepted() {
+    // Raw shard bits should be accepted as an explicit local shard.
+    let (_, _) = run_persistd(&["--shard", "0xA924_9249_2492_4E00"]);
 }
 
 #[test]
-fn nodes_greater_than_one_are_rejected_with_an_actionable_message() {
-    let (status, stderr) = run_persistd_exit(&["--nodes", "2"]);
+fn coordinate_shard_flag_is_accepted() {
+    // Coordinate form should also be accepted.
+    let (_, _) = run_persistd(&["--shard", "2,-1,8@21"]);
+}
+
+#[test]
+fn overlapping_local_shards_are_rejected() {
+    let (status, stderr) =
+        run_persistd_exit(&["--shard", "0x8000_0000_0000_0000", "--shard", "0,0,0@1"]);
 
     assert!(
         !status.success(),
-        "persistd must exit non-zero when asked for more than one node"
+        "persistd must exit non-zero for overlapping local shards"
     );
     assert!(
-        stderr.contains("node-to-node chain transport"),
-        "stderr should explain that the in-process MemChainTransport is not a distributed transport: {stderr}"
+        stderr.contains("overlapping --shard values"),
+        "stderr should explain the overlap: {stderr}"
+    );
+}
+
+#[test]
+fn clustered_topology_without_node_id_is_rejected() {
+    let (status, stderr) = run_persistd_exit(&["--chain-listen", "127.0.0.1:3000"]);
+
+    assert!(
+        !status.success(),
+        "persistd must exit non-zero when chain topology is requested without --node-id"
     );
     assert!(
-        stderr.contains("--nodes 2"),
-        "stderr should mention the rejected node count: {stderr}"
+        stderr.contains("--node-id is required"),
+        "stderr should explain that clustered mode requires --node-id: {stderr}"
+    );
+}
+
+#[test]
+fn clustered_topology_is_rejected_until_chain_rpc_exists() {
+    let (status, stderr) = run_persistd_exit(&[
+        "--node-id",
+        "7",
+        "--chain-listen",
+        "127.0.0.1:3000",
+        "--chain-follower",
+        "8@127.0.0.1:3001",
+    ]);
+
+    assert!(
+        !status.success(),
+        "persistd must exit non-zero until chain RPC is implemented"
+    );
+    assert!(
+        stderr.contains("chain topology is not wired into persistd yet"),
+        "stderr should explain that the chain topology is not integrated yet: {stderr}"
     );
 }
