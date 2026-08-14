@@ -969,6 +969,9 @@ impl Rig<'_> {
                     tracing::debug!(session, first_page_ms = dt.as_millis(), "first area page");
                 }
             }
+            GatewayReply::AreaLoadError { cell, kind } => {
+                tracing::warn!(session, ?cell, kind, "area load failed");
+            }
             GatewayReply::HelloAck { .. } => {}
         }
     }
@@ -1181,6 +1184,70 @@ mod tests {
         assert_eq!(parse_duration("90s").unwrap(), Duration::from_secs(90));
         assert_eq!(parse_duration("1h").unwrap(), Duration::from_secs(3600));
         assert!(parse_duration("10x").is_err());
+    }
+
+    #[tokio::test]
+    async fn area_load_error_is_ignored_for_latency_tracking() {
+        let endpoint = bind_endpoint(None).await.expect("bind test endpoint");
+        let cli = Cli {
+            gateway: node(1),
+            addr: SocketAddr::from(([127, 0, 0, 1], 1)),
+            entities: 1,
+            cells: 1,
+            diff_hz: 2.0,
+            intent_mix: String::new(),
+            sessions: 1,
+            duration_secs: 1,
+            manifest: None,
+            scenario: None,
+            json: false,
+            ack_log: None,
+            diff_payload_bytes: 64,
+            secret_key: None,
+        };
+        let mut rig = Rig {
+            cli: &cli,
+            emit_json: false,
+            endpoint,
+            sessions: Vec::new(),
+            inventory: Vec::new(),
+            diff_hz: 2.0,
+            intent_mix: BTreeMap::new(),
+            duration: Duration::from_secs(1),
+            ack_log: None,
+        };
+        let mut sched = UplinkScheduler::new();
+        let mut intents = IntentQueue::new(1024);
+        let mut stats = RunStats::default();
+        let mut area_pending = vec![Some(Instant::now())];
+        let reply = GatewayReply::AreaLoadError {
+            cell: orrery_protocol::CellId::ROOT,
+            kind: orrery_protocol::AREA_LOAD_ERR_LIVE,
+        };
+
+        rig.handle_reply(
+            0,
+            &encode_stream_frame(&reply),
+            &mut sched,
+            &mut intents,
+            &mut stats,
+            &mut area_pending,
+        );
+
+        assert!(
+            area_pending[0].is_some(),
+            "area-load timer must remain pending"
+        );
+        assert_eq!(stats.diffs_sent, 0);
+        assert_eq!(stats.diff_acks, 0);
+        assert_eq!(stats.intents_sent, 0);
+        assert_eq!(stats.intent_acks, 0);
+    }
+
+    fn node(n: u8) -> orrery_protocol::NodeId {
+        let mut seed = [0u8; 32];
+        seed[0] = n;
+        SecretKey::from_bytes(&seed).public()
     }
 
     #[test]
