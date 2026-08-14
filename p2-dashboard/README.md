@@ -26,7 +26,10 @@ object per line:
   session counts, duration). Echoed into the report so a viewer knows which
   run the numbers came from.
 - `{"type":"sample","series":"<name>","value_us":<u64>}` — one raw latency
-  sample. Samples are bucketed into the **bounded-memory D16 histogram** from
+  sample; or `{"type":"sample_batch","series":"<name>","value_us":<u64>,"count":<u64>}`
+  for `count` identical samples. The latter is used by persistd journal group
+  commit telemetry, so its counts remain part of the same run artifact.
+  Samples are bucketed into the **bounded-memory D16 histogram** from
   `orrery_persist_client::latency` — the same recorder the rig uses live — so
   percentiles resolve within one bucket width of the true value in constant
   memory (a 30-minute soak at 10k entities × 4 Hz is ~72M samples; nothing is
@@ -118,9 +121,6 @@ and a missing series fails by omission.
 ## What this does not claim
 
 `journal_commit_ms` is a **server-internal** number (D16): the rig cannot
-observe it over the wire, so the series is only as honest as the gateway that
-reported it. The P2 build has no journal-latency wire message — the demo
-runbook sources those samples from the `persistd` operator's log/metrics
-pipeline and appends them to the JSONL stream before gating. If no journal
-samples are present the gate fails with `missing_data`, which is the intended
-posture.
+observe it over the wire. Persistd emits compact `sample_batch` records into
+the run artifact, which this dashboard folds exactly as repeated samples. If
+no journal samples are present the gate fails with `missing_data`.

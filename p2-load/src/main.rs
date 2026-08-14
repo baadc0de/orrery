@@ -38,9 +38,13 @@
 //! D12 bridge.
 
 mod cli;
+// Recovery-reader wiring arrives with the promotion slice; meanwhile this
+// module is compiled and unit-tested as the stable pure verifier contract.
+#[allow(dead_code)]
+mod evidence;
 mod telemetry;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::net::SocketAddr;
 use std::path::Path;
@@ -55,7 +59,7 @@ use clap::Parser;
 use futures::FutureExt;
 use iroh::endpoint::Connection;
 use iroh::{Endpoint, EndpointAddr, SecretKey};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
 use orrery_persist_client::config::PersistClientConfig;
 use orrery_persist_client::{IntentQueue, UplinkScheduler};
@@ -66,6 +70,7 @@ use orrery_protocol::{
 };
 
 use cli::Cli;
+use evidence::{AckRecord, DiffEvidence, IntentOutcomeEvidence};
 use telemetry::{RunContext, TelemetrySink};
 
 /// The gateway ALPN (matches `orrery_persistd::gateway::GATEWAY_ALPN` and the
@@ -222,6 +227,7 @@ async fn run() -> Result<()> {
         intent_mix,
         duration,
         ack_log,
+        pending_diffs: HashMap::new(),
     };
     let outcome = rig.drive().await;
 
@@ -662,32 +668,6 @@ struct AckLog {
     writer: BufWriter<std::fs::File>,
 }
 
-/// One ack-log record. Tagged so the harness can split diff acks from intent
-/// acks; `lsn` is the durable journal position the gateway acked (the
-/// watermark the kill-9 assertion compares against).
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-enum AckRecord {
-    /// A bulk diff was durably journaled.
-    Diff {
-        /// The entity.
-        entity: PersistId,
-        /// The diff's tick.
-        tick: Tick,
-        /// The durable journal position.
-        lsn: orrery_protocol::Lsn,
-    },
-    /// An intent committed.
-    Intent {
-        /// The intent id (idempotency key), as a decimal string: serde_json
-        /// has no arbitrary-precision u128 support, and the harness compares
-        /// by equality, so the string form is lossless for this contract.
-        intent_id: String,
-        /// The commit tick.
-        tick: Tick,
-    },
-}
-
 impl AckLog {
     fn open(path: &Path) -> Result<Self> {
         // Append-only by construction: `create` truncates a stale log from a
@@ -743,6 +723,10 @@ struct Rig<'a> {
     intent_mix: IntentMix,
     duration: Duration,
     ack_log: Option<AckLog>,
+    /// Sent bulk diffs awaiting an acknowledgement. An ack has no payload or
+    /// cell fields, so retaining the exact outbound evidence is required for
+    /// the post-crash state proof.
+    pending_diffs: HashMap<(PersistId, Tick), DiffEvidence>,
 }
 
 impl Rig<'_> {
@@ -861,6 +845,18 @@ impl Rig<'_> {
                         &self.sessions[n % sessions],
                         &GatewayMsg::Diff { diff: diff.clone() },
                     );
+                    self.pending_diffs.insert(
+                        (diff.entity, diff.tick),
+                        DiffEvidence {
+                            grid: diff.grid,
+                            cell: diff.cell,
+                            entity: diff.entity,
+                            tick: diff.tick,
+                            // The LSN is supplied by the durable ack.
+                            lsn: orrery_protocol::Lsn::new(0, 0),
+                            payload_digest: blake3::hash(&diff.payload).to_hex().to_string(),
+                        },
+                    );
                     stats.diffs_sent += 1;
                 }
                 // Drain queued intents to the wire.
@@ -936,8 +932,15 @@ impl Rig<'_> {
             } => {
                 sched.on_ack(entity, tick, provisional);
                 stats.diff_acks += 1;
-                if let Some(log) = &mut self.ack_log {
-                    log.record(&AckRecord::Diff { entity, tick, lsn });
+                if !provisional {
+                    if let Some(mut evidence) = self.pending_diffs.remove(&(entity, tick)) {
+                        evidence.lsn = lsn;
+                        if let Some(log) = &mut self.ack_log {
+                            log.record(&AckRecord::Diff(evidence));
+                        }
+                    } else {
+                        tracing::warn!(?entity, ?tick, "durable bulk ack had no outbound evidence");
+                    }
                 }
             }
             GatewayReply::BulkNack {
@@ -949,13 +952,22 @@ impl Rig<'_> {
                 tracing::debug!(session, ?entity, ?tick, reason, "bulk nack");
             }
             GatewayReply::IntentAck { intent_id, outcome } => {
-                if let IntentOutcome::Committed { tick, .. } = &outcome {
-                    if let Some(log) = &mut self.ack_log {
-                        log.record(&AckRecord::Intent {
-                            intent_id: intent_id.to_string(),
-                            tick: *tick,
-                        });
+                let evidence_outcome = match &outcome {
+                    IntentOutcome::Committed { tick, minted } => IntentOutcomeEvidence::Committed {
+                        tick: *tick,
+                        minted: minted.clone(),
+                    },
+                    IntentOutcome::Rejected { reason } => {
+                        IntentOutcomeEvidence::Rejected { reason: *reason }
                     }
+                };
+                if let Some(log) = &mut self.ack_log {
+                    log.record(&AckRecord::Intent {
+                        intent_id: intent_id.to_string(),
+                        outcome: evidence_outcome,
+                    });
+                }
+                if matches!(outcome, IntentOutcome::Committed { .. }) {
                     stats.intent_acks += 1;
                 }
                 intents.on_ack(intent_id, outcome);
@@ -1215,6 +1227,7 @@ mod tests {
             intent_mix: BTreeMap::new(),
             duration: Duration::from_secs(1),
             ack_log: None,
+            pending_diffs: HashMap::new(),
         };
         let mut sched = UplinkScheduler::new();
         let mut intents = IntentQueue::new(1024);
@@ -1254,23 +1267,26 @@ mod tests {
     fn ack_log_is_append_only_and_parseable() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("acks.jsonl");
+        let evidence = |entity, tick, segment, offset| DiffEvidence {
+            grid: GridId::ROOT,
+            cell: CellId::ROOT,
+            entity: PersistId::new(entity),
+            tick: Tick::new(tick),
+            lsn: orrery_protocol::Lsn::new(segment, offset),
+            payload_digest: format!("digest-{entity}-{tick}"),
+        };
 
         {
             let mut log = AckLog::open(&path).unwrap();
-            log.record(&AckRecord::Diff {
-                entity: PersistId::new(7),
-                tick: Tick::new(42),
-                lsn: orrery_protocol::Lsn::new(3, 4096),
-            });
+            log.record(&AckRecord::Diff(evidence(7, 42, 3, 4096)));
             log.record(&AckRecord::Intent {
                 intent_id: "213458173728644058818963591144807231488".to_string(),
-                tick: Tick::new(9),
+                outcome: IntentOutcomeEvidence::Committed {
+                    tick: Tick::new(9),
+                    minted: vec![PersistId::new(77)],
+                },
             });
-            log.record(&AckRecord::Diff {
-                entity: PersistId::new(8),
-                tick: Tick::new(43),
-                lsn: orrery_protocol::Lsn::new(3, 8192),
-            });
+            log.record(&AckRecord::Diff(evidence(8, 43, 3, 8192)));
         }
 
         // Re-open (as the kill-9 harness would) and parse every line back.
@@ -1280,23 +1296,39 @@ mod tests {
 
         let first: AckRecord = serde_json::from_str(lines[0]).unwrap();
         match first {
-            AckRecord::Diff { entity, tick, lsn } => {
+            AckRecord::Diff(DiffEvidence {
+                grid,
+                cell,
+                entity,
+                tick,
+                lsn,
+                payload_digest,
+            }) => {
+                assert_eq!(grid, GridId::ROOT);
+                assert_eq!(cell, CellId::ROOT);
                 assert_eq!(entity, PersistId::new(7));
                 assert_eq!(tick, Tick::new(42));
                 assert_eq!(lsn, orrery_protocol::Lsn::new(3, 4096));
+                assert_eq!(payload_digest, "digest-7-42");
             }
             other => panic!("expected a diff ack, got {other:?}"),
         }
         let second: AckRecord = serde_json::from_str(lines[1]).unwrap();
         match second {
-            AckRecord::Intent { intent_id, tick } => {
+            AckRecord::Intent { intent_id, outcome } => {
                 assert_eq!(
                     intent_id,
                     // 0x1122_3344_5566_7788_99aa_bbcc_ddee_ff00 in decimal —
                     // the harness compares the string, so this is lossless.
                     "213458173728644058818963591144807231488"
                 );
-                assert_eq!(tick, Tick::new(9));
+                assert_eq!(
+                    outcome,
+                    IntentOutcomeEvidence::Committed {
+                        tick: Tick::new(9),
+                        minted: vec![PersistId::new(77)],
+                    }
+                );
             }
             other => panic!("expected an intent ack, got {other:?}"),
         }
@@ -1312,11 +1344,7 @@ mod tests {
             let mut log = AckLog {
                 writer: BufWriter::new(file),
             };
-            log.record(&AckRecord::Diff {
-                entity: PersistId::new(9),
-                tick: Tick::new(50),
-                lsn: orrery_protocol::Lsn::new(4, 0),
-            });
+            log.record(&AckRecord::Diff(evidence(9, 50, 4, 0)));
         }
         let text = std::fs::read_to_string(&path).unwrap();
         assert_eq!(text.lines().count(), 4);

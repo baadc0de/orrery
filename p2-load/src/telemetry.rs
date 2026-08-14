@@ -1,8 +1,8 @@
 //! JSONL telemetry output for the P2 latency gate.
 //!
 //! The p0-nat-test contract: one JSON object per line on stdout, tracing on
-//! stderr. Three record kinds — one `run_header` (run context), then one
-//! `sample` per latency observation in any of the four D16 series, then one
+//! stderr. Four record kinds — one `run_header` (run context), then `sample`
+//! or compact `sample_batch` latency observations in any D16 series, then one
 //! `run_footer`. Percentiles are computed by the consumer (`p2-dashboard`)
 //! from the raw samples with the shared bounded-memory histogram
 //! (`orrery_persist_client::latency`), so this stream is the full record — no
@@ -65,9 +65,21 @@ pub struct RunContext {
 #[derive(Debug, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum Record<'a> {
-    RunHeader { run: &'a RunContext },
-    Sample { series: &'a str, value_us: u64 },
-    RunFooter { note: &'a str },
+    RunHeader {
+        run: &'a RunContext,
+    },
+    Sample {
+        series: &'a str,
+        value_us: u64,
+    },
+    SampleBatch {
+        series: &'a str,
+        value_us: u64,
+        count: u64,
+    },
+    RunFooter {
+        note: &'a str,
+    },
 }
 
 /// Serialize and print one JSONL record on stdout. Never panics on a closed
@@ -104,6 +116,18 @@ pub fn sample(series: &'static str, value_us: u64) {
     emit(&Record::Sample { series, value_us });
 }
 
+/// Emit `count` identical latency samples compactly. This is principally for
+/// journal group-commit metrics, whose bucket counts originate in persistd.
+pub fn sample_batch(series: &'static str, value_us: u64, count: u64) {
+    if count != 0 {
+        emit(&Record::SampleBatch {
+            series,
+            value_us,
+            count,
+        });
+    }
+}
+
 /// Emit the `run_footer` record.
 pub fn run_footer(note: &str) {
     emit(&Record::RunFooter { note });
@@ -138,9 +162,9 @@ impl TelemetrySink {
         Self::default()
     }
 
-    /// Drain the not-yet-emitted samples from `hist` for `series` as JSONL
-    /// sample records. Buckets serialize in boundary order; each bucket count
-    /// delta becomes that many identical samples at the bucket's upper bound,
+    /// Drain the not-yet-emitted samples from `hist` for `series` as compact
+    /// JSONL sample-batch records. Buckets serialize in boundary order; each
+    /// bucket count delta becomes one batch at the bucket's upper bound,
     /// which lands the consumer's histogram in the same bucket the rig
     /// recorded — percentiles agree bucket-for-bucket.
     pub fn drain_histogram(&self, series: &'static str, hist: &LatencyHistogram) {
@@ -162,9 +186,7 @@ impl TelemetrySink {
             count -= skip;
             skip = 0;
             let value_us = bucket_upper_us(hist, i);
-            for _ in 0..count {
-                sample(series, value_us);
-            }
+            sample_batch(series, value_us, count);
         }
         *already = total;
     }

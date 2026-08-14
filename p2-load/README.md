@@ -48,11 +48,11 @@ one binary, one `--json` contract, tracing on stderr, JSON on stdout.
   `sessions × capacity < entities × diff_hz` the rig refuses to run with a
   clear message, rather than silently reporting queueing delay as commit
   latency.
-- **Dumps the acked set.** With `--ack-log <path>`, every ack is appended as
-  one JSON line — diffs with `(entity, tick, lsn)`, intents with
-  `(intent_id, tick)` — so a kill-9 harness can enumerate the pre-kill acked
-  set and diff it against the post-restart manifest (docs/12 §12.3: the
-  kill-9 assertion is a manifest comparison over *acked* state).
+- **Dumps durable evidence.** With `--ack-log <path>`, every non-provisional
+  bulk ack is appended with `(grid, cell, entity, tick, lsn, payload_digest)`;
+  every intent ack carries its lossless idempotency key and exact known outcome.
+  Provisional bulk acks are deliberately excluded. The recovery comparator
+  asserts the final acknowledged write per entity and every intent outcome.
 
 ## JSONL contract (what `--json` emits)
 
@@ -63,6 +63,7 @@ One JSON object per line on stdout; logs on stderr. Three record kinds:
  "entities":10000,"cells":128,"sessions":6,"diff_hz":2.0,
  "intent_mix":{"trade":0.02,"craft":0.01},"duration_secs":1800}}
 {"type":"sample","series":"bulk_ack_ms","value_us":2000}
+{"type":"sample_batch","series":"journal_commit_ms","value_us":1000,"count":64}
 {"type":"run_footer","note":"duration elapsed; diffs=… acks=… intents=…"}
 ```
 

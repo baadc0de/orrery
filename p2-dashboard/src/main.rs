@@ -11,8 +11,8 @@
 //! | `intent_commit_ms`   | < 10 ms                     |
 //! | `area_first_page_ms` | < 50 ms                     |
 //!
-//! The JSONL input carries *raw µs samples* (one JSON object per line, one
-//! sample per `series` field); this tool buckets them into the bounded-memory
+//! The JSONL input carries raw µs samples (one `sample`, or a compact
+//! `sample_batch` with an explicit count); this tool buckets them into the bounded-memory
 //! [`LatencyHistogram`] from the client crate, exactly as the rig does —
 //! percentiles come out of one code path on both sides of the wire, so the
 //! gate's reading and the rig's live CPU-side reading mean the same thing.
@@ -164,7 +164,7 @@ struct Report {
 /// fields are ignored so forward-compatible emitters do not break the gate.
 #[derive(Debug, Deserialize)]
 struct Record {
-    /// The record kind: `run_header` | `sample` | `run_footer`.
+    /// The record kind: `run_header` | `sample` | `sample_batch` | `run_footer`.
     #[serde(rename = "type")]
     kind: String,
     /// For `run_header`: the run context.
@@ -176,6 +176,9 @@ struct Record {
     /// For `sample`: the latency, µs.
     #[serde(default)]
     value_us: Option<u64>,
+    /// For `sample_batch`: number of identical values represented.
+    #[serde(default)]
+    count: Option<u64>,
 }
 
 #[derive(Parser)]
@@ -303,10 +306,17 @@ fn ingest(histograms: &mut [LatencyHistogram; 4], run_ctx: &mut Option<RunContex
                 *run_ctx = r.run;
             }
         }
-        "sample" => {
+        "sample" | "sample_batch" => {
             if let (Some(series), Some(value_us)) = (r.series, r.value_us) {
                 if let Some(idx) = SERIES_KEYS.iter().position(|&k| k == series) {
-                    histograms[idx].record(Duration::from_micros(value_us));
+                    let count = if r.kind == "sample_batch" {
+                        r.count.unwrap_or(0)
+                    } else {
+                        1
+                    };
+                    for _ in 0..count {
+                        histograms[idx].record(Duration::from_micros(value_us));
+                    }
                 }
             }
         }
@@ -484,6 +494,10 @@ mod tests {
         serde_json::json!({"type": "sample", "series": series, "value_us": value_us})
     }
 
+    fn sample_batch(series: &str, value_us: u64, count: u64) -> serde_json::Value {
+        serde_json::json!({"type": "sample_batch", "series": series, "value_us": value_us, "count": count})
+    }
+
     fn run_header() -> serde_json::Value {
         serde_json::json!({
             "type": "run_header",
@@ -586,6 +600,23 @@ mod tests {
             .filter(|v| v.get("series").and_then(|s| s.as_str()) != Some("intent_commit_ms"))
             .collect::<Vec<_>>();
         assert_ne!(run_gate_on(lines), ExitCode::SUCCESS);
+    }
+
+    #[test]
+    fn sample_batch_folds_exactly_like_repeated_samples() {
+        let path = tmp("batch");
+        let lines = vec![
+            sample_batch("journal_commit_ms", 1_500, 100),
+            sample_batch("bulk_ack_ms", 3_000, 100),
+            sample_batch("intent_commit_ms", 7_000, 100),
+            sample_batch("area_first_page_ms", 28_000, 100),
+        ];
+        write_jsonl(&path, &lines);
+        let loaded = load(std::slice::from_ref(&path)).unwrap();
+        assert_eq!(loaded.histograms[0].total(), 100);
+        assert_eq!(loaded.histograms[0].p99(), Duration::from_micros(2_000));
+        assert_eq!(loaded.histograms[3].total(), 100);
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
