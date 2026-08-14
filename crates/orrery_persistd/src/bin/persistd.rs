@@ -19,20 +19,26 @@
 //! On startup the binary prints the gateway's [`EndpointAddr`] as a single-line
 //! JSON object on stdout (tracing stays on stderr) so a harness can find the
 //! address. The two signals that trigger graceful shutdown are SIGTERM and
-//! Ctrl-C.
+//! Ctrl-C. `--metrics-jsonl` appends primary-side `journal_commit_ms`
+//! `sample_batch` records to a separate P2 artifact file; it never alters the
+//! stdout readiness contract.
 //!
 //! The demo path this enables: start the binary with `--secret-key`, load it,
 //! `kill -9` the process, restart from the same FDB cluster and secret key, and
 //! the world resumes (RPO 0 intents, bulk bounded by the journal window).
 
+use std::fs::OpenOptions;
+use std::io::{BufWriter, Write};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use clap::Parser;
 use glam::IVec3;
-use tokio::sync::Mutex;
+use tokio::sync::{oneshot, Mutex};
+use tokio::task::JoinHandle;
 
 use orrery_persistd::cluster::{ColdFallbackRouter, Router};
 use orrery_persistd::journal::{
@@ -107,6 +113,96 @@ struct Cli {
     /// decimal) or coordinate form `x,y,z@level`.
     #[arg(long, value_name = "RAW|X,Y,Z@LEVEL")]
     shard: Vec<ShardSpec>,
+
+    /// Append server-internal journal commit latency batches to this JSONL
+    /// file. Only an active gateway node emits these records; chain followers
+    /// remain passive and do not produce a D16 measurement stream.
+    #[arg(long, value_name = "PATH")]
+    metrics_jsonl: Option<PathBuf>,
+}
+
+/// The P2 artifact needs a compact, server-internal view of group-commit
+/// latency. A one-second export interval keeps file traffic negligible while
+/// preserving the fixed-memory histogram's buckets and counts.
+const METRICS_REPORT_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Owns the primary-only JSONL reporter and guarantees its final delta is
+/// flushed before the journal closes during a graceful shutdown.
+struct MetricsReporter {
+    shutdown: oneshot::Sender<()>,
+    task: JoinHandle<()>,
+}
+
+impl MetricsReporter {
+    async fn shutdown(self) {
+        // A completed reporter has dropped its receiver; that is already
+        // logged by the task and there is nothing more to signal.
+        let _ = self.shutdown.send(());
+        if let Err(error) = self.task.await {
+            tracing::warn!(%error, "journal metrics reporter task failed");
+        }
+    }
+}
+
+/// Start a compact JSONL reporter for the active node's local journal.
+///
+/// The caller deliberately invokes this only after the follower early-return:
+/// a passive follower mirrors records but must not be treated as the primary's
+/// server-internal commit-latency source.
+fn spawn_metrics_reporter(path: PathBuf, journal: Arc<Journal>) -> anyhow::Result<MetricsReporter> {
+    let file = OpenOptions::new().create(true).append(true).open(&path)?;
+    let (shutdown, mut stopped) = oneshot::channel();
+    let task = tokio::spawn(async move {
+        let metrics = journal.commit_metrics();
+        let mut cursor = metrics.snapshot();
+        let mut interval = tokio::time::interval(METRICS_REPORT_INTERVAL);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut writer = BufWriter::new(file);
+
+        loop {
+            tokio::select! {
+                _ = interval.tick() => {}
+                _ = &mut stopped => {
+                    if let Err(error) = write_journal_metric_batches(&mut writer, &metrics.delta(&mut cursor))
+                        .and_then(|()| writer.flush())
+                    {
+                        tracing::warn!(path = %path.display(), %error, "failed to flush final journal metrics");
+                    }
+                    break;
+                }
+            }
+
+            if let Err(error) =
+                write_journal_metric_batches(&mut writer, &metrics.delta(&mut cursor))
+                    .and_then(|()| writer.flush())
+            {
+                tracing::warn!(path = %path.display(), %error, "failed to write journal metrics; stopping reporter");
+                break;
+            }
+        }
+    });
+    Ok(MetricsReporter { shutdown, task })
+}
+
+/// Append P2-dashboard-compatible records for one telemetry delta.
+fn write_journal_metric_batches(
+    mut writer: impl Write,
+    samples: &[orrery_persistd::JournalCommitSample],
+) -> std::io::Result<()> {
+    for sample in samples {
+        serde_json::to_writer(
+            &mut writer,
+            &serde_json::json!({
+                "type": "sample_batch",
+                "series": "journal_commit_ms",
+                "value_us": sample.value_us,
+                "count": sample.count,
+            }),
+        )
+        .map_err(std::io::Error::other)?;
+        writer.write_all(b"\n")?;
+    }
+    Ok(())
 }
 
 #[tokio::main]
@@ -254,6 +350,19 @@ async fn main() -> anyhow::Result<()> {
     let runtime = Arc::new(Mutex::new(CellRuntime::open(&config, &checkpoint_store)?));
     let runtime_for_shutdown = Arc::clone(&runtime);
 
+    // This executes only on an active node: passive followers returned above
+    // before opening a runtime. Capture the journal before handing the runtime
+    // to the gateway/router so reporter lifetime is independent of routing.
+    let metrics_reporter = if let Some(path) = cli.metrics_jsonl.clone() {
+        let journal = {
+            let guard = runtime.lock().await;
+            Arc::clone(guard.journal())
+        };
+        Some(spawn_metrics_reporter(path, journal)?)
+    } else {
+        None
+    };
+
     // Chain replication is intentionally downstream of the journal ack path.
     // The transport is lazy: an unavailable follower marks the chain degraded
     // but never prevents the primary from serving local durable writes.
@@ -398,6 +507,10 @@ async fn main() -> anyhow::Result<()> {
 
     for scheduler in schedulers {
         scheduler.shutdown().await;
+    }
+
+    if let Some(reporter) = metrics_reporter {
+        reporter.shutdown().await;
     }
 
     // Close each runtime's journal explicitly.
@@ -919,7 +1032,50 @@ mod tests {
             fdb_cluster_file,
             secret_key: None,
             shard: Vec::new(),
+            metrics_jsonl: None,
         }
+    }
+
+    #[test]
+    fn journal_metrics_jsonl_uses_dashboard_sample_batch_contract() {
+        let mut output = Vec::new();
+        write_journal_metric_batches(
+            &mut output,
+            &[
+                orrery_persistd::JournalCommitSample {
+                    value_us: 2_000,
+                    count: 3,
+                },
+                orrery_persistd::JournalCommitSample {
+                    value_us: 5_000,
+                    count: 1,
+                },
+            ],
+        )
+        .expect("JSONL serialization succeeds");
+
+        let records: Vec<serde_json::Value> = std::str::from_utf8(&output)
+            .expect("JSONL is UTF-8")
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("valid JSONL record"))
+            .collect();
+        assert_eq!(
+            records,
+            vec![
+                serde_json::json!({
+                    "type": "sample_batch",
+                    "series": "journal_commit_ms",
+                    "value_us": 2_000,
+                    "count": 3,
+                }),
+                serde_json::json!({
+                    "type": "sample_batch",
+                    "series": "journal_commit_ms",
+                    "value_us": 5_000,
+                    "count": 1,
+                }),
+            ]
+        );
     }
 
     #[test]
