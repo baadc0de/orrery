@@ -49,11 +49,11 @@ use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::net::SocketAddr;
 use std::path::Path;
 use std::process::ExitCode;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use bytes::Bytes;
 use clap::Parser;
 use futures::FutureExt;
@@ -64,7 +64,7 @@ use serde::{Deserialize, Serialize};
 use orrery_persist_client::config::PersistClientConfig;
 use orrery_persist_client::latency::LatencyHistogram;
 use orrery_persist_client::{IntentQueue, UplinkScheduler};
-use orrery_protocol::channels::{Channel, encode_datagram, encode_stream_frame, untag};
+use orrery_protocol::channels::{encode_datagram, encode_stream_frame, untag, Channel};
 use orrery_protocol::{
     Attestation, CellId, DiffUplink, Epoch, GatewayMsg, GatewayReply, GridId, Intent, IntentOp,
     IntentOutcome, NodeId, PersistId, RecordKind, Tick,
@@ -72,8 +72,8 @@ use orrery_protocol::{
 
 use cli::Cli;
 use evidence::{
-    AckRecord, DiffEvidence, IntentOutcomeEvidence, RecoveredDiff, RecoveredEvidence,
-    compare_recovery,
+    compare_recovery, AckRecord, DiffEvidence, IntentOutcomeEvidence, RecoveredDiff,
+    RecoveredEvidence,
 };
 use telemetry::{RunContext, TelemetrySink};
 
@@ -395,7 +395,10 @@ async fn read_gateway_state(cli: &Cli, expected: &[DiffEvidence]) -> Result<Vec<
         .iter()
         .map(|diff| {
             let placement = inventory.get(&diff.entity).with_context(|| {
-                format!("recovered entity {:?} is absent from P2 inventory", diff.entity)
+                format!(
+                    "recovered entity {:?} is absent from P2 inventory",
+                    diff.entity
+                )
             })?;
             Ok(moved_cell(placement, diff.tick.0))
         })
@@ -419,6 +422,24 @@ fn recovery_inventory(cli: &Cli) -> Result<Inventory> {
 
 /// Read complete area pages for the requested physical cells.
 async fn read_snapshot_pages(
+    conn: &Connection,
+    cells: &[CellId],
+) -> Result<BTreeMap<CellId, BTreeMap<u32, (Vec<PersistId>, Vec<Bytes>)>>> {
+    // Subscribe travels on the QUIC packet lane.  A P2 recovery scan may
+    // cover hundreds of physical leaves, so never encode them all into one
+    // datagram (which is bounded to roughly an MTU).  This bound leaves ample
+    // room for the tagged postcard frame and is independent of page payload
+    // chunking, which the gateway handles separately.
+    const CELLS_PER_SUBSCRIBE: usize = 64;
+    let mut pages = BTreeMap::new();
+    for batch in cells.chunks(CELLS_PER_SUBSCRIBE) {
+        pages.extend(read_snapshot_batch(conn, batch).await?);
+    }
+    Ok(pages)
+}
+
+/// Read one datagram-safe batch of area pages.
+async fn read_snapshot_batch(
     conn: &Connection,
     cells: &[CellId],
 ) -> Result<BTreeMap<CellId, BTreeMap<u32, (Vec<PersistId>, Vec<Bytes>)>>> {
@@ -1676,11 +1697,9 @@ mod tests {
 
         assert_eq!(total, entities * (30 * 2 - 1));
         assert_eq!(sent_per_second[0], entities);
-        assert!(
-            sent_per_second[1..]
-                .iter()
-                .all(|&count| count == entities * 2)
-        );
+        assert!(sent_per_second[1..]
+            .iter()
+            .all(|&count| count == entities * 2));
     }
 
     #[test]
