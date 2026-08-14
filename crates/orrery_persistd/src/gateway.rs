@@ -28,8 +28,9 @@
 //!
 //! Because `CellRuntime` is `Send` but not `Sync` (its `CellActorHandle`s hold
 //! `JoinHandle`s), the gateway shares it behind a `tokio::sync::Mutex`. For a
-//! single persistd node this is correct serialization; a multi-node deployment
-//! would route by rendezvous placement instead (docs/08-persistence.md §3).
+//! single persistd node this is correct serialization; a real distributed
+//! deployment would route by rendezvous placement instead (docs/08-persistence.md
+//! §3), but the current reference binary does not ship that transport.
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -131,7 +132,7 @@ impl core::fmt::Display for GatewayError {
 impl core::error::Error for GatewayError {}
 
 /// A running gateway: an iroh endpoint that accepts client sessions and routes
-/// them onto a [`Router`] (a single runtime or a multi-node cluster).
+/// them onto a [`Router`] (a single runtime or a test cluster harness).
 pub struct GatewayServer {
     endpoint: Arc<Endpoint>,
     send_failures: Arc<AtomicU64>,

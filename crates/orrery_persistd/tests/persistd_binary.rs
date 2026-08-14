@@ -83,6 +83,24 @@ fn run_persistd(args: &[&str]) -> (String, String) {
     (node_id, endpoint_addr)
 }
 
+/// Run `persistd` and return its exit status plus stderr output.
+fn run_persistd_exit(args: &[&str]) -> (std::process::ExitStatus, String) {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let output = Command::new(persistd_binary())
+        .arg("--dir")
+        .arg(dir.path())
+        .arg("--bind")
+        .arg("127.0.0.1:0")
+        .args(args)
+        .output()
+        .expect("failed to run persistd");
+
+    (
+        output.status,
+        String::from_utf8(output.stderr).expect("stderr is utf-8"),
+    )
+}
+
 #[test]
 fn gateway_node_id_is_stable_across_restart() {
     // The same --secret-key must produce the same NodeId across two runs.
@@ -129,4 +147,22 @@ fn stdout_lines_are_json_only() {
 fn shard_level_flag_is_accepted() {
     // --shard-level 18 should be accepted (produces a valid shard cell).
     let (_, _) = run_persistd(&["--nodes", "1", "--shard-level", "18"]);
+}
+
+#[test]
+fn nodes_greater_than_one_are_rejected_with_an_actionable_message() {
+    let (status, stderr) = run_persistd_exit(&["--nodes", "2"]);
+
+    assert!(
+        !status.success(),
+        "persistd must exit non-zero when asked for more than one node"
+    );
+    assert!(
+        stderr.contains("node-to-node chain transport"),
+        "stderr should explain that the in-process MemChainTransport is not a distributed transport: {stderr}"
+    );
+    assert!(
+        stderr.contains("--nodes 2"),
+        "stderr should mention the rejected node count: {stderr}"
+    );
 }
