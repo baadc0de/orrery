@@ -181,8 +181,16 @@ async fn checkpoint_cell(
     store: &Arc<dyn CheckpointStore>,
     shard: CellId,
 ) -> Result<(), CheckpointError> {
-    let rt = runtime.lock().await;
-    rt.checkpoint_shard(shard, store.as_ref()).await
+    // The runtime mutex protects the actor topology, not checkpoint I/O.
+    // Resolve a cloneable target under it, then release it before the actor
+    // snapshot, durable-store transaction, and tombstone-pruning awaits. A
+    // root checkpoint can take seconds under load; holding this mutex would
+    // block every Router::apply from resolving its actor for that whole time.
+    let target = {
+        let rt = runtime.lock().await;
+        rt.checkpoint_target(shard)?
+    };
+    target.checkpoint(store.as_ref()).await
 }
 
 /// A jittered delay in `[interval - jitter, interval + jitter]`, seeded from
@@ -215,7 +223,8 @@ mod tests {
 
     use orrery_protocol::{CellId, GridId, NodeId};
 
-    use crate::checkpoint::{CheckpointStore, MemCheckpointStore};
+    use crate::checkpoint::{CheckpointData, CheckpointError, CheckpointStore, MemCheckpointStore};
+    use crate::cluster::Router;
     use crate::journal::{AdaptiveCommitMode, GroupCommitConfig};
     use crate::{CellRuntime, JournalConfig, RuntimeConfig};
 
@@ -243,6 +252,36 @@ mod tests {
     /// The checkpoint store as the trait object `CellRuntime::open` takes.
     fn ckpt_store(store: &Arc<MemCheckpointStore>) -> Arc<dyn CheckpointStore> {
         store.clone()
+    }
+
+    /// A store that announces entry into the durable write, then waits until
+    /// the test releases it. This models a slow FDB checkpoint transaction
+    /// without making the regression depend on a live FDB cluster.
+    #[derive(Default)]
+    struct BlockingCheckpointStore {
+        started: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+    }
+
+    #[async_trait::async_trait]
+    impl CheckpointStore for BlockingCheckpointStore {
+        async fn checkpoint(&self, _data: &CheckpointData) -> Result<(), CheckpointError> {
+            self.started.notify_one();
+            self.release.notified().await;
+            Ok(())
+        }
+
+        async fn load(
+            &self,
+            _shard: CellId,
+            _grid: GridId,
+        ) -> Result<Option<CheckpointData>, CheckpointError> {
+            Ok(None)
+        }
+
+        async fn delete(&self, _shard: CellId, _grid: GridId) -> Result<(), CheckpointError> {
+            Ok(())
+        }
     }
 
     #[test]
@@ -402,6 +441,62 @@ mod tests {
         scheduler.shutdown().await;
         // After shutdown the scheduler no longer holds the runtime Arc; take it
         // back so we can close the journal cleanly.
+        let rt = Arc::try_unwrap(runtime)
+            .unwrap_or_else(|_| panic!("scheduler released the runtime"))
+            .into_inner();
+        rt.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn checkpoint_store_wait_does_not_block_router_apply() {
+        let dir = tempfile::tempdir().unwrap();
+        let seed_store = Arc::new(MemCheckpointStore::new());
+        let runtime = Arc::new(tokio::sync::Mutex::new(
+            CellRuntime::open(&test_runtime_config(dir.path()), &ckpt_store(&seed_store)).unwrap(),
+        ));
+        let blocking_store = Arc::new(BlockingCheckpointStore::default());
+        let scheduler = spawn_checkpoint_scheduler(
+            Arc::clone(&runtime),
+            blocking_store.clone(),
+            &CheckpointConfig {
+                interval: Duration::from_secs(60),
+                jitter: Duration::ZERO,
+            },
+        );
+
+        // Park the checkpoint task inside durable storage. By this point its
+        // actor snapshot and watermark have already been captured.
+        assert!(scheduler.quiesce_signal().quiesce(CellId::ROOT).await);
+        tokio::time::timeout(Duration::from_secs(2), blocking_store.started.notified())
+            .await
+            .expect("checkpoint never entered durable store");
+
+        // Actor routing must remain available while the checkpoint store is
+        // stalled. Before checkpoint-target isolation this timed out waiting
+        // for the scheduler's runtime mutex.
+        use crate::payload_crc;
+        use orrery_protocol::{JournalRecord, Lsn, PersistId, RecordKind, Tick};
+        let rec = JournalRecord {
+            lsn: Lsn::new(0, 0),
+            cell: CellId::ROOT,
+            grid: GridId::ROOT,
+            entity: PersistId::new(99),
+            tick: Tick::new(1),
+            epoch: orrery_protocol::Epoch::new(0),
+            author: NodeId::from_bytes(&[0u8; 32]).expect("valid node id"),
+            kind: RecordKind::Spawn,
+            payload: bytes::Bytes::from_static(b"concurrent"),
+            crc: payload_crc(b"concurrent"),
+        };
+        let lsn =
+            tokio::time::timeout(Duration::from_secs(2), Router::apply(runtime.as_ref(), rec))
+                .await
+                .expect("Router::apply blocked behind checkpoint storage")
+                .expect("concurrent apply succeeds");
+        assert_eq!(lsn.segment, 0);
+
+        blocking_store.release.notify_one();
+        scheduler.shutdown().await;
         let rt = Arc::try_unwrap(runtime)
             .unwrap_or_else(|_| panic!("scheduler released the runtime"))
             .into_inner();

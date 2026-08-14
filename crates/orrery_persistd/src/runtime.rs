@@ -69,6 +69,58 @@ pub struct CellRuntime {
     joins: Arc<actor::ActorJoinSet>,
 }
 
+/// Everything needed to checkpoint one actor without retaining a borrow of
+/// the runtime that owns it.
+///
+/// The scheduler resolves this target while holding its topology mutex, then
+/// drops that mutex before asking the actor for a copy-on-update snapshot or
+/// awaiting durable storage. The cloned actor handle keeps the snapshot and
+/// post-commit tombstone pruning tied to the same actor incarnation. Durable
+/// stores still fence the captured `(node_id, epoch)` at commit time.
+pub(crate) struct CheckpointTarget {
+    handle: CellActorHandle,
+    node_id: u64,
+}
+
+impl CheckpointTarget {
+    /// Capture and durably store this actor's current state.
+    pub(crate) async fn checkpoint(
+        self,
+        store: &dyn CheckpointStore,
+    ) -> Result<(), crate::checkpoint::CheckpointError> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let snap = self
+            .handle
+            .checkpoint_snapshot()
+            .await
+            .map_err(|_| crate::checkpoint::CheckpointError::Store("actor gone".into()))?;
+        let data = CheckpointData {
+            shard: snap.shard,
+            grid: snap.grid,
+            node_id: self.node_id,
+            epoch: snap.epoch,
+            watermark: snap.ckpt_watermark,
+            entities: snap.entities,
+            by_cell: snap.by_cell,
+            tombstones: snap.tombstones,
+            taken_at_ms: now,
+        };
+        store.checkpoint(&data).await?;
+        // The store's GC pass cleared the expired tombstone rows (D11 §6,
+        // P-6); drop them from the same actor incarnation now so the next
+        // checkpoint does not rewrite them. Safe on failure: an interrupted
+        // checkpoint re-runs and clears them again, so a stale actor entry
+        // cannot resurrect a row.
+        self.handle.prune_tombstones(now).await.map_err(|_| {
+            crate::checkpoint::CheckpointError::Store("actor gone after checkpoint".into())
+        })?;
+        Ok(())
+    }
+}
+
 impl CellRuntime {
     /// Open the journal and spawn an actor per shard cell, seeded from the
     /// durable tier and recovered from the journal (§3.4).
@@ -579,37 +631,25 @@ impl CellRuntime {
         shard: CellId,
         store: &dyn CheckpointStore,
     ) -> Result<(), crate::checkpoint::CheckpointError> {
-        let handle = self.actor(self.grid, shard).ok_or_else(|| {
+        self.checkpoint_target(shard)?.checkpoint(store).await
+    }
+
+    /// Resolve a shard checkpoint to a cloneable actor target.
+    ///
+    /// This method performs no actor or storage await. Callers that protect a
+    /// runtime with a topology mutex can therefore resolve the target under
+    /// that mutex and release it before [`CheckpointTarget::checkpoint`].
+    pub(crate) fn checkpoint_target(
+        &self,
+        shard: CellId,
+    ) -> Result<CheckpointTarget, crate::checkpoint::CheckpointError> {
+        let handle = self.actor(self.grid, shard).cloned().ok_or_else(|| {
             crate::checkpoint::CheckpointError::Store(format!("no actor for shard {shard}"))
         })?;
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
-        let snap = handle
-            .checkpoint_snapshot()
-            .await
-            .map_err(|_| crate::checkpoint::CheckpointError::Store("actor gone".into()))?;
-        let data = CheckpointData {
-            shard: snap.shard,
-            grid: snap.grid,
+        Ok(CheckpointTarget {
+            handle,
             node_id: self.node_id,
-            epoch: snap.epoch,
-            watermark: snap.ckpt_watermark,
-            entities: snap.entities,
-            by_cell: snap.by_cell,
-            tombstones: snap.tombstones,
-            taken_at_ms: now,
-        };
-        store.checkpoint(&data).await?;
-        // The store's GC pass cleared the expired tombstone rows (D11 §6,
-        // P-6); drop them from the actor now so the next checkpoint does not
-        // rewrite them. Safe on failure: an interrupted checkpoint re-runs and
-        // clears them again, so a stale actor entry cannot resurrect a row.
-        handle.prune_tombstones(now).await.map_err(|_| {
-            crate::checkpoint::CheckpointError::Store("actor gone after checkpoint".into())
-        })?;
-        Ok(())
+        })
     }
 
     /// Restore an actor's state from `store`, then replay the journal tail.
