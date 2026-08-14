@@ -11,14 +11,42 @@ use std::time::Duration;
 use orrery_persistd::checkpoint::{CheckpointStore, MemCheckpointStore};
 use orrery_persistd::journal::{AdaptiveCommitMode, GroupCommitConfig};
 use orrery_persistd::{
-    payload_crc, spawn_checkpoint_scheduler, CellRuntime, CheckpointConfig, JournalConfig,
-    RuntimeConfig,
+    CellRuntime, CheckpointConfig, JournalConfig, RuntimeConfig, payload_crc,
+    spawn_checkpoint_scheduler,
 };
 
 use orrery_protocol::{CellId, Epoch, GridId, JournalRecord, Lsn, PersistId, RecordKind, Tick};
 
 #[cfg(feature = "fdb")]
 use orrery_persistd::checkpoint::ColdCellReader;
+#[cfg(feature = "fdb")]
+use orrery_persistd::{FenceRow, FenceStatus, FenceStore};
+
+/// Install the active ownership row required by FDB checkpoint writes. Tests
+/// share a cluster, so retain an already-correct row for restart coverage.
+#[cfg(feature = "fdb")]
+async fn activate_fdb_checkpoint_fence(cluster: &str, grid: GridId) {
+    activate_fdb_fence(cluster, grid, CellId::ROOT, 0, Epoch::new(0)).await;
+}
+
+#[cfg(feature = "fdb")]
+async fn activate_fdb_fence(cluster: &str, grid: GridId, shard: CellId, owner: u64, epoch: Epoch) {
+    let store = orrery_persistd::fence::FdbFenceStore::connect(cluster).unwrap();
+    let expected = FenceRow {
+        owner,
+        epoch,
+        status: FenceStatus::Active,
+    };
+    match store.read(grid, shard).await.unwrap() {
+        Some(row) => assert_eq!(row, expected, "test grid has unexpected fence"),
+        None => {
+            assert!(matches!(
+                store.fence(grid, shard, None, &expected).await.unwrap(),
+                orrery_persistd::FenceOutcome::Fenced
+            ));
+        }
+    }
+}
 
 fn test_node(n: u8) -> orrery_protocol::NodeId {
     let mut seed = [0u8; 32];
@@ -445,6 +473,7 @@ async fn fdb_checkpoint_roundtrip() {
         eprintln!("skipping: ORRERY_FDB_CLUSTER_FILE not set and no .fdb-dev/fdb.cluster");
         return;
     };
+    activate_fdb_checkpoint_fence(&cluster, GridId::new(9001)).await;
     let store = std::sync::Arc::new(
         orrery_persistd::checkpoint::FdbCheckpointStore::connect(&cluster).unwrap(),
     );
@@ -473,11 +502,13 @@ async fn fdb_checkpoint_roundtrip() {
         .unwrap();
     assert_eq!(ckpt.entities.len(), 10);
     store.delete(CellId::ROOT, GridId::new(9001)).await.unwrap();
-    assert!(store
-        .load(CellId::ROOT, GridId::new(9001))
-        .await
-        .unwrap()
-        .is_none());
+    assert!(
+        store
+            .load(CellId::ROOT, GridId::new(9001))
+            .await
+            .unwrap()
+            .is_none()
+    );
     rt.close().await.unwrap();
 }
 
@@ -488,6 +519,7 @@ async fn fdb_checkpoint_then_restore() {
         eprintln!("skipping: ORRERY_FDB_CLUSTER_FILE not set and no .fdb-dev/fdb.cluster");
         return;
     };
+    activate_fdb_checkpoint_fence(&cluster, GridId::new(9002)).await;
     let store = std::sync::Arc::new(
         orrery_persistd::checkpoint::FdbCheckpointStore::connect(&cluster).unwrap(),
     );
@@ -543,6 +575,7 @@ async fn fdb_cold_cell_area_load() {
         eprintln!("skipping: ORRERY_FDB_CLUSTER_FILE not set and no .fdb-dev/fdb.cluster");
         return;
     };
+    activate_fdb_checkpoint_fence(&cluster, GridId::new(9003)).await;
     let store = std::sync::Arc::new(
         orrery_persistd::checkpoint::FdbCheckpointStore::connect(&cluster).unwrap(),
     );
@@ -584,11 +617,13 @@ async fn fdb_cold_cell_area_load() {
     }
 
     store.delete(CellId::ROOT, GridId::new(9003)).await.unwrap();
-    assert!(store
-        .read_cold(GridId::new(9003), CellId::ROOT)
-        .await
-        .unwrap()
-        .is_none());
+    assert!(
+        store
+            .read_cold(GridId::new(9003), CellId::ROOT)
+            .await
+            .unwrap()
+            .is_none()
+    );
 }
 
 #[cfg(feature = "fdb")]
@@ -648,6 +683,7 @@ async fn fdb_subtree_keying_and_watermark_only_checkpoint() {
         tombstones: HashMap::new(),
         taken_at_ms: 1_700_000_000_000,
     };
+    activate_fdb_fence(&cluster, data.grid, data.shard, data.node_id, data.epoch).await;
     let store = std::sync::Arc::new(
         orrery_persistd::checkpoint::FdbCheckpointStore::connect(&cluster).unwrap(),
     );
@@ -693,16 +729,20 @@ async fn fdb_subtree_keying_and_watermark_only_checkpoint() {
 
     // P-3: delete clears the shard's subtree but not the foreign row.
     store.delete(shard, GridId::new(9004)).await.unwrap();
-    assert!(store
-        .load(shard, GridId::new(9004))
-        .await
-        .unwrap()
-        .is_none());
-    assert!(store
-        .read_cold(GridId::new(9004), shard)
-        .await
-        .unwrap()
-        .is_none());
+    assert!(
+        store
+            .load(shard, GridId::new(9004))
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .read_cold(GridId::new(9004), shard)
+            .await
+            .unwrap()
+            .is_none()
+    );
     let foreign_page = store
         .read_cold(GridId::new(9004), foreign)
         .await
@@ -712,11 +752,13 @@ async fn fdb_subtree_keying_and_watermark_only_checkpoint() {
     assert!(foreign_page.entities.contains_key(&PersistId::new(3)));
 
     store.delete(foreign, GridId::new(9004)).await.unwrap();
-    assert!(store
-        .read_cold(GridId::new(9004), foreign)
-        .await
-        .unwrap()
-        .is_none());
+    assert!(
+        store
+            .read_cold(GridId::new(9004), foreign)
+            .await
+            .unwrap()
+            .is_none()
+    );
 }
 
 #[cfg(feature = "fdb")]
@@ -766,6 +808,7 @@ async fn fdb_tombstones_write_gc_and_isolate_grids() {
         ]),
         taken_at_ms: 1_700_000_000_000,
     };
+    activate_fdb_fence(&cluster, data.grid, data.shard, data.node_id, data.epoch).await;
     store.checkpoint(&data).await.unwrap();
 
     // The cold scan serves only the live entity; neither tombstone leaks.
@@ -814,6 +857,14 @@ async fn fdb_tombstones_write_gc_and_isolate_grids() {
         tombstones: HashMap::new(),
         taken_at_ms: 1_700_000_000_000,
     };
+    activate_fdb_fence(
+        &cluster,
+        data2.grid,
+        data2.shard,
+        data2.node_id,
+        data2.epoch,
+    )
+    .await;
     store.checkpoint(&data2).await.unwrap();
     let page2 = store
         .read_cold(g2, cell)
@@ -823,11 +874,13 @@ async fn fdb_tombstones_write_gc_and_isolate_grids() {
     assert!(page2.entities.contains_key(&PersistId::new(3)));
 
     store.delete(shard, GridId::new(9005)).await.unwrap();
-    assert!(store
-        .load(shard, GridId::new(9005))
-        .await
-        .unwrap()
-        .is_none());
+    assert!(
+        store
+            .load(shard, GridId::new(9005))
+            .await
+            .unwrap()
+            .is_none()
+    );
     let page2_after = store
         .read_cold(g2, cell)
         .await
@@ -848,6 +901,7 @@ async fn fdb_tombstone_end_to_end_lifecycle() {
         eprintln!("skipping: ORRERY_FDB_CLUSTER_FILE not set and no .fdb-dev/fdb.cluster");
         return;
     };
+    activate_fdb_checkpoint_fence(&cluster, GridId::new(9007)).await;
     let store = std::sync::Arc::new(
         orrery_persistd::checkpoint::FdbCheckpointStore::connect(&cluster).unwrap(),
     );

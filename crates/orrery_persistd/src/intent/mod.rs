@@ -29,7 +29,7 @@ use orrery_protocol::{Intent, IntentOutcome, REASON_CONTENTION_EXHAUSTED};
 #[cfg(feature = "fdb")]
 mod fdb;
 #[cfg(feature = "fdb")]
-pub use fdb::FdbIntentExecutor;
+pub use fdb::{FdbIntentExecutor, IntentFence};
 
 /// The result of admitting an [`Intent`] before execution.
 ///

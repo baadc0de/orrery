@@ -17,9 +17,12 @@ use foundationdb::Database;
 
 use orrery_protocol::{CellId, GridId};
 
-use crate::fence::{FenceError, FenceOutcome, FenceRow, FenceStatus, FenceStore};
-use crate::keyspace;
 use crate::FdbContext;
+use crate::fence::{
+    ActivationOutcome, FenceError, FenceOutcome, FenceRow, FenceStatus, FenceStore,
+    ShardActivation, validate_activation_set,
+};
+use crate::keyspace;
 
 /// Encode a fence row (postcard, matching the in-memory store's wire format).
 fn encode_row(row: &FenceRow) -> Result<Vec<u8>, FenceError> {
@@ -113,6 +116,70 @@ impl FenceStore for FdbFenceStore {
         })
         .await
         .map_err(|e: foundationdb::FdbBindingError| FenceError::Store(format!("fence txn: {e}")))
+    }
+
+    async fn activate_shards(
+        &self,
+        grid: GridId,
+        owner: u64,
+        shards: &[ShardActivation],
+    ) -> Result<ActivationOutcome, FenceError> {
+        validate_activation_set(shards)?;
+        let db = Arc::clone(&self.db);
+        let requests: Vec<(CellId, Vec<u8>, Option<FenceRow>, FenceRow)> = shards
+            .iter()
+            .map(|request| {
+                let row = FenceRow {
+                    owner,
+                    epoch: orrery_protocol::Epoch::new(
+                        request.expected.map_or(0, |current| current.epoch.0) + 1,
+                    ),
+                    status: FenceStatus::Active,
+                };
+                (
+                    request.shard,
+                    keyspace::fence_key(grid, request.shard).to_vec(),
+                    request.expected,
+                    row,
+                )
+            })
+            .collect();
+        db.run(move |trx, _| {
+            let requests = requests.clone();
+            async move {
+                // Read the complete compare set before writing any row. FDB
+                // commits this transaction all-or-nothing; a conflicting fence
+                // change makes `run` retry and then observe the mismatch.
+                for (shard, key, expected, _) in &requests {
+                    let raw = trx.get(key, false).await?;
+                    let current = match raw {
+                        Some(bytes) => Some(decode_row(bytes.as_ref()).map_err(|e| {
+                            foundationdb::FdbBindingError::new_custom_error(Box::new(e))
+                        })?),
+                        None => None,
+                    };
+                    if current != *expected {
+                        return Ok(ActivationOutcome::Conflict {
+                            shard: *shard,
+                            current,
+                        });
+                    }
+                }
+                let mut rows = Vec::with_capacity(requests.len());
+                for (shard, key, _, row) in &requests {
+                    let encoded = encode_row(row).map_err(|e| {
+                        foundationdb::FdbBindingError::new_custom_error(Box::new(e))
+                    })?;
+                    trx.set(key, &encoded);
+                    rows.push((*shard, *row));
+                }
+                Ok(ActivationOutcome::Activated { rows })
+            }
+        })
+        .await
+        .map_err(|e: foundationdb::FdbBindingError| {
+            FenceError::Store(format!("activation txn: {e}"))
+        })
     }
 
     async fn begin_split(

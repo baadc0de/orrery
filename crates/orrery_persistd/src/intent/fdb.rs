@@ -31,10 +31,13 @@ use std::sync::Arc;
 use foundationdb::options::MutationType;
 use foundationdb::{Database, FdbBindingError};
 
-use orrery_protocol::{AccountId, AssetId, GridId, Intent, IntentOutcome, PersistId};
+use orrery_protocol::{
+    AccountId, AssetId, CellId, Epoch, GridId, Intent, IntentOutcome, PersistId,
+};
 
-use crate::keyspace;
 use crate::FdbContext;
+use crate::fence::{FenceRow, FenceStatus};
+use crate::keyspace;
 
 use super::{IntentError, IntentExecutor};
 
@@ -57,6 +60,18 @@ const INTENT_ROW_RETENTION_MS: u64 = 60 * 60 * 1000;
 pub struct FdbIntentExecutor {
     db: Arc<Database>,
     grid: GridId,
+    fence: Option<IntentFence>,
+}
+
+/// The active shard ownership an intent executor is allowed to write under.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IntentFence {
+    /// The grid-relative shard that admits these intents.
+    pub shard: CellId,
+    /// Active persistd node id.
+    pub owner: u64,
+    /// Active fencing epoch.
+    pub epoch: Epoch,
 }
 
 impl FdbIntentExecutor {
@@ -69,7 +84,27 @@ impl FdbIntentExecutor {
     /// Build an executor from an already-open database handle.
     #[must_use]
     pub fn from_database(db: Arc<Database>, grid: GridId) -> Self {
-        Self { db, grid }
+        Self {
+            db,
+            grid,
+            fence: None,
+        }
+    }
+
+    /// Build an executor whose writes require this exact active shard fence.
+    #[must_use]
+    pub fn fenced_from_context(context: &FdbContext, grid: GridId, fence: IntentFence) -> Self {
+        Self::fenced_from_database(context.database(), grid, fence)
+    }
+
+    /// Build a fenced executor from an already-open database handle.
+    #[must_use]
+    pub fn fenced_from_database(db: Arc<Database>, grid: GridId, fence: IntentFence) -> Self {
+        Self {
+            db,
+            grid,
+            fence: Some(fence),
+        }
     }
 
     /// Connect to the cluster at `cluster_file`, minting ids from `grid`'s
@@ -90,11 +125,53 @@ impl FdbIntentExecutor {
     }
 }
 
+/// Require the active ownership row in the same transaction as an intent's
+/// idempotency row and effects. A promotion changes this key and fences a
+/// zombie executor before it can commit.
+async fn require_intent_fence(
+    trx: &foundationdb::Transaction,
+    grid: GridId,
+    fence: IntentFence,
+    intent: &Intent,
+) -> Result<(), FdbBindingError> {
+    if intent.cell_epoch != fence.epoch {
+        return Err(FdbBindingError::new_custom_error(Box::new(
+            IntentError::Store(format!(
+                "intent epoch {} does not match active shard epoch {}",
+                intent.cell_epoch, fence.epoch
+            )),
+        )));
+    }
+    let key = keyspace::fence_key(grid, fence.shard);
+    let current: Option<FenceRow> = trx
+        .get(&key, false)
+        .await?
+        .map(|bytes| postcard::from_bytes(bytes.as_ref()))
+        .transpose()
+        .map_err(store_err("fence row decode"))?;
+    if current
+        != Some(FenceRow {
+            owner: fence.owner,
+            epoch: fence.epoch,
+            status: FenceStatus::Active,
+        })
+    {
+        return Err(FdbBindingError::new_custom_error(Box::new(
+            IntentError::Store(format!(
+                "intent fence mismatch for {grid}/{}: expected owner {} epoch {}, got {current:?}",
+                fence.shard, fence.owner, fence.epoch
+            )),
+        )));
+    }
+    Ok(())
+}
+
 #[async_trait::async_trait]
 impl IntentExecutor for FdbIntentExecutor {
     async fn execute(&self, intent: &Intent) -> Result<IntentOutcome, IntentError> {
         let intent = intent.clone();
         let grid = self.grid;
+        let fence = self.fence;
         // `db.run` is the retry loop (§7: "retry loop is db.run's"). We bound
         // the `not_committed` retries with an interior-mutable attempt counter:
         // past the limit the closure returns `ContentionExhausted` as a custom
@@ -123,6 +200,10 @@ impl IntentExecutor for FdbIntentExecutor {
                         let row: keyspace::IntentRow =
                             postcard::from_bytes(&prev).map_err(store_err("intent row decode"))?;
                         return Ok(row.outcome);
+                    }
+
+                    if let Some(fence) = fence {
+                        require_intent_fence(&trx, grid, fence, &intent).await?;
                     }
 
                     // Step 1: reads register conflict ranges. The tick is

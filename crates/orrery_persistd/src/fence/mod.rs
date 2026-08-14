@@ -65,6 +65,38 @@ pub enum FenceOutcome {
     },
 }
 
+/// One shard participating in an atomic ownership activation.
+///
+/// `expected` is the row observed by the coordinator before activation.  It
+/// is deliberately part of the request: bootstrap (`None`), restart (our
+/// previous row), and promotion (the failed primary's row) all use the same
+/// compare-and-set rule and cannot silently overwrite a newer owner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ShardActivation {
+    /// The grid-relative shard cell to activate.
+    pub shard: CellId,
+    /// The exact durable row expected before this activation.
+    pub expected: Option<FenceRow>,
+}
+
+/// Result of atomically activating a set of shards.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ActivationOutcome {
+    /// Every requested shard now has this node as its active owner.  Rows are
+    /// returned in the request's canonical shard order.
+    Activated {
+        /// The newly durable active rows, in canonical shard order.
+        rows: Vec<(CellId, FenceRow)>,
+    },
+    /// One request no longer matched its durable row; none of the set changed.
+    Conflict {
+        /// The request whose precondition no longer matched.
+        shard: CellId,
+        /// The current durable row for that shard.
+        current: Option<FenceRow>,
+    },
+}
+
 /// Errors from a [`FenceStore`].
 #[derive(Debug)]
 pub enum FenceError {
@@ -75,6 +107,9 @@ pub enum FenceError {
         /// The row actually present (or `None` if the shard has no row).
         current: Option<FenceRow>,
     },
+    /// An activation set was not in canonical order or contains overlapping
+    /// subtrees.  Such a set is ambiguous and must never be committed.
+    InvalidActivation(String),
 }
 
 impl core::fmt::Display for FenceError {
@@ -82,6 +117,7 @@ impl core::fmt::Display for FenceError {
         match self {
             Self::Store(s) => write!(f, "fence store error: {s}"),
             Self::Conflict { current } => write!(f, "fence conflict: current row {current:?}"),
+            Self::InvalidActivation(s) => write!(f, "invalid shard activation: {s}"),
         }
     }
 }
@@ -116,6 +152,20 @@ pub trait FenceStore: Send + Sync {
         expected: Option<&FenceRow>,
         new: &FenceRow,
     ) -> Result<FenceOutcome, FenceError>;
+
+    /// Atomically activate a canonical, non-overlapping shard set for
+    /// `owner`.  Each row advances its expected epoch by one and becomes
+    /// [`FenceStatus::Active`].
+    ///
+    /// This is the durable ownership transition used for bootstrap, clean
+    /// restart, and follower promotion.  A mismatch returns the offending
+    /// row and leaves *every* shard unchanged.
+    async fn activate_shards(
+        &self,
+        grid: GridId,
+        owner: u64,
+        shards: &[ShardActivation],
+    ) -> Result<ActivationOutcome, FenceError>;
 
     /// Atomically mark `parent` `Splitting` and write the child rows (§3.5).
     ///
@@ -181,6 +231,38 @@ impl FenceStore for MemFenceStore {
         Ok(FenceOutcome::Fenced)
     }
 
+    async fn activate_shards(
+        &self,
+        grid: GridId,
+        owner: u64,
+        shards: &[ShardActivation],
+    ) -> Result<ActivationOutcome, FenceError> {
+        validate_activation_set(shards)?;
+        let mut map = self.map.lock().expect("mem fence lock");
+        for request in shards {
+            let current = map.get(&(grid, request.shard)).copied();
+            if current != request.expected {
+                return Ok(ActivationOutcome::Conflict {
+                    shard: request.shard,
+                    current,
+                });
+            }
+        }
+        let rows = shards
+            .iter()
+            .map(|request| {
+                let row = FenceRow {
+                    owner,
+                    epoch: Epoch::new(request.expected.map_or(0, |row| row.epoch.0) + 1),
+                    status: FenceStatus::Active,
+                };
+                map.insert((grid, request.shard), row);
+                (request.shard, row)
+            })
+            .collect();
+        Ok(ActivationOutcome::Activated { rows })
+    }
+
     async fn begin_split(
         &self,
         grid: GridId,
@@ -214,6 +296,34 @@ impl FenceStore for MemFenceStore {
             .remove(&(grid, shard));
         Ok(())
     }
+}
+
+/// Validate the canonical ordering required to make a shard-set activation
+/// unambiguous.  A parent and child overlap even if their raw Morton values
+/// sort differently, so check prefix relation as well as strict ordering.
+pub(crate) fn validate_activation_set(shards: &[ShardActivation]) -> Result<(), FenceError> {
+    if shards.is_empty() {
+        return Err(FenceError::InvalidActivation("empty shard set".into()));
+    }
+    for pair in shards.windows(2) {
+        let previous = pair[0].shard;
+        let next = pair[1].shard;
+        if previous.to_bits() >= next.to_bits() {
+            return Err(FenceError::InvalidActivation(
+                "shards must be strictly sorted by CellId bits".into(),
+            ));
+        }
+    }
+    for (index, request) in shards.iter().enumerate() {
+        if shards[index + 1..].iter().any(|other| {
+            request.shard.is_prefix_of(other.shard) || other.shard.is_prefix_of(request.shard)
+        }) {
+            return Err(FenceError::InvalidActivation(
+                "shards must not have overlapping subtrees".into(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -354,5 +464,47 @@ mod tests {
             .unwrap();
         store.retire(GridId::ROOT, CellId::ROOT).await.unwrap();
         assert_eq!(store.read(GridId::ROOT, CellId::ROOT).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn activation_is_all_or_nothing() {
+        let store = MemFenceStore::new();
+        let children = CellId::ROOT.children();
+        let mut shards = [children[0], children[1]];
+        shards.sort_by_key(|cell| cell.to_bits());
+        let requests = shards.map(|shard| ShardActivation {
+            shard,
+            expected: None,
+        });
+        let ActivationOutcome::Activated { rows } = store
+            .activate_shards(GridId::ROOT, 8, &requests)
+            .await
+            .unwrap()
+        else {
+            panic!("bootstrap activation must succeed");
+        };
+        assert!(
+            rows.iter()
+                .all(|(_, row)| row.owner == 8 && row.epoch == Epoch::new(1))
+        );
+
+        let stale = [
+            ShardActivation {
+                shard: rows[0].0,
+                expected: Some(rows[0].1),
+            },
+            ShardActivation {
+                shard: rows[1].0,
+                expected: None,
+            },
+        ];
+        assert!(matches!(
+            store.activate_shards(GridId::ROOT, 9, &stale).await.unwrap(),
+            ActivationOutcome::Conflict { shard, .. } if shard == rows[1].0
+        ));
+        assert_eq!(
+            store.read(GridId::ROOT, rows[0].0).await.unwrap(),
+            Some(rows[0].1)
+        );
     }
 }

@@ -8,11 +8,14 @@ use std::sync::Arc;
 use orrery_protocol::{CellId, Epoch, GridId, JournalRecord, Lsn, PersistId, RecordKind};
 
 use crate::actor::{
-    self, CellActorHandle, EntityRecord, SnapshotPage, Tombstone, TOMBSTONE_RETENTION_MS,
+    self, CellActorHandle, EntityRecord, SnapshotPage, TOMBSTONE_RETENTION_MS, Tombstone,
 };
 use crate::checkpoint::{CheckpointData, CheckpointStore};
 use crate::crc::crc32c;
-use crate::fence::{FenceOutcome, FenceRow, FenceStatus, FenceStore, MemFenceStore};
+use crate::fence::{
+    ActivationOutcome, FenceOutcome, FenceRow, FenceStatus, FenceStore, MemFenceStore,
+    ShardActivation,
+};
 use crate::journal::{Journal, JournalConfig};
 use crate::placement::{RendezvousHasher, RendezvousNode};
 
@@ -336,6 +339,80 @@ impl CellRuntime {
             }
             Err(e) => Err(e),
         }
+    }
+
+    /// Atomically activate a canonical shard set for this node.
+    ///
+    /// This is the ownership hand-off entry point for bootstrap, restart, and
+    /// follower promotion. The durable fence transition happens before any
+    /// local actor is replaced, so a stale expected row cannot leave a
+    /// half-activated local runtime. Callers must not expose a gateway until
+    /// this returns [`ActivationOutcome::Activated`].
+    pub async fn activate_shards(
+        &mut self,
+        requests: &[ShardActivation],
+        checkpoints: &dyn CheckpointStore,
+    ) -> Result<ActivationOutcome, crate::fence::FenceError> {
+        let outcome = self
+            .fence
+            .activate_shards(self.grid, self.node_id, requests)
+            .await?;
+        let ActivationOutcome::Activated { rows } = &outcome else {
+            return Ok(outcome);
+        };
+
+        // The committed rows are the sole authority for the local epoch. Only
+        // after the whole set committed do we replace actors. Existing actors
+        // supply the freshest journal-recovered state; an absent actor starts
+        // from its durable checkpoint.
+        for (shard, row) in rows {
+            let ckpt = checkpoints
+                .load(*shard, self.grid)
+                .await
+                .map_err(|e| crate::fence::FenceError::Store(e.to_string()))?;
+            let (mut state, mut by_cell, mut tombstones, mut watermark) = ckpt.map_or_else(
+                || {
+                    (
+                        HashMap::new(),
+                        HashMap::new(),
+                        HashMap::new(),
+                        Lsn::new(0, 0),
+                    )
+                },
+                |c| (c.entities, c.by_cell, c.tombstones, c.watermark),
+            );
+            if let Some(old) = self.actors.remove(shard) {
+                if let Ok(snapshot) = old.checkpoint_snapshot().await {
+                    if snapshot.ckpt_watermark >= watermark {
+                        state = snapshot.entities;
+                        by_cell = snapshot.by_cell;
+                        tombstones = snapshot.tombstones;
+                        watermark = snapshot.ckpt_watermark;
+                    }
+                }
+                old.shutdown().await;
+            }
+            self.actors.insert(
+                *shard,
+                actor::spawn_preloaded(
+                    *shard,
+                    self.grid,
+                    row.epoch,
+                    Arc::clone(&self.journal),
+                    state,
+                    by_cell,
+                    tombstones,
+                    watermark,
+                    &self.joins,
+                ),
+            );
+        }
+        self.epoch = rows
+            .iter()
+            .map(|(_, row)| row.epoch)
+            .max()
+            .unwrap_or(self.epoch);
+        Ok(outcome)
     }
 
     /// Split a hot shard into its eight children (§3.5).

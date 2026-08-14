@@ -43,11 +43,49 @@ use futures::TryStreamExt;
 
 use orrery_protocol::{CellId, Epoch, GridId, Lsn, PersistId};
 
-use crate::keyspace;
 use crate::FdbContext;
+use crate::keyspace;
 
 use crate::actor::{EntityRecord, SnapshotPage, Tombstone};
 use crate::checkpoint::{CheckpointData, CheckpointError, CheckpointStore, ColdCellReader};
+use crate::fence::{FenceRow, FenceStatus};
+
+/// Require the active ownership row in the transaction that writes a
+/// checkpoint. Reading the row establishes the conflict range which fences a
+/// zombie checkpoint when a promotion changes the owner or epoch.
+async fn require_active_fence(
+    trx: &foundationdb::Transaction,
+    grid: GridId,
+    shard: CellId,
+    owner: u64,
+    epoch: Epoch,
+) -> Result<(), foundationdb::FdbBindingError> {
+    let key = keyspace::fence_key(grid, shard);
+    let current: Option<FenceRow> = trx
+        .get(&key, false)
+        .await?
+        .map(|bytes| postcard::from_bytes(bytes.as_ref()))
+        .transpose()
+        .map_err(|e| {
+            foundationdb::FdbBindingError::new_custom_error(Box::new(CheckpointError::Store(
+                format!("fence decode: {e}"),
+            )))
+        })?;
+    if current
+        != Some(FenceRow {
+            owner,
+            epoch,
+            status: FenceStatus::Active,
+        })
+    {
+        return Err(foundationdb::FdbBindingError::new_custom_error(Box::new(
+            CheckpointError::Store(format!(
+                "fence mismatch for {grid}/{shard}: expected active owner {owner} epoch {epoch}, got {current:?}"
+            )),
+        )));
+    }
+    Ok(())
+}
 
 /// The `ckpt/{shard}` value: the recovery watermark, exactly as D11 §6 —
 /// `(node_id, journal lsn, epoch, time)`. Deliberately **not** the entity bag
@@ -204,6 +242,7 @@ impl CheckpointStore for FdbCheckpointStore {
         db.run(|trx, _| {
             let data = data.clone();
             async move {
+                require_active_fence(&trx, data.grid, data.shard, data.node_id, data.epoch).await?;
                 for (entity, record) in &data.entities {
                     // P-2: keyed by the entity's own cell (§6
                     // `world/{cell_id}/…`), not the shard. `by_cell` is carried

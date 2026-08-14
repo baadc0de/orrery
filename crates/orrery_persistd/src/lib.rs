@@ -46,10 +46,13 @@ pub use checkpoint::{
 pub use cluster::{Cluster, ColdFallbackRouter, Router};
 #[cfg(feature = "fdb")]
 pub use fdb::{FdbContext, FdbContextError};
-pub use fence::{FenceError, FenceOutcome, FenceRow, FenceStatus, FenceStore, MemFenceStore};
+pub use fence::{
+    ActivationOutcome, FenceError, FenceOutcome, FenceRow, FenceStatus, FenceStore, MemFenceStore,
+    ShardActivation,
+};
 pub use gateway::{GatewayConfig, GatewayError, GatewayServer, GATEWAY_ALPN};
 #[cfg(feature = "fdb")]
-pub use intent::FdbIntentExecutor;
+pub use intent::{FdbIntentExecutor, IntentFence};
 pub use intent::{
     IntentError, IntentExecutor, IntentPrecheck, IntentValidator, IntentVerdict, MemIntentExecutor,
     PermissiveValidator,

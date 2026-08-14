@@ -9,7 +9,7 @@ use std::time::Duration;
 use orrery_persistd::checkpoint::{CheckpointStore, MemCheckpointStore};
 use orrery_persistd::fence::{FenceError, FenceOutcome, FenceRow, FenceStatus, MemFenceStore};
 use orrery_persistd::journal::{AdaptiveCommitMode, GroupCommitConfig};
-use orrery_persistd::{payload_crc, CellRuntime, FenceStore, JournalConfig, RuntimeConfig};
+use orrery_persistd::{CellRuntime, FenceStore, JournalConfig, RuntimeConfig, payload_crc};
 
 use orrery_protocol::{CellId, Epoch, GridId, JournalRecord, Lsn, PersistId, RecordKind, Tick};
 
@@ -289,12 +289,13 @@ async fn split_partitions_entities_and_retires_parent() {
     }
 
     // Parent row retired; children active.
-    assert!(rt
-        .fence()
-        .read(GridId::ROOT, shard)
-        .await
-        .unwrap()
-        .is_none());
+    assert!(
+        rt.fence()
+            .read(GridId::ROOT, shard)
+            .await
+            .unwrap()
+            .is_none()
+    );
     for (child, _) in &child_rows {
         let row = rt
             .fence()
@@ -452,12 +453,13 @@ async fn split_conflicts_on_stale_parent_row() {
     assert!(rt.actor(GridId::ROOT, shard).is_some());
     for child in shard.children() {
         // No child fence row was written.
-        assert!(rt
-            .fence()
-            .read(GridId::ROOT, child)
-            .await
-            .unwrap()
-            .is_none());
+        assert!(
+            rt.fence()
+                .read(GridId::ROOT, child)
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     rt.close().await.unwrap();
@@ -541,6 +543,64 @@ async fn fdb_fence_cas_roundtrip() {
 
     store.retire(GridId::ROOT, shard).await.unwrap();
     assert_eq!(store.read(GridId::ROOT, shard).await.unwrap(), None);
+}
+
+#[cfg(feature = "fdb")]
+#[tokio::test]
+async fn fdb_shard_set_activation_is_atomic_and_fenced() {
+    use orrery_persistd::{ActivationOutcome, ShardActivation};
+
+    let Some(store) = fdb_fence_store() else {
+        eprintln!("skipping: no reachable FDB cluster");
+        return;
+    };
+    let grid = GridId::new(9_401);
+    // Distinct non-overlapping cells in one grid, reserved for this test.
+    let left = shard_cell(4, 0, 0);
+    let right = shard_cell(4, 1, 0);
+    store.retire(grid, left).await.unwrap();
+    store.retire(grid, right).await.unwrap();
+    let requests = [
+        ShardActivation {
+            shard: left,
+            expected: None,
+        },
+        ShardActivation {
+            shard: right,
+            expected: None,
+        },
+    ];
+    let first = store.activate_shards(grid, 41, &requests).await.unwrap();
+    let rows = match first {
+        ActivationOutcome::Activated { rows } => rows,
+        other => panic!("expected activation, got {other:?}"),
+    };
+    assert_eq!(rows.len(), 2);
+    assert!(
+        rows.iter()
+            .all(|(_, row)| row.owner == 41 && row.epoch == Epoch::new(1))
+    );
+
+    // One stale expectation rejects the *whole* set: the first shard must not
+    // advance just because it still matched.
+    let stale = [
+        ShardActivation {
+            shard: left,
+            expected: Some(rows[0].1),
+        },
+        ShardActivation {
+            shard: right,
+            expected: None,
+        },
+    ];
+    assert!(matches!(
+        store.activate_shards(grid, 42, &stale).await.unwrap(),
+        ActivationOutcome::Conflict { shard, .. } if shard == right
+    ));
+    assert_eq!(store.read(grid, left).await.unwrap(), Some(rows[0].1));
+    assert_eq!(store.read(grid, right).await.unwrap(), Some(rows[1].1));
+    store.retire(grid, left).await.unwrap();
+    store.retire(grid, right).await.unwrap();
 }
 
 #[cfg(feature = "fdb")]
@@ -647,12 +707,13 @@ async fn fdb_runtime_split_end_to_end() {
 
     let child_rows = rt.split(shard, &parent_row).await.unwrap();
     assert_eq!(child_rows.len(), 8);
-    assert!(rt
-        .fence()
-        .read(GridId::ROOT, shard)
-        .await
-        .unwrap()
-        .is_none());
+    assert!(
+        rt.fence()
+            .read(GridId::ROOT, shard)
+            .await
+            .unwrap()
+            .is_none()
+    );
     for (i, child) in children.iter().enumerate() {
         let page = rt.read(GridId::ROOT, *child).await.unwrap();
         assert_eq!(page.entities.len(), 1, "child {child:?}");

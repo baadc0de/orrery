@@ -21,8 +21,8 @@ use bytes::Bytes;
 use iroh::RelayMode;
 use orrery_persistd::journal::{AdaptiveCommitMode, GroupCommitConfig};
 use orrery_persistd::{
-    CellRuntime, GatewayConfig, GatewayServer, JournalConfig, MemFenceStore, MemIntentExecutor,
-    Router, RuntimeConfig, GATEWAY_ALPN,
+    CellRuntime, GATEWAY_ALPN, GatewayConfig, GatewayServer, JournalConfig, MemFenceStore,
+    MemIntentExecutor, Router, RuntimeConfig,
 };
 use orrery_protocol::channels::{decode_stream_frame, encode_stream_frame};
 use orrery_protocol::{
@@ -388,4 +388,66 @@ async fn fdb_committed_intent_survives_restart() {
     // And it still did not double-apply.
     let bal = read_balance(exec.database(), account, asset).await;
     assert_eq!(bal, Some(750), "no double-apply across the restart");
+}
+
+#[cfg(feature = "fdb")]
+#[tokio::test]
+async fn fdb_fenced_intent_refuses_a_promoted_owner() {
+    use orrery_persistd::{
+        FdbIntentExecutor, FenceOutcome, FenceRow, FenceStatus, FenceStore, IntentExecutor,
+        IntentFence,
+    };
+
+    let Some(cluster) = fdb_cluster_file() else {
+        eprintln!("skipping: ORRERY_FDB_CLUSTER_FILE not set and no .fdb-dev/fdb.cluster");
+        return;
+    };
+    let grid = GridId::new(9_303);
+    let shard = CellId::ROOT;
+    let fences = orrery_persistd::fence::FdbFenceStore::connect(&cluster).unwrap();
+    fences.retire(grid, shard).await.unwrap();
+    let owner = FenceRow {
+        owner: 73,
+        epoch: Epoch::new(0),
+        status: FenceStatus::Active,
+    };
+    assert_eq!(
+        fences.fence(grid, shard, None, &owner).await.unwrap(),
+        FenceOutcome::Fenced
+    );
+    let exec = FdbIntentExecutor::fenced_from_database(
+        FdbIntentExecutor::connect(&cluster, grid)
+            .unwrap()
+            .database()
+            .clone(),
+        grid,
+        IntentFence {
+            shard,
+            owner: 73,
+            epoch: Epoch::new(0),
+        },
+    );
+    let intent = signed_intent(0x9303_0001, &secret(33), 0, &credit_args(500_003, 3, 1));
+    assert!(matches!(
+        exec.execute(&intent).await,
+        Ok(IntentOutcome::Committed { .. })
+    ));
+
+    // Promotion advances the fence. The old executor can no longer commit a
+    // distinct intent even though it still has a live database handle.
+    let promoted = FenceRow {
+        owner: 74,
+        epoch: Epoch::new(1),
+        status: FenceStatus::Active,
+    };
+    assert_eq!(
+        fences
+            .fence(grid, shard, Some(&owner), &promoted)
+            .await
+            .unwrap(),
+        FenceOutcome::Fenced
+    );
+    let stale = signed_intent(0x9303_0002, &secret(34), 0, &credit_args(500_004, 3, 1));
+    assert!(exec.execute(&stale).await.is_err());
+    fences.retire(grid, shard).await.unwrap();
 }
