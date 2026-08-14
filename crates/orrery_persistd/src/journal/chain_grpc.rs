@@ -892,12 +892,15 @@ fn build_client() -> GrpcClient {
 }
 
 impl GrpcChainTransport {
-    /// Connect and perform a fresh remote recovery probe.
-    pub async fn connect(
-        addr: std::net::SocketAddr,
-        chain: DurableChainId,
-    ) -> Result<Self, JournalError> {
-        let transport = Self {
+    /// Construct a transport without performing network I/O.
+    ///
+    /// The first append or explicit [`Self::reconnect`] performs the recovery
+    /// probe. This lets a primary start and keep committing locally while its
+    /// designated follower is unavailable; [`crate::journal::spawn_chain`]
+    /// retries from the follower's durable watermark in the background.
+    #[must_use]
+    pub fn new(addr: std::net::SocketAddr, chain: DurableChainId) -> Self {
+        Self {
             addr,
             chain,
             inner: Mutex::new(ClientState {
@@ -906,7 +909,15 @@ impl GrpcChainTransport {
                 next_batch: 0,
                 watermark: None,
             }),
-        };
+        }
+    }
+
+    /// Connect and perform a fresh remote recovery probe.
+    pub async fn connect(
+        addr: std::net::SocketAddr,
+        chain: DurableChainId,
+    ) -> Result<Self, JournalError> {
+        let transport = Self::new(addr, chain);
         transport.reconnect().await?;
         Ok(transport)
     }
@@ -1036,6 +1047,23 @@ impl GrpcChainTransport {
                     .map_err(|e| JournalError::Store(format!("encode chain record: {e}")))
             })
             .collect::<Result<_, _>>()?;
+
+        // `new` is deliberately lazy. Establishing the first session here also
+        // reconstructs batch sequencing and the durable remote watermark before
+        // any record is sent.
+        if state.live.is_none() {
+            self.probe_locked(&mut state).await?;
+        }
+        if let Some(remote) = state.watermark {
+            if last <= remote {
+                return Ok(remote);
+            }
+            if first <= remote {
+                return Err(JournalError::Store(
+                    "chain batch overlaps follower watermark; rescan from durable progress".into(),
+                ));
+            }
+        }
         let attempted_batch = state.next_batch;
         let make_request = |state: &ClientState| AppendBatchRequest {
             chain: Some(wire_chain(&self.chain)),

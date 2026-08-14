@@ -195,14 +195,11 @@ fn lag_alarm_bytes(lag_alarm: Duration) -> u64 {
 /// Spawn a chain-replication task streaming `journal`'s committed records to
 /// `transport` (which writes into the follower's [`ChainSink`]).
 ///
-/// The task subscribes to the journal's committed-record broadcast. If it falls
-/// behind (the bounded channel reports a gap), it rescans the journal from its
-/// last-known watermark so no committed record is skipped — the broadcast is a
-/// fast path, the rescan is the correctness backstop. Each transport round trip
-/// carries up to [`ChainConfig::batch_max`] records. Lag is reported through
-/// the returned [`ChainReplicator`]'s watermark and lag gauge; a
-/// `tracing::warn!` fires whenever the lag exceeds [`ChainConfig::lag_alarm`]
-/// records.
+/// The journal scan is the correctness path and the committed-record broadcast
+/// is only its wake-up signal. The task probes the follower's durable watermark
+/// on startup and after every transport error, then scans and replays everything
+/// after that cursor. This also catches records committed before the task was
+/// spawned and records committed while the follower was unavailable.
 pub fn spawn_chain(
     journal: Arc<Journal>,
     transport: Arc<dyn ChainTransport>,
@@ -220,7 +217,8 @@ pub fn spawn_chain(
     let sd = Arc::clone(&shutdown);
 
     let join = tokio::spawn(async move {
-        let mut last: Option<Lsn> = None;
+        let mut cursor: Option<Lsn> = None;
+        let mut needs_probe = true;
         loop {
             // The flag is checked at every await boundary: `push_batch`'s
             // per-append select races shutdown too, so a permit-style wakeup
@@ -228,63 +226,52 @@ pub fn spawn_chain(
             if sd.armed() {
                 break;
             }
-            // Fill one transport round trip with up to `batch_max` broadcast
-            // records. The first `recv().await` suspends until a record (or
-            // shutdown); the subsequent `try_recv` sweep drains whatever else
-            // is already committed, so a busy journal batches instead of
-            // paying one round trip per record.
-            let mut batch: Vec<JournalRecord> = Vec::new();
-            let mut rescans: usize = 0;
-            let recv = tokio::select! {
-                r = rx.recv() => r,
-                _ = sd.wake.notified() => break,
-            };
-            match recv {
-                Ok(record) => batch.push(record),
-                Err(broadcast::error::RecvError::Lagged(_)) => rescans += 1,
-                Err(broadcast::error::RecvError::Closed) => break,
-            }
-            while batch.len() + rescans < batch_max {
-                match rx.try_recv() {
-                    Ok(record) => batch.push(record),
-                    Err(broadcast::error::TryRecvError::Lagged(_)) => rescans += 1,
-                    Err(broadcast::error::TryRecvError::Empty)
-                    | Err(broadcast::error::TryRecvError::Closed) => break,
+            if needs_probe {
+                // A probe is deliberately cancellable: an unreachable network
+                // follower must not make shutdown wait for connector timeout.
+                let remote = tokio::select! {
+                    value = transport.follower_watermark() => value,
+                    _ = sd.wake.notified() => break,
+                };
+                if let Some(remote) = remote {
+                    cursor = Some(remote);
+                    update_progress(&journal, &wm, &lag, alarm_bytes, follower, remote);
                 }
+                needs_probe = false;
             }
 
-            // Fell behind the bounded channel: rescan from the last durable
-            // watermark so nothing is skipped. The scan iterator is not
-            // `Send`, so collect it before awaiting.
-            if rescans > 0 {
-                let from = last.unwrap_or(Lsn::new(0, 0));
-                let records: Vec<JournalRecord> = journal
-                    .scan_from(from)
-                    .filter_map(|item| item.ok())
-                    .map(|stored| stored.record)
-                    .collect();
-                for chunk in records.chunks(batch_max) {
-                    let pushed = push_batch(
-                        &journal,
-                        &*transport,
-                        chunk,
-                        &sd,
-                        &wm,
-                        &lag,
-                        alarm_bytes,
-                        follower,
-                    )
-                    .await;
-                    if let Some(l) = pushed.last() {
-                        last = Some(l);
-                    }
-                    if !pushed.complete() {
-                        break;
-                    }
+            // `scan_from` is inclusive, while the durable watermark is the
+            // record already held by the follower. Filtering it out is what
+            // makes normal reconnects duplicate-free. Limit each collection so
+            // a hot journal cannot make this non-Send iterator monopolize the
+            // replication task indefinitely.
+            let from = cursor.unwrap_or(Lsn::new(0, 0));
+            let committed = journal.committed_watermark();
+            let batch = committed
+                .map(|committed| {
+                    journal
+                        .scan_originated_from(from)
+                        .filter(|item| match item {
+                            Ok(stored) => {
+                                stored.lsn <= committed
+                                    && cursor.is_none_or(|last| stored.record.lsn > last)
+                            }
+                            Err(_) => true,
+                        })
+                        .take(batch_max)
+                        .map(|item| item.map(|stored| stored.record))
+                        .collect::<Result<Vec<_>, _>>()
+                })
+                .unwrap_or_else(|| Ok(Vec::new()));
+            let batch = match batch {
+                Ok(batch) => batch,
+                Err(error) => {
+                    tracing::error!(follower, ?error, "chain: primary journal scan failed");
+                    break;
                 }
-            } else if batch.is_empty() {
-                continue;
-            } else {
+            };
+
+            if !batch.is_empty() {
                 let pushed = push_batch(
                     &journal,
                     &*transport,
@@ -296,16 +283,33 @@ pub fn spawn_chain(
                     follower,
                 )
                 .await;
-                if let Some(l) = pushed.last() {
-                    last = Some(l);
+                if let Some(last) = pushed.last() {
+                    cursor = Some(last);
                 }
-                // On an incomplete push (transport error or shutdown), back
-                // off; the flag check at the top of the loop exits on
-                // shutdown, and the rescan path re-sends from the last
-                // durable watermark on error.
                 if !pushed.complete() {
-                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    // The failed append is intentionally not retained in
+                    // volatile state. Re-probe the follower's durable cursor,
+                    // then reconstruct the complete tail from the primary.
+                    needs_probe = true;
+                    tokio::select! {
+                        _ = tokio::time::sleep(Duration::from_millis(10)) => {}
+                        _ = sd.wake.notified() => break,
+                    }
                 }
+                continue;
+            }
+
+            // We reached the journal tail represented by `cursor`. Broadcast
+            // contents are never delivered directly; any message (or lag
+            // notification) merely tells us to scan again from the durable
+            // cursor, preserving primary order even across channel overflow.
+            let recv = tokio::select! {
+                result = rx.recv() => result,
+                _ = sd.wake.notified() => break,
+            };
+            match recv {
+                Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
+                Err(broadcast::error::RecvError::Closed) => break,
             }
         }
     });
@@ -338,13 +342,32 @@ impl PushOutcome {
     }
 }
 
-/// Push one batch of records to the follower: one `ChainTransport::append`
-/// round trip per record, capped at `batch_max` records per outer-loop
-/// iteration by the caller. `shutdown` races every append so a stalled
-/// transport cannot wedge `ChainReplicator::shutdown` forever. Lag bookkeeping
-/// runs after **each** record — a follower that stalls mid-batch is exactly
-/// the case the lag alarm exists for, so the gauge cannot wait for the batch
-/// to complete.
+fn update_progress(
+    journal: &Journal,
+    wm: &std::sync::Mutex<Option<Lsn>>,
+    lag: &std::sync::atomic::AtomicU64,
+    alarm_bytes: u64,
+    follower: u64,
+    durable: Lsn,
+) {
+    *wm.lock().expect("chain watermark lock") = Some(durable);
+    if let Some(bytes) = lag_in_bytes(journal.committed(), Some(durable)) {
+        lag.store(bytes, std::sync::atomic::Ordering::Release);
+        if bytes > alarm_bytes {
+            tracing::warn!(
+                follower,
+                lag_bytes = bytes,
+                alarm_bytes,
+                "chain: replication lag exceeds lag_alarm"
+            );
+        }
+    }
+}
+
+/// Push one batch of records to the follower. `shutdown` races every append so
+/// a stalled transport cannot wedge [`ChainReplicator::shutdown`] forever. The
+/// append result is itself the follower's durable watermark, avoiding a second
+/// transport probe after every record.
 #[allow(clippy::too_many_arguments)]
 async fn push_batch(
     journal: &Journal,
@@ -371,25 +394,21 @@ async fn push_batch(
             }
         };
         match pushed {
-            Ok(_) => {
-                last = Some(record.lsn);
-                // The follower's watermark is an *origin* LSN (the sink
-                // echoes the record's own lsn), so it subtracts cleanly from
-                // this journal's committed cursor.
-                if let Some(w) = transport.follower_watermark().await {
-                    *wm.lock().expect("chain watermark lock") = Some(w);
-                    if let Some(l) = lag_in_bytes(journal.committed(), Some(w)) {
-                        lag.store(l, std::sync::atomic::Ordering::Release);
-                        if l > alarm_bytes {
-                            tracing::warn!(
-                                follower,
-                                lag_bytes = l,
-                                alarm_bytes,
-                                "chain: replication lag exceeds lag_alarm"
-                            );
-                        }
-                    }
+            Ok(durable) => {
+                if durable < record.lsn {
+                    tracing::warn!(
+                        follower,
+                        record_lsn = %record.lsn,
+                        durable_lsn = %durable,
+                        "chain: follower returned a regressed watermark"
+                    );
+                    return PushOutcome {
+                        last,
+                        complete: false,
+                    };
                 }
+                last = Some(durable);
+                update_progress(journal, wm, lag, alarm_bytes, follower, durable);
             }
             Err(e) => {
                 tracing::warn!(follower, ?e, "chain: follower append failed");

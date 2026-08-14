@@ -4,8 +4,19 @@
 //! identity across restarts, the stdout JSON address line, and graceful signal
 //! handling. They do NOT require FoundationDB.
 
-use std::process::Command;
+use std::net::{SocketAddr, TcpListener};
+use std::process::{Child, Command};
 use std::time::Duration;
+
+use bytes::Bytes;
+use iroh::endpoint::{presets::N0, Builder};
+use iroh::RelayMode;
+use orrery_persistd::journal::{AdaptiveCommitMode, GroupCommitConfig};
+use orrery_persistd::{Journal, JournalConfig, GATEWAY_ALPN};
+use orrery_protocol::channels::{decode_datagram, encode_datagram, encode_stream_frame};
+use orrery_protocol::{
+    CellId, DiffUplink, GatewayMsg, GatewayReply, GridId, NodeId, PersistId, RecordKind, Tick,
+};
 
 /// Locate the compiled `persistd` binary via `CARGO_BIN_EXE_persistd`, set by
 /// Cargo when running `cargo test` on a binary target's integration tests.
@@ -81,6 +92,43 @@ fn run_persistd(args: &[&str]) -> (String, String) {
     let _ = child.wait();
 
     (node_id, endpoint_addr)
+}
+
+/// Start a process-topology role and return its single readiness document.
+/// The temporary directory stays alive until the caller terminates the child,
+/// avoiding a platform-dependent open-journal directory removal race.
+fn spawn_persistd(args: &[String]) -> (tempfile::TempDir, Child, serde_json::Value) {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let mut child = Command::new(persistd_binary())
+        .arg("--dir")
+        .arg(dir.path())
+        .args(args)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn persistd topology role");
+    let stdout = child.stdout.take().expect("stdout captured");
+    let mut reader = std::io::BufReader::new(stdout);
+    let mut line = String::new();
+    use std::io::BufRead;
+    reader
+        .read_line(&mut line)
+        .expect("read readiness document");
+    let ready = serde_json::from_str(line.trim()).expect("valid readiness JSON");
+    (dir, child, ready)
+}
+
+fn stop(child: &mut Child) {
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// Reserve an ephemeral loopback port long enough to pass it to the spawned
+/// primary. Tests use an explicit direct address because the readiness document
+/// is intentionally a stable machine contract rather than a debug string.
+fn free_loopback_addr() -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback port");
+    listener.local_addr().expect("listener address")
 }
 
 /// Run `persistd` and return its exit status plus stderr output.
@@ -185,22 +233,177 @@ fn clustered_topology_without_node_id_is_rejected() {
 }
 
 #[test]
-fn clustered_topology_is_rejected_until_chain_rpc_exists() {
-    let (status, stderr) = run_persistd_exit(&[
-        "--node-id",
-        "7",
-        "--chain-listen",
-        "127.0.0.1:3000",
-        "--chain-follower",
-        "8@127.0.0.1:3001",
-    ]);
+fn two_process_topology_starts_follower_then_primary() {
+    let follower_args = vec![
+        "--node-id".into(),
+        "2".into(),
+        "--chain-epoch".into(),
+        "9".into(),
+        "--chain-primary".into(),
+        "1".into(),
+        "--chain-listen".into(),
+        "127.0.0.1:0".into(),
+    ];
+    let (_follower_dir, mut follower, follower_ready) = spawn_persistd(&follower_args);
+    assert_eq!(follower_ready["role"], "follower");
+    assert_eq!(follower_ready["node_id"], 2);
+    assert!(
+        follower_ready.get("endpoint_addr").is_none(),
+        "a follower must not advertise a gateway endpoint"
+    );
+    let chain_addr = follower_ready["chain_addr"]
+        .as_str()
+        .expect("follower chain listener")
+        .to_owned();
 
-    assert!(
-        !status.success(),
-        "persistd must exit non-zero until chain RPC is implemented"
-    );
-    assert!(
-        stderr.contains("chain topology is not wired into persistd yet"),
-        "stderr should explain that the chain topology is not integrated yet: {stderr}"
-    );
+    let primary_args = vec![
+        "--node-id".into(),
+        "1".into(),
+        "--chain-epoch".into(),
+        "9".into(),
+        "--chain-follower".into(),
+        format!("2@{chain_addr}"),
+    ];
+    let (_primary_dir, mut primary, primary_ready) = spawn_persistd(&primary_args);
+    assert_eq!(primary_ready["role"], "primary");
+    assert_eq!(primary_ready["cluster_node_id"], 1);
+    assert!(primary_ready["endpoint_addr"].is_string());
+    assert!(primary_ready["bind_addr"].is_string());
+
+    stop(&mut primary);
+    stop(&mut follower);
+}
+
+#[test]
+fn primary_starts_when_follower_is_temporarily_unavailable() {
+    let args = vec![
+        "--node-id".into(),
+        "1".into(),
+        "--chain-epoch".into(),
+        "9".into(),
+        "--chain-follower".into(),
+        "2@127.0.0.1:9".into(),
+    ];
+    let (_dir, mut primary, ready) = spawn_persistd(&args);
+    assert_eq!(ready["role"], "primary");
+    assert!(ready["endpoint_addr"].is_string());
+    assert!(ready["bind_addr"].is_string());
+    stop(&mut primary);
+}
+
+/// The static topology's essential process boundary: a client-visible primary
+/// acknowledgement is locally durable and subsequently appears in the passive
+/// follower journal. This exercises the real binary, TCP gRPC transport, and
+/// iroh gateway rather than the in-process chain shim.
+#[tokio::test]
+async fn primary_ack_is_mirrored_to_the_passive_follower_journal() {
+    let follower_args = vec![
+        "--node-id".into(),
+        "2".into(),
+        "--chain-epoch".into(),
+        "9".into(),
+        "--chain-primary".into(),
+        "1".into(),
+        "--chain-listen".into(),
+        "127.0.0.1:0".into(),
+    ];
+    let (follower_dir, mut follower, follower_ready) = spawn_persistd(&follower_args);
+    let chain_addr = follower_ready["chain_addr"]
+        .as_str()
+        .expect("follower chain listener")
+        .to_owned();
+    let bind_addr = free_loopback_addr();
+    let primary_args = vec![
+        "--node-id".into(),
+        "1".into(),
+        "--chain-epoch".into(),
+        "9".into(),
+        "--chain-follower".into(),
+        format!("2@{chain_addr}"),
+        "--bind".into(),
+        bind_addr.to_string(),
+    ];
+    let (_primary_dir, mut primary, primary_ready) = spawn_persistd(&primary_args);
+    assert_eq!(primary_ready["bind_addr"], bind_addr.to_string());
+    let primary_id = primary_ready["node_id"]
+        .as_str()
+        .expect("primary iroh node id")
+        .parse::<NodeId>()
+        .expect("valid primary node id");
+
+    let client = Builder::new(N0)
+        .alpns(vec![GATEWAY_ALPN.to_vec()])
+        .relay_mode(RelayMode::Disabled)
+        .bind()
+        .await
+        .expect("client endpoint");
+    let target = iroh::EndpointAddr::new(primary_id).with_ip_addr(bind_addr);
+    let conn = client
+        .connect(target, GATEWAY_ALPN)
+        .await
+        .expect("connect to primary gateway");
+    let mut admission = conn.accept_uni().await.expect("gateway admission");
+    assert_eq!(admission.read_to_end(16).await.unwrap(), vec![0]);
+
+    let author = iroh::SecretKey::generate().public();
+    conn.send_datagram(Bytes::from(encode_stream_frame(&GatewayMsg::Hello {
+        token: b"process-topology".to_vec(),
+        node: author,
+    })))
+    .expect("send hello");
+    conn.send_datagram(Bytes::from(encode_datagram(&GatewayMsg::Diff {
+        diff: DiffUplink {
+            cell: CellId::ROOT,
+            grid: GridId::ROOT,
+            entity: PersistId::new(77),
+            tick: Tick::new(11),
+            kind: RecordKind::Spawn,
+            payload: Bytes::from_static(b"process-chain"),
+            seq: 1,
+        },
+    })))
+    .expect("send diff");
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "primary never acknowledged diff"
+        );
+        let packet = tokio::time::timeout(Duration::from_millis(250), conn.read_datagram()).await;
+        let Ok(Ok(packet)) = packet else { continue };
+        if let Some(GatewayReply::BulkAck { entity, tick, .. }) = decode_datagram(&packet) {
+            if entity == PersistId::new(77) && tick == Tick::new(11) {
+                break;
+            }
+        }
+    }
+
+    // Chain replication is asynchronous. Give its background task an explicit
+    // bounded interval to cross the process boundary before stopping both
+    // processes and opening the follower journal independently.
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    drop(conn);
+    client.close().await;
+    stop(&mut primary);
+    stop(&mut follower);
+
+    let journal = Journal::open(&JournalConfig {
+        dir: follower_dir.path().join("node-2"),
+        commit: GroupCommitConfig {
+            mode: AdaptiveCommitMode::Adaptive,
+            ..GroupCommitConfig::default()
+        },
+    })
+    .expect("open mirrored follower journal");
+    let records = journal
+        .scan_from(orrery_protocol::Lsn::new(0, 0))
+        .map(|item| item.expect("valid mirrored record").record)
+        .collect::<Vec<_>>();
+    assert!(records.iter().any(|record| {
+        record.entity == PersistId::new(77)
+            && record.tick == Tick::new(11)
+            && record.payload.as_ref() == b"process-chain"
+    }));
+    journal.close().await.expect("close inspected journal");
 }

@@ -155,6 +155,79 @@ async fn chain_replicates_records_to_follower() {
     follower.close().await.unwrap();
 }
 
+/// Records are inserted into Fjall before the group fsync, so the originated
+/// index can see them before the client durability boundary. This transport
+/// makes any premature replication directly observable without introducing a
+/// follower commit of its own.
+#[derive(Default)]
+struct RecordingTransport {
+    records: std::sync::Mutex<Vec<JournalRecord>>,
+}
+
+#[async_trait::async_trait]
+impl ChainTransport for RecordingTransport {
+    async fn append(&self, record: JournalRecord) -> Result<Lsn, JournalError> {
+        let lsn = record.lsn;
+        self.records.lock().unwrap().push(record);
+        Ok(lsn)
+    }
+
+    async fn follower_watermark(&self) -> Option<Lsn> {
+        None
+    }
+}
+
+#[tokio::test]
+async fn chain_waits_for_primary_commit_before_mirroring() {
+    let primary_dir = tempfile::tempdir().unwrap();
+    let primary = Arc::new(
+        Journal::open(&JournalConfig {
+            dir: primary_dir.path().to_path_buf(),
+            commit: GroupCommitConfig {
+                mode: AdaptiveCommitMode::AlwaysBatch,
+                batch_window: Duration::from_millis(500),
+                batch_max_records: 100_000,
+                batch_max_bytes: 1 << 20,
+            },
+        })
+        .unwrap(),
+    );
+    let transport = Arc::new(RecordingTransport::default());
+    // Stage the row before spawning the replicator. Its initial correctness
+    // scan therefore deterministically encounters the originated index entry
+    // while the primary committed watermark is still empty.
+    let handle = primary
+        .append(mk_record(CellId::ROOT, 1, RecordKind::Spawn, b"pending"))
+        .unwrap();
+    let replicator = orrery_persistd::spawn_chain(
+        Arc::clone(&primary),
+        transport.clone(),
+        &ChainConfig::default(),
+    );
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        transport.records.lock().unwrap().is_empty(),
+        "an uncommitted primary record must not reach the follower"
+    );
+
+    tokio::time::timeout(Duration::from_secs(2), handle.committed())
+        .await
+        .expect("primary commit timed out")
+        .unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while transport.records.lock().unwrap().len() != 1 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "committed record was not mirrored after the commit wakeup"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    replicator.shutdown().await;
+    primary.close().await.unwrap();
+}
+
 #[tokio::test]
 async fn follower_serves_as_recovery_source() {
     // Simulate primary node loss: the follower journal (which replicated every
@@ -223,6 +296,154 @@ async fn follower_serves_as_recovery_source() {
         assert_eq!(e.components.as_ref(), &i.to_le_bytes());
     }
     rt.close().await.unwrap();
+}
+
+/// A follower transport that can be taken offline without replacing its
+/// durable sink. While offline both append and watermark probes fail from the
+/// replicator's point of view; once restored, the sink exposes its last durable
+/// origin LSN and accepts the missing tail.
+struct RecoveringTransport {
+    sink: Arc<JournalChainSink>,
+    online: std::sync::atomic::AtomicBool,
+    attempts: std::sync::atomic::AtomicUsize,
+}
+
+impl RecoveringTransport {
+    fn new(sink: Arc<JournalChainSink>) -> Self {
+        Self {
+            sink,
+            online: std::sync::atomic::AtomicBool::new(false),
+            attempts: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    fn restore(&self) {
+        self.online
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+}
+
+#[async_trait::async_trait]
+impl ChainTransport for RecoveringTransport {
+    async fn append(&self, record: JournalRecord) -> Result<Lsn, JournalError> {
+        self.attempts
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        if !self.online.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(JournalError::Store("follower unavailable".into()));
+        }
+        orrery_persistd::ChainSink::append(&*self.sink, record).await
+    }
+
+    async fn follower_watermark(&self) -> Option<Lsn> {
+        self.online
+            .load(std::sync::atomic::Ordering::Acquire)
+            .then(|| self.sink.watermark())
+            .flatten()
+    }
+}
+
+#[tokio::test]
+async fn follower_outage_replays_complete_primary_tail_without_new_wakeup() {
+    let primary_dir = tempfile::tempdir().unwrap();
+    let follower_dir = tempfile::tempdir().unwrap();
+    let primary = Arc::new(Journal::open(&journal_config(primary_dir.path())).unwrap());
+    let follower = Arc::new(Journal::open(&journal_config(follower_dir.path())).unwrap());
+
+    // These commits precede the subscription and therefore exercise initial
+    // recovery from the durable journal rather than the broadcast fast path.
+    for i in 0..3u64 {
+        let handle = primary
+            .append(mk_record(
+                CellId::ROOT,
+                i,
+                RecordKind::Spawn,
+                &i.to_le_bytes(),
+            ))
+            .unwrap();
+        handle.committed().await.unwrap();
+    }
+    primary.close().await.unwrap();
+    drop(primary);
+    let primary = Arc::new(Journal::open(&journal_config(primary_dir.path())).unwrap());
+
+    let sink = Arc::new(JournalChainSink::new(Arc::clone(&follower)));
+    let transport = Arc::new(RecoveringTransport::new(sink));
+    let replicator = orrery_persistd::spawn_chain(
+        Arc::clone(&primary),
+        transport.clone(),
+        &ChainConfig {
+            follower: 2,
+            batch_max: 2,
+            ..ChainConfig::default()
+        },
+    );
+
+    // Local durable acknowledgements continue while the follower is down.
+    // No later append is made after recovery, so catch-up cannot depend on a
+    // fresh broadcast message to wake the task.
+    for i in 3..6u64 {
+        let handle = primary
+            .append(mk_record(
+                CellId::ROOT,
+                i,
+                RecordKind::Spawn,
+                &i.to_le_bytes(),
+            ))
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), handle.committed())
+            .await
+            .expect("primary ack must not wait for follower")
+            .unwrap();
+    }
+
+    let failed_deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while transport
+        .attempts
+        .load(std::sync::atomic::Ordering::Acquire)
+        == 0
+    {
+        assert!(
+            std::time::Instant::now() < failed_deadline,
+            "replicator never attempted the unavailable follower"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    transport.restore();
+
+    let caught_up = primary.committed();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while replicator.follower_watermark() != Some(caught_up) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "follower did not replay the complete outage tail"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    let primary_records = primary
+        .scan_from(Lsn::new(0, 0))
+        .map(|item| item.unwrap().record)
+        .collect::<Vec<_>>();
+    let follower_records = follower
+        .scan_from(Lsn::new(0, 0))
+        .map(|item| item.unwrap().record)
+        .collect::<Vec<_>>();
+    assert_eq!(follower_records.len(), 6, "no duplicate durable records");
+    assert_eq!(
+        follower_records
+            .iter()
+            .map(|record| (record.lsn, record.entity, record.payload.clone()))
+            .collect::<Vec<_>>(),
+        primary_records
+            .iter()
+            .map(|record| (record.lsn, record.entity, record.payload.clone()))
+            .collect::<Vec<_>>(),
+        "replay preserves the primary's complete contiguous order"
+    );
+
+    replicator.shutdown().await;
+    primary.close().await.unwrap();
+    follower.close().await.unwrap();
 }
 
 #[tokio::test]

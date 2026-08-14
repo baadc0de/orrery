@@ -11,10 +11,10 @@
 //! stores - suitable for development and tests that do not need the durable
 //! tier.
 //!
-//! The process-topology flags (`--node-id`, `--chain-listen`,
-//! `--chain-follower`) are parsed now so the eventual cross-process chain RPC
-//! can land without changing the binary surface, but startup still rejects any
-//! chain request until that transport exists.
+//! A static two-process topology is also supported: a primary owns the shard
+//! actors and gateway, while its one follower owns only a mirrored journal and
+//! the chain gRPC listener. The follower is deliberately outside the client
+//! write path.
 //!
 //! On startup the binary prints the gateway's [`EndpointAddr`] as a single-line
 //! JSON object on stdout (tracing stays on stderr) so a harness can find the
@@ -35,12 +35,14 @@ use glam::IVec3;
 use tokio::sync::Mutex;
 
 use orrery_persistd::cluster::{ColdFallbackRouter, Router};
-use orrery_persistd::journal::{AdaptiveCommitMode, GroupCommitConfig};
+use orrery_persistd::journal::{
+    spawn_chain, spawn_chain_grpc, AdaptiveCommitMode, ChainConfig, GroupCommitConfig, Journal,
+};
 #[cfg(feature = "fdb")]
 use orrery_persistd::FdbIntentExecutor;
 use orrery_persistd::{
-    CellRuntime, CheckpointScheduler, FenceStore, GatewayConfig, GatewayServer, IntentExecutor,
-    JournalConfig, MemCheckpointStore, RuntimeConfig,
+    CellRuntime, CheckpointScheduler, DurableChainId, FenceStore, GatewayConfig, GatewayServer,
+    GrpcChainTransport, IntentExecutor, JournalConfig, MemCheckpointStore, RuntimeConfig,
 };
 use orrery_protocol::{CellId, Epoch, GridId};
 
@@ -62,6 +64,17 @@ struct Cli {
     /// Local chain listen address for clustered topology.
     #[arg(long)]
     chain_listen: Option<SocketAddr>,
+
+    /// Stable primary process identity for a follower. Used with
+    /// `--chain-listen`; the follower never accepts gateway writes.
+    #[arg(long)]
+    chain_primary: Option<u64>,
+
+    /// Fencing epoch for this static chain assignment. Required in clustered
+    /// mode so a chain never silently resumes under a different ownership
+    /// epoch.
+    #[arg(long)]
+    chain_epoch: Option<u64>,
 
     /// A follower node and its listen address in `<node-id>@<addr>` form.
     /// Repeated to describe the follower chain order.
@@ -98,6 +111,10 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let topology = resolve_topology(&cli)?;
+
+    if matches!(topology.role, TopologyRole::Follower { .. }) {
+        return run_follower(&cli, &topology).await;
+    }
 
     // ── FoundationDB stores (optional) ──────────────────────────────────
     // The fence store gates the single runtime against the same durable rows.
@@ -169,7 +186,7 @@ async fn main() -> anyhow::Result<()> {
             },
         },
         node_id: topology.node_id,
-        epoch: Epoch::new(0),
+        epoch: topology.epoch,
         fence: Arc::clone(&fence_store),
     };
     // Recovery seeds actors from the same durable tier the checkpoint
@@ -177,6 +194,37 @@ async fn main() -> anyhow::Result<()> {
     // delta (§3.4).
     let runtime = Arc::new(Mutex::new(CellRuntime::open(&config, &checkpoint_store)?));
     let runtime_for_shutdown = Arc::clone(&runtime);
+
+    // Chain replication is intentionally downstream of the journal ack path.
+    // The transport is lazy: an unavailable follower marks the chain degraded
+    // but never prevents the primary from serving local durable writes.
+    let chain_replicator = if let Some(chain) = topology.chain_id() {
+        let follower = topology
+            .follower()
+            .expect("only primary topologies have a chain id")
+            .node_id;
+        let journal = {
+            let guard = runtime.lock().await;
+            Arc::clone(guard.journal())
+        };
+        let transport = Arc::new(GrpcChainTransport::new(
+            topology
+                .follower()
+                .expect("only primary topologies have a follower")
+                .addr,
+            chain,
+        ));
+        Some(spawn_chain(
+            journal,
+            transport,
+            &ChainConfig {
+                follower,
+                ..ChainConfig::default()
+            },
+        ))
+    } else {
+        None
+    };
 
     // Spawn one checkpoint scheduler for the single runtime, using the
     // default 20 s jittered cadence (D16).
@@ -232,9 +280,19 @@ async fn main() -> anyhow::Result<()> {
     {
         let addr = gateway.addr();
         let node_id = gateway.id();
+        // `EndpointAddr` is the full client dial document; expose one direct
+        // socket separately so local multi-process harnesses can construct an
+        // endpoint without parsing its debug representation.
+        let bind_addr = addr
+            .ip_addrs()
+            .next()
+            .expect("gateway endpoint has its configured direct bind address");
         let json = serde_json::json!({
             "endpoint_addr": format!("{addr:?}"),
+            "bind_addr": bind_addr.to_string(),
             "node_id": format!("{node_id}"),
+            "cluster_node_id": topology.node_id,
+            "role": topology.role.name(),
         });
         // Write manually so a BrokenPipe (harness closed stdout) does not
         // panic the process.
@@ -249,6 +307,7 @@ async fn main() -> anyhow::Result<()> {
         gateway = %gateway.id(),
         node_id = topology.node_id,
         shards = topology.shards.len(),
+        role = topology.role.name(),
         "persistd cluster up"
     );
 
@@ -269,6 +328,10 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("stopping gateway");
     gateway.shutdown().await;
 
+    if let Some(replicator) = chain_replicator {
+        replicator.shutdown().await;
+    }
+
     for scheduler in schedulers {
         scheduler.shutdown().await;
     }
@@ -283,6 +346,74 @@ async fn main() -> anyhow::Result<()> {
     }
 
     tracing::info!("persistd shutdown complete");
+    Ok(())
+}
+
+/// Run the passive half of a static chain topology. It opens no actor runtime,
+/// scheduler, fence store, or gateway: mirrored records are its only writes.
+async fn run_follower(cli: &Cli, topology: &Topology) -> anyhow::Result<()> {
+    if cli.fdb_cluster_file.is_some() {
+        anyhow::bail!(
+            "--fdb-cluster-file is not valid for a chain follower; a follower hosts only its mirrored journal"
+        );
+    }
+    if cli.secret_key.is_some() {
+        anyhow::bail!(
+            "--secret-key is not valid for a chain follower; --node-id is its stable chain identity"
+        );
+    }
+
+    let TopologyRole::Follower { listen, .. } = topology.role else {
+        unreachable!("run_follower is called only for follower topology");
+    };
+    let node_dir = cli.dir.join(format!("node-{}", topology.node_id));
+    std::fs::create_dir_all(&node_dir)?;
+    let journal = Arc::new(Journal::open(&JournalConfig {
+        dir: node_dir,
+        commit: GroupCommitConfig {
+            mode: AdaptiveCommitMode::Adaptive,
+            ..GroupCommitConfig::default()
+        },
+    })?);
+    let server = spawn_chain_grpc(
+        listen,
+        Arc::clone(&journal),
+        topology
+            .chain_id()
+            .expect("follower topology always has a durable chain identity"),
+    )
+    .await?;
+
+    // stdout is a one-line machine-readable readiness contract. Unlike a
+    // primary, the follower has no client endpoint to advertise.
+    {
+        use std::io::Write;
+        let json = serde_json::json!({
+            "node_id": topology.node_id,
+            "chain_addr": server.addr().to_string(),
+            "role": topology.role.name(),
+        });
+        let stdout = std::io::stdout();
+        let mut handle = stdout.lock();
+        let _ = writeln!(handle, "{json}");
+        let _ = handle.flush();
+    }
+    tracing::info!(
+        node_id = topology.node_id,
+        chain_addr = %server.addr(),
+        shards = topology.shards.len(),
+        epoch = topology.epoch.0,
+        "persistd chain follower up"
+    );
+
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => tracing::info!("received Ctrl-C, shutting down"),
+        _ = sigterm.recv() => tracing::info!("received SIGTERM, shutting down"),
+    }
+    server.shutdown().await;
+    journal.close().await?;
+    tracing::info!("persistd chain follower shutdown complete");
     Ok(())
 }
 
@@ -346,27 +477,151 @@ impl FromStr for ChainFollower {
 struct Topology {
     node_id: u64,
     shards: Vec<CellId>,
+    epoch: Epoch,
+    role: TopologyRole,
+}
+
+impl Topology {
+    /// The durable chain identity is stable across reconnects and derives only
+    /// from explicit CLI topology. `node_id` is a persistd placement identity;
+    /// it is deterministically embedded in a `NodeId` because the gRPC chain
+    /// protocol shares that typed identity with the iroh-facing architecture.
+    fn chain_id(&self) -> Option<DurableChainId> {
+        match self.role {
+            TopologyRole::Single => None,
+            TopologyRole::Primary { follower } => Some(DurableChainId {
+                primary_node: chain_node_id(self.node_id),
+                follower_node: chain_node_id(follower.node_id),
+                shard_set: canonical_shard_set(GridId::ROOT, &self.shards),
+                epoch: self.epoch.0,
+            }),
+            TopologyRole::Follower { primary, .. } => Some(DurableChainId {
+                primary_node: chain_node_id(primary),
+                follower_node: chain_node_id(self.node_id),
+                shard_set: canonical_shard_set(GridId::ROOT, &self.shards),
+                epoch: self.epoch.0,
+            }),
+        }
+    }
+
+    fn follower(&self) -> Option<ChainFollower> {
+        match self.role {
+            TopologyRole::Primary { follower } => Some(follower),
+            TopologyRole::Single | TopologyRole::Follower { .. } => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TopologyRole {
+    /// The legacy one-process harness: actor runtime and gateway, no mirror.
+    Single,
+    /// The only process allowed to own shards and serve gateway writes.
+    Primary { follower: ChainFollower },
+    /// A passive journal mirror and gRPC listener, never a gateway.
+    Follower { primary: u64, listen: SocketAddr },
+}
+
+impl TopologyRole {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Single => "single",
+            Self::Primary { .. } => "primary",
+            Self::Follower { .. } => "follower",
+        }
+    }
 }
 
 fn resolve_topology(cli: &Cli) -> anyhow::Result<Topology> {
     let shards = resolve_shards(&cli.shard)?;
-    let node_id = cli.node_id.unwrap_or(0);
-
-    if cli.chain_listen.is_some() || !cli.chain_follower.is_empty() {
-        if cli.node_id.is_none() {
-            anyhow::bail!(
-                "--node-id is required when any --chain-* flags are set; chain RPC is not wired into persistd yet"
-            );
-        }
-        validate_followers(&cli.chain_follower, node_id)?;
-        anyhow::bail!(
-            "chain topology is not wired into persistd yet; remove --chain-listen/--chain-follower and run single-node"
-        );
+    let clustered = cli.chain_listen.is_some()
+        || !cli.chain_follower.is_empty()
+        || cli.chain_primary.is_some()
+        || cli.chain_epoch.is_some();
+    if !clustered {
+        return Ok(Topology {
+            node_id: cli.node_id.unwrap_or(0),
+            shards,
+            epoch: Epoch::new(0),
+            role: TopologyRole::Single,
+        });
     }
 
+    let node_id = cli
+        .node_id
+        .ok_or_else(|| anyhow::anyhow!("--node-id is required when any --chain-* flags are set"))?;
+    let epoch = Epoch::new(
+        cli.chain_epoch
+            .ok_or_else(|| anyhow::anyhow!("--chain-epoch is required in clustered topology"))?,
+    );
     validate_followers(&cli.chain_follower, node_id)?;
 
-    Ok(Topology { node_id, shards })
+    let role = match (cli.chain_listen, cli.chain_follower.as_slice(), cli.chain_primary) {
+        (None, [follower], None) => TopologyRole::Primary {
+            follower: *follower,
+        },
+        (Some(listen), [], Some(primary)) => {
+            if primary == node_id {
+                anyhow::bail!("--chain-primary cannot name the local --node-id {node_id}");
+            }
+            TopologyRole::Follower { primary, listen }
+        }
+        (None, [], _) => anyhow::bail!(
+            "clustered primary requires exactly one --chain-follower <node-id>@<addr>"
+        ),
+        (None, [_, _, ..], None) => anyhow::bail!(
+            "clustered primary requires exactly one --chain-follower <node-id>@<addr>"
+        ),
+        (Some(_), [], None) => anyhow::bail!(
+            "clustered follower requires --chain-primary <node-id> with --chain-listen"
+        ),
+        (Some(_), [..], _) => anyhow::bail!(
+            "a clustered process is either primary (--chain-follower) or follower (--chain-listen --chain-primary), not both"
+        ),
+        (None, [..], Some(_)) => anyhow::bail!(
+            "a clustered primary uses --chain-follower; --chain-primary is follower-only"
+        ),
+    };
+
+    Ok(Topology {
+        node_id,
+        shards,
+        epoch,
+        role,
+    })
+}
+
+/// Canonical durable shard-set encoding, deliberately independent of CLI flag
+/// ordering: `version(1) | grid(u32 BE) | count(u32 BE) | cell_bits(u64 BE)*`.
+/// It includes the grid because the same `CellId` bit pattern is meaningful in
+/// each nested grid (D5); the fixed-width network-order format is stable for
+/// durable chain keys and straightforward to inspect in recovery tooling.
+fn canonical_shard_set(grid: GridId, shards: &[CellId]) -> Vec<u8> {
+    let mut bits: Vec<u64> = shards.iter().map(|cell| cell.to_bits()).collect();
+    bits.sort_unstable();
+    let mut encoded = Vec::with_capacity(1 + 4 + 4 + bits.len() * 8);
+    encoded.push(1);
+    encoded.extend_from_slice(&grid.0.to_be_bytes());
+    encoded.extend_from_slice(
+        &u32::try_from(bits.len())
+            .expect("shard set length fits u32")
+            .to_be_bytes(),
+    );
+    for bits in bits {
+        encoded.extend_from_slice(&bits.to_be_bytes());
+    }
+    encoded
+}
+
+/// Derive the typed durable-chain identity from the explicit stable process
+/// id. This is not an iroh authentication key: chain RPC currently authenticates
+/// the durable tuple, and this mapping only avoids representing the same node
+/// with two unrelated ID types in that tuple.
+fn chain_node_id(node_id: u64) -> orrery_protocol::NodeId {
+    let mut seed = [0_u8; 32];
+    seed[..20].copy_from_slice(b"orrery-chain-node-v1");
+    seed[24..].copy_from_slice(&node_id.to_be_bytes());
+    iroh::SecretKey::from_bytes(&seed).public()
 }
 
 fn resolve_shards(shards: &[ShardSpec]) -> anyhow::Result<Vec<CellId>> {
@@ -476,6 +731,8 @@ mod tests {
             node_id: None,
             dir: PathBuf::from("persistd-data"),
             chain_listen: None,
+            chain_primary: None,
+            chain_epoch: None,
             chain_follower: Vec::new(),
             bind: "127.0.0.1:0".parse().expect("valid loopback bind"),
             fdb_cluster_file,
@@ -570,5 +827,71 @@ mod tests {
             err.to_string().contains("--node-id is required"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn primary_topology_is_explicit_and_uses_its_chain_epoch() {
+        let mut cli = cli(None);
+        cli.node_id = Some(7);
+        cli.chain_epoch = Some(42);
+        cli.chain_follower = vec![ChainFollower {
+            node_id: 8,
+            addr: "127.0.0.1:3001".parse().unwrap(),
+        }];
+        cli.shard = vec![ShardSpec(CellId::from_bits(9).unwrap())];
+
+        let topology = resolve_topology(&cli).expect("primary topology");
+        assert_eq!(topology.role.name(), "primary");
+        assert_eq!(topology.epoch, Epoch::new(42));
+        let chain = topology.chain_id().expect("clustered chain id");
+        assert_eq!(chain.primary_node, chain_node_id(7));
+        assert_eq!(chain.follower_node, chain_node_id(8));
+        assert_eq!(chain.epoch, 42);
+    }
+
+    #[test]
+    fn follower_topology_has_no_gateway_role() {
+        let mut cli = cli(None);
+        cli.node_id = Some(8);
+        cli.chain_epoch = Some(42);
+        cli.chain_primary = Some(7);
+        cli.chain_listen = Some("127.0.0.1:3001".parse().unwrap());
+
+        let topology = resolve_topology(&cli).expect("follower topology");
+        assert!(matches!(topology.role, TopologyRole::Follower { .. }));
+        assert!(topology.follower().is_none());
+        let chain = topology.chain_id().expect("clustered chain id");
+        assert_eq!(chain.primary_node, chain_node_id(7));
+        assert_eq!(chain.follower_node, chain_node_id(8));
+    }
+
+    #[test]
+    fn canonical_shard_set_is_order_independent_and_grid_scoped() {
+        let one = CellId::from_bits(9).unwrap();
+        let two = CellId::from_bits(3).unwrap();
+        let root = canonical_shard_set(GridId::ROOT, &[one, two]);
+        assert_eq!(root, canonical_shard_set(GridId::ROOT, &[two, one]));
+        assert_ne!(root, canonical_shard_set(GridId::new(1), &[one, two]));
+        assert_eq!(
+            root,
+            [
+                1, 0, 0, 0, 0, // encoding version + root grid
+                0, 0, 0, 2, // two cells
+                0, 0, 0, 0, 0, 0, 0, 3, // sorted CellId bits
+                0, 0, 0, 0, 0, 0, 0, 9,
+            ]
+        );
+    }
+
+    #[test]
+    fn clustered_topology_requires_explicit_epoch() {
+        let mut cli = cli(None);
+        cli.node_id = Some(7);
+        cli.chain_follower = vec![ChainFollower {
+            node_id: 8,
+            addr: "127.0.0.1:3001".parse().unwrap(),
+        }];
+        let err = resolve_topology(&cli).expect_err("epoch is a chain fence");
+        assert!(err.to_string().contains("--chain-epoch is required"));
     }
 }
