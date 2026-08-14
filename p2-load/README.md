@@ -103,6 +103,17 @@ default 64-byte payload (10 000 × 2 Hz = 20 000 diffs/s vs 160 diffs/s per
 session); the startup assert enforces this rather than letting you measure a
 queue. For a quick smoke, `--entities 1000 --sessions 13` clears the bar.
 
+## Kill-9 restart slice
+
+Set `ORRERY_FDB_CLUSTER_FILE`, `PERSISTD_BIN`, and `P2_LOAD_BIN`, then run
+`scripts/p2-kill9-gate.sh`. It runs the calibrated 10k/128-cell load, kills a
+single FDB-backed persistd with `SIGKILL`, restarts it on the same journal and
+writes an artifact JSON file. `--self-test` verifies its prerequisite guard.
+It exits non-zero after the slice because no checked-in reader can compare all
+pre-kill acknowledgements after restart; it never claims the full P2 gate.
+Append `journal_commit_ms` from persistd metrics before dashboard gating. This
+is not distributed chain replication or failover coverage.
+
 ## Options
 
 | Flag | Default | Meaning |
