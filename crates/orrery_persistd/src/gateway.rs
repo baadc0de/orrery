@@ -33,26 +33,26 @@
 //! §3), but the current reference binary does not ship that transport.
 
 use std::net::SocketAddr;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use bytes::Bytes;
 use iroh::{Endpoint, EndpointAddr, RelayMode};
-use tokio::sync::{Semaphore, oneshot};
+use tokio::sync::{oneshot, OwnedSemaphorePermit, Semaphore};
 use tracing::{debug, warn};
 
 use orrery_protocol::channels::{
-    Channel, decode_datagram, decode_stream_frame, encode_datagram, encode_stream_frame, untag,
+    decode_datagram, decode_stream_frame, encode_datagram, encode_stream_frame, untag, Channel,
 };
 use orrery_protocol::{
     AreaPage, CellId, DiffUplink, Epoch, GatewayMsg, GatewayReply, GridId, Intent, IntentOutcome,
-    JournalRecord, Lsn, MAX_AREA_PAGE_FRAME_BYTES, NodeId, PROTOCOL_VERSION, PersistId,
+    JournalRecord, Lsn, NodeId, PersistId, MAX_AREA_PAGE_FRAME_BYTES, PROTOCOL_VERSION,
     REASON_BAD_SIGNATURE, REASON_ISSUER_MISMATCH, REASON_NO_EXECUTOR,
 };
 
 use crate::cluster::Router;
 use crate::intent::{
-    IntentVerdict, PermissiveValidator, SharedExecutor, SharedValidator, error_outcome,
+    error_outcome, IntentVerdict, PermissiveValidator, SharedExecutor, SharedValidator,
 };
 use crate::payload_crc;
 
@@ -77,6 +77,16 @@ const MAX_INFLIGHT_DIFF_ROUTES_PER_CONN: usize = 128;
 /// acknowledgement budget.  In particular, an FDB cold area-load must not
 /// head-of-line block a durability acknowledgement on the same connection.
 const MAX_INFLIGHT_CONTROL_ROUTES_PER_CONN: usize = 8;
+
+/// How many critical intent transactions one connection may execute at once.
+///
+/// Intent commits perform an FDB transaction and can take materially longer
+/// than a journal append.  They therefore have their own non-waiting lane:
+/// the datagram reader must keep draining bulk/control traffic while an
+/// intent is in flight.  Unlike the bulk and control lanes, saturation is not
+/// queued behind an `await acquire`: it is an immediate, definitive refusal.
+/// This prevents a peer from turning queued tasks into unbounded memory use.
+const MAX_INFLIGHT_INTENT_ROUTES_PER_CONN: usize = 16;
 
 /// Decides whether a successful bulk route can make the normal durable-ack
 /// claim.
@@ -367,6 +377,7 @@ async fn handle_connection(
     };
     let inflight_diffs = Arc::new(Semaphore::new(MAX_INFLIGHT_DIFF_ROUTES_PER_CONN));
     let inflight_control = Arc::new(Semaphore::new(MAX_INFLIGHT_CONTROL_ROUTES_PER_CONN));
+    let inflight_intents = Arc::new(Semaphore::new(MAX_INFLIGHT_INTENT_ROUTES_PER_CONN));
 
     loop {
         let pkt = match conn.read_datagram().await {
@@ -425,13 +436,53 @@ async fn handle_connection(
                 }
             }
             GatewayMsg::SubmitIntent { intent } => {
-                route_intent(send.as_ref(), intent, remote, &executor, &validator).await;
+                // Keep signature/identity/admission checks at the edge, then
+                // route the potentially slow FDB transaction on its own
+                // bounded lane. In particular, never await a semaphore here:
+                // waiting would recreate the receive-loop HOL blocking this
+                // lane is intended to prevent.
+                if let Err(outcome) = admit_intent(&intent, remote, validator.as_ref()) {
+                    send_intent_reply(send.as_ref(), intent.intent_id, outcome);
+                    continue;
+                }
+                match reserve_intent_lane(Arc::clone(&inflight_intents)) {
+                    Ok(permit) => {
+                        let send = Arc::clone(&send);
+                        let executor = executor.clone();
+                        tokio::spawn(async move {
+                            let _permit = permit;
+                            execute_admitted_intent(send.as_ref(), intent, &executor).await;
+                        });
+                    }
+                    Err(outcome) => {
+                        // There is deliberately no deferred task waiting for
+                        // capacity. The client receives a definitive outcome
+                        // and may submit a new, idempotently keyed intent on
+                        // its normal retry policy.
+                        warn!(%remote, intent_id = intent.intent_id, "gateway: intent lane saturated");
+                        send_intent_reply(send.as_ref(), intent.intent_id, outcome);
+                    }
+                }
             }
         }
     }
 }
 
-/// Execute one submitted intent and reply with its outcome (D11 §2.2).
+/// Reserve a slot in the per-connection intent lane without waiting. Keeping
+/// the admission decision in a small helper makes its bounded behaviour
+/// directly testable and prevents an accidental future `.await` in the
+/// datagram reader.
+fn reserve_intent_lane(lane: Arc<Semaphore>) -> Result<OwnedSemaphorePermit, IntentOutcome> {
+    lane.try_acquire_owned()
+        .map_err(|_| IntentOutcome::Rejected {
+            // The protocol currently represents service-side admission failure as
+            // an executor error. It is still definitive: no execution was
+            // scheduled and therefore no commit is claimed.
+            reason: orrery_protocol::REASON_EXECUTOR_ERROR,
+        })
+}
+
+/// Run the synchronous edge checks for one submitted intent (D11 §2.2).
 ///
 /// The checks run in edge-to-authority order, each rejection a definitive
 /// `Rejected` ack carrying its reason code:
@@ -449,56 +500,47 @@ async fn handle_connection(
 ///    commit (RPO 0). With no executor configured the reply is
 ///    [`REASON_NO_EXECUTOR`] — the gateway never acks a commit that did not
 ///    happen (the pre-existing stub's inverted RPO-0).
-async fn route_intent(
-    send: &(dyn Fn(Bytes) + Send + Sync),
-    intent: Intent,
+fn admit_intent(
+    intent: &Intent,
     remote: NodeId,
-    executor: &Option<SharedExecutor>,
-    validator: &SharedValidator,
-) {
-    let intent_id = intent.intent_id;
-
+    validator: &dyn crate::intent::IntentValidator,
+) -> Result<(), IntentOutcome> {
     // 1. Signature (docs/08-persistence.md §2.2: signature checks at the
     //    edge, before any transaction work).
     if !intent.verify_issuer() {
-        let reply = GatewayReply::IntentAck {
-            intent_id,
-            outcome: IntentOutcome::Rejected {
-                reason: REASON_BAD_SIGNATURE,
-            },
-        };
-        send(Bytes::from(encode_stream_frame(&reply)));
-        return;
+        return Err(IntentOutcome::Rejected {
+            reason: REASON_BAD_SIGNATURE,
+        });
     }
 
     // 2. Issuer binding (the connection's authenticated id is the only
     //    identity the gateway can trust).
     if intent.issuer != remote {
-        let reply = GatewayReply::IntentAck {
-            intent_id,
-            outcome: IntentOutcome::Rejected {
-                reason: REASON_ISSUER_MISMATCH,
-            },
-        };
-        send(Bytes::from(encode_stream_frame(&reply)));
-        return;
+        return Err(IntentOutcome::Rejected {
+            reason: REASON_ISSUER_MISMATCH,
+        });
     }
 
     // 3. Admission (the Ruleset stub for now).
     let precheck = match validator.validate(&intent) {
         IntentVerdict::Admit(precheck) => precheck,
-        IntentVerdict::Reject { reason } => {
-            let reply = GatewayReply::IntentAck {
-                intent_id,
-                outcome: IntentOutcome::Rejected { reason },
-            };
-            send(Bytes::from(encode_stream_frame(&reply)));
-            return;
-        }
+        IntentVerdict::Reject { reason } => return Err(IntentOutcome::Rejected { reason }),
     };
     // The FDB executor derives its read set from the intent's ops; the
     // precheck's named keys are reserved for a Ruleset-linked executor.
     let _ = precheck;
+    Ok(())
+}
+
+/// Execute an intent that already passed the edge checks, then send its
+/// definitive result. This is intentionally separate from [`admit_intent`]
+/// so an FDB await never occupies the connection receive loop.
+async fn execute_admitted_intent(
+    send: &(dyn Fn(Bytes) + Send + Sync),
+    intent: Intent,
+    executor: &Option<SharedExecutor>,
+) {
+    let intent_id = intent.intent_id;
 
     // 4. Execution — ack only after the future resolves. An executor error
     //    becomes a definitive rejection (bounded-retry refusal, §7).
@@ -511,6 +553,16 @@ async fn route_intent(
             Err(err) => error_outcome(&err),
         },
     };
+    send_intent_reply(send, intent_id, outcome);
+}
+
+/// Encode and send an intent result. Every path uses this helper so an intent
+/// has exactly one definitive acknowledgement, including lane saturation.
+fn send_intent_reply(
+    send: &(dyn Fn(Bytes) + Send + Sync),
+    intent_id: u128,
+    outcome: IntentOutcome,
+) {
     let reply = GatewayReply::IntentAck { intent_id, outcome };
     send(Bytes::from(encode_stream_frame(&reply)));
 }
@@ -787,6 +839,21 @@ mod tests {
         fn assess(&self, _grid: GridId, _cell: CellId) -> BulkAckDisposition {
             BulkAckDisposition::Provisional
         }
+    }
+
+    #[test]
+    fn saturated_intent_lane_is_definitively_rejected_without_waiting() {
+        let lane = Arc::new(Semaphore::new(1));
+        let held = reserve_intent_lane(Arc::clone(&lane)).expect("first slot");
+
+        let outcome = reserve_intent_lane(lane).expect_err("full lane rejects immediately");
+        assert_eq!(
+            outcome,
+            IntentOutcome::Rejected {
+                reason: orrery_protocol::REASON_EXECUTOR_ERROR,
+            }
+        );
+        drop(held);
     }
 
     #[test]
