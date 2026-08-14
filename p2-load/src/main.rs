@@ -49,11 +49,11 @@ use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::net::SocketAddr;
 use std::path::Path;
 use std::process::ExitCode;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use bytes::Bytes;
 use clap::Parser;
 use futures::FutureExt;
@@ -64,7 +64,7 @@ use serde::{Deserialize, Serialize};
 use orrery_persist_client::config::PersistClientConfig;
 use orrery_persist_client::latency::LatencyHistogram;
 use orrery_persist_client::{IntentQueue, UplinkScheduler};
-use orrery_protocol::channels::{encode_datagram, encode_stream_frame, untag, Channel};
+use orrery_protocol::channels::{Channel, encode_datagram, encode_stream_frame, untag};
 use orrery_protocol::{
     Attestation, CellId, DiffUplink, Epoch, GatewayMsg, GatewayReply, GridId, Intent, IntentOp,
     IntentOutcome, NodeId, PersistId, RecordKind, Tick,
@@ -72,8 +72,8 @@ use orrery_protocol::{
 
 use cli::Cli;
 use evidence::{
-    compare_recovery, AckRecord, DiffEvidence, IntentOutcomeEvidence, RecoveredDiff,
-    RecoveredEvidence,
+    AckRecord, DiffEvidence, IntentOutcomeEvidence, RecoveredDiff, RecoveredEvidence,
+    compare_recovery,
 };
 use telemetry::{RunContext, TelemetrySink};
 
@@ -523,6 +523,30 @@ fn check_fan_out(sessions: u32, payload_bytes: usize, entities: u64, diff_hz: f6
 /// rule.
 fn scheduler_shard(index: usize, sessions: usize) -> usize {
     index % sessions
+}
+
+/// Number of flush windows in which to spread the initial registrations.
+///
+/// `UplinkScheduler` deliberately starts every registration with zero credit.
+/// If the rig queues all of them on its first flush, equal rates make every
+/// entity become ready in the same later flush.  The resulting 10k burst
+/// exhausts every connection's byte budget despite the aggregate fan-out
+/// proof.  Starting one evenly-sized cohort per window lets the scheduler
+/// retain its normal rate accumulator while assigning a stable phase to each
+/// entity.
+fn registration_phase_slots(diff_hz: f64) -> usize {
+    ((FLUSH_HZ as f64 / diff_hz).ceil() as usize).max(1)
+}
+
+/// The deterministic initial-registration phase for one inventory entry.
+///
+/// Entries are sharded round-robin, so their per-session ordinal is
+/// `index / sessions`.  Phasing that ordinal (rather than the global index)
+/// keeps each connection balanced as well as the global workload.
+fn registration_phase(index: usize, sessions: usize, phase_slots: usize) -> u64 {
+    debug_assert!(sessions > 0);
+    debug_assert!(phase_slots > 0);
+    ((index / sessions) % phase_slots) as u64
 }
 
 /// Build one D16 scheduler per live connection, registering each entity with
@@ -1031,6 +1055,7 @@ impl Rig<'_> {
         }
 
         let flush_period = Duration::from_secs_f64(1.0 / FLUSH_HZ as f64);
+        let phase_slots = registration_phase_slots(self.diff_hz);
         let start = Instant::now();
         let mut elapsed = Duration::ZERO;
         let mut next_flush = start;
@@ -1067,8 +1092,16 @@ impl Rig<'_> {
             if start.elapsed() >= next_flush.duration_since(start) {
                 // Compute each entity's current cell from its trajectory and
                 // queue a fresh diff (newest-wins replaces the pending one).
+                // Registrations are deliberately phased during the first
+                // rate interval. Once an entity has joined, it is refreshed
+                // every flush; its UplinkScheduler accumulator preserves the
+                // assigned phase and exact configured rate.
+                let flush_index = tick.load(Ordering::Relaxed);
                 for (index, p) in self.inventory.iter().enumerate() {
-                    let tick_now = tick.load(Ordering::Relaxed);
+                    if flush_index < registration_phase(index, sessions, phase_slots) {
+                        continue;
+                    }
+                    let tick_now = flush_index;
                     let cell = moved_cell(p, tick_now);
                     schedulers[scheduler_shard(index, sessions)].queue(DiffUplink {
                         cell,
@@ -1450,6 +1483,56 @@ mod tests {
             schedulers.iter().map(UplinkScheduler::len).sum::<usize>(),
             10_000
         );
+    }
+
+    #[test]
+    fn phased_registrations_spread_default_fan_out_per_session() {
+        // The P2 profile is 10k entities at 2 Hz over a 20 Hz flush clock.
+        // Its first rate interval must feed exactly 1k registrations into
+        // each 50 ms window, or the schedulers will later emit a 10k burst.
+        // Because the phase uses each connection's local ordinal, the same
+        // proof holds per session: 80 entities / 10 phases = 8 per window.
+        let entities = 10_000;
+        let sessions = 125;
+        let slots = registration_phase_slots(2.0);
+        assert_eq!(slots, 10);
+
+        let mut global = vec![0usize; slots];
+        let mut per_session = vec![vec![0usize; slots]; sessions];
+        for index in 0..entities {
+            let session = scheduler_shard(index, sessions);
+            let phase = registration_phase(index, sessions, slots) as usize;
+            global[phase] += 1;
+            per_session[session][phase] += 1;
+        }
+
+        assert_eq!(global, vec![1_000; slots]);
+        assert!(per_session.iter().all(|counts| counts == &vec![8; slots]));
+    }
+
+    #[test]
+    fn registration_phases_remain_balanced_for_non_divisible_profiles() {
+        // A small arbitrary workload exercises the ceiling phase count used
+        // for rates such as 3 Hz, where a rate interval is not an integral
+        // number of 50 ms windows. Every session's cohorts differ by at most
+        // one entity, so no connection receives an avoidable startup burst.
+        let entities = 1_003;
+        let sessions = 13;
+        let slots = registration_phase_slots(3.0);
+        assert_eq!(slots, 7);
+
+        let mut per_session = vec![vec![0usize; slots]; sessions];
+        for index in 0..entities {
+            let session = scheduler_shard(index, sessions);
+            let phase = registration_phase(index, sessions, slots) as usize;
+            per_session[session][phase] += 1;
+        }
+
+        for counts in per_session {
+            let min = *counts.iter().min().unwrap();
+            let max = *counts.iter().max().unwrap();
+            assert!(max - min <= 1, "unbalanced phase cohorts: {counts:?}");
+        }
     }
 
     #[test]
