@@ -7,6 +7,8 @@
 //! server-internal).
 
 pub mod chain;
+#[cfg(feature = "chain-grpc")]
+pub mod chain_grpc;
 pub mod fjall;
 mod group_commit;
 
@@ -17,6 +19,8 @@ pub use chain::{
     spawn_chain, ChainConfig, ChainReplicator, ChainSink, ChainTransport, JournalChainSink,
     MemChainTransport,
 };
+#[cfg(feature = "chain-grpc")]
+pub use chain_grpc::{spawn_chain_grpc, ChainGrpcServer, DurableChainId, GrpcChainTransport};
 pub use fjall::Journal;
 pub use group_commit::{AdaptiveCommitMode, GroupCommitConfig};
 

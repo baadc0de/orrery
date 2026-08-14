@@ -29,6 +29,10 @@ use crate::journal::{AppendHandle, JournalConfig, JournalError, JournalScan, Sto
 /// before the channel reports lag. Subscribers that fall behind rescan the
 /// journal from their watermark, so this bounds memory, not correctness.
 const PUBLISH_CAPACITY: usize = 4096;
+#[cfg(feature = "chain-grpc")]
+const CHAIN_RECORDS_KS: &str = "chain_records";
+#[cfg(feature = "chain-grpc")]
+const CHAIN_STATE_KS: &str = "chain_state";
 
 /// The fjall keyspace holding LSN-keyed journal records.
 const RECORDS_KS: &str = "records";
@@ -116,10 +120,54 @@ impl Journal {
         self.append_inner(record, false)
     }
 
+    /// Atomically stage a mirrored record and its chain-scoped provenance.
+    ///
+    /// The provenance key is `(durable_chain_id, origin_lsn)`.  Returning
+    /// `None` means that exact origin record is already present, making a
+    /// retry harmless.  The journal row and provenance row enter fjall in one
+    /// write batch and become durable in the same group fsync.
+    #[cfg(feature = "chain-grpc")]
+    pub(crate) fn append_replicated_indexed(
+        &self,
+        record: JournalRecord,
+        chain_key: &[u8],
+        provenance: &[u8],
+    ) -> Result<Option<Arc<AppendHandle>>, JournalError> {
+        let origin = record.lsn;
+        let index_key = chain_record_key(chain_key, origin);
+        let index = self.chain_records()?;
+        if index
+            .contains_key(&index_key)
+            .map_err(|e| JournalError::Store(format!("read chain record index: {e}")))?
+        {
+            return Ok(None);
+        }
+        self.append_inner_with_index(record, false, Some((index, index_key, provenance)))
+            .map(Some)
+    }
+
+    /// Compute the primary LSN that must immediately follow `record`.
+    #[cfg(feature = "chain-grpc")]
+    pub(crate) fn chain_grpc_successor(&self, record: &JournalRecord) -> Lsn {
+        let mut next = record.lsn;
+        advance(&mut next, encoded_len(record), self.segment_size);
+        next
+    }
+
     fn append_inner(
+        &self,
+        record: JournalRecord,
+        publish: bool,
+    ) -> Result<Arc<AppendHandle>, JournalError> {
+        self.append_inner_with_index(record, publish, None)
+    }
+
+    fn append_inner_with_index(
         &self,
         mut record: JournalRecord,
         publish: bool,
+        #[cfg(feature = "chain-grpc")] index: Option<(Keyspace, Vec<u8>, &[u8])>,
+        #[cfg(not(feature = "chain-grpc"))] _index: Option<()>,
     ) -> Result<Arc<AppendHandle>, JournalError> {
         if self.closed.load(std::sync::atomic::Ordering::Acquire) {
             return Err(JournalError::Closed);
@@ -136,16 +184,34 @@ impl Journal {
         // the stored bytes and the key agree (checkpoint watermarks and chain
         // lag both read `record.lsn`).
         let (lsn, key, encoded) = {
+            let origin_lsn = record.lsn;
             let mut cursor = self.cursor.lock().expect("journal cursor lock");
             let span = encoded_len(&record);
             let lsn = advance(&mut cursor, span, self.segment_size);
             record.lsn = lsn;
             let key = lsn_key(lsn);
+            if !publish {
+                record.lsn = origin_lsn;
+            }
             let encoded = postcard::to_stdvec(&record)
                 .map_err(|e| JournalError::Store(format!("encode record: {e}")))?;
             (lsn, key, encoded)
         };
 
+        #[cfg(feature = "chain-grpc")]
+        if let Some((index, index_key, provenance)) = index {
+            let mut batch = self.db.batch();
+            batch.insert(&self.records, key, encoded);
+            batch.insert(&index, index_key, provenance);
+            batch
+                .commit()
+                .map_err(|e| JournalError::Store(format!("insert mirrored record: {e}")))?;
+        } else {
+            self.records
+                .insert(key, encoded)
+                .map_err(|e| JournalError::Store(format!("insert record: {e}")))?;
+        }
+        #[cfg(not(feature = "chain-grpc"))]
         self.records
             .insert(key, encoded)
             .map_err(|e| JournalError::Store(format!("insert record: {e}")))?;
@@ -207,6 +273,112 @@ impl Journal {
     pub fn is_closed(&self) -> bool {
         self.closed.load(std::sync::atomic::Ordering::Acquire)
     }
+
+    #[cfg(feature = "chain-grpc")]
+    fn chain_records(&self) -> Result<Keyspace, JournalError> {
+        self.db
+            .keyspace(CHAIN_RECORDS_KS, fjall::KeyspaceCreateOptions::default)
+            .map_err(|e| JournalError::Store(format!("open chain record index: {e}")))
+    }
+
+    /// Read all provenance rows for exactly one durable chain.
+    #[cfg(feature = "chain-grpc")]
+    pub(crate) fn chain_grpc_records(
+        &self,
+        chain_key: &[u8],
+    ) -> Result<Vec<(Lsn, Vec<u8>)>, JournalError> {
+        let index = self.chain_records()?;
+        let prefix = chain_record_prefix(chain_key);
+        let end = prefix_successor(&prefix).ok_or_else(|| {
+            JournalError::Store("chain identity has no finite key-range successor".into())
+        })?;
+        index
+            .range(prefix.clone()..end)
+            .map(|entry| {
+                let entry = entry
+                    .into_inner()
+                    .map_err(|e| JournalError::Store(format!("scan chain index: {e}")))?;
+                let suffix = &entry.0.as_ref()[prefix.len()..];
+                let lsn = parse_lsn_key(suffix).ok_or_else(|| JournalError::Corrupt {
+                    lsn: Lsn::new(0, 0),
+                    msg: "invalid origin LSN in chain index".into(),
+                })?;
+                Ok((lsn, entry.1.as_ref().to_vec()))
+            })
+            .collect()
+    }
+
+    /// Read provenance for one chain/origin dedupe key.
+    #[cfg(feature = "chain-grpc")]
+    pub(crate) fn chain_grpc_record(
+        &self,
+        chain_key: &[u8],
+        origin: Lsn,
+    ) -> Result<Option<Vec<u8>>, JournalError> {
+        self.chain_records()?
+            .get(chain_record_key(chain_key, origin))
+            .map(|value| value.map(|value| value.as_ref().to_vec()))
+            .map_err(|e| JournalError::Store(format!("read chain record provenance: {e}")))
+    }
+
+    /// Load opaque cursor state for exactly one durable chain.
+    #[cfg(feature = "chain-grpc")]
+    pub(crate) fn chain_grpc_state(
+        &self,
+        chain_key: &[u8],
+    ) -> Result<Option<Vec<u8>>, JournalError> {
+        let state = self
+            .db
+            .keyspace(CHAIN_STATE_KS, fjall::KeyspaceCreateOptions::default)
+            .map_err(|e| JournalError::Store(format!("open chain state: {e}")))?;
+        state
+            .get(chain_key)
+            .map(|value| value.map(|value| value.as_ref().to_vec()))
+            .map_err(|e| JournalError::Store(format!("read chain state: {e}")))
+    }
+
+    /// Persist opaque cursor state after its referenced records are durable.
+    #[cfg(feature = "chain-grpc")]
+    pub(crate) fn set_chain_grpc_state(
+        &self,
+        chain_key: &[u8],
+        value: &[u8],
+    ) -> Result<(), JournalError> {
+        let state = self
+            .db
+            .keyspace(CHAIN_STATE_KS, fjall::KeyspaceCreateOptions::default)
+            .map_err(|e| JournalError::Store(format!("open chain state: {e}")))?;
+        state
+            .insert(chain_key, value)
+            .map_err(|e| JournalError::Store(format!("write chain state: {e}")))?;
+        self.db
+            .persist(PersistMode::SyncData)
+            .map_err(|e| JournalError::Store(format!("persist chain state: {e}")))
+    }
+}
+
+#[cfg(feature = "chain-grpc")]
+fn chain_record_prefix(chain_key: &[u8]) -> Vec<u8> {
+    let mut key = Vec::with_capacity(4 + chain_key.len());
+    key.extend_from_slice(&(chain_key.len() as u32).to_be_bytes());
+    key.extend_from_slice(chain_key);
+    key
+}
+
+#[cfg(feature = "chain-grpc")]
+fn chain_record_key(chain_key: &[u8], lsn: Lsn) -> Vec<u8> {
+    let mut key = chain_record_prefix(chain_key);
+    key.extend_from_slice(&lsn_key(lsn));
+    key
+}
+
+#[cfg(feature = "chain-grpc")]
+fn prefix_successor(prefix: &[u8]) -> Option<Vec<u8>> {
+    let mut end = prefix.to_vec();
+    let position = end.iter().rposition(|byte| *byte != u8::MAX)?;
+    end[position] += 1;
+    end.truncate(position + 1);
+    Some(end)
 }
 
 /// Recover the next LSN from the last record stored, or a fresh start.

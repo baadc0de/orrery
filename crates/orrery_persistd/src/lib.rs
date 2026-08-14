@@ -54,5 +54,7 @@ pub use journal::{
     spawn_chain, AppendHandle, ChainConfig, ChainReplicator, ChainSink, ChainTransport, Journal,
     JournalChainSink, JournalConfig, JournalError, JournalScan, MemChainTransport, StoredRecord,
 };
+#[cfg(feature = "chain-grpc")]
+pub use journal::{spawn_chain_grpc, ChainGrpcServer, DurableChainId, GrpcChainTransport};
 pub use placement::{RendezvousHasher, RendezvousNode, RendezvousWeight};
 pub use runtime::{payload_crc, CellRuntime, RuntimeConfig};
