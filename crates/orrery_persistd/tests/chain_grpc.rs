@@ -5,8 +5,8 @@ use std::time::Duration;
 
 use orrery_persistd::journal::{AdaptiveCommitMode, GroupCommitConfig};
 use orrery_persistd::{
-    payload_crc, spawn_chain_grpc, ChainTransport, DurableChainId, GrpcChainTransport, Journal,
-    JournalConfig,
+    payload_crc, spawn_adopted_chain, spawn_chain_grpc, ChainConfig, ChainTransport,
+    DurableChainId, GrpcChainTransport, Journal, JournalConfig,
 };
 use orrery_protocol::{
     CellId, Epoch, GridId, JournalRecord, Lsn, NodeId, PersistId, RecordKind, Tick,
@@ -181,4 +181,80 @@ async fn durable_append_lost_ack_replays_without_duplicate_record() {
     drop(transport);
     server.shutdown().await;
     journal.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn promoted_history_survives_restart_idempotently_and_seeds_new_follower() {
+    let source_dir = tempfile::tempdir().unwrap();
+    let mut source = Arc::new(Journal::open(&config(source_dir.path())).unwrap());
+    let inbound = spawn_chain_grpc("127.0.0.1:0".parse().unwrap(), Arc::clone(&source), chain())
+        .await
+        .unwrap();
+    let input = GrpcChainTransport::connect(inbound.addr(), chain())
+        .await
+        .unwrap();
+    input.append(record(10)).await.unwrap();
+    input.append(record(82)).await.unwrap();
+    drop(input);
+    inbound.shutdown().await;
+    source.close().await.unwrap();
+    drop(source);
+
+    source = Arc::new(Journal::open(&config(source_dir.path())).unwrap());
+    let adopted = source.adopt_chain_history(chain()).unwrap();
+    assert_eq!(adopted.watermark(), Some(Lsn::new(0, 82)));
+    assert_eq!(
+        source.adopt_chain_history(chain()).unwrap().watermark(),
+        adopted.watermark()
+    );
+
+    let output_dir = tempfile::tempdir().unwrap();
+    let output = Arc::new(Journal::open(&config(output_dir.path())).unwrap());
+    let new_chain = DurableChainId {
+        primary_node: node(2),
+        follower_node: node(3),
+        shard_set: b"root/0-7".to_vec(),
+        epoch: 5,
+    };
+    let outbound = spawn_chain_grpc(
+        "127.0.0.1:0".parse().unwrap(),
+        Arc::clone(&output),
+        new_chain.clone(),
+    )
+    .await
+    .unwrap();
+    let transport: Arc<dyn ChainTransport> = Arc::new(
+        GrpcChainTransport::connect(outbound.addr(), new_chain)
+            .await
+            .unwrap(),
+    );
+    let replicator = spawn_adopted_chain(
+        Arc::clone(&source),
+        adopted,
+        transport,
+        &ChainConfig::default(),
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while replicator.follower_watermark() != Some(Lsn::new(0, 82)) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "adopted prefix did not reach new follower"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let mirrored = output
+        .scan_from(Lsn::new(0, 0))
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(
+        mirrored
+            .iter()
+            .map(|row| row.record.lsn)
+            .collect::<Vec<_>>(),
+        vec![Lsn::new(0, 10), Lsn::new(0, 82)]
+    );
+    replicator.shutdown().await;
+    outbound.shutdown().await;
+    source.close().await.unwrap();
+    output.close().await.unwrap();
 }

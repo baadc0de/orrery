@@ -24,7 +24,7 @@ use tokio::sync::broadcast;
 use orrery_protocol::JournalRecord;
 use orrery_protocol::Lsn;
 
-use crate::journal::group_commit::{spawn_committer, CommitterHandle};
+use crate::journal::group_commit::{CommitterHandle, spawn_committer};
 use crate::journal::{AppendHandle, JournalConfig, JournalError, JournalScan, StoredRecord};
 
 /// The number of committed records buffered for chain-replication subscribers
@@ -35,6 +35,10 @@ const PUBLISH_CAPACITY: usize = 4096;
 const CHAIN_RECORDS_KS: &str = "chain_records";
 #[cfg(feature = "chain-grpc")]
 const CHAIN_STATE_KS: &str = "chain_state";
+#[cfg(feature = "chain-grpc")]
+const ADOPTIONS_KS: &str = "chain_adoptions";
+#[cfg(feature = "chain-grpc")]
+const ADOPTED_RECORDS_KS: &str = "adopted_chain_records";
 
 /// The fjall keyspace holding LSN-keyed journal records.
 const RECORDS_KS: &str = "records";
@@ -305,6 +309,20 @@ impl Journal {
         }
     }
 
+    #[cfg(feature = "chain-grpc")]
+    pub(crate) fn scan_source_from<'a>(
+        &'a self,
+        source: &crate::journal::chain::ChainSource,
+        from: Lsn,
+    ) -> Result<JournalScan<'a>, JournalError> {
+        match source {
+            crate::journal::chain::ChainSource::Originated => Ok(self.scan_originated_from(from)),
+            crate::journal::chain::ChainSource::Adopted(history) => {
+                self.scan_adopted_from(history, from)
+            }
+        }
+    }
+
     /// Flush any pending appends and stop the committer, then close the store.
     ///
     /// Awaits the committer task's exit so its store clone (and the file lock)
@@ -406,6 +424,170 @@ impl Journal {
             .persist(PersistMode::SyncData)
             .map_err(|e| JournalError::Store(format!("persist chain state: {e}")))
     }
+
+    /// Adopt one follower chain after ownership fencing. Provenance must form
+    /// one complete, unambiguous prefix; partial tails are never promoted.
+    #[cfg(feature = "chain-grpc")]
+    pub fn adopt_chain_history(
+        &self,
+        source: crate::journal::chain_grpc::DurableChainId,
+    ) -> Result<crate::journal::chain::AdoptedChainHistory, JournalError> {
+        use crate::journal::chain::AdoptedChainHistory;
+        use crate::journal::chain_grpc::{
+            AdoptedRecord, AdoptionMarker, RecordProvenance, chain_key_for_adoption,
+        };
+        use std::collections::BTreeMap;
+
+        let source_key = chain_key_for_adoption(&source)?;
+        let marker_key = adoption_key(&source_key);
+        let markers = self
+            .db
+            .keyspace(ADOPTIONS_KS, fjall::KeyspaceCreateOptions::default)
+            .map_err(|e| JournalError::Store(format!("open adoption markers: {e}")))?;
+        if let Some(value) = markers
+            .get(&marker_key)
+            .map_err(|e| JournalError::Store(format!("read adoption marker: {e}")))?
+        {
+            let marker: AdoptionMarker = postcard::from_bytes(&value)
+                .map_err(|e| JournalError::Store(format!("decode adoption marker: {e}")))?;
+            if marker.source_key != source_key {
+                return Err(JournalError::Store(
+                    "adoption marker identity mismatch".into(),
+                ));
+            }
+            return Ok(AdoptedChainHistory::new(source, marker.watermark));
+        }
+
+        let mut batches: BTreeMap<u64, Vec<(Lsn, RecordProvenance)>> = BTreeMap::new();
+        for (origin, bytes) in self.chain_grpc_records(&source_key)? {
+            let provenance: RecordProvenance = postcard::from_bytes(&bytes)
+                .map_err(|e| JournalError::Store(format!("decode chain provenance: {e}")))?;
+            batches
+                .entry(provenance.batch_seq)
+                .or_default()
+                .push((origin, provenance));
+        }
+        let mut previous = None;
+        let mut adopted_records = Vec::new();
+        for (expected, (seq, mut batch)) in batches.into_iter().enumerate() {
+            if seq != expected as u64 {
+                return Err(JournalError::Store(
+                    "cannot adopt chain history with a batch gap".into(),
+                ));
+            }
+            batch.sort_by_key(|(_, p)| p.ordinal);
+            let Some((_, first)) = batch.first() else {
+                return Err(JournalError::Store("cannot adopt empty chain batch".into()));
+            };
+            if first.predecessor != previous
+                || usize::try_from(first.batch_len).ok() != Some(batch.len())
+            {
+                return Err(JournalError::Store(
+                    "cannot adopt discontinuous chain history".into(),
+                ));
+            }
+            for (ordinal, (origin, p)) in batch.iter().enumerate() {
+                if p.batch_seq != seq
+                    || p.ordinal as usize != ordinal
+                    || p.batch_len != first.batch_len
+                    || p.predecessor != first.predecessor
+                    || p.first_lsn != first.first_lsn
+                    || p.last_lsn != first.last_lsn
+                    || p.next_lsn != first.next_lsn
+                    || (ordinal == 0 && *origin != first.first_lsn)
+                    || (ordinal + 1 == batch.len() && *origin != first.last_lsn)
+                {
+                    return Err(JournalError::Store(
+                        "cannot adopt ambiguous chain provenance".into(),
+                    ));
+                }
+                let matches = self
+                    .scan_from(Lsn::new(0, 0))
+                    .filter_map(Result::ok)
+                    .filter(|stored| stored.record.lsn == *origin)
+                    .collect::<Vec<_>>();
+                if matches.len() != 1 {
+                    return Err(JournalError::Store(
+                        "cannot adopt ambiguous source record identity".into(),
+                    ));
+                }
+                adopted_records.push(AdoptedRecord {
+                    origin: *origin,
+                    local: matches[0].lsn,
+                });
+            }
+            previous = Some(first.last_lsn);
+        }
+        let marker = AdoptionMarker {
+            source_key: source_key.clone(),
+            watermark: previous,
+            records: adopted_records,
+        };
+        let adopted = self
+            .db
+            .keyspace(ADOPTED_RECORDS_KS, fjall::KeyspaceCreateOptions::default)
+            .map_err(|e| JournalError::Store(format!("open adopted record index: {e}")))?;
+        let mut write = self.db.batch();
+        for record in &marker.records {
+            write.insert(
+                &adopted,
+                adoption_record_key(&source_key, record.origin),
+                lsn_key(record.local).to_vec(),
+            );
+        }
+        write.insert(
+            &markers,
+            marker_key,
+            postcard::to_stdvec(&marker)
+                .map_err(|e| JournalError::Store(format!("encode adoption marker: {e}")))?,
+        );
+        write
+            .commit()
+            .map_err(|e| JournalError::Store(format!("write adoption marker: {e}")))?;
+        self.db
+            .persist(PersistMode::SyncData)
+            .map_err(|e| JournalError::Store(format!("persist adoption marker: {e}")))?;
+        Ok(AdoptedChainHistory::new(source, previous))
+    }
+
+    #[cfg(feature = "chain-grpc")]
+    fn scan_adopted_from<'a>(
+        &'a self,
+        history: &crate::journal::chain::AdoptedChainHistory,
+        from: Lsn,
+    ) -> Result<JournalScan<'a>, JournalError> {
+        use crate::journal::chain_grpc::chain_key_for_adoption;
+        let source_key = chain_key_for_adoption(history.source())?;
+        let adopted = self
+            .db
+            .keyspace(ADOPTED_RECORDS_KS, fjall::KeyspaceCreateOptions::default)
+            .map_err(|e| JournalError::Store(format!("open adopted record index: {e}")))?;
+        let prefix = chain_record_prefix(&source_key);
+        let end = prefix_successor(&prefix).ok_or_else(|| {
+            JournalError::Store("adopted chain identity has no finite key-range successor".into())
+        })?;
+        let records = &self.records;
+        let iter = adopted
+            .range(adoption_record_key(&source_key, from)..end)
+            .map(move |entry| {
+                let entry = entry
+                    .into_inner()
+                    .map_err(|e| JournalError::Store(format!("scan adopted record index: {e}")))?;
+                let local = parse_lsn_key(entry.1.as_ref())
+                    .ok_or_else(|| JournalError::Store("invalid adopted local LSN".into()))?;
+                let value = records
+                    .get(lsn_key(local))
+                    .map_err(|e| JournalError::Store(format!("read adopted record: {e}")))?
+                    .ok_or_else(|| JournalError::Corrupt {
+                        lsn: local,
+                        msg: "adopted record missing".into(),
+                    })?;
+                decode_pair(&lsn_key(local), &value)
+            });
+        Ok(JournalScan {
+            iter: Box::new(iter),
+        })
+    }
 }
 
 #[cfg(feature = "chain-grpc")]
@@ -418,6 +600,20 @@ fn chain_record_prefix(chain_key: &[u8]) -> Vec<u8> {
 
 #[cfg(feature = "chain-grpc")]
 fn chain_record_key(chain_key: &[u8], lsn: Lsn) -> Vec<u8> {
+    let mut key = chain_record_prefix(chain_key);
+    key.extend_from_slice(&lsn_key(lsn));
+    key
+}
+
+#[cfg(feature = "chain-grpc")]
+fn adoption_key(chain_key: &[u8]) -> Vec<u8> {
+    let mut key = b"adoption/".to_vec();
+    key.extend_from_slice(&chain_record_prefix(chain_key));
+    key
+}
+
+#[cfg(feature = "chain-grpc")]
+fn adoption_record_key(chain_key: &[u8], lsn: Lsn) -> Vec<u8> {
     let mut key = chain_record_prefix(chain_key);
     key.extend_from_slice(&lsn_key(lsn));
     key

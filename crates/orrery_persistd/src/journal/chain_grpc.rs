@@ -15,19 +15,19 @@
 
 use std::collections::BTreeMap;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use bytes::{Buf, BufMut};
 use futures::{SinkExt, Stream};
-use hyper_util::client::legacy::{connect::HttpConnector, Client};
+use hyper_util::client::legacy::{Client, connect::HttpConnector};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto;
 use prost::encoding::{self as pb, DecodeContext, WireType};
 use prost::{DecodeError, Message};
-use tokio::sync::{broadcast, Mutex};
+use tokio::sync::{Mutex, broadcast};
 use tonic::codec::{BufferSettings, Codec, DecodeBuf, Decoder, EncodeBuf, Encoder};
-use tonic::codegen::{http, Body, BoxFuture, Service, StdError};
+use tonic::codegen::{Body, BoxFuture, Service, StdError, http};
 use tonic::{Request, Response, Status};
 
 use orrery_protocol::{JournalRecord, Lsn, NodeId};
@@ -213,14 +213,28 @@ postcard_message!(StreamRequest);
 postcard_message!(StreamReply);
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-struct RecordProvenance {
-    batch_seq: u64,
-    ordinal: u32,
-    batch_len: u32,
-    predecessor: Option<Lsn>,
-    first_lsn: Lsn,
-    last_lsn: Lsn,
-    next_lsn: Lsn,
+pub(crate) struct RecordProvenance {
+    pub(crate) batch_seq: u64,
+    pub(crate) ordinal: u32,
+    pub(crate) batch_len: u32,
+    pub(crate) predecessor: Option<Lsn>,
+    pub(crate) first_lsn: Lsn,
+    pub(crate) last_lsn: Lsn,
+    pub(crate) next_lsn: Lsn,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct AdoptedRecord {
+    pub(crate) origin: Lsn,
+    pub(crate) local: Lsn,
+}
+
+/// Fsynced acceptance decision for a complete source-chain history.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct AdoptionMarker {
+    pub(crate) source_key: Vec<u8>,
+    pub(crate) watermark: Option<Lsn>,
+    pub(crate) records: Vec<AdoptedRecord>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -230,9 +244,13 @@ struct Cursor {
     next_lsn: Option<Lsn>,
 }
 
-fn chain_key(chain: &DurableChainId) -> Result<Vec<u8>, JournalError> {
+pub(crate) fn chain_key_for_adoption(chain: &DurableChainId) -> Result<Vec<u8>, JournalError> {
     postcard::to_stdvec(chain)
         .map_err(|e| JournalError::Store(format!("encode durable chain identity: {e}")))
+}
+
+fn chain_key(chain: &DurableChainId) -> Result<Vec<u8>, JournalError> {
+    chain_key_for_adoption(chain)
 }
 
 fn wire_chain(chain: &DurableChainId) -> WireChainId {
@@ -1308,35 +1326,41 @@ mod tests {
             .reconnect(reconnect_request(&id, nonce))
             .await
             .unwrap();
-        assert!(replica
-            .append(batch_request(&id, nonce, 1, None, &[record(10, 1)]))
-            .await
-            .is_err());
-        assert!(replica
-            .append(batch_request(
-                &id,
-                nonce,
-                0,
-                None,
-                &[record(10, 1), record(20, 2)],
-            ))
-            .await
-            .is_err());
+        assert!(
+            replica
+                .append(batch_request(&id, nonce, 1, None, &[record(10, 1)]))
+                .await
+                .is_err()
+        );
+        assert!(
+            replica
+                .append(batch_request(
+                    &id,
+                    nonce,
+                    0,
+                    None,
+                    &[record(10, 1), record(20, 2)],
+                ))
+                .await
+                .is_err()
+        );
         assert_eq!(replica.state.lock().await.cursor, Cursor::default());
         replica
             .append(batch_request(&id, nonce, 0, None, &[record(10, 1)]))
             .await
             .unwrap();
-        assert!(replica
-            .append(batch_request(
-                &id,
-                nonce,
-                1,
-                Some(Lsn::new(0, 9)),
-                &[record(11, 2)],
-            ))
-            .await
-            .is_err());
+        assert!(
+            replica
+                .append(batch_request(
+                    &id,
+                    nonce,
+                    1,
+                    Some(Lsn::new(0, 9)),
+                    &[record(11, 2)],
+                ))
+                .await
+                .is_err()
+        );
         assert_eq!(
             replica.state.lock().await.cursor.watermark,
             Some(Lsn::new(0, 10))
@@ -1395,6 +1419,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn adoption_refuses_a_provenance_batch_gap() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = Journal::open(&config(dir.path())).unwrap();
+        let id = chain(1, 9, 1, 1);
+        let key = chain_key(&id).unwrap();
+        let provenance = RecordProvenance {
+            batch_seq: 1,
+            ordinal: 0,
+            batch_len: 1,
+            predecessor: None,
+            first_lsn: Lsn::new(0, 10),
+            last_lsn: Lsn::new(0, 10),
+            next_lsn: Lsn::new(0, 82),
+        };
+        journal
+            .append_replicated_indexed(
+                record(10, 1),
+                &key,
+                &postcard::to_stdvec(&provenance).unwrap(),
+            )
+            .unwrap()
+            .unwrap()
+            .committed()
+            .await
+            .unwrap();
+        assert!(journal.adopt_chain_history(id).is_err());
+        journal.close().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn every_mismatched_chain_component_is_rejected() {
         let dir = tempfile::tempdir().unwrap();
         let journal = Arc::new(Journal::open(&config(dir.path())).unwrap());
@@ -1406,10 +1460,12 @@ mod tests {
             chain(1, 9, 2, 1),
             chain(1, 9, 1, 2),
         ] {
-            assert!(replica
-                .reconnect(reconnect_request(&wrong, [5; 16]))
-                .await
-                .is_err());
+            assert!(
+                replica
+                    .reconnect(reconnect_request(&wrong, [5; 16]))
+                    .await
+                    .is_err()
+            );
         }
         assert_eq!(replica.state.lock().await.cursor, Cursor::default());
         journal.close().await.unwrap();
@@ -1460,20 +1516,24 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(replica
-            .append(batch_request(&id, stale, 0, None, &[record(10, 1)]))
-            .await
-            .is_err());
-        assert!(replica
-            .append(batch_request(
-                &chain(1, 9, 2, 1),
-                current,
-                0,
-                None,
-                &[record(10, 1)],
-            ))
-            .await
-            .is_err());
+        assert!(
+            replica
+                .append(batch_request(&id, stale, 0, None, &[record(10, 1)]))
+                .await
+                .is_err()
+        );
+        assert!(
+            replica
+                .append(batch_request(
+                    &chain(1, 9, 2, 1),
+                    current,
+                    0,
+                    None,
+                    &[record(10, 1)],
+                ))
+                .await
+                .is_err()
+        );
         assert_eq!(replica.state.lock().await.cursor, Cursor::default());
 
         replica

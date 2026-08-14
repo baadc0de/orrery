@@ -15,12 +15,14 @@ mod group_commit;
 use orrery_protocol::JournalRecord;
 use orrery_protocol::Lsn;
 
+#[cfg(feature = "chain-grpc")]
+pub use chain::{AdoptedChainHistory, spawn_adopted_chain};
 pub use chain::{
-    spawn_chain, ChainConfig, ChainReplicator, ChainSink, ChainTransport, JournalChainSink,
-    MemChainTransport,
+    ChainConfig, ChainReplicator, ChainSink, ChainTransport, JournalChainSink, MemChainTransport,
+    spawn_chain,
 };
 #[cfg(feature = "chain-grpc")]
-pub use chain_grpc::{spawn_chain_grpc, ChainGrpcServer, DurableChainId, GrpcChainTransport};
+pub use chain_grpc::{ChainGrpcServer, DurableChainId, GrpcChainTransport, spawn_chain_grpc};
 pub use fjall::Journal;
 pub use group_commit::{AdaptiveCommitMode, GroupCommitConfig};
 

@@ -31,6 +31,43 @@ use orrery_protocol::Lsn;
 
 use crate::journal::{Journal, JournalError};
 
+/// A durably accepted follower history that a promoted node may export to its
+/// new follower. Mirrored rows remain non-outbound unless explicitly adopted.
+#[cfg(feature = "chain-grpc")]
+#[derive(Clone, Debug)]
+pub struct AdoptedChainHistory {
+    source: crate::journal::chain_grpc::DurableChainId,
+    watermark: Option<Lsn>,
+}
+
+#[cfg(feature = "chain-grpc")]
+impl AdoptedChainHistory {
+    pub(crate) fn new(
+        source: crate::journal::chain_grpc::DurableChainId,
+        watermark: Option<Lsn>,
+    ) -> Self {
+        Self { source, watermark }
+    }
+
+    /// The source chain whose record identities this history preserves.
+    #[must_use]
+    pub fn source(&self) -> &crate::journal::chain_grpc::DurableChainId {
+        &self.source
+    }
+
+    /// Highest accepted source LSN, if the mirrored chain was non-empty.
+    #[must_use]
+    pub fn watermark(&self) -> Option<Lsn> {
+        self.watermark
+    }
+}
+
+pub(crate) enum ChainSource {
+    Originated,
+    #[cfg(feature = "chain-grpc")]
+    Adopted(AdoptedChainHistory),
+}
+
 /// Configuration for chain replication (D11 §4).
 #[derive(Debug, Clone)]
 pub struct ChainConfig {
@@ -205,6 +242,30 @@ pub fn spawn_chain(
     transport: Arc<dyn ChainTransport>,
     config: &ChainConfig,
 ) -> ChainReplicator {
+    spawn_chain_from(journal, transport, config, ChainSource::Originated)
+}
+
+/// Spawn an outbound chain from a promotion-adopted source prefix.
+///
+/// The records retain their original source LSNs and epochs. This path is
+/// intentionally separate from ordinary mirroring, preventing a follower from
+/// becoming an accidental relay without a fenced promotion decision.
+#[cfg(feature = "chain-grpc")]
+pub fn spawn_adopted_chain(
+    journal: Arc<Journal>,
+    history: AdoptedChainHistory,
+    transport: Arc<dyn ChainTransport>,
+    config: &ChainConfig,
+) -> ChainReplicator {
+    spawn_chain_from(journal, transport, config, ChainSource::Adopted(history))
+}
+
+fn spawn_chain_from(
+    journal: Arc<Journal>,
+    transport: Arc<dyn ChainTransport>,
+    config: &ChainConfig,
+    source: ChainSource,
+) -> ChainReplicator {
     let watermark = Arc::new(std::sync::Mutex::new(None));
     let lag_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let shutdown = Arc::new(ShutdownSignal::default());
@@ -250,7 +311,8 @@ pub fn spawn_chain(
             let batch = committed
                 .map(|committed| {
                     journal
-                        .scan_originated_from(from)
+                        .scan_source_from(&source, from)
+                        .expect("adopted chain history was validated before replication")
                         .filter(|item| match item {
                             Ok(stored) => {
                                 stored.lsn <= committed

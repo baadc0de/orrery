@@ -54,11 +54,15 @@ pub use intent::{
     IntentError, IntentExecutor, IntentPrecheck, IntentValidator, IntentVerdict, MemIntentExecutor,
     PermissiveValidator,
 };
-pub use journal::{
-    spawn_chain, AppendHandle, ChainConfig, ChainReplicator, ChainSink, ChainTransport, Journal,
-    JournalChainSink, JournalConfig, JournalError, JournalScan, MemChainTransport, StoredRecord,
-};
 #[cfg(feature = "chain-grpc")]
-pub use journal::{spawn_chain_grpc, ChainGrpcServer, DurableChainId, GrpcChainTransport};
+pub use journal::{
+    AdoptedChainHistory, ChainGrpcServer, DurableChainId, GrpcChainTransport, spawn_adopted_chain,
+    spawn_chain_grpc,
+};
+pub use journal::{
+    AppendHandle, ChainConfig, ChainReplicator, ChainSink, ChainTransport, Journal,
+    JournalChainSink, JournalConfig, JournalError, JournalScan, MemChainTransport, StoredRecord,
+    spawn_chain,
+};
 pub use placement::{RendezvousHasher, RendezvousNode, RendezvousWeight};
 pub use runtime::{payload_crc, CellRuntime, RuntimeConfig};
