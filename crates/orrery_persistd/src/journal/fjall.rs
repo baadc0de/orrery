@@ -457,7 +457,7 @@ impl Journal {
         use crate::journal::chain_grpc::{
             AdoptedRecord, AdoptionMarker, RecordProvenance, chain_key_for_adoption,
         };
-        use std::collections::BTreeMap;
+        use std::collections::{BTreeMap, HashMap};
 
         let source_key = chain_key_for_adoption(&source)?;
         let marker_key = adoption_key(&source_key);
@@ -488,6 +488,32 @@ impl Journal {
                 .or_default()
                 .push((origin, provenance));
         }
+
+        // Mirrored records retain their source LSN in the encoded value while
+        // receiving a follower-local key.  Build that reverse lookup once.
+        //
+        // Do not use the chain provenance index for this lookup: the check is
+        // intentionally against the complete journal, so a local record that
+        // collides with a source identity makes promotion ambiguous.  The old
+        // implementation performed this full scan for every source record,
+        // making promotion O(chain_records * journal_records).  A 30-second
+        // P2 run has hundreds of thousands of records, so that prevented the
+        // promoted follower from ever becoming ready.
+        let mut local_by_origin = HashMap::<Lsn, Option<Lsn>>::new();
+        for stored in self.scan_from(Lsn::new(0, 0)).filter_map(Result::ok) {
+            match local_by_origin.entry(stored.record.lsn) {
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert(Some(stored.lsn));
+                }
+                std::collections::hash_map::Entry::Occupied(mut entry) => {
+                    // Keep scanning: two local rows for one source identity
+                    // are indistinguishable from the repeated scans above and
+                    // must reject adoption rather than choose arbitrarily.
+                    *entry.get_mut() = None;
+                }
+            }
+        }
+
         let mut previous = None;
         let mut adopted_records = Vec::new();
         for (expected, (seq, mut batch)) in batches.into_iter().enumerate() {
@@ -522,19 +548,15 @@ impl Journal {
                         "cannot adopt ambiguous chain provenance".into(),
                     ));
                 }
-                let matches = self
-                    .scan_from(Lsn::new(0, 0))
-                    .filter_map(Result::ok)
-                    .filter(|stored| stored.record.lsn == *origin)
-                    .collect::<Vec<_>>();
-                if matches.len() != 1 {
-                    return Err(JournalError::Store(
-                        "cannot adopt ambiguous source record identity".into(),
-                    ));
-                }
+                let local = local_by_origin
+                    .get(origin)
+                    .and_then(|local| *local)
+                    .ok_or_else(|| {
+                        JournalError::Store("cannot adopt ambiguous source record identity".into())
+                    })?;
                 adopted_records.push(AdoptedRecord {
                     origin: *origin,
-                    local: matches[0].lsn,
+                    local,
                 });
             }
             previous = Some(first.last_lsn);
@@ -927,6 +949,70 @@ mod tests {
         let delta = metrics.delta(&mut cursor);
         assert_eq!(delta.iter().map(|sample| sample.count).sum::<u64>(), 1);
         assert!(metrics.delta(&mut cursor).is_empty());
+        journal.close().await.expect("close");
+    }
+
+    #[cfg(feature = "chain-grpc")]
+    #[tokio::test]
+    async fn adoption_indexes_a_large_mirrored_prefix_in_one_pass() {
+        use crate::journal::chain_grpc::{
+            chain_key_for_adoption, DurableChainId, RecordProvenance,
+        };
+
+        const RECORDS: usize = 1_024;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let journal = Journal::open(&JournalConfig {
+            dir: dir.path().to_path_buf(),
+            commit: GroupCommitConfig::default(),
+        })
+        .expect("open journal");
+        let source = DurableChainId {
+            primary_node: test_node(11),
+            follower_node: test_node(12),
+            shard_set: b"adoption-perf".to_vec(),
+            epoch: 7,
+        };
+        let source_key = chain_key_for_adoption(&source).expect("source key");
+        let first = Lsn::new(0, 100);
+        let last = Lsn::new(0, 100 + (RECORDS as u64 - 1) * 100);
+        let mut handles = Vec::with_capacity(RECORDS);
+        for ordinal in 0..RECORDS {
+            let origin = Lsn::new(0, 100 + ordinal as u64 * 100);
+            let mut record = mk_record(ordinal as u64);
+            record.lsn = origin;
+            let provenance = RecordProvenance {
+                batch_seq: 0,
+                ordinal: ordinal as u32,
+                batch_len: RECORDS as u32,
+                predecessor: None,
+                first_lsn: first,
+                last_lsn: last,
+                next_lsn: Lsn::new(0, last.offset + 100),
+            };
+            handles.push(
+                journal
+                    .append_replicated_indexed(
+                        record,
+                        &source_key,
+                        &postcard::to_stdvec(&provenance).expect("encode provenance"),
+                    )
+                    .expect("stage mirrored record")
+                    .expect("new mirrored record"),
+            );
+        }
+        for handle in handles {
+            handle.committed().await.expect("commit mirrored record");
+        }
+
+        let history = journal.adopt_chain_history(source).expect("adopt prefix");
+        assert_eq!(history.watermark(), Some(last));
+        assert_eq!(
+            journal
+                .scan_adopted_from(&history, Lsn::new(0, 0))
+                .expect("scan adopted history")
+                .count(),
+            RECORDS
+        );
         journal.close().await.expect("close");
     }
 
