@@ -301,6 +301,21 @@ pub fn seedprog_emit_range(emit_hash: [u8; 8]) -> (Vec<u8>, Vec<u8>) {
     (start, end)
 }
 
+/// Decode a `seedprog/{emit_hash}/{grid_id}/{cell_id}` key.
+///
+/// Returns `None` unless `key` has the fixed-width seed-progress layout.
+#[must_use]
+pub fn decode_seedprog_key(key: &[u8]) -> Option<([u8; 8], GridId, CellId)> {
+    if key.len() != 21 || key[0] != b'p' {
+        return None;
+    }
+    let mut emit_hash = [0u8; 8];
+    emit_hash.copy_from_slice(&key[1..9]);
+    let grid = GridId(u32::from_be_bytes(key[9..13].try_into().ok()?));
+    let cell = CellId::from_bits(u64::from_be_bytes(key[13..21].try_into().ok()?))?;
+    Some((emit_hash, grid, cell))
+}
+
 // ---------------------------------------------------------------------------
 // Terrain chunk family: `chunk/{grid}/{cell}/{n}`
 // ---------------------------------------------------------------------------
@@ -768,6 +783,8 @@ mod tests {
         expected[9..13].copy_from_slice(&42u32.to_be_bytes());
         expected[13..21].copy_from_slice(&cell.to_bits().to_be_bytes());
         assert_eq!(key, expected);
+        assert_eq!(decode_seedprog_key(&key), Some((emit_hash, grid, cell)));
+        assert_eq!(decode_seedprog_key(&key[..20]), None);
     }
 
     #[test]

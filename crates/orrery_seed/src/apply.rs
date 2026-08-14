@@ -15,7 +15,7 @@ use crate::idmap::{self, BlockGrantCursor, SeedMap, SeedMapRow};
 use crate::manifest::{ManifestEntry, ManifestWriter};
 use crate::scenario::ResolvedScenario;
 use crate::seedtree::SeedRoot;
-use crate::split::{split_cell, FieldOracle};
+use crate::split::{FieldOracle, split_cell};
 use crate::write::{self, EncodedRow};
 
 /// Writer options.
@@ -352,14 +352,16 @@ async fn next_persist_id(
     grid: GridId,
     grants: &mut BTreeMap<GridId, BlockGrantCursor>,
 ) -> Result<PersistId, String> {
-    let cursor = grants
-        .entry(grid)
-        .or_insert_with(|| BlockGrantCursor::new(crate::idmap::BlockGrant::default()));
-    if let Some(id) = cursor.next_id() {
-        return Ok(id);
+    if let Some(cursor) = grants.get_mut(&grid) {
+        if let Some(id) = cursor.next_id() {
+            return Ok(id);
+        }
     }
     let grant = idmap::reserve_block(db, grid, idmap::DEFAULT_BLOCK_GRANT).await?;
-    *cursor = BlockGrantCursor::new(grant);
+    let cursor = grants
+        .entry(grid)
+        .and_modify(|cursor| *cursor = BlockGrantCursor::new(grant))
+        .or_insert_with(|| BlockGrantCursor::new(grant));
     cursor
         .next_id()
         .ok_or_else(|| "pid grant exhausted".to_string())

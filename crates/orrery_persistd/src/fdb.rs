@@ -51,6 +51,14 @@ impl FdbContext {
     }
 }
 
+/// Start the FoundationDB client network without opening a database.
+///
+/// This is for callers that own their own database handle but still need to
+/// share the process-wide client bootstrap.
+pub fn fdb_network() {
+    boot_network();
+}
+
 /// Boot FoundationDB exactly once for this Rust process.
 fn boot_network() {
     static ONCE: std::sync::Once = std::sync::Once::new();

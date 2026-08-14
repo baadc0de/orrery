@@ -25,15 +25,6 @@ pub struct BlockGrant {
     pub len: u64,
 }
 
-impl Default for BlockGrant {
-    fn default() -> Self {
-        Self {
-            start: PersistId::new(1),
-            len: DEFAULT_BLOCK_GRANT,
-        }
-    }
-}
-
 /// A cursor over a grant that hands out ids one by one.
 #[derive(Debug, Clone)]
 pub struct BlockGrantCursor {
@@ -106,6 +97,23 @@ pub fn seedprog_key(emit: &str, grid: GridId, cell: CellId) -> [u8; 21] {
 
 /// A seedmap index in memory, keyed by `ContentKey`.
 pub type SeedMap = BTreeMap<ContentKey, SeedMapRow>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cursor_yields_exactly_the_reserved_block() {
+        let mut cursor = BlockGrantCursor::new(BlockGrant {
+            start: PersistId::new(41),
+            len: 2,
+        });
+
+        assert_eq!(cursor.next_id(), Some(PersistId::new(41)));
+        assert_eq!(cursor.next_id(), Some(PersistId::new(42)));
+        assert_eq!(cursor.next_id(), None);
+    }
+}
 
 #[cfg(feature = "fdb")]
 mod fdb {

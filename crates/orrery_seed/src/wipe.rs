@@ -6,6 +6,7 @@ use futures::TryStreamExt;
 use orrery_persistd::keyspace;
 use orrery_protocol::{CellId, GridId};
 
+use crate::idmap;
 use crate::scenario::ResolvedScenario;
 
 /// Wipe options.
@@ -100,16 +101,56 @@ pub async fn run(
             let chunk_start = chunk_start.clone();
             let chunk_end = chunk_end.clone();
             async move {
+                // `seedmap/` and `seedprog/` are global families, but each
+                // row is grid-scoped. Clearing either whole family here would
+                // erase another grid's stable ids during a concurrent or
+                // multi-grid seed operation.
+                let seedmap_start = keyspace::seedmap_range_start();
+                let seedmap_end = keyspace::seedmap_range_end();
+                let seedmap_range = foundationdb::RangeOption {
+                    begin: foundationdb::KeySelector::first_greater_or_equal(
+                        seedmap_start.as_slice(),
+                    ),
+                    end: foundationdb::KeySelector::first_greater_or_equal(seedmap_end.as_slice()),
+                    ..foundationdb::RangeOption::default()
+                };
+                let mut seedmap_rows = trx.get_ranges_keyvalues(seedmap_range, false);
+                while let Some(row) = seedmap_rows
+                    .try_next()
+                    .await
+                    .map_err(|e| foundationdb::FdbBindingError::new_custom_error(Box::new(e)))?
+                {
+                    let Ok(seed_row) = idmap::decode_seedmap_value(row.value()) else {
+                        continue;
+                    };
+                    if seed_row.grid == *grid {
+                        trx.clear(row.key());
+                    }
+                }
+
+                let seedprog_start = keyspace::seedprog_range_start();
+                let seedprog_end = keyspace::seedprog_range_end();
+                let seedprog_range = foundationdb::RangeOption {
+                    begin: foundationdb::KeySelector::first_greater_or_equal(
+                        seedprog_start.as_slice(),
+                    ),
+                    end: foundationdb::KeySelector::first_greater_or_equal(seedprog_end.as_slice()),
+                    ..foundationdb::RangeOption::default()
+                };
+                let mut seedprog_rows = trx.get_ranges_keyvalues(seedprog_range, false);
+                while let Some(row) = seedprog_rows
+                    .try_next()
+                    .await
+                    .map_err(|e| foundationdb::FdbBindingError::new_custom_error(Box::new(e)))?
+                {
+                    if keyspace::decode_seedprog_key(row.key())
+                        .is_some_and(|(_, row_grid, _)| row_grid == *grid)
+                    {
+                        trx.clear(row.key());
+                    }
+                }
                 trx.clear_range(&world_start, &world_end);
                 trx.clear_range(&chunk_start, &chunk_end);
-                trx.clear_range(
-                    &keyspace::seedmap_range_start(),
-                    &keyspace::seedmap_range_end(),
-                );
-                trx.clear_range(
-                    &keyspace::seedprog_range_start(),
-                    &keyspace::seedprog_range_end(),
-                );
                 trx.clear(&keyspace::content_version_key());
                 Ok::<_, foundationdb::FdbBindingError>(())
             }

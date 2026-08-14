@@ -24,7 +24,7 @@ use orrery_persistd::cluster::{ColdFallbackRouter, Router};
 #[cfg(feature = "fdb")]
 use orrery_persistd::keyspace;
 #[cfg(feature = "fdb")]
-use orrery_persistd::{payload_crc, CellRuntime, JournalConfig, MemFenceStore, RuntimeConfig};
+use orrery_persistd::{CellRuntime, JournalConfig, MemFenceStore, RuntimeConfig, payload_crc};
 #[cfg(feature = "fdb")]
 use orrery_protocol::{CellId, Epoch, GridId, JournalRecord, Lsn, PersistId, RecordKind, Tick};
 
@@ -249,6 +249,87 @@ async fn fdb_reseed_preserves_persist_ids() {
 
 #[cfg(feature = "fdb")]
 #[tokio::test]
+async fn wipe_in_another_grid_preserves_seedmap_ids() {
+    let Some(cluster) = skip_if_no_fdb() else {
+        return;
+    };
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("scenarios")
+        .join("p2demo.toml");
+    let source = std::fs::read_to_string(&root).expect("read scenario");
+    let retained_grid = GridId::new(9410);
+    let wiped_grid = GridId::new(9411);
+    let retained = write_temp_scenario(
+        "retained scenario",
+        &with_grid(&source, retained_grid, false),
+    );
+    let wiped = write_temp_scenario("wiped scenario", &with_grid(&source, wiped_grid, false));
+    wipe_scenario(retained.path(), "demo-2026-08-13").await;
+    wipe_scenario(wiped.path(), "demo-2026-08-13").await;
+
+    let first = run_seed(
+        &["apply", "--profile", "demo", "--allow-opaque"],
+        retained.path(),
+    )
+    .await;
+    maybe_assert_success(&first, "retained apply");
+
+    orrery_seed::fdb_network();
+    let db = Database::from_path(&cluster).expect("db");
+    let before: Vec<_> = scan_world_rows(&db, retained_grid)
+        .await
+        .expect("scan retained before wipe")
+        .iter()
+        .filter_map(|(key, _)| keyspace::decode_world_key(key).map(|(_, _, pid)| pid))
+        .collect();
+
+    wipe_scenario(wiped.path(), "demo-2026-08-13").await;
+    let second = run_seed(
+        &["apply", "--profile", "demo", "--allow-opaque"],
+        retained.path(),
+    )
+    .await;
+    maybe_assert_success(&second, "retained reseed");
+    let after: Vec<_> = scan_world_rows(&db, retained_grid)
+        .await
+        .expect("scan retained after wipe")
+        .iter()
+        .filter_map(|(key, _)| keyspace::decode_world_key(key).map(|(_, _, pid)| pid))
+        .collect();
+
+    assert_eq!(before, after, "a different grid's wipe keeps stable ids");
+}
+
+#[cfg(feature = "fdb")]
+#[tokio::test]
+async fn block_grants_begin_after_the_fdb_allocator() {
+    let Some(cluster) = skip_if_no_fdb() else {
+        return;
+    };
+    let grid = GridId::new(9412);
+    orrery_seed::fdb_network();
+    let db = Database::from_path(&cluster).expect("db");
+    db.run(|trx, _| async move {
+        let key = keyspace::pid_next_key(grid);
+        trx.set(&key, &10_000u64.to_le_bytes());
+        Ok::<_, foundationdb::FdbBindingError>(())
+    })
+    .await
+    .expect("seed allocator counter");
+
+    let first = orrery_seed::idmap::reserve_block(&db, grid, 2)
+        .await
+        .expect("first block");
+    let second = orrery_seed::idmap::reserve_block(&db, grid, 2)
+        .await
+        .expect("second block");
+
+    assert_eq!(first.start, PersistId::new(10_001));
+    assert_eq!(second.start, PersistId::new(10_003));
+}
+
+#[cfg(feature = "fdb")]
+#[tokio::test]
 async fn every_written_value_carries_the_live_tag() {
     let Some(cluster) = skip_if_no_fdb() else {
         return;
@@ -270,9 +351,10 @@ async fn every_written_value_carries_the_live_tag() {
         .await
         .expect("scan world");
     assert_eq!(rows.len(), 1_000, "smoke writes exactly 1000 world rows");
-    assert!(rows
-        .iter()
-        .all(|(_, value)| value.first() == Some(&keyspace::LIVE_TAG)));
+    assert!(
+        rows.iter()
+            .all(|(_, value)| value.first() == Some(&keyspace::LIVE_TAG))
+    );
 }
 
 #[cfg(feature = "fdb")]
