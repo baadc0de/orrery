@@ -63,13 +63,20 @@ pub const GATEWAY_ALPN: &[u8] = b"orrery/gateway/0";
 /// The admission response byte, mirroring `aeronet_iroh`'s `ACCEPTED`.
 const ACCEPTED: u8 = 0;
 
-/// How many client messages one connection routes concurrently.
+/// How many bulk updates one connection routes concurrently.
 ///
-/// Per-message routing is spawned (`tokio::spawn`) with this semaphore bounding
-/// the in-flight routes per connection, so a slow 27-cell subscribe (FDB cold
-/// scans) does not head-of-line block diffs — and their acks — on the same
-/// connection (D16: the ack *is* the client-observed durability contract).
-const MAX_INFLIGHT_ROUTES_PER_CONN: usize = 8;
+/// The P2 load client spreads 10k entities over 125 sessions.  A session emits
+/// roughly 80 diffs on each 2 Hz scheduler tick.  Keeping the old eight-route
+/// cap made the receive loop wait for seven durability waves before it could
+/// even read the later datagrams, turning an otherwise sub-2 ms journal commit
+/// into a 20+ ms client acknowledgement.  This cap admits one complete P2
+/// tick per session while still bounding a misbehaving peer's task count.
+const MAX_INFLIGHT_DIFF_ROUTES_PER_CONN: usize = 128;
+
+/// Slow control reads are separately bounded so they cannot consume the bulk
+/// acknowledgement budget.  In particular, an FDB cold area-load must not
+/// head-of-line block a durability acknowledgement on the same connection.
+const MAX_INFLIGHT_CONTROL_ROUTES_PER_CONN: usize = 8;
 
 /// Decides whether a successful bulk route can make the normal durable-ack
 /// claim.
@@ -307,7 +314,7 @@ async fn accept_loop(
 /// uni-stream, then read tagged datagrams and route each [`GatewayMsg`].
 ///
 /// Each decoded message is routed on its own spawned task (bounded by
-/// [`MAX_INFLIGHT_ROUTES_PER_CONN`] per connection) so a slow 27-cell
+/// separate bulk and control limits per connection) so a slow 27-cell
 /// subscribe — FDB cold scans — never head-of-line blocks diffs on the same
 /// connection: the bulk ack is the client-observed durability contract
 /// (docs/08-persistence.md §2.1, D16 p99 < 5 ms) and must not queue behind an
@@ -358,7 +365,8 @@ async fn handle_connection(
             }
         })
     };
-    let inflight = Arc::new(Semaphore::new(MAX_INFLIGHT_ROUTES_PER_CONN));
+    let inflight_diffs = Arc::new(Semaphore::new(MAX_INFLIGHT_DIFF_ROUTES_PER_CONN));
+    let inflight_control = Arc::new(Semaphore::new(MAX_INFLIGHT_CONTROL_ROUTES_PER_CONN));
 
     loop {
         let pkt = match conn.read_datagram().await {
@@ -388,7 +396,7 @@ async fn handle_connection(
                 let send = Arc::clone(&send);
                 let router = Arc::clone(&router);
                 let bulk_ack_admission = Arc::clone(&bulk_ack_admission);
-                let permit = Arc::clone(&inflight).acquire_owned().await;
+                let permit = Arc::clone(&inflight_diffs).acquire_owned().await;
                 match permit {
                     Ok(permit) => {
                         tokio::spawn(async move {
@@ -405,7 +413,7 @@ async fn handle_connection(
             GatewayMsg::Subscribe { grid, cells } => {
                 let send = Arc::clone(&send);
                 let router = Arc::clone(&router);
-                let permit = Arc::clone(&inflight).acquire_owned().await;
+                let permit = Arc::clone(&inflight_control).acquire_owned().await;
                 match permit {
                     Ok(permit) => {
                         tokio::spawn(async move {
