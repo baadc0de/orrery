@@ -2,7 +2,7 @@
 
 Orrery replicates entity state peer-to-peer over a consolidated ecosystem stack — aeronet IO, bevy_replicon diffing, lightyear prediction and bandwidth management — and adds the pieces none of those crates have: cell-based interest management, bounded per-peer interest sets with low-rate extrapolated proxies, and the uplink that feeds the persistence tier. This document specifies what each layer of the stack contributes, how games classify components for replication, how the 27-cell AOI maps onto replicon visibility and lightyear rooms, the interest-set selection algorithm, delta compression and priority scheduling, the late-join snapshot flow, baseline handling across authority transfers, terrain delta replication, and the bandwidth arithmetic for all three topology regimes.
 
-Normative source: [DECISIONS.md](DECISIONS.md) D4, D8 (bandwidth aspects); touches D5, D6, D9, D11.
+Normative source: [ADR-0004](adr/0004-bevy-netcode-stack.md) and [ADR-0008](adr/0008-prediction-rollback-interpolation.md) (bandwidth aspects); touches [D5](adr/0005-spatial-model.md), [D6](adr/0006-population-adaptive-topology.md), [D9](adr/0009-verifiable-core.md), and [D11](adr/0011-persistence.md).
 
 ## 1. Stack layering
 

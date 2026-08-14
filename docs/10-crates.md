@@ -1,8 +1,8 @@
 # Crate architecture
 
-This document expands the ADR's crate set into a concrete Cargo workspace: the layout tree, the dependency spine and its layering rules, a per-crate reference (purpose, public API sketch, dependencies, feature flags, Bevy status) for all thirteen `orrery_*` crates, the games-bring-rules linking pattern, client app composition, the lockstep versioning/release policy, and the upstreaming plan plus the replicon-direct plan B. All code below is **sketch-grade**: signatures are indicative of shape and naming, not guaranteed to compile.
+This document expands [ADR-0015](adr/0015-crate-set.md) into a concrete Cargo workspace: the layout tree, the dependency spine and its layering rules, a per-crate reference (purpose, public API sketch, dependencies, feature flags, Bevy status) for all thirteen `orrery_*` crates, the games-bring-rules linking pattern, client app composition, the lockstep versioning/release policy, and the upstreaming plan plus the replicon-direct plan B. All code below is **sketch-grade**: signatures are indicative of shape and naming, not guaranteed to compile.
 
-Normative source: [DECISIONS.md](DECISIONS.md) D15, drawing on D4 (netcode stack), D12 (service inventory), D14 (pinned versions), and D17 (risks).
+Normative source: [ADR-0015](adr/0015-crate-set.md), drawing on [D4](adr/0004-bevy-netcode-stack.md), [D12](adr/0012-backend-services.md), [D14](adr/0014-pinned-versions.md), and [D17](adr/0017-risks-and-open-questions.md).
 
 ## Workspace layout
 

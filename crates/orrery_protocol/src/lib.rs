@@ -6,7 +6,7 @@
 //! ed25519 identity/signature types — no Bevy, no tokio) so servers, tools, and
 //! tests link it without an engine (D15, docs/10-crates.md §1).
 //!
-//! Normative source: [DECISIONS.md](https://github.com/baadc0de/orrery/blob/main/docs/DECISIONS.md)
+//! Normative source: [ADR index](https://github.com/baadc0de/orrery/blob/main/docs/DECISIONS.md)
 //! D5 (CellId encoding), D7 (leases), D9 (input logs), D10 (evidence), D11
 //! (intents), D15 (canonical scalars).
 

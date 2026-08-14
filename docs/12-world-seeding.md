@@ -4,7 +4,7 @@
 
 It exists to answer one question a demo operator actually asks: *"give me a world of size X with density pattern Y, and tell me what it will cost before you write it."* Everything in this document follows from taking that question literally.
 
-Normative source: [DECISIONS.md](DECISIONS.md) §D11 (keyspace, seeding, id minting), with D5 (`CellId`), D9 (`Ruleset`, `universe_seed`), D12 (library-harness posture), D13 (float determinism), D15 (canonical scalars) and D16 (parameters). This document expands [08-persistence.md](08-persistence.md) §17 and is normative for the tool; where it and §17 differ, §17 wins and this document is wrong.
+Normative source: [ADR-0011](adr/0011-persistence.md) (keyspace, seeding, id minting), with [D5](adr/0005-spatial-model.md), [D9](adr/0009-verifiable-core.md), [D12](adr/0012-backend-services.md), [D13](adr/0013-physics-and-determinism.md), [D15](adr/0015-crate-set.md), and [D16](adr/0016-parameter-reference.md). This document expands [08-persistence.md](08-persistence.md) §17 and is normative for the tool; where it and §17 differ, §17 wins and this document is wrong.
 
 ---
 
@@ -891,7 +891,7 @@ Golden-manifest tests are valid within a pinned toolchain (§8) and the manifest
 | S1 | `INTEREST_LEVEL`, `SHARD_LEVEL` and the metres↔cells conversion move from `orrery_spatial` (Bevy) to `orrery_protocol` (engine-free) | [10-crates.md](10-crates.md) §1 |
 | S2 | `orrery_persistd::keyspace` becomes public: one definition of `world_key`, `ckpt_key` and the subtree spans | [10-crates.md](10-crates.md) §11 |
 | S3 | New crate `orrery_seed` in the workspace and the crate table | [10-crates.md](10-crates.md) |
-| S4 | `toml` + `blake3` added to the D14 pinned-dependency list (neither is currently a workspace dependency) | [DECISIONS.md](DECISIONS.md) D14 |
+| S4 | `toml` + `blake3` added to the D14 pinned-dependency list (neither is currently a workspace dependency) | [ADR-0014](adr/0014-pinned-versions.md) |
 | S5 | `seedmap/{content_key}` and `seedprog/{emit}/{cell}` added to the keyspace table; `content/version` value extended to `(build, manifest digest, scenario seed, config digest, toolchain, seeded_at)` | [08-persistence.md](08-persistence.md) §6 |
 | S6 | The `world/` key gains a `GridId` discriminator, or per-grid Directory subspaces are specified (P-7) | [08-persistence.md](08-persistence.md) §6 |
 | S7 | §17 gains a pointer to this document as its expansion | [08-persistence.md](08-persistence.md) §17 |
@@ -2049,4 +2049,4 @@ So the failure is not a tuning problem and cannot be configured away. D11 §6 al
 
 ## Cross-references
 
-[08-persistence.md](08-persistence.md) §6 (keyspace), §9 (area load), §17 (world seeding — this document's normative parent) · [01-spatial-model.md](01-spatial-model.md) §3 (`CellId`), §13 (nested grids) · [06-verifiable-core.md](06-verifiable-core.md) (VC-3 RNG derivation, `universe_seed`) · [10-crates.md](10-crates.md) §11 (persistd harness) · [11-roadmap.md](11-roadmap.md) §P2 (the demo criterion), R-7 (FDB hotspots) · [DECISIONS.md](DECISIONS.md) D5, D9, D11, D12, D13, D15, D16.
+[08-persistence.md](08-persistence.md) §6 (keyspace), §9 (area load), §17 (world seeding — this document's normative parent) · [01-spatial-model.md](01-spatial-model.md) §3 (`CellId`), §13 (nested grids) · [06-verifiable-core.md](06-verifiable-core.md) (VC-3 RNG derivation, `universe_seed`) · [10-crates.md](10-crates.md) §11 (persistd harness) · [11-roadmap.md](11-roadmap.md) §P2 (the demo criterion), R-7 (FDB hotspots) · [ADR index](DECISIONS.md): D5, D9, D11, D12, D13, D15, D16.

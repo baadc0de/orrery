@@ -6,7 +6,8 @@ use bevy_ecs::prelude::*;
 
 /// Configuration for the [`OrreryPersistClientPlugin`](crate::OrreryPersistClientPlugin).
 ///
-/// Defaults are the D16 parameter-table values (docs/DECISIONS.md D16).
+/// Defaults are the D16 parameter-table values
+/// (docs/adr/0016-parameter-reference.md).
 #[derive(Debug, Clone, Resource)]
 pub struct PersistClientConfig {
     /// The per-entity diff uplink rate range in Hz. Default `1.0..=4.0` (D16).

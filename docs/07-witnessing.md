@@ -2,7 +2,7 @@
 
 In a per-entity-authority P2P world every peer is a tiny server, and a tiny server can lie. Orrery does not pretend to solve cheating in general; it partitions the threat space into what is *prevented by construction* (durable-state forgery), what is *detected and punished* (rule violations in authoritative state), and what is *explicitly out of scope for witnessing* (legal-input cheats, information leaks) and delegated to statistical telemetry. The detection half is "amended witnessing": machinery peers are already running does the witnessing. For entities an observer predicts and reconciles against, a cheat surfaces as a prediction error that refuses to go away; for authoritative core entities outside anyone's predicted set, the **cell-epoch witness set continuously re-executes the streamed signed input logs** (a ~µs/tick kinematic replay) against the authority's own state claims; and stateless invariant validators screen everything every peer receives. This document specifies the threat model, the passive detection pipeline, replay adjudication, witness-attested persistence writes, the strike system, and the residual limits we accept.
 
-Normative source: [DECISIONS.md](DECISIONS.md) §D10, elaborating details from §D8, §D9, §D11 and §D12.
+Normative source: [ADR-0010](adr/0010-witnessing.md), elaborating details from [D8](adr/0008-prediction-rollback-interpolation.md), [D9](adr/0009-verifiable-core.md), [D11](adr/0011-persistence.md), and [D12](adr/0012-backend-services.md).
 
 ## 1. Threat model
 

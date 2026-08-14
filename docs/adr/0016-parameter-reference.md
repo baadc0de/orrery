@@ -1,0 +1,22 @@
+# ADR-0016: Parameter reference (defaults)
+
+**Status:** Accepted · **Date:** 2026-08-11 · **Decision:** D16
+
+This decision is normative. See the [ADR index](../DECISIONS.md) for precedence, scope, and the complete decision set.
+
+| Parameter | Default | Parameter | Default |
+|---|---|---|---|
+| Sim tick | 60 Hz | Lease TTL / heartbeat | 10 s / 2.5 s |
+| Send rate | 20 Hz (≤30) | Journal fsync group | ~2 ms |
+| Rollback window | 9 ticks (150 ms) | Checkpoint cadence | 20 s jittered |
+| Interp buffer | 100 ms | Bulk ack p99 (client / journal) | < 5 ms / < 2 ms |
+| High-rate interest set | 24 entities | Intent commit p99 | < 10 ms |
+| Proxy rate | 1–4 Hz | Area first-page-in | < 50 ms |
+| Hit rewind cap | 200 ms | Witness quorum | K=3 of N≥5 |
+| Cell edge (interest) | 128 m | Strike half-life | 14 days |
+| Shard cell | 8×8×8 interest cells | Peer upload budget | ≤1 Mbps |
+| Hysteresis margin | 10% cell edge | Mesh→promotion threshold | >32 sustained |
+| ε_pos / ε_vel / window | 1 cm / 1 cm·s⁻¹ / 250 ms | Adjudication window max | 3 s (180 ticks) |
+| Epoch reseed min interval | 10 s | Ruleset builds retained (adjudication) | 3 |
+| Hot-cell egress (promoted) | ≤ 35 Mbps | Witness-log fan-out | witness set only (≤ 7 links) |
+

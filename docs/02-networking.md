@@ -2,7 +2,7 @@
 
 Orrery's transport layer is iroh 1.x QUIC: peers dial each other by public key, connect instantly through self-hosted relays, and migrate to punched direct paths via QUIC multipath. On top of that transport, the coordinator organizes peers into **islands** — per-region replication sessions whose internal topology adapts to population: full mesh up to 8 players, interest-managed mesh to 32, and coordinator-spawned field hosts beyond that. This document explains the transport mechanics, the topology regimes and their bandwidth math, the connection and island lifecycles, the channel policy, and the failure modes. It expands the transport and topology decisions; the persistence uplink that rides this transport is specified in [08-persistence.md](08-persistence.md), and the replication payloads in [03-replication.md](03-replication.md).
 
-Normative source: [DECISIONS.md](DECISIONS.md) D3, D6 (touchpoints: D4, D12, D15, D16).
+Normative source: [ADR-0003](adr/0003-transport.md) and [ADR-0006](adr/0006-population-adaptive-topology.md) (touchpoints: [D4](adr/0004-bevy-netcode-stack.md), [D12](adr/0012-backend-services.md), [D15](adr/0015-crate-set.md), [D16](adr/0016-parameter-reference.md)).
 
 ---
 

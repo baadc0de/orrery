@@ -8,7 +8,8 @@ use orrery_protocol::DEFAULT_CELL_EDGE_M;
 
 /// Spatial configuration for the [`OrrerySpatialPlugin`](crate::OrrerySpatialPlugin).
 ///
-/// Defaults are the D16 parameter-table values (docs/DECISIONS.md D16).
+/// Defaults are the D16 parameter-table values
+/// (docs/adr/0016-parameter-reference.md).
 #[derive(Debug, Clone, Resource)]
 pub struct SpatialConfig {
     /// Interest-cell edge in metres. Default 128.0 (D16).

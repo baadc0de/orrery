@@ -2,7 +2,7 @@
 //!
 //! Consumes the JSONL telemetry emitted by `p2-load --json`
 //! (docs/11-roadmap.md §P2) and reports the four D16 latency series against
-//! the demo-criterion targets verbatim (docs/DECISIONS.md D16):
+//! the demo-criterion targets verbatim (docs/adr/0016-parameter-reference.md):
 //!
 //! | series               | D16 target (p99, in-region) |
 //! |----------------------|-----------------------------|
@@ -43,7 +43,8 @@ const SERIES_KEYS: [&str; 4] = [
     "area_first_page_ms",
 ];
 
-/// D16 defaults (docs/DECISIONS.md D16) as **µs ceilings** on the p99. These
+/// D16 defaults (docs/adr/0016-parameter-reference.md) as **µs ceilings** on
+/// the p99. These
 /// are the demo-criterion numbers; `--<series>-us` flags override them
 /// individually for a sample-size- or posture-specific gate.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]

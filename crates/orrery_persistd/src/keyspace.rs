@@ -7,7 +7,7 @@
 //! the `fdb` feature — it is pure byte layout.
 //!
 //! Normative source: docs/08-persistence.md §6, docs/12-world-seeding.md §9.2,
-//! §9.3, §11.1, and docs/DECISIONS.md D11.
+//! §9.3, §11.1, and docs/adr/0011-persistence.md.
 
 use orrery_protocol::{AccountId, AssetId, CellId, GridId, ItemUid, PersistId};
 

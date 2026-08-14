@@ -2,7 +2,7 @@
 
 Every replicated entity in Orrery has exactly one writer at any instant. This document specifies how that writer is chosen, proven, transferred, and recovered: the two-tier claim model (weak authority by interaction, strong ownership by explicit act) with its sequence-number invariants; the lease registrar inside the persistence cluster that arbitrates claims for persistent entities via compare-and-swap; the full message-level lease protocol (`Claim`, `Grant`, `Deny`, `Divest`, `Heartbeat`, `Expire`) with flows for cooperative handoff, contested claims, crash orphaning, and cluster-unreachable degraded operation; contact-island propagation for physics; ephemeral, parked, and active (NPC-hosted) entities; and the interactions with field-host promotion and cross-cell movement. The protocol lives in `orrery_protocol`, the client logic in `orrery_authority`, and the registrar in `orrery_persistd`.
 
-Normative source: [DECISIONS.md](DECISIONS.md) §D7 (boundaries with §D5, §D6, §D8, §D11, §D12).
+Normative source: [ADR-0007](adr/0007-authority-and-leases.md) (boundaries with [D5](adr/0005-spatial-model.md), [D6](adr/0006-population-adaptive-topology.md), [D8](adr/0008-prediction-rollback-interpolation.md), [D11](adr/0011-persistence.md), and [D12](adr/0012-backend-services.md)).
 
 ## 1. The two-tier model
 

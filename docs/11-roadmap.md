@@ -1,8 +1,8 @@
 # Roadmap & Risk Register
 
-This document turns the Orrery architecture into a phased build plan: seven phases (P0–P6), each with explicit goals, the crates it touches, deliverables, an upstream-contribution milestone, and — non-negotiably — a **demo criterion**: something runnable and observable that proves the phase, becomes a permanent regression harness, and gates entry to the next phase. It then expands the ADR's known risks into a full register (likelihood, impact, early-warning triggers, mitigations, plan B) and restates the open questions with proposed resolution paths and decision deadlines.
+This document turns the Orrery architecture into a phased build plan: seven phases (P0–P6), each with explicit goals, the crates it touches, deliverables, an upstream-contribution milestone, and — non-negotiably — a **demo criterion**: something runnable and observable that proves the phase, becomes a permanent regression harness, and gates entry to the next phase. It then expands [ADR-0017](adr/0017-risks-and-open-questions.md) into a full register (likelihood, impact, early-warning triggers, mitigations, plan B) and restates the open questions with proposed resolution paths and decision deadlines.
 
-Normative source: [DECISIONS.md](DECISIONS.md) D17 (risks and open questions), with D14–D16 governing every version, crate name, and numeric parameter cited here, and D3–D13 governing phase content.
+Normative source: [ADR-0017](adr/0017-risks-and-open-questions.md), with [D14](adr/0014-pinned-versions.md)–[D16](adr/0016-parameter-reference.md) governing versions, crate names, and parameters, and the applicable D3–D13 records in the [ADR index](DECISIONS.md) governing phase content.
 
 ## Sequencing principles
 

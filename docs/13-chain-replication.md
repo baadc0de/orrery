@@ -1,6 +1,6 @@
 # 13 - Chain Replication: Cross-Process Journal Mirroring
 
-This document describes the P2 exit design for journal-chain replication in `orrery_persistd`: one primary process appends and a single follower process mirrors the journal so the bulk write path keeps its low-latency ack contract while improving node-loss recovery. It is an implementation-facing design note, not a normative source. If it conflicts with [docs/DECISIONS.md](DECISIONS.md), the ADR wins.
+This document describes the P2 exit design for journal-chain replication in `orrery_persistd`: one primary process appends and a single follower process mirrors the journal so the bulk write path keeps its low-latency ack contract while improving node-loss recovery. It is an implementation-facing design note, not a normative source. If it conflicts with [ADR-0011](adr/0011-persistence.md) or [ADR-0012](adr/0012-backend-services.md), the applicable ADR wins.
 
 Normative context:
 

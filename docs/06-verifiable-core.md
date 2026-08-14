@@ -2,7 +2,7 @@
 
 Orrery does not require determinism to keep peers in sync — it requires determinism to prove, after the fact, that an authority executed the rules it claimed to execute. This document specifies the **verifiable core**: the game-supplied `Ruleset` that isolates every rule touching persistent value into a pure, fixed-tick, deterministically replayable step function; the hard determinism rules that step function must obey; the tolerance-band comparator that separates platform drift from cheating; the PeerReview-style tamper-evident input log each authority maintains; and the headless replay harness that turns a disputed 3-second window into self-verifying evidence. It is implemented in `orrery_core` (engine-agnostic, no Bevy dependency) with wire types in `orrery_protocol`.
 
-Normative source: [DECISIONS.md](DECISIONS.md) §D9 (context: §D10 witnessing, §D13 physics posture, §D16 parameters).
+Normative source: [ADR-0009](adr/0009-verifiable-core.md) (context: [D10](adr/0010-witnessing.md), [D13](adr/0013-physics-and-determinism.md), and [D16](adr/0016-parameter-reference.md)).
 
 ## 1. Why scoped determinism
 

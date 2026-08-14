@@ -4,7 +4,7 @@ The **latency gate** for the P2 persistence MVP
 ([docs/11-roadmap.md](../docs/11-roadmap.md) §P2). It consumes the JSONL
 telemetry emitted by `p2-load --json` and reports the four D16 latency series
 against the demo-criterion targets verbatim
-([docs/DECISIONS.md](../docs/DECISIONS.md) D16):
+([ADR-0016](../docs/adr/0016-parameter-reference.md)):
 
 | series               | D16 target (p99, in-region) |
 |----------------------|-----------------------------|

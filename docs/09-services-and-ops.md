@@ -2,11 +2,11 @@
 
 Orrery's backend is deliberately small: five services, all Rust, all speaking iroh QUIC externally. None of them simulate the game — simulation lives on players' machines until a cell's population exceeds the mesh ceiling, at which point (and only at which point) the coordinator spins up a field host. This document specifies each service's operational contract: the state it holds, its scaling axis, its failure blast radius, and its HA strategy; the three reference deployment topologies; per-service ops procedures (relay fleet, FoundationDB, coordinator failover, field-host autoscaling, identity/key management); the observability and audit pipeline; runbook summaries for the major failure modes; and a worked capacity plan at 10k CCU.
 
-Normative source: [DECISIONS.md](DECISIONS.md) D12 (expanding on D3, D6, D7, D10, D11, D16, D17).
+Normative source: [ADR-0012](adr/0012-backend-services.md) (expanding on [D3](adr/0003-transport.md), [D6](adr/0006-population-adaptive-topology.md), [D7](adr/0007-authority-and-leases.md), [D10](adr/0010-witnessing.md), [D11](adr/0011-persistence.md), [D16](adr/0016-parameter-reference.md), and [D17](adr/0017-risks-and-open-questions.md)).
 
 ## 1. Service inventory
 
-Crate names per [DECISIONS.md](DECISIONS.md) D15. `orrery_persistd` ships as a library harness — the game team links its `Ruleset` and builds the deployed binary, so *the game repo owns the persistd artifact* and every `Ruleset` change is a persistd redeploy (D11, D17.6). Rolling deploys keep old builds alive for the adjudication retention horizon: persistd retains the last **3** ruleset builds as version-keyed sidecar adjudication workers (D12); the adjudication executor routes evidence bundles by `RulesetId`, and bundles older than retention are ruled `Unadjudicable` — no strike, rate-limited per account (D10).
+Crate names come from [D15](adr/0015-crate-set.md). `orrery_persistd` ships as a library harness — the game team links its `Ruleset` and builds the deployed binary, so *the game repo owns the persistd artifact* and every `Ruleset` change is a persistd redeploy (D11, D17.6). Rolling deploys keep old builds alive for the adjudication retention horizon: persistd retains the last **3** ruleset builds as version-keyed sidecar adjudication workers (D12); the adjudication executor routes evidence bundles by `RulesetId`, and bundles older than retention are ruled `Unadjudicable` — no strike, rate-limited per account (D10).
 
 | Service | Crate | Role | State held | Scaling axis | Failure blast radius | HA strategy |
 |---|---|---|---|---|---|---|

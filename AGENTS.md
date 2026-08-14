@@ -4,33 +4,64 @@ Guidance for AI coding agents working in this repository.
 
 ## What this is
 
-**Orrery** is a planned set of Rust crates for the Bevy game engine (0.19):
+**Orrery** is an in-development set of Rust crates for the Bevy game engine (0.19):
 peer-to-peer multiplayer (QUIC transport with NAT hole punching via iroh) and a
-persistent-universe backend. **Architecture and design phase — no code exists
-yet.** This repository currently contains only the architecture decision record
-and its expansion documents.
+persistent-universe backend. The repository contains the accepted architecture,
+active P0–P2 implementation, test tools, and incomplete milestone harnesses.
 
 ## Reading path (normative order)
 
-The design is documented in `docs/`. The ADR is normative over the README and
-every numbered doc:
+The design is documented in `docs/`. Accepted ADRs are normative over the
+README and every numbered expansion document.
+
+Start with [docs/DECISIONS.md](docs/DECISIONS.md), the ADR index and governance
+entry point. Decisions live independently under [docs/adr/](docs/adr/):
+
+- For architecture-wide work, read all accepted ADRs in numeric order.
+- For scoped work, read the index, the ADRs named by the relevant expansion
+  document, and any ADR dependencies those records link.
+- Never treat the index summary as a substitute for the applicable ADR text.
+- A future change to an accepted decision is a new ADR that explicitly
+  supersedes the old one; do not silently rewrite architectural history.
+
+| Decision | ADR | Covers |
+|---|---|---|
+| D1 | [ADR-0001](docs/adr/0001-requirements.md) | Requirements |
+| D2 | [ADR-0002](docs/adr/0002-simulation-model.md) | Simulation model |
+| D3 | [ADR-0003](docs/adr/0003-transport.md) | iroh transport |
+| D4 | [ADR-0004](docs/adr/0004-bevy-netcode-stack.md) | Bevy netcode stack |
+| D5 | [ADR-0005](docs/adr/0005-spatial-model.md) | Spatial model and CellId |
+| D6 | [ADR-0006](docs/adr/0006-population-adaptive-topology.md) | Island topology |
+| D7 | [ADR-0007](docs/adr/0007-authority-and-leases.md) | Authority and leases |
+| D8 | [ADR-0008](docs/adr/0008-prediction-rollback-interpolation.md) | Prediction and rollback |
+| D9 | [ADR-0009](docs/adr/0009-verifiable-core.md) | Verifiable core |
+| D10 | [ADR-0010](docs/adr/0010-witnessing.md) | Witnessing |
+| D11 | [ADR-0011](docs/adr/0011-persistence.md) | Persistence |
+| D12 | [ADR-0012](docs/adr/0012-backend-services.md) | Backend services |
+| D13 | [ADR-0013](docs/adr/0013-physics-and-determinism.md) | Physics posture |
+| D14 | [ADR-0014](docs/adr/0014-pinned-versions.md) | Pinned versions |
+| D15 | [ADR-0015](docs/adr/0015-crate-set.md) | Crate set |
+| D16 | [ADR-0016](docs/adr/0016-parameter-reference.md) | Parameter defaults |
+| D17 | [ADR-0017](docs/adr/0017-risks-and-open-questions.md) | Risks and open questions |
+
+After the applicable ADRs, use this expansion reading path:
 
 | Order | Document | Covers |
 |---|---|---|
-| 1 | [docs/DECISIONS.md](docs/DECISIONS.md) | The ADR: every decision, alternatives, D16 parameter table. **Normative.** |
-| 2 | [docs/00-overview.md](docs/00-overview.md) | Goals, constraints, system diagram, subsystem tour, glossary |
-| 3 | [docs/01-spatial-model.md](docs/01-spatial-model.md) | Grid, `CellId` encoding, `big_space`, AOI, hysteresis, hotspots |
-| 4 | [docs/02-networking.md](docs/02-networking.md) | iroh, relays, islands, topology regimes, channels, bandwidth |
-| 5 | [docs/03-replication.md](docs/03-replication.md) | replicon/lightyear stack, interest sets, delta compression, priority |
-| 6 | [docs/04-authority.md](docs/04-authority.md) | Weak/strong claims, leases, handoff, orphans, promotion |
-| 7 | [docs/05-prediction-rollback.md](docs/05-prediction-rollback.md) | Timelines, prediction sets, reconciliation, interpolation, hit validation |
-| 8 | [docs/06-verifiable-core.md](docs/06-verifiable-core.md) | `Ruleset`, determinism scoping, signed input logs, replay harness |
-| 9 | [docs/07-witnessing.md](docs/07-witnessing.md) | Threat model, discrepancy protocol, adjudication, strikes |
-| 10 | [docs/08-persistence.md](docs/08-persistence.md) | Cell actors, journal, FDB schema, intents, terrain, event archive |
-| 11 | [docs/09-services-and-ops.md](docs/09-services-and-ops.md) | Service inventory, deployment, scaling, failure modes, telemetry |
-| 12 | [docs/10-crates.md](docs/10-crates.md) | Workspace layout, per-crate API sketches, dependency graph |
-| 13 | [docs/11-roadmap.md](docs/11-roadmap.md) | Build phases (P0–P6), milestones, tracked risks |
-| 14 | [docs/12-world-seeding.md](docs/12-world-seeding.md) | World seeder: TOML scenario runner, generator bank, content diff/patch (expands 08 §17) |
+| 1 | [docs/00-overview.md](docs/00-overview.md) | Goals, constraints, system diagram, subsystem tour, glossary |
+| 2 | [docs/01-spatial-model.md](docs/01-spatial-model.md) | Grid, `CellId` encoding, `big_space`, AOI, hysteresis, hotspots |
+| 3 | [docs/02-networking.md](docs/02-networking.md) | iroh, relays, islands, topology regimes, channels, bandwidth |
+| 4 | [docs/03-replication.md](docs/03-replication.md) | replicon/lightyear stack, interest sets, delta compression, priority |
+| 5 | [docs/04-authority.md](docs/04-authority.md) | Weak/strong claims, leases, handoff, orphans, promotion |
+| 6 | [docs/05-prediction-rollback.md](docs/05-prediction-rollback.md) | Timelines, prediction sets, reconciliation, interpolation, hit validation |
+| 7 | [docs/06-verifiable-core.md](docs/06-verifiable-core.md) | `Ruleset`, determinism scoping, signed input logs, replay harness |
+| 8 | [docs/07-witnessing.md](docs/07-witnessing.md) | Threat model, discrepancy protocol, adjudication, strikes |
+| 9 | [docs/08-persistence.md](docs/08-persistence.md) | Cell actors, journal, FDB schema, intents, terrain, event archive |
+| 10 | [docs/09-services-and-ops.md](docs/09-services-and-ops.md) | Service inventory, deployment, scaling, failure modes, telemetry |
+| 11 | [docs/10-crates.md](docs/10-crates.md) | Workspace layout, per-crate API sketches, dependency graph |
+| 12 | [docs/11-roadmap.md](docs/11-roadmap.md) | Build phases (P0–P6), milestones, tracked risks |
+| 13 | [docs/12-world-seeding.md](docs/12-world-seeding.md) | World seeder: TOML scenario runner, generator bank, content diff/patch (expands 08 §17) |
+| 14 | [docs/13-chain-replication.md](docs/13-chain-replication.md) | Cross-process journal mirroring, reconnect, and recovery |
 | 15 | [docs/references.md](docs/references.md) | Annotated bibliography, organized by topic |
 
 Also read [README.md](README.md) — it summarizes the architecture, the status,
@@ -38,16 +69,18 @@ and the feature set.
 
 ## Ground rules
 
-- **The ADR is normative.** `docs/DECISIONS.md` (D1–D17) governs the README and
-  every numbered doc. If something conflicts, the ADR wins.
-- **Design phase, no code.** Don't assume implementation exists. Code sketches
-  in `docs/10-crates.md` are indicative of shape, not guaranteed to compile.
-- **Pinned versions (D14).** All dependency versions reflect the ecosystem as of
-  August 2026 and are re-validated when implementation starts. Don't bump them
-  casually.
-- **Roadmap gates (D17).** Each phase (P0–P6) has a demo criterion that is a
-  permanent regression harness and gates entry to the next phase. See
-  [docs/11-roadmap.md](docs/11-roadmap.md).
+- **Accepted ADRs are normative.** The records in `docs/adr/` govern the
+  README and numbered docs. If an expansion conflicts with an applicable ADR,
+  the ADR wins.
+- **Implementation is partial.** Inspect the current tree before assuming a
+  designed crate or service exists. Code sketches in `docs/10-crates.md` are
+  indicative of shape, not guaranteed to match landed APIs.
+- **Pinned versions ([D14](docs/adr/0014-pinned-versions.md)).** All dependency
+  versions reflect the ecosystem as of August 2026 and are re-validated when
+  implementation starts. Don't bump them casually.
+- **Roadmap gates ([D17](docs/adr/0017-risks-and-open-questions.md)).** Each
+  phase (P0–P6) has a demo criterion that is a permanent regression harness and
+  gates entry to the next phase. See [docs/11-roadmap.md](docs/11-roadmap.md).
 
 ## Device-local memory
 

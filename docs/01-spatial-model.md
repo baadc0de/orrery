@@ -2,7 +2,7 @@
 
 The universe is partitioned by a hierarchical uniform integer grid whose cells are canonically aligned with `big_space` `GridCell`s. A single sortable `CellId(u64)` — offset-binary coordinates, Morton-interleaved, S2-style sentinel level encoding — simultaneously names a replication interest group, a storage shard-key prefix, and an authority/handoff unit. This document specifies the encoding bit-for-bit, the level hierarchy, the 27-cell area-of-interest (AOI) subscription mechanics, the boundary hysteresis that prevents authority thrash, hotspot splitting, and the tuning space. It is implemented by `orrery_protocol` (the `CellId` type) and `orrery_spatial` (Bevy-side integration).
 
-Normative source: [DECISIONS.md](DECISIONS.md) D5 (parameters D16; interfaces to D6 topology, D7 authority, D11 persistence).
+Normative source: [ADR-0005](adr/0005-spatial-model.md) (parameters [D16](adr/0016-parameter-reference.md); interfaces to [D6](adr/0006-population-adaptive-topology.md), [D7](adr/0007-authority-and-leases.md), and [D11](adr/0011-persistence.md)).
 
 ## 1. Why a hierarchical uniform integer grid
 

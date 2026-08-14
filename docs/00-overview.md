@@ -1,14 +1,14 @@
 # Orrery — System Overview
 
-Orrery is a set of Rust crates for [Bevy](https://bevy.org) 0.19 that provides peer-to-peer multiplayer (QUIC with NAT hole punching via [iroh](https://github.com/n0-computer/iroh)), client-side prediction with rollback/reapply, witness-based trust, and a horizontally scalable, low-latency clustered persistence tier for very large persistent universes with strong spatial locality. This document is the entry point to the architecture doc set: what the system is, the five ideas that carry its weight, a full-system diagram, two end-to-end walkthroughs, and a glossary. Everything here is a summary; the numbered sibling docs carry the detail, and the ADR is the law.
+Orrery is a set of Rust crates for [Bevy](https://bevy.org) 0.19 that provides peer-to-peer multiplayer (QUIC with NAT hole punching via [iroh](https://github.com/n0-computer/iroh)), client-side prediction with rollback/reapply, witness-based trust, and a horizontally scalable, low-latency clustered persistence tier for very large persistent universes with strong spatial locality. This document is the entry point to the architecture doc set: what the system is, the five ideas that carry its weight, a full-system diagram, two end-to-end walkthroughs, and a glossary. Everything here is a summary; the numbered sibling docs carry the detail, and the accepted ADRs are the law.
 
-Normative source: [DECISIONS.md](DECISIONS.md) D1–D17 (this overview touches all sections; it expands none — where wording differs, DECISIONS.md wins).
+Normative source: the [ADR index](DECISIONS.md) and all [accepted ADRs](adr/) D1–D17 (this overview touches every decision; where wording differs, the applicable ADR wins).
 
 ## 1. What Orrery is — and is not
 
 Orrery **is a framework**, not a game. Games bring their own rules — movement limits, combat resolution, loot tables, economy — by implementing a `Ruleset` trait (D9) that both clients and the persistence cluster execute. Every numeric in this doc set is a configurable parameter with the stated default (D16).
 
-Orrery **is in the design phase**. The ADR is accepted; the crates in [10-crates.md](10-crates.md) do not exist yet. Version pins (D14) reflect the ecosystem as of August 2026.
+Orrery **is under active implementation**. P0–P2 code exists, but not every crate in [10-crates.md](10-crates.md) has landed; inspect the workspace and [README status](../README.md#status) before assuming a designed component exists. Version pins ([D14](adr/0014-pinned-versions.md)) reflect the ecosystem as of August 2026.
 
 Orrery is **not**:
 
@@ -266,4 +266,4 @@ Each sibling doc has its own failure-mode section; these are the cross-cutting o
 
 ## 10. Where to go next
 
-Read [01-spatial-model.md](01-spatial-model.md) → [02-networking.md](02-networking.md) → [04-authority.md](04-authority.md) for the simulation half; [08-persistence.md](08-persistence.md) → [07-witnessing.md](07-witnessing.md) for the durable half; [10-crates.md](10-crates.md) for the workspace layout; [11-roadmap.md](11-roadmap.md) for build order and the risk register (D17). The full document map is at the end of [DECISIONS.md](DECISIONS.md).
+Read [01-spatial-model.md](01-spatial-model.md) → [02-networking.md](02-networking.md) → [04-authority.md](04-authority.md) for the simulation half; [08-persistence.md](08-persistence.md) → [07-witnessing.md](07-witnessing.md) for the durable half; [10-crates.md](10-crates.md) for the workspace layout; [11-roadmap.md](11-roadmap.md) for build order and the risk register ([D17](adr/0017-risks-and-open-questions.md)). The full document map is in the [ADR index](DECISIONS.md).

@@ -27,7 +27,7 @@ exclude = [
     "p2-dashboard",
 ]
 
-# Pinned versions per D14 (docs/DECISIONS.md), ecosystem as of Aug 2026.
+# Pinned versions per D14 (docs/adr/0014-pinned-versions.md), ecosystem as of Aug 2026.
 # Re-validate when implementation of each dependent crate starts; don't bump
 # casually.
 [workspace.dependencies]
