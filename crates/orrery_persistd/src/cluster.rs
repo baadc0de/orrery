@@ -1,15 +1,17 @@
-//! The multi-node persistence cluster (docs/08-persistence.md §3.2, P2 gaps #2/#7).
+//! The in-process persistence cluster harness (docs/08-persistence.md §3.2,
+//! P2 gaps #2/#7).
 //!
 //! A [`Cluster`] owns the node set and routes each shard cell to the node that
-//! rendezvous (HRW) placement assigns it to — replacing the single
-//! `Arc<Mutex<CellRuntime>>` the gateway used for a one-node deployment. The
-//! gateway routes diffs and area loads by placement, so a multi-node `persistd`
-//! serves shards across nodes instead of one process holding everything.
+//! rendezvous (HRW) placement assigns it to. This is the library-side harness
+//! the tests use to exercise placement and replication logic without a real
+//! node-to-node transport; the reference binary itself stays single-node until
+//! that transport exists.
 //!
 //! Each node is a [`CellRuntime`] with its own journal and actors. The cluster
-//! also wires chain replication between nodes: each node's journal streams to
-//! its follower (the next node in HRW order), so a node loss is covered by the
-//! follower's copy (RPO ≤ ~100 ms, D11 §4).
+//! also wires chain replication between nodes using the in-process
+//! [`MemChainTransport`]: each node's journal streams to its follower (the next
+//! node in HRW order), so the replication logic is testable without pretending
+//! that the process-local shim is a distributed failover transport.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -95,6 +97,26 @@ impl Router for tokio::sync::Mutex<CellRuntime> {
     }
 }
 
+/// A router over a shared runtime handle.
+///
+/// This lets the single-node `persistd` binary keep one `Arc<Mutex<CellRuntime>>`
+/// for shutdown while still composing that runtime into the cold-fallback
+/// router used when FoundationDB is available.
+#[async_trait::async_trait]
+impl Router for Arc<tokio::sync::Mutex<CellRuntime>> {
+    async fn apply(&self, record: JournalRecord) -> Result<orrery_protocol::Lsn, Reject> {
+        self.as_ref().apply(record).await
+    }
+
+    async fn read(&self, grid: GridId, cell: CellId) -> Result<SnapshotPage, Reject> {
+        self.as_ref().read(grid, cell).await
+    }
+
+    async fn has_actor(&self, grid: GridId, cell: CellId) -> bool {
+        self.as_ref().has_actor(grid, cell).await
+    }
+}
+
 /// A router that serves cold cells from a durable [`ColdCellReader`], falling
 /// back to a live [`Router`] for hot cells.
 ///
@@ -138,7 +160,7 @@ impl<R: Router + Send + Sync> Router for ColdFallbackRouter<R> {
     }
 }
 
-/// A running multi-node cluster.
+/// A running cluster harness.
 pub struct Cluster {
     /// The node set for rendezvous placement.
     nodes: Vec<RendezvousNode>,

@@ -6,7 +6,7 @@ Normative source: [DECISIONS.md](DECISIONS.md) §D11 (with D5 for `CellId`/shard
 
 ## 1. Architecture
 
-One `orrery_persistd` process per cluster node hosts six components. Games link their `Ruleset` (D9) into their own `persistd` binary — the harness is a library.
+The current `orrery_persistd` reference binary runs one process per node. Games link their `Ruleset` (D9) into their own `persistd` binary — the harness is a library, and the distributed multi-node transport remains a later step.
 
 ```mermaid
 graph LR
