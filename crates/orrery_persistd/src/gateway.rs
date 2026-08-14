@@ -312,6 +312,7 @@ async fn accept_loop(
 /// connection: the bulk ack is the client-observed durability contract
 /// (docs/08-persistence.md §2.1, D16 p99 < 5 ms) and must not queue behind an
 /// area load.
+#[allow(clippy::too_many_arguments)] // Connection dependencies are explicit at this boundary.
 async fn handle_connection(
     incoming: iroh::endpoint::Incoming,
     router: Arc<dyn Router>,
