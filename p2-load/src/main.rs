@@ -191,7 +191,7 @@ async fn run() -> Result<()> {
     )?;
 
     // ── Transport ────────────────────────────────────────────────────────
-    let endpoint = bind_endpoint(cli.secret_key.as_deref()).await?;
+    let (endpoint, intent_signing_key) = bind_endpoint(cli.secret_key.as_deref()).await?;
     tracing::info!(node = %endpoint.id(), addr = %cli.addr, "rig endpoint up");
 
     let mut sessions = Vec::new();
@@ -229,6 +229,7 @@ async fn run() -> Result<()> {
         cli: &cli,
         emit_json: cli.json,
         endpoint,
+        intent_signing_key,
         sessions,
         inventory,
         diff_hz,
@@ -363,7 +364,7 @@ fn parse_lsn(raw: &str) -> Result<orrery_protocol::Lsn> {
 }
 
 async fn read_gateway_state(cli: &Cli, expected: &[DiffEvidence]) -> Result<Vec<RecoveredDiff>> {
-    let endpoint = bind_endpoint(None).await?;
+    let (endpoint, _) = bind_endpoint(None).await?;
     let conn = dial(&endpoint, cli.addr, cli.gateway).await?;
     let mut wanted = BTreeMap::<CellId, Vec<PersistId>>::new();
     for d in expected {
@@ -555,15 +556,22 @@ fn aggregate_bulk_latency(schedulers: &[UplinkScheduler]) -> LatencyHistogram {
 /// Bind the rig-local iroh endpoint (relay disabled — the rig is
 /// gateway-colocated by design, docs/11-roadmap.md §P2 "gateway-colocated
 /// load generator"; a relayed path would inflate the client-observed series).
-async fn bind_endpoint(secret_key: Option<&str>) -> Result<Endpoint> {
-    let mut builder = Endpoint::builder(iroh::endpoint::presets::Minimal)
+async fn bind_endpoint(secret_key: Option<&str>) -> Result<(Endpoint, SecretKey)> {
+    // The endpoint identity is also the intent issuer. Keep its private key
+    // alongside the endpoint so load-generated intents are signed by the
+    // NodeId that the gateway binds to the connection.
+    let signing_key = match secret_key {
+        Some(encoded) => encoded
+            .parse()
+            .context("invalid --secret-key (expected hex)")?,
+        None => SecretKey::generate(),
+    };
+    let builder = Endpoint::builder(iroh::endpoint::presets::Minimal)
         .relay_mode(iroh::RelayMode::Disabled)
-        .alpns(vec![GATEWAY_ALPN.to_vec()]);
-    if let Some(hex) = secret_key {
-        let sk: SecretKey = hex.parse().context("invalid --secret-key (expected hex)")?;
-        builder = builder.secret_key(sk);
-    }
-    builder.bind().await.context("bind rig endpoint")
+        .alpns(vec![GATEWAY_ALPN.to_vec()])
+        .secret_key(signing_key.clone());
+    let endpoint = builder.bind().await.context("bind rig endpoint")?;
+    Ok((endpoint, signing_key))
 }
 
 /// Dial the gateway and complete the admission + hello handshake.
@@ -967,6 +975,8 @@ struct Rig<'a> {
     /// drive loop silently without rebuilding the CLI.
     emit_json: bool,
     endpoint: Endpoint,
+    /// Private half of `endpoint.id()`, used for canonical issuer signatures.
+    intent_signing_key: SecretKey,
     sessions: Vec<Connection>,
     inventory: Inventory,
     diff_hz: f64,
@@ -1273,23 +1283,32 @@ impl Rig<'_> {
     }
 
     /// Build a minimal intent of `kind` bound to the entity's current cell
-    /// epoch. The P2 gateway's intent path is a stub (signature check →
-    /// `Ruleset` validation stub → optimistic commit, roadmap §P2): the rig's
-    /// job is to make the *commit latency* measurable at the calibrated mix,
-    /// so the intent is wire-shaped and empty of ops.
+    /// epoch. The P2 gateway verifies the issuer signature before durable
+    /// execution, so the rig signs the canonical preimage with the same key
+    /// that established this endpoint's authenticated NodeId.
     fn make_intent(&self, id: u128, kind: String) -> Intent {
-        Intent {
-            intent_id: id,
-            issuer: self.endpoint.id(),
-            cell_epoch: Epoch::new(0),
-            ops: vec![IntentOp {
-                op: op_code(&kind),
-                args: Bytes::from(kind.into_bytes()),
-            }],
-            attestations: Vec::<Attestation>::new(),
-            signature: dummy_signature(),
-        }
+        signed_intent(id, self.endpoint.id(), &self.intent_signing_key, kind)
     }
+}
+
+/// Build and canonically sign one load-generated intent. Kept separate from
+/// [`Rig`] so this critical wire invariant has a direct unit regression.
+fn signed_intent(id: u128, issuer: NodeId, signing_key: &SecretKey, kind: String) -> Intent {
+    debug_assert_eq!(issuer, signing_key.public());
+    let mut intent = Intent {
+        intent_id: id,
+        issuer,
+        cell_epoch: Epoch::new(0),
+        ops: vec![IntentOp {
+            op: op_code(&kind),
+            args: Bytes::from(kind.into_bytes()),
+        }],
+        attestations: Vec::<Attestation>::new(),
+        // `Intent::sign` replaces this placeholder immediately.
+        signature: signing_key.sign(&[]),
+    };
+    intent.sign(signing_key);
+    intent
 }
 
 /// A stable op code per intent kind (FNV-1a over the kind string, truncated
@@ -1302,15 +1321,6 @@ fn op_code(kind: &str) -> u16 {
         h = h.wrapping_mul(0x0000_0100_0000_01B3);
     }
     (h >> 48) as u16
-}
-
-/// The P2 gateway's intent stub does not verify signatures (roadmap §P2:
-/// attestation arrives in P5), so the rig signs with a fixed key — the field
-/// is wire-shaped, not meaningful.
-fn dummy_signature() -> orrery_protocol::Signature {
-    static KEY: std::sync::OnceLock<iroh::SecretKey> = std::sync::OnceLock::new();
-    KEY.get_or_init(|| iroh::SecretKey::from_bytes(&[0x2du8; 32]))
-        .sign(b"p2-load intent")
 }
 
 /// A deterministic intent id for (entity, send index): high 64 bits the
@@ -1471,6 +1481,19 @@ mod tests {
     }
 
     #[test]
+    fn generated_intent_verifies_as_its_connected_issuer() {
+        let key = SecretKey::from_bytes(&[0x5au8; 32]);
+        let intent = signed_intent(42, key.public(), &key, "trade".to_owned());
+
+        assert!(
+            intent.verify_issuer(),
+            "p2-load must sign the canonical preimage with the endpoint identity"
+        );
+        assert_eq!(intent.issuer, key.public());
+        assert_eq!(intent.ops[0].op, op_code("trade"));
+    }
+
+    #[test]
     fn duration_strings_parse() {
         assert_eq!(parse_duration("30m").unwrap(), Duration::from_secs(1800));
         assert_eq!(parse_duration("90s").unwrap(), Duration::from_secs(90));
@@ -1480,7 +1503,7 @@ mod tests {
 
     #[tokio::test]
     async fn area_load_error_is_ignored_for_latency_tracking() {
-        let endpoint = bind_endpoint(None).await.expect("bind test endpoint");
+        let (endpoint, intent_signing_key) = bind_endpoint(None).await.expect("bind test endpoint");
         let cli = Cli {
             gateway: node(1),
             addr: SocketAddr::from(([127, 0, 0, 1], 1)),
@@ -1505,6 +1528,7 @@ mod tests {
             cli: &cli,
             emit_json: false,
             endpoint,
+            intent_signing_key,
             sessions: Vec::new(),
             inventory: Vec::new(),
             diff_hz: 2.0,
@@ -1545,7 +1569,7 @@ mod tests {
 
     #[tokio::test]
     async fn provisional_bulk_ack_is_not_written_as_durable_evidence() {
-        let endpoint = bind_endpoint(None).await.expect("bind test endpoint");
+        let (endpoint, intent_signing_key) = bind_endpoint(None).await.expect("bind test endpoint");
         let cli = Cli {
             gateway: node(1),
             addr: SocketAddr::from(([127, 0, 0, 1], 1)),
@@ -1582,6 +1606,7 @@ mod tests {
             cli: &cli,
             emit_json: false,
             endpoint,
+            intent_signing_key,
             sessions: Vec::new(),
             inventory: Vec::new(),
             diff_hz: 2.0,
