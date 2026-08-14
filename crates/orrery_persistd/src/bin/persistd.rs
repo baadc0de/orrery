@@ -46,8 +46,8 @@ use orrery_persistd::journal::{
 };
 use orrery_persistd::{
     ActivationOutcome, CellRuntime, CheckpointScheduler, DurableChainId, FenceFreshnessConfig,
-    FenceStore, GatewayConfig, GatewayServer, GrpcChainTransport, IntentExecutor, JournalConfig,
-    MemCheckpointStore, RuntimeConfig, ShardActivation,
+    FenceStore, GatewayBulkMetrics, GatewayConfig, GatewayServer, GrpcChainTransport,
+    IntentExecutor, JournalConfig, MemCheckpointStore, RuntimeConfig, ShardActivation,
 };
 #[cfg(feature = "fdb")]
 use orrery_persistd::{FdbContext, FdbIntentExecutor};
@@ -149,13 +149,21 @@ impl MetricsReporter {
 /// The caller deliberately invokes this only after the follower early-return:
 /// a passive follower mirrors records but must not be treated as the primary's
 /// server-internal commit-latency source.
-fn spawn_metrics_reporter(path: PathBuf, journal: Arc<Journal>) -> anyhow::Result<MetricsReporter> {
+fn spawn_metrics_reporter(
+    path: PathBuf,
+    journal: Arc<Journal>,
+    bulk_metrics: Option<Arc<GatewayBulkMetrics>>,
+) -> anyhow::Result<MetricsReporter> {
     let file = OpenOptions::new().create(true).append(true).open(&path)?;
     let (shutdown, mut stopped) = oneshot::channel();
     let task = tokio::spawn(async move {
         let metrics = journal.commit_metrics();
         let mut cursor = metrics.snapshot();
         let mut stage_cursor = metrics.stage_snapshot();
+        let mut bulk_cursor = bulk_metrics.as_ref().map(|metrics| metrics.snapshot());
+        let mut bulk_latency_cursor = bulk_metrics
+            .as_ref()
+            .map(|metrics| metrics.latency_snapshot());
         let mut interval = tokio::time::interval(METRICS_REPORT_INTERVAL);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut writer = BufWriter::new(file);
@@ -166,6 +174,8 @@ fn spawn_metrics_reporter(path: PathBuf, journal: Arc<Journal>) -> anyhow::Resul
                 _ = &mut stopped => {
                     if let Err(error) = write_journal_metric_batches(&mut writer, &metrics.delta(&mut cursor))
                         .and_then(|()| write_journal_stage_delta(&mut writer, metrics.stage_delta(&mut stage_cursor)))
+                        .and_then(|()| write_gateway_bulk_delta(&mut writer, bulk_metrics.as_deref(), bulk_cursor.as_mut()))
+                        .and_then(|()| write_gateway_bulk_latency(&mut writer, bulk_metrics.as_deref(), bulk_latency_cursor.as_mut()))
                         .and_then(|()| writer.flush())
                     {
                         tracing::warn!(path = %path.display(), %error, "failed to flush final journal metrics");
@@ -182,6 +192,20 @@ fn spawn_metrics_reporter(path: PathBuf, journal: Arc<Journal>) -> anyhow::Resul
                             metrics.stage_delta(&mut stage_cursor),
                         )
                     })
+                    .and_then(|()| {
+                        write_gateway_bulk_latency(
+                            &mut writer,
+                            bulk_metrics.as_deref(),
+                            bulk_latency_cursor.as_mut(),
+                        )
+                    })
+                    .and_then(|()| {
+                        write_gateway_bulk_delta(
+                            &mut writer,
+                            bulk_metrics.as_deref(),
+                            bulk_cursor.as_mut(),
+                        )
+                    })
                     .and_then(|()| writer.flush())
             {
                 tracing::warn!(path = %path.display(), %error, "failed to write journal metrics; stopping reporter");
@@ -190,6 +214,65 @@ fn spawn_metrics_reporter(path: PathBuf, journal: Arc<Journal>) -> anyhow::Resul
         }
     });
     Ok(MetricsReporter { shutdown, task })
+}
+
+/// Export the server receipt-through-send-call histogram in dashboard form.
+fn write_gateway_bulk_latency(
+    mut writer: impl Write,
+    metrics: Option<&GatewayBulkMetrics>,
+    cursor: Option<&mut orrery_persistd::GatewayBulkLatencySnapshot>,
+) -> std::io::Result<()> {
+    let (Some(metrics), Some(cursor)) = (metrics, cursor) else {
+        return Ok(());
+    };
+    for sample in metrics.latency_delta(cursor) {
+        serde_json::to_writer(
+            &mut writer,
+            &serde_json::json!({
+                "type": "sample_batch",
+                "series": "gateway_bulk_server_ms",
+                "value_us": sample.value_us,
+                "count": sample.count,
+            }),
+        )
+        .map_err(std::io::Error::other)?;
+        writer.write_all(b"\n")?;
+    }
+    Ok(())
+}
+
+/// Append one compact interval aggregate for gateway stages outside Fjall.
+fn write_gateway_bulk_delta(
+    mut writer: impl Write,
+    metrics: Option<&GatewayBulkMetrics>,
+    cursor: Option<&mut orrery_persistd::GatewayBulkSnapshot>,
+) -> std::io::Result<()> {
+    let (Some(metrics), Some(cursor)) = (metrics, cursor) else {
+        return Ok(());
+    };
+    let delta = metrics.delta(cursor);
+    if delta.acknowledgements == 0 {
+        return Ok(());
+    }
+    serde_json::to_writer(
+        &mut writer,
+        &serde_json::json!({
+            "type": "gateway_bulk_stage_delta",
+            "acknowledgements": delta.acknowledgements,
+            "route_queue_us_sum": delta.route_queue_us_sum,
+            "route_queue_us_max": delta.route_queue_us_max,
+            "router_apply_us_sum": delta.router_apply_us_sum,
+            "router_apply_us_max": delta.router_apply_us_max,
+            "journal_wait_us_sum": delta.journal_wait_us_sum,
+            "journal_wait_us_max": delta.journal_wait_us_max,
+            "reply_us_sum": delta.reply_us_sum,
+            "reply_us_max": delta.reply_us_max,
+            "total_us_sum": delta.total_us_sum,
+            "total_us_max": delta.total_us_max,
+        }),
+    )
+    .map_err(std::io::Error::other)?;
+    writer.write_all(b"\n")
 }
 
 /// Append one compact interval aggregate for group-commit stage diagnostics.
@@ -450,12 +533,16 @@ async fn main() -> anyhow::Result<()> {
     // This executes only on an active node: passive followers returned above
     // before opening a runtime. Capture the journal before handing the runtime
     // to the gateway/router so reporter lifetime is independent of routing.
+    let bulk_metrics = cli
+        .metrics_jsonl
+        .as_ref()
+        .map(|_| Arc::new(GatewayBulkMetrics::default()));
     let metrics_reporter = if let Some(path) = cli.metrics_jsonl.clone() {
         let journal = {
             let guard = runtime.lock().await;
             Arc::clone(guard.journal())
         };
-        Some(spawn_metrics_reporter(path, journal)?)
+        Some(spawn_metrics_reporter(path, journal, bulk_metrics.clone())?)
     } else {
         None
     };
@@ -544,6 +631,7 @@ async fn main() -> anyhow::Result<()> {
     if let Some(monitor) = &fence_freshness_monitor {
         gateway_config.bulk_ack_admission = monitor.clone();
     }
+    gateway_config.bulk_metrics = bulk_metrics;
     tracing::info!(
         elapsed_ms = startup_started.elapsed().as_millis(),
         "persistd startup: starting gateway"
@@ -673,7 +761,7 @@ async fn run_follower(cli: &Cli, topology: &Topology) -> anyhow::Result<()> {
     let metrics_reporter = cli
         .metrics_jsonl
         .clone()
-        .map(|path| spawn_metrics_reporter(path, Arc::clone(&journal)))
+        .map(|path| spawn_metrics_reporter(path, Arc::clone(&journal), None))
         .transpose()?;
 
     // stdout is a one-line machine-readable readiness contract. Unlike a

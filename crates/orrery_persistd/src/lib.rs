@@ -52,7 +52,8 @@ pub use fence::{
     ShardActivation,
 };
 pub use gateway::{
-    BulkAckAdmission, BulkAckDisposition, FreshBulkAckAdmission, GatewayConfig, GatewayError,
+    BulkAckAdmission, BulkAckDisposition, FreshBulkAckAdmission, GatewayBulkLatencySnapshot,
+    GatewayBulkMetrics, GatewayBulkSample, GatewayBulkSnapshot, GatewayConfig, GatewayError,
     GatewayServer, SharedBulkAckAdmission, GATEWAY_ALPN,
 };
 #[cfg(feature = "fdb")]

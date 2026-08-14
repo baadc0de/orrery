@@ -35,6 +35,7 @@
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 
 use bytes::Bytes;
 use iroh::{Endpoint, EndpointAddr, RelayMode};
@@ -123,6 +124,218 @@ impl BulkAckDisposition {
 /// Shared bulk-ack admission policy used by a gateway.
 pub type SharedBulkAckAdmission = Arc<dyn BulkAckAdmission>;
 
+const BULK_LATENCY_BOUNDARIES_US: [u64; 22] = [
+    50, 100, 200, 500, 1_000, 2_000, 3_000, 5_000, 7_000, 10_000, 15_000, 20_000, 30_000, 50_000,
+    75_000, 100_000, 150_000, 200_000, 300_000, 500_000, 750_000, 1_000_000,
+];
+const NUM_BULK_LATENCY_BUCKETS: usize = BULK_LATENCY_BOUNDARIES_US.len() + 1;
+
+/// One compact server-side bulk latency histogram bucket.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GatewayBulkSample {
+    /// Bucket upper bound in microseconds; overflow uses the observed maximum.
+    pub value_us: u64,
+    /// Successful acknowledgements in this bucket.
+    pub count: u64,
+}
+
+/// Point-in-time view of the fixed-memory server-side bulk histogram.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GatewayBulkLatencySnapshot {
+    buckets: [u64; NUM_BULK_LATENCY_BUCKETS],
+    max_us: u64,
+}
+
+/// Fixed-memory timing counters for successful bulk acknowledgements.
+///
+/// These stages bracket the server work outside the journal's own commit
+/// telemetry. Sums support interval averages while maxima expose excursions;
+/// recording one acknowledgement is a small, fixed number of relaxed atomic
+/// operations and never allocates.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct GatewayBulkSnapshot {
+    /// Successfully sent durable or provisional bulk acknowledgements.
+    pub acknowledgements: u64,
+    /// Time from decoded gateway receipt until the bounded route task starts.
+    pub route_queue_us_sum: u64,
+    /// Largest decoded-receipt to route-task-start latency.
+    pub route_queue_us_max: u64,
+    /// Time spent routing to the cell actor and obtaining its append handle.
+    pub router_apply_us_sum: u64,
+    /// Largest router-apply latency.
+    pub router_apply_us_max: u64,
+    /// Time from obtaining the append handle until durable resolution.
+    pub journal_wait_us_sum: u64,
+    /// Largest append-handle durability wait.
+    pub journal_wait_us_max: u64,
+    /// Admission, acknowledgement encoding, and datagram-send call time.
+    pub reply_us_sum: u64,
+    /// Largest admission, encoding, and send-call latency.
+    pub reply_us_max: u64,
+    /// Complete decoded-receipt through datagram-send-call latency.
+    pub total_us_sum: u64,
+    /// Largest complete decoded-receipt through send-call latency.
+    pub total_us_max: u64,
+}
+
+/// Thread-safe gateway bulk-stage recorder.
+#[derive(Debug)]
+pub struct GatewayBulkMetrics {
+    acknowledgements: AtomicU64,
+    route_queue_us_sum: AtomicU64,
+    route_queue_us_max: AtomicU64,
+    router_apply_us_sum: AtomicU64,
+    router_apply_us_max: AtomicU64,
+    journal_wait_us_sum: AtomicU64,
+    journal_wait_us_max: AtomicU64,
+    reply_us_sum: AtomicU64,
+    reply_us_max: AtomicU64,
+    total_us_sum: AtomicU64,
+    total_us_max: AtomicU64,
+    total_buckets: [AtomicU64; NUM_BULK_LATENCY_BUCKETS],
+    total_latency_max_us: AtomicU64,
+}
+
+impl Default for GatewayBulkMetrics {
+    fn default() -> Self {
+        Self {
+            acknowledgements: AtomicU64::new(0),
+            route_queue_us_sum: AtomicU64::new(0),
+            route_queue_us_max: AtomicU64::new(0),
+            router_apply_us_sum: AtomicU64::new(0),
+            router_apply_us_max: AtomicU64::new(0),
+            journal_wait_us_sum: AtomicU64::new(0),
+            journal_wait_us_max: AtomicU64::new(0),
+            reply_us_sum: AtomicU64::new(0),
+            reply_us_max: AtomicU64::new(0),
+            total_us_sum: AtomicU64::new(0),
+            total_us_max: AtomicU64::new(0),
+            total_buckets: [const { AtomicU64::new(0) }; NUM_BULK_LATENCY_BUCKETS],
+            total_latency_max_us: AtomicU64::new(0),
+        }
+    }
+}
+
+impl GatewayBulkMetrics {
+    /// Capture cumulative bulk acknowledgement stage counters.
+    #[must_use]
+    pub fn snapshot(&self) -> GatewayBulkSnapshot {
+        let load = |counter: &AtomicU64| counter.load(Ordering::Relaxed);
+        GatewayBulkSnapshot {
+            acknowledgements: load(&self.acknowledgements),
+            route_queue_us_sum: load(&self.route_queue_us_sum),
+            route_queue_us_max: load(&self.route_queue_us_max),
+            router_apply_us_sum: load(&self.router_apply_us_sum),
+            router_apply_us_max: load(&self.router_apply_us_max),
+            journal_wait_us_sum: load(&self.journal_wait_us_sum),
+            journal_wait_us_max: load(&self.journal_wait_us_max),
+            reply_us_sum: load(&self.reply_us_sum),
+            reply_us_max: load(&self.reply_us_max),
+            total_us_sum: load(&self.total_us_sum),
+            total_us_max: load(&self.total_us_max),
+        }
+    }
+
+    /// Return counters added since `previous` and advance that cursor.
+    pub fn delta(&self, previous: &mut GatewayBulkSnapshot) -> GatewayBulkSnapshot {
+        let current = self.snapshot();
+        let sub = |now: u64, before: u64| now.saturating_sub(before);
+        let delta = GatewayBulkSnapshot {
+            acknowledgements: sub(current.acknowledgements, previous.acknowledgements),
+            route_queue_us_sum: sub(current.route_queue_us_sum, previous.route_queue_us_sum),
+            route_queue_us_max: current.route_queue_us_max,
+            router_apply_us_sum: sub(current.router_apply_us_sum, previous.router_apply_us_sum),
+            router_apply_us_max: current.router_apply_us_max,
+            journal_wait_us_sum: sub(current.journal_wait_us_sum, previous.journal_wait_us_sum),
+            journal_wait_us_max: current.journal_wait_us_max,
+            reply_us_sum: sub(current.reply_us_sum, previous.reply_us_sum),
+            reply_us_max: current.reply_us_max,
+            total_us_sum: sub(current.total_us_sum, previous.total_us_sum),
+            total_us_max: current.total_us_max,
+        };
+        *previous = current;
+        delta
+    }
+
+    /// Capture the server receipt-through-send-call latency histogram.
+    #[must_use]
+    pub fn latency_snapshot(&self) -> GatewayBulkLatencySnapshot {
+        GatewayBulkLatencySnapshot {
+            buckets: self
+                .total_buckets
+                .each_ref()
+                .map(|bucket| bucket.load(Ordering::Relaxed)),
+            max_us: self.total_latency_max_us.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Return histogram buckets added since `previous` and advance the cursor.
+    pub fn latency_delta(
+        &self,
+        previous: &mut GatewayBulkLatencySnapshot,
+    ) -> Vec<GatewayBulkSample> {
+        let current = self.latency_snapshot();
+        let samples = current
+            .buckets
+            .iter()
+            .zip(previous.buckets.iter())
+            .enumerate()
+            .filter_map(|(index, (&now, &before))| {
+                let count = now.saturating_sub(before);
+                (count != 0).then_some(GatewayBulkSample {
+                    value_us: BULK_LATENCY_BOUNDARIES_US
+                        .get(index)
+                        .copied()
+                        .unwrap_or(current.max_us),
+                    count,
+                })
+            })
+            .collect();
+        *previous = current;
+        samples
+    }
+
+    fn record(
+        &self,
+        route_queue_us: u64,
+        router_apply_us: u64,
+        journal_wait_us: u64,
+        reply_us: u64,
+        total_us: u64,
+    ) {
+        let stage = |sum: &AtomicU64, max: &AtomicU64, value| {
+            sum.fetch_add(value, Ordering::Relaxed);
+            max.fetch_max(value, Ordering::Relaxed);
+        };
+        self.acknowledgements.fetch_add(1, Ordering::Relaxed);
+        stage(
+            &self.route_queue_us_sum,
+            &self.route_queue_us_max,
+            route_queue_us,
+        );
+        stage(
+            &self.router_apply_us_sum,
+            &self.router_apply_us_max,
+            router_apply_us,
+        );
+        stage(
+            &self.journal_wait_us_sum,
+            &self.journal_wait_us_max,
+            journal_wait_us,
+        );
+        stage(&self.reply_us_sum, &self.reply_us_max, reply_us);
+        stage(&self.total_us_sum, &self.total_us_max, total_us);
+        let index = BULK_LATENCY_BOUNDARIES_US.partition_point(|&boundary| total_us > boundary);
+        self.total_buckets[index].fetch_add(1, Ordering::Relaxed);
+        self.total_latency_max_us
+            .fetch_max(total_us, Ordering::Relaxed);
+    }
+}
+
+fn elapsed_us(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX)
+}
+
 /// The current single-node policy: its ownership is always fresh.
 #[derive(Debug, Default)]
 pub struct FreshBulkAckAdmission;
@@ -161,6 +374,8 @@ pub struct GatewayConfig {
     /// preserves the current single-node durable-ack behavior; activation can
     /// inject its three-second fence freshness monitor here.
     pub bulk_ack_admission: SharedBulkAckAdmission,
+    /// Bulk acknowledgement stage telemetry shared with the metrics reporter.
+    pub bulk_metrics: Option<Arc<GatewayBulkMetrics>>,
 }
 
 impl Default for GatewayConfig {
@@ -174,6 +389,7 @@ impl Default for GatewayConfig {
             executor: None,
             validator: Arc::new(PermissiveValidator),
             bulk_ack_admission: Arc::new(FreshBulkAckAdmission),
+            bulk_metrics: None,
         }
     }
 }
@@ -230,6 +446,7 @@ impl GatewayServer {
         let executor = config.executor;
         let validator = config.validator;
         let bulk_ack_admission = config.bulk_ack_admission;
+        let bulk_metrics = config.bulk_metrics;
         let (shutdown, rx) = oneshot::channel();
         let send_failures = Arc::new(AtomicU64::new(0));
         let join = tokio::spawn(accept_loop(
@@ -240,6 +457,7 @@ impl GatewayServer {
             executor,
             validator,
             bulk_ack_admission,
+            bulk_metrics,
             Arc::clone(&send_failures),
             rx,
         ));
@@ -293,6 +511,7 @@ async fn accept_loop(
     executor: Option<SharedExecutor>,
     validator: SharedValidator,
     bulk_ack_admission: SharedBulkAckAdmission,
+    bulk_metrics: Option<Arc<GatewayBulkMetrics>>,
     send_failures: Arc<AtomicU64>,
     mut shutdown: oneshot::Receiver<()>,
 ) {
@@ -305,6 +524,7 @@ async fn accept_loop(
                 let executor = executor.clone();
                 let validator = Arc::clone(&validator);
                 let bulk_ack_admission = Arc::clone(&bulk_ack_admission);
+                let bulk_metrics = bulk_metrics.clone();
                 let send_failures = Arc::clone(&send_failures);
                 tokio::spawn(handle_connection(
                     incoming,
@@ -314,6 +534,7 @@ async fn accept_loop(
                     executor,
                     validator,
                     bulk_ack_admission,
+                    bulk_metrics,
                     send_failures,
                 ));
             }
@@ -339,6 +560,7 @@ async fn handle_connection(
     executor: Option<SharedExecutor>,
     validator: SharedValidator,
     bulk_ack_admission: SharedBulkAckAdmission,
+    bulk_metrics: Option<Arc<GatewayBulkMetrics>>,
     send_failures: Arc<AtomicU64>,
 ) {
     let conn = match incoming.accept() {
@@ -405,20 +627,39 @@ async fn handle_connection(
                 send(Bytes::from(encode_stream_frame(&reply)));
             }
             GatewayMsg::Diff { diff } => {
+                let received_at = Instant::now();
                 let send = Arc::clone(&send);
                 let router = Arc::clone(&router);
                 let bulk_ack_admission = Arc::clone(&bulk_ack_admission);
+                let bulk_metrics = bulk_metrics.clone();
                 let permit = Arc::clone(&inflight_diffs).acquire_owned().await;
                 match permit {
                     Ok(permit) => {
                         tokio::spawn(async move {
                             let _permit = permit;
-                            route_diff(send.as_ref(), diff, remote, &router, &bulk_ack_admission)
-                                .await;
+                            route_diff(
+                                send.as_ref(),
+                                diff,
+                                remote,
+                                &router,
+                                &bulk_ack_admission,
+                                bulk_metrics.as_deref(),
+                                received_at,
+                            )
+                            .await;
                         });
                     }
                     Err(_) => {
-                        route_diff(send.as_ref(), diff, remote, &router, &bulk_ack_admission).await
+                        route_diff(
+                            send.as_ref(),
+                            diff,
+                            remote,
+                            &router,
+                            &bulk_ack_admission,
+                            bulk_metrics.as_deref(),
+                            received_at,
+                        )
+                        .await
                     }
                 }
             }
@@ -592,7 +833,11 @@ async fn route_diff(
     author: NodeId,
     router: &Arc<dyn Router>,
     bulk_ack_admission: &SharedBulkAckAdmission,
+    bulk_metrics: Option<&GatewayBulkMetrics>,
+    received_at: Instant,
 ) {
+    let route_started = Instant::now();
+    let route_queue_us = elapsed_us(received_at);
     let entity = diff.entity;
     let tick = diff.tick;
     let crc = payload_crc(&diff.payload);
@@ -611,6 +856,8 @@ async fn route_diff(
             crc,
         })
         .await;
+    let router_apply_us = elapsed_us(route_started);
+    let journal_wait_started = Instant::now();
 
     // The actor has already stamped, appended, and folded before returning
     // this handle. Keep the durability wait in this existing bounded route
@@ -626,9 +873,11 @@ async fn route_diff(
         }
         Err(error) => Err(error),
     };
+    let journal_wait_us = elapsed_us(journal_wait_started);
 
     match result {
         Ok(lsn) => {
+            let reply_started = Instant::now();
             // Check after the actor reports its local journal append so the
             // reply states the ownership freshness at acknowledgement time.
             // A stale/lost owner remains observable to the caller but cannot
@@ -643,6 +892,15 @@ async fn route_diff(
                 provisional,
             };
             send(Bytes::from(encode_datagram(&reply)));
+            if let Some(bulk_metrics) = bulk_metrics {
+                bulk_metrics.record(
+                    route_queue_us,
+                    router_apply_us,
+                    journal_wait_us,
+                    elapsed_us(reply_started),
+                    elapsed_us(received_at),
+                );
+            }
         }
         Err(_) => {
             let reply = GatewayReply::BulkNack {
@@ -890,6 +1148,7 @@ mod tests {
         let send = move |bytes| capture.lock().expect("capture lock").push(bytes);
         let router: Arc<dyn Router> = Arc::new(SuccessfulRouter);
         let admission: SharedBulkAckAdmission = Arc::new(StaleAdmission);
+        let metrics = GatewayBulkMetrics::default();
 
         route_diff(
             &send,
@@ -905,6 +1164,8 @@ mod tests {
             iroh::SecretKey::from_bytes(&[1; 32]).public(),
             &router,
             &admission,
+            Some(&metrics),
+            Instant::now(),
         )
         .await;
 
@@ -924,6 +1185,14 @@ mod tests {
                 && tick == orrery_protocol::Tick::new(3)
                 && lsn == Lsn::new(7, 11)
         ));
+        let mut cursor = GatewayBulkSnapshot::default();
+        let delta = metrics.delta(&mut cursor);
+        assert_eq!(delta.acknowledgements, 1);
+        assert_eq!(metrics.delta(&mut cursor).acknowledgements, 0);
+        let mut latency_cursor = GatewayBulkMetrics::default().latency_snapshot();
+        let samples = metrics.latency_delta(&mut latency_cursor);
+        assert_eq!(samples.iter().map(|sample| sample.count).sum::<u64>(), 1);
+        assert!(metrics.latency_delta(&mut latency_cursor).is_empty());
     }
 
     #[tokio::test]
@@ -993,6 +1262,8 @@ mod tests {
             iroh::SecretKey::from_bytes(&[2; 32]).public(),
             &router,
             &admission,
+            None,
+            Instant::now(),
         )
         .await;
         let bytes = sent
