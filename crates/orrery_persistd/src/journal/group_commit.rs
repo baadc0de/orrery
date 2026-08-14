@@ -6,7 +6,7 @@
 //!
 //! - **Adaptive (default):** a lone append arriving while the disk is idle is
 //!   flushed immediately (a lone record pays only device latency); under load,
-//!   appends batch for [`GroupCommitConfig::batch_window`] (default 0.5 ms) or
+//!   appends batch for [`GroupCommitConfig::batch_window`] (default 0.25 ms) or
 //!   until a size cap, then flush once.
 //! - The other [`AdaptiveCommitMode`]s exist to make batching deterministic in
 //!   tests ([`AlwaysBatch`](AdaptiveCommitMode::AlwaysBatch) forces the window
@@ -53,7 +53,12 @@ impl Default for GroupCommitConfig {
     fn default() -> Self {
         Self {
             mode: AdaptiveCommitMode::Adaptive,
-            batch_window: Duration::from_micros(500),
+            // Keep the normal under-load wait below a quarter millisecond:
+            // the D16 server-internal p99 is < 2 ms, and the actual device
+            // flush still needs most of that budget.  At the P2 write rate
+            // this window groups dozens of appends without making the batch
+            // timer itself the dominant tail-latency contributor.
+            batch_window: Duration::from_micros(250),
             batch_max_records: 8192,
             batch_max_bytes: 1 << 20,
         }
