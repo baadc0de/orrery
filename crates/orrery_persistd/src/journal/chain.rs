@@ -217,16 +217,32 @@ fn lag_in_bytes(committed: Lsn, watermark: Option<Lsn>) -> Option<u64> {
 /// budget the lag gauge is compared against. The lag alarm is D11's "~100 ms
 /// of journal"; LSNs carry no wall-clock time, so the replicator maps the
 /// duration through the journal's sustained byte rate. At the D16 envelope a
-/// node commits one record group per ~0.5 ms batch window; the constant below
-/// is the conservative floor (bytes per lag-alarm second) used until the
-/// tonic transport (D12) reports the follower's wall-clock watermark age.
-const LAG_BYTES_PER_ALARM_SECOND: f64 = 1.0;
+/// node's P2 envelope is roughly 10k 128-byte records/s.  Keep the floor at
+/// 1 MiB/s until the tonic transport (D12) reports the follower's wall-clock
+/// watermark age.  The former `1 B/s` placeholder truncated the default
+/// 100-ms window to zero bytes, causing one warning per replicated record and
+/// putting log formatting on the gateway's latency-critical runtime.
+const LAG_BYTES_PER_ALARM_SECOND: f64 = 1_048_576.0;
 
 /// The byte budget for [`ChainConfig::lag_alarm`]: the alarm fires when the
 /// follower's durable watermark trails the primary's committed LSN by more
 /// journal bytes than the primary produces in `lag_alarm` wall time.
 fn lag_alarm_bytes(lag_alarm: Duration) -> u64 {
     (lag_alarm.as_secs_f64() * LAG_BYTES_PER_ALARM_SECOND) as u64
+}
+
+#[cfg(test)]
+mod lag_alarm_tests {
+    use super::lag_alarm_bytes;
+    use std::time::Duration;
+
+    #[test]
+    fn default_lag_window_never_collapses_to_a_per_record_alarm() {
+        // The default is deliberately large enough to represent roughly
+        // 100 ms of the P2 write envelope, rather than truncating to zero and
+        // formatting a warning for every acknowledgement.
+        assert_eq!(lag_alarm_bytes(Duration::from_millis(100)), 104_857);
+    }
 }
 
 /// Spawn a chain-replication task streaming `journal`'s committed records to
