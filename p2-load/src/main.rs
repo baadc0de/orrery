@@ -62,6 +62,7 @@ use iroh::{Endpoint, EndpointAddr, SecretKey};
 use serde::{Deserialize, Serialize};
 
 use orrery_persist_client::config::PersistClientConfig;
+use orrery_persist_client::latency::LatencyHistogram;
 use orrery_persist_client::{IntentQueue, UplinkScheduler};
 use orrery_protocol::channels::{encode_datagram, encode_stream_frame, untag, Channel};
 use orrery_protocol::{
@@ -263,6 +264,7 @@ struct RecoveryVerificationReport {
     eligible_bulk_acks: usize,
     bulk_checked: usize,
     intents_checked: usize,
+    rejected_intents_audited: usize,
     mismatches: Vec<String>,
 }
 
@@ -310,6 +312,7 @@ async fn verify_recovery(cli: &Cli) -> Result<()> {
         eligible_bulk_acks: expected.len(),
         bulk_checked: compared.bulk_checked,
         intents_checked: compared.intents_checked,
+        rejected_intents_audited: compared.rejected_intents_audited,
         mismatches: compared
             .mismatches
             .iter()
@@ -512,6 +515,41 @@ fn check_fan_out(sessions: u32, payload_bytes: usize, entities: u64, diff_hz: f6
         "fan-out assert satisfied"
     );
     Ok(())
+}
+
+/// The connection-local scheduler which owns an inventory entry. Keeping this
+/// mapping pure makes the driver and its capacity proof use the same sharding
+/// rule.
+fn scheduler_shard(index: usize, sessions: usize) -> usize {
+    index % sessions
+}
+
+/// Build one D16 scheduler per live connection, registering each entity with
+/// exactly one owner. The owner is also the connection used for its datagrams,
+/// so acknowledgements return to the scheduler that recorded the send time.
+fn scheduler_shards(
+    inventory: &[Placement],
+    sessions: usize,
+    diff_hz: f64,
+) -> Vec<UplinkScheduler> {
+    let mut schedulers = (0..sessions)
+        .map(|_| UplinkScheduler::new())
+        .collect::<Vec<_>>();
+    for (index, p) in inventory.iter().enumerate() {
+        schedulers[scheduler_shard(index, sessions)].register(p.entity, diff_hz as f32);
+    }
+    schedulers
+}
+
+/// Combine the connection-local scheduler histograms into the single client
+/// population reported to the P2 dashboard. `LatencyHistogram::merge` keeps
+/// the same bounded-memory bucket semantics as a single scheduler.
+fn aggregate_bulk_latency(schedulers: &[UplinkScheduler]) -> LatencyHistogram {
+    let mut combined = LatencyHistogram::new();
+    for scheduler in schedulers {
+        combined.merge(scheduler.ack_latency());
+    }
+    combined
 }
 
 /// Bind the rig-local iroh endpoint (relay disabled — the rig is
@@ -944,22 +982,21 @@ struct Rig<'a> {
 impl Rig<'_> {
     /// Drive the load loop until the duration elapses.
     async fn drive(mut self) -> Result<RunStats> {
-        let mut sched = UplinkScheduler::new();
         let cfg = PersistClientConfig {
             flush_budget_bytes: FLUSH_BUDGET_BYTES,
             ..PersistClientConfig::default()
         };
         let mut intents = IntentQueue::new(1024);
 
-        // Register every entity at the calibrated rate (inside the D16 1–4 Hz
-        // uplink range).
-        for p in &self.inventory {
-            sched.register(p.entity, self.diff_hz as f32);
-        }
-
-        // Per-session state: scheduler shards, send counters, tick clock.
+        // Each connection owns an independent D16 scheduler and its byte
+        // budget.  The fan-out check is expressed per session, so sharing one
+        // scheduler and merely round-robining its selected output would cap a
+        // 125-session demo at one session's 160 diffs/s.
         let sessions = self.sessions.len().max(1);
         let shard_size = self.inventory.len().div_ceil(sessions);
+        let mut schedulers = scheduler_shards(&self.inventory, sessions, self.diff_hz);
+
+        // Per-session state: scheduler shards, send counters, tick clock.
         let tick = Arc::new(AtomicU64::new(0));
         let mut stats = RunStats::default();
         let sink = TelemetrySink::new();
@@ -1009,7 +1046,7 @@ impl Rig<'_> {
                 self.handle_reply(
                     i,
                     &pkt,
-                    &mut sched,
+                    &mut schedulers,
                     &mut intents,
                     &mut stats,
                     &mut area_pending,
@@ -1020,10 +1057,10 @@ impl Rig<'_> {
             if start.elapsed() >= next_flush.duration_since(start) {
                 // Compute each entity's current cell from its trajectory and
                 // queue a fresh diff (newest-wins replaces the pending one).
-                for p in &self.inventory {
+                for (index, p) in self.inventory.iter().enumerate() {
                     let tick_now = tick.load(Ordering::Relaxed);
                     let cell = moved_cell(p, tick_now);
-                    sched.queue(DiffUplink {
+                    schedulers[scheduler_shard(index, sessions)].queue(DiffUplink {
                         cell,
                         grid: GridId::ROOT,
                         entity: p.entity,
@@ -1035,41 +1072,42 @@ impl Rig<'_> {
                 }
                 tick.fetch_add(1, Ordering::Relaxed);
 
-                // Flush, then fan the selected diffs out over the sessions
-                // round-robin (one scheduler across sessions keeps the
-                // priority math global; the budget was asserted per-session).
-                let out = sched.flush(&cfg, elapsed);
-                for (n, diff) in out.iter().enumerate() {
-                    // Intent mix: a fraction of sends is upgraded to an intent
-                    // instead of a diff (docs/12 §12.3 `intent_mix`). The
-                    // decision is deterministic per (entity, send index).
-                    if let Some(kind) = self.intent_for(diff.entity, diff.seq) {
-                        let id = intent_id(diff.entity, diff.seq);
-                        let intent = self.make_intent(id, kind);
-                        if intents.submit(intent).is_some() {
-                            stats.intents_sent += 1;
+                // Flush every per-connection scheduler. Each flush receives
+                // its own D16 byte budget, matching `check_fan_out`.
+                for (session, sched) in schedulers.iter_mut().enumerate() {
+                    let out = sched.flush(&cfg, elapsed);
+                    for diff in out {
+                        // Intent mix: a fraction of sends is upgraded to an intent
+                        // instead of a diff (docs/12 §12.3 `intent_mix`). The
+                        // decision is deterministic per (entity, send index).
+                        if let Some(kind) = self.intent_for(diff.entity, diff.seq) {
+                            let id = intent_id(diff.entity, diff.seq);
+                            let intent = self.make_intent(id, kind);
+                            if intents.submit(intent).is_some() {
+                                stats.intents_sent += 1;
+                            }
+                            // The diff is still sent: the intent is *in addition
+                            // to* the bulk stream (trades/crafts do not replace
+                            // the entity's state diff).
                         }
-                        // The diff is still sent: the intent is *in addition
-                        // to* the bulk stream (trades/crafts do not replace
-                        // the entity's state diff).
+                        send_msg(
+                            &self.sessions[session],
+                            &GatewayMsg::Diff { diff: diff.clone() },
+                        );
+                        self.pending_diffs.insert(
+                            (diff.entity, diff.tick),
+                            DiffEvidence {
+                                grid: diff.grid,
+                                cell: diff.cell,
+                                entity: diff.entity,
+                                tick: diff.tick,
+                                // The LSN is supplied by the durable ack.
+                                lsn: orrery_protocol::Lsn::new(0, 0),
+                                payload_digest: blake3::hash(&diff.payload).to_hex().to_string(),
+                            },
+                        );
+                        stats.diffs_sent += 1;
                     }
-                    send_msg(
-                        &self.sessions[n % sessions],
-                        &GatewayMsg::Diff { diff: diff.clone() },
-                    );
-                    self.pending_diffs.insert(
-                        (diff.entity, diff.tick),
-                        DiffEvidence {
-                            grid: diff.grid,
-                            cell: diff.cell,
-                            entity: diff.entity,
-                            tick: diff.tick,
-                            // The LSN is supplied by the durable ack.
-                            lsn: orrery_protocol::Lsn::new(0, 0),
-                            payload_digest: blake3::hash(&diff.payload).to_hex().to_string(),
-                        },
-                    );
-                    stats.diffs_sent += 1;
                 }
                 // Drain queued intents to the wire.
                 for intent in intents.drain() {
@@ -1088,7 +1126,8 @@ impl Rig<'_> {
             // stays silent there. The drain logic itself is covered by the
             // telemetry module's tests.
             if self.emit_json {
-                sink.drain_histogram(telemetry::SERIES_BULK_ACK, sched.ack_latency());
+                let bulk_latency = aggregate_bulk_latency(&schedulers);
+                sink.drain_histogram(telemetry::SERIES_BULK_ACK, &bulk_latency);
                 sink.drain_histogram(telemetry::SERIES_INTENT_COMMIT, intents.intent_latency());
             }
 
@@ -1098,7 +1137,8 @@ impl Rig<'_> {
 
         // Final drain.
         if self.emit_json {
-            sink.drain_histogram(telemetry::SERIES_BULK_ACK, sched.ack_latency());
+            let bulk_latency = aggregate_bulk_latency(&schedulers);
+            sink.drain_histogram(telemetry::SERIES_BULK_ACK, &bulk_latency);
             sink.drain_histogram(telemetry::SERIES_INTENT_COMMIT, intents.intent_latency());
         }
         tracing::info!(
@@ -1108,7 +1148,7 @@ impl Rig<'_> {
             provisional_acks = stats.provisional_diff_acks,
             intents = stats.intents_sent,
             intent_acks = stats.intent_acks,
-            bulk_p99_us = sched.ack_latency().p99().as_micros() as u64,
+            bulk_p99_us = aggregate_bulk_latency(&schedulers).p99().as_micros() as u64,
             intent_p99_us = intents.intent_latency().p99().as_micros() as u64,
             "run complete"
         );
@@ -1121,7 +1161,7 @@ impl Rig<'_> {
         &mut self,
         session: usize,
         pkt: &[u8],
-        sched: &mut UplinkScheduler,
+        schedulers: &mut [UplinkScheduler],
         intents: &mut IntentQueue,
         stats: &mut RunStats,
         area_pending: &mut [Option<Instant>],
@@ -1144,7 +1184,9 @@ impl Rig<'_> {
                 lsn,
                 provisional,
             } => {
-                sched.on_ack(entity, tick, provisional);
+                if let Some(sched) = schedulers.get_mut(session) {
+                    sched.on_ack(entity, tick, provisional);
+                }
                 stats.diff_acks += 1;
                 if !provisional {
                     stats.durable_diff_acks += 1;
@@ -1168,7 +1210,9 @@ impl Rig<'_> {
                 tick,
                 reason,
             } => {
-                sched.on_nack(entity, tick);
+                if let Some(sched) = schedulers.get_mut(session) {
+                    sched.on_nack(entity, tick);
+                }
                 tracing::debug!(session, ?entity, ?tick, reason, "bulk nack");
             }
             GatewayReply::IntentAck { intent_id, outcome } => {
@@ -1383,6 +1427,22 @@ mod tests {
     }
 
     #[test]
+    fn scheduler_shards_give_every_session_its_own_budget() {
+        // Regression for the P2 rig throughput bug: the fan-out calculation
+        // counted 125 independent session budgets, while the driver had only
+        // one scheduler and round-robined its output. Every scheduler must
+        // own a balanced disjoint entity set.
+        let inventory = synthetic_inventory(10_000, 128);
+        let schedulers = scheduler_shards(&inventory, 125, 2.0);
+        assert_eq!(schedulers.len(), 125);
+        assert!(schedulers.iter().all(|scheduler| scheduler.len() == 80));
+        assert_eq!(
+            schedulers.iter().map(UplinkScheduler::len).sum::<usize>(),
+            10_000
+        );
+    }
+
+    #[test]
     fn intent_mix_parse_and_bounds() {
         // The mix parser must reject sums > 1 (a mix is a *fraction of* the
         // diff rate) and non-numeric/out-of-range entries. The pairs below
@@ -1453,7 +1513,7 @@ mod tests {
             ack_log: None,
             pending_diffs: HashMap::new(),
         };
-        let mut sched = UplinkScheduler::new();
+        let mut sched = vec![UplinkScheduler::new()];
         let mut intents = IntentQueue::new(1024);
         let mut stats = RunStats::default();
         let mut area_pending = vec![Some(Instant::now())];
@@ -1530,7 +1590,7 @@ mod tests {
             ack_log: Some(AckLog::open(&path).unwrap()),
             pending_diffs,
         };
-        let mut sched = UplinkScheduler::new();
+        let mut sched = vec![UplinkScheduler::new()];
         let mut intents = IntentQueue::new(1024);
         let mut stats = RunStats::default();
         let mut area_pending = vec![None];
