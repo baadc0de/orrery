@@ -76,10 +76,16 @@ async fn grpc_batch_ack_and_restart_probe_are_durable() {
         Lsn::new(0, 154)
     );
     assert_eq!(
+        server.sessions_opened(),
+        1,
+        "append must reuse the open stream"
+    );
+    assert_eq!(
         transport.follower_watermark().await,
         Some(Lsn::new(0, 154)),
         "watermark call must perform a fresh reconnect probe"
     );
+    assert_eq!(server.sessions_opened(), 2);
     drop(transport);
     server.shutdown().await;
     journal.close().await.unwrap();
@@ -105,6 +111,73 @@ async fn grpc_batch_ack_and_restart_probe_are_durable() {
             .len(),
         4
     );
+    drop(transport);
+    server.shutdown().await;
+    journal.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn stream_loss_opens_one_fresh_session_and_resumes_from_remote_progress() {
+    let dir = tempfile::tempdir().unwrap();
+    let journal = Arc::new(Journal::open(&config(dir.path())).unwrap());
+    let server = spawn_chain_grpc(
+        "127.0.0.1:0".parse().unwrap(),
+        Arc::clone(&journal),
+        chain(),
+    )
+    .await
+    .unwrap();
+    let transport = GrpcChainTransport::connect(server.addr(), chain())
+        .await
+        .unwrap();
+    transport.append(record(10)).await.unwrap();
+    assert_eq!(server.sessions_opened(), 1);
+
+    server.close_connections().await;
+    assert_eq!(transport.append(record(82)).await.unwrap(), Lsn::new(0, 82));
+    assert_eq!(server.sessions_opened(), 2);
+    assert_eq!(
+        journal
+            .scan_from(Lsn::new(0, 0))
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+            .len(),
+        2
+    );
+
+    drop(transport);
+    server.shutdown().await;
+    journal.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn durable_append_lost_ack_replays_without_duplicate_record() {
+    let dir = tempfile::tempdir().unwrap();
+    let journal = Arc::new(Journal::open(&config(dir.path())).unwrap());
+    let server = spawn_chain_grpc(
+        "127.0.0.1:0".parse().unwrap(),
+        Arc::clone(&journal),
+        chain(),
+    )
+    .await
+    .unwrap();
+    let transport = GrpcChainTransport::connect(server.addr(), chain())
+        .await
+        .unwrap();
+
+    server.fail_next_ack();
+    assert_eq!(transport.append(record(10)).await.unwrap(), Lsn::new(0, 10));
+    assert_eq!(server.sessions_opened(), 2);
+    assert_eq!(
+        journal
+            .scan_from(Lsn::new(0, 0))
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+            .len(),
+        1,
+        "ambiguous append must be recovered by durable watermark, not duplicated"
+    );
+
     drop(transport);
     server.shutdown().await;
     journal.close().await.unwrap();

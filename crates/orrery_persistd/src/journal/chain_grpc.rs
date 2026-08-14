@@ -5,17 +5,27 @@
 //! indexed by `(chain, origin_lsn)` with batch provenance, so restart recovery
 //! scans only that chain and can distinguish a complete contiguous prefix from
 //! an append whose cursor update was interrupted.
+//!
+//! One bounded bidirectional gRPC stream carries the open handshake, ordered
+//! batches, and durable acknowledgements for a connection session. Closure,
+//! cancellation, any send/receive error, or a mismatched response permanently
+//! invalidates that stream. Reconnect drops both halves, chooses a fresh nonce,
+//! and obtains a reconstructed remote watermark before any replay. No sender
+//! task is detached, so dropping a transport also cancels its request stream.
 
 use std::collections::BTreeMap;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use bytes::{Buf, BufMut};
+use futures::{SinkExt, Stream};
 use hyper_util::client::legacy::{connect::HttpConnector, Client};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto;
 use prost::encoding::{self as pb, DecodeContext, WireType};
 use prost::{DecodeError, Message};
-use tokio::sync::Mutex;
+use tokio::sync::{broadcast, Mutex};
 use tonic::codec::{BufferSettings, Codec, DecodeBuf, Decoder, EncodeBuf, Encoder};
 use tonic::codegen::{http, Body, BoxFuture, Service, StdError};
 use tonic::{Request, Response, Status};
@@ -25,8 +35,7 @@ use orrery_protocol::{JournalRecord, Lsn, NodeId};
 use crate::journal::{ChainTransport, Journal, JournalError};
 
 const SERVICE_NAME: &str = "orrery.persistd.chain.v1.ChainReplication";
-const APPEND_PATH: &str = "/orrery.persistd.chain.v1.ChainReplication/AppendBatch";
-const RECONNECT_PATH: &str = "/orrery.persistd.chain.v1.ChainReplication/Reconnect";
+const STREAM_PATH: &str = "/orrery.persistd.chain.v1.ChainReplication/Replicate";
 type GrpcClient = Client<HttpConnector, tonic::body::Body>;
 
 #[derive(Debug, Clone, Default)]
@@ -139,6 +148,25 @@ struct ProgressReply {
     batch_seq: u64,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+enum RequestFrame {
+    Open(ReconnectRequest),
+    Append(AppendBatchRequest),
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct StreamRequest {
+    frame: Option<RequestFrame>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct StreamReply {
+    chain: Option<WireChainId>,
+    session_nonce: Vec<u8>,
+    opened: bool,
+    progress: Option<ProgressReply>,
+}
+
 macro_rules! postcard_message {
     ($ty:ty) => {
         impl Message for $ty {
@@ -181,6 +209,8 @@ macro_rules! postcard_message {
 postcard_message!(AppendBatchRequest);
 postcard_message!(ReconnectRequest);
 postcard_message!(ProgressReply);
+postcard_message!(StreamRequest);
+postcard_message!(StreamReply);
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct RecordProvenance {
@@ -320,6 +350,8 @@ struct FollowerReplica {
     key: Vec<u8>,
     journal: Arc<Journal>,
     state: Mutex<FollowerState>,
+    sessions_opened: AtomicU64,
+    fail_next_ack: AtomicBool,
 }
 
 impl FollowerReplica {
@@ -341,6 +373,8 @@ impl FollowerReplica {
                 session_nonce: None,
                 cursor,
             }),
+            sessions_opened: AtomicU64::new(0),
+            fail_next_ack: AtomicBool::new(false),
         })
     }
 
@@ -368,12 +402,20 @@ impl FollowerReplica {
         state.cursor = rebuild_cursor(&self.journal, &self.key)
             .map_err(|e| Status::internal(format!("rebuild chain cursor: {e}")))?;
         state.session_nonce = Some(nonce);
+        self.sessions_opened.fetch_add(1, Ordering::Relaxed);
         let encoded = postcard::to_stdvec(&state.cursor)
             .map_err(|e| Status::internal(format!("encode chain cursor: {e}")))?;
         self.journal
             .set_chain_grpc_state(&self.key, &encoded)
             .map_err(|e| Status::internal(format!("persist chain cursor: {e}")))?;
         Ok(progress(state.cursor))
+    }
+
+    async fn close_session(&self, nonce: [u8; 16]) {
+        let mut state = self.state.lock().await;
+        if state.session_nonce == Some(nonce) {
+            state.session_nonce = None;
+        }
     }
 
     async fn append(&self, request: AppendBatchRequest) -> Result<ProgressReply, Status> {
@@ -492,34 +534,119 @@ impl FollowerReplica {
     }
 }
 
-#[async_trait::async_trait]
+type ReplyStream = Pin<Box<dyn Stream<Item = Result<StreamReply, Status>> + Send + 'static>>;
+
 trait ChainReplication: Send + Sync + 'static {
-    async fn append_batch(
-        &self,
-        request: Request<AppendBatchRequest>,
-    ) -> Result<Response<ProgressReply>, Status>;
-    async fn reconnect(
-        &self,
-        request: Request<ReconnectRequest>,
-    ) -> Result<Response<ProgressReply>, Status>;
+    fn replicate(
+        self: Arc<Self>,
+        request: Request<tonic::Streaming<StreamRequest>>,
+    ) -> Result<Response<ReplyStream>, Status>;
 }
 
-#[async_trait::async_trait]
 impl ChainReplication for FollowerReplica {
-    async fn append_batch(
-        &self,
-        request: Request<AppendBatchRequest>,
-    ) -> Result<Response<ProgressReply>, Status> {
-        self.append(request.into_inner()).await.map(Response::new)
-    }
+    fn replicate(
+        self: Arc<Self>,
+        request: Request<tonic::Streaming<StreamRequest>>,
+    ) -> Result<Response<ReplyStream>, Status> {
+        struct SessionStream {
+            incoming: tonic::Streaming<StreamRequest>,
+            replica: Arc<FollowerReplica>,
+            nonce: Option<[u8; 16]>,
+            terminal: bool,
+        }
 
-    async fn reconnect(
-        &self,
-        request: Request<ReconnectRequest>,
-    ) -> Result<Response<ProgressReply>, Status> {
-        self.reconnect(request.into_inner())
-            .await
-            .map(Response::new)
+        let stream = futures::stream::unfold(
+            SessionStream {
+                incoming: request.into_inner(),
+                replica: self,
+                nonce: None,
+                terminal: false,
+            },
+            |mut session| async move {
+                if session.terminal {
+                    return None;
+                }
+                let next = session.incoming.message().await;
+                let frame = match next {
+                    Ok(Some(request)) => request
+                        .frame
+                        .ok_or_else(|| Status::invalid_argument("missing stream frame")),
+                    Ok(None) => {
+                        if let Some(nonce) = session.nonce {
+                            session.replica.close_session(nonce).await;
+                        }
+                        return None;
+                    }
+                    Err(error) => {
+                        if let Some(nonce) = session.nonce.take() {
+                            session.replica.close_session(nonce).await;
+                        }
+                        session.terminal = true;
+                        return Some((Err(error), session));
+                    }
+                };
+
+                let reply = match frame {
+                    Ok(RequestFrame::Open(open)) if session.nonce.is_none() => {
+                        let nonce = FollowerReplica::nonce(&open.session_nonce);
+                        match nonce {
+                            Ok(nonce) => match session.replica.reconnect(open).await {
+                                Ok(progress) => {
+                                    session.nonce = Some(nonce);
+                                    Ok(StreamReply {
+                                        chain: Some(wire_chain(&session.replica.chain)),
+                                        session_nonce: nonce.to_vec(),
+                                        opened: true,
+                                        progress: Some(progress),
+                                    })
+                                }
+                                Err(error) => Err(error),
+                            },
+                            Err(error) => Err(error),
+                        }
+                    }
+                    Ok(RequestFrame::Open(_)) => {
+                        Err(Status::failed_precondition("session is already open"))
+                    }
+                    Ok(RequestFrame::Append(append)) => {
+                        let Some(nonce) = session.nonce else {
+                            return Some((
+                                Err(Status::failed_precondition(
+                                    "first stream frame must open the session",
+                                )),
+                                session,
+                            ));
+                        };
+                        match session.replica.append(append).await {
+                            Ok(progress) => {
+                                if session.replica.fail_next_ack.swap(false, Ordering::SeqCst) {
+                                    Err(Status::unavailable(
+                                        "injected stream loss after durable append",
+                                    ))
+                                } else {
+                                    Ok(StreamReply {
+                                        chain: Some(wire_chain(&session.replica.chain)),
+                                        session_nonce: nonce.to_vec(),
+                                        opened: false,
+                                        progress: Some(progress),
+                                    })
+                                }
+                            }
+                            Err(error) => Err(error),
+                        }
+                    }
+                    Err(error) => Err(error),
+                };
+                if reply.is_err() {
+                    if let Some(nonce) = session.nonce.take() {
+                        session.replica.close_session(nonce).await;
+                    }
+                    session.terminal = true;
+                }
+                Some((reply, session))
+            },
+        );
+        Ok(Response::new(Box::pin(stream)))
     }
 }
 
@@ -555,34 +682,23 @@ where
     fn call(&mut self, request: http::Request<B>) -> Self::Future {
         let inner = Arc::clone(&self.0);
         match request.uri().path() {
-            APPEND_PATH => {
+            STREAM_PATH => {
                 struct Method<T>(Arc<T>);
-                impl<T: ChainReplication> tonic::server::UnaryService<AppendBatchRequest> for Method<T> {
-                    type Response = ProgressReply;
-                    type Future = BoxFuture<Response<Self::Response>, Status>;
-                    fn call(&mut self, request: Request<AppendBatchRequest>) -> Self::Future {
+                impl<T: ChainReplication> tonic::server::StreamingService<StreamRequest> for Method<T> {
+                    type Response = StreamReply;
+                    type ResponseStream = ReplyStream;
+                    type Future = BoxFuture<Response<Self::ResponseStream>, Status>;
+                    fn call(
+                        &mut self,
+                        request: Request<tonic::Streaming<StreamRequest>>,
+                    ) -> Self::Future {
                         let inner = Arc::clone(&self.0);
-                        Box::pin(async move { inner.append_batch(request).await })
+                        Box::pin(async move { inner.replicate(request) })
                     }
                 }
                 Box::pin(async move {
                     let mut grpc = tonic::server::Grpc::new(ProstCodec::default());
-                    Ok(grpc.unary(Method(inner), request).await)
-                })
-            }
-            RECONNECT_PATH => {
-                struct Method<T>(Arc<T>);
-                impl<T: ChainReplication> tonic::server::UnaryService<ReconnectRequest> for Method<T> {
-                    type Response = ProgressReply;
-                    type Future = BoxFuture<Response<Self::Response>, Status>;
-                    fn call(&mut self, request: Request<ReconnectRequest>) -> Self::Future {
-                        let inner = Arc::clone(&self.0);
-                        Box::pin(async move { inner.reconnect(request).await })
-                    }
-                }
-                Box::pin(async move {
-                    let mut grpc = tonic::server::Grpc::new(ProstCodec::default());
-                    Ok(grpc.unary(Method(inner), request).await)
+                    Ok(grpc.streaming(Method(inner), request).await)
                 })
             }
             _ => Box::pin(async move {
@@ -614,11 +730,22 @@ where
 }
 
 /// Running follower gRPC endpoint.
-#[derive(Debug)]
 pub struct ChainGrpcServer {
     addr: std::net::SocketAddr,
     shutdown: Option<tokio::sync::oneshot::Sender<()>>,
+    close_connections: broadcast::Sender<Arc<tokio::sync::Barrier>>,
+    replica: Arc<FollowerReplica>,
     join: tokio::task::JoinHandle<()>,
+}
+
+impl std::fmt::Debug for ChainGrpcServer {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ChainGrpcServer")
+            .field("addr", &self.addr)
+            .field("sessions_opened", &self.sessions_opened())
+            .finish_non_exhaustive()
+    }
 }
 
 impl ChainGrpcServer {
@@ -628,7 +755,36 @@ impl ChainGrpcServer {
         self.addr
     }
 
-    /// Stop accepting connections.
+    /// Number of successfully opened stream sessions.
+    ///
+    /// This diagnostic is useful for asserting that batches reuse one live
+    /// stream and that failure recovery establishes exactly one replacement.
+    #[must_use]
+    pub fn sessions_opened(&self) -> u64 {
+        self.replica.sessions_opened.load(Ordering::Relaxed)
+    }
+
+    /// Deterministically close all current HTTP/2 connections while continuing
+    /// to accept reconnects. Every stream on those connections becomes unusable.
+    pub async fn close_connections(&self) {
+        let barrier = Arc::new(tokio::sync::Barrier::new(
+            self.close_connections.receiver_count() + 1,
+        ));
+        if self.close_connections.send(Arc::clone(&barrier)).is_ok() {
+            barrier.wait().await;
+        }
+    }
+
+    /// Test hook: fail the next response after its batch is durably appended.
+    ///
+    /// The resulting replay exercises the ambiguous durable-before-ACK case.
+    #[doc(hidden)]
+    pub fn fail_next_ack(&self) {
+        self.replica.fail_next_ack.store(true, Ordering::SeqCst);
+    }
+
+    /// Stop accepting connections, cancel all live streams, and await every
+    /// connection task so shutdown leaves no detached senders or servers.
     pub async fn shutdown(mut self) {
         if let Some(tx) = self.shutdown.take() {
             let _ = tx.send(());
@@ -647,10 +803,14 @@ pub async fn spawn_chain_grpc(
     let addr = listener.local_addr()?;
     let replica =
         FollowerReplica::load(chain, journal).map_err(|e| std::io::Error::other(e.to_string()))?;
-    let service = ChainService(Arc::new(replica));
+    let replica = Arc::new(replica);
+    let service = ChainService(Arc::clone(&replica));
     let (shutdown, mut stopped) = tokio::sync::oneshot::channel();
+    let (close_connections, _) = broadcast::channel::<Arc<tokio::sync::Barrier>>(1);
+    let close_for_server = close_connections.clone();
     let join = tokio::spawn(async move {
         let builder = auto::Builder::new(TokioExecutor::new()).http2_only();
+        let mut connections = tokio::task::JoinSet::new();
         loop {
             tokio::select! {
                 _ = &mut stopped => break,
@@ -658,16 +818,31 @@ pub async fn spawn_chain_grpc(
                     let Ok((stream, _)) = accepted else { break };
                     let service = service.clone();
                     let builder = builder.clone();
-                    tokio::spawn(async move {
-                        let _ = builder.serve_connection(TokioIo::new(stream), service).await;
+                    let mut close = close_for_server.subscribe();
+                    connections.spawn(async move {
+                        tokio::select! {
+                            result = builder.serve_connection(TokioIo::new(stream), service) => {
+                                let _ = result;
+                            }
+                            result = close.recv() => {
+                                if let Ok(barrier) = result {
+                                    barrier.wait().await;
+                                }
+                            }
+                        }
                     });
                 }
+                Some(_) = connections.join_next(), if !connections.is_empty() => {}
             }
         }
+        connections.abort_all();
+        while connections.join_next().await.is_some() {}
     });
     Ok(ChainGrpcServer {
         addr,
         shutdown: Some(shutdown),
+        close_connections,
+        replica,
         join,
     })
 }
@@ -684,13 +859,19 @@ pub struct GrpcChainTransport {
 #[derive(Debug)]
 struct ClientState {
     client: GrpcClient,
-    nonce: [u8; 16],
+    live: Option<LiveStream>,
     next_batch: u64,
     watermark: Option<Lsn>,
 }
 
+#[derive(Debug)]
+struct LiveStream {
+    nonce: [u8; 16],
+    requests: futures::channel::mpsc::Sender<StreamRequest>,
+    replies: tonic::Streaming<StreamReply>,
+}
+
 fn fresh_nonce() -> [u8; 16] {
-    use std::sync::atomic::{AtomicU64, Ordering};
     static NEXT: AtomicU64 = AtomicU64::new(1);
     let mut nonce = [0; 16];
     nonce[..8].copy_from_slice(&NEXT.fetch_add(1, Ordering::Relaxed).to_be_bytes());
@@ -710,32 +891,6 @@ fn build_client() -> GrpcClient {
         .build(HttpConnector::new())
 }
 
-async fn unary<Req, Resp>(
-    client: GrpcClient,
-    addr: std::net::SocketAddr,
-    path: &'static str,
-    request: Req,
-) -> Result<Resp, Status>
-where
-    Req: Message + Default + Send + 'static,
-    Resp: Message + Default + Send + 'static,
-{
-    let origin = format!("http://{addr}")
-        .parse::<http::Uri>()
-        .map_err(|e| Status::invalid_argument(format!("gRPC origin: {e}")))?;
-    let mut grpc = tonic::client::Grpc::with_origin(client, origin);
-    grpc.ready()
-        .await
-        .map_err(|e| Status::unavailable(format!("gRPC transport: {e}")))?;
-    grpc.unary(
-        Request::new(request),
-        http::uri::PathAndQuery::from_static(path),
-        ProstCodec::default(),
-    )
-    .await
-    .map(Response::into_inner)
-}
-
 impl GrpcChainTransport {
     /// Connect and perform a fresh remote recovery probe.
     pub async fn connect(
@@ -747,7 +902,7 @@ impl GrpcChainTransport {
             chain,
             inner: Mutex::new(ClientState {
                 client: build_client(),
-                nonce: fresh_nonce(),
+                live: None,
                 next_batch: 0,
                 watermark: None,
             }),
@@ -756,29 +911,114 @@ impl GrpcChainTransport {
         Ok(transport)
     }
 
-    /// Start a fresh session and return the follower's reconstructed progress.
+    /// Drop the current stream, start a fresh session, and return the follower's
+    /// remotely reconstructed progress. Cached client progress is never used as
+    /// a successful recovery probe.
     pub async fn reconnect(&self) -> Result<Option<Lsn>, JournalError> {
         let mut state = self.inner.lock().await;
         self.probe_locked(&mut state).await
     }
 
     async fn probe_locked(&self, state: &mut ClientState) -> Result<Option<Lsn>, JournalError> {
-        state.nonce = fresh_nonce();
-        let reply: ProgressReply = unary(
-            state.client.clone(),
-            self.addr,
-            RECONNECT_PATH,
-            ReconnectRequest {
-                chain: Some(wire_chain(&self.chain)),
-                session_nonce: state.nonce.to_vec(),
-            },
-        )
-        .await
-        .map_err(|e| JournalError::Store(format!("gRPC reconnect: {e}")))?;
-        let (batch, watermark) = decode_progress(reply);
+        state.live = None;
+        let nonce = fresh_nonce();
+        let (mut requests, incoming) = futures::channel::mpsc::channel(1);
+        requests
+            .try_send(StreamRequest {
+                frame: Some(RequestFrame::Open(ReconnectRequest {
+                    chain: Some(wire_chain(&self.chain)),
+                    session_nonce: nonce.to_vec(),
+                })),
+            })
+            .map_err(|e| JournalError::Store(format!("queue gRPC open handshake: {e}")))?;
+
+        let origin = format!("http://{}", self.addr)
+            .parse::<http::Uri>()
+            .map_err(|e| JournalError::Store(format!("gRPC origin: {e}")))?;
+        let mut grpc = tonic::client::Grpc::with_origin(state.client.clone(), origin);
+        grpc.ready()
+            .await
+            .map_err(|e| JournalError::Store(format!("gRPC transport: {e}")))?;
+        let replies = grpc
+            .streaming(
+                Request::new(incoming),
+                http::uri::PathAndQuery::from_static(STREAM_PATH),
+                ProstCodec::default(),
+            )
+            .await
+            .map(Response::into_inner)
+            .map_err(|e| JournalError::Store(format!("gRPC open stream: {e}")))?;
+        let mut live = LiveStream {
+            nonce,
+            requests,
+            replies,
+        };
+        let reply = live
+            .replies
+            .message()
+            .await
+            .map_err(|e| JournalError::Store(format!("gRPC recovery probe: {e}")))?
+            .ok_or_else(|| {
+                JournalError::Store("gRPC stream closed during recovery probe".into())
+            })?;
+        let (batch, watermark) = decode_progress(self.validate_reply(&live, reply, true)?);
+        if state
+            .watermark
+            .is_some_and(|previous| watermark.is_none_or(|remote| remote < previous))
+        {
+            return Err(JournalError::Store(
+                "follower watermark regressed during reconnect".into(),
+            ));
+        }
         state.next_batch = batch.map_or(0, |value| value + 1);
         state.watermark = watermark;
+        state.live = Some(live);
         Ok(watermark)
+    }
+
+    fn validate_reply(
+        &self,
+        live: &LiveStream,
+        reply: StreamReply,
+        opened: bool,
+    ) -> Result<ProgressReply, JournalError> {
+        let chain = decode_chain(reply.chain)
+            .map_err(|e| JournalError::Store(format!("gRPC response identity: {e}")))?;
+        if chain != self.chain
+            || reply.session_nonce.as_slice() != live.nonce
+            || reply.opened != opened
+        {
+            return Err(JournalError::Store(
+                "stale or mismatched gRPC stream response".into(),
+            ));
+        }
+        reply
+            .progress
+            .ok_or_else(|| JournalError::Store("gRPC response omitted progress".into()))
+    }
+
+    async fn send_batch_locked(
+        &self,
+        state: &mut ClientState,
+        request: AppendBatchRequest,
+    ) -> Result<ProgressReply, JournalError> {
+        let live = state
+            .live
+            .as_mut()
+            .ok_or_else(|| JournalError::Store("gRPC chain stream is not open".into()))?;
+        live.requests
+            .send(StreamRequest {
+                frame: Some(RequestFrame::Append(request)),
+            })
+            .await
+            .map_err(|e| JournalError::Store(format!("gRPC append send: {e}")))?;
+        let reply = live
+            .replies
+            .message()
+            .await
+            .map_err(|e| JournalError::Store(format!("gRPC append receive: {e}")))?
+            .ok_or_else(|| JournalError::Store("gRPC stream closed before durable ACK".into()))?;
+        self.validate_reply(live, reply, false)
     }
 
     /// Send one ordered batch and await its durable follower acknowledgement.
@@ -799,7 +1039,12 @@ impl GrpcChainTransport {
         let attempted_batch = state.next_batch;
         let make_request = |state: &ClientState| AppendBatchRequest {
             chain: Some(wire_chain(&self.chain)),
-            session_nonce: state.nonce.to_vec(),
+            session_nonce: state
+                .live
+                .as_ref()
+                .expect("connected transport has a live stream")
+                .nonce
+                .to_vec(),
             batch_seq: attempted_batch,
             predecessor: state.watermark.map(|value| WireLsn {
                 segment: value.segment,
@@ -815,16 +1060,12 @@ impl GrpcChainTransport {
             }),
             records: encoded.clone(),
         };
-        let first: Result<ProgressReply, Status> = unary(
-            state.client.clone(),
-            self.addr,
-            APPEND_PATH,
-            make_request(&state),
-        )
-        .await;
+        let request = make_request(&state);
+        let first = self.send_batch_locked(&mut state, request).await;
         let reply = match first {
             Ok(reply) => reply,
             Err(error) => {
+                state.live = None;
                 tracing::debug!(%error, "chain append failed; probing follower before retry");
                 self.probe_locked(&mut state).await?;
                 if state.next_batch == attempted_batch + 1 && state.watermark == Some(last) {
@@ -835,18 +1076,19 @@ impl GrpcChainTransport {
                         "follower progress changed incompatibly during retry".into(),
                     ));
                 }
-                unary(
-                    state.client.clone(),
-                    self.addr,
-                    APPEND_PATH,
-                    make_request(&state),
-                )
-                .await
-                .map_err(|e| JournalError::Store(format!("gRPC append retry: {e}")))?
+                let request = make_request(&state);
+                match self.send_batch_locked(&mut state, request).await {
+                    Ok(reply) => reply,
+                    Err(error) => {
+                        state.live = None;
+                        return Err(JournalError::Store(format!("gRPC append retry: {error}")));
+                    }
+                }
             }
         };
         let (batch, watermark) = decode_progress(reply);
         if batch != Some(state.next_batch) || watermark != Some(last) {
+            state.live = None;
             return Err(JournalError::Store(
                 "follower returned inconsistent progress".into(),
             ));
@@ -1166,6 +1408,50 @@ mod tests {
         let (stale, current) = tokio::join!(stale, current);
         assert!(stale.is_err());
         assert!(current.is_ok());
+        assert_eq!(
+            replica.state.lock().await.cursor.watermark,
+            Some(Lsn::new(0, 10))
+        );
+        journal.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn reconnect_rejects_stale_session_and_identity_frames_without_progress() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = Arc::new(Journal::open(&config(dir.path())).unwrap());
+        let id = chain(1, 9, 1, 1);
+        let replica = FollowerReplica::load(id.clone(), Arc::clone(&journal)).unwrap();
+        let stale = [8; 16];
+        let current = [9; 16];
+        replica
+            .reconnect(reconnect_request(&id, stale))
+            .await
+            .unwrap();
+        replica
+            .reconnect(reconnect_request(&id, current))
+            .await
+            .unwrap();
+
+        assert!(replica
+            .append(batch_request(&id, stale, 0, None, &[record(10, 1)]))
+            .await
+            .is_err());
+        assert!(replica
+            .append(batch_request(
+                &chain(1, 9, 2, 1),
+                current,
+                0,
+                None,
+                &[record(10, 1)],
+            ))
+            .await
+            .is_err());
+        assert_eq!(replica.state.lock().await.cursor, Cursor::default());
+
+        replica
+            .append(batch_request(&id, current, 0, None, &[record(10, 1)]))
+            .await
+            .unwrap();
         assert_eq!(
             replica.state.lock().await.cursor.watermark,
             Some(Lsn::new(0, 10))
