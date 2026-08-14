@@ -1564,6 +1564,63 @@ mod tests {
     }
 
     #[test]
+    fn cold_profile_is_rate_limited_and_reaches_two_hz_after_warmup() {
+        // Reproduce the load driver's registration, queue, flush, and ack
+        // flow with a deterministic clock. A fresh UplinkScheduler starts
+        // with zero credit, so an entity's first 2 Hz send is one 500 ms
+        // interval after its phased registration. That makes a cold 30 s run
+        // contain 59 sends/entity (590k for the P2 population), not 600k.
+        // Thereafter every entity sends exactly twice in every one-second
+        // window; in particular this catches a future accidental 20 Hz
+        // queue/flush coupling.
+        let entities = 1_000_usize;
+        let sessions = 13;
+        let inventory = synthetic_inventory(entities as u64, 100);
+        let mut schedulers = scheduler_shards(&inventory, sessions, 2.0);
+        let cfg = PersistClientConfig {
+            flush_budget_bytes: FLUSH_BUDGET_BYTES,
+            ..PersistClientConfig::default()
+        };
+        let phase_slots = registration_phase_slots(2.0);
+        let frame = Duration::from_secs_f64(1.0 / FLUSH_HZ as f64);
+        let mut sent_per_second = [0_usize; 30];
+        let mut total = 0_usize;
+
+        for frame_index in 0..(30 * FLUSH_HZ) {
+            for (index, placement) in inventory.iter().enumerate() {
+                if frame_index < registration_phase(index, sessions, phase_slots) {
+                    continue;
+                }
+                let tick = frame_index;
+                schedulers[scheduler_shard(index, sessions)].queue(DiffUplink {
+                    cell: moved_cell(placement, tick),
+                    grid: GridId::ROOT,
+                    entity: placement.entity,
+                    tick: Tick::new(tick),
+                    kind: RecordKind::ComponentDiff,
+                    payload: synthetic_payload(placement.entity, tick, 64),
+                    seq: tick,
+                });
+            }
+
+            let elapsed = frame * frame_index as u32;
+            for scheduler in &mut schedulers {
+                for diff in scheduler.flush(&cfg, elapsed) {
+                    total += 1;
+                    sent_per_second[(frame_index / FLUSH_HZ) as usize] += 1;
+                    scheduler.on_ack(diff.entity, diff.tick, false);
+                }
+            }
+        }
+
+        assert_eq!(total, entities * (30 * 2 - 1));
+        assert_eq!(sent_per_second[0], entities);
+        assert!(sent_per_second[1..]
+            .iter()
+            .all(|&count| count == entities * 2));
+    }
+
+    #[test]
     fn registration_phases_remain_balanced_for_non_divisible_profiles() {
         // A small arbitrary workload exercises the ceiling phase count used
         // for rates such as 3 Hz, where a rate interval is not an integral
