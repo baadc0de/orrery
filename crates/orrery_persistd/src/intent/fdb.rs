@@ -26,8 +26,6 @@
 //! [`IntentError::ContentionExhausted`], which the gateway maps to a
 //! definitive `Rejected` refusal.
 
-#![allow(unsafe_code)] // `foundationdb::boot()` is the one unsafe call, gated behind the `fdb` feature.
-
 use std::sync::Arc;
 
 use foundationdb::options::MutationType;
@@ -36,6 +34,7 @@ use foundationdb::{Database, FdbBindingError};
 use orrery_protocol::{AccountId, AssetId, GridId, Intent, IntentOutcome, PersistId};
 
 use crate::keyspace;
+use crate::FdbContext;
 
 use super::{IntentError, IntentExecutor};
 
@@ -50,18 +49,6 @@ const NOT_COMMITTED: i32 = 1020;
 /// default **1 h**, swept by the checkpoint GC pass).
 const INTENT_ROW_RETENTION_MS: u64 = 60 * 60 * 1000;
 
-/// Boot the FDB network once per process (the C API allows exactly one boot
-/// per process; the checkpoint store keeps its own copy of this helper).
-fn fdb_network() {
-    static ONCE: std::sync::Once = std::sync::Once::new();
-    ONCE.call_once(|| {
-        // SAFETY: boot() is called exactly once per process (Once), and the
-        // returned guard is leaked so the network outlives every use.
-        let guard = unsafe { foundationdb::boot() };
-        std::mem::forget(guard);
-    });
-}
-
 /// An FDB-backed intent executor.
 ///
 /// The grid scopes the `pid/next` counter the executor mints from
@@ -73,16 +60,27 @@ pub struct FdbIntentExecutor {
 }
 
 impl FdbIntentExecutor {
+    /// Build an executor using a process-scoped FDB context.
+    #[must_use]
+    pub fn from_context(context: &FdbContext, grid: GridId) -> Self {
+        Self::from_database(context.database(), grid)
+    }
+
+    /// Build an executor from an already-open database handle.
+    #[must_use]
+    pub fn from_database(db: Arc<Database>, grid: GridId) -> Self {
+        Self { db, grid }
+    }
+
     /// Connect to the cluster at `cluster_file`, minting ids from `grid`'s
     /// `pid/next` counter.
+    ///
+    /// Prefer constructing one [`FdbContext`] and using [`Self::from_context`]
+    /// when a process needs more than one FDB-backed adapter.
     pub fn connect(cluster_file: &str, grid: GridId) -> Result<Self, IntentError> {
-        fdb_network();
-        let db = Database::from_path(cluster_file)
-            .map_err(|e| IntentError::Store(format!("connect: {e}")))?;
-        Ok(Self {
-            db: Arc::new(db),
-            grid,
-        })
+        let context =
+            FdbContext::connect(cluster_file).map_err(|e| IntentError::Store(e.to_string()))?;
+        Ok(Self::from_context(&context, grid))
     }
 
     /// The underlying database handle, for tests that need to read rows back.

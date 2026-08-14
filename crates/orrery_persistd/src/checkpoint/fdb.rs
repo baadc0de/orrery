@@ -1,5 +1,3 @@
-#![allow(unsafe_code)] // `foundationdb::boot()` is the one unsafe call, gated behind the `fdb` feature.
-
 //! FoundationDB-backed checkpoint store (`fdb` feature, D11 §6, §5).
 //!
 //! Maps the checkpoint keyspace onto FDB as specified in docs/08-persistence.md
@@ -46,6 +44,7 @@ use futures::TryStreamExt;
 use orrery_protocol::{CellId, Epoch, GridId, Lsn, PersistId};
 
 use crate::keyspace;
+use crate::FdbContext;
 
 use crate::actor::{EntityRecord, SnapshotPage, Tombstone};
 use crate::checkpoint::{CheckpointData, CheckpointError, CheckpointStore, ColdCellReader};
@@ -74,33 +73,6 @@ impl From<&CheckpointData> for CheckpointMeta {
             taken_at_ms: data.taken_at_ms,
         }
     }
-}
-
-/// Boot the FoundationDB network once per process and leak the stop guard.
-///
-/// The FDB C API can only be initialized once per process (docs §5). We boot on
-/// first use and intentionally leak the [`NetworkAutoStop`] so the network stays
-/// alive for the process lifetime; the OS reclaims it at exit. Safe because this
-/// is only ever called once (guarded by `OnceLock`).
-///
-/// **This is the one boot for the whole process.** `foundationdb::boot()`
-/// selects the client API version, which the C client permits exactly once per
-/// process — so every crate in the workspace that opens a `Database` must call
-/// *this* function rather than booting again. A second boot panics with "the
-/// fdb select api version can only be run once per process" and poisons the
-/// guard, which then surfaces as "Once instance has previously been poisoned"
-/// in every later caller.
-pub fn fdb_network() -> Result<(), CheckpointError> {
-    static ONCE: std::sync::Once = std::sync::Once::new();
-    // `foundationdb::boot()` panics on failure, so once we get here the network
-    // is up. We leak the guard so the network lives for the process lifetime.
-    ONCE.call_once(|| {
-        // SAFETY: boot() is called exactly once per process (Once), and the
-        // returned guard is leaked so the network outlives every use.
-        let guard = unsafe { foundationdb::boot() };
-        std::mem::forget(guard);
-    });
-    Ok(())
 }
 
 /// Scan the `world/` rows of `shard`'s subtree in `grid`, rebuilding the entity
@@ -186,12 +158,28 @@ pub struct FdbCheckpointStore {
 }
 
 impl FdbCheckpointStore {
+    /// Build a checkpoint store using a process-scoped FDB context.
+    #[must_use]
+    pub fn from_context(context: &FdbContext) -> Self {
+        Self {
+            db: context.database(),
+        }
+    }
+
+    /// Build a checkpoint store from an already-open database handle.
+    #[must_use]
+    pub fn from_database(db: Arc<Database>) -> Self {
+        Self { db }
+    }
+
     /// Connect to the cluster at `cluster_file`.
+    ///
+    /// Prefer constructing one [`FdbContext`] and using [`Self::from_context`]
+    /// when a process needs more than one FDB-backed adapter.
     pub fn connect(cluster_file: &str) -> Result<Self, CheckpointError> {
-        fdb_network()?;
-        let db = Database::from_path(cluster_file)
-            .map_err(|e| CheckpointError::Store(format!("connect: {e}")))?;
-        Ok(Self { db: Arc::new(db) })
+        let context =
+            FdbContext::connect(cluster_file).map_err(|e| CheckpointError::Store(e.to_string()))?;
+        Ok(Self::from_context(&context))
     }
 }
 

@@ -38,12 +38,12 @@ use orrery_persistd::cluster::{ColdFallbackRouter, Router};
 use orrery_persistd::journal::{
     spawn_chain, spawn_chain_grpc, AdaptiveCommitMode, ChainConfig, GroupCommitConfig, Journal,
 };
-#[cfg(feature = "fdb")]
-use orrery_persistd::FdbIntentExecutor;
 use orrery_persistd::{
     CellRuntime, CheckpointScheduler, DurableChainId, FenceStore, GatewayConfig, GatewayServer,
     GrpcChainTransport, IntentExecutor, JournalConfig, MemCheckpointStore, RuntimeConfig,
 };
+#[cfg(feature = "fdb")]
+use orrery_persistd::{FdbContext, FdbIntentExecutor};
 use orrery_protocol::{CellId, Epoch, GridId};
 
 type SharedExecutor = Arc<dyn IntentExecutor>;
@@ -117,6 +117,15 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // ── FoundationDB stores (optional) ──────────────────────────────────
+    // The FDB client network can boot only once per process. Keep one context
+    // and pass its database handle to fence, checkpoint, and intent adapters.
+    #[cfg(feature = "fdb")]
+    let fdb_context = cli
+        .fdb_cluster_file
+        .as_ref()
+        .map(|path| FdbContext::connect(&path.display().to_string()))
+        .transpose()?;
+
     // The fence store gates the single runtime against the same durable rows.
     // When no FDB cluster file is given we fall back to in-memory stores
     // (MemFenceStore, MemCheckpointStore) which are not durable across process
@@ -124,8 +133,11 @@ async fn main() -> anyhow::Result<()> {
     let fence_store: Arc<dyn FenceStore> = if let Some(ref cluster_file) = cli.fdb_cluster_file {
         #[cfg(feature = "fdb")]
         {
-            let path = cluster_file.display().to_string();
-            Arc::new(orrery_persistd::fence::FdbFenceStore::connect(&path)?)
+            let _ = cluster_file;
+            let context = fdb_context
+                .as_ref()
+                .expect("FDB context exists when --fdb-cluster-file is set");
+            Arc::new(orrery_persistd::fence::FdbFenceStore::from_context(context))
         }
         #[cfg(not(feature = "fdb"))]
         {
@@ -150,8 +162,11 @@ async fn main() -> anyhow::Result<()> {
     if let Some(ref cluster_file) = cli.fdb_cluster_file {
         #[cfg(feature = "fdb")]
         {
-            let path = cluster_file.display().to_string();
-            let store = orrery_persistd::checkpoint::FdbCheckpointStore::connect(&path)?;
+            let _ = cluster_file;
+            let context = fdb_context
+                .as_ref()
+                .expect("FDB context exists when --fdb-cluster-file is set");
+            let store = orrery_persistd::checkpoint::FdbCheckpointStore::from_context(context);
             let store = Arc::new(store);
             let cold: Arc<dyn orrery_persistd::checkpoint::ColdCellReader> =
                 Arc::clone(&store) as Arc<dyn orrery_persistd::checkpoint::ColdCellReader>;
@@ -258,8 +273,11 @@ async fn main() -> anyhow::Result<()> {
         gateway_config(&cli, secret_key, |cluster_file, grid| {
             #[cfg(feature = "fdb")]
             {
-                let path = cluster_file.display().to_string();
-                let exec = FdbIntentExecutor::connect(&path, grid)?;
+                let _ = cluster_file;
+                let context = fdb_context
+                    .as_ref()
+                    .expect("FDB context exists when --fdb-cluster-file is set");
+                let exec = FdbIntentExecutor::from_context(context, grid);
                 Ok(Some(Arc::new(exec) as SharedExecutor))
             }
             #[cfg(not(feature = "fdb"))]

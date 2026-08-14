@@ -28,6 +28,8 @@ pub mod actor;
 pub mod checkpoint;
 pub mod cluster;
 mod crc;
+#[cfg(feature = "fdb")]
+pub mod fdb;
 pub mod fence;
 pub mod gateway;
 pub mod intent;
@@ -42,6 +44,8 @@ pub use checkpoint::{
     CheckpointScheduler, CheckpointStore, ColdCellReader, MemCheckpointStore, QuiesceSignal,
 };
 pub use cluster::{Cluster, ColdFallbackRouter, Router};
+#[cfg(feature = "fdb")]
+pub use fdb::{FdbContext, FdbContextError};
 pub use fence::{FenceError, FenceOutcome, FenceRow, FenceStatus, FenceStore, MemFenceStore};
 pub use gateway::{GatewayConfig, GatewayError, GatewayServer, GATEWAY_ALPN};
 #[cfg(feature = "fdb")]

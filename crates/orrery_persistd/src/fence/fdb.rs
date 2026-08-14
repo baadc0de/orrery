@@ -1,5 +1,3 @@
-#![allow(unsafe_code)] // `foundationdb::boot()` is the one unsafe call, gated behind the `fdb` feature.
-
 //! FoundationDB-backed fence store (`fdb` feature, D11 §6, §3.4/§3.5).
 //!
 //! Maps the `actor/{grid}/{shard}` keyspace onto FDB as specified in
@@ -21,25 +19,7 @@ use orrery_protocol::{CellId, GridId};
 
 use crate::fence::{FenceError, FenceOutcome, FenceRow, FenceStatus, FenceStore};
 use crate::keyspace;
-
-/// Boot the FoundationDB network once per process and leak the stop guard.
-///
-/// The FDB C API can only be initialized once per process (docs §5). We boot on
-/// first use and intentionally leak the [`NetworkAutoStop`] so the network stays
-/// alive for the process lifetime; the OS reclaims it at exit. Safe because this
-/// is only ever called once (guarded by `OnceLock`).
-fn fdb_network() -> Result<(), FenceError> {
-    static ONCE: std::sync::Once = std::sync::Once::new();
-    // `foundationdb::boot()` panics on failure, so once we get here the network
-    // is up. We leak the guard so the network lives for the process lifetime.
-    ONCE.call_once(|| {
-        // SAFETY: boot() is called exactly once per process (Once), and the
-        // returned guard is leaked so the network outlives every use.
-        let guard = unsafe { foundationdb::boot() };
-        std::mem::forget(guard);
-    });
-    Ok(())
-}
+use crate::FdbContext;
 
 /// Encode a fence row (postcard, matching the in-memory store's wire format).
 fn encode_row(row: &FenceRow) -> Result<Vec<u8>, FenceError> {
@@ -57,12 +37,28 @@ pub struct FdbFenceStore {
 }
 
 impl FdbFenceStore {
+    /// Build a fence store using a process-scoped FDB context.
+    #[must_use]
+    pub fn from_context(context: &FdbContext) -> Self {
+        Self {
+            db: context.database(),
+        }
+    }
+
+    /// Build a fence store from an already-open database handle.
+    #[must_use]
+    pub fn from_database(db: Arc<Database>) -> Self {
+        Self { db }
+    }
+
     /// Connect to the cluster at `cluster_file`.
+    ///
+    /// Prefer constructing one [`FdbContext`] and using [`Self::from_context`]
+    /// when a process needs more than one FDB-backed adapter.
     pub fn connect(cluster_file: &str) -> Result<Self, FenceError> {
-        fdb_network()?;
-        let db = Database::from_path(cluster_file)
-            .map_err(|e| FenceError::Store(format!("connect: {e}")))?;
-        Ok(Self { db: Arc::new(db) })
+        let context =
+            FdbContext::connect(cluster_file).map_err(|e| FenceError::Store(e.to_string()))?;
+        Ok(Self::from_context(&context))
     }
 }
 

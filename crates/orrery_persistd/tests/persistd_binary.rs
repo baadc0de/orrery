@@ -12,6 +12,8 @@ use bytes::Bytes;
 use iroh::endpoint::{presets::N0, Builder};
 use iroh::RelayMode;
 use orrery_persistd::journal::{AdaptiveCommitMode, GroupCommitConfig};
+#[cfg(feature = "fdb")]
+use orrery_persistd::{FdbContext, FenceStore};
 use orrery_persistd::{Journal, JournalConfig, GATEWAY_ALPN};
 use orrery_protocol::channels::{decode_datagram, encode_datagram, encode_stream_frame};
 use orrery_protocol::{
@@ -147,6 +149,61 @@ fn run_persistd_exit(args: &[&str]) -> (std::process::ExitStatus, String) {
         output.status,
         String::from_utf8(output.stderr).expect("stderr is utf-8"),
     )
+}
+
+/// Locate the optional workspace development cluster, with an environment
+/// override for CI. Presence alone is not sufficient: the FDB readiness test
+/// below performs a transaction before spawning the binary.
+#[cfg(feature = "fdb")]
+fn fdb_cluster_file() -> Option<std::path::PathBuf> {
+    if let Ok(path) = std::env::var("ORRERY_FDB_CLUSTER_FILE") {
+        return Some(path.into());
+    }
+    let mut dir = std::env::current_dir().ok()?;
+    loop {
+        let candidate = dir.join(".fdb-dev/fdb.cluster");
+        if candidate.exists() {
+            return Some(candidate);
+        }
+        if !dir.pop() {
+            return None;
+        }
+    }
+}
+
+/// The fdb-enabled binary must reach its JSON readiness line after building
+/// fence, checkpoint, and intent adapters from one process-scoped context.
+///
+/// This is a process-level regression for the former multiple-`boot()` panic.
+/// It skips only when no local cluster is configured or reachable.
+#[cfg(feature = "fdb")]
+#[tokio::test]
+async fn fdb_binary_reaches_readiness_with_shared_context() {
+    let Some(cluster) = fdb_cluster_file() else {
+        eprintln!("skipping: ORRERY_FDB_CLUSTER_FILE not set and no .fdb-dev/fdb.cluster");
+        return;
+    };
+    let cluster_string = cluster.display().to_string();
+    let Ok(context) = FdbContext::connect(&cluster_string) else {
+        eprintln!("skipping: unable to open FDB cluster file");
+        return;
+    };
+    let store = orrery_persistd::fence::FdbFenceStore::from_context(&context);
+    if store.read(GridId::ROOT, CellId::ROOT).await.is_err() {
+        eprintln!("skipping: FDB cluster is not reachable");
+        return;
+    }
+
+    let args = vec![
+        "--bind".to_string(),
+        "127.0.0.1:0".to_string(),
+        "--fdb-cluster-file".to_string(),
+        cluster_string,
+    ];
+    let (_dir, mut child, ready) = spawn_persistd(&args);
+    assert_eq!(ready["role"], "single");
+    assert!(ready["endpoint_addr"].is_string());
+    stop(&mut child);
 }
 
 #[test]
