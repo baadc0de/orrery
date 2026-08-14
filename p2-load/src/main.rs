@@ -1068,7 +1068,13 @@ impl AckLog {
         // acks".
         match serde_json::to_string(record) {
             Ok(line) => {
-                if let Err(e) = writeln!(self.writer, "{line}").and_then(|()| self.writer.flush()) {
+                // The load loop is also the gateway receive loop. Flushing
+                // every acknowledgement makes the evidence log a synchronous
+                // disk operation per packet, manufacturing tail latency at
+                // the 20k/s P2 rate. `BufWriter` preserves order and flushes
+                // when this cleanly-completing load process is dropped before
+                // the separate recovery verifier reads the file.
+                if let Err(e) = writeln!(self.writer, "{line}") {
                     tracing::warn!(error = %e, "ack-log write failed");
                 }
             }
