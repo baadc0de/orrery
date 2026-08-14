@@ -96,6 +96,13 @@ Some machines carry a local protocol for delegating work to other coding agents.
 It is **not** part of this repository — like `.agents/memory/`, it is git-ignored
 and machine-specific, and most checkouts will not have it.
 
+**Codex-to-Codex exception.** When a Codex agent delegates to another Codex
+agent, do not use the `cx` tool or this device-local protocol. Use Codex-native
+subagents, tasks, and workflows instead. This exception takes precedence over
+the delegation instructions below. Still use `sccache` and Git worktrees when
+they are appropriate to the task; this exception only bypasses the `cx` tool
+and protocol.
+
 **If `.agents/protocol.md` exists, read it before delegating any task**; it is
 authoritative for how work is handed off on that machine. It typically defines
 a driver under `.agents/bin/`, a worktree-per-task layout, a document bus for
