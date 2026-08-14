@@ -323,7 +323,9 @@ async fn main() -> anyhow::Result<()> {
                 .chain_id_at(source_epoch)
                 .expect("promotion has a source chain identity"),
         )?;
-        let cutoff = history.watermark().map(|lsn| format!("{lsn:?}"));
+        let cutoff = history
+            .watermark()
+            .map(|lsn| format!("{}:{}", lsn.segment, lsn.offset));
         journal.close().await?;
         cutoff
     } else {
@@ -381,7 +383,10 @@ async fn main() -> anyhow::Result<()> {
     // Chain replication is intentionally downstream of the journal ack path.
     // The transport is lazy: an unavailable follower marks the chain degraded
     // but never prevents the primary from serving local durable writes.
-    let chain_replicator = if let Some(chain) = topology.chain_id() {
+    let chain_replicator = if matches!(topology.role, TopologyRole::Primary { .. }) {
+        let chain = topology
+            .chain_id()
+            .expect("primary topology always has a chain identity");
         let follower = topology
             .follower()
             .expect("only primary topologies have a chain id")

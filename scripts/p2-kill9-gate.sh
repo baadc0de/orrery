@@ -52,7 +52,7 @@ chain_port=${P2_GATE_CHAIN_PORT:-7778}
 zombie_port=${P2_GATE_ZOMBIE_PORT:-7779}
 [[ $gateway_port =~ ^[0-9]+$ && $chain_port =~ ^[0-9]+$ && $zombie_port =~ ^[0-9]+$ ]] || die 'ports must be numeric'
 secret_primary=${P2_GATE_PRIMARY_SECRET_KEY:-000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f}
-secret_follower=${P2_GATE_FOLLOWER_SECRET_KEY:-101112131415161718191a1b1c1d1e1f000102030405060708090a0b0c0d0e}
+secret_follower=${P2_GATE_FOLLOWER_SECRET_KEY:-101112131415161718191a1b1c1d1e1f000102030405060708090a0b0c0d0e0f}
 duration=${P2_GATE_DURATION_SECS:-30}
 entities=${P2_GATE_ENTITIES:-10000}
 cells=${P2_GATE_CELLS:-128}
@@ -70,7 +70,7 @@ trap cleanup EXIT
 
 wait_json() {
   local file=$1 pid=$2 label=$3
-  for _ in $(seq 1 300); do
+  for _ in $(seq 1 1200); do
     [[ -s $file ]] && return 0
     kill -0 "$pid" 2>/dev/null || die "$label exited before readiness; see ${file%.json}.stderr"
     sleep .1
@@ -110,7 +110,7 @@ start_promoted_follower() {
   # The follower process was passive and is deliberately stopped before
   # promotion: the promoted instance adopts the same on-disk mirror.
   kill -TERM "$follower_pid"; wait "$follower_pid" || true; follower_pid=''
-  "$PERSISTD_BIN" --node-id 2 --chain-epoch 1 --chain-primary 1 --promote-from 1 \
+  "$PERSISTD_BIN" --node-id 2 --chain-epoch 2 --chain-primary 1 --promote-from 1 \
     --chain-listen "127.0.0.1:$chain_port" --bind "127.0.0.1:$gateway_port" \
     --dir "$out/follower-data" --secret-key "$secret_follower" \
     --fdb-cluster-file "$ORRERY_FDB_CLUSTER_FILE" --metrics-jsonl "$out/promoted-metrics.jsonl" \
