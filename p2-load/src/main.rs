@@ -49,14 +49,13 @@ use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::net::SocketAddr;
 use std::path::Path;
 use std::process::ExitCode;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use bytes::Bytes;
 use clap::Parser;
-use futures::FutureExt;
 use iroh::endpoint::Connection;
 use iroh::{Endpoint, EndpointAddr, SecretKey};
 use serde::{Deserialize, Serialize};
@@ -64,7 +63,7 @@ use serde::{Deserialize, Serialize};
 use orrery_persist_client::config::PersistClientConfig;
 use orrery_persist_client::latency::LatencyHistogram;
 use orrery_persist_client::{IntentQueue, UplinkScheduler};
-use orrery_protocol::channels::{encode_datagram, encode_stream_frame, untag, Channel};
+use orrery_protocol::channels::{Channel, encode_datagram, encode_stream_frame, untag};
 use orrery_protocol::{
     Attestation, CellId, DiffUplink, Epoch, GatewayMsg, GatewayReply, GridId, Intent, IntentOp,
     IntentOutcome, NodeId, PersistId, RecordKind, Tick,
@@ -72,8 +71,8 @@ use orrery_protocol::{
 
 use cli::Cli;
 use evidence::{
-    compare_recovery, AckRecord, DiffEvidence, IntentOutcomeEvidence, RecoveredDiff,
-    RecoveredEvidence,
+    AckRecord, DiffEvidence, IntentOutcomeEvidence, RecoveredDiff, RecoveredEvidence,
+    compare_recovery,
 };
 use telemetry::{RunContext, TelemetrySink};
 
@@ -95,6 +94,12 @@ const FLUSH_HZ: u64 = 20;
 /// these slots to make the load generator measure append latency rather than
 /// an artificial client-side burst.
 const SESSION_FLUSH_PHASE_SLOTS: usize = 20;
+
+/// After the send window closes, keep receiving for a short bounded interval
+/// so replies already in flight are represented in the latency gate. Ten
+/// times the D16 bulk target is enough to expose a backlog without turning a
+/// failed gateway into an unbounded test hang.
+const FINAL_REPLY_DRAIN: Duration = Duration::from_millis(50);
 
 /// The per-session flush byte budget, = the D16 client default
 /// (`PersistClientConfig::flush_budget_bytes`, 1024). One session sustains
@@ -640,6 +645,18 @@ fn registration_phase(index: usize, sessions: usize, phase_slots: usize) -> u64 
     ((index / sessions) % phase_slots) as u64
 }
 
+/// Whether an entity's phased registration has begun. Once begun, the caller
+/// allocates a successor only when its scheduler no longer has a pending diff
+/// (that is, after the preceding durable reply).
+fn registration_is_due(
+    index: usize,
+    sessions: usize,
+    phase_slots: usize,
+    flush_index: u64,
+) -> bool {
+    flush_index >= registration_phase(index, sessions, phase_slots)
+}
+
 /// The intra-frame flush phase for a connection-local scheduler.
 ///
 /// Round-robin assignment keeps the number of sessions (and therefore the
@@ -674,6 +691,19 @@ fn aggregate_bulk_latency(schedulers: &[UplinkScheduler]) -> LatencyHistogram {
         combined.merge(scheduler.ack_latency());
     }
     combined
+}
+
+fn check_bulk_reply_coverage(sampled: u64, stats: &RunStats) -> Result<()> {
+    let expected = stats.durable_diff_acks + stats.diff_nacks;
+    if sampled != expected {
+        bail!(
+            "bulk latency coverage incomplete after {} ms drain: sampled {} of {} durable ack/nack replies",
+            FINAL_REPLY_DRAIN.as_millis(),
+            sampled,
+            expected
+        );
+    }
+    Ok(())
 }
 
 /// Bind the rig-local iroh endpoint (relay disabled — the rig is
@@ -758,23 +788,62 @@ async fn dial(endpoint: &Endpoint, addr: SocketAddr, gateway: NodeId) -> Result<
     Ok(conn)
 }
 
-/// Non-blocking receive: `None` when no datagram is queued. The load loop
-/// must never await the network — a blocked receive would starve the 20 Hz
-/// flush clock and inflate the very latencies the rig measures. Errors are
-/// reported as `Some(Err(..))` so the caller can log and drop the session.
-///
-/// Implemented as a zero-duration timeout around the read: a ready datagram
-/// resolves immediately, a pending one yields `Elapsed`. This needs no
-/// `futures` dep and no unsafe pinning.
-fn try_recv_datagram(conn: &Connection) -> Option<Result<Bytes, String>> {
-    match tokio::runtime::Handle::try_current() {
-        Ok(_) => match conn.read_datagram().now_or_never() {
-            Some(Ok(pkt)) => Some(Ok(pkt)),
-            Some(Err(e)) => Some(Err(e.to_string())),
-            None => None,
-        },
-        Err(_) => None,
-    }
+#[derive(Debug)]
+enum InboundEvent {
+    Datagram {
+        session: usize,
+        packet: Bytes,
+        received_at: Instant,
+    },
+    Closed {
+        session: usize,
+        error: String,
+    },
+}
+
+/// Give every connection a dedicated receive future. The timestamp is taken
+/// immediately after QUIC yields the datagram, before the load loop scans
+/// other sessions, allocates payloads, or writes evidence.
+fn spawn_receivers(
+    sessions: &[Connection],
+) -> (
+    tokio::sync::mpsc::UnboundedReceiver<InboundEvent>,
+    Vec<tokio::task::JoinHandle<()>>,
+) {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let tasks = sessions
+        .iter()
+        .cloned()
+        .enumerate()
+        .map(|(session, conn)| {
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                loop {
+                    match conn.read_datagram().await {
+                        Ok(packet) => {
+                            let event = InboundEvent::Datagram {
+                                session,
+                                packet,
+                                received_at: Instant::now(),
+                            };
+                            if tx.send(event).is_err() {
+                                break;
+                            }
+                        }
+                        Err(error) => {
+                            let _ = tx.send(InboundEvent::Closed {
+                                session,
+                                error: error.to_string(),
+                            });
+                            break;
+                        }
+                    }
+                }
+            })
+        })
+        .collect();
+    drop(tx);
+    (rx, tasks)
 }
 
 /// Send one `GatewayMsg` on the packet lane. Bulk diffs are tagged datagrams;
@@ -1092,6 +1161,7 @@ struct RunStats {
     diff_acks: u64,
     durable_diff_acks: u64,
     provisional_diff_acks: u64,
+    diff_nacks: u64,
     intents_sent: u64,
     intent_acks: u64,
 }
@@ -1139,6 +1209,7 @@ impl Rig<'_> {
         let tick = Arc::new(AtomicU64::new(0));
         let mut stats = RunStats::default();
         let sink = TelemetrySink::new();
+        let (mut inbound, receiver_tasks) = spawn_receivers(&self.sessions);
 
         // Area load: one 27-cell subscribe per session at startup, measuring
         // time-to-first-page per session (D16: area first page-in < 50 ms).
@@ -1171,26 +1242,10 @@ impl Rig<'_> {
             .collect::<Vec<_>>();
 
         while start.elapsed() < self.duration {
-            // ── Receive: drain every pending datagram on every session ──
-            // Collect first (borrowing the sessions), then handle (borrowing
-            // self mutably): the two borrows cannot overlap in one loop.
-            let mut inbox: Vec<(usize, Bytes)> = Vec::new();
-            for (i, conn) in self.sessions.iter().enumerate() {
-                loop {
-                    match try_recv_datagram(conn) {
-                        Some(Ok(pkt)) => inbox.push((i, pkt)),
-                        Some(Err(e)) => {
-                            tracing::warn!(session = i, error = %e, "gateway read failed");
-                            break;
-                        }
-                        None => break,
-                    }
-                }
-            }
-            for (i, pkt) in inbox {
-                self.handle_reply(
-                    i,
-                    &pkt,
+            // ── Receive: drain replies already timestamped by receiver tasks
+            while let Ok(event) = inbound.try_recv() {
+                self.handle_inbound(
+                    event,
                     &mut schedulers,
                     &mut intents,
                     &mut stats,
@@ -1204,20 +1259,22 @@ impl Rig<'_> {
             // on that owner's next 20 Hz flush. The actual scheduler flushes
             // below are connection-phased: a frame is not a 125-session burst.
             if Instant::now() >= next_queue {
-                // Compute each entity's current cell from its trajectory and
-                // queue a fresh diff (newest-wins replaces the pending one).
-                // Registrations are deliberately phased during the first
-                // rate interval. Once an entity has joined, it is refreshed
-                // every flush; its UplinkScheduler accumulator preserves the
-                // assigned phase and exact configured rate.
+                // Allocate payloads only for this frame's rate cohort. A
+                // cohort is refreshed once per configured send interval,
+                // immediately before the scheduler can spend its next credit.
+                // This preserves trajectory ticks and session budgets while
+                // avoiding 10x throwaway payload construction at 2 Hz.
                 let flush_index = tick.load(Ordering::Relaxed);
                 for (index, p) in self.inventory.iter().enumerate() {
-                    if flush_index < registration_phase(index, sessions, phase_slots) {
+                    let shard = scheduler_shard(index, sessions);
+                    if !registration_is_due(index, sessions, phase_slots, flush_index)
+                        || schedulers[shard].has_pending(p.entity)
+                    {
                         continue;
                     }
                     let tick_now = flush_index;
                     let cell = moved_cell(p, tick_now);
-                    schedulers[scheduler_shard(index, sessions)].queue(DiffUplink {
+                    schedulers[shard].queue(DiffUplink {
                         cell,
                         grid: GridId::ROOT,
                         entity: p.entity,
@@ -1304,12 +1361,36 @@ impl Rig<'_> {
             elapsed = start.elapsed();
         }
 
-        // Final drain.
+        // Stop sending, then collect replies already in flight for a bounded
+        // interval. This makes latency coverage explicit without allowing a
+        // dead gateway to hang the gate.
+        let drain_deadline = tokio::time::Instant::now() + FINAL_REPLY_DRAIN;
+        loop {
+            let remaining = drain_deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            match tokio::time::timeout(remaining, inbound.recv()).await {
+                Ok(Some(event)) => self.handle_inbound(
+                    event,
+                    &mut schedulers,
+                    &mut intents,
+                    &mut stats,
+                    &mut area_pending,
+                ),
+                Ok(None) | Err(_) => break,
+            }
+        }
+        for task in receiver_tasks {
+            task.abort();
+        }
+
         if self.emit_json {
             let bulk_latency = aggregate_bulk_latency(&schedulers);
             sink.drain_histogram(telemetry::SERIES_BULK_ACK, &bulk_latency);
             sink.drain_histogram(telemetry::SERIES_INTENT_COMMIT, intents.intent_latency());
         }
+        check_bulk_reply_coverage(aggregate_bulk_latency(&schedulers).total(), &stats)?;
         tracing::info!(
             diffs = stats.diffs_sent,
             acks = stats.diff_acks,
@@ -1324,12 +1405,41 @@ impl Rig<'_> {
         Ok(stats)
     }
 
+    fn handle_inbound(
+        &mut self,
+        event: InboundEvent,
+        schedulers: &mut [UplinkScheduler],
+        intents: &mut IntentQueue,
+        stats: &mut RunStats,
+        area_pending: &mut [Option<Instant>],
+    ) {
+        match event {
+            InboundEvent::Datagram {
+                session,
+                packet,
+                received_at,
+            } => self.handle_reply(
+                session,
+                &packet,
+                received_at,
+                schedulers,
+                intents,
+                stats,
+                area_pending,
+            ),
+            InboundEvent::Closed { session, error } => {
+                tracing::warn!(session, error, "gateway read failed");
+            }
+        }
+    }
+
     /// Handle one inbound datagram from session `i`.
     #[allow(clippy::too_many_arguments)]
     fn handle_reply(
         &mut self,
         session: usize,
         pkt: &[u8],
+        received_at: Instant,
         schedulers: &mut [UplinkScheduler],
         intents: &mut IntentQueue,
         stats: &mut RunStats,
@@ -1354,7 +1464,7 @@ impl Rig<'_> {
                 provisional,
             } => {
                 if let Some(sched) = schedulers.get_mut(session) {
-                    sched.on_ack(entity, tick, provisional);
+                    sched.on_ack_at(entity, tick, provisional, received_at);
                 }
                 stats.diff_acks += 1;
                 if !provisional {
@@ -1380,8 +1490,9 @@ impl Rig<'_> {
                 reason,
             } => {
                 if let Some(sched) = schedulers.get_mut(session) {
-                    sched.on_nack(entity, tick);
+                    sched.on_nack_at(entity, tick, received_at);
                 }
+                stats.diff_nacks += 1;
                 tracing::debug!(session, ?entity, ?tick, reason, "bulk nack");
             }
             GatewayReply::IntentAck { intent_id, outcome } => {
@@ -1407,7 +1518,7 @@ impl Rig<'_> {
             }
             GatewayReply::AreaPage { .. } => {
                 if let Some(t0) = area_pending.get_mut(session).and_then(|s| s.take()) {
-                    let dt = t0.elapsed();
+                    let dt = received_at.checked_duration_since(t0).unwrap_or_default();
                     if self.cli.json {
                         telemetry::sample(telemetry::SERIES_AREA_FIRST_PAGE, dt.as_micros() as u64);
                     }
@@ -1673,14 +1784,19 @@ mod tests {
         let frame = Duration::from_secs_f64(1.0 / FLUSH_HZ as f64);
         let mut sent_per_second = [0_usize; 30];
         let mut total = 0_usize;
+        let mut payloads_allocated = 0_usize;
 
         for frame_index in 0..(30 * FLUSH_HZ) {
             for (index, placement) in inventory.iter().enumerate() {
-                if frame_index < registration_phase(index, sessions, phase_slots) {
+                let shard = scheduler_shard(index, sessions);
+                if !registration_is_due(index, sessions, phase_slots, frame_index)
+                    || schedulers[shard].has_pending(placement.entity)
+                {
                     continue;
                 }
+                payloads_allocated += 1;
                 let tick = frame_index;
-                schedulers[scheduler_shard(index, sessions)].queue(DiffUplink {
+                schedulers[shard].queue(DiffUplink {
                     cell: moved_cell(placement, tick),
                     grid: GridId::ROOT,
                     entity: placement.entity,
@@ -1702,10 +1818,20 @@ mod tests {
         }
 
         assert_eq!(total, entities * (30 * 2 - 1));
+        assert!(
+            (total..=total + entities).contains(&payloads_allocated),
+            "allocations ({payloads_allocated}) must track sends ({total}) plus at most one pending cohort"
+        );
+        assert!(
+            payloads_allocated < entities * 30 * FLUSH_HZ as usize / 9,
+            "generator regressed toward allocating every entity every frame"
+        );
         assert_eq!(sent_per_second[0], entities);
-        assert!(sent_per_second[1..]
-            .iter()
-            .all(|&count| count == entities * 2));
+        assert!(
+            sent_per_second[1..]
+                .iter()
+                .all(|&count| count == entities * 2)
+        );
     }
 
     #[test]
@@ -1731,6 +1857,18 @@ mod tests {
             let max = *counts.iter().max().unwrap();
             assert!(max - min <= 1, "unbalanced phase cohorts: {counts:?}");
         }
+    }
+
+    #[test]
+    fn final_drain_requires_complete_durable_reply_coverage() {
+        let stats = RunStats {
+            durable_diff_acks: 2,
+            diff_nacks: 1,
+            ..RunStats::default()
+        };
+        assert!(check_bulk_reply_coverage(3, &stats).is_ok());
+        let error = check_bulk_reply_coverage(2, &stats).unwrap_err();
+        assert!(format!("{error:#}").contains("sampled 2 of 3"));
     }
 
     #[test]
@@ -1875,6 +2013,7 @@ mod tests {
         rig.handle_reply(
             0,
             &encode_stream_frame(&reply),
+            Instant::now(),
             &mut sched,
             &mut intents,
             &mut stats,
@@ -1955,6 +2094,7 @@ mod tests {
         rig.handle_reply(
             0,
             &encode_datagram(&reply),
+            Instant::now(),
             &mut sched,
             &mut intents,
             &mut stats,

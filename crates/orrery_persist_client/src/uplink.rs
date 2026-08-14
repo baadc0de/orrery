@@ -20,7 +20,7 @@
 //! latest send instant, so a retransmission is not credited with the original
 //! send time.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::time::Duration;
 
 use bevy_ecs::prelude::*;
@@ -47,11 +47,16 @@ struct EntityState {
     last_acked_tick: Option<Tick>,
     /// The client-side sequence of the last sent diff.
     last_seq: u64,
-    /// The instant the currently-pending diff was last sent (for ack-latency
-    /// sampling). Updated on every resend so a retransmitted diff is not
-    /// credited with the original send time.
-    last_sent_at: Option<Instant>,
 }
+
+/// Upper bound on send timestamps retained by one scheduler shard. The P2
+/// profile has only 80 entities per shard; this leaves ample room for delayed
+/// replies while preventing an unavailable gateway from growing memory
+/// without bound.
+const MAX_IN_FLIGHT_SEND_TIMES: usize = 4_096;
+const MAX_SEND_ORDER_ENTRIES: usize = MAX_IN_FLIGHT_SEND_TIMES * 2;
+
+type SendKey = (PersistId, Tick);
 
 /// The per-entity diff uplink scheduler (D11 §2.1, docs/10-crates.md §9).
 ///
@@ -71,6 +76,14 @@ pub struct UplinkScheduler {
     last_elapsed: Option<Duration>,
     /// Bulk-ack latency histogram (D16: bulk ack p99 < 5 ms).
     ack_latency: LatencyHistogram,
+    /// Latest wire-send timestamp for every in-flight `(entity, tick)`.
+    ///
+    /// This is deliberately not stored in `EntityState`: a newly queued tick
+    /// may supersede the entity's pending diff before the older durable reply
+    /// arrives. Both replies still need latency samples.
+    sent_at: HashMap<SendKey, (Instant, u64)>,
+    sent_order: VecDeque<(SendKey, u64)>,
+    send_generation: u64,
 }
 
 impl UplinkScheduler {
@@ -91,7 +104,6 @@ impl UplinkScheduler {
             last_sent_tick: None,
             last_acked_tick: None,
             last_seq: 0,
-            last_sent_at: None,
         });
         entry.rate_hz = rate_hz;
     }
@@ -185,10 +197,15 @@ impl UplinkScheduler {
             state.last_sent_tick = Some(diff.tick);
             state.last_seq = diff.seq;
             state.acc = 0.0; // packed entities reset their accumulator (§5.2)
-                             // Record the send instant for ack-latency sampling. Updated on
-                             // every send (including resends) so a retransmitted diff is not
-                             // credited with the original send time.
-            state.last_sent_at = Some(now);
+            // Record the send instant for ack-latency sampling. Updated on
+            // every send (including resends) so a retransmitted diff is not
+            // credited with the original send time.
+            let key = (diff.entity, diff.tick);
+            self.send_generation = self.send_generation.wrapping_add(1);
+            let generation = self.send_generation;
+            self.sent_at.insert(key, (now, generation));
+            self.sent_order.push_back((key, generation));
+            self.prune_send_times();
             out.push(diff);
         }
 
@@ -206,16 +223,26 @@ impl UplinkScheduler {
     /// stamps the send instant on every send, a retransmitted diff is not
     /// credited with the original send time.
     pub fn on_ack(&mut self, entity: PersistId, tick: Tick, provisional: bool) {
+        self.on_ack_at(entity, tick, provisional, Instant::now());
+    }
+
+    /// Record a gateway ack using the instant at which its datagram was
+    /// received. Keeping receipt time separate from handler time prevents a
+    /// busy game/load loop from being counted as gateway latency.
+    pub fn on_ack_at(
+        &mut self,
+        entity: PersistId,
+        tick: Tick,
+        provisional: bool,
+        received_at: Instant,
+    ) {
         if provisional {
             return;
         }
+        self.record_reply_latency(entity, tick, received_at);
         if let Some(state) = self.entities.get_mut(&entity) {
             state.last_acked_tick = Some(tick);
             if state.pending.as_ref().is_some_and(|d| d.tick == tick) {
-                // Record ack-latency: time from the latest send to this ack.
-                if let Some(sent_at) = state.last_sent_at {
-                    self.ack_latency.record(sent_at.elapsed());
-                }
                 state.pending = None;
             }
         }
@@ -227,6 +254,12 @@ impl UplinkScheduler {
     /// gateway rejected it, so resending is pointless. The caller is expected
     /// to surface the rejection to the game.
     pub fn on_nack(&mut self, entity: PersistId, tick: Tick) {
+        self.on_nack_at(entity, tick, Instant::now());
+    }
+
+    /// Record a gateway nack using its wire-receipt instant.
+    pub fn on_nack_at(&mut self, entity: PersistId, tick: Tick, received_at: Instant) {
+        self.record_reply_latency(entity, tick, received_at);
         if let Some(state) = self.entities.get_mut(&entity) {
             if state.pending.as_ref().is_some_and(|d| d.tick == tick) {
                 state.pending = None;
@@ -250,6 +283,40 @@ impl UplinkScheduler {
     #[must_use]
     pub fn ack_latency(&self) -> &LatencyHistogram {
         &self.ack_latency
+    }
+
+    fn record_reply_latency(&mut self, entity: PersistId, tick: Tick, received_at: Instant) {
+        if let Some((sent_at, _)) = self.sent_at.remove(&(entity, tick)) {
+            self.ack_latency.record(
+                received_at
+                    .checked_duration_since(sent_at)
+                    .unwrap_or_default(),
+            );
+        }
+    }
+
+    fn prune_send_times(&mut self) {
+        while self.sent_at.len() > MAX_IN_FLIGHT_SEND_TIMES
+            || self.sent_order.len() > MAX_SEND_ORDER_ENTRIES
+        {
+            let Some((key, generation)) = self.sent_order.pop_front() else {
+                break;
+            };
+            if self
+                .sent_at
+                .get(&key)
+                .is_some_and(|(_, current)| *current == generation)
+            {
+                self.sent_at.remove(&key);
+            }
+        }
+        while self.sent_order.front().is_some_and(|(key, generation)| {
+            self.sent_at
+                .get(key)
+                .is_none_or(|(_, current)| current != generation)
+        }) {
+            self.sent_order.pop_front();
+        }
     }
 }
 
@@ -394,6 +461,46 @@ mod tests {
     }
 
     #[test]
+    fn older_ack_after_newer_tick_is_queued_still_records_latency() {
+        let cfg = cfg();
+        let mut sched = UplinkScheduler::new();
+        let entity = PersistId::new(1);
+        sched.register(entity, 4.0);
+        sched.queue(diff(1, 1, b"old"));
+        sched.flush(&cfg, t(0));
+        sched.flush(&cfg, t(250));
+
+        // Supersede the entity's pending state and send the newer tick before
+        // the older durable reply arrives.
+        sched.queue(diff(1, 2, b"new"));
+        sched.flush(&cfg, t(500));
+        sched.on_ack(entity, Tick::new(1), false);
+
+        assert_eq!(sched.ack_latency().total(), 1);
+        assert!(sched.has_pending(entity), "old ack must not clear tick 2");
+
+        sched.on_ack(entity, Tick::new(2), false);
+        assert_eq!(sched.ack_latency().total(), 2);
+        assert!(!sched.has_pending(entity));
+    }
+
+    #[test]
+    fn send_time_ledger_is_bounded() {
+        let mut cfg = cfg();
+        cfg.flush_budget_bytes = usize::MAX;
+        let mut sched = UplinkScheduler::new();
+        for entity in 0..(MAX_IN_FLIGHT_SEND_TIMES as u64 + 64) {
+            sched.register(PersistId::new(entity), 4.0);
+            sched.queue(diff(entity, 1, b"x"));
+        }
+        sched.flush(&cfg, t(0));
+        sched.flush(&cfg, t(250));
+
+        assert_eq!(sched.sent_at.len(), MAX_IN_FLIGHT_SEND_TIMES);
+        assert!(sched.sent_order.len() <= MAX_SEND_ORDER_ENTRIES);
+    }
+
+    #[test]
     fn byte_budget_limits_flush() {
         let mut cfg = cfg();
         cfg.flush_budget_bytes = 80; // ~one small diff
@@ -450,6 +557,27 @@ mod tests {
         assert_eq!(sched.ack_latency().total(), 1);
         // The sample should be a positive duration (the time from flush to ack).
         assert!(sched.ack_latency().min().unwrap() > Duration::ZERO);
+    }
+
+    #[test]
+    fn receipt_timestamp_excludes_delayed_handler_work() {
+        let cfg = cfg();
+        let mut sched = UplinkScheduler::new();
+        let entity = PersistId::new(1);
+        sched.register(entity, 4.0);
+        sched.queue(diff(1, 1, b"hp=50"));
+        sched.flush(&cfg, t(0));
+        sched.flush(&cfg, t(250));
+
+        let received_at = Instant::now();
+        std::thread::sleep(Duration::from_millis(20));
+        sched.on_ack_at(entity, Tick::new(1), false, received_at);
+
+        assert_eq!(sched.ack_latency().total(), 1);
+        assert!(
+            sched.ack_latency().max().unwrap() < Duration::from_millis(10),
+            "handler delay leaked into wire latency"
+        );
     }
 
     #[test]
