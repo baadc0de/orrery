@@ -521,6 +521,12 @@ impl FollowerReplica {
             ));
         }
 
+        // Stage every row before awaiting any commit.  The journal committer
+        // can therefore group the complete wire batch into one fsync window;
+        // importantly, the cursor remains unpublished until *all* staged rows
+        // are durable.  If a process dies between the two, rebuild_cursor sees
+        // the indexed prefix and the primary retries the same idempotent batch.
+        let mut commits = Vec::with_capacity(records.len());
         for (ordinal, record) in records.into_iter().enumerate() {
             let mut item = provenance.clone();
             item.ordinal = ordinal as u32;
@@ -531,11 +537,14 @@ impl FollowerReplica {
                 .append_replicated_indexed(record, &self.key, &encoded)
                 .map_err(|e| Status::internal(format!("append mirrored record: {e}")))?
             {
-                handle
-                    .committed()
-                    .await
-                    .map_err(|e| Status::internal(format!("commit mirrored record: {e}")))?;
+                commits.push(handle);
             }
+        }
+        for handle in commits {
+            handle
+                .committed()
+                .await
+                .map_err(|e| Status::internal(format!("commit mirrored record: {e}")))?;
         }
 
         state.cursor = Cursor {
@@ -1151,6 +1160,10 @@ impl ChainTransport for GrpcChainTransport {
         self.append_batch(vec![record]).await
     }
 
+    async fn append_batch(&self, records: Vec<JournalRecord>) -> Result<Lsn, JournalError> {
+        GrpcChainTransport::append_batch(self, records).await
+    }
+
     async fn follower_watermark(&self) -> Option<Lsn> {
         self.reconnect().await.ok().flatten()
     }
@@ -1312,6 +1325,48 @@ mod tests {
         let b = FollowerReplica::load(chain_b, Arc::clone(&journal)).unwrap();
         assert_eq!(a.state.lock().await.cursor.watermark, Some(Lsn::new(0, 10)));
         assert_eq!(b.state.lock().await.cursor.watermark, Some(Lsn::new(0, 20)));
+        journal.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn complete_wire_batch_persists_every_index_before_advancing_cursor() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = Arc::new(Journal::open(&config(dir.path())).unwrap());
+        let id = chain(1, 9, 1, 4);
+        let replica = FollowerReplica::load(id.clone(), Arc::clone(&journal)).unwrap();
+        let nonce = [12; 16];
+        replica
+            .reconnect(reconnect_request(&id, nonce))
+            .await
+            .unwrap();
+
+        let first = record(10, 1);
+        let second = record(journal.chain_grpc_successor(&first).offset, 2);
+        let third = record(journal.chain_grpc_successor(&second).offset, 3);
+        let records = [first, second, third];
+        let reply = replica
+            .append(batch_request(&id, nonce, 0, None, &records))
+            .await
+            .unwrap();
+        assert_eq!(decode_progress(reply).1, Some(records[2].lsn));
+        assert_eq!(
+            journal
+                .scan_from(Lsn::new(0, 0))
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+                .len(),
+            records.len()
+        );
+        let key = chain_key(&id).unwrap();
+        for (ordinal, record) in records.iter().enumerate() {
+            let provenance = journal
+                .chain_grpc_record(&key, record.lsn)
+                .unwrap()
+                .expect("cursor cannot advance before record provenance is durable");
+            let provenance: RecordProvenance = postcard::from_bytes(&provenance).unwrap();
+            assert_eq!(provenance.ordinal, ordinal as u32);
+            assert_eq!(provenance.batch_len, records.len() as u32);
+        }
         journal.close().await.unwrap();
     }
 

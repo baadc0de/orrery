@@ -121,6 +121,18 @@ pub trait ChainTransport: Send + Sync {
     /// watermark after this record (in the primary's LSN space).
     async fn append(&self, record: JournalRecord) -> Result<Lsn, JournalError>;
 
+    /// Push one contiguous ordered batch and return the durable watermark after
+    /// its final record.  Transports which have no wire-level batch primitive
+    /// retain the old per-record behaviour; the gRPC transport overrides this
+    /// so `ChainConfig::batch_max` is also an RPC batching bound.
+    async fn append_batch(&self, records: Vec<JournalRecord>) -> Result<Lsn, JournalError> {
+        let mut last = None;
+        for record in records {
+            last = Some(self.append(record).await?);
+        }
+        last.ok_or_else(|| JournalError::Store("cannot send empty chain batch".into()))
+    }
+
     /// The follower's durable watermark (highest primary LSN persisted on the
     /// follower), or `None` if unknown.
     async fn follower_watermark(&self) -> Option<Lsn>;
@@ -233,8 +245,13 @@ fn lag_alarm_bytes(lag_alarm: Duration) -> u64 {
 
 #[cfg(test)]
 mod lag_alarm_tests {
-    use super::lag_alarm_bytes;
+    use super::*;
+    use std::sync::Mutex;
     use std::time::Duration;
+
+    use orrery_protocol::{CellId, Epoch, GridId, PersistId, RecordKind, Tick};
+
+    use crate::journal::{AdaptiveCommitMode, GroupCommitConfig, JournalConfig};
 
     #[test]
     fn default_lag_window_never_collapses_to_a_per_record_alarm() {
@@ -242,6 +259,89 @@ mod lag_alarm_tests {
         // 100 ms of the P2 write envelope, rather than truncating to zero and
         // formatting a warning for every acknowledgement.
         assert_eq!(lag_alarm_bytes(Duration::from_millis(100)), 104_857);
+    }
+
+    struct BatchSpy {
+        batches: Mutex<Vec<Vec<Lsn>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ChainTransport for BatchSpy {
+        async fn append(&self, _record: JournalRecord) -> Result<Lsn, JournalError> {
+            unreachable!("the replicator must use append_batch")
+        }
+
+        async fn append_batch(&self, records: Vec<JournalRecord>) -> Result<Lsn, JournalError> {
+            let last = records.last().expect("non-empty batch").lsn;
+            self.batches
+                .lock()
+                .expect("batch spy lock")
+                .push(records.into_iter().map(|record| record.lsn).collect());
+            Ok(last)
+        }
+
+        async fn follower_watermark(&self) -> Option<Lsn> {
+            None
+        }
+    }
+
+    fn test_record(entity: u64) -> JournalRecord {
+        let payload = entity.to_le_bytes();
+        let author = iroh_base::SecretKey::from_bytes(&[7; 32]).public();
+        JournalRecord {
+            lsn: Lsn::new(0, 0),
+            cell: CellId::ROOT,
+            grid: GridId::ROOT,
+            entity: PersistId::new(entity),
+            tick: Tick::new(entity),
+            epoch: Epoch::new(0),
+            author,
+            kind: RecordKind::Spawn,
+            payload: bytes::Bytes::copy_from_slice(&payload),
+            crc: crate::payload_crc(&payload),
+        }
+    }
+
+    #[tokio::test]
+    async fn replicator_sends_collected_records_as_one_transport_batch() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = Arc::new(
+            Journal::open(&JournalConfig {
+                dir: dir.path().to_path_buf(),
+                commit: GroupCommitConfig {
+                    mode: AdaptiveCommitMode::AlwaysBatch,
+                    batch_window: Duration::from_millis(1),
+                    batch_max_records: 128,
+                    batch_max_bytes: 1 << 20,
+                },
+            })
+            .unwrap(),
+        );
+        for entity in 1..=3 {
+            journal.append(test_record(entity)).unwrap().committed().await.unwrap();
+        }
+        let transport = Arc::new(BatchSpy { batches: Mutex::new(Vec::new()) });
+        let replicator = spawn_chain(
+            Arc::clone(&journal),
+            Arc::clone(&transport) as Arc<dyn ChainTransport>,
+            &ChainConfig { follower: 9, batch_max: 3, ..ChainConfig::default() },
+        );
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if transport.batches.lock().expect("batch spy lock").len() == 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("replicator should flush the initial scan");
+        let batches = transport.batches.lock().expect("batch spy lock").clone();
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].len(), 3);
+        assert!(batches[0].windows(2).all(|pair| pair[0] < pair[1]));
+        replicator.shutdown().await;
+        journal.close().await.unwrap();
     }
 }
 
@@ -442,10 +542,10 @@ fn update_progress(
     }
 }
 
-/// Push one batch of records to the follower. `shutdown` races every append so
+/// Push one batch of records to the follower. `shutdown` races the batch RPC so
 /// a stalled transport cannot wedge [`ChainReplicator::shutdown`] forever. The
-/// append result is itself the follower's durable watermark, avoiding a second
-/// transport probe after every record.
+/// result is the follower's durable watermark after the entire batch, avoiding
+/// both a second probe and a per-record RPC on transports that support batching.
 #[allow(clippy::too_many_arguments)]
 async fn push_batch(
     journal: &Journal,
@@ -457,49 +557,33 @@ async fn push_batch(
     alarm_bytes: u64,
     follower: u64,
 ) -> PushOutcome {
-    let mut last = None;
-    for record in records {
-        if shutdown.armed() {
-            return PushOutcome {
-                last,
-                complete: false,
-            };
-        }
-        let pushed = tokio::select! {
-            r = transport.append(record.clone()) => r,
-            _ = shutdown.wake.notified() => {
-                return PushOutcome { last, complete: false };
-            }
-        };
-        match pushed {
-            Ok(durable) => {
-                if durable < record.lsn {
-                    tracing::warn!(
-                        follower,
-                        record_lsn = %record.lsn,
-                        durable_lsn = %durable,
-                        "chain: follower returned a regressed watermark"
-                    );
-                    return PushOutcome {
-                        last,
-                        complete: false,
-                    };
-                }
-                last = Some(durable);
-                update_progress(journal, wm, lag, alarm_bytes, follower, durable);
-            }
-            Err(e) => {
-                tracing::warn!(follower, ?e, "chain: follower append failed");
-                return PushOutcome {
-                    last,
-                    complete: false,
-                };
-            }
-        }
+    if shutdown.armed() {
+        return PushOutcome { last: None, complete: false };
     }
-    PushOutcome {
-        last,
-        complete: true,
+    let pushed = tokio::select! {
+        r = transport.append_batch(records.to_vec()) => r,
+        _ = shutdown.wake.notified() => {
+            return PushOutcome { last: None, complete: false };
+        }
+    };
+    match pushed {
+        Ok(durable) if durable >= records.last().expect("non-empty batch").lsn => {
+            update_progress(journal, wm, lag, alarm_bytes, follower, durable);
+            PushOutcome { last: Some(durable), complete: true }
+        }
+        Ok(durable) => {
+            tracing::warn!(
+                follower,
+                record_lsn = %records.last().expect("non-empty batch").lsn,
+                durable_lsn = %durable,
+                "chain: follower returned a regressed batch watermark"
+            );
+            PushOutcome { last: None, complete: false }
+        }
+        Err(error) => {
+            tracing::warn!(follower, ?error, "chain: follower batch append failed");
+            PushOutcome { last: None, complete: false }
+        }
     }
 }
 
