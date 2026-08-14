@@ -24,7 +24,14 @@ use tokio::time::Instant;
 
 use orrery_protocol::{JournalRecord, Lsn};
 
-use crate::journal::{AppendHandle, JournalError};
+use crate::journal::{AppendHandle, JournalCommitMetrics, JournalError, JournalStageSnapshot};
+
+/// Store-side portions of one successful durability flush.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct StoreCommitTimings {
+    pub(crate) fjall_batch_commit: Duration,
+    pub(crate) sync_data: Duration,
+}
 
 /// How the committer decides when to fsync.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -153,6 +160,7 @@ pub(crate) struct CommitterState {
     /// LSN 0 has crossed the durability boundary.
     committed: Mutex<Option<Lsn>>,
     flush_count: AtomicUsize,
+    metrics: Arc<JournalCommitMetrics>,
     /// Committed records, published for chain replication (§4). Subscribers
     /// that fall behind rescan the journal from their watermark, so a bounded
     /// channel here is a lag signal, not a loss.
@@ -228,7 +236,8 @@ impl CommitterHandle {
 
 /// Atomically stage a selected group and durably persist it. Runs on a
 /// blocking thread because both Fjall staging and `fdatasync` may block.
-pub(crate) type CommitFn = Arc<dyn Fn(&[Pending]) -> Result<(), JournalError> + Send + Sync>;
+pub(crate) type CommitFn =
+    Arc<dyn Fn(&[Pending]) -> Result<StoreCommitTimings, JournalError> + Send + Sync>;
 
 /// Start the group-commit committer task.
 ///
@@ -241,6 +250,7 @@ pub(crate) fn spawn_committer(
     commit: CommitFn,
     published: broadcast::Sender<JournalRecord>,
     recovered_committed: Option<Lsn>,
+    metrics: Arc<JournalCommitMetrics>,
 ) -> CommitterHandle {
     let state = Arc::new(CommitterState {
         config,
@@ -251,6 +261,7 @@ pub(crate) fn spawn_committer(
         flushing: AtomicBool::new(false),
         committed: Mutex::new(recovered_committed),
         flush_count: AtomicUsize::new(0),
+        metrics,
         published,
     });
 
@@ -335,15 +346,23 @@ async fn run_committer(state: Arc<CommitterState>, commit: CommitFn) {
             .map(|p| p.handle.lsn())
             .max()
             .expect("non-empty batch");
+        let records = u64::try_from(batch.len()).unwrap_or(u64::MAX);
+        let bytes = u64::try_from(batch.iter().map(|p| p.bytes).sum::<usize>()).unwrap_or(u64::MAX);
+        let queue_wait = batch
+            .iter()
+            .map(|p| p.arrived.elapsed())
+            .max()
+            .unwrap_or_default();
 
         state.flushing.store(true, Ordering::Release);
-        let (batch, result) = commit_inner(&commit, batch).await;
+        let (batch, blocking_dispatch, result) = commit_inner(&commit, batch).await;
         state.flushing.store(false, Ordering::Release);
 
         match result {
-            Ok(()) => {
+            Ok(store_timings) => {
                 state.flush_count.fetch_add(1, Ordering::AcqRel);
                 state.set_committed(max_lsn);
+                let resolve_started = std::time::Instant::now();
                 for p in batch {
                     // Publish for chain replication — except records that
                     // arrived via chain replication themselves (`!publish`),
@@ -357,6 +376,22 @@ async fn run_committer(state: Arc<CommitterState>, commit: CommitFn) {
                     }
                     p.handle.resolve(Ok(max_lsn));
                 }
+                let resolve = resolve_started.elapsed();
+                state.metrics.record_group(JournalStageSnapshot {
+                    flushes: 1,
+                    records,
+                    bytes,
+                    queue_wait_us_sum: duration_us(queue_wait),
+                    queue_wait_us_max: duration_us(queue_wait),
+                    blocking_dispatch_us_sum: duration_us(blocking_dispatch),
+                    blocking_dispatch_us_max: duration_us(blocking_dispatch),
+                    fjall_batch_commit_us_sum: duration_us(store_timings.fjall_batch_commit),
+                    fjall_batch_commit_us_max: duration_us(store_timings.fjall_batch_commit),
+                    sync_data_us_sum: duration_us(store_timings.sync_data),
+                    sync_data_us_max: duration_us(store_timings.sync_data),
+                    resolve_us_sum: duration_us(resolve),
+                    resolve_us_max: duration_us(resolve),
+                });
             }
             Err(e) => {
                 for p in batch {
@@ -377,12 +412,18 @@ impl CommitterState {
 async fn commit_inner(
     commit: &CommitFn,
     batch: Vec<Pending>,
-) -> (Vec<Pending>, Result<(), JournalError>) {
+) -> (
+    Vec<Pending>,
+    Duration,
+    Result<StoreCommitTimings, JournalError>,
+) {
     let commit = Arc::clone(commit);
+    let dispatched = std::time::Instant::now();
     tokio::task::spawn_blocking(move || {
+        let blocking_dispatch = dispatched.elapsed();
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| commit(&batch)))
             .unwrap_or_else(|_| Err(JournalError::Store("committer task panicked".into())));
-        (batch, result)
+        (batch, blocking_dispatch, result)
     })
     .await
     .unwrap_or_else(|_| {
@@ -391,6 +432,10 @@ async fn commit_inner(
         // to resolve in that case, so make the invariant failure explicit.
         panic!("journal committer blocking task was cancelled")
     })
+}
+
+fn duration_us(duration: Duration) -> u64 {
+    u64::try_from(duration.as_micros()).unwrap_or(u64::MAX)
 }
 
 fn drain_batch(state: &CommitterState) -> Vec<Pending> {
@@ -546,6 +591,7 @@ mod tests {
     #[tokio::test]
     async fn store_failure_resolves_every_handle_without_publishing() {
         let (published, mut subscriber) = broadcast::channel(8);
+        let metrics = Arc::new(crate::journal::JournalCommitMetrics::new());
         let committer = spawn_committer(
             GroupCommitConfig {
                 mode: AdaptiveCommitMode::AlwaysBatch,
@@ -559,8 +605,8 @@ mod tests {
             }),
             published,
             None,
+            Arc::clone(&metrics),
         );
-        let metrics = Arc::new(crate::journal::JournalCommitMetrics::new());
         let mut handles = Vec::new();
         for entity in 0..3 {
             let record = mk_record(entity);
@@ -590,6 +636,7 @@ mod tests {
         let (published, _) = broadcast::channel(8);
         let committed_rows = Arc::new(AtomicUsize::new(0));
         let observed = Arc::clone(&committed_rows);
+        let metrics = Arc::new(crate::journal::JournalCommitMetrics::new());
         let committer = spawn_committer(
             GroupCommitConfig {
                 mode: AdaptiveCommitMode::AlwaysBatch,
@@ -599,12 +646,15 @@ mod tests {
             },
             Arc::new(move |pending| {
                 observed.fetch_add(pending.len(), Ordering::AcqRel);
-                Ok(())
+                Ok(StoreCommitTimings {
+                    fjall_batch_commit: Duration::ZERO,
+                    sync_data: Duration::ZERO,
+                })
             }),
             published,
             None,
+            Arc::clone(&metrics),
         );
-        let metrics = Arc::new(crate::journal::JournalCommitMetrics::new());
         let record = mk_record(9);
         let handle = Arc::new(AppendHandle::new(
             Lsn::new(0, 9),

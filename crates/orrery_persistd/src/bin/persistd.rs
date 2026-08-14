@@ -155,6 +155,7 @@ fn spawn_metrics_reporter(path: PathBuf, journal: Arc<Journal>) -> anyhow::Resul
     let task = tokio::spawn(async move {
         let metrics = journal.commit_metrics();
         let mut cursor = metrics.snapshot();
+        let mut stage_cursor = metrics.stage_snapshot();
         let mut interval = tokio::time::interval(METRICS_REPORT_INTERVAL);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut writer = BufWriter::new(file);
@@ -164,6 +165,7 @@ fn spawn_metrics_reporter(path: PathBuf, journal: Arc<Journal>) -> anyhow::Resul
                 _ = interval.tick() => {}
                 _ = &mut stopped => {
                     if let Err(error) = write_journal_metric_batches(&mut writer, &metrics.delta(&mut cursor))
+                        .and_then(|()| write_journal_stage_delta(&mut writer, metrics.stage_delta(&mut stage_cursor)))
                         .and_then(|()| writer.flush())
                     {
                         tracing::warn!(path = %path.display(), %error, "failed to flush final journal metrics");
@@ -174,6 +176,12 @@ fn spawn_metrics_reporter(path: PathBuf, journal: Arc<Journal>) -> anyhow::Resul
 
             if let Err(error) =
                 write_journal_metric_batches(&mut writer, &metrics.delta(&mut cursor))
+                    .and_then(|()| {
+                        write_journal_stage_delta(
+                            &mut writer,
+                            metrics.stage_delta(&mut stage_cursor),
+                        )
+                    })
                     .and_then(|()| writer.flush())
             {
                 tracing::warn!(path = %path.display(), %error, "failed to write journal metrics; stopping reporter");
@@ -182,6 +190,37 @@ fn spawn_metrics_reporter(path: PathBuf, journal: Arc<Journal>) -> anyhow::Resul
         }
     });
     Ok(MetricsReporter { shutdown, task })
+}
+
+/// Append one compact interval aggregate for group-commit stage diagnostics.
+fn write_journal_stage_delta(
+    mut writer: impl Write,
+    delta: orrery_persistd::JournalStageSnapshot,
+) -> std::io::Result<()> {
+    if delta.flushes == 0 {
+        return Ok(());
+    }
+    serde_json::to_writer(
+        &mut writer,
+        &serde_json::json!({
+            "type": "journal_stage_delta",
+            "flushes": delta.flushes,
+            "records": delta.records,
+            "bytes": delta.bytes,
+            "queue_wait_us_sum": delta.queue_wait_us_sum,
+            "queue_wait_us_max": delta.queue_wait_us_max,
+            "blocking_dispatch_us_sum": delta.blocking_dispatch_us_sum,
+            "blocking_dispatch_us_max": delta.blocking_dispatch_us_max,
+            "fjall_batch_commit_us_sum": delta.fjall_batch_commit_us_sum,
+            "fjall_batch_commit_us_max": delta.fjall_batch_commit_us_max,
+            "sync_data_us_sum": delta.sync_data_us_sum,
+            "sync_data_us_max": delta.sync_data_us_max,
+            "resolve_us_sum": delta.resolve_us_sum,
+            "resolve_us_max": delta.resolve_us_max,
+        }),
+    )
+    .map_err(std::io::Error::other)?;
+    writer.write_all(b"\n")
 }
 
 /// Append P2-dashboard-compatible records for one telemetry delta.
@@ -631,6 +670,11 @@ async fn run_follower(cli: &Cli, topology: &Topology) -> anyhow::Result<()> {
             .expect("follower topology always has a durable chain identity"),
     )
     .await?;
+    let metrics_reporter = cli
+        .metrics_jsonl
+        .clone()
+        .map(|path| spawn_metrics_reporter(path, Arc::clone(&journal)))
+        .transpose()?;
 
     // stdout is a one-line machine-readable readiness contract. Unlike a
     // primary, the follower has no client endpoint to advertise.
@@ -660,6 +704,9 @@ async fn run_follower(cli: &Cli, topology: &Topology) -> anyhow::Result<()> {
         _ = sigterm.recv() => tracing::info!("received SIGTERM, shutting down"),
     }
     server.shutdown().await;
+    if let Some(reporter) = metrics_reporter {
+        reporter.shutdown().await;
+    }
     journal.close().await?;
     tracing::info!("persistd chain follower shutdown complete");
     Ok(())

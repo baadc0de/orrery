@@ -17,16 +17,18 @@ use orrery_protocol::JournalRecord;
 use orrery_protocol::Lsn;
 
 #[cfg(feature = "chain-grpc")]
-pub use chain::{AdoptedChainHistory, spawn_adopted_chain};
+pub use chain::{spawn_adopted_chain, AdoptedChainHistory};
 pub use chain::{
-    ChainConfig, ChainReplicator, ChainSink, ChainTransport, JournalChainSink, MemChainTransport,
-    spawn_chain,
+    spawn_chain, ChainConfig, ChainReplicator, ChainSink, ChainTransport, JournalChainSink,
+    MemChainTransport,
 };
 #[cfg(feature = "chain-grpc")]
-pub use chain_grpc::{ChainGrpcServer, DurableChainId, GrpcChainTransport, spawn_chain_grpc};
+pub use chain_grpc::{spawn_chain_grpc, ChainGrpcServer, DurableChainId, GrpcChainTransport};
 pub use fjall::Journal;
 pub use group_commit::{AdaptiveCommitMode, GroupCommitConfig};
-pub use metrics::{JournalCommitMetrics, JournalCommitSample, JournalCommitSnapshot};
+pub use metrics::{
+    JournalCommitMetrics, JournalCommitSample, JournalCommitSnapshot, JournalStageSnapshot,
+};
 
 /// Configuration for a node's [`Journal`].
 #[derive(Debug, Clone)]

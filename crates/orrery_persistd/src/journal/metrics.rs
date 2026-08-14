@@ -41,6 +41,40 @@ pub struct JournalCommitSnapshot {
     max_us: u64,
 }
 
+/// Aggregate, fixed-memory measurements for completed group-commit flushes.
+///
+/// Sums make interval averages available without recording one event per
+/// flush, while maxima expose tail excursions during diagnostic trials.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct JournalStageSnapshot {
+    /// Successful durability flushes.
+    pub flushes: u64,
+    /// Records included in those flushes.
+    pub records: u64,
+    /// Encoded key/value bytes included in those flushes.
+    pub bytes: u64,
+    /// Sum of oldest-record queue waits, in microseconds.
+    pub queue_wait_us_sum: u64,
+    /// Cumulative maximum oldest-record queue wait, in microseconds.
+    pub queue_wait_us_max: u64,
+    /// Sum of waits for a blocking worker to start, in microseconds.
+    pub blocking_dispatch_us_sum: u64,
+    /// Cumulative maximum blocking-worker dispatch wait, in microseconds.
+    pub blocking_dispatch_us_max: u64,
+    /// Sum of Fjall batch-commit calls, in microseconds.
+    pub fjall_batch_commit_us_sum: u64,
+    /// Cumulative maximum Fjall batch-commit call, in microseconds.
+    pub fjall_batch_commit_us_max: u64,
+    /// Sum of `SyncData` calls, in microseconds.
+    pub sync_data_us_sum: u64,
+    /// Cumulative maximum `SyncData` call, in microseconds.
+    pub sync_data_us_max: u64,
+    /// Sum of waiter-resolution and publication work, in microseconds.
+    pub resolve_us_sum: u64,
+    /// Cumulative maximum waiter-resolution/publication work, in microseconds.
+    pub resolve_us_max: u64,
+}
+
 impl JournalCommitSnapshot {
     /// The total number of successfully durable appends in this snapshot.
     #[must_use]
@@ -60,6 +94,24 @@ impl JournalCommitSnapshot {
 pub struct JournalCommitMetrics {
     buckets: [AtomicU64; NUM_BUCKETS],
     max_us: AtomicU64,
+    stages: JournalStageCounters,
+}
+
+#[derive(Debug, Default)]
+struct JournalStageCounters {
+    flushes: AtomicU64,
+    records: AtomicU64,
+    bytes: AtomicU64,
+    queue_wait_us_sum: AtomicU64,
+    queue_wait_us_max: AtomicU64,
+    blocking_dispatch_us_sum: AtomicU64,
+    blocking_dispatch_us_max: AtomicU64,
+    fjall_batch_commit_us_sum: AtomicU64,
+    fjall_batch_commit_us_max: AtomicU64,
+    sync_data_us_sum: AtomicU64,
+    sync_data_us_max: AtomicU64,
+    resolve_us_sum: AtomicU64,
+    resolve_us_max: AtomicU64,
 }
 
 impl Default for JournalCommitMetrics {
@@ -67,6 +119,7 @@ impl Default for JournalCommitMetrics {
         Self {
             buckets: [const { AtomicU64::new(0) }; NUM_BUCKETS],
             max_us: AtomicU64::new(0),
+            stages: JournalStageCounters::default(),
         }
     }
 }
@@ -107,6 +160,94 @@ impl JournalCommitMetrics {
         }
         *previous = current.clone();
         samples_for(&delta, current.max_us)
+    }
+
+    /// Capture cumulative group-commit stage counters.
+    #[must_use]
+    pub fn stage_snapshot(&self) -> JournalStageSnapshot {
+        let load = |counter: &AtomicU64| counter.load(Ordering::Relaxed);
+        JournalStageSnapshot {
+            flushes: load(&self.stages.flushes),
+            records: load(&self.stages.records),
+            bytes: load(&self.stages.bytes),
+            queue_wait_us_sum: load(&self.stages.queue_wait_us_sum),
+            queue_wait_us_max: load(&self.stages.queue_wait_us_max),
+            blocking_dispatch_us_sum: load(&self.stages.blocking_dispatch_us_sum),
+            blocking_dispatch_us_max: load(&self.stages.blocking_dispatch_us_max),
+            fjall_batch_commit_us_sum: load(&self.stages.fjall_batch_commit_us_sum),
+            fjall_batch_commit_us_max: load(&self.stages.fjall_batch_commit_us_max),
+            sync_data_us_sum: load(&self.stages.sync_data_us_sum),
+            sync_data_us_max: load(&self.stages.sync_data_us_max),
+            resolve_us_sum: load(&self.stages.resolve_us_sum),
+            resolve_us_max: load(&self.stages.resolve_us_max),
+        }
+    }
+
+    /// Return group-commit counters added since `previous`.
+    pub fn stage_delta(&self, previous: &mut JournalStageSnapshot) -> JournalStageSnapshot {
+        let current = self.stage_snapshot();
+        let delta = JournalStageSnapshot {
+            flushes: current.flushes.saturating_sub(previous.flushes),
+            records: current.records.saturating_sub(previous.records),
+            bytes: current.bytes.saturating_sub(previous.bytes),
+            queue_wait_us_sum: current
+                .queue_wait_us_sum
+                .saturating_sub(previous.queue_wait_us_sum),
+            queue_wait_us_max: current.queue_wait_us_max,
+            blocking_dispatch_us_sum: current
+                .blocking_dispatch_us_sum
+                .saturating_sub(previous.blocking_dispatch_us_sum),
+            blocking_dispatch_us_max: current.blocking_dispatch_us_max,
+            fjall_batch_commit_us_sum: current
+                .fjall_batch_commit_us_sum
+                .saturating_sub(previous.fjall_batch_commit_us_sum),
+            fjall_batch_commit_us_max: current.fjall_batch_commit_us_max,
+            sync_data_us_sum: current
+                .sync_data_us_sum
+                .saturating_sub(previous.sync_data_us_sum),
+            sync_data_us_max: current.sync_data_us_max,
+            resolve_us_sum: current
+                .resolve_us_sum
+                .saturating_sub(previous.resolve_us_sum),
+            resolve_us_max: current.resolve_us_max,
+        };
+        *previous = current;
+        delta
+    }
+
+    pub(crate) fn record_group(&self, sample: JournalStageSnapshot) {
+        let add = |counter: &AtomicU64, value| {
+            counter.fetch_add(value, Ordering::Relaxed);
+        };
+        add(&self.stages.flushes, 1);
+        add(&self.stages.records, sample.records);
+        add(&self.stages.bytes, sample.bytes);
+        add(&self.stages.queue_wait_us_sum, sample.queue_wait_us_sum);
+        self.stages
+            .queue_wait_us_max
+            .fetch_max(sample.queue_wait_us_max, Ordering::Relaxed);
+        add(
+            &self.stages.blocking_dispatch_us_sum,
+            sample.blocking_dispatch_us_sum,
+        );
+        self.stages
+            .blocking_dispatch_us_max
+            .fetch_max(sample.blocking_dispatch_us_max, Ordering::Relaxed);
+        add(
+            &self.stages.fjall_batch_commit_us_sum,
+            sample.fjall_batch_commit_us_sum,
+        );
+        self.stages
+            .fjall_batch_commit_us_max
+            .fetch_max(sample.fjall_batch_commit_us_max, Ordering::Relaxed);
+        add(&self.stages.sync_data_us_sum, sample.sync_data_us_sum);
+        self.stages
+            .sync_data_us_max
+            .fetch_max(sample.sync_data_us_max, Ordering::Relaxed);
+        add(&self.stages.resolve_us_sum, sample.resolve_us_sum);
+        self.stages
+            .resolve_us_max
+            .fetch_max(sample.resolve_us_max, Ordering::Relaxed);
     }
 
     pub(crate) fn record(&self, latency: Duration) {
@@ -192,5 +333,34 @@ mod tests {
                 count: 1
             }]
         );
+    }
+
+    #[test]
+    fn stage_delta_reports_interval_totals_and_cumulative_maxima() {
+        let metrics = JournalCommitMetrics::new();
+        let mut cursor = metrics.stage_snapshot();
+        metrics.record_group(JournalStageSnapshot {
+            records: 12,
+            bytes: 345,
+            queue_wait_us_sum: 250,
+            queue_wait_us_max: 250,
+            blocking_dispatch_us_sum: 8,
+            blocking_dispatch_us_max: 8,
+            fjall_batch_commit_us_sum: 40,
+            fjall_batch_commit_us_max: 40,
+            sync_data_us_sum: 900,
+            sync_data_us_max: 900,
+            resolve_us_sum: 30,
+            resolve_us_max: 30,
+            ..JournalStageSnapshot::default()
+        });
+
+        let delta = metrics.stage_delta(&mut cursor);
+        assert_eq!(delta.flushes, 1);
+        assert_eq!(delta.records, 12);
+        assert_eq!(delta.bytes, 345);
+        assert_eq!(delta.sync_data_us_sum, 900);
+        assert_eq!(delta.sync_data_us_max, 900);
+        assert_eq!(metrics.stage_delta(&mut cursor).flushes, 0);
     }
 }

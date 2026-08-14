@@ -63,14 +63,14 @@ pub use intent::{
 };
 #[cfg(feature = "chain-grpc")]
 pub use journal::{
-    AdoptedChainHistory, ChainGrpcServer, DurableChainId, GrpcChainTransport, spawn_adopted_chain,
-    spawn_chain_grpc,
+    spawn_adopted_chain, spawn_chain_grpc, AdoptedChainHistory, ChainGrpcServer, DurableChainId,
+    GrpcChainTransport,
 };
 pub use journal::{
-    AppendHandle, ChainConfig, ChainReplicator, ChainSink, ChainTransport, Journal,
+    spawn_chain, AppendHandle, ChainConfig, ChainReplicator, ChainSink, ChainTransport, Journal,
     JournalChainSink, JournalCommitMetrics, JournalCommitSample, JournalCommitSnapshot,
-    JournalConfig, JournalError, JournalScan, MemChainTransport, StoredRecord,
-    spawn_chain,
+    JournalConfig, JournalError, JournalScan, JournalStageSnapshot, MemChainTransport,
+    StoredRecord,
 };
 pub use placement::{RendezvousHasher, RendezvousNode, RendezvousWeight};
 pub use runtime::{payload_crc, CellRuntime, RuntimeConfig};

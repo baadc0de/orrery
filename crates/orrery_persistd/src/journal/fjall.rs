@@ -24,7 +24,9 @@ use tokio::sync::broadcast;
 use orrery_protocol::JournalRecord;
 use orrery_protocol::Lsn;
 
-use crate::journal::group_commit::{CommitterHandle, StagedAppend, spawn_committer};
+use crate::journal::group_commit::{
+    spawn_committer, CommitterHandle, StagedAppend, StoreCommitTimings,
+};
 use crate::journal::{
     AppendHandle, JournalCommitMetrics, JournalConfig, JournalError, JournalScan, StoredRecord,
 };
@@ -104,6 +106,7 @@ impl Journal {
             .keyspace(CHAIN_RECORDS_KS, fjall::KeyspaceCreateOptions::default)
             .map_err(|e| JournalError::Store(format!("open chain record index: {e}")))?;
 
+        let metrics = Arc::new(JournalCommitMetrics::new());
         let db_commit = Arc::new({
             let db = db.clone();
             let records = records.clone();
@@ -123,21 +126,28 @@ impl Journal {
                         batch.insert(&chain_records, key, value);
                     }
                 }
+                let batch_started = std::time::Instant::now();
                 batch
                     .commit()
                     .map_err(|e| JournalError::Store(format!("insert journal batch: {e}")))?;
+                let fjall_batch_commit = batch_started.elapsed();
+                let sync_started = std::time::Instant::now();
                 db.persist(PersistMode::SyncData)
-                    .map_err(|e| JournalError::Store(e.to_string()))
+                    .map_err(|e| JournalError::Store(e.to_string()))?;
+                Ok(StoreCommitTimings {
+                    fjall_batch_commit,
+                    sync_data: sync_started.elapsed(),
+                })
             }
         });
 
         let (published, _) = broadcast::channel(PUBLISH_CAPACITY);
-        let metrics = Arc::new(JournalCommitMetrics::new());
         let committer = spawn_committer(
             config.commit.clone(),
             db_commit,
             published.clone(),
             recovered_committed,
+            Arc::clone(&metrics),
         );
 
         Ok(Self {
@@ -476,7 +486,7 @@ impl Journal {
     ) -> Result<crate::journal::chain::AdoptedChainHistory, JournalError> {
         use crate::journal::chain::AdoptedChainHistory;
         use crate::journal::chain_grpc::{
-            AdoptedRecord, AdoptionMarker, RecordProvenance, chain_key_for_adoption,
+            chain_key_for_adoption, AdoptedRecord, AdoptionMarker, RecordProvenance,
         };
         use std::collections::{BTreeMap, HashMap};
 
