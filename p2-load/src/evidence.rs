@@ -2,8 +2,9 @@
 //!
 //! This module is deliberately storage-agnostic. The future FDB/gateway
 //! reader supplies [`RecoveredEvidence`]; the comparison below then proves
-//! that every final, durably acknowledged bulk update and every intent
-//! outcome survived recovery.
+//! that every final, durably acknowledged bulk update and every committed
+//! intent outcome survived recovery. Rejected replies remain audit evidence:
+//! edge validation may reject them before an FDB idempotency row exists.
 
 use std::collections::BTreeMap;
 
@@ -18,6 +19,9 @@ pub enum AckRecord {
     /// A non-provisional bulk acknowledgement: eligible durable evidence.
     Diff(DiffEvidence),
     /// An intent acknowledgement, including the exact protocol outcome.
+    ///
+    /// Committed outcomes are durable evidence. Rejections are retained for
+    /// audit but are not claims that an FDB idempotency row was written.
     Intent {
         /// Decimal u128 idempotency key, lossless in JSON.
         intent_id: String,
@@ -90,6 +94,8 @@ pub struct EvidenceReport {
     /// Number of final per-entity bulk writes checked (not every superseded diff).
     pub bulk_checked: usize,
     pub intents_checked: usize,
+    /// Rejected replies retained in the ack log but excluded from FDB proof.
+    pub rejected_intents_audited: usize,
     pub mismatches: Vec<EvidenceMismatch>,
 }
 
@@ -103,13 +109,16 @@ impl EvidenceReport {
 /// Compare durable acknowledgements to recovered state.
 ///
 /// Bulk state is last-writer-wins, so only the largest acknowledged tick per
-/// `(grid, entity)` is asserted. Intent outcomes are idempotency rows and all
-/// acknowledged outcomes are asserted exactly. Provisional bulk acks never
-/// reach [`AckRecord::Diff`] and therefore cannot enter this proof.
+/// `(grid, entity)` is asserted. Committed intent outcomes are idempotency
+/// rows and are asserted exactly. Rejected edge replies are counted for audit
+/// but not queried from FDB: they intentionally may have no idempotency row.
+/// Provisional bulk acks never reach [`AckRecord::Diff`] and therefore cannot
+/// enter this proof.
 #[must_use]
 pub fn compare_recovery(records: &[AckRecord], recovered: &RecoveredEvidence) -> EvidenceReport {
     let mut expected_diffs = BTreeMap::<(GridId, PersistId), DiffEvidence>::new();
     let mut expected_intents = BTreeMap::<String, IntentOutcomeEvidence>::new();
+    let mut rejected_intents_audited = 0;
     for record in records {
         match record {
             AckRecord::Diff(diff) => {
@@ -121,9 +130,12 @@ pub fn compare_recovery(records: &[AckRecord], recovered: &RecoveredEvidence) ->
                     expected_diffs.insert(key, diff.clone());
                 }
             }
-            AckRecord::Intent { intent_id, outcome } => {
-                expected_intents.insert(intent_id.clone(), outcome.clone());
-            }
+            AckRecord::Intent { intent_id, outcome } => match outcome {
+                IntentOutcomeEvidence::Committed { .. } => {
+                    expected_intents.insert(intent_id.clone(), outcome.clone());
+                }
+                IntentOutcomeEvidence::Rejected { .. } => rejected_intents_audited += 1,
+            },
         }
     }
 
@@ -136,6 +148,7 @@ pub fn compare_recovery(records: &[AckRecord], recovered: &RecoveredEvidence) ->
     let mut report = EvidenceReport {
         bulk_checked: expected_diffs.len(),
         intents_checked: expected_intents.len(),
+        rejected_intents_audited,
         mismatches: Vec::new(),
     };
     for (key, expected) in expected_diffs {
@@ -231,7 +244,10 @@ mod tests {
             AckRecord::Diff(diff(11, "expected")),
             AckRecord::Intent {
                 intent_id: "42".into(),
-                outcome: IntentOutcomeEvidence::Rejected { reason: 3 },
+                outcome: IntentOutcomeEvidence::Committed {
+                    tick: Tick::new(12),
+                    minted: vec![],
+                },
             },
         ];
         let recovered = RecoveredEvidence {
@@ -242,8 +258,28 @@ mod tests {
                 tick: Tick::new(11),
                 payload_digest: "wrong".into(),
             }],
-            intents: BTreeMap::from([("42".into(), IntentOutcomeEvidence::Rejected { reason: 4 })]),
+            intents: BTreeMap::from([(
+                "42".into(),
+                IntentOutcomeEvidence::Committed {
+                    tick: Tick::new(13),
+                    minted: vec![],
+                },
+            )]),
         };
         assert_eq!(compare_recovery(&records, &recovered).mismatches.len(), 2);
+    }
+
+    #[test]
+    fn audits_edge_rejection_without_requiring_an_fdb_row() {
+        let records = vec![AckRecord::Intent {
+            intent_id: "rejected-before-fdb".into(),
+            outcome: IntentOutcomeEvidence::Rejected { reason: 1 },
+        }];
+
+        let report = compare_recovery(&records, &RecoveredEvidence::default());
+
+        assert!(report.passes());
+        assert_eq!(report.intents_checked, 0);
+        assert_eq!(report.rejected_intents_audited, 1);
     }
 }
