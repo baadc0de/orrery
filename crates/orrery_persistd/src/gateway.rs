@@ -33,26 +33,26 @@
 //! §3), but the current reference binary does not ship that transport.
 
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::Bytes;
 use iroh::{Endpoint, EndpointAddr, RelayMode};
-use tokio::sync::{oneshot, Semaphore};
+use tokio::sync::{Semaphore, oneshot};
 use tracing::{debug, warn};
 
 use orrery_protocol::channels::{
-    decode_datagram, decode_stream_frame, encode_datagram, encode_stream_frame, untag, Channel,
+    Channel, decode_datagram, decode_stream_frame, encode_datagram, encode_stream_frame, untag,
 };
 use orrery_protocol::{
     AreaPage, CellId, DiffUplink, Epoch, GatewayMsg, GatewayReply, GridId, Intent, IntentOutcome,
-    JournalRecord, Lsn, NodeId, PersistId, MAX_AREA_PAGE_FRAME_BYTES, PROTOCOL_VERSION,
+    JournalRecord, Lsn, MAX_AREA_PAGE_FRAME_BYTES, NodeId, PROTOCOL_VERSION, PersistId,
     REASON_BAD_SIGNATURE, REASON_ISSUER_MISMATCH, REASON_NO_EXECUTOR,
 };
 
 use crate::cluster::Router;
 use crate::intent::{
-    error_outcome, IntentVerdict, PermissiveValidator, SharedExecutor, SharedValidator,
+    IntentVerdict, PermissiveValidator, SharedExecutor, SharedValidator, error_outcome,
 };
 use crate::payload_crc;
 
@@ -70,6 +70,50 @@ const ACCEPTED: u8 = 0;
 /// scans) does not head-of-line block diffs — and their acks — on the same
 /// connection (D16: the ack *is* the client-observed durability contract).
 const MAX_INFLIGHT_ROUTES_PER_CONN: usize = 8;
+
+/// Decides whether a successful bulk route can make the normal durable-ack
+/// claim.
+///
+/// The current single-node service is always fresh. During fenced activation,
+/// the owner monitor supplies this boundary with its grid/cell freshness view;
+/// a stale or lost lease deliberately downgrades a successful local journal
+/// append to a provisional ack. Intents do not consult this interface: their
+/// `Committed` reply remains an RPO-0 statement about the intent executor.
+pub trait BulkAckAdmission: Send + Sync {
+    /// Assess the ownership/fence freshness for a bulk acknowledgement.
+    fn assess(&self, grid: GridId, cell: CellId) -> BulkAckDisposition;
+}
+
+/// The durability strength a bulk acknowledgement may claim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BulkAckDisposition {
+    /// Ownership is fresh, so the local journal acknowledgement is durable
+    /// evidence for the P2 recovery gate.
+    Durable,
+    /// Ownership is stale or unavailable. The write may have reached the
+    /// local actor, but clients must not treat its acknowledgement as durable
+    /// recovery evidence.
+    Provisional,
+}
+
+impl BulkAckDisposition {
+    fn is_provisional(self) -> bool {
+        matches!(self, Self::Provisional)
+    }
+}
+
+/// Shared bulk-ack admission policy used by a gateway.
+pub type SharedBulkAckAdmission = Arc<dyn BulkAckAdmission>;
+
+/// The current single-node policy: its ownership is always fresh.
+#[derive(Debug, Default)]
+pub struct FreshBulkAckAdmission;
+
+impl BulkAckAdmission for FreshBulkAckAdmission {
+    fn assess(&self, _grid: GridId, _cell: CellId) -> BulkAckDisposition {
+        BulkAckDisposition::Durable
+    }
+}
 
 /// Configuration for the [`GatewayServer`].
 #[derive(Clone)]
@@ -95,6 +139,10 @@ pub struct GatewayConfig {
     /// the permissive stub so the harness runs unconfigured; a linked
     /// `Ruleset` swaps in real validation.
     pub validator: SharedValidator,
+    /// Ownership/fence freshness policy for bulk acknowledgements. The default
+    /// preserves the current single-node durable-ack behavior; activation can
+    /// inject its three-second fence freshness monitor here.
+    pub bulk_ack_admission: SharedBulkAckAdmission,
 }
 
 impl Default for GatewayConfig {
@@ -107,6 +155,7 @@ impl Default for GatewayConfig {
             protocol_version: PROTOCOL_VERSION,
             executor: None,
             validator: Arc::new(PermissiveValidator),
+            bulk_ack_admission: Arc::new(FreshBulkAckAdmission),
         }
     }
 }
@@ -162,6 +211,7 @@ impl GatewayServer {
         let protocol = config.protocol_version;
         let executor = config.executor;
         let validator = config.validator;
+        let bulk_ack_admission = config.bulk_ack_admission;
         let (shutdown, rx) = oneshot::channel();
         let send_failures = Arc::new(AtomicU64::new(0));
         let join = tokio::spawn(accept_loop(
@@ -171,6 +221,7 @@ impl GatewayServer {
             protocol,
             executor,
             validator,
+            bulk_ack_admission,
             Arc::clone(&send_failures),
             rx,
         ));
@@ -223,6 +274,7 @@ async fn accept_loop(
     protocol: u16,
     executor: Option<SharedExecutor>,
     validator: SharedValidator,
+    bulk_ack_admission: SharedBulkAckAdmission,
     send_failures: Arc<AtomicU64>,
     mut shutdown: oneshot::Receiver<()>,
 ) {
@@ -234,6 +286,7 @@ async fn accept_loop(
                 let router = Arc::clone(&router);
                 let executor = executor.clone();
                 let validator = Arc::clone(&validator);
+                let bulk_ack_admission = Arc::clone(&bulk_ack_admission);
                 let send_failures = Arc::clone(&send_failures);
                 tokio::spawn(handle_connection(
                     incoming,
@@ -242,6 +295,7 @@ async fn accept_loop(
                     protocol,
                     executor,
                     validator,
+                    bulk_ack_admission,
                     send_failures,
                 ));
             }
@@ -265,6 +319,7 @@ async fn handle_connection(
     protocol: u16,
     executor: Option<SharedExecutor>,
     validator: SharedValidator,
+    bulk_ack_admission: SharedBulkAckAdmission,
     send_failures: Arc<AtomicU64>,
 ) {
     let conn = match incoming.accept() {
@@ -331,15 +386,19 @@ async fn handle_connection(
             GatewayMsg::Diff { diff } => {
                 let send = Arc::clone(&send);
                 let router = Arc::clone(&router);
+                let bulk_ack_admission = Arc::clone(&bulk_ack_admission);
                 let permit = Arc::clone(&inflight).acquire_owned().await;
                 match permit {
                     Ok(permit) => {
                         tokio::spawn(async move {
                             let _permit = permit;
-                            route_diff(send.as_ref(), diff, remote, &router).await;
+                            route_diff(send.as_ref(), diff, remote, &router, &bulk_ack_admission)
+                                .await;
                         });
                     }
-                    Err(_) => route_diff(send.as_ref(), diff, remote, &router).await,
+                    Err(_) => {
+                        route_diff(send.as_ref(), diff, remote, &router, &bulk_ack_admission).await
+                    }
                 }
             }
             GatewayMsg::Subscribe { grid, cells } => {
@@ -470,6 +529,7 @@ async fn route_diff(
     diff: DiffUplink,
     author: NodeId,
     router: &Arc<dyn Router>,
+    bulk_ack_admission: &SharedBulkAckAdmission,
 ) {
     let entity = diff.entity;
     let tick = diff.tick;
@@ -492,11 +552,18 @@ async fn route_diff(
 
     match result {
         Ok(lsn) => {
+            // Check after the actor reports its local journal append so the
+            // reply states the ownership freshness at acknowledgement time.
+            // A stale/lost owner remains observable to the caller but cannot
+            // contaminate the durable recovery evidence set.
+            let provisional = bulk_ack_admission
+                .assess(diff.grid, diff.cell)
+                .is_provisional();
             let reply = GatewayReply::BulkAck {
                 entity,
                 tick,
                 lsn,
-                provisional: false,
+                provisional,
             };
             send(Bytes::from(encode_datagram(&reply)));
         }
@@ -675,4 +742,88 @@ fn encode_chunk(
             live,
         },
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Mutex;
+
+    use super::*;
+    use crate::actor::{Reject, SnapshotPage};
+
+    struct SuccessfulRouter;
+
+    #[async_trait::async_trait]
+    impl Router for SuccessfulRouter {
+        async fn apply(&self, _record: JournalRecord) -> Result<Lsn, Reject> {
+            Ok(Lsn::new(7, 11))
+        }
+
+        async fn read(&self, _grid: GridId, _cell: CellId) -> Result<SnapshotPage, Reject> {
+            Err(Reject::JournalClosed)
+        }
+
+        async fn has_actor(&self, _grid: GridId, _cell: CellId) -> bool {
+            false
+        }
+    }
+
+    struct StaleAdmission;
+
+    impl BulkAckAdmission for StaleAdmission {
+        fn assess(&self, _grid: GridId, _cell: CellId) -> BulkAckDisposition {
+            BulkAckDisposition::Provisional
+        }
+    }
+
+    #[test]
+    fn default_bulk_ack_admission_is_fresh() {
+        assert_eq!(
+            FreshBulkAckAdmission.assess(GridId::ROOT, CellId::ROOT),
+            BulkAckDisposition::Durable
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_ownership_downgrades_a_successful_bulk_route_to_provisional() {
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let capture = Arc::clone(&sent);
+        let send = move |bytes| capture.lock().expect("capture lock").push(bytes);
+        let router: Arc<dyn Router> = Arc::new(SuccessfulRouter);
+        let admission: SharedBulkAckAdmission = Arc::new(StaleAdmission);
+
+        route_diff(
+            &send,
+            DiffUplink {
+                cell: CellId::ROOT,
+                grid: GridId::ROOT,
+                entity: PersistId::new(12),
+                tick: orrery_protocol::Tick::new(3),
+                kind: orrery_protocol::RecordKind::ComponentDiff,
+                payload: Bytes::from_static(b"state"),
+                seq: 3,
+            },
+            iroh::SecretKey::from_bytes(&[1; 32]).public(),
+            &router,
+            &admission,
+        )
+        .await;
+
+        let bytes = sent
+            .lock()
+            .expect("capture lock")
+            .pop()
+            .expect("bulk reply");
+        assert!(matches!(
+            decode_datagram(&bytes),
+            Some(GatewayReply::BulkAck {
+                entity,
+                tick,
+                lsn,
+                provisional: true,
+            }) if entity == PersistId::new(12)
+                && tick == orrery_protocol::Tick::new(3)
+                && lsn == Lsn::new(7, 11)
+        ));
+    }
 }

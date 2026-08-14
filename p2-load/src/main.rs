@@ -49,11 +49,11 @@ use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::net::SocketAddr;
 use std::path::Path;
 use std::process::ExitCode;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use bytes::Bytes;
 use clap::Parser;
 use futures::FutureExt;
@@ -63,7 +63,7 @@ use serde::Deserialize;
 
 use orrery_persist_client::config::PersistClientConfig;
 use orrery_persist_client::{IntentQueue, UplinkScheduler};
-use orrery_protocol::channels::{encode_datagram, encode_stream_frame, untag, Channel};
+use orrery_protocol::channels::{Channel, encode_datagram, encode_stream_frame, untag};
 use orrery_protocol::{
     Attestation, CellId, DiffUplink, Epoch, GatewayMsg, GatewayReply, GridId, Intent, IntentOp,
     IntentOutcome, NodeId, PersistId, RecordKind, Tick,
@@ -704,7 +704,11 @@ impl AckLog {
 #[derive(Debug, Default)]
 struct RunStats {
     diffs_sent: u64,
+    /// All bulk replies, including provisional acknowledgements that do not
+    /// qualify as durable recovery evidence.
     diff_acks: u64,
+    durable_diff_acks: u64,
+    provisional_diff_acks: u64,
     intents_sent: u64,
     intent_acks: u64,
 }
@@ -892,6 +896,8 @@ impl Rig<'_> {
         tracing::info!(
             diffs = stats.diffs_sent,
             acks = stats.diff_acks,
+            durable_acks = stats.durable_diff_acks,
+            provisional_acks = stats.provisional_diff_acks,
             intents = stats.intents_sent,
             intent_acks = stats.intent_acks,
             bulk_p99_us = sched.ack_latency().p99().as_micros() as u64,
@@ -933,6 +939,7 @@ impl Rig<'_> {
                 sched.on_ack(entity, tick, provisional);
                 stats.diff_acks += 1;
                 if !provisional {
+                    stats.durable_diff_acks += 1;
                     if let Some(mut evidence) = self.pending_diffs.remove(&(entity, tick)) {
                         evidence.lsn = lsn;
                         if let Some(log) = &mut self.ack_log {
@@ -941,6 +948,11 @@ impl Rig<'_> {
                     } else {
                         tracing::warn!(?entity, ?tick, "durable bulk ack had no outbound evidence");
                     }
+                } else {
+                    // Deliberately retain the outbound record: a provisional
+                    // reply is scheduler feedback only, never a durable
+                    // acknowledgement for the kill-9 recovery comparator.
+                    stats.provisional_diff_acks += 1;
                 }
             }
             GatewayReply::BulkNack {
@@ -1253,8 +1265,83 @@ mod tests {
         );
         assert_eq!(stats.diffs_sent, 0);
         assert_eq!(stats.diff_acks, 0);
+        assert_eq!(stats.durable_diff_acks, 0);
+        assert_eq!(stats.provisional_diff_acks, 0);
         assert_eq!(stats.intents_sent, 0);
         assert_eq!(stats.intent_acks, 0);
+    }
+
+    #[tokio::test]
+    async fn provisional_bulk_ack_is_not_written_as_durable_evidence() {
+        let endpoint = bind_endpoint(None).await.expect("bind test endpoint");
+        let cli = Cli {
+            gateway: node(1),
+            addr: SocketAddr::from(([127, 0, 0, 1], 1)),
+            entities: 1,
+            cells: 1,
+            diff_hz: 2.0,
+            intent_mix: String::new(),
+            sessions: 1,
+            duration_secs: 1,
+            manifest: None,
+            scenario: None,
+            json: false,
+            ack_log: None,
+            diff_payload_bytes: 64,
+            secret_key: None,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("acks.jsonl");
+        let evidence = DiffEvidence {
+            grid: GridId::ROOT,
+            cell: CellId::ROOT,
+            entity: PersistId::new(99),
+            tick: Tick::new(4),
+            lsn: orrery_protocol::Lsn::new(0, 0),
+            payload_digest: "outbound".to_owned(),
+        };
+        let mut pending_diffs = HashMap::new();
+        pending_diffs.insert((evidence.entity, evidence.tick), evidence);
+        let mut rig = Rig {
+            cli: &cli,
+            emit_json: false,
+            endpoint,
+            sessions: Vec::new(),
+            inventory: Vec::new(),
+            diff_hz: 2.0,
+            intent_mix: BTreeMap::new(),
+            duration: Duration::from_secs(1),
+            ack_log: Some(AckLog::open(&path).unwrap()),
+            pending_diffs,
+        };
+        let mut sched = UplinkScheduler::new();
+        let mut intents = IntentQueue::new(1024);
+        let mut stats = RunStats::default();
+        let mut area_pending = vec![None];
+        let reply = GatewayReply::BulkAck {
+            entity: PersistId::new(99),
+            tick: Tick::new(4),
+            lsn: orrery_protocol::Lsn::new(8, 1),
+            provisional: true,
+        };
+
+        rig.handle_reply(
+            0,
+            &encode_datagram(&reply),
+            &mut sched,
+            &mut intents,
+            &mut stats,
+            &mut area_pending,
+        );
+        drop(rig);
+
+        assert_eq!(stats.diff_acks, 1);
+        assert_eq!(stats.durable_diff_acks, 0);
+        assert_eq!(stats.provisional_diff_acks, 1);
+        assert!(
+            std::fs::read_to_string(path).unwrap().is_empty(),
+            "a provisional bulk reply must never enter acks.jsonl"
+        );
     }
 
     fn node(n: u8) -> orrery_protocol::NodeId {
