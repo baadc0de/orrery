@@ -1,12 +1,12 @@
 # Orrery
 
-Orrery is a planned set of Rust crates for the [Bevy](https://bevy.org) game engine (0.19) providing peer-to-peer multiplayer and a persistent-universe backend: QUIC transport with NAT hole punching via [iroh](https://github.com/n0-computer/iroh), per-entity authority with client-side prediction and rollback/reapply, witness-validated trust in an untrusted peer mesh, and a horizontally scalable, low-latency clustered persistence tier (in-memory cell actors and an append-only journal in front of FoundationDB). It targets very large universes with strong spatial locality — 32–128 players per area, 60 Hz fast action — and it is a framework, not a game: games supply a `Ruleset`, and every tunable is a configurable parameter with a stated default.
+Orrery is an in-development Rust workspace and architecture for the [Bevy](https://bevy.org) game engine (0.19), providing peer-to-peer multiplayer and a persistent-universe backend: QUIC transport with NAT hole punching via [iroh](https://github.com/n0-computer/iroh), per-entity authority with client-side prediction and rollback/reapply, witness-validated trust in an untrusted peer mesh, and a horizontally scalable, low-latency clustered persistence tier (in-memory cell actors and an append-only journal in front of FoundationDB). It targets very large universes with strong spatial locality — 32–128 players per area, 60 Hz fast action — and it is a framework, not a game: games supply a `Ruleset`, and every tunable is a configurable parameter with a stated default.
 
 Normative source: [DECISIONS.md](docs/DECISIONS.md) D1–D17 (the ADR is normative over this README and every numbered doc).
 
 ## Status
 
-**Design + early implementation.** The architecture decision record and its expansion documents are normative. Implementation has begun on the P0→P1 track: the first `orrery_*` crates exist under `crates/` and build clean (workspace + clippy + tests). Landed so far: `orrery_protocol` (the 64-bit `CellId` with its property suite, wire types, coordinator message set, gateway wire surface), `orrery_net` (session lifecycle, channel policy, island membership), `orrery_spatial` (big_space→replicon visibility, cell-crossing hysteresis, bounded high-rate interest set + 1–4 Hz proxies), `orrery_coordinator` (island-formation registry), `orrery_predict` (lightyear config, reconciliation monitor, rollback budget), and `orrery_persist_client` (gateway session, 1–4 Hz per-entity diff uplink scheduler, area load/subscribe, intent queue with offline netsplit posture). See [docs/11-roadmap.md](docs/11-roadmap.md) for the phase plan and the demo criteria that gate each phase. The `orrery` name and crate prefix are provisional and mechanically replaceable; all pinned dependency versions (DECISIONS.md D14) reflect the ecosystem as of August 2026 and are re-validated as each crate's implementation starts.
+**Design + active P0–P2 implementation.** The architecture decision record and its expansion documents remain normative. The workspace contains the vendored iroh/aeronet transport adapter and P0 test/dashboard tools; `orrery_protocol`, `orrery_net`, `orrery_spatial`, `orrery_coordinator`, and `orrery_predict` for the P1 foundation; and `orrery_persist_client`, `orrery_persistd`, and `orrery_seed` for P2. Landed persistence work includes single-writer cell actors, adaptive group-commit journals, fencing and hotspot splits, checkpoint/restore and cold area reads, the iroh gateway, FDB-backed checkpoints and serializable intent execution, the TOML world seeder, and a feature-gated bidirectional gRPC journal mirror with durable chain identity, restart reconstruction, dedupe, and reconnect after stream loss. Standalone `p2-load` and `p2-dashboard` tools exercise and gate the latency series. **P2 is not yet complete:** the reference `persistd` binary is still a single-node harness and deliberately rejects its parsed chain-topology flags; the checked-in kill-9 script is an explicitly incomplete restart slice without the post-restart acknowledged-state comparator or distributed failover required by the roadmap demo. The authority, verifiable-core, witnessing, identity, and field-host crates planned for P3–P6 are not present. See [docs/11-roadmap.md](docs/11-roadmap.md) for the phase gates. The `orrery` name and crate prefix are provisional and mechanically replaceable; pinned dependency versions (DECISIONS.md D14) reflect the ecosystem as of August 2026 and are re-validated as implementation reaches each dependency.
 
 ## Features (as designed)
 
@@ -37,15 +37,21 @@ graph LR
         peers <--> fieldhost
     end
 
-    subgraph backend["Operated services · all speak iroh QUIC"]
+    subgraph backend["Operated backend services"]
         relays["iroh-relay fleet<br/>punch rendezvous + fallback"]
         coord["orrery_coordinator<br/>islands · witness seeding · promotion"]
         identity["orrery_identity<br/>accounts · strikes · bans"]
-        subgraph persistd["orrery_persistd cluster"]
+        subgraph persistd["orrery_persistd deployment"]
             gateway["Gateway<br/>intent validation · lease routing"]
-            actors["Cell actors + journal<br/>lease registrar"]
+            actors["Single-writer cell actors<br/>lease registrar"]
+            journal["Primary journal<br/>adaptive group commit"]
+            mirror["Follower journal<br/>chain-grpc library; CLI wiring pending"]
             fdb[("FoundationDB 7.3.x")]
-            gateway --> actors --> fdb
+            gateway -->|"bulk diffs"| actors
+            actors --> journal
+            journal -.->|"async bidirectional gRPC"| mirror
+            actors -->|"checkpoints"| fdb
+            gateway -->|"critical intent transactions"| fdb
         end
     end
 
@@ -74,7 +80,8 @@ graph LR
 | 12 | [docs/10-crates.md](docs/10-crates.md) | Workspace layout, per-crate API sketches, dependency graph |
 | 13 | [docs/11-roadmap.md](docs/11-roadmap.md) | Build phases, milestones, tracked risks |
 | 14 | [docs/12-world-seeding.md](docs/12-world-seeding.md) | World seeder: TOML scenario runner, generator bank, content diff/patch |
-| 15 | [docs/references.md](docs/references.md) | Annotated bibliography, organized by topic |
+| 15 | [docs/13-chain-replication.md](docs/13-chain-replication.md) | Cross-process journal mirroring, durable chain identity, ordered batches, reconnect and recovery |
+| 16 | [docs/references.md](docs/references.md) | Annotated bibliography, organized by topic |
 
 ## Acknowledgments
 
