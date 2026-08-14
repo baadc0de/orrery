@@ -34,6 +34,8 @@ use orrery_persistd::{
     payload_crc, CellRuntime, GatewayConfig, GatewayServer, JournalConfig, MemFenceStore, Router,
     RuntimeConfig, GATEWAY_ALPN,
 };
+#[cfg(feature = "fdb")]
+use orrery_persistd::{FenceOutcome, FenceRow, FenceStatus, FenceStore};
 use orrery_protocol::channels::{decode_stream_frame, encode_datagram, encode_stream_frame};
 use orrery_protocol::{
     CellId, DiffUplink, GatewayMsg, GatewayReply, GridId, JournalRecord, Lsn, PersistId,
@@ -691,6 +693,26 @@ fn runtime_config_in(dir: &std::path::Path, grid: GridId) -> RuntimeConfig {
     }
 }
 
+#[cfg(feature = "fdb")]
+async fn activate_fdb_checkpoint_fence(cluster: &str, grid: GridId) {
+    let store = orrery_persistd::fence::FdbFenceStore::connect(cluster).unwrap();
+    let expected = FenceRow {
+        owner: 0,
+        epoch: orrery_protocol::Epoch::new(0),
+        status: FenceStatus::Active,
+    };
+    match store.read(grid, CellId::ROOT).await.unwrap() {
+        Some(row) => assert_eq!(row, expected, "test grid has unexpected fence"),
+        None => assert!(matches!(
+            store
+                .fence(grid, CellId::ROOT, None, &expected)
+                .await
+                .unwrap(),
+            FenceOutcome::Fenced
+        )),
+    }
+}
+
 /// Cold-cell coverage: an entity checkpointed into FDB and then absent from
 /// any live actor is served by the durable tier on subscribe
 /// (docs/08-persistence.md §9). Grid 9201 is this test's slice of the shared
@@ -703,6 +725,7 @@ async fn area_load_end_to_end_cold_cell_served() {
         return;
     };
     let grid = GridId::new(9201);
+    activate_fdb_checkpoint_fence(&cluster, grid).await;
     let store =
         Arc::new(orrery_persistd::checkpoint::FdbCheckpointStore::connect(&cluster).unwrap());
 

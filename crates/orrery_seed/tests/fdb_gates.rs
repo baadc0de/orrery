@@ -24,7 +24,9 @@ use orrery_persistd::cluster::{ColdFallbackRouter, Router};
 #[cfg(feature = "fdb")]
 use orrery_persistd::keyspace;
 #[cfg(feature = "fdb")]
-use orrery_persistd::{CellRuntime, JournalConfig, MemFenceStore, RuntimeConfig, payload_crc};
+use orrery_persistd::{payload_crc, CellRuntime, JournalConfig, MemFenceStore, RuntimeConfig};
+#[cfg(feature = "fdb")]
+use orrery_persistd::{FenceOutcome, FenceRow, FenceStatus, FenceStore};
 #[cfg(feature = "fdb")]
 use orrery_protocol::{CellId, Epoch, GridId, JournalRecord, Lsn, PersistId, RecordKind, Tick};
 
@@ -59,6 +61,35 @@ fn skip_if_no_fdb() -> Option<String> {
         return None;
     };
     Some(cluster)
+}
+
+#[cfg(feature = "fdb")]
+async fn activate_fdb_checkpoint_fence(cluster: &str, grid: GridId) {
+    let store = orrery_persistd::fence::FdbFenceStore::connect(cluster).expect("fence store");
+    let expected = FenceRow {
+        owner: 0,
+        epoch: Epoch::new(0),
+        status: FenceStatus::Active,
+    };
+    match store.read(grid, CellId::ROOT).await.expect("read fence") {
+        Some(row) => assert_eq!(row, expected, "test grid has unexpected fence"),
+        None => assert!(matches!(
+            store
+                .fence(grid, CellId::ROOT, None, &expected)
+                .await
+                .expect("activate fence"),
+            FenceOutcome::Fenced
+        )),
+    }
+}
+
+#[cfg(feature = "fdb")]
+async fn retire_fdb_checkpoint_fence(cluster: &str, grid: GridId) {
+    orrery_persistd::fence::FdbFenceStore::connect(cluster)
+        .expect("fence store")
+        .retire(grid, CellId::ROOT)
+        .await
+        .expect("retire test fence");
 }
 
 #[cfg(feature = "fdb")]
@@ -431,7 +462,9 @@ async fn wipe_leaves_ckpt_rows_intact() {
         .join("p2demo.toml");
     let source = std::fs::read_to_string(&root).expect("read scenario");
     let temp = write_temp_scenario("scenario", &with_grid(&source, GridId::new(9406), false));
+    retire_fdb_checkpoint_fence(&fdb_cluster_file().unwrap(), GridId::new(9406)).await;
     wipe_scenario(temp.path(), "demo-2026-08-13").await;
+    activate_fdb_checkpoint_fence(&fdb_cluster_file().unwrap(), GridId::new(9406)).await;
 
     let rt = CellRuntime::open(&runtime_config(dir.path(), GridId::new(9406)), &store).unwrap();
     for i in 0..4u64 {
@@ -452,6 +485,7 @@ async fn wipe_leaves_ckpt_rows_intact() {
         .unwrap();
     assert!(before.is_some(), "checkpoint row exists before wipe");
 
+    retire_fdb_checkpoint_fence(&fdb_cluster_file().unwrap(), GridId::new(9406)).await;
     let output = run_seed(
         &["wipe", "--yes", "--content-build", "demo-2026-08-13"],
         temp.path(),
@@ -487,7 +521,9 @@ async fn cold_area_load_returns_seeded_entities() {
         .join("p2demo.toml");
     let source = std::fs::read_to_string(&root).expect("read scenario");
     let temp = write_temp_scenario("scenario", &with_grid(&source, grid, false));
+    retire_fdb_checkpoint_fence(&cluster, grid).await;
     wipe_scenario(temp.path(), "demo-2026-08-13").await;
+    activate_fdb_checkpoint_fence(&cluster, grid).await;
 
     let rt = CellRuntime::open(&runtime_config(dir.path(), grid), &store_ckpt).unwrap();
     for (i, cell) in cells.iter().copied().enumerate() {
