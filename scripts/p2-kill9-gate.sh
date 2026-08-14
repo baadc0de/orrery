@@ -92,7 +92,7 @@ PY
 start_follower() {
   "$PERSISTD_BIN" --node-id 2 --chain-epoch 1 --chain-primary 1 \
     --chain-listen "127.0.0.1:$chain_port" --dir "$out/follower-data" \
-    --fdb-cluster-file "$ORRERY_FDB_CLUSTER_FILE" --metrics-jsonl "$out/follower-metrics.jsonl" \
+    --metrics-jsonl "$out/follower-metrics.jsonl" \
     >"$out/follower.json" 2>"$out/follower.stderr" & follower_pid=$!
   wait_json "$out/follower.json" "$follower_pid" follower
   follower_chain=$(json_field "$out/follower.json" chain_addr)
