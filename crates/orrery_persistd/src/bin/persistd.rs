@@ -45,9 +45,9 @@ use orrery_persistd::journal::{
     spawn_chain, spawn_chain_grpc, AdaptiveCommitMode, ChainConfig, GroupCommitConfig, Journal,
 };
 use orrery_persistd::{
-    ActivationOutcome, CellRuntime, CheckpointScheduler, DurableChainId, FenceStore, GatewayConfig,
-    GatewayServer, GrpcChainTransport, IntentExecutor, JournalConfig, MemCheckpointStore,
-    RuntimeConfig, ShardActivation,
+    ActivationOutcome, CellRuntime, CheckpointScheduler, DurableChainId, FenceFreshnessConfig,
+    FenceStore, GatewayConfig, GatewayServer, GrpcChainTransport, IntentExecutor, JournalConfig,
+    MemCheckpointStore, RuntimeConfig, ShardActivation,
 };
 #[cfg(feature = "fdb")]
 use orrery_persistd::{FdbContext, FdbIntentExecutor};
@@ -350,6 +350,21 @@ async fn main() -> anyhow::Result<()> {
     let runtime = Arc::new(Mutex::new(CellRuntime::open(&config, &checkpoint_store)?));
     let runtime_for_shutdown = Arc::clone(&runtime);
 
+    // FDB-backed active nodes must continuously revalidate the rows acquired
+    // above.  Start this after recovery but before exposing a gateway, so a
+    // failed first poll can only yield provisional bulk acknowledgements.
+    let fence_freshness_monitor = if cli.fdb_cluster_file.is_some() {
+        let guard = runtime.lock().await;
+        Some(
+            guard
+                .start_fence_freshness_monitor(FenceFreshnessConfig::default())
+                .await
+                .map_err(|error| anyhow::anyhow!("start fence freshness monitor: {error}"))?,
+        )
+    } else {
+        None
+    };
+
     // This executes only on an active node: passive followers returned above
     // before opening a runtime. Capture the journal before handing the runtime
     // to the gateway/router so reporter lifetime is independent of routing.
@@ -422,29 +437,29 @@ async fn main() -> anyhow::Result<()> {
         })
         .transpose()?;
 
-    let gateway = GatewayServer::spawn(
-        gateway_config(&cli, secret_key, |cluster_file, grid| {
-            #[cfg(feature = "fdb")]
-            {
-                let _ = cluster_file;
-                let context = fdb_context
-                    .as_ref()
-                    .expect("FDB context exists when --fdb-cluster-file is set");
-                let exec = FdbIntentExecutor::from_context(context, grid);
-                Ok(Some(Arc::new(exec) as SharedExecutor))
-            }
-            #[cfg(not(feature = "fdb"))]
-            {
-                let _ = (cluster_file, grid);
-                anyhow::bail!(
-                    "persistd was compiled without the `fdb` feature; \
+    let mut gateway_config = gateway_config(&cli, secret_key, |cluster_file, grid| {
+        #[cfg(feature = "fdb")]
+        {
+            let _ = cluster_file;
+            let context = fdb_context
+                .as_ref()
+                .expect("FDB context exists when --fdb-cluster-file is set");
+            let exec = FdbIntentExecutor::from_context(context, grid);
+            Ok(Some(Arc::new(exec) as SharedExecutor))
+        }
+        #[cfg(not(feature = "fdb"))]
+        {
+            let _ = (cluster_file, grid);
+            anyhow::bail!(
+                "persistd was compiled without the `fdb` feature; \
                      --fdb-cluster-file requires libfdb_c"
-                );
-            }
-        })?,
-        router,
-    )
-    .await?;
+            );
+        }
+    })?;
+    if let Some(monitor) = &fence_freshness_monitor {
+        gateway_config.bulk_ack_admission = monitor.clone();
+    }
+    let gateway = GatewayServer::spawn(gateway_config, router).await?;
 
     // Print the gateway address as a single-line JSON object on stdout, so a
     // demo harness can parse it. Everything else goes to stderr via tracing.
@@ -466,6 +481,7 @@ async fn main() -> anyhow::Result<()> {
             "role": topology.role.name(),
             "ownership_epoch": activation.epoch.0,
             "recovery_cutoff": recovery_cutoff,
+            "bulk_ack_fence_monitor": fence_freshness_monitor.is_some(),
         });
         // Write manually so a BrokenPipe (harness closed stdout) does not
         // panic the process.
@@ -500,6 +516,10 @@ async fn main() -> anyhow::Result<()> {
     // Graceful shutdown in reverse order: gateway - schedulers - cluster.
     tracing::info!("stopping gateway");
     gateway.shutdown().await;
+
+    if let Some(monitor) = fence_freshness_monitor {
+        monitor.shutdown();
+    }
 
     if let Some(replicator) = chain_replicator {
         replicator.shutdown().await;

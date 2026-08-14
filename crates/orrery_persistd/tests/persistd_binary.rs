@@ -203,6 +203,7 @@ async fn fdb_binary_reaches_readiness_with_shared_context() {
     let (_dir, mut child, ready) = spawn_persistd(&args);
     assert_eq!(ready["role"], "single");
     assert!(ready["endpoint_addr"].is_string());
+    assert_eq!(ready["bulk_ack_fence_monitor"], true);
     stop(&mut child);
 }
 
