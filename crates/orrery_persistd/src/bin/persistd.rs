@@ -33,7 +33,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use clap::Parser;
 use glam::IVec3;
@@ -214,6 +214,7 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let topology = resolve_topology(&cli)?;
+    let startup_started = Instant::now();
 
     if matches!(topology.role, TopologyRole::Follower { .. }) {
         return run_follower(&cli, &topology).await;
@@ -300,17 +301,32 @@ async fn main() -> anyhow::Result<()> {
     // or gateway is created until the durable ownership transition commits.
     // In particular a former primary cannot reclaim a shard after its follower
     // has promoted: ordinary startup accepts only an absent row or our own row.
+    tracing::info!(
+        role = topology.role.name(),
+        "persistd startup: acquiring durable activation"
+    );
     let activation = activate_topology(
         &topology,
         fence_store.as_ref(),
         cli.fdb_cluster_file.is_some(),
     )
     .await?;
+    tracing::info!(
+        elapsed_ms = startup_started.elapsed().as_millis(),
+        ownership_epoch = activation.epoch.0,
+        "persistd startup: durable activation acquired"
+    );
 
     // A promoted follower first makes its mirrored, provenance-checked prefix
     // locally replayable.  This happens after its fence CAS and before the
     // runtime opens, so readiness means recovery includes the promoted tail.
     let recovery_cutoff = if let Some(source_epoch) = activation.promoted_source_epoch {
+        let adoption_started = Instant::now();
+        tracing::info!(
+            source_epoch,
+            elapsed_ms = startup_started.elapsed().as_millis(),
+            "persistd promotion recovery: opening mirrored journal"
+        );
         let journal = Journal::open(&JournalConfig {
             dir: node_dir.clone(),
             commit: GroupCommitConfig {
@@ -318,15 +334,32 @@ async fn main() -> anyhow::Result<()> {
                 ..GroupCommitConfig::default()
             },
         })?;
-        let history = journal.adopt_chain_history(
-            topology
-                .chain_id_at(source_epoch)
-                .expect("promotion has a source chain identity"),
-        )?;
+        tracing::info!(
+            source_epoch,
+            elapsed_ms = startup_started.elapsed().as_millis(),
+            "persistd promotion recovery: validating and indexing mirrored chain history"
+        );
+        let history = journal
+            .adopt_chain_history(
+                topology
+                    .chain_id_at(source_epoch)
+                    .expect("promotion has a source chain identity"),
+            )
+            .map_err(|error| anyhow::anyhow!("promoted chain-history adoption failed: {error}"))?;
         let cutoff = history
             .watermark()
             .map(|lsn| format!("{}:{}", lsn.segment, lsn.offset));
+        tracing::info!(
+            elapsed_ms = startup_started.elapsed().as_millis(),
+            adoption_elapsed_ms = adoption_started.elapsed().as_millis(),
+            recovery_cutoff = ?cutoff,
+            "persistd promotion recovery: mirrored chain history adopted"
+        );
         journal.close().await?;
+        tracing::info!(
+            elapsed_ms = startup_started.elapsed().as_millis(),
+            "persistd promotion recovery: mirrored journal closed; opening runtime"
+        );
         cutoff
     } else {
         None
@@ -349,7 +382,15 @@ async fn main() -> anyhow::Result<()> {
     // Recovery seeds actors from the same durable tier the checkpoint
     // scheduler writes: the checkpoint is the base, the journal the
     // delta (§3.4).
+    tracing::info!(
+        elapsed_ms = startup_started.elapsed().as_millis(),
+        "persistd startup: recovering runtime"
+    );
     let runtime = Arc::new(Mutex::new(CellRuntime::open(&config, &checkpoint_store)?));
+    tracing::info!(
+        elapsed_ms = startup_started.elapsed().as_millis(),
+        "persistd startup: runtime recovered"
+    );
     let runtime_for_shutdown = Arc::clone(&runtime);
 
     // FDB-backed active nodes must continuously revalidate the rows acquired
@@ -464,6 +505,10 @@ async fn main() -> anyhow::Result<()> {
     if let Some(monitor) = &fence_freshness_monitor {
         gateway_config.bulk_ack_admission = monitor.clone();
     }
+    tracing::info!(
+        elapsed_ms = startup_started.elapsed().as_millis(),
+        "persistd startup: starting gateway"
+    );
     let gateway = GatewayServer::spawn(gateway_config, router).await?;
 
     // Print the gateway address as a single-line JSON object on stdout, so a
@@ -502,6 +547,7 @@ async fn main() -> anyhow::Result<()> {
         node_id = topology.node_id,
         shards = topology.shards.len(),
         role = topology.role.name(),
+        startup_elapsed_ms = startup_started.elapsed().as_millis(),
         "persistd cluster up"
     );
 
