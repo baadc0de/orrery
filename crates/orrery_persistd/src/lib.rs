@@ -47,10 +47,14 @@ pub use cluster::{Cluster, ColdFallbackRouter, Router};
 #[cfg(feature = "fdb")]
 pub use fdb::{FdbContext, FdbContextError};
 pub use fence::{
-    ActivationOutcome, FenceError, FenceOutcome, FenceRow, FenceStatus, FenceStore, MemFenceStore,
+    ActivationOutcome, FenceError, FenceFreshnessConfig, FenceFreshnessError,
+    FenceFreshnessMonitor, FenceOutcome, FenceRow, FenceStatus, FenceStore, MemFenceStore,
     ShardActivation,
 };
-pub use gateway::{GatewayConfig, GatewayError, GatewayServer, GATEWAY_ALPN};
+pub use gateway::{
+    BulkAckAdmission, BulkAckDisposition, FreshBulkAckAdmission, GatewayConfig, GatewayError,
+    GatewayServer, SharedBulkAckAdmission, GATEWAY_ALPN,
+};
 #[cfg(feature = "fdb")]
 pub use intent::{FdbIntentExecutor, IntentFence};
 pub use intent::{

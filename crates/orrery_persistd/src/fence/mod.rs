@@ -21,6 +21,9 @@ use std::sync::Mutex;
 
 use orrery_protocol::{CellId, Epoch, GridId};
 
+mod freshness;
+pub use freshness::{FenceFreshnessConfig, FenceFreshnessError, FenceFreshnessMonitor};
+
 #[cfg(feature = "fdb")]
 pub mod fdb;
 

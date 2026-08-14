@@ -13,8 +13,8 @@ use crate::actor::{
 use crate::checkpoint::{CheckpointData, CheckpointStore};
 use crate::crc::crc32c;
 use crate::fence::{
-    ActivationOutcome, FenceOutcome, FenceRow, FenceStatus, FenceStore, MemFenceStore,
-    ShardActivation,
+    ActivationOutcome, FenceFreshnessConfig, FenceFreshnessError, FenceFreshnessMonitor,
+    FenceOutcome, FenceRow, FenceStatus, FenceStore, MemFenceStore, ShardActivation,
 };
 use crate::journal::{Journal, JournalConfig};
 use crate::placement::{RendezvousHasher, RendezvousNode};
@@ -234,6 +234,35 @@ impl CellRuntime {
     /// grid-relative, and the actors write rows under this grid).
     pub fn grid(&self) -> GridId {
         self.grid
+    }
+
+    /// Start a bounded-staleness monitor for the exact active fence rows this
+    /// runtime currently hosts. Inject the returned monitor as the gateway's
+    /// bulk-ack admission policy before exposing the gateway after activation.
+    ///
+    /// The rows are read before the monitor starts; if another owner changes a
+    /// row in that small interval, the monitor detects the mismatch on its
+    /// immediate first poll and bulk acknowledgements become provisional.
+    pub async fn start_fence_freshness_monitor(
+        &self,
+        config: FenceFreshnessConfig,
+    ) -> Result<Arc<FenceFreshnessMonitor>, FenceFreshnessError> {
+        let mut rows = Vec::with_capacity(self.actors.len());
+        for &shard in self.actors.keys() {
+            let Some(row) = self
+                .fence
+                .read(self.grid, shard)
+                .await
+                .map_err(|error| FenceFreshnessError::FenceRead(error.to_string()))?
+            else {
+                return Err(FenceFreshnessError::InactiveShard(shard));
+            };
+            if row.status != FenceStatus::Active || row.owner != self.node_id {
+                return Err(FenceFreshnessError::InactiveShard(shard));
+            }
+            rows.push((shard, row));
+        }
+        FenceFreshnessMonitor::start(Arc::clone(&self.fence), self.grid, rows, config)
     }
 
     /// The actor owning `cell` in `grid`: the **deepest** shard actor whose

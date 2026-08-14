@@ -751,6 +751,10 @@ mod tests {
 
     use super::*;
     use crate::actor::{Reject, SnapshotPage};
+    use crate::fence::{
+        FenceFreshnessConfig, FenceFreshnessMonitor, FenceOutcome, FenceRow, FenceStatus,
+        FenceStore, MemFenceStore,
+    };
 
     struct SuccessfulRouter;
 
@@ -826,5 +830,89 @@ mod tests {
                 && tick == orrery_protocol::Tick::new(3)
                 && lsn == Lsn::new(7, 11)
         ));
+    }
+
+    #[tokio::test]
+    async fn fence_monitor_downgrades_a_successful_bulk_route_to_provisional() {
+        let fences = Arc::new(MemFenceStore::new());
+        let expected = FenceRow {
+            owner: 13,
+            epoch: Epoch::new(2),
+            status: FenceStatus::Active,
+        };
+        assert_eq!(
+            fences
+                .fence(GridId::ROOT, CellId::ROOT, None, &expected)
+                .await
+                .unwrap(),
+            FenceOutcome::Fenced
+        );
+        let monitor = FenceFreshnessMonitor::start(
+            fences.clone(),
+            GridId::ROOT,
+            vec![(CellId::ROOT, expected)],
+            FenceFreshnessConfig {
+                poll_interval: std::time::Duration::from_millis(2),
+                max_staleness: std::time::Duration::from_secs(3),
+            },
+        )
+        .unwrap();
+        let replacement = FenceRow {
+            owner: 14,
+            epoch: Epoch::new(3),
+            status: FenceStatus::Active,
+        };
+        assert_eq!(
+            fences
+                .fence(GridId::ROOT, CellId::ROOT, Some(&expected), &replacement,)
+                .await
+                .unwrap(),
+            FenceOutcome::Fenced
+        );
+        tokio::time::timeout(std::time::Duration::from_millis(100), async {
+            loop {
+                if monitor.assess(GridId::ROOT, CellId::ROOT) == BulkAckDisposition::Provisional {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .expect("fence mismatch reaches admission");
+
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let capture = Arc::clone(&sent);
+        let send = move |bytes| capture.lock().expect("capture lock").push(bytes);
+        let router: Arc<dyn Router> = Arc::new(SuccessfulRouter);
+        let admission: SharedBulkAckAdmission = monitor.clone();
+        route_diff(
+            &send,
+            DiffUplink {
+                cell: CellId::ROOT,
+                grid: GridId::ROOT,
+                entity: PersistId::new(22),
+                tick: orrery_protocol::Tick::new(4),
+                kind: orrery_protocol::RecordKind::ComponentDiff,
+                payload: Bytes::from_static(b"state"),
+                seq: 4,
+            },
+            iroh::SecretKey::from_bytes(&[2; 32]).public(),
+            &router,
+            &admission,
+        )
+        .await;
+        let bytes = sent
+            .lock()
+            .expect("capture lock")
+            .pop()
+            .expect("bulk reply");
+        assert!(matches!(
+            decode_datagram(&bytes),
+            Some(GatewayReply::BulkAck {
+                provisional: true,
+                ..
+            })
+        ));
+        monitor.shutdown();
     }
 }
