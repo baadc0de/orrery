@@ -11,6 +11,7 @@ pub mod chain;
 pub mod chain_grpc;
 pub mod fjall;
 mod group_commit;
+mod metrics;
 
 use orrery_protocol::JournalRecord;
 use orrery_protocol::Lsn;
@@ -25,6 +26,7 @@ pub use chain::{
 pub use chain_grpc::{ChainGrpcServer, DurableChainId, GrpcChainTransport, spawn_chain_grpc};
 pub use fjall::Journal;
 pub use group_commit::{AdaptiveCommitMode, GroupCommitConfig};
+pub use metrics::{JournalCommitMetrics, JournalCommitSample, JournalCommitSnapshot};
 
 /// Configuration for a node's [`Journal`].
 #[derive(Debug, Clone)]
@@ -52,6 +54,10 @@ impl Default for JournalConfig {
 #[derive(Debug)]
 pub struct AppendHandle {
     lsn: Lsn,
+    /// Measurement starts at `Journal::append` entry and completes when the
+    /// committer resolves this durable append.
+    started: std::time::Instant,
+    metrics: metrics::SharedJournalCommitMetrics,
     /// Completion state, shared with the committer: `Some(result)` once the
     /// record's batch is durably flushed (`Err` means the write never became
     /// durable, e.g. the journal is shutting down).
@@ -69,9 +75,15 @@ struct AppendHandleState {
 }
 
 impl AppendHandle {
-    pub(crate) fn new(lsn: Lsn) -> Self {
+    pub(crate) fn new(
+        lsn: Lsn,
+        started: std::time::Instant,
+        metrics: metrics::SharedJournalCommitMetrics,
+    ) -> Self {
         Self {
             lsn,
+            started,
+            metrics,
             state: std::sync::Arc::new(AppendHandleState {
                 result: std::sync::Mutex::new(None),
                 done: tokio::sync::Notify::new(),
@@ -80,6 +92,9 @@ impl AppendHandle {
     }
 
     fn resolve(&self, result: Result<Lsn, JournalError>) {
+        if result.is_ok() {
+            self.metrics.record(self.started.elapsed());
+        }
         *self.state.result.lock().expect("handle lock") = Some(result);
         self.state.done.notify_one();
     }

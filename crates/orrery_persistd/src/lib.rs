@@ -64,7 +64,8 @@ pub use journal::{
 };
 pub use journal::{
     AppendHandle, ChainConfig, ChainReplicator, ChainSink, ChainTransport, Journal,
-    JournalChainSink, JournalConfig, JournalError, JournalScan, MemChainTransport, StoredRecord,
+    JournalChainSink, JournalCommitMetrics, JournalCommitSample, JournalCommitSnapshot,
+    JournalConfig, JournalError, JournalScan, MemChainTransport, StoredRecord,
     spawn_chain,
 };
 pub use placement::{RendezvousHasher, RendezvousNode, RendezvousWeight};

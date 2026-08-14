@@ -25,7 +25,9 @@ use orrery_protocol::JournalRecord;
 use orrery_protocol::Lsn;
 
 use crate::journal::group_commit::{CommitterHandle, spawn_committer};
-use crate::journal::{AppendHandle, JournalConfig, JournalError, JournalScan, StoredRecord};
+use crate::journal::{
+    AppendHandle, JournalCommitMetrics, JournalConfig, JournalError, JournalScan, StoredRecord,
+};
 
 /// The number of committed records buffered for chain-replication subscribers
 /// before the channel reports lag. Subscribers that fall behind rescan the
@@ -63,6 +65,9 @@ pub struct Journal {
     segment_size: u64,
     committer: CommitterHandle,
     closed: std::sync::atomic::AtomicBool,
+    /// Fixed-memory append-to-durable-resolve telemetry. Kept separate from
+    /// the committer queue so recording never affects batch selection.
+    metrics: Arc<JournalCommitMetrics>,
     /// Committed records, published for chain replication (§4).
     published: broadcast::Sender<JournalRecord>,
 }
@@ -103,6 +108,7 @@ impl Journal {
         });
 
         let (published, _) = broadcast::channel(PUBLISH_CAPACITY);
+        let metrics = Arc::new(JournalCommitMetrics::new());
         let committer = spawn_committer(
             config.commit.clone(),
             db_flush,
@@ -118,6 +124,7 @@ impl Journal {
             segment_size: 128 * 1024 * 1024,
             committer,
             closed: std::sync::atomic::AtomicBool::new(false),
+            metrics,
             published,
         })
     }
@@ -198,6 +205,9 @@ impl Journal {
         #[cfg(feature = "chain-grpc")] index: Option<(Keyspace, Vec<u8>, &[u8])>,
         #[cfg(not(feature = "chain-grpc"))] _index: Option<()>,
     ) -> Result<Arc<AppendHandle>, JournalError> {
+        // Includes journal staging plus queue/batch/fsync time, ending exactly
+        // when `AppendHandle::committed` becomes resolvable.
+        let started = std::time::Instant::now();
         if self.closed.load(std::sync::atomic::Ordering::Acquire) {
             return Err(JournalError::Closed);
         }
@@ -240,7 +250,7 @@ impl Journal {
             .commit()
             .map_err(|e| JournalError::Store(format!("insert journal record: {e}")))?;
 
-        let handle = Arc::new(AppendHandle::new(lsn));
+        let handle = Arc::new(AppendHandle::new(lsn, started, Arc::clone(&self.metrics)));
         self.committer
             .submit(handle.clone(), payload_bytes, record, publish);
         Ok(handle)
@@ -260,6 +270,17 @@ impl Journal {
     /// the count that proves adaptive batching is engaging).
     pub fn flush_count(&self) -> usize {
         self.committer.flush_count()
+    }
+
+    /// Fixed-memory D16 journal commit telemetry.
+    ///
+    /// The returned recorder exposes cumulative snapshots and delta batches
+    /// whose `{ value_us, count }` values can be written as P2
+    /// `journal_commit_ms` `sample_batch` JSONL records. Reporting is kept
+    /// out of the append and group-commit paths.
+    #[must_use]
+    pub fn commit_metrics(&self) -> Arc<JournalCommitMetrics> {
+        Arc::clone(&self.metrics)
     }
 
     /// Subscribe to durably-flushed records, for chain replication (§4).
@@ -884,6 +905,28 @@ mod tests {
             stored.iter().map(|s| s.lsn).collect::<Vec<_>>()
         );
 
+        journal.close().await.expect("close");
+    }
+
+    #[tokio::test]
+    async fn durable_append_is_recorded_once_at_resolution() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let journal = Journal::open(&JournalConfig {
+            dir: dir.path().to_path_buf(),
+            commit: GroupCommitConfig::default(),
+        })
+        .expect("open journal");
+        let metrics = journal.commit_metrics();
+        let mut cursor = metrics.snapshot();
+
+        let handle = journal.append(mk_record(42)).expect("append");
+        // Staging an append has not crossed the durable boundary yet.
+        assert_eq!(metrics.snapshot().total(), 0);
+        handle.committed().await.expect("commit");
+
+        let delta = metrics.delta(&mut cursor);
+        assert_eq!(delta.iter().map(|sample| sample.count).sum::<u64>(), 1);
+        assert!(metrics.delta(&mut cursor).is_empty());
         journal.close().await.expect("close");
     }
 
