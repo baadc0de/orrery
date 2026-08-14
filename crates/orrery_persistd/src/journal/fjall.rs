@@ -24,7 +24,7 @@ use tokio::sync::broadcast;
 use orrery_protocol::JournalRecord;
 use orrery_protocol::Lsn;
 
-use crate::journal::group_commit::{CommitterHandle, spawn_committer};
+use crate::journal::group_commit::{CommitterHandle, StagedAppend, spawn_committer};
 use crate::journal::{
     AppendHandle, JournalCommitMetrics, JournalConfig, JournalError, JournalScan, StoredRecord,
 };
@@ -99,9 +99,33 @@ impl Journal {
         let recovered_committed = last_stored_lsn(&records)?;
         let next_lsn = next_lsn_after(&records)?;
 
-        let db_flush = Arc::new({
+        #[cfg(feature = "chain-grpc")]
+        let chain_records = db
+            .keyspace(CHAIN_RECORDS_KS, fjall::KeyspaceCreateOptions::default)
+            .map_err(|e| JournalError::Store(format!("open chain record index: {e}")))?;
+
+        let db_commit = Arc::new({
             let db = db.clone();
-            move || {
+            let records = records.clone();
+            let originated_records = originated_records.clone();
+            #[cfg(feature = "chain-grpc")]
+            let chain_records = chain_records.clone();
+            move |pending: &[crate::journal::group_commit::Pending]| {
+                let mut batch = db.batch();
+                for pending in pending {
+                    let staged = &pending.staged;
+                    batch.insert(&records, &staged.key, &staged.encoded);
+                    if staged.originated {
+                        batch.insert(&originated_records, &staged.key, b"");
+                    }
+                    #[cfg(feature = "chain-grpc")]
+                    if let Some((key, value)) = &staged.provenance {
+                        batch.insert(&chain_records, key, value);
+                    }
+                }
+                batch
+                    .commit()
+                    .map_err(|e| JournalError::Store(format!("insert journal batch: {e}")))?;
                 db.persist(PersistMode::SyncData)
                     .map_err(|e| JournalError::Store(e.to_string()))
             }
@@ -111,7 +135,7 @@ impl Journal {
         let metrics = Arc::new(JournalCommitMetrics::new());
         let committer = spawn_committer(
             config.commit.clone(),
-            db_flush,
+            db_commit,
             published.clone(),
             recovered_committed,
         );
@@ -171,14 +195,14 @@ impl Journal {
     ) -> Result<Option<Arc<AppendHandle>>, JournalError> {
         let origin = record.lsn;
         let index_key = chain_record_key(chain_key, origin);
-        let index = self.chain_records()?;
-        if index
+        if self
+            .chain_records()?
             .contains_key(&index_key)
             .map_err(|e| JournalError::Store(format!("read chain record index: {e}")))?
         {
             return Ok(None);
         }
-        self.append_inner_with_index(record, false, Some((index, index_key, provenance)))
+        self.append_inner_with_index(record, false, Some((index_key, provenance.to_vec())))
             .map(Some)
     }
 
@@ -202,7 +226,7 @@ impl Journal {
         &self,
         mut record: JournalRecord,
         publish: bool,
-        #[cfg(feature = "chain-grpc")] index: Option<(Keyspace, Vec<u8>, &[u8])>,
+        #[cfg(feature = "chain-grpc")] index: Option<(Vec<u8>, Vec<u8>)>,
         #[cfg(not(feature = "chain-grpc"))] _index: Option<()>,
     ) -> Result<Arc<AppendHandle>, JournalError> {
         // Includes journal staging plus queue/batch/fsync time, ending exactly
@@ -237,22 +261,19 @@ impl Journal {
             (lsn, key, encoded)
         };
 
-        let mut batch = self.db.batch();
-        batch.insert(&self.records, key, encoded);
-        if publish {
-            batch.insert(&self.originated_records, key, b"");
-        }
-        #[cfg(feature = "chain-grpc")]
-        if let Some((index, index_key, provenance)) = index {
-            batch.insert(&index, index_key, provenance);
-        }
-        batch
-            .commit()
-            .map_err(|e| JournalError::Store(format!("insert journal record: {e}")))?;
-
         let handle = Arc::new(AppendHandle::new(lsn, started, Arc::clone(&self.metrics)));
-        self.committer
-            .submit(handle.clone(), payload_bytes, record, publish);
+        self.committer.submit(
+            handle.clone(),
+            StagedAppend {
+                key: key.to_vec(),
+                encoded,
+                originated: publish,
+                #[cfg(feature = "chain-grpc")]
+                provenance: index,
+            },
+            record,
+            publish,
+        );
         Ok(handle)
     }
 
@@ -949,6 +970,43 @@ mod tests {
         let delta = metrics.delta(&mut cursor);
         assert_eq!(delta.iter().map(|sample| sample.count).sum::<u64>(), 1);
         assert!(metrics.delta(&mut cursor).is_empty());
+        journal.close().await.expect("close");
+    }
+
+    #[tokio::test]
+    async fn selected_group_is_staged_and_made_visible_together() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let journal = Journal::open(&JournalConfig {
+            dir: dir.path().to_path_buf(),
+            commit: GroupCommitConfig {
+                mode: crate::journal::AdaptiveCommitMode::AlwaysBatch,
+                batch_window: std::time::Duration::from_millis(100),
+                batch_max_records: 64,
+                batch_max_bytes: 1 << 20,
+            },
+        })
+        .expect("open journal");
+
+        let handles = (0..16)
+            .map(|entity| journal.append(mk_record(entity)).expect("queue append"))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            journal.scan_from(Lsn::new(0, 0)).count(),
+            0,
+            "queued rows must not be individually staged before group selection"
+        );
+        for handle in handles {
+            handle.committed().await.expect("commit selected group");
+        }
+
+        assert_eq!(journal.flush_count(), 1, "one selected group, one commit");
+        let stored = journal
+            .scan_from(Lsn::new(0, 0))
+            .collect::<Result<Vec<_>, _>>()
+            .expect("scan committed group");
+        assert_eq!(stored.len(), 16);
+        assert!(stored.windows(2).all(|pair| pair[0].lsn < pair[1].lsn));
         journal.close().await.expect("close");
     }
 

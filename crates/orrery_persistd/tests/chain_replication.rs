@@ -127,9 +127,11 @@ async fn chain_replicates_records_to_follower() {
     assert_eq!(replicator.follower(), 2);
 
     // Write records on the primary.
+    let mut expected_watermark = None;
     for i in 0..50u64 {
         let rec = mk_record(CellId::ROOT, i, RecordKind::Spawn, &i.to_le_bytes());
         let handle = primary.append(rec).unwrap();
+        expected_watermark = Some(handle.lsn());
         handle.committed().await.unwrap();
     }
 
@@ -137,7 +139,7 @@ async fn chain_replicates_records_to_follower() {
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     loop {
         let wm = replicator.follower_watermark();
-        if wm.is_some() {
+        if wm == expected_watermark {
             break;
         }
         assert!(

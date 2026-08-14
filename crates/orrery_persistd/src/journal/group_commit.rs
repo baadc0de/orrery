@@ -1,8 +1,9 @@
 //! Adaptive group commit (docs/08-persistence.md §4, D16).
 //!
 //! Appends from all actors on a node accumulate in a shared queue; a single
-//! committer task issues the durable `fdatasync` and resolves **every** waiter
-//! in the batch on that one fsync. Two regimes:
+//! committer task stages a whole group in one store batch, issues the durable
+//! `fdatasync`, and resolves **every** waiter in the batch on that one fsync.
+//! Two regimes:
 //!
 //! - **Adaptive (default):** a lone append arriving while the disk is idle is
 //!   flushed immediately (a lone record pays only device latency); under load,
@@ -67,7 +68,7 @@ impl Default for GroupCommitConfig {
 
 /// A pending append awaiting its group fsync.
 #[derive(Debug)]
-struct Pending {
+pub(crate) struct Pending {
     handle: Arc<AppendHandle>,
     bytes: usize,
     /// The record itself, published to chain-replication subscribers once the
@@ -81,6 +82,33 @@ struct Pending {
     /// the batch's *first* arrival, not from when the committer happens to
     /// notice the work.
     arrived: Instant,
+    /// Encoded storage mutations. They remain out of the database until the
+    /// committer has selected the complete durability group.
+    pub(crate) staged: StagedAppend,
+}
+
+/// One append's owned database mutations, consumed by the Fjall commit
+/// callback as part of a larger atomic write batch.
+#[derive(Debug)]
+pub(crate) struct StagedAppend {
+    pub(crate) key: Vec<u8>,
+    pub(crate) encoded: Vec<u8>,
+    pub(crate) originated: bool,
+    #[cfg(feature = "chain-grpc")]
+    pub(crate) provenance: Option<(Vec<u8>, Vec<u8>)>,
+}
+
+impl StagedAppend {
+    fn bytes(&self) -> usize {
+        let bytes = self.key.len() + self.encoded.len();
+        #[cfg(feature = "chain-grpc")]
+        let bytes = bytes
+            + self
+                .provenance
+                .as_ref()
+                .map_or(0, |(key, value)| key.len() + value.len());
+        bytes
+    }
 }
 
 /// Shared commit queue between the journal and the committer task.
@@ -161,16 +189,18 @@ impl CommitterHandle {
     pub(crate) fn submit(
         &self,
         handle: Arc<AppendHandle>,
-        payload_bytes: usize,
+        staged: StagedAppend,
         record: JournalRecord,
         publish: bool,
     ) {
+        let bytes = staged.bytes();
         self.state.queue.push(Pending {
             handle,
-            bytes: payload_bytes,
+            bytes,
             record,
             publish,
             arrived: Instant::now(),
+            staged,
         });
     }
 
@@ -196,18 +226,19 @@ impl CommitterHandle {
     }
 }
 
-/// The flush callback: durably persist everything submitted so far. Runs on a
-/// blocking thread (it is an `fdatasync`). Returns the store's error, if any.
-pub(crate) type FlushFn = Arc<dyn Fn() -> Result<(), JournalError> + Send + Sync>;
+/// Atomically stage a selected group and durably persist it. Runs on a
+/// blocking thread because both Fjall staging and `fdatasync` may block.
+pub(crate) type CommitFn = Arc<dyn Fn(&[Pending]) -> Result<(), JournalError> + Send + Sync>;
 
 /// Start the group-commit committer task.
 ///
-/// `flush` must durably persist every payload already inserted into the store.
-/// `flush` runs on a blocking thread so it never blocks the async runtime.
+/// `commit` must stage every supplied append in one atomic store batch and
+/// durably persist that batch before returning success. It runs on a blocking
+/// thread so neither staging nor `fdatasync` blocks the async runtime.
 /// `published` receives each durably-flushed record (for chain replication).
 pub(crate) fn spawn_committer(
     config: GroupCommitConfig,
-    flush: FlushFn,
+    commit: CommitFn,
     published: broadcast::Sender<JournalRecord>,
     recovered_committed: Option<Lsn>,
 ) -> CommitterHandle {
@@ -225,13 +256,13 @@ pub(crate) fn spawn_committer(
 
     let task_state = Arc::clone(&state);
     tokio::task::spawn(async move {
-        run_committer(task_state, flush).await;
+        run_committer(task_state, commit).await;
     });
 
     CommitterHandle { state }
 }
 
-async fn run_committer(state: Arc<CommitterState>, flush: FlushFn) {
+async fn run_committer(state: Arc<CommitterState>, commit: CommitFn) {
     loop {
         // Shutdown with nothing pending: exit and release the store clone.
         if state.shutdown_armed() && state.queue.len() == 0 {
@@ -252,7 +283,10 @@ async fn run_committer(state: Arc<CommitterState>, flush: FlushFn) {
             && state.queue.len() == 1
             && !state.is_flushing();
 
-        if !idle_fast_path && state.config.mode != AdaptiveCommitMode::AlwaysIdle {
+        if !state.shutdown_armed()
+            && !idle_fast_path
+            && state.config.mode != AdaptiveCommitMode::AlwaysIdle
+        {
             // Batch: hold the fsync until the oldest pending append has been
             // waiting `batch_window`. The window is measured from the batch's
             // first arrival, not by a fresh `sleep(batch_window)` raced against
@@ -303,7 +337,7 @@ async fn run_committer(state: Arc<CommitterState>, flush: FlushFn) {
             .expect("non-empty batch");
 
         state.flushing.store(true, Ordering::Release);
-        let result = flush_inner(&flush).await;
+        let (batch, result) = commit_inner(&commit, batch).await;
         state.flushing.store(false, Ordering::Release);
 
         match result {
@@ -311,15 +345,17 @@ async fn run_committer(state: Arc<CommitterState>, flush: FlushFn) {
                 state.flush_count.fetch_add(1, Ordering::AcqRel);
                 state.set_committed(max_lsn);
                 for p in batch {
-                    p.handle.resolve(Ok(max_lsn));
                     // Publish for chain replication — except records that
                     // arrived via chain replication themselves (`!publish`),
                     // which must not echo back to their origin (§4). A full
                     // channel is a lag signal (the subscriber rescans from its
-                    // watermark).
+                    // watermark). Queue the durability notification before
+                    // waking the client handle, so a client-observed commit
+                    // cannot strand a replicator asleep at the preceding tail.
                     if p.publish {
                         let _ = state.published.send(p.record);
                     }
+                    p.handle.resolve(Ok(max_lsn));
                 }
             }
             Err(e) => {
@@ -338,11 +374,23 @@ impl CommitterState {
     }
 }
 
-async fn flush_inner(flush: &FlushFn) -> Result<(), JournalError> {
-    let flush = Arc::clone(flush);
-    tokio::task::spawn_blocking(move || flush())
-        .await
-        .unwrap_or_else(|_| Err(JournalError::Store("committer task panicked".into())))
+async fn commit_inner(
+    commit: &CommitFn,
+    batch: Vec<Pending>,
+) -> (Vec<Pending>, Result<(), JournalError>) {
+    let commit = Arc::clone(commit);
+    tokio::task::spawn_blocking(move || {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| commit(&batch)))
+            .unwrap_or_else(|_| Err(JournalError::Store("committer task panicked".into())));
+        (batch, result)
+    })
+    .await
+    .unwrap_or_else(|_| {
+        // A join failure after the blocking closure owns the batch is only
+        // possible if Tokio cancels the task itself. There are no handles left
+        // to resolve in that case, so make the invariant failure explicit.
+        panic!("journal committer blocking task was cancelled")
+    })
 }
 
 fn drain_batch(state: &CommitterState) -> Vec<Pending> {
@@ -483,5 +531,94 @@ mod tests {
         );
 
         journal.close().await.expect("close");
+    }
+
+    fn staged(entity: u64) -> StagedAppend {
+        StagedAppend {
+            key: entity.to_be_bytes().to_vec(),
+            encoded: entity.to_le_bytes().to_vec(),
+            originated: true,
+            #[cfg(feature = "chain-grpc")]
+            provenance: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn store_failure_resolves_every_handle_without_publishing() {
+        let (published, mut subscriber) = broadcast::channel(8);
+        let committer = spawn_committer(
+            GroupCommitConfig {
+                mode: AdaptiveCommitMode::AlwaysBatch,
+                batch_window: Duration::from_millis(1),
+                batch_max_records: 8,
+                batch_max_bytes: 1 << 20,
+            },
+            Arc::new(|pending| {
+                assert_eq!(pending.len(), 3);
+                Err(JournalError::Store("injected batch failure".into()))
+            }),
+            published,
+            None,
+        );
+        let metrics = Arc::new(crate::journal::JournalCommitMetrics::new());
+        let mut handles = Vec::new();
+        for entity in 0..3 {
+            let record = mk_record(entity);
+            let handle = Arc::new(AppendHandle::new(
+                Lsn::new(0, entity),
+                std::time::Instant::now(),
+                Arc::clone(&metrics),
+            ));
+            committer.submit(Arc::clone(&handle), staged(entity), record, true);
+            handles.push(handle);
+        }
+        for handle in handles {
+            assert!(matches!(
+                handle.committed().await,
+                Err(JournalError::Store(message)) if message == "injected batch failure"
+            ));
+        }
+        assert!(subscriber.try_recv().is_err());
+        assert_eq!(committer.committed(), None);
+        assert_eq!(committer.flush_count(), 0);
+        committer.shutdown();
+        committer.wait_exit().await;
+    }
+
+    #[tokio::test]
+    async fn shutdown_drains_selected_rows_without_waiting_for_batch_window() {
+        let (published, _) = broadcast::channel(8);
+        let committed_rows = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&committed_rows);
+        let committer = spawn_committer(
+            GroupCommitConfig {
+                mode: AdaptiveCommitMode::AlwaysBatch,
+                batch_window: Duration::from_secs(30),
+                batch_max_records: 8,
+                batch_max_bytes: 1 << 20,
+            },
+            Arc::new(move |pending| {
+                observed.fetch_add(pending.len(), Ordering::AcqRel);
+                Ok(())
+            }),
+            published,
+            None,
+        );
+        let metrics = Arc::new(crate::journal::JournalCommitMetrics::new());
+        let record = mk_record(9);
+        let handle = Arc::new(AppendHandle::new(
+            Lsn::new(0, 9),
+            std::time::Instant::now(),
+            metrics,
+        ));
+        committer.submit(Arc::clone(&handle), staged(9), record, true);
+        committer.shutdown();
+
+        tokio::time::timeout(Duration::from_secs(1), handle.committed())
+            .await
+            .expect("shutdown drain must bypass the batch timer")
+            .expect("drain commit");
+        committer.wait_exit().await;
+        assert_eq!(committed_rows.load(Ordering::Acquire), 1);
     }
 }
