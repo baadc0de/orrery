@@ -39,8 +39,9 @@ use orrery_persistd::journal::{
     spawn_chain, spawn_chain_grpc, AdaptiveCommitMode, ChainConfig, GroupCommitConfig, Journal,
 };
 use orrery_persistd::{
-    CellRuntime, CheckpointScheduler, DurableChainId, FenceStore, GatewayConfig, GatewayServer,
-    GrpcChainTransport, IntentExecutor, JournalConfig, MemCheckpointStore, RuntimeConfig,
+    ActivationOutcome, CellRuntime, CheckpointScheduler, DurableChainId, FenceStore, GatewayConfig,
+    GatewayServer, GrpcChainTransport, IntentExecutor, JournalConfig, MemCheckpointStore,
+    RuntimeConfig, ShardActivation,
 };
 #[cfg(feature = "fdb")]
 use orrery_persistd::{FdbContext, FdbIntentExecutor};
@@ -75,6 +76,12 @@ struct Cli {
     /// epoch.
     #[arg(long)]
     chain_epoch: Option<u64>,
+
+    /// Promote this passive follower after the named primary has failed.  The
+    /// FDB fence is advanced from that owner before recovery or gateway
+    /// readiness; this flag is deliberately not a lease override.
+    #[arg(long, value_name = "NODE_ID")]
+    promote_from: Option<u64>,
 
     /// A follower node and its listen address in `<node-id>@<addr>` form.
     /// Repeated to describe the follower chain order.
@@ -114,6 +121,9 @@ async fn main() -> anyhow::Result<()> {
 
     if matches!(topology.role, TopologyRole::Follower { .. }) {
         return run_follower(&cli, &topology).await;
+    }
+    if matches!(topology.role, TopologyRole::Promotion { .. }) && cli.fdb_cluster_file.is_none() {
+        anyhow::bail!("--promote-from requires --fdb-cluster-file for durable fencing");
     }
 
     // ── FoundationDB stores (optional) ──────────────────────────────────
@@ -190,6 +200,40 @@ async fn main() -> anyhow::Result<()> {
     let node_dir = cli.dir.join(format!("node-{}", topology.node_id));
     std::fs::create_dir_all(&node_dir)?;
 
+    // Fencing is the startup admission control.  No actor recovery, scheduler,
+    // or gateway is created until the durable ownership transition commits.
+    // In particular a former primary cannot reclaim a shard after its follower
+    // has promoted: ordinary startup accepts only an absent row or our own row.
+    let activation = activate_topology(
+        &topology,
+        fence_store.as_ref(),
+        cli.fdb_cluster_file.is_some(),
+    )
+    .await?;
+
+    // A promoted follower first makes its mirrored, provenance-checked prefix
+    // locally replayable.  This happens after its fence CAS and before the
+    // runtime opens, so readiness means recovery includes the promoted tail.
+    let recovery_cutoff = if let Some(source_epoch) = activation.promoted_source_epoch {
+        let journal = Journal::open(&JournalConfig {
+            dir: node_dir.clone(),
+            commit: GroupCommitConfig {
+                mode: AdaptiveCommitMode::Adaptive,
+                ..GroupCommitConfig::default()
+            },
+        })?;
+        let history = journal.adopt_chain_history(
+            topology
+                .chain_id_at(source_epoch)
+                .expect("promotion has a source chain identity"),
+        )?;
+        let cutoff = history.watermark().map(|lsn| format!("{lsn:?}"));
+        journal.close().await?;
+        cutoff
+    } else {
+        None
+    };
+
     let config = RuntimeConfig {
         shards: topology.shards.clone(),
         grid: GridId::ROOT,
@@ -201,7 +245,7 @@ async fn main() -> anyhow::Result<()> {
             },
         },
         node_id: topology.node_id,
-        epoch: topology.epoch,
+        epoch: activation.epoch,
         fence: Arc::clone(&fence_store),
     };
     // Recovery seeds actors from the same durable tier the checkpoint
@@ -311,6 +355,8 @@ async fn main() -> anyhow::Result<()> {
             "node_id": format!("{node_id}"),
             "cluster_node_id": topology.node_id,
             "role": topology.role.name(),
+            "ownership_epoch": activation.epoch.0,
+            "recovery_cutoff": recovery_cutoff,
         });
         // Write manually so a BrokenPipe (harness closed stdout) does not
         // panic the process.
@@ -435,6 +481,98 @@ async fn run_follower(cli: &Cli, topology: &Topology) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[derive(Debug)]
+struct StartupActivation {
+    epoch: Epoch,
+    /// The old primary epoch whose chain identity must be adopted.
+    promoted_source_epoch: Option<u64>,
+}
+
+/// Perform the only ownership transition allowed by the static topology.
+/// Reading first is safe because `activate_shards` compares every row again in
+/// one transaction.  We intentionally refuse an ordinary boot over another
+/// node: a stale process must be restarted as a follower, never steal back a
+/// promoted writer merely because it can reach FDB.
+async fn activate_topology(
+    topology: &Topology,
+    fence: &dyn FenceStore,
+    durable: bool,
+) -> anyhow::Result<StartupActivation> {
+    let mut requests = Vec::with_capacity(topology.shards.len());
+    let mut source_epoch = None;
+    for &shard in &topology.shards {
+        let current = fence.read(GridId::ROOT, shard).await?;
+        match topology.role {
+            TopologyRole::Promotion { primary, .. } => {
+                let Some(row) = current else {
+                    anyhow::bail!("cannot promote shard {shard:?}: no primary fence row");
+                };
+                if row.owner != primary {
+                    anyhow::bail!("cannot promote shard {shard:?}: expected failed primary {primary}, found owner {}", row.owner);
+                }
+                if let Some(epoch) = source_epoch {
+                    if epoch != row.epoch.0 {
+                        anyhow::bail!("cannot promote a shard set with mixed fence epochs");
+                    }
+                } else {
+                    source_epoch = Some(row.epoch.0);
+                }
+            }
+            TopologyRole::Single | TopologyRole::Primary { .. } => {
+                if let Some(row) = current {
+                    if row.owner != topology.node_id {
+                        anyhow::bail!(
+                            "startup rejected for shard {shard:?}: owned by node {} at epoch {}",
+                            row.owner,
+                            row.epoch.0
+                        );
+                    }
+                }
+            }
+            TopologyRole::Follower { .. } => unreachable!("passive follower does not activate"),
+        }
+        requests.push(ShardActivation {
+            shard,
+            expected: current,
+        });
+    }
+    if durable && topology.chain_id().is_some() {
+        let expected_epoch = requests
+            .first()
+            .and_then(|request| request.expected)
+            .map_or(1, |row| row.epoch.0 + 1);
+        if requests
+            .iter()
+            .any(|request| request.expected.map_or(1, |row| row.epoch.0 + 1) != expected_epoch)
+        {
+            anyhow::bail!("cannot activate a shard set with mixed resulting fence epochs");
+        }
+        if topology.epoch.0 != expected_epoch {
+            anyhow::bail!(
+                "--chain-epoch {} is an assertion; FDB fence activation would produce epoch {expected_epoch}",
+                topology.epoch.0
+            );
+        }
+    }
+    let ActivationOutcome::Activated { rows } = fence
+        .activate_shards(GridId::ROOT, topology.node_id, &requests)
+        .await?
+    else {
+        anyhow::bail!("startup fence activation conflicted; retry after refreshing topology");
+    };
+    let epoch = rows
+        .first()
+        .map(|(_, row)| row.epoch)
+        .unwrap_or(Epoch::new(0));
+    if rows.iter().any(|(_, row)| row.epoch != epoch) {
+        anyhow::bail!("startup fence activation returned mixed epochs");
+    }
+    Ok(StartupActivation {
+        epoch,
+        promoted_source_epoch: source_epoch,
+    })
+}
+
 fn gateway_config<F>(
     cli: &Cli,
     secret_key: Option<iroh::SecretKey>,
@@ -505,19 +643,29 @@ impl Topology {
     /// it is deterministically embedded in a `NodeId` because the gRPC chain
     /// protocol shares that typed identity with the iroh-facing architecture.
     fn chain_id(&self) -> Option<DurableChainId> {
+        self.chain_id_at(self.epoch.0)
+    }
+
+    fn chain_id_at(&self, epoch: u64) -> Option<DurableChainId> {
         match self.role {
             TopologyRole::Single => None,
             TopologyRole::Primary { follower } => Some(DurableChainId {
                 primary_node: chain_node_id(self.node_id),
                 follower_node: chain_node_id(follower.node_id),
                 shard_set: canonical_shard_set(GridId::ROOT, &self.shards),
-                epoch: self.epoch.0,
+                epoch,
             }),
             TopologyRole::Follower { primary, .. } => Some(DurableChainId {
                 primary_node: chain_node_id(primary),
                 follower_node: chain_node_id(self.node_id),
                 shard_set: canonical_shard_set(GridId::ROOT, &self.shards),
-                epoch: self.epoch.0,
+                epoch,
+            }),
+            TopologyRole::Promotion { primary, .. } => Some(DurableChainId {
+                primary_node: chain_node_id(primary),
+                follower_node: chain_node_id(self.node_id),
+                shard_set: canonical_shard_set(GridId::ROOT, &self.shards),
+                epoch,
             }),
         }
     }
@@ -525,7 +673,9 @@ impl Topology {
     fn follower(&self) -> Option<ChainFollower> {
         match self.role {
             TopologyRole::Primary { follower } => Some(follower),
-            TopologyRole::Single | TopologyRole::Follower { .. } => None,
+            TopologyRole::Single
+            | TopologyRole::Follower { .. }
+            | TopologyRole::Promotion { .. } => None,
         }
     }
 }
@@ -538,6 +688,9 @@ enum TopologyRole {
     Primary { follower: ChainFollower },
     /// A passive journal mirror and gRPC listener, never a gateway.
     Follower { primary: u64, listen: SocketAddr },
+    /// A former follower that has atomically fenced `primary` and may now
+    /// recover its mirrored history and expose a gateway.
+    Promotion { primary: u64, listen: SocketAddr },
 }
 
 impl TopologyRole {
@@ -546,6 +699,7 @@ impl TopologyRole {
             Self::Single => "single",
             Self::Primary { .. } => "primary",
             Self::Follower { .. } => "follower",
+            Self::Promotion { .. } => "promoted-primary",
         }
     }
 }
@@ -574,29 +728,37 @@ fn resolve_topology(cli: &Cli) -> anyhow::Result<Topology> {
     );
     validate_followers(&cli.chain_follower, node_id)?;
 
-    let role = match (cli.chain_listen, cli.chain_follower.as_slice(), cli.chain_primary) {
-        (None, [follower], None) => TopologyRole::Primary {
+    let role = match (cli.chain_listen, cli.chain_follower.as_slice(), cli.chain_primary, cli.promote_from) {
+        (None, [follower], None, None) => TopologyRole::Primary {
             follower: *follower,
         },
-        (Some(listen), [], Some(primary)) => {
+        (None, [..], None, Some(_)) => anyhow::bail!(
+            "--promote-from is valid only for a passive follower (--chain-listen --chain-primary)"
+        ),
+        (Some(listen), [], Some(primary), None) => {
             if primary == node_id {
                 anyhow::bail!("--chain-primary cannot name the local --node-id {node_id}");
             }
             TopologyRole::Follower { primary, listen }
         }
-        (None, [], _) => anyhow::bail!(
+        (Some(listen), [], Some(primary), Some(promote_from)) => {
+            if promote_from != primary { anyhow::bail!("--promote-from must equal --chain-primary for the follower being promoted"); }
+            if primary == node_id { anyhow::bail!("--chain-primary cannot name the local --node-id {node_id}"); }
+            TopologyRole::Promotion { primary, listen }
+        }
+        (None, [], _, _) => anyhow::bail!(
             "clustered primary requires exactly one --chain-follower <node-id>@<addr>"
         ),
-        (None, [_, _, ..], None) => anyhow::bail!(
+        (None, [_, _, ..], None, _) => anyhow::bail!(
             "clustered primary requires exactly one --chain-follower <node-id>@<addr>"
         ),
-        (Some(_), [], None) => anyhow::bail!(
+        (Some(_), [], None, _) => anyhow::bail!(
             "clustered follower requires --chain-primary <node-id> with --chain-listen"
         ),
-        (Some(_), [..], _) => anyhow::bail!(
+        (Some(_), [..], _, _) => anyhow::bail!(
             "a clustered process is either primary (--chain-follower) or follower (--chain-listen --chain-primary), not both"
         ),
-        (None, [..], Some(_)) => anyhow::bail!(
+        (None, [..], Some(_), _) => anyhow::bail!(
             "a clustered primary uses --chain-follower; --chain-primary is follower-only"
         ),
     };
@@ -751,6 +913,7 @@ mod tests {
             chain_listen: None,
             chain_primary: None,
             chain_epoch: None,
+            promote_from: None,
             chain_follower: Vec::new(),
             bind: "127.0.0.1:0".parse().expect("valid loopback bind"),
             fdb_cluster_file,
@@ -881,6 +1044,52 @@ mod tests {
         let chain = topology.chain_id().expect("clustered chain id");
         assert_eq!(chain.primary_node, chain_node_id(7));
         assert_eq!(chain.follower_node, chain_node_id(8));
+    }
+
+    #[test]
+    fn promotion_is_explicitly_tied_to_its_failed_primary() {
+        let mut cli = cli(Some(PathBuf::from("/tmp/fdb.cluster")));
+        cli.node_id = Some(8);
+        cli.chain_epoch = Some(2);
+        cli.chain_primary = Some(7);
+        cli.chain_listen = Some("127.0.0.1:3001".parse().unwrap());
+        cli.promote_from = Some(7);
+
+        let topology = resolve_topology(&cli).expect("promotion topology");
+        assert!(matches!(
+            topology.role,
+            TopologyRole::Promotion { primary: 7, .. }
+        ));
+        assert_eq!(topology.chain_id_at(1).unwrap().epoch, 1);
+    }
+
+    #[tokio::test]
+    async fn ordinary_startup_refuses_a_foreign_fence_owner() {
+        let mut cli = cli(None);
+        cli.node_id = Some(2);
+        cli.chain_epoch = Some(2);
+        cli.chain_follower = vec![ChainFollower {
+            node_id: 3,
+            addr: "127.0.0.1:3001".parse().unwrap(),
+        }];
+        let topology = resolve_topology(&cli).unwrap();
+        let store = orrery_persistd::MemFenceStore::new();
+        let first = store
+            .activate_shards(
+                GridId::ROOT,
+                1,
+                &[ShardActivation {
+                    shard: CellId::ROOT,
+                    expected: None,
+                }],
+            )
+            .await
+            .unwrap();
+        assert!(matches!(first, ActivationOutcome::Activated { .. }));
+        let err = activate_topology(&topology, &store, false)
+            .await
+            .expect_err("stale former primary must be rejected");
+        assert!(err.to_string().contains("owned by node 1"));
     }
 
     #[test]
