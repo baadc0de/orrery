@@ -49,11 +49,11 @@ use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::net::SocketAddr;
 use std::path::Path;
 use std::process::ExitCode;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use bytes::Bytes;
 use clap::Parser;
 use futures::FutureExt;
@@ -64,7 +64,7 @@ use serde::{Deserialize, Serialize};
 use orrery_persist_client::config::PersistClientConfig;
 use orrery_persist_client::latency::LatencyHistogram;
 use orrery_persist_client::{IntentQueue, UplinkScheduler};
-use orrery_protocol::channels::{Channel, encode_datagram, encode_stream_frame, untag};
+use orrery_protocol::channels::{encode_datagram, encode_stream_frame, untag, Channel};
 use orrery_protocol::{
     Attestation, CellId, DiffUplink, Epoch, GatewayMsg, GatewayReply, GridId, Intent, IntentOp,
     IntentOutcome, NodeId, PersistId, RecordKind, Tick,
@@ -72,8 +72,8 @@ use orrery_protocol::{
 
 use cli::Cli;
 use evidence::{
-    AckRecord, DiffEvidence, IntentOutcomeEvidence, RecoveredDiff, RecoveredEvidence,
-    compare_recovery,
+    compare_recovery, AckRecord, DiffEvidence, IntentOutcomeEvidence, RecoveredDiff,
+    RecoveredEvidence,
 };
 use telemetry::{RunContext, TelemetrySink};
 
@@ -86,6 +86,15 @@ const GATEWAY_ALPN: &[u8] = b"orrery/gateway/0";
 /// loop the scheduler is designed around) and gives the per-session fan-out
 /// math its denominator.
 const FLUSH_HZ: u64 = 20;
+
+/// Connection flushes are spread through one 20 Hz frame.  The P2 profile
+/// needs 125 independent scheduler budgets; flushing all of them at one frame
+/// boundary creates a 1,000-datagram burst (125 sessions × 8 diffs) even
+/// though each session independently satisfies its 160 diff/s budget.  Keep
+/// every individual scheduler at 20 Hz, but distribute their frames over
+/// these slots to make the load generator measure append latency rather than
+/// an artificial client-side burst.
+const SESSION_FLUSH_PHASE_SLOTS: usize = 20;
 
 /// The per-session flush byte budget, = the D16 client default
 /// (`PersistClientConfig::flush_budget_bytes`, 1024). One session sustains
@@ -547,6 +556,14 @@ fn registration_phase(index: usize, sessions: usize, phase_slots: usize) -> u64 
     debug_assert!(sessions > 0);
     debug_assert!(phase_slots > 0);
     ((index / sessions) % phase_slots) as u64
+}
+
+/// The intra-frame flush phase for a connection-local scheduler.
+///
+/// Round-robin assignment keeps the number of sessions (and therefore the
+/// number of independently-budgeted datagrams) within one in every phase.
+fn session_flush_phase(session: usize) -> usize {
+    session % SESSION_FLUSH_PHASE_SLOTS
 }
 
 /// Build one D16 scheduler per live connection, registering each entity with
@@ -1058,7 +1075,12 @@ impl Rig<'_> {
         let phase_slots = registration_phase_slots(self.diff_hz);
         let start = Instant::now();
         let mut elapsed = Duration::ZERO;
-        let mut next_flush = start;
+        let mut next_queue = start;
+        let session_phase_period =
+            Duration::from_secs_f64(1.0 / (FLUSH_HZ * SESSION_FLUSH_PHASE_SLOTS as u64) as f64);
+        let mut next_session_flush = (0..sessions)
+            .map(|session| start + session_phase_period * session_flush_phase(session) as u32)
+            .collect::<Vec<_>>();
 
         while start.elapsed() < self.duration {
             // ── Receive: drain every pending datagram on every session ──
@@ -1088,8 +1110,12 @@ impl Rig<'_> {
                 );
             }
 
-            // ── Load: queue each entity's diff for this flush window ─────
-            if start.elapsed() >= next_flush.duration_since(start) {
+            // ── Load: queue each entity's diff for this global frame ─────
+            //
+            // Queueing is global so a state change is available to its owner
+            // on that owner's next 20 Hz flush. The actual scheduler flushes
+            // below are connection-phased: a frame is not a 125-session burst.
+            if Instant::now() >= next_queue {
                 // Compute each entity's current cell from its trajectory and
                 // queue a fresh diff (newest-wins replaces the pending one).
                 // Registrations are deliberately phased during the first
@@ -1115,52 +1141,64 @@ impl Rig<'_> {
                 }
                 tick.fetch_add(1, Ordering::Relaxed);
 
-                // Flush every per-connection scheduler. Each flush receives
-                // its own D16 byte budget, matching `check_fan_out`.
-                for (session, sched) in schedulers.iter_mut().enumerate() {
-                    let out = sched.flush(&cfg, elapsed);
-                    for diff in out {
-                        // Intent mix: a fraction of sends is upgraded to an intent
-                        // instead of a diff (docs/12 §12.3 `intent_mix`). The
-                        // decision is deterministic per (entity, send index).
-                        if let Some(kind) = self.intent_for(diff.entity, diff.seq) {
-                            let id = intent_id(diff.entity, diff.seq);
-                            let intent = self.make_intent(id, kind);
-                            if intents.submit(intent).is_some() {
-                                stats.intents_sent += 1;
-                            }
-                            // The diff is still sent: the intent is *in addition
-                            // to* the bulk stream (trades/crafts do not replace
-                            // the entity's state diff).
-                        }
-                        send_msg(
-                            &self.sessions[session],
-                            &GatewayMsg::Diff { diff: diff.clone() },
-                        );
-                        self.pending_diffs.insert(
-                            (diff.entity, diff.tick),
-                            DiffEvidence {
-                                grid: diff.grid,
-                                cell: diff.cell,
-                                entity: diff.entity,
-                                tick: diff.tick,
-                                // The LSN is supplied by the durable ack.
-                                lsn: orrery_protocol::Lsn::new(0, 0),
-                                payload_digest: blake3::hash(&diff.payload).to_hex().to_string(),
-                            },
-                        );
-                        stats.diffs_sent += 1;
-                    }
-                }
-                // Drain queued intents to the wire.
-                for intent in intents.drain() {
-                    send_msg(
-                        &self.sessions[(intent.intent_id as usize) % sessions],
-                        &GatewayMsg::SubmitIntent { intent },
-                    );
-                }
+                next_queue += flush_period;
+            }
 
-                next_flush += flush_period;
+            // Flush each connection at 20 Hz, offset within the global frame.
+            // Each shard retains its own byte budget; only *when* its packets
+            // are released changes. This removes a synthetic 1,000-packet
+            // burst from the rig without reducing its 20,000 diff/s profile.
+            let now = Instant::now();
+            for (session, sched) in schedulers.iter_mut().enumerate() {
+                if now < next_session_flush[session] {
+                    continue;
+                }
+                let out = sched.flush(&cfg, elapsed);
+                for diff in out {
+                    // Intent mix: a fraction of sends is upgraded to an intent
+                    // instead of a diff (docs/12 §12.3 `intent_mix`). The
+                    // decision is deterministic per (entity, send index).
+                    if let Some(kind) = self.intent_for(diff.entity, diff.seq) {
+                        let id = intent_id(diff.entity, diff.seq);
+                        let intent = self.make_intent(id, kind);
+                        if intents.submit(intent).is_some() {
+                            stats.intents_sent += 1;
+                        }
+                        // The diff is still sent: the intent is *in addition
+                        // to* the bulk stream (trades/crafts do not replace
+                        // the entity's state diff).
+                    }
+                    send_msg(
+                        &self.sessions[session],
+                        &GatewayMsg::Diff { diff: diff.clone() },
+                    );
+                    self.pending_diffs.insert(
+                        (diff.entity, diff.tick),
+                        DiffEvidence {
+                            grid: diff.grid,
+                            cell: diff.cell,
+                            entity: diff.entity,
+                            tick: diff.tick,
+                            // The LSN is supplied by the durable ack.
+                            lsn: orrery_protocol::Lsn::new(0, 0),
+                            payload_digest: blake3::hash(&diff.payload).to_hex().to_string(),
+                        },
+                    );
+                    stats.diffs_sent += 1;
+                }
+                // If a runtime stall skips a phase, resume this session on
+                // its regular cadence rather than issuing catch-up bursts.
+                next_session_flush[session] = now + flush_period;
+            }
+
+            // Drain queued intents to the wire after the phased bulk sends.
+            // A load phase produces only its matching intent subset, so this
+            // control traffic is phased with the bulk work as well.
+            for intent in intents.drain() {
+                send_msg(
+                    &self.sessions[(intent.intent_id as usize) % sessions],
+                    &GatewayMsg::SubmitIntent { intent },
+                );
             }
 
             // ── Telemetry drain (bounded-memory histograms → JSONL) ──────
@@ -1508,6 +1546,21 @@ mod tests {
 
         assert_eq!(global, vec![1_000; slots]);
         assert!(per_session.iter().all(|counts| counts == &vec![8; slots]));
+    }
+
+    #[test]
+    fn session_flush_phases_spread_default_fan_out_within_a_frame() {
+        // The default P2 fan-out has 125 independent connections. They must
+        // not all flush on the same 50 ms boundary: with eight diffs per
+        // session that would make an artificial 1,000-packet burst. Twenty
+        // intra-frame phases leave six or seven sessions in each 2.5 ms slot.
+        let mut counts = vec![0usize; SESSION_FLUSH_PHASE_SLOTS];
+        for session in 0..125 {
+            counts[session_flush_phase(session)] += 1;
+        }
+        assert_eq!(counts.iter().sum::<usize>(), 125);
+        assert_eq!(*counts.iter().min().unwrap(), 6);
+        assert_eq!(*counts.iter().max().unwrap(), 7);
     }
 
     #[test]
