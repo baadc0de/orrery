@@ -61,28 +61,34 @@ That keeps the failure model simple: one writer, one mirror, one recovery source
 
 ## 3. gRPC protocol
 
-Use tonic/gRPC for node-to-node transport, with one long-lived bidirectional stream per `(primary_id, follower_id, shard_set, epoch)` tuple. A session identity is explicit so reconnects cannot silently cross streams.
+Use tonic/gRPC for node-to-node transport, with one long-lived bidirectional stream per `(primary_id, follower_id, shard_set, epoch)` tuple. The durable chain identity is distinct from an ephemeral connection session, so reconnects preserve dedupe state without silently crossing ownership streams.
 
 ### 3.1 Stream identity
 
 Suggested envelope:
 
 ```rust
-pub struct ChainStreamId {
+pub struct DurableChainId {
     pub primary_node: NodeId,
     pub follower_node: NodeId,
     pub shard_set: ShardSetId,
     pub epoch: u64,
+}
+
+pub struct ChainSession {
+    pub chain: DurableChainId,
     pub session_nonce: u128,
 }
 ```
 
-The identity must change when:
+`DurableChainId` must change when:
 
 - the ownership epoch changes,
 - the shard set is reassigned,
 - the follower is replaced,
-- or the stream is re-established after an explicit reconnect.
+
+`session_nonce` changes on every reconnect, but never participates in durable
+dedupe or watermark lookup.
 
 This prevents a stale primary from resuming onto a new follower session without an intentional restart handshake.
 
@@ -92,7 +98,7 @@ Records move in batches so the transport amortizes framing and syscalls:
 
 ```rust
 pub struct AppendBatch {
-    pub stream_id: ChainStreamId,
+    pub session: ChainSession,
     pub batch_seq: u64,
     pub first_lsn: Lsn,
     pub records: Vec<JournalRecord>,
@@ -112,7 +118,7 @@ The follower replies after the batch is durably appended:
 
 ```rust
 pub struct DurableAck {
-    pub stream_id: ChainStreamId,
+    pub session: ChainSession,
     pub batch_seq: u64,
     pub durable_through: Lsn,
     pub follower_watermark: Lsn,
@@ -135,7 +141,7 @@ The follower must survive duplicates and restarts without inventing a new write 
 
 The follower dedupes by durable stream identity plus primary LSN:
 
-- `(stream_id, record.lsn)` is the stable identity of a mirrored record.
+- `(durable_chain_id, record.lsn)` is the stable identity of a mirrored record.
 - A record already persisted in the follower journal must be rejected as a harmless duplicate.
 - Duplicate batches are expected during reconnects and retries; they are not exceptional.
 
@@ -149,15 +155,15 @@ Implementation consequence:
 On follower restart:
 
 1. Open the local journal.
-2. Rebuild the highest contiguous watermark per active stream from durable records.
+2. Rebuild the highest contiguous watermark per durable chain from durable records.
 3. Rebuild the dedupe cursor from the same durable source.
-4. Resume accepting `AppendBatch` messages only after the stream identity is revalidated.
+4. Resume accepting `AppendBatch` messages only after the durable chain identity is revalidated.
 
 On primary restart:
 
 1. Load the last locally committed LSN.
 2. Query the follower's watermark for the previous stream.
-3. Resume replication from `max(local_committed, follower_watermark) + 1`.
+3. Scan its local journal from `follower_watermark + 1` and resend that tail.
 4. Replay any unconfirmed tail records as idempotent resends.
 
 This is why the protocol needs a watermark rather than a simple last-seen batch id: the recovery point is an LSN, not a transport message counter.
@@ -183,13 +189,13 @@ The design assumes failures happen while one side is still live.
 ### Network partition
 
 - Transient disconnects are treated as stream loss, not as logical data loss.
-- The primary retries the same stream identity until it is explicitly superseded.
-- The follower rejects stale batches by stream identity and batch sequence.
+- The primary retries the same durable chain identity with a fresh session nonce until it is explicitly superseded.
+- The follower rejects stale batches by durable chain identity, session nonce, and batch sequence.
 - If the stream cannot be re-established within the alarm window, page ops and mark the shard set as running without chain protection.
 
 ### Reconnect rules
 
-- Reconnect is always explicit, with a fresh `session_nonce`.
+- Reconnect is always explicit, with a fresh `session_nonce` but the same durable chain identity.
 - The primary must perform a watermark probe before sending new records.
 - The follower must not accept writes for an old stream identity after a new identity is established.
 
