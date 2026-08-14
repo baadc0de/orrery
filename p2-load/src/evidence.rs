@@ -78,6 +78,11 @@ pub enum EvidenceMismatch {
         expected: DiffEvidence,
         actual: RecoveredDiff,
     },
+    /// Recovered materialized state predates the last durable acknowledgement.
+    RegressedBulk {
+        expected: DiffEvidence,
+        actual: RecoveredDiff,
+    },
     MissingIntent {
         intent_id: String,
     },
@@ -109,9 +114,12 @@ impl EvidenceReport {
 /// Compare durable acknowledgements to recovered state.
 ///
 /// Bulk state is last-writer-wins, so only the largest acknowledged tick per
-/// `(grid, entity)` is asserted. Committed intent outcomes are idempotency
-/// rows and are asserted exactly. Rejected edge replies are counted for audit
-/// but not queried from FDB: they intentionally may have no idempotency row.
+/// `(grid, entity)` is asserted. A recovered state with a later tick is a
+/// valid successor (it may have arrived after the recovery cutoff); a state
+/// with an earlier tick is a regression. At the same tick, cell and payload
+/// must match exactly. Committed intent outcomes are idempotency rows and are
+/// asserted exactly. Rejected edge replies are counted for audit but not
+/// queried from FDB: they intentionally may have no idempotency row.
 /// Provisional bulk acks never reach [`AckRecord::Diff`] and therefore cannot
 /// enter this proof.
 #[must_use]
@@ -157,10 +165,16 @@ pub fn compare_recovery(records: &[AckRecord], recovered: &RecoveredEvidence) ->
                 grid: expected.grid,
                 entity: expected.entity,
             }),
+            Some(actual) if actual.tick < expected.tick => {
+                report.mismatches.push(EvidenceMismatch::RegressedBulk {
+                    expected,
+                    actual: actual.clone(),
+                });
+            }
             Some(actual)
-                if actual.cell != expected.cell
-                    || actual.tick != expected.tick
-                    || actual.payload_digest != expected.payload_digest =>
+                if actual.tick == expected.tick
+                    && (actual.cell != expected.cell
+                        || actual.payload_digest != expected.payload_digest) =>
             {
                 report.mismatches.push(EvidenceMismatch::DifferentBulk {
                     expected,
@@ -267,6 +281,67 @@ mod tests {
             )]),
         };
         assert_eq!(compare_recovery(&records, &recovered).mismatches.len(), 2);
+    }
+
+    #[test]
+    fn accepts_a_newer_recovered_bulk_successor() {
+        let records = vec![AckRecord::Diff(diff(11, "expected"))];
+        let recovered = RecoveredEvidence {
+            diffs: vec![RecoveredDiff {
+                grid: GridId::ROOT,
+                cell: CellId::ROOT,
+                entity: PersistId::new(7),
+                tick: Tick::new(12),
+                payload_digest: "newer-payload".into(),
+            }],
+            intents: BTreeMap::new(),
+        };
+
+        assert!(compare_recovery(&records, &recovered).passes());
+    }
+
+    #[test]
+    fn reports_an_older_recovered_bulk_as_a_regression() {
+        let expected = diff(11, "expected");
+        let records = vec![AckRecord::Diff(expected.clone())];
+        let actual = RecoveredDiff {
+            grid: GridId::ROOT,
+            cell: CellId::ROOT,
+            entity: PersistId::new(7),
+            tick: Tick::new(10),
+            payload_digest: "older-payload".into(),
+        };
+        let recovered = RecoveredEvidence {
+            diffs: vec![actual.clone()],
+            intents: BTreeMap::new(),
+        };
+
+        assert_eq!(
+            compare_recovery(&records, &recovered).mismatches,
+            vec![EvidenceMismatch::RegressedBulk { expected, actual }]
+        );
+    }
+
+    #[test]
+    fn requires_an_exact_bulk_match_at_the_same_tick() {
+        let expected = diff(11, "expected");
+        let records = vec![AckRecord::Diff(expected.clone())];
+        let actual = RecoveredDiff {
+            grid: GridId::ROOT,
+            cell: CellId::ROOT,
+            entity: PersistId::new(7),
+            tick: Tick::new(11),
+            payload_digest: "different-payload".into(),
+        };
+        let recovered = RecoveredEvidence {
+            diffs: vec![actual.clone()],
+            intents: BTreeMap::new(),
+        };
+
+        assert_eq!(
+            compare_recovery(&records, &recovered).mismatches,
+            vec![EvidenceMismatch::DifferentBulk { expected, actual }]
+        );
     }
 
     #[test]
