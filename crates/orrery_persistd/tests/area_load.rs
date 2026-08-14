@@ -29,7 +29,7 @@ use bytes::Bytes;
 use iroh::RelayMode;
 use orrery_persistd::actor::{EntityRecord, Reject, SnapshotPage};
 use orrery_persistd::checkpoint::{CheckpointStore, MemCheckpointStore};
-use orrery_persistd::journal::{AdaptiveCommitMode, GroupCommitConfig};
+use orrery_persistd::journal::{AdaptiveCommitMode, AppendHandle, GroupCommitConfig};
 use orrery_persistd::{
     payload_crc, CellRuntime, GatewayConfig, GatewayServer, JournalConfig, MemFenceStore, Router,
     RuntimeConfig, GATEWAY_ALPN,
@@ -154,8 +154,8 @@ struct ScriptedRouter {
 
 #[async_trait::async_trait]
 impl Router for ScriptedRouter {
-    async fn apply(&self, _record: JournalRecord) -> Result<Lsn, Reject> {
-        Ok(Lsn::new(1, 0))
+    async fn apply(&self, _record: JournalRecord) -> Result<Arc<AppendHandle>, Reject> {
+        Ok(AppendHandle::completed(Lsn::new(1, 0)))
     }
 
     async fn read(&self, _grid: GridId, cell: CellId) -> Result<SnapshotPage, Reject> {
@@ -186,7 +186,7 @@ struct BlockingApplyRouter {
 
 #[async_trait::async_trait]
 impl Router for BlockingApplyRouter {
-    async fn apply(&self, _record: JournalRecord) -> Result<Lsn, Reject> {
+    async fn apply(&self, _record: JournalRecord) -> Result<Arc<AppendHandle>, Reject> {
         self.applied.fetch_add(1, Ordering::SeqCst);
         std::future::pending::<()>().await;
         unreachable!("pending never resolves")
@@ -206,8 +206,8 @@ struct FailingColdRouter;
 
 #[async_trait::async_trait]
 impl Router for FailingColdRouter {
-    async fn apply(&self, _record: JournalRecord) -> Result<Lsn, Reject> {
-        Ok(Lsn::new(1, 0))
+    async fn apply(&self, _record: JournalRecord) -> Result<Arc<AppendHandle>, Reject> {
+        Ok(AppendHandle::completed(Lsn::new(1, 0)))
     }
 
     async fn read(&self, _grid: GridId, _cell: CellId) -> Result<SnapshotPage, Reject> {
@@ -761,7 +761,7 @@ async fn area_load_end_to_end_cold_cell_served() {
     struct NoLive;
     #[async_trait::async_trait]
     impl Router for NoLive {
-        async fn apply(&self, _record: JournalRecord) -> Result<Lsn, Reject> {
+        async fn apply(&self, _record: JournalRecord) -> Result<Arc<AppendHandle>, Reject> {
             Err(Reject::JournalClosed)
         }
         async fn read(&self, _grid: GridId, _cell: CellId) -> Result<SnapshotPage, Reject> {

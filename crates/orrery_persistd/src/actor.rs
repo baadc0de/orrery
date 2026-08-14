@@ -13,7 +13,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use orrery_protocol::{CellId, Epoch, GridId, JournalRecord, Lsn, PersistId, RecordKind, Tick};
 
-use crate::journal::Journal;
+use crate::journal::{AppendHandle, Journal};
 
 /// How long a despawned entity's `world/` tombstone persists before the
 /// checkpoint GC pass clears it (D11 §6). Must comfortably exceed the 20 s
@@ -127,16 +127,14 @@ pub enum CellMsg {
     /// authority — the gateway's `Epoch::new(0)` is a placeholder, D11 §2.1),
     /// appends it to the journal and folds it into hot state **synchronously**
     /// (so LSN assignment order, hot-state order, and mailbox order agree,
-    /// §3.1), then hands only the durability wait to a per-append resolver
-    /// task. The mailbox returns to `rx.recv()` immediately; the client's
-    /// ack resolves only after the group fsync, so the ack still *is* the
-    /// durability contract (§2.1) — and because the fold precedes the ack,
-    /// an acked write is always reflected in state.
+    /// §3.1), then returns the pending append handle. The mailbox returns to
+    /// `rx.recv()` immediately; the gateway route task owns the durability
+    /// wait and only acks after group fsync (§2.1).
     ApplyDiff {
         /// The record to apply.
         record: JournalRecord,
         /// Reply channel for the result.
-        reply: oneshot::Sender<Result<Lsn, Reject>>,
+        reply: oneshot::Sender<Result<Arc<AppendHandle>, Reject>>,
     },
     /// Read a snapshot of the given cells.
     ReadSnapshot {
@@ -283,21 +281,19 @@ fn now_ms() -> u64 {
 }
 
 /// Apply a diff: stamp the epoch, journal the record, fold it into hot state,
-/// and hand only the durability wait to a resolver task — so the mailbox
-/// returns to `rx.recv()` immediately instead of serializing on the fsync.
+/// and return the pending append handle — so the mailbox returns to
+/// `rx.recv()` immediately instead of serializing on the fsync.
 ///
 /// The record is stamped, journaled, and folded synchronously (this is the
 /// serial single-writer section — LSN assignment order and hot-state order
-/// are both mailbox order, §3.1), then the [`AppendHandle`] plus the reply
-/// oneshot move to a spawned resolver. The resolver awaits the group fsync
-/// and only then sends the ack, so the ack still *is* the durability
-/// contract (§2.1: an acked write survives a crash even if the Fold had been
-/// deferred), while many appends from one actor coexist in the commit queue
-/// and share fsyncs (§4 adaptive group commit, D16).
+/// are both mailbox order, §3.1), then the [`AppendHandle`] moves back to the
+/// gateway route task through the reply oneshot. That task awaits group fsync
+/// before sending the ack, while many appends from one actor coexist in the
+/// commit queue and share fsyncs (§4 adaptive group commit, D16).
 fn apply_diff(
     env: &mut ActorEnv,
     mut record: JournalRecord,
-    reply: oneshot::Sender<Result<Lsn, Reject>>,
+    reply: oneshot::Sender<Result<Arc<AppendHandle>, Reject>>,
 ) {
     // The actor is the epoch authority: the record is durably stamped with
     // the shard-ownership epoch here (§3.4), overwriting the gateway's
@@ -316,25 +312,14 @@ fn apply_diff(
     // advances the actor's `ckpt_watermark` past this record.
     record.lsn = handle.lsn();
 
-    // Fold into hot state now, before the resolver exists: an ack resolves
+    // Fold into hot state before returning the handle: an ack resolves
     // only after the record is BOTH durably journaled and reflected in the
     // snapshot, so a kill between commit and fold cannot lose the fold (the
     // fold precedes the ack). Last-writer-wins per entity, keyed by
     // (entity, tick), so replay of the same record is a no-op.
     fold(env, &record, now_ms());
 
-    tokio::spawn(async move {
-        let lsn = handle.lsn();
-        // `committed` resolves with the batch's max LSN; the ack must carry
-        // THIS append's LSN, so checkpoint watermarks compare against the
-        // right position.
-        let result = handle
-            .committed()
-            .await
-            .map(|_| lsn)
-            .map_err(|_| Reject::JournalClosed);
-        let _ = reply.send(result);
-    });
+    let _ = reply.send(Ok(handle));
 }
 
 /// Fold a journal record into in-memory state (no durability work).
@@ -508,14 +493,26 @@ impl ActorJoinSet {
 }
 
 impl CellActorHandle {
-    /// Apply a diff, awaiting the durable LSN.
-    pub async fn apply_diff(&self, record: JournalRecord) -> Result<Lsn, Reject> {
+    /// Stamp, append, and fold a diff, returning its pending durability handle.
+    /// The caller owns the wait so the actor creates no task per append.
+    pub async fn start_diff(&self, record: JournalRecord) -> Result<Arc<AppendHandle>, Reject> {
         let (reply, rx) = oneshot::channel();
         self.tx
             .send(CellMsg::ApplyDiff { record, reply })
             .await
             .map_err(|_| Reject::JournalClosed)?;
         rx.await.map_err(|_| Reject::JournalClosed)?
+    }
+
+    /// Apply a diff, awaiting its own durable LSN.
+    pub async fn apply_diff(&self, record: JournalRecord) -> Result<Lsn, Reject> {
+        let handle = self.start_diff(record).await?;
+        let lsn = handle.lsn();
+        handle
+            .committed()
+            .await
+            .map(|_| lsn)
+            .map_err(|_| Reject::JournalClosed)
     }
 
     /// Read a snapshot of the given cells.

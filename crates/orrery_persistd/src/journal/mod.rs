@@ -91,6 +91,23 @@ impl AppendHandle {
         }
     }
 
+    /// Construct an already-durable handle for router adapters that do not
+    /// own a journal (principally deterministic gateway harnesses).
+    ///
+    /// Production cell actors return handles created by [`Journal::append`];
+    /// this constructor exists so alternate [`crate::Router`] implementations
+    /// can still satisfy the same durability-handle contract.
+    #[must_use]
+    pub fn completed(lsn: Lsn) -> std::sync::Arc<Self> {
+        let handle = std::sync::Arc::new(Self::new(
+            lsn,
+            std::time::Instant::now(),
+            std::sync::Arc::new(metrics::JournalCommitMetrics::new()),
+        ));
+        handle.resolve(Ok(lsn));
+        handle
+    }
+
     fn resolve(&self, result: Result<Lsn, JournalError>) {
         if result.is_ok() {
             self.metrics.record(self.started.elapsed());

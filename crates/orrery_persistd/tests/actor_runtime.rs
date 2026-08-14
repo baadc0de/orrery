@@ -89,6 +89,43 @@ async fn actor_applies_and_snapshot_reflects() {
 }
 
 #[tokio::test]
+async fn actor_returns_pending_handle_after_fold_without_resolver_task() {
+    let dir = tempfile::tempdir().unwrap();
+    // `runtime_config(..., true)` holds a one-record group for 100 ms, making
+    // the boundary between actor work and durability deterministic.
+    let rt = CellRuntime::open(&runtime_config(dir.path(), true), &mem_store()).unwrap();
+    let actor = rt
+        .actor(GridId::ROOT, CellId::ROOT)
+        .expect("root actor")
+        .clone();
+
+    let handle = tokio::time::timeout(
+        Duration::from_millis(20),
+        actor.start_diff(mk_record(CellId::ROOT, 88, RecordKind::Spawn, b"pending")),
+    )
+    .await
+    .expect("mailbox returns before the group fsync")
+    .expect("append accepted");
+
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), handle.committed())
+            .await
+            .is_err(),
+        "returned handle must still represent the pending durability wait"
+    );
+    let page = rt.read(GridId::ROOT, CellId::ROOT).await.unwrap();
+    assert_eq!(
+        page.entities[&PersistId::new(88)].components.as_ref(),
+        b"pending",
+        "fold precedes returning the pending handle"
+    );
+
+    let committed = handle.committed().await.unwrap();
+    assert_eq!(committed, handle.lsn());
+    rt.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn read_snapshot_filters_to_requested_cells() {
     let dir = tempfile::tempdir().unwrap();
     let rt = CellRuntime::open(&runtime_config(dir.path(), true), &mem_store()).unwrap();
@@ -173,9 +210,10 @@ async fn concurrent_diffs_batch_into_fewer_fsyncs() {
         let router = Arc::clone(&router);
         waiters.push(tokio::spawn(async move {
             let rec = mk_record(CellId::ROOT, i, RecordKind::Spawn, &i.to_le_bytes());
-            orrery_persistd::Router::apply(router.as_ref(), rec)
+            let append = orrery_persistd::Router::apply(router.as_ref(), rec)
                 .await
-                .unwrap()
+                .unwrap();
+            append.committed().await.unwrap()
         }));
     }
     for w in waiters {
@@ -237,9 +275,10 @@ async fn concurrent_diffs_stay_last_writer_wins() {
         let payload = format!("burst-{i}").into_bytes();
         waiters.push(tokio::spawn(async move {
             let rec = mk_record(CellId::ROOT, 9, RecordKind::ComponentDiff, &payload);
-            orrery_persistd::Router::apply(router.as_ref(), rec)
+            let append = orrery_persistd::Router::apply(router.as_ref(), rec)
                 .await
                 .unwrap();
+            append.committed().await.unwrap();
             payload
         }));
     }

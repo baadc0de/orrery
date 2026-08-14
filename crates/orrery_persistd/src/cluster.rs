@@ -23,7 +23,9 @@ use orrery_protocol::GridId;
 use orrery_protocol::JournalRecord;
 
 use crate::actor::{Reject, SnapshotPage};
-use crate::journal::{ChainConfig, ChainReplicator, ChainTransport, JournalChainSink};
+use crate::journal::{
+    AppendHandle, ChainConfig, ChainReplicator, ChainTransport, JournalChainSink,
+};
 use crate::placement::{RendezvousHasher, RendezvousNode};
 use crate::runtime::CellRuntime;
 
@@ -36,8 +38,8 @@ use crate::runtime::CellRuntime;
 #[async_trait::async_trait]
 pub trait Router: Send + Sync {
     /// Apply a journal record to the actor owning its cell, returning the
-    /// durable LSN.
-    async fn apply(&self, record: JournalRecord) -> Result<orrery_protocol::Lsn, Reject>;
+    /// handle the gateway must await before acknowledging durability.
+    async fn apply(&self, record: JournalRecord) -> Result<Arc<AppendHandle>, Reject>;
 
     /// Read a snapshot of `cell` in `grid` from its owning actor (P-7:
     /// storage cell ids are grid-relative, so the grid scopes which universe
@@ -69,14 +71,14 @@ pub trait Router: Send + Sync {
 /// queue instead of serializing the whole node behind one fsync (§4).
 #[async_trait::async_trait]
 impl Router for tokio::sync::Mutex<CellRuntime> {
-    async fn apply(&self, record: JournalRecord) -> Result<orrery_protocol::Lsn, Reject> {
+    async fn apply(&self, record: JournalRecord) -> Result<Arc<AppendHandle>, Reject> {
         let handle = {
             let rt = self.lock().await;
             rt.actor(record.grid, record.cell).cloned()
         };
         handle
             .ok_or(Reject::JournalClosed)?
-            .apply_diff(record)
+            .start_diff(record)
             .await
     }
 
@@ -104,7 +106,7 @@ impl Router for tokio::sync::Mutex<CellRuntime> {
 /// router used when FoundationDB is available.
 #[async_trait::async_trait]
 impl Router for Arc<tokio::sync::Mutex<CellRuntime>> {
-    async fn apply(&self, record: JournalRecord) -> Result<orrery_protocol::Lsn, Reject> {
+    async fn apply(&self, record: JournalRecord) -> Result<Arc<AppendHandle>, Reject> {
         self.as_ref().apply(record).await
     }
 
@@ -140,7 +142,7 @@ impl<R> ColdFallbackRouter<R> {
 
 #[async_trait::async_trait]
 impl<R: Router + Send + Sync> Router for ColdFallbackRouter<R> {
-    async fn apply(&self, record: JournalRecord) -> Result<orrery_protocol::Lsn, Reject> {
+    async fn apply(&self, record: JournalRecord) -> Result<Arc<AppendHandle>, Reject> {
         self.live.apply(record).await
     }
 
@@ -285,7 +287,7 @@ fn journal_of(rt: &Arc<tokio::sync::Mutex<CellRuntime>>) -> Arc<crate::journal::
 /// placement assigns it to (docs/08-persistence.md §3.2).
 #[async_trait::async_trait]
 impl Router for Cluster {
-    async fn apply(&self, record: JournalRecord) -> Result<orrery_protocol::Lsn, Reject> {
+    async fn apply(&self, record: JournalRecord) -> Result<Arc<AppendHandle>, Reject> {
         let rt = self
             .runtime_for(record.grid, record.cell)
             .ok_or(Reject::JournalClosed)?;
@@ -295,7 +297,7 @@ impl Router for Cluster {
         };
         handle
             .ok_or(Reject::JournalClosed)?
-            .apply_diff(record)
+            .start_diff(record)
             .await
     }
 

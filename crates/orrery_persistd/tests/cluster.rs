@@ -92,7 +92,8 @@ async fn cluster_routes_by_placement_and_replicates() {
     // A diff routes to the owning node's actor and acks.
     let router: Arc<dyn Router> = Arc::new(cluster);
     let rec = mk_record(CellId::ROOT, 7, RecordKind::Spawn, b"hp=100");
-    let lsn = router.apply(rec.clone()).await.unwrap();
+    let append = router.apply(rec.clone()).await.unwrap();
+    let lsn = append.committed().await.unwrap();
     assert!(lsn >= Lsn::new(0, 0));
 
     // The owning node's runtime reflects the write.

@@ -150,9 +150,10 @@ pub fn run_footer(note: &str) {
 /// those samples out of band (see `p2-load/README.md`).
 #[derive(Debug, Default)]
 pub struct TelemetrySink {
-    /// Watermarks: how many samples per histogram have already been drained,
-    /// so a long run re-emits only the delta.
-    drained: Mutex<BTreeMap<&'static str, u64>>,
+    /// Watermarks for every bucket in every series. Bucket-local cursors are
+    /// required because a later sample can land before samples emitted by an
+    /// earlier drain; a single total-count cursor cannot represent that.
+    drained: Mutex<BTreeMap<&'static str, Vec<u64>>>,
 }
 
 impl TelemetrySink {
@@ -168,27 +169,29 @@ impl TelemetrySink {
     /// which lands the consumer's histogram in the same bucket the rig
     /// recorded — percentiles agree bucket-for-bucket.
     pub fn drain_histogram(&self, series: &'static str, hist: &LatencyHistogram) {
-        let mut drained = self.drained.lock().expect("telemetry sink lock");
-        let already = drained.entry(series).or_insert(0);
-        let total = hist.total();
-        if total <= *already {
-            return;
-        }
-        // Walk buckets in boundary order, skipping the first `already` samples
-        // (they were emitted by a previous drain) and emitting the rest.
-        let mut skip = *already;
-        for (i, &count) in hist.buckets().iter().enumerate() {
-            let mut count = count;
-            if skip >= count {
-                skip -= count;
-                continue;
-            }
-            count -= skip;
-            skip = 0;
-            let value_us = bucket_upper_us(hist, i);
+        for (value_us, count) in self.take_delta(series, hist) {
             sample_batch(series, value_us, count);
         }
-        *already = total;
+    }
+
+    /// Advance this series' per-bucket cursors and return exact bucket deltas.
+    fn take_delta(&self, series: &'static str, hist: &LatencyHistogram) -> Vec<(u64, u64)> {
+        let mut drained = self.drained.lock().expect("telemetry sink lock");
+        let buckets = hist.buckets();
+        let previous = drained
+            .entry(series)
+            .or_insert_with(|| vec![0; buckets.len()]);
+        debug_assert_eq!(previous.len(), buckets.len());
+
+        let mut delta = Vec::new();
+        for (i, (&current, before)) in buckets.iter().zip(previous.iter_mut()).enumerate() {
+            let count = current.saturating_sub(*before);
+            *before = current;
+            if count != 0 {
+                delta.push((bucket_upper_us(hist, i), count));
+            }
+        }
+        delta
     }
 }
 
@@ -228,26 +231,58 @@ mod tests {
         for _ in 0..10 {
             hist.record(Duration::from_micros(1_500));
         }
-        sink.drain_histogram(SERIES_BULK_ACK, &hist);
-        assert_eq!(
-            *sink.drained.lock().unwrap().get(SERIES_BULK_ACK).unwrap(),
-            10
-        );
+        assert_eq!(sink.take_delta(SERIES_BULK_ACK, &hist), vec![(2_000, 10)]);
         // A second drain with no new samples emits nothing.
-        sink.drain_histogram(SERIES_BULK_ACK, &hist);
-        assert_eq!(
-            *sink.drained.lock().unwrap().get(SERIES_BULK_ACK).unwrap(),
-            10
-        );
+        assert!(sink.take_delta(SERIES_BULK_ACK, &hist).is_empty());
         // New samples drain on the next pass.
         for _ in 0..5 {
             hist.record(Duration::from_micros(1_500));
         }
-        sink.drain_histogram(SERIES_BULK_ACK, &hist);
-        assert_eq!(
-            *sink.drained.lock().unwrap().get(SERIES_BULK_ACK).unwrap(),
-            15
-        );
+        assert_eq!(sink.take_delta(SERIES_BULK_ACK, &hist), vec![(2_000, 5)]);
+    }
+
+    #[test]
+    fn mixed_bucket_multi_drain_emits_exact_dashboard_reconstruction() {
+        let sink = TelemetrySink::new();
+        let mut source = LatencyHistogram::new();
+        let mut reconstructed = LatencyHistogram::new();
+
+        // First drain contains only a high bucket. The old total-count cursor
+        // would later skip a newly populated lower bucket and re-emit part of
+        // this high bucket after bucket ordering changed beneath it.
+        for _ in 0..3 {
+            source.record(Duration::from_micros(12_000));
+        }
+        let first = sink.take_delta(SERIES_BULK_ACK, &source);
+        assert_eq!(first, vec![(15_000, 3)]);
+        replay_batches(&mut reconstructed, &first);
+
+        for _ in 0..5 {
+            source.record(Duration::from_micros(1_500));
+        }
+        for _ in 0..2 {
+            source.record(Duration::from_micros(12_000));
+        }
+        let second = sink.take_delta(SERIES_BULK_ACK, &source);
+        assert_eq!(second, vec![(2_000, 5), (15_000, 2)]);
+        replay_batches(&mut reconstructed, &second);
+
+        assert_eq!(reconstructed.total(), source.total());
+        assert_eq!(reconstructed.buckets(), source.buckets());
+        assert_eq!(reconstructed.p50(), source.p50());
+        assert_eq!(reconstructed.p99(), source.p99());
+        assert!(sink.take_delta(SERIES_BULK_ACK, &source).is_empty());
+    }
+
+    /// Mirror `p2-dashboard`'s `sample_batch` ingestion: recording the batch's
+    /// bucket-upper-bound value `count` times must reconstruct identical
+    /// bucket counts and percentiles.
+    fn replay_batches(hist: &mut LatencyHistogram, batches: &[(u64, u64)]) {
+        for &(value_us, count) in batches {
+            for _ in 0..count {
+                hist.record(Duration::from_micros(value_us));
+            }
+        }
     }
 
     #[test]

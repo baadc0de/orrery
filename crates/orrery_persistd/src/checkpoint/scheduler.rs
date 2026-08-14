@@ -488,11 +488,12 @@ mod tests {
             payload: bytes::Bytes::from_static(b"concurrent"),
             crc: payload_crc(b"concurrent"),
         };
-        let lsn =
+        let append =
             tokio::time::timeout(Duration::from_secs(2), Router::apply(runtime.as_ref(), rec))
                 .await
                 .expect("Router::apply blocked behind checkpoint storage")
                 .expect("concurrent apply succeeds");
+        let lsn = append.committed().await.expect("concurrent append durable");
         assert_eq!(lsn.segment, 0);
 
         blocking_store.release.notify_one();

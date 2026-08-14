@@ -50,6 +50,7 @@ use orrery_protocol::{
     REASON_BAD_SIGNATURE, REASON_ISSUER_MISMATCH, REASON_NO_EXECUTOR,
 };
 
+use crate::actor::Reject;
 use crate::cluster::Router;
 use crate::intent::{
     error_outcome, IntentVerdict, PermissiveValidator, SharedExecutor, SharedValidator,
@@ -611,6 +612,21 @@ async fn route_diff(
         })
         .await;
 
+    // The actor has already stamped, appended, and folded before returning
+    // this handle. Keep the durability wait in this existing bounded route
+    // task rather than spawning one resolver task per append.
+    let result = match result {
+        Ok(handle) => {
+            let own_lsn = handle.lsn();
+            handle
+                .committed()
+                .await
+                .map(|_| own_lsn)
+                .map_err(|_| Reject::JournalClosed)
+        }
+        Err(error) => Err(error),
+    };
+
     match result {
         Ok(lsn) => {
             // Check after the actor reports its local journal append so the
@@ -820,8 +836,11 @@ mod tests {
 
     #[async_trait::async_trait]
     impl Router for SuccessfulRouter {
-        async fn apply(&self, _record: JournalRecord) -> Result<Lsn, Reject> {
-            Ok(Lsn::new(7, 11))
+        async fn apply(
+            &self,
+            _record: JournalRecord,
+        ) -> Result<Arc<crate::journal::AppendHandle>, Reject> {
+            Ok(crate::journal::AppendHandle::completed(Lsn::new(7, 11)))
         }
 
         async fn read(&self, _grid: GridId, _cell: CellId) -> Result<SnapshotPage, Reject> {
