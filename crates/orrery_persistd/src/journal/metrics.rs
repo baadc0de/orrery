@@ -17,9 +17,10 @@ use std::time::Duration;
 ///
 /// A sample belongs to the first boundary greater than or equal to it. The
 /// final bucket is overflow and is serialized at the observed maximum.
-const BOUNDARIES_US: [u64; 22] = [
-    50, 100, 200, 500, 1_000, 2_000, 3_000, 5_000, 7_000, 10_000, 15_000, 20_000, 30_000, 50_000,
-    75_000, 100_000, 150_000, 200_000, 300_000, 500_000, 750_000, 1_000_000,
+const BOUNDARIES_US: [u64; 25] = [
+    50, 100, 200, 500, 1_000, 1_250, 1_500, 1_750, 2_000, 3_000, 5_000, 7_000, 10_000, 15_000,
+    20_000, 30_000, 50_000, 75_000, 100_000, 150_000, 200_000, 300_000, 500_000, 750_000,
+    1_000_000,
 ];
 const NUM_BUCKETS: usize = BOUNDARIES_US.len() + 1;
 
@@ -289,8 +290,12 @@ mod tests {
             metrics.snapshot().samples(),
             vec![
                 JournalCommitSample {
+                    value_us: 1_500,
+                    count: 1
+                },
+                JournalCommitSample {
                     value_us: 2_000,
-                    count: 2
+                    count: 1
                 },
                 JournalCommitSample {
                     value_us: 3_000,
@@ -318,7 +323,7 @@ mod tests {
                     count: 1
                 },
                 JournalCommitSample {
-                    value_us: 2_000,
+                    value_us: 1_500,
                     count: 1
                 },
             ]
@@ -329,7 +334,7 @@ mod tests {
         assert_eq!(
             metrics.delta(&mut cursor),
             vec![JournalCommitSample {
-                value_us: 2_000,
+                value_us: 1_500,
                 count: 1
             }]
         );

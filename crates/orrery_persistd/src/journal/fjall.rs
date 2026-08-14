@@ -1,9 +1,10 @@
 //! The fjall-backed segmented append-only journal (`journal-fjall`, default).
 //!
 //! Records are stored in a single fjall `Database` with **manual journal
-//! persistence** — the group committer issues `db.persist(SyncData)`
-//! (`fdatasync`) when it decides to, which is exactly the control the adaptive
-//! group-commit design needs (docs/08-persistence.md §4).
+//! persistence** — each selected group is one Fjall batch whose durability is
+//! `SyncData` (`fdatasync`). Keeping SyncData inside the batch avoids releasing
+//! and immediately reacquiring Fjall's journal-writer lock while retaining
+//! exact control of the durability boundary (docs/08-persistence.md §4).
 //!
 //! Keys are the [`Lsn`] `(segment, offset)` encoded big-endian, so byte order
 //! equals LSN order and a replay is one forward range scan. Records carry their
@@ -17,6 +18,7 @@
 #[cfg(feature = "chain-grpc")]
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use fjall::{Database, Keyspace, PersistMode};
 use tokio::sync::broadcast;
@@ -114,7 +116,7 @@ impl Journal {
             #[cfg(feature = "chain-grpc")]
             let chain_records = chain_records.clone();
             move |pending: &[crate::journal::group_commit::Pending]| {
-                let mut batch = db.batch();
+                let mut batch = db.batch().durability(Some(PersistMode::SyncData));
                 for pending in pending {
                     let staged = &pending.staged;
                     batch.insert(&records, &staged.key, &staged.encoded);
@@ -126,16 +128,16 @@ impl Journal {
                         batch.insert(&chain_records, key, value);
                     }
                 }
-                let batch_started = std::time::Instant::now();
+                let sync_started = std::time::Instant::now();
                 batch
                     .commit()
                     .map_err(|e| JournalError::Store(format!("insert journal batch: {e}")))?;
-                let fjall_batch_commit = batch_started.elapsed();
-                let sync_started = std::time::Instant::now();
-                db.persist(PersistMode::SyncData)
-                    .map_err(|e| JournalError::Store(e.to_string()))?;
+                // Fjall performs both staging and the one SyncData while
+                // `commit` owns its journal-writer lock. Attribute the coupled
+                // operation to SyncData; there is no separately measurable
+                // non-durable batch-commit phase on this path.
                 Ok(StoreCommitTimings {
-                    fjall_batch_commit,
+                    fjall_batch_commit: Duration::ZERO,
                     sync_data: sync_started.elapsed(),
                 })
             }

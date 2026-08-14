@@ -5,10 +5,10 @@
 //! `fdatasync`, and resolves **every** waiter in the batch on that one fsync.
 //! Two regimes:
 //!
-//! - **Adaptive (default):** a lone append arriving while the disk is idle is
-//!   flushed immediately (a lone record pays only device latency); under load,
-//!   appends batch for [`GroupCommitConfig::batch_window`] (default 0.25 ms) or
-//!   until a size cap, then flush once.
+//! - **Adaptive (default):** work already queued by concurrent submitters is
+//!   drained as one group without an intentional timer. A lone append arriving
+//!   while the disk is idle is therefore flushed immediately, while arrivals
+//!   during a durability flush naturally form the next group.
 //! - The other [`AdaptiveCommitMode`]s exist to make batching deterministic in
 //!   tests ([`AlwaysBatch`](AdaptiveCommitMode::AlwaysBatch) forces the window
 //!   path even for a single record) and to measure worst case
@@ -49,7 +49,8 @@ pub enum AdaptiveCommitMode {
 pub struct GroupCommitConfig {
     /// The commit mode.
     pub mode: AdaptiveCommitMode,
-    /// How long to accumulate a batch under load (D16: ~2 ms fsync group).
+    /// Optional time to accumulate a batch under load. The production default
+    /// is zero; deterministic tests can still request a non-zero window.
     pub batch_window: Duration,
     /// Hard cap on records per batch (prevents unbounded batches).
     pub batch_max_records: usize,
@@ -61,12 +62,10 @@ impl Default for GroupCommitConfig {
     fn default() -> Self {
         Self {
             mode: AdaptiveCommitMode::Adaptive,
-            // Keep the normal under-load wait below a quarter millisecond:
-            // the D16 server-internal p99 is < 2 ms, and the actual device
-            // flush still needs most of that budget.  At the P2 write rate
-            // this window groups dozens of appends without making the batch
-            // timer itself the dominant tail-latency contributor.
-            batch_window: Duration::from_micros(250),
+            // Concurrent gateway submissions and arrivals during SyncData
+            // already form groups. Avoid putting a timer wake in the D16 p99
+            // path; the idle fast path and the loaded path both drain promptly.
+            batch_window: Duration::ZERO,
             batch_max_records: 8192,
             batch_max_bytes: 1 << 20,
         }
@@ -494,6 +493,13 @@ mod tests {
             payload: bytes::Bytes::copy_from_slice(&payload),
             crc: crate::payload_crc(&payload),
         }
+    }
+
+    #[test]
+    fn adaptive_default_has_no_intentional_batch_timer() {
+        let config = GroupCommitConfig::default();
+        assert_eq!(config.mode, AdaptiveCommitMode::Adaptive);
+        assert_eq!(config.batch_window, Duration::ZERO);
     }
 
     #[tokio::test]
