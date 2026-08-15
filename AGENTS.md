@@ -82,6 +82,78 @@ and the feature set.
   phase (P0–P6) has a demo criterion that is a permanent regression harness and
   gates entry to the next phase. See [docs/11-roadmap.md](docs/11-roadmap.md).
 
+## Build cache and target directories
+
+Agents work in parallel git worktrees, and a Rust `target/` is enormous: one
+worktree here reached **77 GiB**, a second checkout **182 GiB**, and 17 GiB of
+that was incremental-compilation scratch alone. Left alone this fills the disk,
+and a build that dies with `No space left on device` costs more than it saves.
+
+The arrangement is: **every worktree keeps its own `target/`, and they all share
+one object cache.**
+
+Sharing a `CARGO_TARGET_DIR` instead would look tempting and be wrong — cargo
+takes an exclusive lock on a target directory, so two agents building at once
+would serialize, one waiting on the other for the whole build. The object cache
+has no such contention: identical `rustc` invocations, which is nearly the
+entire dependency graph, are compiled once per machine and reused everywhere.
+
+### What is configured, and where
+
+| Setting | Location | Committed? |
+|---|---|---|
+| `build.rustc-wrapper = "sccache"` | `.cargo/config.toml` | yes — worktrees each get a copy of tracked files, so this is the only way a setting reaches all of them |
+| `build.incremental = false` | `.cargo/config.toml` | yes |
+| cache directory and size cap | `~/.config/sccache/config` | no — machine-local |
+
+The standalone tools (`p2-load`, `p3-island`, `p0-*`) each declare their own
+`[workspace]`, so each has its own `target/`. They still inherit the repo's
+`.cargo/config.toml`, because cargo walks up from the working directory — do
+not add a per-tool `.cargo/config.toml`, which would shadow it and silently
+drop that tool back to uncached builds.
+
+**Incremental compilation is off deliberately, and the two reasons compound.**
+sccache cannot cache an incremental unit — it marks them non-cacheable — so
+leaving it on would defeat the cache for exactly the crates being worked on,
+while still writing the artifacts to disk. If you are a human tight-looping
+edits on one crate, that trade is not in your favour: use `CARGO_INCREMENTAL=1`
+for that session, which overrides the file.
+
+### This makes sccache a build prerequisite
+
+If it is missing, install it (`pacman -S sccache`, or
+`cargo install sccache --locked`) or opt out for one command with an empty
+wrapper, which takes precedence over the config file:
+
+```
+RUSTC_WRAPPER= cargo build
+```
+
+### Working with it
+
+```
+./scripts/dev-cache.sh doctor   # is the cache wired up and actually taking effect?
+./scripts/dev-cache.sh stats    # hit rate, cache size
+./scripts/dev-cache.sh disk     # what every target/ in this checkout costs
+./scripts/dev-cache.sh prune    # delete every target/ — safe, and meant to be used
+```
+
+`prune` is the lever to pull when disk gets tight, and pulling it is cheap:
+sources are in git and the rebuild refills from the cache. Measured on the
+`p3-island` tool, deleting its whole `target/` and rebuilding: **100% cache hit
+rate, 304/304 units**, 21 s cold versus 14 s warm — the residual is linking and
+cargo's own bookkeeping, which no object cache can remove.
+
+Two things follow for agents sharing this machine:
+
+- **Prune freely, and prune your own worktree before a long build.** You are not
+  destroying anyone's work; you are dropping a derived artifact that another
+  agent's build already paid to compute.
+- **Do not read `Non-cacheable calls` in the stats as breakage.** Linking,
+  `build.rs` executions, and a few binary crate-type units are not cacheable by
+  design. A healthy report has a high hit *rate* with a non-zero non-cacheable
+  count.
+
 ## Device-local memory
 
 Durable, machine-local agent context lives in
