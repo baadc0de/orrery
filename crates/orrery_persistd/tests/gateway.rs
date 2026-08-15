@@ -141,6 +141,7 @@ impl Router for BlockingClaimRouter {
             lease_id: self.lease_id,
             expires_at: u64::MAX,
             flags: LeaseFlags::default(),
+            bound_to: None,
         };
         *self.live.lock().await = Some(lease.clone());
         Ok(ClaimResult::Granted(lease))
@@ -187,6 +188,7 @@ impl Router for BlockingClaimRouter {
             lease_id,
             expires_at: 0,
             flags: LeaseFlags::default(),
+            bound_to: None,
         }))
     }
 
@@ -234,6 +236,7 @@ impl BlockingHeartbeatRouter {
             lease_id: self.lease_id,
             expires_at: u64::MAX,
             flags: LeaseFlags::default(),
+            bound_to: None,
         }
     }
 }
@@ -3631,5 +3634,279 @@ fn an_interest_grant_is_refused_with_a_reason_the_peer_can_act_on() {
         );
 
         server.shutdown().await;
+    });
+}
+
+/// Send a claim without waiting for its reply, so the caller can watch what
+/// the *other* peer is asked to do first.
+fn send_claim(
+    connection: &iroh::endpoint::Connection,
+    claim_id: orrery_protocol::ClaimId,
+    entity: PersistId,
+    cell: CellId,
+    kind: ClaimKind,
+) {
+    connection
+        .send_datagram(Bytes::from(encode_stream_frame(&GatewayMsg::Lease {
+            message: LeaseMsg::Claim {
+                claim_id,
+                entity,
+                grid: GridId::ROOT,
+                cell,
+                kind,
+                basis: ClaimBasis::Explicit,
+                observed: Default::default(),
+                tick: Tick::new(1),
+            },
+        })))
+        .unwrap();
+}
+
+#[test]
+fn a_strong_claim_asks_the_holder_to_divest_instead_of_refusing_the_claimant() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        // Given: one peer holds the entity and another grabs it — "B grabs an
+        // object A is holding", the half of §4.2 a claimant drives.
+        let fixture = handoff_fixture(GatewayConfig::default()).await;
+        let (lease_id, seq) = claim_for_holder(&fixture).await;
+        let GatewayReply::BulkAck { lsn: cursor, .. } =
+            diff_reply(&fixture.holder, holder_diff(&fixture, lease_id, seq, 5)).await
+        else {
+            panic!("the holder's own fenced write must be acked");
+        };
+
+        // When: the claimant sends its explicit strong claim.
+        let claim_id = orrery_protocol::ClaimId(42);
+        send_claim(
+            &fixture.successor,
+            claim_id,
+            fixture.entity,
+            fixture.cell,
+            ClaimKind::Strong,
+        );
+
+        // Then: the registrar asks the holder rather than answering the
+        // claimant, naming the claimant as the successor to hand it to.
+        let asked = pushed_lease(&fixture.holder, Duration::from_secs(5))
+            .await
+            .expect("the holder is asked to divest");
+        assert_eq!(
+            asked,
+            LeaseMsg::Divest {
+                entity: fixture.entity,
+                lease_id,
+                to: Some(node(2)),
+                final_seq: SeqPair::default(),
+                cursor: None,
+            }
+        );
+        assert_eq!(
+            fixture
+                .server
+                .authority_metrics()
+                .snapshot()
+                .divest_requested,
+            1
+        );
+
+        // When: the holder consents.
+        fixture
+            .holder
+            .send_datagram(Bytes::from(encode_stream_frame(&GatewayMsg::Lease {
+                message: LeaseMsg::Divest {
+                    entity: fixture.entity,
+                    lease_id,
+                    to: Some(node(2)),
+                    final_seq: seq,
+                    cursor: Some(cursor),
+                },
+            })))
+            .unwrap();
+
+        // Then: the claimant's *own* claim is what gets answered — its pending
+        // correlation resolves rather than looking like an unsolicited grant.
+        let granted = pushed_lease(&fixture.successor, Duration::from_secs(5))
+            .await
+            .expect("the claimant receives its grant");
+        let LeaseMsg::Grant {
+            claim_id: answered,
+            lease_id: claimant_lease_id,
+            prev_holder,
+            ..
+        } = granted
+        else {
+            panic!("claimant must receive a grant, got {granted:?}");
+        };
+        assert_eq!(answered, claim_id);
+        assert!(claimant_lease_id > lease_id);
+        assert_eq!(prev_holder, Some(node(1)));
+
+        // And: the old holder's token is dead.
+        assert!(matches!(
+            diff_reply(&fixture.holder, holder_diff(&fixture, lease_id, seq, 6)).await,
+            GatewayReply::BulkNack { .. }
+        ));
+
+        fixture.server.shutdown().await;
+    });
+}
+
+#[test]
+fn an_unanswered_request_takes_weak_authority_but_never_strong_ownership() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        // Given: a deadline short enough to observe, and a holder that will
+        // simply not answer.
+        let fixture = handoff_fixture(GatewayConfig {
+            handoff_deadline_ms: 120,
+            ..GatewayConfig::default()
+        })
+        .await;
+        let (weak_lease_id, _) = claim_for_holder(&fixture).await;
+
+        // When: the claimant grabs it and the holder stays silent.
+        send_claim(
+            &fixture.successor,
+            orrery_protocol::ClaimId(7),
+            fixture.entity,
+            fixture.cell,
+            ClaimKind::Strong,
+        );
+        assert!(matches!(
+            pushed_lease(&fixture.holder, Duration::from_secs(5)).await,
+            Some(LeaseMsg::Divest { .. })
+        ));
+
+        // Then: weak authority converts to unconditional divestiture past the
+        // deadline — an interaction must not stall on an unresponsive peer.
+        let granted = pushed_lease(&fixture.successor, Duration::from_secs(5))
+            .await
+            .expect("the claimant is granted after the deadline");
+        let LeaseMsg::Grant {
+            claim_id,
+            lease_id: taken,
+            ..
+        } = granted
+        else {
+            panic!("weak authority must be taken, got {granted:?}");
+        };
+        assert_eq!(claim_id, orrery_protocol::ClaimId(7));
+        assert!(taken > weak_lease_id);
+        let metrics = fixture.server.authority_metrics().snapshot();
+        assert_eq!(metrics.handoff_timed_out, 1);
+        assert_eq!(metrics.reassigned, 1);
+
+        // The dispossessed holder is told, so it stops writing without
+        // consulting its own clock.
+        let told = pushed_lease(&fixture.holder, Duration::from_secs(5))
+            .await
+            .expect("the silent holder is told its lease ended");
+        assert!(matches!(
+            told,
+            LeaseMsg::Expire {
+                disposition: orrery_protocol::ExpireDisposition::Reassigned { to },
+                ..
+            } if to == node(2)
+        ));
+
+        // When: the new holder now owns it *strongly* and a third claim
+        // arrives that it also ignores.
+        send_claim(
+            &fixture.holder,
+            orrery_protocol::ClaimId(8),
+            fixture.entity,
+            fixture.cell,
+            ClaimKind::Strong,
+        );
+        assert!(matches!(
+            pushed_lease(&fixture.successor, Duration::from_secs(5)).await,
+            Some(LeaseMsg::Divest { .. })
+        ));
+
+        // Then: nothing is taken. Only expiry breaks strong ownership; a
+        // missed deadline is not a theft licence.
+        let refused = pushed_lease(&fixture.holder, Duration::from_secs(5))
+            .await
+            .expect("the claimant gets a definitive refusal");
+        assert_eq!(
+            refused,
+            LeaseMsg::Deny {
+                claim_id: Some(orrery_protocol::ClaimId(8)),
+                entity: fixture.entity,
+                reason: orrery_protocol::DenyReason::StrongHeld,
+                retry_after_ms: 0,
+            }
+        );
+
+        fixture.server.shutdown().await;
+    });
+}
+
+#[test]
+fn a_holder_that_parks_instead_of_handing_over_still_answers_the_claimant() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        // Given: a claimant waiting on a request the holder will refuse by
+        // releasing the entity rather than handing it over.
+        let fixture = handoff_fixture(GatewayConfig::default()).await;
+        let (lease_id, seq) = claim_for_holder(&fixture).await;
+        send_claim(
+            &fixture.successor,
+            orrery_protocol::ClaimId(11),
+            fixture.entity,
+            fixture.cell,
+            ClaimKind::Strong,
+        );
+        assert!(matches!(
+            pushed_lease(&fixture.holder, Duration::from_secs(5)).await,
+            Some(LeaseMsg::Divest { .. })
+        ));
+
+        // When: the holder releases it to nobody.
+        fixture
+            .holder
+            .send_datagram(Bytes::from(encode_stream_frame(&GatewayMsg::Lease {
+                message: LeaseMsg::Divest {
+                    entity: fixture.entity,
+                    lease_id,
+                    to: None,
+                    final_seq: seq,
+                    cursor: None,
+                },
+            })))
+            .unwrap();
+
+        // Then: the claimant is told, rather than waiting out a deadline for a
+        // request that has already been resolved.
+        let answered = pushed_lease(&fixture.successor, Duration::from_secs(5))
+            .await
+            .expect("the claimant is answered");
+        assert_eq!(
+            answered,
+            LeaseMsg::Deny {
+                claim_id: Some(orrery_protocol::ClaimId(11)),
+                entity: fixture.entity,
+                reason: orrery_protocol::DenyReason::NotEligible,
+                retry_after_ms: 0,
+            }
+        );
+
+        // And: the entity parked, so the claimant's retry can unpark it.
+        let parked = claim_reply(
+            &fixture.successor,
+            fixture.entity,
+            GridId::ROOT,
+            fixture.cell,
+            ClaimKind::Strong,
+            ClaimBasis::Explicit,
+        )
+        .await;
+        assert!(
+            matches!(parked, LeaseMsg::Grant { .. }),
+            "a parked entity is claimable by anyone, got {parked:?}"
+        );
+
+        fixture.server.shutdown().await;
     });
 }

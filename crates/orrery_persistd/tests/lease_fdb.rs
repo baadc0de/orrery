@@ -83,6 +83,7 @@ fn lease(entity: PersistId, lease_id: u64) -> Lease {
         lease_id: LeaseId(lease_id),
         expires_at: 42_000,
         flags: LeaseFlags(LeaseFlags::PLAYER_BOUND.0 | LeaseFlags::STRONG_HELD.0),
+        bound_to: None,
     }
 }
 
@@ -280,6 +281,7 @@ async fn fdb_lease_actor_restore_and_expiry_are_durable() {
         lease_id: LeaseId(1),
         expires_at: 10_000,
         flags: LeaseFlags(0),
+        bound_to: None,
     };
     let right = Lease {
         holder: Some(node(83)),

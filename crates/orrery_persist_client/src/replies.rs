@@ -537,6 +537,7 @@ mod tests {
             lease_id: LeaseId(6),
             expires_at: 99,
             flags: LeaseFlags::default(),
+            bound_to: None,
         };
 
         // When: the registrar rejects the stale write and returns its current

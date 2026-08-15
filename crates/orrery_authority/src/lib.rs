@@ -101,6 +101,25 @@ pub enum AuthorityEvent {
         /// Registrar reason for refusing the claim.
         reason: DenyReason,
     },
+    /// The registrar is asking this peer to give an entity up, because
+    /// another peer explicitly claimed it (D7 §4.2).
+    ///
+    /// Nothing happens automatically: game code decides whether to consent,
+    /// by calling [`LeaseClient::divest`] with the named successor. Ignoring
+    /// the request is a legitimate answer — past the registrar's deadline,
+    /// *weak* authority is taken anyway, so an interaction never stalls on an
+    /// unresponsive peer, while *strong* ownership is kept, because stealing
+    /// by timeout is what "not stealable" forbids. The "ask to trade" UX lives
+    /// above this protocol, which is why the decision is surfaced rather than
+    /// taken here.
+    DivestRequested {
+        /// ECS entity the registrar is asking about.
+        entity: Entity,
+        /// The fencing token this peer currently holds for it.
+        lease_id: LeaseId,
+        /// The peer that claimed it, and the successor to name when consenting.
+        to: Option<NodeId>,
+    },
     /// A grant expired or was revoked.
     Lost {
         /// ECS entity that lost local authority.
@@ -462,6 +481,26 @@ pub fn process_lease_replies(
                         lease_id,
                     });
                 }
+            }
+            LeaseMsg::Divest {
+                entity,
+                lease_id,
+                to,
+                ..
+            } => {
+                // Only a request naming the fence this peer actually holds is
+                // surfaced; a late one for a superseded token is noise.
+                let Some(local) = state.leases.get(&entity) else {
+                    continue;
+                };
+                if local.lease_id != lease_id {
+                    continue;
+                }
+                events.write(AuthorityEvent::DivestRequested {
+                    entity: local.entity,
+                    lease_id,
+                    to,
+                });
             }
             LeaseMsg::HeartbeatAck { leases, invalid } => {
                 // An explicit failed heartbeat wins over any row carried for
@@ -1347,6 +1386,7 @@ mod tests {
                     // Deliberately unrelated gateway-process monotonic time.
                     expires_at: 4,
                     flags: LeaseFlags::default(),
+                    bound_to: None,
                 }],
                 invalid: Vec::new(),
             });

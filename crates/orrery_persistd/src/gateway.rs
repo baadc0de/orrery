@@ -609,6 +609,10 @@ pub struct AuthoritySnapshot {
     pub divested: u64,
     /// Divestitures refused before any registrar mutation.
     pub divest_rejected: u64,
+    /// Divest requests the registrar sent to a holder on a claimant's behalf.
+    pub divest_requested: u64,
+    /// Requests a holder did not answer before the deadline.
+    pub handoff_timed_out: u64,
 }
 
 /// Always-on authority telemetry.
@@ -626,6 +630,8 @@ pub struct AuthorityMetrics {
     parked_without_successor: AtomicU64,
     divested: AtomicU64,
     divest_rejected: AtomicU64,
+    divest_requested: AtomicU64,
+    handoff_timed_out: AtomicU64,
     last_duplicate: std::sync::Mutex<Option<DuplicateAuthoritySample>>,
 }
 
@@ -639,6 +645,8 @@ impl AuthorityMetrics {
             parked_without_successor: self.parked_without_successor.load(Ordering::Relaxed),
             divested: self.divested.load(Ordering::Relaxed),
             divest_rejected: self.divest_rejected.load(Ordering::Relaxed),
+            divest_requested: self.divest_requested.load(Ordering::Relaxed),
+            handoff_timed_out: self.handoff_timed_out.load(Ordering::Relaxed),
         }
     }
 
@@ -663,6 +671,14 @@ impl AuthorityMetrics {
 
     fn record_divest_rejected(&self) {
         self.divest_rejected.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_divest_requested(&self) {
+        self.divest_requested.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_handoff_timed_out(&self) {
+        self.handoff_timed_out.fetch_add(1, Ordering::Relaxed);
     }
 
     fn record_duplicate_authority(&self, sample: DuplicateAuthoritySample) {
@@ -1009,6 +1025,14 @@ pub struct GatewayConfig {
     /// Registrar clock the periodic TTL sweep reads. Injectable so a test can
     /// advance expiry without sleeping through a 10 s lease.
     pub lease_sweep_clock: SharedClaimClock,
+    /// How long a holder has to answer a registrar divest request, in
+    /// milliseconds (D7 §4.2 default: 300).
+    ///
+    /// Past it, a *weak* holder is divested unconditionally — an interaction
+    /// must not stall on an unresponsive peer — while strong ownership is
+    /// kept, because stealing by timeout is exactly what "not stealable"
+    /// forbids.
+    pub handoff_deadline_ms: u32,
 }
 
 impl Default for GatewayConfig {
@@ -1034,6 +1058,7 @@ impl Default for GatewayConfig {
             successor_policy: Arc::new(NearestInterestSuccessorPolicy),
             authority_metrics: Arc::new(AuthorityMetrics::default()),
             lease_sweep_clock: Arc::new(RegistrarSweepClock),
+            handoff_deadline_ms: 300,
         }
     }
 }
@@ -1413,11 +1438,38 @@ impl GatewayAdmission {
 /// A successor must therefore be reachable on **this** gateway. A peer
 /// connected to a sibling gateway is not a candidate — redistribution across
 /// gateways needs a cluster-wide session directory, which is later work.
+/// A registrar divest request awaiting the holder's answer (D7 §4.2).
+///
+/// This is the *claimant-triggered* half of cooperative handoff: B explicitly
+/// grabs something A holds, and the registrar asks A rather than refusing B
+/// outright. Keyed by the entity and its current holder, because that is what
+/// the holder's answer names when it arrives on its own connection.
+#[derive(Debug, Clone, Copy)]
+struct PendingHandoff {
+    entity: PersistId,
+    grid: GridId,
+    cell: CellId,
+    holder: NodeId,
+    holder_lease_id: LeaseId,
+    claimant: NodeId,
+    claim_id: orrery_protocol::ClaimId,
+    /// The tier the claimant asked for. A grab confers strong ownership, so
+    /// granting the successor weak authority would make the object stealable
+    /// the instant it changed hands.
+    kind: orrery_protocol::ClaimKind,
+    /// Whether the holder's authority was strong when the request went out.
+    /// This decides what a missed deadline means, and it is read from the
+    /// registrar row rather than from the holder's own account of itself.
+    strong_held: bool,
+}
+
 struct Redistributor {
     peers: Arc<PeerRegistry>,
     interest: SharedInterestAuthority,
     policy: SharedSuccessorPolicy,
     metrics: Arc<AuthorityMetrics>,
+    handoff_deadline_ms: u32,
+    pending: tokio::sync::Mutex<HashMap<(PersistId, NodeId), PendingHandoff>>,
 }
 
 impl Redistributor {
@@ -1465,6 +1517,7 @@ impl Redistributor {
 
     /// Grant a parked entity to `successor` and tell it, or return `None`
     /// having left the registrar exactly as it found it.
+    #[allow(clippy::too_many_arguments)] // One handoff's parameters, all explicit.
     async fn hand_to(
         &self,
         router: &Arc<dyn Router>,
@@ -1473,20 +1526,15 @@ impl Redistributor {
         entity: PersistId,
         successor: NodeId,
         prev_holder: Option<NodeId>,
+        claim_id: orrery_protocol::ClaimId,
+        kind: orrery_protocol::ClaimKind,
     ) -> Option<orrery_protocol::Lease> {
         let session = self.peers.current_session(successor).await?;
         if !session.try_reserve_lease_slot().await {
             return None;
         }
         let granted = match router
-            .claim_lease(
-                grid,
-                cell,
-                entity,
-                successor,
-                orrery_protocol::ClaimKind::Weak,
-                registrar_now_ms(),
-            )
+            .claim_lease(grid, cell, entity, successor, kind, registrar_now_ms())
             .await
         {
             Ok(crate::lease::ClaimResult::Granted(row)) => row,
@@ -1507,7 +1555,7 @@ impl Redistributor {
                 let delivered = session
                     .notify(&GatewayReply::Lease {
                         message: LeaseMsg::Grant {
-                            claim_id: orrery_protocol::ClaimId::REGISTRAR,
+                            claim_id,
                             entity,
                             lease_id: granted.lease_id,
                             seq: granted.seq,
@@ -1564,6 +1612,162 @@ impl Redistributor {
         }
     }
 
+    /// Ask a live holder to give an entity up on a claimant's behalf.
+    ///
+    /// Returns `false` when there is nobody to ask — no live session, or a
+    /// request already outstanding for this holder and entity — in which case
+    /// the caller falls back to the ordinary claim path and its refusal.
+    /// Deduplication matters: without it, a contested object would fan a
+    /// divest request out to its holder once per claimant per tick.
+    async fn request_divest(
+        self: &Arc<Self>,
+        router: &Arc<dyn Router>,
+        pending: PendingHandoff,
+    ) -> bool {
+        let Some(holder_session) = self.peers.current_session(pending.holder).await else {
+            return false;
+        };
+        {
+            let mut outstanding = self.pending.lock().await;
+            let key = (pending.entity, pending.holder);
+            if outstanding.contains_key(&key) {
+                return false;
+            }
+            outstanding.insert(key, pending);
+        }
+        let delivered = holder_session
+            .notify(&GatewayReply::Lease {
+                message: LeaseMsg::Divest {
+                    entity: pending.entity,
+                    lease_id: pending.holder_lease_id,
+                    to: Some(pending.claimant),
+                    final_seq: orrery_protocol::SeqPair::default(),
+                    cursor: None,
+                },
+            })
+            .await;
+        if !delivered {
+            self.pending
+                .lock()
+                .await
+                .remove(&(pending.entity, pending.holder));
+            return false;
+        }
+        self.metrics.record_divest_requested();
+
+        // The deadline is armed here rather than swept, so an unanswered
+        // request resolves on its own schedule instead of waiting for whatever
+        // else happens to run.
+        let deadline = std::time::Duration::from_millis(u64::from(self.handoff_deadline_ms));
+        let router = Arc::clone(router);
+        let redistributor = Arc::clone(self);
+        tokio::spawn(async move {
+            tokio::time::sleep(deadline).await;
+            redistributor.expire_handoff(&router, pending).await;
+        });
+        true
+    }
+
+    /// Resolve a request the holder never answered (D7 §4.2 deadline rules).
+    async fn expire_handoff(&self, router: &Arc<dyn Router>, pending: PendingHandoff) {
+        let key = (pending.entity, pending.holder);
+        if self.pending.lock().await.remove(&key).is_none() {
+            // The holder answered in time; its reply already resolved this.
+            return;
+        }
+        self.metrics.record_handoff_timed_out();
+
+        if pending.strong_held {
+            // Stealing by timeout is exactly what "not stealable" forbids.
+            // Only expiry — a crash — breaks strong ownership.
+            self.answer_claimant(
+                pending.claimant,
+                LeaseMsg::Deny {
+                    claim_id: Some(pending.claim_id),
+                    entity: pending.entity,
+                    reason: orrery_protocol::DenyReason::StrongHeld,
+                    retry_after_ms: 0,
+                },
+            )
+            .await;
+            return;
+        }
+
+        // Weak authority converts to unconditional divestiture: an
+        // interaction must not stall on an unresponsive peer. The successor
+        // inherits last-committed state, which is what redistribution gives it
+        // anyway — there is no cursor to gate on, because the holder never
+        // answered.
+        let parked = router
+            .park_lease(
+                pending.grid,
+                pending.cell,
+                pending.entity,
+                pending.holder,
+                pending.holder_lease_id,
+            )
+            .await;
+        let unconditional =
+            matches!(&parked, Ok(Some(row)) if parked_by_us(row, pending.holder_lease_id));
+        let handed = unconditional
+            && self
+                .hand_to(
+                    router,
+                    pending.grid,
+                    pending.cell,
+                    pending.entity,
+                    pending.claimant,
+                    Some(pending.holder),
+                    pending.claim_id,
+                    pending.kind,
+                )
+                .await
+                .is_some();
+        if handed {
+            self.metrics.record_reassigned();
+            // Tell the silent holder its lease ended, addressed by the token
+            // it still believes it holds.
+            if let Some(session) = self.peers.current_session(pending.holder).await {
+                session
+                    .notify(&GatewayReply::Lease {
+                        message: LeaseMsg::Expire {
+                            entity: pending.entity,
+                            lease_id: pending.holder_lease_id,
+                            last_holder: Some(pending.holder),
+                            reason: orrery_protocol::ExpireReason::Revoked,
+                            disposition: orrery_protocol::ExpireDisposition::Reassigned {
+                                to: pending.claimant,
+                            },
+                        },
+                    })
+                    .await;
+            }
+        } else {
+            self.answer_claimant(
+                pending.claimant,
+                LeaseMsg::Deny {
+                    claim_id: Some(pending.claim_id),
+                    entity: pending.entity,
+                    reason: orrery_protocol::DenyReason::NotEligible,
+                    retry_after_ms: 0,
+                },
+            )
+            .await;
+        }
+    }
+
+    /// Take the request outstanding for this holder and entity, if any.
+    async fn take_pending(&self, entity: PersistId, holder: NodeId) -> Option<PendingHandoff> {
+        self.pending.lock().await.remove(&(entity, holder))
+    }
+
+    /// Push a control reply to a claimant that is waiting on one.
+    async fn answer_claimant(&self, claimant: NodeId, message: LeaseMsg) {
+        if let Some(session) = self.peers.current_session(claimant).await {
+            session.notify(&GatewayReply::Lease { message }).await;
+        }
+    }
+
     /// Choose where a lost lease goes, put it there, and tell the loser.
     async fn redistribute(&self, router: &Arc<dyn Router>, parked: crate::lease::ParkedLease) {
         let entity = parked.lease.entity;
@@ -1602,10 +1806,18 @@ impl Redistributor {
         // D7 §5: a strong-owned entity whose owner crashed re-parks with its
         // `own_seq` intact rather than being regranted. Only weak authority
         // is redistributed without consent.
+        //
+        // A player-bound entity is excluded even more firmly (D7 §4.3): a
+        // character parks and is exclusively reclaimable by the account that
+        // owns it, so it is never offered to anyone, at any tier.
         if parked
             .lease
             .flags
             .contains(orrery_protocol::LeaseFlags::STRONG_HELD)
+            || parked
+                .lease
+                .flags
+                .contains(orrery_protocol::LeaseFlags::PLAYER_BOUND)
         {
             return orrery_protocol::ExpireDisposition::Parked;
         }
@@ -1644,6 +1856,8 @@ impl Redistributor {
                 parked.lease.entity,
                 successor,
                 Some(parked.previous_holder),
+                orrery_protocol::ClaimId::REGISTRAR,
+                orrery_protocol::ClaimKind::Weak,
             )
             .await
             .is_some()
@@ -1708,6 +1922,8 @@ impl GatewayServer {
             interest: Arc::clone(&interest_authority),
             policy: config.successor_policy,
             metrics: Arc::clone(&authority_metrics),
+            handoff_deadline_ms: config.handoff_deadline_ms,
+            pending: tokio::sync::Mutex::new(HashMap::new()),
         });
         let lease_sweep_clock = config.lease_sweep_clock;
         let (shutdown, rx) = oneshot::channel();
@@ -2037,6 +2253,46 @@ async fn handle_connection(
                                     orrery_protocol::ClaimKind::Strong => true,
                                 }
                         });
+                        // A strong claim on something another peer is
+                        // actively holding is a *request*, not a refusal
+                        // (D7 §4.2): the registrar asks the holder to divest
+                        // rather than telling the claimant no. The reply then
+                        // arrives on the holder's answer or on the deadline,
+                        // so nothing is sent here.
+                        let contested = if plausible
+                            && matches!(kind, orrery_protocol::ClaimKind::Strong)
+                        {
+                            match router.inspect_lease(grid, entity).await {
+                                Ok((Some(row), Some(committed_cell), _)) => row
+                                    .holder
+                                    .filter(|holder| *holder != remote && row.expires_at > now_ms)
+                                    .map(|holder| PendingHandoff {
+                                        entity,
+                                        grid,
+                                        cell: committed_cell,
+                                        holder,
+                                        holder_lease_id: row.lease_id,
+                                        claimant: remote,
+                                        claim_id,
+                                        kind,
+                                        strong_held: row
+                                            .flags
+                                            .contains(orrery_protocol::LeaseFlags::STRONG_HELD),
+                                    }),
+                                _ => None,
+                            }
+                        } else {
+                            None
+                        };
+                        if let Some(pending) = contested {
+                            if redistributor.request_divest(&router, pending).await {
+                                // The reservation is released now and retaken
+                                // when the handoff lands, so a peer waiting on
+                                // a deadline does not sit on lease capacity.
+                                let _ = active_session.complete_lease_claim(None).await;
+                                continue;
+                            }
+                        }
                         let outcome = if plausible {
                             router
                                 .claim_lease(grid, cell, entity, remote, kind, now_ms)
@@ -2489,6 +2745,10 @@ async fn divest_lease(
     }
     metrics.record_divested();
 
+    // A request the registrar made on a claimant's behalf is answered by this
+    // reply, whichever way the holder decided.
+    let requested = redistributor.take_pending(entity, session.node).await;
+
     let disposition = match to {
         None => orrery_protocol::ExpireDisposition::Parked,
         Some(successor) if successor == session.node => orrery_protocol::ExpireDisposition::Parked,
@@ -2501,6 +2761,14 @@ async fn divest_lease(
                 .await
                 .iter()
                 .any(|candidate| candidate.node == successor);
+            // When this consent answers a registrar request naming the same
+            // successor, the grant carries that claimant's own correlation, so
+            // its pending `Claim` resolves rather than looking unanswered.
+            let claim_id = requested
+                .filter(|pending| pending.claimant == successor)
+                .map_or(orrery_protocol::ClaimId::REGISTRAR, |pending| {
+                    pending.claim_id
+                });
             let handed = eligible
                 && redistributor
                     .hand_to(
@@ -2510,6 +2778,13 @@ async fn divest_lease(
                         entity,
                         successor,
                         Some(session.node),
+                        claim_id,
+                        // A handoff answering an explicit grab confers the tier
+                        // that grab asked for; an unsolicited release does not
+                        // make the receiver an owner.
+                        requested
+                            .filter(|pending| pending.claimant == successor)
+                            .map_or(orrery_protocol::ClaimKind::Weak, |pending| pending.kind),
                     )
                     .await
                     .is_some();
@@ -2522,6 +2797,28 @@ async fn divest_lease(
             }
         }
     };
+
+    // A claimant whose request the holder answered by parking, or by handing
+    // the entity to somebody else, is told so rather than left waiting for its
+    // deadline to elapse.
+    if let Some(pending) = requested.filter(|pending| {
+        !matches!(
+            disposition,
+            orrery_protocol::ExpireDisposition::Reassigned { to } if to == pending.claimant
+        )
+    }) {
+        redistributor
+            .answer_claimant(
+                pending.claimant,
+                LeaseMsg::Deny {
+                    claim_id: Some(pending.claim_id),
+                    entity,
+                    reason: orrery_protocol::DenyReason::NotEligible,
+                    retry_after_ms: 0,
+                },
+            )
+            .await;
+    }
 
     LeaseMsg::Expire {
         entity,
@@ -3231,6 +3528,7 @@ mod tests {
             lease_id,
             expires_at: 0,
             flags: orrery_protocol::LeaseFlags::PARKED,
+            bound_to: None,
         };
 
         // A park of ours advances the token and clears the holder.
@@ -3257,6 +3555,7 @@ mod tests {
             lease_id: LeaseId(9),
             expires_at,
             flags: orrery_protocol::LeaseFlags::default(),
+            bound_to: None,
         };
         let observe = |lease: Option<orrery_protocol::Lease>| {
             let metrics = AuthorityMetrics::default();
@@ -3483,6 +3782,8 @@ mod tests {
             interest: Arc::new(DenyAllInterestAuthority),
             policy: Arc::new(ParkOnLossPolicy),
             metrics: Arc::new(AuthorityMetrics::default()),
+            handoff_deadline_ms: 300,
+            pending: tokio::sync::Mutex::new(HashMap::new()),
         }
     }
 

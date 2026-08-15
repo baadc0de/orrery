@@ -238,6 +238,21 @@ impl LeaseRegistrar {
         self.leases.insert(lease.entity, lease);
     }
 
+    /// Mark an entity as one identity's character (D7 §4.3).
+    ///
+    /// From here on the row is claimable only by `owner`, is never offered to
+    /// a successor, and keeps both properties while parked — that is the whole
+    /// point: a player's character must still be theirs after they disconnect.
+    /// Returns `false` when the entity has no row yet.
+    pub fn bind_to_player(&mut self, entity: PersistId, owner: NodeId) -> bool {
+        let Some(row) = self.leases.get_mut(&entity) else {
+            return false;
+        };
+        row.flags.set(LeaseFlags::PLAYER_BOUND, true);
+        row.bound_to = Some(owner);
+        true
+    }
+
     pub(crate) fn remove(&mut self, entity: PersistId) {
         self.leases.remove(&entity);
     }
@@ -281,7 +296,17 @@ impl LeaseRegistrar {
             lease_id: LeaseId(0),
             expires_at: 0,
             flags: LeaseFlags::PARKED,
+            bound_to: None,
         });
+        // A player's character is theirs whether they are here or not: parking
+        // it on disconnect must not make it claimable by whoever walks past
+        // (D7 §4.3). This is checked before the holder/expiry rules, because
+        // the whole point is that it holds while the row is parked.
+        if row.flags.contains(LeaseFlags::PLAYER_BOUND)
+            && row.bound_to.is_some_and(|bound| bound != claimant)
+        {
+            return ClaimResult::Denied(DenyReason::NotEligible);
+        }
         if let Some(holder) = row.holder {
             if row.expires_at > now_ms {
                 if holder == claimant {
@@ -473,6 +498,77 @@ mod tests {
     }
 
     #[test]
+    fn a_players_character_stays_theirs_across_a_disconnect() {
+        // Given: a character bound to the account playing it.
+        let mut registrar = LeaseRegistrar::default();
+        let player = node(1);
+        let stranger = node(2);
+        let character = PersistId::new(50);
+        assert!(matches!(
+            registrar.claim(character, player, ClaimKind::Strong, 0),
+            ClaimResult::Granted(_)
+        ));
+        assert!(registrar.bind_to_player(character, player));
+
+        // When: the player disconnects, so the character parks.
+        assert_eq!(registrar.disconnect(player).len(), 1);
+        assert!(registrar
+            .get(character)
+            .unwrap()
+            .flags
+            .contains(LeaseFlags::PARKED));
+
+        // Then: a parked character is *not* up for grabs. Without this, the
+        // ordinary "first claim unparks it" rule would hand someone else's
+        // character to whoever walked past it.
+        assert_eq!(
+            registrar.claim(character, stranger, ClaimKind::Weak, 1),
+            ClaimResult::Denied(DenyReason::NotEligible)
+        );
+        assert_eq!(
+            registrar.claim(character, stranger, ClaimKind::Strong, 1),
+            ClaimResult::Denied(DenyReason::NotEligible)
+        );
+
+        // And: the owner reclaims it on return, with the binding intact.
+        let ClaimResult::Granted(reclaimed) =
+            registrar.claim(character, player, ClaimKind::Strong, 2)
+        else {
+            panic!("the returning account must be able to reclaim its character");
+        };
+        assert_eq!(reclaimed.holder, Some(player));
+        assert!(reclaimed.flags.contains(LeaseFlags::PLAYER_BOUND));
+        assert_eq!(reclaimed.bound_to, Some(player));
+    }
+
+    #[test]
+    fn binding_needs_an_existing_row_and_survives_expiry() {
+        let mut registrar = LeaseRegistrar::default();
+        let player = node(1);
+        let character = PersistId::new(51);
+
+        // Nothing to bind to yet.
+        assert!(!registrar.bind_to_player(character, player));
+
+        assert!(matches!(
+            registrar.claim(character, player, ClaimKind::Strong, 0),
+            ClaimResult::Granted(_)
+        ));
+        assert!(registrar.bind_to_player(character, player));
+
+        // A TTL lapse parks it like any other lease, and the binding rides
+        // through: expiry is not a transfer of ownership.
+        assert_eq!(registrar.sweep_expired(LEASE_TTL_MS + 1).len(), 1);
+        let row = registrar.get(character).unwrap();
+        assert!(row.flags.contains(LeaseFlags::PLAYER_BOUND));
+        assert_eq!(row.bound_to, Some(player));
+        assert_eq!(
+            registrar.claim(character, node(2), ClaimKind::Weak, LEASE_TTL_MS + 2),
+            ClaimResult::Denied(DenyReason::NotEligible)
+        );
+    }
+
+    #[test]
     fn current_holder_unexpired_claim_preserves_existing_lease() {
         let mut registrar = LeaseRegistrar::default();
         let holder = node(1);
@@ -504,6 +600,7 @@ mod tests {
             lease_id: LeaseId(4),
             expires_at: 5,
             flags: LeaseFlags::STRONG_HELD,
+            bound_to: None,
         };
         let second = Lease {
             entity: PersistId::new(11),

@@ -258,6 +258,7 @@ impl Router for BlockingApplyRouter {
             lease_id: LeaseId(1),
             expires_at: now_ms + 60_000,
             flags: LeaseFlags::default(),
+            bound_to: None,
         }))
     }
 }
