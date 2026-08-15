@@ -173,6 +173,26 @@ impl IslandRegistry {
         vec![self.manifest(island_id)]
     }
 
+    /// Drop a peer entirely: its presence, and its place in any island.
+    ///
+    /// Returns the manifests the *remaining* peers must apply. A departed peer
+    /// left in a roster is worse than a missing one — survivors would keep
+    /// trying to reach a ghost.
+    pub fn forget_peer(&mut self, node: NodeId) -> Vec<IslandManifest> {
+        let island = self.island_of(node);
+        self.peers.remove(&node);
+        let Some(island) = island else {
+            return Vec::new();
+        };
+        self.remove_peer_from_island(node, island);
+        // A drained island has no manifest left to send.
+        if self.islands.contains_key(&island) {
+            vec![self.manifest(island)]
+        } else {
+            Vec::new()
+        }
+    }
+
     /// Mint the interest claims authorizing `node`'s current coverage.
     ///
     /// Returns `None` for a peer with no reported presence: there is nothing

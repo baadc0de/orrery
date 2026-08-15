@@ -13,8 +13,21 @@ license = "MIT OR Apache-2.0"
 # Not implemented in P1; the in-memory state is reconstructible from presence.
 fdb-state = []
 
+[[bin]]
+name = "orrery-coordinator"
+path = "src/bin/orrery-coordinator.rs"
+
 [dependencies]
 orrery_protocol = { path = "../orrery_protocol" }
+# The coordinator is a Bevy-free service that speaks iroh directly
+# (docs/10-crates.md §6), so it owns an endpoint and a tokio runtime.
+iroh = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "sync", "signal"] }
+bytes = { workspace = true }
+clap = { workspace = true }
+anyhow = { workspace = true }
+serde_json = "1"
+tracing-subscriber = { workspace = true }
 # Signing interest grants: the coordinator is the only party allowed to assert
 # what a peer is interested in, so it needs the ed25519 secret half (D3).
 iroh-base = { workspace = true }
@@ -24,3 +37,5 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 glam = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
+bytes = { workspace = true }

@@ -23,6 +23,7 @@ if [[ ${1:-} == --self-test ]]; then
   # criterion, without pretending to run an island locally.
   grep -Fq -- '--dev-seed' "$0" || die 'self-test: entity seeding absent'
   grep -Fq -- '--coordinator-key' "$0" || die 'self-test: interest handout absent'
+  grep -Fq 'orrery-coordinator' "$0" || die 'self-test: live coordinator absent'
   grep -Fq -- '--metrics-jsonl' "$0" || die 'self-test: duplicate-authority read absent'
   grep -Fq 'p3-island' "$0" || die 'self-test: island harness absent'
   grep -Fq 'kill -9' "$0" || die 'self-test: kill -9 documentation absent'
@@ -32,7 +33,8 @@ fi
 
 : "${PERSISTD_BIN:?set PERSISTD_BIN to a persistd binary}"
 : "${P3_ISLAND_BIN:?set P3_ISLAND_BIN to the p3-island binary}"
-for tool in "$PERSISTD_BIN" "$P3_ISLAND_BIN"; do
+: "${COORDINATOR_BIN:?set COORDINATOR_BIN to the orrery-coordinator binary}"
+for tool in "$PERSISTD_BIN" "$P3_ISLAND_BIN" "$COORDINATOR_BIN"; do
   [[ -x $tool ]] || die "not an executable: $tool"
 done
 
@@ -50,28 +52,57 @@ mkdir -p "$out" "$out/data" "$out/peers"
 : > "$out/metrics.jsonl"
 
 # Deterministic key material. These are harness keys, generated here and used
-# nowhere else: the identity issuer signs peer session tokens, the coordinator
-# signs interest grants, and persistd is configured to trust exactly these two.
+# nowhere else: the identity issuer signs peer session tokens (both the
+# coordinator and persistd verify them), and the coordinator signs the interest
+# grants persistd is configured to trust.
 ISSUER_SECRET=${P3_ISSUER_SECRET:-1111111111111111111111111111111111111111111111111111111111111111}
 COORDINATOR_SECRET=${P3_COORDINATOR_SECRET:-2222222222222222222222222222222222222222222222222222222222222222}
 
-# persistd must trust exactly these two keys; derive the public halves with
-# the harness itself rather than carrying an ed25519 implementation in shell.
+# Derive the issuer's public half with the harness rather than carrying an
+# ed25519 implementation in shell. The coordinator's public half comes from the
+# coordinator's own readiness line — it is the one that signs, so it is the one
+# that says which key to trust.
 keys=$("$P3_ISLAND_BIN" --print-keys \
   --gateway-addr 127.0.0.1:1 --gateway-node "$(printf '0%.0s' {1..64})" \
-  --issuer-secret "$ISSUER_SECRET" --coordinator-secret "$COORDINATOR_SECRET") \
-  || die 'could not derive public keys from the supplied secrets'
+  --coordinator-addr 127.0.0.1:1 --coordinator-node "$(printf '0%.0s' {1..64})" \
+  --issuer-secret "$ISSUER_SECRET") \
+  || die 'could not derive the issuer public key from the supplied secret'
 ISSUER_PUBLIC=$(python3 -c 'import json,sys;print(json.loads(sys.argv[1])["issuer_public"])' "$keys")
-COORDINATOR_PUBLIC=$(python3 -c 'import json,sys;print(json.loads(sys.argv[1])["coordinator_public"])' "$keys")
 
 cleanup() {
-  if [[ -n ${PERSISTD_PID:-} ]] && kill -0 "$PERSISTD_PID" 2>/dev/null; then
-    kill "$PERSISTD_PID" 2>/dev/null || true
-    wait "$PERSISTD_PID" 2>/dev/null || true
-  fi
+  for pid in ${PERSISTD_PID:-} ${COORDINATOR_PID:-}; do
+    if kill -0 "$pid" 2>/dev/null; then
+      kill "$pid" 2>/dev/null || true
+      wait "$pid" 2>/dev/null || true
+    fi
+  done
   pkill -f "$P3_ISLAND_BIN --peer-spec" 2>/dev/null || true
 }
 trap cleanup EXIT
+
+# ── Coordinator ─────────────────────────────────────────────────────────
+# Interest is minted here, not by the harness. A fixture that signs its own
+# authorization proves nothing about the path production uses.
+note 'starting the coordinator'
+"$COORDINATOR_BIN" \
+  --bind 127.0.0.1:0 \
+  --issuer-key "1@$ISSUER_PUBLIC" \
+  --interest-secret "$COORDINATOR_SECRET" \
+  --interest-key-id 1 \
+  > "$out/coordinator.json" 2> "$out/coordinator.log" &
+COORDINATOR_PID=$!
+
+for _ in $(seq 1 100); do
+  [[ -s "$out/coordinator.json" ]] && break
+  kill -0 "$COORDINATOR_PID" 2>/dev/null || die "coordinator exited early; see $out/coordinator.log"
+  sleep 0.2
+done
+[[ -s "$out/coordinator.json" ]] || die 'coordinator never printed its readiness line'
+
+COORDINATOR_NODE=$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["node_id"])' "$out/coordinator.json")
+COORDINATOR_ADDR=$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["bind_addr"])' "$out/coordinator.json")
+COORDINATOR_PUBLIC=$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["interest_public_key"])' "$out/coordinator.json")
+note "coordinator $COORDINATOR_NODE at $COORDINATOR_ADDR signing interest with $COORDINATOR_PUBLIC"
 
 total_entities=$((PEERS * ENTITIES_PER_PEER))
 note "starting persistd with $total_entities seeded entities in $CELL"
@@ -110,8 +141,9 @@ set +e
 "$P3_ISLAND_BIN" \
   --gateway-addr "$GATEWAY_ADDR" \
   --gateway-node "$GATEWAY_NODE" \
+  --coordinator-addr "$COORDINATOR_ADDR" \
+  --coordinator-node "$COORDINATOR_NODE" \
   --issuer-secret "$ISSUER_SECRET" \
-  --coordinator-secret "$COORDINATOR_SECRET" \
   --peers "$PEERS" \
   --entities-per-peer "$ENTITIES_PER_PEER" \
   --cell "$CELL" \

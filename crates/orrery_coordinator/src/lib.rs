@@ -15,8 +15,12 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod client;
 pub mod interest;
 pub mod registry;
+pub mod server;
 
+pub use client::{ClientError, CoordinatorClient};
 pub use interest::InterestIssuer;
 pub use registry::{CoordinatorConfig, IslandRegistry};
+pub use server::{CoordinatorServer, CoordinatorStats, ServerConfig, ServerError};
