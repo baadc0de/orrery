@@ -5,18 +5,18 @@
 //! (VC-8) — because the whole adjudication story is "re-run it somewhere else
 //! and get the same answer".
 //!
-//! **Scoped to what the executor and the replay harness need.** The §3 sketch
-//! also carries `validate_intent`, `park_tick`, `catch_up` and `invariants`.
-//! Each belongs to a consumer that does not exist yet — the intent path, the
-//! field host's parked-cell catch-up, `orrery_witness` — and each needs types
-//! (`Intent`, `HotStateRead`, `InvariantValidator`) that would be invented
-//! here and re-invented there. They are additive on this trait when their
-//! consumers land.
+//! **Scoped to what the executor, the replay harness and stage-1 checking
+//! need.** The §3 sketch also carries `validate_intent`, `park_tick` and
+//! `catch_up`. Each belongs to a consumer that does not exist yet — the intent
+//! path, the field host's parked-cell catch-up — and each needs types
+//! (`Intent`, `HotStateRead`) that would be invented here and re-invented
+//! there. They are additive on this trait when their consumers land.
 
 use std::collections::BTreeMap;
 
 use orrery_protocol::{PersistId, RulesetId};
 
+use crate::invariants::Invariant;
 use crate::quantize::Quantized;
 use crate::rng::TickRng;
 
@@ -232,6 +232,21 @@ pub trait Ruleset: Send + Sync + 'static {
     fn classify_component(&self, component: ComponentTypeId) -> CoreClass {
         let _ = component;
         CoreClass::Cosmetic
+    }
+
+    /// The stateless stage-1 checks (D10 stage 1, docs/06 §3).
+    ///
+    /// These live here rather than in `orrery_witness` because *every*
+    /// interested peer runs them on received authoritative state, regardless of
+    /// witness-set membership, and cell actors run them on inbound bulk diffs.
+    /// They are the only validation most bulk-class state ever gets, so they
+    /// have to travel with the rules.
+    ///
+    /// The default is none, which is a real choice rather than a placeholder: a
+    /// game with no cheap invariants gets replay adjudication and nothing else,
+    /// which is correct but slower to notice. It should supply some.
+    fn invariants(&self) -> &[Invariant<Self::CoreState>] {
+        &[]
     }
 }
 

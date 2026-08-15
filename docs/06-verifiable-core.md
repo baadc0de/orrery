@@ -7,11 +7,19 @@ Normative source: [ADR-0009](adr/0009-verifiable-core.md) (context: [D10](adr/00
 > **Implementation status (2026-08-15).** `orrery_core` exists and is
 > Bevy-free, with wire types in `orrery_protocol::verifiable`. Landed: the
 > `Ruleset` contract (`CoreState`/`CoreInput`/`CoreEvent`, `step`,
-> `classify_component`), the fixed 60 Hz executor with its VC-1/VC-3/VC-7
-> guarantees, `StateView` neighbour-read recording, the quantization lattice,
-> the tolerance-band comparator, the hash-chained input log with per-frame
-> signatures and claim chaining, the replay harness, and `verify_bundle`.
-> `scripts/core-gates.sh` runs §8's static gates.
+> `classify_component`, `invariants`), the fixed 60 Hz executor with its
+> VC-1/VC-3/VC-7 guarantees, `StateView` neighbour-read recording, the
+> quantization lattice, the tolerance-band comparator, the hash-chained input
+> log with per-frame signatures and claim chaining, the stage-1 invariant
+> checks, the authority-side retained log with bundle assembly, the replay
+> harness, and `verify_bundle`. `scripts/core-gates.sh` runs §8's static gates.
+>
+> Retention is implemented as this section describes: per-entity chain records,
+> sent frames with the head transitions they commit to, claims, claim-tick
+> snapshots and per-tick state hashes — floored at the 180-tick adjudication
+> window, defaulting to 600. `AuthorityLog::assemble_bundle` is the producer
+> side of `verify_bundle`: it is what makes a disputed window servable at all,
+> and it refuses a window it cannot cover rather than serving a partial one.
 >
 > The quantization **lattice** is 1 mm and 1 mm/s — an invented default, an
 > order of magnitude finer than D16's bands so quantization noise cannot itself
@@ -20,8 +28,8 @@ Normative source: [ADR-0009](adr/0009-verifiable-core.md) (context: [D10](adr/00
 > Deferred, each because its consumer or its subsystem does not exist yet: the
 > `GeometryFrame`, `FieldFrame`, `FrameChange` and `TerrainPromotion` record
 > sources (mutable terrain, environmental fields, nested-grid migration,
-> terrain↔entity promotion); `validate_intent`, `park_tick`, `catch_up` and
-> `invariants` on the trait (the intent path, the field host, `orrery_witness`);
+> terrain↔entity promotion); `validate_intent`, `park_tick` and `catch_up` on
+> the trait (the intent path, the field host);
 > log streaming and gap repair (`orrery_witness` + `orrery_net`); and the
 > cross-platform CI matrix, for which the golden-vector and run-twice tests are
 > in place but no Windows/macOS runner is. All are additive.

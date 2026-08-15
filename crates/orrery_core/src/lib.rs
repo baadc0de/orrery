@@ -25,6 +25,10 @@
 //!   cheating (docs/06 §5).
 //! - [`log`] — the tamper-evident hash chain and its frame/claim signatures
 //!   (docs/06 §6).
+//! - [`store`] — the authority's retained history, and the bundle assembly that
+//!   makes a window servable (docs/06 §6, "Retention").
+//! - [`invariants`] — the stage-1 checks every interested peer runs on received
+//!   state, regardless of witness-set membership (docs/06 §3, D10 stage 1).
 //! - [`replay`] — the headless harness and `verify_bundle` (docs/06 §7).
 //!
 //! # Engine-agnostic, and mechanically so
@@ -59,8 +63,8 @@
 //! # Not yet here
 //!
 //! The `GeometryFrame`, `FieldFrame`, `FrameChange` and `TerrainPromotion`
-//! record sources, and the `validate_intent` / `park_tick` / `catch_up` /
-//! `invariants` half of the `Ruleset` sketch. Each closes replay over a
+//! record sources, and the `validate_intent` / `park_tick` / `catch_up` half of
+//! the `Ruleset` sketch. Each closes replay over a
 //! subsystem that does not exist yet, or serves a consumer that does not
 //! (`orrery_witness`, the field host, the intent path). Each is additive.
 
@@ -68,14 +72,17 @@
 #![warn(missing_docs)]
 
 pub mod executor;
+pub mod invariants;
 pub mod log;
 pub mod quantize;
 pub mod replay;
 pub mod rng;
 pub mod ruleset;
+pub mod store;
 pub mod tolerance;
 
 pub use executor::{Executor, TickOutcome, TICK_HZ, TICK_NANOS};
+pub use invariants::{evaluate, Invariant, InvariantKind, InvariantSample, InvariantViolation};
 pub use quantize::{QPos, QVel, Quantized};
 pub use replay::{verify_bundle, ReplayError, ReplayHarness, ReplayTrace};
 pub use rng::{tick_rng, tick_seed, TickRng};
@@ -83,4 +90,5 @@ pub use ruleset::{
     state_hash, CodecError, ComponentTypeId, CoreClass, CoreCodec, OrderedInputs, Ruleset,
     StateView, StepOutput,
 };
+pub use store::{AuthorityLog, BundleError, Retention};
 pub use tolerance::{Tolerance, ToleranceOutcome, TrajectorySample};

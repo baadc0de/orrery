@@ -84,6 +84,13 @@ impl ReplayTrace {
 pub struct ReplayHarness<R: Ruleset> {
     executor: Executor<R>,
     entity: Option<PersistId>,
+    /// The chain head the loaded claim commits to.
+    ///
+    /// A window rarely starts at the beginning of a chain, so folding from the
+    /// empty head would put the replay on a different chain than the authority
+    /// and report a head mismatch on the first frame. This is what
+    /// `StateClaim::input_head` is *for*.
+    start_head: Option<ChainHash>,
 }
 
 impl<R: Ruleset> ReplayHarness<R> {
@@ -92,6 +99,7 @@ impl<R: Ruleset> ReplayHarness<R> {
         Self {
             executor: Executor::new(ruleset, universe_seed),
             entity: None,
+            start_head: None,
         }
     }
 
@@ -117,6 +125,7 @@ impl<R: Ruleset> ReplayHarness<R> {
             R::CoreState::decode(snapshot_bytes).map_err(|_| ReplayError::SnapshotMalformed)?;
         self.executor.insert(claim.entity, state);
         self.entity = Some(claim.entity);
+        self.start_head = Some(claim.input_head);
         Ok(())
     }
 
@@ -150,8 +159,10 @@ impl<R: Ruleset> ReplayHarness<R> {
         // Collect this entity's inputs per absolute tick, verifying each frame
         // as it is consumed. Ordering inside a tick is the log's, never ours.
         let mut per_tick: BTreeMap<u64, Vec<R::CoreInput>> = BTreeMap::new();
-        let mut head = ChainHash::EMPTY;
-        let mut have_head = false;
+        // Start from the chain head the claim commits to, not from the empty
+        // head: a window opened at a later claim is mid-chain, and folding from
+        // zero would compare against a chain nobody has.
+        let mut head = self.start_head.unwrap_or(ChainHash::EMPTY);
         let mut previous_end: Option<u64> = None;
 
         for (index, frame) in frames.iter().enumerate() {
@@ -170,9 +181,6 @@ impl<R: Ruleset> ReplayHarness<R> {
             let mut sibling_cursor = 0usize;
             for slice in &frame.entities {
                 if slice.entity == entity {
-                    if !have_head {
-                        head = ChainHash::EMPTY;
-                    }
                     prev_heads.push(head);
                 } else {
                     let pair = siblings
@@ -187,7 +195,6 @@ impl<R: Ruleset> ReplayHarness<R> {
             for transition in &transitions {
                 if transition.entity == entity {
                     head = transition.head;
-                    have_head = true;
                 }
             }
 
