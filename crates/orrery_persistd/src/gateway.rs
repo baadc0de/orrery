@@ -32,10 +32,11 @@
 //! deployment would route by rendezvous placement instead (docs/08-persistence.md
 //! §3), but the current reference binary does not ship that transport.
 
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use iroh::{Endpoint, EndpointAddr, RelayMode};
@@ -46,16 +47,19 @@ use orrery_protocol::channels::{
     decode_datagram, decode_stream_frame, encode_datagram, encode_stream_frame, untag, Channel,
 };
 use orrery_protocol::{
-    AreaPage, CellId, DiffUplink, Epoch, GatewayMsg, GatewayReply, GridId, Intent, IntentOutcome,
-    JournalRecord, Lsn, NodeId, PersistId, MAX_AREA_PAGE_FRAME_BYTES, PROTOCOL_VERSION,
-    REASON_BAD_SIGNATURE, REASON_ISSUER_MISMATCH, REASON_NO_EXECUTOR,
+    AreaPage, CellId, CoordinatorInterestSnapshot, DiffUplink, Epoch, GatewayMsg, GatewayReply,
+    GridId, Intent, IntentOutcome, IssuerKey, JournalRecord, LeaseId, LeaseMsg, Lsn, NodeId,
+    PersistId, SessionTokenClaimsV1, SessionTokenV1, SessionTokenVerificationError,
+    SessionTokenVerifier, UnixMillis, MAX_AREA_PAGE_FRAME_BYTES, MAX_SESSION_TOKEN_TTL_MS,
+    PROTOCOL_VERSION, REASON_BAD_SIGNATURE, REASON_ISSUER_MISMATCH, REASON_NO_EXECUTOR,
 };
 
-use crate::actor::Reject;
+use crate::actor::{FencedApply, Reject};
 use crate::cluster::Router;
 use crate::intent::{
     error_outcome, IntentVerdict, PermissiveValidator, SharedExecutor, SharedValidator,
 };
+use crate::lease::registrar_now_ms;
 use crate::payload_crc;
 
 /// The ALPN the gateway advertises and accepts. Matches the client's
@@ -64,6 +68,161 @@ pub const GATEWAY_ALPN: &[u8] = b"orrery/gateway/0";
 
 /// The admission response byte, mirroring `aeronet_iroh`'s `ACCEPTED`.
 const ACCEPTED: u8 = 0;
+
+/// Result of verifying a gateway session token.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GatewayAuthorization {
+    /// The token is valid at the injected gateway clock.
+    Valid(SessionTokenClaimsV1),
+    /// The token is authentic and transport-bound, but its lifetime elapsed.
+    Expired(SessionTokenClaimsV1),
+}
+
+/// Verifies the identity token carried by [`GatewayMsg::Hello`].
+pub trait GatewayAuthorizer: Send + Sync {
+    /// Verify `token` for the connected transport `node` at `now_ms`.
+    fn authorize(
+        &self,
+        token: &[u8],
+        node: &NodeId,
+        now_ms: UnixMillis,
+    ) -> Result<GatewayAuthorization, SessionTokenVerificationError>;
+}
+
+/// Shared gateway session-token verifier.
+pub type SharedGatewayAuthorizer = Arc<dyn GatewayAuthorizer>;
+
+/// Default-deny authorizer used until a deployment explicitly supplies keys.
+#[derive(Debug, Default)]
+pub struct DenyAllGatewayAuthorizer;
+
+impl GatewayAuthorizer for DenyAllGatewayAuthorizer {
+    fn authorize(
+        &self,
+        _token: &[u8],
+        _node: &NodeId,
+        _now_ms: UnixMillis,
+    ) -> Result<GatewayAuthorization, SessionTokenVerificationError> {
+        Err(SessionTokenVerificationError::Malformed)
+    }
+}
+
+/// V1 authorizer backed by configured identity issuer keys.
+#[derive(Debug, Clone)]
+pub struct SessionTokenV1Authorizer {
+    issuer_keys: Vec<IssuerKey>,
+}
+
+impl SessionTokenV1Authorizer {
+    /// Build an authorizer from the trusted identity issuer-key set.
+    #[must_use]
+    pub fn new(issuer_keys: impl IntoIterator<Item = IssuerKey>) -> Self {
+        Self {
+            issuer_keys: issuer_keys.into_iter().collect(),
+        }
+    }
+}
+
+impl GatewayAuthorizer for SessionTokenV1Authorizer {
+    fn authorize(
+        &self,
+        token: &[u8],
+        node: &NodeId,
+        now_ms: UnixMillis,
+    ) -> Result<GatewayAuthorization, SessionTokenVerificationError> {
+        let verifier = SessionTokenVerifier::new(
+            orrery_protocol::FixedTokenClock::new(now_ms),
+            self.issuer_keys.clone(),
+        );
+        match verifier.verify(token, node) {
+            Ok(claims) => Ok(GatewayAuthorization::Valid(claims)),
+            Err(SessionTokenVerificationError::Expired) => {
+                let decoded = SessionTokenV1::decode(token)?;
+                let issued_at = decoded.claims.issued_at_ms;
+                let expiry_verifier = SessionTokenVerifier::new(
+                    orrery_protocol::FixedTokenClock::new(issued_at),
+                    self.issuer_keys.clone(),
+                );
+                expiry_verifier
+                    .verify(token, node)
+                    .map(GatewayAuthorization::Expired)
+            }
+            Err(error) => Err(error),
+        }
+    }
+}
+
+/// Injected Unix clock used for session-token admission.
+pub trait GatewayClock: Send + Sync {
+    /// Return the current Unix timestamp in milliseconds.
+    fn now_ms(&self) -> UnixMillis;
+}
+
+/// Shared gateway clock.
+pub type SharedGatewayClock = Arc<dyn GatewayClock>;
+
+/// Production Unix wall clock.
+#[derive(Debug, Default)]
+pub struct SystemGatewayClock;
+
+impl GatewayClock for SystemGatewayClock {
+    fn now_ms(&self) -> UnixMillis {
+        let milliseconds = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |duration| {
+                u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+            });
+        UnixMillis::new(milliseconds)
+    }
+}
+
+/// Injected monotonic clock used for claim-rate admission.
+pub trait ClaimClock: Send + Sync {
+    /// Return elapsed monotonic milliseconds from an arbitrary process-local origin.
+    fn now_ms(&self) -> u64;
+}
+
+/// Shared monotonic clock used by the D16 claim limiter.
+pub type SharedClaimClock = Arc<dyn ClaimClock>;
+
+/// Production monotonic clock for claim-rate admission.
+#[derive(Debug)]
+pub struct SystemClaimClock {
+    started: Instant,
+}
+
+impl Default for SystemClaimClock {
+    fn default() -> Self {
+        Self {
+            started: Instant::now(),
+        }
+    }
+}
+
+impl ClaimClock for SystemClaimClock {
+    fn now_ms(&self) -> u64 {
+        u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX)
+    }
+}
+
+/// Reports whether identity is reachable for expiry decisions.
+pub trait IdentityHealth: Send + Sync {
+    /// Return `true` only while the identity service is known to be available.
+    fn is_available(&self) -> bool;
+}
+
+/// Shared identity-service health source.
+pub type SharedIdentityHealth = Arc<dyn IdentityHealth>;
+
+/// Healthy-by-default production health until an outage monitor reports otherwise.
+#[derive(Debug, Default)]
+pub struct AvailableIdentityHealth;
+
+impl IdentityHealth for AvailableIdentityHealth {
+    fn is_available(&self) -> bool {
+        true
+    }
+}
 
 /// How many bulk updates one connection routes concurrently.
 ///
@@ -89,6 +248,10 @@ const MAX_INFLIGHT_CONTROL_ROUTES_PER_CONN: usize = 8;
 /// queued behind an `await acquire`: it is an immediate, definitive refusal.
 /// This prevents a peer from turning queued tasks into unbounded memory use.
 const MAX_INFLIGHT_INTENT_ROUTES_PER_CONN: usize = 16;
+
+const MAX_PEER_REGISTRY_ENTRIES: usize = 4_096;
+
+const MAX_PEER_LIVE_LEASES: usize = 256;
 
 /// Decides whether a successful bulk route can make the normal durable-ack
 /// claim.
@@ -123,6 +286,75 @@ impl BulkAckDisposition {
 
 /// Shared bulk-ack admission policy used by a gateway.
 pub type SharedBulkAckAdmission = Arc<dyn BulkAckAdmission>;
+
+/// Supplies the coordinator's latest active-interest snapshot for a peer.
+///
+/// This synchronous seam deliberately exposes only immutable coordinator
+/// snapshots. Gateway client traffic, including [`GatewayMsg::Subscribe`],
+/// cannot mutate it.
+pub trait InterestAuthority: Send + Sync {
+    /// Return the latest coordinator snapshot for `peer`, if one is active.
+    fn snapshot_for(&self, peer: NodeId) -> Option<CoordinatorInterestSnapshot>;
+
+    /// Return whether `peer` currently covers `cell` in `grid`.
+    #[must_use]
+    fn allows(&self, peer: NodeId, grid: GridId, cell: CellId, now_ms: u64) -> bool {
+        self.snapshot_for(peer).is_some_and(|snapshot| {
+            snapshot.peer == peer
+                && snapshot.grid == grid
+                && snapshot.valid_until_ms > now_ms
+                && snapshot.covered_cells.contains(&cell)
+        })
+    }
+}
+
+/// Shared coordinator-interest authority injected into a gateway.
+pub type SharedInterestAuthority = Arc<dyn InterestAuthority>;
+
+/// Default coordinator-interest adapter until coordinator transport lands.
+///
+/// No snapshot is trusted unless a deployment injects one from its coordinator
+/// integration.
+#[derive(Debug, Default)]
+pub struct DenyAllInterestAuthority;
+
+impl InterestAuthority for DenyAllInterestAuthority {
+    fn snapshot_for(&self, _peer: NodeId) -> Option<CoordinatorInterestSnapshot> {
+        None
+    }
+}
+
+/// Immutable in-memory coordinator snapshot adapter for deterministic tests
+/// and deployments that already have a snapshot handout path.
+#[derive(Debug, Default)]
+pub struct SnapshotInterestAuthority {
+    snapshots: HashMap<NodeId, CoordinatorInterestSnapshot>,
+}
+
+impl SnapshotInterestAuthority {
+    /// Build an authority from snapshots, retaining the latest epoch per peer.
+    #[must_use]
+    pub fn from_snapshots(
+        snapshots: impl IntoIterator<Item = CoordinatorInterestSnapshot>,
+    ) -> Self {
+        let mut latest: HashMap<NodeId, CoordinatorInterestSnapshot> = HashMap::new();
+        for snapshot in snapshots {
+            match latest.get(&snapshot.peer) {
+                Some(current) if current.epoch >= snapshot.epoch => {}
+                _ => {
+                    latest.insert(snapshot.peer, snapshot);
+                }
+            }
+        }
+        Self { snapshots: latest }
+    }
+}
+
+impl InterestAuthority for SnapshotInterestAuthority {
+    fn snapshot_for(&self, peer: NodeId) -> Option<CoordinatorInterestSnapshot> {
+        self.snapshots.get(&peer).cloned()
+    }
+}
 
 const BULK_LATENCY_BOUNDARIES_US: [u64; 22] = [
     50, 100, 200, 500, 1_000, 2_000, 3_000, 5_000, 7_000, 10_000, 15_000, 20_000, 30_000, 50_000,
@@ -374,8 +606,26 @@ pub struct GatewayConfig {
     /// preserves the current single-node durable-ack behavior; activation can
     /// inject its three-second fence freshness monitor here.
     pub bulk_ack_admission: SharedBulkAckAdmission,
+    /// Coordinator-owned active-interest source for future weak-claim
+    /// plausibility checks. The default denies every peer until coordinator
+    /// transport injects a snapshot authority.
+    pub interest_authority: SharedInterestAuthority,
+    /// Session-token verifier. Defaults to explicit denial.
+    pub authorizer: SharedGatewayAuthorizer,
+    /// Unix clock used by the session-token verifier.
+    pub identity_clock: SharedGatewayClock,
+    /// Identity-service health used only for established-token expiry grace.
+    pub identity_health: SharedIdentityHealth,
     /// Bulk acknowledgement stage telemetry shared with the metrics reporter.
     pub bulk_metrics: Option<Arc<GatewayBulkMetrics>>,
+    /// Maximum retained authority peers, capped at 4,096.
+    pub peer_registry_capacity: usize,
+    /// Maximum live leases tracked for one authenticated NodeId, capped at 256.
+    pub peer_lease_capacity: usize,
+    /// Idle established-identity retention used for identity-outage grace.
+    pub peer_idle_retention_ms: u64,
+    /// Monotonic source for NodeId-scoped D16 claim admission.
+    pub claim_clock: SharedClaimClock,
 }
 
 impl Default for GatewayConfig {
@@ -389,7 +639,15 @@ impl Default for GatewayConfig {
             executor: None,
             validator: Arc::new(PermissiveValidator),
             bulk_ack_admission: Arc::new(FreshBulkAckAdmission),
+            interest_authority: Arc::new(DenyAllInterestAuthority),
+            authorizer: Arc::new(DenyAllGatewayAuthorizer),
+            identity_clock: Arc::new(SystemGatewayClock),
+            identity_health: Arc::new(AvailableIdentityHealth),
             bulk_metrics: None,
+            peer_registry_capacity: MAX_PEER_REGISTRY_ENTRIES,
+            peer_lease_capacity: MAX_PEER_LIVE_LEASES,
+            peer_idle_retention_ms: MAX_SESSION_TOKEN_TTL_MS,
+            claim_clock: Arc::new(SystemClaimClock::default()),
         }
     }
 }
@@ -414,10 +672,279 @@ impl core::fmt::Display for GatewayError {
 
 impl core::error::Error for GatewayError {}
 
+#[derive(Clone)]
+struct GatewayAdmission {
+    authorizer: SharedGatewayAuthorizer,
+    clock: SharedGatewayClock,
+    health: SharedIdentityHealth,
+    claim_clock: SharedClaimClock,
+    peers: Arc<PeerRegistry>,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct EstablishedIdentity {
+    claims: SessionTokenClaimsV1,
+    token: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct SessionGeneration(u64);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SessionLease {
+    entity: PersistId,
+    lease_id: LeaseId,
+    grid: GridId,
+    cell: CellId,
+    owner: SessionLeaseOwner,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionLeaseOwner {
+    Active(SessionGeneration),
+    Parking(SessionGeneration),
+}
+
+enum LeaseClaimCompletion {
+    Granted,
+    Compensate(SessionLease),
+    Denied,
+}
+
+struct PeerState {
+    established: EstablishedIdentity,
+    current: Option<SessionGeneration>,
+    live: HashSet<SessionGeneration>,
+    leases: HashMap<PersistId, SessionLease>,
+    pending_lease_claims: usize,
+    lease_capacity: usize,
+    idle_since_ms: Option<u64>,
+    claim_bucket: ClaimBucket,
+}
+
+struct PeerRegistry {
+    entries: tokio::sync::Mutex<HashMap<NodeId, Arc<tokio::sync::Mutex<PeerState>>>>,
+    next_generation: AtomicU64,
+    capacity: usize,
+    lease_capacity: usize,
+    idle_retention_ms: u64,
+}
+
+#[derive(Clone)]
+struct PeerSession {
+    node: NodeId,
+    generation: SessionGeneration,
+    state: Arc<tokio::sync::Mutex<PeerState>>,
+}
+
+impl PeerSession {
+    async fn lock_current(&self) -> Option<tokio::sync::OwnedMutexGuard<PeerState>> {
+        let state = Arc::clone(&self.state).lock_owned().await;
+        (state.current == Some(self.generation)).then_some(state)
+    }
+
+    async fn try_reserve_lease_slot(&self) -> bool {
+        let Some(mut peer) = self.lock_current().await else {
+            return false;
+        };
+        if peer.leases.len().saturating_add(peer.pending_lease_claims) >= peer.lease_capacity {
+            return false;
+        }
+        peer.pending_lease_claims += 1;
+        true
+    }
+
+    async fn complete_lease_claim(&self, lease: Option<SessionLease>) -> LeaseClaimCompletion {
+        let mut peer = self.state.lock().await;
+        let Some(pending_lease_claims) = peer.pending_lease_claims.checked_sub(1) else {
+            return LeaseClaimCompletion::Denied;
+        };
+        peer.pending_lease_claims = pending_lease_claims;
+        let Some(lease) = lease else {
+            return LeaseClaimCompletion::Denied;
+        };
+        if peer.current == Some(self.generation) {
+            return match peer.leases.get(&lease.entity) {
+                Some(indexed) if *indexed == lease => LeaseClaimCompletion::Granted,
+                Some(_) => LeaseClaimCompletion::Denied,
+                None => {
+                    peer.leases.insert(lease.entity, lease);
+                    LeaseClaimCompletion::Granted
+                }
+            };
+        }
+        let compensation = SessionLease {
+            owner: SessionLeaseOwner::Parking(self.generation),
+            ..lease
+        };
+        match peer.leases.get(&lease.entity) {
+            Some(indexed) if *indexed == compensation => {
+                LeaseClaimCompletion::Compensate(compensation)
+            }
+            Some(indexed)
+                if indexed.entity == lease.entity
+                    && indexed.lease_id == lease.lease_id
+                    && indexed.grid == lease.grid
+                    && indexed.cell == lease.cell
+                    && matches!(
+                        indexed.owner,
+                        SessionLeaseOwner::Active(generation)
+                            if Some(generation) == peer.current
+                    ) =>
+            {
+                LeaseClaimCompletion::Denied
+            }
+            Some(_) => LeaseClaimCompletion::Compensate(compensation),
+            None => {
+                peer.leases.insert(lease.entity, compensation);
+                LeaseClaimCompletion::Compensate(compensation)
+            }
+        }
+    }
+}
+
+impl PeerRegistry {
+    fn new(capacity: usize, idle_retention_ms: u64, lease_capacity: usize) -> Self {
+        Self {
+            entries: tokio::sync::Mutex::new(HashMap::new()),
+            next_generation: AtomicU64::new(0),
+            capacity: capacity.min(MAX_PEER_REGISTRY_ENTRIES),
+            lease_capacity: lease_capacity.min(MAX_PEER_LIVE_LEASES),
+            idle_retention_ms,
+        }
+    }
+
+    async fn activate(
+        &self,
+        node: NodeId,
+        authorization: GatewayAuthorization,
+        token: &[u8],
+        retiring: Option<SessionGeneration>,
+        now_ms: u64,
+        claim_now_ms: u64,
+    ) -> Option<PeerSession> {
+        self.evict_idle(now_ms).await;
+        let valid = matches!(authorization, GatewayAuthorization::Valid(_));
+        let state = {
+            let mut entries = self.entries.lock().await;
+            if let Some(state) = entries.get(&node) {
+                Arc::clone(state)
+            } else {
+                if !valid || entries.len() >= self.capacity {
+                    return None;
+                }
+                let claims = match &authorization {
+                    GatewayAuthorization::Valid(claims) => claims.clone(),
+                    GatewayAuthorization::Expired(_) => return None,
+                };
+                let state = Arc::new(tokio::sync::Mutex::new(PeerState {
+                    established: EstablishedIdentity {
+                        claims,
+                        token: token.to_vec(),
+                    },
+                    current: None,
+                    live: HashSet::new(),
+                    leases: HashMap::new(),
+                    pending_lease_claims: 0,
+                    lease_capacity: self.lease_capacity,
+                    idle_since_ms: Some(now_ms),
+                    claim_bucket: ClaimBucket::new(claim_now_ms),
+                }));
+                entries.insert(node, Arc::clone(&state));
+                state
+            }
+        };
+        let mut peer = state.lock().await;
+        match authorization {
+            GatewayAuthorization::Valid(claims) => {
+                peer.established = EstablishedIdentity {
+                    claims,
+                    token: token.to_vec(),
+                };
+            }
+            GatewayAuthorization::Expired(claims) => {
+                let retained = peer.idle_since_ms.is_none_or(|idle_since| {
+                    now_ms.saturating_sub(idle_since) <= self.idle_retention_ms
+                });
+                if !retained || peer.established.claims != claims || peer.established.token != token
+                {
+                    return None;
+                }
+            }
+        }
+        if let Some(retiring) = retiring {
+            peer.live.remove(&retiring);
+        }
+        let generation = SessionGeneration(
+            self.next_generation
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                    current.checked_add(1)
+                })
+                .ok()?
+                .checked_add(1)?,
+        );
+        peer.current = Some(generation);
+        peer.live.insert(generation);
+        peer.idle_since_ms = None;
+        for lease in peer.leases.values_mut() {
+            if let SessionLeaseOwner::Active(_) = lease.owner {
+                lease.owner = SessionLeaseOwner::Active(generation);
+            }
+        }
+        drop(peer);
+        Some(PeerSession {
+            node,
+            generation,
+            state,
+        })
+    }
+
+    async fn evict_idle(&self, now_ms: u64) {
+        self.entries.lock().await.retain(|_, state| {
+            let Ok(peer) = state.try_lock() else {
+                return true;
+            };
+            let retained = peer.idle_since_ms.is_none_or(|idle_since| {
+                now_ms.saturating_sub(idle_since) <= self.idle_retention_ms
+            });
+            retained || !peer.live.is_empty() || !peer.leases.is_empty() || peer.current.is_some()
+        });
+    }
+}
+
+impl GatewayAdmission {
+    async fn authorize(
+        &self,
+        token: &[u8],
+        remote: &NodeId,
+        retiring: Option<SessionGeneration>,
+    ) -> Option<PeerSession> {
+        let now_ms = self.clock.now_ms();
+        let authorization = match self.authorizer.authorize(token, remote, now_ms) {
+            Ok(valid @ GatewayAuthorization::Valid(_)) => valid,
+            Ok(expired @ GatewayAuthorization::Expired(_)) if !self.health.is_available() => {
+                expired
+            }
+            Ok(GatewayAuthorization::Expired(_)) | Err(_) => return None,
+        };
+        self.peers
+            .activate(
+                *remote,
+                authorization,
+                token,
+                retiring,
+                now_ms.0,
+                self.claim_clock.now_ms(),
+            )
+            .await
+    }
+}
+
 /// A running gateway: an iroh endpoint that accepts client sessions and routes
 /// them onto a [`Router`] (a single runtime or a test cluster harness).
 pub struct GatewayServer {
     endpoint: Arc<Endpoint>,
+    interest_authority: SharedInterestAuthority,
     send_failures: Arc<AtomicU64>,
     shutdown: oneshot::Sender<()>,
     join: tokio::task::JoinHandle<()>,
@@ -446,6 +973,18 @@ impl GatewayServer {
         let executor = config.executor;
         let validator = config.validator;
         let bulk_ack_admission = config.bulk_ack_admission;
+        let interest_authority = config.interest_authority;
+        let admission = GatewayAdmission {
+            authorizer: config.authorizer,
+            clock: config.identity_clock,
+            health: config.identity_health,
+            claim_clock: config.claim_clock,
+            peers: Arc::new(PeerRegistry::new(
+                config.peer_registry_capacity,
+                config.peer_idle_retention_ms,
+                config.peer_lease_capacity,
+            )),
+        };
         let bulk_metrics = config.bulk_metrics;
         let (shutdown, rx) = oneshot::channel();
         let send_failures = Arc::new(AtomicU64::new(0));
@@ -457,12 +996,15 @@ impl GatewayServer {
             executor,
             validator,
             bulk_ack_admission,
+            Arc::clone(&interest_authority),
+            admission,
             bulk_metrics,
             Arc::clone(&send_failures),
             rx,
         ));
         Ok(Self {
             endpoint,
+            interest_authority,
             send_failures,
             shutdown,
             join,
@@ -480,6 +1022,15 @@ impl GatewayServer {
     #[must_use]
     pub fn addr(&self) -> EndpointAddr {
         self.endpoint.addr()
+    }
+
+    /// The coordinator-owned interest authority supplied at gateway startup.
+    ///
+    /// This read-only seam is retained for coordinator integration; gateway
+    /// client messages do not update it.
+    #[must_use]
+    pub fn interest_authority(&self) -> &dyn InterestAuthority {
+        self.interest_authority.as_ref()
     }
 
     /// The number of reply datagram sends that failed since startup (e.g. an
@@ -511,6 +1062,8 @@ async fn accept_loop(
     executor: Option<SharedExecutor>,
     validator: SharedValidator,
     bulk_ack_admission: SharedBulkAckAdmission,
+    interest_authority: SharedInterestAuthority,
+    admission: GatewayAdmission,
     bulk_metrics: Option<Arc<GatewayBulkMetrics>>,
     send_failures: Arc<AtomicU64>,
     mut shutdown: oneshot::Receiver<()>,
@@ -518,12 +1071,18 @@ async fn accept_loop(
     loop {
         tokio::select! {
             _ = &mut shutdown => break,
+            _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {
+                router.sweep_expired_leases(registrar_now_ms()).await;
+                admission.peers.evict_idle(admission.clock.now_ms().0).await;
+            }
             incoming = endpoint.accept() => {
                 let Some(incoming) = incoming else { break };
                 let router = Arc::clone(&router);
                 let executor = executor.clone();
                 let validator = Arc::clone(&validator);
                 let bulk_ack_admission = Arc::clone(&bulk_ack_admission);
+                let interest_authority = Arc::clone(&interest_authority);
+                let admission = admission.clone();
                 let bulk_metrics = bulk_metrics.clone();
                 let send_failures = Arc::clone(&send_failures);
                 tokio::spawn(handle_connection(
@@ -534,6 +1093,8 @@ async fn accept_loop(
                     executor,
                     validator,
                     bulk_ack_admission,
+                    interest_authority,
+                    admission,
                     bulk_metrics,
                     send_failures,
                 ));
@@ -560,6 +1121,8 @@ async fn handle_connection(
     executor: Option<SharedExecutor>,
     validator: SharedValidator,
     bulk_ack_admission: SharedBulkAckAdmission,
+    interest_authority: SharedInterestAuthority,
+    admission: GatewayAdmission,
     bulk_metrics: Option<Arc<GatewayBulkMetrics>>,
     send_failures: Arc<AtomicU64>,
 ) {
@@ -601,6 +1164,7 @@ async fn handle_connection(
     let inflight_diffs = Arc::new(Semaphore::new(MAX_INFLIGHT_DIFF_ROUTES_PER_CONN));
     let inflight_control = Arc::new(Semaphore::new(MAX_INFLIGHT_CONTROL_ROUTES_PER_CONN));
     let inflight_intents = Arc::new(Semaphore::new(MAX_INFLIGHT_INTENT_ROUTES_PER_CONN));
+    let mut session: Option<PeerSession> = None;
 
     loop {
         let pkt = match conn.read_datagram().await {
@@ -622,27 +1186,286 @@ async fn handle_connection(
             continue;
         };
         match msg {
-            GatewayMsg::Hello { .. } => {
-                let reply = GatewayReply::HelloAck { gateway, protocol };
-                send(Bytes::from(encode_stream_frame(&reply)));
-            }
-            // The P3 wire lane is present before the distributed registrar is
-            // wired into this P2 gateway process. Never silently accept a
-            // lease request: an explicit denial keeps optimistic clients from
-            // treating an unsupported endpoint as an authority grant.
-            GatewayMsg::Lease { message } => {
-                if let orrery_protocol::LeaseMsg::Claim { entity, .. } = message {
-                    let reply = GatewayReply::Lease {
-                        message: orrery_protocol::LeaseMsg::Deny {
-                            entity,
-                            reason: orrery_protocol::DenyReason::NotEligible,
-                            retry_after_ms: 0,
-                        },
-                    };
+            GatewayMsg::Hello { token, node } => {
+                // The iroh transport identity is the authority identity; a
+                // claimed wire NodeId must never be allowed to substitute it.
+                let retiring = session.as_ref().map(|session| session.generation);
+                let authorized = if node == remote {
+                    admission.authorize(&token, &remote, retiring).await
+                } else {
+                    None
+                };
+                if let Some(authorized) = authorized {
+                    session = Some(authorized);
+                    let reply = GatewayReply::HelloAck { gateway, protocol };
                     send(Bytes::from(encode_stream_frame(&reply)));
+                } else {
+                    if let Some(retiring) = session.take() {
+                        cleanup_peer_session(&retiring, &router, admission.clock.now_ms().0).await;
+                    }
+                    if node != remote {
+                        warn!(%remote, "gateway: Hello node did not match transport identity");
+                    }
+                }
+            }
+            GatewayMsg::Lease { message } => {
+                let Some(active_session) = session.as_ref() else {
+                    continue;
+                };
+                match message {
+                    LeaseMsg::Claim {
+                        claim_id,
+                        entity,
+                        grid,
+                        cell,
+                        kind,
+                        basis,
+                        ..
+                    } => {
+                        let Some(mut peer) = active_session.lock_current().await else {
+                            send(Bytes::from(encode_stream_frame(&GatewayReply::Lease {
+                                message: LeaseMsg::Deny {
+                                    claim_id: Some(claim_id),
+                                    entity,
+                                    reason: orrery_protocol::DenyReason::NotEligible,
+                                    retry_after_ms: 0,
+                                },
+                            })));
+                            continue;
+                        };
+                        let claim_now_ms = admission.claim_clock.now_ms();
+                        if !peer.claim_bucket.take(claim_now_ms) {
+                            let retry_after_ms = peer.claim_bucket.retry_after_ms();
+                            send(Bytes::from(encode_stream_frame(&GatewayReply::Lease {
+                                message: LeaseMsg::Deny {
+                                    claim_id: Some(claim_id),
+                                    entity,
+                                    reason: orrery_protocol::DenyReason::RateLimited,
+                                    retry_after_ms,
+                                },
+                            })));
+                            continue;
+                        }
+                        drop(peer);
+                        if !active_session.try_reserve_lease_slot().await {
+                            send(Bytes::from(encode_stream_frame(&GatewayReply::Lease {
+                                message: LeaseMsg::Deny {
+                                    claim_id: Some(claim_id),
+                                    entity,
+                                    reason: orrery_protocol::DenyReason::NotEligible,
+                                    retry_after_ms: 0,
+                                },
+                            })));
+                            continue;
+                        }
+                        let now_ms = registrar_now_ms();
+                        let player_basis = matches!(
+                            basis,
+                            orrery_protocol::ClaimBasis::Contact { .. }
+                                | orrery_protocol::ClaimBasis::Explicit
+                        );
+                        let committed_cell = if player_basis {
+                            router
+                                .committed_entity_cell(grid, entity)
+                                .await
+                                .ok()
+                                .flatten()
+                        } else {
+                            None
+                        };
+                        let plausible = committed_cell.is_some_and(|resolved| {
+                            resolved == cell
+                                && match kind {
+                                    orrery_protocol::ClaimKind::Weak => {
+                                        interest_authority.allows(remote, grid, resolved, now_ms)
+                                    }
+                                    orrery_protocol::ClaimKind::Strong => true,
+                                }
+                        });
+                        let outcome = if plausible {
+                            router
+                                .claim_lease(grid, cell, entity, remote, kind, now_ms)
+                                .await
+                        } else {
+                            Ok(crate::lease::ClaimResult::Denied(
+                                orrery_protocol::DenyReason::NotEligible,
+                            ))
+                        };
+                        let message = match outcome {
+                            Ok(crate::lease::ClaimResult::Granted(row)) => {
+                                let lease = SessionLease {
+                                    entity,
+                                    lease_id: row.lease_id,
+                                    grid,
+                                    cell,
+                                    owner: SessionLeaseOwner::Active(active_session.generation),
+                                };
+                                match active_session.complete_lease_claim(Some(lease)).await {
+                                    LeaseClaimCompletion::Granted => LeaseMsg::Grant {
+                                        claim_id,
+                                        entity,
+                                        lease_id: row.lease_id,
+                                        seq: row.seq,
+                                        ttl_ms: crate::lease::LEASE_TTL_MS as u32,
+                                        prev_holder: None,
+                                    },
+                                    LeaseClaimCompletion::Compensate(compensation) => {
+                                        let parked = router
+                                            .park_lease(grid, cell, entity, remote, row.lease_id)
+                                            .await
+                                            .is_ok();
+                                        if parked {
+                                            let mut peer = active_session.state.lock().await;
+                                            if peer.leases.get(&compensation.entity)
+                                                == Some(&compensation)
+                                            {
+                                                peer.leases.remove(&compensation.entity);
+                                            }
+                                        }
+                                        LeaseMsg::Deny {
+                                            claim_id: Some(claim_id),
+                                            entity,
+                                            reason: orrery_protocol::DenyReason::NotEligible,
+                                            retry_after_ms: 0,
+                                        }
+                                    }
+                                    LeaseClaimCompletion::Denied => LeaseMsg::Deny {
+                                        claim_id: Some(claim_id),
+                                        entity,
+                                        reason: orrery_protocol::DenyReason::NotEligible,
+                                        retry_after_ms: 0,
+                                    },
+                                }
+                            }
+                            Ok(crate::lease::ClaimResult::Denied(reason)) => {
+                                let _ = active_session.complete_lease_claim(None).await;
+                                LeaseMsg::Deny {
+                                    claim_id: Some(claim_id),
+                                    entity,
+                                    reason,
+                                    retry_after_ms: 0,
+                                }
+                            }
+                            Err(_) => {
+                                let _ = active_session.complete_lease_claim(None).await;
+                                LeaseMsg::Deny {
+                                    claim_id: Some(claim_id),
+                                    entity,
+                                    reason: orrery_protocol::DenyReason::NotEligible,
+                                    retry_after_ms: 100,
+                                }
+                            }
+                        };
+                        send(Bytes::from(encode_stream_frame(&GatewayReply::Lease {
+                            message,
+                        })));
+                    }
+                    LeaseMsg::Heartbeat { lease_ids, .. } => {
+                        let Some(peer) = active_session.lock_current().await else {
+                            send(Bytes::from(encode_stream_frame(&GatewayReply::Lease {
+                                message: LeaseMsg::HeartbeatAck {
+                                    leases: Vec::new(),
+                                    invalid: lease_ids,
+                                },
+                            })));
+                            continue;
+                        };
+                        let indexed_leases = lease_ids
+                            .iter()
+                            .map(|lease_id| {
+                                (
+                                    *lease_id,
+                                    peer.leases
+                                        .values()
+                                        .filter(|lease| {
+                                            lease.lease_id == *lease_id
+                                                && lease.owner
+                                                    == SessionLeaseOwner::Active(
+                                                        active_session.generation,
+                                                    )
+                                        })
+                                        .copied()
+                                        .collect::<Vec<_>>(),
+                                )
+                            })
+                            .collect::<Vec<_>>();
+                        drop(peer);
+                        let mut rows = Vec::with_capacity(lease_ids.len());
+                        let mut invalid = Vec::new();
+                        for (lease_id, leases) in indexed_leases {
+                            if leases.is_empty() {
+                                invalid.push(lease_id);
+                            }
+                            for lease in leases {
+                                match router
+                                    .heartbeat_lease(
+                                        lease.grid,
+                                        lease.cell,
+                                        lease.entity,
+                                        remote,
+                                        lease_id,
+                                        registrar_now_ms(),
+                                    )
+                                    .await
+                                {
+                                    Ok(Some(row)) => {
+                                        let current = row.holder == Some(remote)
+                                            && row.lease_id == lease_id
+                                            && row.expires_at > registrar_now_ms();
+                                        rows.push(row);
+                                        if !current {
+                                            invalid.push(lease_id);
+                                        }
+                                    }
+                                    Ok(None) | Err(_) => invalid.push(lease_id),
+                                }
+                            }
+                        }
+                        if active_session.lock_current().await.is_none() {
+                            rows.clear();
+                            invalid = lease_ids;
+                        }
+                        send(Bytes::from(encode_stream_frame(&GatewayReply::Lease {
+                            message: LeaseMsg::HeartbeatAck {
+                                leases: rows,
+                                invalid,
+                            },
+                        })));
+                    }
+                    LeaseMsg::Rekey { entity, .. } => {
+                        send(Bytes::from(encode_stream_frame(&GatewayReply::Lease {
+                            message: LeaseMsg::Deny {
+                                claim_id: None,
+                                entity,
+                                reason: orrery_protocol::DenyReason::NotEligible,
+                                retry_after_ms: 0,
+                            },
+                        })));
+                    }
+                    _ => {}
                 }
             }
             GatewayMsg::Diff { diff } => {
+                if diff.kind == orrery_protocol::RecordKind::Rekey {
+                    send(Bytes::from(encode_datagram(&GatewayReply::BulkNack {
+                        entity: diff.entity,
+                        tick: diff.tick,
+                        reason: 2,
+                        lease: None,
+                    })));
+                    continue;
+                }
+                // Persistent state is never admitted until the peer has
+                // bound its claimed NodeId to the iroh-authenticated identity.
+                let Some(active_session) = session.clone() else {
+                    send(Bytes::from(encode_datagram(&GatewayReply::BulkNack {
+                        entity: diff.entity,
+                        tick: diff.tick,
+                        reason: 2,
+                        lease: None,
+                    })));
+                    continue;
+                };
                 let received_at = Instant::now();
                 let send = Arc::clone(&send);
                 let router = Arc::clone(&router);
@@ -653,10 +1476,10 @@ async fn handle_connection(
                     Ok(permit) => {
                         tokio::spawn(async move {
                             let _permit = permit;
-                            route_diff(
+                            route_session_diff(
                                 send.as_ref(),
                                 diff,
-                                remote,
+                                &active_session,
                                 &router,
                                 &bulk_ack_admission,
                                 bulk_metrics.as_deref(),
@@ -666,10 +1489,10 @@ async fn handle_connection(
                         });
                     }
                     Err(_) => {
-                        route_diff(
+                        route_session_diff(
                             send.as_ref(),
                             diff,
-                            remote,
+                            &active_session,
                             &router,
                             &bulk_ack_admission,
                             bulk_metrics.as_deref(),
@@ -723,6 +1546,89 @@ async fn handle_connection(
                 }
             }
         }
+    }
+    if let Some(session) = session {
+        cleanup_peer_session(&session, &router, admission.clock.now_ms().0).await;
+    }
+}
+
+async fn cleanup_peer_session(session: &PeerSession, router: &Arc<dyn Router>, now_ms: u64) {
+    let leases = {
+        let mut peer = session.state.lock().await;
+        peer.live.remove(&session.generation);
+        if peer.current == Some(session.generation) {
+            peer.current = None;
+            for lease in peer.leases.values_mut() {
+                if lease.owner == SessionLeaseOwner::Active(session.generation) {
+                    lease.owner = SessionLeaseOwner::Parking(session.generation);
+                }
+            }
+        }
+        peer.leases
+            .iter()
+            .filter(|(_, lease)| lease.owner == SessionLeaseOwner::Parking(session.generation))
+            .map(|(_, lease)| (lease.lease_id, *lease))
+            .collect::<Vec<_>>()
+    };
+
+    for (lease_id, lease) in leases {
+        let parked = router
+            .park_lease(lease.grid, lease.cell, lease.entity, session.node, lease_id)
+            .await
+            .is_ok();
+        let mut peer = session.state.lock().await;
+        if parked && peer.leases.get(&lease.entity) == Some(&lease) {
+            peer.leases.remove(&lease.entity);
+        }
+    }
+
+    let mut peer = session.state.lock().await;
+    if peer.current.is_none() && peer.live.is_empty() && peer.leases.is_empty() {
+        peer.idle_since_ms = Some(now_ms);
+    }
+}
+
+struct ClaimBucket {
+    token_millis: u64,
+    updated_ms: u64,
+}
+
+impl ClaimBucket {
+    const CLAIMS_PER_SECOND: u64 = 20;
+    const BURST_CLAIMS: u64 = 64;
+    const TOKEN_MILLIS_PER_CLAIM: u64 = 1_000;
+    const BURST_TOKEN_MILLIS: u64 = Self::BURST_CLAIMS * Self::TOKEN_MILLIS_PER_CLAIM;
+
+    const fn new(now_ms: u64) -> Self {
+        Self {
+            token_millis: Self::BURST_TOKEN_MILLIS,
+            updated_ms: now_ms,
+        }
+    }
+    fn take(&mut self, now_ms: u64) -> bool {
+        if now_ms > self.updated_ms {
+            let replenished = now_ms
+                .saturating_sub(self.updated_ms)
+                .saturating_mul(Self::CLAIMS_PER_SECOND);
+            self.token_millis = self
+                .token_millis
+                .saturating_add(replenished)
+                .min(Self::BURST_TOKEN_MILLIS);
+            self.updated_ms = now_ms;
+        }
+        if self.token_millis < Self::TOKEN_MILLIS_PER_CLAIM {
+            false
+        } else {
+            self.token_millis -= Self::TOKEN_MILLIS_PER_CLAIM;
+            true
+        }
+    }
+
+    fn retry_after_ms(&self) -> u32 {
+        let missing_token_millis = Self::TOKEN_MILLIS_PER_CLAIM.saturating_sub(self.token_millis);
+        let wait_ms = missing_token_millis.saturating_add(Self::CLAIMS_PER_SECOND - 1)
+            / Self::CLAIMS_PER_SECOND;
+        u32::try_from(wait_ms).unwrap_or(u32::MAX)
     }
 }
 
@@ -840,38 +1746,107 @@ async fn send_admission(conn: &iroh::endpoint::Connection) -> Result<(), String>
         .map_err(|e| format!("finish admission: {e}"))
 }
 
-/// Journal a bulk diff via the owning cell actor, then ack with the durable
-/// LSN (or nack on rejection). The gateway fills in the server-assigned
-/// `epoch`/`lsn`/`author`/`crc` (docs/08-persistence.md §2.1).
-async fn route_diff(
+async fn route_session_diff(
     send: &(dyn Fn(Bytes) + Send + Sync),
     diff: DiffUplink,
-    author: NodeId,
+    session: &PeerSession,
     router: &Arc<dyn Router>,
     bulk_ack_admission: &SharedBulkAckAdmission,
     bulk_metrics: Option<&GatewayBulkMetrics>,
     received_at: Instant,
 ) {
+    let Some(_peer) = session.lock_current().await else {
+        send(Bytes::from(encode_datagram(&GatewayReply::BulkNack {
+            entity: diff.entity,
+            tick: diff.tick,
+            reason: 2,
+            lease: None,
+        })));
+        return;
+    };
+    route_diff(
+        send,
+        DiffRoute {
+            diff,
+            author: session.node,
+            received_at,
+            strict_authority: true,
+        },
+        router,
+        bulk_ack_admission,
+        bulk_metrics,
+    )
+    .await;
+}
+
+struct DiffRoute {
+    diff: DiffUplink,
+    author: NodeId,
+    received_at: Instant,
+    strict_authority: bool,
+}
+
+/// Journal a bulk diff via the owning cell actor, then ack with the durable
+/// LSN (or nack on rejection). The gateway fills in the server-assigned
+/// `epoch`/`lsn`/`author`/`crc` (docs/08-persistence.md §2.1).
+async fn route_diff(
+    send: &(dyn Fn(Bytes) + Send + Sync),
+    route: DiffRoute,
+    router: &Arc<dyn Router>,
+    bulk_ack_admission: &SharedBulkAckAdmission,
+    bulk_metrics: Option<&GatewayBulkMetrics>,
+) {
+    let DiffRoute {
+        diff,
+        author,
+        received_at,
+        strict_authority,
+    } = route;
     let route_started = Instant::now();
     let route_queue_us = elapsed_us(received_at);
     let entity = diff.entity;
     let tick = diff.tick;
     let crc = payload_crc(&diff.payload);
 
-    let result = router
-        .apply(JournalRecord {
-            lsn: Lsn::new(0, 0),
-            cell: diff.cell,
-            grid: diff.grid,
-            entity,
-            tick,
-            epoch: Epoch::new(0),
-            author,
-            kind: diff.kind,
-            payload: diff.payload,
-            crc,
-        })
-        .await;
+    let record = JournalRecord {
+        lsn: Lsn::new(0, 0),
+        cell: diff.cell,
+        grid: diff.grid,
+        entity,
+        tick,
+        epoch: Epoch::new(0),
+        author,
+        kind: diff.kind,
+        payload: diff.payload,
+        crc,
+    };
+    let result = if strict_authority {
+        // The actor performs this comparison and append in one mailbox turn.
+        // A missing pair deliberately uses the never-granted zero token so it
+        // still returns the current row in the lease-specific NACK.
+        let (lease_id, authority_seq) = diff
+            .lease_id
+            .zip(diff.authority_seq)
+            .unwrap_or((LeaseId(0), Default::default()));
+        match router
+            .apply_fenced(record, author, lease_id, authority_seq, registrar_now_ms())
+            .await
+        {
+            Ok(FencedApply::Accepted(handle)) => Ok(handle),
+            Ok(FencedApply::Rejected(lease)) => {
+                send(Bytes::from(encode_datagram(&GatewayReply::BulkNack {
+                    entity,
+                    tick,
+                    reason: 2,
+                    lease,
+                })));
+                return;
+            }
+            Err(error) => Err(error),
+        }
+    } else {
+        router.apply(record).await
+    };
     let router_apply_us = elapsed_us(route_started);
     let journal_wait_started = Instant::now();
 
@@ -923,6 +1898,7 @@ async fn route_diff(
                 entity,
                 tick,
                 reason: 1,
+                lease: None,
             };
             send(Bytes::from(encode_datagram(&reply)));
         }
@@ -1106,6 +2082,32 @@ mod tests {
         FenceStore, MemFenceStore,
     };
 
+    fn interest_snapshot(
+        peer: NodeId,
+        epoch: u64,
+        grid: GridId,
+        covered_cells: Vec<CellId>,
+        valid_until_ms: u64,
+    ) -> CoordinatorInterestSnapshot {
+        CoordinatorInterestSnapshot {
+            peer,
+            epoch: Epoch::new(epoch),
+            grid,
+            covered_cells,
+            valid_until_ms,
+        }
+    }
+
+    struct WrongPeerInterestAuthority {
+        snapshot: CoordinatorInterestSnapshot,
+    }
+
+    impl InterestAuthority for WrongPeerInterestAuthority {
+        fn snapshot_for(&self, _peer: NodeId) -> Option<CoordinatorInterestSnapshot> {
+            Some(self.snapshot.clone())
+        }
+    }
+
     struct SuccessfulRouter;
 
     #[async_trait::async_trait]
@@ -1123,6 +2125,50 @@ mod tests {
 
         async fn has_actor(&self, _grid: GridId, _cell: CellId) -> bool {
             false
+        }
+    }
+
+    struct BlockingParkRouter {
+        entered: tokio::sync::mpsc::Sender<LeaseId>,
+        release: Arc<tokio::sync::Notify>,
+        parked: Mutex<Vec<LeaseId>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Router for BlockingParkRouter {
+        async fn apply(
+            &self,
+            _record: JournalRecord,
+        ) -> Result<Arc<crate::journal::AppendHandle>, Reject> {
+            Ok(crate::journal::AppendHandle::completed(Lsn::new(7, 11)))
+        }
+
+        async fn read(&self, _grid: GridId, _cell: CellId) -> Result<SnapshotPage, Reject> {
+            Err(Reject::JournalClosed)
+        }
+
+        async fn has_actor(&self, _grid: GridId, _cell: CellId) -> bool {
+            false
+        }
+
+        async fn park_lease(
+            &self,
+            _grid: GridId,
+            _cell: CellId,
+            _entity: PersistId,
+            _holder: NodeId,
+            lease_id: LeaseId,
+        ) -> Result<Option<orrery_protocol::Lease>, Reject> {
+            self.entered
+                .send(lease_id)
+                .await
+                .map_err(|_| Reject::JournalClosed)?;
+            self.release.notified().await;
+            self.parked
+                .lock()
+                .expect("parked lease lock")
+                .push(lease_id);
+            Ok(None)
         }
     }
 
@@ -1150,11 +2196,408 @@ mod tests {
     }
 
     #[test]
+    fn claim_bucket_allows_d16_burst_then_refills_at_twenty_per_second() {
+        let mut bucket = ClaimBucket::new(0);
+        for _ in 0..64 {
+            assert!(bucket.take(0), "configured burst is admitted");
+        }
+        assert!(!bucket.take(0), "65th immediate claim is rate limited");
+        assert_eq!(bucket.retry_after_ms(), 50);
+        assert!(!bucket.take(1), "one millisecond cannot admit a claim");
+        assert_eq!(bucket.retry_after_ms(), 49);
+
+        // A deterministic monotonic second restores only the D16 sustained rate.
+        for _ in 0..20 {
+            assert!(bucket.take(1_000), "one second restores 20 claim tokens");
+        }
+        assert!(
+            !bucket.take(1_000),
+            "refill does not exceed sustained D16 rate"
+        );
+    }
+
+    #[tokio::test]
+    async fn peer_registry_shares_claim_bucket_across_replacement_sessions() {
+        // Given: one authenticated NodeId has exhausted half its burst.
+        let registry = PeerRegistry::new(2, 10_000, MAX_PEER_LIVE_LEASES);
+        let node = iroh::SecretKey::from_bytes(&[1; 32]).public();
+        let authorization = GatewayAuthorization::Valid(SessionTokenClaimsV1::new(
+            orrery_protocol::AccountId::new(1),
+            node,
+            UnixMillis::new(0),
+            orrery_protocol::SessionTokenTtlMs::new(1_000),
+            orrery_protocol::SessionStanding::Good,
+            orrery_protocol::IssuerKeyId::new(1),
+        ));
+        let first = registry
+            .activate(node, authorization.clone(), b"first", None, 0, 0)
+            .await
+            .expect("valid peer is admitted");
+        let mut first_state = first.lock_current().await.expect("first is current");
+        for _ in 0..16 {
+            assert!(first_state.claim_bucket.take(0));
+        }
+        drop(first_state);
+
+        // When: a parallel authenticated connection replaces the first one.
+        let replacement = registry
+            .activate(
+                node,
+                authorization,
+                b"replacement",
+                Some(first.generation),
+                0,
+                0,
+            )
+            .await
+            .expect("replacement is admitted");
+        let mut replacement_state = replacement
+            .lock_current()
+            .await
+            .expect("replacement is current");
+
+        // Then: both connections consumed one 64-claim burst, and only a
+        // deterministic one-second refill admits the next twenty claims.
+        for _ in 0..16 {
+            assert!(replacement_state.claim_bucket.take(0));
+        }
+        drop(replacement_state);
+        let router: Arc<dyn Router> = Arc::new(SuccessfulRouter);
+        cleanup_peer_session(&replacement, &router, 1).await;
+        let reconnect = registry
+            .activate(
+                node,
+                GatewayAuthorization::Valid(SessionTokenClaimsV1::new(
+                    orrery_protocol::AccountId::new(1),
+                    node,
+                    UnixMillis::new(0),
+                    orrery_protocol::SessionTokenTtlMs::new(1_000),
+                    orrery_protocol::SessionStanding::Good,
+                    orrery_protocol::IssuerKeyId::new(1),
+                )),
+                b"reconnect",
+                None,
+                1,
+                0,
+            )
+            .await
+            .expect("retained peer reconnects");
+        let mut reconnect_state = reconnect
+            .lock_current()
+            .await
+            .expect("reconnect is current");
+
+        for _ in 0..32 {
+            assert!(reconnect_state.claim_bucket.take(0));
+        }
+        assert!(!reconnect_state.claim_bucket.take(0));
+        for _ in 0..20 {
+            assert!(reconnect_state.claim_bucket.take(1_000));
+        }
+        assert!(!reconnect_state.claim_bucket.take(1_000));
+
+        let other_node = iroh::SecretKey::from_bytes(&[2; 32]).public();
+        let other = registry
+            .activate(
+                other_node,
+                GatewayAuthorization::Valid(SessionTokenClaimsV1::new(
+                    orrery_protocol::AccountId::new(2),
+                    other_node,
+                    UnixMillis::new(0),
+                    orrery_protocol::SessionTokenTtlMs::new(1_000),
+                    orrery_protocol::SessionStanding::Good,
+                    orrery_protocol::IssuerKeyId::new(1),
+                )),
+                b"other",
+                None,
+                1_000,
+                1_000,
+            )
+            .await
+            .expect("independent peer is admitted");
+        let mut other_state = other.lock_current().await.expect("other is current");
+        for _ in 0..64 {
+            assert!(other_state.claim_bucket.take(1_000));
+        }
+        assert!(!other_state.claim_bucket.take(1_000));
+    }
+
+    #[tokio::test]
+    async fn peer_registry_rejects_claim_when_lease_capacity_is_full() {
+        // Given: a NodeId-scoped peer has one indexed live lease, filling its capacity.
+        let registry = PeerRegistry::new(2, 10_000, 1);
+        let node = iroh::SecretKey::from_bytes(&[4; 32]).public();
+        let authorization = GatewayAuthorization::Valid(SessionTokenClaimsV1::new(
+            orrery_protocol::AccountId::new(4),
+            node,
+            UnixMillis::new(0),
+            orrery_protocol::SessionTokenTtlMs::new(1_000),
+            orrery_protocol::SessionStanding::Good,
+            orrery_protocol::IssuerKeyId::new(1),
+        ));
+        let first = registry
+            .activate(node, authorization.clone(), b"first", None, 0, 0)
+            .await
+            .expect("valid peer is admitted");
+        first.state.lock().await.leases.insert(
+            PersistId::new(44),
+            SessionLease {
+                entity: PersistId::new(44),
+                lease_id: LeaseId(44),
+                grid: GridId::ROOT,
+                cell: CellId::ROOT,
+                owner: SessionLeaseOwner::Active(first.generation),
+            },
+        );
+
+        // When: that same NodeId reconnects and attempts one more claim.
+        let replacement = registry
+            .activate(
+                node,
+                authorization,
+                b"replacement",
+                Some(first.generation),
+                0,
+                0,
+            )
+            .await
+            .expect("replacement preserves the established peer");
+        let admitted = replacement.try_reserve_lease_slot().await;
+
+        // Then: the bound survives replacement, no admission is reserved, and
+        // the live-lease index cannot grow before actor routing.
+        let peer = replacement
+            .lock_current()
+            .await
+            .expect("replacement remains current");
+        assert!(!admitted);
+        assert_eq!(peer.leases.len(), 1);
+        assert_eq!(peer.pending_lease_claims, 0);
+    }
+
+    #[tokio::test]
+    async fn cleanup_peer_session_releases_peer_state_while_park_is_pending() {
+        // Given: a current session owns an indexed lease and parking blocks at the router seam.
+        let registry = PeerRegistry::new(2, 10_000, MAX_PEER_LIVE_LEASES);
+        let node = iroh::SecretKey::from_bytes(&[3; 32]).public();
+        let authorization = GatewayAuthorization::Valid(SessionTokenClaimsV1::new(
+            orrery_protocol::AccountId::new(3),
+            node,
+            UnixMillis::new(0),
+            orrery_protocol::SessionTokenTtlMs::new(1_000),
+            orrery_protocol::SessionStanding::Good,
+            orrery_protocol::IssuerKeyId::new(1),
+        ));
+        let first = registry
+            .activate(node, authorization.clone(), b"first", None, 0, 0)
+            .await
+            .expect("first session is admitted");
+        let parked_lease = LeaseId(41);
+        first.state.lock().await.leases.insert(
+            PersistId::new(41),
+            SessionLease {
+                entity: PersistId::new(41),
+                lease_id: parked_lease,
+                grid: GridId::ROOT,
+                cell: CellId::ROOT,
+                owner: SessionLeaseOwner::Active(first.generation),
+            },
+        );
+        let (entered_tx, mut entered_rx) = tokio::sync::mpsc::channel(2);
+        let release = Arc::new(tokio::sync::Notify::new());
+        let router = Arc::new(BlockingParkRouter {
+            entered: entered_tx,
+            release: Arc::clone(&release),
+            parked: Mutex::new(Vec::new()),
+        });
+        let cleanup_router: Arc<dyn Router> = router.clone();
+        let cleanup_session = first.clone();
+        let cleanup = tokio::spawn(async move {
+            cleanup_peer_session(&cleanup_session, &cleanup_router, 1).await;
+        });
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_millis(250), entered_rx.recv())
+                .await
+                .expect("cleanup reaches the blocking park seam"),
+            Some(parked_lease)
+        );
+
+        // When: a replacement needs the same PeerState while the old cleanup is blocked.
+        let replacement = tokio::time::timeout(
+            std::time::Duration::from_millis(250),
+            registry.activate(
+                node,
+                authorization,
+                b"replacement",
+                Some(first.generation),
+                1,
+                1,
+            ),
+        )
+        .await
+        .expect("blocked parking does not retain the peer-state mutex")
+        .expect("replacement session is admitted");
+        let replacement_lease = LeaseId(42);
+        let mut replacement_state = replacement
+            .lock_current()
+            .await
+            .expect("replacement owns peer state while old cleanup parks");
+        assert_eq!(
+            replacement_state
+                .leases
+                .get(&PersistId::new(41))
+                .map(|lease| lease.owner),
+            Some(SessionLeaseOwner::Parking(first.generation)),
+            "a pending old cleanup lease stays reserved for its original generation"
+        );
+        replacement_state.leases.insert(
+            PersistId::new(42),
+            SessionLease {
+                entity: PersistId::new(42),
+                lease_id: replacement_lease,
+                grid: GridId::ROOT,
+                cell: CellId::ROOT,
+                owner: SessionLeaseOwner::Active(replacement.generation),
+            },
+        );
+        drop(replacement_state);
+
+        // Then: cancellation leaves the pending old lease resumable without touching the replacement.
+        cleanup.abort();
+        assert!(cleanup
+            .await
+            .expect_err("blocked cleanup is cancelled")
+            .is_cancelled());
+        let state = first.state.lock().await;
+        assert!(state.leases.contains_key(&PersistId::new(41)));
+        assert!(state.leases.contains_key(&PersistId::new(42)));
+        drop(state);
+
+        let resume_router: Arc<dyn Router> = router.clone();
+        let resume_session = first.clone();
+        let resume = tokio::spawn(async move {
+            cleanup_peer_session(&resume_session, &resume_router, 2).await;
+        });
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_millis(250), entered_rx.recv())
+                .await
+                .expect("resumed cleanup reaches the blocking park seam"),
+            Some(parked_lease)
+        );
+        release.notify_one();
+        tokio::time::timeout(std::time::Duration::from_millis(250), resume)
+            .await
+            .expect("resumed cleanup completes after park release")
+            .expect("resumed cleanup task does not panic");
+        assert_eq!(
+            router.parked.lock().expect("parked lease lock").as_slice(),
+            &[parked_lease],
+            "obsolete cleanup parks only its own pre-replacement lease"
+        );
+
+        let replacement_router: Arc<dyn Router> = router.clone();
+        let replacement_session = replacement.clone();
+        let replacement_cleanup = tokio::spawn(async move {
+            cleanup_peer_session(&replacement_session, &replacement_router, 3).await;
+        });
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_millis(250), entered_rx.recv())
+                .await
+                .expect("current cleanup reaches the blocking park seam"),
+            Some(replacement_lease)
+        );
+        release.notify_one();
+        tokio::time::timeout(std::time::Duration::from_millis(250), replacement_cleanup)
+            .await
+            .expect("current cleanup completes after park release")
+            .expect("current cleanup task does not panic");
+        assert_eq!(
+            router.parked.lock().expect("parked lease lock").as_slice(),
+            &[parked_lease, replacement_lease],
+            "current cleanup parks its replacement-owned lease after the old cleanup resumes"
+        );
+    }
+
+    #[test]
     fn default_bulk_ack_admission_is_fresh() {
         assert_eq!(
             FreshBulkAckAdmission.assess(GridId::ROOT, CellId::ROOT),
             BulkAckDisposition::Durable
         );
+    }
+
+    #[test]
+    fn default_gateway_config_denies_interest() {
+        let peer = iroh::SecretKey::from_bytes(&[6; 32]).public();
+
+        assert!(!GatewayConfig::default().interest_authority.allows(
+            peer,
+            GridId::ROOT,
+            CellId::ROOT,
+            0
+        ));
+    }
+
+    #[test]
+    fn interest_authority_allows_an_exact_live_snapshot_match() {
+        let peer = iroh::SecretKey::from_bytes(&[7; 32]).public();
+        let grid = GridId::new(4);
+        let cell = CellId::ROOT;
+        let authority = SnapshotInterestAuthority::from_snapshots([interest_snapshot(
+            peer,
+            2,
+            grid,
+            vec![cell],
+            101,
+        )]);
+
+        assert!(authority.allows(peer, grid, cell, 100));
+    }
+
+    #[test]
+    fn interest_authority_denies_missing_stale_or_replaced_snapshot() {
+        let peer = iroh::SecretKey::from_bytes(&[8; 32]).public();
+        let grid = GridId::new(5);
+        let cell = CellId::ROOT;
+
+        assert!(!DenyAllInterestAuthority.allows(peer, grid, cell, 0));
+
+        let stale = SnapshotInterestAuthority::from_snapshots([interest_snapshot(
+            peer,
+            1,
+            grid,
+            vec![cell],
+            100,
+        )]);
+        assert!(!stale.allows(peer, grid, cell, 100));
+
+        let replaced = SnapshotInterestAuthority::from_snapshots([
+            interest_snapshot(peer, 1, grid, vec![cell], 200),
+            interest_snapshot(peer, 2, grid, Vec::new(), 200),
+        ]);
+        assert!(!replaced.allows(peer, grid, cell, 100));
+    }
+
+    #[test]
+    fn interest_authority_denies_wrong_peer_grid_or_uncovered_cell() {
+        let peer = iroh::SecretKey::from_bytes(&[9; 32]).public();
+        let other_peer = iroh::SecretKey::from_bytes(&[10; 32]).public();
+        let grid = GridId::new(6);
+        let cell = CellId::ROOT;
+        let snapshot = interest_snapshot(peer, 1, grid, vec![cell], 200);
+        let authority = WrongPeerInterestAuthority { snapshot };
+
+        assert!(!authority.allows(other_peer, grid, cell, 100));
+
+        let covered = SnapshotInterestAuthority::from_snapshots([interest_snapshot(
+            peer,
+            1,
+            grid,
+            vec![cell],
+            200,
+        )]);
+        assert!(!covered.allows(peer, GridId::new(7), cell, 100));
+        assert!(!covered.allows(peer, grid, CellId::ROOT.children()[0], 100));
     }
 
     #[tokio::test]
@@ -1168,22 +2611,25 @@ mod tests {
 
         route_diff(
             &send,
-            DiffUplink {
-                cell: CellId::ROOT,
-                grid: GridId::ROOT,
-                entity: PersistId::new(12),
-                tick: orrery_protocol::Tick::new(3),
-                kind: orrery_protocol::RecordKind::ComponentDiff,
-                payload: Bytes::from_static(b"state"),
-                seq: 3,
-                lease_id: None,
-                authority_seq: None,
+            DiffRoute {
+                diff: DiffUplink {
+                    cell: CellId::ROOT,
+                    grid: GridId::ROOT,
+                    entity: PersistId::new(12),
+                    tick: orrery_protocol::Tick::new(3),
+                    kind: orrery_protocol::RecordKind::ComponentDiff,
+                    payload: Bytes::from_static(b"state"),
+                    seq: 3,
+                    lease_id: None,
+                    authority_seq: None,
+                },
+                author: iroh::SecretKey::from_bytes(&[1; 32]).public(),
+                received_at: Instant::now(),
+                strict_authority: false,
             },
-            iroh::SecretKey::from_bytes(&[1; 32]).public(),
             &router,
             &admission,
             Some(&metrics),
-            Instant::now(),
         )
         .await;
 
@@ -1268,22 +2714,25 @@ mod tests {
         let admission: SharedBulkAckAdmission = monitor.clone();
         route_diff(
             &send,
-            DiffUplink {
-                cell: CellId::ROOT,
-                grid: GridId::ROOT,
-                entity: PersistId::new(22),
-                tick: orrery_protocol::Tick::new(4),
-                kind: orrery_protocol::RecordKind::ComponentDiff,
-                payload: Bytes::from_static(b"state"),
-                seq: 4,
-                lease_id: None,
-                authority_seq: None,
+            DiffRoute {
+                diff: DiffUplink {
+                    cell: CellId::ROOT,
+                    grid: GridId::ROOT,
+                    entity: PersistId::new(22),
+                    tick: orrery_protocol::Tick::new(4),
+                    kind: orrery_protocol::RecordKind::ComponentDiff,
+                    payload: Bytes::from_static(b"state"),
+                    seq: 4,
+                    lease_id: None,
+                    authority_seq: None,
+                },
+                author: iroh::SecretKey::from_bytes(&[2; 32]).public(),
+                received_at: Instant::now(),
+                strict_authority: false,
             },
-            iroh::SecretKey::from_bytes(&[2; 32]).public(),
             &router,
             &admission,
             None,
-            Instant::now(),
         )
         .await;
         let bytes = sent

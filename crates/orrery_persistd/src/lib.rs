@@ -39,7 +39,9 @@ pub mod lease;
 pub mod placement;
 pub mod runtime;
 
-pub use actor::{CellActorHandle, CellMsg, EntityRecord, Reject, SnapshotPage, Tombstone};
+pub use actor::{
+    CellActorHandle, EntityRecord, FencedApply, Reject, RekeyError, SnapshotPage, Tombstone,
+};
 pub use checkpoint::{
     spawn_checkpoint_scheduler, spawn_checkpoint_scheduler_direct, CheckpointConfig,
     CheckpointData, CheckpointError, CheckpointScheduler, CheckpointStore, ColdCellReader,
@@ -75,6 +77,11 @@ pub use journal::{
     JournalConfig, JournalError, JournalScan, JournalStageSnapshot, MemChainTransport,
     StoredRecord,
 };
-pub use lease::{ClaimResult, LeaseRegistrar, LEASE_TTL_MS};
+#[cfg(feature = "fdb")]
+pub use lease::FdbLeaseStore;
+pub use lease::{
+    ClaimResult, LeaseMigrate, LeasePut, LeaseRegistrar, LeaseStore, LeaseStoreError,
+    MemLeaseStore, LEASE_TTL_MS,
+};
 pub use placement::{RendezvousHasher, RendezvousNode, RendezvousWeight};
 pub use runtime::{payload_crc, CellRuntime, RuntimeConfig};

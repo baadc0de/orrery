@@ -16,18 +16,51 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use orrery_protocol::CellId;
+use orrery_protocol::{CellId, ClaimKind, Lease, LeaseId, NodeId, PersistId};
 
 use orrery_protocol::GridId;
 
 use orrery_protocol::JournalRecord;
 
-use crate::actor::{Reject, SnapshotPage};
+use crate::actor::{CellActorHandle, FencedApply, Reject, SnapshotPage};
 use crate::journal::{
     AppendHandle, ChainConfig, ChainReplicator, ChainTransport, JournalChainSink,
 };
 use crate::placement::{RendezvousHasher, RendezvousNode};
-use crate::runtime::CellRuntime;
+use crate::runtime::{CellRuntime, EntityStripeGates};
+
+async fn gated_mutex_actor(
+    runtime: &tokio::sync::Mutex<CellRuntime>,
+    grid: GridId,
+    presented_cell: CellId,
+    entity: PersistId,
+) -> Result<(tokio::sync::OwnedMutexGuard<()>, CellActorHandle), Reject> {
+    let (gate, store, runtime_grid) = {
+        let runtime = runtime.lock().await;
+        (
+            runtime.entity_gate(grid, entity),
+            runtime.lease_store_handle(),
+            runtime.grid(),
+        )
+    };
+    let guard = gate.lock_owned().await;
+    let route_cell = if runtime_grid == grid {
+        store
+            .locate(grid, entity)
+            .await
+            .map_err(|_| Reject::LeaseStore)?
+            .unwrap_or(presented_cell)
+    } else {
+        presented_cell
+    };
+    let actor = runtime
+        .lock()
+        .await
+        .actor(grid, route_cell)
+        .cloned()
+        .ok_or(Reject::JournalClosed)?;
+    Ok((guard, actor))
+}
 
 /// The routing surface the gateway uses to reach cell actors.
 ///
@@ -37,9 +70,35 @@ use crate::runtime::CellRuntime;
 /// the routing topology is swappable.
 #[async_trait::async_trait]
 pub trait Router: Send + Sync {
+    /// Sweep registrar TTLs for every live actor this router owns.
+    async fn sweep_expired_leases(&self, _now_ms: u64) {}
     /// Apply a journal record to the actor owning its cell, returning the
     /// handle the gateway must await before acknowledging durability.
     async fn apply(&self, record: JournalRecord) -> Result<Arc<AppendHandle>, Reject>;
+
+    /// Validate a server-owned committed rekey before actor transfer.
+    ///
+    /// Task 11 deliberately stops after establishing this trusted entrypoint;
+    /// actor export/import and journal application are implemented by Task 12.
+    async fn commit_rekey(&self, record: JournalRecord) -> Result<(), crate::actor::RekeyError> {
+        crate::actor::decode_entity_rekey(&record)?;
+        Err(crate::actor::RekeyError::ActorUnavailable)
+    }
+
+    /// Atomically check a persistent authority fence and append its diff.
+    ///
+    /// Real actor routers override this to keep the comparison and admission
+    /// in one mailbox turn. The fallback preserves non-authority test routers.
+    async fn apply_fenced(
+        &self,
+        record: JournalRecord,
+        _holder: NodeId,
+        _lease_id: LeaseId,
+        _authority_seq: orrery_protocol::SeqPair,
+        _now_ms: u64,
+    ) -> Result<FencedApply, Reject> {
+        self.apply(record).await.map(FencedApply::Accepted)
+    }
 
     /// Read a snapshot of `cell` in `grid` from its owning actor (P-7:
     /// storage cell ids are grid-relative, so the grid scopes which universe
@@ -48,6 +107,15 @@ pub trait Router: Send + Sync {
 
     /// Whether a live actor holds `cell` in `grid` (vs a cold FDB scan).
     async fn has_actor(&self, grid: GridId, cell: CellId) -> bool;
+
+    /// Resolve an entity's committed cell without trusting a client cell hint.
+    async fn committed_entity_cell(
+        &self,
+        _grid: GridId,
+        _entity: PersistId,
+    ) -> Result<Option<CellId>, Reject> {
+        Ok(None)
+    }
 
     /// Read a cold cell from the durable tier (an FDB range scan), if this
     /// router has a cold-store fallback. Returns `None` when there is no cold
@@ -61,6 +129,53 @@ pub trait Router: Send + Sync {
         let _ = (grid, cell);
         Ok(None)
     }
+    /// Serialized registrar claim routed to the actor owning `cell`.
+    async fn claim_lease(
+        &self,
+        _grid: GridId,
+        _cell: CellId,
+        _entity: PersistId,
+        _holder: NodeId,
+        _kind: ClaimKind,
+        _now_ms: u64,
+    ) -> Result<crate::lease::ClaimResult, Reject> {
+        Err(Reject::JournalClosed)
+    }
+    /// Renew or inspect a session lease.
+    async fn heartbeat_lease(
+        &self,
+        _grid: GridId,
+        _cell: CellId,
+        _entity: PersistId,
+        _holder: NodeId,
+        _lease_id: LeaseId,
+        _now_ms: u64,
+    ) -> Result<Option<Lease>, Reject> {
+        Err(Reject::JournalClosed)
+    }
+    /// Validate a bulk fencing token, returning the current row on failure.
+    async fn validate_lease(
+        &self,
+        _grid: GridId,
+        _cell: CellId,
+        _entity: PersistId,
+        _holder: NodeId,
+        _lease_id: LeaseId,
+        _now_ms: u64,
+    ) -> Result<Option<Lease>, Reject> {
+        Err(Reject::JournalClosed)
+    }
+    /// Park a disconnecting holder's indexed lease.
+    async fn park_lease(
+        &self,
+        _grid: GridId,
+        _cell: CellId,
+        _entity: PersistId,
+        _holder: NodeId,
+        _lease_id: LeaseId,
+    ) -> Result<Option<Lease>, Reject> {
+        Err(Reject::JournalClosed)
+    }
 }
 
 /// A router over a single runtime (one-node deployment).
@@ -69,10 +184,35 @@ pub trait Router: Send + Sync {
 /// concurrent applies directly into the journal's commit queue (§4).
 #[async_trait::async_trait]
 impl Router for CellRuntime {
+    async fn sweep_expired_leases(&self, now_ms: u64) {
+        self.sweep_expired_leases(now_ms).await;
+    }
     async fn apply(&self, record: JournalRecord) -> Result<Arc<AppendHandle>, Reject> {
         self.actor(record.grid, record.cell)
             .ok_or(Reject::JournalClosed)?
             .start_diff(record)
+            .await
+    }
+    async fn commit_rekey(&self, record: JournalRecord) -> Result<(), crate::actor::RekeyError> {
+        self.commit_rekey(record).await
+    }
+    async fn apply_fenced(
+        &self,
+        record: JournalRecord,
+        holder: NodeId,
+        lease_id: LeaseId,
+        authority_seq: orrery_protocol::SeqPair,
+        now_ms: u64,
+    ) -> Result<FencedApply, Reject> {
+        let gate = self.entity_gate(record.grid, record.entity);
+        let _guard = gate.lock_owned().await;
+        let route_cell = self
+            .lease_location(record.entity)
+            .await?
+            .unwrap_or(record.cell);
+        self.actor(record.grid, route_cell)
+            .ok_or(Reject::JournalClosed)?
+            .start_fenced_diff(record, holder, lease_id, authority_seq, now_ms)
             .await
     }
 
@@ -86,13 +226,126 @@ impl Router for CellRuntime {
     async fn has_actor(&self, grid: GridId, cell: CellId) -> bool {
         self.actor(grid, cell).is_some()
     }
+    async fn committed_entity_cell(
+        &self,
+        grid: GridId,
+        entity: PersistId,
+    ) -> Result<Option<CellId>, Reject> {
+        if self.grid() != grid {
+            return Ok(None);
+        }
+        if let Some(cell) = self.lease_location(entity).await? {
+            return Ok(Some(cell));
+        }
+        let actors: Vec<_> = self
+            .shards()
+            .filter_map(|shard| self.actor(grid, *shard).cloned())
+            .collect();
+        for actor in actors {
+            if let Some(cell) = actor.committed_entity_cell(entity).await? {
+                return Ok(Some(cell));
+            }
+        }
+        Ok(None)
+    }
+    async fn claim_lease(
+        &self,
+        grid: GridId,
+        cell: CellId,
+        entity: PersistId,
+        holder: NodeId,
+        kind: ClaimKind,
+        now_ms: u64,
+    ) -> Result<crate::lease::ClaimResult, Reject> {
+        let gate = self.entity_gate(grid, entity);
+        let _guard = gate.lock_owned().await;
+        let route_cell = self.lease_location(entity).await?.unwrap_or(cell);
+        self.actor(grid, route_cell)
+            .ok_or(Reject::JournalClosed)?
+            .claim_lease(entity, cell, holder, kind, now_ms)
+            .await
+    }
+    async fn heartbeat_lease(
+        &self,
+        grid: GridId,
+        cell: CellId,
+        entity: PersistId,
+        holder: NodeId,
+        lease_id: LeaseId,
+        now_ms: u64,
+    ) -> Result<Option<Lease>, Reject> {
+        let gate = self.entity_gate(grid, entity);
+        let _guard = gate.lock_owned().await;
+        let route_cell = self.lease_location(entity).await?.unwrap_or(cell);
+        self.actor(grid, route_cell)
+            .ok_or(Reject::JournalClosed)?
+            .heartbeat_lease(entity, holder, lease_id, now_ms)
+            .await
+    }
+    async fn validate_lease(
+        &self,
+        grid: GridId,
+        cell: CellId,
+        entity: PersistId,
+        holder: NodeId,
+        lease_id: LeaseId,
+        now_ms: u64,
+    ) -> Result<Option<Lease>, Reject> {
+        let gate = self.entity_gate(grid, entity);
+        let _guard = gate.lock_owned().await;
+        let route_cell = self.lease_location(entity).await?.unwrap_or(cell);
+        self.actor(grid, route_cell)
+            .ok_or(Reject::JournalClosed)?
+            .validate_lease(entity, holder, lease_id, now_ms)
+            .await
+    }
+    async fn park_lease(
+        &self,
+        grid: GridId,
+        cell: CellId,
+        entity: PersistId,
+        holder: NodeId,
+        lease_id: LeaseId,
+    ) -> Result<Option<Lease>, Reject> {
+        let gate = self.entity_gate(grid, entity);
+        let _guard = gate.lock_owned().await;
+        let route_cell = self.lease_location(entity).await?.unwrap_or(cell);
+        self.actor(grid, route_cell)
+            .ok_or(Reject::JournalClosed)?
+            .park_lease(entity, holder, lease_id)
+            .await
+    }
 }
 
 /// A router over a shared runtime.
 #[async_trait::async_trait]
 impl Router for Arc<CellRuntime> {
+    async fn sweep_expired_leases(&self, now_ms: u64) {
+        <CellRuntime as Router>::sweep_expired_leases(self.as_ref(), now_ms).await;
+    }
     async fn apply(&self, record: JournalRecord) -> Result<Arc<AppendHandle>, Reject> {
         <CellRuntime as Router>::apply(self.as_ref(), record).await
+    }
+    async fn commit_rekey(&self, record: JournalRecord) -> Result<(), crate::actor::RekeyError> {
+        <CellRuntime as Router>::commit_rekey(self.as_ref(), record).await
+    }
+    async fn apply_fenced(
+        &self,
+        record: JournalRecord,
+        holder: NodeId,
+        lease_id: LeaseId,
+        authority_seq: orrery_protocol::SeqPair,
+        now_ms: u64,
+    ) -> Result<FencedApply, Reject> {
+        <CellRuntime as Router>::apply_fenced(
+            self.as_ref(),
+            record,
+            holder,
+            lease_id,
+            authority_seq,
+            now_ms,
+        )
+        .await
     }
 
     async fn read(&self, grid: GridId, cell: CellId) -> Result<SnapshotPage, Reject> {
@@ -101,6 +354,64 @@ impl Router for Arc<CellRuntime> {
 
     async fn has_actor(&self, grid: GridId, cell: CellId) -> bool {
         <CellRuntime as Router>::has_actor(self.as_ref(), grid, cell).await
+    }
+    async fn committed_entity_cell(
+        &self,
+        grid: GridId,
+        entity: PersistId,
+    ) -> Result<Option<CellId>, Reject> {
+        <CellRuntime as Router>::committed_entity_cell(self.as_ref(), grid, entity).await
+    }
+    async fn claim_lease(
+        &self,
+        grid: GridId,
+        cell: CellId,
+        entity: PersistId,
+        holder: NodeId,
+        kind: ClaimKind,
+        now_ms: u64,
+    ) -> Result<crate::lease::ClaimResult, Reject> {
+        self.as_ref()
+            .claim_lease(grid, cell, entity, holder, kind, now_ms)
+            .await
+    }
+    async fn heartbeat_lease(
+        &self,
+        grid: GridId,
+        cell: CellId,
+        entity: PersistId,
+        holder: NodeId,
+        lease_id: LeaseId,
+        now_ms: u64,
+    ) -> Result<Option<Lease>, Reject> {
+        self.as_ref()
+            .heartbeat_lease(grid, cell, entity, holder, lease_id, now_ms)
+            .await
+    }
+    async fn validate_lease(
+        &self,
+        grid: GridId,
+        cell: CellId,
+        entity: PersistId,
+        holder: NodeId,
+        lease_id: LeaseId,
+        now_ms: u64,
+    ) -> Result<Option<Lease>, Reject> {
+        self.as_ref()
+            .validate_lease(grid, cell, entity, holder, lease_id, now_ms)
+            .await
+    }
+    async fn park_lease(
+        &self,
+        grid: GridId,
+        cell: CellId,
+        entity: PersistId,
+        holder: NodeId,
+        lease_id: LeaseId,
+    ) -> Result<Option<Lease>, Reject> {
+        self.as_ref()
+            .park_lease(grid, cell, entity, holder, lease_id)
+            .await
     }
 }
 
@@ -112,6 +423,9 @@ impl Router for Arc<CellRuntime> {
 /// queue instead of serializing the whole node behind one fsync (§4).
 #[async_trait::async_trait]
 impl Router for tokio::sync::Mutex<CellRuntime> {
+    async fn sweep_expired_leases(&self, now_ms: u64) {
+        self.lock().await.sweep_expired_leases(now_ms).await;
+    }
     async fn apply(&self, record: JournalRecord) -> Result<Arc<AppendHandle>, Reject> {
         let handle = {
             let rt = self.lock().await;
@@ -120,6 +434,30 @@ impl Router for tokio::sync::Mutex<CellRuntime> {
         handle
             .ok_or(Reject::JournalClosed)?
             .start_diff(record)
+            .await
+    }
+    async fn commit_rekey(&self, record: JournalRecord) -> Result<(), crate::actor::RekeyError> {
+        let rekey = crate::actor::decode_entity_rekey(&record)?;
+        let gate = self
+            .lock()
+            .await
+            .entity_gate(rekey.source_grid, rekey.entity);
+        let _guard = gate.lock_owned().await;
+        let plan = self.lock().await.committed_rekey_plan(record)?;
+        plan.execute().await
+    }
+    async fn apply_fenced(
+        &self,
+        record: JournalRecord,
+        holder: NodeId,
+        lease_id: LeaseId,
+        authority_seq: orrery_protocol::SeqPair,
+        now_ms: u64,
+    ) -> Result<FencedApply, Reject> {
+        let (_guard, handle) =
+            gated_mutex_actor(self, record.grid, record.cell, record.entity).await?;
+        handle
+            .start_fenced_diff(record, holder, lease_id, authority_seq, now_ms)
             .await
     }
 
@@ -138,6 +476,87 @@ impl Router for tokio::sync::Mutex<CellRuntime> {
         let rt = self.lock().await;
         rt.actor(grid, cell).is_some()
     }
+    async fn committed_entity_cell(
+        &self,
+        grid: GridId,
+        entity: PersistId,
+    ) -> Result<Option<CellId>, Reject> {
+        let (store, actors): (_, Vec<_>) = {
+            let runtime = self.lock().await;
+            if runtime.grid() != grid {
+                return Ok(None);
+            }
+            (
+                runtime.lease_store_handle(),
+                runtime
+                    .shards()
+                    .filter_map(|shard| runtime.actor(grid, *shard).cloned())
+                    .collect(),
+            )
+        };
+        if let Some(cell) = store
+            .locate(grid, entity)
+            .await
+            .map_err(|_| Reject::LeaseStore)?
+        {
+            return Ok(Some(cell));
+        }
+        for actor in actors {
+            if let Some(cell) = actor.committed_entity_cell(entity).await? {
+                return Ok(Some(cell));
+            }
+        }
+        Ok(None)
+    }
+    async fn claim_lease(
+        &self,
+        grid: GridId,
+        cell: CellId,
+        entity: PersistId,
+        holder: NodeId,
+        kind: ClaimKind,
+        now_ms: u64,
+    ) -> Result<crate::lease::ClaimResult, Reject> {
+        let (_guard, actor) = gated_mutex_actor(self, grid, cell, entity).await?;
+        actor.claim_lease(entity, cell, holder, kind, now_ms).await
+    }
+    async fn heartbeat_lease(
+        &self,
+        grid: GridId,
+        cell: CellId,
+        entity: PersistId,
+        holder: NodeId,
+        lease_id: LeaseId,
+        now_ms: u64,
+    ) -> Result<Option<Lease>, Reject> {
+        let (_guard, actor) = gated_mutex_actor(self, grid, cell, entity).await?;
+        actor
+            .heartbeat_lease(entity, holder, lease_id, now_ms)
+            .await
+    }
+    async fn validate_lease(
+        &self,
+        grid: GridId,
+        cell: CellId,
+        entity: PersistId,
+        holder: NodeId,
+        lease_id: LeaseId,
+        now_ms: u64,
+    ) -> Result<Option<Lease>, Reject> {
+        let (_guard, actor) = gated_mutex_actor(self, grid, cell, entity).await?;
+        actor.validate_lease(entity, holder, lease_id, now_ms).await
+    }
+    async fn park_lease(
+        &self,
+        grid: GridId,
+        cell: CellId,
+        entity: PersistId,
+        holder: NodeId,
+        lease_id: LeaseId,
+    ) -> Result<Option<Lease>, Reject> {
+        let (_guard, actor) = gated_mutex_actor(self, grid, cell, entity).await?;
+        actor.park_lease(entity, holder, lease_id).await
+    }
 }
 
 /// A router over a shared runtime handle.
@@ -147,8 +566,26 @@ impl Router for tokio::sync::Mutex<CellRuntime> {
 /// router used when FoundationDB is available.
 #[async_trait::async_trait]
 impl Router for Arc<tokio::sync::Mutex<CellRuntime>> {
+    async fn sweep_expired_leases(&self, now_ms: u64) {
+        self.as_ref().sweep_expired_leases(now_ms).await;
+    }
     async fn apply(&self, record: JournalRecord) -> Result<Arc<AppendHandle>, Reject> {
         self.as_ref().apply(record).await
+    }
+    async fn commit_rekey(&self, record: JournalRecord) -> Result<(), crate::actor::RekeyError> {
+        self.as_ref().commit_rekey(record).await
+    }
+    async fn apply_fenced(
+        &self,
+        record: JournalRecord,
+        holder: NodeId,
+        lease_id: LeaseId,
+        authority_seq: orrery_protocol::SeqPair,
+        now_ms: u64,
+    ) -> Result<FencedApply, Reject> {
+        self.as_ref()
+            .apply_fenced(record, holder, lease_id, authority_seq, now_ms)
+            .await
     }
 
     async fn read(&self, grid: GridId, cell: CellId) -> Result<SnapshotPage, Reject> {
@@ -157,6 +594,64 @@ impl Router for Arc<tokio::sync::Mutex<CellRuntime>> {
 
     async fn has_actor(&self, grid: GridId, cell: CellId) -> bool {
         self.as_ref().has_actor(grid, cell).await
+    }
+    async fn committed_entity_cell(
+        &self,
+        grid: GridId,
+        entity: PersistId,
+    ) -> Result<Option<CellId>, Reject> {
+        self.as_ref().committed_entity_cell(grid, entity).await
+    }
+    async fn claim_lease(
+        &self,
+        grid: GridId,
+        cell: CellId,
+        entity: PersistId,
+        holder: NodeId,
+        kind: ClaimKind,
+        now_ms: u64,
+    ) -> Result<crate::lease::ClaimResult, Reject> {
+        self.as_ref()
+            .claim_lease(grid, cell, entity, holder, kind, now_ms)
+            .await
+    }
+    async fn heartbeat_lease(
+        &self,
+        grid: GridId,
+        cell: CellId,
+        entity: PersistId,
+        holder: NodeId,
+        lease_id: LeaseId,
+        now_ms: u64,
+    ) -> Result<Option<Lease>, Reject> {
+        self.as_ref()
+            .heartbeat_lease(grid, cell, entity, holder, lease_id, now_ms)
+            .await
+    }
+    async fn validate_lease(
+        &self,
+        grid: GridId,
+        cell: CellId,
+        entity: PersistId,
+        holder: NodeId,
+        lease_id: LeaseId,
+        now_ms: u64,
+    ) -> Result<Option<Lease>, Reject> {
+        self.as_ref()
+            .validate_lease(grid, cell, entity, holder, lease_id, now_ms)
+            .await
+    }
+    async fn park_lease(
+        &self,
+        grid: GridId,
+        cell: CellId,
+        entity: PersistId,
+        holder: NodeId,
+        lease_id: LeaseId,
+    ) -> Result<Option<Lease>, Reject> {
+        self.as_ref()
+            .park_lease(grid, cell, entity, holder, lease_id)
+            .await
     }
 }
 
@@ -183,8 +678,26 @@ impl<R> ColdFallbackRouter<R> {
 
 #[async_trait::async_trait]
 impl<R: Router + Send + Sync> Router for ColdFallbackRouter<R> {
+    async fn sweep_expired_leases(&self, now_ms: u64) {
+        self.live.sweep_expired_leases(now_ms).await;
+    }
     async fn apply(&self, record: JournalRecord) -> Result<Arc<AppendHandle>, Reject> {
         self.live.apply(record).await
+    }
+    async fn commit_rekey(&self, record: JournalRecord) -> Result<(), crate::actor::RekeyError> {
+        self.live.commit_rekey(record).await
+    }
+    async fn apply_fenced(
+        &self,
+        record: JournalRecord,
+        holder: NodeId,
+        lease_id: LeaseId,
+        authority_seq: orrery_protocol::SeqPair,
+        now_ms: u64,
+    ) -> Result<FencedApply, Reject> {
+        self.live
+            .apply_fenced(record, holder, lease_id, authority_seq, now_ms)
+            .await
     }
 
     async fn read(&self, grid: GridId, cell: CellId) -> Result<SnapshotPage, Reject> {
@@ -195,11 +708,70 @@ impl<R: Router + Send + Sync> Router for ColdFallbackRouter<R> {
         self.live.has_actor(grid, cell).await
     }
 
+    async fn committed_entity_cell(
+        &self,
+        grid: GridId,
+        entity: PersistId,
+    ) -> Result<Option<CellId>, Reject> {
+        self.live.committed_entity_cell(grid, entity).await
+    }
+
     async fn read_cold(&self, grid: GridId, cell: CellId) -> Result<Option<SnapshotPage>, Reject> {
         self.cold
             .read_cold(grid, cell)
             .await
             .map_err(|_| Reject::JournalClosed)
+    }
+    async fn claim_lease(
+        &self,
+        grid: GridId,
+        cell: CellId,
+        entity: PersistId,
+        holder: NodeId,
+        kind: ClaimKind,
+        now_ms: u64,
+    ) -> Result<crate::lease::ClaimResult, Reject> {
+        self.live
+            .claim_lease(grid, cell, entity, holder, kind, now_ms)
+            .await
+    }
+    async fn heartbeat_lease(
+        &self,
+        grid: GridId,
+        cell: CellId,
+        entity: PersistId,
+        holder: NodeId,
+        lease_id: LeaseId,
+        now_ms: u64,
+    ) -> Result<Option<Lease>, Reject> {
+        self.live
+            .heartbeat_lease(grid, cell, entity, holder, lease_id, now_ms)
+            .await
+    }
+    async fn validate_lease(
+        &self,
+        grid: GridId,
+        cell: CellId,
+        entity: PersistId,
+        holder: NodeId,
+        lease_id: LeaseId,
+        now_ms: u64,
+    ) -> Result<Option<Lease>, Reject> {
+        self.live
+            .validate_lease(grid, cell, entity, holder, lease_id, now_ms)
+            .await
+    }
+    async fn park_lease(
+        &self,
+        grid: GridId,
+        cell: CellId,
+        entity: PersistId,
+        holder: NodeId,
+        lease_id: LeaseId,
+    ) -> Result<Option<Lease>, Reject> {
+        self.live
+            .park_lease(grid, cell, entity, holder, lease_id)
+            .await
     }
 }
 
@@ -211,6 +783,7 @@ pub struct Cluster {
     runtimes: HashMap<u64, Arc<tokio::sync::Mutex<CellRuntime>>>,
     /// Chain-replication tasks (primary → follower), one per node.
     chains: Vec<ChainReplicator>,
+    entity_gates: Arc<EntityStripeGates>,
 }
 
 impl Cluster {
@@ -254,6 +827,7 @@ impl Cluster {
             nodes,
             runtimes,
             chains,
+            entity_gates: Arc::new(EntityStripeGates::default()),
         }
     }
 
@@ -268,20 +842,17 @@ impl Cluster {
     /// Placement is keyed by `(grid, cell)` (P-7: storage cell ids are
     /// grid-relative). Today each cluster serves exactly one grid — a nested
     /// deployment runs one cluster per grid — so a mismatched grid has no
-    /// runtime to route to and this returns `None`. The grid check is the
-    /// routing half of the P-7 guard; the runtime's own `actor()` guard is
-    /// the enforcement half.
+    /// runtime to route to and this returns `None`. Grid validity is checked
+    /// after the selected runtime lock is acquired, by the runtime's own
+    /// `actor()` guard; routing selection must not depend on lock availability.
     #[must_use]
     pub fn runtime_for(
         &self,
-        grid: GridId,
+        _grid: GridId,
         cell: CellId,
     ) -> Option<&Arc<tokio::sync::Mutex<CellRuntime>>> {
         let owner = self.owner(cell)?;
         let rt = self.runtimes.get(&owner)?;
-        if rt.try_lock().ok()?.grid() != grid {
-            return None;
-        }
         Some(rt)
     }
 
@@ -328,6 +899,11 @@ fn journal_of(rt: &Arc<tokio::sync::Mutex<CellRuntime>>) -> Arc<crate::journal::
 /// placement assigns it to (docs/08-persistence.md §3.2).
 #[async_trait::async_trait]
 impl Router for Cluster {
+    async fn sweep_expired_leases(&self, now_ms: u64) {
+        for runtime in self.runtimes.values() {
+            runtime.sweep_expired_leases(now_ms).await;
+        }
+    }
     async fn apply(&self, record: JournalRecord) -> Result<Arc<AppendHandle>, Reject> {
         let rt = self
             .runtime_for(record.grid, record.cell)
@@ -340,6 +916,23 @@ impl Router for Cluster {
             .ok_or(Reject::JournalClosed)?
             .start_diff(record)
             .await
+    }
+    async fn commit_rekey(&self, record: JournalRecord) -> Result<(), crate::actor::RekeyError> {
+        let rekey = crate::actor::decode_entity_rekey(&record)?;
+        let gate = self.entity_gates.gate(rekey.source_grid, rekey.entity);
+        let _guard = gate.lock_owned().await;
+        let source_owner = self
+            .owner(rekey.source_cell)
+            .ok_or(crate::actor::RekeyError::ActorUnavailable)?;
+        if self.owner(rekey.destination_cell) != Some(source_owner) {
+            return Err(crate::actor::RekeyError::ActorUnavailable);
+        }
+        let runtime = self
+            .runtimes
+            .get(&source_owner)
+            .ok_or(crate::actor::RekeyError::ActorUnavailable)?;
+        let plan = runtime.lock().await.committed_rekey_plan(record)?;
+        plan.execute().await
     }
 
     async fn read(&self, grid: GridId, cell: CellId) -> Result<SnapshotPage, Reject> {
@@ -360,5 +953,123 @@ impl Router for Cluster {
         };
         let rt = rt.lock().await;
         rt.actor(grid, cell).is_some()
+    }
+    async fn committed_entity_cell(
+        &self,
+        grid: GridId,
+        entity: PersistId,
+    ) -> Result<Option<CellId>, Reject> {
+        let runtimes: Vec<_> = self.runtimes.values().cloned().collect();
+        for runtime in runtimes {
+            if let Some(cell) = runtime.committed_entity_cell(grid, entity).await? {
+                return Ok(Some(cell));
+            }
+        }
+        Ok(None)
+    }
+    async fn claim_lease(
+        &self,
+        grid: GridId,
+        cell: CellId,
+        entity: PersistId,
+        holder: NodeId,
+        kind: ClaimKind,
+        now_ms: u64,
+    ) -> Result<crate::lease::ClaimResult, Reject> {
+        let gate = self.entity_gates.gate(grid, entity);
+        let _guard = gate.lock_owned().await;
+        let route_cell = self
+            .committed_entity_cell(grid, entity)
+            .await?
+            .unwrap_or(cell);
+        self.runtime_for(grid, route_cell)
+            .ok_or(Reject::JournalClosed)?
+            .claim_lease(grid, cell, entity, holder, kind, now_ms)
+            .await
+    }
+    async fn heartbeat_lease(
+        &self,
+        grid: GridId,
+        cell: CellId,
+        entity: PersistId,
+        holder: NodeId,
+        lease_id: LeaseId,
+        now_ms: u64,
+    ) -> Result<Option<Lease>, Reject> {
+        let gate = self.entity_gates.gate(grid, entity);
+        let _guard = gate.lock_owned().await;
+        let route_cell = self
+            .committed_entity_cell(grid, entity)
+            .await?
+            .unwrap_or(cell);
+        self.runtime_for(grid, route_cell)
+            .ok_or(Reject::JournalClosed)?
+            .heartbeat_lease(grid, route_cell, entity, holder, lease_id, now_ms)
+            .await
+    }
+    async fn validate_lease(
+        &self,
+        grid: GridId,
+        cell: CellId,
+        entity: PersistId,
+        holder: NodeId,
+        lease_id: LeaseId,
+        now_ms: u64,
+    ) -> Result<Option<Lease>, Reject> {
+        let gate = self.entity_gates.gate(grid, entity);
+        let _guard = gate.lock_owned().await;
+        let route_cell = self
+            .committed_entity_cell(grid, entity)
+            .await?
+            .unwrap_or(cell);
+        self.runtime_for(grid, route_cell)
+            .ok_or(Reject::JournalClosed)?
+            .validate_lease(grid, route_cell, entity, holder, lease_id, now_ms)
+            .await
+    }
+    async fn park_lease(
+        &self,
+        grid: GridId,
+        cell: CellId,
+        entity: PersistId,
+        holder: NodeId,
+        lease_id: LeaseId,
+    ) -> Result<Option<Lease>, Reject> {
+        let gate = self.entity_gates.gate(grid, entity);
+        let _guard = gate.lock_owned().await;
+        let route_cell = self
+            .committed_entity_cell(grid, entity)
+            .await?
+            .unwrap_or(cell);
+        self.runtime_for(grid, route_cell)
+            .ok_or(Reject::JournalClosed)?
+            .park_lease(grid, route_cell, entity, holder, lease_id)
+            .await
+    }
+    async fn apply_fenced(
+        &self,
+        record: JournalRecord,
+        holder: NodeId,
+        lease_id: LeaseId,
+        authority_seq: orrery_protocol::SeqPair,
+        now_ms: u64,
+    ) -> Result<FencedApply, Reject> {
+        let gate = self.entity_gates.gate(record.grid, record.entity);
+        let _guard = gate.lock_owned().await;
+        let route_cell = self
+            .committed_entity_cell(record.grid, record.entity)
+            .await?
+            .unwrap_or(record.cell);
+        let rt = self
+            .runtime_for(record.grid, route_cell)
+            .ok_or(Reject::JournalClosed)?;
+        let handle = {
+            let rt = rt.lock().await;
+            rt.actor(record.grid, route_cell).cloned()
+        };
+        handle
+            .ok_or(Reject::JournalClosed)?
+            .start_fenced_diff(record, holder, lease_id, authority_seq, now_ms)
+            .await
     }
 }

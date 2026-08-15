@@ -12,10 +12,13 @@ use std::time::Duration;
 
 use orrery_persistd::journal::{AdaptiveCommitMode, GroupCommitConfig};
 use orrery_persistd::{
-    payload_crc, CellRuntime, CheckpointError, Cluster, ColdCellReader, ColdFallbackRouter,
-    EntityRecord, JournalConfig, MemFenceStore, Router, RuntimeConfig, SnapshotPage,
+    payload_crc, CellRuntime, CheckpointError, ClaimResult, Cluster, ColdCellReader,
+    ColdFallbackRouter, EntityRecord, JournalConfig, MemFenceStore, Router, RuntimeConfig,
+    SnapshotPage,
 };
-use orrery_protocol::{CellId, Epoch, GridId, JournalRecord, Lsn, PersistId, RecordKind, Tick};
+use orrery_protocol::{
+    CellId, ClaimKind, Epoch, GridId, JournalRecord, Lsn, PersistId, RecordKind, Tick,
+};
 
 fn test_node(n: u8) -> orrery_protocol::NodeId {
     let mut seed = [0u8; 32];
@@ -68,12 +71,14 @@ fn mem_store() -> Arc<dyn orrery_persistd::checkpoint::CheckpointStore> {
 }
 
 /// Build a `nodes`-node cluster, each with its own journal dir under `base`.
-fn build_cluster(base: &std::path::Path, nodes: usize) -> Cluster {
+async fn build_cluster(base: &std::path::Path, nodes: usize) -> Cluster {
     let mut runtimes = HashMap::new();
     for i in 0..nodes {
         let dir = base.join(format!("node-{i}"));
         std::fs::create_dir_all(&dir).unwrap();
-        let rt = CellRuntime::open(&runtime_config(&dir, i as u64), &mem_store()).unwrap();
+        let rt = CellRuntime::open(&runtime_config(&dir, i as u64), &mem_store())
+            .await
+            .unwrap();
         runtimes.insert(i as u64, Arc::new(tokio::sync::Mutex::new(rt)));
     }
     Cluster::new(runtimes, Some(&orrery_persistd::ChainConfig::default()))
@@ -82,7 +87,7 @@ fn build_cluster(base: &std::path::Path, nodes: usize) -> Cluster {
 #[tokio::test]
 async fn cluster_routes_by_placement_and_replicates() {
     let base = tempfile::tempdir().unwrap();
-    let cluster = build_cluster(base.path(), 3);
+    let cluster = build_cluster(base.path(), 3).await;
     assert_eq!(cluster.len(), 3);
 
     // Every node hosts the root shard, so the owner of ROOT is deterministic.
@@ -105,6 +110,93 @@ async fn cluster_routes_by_placement_and_replicates() {
 }
 
 #[tokio::test]
+async fn cluster_valid_claim_waits_for_contended_runtime_then_completes() {
+    // Given: a valid target entity in the sole runtime of a one-node cluster.
+    let base = tempfile::tempdir().unwrap();
+    let dir = base.path().join("node-0");
+    std::fs::create_dir_all(&dir).unwrap();
+    let runtime = Arc::new(tokio::sync::Mutex::new(
+        CellRuntime::open(&runtime_config(&dir, 0), &mem_store())
+            .await
+            .unwrap(),
+    ));
+    let cluster = Arc::new(Cluster::new(
+        HashMap::from([(0u64, Arc::clone(&runtime))]),
+        None,
+    ));
+    let entity = PersistId::new(8);
+    let holder = test_node(8);
+    cluster
+        .apply(mk_record(
+            CellId::ROOT,
+            entity.0,
+            RecordKind::Spawn,
+            b"valid",
+        ))
+        .await
+        .unwrap()
+        .committed()
+        .await
+        .unwrap();
+
+    // When: the runtime is held while a valid claim begins routing.
+    let held_runtime = runtime.lock().await;
+    assert!(
+        cluster.runtime_for(GridId::ROOT, CellId::ROOT).is_some(),
+        "a held target runtime must remain routable instead of appearing JournalClosed"
+    );
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let cluster_for_claim = Arc::clone(&cluster);
+    let mut claim = tokio::spawn(async move {
+        let _ = started_tx.send(());
+        Router::claim_lease(
+            cluster_for_claim.as_ref(),
+            GridId::ROOT,
+            CellId::ROOT,
+            entity,
+            holder,
+            ClaimKind::Weak,
+            0,
+        )
+        .await
+    });
+    started_rx.await.unwrap();
+
+    // Then: contention leaves the operation pending, rather than falsely
+    // reporting a closed journal. Releasing the runtime completes the claim.
+    let early = tokio::time::timeout(Duration::from_millis(100), &mut claim).await;
+    assert!(
+        early.is_err(),
+        "a valid claim must wait for the contended runtime, not return JournalClosed"
+    );
+    drop(held_runtime);
+    let claimed = tokio::time::timeout(Duration::from_secs(5), claim)
+        .await
+        .expect("claim completes after the runtime lock is released")
+        .expect("claim task does not panic")
+        .expect("valid routed claim does not return JournalClosed");
+    assert!(matches!(claimed, ClaimResult::Granted(_)));
+
+    // Cancel/resume probe: retrying after the release remains valid.
+    let retried = Router::claim_lease(
+        cluster.as_ref(),
+        GridId::ROOT,
+        CellId::ROOT,
+        entity,
+        holder,
+        ClaimKind::Weak,
+        1,
+    )
+    .await
+    .expect("retry does not return JournalClosed");
+    assert!(matches!(retried, ClaimResult::Granted(_)));
+    assert!(matches!(
+        cluster.read(GridId::new(1), CellId::ROOT).await,
+        Err(orrery_persistd::Reject::JournalClosed)
+    ));
+}
+
+#[tokio::test]
 async fn cluster_restart_resumes_world() {
     // The kill-9 → restart → world-resumes demo path: write, drop the cluster
     // (simulating process death), reopen from the same journals, and the world
@@ -121,7 +213,9 @@ async fn cluster_restart_resumes_world() {
     {
         let mut runtimes = HashMap::new();
         for (i, dir) in dirs.iter().enumerate() {
-            let rt = CellRuntime::open(&runtime_config(dir, i as u64), &mem_store()).unwrap();
+            let rt = CellRuntime::open(&runtime_config(dir, i as u64), &mem_store())
+                .await
+                .unwrap();
             runtimes.insert(i as u64, Arc::new(tokio::sync::Mutex::new(rt)));
         }
         let cluster = Cluster::new(runtimes, Some(&orrery_persistd::ChainConfig::default()));
@@ -138,7 +232,9 @@ async fn cluster_restart_resumes_world() {
     // Phase 2: restart from the same journals.
     let mut runtimes = HashMap::new();
     for (i, dir) in dirs.iter().enumerate() {
-        let rt = CellRuntime::open(&runtime_config(dir, i as u64), &mem_store()).unwrap();
+        let rt = CellRuntime::open(&runtime_config(dir, i as u64), &mem_store())
+            .await
+            .unwrap();
         runtimes.insert(i as u64, Arc::new(tokio::sync::Mutex::new(rt)));
     }
     let cluster = Cluster::new(runtimes, Some(&orrery_persistd::ChainConfig::default()));
@@ -182,7 +278,7 @@ async fn has_actor_means_live_actor_not_placement_answer() {
     std::fs::create_dir_all(&dir).unwrap();
     let mut cfg = runtime_config(&dir, 0);
     cfg.shards = Vec::new();
-    let rt = CellRuntime::open(&cfg, &mem_store()).unwrap();
+    let rt = CellRuntime::open(&cfg, &mem_store()).await.unwrap();
     let runtimes = HashMap::from([(0u64, Arc::new(tokio::sync::Mutex::new(rt)))]);
     let cluster = Cluster::new(runtimes, None);
 
@@ -217,7 +313,9 @@ async fn has_actor_means_live_actor_not_placement_answer() {
     // the read is served from actor memory, not the cold store.
     let dir2 = base.path().join("node-1");
     std::fs::create_dir_all(&dir2).unwrap();
-    let rt2 = CellRuntime::open(&runtime_config(&dir2, 1), &mem_store()).unwrap();
+    let rt2 = CellRuntime::open(&runtime_config(&dir2, 1), &mem_store())
+        .await
+        .unwrap();
     let runtimes2 = HashMap::from([(1u64, Arc::new(tokio::sync::Mutex::new(rt2)))]);
     let cluster2 = Cluster::new(runtimes2, None);
     cluster2

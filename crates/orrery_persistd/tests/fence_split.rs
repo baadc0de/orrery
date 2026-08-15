@@ -9,9 +9,14 @@ use std::time::Duration;
 use orrery_persistd::checkpoint::{CheckpointStore, MemCheckpointStore};
 use orrery_persistd::fence::{FenceError, FenceOutcome, FenceRow, FenceStatus, MemFenceStore};
 use orrery_persistd::journal::{AdaptiveCommitMode, GroupCommitConfig};
-use orrery_persistd::{payload_crc, CellRuntime, FenceStore, JournalConfig, RuntimeConfig};
+use orrery_persistd::{
+    payload_crc, CellRuntime, ClaimResult, FenceStore, JournalConfig, LeaseStore, MemLeaseStore,
+    Router, RuntimeConfig,
+};
 
-use orrery_protocol::{CellId, Epoch, GridId, JournalRecord, Lsn, PersistId, RecordKind, Tick};
+use orrery_protocol::{
+    CellId, ClaimKind, DenyReason, Epoch, GridId, JournalRecord, Lsn, PersistId, RecordKind, Tick,
+};
 
 fn test_node(n: u8) -> orrery_protocol::NodeId {
     let mut seed = [0u8; 32];
@@ -164,7 +169,9 @@ fn fdb_cluster_file() -> Option<String> {
 #[tokio::test]
 async fn fence_shard_from_absent_fences_and_spawns_actor() {
     let dir = tempfile::tempdir().unwrap();
-    let mut rt = CellRuntime::open(&runtime_config(dir.path(), 7), &mem_store()).unwrap();
+    let mut rt = CellRuntime::open(&runtime_config(dir.path(), 7), &mem_store())
+        .await
+        .unwrap();
 
     let shard = shard_cell(1, 0, 0);
     let epoch = rt
@@ -190,7 +197,9 @@ async fn fence_shard_from_absent_fences_and_spawns_actor() {
 #[tokio::test]
 async fn fence_shard_conflicts_on_stale_expected() {
     let dir = tempfile::tempdir().unwrap();
-    let mut rt = CellRuntime::open(&runtime_config(dir.path(), 7), &mem_store()).unwrap();
+    let mut rt = CellRuntime::open(&runtime_config(dir.path(), 7), &mem_store())
+        .await
+        .unwrap();
 
     let shard = shard_cell(1, 0, 0);
     rt.fence_shard(shard, None, mem_store().as_ref())
@@ -231,11 +240,13 @@ async fn fence_shard_second_node_conflicts() {
         &runtime_config_with_fence(dir_a.path(), 1, Arc::clone(&fence)),
         &mem_store(),
     )
+    .await
     .unwrap();
     let mut rt_b = CellRuntime::open(
         &runtime_config_with_fence(dir_b.path(), 2, Arc::clone(&fence)),
         &mem_store(),
     )
+    .await
     .unwrap();
 
     let shard = shard_cell(2, 0, 0);
@@ -265,6 +276,7 @@ async fn split_partitions_entities_and_retires_parent() {
         &runtime_config_shards(dir.path(), 3, vec![shard]),
         &mem_store(),
     )
+    .await
     .unwrap();
     rt.fence_shard(shard, None, mem_store().as_ref())
         .await
@@ -319,6 +331,140 @@ async fn split_partitions_entities_and_retires_parent() {
 }
 
 #[tokio::test]
+async fn split_routes_a_claim_to_the_committed_lease_actor() {
+    let dir = tempfile::tempdir().unwrap();
+    let shard = shard_cell(1, 0, 0);
+    let leases = Arc::new(MemLeaseStore::new());
+    let mut rt = CellRuntime::open_with_lease_store(
+        &runtime_config_shards(dir.path(), 3, vec![shard]),
+        &mem_store(),
+        leases,
+    )
+    .await
+    .unwrap();
+    rt.fence_shard(shard, None, mem_store().as_ref())
+        .await
+        .unwrap();
+    let parent_row = rt.fence().read(GridId::ROOT, shard).await.unwrap().unwrap();
+    let children = shard.children();
+    let entity = PersistId::new(10_001);
+    let original_holder = test_node(30);
+    let ClaimResult::Granted(original) = rt
+        .actor(GridId::ROOT, children[0])
+        .unwrap()
+        .claim_lease(entity, children[0], original_holder, ClaimKind::Weak, 0)
+        .await
+        .unwrap()
+    else {
+        panic!("initial claim should be granted");
+    };
+
+    rt.split(shard, &parent_row).await.unwrap();
+    let outcome = <CellRuntime as Router>::claim_lease(
+        &rt,
+        GridId::ROOT,
+        children[1],
+        entity,
+        test_node(31),
+        ClaimKind::Weak,
+        1,
+    )
+    .await
+    .unwrap();
+    assert_eq!(outcome, ClaimResult::Denied(DenyReason::NotEligible));
+
+    let current = rt
+        .actor(GridId::ROOT, children[0])
+        .unwrap()
+        .validate_lease(entity, original_holder, original.lease_id, 1)
+        .await
+        .unwrap()
+        .expect("original child retains the only lease row");
+    assert_eq!(current.entity, original.entity);
+    assert_eq!(current.holder, original.holder);
+    assert_eq!(current.seq, original.seq);
+    assert_eq!(current.lease_id, original.lease_id);
+    assert_eq!(current.flags, original.flags);
+    assert!(current.expires_at >= original.expires_at);
+    assert!(
+        rt.actor(GridId::ROOT, children[1])
+            .unwrap()
+            .validate_lease(entity, test_node(31), orrery_protocol::LeaseId(0), 1)
+            .await
+            .unwrap()
+            .is_none(),
+        "sibling actor never minted a duplicate row"
+    );
+
+    rt.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn split_serializes_first_claims_across_sibling_actors() {
+    let dir = tempfile::tempdir().unwrap();
+    let shard = shard_cell(2, 0, 0);
+    let leases = Arc::new(MemLeaseStore::new());
+    let mut rt = CellRuntime::open_with_lease_store(
+        &runtime_config_shards(dir.path(), 3, vec![shard]),
+        &mem_store(),
+        leases.clone(),
+    )
+    .await
+    .unwrap();
+    rt.fence_shard(shard, None, mem_store().as_ref())
+        .await
+        .unwrap();
+    let parent_row = rt.fence().read(GridId::ROOT, shard).await.unwrap().unwrap();
+    let children = shard.children();
+    rt.split(shard, &parent_row).await.unwrap();
+
+    let entity = PersistId::new(10_002);
+    let left = <CellRuntime as Router>::claim_lease(
+        &rt,
+        GridId::ROOT,
+        children[0],
+        entity,
+        test_node(32),
+        ClaimKind::Weak,
+        0,
+    );
+    let right = <CellRuntime as Router>::claim_lease(
+        &rt,
+        GridId::ROOT,
+        children[1],
+        entity,
+        test_node(33),
+        ClaimKind::Weak,
+        0,
+    );
+    let (left, right) = tokio::join!(left, right);
+    let outcomes = [left.unwrap(), right.unwrap()];
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| matches!(outcome, ClaimResult::Granted(_)))
+            .count(),
+        1,
+        "the durable location conditional permits one first claimant"
+    );
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| matches!(outcome, ClaimResult::Denied(DenyReason::NotEligible)))
+            .count(),
+        1
+    );
+    let committed = leases
+        .locate(GridId::ROOT, entity)
+        .await
+        .unwrap()
+        .expect("one durable committed location");
+    assert!(committed == children[0] || committed == children[1]);
+
+    rt.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn split_after_checkpoint_restore_partitions_correctly() {
     // A checkpoint carries the per-entity cell map, so a split after a
     // checkpoint+restore still partitions entities into the right children
@@ -336,6 +482,7 @@ async fn split_after_checkpoint_restore_partitions_correctly() {
             &runtime_config_shards(dir.path(), 3, vec![shard]),
             &mem_store(),
         )
+        .await
         .unwrap();
         rt.fence_shard(shard, None, mem_store().as_ref())
             .await
@@ -355,6 +502,7 @@ async fn split_after_checkpoint_restore_partitions_correctly() {
         &runtime_config_shards(dir.path(), 3, vec![shard]),
         &mem_store(),
     )
+    .await
     .unwrap();
     rt.fence_shard(shard, None, mem_store().as_ref())
         .await
@@ -387,6 +535,7 @@ async fn second_level_split_partitions_correctly() {
         &runtime_config_shards(dir.path(), 3, vec![shard]),
         &mem_store(),
     )
+    .await
     .unwrap();
     rt.fence_shard(shard, None, mem_store().as_ref())
         .await
@@ -427,7 +576,9 @@ async fn second_level_split_partitions_correctly() {
 #[tokio::test]
 async fn split_conflicts_on_stale_parent_row() {
     let dir = tempfile::tempdir().unwrap();
-    let mut rt = CellRuntime::open(&runtime_config(dir.path(), 3), &mem_store()).unwrap();
+    let mut rt = CellRuntime::open(&runtime_config(dir.path(), 3), &mem_store())
+        .await
+        .unwrap();
 
     let shard = shard_cell(0, 0, 0);
     rt.fence_shard(shard, None, mem_store().as_ref())
@@ -689,6 +840,7 @@ async fn fdb_runtime_split_end_to_end() {
         &runtime_config_dyn_fence(dir.path(), 3, vec![shard], Arc::new(store)),
         &mem_store(),
     )
+    .await
     .unwrap();
 
     rt.fence_shard(shard, None, mem_store().as_ref())

@@ -160,7 +160,9 @@ async fn actor_serves_rows_present_only_in_the_checkpoint() {
 
     // Open with an EMPTY journal but the seeded checkpoint: the actor serves
     // the checkpoint's rows immediately (§3.4: checkpoint is the base).
-    let rt = CellRuntime::open(&runtime_config(dir.path()), &store_dyn(&store)).unwrap();
+    let rt = CellRuntime::open(&runtime_config(dir.path()), &store_dyn(&store))
+        .await
+        .unwrap();
     let page = rt.read(GridId::ROOT, CellId::ROOT).await.unwrap();
     assert_eq!(
         page.entities.len(),
@@ -205,21 +207,21 @@ async fn open_scans_the_journal_once_for_many_shards() {
         drop(journal);
     }
 
-    let one_shard = |shards: Vec<CellId>| {
+    let one_shard = |shards: Vec<CellId>| async {
         let mut cfg = runtime_config(dir.path());
         cfg.shards = shards;
         let t0 = std::time::Instant::now();
-        let rt = CellRuntime::open(&cfg, &store()).unwrap();
+        let rt = CellRuntime::open(&cfg, &store()).await.unwrap();
         let opened = t0.elapsed();
         (rt, opened)
     };
 
-    let (rt1, t1) = one_shard(vec![CellId::ROOT]);
+    let (rt1, t1) = one_shard(vec![CellId::ROOT]).await;
     let page = rt1.read(GridId::ROOT, CellId::ROOT).await.unwrap();
     assert_eq!(page.entities.len(), 512, "1-shard open replays all");
     rt1.close().await.unwrap();
 
-    let (rt8, t8) = one_shard(CellId::ROOT.children().to_vec());
+    let (rt8, t8) = one_shard(CellId::ROOT.children().to_vec()).await;
     let mut total = 0usize;
     for child in CellId::ROOT.children() {
         let page = rt8.read(GridId::ROOT, child).await.unwrap();
@@ -240,7 +242,9 @@ async fn checkpoint_then_replay_zero_loss() {
     let store = Arc::new(MemCheckpointStore::new());
 
     // Phase 1: write 50 entities, checkpoint (watermark W).
-    let rt = CellRuntime::open(&runtime_config(dir.path()), &store_dyn(&store)).unwrap();
+    let rt = CellRuntime::open(&runtime_config(dir.path()), &store_dyn(&store))
+        .await
+        .unwrap();
     for i in 0..50u64 {
         let rec = mk_record(CellId::ROOT, i, RecordKind::Spawn, &i.to_le_bytes());
         rt.apply(rec).await.unwrap();
@@ -261,7 +265,9 @@ async fn checkpoint_then_replay_zero_loss() {
     rt.close().await.unwrap();
 
     // Simulate node loss: fresh runtime, restore from checkpoint + journal tail.
-    let rt2 = CellRuntime::open(&runtime_config(dir.path()), &store_dyn(&store)).unwrap();
+    let rt2 = CellRuntime::open(&runtime_config(dir.path()), &store_dyn(&store))
+        .await
+        .unwrap();
     let replayed = rt2.restore(CellId::ROOT, store.as_ref()).await.unwrap();
     assert_eq!(
         replayed, 50,
@@ -282,7 +288,9 @@ async fn checkpoint_marks_watermark() {
     let dir = tempfile::tempdir().unwrap();
     let store = Arc::new(MemCheckpointStore::new());
 
-    let rt = CellRuntime::open(&runtime_config(dir.path()), &store_dyn(&store)).unwrap();
+    let rt = CellRuntime::open(&runtime_config(dir.path()), &store_dyn(&store))
+        .await
+        .unwrap();
     // Track the last acked LSN independently of the checkpoint path: the
     // apply ack carries it (the journal stamps it into the stored record).
     let mut last_lsn = Lsn::new(0, 0);
@@ -307,7 +315,9 @@ async fn despawn_tombstone_survives_checkpoint_restore_and_gc() {
     let dir = tempfile::tempdir().unwrap();
     let store = Arc::new(MemCheckpointStore::new());
 
-    let rt = CellRuntime::open(&runtime_config(dir.path()), &store_dyn(&store)).unwrap();
+    let rt = CellRuntime::open(&runtime_config(dir.path()), &store_dyn(&store))
+        .await
+        .unwrap();
     for i in 0..10u64 {
         let rec = mk_record(CellId::ROOT, i, RecordKind::Spawn, &i.to_le_bytes());
         rt.apply(rec).await.unwrap();
@@ -327,7 +337,9 @@ async fn despawn_tombstone_survives_checkpoint_restore_and_gc() {
     // Kill -9: restore from the checkpoint + journal tail. The despawned ids
     // must stay dead and their markers must be carried by the checkpoint.
     rt.close().await.unwrap();
-    let rt2 = CellRuntime::open(&runtime_config(dir.path()), &store_dyn(&store)).unwrap();
+    let rt2 = CellRuntime::open(&runtime_config(dir.path()), &store_dyn(&store))
+        .await
+        .unwrap();
     rt2.restore(CellId::ROOT, store.as_ref()).await.unwrap();
     let page = rt2.read(GridId::ROOT, CellId::ROOT).await.unwrap();
     assert_eq!(
@@ -361,7 +373,9 @@ async fn restore_with_no_checkpoint_replays_all() {
     let dir = tempfile::tempdir().unwrap();
     let store = Arc::new(MemCheckpointStore::new());
 
-    let rt = CellRuntime::open(&runtime_config(dir.path()), &store_dyn(&store)).unwrap();
+    let rt = CellRuntime::open(&runtime_config(dir.path()), &store_dyn(&store))
+        .await
+        .unwrap();
     for i in 0..20u64 {
         let rec = mk_record(CellId::ROOT, i, RecordKind::Spawn, &i.to_le_bytes());
         rt.apply(rec).await.unwrap();
@@ -369,7 +383,9 @@ async fn restore_with_no_checkpoint_replays_all() {
     rt.close().await.unwrap();
 
     // No checkpoint written: restore must replay the whole journal.
-    let rt2 = CellRuntime::open(&runtime_config(dir.path()), &store_dyn(&store)).unwrap();
+    let rt2 = CellRuntime::open(&runtime_config(dir.path()), &store_dyn(&store))
+        .await
+        .unwrap();
     let replayed = rt2.restore(CellId::ROOT, store.as_ref()).await.unwrap();
     assert_eq!(replayed, 20);
     let page = rt2.read(GridId::ROOT, CellId::ROOT).await.unwrap();
@@ -382,7 +398,9 @@ async fn scheduler_checkpoints_on_cadence_and_quiesce() {
     let dir = tempfile::tempdir().unwrap();
     let store = Arc::new(MemCheckpointStore::new());
     let runtime = Arc::new(tokio::sync::Mutex::new(
-        CellRuntime::open(&runtime_config(dir.path()), &store_dyn(&store)).unwrap(),
+        CellRuntime::open(&runtime_config(dir.path()), &store_dyn(&store))
+            .await
+            .unwrap(),
     ));
 
     // Write an entity so there is something to checkpoint.
@@ -483,6 +501,7 @@ async fn fdb_checkpoint_roundtrip() {
         &runtime_config_in(dir.path(), GridId::new(9001)),
         &store_dyn(&store),
     )
+    .await
     .unwrap();
     for i in 0..10u64 {
         let rec = mk_record_in(
@@ -527,6 +546,7 @@ async fn fdb_checkpoint_then_restore() {
         &runtime_config_in(dir.path(), GridId::new(9002)),
         &store_dyn(&store),
     )
+    .await
     .unwrap();
     for i in 0..30u64 {
         let rec = mk_record_in(
@@ -555,6 +575,7 @@ async fn fdb_checkpoint_then_restore() {
         &runtime_config_in(dir.path(), GridId::new(9002)),
         &store_dyn(&store),
     )
+    .await
     .unwrap();
     let replayed = rt2.restore(CellId::ROOT, store.as_ref()).await.unwrap();
     assert!(replayed >= 10, "replayed {replayed} tail records");
@@ -583,6 +604,7 @@ async fn fdb_cold_cell_area_load() {
         &runtime_config_in(dir.path(), GridId::new(9003)),
         &store_dyn(&store),
     )
+    .await
     .unwrap();
     for i in 0..20u64 {
         let rec = mk_record_in(
@@ -899,6 +921,7 @@ async fn fdb_tombstone_end_to_end_lifecycle() {
         &runtime_config_in(dir.path(), GridId::new(9007)),
         &store_dyn(&store),
     )
+    .await
     .unwrap();
     for i in 0..6u64 {
         let rec = mk_record_in(
@@ -941,6 +964,7 @@ async fn fdb_tombstone_end_to_end_lifecycle() {
         &runtime_config_in(dir.path(), GridId::new(9007)),
         &store_dyn(&store),
     )
+    .await
     .unwrap();
     rt2.restore(CellId::ROOT, store.as_ref()).await.unwrap();
     let page = rt2.read(GridId::new(9007), CellId::ROOT).await.unwrap();

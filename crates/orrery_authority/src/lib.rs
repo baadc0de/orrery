@@ -16,7 +16,8 @@ use bevy_ecs::prelude::*;
 use bevy_ecs::system::SystemParam;
 use bevy_platform::time::Instant;
 use orrery_protocol::{
-    ClaimBasis, ClaimKind, DenyReason, LeaseId, LeaseMsg, NodeId, PersistId, SeqPair, Tick,
+    ClaimBasis, ClaimId, ClaimKind, DenyReason, GridId, LeaseId, LeaseMsg, NodeId, PersistId,
+    SeqPair, Tick,
 };
 
 /// Registrar TTL from D7/D16, in milliseconds.
@@ -44,27 +45,53 @@ pub enum AuthorityPhase {
     /// Another peer (or no peer) is authoritative.
     Remote,
     /// Locally simulated optimistically, but not allowed to persist yet.
-    LocalPending,
+    LocalPending {
+        /// Client-session identifier of the claim awaiting a reply.
+        claim_id: ClaimId,
+    },
     /// Registrar granted a fencing token; persistence uplinks are permitted.
     LocalGranted {
+        /// Registrar-issued fencing token that authorizes local uplinks.
         lease_id: LeaseId,
+        /// Client-monotonic deadline after which local writes must stop.
         expires_at_ms: u64,
     },
     /// The local conservative expiry floor passed; writes are stopped pending a reply.
-    LocalUncertain { lease_id: LeaseId },
+    LocalUncertain {
+        /// The last fencing token held before local authority became uncertain.
+        lease_id: LeaseId,
+    },
 }
 
 /// An authority-state transition visible to game code.
 #[derive(Debug, Clone, Message, PartialEq, Eq)]
 pub enum AuthorityEvent {
     /// Optimistic claim began.
-    ClaimPending { entity: Entity },
+    ClaimPending {
+        /// ECS entity whose optimistic claim began.
+        entity: Entity,
+    },
     /// Registrar granted authority.
-    Granted { entity: Entity, lease_id: LeaseId },
+    Granted {
+        /// ECS entity that received authority.
+        entity: Entity,
+        /// Registrar-issued fencing token for the grant.
+        lease_id: LeaseId,
+    },
     /// Registrar denied the claim and local prediction was rolled back.
-    Denied { entity: Entity, reason: DenyReason },
+    Denied {
+        /// ECS entity whose optimistic claim was rolled back.
+        entity: Entity,
+        /// Registrar reason for refusing the claim.
+        reason: DenyReason,
+    },
     /// A grant expired or was revoked.
-    Lost { entity: Entity, lease_id: LeaseId },
+    Lost {
+        /// ECS entity that lost local authority.
+        entity: Entity,
+        /// Fencing token that is no longer valid.
+        lease_id: LeaseId,
+    },
 }
 
 /// Queued lease control messages for the gateway adapter.
@@ -83,16 +110,21 @@ struct LocalLease {
     expires_at_ms: u64,
 }
 
-/// Client-side lease bookkeeping. Gateway transport adapters set `now_ms` from
-/// registrar-relative time when available; tests and standalone clients may
-/// advance it explicitly.
+/// Client-side lease bookkeeping.
+///
+/// `now_ms` is a client-process monotonic safety clock. Registrar timestamps
+/// are never used as a client clock because the two processes have unrelated
+/// monotonic origins; an acknowledged grant or heartbeat instead establishes a
+/// fresh local deadline from the registrar-issued TTL.
 #[derive(Debug, Resource)]
 pub struct AuthorityState {
     /// This peer's authenticated transport identity.
     pub node: NodeId,
-    /// Registrar-relative monotonic milliseconds.
+    /// Client-process monotonic milliseconds used only for local expiry safety.
     pub now_ms: u64,
     leases: BTreeMap<PersistId, LocalLease>,
+    pending_claims: BTreeMap<PersistId, ClaimId>,
+    next_claim_id: ClaimId,
     last_heartbeat: Instant,
 }
 
@@ -102,16 +134,40 @@ impl Default for AuthorityState {
             node: NodeId::from_bytes(&[0; 32]).expect("zero node id is valid"),
             now_ms: 0,
             leases: BTreeMap::new(),
+            pending_claims: BTreeMap::new(),
+            next_claim_id: ClaimId(1),
             last_heartbeat: Instant::now(),
         }
     }
 }
 
 impl AuthorityState {
-    /// Set the registrar-relative monotonic clock used for local expiry safety.
+    /// Set the local monotonic clock used for expiry safety.
     pub fn set_now_ms(&mut self, now_ms: u64) {
         self.now_ms = now_ms;
     }
+
+    /// Remove the local fencing record for an entity and return its token.
+    pub fn revoke_local_lease(&mut self, entity: PersistId) -> Option<LeaseId> {
+        self.leases.remove(&entity).map(|lease| lease.lease_id)
+    }
+
+    /// Allocate and record a claim correlation identifier for `entity`.
+    pub fn begin_claim(&mut self, entity: PersistId) -> Option<ClaimId> {
+        let claim_id = self.next_claim_id;
+        self.next_claim_id = ClaimId(claim_id.0.checked_add(1)?);
+        self.pending_claims.insert(entity, claim_id);
+        Some(claim_id)
+    }
+}
+
+/// Advance the client-process monotonic safety clock once per update.
+pub fn advance_lease_clock(mut state: ResMut<AuthorityState>) {
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    state.now_ms = START
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_millis() as u64;
 }
 
 /// Ergonomic command interface for systems that initiate claims.
@@ -119,32 +175,53 @@ impl AuthorityState {
 pub struct LeaseClient<'w, 's> {
     commands: Commands<'w, 's>,
     outbox: ResMut<'w, LeaseOutbox>,
+    state: ResMut<'w, AuthorityState>,
+}
+
+/// Complete gameplay request for an optimistic persistent-entity lease claim.
+///
+/// This keeps the ECS entity context and registrar protocol fields together so
+/// callers cannot lose part of a claim while forwarding it through systems.
+#[derive(Debug, Clone, Copy)]
+pub struct LeaseClaim {
+    /// ECS entity to mark as locally pending before registrar confirmation.
+    pub entity: Entity,
+    /// Stable persistent identity whose lease is requested.
+    pub persist: PersistId,
+    /// Nested grid containing the persistent entity.
+    pub grid: GridId,
+    /// Cell containing the persistent entity in `grid`.
+    pub cell: orrery_protocol::CellId,
+    /// Requested weak authority or strong ownership tier.
+    pub kind: ClaimKind,
+    /// Evidence supporting the requested tier.
+    pub basis: ClaimBasis,
+    /// Most recent authority and ownership sequences observed by the claimant.
+    pub observed: SeqPair,
+    /// Universe tick at which the claim is submitted.
+    pub tick: Tick,
 }
 
 impl<'w, 's> LeaseClient<'w, 's> {
     /// Begin an optimistic claim. The entity remains unable to uplink until a
     /// matching [`LeaseMsg::Grant`] is processed.
-    pub fn claim(
-        &mut self,
-        entity: Entity,
-        persist: PersistId,
-        cell: orrery_protocol::CellId,
-        kind: ClaimKind,
-        basis: ClaimBasis,
-        observed: SeqPair,
-        tick: Tick,
-    ) {
+    #[must_use]
+    pub fn claim(&mut self, request: LeaseClaim) -> Option<ClaimId> {
+        let claim_id = self.state.begin_claim(request.persist)?;
         self.commands
-            .entity(entity)
-            .insert(AuthorityPhase::LocalPending);
+            .entity(request.entity)
+            .insert(AuthorityPhase::LocalPending { claim_id });
         self.outbox.0.push(LeaseMsg::Claim {
-            entity: persist,
-            cell,
-            kind,
-            basis,
-            observed,
-            tick,
+            claim_id,
+            entity: request.persist,
+            grid: request.grid,
+            cell: request.cell,
+            kind: request.kind,
+            basis: request.basis,
+            observed: request.observed,
+            tick: request.tick,
         });
+        Some(claim_id)
     }
 }
 
@@ -159,13 +236,23 @@ pub fn process_lease_replies(
     for message in std::mem::take(&mut inbox.0) {
         match message {
             LeaseMsg::Grant {
+                claim_id,
                 entity,
                 lease_id,
                 seq,
                 ttl_ms,
                 ..
             } => {
+                let is_current_claim = state.pending_claims.get(&entity) == Some(&claim_id);
+                let advances_fence = state
+                    .leases
+                    .get(&entity)
+                    .is_none_or(|current| lease_id > current.lease_id);
+                if !is_current_claim || !advances_fence {
+                    continue;
+                }
                 if let Some((entity_ref, _)) = entities.iter().find(|(_, id)| id.0 == entity) {
+                    state.pending_claims.remove(&entity);
                     let expiry = state.now_ms.saturating_add(u64::from(ttl_ms));
                     state.leases.insert(
                         entity,
@@ -192,8 +279,17 @@ pub fn process_lease_replies(
                     });
                 }
             }
-            LeaseMsg::Deny { entity, reason, .. } => {
+            LeaseMsg::Deny {
+                claim_id,
+                entity,
+                reason,
+                ..
+            } => {
+                if claim_id.is_none() || state.pending_claims.get(&entity) != claim_id.as_ref() {
+                    continue;
+                }
                 if let Some((entity_ref, _)) = entities.iter().find(|(_, id)| id.0 == entity) {
+                    state.pending_claims.remove(&entity);
                     state.leases.remove(&entity);
                     commands
                         .entity(entity_ref)
@@ -208,6 +304,13 @@ pub fn process_lease_replies(
             LeaseMsg::Expire {
                 entity, lease_id, ..
             } => {
+                if state
+                    .leases
+                    .get(&entity)
+                    .is_none_or(|lease| lease.lease_id != lease_id)
+                {
+                    continue;
+                }
                 if let Some(lease) = state.leases.remove(&entity) {
                     commands
                         .entity(lease.entity)
@@ -217,6 +320,56 @@ pub fn process_lease_replies(
                         entity: lease.entity,
                         lease_id,
                     });
+                }
+            }
+            LeaseMsg::HeartbeatAck { leases, invalid } => {
+                // An explicit failed heartbeat wins over any row carried for
+                // status. This drops the local fence immediately instead of
+                // waiting for the conservative expiry floor.
+                let invalidated: Vec<_> = state
+                    .leases
+                    .iter()
+                    .filter_map(|(persist, local)| {
+                        invalid
+                            .contains(&local.lease_id)
+                            .then_some((*persist, local.clone()))
+                    })
+                    .collect();
+                for (persist, local) in invalidated {
+                    state.leases.remove(&persist);
+                    commands
+                        .entity(local.entity)
+                        .remove::<LocallyAuthoritative>()
+                        .insert(AuthorityPhase::Remote);
+                    events.write(AuthorityEvent::Lost {
+                        entity: local.entity,
+                        lease_id: local.lease_id,
+                    });
+                }
+                let local_node = state.node;
+                let refreshed_expiry = state.now_ms.saturating_add(LEASE_TTL_MS);
+                for row in leases {
+                    let Some(local) = state.leases.get_mut(&row.entity) else {
+                        continue;
+                    };
+                    if local.lease_id != row.lease_id || row.holder != Some(local_node) {
+                        continue;
+                    }
+                    // `row.expires_at` is registrar-process monotonic time,
+                    // not comparable with this client process. A successful
+                    // renewal response therefore refreshes the local safety
+                    // deadline from the fixed registrar TTL.
+                    local.expires_at_ms = refreshed_expiry;
+                    commands.entity(local.entity).insert((
+                        Authority {
+                            holder: row.holder,
+                            seq: row.seq,
+                        },
+                        AuthorityPhase::LocalGranted {
+                            lease_id: row.lease_id,
+                            expires_at_ms: refreshed_expiry,
+                        },
+                    ));
                 }
             }
             _ => {}
@@ -280,7 +433,10 @@ impl Plugin for OrreryAuthorityPlugin {
             .init_resource::<LeaseInbox>()
             .init_resource::<LeaseOutbox>()
             .add_message::<AuthorityEvent>()
-            .add_systems(Update, (process_lease_replies, maintain_leases).chain());
+            .add_systems(
+                Update,
+                (advance_lease_clock, process_lease_replies, maintain_leases).chain(),
+            );
     }
 }
 
@@ -288,7 +444,337 @@ impl Plugin for OrreryAuthorityPlugin {
 mod tests {
     use super::*;
     use bevy_app::App;
-    use orrery_protocol::CellId;
+    use orrery_protocol::{CellId, ExpireDisposition, ExpireReason, Lease, LeaseFlags};
+
+    fn begin_test_claim(app: &mut App, entity: Entity, persisted: PersistId) -> ClaimId {
+        let claim_id = app
+            .world_mut()
+            .resource_mut::<AuthorityState>()
+            .begin_claim(persisted)
+            .expect("test claim id space is available");
+        app.world_mut()
+            .entity_mut(entity)
+            .insert(AuthorityPhase::LocalPending { claim_id });
+        claim_id
+    }
+
+    #[test]
+    fn current_grant_deny_and_expire_replies_apply_the_documented_transitions() {
+        // Given: two optimistic claims awaiting their registrar replies.
+        let mut app = App::new();
+        app.add_plugins(OrreryAuthorityPlugin);
+        let denied = app
+            .world_mut()
+            .spawn((PersistIdentity(PersistId::new(40)), AuthorityPhase::Remote))
+            .id();
+        let expired = app
+            .world_mut()
+            .spawn((PersistIdentity(PersistId::new(41)), AuthorityPhase::Remote))
+            .id();
+        let denied_claim = begin_test_claim(&mut app, denied, PersistId::new(40));
+        let expired_claim = begin_test_claim(&mut app, expired, PersistId::new(41));
+        app.world_mut().resource_mut::<LeaseInbox>().0.extend([
+            LeaseMsg::Deny {
+                claim_id: Some(denied_claim),
+                entity: PersistId::new(40),
+                reason: DenyReason::NotEligible,
+                retry_after_ms: 0,
+            },
+            LeaseMsg::Grant {
+                claim_id: expired_claim,
+                entity: PersistId::new(41),
+                lease_id: LeaseId(9),
+                seq: SeqPair {
+                    own_seq: 1,
+                    auth_seq: 2,
+                },
+                ttl_ms: 10_000,
+                prev_holder: None,
+            },
+        ]);
+        app.update();
+        assert_eq!(
+            app.world().get::<AuthorityPhase>(expired),
+            Some(&AuthorityPhase::LocalGranted {
+                lease_id: LeaseId(9),
+                expires_at_ms: 10_000,
+            })
+        );
+        assert!(app.world().get::<LocallyAuthoritative>(expired).is_some());
+
+        // When: the registrar expires the currently installed fence.
+        app.world_mut()
+            .resource_mut::<LeaseInbox>()
+            .0
+            .push(LeaseMsg::Expire {
+                entity: PersistId::new(41),
+                lease_id: LeaseId(9),
+                last_holder: None,
+                reason: ExpireReason::Revoked,
+                disposition: ExpireDisposition::Free,
+            });
+        app.update();
+
+        // Then: both legitimate current replies revoke local authority.
+        assert_eq!(
+            app.world().get::<AuthorityPhase>(denied),
+            Some(&AuthorityPhase::Remote)
+        );
+        assert_eq!(
+            app.world().get::<AuthorityPhase>(expired),
+            Some(&AuthorityPhase::Remote)
+        );
+        assert!(app.world().get::<LocallyAuthoritative>(denied).is_none());
+        assert!(app.world().get::<LocallyAuthoritative>(expired).is_none());
+    }
+
+    #[test]
+    fn delayed_control_replies_do_not_replace_or_revoke_a_newer_grant() {
+        // Given: the Bevy scheduler installed a second grant after an earlier grant.
+        let mut app = App::new();
+        app.add_plugins(OrreryAuthorityPlugin);
+        let persisted = PersistId::new(42);
+        let entity = app
+            .world_mut()
+            .spawn((PersistIdentity(persisted), AuthorityPhase::Remote))
+            .id();
+        let claim1 = begin_test_claim(&mut app, entity, persisted);
+        app.world_mut()
+            .resource_mut::<LeaseInbox>()
+            .0
+            .push(LeaseMsg::Grant {
+                claim_id: claim1,
+                entity: persisted,
+                lease_id: LeaseId(1),
+                seq: SeqPair {
+                    own_seq: 0,
+                    auth_seq: 1,
+                },
+                ttl_ms: 10_000,
+                prev_holder: None,
+            });
+        app.update();
+        let claim2 = begin_test_claim(&mut app, entity, persisted);
+        app.world_mut()
+            .resource_mut::<LeaseInbox>()
+            .0
+            .push(LeaseMsg::Grant {
+                claim_id: claim2,
+                entity: persisted,
+                lease_id: LeaseId(2),
+                seq: SeqPair {
+                    own_seq: 0,
+                    auth_seq: 2,
+                },
+                ttl_ms: 10_000,
+                prev_holder: None,
+            });
+        app.update();
+        app.world_mut()
+            .resource_mut::<Messages<AuthorityEvent>>()
+            .clear();
+
+        // When: Grant1, Deny1, and Expire1 arrive after Grant2.
+        app.world_mut()
+            .resource_mut::<LeaseInbox>()
+            .0
+            .push(LeaseMsg::Grant {
+                claim_id: claim1,
+                entity: persisted,
+                lease_id: LeaseId(1),
+                seq: SeqPair {
+                    own_seq: 0,
+                    auth_seq: 1,
+                },
+                ttl_ms: 10_000,
+                prev_holder: None,
+            });
+        app.update();
+        assert!(matches!(
+            app.world().get::<AuthorityPhase>(entity),
+            Some(AuthorityPhase::LocalGranted {
+                lease_id: LeaseId(2),
+                ..
+            })
+        ));
+
+        app.world_mut()
+            .resource_mut::<LeaseInbox>()
+            .0
+            .push(LeaseMsg::Deny {
+                claim_id: Some(claim1),
+                entity: persisted,
+                reason: DenyReason::NotEligible,
+                retry_after_ms: 0,
+            });
+        app.update();
+        assert!(matches!(
+            app.world().get::<AuthorityPhase>(entity),
+            Some(AuthorityPhase::LocalGranted {
+                lease_id: LeaseId(2),
+                ..
+            })
+        ));
+
+        app.world_mut()
+            .resource_mut::<LeaseInbox>()
+            .0
+            .push(LeaseMsg::Expire {
+                entity: persisted,
+                lease_id: LeaseId(1),
+                last_holder: None,
+                reason: ExpireReason::Revoked,
+                disposition: ExpireDisposition::Free,
+            });
+        app.update();
+
+        // Then: Grant2 remains the sole local fence until Expire2 arrives.
+        assert!(matches!(
+            app.world().get::<AuthorityPhase>(entity),
+            Some(AuthorityPhase::LocalGranted {
+                lease_id: LeaseId(2),
+                ..
+            })
+        ));
+        assert_eq!(
+            app.world()
+                .get::<Authority>(entity)
+                .map(|authority| authority.seq),
+            Some(SeqPair {
+                own_seq: 0,
+                auth_seq: 2,
+            })
+        );
+        assert!(app.world().get::<LocallyAuthoritative>(entity).is_some());
+        assert!(app
+            .world_mut()
+            .resource_mut::<Messages<AuthorityEvent>>()
+            .drain()
+            .next()
+            .is_none());
+
+        app.world_mut()
+            .resource_mut::<LeaseInbox>()
+            .0
+            .push(LeaseMsg::Expire {
+                entity: persisted,
+                lease_id: LeaseId(2),
+                last_holder: None,
+                reason: ExpireReason::Revoked,
+                disposition: ExpireDisposition::Free,
+            });
+        app.update();
+        assert_eq!(
+            app.world().get::<AuthorityPhase>(entity),
+            Some(&AuthorityPhase::Remote)
+        );
+        assert!(app.world().get::<LocallyAuthoritative>(entity).is_none());
+        assert_eq!(
+            app.world_mut()
+                .resource_mut::<Messages<AuthorityEvent>>()
+                .drain()
+                .collect::<Vec<_>>(),
+            vec![AuthorityEvent::Lost {
+                entity,
+                lease_id: LeaseId(2),
+            }]
+        );
+    }
+
+    #[test]
+    fn stale_control_reply_permutations_remain_idempotent() {
+        let permutations = [
+            [0, 1, 2],
+            [0, 2, 1],
+            [1, 0, 2],
+            [1, 2, 0],
+            [2, 0, 1],
+            [2, 1, 0],
+        ];
+        for order in permutations {
+            // Given: claim two owns the current fence.
+            let mut app = App::new();
+            app.add_plugins(OrreryAuthorityPlugin);
+            let persisted = PersistId::new(43);
+            let entity = app
+                .world_mut()
+                .spawn((PersistIdentity(persisted), AuthorityPhase::Remote))
+                .id();
+            let stale_claim = begin_test_claim(&mut app, entity, persisted);
+            let current_claim = begin_test_claim(&mut app, entity, persisted);
+            app.world_mut()
+                .resource_mut::<LeaseInbox>()
+                .0
+                .push(LeaseMsg::Grant {
+                    claim_id: current_claim,
+                    entity: persisted,
+                    lease_id: LeaseId(2),
+                    seq: SeqPair {
+                        own_seq: 0,
+                        auth_seq: 2,
+                    },
+                    ttl_ms: 10_000,
+                    prev_holder: None,
+                });
+            app.update();
+            app.world_mut()
+                .resource_mut::<Messages<AuthorityEvent>>()
+                .clear();
+            let stale = [
+                LeaseMsg::Grant {
+                    claim_id: stale_claim,
+                    entity: persisted,
+                    lease_id: LeaseId(1),
+                    seq: SeqPair {
+                        own_seq: 0,
+                        auth_seq: 1,
+                    },
+                    ttl_ms: 10_000,
+                    prev_holder: None,
+                },
+                LeaseMsg::Deny {
+                    claim_id: Some(stale_claim),
+                    entity: persisted,
+                    reason: DenyReason::NotEligible,
+                    retry_after_ms: 0,
+                },
+                LeaseMsg::Expire {
+                    entity: persisted,
+                    lease_id: LeaseId(1),
+                    last_holder: None,
+                    reason: ExpireReason::Revoked,
+                    disposition: ExpireDisposition::Free,
+                },
+            ];
+
+            // When: stale replies are repeated in every ordering within one update.
+            let repeated = order
+                .into_iter()
+                .chain(order)
+                .map(|index| stale[index].clone());
+            app.world_mut()
+                .resource_mut::<LeaseInbox>()
+                .0
+                .extend(repeated);
+            app.update();
+
+            // Then: no ordering or duplicate interrupts the current writer.
+            assert!(matches!(
+                app.world().get::<AuthorityPhase>(entity),
+                Some(AuthorityPhase::LocalGranted {
+                    lease_id: LeaseId(2),
+                    ..
+                })
+            ));
+            assert!(app.world().get::<LocallyAuthoritative>(entity).is_some());
+            assert!(app
+                .world_mut()
+                .resource_mut::<Messages<AuthorityEvent>>()
+                .drain()
+                .next()
+                .is_none());
+        }
+    }
 
     #[test]
     fn grant_enables_and_deny_removes_the_only_uplink_marker() {
@@ -296,15 +782,14 @@ mod tests {
         app.add_plugins(OrreryAuthorityPlugin);
         let e = app
             .world_mut()
-            .spawn((
-                PersistIdentity(PersistId::new(4)),
-                AuthorityPhase::LocalPending,
-            ))
+            .spawn((PersistIdentity(PersistId::new(4)), AuthorityPhase::Remote))
             .id();
+        let first_claim = begin_test_claim(&mut app, e, PersistId::new(4));
         app.world_mut()
             .resource_mut::<LeaseInbox>()
             .0
             .push(LeaseMsg::Grant {
+                claim_id: first_claim,
                 entity: PersistId::new(4),
                 lease_id: LeaseId(2),
                 seq: SeqPair::default(),
@@ -313,10 +798,12 @@ mod tests {
             });
         app.update();
         assert!(app.world().get::<LocallyAuthoritative>(e).is_some());
+        let second_claim = begin_test_claim(&mut app, e, PersistId::new(4));
         app.world_mut()
             .resource_mut::<LeaseInbox>()
             .0
             .push(LeaseMsg::Deny {
+                claim_id: Some(second_claim),
                 entity: PersistId::new(4),
                 reason: DenyReason::NotEligible,
                 retry_after_ms: 0,
@@ -324,5 +811,176 @@ mod tests {
         app.update();
         assert!(app.world().get::<LocallyAuthoritative>(e).is_none());
         let _ = CellId::ROOT;
+    }
+
+    #[test]
+    fn claim_queues_the_complete_request_and_marks_the_entity_pending() {
+        let mut app = App::new();
+        app.add_plugins(OrreryAuthorityPlugin);
+        let entity = app.world_mut().spawn_empty().id();
+        let persist = PersistId::new(7);
+        let grid = GridId::new(8);
+        let cell = CellId::ROOT;
+        let observed = SeqPair {
+            own_seq: 2,
+            auth_seq: 3,
+        };
+        let tick = Tick::new(9);
+        app.add_systems(Update, move |mut client: LeaseClient| {
+            let _ = client.claim(LeaseClaim {
+                entity,
+                persist,
+                grid,
+                cell,
+                kind: ClaimKind::Weak,
+                basis: ClaimBasis::Contact { tick },
+                observed,
+                tick,
+            });
+        });
+
+        app.update();
+
+        assert_eq!(
+            app.world().get::<AuthorityPhase>(entity),
+            Some(&AuthorityPhase::LocalPending {
+                claim_id: ClaimId(1),
+            })
+        );
+        assert_eq!(
+            app.world().resource::<LeaseOutbox>().0,
+            vec![LeaseMsg::Claim {
+                claim_id: ClaimId(1),
+                entity: persist,
+                grid,
+                cell,
+                kind: ClaimKind::Weak,
+                basis: ClaimBasis::Contact { tick },
+                observed,
+                tick,
+            }]
+        );
+    }
+
+    #[test]
+    fn client_revoke_returns_the_granted_fencing_token() {
+        let mut app = App::new();
+        app.add_plugins(OrreryAuthorityPlugin);
+        let persist = PersistId::new(8);
+        let entity = app
+            .world_mut()
+            .spawn((PersistIdentity(persist), AuthorityPhase::Remote))
+            .id();
+        let claim_id = begin_test_claim(&mut app, entity, persist);
+        app.world_mut()
+            .resource_mut::<LeaseInbox>()
+            .0
+            .push(LeaseMsg::Grant {
+                claim_id,
+                entity: persist,
+                lease_id: LeaseId(5),
+                seq: SeqPair::default(),
+                ttl_ms: 10_000,
+                prev_holder: None,
+            });
+
+        app.update();
+
+        assert_eq!(
+            app.world_mut()
+                .resource_mut::<AuthorityState>()
+                .revoke_local_lease(persist),
+            Some(LeaseId(5))
+        );
+    }
+
+    #[test]
+    fn invalid_heartbeat_ack_immediately_removes_the_local_fence() {
+        let mut app = App::new();
+        app.add_plugins(OrreryAuthorityPlugin);
+        let e = app
+            .world_mut()
+            .spawn((PersistIdentity(PersistId::new(5)), AuthorityPhase::Remote))
+            .id();
+        let claim_id = begin_test_claim(&mut app, e, PersistId::new(5));
+        app.world_mut()
+            .resource_mut::<LeaseInbox>()
+            .0
+            .push(LeaseMsg::Grant {
+                claim_id,
+                entity: PersistId::new(5),
+                lease_id: LeaseId(3),
+                seq: SeqPair::default(),
+                ttl_ms: 10_000,
+                prev_holder: None,
+            });
+        app.update();
+        assert!(app.world().get::<LocallyAuthoritative>(e).is_some());
+
+        app.world_mut()
+            .resource_mut::<LeaseInbox>()
+            .0
+            .push(LeaseMsg::HeartbeatAck {
+                leases: Vec::new(),
+                invalid: vec![LeaseId(3)],
+            });
+        app.update();
+        assert!(app.world().get::<LocallyAuthoritative>(e).is_none());
+        assert_eq!(
+            app.world().get::<AuthorityPhase>(e),
+            Some(&AuthorityPhase::Remote)
+        );
+    }
+
+    #[test]
+    fn heartbeat_refreshes_the_local_deadline_not_the_gateway_clock() {
+        let mut app = App::new();
+        app.init_resource::<AuthorityState>()
+            .init_resource::<LeaseInbox>()
+            .add_message::<AuthorityEvent>()
+            .add_systems(Update, process_lease_replies);
+        let e = app
+            .world_mut()
+            .spawn((PersistIdentity(PersistId::new(6)), AuthorityPhase::Remote))
+            .id();
+        let claim_id = begin_test_claim(&mut app, e, PersistId::new(6));
+        app.world_mut()
+            .resource_mut::<LeaseInbox>()
+            .0
+            .push(LeaseMsg::Grant {
+                claim_id,
+                entity: PersistId::new(6),
+                lease_id: LeaseId(4),
+                seq: SeqPair::default(),
+                ttl_ms: 10_000,
+                prev_holder: None,
+            });
+        app.update();
+        app.world_mut()
+            .resource_mut::<AuthorityState>()
+            .set_now_ms(500);
+        app.world_mut()
+            .resource_mut::<LeaseInbox>()
+            .0
+            .push(LeaseMsg::HeartbeatAck {
+                leases: vec![Lease {
+                    entity: PersistId::new(6),
+                    holder: Some(NodeId::from_bytes(&[0; 32]).unwrap()),
+                    seq: SeqPair::default(),
+                    lease_id: LeaseId(4),
+                    // Deliberately unrelated gateway-process monotonic time.
+                    expires_at: 4,
+                    flags: LeaseFlags::default(),
+                }],
+                invalid: Vec::new(),
+            });
+        app.update();
+        assert_eq!(
+            app.world().get::<AuthorityPhase>(e),
+            Some(&AuthorityPhase::LocalGranted {
+                lease_id: LeaseId(4),
+                expires_at_ms: 10_500,
+            })
+        );
     }
 }

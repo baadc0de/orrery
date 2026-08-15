@@ -14,6 +14,8 @@
 //!   cluster drop (the idempotency row and the ledger row are both readable
 //!   after reopening).
 
+mod support;
+
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -92,7 +94,9 @@ async fn connect(config: GatewayConfig, key: &iroh_base::SecretKey) -> Session {
     let runtime = Arc::new(Mutex::new({
         let store: std::sync::Arc<dyn orrery_persistd::checkpoint::CheckpointStore> =
             std::sync::Arc::new(orrery_persistd::checkpoint::MemCheckpointStore::new());
-        CellRuntime::open(&runtime_config(dir.path()), &store).unwrap()
+        CellRuntime::open(&runtime_config(dir.path()), &store)
+            .await
+            .unwrap()
     }));
     let router: Arc<dyn Router> = runtime.clone();
     let server = GatewayServer::spawn(config, router).await.unwrap();
@@ -110,6 +114,19 @@ async fn connect(config: GatewayConfig, key: &iroh_base::SecretKey) -> Session {
     let mut admission = conn.accept_uni().await.unwrap();
     let msg = admission.read_to_end(16).await.unwrap();
     assert_eq!(msg, vec![0u8]);
+    conn.send_datagram(Bytes::from(encode_stream_frame(&GatewayMsg::Hello {
+        token: support::valid_session_token(key.public()),
+        node: key.public(),
+    })))
+    .unwrap();
+    let reply = tokio::time::timeout(Duration::from_secs(5), conn.read_datagram())
+        .await
+        .expect("hello reply")
+        .expect("hello datagram");
+    assert!(matches!(
+        decode_stream_frame(&reply),
+        Some(GatewayReply::HelloAck { .. })
+    ));
     Session {
         server,
         conn,
@@ -150,7 +167,7 @@ async fn unsigned_intent_is_rejected() {
     // check, not the missing-executor path.
     let config = GatewayConfig {
         executor: Some(Arc::new(MemIntentExecutor::new())),
-        ..GatewayConfig::default()
+        ..support::authority_config(key.public(), GridId::ROOT, vec![CellId::ROOT])
     };
     let session = connect(config, &key).await;
 
@@ -186,7 +203,7 @@ async fn issuer_mismatch_is_rejected() {
     let other = secret(2);
     let config = GatewayConfig {
         executor: Some(Arc::new(MemIntentExecutor::new())),
-        ..GatewayConfig::default()
+        ..support::authority_config(key.public(), GridId::ROOT, vec![CellId::ROOT])
     };
     let session = connect(config, &key).await;
 
@@ -209,7 +226,11 @@ async fn issuer_mismatch_is_rejected() {
 async fn intent_without_executor_is_rejected() {
     let key = secret(1);
     // No executor: the honest reply is a rejection, never a fake commit.
-    let session = connect(GatewayConfig::default(), &key).await;
+    let session = connect(
+        support::authority_config(key.public(), GridId::ROOT, vec![CellId::ROOT]),
+        &key,
+    )
+    .await;
 
     let intent = signed_intent(4, &key, 1, b"trade");
     let outcome = submit(&session.conn, intent).await;

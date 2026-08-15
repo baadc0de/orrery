@@ -18,7 +18,7 @@ use bevy_platform::time::Instant;
 use bytes::Bytes;
 
 use aeronet_iroh::iroh;
-use orrery_authority::LeaseOutbox;
+use orrery_authority::{AuthorityState, LeaseOutbox};
 use orrery_net::channels::{tag, Channel};
 use orrery_protocol::{GatewayMsg, GatewayReply, NodeId, PROTOCOL_VERSION};
 
@@ -288,6 +288,21 @@ pub fn flush_lease_control(
                 message,
             }));
     }
+}
+
+/// Mirror the iroh-authenticated local identity into optional authority state.
+///
+/// The authority plugin is independently composable, so P2-only clients need
+/// not create this resource. When it is present, grants and heartbeat rows use
+/// the same `NodeId` that the gateway bound during `Hello`.
+pub fn sync_authority_identity(
+    session: Res<GatewaySession>,
+    authority: Option<ResMut<AuthorityState>>,
+) {
+    let Some(mut authority) = authority else {
+        return;
+    };
+    authority.node = session.node;
 }
 
 /// Return to `Disconnected` when the session entity is despawned by the IO

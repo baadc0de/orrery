@@ -205,6 +205,67 @@ pub fn fence_grid_range_end(grid: GridId) -> Vec<u8> {
     }
 }
 
+/// Durable registrar row `lease/{grid}/{entity}`.
+#[must_use]
+pub fn lease_key(grid: GridId, entity: PersistId) -> [u8; 13] {
+    let mut key = [0; 13];
+    key[0] = b'l';
+    key[1..5].copy_from_slice(&grid.0.to_be_bytes());
+    key[5..].copy_from_slice(&entity.0.to_be_bytes());
+    key
+}
+/// Location index `lease-cell/{grid}/{cell}/{entity}` used for actor restore.
+#[must_use]
+pub fn lease_cell_key(grid: GridId, cell: CellId, entity: PersistId) -> [u8; 21] {
+    let mut key = [0; 21];
+    key[0] = b'm';
+    key[1..5].copy_from_slice(&grid.0.to_be_bytes());
+    key[5..13].copy_from_slice(&cell.to_bits().to_be_bytes());
+    key[13..].copy_from_slice(&entity.0.to_be_bytes());
+    key
+}
+/// Reverse location index `lease-location/{grid}/{entity}` → `cell`.
+///
+/// The cell-first [`lease_cell_key`] makes shard startup scans contiguous;
+/// this entity-first companion lets claim routing find the actor that already
+/// owns a lease after a shard split, without scanning every location row.
+#[must_use]
+pub fn lease_location_key(grid: GridId, entity: PersistId) -> [u8; 13] {
+    let mut key = [0; 13];
+    key[0] = b'o';
+    key[1..5].copy_from_slice(&grid.0.to_be_bytes());
+    key[5..].copy_from_slice(&entity.0.to_be_bytes());
+    key
+}
+/// Start of a shard's location-index subtree.
+#[must_use]
+pub fn lease_cell_range_start(grid: GridId, shard: CellId) -> Vec<u8> {
+    let mut key = Vec::with_capacity(13);
+    key.push(b'm');
+    key.extend_from_slice(&grid.0.to_be_bytes());
+    key.extend_from_slice(&shard.subtree_range().start().to_be_bytes());
+    key
+}
+/// Exclusive end of a shard's location-index subtree.
+#[must_use]
+pub fn lease_cell_range_end(grid: GridId, shard: CellId) -> Vec<u8> {
+    let end = *shard.subtree_range().end();
+    if end < u64::MAX {
+        let mut key = Vec::with_capacity(13);
+        key.push(b'm');
+        key.extend_from_slice(&grid.0.to_be_bytes());
+        key.extend_from_slice(&(end + 1).to_be_bytes());
+        key
+    } else if grid.0 < u32::MAX {
+        let mut key = Vec::with_capacity(5);
+        key.push(b'm');
+        key.extend_from_slice(&(grid.0 + 1).to_be_bytes());
+        key
+    } else {
+        vec![b'n']
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Seed content map family: `seedmap/{content_key}`
 // ---------------------------------------------------------------------------

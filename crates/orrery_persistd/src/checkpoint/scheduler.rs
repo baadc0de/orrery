@@ -441,7 +441,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(MemCheckpointStore::new());
         let runtime = Arc::new(tokio::sync::Mutex::new(
-            CellRuntime::open(&test_runtime_config(dir.path()), &ckpt_store(&store)).unwrap(),
+            CellRuntime::open(&test_runtime_config(dir.path()), &ckpt_store(&store))
+                .await
+                .unwrap(),
         ));
 
         // Write an entity so there is something to checkpoint.
@@ -523,7 +525,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let seed_store = Arc::new(MemCheckpointStore::new());
         let runtime = Arc::new(tokio::sync::Mutex::new(
-            CellRuntime::open(&test_runtime_config(dir.path()), &ckpt_store(&seed_store)).unwrap(),
+            CellRuntime::open(&test_runtime_config(dir.path()), &ckpt_store(&seed_store))
+                .await
+                .unwrap(),
         ));
         let blocking_store = Arc::new(BlockingCheckpointStore::default());
         let scheduler = spawn_checkpoint_scheduler(
@@ -583,7 +587,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(MemCheckpointStore::new());
         let runtime = Arc::new(tokio::sync::Mutex::new(
-            CellRuntime::open(&test_runtime_config(dir.path()), &ckpt_store(&store)).unwrap(),
+            CellRuntime::open(&test_runtime_config(dir.path()), &ckpt_store(&store))
+                .await
+                .unwrap(),
         ));
 
         // Write entities at child-cell positions so they partition cleanly
@@ -682,7 +688,9 @@ mod tests {
         // rt.shards()) loses its timer after reconcile by checking that it
         // is no longer checkpointed.
         let runtime = Arc::new(tokio::sync::Mutex::new(
-            CellRuntime::open(&test_runtime_config(dir.path()), &ckpt_store(&store)).unwrap(),
+            CellRuntime::open(&test_runtime_config(dir.path()), &ckpt_store(&store))
+                .await
+                .unwrap(),
         ));
 
         let interval = Duration::from_millis(50);

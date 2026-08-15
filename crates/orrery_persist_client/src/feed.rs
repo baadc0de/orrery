@@ -19,6 +19,7 @@ use orrery_protocol::{DiffUplink, GridId, RecordKind, Tick};
 use orrery_spatial::plugin::Cell;
 
 pub use orrery_authority::LocallyAuthoritative;
+use orrery_authority::{Authority, AuthorityPhase};
 
 use crate::config::PersistClientConfig;
 use crate::uplink::UplinkScheduler;
@@ -57,7 +58,7 @@ pub fn feed_uplink(
     mut scheduler: ResMut<UplinkScheduler>,
     mut seq: ResMut<UplinkSeq>,
     mut diffs: MessageReader<ComponentDiff>,
-    entities: Query<(Entity, &PersistId, &Cell)>,
+    entities: Query<(Entity, &PersistId, &Cell, &Authority, &AuthorityPhase)>,
     authorities: Query<(), With<LocallyAuthoritative>>,
 ) {
     for diff in diffs.read() {
@@ -65,7 +66,10 @@ pub fn feed_uplink(
         if authorities.get(diff.entity).is_err() {
             continue;
         }
-        let Ok((entity, persist_id, cell)) = entities.get(diff.entity) else {
+        let Ok((entity, persist_id, cell, authority, phase)) = entities.get(diff.entity) else {
+            continue;
+        };
+        let AuthorityPhase::LocalGranted { lease_id, .. } = *phase else {
             continue;
         };
 
@@ -86,8 +90,8 @@ pub fn feed_uplink(
             kind: RecordKind::ComponentDiff,
             payload: diff.payload.clone(),
             seq: tick,
-            lease_id: None,
-            authority_seq: None,
+            lease_id: Some(lease_id),
+            authority_seq: Some(authority.seq),
         });
     }
 }
@@ -114,7 +118,19 @@ mod tests {
         let mut app = app();
         let entity = app
             .world_mut()
-            .spawn((PersistId::new(1), Cell(CellId::ROOT), LocallyAuthoritative))
+            .spawn((
+                PersistId::new(1),
+                Cell(CellId::ROOT),
+                LocallyAuthoritative,
+                Authority {
+                    holder: None,
+                    seq: Default::default(),
+                },
+                AuthorityPhase::LocalGranted {
+                    lease_id: orrery_protocol::LeaseId(1),
+                    expires_at_ms: 10_000,
+                },
+            ))
             .id();
 
         app.world_mut()

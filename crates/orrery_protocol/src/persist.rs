@@ -194,6 +194,35 @@ pub struct JournalRecord {
     pub crc: u32,
 }
 
+/// Current serialization version for [`EntityRekey`].
+pub const ENTITY_REKEY_VERSION: u8 = 1;
+
+/// Server-owned payload for one committed storage-location transition.
+///
+/// This payload is journaled as [`RecordKind::Rekey`] and is intentionally not
+/// part of the client [`crate::DiffUplink`] surface. `source_record` is the
+/// opaque component image from the source actor, allowing later recovery to
+/// reconstruct the destination without consulting mutable client state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EntityRekey {
+    /// Payload schema version.
+    pub version: u8,
+    /// Entity whose durable row moves.
+    pub entity: PersistId,
+    /// Grid containing the current durable row.
+    pub source_grid: GridId,
+    /// Cell containing the current durable row.
+    pub source_cell: CellId,
+    /// Grid receiving the durable row.
+    pub destination_grid: GridId,
+    /// Cell receiving the durable row.
+    pub destination_cell: CellId,
+    /// Exact registrar fence which must still own the source row.
+    pub expected_lease_id: crate::LeaseId,
+    /// Opaque source component image used by deterministic recovery.
+    pub source_record: bytes::Bytes,
+}
+
 /// A single operation inside an [`Intent`] (D11 §2.2).
 ///
 /// The op payload is `Ruleset`-opaque: the game's `Ruleset` classifies ops as
@@ -352,6 +381,29 @@ pub struct Checkpoint {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn entity_rekey_payload_round_trips_with_explicit_version_and_source_record() {
+        // Given: a committed cross-grid move with an exact source image and fence.
+        let cells = CellId::ROOT.children();
+        let rekey = EntityRekey {
+            version: ENTITY_REKEY_VERSION,
+            entity: PersistId::new(77),
+            source_grid: GridId::ROOT,
+            source_cell: cells[0],
+            destination_grid: GridId::new(8),
+            destination_cell: cells[1],
+            expected_lease_id: crate::LeaseId(42),
+            source_record: bytes::Bytes::from_static(b"component-image"),
+        };
+
+        // When: the server-owned payload crosses its postcard boundary.
+        let encoded = postcard::to_allocvec(&rekey).unwrap();
+        let decoded: EntityRekey = postcard::from_bytes(&encoded).unwrap();
+
+        // Then: recovery-critical fields survive without DiffUplink involvement.
+        assert_eq!(decoded, rekey);
+    }
 
     fn node(n: u8) -> NodeId {
         let mut seed = [0u8; 32];

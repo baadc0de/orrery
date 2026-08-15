@@ -11,9 +11,13 @@ use std::sync::Arc;
 
 use tokio::sync::{mpsc, oneshot};
 
-use orrery_protocol::{CellId, Epoch, GridId, JournalRecord, Lsn, PersistId, RecordKind, Tick};
+use orrery_protocol::{
+    CellId, ClaimKind, EntityRekey, Epoch, GridId, JournalRecord, Lease, LeaseId, Lsn, NodeId,
+    PersistId, RecordKind, Tick, ENTITY_REKEY_VERSION,
+};
 
 use crate::journal::{AppendHandle, Journal};
+use crate::lease::{registrar_now_ms, ClaimResult, LeasePut, LeaseRegistrar, LeaseStore};
 
 /// How long a despawned entity's `world/` tombstone persists before the
 /// checkpoint GC pass clears it (D11 §6). Must comfortably exceed the 20 s
@@ -60,11 +64,97 @@ pub enum Accept {
     Accepted(Lsn),
 }
 
+/// Result of atomically checking a lease fence and admitting a diff.
+#[derive(Debug, Clone)]
+pub enum FencedApply {
+    /// The actor checked the exact live lease row and accepted the diff.
+    Accepted(Arc<AppendHandle>),
+    /// The actor rejected the presented pair and returns its current row for
+    /// the gateway's lease-specific NACK.
+    Rejected(Option<Lease>),
+}
+
 /// A rejection of a diff.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Reject {
     /// The journal refused the append.
     JournalClosed,
+    /// The durable lease row could not be committed.
+    LeaseStore,
+}
+
+/// Why a server committed-rekey record was rejected before actor transfer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RekeyError {
+    /// The journal envelope is not a rekey record.
+    WrongRecordKind,
+    /// Payload bytes or their integrity checksum are invalid.
+    MalformedPayload,
+    /// Payload schema version is unsupported.
+    VersionMismatch,
+    /// Envelope identity or source location disagrees with the payload.
+    SourceMismatch,
+    /// Source and destination identify the same durable row.
+    SelfMove,
+    /// A zero fence cannot authorize migration.
+    MissingExpectedFence,
+    /// Recovery cannot proceed without the source component image.
+    MissingSourceRecord,
+    /// The source actor does not contain the committed entity location.
+    SourceEntityMissing,
+    /// The durable source image does not match the actor-owned component bag.
+    SourceRecordMismatch,
+    /// The actor-owned registrar row does not match the expected fencing token.
+    FenceMismatch,
+    /// Source or destination actor routing failed.
+    ActorUnavailable,
+    /// Durable journal append or flush failed.
+    Journal,
+    /// Durable lease migration failed.
+    LeaseStore,
+    /// Durable lease migration rejected the expected source or fence.
+    LeaseMigrationRejected,
+    /// Destination already contains a different copy of the entity.
+    DestinationConflict,
+}
+
+impl core::fmt::Display for RekeyError {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(formatter, "{self:?}")
+    }
+}
+
+impl core::error::Error for RekeyError {}
+
+/// Decode and validate a server-owned committed-rekey journal envelope.
+pub(crate) fn decode_entity_rekey(record: &JournalRecord) -> Result<EntityRekey, RekeyError> {
+    if record.kind != RecordKind::Rekey {
+        return Err(RekeyError::WrongRecordKind);
+    }
+    if crate::payload_crc(&record.payload) != record.crc {
+        return Err(RekeyError::MalformedPayload);
+    }
+    let rekey: EntityRekey =
+        postcard::from_bytes(&record.payload).map_err(|_| RekeyError::MalformedPayload)?;
+    if rekey.version != ENTITY_REKEY_VERSION {
+        return Err(RekeyError::VersionMismatch);
+    }
+    if rekey.entity != record.entity
+        || rekey.source_grid != record.grid
+        || rekey.source_cell != record.cell
+    {
+        return Err(RekeyError::SourceMismatch);
+    }
+    if (rekey.source_grid, rekey.source_cell) == (rekey.destination_grid, rekey.destination_cell) {
+        return Err(RekeyError::SelfMove);
+    }
+    if rekey.expected_lease_id == LeaseId(0) {
+        return Err(RekeyError::MissingExpectedFence);
+    }
+    if rekey.source_record.is_empty() {
+        return Err(RekeyError::MissingSourceRecord);
+    }
+    Ok(rekey)
 }
 
 /// A snapshot page returned to a reader (§3.1 `ReadSnapshot`).
@@ -118,9 +208,18 @@ pub struct SplitSnapshot {
     pub ckpt_watermark: Lsn,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct RekeyTransfer {
+    entity: PersistId,
+    source_cell: CellId,
+    destination_cell: CellId,
+    record: EntityRecord,
+    lease: Lease,
+}
+
 /// A message to a cell actor's mailbox (§3.1).
 #[derive(Debug)]
-pub enum CellMsg {
+pub(crate) enum CellMsg {
     /// Apply a diff and return the durable LSN.
     ///
     /// The actor stamps its ownership epoch into the record (it is the epoch
@@ -136,12 +235,37 @@ pub enum CellMsg {
         /// Reply channel for the result.
         reply: oneshot::Sender<Result<Arc<AppendHandle>, Reject>>,
     },
+    /// Check a fencing pair and enqueue a diff in the same mailbox turn.
+    ///
+    /// This closes the validate-then-append race: a competing claim cannot
+    /// change the row between the comparison and journal admission.
+    ApplyFencedDiff {
+        /// The record to apply after successful validation.
+        record: JournalRecord,
+        /// Authenticated holder presenting the fence.
+        holder: NodeId,
+        /// Presented registrar token.
+        lease_id: LeaseId,
+        /// Presented sequence pair.
+        authority_seq: orrery_protocol::SeqPair,
+        /// Current registrar-monotonic time.
+        now_ms: u64,
+        /// Reply channel for the admitted handle or current rejected row.
+        reply: oneshot::Sender<Result<FencedApply, Reject>>,
+    },
     /// Read a snapshot of the given cells.
     ReadSnapshot {
         /// The cells to read.
         cells: Vec<orrery_protocol::CellId>,
         /// Reply channel for the page.
         reply: oneshot::Sender<SnapshotPage>,
+    },
+    /// Resolve an entity's committed cell from the actor-owned hot-state index.
+    LocateEntity {
+        /// Persistent entity to locate.
+        entity: PersistId,
+        /// Reply channel for the committed cell, if the entity exists.
+        reply: oneshot::Sender<Option<CellId>>,
     },
     /// Capture the actor's full state for a checkpoint (§8).
     CheckpointSnapshot {
@@ -195,6 +319,70 @@ pub enum CellMsg {
         /// Reply channel.
         reply: oneshot::Sender<()>,
     },
+    /// Serialized registrar claim for one entity.
+    ClaimLease {
+        entity: PersistId,
+        cell: CellId,
+        holder: NodeId,
+        kind: ClaimKind,
+        now_ms: u64,
+        reply: oneshot::Sender<Result<ClaimResult, Reject>>,
+    },
+    /// Renew one current session lease.
+    HeartbeatLease {
+        entity: PersistId,
+        holder: NodeId,
+        lease_id: LeaseId,
+        now_ms: u64,
+        reply: oneshot::Sender<Result<Option<Lease>, Reject>>,
+    },
+    /// Return the current row while checking its fencing token.
+    ValidateLease {
+        entity: PersistId,
+        holder: NodeId,
+        lease_id: LeaseId,
+        now_ms: u64,
+        reply: oneshot::Sender<Result<Option<Lease>, Reject>>,
+    },
+    /// Park a known lease on disconnect or expiry.
+    ParkLease {
+        entity: PersistId,
+        holder: NodeId,
+        lease_id: LeaseId,
+        reply: oneshot::Sender<Result<Option<Lease>, Reject>>,
+    },
+    /// Park all silent holders in this actor.
+    SweepLeases {
+        now_ms: u64,
+        reply: oneshot::Sender<Result<Vec<Lease>, Reject>>,
+    },
+    /// Validate and reserve a source entity, then append its committed rekey.
+    PrepareRekey {
+        rekey: EntityRekey,
+        record: JournalRecord,
+        reply: oneshot::Sender<Result<(RekeyTransfer, Arc<AppendHandle>), RekeyError>>,
+    },
+    /// Release a failed source reservation without changing actor state.
+    AbortRekey {
+        entity: PersistId,
+        lease_id: LeaseId,
+    },
+    /// Install a durably migrated entity and its unchanged fencing row.
+    InstallRekey {
+        transfer: RekeyTransfer,
+        reply: oneshot::Sender<Result<(), RekeyError>>,
+    },
+    /// Retire the source copy after destination installation completes.
+    RetireRekey {
+        entity: PersistId,
+        lease_id: LeaseId,
+        reply: oneshot::Sender<Result<(), RekeyError>>,
+    },
+    /// Finish a rekey whose source and destination share one actor mailbox.
+    CompleteLocalRekey {
+        transfer: RekeyTransfer,
+        reply: oneshot::Sender<Result<(), RekeyError>>,
+    },
     /// Shut the actor down after draining the mailbox.
     Shutdown,
 }
@@ -216,12 +404,18 @@ pub struct CellActorState {
     pub tombstones: HashMap<PersistId, Tombstone>,
     /// The journal LSN covered by the last checkpoint.
     pub ckpt_watermark: Lsn,
+    /// Actor-owned lease registrar; no gateway path mutates it directly.
+    pub leases: LeaseRegistrar,
+    /// Durable entity-location index mirrored by the lease store.
+    pub lease_cells: HashMap<PersistId, CellId>,
+    pending_rekeys: HashMap<PersistId, LeaseId>,
 }
 
 /// The actor task's environment: its state plus the shared journal.
 struct ActorEnv {
     state: CellActorState,
     journal: Arc<Journal>,
+    lease_store: Arc<dyn LeaseStore>,
 }
 
 /// Run the actor's mailbox loop until [`CellMsg::Shutdown`].
@@ -229,10 +423,41 @@ async fn actor_loop(env: &mut ActorEnv, mut rx: mpsc::Receiver<CellMsg>) {
     while let Some(msg) = rx.recv().await {
         match msg {
             CellMsg::ApplyDiff { record, reply } => {
-                apply_diff(env, record, reply);
+                if env.state.pending_rekeys.contains_key(&record.entity) {
+                    let _ = reply.send(Err(Reject::JournalClosed));
+                } else {
+                    apply_diff(env, record, reply);
+                }
+            }
+            CellMsg::ApplyFencedDiff {
+                record,
+                holder,
+                lease_id,
+                authority_seq,
+                now_ms,
+                reply,
+            } => {
+                let current = env.state.leases.current(record.entity);
+                let admitted = !env.state.pending_rekeys.contains_key(&record.entity)
+                    && env.state.by_cell.get(&record.entity) == Some(&record.cell)
+                    && current.as_ref().is_some_and(|row| {
+                        row.holder == Some(holder)
+                            && row.lease_id == lease_id
+                            && row.seq == authority_seq
+                            && row.expires_at > now_ms
+                    });
+                let result = if admitted {
+                    start_diff(env, record).map(FencedApply::Accepted)
+                } else {
+                    Ok(FencedApply::Rejected(current))
+                };
+                let _ = reply.send(result);
             }
             CellMsg::ReadSnapshot { cells, reply } => {
                 let _ = reply.send(read_snapshot(env, &cells));
+            }
+            CellMsg::LocateEntity { entity, reply } => {
+                let _ = reply.send(env.state.by_cell.get(&entity).copied());
             }
             CellMsg::CheckpointSnapshot { reply } => {
                 let _ = reply.send(checkpoint_snapshot(env));
@@ -267,9 +492,323 @@ async fn actor_loop(env: &mut ActorEnv, mut rx: mpsc::Receiver<CellMsg>) {
                     .retain(|_, t| t.gc_deadline_ms > now_ms);
                 let _ = reply.send(());
             }
+            CellMsg::ClaimLease {
+                entity,
+                cell,
+                holder,
+                kind,
+                now_ms,
+                reply,
+            } => {
+                if env.state.pending_rekeys.contains_key(&entity) {
+                    let _ = reply.send(Ok(ClaimResult::Denied(
+                        orrery_protocol::DenyReason::NotEligible,
+                    )));
+                } else {
+                    let _ = reply.send(claim_lease(env, entity, cell, holder, kind, now_ms).await);
+                }
+            }
+            CellMsg::HeartbeatLease {
+                entity,
+                holder,
+                lease_id,
+                now_ms,
+                reply,
+            } => {
+                let _ = reply.send(heartbeat_lease(env, entity, holder, lease_id, now_ms));
+            }
+            CellMsg::ValidateLease {
+                entity,
+                holder,
+                lease_id,
+                now_ms,
+                reply,
+            } => {
+                let row = env.state.leases.current(entity);
+                let _ = (holder, lease_id, now_ms);
+                // Return the row on both success and failure. The gateway
+                // compares it with the presented fencing pair and includes it
+                // in a lease-specific NACK when it does not match.
+                let _ = reply.send(Ok(row));
+            }
+            CellMsg::ParkLease {
+                entity,
+                holder,
+                lease_id,
+                reply,
+            } => {
+                if env.state.pending_rekeys.contains_key(&entity) {
+                    let _ = reply.send(Ok(env.state.leases.current(entity)));
+                } else {
+                    let _ = reply.send(park_lease(env, entity, holder, lease_id).await);
+                }
+            }
+            CellMsg::SweepLeases { now_ms, reply } => {
+                if env.state.pending_rekeys.is_empty() {
+                    let _ = reply.send(sweep_leases(env, now_ms).await);
+                } else {
+                    let _ = reply.send(Ok(Vec::new()));
+                }
+            }
+            CellMsg::PrepareRekey {
+                rekey,
+                record,
+                reply,
+            } => {
+                let _ = reply.send(prepare_rekey(env, &rekey, record));
+            }
+            CellMsg::AbortRekey { entity, lease_id } => {
+                if env.state.pending_rekeys.get(&entity) == Some(&lease_id) {
+                    env.state.pending_rekeys.remove(&entity);
+                }
+            }
+            CellMsg::InstallRekey { transfer, reply } => {
+                let _ = reply.send(install_rekey(env, transfer));
+            }
+            CellMsg::RetireRekey {
+                entity,
+                lease_id,
+                reply,
+            } => {
+                let _ = reply.send(retire_rekey(env, entity, lease_id));
+            }
+            CellMsg::CompleteLocalRekey { transfer, reply } => {
+                let _ = reply.send(complete_local_rekey(env, transfer));
+            }
             CellMsg::Shutdown => break,
         }
     }
+}
+
+fn prepare_rekey(
+    env: &mut ActorEnv,
+    rekey: &EntityRekey,
+    mut record: JournalRecord,
+) -> Result<(RekeyTransfer, Arc<AppendHandle>), RekeyError> {
+    if env.state.grid != rekey.source_grid
+        || env.state.by_cell.get(&rekey.entity) != Some(&rekey.source_cell)
+    {
+        return Err(RekeyError::SourceEntityMissing);
+    }
+    let entity_record = env
+        .state
+        .entities
+        .get(&rekey.entity)
+        .cloned()
+        .ok_or(RekeyError::SourceEntityMissing)?;
+    if entity_record.components != rekey.source_record {
+        return Err(RekeyError::SourceRecordMismatch);
+    }
+    let lease = env
+        .state
+        .leases
+        .current(rekey.entity)
+        .filter(|row| row.lease_id == rekey.expected_lease_id)
+        .ok_or(RekeyError::FenceMismatch)?;
+    if env
+        .state
+        .pending_rekeys
+        .insert(rekey.entity, rekey.expected_lease_id)
+        .is_some()
+    {
+        return Err(RekeyError::FenceMismatch);
+    }
+    record.epoch = env.state.epoch;
+    let handle = match env.journal.append(record) {
+        Ok(handle) => handle,
+        Err(_) => {
+            env.state.pending_rekeys.remove(&rekey.entity);
+            return Err(RekeyError::Journal);
+        }
+    };
+    env.state.ckpt_watermark = env.state.ckpt_watermark.max(handle.lsn());
+    Ok((
+        RekeyTransfer {
+            entity: rekey.entity,
+            source_cell: rekey.source_cell,
+            destination_cell: rekey.destination_cell,
+            record: entity_record,
+            lease,
+        },
+        handle,
+    ))
+}
+
+fn install_rekey(env: &mut ActorEnv, transfer: RekeyTransfer) -> Result<(), RekeyError> {
+    if let Some(existing) = env.state.entities.get(&transfer.entity) {
+        let idempotent = existing == &transfer.record
+            && env.state.by_cell.get(&transfer.entity) == Some(&transfer.destination_cell)
+            && env
+                .state
+                .leases
+                .current(transfer.entity)
+                .is_some_and(|row| row == transfer.lease);
+        return if idempotent {
+            Ok(())
+        } else {
+            Err(RekeyError::DestinationConflict)
+        };
+    }
+    env.state.entities.insert(transfer.entity, transfer.record);
+    env.state
+        .by_cell
+        .insert(transfer.entity, transfer.destination_cell);
+    env.state.tombstones.remove(&transfer.entity);
+    env.state.leases.restore(transfer.lease);
+    env.state
+        .lease_cells
+        .insert(transfer.entity, transfer.destination_cell);
+    Ok(())
+}
+
+fn retire_rekey(
+    env: &mut ActorEnv,
+    entity: PersistId,
+    lease_id: LeaseId,
+) -> Result<(), RekeyError> {
+    if env.state.pending_rekeys.get(&entity) != Some(&lease_id) {
+        return Err(RekeyError::FenceMismatch);
+    }
+    env.state.pending_rekeys.remove(&entity);
+    env.state.entities.remove(&entity);
+    env.state.by_cell.remove(&entity);
+    env.state.tombstones.remove(&entity);
+    env.state.leases.remove(entity);
+    env.state.lease_cells.remove(&entity);
+    Ok(())
+}
+
+fn complete_local_rekey(env: &mut ActorEnv, transfer: RekeyTransfer) -> Result<(), RekeyError> {
+    if env.state.pending_rekeys.get(&transfer.entity) != Some(&transfer.lease.lease_id)
+        || env.state.by_cell.get(&transfer.entity) != Some(&transfer.source_cell)
+        || env.state.entities.get(&transfer.entity) != Some(&transfer.record)
+    {
+        return Err(RekeyError::DestinationConflict);
+    }
+    env.state.pending_rekeys.remove(&transfer.entity);
+    env.state
+        .by_cell
+        .insert(transfer.entity, transfer.destination_cell);
+    env.state
+        .lease_cells
+        .insert(transfer.entity, transfer.destination_cell);
+    env.state.leases.restore(transfer.lease);
+    Ok(())
+}
+
+async fn claim_lease(
+    env: &mut ActorEnv,
+    entity: PersistId,
+    cell: CellId,
+    holder: NodeId,
+    kind: ClaimKind,
+    now_ms: u64,
+) -> Result<ClaimResult, Reject> {
+    if let Some(committed) = env.state.lease_cells.get(&entity) {
+        if *committed != cell {
+            return Ok(ClaimResult::Denied(
+                orrery_protocol::DenyReason::NotEligible,
+            ));
+        }
+    }
+    let mut next = env.state.leases.clone();
+    let result = next.claim(entity, holder, kind, now_ms);
+    if let ClaimResult::Granted(row) = &result {
+        match env
+            .lease_store
+            .put(env.state.grid, cell, row)
+            .await
+            .map_err(|_| Reject::LeaseStore)?
+        {
+            LeasePut::Stored => {}
+            LeasePut::LocationConflict(_) => {
+                return Ok(ClaimResult::Denied(
+                    orrery_protocol::DenyReason::NotEligible,
+                ));
+            }
+        }
+        env.state.lease_cells.insert(entity, cell);
+    }
+    env.state.leases = next;
+    Ok(result)
+}
+
+fn heartbeat_lease(
+    env: &mut ActorEnv,
+    entity: PersistId,
+    holder: NodeId,
+    lease_id: LeaseId,
+    now_ms: u64,
+) -> Result<Option<Lease>, Reject> {
+    let mut next = env.state.leases.clone();
+    next.heartbeat(entity, holder, lease_id, now_ms);
+    let row = next.current(entity);
+    env.state.leases = next;
+    Ok(row)
+}
+
+fn with_fresh_recovery_ttl(mut row: Lease, now_ms: u64) -> Lease {
+    row.expires_at = now_ms.saturating_add(crate::lease::LEASE_TTL_MS);
+    row
+}
+
+async fn park_lease(
+    env: &mut ActorEnv,
+    entity: PersistId,
+    holder: NodeId,
+    lease_id: LeaseId,
+) -> Result<Option<Lease>, Reject> {
+    let Some(current) = env.state.leases.current(entity) else {
+        return Ok(None);
+    };
+    if current.holder != Some(holder) || current.lease_id != lease_id {
+        return Ok(Some(current));
+    }
+    let mut next = env.state.leases.clone();
+    let row = next
+        .disconnect(holder)
+        .into_iter()
+        .find(|row| row.entity == entity)
+        .expect("checked holder");
+    let cell = *env
+        .state
+        .lease_cells
+        .get(&entity)
+        .unwrap_or(&env.state.shard);
+    if !matches!(
+        env.lease_store
+            .put(env.state.grid, cell, &row)
+            .await
+            .map_err(|_| Reject::LeaseStore)?,
+        LeasePut::Stored
+    ) {
+        return Err(Reject::LeaseStore);
+    }
+    env.state.leases = next;
+    Ok(Some(row))
+}
+
+async fn sweep_leases(env: &mut ActorEnv, now_ms: u64) -> Result<Vec<Lease>, Reject> {
+    let mut next = env.state.leases.clone();
+    let rows = next.sweep_expired(now_ms);
+    for row in &rows {
+        let cell = *env
+            .state
+            .lease_cells
+            .get(&row.entity)
+            .unwrap_or(&env.state.shard);
+        if !matches!(
+            env.lease_store
+                .put(env.state.grid, cell, row)
+                .await
+                .map_err(|_| Reject::LeaseStore)?,
+            LeasePut::Stored
+        ) {
+            return Err(Reject::LeaseStore);
+        }
+    }
+    env.state.leases = next;
+    Ok(rows)
 }
 
 /// The current wall-clock time as unix milliseconds.
@@ -290,11 +829,7 @@ fn now_ms() -> u64 {
 /// gateway route task through the reply oneshot. That task awaits group fsync
 /// before sending the ack, while many appends from one actor coexist in the
 /// commit queue and share fsyncs (§4 adaptive group commit, D16).
-fn apply_diff(
-    env: &mut ActorEnv,
-    mut record: JournalRecord,
-    reply: oneshot::Sender<Result<Arc<AppendHandle>, Reject>>,
-) {
+fn start_diff(env: &mut ActorEnv, mut record: JournalRecord) -> Result<Arc<AppendHandle>, Reject> {
     // The actor is the epoch authority: the record is durably stamped with
     // the shard-ownership epoch here (§3.4), overwriting the gateway's
     // placeholder `Epoch::new(0)` (D11 §2.1: the server assigns epoch/lsn).
@@ -302,10 +837,7 @@ fn apply_diff(
     record.epoch = env.state.epoch;
     let handle = match env.journal.append(record.clone()) {
         Ok(handle) => handle,
-        Err(_) => {
-            let _ = reply.send(Err(Reject::JournalClosed));
-            return;
-        }
+        Err(_) => return Err(Reject::JournalClosed),
     };
     // `append` stamped the assigned LSN into the stored bytes but not into
     // `record` (it took a clone); stamp it from the handle so the fold below
@@ -319,7 +851,15 @@ fn apply_diff(
     // (entity, tick), so replay of the same record is a no-op.
     fold(env, &record, now_ms());
 
-    let _ = reply.send(Ok(handle));
+    Ok(handle)
+}
+
+fn apply_diff(
+    env: &mut ActorEnv,
+    record: JournalRecord,
+    reply: oneshot::Sender<Result<Arc<AppendHandle>, Reject>>,
+) {
+    let _ = reply.send(start_diff(env, record));
 }
 
 /// Fold a journal record into in-memory state (no durability work).
@@ -348,9 +888,35 @@ fn fold(env: &mut ActorEnv, record: &JournalRecord, now_ms: u64) {
                 },
             );
         }
-        // Terrain, Rekey, CheckpointMark are recognized but not folded into the
-        // entity map in this slice.
-        RecordKind::TerrainDelta | RecordKind::Rekey | RecordKind::CheckpointMark => {}
+        RecordKind::Rekey => {
+            if let Ok(rekey) = decode_entity_rekey(record) {
+                if env.state.grid == rekey.source_grid
+                    && env.state.by_cell.get(&rekey.entity) == Some(&rekey.source_cell)
+                {
+                    env.state.entities.remove(&rekey.entity);
+                    env.state.by_cell.remove(&rekey.entity);
+                    env.state.tombstones.remove(&rekey.entity);
+                    env.state.leases.remove(rekey.entity);
+                    env.state.lease_cells.remove(&rekey.entity);
+                }
+                if env.state.grid == rekey.destination_grid
+                    && env.state.shard.is_prefix_of(rekey.destination_cell)
+                {
+                    env.state.entities.insert(
+                        rekey.entity,
+                        EntityRecord {
+                            components: rekey.source_record,
+                            dirty: true,
+                        },
+                    );
+                    env.state
+                        .by_cell
+                        .insert(rekey.entity, rekey.destination_cell);
+                    env.state.tombstones.remove(&rekey.entity);
+                }
+            }
+        }
+        RecordKind::TerrainDelta | RecordKind::CheckpointMark => {}
     }
     env.state.ckpt_watermark = env.state.ckpt_watermark.max(record.lsn);
 }
@@ -493,12 +1059,204 @@ impl ActorJoinSet {
 }
 
 impl CellActorHandle {
+    pub(crate) fn same_actor(&self, other: &Self) -> bool {
+        self.tx.same_channel(&other.tx)
+    }
+    /// Resolve an entity's committed cell from this actor's hot-state index.
+    pub async fn committed_entity_cell(&self, entity: PersistId) -> Result<Option<CellId>, Reject> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(CellMsg::LocateEntity { entity, reply })
+            .await
+            .map_err(|_| Reject::JournalClosed)?;
+        rx.await.map_err(|_| Reject::JournalClosed)
+    }
+
+    pub(crate) async fn prepare_rekey(
+        &self,
+        rekey: EntityRekey,
+        record: JournalRecord,
+    ) -> Result<(RekeyTransfer, Arc<AppendHandle>), RekeyError> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(CellMsg::PrepareRekey {
+                rekey,
+                record,
+                reply,
+            })
+            .await
+            .map_err(|_| RekeyError::ActorUnavailable)?;
+        rx.await.map_err(|_| RekeyError::ActorUnavailable)?
+    }
+
+    pub(crate) async fn abort_rekey(&self, entity: PersistId, lease_id: LeaseId) {
+        let _ = self.tx.send(CellMsg::AbortRekey { entity, lease_id }).await;
+    }
+
+    pub(crate) async fn install_rekey(&self, transfer: RekeyTransfer) -> Result<(), RekeyError> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(CellMsg::InstallRekey { transfer, reply })
+            .await
+            .map_err(|_| RekeyError::ActorUnavailable)?;
+        rx.await.map_err(|_| RekeyError::ActorUnavailable)?
+    }
+
+    pub(crate) async fn retire_rekey(
+        &self,
+        entity: PersistId,
+        lease_id: LeaseId,
+    ) -> Result<(), RekeyError> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(CellMsg::RetireRekey {
+                entity,
+                lease_id,
+                reply,
+            })
+            .await
+            .map_err(|_| RekeyError::ActorUnavailable)?;
+        rx.await.map_err(|_| RekeyError::ActorUnavailable)?
+    }
+
+    pub(crate) async fn complete_local_rekey(
+        &self,
+        transfer: RekeyTransfer,
+    ) -> Result<(), RekeyError> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(CellMsg::CompleteLocalRekey { transfer, reply })
+            .await
+            .map_err(|_| RekeyError::ActorUnavailable)?;
+        rx.await.map_err(|_| RekeyError::ActorUnavailable)?
+    }
+
+    /// Execute a serialized claim in this actor.
+    pub async fn claim_lease(
+        &self,
+        entity: PersistId,
+        cell: CellId,
+        holder: NodeId,
+        kind: ClaimKind,
+        now_ms: u64,
+    ) -> Result<ClaimResult, Reject> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(CellMsg::ClaimLease {
+                entity,
+                cell,
+                holder,
+                kind,
+                now_ms,
+                reply,
+            })
+            .await
+            .map_err(|_| Reject::JournalClosed)?;
+        rx.await.map_err(|_| Reject::JournalClosed)?
+    }
+    /// Renew a lease and return its current row.
+    pub async fn heartbeat_lease(
+        &self,
+        entity: PersistId,
+        holder: NodeId,
+        lease_id: LeaseId,
+        now_ms: u64,
+    ) -> Result<Option<Lease>, Reject> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(CellMsg::HeartbeatLease {
+                entity,
+                holder,
+                lease_id,
+                now_ms,
+                reply,
+            })
+            .await
+            .map_err(|_| Reject::JournalClosed)?;
+        rx.await.map_err(|_| Reject::JournalClosed)?
+    }
+    /// Check a fencing token, returning the row only if it admits the write.
+    pub async fn validate_lease(
+        &self,
+        entity: PersistId,
+        holder: NodeId,
+        lease_id: LeaseId,
+        now_ms: u64,
+    ) -> Result<Option<Lease>, Reject> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(CellMsg::ValidateLease {
+                entity,
+                holder,
+                lease_id,
+                now_ms,
+                reply,
+            })
+            .await
+            .map_err(|_| Reject::JournalClosed)?;
+        rx.await.map_err(|_| Reject::JournalClosed)?
+    }
+    /// Park a lease only when the holder and token are still current.
+    pub async fn park_lease(
+        &self,
+        entity: PersistId,
+        holder: NodeId,
+        lease_id: LeaseId,
+    ) -> Result<Option<Lease>, Reject> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(CellMsg::ParkLease {
+                entity,
+                holder,
+                lease_id,
+                reply,
+            })
+            .await
+            .map_err(|_| Reject::JournalClosed)?;
+        rx.await.map_err(|_| Reject::JournalClosed)?
+    }
+    /// Park leases whose registrar TTL elapsed.
+    pub async fn sweep_leases(&self, now_ms: u64) -> Result<Vec<Lease>, Reject> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(CellMsg::SweepLeases { now_ms, reply })
+            .await
+            .map_err(|_| Reject::JournalClosed)?;
+        rx.await.map_err(|_| Reject::JournalClosed)?
+    }
     /// Stamp, append, and fold a diff, returning its pending durability handle.
     /// The caller owns the wait so the actor creates no task per append.
     pub async fn start_diff(&self, record: JournalRecord) -> Result<Arc<AppendHandle>, Reject> {
         let (reply, rx) = oneshot::channel();
         self.tx
             .send(CellMsg::ApplyDiff { record, reply })
+            .await
+            .map_err(|_| Reject::JournalClosed)?;
+        rx.await.map_err(|_| Reject::JournalClosed)?
+    }
+
+    /// Atomically validate a persistent lease fence and enqueue its diff.
+    ///
+    /// The compare and journal admission share one actor mailbox turn, so a
+    /// transfer cannot create a stale-token write between them.
+    pub async fn start_fenced_diff(
+        &self,
+        record: JournalRecord,
+        holder: NodeId,
+        lease_id: LeaseId,
+        authority_seq: orrery_protocol::SeqPair,
+        now_ms: u64,
+    ) -> Result<FencedApply, Reject> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(CellMsg::ApplyFencedDiff {
+                record,
+                holder,
+                lease_id,
+                authority_seq,
+                now_ms,
+                reply,
+            })
             .await
             .map_err(|_| Reject::JournalClosed)?;
         rx.await.map_err(|_| Reject::JournalClosed)?
@@ -636,6 +1394,7 @@ pub fn spawn(
     grid: GridId,
     epoch: Epoch,
     journal: Arc<Journal>,
+    lease_store: Arc<dyn LeaseStore>,
     joins: &Arc<ActorJoinSet>,
 ) -> CellActorHandle {
     spawn_preloaded(
@@ -643,6 +1402,7 @@ pub fn spawn(
         grid,
         epoch,
         journal,
+        lease_store,
         HashMap::new(),
         HashMap::new(),
         HashMap::new(),
@@ -660,12 +1420,45 @@ pub fn spawn_preloaded(
     grid: GridId,
     epoch: Epoch,
     journal: Arc<Journal>,
+    lease_store: Arc<dyn LeaseStore>,
     entities: HashMap<PersistId, EntityRecord>,
     by_cell: HashMap<PersistId, orrery_protocol::CellId>,
     tombstones: HashMap<PersistId, Tombstone>,
     ckpt_watermark: Lsn,
     joins: &Arc<ActorJoinSet>,
 ) -> CellActorHandle {
+    spawn_preloaded_with_recovery_now(
+        shard,
+        grid,
+        epoch,
+        journal,
+        lease_store,
+        entities,
+        by_cell,
+        tombstones,
+        ckpt_watermark,
+        registrar_now_ms,
+        joins,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_preloaded_with_recovery_now<F>(
+    shard: orrery_protocol::CellId,
+    grid: GridId,
+    epoch: Epoch,
+    journal: Arc<Journal>,
+    lease_store: Arc<dyn LeaseStore>,
+    entities: HashMap<PersistId, EntityRecord>,
+    by_cell: HashMap<PersistId, orrery_protocol::CellId>,
+    tombstones: HashMap<PersistId, Tombstone>,
+    ckpt_watermark: Lsn,
+    recovery_now: F,
+    joins: &Arc<ActorJoinSet>,
+) -> CellActorHandle
+where
+    F: FnOnce() -> u64 + Send + 'static,
+{
     let (tx, rx) = mpsc::channel(4096);
     let mut env = ActorEnv {
         state: CellActorState {
@@ -676,10 +1469,43 @@ pub fn spawn_preloaded(
             by_cell,
             tombstones,
             ckpt_watermark,
+            leases: LeaseRegistrar::default(),
+            lease_cells: HashMap::new(),
+            pending_rekeys: HashMap::new(),
         },
         journal,
+        lease_store,
     };
     let join = tokio::spawn(async move {
+        // Startup recovery is deliberately inside this single task: queued
+        // requests cannot observe a partially restored registrar.
+        let rows = match env
+            .lease_store
+            .load_cell(env.state.grid, env.state.shard)
+            .await
+        {
+            Ok(rows) => rows,
+            // Serving an empty actor after a failed durable restore could
+            // mint a duplicate lease. Dropping its mailbox makes routing fail
+            // closed until the runtime is recreated successfully.
+            Err(_) => return,
+        };
+        let now = recovery_now();
+        for (cell, row) in rows {
+            let row = with_fresh_recovery_ttl(row, now);
+            // Recovery is itself a durable transition; do not expose the
+            // fresh TTL until its row has been stored.
+            if !matches!(
+                env.lease_store.put(env.state.grid, cell, &row).await,
+                Ok(LeasePut::Stored)
+            ) {
+                // As above, fail closed rather than start with an incomplete
+                // registrar after a durable transition failure.
+                return;
+            }
+            env.state.lease_cells.insert(row.entity, cell);
+            env.state.leases.restore(row);
+        }
         actor_loop(&mut env, rx).await;
     });
     joins.add(join);
@@ -688,5 +1514,77 @@ pub fn spawn_preloaded(
         shard,
         grid,
         epoch,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn recovery_at_controlled_time_sets_exact_hot_and_durable_ttl() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = Arc::new(
+            Journal::open(&crate::journal::JournalConfig {
+                dir: dir.path().join("journal"),
+                commit: crate::journal::GroupCommitConfig::default(),
+            })
+            .unwrap(),
+        );
+        let store = Arc::new(crate::lease::MemLeaseStore::new());
+        let holder = iroh_base::SecretKey::from_bytes(&[1; 32]).public();
+        let initial_joins = Arc::new(ActorJoinSet::new());
+        let initial = spawn(
+            CellId::ROOT,
+            GridId::ROOT,
+            Epoch::new(0),
+            Arc::clone(&journal),
+            store.clone(),
+            &initial_joins,
+        );
+        let ClaimResult::Granted(prior) = initial
+            .claim_lease(
+                PersistId::new(1),
+                CellId::ROOT,
+                holder,
+                orrery_protocol::ClaimKind::Weak,
+                0,
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("initial claim should be granted");
+        };
+        initial.shutdown().await;
+        initial_joins.join_all().await;
+
+        let joins = Arc::new(ActorJoinSet::new());
+        let recovery_now = 42;
+        let actor = spawn_preloaded_with_recovery_now(
+            CellId::ROOT,
+            GridId::ROOT,
+            Epoch::new(0),
+            Arc::clone(&journal),
+            store.clone(),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            Lsn::new(0, 0),
+            move || recovery_now,
+            &joins,
+        );
+        let hot = actor
+            .validate_lease(prior.entity, holder, prior.lease_id, recovery_now)
+            .await
+            .unwrap()
+            .unwrap();
+        let durable = store.load_cell(GridId::ROOT, CellId::ROOT).await.unwrap();
+
+        assert_eq!(hot.expires_at, recovery_now + crate::lease::LEASE_TTL_MS);
+        assert_eq!(durable, vec![(CellId::ROOT, hot)]);
+
+        actor.shutdown().await;
+        joins.join_all().await;
+        journal.close().await.unwrap();
     }
 }

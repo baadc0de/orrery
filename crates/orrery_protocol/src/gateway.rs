@@ -24,7 +24,8 @@
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    CellId, GridId, Intent, IntentOutcome, LeaseId, LeaseMsg, Lsn, NodeId, PersistId, SeqPair, Tick,
+    CellId, GridId, Intent, IntentOutcome, Lease, LeaseId, LeaseMsg, Lsn, NodeId, PersistId,
+    SeqPair, Tick,
 };
 
 /// A client → gateway message (docs/10-crates.md §9).
@@ -39,7 +40,10 @@ pub enum GatewayMsg {
     },
     /// Authority-lease control traffic. This always uses the reliable control
     /// lane, unlike bulk diffs.
-    Lease { message: LeaseMsg },
+    Lease {
+        /// Authority control message for the registrar.
+        message: LeaseMsg,
+    },
     /// Bulk uplink: one change-detection diff for an entity (D11 §2.1).
     Diff {
         /// The diff to journal.
@@ -72,7 +76,10 @@ pub enum GatewayReply {
         protocol: u16,
     },
     /// Authority-lease control reply.
-    Lease { message: LeaseMsg },
+    Lease {
+        /// Authority control reply from the registrar.
+        message: LeaseMsg,
+    },
     /// A bulk diff was durably journaled at `lsn` (D11 §2.1).
     ///
     /// `provisional` marks an epoch-fenced downgrade: the actor could not
@@ -98,6 +105,11 @@ pub enum GatewayReply {
         tick: Tick,
         /// A `Ruleset`-defined rejection reason code.
         reason: u16,
+        /// Current registrar row when fencing rejected this persistent write.
+        /// `None` is retained for non-authority failures such as a closed
+        /// journal.
+        #[serde(default)]
+        lease: Option<Lease>,
     },
     /// A page of an area load for one cell (D11 §9).
     AreaPage {

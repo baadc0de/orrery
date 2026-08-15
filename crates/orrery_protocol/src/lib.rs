@@ -24,24 +24,31 @@ mod persist;
 mod protocol;
 
 pub use authority::{
-    ClaimBasis, ClaimKind, DenyReason, ExpireDisposition, ExpireReason, Lease, LeaseFlags, LeaseId,
-    LeaseMsg, SeqPair,
+    ClaimBasis, ClaimId, ClaimKind, DenyReason, ExpireDisposition, ExpireReason, Lease, LeaseFlags,
+    LeaseId, LeaseMsg, SeqPair,
 };
 pub use cell::{
     cell_id_from_metres, metres_from_cell_id, shard_of, CellId, CellRangeError,
     DEFAULT_CELL_EDGE_M, INTEREST_LEVEL, SHARD_LEVEL,
 };
-pub use coord::{CoordMsg, IslandId, IslandManifest, PeerEntry, TopologyRegime};
+pub use coord::{
+    CoordMsg, CoordinatorInterestSnapshot, IslandId, IslandManifest, PeerEntry, TopologyRegime,
+};
 pub use gateway::{
     AreaPage, DiffUplink, GatewayMsg, GatewayReply, AREA_LOAD_ERR_COLD, AREA_LOAD_ERR_LIVE,
     MAX_AREA_PAGE_FRAME_BYTES,
 };
 pub use grid::GridId;
-pub use identity::{NodeId, Signature};
+pub use identity::{
+    FixedTokenClock, IssuerKey, IssuerKeyId, NodeId, SessionStanding, SessionTokenClaimsV1,
+    SessionTokenTtlMs, SessionTokenV1, SessionTokenVerificationError, SessionTokenVerifier,
+    Signature, TokenClock, UnixMillis, MAX_SESSION_TOKEN_BYTES, MAX_SESSION_TOKEN_TTL_MS,
+    SESSION_TOKEN_V1_DOMAIN, SESSION_TOKEN_V1_VERSION,
+};
 pub use persist::{
-    AccountId, AssetId, Attestation, Checkpoint, Epoch, Intent, IntentOp, IntentOutcome, ItemUid,
-    JournalRecord, Lsn, PersistId, RecordKind, Tick, INTENT_PREIMAGE_TAG, REASON_BAD_SIGNATURE,
-    REASON_CONTENTION_EXHAUSTED, REASON_EXECUTOR_ERROR, REASON_ISSUER_MISMATCH, REASON_NO_EXECUTOR,
-    REASON_VALIDATION_FAILED,
+    AccountId, AssetId, Attestation, Checkpoint, EntityRekey, Epoch, Intent, IntentOp,
+    IntentOutcome, ItemUid, JournalRecord, Lsn, PersistId, RecordKind, Tick, ENTITY_REKEY_VERSION,
+    INTENT_PREIMAGE_TAG, REASON_BAD_SIGNATURE, REASON_CONTENTION_EXHAUSTED, REASON_EXECUTOR_ERROR,
+    REASON_ISSUER_MISMATCH, REASON_NO_EXECUTOR, REASON_VALIDATION_FAILED,
 };
 pub use protocol::PROTOCOL_VERSION;

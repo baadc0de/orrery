@@ -20,6 +20,8 @@
 //!   centre first, the cold cell served from the durable tier
 //!   (`area_load_end_to_end`, FDB-gated).
 
+mod support;
+
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -38,15 +40,18 @@ use orrery_persistd::{
 use orrery_persistd::{FenceOutcome, FenceRow, FenceStatus, FenceStore};
 use orrery_protocol::channels::{decode_stream_frame, encode_datagram, encode_stream_frame};
 use orrery_protocol::{
-    CellId, DiffUplink, GatewayMsg, GatewayReply, GridId, JournalRecord, Lsn, PersistId,
-    RecordKind, Tick, MAX_AREA_PAGE_FRAME_BYTES,
+    CellId, ClaimBasis, ClaimKind, DenyReason, DiffUplink, GatewayMsg, GatewayReply, GridId,
+    JournalRecord, Lease, LeaseFlags, LeaseId, LeaseMsg, Lsn, NodeId, PersistId, RecordKind,
+    SeqPair, Tick, MAX_AREA_PAGE_FRAME_BYTES,
 };
 use tokio::sync::{Barrier, Mutex};
 
 fn node(n: u8) -> orrery_protocol::NodeId {
-    let mut seed = [0u8; 32];
-    seed[0] = n;
-    iroh_base::SecretKey::from_bytes(&seed).public()
+    support::node(n)
+}
+
+fn gateway_config(grid: GridId) -> GatewayConfig {
+    support::authority_config(node(7), grid, vec![CellId::ROOT])
 }
 
 #[allow(clippy::needless_pass_by_value)]
@@ -108,14 +113,29 @@ async fn dial(server: &GatewayServer) -> Client {
     let endpoint = iroh::endpoint::Builder::new(iroh::endpoint::presets::N0)
         .alpns(vec![GATEWAY_ALPN.to_vec()])
         .relay_mode(RelayMode::Disabled)
+        .secret_key(support::secret(7))
         .bind()
         .await
         .unwrap();
+    let node = endpoint.id();
     let conn = endpoint.connect(server.addr(), GATEWAY_ALPN).await.unwrap();
     // Admission: the gateway streams [ACCEPTED] (byte 0) on a uni stream.
     let mut admission = conn.accept_uni().await.unwrap();
     let msg = admission.read_to_end(16).await.unwrap();
     assert_eq!(msg, vec![0u8]);
+    conn.send_datagram(Bytes::from(encode_stream_frame(&GatewayMsg::Hello {
+        token: support::valid_session_token(node),
+        node,
+    })))
+    .unwrap();
+    let pkt = tokio::time::timeout(Duration::from_secs(5), conn.read_datagram())
+        .await
+        .expect("hello reply")
+        .expect("hello datagram");
+    assert!(matches!(
+        decode_stream_frame(&pkt),
+        Some(GatewayReply::HelloAck { .. })
+    ));
     Client {
         _endpoint: endpoint,
         conn,
@@ -182,6 +202,8 @@ impl Router for ScriptedRouter {
 /// A router whose `apply` never resolves and whose reads complete instantly.
 struct BlockingApplyRouter {
     applied: AtomicUsize,
+    entity: PersistId,
+    cell: CellId,
 }
 
 #[async_trait::async_trait]
@@ -198,6 +220,45 @@ impl Router for BlockingApplyRouter {
 
     async fn has_actor(&self, _grid: GridId, _cell: CellId) -> bool {
         true
+    }
+
+    async fn committed_entity_cell(
+        &self,
+        grid: GridId,
+        entity: PersistId,
+    ) -> Result<Option<CellId>, Reject> {
+        Ok((grid == GridId::ROOT && entity == self.entity).then_some(self.cell))
+    }
+
+    async fn claim_lease(
+        &self,
+        grid: GridId,
+        cell: CellId,
+        entity: PersistId,
+        holder: NodeId,
+        kind: ClaimKind,
+        now_ms: u64,
+    ) -> Result<orrery_persistd::lease::ClaimResult, Reject> {
+        if grid != GridId::ROOT
+            || cell != self.cell
+            || entity != self.entity
+            || kind != ClaimKind::Weak
+        {
+            return Ok(orrery_persistd::lease::ClaimResult::Denied(
+                DenyReason::NotEligible,
+            ));
+        }
+        Ok(orrery_persistd::lease::ClaimResult::Granted(Lease {
+            entity,
+            holder: Some(holder),
+            seq: SeqPair {
+                own_seq: 0,
+                auth_seq: 1,
+            },
+            lease_id: LeaseId(1),
+            expires_at: now_ms + 60_000,
+            flags: LeaseFlags::default(),
+        }))
     }
 }
 
@@ -255,7 +316,7 @@ async fn first_page_precedes_last_cell_read() {
         started: Mutex::new(Vec::new()),
         all_live: true,
     });
-    let server = GatewayServer::spawn(GatewayConfig::default(), router.clone())
+    let server = GatewayServer::spawn(gateway_config(GridId::ROOT), router.clone())
         .await
         .unwrap();
     let client = dial(&server).await;
@@ -332,7 +393,7 @@ async fn every_requested_cell_gets_a_page() {
         started: Mutex::new(Vec::new()),
         all_live: true,
     });
-    let server = GatewayServer::spawn(GatewayConfig::default(), router)
+    let server = GatewayServer::spawn(gateway_config(GridId::ROOT), router)
         .await
         .unwrap();
     let client = dial(&server).await;
@@ -369,7 +430,7 @@ async fn every_requested_cell_gets_a_page() {
 async fn failed_scan_is_a_distinct_reply_not_an_empty_page() {
     // A cold scan that errors is an AreaLoadError, diagnosable — never an
     // empty page (docs/08-persistence.md §9).
-    let server = GatewayServer::spawn(GatewayConfig::default(), Arc::new(FailingColdRouter))
+    let server = GatewayServer::spawn(gateway_config(GridId::ROOT), Arc::new(FailingColdRouter))
         .await
         .unwrap();
     let client = dial(&server).await;
@@ -415,7 +476,7 @@ async fn collect_chunked_frames() -> (Vec<Bytes>, GatewayServer) {
         started: Mutex::new(Vec::new()),
         all_live: true,
     });
-    let server = GatewayServer::spawn(GatewayConfig::default(), router)
+    let server = GatewayServer::spawn(gateway_config(GridId::ROOT), router)
         .await
         .unwrap();
     let client = dial(&server).await;
@@ -526,27 +587,61 @@ async fn subscribe_does_not_block_diffs() {
     // Here the *diff* is the blocked route and the subscribe is fast: the ack
     // can never arrive, but all 27 pages must — proving the subscribe was not
     // queued behind the in-flight diff.
+    let entity = PersistId::new(1);
     let router = Arc::new(BlockingApplyRouter {
         applied: AtomicUsize::new(0),
+        entity,
+        cell: CellId::ROOT,
     });
-    let server = GatewayServer::spawn(GatewayConfig::default(), router.clone())
+    let server = GatewayServer::spawn(gateway_config(GridId::ROOT), router.clone())
         .await
         .unwrap();
     let client = dial(&server).await;
     let conn = &client.conn;
+
+    send_stream(
+        conn,
+        &GatewayMsg::Lease {
+            message: LeaseMsg::Claim {
+                claim_id: orrery_protocol::ClaimId(1),
+                entity,
+                grid: GridId::ROOT,
+                cell: CellId::ROOT,
+                kind: ClaimKind::Weak,
+                basis: ClaimBasis::Explicit,
+                observed: SeqPair::default(),
+                tick: Tick::new(1),
+            },
+        },
+    );
+    let (lease_id, authority_seq) = match recv_reply(conn, 5).await {
+        GatewayReply::Lease {
+            message:
+                LeaseMsg::Grant {
+                    entity: granted,
+                    lease_id,
+                    seq,
+                    ..
+                },
+        } => {
+            assert_eq!(granted, entity);
+            (lease_id, seq)
+        }
+        other => panic!("expected authority grant, got {other:?}"),
+    };
 
     // The diff first: its route task pends forever on `apply`.
     conn.send_datagram(Bytes::from(encode_datagram(&GatewayMsg::Diff {
         diff: DiffUplink {
             cell: CellId::ROOT,
             grid: GridId::ROOT,
-            entity: PersistId::new(1),
+            entity,
             tick: Tick::new(1),
             kind: RecordKind::Spawn,
             payload: Bytes::from_static(b"hp=100"),
             seq: 1,
-            lease_id: None,
-            authority_seq: None,
+            lease_id: Some(lease_id),
+            authority_seq: Some(authority_seq),
         },
     })))
     .unwrap();
@@ -590,6 +685,7 @@ async fn area_load_end_to_end_live_cells() {
             &runtime_config(dir.path()),
             &(Arc::new(MemCheckpointStore::new()) as Arc<dyn CheckpointStore>),
         )
+        .await
         .unwrap(),
     ));
     // Seed live entities into three cells (all under the ROOT shard).
@@ -612,7 +708,7 @@ async fn area_load_end_to_end_live_cells() {
         runtime.lock().await.apply(rec).await.unwrap();
     }
     let router: Arc<dyn Router> = runtime;
-    let server = GatewayServer::spawn(GatewayConfig::default(), router)
+    let server = GatewayServer::spawn(gateway_config(GridId::ROOT), router)
         .await
         .unwrap();
     let client = dial(&server).await;
@@ -739,6 +835,7 @@ async fn area_load_end_to_end_cold_cell_served() {
             &runtime_config_in(dir.path(), grid),
             &(store.clone() as Arc<dyn CheckpointStore>),
         )
+        .await
         .unwrap();
         let rec = JournalRecord {
             lsn: Lsn::new(0, 0),
@@ -774,7 +871,7 @@ async fn area_load_end_to_end_cold_cell_served() {
         }
     }
     let router: Arc<dyn Router> = Arc::new(orrery_persistd::ColdFallbackRouter::new(NoLive, store));
-    let server = GatewayServer::spawn(GatewayConfig::default(), router)
+    let server = GatewayServer::spawn(gateway_config(grid), router)
         .await
         .unwrap();
     let client = dial(&server).await;

@@ -7,9 +7,9 @@
 //! local shard cells via `--shard`.
 //!
 //! When `--fdb-cluster-file` is set, the binary connects to FoundationDB for
-//! checkpoint storage and fencing (D11 §6). Without it, it runs with in-memory
-//! stores - suitable for development and tests that do not need the durable
-//! tier.
+//! checkpoint storage and fencing (D11 §6). A volatile in-memory authority
+//! path requires an explicit development switch; production authority never
+//! starts without FDB.
 //!
 //! A static two-process topology is also supported: a primary owns the shard
 //! actors and gateway, while its one follower owns only a mirrored journal and
@@ -41,19 +41,33 @@ use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
 use orrery_persistd::cluster::{ColdFallbackRouter, Router};
+use orrery_persistd::gateway::SessionTokenV1Authorizer;
 use orrery_persistd::journal::{
     spawn_chain, spawn_chain_grpc, AdaptiveCommitMode, ChainConfig, GroupCommitConfig, Journal,
 };
 use orrery_persistd::{
     ActivationOutcome, CellRuntime, CheckpointScheduler, DurableChainId, FenceFreshnessConfig,
     FenceStore, GatewayBulkMetrics, GatewayConfig, GatewayServer, GrpcChainTransport,
-    IntentExecutor, JournalConfig, MemCheckpointStore, RuntimeConfig, ShardActivation,
+    IntentExecutor, IntentValidator, IntentVerdict, JournalConfig, MemCheckpointStore,
+    RuntimeConfig, ShardActivation,
 };
 #[cfg(feature = "fdb")]
 use orrery_persistd::{FdbContext, FdbIntentExecutor};
-use orrery_protocol::{CellId, Epoch, GridId};
+use orrery_protocol::{
+    CellId, Epoch, GridId, IssuerKey, IssuerKeyId, NodeId, REASON_VALIDATION_FAILED,
+};
 
 type SharedExecutor = Arc<dyn IntentExecutor>;
+
+struct ProductionIntentValidator;
+
+impl IntentValidator for ProductionIntentValidator {
+    fn validate(&self, _intent: &orrery_protocol::Intent) -> IntentVerdict {
+        IntentVerdict::Reject {
+            reason: REASON_VALIDATION_FAILED,
+        }
+    }
+}
 
 /// Command-line configuration for the `persistd` binary.
 #[derive(Debug, Parser)]
@@ -103,6 +117,15 @@ struct Cli {
     /// in-memory stores are used.
     #[arg(long)]
     fdb_cluster_file: Option<PathBuf>,
+
+    /// Permit the volatile in-memory lease store for local development and
+    /// tests. Production authority requires `--fdb-cluster-file` instead.
+    #[arg(long)]
+    allow_volatile_leases: bool,
+
+    /// Trusted identity issuer key in `<key-id>@<public-key>` form.
+    #[arg(long, value_name = "KEY_ID@PUBLIC_KEY")]
+    issuer_key: Vec<IssuerKeySpec>,
 
     /// Hex-encoded iroh secret key, pinning the gateway's NodeId across runs.
     /// When absent a fresh identity is generated per boot.
@@ -344,6 +367,14 @@ async fn main() -> anyhow::Result<()> {
     if matches!(topology.role, TopologyRole::Promotion { .. }) && cli.fdb_cluster_file.is_none() {
         anyhow::bail!("--promote-from requires --fdb-cluster-file for durable fencing");
     }
+    if cli.fdb_cluster_file.is_none() && !cli.allow_volatile_leases {
+        anyhow::bail!(
+            "authority requires --fdb-cluster-file; use --allow-volatile-leases only for local development or tests"
+        );
+    }
+    if cli.issuer_key.is_empty() {
+        anyhow::bail!("authority requires at least one --issuer-key <key-id>@<public-key>");
+    }
 
     // ── FoundationDB stores (optional) ──────────────────────────────────
     // The FDB client network can boot only once per process. Keep one context
@@ -510,7 +541,21 @@ async fn main() -> anyhow::Result<()> {
         elapsed_ms = startup_started.elapsed().as_millis(),
         "persistd startup: recovering runtime"
     );
-    let runtime = Arc::new(CellRuntime::open(&config, &checkpoint_store)?);
+    let lease_store: Arc<dyn orrery_persistd::LeaseStore> = if cli.fdb_cluster_file.is_some() {
+        #[cfg(feature = "fdb")]
+        {
+            Arc::new(orrery_persistd::FdbLeaseStore::from_context(
+                fdb_context.as_ref().expect("FDB context exists"),
+            ))
+        }
+        #[cfg(not(feature = "fdb"))]
+        unreachable!("FDB flag was rejected before startup")
+    } else {
+        Arc::new(orrery_persistd::MemLeaseStore::new())
+    };
+    let runtime = Arc::new(
+        CellRuntime::open_with_lease_store(&config, &checkpoint_store, lease_store).await?,
+    );
     tracing::info!(
         elapsed_ms = startup_started.elapsed().as_millis(),
         "persistd startup: runtime recovered"
@@ -906,8 +951,32 @@ where
         bind: cli.bind.parse::<SocketAddr>()?,
         secret_key,
         executor,
+        authorizer: Arc::new(SessionTokenV1Authorizer::new(
+            cli.issuer_key.iter().map(|key| key.0.clone()),
+        )),
+        validator: Arc::new(ProductionIntentValidator),
         ..GatewayConfig::default()
     })
+}
+
+#[derive(Debug, Clone)]
+struct IssuerKeySpec(IssuerKey);
+
+impl FromStr for IssuerKeySpec {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let (key_id, public_key) = value
+            .split_once('@')
+            .ok_or_else(|| "expected issuer key as <key-id>@<public-key>".to_string())?;
+        let key_id = key_id
+            .parse::<u32>()
+            .map_err(|error| format!("invalid issuer key id `{key_id}`: {error}"))?;
+        let public_key = public_key
+            .parse::<NodeId>()
+            .map_err(|error| format!("invalid issuer public key `{public_key}`: {error}"))?;
+        Ok(Self(IssuerKey::new(IssuerKeyId::new(key_id), public_key)))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -1232,6 +1301,11 @@ mod tests {
             chain_follower: Vec::new(),
             bind: "127.0.0.1:0".parse().expect("valid loopback bind"),
             fdb_cluster_file,
+            allow_volatile_leases: false,
+            issuer_key: vec![IssuerKeySpec(IssuerKey::new(
+                IssuerKeyId::new(1),
+                iroh::SecretKey::from_bytes(&[9; 32]).public(),
+            ))],
             secret_key: None,
             shard: Vec::new(),
             metrics_jsonl: None,
@@ -1312,6 +1386,47 @@ mod tests {
         .expect("gateway config");
 
         assert!(cfg.executor.is_none(), "no FDB file leaves executor unset");
+    }
+
+    #[test]
+    fn gateway_config_accepts_only_tokens_signed_by_the_configured_issuer() {
+        use orrery_persistd::gateway::GatewayAuthorization;
+        use orrery_protocol::{
+            AccountId, SessionStanding, SessionTokenClaimsV1, SessionTokenTtlMs, SessionTokenV1,
+            SessionTokenVerificationError, UnixMillis,
+        };
+
+        // Given: production startup has one configured identity issuer.
+        let config = gateway_config(&cli(None), None, |_cluster_file, _grid| Ok(None))
+            .expect("gateway config");
+        let client = iroh::SecretKey::from_bytes(&[8; 32]);
+        let signed = SessionTokenV1::sign(
+            SessionTokenClaimsV1::new(
+                AccountId::new(7),
+                client.public(),
+                UnixMillis::new(900),
+                SessionTokenTtlMs::new(1_000),
+                SessionStanding::Good,
+                IssuerKeyId::new(1),
+            ),
+            &iroh::SecretKey::from_bytes(&[9; 32]),
+        )
+        .expect("sign test session token")
+        .encode()
+        .expect("encode test session token");
+
+        // When: the gateway admits a valid credential and rejects malformed input.
+        let admitted =
+            config
+                .authorizer
+                .authorize(&signed, &client.public(), UnixMillis::new(1_000));
+        let rejected = config
+            .authorizer
+            .authorize(&[], &client.public(), UnixMillis::new(1_000));
+
+        // Then: only the configured issuer's signed token establishes authority.
+        assert!(matches!(admitted, Ok(GatewayAuthorization::Valid(_))));
+        assert_eq!(rejected, Err(SessionTokenVerificationError::Malformed));
     }
 
     #[test]

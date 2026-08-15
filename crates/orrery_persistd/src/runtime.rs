@@ -5,7 +5,9 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use orrery_protocol::{CellId, Epoch, GridId, JournalRecord, Lsn, PersistId, RecordKind};
+use orrery_protocol::{
+    CellId, EntityRekey, Epoch, GridId, JournalRecord, Lsn, PersistId, RecordKind,
+};
 
 use crate::actor::{
     self, CellActorHandle, EntityRecord, SnapshotPage, Tombstone, TOMBSTONE_RETENTION_MS,
@@ -17,7 +19,34 @@ use crate::fence::{
     FenceOutcome, FenceRow, FenceStatus, FenceStore, MemFenceStore, ShardActivation,
 };
 use crate::journal::{Journal, JournalConfig};
+use crate::lease::{LeaseMigrate, LeaseStore, MemLeaseStore};
 use crate::placement::{RendezvousHasher, RendezvousNode};
+
+pub(crate) const ENTITY_STRIPE_COUNT: usize = 1_024;
+
+pub(crate) struct EntityStripeGates {
+    stripes: [Arc<tokio::sync::Mutex<()>>; ENTITY_STRIPE_COUNT],
+}
+
+impl Default for EntityStripeGates {
+    fn default() -> Self {
+        Self {
+            stripes: std::array::from_fn(|_| Arc::new(tokio::sync::Mutex::new(()))),
+        }
+    }
+}
+
+impl EntityStripeGates {
+    pub(crate) fn gate(&self, grid: GridId, entity: PersistId) -> Arc<tokio::sync::Mutex<()>> {
+        let mut mixed = entity.0 ^ u64::from(grid.0).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        mixed = (mixed ^ (mixed >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        mixed = (mixed ^ (mixed >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        mixed ^= mixed >> 31;
+        let bytes = mixed.to_le_bytes();
+        let stripe = usize::from(u16::from_le_bytes([bytes[0], bytes[1]]) & 1_023);
+        Arc::clone(&self.stripes[stripe])
+    }
+}
 
 /// Runtime configuration.
 #[derive(Clone)]
@@ -62,11 +91,70 @@ pub struct CellRuntime {
     grid: GridId,
     fence: std::sync::Arc<dyn FenceStore>,
     node_id: u64,
+    /// Shared registrar durable tier for all actors in this runtime.
+    lease_store: Arc<dyn LeaseStore>,
+    entity_gates: Arc<EntityStripeGates>,
     /// Join handles of this runtime's actor tasks; drained by [`Self::close`]
     /// (and by [`Self::split`] for the retired parent) so a closed runtime
     /// releases every actor's `Arc<Journal>` — and the journal's file lock —
     /// before returning.
     joins: Arc<actor::ActorJoinSet>,
+}
+
+pub(crate) struct CommittedRekeyPlan {
+    source: CellActorHandle,
+    destination: CellActorHandle,
+    lease_store: Arc<dyn LeaseStore>,
+    rekey: EntityRekey,
+    record: JournalRecord,
+    local: bool,
+}
+
+impl CommittedRekeyPlan {
+    pub(crate) async fn execute(self) -> Result<(), actor::RekeyError> {
+        let (transfer, handle) = self
+            .source
+            .prepare_rekey(self.rekey.clone(), self.record)
+            .await?;
+        if handle.committed().await.is_err() {
+            self.source
+                .abort_rekey(self.rekey.entity, self.rekey.expected_lease_id)
+                .await;
+            return Err(actor::RekeyError::Journal);
+        }
+        let migration = self
+            .lease_store
+            .migrate(
+                self.rekey.source_grid,
+                self.rekey.entity,
+                self.rekey.source_cell,
+                self.rekey.destination_cell,
+                self.rekey.expected_lease_id,
+            )
+            .await;
+        match migration {
+            // The rekey record is already durable. Keep the source reservation
+            // until restart reconciliation so later source writes cannot replay
+            // beside the committed destination image.
+            Err(_) => return Err(actor::RekeyError::LeaseStore),
+            Ok(LeaseMigrate::Migrated) => {}
+            Ok(LeaseMigrate::SourceMismatch {
+                actual: Some(actual),
+            }) if actual == self.rekey.destination_cell => {}
+            Ok(LeaseMigrate::SourceMismatch { .. })
+            | Ok(LeaseMigrate::LeaseIdMismatch { .. })
+            | Ok(LeaseMigrate::IndexConflict) => {
+                return Err(actor::RekeyError::LeaseMigrationRejected);
+            }
+        }
+        if self.local {
+            return self.source.complete_local_rekey(transfer).await;
+        }
+        self.destination.install_rekey(transfer).await?;
+        self.source
+            .retire_rekey(self.rekey.entity, self.rekey.expected_lease_id)
+            .await
+    }
 }
 
 /// Everything needed to checkpoint one actor without retaining a borrow of
@@ -146,9 +234,23 @@ impl CellRuntime {
     /// against `config.epoch` would discard that history the moment fencing
     /// is live. Zombie protection comes from the `actor/{shard}` fence CAS,
     /// not from filtering a node's own journal.
-    pub fn open(
+    pub async fn open(
         config: &RuntimeConfig,
         checkpoints: &Arc<dyn CheckpointStore>,
+    ) -> Result<Self, crate::journal::JournalError> {
+        Self::open_with_lease_store(config, checkpoints, Arc::new(MemLeaseStore::new())).await
+    }
+
+    /// Open with an explicitly selected durable registrar tier. Production
+    /// startup passes [`crate::FdbLeaseStore`] here; tests use the memory tier.
+    ///
+    /// The returned future is cancellation-safe while loading checkpoints and
+    /// reconciling committed rekeys: dropping it drops the in-flight store
+    /// future and no recovery worker remains detached.
+    pub async fn open_with_lease_store(
+        config: &RuntimeConfig,
+        checkpoints: &Arc<dyn CheckpointStore>,
+        lease_store: Arc<dyn LeaseStore>,
     ) -> Result<Self, crate::journal::JournalError> {
         let journal = Arc::new(Journal::open(&config.journal)?);
         let joins = Arc::new(actor::ActorJoinSet::new());
@@ -161,12 +263,12 @@ impl CellRuntime {
         let mut seeds: HashMap<CellId, RecoveredState> = HashMap::new();
         let mut ckpt_watermarks: HashMap<CellId, Lsn> = HashMap::new();
         for &shard in &config.shards {
-            let store = Arc::clone(checkpoints);
-            let grid = config.grid;
-            let loaded = block_on_store(
-                move || async move { store.load(shard, grid).await },
-                "checkpoint load",
-            )?;
+            let loaded = checkpoints
+                .load(shard, config.grid)
+                .await
+                .map_err(|error| {
+                    crate::journal::JournalError::Store(format!("checkpoint load: {error}"))
+                })?;
             if let Some(ckpt) = loaded {
                 ckpt_watermarks.insert(shard, ckpt.watermark);
                 seeds.insert(
@@ -190,9 +292,72 @@ impl CellRuntime {
         // checkpoint watermark advanced by every kept tail record past it.
         // This is the actor's `ckpt_watermark` after open.
         let mut coverage: HashMap<CellId, Lsn> = ckpt_watermarks.clone();
-        for item in journal.scan_from(Lsn::new(0, 0)) {
-            let stored = item?;
+        let stored_records = journal
+            .scan_from(Lsn::new(0, 0))
+            .collect::<Result<Vec<_>, _>>()?;
+        for stored in stored_records {
             let rec = stored.record;
+            verify_crc(&rec)?;
+            if rec.kind == RecordKind::Rekey {
+                let rekey = actor::decode_entity_rekey(&rec).map_err(|error| {
+                    crate::journal::JournalError::Corrupt {
+                        lsn: rec.lsn,
+                        msg: error.to_string(),
+                    }
+                })?;
+                if rekey.source_grid != config.grid || rekey.destination_grid != config.grid {
+                    return Err(crate::journal::JournalError::Corrupt {
+                        lsn: rec.lsn,
+                        msg: "rekey crosses an unavailable runtime grid".into(),
+                    });
+                }
+                let source_shard =
+                    deepest_shard(&config.shards, rekey.source_cell).ok_or_else(|| {
+                        crate::journal::JournalError::Store(
+                            "committed rekey source actor unavailable".into(),
+                        )
+                    })?;
+                let max_seen = max_epoch_by_shard
+                    .entry(source_shard)
+                    .or_insert(Epoch::new(0));
+                if rec.epoch < *max_seen {
+                    continue;
+                }
+                *max_seen = (*max_seen).max(rec.epoch);
+                recover_rekey(
+                    &config.shards,
+                    &ckpt_watermarks,
+                    &mut seeds,
+                    &mut coverage,
+                    &rekey,
+                    rec.lsn,
+                )?;
+                let migration = lease_store
+                    .migrate(
+                        rekey.source_grid,
+                        rekey.entity,
+                        rekey.source_cell,
+                        rekey.destination_cell,
+                        rekey.expected_lease_id,
+                    )
+                    .await
+                    .map_err(|error| crate::journal::JournalError::Store(error.to_string()))?;
+                match migration {
+                    LeaseMigrate::Migrated => {}
+                    LeaseMigrate::SourceMismatch {
+                        actual: Some(actual),
+                    } if actual == rekey.destination_cell => {}
+                    LeaseMigrate::SourceMismatch { actual: None }
+                    | LeaseMigrate::SourceMismatch { actual: Some(_) }
+                    | LeaseMigrate::LeaseIdMismatch { .. }
+                    | LeaseMigrate::IndexConflict => {
+                        return Err(crate::journal::JournalError::Store(
+                            "committed rekey lease reconciliation rejected".into(),
+                        ));
+                    }
+                }
+                continue;
+            }
             let Some(shard) = deepest_shard(&config.shards, rec.cell) else {
                 continue;
             };
@@ -203,7 +368,6 @@ impl CellRuntime {
                 continue;
             }
             *max_seen = (*max_seen).max(rec.epoch);
-            verify_crc(&rec)?;
             // The watermark strictly bounds the tail: the checkpoint covers
             // LSNs `1..=watermark`, but the very first record of a journal is
             // LSN 0:0 — equal to the absent-checkpoint watermark, not covered
@@ -236,6 +400,7 @@ impl CellRuntime {
                     config.grid,
                     config.epoch,
                     Arc::clone(&journal),
+                    Arc::clone(&lease_store),
                     seed.state,
                     seed.by_cell,
                     seed.tombstones,
@@ -252,6 +417,8 @@ impl CellRuntime {
             grid: config.grid,
             fence: Arc::clone(&config.fence),
             node_id: config.node_id,
+            lease_store,
+            entity_gates: Arc::new(EntityStripeGates::default()),
             joins,
         })
     }
@@ -286,6 +453,36 @@ impl CellRuntime {
     /// grid-relative, and the actors write rows under this grid).
     pub fn grid(&self) -> GridId {
         self.grid
+    }
+
+    /// Ask every live actor to park registrar rows whose monotonic TTL passed.
+    pub async fn sweep_expired_leases(&self, now_ms: u64) {
+        for actor in self.actors.values() {
+            let _ = actor.sweep_leases(now_ms).await;
+        }
+    }
+
+    /// Find an entity's durable registrar location.
+    ///
+    /// Claim routing uses this before choosing an actor so a post-split claim
+    /// cannot create a second row in a sibling shard.
+    pub async fn lease_location(&self, entity: PersistId) -> Result<Option<CellId>, actor::Reject> {
+        self.lease_store
+            .locate(self.grid, entity)
+            .await
+            .map_err(|_| actor::Reject::LeaseStore)
+    }
+
+    pub(crate) fn entity_gate(
+        &self,
+        grid: GridId,
+        entity: PersistId,
+    ) -> Arc<tokio::sync::Mutex<()>> {
+        self.entity_gates.gate(grid, entity)
+    }
+
+    pub(crate) fn lease_store_handle(&self) -> Arc<dyn LeaseStore> {
+        Arc::clone(&self.lease_store)
     }
 
     /// Start a bounded-staleness monitor for the exact active fence rows this
@@ -406,6 +603,7 @@ impl CellRuntime {
                         self.grid,
                         new_epoch,
                         Arc::clone(&self.journal),
+                        Arc::clone(&self.lease_store),
                         state,
                         by_cell,
                         tombstones,
@@ -480,6 +678,7 @@ impl CellRuntime {
                     self.grid,
                     row.epoch,
                     Arc::clone(&self.journal),
+                    Arc::clone(&self.lease_store),
                     state,
                     by_cell,
                     tombstones,
@@ -560,6 +759,7 @@ impl CellRuntime {
                     self.grid,
                     new_epoch,
                     Arc::clone(&self.journal),
+                    Arc::clone(&self.lease_store),
                     partition,
                     child_by_cell,
                     child_tombstones,
@@ -584,6 +784,40 @@ impl CellRuntime {
             .actor(record.grid, record.cell)
             .ok_or(actor::Reject::JournalClosed)?;
         handle.apply_diff(record).await
+    }
+
+    pub(crate) fn committed_rekey_plan(
+        &self,
+        record: JournalRecord,
+    ) -> Result<CommittedRekeyPlan, actor::RekeyError> {
+        let rekey = actor::decode_entity_rekey(&record)?;
+        if rekey.source_grid != self.grid || rekey.destination_grid != self.grid {
+            return Err(actor::RekeyError::ActorUnavailable);
+        }
+        let source = self
+            .actor(rekey.source_grid, rekey.source_cell)
+            .cloned()
+            .ok_or(actor::RekeyError::ActorUnavailable)?;
+        let destination = self
+            .actor(rekey.destination_grid, rekey.destination_cell)
+            .cloned()
+            .ok_or(actor::RekeyError::ActorUnavailable)?;
+        Ok(CommittedRekeyPlan {
+            local: source.same_actor(&destination),
+            source,
+            destination,
+            lease_store: Arc::clone(&self.lease_store),
+            rekey,
+            record,
+        })
+    }
+
+    /// Commit a server-owned storage rekey across the source and destination actors.
+    pub async fn commit_rekey(&self, record: JournalRecord) -> Result<(), actor::RekeyError> {
+        let rekey = actor::decode_entity_rekey(&record)?;
+        let gate = self.entity_gate(rekey.source_grid, rekey.entity);
+        let _guard = gate.lock_owned().await;
+        self.committed_rekey_plan(record)?.execute().await
     }
 
     /// Read a snapshot from the actor owning `cell` in `grid` (P-7: the grid
@@ -706,7 +940,21 @@ impl CellRuntime {
             let stored =
                 item.map_err(|e| crate::checkpoint::CheckpointError::Store(format!("{e}")))?;
             let rec = &stored.record;
-            if !shard.is_prefix_of(rec.cell) {
+            let rekey = if rec.kind == RecordKind::Rekey {
+                Some(actor::decode_entity_rekey(rec).map_err(|error| {
+                    crate::checkpoint::CheckpointError::Store(error.to_string())
+                })?)
+            } else {
+                None
+            };
+            let relevant = rekey.as_ref().map_or_else(
+                || shard.is_prefix_of(rec.cell),
+                |rekey| {
+                    shard.is_prefix_of(rekey.source_cell)
+                        || shard.is_prefix_of(rekey.destination_cell)
+                },
+            );
+            if !relevant {
                 continue;
             }
             if watermark.is_some_and(|w| rec.lsn <= w) {
@@ -720,6 +968,34 @@ impl CellRuntime {
             max_epoch = max_epoch.max(rec.epoch);
             verify_crc(rec)
                 .map_err(|e| crate::checkpoint::CheckpointError::Store(format!("{e}")))?;
+            if let Some(rekey) = rekey {
+                let migration = self
+                    .lease_store
+                    .migrate(
+                        rekey.source_grid,
+                        rekey.entity,
+                        rekey.source_cell,
+                        rekey.destination_cell,
+                        rekey.expected_lease_id,
+                    )
+                    .await
+                    .map_err(|error| {
+                        crate::checkpoint::CheckpointError::Store(error.to_string())
+                    })?;
+                match migration {
+                    LeaseMigrate::Migrated => {}
+                    LeaseMigrate::SourceMismatch {
+                        actual: Some(actual),
+                    } if actual == rekey.destination_cell => {}
+                    LeaseMigrate::SourceMismatch { .. }
+                    | LeaseMigrate::LeaseIdMismatch { .. }
+                    | LeaseMigrate::IndexConflict => {
+                        return Err(crate::checkpoint::CheckpointError::Store(
+                            "committed rekey lease reconciliation rejected".into(),
+                        ));
+                    }
+                }
+            }
             handle.restore_apply(rec.clone()).await.map_err(|_| {
                 crate::checkpoint::CheckpointError::Store("actor gone during replay".into())
             })?;
@@ -767,36 +1043,53 @@ fn deepest_shard(shards: &[CellId], cell: CellId) -> Option<CellId> {
         .copied()
 }
 
-/// Drive a [`CheckpointStore`] call to completion from synchronous recovery
-/// code (`open` runs before the runtime's async surface is usable).
-///
-/// The thunk produces the store's future on the executing thread: inside a
-/// Tokio context that is a freshly spawned worker thread (the future is
-/// `Send` and the store `Sync`, and the `Mem`/`Fdb` stores are
-/// runtime-agnostic), avoiding `block_in_place`'s multi-thread-runtime
-/// requirement; outside any Tokio context a current-thread runtime drives it
-/// in place.
-fn block_on_store<F, Fut, T>(call: F, what: &'static str) -> Result<T, crate::journal::JournalError>
-where
-    F: FnOnce() -> Fut + Send + 'static,
-    Fut: core::future::Future<Output = Result<T, crate::checkpoint::CheckpointError>> + Send,
-    T: Send + 'static,
-{
-    let run = move || {
-        futures::executor::block_on(call())
-            .map_err(|e| crate::journal::JournalError::Store(format!("{what}: {e}")))
-    };
-    if tokio::runtime::Handle::try_current().is_ok() {
-        std::thread::spawn(run)
-            .join()
-            .map_err(|_| crate::journal::JournalError::Store(format!("{what} thread panicked")))?
-    } else {
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|e| crate::journal::JournalError::Store(format!("{what} runtime: {e}")))?
-            .block_on(async { run() })
+fn recover_rekey(
+    shards: &[CellId],
+    checkpoint_watermarks: &HashMap<CellId, Lsn>,
+    seeds: &mut HashMap<CellId, RecoveredState>,
+    coverage: &mut HashMap<CellId, Lsn>,
+    rekey: &EntityRekey,
+    lsn: Lsn,
+) -> Result<(), crate::journal::JournalError> {
+    let source = deepest_shard(shards, rekey.source_cell).ok_or_else(|| {
+        crate::journal::JournalError::Store("committed rekey source actor unavailable".into())
+    })?;
+    let destination = deepest_shard(shards, rekey.destination_cell).ok_or_else(|| {
+        crate::journal::JournalError::Store("committed rekey destination actor unavailable".into())
+    })?;
+    if checkpoint_watermarks
+        .get(&source)
+        .is_none_or(|watermark| lsn > *watermark)
+    {
+        let seed = seeds.entry(source).or_default();
+        seed.state.remove(&rekey.entity);
+        seed.by_cell.remove(&rekey.entity);
+        seed.tombstones.remove(&rekey.entity);
+        coverage
+            .entry(source)
+            .and_modify(|covered| *covered = (*covered).max(lsn))
+            .or_insert(lsn);
     }
+    if checkpoint_watermarks
+        .get(&destination)
+        .is_none_or(|watermark| lsn > *watermark)
+    {
+        let seed = seeds.entry(destination).or_default();
+        seed.state.insert(
+            rekey.entity,
+            EntityRecord {
+                components: rekey.source_record.clone(),
+                dirty: true,
+            },
+        );
+        seed.by_cell.insert(rekey.entity, rekey.destination_cell);
+        seed.tombstones.remove(&rekey.entity);
+        coverage
+            .entry(destination)
+            .and_modify(|covered| *covered = (*covered).max(lsn))
+            .or_insert(lsn);
+    }
+    Ok(())
 }
 
 /// Re-verify a record's payload crc (§4.1 replay integrity).

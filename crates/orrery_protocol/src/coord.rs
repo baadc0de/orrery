@@ -7,8 +7,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::CellId;
-use crate::NodeId;
+use crate::{CellId, Epoch, GridId, NodeId};
 
 /// A coordinator-allocated island identifier (docs/02-networking.md §3).
 ///
@@ -95,6 +94,26 @@ pub struct IslandManifest {
     pub peers: Vec<PeerEntry>,
 }
 
+/// The coordinator's current authorization snapshot for one peer's active
+/// interest set.
+///
+/// Gateways consume this value as an immutable handout from the coordinator;
+/// client area-load requests never create or extend its coverage.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CoordinatorInterestSnapshot {
+    /// The peer whose interest set this snapshot authorizes.
+    pub peer: NodeId,
+    /// Monotonic coordinator epoch for replacing older snapshots.
+    pub epoch: Epoch,
+    /// The grid containing every covered cell.
+    pub grid: GridId,
+    /// Cells covered by the peer's coordinator-confirmed active interest.
+    pub covered_cells: Vec<CellId>,
+    /// Coordinator-monotonic deadline in milliseconds; the snapshot is stale
+    /// at and after this instant.
+    pub valid_until_ms: u64,
+}
+
 /// A coordinator message (docs/10-crates.md §12).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CoordMsg {
@@ -178,5 +197,26 @@ mod tests {
         let bytes = postcard::to_stdvec(&manifest).unwrap();
         let back: IslandManifest = postcard::from_bytes(&bytes).unwrap();
         assert_eq!(back, manifest);
+    }
+
+    #[test]
+    fn coordinator_interest_snapshot_roundtrips() {
+        let snapshot = CoordinatorInterestSnapshot {
+            peer: node(1),
+            epoch: Epoch::new(3),
+            grid: GridId::new(8),
+            covered_cells: vec![CellId::ROOT],
+            valid_until_ms: 4_000,
+        };
+
+        let bytes = postcard::to_stdvec(&snapshot).unwrap();
+        let back: CoordinatorInterestSnapshot = postcard::from_bytes(&bytes).unwrap();
+
+        assert_eq!(back, snapshot);
+    }
+
+    #[test]
+    fn coordinator_interest_snapshot_rejects_truncated_postcard() {
+        assert!(postcard::from_bytes::<CoordinatorInterestSnapshot>(&[0]).is_err());
     }
 }

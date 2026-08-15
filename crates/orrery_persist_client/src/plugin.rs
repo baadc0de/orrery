@@ -14,7 +14,8 @@ use crate::area::{drive_area_loader, sync_aoi_to_loader, AreaLoader};
 use crate::config::PersistClientConfig;
 use crate::feed::{feed_uplink, UplinkSeq};
 use crate::gateway::{
-    connect_gateway, disconnect_gateway, flush_lease_control, hello_gateway, GatewaySession,
+    connect_gateway, disconnect_gateway, flush_lease_control, hello_gateway,
+    sync_authority_identity, GatewaySession,
 };
 use crate::intents::{drain_intents, IntentQueue};
 use crate::replies::process_replies;
@@ -69,11 +70,12 @@ impl Plugin for OrreryPersistClientPlugin {
                 (
                     connect_gateway,
                     hello_gateway,
+                    sync_authority_identity,
                     flush_lease_control,
                     disconnect_gateway,
                 ),
             )
-            .add_systems(Update, process_replies)
+            .add_systems(Update, process_replies.before(feed_uplink))
             // Feed replicon change-detection diffs into the scheduler before the
             // flush, so the same update flushes what just changed.
             .add_systems(Update, feed_uplink.before(PersistClientSet::Flush));

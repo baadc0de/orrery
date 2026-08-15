@@ -113,9 +113,12 @@ impl UplinkScheduler {
         entry.rate_hz = rate_hz;
     }
 
-    /// Unregister an entity (despawn, or authority handed off).
+    /// Unregister an entity and purge its queued and in-flight bookkeeping.
     pub fn unregister(&mut self, entity: PersistId) {
         self.entities.remove(&entity);
+        self.sent_at.retain(|(persist, _), _| *persist != entity);
+        self.sent_order
+            .retain(|((persist, _), _)| *persist != entity);
     }
 
     /// Queue a change-detection diff for `entity`.
@@ -291,6 +294,11 @@ impl UplinkScheduler {
     #[must_use]
     pub fn ack_latency(&self) -> &LatencyHistogram {
         &self.ack_latency
+    }
+
+    #[cfg(test)]
+    pub(crate) fn in_flight_bookkeeping_len(&self) -> (usize, usize) {
+        (self.sent_at.len(), self.sent_order.len())
     }
 
     fn record_reply_latency(&mut self, entity: PersistId, tick: Tick, received_at: Instant) {

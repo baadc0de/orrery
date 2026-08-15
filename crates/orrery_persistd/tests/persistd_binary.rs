@@ -4,6 +4,8 @@
 //! identity across restarts, the stdout JSON address line, and graceful signal
 //! handling. They do NOT require FoundationDB.
 
+mod support;
+
 use std::net::{SocketAddr, TcpListener};
 use std::process::{Child, Command};
 use std::time::Duration;
@@ -15,15 +17,36 @@ use orrery_persistd::journal::{AdaptiveCommitMode, GroupCommitConfig};
 #[cfg(feature = "fdb")]
 use orrery_persistd::{FdbContext, FenceStore};
 use orrery_persistd::{Journal, JournalConfig, GATEWAY_ALPN};
-use orrery_protocol::channels::{decode_datagram, encode_datagram, encode_stream_frame};
+use orrery_protocol::channels::{
+    decode_datagram, decode_stream_frame, encode_datagram, encode_stream_frame,
+};
 use orrery_protocol::{
-    CellId, DiffUplink, GatewayMsg, GatewayReply, GridId, NodeId, PersistId, RecordKind, Tick,
+    CellId, DiffUplink, Epoch, GatewayMsg, GatewayReply, GridId, Intent, IntentOp, IntentOutcome,
+    JournalRecord, Lsn, NodeId, PersistId, RecordKind, Tick, REASON_VALIDATION_FAILED,
 };
 
 /// Locate the compiled `persistd` binary via `CARGO_BIN_EXE_persistd`, set by
 /// Cargo when running `cargo test` on a binary target's integration tests.
 fn persistd_binary() -> &'static str {
     env!("CARGO_BIN_EXE_persistd")
+}
+
+fn issuer_key_arg() -> String {
+    format!("{}@{}", support::ISSUER_KEY_ID, support::issuer().public())
+}
+
+fn process_session_token(node: NodeId) -> Vec<u8> {
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock after Unix epoch")
+        .as_millis();
+    let issued_at_ms = u64::try_from(now_ms).expect("current timestamp fits u64");
+    support::session_token(
+        &support::issuer(),
+        node,
+        issued_at_ms,
+        support::TOKEN_TTL_MS,
+    )
 }
 
 /// Run `persistd` with the given extra arguments, wait for the JSON address
@@ -39,6 +62,9 @@ fn run_persistd(args: &[&str]) -> (String, String) {
         .arg(dir.path())
         .arg("--bind")
         .arg("127.0.0.1:0")
+        .arg("--allow-volatile-leases")
+        .arg("--issuer-key")
+        .arg(issuer_key_arg())
         .args(args)
         // Route tracing to stderr so stdout has only the JSON line.
         .stdout(std::process::Stdio::piped())
@@ -101,9 +127,17 @@ fn run_persistd(args: &[&str]) -> (String, String) {
 /// avoiding a platform-dependent open-journal directory removal race.
 fn spawn_persistd(args: &[String]) -> (tempfile::TempDir, Child, serde_json::Value) {
     let dir = tempfile::tempdir().expect("temp dir");
+    let (child, ready) = spawn_persistd_in(dir.path(), args);
+    (dir, child, ready)
+}
+
+fn spawn_persistd_in(dir: &std::path::Path, args: &[String]) -> (Child, serde_json::Value) {
     let mut child = Command::new(persistd_binary())
         .arg("--dir")
-        .arg(dir.path())
+        .arg(dir)
+        .arg("--allow-volatile-leases")
+        .arg("--issuer-key")
+        .arg(issuer_key_arg())
         .args(args)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -117,7 +151,42 @@ fn spawn_persistd(args: &[String]) -> (tempfile::TempDir, Child, serde_json::Val
         .read_line(&mut line)
         .expect("read readiness document");
     let ready = serde_json::from_str(line.trim()).expect("valid readiness JSON");
-    (dir, child, ready)
+    (child, ready)
+}
+
+async fn seed_process_entity(
+    dir: &std::path::Path,
+    node_id: u64,
+    entity: PersistId,
+    author: NodeId,
+) {
+    let journal = Journal::open(&JournalConfig {
+        dir: dir.join(format!("node-{node_id}")),
+        commit: GroupCommitConfig {
+            mode: AdaptiveCommitMode::AlwaysBatch,
+            ..GroupCommitConfig::default()
+        },
+    })
+    .expect("open primary journal for seed");
+    let payload = Bytes::from_static(b"seeded");
+    journal
+        .append_replicated(JournalRecord {
+            lsn: Lsn::new(0, 0),
+            cell: CellId::ROOT,
+            grid: GridId::ROOT,
+            entity,
+            tick: Tick::new(0),
+            epoch: Epoch::new(0),
+            author,
+            kind: RecordKind::Spawn,
+            crc: orrery_persistd::payload_crc(&payload),
+            payload,
+        })
+        .expect("append seed entity")
+        .committed()
+        .await
+        .expect("commit seed entity");
+    journal.close().await.expect("close seeded journal");
 }
 
 fn stop(child: &mut Child) {
@@ -149,6 +218,102 @@ fn run_persistd_exit(args: &[&str]) -> (std::process::ExitStatus, String) {
         output.status,
         String::from_utf8(output.stderr).expect("stderr is utf-8"),
     )
+}
+
+#[test]
+fn authority_startup_requires_durable_fdb_or_explicit_volatile_mode() {
+    let (status, stderr) = run_persistd_exit(&[]);
+    assert!(!status.success());
+    assert!(stderr.contains("authority requires --fdb-cluster-file"));
+}
+
+#[test]
+fn authority_startup_requires_an_identity_issuer_key() {
+    let (status, stderr) = run_persistd_exit(&["--allow-volatile-leases"]);
+    assert!(!status.success());
+    assert!(stderr.contains("authority requires at least one --issuer-key"));
+}
+
+#[tokio::test]
+async fn production_authority_rejects_intents_without_a_secure_validator() {
+    // Given: the production binary's authority configuration and an
+    // authenticated peer submitting a correctly signed intent.
+    let client_key = iroh::SecretKey::generate();
+    let bind_addr = free_loopback_addr();
+    let args = vec!["--bind".to_string(), bind_addr.to_string()];
+    let (_dir, mut child, ready) = spawn_persistd(&args);
+    let gateway = ready["node_id"]
+        .as_str()
+        .expect("gateway node id")
+        .parse::<NodeId>()
+        .expect("valid gateway node id");
+    let client = Builder::new(N0)
+        .alpns(vec![GATEWAY_ALPN.to_vec()])
+        .relay_mode(RelayMode::Disabled)
+        .secret_key(client_key.clone())
+        .bind()
+        .await
+        .expect("client endpoint");
+    let connection = client
+        .connect(
+            iroh::EndpointAddr::new(gateway).with_ip_addr(bind_addr),
+            GATEWAY_ALPN,
+        )
+        .await
+        .expect("connect to production gateway");
+    let mut admission = connection.accept_uni().await.expect("gateway admission");
+    assert_eq!(admission.read_to_end(16).await.unwrap(), vec![0]);
+    connection
+        .send_datagram(Bytes::from(encode_stream_frame(&GatewayMsg::Hello {
+            token: process_session_token(client_key.public()),
+            node: client_key.public(),
+        })))
+        .expect("send hello");
+    let hello = tokio::time::timeout(Duration::from_secs(5), connection.read_datagram())
+        .await
+        .expect("hello reply timeout")
+        .expect("hello reply");
+    assert!(matches!(
+        decode_stream_frame(&hello),
+        Some(GatewayReply::HelloAck { .. })
+    ));
+    let mut intent = Intent {
+        intent_id: 71,
+        issuer: client_key.public(),
+        cell_epoch: Epoch::new(0),
+        ops: vec![IntentOp {
+            op: 1,
+            args: Bytes::from_static(b"production-authority"),
+        }],
+        attestations: Vec::new(),
+        signature: client_key.sign(b"placeholder"),
+    };
+    intent.sign(&client_key);
+
+    // When: the intent crosses the real binary gateway surface.
+    connection
+        .send_datagram(Bytes::from(encode_stream_frame(
+            &GatewayMsg::SubmitIntent { intent },
+        )))
+        .expect("submit intent");
+    let reply = tokio::time::timeout(Duration::from_secs(5), connection.read_datagram())
+        .await
+        .expect("intent reply timeout")
+        .expect("intent reply");
+
+    // Then: validation fails closed before the missing-executor fallback.
+    assert!(matches!(
+        decode_stream_frame(&reply),
+        Some(GatewayReply::IntentAck {
+            intent_id: 71,
+            outcome: IntentOutcome::Rejected {
+                reason: REASON_VALIDATION_FAILED,
+            },
+        })
+    ));
+    connection.close(0u32.into(), b"test complete");
+    client.close().await;
+    stop(&mut child);
 }
 
 /// Locate the optional workspace development cluster, with an environment
@@ -355,6 +520,7 @@ fn primary_starts_when_follower_is_temporarily_unavailable() {
 /// iroh gateway rather than the in-process chain shim.
 #[tokio::test]
 async fn primary_ack_is_mirrored_to_the_passive_follower_journal() {
+    let client_key = iroh::SecretKey::generate();
     let follower_args = vec![
         "--node-id".into(),
         "2".into(),
@@ -365,7 +531,8 @@ async fn primary_ack_is_mirrored_to_the_passive_follower_journal() {
         "--chain-listen".into(),
         "127.0.0.1:0".into(),
     ];
-    let (follower_dir, mut follower, follower_ready) = spawn_persistd(&follower_args);
+    let follower_dir = tempfile::tempdir().expect("follower temp dir");
+    let (mut follower, follower_ready) = spawn_persistd_in(follower_dir.path(), &follower_args);
     let chain_addr = follower_ready["chain_addr"]
         .as_str()
         .expect("follower chain listener")
@@ -381,7 +548,15 @@ async fn primary_ack_is_mirrored_to_the_passive_follower_journal() {
         "--bind".into(),
         bind_addr.to_string(),
     ];
-    let (_primary_dir, mut primary, primary_ready) = spawn_persistd(&primary_args);
+    let primary_dir = tempfile::tempdir().expect("primary temp dir");
+    seed_process_entity(
+        primary_dir.path(),
+        1,
+        PersistId::new(77),
+        client_key.public(),
+    )
+    .await;
+    let (mut primary, primary_ready) = spawn_persistd_in(primary_dir.path(), &primary_args);
     assert_eq!(primary_ready["bind_addr"], bind_addr.to_string());
     let primary_id = primary_ready["node_id"]
         .as_str()
@@ -392,6 +567,7 @@ async fn primary_ack_is_mirrored_to_the_passive_follower_journal() {
     let client = Builder::new(N0)
         .alpns(vec![GATEWAY_ALPN.to_vec()])
         .relay_mode(RelayMode::Disabled)
+        .secret_key(client_key.clone())
         .bind()
         .await
         .expect("client endpoint");
@@ -403,12 +579,38 @@ async fn primary_ack_is_mirrored_to_the_passive_follower_journal() {
     let mut admission = conn.accept_uni().await.expect("gateway admission");
     assert_eq!(admission.read_to_end(16).await.unwrap(), vec![0]);
 
-    let author = iroh::SecretKey::generate().public();
+    let author = client_key.public();
     conn.send_datagram(Bytes::from(encode_stream_frame(&GatewayMsg::Hello {
-        token: b"process-topology".to_vec(),
+        token: process_session_token(author),
         node: author,
     })))
     .expect("send hello");
+    conn.send_datagram(Bytes::from(encode_stream_frame(&GatewayMsg::Lease {
+        message: orrery_protocol::LeaseMsg::Claim {
+            claim_id: orrery_protocol::ClaimId(1),
+            entity: PersistId::new(77),
+            grid: GridId::ROOT,
+            cell: CellId::ROOT,
+            kind: orrery_protocol::ClaimKind::Strong,
+            basis: orrery_protocol::ClaimBasis::Explicit,
+            observed: Default::default(),
+            tick: Tick::new(11),
+        },
+    })))
+    .expect("send lease claim");
+    let (lease_id, authority_seq) = loop {
+        let packet = tokio::time::timeout(Duration::from_secs(5), conn.read_datagram())
+            .await
+            .expect("claim reply timeout")
+            .expect("claim reply");
+        let Some(GatewayReply::Lease {
+            message: orrery_protocol::LeaseMsg::Grant { lease_id, seq, .. },
+        }) = decode_stream_frame(&packet)
+        else {
+            continue;
+        };
+        break (lease_id, seq);
+    };
     conn.send_datagram(Bytes::from(encode_datagram(&GatewayMsg::Diff {
         diff: DiffUplink {
             cell: CellId::ROOT,
@@ -418,8 +620,8 @@ async fn primary_ack_is_mirrored_to_the_passive_follower_journal() {
             kind: RecordKind::Spawn,
             payload: Bytes::from_static(b"process-chain"),
             seq: 1,
-            lease_id: None,
-            authority_seq: None,
+            lease_id: Some(lease_id),
+            authority_seq: Some(authority_seq),
         },
     })))
     .expect("send diff");
@@ -460,10 +662,22 @@ async fn primary_ack_is_mirrored_to_the_passive_follower_journal() {
         .scan_from(orrery_protocol::Lsn::new(0, 0))
         .map(|item| item.expect("valid mirrored record").record)
         .collect::<Vec<_>>();
-    assert!(records.iter().any(|record| {
-        record.entity == PersistId::new(77)
-            && record.tick == Tick::new(11)
-            && record.payload.as_ref() == b"process-chain"
-    }));
+    assert!(
+        records.iter().any(|record| {
+            record.entity == PersistId::new(77)
+                && record.tick == Tick::new(11)
+                && record.payload.as_ref() == b"process-chain"
+        }),
+        "follower records: {:?}",
+        records
+            .iter()
+            .map(|record| (
+                record.lsn,
+                record.entity,
+                record.tick,
+                record.payload.clone()
+            ))
+            .collect::<Vec<_>>()
+    );
     journal.close().await.expect("close inspected journal");
 }
