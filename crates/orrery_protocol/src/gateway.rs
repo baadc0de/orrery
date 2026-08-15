@@ -24,7 +24,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    CellId, GridId, Intent, IntentOutcome, Lease, LeaseId, LeaseMsg, Lsn, NodeId, PersistId,
+    CellId, Epoch, GridId, Intent, IntentOutcome, Lease, LeaseId, LeaseMsg, Lsn, NodeId, PersistId,
     SeqPair, Tick,
 };
 
@@ -43,6 +43,17 @@ pub enum GatewayMsg {
     Lease {
         /// Authority control message for the registrar.
         message: LeaseMsg,
+    },
+    /// Present the coordinator's signed grant for this peer's active interest
+    /// (D7 §5).
+    ///
+    /// The peer forwards bytes it cannot forge: the gateway verifies the
+    /// coordinator's signature and that the grant names this peer. This is the
+    /// same handout shape as the identity token in [`GatewayMsg::Hello`] —
+    /// carried by the peer, authored by someone else.
+    InterestGrant {
+        /// A postcard-encoded `InterestGrantV1`.
+        grant: Vec<u8>,
     },
     /// Bulk uplink: one change-detection diff for an entity (D11 §2.1).
     Diff {
@@ -79,6 +90,18 @@ pub enum GatewayReply {
     Lease {
         /// Authority control reply from the registrar.
         message: LeaseMsg,
+    },
+    /// Outcome of presenting a coordinator interest grant.
+    ///
+    /// A peer needs this: without it, a rejected grant is indistinguishable
+    /// from a working one until claims start failing as `NotEligible` for no
+    /// visible reason.
+    InterestAck {
+        /// The coordinator epoch now in force for this peer, when accepted.
+        epoch: Option<Epoch>,
+        /// Why the grant was refused, as a stable numeric code. `0` on
+        /// acceptance. See `INTEREST_ACK_*`.
+        reason: u8,
     },
     /// A bulk diff was durably journaled at `lsn` (D11 §2.1).
     ///
@@ -170,6 +193,23 @@ pub struct DiffUplink {
     #[serde(default)]
     pub authority_seq: Option<SeqPair>,
 }
+
+/// [`GatewayReply::InterestAck`] reason: the grant was accepted.
+pub const INTEREST_ACK_OK: u8 = 0;
+/// [`GatewayReply::InterestAck`] reason: oversized, undecodable, or a version
+/// this build does not accept.
+pub const INTEREST_ACK_MALFORMED: u8 = 1;
+/// [`GatewayReply::InterestAck`] reason: no configured coordinator key carries
+/// the claimed identifier, or the signature did not verify under it.
+pub const INTEREST_ACK_UNTRUSTED: u8 = 2;
+/// [`GatewayReply::InterestAck`] reason: the grant authorizes a different peer.
+pub const INTEREST_ACK_WRONG_PEER: u8 = 3;
+/// [`GatewayReply::InterestAck`] reason: unusable coverage or lifetime.
+pub const INTEREST_ACK_BOUNDS: u8 = 4;
+/// [`GatewayReply::InterestAck`] reason: an epoch this gateway has moved past.
+pub const INTEREST_ACK_SUPERSEDED: u8 = 5;
+/// [`GatewayReply::InterestAck`] reason: this gateway accepts no grants.
+pub const INTEREST_ACK_UNSUPPORTED: u8 = 6;
 
 /// [`GatewayReply::AreaLoadError`] kind: the live read failed (the owning
 /// actor is gone — e.g. it crashed between the liveness check and the read).

@@ -14,7 +14,7 @@ use crate::area::{drive_area_loader, sync_aoi_to_loader, AreaLoader};
 use crate::config::PersistClientConfig;
 use crate::feed::{feed_uplink, UplinkSeq};
 use crate::gateway::{
-    connect_gateway, disconnect_gateway, flush_lease_control, hello_gateway,
+    connect_gateway, disconnect_gateway, flush_interest_grant, flush_lease_control, hello_gateway,
     sync_authority_identity, GatewaySession,
 };
 use crate::intents::{drain_intents, IntentQueue};
@@ -71,6 +71,10 @@ impl Plugin for OrreryPersistClientPlugin {
                     connect_gateway,
                     hello_gateway,
                     sync_authority_identity,
+                    // Interest before lease control: a claim sent in the same
+                    // frame as a fresh session's grant would otherwise be
+                    // judged against interest the gateway has not seen yet.
+                    flush_interest_grant,
                     flush_lease_control,
                     disconnect_gateway,
                 ),

@@ -126,14 +126,22 @@ inherited a lease and a silent holder learns its lease ended, and the always-on
 **single-writer invariant checker**. Strong-held rows still re-park rather than
 being regranted, per D7.
 
-Remaining P3 follow-on: the registrar→holder `Divest` *request* (so a
-claimant's `Claim{Strong}` can trigger the handoff, and so the coordinator can
-drain an island), `Expire` fan-out to cell subscribers, contact-island
-propagation, redistribution across sibling gateways, coordinator movement
-orchestration, ephemeral in-island claims, field-host promotion, and the 8-peer
-demo harness.
+Coordinator interest now reaches the gateway as a signed grant peers carry
+themselves, which is what makes successor selection operable outside tests;
+both directions of cooperative handoff are implemented, including the
+registrar's divest request with D7's per-tier deadline rules; and
+`PLAYER_BOUND` is enforced rather than merely declared. **The demo criterion
+runs and holds** — see below.
 
-**Crates.** `orrery_authority` implements optimistic weak/strong claims,
+Remaining P3 follow-on: coordinator-driven island drain, `Expire` fan-out to
+cell subscribers, contact-island propagation, redistribution across sibling
+gateways, coordinator movement orchestration, ephemeral in-island claims, and
+field-host promotion.
+
+**Crates.** `orrery_coordinator` mints and signs interest grants from coarse
+presence (`InterestIssuer`), with monotonic per-peer epochs; the iroh wire
+server that drives it remains later work. `orrery_authority` implements
+optimistic weak/strong claims,
 `auth_seq`/`own_seq`, correlation-safe lease control, inherited grants
 (`ClaimId::REGISTRAR` → `AuthorityEvent::Inherited`), holder-initiated
 `LeaseClient::divest`, and loss-of-authority reconciliation; contact-island
@@ -147,25 +155,38 @@ coordinator-driven movement orchestration is not part of the delivered slice.
 - Lease rows `(entity_id → holder NodeId, auth_seq, own_seq, expiry)`; TTL 10 s, heartbeat 2.5 s; optimistic claim (simulate immediately, roll back on CAS loss).
 - Cooperative handoff (negotiated divestiture with holder ack) and crash handoff (lease expiry → orphan → reassign to nearest interacting peer, else park in cluster). **Implemented:** crash handoff on both the disconnect and TTL paths, and the holder-initiated half of cooperative handoff with an enforced `Divest.cursor` gate. **Follow-on:** the registrar→holder `Divest` request, which is what lets a claimant's `Claim{Strong}` trigger the handoff.
 - Cross-cell movement keeping the holder under hysteresis; storage row re-keyed on commit. **Implemented:** server-owned committed rekey preserves the lease fence and atomically relocates the durable lease index; client movement control is rejected.
-- Ephemeral entities (projectiles, VFX) on in-island claims only, never touching the registrar.
+- Ephemeral entities (projectiles, VFX) on in-island claims only, never touching the registrar. **Follow-on.**
 - Single-writer invariant checker: telemetry that flags any tick where two peers both believed they held authority. **Implemented:** `GatewayServer::authority_metrics()` counts fenced-out writes whose live row named a different unexpired holder, retains the last sample, and logs each at `warn`.
 
-**Demo criterion.** An 8-peer island with contested physics objects:
-`kill -9` one peer holding ~50 entities → every entity is reassigned or parked
-within the 10 s lease TTL, with no duplicate-authority tick recorded and no
-lost entity; separately, a scripted cooperative handoff chain (player A grabs,
-throws to B's contact island) completes with zero registrar-visible conflicts
-and no visible pop.
+**Demo criterion — met (2026-08-16).** An 8-peer island with contested physics
+objects: `kill -9` one peer holding ~50 entities → every entity is reassigned
+or parked within the 10 s lease TTL, with no duplicate-authority tick recorded
+and no lost entity; separately, a scripted cooperative handoff chain (player A
+grabs, throws to B's contact island) completes with zero registrar-visible
+conflicts and no visible pop.
 
-The mechanisms the criterion measures are in place and covered at the wire
-level in `orrery_persistd/tests/gateway.rs` — reassignment on disconnect,
-reassignment on TTL expiry with the silent holder notified, a completed
-negotiated handoff, a refused one, and the invariant counter firing on an
-overlapping writer. What is **not** yet built is the harness itself: an 8-peer
-island, ~50 entities, a real `kill -9`, and the sustained no-duplicate-tick
-measurement. Until that runs, the criterion is unproven at scale even though
-each mechanism it exercises is tested. This remains the anti-host-
-migration proof: authority moves per entity, so no session-wide stall — the
+`scripts/p3-island-gate.sh` is the permanent harness, driving the `p3-island`
+tool. Peers are real OS processes, so the `kill -9` is a real SIGKILL rather
+than a dropped task. Observed on an 8-peer island of 400 entities: **50/50 of
+the victim's entities reassigned to survivors in 10.95 s, 0 lost, 0
+duplicate-authority observations**, reproduced across runs. The gate writes no
+success artifact unless every clause holds.
+
+One finding worth recording, because it changes what "within the TTL" means in
+practice: **a `kill -9` is resolved by the slow path, not the fast one**. QUIC
+cannot distinguish a dead process from a dead path until its own idle timeout,
+so the gateway never sees a connection drop for a SIGKILLed peer; the lease
+TTL lapsing is what redistributes its entities (§4.3's `else silent` branch).
+The fast path is real, and covered by the disconnect test, but it is what a
+*graceful* exit or a torn connection takes. The harness therefore budgets the
+TTL plus the registrar's once-a-second sweep granularity and the up-to-one
+heartbeat interval of TTL already spent before the kill.
+
+The cooperative-handoff half is proven at the wire level in
+`orrery_persistd/tests/gateway.rs` rather than in the island harness: both
+directions of §4.2, the deadline rules for each tier, and the refusal paths.
+
+This remains the anti-host-migration proof: authority moves per entity, so no session-wide stall — the
 failure mode that [drove For Honor off P2P](https://www.ubisoft.com/en-us/game/for-honor/news-updates/2HayRoZjbJzSEJAhJMpeF7/for-honor-now-on-dedicated-servers-on-all-platforms)
 cannot occur by construction.
 

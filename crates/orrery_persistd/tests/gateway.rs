@@ -141,6 +141,7 @@ impl Router for BlockingClaimRouter {
             lease_id: self.lease_id,
             expires_at: u64::MAX,
             flags: LeaseFlags::default(),
+            bound_to: None,
         };
         *self.live.lock().await = Some(lease.clone());
         Ok(ClaimResult::Granted(lease))
@@ -187,6 +188,7 @@ impl Router for BlockingClaimRouter {
             lease_id,
             expires_at: 0,
             flags: LeaseFlags::default(),
+            bound_to: None,
         }))
     }
 
@@ -234,6 +236,7 @@ impl BlockingHeartbeatRouter {
             lease_id: self.lease_id,
             expires_at: u64::MAX,
             flags: LeaseFlags::default(),
+            bound_to: None,
         }
     }
 }
@@ -3345,6 +3348,564 @@ fn single_writer_invariant_checker_flags_a_fenced_out_second_writer() {
         assert_eq!(sample.rejected_writer, node(1));
         assert_eq!(sample.current_holder, node(2));
         assert_eq!(sample.rejected_lease_id, first_lease_id);
+
+        fixture.server.shutdown().await;
+    });
+}
+
+/// Present a coordinator-signed interest grant and return the gateway's answer.
+async fn present_grant(
+    connection: &iroh::endpoint::Connection,
+    grant: Vec<u8>,
+) -> (Option<Epoch>, u8) {
+    connection
+        .send_datagram(Bytes::from(encode_stream_frame(
+            &GatewayMsg::InterestGrant { grant },
+        )))
+        .unwrap();
+    loop {
+        let packet = tokio::time::timeout(Duration::from_secs(5), connection.read_datagram())
+            .await
+            .unwrap()
+            .unwrap();
+        if let Some(GatewayReply::InterestAck { epoch, reason }) = decode_stream_frame(&packet) {
+            return (epoch, reason);
+        }
+    }
+}
+
+fn coordinator_grant(
+    coordinator: &iroh_base::SecretKey,
+    key_id: u32,
+    peer: orrery_protocol::NodeId,
+    epoch: u64,
+    cells: Vec<CellId>,
+) -> Vec<u8> {
+    orrery_protocol::InterestGrantV1::sign(
+        orrery_protocol::InterestGrantClaimsV1::new(
+            peer,
+            Epoch::new(epoch),
+            GridId::ROOT,
+            cells,
+            60_000,
+            orrery_protocol::IssuerKeyId::new(key_id),
+        ),
+        coordinator,
+    )
+    .expect("sign grant")
+    .encode()
+    .expect("encode grant")
+}
+
+#[test]
+fn a_peer_carrying_its_coordinator_grant_unlocks_claims_and_redistribution() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        // Given: a gateway that trusts a coordinator key but has been handed
+        // no snapshots out of band — the production posture, where interest
+        // arrives only because peers carry it.
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = Arc::new(Mutex::new({
+            let store: Arc<dyn orrery_persistd::checkpoint::CheckpointStore> =
+                Arc::new(orrery_persistd::checkpoint::MemCheckpointStore::new());
+            CellRuntime::open(&runtime_config(dir.path()), &store)
+                .await
+                .unwrap()
+        }));
+        let cell = CellId::ROOT.children()[0];
+        let entity = PersistId::new(880);
+        seed_entity(&runtime, entity, cell).await;
+
+        let issuer = secret(42);
+        let coordinator = secret(77);
+        let server = GatewayServer::spawn(
+            GatewayConfig {
+                interest_authority: Arc::new(orrery_persistd::CoordinatorHandoutAuthority::new([
+                    orrery_protocol::IssuerKey::new(
+                        orrery_protocol::IssuerKeyId::new(5),
+                        coordinator.public(),
+                    ),
+                ])),
+                authorizer: support::authorizer(&issuer),
+                identity_clock: support::fixed_clock(support::TOKEN_NOW_MS),
+                identity_health: support::available_identity_health(),
+                ..GatewayConfig::default()
+            },
+            runtime.clone(),
+        )
+        .await
+        .unwrap();
+
+        let mut endpoints = Vec::new();
+        let mut connections = Vec::new();
+        for seed in [1u8, 2] {
+            let (endpoint, connection) = raw_connection(secret(seed), server.addr()).await;
+            connection
+                .send_datagram(Bytes::from(encode_stream_frame(&GatewayMsg::Hello {
+                    token: session_token(
+                        &issuer,
+                        node(seed),
+                        support::TOKEN_ISSUED_AT_MS,
+                        support::TOKEN_TTL_MS,
+                    ),
+                    node: node(seed),
+                })))
+                .unwrap();
+            assert!(receives_hello_ack(&connection).await);
+            endpoints.push(endpoint);
+            connections.push(connection);
+        }
+        let successor = connections.pop().unwrap();
+        let holder = connections.pop().unwrap();
+
+        // Then: with no grant presented, a weak claim has no interest backing
+        // it and is refused.
+        assert!(matches!(
+            claim_reply(
+                &holder,
+                entity,
+                GridId::ROOT,
+                cell,
+                ClaimKind::Weak,
+                ClaimBasis::Contact { tick: Tick::new(1) },
+            )
+            .await,
+            LeaseMsg::Deny {
+                reason: orrery_protocol::DenyReason::NotEligible,
+                ..
+            }
+        ));
+
+        // When: a peer forges its own grant.
+        let forged = coordinator_grant(&secret(1), 5, node(1), 1, vec![cell]);
+        assert_eq!(
+            present_grant(&holder, forged).await,
+            (None, orrery_protocol::INTEREST_ACK_UNTRUSTED),
+            "self-declared interest is self-granted authority; it must not verify"
+        );
+
+        // When: both peers present genuine coordinator grants.
+        for (connection, seed) in [(&holder, 1u8), (&successor, 2u8)] {
+            assert_eq!(
+                present_grant(
+                    connection,
+                    coordinator_grant(&coordinator, 5, node(seed), 1, vec![cell])
+                )
+                .await,
+                (Some(Epoch::new(1)), orrery_protocol::INTEREST_ACK_OK)
+            );
+        }
+
+        // Then: the same claim now succeeds — interest is what gated it.
+        let granted = claim_reply(
+            &holder,
+            entity,
+            GridId::ROOT,
+            cell,
+            ClaimKind::Weak,
+            ClaimBasis::Contact { tick: Tick::new(2) },
+        )
+        .await;
+        let LeaseMsg::Grant { lease_id, .. } = granted else {
+            panic!("a grant-backed weak claim must be granted, got {granted:?}");
+        };
+
+        // And: redistribution now has a candidate, so a lost holder's lease
+        // moves instead of parking. This is the whole point of the transport:
+        // the mechanism was already built, and interest is what switches it on.
+        holder.close(0u32.into(), b"gone");
+        let inherited = pushed_lease(&successor, Duration::from_secs(5))
+            .await
+            .expect("the interested peer inherits the lease");
+        let LeaseMsg::Grant {
+            claim_id,
+            lease_id: successor_lease_id,
+            prev_holder,
+            ..
+        } = inherited
+        else {
+            panic!("successor must receive a grant, got {inherited:?}");
+        };
+        assert_eq!(claim_id, orrery_protocol::ClaimId::REGISTRAR);
+        assert!(successor_lease_id > lease_id);
+        assert_eq!(prev_holder, Some(node(1)));
+        assert_eq!(server.authority_metrics().snapshot().reassigned, 1);
+
+        server.shutdown().await;
+    });
+}
+
+#[test]
+fn an_interest_grant_is_refused_with_a_reason_the_peer_can_act_on() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        // Given: a gateway trusting one coordinator key.
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = Arc::new(Mutex::new({
+            let store: Arc<dyn orrery_persistd::checkpoint::CheckpointStore> =
+                Arc::new(orrery_persistd::checkpoint::MemCheckpointStore::new());
+            CellRuntime::open(&runtime_config(dir.path()), &store)
+                .await
+                .unwrap()
+        }));
+        let issuer = secret(42);
+        let coordinator = secret(77);
+        let server = GatewayServer::spawn(
+            GatewayConfig {
+                interest_authority: Arc::new(orrery_persistd::CoordinatorHandoutAuthority::new([
+                    orrery_protocol::IssuerKey::new(
+                        orrery_protocol::IssuerKeyId::new(5),
+                        coordinator.public(),
+                    ),
+                ])),
+                authorizer: support::authorizer(&issuer),
+                identity_clock: support::fixed_clock(support::TOKEN_NOW_MS),
+                identity_health: support::available_identity_health(),
+                ..GatewayConfig::default()
+            },
+            runtime.clone(),
+        )
+        .await
+        .unwrap();
+        let (_client, connection) = raw_connection(secret(1), server.addr()).await;
+        connection
+            .send_datagram(Bytes::from(encode_stream_frame(&GatewayMsg::Hello {
+                token: session_token(
+                    &issuer,
+                    node(1),
+                    support::TOKEN_ISSUED_AT_MS,
+                    support::TOKEN_TTL_MS,
+                ),
+                node: node(1),
+            })))
+            .unwrap();
+        assert!(receives_hello_ack(&connection).await);
+        let cell = CellId::ROOT.children()[0];
+
+        // Every refusal is distinguishable, so a misconfiguration is
+        // diagnosable instead of surfacing later as unexplained claim denials.
+        assert_eq!(
+            present_grant(&connection, b"not a grant".to_vec()).await,
+            (None, orrery_protocol::INTEREST_ACK_MALFORMED)
+        );
+        assert_eq!(
+            present_grant(
+                &connection,
+                coordinator_grant(&coordinator, 99, node(1), 1, vec![cell])
+            )
+            .await,
+            (None, orrery_protocol::INTEREST_ACK_UNTRUSTED),
+            "an unknown key id is a rotation gap, not a bad signature"
+        );
+        assert_eq!(
+            present_grant(
+                &connection,
+                coordinator_grant(&coordinator, 5, node(2), 1, vec![cell])
+            )
+            .await,
+            (None, orrery_protocol::INTEREST_ACK_WRONG_PEER),
+            "relaying someone else's genuine grant must not work"
+        );
+        assert_eq!(
+            present_grant(
+                &connection,
+                coordinator_grant(&coordinator, 5, node(1), 1, Vec::new())
+            )
+            .await,
+            (None, orrery_protocol::INTEREST_ACK_BOUNDS)
+        );
+
+        // A newer epoch lands; replaying the older one is then refused.
+        assert_eq!(
+            present_grant(
+                &connection,
+                coordinator_grant(&coordinator, 5, node(1), 9, vec![cell])
+            )
+            .await,
+            (Some(Epoch::new(9)), orrery_protocol::INTEREST_ACK_OK)
+        );
+        assert_eq!(
+            present_grant(
+                &connection,
+                coordinator_grant(&coordinator, 5, node(1), 8, vec![cell, CellId::ROOT])
+            )
+            .await,
+            (None, orrery_protocol::INTEREST_ACK_SUPERSEDED)
+        );
+
+        server.shutdown().await;
+    });
+}
+
+/// Send a claim without waiting for its reply, so the caller can watch what
+/// the *other* peer is asked to do first.
+fn send_claim(
+    connection: &iroh::endpoint::Connection,
+    claim_id: orrery_protocol::ClaimId,
+    entity: PersistId,
+    cell: CellId,
+    kind: ClaimKind,
+) {
+    connection
+        .send_datagram(Bytes::from(encode_stream_frame(&GatewayMsg::Lease {
+            message: LeaseMsg::Claim {
+                claim_id,
+                entity,
+                grid: GridId::ROOT,
+                cell,
+                kind,
+                basis: ClaimBasis::Explicit,
+                observed: Default::default(),
+                tick: Tick::new(1),
+            },
+        })))
+        .unwrap();
+}
+
+#[test]
+fn a_strong_claim_asks_the_holder_to_divest_instead_of_refusing_the_claimant() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        // Given: one peer holds the entity and another grabs it — "B grabs an
+        // object A is holding", the half of §4.2 a claimant drives.
+        let fixture = handoff_fixture(GatewayConfig::default()).await;
+        let (lease_id, seq) = claim_for_holder(&fixture).await;
+        let GatewayReply::BulkAck { lsn: cursor, .. } =
+            diff_reply(&fixture.holder, holder_diff(&fixture, lease_id, seq, 5)).await
+        else {
+            panic!("the holder's own fenced write must be acked");
+        };
+
+        // When: the claimant sends its explicit strong claim.
+        let claim_id = orrery_protocol::ClaimId(42);
+        send_claim(
+            &fixture.successor,
+            claim_id,
+            fixture.entity,
+            fixture.cell,
+            ClaimKind::Strong,
+        );
+
+        // Then: the registrar asks the holder rather than answering the
+        // claimant, naming the claimant as the successor to hand it to.
+        let asked = pushed_lease(&fixture.holder, Duration::from_secs(5))
+            .await
+            .expect("the holder is asked to divest");
+        assert_eq!(
+            asked,
+            LeaseMsg::Divest {
+                entity: fixture.entity,
+                lease_id,
+                to: Some(node(2)),
+                final_seq: SeqPair::default(),
+                cursor: None,
+            }
+        );
+        assert_eq!(
+            fixture
+                .server
+                .authority_metrics()
+                .snapshot()
+                .divest_requested,
+            1
+        );
+
+        // When: the holder consents.
+        fixture
+            .holder
+            .send_datagram(Bytes::from(encode_stream_frame(&GatewayMsg::Lease {
+                message: LeaseMsg::Divest {
+                    entity: fixture.entity,
+                    lease_id,
+                    to: Some(node(2)),
+                    final_seq: seq,
+                    cursor: Some(cursor),
+                },
+            })))
+            .unwrap();
+
+        // Then: the claimant's *own* claim is what gets answered — its pending
+        // correlation resolves rather than looking like an unsolicited grant.
+        let granted = pushed_lease(&fixture.successor, Duration::from_secs(5))
+            .await
+            .expect("the claimant receives its grant");
+        let LeaseMsg::Grant {
+            claim_id: answered,
+            lease_id: claimant_lease_id,
+            prev_holder,
+            ..
+        } = granted
+        else {
+            panic!("claimant must receive a grant, got {granted:?}");
+        };
+        assert_eq!(answered, claim_id);
+        assert!(claimant_lease_id > lease_id);
+        assert_eq!(prev_holder, Some(node(1)));
+
+        // And: the old holder's token is dead.
+        assert!(matches!(
+            diff_reply(&fixture.holder, holder_diff(&fixture, lease_id, seq, 6)).await,
+            GatewayReply::BulkNack { .. }
+        ));
+
+        fixture.server.shutdown().await;
+    });
+}
+
+#[test]
+fn an_unanswered_request_takes_weak_authority_but_never_strong_ownership() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        // Given: a deadline short enough to observe, and a holder that will
+        // simply not answer.
+        let fixture = handoff_fixture(GatewayConfig {
+            handoff_deadline_ms: 120,
+            ..GatewayConfig::default()
+        })
+        .await;
+        let (weak_lease_id, _) = claim_for_holder(&fixture).await;
+
+        // When: the claimant grabs it and the holder stays silent.
+        send_claim(
+            &fixture.successor,
+            orrery_protocol::ClaimId(7),
+            fixture.entity,
+            fixture.cell,
+            ClaimKind::Strong,
+        );
+        assert!(matches!(
+            pushed_lease(&fixture.holder, Duration::from_secs(5)).await,
+            Some(LeaseMsg::Divest { .. })
+        ));
+
+        // Then: weak authority converts to unconditional divestiture past the
+        // deadline — an interaction must not stall on an unresponsive peer.
+        let granted = pushed_lease(&fixture.successor, Duration::from_secs(5))
+            .await
+            .expect("the claimant is granted after the deadline");
+        let LeaseMsg::Grant {
+            claim_id,
+            lease_id: taken,
+            ..
+        } = granted
+        else {
+            panic!("weak authority must be taken, got {granted:?}");
+        };
+        assert_eq!(claim_id, orrery_protocol::ClaimId(7));
+        assert!(taken > weak_lease_id);
+        let metrics = fixture.server.authority_metrics().snapshot();
+        assert_eq!(metrics.handoff_timed_out, 1);
+        assert_eq!(metrics.reassigned, 1);
+
+        // The dispossessed holder is told, so it stops writing without
+        // consulting its own clock.
+        let told = pushed_lease(&fixture.holder, Duration::from_secs(5))
+            .await
+            .expect("the silent holder is told its lease ended");
+        assert!(matches!(
+            told,
+            LeaseMsg::Expire {
+                disposition: orrery_protocol::ExpireDisposition::Reassigned { to },
+                ..
+            } if to == node(2)
+        ));
+
+        // When: the new holder now owns it *strongly* and a third claim
+        // arrives that it also ignores.
+        send_claim(
+            &fixture.holder,
+            orrery_protocol::ClaimId(8),
+            fixture.entity,
+            fixture.cell,
+            ClaimKind::Strong,
+        );
+        assert!(matches!(
+            pushed_lease(&fixture.successor, Duration::from_secs(5)).await,
+            Some(LeaseMsg::Divest { .. })
+        ));
+
+        // Then: nothing is taken. Only expiry breaks strong ownership; a
+        // missed deadline is not a theft licence.
+        let refused = pushed_lease(&fixture.holder, Duration::from_secs(5))
+            .await
+            .expect("the claimant gets a definitive refusal");
+        assert_eq!(
+            refused,
+            LeaseMsg::Deny {
+                claim_id: Some(orrery_protocol::ClaimId(8)),
+                entity: fixture.entity,
+                reason: orrery_protocol::DenyReason::StrongHeld,
+                retry_after_ms: 0,
+            }
+        );
+
+        fixture.server.shutdown().await;
+    });
+}
+
+#[test]
+fn a_holder_that_parks_instead_of_handing_over_still_answers_the_claimant() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        // Given: a claimant waiting on a request the holder will refuse by
+        // releasing the entity rather than handing it over.
+        let fixture = handoff_fixture(GatewayConfig::default()).await;
+        let (lease_id, seq) = claim_for_holder(&fixture).await;
+        send_claim(
+            &fixture.successor,
+            orrery_protocol::ClaimId(11),
+            fixture.entity,
+            fixture.cell,
+            ClaimKind::Strong,
+        );
+        assert!(matches!(
+            pushed_lease(&fixture.holder, Duration::from_secs(5)).await,
+            Some(LeaseMsg::Divest { .. })
+        ));
+
+        // When: the holder releases it to nobody.
+        fixture
+            .holder
+            .send_datagram(Bytes::from(encode_stream_frame(&GatewayMsg::Lease {
+                message: LeaseMsg::Divest {
+                    entity: fixture.entity,
+                    lease_id,
+                    to: None,
+                    final_seq: seq,
+                    cursor: None,
+                },
+            })))
+            .unwrap();
+
+        // Then: the claimant is told, rather than waiting out a deadline for a
+        // request that has already been resolved.
+        let answered = pushed_lease(&fixture.successor, Duration::from_secs(5))
+            .await
+            .expect("the claimant is answered");
+        assert_eq!(
+            answered,
+            LeaseMsg::Deny {
+                claim_id: Some(orrery_protocol::ClaimId(11)),
+                entity: fixture.entity,
+                reason: orrery_protocol::DenyReason::NotEligible,
+                retry_after_ms: 0,
+            }
+        );
+
+        // And: the entity parked, so the claimant's retry can unpark it.
+        let parked = claim_reply(
+            &fixture.successor,
+            fixture.entity,
+            GridId::ROOT,
+            fixture.cell,
+            ClaimKind::Strong,
+            ClaimBasis::Explicit,
+        )
+        .await;
+        assert!(
+            matches!(parked, LeaseMsg::Grant { .. }),
+            "a parked entity is claimable by anyone, got {parked:?}"
+        );
 
         fixture.server.shutdown().await;
     });

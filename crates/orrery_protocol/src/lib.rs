@@ -32,10 +32,15 @@ pub use cell::{
     DEFAULT_CELL_EDGE_M, INTEREST_LEVEL, SHARD_LEVEL,
 };
 pub use coord::{
-    CoordMsg, CoordinatorInterestSnapshot, IslandId, IslandManifest, PeerEntry, TopologyRegime,
+    verify_interest_grant, CoordMsg, CoordinatorInterestSnapshot, InterestGrantClaimsV1,
+    InterestGrantV1, InterestGrantVerificationError, IslandId, IslandManifest, PeerEntry,
+    TopologyRegime, INTEREST_GRANT_V1_DOMAIN, INTEREST_GRANT_V1_VERSION, MAX_INTEREST_GRANT_BYTES,
+    MAX_INTEREST_GRANT_CELLS, MAX_INTEREST_GRANT_TTL_MS,
 };
 pub use gateway::{
     AreaPage, DiffUplink, GatewayMsg, GatewayReply, AREA_LOAD_ERR_COLD, AREA_LOAD_ERR_LIVE,
+    INTEREST_ACK_BOUNDS, INTEREST_ACK_MALFORMED, INTEREST_ACK_OK, INTEREST_ACK_SUPERSEDED,
+    INTEREST_ACK_UNSUPPORTED, INTEREST_ACK_UNTRUSTED, INTEREST_ACK_WRONG_PEER,
     MAX_AREA_PAGE_FRAME_BYTES,
 };
 pub use grid::GridId;

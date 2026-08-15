@@ -18,7 +18,7 @@ use bevy_platform::time::Instant;
 use bytes::Bytes;
 
 use aeronet_iroh::iroh;
-use orrery_authority::{AuthorityState, LeaseOutbox};
+use orrery_authority::{AuthorityState, InterestGrant, LeaseOutbox};
 use orrery_net::channels::{tag, Channel};
 use orrery_protocol::{GatewayMsg, GatewayReply, NodeId, PROTOCOL_VERSION};
 
@@ -288,6 +288,47 @@ pub fn flush_lease_control(
                 message,
             }));
     }
+}
+
+/// Present this peer's coordinator interest grant once per session.
+///
+/// A gateway holds no interest for a peer that has just connected, so the
+/// grant is re-presented after every reconnect rather than only when the
+/// coordinator issues a new one.
+pub fn flush_interest_grant(
+    interest: Option<ResMut<InterestGrant>>,
+    session: Res<GatewaySession>,
+    mut sessions: Query<&mut aeronet_io::Session>,
+) {
+    let Some(mut interest) = interest else {
+        return;
+    };
+    if !session.is_connected() {
+        // A fresh session will need the grant again; nothing is presented
+        // until the connection is back up.
+        if interest.is_accepted() {
+            interest.resend();
+        }
+        return;
+    }
+    if !interest.pending {
+        return;
+    }
+    let Some(entity) = session.session else {
+        return;
+    };
+    let Ok(mut io) = sessions.get_mut(entity) else {
+        return;
+    };
+    let Some(grant) = interest.grant.clone() else {
+        interest.pending = false;
+        return;
+    };
+    io.send
+        .push(GatewaySession::encode_stream(&GatewayMsg::InterestGrant {
+            grant,
+        }));
+    // Cleared on the ack, not here: a dropped datagram must be re-presented.
 }
 
 /// Mirror the iroh-authenticated local identity into optional authority state.

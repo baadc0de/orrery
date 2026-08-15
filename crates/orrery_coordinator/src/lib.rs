@@ -15,6 +15,8 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod interest;
 pub mod registry;
 
+pub use interest::InterestIssuer;
 pub use registry::{CoordinatorConfig, IslandRegistry};

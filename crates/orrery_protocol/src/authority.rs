@@ -69,7 +69,9 @@ impl ClaimId {
 pub struct LeaseFlags(pub u8);
 
 impl LeaseFlags {
-    /// Lease belongs permanently to a player character.
+    /// Lease belongs permanently to a player character. Such an entity is
+    /// never redistributed to a successor and never claimable by anyone but
+    /// the identity in [`Lease::bound_to`].
     pub const PLAYER_BOUND: Self = Self(1 << 0);
     /// Lease currently represents non-stealable strong ownership.
     pub const STRONG_HELD: Self = Self(1 << 1);
@@ -109,6 +111,13 @@ pub struct Lease {
     pub expires_at: u64,
     /// Lease state flags.
     pub flags: LeaseFlags,
+    /// The identity a [`LeaseFlags::PLAYER_BOUND`] entity belongs to.
+    ///
+    /// A player's character parks when they disconnect and is *exclusively*
+    /// reclaimable by them (D7 §4.3), so the binding has to outlive `holder`,
+    /// which parking clears. `None` on every entity that is not player-bound.
+    #[serde(default)]
+    pub bound_to: Option<NodeId>,
 }
 
 /// Requested authority tier.

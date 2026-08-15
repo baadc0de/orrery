@@ -101,6 +101,25 @@ pub enum AuthorityEvent {
         /// Registrar reason for refusing the claim.
         reason: DenyReason,
     },
+    /// The registrar is asking this peer to give an entity up, because
+    /// another peer explicitly claimed it (D7 §4.2).
+    ///
+    /// Nothing happens automatically: game code decides whether to consent,
+    /// by calling [`LeaseClient::divest`] with the named successor. Ignoring
+    /// the request is a legitimate answer — past the registrar's deadline,
+    /// *weak* authority is taken anyway, so an interaction never stalls on an
+    /// unresponsive peer, while *strong* ownership is kept, because stealing
+    /// by timeout is what "not stealable" forbids. The "ask to trade" UX lives
+    /// above this protocol, which is why the decision is surfaced rather than
+    /// taken here.
+    DivestRequested {
+        /// ECS entity the registrar is asking about.
+        entity: Entity,
+        /// The fencing token this peer currently holds for it.
+        lease_id: LeaseId,
+        /// The peer that claimed it, and the successor to name when consenting.
+        to: Option<NodeId>,
+    },
     /// A grant expired or was revoked.
     Lost {
         /// ECS entity that lost local authority.
@@ -113,6 +132,52 @@ pub enum AuthorityEvent {
 /// Queued lease control messages for the gateway adapter.
 #[derive(Debug, Default, Resource)]
 pub struct LeaseOutbox(pub Vec<LeaseMsg>);
+
+/// This peer's coordinator interest grant, and what the gateway made of it.
+///
+/// Interest is what authorizes weak claims and makes this peer eligible to
+/// inherit a lease, and only the coordinator can assert it. The peer is
+/// merely the courier: it holds opaque signed bytes, presents them, and reads
+/// back whether they were accepted.
+///
+/// Put the coordinator's handout in `grant` and the gateway adapter presents
+/// it on the next connected frame, re-presenting it after a reconnect — a new
+/// session starts with no interest on file.
+#[derive(Debug, Default, Resource)]
+pub struct InterestGrant {
+    /// The coordinator-signed grant to present, if one has been received.
+    pub grant: Option<Vec<u8>>,
+    /// The coordinator epoch the gateway currently holds for this peer.
+    ///
+    /// `None` before the first acceptance, and after a refusal — a peer with
+    /// no epoch on file should expect its weak claims to be refused.
+    pub accepted_epoch: Option<orrery_protocol::Epoch>,
+    /// The reason code from the most recent reply, `INTEREST_ACK_OK` when the
+    /// grant was accepted.
+    pub last_reason: u8,
+    /// Whether `grant` still needs presenting on the current session.
+    pub pending: bool,
+}
+
+impl InterestGrant {
+    /// Install a freshly received coordinator grant, to be presented next.
+    pub fn set(&mut self, grant: Vec<u8>) {
+        self.grant = Some(grant);
+        self.pending = true;
+    }
+
+    /// Mark the held grant as needing presentation again, after a reconnect.
+    pub fn resend(&mut self) {
+        self.accepted_epoch = None;
+        self.pending = self.grant.is_some();
+    }
+
+    /// Whether the gateway currently believes this peer's interest.
+    #[must_use]
+    pub fn is_accepted(&self) -> bool {
+        self.accepted_epoch.is_some()
+    }
+}
 
 /// Lease replies delivered by the gateway adapter.
 #[derive(Debug, Default, Resource)]
@@ -417,6 +482,26 @@ pub fn process_lease_replies(
                     });
                 }
             }
+            LeaseMsg::Divest {
+                entity,
+                lease_id,
+                to,
+                ..
+            } => {
+                // Only a request naming the fence this peer actually holds is
+                // surfaced; a late one for a superseded token is noise.
+                let Some(local) = state.leases.get(&entity) else {
+                    continue;
+                };
+                if local.lease_id != lease_id {
+                    continue;
+                }
+                events.write(AuthorityEvent::DivestRequested {
+                    entity: local.entity,
+                    lease_id,
+                    to,
+                });
+            }
             LeaseMsg::HeartbeatAck { leases, invalid } => {
                 // An explicit failed heartbeat wins over any row carried for
                 // status. This drops the local fence immediately instead of
@@ -538,6 +623,7 @@ pub struct OrreryAuthorityPlugin;
 impl Plugin for OrreryAuthorityPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<AuthorityState>()
+            .init_resource::<InterestGrant>()
             .init_resource::<LeaseInbox>()
             .init_resource::<LeaseOutbox>()
             .add_message::<AuthorityEvent>()
@@ -1300,6 +1386,7 @@ mod tests {
                     // Deliberately unrelated gateway-process monotonic time.
                     expires_at: 4,
                     flags: LeaseFlags::default(),
+                    bound_to: None,
                 }],
                 invalid: Vec::new(),
             });

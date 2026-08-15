@@ -16,6 +16,7 @@ Cargo.lock
 p2-kill9-*/
 p2-abba-*/
 p2-gateway-*/
+p3-island-*/
 
 # Device-local agent memory (never committed — lives only on this machine)
 .agents/memory/
