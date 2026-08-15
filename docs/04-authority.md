@@ -22,8 +22,15 @@ Normative source: [ADR-0007](adr/0007-authority-and-leases.md) (boundaries with 
 > uplink-completeness gate. The single-writer invariant checker is always on and
 > counts fenced-out writes that overlapped a different live holder.
 >
-> Still deferred: the registrar→holder `Divest` *request* (coordinator-driven
-> drain and the claimant-triggered half of §4.2), `Expire` fan-out to cell
+> Both halves of §4.2 are now implemented: a holder may divest on its own
+> initiative, and a `Claim{Strong}` against a live holder makes the registrar
+> *ask* that holder rather than refusing the claimant, with D7's per-tier
+> deadline rules. Coordinator interest reaches the gateway as a signed grant
+> the peer itself carries (§2.1), which is what makes successor selection
+> operable outside tests. `PLAYER_BOUND` is enforced: a character parks and is
+> reclaimable only by the identity in `Lease::bound_to`.
+>
+> Still deferred: coordinator-driven island drain, `Expire` fan-out to cell
 > subscribers, contact-island propagation, redistribution across sibling
 > gateways, and field-host promotion. The design flows below describe those
 > future capabilities as well.
@@ -78,6 +85,7 @@ The registrar is a facet of `orrery_persistd`, not a separate service. A lease r
 - **Acquire** = CAS on `(holder, seq, lease_id)`: the actor checks eligibility (INV-5, plausibility gate §10, expiry), bumps the relevant sequence, increments `lease_id`, sets `expires_at = now + TTL`, and emits `Grant`. Losing concurrent claimants get `Deny`. TTL is **10 s**, heartbeat every **2.5 s** (four missed heartbeats = expiry).
 - **Durability**: acquire/transfer/park/expire write through to FDB; heartbeats renew only the in-memory row. On actor failover, leases are rebuilt from FDB with a *full fresh TTL* — conservative in the safe direction (an extra ≤10 s of orphan latency, never two writers).
 - **Fencing**: the gateway tracks the `lease_id`s a peer holds; a diff carrying a stale `lease_id` is dropped and answered with a lease-specific `BulkNack` containing the current row. This closes the classic zombie-holder race without trusting peer clocks.
+- **Interest handout**: a gateway will not take a peer's word for what it is interested in — interest gates weak claims and successor candidacy, so self-declared interest would be self-granted authority. The coordinator signs an `InterestGrantV1` naming one peer, its cells and a *lifetime*; the peer carries it to whichever gateway it is talking to, exactly as it carries its identity token. Adding gateways therefore adds no coordinator fan-out, and a gateway needs only the coordinator's public key. The grant ships a duration rather than a deadline because the two processes have unrelated monotonic origins; the gateway stamps its own expiry on acceptance. Epochs are monotonic per peer, so replaying an older, wider grant after moving away is refused while re-presenting the current one is a refresh.
 - **Single-writer invariant checker**: a fenced-out write whose live row names a *different*, unexpired holder is the only externally observable form of "two peers both believed they were the writer". The gateway counts each one, retains the last sample (`entity`, `tick`, both node ids, both tokens) and logs it at `warn`. A healthy cluster holds this at zero; it is the phase's acceptance signal, not a debug aid.
 - **Clock discipline**: only the registrar's monotonic clock decides expiry. Holders track a conservative local estimate (`expires_at − one heartbeat interval`) and mark their lease *uncertain* past it (§11.1).
 

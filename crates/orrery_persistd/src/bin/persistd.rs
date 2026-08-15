@@ -128,6 +128,18 @@ struct Cli {
     #[arg(long, value_name = "KEY_ID@PUBLIC_KEY")]
     issuer_key: Vec<IssuerKeySpec>,
 
+    /// Development affordance: spawn `<count>@<cell>` placeholder entities at
+    /// startup so a harness has something to claim.
+    ///
+    /// Authority requires an entity to already have a committed cell before it
+    /// can be claimed (a claim names a location the registrar can check), and
+    /// spawning is a server-side or intent concern — a client cannot bootstrap
+    /// one. Offline seeding via `orrery-seed` is the real path; this exists so
+    /// the authority harness can run without a seeded world, and it refuses
+    /// to run on a node holding durable leases.
+    #[arg(long, value_name = "COUNT@CELL")]
+    dev_seed: Option<DevSeedSpec>,
+
     /// Trusted coordinator interest-grant key in `<key-id>@<public-key>` form.
     ///
     /// Repeatable, so a key rotation can be deployed with an overlap. Without
@@ -695,6 +707,9 @@ async fn main() -> anyhow::Result<()> {
         // Without FDB there is no cold fallback; the runtime itself is the Router.
         runtime.clone()
     };
+    // Retained only for the dev-seed affordance below, which needs the actor
+    // handles directly rather than the routing surface.
+    let seed_runtime = cli.dev_seed.is_some().then(|| Arc::clone(&runtime));
     drop(runtime);
 
     // ── Gateway ─────────────────────────────────────────────────────────
@@ -737,6 +752,28 @@ async fn main() -> anyhow::Result<()> {
     );
     let gateway = GatewayServer::spawn(gateway_config, router).await?;
 
+    // Development seeding, after activation and before the readiness line, so
+    // a harness that sees the line can immediately claim what it names.
+    let dev_seeded = if let Some(spec) = cli.dev_seed {
+        if cli.fdb_cluster_file.is_some() {
+            anyhow::bail!(
+                "--dev-seed is a local harness affordance; seed a durable world with orrery-seed instead"
+            );
+        }
+        let seed_runtime = seed_runtime
+            .as_ref()
+            .expect("dev seed runtime is retained whenever --dev-seed is set");
+        let entities = dev_seed_entities(seed_runtime, spec).await?;
+        tracing::warn!(
+            count = entities.len(),
+            cell = ?spec.cell,
+            "seeded placeholder entities: --dev-seed is not a production path"
+        );
+        entities
+    } else {
+        Vec::new()
+    };
+
     // Print the gateway address as a single-line JSON object on stdout, so a
     // demo harness can parse it. Everything else goes to stderr via tracing.
     {
@@ -758,6 +795,7 @@ async fn main() -> anyhow::Result<()> {
             "ownership_epoch": activation.epoch.0,
             "recovery_cutoff": recovery_cutoff,
             "bulk_ack_fence_monitor": fence_freshness_monitor.is_some(),
+            "dev_seeded_entities": dev_seeded,
         });
         // Write manually so a BrokenPipe (harness closed stdout) does not
         // panic the process.
@@ -999,6 +1037,49 @@ async fn activate_topology(
     })
 }
 
+/// Spawn placeholder entities so a harness has claimable subjects.
+///
+/// These go in through the ordinary actor append path — the same records a
+/// real spawn produces — so the entities have a committed cell, appear in area
+/// loads, and are claimable exactly like seeded content.
+async fn dev_seed_entities(
+    runtime: &Arc<CellRuntime>,
+    spec: DevSeedSpec,
+) -> anyhow::Result<Vec<u64>> {
+    let actor = runtime
+        .actor(GridId::ROOT, spec.cell)
+        .ok_or_else(|| anyhow::anyhow!("no actor owns dev-seed cell {:?}", spec.cell))?
+        .clone();
+    let author = orrery_protocol::NodeId::from_bytes(&[0; 32])
+        .map_err(|error| anyhow::anyhow!("zero author node id: {error}"))?;
+
+    let mut seeded = Vec::with_capacity(spec.count as usize);
+    for index in 1..=spec.count {
+        let entity = orrery_protocol::PersistId::new(u64::from(index));
+        let payload = bytes::Bytes::from_static(b"dev-seed");
+        actor
+            .start_diff(orrery_protocol::JournalRecord {
+                lsn: orrery_protocol::Lsn::new(0, 0),
+                cell: spec.cell,
+                grid: GridId::ROOT,
+                entity,
+                tick: orrery_protocol::Tick::new(0),
+                epoch: Epoch::new(0),
+                author,
+                kind: orrery_protocol::RecordKind::Spawn,
+                crc: orrery_persistd::payload_crc(&payload),
+                payload,
+            })
+            .await
+            .map_err(|error| anyhow::anyhow!("dev seed append failed: {error:?}"))?
+            .committed()
+            .await
+            .map_err(|error| anyhow::anyhow!("dev seed commit failed: {error:?}"))?;
+        seeded.push(entity.0);
+    }
+    Ok(seeded)
+}
+
 fn gateway_config<F>(
     cli: &Cli,
     secret_key: Option<iroh::SecretKey>,
@@ -1036,6 +1117,33 @@ where
         validator: Arc::new(ProductionIntentValidator),
         ..GatewayConfig::default()
     })
+}
+
+/// `<count>@<cell>` for [`Cli::dev_seed`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DevSeedSpec {
+    count: u32,
+    cell: CellId,
+}
+
+impl FromStr for DevSeedSpec {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let (count, cell) = value
+            .split_once('@')
+            .ok_or_else(|| "expected dev seed as <count>@<cell>".to_string())?;
+        let count = count
+            .parse::<u32>()
+            .map_err(|error| format!("invalid dev seed count `{count}`: {error}"))?;
+        if count == 0 {
+            return Err("dev seed count must be positive".to_string());
+        }
+        Ok(Self {
+            count,
+            cell: cell.parse::<ShardSpec>()?.0,
+        })
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1386,6 +1494,7 @@ mod tests {
                 iroh::SecretKey::from_bytes(&[9; 32]).public(),
             ))],
             coordinator_key: Vec::new(),
+            dev_seed: None,
             secret_key: None,
             shard: Vec::new(),
             metrics_jsonl: None,
