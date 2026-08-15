@@ -22,6 +22,7 @@ mod grid;
 mod identity;
 mod persist;
 mod protocol;
+mod verifiable;
 
 pub use authority::{
     ClaimBasis, ClaimId, ClaimKind, DenyReason, ExpireDisposition, ExpireReason, Lease, LeaseFlags,
@@ -58,3 +59,8 @@ pub use persist::{
     REASON_ISSUER_MISMATCH, REASON_NO_EXECUTOR, REASON_VALIDATION_FAILED,
 };
 pub use protocol::PROTOCOL_VERSION;
+pub use verifiable::{
+    ChainHash, DeviationKind, EntitySlice, EvidenceBundle, ForgeryProof, InputRecord, LogFrame,
+    RecordSource, RollingHead, RulesetId, StateClaim, UnadjudicableReason, UniverseSeed, Verdict,
+    MAX_ADJUDICATION_TICKS,
+};

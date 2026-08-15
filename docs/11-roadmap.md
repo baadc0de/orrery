@@ -200,7 +200,14 @@ cannot occur by construction.
 
 **Goal.** Scoped determinism (D9) and passive witnessing (D10) with **no enforcement**: logs, replay, adjudication, and discrepancy telemetry only. This phase exists to calibrate tolerance bands against reality before anyone can be striked.
 
-**Crates.** `orrery_core` (`Ruleset` trait, fixed-tick executor, `rand_chacha` seeded per `(universe_seed, entity, tick)`, quantization, tolerance comparators, signed hash-chained input logs, headless replay harness), `orrery_witness` (invariant validators, discrepancy detection, evidence assembly), `orrery_persistd` (adjudication executor linking the same `Ruleset`), reference game (kinematic movement + integer combat core).
+**Crates.** `orrery_core` (`Ruleset` trait, fixed-tick executor, `rand_chacha` seeded per `(universe_seed, entity, tick)`, quantization, tolerance comparators, signed hash-chained input logs, headless replay harness) — **landed**, see [06-verifiable-core.md](06-verifiable-core.md); `orrery_witness` (invariant validators, discrepancy detection, evidence assembly), `orrery_persistd` (adjudication executor linking the same `Ruleset`), reference game (kinematic movement + integer combat core).
+
+The core is built as a side track (sequencing principle 2), so it proceeds
+independently of the P1/P3 tracks and did. What it does *not* yet have is a
+consumer: `orrery_witness` does not exist, nothing streams log frames, and no
+adjudication executor calls `verify_bundle`. The kernel is provably
+deterministic and self-verifying in isolation; the phase turns on wiring it to
+the witness pipeline and then calibrating ε against real play.
 
 **Deliverables.**
 - PeerReview-style tamper-evident logs streamed to the cell-epoch witness set (piggybacked on the 20 Hz replication datagrams, gap repair over the reliable control stream); any holder of a segment + t₀ claim can re-execute a window ≤ 3 s (180 ticks) and produce self-verifying evidence.

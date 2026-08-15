@@ -4,6 +4,33 @@ Orrery does not require determinism to keep peers in sync — it requires determ
 
 Normative source: [ADR-0009](adr/0009-verifiable-core.md) (context: [D10](adr/0010-witnessing.md), [D13](adr/0013-physics-and-determinism.md), and [D16](adr/0016-parameter-reference.md)).
 
+> **Implementation status (2026-08-15).** `orrery_core` exists and is
+> Bevy-free, with wire types in `orrery_protocol::verifiable`. Landed: the
+> `Ruleset` contract (`CoreState`/`CoreInput`/`CoreEvent`, `step`,
+> `classify_component`), the fixed 60 Hz executor with its VC-1/VC-3/VC-7
+> guarantees, `StateView` neighbour-read recording, the quantization lattice,
+> the tolerance-band comparator, the hash-chained input log with per-frame
+> signatures and claim chaining, the replay harness, and `verify_bundle`.
+> `scripts/core-gates.sh` runs §8's static gates.
+>
+> The quantization **lattice** is 1 mm and 1 mm/s — an invented default, an
+> order of magnitude finer than D16's bands so quantization noise cannot itself
+> trip the comparator. D16 fixes the bands, not the lattice.
+>
+> Deferred, each because its consumer or its subsystem does not exist yet: the
+> `GeometryFrame`, `FieldFrame`, `FrameChange` and `TerrainPromotion` record
+> sources (mutable terrain, environmental fields, nested-grid migration,
+> terrain↔entity promotion); `validate_intent`, `park_tick`, `catch_up` and
+> `invariants` on the trait (the intent path, the field host, `orrery_witness`);
+> log streaming and gap repair (`orrery_witness` + `orrery_net`); and the
+> cross-platform CI matrix, for which the golden-vector and run-twice tests are
+> in place but no Windows/macOS runner is. All are additive.
+
+`verify_bundle` takes the authority's `NodeId` explicitly, which the §7 sketch
+omits. An adjudicator always knows it from the lease row, and passing it beats
+having the function infer which key a signature was meant to verify under —
+that inference is exactly what a forged bundle would want it to make.
+
 ## 1. Why scoped determinism
 
 Live synchronization in Orrery is per-entity-authority **state replication** ([03-replication.md](03-replication.md), [05-prediction-rollback.md](05-prediction-rollback.md)). As Gaffer's taxonomy puts it, state synchronization sends inputs *and* state, so ["perfect determinism is not required to stay in sync"](https://gafferongames.com/post/state_synchronization/) — a misprediction is corrected by the next authoritative snapshot, not by input replay from genesis. Contrast [deterministic lockstep](https://gafferongames.com/post/deterministic_lockstep/) ([GGPO](https://github.com/pond3r/ggpo)-family rollback), where determinism is *globally load-bearing*: every peer resimulates identical whole-world state, one divergent bit is a permanent desync, and resim cost scales with world size — [SnapNet's arithmetic](https://www.snapnet.dev/blog/netcode-architectures-part-2-rollback/) gives a 60 Hz game absorbing 300 ms roughly 1.1 ms/frame of simulation budget before the resim spiral of death.
