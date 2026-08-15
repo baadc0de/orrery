@@ -97,7 +97,7 @@ Layering rules (the first two are normative from D15; the rest are containment r
 3. **lightyear types appear only inside `orrery_predict`.** No other crate names a lightyear type in its public API. This is the plan-B blast radius (see below).
 4. **replicon types appear only in `orrery_spatial`** (visibility mapping) **and `orrery_persist_client`** (change-detection uplink). **aeronet types appear only in `orrery_aeronet_iroh` and `orrery_net`.**
 5. `orrery_witness` and `orrery_persist_client` do not depend on each other: the witness emits `orrery_protocol` event types (`EvidenceBundle`, `AttestationGrant`) as Bevy messages; the persist client drains and transmits them.
-6. Bevy-free services speak iroh directly (tokio-native endpoints); `orrery_aeronet_iroh` exists only for Bevy processes, because [`aeronet_io`](https://github.com/aecsocket/aeronet) is `bevy_ecs`-based. Both sides interoperate because framing lives in `orrery_protocol`, not in the IO layer.
+6. Bevy-free services speak iroh directly (tokio-native endpoints); `orrery_aeronet_iroh` exists only for Bevy processes, because [`aeronet_io`](https://github.com/aecsocket/aeronet) is `bevy_ecs`-based. Both sides interoperate because framing lives in `orrery_protocol`, not in the IO layer. `orrery-coordinator` and `persistd` are both this shape, and deliberately share one session pattern — an admission uni-stream, then tagged datagrams — so a peer needs one client for both.
 
 ## Crate reference
 

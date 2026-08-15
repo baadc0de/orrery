@@ -48,9 +48,9 @@ pub enum PeerEvent {
 /// Everything one peer process needs, passed on argv by the orchestrator.
 pub struct PeerConfig {
     pub gateway: iroh::EndpointAddr,
+    pub coordinator: iroh::EndpointAddr,
     pub secret: iroh::SecretKey,
     pub token: Vec<u8>,
-    pub grant: Vec<u8>,
     pub cell: CellId,
     pub entities: Vec<u64>,
     pub duration: Duration,
@@ -68,6 +68,25 @@ pub async fn run(config: PeerConfig) -> Result<()> {
         }
     };
 
+    // Interest comes from the coordinator, not from the harness. The peer
+    // reports what it covers and forwards the signed bytes it gets back — it
+    // cannot author its own authorization, which is the whole point.
+    let coordinator = orrery_coordinator::CoordinatorClient::connect(
+        config.secret.clone(),
+        config.coordinator,
+        config.token.clone(),
+        Duration::from_secs(10),
+    )
+    .await
+    .map_err(|error| anyhow::anyhow!("coordinator session: {error}"))?;
+    coordinator
+        .report_presence(vec![config.cell])
+        .map_err(|error| anyhow::anyhow!("report presence: {error}"))?;
+    let grant = coordinator
+        .next_grant(Duration::from_secs(10))
+        .await
+        .map_err(|error| anyhow::anyhow!("interest grant: {error}"))?;
+
     let session = Session::connect(config.secret.clone(), config.gateway).await?;
     let node = config.secret.public();
 
@@ -83,9 +102,7 @@ pub async fn run(config: PeerConfig) -> Result<()> {
 
     // Interest before any claim: a claim judged against interest the gateway
     // has not seen yet is refused, and that would look like a registrar bug.
-    session.send_control(&GatewayMsg::InterestGrant {
-        grant: config.grant,
-    })?;
+    session.send_control(&GatewayMsg::InterestGrant { grant })?;
     let ack = session.recv(Duration::from_secs(10)).await;
     match ack {
         Some(GatewayReply::InterestAck {
@@ -214,6 +231,10 @@ pub async fn run(config: PeerConfig) -> Result<()> {
     }
 
     emit(&PeerEvent::Done { held: held.len() });
+    // Keep the coordinator session alive to here: a peer that vanished from
+    // the island roster while still holding leases would be a different
+    // scenario than the one under test.
+    drop(coordinator);
     Ok(())
 }
 

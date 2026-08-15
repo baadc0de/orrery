@@ -34,9 +34,9 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use clap::Parser;
 use orrery_protocol::{
-    AccountId, CellId, ClaimBasis, ClaimId, ClaimKind, Epoch, GatewayMsg, GatewayReply, GridId,
-    InterestGrantClaimsV1, InterestGrantV1, IssuerKeyId, LeaseMsg, NodeId, PersistId, SeqPair,
-    SessionStanding, SessionTokenClaimsV1, SessionTokenTtlMs, SessionTokenV1, Tick, UnixMillis,
+    AccountId, CellId, ClaimBasis, ClaimId, ClaimKind, GatewayMsg, GatewayReply, GridId,
+    IssuerKeyId, LeaseMsg, NodeId, PersistId, SeqPair, SessionStanding, SessionTokenClaimsV1,
+    SessionTokenTtlMs, SessionTokenV1, Tick, UnixMillis,
 };
 
 use crate::peer::{PeerConfig, PeerEvent};
@@ -77,10 +77,13 @@ struct Cli {
     #[arg(long, value_name = "HEX")]
     issuer_secret: String,
 
-    /// Hex-encoded coordinator secret; its public half must be persistd's
-    /// `--coordinator-key`.
-    #[arg(long, value_name = "HEX")]
-    coordinator_secret: String,
+    /// The coordinator's `bind_addr` from its readiness line.
+    #[arg(long, value_name = "IP:PORT")]
+    coordinator_addr: String,
+
+    /// The coordinator's `node_id` from its readiness line.
+    #[arg(long, value_name = "NODE_ID")]
+    coordinator_node: String,
 
     /// Peers in the island. The criterion's number is 8.
     #[arg(long, default_value_t = 8)]
@@ -107,10 +110,10 @@ struct Cli {
     #[arg(long, value_name = "PATH")]
     metrics_jsonl: Option<PathBuf>,
 
-    /// Print the public halves of the supplied secrets as JSON and exit.
+    /// Print the public half of the identity issuer secret as JSON and exit.
     ///
-    /// persistd must be configured to trust exactly these, so deriving them
-    /// here keeps the harness from needing an ed25519 implementation in shell.
+    /// persistd and the coordinator must be configured to trust it, so
+    /// deriving it here keeps the harness from needing ed25519 in shell.
     #[arg(long)]
     print_keys: bool,
 
@@ -130,13 +133,9 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     if cli.print_keys {
         let issuer = iroh::SecretKey::from_bytes(&decode_key(&cli.issuer_secret)?);
-        let coordinator = iroh::SecretKey::from_bytes(&decode_key(&cli.coordinator_secret)?);
         println!(
             "{}",
-            serde_json::json!({
-                "issuer_public": issuer.public().to_string(),
-                "coordinator_public": coordinator.public().to_string(),
-            })
+            serde_json::json!({ "issuer_public": issuer.public().to_string() })
         );
         return Ok(());
     }
@@ -160,9 +159,10 @@ fn main() -> Result<()> {
 struct PeerSpec {
     gateway_addr: String,
     gateway_node: String,
+    coordinator_addr: String,
+    coordinator_node: String,
     secret: String,
     token: String,
-    grant: String,
     cell: u64,
     entities: Vec<u64>,
     duration_secs: u64,
@@ -174,9 +174,9 @@ async fn run_peer(spec_path: PathBuf) -> Result<()> {
         .with_context(|| format!("read peer spec {}", spec_path.display()))?;
     peer::run(PeerConfig {
         gateway: endpoint_addr(&spec.gateway_node, &spec.gateway_addr)?,
+        coordinator: endpoint_addr(&spec.coordinator_node, &spec.coordinator_addr)?,
         secret: iroh::SecretKey::from_bytes(&decode_key(&spec.secret)?),
         token: decode_hex(&spec.token)?,
-        grant: decode_hex(&spec.grant)?,
         cell: CellId::from_bits(spec.cell).context("peer spec cell is not a valid CellId")?,
         entities: spec.entities,
         duration: Duration::from_secs(spec.duration_secs),
@@ -195,8 +195,8 @@ async fn orchestrate(cli: Cli) -> Result<Outcome> {
         .with_context(|| format!("create output directory {}", cli.out.display()))?;
     let cell = parse_cell(&cli.cell)?;
     let issuer = iroh::SecretKey::from_bytes(&decode_key(&cli.issuer_secret)?);
-    let coordinator = iroh::SecretKey::from_bytes(&decode_key(&cli.coordinator_secret)?);
     let gateway = endpoint_addr(&cli.gateway_node, &cli.gateway_addr)?;
+    let coordinator_addr = endpoint_addr(&cli.coordinator_node, &cli.coordinator_addr)?;
 
     anyhow::ensure!(cli.peers >= 2, "redistribution needs at least two peers");
     // Survivors must still be running while the proof is collected: a peer
@@ -229,9 +229,10 @@ async fn orchestrate(cli: Cli) -> Result<Outcome> {
         let spec = PeerSpec {
             gateway_addr: cli.gateway_addr.clone(),
             gateway_node: cli.gateway_node.clone(),
+            coordinator_addr: cli.coordinator_addr.clone(),
+            coordinator_node: cli.coordinator_node.clone(),
             secret: encode_hex(&secret.to_bytes()),
             token: encode_hex(&mint_token(&issuer, node)?),
-            grant: encode_hex(&mint_grant(&coordinator, node, cell)?),
             cell: cell.to_bits(),
             entities,
             duration_secs: cli.duration_secs,
@@ -246,8 +247,9 @@ async fn orchestrate(cli: Cli) -> Result<Outcome> {
             // mode but still parsed, so echo them through.
             .args(["--gateway-addr", &cli.gateway_addr])
             .args(["--gateway-node", &cli.gateway_node])
+            .args(["--coordinator-addr", &cli.coordinator_addr])
+            .args(["--coordinator-node", &cli.coordinator_node])
             .args(["--issuer-secret", &cli.issuer_secret])
-            .args(["--coordinator-secret", &cli.coordinator_secret])
             .args(["--out", &cli.out.to_string_lossy()])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::from(std::fs::File::create(
@@ -338,9 +340,28 @@ async fn orchestrate(cli: Cli) -> Result<Outcome> {
     // registrar's own opinion of itself.
     let probe_secret = peer_secret(u8::MAX);
     let probe_node = probe_secret.public();
+    let probe_token = mint_token(&issuer, probe_node)?;
+    // The probe is a peer like any other: it asks the coordinator for its
+    // interest rather than assuming any.
+    let probe_coordinator = orrery_coordinator::CoordinatorClient::connect(
+        probe_secret.clone(),
+        coordinator_addr,
+        probe_token.clone(),
+        Duration::from_secs(10),
+    )
+    .await
+    .map_err(|error| anyhow::anyhow!("probe coordinator session: {error}"))?;
+    probe_coordinator
+        .report_presence(vec![cell])
+        .map_err(|error| anyhow::anyhow!("probe presence: {error}"))?;
+    let probe_grant = probe_coordinator
+        .next_grant(Duration::from_secs(10))
+        .await
+        .map_err(|error| anyhow::anyhow!("probe interest grant: {error}"))?;
+
     let probe = Session::connect(probe_secret, gateway).await?;
     probe.send_control(&GatewayMsg::Hello {
-        token: mint_token(&issuer, probe_node)?,
+        token: probe_token,
         node: probe_node,
     })?;
     anyhow::ensure!(
@@ -350,9 +371,7 @@ async fn orchestrate(cli: Cli) -> Result<Outcome> {
         ),
         "probe session was refused"
     );
-    probe.send_control(&GatewayMsg::InterestGrant {
-        grant: mint_grant(&coordinator, probe_node, cell)?,
-    })?;
+    probe.send_control(&GatewayMsg::InterestGrant { grant: probe_grant })?;
     anyhow::ensure!(
         matches!(
             probe.recv(Duration::from_secs(10)).await,
@@ -540,21 +559,6 @@ fn mint_token(issuer: &iroh::SecretKey, node: NodeId) -> Result<Vec<u8>> {
             IssuerKeyId::new(1),
         ),
         issuer,
-    )?
-    .encode()?)
-}
-
-fn mint_grant(coordinator: &iroh::SecretKey, node: NodeId, cell: CellId) -> Result<Vec<u8>> {
-    Ok(InterestGrantV1::sign(
-        InterestGrantClaimsV1::new(
-            node,
-            Epoch::new(1),
-            GridId::ROOT,
-            vec![cell],
-            300_000,
-            IssuerKeyId::new(1),
-        ),
-        coordinator,
     )?
     .encode()?)
 }

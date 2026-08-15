@@ -85,7 +85,7 @@ The registrar is a facet of `orrery_persistd`, not a separate service. A lease r
 - **Acquire** = CAS on `(holder, seq, lease_id)`: the actor checks eligibility (INV-5, plausibility gate §10, expiry), bumps the relevant sequence, increments `lease_id`, sets `expires_at = now + TTL`, and emits `Grant`. Losing concurrent claimants get `Deny`. TTL is **10 s**, heartbeat every **2.5 s** (four missed heartbeats = expiry).
 - **Durability**: acquire/transfer/park/expire write through to FDB; heartbeats renew only the in-memory row. On actor failover, leases are rebuilt from FDB with a *full fresh TTL* — conservative in the safe direction (an extra ≤10 s of orphan latency, never two writers).
 - **Fencing**: the gateway tracks the `lease_id`s a peer holds; a diff carrying a stale `lease_id` is dropped and answered with a lease-specific `BulkNack` containing the current row. This closes the classic zombie-holder race without trusting peer clocks.
-- **Interest handout**: a gateway will not take a peer's word for what it is interested in — interest gates weak claims and successor candidacy, so self-declared interest would be self-granted authority. The coordinator signs an `InterestGrantV1` naming one peer, its cells and a *lifetime*; the peer carries it to whichever gateway it is talking to, exactly as it carries its identity token. Adding gateways therefore adds no coordinator fan-out, and a gateway needs only the coordinator's public key. The grant ships a duration rather than a deadline because the two processes have unrelated monotonic origins; the gateway stamps its own expiry on acceptance. Epochs are monotonic per peer, so replaying an older, wider grant after moving away is refused while re-presenting the current one is a refresh.
+- **Interest handout**: a gateway will not take a peer's word for what it is interested in — interest gates weak claims and successor candidacy, so self-declared interest would be self-granted authority. The `orrery-coordinator` service signs an `InterestGrantV1` naming one peer, its cells and a *lifetime*; the peer carries it to whichever gateway it is talking to, exactly as it carries its identity token. Adding gateways therefore adds no coordinator fan-out, and a gateway needs only the coordinator's public key. The grant ships a duration rather than a deadline because the two processes have unrelated monotonic origins; the gateway stamps its own expiry on acceptance. Epochs are monotonic per peer, so replaying an older, wider grant after moving away is refused while re-presenting the current one is a refresh.
 - **Single-writer invariant checker**: a fenced-out write whose live row names a *different*, unexpired holder is the only externally observable form of "two peers both believed they were the writer". The gateway counts each one, retains the last sample (`entity`, `tick`, both node ids, both tokens) and logs it at `warn`. A healthy cluster holds this at zero; it is the phase's acceptance signal, not a debug aid.
 - **Clock discipline**: only the registrar's monotonic clock decides expiry. Holders track a conservative local estimate (`expires_at − one heartbeat interval`) and mark their lease *uncertain* past it (§11.1).
 
@@ -235,21 +235,23 @@ sequenceDiagram
 Redistribution is NGO-style: the successor inherits last-known committed state, not the crashed peer's unreplicated tail (bounded by the ≈1–4 Hz uplink cadence plus journal durability — see [08-persistence.md](08-persistence.md)). A strong-owned entity whose owner crashed re-parks with `own_seq` intact rather than being regranted, unless it is `PLAYER_BOUND` (the character parks and is exclusively reclaimable by the returning account).
 
 **Successor selection as implemented.** Candidacy is deliberately no wider than
-a live claim's own admission: a peer qualifies only when it has a live
-authenticated session *on this gateway* and the coordinator's own interest
-snapshot still covers the entity's committed cell. Redistribution can therefore
-never place authority somewhere an ordinary `Claim` could not. True metric
-proximity needs peer positions the coordinator does not yet hand the gateway,
-so "nearest interacting peer" is read off the data that is authoritative here,
-in order:
+a live claim's own admission, and is evaluated by calling the *same* predicate
+rather than reimplementing it: a peer qualifies only when it has a live
+authenticated session on this gateway and `InterestAuthority::allows` accepts
+it for the entity's committed cell — exactly what a `Claim` passes.
+Redistribution can therefore never place authority somewhere an ordinary claim
+could not. True metric proximity needs peer positions the coordinator does not
+yet hand the gateway, so "nearest interacting peer" is read off the data that
+is authoritative here, in order:
 
 1. a peer already holding a lease on an entity committed to the same cell — the
    observable proxy for "already interacting";
-2. the tightest coordinator interest covering the cell (a deeper covering cell
-   is a smaller region, hence nearer);
-3. the fewest leases already held, so one peer does not inherit a crashed
+2. the fewest leases already held, so one peer does not inherit a crashed
    holder's entire working set;
-4. the node id, so the choice is deterministic and reproducible in a replay.
+3. the node id, so the choice is deterministic and reproducible in a replay.
+
+Coverage carries no ranking signal because every candidate covers the same
+cell; that is what eligibility means.
 
 The policy is a seam (`SuccessorPolicy`), so a deployment can substitute a real
 proximity ranking the moment the coordinator supplies positions; `select`

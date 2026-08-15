@@ -17,6 +17,10 @@ path = "src/main.rs"
 
 [dependencies]
 orrery_protocol = { path = "../crates/orrery_protocol" }
+# The harness gets its interest grants from a live coordinator rather than
+# minting them: a fixture that signs its own authorization proves nothing about
+# the path production uses.
+orrery_coordinator = { path = "../crates/orrery_coordinator" }
 # Versions mirror the root workspace's D14 pins exactly (a standalone
 # `[workspace]` cannot inherit `workspace.dependencies`).
 iroh = "1.0.3"

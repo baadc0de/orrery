@@ -488,9 +488,6 @@ impl InterestAuthority for SnapshotInterestAuthority {
 pub struct SuccessorCandidate {
     /// The candidate peer's authenticated transport identity.
     pub node: NodeId,
-    /// The cell in the candidate's coordinator snapshot that covers the
-    /// entity. A deeper cell is a tighter interest, and therefore nearer.
-    pub covering_cell: CellId,
     /// Leases this peer already holds on this gateway.
     pub held_leases: usize,
     /// Whether one of those leases is on an entity committed to the same cell
@@ -551,11 +548,12 @@ impl SuccessorPolicy for ParkOnLossPolicy {
 ///
 /// 1. a peer already holding a lease in the same cell — it is demonstrably
 ///    interacting with the entity's neighbourhood;
-/// 2. the tightest coordinator interest covering the cell (a deeper covering
-///    cell is a smaller region, so a nearer peer);
-/// 3. the fewest leases already held, so one peer does not inherit a crashed
+/// 2. the fewest leases already held, so one peer does not inherit a crashed
 ///    holder's entire working set;
-/// 4. the node id, so the choice is deterministic and reproducible in a replay.
+/// 3. the node id, so the choice is deterministic and reproducible in a replay.
+///
+/// Every candidate covers the entity's exact cell — that is what eligibility
+/// means — so coverage itself carries no ranking signal.
 #[derive(Debug, Default)]
 pub struct NearestInterestSuccessorPolicy;
 
@@ -568,7 +566,6 @@ impl SuccessorPolicy for NearestInterestSuccessorPolicy {
             .min_by_key(|candidate| {
                 (
                     usize::from(!candidate.holds_lease_in_cell),
-                    u8::MAX - candidate.covering_cell.level(),
                     candidate.held_leases,
                     *candidate.node.as_bytes(),
                 )
@@ -1486,26 +1483,16 @@ impl Redistributor {
             if node == exclude {
                 continue;
             }
-            let Some(snapshot) = self.interest.snapshot_for(node) else {
-                continue;
-            };
-            if snapshot.peer != node || snapshot.grid != grid || snapshot.valid_until_ms <= now_ms {
+            // Eligibility is the *same* predicate a live claim passes, called
+            // through the same seam rather than reimplemented beside it. An
+            // earlier version matched an ancestor of the entity's cell here
+            // while `allows` required the exact cell, so a peer could be handed
+            // a lease it could not have claimed for itself.
+            if !self.interest.allows(node, grid, cell, now_ms) {
                 continue;
             }
-            // The tightest covering cell in the snapshot: covering the exact
-            // cell is nearer than covering one of its ancestors.
-            let Some(covering_cell) = snapshot
-                .covered_cells
-                .iter()
-                .filter(|covered| covered.is_prefix_of(cell))
-                .max_by_key(|covered| covered.level())
-                .copied()
-            else {
-                continue;
-            };
             candidates.push(SuccessorCandidate {
                 node,
-                covering_cell,
                 held_leases: leases.len(),
                 holds_lease_in_cell: leases
                     .iter()
@@ -3438,31 +3425,23 @@ mod tests {
     }
 
     #[test]
-    fn nearest_interest_ranks_interaction_then_tightness_then_load() {
-        // Given: four peers whose interest all covers the entity's cell, but
-        // by different routes.
+    fn nearest_interest_ranks_interaction_then_load_then_node_id() {
+        // Given: three eligible peers. Eligibility already means each one's
+        // coordinator interest covers this exact cell, so coverage carries no
+        // ranking signal — what separates them is interaction and load.
         let cell = CellId::ROOT.children()[0].children()[1];
         let interacting = SuccessorCandidate {
             node: successor_node(1),
-            covering_cell: CellId::ROOT,
             held_leases: 40,
             holds_lease_in_cell: true,
         };
-        let tight = SuccessorCandidate {
-            node: successor_node(2),
-            covering_cell: cell,
-            held_leases: 0,
-            holds_lease_in_cell: false,
-        };
-        let loose_idle = SuccessorCandidate {
+        let idle = SuccessorCandidate {
             node: successor_node(3),
-            covering_cell: CellId::ROOT,
             held_leases: 0,
             holds_lease_in_cell: false,
         };
-        let loose_busy = SuccessorCandidate {
+        let busy = SuccessorCandidate {
             node: successor_node(4),
-            covering_cell: CellId::ROOT,
             held_leases: 9,
             holds_lease_in_cell: false,
         };
@@ -3478,18 +3457,20 @@ mod tests {
             })
         };
 
-        // Then: demonstrated interaction outranks everything, including a
-        // tighter interest and a far lighter load.
-        assert_eq!(
-            request(&[loose_idle, tight, interacting, loose_busy]),
-            Some(interacting.node)
-        );
-        // Then: without an interacting peer, the tightest covering interest
-        // wins even against an equally idle peer.
-        assert_eq!(request(&[loose_idle, tight, loose_busy]), Some(tight.node));
-        // Then: among equally tight peers, the least loaded inherits, so one
+        // Then: demonstrated interaction outranks a far lighter load.
+        assert_eq!(request(&[idle, interacting, busy]), Some(interacting.node));
+        // Then: with nobody interacting, the least loaded inherits, so one
         // peer does not absorb a crashed holder's whole working set.
-        assert_eq!(request(&[loose_busy, loose_idle]), Some(loose_idle.node));
+        assert_eq!(request(&[busy, idle]), Some(idle.node));
+        // Then: a tie is broken deterministically, so a replay reproduces it.
+        let tie_a = SuccessorCandidate {
+            node: successor_node(2),
+            held_leases: 0,
+            holds_lease_in_cell: false,
+        };
+        let chosen = request(&[idle, tie_a]);
+        assert_eq!(chosen, request(&[tie_a, idle]), "order must not decide");
+        assert!(chosen == Some(idle.node) || chosen == Some(tie_a.node));
     }
 
     #[test]
@@ -3498,7 +3479,6 @@ mod tests {
         let previous_holder = successor_node(1);
         let candidates = [SuccessorCandidate {
             node: previous_holder,
-            covering_cell: CellId::ROOT,
             held_leases: 0,
             holds_lease_in_cell: true,
         }];

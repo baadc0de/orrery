@@ -332,6 +332,18 @@ fn grant_signature_payload(claims: &InterestGrantClaimsV1) -> Result<Vec<u8>, po
     Ok(payload)
 }
 
+/// The ALPN peers use to reach a coordinator.
+pub const COORD_ALPN: &[u8] = b"orrery/coord/0";
+/// The coordinator wire version reported in [`CoordMsg::Welcome`].
+pub const COORD_PROTOCOL_VERSION: u16 = 0;
+/// The most cells one presence report may carry.
+///
+/// Presence is the peer's active interest set, which D5 bounds at the 27-cell
+/// neighbourhood. The allowance matches [`MAX_INTEREST_GRANT_CELLS`] because a
+/// presence report is what a grant is minted from — a coordinator that
+/// accepted more than it could sign would be storing an unusable set.
+pub const MAX_PRESENCE_CELLS: usize = MAX_INTEREST_GRANT_CELLS;
+
 /// A coordinator message (docs/10-crates.md §12).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CoordMsg {
@@ -342,10 +354,22 @@ pub enum CoordMsg {
         /// The peer's NodeId.
         node: NodeId,
     },
-    /// Coarse presence update (shard level, rate-limited).
+    /// Coordinator's answer to a [`CoordMsg::Hello`] it accepted.
+    Welcome {
+        /// The coordinator's own NodeId, so a peer can confirm who answered.
+        coordinator: NodeId,
+        /// The negotiated wire version.
+        protocol: u16,
+    },
+    /// Presence update: the cells this peer's active interest covers.
+    ///
+    /// This is the *input* to both island formation and interest issuance, so
+    /// it carries the covered set rather than a single cell: a grant minted
+    /// from one coarse cell could not authorize a claim on an entity in a
+    /// finer one, because interest is matched exactly.
     Presence {
-        /// The peer's coarse cell.
-        cell: CellId,
+        /// The cells this peer covers, at most [`MAX_PRESENCE_CELLS`].
+        cells: Vec<CellId>,
     },
     /// Island membership handout.
     IslandAssignment {

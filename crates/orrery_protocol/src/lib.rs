@@ -34,8 +34,9 @@ pub use cell::{
 pub use coord::{
     verify_interest_grant, CoordMsg, CoordinatorInterestSnapshot, InterestGrantClaimsV1,
     InterestGrantV1, InterestGrantVerificationError, IslandId, IslandManifest, PeerEntry,
-    TopologyRegime, INTEREST_GRANT_V1_DOMAIN, INTEREST_GRANT_V1_VERSION, MAX_INTEREST_GRANT_BYTES,
-    MAX_INTEREST_GRANT_CELLS, MAX_INTEREST_GRANT_TTL_MS,
+    TopologyRegime, COORD_ALPN, COORD_PROTOCOL_VERSION, INTEREST_GRANT_V1_DOMAIN,
+    INTEREST_GRANT_V1_VERSION, MAX_INTEREST_GRANT_BYTES, MAX_INTEREST_GRANT_CELLS,
+    MAX_INTEREST_GRANT_TTL_MS, MAX_PRESENCE_CELLS,
 };
 pub use gateway::{
     AreaPage, DiffUplink, GatewayMsg, GatewayReply, AREA_LOAD_ERR_COLD, AREA_LOAD_ERR_LIVE,

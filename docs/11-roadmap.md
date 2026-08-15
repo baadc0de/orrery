@@ -133,14 +133,15 @@ registrar's divest request with D7's per-tier deadline rules; and
 `PLAYER_BOUND` is enforced rather than merely declared. **The demo criterion
 runs and holds** — see below.
 
-Remaining P3 follow-on: coordinator-driven island drain, `Expire` fan-out to
-cell subscribers, contact-island propagation, redistribution across sibling
-gateways, coordinator movement orchestration, ephemeral in-island claims, and
-field-host promotion.
+Remaining P3 follow-on: the Bevy coordinator client in `orrery_net` (island
+membership there is still derived from the connected-peer stand-in rather than
+from manifests), coordinator-driven island drain, `Expire` fan-out to cell
+subscribers, contact-island propagation, redistribution across sibling
+gateways, ephemeral in-island claims, and field-host promotion.
 
-**Crates.** `orrery_coordinator` mints and signs interest grants from coarse
-presence (`InterestIssuer`), with monotonic per-peer epochs; the iroh wire
-server that drives it remains later work. `orrery_authority` implements
+**Crates.** `orrery_coordinator` ships the `orrery-coordinator` service:
+authenticated presence in, island manifests and signed interest grants out,
+Bevy-free over iroh (docs/10-crates.md §6). `orrery_authority` implements
 optimistic weak/strong claims,
 `auth_seq`/`own_seq`, correlation-safe lease control, inherited grants
 (`ClaimId::REGISTRAR` → `AuthorityEvent::Inherited`), holder-initiated
@@ -166,11 +167,14 @@ grabs, throws to B's contact island) completes with zero registrar-visible
 conflicts and no visible pop.
 
 `scripts/p3-island-gate.sh` is the permanent harness, driving the `p3-island`
-tool. Peers are real OS processes, so the `kill -9` is a real SIGKILL rather
-than a dropped task. Observed on an 8-peer island of 400 entities: **50/50 of
-the victim's entities reassigned to survivors in 10.95 s, 0 lost, 0
-duplicate-authority observations**, reproduced across runs. The gate writes no
-success artifact unless every clause holds.
+tool against a live `orrery-coordinator` and `persistd`. Peers are real OS
+processes, so the `kill -9` is a real SIGKILL rather than a dropped task, and
+each peer obtains its interest grant from the coordinator rather than having
+one minted for it — a fixture that signs its own authorization would prove
+nothing about the path production uses. Observed on an 8-peer island of 400
+entities: **50/50 of the victim's entities reassigned to survivors in ~10.9 s,
+0 lost, 0 duplicate-authority observations**, reproduced across runs. The gate
+writes no success artifact unless every clause holds.
 
 One finding worth recording, because it changes what "within the TTL" means in
 practice: **a `kill -9` is resolved by the slow path, not the fast one**. QUIC
