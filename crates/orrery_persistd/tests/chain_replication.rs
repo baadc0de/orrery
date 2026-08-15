@@ -250,16 +250,17 @@ async fn follower_serves_as_recovery_source() {
     );
 
     // Write 100 acked records on the primary.
+    let mut last_lsn = None;
     for i in 0..100u64 {
         let rec = mk_record(CellId::ROOT, i, RecordKind::Spawn, &i.to_le_bytes());
         let handle = primary.append(rec).unwrap();
-        handle.committed().await.unwrap();
+        last_lsn = Some(handle.committed().await.unwrap());
     }
 
     // Wait for the follower to catch up.
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     loop {
-        if replicator.follower_watermark().is_some() {
+        if replicator.follower_watermark() == last_lsn {
             break;
         }
         assert!(

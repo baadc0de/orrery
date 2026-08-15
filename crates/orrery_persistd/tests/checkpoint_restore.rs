@@ -11,8 +11,8 @@ use std::time::Duration;
 use orrery_persistd::checkpoint::{CheckpointStore, MemCheckpointStore};
 use orrery_persistd::journal::{AdaptiveCommitMode, GroupCommitConfig};
 use orrery_persistd::{
-    CellRuntime, CheckpointConfig, JournalConfig, RuntimeConfig, payload_crc,
-    spawn_checkpoint_scheduler,
+    payload_crc, spawn_checkpoint_scheduler, CellRuntime, CheckpointConfig, JournalConfig,
+    RuntimeConfig,
 };
 
 use orrery_protocol::{CellId, Epoch, GridId, JournalRecord, Lsn, PersistId, RecordKind, Tick};
@@ -502,13 +502,11 @@ async fn fdb_checkpoint_roundtrip() {
         .unwrap();
     assert_eq!(ckpt.entities.len(), 10);
     store.delete(CellId::ROOT, GridId::new(9001)).await.unwrap();
-    assert!(
-        store
-            .load(CellId::ROOT, GridId::new(9001))
-            .await
-            .unwrap()
-            .is_none()
-    );
+    assert!(store
+        .load(CellId::ROOT, GridId::new(9001))
+        .await
+        .unwrap()
+        .is_none());
     rt.close().await.unwrap();
 }
 
@@ -617,13 +615,11 @@ async fn fdb_cold_cell_area_load() {
     }
 
     store.delete(CellId::ROOT, GridId::new(9003)).await.unwrap();
-    assert!(
-        store
-            .read_cold(GridId::new(9003), CellId::ROOT)
-            .await
-            .unwrap()
-            .is_none()
-    );
+    assert!(store
+        .read_cold(GridId::new(9003), CellId::ROOT)
+        .await
+        .unwrap()
+        .is_none());
 }
 
 #[cfg(feature = "fdb")]
@@ -729,20 +725,16 @@ async fn fdb_subtree_keying_and_watermark_only_checkpoint() {
 
     // P-3: delete clears the shard's subtree but not the foreign row.
     store.delete(shard, GridId::new(9004)).await.unwrap();
-    assert!(
-        store
-            .load(shard, GridId::new(9004))
-            .await
-            .unwrap()
-            .is_none()
-    );
-    assert!(
-        store
-            .read_cold(GridId::new(9004), shard)
-            .await
-            .unwrap()
-            .is_none()
-    );
+    assert!(store
+        .load(shard, GridId::new(9004))
+        .await
+        .unwrap()
+        .is_none());
+    assert!(store
+        .read_cold(GridId::new(9004), shard)
+        .await
+        .unwrap()
+        .is_none());
     let foreign_page = store
         .read_cold(GridId::new(9004), foreign)
         .await
@@ -752,13 +744,11 @@ async fn fdb_subtree_keying_and_watermark_only_checkpoint() {
     assert!(foreign_page.entities.contains_key(&PersistId::new(3)));
 
     store.delete(foreign, GridId::new(9004)).await.unwrap();
-    assert!(
-        store
-            .read_cold(GridId::new(9004), foreign)
-            .await
-            .unwrap()
-            .is_none()
-    );
+    assert!(store
+        .read_cold(GridId::new(9004), foreign)
+        .await
+        .unwrap()
+        .is_none());
 }
 
 #[cfg(feature = "fdb")]
@@ -874,13 +864,11 @@ async fn fdb_tombstones_write_gc_and_isolate_grids() {
     assert!(page2.entities.contains_key(&PersistId::new(3)));
 
     store.delete(shard, GridId::new(9005)).await.unwrap();
-    assert!(
-        store
-            .load(shard, GridId::new(9005))
-            .await
-            .unwrap()
-            .is_none()
-    );
+    assert!(store
+        .load(shard, GridId::new(9005))
+        .await
+        .unwrap()
+        .is_none());
     let page2_after = store
         .read_cold(g2, cell)
         .await

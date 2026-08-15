@@ -16,11 +16,10 @@
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
 
 use tokio::sync::{broadcast, Notify};
-use tokio::time::Instant;
 
 use orrery_protocol::{JournalRecord, Lsn};
 
@@ -121,14 +120,14 @@ impl StagedAppend {
 #[derive(Debug)]
 pub(crate) struct CommitQueue {
     inner: Mutex<VecDeque<Pending>>,
-    wake: Notify,
+    condvar: Condvar,
 }
 
 impl CommitQueue {
     fn new() -> Self {
         Self {
             inner: Mutex::new(VecDeque::new()),
-            wake: Notify::new(),
+            condvar: Condvar::new(),
         }
     }
 
@@ -137,11 +136,7 @@ impl CommitQueue {
             .lock()
             .expect("commit queue lock")
             .push_back(pending);
-        self.wake.notify_one();
-    }
-
-    fn len(&self) -> usize {
-        self.inner.lock().expect("commit queue lock").len()
+        self.condvar.notify_one();
     }
 }
 
@@ -151,7 +146,7 @@ pub(crate) struct CommitterState {
     config: GroupCommitConfig,
     queue: CommitQueue,
     shutdown_flag: AtomicBool,
-    shutdown: Notify,
+    exited_flag: AtomicBool,
     /// Notified once the committer task has exited (releasing its store clone).
     exited: Notify,
     flushing: AtomicBool,
@@ -224,26 +219,29 @@ impl CommitterHandle {
     /// Arm shutdown: the committer drains pending appends, flushes, then stops.
     pub(crate) fn shutdown(&self) {
         self.state.shutdown_flag.store(true, Ordering::Release);
-        self.state.shutdown.notify_waiters();
+        self.state.queue.condvar.notify_all();
     }
 
     /// Wait until the committer task has exited (releasing its store clone).
     pub(crate) async fn wait_exit(&self) {
+        if self.state.exited_flag.load(Ordering::Acquire) {
+            return;
+        }
         self.state.exited.notified().await;
     }
 }
 
-/// Atomically stage a selected group and durably persist it. Runs on a
-/// blocking thread because both Fjall staging and `fdatasync` may block.
+impl Drop for CommitterHandle {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+/// Atomically stage a selected group and durably persist it.
 pub(crate) type CommitFn =
     Arc<dyn Fn(&[Pending]) -> Result<StoreCommitTimings, JournalError> + Send + Sync>;
 
-/// Start the group-commit committer task.
-///
-/// `commit` must stage every supplied append in one atomic store batch and
-/// durably persist that batch before returning success. It runs on a blocking
-/// thread so neither staging nor `fdatasync` blocks the async runtime.
-/// `published` receives each durably-flushed record (for chain replication).
+/// Start the group-commit committer task on a dedicated OS thread.
 pub(crate) fn spawn_committer(
     config: GroupCommitConfig,
     commit: CommitFn,
@@ -255,7 +253,7 @@ pub(crate) fn spawn_committer(
         config,
         queue: CommitQueue::new(),
         shutdown_flag: AtomicBool::new(false),
-        shutdown: Notify::new(),
+        exited_flag: AtomicBool::new(false),
         exited: Notify::new(),
         flushing: AtomicBool::new(false),
         committed: Mutex::new(recovered_committed),
@@ -265,77 +263,77 @@ pub(crate) fn spawn_committer(
     });
 
     let task_state = Arc::clone(&state);
-    tokio::task::spawn(async move {
-        run_committer(task_state, commit).await;
-    });
+    std::thread::Builder::new()
+        .name("journal-committer".into())
+        .spawn(move || {
+            run_committer(task_state, commit);
+        })
+        .expect("spawn journal committer thread");
 
     CommitterHandle { state }
 }
 
-async fn run_committer(state: Arc<CommitterState>, commit: CommitFn) {
+fn run_committer(state: Arc<CommitterState>, commit: CommitFn) {
     loop {
-        // Shutdown with nothing pending: exit and release the store clone.
-        if state.shutdown_armed() && state.queue.len() == 0 {
-            break;
+        let mut guard = state.queue.inner.lock().expect("commit queue lock");
+        while guard.is_empty() && !state.shutdown_armed() {
+            guard = state.queue.condvar.wait(guard).expect("condvar wait");
         }
-
-        // Wait until there is work (or shutdown).
-        if state.queue.len() == 0 {
-            tokio::select! {
-                _ = state.queue.wake.notified() => {}
-                _ = state.shutdown.notified() => {}
+        if guard.is_empty() {
+            if state.shutdown_armed() {
+                break;
             }
             continue;
         }
 
-        // Decide whether to batch (wait for more appends) or flush immediately.
         let idle_fast_path = state.config.mode == AdaptiveCommitMode::Adaptive
-            && state.queue.len() == 1
-            && !state.is_flushing();
+            && guard.len() == 1
+            && !state.is_flushing()
+            && state.config.batch_window == Duration::ZERO;
 
         if !state.shutdown_armed()
             && !idle_fast_path
             && state.config.mode != AdaptiveCommitMode::AlwaysIdle
+            && state.config.batch_window > Duration::ZERO
         {
-            // Batch: hold the fsync until the oldest pending append has been
-            // waiting `batch_window`. The window is measured from the batch's
-            // first arrival, not by a fresh `sleep(batch_window)` raced against
-            // the wake `Notify` — under load the queue's `notify_one` permit
-            // is always buffered (N pushes, 1 waiter), so the old select
-            // resolved through the permit branch instantly and every batch
-            // flushed after ~0 ms of accumulation.
-            let deadline = {
-                let queue = state.queue.inner.lock().expect("commit queue lock");
-                queue
-                    .front()
-                    .map_or_else(Instant::now, |oldest| oldest.arrived)
-                    + state.config.batch_window
-            };
-            loop {
-                // A size cap already reached flushes early.
-                let (qlen, qbytes) = {
-                    let queue = state.queue.inner.lock().expect("commit queue lock");
-                    (queue.len(), queue.iter().map(|p| p.bytes).sum::<usize>())
-                };
+            let deadline = guard
+                .front()
+                .map_or_else(Instant::now, |oldest| oldest.arrived)
+                + state.config.batch_window;
+            while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
+                if state.shutdown_armed() {
+                    break;
+                }
+                let (qlen, qbytes) = (guard.len(), guard.iter().map(|p| p.bytes).sum::<usize>());
                 if qlen >= state.config.batch_max_records || qbytes >= state.config.batch_max_bytes
                 {
                     break;
                 }
-                let now = Instant::now();
-                if now >= deadline {
-                    break;
-                }
-                tokio::select! {
-                    // New work: re-check the caps (and possibly the queue's
-                    // first-arrival time is unchanged, so the deadline is).
-                    _ = state.queue.wake.notified() => {}
-                    _ = tokio::time::sleep_until(deadline) => break,
-                }
+                let (next_guard, _) = state
+                    .queue
+                    .condvar
+                    .wait_timeout(guard, remaining)
+                    .expect("condvar wait_timeout");
+                guard = next_guard;
             }
         }
 
-        // Drain the current queue into a batch, honoring caps.
-        let batch = drain_batch(&state);
+        let mut batch = Vec::new();
+        let mut bytes = 0usize;
+        while let Some(p) = guard.pop_front() {
+            bytes += p.bytes;
+            batch.push(p);
+            if state.config.mode == AdaptiveCommitMode::AlwaysIdle {
+                break;
+            }
+            if batch.len() >= state.config.batch_max_records
+                || bytes >= state.config.batch_max_bytes
+            {
+                break;
+            }
+        }
+        drop(guard);
+
         if batch.is_empty() {
             continue;
         }
@@ -346,7 +344,7 @@ async fn run_committer(state: Arc<CommitterState>, commit: CommitFn) {
             .max()
             .expect("non-empty batch");
         let records = u64::try_from(batch.len()).unwrap_or(u64::MAX);
-        let bytes = u64::try_from(batch.iter().map(|p| p.bytes).sum::<usize>()).unwrap_or(u64::MAX);
+        let batch_bytes = u64::try_from(bytes).unwrap_or(u64::MAX);
         let queue_wait = batch
             .iter()
             .map(|p| p.arrived.elapsed())
@@ -354,22 +352,16 @@ async fn run_committer(state: Arc<CommitterState>, commit: CommitFn) {
             .unwrap_or_default();
 
         state.flushing.store(true, Ordering::Release);
-        let (batch, blocking_dispatch, result) = commit_inner(&commit, batch).await;
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| commit(&batch)))
+            .unwrap_or_else(|_| Err(JournalError::Store("committer task panicked".into())));
         state.flushing.store(false, Ordering::Release);
 
         match result {
             Ok(store_timings) => {
                 state.flush_count.fetch_add(1, Ordering::AcqRel);
                 state.set_committed(max_lsn);
-                let resolve_started = std::time::Instant::now();
+                let resolve_started = Instant::now();
                 for p in batch {
-                    // Publish for chain replication — except records that
-                    // arrived via chain replication themselves (`!publish`),
-                    // which must not echo back to their origin (§4). A full
-                    // channel is a lag signal (the subscriber rescans from its
-                    // watermark). Queue the durability notification before
-                    // waking the client handle, so a client-observed commit
-                    // cannot strand a replicator asleep at the preceding tail.
                     if p.publish {
                         let _ = state.published.send(p.record);
                     }
@@ -379,11 +371,11 @@ async fn run_committer(state: Arc<CommitterState>, commit: CommitFn) {
                 state.metrics.record_group(JournalStageSnapshot {
                     flushes: 1,
                     records,
-                    bytes,
+                    bytes: batch_bytes,
                     queue_wait_us_sum: duration_us(queue_wait),
                     queue_wait_us_max: duration_us(queue_wait),
-                    blocking_dispatch_us_sum: duration_us(blocking_dispatch),
-                    blocking_dispatch_us_max: duration_us(blocking_dispatch),
+                    blocking_dispatch_us_sum: 0,
+                    blocking_dispatch_us_max: 0,
                     fjall_batch_commit_us_sum: duration_us(store_timings.fjall_batch_commit),
                     fjall_batch_commit_us_max: duration_us(store_timings.fjall_batch_commit),
                     sync_data_us_sum: duration_us(store_timings.sync_data),
@@ -399,7 +391,8 @@ async fn run_committer(state: Arc<CommitterState>, commit: CommitFn) {
             }
         }
     }
-    state.exited.notify_one();
+    state.exited_flag.store(true, Ordering::Release);
+    state.exited.notify_waiters();
 }
 
 impl CommitterState {
@@ -408,64 +401,8 @@ impl CommitterState {
     }
 }
 
-async fn commit_inner(
-    commit: &CommitFn,
-    batch: Vec<Pending>,
-) -> (
-    Vec<Pending>,
-    Duration,
-    Result<StoreCommitTimings, JournalError>,
-) {
-    let commit = Arc::clone(commit);
-    let dispatched = std::time::Instant::now();
-    tokio::task::spawn_blocking(move || {
-        let blocking_dispatch = dispatched.elapsed();
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| commit(&batch)))
-            .unwrap_or_else(|_| Err(JournalError::Store("committer task panicked".into())));
-        (batch, blocking_dispatch, result)
-    })
-    .await
-    .unwrap_or_else(|_| {
-        // A join failure after the blocking closure owns the batch is only
-        // possible if Tokio cancels the task itself. There are no handles left
-        // to resolve in that case, so make the invariant failure explicit.
-        panic!("journal committer blocking task was cancelled")
-    })
-}
-
 fn duration_us(duration: Duration) -> u64 {
     u64::try_from(duration.as_micros()).unwrap_or(u64::MAX)
-}
-
-fn drain_batch(state: &CommitterState) -> Vec<Pending> {
-    let mut batch = Vec::new();
-    let mut bytes = 0usize;
-    let max_records = state.config.batch_max_records;
-    let max_bytes = state.config.batch_max_bytes;
-
-    if state.config.mode == AdaptiveCommitMode::AlwaysIdle {
-        // Flush one record at a time.
-        if let Some(pending) = state
-            .queue
-            .inner
-            .lock()
-            .expect("commit queue lock")
-            .pop_front()
-        {
-            batch.push(pending);
-        }
-        return batch;
-    }
-
-    let mut queue = state.queue.inner.lock().expect("commit queue lock");
-    while batch.len() < max_records && bytes < max_bytes {
-        let Some(pending) = queue.pop_front() else {
-            break;
-        };
-        bytes += pending.bytes;
-        batch.push(pending);
-    }
-    batch
 }
 
 #[cfg(test)]

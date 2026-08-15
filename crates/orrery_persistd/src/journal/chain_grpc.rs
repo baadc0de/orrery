@@ -15,19 +15,19 @@
 
 use std::collections::BTreeMap;
 use std::pin::Pin;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 
 use bytes::{Buf, BufMut};
 use futures::{SinkExt, Stream};
-use hyper_util::client::legacy::{Client, connect::HttpConnector};
+use hyper_util::client::legacy::{connect::HttpConnector, Client};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto;
 use prost::encoding::{self as pb, DecodeContext, WireType};
 use prost::{DecodeError, Message};
-use tokio::sync::{Mutex, broadcast};
+use tokio::sync::{broadcast, Mutex};
 use tonic::codec::{BufferSettings, Codec, DecodeBuf, Decoder, EncodeBuf, Encoder};
-use tonic::codegen::{Body, BoxFuture, Service, StdError, http};
+use tonic::codegen::{http, Body, BoxFuture, Service, StdError};
 use tonic::{Request, Response, Status};
 
 use orrery_protocol::{JournalRecord, Lsn, NodeId};
@@ -1381,41 +1381,35 @@ mod tests {
             .reconnect(reconnect_request(&id, nonce))
             .await
             .unwrap();
-        assert!(
-            replica
-                .append(batch_request(&id, nonce, 1, None, &[record(10, 1)]))
-                .await
-                .is_err()
-        );
-        assert!(
-            replica
-                .append(batch_request(
-                    &id,
-                    nonce,
-                    0,
-                    None,
-                    &[record(10, 1), record(20, 2)],
-                ))
-                .await
-                .is_err()
-        );
+        assert!(replica
+            .append(batch_request(&id, nonce, 1, None, &[record(10, 1)]))
+            .await
+            .is_err());
+        assert!(replica
+            .append(batch_request(
+                &id,
+                nonce,
+                0,
+                None,
+                &[record(10, 1), record(20, 2)],
+            ))
+            .await
+            .is_err());
         assert_eq!(replica.state.lock().await.cursor, Cursor::default());
         replica
             .append(batch_request(&id, nonce, 0, None, &[record(10, 1)]))
             .await
             .unwrap();
-        assert!(
-            replica
-                .append(batch_request(
-                    &id,
-                    nonce,
-                    1,
-                    Some(Lsn::new(0, 9)),
-                    &[record(11, 2)],
-                ))
-                .await
-                .is_err()
-        );
+        assert!(replica
+            .append(batch_request(
+                &id,
+                nonce,
+                1,
+                Some(Lsn::new(0, 9)),
+                &[record(11, 2)],
+            ))
+            .await
+            .is_err());
         assert_eq!(
             replica.state.lock().await.cursor.watermark,
             Some(Lsn::new(0, 10))
@@ -1515,12 +1509,10 @@ mod tests {
             chain(1, 9, 2, 1),
             chain(1, 9, 1, 2),
         ] {
-            assert!(
-                replica
-                    .reconnect(reconnect_request(&wrong, [5; 16]))
-                    .await
-                    .is_err()
-            );
+            assert!(replica
+                .reconnect(reconnect_request(&wrong, [5; 16]))
+                .await
+                .is_err());
         }
         assert_eq!(replica.state.lock().await.cursor, Cursor::default());
         journal.close().await.unwrap();
@@ -1571,24 +1563,20 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(
-            replica
-                .append(batch_request(&id, stale, 0, None, &[record(10, 1)]))
-                .await
-                .is_err()
-        );
-        assert!(
-            replica
-                .append(batch_request(
-                    &chain(1, 9, 2, 1),
-                    current,
-                    0,
-                    None,
-                    &[record(10, 1)],
-                ))
-                .await
-                .is_err()
-        );
+        assert!(replica
+            .append(batch_request(&id, stale, 0, None, &[record(10, 1)]))
+            .await
+            .is_err());
+        assert!(replica
+            .append(batch_request(
+                &chain(1, 9, 2, 1),
+                current,
+                0,
+                None,
+                &[record(10, 1)],
+            ))
+            .await
+            .is_err());
         assert_eq!(replica.state.lock().await.cursor, Cursor::default());
 
         replica

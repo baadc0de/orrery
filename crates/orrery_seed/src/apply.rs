@@ -15,7 +15,7 @@ use crate::idmap::{self, BlockGrantCursor, SeedMap, SeedMapRow};
 use crate::manifest::{ManifestEntry, ManifestWriter};
 use crate::scenario::ResolvedScenario;
 use crate::seedtree::SeedRoot;
-use crate::split::{FieldOracle, split_cell};
+use crate::split::{split_cell, FieldOracle};
 use crate::write::{self, EncodedRow};
 
 /// Writer options.

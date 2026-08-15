@@ -80,12 +80,12 @@ pub fn validate(
             let body = hex.strip_prefix("0x").unwrap_or(hex);
             if body.len() / 2 > 100 * 1024 {
                 return Err(snippet_error(
-                source,
-                "bytes",
-                format!(
-                    "archetype {name:?} hex escape projects a world value above the 100 KB hard limit (V9)"
-                ),
-            ));
+                    source,
+                    "bytes",
+                    format!(
+                        "archetype {name:?} hex escape projects a world value above the 100 KB hard limit (V9)"
+                    ),
+                ));
             }
         }
     }

@@ -26,7 +26,8 @@ pub use fdb::FdbCheckpointStore;
 mod scheduler;
 
 pub use scheduler::{
-    spawn_checkpoint_scheduler, CheckpointConfig, CheckpointScheduler, QuiesceSignal,
+    spawn_checkpoint_scheduler, spawn_checkpoint_scheduler_direct, CheckpointConfig,
+    CheckpointScheduler, QuiesceSignal,
 };
 
 /// The durable payload of one shard cell's checkpoint (§8, `ckpt/{shard}` row).

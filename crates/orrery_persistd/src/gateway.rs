@@ -764,7 +764,7 @@ fn admit_intent(
     }
 
     // 3. Admission (the Ruleset stub for now).
-    let precheck = match validator.validate(&intent) {
+    let precheck = match validator.validate(intent) {
         IntentVerdict::Admit(precheck) => precheck,
         IntentVerdict::Reject { reason } => return Err(IntentOutcome::Rejected { reason }),
     };

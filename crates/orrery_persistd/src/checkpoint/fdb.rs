@@ -43,8 +43,8 @@ use futures::TryStreamExt;
 
 use orrery_protocol::{CellId, Epoch, GridId, Lsn, PersistId};
 
-use crate::FdbContext;
 use crate::keyspace;
+use crate::FdbContext;
 
 use crate::actor::{EntityRecord, SnapshotPage, Tombstone};
 use crate::checkpoint::{CheckpointData, CheckpointError, CheckpointStore, ColdCellReader};
@@ -239,18 +239,61 @@ impl CheckpointStore for FdbCheckpointStore {
         // pass's clock, so an interrupted checkpoint re-runs identically.
         let db = Arc::clone(&self.db);
         let data = data.clone();
+
+        // Prepare entity rows
+        let entries: Vec<([u8; 21], Vec<u8>)> = data
+            .entities
+            .iter()
+            .map(|(entity, record)| {
+                let cell = data.by_cell.get(entity).copied().unwrap_or(data.shard);
+                let key = keyspace::world_key(data.grid, cell, *entity);
+                (key, keyspace::encode_live_value(&record.components))
+            })
+            .collect();
+
+        // Write entity rows in parallel bounded chunks to avoid FDB commit latency spikes.
+        let chunk_futures: Vec<_> = entries
+            .chunks(2000)
+            .map(|chunk| {
+                let chunk = chunk.to_vec();
+                let db = Arc::clone(&db);
+                let data = data.clone();
+                async move {
+                    db.run(|trx, _| {
+                        let chunk = chunk.clone();
+                        let data = data.clone();
+                        async move {
+                            require_active_fence(
+                                &trx,
+                                data.grid,
+                                data.shard,
+                                data.node_id,
+                                data.epoch,
+                            )
+                            .await?;
+                            for (key, val) in &chunk {
+                                trx.set(key, val);
+                            }
+                            Ok(())
+                        }
+                    })
+                    .await
+                }
+            })
+            .collect();
+
+        futures::future::try_join_all(chunk_futures).await.map_err(
+            |e: foundationdb::FdbBindingError| {
+                CheckpointError::Store(format!("checkpoint chunk txn: {e}"))
+            },
+        )?;
+
+        // Final transaction: tombstones and checkpoint metadata
+        let data = data.clone();
         db.run(|trx, _| {
             let data = data.clone();
             async move {
                 require_active_fence(&trx, data.grid, data.shard, data.node_id, data.epoch).await?;
-                for (entity, record) in &data.entities {
-                    // P-2: keyed by the entity's own cell (§6
-                    // `world/{cell_id}/…`), not the shard. `by_cell` is carried
-                    // on the checkpoint for exactly this. P-7: grid-scoped.
-                    let cell = data.by_cell.get(entity).copied().unwrap_or(data.shard);
-                    let key = keyspace::world_key(data.grid, cell, *entity);
-                    trx.set(&key, &keyspace::encode_live_value(&record.components));
-                }
                 for (entity, tombstone) in &data.tombstones {
                     let key = keyspace::world_key(data.grid, tombstone.cell, *entity);
                     if tombstone.gc_deadline_ms <= data.taken_at_ms {
@@ -273,7 +316,7 @@ impl CheckpointStore for FdbCheckpointStore {
         })
         .await
         .map_err(|e: foundationdb::FdbBindingError| {
-            CheckpointError::Store(format!("checkpoint txn: {e}"))
+            CheckpointError::Store(format!("checkpoint meta txn: {e}"))
         })
     }
 

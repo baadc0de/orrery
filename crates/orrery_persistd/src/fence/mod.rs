@@ -486,10 +486,9 @@ mod tests {
         else {
             panic!("bootstrap activation must succeed");
         };
-        assert!(
-            rows.iter()
-                .all(|(_, row)| row.owner == 8 && row.epoch == Epoch::new(1))
-        );
+        assert!(rows
+            .iter()
+            .all(|(_, row)| row.owner == 8 && row.epoch == Epoch::new(1)));
 
         let stale = [
             ShardActivation {

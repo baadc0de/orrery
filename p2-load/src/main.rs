@@ -54,7 +54,6 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, Context, Result};
 use bytes::Bytes;
 use clap::Parser;
-use futures::FutureExt;
 use iroh::endpoint::Connection;
 use iroh::{Endpoint, EndpointAddr, SecretKey};
 use serde::{Deserialize, Serialize};
@@ -482,13 +481,15 @@ async fn read_snapshot_batch(
     Ok(chunks)
 }
 
+type RecoveredPageMap = BTreeMap<CellId, BTreeMap<u32, (Vec<PersistId>, Vec<Bytes>)>>;
+
 /// Decode and filter physical-cell pages, retaining each response cell.
 ///
 /// Callers must use leaf pages for a storage-cell identity proof; ROOT pages
 /// are suitable only for discovery.
 fn recovered_snapshot_diffs(
     wanted_ids: BTreeSet<PersistId>,
-    pages: BTreeMap<CellId, BTreeMap<u32, (Vec<PersistId>, Vec<Bytes>)>>,
+    pages: RecoveredPageMap,
 ) -> Result<Vec<RecoveredDiff>> {
     let mut actual = BTreeMap::new();
     for (cell, chunks) in pages {
@@ -802,41 +803,6 @@ enum InboundEvent {
         session: usize,
         error: String,
     },
-}
-
-/// Drain every currently-ready connection on the load-loop task.
-///
-/// The timestamp is taken immediately when QUIC yields each datagram, before
-/// later packets are handled. This retains wire-receipt semantics without a
-/// receiver task and unbounded-channel wakeup for every live connection.
-fn scan_inbound(sessions: &[Connection], closed: &mut [bool]) -> Vec<InboundEvent> {
-    let mut events = Vec::new();
-    for (session, conn) in sessions.iter().enumerate() {
-        if closed[session] {
-            continue;
-        }
-        loop {
-            match conn.read_datagram().now_or_never() {
-                Some(Ok(packet)) => events.push(InboundEvent::Datagram {
-                    session,
-                    packet,
-                    // Stamp at the point the QUIC read resolves, before this
-                    // packet waits behind later scans or reply handling.
-                    received_at: Instant::now(),
-                }),
-                Some(Err(error)) => {
-                    closed[session] = true;
-                    events.push(InboundEvent::Closed {
-                        session,
-                        error: error.to_string(),
-                    });
-                    break;
-                }
-                None => break,
-            }
-        }
-    }
-    events
 }
 
 /// Send one `GatewayMsg` on the packet lane. Bulk diffs are tagged datagrams;
@@ -1202,7 +1168,6 @@ impl Rig<'_> {
         let mut flush_index = 0_u64;
         let mut stats = RunStats::default();
         let sink = TelemetrySink::new();
-        let mut closed_sessions = vec![false; sessions];
 
         // Area load: one 27-cell subscribe per session at startup, measuring
         // time-to-first-page per session (D16: area first page-in < 50 ms).
@@ -1234,11 +1199,41 @@ impl Rig<'_> {
             .map(|session| start + session_phase_period * session_flush_phase(session) as u32)
             .collect::<Vec<_>>();
 
+        let (inbound_tx, mut inbound_rx) = tokio::sync::mpsc::unbounded_channel();
+        for (session, conn) in self.sessions.iter().enumerate() {
+            let conn = conn.clone();
+            let tx = inbound_tx.clone();
+            tokio::spawn(async move {
+                loop {
+                    match conn.read_datagram().await {
+                        Ok(packet) => {
+                            let received_at = Instant::now();
+                            if tx
+                                .send(InboundEvent::Datagram {
+                                    session,
+                                    packet,
+                                    received_at,
+                                })
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                        Err(error) => {
+                            let _ = tx.send(InboundEvent::Closed {
+                                session,
+                                error: error.to_string(),
+                            });
+                            break;
+                        }
+                    }
+                }
+            });
+        }
+
         while start.elapsed() < self.duration {
-            // ── Receive: one inline nonblocking connection scan. Keeping
-            // receipt work on this task avoids 125 receiver tasks and ~19k
-            // cross-task channel wakeups/s on the colocated test rig.
-            for event in scan_inbound(&self.sessions, &mut closed_sessions) {
+            // ── Receive: drain all events received from background tasks ──
+            while let Ok(event) = inbound_rx.try_recv() {
                 self.handle_inbound(
                     event,
                     &mut schedulers,
@@ -1248,12 +1243,14 @@ impl Rig<'_> {
                 );
             }
 
+            let now = Instant::now();
+
             // ── Load: queue each entity's diff for this global frame ─────
             //
             // Queueing is global so a state change is available to its owner
             // on that owner's next 20 Hz flush. The actual scheduler flushes
             // below are connection-phased: a frame is not a 125-session burst.
-            if Instant::now() >= next_queue {
+            if now >= next_queue {
                 // Allocate payloads only for this frame's rate cohort. A
                 // cohort is refreshed once per configured send interval,
                 // immediately before the scheduler can spend its next credit.
@@ -1278,17 +1275,17 @@ impl Rig<'_> {
                 }
                 flush_index += 1;
 
-                // Do not replay missed generation frames after a runtime
-                // stall: resume the 20 Hz open-loop clock without turning a
-                // pause into a catch-up burst on this colocated rig.
-                next_queue = Instant::now() + flush_period;
+                // Resume the 20 Hz open-loop clock maintaining exact phase cadence.
+                next_queue += flush_period;
+                while next_queue <= now {
+                    next_queue += flush_period;
+                }
             }
 
             // Flush each connection at 20 Hz, offset within the global frame.
             // Each shard retains its own byte budget; only *when* its packets
             // are released changes. This removes a synthetic 1,000-packet
             // burst from the rig without reducing its 20,000 diff/s profile.
-            let now = Instant::now();
             for (session, sched) in schedulers.iter_mut().enumerate() {
                 if now < next_session_flush[session] {
                     continue;
@@ -1326,9 +1323,11 @@ impl Rig<'_> {
                     );
                     stats.diffs_sent += 1;
                 }
-                // If a runtime stall skips a phase, resume this session on
-                // its regular cadence rather than issuing catch-up bursts.
-                next_session_flush[session] = now + flush_period;
+                // Advance to next period maintaining exact slot alignment.
+                next_session_flush[session] += flush_period;
+                while next_session_flush[session] <= now {
+                    next_session_flush[session] += flush_period;
+                }
             }
 
             // Drain queued intents to the wire after the phased bulk sends.
@@ -1352,7 +1351,19 @@ impl Rig<'_> {
                 sink.drain_histogram(telemetry::SERIES_INTENT_COMMIT, intents.intent_latency());
             }
 
-            tokio::time::sleep(Duration::from_millis(1)).await;
+            let now = Instant::now();
+            let mut next_wake = next_queue;
+            for &flush_at in &next_session_flush {
+                if flush_at < next_wake {
+                    next_wake = flush_at;
+                }
+            }
+            if next_wake > now {
+                let sleep_dur = next_wake.saturating_duration_since(now);
+                tokio::time::sleep(sleep_dur.min(Duration::from_millis(1))).await;
+            } else {
+                tokio::task::yield_now().await;
+            }
             elapsed = start.elapsed();
         }
 
@@ -1365,19 +1376,26 @@ impl Rig<'_> {
             if remaining.is_zero() {
                 break;
             }
-            let events = scan_inbound(&self.sessions, &mut closed_sessions);
-            let had_events = !events.is_empty();
-            for event in events {
-                self.handle_inbound(
-                    event,
-                    &mut schedulers,
-                    &mut intents,
-                    &mut stats,
-                    &mut area_pending,
-                );
-            }
-            if !had_events {
-                tokio::time::sleep(remaining.min(Duration::from_millis(1))).await;
+            tokio::select! {
+                Some(event) = inbound_rx.recv() => {
+                    self.handle_inbound(
+                        event,
+                        &mut schedulers,
+                        &mut intents,
+                        &mut stats,
+                        &mut area_pending,
+                    );
+                    while let Ok(event) = inbound_rx.try_recv() {
+                        self.handle_inbound(
+                            event,
+                            &mut schedulers,
+                            &mut intents,
+                            &mut stats,
+                            &mut area_pending,
+                        );
+                    }
+                }
+                _ = tokio::time::sleep(remaining) => break,
             }
         }
 
@@ -1749,7 +1767,7 @@ mod tests {
         // not all flush on the same 50 ms boundary: with eight diffs per
         // session that would make an artificial 1,000-packet burst. Twenty
         // intra-frame phases leave six or seven sessions in each 2.5 ms slot.
-        let mut counts = vec![0usize; SESSION_FLUSH_PHASE_SLOTS];
+        let mut counts = [0usize; SESSION_FLUSH_PHASE_SLOTS];
         for session in 0..125 {
             counts[session_flush_phase(session)] += 1;
         }

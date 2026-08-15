@@ -65,6 +65,47 @@ pub trait Router: Send + Sync {
 
 /// A router over a single runtime (one-node deployment).
 ///
+/// Direct dispatch into the actor mailbox without lock acquisition, pipelining
+/// concurrent applies directly into the journal's commit queue (§4).
+#[async_trait::async_trait]
+impl Router for CellRuntime {
+    async fn apply(&self, record: JournalRecord) -> Result<Arc<AppendHandle>, Reject> {
+        self.actor(record.grid, record.cell)
+            .ok_or(Reject::JournalClosed)?
+            .start_diff(record)
+            .await
+    }
+
+    async fn read(&self, grid: GridId, cell: CellId) -> Result<SnapshotPage, Reject> {
+        self.actor(grid, cell)
+            .ok_or(Reject::JournalClosed)?
+            .read_snapshot(vec![cell])
+            .await
+    }
+
+    async fn has_actor(&self, grid: GridId, cell: CellId) -> bool {
+        self.actor(grid, cell).is_some()
+    }
+}
+
+/// A router over a shared runtime.
+#[async_trait::async_trait]
+impl Router for Arc<CellRuntime> {
+    async fn apply(&self, record: JournalRecord) -> Result<Arc<AppendHandle>, Reject> {
+        <CellRuntime as Router>::apply(self.as_ref(), record).await
+    }
+
+    async fn read(&self, grid: GridId, cell: CellId) -> Result<SnapshotPage, Reject> {
+        <CellRuntime as Router>::read(self.as_ref(), grid, cell).await
+    }
+
+    async fn has_actor(&self, grid: GridId, cell: CellId) -> bool {
+        <CellRuntime as Router>::has_actor(self.as_ref(), grid, cell).await
+    }
+}
+
+/// A router over a single runtime behind a Mutex (test compatibility).
+///
 /// The guard is never held across an actor await: the handle is resolved
 /// under the lock, the lock is dropped, and the actor mailbox is awaited
 /// outside it — so concurrent applies pipeline into the journal's commit

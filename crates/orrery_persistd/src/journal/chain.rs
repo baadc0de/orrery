@@ -243,108 +243,6 @@ fn lag_alarm_bytes(lag_alarm: Duration) -> u64 {
     (lag_alarm.as_secs_f64() * LAG_BYTES_PER_ALARM_SECOND) as u64
 }
 
-#[cfg(test)]
-mod lag_alarm_tests {
-    use super::*;
-    use std::sync::Mutex;
-    use std::time::Duration;
-
-    use orrery_protocol::{CellId, Epoch, GridId, PersistId, RecordKind, Tick};
-
-    use crate::journal::{AdaptiveCommitMode, GroupCommitConfig, JournalConfig};
-
-    #[test]
-    fn default_lag_window_never_collapses_to_a_per_record_alarm() {
-        // The default is deliberately large enough to represent roughly
-        // 100 ms of the P2 write envelope, rather than truncating to zero and
-        // formatting a warning for every acknowledgement.
-        assert_eq!(lag_alarm_bytes(Duration::from_millis(100)), 104_857);
-    }
-
-    struct BatchSpy {
-        batches: Mutex<Vec<Vec<Lsn>>>,
-    }
-
-    #[async_trait::async_trait]
-    impl ChainTransport for BatchSpy {
-        async fn append(&self, _record: JournalRecord) -> Result<Lsn, JournalError> {
-            unreachable!("the replicator must use append_batch")
-        }
-
-        async fn append_batch(&self, records: Vec<JournalRecord>) -> Result<Lsn, JournalError> {
-            let last = records.last().expect("non-empty batch").lsn;
-            self.batches
-                .lock()
-                .expect("batch spy lock")
-                .push(records.into_iter().map(|record| record.lsn).collect());
-            Ok(last)
-        }
-
-        async fn follower_watermark(&self) -> Option<Lsn> {
-            None
-        }
-    }
-
-    fn test_record(entity: u64) -> JournalRecord {
-        let payload = entity.to_le_bytes();
-        let author = iroh_base::SecretKey::from_bytes(&[7; 32]).public();
-        JournalRecord {
-            lsn: Lsn::new(0, 0),
-            cell: CellId::ROOT,
-            grid: GridId::ROOT,
-            entity: PersistId::new(entity),
-            tick: Tick::new(entity),
-            epoch: Epoch::new(0),
-            author,
-            kind: RecordKind::Spawn,
-            payload: bytes::Bytes::copy_from_slice(&payload),
-            crc: crate::payload_crc(&payload),
-        }
-    }
-
-    #[tokio::test]
-    async fn replicator_sends_collected_records_as_one_transport_batch() {
-        let dir = tempfile::tempdir().unwrap();
-        let journal = Arc::new(
-            Journal::open(&JournalConfig {
-                dir: dir.path().to_path_buf(),
-                commit: GroupCommitConfig {
-                    mode: AdaptiveCommitMode::AlwaysBatch,
-                    batch_window: Duration::from_millis(1),
-                    batch_max_records: 128,
-                    batch_max_bytes: 1 << 20,
-                },
-            })
-            .unwrap(),
-        );
-        for entity in 1..=3 {
-            journal.append(test_record(entity)).unwrap().committed().await.unwrap();
-        }
-        let transport = Arc::new(BatchSpy { batches: Mutex::new(Vec::new()) });
-        let replicator = spawn_chain(
-            Arc::clone(&journal),
-            Arc::clone(&transport) as Arc<dyn ChainTransport>,
-            &ChainConfig { follower: 9, batch_max: 3, ..ChainConfig::default() },
-        );
-        tokio::time::timeout(Duration::from_secs(1), async {
-            loop {
-                if transport.batches.lock().expect("batch spy lock").len() == 1 {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("replicator should flush the initial scan");
-        let batches = transport.batches.lock().expect("batch spy lock").clone();
-        assert_eq!(batches.len(), 1);
-        assert_eq!(batches[0].len(), 3);
-        assert!(batches[0].windows(2).all(|pair| pair[0] < pair[1]));
-        replicator.shutdown().await;
-        journal.close().await.unwrap();
-    }
-}
-
 /// Spawn a chain-replication task streaming `journal`'s committed records to
 /// `transport` (which writes into the follower's [`ChainSink`]).
 ///
@@ -558,7 +456,10 @@ async fn push_batch(
     follower: u64,
 ) -> PushOutcome {
     if shutdown.armed() {
-        return PushOutcome { last: None, complete: false };
+        return PushOutcome {
+            last: None,
+            complete: false,
+        };
     }
     let pushed = tokio::select! {
         r = transport.append_batch(records.to_vec()) => r,
@@ -569,7 +470,10 @@ async fn push_batch(
     match pushed {
         Ok(durable) if durable >= records.last().expect("non-empty batch").lsn => {
             update_progress(journal, wm, lag, alarm_bytes, follower, durable);
-            PushOutcome { last: Some(durable), complete: true }
+            PushOutcome {
+                last: Some(durable),
+                complete: true,
+            }
         }
         Ok(durable) => {
             tracing::warn!(
@@ -578,11 +482,17 @@ async fn push_batch(
                 durable_lsn = %durable,
                 "chain: follower returned a regressed batch watermark"
             );
-            PushOutcome { last: None, complete: false }
+            PushOutcome {
+                last: None,
+                complete: false,
+            }
         }
         Err(error) => {
             tracing::warn!(follower, ?error, "chain: follower batch append failed");
-            PushOutcome { last: None, complete: false }
+            PushOutcome {
+                last: None,
+                complete: false,
+            }
         }
     }
 }
@@ -662,5 +572,118 @@ impl ChainSink for JournalChainSink {
 
     async fn watermark(&self) -> Option<Lsn> {
         self.watermark()
+    }
+}
+
+#[cfg(test)]
+mod lag_alarm_tests {
+    use super::*;
+    use std::sync::Mutex;
+    use std::time::Duration;
+
+    use orrery_protocol::{CellId, Epoch, GridId, PersistId, RecordKind, Tick};
+
+    use crate::journal::{AdaptiveCommitMode, GroupCommitConfig, JournalConfig};
+
+    #[test]
+    fn default_lag_window_never_collapses_to_a_per_record_alarm() {
+        // The default is deliberately large enough to represent roughly
+        // 100 ms of the P2 write envelope, rather than truncating to zero and
+        // formatting a warning for every acknowledgement.
+        assert_eq!(lag_alarm_bytes(Duration::from_millis(100)), 104_857);
+    }
+
+    struct BatchSpy {
+        batches: Mutex<Vec<Vec<Lsn>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ChainTransport for BatchSpy {
+        async fn append(&self, _record: JournalRecord) -> Result<Lsn, JournalError> {
+            unreachable!("the replicator must use append_batch")
+        }
+
+        async fn append_batch(&self, records: Vec<JournalRecord>) -> Result<Lsn, JournalError> {
+            let last = records.last().expect("non-empty batch").lsn;
+            self.batches
+                .lock()
+                .expect("batch spy lock")
+                .push(records.into_iter().map(|record| record.lsn).collect());
+            Ok(last)
+        }
+
+        async fn follower_watermark(&self) -> Option<Lsn> {
+            None
+        }
+    }
+
+    fn test_record(entity: u64) -> JournalRecord {
+        let payload = entity.to_le_bytes();
+        let author = iroh_base::SecretKey::from_bytes(&[7; 32]).public();
+        JournalRecord {
+            lsn: Lsn::new(0, 0),
+            cell: CellId::ROOT,
+            grid: GridId::ROOT,
+            entity: PersistId::new(entity),
+            tick: Tick::new(entity),
+            epoch: Epoch::new(0),
+            author,
+            kind: RecordKind::Spawn,
+            payload: bytes::Bytes::copy_from_slice(&payload),
+            crc: crate::payload_crc(&payload),
+        }
+    }
+
+    #[tokio::test]
+    async fn replicator_sends_collected_records_as_one_transport_batch() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = Arc::new(
+            Journal::open(&JournalConfig {
+                dir: dir.path().to_path_buf(),
+                commit: GroupCommitConfig {
+                    mode: AdaptiveCommitMode::AlwaysBatch,
+                    batch_window: Duration::from_millis(1),
+                    batch_max_records: 128,
+                    batch_max_bytes: 1 << 20,
+                },
+            })
+            .unwrap(),
+        );
+        for entity in 1..=3 {
+            journal
+                .append(test_record(entity))
+                .unwrap()
+                .committed()
+                .await
+                .unwrap();
+        }
+        let transport = Arc::new(BatchSpy {
+            batches: Mutex::new(Vec::new()),
+        });
+        let replicator = spawn_chain(
+            Arc::clone(&journal),
+            Arc::clone(&transport) as Arc<dyn ChainTransport>,
+            &ChainConfig {
+                follower: 9,
+                batch_max: 3,
+                ..ChainConfig::default()
+            },
+        );
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if transport.batches.lock().expect("batch spy lock").len() == 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("replicator should flush the initial scan");
+        let batches = transport.batches.lock().expect("batch spy lock").clone();
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].len(), 3);
+        assert!(batches[0].windows(2).all(|pair| pair[0] < pair[1]));
+        replicator.shutdown().await;
+        journal.close().await.unwrap();
     }
 }

@@ -8,7 +8,7 @@ use std::sync::Arc;
 use orrery_protocol::{CellId, Epoch, GridId, JournalRecord, Lsn, PersistId, RecordKind};
 
 use crate::actor::{
-    self, CellActorHandle, EntityRecord, SnapshotPage, TOMBSTONE_RETENTION_MS, Tombstone,
+    self, CellActorHandle, EntityRecord, SnapshotPage, Tombstone, TOMBSTONE_RETENTION_MS,
 };
 use crate::checkpoint::{CheckpointData, CheckpointStore};
 use crate::crc::crc32c;

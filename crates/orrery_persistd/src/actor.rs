@@ -666,7 +666,7 @@ pub fn spawn_preloaded(
     ckpt_watermark: Lsn,
     joins: &Arc<ActorJoinSet>,
 ) -> CellActorHandle {
-    let (tx, rx) = mpsc::channel(64);
+    let (tx, rx) = mpsc::channel(4096);
     let mut env = ActorEnv {
         state: CellActorState {
             shard,

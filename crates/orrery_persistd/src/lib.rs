@@ -40,8 +40,9 @@ pub mod runtime;
 
 pub use actor::{CellActorHandle, CellMsg, EntityRecord, Reject, SnapshotPage, Tombstone};
 pub use checkpoint::{
-    spawn_checkpoint_scheduler, CheckpointConfig, CheckpointData, CheckpointError,
-    CheckpointScheduler, CheckpointStore, ColdCellReader, MemCheckpointStore, QuiesceSignal,
+    spawn_checkpoint_scheduler, spawn_checkpoint_scheduler_direct, CheckpointConfig,
+    CheckpointData, CheckpointError, CheckpointScheduler, CheckpointStore, ColdCellReader,
+    MemCheckpointStore, QuiesceSignal,
 };
 pub use cluster::{Cluster, ColdFallbackRouter, Router};
 #[cfg(feature = "fdb")]

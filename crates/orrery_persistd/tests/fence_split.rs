@@ -9,7 +9,7 @@ use std::time::Duration;
 use orrery_persistd::checkpoint::{CheckpointStore, MemCheckpointStore};
 use orrery_persistd::fence::{FenceError, FenceOutcome, FenceRow, FenceStatus, MemFenceStore};
 use orrery_persistd::journal::{AdaptiveCommitMode, GroupCommitConfig};
-use orrery_persistd::{CellRuntime, FenceStore, JournalConfig, RuntimeConfig, payload_crc};
+use orrery_persistd::{payload_crc, CellRuntime, FenceStore, JournalConfig, RuntimeConfig};
 
 use orrery_protocol::{CellId, Epoch, GridId, JournalRecord, Lsn, PersistId, RecordKind, Tick};
 
@@ -289,13 +289,12 @@ async fn split_partitions_entities_and_retires_parent() {
     }
 
     // Parent row retired; children active.
-    assert!(
-        rt.fence()
-            .read(GridId::ROOT, shard)
-            .await
-            .unwrap()
-            .is_none()
-    );
+    assert!(rt
+        .fence()
+        .read(GridId::ROOT, shard)
+        .await
+        .unwrap()
+        .is_none());
     for (child, _) in &child_rows {
         let row = rt
             .fence()
@@ -453,13 +452,12 @@ async fn split_conflicts_on_stale_parent_row() {
     assert!(rt.actor(GridId::ROOT, shard).is_some());
     for child in shard.children() {
         // No child fence row was written.
-        assert!(
-            rt.fence()
-                .read(GridId::ROOT, child)
-                .await
-                .unwrap()
-                .is_none()
-        );
+        assert!(rt
+            .fence()
+            .read(GridId::ROOT, child)
+            .await
+            .unwrap()
+            .is_none());
     }
 
     rt.close().await.unwrap();
@@ -576,10 +574,9 @@ async fn fdb_shard_set_activation_is_atomic_and_fenced() {
         other => panic!("expected activation, got {other:?}"),
     };
     assert_eq!(rows.len(), 2);
-    assert!(
-        rows.iter()
-            .all(|(_, row)| row.owner == 41 && row.epoch == Epoch::new(1))
-    );
+    assert!(rows
+        .iter()
+        .all(|(_, row)| row.owner == 41 && row.epoch == Epoch::new(1)));
 
     // One stale expectation rejects the *whole* set: the first shard must not
     // advance just because it still matched.
@@ -707,13 +704,12 @@ async fn fdb_runtime_split_end_to_end() {
 
     let child_rows = rt.split(shard, &parent_row).await.unwrap();
     assert_eq!(child_rows.len(), 8);
-    assert!(
-        rt.fence()
-            .read(GridId::ROOT, shard)
-            .await
-            .unwrap()
-            .is_none()
-    );
+    assert!(rt
+        .fence()
+        .read(GridId::ROOT, shard)
+        .await
+        .unwrap()
+        .is_none());
     for (i, child) in children.iter().enumerate() {
         let page = rt.read(GridId::ROOT, *child).await.unwrap();
         assert_eq!(page.entities.len(), 1, "child {child:?}");

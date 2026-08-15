@@ -175,6 +175,77 @@ pub fn spawn_checkpoint_scheduler(
     }
 }
 
+/// Spawn a checkpoint scheduler for an unlocked `Arc<CellRuntime>`.
+pub fn spawn_checkpoint_scheduler_direct(
+    runtime: Arc<CellRuntime>,
+    store: Arc<dyn CheckpointStore>,
+    config: &CheckpointConfig,
+) -> CheckpointScheduler {
+    let shutdown = Arc::new(tokio::sync::Notify::new());
+    let (quiesce_tx, mut quiesce_rx) = tokio::sync::mpsc::channel(64);
+
+    let interval = config.interval;
+    let jitter = config.jitter;
+    let shutdown_task = Arc::clone(&shutdown);
+
+    let join = tokio::spawn(async move {
+        let mut timers: Vec<(CellId, tokio::time::Instant)> = Vec::new();
+
+        loop {
+            let shards: Vec<CellId> = runtime.shards().copied().collect();
+
+            let now = tokio::time::Instant::now();
+            timers.retain(|(shard, _)| shards.contains(shard));
+
+            for &shard in &shards {
+                if !timers.iter().any(|(s, _)| *s == shard) {
+                    let delay = jittered(interval, jitter, shard);
+                    timers.push((shard, now + delay));
+                }
+            }
+
+            let next = timers
+                .iter()
+                .map(|(_, t)| *t)
+                .min()
+                .unwrap_or(now + interval);
+
+            let sleep = tokio::time::sleep_until(next);
+            tokio::pin!(sleep);
+            tokio::select! {
+                _ = &mut sleep => {}
+                _ = shutdown_task.notified() => break,
+                Some(cell) = quiesce_rx.recv() => {
+                    if let Ok(target) = runtime.checkpoint_target(cell) {
+                        if let Err(e) = target.checkpoint(store.as_ref()).await {
+                            tracing::warn!(shard = %cell, error = %e, "quiesce checkpoint failed");
+                        }
+                    }
+                    continue;
+                }
+            }
+
+            let now = tokio::time::Instant::now();
+            for (shard, due) in timers.iter_mut() {
+                if *due <= now {
+                    if let Ok(target) = runtime.checkpoint_target(*shard) {
+                        if let Err(e) = target.checkpoint(store.as_ref()).await {
+                            tracing::warn!(shard = %shard, error = %e, "scheduled checkpoint failed");
+                        }
+                    }
+                    *due = now + jittered(interval, jitter, *shard);
+                }
+            }
+        }
+    });
+
+    CheckpointScheduler {
+        shutdown,
+        join,
+        quiesce: QuiesceSignal { tx: quiesce_tx },
+    }
+}
+
 /// Checkpoint a single shard cell via the runtime.
 async fn checkpoint_cell(
     runtime: &Arc<tokio::sync::Mutex<CellRuntime>>,

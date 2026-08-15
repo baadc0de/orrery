@@ -1050,9 +1050,9 @@ fn resolve_bounds(
             "layer {layer_name:?}: bounds = \"all\" is unsupported in v1 for an entity-emit field — the uniform mass oracle needs a bounded region (docs/12 §5.1, V6)"
         ))),
         Some(BoundsSpec::Subtree { cell }) => {
-            let root = cell.resolve(cell_edge_m).map_err(|e| {
-                err(format!("layer {layer_name:?}: subtree cell: {e}"))
-            })?;
+            let root = cell
+                .resolve(cell_edge_m)
+                .map_err(|e| err(format!("layer {layer_name:?}: subtree cell: {e}")))?;
             if root.level() != level {
                 return Err(err(format!(
                     "layer {layer_name:?}: subtree root is level {} but the layer is level {level} — v1 needs the bounds at the layer level (docs/12 §5.1)",
@@ -1067,7 +1067,11 @@ fn resolve_bounds(
                 snap: None,
             })
         }
-        Some(BoundsSpec::Cells { level: bl, min, max }) => {
+        Some(BoundsSpec::Cells {
+            level: bl,
+            min,
+            max,
+        }) => {
             if *bl != level {
                 return Err(err(format!(
                     "layer {layer_name:?}: cells bounds are level {bl} but the layer is level {level}"
@@ -1075,9 +1079,8 @@ fn resolve_bounds(
             }
             // Validate corners are in range at the level.
             for c in [min, max] {
-                CellId::from_cell_coords(glam::IVec3::new(c[0], c[1], c[2]), level).map_err(
-                    |e| err(format!("layer {layer_name:?}: cells corner: {e}")),
-                )?;
+                CellId::from_cell_coords(glam::IVec3::new(c[0], c[1], c[2]), level)
+                    .map_err(|e| err(format!("layer {layer_name:?}: cells corner: {e}")))?;
             }
             Ok(ResolvedBounds {
                 level,
@@ -1090,9 +1093,9 @@ fn resolve_bounds(
             center,
             extent_cells,
         }) => {
-            let center = center.resolve(cell_edge_m).map_err(|e| {
-                err(format!("layer {layer_name:?}: box center: {e}"))
-            })?;
+            let center = center
+                .resolve(cell_edge_m)
+                .map_err(|e| err(format!("layer {layer_name:?}: box center: {e}")))?;
             let (cc, cl) = center.coords();
             if cl != level {
                 return Err(err(format!(
@@ -1130,9 +1133,9 @@ fn resolve_bounds(
             })
         }
         Some(BoundsSpec::Sphere { center, radius_m }) => {
-            let center = center.resolve(cell_edge_m).map_err(|e| {
-                err(format!("layer {layer_name:?}: sphere center: {e}"))
-            })?;
+            let center = center
+                .resolve(cell_edge_m)
+                .map_err(|e| err(format!("layer {layer_name:?}: sphere center: {e}")))?;
             let (cc, cl) = center.coords();
             if cl != level {
                 return Err(err(format!(

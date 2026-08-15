@@ -382,10 +382,9 @@ async fn every_written_value_carries_the_live_tag() {
         .await
         .expect("scan world");
     assert_eq!(rows.len(), 1_000, "smoke writes exactly 1000 world rows");
-    assert!(
-        rows.iter()
-            .all(|(_, value)| value.first() == Some(&keyspace::LIVE_TAG))
-    );
+    assert!(rows
+        .iter()
+        .all(|(_, value)| value.first() == Some(&keyspace::LIVE_TAG)));
 }
 
 #[cfg(feature = "fdb")]

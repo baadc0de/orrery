@@ -10,9 +10,12 @@ Cargo.lock
 *.swo
 .DS_Store
 
-# Logs / telemetry
+# Logs / telemetry / test output
 *.log
 *.tmp
+p2-kill9-*/
+p2-abba-*/
+p2-gateway-*/
 
 # Device-local agent memory (never committed — lives only on this machine)
 .agents/memory/

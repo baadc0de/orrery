@@ -21,8 +21,8 @@ use bytes::Bytes;
 use iroh::RelayMode;
 use orrery_persistd::journal::{AdaptiveCommitMode, GroupCommitConfig};
 use orrery_persistd::{
-    CellRuntime, GATEWAY_ALPN, GatewayConfig, GatewayServer, JournalConfig, MemFenceStore,
-    MemIntentExecutor, Router, RuntimeConfig,
+    CellRuntime, GatewayConfig, GatewayServer, JournalConfig, MemFenceStore, MemIntentExecutor,
+    Router, RuntimeConfig, GATEWAY_ALPN,
 };
 use orrery_protocol::channels::{decode_stream_frame, encode_stream_frame};
 use orrery_protocol::{

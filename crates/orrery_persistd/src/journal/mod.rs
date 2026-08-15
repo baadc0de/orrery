@@ -70,6 +70,8 @@ pub struct AppendHandle {
 struct AppendHandleState {
     /// Set by the committer's `resolve`, read by `committed`.
     result: std::sync::Mutex<Option<Result<Lsn, JournalError>>>,
+    /// Fast-path readiness check before taking the mutex.
+    is_done: std::sync::atomic::AtomicBool,
     /// Wakes the waiter. `notify_one` (not `notify_waiters`) stores a permit
     /// when no waiter is registered, so a resolve that lands before the
     /// waiter suspends is never lost.
@@ -88,6 +90,7 @@ impl AppendHandle {
             metrics,
             state: std::sync::Arc::new(AppendHandleState {
                 result: std::sync::Mutex::new(None),
+                is_done: std::sync::atomic::AtomicBool::new(false),
                 done: tokio::sync::Notify::new(),
             }),
         }
@@ -115,6 +118,9 @@ impl AppendHandle {
             self.metrics.record(self.started.elapsed());
         }
         *self.state.result.lock().expect("handle lock") = Some(result);
+        self.state
+            .is_done
+            .store(true, std::sync::atomic::Ordering::Release);
         self.state.done.notify_one();
     }
 
@@ -128,8 +134,18 @@ impl AppendHandle {
     /// way the waiter wakes and observes the stored result.
     pub async fn committed(&self) -> Result<Lsn, JournalError> {
         // 1. Fast path: already resolved.
-        if let Some(r) = self.state.result.lock().expect("handle lock").as_ref() {
-            return r.clone();
+        if self
+            .state
+            .is_done
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return self
+                .state
+                .result
+                .lock()
+                .expect("handle lock")
+                .clone()
+                .unwrap_or(Err(JournalError::Closed));
         }
         // 2. Register interest, THEN re-check. Any resolve after the
         //    registration notifies this future (or stores the permit it will
@@ -137,8 +153,18 @@ impl AppendHandle {
         //    `pin!` gives the `Notified` an address so it stays registered
         //    across the re-check and the await.
         let notified = std::pin::pin!(self.state.done.notified());
-        if let Some(r) = self.state.result.lock().expect("handle lock").as_ref() {
-            return r.clone();
+        if self
+            .state
+            .is_done
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return self
+                .state
+                .result
+                .lock()
+                .expect("handle lock")
+                .clone()
+                .unwrap_or(Err(JournalError::Closed));
         }
         notified.await;
         self.state

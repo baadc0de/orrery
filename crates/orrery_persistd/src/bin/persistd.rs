@@ -37,7 +37,7 @@ use std::time::{Duration, Instant};
 
 use clap::Parser;
 use glam::IVec3;
-use tokio::sync::{oneshot, Mutex};
+use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
 use orrery_persistd::cluster::{ColdFallbackRouter, Router};
@@ -453,6 +453,7 @@ async fn main() -> anyhow::Result<()> {
             dir: node_dir.clone(),
             commit: GroupCommitConfig {
                 mode: AdaptiveCommitMode::Adaptive,
+                batch_window: Duration::from_micros(200),
                 ..GroupCommitConfig::default()
             },
         })?;
@@ -494,6 +495,7 @@ async fn main() -> anyhow::Result<()> {
             dir: node_dir,
             commit: GroupCommitConfig {
                 mode: AdaptiveCommitMode::Adaptive,
+                batch_window: Duration::from_micros(200),
                 ..GroupCommitConfig::default()
             },
         },
@@ -508,7 +510,7 @@ async fn main() -> anyhow::Result<()> {
         elapsed_ms = startup_started.elapsed().as_millis(),
         "persistd startup: recovering runtime"
     );
-    let runtime = Arc::new(Mutex::new(CellRuntime::open(&config, &checkpoint_store)?));
+    let runtime = Arc::new(CellRuntime::open(&config, &checkpoint_store)?);
     tracing::info!(
         elapsed_ms = startup_started.elapsed().as_millis(),
         "persistd startup: runtime recovered"
@@ -519,9 +521,8 @@ async fn main() -> anyhow::Result<()> {
     // above.  Start this after recovery but before exposing a gateway, so a
     // failed first poll can only yield provisional bulk acknowledgements.
     let fence_freshness_monitor = if cli.fdb_cluster_file.is_some() {
-        let guard = runtime.lock().await;
         Some(
-            guard
+            runtime
                 .start_fence_freshness_monitor(FenceFreshnessConfig::default())
                 .await
                 .map_err(|error| anyhow::anyhow!("start fence freshness monitor: {error}"))?,
@@ -538,10 +539,7 @@ async fn main() -> anyhow::Result<()> {
         .as_ref()
         .map(|_| Arc::new(GatewayBulkMetrics::default()));
     let metrics_reporter = if let Some(path) = cli.metrics_jsonl.clone() {
-        let journal = {
-            let guard = runtime.lock().await;
-            Arc::clone(guard.journal())
-        };
+        let journal = Arc::clone(runtime.journal());
         Some(spawn_metrics_reporter(path, journal, bulk_metrics.clone())?)
     } else {
         None
@@ -558,10 +556,7 @@ async fn main() -> anyhow::Result<()> {
             .follower()
             .expect("only primary topologies have a chain id")
             .node_id;
-        let journal = {
-            let guard = runtime.lock().await;
-            Arc::clone(guard.journal())
-        };
+        let journal = Arc::clone(runtime.journal());
         let transport = Arc::new(GrpcChainTransport::new(
             topology
                 .follower()
@@ -583,7 +578,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Spawn one checkpoint scheduler for the single runtime, using the
     // default 20 s jittered cadence (D16).
-    let scheduler = orrery_persistd::spawn_checkpoint_scheduler(
+    let scheduler = orrery_persistd::spawn_checkpoint_scheduler_direct(
         Arc::clone(&runtime),
         Arc::clone(&checkpoint_store),
         &orrery_persistd::checkpoint::CheckpointConfig::default(),
@@ -712,11 +707,11 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // Close each runtime's journal explicitly.
-    let Ok(mutex) = Arc::try_unwrap(runtime_for_shutdown) else {
+    let Ok(runtime) = Arc::try_unwrap(runtime_for_shutdown) else {
         tracing::warn!("runtime Arc still referenced during shutdown");
         return Ok(());
     };
-    if let Err(e) = mutex.into_inner().close().await {
+    if let Err(e) = runtime.close().await {
         tracing::warn!(error = %e, "journal close error during shutdown");
     }
 
@@ -747,6 +742,7 @@ async fn run_follower(cli: &Cli, topology: &Topology) -> anyhow::Result<()> {
         dir: node_dir,
         commit: GroupCommitConfig {
             mode: AdaptiveCommitMode::Adaptive,
+            batch_window: Duration::from_micros(200),
             ..GroupCommitConfig::default()
         },
     })?);

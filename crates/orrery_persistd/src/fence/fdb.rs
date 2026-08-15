@@ -17,12 +17,12 @@ use foundationdb::Database;
 
 use orrery_protocol::{CellId, GridId};
 
-use crate::FdbContext;
 use crate::fence::{
-    ActivationOutcome, FenceError, FenceOutcome, FenceRow, FenceStatus, FenceStore,
-    ShardActivation, validate_activation_set,
+    validate_activation_set, ActivationOutcome, FenceError, FenceOutcome, FenceRow, FenceStatus,
+    FenceStore, ShardActivation,
 };
 use crate::keyspace;
+use crate::FdbContext;
 
 /// Encode a fence row (postcard, matching the in-memory store's wire format).
 fn encode_row(row: &FenceRow) -> Result<Vec<u8>, FenceError> {

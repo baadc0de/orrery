@@ -36,9 +36,9 @@ use orrery_protocol::{
     AccountId, AssetId, CellId, Epoch, GridId, Intent, IntentOutcome, PersistId,
 };
 
-use crate::FdbContext;
 use crate::fence::{FenceRow, FenceStatus};
 use crate::keyspace;
+use crate::FdbContext;
 
 use super::{IntentError, IntentExecutor};
 
@@ -179,29 +179,6 @@ impl FdbIntentExecutor {
             .ok_or_else(|| IntentError::Store("PersistId allocator overflow".to_owned()))?;
         Ok((start..allocator.next).map(PersistId::new).collect())
     }
-
-    /// Fast path for an already-committed idempotency row. The transaction
-    /// below repeats this read for correctness; this one simply avoids
-    /// consuming a fresh local grant for the overwhelmingly common replay
-    /// case after a client reconnect.
-    async fn recorded_outcome(
-        &self,
-        intent_id: u128,
-    ) -> Result<Option<IntentOutcome>, IntentError> {
-        let key = keyspace::intent_key(intent_id);
-        let result: Result<Option<IntentOutcome>, FdbBindingError> = self
-            .db
-            .run(|trx, _maybe_committed| async move {
-                let Some(value) = trx.get(&key, false).await? else {
-                    return Ok(None);
-                };
-                let row: keyspace::IntentRow =
-                    postcard::from_bytes(&value).map_err(store_err("intent row decode"))?;
-                Ok(Some(row.outcome))
-            })
-            .await;
-        result.map_err(unwrap_binding_error)
-    }
 }
 
 /// Require the active ownership row in the same transaction as an intent's
@@ -248,9 +225,6 @@ async fn require_intent_fence(
 #[async_trait::async_trait]
 impl IntentExecutor for FdbIntentExecutor {
     async fn execute(&self, intent: &Intent) -> Result<IntentOutcome, IntentError> {
-        if let Some(outcome) = self.recorded_outcome(intent.intent_id).await? {
-            return Ok(outcome);
-        }
         let intent = intent.clone();
         let grid = self.grid;
         let fence = self.fence;
