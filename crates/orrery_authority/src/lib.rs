@@ -16,8 +16,8 @@ use bevy_ecs::prelude::*;
 use bevy_ecs::system::SystemParam;
 use bevy_platform::time::Instant;
 use orrery_protocol::{
-    ClaimBasis, ClaimId, ClaimKind, DenyReason, GridId, LeaseId, LeaseMsg, NodeId, PersistId,
-    SeqPair, Tick,
+    ClaimBasis, ClaimId, ClaimKind, DenyReason, ExpireDisposition, GridId, LeaseId, LeaseMsg,
+    NodeId, PersistId, SeqPair, Tick,
 };
 
 /// Registrar TTL from D7/D16, in milliseconds.
@@ -71,12 +71,28 @@ pub enum AuthorityEvent {
         /// ECS entity whose optimistic claim began.
         entity: Entity,
     },
-    /// Registrar granted authority.
+    /// Registrar granted authority in reply to this peer's own claim.
     Granted {
         /// ECS entity that received authority.
         entity: Entity,
         /// Registrar-issued fencing token for the grant.
         lease_id: LeaseId,
+    },
+    /// The registrar handed this peer authority it never asked for: it was
+    /// selected as successor to a lost holder, or received a negotiated
+    /// handoff (D7 §5).
+    ///
+    /// Distinct from [`AuthorityEvent::Granted`] because the entity was not
+    /// being simulated optimistically beforehand — game code typically has to
+    /// promote it from an interpolated proxy to a simulated body rather than
+    /// confirm a prediction it was already running.
+    Inherited {
+        /// ECS entity that received authority.
+        entity: Entity,
+        /// Registrar-issued fencing token for the grant.
+        lease_id: LeaseId,
+        /// The holder this peer succeeded, when the registrar named one.
+        from: Option<NodeId>,
     },
     /// Registrar denied the claim and local prediction was rolled back.
     Denied {
@@ -152,6 +168,12 @@ impl AuthorityState {
         self.leases.remove(&entity).map(|lease| lease.lease_id)
     }
 
+    /// The fencing token currently installed for `entity`, if any.
+    #[must_use]
+    pub fn local_lease_id(&self, entity: PersistId) -> Option<LeaseId> {
+        self.leases.get(&entity).map(|lease| lease.lease_id)
+    }
+
     /// Allocate and record a claim correlation identifier for `entity`.
     pub fn begin_claim(&mut self, entity: PersistId) -> Option<ClaimId> {
         let claim_id = self.next_claim_id;
@@ -223,6 +245,50 @@ impl<'w, 's> LeaseClient<'w, 's> {
         });
         Some(claim_id)
     }
+
+    /// Consent to give up a lease: hand it to `to`, or release it when `to`
+    /// is `None` (D7 §5).
+    ///
+    /// Local authority is dropped **before** the message goes out, not when
+    /// the registrar replies. A holder that has offered a lease away must stop
+    /// writing immediately; if the registrar refuses the divestiture the
+    /// entity is simply unowned until this peer claims it again, which is the
+    /// safe direction to be wrong in.
+    ///
+    /// Returns `false` when this peer holds no fence for the entity.
+    pub fn divest(&mut self, request: LeaseDivest) -> bool {
+        let Some(lease_id) = self.state.revoke_local_lease(request.persist) else {
+            return false;
+        };
+        self.commands
+            .entity(request.entity)
+            .remove::<LocallyAuthoritative>()
+            .insert(AuthorityPhase::Remote);
+        self.outbox.0.push(LeaseMsg::Divest {
+            entity: request.persist,
+            lease_id,
+            to: request.to,
+            final_seq: request.final_seq,
+            cursor: request.cursor,
+        });
+        true
+    }
+}
+
+/// Complete gameplay request for a cooperative handoff or release.
+#[derive(Debug, Clone, Copy)]
+pub struct LeaseDivest {
+    /// ECS entity giving up local authority.
+    pub entity: Entity,
+    /// Stable persistent identity whose lease is being divested.
+    pub persist: PersistId,
+    /// Successor to offer the lease to, or `None` to release and park.
+    pub to: Option<NodeId>,
+    /// The holder's final authoritative sequence pair.
+    pub final_seq: SeqPair,
+    /// The last journal position this peer saw acknowledged for the entity.
+    /// The registrar requires one before handing state to a named successor.
+    pub cursor: Option<orrery_protocol::Lsn>,
 }
 
 /// Apply received registrar lease messages to ECS authority state.
@@ -241,14 +307,21 @@ pub fn process_lease_replies(
                 lease_id,
                 seq,
                 ttl_ms,
-                ..
+                prev_holder,
             } => {
+                // A grant is legitimate either as the reply to this peer's
+                // own pending claim, or as a registrar-initiated placement
+                // carrying the reserved correlation — successor selection or
+                // the receiving half of a handoff (D7 §5). Both still have to
+                // advance the fence this peer already has installed, so a
+                // delayed duplicate can never reinstate stale authority.
+                let inherited = claim_id == ClaimId::REGISTRAR;
                 let is_current_claim = state.pending_claims.get(&entity) == Some(&claim_id);
                 let advances_fence = state
                     .leases
                     .get(&entity)
                     .is_none_or(|current| lease_id > current.lease_id);
-                if !is_current_claim || !advances_fence {
+                if !(inherited || is_current_claim) || !advances_fence {
                     continue;
                 }
                 if let Some((entity_ref, _)) = entities.iter().find(|(_, id)| id.0 == entity) {
@@ -273,9 +346,17 @@ pub fn process_lease_replies(
                         },
                         LocallyAuthoritative,
                     ));
-                    events.write(AuthorityEvent::Granted {
-                        entity: entity_ref,
-                        lease_id,
+                    events.write(if inherited {
+                        AuthorityEvent::Inherited {
+                            entity: entity_ref,
+                            lease_id,
+                            from: prev_holder,
+                        }
+                    } else {
+                        AuthorityEvent::Granted {
+                            entity: entity_ref,
+                            lease_id,
+                        }
                     });
                 }
             }
@@ -302,7 +383,10 @@ pub fn process_lease_replies(
                 }
             }
             LeaseMsg::Expire {
-                entity, lease_id, ..
+                entity,
+                lease_id,
+                disposition,
+                ..
             } => {
                 if state
                     .leases
@@ -312,10 +396,21 @@ pub fn process_lease_replies(
                     continue;
                 }
                 if let Some(lease) = state.leases.remove(&entity) {
-                    commands
-                        .entity(lease.entity)
-                        .remove::<LocallyAuthoritative>()
-                        .insert(AuthorityPhase::Remote);
+                    let mut entity_commands = lease_commands(&mut commands, lease.entity);
+                    // The disposition names where authority actually went, so
+                    // the loser can render the entity against its real holder
+                    // instead of a stale one it no longer is.
+                    if let ExpireDisposition::Reassigned { to } = disposition {
+                        entity_commands.insert(Authority {
+                            holder: Some(to),
+                            seq: SeqPair::default(),
+                        });
+                    } else {
+                        entity_commands.insert(Authority {
+                            holder: None,
+                            seq: SeqPair::default(),
+                        });
+                    }
                     events.write(AuthorityEvent::Lost {
                         entity: lease.entity,
                         lease_id,
@@ -375,6 +470,19 @@ pub fn process_lease_replies(
             _ => {}
         }
     }
+}
+
+/// Drop the local write marker and return the entity's commands for the
+/// caller to stamp the new authority state onto.
+fn lease_commands<'a>(
+    commands: &'a mut Commands<'_, '_>,
+    entity: Entity,
+) -> bevy_ecs::system::EntityCommands<'a> {
+    let mut entity_commands = commands.entity(entity);
+    entity_commands
+        .remove::<LocallyAuthoritative>()
+        .insert(AuthorityPhase::Remote);
+    entity_commands
 }
 
 /// Emit one compact batched heartbeat and stop uplinks before local expiry.
@@ -444,6 +552,7 @@ impl Plugin for OrreryAuthorityPlugin {
 mod tests {
     use super::*;
     use bevy_app::App;
+    use bevy_ecs::system::RunSystemOnce;
     use orrery_protocol::{CellId, ExpireDisposition, ExpireReason, Lease, LeaseFlags};
 
     fn begin_test_claim(app: &mut App, entity: Entity, persisted: PersistId) -> ClaimId {
@@ -456,6 +565,226 @@ mod tests {
             .entity_mut(entity)
             .insert(AuthorityPhase::LocalPending { claim_id });
         claim_id
+    }
+
+    fn node_id(seed: u8) -> NodeId {
+        let mut bytes = [0u8; 32];
+        bytes[0] = seed;
+        iroh_base::SecretKey::from_bytes(&bytes).public()
+    }
+
+    #[test]
+    fn a_registrar_initiated_grant_installs_authority_without_a_pending_claim() {
+        // Given: an entity this peer replicates but never claimed.
+        let mut app = App::new();
+        app.add_plugins(OrreryAuthorityPlugin);
+        let inherited = app
+            .world_mut()
+            .spawn((PersistIdentity(PersistId::new(60)), AuthorityPhase::Remote))
+            .id();
+
+        // When: the registrar hands it over — successor selection after
+        // another holder was lost.
+        app.world_mut()
+            .resource_mut::<LeaseInbox>()
+            .0
+            .push(LeaseMsg::Grant {
+                claim_id: ClaimId::REGISTRAR,
+                entity: PersistId::new(60),
+                lease_id: LeaseId(4),
+                seq: SeqPair {
+                    own_seq: 0,
+                    auth_seq: 3,
+                },
+                ttl_ms: 10_000,
+                prev_holder: Some(node_id(7)),
+            });
+        app.update();
+
+        // Then: local authority is installed, and the event says it was
+        // inherited rather than confirming a prediction this peer was running.
+        assert!(app.world().get::<LocallyAuthoritative>(inherited).is_some());
+        assert_eq!(
+            app.world().get::<AuthorityPhase>(inherited),
+            Some(&AuthorityPhase::LocalGranted {
+                lease_id: LeaseId(4),
+                expires_at_ms: 10_000,
+            })
+        );
+        assert!(app
+            .world()
+            .resource::<Messages<AuthorityEvent>>()
+            .iter_current_update_messages()
+            .any(|event| *event
+                == AuthorityEvent::Inherited {
+                    entity: inherited,
+                    lease_id: LeaseId(4),
+                    from: Some(node_id(7)),
+                }));
+    }
+
+    #[test]
+    fn a_registrar_grant_that_does_not_advance_the_fence_is_ignored() {
+        // Given: a peer already holding a newer fence than a delayed grant
+        // names — a duplicate push, or one reordered behind a later transfer.
+        let mut app = App::new();
+        app.add_plugins(OrreryAuthorityPlugin);
+        let held = app
+            .world_mut()
+            .spawn((PersistIdentity(PersistId::new(61)), AuthorityPhase::Remote))
+            .id();
+        app.world_mut()
+            .resource_mut::<LeaseInbox>()
+            .0
+            .push(LeaseMsg::Grant {
+                claim_id: ClaimId::REGISTRAR,
+                entity: PersistId::new(61),
+                lease_id: LeaseId(9),
+                seq: SeqPair::default(),
+                ttl_ms: 10_000,
+                prev_holder: None,
+            });
+        app.update();
+
+        // When: an older registrar-initiated grant arrives late.
+        app.world_mut()
+            .resource_mut::<LeaseInbox>()
+            .0
+            .push(LeaseMsg::Grant {
+                claim_id: ClaimId::REGISTRAR,
+                entity: PersistId::new(61),
+                lease_id: LeaseId(8),
+                seq: SeqPair::default(),
+                ttl_ms: 10_000,
+                prev_holder: None,
+            });
+        app.update();
+
+        // Then: the installed fence is untouched — a stale push can never
+        // reinstate superseded authority.
+        assert_eq!(
+            app.world()
+                .resource::<AuthorityState>()
+                .local_lease_id(PersistId::new(61)),
+            Some(LeaseId(9))
+        );
+        assert!(matches!(
+            app.world().get::<AuthorityPhase>(held),
+            Some(AuthorityPhase::LocalGranted {
+                lease_id: LeaseId(9),
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn divesting_stops_local_writes_before_the_message_leaves() {
+        // Given: a granted lease this peer is writing under.
+        let mut app = App::new();
+        app.add_plugins(OrreryAuthorityPlugin);
+        let held = app
+            .world_mut()
+            .spawn((PersistIdentity(PersistId::new(62)), AuthorityPhase::Remote))
+            .id();
+        app.world_mut()
+            .resource_mut::<LeaseInbox>()
+            .0
+            .push(LeaseMsg::Grant {
+                claim_id: ClaimId::REGISTRAR,
+                entity: PersistId::new(62),
+                lease_id: LeaseId(3),
+                seq: SeqPair::default(),
+                ttl_ms: 10_000,
+                prev_holder: None,
+            });
+        app.update();
+        assert!(app.world().get::<LocallyAuthoritative>(held).is_some());
+
+        // When: gameplay hands the entity to another peer.
+        let handed = app
+            .world_mut()
+            .run_system_once(move |mut client: LeaseClient| {
+                client.divest(LeaseDivest {
+                    entity: held,
+                    persist: PersistId::new(62),
+                    to: Some(node_id(5)),
+                    final_seq: SeqPair::default(),
+                    cursor: Some(orrery_protocol::Lsn::new(1, 64)),
+                })
+            });
+        assert!(handed.expect("divest system runs"));
+        app.update();
+
+        // Then: the write marker is gone immediately — before any registrar
+        // reply — and the offer is queued for the gateway adapter.
+        assert!(app.world().get::<LocallyAuthoritative>(held).is_none());
+        assert_eq!(
+            app.world()
+                .resource::<AuthorityState>()
+                .local_lease_id(PersistId::new(62)),
+            None
+        );
+        assert!(app
+            .world()
+            .resource::<LeaseOutbox>()
+            .0
+            .iter()
+            .any(|message| *message
+                == LeaseMsg::Divest {
+                    entity: PersistId::new(62),
+                    lease_id: LeaseId(3),
+                    to: Some(node_id(5)),
+                    final_seq: SeqPair::default(),
+                    cursor: Some(orrery_protocol::Lsn::new(1, 64)),
+                }));
+    }
+
+    #[test]
+    fn a_reassigning_expiry_points_the_loser_at_the_new_holder() {
+        // Given: a peer holding a lease the registrar is about to move.
+        let mut app = App::new();
+        app.add_plugins(OrreryAuthorityPlugin);
+        let lost = app
+            .world_mut()
+            .spawn((PersistIdentity(PersistId::new(63)), AuthorityPhase::Remote))
+            .id();
+        app.world_mut()
+            .resource_mut::<LeaseInbox>()
+            .0
+            .push(LeaseMsg::Grant {
+                claim_id: ClaimId::REGISTRAR,
+                entity: PersistId::new(63),
+                lease_id: LeaseId(2),
+                seq: SeqPair::default(),
+                ttl_ms: 10_000,
+                prev_holder: None,
+            });
+        app.update();
+
+        // When: the registrar reassigns it to a named successor.
+        app.world_mut()
+            .resource_mut::<LeaseInbox>()
+            .0
+            .push(LeaseMsg::Expire {
+                entity: PersistId::new(63),
+                lease_id: LeaseId(2),
+                last_holder: None,
+                reason: ExpireReason::Timeout,
+                disposition: ExpireDisposition::Reassigned { to: node_id(6) },
+            });
+        app.update();
+
+        // Then: local authority is dropped and the entity now renders against
+        // its real holder, not the stale local one.
+        assert!(app.world().get::<LocallyAuthoritative>(lost).is_none());
+        assert_eq!(
+            app.world().get::<AuthorityPhase>(lost),
+            Some(&AuthorityPhase::Remote)
+        );
+        assert_eq!(
+            app.world().get::<Authority>(lost).map(|a| a.holder),
+            Some(Some(node_id(6)))
+        );
     }
 
     #[test]

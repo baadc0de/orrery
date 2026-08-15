@@ -111,37 +111,60 @@ settled independently inside a single change.
 
 **Goal.** The two-tier claim model with cluster-arbitered leases (D7): the tracks merge — the persistence cluster becomes the authority arbiter for live simulation.
 
-**Status (2026-08-15).** The strict persistence-authority slice is complete:
+**Status (2026-08-16).** The strict persistence-authority slice is complete:
 signed transport-bound admission, coordinator-interest-gated weak claims,
 actor-owned durable lease rows, strict fenced uplinks, NodeId-scoped session and
 claim-rate controls, client revocation on lease-bearing NACKs, hot-only
-heartbeats, and server-owned recoverable committed rekeys. Owner loss currently
-parks leases. Successor selection, negotiated divestiture, contact-island
-propagation, coordinator movement orchestration, field-host promotion, and the
-8-peer handoff harness remain P3 follow-on work.
+heartbeats, and server-owned recoverable committed rekeys.
+
+The handoff slice on top of it adds **crash redistribution** (both the
+disconnect fast path and the TTL slow path select a successor and grant through
+the ordinary serialized claim path, parking only when no peer is eligible),
+**holder-initiated negotiated divestiture** with an enforced
+uplink-completeness gate, a registrar→peer push lane so a successor learns it
+inherited a lease and a silent holder learns its lease ended, and the always-on
+**single-writer invariant checker**. Strong-held rows still re-park rather than
+being regranted, per D7.
+
+Remaining P3 follow-on: the registrar→holder `Divest` *request* (so a
+claimant's `Claim{Strong}` can trigger the handoff, and so the coordinator can
+drain an island), `Expire` fan-out to cell subscribers, contact-island
+propagation, redistribution across sibling gateways, coordinator movement
+orchestration, ephemeral in-island claims, field-host promotion, and the 8-peer
+demo harness.
 
 **Crates.** `orrery_authority` implements optimistic weak/strong claims,
-`auth_seq`/`own_seq`, correlation-safe lease control, and loss-of-authority
-reconciliation; contact-island propagation, negotiated handoff, and successor
-selection remain follow-on. `orrery_persistd` implements the actor-owned lease
-registrar, strict gateway fencing, and committed rekey. `orrery_predict` and
-`orrery_coordinator` retain their P1/P4 scaffolding; coordinator-driven movement
-orchestration is not part of the delivered slice.
+`auth_seq`/`own_seq`, correlation-safe lease control, inherited grants
+(`ClaimId::REGISTRAR` → `AuthorityEvent::Inherited`), holder-initiated
+`LeaseClient::divest`, and loss-of-authority reconciliation; contact-island
+propagation remains follow-on. `orrery_persistd` implements the actor-owned
+lease registrar, strict gateway fencing, committed rekey, the `SuccessorPolicy`
+seam with its coordinator-interest-ranked default, and `AuthorityMetrics`.
+`orrery_predict` and `orrery_coordinator` retain their P1/P4 scaffolding;
+coordinator-driven movement orchestration is not part of the delivered slice.
 
 **Deliverables.**
 - Lease rows `(entity_id → holder NodeId, auth_seq, own_seq, expiry)`; TTL 10 s, heartbeat 2.5 s; optimistic claim (simulate immediately, roll back on CAS loss).
-- Cooperative handoff (negotiated divestiture with holder ack) and crash handoff (lease expiry → orphan → reassign to nearest interacting peer, else park in cluster). **Follow-on:** the current registrar parks all owner-loss leases.
+- Cooperative handoff (negotiated divestiture with holder ack) and crash handoff (lease expiry → orphan → reassign to nearest interacting peer, else park in cluster). **Implemented:** crash handoff on both the disconnect and TTL paths, and the holder-initiated half of cooperative handoff with an enforced `Divest.cursor` gate. **Follow-on:** the registrar→holder `Divest` request, which is what lets a claimant's `Claim{Strong}` trigger the handoff.
 - Cross-cell movement keeping the holder under hysteresis; storage row re-keyed on commit. **Implemented:** server-owned committed rekey preserves the lease fence and atomically relocates the durable lease index; client movement control is rejected.
 - Ephemeral entities (projectiles, VFX) on in-island claims only, never touching the registrar.
-- Single-writer invariant checker: telemetry that flags any tick where two peers both believed they held authority.
+- Single-writer invariant checker: telemetry that flags any tick where two peers both believed they held authority. **Implemented:** `GatewayServer::authority_metrics()` counts fenced-out writes whose live row named a different unexpired holder, retains the last sample, and logs each at `warn`.
 
-**Follow-on demo criterion.** An 8-peer island with contested physics objects:
+**Demo criterion.** An 8-peer island with contested physics objects:
 `kill -9` one peer holding ~50 entities → every entity is reassigned or parked
 within the 10 s lease TTL, with no duplicate-authority tick recorded and no
 lost entity; separately, a scripted cooperative handoff chain (player A grabs,
 throws to B's contact island) completes with zero registrar-visible conflicts
-and no visible pop. The delivered slice proves park-on-loss and fencing, not
-successor assignment or cooperative handoff. This remains the anti-host-
+and no visible pop.
+
+The mechanisms the criterion measures are in place and covered at the wire
+level in `orrery_persistd/tests/gateway.rs` — reassignment on disconnect,
+reassignment on TTL expiry with the silent holder notified, a completed
+negotiated handoff, a refused one, and the invariant counter firing on an
+overlapping writer. What is **not** yet built is the harness itself: an 8-peer
+island, ~50 entities, a real `kill -9`, and the sustained no-duplicate-tick
+measurement. Until that runs, the criterion is unproven at scale even though
+each mechanism it exercises is tested. This remains the anti-host-
 migration proof: authority moves per entity, so no session-wide stall — the
 failure mode that [drove For Honor off P2P](https://www.ubisoft.com/en-us/game/for-honor/news-updates/2HayRoZjbJzSEJAhJMpeF7/for-honor-now-on-dedicated-servers-on-all-platforms)
 cannot occur by construction.

@@ -11,7 +11,8 @@ use std::time::Instant;
 use async_trait::async_trait;
 
 use orrery_protocol::{
-    CellId, ClaimKind, DenyReason, GridId, Lease, LeaseFlags, LeaseId, NodeId, PersistId, SeqPair,
+    CellId, ClaimKind, DenyReason, ExpireReason, GridId, Lease, LeaseFlags, LeaseId, NodeId,
+    PersistId, SeqPair,
 };
 
 #[cfg(feature = "fdb")]
@@ -362,19 +363,64 @@ impl LeaseRegistrar {
     }
 
     /// Park silent holders whose registrar-clock TTL elapsed.
-    pub fn sweep_expired(&mut self, now_ms: u64) -> Vec<Lease> {
+    ///
+    /// Each entry carries the holder and fencing token the row had **before**
+    /// the park. A reassignment policy needs the former to rank successors and
+    /// the latter to address the loser's `Expire`: the client only acts on an
+    /// `Expire` naming the token it still has installed, and parking has
+    /// already bumped the row's own `lease_id` past it.
+    pub fn sweep_expired(&mut self, now_ms: u64) -> Vec<ExpiredLease> {
         self.leases
             .values_mut()
             .filter_map(|row| {
-                (row.holder.is_some() && row.expires_at <= now_ms).then(|| {
+                let previous_holder = row.holder?;
+                (row.expires_at <= now_ms).then(|| {
+                    let previous_lease_id = row.lease_id;
                     row.holder = None;
                     row.lease_id.0 = row.lease_id.0.saturating_add(1);
                     row.flags.set(LeaseFlags::PARKED, true);
-                    row.clone()
+                    ExpiredLease {
+                        previous_holder,
+                        previous_lease_id,
+                        lease: row.clone(),
+                    }
                 })
             })
             .collect()
     }
+}
+
+/// One registrar row parked by a TTL sweep, with the identity it lost.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExpiredLease {
+    /// Holder immediately before the park.
+    pub previous_holder: NodeId,
+    /// Fencing token that holder still believes it has installed.
+    pub previous_lease_id: LeaseId,
+    /// The parked row, with its bumped token and `PARKED` flag.
+    pub lease: Lease,
+}
+
+/// A lease that lost its holder, addressed well enough for a reassignment
+/// policy to act on it without re-reading the registrar (D7 §5).
+///
+/// The gateway owns successor selection because only the gateway knows which
+/// peers have live authenticated sessions; the actor owns the row. This is the
+/// value that crosses between them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParkedLease {
+    /// Grid containing `cell`.
+    pub grid: GridId,
+    /// The entity's committed cell, as the durable lease index records it.
+    pub cell: CellId,
+    /// Holder immediately before the park.
+    pub previous_holder: NodeId,
+    /// Fencing token that holder still believes it has installed.
+    pub previous_lease_id: LeaseId,
+    /// The parked row.
+    pub lease: Lease,
+    /// What ended the lease.
+    pub reason: ExpireReason,
 }
 
 #[cfg(test)]

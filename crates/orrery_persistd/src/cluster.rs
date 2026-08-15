@@ -70,8 +70,24 @@ async fn gated_mutex_actor(
 /// the routing topology is swappable.
 #[async_trait::async_trait]
 pub trait Router: Send + Sync {
-    /// Sweep registrar TTLs for every live actor this router owns.
-    async fn sweep_expired_leases(&self, _now_ms: u64) {}
+    /// Sweep registrar TTLs for every live actor this router owns, returning
+    /// the rows that lost their holder so the caller can select successors.
+    async fn sweep_expired_leases(&self, _now_ms: u64) -> Vec<crate::lease::ParkedLease> {
+        Vec::new()
+    }
+
+    /// Read one registrar row, its committed cell, and the highest journal
+    /// position folded for that entity.
+    ///
+    /// The uplink watermark is what makes a `Divest.cursor` checkable: a
+    /// cursor ahead of it names state the cluster never journaled.
+    async fn inspect_lease(
+        &self,
+        _grid: GridId,
+        _entity: PersistId,
+    ) -> Result<(Option<Lease>, Option<CellId>, Option<orrery_protocol::Lsn>), Reject> {
+        Ok((None, None, None))
+    }
     /// Apply a journal record to the actor owning its cell, returning the
     /// handle the gateway must await before acknowledging durability.
     async fn apply(&self, record: JournalRecord) -> Result<Arc<AppendHandle>, Reject>;
@@ -184,8 +200,15 @@ pub trait Router: Send + Sync {
 /// concurrent applies directly into the journal's commit queue (§4).
 #[async_trait::async_trait]
 impl Router for CellRuntime {
-    async fn sweep_expired_leases(&self, now_ms: u64) {
-        self.sweep_expired_leases(now_ms).await;
+    async fn sweep_expired_leases(&self, now_ms: u64) -> Vec<crate::lease::ParkedLease> {
+        self.sweep_expired_leases(now_ms).await
+    }
+    async fn inspect_lease(
+        &self,
+        grid: GridId,
+        entity: PersistId,
+    ) -> Result<(Option<Lease>, Option<CellId>, Option<orrery_protocol::Lsn>), Reject> {
+        self.inspect_lease(grid, entity).await
     }
     async fn apply(&self, record: JournalRecord) -> Result<Arc<AppendHandle>, Reject> {
         self.actor(record.grid, record.cell)
@@ -320,8 +343,15 @@ impl Router for CellRuntime {
 /// A router over a shared runtime.
 #[async_trait::async_trait]
 impl Router for Arc<CellRuntime> {
-    async fn sweep_expired_leases(&self, now_ms: u64) {
-        <CellRuntime as Router>::sweep_expired_leases(self.as_ref(), now_ms).await;
+    async fn sweep_expired_leases(&self, now_ms: u64) -> Vec<crate::lease::ParkedLease> {
+        <CellRuntime as Router>::sweep_expired_leases(self.as_ref(), now_ms).await
+    }
+    async fn inspect_lease(
+        &self,
+        grid: GridId,
+        entity: PersistId,
+    ) -> Result<(Option<Lease>, Option<CellId>, Option<orrery_protocol::Lsn>), Reject> {
+        <CellRuntime as Router>::inspect_lease(self.as_ref(), grid, entity).await
     }
     async fn apply(&self, record: JournalRecord) -> Result<Arc<AppendHandle>, Reject> {
         <CellRuntime as Router>::apply(self.as_ref(), record).await
@@ -423,8 +453,34 @@ impl Router for Arc<CellRuntime> {
 /// queue instead of serializing the whole node behind one fsync (§4).
 #[async_trait::async_trait]
 impl Router for tokio::sync::Mutex<CellRuntime> {
-    async fn sweep_expired_leases(&self, now_ms: u64) {
-        self.lock().await.sweep_expired_leases(now_ms).await;
+    async fn sweep_expired_leases(&self, now_ms: u64) -> Vec<crate::lease::ParkedLease> {
+        // The actor mailboxes are awaited outside the runtime lock: a sweep
+        // must never hold the whole node while each actor drains its queue.
+        let actors = self.lock().await.actor_handles();
+        let mut parked = Vec::new();
+        for actor in actors {
+            if let Ok(rows) = actor.sweep_leases(now_ms).await {
+                parked.extend(rows);
+            }
+        }
+        parked
+    }
+    async fn inspect_lease(
+        &self,
+        grid: GridId,
+        entity: PersistId,
+    ) -> Result<(Option<Lease>, Option<CellId>, Option<orrery_protocol::Lsn>), Reject> {
+        let (cell, handle) = {
+            let rt = self.lock().await;
+            let Some(cell) = rt.lease_location(entity).await? else {
+                return Ok((None, None, None));
+            };
+            (cell, rt.actor(grid, cell).cloned())
+        };
+        match handle {
+            Some(handle) => handle.inspect_lease(entity).await,
+            None => Ok((None, Some(cell), None)),
+        }
     }
     async fn apply(&self, record: JournalRecord) -> Result<Arc<AppendHandle>, Reject> {
         let handle = {
@@ -566,8 +622,15 @@ impl Router for tokio::sync::Mutex<CellRuntime> {
 /// router used when FoundationDB is available.
 #[async_trait::async_trait]
 impl Router for Arc<tokio::sync::Mutex<CellRuntime>> {
-    async fn sweep_expired_leases(&self, now_ms: u64) {
-        self.as_ref().sweep_expired_leases(now_ms).await;
+    async fn sweep_expired_leases(&self, now_ms: u64) -> Vec<crate::lease::ParkedLease> {
+        self.as_ref().sweep_expired_leases(now_ms).await
+    }
+    async fn inspect_lease(
+        &self,
+        grid: GridId,
+        entity: PersistId,
+    ) -> Result<(Option<Lease>, Option<CellId>, Option<orrery_protocol::Lsn>), Reject> {
+        self.as_ref().inspect_lease(grid, entity).await
     }
     async fn apply(&self, record: JournalRecord) -> Result<Arc<AppendHandle>, Reject> {
         self.as_ref().apply(record).await
@@ -678,8 +741,15 @@ impl<R> ColdFallbackRouter<R> {
 
 #[async_trait::async_trait]
 impl<R: Router + Send + Sync> Router for ColdFallbackRouter<R> {
-    async fn sweep_expired_leases(&self, now_ms: u64) {
-        self.live.sweep_expired_leases(now_ms).await;
+    async fn sweep_expired_leases(&self, now_ms: u64) -> Vec<crate::lease::ParkedLease> {
+        self.live.sweep_expired_leases(now_ms).await
+    }
+    async fn inspect_lease(
+        &self,
+        grid: GridId,
+        entity: PersistId,
+    ) -> Result<(Option<Lease>, Option<CellId>, Option<orrery_protocol::Lsn>), Reject> {
+        self.live.inspect_lease(grid, entity).await
     }
     async fn apply(&self, record: JournalRecord) -> Result<Arc<AppendHandle>, Reject> {
         self.live.apply(record).await
@@ -899,10 +969,25 @@ fn journal_of(rt: &Arc<tokio::sync::Mutex<CellRuntime>>) -> Arc<crate::journal::
 /// placement assigns it to (docs/08-persistence.md §3.2).
 #[async_trait::async_trait]
 impl Router for Cluster {
-    async fn sweep_expired_leases(&self, now_ms: u64) {
+    async fn sweep_expired_leases(&self, now_ms: u64) -> Vec<crate::lease::ParkedLease> {
+        let mut parked = Vec::new();
         for runtime in self.runtimes.values() {
-            runtime.sweep_expired_leases(now_ms).await;
+            parked.extend(runtime.sweep_expired_leases(now_ms).await);
         }
+        parked
+    }
+    async fn inspect_lease(
+        &self,
+        grid: GridId,
+        entity: PersistId,
+    ) -> Result<(Option<Lease>, Option<CellId>, Option<orrery_protocol::Lsn>), Reject> {
+        for runtime in self.runtimes.values() {
+            let found = runtime.inspect_lease(grid, entity).await?;
+            if found.0.is_some() || found.1.is_some() {
+                return Ok(found);
+            }
+        }
+        Ok((None, None, None))
     }
     async fn apply(&self, record: JournalRecord) -> Result<Arc<AppendHandle>, Reject> {
         let rt = self

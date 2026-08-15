@@ -51,6 +51,18 @@ pub struct LeaseId(pub u64);
 )]
 pub struct ClaimId(pub u64);
 
+impl ClaimId {
+    /// The reserved correlation for a grant the registrar issued on its own
+    /// initiative — successor selection after a holder was lost, or the
+    /// receiving half of a negotiated divestiture.
+    ///
+    /// Clients allocate correlations from `1` upwards, so this value can never
+    /// collide with a pending client claim. A client accepts a grant carrying
+    /// it without a matching pending claim, but still only when it advances
+    /// the fence it already has installed (D7 §5).
+    pub const REGISTRAR: Self = Self(0);
+}
+
 /// Compact lease flags. This is deliberately a numeric bitset so new flags are
 /// wire-compatible with older decoders.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]

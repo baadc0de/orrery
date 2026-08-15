@@ -17,7 +17,9 @@ use orrery_protocol::{
 };
 
 use crate::journal::{AppendHandle, Journal};
-use crate::lease::{registrar_now_ms, ClaimResult, LeasePut, LeaseRegistrar, LeaseStore};
+use crate::lease::{
+    registrar_now_ms, ClaimResult, LeasePut, LeaseRegistrar, LeaseStore, ParkedLease,
+};
 
 /// How long a despawned entity's `world/` tombstone persists before the
 /// checkpoint GC pass clears it (D11 §6). Must comfortably exceed the 20 s
@@ -354,7 +356,13 @@ pub(crate) enum CellMsg {
     /// Park all silent holders in this actor.
     SweepLeases {
         now_ms: u64,
-        reply: oneshot::Sender<Result<Vec<Lease>, Reject>>,
+        reply: oneshot::Sender<Result<Vec<ParkedLease>, Reject>>,
+    },
+    /// Read one registrar row and the entity's durable uplink cursor without
+    /// mutating either.
+    InspectLease {
+        entity: PersistId,
+        reply: oneshot::Sender<(Option<Lease>, Option<CellId>, Option<Lsn>)>,
     },
     /// Validate and reserve a source entity, then append its committed rekey.
     PrepareRekey {
@@ -408,6 +416,13 @@ pub struct CellActorState {
     pub leases: LeaseRegistrar,
     /// Durable entity-location index mirrored by the lease store.
     pub lease_cells: HashMap<PersistId, CellId>,
+    /// Highest journal position this actor has folded for each entity.
+    ///
+    /// A divesting holder names the journal position it last saw acked
+    /// (`Divest.cursor`, D7 §5). Comparing it against this watermark is what
+    /// lets the registrar refuse to hand a successor state the predecessor
+    /// never actually committed.
+    pub entity_lsn: HashMap<PersistId, Lsn>,
     pending_rekeys: HashMap<PersistId, LeaseId>,
 }
 
@@ -542,6 +557,13 @@ async fn actor_loop(env: &mut ActorEnv, mut rx: mpsc::Receiver<CellMsg>) {
                 } else {
                     let _ = reply.send(park_lease(env, entity, holder, lease_id).await);
                 }
+            }
+            CellMsg::InspectLease { entity, reply } => {
+                let _ = reply.send((
+                    env.state.leases.current(entity),
+                    env.state.lease_cells.get(&entity).copied(),
+                    env.state.entity_lsn.get(&entity).copied(),
+                ));
             }
             CellMsg::SweepLeases { now_ms, reply } => {
                 if env.state.pending_rekeys.is_empty() {
@@ -788,27 +810,36 @@ async fn park_lease(
     Ok(Some(row))
 }
 
-async fn sweep_leases(env: &mut ActorEnv, now_ms: u64) -> Result<Vec<Lease>, Reject> {
+async fn sweep_leases(env: &mut ActorEnv, now_ms: u64) -> Result<Vec<ParkedLease>, Reject> {
     let mut next = env.state.leases.clone();
-    let rows = next.sweep_expired(now_ms);
-    for row in &rows {
+    let expired = next.sweep_expired(now_ms);
+    let mut parked = Vec::with_capacity(expired.len());
+    for row in expired {
         let cell = *env
             .state
             .lease_cells
-            .get(&row.entity)
+            .get(&row.lease.entity)
             .unwrap_or(&env.state.shard);
         if !matches!(
             env.lease_store
-                .put(env.state.grid, cell, row)
+                .put(env.state.grid, cell, &row.lease)
                 .await
                 .map_err(|_| Reject::LeaseStore)?,
             LeasePut::Stored
         ) {
             return Err(Reject::LeaseStore);
         }
+        parked.push(ParkedLease {
+            grid: env.state.grid,
+            cell,
+            previous_holder: row.previous_holder,
+            previous_lease_id: row.previous_lease_id,
+            lease: row.lease,
+            reason: orrery_protocol::ExpireReason::Timeout,
+        });
     }
     env.state.leases = next;
-    Ok(rows)
+    Ok(parked)
 }
 
 /// The current wall-clock time as unix milliseconds.
@@ -915,6 +946,23 @@ fn fold(env: &mut ActorEnv, record: &JournalRecord, now_ms: u64) {
                     env.state.tombstones.remove(&rekey.entity);
                 }
             }
+        }
+        RecordKind::TerrainDelta | RecordKind::CheckpointMark => {}
+    }
+    match record.kind {
+        RecordKind::Spawn | RecordKind::ComponentDiff | RecordKind::Despawn => {
+            let watermark = env
+                .state
+                .entity_lsn
+                .entry(record.entity)
+                .or_insert(Lsn::new(0, 0));
+            *watermark = (*watermark).max(record.lsn);
+        }
+        // A rekey moves the entity to another actor, which folds its own
+        // records from there; keeping the source watermark would let a stale
+        // cursor comparison outlive the entity's residence here.
+        RecordKind::Rekey => {
+            env.state.entity_lsn.remove(&record.entity);
         }
         RecordKind::TerrainDelta | RecordKind::CheckpointMark => {}
     }
@@ -1215,8 +1263,20 @@ impl CellActorHandle {
             .map_err(|_| Reject::JournalClosed)?;
         rx.await.map_err(|_| Reject::JournalClosed)?
     }
+    /// Read one registrar row, its committed cell, and its uplink watermark.
+    pub async fn inspect_lease(
+        &self,
+        entity: PersistId,
+    ) -> Result<(Option<Lease>, Option<CellId>, Option<Lsn>), Reject> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(CellMsg::InspectLease { entity, reply })
+            .await
+            .map_err(|_| Reject::JournalClosed)?;
+        rx.await.map_err(|_| Reject::JournalClosed)
+    }
     /// Park leases whose registrar TTL elapsed.
-    pub async fn sweep_leases(&self, now_ms: u64) -> Result<Vec<Lease>, Reject> {
+    pub async fn sweep_leases(&self, now_ms: u64) -> Result<Vec<ParkedLease>, Reject> {
         let (reply, rx) = oneshot::channel();
         self.tx
             .send(CellMsg::SweepLeases { now_ms, reply })
@@ -1471,6 +1531,7 @@ where
             ckpt_watermark,
             leases: LeaseRegistrar::default(),
             lease_cells: HashMap::new(),
+            entity_lsn: HashMap::new(),
             pending_rekeys: HashMap::new(),
         },
         journal,

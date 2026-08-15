@@ -2853,3 +2853,499 @@ fn reviewed_authority_narrative() {
         server.shutdown().await;
     });
 }
+
+/// Read the next registrar-pushed lease control message on `connection`.
+///
+/// Unlike [`claim_reply`] this sends nothing: reassignment grants and expiry
+/// notices arrive unprompted, which is the whole point of the push path.
+async fn pushed_lease(
+    connection: &iroh::endpoint::Connection,
+    within: Duration,
+) -> Option<LeaseMsg> {
+    let deadline = tokio::time::Instant::now() + within;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return None;
+        }
+        let Ok(Ok(packet)) = tokio::time::timeout(remaining, connection.read_datagram()).await
+        else {
+            return None;
+        };
+        if let Some(GatewayReply::Lease { message }) = decode_stream_frame(&packet) {
+            return Some(message);
+        }
+    }
+}
+
+/// A two-peer authority fixture: one seeded entity, both peers authenticated
+/// with coordinator interest covering its cell.
+struct HandoffFixture {
+    _dir: tempfile::TempDir,
+    runtime: Arc<Mutex<CellRuntime>>,
+    server: GatewayServer,
+    _endpoints: Vec<iroh::Endpoint>,
+    holder: iroh::endpoint::Connection,
+    successor: iroh::endpoint::Connection,
+    entity: PersistId,
+    cell: CellId,
+}
+
+async fn handoff_fixture(config: GatewayConfig) -> HandoffFixture {
+    let dir = tempfile::tempdir().unwrap();
+    let runtime = Arc::new(Mutex::new({
+        let store: Arc<dyn orrery_persistd::checkpoint::CheckpointStore> =
+            Arc::new(orrery_persistd::checkpoint::MemCheckpointStore::new());
+        CellRuntime::open(&runtime_config(dir.path()), &store)
+            .await
+            .unwrap()
+    }));
+    let cell = CellId::ROOT.children()[0];
+    let entity = PersistId::new(770);
+    seed_entity(&runtime, entity, cell).await;
+
+    let issuer = secret(42);
+    let server = GatewayServer::spawn(
+        GatewayConfig {
+            interest_authority: support::interest_authority([
+                support::interest_snapshot(node(1), GridId::ROOT, vec![cell]),
+                support::interest_snapshot(node(2), GridId::ROOT, vec![cell]),
+            ]),
+            authorizer: support::authorizer(&issuer),
+            identity_clock: support::fixed_clock(support::TOKEN_NOW_MS),
+            identity_health: support::available_identity_health(),
+            ..config
+        },
+        runtime.clone(),
+    )
+    .await
+    .unwrap();
+
+    let mut endpoints = Vec::new();
+    let mut connections = Vec::new();
+    for seed in [1u8, 2] {
+        let (endpoint, connection) = raw_connection(secret(seed), server.addr()).await;
+        connection
+            .send_datagram(Bytes::from(encode_stream_frame(&GatewayMsg::Hello {
+                token: session_token(
+                    &issuer,
+                    node(seed),
+                    support::TOKEN_ISSUED_AT_MS,
+                    support::TOKEN_TTL_MS,
+                ),
+                node: node(seed),
+            })))
+            .unwrap();
+        assert!(receives_hello_ack(&connection).await);
+        endpoints.push(endpoint);
+        connections.push(connection);
+    }
+    let successor = connections.pop().expect("successor connection");
+    let holder = connections.pop().expect("holder connection");
+
+    HandoffFixture {
+        _dir: dir,
+        runtime,
+        server,
+        _endpoints: endpoints,
+        holder,
+        successor,
+        entity,
+        cell,
+    }
+}
+
+/// Claim the fixture's entity for the holder and return its grant.
+async fn claim_for_holder(fixture: &HandoffFixture) -> (LeaseId, SeqPair) {
+    let granted = claim_reply(
+        &fixture.holder,
+        fixture.entity,
+        GridId::ROOT,
+        fixture.cell,
+        ClaimKind::Weak,
+        ClaimBasis::Contact { tick: Tick::new(1) },
+    )
+    .await;
+    let LeaseMsg::Grant { lease_id, seq, .. } = granted else {
+        panic!("holder's covered weak claim must be granted, got {granted:?}");
+    };
+    (lease_id, seq)
+}
+
+fn holder_diff(fixture: &HandoffFixture, lease_id: LeaseId, seq: SeqPair, tick: u64) -> DiffUplink {
+    DiffUplink {
+        cell: fixture.cell,
+        grid: GridId::ROOT,
+        entity: fixture.entity,
+        tick: Tick::new(tick),
+        kind: RecordKind::ComponentDiff,
+        payload: Bytes::from_static(b"held"),
+        seq: tick,
+        lease_id: Some(lease_id),
+        authority_seq: Some(seq),
+    }
+}
+
+#[test]
+fn disconnected_holder_lease_is_reassigned_to_an_interested_peer() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        // Given: one peer holds a lease and a second interested peer is live.
+        let fixture = handoff_fixture(GatewayConfig::default()).await;
+        let (lease_id, _) = claim_for_holder(&fixture).await;
+
+        // When: the holder's session dies without divesting — the `kill -9`
+        // case the phase exists to survive.
+        fixture.holder.close(0u32.into(), b"gone");
+
+        // Then: the registrar pushes the lease to the interested peer, on a
+        // freshly advanced fence, naming who it succeeded.
+        let inherited = pushed_lease(&fixture.successor, Duration::from_secs(5))
+            .await
+            .expect("successor is told it inherited the lease");
+        let LeaseMsg::Grant {
+            claim_id,
+            entity,
+            lease_id: successor_lease_id,
+            prev_holder,
+            ..
+        } = inherited
+        else {
+            panic!("successor must receive a grant, got {inherited:?}");
+        };
+        assert_eq!(claim_id, orrery_protocol::ClaimId::REGISTRAR);
+        assert_eq!(entity, fixture.entity);
+        assert!(successor_lease_id > lease_id);
+        assert_eq!(prev_holder, Some(node(1)));
+        assert_eq!(
+            fixture.server.authority_metrics().snapshot().reassigned,
+            1,
+            "the reassignment is counted"
+        );
+
+        // Then: the successor can actually write, and the dead holder's token
+        // never can.
+        let seq = fixture
+            .runtime
+            .lock()
+            .await
+            .inspect_lease(GridId::ROOT, fixture.entity)
+            .await
+            .unwrap()
+            .0
+            .expect("registrar row survives the handoff")
+            .seq;
+        assert!(matches!(
+            diff_reply(
+                &fixture.successor,
+                DiffUplink {
+                    lease_id: Some(successor_lease_id),
+                    authority_seq: Some(seq),
+                    ..holder_diff(&fixture, successor_lease_id, seq, 11)
+                },
+            )
+            .await,
+            GatewayReply::BulkAck { .. }
+        ));
+
+        fixture.server.shutdown().await;
+    });
+}
+
+#[test]
+fn expired_holder_lease_is_reassigned_and_the_silent_holder_is_told() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        // Given: a sweep clock a test can advance past the 10 s TTL, so a
+        // silent-holder expiry does not need a ten-second sleep.
+        let sweep_clock = Arc::new(AtomicClaimClock(AtomicU64::new(0)));
+        let fixture = handoff_fixture(GatewayConfig {
+            lease_sweep_clock: sweep_clock.clone(),
+            ..GatewayConfig::default()
+        })
+        .await;
+        let (lease_id, _) = claim_for_holder(&fixture).await;
+
+        // When: the holder goes silent past its TTL while staying connected —
+        // the zombie case peer clocks must never be trusted to resolve.
+        sweep_clock.0.store(u64::MAX, Ordering::SeqCst);
+
+        // Then: the lease moves to the interested peer...
+        let inherited = pushed_lease(&fixture.successor, Duration::from_secs(5))
+            .await
+            .expect("successor is told it inherited the expired lease");
+        let LeaseMsg::Grant {
+            claim_id,
+            lease_id: successor_lease_id,
+            ..
+        } = inherited
+        else {
+            panic!("successor must receive a grant, got {inherited:?}");
+        };
+        assert_eq!(claim_id, orrery_protocol::ClaimId::REGISTRAR);
+        assert!(successor_lease_id > lease_id);
+
+        // ...and the zombie is told, addressed by the token it still believes
+        // it holds, so it stops writing without consulting its own clock.
+        let expired = pushed_lease(&fixture.holder, Duration::from_secs(5))
+            .await
+            .expect("the silent holder is told its lease ended");
+        assert_eq!(
+            expired,
+            LeaseMsg::Expire {
+                entity: fixture.entity,
+                lease_id,
+                last_holder: Some(node(1)),
+                reason: orrery_protocol::ExpireReason::Timeout,
+                disposition: orrery_protocol::ExpireDisposition::Reassigned { to: node(2) },
+            }
+        );
+        sweep_clock.0.store(0, Ordering::SeqCst);
+
+        fixture.server.shutdown().await;
+    });
+}
+
+#[test]
+fn negotiated_divestiture_hands_the_lease_to_the_named_successor() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        // Given: a holder that has uplinked and knows its acked journal cursor
+        // — the "player A grabs, throws to B" flow.
+        let fixture = handoff_fixture(GatewayConfig::default()).await;
+        let (lease_id, seq) = claim_for_holder(&fixture).await;
+        let GatewayReply::BulkAck { lsn: cursor, .. } =
+            diff_reply(&fixture.holder, holder_diff(&fixture, lease_id, seq, 5)).await
+        else {
+            panic!("the holder's own fenced write must be acked");
+        };
+
+        // When: it consents to hand the lease to the named peer.
+        fixture
+            .holder
+            .send_datagram(Bytes::from(encode_stream_frame(&GatewayMsg::Lease {
+                message: LeaseMsg::Divest {
+                    entity: fixture.entity,
+                    lease_id,
+                    to: Some(node(2)),
+                    final_seq: seq,
+                    cursor: Some(cursor),
+                },
+            })))
+            .unwrap();
+
+        // Then: the successor is granted the lease...
+        let inherited = pushed_lease(&fixture.successor, Duration::from_secs(5))
+            .await
+            .expect("named successor receives the handoff");
+        let LeaseMsg::Grant {
+            claim_id,
+            lease_id: successor_lease_id,
+            prev_holder,
+            ..
+        } = inherited
+        else {
+            panic!("successor must receive a grant, got {inherited:?}");
+        };
+        assert_eq!(claim_id, orrery_protocol::ClaimId::REGISTRAR);
+        assert!(successor_lease_id > lease_id);
+        assert_eq!(prev_holder, Some(node(1)));
+
+        // ...and the divesting holder is told where authority went.
+        let released = pushed_lease(&fixture.holder, Duration::from_secs(5))
+            .await
+            .expect("the divesting holder receives its expiry");
+        assert_eq!(
+            released,
+            LeaseMsg::Expire {
+                entity: fixture.entity,
+                lease_id,
+                last_holder: Some(node(1)),
+                reason: orrery_protocol::ExpireReason::Revoked,
+                disposition: orrery_protocol::ExpireDisposition::Reassigned { to: node(2) },
+            }
+        );
+
+        let metrics = fixture.server.authority_metrics().snapshot();
+        assert_eq!(metrics.divested, 1);
+        assert_eq!(metrics.reassigned, 1);
+        assert_eq!(
+            metrics.duplicate_authority, 0,
+            "a consented handoff has no overlap of its own"
+        );
+
+        // Then: the old token is dead on the wire. A real client stops writing
+        // the moment it sends a divest, so this write is deliberately
+        // misbehaved — and the invariant checker flags it, because on the wire
+        // a lying ex-holder is indistinguishable from a zombie.
+        assert!(matches!(
+            diff_reply(&fixture.holder, holder_diff(&fixture, lease_id, seq, 6)).await,
+            GatewayReply::BulkNack { .. }
+        ));
+        assert_eq!(
+            fixture
+                .server
+                .authority_metrics()
+                .snapshot()
+                .duplicate_authority,
+            1
+        );
+
+        fixture.server.shutdown().await;
+    });
+}
+
+#[test]
+fn divestiture_without_a_committed_cursor_is_refused_and_the_holder_keeps_writing() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        // Given: a holder mid-uplink.
+        let fixture = handoff_fixture(GatewayConfig::default()).await;
+        let (lease_id, seq) = claim_for_holder(&fixture).await;
+        let GatewayReply::BulkAck { .. } =
+            diff_reply(&fixture.holder, holder_diff(&fixture, lease_id, seq, 5)).await
+        else {
+            panic!("the holder's own fenced write must be acked");
+        };
+
+        // When: it offers a handoff naming a journal position the cluster
+        // never wrote, and then one with no cursor at all.
+        for cursor in [Some(Lsn::new(u64::MAX, u64::MAX)), None] {
+            fixture
+                .holder
+                .send_datagram(Bytes::from(encode_stream_frame(&GatewayMsg::Lease {
+                    message: LeaseMsg::Divest {
+                        entity: fixture.entity,
+                        lease_id,
+                        to: Some(node(2)),
+                        final_seq: seq,
+                        cursor,
+                    },
+                })))
+                .unwrap();
+
+            // Then: the registrar refuses, definitively.
+            let refused = pushed_lease(&fixture.holder, Duration::from_secs(5))
+                .await
+                .expect("an unsatisfiable divest gets a definitive reply");
+            assert_eq!(
+                refused,
+                LeaseMsg::Deny {
+                    claim_id: None,
+                    entity: fixture.entity,
+                    reason: orrery_protocol::DenyReason::NotEligible,
+                    retry_after_ms: 0,
+                }
+            );
+        }
+
+        // When: the same peer floods refused divestitures.
+        for _ in 0..80 {
+            fixture
+                .holder
+                .send_datagram(Bytes::from(encode_stream_frame(&GatewayMsg::Lease {
+                    message: LeaseMsg::Divest {
+                        entity: fixture.entity,
+                        lease_id,
+                        to: Some(node(2)),
+                        final_seq: seq,
+                        cursor: None,
+                    },
+                })))
+                .unwrap();
+        }
+        // Then: the NodeId-scoped budget cuts it off — a refused divest still
+        // costs an actor round trip, so it is not an unmetered path in.
+        let mut rate_limited = 0;
+        while let Some(reply) = pushed_lease(&fixture.holder, Duration::from_millis(500)).await {
+            if matches!(
+                reply,
+                LeaseMsg::Deny {
+                    reason: orrery_protocol::DenyReason::RateLimited,
+                    ..
+                }
+            ) {
+                rate_limited += 1;
+            }
+        }
+        assert!(
+            rate_limited > 0,
+            "a divest flood must hit the claim budget, not the registrar"
+        );
+
+        // Then: nothing moved — the holder is still the writer, and the
+        // successor was never offered anything.
+        assert!(matches!(
+            diff_reply(&fixture.holder, holder_diff(&fixture, lease_id, seq, 6)).await,
+            GatewayReply::BulkAck { .. }
+        ));
+        assert_eq!(
+            pushed_lease(&fixture.successor, Duration::from_millis(250)).await,
+            None
+        );
+        let metrics = fixture.server.authority_metrics().snapshot();
+        assert!(metrics.divest_rejected >= 2);
+        assert_eq!(metrics.divested, 0);
+        assert_eq!(metrics.reassigned, 0);
+
+        fixture.server.shutdown().await;
+    });
+}
+
+#[test]
+fn single_writer_invariant_checker_flags_a_fenced_out_second_writer() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        // Given: a weak lease that a second interested peer takes over — the
+        // legitimate contested-object case.
+        let fixture = handoff_fixture(GatewayConfig::default()).await;
+        let (first_lease_id, first_seq) = claim_for_holder(&fixture).await;
+        let stolen = claim_reply(
+            &fixture.successor,
+            fixture.entity,
+            GridId::ROOT,
+            fixture.cell,
+            ClaimKind::Weak,
+            ClaimBasis::Contact { tick: Tick::new(2) },
+        )
+        .await;
+        let LeaseMsg::Grant { .. } = stolen else {
+            panic!("a weak lease is supersedable, got {stolen:?}");
+        };
+        assert_eq!(
+            fixture
+                .server
+                .authority_metrics()
+                .snapshot()
+                .duplicate_authority,
+            0,
+            "an orderly weak transfer is not a duplicate-authority event"
+        );
+
+        // When: the superseded peer keeps writing on its stale token, still
+        // believing it is the authority.
+        assert!(matches!(
+            diff_reply(
+                &fixture.holder,
+                holder_diff(&fixture, first_lease_id, first_seq, 7)
+            )
+            .await,
+            GatewayReply::BulkNack { .. }
+        ));
+
+        // Then: the invariant checker records exactly that overlap, naming
+        // both peers.
+        let metrics = fixture.server.authority_metrics();
+        assert_eq!(metrics.snapshot().duplicate_authority, 1);
+        let sample = metrics
+            .last_duplicate_authority()
+            .expect("the observation is retained for diagnosis");
+        assert_eq!(sample.entity, fixture.entity);
+        assert_eq!(sample.tick, Tick::new(7));
+        assert_eq!(sample.rejected_writer, node(1));
+        assert_eq!(sample.current_holder, node(2));
+        assert_eq!(sample.rejected_lease_id, first_lease_id);
+
+        fixture.server.shutdown().await;
+    });
+}

@@ -56,9 +56,12 @@ pub use fence::{
     ShardActivation,
 };
 pub use gateway::{
-    BulkAckAdmission, BulkAckDisposition, FreshBulkAckAdmission, GatewayBulkLatencySnapshot,
+    AuthorityMetrics, AuthoritySnapshot, BulkAckAdmission, BulkAckDisposition,
+    DuplicateAuthoritySample, FreshBulkAckAdmission, GatewayBulkLatencySnapshot,
     GatewayBulkMetrics, GatewayBulkSample, GatewayBulkSnapshot, GatewayConfig, GatewayError,
-    GatewayServer, SharedBulkAckAdmission, GATEWAY_ALPN,
+    GatewayServer, NearestInterestSuccessorPolicy, ParkOnLossPolicy, RegistrarSweepClock,
+    SharedBulkAckAdmission, SharedSuccessorPolicy, SuccessorCandidate, SuccessorPolicy,
+    SuccessorRequest, GATEWAY_ALPN,
 };
 #[cfg(feature = "fdb")]
 pub use intent::{FdbIntentExecutor, IntentFence};

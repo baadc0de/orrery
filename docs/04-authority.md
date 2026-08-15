@@ -4,16 +4,29 @@ Every replicated entity in Orrery has exactly one writer at any instant. This do
 
 Normative source: [ADR-0007](adr/0007-authority-and-leases.md) (boundaries with [D5](adr/0005-spatial-model.md), [D6](adr/0006-population-adaptive-topology.md), [D8](adr/0008-prediction-rollback-interpolation.md), [D11](adr/0011-persistence.md), and [D12](adr/0012-backend-services.md)).
 
-> **Implementation status (2026-08-15).** The strict persistence-authority path is
+> **Implementation status (2026-08-16).** The strict persistence-authority path is
 > implemented: a signed, transport-NodeId-bound session is required before lease
 > or fenced-diff traffic; weak claims require an exact live coordinator-interest
 > snapshot for the entity's committed cell; lease transitions are serialized by
 > cell actors and durably indexed; heartbeats are hot-state only; and stale,
 > missing, expired, or wrong-holder fences are rejected before journaling. A
 > server-owned committed rekey migrates the entity and lease index atomically.
-> Current owner loss always **parks** the lease. Successor selection, negotiated
-> divestiture, contact-island propagation, and field-host promotion remain
-> deferred; the design flows below describe those future capabilities as well.
+>
+> Owner loss now **redistributes** rather than always parking (§4.3): both the
+> disconnect fast path and the TTL slow path select a successor among peers with
+> a live session on the same gateway and live coordinator interest covering the
+> entity's cell, grant it through the ordinary serialized claim path, and push
+> the loser an `Expire` naming the disposition. Strong-held rows still re-park
+> rather than being regranted. **Holder-initiated** negotiated divestiture
+> (§4.2, `Divest{to, final_seq, cursor}`) is implemented with its
+> uplink-completeness gate. The single-writer invariant checker is always on and
+> counts fenced-out writes that overlapped a different live holder.
+>
+> Still deferred: the registrar→holder `Divest` *request* (coordinator-driven
+> drain and the claimant-triggered half of §4.2), `Expire` fan-out to cell
+> subscribers, contact-island propagation, redistribution across sibling
+> gateways, and field-host promotion. The design flows below describe those
+> future capabilities as well.
 
 ## 1. The two-tier model
 
@@ -65,6 +78,7 @@ The registrar is a facet of `orrery_persistd`, not a separate service. A lease r
 - **Acquire** = CAS on `(holder, seq, lease_id)`: the actor checks eligibility (INV-5, plausibility gate §10, expiry), bumps the relevant sequence, increments `lease_id`, sets `expires_at = now + TTL`, and emits `Grant`. Losing concurrent claimants get `Deny`. TTL is **10 s**, heartbeat every **2.5 s** (four missed heartbeats = expiry).
 - **Durability**: acquire/transfer/park/expire write through to FDB; heartbeats renew only the in-memory row. On actor failover, leases are rebuilt from FDB with a *full fresh TTL* — conservative in the safe direction (an extra ≤10 s of orphan latency, never two writers).
 - **Fencing**: the gateway tracks the `lease_id`s a peer holds; a diff carrying a stale `lease_id` is dropped and answered with a lease-specific `BulkNack` containing the current row. This closes the classic zombie-holder race without trusting peer clocks.
+- **Single-writer invariant checker**: a fenced-out write whose live row names a *different*, unexpired holder is the only externally observable form of "two peers both believed they were the writer". The gateway counts each one, retains the last sample (`entity`, `tick`, both node ids, both tokens) and logs it at `warn`. A healthy cluster holds this at zero; it is the phase's acceptance signal, not a debug aid.
 - **Clock discipline**: only the registrar's monotonic clock decides expiry. Holders track a conservative local estimate (`expires_at − one heartbeat interval`) and mark their lease *uncertain* past it (§11.1).
 
 Ordinary claim round-trips ride the reliable control stream of the peer's existing iroh connection to the gateway (§D3 channel policy) and land on an in-memory actor; target p99 grant latency in-region is **< 5 ms** (design target, same path class as the < 2 ms bulk ack) — comfortably inside the 9-tick/150 ms rollback window, which is what makes optimistic claiming safe (§4).
@@ -94,9 +108,22 @@ Six messages, defined in `orrery_protocol`, postcard-encoded on the reliable con
 `claim_id` makes delayed control replies safe: a client ignores a `Grant` or
 `Deny` that does not correspond to its pending claim, ignores grants that do
 not advance its installed fence, and accepts `Expire` only for its installed
-`lease_id`. The current implementation emits `Parked` for owner loss; the
-`Reassigned` disposition remains part of the accepted design, pending successor
-selection.
+`lease_id`.
+
+Registrar-initiated grants — successor selection and the receiving half of a
+handoff — carry the reserved correlation `ClaimId::REGISTRAR` (`0`), which
+client-allocated ids (from `1`) can never collide with. The client installs one
+without a pending claim but still only when it advances the fence it already
+holds, so a duplicated or reordered push can never reinstate superseded
+authority. `orrery_authority` surfaces it as `AuthorityEvent::Inherited` rather
+than `Granted`: the entity was not being simulated optimistically beforehand,
+so game code has to promote it from proxy to simulated body rather than confirm
+a prediction.
+
+An `Expire` addresses the loser by the token it *still believes it has
+installed* — parking has already bumped the row's own `lease_id` past it — and
+its `disposition` tells the loser where authority actually went, so a demoted
+peer renders the entity against its real holder instead of a stale local one.
 
 `Divest.cursor` names the holder's last acked journal position so the registrar can require the state to be uplink-complete before regranting — the successor starts from exactly the state the predecessor last committed.
 
@@ -159,6 +186,22 @@ sequenceDiagram
     Reg->>A: Expire{Revoked, Reassigned{B}}
 ```
 
+**As implemented (holder-initiated half).** The holder sends
+`Divest{entity, lease_id, to, final_seq, cursor}` on its own initiative — the
+"player A grabs, throws to B" flow — and the registrar checks its consent
+rather than trusting it. It refuses, *without mutating anything*, when the
+session does not hold the named token, when `final_seq` claims an authority
+generation the registrar never issued, or when `cursor` names a journal position
+past the cluster's own uplink watermark for that entity. Naming a successor
+additionally requires a cursor at all: the successor must start from state the
+predecessor actually committed, and without a cursor there is nothing to check
+that against. A named successor then passes the same candidacy check as a crash
+successor. `orrery_authority` drops the local write marker *before* the message
+leaves, so a refusal leaves the entity unowned until this peer reclaims it —
+conservative in the safe direction. The registrar→holder `Divest` request shown
+above, which is what lets *B's claim* trigger the handoff, is not yet
+implemented.
+
 Deadline behavior (design defaults): if A holds only *weak* authority, a missed 300 ms deadline converts to unconditional divestiture — the grant proceeds (interactions must not stall on an unresponsive peer). If A holds *strong* ownership, a missed deadline yields `Deny{StrongHeld}` to B (INV-5): stealing by timeout is exactly what "not stealable" forbids; only lease expiry (crash) breaks strong ownership. Game-level "ask to trade" UX happens above this protocol.
 
 ### 4.3 Crash orphaning and redistribution
@@ -182,6 +225,40 @@ sequenceDiagram
 ```
 
 Redistribution is NGO-style: the successor inherits last-known committed state, not the crashed peer's unreplicated tail (bounded by the ≈1–4 Hz uplink cadence plus journal durability — see [08-persistence.md](08-persistence.md)). A strong-owned entity whose owner crashed re-parks with `own_seq` intact rather than being regranted, unless it is `PLAYER_BOUND` (the character parks and is exclusively reclaimable by the returning account).
+
+**Successor selection as implemented.** Candidacy is deliberately no wider than
+a live claim's own admission: a peer qualifies only when it has a live
+authenticated session *on this gateway* and the coordinator's own interest
+snapshot still covers the entity's committed cell. Redistribution can therefore
+never place authority somewhere an ordinary `Claim` could not. True metric
+proximity needs peer positions the coordinator does not yet hand the gateway,
+so "nearest interacting peer" is read off the data that is authoritative here,
+in order:
+
+1. a peer already holding a lease on an entity committed to the same cell — the
+   observable proxy for "already interacting";
+2. the tightest coordinator interest covering the cell (a deeper covering cell
+   is a smaller region, hence nearer);
+3. the fewest leases already held, so one peer does not inherit a crashed
+   holder's entire working set;
+4. the node id, so the choice is deterministic and reproducible in a replay.
+
+The policy is a seam (`SuccessorPolicy`), so a deployment can substitute a real
+proximity ranking the moment the coordinator supplies positions; `select`
+returning `None` parks, which is always safe. The registrar ignores a selection
+outside the vetted candidate set rather than granting to an unchecked peer, and
+if the grant lands but the successor's session dies before the push is
+delivered, the grant is unwound and the entity parks — never an unreachable
+holder.
+
+**Grid of dispositions.** A lost lease resolves to exactly one of:
+
+| Condition | Disposition |
+|---|---|
+| weak, an eligible successor accepted the push | `Reassigned{to}` |
+| weak, no eligible candidate | `Parked` |
+| weak, grant or push failed | `Parked` (grant unwound first) |
+| `STRONG_HELD` | `Parked`, `own_seq` intact — never regranted without consent |
 
 The `alt` branch above is also how **field-host loss** resolves (§8): a field host is just a holder with many leases, and the gateway observing its connection drop triggers the **fast path** — immediate unconditional divestiture of every lease it held, while the coordinator re-promotes from the warm pool — **< 10 s player-facing** (the figure [02-networking.md](02-networking.md) and [09-services-and-ops.md](09-services-and-ops.md) reference). Only a *zombie* host — connection alive, heartbeats silent — falls to the **slow path** of lease-TTL expiry, **< 30 s worst case**.
 

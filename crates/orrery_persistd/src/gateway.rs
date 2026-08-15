@@ -356,6 +356,240 @@ impl InterestAuthority for SnapshotInterestAuthority {
     }
 }
 
+/// One candidate for inheriting a lease whose holder was lost (D7 §5).
+///
+/// Candidacy is deliberately narrow: a peer qualifies only when the
+/// coordinator's own interest snapshot still covers the entity's committed
+/// cell. That is the same admission rule a weak claim passes, so crash
+/// redistribution can never place authority somewhere a live claim could not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SuccessorCandidate {
+    /// The candidate peer's authenticated transport identity.
+    pub node: NodeId,
+    /// The cell in the candidate's coordinator snapshot that covers the
+    /// entity. A deeper cell is a tighter interest, and therefore nearer.
+    pub covering_cell: CellId,
+    /// Leases this peer already holds on this gateway.
+    pub held_leases: usize,
+    /// Whether one of those leases is on an entity committed to the same cell
+    /// — the observable proxy for "already interacting with this entity".
+    pub holds_lease_in_cell: bool,
+}
+
+/// The registrar's request for a successor to a lost lease.
+#[derive(Debug, Clone)]
+pub struct SuccessorRequest<'a> {
+    /// Grid containing `cell`.
+    pub grid: GridId,
+    /// The entity's committed cell.
+    pub cell: CellId,
+    /// The entity whose authority is being redistributed.
+    pub entity: PersistId,
+    /// The holder that was lost.
+    pub previous_holder: NodeId,
+    /// What ended the lease.
+    pub reason: orrery_protocol::ExpireReason,
+    /// Eligible peers, in no particular order.
+    pub candidates: &'a [SuccessorCandidate],
+}
+
+/// Chooses which peer inherits a lease whose holder was lost.
+///
+/// Returning `None` parks the entity, which is always safe: a parked entity is
+/// served read-only from persistence and the first ordinary claim unparks it
+/// (D7 §7).
+pub trait SuccessorPolicy: Send + Sync {
+    /// Pick a successor from `request.candidates`, or `None` to park.
+    ///
+    /// An implementation must return a node that appears in `candidates`; the
+    /// gateway ignores anything else rather than granting to an unvetted peer.
+    fn select(&self, request: &SuccessorRequest<'_>) -> Option<NodeId>;
+}
+
+/// Shared successor policy injected into a gateway.
+pub type SharedSuccessorPolicy = Arc<dyn SuccessorPolicy>;
+
+/// The policy that always parks — the behaviour before successor selection
+/// landed, kept as an explicit choice for deployments that do not want
+/// redistribution.
+#[derive(Debug, Default)]
+pub struct ParkOnLossPolicy;
+
+impl SuccessorPolicy for ParkOnLossPolicy {
+    fn select(&self, _request: &SuccessorRequest<'_>) -> Option<NodeId> {
+        None
+    }
+}
+
+/// The default "nearest interacting peer" policy (D7 §5).
+///
+/// True metric proximity needs peer positions the coordinator does not yet
+/// hand the gateway, so nearness is read off the data that *is* authoritative
+/// here, in this order:
+///
+/// 1. a peer already holding a lease in the same cell — it is demonstrably
+///    interacting with the entity's neighbourhood;
+/// 2. the tightest coordinator interest covering the cell (a deeper covering
+///    cell is a smaller region, so a nearer peer);
+/// 3. the fewest leases already held, so one peer does not inherit a crashed
+///    holder's entire working set;
+/// 4. the node id, so the choice is deterministic and reproducible in a replay.
+#[derive(Debug, Default)]
+pub struct NearestInterestSuccessorPolicy;
+
+impl SuccessorPolicy for NearestInterestSuccessorPolicy {
+    fn select(&self, request: &SuccessorRequest<'_>) -> Option<NodeId> {
+        request
+            .candidates
+            .iter()
+            .filter(|candidate| candidate.node != request.previous_holder)
+            .min_by_key(|candidate| {
+                (
+                    usize::from(!candidate.holds_lease_in_cell),
+                    u8::MAX - candidate.covering_cell.level(),
+                    candidate.held_leases,
+                    *candidate.node.as_bytes(),
+                )
+            })
+            .map(|candidate| candidate.node)
+    }
+}
+
+/// One observation of two peers simultaneously believing they held authority
+/// over the same entity (D7 §5, the single-writer invariant checker).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DuplicateAuthoritySample {
+    /// The contested entity.
+    pub entity: PersistId,
+    /// The tick the losing writer stamped on its diff.
+    pub tick: orrery_protocol::Tick,
+    /// The peer whose write was fenced out.
+    pub rejected_writer: NodeId,
+    /// The token that peer presented.
+    pub rejected_lease_id: LeaseId,
+    /// The peer the registrar considers authoritative.
+    pub current_holder: NodeId,
+    /// The registrar's live token for the entity.
+    pub current_lease_id: LeaseId,
+}
+
+/// A point-in-time read of [`AuthorityMetrics`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct AuthoritySnapshot {
+    /// Fenced writes that arrived while a *different* peer held a live lease.
+    pub duplicate_authority: u64,
+    /// Leases placed with a selected successor, by crash redistribution or by
+    /// negotiated handoff.
+    pub reassigned: u64,
+    /// Lost leases parked because no successor was eligible.
+    pub parked_without_successor: u64,
+    /// Leases a holder released or handed off by consent.
+    pub divested: u64,
+    /// Divestitures refused before any registrar mutation.
+    pub divest_rejected: u64,
+}
+
+/// Always-on authority telemetry.
+///
+/// `duplicate_authority` is the single-writer invariant checker the phase
+/// requires: it counts bulk writes the registrar fenced out **while another
+/// peer held a live, unexpired lease on the same entity** — the only
+/// externally observable form of "two peers both believed they were the
+/// writer". A healthy cluster leaves it at zero; every increment is also
+/// logged at `warn` with both node ids, so the signal exists without a scrape.
+#[derive(Debug, Default)]
+pub struct AuthorityMetrics {
+    duplicate_authority: AtomicU64,
+    reassigned: AtomicU64,
+    parked_without_successor: AtomicU64,
+    divested: AtomicU64,
+    divest_rejected: AtomicU64,
+    last_duplicate: std::sync::Mutex<Option<DuplicateAuthoritySample>>,
+}
+
+impl AuthorityMetrics {
+    /// Read every counter.
+    #[must_use]
+    pub fn snapshot(&self) -> AuthoritySnapshot {
+        AuthoritySnapshot {
+            duplicate_authority: self.duplicate_authority.load(Ordering::Relaxed),
+            reassigned: self.reassigned.load(Ordering::Relaxed),
+            parked_without_successor: self.parked_without_successor.load(Ordering::Relaxed),
+            divested: self.divested.load(Ordering::Relaxed),
+            divest_rejected: self.divest_rejected.load(Ordering::Relaxed),
+        }
+    }
+
+    /// The most recent duplicate-authority observation, if any.
+    #[must_use]
+    pub fn last_duplicate_authority(&self) -> Option<DuplicateAuthoritySample> {
+        self.last_duplicate.lock().ok().and_then(|last| *last)
+    }
+
+    fn record_reassigned(&self) {
+        self.reassigned.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_parked_without_successor(&self) {
+        self.parked_without_successor
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_divested(&self) {
+        self.divested.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_divest_rejected(&self) {
+        self.divest_rejected.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_duplicate_authority(&self, sample: DuplicateAuthoritySample) {
+        self.duplicate_authority.fetch_add(1, Ordering::Relaxed);
+        if let Ok(mut last) = self.last_duplicate.lock() {
+            *last = Some(sample);
+        }
+        warn!(
+            entity = ?sample.entity,
+            tick = ?sample.tick,
+            rejected_writer = %sample.rejected_writer,
+            current_holder = %sample.current_holder,
+            "gateway: duplicate-authority write fenced out"
+        );
+    }
+}
+
+/// Inspect a fencing rejection for the single-writer invariant.
+///
+/// Only a rejection whose live row names a *different* holder with an
+/// unexpired lease counts. A rejection against a parked row, an expired row,
+/// or the writer's own superseded token is ordinary fencing, not two live
+/// writers.
+fn observe_fencing_rejection(
+    metrics: &AuthorityMetrics,
+    entity: PersistId,
+    tick: orrery_protocol::Tick,
+    rejected_writer: NodeId,
+    rejected_lease_id: LeaseId,
+    lease: Option<&orrery_protocol::Lease>,
+    now_ms: u64,
+) {
+    let Some(lease) = lease else { return };
+    let Some(current_holder) = lease.holder else {
+        return;
+    };
+    if current_holder == rejected_writer || lease.expires_at <= now_ms {
+        return;
+    }
+    metrics.record_duplicate_authority(DuplicateAuthoritySample {
+        entity,
+        tick,
+        rejected_writer,
+        rejected_lease_id,
+        current_holder,
+        current_lease_id: lease.lease_id,
+    });
+}
+
 const BULK_LATENCY_BOUNDARIES_US: [u64; 22] = [
     50, 100, 200, 500, 1_000, 2_000, 3_000, 5_000, 7_000, 10_000, 15_000, 20_000, 30_000, 50_000,
     75_000, 100_000, 150_000, 200_000, 300_000, 500_000, 750_000, 1_000_000,
@@ -578,6 +812,19 @@ impl BulkAckAdmission for FreshBulkAckAdmission {
     }
 }
 
+/// The registrar-monotonic clock driving the periodic lease-TTL sweep.
+///
+/// Deliberately the same trait as the claim-admission clock: both read the
+/// registrar's own monotonic milliseconds and never a peer or wall clock.
+#[derive(Debug, Default)]
+pub struct RegistrarSweepClock;
+
+impl ClaimClock for RegistrarSweepClock {
+    fn now_ms(&self) -> u64 {
+        registrar_now_ms()
+    }
+}
+
 /// Configuration for the [`GatewayServer`].
 #[derive(Clone)]
 pub struct GatewayConfig {
@@ -626,6 +873,20 @@ pub struct GatewayConfig {
     pub peer_idle_retention_ms: u64,
     /// Monotonic source for NodeId-scoped D16 claim admission.
     pub claim_clock: SharedClaimClock,
+    /// Who inherits a lease whose holder was lost (D7 §5).
+    ///
+    /// The default ranks by coordinator interest. Candidacy still requires a
+    /// live coordinator snapshot covering the entity's cell, so the shipped
+    /// default combined with the default [`DenyAllInterestAuthority`] parks
+    /// every lost lease — redistribution turns on with the coordinator, not
+    /// before it.
+    pub successor_policy: SharedSuccessorPolicy,
+    /// Always-on single-writer invariant telemetry. Share the handle to scrape
+    /// it; a fresh one is created when the caller does not.
+    pub authority_metrics: Arc<AuthorityMetrics>,
+    /// Registrar clock the periodic TTL sweep reads. Injectable so a test can
+    /// advance expiry without sleeping through a 10 s lease.
+    pub lease_sweep_clock: SharedClaimClock,
 }
 
 impl Default for GatewayConfig {
@@ -648,6 +909,9 @@ impl Default for GatewayConfig {
             peer_lease_capacity: MAX_PEER_LIVE_LEASES,
             peer_idle_retention_ms: MAX_SESSION_TOKEN_TTL_MS,
             claim_clock: Arc::new(SystemClaimClock::default()),
+            successor_policy: Arc::new(NearestInterestSuccessorPolicy),
+            authority_metrics: Arc::new(AuthorityMetrics::default()),
+            lease_sweep_clock: Arc::new(RegistrarSweepClock),
         }
     }
 }
@@ -711,10 +975,19 @@ enum LeaseClaimCompletion {
     Denied,
 }
 
+/// Sends one encoded frame back down a peer's live connection.
+///
+/// The registrar needs this to reach a peer that did not ask anything: a
+/// successor learning it inherited a lease, or a silent holder learning its
+/// lease expired. Every other gateway reply is a response to a datagram the
+/// peer just sent.
+type PeerNotifier = Arc<dyn Fn(Bytes) + Send + Sync>;
+
 struct PeerState {
     established: EstablishedIdentity,
     current: Option<SessionGeneration>,
     live: HashSet<SessionGeneration>,
+    notify: Option<(SessionGeneration, PeerNotifier)>,
     leases: HashMap<PersistId, SessionLease>,
     pending_lease_claims: usize,
     lease_capacity: usize,
@@ -741,6 +1014,27 @@ impl PeerSession {
     async fn lock_current(&self) -> Option<tokio::sync::OwnedMutexGuard<PeerState>> {
         let state = Arc::clone(&self.state).lock_owned().await;
         (state.current == Some(self.generation)).then_some(state)
+    }
+
+    /// Install this session's send path so the registrar can push to it.
+    async fn install_notifier(&self, notify: PeerNotifier) {
+        let mut peer = self.state.lock().await;
+        if peer.current == Some(self.generation) {
+            peer.notify = Some((self.generation, notify));
+        }
+    }
+
+    /// Push an unsolicited reply, if this session is still the current one.
+    async fn notify(&self, reply: &GatewayReply) -> bool {
+        let frame = Bytes::from(encode_stream_frame(reply));
+        let peer = self.state.lock().await;
+        match &peer.notify {
+            Some((generation, notify)) if *generation == self.generation => {
+                notify(frame);
+                true
+            }
+            _ => false,
+        }
     }
 
     async fn try_reserve_lease_slot(&self) -> bool {
@@ -844,6 +1138,7 @@ impl PeerRegistry {
                     },
                     current: None,
                     live: HashSet::new(),
+                    notify: None,
                     leases: HashMap::new(),
                     pending_lease_claims: 0,
                     lease_capacity: self.lease_capacity,
@@ -899,6 +1194,51 @@ impl PeerRegistry {
         })
     }
 
+    /// A handle to `node`'s current session, if it has one.
+    ///
+    /// The registrar uses this to reach a peer that is not the one it is
+    /// currently serving — the successor of a lost lease, or the loser of a
+    /// negotiated handoff.
+    async fn current_session(&self, node: NodeId) -> Option<PeerSession> {
+        let state = Arc::clone(self.entries.lock().await.get(&node)?);
+        let generation = {
+            let peer = state.lock().await;
+            peer.current?
+        };
+        Some(PeerSession {
+            node,
+            generation,
+            state,
+        })
+    }
+
+    /// Every peer with a live session, and the leases it currently holds.
+    async fn live_peer_leases(&self) -> Vec<(NodeId, Vec<SessionLease>)> {
+        let entries = {
+            let entries = self.entries.lock().await;
+            entries
+                .iter()
+                .map(|(node, state)| (*node, Arc::clone(state)))
+                .collect::<Vec<_>>()
+        };
+        let mut live = Vec::new();
+        for (node, state) in entries {
+            let peer = state.lock().await;
+            let Some(current) = peer.current else {
+                continue;
+            };
+            live.push((
+                node,
+                peer.leases
+                    .values()
+                    .filter(|lease| lease.owner == SessionLeaseOwner::Active(current))
+                    .copied()
+                    .collect(),
+            ));
+        }
+        live
+    }
+
     async fn evict_idle(&self, now_ms: u64) {
         self.entries.lock().await.retain(|_, state| {
             let Ok(peer) = state.try_lock() else {
@@ -940,11 +1280,265 @@ impl GatewayAdmission {
     }
 }
 
+/// The registrar-side half of authority redistribution.
+///
+/// Successor selection lives on the gateway, not in the cell actor, because
+/// only the gateway knows which peers currently hold authenticated sessions
+/// and what the coordinator says they are interested in. The actor stays the
+/// single writer of the row; this type only decides *who to offer it to* and
+/// then goes through the ordinary serialized claim path to make it so.
+///
+/// A successor must therefore be reachable on **this** gateway. A peer
+/// connected to a sibling gateway is not a candidate — redistribution across
+/// gateways needs a cluster-wide session directory, which is later work.
+struct Redistributor {
+    peers: Arc<PeerRegistry>,
+    interest: SharedInterestAuthority,
+    policy: SharedSuccessorPolicy,
+    metrics: Arc<AuthorityMetrics>,
+}
+
+impl Redistributor {
+    /// Peers eligible to inherit an entity committed to `cell`.
+    async fn candidates(
+        &self,
+        grid: GridId,
+        cell: CellId,
+        exclude: NodeId,
+        now_ms: u64,
+    ) -> Vec<SuccessorCandidate> {
+        let mut candidates = Vec::new();
+        for (node, leases) in self.peers.live_peer_leases().await {
+            if node == exclude {
+                continue;
+            }
+            let Some(snapshot) = self.interest.snapshot_for(node) else {
+                continue;
+            };
+            if snapshot.peer != node || snapshot.grid != grid || snapshot.valid_until_ms <= now_ms {
+                continue;
+            }
+            // The tightest covering cell in the snapshot: covering the exact
+            // cell is nearer than covering one of its ancestors.
+            let Some(covering_cell) = snapshot
+                .covered_cells
+                .iter()
+                .filter(|covered| covered.is_prefix_of(cell))
+                .max_by_key(|covered| covered.level())
+                .copied()
+            else {
+                continue;
+            };
+            candidates.push(SuccessorCandidate {
+                node,
+                covering_cell,
+                held_leases: leases.len(),
+                holds_lease_in_cell: leases
+                    .iter()
+                    .any(|lease| lease.grid == grid && lease.cell == cell),
+            });
+        }
+        candidates
+    }
+
+    /// Grant a parked entity to `successor` and tell it, or return `None`
+    /// having left the registrar exactly as it found it.
+    async fn hand_to(
+        &self,
+        router: &Arc<dyn Router>,
+        grid: GridId,
+        cell: CellId,
+        entity: PersistId,
+        successor: NodeId,
+        prev_holder: Option<NodeId>,
+    ) -> Option<orrery_protocol::Lease> {
+        let session = self.peers.current_session(successor).await?;
+        if !session.try_reserve_lease_slot().await {
+            return None;
+        }
+        let granted = match router
+            .claim_lease(
+                grid,
+                cell,
+                entity,
+                successor,
+                orrery_protocol::ClaimKind::Weak,
+                registrar_now_ms(),
+            )
+            .await
+        {
+            Ok(crate::lease::ClaimResult::Granted(row)) => row,
+            Ok(crate::lease::ClaimResult::Denied(_)) | Err(_) => {
+                let _ = session.complete_lease_claim(None).await;
+                return None;
+            }
+        };
+        let lease = SessionLease {
+            entity,
+            lease_id: granted.lease_id,
+            grid,
+            cell,
+            owner: SessionLeaseOwner::Active(session.generation),
+        };
+        match session.complete_lease_claim(Some(lease)).await {
+            LeaseClaimCompletion::Granted => {
+                let delivered = session
+                    .notify(&GatewayReply::Lease {
+                        message: LeaseMsg::Grant {
+                            claim_id: orrery_protocol::ClaimId::REGISTRAR,
+                            entity,
+                            lease_id: granted.lease_id,
+                            seq: granted.seq,
+                            ttl_ms: crate::lease::LEASE_TTL_MS as u32,
+                            prev_holder,
+                        },
+                    })
+                    .await;
+                if delivered {
+                    Some(granted)
+                } else {
+                    // The successor's session went away between the grant and
+                    // the push. Nobody would ever learn it holds this lease,
+                    // so undo rather than leave an unreachable holder.
+                    self.unwind_grant(router, &session, lease).await;
+                    None
+                }
+            }
+            LeaseClaimCompletion::Compensate(compensation) => {
+                self.unwind_grant(router, &session, compensation).await;
+                None
+            }
+            LeaseClaimCompletion::Denied => {
+                let _ = router
+                    .park_lease(grid, cell, entity, successor, granted.lease_id)
+                    .await;
+                None
+            }
+        }
+    }
+
+    /// Park a grant back out and drop the session index entry it created.
+    async fn unwind_grant(
+        &self,
+        router: &Arc<dyn Router>,
+        session: &PeerSession,
+        lease: SessionLease,
+    ) {
+        let parked = router
+            .park_lease(
+                lease.grid,
+                lease.cell,
+                lease.entity,
+                session.node,
+                lease.lease_id,
+            )
+            .await
+            .is_ok();
+        if parked {
+            let mut peer = session.state.lock().await;
+            if peer.leases.get(&lease.entity) == Some(&lease) {
+                peer.leases.remove(&lease.entity);
+            }
+        }
+    }
+
+    /// Choose where a lost lease goes, put it there, and tell the loser.
+    async fn redistribute(&self, router: &Arc<dyn Router>, parked: crate::lease::ParkedLease) {
+        let entity = parked.lease.entity;
+        let disposition = self.place(router, &parked).await;
+        match &disposition {
+            orrery_protocol::ExpireDisposition::Reassigned { .. } => {
+                self.metrics.record_reassigned()
+            }
+            _ => self.metrics.record_parked_without_successor(),
+        }
+        // Tell the losing holder, addressed by the token it still believes it
+        // has installed — parking already bumped the row's own `lease_id`
+        // past it. On a disconnect there is nobody left to tell; on a TTL
+        // sweep this is what stops a silent zombie from writing again.
+        if let Some(session) = self.peers.current_session(parked.previous_holder).await {
+            session
+                .notify(&GatewayReply::Lease {
+                    message: LeaseMsg::Expire {
+                        entity,
+                        lease_id: parked.previous_lease_id,
+                        last_holder: Some(parked.previous_holder),
+                        reason: parked.reason,
+                        disposition,
+                    },
+                })
+                .await;
+        }
+    }
+
+    /// Decide and enact the disposition of one parked row.
+    async fn place(
+        &self,
+        router: &Arc<dyn Router>,
+        parked: &crate::lease::ParkedLease,
+    ) -> orrery_protocol::ExpireDisposition {
+        // D7 §5: a strong-owned entity whose owner crashed re-parks with its
+        // `own_seq` intact rather than being regranted. Only weak authority
+        // is redistributed without consent.
+        if parked
+            .lease
+            .flags
+            .contains(orrery_protocol::LeaseFlags::STRONG_HELD)
+        {
+            return orrery_protocol::ExpireDisposition::Parked;
+        }
+        let candidates = self
+            .candidates(
+                parked.grid,
+                parked.cell,
+                parked.previous_holder,
+                registrar_now_ms(),
+            )
+            .await;
+        if candidates.is_empty() {
+            return orrery_protocol::ExpireDisposition::Parked;
+        }
+        let chosen = self.policy.select(&SuccessorRequest {
+            grid: parked.grid,
+            cell: parked.cell,
+            entity: parked.lease.entity,
+            previous_holder: parked.previous_holder,
+            reason: parked.reason,
+            candidates: &candidates,
+        });
+        // A policy may only pick from the vetted set; anything else is
+        // ignored rather than granted to an unchecked peer.
+        let Some(successor) = chosen.filter(|node| {
+            *node != parked.previous_holder
+                && candidates.iter().any(|candidate| candidate.node == *node)
+        }) else {
+            return orrery_protocol::ExpireDisposition::Parked;
+        };
+        if self
+            .hand_to(
+                router,
+                parked.grid,
+                parked.cell,
+                parked.lease.entity,
+                successor,
+                Some(parked.previous_holder),
+            )
+            .await
+            .is_some()
+        {
+            orrery_protocol::ExpireDisposition::Reassigned { to: successor }
+        } else {
+            orrery_protocol::ExpireDisposition::Parked
+        }
+    }
+}
+
 /// A running gateway: an iroh endpoint that accepts client sessions and routes
 /// them onto a [`Router`] (a single runtime or a test cluster harness).
 pub struct GatewayServer {
     endpoint: Arc<Endpoint>,
     interest_authority: SharedInterestAuthority,
+    authority_metrics: Arc<AuthorityMetrics>,
     send_failures: Arc<AtomicU64>,
     shutdown: oneshot::Sender<()>,
     join: tokio::task::JoinHandle<()>,
@@ -986,6 +1580,14 @@ impl GatewayServer {
             )),
         };
         let bulk_metrics = config.bulk_metrics;
+        let authority_metrics = Arc::clone(&config.authority_metrics);
+        let redistributor = Arc::new(Redistributor {
+            peers: Arc::clone(&admission.peers),
+            interest: Arc::clone(&interest_authority),
+            policy: config.successor_policy,
+            metrics: Arc::clone(&authority_metrics),
+        });
+        let lease_sweep_clock = config.lease_sweep_clock;
         let (shutdown, rx) = oneshot::channel();
         let send_failures = Arc::new(AtomicU64::new(0));
         let join = tokio::spawn(accept_loop(
@@ -999,12 +1601,15 @@ impl GatewayServer {
             Arc::clone(&interest_authority),
             admission,
             bulk_metrics,
+            redistributor,
+            lease_sweep_clock,
             Arc::clone(&send_failures),
             rx,
         ));
         Ok(Self {
             endpoint,
             interest_authority,
+            authority_metrics,
             send_failures,
             shutdown,
             join,
@@ -1031,6 +1636,13 @@ impl GatewayServer {
     #[must_use]
     pub fn interest_authority(&self) -> &dyn InterestAuthority {
         self.interest_authority.as_ref()
+    }
+
+    /// The always-on authority telemetry, including the single-writer
+    /// invariant checker (D7 §5). `duplicate_authority` must stay at zero.
+    #[must_use]
+    pub fn authority_metrics(&self) -> &Arc<AuthorityMetrics> {
+        &self.authority_metrics
     }
 
     /// The number of reply datagram sends that failed since startup (e.g. an
@@ -1065,6 +1677,8 @@ async fn accept_loop(
     interest_authority: SharedInterestAuthority,
     admission: GatewayAdmission,
     bulk_metrics: Option<Arc<GatewayBulkMetrics>>,
+    redistributor: Arc<Redistributor>,
+    lease_sweep_clock: SharedClaimClock,
     send_failures: Arc<AtomicU64>,
     mut shutdown: oneshot::Receiver<()>,
 ) {
@@ -1072,7 +1686,12 @@ async fn accept_loop(
         tokio::select! {
             _ = &mut shutdown => break,
             _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {
-                router.sweep_expired_leases(registrar_now_ms()).await;
+                // Expiry and redistribution are one step: a swept row that is
+                // parked and then left is exactly the orphan the phase exists
+                // to eliminate.
+                for parked in router.sweep_expired_leases(lease_sweep_clock.now_ms()).await {
+                    redistributor.redistribute(&router, parked).await;
+                }
                 admission.peers.evict_idle(admission.clock.now_ms().0).await;
             }
             incoming = endpoint.accept() => {
@@ -1084,6 +1703,7 @@ async fn accept_loop(
                 let interest_authority = Arc::clone(&interest_authority);
                 let admission = admission.clone();
                 let bulk_metrics = bulk_metrics.clone();
+                let redistributor = Arc::clone(&redistributor);
                 let send_failures = Arc::clone(&send_failures);
                 tokio::spawn(handle_connection(
                     incoming,
@@ -1096,6 +1716,7 @@ async fn accept_loop(
                     interest_authority,
                     admission,
                     bulk_metrics,
+                    redistributor,
                     send_failures,
                 ));
             }
@@ -1124,6 +1745,7 @@ async fn handle_connection(
     interest_authority: SharedInterestAuthority,
     admission: GatewayAdmission,
     bulk_metrics: Option<Arc<GatewayBulkMetrics>>,
+    redistributor: Arc<Redistributor>,
     send_failures: Arc<AtomicU64>,
 ) {
     let conn = match incoming.accept() {
@@ -1196,12 +1818,22 @@ async fn handle_connection(
                     None
                 };
                 if let Some(authorized) = authorized {
+                    // Install the push path before acknowledging: from here on
+                    // the registrar can reach this peer unprompted, which is
+                    // what makes reassignment and expiry visible to it.
+                    authorized.install_notifier(Arc::clone(&send)).await;
                     session = Some(authorized);
                     let reply = GatewayReply::HelloAck { gateway, protocol };
                     send(Bytes::from(encode_stream_frame(&reply)));
                 } else {
                     if let Some(retiring) = session.take() {
-                        cleanup_peer_session(&retiring, &router, admission.clock.now_ms().0).await;
+                        cleanup_peer_session(
+                            &retiring,
+                            &router,
+                            &redistributor,
+                            admission.clock.now_ms().0,
+                        )
+                        .await;
                     }
                     if node != remote {
                         warn!(%remote, "gateway: Hello node did not match transport identity");
@@ -1432,6 +2064,31 @@ async fn handle_connection(
                             },
                         })));
                     }
+                    LeaseMsg::Divest {
+                        entity,
+                        lease_id,
+                        to,
+                        final_seq,
+                        cursor,
+                    } => {
+                        let message = divest_lease(
+                            active_session,
+                            &router,
+                            &redistributor,
+                            admission.claim_clock.now_ms(),
+                            DivestRequest {
+                                entity,
+                                lease_id,
+                                to,
+                                final_seq,
+                                cursor,
+                            },
+                        )
+                        .await;
+                        send(Bytes::from(encode_stream_frame(&GatewayReply::Lease {
+                            message,
+                        })));
+                    }
                     LeaseMsg::Rekey { entity, .. } => {
                         send(Bytes::from(encode_stream_frame(&GatewayReply::Lease {
                             message: LeaseMsg::Deny {
@@ -1471,6 +2128,7 @@ async fn handle_connection(
                 let router = Arc::clone(&router);
                 let bulk_ack_admission = Arc::clone(&bulk_ack_admission);
                 let bulk_metrics = bulk_metrics.clone();
+                let authority_metrics = Arc::clone(&redistributor.metrics);
                 let permit = Arc::clone(&inflight_diffs).acquire_owned().await;
                 match permit {
                     Ok(permit) => {
@@ -1483,6 +2141,7 @@ async fn handle_connection(
                                 &router,
                                 &bulk_ack_admission,
                                 bulk_metrics.as_deref(),
+                                authority_metrics,
                                 received_at,
                             )
                             .await;
@@ -1496,6 +2155,7 @@ async fn handle_connection(
                             &router,
                             &bulk_ack_admission,
                             bulk_metrics.as_deref(),
+                            authority_metrics,
                             received_at,
                         )
                         .await
@@ -1548,16 +2208,204 @@ async fn handle_connection(
         }
     }
     if let Some(session) = session {
-        cleanup_peer_session(&session, &router, admission.clock.now_ms().0).await;
+        cleanup_peer_session(
+            &session,
+            &router,
+            &redistributor,
+            admission.clock.now_ms().0,
+        )
+        .await;
     }
 }
 
-async fn cleanup_peer_session(session: &PeerSession, router: &Arc<dyn Router>, now_ms: u64) {
+/// Whether `row` is the result of *this* caller's park of `lease_id`.
+///
+/// `park_lease` returns the live row unchanged when the presented holder or
+/// token no longer matches, so a returned row is not by itself evidence that
+/// anything was parked. Treating one as evidence would redistribute a lease
+/// that is legitimately held by somebody else.
+fn parked_by_us(row: &orrery_protocol::Lease, lease_id: LeaseId) -> bool {
+    row.holder.is_none() && row.lease_id > lease_id
+}
+
+/// One holder-initiated divestiture, as it arrives on the wire.
+struct DivestRequest {
+    entity: PersistId,
+    lease_id: LeaseId,
+    to: Option<NodeId>,
+    final_seq: orrery_protocol::SeqPair,
+    cursor: Option<Lsn>,
+}
+
+fn divest_denied(entity: PersistId, retry_after_ms: u32) -> LeaseMsg {
+    LeaseMsg::Deny {
+        claim_id: None,
+        entity,
+        reason: orrery_protocol::DenyReason::NotEligible,
+        retry_after_ms,
+    }
+}
+
+/// Cooperative handoff: the holder consents to give the lease up, naming the
+/// successor it wants (or `None` to release), its final sequence pair and the
+/// journal position it last saw acknowledged (D7 §5).
+///
+/// The consent is checked, not trusted. The registrar refuses — without
+/// mutating anything — when the session does not hold the named token, when
+/// the holder's `final_seq` claims an authority generation the registrar never
+/// issued, or when its `cursor` names a journal position the cluster never
+/// wrote. A handoff to a named successor additionally requires a cursor at
+/// all: the successor must start from state the predecessor actually
+/// committed, and without a cursor there is nothing to check that against.
+///
+/// A refusal is definitive and leaves the holder authoritative; the holder
+/// stops writing when it *sends* a divest, so a refusal is conservative in the
+/// safe direction — nobody writes until it reclaims.
+async fn divest_lease(
+    session: &PeerSession,
+    router: &Arc<dyn Router>,
+    redistributor: &Redistributor,
+    claim_now_ms: u64,
+    request: DivestRequest,
+) -> LeaseMsg {
+    let DivestRequest {
+        entity,
+        lease_id,
+        to,
+        final_seq,
+        cursor,
+    } = request;
+    let metrics = &redistributor.metrics;
+
+    let indexed = {
+        let Some(mut peer) = session.lock_current().await else {
+            metrics.record_divest_rejected();
+            return divest_denied(entity, 0);
+        };
+        // Divesting is lease control like claiming, and a refused one still
+        // costs an actor round trip, so it draws from the same NodeId-scoped
+        // budget rather than being an unmetered path into the registrar.
+        if !peer.claim_bucket.take(claim_now_ms) {
+            let retry_after_ms = peer.claim_bucket.retry_after_ms();
+            metrics.record_divest_rejected();
+            return LeaseMsg::Deny {
+                claim_id: None,
+                entity,
+                reason: orrery_protocol::DenyReason::RateLimited,
+                retry_after_ms,
+            };
+        }
+        peer.leases.get(&entity).copied()
+    };
+    let Some(indexed) = indexed.filter(|lease| {
+        lease.lease_id == lease_id && lease.owner == SessionLeaseOwner::Active(session.generation)
+    }) else {
+        metrics.record_divest_rejected();
+        return divest_denied(entity, 0);
+    };
+
+    // Uplink-completeness gate. Everything here is read-only: a refusal must
+    // leave the holder exactly as authoritative as it was.
+    let Ok((row, _, watermark)) = router.inspect_lease(indexed.grid, entity).await else {
+        metrics.record_divest_rejected();
+        return divest_denied(entity, 100);
+    };
+    let holder_matches = row.as_ref().is_some_and(|row| {
+        row.holder == Some(session.node)
+            && row.lease_id == lease_id
+            && !final_seq.supersedes(row.seq)
+    });
+    let cursor_is_committed = match (cursor, watermark) {
+        // A cursor past the cluster's own watermark for this entity names
+        // state that was never journaled.
+        (Some(cursor), Some(watermark)) => cursor <= watermark,
+        (Some(_), None) => false,
+        (None, _) => to.is_none(),
+    };
+    if !holder_matches || !cursor_is_committed {
+        metrics.record_divest_rejected();
+        return divest_denied(entity, 0);
+    }
+
+    let parked = router
+        .park_lease(indexed.grid, indexed.cell, entity, session.node, lease_id)
+        .await;
+    if !matches!(&parked, Ok(Some(row)) if parked_by_us(row, lease_id)) {
+        metrics.record_divest_rejected();
+        return divest_denied(entity, 100);
+    }
+    {
+        let mut peer = session.state.lock().await;
+        if peer.leases.get(&entity) == Some(&indexed) {
+            peer.leases.remove(&entity);
+        }
+    }
+    metrics.record_divested();
+
+    let disposition = match to {
+        None => orrery_protocol::ExpireDisposition::Parked,
+        Some(successor) if successor == session.node => orrery_protocol::ExpireDisposition::Parked,
+        Some(successor) => {
+            // The named successor passes exactly the admission a claim of its
+            // own would: a live session on this gateway plus live coordinator
+            // interest covering the cell. Consent does not widen it.
+            let eligible = redistributor
+                .candidates(indexed.grid, indexed.cell, session.node, registrar_now_ms())
+                .await
+                .iter()
+                .any(|candidate| candidate.node == successor);
+            let handed = eligible
+                && redistributor
+                    .hand_to(
+                        router,
+                        indexed.grid,
+                        indexed.cell,
+                        entity,
+                        successor,
+                        Some(session.node),
+                    )
+                    .await
+                    .is_some();
+            if handed {
+                metrics.record_reassigned();
+                orrery_protocol::ExpireDisposition::Reassigned { to: successor }
+            } else {
+                metrics.record_parked_without_successor();
+                orrery_protocol::ExpireDisposition::Parked
+            }
+        }
+    };
+
+    LeaseMsg::Expire {
+        entity,
+        lease_id,
+        last_holder: Some(session.node),
+        // A consented release parks deliberately; a consented handoff ends the
+        // holder's lease by registrar action. The disposition carries where
+        // authority actually went.
+        reason: if matches!(disposition, orrery_protocol::ExpireDisposition::Parked) {
+            orrery_protocol::ExpireReason::Parked
+        } else {
+            orrery_protocol::ExpireReason::Revoked
+        },
+        disposition,
+    }
+}
+
+async fn cleanup_peer_session(
+    session: &PeerSession,
+    router: &Arc<dyn Router>,
+    redistributor: &Redistributor,
+    now_ms: u64,
+) {
     let leases = {
         let mut peer = session.state.lock().await;
         peer.live.remove(&session.generation);
         if peer.current == Some(session.generation) {
             peer.current = None;
+            if matches!(&peer.notify, Some((generation, _)) if *generation == session.generation) {
+                peer.notify = None;
+            }
             for lease in peer.leases.values_mut() {
                 if lease.owner == SessionLeaseOwner::Active(session.generation) {
                     lease.owner = SessionLeaseOwner::Parking(session.generation);
@@ -1571,15 +2419,37 @@ async fn cleanup_peer_session(session: &PeerSession, router: &Arc<dyn Router>, n
             .collect::<Vec<_>>()
     };
 
+    let mut orphaned = Vec::new();
     for (lease_id, lease) in leases {
         let parked = router
             .park_lease(lease.grid, lease.cell, lease.entity, session.node, lease_id)
-            .await
-            .is_ok();
-        let mut peer = session.state.lock().await;
-        if parked && peer.leases.get(&lease.entity) == Some(&lease) {
-            peer.leases.remove(&lease.entity);
+            .await;
+        let Ok(parked_row) = parked else { continue };
+        {
+            let mut peer = session.state.lock().await;
+            if peer.leases.get(&lease.entity) == Some(&lease) {
+                peer.leases.remove(&lease.entity);
+            }
         }
+        // `park_lease` returns the row it just parked; a `None` means the
+        // registrar had no row to park, and an unchanged row means someone
+        // else now holds it — neither is ours to redistribute.
+        if let Some(row) = parked_row.filter(|row| parked_by_us(row, lease_id)) {
+            orphaned.push(crate::lease::ParkedLease {
+                grid: lease.grid,
+                cell: lease.cell,
+                previous_holder: session.node,
+                previous_lease_id: lease_id,
+                lease: row,
+                reason: orrery_protocol::ExpireReason::Disconnect,
+            });
+        }
+    }
+
+    // Redistribute only after every park has landed and every session lock is
+    // released: a successor's grant path locks peer state of its own.
+    for parked in orphaned {
+        redistributor.redistribute(router, parked).await;
     }
 
     let mut peer = session.state.lock().await;
@@ -1746,6 +2616,7 @@ async fn send_admission(conn: &iroh::endpoint::Connection) -> Result<(), String>
         .map_err(|e| format!("finish admission: {e}"))
 }
 
+#[allow(clippy::too_many_arguments)] // One session diff's dependencies, explicit.
 async fn route_session_diff(
     send: &(dyn Fn(Bytes) + Send + Sync),
     diff: DiffUplink,
@@ -1753,6 +2624,7 @@ async fn route_session_diff(
     router: &Arc<dyn Router>,
     bulk_ack_admission: &SharedBulkAckAdmission,
     bulk_metrics: Option<&GatewayBulkMetrics>,
+    authority_metrics: Arc<AuthorityMetrics>,
     received_at: Instant,
 ) {
     let Some(_peer) = session.lock_current().await else {
@@ -1771,6 +2643,7 @@ async fn route_session_diff(
             author: session.node,
             received_at,
             strict_authority: true,
+            authority_metrics,
         },
         router,
         bulk_ack_admission,
@@ -1784,6 +2657,7 @@ struct DiffRoute {
     author: NodeId,
     received_at: Instant,
     strict_authority: bool,
+    authority_metrics: Arc<AuthorityMetrics>,
 }
 
 /// Journal a bulk diff via the owning cell actor, then ack with the durable
@@ -1801,6 +2675,7 @@ async fn route_diff(
         author,
         received_at,
         strict_authority,
+        authority_metrics,
     } = route;
     let route_started = Instant::now();
     let route_queue_us = elapsed_us(received_at);
@@ -1828,12 +2703,25 @@ async fn route_diff(
             .lease_id
             .zip(diff.authority_seq)
             .unwrap_or((LeaseId(0), Default::default()));
+        let fence_now_ms = registrar_now_ms();
         match router
-            .apply_fenced(record, author, lease_id, authority_seq, registrar_now_ms())
+            .apply_fenced(record, author, lease_id, authority_seq, fence_now_ms)
             .await
         {
             Ok(FencedApply::Accepted(handle)) => Ok(handle),
             Ok(FencedApply::Rejected(lease)) => {
+                // The single-writer invariant checker (D7 §5): a fenced-out
+                // write whose live row names a *different* unexpired holder is
+                // two peers believing they were the writer at once.
+                observe_fencing_rejection(
+                    &authority_metrics,
+                    entity,
+                    tick,
+                    author,
+                    lease_id,
+                    lease.as_ref(),
+                    fence_now_ms,
+                );
                 send(Bytes::from(encode_datagram(&GatewayReply::BulkNack {
                     entity,
                     tick,
@@ -2082,6 +2970,180 @@ mod tests {
         FenceStore, MemFenceStore,
     };
 
+    fn successor_node(seed: u8) -> NodeId {
+        iroh::SecretKey::from_bytes(&[seed; 32]).public()
+    }
+
+    #[test]
+    fn nearest_interest_ranks_interaction_then_tightness_then_load() {
+        // Given: four peers whose interest all covers the entity's cell, but
+        // by different routes.
+        let cell = CellId::ROOT.children()[0].children()[1];
+        let interacting = SuccessorCandidate {
+            node: successor_node(1),
+            covering_cell: CellId::ROOT,
+            held_leases: 40,
+            holds_lease_in_cell: true,
+        };
+        let tight = SuccessorCandidate {
+            node: successor_node(2),
+            covering_cell: cell,
+            held_leases: 0,
+            holds_lease_in_cell: false,
+        };
+        let loose_idle = SuccessorCandidate {
+            node: successor_node(3),
+            covering_cell: CellId::ROOT,
+            held_leases: 0,
+            holds_lease_in_cell: false,
+        };
+        let loose_busy = SuccessorCandidate {
+            node: successor_node(4),
+            covering_cell: CellId::ROOT,
+            held_leases: 9,
+            holds_lease_in_cell: false,
+        };
+        let policy = NearestInterestSuccessorPolicy;
+        let request = |candidates: &[SuccessorCandidate]| {
+            policy.select(&SuccessorRequest {
+                grid: GridId::ROOT,
+                cell,
+                entity: PersistId::new(1),
+                previous_holder: successor_node(9),
+                reason: orrery_protocol::ExpireReason::Timeout,
+                candidates,
+            })
+        };
+
+        // Then: demonstrated interaction outranks everything, including a
+        // tighter interest and a far lighter load.
+        assert_eq!(
+            request(&[loose_idle, tight, interacting, loose_busy]),
+            Some(interacting.node)
+        );
+        // Then: without an interacting peer, the tightest covering interest
+        // wins even against an equally idle peer.
+        assert_eq!(request(&[loose_idle, tight, loose_busy]), Some(tight.node));
+        // Then: among equally tight peers, the least loaded inherits, so one
+        // peer does not absorb a crashed holder's whole working set.
+        assert_eq!(request(&[loose_busy, loose_idle]), Some(loose_idle.node));
+    }
+
+    #[test]
+    fn a_policy_never_selects_the_holder_it_is_replacing() {
+        // Given: the lost holder is somehow still in the candidate list.
+        let previous_holder = successor_node(1);
+        let candidates = [SuccessorCandidate {
+            node: previous_holder,
+            covering_cell: CellId::ROOT,
+            held_leases: 0,
+            holds_lease_in_cell: true,
+        }];
+
+        // Then: it is filtered out and the entity parks instead.
+        assert_eq!(
+            NearestInterestSuccessorPolicy.select(&SuccessorRequest {
+                grid: GridId::ROOT,
+                cell: CellId::ROOT,
+                entity: PersistId::new(1),
+                previous_holder,
+                reason: orrery_protocol::ExpireReason::Disconnect,
+                candidates: &candidates,
+            }),
+            None
+        );
+    }
+
+    #[test]
+    fn a_returned_row_is_only_evidence_of_our_own_park() {
+        // `park_lease` answers with the live row when the presented holder or
+        // token no longer matches, so the reply alone proves nothing.
+        let row = |holder: Option<NodeId>, lease_id: LeaseId| orrery_protocol::Lease {
+            entity: PersistId::new(3),
+            holder,
+            seq: orrery_protocol::SeqPair::default(),
+            lease_id,
+            expires_at: 0,
+            flags: orrery_protocol::LeaseFlags::PARKED,
+        };
+
+        // A park of ours advances the token and clears the holder.
+        assert!(parked_by_us(&row(None, LeaseId(5)), LeaseId(4)));
+        // Someone else holds it now: redistributing would take it from them.
+        assert!(!parked_by_us(
+            &row(Some(successor_node(1)), LeaseId(5)),
+            LeaseId(4)
+        ));
+        // The row is untouched, so nothing was parked.
+        assert!(!parked_by_us(&row(None, LeaseId(4)), LeaseId(4)));
+    }
+
+    #[test]
+    fn duplicate_authority_counts_only_a_second_live_writer() {
+        let writer = successor_node(1);
+        let other = successor_node(2);
+        let entity = PersistId::new(7);
+        let tick = orrery_protocol::Tick::new(3);
+        let row = |holder: Option<NodeId>, expires_at: u64| orrery_protocol::Lease {
+            entity,
+            holder,
+            seq: orrery_protocol::SeqPair::default(),
+            lease_id: LeaseId(9),
+            expires_at,
+            flags: orrery_protocol::LeaseFlags::default(),
+        };
+        let observe = |lease: Option<orrery_protocol::Lease>| {
+            let metrics = AuthorityMetrics::default();
+            observe_fencing_rejection(
+                &metrics,
+                entity,
+                tick,
+                writer,
+                LeaseId(8),
+                lease.as_ref(),
+                100,
+            );
+            metrics.snapshot().duplicate_authority
+        };
+
+        // Ordinary fencing, not two writers: no row at all, a parked row, an
+        // expired row, or the writer's own superseded token.
+        assert_eq!(observe(None), 0);
+        assert_eq!(observe(Some(row(None, 1_000))), 0);
+        assert_eq!(observe(Some(row(Some(other), 100))), 0);
+        assert_eq!(observe(Some(row(Some(writer), 1_000))), 0);
+
+        // A different holder with an unexpired lease is the real thing: two
+        // peers believed they were the writer at the same tick.
+        let metrics = AuthorityMetrics::default();
+        let live = row(Some(other), 1_000);
+        observe_fencing_rejection(&metrics, entity, tick, writer, LeaseId(8), Some(&live), 100);
+        assert_eq!(metrics.snapshot().duplicate_authority, 1);
+        assert_eq!(
+            metrics.last_duplicate_authority(),
+            Some(DuplicateAuthoritySample {
+                entity,
+                tick,
+                rejected_writer: writer,
+                rejected_lease_id: LeaseId(8),
+                current_holder: other,
+                current_lease_id: LeaseId(9),
+            })
+        );
+    }
+
+    /// A redistributor for unit tests: no coordinator interest, so no peer is
+    /// ever a candidate and every lost lease parks — the behaviour these tests
+    /// were written against.
+    fn parking_redistributor(peers: Arc<PeerRegistry>) -> Redistributor {
+        Redistributor {
+            peers,
+            interest: Arc::new(DenyAllInterestAuthority),
+            policy: Arc::new(ParkOnLossPolicy),
+            metrics: Arc::new(AuthorityMetrics::default()),
+        }
+    }
+
     fn interest_snapshot(
         peer: NodeId,
         epoch: u64,
@@ -2219,7 +3281,7 @@ mod tests {
     #[tokio::test]
     async fn peer_registry_shares_claim_bucket_across_replacement_sessions() {
         // Given: one authenticated NodeId has exhausted half its burst.
-        let registry = PeerRegistry::new(2, 10_000, MAX_PEER_LIVE_LEASES);
+        let registry = Arc::new(PeerRegistry::new(2, 10_000, MAX_PEER_LIVE_LEASES));
         let node = iroh::SecretKey::from_bytes(&[1; 32]).public();
         let authorization = GatewayAuthorization::Valid(SessionTokenClaimsV1::new(
             orrery_protocol::AccountId::new(1),
@@ -2263,7 +3325,13 @@ mod tests {
         }
         drop(replacement_state);
         let router: Arc<dyn Router> = Arc::new(SuccessfulRouter);
-        cleanup_peer_session(&replacement, &router, 1).await;
+        cleanup_peer_session(
+            &replacement,
+            &router,
+            &parking_redistributor(Arc::clone(&registry)),
+            1,
+        )
+        .await;
         let reconnect = registry
             .activate(
                 node,
@@ -2378,7 +3446,7 @@ mod tests {
     #[tokio::test]
     async fn cleanup_peer_session_releases_peer_state_while_park_is_pending() {
         // Given: a current session owns an indexed lease and parking blocks at the router seam.
-        let registry = PeerRegistry::new(2, 10_000, MAX_PEER_LIVE_LEASES);
+        let registry = Arc::new(PeerRegistry::new(2, 10_000, MAX_PEER_LIVE_LEASES));
         let node = iroh::SecretKey::from_bytes(&[3; 32]).public();
         let authorization = GatewayAuthorization::Valid(SessionTokenClaimsV1::new(
             orrery_protocol::AccountId::new(3),
@@ -2412,8 +3480,15 @@ mod tests {
         });
         let cleanup_router: Arc<dyn Router> = router.clone();
         let cleanup_session = first.clone();
+        let cleanup_registry = Arc::clone(&registry);
         let cleanup = tokio::spawn(async move {
-            cleanup_peer_session(&cleanup_session, &cleanup_router, 1).await;
+            cleanup_peer_session(
+                &cleanup_session,
+                &cleanup_router,
+                &parking_redistributor(cleanup_registry),
+                1,
+            )
+            .await;
         });
         assert_eq!(
             tokio::time::timeout(std::time::Duration::from_millis(250), entered_rx.recv())
@@ -2475,8 +3550,15 @@ mod tests {
 
         let resume_router: Arc<dyn Router> = router.clone();
         let resume_session = first.clone();
+        let resume_registry = Arc::clone(&registry);
         let resume = tokio::spawn(async move {
-            cleanup_peer_session(&resume_session, &resume_router, 2).await;
+            cleanup_peer_session(
+                &resume_session,
+                &resume_router,
+                &parking_redistributor(resume_registry),
+                2,
+            )
+            .await;
         });
         assert_eq!(
             tokio::time::timeout(std::time::Duration::from_millis(250), entered_rx.recv())
@@ -2497,8 +3579,15 @@ mod tests {
 
         let replacement_router: Arc<dyn Router> = router.clone();
         let replacement_session = replacement.clone();
+        let replacement_registry = Arc::clone(&registry);
         let replacement_cleanup = tokio::spawn(async move {
-            cleanup_peer_session(&replacement_session, &replacement_router, 3).await;
+            cleanup_peer_session(
+                &replacement_session,
+                &replacement_router,
+                &parking_redistributor(replacement_registry),
+                3,
+            )
+            .await;
         });
         assert_eq!(
             tokio::time::timeout(std::time::Duration::from_millis(250), entered_rx.recv())
@@ -2623,6 +3712,7 @@ mod tests {
                     lease_id: None,
                     authority_seq: None,
                 },
+                authority_metrics: Arc::new(AuthorityMetrics::default()),
                 author: iroh::SecretKey::from_bytes(&[1; 32]).public(),
                 received_at: Instant::now(),
                 strict_authority: false,
@@ -2726,6 +3816,7 @@ mod tests {
                     lease_id: None,
                     authority_seq: None,
                 },
+                authority_metrics: Arc::new(AuthorityMetrics::default()),
                 author: iroh::SecretKey::from_bytes(&[2; 32]).public(),
                 received_at: Instant::now(),
                 strict_authority: false,

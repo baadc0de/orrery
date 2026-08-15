@@ -49,9 +49,13 @@ graph LR
 - **Journal** — one segmented append-only log per node, shared by all actors on the node, adaptively group-committed (< 2 ms server-internal, §4).
 - **Lease registrar** — arbiter for authority leases (D7): CAS on `lease/{entity_id}` rows, TTL 10 s, heartbeat 2.5 s, batched. Logically a distinct component, physically it executes **inside each cell actor's single-writer event loop** (lease rows shard with their cells); the gateway routes lease traffic to the owning actor.
 
-**Implemented authority status (2026-08-15).** Lease rows are durably written
+**Implemented authority status (2026-08-16).** Lease rows are durably written
 on acquire, park, expiry, restore, and committed rekey; heartbeats update only
-hot actor state. Each row has a durable cell-location index, so actor recovery
+hot actor state. A TTL sweep returns the rows that lost a holder — with the
+holder and token they lost — so the gateway can select a successor without
+re-reading the registrar; the actor also tracks the highest journal position it
+has folded per entity, which is what makes a divesting holder's `Divest.cursor`
+checkable rather than merely carried. Each row has a durable cell-location index, so actor recovery
 loads only its own leases and gives restored rows a fresh conservative TTL.
 Committed rekeys are server-only: the journaled record moves the entity and its
 lease index together, preserves holder/sequence/fence, rejects stale presented

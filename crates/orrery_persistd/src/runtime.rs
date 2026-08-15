@@ -456,10 +456,32 @@ impl CellRuntime {
     }
 
     /// Ask every live actor to park registrar rows whose monotonic TTL passed.
-    pub async fn sweep_expired_leases(&self, now_ms: u64) {
+    pub async fn sweep_expired_leases(&self, now_ms: u64) -> Vec<crate::lease::ParkedLease> {
+        let mut parked = Vec::new();
         for actor in self.actors.values() {
-            let _ = actor.sweep_leases(now_ms).await;
+            if let Ok(rows) = actor.sweep_leases(now_ms).await {
+                parked.extend(rows);
+            }
         }
+        parked
+    }
+
+    /// Read one registrar row, its committed cell, and its uplink watermark.
+    ///
+    /// Routed through the durable location index, so a post-split or post-rekey
+    /// entity is inspected on the actor that actually owns its row.
+    pub async fn inspect_lease(
+        &self,
+        grid: GridId,
+        entity: PersistId,
+    ) -> Result<(Option<orrery_protocol::Lease>, Option<CellId>, Option<Lsn>), actor::Reject> {
+        let Some(cell) = self.lease_location(entity).await? else {
+            return Ok((None, None, None));
+        };
+        let Some(handle) = self.actor(grid, cell) else {
+            return Ok((None, Some(cell), None));
+        };
+        handle.inspect_lease(entity).await
     }
 
     /// Find an entity's durable registrar location.
@@ -532,6 +554,13 @@ impl CellRuntime {
             .filter(|(shard, _)| shard.is_prefix_of(cell))
             .max_by_key(|(shard, _)| shard.level())
             .map(|(_, handle)| handle)
+    }
+
+    /// Clone every live actor handle, so a caller can await their mailboxes
+    /// without holding a lock on the runtime itself.
+    #[must_use]
+    pub fn actor_handles(&self) -> Vec<CellActorHandle> {
+        self.actors.values().cloned().collect()
     }
 
     /// Fence shard `S` for this node: CAS `actor/{S}` from `expected` to
