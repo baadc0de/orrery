@@ -69,7 +69,7 @@ Indicative calendar (planning estimate, not normative): P0 Q3 2026 · P1 Q4 2026
 - Journal with adaptive group commit (fsync immediately when the disk is idle, ~0.5 ms batching under load; commit < 2 ms server-internal); optional chain replication to one async follower (default on, RPO ≤ ~100 ms for bulk on node loss).
 - FDB 7.3.x checkpointing on the 20 s jittered cadence, immediate on cell quiesce; keyspace exactly as D11 (`world/{cell_id}/{entity_id}`, `player/…`, `ledger/…`, `lease/…`, `chunk/…`).
 - Area load: 27-cell FDB range scans + live actor deltas, streamed nearest-first.
-- Offline world-seed import tool on the persistd harness (D11): bulk-writes designed content into `world/`/`chunk/` rows, mints `PersistId`s, and records a content-version row so later deploys can diff/patch designed content. Specified as a TOML scenario runner in [12-world-seeding.md](12-world-seeding.md); not yet implemented.
+- Offline world-seed import tool on the persistd harness (D11): bulk-writes designed content into `world/`/`chunk/` rows, mints `PersistId`s, and records a content-version row so later deploys can diff/patch designed content. Implemented as the TOML scenario runner specified in [12-world-seeding.md](12-world-seeding.md).
 - The intent *execution* path (signature check → `Ruleset` validation stub → FDB serializable optimistic transaction) without witness attestation, so commit latency is measurable now; attestation arrives in P5.
 - Latency rig: gateway-colocated load generator producing calibrated diff and intent mixes.
 
@@ -96,7 +96,7 @@ settled independently inside a single change.
 
 | # | Decision | Why |
 |---|---|---|
-| **C-1** | **The reliable-stream class is not realized in P2.** Area loads and intents ride the packet lane, not a QUIC stream. Pages are chunked under a conservative datagram budget with sequenced continuation markers and send errors are logged rather than swallowed; intents are made safe by at-least-once delivery plus the `intent/{intent_id}` idempotency row and a client-side in-flight retransmit timeout. | [08-persistence.md](08-persistence.md) §2/§2.1 assign these to a reliable-stream class, but no such lane exists in this build: the client talks through `aeronet_io` 0.21's `Session`, whose surface is packet-only, and the server side is raw iroh datagrams. A true stream lane is a change to the vendored `aeronet_iroh` IO layer, which is P3 work. At-least-once plus an idempotency row is a legitimate route to exactly-once *outcomes*, and the keyspace already anticipated it. |
+| **C-1** | **Area loads and intents remain packet-lane in the P2 surface.** Pages are chunked under a conservative datagram budget with sequenced continuation markers and send errors are logged rather than swallowed; intents are made safe by at-least-once delivery plus the `intent/{intent_id}` idempotency row and a client-side in-flight retransmit timeout. | P3 added a reliable iroh control lane for authenticated `Hello` and lease control. Area-load and intent transport still use the P2 packet-lane shape; moving those paths to a general client stream abstraction remains later work. At-least-once plus an idempotency row remains a legitimate route to exactly-once *outcomes*. |
 | **C-2** | **Journal replay drops only records superseded at write time.** Recovery scans in LSN order maintaining the running maximum epoch and discards a record iff its epoch is **below** that running maximum — not below the runtime's current epoch. | The naive predicate (`rec.epoch < current_epoch`) is inert only while the binary pins `Epoch::new(0)` and nothing fences. The moment startup fencing lands, it discards every legitimately acked record on every restart — the demo's exact failure mode, in a form that reads as success until someone counts entities. Zombie protection comes from the `actor/{shard}` fence CAS and the checkpoint's epoch read, not from filtering a node's own journal. |
 | **C-3** | **`world/` values over 100 KB are a hard error, not a split row.** | → [08-persistence.md](08-persistence.md) §6. The reader identifies a row by exact key length; a suffixed row would be invisible to `load` and `read_cold`. |
 | **C-4** | **The manifest's `value_digest` covers the component bag only**, excluding the storage value's live/tombstone tag byte. | → [12-world-seeding.md](12-world-seeding.md) §9.3. One decision with three consumers; if they disagree, gate A4 fails for a reason nobody can localize. |
@@ -111,16 +111,40 @@ settled independently inside a single change.
 
 **Goal.** The two-tier claim model with cluster-arbitered leases (D7): the tracks merge — the persistence cluster becomes the authority arbiter for live simulation.
 
-**Crates.** `orrery_authority` (weak/strong claims, `auth_seq`/`own_seq`, optimistic lease client, contact-island propagation, handoff, orphan recovery), `orrery_persistd` (lease registrar: CAS on `lease/{entity_id}` rows), `orrery_predict` (per-entity-authority prediction hardening; reconciliation-error monitor scaffolding for P4), `orrery_coordinator` (island merge/split/drain driven by movement).
+**Status (2026-08-15).** The strict persistence-authority slice is complete:
+signed transport-bound admission, coordinator-interest-gated weak claims,
+actor-owned durable lease rows, strict fenced uplinks, NodeId-scoped session and
+claim-rate controls, client revocation on lease-bearing NACKs, hot-only
+heartbeats, and server-owned recoverable committed rekeys. Owner loss currently
+parks leases. Successor selection, negotiated divestiture, contact-island
+propagation, coordinator movement orchestration, field-host promotion, and the
+8-peer handoff harness remain P3 follow-on work.
+
+**Crates.** `orrery_authority` implements optimistic weak/strong claims,
+`auth_seq`/`own_seq`, correlation-safe lease control, and loss-of-authority
+reconciliation; contact-island propagation, negotiated handoff, and successor
+selection remain follow-on. `orrery_persistd` implements the actor-owned lease
+registrar, strict gateway fencing, and committed rekey. `orrery_predict` and
+`orrery_coordinator` retain their P1/P4 scaffolding; coordinator-driven movement
+orchestration is not part of the delivered slice.
 
 **Deliverables.**
 - Lease rows `(entity_id → holder NodeId, auth_seq, own_seq, expiry)`; TTL 10 s, heartbeat 2.5 s; optimistic claim (simulate immediately, roll back on CAS loss).
-- Cooperative handoff (negotiated divestiture with holder ack) and crash handoff (lease expiry → orphan → reassign to nearest interacting peer, else park in cluster).
-- Cross-cell movement keeping the holder under hysteresis; storage row re-keyed on commit.
+- Cooperative handoff (negotiated divestiture with holder ack) and crash handoff (lease expiry → orphan → reassign to nearest interacting peer, else park in cluster). **Follow-on:** the current registrar parks all owner-loss leases.
+- Cross-cell movement keeping the holder under hysteresis; storage row re-keyed on commit. **Implemented:** server-owned committed rekey preserves the lease fence and atomically relocates the durable lease index; client movement control is rejected.
 - Ephemeral entities (projectiles, VFX) on in-island claims only, never touching the registrar.
 - Single-writer invariant checker: telemetry that flags any tick where two peers both believed they held authority.
 
-**Demo criterion.** An 8-peer island with contested physics objects: `kill -9` one peer holding ~50 entities → every entity is reassigned or parked within the 10 s lease TTL, with no duplicate-authority tick recorded and no lost entity; separately, a scripted cooperative handoff chain (player A grabs, throws to B's contact island) completes with zero registrar-visible conflicts and no visible pop. This is the anti-host-migration proof: authority moves per entity, so no session-wide stall — the failure mode that [drove For Honor off P2P](https://www.ubisoft.com/en-us/game/for-honor/news-updates/2HayRoZjbJzSEJAhJMpeF7/for-honor-now-on-dedicated-servers-on-all-platforms) cannot occur by construction.
+**Follow-on demo criterion.** An 8-peer island with contested physics objects:
+`kill -9` one peer holding ~50 entities → every entity is reassigned or parked
+within the 10 s lease TTL, with no duplicate-authority tick recorded and no
+lost entity; separately, a scripted cooperative handoff chain (player A grabs,
+throws to B's contact island) completes with zero registrar-visible conflicts
+and no visible pop. The delivered slice proves park-on-loss and fencing, not
+successor assignment or cooperative handoff. This remains the anti-host-
+migration proof: authority moves per entity, so no session-wide stall — the
+failure mode that [drove For Honor off P2P](https://www.ubisoft.com/en-us/game/for-honor/news-updates/2HayRoZjbJzSEJAhJMpeF7/for-honor-now-on-dedicated-servers-on-all-platforms)
+cannot occur by construction.
 
 **Upstream milestone.** Authority-model hardening PRs to lightyear (its authority handling is self-described as ["somewhat in flux"](https://github.com/cBournhonesque/lightyear/releases), and the `distributed_authority` example is outdated) — contribution, not fork, per D4.
 

@@ -6,7 +6,10 @@ Normative source: [ADR-0011](adr/0011-persistence.md) (with [D5](adr/0005-spatia
 
 ## 1. Architecture
 
-The current `orrery_persistd` reference binary runs one process per node. Games link their `Ruleset` (D9) into their own `persistd` binary — the harness is a library, and the distributed multi-node transport remains a later step.
+The current `orrery_persistd` reference binary runs one process per node, with a
+static primary/follower journal-chain topology available for two-process
+recovery. Games link their `Ruleset` (D9) into their own `persistd` binary —
+the harness is a library; dynamic multi-node placement remains a later step.
 
 ```mermaid
 graph LR
@@ -45,6 +48,15 @@ graph LR
 - **Cell actors** — one single-writer actor per *shard cell* (8×8×8 interest cells, D5/D16) holding that region's hot state in memory.
 - **Journal** — one segmented append-only log per node, shared by all actors on the node, adaptively group-committed (< 2 ms server-internal, §4).
 - **Lease registrar** — arbiter for authority leases (D7): CAS on `lease/{entity_id}` rows, TTL 10 s, heartbeat 2.5 s, batched. Logically a distinct component, physically it executes **inside each cell actor's single-writer event loop** (lease rows shard with their cells); the gateway routes lease traffic to the owning actor.
+
+**Implemented authority status (2026-08-15).** Lease rows are durably written
+on acquire, park, expiry, restore, and committed rekey; heartbeats update only
+hot actor state. Each row has a durable cell-location index, so actor recovery
+loads only its own leases and gives restored rows a fresh conservative TTL.
+Committed rekeys are server-only: the journaled record moves the entity and its
+lease index together, preserves holder/sequence/fence, rejects stale presented
+cells, and leaves no partial migration after an error. Client lease-rekey
+control messages and rekey bulk records are rejected at the gateway.
 - **Intent validator** — runs `Ruleset` admission checks against hot state, then executes the FDB transaction.
 - **Adjudication executor** — re-executes discrepancy-report evidence bundles (D10) in the headless `orrery_core` replay harness; retains the last **3** ruleset builds as version-keyed sidecar workers and routes each bundle by its `RulesetId` (bundles older than retention are *unadjudicable* — no strike, D10); verdicts produce write refusals/annulments and `strike/` rows.
 - **Archive tailer** — compacts sealed journal segments into Parquet objects (event history, R7).

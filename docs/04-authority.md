@@ -4,6 +4,17 @@ Every replicated entity in Orrery has exactly one writer at any instant. This do
 
 Normative source: [ADR-0007](adr/0007-authority-and-leases.md) (boundaries with [D5](adr/0005-spatial-model.md), [D6](adr/0006-population-adaptive-topology.md), [D8](adr/0008-prediction-rollback-interpolation.md), [D11](adr/0011-persistence.md), and [D12](adr/0012-backend-services.md)).
 
+> **Implementation status (2026-08-15).** The strict persistence-authority path is
+> implemented: a signed, transport-NodeId-bound session is required before lease
+> or fenced-diff traffic; weak claims require an exact live coordinator-interest
+> snapshot for the entity's committed cell; lease transitions are serialized by
+> cell actors and durably indexed; heartbeats are hot-state only; and stale,
+> missing, expired, or wrong-holder fences are rejected before journaling. A
+> server-owned committed rekey migrates the entity and lease index atomically.
+> Current owner loss always **parks** the lease. Successor selection, negotiated
+> divestiture, contact-island propagation, and field-host promotion remain
+> deferred; the design flows below describe those future capabilities as well.
+
 ## 1. The two-tier model
 
 Orrery follows [Gaffer's Networked Physics in VR](https://gafferongames.com/post/networked_physics_in_virtual_reality/) authority scheme, generalized by the ownership-management services of [HLA (IEEE 1516)](https://en.wikipedia.org/wiki/High_Level_Architecture):
@@ -53,7 +64,7 @@ The registrar is a facet of `orrery_persistd`, not a separate service. A lease r
 
 - **Acquire** = CAS on `(holder, seq, lease_id)`: the actor checks eligibility (INV-5, plausibility gate §10, expiry), bumps the relevant sequence, increments `lease_id`, sets `expires_at = now + TTL`, and emits `Grant`. Losing concurrent claimants get `Deny`. TTL is **10 s**, heartbeat every **2.5 s** (four missed heartbeats = expiry).
 - **Durability**: acquire/transfer/park/expire write through to FDB; heartbeats renew only the in-memory row. On actor failover, leases are rebuilt from FDB with a *full fresh TTL* — conservative in the safe direction (an extra ≤10 s of orphan latency, never two writers).
-- **Fencing**: the gateway tags each uplink session with the `lease_id`s the peer holds; a diff carrying a stale `lease_id` is dropped and answered with the current `Expire`. This closes the classic zombie-holder race without trusting peer clocks.
+- **Fencing**: the gateway tracks the `lease_id`s a peer holds; a diff carrying a stale `lease_id` is dropped and answered with a lease-specific `BulkNack` containing the current row. This closes the classic zombie-holder race without trusting peer clocks.
 - **Clock discipline**: only the registrar's monotonic clock decides expiry. Holders track a conservative local estimate (`expires_at − one heartbeat interval`) and mark their lease *uncertain* past it (§11.1).
 
 Ordinary claim round-trips ride the reliable control stream of the peer's existing iroh connection to the gateway (§D3 channel policy) and land on an in-memory actor; target p99 grant latency in-region is **< 5 ms** (design target, same path class as the < 2 ms bulk ack) — comfortably inside the 9-tick/150 ms rollback window, which is what makes optimistic claiming safe (§4).
@@ -73,12 +84,19 @@ Six messages, defined in `orrery_protocol`, postcard-encoded on the reliable con
 
 | Message | Direction | Fields (sketch) |
 |---|---|---|
-| `Claim` | peer → registrar | `entity`, `kind: Weak\|Strong`, `basis: Contact{tick} \| Explicit \| Orphan \| Promotion{warrant} \| Reconcile{log_ref}`, `observed: SeqPair`, `tick` |
-| `Grant` | registrar → peer | `entity`, `lease_id`, `seq: SeqPair` (authoritative), `ttl_ms: 10_000`, `prev_holder` |
-| `Deny` | registrar → peer | `entity`, `reason: Held{holder, seq} \| StrongHeld \| NotEligible \| RateLimited \| Parked`, `retry_after_ms` |
+| `Claim` | peer → registrar | `claim_id`, `entity`, `kind: Weak\|Strong`, `basis: Contact{tick} \| Explicit \| Orphan \| Promotion{warrant} \| Reconcile{log_ref}`, `observed: SeqPair`, `tick` |
+| `Grant` | registrar → peer | `claim_id`, `entity`, `lease_id`, `seq: SeqPair` (authoritative), `ttl_ms: 10_000`, `prev_holder` |
+| `Deny` | registrar → peer | `claim_id`, `entity`, `reason: Held{holder, seq} \| StrongHeld \| NotEligible \| RateLimited \| Parked`, `retry_after_ms` |
 | `Divest` | both | registrar → holder: request `{entity, lease_id, to: Option<NodeId>, deadline_ms}`; holder → registrar: consent/offer `{entity, lease_id, to: Option<NodeId>, final_seq, cursor: JournalCursor}`. `to: None` = release/park. |
 | `Heartbeat` | both | peer → registrar: `{lease_ids: Vec<u64>, tick}` (one batch per peer per 2.5 s covering all held leases); registrar → peer echo: `{renewed_until}` |
 | `Expire` | registrar → holder + cell subscribers | `{entity, lease_id, last_holder, reason: Timeout\|Disconnect\|Revoked\|Parked, disposition: Reassigned{to}\|Parked\|Free}` |
+
+`claim_id` makes delayed control replies safe: a client ignores a `Grant` or
+`Deny` that does not correspond to its pending claim, ignores grants that do
+not advance its installed fence, and accepts `Expire` only for its installed
+`lease_id`. The current implementation emits `Parked` for owner loss; the
+`Reassigned` disposition remains part of the accepted design, pending successor
+selection.
 
 `Divest.cursor` names the holder's last acked journal position so the registrar can require the state to be uplink-complete before regranting — the successor starts from exactly the state the predecessor last committed.
 
