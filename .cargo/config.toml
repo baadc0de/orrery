@@ -1,0 +1,29 @@
+# Build settings shared by every checkout and worktree of this repository.
+#
+# This file is committed on purpose: worktrees each get their own copy of the
+# repo's tracked files, so a committed cargo config is the only way a setting
+# reaches all of them without per-agent setup.
+
+[build]
+# Route rustc through sccache so the dependency graph is compiled once per
+# machine rather than once per worktree. See AGENTS.md § Build cache.
+#
+# This makes `sccache` a build prerequisite. If it is missing, either install
+# it (`pacman -S sccache`, or `cargo install sccache --locked`) or opt out for
+# one command with an empty wrapper, which takes precedence over this file:
+#
+#     RUSTC_WRAPPER= cargo build
+rustc-wrapper = "sccache"
+
+# Incremental compilation is off deliberately, and the two reasons compound.
+#
+# sccache cannot cache an incremental unit — it marks them non-cacheable — so
+# leaving this on would silently defeat the cache for exactly the workspace
+# crates being worked on, while still writing the artifacts to disk. And those
+# artifacts are not small: one worktree had accumulated 17 GiB of
+# `target/debug/incremental` alone.
+#
+# The trade is real: a human tight-looping edits on a single crate loses
+# incremental's advantage. Turn it back on for that session with
+# `CARGO_INCREMENTAL=1`, which overrides this.
+incremental = false
