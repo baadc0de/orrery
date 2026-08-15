@@ -2218,13 +2218,19 @@ async fn expiry_sweep_parks_the_durable_row_and_rotates_its_token() {
     let swept = actor.sweep_leases(grant.expires_at).await.unwrap();
     assert_eq!(swept.len(), 1);
     let parked = &swept[0];
-    assert_eq!(parked.entity, entity);
-    assert_eq!(parked.holder, None);
-    assert!(parked.flags.contains(LeaseFlags::PARKED));
-    assert!(parked.lease_id > grant.lease_id);
+    assert_eq!(parked.lease.entity, entity);
+    assert_eq!(parked.lease.holder, None);
+    assert!(parked.lease.flags.contains(LeaseFlags::PARKED));
+    assert!(parked.lease.lease_id > grant.lease_id);
+    // The sweep also reports who lost the lease and under which token, so a
+    // successor policy can act without re-reading the registrar.
+    assert_eq!(parked.previous_holder, holder);
+    assert_eq!(parked.previous_lease_id, grant.lease_id);
+    assert_eq!(parked.cell, CellId::ROOT);
+    assert_eq!(parked.reason, orrery_protocol::ExpireReason::Timeout);
     assert_eq!(
         store.load_cell(GridId::ROOT, CellId::ROOT).await.unwrap(),
-        vec![(CellId::ROOT, parked.clone())]
+        vec![(CellId::ROOT, parked.lease.clone())]
     );
 
     rt.close().await.unwrap();

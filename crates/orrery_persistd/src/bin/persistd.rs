@@ -46,10 +46,10 @@ use orrery_persistd::journal::{
     spawn_chain, spawn_chain_grpc, AdaptiveCommitMode, ChainConfig, GroupCommitConfig, Journal,
 };
 use orrery_persistd::{
-    ActivationOutcome, CellRuntime, CheckpointScheduler, DurableChainId, FenceFreshnessConfig,
-    FenceStore, GatewayBulkMetrics, GatewayConfig, GatewayServer, GrpcChainTransport,
-    IntentExecutor, IntentValidator, IntentVerdict, JournalConfig, MemCheckpointStore,
-    RuntimeConfig, ShardActivation,
+    ActivationOutcome, AuthorityMetrics, CellRuntime, CheckpointScheduler, DurableChainId,
+    FenceFreshnessConfig, FenceStore, GatewayBulkMetrics, GatewayConfig, GatewayServer,
+    GrpcChainTransport, IntentExecutor, IntentValidator, IntentVerdict, JournalConfig,
+    MemCheckpointStore, RuntimeConfig, ShardActivation,
 };
 #[cfg(feature = "fdb")]
 use orrery_persistd::{FdbContext, FdbIntentExecutor};
@@ -176,6 +176,7 @@ fn spawn_metrics_reporter(
     path: PathBuf,
     journal: Arc<Journal>,
     bulk_metrics: Option<Arc<GatewayBulkMetrics>>,
+    authority_metrics: Arc<AuthorityMetrics>,
 ) -> anyhow::Result<MetricsReporter> {
     let file = OpenOptions::new().create(true).append(true).open(&path)?;
     let (shutdown, mut stopped) = oneshot::channel();
@@ -187,6 +188,7 @@ fn spawn_metrics_reporter(
         let mut bulk_latency_cursor = bulk_metrics
             .as_ref()
             .map(|metrics| metrics.latency_snapshot());
+        let mut authority_cursor = orrery_persistd::AuthoritySnapshot::default();
         let mut interval = tokio::time::interval(METRICS_REPORT_INTERVAL);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut writer = BufWriter::new(file);
@@ -199,6 +201,7 @@ fn spawn_metrics_reporter(
                         .and_then(|()| write_journal_stage_delta(&mut writer, metrics.stage_delta(&mut stage_cursor)))
                         .and_then(|()| write_gateway_bulk_delta(&mut writer, bulk_metrics.as_deref(), bulk_cursor.as_mut()))
                         .and_then(|()| write_gateway_bulk_latency(&mut writer, bulk_metrics.as_deref(), bulk_latency_cursor.as_mut()))
+                        .and_then(|()| write_gateway_authority(&mut writer, &authority_metrics, &mut authority_cursor))
                         .and_then(|()| writer.flush())
                     {
                         tracing::warn!(path = %path.display(), %error, "failed to flush final journal metrics");
@@ -229,6 +232,13 @@ fn spawn_metrics_reporter(
                             bulk_cursor.as_mut(),
                         )
                     })
+                    .and_then(|()| {
+                        write_gateway_authority(
+                            &mut writer,
+                            &authority_metrics,
+                            &mut authority_cursor,
+                        )
+                    })
                     .and_then(|()| writer.flush())
             {
                 tracing::warn!(path = %path.display(), %error, "failed to write journal metrics; stopping reporter");
@@ -237,6 +247,36 @@ fn spawn_metrics_reporter(
         }
     });
     Ok(MetricsReporter { shutdown, task })
+}
+
+/// Append the authority counters whenever any of them moved.
+///
+/// These are absolute totals, not interval deltas: `duplicate_authority` is an
+/// invariant that must read zero for the life of the process, and a gauge that
+/// resets every interval would hide a violation that happened one tick ago.
+fn write_gateway_authority(
+    mut writer: impl Write,
+    metrics: &AuthorityMetrics,
+    cursor: &mut orrery_persistd::AuthoritySnapshot,
+) -> std::io::Result<()> {
+    let snapshot = metrics.snapshot();
+    if snapshot == *cursor {
+        return Ok(());
+    }
+    *cursor = snapshot;
+    serde_json::to_writer(
+        &mut writer,
+        &serde_json::json!({
+            "type": "gateway_authority",
+            "duplicate_authority": snapshot.duplicate_authority,
+            "reassigned": snapshot.reassigned,
+            "parked_without_successor": snapshot.parked_without_successor,
+            "divested": snapshot.divested,
+            "divest_rejected": snapshot.divest_rejected,
+        }),
+    )
+    .map_err(std::io::Error::other)?;
+    writer.write_all(b"\n")
 }
 
 /// Export the server receipt-through-send-call histogram in dashboard form.
@@ -583,9 +623,18 @@ async fn main() -> anyhow::Result<()> {
         .metrics_jsonl
         .as_ref()
         .map(|_| Arc::new(GatewayBulkMetrics::default()));
+    // Authority telemetry is always collected, unlike the optional bulk
+    // histograms: the single-writer invariant must be observable on any node
+    // that serves leases, whether or not a metrics file was requested.
+    let authority_metrics = Arc::new(AuthorityMetrics::default());
     let metrics_reporter = if let Some(path) = cli.metrics_jsonl.clone() {
         let journal = Arc::clone(runtime.journal());
-        Some(spawn_metrics_reporter(path, journal, bulk_metrics.clone())?)
+        Some(spawn_metrics_reporter(
+            path,
+            journal,
+            bulk_metrics.clone(),
+            Arc::clone(&authority_metrics),
+        )?)
     } else {
         None
     };
@@ -672,6 +721,7 @@ async fn main() -> anyhow::Result<()> {
         gateway_config.bulk_ack_admission = monitor.clone();
     }
     gateway_config.bulk_metrics = bulk_metrics;
+    gateway_config.authority_metrics = Arc::clone(&authority_metrics);
     tracing::info!(
         elapsed_ms = startup_started.elapsed().as_millis(),
         "persistd startup: starting gateway"
@@ -802,7 +852,14 @@ async fn run_follower(cli: &Cli, topology: &Topology) -> anyhow::Result<()> {
     let metrics_reporter = cli
         .metrics_jsonl
         .clone()
-        .map(|path| spawn_metrics_reporter(path, Arc::clone(&journal), None))
+        .map(|path| {
+            spawn_metrics_reporter(
+                path,
+                Arc::clone(&journal),
+                None,
+                Arc::new(AuthorityMetrics::default()),
+            )
+        })
         .transpose()?;
 
     // stdout is a one-line machine-readable readiness contract. Unlike a

@@ -249,15 +249,21 @@ async fn fdb_lease_actor_restore_and_expiry_are_durable() {
         .unwrap()
         .pop()
         .expect("expired row is parked");
-    assert_eq!(parked.holder, None);
-    assert!(parked.flags.contains(LeaseFlags::PARKED));
-    assert!(parked.lease_id > restored.lease_id);
+    assert_eq!(parked.lease.holder, None);
+    assert!(parked.lease.flags.contains(LeaseFlags::PARKED));
+    assert!(parked.lease.lease_id > restored.lease_id);
+    // The sweep also reports the identity the row lost, so a successor policy
+    // can act on a restored-then-expired lease without re-reading the tier.
+    assert_eq!(parked.previous_holder, holder);
+    assert_eq!(parked.previous_lease_id, restored.lease_id);
+    assert_eq!(parked.grid, grid);
+    assert_eq!(parked.cell, CellId::ROOT);
     assert!(store
         .load_cell(grid, CellId::ROOT)
         .await
         .unwrap()
         .iter()
-        .any(|(cell, row)| *cell == CellId::ROOT && row == &parked));
+        .any(|(cell, row)| *cell == CellId::ROOT && row == &parked.lease));
 
     restored_rt.close().await.unwrap();
     store.remove(grid, CellId::ROOT, entity).await.unwrap();

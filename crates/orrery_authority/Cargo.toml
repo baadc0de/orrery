@@ -10,3 +10,7 @@ orrery_protocol = { path = "../orrery_protocol" }
 bevy_app = { workspace = true }
 bevy_ecs = { workspace = true }
 bevy_platform = { workspace = true }
+
+[dev-dependencies]
+# Test-only: minting valid ed25519 NodeIds for successor/handoff assertions.
+iroh-base = { workspace = true }
