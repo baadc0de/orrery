@@ -545,6 +545,8 @@ async fn subscribe_does_not_block_diffs() {
             kind: RecordKind::Spawn,
             payload: Bytes::from_static(b"hp=100"),
             seq: 1,
+            lease_id: None,
+            authority_seq: None,
         },
     })))
     .unwrap();

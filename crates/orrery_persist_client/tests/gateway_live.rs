@@ -116,6 +116,8 @@ fn client_connects_hellos_and_uplinks_to_real_gateway() {
             kind: RecordKind::Spawn,
             payload: bytes::Bytes::from_static(b"hp=100"),
             seq: 1,
+            lease_id: None,
+            authority_seq: None,
         });
     }
     let cfg = app.world().resource::<PersistClientConfig>().clone();

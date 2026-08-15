@@ -23,7 +23,9 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::{CellId, GridId, Intent, IntentOutcome, Lsn, NodeId, PersistId, Tick};
+use crate::{
+    CellId, GridId, Intent, IntentOutcome, LeaseId, LeaseMsg, Lsn, NodeId, PersistId, SeqPair, Tick,
+};
 
 /// A client → gateway message (docs/10-crates.md §9).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -35,6 +37,9 @@ pub enum GatewayMsg {
         /// The client's NodeId (transport identity, D3).
         node: NodeId,
     },
+    /// Authority-lease control traffic. This always uses the reliable control
+    /// lane, unlike bulk diffs.
+    Lease { message: LeaseMsg },
     /// Bulk uplink: one change-detection diff for an entity (D11 §2.1).
     Diff {
         /// The diff to journal.
@@ -66,6 +71,8 @@ pub enum GatewayReply {
         /// The negotiated protocol version.
         protocol: u16,
     },
+    /// Authority-lease control reply.
+    Lease { message: LeaseMsg },
     /// A bulk diff was durably journaled at `lsn` (D11 §2.1).
     ///
     /// `provisional` marks an epoch-fenced downgrade: the actor could not
@@ -143,6 +150,13 @@ pub struct DiffUplink {
     pub payload: bytes::Bytes,
     /// A client-side monotonic sequence per entity, for ordering/idempotency.
     pub seq: u64,
+    /// Registrar fencing token. `None` remains valid only for legacy/P2
+    /// sessions; a P3 registrar requires a current token for persistent rows.
+    #[serde(default)]
+    pub lease_id: Option<LeaseId>,
+    /// Sequence pair observed by the holder when generating this diff.
+    #[serde(default)]
+    pub authority_seq: Option<SeqPair>,
 }
 
 /// [`GatewayReply::AreaLoadError`] kind: the live read failed (the owning
@@ -227,6 +241,8 @@ mod tests {
                 kind: RecordKind::ComponentDiff,
                 payload: bytes::Bytes::from_static(b"\x01\x02\x03"),
                 seq: 42,
+                lease_id: None,
+                authority_seq: None,
             },
         };
         let bytes = postcard::to_stdvec(&msg).unwrap();

@@ -18,6 +18,7 @@ use bevy_platform::time::Instant;
 use bytes::Bytes;
 
 use aeronet_iroh::iroh;
+use orrery_authority::LeaseOutbox;
 use orrery_net::channels::{tag, Channel};
 use orrery_protocol::{GatewayMsg, GatewayReply, NodeId, PROTOCOL_VERSION};
 
@@ -261,6 +262,34 @@ pub fn hello_gateway(
     session.hello_sent = true;
 }
 
+/// Flush P3 authority control messages on the reliable gateway lane.
+///
+/// The resource is optional, preserving P2-only plugin composition.
+pub fn flush_lease_control(
+    outbox: Option<ResMut<LeaseOutbox>>,
+    session: Res<GatewaySession>,
+    mut sessions: Query<&mut aeronet_io::Session>,
+) {
+    let Some(mut outbox) = outbox else {
+        return;
+    };
+    if !session.is_connected() {
+        return;
+    }
+    let Some(entity) = session.session else {
+        return;
+    };
+    let Ok(mut io) = sessions.get_mut(entity) else {
+        return;
+    };
+    for message in std::mem::take(&mut outbox.0) {
+        io.send
+            .push(GatewaySession::encode_stream(&GatewayMsg::Lease {
+                message,
+            }));
+    }
+}
+
 /// Return to `Disconnected` when the session entity is despawned by the IO
 /// layer (connect failed, or the connection dropped), so the next frame
 /// re-dials. Unacked buffered diffs stay in the scheduler and are resent on the
@@ -308,6 +337,8 @@ mod tests {
                 kind: RecordKind::ComponentDiff,
                 payload: Bytes::from_static(b"hp=50"),
                 seq: 0,
+                lease_id: None,
+                authority_seq: None,
             },
         }
     }

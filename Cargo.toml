@@ -9,6 +9,7 @@ members = [
     "crates/orrery_spatial",
     "crates/orrery_coordinator",
     "crates/orrery_predict",
+    "crates/orrery_authority",
     "crates/orrery_persist_client",
     "crates/orrery_persistd",
     "crates/orrery_seed",

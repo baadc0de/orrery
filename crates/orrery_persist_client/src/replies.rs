@@ -10,6 +10,7 @@
 use bevy_ecs::prelude::*;
 use bevy_platform::time::Instant;
 
+use orrery_authority::LeaseInbox;
 use orrery_protocol::GatewayReply;
 
 use crate::area::AreaLoader;
@@ -32,6 +33,7 @@ pub fn process_replies(
     mut scheduler: ResMut<UplinkScheduler>,
     mut loader: ResMut<AreaLoader>,
     mut queue: ResMut<IntentQueue>,
+    mut lease_inbox: Option<ResMut<LeaseInbox>>,
     mut sessions: Query<&mut aeronet_io::Session>,
 ) {
     let Some(entity) = session.session else {
@@ -106,6 +108,11 @@ pub fn process_replies(
                 session.connected_at = Some(Instant::now());
                 session.hello_sent = false;
                 session.state = GatewayState::Connected;
+            }
+            GatewayReply::Lease { message } => {
+                if let Some(inbox) = &mut lease_inbox {
+                    inbox.0.push(message);
+                }
             }
         }
     }
@@ -250,6 +257,8 @@ mod tests {
             kind: RecordKind::ComponentDiff,
             payload: bytes::Bytes::from_static(b"hp=50"),
             seq: 1,
+            lease_id: None,
+            authority_seq: None,
         });
         // Simulate the ack arriving in the recv buffer.
         let reply = GatewayReply::BulkAck {

@@ -13,7 +13,9 @@ use bevy_ecs::prelude::*;
 use crate::area::{drive_area_loader, sync_aoi_to_loader, AreaLoader};
 use crate::config::PersistClientConfig;
 use crate::feed::{feed_uplink, UplinkSeq};
-use crate::gateway::{connect_gateway, disconnect_gateway, hello_gateway, GatewaySession};
+use crate::gateway::{
+    connect_gateway, disconnect_gateway, flush_lease_control, hello_gateway, GatewaySession,
+};
 use crate::intents::{drain_intents, IntentQueue};
 use crate::replies::process_replies;
 use crate::uplink::{flush_uplink, UplinkScheduler};
@@ -62,7 +64,15 @@ impl Plugin for OrreryPersistClientPlugin {
                     .chain()
                     .in_set(PersistClientSet::Flush),
             )
-            .add_systems(Update, (connect_gateway, hello_gateway, disconnect_gateway))
+            .add_systems(
+                Update,
+                (
+                    connect_gateway,
+                    hello_gateway,
+                    flush_lease_control,
+                    disconnect_gateway,
+                ),
+            )
             .add_systems(Update, process_replies)
             // Feed replicon change-detection diffs into the scheduler before the
             // flush, so the same update flushes what just changed.

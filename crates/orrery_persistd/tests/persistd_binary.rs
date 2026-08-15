@@ -418,6 +418,8 @@ async fn primary_ack_is_mirrored_to_the_passive_follower_journal() {
             kind: RecordKind::Spawn,
             payload: Bytes::from_static(b"process-chain"),
             seq: 1,
+            lease_id: None,
+            authority_seq: None,
         },
     })))
     .expect("send diff");

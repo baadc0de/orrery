@@ -1,0 +1,12 @@
+[package]
+name = "orrery_authority"
+version = "0.1.0"
+edition = "2021"
+description = "Orrery optimistic client authority and lease state (P3)"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+orrery_protocol = { path = "../orrery_protocol" }
+bevy_app = { workspace = true }
+bevy_ecs = { workspace = true }
+bevy_platform = { workspace = true }

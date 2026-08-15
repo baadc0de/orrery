@@ -626,6 +626,22 @@ async fn handle_connection(
                 let reply = GatewayReply::HelloAck { gateway, protocol };
                 send(Bytes::from(encode_stream_frame(&reply)));
             }
+            // The P3 wire lane is present before the distributed registrar is
+            // wired into this P2 gateway process. Never silently accept a
+            // lease request: an explicit denial keeps optimistic clients from
+            // treating an unsupported endpoint as an authority grant.
+            GatewayMsg::Lease { message } => {
+                if let orrery_protocol::LeaseMsg::Claim { entity, .. } = message {
+                    let reply = GatewayReply::Lease {
+                        message: orrery_protocol::LeaseMsg::Deny {
+                            entity,
+                            reason: orrery_protocol::DenyReason::NotEligible,
+                            retry_after_ms: 0,
+                        },
+                    };
+                    send(Bytes::from(encode_stream_frame(&reply)));
+                }
+            }
             GatewayMsg::Diff { diff } => {
                 let received_at = Instant::now();
                 let send = Arc::clone(&send);
@@ -1160,6 +1176,8 @@ mod tests {
                 kind: orrery_protocol::RecordKind::ComponentDiff,
                 payload: Bytes::from_static(b"state"),
                 seq: 3,
+                lease_id: None,
+                authority_seq: None,
             },
             iroh::SecretKey::from_bytes(&[1; 32]).public(),
             &router,
@@ -1258,6 +1276,8 @@ mod tests {
                 kind: orrery_protocol::RecordKind::ComponentDiff,
                 payload: Bytes::from_static(b"state"),
                 seq: 4,
+                lease_id: None,
+                authority_seq: None,
             },
             iroh::SecretKey::from_bytes(&[2; 32]).public(),
             &router,

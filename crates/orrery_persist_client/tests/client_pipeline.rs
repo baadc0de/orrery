@@ -162,6 +162,8 @@ fn client_feeds_cell_actors_end_to_end() {
             kind: RecordKind::ComponentDiff,
             payload: bytes::Bytes::from_static(b"hp=50"),
             seq: 1,
+            lease_id: None,
+            authority_seq: None,
         });
     }
 

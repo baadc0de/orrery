@@ -22,6 +22,7 @@ disk-queue = ["dep:fjall"]
 
 [dependencies]
 orrery_protocol = { path = "../orrery_protocol" }
+orrery_authority = { path = "../orrery_authority" }
 orrery_net = { path = "../orrery_net" }
 orrery_spatial = { path = "../orrery_spatial" }
 aeronet_io = { workspace = true }

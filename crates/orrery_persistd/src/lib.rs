@@ -35,6 +35,7 @@ pub mod gateway;
 pub mod intent;
 pub mod journal;
 pub mod keyspace;
+pub mod lease;
 pub mod placement;
 pub mod runtime;
 
@@ -74,5 +75,6 @@ pub use journal::{
     JournalConfig, JournalError, JournalScan, JournalStageSnapshot, MemChainTransport,
     StoredRecord,
 };
+pub use lease::{ClaimResult, LeaseRegistrar, LEASE_TTL_MS};
 pub use placement::{RendezvousHasher, RendezvousNode, RendezvousWeight};
 pub use runtime::{payload_crc, CellRuntime, RuntimeConfig};

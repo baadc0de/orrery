@@ -13,6 +13,7 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod authority;
 pub mod cell;
 pub mod channels;
 pub mod coord;
@@ -22,6 +23,10 @@ mod identity;
 mod persist;
 mod protocol;
 
+pub use authority::{
+    ClaimBasis, ClaimKind, DenyReason, ExpireDisposition, ExpireReason, Lease, LeaseFlags, LeaseId,
+    LeaseMsg, SeqPair,
+};
 pub use cell::{
     cell_id_from_metres, metres_from_cell_id, shard_of, CellId, CellRangeError,
     DEFAULT_CELL_EDGE_M, INTEREST_LEVEL, SHARD_LEVEL,

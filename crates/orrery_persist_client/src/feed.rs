@@ -18,6 +18,8 @@ use bevy_replicon::server::uplink::ComponentDiff;
 use orrery_protocol::{DiffUplink, GridId, RecordKind, Tick};
 use orrery_spatial::plugin::Cell;
 
+pub use orrery_authority::LocallyAuthoritative;
+
 use crate::config::PersistClientConfig;
 use crate::uplink::UplinkScheduler;
 
@@ -36,13 +38,6 @@ impl PersistId {
         Self(orrery_protocol::PersistId::new(id))
     }
 }
-
-/// Marker: this locally-owned entity's changes are uplinked to the gateway.
-///
-/// Only the entity's owner adds this, so only the authoritative peer's writes
-/// reach the persistence cluster (single-writer per entity, D11).
-#[derive(Debug, Clone, Copy, Component)]
-pub struct LocallyAuthoritative;
 
 /// Per-entity diff sequence, for idempotent `(entity, tick)`-keyed records.
 #[derive(Debug, Default, Resource)]
@@ -91,6 +86,8 @@ pub fn feed_uplink(
             kind: RecordKind::ComponentDiff,
             payload: diff.payload.clone(),
             seq: tick,
+            lease_id: None,
+            authority_seq: None,
         });
     }
 }

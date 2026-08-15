@@ -388,6 +388,8 @@ mod tests {
             kind: orrery_protocol::RecordKind::ComponentDiff,
             payload: bytes::Bytes::copy_from_slice(payload),
             seq: tick,
+            lease_id: None,
+            authority_seq: None,
         }
     }
 

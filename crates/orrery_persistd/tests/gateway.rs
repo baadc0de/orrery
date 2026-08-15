@@ -128,6 +128,8 @@ fn gateway_closes_the_client_to_actor_path() {
                 kind: RecordKind::Spawn,
                 payload: bytes::Bytes::from_static(b"hp=100"),
                 seq: 1,
+                lease_id: None,
+                authority_seq: None,
             },
         })))
         .unwrap();
