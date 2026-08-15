@@ -47,11 +47,12 @@ use orrery_protocol::channels::{
     decode_datagram, decode_stream_frame, encode_datagram, encode_stream_frame, untag, Channel,
 };
 use orrery_protocol::{
-    AreaPage, CellId, CoordinatorInterestSnapshot, DiffUplink, Epoch, GatewayMsg, GatewayReply,
-    GridId, Intent, IntentOutcome, IssuerKey, JournalRecord, LeaseId, LeaseMsg, Lsn, NodeId,
-    PersistId, SessionTokenClaimsV1, SessionTokenV1, SessionTokenVerificationError,
-    SessionTokenVerifier, UnixMillis, MAX_AREA_PAGE_FRAME_BYTES, MAX_SESSION_TOKEN_TTL_MS,
-    PROTOCOL_VERSION, REASON_BAD_SIGNATURE, REASON_ISSUER_MISMATCH, REASON_NO_EXECUTOR,
+    verify_interest_grant, AreaPage, CellId, CoordinatorInterestSnapshot, DiffUplink, Epoch,
+    GatewayMsg, GatewayReply, GridId, Intent, IntentOutcome, IssuerKey, JournalRecord, LeaseId,
+    LeaseMsg, Lsn, NodeId, PersistId, SessionTokenClaimsV1, SessionTokenV1,
+    SessionTokenVerificationError, SessionTokenVerifier, UnixMillis, MAX_AREA_PAGE_FRAME_BYTES,
+    MAX_SESSION_TOKEN_TTL_MS, PROTOCOL_VERSION, REASON_BAD_SIGNATURE, REASON_ISSUER_MISMATCH,
+    REASON_NO_EXECUTOR,
 };
 
 use crate::actor::{FencedApply, Reject};
@@ -296,6 +297,35 @@ pub trait InterestAuthority: Send + Sync {
     /// Return the latest coordinator snapshot for `peer`, if one is active.
     fn snapshot_for(&self, peer: NodeId) -> Option<CoordinatorInterestSnapshot>;
 
+    /// Accept a coordinator-signed grant a peer has presented.
+    ///
+    /// `presenter` is the transport-authenticated identity that handed the
+    /// bytes over, and `now_ms` is this gateway's own monotonic clock — the
+    /// grant carries a lifetime, never a coordinator timestamp, so the
+    /// deadline is stamped here.
+    ///
+    /// The default refuses: an authority with no coordinator keys configured
+    /// has no basis on which to believe anything, and silently ignoring a
+    /// grant would leave a peer unable to tell why its claims fail.
+    fn apply_grant(
+        &self,
+        grant: &[u8],
+        presenter: &NodeId,
+        now_ms: u64,
+    ) -> Result<Epoch, orrery_protocol::InterestGrantVerificationError> {
+        let _ = (grant, presenter, now_ms);
+        Err(orrery_protocol::InterestGrantVerificationError::Unsupported)
+    }
+
+    /// Reclaim interest whose gateway-local deadline has passed.
+    ///
+    /// Expiry is enforced on the read path regardless; this exists so a
+    /// long-running gateway does not retain every peer that ever connected.
+    /// The default does nothing, which is correct for a fixed snapshot set.
+    fn prune_expired(&self, now_ms: u64) {
+        let _ = now_ms;
+    }
+
     /// Return whether `peer` currently covers `cell` in `grid`.
     #[must_use]
     fn allows(&self, peer: NodeId, grid: GridId, cell: CellId, now_ms: u64) -> bool {
@@ -310,6 +340,98 @@ pub trait InterestAuthority: Send + Sync {
 
 /// Shared coordinator-interest authority injected into a gateway.
 pub type SharedInterestAuthority = Arc<dyn InterestAuthority>;
+
+/// The most peers whose interest a gateway retains at once.
+///
+/// Sized against the peer registry: a grant is only useful while its peer has
+/// a session, and this bound is what stops grant presentation from being an
+/// unbounded allocation channel.
+pub const MAX_INTEREST_PEERS: usize = MAX_PEER_REGISTRY_ENTRIES;
+
+/// Coordinator interest, accepted from peers that carry their own signed grant.
+///
+/// This is the production [`InterestAuthority`]. It holds only the
+/// coordinator's **public** keys: it verifies handouts, it never mints them.
+/// A peer therefore cannot widen its own interest, and the gateway needs no
+/// connection to the coordinator — the peer is the courier, exactly as it is
+/// for its identity token.
+#[derive(Debug)]
+pub struct CoordinatorHandoutAuthority {
+    keys: Vec<IssuerKey>,
+    snapshots: std::sync::RwLock<HashMap<NodeId, CoordinatorInterestSnapshot>>,
+}
+
+impl CoordinatorHandoutAuthority {
+    /// Trust these coordinator signing keys, and nothing else.
+    ///
+    /// More than one key is the rotation overlap: a new key can be accepted
+    /// before the old one is retired, so a rotation needs no flag day.
+    #[must_use]
+    pub fn new(keys: impl IntoIterator<Item = IssuerKey>) -> Self {
+        Self {
+            keys: keys.into_iter().collect(),
+            snapshots: std::sync::RwLock::new(HashMap::new()),
+        }
+    }
+
+    /// How many peers currently have interest on file.
+    #[must_use]
+    pub fn tracked_peers(&self) -> usize {
+        self.snapshots.read().map(|held| held.len()).unwrap_or(0)
+    }
+}
+
+impl InterestAuthority for CoordinatorHandoutAuthority {
+    fn snapshot_for(&self, peer: NodeId) -> Option<CoordinatorInterestSnapshot> {
+        self.snapshots.read().ok()?.get(&peer).cloned()
+    }
+
+    fn prune_expired(&self, now_ms: u64) {
+        if let Ok(mut held) = self.snapshots.write() {
+            held.retain(|_, snapshot| snapshot.valid_until_ms > now_ms);
+        }
+    }
+
+    fn apply_grant(
+        &self,
+        grant: &[u8],
+        presenter: &NodeId,
+        now_ms: u64,
+    ) -> Result<Epoch, orrery_protocol::InterestGrantVerificationError> {
+        use orrery_protocol::InterestGrantVerificationError as GrantError;
+
+        let claims = verify_interest_grant(grant, presenter, &self.keys)?;
+        let snapshot = CoordinatorInterestSnapshot::from_grant(claims, now_ms);
+        let epoch = snapshot.epoch;
+
+        let mut held = self.snapshots.write().map_err(|_| GrantError::Malformed)?;
+        match held.get(presenter) {
+            // A strictly older epoch is a replay of interest the coordinator
+            // has already narrowed; refusing it is the point of the epoch.
+            Some(current) if epoch < current.epoch => return Err(GrantError::Superseded),
+            // The same epoch means the same coverage — the coordinator bumps
+            // on every change — so this is a refresh, and re-accepting it
+            // extends the deadline without widening anything. Coverage that
+            // disagrees at one epoch cannot have come from one coordinator.
+            Some(current)
+                if epoch == current.epoch && current.covered_cells != snapshot.covered_cells =>
+            {
+                return Err(GrantError::Superseded);
+            }
+            _ => {}
+        }
+        if !held.contains_key(presenter) && held.len() >= MAX_INTEREST_PEERS {
+            // Reclaim expired entries before refusing: the cap exists to bound
+            // memory, not to lock out a peer behind peers that have left.
+            held.retain(|_, snapshot| snapshot.valid_until_ms > now_ms);
+            if held.len() >= MAX_INTEREST_PEERS {
+                return Err(GrantError::Superseded);
+            }
+        }
+        held.insert(*presenter, snapshot);
+        Ok(epoch)
+    }
+}
 
 /// Default coordinator-interest adapter until coordinator transport lands.
 ///
@@ -1693,6 +1815,7 @@ async fn accept_loop(
                     redistributor.redistribute(&router, parked).await;
                 }
                 admission.peers.evict_idle(admission.clock.now_ms().0).await;
+                interest_authority.prune_expired(registrar_now_ms());
             }
             incoming = endpoint.accept() => {
                 let Some(incoming) = incoming else { break };
@@ -2102,6 +2225,30 @@ async fn handle_connection(
                     _ => {}
                 }
             }
+            GatewayMsg::InterestGrant { grant } => {
+                // A grant is self-authenticating — it is signed by the
+                // coordinator and names its peer — but it is still only
+                // accepted inside an established session, so no gateway state
+                // exists for a peer that has not passed admission.
+                if session.as_ref().is_none() {
+                    continue;
+                }
+                let outcome = interest_authority.apply_grant(&grant, &remote, registrar_now_ms());
+                if let Err(error) = &outcome {
+                    debug!(%remote, %error, "gateway: interest grant refused");
+                }
+                let reply = match outcome {
+                    Ok(epoch) => GatewayReply::InterestAck {
+                        epoch: Some(epoch),
+                        reason: orrery_protocol::INTEREST_ACK_OK,
+                    },
+                    Err(error) => GatewayReply::InterestAck {
+                        epoch: None,
+                        reason: interest_ack_reason(error),
+                    },
+                };
+                send(Bytes::from(encode_stream_frame(&reply)));
+            }
             GatewayMsg::Diff { diff } => {
                 if diff.kind == orrery_protocol::RecordKind::Rekey {
                     send(Bytes::from(encode_datagram(&GatewayReply::BulkNack {
@@ -2389,6 +2536,25 @@ async fn divest_lease(
             orrery_protocol::ExpireReason::Revoked
         },
         disposition,
+    }
+}
+
+/// Map a verification failure onto its stable wire code.
+///
+/// A peer gets a reason rather than silence: a refused grant otherwise shows
+/// up only as claims failing `NotEligible`, which is the hardest possible way
+/// to discover a key-rotation or clock problem.
+fn interest_ack_reason(error: orrery_protocol::InterestGrantVerificationError) -> u8 {
+    use orrery_protocol::InterestGrantVerificationError as GrantError;
+    match error {
+        GrantError::Malformed => orrery_protocol::INTEREST_ACK_MALFORMED,
+        GrantError::UnknownIssuer(_) | GrantError::BadSignature => {
+            orrery_protocol::INTEREST_ACK_UNTRUSTED
+        }
+        GrantError::WrongPeer => orrery_protocol::INTEREST_ACK_WRONG_PEER,
+        GrantError::CellCount | GrantError::OverTtl => orrery_protocol::INTEREST_ACK_BOUNDS,
+        GrantError::Superseded => orrery_protocol::INTEREST_ACK_SUPERSEDED,
+        GrantError::Unsupported => orrery_protocol::INTEREST_ACK_UNSUPPORTED,
     }
 }
 
@@ -3129,6 +3295,182 @@ mod tests {
                 current_holder: other,
                 current_lease_id: LeaseId(9),
             })
+        );
+    }
+
+    fn coordinator_secret(seed: u8) -> iroh::SecretKey {
+        iroh::SecretKey::from_bytes(&[seed; 32])
+    }
+
+    fn signed_grant(
+        key: &iroh::SecretKey,
+        key_id: u32,
+        peer: NodeId,
+        epoch: u64,
+        cells: Vec<CellId>,
+        ttl_ms: u64,
+    ) -> Vec<u8> {
+        orrery_protocol::InterestGrantV1::sign(
+            orrery_protocol::InterestGrantClaimsV1::new(
+                peer,
+                Epoch::new(epoch),
+                GridId::ROOT,
+                cells,
+                ttl_ms,
+                orrery_protocol::IssuerKeyId::new(key_id),
+            ),
+            key,
+        )
+        .expect("sign grant")
+        .encode()
+        .expect("encode grant")
+    }
+
+    #[test]
+    fn a_verified_grant_becomes_interest_dated_by_the_gateways_own_clock() {
+        // Given: a gateway trusting one coordinator key.
+        let coordinator = coordinator_secret(9);
+        let authority = CoordinatorHandoutAuthority::new([IssuerKey::new(
+            orrery_protocol::IssuerKeyId::new(3),
+            coordinator.public(),
+        )]);
+        let peer = successor_node(1);
+        let cell = CellId::ROOT.children()[0];
+
+        // When: the peer presents its coordinator-signed grant at t=1000.
+        let epoch = authority
+            .apply_grant(
+                &signed_grant(&coordinator, 3, peer, 7, vec![cell], 30_000),
+                &peer,
+                1_000,
+            )
+            .expect("a genuine grant is accepted");
+
+        // Then: interest is in force, and its deadline is this gateway's own
+        // clock plus the grant's lifetime — never a coordinator timestamp.
+        assert_eq!(epoch, Epoch::new(7));
+        let snapshot = authority.snapshot_for(peer).expect("interest on file");
+        assert_eq!(snapshot.valid_until_ms, 31_000);
+        assert!(authority.allows(peer, GridId::ROOT, cell, 30_999));
+        assert!(!authority.allows(peer, GridId::ROOT, cell, 31_000));
+        // Coverage is exact: a neighbouring cell was never granted.
+        assert!(!authority.allows(peer, GridId::ROOT, CellId::ROOT.children()[1], 1_100));
+    }
+
+    #[test]
+    fn a_peer_cannot_grant_itself_interest() {
+        // The attack this whole path exists to stop: self-declared interest
+        // would be self-granted authority, since interest gates weak claims.
+        let coordinator = coordinator_secret(9);
+        let authority = CoordinatorHandoutAuthority::new([IssuerKey::new(
+            orrery_protocol::IssuerKeyId::new(3),
+            coordinator.public(),
+        )]);
+        let peer = successor_node(1);
+        let forged = coordinator_secret(1);
+
+        assert_eq!(
+            authority.apply_grant(
+                &signed_grant(&forged, 3, peer, 1, vec![CellId::ROOT], 30_000),
+                &peer,
+                1_000
+            ),
+            Err(orrery_protocol::InterestGrantVerificationError::BadSignature)
+        );
+        assert!(authority.snapshot_for(peer).is_none());
+    }
+
+    #[test]
+    fn a_narrowed_interest_cannot_be_widened_by_replaying_the_old_grant() {
+        // Given: a peer that moved, so the coordinator issued a narrower grant.
+        let coordinator = coordinator_secret(9);
+        let authority = CoordinatorHandoutAuthority::new([IssuerKey::new(
+            orrery_protocol::IssuerKeyId::new(3),
+            coordinator.public(),
+        )]);
+        let peer = successor_node(1);
+        let cells = CellId::ROOT.children();
+        let wide = signed_grant(&coordinator, 3, peer, 1, vec![cells[0], cells[1]], 30_000);
+        let narrow = signed_grant(&coordinator, 3, peer, 2, vec![cells[0]], 30_000);
+
+        authority
+            .apply_grant(&wide, &peer, 1_000)
+            .expect("accepted");
+        authority
+            .apply_grant(&narrow, &peer, 1_100)
+            .expect("newer epoch accepted");
+        assert!(!authority.allows(peer, GridId::ROOT, cells[1], 1_200));
+
+        // When: the peer replays the older, wider grant.
+        assert_eq!(
+            authority.apply_grant(&wide, &peer, 1_200),
+            Err(orrery_protocol::InterestGrantVerificationError::Superseded)
+        );
+
+        // Then: the narrowed coverage stands.
+        assert!(!authority.allows(peer, GridId::ROOT, cells[1], 1_200));
+        assert!(authority.allows(peer, GridId::ROOT, cells[0], 1_200));
+    }
+
+    #[test]
+    fn re_presenting_the_current_grant_refreshes_its_deadline() {
+        // A peer holding steady interest must be able to keep it alive without
+        // the coordinator inventing a new epoch on every presence tick.
+        let coordinator = coordinator_secret(9);
+        let authority = CoordinatorHandoutAuthority::new([IssuerKey::new(
+            orrery_protocol::IssuerKeyId::new(3),
+            coordinator.public(),
+        )]);
+        let peer = successor_node(1);
+        let grant = signed_grant(&coordinator, 3, peer, 5, vec![CellId::ROOT], 30_000);
+
+        authority
+            .apply_grant(&grant, &peer, 1_000)
+            .expect("accepted");
+        authority
+            .apply_grant(&grant, &peer, 20_000)
+            .expect("same epoch refreshes");
+
+        assert_eq!(
+            authority
+                .snapshot_for(peer)
+                .expect("on file")
+                .valid_until_ms,
+            50_000
+        );
+    }
+
+    #[test]
+    fn expired_interest_is_reclaimed_rather_than_retained_forever() {
+        let coordinator = coordinator_secret(9);
+        let authority = CoordinatorHandoutAuthority::new([IssuerKey::new(
+            orrery_protocol::IssuerKeyId::new(3),
+            coordinator.public(),
+        )]);
+        let peer = successor_node(1);
+        authority
+            .apply_grant(
+                &signed_grant(&coordinator, 3, peer, 1, vec![CellId::ROOT], 30_000),
+                &peer,
+                0,
+            )
+            .expect("accepted");
+        assert_eq!(authority.tracked_peers(), 1);
+
+        authority.prune_expired(29_999);
+        assert_eq!(authority.tracked_peers(), 1, "still inside its lifetime");
+        authority.prune_expired(30_000);
+        assert_eq!(authority.tracked_peers(), 0);
+    }
+
+    #[test]
+    fn a_gateway_with_no_coordinator_keys_says_so_instead_of_going_quiet() {
+        // `DenyAllInterestAuthority` is the default, and a peer presenting a
+        // grant to it must learn that grants are not accepted here rather than
+        // discovering it later as unexplained `NotEligible` claims.
+        assert_eq!(
+            DenyAllInterestAuthority.apply_grant(b"anything", &successor_node(1), 0),
+            Err(orrery_protocol::InterestGrantVerificationError::Unsupported)
         );
     }
 

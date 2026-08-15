@@ -3349,3 +3349,287 @@ fn single_writer_invariant_checker_flags_a_fenced_out_second_writer() {
         fixture.server.shutdown().await;
     });
 }
+
+/// Present a coordinator-signed interest grant and return the gateway's answer.
+async fn present_grant(
+    connection: &iroh::endpoint::Connection,
+    grant: Vec<u8>,
+) -> (Option<Epoch>, u8) {
+    connection
+        .send_datagram(Bytes::from(encode_stream_frame(
+            &GatewayMsg::InterestGrant { grant },
+        )))
+        .unwrap();
+    loop {
+        let packet = tokio::time::timeout(Duration::from_secs(5), connection.read_datagram())
+            .await
+            .unwrap()
+            .unwrap();
+        if let Some(GatewayReply::InterestAck { epoch, reason }) = decode_stream_frame(&packet) {
+            return (epoch, reason);
+        }
+    }
+}
+
+fn coordinator_grant(
+    coordinator: &iroh_base::SecretKey,
+    key_id: u32,
+    peer: orrery_protocol::NodeId,
+    epoch: u64,
+    cells: Vec<CellId>,
+) -> Vec<u8> {
+    orrery_protocol::InterestGrantV1::sign(
+        orrery_protocol::InterestGrantClaimsV1::new(
+            peer,
+            Epoch::new(epoch),
+            GridId::ROOT,
+            cells,
+            60_000,
+            orrery_protocol::IssuerKeyId::new(key_id),
+        ),
+        coordinator,
+    )
+    .expect("sign grant")
+    .encode()
+    .expect("encode grant")
+}
+
+#[test]
+fn a_peer_carrying_its_coordinator_grant_unlocks_claims_and_redistribution() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        // Given: a gateway that trusts a coordinator key but has been handed
+        // no snapshots out of band — the production posture, where interest
+        // arrives only because peers carry it.
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = Arc::new(Mutex::new({
+            let store: Arc<dyn orrery_persistd::checkpoint::CheckpointStore> =
+                Arc::new(orrery_persistd::checkpoint::MemCheckpointStore::new());
+            CellRuntime::open(&runtime_config(dir.path()), &store)
+                .await
+                .unwrap()
+        }));
+        let cell = CellId::ROOT.children()[0];
+        let entity = PersistId::new(880);
+        seed_entity(&runtime, entity, cell).await;
+
+        let issuer = secret(42);
+        let coordinator = secret(77);
+        let server = GatewayServer::spawn(
+            GatewayConfig {
+                interest_authority: Arc::new(orrery_persistd::CoordinatorHandoutAuthority::new([
+                    orrery_protocol::IssuerKey::new(
+                        orrery_protocol::IssuerKeyId::new(5),
+                        coordinator.public(),
+                    ),
+                ])),
+                authorizer: support::authorizer(&issuer),
+                identity_clock: support::fixed_clock(support::TOKEN_NOW_MS),
+                identity_health: support::available_identity_health(),
+                ..GatewayConfig::default()
+            },
+            runtime.clone(),
+        )
+        .await
+        .unwrap();
+
+        let mut endpoints = Vec::new();
+        let mut connections = Vec::new();
+        for seed in [1u8, 2] {
+            let (endpoint, connection) = raw_connection(secret(seed), server.addr()).await;
+            connection
+                .send_datagram(Bytes::from(encode_stream_frame(&GatewayMsg::Hello {
+                    token: session_token(
+                        &issuer,
+                        node(seed),
+                        support::TOKEN_ISSUED_AT_MS,
+                        support::TOKEN_TTL_MS,
+                    ),
+                    node: node(seed),
+                })))
+                .unwrap();
+            assert!(receives_hello_ack(&connection).await);
+            endpoints.push(endpoint);
+            connections.push(connection);
+        }
+        let successor = connections.pop().unwrap();
+        let holder = connections.pop().unwrap();
+
+        // Then: with no grant presented, a weak claim has no interest backing
+        // it and is refused.
+        assert!(matches!(
+            claim_reply(
+                &holder,
+                entity,
+                GridId::ROOT,
+                cell,
+                ClaimKind::Weak,
+                ClaimBasis::Contact { tick: Tick::new(1) },
+            )
+            .await,
+            LeaseMsg::Deny {
+                reason: orrery_protocol::DenyReason::NotEligible,
+                ..
+            }
+        ));
+
+        // When: a peer forges its own grant.
+        let forged = coordinator_grant(&secret(1), 5, node(1), 1, vec![cell]);
+        assert_eq!(
+            present_grant(&holder, forged).await,
+            (None, orrery_protocol::INTEREST_ACK_UNTRUSTED),
+            "self-declared interest is self-granted authority; it must not verify"
+        );
+
+        // When: both peers present genuine coordinator grants.
+        for (connection, seed) in [(&holder, 1u8), (&successor, 2u8)] {
+            assert_eq!(
+                present_grant(
+                    connection,
+                    coordinator_grant(&coordinator, 5, node(seed), 1, vec![cell])
+                )
+                .await,
+                (Some(Epoch::new(1)), orrery_protocol::INTEREST_ACK_OK)
+            );
+        }
+
+        // Then: the same claim now succeeds — interest is what gated it.
+        let granted = claim_reply(
+            &holder,
+            entity,
+            GridId::ROOT,
+            cell,
+            ClaimKind::Weak,
+            ClaimBasis::Contact { tick: Tick::new(2) },
+        )
+        .await;
+        let LeaseMsg::Grant { lease_id, .. } = granted else {
+            panic!("a grant-backed weak claim must be granted, got {granted:?}");
+        };
+
+        // And: redistribution now has a candidate, so a lost holder's lease
+        // moves instead of parking. This is the whole point of the transport:
+        // the mechanism was already built, and interest is what switches it on.
+        holder.close(0u32.into(), b"gone");
+        let inherited = pushed_lease(&successor, Duration::from_secs(5))
+            .await
+            .expect("the interested peer inherits the lease");
+        let LeaseMsg::Grant {
+            claim_id,
+            lease_id: successor_lease_id,
+            prev_holder,
+            ..
+        } = inherited
+        else {
+            panic!("successor must receive a grant, got {inherited:?}");
+        };
+        assert_eq!(claim_id, orrery_protocol::ClaimId::REGISTRAR);
+        assert!(successor_lease_id > lease_id);
+        assert_eq!(prev_holder, Some(node(1)));
+        assert_eq!(server.authority_metrics().snapshot().reassigned, 1);
+
+        server.shutdown().await;
+    });
+}
+
+#[test]
+fn an_interest_grant_is_refused_with_a_reason_the_peer_can_act_on() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        // Given: a gateway trusting one coordinator key.
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = Arc::new(Mutex::new({
+            let store: Arc<dyn orrery_persistd::checkpoint::CheckpointStore> =
+                Arc::new(orrery_persistd::checkpoint::MemCheckpointStore::new());
+            CellRuntime::open(&runtime_config(dir.path()), &store)
+                .await
+                .unwrap()
+        }));
+        let issuer = secret(42);
+        let coordinator = secret(77);
+        let server = GatewayServer::spawn(
+            GatewayConfig {
+                interest_authority: Arc::new(orrery_persistd::CoordinatorHandoutAuthority::new([
+                    orrery_protocol::IssuerKey::new(
+                        orrery_protocol::IssuerKeyId::new(5),
+                        coordinator.public(),
+                    ),
+                ])),
+                authorizer: support::authorizer(&issuer),
+                identity_clock: support::fixed_clock(support::TOKEN_NOW_MS),
+                identity_health: support::available_identity_health(),
+                ..GatewayConfig::default()
+            },
+            runtime.clone(),
+        )
+        .await
+        .unwrap();
+        let (_client, connection) = raw_connection(secret(1), server.addr()).await;
+        connection
+            .send_datagram(Bytes::from(encode_stream_frame(&GatewayMsg::Hello {
+                token: session_token(
+                    &issuer,
+                    node(1),
+                    support::TOKEN_ISSUED_AT_MS,
+                    support::TOKEN_TTL_MS,
+                ),
+                node: node(1),
+            })))
+            .unwrap();
+        assert!(receives_hello_ack(&connection).await);
+        let cell = CellId::ROOT.children()[0];
+
+        // Every refusal is distinguishable, so a misconfiguration is
+        // diagnosable instead of surfacing later as unexplained claim denials.
+        assert_eq!(
+            present_grant(&connection, b"not a grant".to_vec()).await,
+            (None, orrery_protocol::INTEREST_ACK_MALFORMED)
+        );
+        assert_eq!(
+            present_grant(
+                &connection,
+                coordinator_grant(&coordinator, 99, node(1), 1, vec![cell])
+            )
+            .await,
+            (None, orrery_protocol::INTEREST_ACK_UNTRUSTED),
+            "an unknown key id is a rotation gap, not a bad signature"
+        );
+        assert_eq!(
+            present_grant(
+                &connection,
+                coordinator_grant(&coordinator, 5, node(2), 1, vec![cell])
+            )
+            .await,
+            (None, orrery_protocol::INTEREST_ACK_WRONG_PEER),
+            "relaying someone else's genuine grant must not work"
+        );
+        assert_eq!(
+            present_grant(
+                &connection,
+                coordinator_grant(&coordinator, 5, node(1), 1, Vec::new())
+            )
+            .await,
+            (None, orrery_protocol::INTEREST_ACK_BOUNDS)
+        );
+
+        // A newer epoch lands; replaying the older one is then refused.
+        assert_eq!(
+            present_grant(
+                &connection,
+                coordinator_grant(&coordinator, 5, node(1), 9, vec![cell])
+            )
+            .await,
+            (Some(Epoch::new(9)), orrery_protocol::INTEREST_ACK_OK)
+        );
+        assert_eq!(
+            present_grant(
+                &connection,
+                coordinator_grant(&coordinator, 5, node(1), 8, vec![cell, CellId::ROOT])
+            )
+            .await,
+            (None, orrery_protocol::INTEREST_ACK_SUPERSEDED)
+        );
+
+        server.shutdown().await;
+    });
+}

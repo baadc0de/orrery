@@ -12,8 +12,8 @@ use bevy_ecs::system::SystemParam;
 use bevy_platform::time::Instant;
 
 use orrery_authority::{
-    Authority, AuthorityEvent, AuthorityPhase, AuthorityState, LeaseInbox, LocallyAuthoritative,
-    PersistIdentity,
+    Authority, AuthorityEvent, AuthorityPhase, AuthorityState, InterestGrant, LeaseInbox,
+    LocallyAuthoritative, PersistIdentity,
 };
 use orrery_protocol::{GatewayReply, Lease, PersistId};
 
@@ -128,6 +128,23 @@ pub(crate) fn process_replies(mut context: ReplyProcessingContext) {
                     inbox.0.push(message);
                 }
             }
+            GatewayReply::InterestAck { epoch, reason } => {
+                if let Some(interest) = &mut context.interest {
+                    interest.accepted_epoch = epoch;
+                    interest.last_reason = reason;
+                    if epoch.is_some() {
+                        interest.pending = false;
+                    }
+                }
+                if epoch.is_none() {
+                    // Without this the peer would only learn its interest was
+                    // refused by watching claims fail as `NotEligible`.
+                    tracing::warn!(
+                        reason,
+                        "gateway: coordinator interest grant refused; weak claims will be denied"
+                    );
+                }
+            }
         }
     }
 }
@@ -141,6 +158,7 @@ pub(crate) struct ReplyProcessingContext<'w, 's> {
     loader: ResMut<'w, AreaLoader>,
     queue: ResMut<'w, IntentQueue>,
     lease_inbox: Option<ResMut<'w, LeaseInbox>>,
+    interest: Option<ResMut<'w, InterestGrant>>,
     authority_state: Option<ResMut<'w, AuthorityState>>,
     authority_events: Option<ResMut<'w, Messages<AuthorityEvent>>>,
     identities: Query<'w, 's, (Entity, &'static PersistIdentity)>,
@@ -239,6 +257,77 @@ mod tests {
                 recv_at: bevy_platform::time::Instant::now(),
                 payload: bytes,
             });
+    }
+
+    #[test]
+    fn an_interest_ack_records_the_epoch_and_a_refusal_clears_it() {
+        // Given: a peer holding a coordinator grant it has presented.
+        let (mut app, session_entity) = reply_app();
+        app.init_resource::<orrery_authority::InterestGrant>();
+        {
+            let mut interest = app
+                .world_mut()
+                .resource_mut::<orrery_authority::InterestGrant>();
+            interest.set(vec![1, 2, 3]);
+        }
+
+        // When: the gateway accepts it.
+        push_reply(
+            &mut app,
+            session_entity,
+            Bytes::from(GatewaySession::encode_stream(&GatewayReply::InterestAck {
+                epoch: Some(orrery_protocol::Epoch::new(4)),
+                reason: orrery_protocol::INTEREST_ACK_OK,
+            })),
+        );
+        app.update();
+
+        // Then: the peer knows its interest is on file and stops re-presenting.
+        let interest = app.world().resource::<orrery_authority::InterestGrant>();
+        assert_eq!(
+            interest.accepted_epoch,
+            Some(orrery_protocol::Epoch::new(4))
+        );
+        assert!(interest.is_accepted());
+        assert!(!interest.pending);
+
+        // When: a later grant is refused (a rotated-out coordinator key, say).
+        push_reply(
+            &mut app,
+            session_entity,
+            Bytes::from(GatewaySession::encode_stream(&GatewayReply::InterestAck {
+                epoch: None,
+                reason: orrery_protocol::INTEREST_ACK_UNTRUSTED,
+            })),
+        );
+        app.update();
+
+        // Then: the peer can see it has no interest on file, rather than
+        // discovering it later as unexplained `NotEligible` claim denials.
+        let interest = app.world().resource::<orrery_authority::InterestGrant>();
+        assert!(!interest.is_accepted());
+        assert_eq!(
+            interest.last_reason,
+            orrery_protocol::INTEREST_ACK_UNTRUSTED
+        );
+    }
+
+    #[test]
+    fn a_reconnect_re_presents_the_grant_because_a_new_session_holds_none() {
+        let mut interest = orrery_authority::InterestGrant::default();
+        interest.set(vec![9]);
+        interest.pending = false;
+        interest.accepted_epoch = Some(orrery_protocol::Epoch::new(2));
+
+        interest.resend();
+
+        assert!(interest.pending, "a fresh session has no interest on file");
+        assert!(!interest.is_accepted());
+
+        // A peer that never had a grant has nothing to re-present.
+        let mut empty = orrery_authority::InterestGrant::default();
+        empty.resend();
+        assert!(!empty.pending);
     }
 
     #[test]

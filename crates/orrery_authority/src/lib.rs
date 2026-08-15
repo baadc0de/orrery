@@ -114,6 +114,52 @@ pub enum AuthorityEvent {
 #[derive(Debug, Default, Resource)]
 pub struct LeaseOutbox(pub Vec<LeaseMsg>);
 
+/// This peer's coordinator interest grant, and what the gateway made of it.
+///
+/// Interest is what authorizes weak claims and makes this peer eligible to
+/// inherit a lease, and only the coordinator can assert it. The peer is
+/// merely the courier: it holds opaque signed bytes, presents them, and reads
+/// back whether they were accepted.
+///
+/// Put the coordinator's handout in `grant` and the gateway adapter presents
+/// it on the next connected frame, re-presenting it after a reconnect — a new
+/// session starts with no interest on file.
+#[derive(Debug, Default, Resource)]
+pub struct InterestGrant {
+    /// The coordinator-signed grant to present, if one has been received.
+    pub grant: Option<Vec<u8>>,
+    /// The coordinator epoch the gateway currently holds for this peer.
+    ///
+    /// `None` before the first acceptance, and after a refusal — a peer with
+    /// no epoch on file should expect its weak claims to be refused.
+    pub accepted_epoch: Option<orrery_protocol::Epoch>,
+    /// The reason code from the most recent reply, `INTEREST_ACK_OK` when the
+    /// grant was accepted.
+    pub last_reason: u8,
+    /// Whether `grant` still needs presenting on the current session.
+    pub pending: bool,
+}
+
+impl InterestGrant {
+    /// Install a freshly received coordinator grant, to be presented next.
+    pub fn set(&mut self, grant: Vec<u8>) {
+        self.grant = Some(grant);
+        self.pending = true;
+    }
+
+    /// Mark the held grant as needing presentation again, after a reconnect.
+    pub fn resend(&mut self) {
+        self.accepted_epoch = None;
+        self.pending = self.grant.is_some();
+    }
+
+    /// Whether the gateway currently believes this peer's interest.
+    #[must_use]
+    pub fn is_accepted(&self) -> bool {
+        self.accepted_epoch.is_some()
+    }
+}
+
 /// Lease replies delivered by the gateway adapter.
 #[derive(Debug, Default, Resource)]
 pub struct LeaseInbox(pub Vec<LeaseMsg>);
@@ -538,6 +584,7 @@ pub struct OrreryAuthorityPlugin;
 impl Plugin for OrreryAuthorityPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<AuthorityState>()
+            .init_resource::<InterestGrant>()
             .init_resource::<LeaseInbox>()
             .init_resource::<LeaseOutbox>()
             .add_message::<AuthorityEvent>()

@@ -19,9 +19,11 @@
 
 use std::collections::{HashMap, HashSet};
 
-use orrery_protocol::coord::{IslandId, IslandManifest, PeerEntry, TopologyRegime};
-use orrery_protocol::CellId;
-use orrery_protocol::NodeId;
+use orrery_protocol::coord::{
+    CoordinatorInterestSnapshot, InterestGrantClaimsV1, IslandId, IslandManifest, PeerEntry,
+    TopologyRegime,
+};
+use orrery_protocol::{CellId, Epoch, GridId, NodeId};
 
 /// Coordinator configuration (docs/10-crates.md §12).
 #[derive(Debug, Clone)]
@@ -29,12 +31,20 @@ pub struct CoordinatorConfig {
     /// The population at which a cell is promoted to a field host. Default 32
     /// (D16); the D6 hysteresis windows are not implemented in P1.
     pub promotion_threshold: u32,
+    /// Lifetime stamped on issued interest grants, in milliseconds.
+    ///
+    /// A grant is a *lease on being believed*: short enough that a peer which
+    /// stops reporting presence stops being able to claim authority, long
+    /// enough to survive ordinary presence jitter. The default is one minute,
+    /// six presence intervals at the D16 cadence.
+    pub interest_grant_ttl_ms: u64,
 }
 
 impl Default for CoordinatorConfig {
     fn default() -> Self {
         Self {
             promotion_threshold: 32,
+            interest_grant_ttl_ms: 60_000,
         }
     }
 }
@@ -44,6 +54,11 @@ impl Default for CoordinatorConfig {
 struct Presence {
     /// The cells this peer occupies (shard level).
     cells: HashSet<CellId>,
+    /// Monotonic epoch, bumped whenever `cells` changes.
+    ///
+    /// A gateway keeps the highest epoch it has seen per peer, so this is what
+    /// stops a peer replaying a stale, wider grant after moving away.
+    interest_epoch: u32,
 }
 
 /// The in-memory island registry (P1).
@@ -118,7 +133,13 @@ impl IslandRegistry {
             self.remove_peer_from_island(node, id);
         }
 
-        self.peers.entry(node).or_default().cells = cells.clone();
+        {
+            let presence = self.peers.entry(node).or_default();
+            if presence.cells != cells {
+                presence.cells = cells.clone();
+                presence.interest_epoch = presence.interest_epoch.saturating_add(1);
+            }
+        }
 
         // Find an island whose cells overlap this peer's, else form a new one.
         let overlapping = self
@@ -150,6 +171,51 @@ impl IslandRegistry {
         island.epoch += 1;
 
         vec![self.manifest(island_id)]
+    }
+
+    /// Mint the interest claims authorizing `node`'s current coverage.
+    ///
+    /// Returns `None` for a peer with no reported presence: there is nothing
+    /// to authorize, and a grant covering no cells is refused by verifiers
+    /// anyway. The cells are sorted so the same presence always produces the
+    /// same bytes, which keeps a re-issued grant diffable in a log.
+    #[must_use]
+    pub fn interest_claims(
+        &self,
+        node: NodeId,
+        grid: GridId,
+        issuer_key_id: orrery_protocol::IssuerKeyId,
+    ) -> Option<InterestGrantClaimsV1> {
+        let presence = self.peers.get(&node)?;
+        if presence.cells.is_empty() {
+            return None;
+        }
+        let mut covered_cells: Vec<CellId> = presence.cells.iter().copied().collect();
+        covered_cells.sort();
+        Some(InterestGrantClaimsV1::new(
+            node,
+            Epoch::new(u64::from(presence.interest_epoch)),
+            grid,
+            covered_cells,
+            self.config.interest_grant_ttl_ms,
+            issuer_key_id,
+        ))
+    }
+
+    /// The unsigned snapshot a gateway would hold for `node`, for tests and
+    /// in-process embeddings that skip the signature round trip.
+    ///
+    /// `accepted_at_ms` is the *consumer's* clock, not the coordinator's —
+    /// same rule as a verified grant.
+    #[must_use]
+    pub fn interest_snapshot(
+        &self,
+        node: NodeId,
+        grid: GridId,
+        accepted_at_ms: u64,
+    ) -> Option<CoordinatorInterestSnapshot> {
+        self.interest_claims(node, grid, orrery_protocol::IssuerKeyId::new(0))
+            .map(|claims| CoordinatorInterestSnapshot::from_grant(claims, accepted_at_ms))
     }
 
     /// The manifest for an island at its current epoch.

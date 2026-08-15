@@ -15,10 +15,12 @@ fdb-state = []
 
 [dependencies]
 orrery_protocol = { path = "../orrery_protocol" }
+# Signing interest grants: the coordinator is the only party allowed to assert
+# what a peer is interested in, so it needs the ed25519 secret half (D3).
+iroh-base = { workspace = true }
+postcard = { workspace = true }
 serde = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
-postcard = { workspace = true }
 glam = { workspace = true }
-iroh-base = { workspace = true }

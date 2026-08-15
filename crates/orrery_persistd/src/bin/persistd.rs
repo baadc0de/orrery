@@ -46,10 +46,11 @@ use orrery_persistd::journal::{
     spawn_chain, spawn_chain_grpc, AdaptiveCommitMode, ChainConfig, GroupCommitConfig, Journal,
 };
 use orrery_persistd::{
-    ActivationOutcome, AuthorityMetrics, CellRuntime, CheckpointScheduler, DurableChainId,
-    FenceFreshnessConfig, FenceStore, GatewayBulkMetrics, GatewayConfig, GatewayServer,
-    GrpcChainTransport, IntentExecutor, IntentValidator, IntentVerdict, JournalConfig,
-    MemCheckpointStore, RuntimeConfig, ShardActivation,
+    ActivationOutcome, AuthorityMetrics, CellRuntime, CheckpointScheduler,
+    CoordinatorHandoutAuthority, DurableChainId, FenceFreshnessConfig, FenceStore,
+    GatewayBulkMetrics, GatewayConfig, GatewayServer, GrpcChainTransport, IntentExecutor,
+    IntentValidator, IntentVerdict, JournalConfig, MemCheckpointStore, RuntimeConfig,
+    ShardActivation,
 };
 #[cfg(feature = "fdb")]
 use orrery_persistd::{FdbContext, FdbIntentExecutor};
@@ -126,6 +127,14 @@ struct Cli {
     /// Trusted identity issuer key in `<key-id>@<public-key>` form.
     #[arg(long, value_name = "KEY_ID@PUBLIC_KEY")]
     issuer_key: Vec<IssuerKeySpec>,
+
+    /// Trusted coordinator interest-grant key in `<key-id>@<public-key>` form.
+    ///
+    /// Repeatable, so a key rotation can be deployed with an overlap. Without
+    /// at least one, no peer has coordinator-confirmed interest: weak claims
+    /// are refused and a lost lease parks instead of moving to a successor.
+    #[arg(long, value_name = "KEY_ID@PUBLIC_KEY")]
+    coordinator_key: Vec<IssuerKeySpec>,
 
     /// Hex-encoded iroh secret key, pinning the gateway's NodeId across runs.
     /// When absent a fresh identity is generated per boot.
@@ -1004,6 +1013,18 @@ where
         None
     };
 
+    // With no coordinator key configured the default deny-all authority
+    // stands: interest is unproven, so weak claims are refused and lost leases
+    // park. That is the conservative posture, not a silent downgrade.
+    let interest_authority: Arc<dyn orrery_persistd::gateway::InterestAuthority> =
+        if cli.coordinator_key.is_empty() {
+            Arc::new(orrery_persistd::gateway::DenyAllInterestAuthority)
+        } else {
+            Arc::new(CoordinatorHandoutAuthority::new(
+                cli.coordinator_key.iter().map(|key| key.0.clone()),
+            ))
+        };
+
     Ok(GatewayConfig {
         bind: cli.bind.parse::<SocketAddr>()?,
         secret_key,
@@ -1011,6 +1032,7 @@ where
         authorizer: Arc::new(SessionTokenV1Authorizer::new(
             cli.issuer_key.iter().map(|key| key.0.clone()),
         )),
+        interest_authority,
         validator: Arc::new(ProductionIntentValidator),
         ..GatewayConfig::default()
     })
@@ -1363,6 +1385,7 @@ mod tests {
                 IssuerKeyId::new(1),
                 iroh::SecretKey::from_bytes(&[9; 32]).public(),
             ))],
+            coordinator_key: Vec::new(),
             secret_key: None,
             shard: Vec::new(),
             metrics_jsonl: None,
