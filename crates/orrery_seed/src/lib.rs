@@ -47,6 +47,28 @@ pub fn fdb_network() {
     orrery_persistd::fdb::fdb_network();
 }
 
+/// Open `cluster_file` with every transaction bounded.
+///
+/// Delegates to [`orrery_persistd::fdb::FdbContext::connect`], which boots the
+/// client network and then sets the transaction timeout and retry limit
+/// documented in that module. The seeder writes to the same clusters persistd
+/// does, so it must inherit the same bounds: without them a `verify` against
+/// an unreachable cluster never returns, and an operator sees a wedged batch
+/// job rather than a failed one.
+#[cfg(feature = "fdb")]
+pub fn fdb_open(cluster_file: &str) -> Result<std::sync::Arc<foundationdb::Database>, String> {
+    Ok(orrery_persistd::fdb::FdbContext::connect(cluster_file)
+        .map_err(|e| format!("connect: {e}"))?
+        .database())
+}
+
+/// The cluster file this process should use, from `ORRERY_FDB_CLUSTER_FILE`.
+#[cfg(feature = "fdb")]
+fn cluster_file_from_env() -> Result<String, String> {
+    std::env::var("ORRERY_FDB_CLUSTER_FILE")
+        .map_err(|_| "set ORRERY_FDB_CLUSTER_FILE to the FDB cluster file".to_string())
+}
+
 pub mod apply;
 pub mod content;
 pub mod encode;

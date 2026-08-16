@@ -776,28 +776,6 @@ async fn area_load_end_to_end_live_cells() {
     server.shutdown().await;
 }
 
-/// The cluster file for the FDB-gated tests, or `None` if not configured.
-///
-/// Honors `ORRERY_FDB_CLUSTER_FILE`; otherwise walks up from the crate dir to
-/// find the workspace-root `.fdb-dev/fdb.cluster` (tests run with CWD = the
-/// crate dir, not the workspace root).
-#[cfg(feature = "fdb")]
-fn fdb_cluster_file() -> Option<String> {
-    if let Ok(path) = std::env::var("ORRERY_FDB_CLUSTER_FILE") {
-        return Some(path);
-    }
-    let mut dir = std::env::current_dir().ok()?;
-    loop {
-        let candidate = dir.join(".fdb-dev/fdb.cluster");
-        if candidate.exists() {
-            return Some(candidate.display().to_string());
-        }
-        if !dir.pop() {
-            return None;
-        }
-    }
-}
-
 /// A runtime pinned to `grid` (the fdb tests share one dev cluster; the grid
 /// scopes every row so tests are disjoint by construction, P-7).
 #[cfg(feature = "fdb")]
@@ -835,7 +813,7 @@ async fn activate_fdb_checkpoint_fence(cluster: &str, grid: GridId) {
 #[cfg(feature = "fdb")]
 #[tokio::test]
 async fn area_load_end_to_end_cold_cell_served() {
-    let Some(cluster) = fdb_cluster_file() else {
+    let Some(cluster) = support::fdb_cluster_file() else {
         eprintln!("skipping: ORRERY_FDB_CLUSTER_FILE not set and no .fdb-dev/fdb.cluster");
         return;
     };
@@ -926,4 +904,54 @@ async fn area_load_end_to_end_cold_cell_served() {
         "the cold cell was served from the durable tier"
     );
     server.shutdown().await;
+}
+
+/// The wall-clock ceiling the unreachable-cluster test asserts.
+///
+/// The promised bound is [`orrery_persistd::fdb::DEFAULT_TRANSACTION_TIMEOUT_MS`],
+/// which covers the whole `db.run` including retries; measured here it lands
+/// at 10.0 s. Three times that is deliberate slack — the assertion under test
+/// is "terminates at all", and a tight ceiling would turn a loaded CI box into
+/// a flake.
+#[cfg(feature = "fdb")]
+const UNREACHABLE_CLUSTER_BOUND: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// A durable read against a cluster nothing is listening on fails inside the
+/// transaction budget instead of hanging forever.
+///
+/// This is the regression test for the C client's retry-forever default: with
+/// no `TransactionTimeout` and no `TransactionRetryLimit` on the database
+/// handle, this `load` never returns and takes the whole area-load path down
+/// with it (docs/09-services-and-ops.md §"FDB degraded").
+///
+/// It needs no cluster — only the C client — because the point is precisely
+/// that the cluster is absent. `Database::from_path` still succeeds: the
+/// client connects lazily, so the failure can only surface on the first
+/// transaction.
+#[cfg(feature = "fdb")]
+#[tokio::test]
+async fn unreachable_fdb_cluster_fails_inside_the_transaction_bound() {
+    let dir = tempfile::tempdir().unwrap();
+    let cluster_file = dir.path().join("unreachable.cluster");
+    // Syntactically valid, and port 4599 is well away from both the shared
+    // dev cluster on 4500 and any throwaway instance an agent stands up.
+    std::fs::write(&cluster_file, "orrery_unreachable:bound@127.0.0.1:4599\n").unwrap();
+
+    let store = orrery_persistd::checkpoint::FdbCheckpointStore::connect(
+        &cluster_file.display().to_string(),
+    )
+    .expect("a well-formed cluster file opens even when nothing is listening");
+
+    let started = std::time::Instant::now();
+    let err = store
+        .load(CellId::ROOT, GridId::new(9299))
+        .await
+        .expect_err("an unreachable cluster must be an error, not a hang");
+    let elapsed = started.elapsed();
+
+    assert!(
+        elapsed < UNREACHABLE_CLUSTER_BOUND,
+        "durable read against an unreachable cluster took {elapsed:?}, over the \
+         {UNREACHABLE_CLUSTER_BOUND:?} bound: {err}"
+    );
 }

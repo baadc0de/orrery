@@ -3,6 +3,8 @@
 //! These exercise the `actor/{shard}` fencing protocol (§3.4) and the hotspot
 //! split (§3.5) end-to-end with the in-memory fence store — no FoundationDB.
 
+mod support;
+
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -141,28 +143,6 @@ fn runtime_config_dyn_fence(
         node_id,
         epoch: Epoch::new(0),
         fence,
-    }
-}
-
-/// The cluster file for the FDB-gated tests, or `None` if not configured.
-///
-/// Honors `ORRERY_FDB_CLUSTER_FILE`; otherwise walks up from the crate dir to
-/// find the workspace-root `.fdb-dev/fdb.cluster` (tests run with CWD = the
-/// crate dir, not the workspace root).
-#[cfg(feature = "fdb")]
-fn fdb_cluster_file() -> Option<String> {
-    if let Ok(path) = std::env::var("ORRERY_FDB_CLUSTER_FILE") {
-        return Some(path);
-    }
-    let mut dir = std::env::current_dir().ok()?;
-    loop {
-        let candidate = dir.join(".fdb-dev/fdb.cluster");
-        if candidate.exists() {
-            return Some(candidate.display().to_string());
-        }
-        if !dir.pop() {
-            return None;
-        }
     }
 }
 
@@ -635,7 +615,7 @@ async fn fence_outcome_is_exposed() {
 
 #[cfg(feature = "fdb")]
 fn fdb_fence_store() -> Option<orrery_persistd::fence::FdbFenceStore> {
-    let cluster = fdb_cluster_file()?;
+    let cluster = support::fdb_cluster_file()?;
     orrery_persistd::fence::FdbFenceStore::connect(&cluster).ok()
 }
 

@@ -51,12 +51,7 @@ pub async fn run(
     if options.single_grid {
         scenario = flatten(scenario);
     }
-    let cluster_file = std::env::var("ORRERY_FDB_CLUSTER_FILE")
-        .map_err(|_| "set ORRERY_FDB_CLUSTER_FILE to the FDB cluster file".to_string())?;
-    let db = std::sync::Arc::new({
-        crate::fdb_network();
-        foundationdb::Database::from_path(&cluster_file).map_err(|e| format!("connect: {e}"))?
-    });
+    let db = crate::fdb_open(&crate::cluster_file_from_env()?)?;
 
     // The grids this scenario actually realizes into — not every declared
     // `[[grid]]`. A scenario may declare a grid it never emits to (the demo

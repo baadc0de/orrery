@@ -5,6 +5,8 @@
 //! **self-skip** when no cluster is reachable — so a bare checkout stays green
 //! and a machine with the dev cluster up exercises the real FDB path.
 
+mod support;
+
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -463,32 +465,10 @@ async fn scheduler_checkpoints_on_cadence_and_quiesce() {
     rt.close().await.unwrap();
 }
 
-/// The cluster file for the FDB-gated tests, or `None` if not configured.
-///
-/// Honors `ORRERY_FDB_CLUSTER_FILE`; otherwise walks up from the crate dir to
-/// find the workspace-root `.fdb-dev/fdb.cluster` (tests run with CWD = the
-/// crate dir, not the workspace root).
-#[cfg(feature = "fdb")]
-fn fdb_cluster_file() -> Option<String> {
-    if let Ok(path) = std::env::var("ORRERY_FDB_CLUSTER_FILE") {
-        return Some(path);
-    }
-    let mut dir = std::env::current_dir().ok()?;
-    loop {
-        let candidate = dir.join(".fdb-dev/fdb.cluster");
-        if candidate.exists() {
-            return Some(candidate.display().to_string());
-        }
-        if !dir.pop() {
-            return None;
-        }
-    }
-}
-
 #[cfg(feature = "fdb")]
 #[tokio::test]
 async fn fdb_checkpoint_roundtrip() {
-    let Some(cluster) = fdb_cluster_file() else {
+    let Some(cluster) = support::fdb_cluster_file() else {
         eprintln!("skipping: ORRERY_FDB_CLUSTER_FILE not set and no .fdb-dev/fdb.cluster");
         return;
     };
@@ -533,7 +513,7 @@ async fn fdb_checkpoint_roundtrip() {
 #[cfg(feature = "fdb")]
 #[tokio::test]
 async fn fdb_checkpoint_then_restore() {
-    let Some(cluster) = fdb_cluster_file() else {
+    let Some(cluster) = support::fdb_cluster_file() else {
         eprintln!("skipping: ORRERY_FDB_CLUSTER_FILE not set and no .fdb-dev/fdb.cluster");
         return;
     };
@@ -591,7 +571,7 @@ async fn fdb_cold_cell_area_load() {
     // Cold-cell area load (gap #4): a cell with no live actor is served by an
     // FDB range scan over `world/{cell_id}/…`, not from actor memory. The
     // checkpoint writes the entity rows; `read_cold` reads them back.
-    let Some(cluster) = fdb_cluster_file() else {
+    let Some(cluster) = support::fdb_cluster_file() else {
         eprintln!("skipping: ORRERY_FDB_CLUSTER_FILE not set and no .fdb-dev/fdb.cluster");
         return;
     };
@@ -658,7 +638,7 @@ async fn fdb_subtree_keying_and_watermark_only_checkpoint() {
     //     and `delete(shard)` clears it (and only it).
     //   * P-8: the `ckpt/` value is the watermark only — `load` rebuilds the
     //     entity bag from the `world/` rows, and the recovery fields round-trip.
-    let Some(cluster) = fdb_cluster_file() else {
+    let Some(cluster) = support::fdb_cluster_file() else {
         eprintln!("skipping: ORRERY_FDB_CLUSTER_FILE not set and no .fdb-dev/fdb.cluster");
         return;
     };
@@ -785,7 +765,7 @@ async fn fdb_tombstones_write_gc_and_isolate_grids() {
     //   * `load` rebuilds the tombstone set so recovery keeps the countdown,
     //   * the same (cell, entity) under two grids lives in disjoint rows, and
     //     `delete(grid, shard)` clears only its own grid's rows.
-    let Some(cluster) = fdb_cluster_file() else {
+    let Some(cluster) = support::fdb_cluster_file() else {
         eprintln!("skipping: ORRERY_FDB_CLUSTER_FILE not set and no .fdb-dev/fdb.cluster");
         return;
     };
@@ -911,7 +891,7 @@ async fn fdb_tombstones_write_gc_and_isolate_grids() {
 async fn fdb_tombstone_end_to_end_lifecycle() {
     // P-6 through the actor path: spawn → checkpoint → despawn → checkpoint
     // (marker written) → restore, with the grid carried end to end.
-    let Some(cluster) = fdb_cluster_file() else {
+    let Some(cluster) = support::fdb_cluster_file() else {
         eprintln!("skipping: ORRERY_FDB_CLUSTER_FILE not set and no .fdb-dev/fdb.cluster");
         return;
     };
@@ -1113,7 +1093,7 @@ fn sharded_config(dir: &std::path::Path, grid: GridId, shards: Vec<CellId>) -> R
 #[cfg(feature = "fdb")]
 #[tokio::test]
 async fn fdb_cross_shard_rekey_leaves_one_world_row() {
-    let Some(cluster) = fdb_cluster_file() else {
+    let Some(cluster) = support::fdb_cluster_file() else {
         eprintln!("skipping: ORRERY_FDB_CLUSTER_FILE not set and no .fdb-dev/fdb.cluster");
         return;
     };
@@ -1187,7 +1167,7 @@ async fn fdb_cross_shard_rekey_leaves_one_world_row() {
 #[cfg(feature = "fdb")]
 #[tokio::test]
 async fn fdb_rekey_then_restart_recovers_one_shard_only() {
-    let Some(cluster) = fdb_cluster_file() else {
+    let Some(cluster) = support::fdb_cluster_file() else {
         eprintln!("skipping: ORRERY_FDB_CLUSTER_FILE not set and no .fdb-dev/fdb.cluster");
         return;
     };
@@ -1276,7 +1256,7 @@ async fn fdb_rekey_then_restart_recovers_one_shard_only() {
 #[cfg(feature = "fdb")]
 #[tokio::test]
 async fn fdb_intra_shard_movement_leaves_one_world_row() {
-    let Some(cluster) = fdb_cluster_file() else {
+    let Some(cluster) = support::fdb_cluster_file() else {
         eprintln!("skipping: ORRERY_FDB_CLUSTER_FILE not set and no .fdb-dev/fdb.cluster");
         return;
     };
@@ -1361,7 +1341,7 @@ async fn fdb_intra_shard_movement_leaves_one_world_row() {
 #[cfg(feature = "fdb")]
 #[tokio::test]
 async fn fdb_split_carries_the_pending_row_clear_to_the_child() {
-    let Some(cluster) = fdb_cluster_file() else {
+    let Some(cluster) = support::fdb_cluster_file() else {
         eprintln!("skipping: ORRERY_FDB_CLUSTER_FILE not set and no .fdb-dev/fdb.cluster");
         return;
     };

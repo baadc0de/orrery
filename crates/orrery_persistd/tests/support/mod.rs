@@ -1,3 +1,9 @@
+#![allow(unexpected_cfgs)]
+// `orrery_persist_client/tests/gateway_live.rs` pulls this module in by
+// `#[path]`, and that crate declares no `fdb` feature — so the `fdb` gate
+// below, correct for this crate, reads as an unexpected cfg over there and
+// trips CI's `-D warnings`. Scoped to this shared support module rather than
+// to either crate.
 #![allow(
     dead_code,
     reason = "each integration-test binary uses a different subset of the shared fixture"
@@ -123,4 +129,22 @@ pub fn authority_config(peer: NodeId, grid: GridId, covered_cells: Vec<CellId>) 
         identity_health: available_identity_health(),
         ..GatewayConfig::default()
     }
+}
+
+/// The cluster file for this crate's FDB-gated tests, or `None` if none is
+/// configured.
+///
+/// One rule for every FDB-gated binary here, delegating to
+/// [`orrery_persistd::fdb::discover_cluster_file`] — which `orrery_seed`'s
+/// gates share, so the two crates' tiers cannot disagree about when they run.
+/// Copies of this guard had already drifted: one variant read only
+/// `ORRERY_FDB_CLUSTER_FILE` while the rest also walked up for a
+/// `.fdb-dev/fdb.cluster`.
+///
+/// Every handle opened from the returned path is bounded (see
+/// [`orrery_persistd::fdb`]), so a test pointed at a cluster that never
+/// answers fails inside the transaction budget rather than hanging the suite.
+#[cfg(feature = "fdb")]
+pub fn fdb_cluster_file() -> Option<String> {
+    orrery_persistd::fdb::discover_cluster_file()
 }
