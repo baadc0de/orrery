@@ -1,5 +1,7 @@
 //! Live FoundationDB coverage for durable lease rows.
 
+mod support;
+
 #[cfg(feature = "fdb")]
 use std::sync::atomic::{AtomicU32, Ordering};
 #[cfg(feature = "fdb")]
@@ -21,11 +23,6 @@ use orrery_persistd::{MemFenceStore, RuntimeConfig};
 use orrery_protocol::{CellId, GridId, Lease, LeaseFlags, LeaseId, PersistId, SeqPair};
 #[cfg(feature = "fdb")]
 use orrery_protocol::{ClaimKind, Epoch};
-
-#[cfg(feature = "fdb")]
-fn fdb_cluster_file() -> Option<String> {
-    std::env::var("ORRERY_FDB_CLUSTER_FILE").ok()
-}
 
 fn node(n: u8) -> orrery_protocol::NodeId {
     let mut seed = [0u8; 32];
@@ -187,7 +184,7 @@ async fn mem_migration_has_no_side_effect_when_fence_is_stale() {
 #[cfg(feature = "fdb")]
 #[tokio::test]
 async fn fdb_lease_actor_restore_and_expiry_are_durable() {
-    let Some(cluster) = fdb_cluster_file() else {
+    let Some(cluster) = support::fdb_cluster_file() else {
         eprintln!("skipping: ORRERY_FDB_CLUSTER_FILE is absent");
         return;
     };
@@ -319,7 +316,7 @@ async fn fdb_lease_actor_restore_and_expiry_are_durable() {
 #[tokio::test]
 async fn fdb_migration_is_atomic_for_exact_source_and_fence() {
     // Given: one reachable FDB-backed lease row at an exact source cell.
-    let Some(cluster) = fdb_cluster_file() else {
+    let Some(cluster) = support::fdb_cluster_file() else {
         eprintln!("skipping: ORRERY_FDB_CLUSTER_FILE is absent");
         return;
     };
@@ -467,7 +464,7 @@ async fn fdb_migration_is_atomic_for_exact_source_and_fence() {
 #[tokio::test]
 async fn fdb_migration_transaction_error_preserves_source_indexes() {
     // Given: a valid row whose reverse index is then made malformed.
-    let Some(cluster) = fdb_cluster_file() else {
+    let Some(cluster) = support::fdb_cluster_file() else {
         eprintln!("skipping: ORRERY_FDB_CLUSTER_FILE is absent");
         return;
     };

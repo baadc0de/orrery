@@ -124,3 +124,21 @@ pub fn authority_config(peer: NodeId, grid: GridId, covered_cells: Vec<CellId>) 
         ..GatewayConfig::default()
     }
 }
+
+/// The cluster file for this crate's FDB-gated tests, or `None` if none is
+/// configured.
+///
+/// One rule for every FDB-gated binary here, delegating to
+/// [`orrery_persistd::fdb::discover_cluster_file`] — which `orrery_seed`'s
+/// gates share, so the two crates' tiers cannot disagree about when they run.
+/// Copies of this guard had already drifted: one variant read only
+/// `ORRERY_FDB_CLUSTER_FILE` while the rest also walked up for a
+/// `.fdb-dev/fdb.cluster`.
+///
+/// Every handle opened from the returned path is bounded (see
+/// [`orrery_persistd::fdb`]), so a test pointed at a cluster that never
+/// answers fails inside the transaction budget rather than hanging the suite.
+#[cfg(feature = "fdb")]
+pub fn fdb_cluster_file() -> Option<String> {
+    orrery_persistd::fdb::discover_cluster_file()
+}

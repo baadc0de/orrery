@@ -30,21 +30,20 @@ use orrery_persistd::{FenceOutcome, FenceRow, FenceStatus, FenceStore};
 #[cfg(feature = "fdb")]
 use orrery_protocol::{CellId, Epoch, GridId, JournalRecord, Lsn, PersistId, RecordKind, Tick};
 
+/// The one cluster-file discovery rule, shared with persistd's FDB tier.
 #[cfg(feature = "fdb")]
 fn fdb_cluster_file() -> Option<String> {
-    if let Ok(path) = std::env::var("ORRERY_FDB_CLUSTER_FILE") {
-        return Some(path);
-    }
-    let mut dir = std::env::current_dir().ok()?;
-    loop {
-        let candidate = dir.join(".fdb-dev/fdb.cluster");
-        if candidate.exists() {
-            return Some(candidate.display().to_string());
-        }
-        if !dir.pop() {
-            return None;
-        }
-    }
+    orrery_persistd::fdb::discover_cluster_file()
+}
+
+/// Open a raw handle for the assertions that read rows back directly.
+///
+/// Goes through the seeder's bounded opener rather than
+/// `Database::from_path`, so a wedged cluster fails these tests instead of
+/// hanging the suite.
+#[cfg(feature = "fdb")]
+fn open_db(cluster: &str) -> Arc<Database> {
+    orrery_seed::fdb_open(cluster).expect("open bounded FDB handle")
 }
 
 #[cfg(feature = "fdb")]
@@ -242,8 +241,7 @@ async fn fdb_reseed_preserves_persist_ids() {
     let temp = write_temp_scenario("scenario", &with_grid(&source, GridId::new(9402), false));
     wipe_scenario(temp.path(), "demo-2026-08-13").await;
 
-    orrery_seed::fdb_network();
-    let db = Database::from_path(&fdb_cluster_file().unwrap()).expect("db");
+    let db = open_db(&fdb_cluster_file().unwrap());
     let first = run_seed(
         &["apply", "--profile", "demo", "--allow-opaque"],
         temp.path(),
@@ -305,8 +303,7 @@ async fn wipe_in_another_grid_preserves_seedmap_ids() {
     .await;
     maybe_assert_success(&first, "retained apply");
 
-    orrery_seed::fdb_network();
-    let db = Database::from_path(&cluster).expect("db");
+    let db = open_db(&cluster);
     let before: Vec<_> = scan_world_rows(&db, retained_grid)
         .await
         .expect("scan retained before wipe")
@@ -338,8 +335,7 @@ async fn block_grants_begin_after_the_fdb_allocator() {
         return;
     };
     let grid = GridId::new(9412);
-    orrery_seed::fdb_network();
-    let db = Database::from_path(&cluster).expect("db");
+    let db = open_db(&cluster);
     db.run(|trx, _| async move {
         let key = keyspace::pid_next_key(grid);
         trx.set(&key, &10_000u64.to_le_bytes());
@@ -376,8 +372,7 @@ async fn every_written_value_carries_the_live_tag() {
     let output = run_seed(&["apply", "--allow-opaque"], temp.path()).await;
     maybe_assert_success(&output, "smoke apply");
 
-    orrery_seed::fdb_network();
-    let db = Database::from_path(&fdb_cluster_file().unwrap()).expect("db");
+    let db = open_db(&fdb_cluster_file().unwrap());
     let rows = scan_world_rows(&db, GridId::new(9401))
         .await
         .expect("scan world");
@@ -437,8 +432,7 @@ async fn fdb_content_version_roundtrips() {
     .await;
     maybe_assert_success(&output, "demo apply");
 
-    orrery_seed::fdb_network();
-    let db = Database::from_path(&fdb_cluster_file().unwrap()).expect("db");
+    let db = open_db(&fdb_cluster_file().unwrap());
     let version = read_content_version(&db).await.expect("content version");
     assert_eq!(version.content_build, "demo-2026-08-13");
     assert!(!version.manifest_digest.is_empty());
@@ -451,8 +445,7 @@ async fn wipe_leaves_ckpt_rows_intact() {
         return;
     };
     let _ = cluster;
-    orrery_seed::fdb_network();
-    let db = Database::from_path(&fdb_cluster_file().unwrap()).expect("db");
+    let db = open_db(&fdb_cluster_file().unwrap());
     let store = Arc::new(FdbCheckpointStore::connect(&fdb_cluster_file().unwrap()).expect("store"));
     let store: Arc<dyn CheckpointStore> = store.clone();
     let dir = tempfile::tempdir().expect("tempdir");
