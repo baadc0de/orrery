@@ -72,16 +72,40 @@ Cosmetic state (particles, ragdolls, animation phase) is never snapshotted and n
 **Budget guard.** The D8 budget: a predicted-subset step must stay ≈ **1 ms**; worst-case resim is 9 ticks ≈ 9 ms, amortized over at most **2 render frames**. SnapNet's arithmetic shows why a guard is mandatory: a 60 Hz game absorbing 300 ms of rollback leaves ~1.1 ms/frame of simulation budget, and exceeding it triggers the resimulation "spiral of death" — resim makes you late, lateness makes the next resim longer ([SnapNet](https://www.snapnet.dev/blog/netcode-architectures-part-2-rollback/)). The guard in `orrery_predict`:
 
 ```rust
-/// Sketch — orrery_predict
+/// Landed — orrery_predict::budget
 pub struct RollbackBudget {
-    /// EWMA of measured cost of one predicted-subset fixed step.
-    pub step_cost_ms: f32,          // target ≈ 1.0
-    /// Max resim milliseconds spent per render frame.
-    pub max_resim_ms_per_frame: f32, // default 5.0
-    /// Max render frames a single resim may be spread over.
-    pub max_amortize_frames: u8,     // default 2 (D8)
+    /// EWMA of the measured cost of one predicted-subset fixed step,
+    /// seeded at D8's ≈ 1 ms target.
+    pub step_cost: Duration,
+    /// Max resim time spent on one render frame. Default 5 ms.
+    pub max_resim_per_frame: Duration,
+    /// Max render frames a single resim may be spread over. Default 2 (D8).
+    pub max_amortize_frames: u8,
+    /// Reciprocal weight of a new cost sample. Integer, so the EWMA cannot
+    /// drift between platforms.
+    pub cost_smoothing: u32,
+    /// How long the hysteresis cap must go unprovoked before release. 5 s.
+    pub recovery_period: Duration,
+}
+
+/// The ladder's answer. Every variant is affordable by construction, and
+/// `ticks_now` is always how many fixed steps to run this frame.
+pub enum ResimPlan {
+    Immediate { ticks_now: u16 },
+    Amortize { frames: u8, ticks_now: u16 },
+    Evict { demote: u16, ticks_now: u16 },
+    SnapOwnPlayer,
+}
+
+impl RollbackBudget {
+    pub fn observe_step(&mut self, measured: Duration);
+    pub fn observe_clean_frame(&mut self, frame_time: Duration);
+    pub fn plan(&mut self, pending_ticks: u16, predicted_len: u16) -> ResimPlan;
+    pub fn predicted_cap(&self) -> Option<u16>;
 }
 ```
+
+The guard cannot gate lightyear's replay directly — lightyear owns the loop and does not ask. What it does instead is set the bound: `RollbackPolicy::max_rollback_ticks` is the number beyond which lightyear *ignores* a rollback request, and an ignored request is exactly this section's "beyond the window, snap + reconcile". So the ladder is applied by narrowing that bound when the measured step cost says a full window will not fit, and restoring it on the first clean frame. `ResimPlan::Evict`'s `demote` count is the interest-set selector's input; the *which* is `PredictPriority` (own player > strong-owned > weak-authority > interaction), which the guard orders but does not choose.
 
 Degradation ladder, evaluated before each resim:
 
@@ -263,20 +287,59 @@ Replicated continuous state is quantized **identically on writer and reader befo
 Every rollback comparison already computes `|predicted − authoritative|` per component per entity. `orrery_predict` keeps these residuals instead of discarding them:
 
 ```rust
-/// Sketch — orrery_predict
-pub struct ReconciliationMonitor {
-    /// Per (remote authority, entity): EWMA of position/velocity error,
-    /// rollback frequency, snap-reconcile count, per D16 bands.
-    pub tracks: HashMap<(NodeId, PersistId), ErrorTrack>,
+/// Landed — orrery_predict::monitor
+pub struct TrackKey { pub authority: NodeId, pub entity: PersistId }
+
+pub struct ErrorTrack {
+    /// Integer EWMAs on the quantization lattice: millimetres and mm/s.
+    pub pos_ewma_mm: i64,
+    pub vel_ewma_mms: i64,
+    /// The open out-of-band run, if any.
+    pub violation_start: Option<Tick>,
+    pub violation_ticks: u32,
+    /// Corrections attributed to this authority this witness epoch.
+    pub rollbacks: u32,
+    pub snaps: u32,
+    pub last_tick: Option<Tick>,
 }
+
 pub enum MonitorSignal {
-    /// ε_pos (1 cm) / ε_vel (1 cm/s) exceeded continuously ≥ 250 ms.
-    SustainedToleranceViolation { window: Range<Tick> },
+    /// ε_pos (1 cm) / ε_vel (1 cm/s) exceeded continuously ≥ 250 ms,
+    /// or one tick ≥ 8× the band (no sustain needed).
+    SustainedToleranceViolation {
+        key: TrackKey, window: Range<Tick>, confidence: WitnessConfidence,
+    },
     /// Rollback storm against one authority: mispredict cause is
     /// remote, not local jitter (other authorities are clean).
-    AnomalousCorrectionPattern,
+    AnomalousCorrectionPattern {
+        authority: NodeId, rollbacks: u32, baseline: u32,
+        confidence: WitnessConfidence,
+    },
+}
+
+pub enum WitnessConfidence { Full, Reduced(DegradedReason) }
+pub enum DegradedReason { HighLatencyBand, BudgetEviction }
+
+impl ReconciliationMonitor {
+    /// Returns a signal on the tick a violation first qualifies, and only
+    /// on that tick — an open run does not re-fire.
+    pub fn record_residual(
+        &mut self, key: TrackKey, tick: Tick, pos_err_mm: i64, vel_err_mms: i64,
+    ) -> Option<MonitorSignal>;
+    pub fn record_rollback(&mut self, key: TrackKey);
+    pub fn record_snap(&mut self, key: TrackKey);
+    pub fn scan_correction_pattern(&self) -> Option<MonitorSignal>;
+    pub fn degrade(&mut self, reason: DegradedReason);
+    pub fn reset_counters(&mut self);
+    pub fn retire_stale(&mut self, before: Tick);
 }
 ```
+
+Every number in the monitor is an integer over the quantization lattice, including the EWMAs, for the reason the tolerance comparator in `orrery_core` is: a comparator that used floats could disagree between the peer that reports and the adjudicator that decides, which would make verdicts platform-dependent. The EWMA moves at least one lattice unit per sample, because plain integer division stalls once the gap is under the smoothing divisor and would leave every sustained deviation under-reported by up to `n − 1` millimetres — permanently, in the direction that favours the accused. A fresh track is seeded from its first sample rather than climbing from zero, because the case that matters most (a hard snap on the tick an entity enters the predicted set) *is* a first sample.
+
+The bands are mirrored from `orrery_core::Tolerance` rather than imported: [10-crates.md](10-crates.md)'s layering rule 2 does not put `orrery_predict` above `orrery_core`. Field names match exactly, so `orrery_witness` — which depends on both — converts mechanically.
+
+**Where the residual comes from.** lightyear 0.29 fires no event, trigger or observer on rollback, and its `PredictionMetrics` counts rollbacks globally with no entity attribution. The per-entity residual arrives instead as `VisualCorrection<D>`, which lightyear adds to a mispredicted entity after its `RollbackSystems::EndRollback` and which carries the error in the component's own type. `orrery_predict` reads it on `Added` — never on a plain query, because the correction decays over several frames and sampling it every frame would turn one mispredict into a sustained run, manufacturing the violation the monitor exists to detect honestly. Attribution comes from a `PredictedBy { authority, persist_id }` component that `orrery_authority` populates; a correction on an entity with no authority recorded is discarded rather than attributed to a guess.
 
 A `MonitorSignal` is exactly the D10 step-1 "prediction *is* the witness" trigger: `orrery_witness` consumes it, requests the disputed window's signed input-log segment, and escalates per the protocol in [07-witnessing.md](07-witnessing.md) (replay, discrepancy report, adjudication — window capped at 3 s / 180 ticks). Two design consequences flow back into this document: residuals must be computed on quantized state against tolerance bands (so honest packet loss and float drift do not accuse anyone — the "multiple rollbacks" thresholding of D10), and the monitor tags its own confidence — a peer in the 250+ ms band, or one that recently evicted entities under the budget guard (§3), reports with reduced witness weight.
 
@@ -304,6 +367,39 @@ D16 defaults are the fast-action (R10) configuration. The parameters are one cou
 | Step budget × window ≤ 2 render frames | `step_ms × window ≤ 2 × frame_ms` | 1 ms × 9 ≤ 33 ms | 2 ms × 5 | 4 ms × 3 |
 
 Guidance: lowering the *send* rate is the cheapest bandwidth lever and only costs interpolation delay; lowering the *sim* tick coarsens rewind granularity and hit fidelity — slow-paced games should take that trade, fast games never should. The 250 ms presentation cutoff (§8) scales with the hit rewind cap. The witness tolerance bands (ε_pos/ε_vel) generally *loosen* for slower games, not tighten — fewer, larger movements per tick mean honest error grows with tick length.
+
+## 13. Implementation status: what lightyear 0.29 actually supplies
+
+Validated against the pinned stack (Bevy 0.19.1, lightyear 0.29.0, bevy_replicon 0.42.1 vendored) on 2026-08-16. The headline is that **D14's pin holds**: lightyear 0.29 builds against Bevy 0.19 unmodified, with no bump, no fork and no patch to lightyear itself. R-1's build-failure mode has not arrived.
+
+Two things did arrive, and both matter more than a compile error would have.
+
+### 13.1 The D16-to-lightyear knob map
+
+Configured by `orrery_predict::wiring`, the only module in the workspace that names a lightyear type. Recording the mapping is most of the value: it is not obvious, and it moved in 0.29.
+
+| D16 parameter | lightyear 0.29 | Note |
+|---|---|---|
+| 60 Hz sim tick | `ClientPlugins { tick_duration }` → `Time<Fixed>` + `TickDuration` | lightyear's own default is also 60 Hz |
+| 20 Hz send | `ReplicationMetadata::new(50 ms)` | **App-global in 0.29.** `ReplicationSender` became a unit marker with no interval of its own; leaving the default sends every frame a fixed tick ran |
+| 9-tick rollback window | `RollbackPolicy::max_rollback_ticks` **and** `InputDelayConfig::maximum_predicted_ticks` | The effective bound is the *minimum* of the two; writing only one lets the other's default silently win. lightyear's defaults are 20 and 100 |
+| 100 ms interp buffer | `InterpolationConfig::min_delay`, with `send_interval_ratio` zeroed | lightyear defaults to `send_interval × 1.7`, which adapts to the peer's observed rate — right for one server, wrong for many authorities at different rates. §5's jitter estimator needs a fixed baseline to widen from |
+| 20-tick input redundancy | `InputConfig::packet_redundancy` | Unit change: lightyear counts **packets**, D16 counts **ticks**. At 60 Hz over a 20 Hz send that is 3 ticks per packet, so 20 ticks is **7 packets**. Writing 20 would carry ~1 s of input history per datagram |
+| — | `InputDelayConfig::maximum_input_delay_before_prediction: 0` | lightyear defaults to 3 ticks of input delay to avoid rollbacks. Orrery declines the trade: the own player is locally authoritative and RTT-free by construction (§2 case 1), so buying fewer rollbacks with input latency would spend the one thing this architecture gives away free |
+
+`PredictConfig::validate` checks §12's coupling invariants and the plugin refuses to build on a defect, because a partial retune produces a game that *runs* and is quietly wrong.
+
+**One workspace consequence.** `lightyear_replication` and `lightyear_prediction` depend on `bevy_replicon` from crates.io; Orrery depends on the vendored fork. Unpatched, cargo resolves both, and two copies of replicon are two distinct component types — `orrery_spatial`'s visibility mapping and lightyear's replication would talk past each other rather than fail to compile. The root manifest carries a `[patch.crates-io]` collapsing them onto the fork, which is 0.42.1 plus the `server::uplink` exposure (D11) and therefore satisfies lightyear's `^0.42.1`.
+
+### 13.2 What is missing, and what it implies for R-1/R-2
+
+**Per-entity authority does not work.** Not "is in flux" — `lightyear_replication`'s own module documentation states it: *"Authority is currently not working since replicon only supports server to client replication"* (`lightyear_replication-0.29.0/src/lib.rs:67`). `HasAuthority`, `AuthorityBroker`, `GiveAuthority` and `RequestAuthority` exist as types with no working machinery behind them.
+
+This is D4's one substantive gap and it lands squarely on Orrery's premise: [ADR-0008](adr/0008-prediction-rollback-interpolation.md) is *per-entity* Gambetta reconciliation, and [ADR-0007](adr/0007-authority-and-leases.md) is a lease protocol on top of it. The consequence is a division of labour rather than a blocker — lightyear supplies prediction *mechanics* (history rings, replay schedule, correction smoothing, interpolation) and `orrery_authority` supplies the authority model in full, which is what it was already doing. Orrery was never going to get its lease semantics from upstream; what changes is that the upstream contribution named in [10-crates.md](10-crates.md)'s upstreaming plan is now a larger piece of work than "hardening", and R-2's plan B is correspondingly closer at hand.
+
+**There is no rollback signal.** No event, trigger or observer; `PredictionMetrics` counts rollbacks with no entity attribution. §10 describes the monitor as reading residuals the rollback comparison already computed, and that is still what happens — but through `VisualCorrection<D>` on the entity, not through a callback. The practical cost is that a game must register lightyear correction for a component before that component's residuals can become witness evidence; `AppReconciliationExt::track_reconciliation::<D>()` is the hook, and it is silent (the query never matches) if correction was not registered.
+
+**Rollback needs a live connection to exercise.** lightyear gates its `check_rollback` on `NetworkingMetadata` reporting a connected client or P2P topology, and on `LocalTimelineSync` having converged. Everything installs and configures in a headless `App`, and everything between lightyear's signal and Orrery's evidence is tested there; a genuine rollback is a two-peer harness, which is P3's island gate.
 
 ## Cross-references
 
