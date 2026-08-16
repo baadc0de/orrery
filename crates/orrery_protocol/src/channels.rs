@@ -73,6 +73,70 @@ pub fn untag(payload: &[u8]) -> Option<(Channel, &[u8])> {
     Some((channel, rest))
 }
 
+/// Sub-tag marking a state datagram as replication traffic.
+///
+/// The complement of [`TAG_WITNESS`]. Both kinds share `Channel::State`, so
+/// *both* have to be positively identified: tagging only one leaves the other
+/// as "everything else", and a receiver still hands foreign bytes to a decoder
+/// that reads length prefixes out of them.
+pub const TAG_REPLICATION: u8 = 0xE6;
+
+/// Encode replication traffic as a state datagram.
+pub fn encode_replication<T: Serialize>(msg: &T) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(64);
+    payload.push(TAG_REPLICATION);
+    payload.extend_from_slice(&postcard::to_stdvec(msg).expect("wire message is serializable"));
+    tag(Channel::State, &payload)
+}
+
+/// Decode replication traffic from a state datagram.
+pub fn decode_replication<T: DeserializeOwned>(payload: &[u8]) -> Option<T> {
+    decode_sub_tagged(payload, TAG_REPLICATION)
+}
+
+/// Shared body of the sub-tagged state decoders.
+fn decode_sub_tagged<T: DeserializeOwned>(payload: &[u8], expect: u8) -> Option<T> {
+    let (channel, rest) = untag(payload)?;
+    if channel != Channel::State {
+        return None;
+    }
+    let (marker, body) = rest.split_first()?;
+    if *marker != expect {
+        return None;
+    }
+    postcard::from_bytes(body).ok()
+}
+
+/// Sub-tag marking a state datagram as verifiable-core traffic.
+///
+/// Replication payloads and witness records share `Channel::State` — docs/03
+/// §5.3 has log records riding *in the same datagrams* at low priority — so the
+/// channel tag alone cannot say which is which. Without a discriminator every
+/// receiver attempts to parse every replication datagram as a `LogFrame`, and
+/// postcard reads a length prefix out of unrelated bytes before it can fail:
+/// slow at best, and an allocation the sender chooses at worst.
+///
+/// Its complement is [`TAG_REPLICATION`]: both kinds are tagged, so a receiver
+/// never hands foreign bytes to a decoder that would read a length prefix out
+/// of them.
+pub const TAG_WITNESS: u8 = 0xE7;
+
+/// Encode verifiable-core traffic as a state datagram.
+pub fn encode_witness<T: Serialize>(msg: &T) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(64);
+    payload.push(TAG_WITNESS);
+    payload.extend_from_slice(&postcard::to_stdvec(msg).expect("wire message is serializable"));
+    tag(Channel::State, &payload)
+}
+
+/// Decode verifiable-core traffic from a state datagram.
+///
+/// Returns `None` for anything not carrying [`TAG_WITNESS`], *before* handing
+/// bytes to postcard — which is the point.
+pub fn decode_witness<T: DeserializeOwned>(payload: &[u8]) -> Option<T> {
+    decode_sub_tagged(payload, TAG_WITNESS)
+}
+
 /// Encode a message as a **state** datagram: `[TAG_STATE][postcard]`.
 ///
 /// Used for bulk diffs and their acks (D11 §2.1). Both directions share this

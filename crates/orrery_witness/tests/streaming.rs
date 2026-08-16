@@ -28,7 +28,9 @@ use orrery_protocol::{
     StateClaim, Tick, UniverseSeed,
 };
 use orrery_witness::plugin::{PublishFrame, WitnessLinkCounters, WitnessState};
-use orrery_witness::{Watch, Witness, WitnessConfig, WitnessPlugin, WitnessSignal, Witnessed};
+use orrery_witness::{
+    Watch, Witness, WitnessConfig, WitnessPlugin, WitnessSet, WitnessSignal, Witnessed,
+};
 
 // ── A ruleset small enough to keep this test about transport ──────────────
 
@@ -454,7 +456,7 @@ fn ask_for_range(app: &mut App, from: u64, to: u64) {
         .write(SendPacket {
             to: subject_key().public(),
             channel: Channel::Control,
-            payload: bytes::Bytes::from(orrery_net::channels::encode_datagram(
+            payload: bytes::Bytes::from(orrery_net::channels::encode_witness(
                 &orrery_protocol::WitnessMsg::RangeRequest(orrery_protocol::LogRangeRequest {
                     entity: ENTITY,
                     chain_epoch: 0,
@@ -463,6 +465,58 @@ fn ask_for_range(app: &mut App, from: u64, to: u64) {
                 }),
             )),
         });
+}
+
+#[test]
+fn the_log_goes_to_the_witness_set_not_the_whole_island() {
+    // docs/03-replication.md §5.3 bounds witness traffic to the cell-epoch
+    // witness set — never the interest set. Streaming to everyone is what makes
+    // "bounded by construction" untrue: ~20–30 kb/s per link is negligible
+    // across seven and ruinous across thirty-one.
+    use orrery_witness::plugin::{witness_links, MAX_WITNESS_LINKS};
+
+    let node = |n: u8| {
+        let mut seed = [0u8; 32];
+        seed[0] = n;
+        iroh_base::SecretKey::from_bytes(&seed).public()
+    };
+    let crowd: Vec<PeerEntry> = (1..=20u8)
+        .map(|n| PeerEntry {
+            node: node(n),
+            cells: Vec::new(),
+        })
+        .collect();
+    let island = IslandMembership {
+        island: Some(IslandId::new(1)),
+        epoch: 1,
+        peers: crowd,
+        regime: TopologyRegime::Mesh,
+        source: orrery_net::IslandSource::Coordinator,
+    };
+
+    let links = witness_links(&WitnessSet::default(), &island);
+    assert_eq!(links.len(), MAX_WITNESS_LINKS, "the fallback is capped");
+
+    // Deterministic: island rosters arrive in whatever order the coordinator
+    // built them, and an unsorted truncation would change who witnesses this
+    // peer every time the manifest reordered.
+    let mut shuffled = island.peers.clone();
+    shuffled.reverse();
+    let reordered = IslandMembership {
+        peers: shuffled,
+        ..island.clone()
+    };
+    assert_eq!(links, witness_links(&WitnessSet::default(), &reordered));
+
+    // A configured set wins outright — that is what the coordinator will seed.
+    let seeded = WitnessSet {
+        members: vec![node(3), node(9)],
+    };
+    assert_eq!(
+        witness_links(&seeded, &island),
+        vec![node(3), node(9)],
+        "a seeded witness set is used verbatim, uncapped and unsorted"
+    );
 }
 
 #[test]

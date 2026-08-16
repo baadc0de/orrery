@@ -25,6 +25,7 @@ bevy_app = { workspace = true }
 bevy_ecs = { workspace = true }
 bevy_math = { workspace = true }
 bevy_reflect = { workspace = true }
+bevy_time = { workspace = true }
 bevy_replicon = { workspace = true }
 glam = { workspace = true }
 big_space = { workspace = true, optional = true }
