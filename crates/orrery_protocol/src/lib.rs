@@ -20,6 +20,7 @@ pub mod coord;
 mod gateway;
 mod grid;
 mod identity;
+pub mod metrics;
 mod persist;
 mod protocol;
 mod verifiable;
