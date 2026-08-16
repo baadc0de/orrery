@@ -43,6 +43,48 @@ env:
   CARGO_INCREMENTAL: 0
 
 jobs:
+  # Which runner the heavy Linux jobs get, decided per event.
+  #
+  # `orrery-hel1-1` is a self-hosted box with a persistent `target/` and a
+  # shared sccache, which is worth 5-9 minutes a run — but this repository is
+  # **public**, and a self-hosted runner is not ephemeral. A pull request from
+  # a fork carries its own `build.rs` and its own test code, and running
+  # `cargo test` on it is arbitrary code execution on hardware that survives
+  # the job.
+  #
+  # So fork pull requests go to GitHub-hosted runners and only same-repository
+  # events reach the box.
+  #
+  # **This guard is not the security boundary, and it is important not to
+  # mistake it for one.** A `pull_request` workflow runs from the merge of the
+  # head and base branches, so a fork can edit *this file* along with the code.
+  # What actually gates a fork is the repository's Actions setting, which is
+  # now "require approval for all outside collaborators": no fork workflow runs
+  # at all until someone approves it. The guard below is defence in depth for
+  # the case where a fork PR is approved so it can be reviewed — approving it
+  # should not silently mean "run this on my hardware".
+  #
+  # The third layer is the box itself: the runner is an unprivileged `ci` user
+  # with no sudo and no docker group, so the blast radius of a mistake at the
+  # first two layers stays inside one home directory.
+  runner:
+    name: pick runner
+    runs-on: ubuntu-latest
+    outputs:
+      labels: ${{ steps.pick.outputs.labels }}
+    steps:
+      - id: pick
+        env:
+          SAME_REPO: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+        run: |
+          if [[ "$SAME_REPO" == "true" ]]; then
+            echo 'labels=["self-hosted","orrery-hel1"]' >> "$GITHUB_OUTPUT"
+            echo "self-hosted: same-repository ${{ github.event_name }}"
+          else
+            echo 'labels=["ubuntu-latest"]' >> "$GITHUB_OUTPUT"
+            echo "::notice::fork pull request — running on GitHub-hosted runners"
+          fi
+
   fmt:
     name: rustfmt
     runs-on: ubuntu-latest
@@ -54,11 +96,21 @@ jobs:
 
   clippy:
     name: clippy
-    runs-on: ubuntu-latest
+    needs: runner
+    runs-on: ${{ fromJSON(needs.runner.outputs.labels) }}
+    # A self-hosted job queues forever if the box is down; fail instead.
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
       - name: Install the pinned toolchain
         run: rustup show active-toolchain || rustup toolchain install
+      - name: Route rustc through the shared sccache
+        # The workflow env clears RUSTC_WRAPPER because a GitHub runner is
+        # ephemeral and has nothing to hit. The self-hosted box is the opposite
+        # case: /var/cache/sccache is shared with the dev checkout on the same
+        # machine, so a CI build starts warm off whatever was compiled there.
+        if: runner.environment == 'self-hosted'
+        run: echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
       # Four first-party crates take `bevy = { workspace = true }` with default
       # features, which pulls bevy_winit and its display/audio stack, so three
       # build scripts probe pkg-config: alsa-sys, libudev-sys and wayland-sys.
@@ -67,6 +119,9 @@ jobs:
       # Only this job and `test` need them — the determinism matrix and both
       # nightly gates build Bevy-free crates, which is why those legs stay cheap.
       - name: Install Bevy's Linux build dependencies
+        # Pre-installed on the self-hosted box, and the `ci` user has no sudo
+        # by design — see the `runner` job.
+        if: runner.environment == 'github-hosted'
         run: |
           sudo apt-get update
           sudo apt-get install --no-install-recommends -y \
@@ -74,6 +129,9 @@ jobs:
             libwayland-dev libxkbcommon-dev
 
       - uses: actions/cache@v6
+        # The self-hosted box keeps its target/ between runs; a cache
+        # round-trip would cost more than it saves there.
+        if: runner.environment == 'github-hosted'
         with:
           path: |
             ~/.cargo/registry/index
@@ -112,6 +170,8 @@ jobs:
       # input. No server here — running the fdb tests against a real cluster is
       # nightly.yml's job.
       - name: Install the FoundationDB client
+        # foundationdb-clients is already installed on the box.
+        if: runner.environment == 'github-hosted'
         uses: ./.github/actions/foundationdb
 
       - name: clippy (fdb feature)
@@ -122,12 +182,25 @@ jobs:
 
   gates:
     name: static gates
-    runs-on: ubuntu-latest
+    needs: runner
+    runs-on: ${{ fromJSON(needs.runner.outputs.labels) }}
+    # A self-hosted job queues forever if the box is down; fail instead.
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
       - name: Install the pinned toolchain
         run: rustup show active-toolchain || rustup toolchain install
+      - name: Route rustc through the shared sccache
+        # The workflow env clears RUSTC_WRAPPER because a GitHub runner is
+        # ephemeral and has nothing to hit. The self-hosted box is the opposite
+        # case: /var/cache/sccache is shared with the dev checkout on the same
+        # machine, so a CI build starts warm off whatever was compiled there.
+        if: runner.environment == 'self-hosted'
+        run: echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
       - uses: actions/cache@v6
+        # The self-hosted box keeps its target/ between runs; a cache
+        # round-trip would cost more than it saves there.
+        if: runner.environment == 'github-hosted'
         with:
           path: |
             ~/.cargo/registry/index
@@ -168,12 +241,25 @@ jobs:
 
   test:
     name: workspace tests
-    runs-on: ubuntu-latest
+    needs: runner
+    runs-on: ${{ fromJSON(needs.runner.outputs.labels) }}
+    # A self-hosted job queues forever if the box is down; fail instead.
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
       - name: Install the pinned toolchain
         run: rustup show active-toolchain || rustup toolchain install
+      - name: Route rustc through the shared sccache
+        # The workflow env clears RUSTC_WRAPPER because a GitHub runner is
+        # ephemeral and has nothing to hit. The self-hosted box is the opposite
+        # case: /var/cache/sccache is shared with the dev checkout on the same
+        # machine, so a CI build starts warm off whatever was compiled there.
+        if: runner.environment == 'self-hosted'
+        run: echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
       - name: Install Bevy's Linux build dependencies
+        # Pre-installed on the self-hosted box, and the `ci` user has no sudo
+        # by design — see the `runner` job.
+        if: runner.environment == 'github-hosted'
         run: |
           sudo apt-get update
           sudo apt-get install --no-install-recommends -y \
@@ -181,6 +267,9 @@ jobs:
             libwayland-dev libxkbcommon-dev
 
       - uses: actions/cache@v6
+        # The self-hosted box keeps its target/ between runs; a cache
+        # round-trip would cost more than it saves there.
+        if: runner.environment == 'github-hosted'
         with:
           path: |
             ~/.cargo/registry/index
