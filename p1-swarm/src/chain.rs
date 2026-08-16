@@ -7,6 +7,9 @@
 //! logged and what was executed for a cheat to live in.
 //!
 //! The claim cadence is 2 Hz (every 30 ticks at 60 Hz), matching docs/06 §6.
+//! The *frame* cadence is not a constant here: it is derived from the share of
+//! the upload budget the witness lane may spend, because that is the thing it
+//! was actually failing (docs/03-replication.md §5.3a).
 
 use orrery_conformance::{Body, Command};
 use orrery_core::log::{claim_hash, fold, sign_claim, sign_frame, HeadTransition};
@@ -18,8 +21,26 @@ use orrery_protocol::{
 
 /// Ticks between state claims — 2 Hz at the 60 Hz sim rate (docs/06 §6).
 pub const CLAIM_EVERY: u64 = 30;
-/// Ticks a frame covers — one 20 Hz send.
-pub const FRAME_TICKS: u16 = 3;
+
+/// Ticks a frame covers — **derived from the lane budget, not from the send
+/// rate** (docs/03-replication.md §5.3a).
+///
+/// This used to be 3: one frame per 20 Hz send, so the chain a witness follows
+/// lined up with the datagrams it already received. That alignment bought
+/// nothing a witness uses and cost ~250 bytes of per-frame fixed overhead every
+/// 50 ms, which at 32 peers put the lane at 384 kb/s against §5.3's 0.15–0.2
+/// Mbps and took the peer over its 1 Mbps ceiling. See the module docs of
+/// `p1-swarm` for the measurement, and `orrery_witness::plugin` for the
+/// arithmetic — at the D16 defaults it lands on **10 ticks, 6 Hz**.
+pub const FRAME_TICKS: u16 = orrery_witness::plugin::frame_interval_ticks(
+    1_000_000,
+    orrery_witness::plugin::MAX_WITNESS_LINKS,
+    TICK_HZ,
+    CLAIM_EVERY,
+);
+
+/// The sim rate the cadence is derived against (D16).
+const TICK_HZ: u64 = 60;
 
 /// One bot's authored chain.
 pub struct Chain {

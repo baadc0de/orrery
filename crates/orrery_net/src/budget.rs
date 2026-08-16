@@ -18,11 +18,12 @@
 //!
 //! # What this enforces, and what it does not
 //!
-//! It enforces the *ceiling*: over budget, [`Channel::State`] packets are shed
-//! and [`Channel::Control`] packets always pass. That asymmetry is the same one
-//! gap repair rests on — state loss is expected and repaired, while shedding a
-//! repair or a lease operation turns one dropped datagram into a permanent
-//! hole.
+//! It enforces the *ceiling*: over budget, [`Lane::Replication`] packets are
+//! shed and [`Lane::Control`] and [`Lane::Witness`] packets always pass. That
+//! asymmetry is the same one gap repair rests on — a replication update lost is
+//! superseded 50 ms later by the next, while shedding a repair, a lease
+//! operation, or a link in a hash chain turns one dropped datagram into a
+//! permanent hole. [`is_sheddable`] carries the measurement.
 //!
 //! It does **not** decide *which* state to drop. docs/03-replication.md §9.3
 //! specifies shedding by relevance class from the bottom, apportioned by a
@@ -38,7 +39,7 @@ use core::time::Duration;
 
 use bevy_ecs::prelude::*;
 
-use crate::channels::Channel;
+use crate::channels::{untag, Channel, TAG_WITNESS};
 use orrery_protocol::NodeId;
 
 /// Per-datagram wire overhead: IP+UDP 28 B, QUIC short header + AEAD ≈ 32 B.
@@ -296,11 +297,12 @@ pub struct UploadMeter {
     pub shed: u64,
     /// Bytes shed for want of budget.
     pub shed_bytes: u64,
-    /// Control packets sent while over budget — never shed, always counted.
+    /// Unsheddable packets sent while over budget — control and witness alike
+    /// (see [`is_sheddable`]) — never shed, always counted.
     ///
     /// A non-zero value here with `shed` climbing is the honest picture of an
-    /// oversubscribed peer: the reliable lane is still being paid for, so the
-    /// overrun is real rather than an artefact of the backstop.
+    /// oversubscribed peer: the lanes that cannot be shed are still being paid
+    /// for, so the overrun is real rather than an artefact of the backstop.
     pub control_over_budget: u64,
     /// Whether the last send pass was over budget.
     ///
@@ -308,6 +310,12 @@ pub struct UploadMeter {
     /// island's links is a promotion signal alongside raw population, so this is
     /// reported rather than merely acted on.
     pub oversubscribed: bool,
+    /// What each lane spent, cumulatively over the session.
+    ///
+    /// Cumulative rather than windowed because the question it answers is a
+    /// budgeting one — *what share of a peer's uplink does witnessing cost?* —
+    /// and that is a property of the run, not of the last second of it.
+    pub lanes: LaneTally,
 }
 
 impl UploadMeter {
@@ -319,12 +327,34 @@ impl UploadMeter {
 
     /// Charge an already-costed send of `wire` bytes to `peer` at `now`.
     ///
-    /// The two lanes cost differently — see [`stream_wire_bytes`] — so the
-    /// caller that knows which lane it is on computes the figure and this
+    /// The two channels cost differently — see [`stream_wire_bytes`] — so the
+    /// caller that knows which one it is on computes the figure and this
     /// records it.
+    ///
+    /// Charged to [`Lane::Replication`]. Callers that know the lane use
+    /// [`Self::charge`]; this exists for the ones that only have a byte count,
+    /// and it charges the lane the budget exists to protect rather than
+    /// silently discounting an unattributed send.
     pub fn record_wire(&mut self, budget: UploadBudget, now: Duration, peer: NodeId, wire: u64) {
+        self.charge(budget, now, peer, Lane::Replication, wire);
+    }
+
+    /// Charge a send of `wire` bytes on `lane` to `peer` at `now`.
+    ///
+    /// The rate meters do not care which lane a byte came from — the ≤ 1 Mbps
+    /// ceiling is over the whole uplink — but the budget *decision* does, which
+    /// is why the tally is kept beside them rather than instead of them.
+    pub fn charge(
+        &mut self,
+        budget: UploadBudget,
+        now: Duration,
+        peer: NodeId,
+        lane: Lane,
+        wire: u64,
+    ) {
         self.total_meter(budget).record(now, wire);
         self.peer_meter(budget, peer).record(now, wire);
+        self.lanes.charge(lane, wire);
     }
 
     /// Whether a packet of `payload` bytes would exceed the budget now.
@@ -372,16 +402,119 @@ impl UploadMeter {
     }
 }
 
-/// Whether a packet on `channel` may be shed when the budget is spent.
+/// Whether a packet on `lane` may be shed when the budget is spent.
 ///
-/// State only. Shedding a control packet would turn one dropped datagram into a
-/// permanent hole — a gap repair that never arrives is indistinguishable from an
-/// authority refusing to answer, and a lease operation that never arrives is a
-/// stall rather than a retry. Loss on the state lane is expected and already
-/// has a repair path.
+/// Replication only, and the two exclusions are the same argument at different
+/// strengths: **a packet whose loss is repaired by the next one is cheap to
+/// drop, and a packet whose loss opens a hole is not.**
+///
+/// A control packet was never sheddable — a gap repair that never arrives is
+/// indistinguishable from an authority refusing to answer, and a lease
+/// operation that never arrives is a stall rather than a retry.
+///
+/// [`Lane::Witness`] joined it on measurement. A witness frame is not a
+/// snapshot that the next send supersedes; it is a link in a hash chain, and
+/// dropping one converts a *sheddable* 316-byte datagram into an
+/// *unsheddable* `LogRangeRequest` and its response on the control lane. So
+/// shedding the witness lane does not relieve an overrun, it deepens one, and
+/// it does so on the lane the backstop cannot touch. P1's 32-peer swarm showed
+/// exactly that: with the two lanes shed indifferently, 14 630 shed packets
+/// produced 9 224 chain gaps and drove observation coverage from 100% to 81% —
+/// a witness that had stopped watching, reported as a witness that found
+/// nothing.
+///
+/// docs/03-replication.md §5.3a calls witness records "low priority", and they
+/// are: the lane is bounded at source by its frame cadence
+/// (`orrery_witness::plugin::WITNESS_LANE_SHARE`) so it *cannot* be the thing
+/// that exhausts the budget. Low priority in what it may spend, not in what
+/// survives when the spend is already committed.
 #[must_use]
-pub const fn is_sheddable(channel: Channel) -> bool {
-    matches!(channel, Channel::State)
+pub const fn is_sheddable(lane: Lane) -> bool {
+    matches!(lane, Lane::Replication)
+}
+
+/// Which kind of traffic a packet carries, for accounting and shedding order.
+///
+/// Read *off the wire* rather than declared by the sender. `Channel::State`
+/// already carries a sub-tag — [`crate::channels::TAG_REPLICATION`] or
+/// [`TAG_WITNESS`] — so a receiver can route a datagram without parsing it, and
+/// the meter reads the same byte the receiver routes on. A field on the packet
+/// would be a second source of truth for one fact, and it would drift from the
+/// wire the first time a caller left it at its default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Lane {
+    /// Replicated entity state — the interactive lane, and the only sheddable
+    /// one. A dropped update is superseded 50 ms later by the next.
+    Replication,
+    /// Verifiable-core log frames and state claims (docs/03-replication.md §5.3a).
+    Witness,
+    /// The reliable lane: gap repairs, leases, handshakes.
+    Control,
+}
+
+/// Which lane a packet belongs to, from its channel and its wire bytes.
+///
+/// Anything on `Channel::State` that is not positively sub-tagged as witness
+/// traffic counts as replication. That default is deliberate: an untagged or
+/// hand-rolled state payload is charged to the lane the budget is *for*, so a
+/// caller can never make its traffic cheaper by leaving the tag off.
+#[must_use]
+pub fn lane_of(channel: Channel, payload: &[u8]) -> Lane {
+    if channel.is_stream() {
+        return Lane::Control;
+    }
+    match untag(payload) {
+        Some((Channel::State, body)) if body.first() == Some(&TAG_WITNESS) => Lane::Witness,
+        _ => Lane::Replication,
+    }
+}
+
+/// Wire bytes and packet counts, split by [`Lane`].
+///
+/// The split is the whole point of the resource. "Peak upload was 1006 kbps"
+/// says a peer is over budget; it does not say which lane to change, and P4's
+/// witness question is precisely *which*. Charged in wire bytes, matching the
+/// meter, so a share is a fraction of the same number the ceiling is expressed
+/// in.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct LaneTally {
+    /// Wire bytes charged to replication.
+    pub replication_bytes: u64,
+    /// Wire bytes charged to the witness lane.
+    pub witness_bytes: u64,
+    /// Wire bytes charged to the control lane.
+    pub control_bytes: u64,
+    /// Replication packets shed for want of budget.
+    pub replication_shed: u64,
+}
+
+impl LaneTally {
+    /// Every wire byte this peer has offered the link, across all lanes.
+    #[must_use]
+    pub const fn total_bytes(&self) -> u64 {
+        self.replication_bytes + self.witness_bytes + self.control_bytes
+    }
+
+    /// The witness lane's share of everything sent, in \[0, 1\].
+    ///
+    /// Zero when nothing has been sent — a peer that has said nothing has not
+    /// spent a disproportionate share of anything.
+    #[must_use]
+    pub fn witness_share(&self) -> f64 {
+        let total = self.total_bytes();
+        if total == 0 {
+            return 0.0;
+        }
+        self.witness_bytes as f64 / total as f64
+    }
+
+    fn charge(&mut self, lane: Lane, wire: u64) {
+        match lane {
+            Lane::Replication => self.replication_bytes += wire,
+            Lane::Witness => self.witness_bytes += wire,
+            Lane::Control => self.control_bytes += wire,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -500,11 +633,67 @@ mod tests {
     }
 
     #[test]
-    fn only_state_is_sheddable() {
+    fn only_replication_is_sheddable() {
         // Shedding a repair or a lease operation turns one dropped datagram
-        // into a permanent hole; state loss is expected and already repaired.
-        assert!(is_sheddable(Channel::State));
-        assert!(!is_sheddable(Channel::Control));
+        // into a permanent hole; replication loss is expected and repaired by
+        // the next send 50 ms later.
+        assert!(is_sheddable(Lane::Replication));
+        assert!(!is_sheddable(Lane::Control));
+    }
+
+    #[test]
+    fn shedding_a_witness_frame_would_cost_more_than_it_saves() {
+        // A log frame is a link in a hash chain, not a snapshot the next send
+        // supersedes: dropping one converts a sheddable 316-byte datagram into
+        // an unsheddable `LogRangeRequest` and response on the control lane. On
+        // P1's 32-peer swarm, shedding the two lanes indifferently turned 14 630
+        // shed packets into 9 224 chain gaps and drove observation coverage from
+        // 100% to 81%. The lane is bounded at source instead — see
+        // `orrery_witness::plugin::WITNESS_LANE_SHARE_PCT`.
+        assert!(!is_sheddable(Lane::Witness));
+    }
+
+    #[test]
+    fn the_lane_is_read_off_the_wire_rather_than_taken_on_trust() {
+        use crate::channels::{encode_replication, encode_witness};
+
+        // The sub-tag a receiver routes on is the same byte the meter reads, so
+        // the two cannot disagree about what a datagram was.
+        assert_eq!(
+            lane_of(Channel::State, &encode_witness(&[1u8, 2, 3])),
+            Lane::Witness
+        );
+        assert_eq!(
+            lane_of(Channel::State, &encode_replication(&[1u8, 2, 3])),
+            Lane::Replication
+        );
+        // Control is control regardless of what it carries: the witness crate
+        // encodes its repair traffic with `encode_witness` and sends it on the
+        // reliable lane, and that is a control cost, not a lane cost.
+        assert_eq!(
+            lane_of(Channel::Control, &encode_witness(&[1u8, 2, 3])),
+            Lane::Control
+        );
+        // An untagged state payload is charged to replication rather than
+        // discounted: no caller gets cheaper bytes by omitting the tag.
+        assert_eq!(lane_of(Channel::State, &[]), Lane::Replication);
+        assert_eq!(lane_of(Channel::State, &[0, 99, 1]), Lane::Replication);
+    }
+
+    #[test]
+    fn the_tally_answers_which_lane_spent_the_budget() {
+        // "Peak upload was 1006 kbps" does not say which dial to turn, and that
+        // was precisely P4's question.
+        let budget = UploadBudget::default();
+        let mut meter = UploadMeter::default();
+        meter.charge(budget, ms(0), node(1), Lane::Replication, 800);
+        meter.charge(budget, ms(0), node(1), Lane::Witness, 200);
+        assert_eq!(meter.lanes.total_bytes(), 1_000);
+        assert!((meter.lanes.witness_share() - 0.2).abs() < 1e-9);
+        // Every byte still counts against the one ceiling that exists.
+        assert_eq!(meter.total_meter(budget).bytes_in_window(ms(0)), 1_000);
+        // And an idle peer has not overspent on anything.
+        assert_eq!(UploadMeter::default().lanes.witness_share(), 0.0);
     }
 
     #[test]

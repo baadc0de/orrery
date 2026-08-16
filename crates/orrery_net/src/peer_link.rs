@@ -40,7 +40,7 @@ use bytes::Bytes;
 use aeronet_iroh::stream::{IrohStreamIo, SendMessage};
 
 use crate::budget::{
-    datagram_wire_bytes, is_sheddable, stream_wire_bytes, UploadBudget, UploadMeter,
+    datagram_wire_bytes, is_sheddable, lane_of, stream_wire_bytes, UploadBudget, UploadMeter,
 };
 use crate::channels::{tag, untag, Channel};
 use crate::plugin::Peer;
@@ -188,14 +188,16 @@ pub fn receive_peer_packets(
 ///
 /// # Shedding
 ///
-/// Over budget, [`Channel::State`] packets are dropped and [`Channel::Control`]
-/// packets still go out — see [`crate::budget::is_sheddable`]. This is the
-/// backstop, not the policy: docs/03-replication.md §9.3 sheds by relevance
-/// class from the bottom via a priority accumulator, which is `orrery_predict`'s
-/// job and reads [`UploadBudget`] rather than reimplementing it. The backstop
-/// exists because §4 is explicit that a sender enforces its own budget
-/// regardless of what was requested of it, and that has to hold whether or not
-/// an accumulator is wired up.
+/// Over budget, replication packets are dropped while control and witness
+/// packets still go out — the lane is read off the wire by
+/// [`crate::budget::lane_of`] and the order is [`crate::budget::is_sheddable`]'s.
+/// This is the backstop, not the policy: docs/03-replication.md §9.3 sheds by
+/// relevance class from the bottom via a priority accumulator, which is
+/// `orrery_predict`'s job and reads [`UploadBudget`] rather than reimplementing
+/// it, and §5.3a bounds the witness lane at source so it never reaches here.
+/// The backstop exists because §4 is explicit that a sender enforces its own
+/// budget regardless of what was requested of it, and that has to hold whether
+/// or not an accumulator is wired up.
 ///
 /// # Charging a stream message
 ///
@@ -222,6 +224,7 @@ pub fn send_peer_packets(
         };
         let framed = tag(packet.channel, &packet.payload);
         let mtu = session.mtu();
+        let lane = lane_of(packet.channel, &packet.payload);
 
         let wire = match packet.channel {
             Channel::State => {
@@ -244,22 +247,24 @@ pub fn send_peer_packets(
 
         if meter.would_exceed_wire(*budget, now, wire) {
             over = true;
-            if is_sheddable(packet.channel) {
+            if is_sheddable(lane) {
                 meter.shed += 1;
                 // Wire bytes, matching what the meter charges — otherwise
                 // "shed" and "sent" are in different units and the obvious
                 // question (what fraction of the budget did I have to shed?)
                 // has no correct answer.
                 meter.shed_bytes += wire;
+                meter.lanes.replication_shed += 1;
                 continue;
             }
-            // Control goes out anyway, and is charged anyway. Counting it
-            // without sending it would understate the overrun; sending it
-            // without counting it would hide one.
+            // Control and witness go out anyway, and are charged anyway.
+            // Counting without sending would understate the overrun; sending
+            // without counting would hide one. See `is_sheddable` for why the
+            // witness lane is on this side of the line.
             meter.control_over_budget += 1;
         }
 
-        meter.record_wire(*budget, now, packet.to, wire);
+        meter.charge(*budget, now, packet.to, lane, wire);
         match packet.channel {
             Channel::State => {
                 counters.sent += 1;

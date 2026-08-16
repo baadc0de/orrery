@@ -649,6 +649,16 @@ impl Bot {
         self.app.world().resource::<UploadMeter>().shed
     }
 
+    /// What each lane spent over the run, in wire bytes.
+    ///
+    /// The split is what makes an overrun actionable: a peak of 1006 kbps says
+    /// a peer is over its ceiling and says nothing about which dial to turn,
+    /// and *which* was P4's whole question about the witness lane.
+    #[must_use]
+    pub fn lanes(&self) -> orrery_net::budget::LaneTally {
+        self.app.world().resource::<UploadMeter>().lanes
+    }
+
     /// Install the island roster this bot believes it is in.
     ///
     /// Stands in for the coordinator's manifest: the harness knows the true

@@ -231,6 +231,38 @@ of hours**: `p1-swarm --witness` runs the pipeline, but nothing yet runs it
 long enough, across enough platforms, to produce the number the gate is stated
 in.
 
+**The bandwidth blocker at 32 peers is settled: it was the frame cadence.** At
+the criterion population the witness lane wanted 384 kb/s per peer against
+[03-replication.md](03-replication.md) §5.3's 0.15–0.2 Mbps, which took the peer
+to 1006 kb/s over a 1 Mbps ceiling. The lane now holds a declared **20% share of
+the peer upload budget** and derives its frame cadence from it — one frame per
+10 ticks, 6 Hz, against the unchanged 20 Hz send rate and 2 Hz claim cadence
+(§5.3a). Measured over 5 simulated minutes at 32 peers: lane 190 kb/s inside its
+200 kb/s share, peak upload 973 kb/s, **observation coverage 81.3% → 100.0%**
+and **false positives 582 → 0**; under the 3% loss / 100 ms jitter profile,
+coverage 96.0% and false positives 0. Eight and sixteen peers hold at 0 shed, 0
+false positives, 100% coverage. Over the criterion's full simulated hour at 32
+peers: **32 accumulated player-hours, zero false positives, 100% coverage**,
+lane at 194 kb/s. The 500-hour gate is now a matter of running the harness
+across the four determinism targets rather than of anything being in the way.
+
+No D16 parameter moved. The witness set stays at N ≥ 5, ≤ 7 links — dropping to
+five would have recovered under a third of what the cadence did while costing
+the K-of-N collusion margin (§4.4's C(c,K)/C(N,K) goes from ~1-in-35 to
+~1-in-10) — and the claim cadence stays at 2 Hz, because a claim is the
+re-anchor point a witness restarts from and stretching it lengthens exactly the
+window in which coverage is lost. What *was* wrong was a cadence inherited from
+the send rate rather than derived from a budget, and a backstop that shed log
+frames as though they were replication updates. The second is now impossible:
+witness records are unsheddable and the lane is bounded at source instead
+(§5.3a).
+
+**The coverage figure is now reported beside every false-positive count and is
+part of the exit gate.** The 500-hour number cannot be accumulated under
+shedding: a witness that has stopped watching also reports zero, and 81%
+coverage makes a false-positive rate a statement about which frames arrived
+rather than about the rules.
+
 **The reference game (`orrery_games`).** Skirmish — small craft, kinematic
 movement over `libm`, integer combat with cooldowns, weapon reach and a death
 state — plus the harness that plays it, records what an authority would have
@@ -264,7 +296,7 @@ milliseconds, on every commit, on four platforms. The swarm is still the thing
 that accumulates the hours.
 
 **Deliverables.**
-- PeerReview-style tamper-evident logs streamed to the cell-epoch witness set (piggybacked on the 20 Hz replication datagrams, gap repair over the reliable control stream); any holder of a segment + t₀ claim can re-execute a window ≤ 3 s (180 ticks) and produce self-verifying evidence.
+- PeerReview-style tamper-evident logs streamed to the cell-epoch witness set (on the state lane beside replication, at a cadence derived from the lane's budget share — [03-replication.md](03-replication.md) §5.3a; gap repair over the reliable control stream); any holder of a segment + t₀ claim can re-execute a window ≤ 3 s (180 ticks) and produce self-verifying evidence.
 - Continuous cheap checks: speed/acceleration caps, teleport detection, rate limits, impossible values, plus the reconciliation-error monitor.
 - Discrepancy pipeline end-to-end: escalation → log-segment request → observer replay → evidence bundle → cluster re-execution → verdict — terminating in telemetry, not enforcement.
 - Rules-version skew handled from the start: the adjudication executor retains the last 3 ruleset builds as version-keyed sidecar workers and routes evidence bundles by `RulesetId`; bundles older than retention resolve as unadjudicable — never a strike (D11, D12).

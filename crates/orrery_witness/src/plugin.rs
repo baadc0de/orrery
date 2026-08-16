@@ -149,6 +149,143 @@ pub struct AuthoredLog(pub AuthorityLog);
 /// and ruinous across thirty-one.
 pub const MAX_WITNESS_LINKS: usize = 7;
 
+/// The share of a peer's ≤ 1 Mbps upload budget the verifiable-core lane may
+/// spend (docs/03-replication.md §5.3a).
+///
+/// Twenty percent — 0.2 Mbps — which is the upper end of the figure §8's
+/// bandwidth tables have always carried for this lane (`≈ 0.15–0.2 Mbps`, i.e.
+/// ≤ 7 links at 20–30 kb/s each). What is new is that it is *enforced* rather
+/// than asserted: [`frame_interval_ticks`] derives the frame cadence that fits
+/// inside it, so the lane cannot be the thing that exhausts the budget.
+///
+/// This is what makes the witness lane unsheddable
+/// (`orrery_net::budget::is_sheddable`) coherent. A lane bounded at source may
+/// keep what it has already spent; a lane that is not would have to be policed
+/// by the backstop, and the backstop is exactly the wrong place — it discovers
+/// the overrun after the frame exists, and dropping it there costs a
+/// control-lane repair larger than the frame was.
+///
+/// Expressed in percent rather than as an `f32` so [`frame_interval_ticks`] can
+/// be a `const fn` and the cadence can be a `const` in the authoring layer,
+/// rather than a runtime value nothing checks.
+pub const WITNESS_LANE_SHARE_PCT: u64 = 20;
+
+/// Wire bytes a log frame costs before its per-tick input records.
+///
+/// Measured on the P1 swarm's reference-ruleset frames: 33 B of `RulesetId` (a
+/// 32-byte build digest, repeated because an evidence bundle has to be
+/// self-describing for adjudication to route it), a 64-byte ed25519 signature,
+/// a 67-byte full [`FrameHead`] pair, ~26 B of framing and tick base, and the
+/// 60-byte IP+UDP+QUIC floor from `orrery_net::budget::DATAGRAM_OVERHEAD_BYTES`.
+///
+/// **This is the whole cadence argument.** Roughly 250 of a 316-byte frame is
+/// paid per *frame*, not per tick, so a frame covering ten ticks costs a tenth
+/// the fixed overhead per tick of audited timeline that one covering three
+/// does. `a_frame_costs_what_the_cadence_arithmetic_assumes` fails if a change
+/// to the wire types invalidates it.
+pub const FRAME_FIXED_WIRE_BYTES: u64 = 250;
+
+/// Wire bytes each covered tick adds to a frame: one sparse `InputRecord`.
+///
+/// The only genuinely per-tick part of a frame, and therefore the floor no
+/// cadence goes below — at 60 Hz it is 1200 B/s per link on its own.
+pub const FRAME_TICK_WIRE_BYTES: u64 = 20;
+
+/// Wire bytes one `StateClaim` costs.
+///
+/// Claims are deliberately *not* on the cadence dial. A claim is the re-anchor
+/// point a witness restarts from after a hole, so stretching that interval
+/// lengthens exactly the window in which a witness is shown timeline it cannot
+/// judge — the coverage number P1 measures. At 2 Hz they are ~4 kb/s per link,
+/// about a sixth of the lane; there is nothing here worth buying with coverage.
+pub const CLAIM_WIRE_BYTES: u64 = 261;
+
+/// How many ticks one log frame should cover, to keep the lane inside
+/// [`WITNESS_LANE_SHARE_PCT`].
+///
+/// # The arithmetic
+///
+/// A peer streaming to `links` witnesses spends, per link and per second:
+///
+/// ```text
+/// (tick_hz / n) * FRAME_FIXED_WIRE_BYTES          frames
+/// + tick_hz * FRAME_TICK_WIRE_BYTES               the input records in them
+/// + (tick_hz / claim_every) * CLAIM_WIRE_BYTES    claims
+/// ```
+///
+/// Only the first term depends on the cadence `n`, so the answer is the
+/// smallest `n` whose frame term fits in what the share leaves after the other
+/// two are paid. At the D16 defaults — 1 Mbps, 7 links, 60 Hz sim, 2 Hz claims
+/// — that is `n >= 8.1`, which the alignment rule below rounds to **10 ticks, a
+/// 6 Hz frame cadence**.
+///
+/// # Why it may be slower than the 20 Hz send rate
+///
+/// docs/07-witnessing.md §3 arms an audit only on a violation *sustained past
+/// the 250 ms window* — a single spike is packet loss, not a cheat. A frame
+/// every 167 ms therefore lands strictly before the earliest tick at which any
+/// signal it could carry becomes actionable, and the 3 s adjudication window is
+/// twenty times longer again. What one-frame-per-send bought was never earlier
+/// detection; it was 250 bytes of fixed cost every 50 ms.
+///
+/// # Why it aligns to the claim interval
+///
+/// The rounded-up `n` is raised to the next divisor of `claim_every`, so frame
+/// boundaries fall on claim ticks. §3 requires an adjudication window to *end
+/// at a claim tick*; a cadence coprime with the claim interval puts most claims
+/// mid-frame, where a witness holding a partial fold has nothing to compare
+/// against and defers instead of judging.
+///
+/// Returns at least 1: a link count or budget leaving no room for frames at all
+/// still has to name a cadence, and the caller's own budget check is what
+/// should object, not an interval of zero ticks.
+#[must_use]
+pub const fn frame_interval_ticks(
+    budget_bits_per_sec: u64,
+    links: usize,
+    tick_hz: u64,
+    claim_every: u64,
+) -> u16 {
+    let links = if links == 0 { 1 } else { links as u64 };
+    let per_link = (budget_bits_per_sec / 8) * WITNESS_LANE_SHARE_PCT / 100 / links;
+    let records = tick_hz * FRAME_TICK_WIRE_BYTES;
+    let claims = match (tick_hz * CLAIM_WIRE_BYTES).checked_div(claim_every) {
+        Some(bytes) => bytes,
+        None => 0,
+    };
+    let longest = if claim_every == 0 { 1 } else { claim_every };
+    let Some(for_frames) = per_link.checked_sub(records + claims) else {
+        // The per-tick records alone do not fit. No cadence recovers that — it
+        // is a link-count or a share question — so name the longest interval
+        // the claim alignment allows and leave the objection to the caller.
+        return longest as u16;
+    };
+    if for_frames == 0 {
+        return longest as u16;
+    }
+    let ticks = {
+        let exact = tick_hz * FRAME_FIXED_WIRE_BYTES;
+        let ceil = exact.div_ceil(for_frames);
+        if ceil == 0 {
+            1
+        } else {
+            ceil
+        }
+    };
+    if claim_every == 0 {
+        return ticks as u16;
+    }
+    // Raise to the next divisor of the claim interval.
+    let mut n = ticks;
+    while n <= claim_every {
+        if claim_every.is_multiple_of(n) {
+            return n as u16;
+        }
+        n += 1;
+    }
+    claim_every as u16
+}
+
 /// The peers this authority streams its log to.
 ///
 /// # Who chooses this
