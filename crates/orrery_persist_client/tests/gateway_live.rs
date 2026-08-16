@@ -17,7 +17,7 @@ use orrery_authority::{
     Authority, AuthorityPhase, AuthorityState, LeaseOutbox, OrreryAuthorityPlugin, PersistIdentity,
 };
 use orrery_net::plugin::NetConfig;
-use orrery_net::OrreryNetPlugin;
+use orrery_net::{CoordinatorConfig, OrreryNetPlugin};
 use orrery_persist_client::{
     GatewayConfig, GatewaySession, GatewayState, OrreryPersistClientPlugin, PersistClientConfig,
     UplinkScheduler,
@@ -57,9 +57,11 @@ fn client_app(gateway: &orrery_persistd::GatewayServer, client_key: &iroh_base::
                 relay_mode: aeronet_iroh::iroh::RelayMode::Disabled,
                 secret_key: Some(client_key.clone()),
             },
-            // No coordinator: this exercises the gateway path, and membership
-            // falls back to the connected-session set.
-            ..Default::default()
+            // No coordinator: this test exercises the client → gateway →
+            // cell-actor path, and with no address configured the coordinator
+            // client stays idle and membership follows the connected-session
+            // set instead.
+            coordinator: CoordinatorConfig::default(),
         },
     ));
     app.add_plugins(OrreryAuthorityPlugin);
