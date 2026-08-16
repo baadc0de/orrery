@@ -14,6 +14,9 @@ categories = ["game-development", "network-programming"]
 #   internals that `collect_changes` already computes (which components changed
 #   this tick, and their postcard-encoded payloads) as a public message, so
 #   `orrery_persist_client` can feed `DiffUplink`s from replicon diffs.
+# - `ClientVisibility::is_visible`: the public read counterpart of the existing
+#   public `set`, so a crate driving visibility from its own policy can assert
+#   what it set. Additive, no behaviour change.
 # Upstreaming intent (orrery D4): keep this diff minimal so it can become a
 # PR against the simgine/bevy_replicon repo.
 

@@ -168,6 +168,29 @@ impl ClientVisibility {
     pub(crate) fn get(&self, entity: Entity) -> FiltersMask {
         self.hidden.get(&entity).copied().unwrap_or_default()
     }
+
+    /// Returns whether `entity` is currently visible to this client under
+    /// `bit` — the read counterpart of [`Self::set`].
+    ///
+    /// Entities default to visible: this component stores only what is
+    /// *hidden*, so an entity no filter has ever hidden is visible, and so is
+    /// one whose bit was cleared again.
+    ///
+    /// Note this answers for a single filter bit. An entity visible under one
+    /// scope may still be hidden by another, so this is "not hidden by `bit`",
+    /// not "replicated".
+    ///
+    /// Orrery addition: [`Self::set`] had no public inverse, so a crate that
+    /// drives visibility from its own policy — `orrery_spatial` maps a 27-cell
+    /// area of interest onto these bits — could not assert what it had set, and
+    /// its visibility rules were untestable outside this crate.
+    #[must_use]
+    pub fn is_visible(&self, entity: Entity, bit: FilterBit) -> bool {
+        !self
+            .hidden
+            .get(&entity)
+            .is_some_and(|mask| mask.contains(bit))
+    }
 }
 
 #[cfg(test)]

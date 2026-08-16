@@ -10,9 +10,12 @@ license = "MIT OR Apache-2.0"
 # per-client visibility, high-rate interest-set selection, cell-crossing
 # hysteresis, and 1-4 Hz extrapolated proxies.
 [features]
-# Gates integration with the big_space 0.19 port so a port delay degrades to
-# manual origin management instead of blocking the workspace (docs/10-crates.md
-# §5).
+# Gates integration with the big_space Bevy-0.19 port. It was a feature because
+# a port delay had to degrade to manual origin management rather than block the
+# workspace (docs/10-crates.md §5, D14). The port landed — big_space 0.13 builds
+# against Bevy 0.19 — so the integration is on by default and the escape hatch
+# stays for anyone who needs to drop it.
+default = ["big_space"]
 big_space = ["dep:big_space"]
 
 [dependencies]
@@ -29,4 +32,5 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 bevy = { workspace = true }
+iroh-base = { workspace = true }
 proptest = { workspace = true }
