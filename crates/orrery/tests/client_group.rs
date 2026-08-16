@@ -11,6 +11,7 @@
 //! bailed on its first line in every real app.
 
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use bevy::prelude::*;
 use bevy::MinimalPlugins;
@@ -18,7 +19,9 @@ use bevy_state::app::StatesPlugin;
 
 use orrery::{OrreryClientPlugins, OrreryConfig, OrreryIslandBindingPlugin};
 use orrery_authority::ephemeral::EphemeralRegistry;
-use orrery_authority::{AuthorityState, IslandBinding, OrreryAuthorityPlugin};
+use orrery_authority::{
+    AuthorityState, ContactObservations, ContactTick, IslandBinding, OrreryAuthorityPlugin,
+};
 use orrery_games::Skirmish;
 use orrery_net::island::IslandMembership;
 use orrery_net::plugin::{NetConfig, OrreryNetPlugin, PathTelemetry, PeerRegistry};
@@ -31,7 +34,7 @@ use orrery_protocol::coord::{IslandManifest, PeerEntry, TopologyRegime};
 use orrery_protocol::{CellId, IslandId, NodeId, Tick};
 use orrery_spatial::plugin::{AoiSubscription, OrrerySpatialPlugin};
 use orrery_spatial::{InterestSelection, SpatialConfig};
-use orrery_witness::plugin::{AuthoredLog, WitnessPlugin, WitnessSet};
+use orrery_witness::plugin::{AuthoredLog, WitnessClock, WitnessPlugin, WitnessSet};
 
 /// Records the order the group's members were built in.
 ///
@@ -234,4 +237,103 @@ fn coordinator_manifest_lets_a_peer_mint_ephemeral_ids() {
         .expect("a peer with an island assignment can mint ephemeral ids");
     assert_eq!(id.island, IslandId::new(42));
     assert_eq!(id.spawner, local);
+}
+
+/// A client with the identity the shipping path would have given it, run for
+/// `frames` frames of real time.
+///
+/// Identity is seeded exactly as `coordinator_manifest_lets_a_peer_mint_
+/// ephemeral_ids` documents: `track_island_binding` and
+/// `sync_authority_identity` are not ordered against each other, and a driver
+/// test that skipped this would be chasing that gap instead of its own
+/// subject. The frames are spaced in wall time because three of the drivers
+/// under test are clocks, and lightyear's fixed schedule only runs once 1/60 s
+/// of it has passed.
+fn driven_client(frames: usize) -> App {
+    let mut app = client(OrreryConfig::default());
+    let local = node_id(1);
+    app.world_mut().resource_mut::<GatewaySession>().node = local;
+    app.world_mut().resource_mut::<AuthorityState>().node = local;
+    for _ in 0..frames {
+        std::thread::sleep(Duration::from_millis(10));
+        app.update();
+    }
+    app
+}
+
+/// Every host-driver resource in the group, in two lists.
+///
+/// The first list is the one that was silently broken: a resource with an
+/// in-crate default, consumed by a system the group installs, and written by
+/// nothing. `ContactTick::now_ms` was that — default 0, and the only writer in
+/// the tree was `orrery_authority`'s own integration test — which made the D7
+/// §10 token bucket compute an elapsed interval of 0 forever and turned the
+/// 250 ms `Deny` back-off into a permanent blacklist, in every composition a
+/// game would ship.
+///
+/// The second list is *not* the same failure and must not be asserted as one:
+/// `ContactObservations`, `ContactTick::tick` and `WitnessClock` are the game's
+/// own physics report and universe tick, which no plugin in this workspace can
+/// synthesize. Nothing advancing them in a headless app is correct. They are
+/// pinned here so that the group's documented contract and this test move
+/// together, and so a future member plugin that starts writing one is a
+/// deliberate change rather than a surprise.
+#[test]
+fn host_driver_resources_either_advance_or_are_a_declared_host_contract() {
+    let mut app = driven_client(4);
+    let world = app.world();
+
+    // Driven by the group. Each of these is a clock, which is why the crate
+    // that consumes it can own it: no game state is being invented.
+    let lease_clock = world.resource::<AuthorityState>().now_ms;
+    let contact_clock = world.resource::<ContactTick>().now_ms;
+    assert!(
+        lease_clock > 0,
+        "`advance_lease_clock` drives the lease expiry floor"
+    );
+    assert!(
+        contact_clock > 0,
+        "`advance_contact_clock` drives the §10 token bucket and the `Deny` back-off"
+    );
+    assert!(
+        contact_clock >= lease_clock,
+        "both clocks share one process origin, and contact runs after the lease clock"
+    );
+    assert!(
+        world.resource::<TickBridge>().last_seen() > 0,
+        "`OrreryPredictPlugin` carries the bridge's wrap epoch from lightyear's \
+         timeline; no host call does"
+    );
+
+    // Supplied by the host, and deliberately still at their defaults here.
+    // This is the group's documented contract, not a defect: see the "What the
+    // host must drive" table on `OrreryClientPlugins`.
+    let observations = world.resource::<ContactObservations>();
+    assert!(
+        observations.bodies.is_empty() && observations.contacts.is_empty(),
+        "the contact report comes from the game's solver"
+    );
+    assert_eq!(
+        world.resource::<ContactTick>().tick,
+        Tick::new(0),
+        "the universe tick a contact happened on is the game's to publish"
+    );
+    assert_eq!(
+        world.resource::<WitnessClock>().0,
+        Tick::new(0),
+        "D10's repair-timeout sweep is opt-in, in the same universe-tick units"
+    );
+
+    // And the second half of the contract: a host that *does* write them is
+    // not overwritten on the next frame by a plugin that thought it knew
+    // better.
+    app.world_mut().resource_mut::<ContactTick>().tick = Tick::new(4_242);
+    app.world_mut().resource_mut::<WitnessClock>().0 = Tick::new(4_242);
+    app.update();
+    assert_eq!(app.world().resource::<ContactTick>().tick, Tick::new(4_242));
+    assert_eq!(app.world().resource::<WitnessClock>().0, Tick::new(4_242));
+    assert!(
+        app.world().resource::<ContactTick>().now_ms >= contact_clock,
+        "and the clock the crate owns keeps moving alongside it"
+    );
 }

@@ -1,6 +1,8 @@
 //! The `OrreryPredictPlugin` (D8, docs/10-crates.md §7).
 
 use bevy_app::prelude::*;
+use bevy_ecs::prelude::*;
+use lightyear::prelude::LocalTimeline;
 
 use crate::budget::RollbackBudget;
 use crate::config::PredictConfig;
@@ -36,15 +38,37 @@ impl Plugin for OrreryPredictPlugin {
         app.insert_resource(self.config.clone())
             .init_resource::<ReconciliationMonitor>()
             .init_resource::<RollbackBudget>()
-            // Anchored at the universe origin until the session has one:
-            // `orrery_net` re-anchors from the coordinator's `UniverseEpoch`
-            // and the converged clock offset once the sync phase completes
-            // (docs/05 §6). Anchoring earlier would bake the pre-convergence
-            // offset error into every tick the session ever stamps.
+            // Anchored at the universe origin, and still there: re-anchoring
+            // from the coordinator's `UniverseEpoch` and the converged clock
+            // offset is the sync phase's job (docs/05 §6) and nothing in the
+            // tree does it yet — see `crate::tick`'s module docs for what that
+            // costs. Anchoring before convergence is not the fix; it would
+            // bake the offset error into every tick the session ever stamps.
             .insert_resource(TickBridge::anchor(orrery_protocol::Tick(0), 0));
+
+        // The bridge is the only thing that carries the wrap epoch, and it
+        // carries it in `advance` — so something has to call it once per fixed
+        // tick or the epoch never moves. `FixedLast`, because lightyear
+        // increments `LocalTimeline` in `FixedFirst` and every reader of the
+        // bridge is later in the frame than that (`feed_residuals` runs in
+        // `PostUpdate`).
+        app.add_systems(FixedLast, advance_tick_bridge);
 
         wiring::install(app, &self.config);
     }
+}
+
+/// Carry [`TickBridge`] to lightyear's current tick, once per fixed tick.
+///
+/// This is the crate's own driver, not a host contract: a host that had to
+/// call [`TickBridge::advance`] itself would be maintaining lightyear's wrap
+/// epoch by hand, and the one composition that forgot would be correct for 828
+/// days and then wrong.
+///
+/// It does not make the bridge's *base* right — see [`crate::tick`]'s module
+/// docs for what still anchors it at the universe origin.
+pub fn advance_tick_bridge(timeline: Res<LocalTimeline>, mut bridge: ResMut<TickBridge>) {
+    bridge.advance(timeline.tick().0);
 }
 
 #[cfg(test)]
@@ -141,6 +165,36 @@ mod tests {
                 ..PredictConfig::default()
             },
         });
+    }
+
+    /// The bridge has to be advanced by *something*, and nothing outside this
+    /// crate ever calls `advance`: a host-driven wrap epoch is a bug with a
+    /// two-year fuse in whichever composition forgets. So the plugin drives
+    /// it, and the check is that a frame of the shipped app moves it — not
+    /// that the function works, which `tick.rs` covers.
+    #[test]
+    fn the_plugin_advances_the_bridge_from_lightyears_timeline() {
+        use lightyear::prelude::LocalTimeline;
+
+        let mut app = headless(OrreryPredictPlugin::default());
+        app.update();
+        assert_eq!(
+            app.world().resource::<TickBridge>().last_seen(),
+            0,
+            "the anchor is where the session starts"
+        );
+
+        // One fixed step's worth of wall time, so `FixedMain` actually runs.
+        std::thread::sleep(Duration::from_millis(40));
+        app.update();
+
+        let timeline = app.world().resource::<LocalTimeline>().tick().0;
+        assert!(timeline > 0, "the fixed schedule ran");
+        assert_eq!(
+            app.world().resource::<TickBridge>().last_seen(),
+            timeline,
+            "the bridge follows lightyear's timeline with no host call"
+        );
     }
 
     #[test]

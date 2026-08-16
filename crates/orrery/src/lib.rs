@@ -227,6 +227,26 @@ impl Plugin for OrreryIslandBindingPlugin {
 /// 6. [`WitnessPlugin<R>`] — the log stream and the discrepancy path.
 /// 7. [`OrreryPersistClientPlugin`] — the gateway session, uplink, area loader.
 ///
+/// # What the host must drive
+///
+/// Every other resource the members register is either configuration or is
+/// written by a system the group installs. Three are not, and a game that
+/// leaves them alone gets a subsystem that runs and quietly does nothing — so
+/// they are enumerated here, and `crates/orrery/tests/client_group.rs` pins the
+/// list. All three carry the same reason: their units are the *game's*, and no
+/// plugin here can invent them.
+///
+/// | Resource | Written from | What is lost without it |
+/// |---|---|---|
+/// | [`ContactObservations`](orrery_authority::ContactObservations) | the physics step's contact report | contact-island weak claims: the planner sees an empty graph and proposes nothing (D7 §5) |
+/// | [`ContactTick::tick`](orrery_authority::ContactTick) | the universe tick that step ran on | every weak claim carries `ClaimBasis::Contact{tick: 0}` as its evidence, which the registrar's plausibility gate reads |
+/// | [`WitnessClock`](orrery_witness::plugin::WitnessClock) | the same universe tick | the repair-timeout sweep, which is the only check a subject that goes *silent* can trip (D10) |
+///
+/// `ContactTick::now_ms` is **not** on that list, and neither is
+/// [`TickBridge`](orrery_predict::TickBridge): those are clocks rather than
+/// game state, so `OrreryAuthorityPlugin` and `OrreryPredictPlugin` drive them
+/// themselves.
+///
 /// # What the group deliberately leaves out
 ///
 /// [`AoiVisibilityPlugin`](orrery_spatial::visibility::AoiVisibilityPlugin) is
