@@ -171,7 +171,11 @@ the security posture is layered and the in-workflow runner guard is the
 *weakest* of the three layers — see the comment on the `runner` job in
 `ci.yml`. The runner is an unprivileged `ci` user with **no sudo**, which is
 why every `apt-get` step in those jobs is conditioned on
-`runner.environment == 'github-hosted'`. And `p2-kill9` and `p3-island` stay on
+`runner.environment == 'github-hosted'` — and why a missing system library on
+the box is an ssh-and-install away rather than a workflow edit. What it needs
+beyond a stock Ubuntu: the Bevy build dependencies, `foundationdb-clients`, and
+**`libclang-dev`** (`foundationdb-sys` runs bindgen, which the hosted images
+happen to satisfy and a bare box does not). And `p2-kill9` and `p3-island` stay on
 hosted runners on purpose: `scripts/fdb-dev.sh` hardcodes `127.0.0.1:4500` and
 stops the cluster with `pkill -f "fdbserver.*:4500"`, while the box runs its own
 `fdbserver` on that port for development. Teaching that harness to take its
