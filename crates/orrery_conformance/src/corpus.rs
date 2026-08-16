@@ -39,7 +39,7 @@ pub struct Case {
 
 /// The corpus.
 ///
-/// Deliberately small and fast — this runs on every commit, on five targets.
+/// Deliberately small and fast — this runs on every commit, on every target.
 /// Breadth comes from the cases differing in the axes that break determinism
 /// (entity count, window length, whether cross-entity events flow), not from
 /// running the same case for longer.

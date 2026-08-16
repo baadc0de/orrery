@@ -47,7 +47,7 @@ jobs:
     name: rustfmt
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install the pinned toolchain
         run: rustup show active-toolchain || rustup toolchain install
       - run: cargo fmt --all --check
@@ -56,7 +56,7 @@ jobs:
     name: clippy
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install the pinned toolchain
         run: rustup show active-toolchain || rustup toolchain install
       # Four first-party crates take `bevy = { workspace = true }` with default
@@ -73,7 +73,7 @@ jobs:
             g++ pkg-config libx11-dev libasound2-dev libudev-dev \
             libwayland-dev libxkbcommon-dev
 
-      - uses: actions/cache@v4
+      - uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry/index
@@ -117,10 +117,10 @@ jobs:
     name: static gates
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install the pinned toolchain
         run: rustup show active-toolchain || rustup toolchain install
-      - uses: actions/cache@v4
+      - uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry/index
@@ -148,7 +148,7 @@ jobs:
     name: workspace tests
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install the pinned toolchain
         run: rustup show active-toolchain || rustup toolchain install
       - name: Install Bevy's Linux build dependencies
@@ -158,7 +158,7 @@ jobs:
             g++ pkg-config libx11-dev libasound2-dev libudev-dev \
             libwayland-dev libxkbcommon-dev
 
-      - uses: actions/cache@v4
+      - uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry/index
@@ -186,13 +186,12 @@ jobs:
           - { os: ubuntu-24.04-arm, label: aarch64-linux }
           - { os: windows-latest,   label: x86_64-windows }
           - { os: macos-latest,     label: aarch64-macos }
-          - { os: macos-13,         label: x86_64-macos }
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install the pinned toolchain
         run: rustup show active-toolchain || rustup toolchain install
-      - uses: actions/cache@v4
+      - uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry/index
@@ -203,7 +202,7 @@ jobs:
           restore-keys: det-${{ matrix.label }}-
 
       # The verifiable spine only: orrery_conformance depends on orrery_core and
-      # orrery_protocol and nothing else, so five platforms stay cheap. These
+      # orrery_protocol and nothing else, so the whole matrix stays cheap. These
       # crates are also the ones that *must* be portable — the rest of the
       # workspace is service infrastructure that runs on Linux hosts.
       - name: Test the verifiable spine
@@ -216,7 +215,7 @@ jobs:
       - name: Emit this platform's determinism report
         run: cargo run -q -p orrery_conformance -- emit --out report-${{ matrix.label }}.json
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: determinism-${{ matrix.label }}
           path: report-${{ matrix.label }}.json
@@ -230,10 +229,10 @@ jobs:
     if: always()
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install the pinned toolchain
         run: rustup show active-toolchain || rustup toolchain install
-      - uses: actions/cache@v4
+      - uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry/index
@@ -243,7 +242,7 @@ jobs:
           key: det-x86_64-linux-${{ hashFiles('Cargo.toml', 'crates/*/Cargo.toml', 'vendor/*/Cargo.toml', 'rust-toolchain.toml') }}
           restore-keys: det-x86_64-linux-
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           pattern: determinism-*
           path: reports
@@ -270,10 +269,13 @@ jobs:
           echo "Comparing ${#compared[@]} platforms against x86_64-linux:"
           for f in "${compared[@]}"; do echo "  $f"; done
 
-          # A partial matrix must not pass quietly. §8 names five targets; if
-          # fewer reported, say so loudly even when those that did agree.
-          if (( ${#compared[@]} < 4 )); then
-            echo "::error::only ${#compared[@]} of 4 non-baseline platforms produced a report"
+          # A partial matrix must not pass quietly: if a leg died, the ones
+          # that did report agreeing says nothing about the one that didn't.
+          # §8 names five targets; x86_64-macos is deliberately not among the
+          # four built here — that platform is not supported. Keep this count in
+          # step with the matrix above, or a dropped leg passes silently.
+          if (( ${#compared[@]} < 3 )); then
+            echo "::error::only ${#compared[@]} of 3 non-baseline platforms produced a report"
             cargo run -q -p orrery_conformance -- compare --baseline "$baseline" "${compared[@]}" || true
             exit 1
           fi

@@ -114,8 +114,9 @@ default `clippy` at `-D warnings`.
 own tests run an identical tick twice in-process and compare hashes, which
 catches VC-4/VC-8 violations but only ever proves one platform agrees with
 itself. `orrery_conformance` closes that: it runs a fixed corpus through a
-reference ruleset on all five targets from docs/06 §8 (x86_64 Linux/Windows/
-macOS, aarch64 Linux/macOS), emits a digest of per-tick state hashes, and a
+reference ruleset on the four supported targets (x86_64 Linux/Windows,
+aarch64 Linux/macOS — x86_64 macOS is one of docs/06 §8's five, deliberately
+dropped as unsupported), emits a digest of per-tick state hashes, and a
 final job compares them. Discrete state must be bit-identical; a mismatch is
 localized to the first diverging `(tick, entity)` and quantified against the §5
 bands so you can tell `libm` drift from a rules change.
