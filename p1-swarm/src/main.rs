@@ -156,10 +156,16 @@ struct Args {
 
     /// Move the impaired profile's loss within the criterion's 3–5% band.
     ///
-    /// The band has only ever been run at its 3% floor. This is how the other
-    /// end gets exercised — on demand rather than nightly, because a second
-    /// witnessed hour would not fit the job's timeout. Ignored without
-    /// `--impaired`, which is the flag that selects the profile at all.
+    /// The band had only ever been run at its 3% floor, and the other end does
+    /// not hold: the witnessed hour at 5% judges **93.8%** of the timeline it
+    /// is shown against the 95% floor, with zero false positives across the
+    /// same 32 player-hours. Coverage is the clause that fails, not the
+    /// findings — 234 930 gaps rather than 156 728, and the repairs do not all
+    /// land before the window they belong to closes. The gate runs the floor
+    /// nightly; closing the band is P4's next measurement, not a knob.
+    ///
+    /// Ignored without `--impaired`, which is the flag that selects the profile
+    /// at all.
     #[arg(long)]
     loss: Option<f64>,
 

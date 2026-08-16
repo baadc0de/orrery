@@ -261,8 +261,16 @@ profile, blocking on all three witnessing clauses, accruing 32 player-hours a
 night on x86_64 Linux (`scripts/p1-swarm-gate.sh`,
 `.github/workflows/nightly.yml`). Measured over that hour before it landed:
 coverage 95.98% against the 95% floor, zero false positives, 156 728 chain gaps
-repaired. What is outstanding is narrower than it was — the other three
-determinism targets, and a ledger that adds the nights up. Each report is
+repaired. What is outstanding is narrower than it was, and one part of it is
+newly visible: **the criterion's loss band is 3–5% and only its floor holds.**
+The same witnessed hour at 5% loss judges 93.8% of the timeline it is shown,
+below the 95% floor, still with zero false positives across 32 player-hours —
+234 930 chain gaps against 156 728, and the repairs do not all land before the
+window they belong to closes. The gate therefore runs the 3% floor nightly and
+`p1-swarm --loss 0.05` reproduces the 5% figure on demand; closing that gap is
+a measurement P4 owes, and lowering the coverage floor to accommodate it is not
+one. The rest of what is outstanding: the other three determinism targets, and
+a ledger that adds the nights up. Each report is
 stamped with its seed, its full impairment profile, its target triple and its
 commit sha, and deliberately not with a wall clock unless asked, so summing them
 later is bookkeeping rather than archaeology.
