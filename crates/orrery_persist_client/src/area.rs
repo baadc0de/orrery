@@ -558,4 +558,65 @@ mod tests {
             "page count bounded by the subscription"
         );
     }
+
+    #[test]
+    fn a_fully_answered_round_is_never_resubscribed() {
+        // The C-1 amplification, as a unit. The old policy re-issued an
+        // unchanged cell set on a 50 ms floor whether or not anything was
+        // outstanding, so a gateway slow enough to miss one window got the
+        // whole 27-cell set asked for again twenty times a second, per client,
+        // for as long as it stayed slow. A round the gateway has fully
+        // answered must cost exactly one subscribe, however long the client
+        // sits in it.
+        let center = cell(0, 0, 0);
+        let cells = order_nearest_first(center, center.neighbors27());
+        let mut loader = AreaLoader::new();
+        loader.begin_round(cells.clone());
+        for c in &cells {
+            loader.record(LoadedPage {
+                cell: *c,
+                entities: vec![PersistId::new(1)],
+                payloads: vec![bytes::Bytes::from_static(b"x")],
+                live: true,
+            });
+        }
+        let issued = Instant::now();
+        loader.last_subscribe = Some(issued);
+
+        // Far past the backstop, and still nothing to ask about.
+        let much_later = issued + std::time::Duration::from_millis(RESUBSCRIBE_BACKSTOP_MS * 100);
+        assert!(!loader.round_is_overdue(much_later, 27));
+    }
+
+    #[test]
+    fn an_incomplete_round_waits_for_the_backstop_before_resubscribing() {
+        // The backstop exists for a gateway that answered part of a subscribe
+        // and stopped. It must fire — a client that never re-asks is stuck —
+        // but not before the interval, or it becomes the amplification again
+        // under a different name.
+        let center = cell(0, 0, 0);
+        let cells = order_nearest_first(center, center.neighbors27());
+        let mut loader = AreaLoader::new();
+        loader.begin_round(cells.clone());
+        // One cell answered out of 27.
+        loader.record(LoadedPage {
+            cell: cells[0],
+            entities: vec![PersistId::new(1)],
+            payloads: vec![bytes::Bytes::from_static(b"x")],
+            live: true,
+        });
+        let issued = Instant::now();
+        loader.last_subscribe = Some(issued);
+
+        let inside = issued + std::time::Duration::from_millis(RESUBSCRIBE_BACKSTOP_MS / 2);
+        assert!(
+            !loader.round_is_overdue(inside, 27),
+            "an incomplete round does not re-ask inside the backstop"
+        );
+        let outside = issued + std::time::Duration::from_millis(RESUBSCRIBE_BACKSTOP_MS + 1);
+        assert!(
+            loader.round_is_overdue(outside, 27),
+            "an incomplete round re-asks once the backstop elapses"
+        );
+    }
 }
