@@ -12,16 +12,26 @@
 //! a missing packet: a chain gap is a [`LogRangeRequest`], because datagram
 //! loss is expected and treating it as fabrication would strike honest peers
 //! on a lossy link.
+//!
+//! # One frame, every entity it names
+//!
+//! A frame's single signature covers every entity the authority authored in
+//! that send (docs/06 §6), so a witness watching several of a subject's
+//! entities sees all of them in one frame. Every watched entity in a frame is
+//! folded, re-executed and advanced — not just the first. A witness that
+//! handled one and treated the rest as siblings would keep accepting frames
+//! while quietly not watching most of what it was asked to watch, and would be
+//! taking the *sender's* word for the head its own frame is checked against.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
-use orrery_core::log::verify_claim;
+use orrery_core::log::{fold_all, verify_claim};
 use orrery_core::replay::ReplayHarness;
 use orrery_core::store::AuthorityLog;
 use orrery_core::{evaluate, Executor, InvariantSample, InvariantViolation, Ruleset, TickOutcome};
 use orrery_protocol::{
-    ChainHash, DiscrepancyReport, EvidenceBundle, LogFrame, LogRangeRequest, NodeId, PersistId,
-    RecordSource, StateClaim, Tick, MAX_ADJUDICATION_TICKS,
+    ChainHash, DiscrepancyReport, EvidenceBundle, FrameHead, LogFrame, LogRangeRequest, NodeId,
+    PersistId, RecordSource, StateClaim, Tick, MAX_ADJUDICATION_TICKS,
 };
 
 use crate::report::sign_report;
@@ -31,6 +41,10 @@ use crate::report::sign_report;
 pub struct WitnessConfig {
     /// Audit window ceiling, in ticks. Anomalies longer than this are reported
     /// as consecutive windows rather than one oversized bundle.
+    ///
+    /// Read by [`Witness::audit_window`] and [`Witness::raise`], and clamped
+    /// down to [`MAX_ADJUDICATION_TICKS`]: a longer window is refused by every
+    /// adjudicator, so accepting one here would only defer the failure.
     pub window_ticks: u64,
     /// **Telemetry only: check everything, file nothing.**
     ///
@@ -58,11 +72,19 @@ pub struct WitnessCounters {
     pub frames_accepted: u64,
     /// Frames rejected — bad signature, broken chain, illegal order.
     pub frames_rejected: u64,
+    /// Frames set aside because a repair for that chain is still outstanding.
+    ///
+    /// Not a rejection and not an acceptance: the frame was well-formed and the
+    /// witness simply cannot chain it yet. Counted because a frame that vanishes
+    /// into neither column is one an operator cannot account for — and this is
+    /// the bucket a broken repair path fills up.
+    pub frames_deferred: u64,
     /// Chain gaps detected, each producing a [`LogRangeRequest`].
     pub gaps_detected: u64,
     /// Stage-1 invariant breaches.
     pub invariant_breaches: u64,
-    /// Re-execution mismatches against a claim.
+    /// Re-execution mismatches against a claim. One per disputed claim, not one
+    /// per packet that re-reveals it.
     pub claim_mismatches: u64,
     /// Reports that would have been filed. In shadow mode nothing leaves.
     pub reports_raised: u64,
@@ -90,6 +112,12 @@ pub enum WitnessError {
     ClaimRejected,
     /// A logged input payload is not a valid `CoreInput`.
     InputMalformed,
+    /// The window cannot be assembled from what this witness holds.
+    ///
+    /// Distinct from shadow mode, and deliberately so: "we chose not to file"
+    /// and "we could not" are different facts, and returning the same value for
+    /// both is how a witness that has gone structurally mute goes unnoticed.
+    WindowUnservable,
 }
 
 impl core::fmt::Display for WitnessError {
@@ -100,6 +128,7 @@ impl core::fmt::Display for WitnessError {
             Self::FrameRejected => f.write_str("frame failed verification"),
             Self::ClaimRejected => f.write_str("claim signature does not verify"),
             Self::InputMalformed => f.write_str("logged input is not a valid CoreInput"),
+            Self::WindowUnservable => f.write_str("window cannot be assembled from what is held"),
         }
     }
 }
@@ -118,7 +147,8 @@ impl core::error::Error for WitnessError {}
 /// The loophole this deliberately does *not* leave open: a cheat could stall
 /// forever to stay unjudged. That is what [`Catchup::attempts`] and
 /// [`WitnessSignal::Stalled`] are for — persistent failure to fill a hole is
-/// itself reportable, so the state has a floor.
+/// itself reportable, so the state has a floor. [`Witness::sweep`] is what
+/// keeps that floor under a subject that stops sending altogether.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Catchup {
     /// Subject tick at which the hole was first noticed.
@@ -185,12 +215,30 @@ pub struct Observation<'a, S> {
     pub tick: Tick,
 }
 
+/// What the repair machinery decided about one entity's chain on one frame.
+enum GapCheck {
+    /// The chain lines up; the frame can be folded.
+    Clear,
+    /// A hole is open and already being repaired. The frame cannot chain and
+    /// asking again would only add load.
+    Waiting,
+    /// Something the caller has to act on: a repair request, or an escalation.
+    Signal(WitnessSignal),
+}
+
 /// One watched entity's running state.
-struct Watched<S> {
+///
+/// The executor is **per entity**, not shared across the witness. See
+/// [`Witness`] for why that is a correctness requirement rather than a layout
+/// choice.
+struct Watched<R: Ruleset> {
     subject: NodeId,
     /// Tick of the claim this watch was anchored at — the earliest point a
     /// repair could usefully start from.
     anchor_tick: u64,
+    /// The chain epoch the last accepted frame declared, so a repair asks about
+    /// the epoch the gap is actually in.
+    chain_epoch: u32,
     /// Set while this subject's chain has a hole being repaired.
     catchup: Option<Catchup>,
     head: ChainHash,
@@ -198,9 +246,19 @@ struct Watched<S> {
     /// seeded. Until the first frame lands there is nothing to detect a gap
     /// against.
     anchored: bool,
-    last_sample: Option<(S, Tick)>,
     claims: BTreeMap<u64, StateClaim>,
     computed: BTreeMap<u64, [u8; 32]>,
+    /// Recent re-executed states, canonical-encoded, so a claim arriving after
+    /// the ticks it commits to can still be given a snapshot. Bounded by
+    /// [`Witness::RECENT_SNAPSHOTS`].
+    recent: BTreeMap<u64, Vec<u8>>,
+    /// Claim ticks this witness holds a snapshot for — the ticks a bundle can
+    /// open at.
+    snapshotted: BTreeSet<u64>,
+    /// Claim ticks already signalled as mismatched, so one divergence is one
+    /// finding rather than one per packet that re-reveals it.
+    reported: BTreeSet<u64>,
+    executor: Executor<R>,
 }
 
 /// A witness over one universe, watching entities held by others.
@@ -208,12 +266,33 @@ struct Watched<S> {
 /// Generic over the ruleset because re-execution *is* the witness signal: a
 /// witness without the game's rules can check signatures and chains but cannot
 /// tell whether an outcome was legal.
+///
+/// # One executor per watched entity
+///
+/// Not a shared world. `Executor::step_entity` exposes every *other* entity in
+/// the same executor as a neighbour snapshot, and a witness advances each
+/// entity as that entity's frames arrive — so a shared executor would present
+/// neighbours sitting at whatever ticks they happened to have reached, which is
+/// not the coherent set the authority stepped. Worse, the adjudicator that
+/// decides the verdict loads exactly one entity
+/// (`ReplayHarness::load_claimed_snapshot`), so its neighbour map is empty.
+/// Isolating each entity here is what makes the witness compute the same
+/// trajectory the adjudicator will.
+///
+/// The residual, stated because it cannot be fixed from this crate: a ruleset
+/// whose `step` reads neighbours is outside what witnessing can adjudicate at
+/// all, because the authority's live execution *does* see them and no replay
+/// reproduces that. Core steps should not read neighbours.
 pub struct Witness<R: Ruleset> {
     config: WitnessConfig,
     seed: orrery_protocol::UniverseSeed,
     ruleset_factory: fn() -> R,
-    executor: Executor<R>,
-    watched: BTreeMap<PersistId, Watched<R::CoreState>>,
+    /// Kept for [`Ruleset::invariants`], which stage 1 reads on every sample.
+    ruleset: R,
+    watched: BTreeMap<PersistId, Watched<R>>,
+    /// Previous stage-1 sample per entity, watched or not — stage 1 runs on
+    /// everything a peer receives (docs/06 §3), not only on what it witnesses.
+    samples: BTreeMap<PersistId, (R::CoreState, Tick)>,
     /// The subject's frames, retained so a window can be assembled from what
     /// was actually received rather than re-requested.
     log: AuthorityLog,
@@ -259,12 +338,22 @@ impl<R: Ruleset> Witness<R> {
     /// not answer stops being given the benefit of the doubt.
     const MAX_REPAIR_ATTEMPTS: u32 = 5;
 
+    /// Re-executed states kept per entity, in ticks.
+    ///
+    /// A witness is never sent state, so the only snapshot it can ever start a
+    /// bundle from is one it computed itself — and it has to still be holding
+    /// the right tick when the claim that commits to it arrives. Two seconds of
+    /// the subject's timeline is several times the 2 Hz claim cadence, which
+    /// leaves room for a claim that arrives late without keeping a copy of
+    /// every tick in the retention window.
+    const RECENT_SNAPSHOTS: usize = 128;
+
     /// A witness that builds a fresh `Ruleset` whenever it needs one.
     ///
-    /// A factory rather than a value because re-executing a window needs its
-    /// own harness with its own executor, and a `Ruleset` is a pure value that
-    /// is cheap to construct — cheaper than making it `Clone` and forcing that
-    /// bound on every game.
+    /// A factory rather than a value because every watched entity gets its own
+    /// executor and re-executing a window needs its own harness, and a
+    /// `Ruleset` is a pure value that is cheap to construct — cheaper than
+    /// making it `Clone` and forcing that bound on every game.
     pub fn new(
         config: WitnessConfig,
         seed: orrery_protocol::UniverseSeed,
@@ -274,8 +363,9 @@ impl<R: Ruleset> Witness<R> {
             config,
             seed,
             ruleset_factory,
-            executor: Executor::new(ruleset_factory(), seed),
+            ruleset: ruleset_factory(),
             watched: BTreeMap::new(),
+            samples: BTreeMap::new(),
             log: AuthorityLog::default(),
             last_pruned: 0,
             counters: WitnessCounters::default(),
@@ -294,6 +384,28 @@ impl<R: Ruleset> Witness<R> {
         self.config.shadow_mode
     }
 
+    /// The authority this witness holds responsible for an entity.
+    ///
+    /// The adapter needs this to address a repair. Sending it to whoever handed
+    /// the frame over instead would let any peer that replays a subject's
+    /// genuine frames collect the repair traffic those frames provoke — and
+    /// then not answer it.
+    #[must_use]
+    pub fn subject(&self, entity: PersistId) -> Option<NodeId> {
+        self.watched.get(&entity).map(|watched| watched.subject)
+    }
+
+    /// The chain epoch this witness last saw an entity's frames declare.
+    #[must_use]
+    pub fn chain_epoch(&self, entity: PersistId) -> Option<u32> {
+        self.watched.get(&entity).map(|watched| watched.chain_epoch)
+    }
+
+    /// The audit window ceiling actually in force.
+    fn window_ceiling(&self) -> u64 {
+        self.config.window_ticks.clamp(1, MAX_ADJUDICATION_TICKS)
+    }
+
     /// Start watching an entity from a signed anchor claim.
     ///
     /// The anchor is verified before anything is stored: a witness that
@@ -307,26 +419,34 @@ impl<R: Ruleset> Witness<R> {
     /// subject.
     pub fn watch(&mut self, watch: Watch<R::CoreState>) -> Result<(), WitnessError> {
         verify_claim(&watch.anchor, watch.subject).map_err(|_| WitnessError::ClaimRejected)?;
-        // Retain the anchor with its snapshot: it is the only claim a witness
-        // ever holds state for, and a bundle has to start from committed state.
+        // Retain the anchor with its snapshot: a bundle has to start from
+        // committed state, and this is the one snapshot a witness is handed
+        // rather than having to compute.
         self.log.record_claim(
             watch.anchor.clone(),
             orrery_core::CoreCodec::to_canonical(&watch.anchor_state),
         );
-        self.executor.insert(watch.entity, watch.anchor_state);
+        let mut executor = Executor::new((self.ruleset_factory)(), self.seed);
+        executor.insert(watch.entity, watch.anchor_state);
         let mut claims = BTreeMap::new();
         claims.insert(watch.anchor.tick.0, watch.anchor.clone());
+        let mut snapshotted = BTreeSet::new();
+        snapshotted.insert(watch.anchor.tick.0);
         self.watched.insert(
             watch.entity,
             Watched {
                 subject: watch.subject,
                 anchor_tick: watch.anchor.tick.0,
+                chain_epoch: watch.anchor.chain_epoch,
                 catchup: None,
                 head: watch.anchor.input_head,
                 anchored: false,
-                last_sample: None,
                 claims,
                 computed: BTreeMap::new(),
+                recent: BTreeMap::new(),
+                snapshotted,
+                reported: BTreeSet::new(),
+                executor,
             },
         );
         Ok(())
@@ -335,29 +455,33 @@ impl<R: Ruleset> Witness<R> {
     /// Run stage-1 invariants on a received sample.
     ///
     /// Cheap and stateless beyond the previous sample, so every interested peer
-    /// runs this regardless of witness-set membership.
+    /// runs this on everything it receives — **including entities it does not
+    /// witness** (docs/06 §3). Stage 1 is what peers outside the witness set
+    /// contribute, and gating it on witness-set membership would leave most
+    /// bulk-class state with no validation at all.
     pub fn observe(&mut self, observation: Observation<'_, R::CoreState>) -> Option<WitnessSignal>
     where
         R::CoreState: Clone,
     {
-        let ruleset = (self.ruleset_factory)();
-        let invariants = ruleset.invariants();
-        let watched = self.watched.get_mut(&observation.entity)?;
-
-        let elapsed_ticks = watched
-            .last_sample
-            .as_ref()
-            .map(|(_, previous_tick)| observation.tick.0.saturating_sub(previous_tick.0) as u32)
-            .unwrap_or(0);
-        let sample = InvariantSample {
-            entity: observation.entity,
-            current: observation.state,
-            tick: observation.tick,
-            previous: watched.last_sample.as_ref().map(|(state, _)| state),
-            elapsed_ticks,
+        let outcome = {
+            let invariants = self.ruleset.invariants();
+            let previous = self.samples.get(&observation.entity);
+            let elapsed_ticks = previous
+                .map(|(_, tick)| observation.tick.0.saturating_sub(tick.0) as u32)
+                .unwrap_or(0);
+            let sample = InvariantSample {
+                entity: observation.entity,
+                current: observation.state,
+                tick: observation.tick,
+                previous: previous.map(|(state, _)| state),
+                elapsed_ticks,
+            };
+            evaluate(invariants, &sample)
         };
-        let outcome = evaluate(invariants, &sample);
-        watched.last_sample = Some((observation.state.clone(), observation.tick));
+        self.samples.insert(
+            observation.entity,
+            (observation.state.clone(), observation.tick),
+        );
 
         match outcome {
             Ok(()) => None,
@@ -395,7 +519,7 @@ impl<R: Ruleset> Witness<R> {
     /// that list, because it does not know what any given receiver follows, so
     /// on the wire every entity's pair travels and the selection happens here.
     /// Doing it in the caller would duplicate the rule that picks the watched
-    /// entity, and the two would drift.
+    /// entities, and the two would drift.
     ///
     /// Pairs for followed entities are ignored: this witness folded those
     /// itself, and taking the sender's word for them would let an authority
@@ -409,18 +533,14 @@ impl<R: Ruleset> Witness<R> {
     pub fn ingest_wire_frame(
         &mut self,
         frame: &LogFrame,
-        heads: &[orrery_protocol::FrameHead],
+        heads: &[FrameHead],
     ) -> Result<Vec<WitnessSignal>, WitnessError> {
-        let watched = frame
-            .entities
-            .iter()
-            .map(|slice| slice.entity)
-            .find(|entity| self.watched.contains_key(entity))
-            .ok_or(WitnessError::NotWatched)?;
-
-        let mut siblings = Vec::with_capacity(frame.entities.len().saturating_sub(1));
+        if !self.follows_anything_in(frame) {
+            return Err(WitnessError::NotWatched);
+        }
+        let mut siblings = Vec::with_capacity(frame.entities.len());
         for slice in &frame.entities {
-            if slice.entity == watched {
+            if self.watched.contains_key(&slice.entity) {
                 continue;
             }
             let Some(pair) = heads.iter().find(|head| head.entity == slice.entity) else {
@@ -432,7 +552,70 @@ impl<R: Ruleset> Witness<R> {
         self.ingest_frame(frame, &siblings)
     }
 
-    /// Ingest a signed frame and re-execute the ticks it covers.
+    /// Ingest a run of frames served as one repair response.
+    ///
+    /// # Why this is not a loop over [`Self::ingest_wire_frame`]
+    ///
+    /// A range response carries **one head pair per entity for the whole
+    /// answer** — the pair as it stood at the first frame that named it, since
+    /// repeating it per frame would multiply the response's overhead. Feeding
+    /// every frame the same pairs therefore checks every frame after the first
+    /// against a sibling head that is one frame stale, the fold lands somewhere
+    /// else, and a repair the authority served correctly and in full is refused
+    /// frame by frame. The hole then never closes, and the subject is escalated
+    /// as stalled for answering properly — D17 risk 3 arriving through the one
+    /// path built to prevent it.
+    ///
+    /// The witness folds the siblings forward itself instead. It can: their
+    /// records are in the frames it was just handed.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::ingest_frame`]. A frame that fails stops the run — the frames
+    /// after it chain from the one that did not land.
+    pub fn ingest_wire_frames(
+        &mut self,
+        frames: &[LogFrame],
+        heads: &[FrameHead],
+    ) -> Result<Vec<WitnessSignal>, WitnessError> {
+        let mut carried: BTreeMap<PersistId, ChainHash> = heads
+            .iter()
+            .map(|head| (head.entity, head.prev_head))
+            .collect();
+        let mut signals = Vec::new();
+        for frame in frames {
+            if !self.follows_anything_in(frame) {
+                return Err(WitnessError::NotWatched);
+            }
+            let mut siblings = Vec::with_capacity(frame.entities.len());
+            let mut advanced = Vec::new();
+            for slice in &frame.entities {
+                if self.watched.contains_key(&slice.entity) {
+                    continue;
+                }
+                let Some(prev) = carried.get(&slice.entity).copied() else {
+                    self.counters.frames_rejected += 1;
+                    return Err(WitnessError::FrameRejected);
+                };
+                let head = fold_all(prev, &slice.records);
+                siblings.push((prev, head));
+                advanced.push((slice.entity, head));
+            }
+            signals.extend(self.ingest_frame(frame, &siblings)?);
+            carried.extend(advanced);
+        }
+        Ok(signals)
+    }
+
+    fn follows_anything_in(&self, frame: &LogFrame) -> bool {
+        frame
+            .entities
+            .iter()
+            .any(|slice| self.watched.contains_key(&slice.entity))
+    }
+
+    /// Ingest a signed frame and re-execute the ticks it covers, for **every**
+    /// entity in it this witness follows.
     ///
     /// # Errors
     ///
@@ -443,103 +626,46 @@ impl<R: Ruleset> Witness<R> {
         frame: &LogFrame,
         sibling_heads: &[(ChainHash, ChainHash)],
     ) -> Result<Vec<WitnessSignal>, WitnessError> {
-        let entity = frame
+        let entities: Vec<PersistId> = frame
             .entities
             .iter()
             .map(|slice| slice.entity)
-            .find(|entity| self.watched.contains_key(entity))
-            .ok_or(WitnessError::NotWatched)?;
-        let watched = self.watched.get(&entity).ok_or(WitnessError::NotWatched)?;
-        let subject = watched.subject;
-        let expected_head = watched.head;
-        let anchored = watched.anchored;
+            .filter(|entity| self.watched.contains_key(entity))
+            .collect();
+        let Some(first) = entities.first().copied() else {
+            return Err(WitnessError::NotWatched);
+        };
+        let subject = self.watched[&first].subject;
 
         // Gap detection first, and it is *not* an accusation. The wire carries
-        // truncated heads precisely so a receiver can notice a hole cheaply.
-        if let Some(slice) = frame.entities.iter().find(|slice| slice.entity == entity) {
-            if anchored && slice.prev_head != expected_head.rolling() {
-                // One outstanding repair at a time. A frame arriving mid-repair
-                // still fails to chain — that is what "mid-repair" means — and
-                // asking again for the same hole achieves nothing but load. The
-                // request is re-issued only once `REPAIR_TIMEOUT_TICKS` of the
-                // subject's own timeline have passed without the hole closing,
-                // which is what keeps a *lost* repair from stalling the witness
-                // forever.
-                let now = frame.first_tick.0;
-                if let Some(catchup) = watched.catchup {
-                    if now
-                        < catchup.since + Self::REPAIR_TIMEOUT_TICKS * u64::from(catchup.attempts)
-                    {
-                        return Ok(Vec::new());
-                    }
-                    if catchup.attempts >= Self::MAX_REPAIR_ATTEMPTS {
-                        if catchup.reported {
-                            // Already said. Repeating it on every frame adds
-                            // nothing an operator can act on.
-                            return Ok(Vec::new());
-                        }
-                        if let Some(watched) = self.watched.get_mut(&entity) {
-                            if let Some(catchup) = watched.catchup.as_mut() {
-                                catchup.reported = true;
-                            }
-                        }
-                        // Asking again has stopped being the answer. Not
-                        // filling a hole across this many chances is the
-                        // finding — and is what keeps "stall forever" from
-                        // being a way to stay unjudged.
-                        self.counters.stalled += 1;
-                        return Ok(vec![WitnessSignal::Stalled {
-                            entity,
-                            since: catchup.since,
-                            attempts: catchup.attempts,
-                        }]);
-                    }
+        // truncated heads precisely so a receiver can notice a hole cheaply. A
+        // hole in any followed entity blocks the whole frame: one signature
+        // covers every slice, so a frame cannot be half-folded.
+        let mut signals = Vec::new();
+        let mut blocked = false;
+        for entity in &entities {
+            match self.repair_check(*entity, frame) {
+                GapCheck::Clear => {}
+                GapCheck::Waiting => blocked = true,
+                GapCheck::Signal(signal) => {
+                    blocked = true;
+                    signals.push(signal);
                 }
-                self.counters.gaps_detected += 1;
-                // Ask from where this witness actually stopped, not from the
-                // beginning of history. `from_tick: 0` looks harmless because
-                // retention bounds the answer, but it makes *every* repair a
-                // full-history request: the authority then scans and measures
-                // its whole retained window, the response is truncated to one
-                // datagram, and the requester asks again — so a peer that
-                // hitches once drags its witnesses through the entire window
-                // repeatedly. A swarm with stalling peers took three orders of
-                // magnitude longer than one without because of this line.
-                let resume = watched
-                    .computed
-                    .keys()
-                    .next_back()
-                    .map_or(watched.anchor_tick, |tick| tick + 1);
-                if let Some(watched) = self.watched.get_mut(&entity) {
-                    watched.catchup = Some(match watched.catchup {
-                        // Same hole, another attempt: the clock runs from when
-                        // it was *first* noticed, so a subject cannot reset its
-                        // own deadline by making the witness ask again.
-                        Some(catchup) => Catchup {
-                            attempts: catchup.attempts + 1,
-                            ..catchup
-                        },
-                        None => Catchup {
-                            since: now,
-                            attempts: 1,
-                            reported: false,
-                        },
-                    });
-                }
-                return Ok(vec![WitnessSignal::Gap(LogRangeRequest {
-                    entity,
-                    chain_epoch: slice.chain_epoch,
-                    from_tick: Tick::new(resume.min(frame.first_tick.0)),
-                    to_tick: frame.first_tick,
-                })]);
             }
         }
+        if blocked {
+            self.counters.frames_deferred += 1;
+            return Ok(signals);
+        }
 
+        // Rebuild the signature preimage: our own heads from our own fold,
+        // siblings from the caller. Anything followed uses the witness's fold,
+        // never the sender's claim about it.
         let mut prev_heads = Vec::with_capacity(frame.entities.len());
         let mut sibling_cursor = 0usize;
         for slice in &frame.entities {
-            if slice.entity == entity {
-                prev_heads.push(expected_head);
+            if let Some(watched) = self.watched.get(&slice.entity) {
+                prev_heads.push(watched.head);
             } else {
                 let Some(pair) = sibling_heads.get(sibling_cursor) else {
                     self.counters.frames_rejected += 1;
@@ -557,10 +683,49 @@ impl<R: Ruleset> Witness<R> {
             })?;
         self.counters.frames_accepted += 1;
 
-        // Re-execute every tick the frame covers, including ticks that logged
-        // nothing: a silent tick still advances state and still draws from the
-        // RNG, so skipping it would put the witness on a different trajectory
-        // than the authority for reasons that have nothing to do with cheating.
+        for entity in &entities {
+            self.replay_entity(*entity, frame)?;
+        }
+
+        for entity in &entities {
+            let Some(watched) = self.watched.get_mut(entity) else {
+                continue;
+            };
+            for transition in &transitions {
+                if transition.entity == *entity {
+                    watched.head = transition.head;
+                    watched.anchored = true;
+                    // The chain moved, so whatever hole was being repaired is
+                    // closed as far as this witness can tell, and judging can
+                    // resume.
+                    watched.catchup = None;
+                }
+            }
+            if let Some(slice) = frame.entities.iter().find(|slice| slice.entity == *entity) {
+                watched.chain_epoch = slice.chain_epoch;
+            }
+        }
+        self.log.record_frame(frame.clone(), transitions);
+
+        // A claim may already have arrived for a tick this frame just computed.
+        for entity in &entities {
+            if let Some(signal) = self.check_pending_claims(*entity) {
+                signals.push(signal);
+            }
+        }
+
+        let last_tick = frame.first_tick.0 + u64::from(frame.tick_count).saturating_sub(1);
+        self.prune_if_due(Tick::new(last_tick));
+        Ok(signals)
+    }
+
+    /// Re-execute one entity's slice of a verified frame.
+    ///
+    /// Every tick the frame covers is stepped, including ticks that logged
+    /// nothing: a silent tick still advances state and still draws from the
+    /// RNG, so skipping it would put the witness on a different trajectory than
+    /// the authority for reasons that have nothing to do with cheating.
+    fn replay_entity(&mut self, entity: PersistId, frame: &LogFrame) -> Result<(), WitnessError> {
         let mut per_tick: BTreeMap<u64, Vec<R::CoreInput>> = BTreeMap::new();
         for slice in &frame.entities {
             if slice.entity != entity {
@@ -584,43 +749,173 @@ impl<R: Ruleset> Witness<R> {
             }
         }
 
-        let mut signals = Vec::new();
+        let watched = self
+            .watched
+            .get_mut(&entity)
+            .ok_or(WitnessError::NotWatched)?;
+        let mut recorded = Vec::with_capacity(usize::from(frame.tick_count));
         for tick in frame.first_tick.0..frame.first_tick.0 + u64::from(frame.tick_count) {
             let inputs = per_tick.remove(&tick).unwrap_or_default();
             let Some(TickOutcome { state_hash, .. }) =
-                self.executor.step_entity(entity, Tick::new(tick), &inputs)
+                watched
+                    .executor
+                    .step_entity(entity, Tick::new(tick), &inputs)
             else {
                 return Err(WitnessError::NotWatched);
             };
-            if let Some(watched) = self.watched.get_mut(&entity) {
-                watched.computed.insert(tick, state_hash);
+            watched.computed.insert(tick, state_hash);
+            if let Some(state) = watched.executor.state(entity) {
+                watched
+                    .recent
+                    .insert(tick, orrery_core::CoreCodec::to_canonical(state));
             }
-            self.log
-                .record_tick_hash(entity, Tick::new(tick), state_hash);
+            recorded.push((tick, state_hash));
+        }
+        while watched.recent.len() > Self::RECENT_SNAPSHOTS {
+            let oldest = *watched.recent.keys().next().expect("len > 0");
+            watched.recent.remove(&oldest);
         }
 
-        if let Some(watched) = self.watched.get_mut(&entity) {
-            for transition in &transitions {
-                if transition.entity == entity {
-                    watched.head = transition.head;
-                    watched.anchored = true;
-                    // The chain moved, so whatever hole was being repaired is
-                    // closed as far as this witness can tell, and judging can
-                    // resume.
-                    watched.catchup = None;
+        for (tick, hash) in recorded {
+            self.log.record_tick_hash(entity, Tick::new(tick), hash);
+        }
+        Ok(())
+    }
+
+    /// Decide what a frame that does not chain means for one entity.
+    fn repair_check(&mut self, entity: PersistId, frame: &LogFrame) -> GapCheck {
+        let Some(watched) = self.watched.get(&entity) else {
+            return GapCheck::Clear;
+        };
+        let Some(slice) = frame.entities.iter().find(|slice| slice.entity == entity) else {
+            return GapCheck::Clear;
+        };
+        if !watched.anchored || slice.prev_head == watched.head.rolling() {
+            return GapCheck::Clear;
+        }
+        self.repair_step(
+            entity,
+            frame.first_tick.0,
+            frame.first_tick.0,
+            slice.chain_epoch,
+        )
+    }
+
+    /// Advance one entity's repair state, returning what the caller must do.
+    ///
+    /// Shared by the frame path and [`Self::sweep`] so the backoff, the attempt
+    /// count and the escalation threshold cannot drift apart between them.
+    ///
+    /// One outstanding repair at a time. A frame arriving mid-repair still
+    /// fails to chain — that is what "mid-repair" means — and asking again for
+    /// the same hole achieves nothing but load. The request is re-issued only
+    /// once [`Self::REPAIR_TIMEOUT_TICKS`] of the subject's own timeline have
+    /// passed without the hole closing, which is what keeps a *lost* repair
+    /// from stalling the witness forever.
+    fn repair_step(
+        &mut self,
+        entity: PersistId,
+        now: u64,
+        to_tick: u64,
+        chain_epoch: u32,
+    ) -> GapCheck {
+        let Some(watched) = self.watched.get(&entity) else {
+            return GapCheck::Clear;
+        };
+
+        // The backoff checks come before anything is computed: `sweep` calls
+        // this every tick for every entity with an open hole, and the common
+        // answer by far is "still waiting".
+        if let Some(catchup) = watched.catchup {
+            if now < catchup.since + Self::REPAIR_TIMEOUT_TICKS * u64::from(catchup.attempts) {
+                return GapCheck::Waiting;
+            }
+            if catchup.attempts >= Self::MAX_REPAIR_ATTEMPTS {
+                if catchup.reported {
+                    // Already said. Repeating it on every frame adds nothing an
+                    // operator can act on.
+                    return GapCheck::Waiting;
                 }
+                if let Some(watched) = self.watched.get_mut(&entity) {
+                    if let Some(catchup) = watched.catchup.as_mut() {
+                        catchup.reported = true;
+                    }
+                }
+                // Asking again has stopped being the answer. Not filling a hole
+                // across this many chances is the finding — and is what keeps
+                // "stall forever" from being a way to stay unjudged.
+                self.counters.stalled += 1;
+                return GapCheck::Signal(WitnessSignal::Stalled {
+                    entity,
+                    since: catchup.since,
+                    attempts: catchup.attempts,
+                });
             }
         }
-        self.log.record_frame(frame.clone(), transitions);
 
-        // A claim may already have arrived for a tick this frame just computed.
-        if let Some(signal) = self.check_pending_claims(entity) {
-            signals.push(signal);
+        let resume = watched
+            .computed
+            .keys()
+            .next_back()
+            .map_or(watched.anchor_tick, |tick| tick + 1);
+
+        self.counters.gaps_detected += 1;
+        if let Some(watched) = self.watched.get_mut(&entity) {
+            watched.catchup = Some(match watched.catchup {
+                // Same hole, another attempt: the clock runs from when it was
+                // *first* noticed, so a subject cannot reset its own deadline by
+                // making the witness ask again.
+                Some(catchup) => Catchup {
+                    attempts: catchup.attempts + 1,
+                    ..catchup
+                },
+                None => Catchup {
+                    since: now,
+                    attempts: 1,
+                    reported: false,
+                },
+            });
         }
+        // Ask from where this witness actually stopped, not from the beginning
+        // of history. `from_tick: 0` looks harmless because retention bounds the
+        // answer, but it makes *every* repair a full-history request: the
+        // authority then scans and measures its whole retained window, the
+        // response is truncated to one datagram, and the requester asks again —
+        // so a peer that hitches once drags its witnesses through the entire
+        // window repeatedly. A swarm with stalling peers took three orders of
+        // magnitude longer than one without because of this line.
+        GapCheck::Signal(WitnessSignal::Gap(LogRangeRequest {
+            entity,
+            chain_epoch,
+            from_tick: Tick::new(resume.min(to_tick)),
+            to_tick: Tick::new(to_tick.max(resume)),
+        }))
+    }
 
-        let last_tick = frame.first_tick.0 + u64::from(frame.tick_count).saturating_sub(1);
-        self.prune_if_due(Tick::new(last_tick));
-        Ok(signals)
+    /// Chase repairs that have gone unanswered, driven by the caller's clock.
+    ///
+    /// Every other repair check hangs off a frame arriving, which closes "stall
+    /// forever to stay unjudged" only for a subject that keeps talking. A
+    /// subject that simply stops sending would otherwise sit in `catchup`
+    /// indefinitely, unjudged and unescalated, which is the cheaper version of
+    /// the same trick. Call this from the tick loop with the local tick.
+    ///
+    /// Returns re-issued [`WitnessSignal::Gap`]s and [`WitnessSignal::Stalled`]
+    /// escalations, exactly as the frame path would have.
+    pub fn sweep(&mut self, now: Tick) -> Vec<WitnessSignal> {
+        let waiting: Vec<(PersistId, u32)> = self
+            .watched
+            .iter()
+            .filter(|(_, watched)| watched.catchup.is_some())
+            .map(|(entity, watched)| (*entity, watched.chain_epoch))
+            .collect();
+        let mut signals = Vec::new();
+        for (entity, chain_epoch) in waiting {
+            if let GapCheck::Signal(signal) = self.repair_step(entity, now.0, now.0, chain_epoch) {
+                signals.push(signal);
+            }
+        }
+        signals
     }
 
     /// Drop history older than the retention window.
@@ -654,14 +949,35 @@ impl<R: Ruleset> Witness<R> {
         self.log.prune(now);
         for watched in self.watched.values_mut() {
             watched.computed.retain(|tick, _| *tick >= floor);
+            watched.recent.retain(|tick, _| *tick >= floor);
             // One claim below the floor is kept: a claim at tick T is compared
             // against the hash for T-1, so evicting on the same boundary as the
             // hashes would drop the comparison a surviving claim still needs.
             watched.claims.retain(|tick, _| *tick + 1 >= floor);
+            watched.snapshotted.retain(|tick| *tick + 1 >= floor);
+            watched.reported.retain(|tick| *tick + 1 >= floor);
         }
+        // Stage-1 samples are kept for entities this peer does not witness, so
+        // nothing else bounds them.
+        self.samples.retain(|_, (_, tick)| tick.0 + 1 >= floor);
     }
 
     /// Ingest a signed claim and compare it against what re-execution produced.
+    ///
+    /// # The snapshot a witness keeps, and the one it must not
+    ///
+    /// A claim at tick T commits to the state *before* T executes — the state
+    /// this witness computed at T-1. Where the two agree, that state is a
+    /// snapshot a bundle can open from, and it is the **only** way a witness
+    /// ever gets one: a witness is never sent state, and the anchor it was
+    /// handed ages out of retention long before the session does. Without this
+    /// a witness that leaves shadow mode can file about its first window and
+    /// nothing afterwards.
+    ///
+    /// Where the two disagree, no snapshot is kept, and that is deliberate: a
+    /// t₀ snapshot that failed `load_claimed_snapshot` reads as
+    /// `EvidenceForged` **against the reporter**. A bundle has to open at the
+    /// last claim the two still shared.
     ///
     /// # Errors
     ///
@@ -676,22 +992,37 @@ impl<R: Ruleset> Witness<R> {
             .get(&claim.entity)
             .ok_or(WitnessError::NotWatched)?;
         verify_claim(claim, watched.subject).map_err(|_| WitnessError::ClaimRejected)?;
+
+        let snapshot = claim.tick.0.checked_sub(1).and_then(|previous| {
+            let watched = self.watched.get(&claim.entity)?;
+            if *watched.computed.get(&previous)? != claim.state_hash {
+                return None;
+            }
+            watched.recent.get(&previous).cloned()
+        });
+
         if let Some(watched) = self.watched.get_mut(&claim.entity) {
             watched.claims.insert(claim.tick.0, claim.clone());
+            if snapshot.is_some() {
+                watched.snapshotted.insert(claim.tick.0);
+            }
         }
-        // Later claims are retained without a snapshot: a witness never holds
-        // the subject's state, only the anchor it was given. That is enough —
-        // a bundle starts from the anchor and the rest are what the subject is
-        // held to.
-        self.log.record_claim(claim.clone(), Vec::new());
+        self.log
+            .record_claim(claim.clone(), snapshot.unwrap_or_default());
         Ok(self.check_pending_claims(claim.entity))
     }
 
-    /// Compare every claim whose tick has been re-executed.
+    /// Compare every claim whose tick has been re-executed and not yet judged.
     ///
     /// A claim at tick T commits to the state *before* T executes, so it is
     /// compared against the hash computed for T-1. Getting that off by one
     /// would make every honest authority look like a cheat.
+    ///
+    /// A disputed claim is signalled **once**. Without that, every later frame
+    /// rescans the same retained claim, finds the same divergence and raises it
+    /// again — hundreds of times per real divergence at the default retention —
+    /// so `claim_mismatches` would measure the ingest rate rather than count
+    /// divergences, and P4 exists to produce exactly that count.
     fn check_pending_claims(&mut self, entity: PersistId) -> Option<WitnessSignal> {
         let watched = self.watched.get(&entity)?;
         // A witness with a hole in the chain has an incomplete trajectory, and
@@ -703,8 +1034,11 @@ impl<R: Ruleset> Witness<R> {
             self.counters.judgements_deferred += 1;
             return None;
         }
-        let mut diverged: Option<Tick> = None;
+        let mut diverged: Option<u64> = None;
         for (tick, claim) in &watched.claims {
+            if watched.reported.contains(tick) {
+                continue;
+            }
             let Some(previous) = tick.checked_sub(1) else {
                 continue;
             };
@@ -712,13 +1046,36 @@ impl<R: Ruleset> Witness<R> {
                 continue;
             };
             if *computed != claim.state_hash {
-                diverged = Some(Tick::new(*tick));
+                diverged = Some(*tick);
                 break;
             }
         }
         let at = diverged?;
+        if let Some(watched) = self.watched.get_mut(&entity) {
+            watched.reported.insert(at);
+        }
         self.counters.claim_mismatches += 1;
-        Some(WitnessSignal::ClaimMismatch { entity, at })
+        Some(WitnessSignal::ClaimMismatch {
+            entity,
+            at: Tick::new(at),
+        })
+    }
+
+    /// The window to raise for a divergence found at `at` (stage 2).
+    ///
+    /// Opens at the newest claim tick this witness holds a snapshot for — the
+    /// last point at which witness and subject demonstrably agreed — and closes
+    /// at the disputed claim, so the bundle contains something the subject
+    /// signed. Bounded by [`WitnessConfig::window_ticks`].
+    ///
+    /// Returns `None` when no agreed claim is close enough, which is the honest
+    /// answer: there is no window this witness can prove anything over.
+    #[must_use]
+    pub fn audit_window(&self, entity: PersistId, at: Tick) -> Option<(Tick, Tick)> {
+        let watched = self.watched.get(&entity)?;
+        let earliest = at.0.saturating_sub(self.window_ceiling());
+        let start = *watched.snapshotted.range(earliest..at.0).next_back()?;
+        Some((Tick::new(start), at))
     }
 
     /// Assemble a report for a window, honouring shadow mode.
@@ -729,7 +1086,12 @@ impl<R: Ruleset> Witness<R> {
     ///
     /// # Errors
     ///
-    /// [`WitnessError::NotWatched`] when the entity is not watched.
+    /// [`WitnessError::NotWatched`] when the entity is not watched, and
+    /// [`WitnessError::WindowUnservable`] when the window is out of range or
+    /// cannot be assembled from what is held. That is deliberately an error
+    /// rather than a quiet `Report(None)`: returning shadow mode's own value
+    /// for "could not" is how a witness that has gone structurally mute keeps
+    /// looking like one that is merely being careful.
     pub fn raise(
         &mut self,
         key: &iroh_base::SecretKey,
@@ -744,19 +1106,41 @@ impl<R: Ruleset> Witness<R> {
             return Ok(WitnessSignal::Report(None));
         }
 
-        let computed: Vec<_> = (window.0 .0..window.1 .0)
-            .map(|tick| watched.computed.get(&tick).copied().unwrap_or([0; 32]))
-            .collect();
-        let Ok(bundle) = self.log.assemble_bundle(entity, window, computed) else {
-            // A window the witness cannot serve is not an accusation it can
-            // make. Silence here is correct: the adjudicator would answer
-            // `Unadjudicable`, which strikes nobody and costs a round trip.
-            return Ok(WitnessSignal::Report(None));
-        };
+        let span = window.1 .0.saturating_sub(window.0 .0);
+        if span == 0 || span > self.window_ceiling() {
+            return Err(WitnessError::WindowUnservable);
+        }
+        let computed = self.computed_window(entity, window)?;
+        let bundle = self
+            .log
+            .assemble_bundle(entity, window, computed)
+            .map_err(|_| WitnessError::WindowUnservable)?;
         self.counters.reports_filed += 1;
         Ok(WitnessSignal::Report(Some(Box::new(sign_report(
             key, subject, bundle,
         )))))
+    }
+
+    /// This witness's own trajectory across a window.
+    ///
+    /// Every tick has to come from re-execution. Substituting zeros for ticks
+    /// the witness never computed would put a run of fabricated hashes into the
+    /// one artefact whose whole purpose is to explain itself — advisory or not.
+    fn computed_window(
+        &self,
+        entity: PersistId,
+        window: (Tick, Tick),
+    ) -> Result<Vec<[u8; 32]>, WitnessError> {
+        let watched = self.watched.get(&entity).ok_or(WitnessError::NotWatched)?;
+        (window.0 .0..window.1 .0)
+            .map(|tick| {
+                watched
+                    .computed
+                    .get(&tick)
+                    .copied()
+                    .ok_or(WitnessError::WindowUnservable)
+            })
+            .collect()
     }
 
     /// Re-execute a window from retained frames, for a caller that wants the
@@ -764,19 +1148,17 @@ impl<R: Ruleset> Witness<R> {
     ///
     /// # Errors
     ///
-    /// [`WitnessError::NotWatched`] when nothing is retained for the entity.
+    /// [`WitnessError::NotWatched`] when nothing is retained for the entity,
+    /// [`WitnessError::WindowUnservable`] when the window cannot be assembled.
     pub fn replay_window(
         &self,
         entity: PersistId,
         window: (Tick, Tick),
     ) -> Result<EvidenceBundle, WitnessError> {
-        let watched = self.watched.get(&entity).ok_or(WitnessError::NotWatched)?;
-        let computed: Vec<_> = (window.0 .0..window.1 .0)
-            .map(|tick| watched.computed.get(&tick).copied().unwrap_or([0; 32]))
-            .collect();
+        let computed = self.computed_window(entity, window)?;
         self.log
             .assemble_bundle(entity, window, computed)
-            .map_err(|_| WitnessError::NotWatched)
+            .map_err(|_| WitnessError::WindowUnservable)
     }
 
     /// A fresh harness over this witness's ruleset build and universe seed.

@@ -190,6 +190,7 @@ impl Authority {
         let key = subject_key();
         let prev_head = self.head;
         let mut records = Vec::new();
+        let mut hashes = Vec::new();
 
         for offset in 0..3u64 {
             let tick = first_tick + offset;
@@ -205,9 +206,11 @@ impl Authority {
             };
             self.head = orrery_core::log::fold(self.head, &record);
             records.push(record);
-            self.executor
+            let outcome = self
+                .executor
                 .step_entity(ENTITY, Tick::new(tick), &inputs)
                 .expect("entity present");
+            hashes.push(outcome.state_hash);
         }
 
         let transitions = vec![HeadTransition {
@@ -216,6 +219,7 @@ impl Authority {
             head: self.head,
         }];
         PublishFrame {
+            tick_hashes: vec![(ENTITY, hashes)],
             frame: LogFrame {
                 ruleset: RULESET,
                 first_tick: Tick::new(first_tick),
@@ -637,10 +641,18 @@ fn a_peer_alone_in_its_island_still_retains_what_it_authored() {
 }
 
 #[test]
-fn a_frame_from_a_peer_the_witness_does_not_watch_is_refused_not_ingested() {
-    // Watching is per subject. A frame from anyone else must not enter the
-    // chain, however well-formed it is.
+fn a_repair_goes_to_the_authority_not_to_whoever_relayed_the_frame() {
+    // Watching is per subject, and the engine checks every frame against the
+    // watched authority's key — so a forged frame cannot enter a chain however
+    // it arrives. What arrival *can* do is open a hole: a third party replaying
+    // the subject's own genuine frames out of order makes the chain fail to
+    // fold. If the resulting range request went back to whoever delivered the
+    // frame, that peer would collect the repair traffic it provoked and simply
+    // never answer, until the witness escalated `Stalled` against an authority
+    // that was never asked. The same mistake in the other direction stamps every
+    // signal, report and counter downstream with the wrong peer.
     let (mut authority, mut witness, mut source) = pair();
+    let subject = subject_key().public();
     let stranger = iroh_base::SecretKey::from_bytes(&[99; 32]).public();
 
     authority
@@ -648,20 +660,164 @@ fn a_frame_from_a_peer_the_witness_does_not_watch_is_refused_not_ingested() {
         .resource_mut::<Messages<PublishFrame>>()
         .write(source.send(T0));
     authority.update();
+    pump(&mut authority, &mut witness, subject, |_| false);
+    witness.update();
+    let _ = signals(&mut witness);
+    witness
+        .world_mut()
+        .resource_mut::<Messages<SendPacket>>()
+        .clear();
+
+    // One frame lost, and the next relayed by a stranger — all it takes.
+    let _lost = source.send(T0 + 3);
+    authority
+        .world_mut()
+        .resource_mut::<Messages<PublishFrame>>()
+        .write(source.send(T0 + 6));
+    authority.update();
     pump(&mut authority, &mut witness, stranger, |_| false);
     witness.update();
 
-    // The frame names a watched entity, so it is ingested and checked against
-    // the *watched* subject's key — where it fails, because the sender is not
-    // who authored it. What must not happen is silent acceptance.
-    let state = witness.world().resource::<WitnessState<Kinematic>>();
-    assert_eq!(
-        state.0.counters().frames_accepted,
-        1,
-        "the frame is genuinely signed by the subject it names"
+    let raised = signals(&mut witness);
+    assert!(
+        raised
+            .iter()
+            .any(|s| matches!(s.signal, WitnessSignal::Gap(_))),
+        "the out-of-order relay opens a hole, got {raised:?}"
     );
     assert!(
-        signals(&mut witness).iter().all(|s| s.subject == stranger),
-        "a signal is attributed to whoever handed the frame over"
+        raised.iter().all(|s| s.subject == subject),
+        "a signal names the authority it is about, not the carrier: {raised:?}"
+    );
+
+    let outbound: Vec<SendPacket> = witness
+        .world_mut()
+        .resource_mut::<Messages<SendPacket>>()
+        .drain()
+        .collect();
+    assert!(!outbound.is_empty(), "the hole must be asked about");
+    assert!(
+        outbound.iter().all(|packet| packet.to == subject),
+        "a repair addressed to the relayer is one nobody will answer"
+    );
+}
+
+#[test]
+fn the_authored_log_is_bounded_and_carries_the_hashes_a_bundle_needs() {
+    // Retention is "the last three seconds", not "everything since launch".
+    // Nothing pruned this log, so it grew for the whole session — and
+    // `serve_range` scans that deque linearly on every repair, so the cost of
+    // answering one grew with it. The repair budget caps the bandwidth; it
+    // cannot cap the scan.
+    let mut solo = App::new();
+    solo.add_plugins(MinimalPlugins)
+        .add_message::<PeerPacket>()
+        .add_message::<SendPacket>()
+        .init_resource::<IslandMembership>()
+        .add_plugins(WitnessPlugin::<Kinematic>::new());
+
+    let mut source = Authority::new();
+    let _ = source.anchor();
+    for round in 0..300u64 {
+        solo.world_mut()
+            .resource_mut::<Messages<PublishFrame>>()
+            .write(source.send(T0 + round * 3));
+        solo.update();
+    }
+
+    let log = &solo.world().resource::<orrery_witness::AuthoredLog>().0;
+    let range = |from: u64, to: u64| orrery_protocol::LogRangeRequest {
+        entity: ENTITY,
+        chain_epoch: 0,
+        from_tick: Tick::new(from),
+        to_tick: Tick::new(to),
+    };
+    assert!(
+        log.serve_range(&range(T0, T0 + 3), 64 * 1024)
+            .response
+            .frames
+            .is_empty(),
+        "the first frame of a 900-tick session is long past retention"
+    );
+    let recent = T0 + 297 * 3;
+    assert!(
+        !log.serve_range(&range(recent, recent + 3), 64 * 1024)
+            .response
+            .frames
+            .is_empty(),
+        "...but the window a dispute would actually open on is kept"
+    );
+
+    // And the per-tick hashes came with the frames. Without them every window
+    // this peer authored fails `IncompleteHashes`, so it can serve everyone
+    // else's repairs and still be unable to answer for itself.
+    assert!(
+        log.claimed_hashes(ENTITY, (Tick::new(recent), Tick::new(recent + 3)))
+            .is_some(),
+        "an authority has to be able to assemble its own window"
+    );
+}
+
+#[test]
+fn one_peer_asking_hard_cannot_evict_every_other_witnesss_repair() {
+    // The queue drops its oldest entry when full, which is right *within* a
+    // requester — its own backoff has superseded the older ask. Across
+    // requesters it is backwards: queueing is not metered, so one peer asking
+    // hard enough pushes every other witness out and keeps them out. An
+    // unfilled hole escalates to `Stalled`, so that turns one noisy peer into
+    // false findings against a third party.
+    use orrery_net::budget::{Bandwidth, UploadBudget};
+    use orrery_witness::plugin::RepairRequest;
+    use orrery_witness::{PendingRepairs, RepairBudget};
+
+    let mut app = App::new();
+    app.add_plugins(MinimalPlugins)
+        .add_message::<PeerPacket>()
+        .add_message::<SendPacket>()
+        .init_resource::<IslandMembership>()
+        .add_plugins(WitnessPlugin::<Kinematic>::new());
+    // No allowance, so everything queues and nothing drains — this is about who
+    // holds the queue, not who gets served.
+    app.insert_resource(UploadBudget {
+        sustained: Bandwidth::from_bits_per_sec(0),
+        ..UploadBudget::default()
+    });
+
+    let greedy = iroh_base::SecretKey::from_bytes(&[77; 32]).public();
+    let honest = witness_key().public();
+    let ask = |from: NodeId, tick: u64| RepairRequest {
+        from,
+        request: orrery_protocol::LogRangeRequest {
+            entity: ENTITY,
+            chain_epoch: 0,
+            from_tick: Tick::new(tick),
+            to_tick: Tick::new(tick + 3),
+        },
+    };
+
+    {
+        let mut requests = app.world_mut().resource_mut::<Messages<RepairRequest>>();
+        for tick in 0..200u64 {
+            requests.write(ask(greedy, tick));
+        }
+        requests.write(ask(honest, 1_000));
+    }
+    app.update();
+
+    let limit = app.world().resource::<RepairBudget>().per_peer_limit;
+    let pending = app.world().resource::<PendingRepairs>();
+    assert_eq!(
+        pending.queued_for(greedy),
+        limit,
+        "a peer holds its own share and no more"
+    );
+    assert_eq!(
+        pending.queued_for(honest),
+        1,
+        "and the one honest request is still there to be served"
+    );
+    assert!(
+        pending.overflowed >= 190,
+        "the excess was dropped, not queued"
     );
 }

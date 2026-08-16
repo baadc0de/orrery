@@ -597,3 +597,189 @@ fn an_anchor_the_subject_did_not_sign_is_refused() {
         })
         .is_err());
 }
+
+#[test]
+fn a_disputed_claim_is_raised_once_not_once_per_packet() {
+    // A divergence is a fact about a claim, not about the frame that happened
+    // to arrive next. Re-scanning the retained claims on every ingest finds the
+    // same disagreement again and again — at the default 600-tick retention,
+    // hundreds of times per real divergence — so `claim_mismatches` would
+    // measure the ingest rate rather than count divergences. P4 exists to
+    // produce exactly that count, which makes this a measurement bug and not
+    // only a noise one. It is the same defect `Catchup::reported` fixed for
+    // gaps.
+    let mut authority = Authority::new(3);
+    let mut witness = watching(WitnessConfig::default(), &mut authority);
+    let signals = stream(&mut witness, &mut authority, 20);
+
+    let mut at: Vec<Tick> = signals
+        .iter()
+        .filter_map(|signal| match signal {
+            WitnessSignal::ClaimMismatch { at, .. } => Some(*at),
+            _ => None,
+        })
+        .collect();
+    let raised = at.len();
+    at.sort_unstable();
+    at.dedup();
+    assert_eq!(
+        raised,
+        at.len(),
+        "the same claim was disputed twice: {at:?}"
+    );
+    assert_eq!(
+        at,
+        vec![Tick::new(T0 + CLAIM_EVERY), Tick::new(T0 + 2 * CLAIM_EVERY)],
+        "one finding per signed claim that does not hold up"
+    );
+    assert_eq!(witness.counters().claim_mismatches, raised as u64);
+}
+
+#[test]
+fn a_report_can_be_filed_from_a_window_later_than_the_anchor() {
+    // A witness is never sent state, so the only snapshot it can open a bundle
+    // from is one it computed itself. Retaining only the anchor it was handed
+    // makes `[anchor, anchor+180)` the sole window it can ever serve — and the
+    // anchor ages out of retention long before the session does, so past a few
+    // seconds of watching the witness is structurally unable to file anything
+    // at all. Every other test here files from the anchor, which is exactly why
+    // that went unnoticed.
+    let mut authority = Authority::new(1);
+    let mut witness = watching(
+        WitnessConfig {
+            shadow_mode: false,
+            ..WitnessConfig::default()
+        },
+        &mut authority,
+    );
+    stream(&mut witness, &mut authority, 40);
+
+    let later = (
+        Tick::new(T0 + 2 * CLAIM_EVERY),
+        Tick::new(T0 + 3 * CLAIM_EVERY),
+    );
+    let raised = witness
+        .raise(&witness_key(), ENTITY, later)
+        .expect("a window opening at an agreed claim is servable");
+    let WitnessSignal::Report(Some(report)) = raised else {
+        panic!("expected a filed report, got {raised:?}");
+    };
+    assert_eq!(report.bundle.window_start, later.0);
+    assert!(orrery_witness::verify_report(&report).is_ok());
+
+    // And it is real evidence, not merely well-formed: an honest peer's own
+    // window exonerates it.
+    let mut adjudicator = orrery_persistd::AdjudicationExecutor::new(SEED);
+    adjudicator.register(|| Kinematic);
+    assert_eq!(adjudicator.adjudicate(&report), Verdict::Exonerates);
+}
+
+#[test]
+fn the_audit_window_opens_at_the_last_claim_the_two_agreed_on() {
+    // Stage 2 has to pick a t0 the *subject* still stands behind. Opening at a
+    // claim the witness already disagrees with would fail the snapshot hash
+    // check at the adjudicator — which is read as `EvidenceForged` against the
+    // reporter, so a witness that got this wrong would convict itself for
+    // catching a cheat.
+    let mut authority = Authority::new(3);
+    let mut witness = watching(
+        WitnessConfig {
+            shadow_mode: false,
+            ..WitnessConfig::default()
+        },
+        &mut authority,
+    );
+    stream(&mut witness, &mut authority, 20);
+
+    let at = Tick::new(T0 + CLAIM_EVERY);
+    let window = witness
+        .audit_window(ENTITY, at)
+        .expect("the anchor is still the last agreed point");
+    assert_eq!(window, (Tick::new(T0), at));
+
+    let raised = witness
+        .raise(&witness_key(), ENTITY, window)
+        .expect("filed");
+    let WitnessSignal::Report(Some(report)) = raised else {
+        panic!("expected a filed report, got {raised:?}");
+    };
+    let mut adjudicator = orrery_persistd::AdjudicationExecutor::new(SEED);
+    adjudicator.register(|| Kinematic);
+    assert!(
+        matches!(adjudicator.adjudicate(&report), Verdict::Confirms { .. }),
+        "the window stage 2 chose must be one the cluster can adjudicate"
+    );
+}
+
+#[test]
+fn a_window_the_witness_cannot_serve_is_an_error_not_silence() {
+    // `Report(None)` is shadow mode's answer, and it means "we chose not to
+    // file". Returning it for "we could not" as well is how a witness that has
+    // gone structurally mute keeps looking like one that is being careful.
+    let mut authority = Authority::new(1);
+    let mut witness = watching(
+        WitnessConfig {
+            shadow_mode: false,
+            ..WitnessConfig::default()
+        },
+        &mut authority,
+    );
+    stream(&mut witness, &mut authority, 20);
+
+    // Mid-claim: no committed state to open from.
+    assert_eq!(
+        witness.raise(
+            &witness_key(),
+            ENTITY,
+            (Tick::new(T0 + 5), Tick::new(T0 + 35))
+        ),
+        Err(orrery_witness::WitnessError::WindowUnservable)
+    );
+    // Past everything re-executed: the missing ticks are missing, not zero.
+    assert_eq!(
+        witness.raise(
+            &witness_key(),
+            ENTITY,
+            (Tick::new(T0), Tick::new(T0 + 4 * CLAIM_EVERY))
+        ),
+        Err(orrery_witness::WitnessError::WindowUnservable)
+    );
+    assert_eq!(
+        witness.counters().reports_filed,
+        0,
+        "nothing was filed, and nothing pretended to be"
+    );
+}
+
+#[test]
+fn a_subject_that_goes_quiet_inside_a_hole_is_still_escalated() {
+    // Every other repair check hangs off a frame arriving. A subject that stops
+    // sending therefore sits in `catchup` forever — unjudged, unescalated, and
+    // costing nothing to maintain. That is the cheap version of the stall the
+    // escalation threshold exists to close, so the clock has to come from
+    // somewhere other than the subject.
+    let mut authority = Authority::new(1);
+    let mut witness = watching(WitnessConfig::default(), &mut authority);
+
+    witness
+        .ingest_frame(&authority.send(T0).frame, &[])
+        .expect("the first frame lands");
+    let _lost = authority.send(T0 + 3);
+    let third = authority.send(T0 + 6);
+    let opened = witness.ingest_frame(&third.frame, &[]).expect("a gap");
+    assert!(matches!(opened.as_slice(), [WitnessSignal::Gap(_)]));
+
+    // Now silence. Only the local clock advances.
+    let mut stalled = 0;
+    let mut now = T0 + 6;
+    for _ in 0..40 {
+        now += 30;
+        for signal in witness.sweep(Tick::new(now)) {
+            if matches!(signal, WitnessSignal::Stalled { .. }) {
+                stalled += 1;
+            }
+        }
+    }
+    assert_eq!(stalled, 1, "escalated once, on a subject that said nothing");
+    assert_eq!(witness.counters().stalled, 1);
+}
