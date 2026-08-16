@@ -174,8 +174,8 @@ optimistic weak/strong claims,
 (`ClaimId::REGISTRAR` → `AuthorityEvent::Inherited`), holder-initiated
 `LeaseClient::divest`, loss-of-authority reconciliation, the contact-island
 propagation planner, and the registrar-free ephemeral path (`IslandClient`,
-`EphemeralRegistry`, `IslandAuthoritative`). `orrery_persistd` implements the actor-owned
-lease registrar, strict gateway fencing, committed rekey, the `SuccessorPolicy`
+`EphemeralRegistry`, `IslandAuthoritative`). `orrery_persistd` implements the
+actor-owned lease registrar, strict gateway fencing, committed rekey, the `SuccessorPolicy`
 seam with its coordinator-interest-ranked default, and `AuthorityMetrics`.
 `orrery_predict` and `orrery_coordinator` retain their P1/P4 scaffolding;
 coordinator-driven movement orchestration is not part of the delivered slice.

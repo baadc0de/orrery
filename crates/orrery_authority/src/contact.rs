@@ -114,6 +114,11 @@ pub struct ContactBody {
 /// Game code fills this from its solver and the planner consumes it; the
 /// planner never reads physics types, which is what keeps it testable without
 /// a solver and unchanged by the D13 physics posture.
+///
+/// [`propagate_contact_islands`] clears it after planning, so the report is
+/// per-tick by construction and a solver system that stops running cannot leave
+/// a stale contact graph generating claims. Fill it before that system runs;
+/// anything written after it is read on the following tick.
 #[derive(Debug, Default, Resource)]
 pub struct ContactObservations {
     /// Every body named by a contact this tick.
