@@ -13,6 +13,8 @@ categories = ["game-development", "network-programming"]
 # from github.com/aecsocket/aeronet @ main, with orrery's additions:
 # - `PathReport` component: relay-vs-direct path kind, RTT, time-to-direct
 # - prompt relay→direct migration reporting via `Connection::path_events()`
+# - `stream` module: a reliable message lane over QUIC uni streams, alongside
+#   the datagram lane, with a per-message shared/bulk stream assignment
 # Upstreaming intent (orrery D4): keep this diff minimal so it can become a
 # PR against the aeronet repo.
 

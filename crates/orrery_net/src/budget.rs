@@ -46,6 +46,41 @@ use orrery_protocol::NodeId;
 /// docs/03-replication.md §7 uses 60 B for the same modelling.
 pub const DATAGRAM_OVERHEAD_BYTES: u64 = 60;
 
+/// Per-message overhead on the reliable lane: the lane's own `u32` length
+/// prefix, plus a QUIC `STREAM` frame header (type, stream id, offset, length).
+///
+/// This is charged **once per message**, not once per packet — the packet-level
+/// cost is [`DATAGRAM_OVERHEAD_BYTES`] per MTU of payload, which
+/// [`stream_wire_bytes`] adds separately.
+pub const STREAM_MESSAGE_OVERHEAD_BYTES: u64 = 4 + 12;
+
+/// What one datagram of `payload` bytes costs on the wire.
+#[must_use]
+pub const fn datagram_wire_bytes(payload: usize) -> u64 {
+    payload as u64 + DATAGRAM_OVERHEAD_BYTES
+}
+
+/// What one reliable-lane message of `payload` bytes costs on the wire.
+///
+/// A stream message is not one datagram. It is cut into as many packets as the
+/// path MTU requires, each carrying the same IP+UDP+QUIC framing a datagram
+/// does, plus one `STREAM` frame header for the message itself. Charging it a
+/// flat [`DATAGRAM_OVERHEAD_BYTES`] would *understate* a 40 kB repair by about
+/// two kilobytes and *overstate* a 30-byte lease ack — which is the wrong sign
+/// in both directions, since the first is what the budget exists to bound.
+///
+/// Retransmission is deliberately not modelled. The meter's job is to bound
+/// what this peer *offers* the link; what loss then costs is the link's to
+/// report, and folding an assumed loss rate in here would make the budget
+/// depend on a number no sender knows.
+#[must_use]
+pub fn stream_wire_bytes(payload: usize, mtu: usize) -> u64 {
+    let bytes = payload as u64 + STREAM_MESSAGE_OVERHEAD_BYTES;
+    let mtu = (mtu as u64).max(1);
+    let packets = bytes.div_ceil(mtu).max(1);
+    bytes + packets * DATAGRAM_OVERHEAD_BYTES
+}
+
 /// The share of a link's budget the high-rate set may spend (docs/03 §9.3).
 ///
 /// The residual is reserved for the 1 Hz proxy floor, so a crowded interest set
@@ -279,14 +314,26 @@ impl UploadMeter {
     /// Charge a packet of `payload` bytes to `peer` at `now`, with wire
     /// overhead included.
     pub fn record(&mut self, budget: UploadBudget, now: Duration, peer: NodeId, payload: usize) {
-        let wire = payload as u64 + DATAGRAM_OVERHEAD_BYTES;
+        self.record_wire(budget, now, peer, datagram_wire_bytes(payload));
+    }
+
+    /// Charge an already-costed send of `wire` bytes to `peer` at `now`.
+    ///
+    /// The two lanes cost differently — see [`stream_wire_bytes`] — so the
+    /// caller that knows which lane it is on computes the figure and this
+    /// records it.
+    pub fn record_wire(&mut self, budget: UploadBudget, now: Duration, peer: NodeId, wire: u64) {
         self.total_meter(budget).record(now, wire);
         self.peer_meter(budget, peer).record(now, wire);
     }
 
     /// Whether a packet of `payload` bytes would exceed the budget now.
     pub fn would_exceed(&mut self, budget: UploadBudget, now: Duration, payload: usize) -> bool {
-        let wire = payload as u64 + DATAGRAM_OVERHEAD_BYTES;
+        self.would_exceed_wire(budget, now, datagram_wire_bytes(payload))
+    }
+
+    /// Whether an already-costed send of `wire` bytes would exceed the budget.
+    pub fn would_exceed_wire(&mut self, budget: UploadBudget, now: Duration, wire: u64) -> bool {
         self.total_meter(budget).would_exceed(now, wire, budget)
     }
 

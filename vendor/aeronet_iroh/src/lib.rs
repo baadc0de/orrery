@@ -12,6 +12,7 @@ extern crate alloc;
 
 pub mod endpoint;
 pub mod session;
+pub mod stream;
 #[cfg(feature = "test-utils")]
 pub mod test_utils;
 

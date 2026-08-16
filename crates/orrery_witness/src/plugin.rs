@@ -37,8 +37,8 @@ use orrery_core::store::AuthorityLog;
 use orrery_core::{log::HeadTransition, Ruleset};
 use orrery_net::budget::{Bandwidth, RateMeter, UploadBudget};
 use orrery_net::channels::{decode_witness, encode_witness, Channel};
-use orrery_net::peer_link::payload_budget;
-use orrery_net::{IslandMembership, PeerPacket, SendPacket};
+use orrery_net::peer_link::{control_payload_budget, payload_budget};
+use orrery_net::{IslandMembership, PeerPacket, SendPacket, StreamMode};
 use orrery_protocol::{
     FrameHead, LogFrame, LogRangeRequest, NodeId, PersistId, StateClaim, Tick, WitnessMsg,
 };
@@ -50,7 +50,44 @@ use crate::witness::{Witness, WitnessSignal};
 /// Deliberately conservative: overshooting means the response is refused by the
 /// peer lane and the gap never fills, while undershooting only costs an extra
 /// round trip.
+///
+/// Since the control lane became QUIC streams this is only the *floor* — see
+/// [`repair_response_budget`], which sizes an answer against what the lane and
+/// the budget will actually carry rather than against one packet.
 pub const ASSUMED_MTU: usize = 1200;
+
+/// How many bytes one range response may carry.
+///
+/// # Why this is not the MTU any more
+///
+/// It used to be. `Channel::Control` was a datagram with a different first byte
+/// (`orrery_net`'s peer lane was datagram-only), so an answer had to fit one
+/// packet: refilling a one-second hole took roughly twenty exchanges *per
+/// witness*, and raising the repair share only put more of them in flight —
+/// measured at eight peers, moving the share from 15% to 60% took stalled
+/// subjects from 28 to 51. The MTU was the binding constraint, not the budget.
+///
+/// The lane now rides QUIC streams and has no MTU. What binds instead is the
+/// share of the upload budget repairs may spend, so that is what an answer is
+/// sized against — `allowance` bytes, floored at the old one-packet budget so
+/// this can never serve *less* than it used to, and capped at what the lane
+/// will carry.
+///
+/// The floor also carries a progress guarantee: an answer never exceeds one
+/// window's allowance, so a response can always be paid for out of an empty
+/// window. Sizing against the lane's full megabyte instead would build
+/// responses no window could ever afford, and the queue would never drain.
+///
+/// The resume-from-here machinery stays either way — a range can still exceed
+/// this — but at a 15% share of 1 Mbps it stops being the common path.
+#[must_use]
+pub fn repair_response_budget(allowance: &UploadBudget) -> usize {
+    let per_window =
+        usize::try_from(allowance.sustained.bytes_over(allowance.window)).unwrap_or(usize::MAX);
+    per_window
+        .max(payload_budget(ASSUMED_MTU))
+        .min(control_payload_budget())
+}
 
 /// A frame this peer authored, on its way out.
 ///
@@ -320,6 +357,7 @@ pub fn publish_authored(
                 to: *peer,
                 channel: Channel::State,
                 payload: payload.clone(),
+                mode: StreamMode::Shared,
             });
         }
     }
@@ -334,6 +372,7 @@ pub fn publish_authored(
                 to: *peer,
                 channel: Channel::State,
                 payload: payload.clone(),
+                mode: StreamMode::Shared,
             });
         }
     }
@@ -475,6 +514,7 @@ pub fn ingest_peer_traffic<R>(
                                 ),
                             },
                         ))),
+                        mode: StreamMode::Shared,
                     });
                 }
             }
@@ -577,6 +617,10 @@ fn route<R: Ruleset + Send + Sync + 'static>(
                 to: subject,
                 channel: Channel::Control,
                 payload: Bytes::from(encode_witness(&WitnessMsg::RangeRequest(request.clone()))),
+                // The shared stream: a request is one packet and ordering is
+                // free. Only the *response* is bulk enough to want a stream of
+                // its own — see `serve_repair_requests`.
+                mode: StreamMode::Shared,
             });
         }
         signals.write(Witnessed { subject, signal });
@@ -739,10 +783,10 @@ pub fn serve_repair_requests(
     };
     let meter = meter.get_or_insert_with(|| RateMeter::new(allowance.window));
 
+    let response_budget = repair_response_budget(&allowance);
+
     while let Some(asked) = pending.queue.front().cloned() {
-        let served = log
-            .0
-            .serve_range(&asked.request, payload_budget(ASSUMED_MTU));
+        let served = log.0.serve_range(&asked.request, response_budget);
         // An empty answer is still sent. Silence is indistinguishable from a
         // dropped repair, and a witness that cannot tell "I have nothing" from
         // "you ignored me" would eventually report an honest peer for the
@@ -771,6 +815,25 @@ pub fn serve_repair_requests(
         out.write(SendPacket {
             to: asked.from,
             channel: Channel::Control,
+            // A stream of its own, not the shared control stream — the one
+            // place in this crate where the distinction is worth spending.
+            //
+            // A range response is bulk; the shared stream also carries lease
+            // traffic and handoff acks, which are small, latency-critical, and
+            // have nothing to do with this peer's hole. `p4-streams-bench`
+            // measures both halves of the trade over real QUIC at 3% loss on a
+            // 40 ms link, across four seeds: mixing them costs sparse control
+            // 2-5x its median and 3-6x its p95, and separating them costs this
+            // response's own tail 1.4-2x.
+            //
+            // Paying the second to avoid the first is a judgement about *this*
+            // crate rather than a benchmark result. A repair is already slow on
+            // purpose — one outstanding at a time, on a backoff, with judgement
+            // deferred while the witness catches up — so a longer tail lands on
+            // machinery built to absorb it. A lease operation five times slower
+            // has nothing to absorb it. The requests stay on the shared stream,
+            // where they are one packet each and ordering is free.
+            mode: StreamMode::Bulk,
             payload: Bytes::from(payload),
         });
     }

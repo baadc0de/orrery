@@ -157,6 +157,15 @@ jobs:
       - name: P1 swarm gate self-test
         run: scripts/p1-swarm-gate.sh --self-test
 
+      # `p4-streams-bench` is a measurement, not a gate — its figures are in its
+      # README and the channel-policy decision they justify is in
+      # docs/02-networking.md §7. What CI owes it is that it still builds and
+      # its unit tests still pass: it has its own workspace, so nothing else
+      # here would notice it rotting.
+      - name: P4 streams benchmark builds and self-tests
+        working-directory: p4-streams-bench
+        run: cargo test
+
   test:
     name: workspace tests
     runs-on: ubuntu-latest

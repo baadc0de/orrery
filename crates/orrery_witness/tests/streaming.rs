@@ -21,7 +21,7 @@ use orrery_core::{
     StateView, StepOutput, TickRng,
 };
 use orrery_net::channels::Channel;
-use orrery_net::{IslandMembership, PeerPacket, SendPacket};
+use orrery_net::{IslandMembership, PeerPacket, SendPacket, StreamMode};
 use orrery_protocol::coord::{IslandId, PeerEntry, TopologyRegime};
 use orrery_protocol::{
     ChainHash, EntitySlice, InputRecord, LogFrame, NodeId, PersistId, RecordSource, RulesetId,
@@ -468,6 +468,7 @@ fn ask_for_range(app: &mut App, from: u64, to: u64) {
                     to_tick: Tick::new(to),
                 }),
             )),
+            mode: StreamMode::Shared,
         });
 }
 
@@ -819,5 +820,48 @@ fn one_peer_asking_hard_cannot_evict_every_other_witnesss_repair() {
     assert!(
         pending.overflowed >= 190,
         "the excess was dropped, not queued"
+    );
+}
+
+#[test]
+fn a_repair_is_sized_against_the_lane_not_against_one_packet() {
+    // The measured constraint the stream lane exists to remove. On the datagram
+    // lane an answer had to fit ~1200 bytes, so a one-second hole took roughly
+    // twenty exchanges per witness and more repair budget only put more of them
+    // in flight. Sized against the repair allowance instead, one answer carries
+    // an order of magnitude more.
+    use orrery_net::budget::UploadBudget;
+    use orrery_witness::plugin::{repair_response_budget, ASSUMED_MTU};
+
+    let allowance = UploadBudget {
+        sustained: orrery_net::budget::Bandwidth::from_bits_per_sec(150_000),
+        window: core::time::Duration::from_secs(1),
+    };
+    let budget = repair_response_budget(&allowance);
+    assert!(
+        budget > orrery_net::peer_link::payload_budget(ASSUMED_MTU) * 10,
+        "expected an answer far past one packet, got {budget} B"
+    );
+
+    // And never more than one window can pay for, or the queue would hold a
+    // response no allowance could ever afford and would never drain.
+    assert!(budget as u64 <= allowance.sustained.bytes_over(allowance.window));
+}
+
+#[test]
+fn a_tiny_allowance_still_serves_at_least_one_packet() {
+    // The floor. A budget so small that a window affords nothing would other-
+    // wise serve empty answers forever, which a witness reads as "cannot
+    // serve" — an accusation, from a peer that had the frames all along.
+    use orrery_net::budget::{Bandwidth, UploadBudget};
+    use orrery_witness::plugin::{repair_response_budget, ASSUMED_MTU};
+
+    let starved = UploadBudget {
+        sustained: Bandwidth::from_bits_per_sec(100),
+        window: core::time::Duration::from_secs(1),
+    };
+    assert_eq!(
+        repair_response_budget(&starved),
+        orrery_net::peer_link::payload_budget(ASSUMED_MTU)
     );
 }

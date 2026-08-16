@@ -7,11 +7,13 @@ use serde::Serialize;
 
 use orrery_core::CoreCodec;
 use orrery_net::channels::{encode_replication, Channel};
-use orrery_net::peer_link::SendPacket;
+use orrery_net::peer_link::{SendPacket, StreamMode};
 use orrery_protocol::coord::PeerEntry;
 use orrery_protocol::{CellId, NodeId, PersistId, UniverseSeed};
 
 use crate::bot::{Bot, TICK_HZ};
+use aeronet_iroh::stream::{IrohStreamIo, RecvMessage};
+
 use crate::router::{Impairment, Router, RouterCounters};
 
 /// How the swarm is configured for a run.
@@ -327,6 +329,7 @@ impl Swarm {
                 to: peer,
                 channel: Channel::State,
                 payload: Bytes::from(payload.clone()),
+                mode: StreamMode::Shared,
             });
         }
     }
@@ -340,48 +343,76 @@ impl Swarm {
                 // leave — which is what a client stall actually is, and it
                 // leaves the peer's own log intact so it can still answer for
                 // itself when its witnesses come asking.
+                // Both lanes: a client hitch is the socket going unserviced,
+                // and a stalling peer does not get to keep its reliable lane
+                // flowing while its datagrams stop.
                 let world = self.bots[index].app.world_mut();
-                let mut query =
-                    world.query::<(&orrery_net::plugin::Peer, &mut aeronet_io::Session)>();
-                for (_, mut session) in query.iter_mut(world) {
+                let mut query = world.query::<(
+                    &orrery_net::plugin::Peer,
+                    &mut aeronet_io::Session,
+                    &mut IrohStreamIo,
+                )>();
+                for (_, mut session, mut streams) in query.iter_mut(world) {
                     session.send.clear();
+                    streams.send.clear();
                 }
                 continue;
             }
-            let mut outbound: Vec<(NodeId, Bytes)> = Vec::new();
+            let mut outbound: Vec<(NodeId, Option<StreamMode>, Bytes)> = Vec::new();
             {
                 let world = self.bots[index].app.world_mut();
-                let mut query =
-                    world.query::<(&orrery_net::plugin::Peer, &mut aeronet_io::Session)>();
-                for (peer, mut session) in query.iter_mut(world) {
+                let mut query = world.query::<(
+                    &orrery_net::plugin::Peer,
+                    &mut aeronet_io::Session,
+                    &mut IrohStreamIo,
+                )>();
+                for (peer, mut session, mut streams) in query.iter_mut(world) {
                     for packet in session.send.drain(..) {
-                        outbound.push((peer.id, packet));
+                        outbound.push((peer.id, None, packet));
+                    }
+                    for message in streams.send.drain(..) {
+                        outbound.push((peer.id, Some(message.mode), message.payload));
                     }
                 }
             }
-            for (to, payload) in outbound {
+            for (to, stream, payload) in outbound {
                 let Some(target) = self.index_of.get(&to).copied() else {
                     self.router.counters.misaddressed += 1;
                     continue;
                 };
-                self.router.accept(tick, node, target, payload);
+                match stream {
+                    Some(mode) => self.router.accept_stream(tick, node, target, mode, payload),
+                    None => self.router.accept(tick, node, target, payload),
+                }
             }
         }
     }
 
-    /// Hand every due packet to its recipient's session buffer.
+    /// Hand every due packet to its recipient's buffer, on the lane it came in on.
     fn deliver(&mut self, tick: u64) {
-        for (to, from, payload) in self.router.deliver_due(tick) {
-            let world = self.bots[to].app.world_mut();
-            let mut query = world.query::<(&orrery_net::plugin::Peer, &mut aeronet_io::Session)>();
-            for (peer, mut session) in query.iter_mut(world) {
-                if peer.id == from {
-                    session.recv.push(aeronet_io::packet::RecvPacket {
-                        payload,
+        for delivery in self.router.deliver_due(tick) {
+            let world = self.bots[delivery.to].app.world_mut();
+            let mut query = world.query::<(
+                &orrery_net::plugin::Peer,
+                &mut aeronet_io::Session,
+                &mut IrohStreamIo,
+            )>();
+            for (peer, mut session, mut streams) in query.iter_mut(world) {
+                if peer.id != delivery.from {
+                    continue;
+                }
+                if delivery.stream.is_some() {
+                    streams.recv.push(RecvMessage {
+                        payload: delivery.payload,
                         recv_at: bevy_platform::time::Instant::now(),
                     });
-                    break;
+                } else {
+                    session.recv.push(aeronet_io::packet::RecvPacket {
+                        payload: delivery.payload,
+                        recv_at: bevy_platform::time::Instant::now(),
+                    });
                 }
+                break;
             }
         }
     }

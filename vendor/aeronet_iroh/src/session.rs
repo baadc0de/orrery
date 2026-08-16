@@ -37,11 +37,19 @@ impl Plugin for IrohSessionPlugin {
         app.init_resource::<IrohRuntime>()
             .add_systems(
                 PreUpdate,
-                (poll_connecting, poll_connected, poll)
+                (
+                    poll_connecting,
+                    poll_connected,
+                    poll,
+                    crate::stream::poll_streams,
+                )
                     .chain()
                     .in_set(IoSystems::Poll),
             )
-            .add_systems(PostUpdate, flush.in_set(IoSystems::Flush))
+            .add_systems(
+                PostUpdate,
+                (flush, crate::stream::flush_streams).in_set(IoSystems::Flush),
+            )
             .add_observer(on_disconnect);
     }
 }
@@ -292,6 +300,16 @@ impl PathReport {
 /// Minimum packet MTU that an [`IrohIo`] must support.
 pub const MIN_MTU: usize = IP_MTU;
 
+/// The largest message the reliable lane will carry, in bytes.
+///
+/// A stream has no MTU, which is the point — but it also has no natural bound,
+/// and the length prefix on the wire is chosen by the peer. Without a ceiling a
+/// remote could announce four gigabytes and have the reader allocate it. One
+/// mebibyte comfortably holds the bulk transfers the lane exists for (a
+/// cell page-in, a log range) and is small enough that refusing one costs a
+/// connection nothing.
+pub const MAX_STREAM_MESSAGE_LEN: u64 = 1024 * 1024;
+
 /// Error that occurs when opening or polling an Iroh session.
 #[derive(Debug, Display, Error)]
 #[non_exhaustive]
@@ -341,6 +359,26 @@ pub enum SessionError {
     /// This may occur either immediately after connecting to the peer, or after
     /// a connection has been established and the path MTU updates.
     MtuTooSmall(MtuTooSmall),
+    /// Failed to open a stream on the reliable lane.
+    #[display("failed to open stream")]
+    OpenStream(iroh::endpoint::ConnectionError),
+    /// Failed to write a message to the reliable lane.
+    #[display("failed to write stream message")]
+    WriteStream(iroh::endpoint::WriteError),
+    /// Failed to read a message from the reliable lane.
+    #[display("failed to read stream message")]
+    ReadStream(iroh::endpoint::ReadExactError),
+    /// A stream message exceeded [`MAX_STREAM_MESSAGE_LEN`].
+    ///
+    /// On the read side the length is attacker-chosen, so it is refused before
+    /// a buffer is reserved for it rather than after.
+    #[display("stream message of {len} B exceeds the {max} B limit")]
+    StreamMessageTooLarge {
+        /// The length that was refused.
+        len: usize,
+        /// The limit it exceeded.
+        max: u64,
+    },
     /// Unexpectedly lost connection from the peer.
     #[display("connection lost")]
     Connection(iroh::endpoint::ConnectionError),
@@ -389,6 +427,8 @@ pub(crate) struct ToConnected {
     rx_meta: mpsc::Receiver<SessionMeta>,
     rx_packet_from_backend: mpsc::UnboundedReceiver<RecvPacket>,
     tx_packet_to_backend: mpsc::UnboundedSender<Bytes>,
+    rx_message_from_backend: mpsc::UnboundedReceiver<crate::stream::FromBackend>,
+    tx_message_to_backend: mpsc::UnboundedSender<crate::stream::SendMessage>,
     tx_user_dc: oneshot::Sender<String>,
 }
 
@@ -462,6 +502,10 @@ pub(crate) fn poll_connecting(
                 tx_packet_to_backend: next.tx_packet_to_backend,
                 tx_user_dc: Some(next.tx_user_dc),
             },
+            crate::stream::IrohStreamIo::new(
+                next.rx_message_from_backend,
+                next.tx_message_to_backend,
+            ),
             Connected { rx_dc_reason },
             session,
         ));
@@ -715,6 +759,8 @@ async fn start_connected(
     let (tx_meta, rx_meta) = mpsc::channel(1);
     let (tx_packet_to_frontend, rx_packet_from_backend) = mpsc::unbounded();
     let (tx_packet_to_backend, rx_packet_from_frontend) = mpsc::unbounded();
+    let (tx_message_to_frontend, rx_message_from_backend) = mpsc::unbounded();
+    let (tx_message_to_backend, rx_message_from_frontend) = mpsc::unbounded();
     let (tx_user_dc, rx_user_dc) = oneshot::channel();
     tx_connected
         .send(ToConnected {
@@ -722,6 +768,8 @@ async fn start_connected(
             rx_meta,
             rx_packet_from_backend,
             tx_packet_to_backend,
+            rx_message_from_backend,
+            tx_message_to_backend,
             tx_user_dc,
         })
         .map_err(|_| SessionError::FrontendClosed)?;
@@ -732,6 +780,8 @@ async fn start_connected(
         tx_meta,
         tx_packet_to_frontend,
         rx_packet_from_frontend,
+        tx_message_to_frontend,
+        rx_message_from_frontend,
         rx_user_dc,
     }
     .start()
@@ -744,6 +794,8 @@ struct SessionBackend {
     tx_meta: mpsc::Sender<SessionMeta>,
     tx_packet_to_frontend: mpsc::UnboundedSender<RecvPacket>,
     rx_packet_from_frontend: mpsc::UnboundedReceiver<Bytes>,
+    tx_message_to_frontend: mpsc::UnboundedSender<crate::stream::FromBackend>,
+    rx_message_from_frontend: mpsc::UnboundedReceiver<crate::stream::SendMessage>,
     rx_user_dc: oneshot::Receiver<String>,
 }
 
@@ -754,6 +806,8 @@ impl SessionBackend {
             tx_meta,
             tx_packet_to_frontend,
             rx_packet_from_frontend,
+            tx_message_to_frontend,
+            rx_message_from_frontend,
             mut rx_user_dc,
         } = self;
 
@@ -786,6 +840,40 @@ impl SessionBackend {
             let mut tx_err = tx_err.clone();
             async move {
                 let Err(err) = send_loop(conn, rx_sending_closed, rx_packet_from_frontend).await;
+                _ = tx_err.try_send(err);
+            }
+        });
+
+        // The reliable lane runs its own send and receive loops. Sharing the
+        // datagram loops would defeat the point: a stream write that blocks on
+        // flow control would hold up a datagram whose whole value is being
+        // dropped rather than delayed.
+        let (_tx_stream_recv_closed, rx_stream_recv_closed) = oneshot::channel();
+        IrohRuntime::spawn({
+            let conn = Arc::clone(&conn);
+            let mut tx_err = tx_err.clone();
+            async move {
+                let Err(err) = crate::stream::stream_recv_loop(
+                    conn,
+                    rx_stream_recv_closed,
+                    tx_message_to_frontend,
+                )
+                .await;
+                _ = tx_err.try_send(err);
+            }
+        });
+
+        let (_tx_stream_send_closed, rx_stream_send_closed) = oneshot::channel();
+        IrohRuntime::spawn({
+            let conn = Arc::clone(&conn);
+            let mut tx_err = tx_err.clone();
+            async move {
+                let Err(err) = crate::stream::stream_send_loop(
+                    conn,
+                    rx_stream_send_closed,
+                    rx_message_from_frontend,
+                )
+                .await;
                 _ = tx_err.try_send(err);
             }
         });
