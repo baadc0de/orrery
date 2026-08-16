@@ -655,6 +655,9 @@ impl Bot {
                 incoming: false,
             },
             aeronet_io::Session::new(bevy_platform::time::Instant::now(), mtu),
+            // The reliable lane. Control rides QUIC streams (D3), so a peer
+            // without this has nowhere to put a gap repair at all.
+            aeronet_iroh::stream::IrohStreamIo::detached(),
         ));
     }
 

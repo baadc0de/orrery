@@ -6,8 +6,10 @@
 //! *right* ones. So this drives the real system over real `aeronet_io::Session`
 //! components and reads the buffer the IO layer would have drained.
 //!
-//! No network: a `Session` is a pair of byte buffers plus an MTU, and standing
-//! up QUIC would make the budget incidental to the test instead of its subject.
+//! No network: a `Session` is a pair of byte buffers plus an MTU and an
+//! `IrohStreamIo` is a pair of message buffers, so both lanes can be driven
+//! without a socket. Standing up QUIC would make the budget incidental to the
+//! test instead of its subject.
 
 use core::time::Duration;
 
@@ -15,11 +17,12 @@ use bevy::prelude::*;
 use bevy_ecs::message::Messages;
 use bevy_platform::time::Instant;
 
-use orrery_net::budget::{UploadBudget, UploadMeter, DATAGRAM_OVERHEAD_BYTES};
+use aeronet_iroh::stream::IrohStreamIo;
+use orrery_net::budget::{stream_wire_bytes, UploadBudget, UploadMeter, DATAGRAM_OVERHEAD_BYTES};
 use orrery_net::channels::Channel;
 use orrery_net::peer_link::{forget_departed_links, send_peer_packets, PeerLinkCounters};
 use orrery_net::plugin::Peer;
-use orrery_net::SendPacket;
+use orrery_net::{SendPacket, StreamMode};
 use orrery_protocol::NodeId;
 
 const MTU: usize = 1_200;
@@ -49,6 +52,9 @@ fn app(peers: &[NodeId]) -> App {
                 incoming: false,
             },
             aeronet_io::Session::new(Instant::now(), MTU),
+            // Control rides QUIC streams, not datagrams (D3). A peer without
+            // this lane has nowhere to put a control packet at all.
+            IrohStreamIo::detached(),
         ));
     }
     app
@@ -61,17 +67,26 @@ fn queue(app: &mut App, to: NodeId, channel: Channel, count: usize) {
             to,
             channel,
             payload: bytes::Bytes::from(vec![0u8; PAYLOAD]),
+            mode: StreamMode::Shared,
         });
     }
 }
 
-/// How many packets the IO layer was handed, across all sessions.
+/// How many sends the IO layer was handed, across all sessions and both lanes.
 fn queued_for_io(app: &mut App) -> usize {
-    app.world_mut()
+    let datagrams: usize = app
+        .world_mut()
         .query::<&aeronet_io::Session>()
         .iter(app.world())
         .map(|session| session.send.len())
-        .sum()
+        .sum();
+    let messages: usize = app
+        .world_mut()
+        .query::<&IrohStreamIo>()
+        .iter(app.world())
+        .map(|streams| streams.send.len())
+        .sum();
+    datagrams + messages
 }
 
 /// Packets the budget allows in one window, at this test's packet size.
@@ -190,6 +205,7 @@ fn a_packet_larger_than_the_mtu_is_refused_before_it_is_charged() {
             to: peer,
             channel: Channel::State,
             payload: bytes::Bytes::from(vec![0u8; MTU * 2]),
+            mode: StreamMode::Shared,
         });
     app.update();
 
@@ -226,4 +242,84 @@ fn a_departed_peers_meter_is_forgotten() {
         0,
         "a peer with no session is no longer a link"
     );
+}
+
+#[test]
+fn control_rides_the_stream_lane_and_state_rides_datagrams() {
+    // The channel policy is D3's, and until the stream lane landed it was
+    // aspirational: both channels went out as datagrams and `Channel::Control`
+    // bought routing rather than reliability. This asserts the split is real.
+    let peer = secret(1).public();
+    let mut app = app(&[peer]);
+    queue(&mut app, peer, Channel::State, 3);
+    queue(&mut app, peer, Channel::Control, 2);
+    app.update();
+
+    let datagrams = app
+        .world_mut()
+        .query::<&aeronet_io::Session>()
+        .iter(app.world())
+        .map(|session| session.send.len())
+        .sum::<usize>();
+    let messages = app
+        .world_mut()
+        .query::<&IrohStreamIo>()
+        .iter(app.world())
+        .map(|streams| streams.send.len())
+        .sum::<usize>();
+    assert_eq!((datagrams, messages), (3, 2));
+
+    let counters = app.world().resource::<PeerLinkCounters>();
+    assert_eq!((counters.sent, counters.stream_sent), (3, 2));
+    assert_eq!(counters.oversized, 0);
+}
+
+#[test]
+fn a_control_payload_far_past_the_mtu_is_carried_rather_than_refused() {
+    // This is the change gap repair was waiting for. On the datagram lane a
+    // 40 kB range response was refused outright, so the authority served what
+    // fit in ~1200 B and the requester asked again — twenty exchanges per
+    // witness for a one-second hole, and more repair budget only put more of
+    // them in flight. A stream has no MTU to run into.
+    let peer = secret(1).public();
+    let mut app = app(&[peer]);
+    let payload = vec![0u8; 40_000];
+    app.world_mut()
+        .resource_mut::<Messages<SendPacket>>()
+        .write(SendPacket::control(
+            peer,
+            bytes::Bytes::from(payload.clone()),
+        ));
+    app.update();
+
+    assert_eq!(queued_for_io(&mut app), 1);
+    assert_eq!(app.world().resource::<PeerLinkCounters>().oversized, 0);
+
+    // And it is charged what it costs: one framing per packet it occupies, not
+    // one for the whole message.
+    let budget = *app.world().resource::<UploadBudget>();
+    let mut meter = app.world_mut().resource_mut::<UploadMeter>();
+    let charged = meter.peer_rate(budget, Duration::ZERO, peer);
+    let expected = stream_wire_bytes(payload.len() + 1, MTU);
+    assert_eq!(charged.bits_per_sec(), expected * 8);
+}
+
+#[test]
+fn a_control_packet_beyond_the_stream_limit_is_refused_not_sent() {
+    // The lane's ceiling is a memory bound rather than a path bound, but it is
+    // still a bound: the IO layer would drop the session over an oversized
+    // message, so it is refused here instead.
+    let peer = secret(1).public();
+    let mut app = app(&[peer]);
+    let too_large = usize::try_from(orrery_net::peer_link::MAX_STREAM_MESSAGE_LEN).unwrap() + 1;
+    app.world_mut()
+        .resource_mut::<Messages<SendPacket>>()
+        .write(SendPacket::control(
+            peer,
+            bytes::Bytes::from(vec![0u8; too_large]),
+        ));
+    app.update();
+
+    assert_eq!(queued_for_io(&mut app), 0);
+    assert_eq!(app.world().resource::<PeerLinkCounters>().oversized, 1);
 }

@@ -28,5 +28,5 @@ pub use coordinator::{
 };
 pub use island::{IslandMembership, IslandSource, NetEvent};
 pub use orrery_protocol::coord::{IslandId, TopologyRegime};
-pub use peer_link::{PeerLinkCounters, PeerPacket, SendPacket};
+pub use peer_link::{PeerLinkCounters, PeerPacket, SendPacket, StreamMode};
 pub use plugin::OrreryNetPlugin;

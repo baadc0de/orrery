@@ -44,6 +44,7 @@ bevy_ecs = { version = "0.19", default-features = false }
 bevy_math = { version = "0.19", default-features = false }
 bevy_time = { version = "0.19", default-features = false }
 aeronet_io = "0.21.0"
+aeronet_iroh = { path = "../vendor/aeronet_iroh" }
 bevy_platform = { version = "0.19", default-features = false, features = ["std"] }
 iroh-base = { version = "1.0.3", default-features = false, features = ["key"] }
 bytes = "1"
