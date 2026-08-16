@@ -166,6 +166,20 @@ requests, and fall back to `ubuntu-latest` for fork pull requests; `p1-swarm`
 and the determinism soak run there nightly. Measured on the workspace test
 job: 305–549 s hosted, 182 s cold on the box, **48 s warm**.
 
+**Three runners, and each job is pinned to one of them.** A runner takes one
+job at a time, so a single runner would serialize the three heavy jobs that
+GitHub used to run on three machines. Three runners share the box — but not a
+`target/`, since cargo takes an exclusive lock on one. That is why the jobs are
+*pinned* by label (`orrery-clippy`, `orrery-gates`, `orrery-tests`) rather than
+left to land wherever: an unpinned job runs against a directory last used by a
+different job and rebuilds most of it. Each runner caps `CARGO_BUILD_JOBS` at
+8, mild oversubscription across three concurrent jobs on 16 threads, which
+keeps a lone nightly job fast when it has the box to itself.
+
+**Do not restart the runner services while a run is in flight** — the job dies
+as `The operation was canceled`, which reads like a test failure and is not
+one.
+
 Three things to know before changing any of it. The repository is public, so
 the security posture is layered and the in-workflow runner guard is the
 *weakest* of the three layers — see the comment on the `runner` job in

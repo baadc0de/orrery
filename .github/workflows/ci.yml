@@ -71,17 +71,28 @@ jobs:
     name: pick runner
     runs-on: ubuntu-latest
     outputs:
-      labels: ${{ steps.pick.outputs.labels }}
+      clippy: ${{ steps.pick.outputs.clippy }}
+      gates: ${{ steps.pick.outputs.gates }}
+      tests: ${{ steps.pick.outputs.tests }}
     steps:
       - id: pick
         env:
           SAME_REPO: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
         run: |
           if [[ "$SAME_REPO" == "true" ]]; then
-            echo 'labels=["self-hosted","orrery-hel1"]' >> "$GITHUB_OUTPUT"
+            # One runner per job, and the pinning is the point: three runners
+            # share the box but not a `target/`, so an unpinned job lands on
+            # whichever runner is free and rebuilds against a directory last
+            # used by a different job. Pinned, each target/ only ever serves
+            # one job and stays warm for it.
+            echo 'clippy=["self-hosted","orrery-clippy"]' >> "$GITHUB_OUTPUT"
+            echo 'gates=["self-hosted","orrery-gates"]'   >> "$GITHUB_OUTPUT"
+            echo 'tests=["self-hosted","orrery-tests"]'   >> "$GITHUB_OUTPUT"
             echo "self-hosted: same-repository ${{ github.event_name }}"
           else
-            echo 'labels=["ubuntu-latest"]' >> "$GITHUB_OUTPUT"
+            for j in clippy gates tests; do
+              echo "$j=[\"ubuntu-latest\"]" >> "$GITHUB_OUTPUT"
+            done
             echo "::notice::fork pull request — running on GitHub-hosted runners"
           fi
 
@@ -97,7 +108,7 @@ jobs:
   clippy:
     name: clippy
     needs: runner
-    runs-on: ${{ fromJSON(needs.runner.outputs.labels) }}
+    runs-on: ${{ fromJSON(needs.runner.outputs.clippy) }}
     # A self-hosted job queues forever if the box is down; fail instead.
     timeout-minutes: 30
     steps:
@@ -183,7 +194,7 @@ jobs:
   gates:
     name: static gates
     needs: runner
-    runs-on: ${{ fromJSON(needs.runner.outputs.labels) }}
+    runs-on: ${{ fromJSON(needs.runner.outputs.gates) }}
     # A self-hosted job queues forever if the box is down; fail instead.
     timeout-minutes: 30
     steps:
@@ -242,7 +253,7 @@ jobs:
   test:
     name: workspace tests
     needs: runner
-    runs-on: ${{ fromJSON(needs.runner.outputs.labels) }}
+    runs-on: ${{ fromJSON(needs.runner.outputs.tests) }}
     # A self-hosted job queues forever if the box is down; fail instead.
     timeout-minutes: 30
     steps:
