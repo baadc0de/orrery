@@ -20,6 +20,7 @@ if [[ ${1:-} == --self-test ]]; then
   grep -Fq -- '--promote-from' "$0" || die 'self-test: promotion absent'
   grep -Fq 'verify-recovery' "$0" || die 'self-test: recovery verifier absent'
   grep -Fq 'zombie' "$0" || die 'self-test: zombie fence proof absent'
+  grep -Fq 'prove_epoch_fork_refused' "$0" || die 'self-test: primary-restart epoch-fork proof absent'
   grep -Fq 'p2-dashboard --gate' "$0" || die 'self-test: latency gate absent'
   echo 'self-test: two-process proof stages present'
   exit 0
@@ -50,7 +51,8 @@ mkdir -p "$out" "$out/primary-data" "$out/follower-data"
 gateway_port=${P2_GATE_PORT:-7777}
 chain_port=${P2_GATE_CHAIN_PORT:-7778}
 zombie_port=${P2_GATE_ZOMBIE_PORT:-7779}
-[[ $gateway_port =~ ^[0-9]+$ && $chain_port =~ ^[0-9]+$ && $zombie_port =~ ^[0-9]+$ ]] || die 'ports must be numeric'
+fork_port=${P2_GATE_FORK_PORT:-7780}
+[[ $gateway_port =~ ^[0-9]+$ && $chain_port =~ ^[0-9]+$ && $zombie_port =~ ^[0-9]+$ && $fork_port =~ ^[0-9]+$ ]] || die 'ports must be numeric'
 secret_primary=${P2_GATE_PRIMARY_SECRET_KEY:-000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f}
 secret_follower=${P2_GATE_FOLLOWER_SECRET_KEY:-101112131415161718191a1b1c1d1e1f000102030405060708090a0b0c0d0e0f}
 duration=${P2_GATE_DURATION_SECS:-30}
@@ -106,10 +108,33 @@ start_primary() {
   primary_gateway=$(json_field "$out/primary.json" node_id)
   primary_addr=$(json_field "$out/primary.json" bind_addr)
 }
+prove_epoch_fork_refused() {
+  # The primary-restart leg. `activate_shards` bumps the ownership epoch on
+  # every activation, an ordinary clean restart of the same owner included,
+  # and the epoch is part of `DurableChainId` — which keys the follower's
+  # durable dedupe index. A follower reopened at the bumped epoch therefore
+  # used to rebuild an empty cursor and take a silent full re-stream into a
+  # second physical copy of every mirrored record, reporting a healthy
+  # zero-byte lag throughout and leaving promotion permanently ambiguous.
+  #
+  # This runs in the one window where nothing holds the mirror open: the
+  # passive follower has been stopped and the promoted instance has not
+  # started. It is a *passive* follower start, not a promotion, so it takes
+  # neither `--promote-from` nor an FDB cluster file.
+  note 'proving a bumped chain epoch is refused, not forked'
+  if timeout 120 "$PERSISTD_BIN" --node-id 2 --chain-epoch 2 --chain-primary 1 \
+    --chain-listen "127.0.0.1:$fork_port" --dir "$out/follower-data" \
+    >"$out/epoch-fork.json" 2>"$out/epoch-fork.stderr"; then
+    die 'follower accepted a bumped chain epoch on an already-mirrored journal'
+  fi
+  grep -Fq 'restart handshake' "$out/epoch-fork.stderr" \
+    || die 'follower rejected the bumped epoch, but not as a chain-epoch fork'
+}
 start_promoted_follower() {
   # The follower process was passive and is deliberately stopped before
   # promotion: the promoted instance adopts the same on-disk mirror.
   kill -TERM "$follower_pid"; wait "$follower_pid" || true; follower_pid=''
+  prove_epoch_fork_refused
   "$PERSISTD_BIN" --node-id 2 --chain-epoch 2 --chain-primary 1 --promote-from 1 \
     --chain-listen "127.0.0.1:$chain_port" --bind "127.0.0.1:$gateway_port" \
     --dir "$out/follower-data" --secret-key "$secret_follower" \
@@ -179,7 +204,8 @@ artifact.write_text(json.dumps({
   'kind':'p2_two_process_kill9_gate',
   'created_at':datetime.datetime.now(datetime.timezone.utc).isoformat(),
   'result':'pass', 'recovery_cutoff':cutoff,
-  'proofs': {'recovery': v, 'latency': l, 'zombie_primary_fenced': True},
+  'proofs': {'recovery': v, 'latency': l, 'zombie_primary_fenced': True,
+             'bumped_chain_epoch_refused': True},
 }, indent=2) + '\n')
 PY
 note "PASS artifact: $out/artifact.json"

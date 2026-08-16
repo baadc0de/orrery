@@ -163,10 +163,15 @@ On primary restart:
 
 1. Load the last locally committed LSN.
 2. Query the follower's watermark for the previous stream.
-3. Scan its local journal from `follower_watermark + 1` and resend that tail.
-4. Replay any unconfirmed tail records as idempotent resends.
+3. Reject a watermark ahead of that committed LSN. It cannot be a resume point — the follower holds history this primary never wrote — and accepting it silently empties every batch and parks the replicator at a reported lag of zero. This is a named fault, not a retryable transport error.
+4. Scan its local journal from `follower_watermark + 1` and resend that tail.
+5. Replay any unconfirmed tail records as idempotent resends.
 
 This is why the protocol needs a watermark rather than a simple last-seen batch id: the recovery point is an LSN, not a transport message counter.
+
+A restart of the same owner is only "the previous stream" while the epoch is unchanged, and in the landed implementation it usually is not: shard activation bumps the ownership epoch on every activation, a clean restart included. §3.1 makes that a different `DurableChainId`, and §4.1 keys the follower's durable dedupe by it — so a follower reopened at the bumped epoch would rebuild an empty cursor and take a full re-stream into a second physical copy of every mirrored record, at a healthy zero-byte lag, leaving promotion permanently ambiguous.
+
+Dropping the epoch from the dedupe key is **not** the fix: §3.1's identity rule is exactly what stops a superseded primary resuming onto a live follower session. Instead the follower detects the fork. When its journal already holds mirrored rows under a sibling identity differing only in epoch, it refuses to open the new one and names the missing restart handshake. That handshake is not designed yet, and a passive follower cannot invent it: it runs without a fence store (§2's follower accepts no writes and performs no activation), so it has no way to verify an epoch claim. Refusing loudly is the correct behaviour until the handshake exists; resolving a fork today is an operator action.
 
 ## 5. Failure and reconnect behavior
 
@@ -222,6 +227,10 @@ Recommended alerts:
 - or stream churn that suggests the topology is flapping.
 
 Every batch and ACK should carry `stream_id`, `batch_seq`, `first_lsn`, `durable_through`, and `follower_watermark` in logs so replay investigations can correlate the two journals.
+
+The series names for these signals are declared once, in `orrery_protocol::metrics` (`CHAIN_SERIES`), for the same reason the D16 latency names are: a producer and a consumer in different processes must spell them identically. Nothing emits them yet — `ChainReplicator::snapshot` is the reading a reporter would publish, and wiring it into `persistd`'s delta reporter is the next step.
+
+One caveat about the lag alarm, because it is the only alarm here: it advances only on a *successful* probe or push. A chain that cannot make progress at all therefore holds its last value rather than growing, which is why a wedged chain reports itself as a fault instead of relying on lag alone.
 
 ## 7. Rollout and acceptance gates
 

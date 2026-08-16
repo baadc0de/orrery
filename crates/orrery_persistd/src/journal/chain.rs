@@ -91,6 +91,62 @@ impl Default for ChainConfig {
     }
 }
 
+/// A condition that stops chain replication and cannot be retried away.
+///
+/// Chain faults exist because the chain's only alarm is a lag gauge, and both
+/// of the ways this loop can wedge report a healthy zero-byte lag: the gauge
+/// advances from [`update_progress`], which runs only on a *successful* probe
+/// or push. A wedged replicator therefore has to say so itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChainFault {
+    /// The follower reported a durable watermark ahead of everything this
+    /// primary has committed.
+    ///
+    /// The batch filter drops every record at or below the probed cursor, so
+    /// an over-large cursor empties every batch and the loop parks on the
+    /// commit broadcast forever — at zero reported lag. The watermark can only
+    /// be ahead if the follower holds history this primary never wrote, so
+    /// resuming would mirror onto a chain that already diverged.
+    FollowerAhead {
+        /// The watermark the follower reported.
+        remote: Lsn,
+        /// This primary's committed LSN, or `None` for an empty journal.
+        committed: Option<Lsn>,
+    },
+}
+
+impl core::fmt::Display for ChainFault {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::FollowerAhead { remote, committed } => match committed {
+                Some(committed) => write!(
+                    f,
+                    "follower watermark {remote} is ahead of the primary's committed LSN \
+                     {committed}"
+                ),
+                None => write!(
+                    f,
+                    "follower watermark {remote} is ahead of an empty primary journal"
+                ),
+            },
+        }
+    }
+}
+
+/// A point-in-time reading of one chain's health, for a delta reporter or an
+/// operator endpoint to publish under the docs/13 §6 chain series.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChainSnapshot {
+    /// The follower node id this chain streams to.
+    pub follower: u64,
+    /// The highest primary LSN the follower has reported durable.
+    pub watermark: Option<Lsn>,
+    /// Replication lag in journal bytes.
+    pub lag_bytes: u64,
+    /// Set once the chain has stopped for a reason retrying cannot fix.
+    pub fault: Option<ChainFault>,
+}
+
 /// The durable landing point on the follower for replicated records.
 ///
 /// A [`ChainSink`] appends records to the follower's journal and reports the
@@ -171,6 +227,8 @@ pub struct ChainReplicator {
     /// it against [`ChainConfig::lag_alarm`]'s byte budget (D11's "~100 ms of
     /// journal" mapped to bytes — see [`lag_alarm_bytes`]).
     lag_bytes: Arc<std::sync::atomic::AtomicU64>,
+    /// Set when the loop stopped for a reason retrying cannot fix.
+    fault: Arc<std::sync::Mutex<Option<ChainFault>>>,
     /// Join handle; awaited on shutdown.
     join: tokio::task::JoinHandle<()>,
     /// Signals the task to stop.
@@ -203,6 +261,26 @@ impl ChainReplicator {
         self.lag_bytes.load(std::sync::atomic::Ordering::Acquire)
     }
 
+    /// The fault that stopped this chain, if one did.
+    ///
+    /// `None` covers both a healthy chain and a merely degraded one: a
+    /// transport error is retried and is not a fault.
+    #[must_use]
+    pub fn fault(&self) -> Option<ChainFault> {
+        *self.fault.lock().expect("chain fault lock")
+    }
+
+    /// Everything a reporter needs about this chain in one consistent read.
+    #[must_use]
+    pub fn snapshot(&self) -> ChainSnapshot {
+        ChainSnapshot {
+            follower: self.follower,
+            watermark: self.follower_watermark(),
+            lag_bytes: self.lag_bytes(),
+            fault: self.fault(),
+        }
+    }
+
     /// Stop the replicator task, awaiting its exit.
     pub async fn shutdown(self) {
         self.shutdown.arm();
@@ -213,16 +291,30 @@ impl ChainReplicator {
 /// Compute the lag between the primary's committed LSN and the follower's
 /// reported durable watermark, in journal bytes. `committed` is stamped by
 /// this journal and `watermark` was echoed by the follower from the records'
-/// own LSNs, so both live in the primary's LSN space. Returns `None` when the
-/// watermark is in a different segment — a cross-segment gap is ill-defined
-/// as a byte distance, and segment transitions are rare enough that the alarm
-/// simply skips that sample.
-fn lag_in_bytes(committed: Lsn, watermark: Option<Lsn>) -> Option<u64> {
-    let w = watermark?;
-    if w.segment != committed.segment {
+/// own LSNs, so both live in the primary's LSN space.
+///
+/// A watermark in an earlier segment is measured through `segment_size`, the
+/// stride at which the cursor rolls. Skipping that sample instead — which is
+/// what this used to do — froze the gauge at its last value on **every**
+/// ordinary segment roll, not only when the chain was in trouble, and the lag
+/// gauge is the chain's only alarm. The result is an upper bound: a segment
+/// closes at the first record that would cross the stride, so it can hold
+/// slightly fewer bytes than the stride itself.
+///
+/// `None` means the watermark is *ahead* of the primary, which is not a
+/// distance at all — it is [`ChainFault::FollowerAhead`], and the caller
+/// reports it as one.
+fn lag_in_bytes(committed: Lsn, watermark: Lsn, segment_size: u64) -> Option<u64> {
+    if watermark > committed {
         return None;
     }
-    Some(committed.offset.saturating_sub(w.offset))
+    let segments = committed.segment - watermark.segment;
+    Some(
+        segments
+            .saturating_mul(segment_size)
+            .saturating_add(committed.offset)
+            .saturating_sub(watermark.offset),
+    )
 }
 
 /// Convert the [`ChainConfig::lag_alarm`] duration into the journal byte
@@ -282,13 +374,20 @@ fn spawn_chain_from(
 ) -> ChainReplicator {
     let watermark = Arc::new(std::sync::Mutex::new(None));
     let lag_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let fault = Arc::new(std::sync::Mutex::new(None));
     let shutdown = Arc::new(ShutdownSignal::default());
+    // An adopted chain re-exports records that keep their *source* LSNs, so
+    // the follower echoes a watermark from the source's LSN space while
+    // `committed()` reports this journal's own. Only an originated chain has
+    // both in one space, so only an originated chain can bound the probe.
+    let bound_watermark = matches!(source, ChainSource::Originated);
     let follower = config.follower;
     let batch_max = config.batch_max.max(1);
     let alarm_bytes = lag_alarm_bytes(config.lag_alarm);
     let mut rx = journal.subscribe();
     let wm = Arc::clone(&watermark);
     let lag = Arc::clone(&lag_bytes);
+    let flt = Arc::clone(&fault);
     let sd = Arc::clone(&shutdown);
 
     let join = tokio::spawn(async move {
@@ -309,6 +408,19 @@ fn spawn_chain_from(
                     _ = sd.wake.notified() => break,
                 };
                 if let Some(remote) = remote {
+                    // A watermark past this primary's committed LSN is not a
+                    // resume point: the batch filter drops every record at or
+                    // below the cursor, so accepting it empties the batch and
+                    // parks the loop on the commit broadcast at zero lag. The
+                    // follower holds history this primary never wrote, and no
+                    // amount of retrying makes that a resumable chain.
+                    let committed = journal.committed_watermark();
+                    if bound_watermark && committed.is_none_or(|local| remote > local) {
+                        let reason = ChainFault::FollowerAhead { remote, committed };
+                        tracing::error!(follower, %reason, "chain: replication stopped");
+                        *flt.lock().expect("chain fault lock") = Some(reason);
+                        break;
+                    }
                     cursor = Some(remote);
                     update_progress(&journal, &wm, &lag, alarm_bytes, follower, remote);
                 }
@@ -393,6 +505,7 @@ fn spawn_chain_from(
     ChainReplicator {
         watermark,
         lag_bytes,
+        fault,
         join,
         shutdown,
         follower,
@@ -427,7 +540,7 @@ fn update_progress(
     durable: Lsn,
 ) {
     *wm.lock().expect("chain watermark lock") = Some(durable);
-    if let Some(bytes) = lag_in_bytes(journal.committed(), Some(durable)) {
+    if let Some(bytes) = lag_in_bytes(journal.committed(), durable, journal.segment_size()) {
         lag.store(bytes, std::sync::atomic::Ordering::Release);
         if bytes > alarm_bytes {
             tracing::warn!(
@@ -584,6 +697,27 @@ mod lag_alarm_tests {
     use orrery_protocol::{CellId, Epoch, GridId, PersistId, RecordKind, Tick};
 
     use crate::journal::{AdaptiveCommitMode, GroupCommitConfig, JournalConfig};
+
+    #[test]
+    fn lag_is_measured_across_a_segment_roll() {
+        const SEGMENT: u64 = 128 * 1024 * 1024;
+        // The gauge used to return `None` here and hold its last value, so an
+        // ordinary segment roll looked exactly like a healthy chain.
+        assert_eq!(
+            lag_in_bytes(Lsn::new(1, 40), Lsn::new(0, SEGMENT - 60), SEGMENT),
+            Some(100)
+        );
+        assert_eq!(
+            lag_in_bytes(Lsn::new(3, 10), Lsn::new(1, 10), SEGMENT),
+            Some(2 * SEGMENT)
+        );
+        assert_eq!(
+            lag_in_bytes(Lsn::new(0, 90), Lsn::new(0, 30), SEGMENT),
+            Some(60)
+        );
+        // A watermark past the primary is a fault, not a negative distance.
+        assert_eq!(lag_in_bytes(Lsn::new(0, 30), Lsn::new(1, 0), SEGMENT), None);
+    }
 
     #[test]
     fn default_lag_window_never_collapses_to_a_per_record_alarm() {

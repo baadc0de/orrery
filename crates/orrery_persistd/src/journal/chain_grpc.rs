@@ -253,6 +253,29 @@ fn chain_key(chain: &DurableChainId) -> Result<Vec<u8>, JournalError> {
     chain_key_for_adoption(chain)
 }
 
+/// The identity a chain shares with every other epoch of the same ownership:
+/// primary, follower and shard set, without the epoch.
+///
+/// postcard writes a struct as its fields back to back and the epoch is the
+/// last field of [`DurableChainId`], so this is exactly the leading bytes of
+/// [`chain_key`] for any epoch — which is what makes a sibling epoch findable
+/// by a key-range seek instead of a scan.
+#[derive(serde::Serialize)]
+struct ChainFamily<'a> {
+    primary_node: &'a NodeId,
+    follower_node: &'a NodeId,
+    shard_set: &'a [u8],
+}
+
+fn chain_family_key(chain: &DurableChainId) -> Result<Vec<u8>, JournalError> {
+    postcard::to_stdvec(&ChainFamily {
+        primary_node: &chain.primary_node,
+        follower_node: &chain.follower_node,
+        shard_set: &chain.shard_set,
+    })
+    .map_err(|e| JournalError::Store(format!("encode chain family identity: {e}")))
+}
+
 fn wire_chain(chain: &DurableChainId) -> WireChainId {
     WireChainId {
         primary_node: chain.primary_node.as_bytes().to_vec(),
@@ -358,6 +381,44 @@ fn rebuild_cursor(journal: &Journal, key: &[u8]) -> Result<Cursor, JournalError>
     Ok(cursor)
 }
 
+/// Refuse to open a chain whose journal already mirrors a sibling epoch.
+///
+/// docs/13 §3.1 requires `DurableChainId` to change when the ownership epoch
+/// changes, and `fence::activate_shards` bumps that epoch on every activation
+/// — an ordinary clean restart of the same owner included. The follower's
+/// dedupe index is keyed by `(chain_key, origin_lsn)`, so a bumped epoch is a
+/// *fresh* namespace: the cursor rebuilds as `None` and the primary re-streams
+/// its whole journal into a second physical copy of every record, which then
+/// makes promotion impossible — `adopt_chain_history` nulls any origin LSN
+/// with two local rows and refuses the ambiguous identity.
+///
+/// Re-keying the index to drop the epoch would silently let a superseded
+/// primary resume onto a live follower session, which is the thing §3.1 exists
+/// to prevent. So the epoch stays in the key and the fork is *detected*: the
+/// only sound resolution is the intentional restart handshake that this design
+/// round does not have, and a follower started without a fence store cannot
+/// verify an epoch claim on its own.
+fn refuse_sibling_epoch(
+    journal: &Journal,
+    chain: &DurableChainId,
+    key: &[u8],
+) -> Result<(), JournalError> {
+    let family = chain_family_key(chain)?;
+    let Some(sibling) = journal.chain_epoch_sibling(&family, key)? else {
+        return Ok(());
+    };
+    let epoch = postcard::from_bytes::<DurableChainId>(&sibling)
+        .map(|sibling| sibling.epoch.to_string())
+        .unwrap_or_else(|_| "unknown".into());
+    Err(JournalError::Store(format!(
+        "follower journal already mirrors this shard set at chain epoch {epoch}; \
+         opening it at epoch {} would fork the mirrored namespace and re-stream \
+         every record. An epoch change needs an intentional restart handshake, \
+         which this follower cannot perform.",
+        chain.epoch
+    )))
+}
+
 struct FollowerState {
     session_nonce: Option<[u8; 16]>,
     cursor: Cursor,
@@ -375,6 +436,7 @@ struct FollowerReplica {
 impl FollowerReplica {
     fn load(chain: DurableChainId, journal: Arc<Journal>) -> Result<Self, JournalError> {
         let key = chain_key(&chain)?;
+        refuse_sibling_epoch(&journal, &chain, &key)?;
         let cursor = rebuild_cursor(&journal, &key)?;
         let persisted = journal.chain_grpc_state(&key)?;
         let encoded = postcard::to_stdvec(&cursor)
@@ -1211,6 +1273,58 @@ mod tests {
         ] {
             assert_ne!(chain_key(&base).unwrap(), chain_key(&changed).unwrap());
         }
+    }
+
+    #[test]
+    fn the_family_key_is_the_chain_key_without_its_epoch() {
+        // The sibling-epoch seek depends on this: postcard writes fields back
+        // to back and `epoch` is last, so every epoch of one ownership shares
+        // this prefix. Widths deliberately span the varint boundary at 128.
+        let base = chain(1, 2, 3, 0);
+        let family = chain_family_key(&base).unwrap();
+        for epoch in [0, 1, 127, 128, 4, u64::MAX] {
+            let id = DurableChainId {
+                epoch,
+                ..base.clone()
+            };
+            let key = chain_key(&id).unwrap();
+            assert!(key.starts_with(&family), "epoch {epoch} left the family");
+            assert!(key.len() > family.len());
+        }
+        assert_ne!(chain_family_key(&chain(1, 2, 4, 0)).unwrap(), family);
+    }
+
+    #[tokio::test]
+    async fn a_sibling_epoch_refuses_to_open_a_forked_namespace() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = Arc::new(Journal::open(&config(dir.path())).unwrap());
+        let first = chain(1, 9, 1, 1);
+        let replica = FollowerReplica::load(first.clone(), Arc::clone(&journal)).unwrap();
+        let nonce = [21; 16];
+        replica
+            .reconnect(reconnect_request(&first, nonce))
+            .await
+            .unwrap();
+        replica
+            .append(batch_request(&first, nonce, 0, None, &[record(10, 1)]))
+            .await
+            .unwrap();
+
+        // Same ownership, next epoch: a fresh key, an empty cursor and a full
+        // re-stream, which is exactly the fork this refuses.
+        for epoch in [2, 200] {
+            let Err(error) = FollowerReplica::load(chain(1, 9, 1, epoch), Arc::clone(&journal))
+            else {
+                panic!("a sibling epoch must not open a second namespace");
+            };
+            assert!(
+                error.to_string().contains("restart handshake"),
+                "refusal must name the missing handshake: {error}"
+            );
+        }
+        // A different shard set is a different chain, not a forked epoch.
+        FollowerReplica::load(chain(1, 9, 2, 7), Arc::clone(&journal)).unwrap();
+        journal.close().await.unwrap();
     }
 
     fn node(n: u8) -> NodeId {

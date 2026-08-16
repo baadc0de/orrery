@@ -8,7 +8,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use orrery_persistd::journal::{AdaptiveCommitMode, GroupCommitConfig};
+use orrery_persistd::journal::{AdaptiveCommitMode, ChainFault, GroupCommitConfig};
 use orrery_persistd::{
     payload_crc, CellRuntime, ChainConfig, ChainTransport, Journal, JournalChainSink,
     JournalConfig, JournalError, MemChainTransport, RuntimeConfig,
@@ -603,6 +603,67 @@ async fn lag_alarm_fires_above_threshold() {
     );
 
     // The second append of the batch is stalled forever; shutdown races it.
+    replicator.shutdown().await;
+    primary.close().await.unwrap();
+}
+
+/// A transport whose follower already holds history this primary never wrote:
+/// its probe answers with a watermark past the primary's committed LSN.
+struct AheadTransport;
+
+#[async_trait::async_trait]
+impl ChainTransport for AheadTransport {
+    async fn append(&self, _record: JournalRecord) -> Result<Lsn, JournalError> {
+        unreachable!("a chain that cannot resume must never push a record");
+    }
+
+    async fn follower_watermark(&self) -> Option<Lsn> {
+        Some(Lsn::new(9, 0))
+    }
+}
+
+#[tokio::test]
+async fn a_follower_ahead_of_the_primary_faults_instead_of_stalling_at_zero_lag() {
+    let dir = tempfile::tempdir().unwrap();
+    let primary = Arc::new(Journal::open(&journal_config(dir.path())).unwrap());
+    for i in 0..4u64 {
+        let record = mk_record(CellId::ROOT, i, RecordKind::Spawn, &i.to_le_bytes());
+        primary.append(record).unwrap().committed().await.unwrap();
+    }
+
+    // The probed watermark used to be accepted unbounded. Every record then
+    // failed the `record.lsn > cursor` batch filter, so the loop parked on the
+    // commit broadcast forever with the lag gauge still reading zero — the
+    // only alarm the chain has, silent on the failure it exists to catch.
+    let replicator = orrery_persistd::spawn_chain(
+        Arc::clone(&primary),
+        Arc::new(AheadTransport),
+        &ChainConfig {
+            follower: 3,
+            ..ChainConfig::default()
+        },
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let fault = loop {
+        if let Some(fault) = replicator.fault() {
+            break fault;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "a follower ahead of the primary must fault, not stall"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+    assert_eq!(
+        fault,
+        ChainFault::FollowerAhead {
+            remote: Lsn::new(9, 0),
+            committed: Some(primary.committed()),
+        }
+    );
+    assert_eq!(replicator.snapshot().fault, Some(fault));
+    assert!(fault.to_string().contains("ahead of the primary"));
+
     replicator.shutdown().await;
     primary.close().await.unwrap();
 }

@@ -258,3 +258,64 @@ async fn promoted_history_survives_restart_idempotently_and_seeds_new_follower()
     source.close().await.unwrap();
     output.close().await.unwrap();
 }
+
+#[tokio::test]
+async fn a_bumped_epoch_refuses_rather_than_forking_the_mirrored_namespace() {
+    // `fence::activate_shards` bumps the ownership epoch on every activation,
+    // an ordinary clean restart of the same owner included. The epoch is part
+    // of `DurableChainId` and the dedupe index is keyed by it, so a restarted
+    // follower at the new epoch used to rebuild an empty cursor and take a
+    // full re-stream into a second physical copy of every record — at a
+    // healthy zero-byte lag, and poisoning promotion afterwards.
+    let dir = tempfile::tempdir().unwrap();
+    let mut journal = Arc::new(Journal::open(&config(dir.path())).unwrap());
+    let server = spawn_chain_grpc(
+        "127.0.0.1:0".parse().unwrap(),
+        Arc::clone(&journal),
+        chain(),
+    )
+    .await
+    .unwrap();
+    let transport = GrpcChainTransport::connect(server.addr(), chain())
+        .await
+        .unwrap();
+    transport
+        .append_batch(vec![record(10), record(82)])
+        .await
+        .unwrap();
+    drop(transport);
+    server.shutdown().await;
+    journal.close().await.unwrap();
+    drop(journal);
+
+    // The same follower journal, reopened under the next ownership epoch.
+    journal = Arc::new(Journal::open(&config(dir.path())).unwrap());
+    let next = DurableChainId {
+        epoch: chain().epoch + 1,
+        ..chain()
+    };
+    let refused = spawn_chain_grpc("127.0.0.1:0".parse().unwrap(), Arc::clone(&journal), next)
+        .await
+        .expect_err("a bumped epoch must not open a second mirrored namespace");
+    assert!(
+        refused.to_string().contains("restart handshake"),
+        "refusal must name the missing handshake: {refused}"
+    );
+
+    // No re-stream happened, so the mirrored history is still one physical
+    // copy per origin LSN and promotion stays unambiguous.
+    let stored = journal
+        .scan_from(Lsn::new(0, 0))
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(
+        stored.iter().map(|row| row.record.lsn).collect::<Vec<_>>(),
+        vec![Lsn::new(0, 10), Lsn::new(0, 82)]
+    );
+    assert_eq!(
+        journal.adopt_chain_history(chain()).unwrap().watermark(),
+        Some(Lsn::new(0, 82)),
+        "the surviving epoch must still adopt without an ambiguous identity"
+    );
+    journal.close().await.unwrap();
+}

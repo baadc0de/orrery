@@ -19,8 +19,8 @@ use orrery_protocol::Lsn;
 #[cfg(feature = "chain-grpc")]
 pub use chain::{spawn_adopted_chain, AdoptedChainHistory};
 pub use chain::{
-    spawn_chain, ChainConfig, ChainReplicator, ChainSink, ChainTransport, JournalChainSink,
-    MemChainTransport,
+    spawn_chain, ChainConfig, ChainFault, ChainReplicator, ChainSink, ChainSnapshot,
+    ChainTransport, JournalChainSink, MemChainTransport,
 };
 #[cfg(feature = "chain-grpc")]
 pub use chain_grpc::{spawn_chain_grpc, ChainGrpcServer, DurableChainId, GrpcChainTransport};
