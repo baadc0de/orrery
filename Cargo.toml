@@ -6,6 +6,7 @@ members = [
     "vendor/bevy_replicon",
     "crates/orrery_protocol",
     "crates/orrery_core",
+    "crates/orrery_witness",
     "crates/orrery_net",
     "crates/orrery_spatial",
     "crates/orrery_coordinator",

@@ -216,11 +216,65 @@ pub struct EvidenceBundle {
     pub sibling_heads: Vec<Vec<(ChainHash, ChainHash)>>,
     /// What the authority signed across the window.
     pub disputed_claims: Vec<StateClaim>,
-    /// The authority's asserted per-tick state trajectory.
+    /// A per-tick trajectory the reporter supplies, **advisory only**.
+    ///
+    /// The subject never signs this, so no verdict may rest on it: doing so
+    /// would let a reporter convict an honest peer by inventing numbers. It
+    /// exists so an adjudicator can jump straight to the neighbourhood of a
+    /// divergence instead of scanning. What the subject *is* held to is
+    /// `disputed_claims`, which carry its signature.
     pub claimed_hashes: Vec<[u8; 32]>,
-    /// The reporter's re-execution, so an adjudicator can jump straight to the
-    /// first divergent tick instead of replaying to find it.
+    /// The reporter's own re-execution, also advisory, for the same reason.
     pub computed_hashes: Vec<[u8; 32]>,
+}
+
+/// A dispute filed at stage 3 (docs/07-witnessing.md §3).
+///
+/// The bundle inside is self-verifying, so an adjudicator needs nothing from
+/// the reporter but this. The extra fields are the two things a bundle cannot
+/// carry about itself: **who is accused**, which the adjudicator needs to know
+/// whose key the signatures should verify under, and **who is reporting**,
+/// which is what makes a fabricated report attributable to an account.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiscrepancyReport {
+    /// The accused authority. Signatures in the bundle must verify under this
+    /// key, and a bundle that does not is forgery by the reporter.
+    pub subject: NodeId,
+    /// The self-verifying evidence.
+    pub bundle: EvidenceBundle,
+    /// The reporter's own signature over the bundle, binding the accusation to
+    /// a strikeable account (D12).
+    pub reporter: NodeId,
+    /// Ed25519 over the reporter preimage.
+    pub reporter_sig: Signature,
+}
+
+/// A witness asking an authority to fill a gap in its chain (docs/06 §6).
+///
+/// Datagram loss is expected, so a receiver detecting a rolling-head mismatch
+/// repairs it over the reliable control lane rather than treating it as an
+/// accusation. Refusal or timeout *is* reportable, but that is a separate
+/// judgement from a missing packet.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LogRangeRequest {
+    /// The entity whose chain has a gap.
+    pub entity: PersistId,
+    /// The chain epoch the gap is in; a request never spans an epoch.
+    pub chain_epoch: u32,
+    /// First tick the requester is missing.
+    pub from_tick: Tick,
+    /// Exclusive end of the missing range.
+    pub to_tick: Tick,
+}
+
+/// The authority's answer to a [`LogRangeRequest`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LogRangeResponse {
+    /// The entity the frames are for.
+    pub entity: PersistId,
+    /// The frames covering the requested range, in tick order. Empty means the
+    /// authority cannot serve it — retention, or refusal.
+    pub frames: Vec<LogFrame>,
 }
 
 /// The adjudication window ceiling: 3 s at 60 Hz (D16).
