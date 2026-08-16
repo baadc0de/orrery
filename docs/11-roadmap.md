@@ -46,7 +46,13 @@ Indicative calendar (planning estimate, not normative): P0 Q3 2026 · P1 Q4 2026
 
 **Goal.** The 64-bit `CellId` doing its first duty (replication interest group, D5), on top of the consolidated stack (D4): bevy_replicon 0.42 visibility driven by cell membership, lightyear 0.29 bring-up for baseline prediction.
 
-**Crates.** `orrery_spatial` (CellId Morton encoding, big_space integration, 27-cell AOI, hysteresis, interest-set selection, proxy extrapolation), `orrery_coordinator` (stub: coarse presence, island formation, NodeId handout), `orrery_net` (island membership lifecycle), `orrery_predict` (initial lightyear configuration: own-player prediction, 9-tick rollback window), `orrery_protocol` (final `CellId` encoding: offset-binary, Morton-interleaved, sentinel-bit level marker).
+**Crates.** `orrery_spatial` (CellId Morton encoding, big_space integration, 27-cell AOI, hysteresis, interest-set selection, proxy extrapolation), `orrery_coordinator` (coarse presence, island formation, NodeId handout) — **landed** as a running service, not a stub; `orrery_net` (island membership lifecycle) — **landed**: the coordinator client drives membership from signed manifests over the game endpoint; `orrery_predict` (initial lightyear configuration: own-player prediction, 9-tick rollback window); `orrery_protocol` (final `CellId` encoding: offset-binary, Morton-interleaved, sentinel-bit level marker).
+
+Membership is now a handout rather than an inference: a peer's island is what
+the coordinator's manifest says, and the connected-session set is reconciled
+against it. Conflating the two — which the P0 skeleton did — let any peer that
+dialled in write itself into the island, and left manifest peers missing until
+they happened to connect.
 
 **Deliverables.**
 - `CellId` property-test suite: sort order = spatial locality, parent = prefix range, level round-trips.

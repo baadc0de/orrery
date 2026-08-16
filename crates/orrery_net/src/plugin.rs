@@ -13,7 +13,8 @@ use aeronet_iroh::session::{PathKind, PathReport, SessionRequest, SessionRespons
 use aeronet_iroh::{IrohPlugin, IrohRuntime};
 use iroh::endpoint::Builder;
 
-use crate::island::{update_island_membership, IslandMembership, NetEvent};
+use crate::coordinator::{CoordinatorConfig, CoordinatorPlugin};
+use crate::island::{follow_sessions_without_coordinator, IslandMembership, NetEvent};
 
 /// The application protocol this endpoint advertises and accepts (D3). Matches
 /// the ALPN the coordinator and peers use.
@@ -71,10 +72,17 @@ impl Default for NetConfig {
 pub struct OrreryNetPlugin {
     /// Endpoint configuration.
     pub config: NetConfig,
+    /// Coordinator address, credentials, and trusted issuer keys.
+    ///
+    /// With no address configured the coordinator client stays idle and
+    /// membership follows the connected-session set instead — see
+    /// [`crate::island`].
+    pub coordinator: CoordinatorConfig,
 }
 
 impl Plugin for OrreryNetPlugin {
     fn build(&self, app: &mut App) {
+        let coordinatorless = self.coordinator.address.is_none();
         app.add_plugins(IrohPlugin)
             .init_resource::<IrohRuntime>()
             .insert_resource(self.config.clone())
@@ -82,9 +90,18 @@ impl Plugin for OrreryNetPlugin {
             .init_resource::<IslandMembership>()
             .init_resource::<PathTelemetry>()
             .add_message::<NetEvent>()
+            .add_plugins(CoordinatorPlugin {
+                config: self.coordinator.clone(),
+            })
             .add_systems(Startup, open_endpoint)
-            .add_systems(Update, (track_peers, track_paths, update_island_membership))
+            .add_systems(Update, (track_peers, track_paths))
             .add_observer(on_session_request);
+
+        // Only one of the two drives membership. Running both would have the
+        // session set overwrite every manifest the frame after it landed.
+        if coordinatorless {
+            app.add_systems(Update, follow_sessions_without_coordinator);
+        }
     }
 }
 
