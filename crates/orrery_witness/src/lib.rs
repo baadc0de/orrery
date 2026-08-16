@@ -33,14 +33,18 @@
 //! enforcement-on by default would be asserting a false-positive rate nobody
 //! has measured yet.
 //!
-//! # Not yet here
+//! # The engine and the adapter
 //!
-//! Transport. Nothing in this crate sends or receives: frames and claims are
-//! handed to [`Witness::ingest_frame`] and [`Witness::ingest_claim`], and gap
-//! repair surfaces as a [`LogRangeRequest`] the caller is expected to send.
-//! Streaming lives in `orrery_net` and the Bevy plugin adapter is a thin drain
-//! over this engine; both land together, since one without the other has
-//! nothing to carry.
+//! [`witness`] and [`report`] are Bevy-free and decide everything. The `bevy`
+//! feature adds [`plugin`], a thin drain that moves bytes between
+//! `orrery_net`'s peer lane and the engine and turns its return values into ECS
+//! messages — no detection logic of its own. `orrery_persistd` takes this crate
+//! with `default-features = false` and gets only the engine, which is what lets
+//! the cluster and a headless bot harness run the same witness a game client
+//! does. The P4 exit criterion is measured over bot *and* human play, so that
+//! has to be one implementation.
+//!
+//! # Not yet here
 //!
 //! Attestation co-signing (docs/07 §4) is P5, not P4 — this phase is passive
 //! by design: logs, replay, telemetry, no enforcement.
@@ -48,9 +52,16 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+#[cfg(feature = "bevy")]
+pub mod plugin;
 pub mod report;
 pub mod witness;
 
+#[cfg(feature = "bevy")]
+pub use plugin::{
+    AuthoredLog, PublishClaim, PublishFrame, WitnessLinkCounters, WitnessPlugin, WitnessState,
+    Witnessed,
+};
 pub use report::{sign_report, verify_report, ReportError};
 pub use witness::{
     Observation, Watch, Witness, WitnessConfig, WitnessCounters, WitnessError, WitnessSignal,

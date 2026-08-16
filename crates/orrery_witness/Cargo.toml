@@ -5,14 +5,24 @@ edition = "2021"
 description = "Orrery passive witnessing (D10): stage-1 invariant checks, continuous log re-execution, escalation, and self-verifying discrepancy reports"
 license = "MIT OR Apache-2.0"
 
-# The engine is Bevy-free even though docs/10-crates.md lists this crate as a
-# plugin. Everything here is pure — ingest signed frames, re-execute, compare,
-# assemble — and the Bevy surface is a thin adapter that drains message queues.
-# Keeping the logic engine-free means `orrery_persistd` and a headless bot
-# harness can run the same witness the game client does, which matters because
-# the P4 exit criterion is measured over bot *and* human play.
+# The engine is Bevy-free. Everything in `witness`/`report` is pure — ingest
+# signed frames, re-execute, compare, assemble — and the `bevy` feature adds a
+# thin adapter over it. Keeping the logic engine-free means `orrery_persistd`
+# and a headless bot harness run the same witness the game client does, which
+# matters because the P4 exit criterion is measured over bot *and* human play.
+#
+# The feature is on by default because docs/10-crates.md lists this as a client
+# plugin; `orrery_persistd`, which is Bevy-free and only wants `verify_report`,
+# takes the crate with `default-features = false`.
+[features]
+default = ["bevy"]
+bevy = ["dep:bevy_app", "dep:bevy_ecs", "dep:orrery_net"]
+
 [dependencies]
 orrery_core = { path = "../orrery_core" }
+orrery_net = { path = "../orrery_net", optional = true }
+bevy_app = { workspace = true, optional = true }
+bevy_ecs = { workspace = true, optional = true }
 orrery_protocol = { path = "../orrery_protocol" }
 iroh-base = { workspace = true }
 blake3 = "1.8"
@@ -23,4 +33,7 @@ tracing = { workspace = true }
 [dev-dependencies]
 # The detection tests drive the whole pipeline, including the cluster end.
 orrery_persistd = { path = "../orrery_persistd" }
+bevy = { workspace = true }
+bevy_ecs = { workspace = true }
+orrery_net = { path = "../orrery_net" }
 rand_chacha = "0.9"

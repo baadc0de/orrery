@@ -20,11 +20,27 @@
 use std::collections::{BTreeMap, VecDeque};
 
 use orrery_protocol::{
-    ChainHash, EvidenceBundle, InputRecord, LogFrame, PersistId, StateClaim, Tick,
-    MAX_ADJUDICATION_TICKS,
+    ChainHash, EvidenceBundle, FrameHead, InputRecord, LogFrame, LogRangeRequest, LogRangeResponse,
+    PersistId, StateClaim, Tick, MAX_ADJUDICATION_TICKS,
 };
 
 use crate::log::{fold, HeadTransition};
+
+/// Postcard cost of one [`FrameHead`]: two 32-byte hashes plus a varint id.
+///
+/// Deliberately an over-estimate, so a budget is never overshot by rounding.
+const SERVED_HEAD_BYTES: usize = 32 + 32 + 10;
+
+/// What an authority could serve of a [`LogRangeRequest`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServedRange {
+    /// The frames, in tick order.
+    pub response: LogRangeResponse,
+    /// Full head pairs for every entity appearing in those frames.
+    pub heads: Vec<FrameHead>,
+    /// First tick still missing, if the answer was cut short by the budget.
+    pub resume_from: Option<Tick>,
+}
 
 /// How much history an authority keeps.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -188,6 +204,86 @@ impl AuthorityLog {
             .or_default()
             .claims
             .push_back(RetainedClaim { claim, snapshot });
+    }
+
+    /// Answer a [`LogRangeRequest`] with as many retained frames as fit.
+    ///
+    /// # Partial by design
+    ///
+    /// A 180-tick window does not fit in one datagram, so this serves frames in
+    /// tick order until `budget` bytes are spent and reports the first tick
+    /// still missing. The requester asks again from there. Truncating without
+    /// saying so would leave a witness believing the gap was unfillable — which
+    /// is the one witness input that *is* reportable, so silence there would
+    /// manufacture accusations out of a packet-size limit.
+    ///
+    /// An empty response with `resume_from: None` is the honest "cannot serve
+    /// it": the range fell out of retention, or nothing was ever logged for it.
+    ///
+    /// Head pairs accompany the frames because a requester that is missing part
+    /// of a chain cannot fold the entities it does not follow, and without every
+    /// entity's full pair it cannot rebuild the signature preimage.
+    #[must_use]
+    pub fn serve_range(&self, request: &LogRangeRequest, budget: usize) -> ServedRange {
+        let mut frames = Vec::new();
+        let mut heads: Vec<FrameHead> = Vec::new();
+        let mut spent = 0usize;
+        let mut resume_from = None;
+
+        for (frame, transitions) in &self.frames {
+            let first = frame.first_tick.0;
+            let end = first + u64::from(frame.tick_count);
+            // Half-open on both sides: a frame overlapping the request at all
+            // is part of the answer, because a chain cannot be folded from a
+            // partial frame — the signature covers the whole thing.
+            if end <= request.from_tick.0 || first >= request.to_tick.0 {
+                continue;
+            }
+            if !frame
+                .entities
+                .iter()
+                .any(|slice| slice.entity == request.entity)
+            {
+                continue;
+            }
+
+            let new_heads: Vec<FrameHead> = transitions
+                .iter()
+                .filter(|transition| !heads.iter().any(|held| held.entity == transition.entity))
+                .map(|transition| FrameHead {
+                    entity: transition.entity,
+                    prev_head: transition.prev_head,
+                    head: transition.head,
+                })
+                .collect();
+
+            let cost = postcard::to_stdvec(frame).map_or(usize::MAX, |bytes| bytes.len())
+                + new_heads.len() * SERVED_HEAD_BYTES;
+            if spent + cost > budget && !frames.is_empty() {
+                // Out of room, and something is already going out: stop here
+                // and tell the requester where to resume.
+                resume_from = Some(Tick::new(first));
+                break;
+            }
+            if spent + cost > budget {
+                // The very first frame does not fit. Sending nothing with a
+                // resume point would loop forever; report it as unservable so
+                // the requester escalates instead of retrying.
+                break;
+            }
+            spent += cost;
+            heads.extend(new_heads);
+            frames.push(frame.clone());
+        }
+
+        ServedRange {
+            response: LogRangeResponse {
+                entity: request.entity,
+                frames,
+            },
+            heads,
+            resume_from,
+        }
     }
 
     /// Drop history older than the retention window relative to `now`.
@@ -529,5 +625,162 @@ mod tests {
         assert!(log
             .assemble_bundle(ENTITY, (Tick::new(400), Tick::new(460)), vec![[0; 32]; 60])
             .is_ok());
+    }
+
+    /// A log holding `count` frames of 3 ticks each, starting at tick 0.
+    fn log_with_frames(count: u64) -> AuthorityLog {
+        let mut log = AuthorityLog::default();
+        for index in 0..count {
+            let (frame, transitions) = frame(index * 3, vec![ENTITY]);
+            log.record_frame(frame, transitions);
+        }
+        log
+    }
+
+    fn request(from: u64, to: u64) -> LogRangeRequest {
+        LogRangeRequest {
+            entity: ENTITY,
+            chain_epoch: 0,
+            from_tick: Tick::new(from),
+            to_tick: Tick::new(to),
+        }
+    }
+
+    #[test]
+    fn a_range_is_served_with_the_head_pairs_needed_to_verify_it() {
+        // A requester missing part of a chain cannot fold entities it does not
+        // follow, and without every entity's full pair it cannot rebuild the
+        // frame preimage — so frames alone are unverifiable.
+        let log = log_with_frames(4);
+        let served = log.serve_range(&request(0, 12), usize::MAX);
+        assert_eq!(served.response.frames.len(), 4);
+        assert_eq!(served.resume_from, None);
+        assert!(served.heads.iter().any(|head| head.entity == ENTITY));
+    }
+
+    #[test]
+    fn only_frames_overlapping_the_request_are_served() {
+        let log = log_with_frames(10);
+        let served = log.serve_range(&request(6, 12), usize::MAX);
+        let ticks: Vec<u64> = served
+            .response
+            .frames
+            .iter()
+            .map(|frame| frame.first_tick.0)
+            .collect();
+        assert_eq!(ticks, vec![6, 9], "frames 0 and 3 end before the request");
+    }
+
+    #[test]
+    fn a_frame_straddling_the_start_is_served_whole() {
+        // A chain cannot be folded from part of a frame: the signature covers
+        // the whole thing, so half a frame is worth nothing to the requester.
+        let log = log_with_frames(4);
+        let served = log.serve_range(&request(4, 8), usize::MAX);
+        let ticks: Vec<u64> = served
+            .response
+            .frames
+            .iter()
+            .map(|frame| frame.first_tick.0)
+            .collect();
+        assert_eq!(ticks, vec![3, 6], "the frame covering ticks 3..6 comes too");
+    }
+
+    #[test]
+    fn a_budget_that_runs_out_says_where_to_resume() {
+        // 180 ticks does not fit in a datagram. Truncating silently would leave
+        // a witness believing the gap was unfillable — and an authority that
+        // will not fill a gap *is* reportable, so silence here manufactures
+        // accusations out of a packet-size limit.
+        let log = log_with_frames(8);
+        let full = log.serve_range(&request(0, 24), usize::MAX);
+        let one_frame = postcard::to_stdvec(&full.response.frames[0]).unwrap().len();
+
+        let served = log.serve_range(&request(0, 24), one_frame * 2 + SERVED_HEAD_BYTES);
+        assert!(
+            served.response.frames.len() < 8,
+            "the budget must actually bite"
+        );
+        assert!(!served.response.frames.is_empty());
+        let resume = served.resume_from.expect("a cut-short answer says where");
+        let last = served.response.frames.last().unwrap();
+        assert_eq!(
+            resume.0,
+            last.first_tick.0 + u64::from(last.tick_count),
+            "resume at the first tick not covered"
+        );
+    }
+
+    #[test]
+    fn resuming_from_where_it_stopped_eventually_serves_everything() {
+        // The loop a requester runs. If `resume_from` ever pointed at a tick
+        // already served, this would not terminate.
+        let log = log_with_frames(8);
+        let one_frame =
+            postcard::to_stdvec(&log.serve_range(&request(0, 24), usize::MAX).response.frames[0])
+                .unwrap()
+                .len();
+        let budget = one_frame * 2 + SERVED_HEAD_BYTES;
+
+        let mut collected = Vec::new();
+        let mut from = 0u64;
+        for _ in 0..16 {
+            let served = log.serve_range(&request(from, 24), budget);
+            collected.extend(served.response.frames.iter().map(|f| f.first_tick.0));
+            match served.resume_from {
+                Some(next) => {
+                    assert!(next.0 > from, "resume must advance");
+                    from = next.0;
+                }
+                None => break,
+            }
+        }
+        assert_eq!(collected, (0..8).map(|i| i * 3).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn a_single_frame_too_large_for_the_budget_is_unservable_not_a_stall() {
+        // Answering "nothing, resume at 0" would loop the requester forever.
+        // An empty answer with no resume point is the honest "cannot serve it",
+        // which escalates instead of retrying.
+        let log = log_with_frames(4);
+        let served = log.serve_range(&request(0, 12), 1);
+        assert!(served.response.frames.is_empty());
+        assert_eq!(served.resume_from, None);
+    }
+
+    #[test]
+    fn a_range_outside_retention_is_empty_rather_than_wrong() {
+        let log = log_with_frames(4);
+        let served = log.serve_range(&request(900, 960), usize::MAX);
+        assert!(served.response.frames.is_empty());
+        assert_eq!(served.resume_from, None);
+        assert_eq!(served.response.entity, ENTITY);
+    }
+
+    #[test]
+    fn frames_for_other_entities_are_not_served() {
+        let mut log = AuthorityLog::default();
+        let (frame, transitions) = frame(0, vec![PersistId::new(99)]);
+        log.record_frame(frame, transitions);
+        assert!(log
+            .serve_range(&request(0, 12), usize::MAX)
+            .response
+            .frames
+            .is_empty());
+    }
+
+    #[test]
+    fn a_head_pair_is_sent_once_however_many_frames_name_the_entity() {
+        // The pair is per entity per response, not per frame. Repeating it
+        // would multiply the response's overhead by the frame count.
+        let mut log = AuthorityLog::default();
+        for index in 0..4 {
+            let (frame, transitions) = frame(index * 3, vec![ENTITY, PersistId::new(2)]);
+            log.record_frame(frame, transitions);
+        }
+        let served = log.serve_range(&request(0, 12), usize::MAX);
+        assert_eq!(served.response.frames.len(), 4);
+        assert_eq!(served.heads.len(), 2, "one pair per entity");
     }
 }
