@@ -180,7 +180,7 @@ pub struct SwarmReport {
     /// Wire bytes the swarm spent on replicated entity state.
     pub replication_bytes: u64,
     /// Wire bytes the swarm spent on the verifiable-core lane: log frames and
-    /// state claims (docs/03-replication.md §7).
+    /// state claims (docs/03-replication.md §5.3a).
     pub witness_bytes: u64,
     /// Wire bytes the swarm spent on the reliable lane, gap repairs included.
     pub control_bytes: u64,

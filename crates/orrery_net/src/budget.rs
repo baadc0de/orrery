@@ -423,7 +423,7 @@ impl UploadMeter {
 /// a witness that had stopped watching, reported as a witness that found
 /// nothing.
 ///
-/// docs/03-replication.md §7 calls witness records "low priority", and they
+/// docs/03-replication.md §5.3a calls witness records "low priority", and they
 /// are: the lane is bounded at source by its frame cadence
 /// (`orrery_witness::plugin::WITNESS_LANE_SHARE`) so it *cannot* be the thing
 /// that exhausts the budget. Low priority in what it may spend, not in what
@@ -446,7 +446,7 @@ pub enum Lane {
     /// Replicated entity state — the interactive lane, and the only sheddable
     /// one. A dropped update is superseded 50 ms later by the next.
     Replication,
-    /// Verifiable-core log frames and state claims (docs/03-replication.md §7).
+    /// Verifiable-core log frames and state claims (docs/03-replication.md §5.3a).
     Witness,
     /// The reliable lane: gap repairs, leases, handshakes.
     Control,

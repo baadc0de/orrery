@@ -9,7 +9,7 @@
 //! The claim cadence is 2 Hz (every 30 ticks at 60 Hz), matching docs/06 §6.
 //! The *frame* cadence is not a constant here: it is derived from the share of
 //! the upload budget the witness lane may spend, because that is the thing it
-//! was actually failing (docs/03-replication.md §7).
+//! was actually failing (docs/03-replication.md §5.3a).
 
 use orrery_conformance::{Body, Command};
 use orrery_core::log::{claim_hash, fold, sign_claim, sign_frame, HeadTransition};
@@ -23,7 +23,7 @@ use orrery_protocol::{
 pub const CLAIM_EVERY: u64 = 30;
 
 /// Ticks a frame covers — **derived from the lane budget, not from the send
-/// rate** (docs/03-replication.md §7).
+/// rate** (docs/03-replication.md §5.3a).
 ///
 /// This used to be 3: one frame per 20 Hz send, so the chain a witness follows
 /// lined up with the datagrams it already received. That alignment bought

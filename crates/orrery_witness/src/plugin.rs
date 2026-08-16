@@ -150,10 +150,10 @@ pub struct AuthoredLog(pub AuthorityLog);
 pub const MAX_WITNESS_LINKS: usize = 7;
 
 /// The share of a peer's ≤ 1 Mbps upload budget the verifiable-core lane may
-/// spend (docs/03-replication.md §5.3, §7).
+/// spend (docs/03-replication.md §5.3a).
 ///
 /// Twenty percent — 0.2 Mbps — which is the upper end of the figure §5.3 has
-/// always carried for this lane (`≈ 0.15–0.2 Mbps`, i.e. ≤ 7 links at 20–30
+/// always carried for this lane in §8 (`≈ 0.15–0.2 Mbps`, i.e. ≤ 7 links at 20–30
 /// kb/s each). What is new is that it is now *enforced by construction* rather
 /// than asserted: [`frame_interval_ticks`] derives the frame cadence that fits
 /// inside it, so the lane cannot be the thing that exhausts the budget.
