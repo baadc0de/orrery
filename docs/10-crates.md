@@ -6,7 +6,7 @@ Normative source: [ADR-0015](adr/0015-crate-set.md), drawing on [D4](adr/0004-be
 
 ## Workspace layout
 
-One workspace, one version number, one lockfile. Server crates and client crates live together so protocol changes are atomic across both sides.
+One workspace, one version number, one lockfile — with the standalone tools (`p0-*`, `p1-swarm`, `p2-load`, `p2-dashboard`, `p3-island`, `p4-streams-bench`) excluded from it, each declaring its own `[workspace]` and carrying its own committed lockfile, so a harness cannot drag a dependency into the shipped graph. Server crates and client crates live together so protocol changes are atomic across both sides.
 
 ```
 orrery/

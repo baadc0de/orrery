@@ -1,7 +1,18 @@
 # Rust / Cargo
 target
 **/*.rs.bk
-Cargo.lock
+# Cargo.lock used to be ignored outright. Every workspace here produces a
+# binary — the root one, and the seven standalone tools that declare their own
+# `[workspace]` — so all eight lockfiles are committed. The one dependency that
+# makes this load-bearing rather than tidy is `big_space`, taken from a git
+# branch rather than a version: without a lockfile "the branch" resolves to
+# whatever its head was that morning, under a four-platform determinism matrix
+# whose entire claim is byte-identical output.
+#
+# Vendored crates are path dependencies of the root workspace and resolve
+# through its lockfile; one of their own would only ever be a build artifact of
+# someone testing them standalone.
+vendor/*/Cargo.lock
 
 # Editor / OS
 .idea/
