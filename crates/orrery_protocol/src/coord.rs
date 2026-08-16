@@ -91,7 +91,13 @@ pub struct IslandManifest {
     pub cells: Vec<CellId>,
     /// The topology regime.
     pub regime: TopologyRegime,
-    /// The peers in the island (excluding the local peer).
+    /// Every peer in the island, **including the recipient**.
+    ///
+    /// One manifest is broadcast to everyone it names, so it cannot be relative
+    /// to any one of them; a peer filters itself out on receipt
+    /// (`orrery_net::IslandMembership::apply_manifest`). It is also what makes
+    /// the roster self-describing: a peer can tell whether the coordinator still
+    /// considers it a member without a second message.
     pub peers: Vec<PeerEntry>,
 }
 

@@ -24,9 +24,10 @@ bevy_platform = { workspace = true }
 bevy_reflect = { workspace = true }
 iroh = { workspace = true }
 bytes = { workspace = true }
+tokio = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
 bevy = { workspace = true }
-tokio = { workspace = true }
+orrery_coordinator = { path = "../orrery_coordinator" }
 tracing-subscriber = { workspace = true }
