@@ -20,8 +20,10 @@
 //! oversized packet would look like a lossy link and be repaired forever.
 
 use bevy_ecs::prelude::*;
+use bevy_time::{Real, Time};
 use bytes::Bytes;
 
+use crate::budget::{is_sheddable, UploadBudget, UploadMeter, DATAGRAM_OVERHEAD_BYTES};
 use crate::channels::{tag, untag, Channel};
 use crate::plugin::Peer;
 use orrery_protocol::NodeId;
@@ -89,12 +91,29 @@ pub fn receive_peer_packets(
     }
 }
 
-/// Routes [`SendPacket`] messages into the addressed session's send buffer.
+/// Routes [`SendPacket`] messages into the addressed session's send buffer,
+/// charging each one against the peer upload budget (D6, D16).
+///
+/// # Shedding
+///
+/// Over budget, [`Channel::State`] packets are dropped and [`Channel::Control`]
+/// packets still go out — see [`crate::budget::is_sheddable`]. This is the
+/// backstop, not the policy: docs/03-replication.md §9.3 sheds by relevance
+/// class from the bottom via a priority accumulator, which is `orrery_predict`'s
+/// job and reads [`UploadBudget`] rather than reimplementing it. The backstop
+/// exists because §4 is explicit that a sender enforces its own budget
+/// regardless of what was requested of it, and that has to hold whether or not
+/// an accumulator is wired up.
 pub fn send_peer_packets(
     mut outbound: MessageReader<SendPacket>,
     mut sessions: Query<(&Peer, &mut aeronet_io::Session)>,
     mut counters: ResMut<PeerLinkCounters>,
+    budget: Res<UploadBudget>,
+    mut meter: ResMut<UploadMeter>,
+    time: Res<Time<Real>>,
 ) {
+    let now = time.elapsed();
+    let mut over = false;
     for packet in outbound.read() {
         let Some((_, mut session)) = sessions.iter_mut().find(|(peer, _)| peer.id == packet.to)
         else {
@@ -106,8 +125,49 @@ pub fn send_peer_packets(
             counters.oversized += 1;
             continue;
         }
+
+        if meter.would_exceed(*budget, now, framed.len()) {
+            over = true;
+            if is_sheddable(packet.channel) {
+                meter.shed += 1;
+                // Wire bytes, matching what the meter charges — otherwise
+                // "shed" and "sent" are in different units and the obvious
+                // question (what fraction of the budget did I have to shed?)
+                // has no correct answer.
+                meter.shed_bytes += framed.len() as u64 + DATAGRAM_OVERHEAD_BYTES;
+                continue;
+            }
+            // Control goes out anyway, and is charged anyway. Counting it
+            // without sending it would understate the overrun; sending it
+            // without counting it would hide one.
+            meter.control_over_budget += 1;
+        }
+
+        meter.record(*budget, now, packet.to, framed.len());
         counters.sent += 1;
         session.send.push(Bytes::from(framed));
+    }
+    meter.oversubscribed = over;
+}
+
+/// Drops per-link meters for peers that no longer have a session.
+///
+/// Without this a long-lived peer accumulates a meter per NodeId it has ever
+/// talked to, and the per-link division the accumulator reads is computed
+/// against a link count that only grows.
+pub fn forget_departed_links(
+    mut meter: ResMut<UploadMeter>,
+    sessions: Query<&Peer>,
+    mut departed: Local<Vec<orrery_protocol::NodeId>>,
+) {
+    departed.clear();
+    departed.extend(
+        meter
+            .links()
+            .filter(|node| !sessions.iter().any(|peer| peer.id == *node)),
+    );
+    for node in departed.iter() {
+        meter.forget(*node);
     }
 }
 

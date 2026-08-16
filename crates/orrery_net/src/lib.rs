@@ -9,6 +9,7 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod budget;
 pub mod channels;
 pub mod coordinator;
 pub mod island;
@@ -21,6 +22,7 @@ pub mod plugin;
 /// handle in — `IrohRuntime::from(handle)` — rather than let the plugin create
 /// and leak a second one.
 pub use aeronet_iroh::IrohRuntime;
+pub use budget::{Bandwidth, UploadBudget, UploadMeter};
 pub use coordinator::{
     ActiveInterest, CoordinatorConfig, CoordinatorLink, CoordinatorPlugin, LinkStatus,
 };

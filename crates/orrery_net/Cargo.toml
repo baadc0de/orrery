@@ -22,6 +22,7 @@ bevy_app = { workspace = true }
 bevy_ecs = { workspace = true }
 bevy_platform = { workspace = true }
 bevy_reflect = { workspace = true }
+bevy_time = { workspace = true }
 iroh = { workspace = true }
 bytes = { workspace = true }
 tokio = { workspace = true }

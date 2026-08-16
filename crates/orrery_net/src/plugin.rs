@@ -90,6 +90,8 @@ impl Plugin for OrreryNetPlugin {
             .init_resource::<IslandMembership>()
             .init_resource::<PathTelemetry>()
             .init_resource::<crate::peer_link::PeerLinkCounters>()
+            .init_resource::<crate::budget::UploadBudget>()
+            .init_resource::<crate::budget::UploadMeter>()
             .add_message::<NetEvent>()
             .add_message::<crate::peer_link::PeerPacket>()
             .add_message::<crate::peer_link::SendPacket>()
@@ -106,6 +108,7 @@ impl Plugin for OrreryNetPlugin {
                     // this frame rather than waiting for the next one.
                     crate::peer_link::receive_peer_packets,
                     crate::peer_link::send_peer_packets,
+                    crate::peer_link::forget_departed_links,
                 )
                     .chain(),
             )
