@@ -6,17 +6,19 @@
 //! replayable on its own — a witness re-executing an entity never needs any
 //! other entity's live state, only what the log says arrived.
 //!
-//! # Neither type names its emitter, and that is not an oversight
+//! # Every effect names who caused it
 //!
-//! [`Outcome::Destroyed`] would obviously rather say *who* landed the last hit,
-//! and [`Order::Damage`] would rather say who rolled it. A step cannot fill
-//! either field: [`StateView`](orrery_core::StateView) hands a rule its own
-//! state and its neighbours' but never its own
-//! [`PersistId`](orrery_protocol::PersistId), so a rule literally cannot
-//! attribute an event to itself. Attribution is therefore left to the layer
-//! that does know — the executor knows which entity it is stepping — rather
-//! than faked here. See the crate docs for the follow-on this suggests for
-//! `orrery_core`.
+//! [`Outcome::DamageDealt`] carries its attacker and [`Outcome::Destroyed`]
+//! carries the craft that landed the last hit, because
+//! [`StateView::entity`](orrery_core::StateView::entity) tells a step which
+//! entity it is. The identity comes from the executor rather than from the
+//! state, so a rule cannot claim to be an entity it is not.
+//!
+//! This matters past flavour. A kill's *durable* consequences — credit, loot,
+//! the ledger rows a P5 intent writes — attach to an account, and an
+//! adjudicator asked to settle a disputed kill needs the log to say whose
+//! window to re-execute. An anonymous effect is one nothing downstream can
+//! act on.
 
 use orrery_core::{CodecError, CoreCodec};
 use orrery_protocol::PersistId;
@@ -49,6 +51,8 @@ pub enum Order {
     Damage {
         /// Amount, already rolled by the attacker.
         amount: i32,
+        /// Who rolled it.
+        from: PersistId,
     },
 }
 
@@ -69,9 +73,10 @@ impl CoreCodec for Order {
                 out.push(1);
                 out.extend_from_slice(&target.0.to_le_bytes());
             }
-            Order::Damage { amount } => {
+            Order::Damage { amount, from } => {
                 out.push(2);
                 out.extend_from_slice(&amount.to_le_bytes());
+                out.extend_from_slice(&from.0.to_le_bytes());
             }
         }
     }
@@ -87,8 +92,9 @@ impl CoreCodec for Order {
             (1, 8) => Ok(Order::Fire {
                 target: PersistId::new(u64::from_le_bytes(rest[0..8].try_into().unwrap())),
             }),
-            (2, 4) => Ok(Order::Damage {
+            (2, 12) => Ok(Order::Damage {
                 amount: i32::from_le_bytes(rest[0..4].try_into().unwrap()),
+                from: PersistId::new(u64::from_le_bytes(rest[4..12].try_into().unwrap())),
             }),
             _ => Err(CodecError("order: bad tag or length")),
         }
@@ -100,6 +106,9 @@ impl CoreCodec for Order {
 pub enum Outcome {
     /// Damage the target must consume on its next tick.
     DamageDealt {
+        /// Who rolled it — [`StateView::entity`](orrery_core::StateView::entity),
+        /// so it is the executor's answer and not the rule's.
+        attacker: PersistId,
         /// Who takes it.
         target: PersistId,
         /// How much.
@@ -107,32 +116,47 @@ pub enum Outcome {
     },
     /// The emitting craft's hull reached zero, on the tick it did.
     ///
-    /// It goes nowhere: kill credit, loot and the rest of a kill's *durable*
-    /// consequences are attested intents (P5), never something a peer's own
-    /// step awards itself. The event exists so the moment is in the log.
-    Destroyed,
+    /// Naming the killer is not the same as awarding the kill: credit, loot
+    /// and the rest of a kill's *durable* consequences are attested intents
+    /// (P5), never something a peer's own step grants. This is the evidence
+    /// such an intent would be adjudicated against.
+    Destroyed {
+        /// Who landed the last hit.
+        by: PersistId,
+    },
 }
 
 impl CoreCodec for Outcome {
     fn encode(&self, out: &mut Vec<u8>) {
         match self {
-            Outcome::DamageDealt { target, amount } => {
+            Outcome::DamageDealt {
+                attacker,
+                target,
+                amount,
+            } => {
                 out.push(0);
+                out.extend_from_slice(&attacker.0.to_le_bytes());
                 out.extend_from_slice(&target.0.to_le_bytes());
                 out.extend_from_slice(&amount.to_le_bytes());
             }
-            Outcome::Destroyed => out.push(1),
+            Outcome::Destroyed { by } => {
+                out.push(1);
+                out.extend_from_slice(&by.0.to_le_bytes());
+            }
         }
     }
 
     fn decode(bytes: &[u8]) -> Result<Self, CodecError> {
         let (tag, rest) = bytes.split_first().ok_or(CodecError("outcome: empty"))?;
         match (tag, rest.len()) {
-            (0, 12) => Ok(Outcome::DamageDealt {
-                target: PersistId::new(u64::from_le_bytes(rest[0..8].try_into().unwrap())),
-                amount: i32::from_le_bytes(rest[8..12].try_into().unwrap()),
+            (0, 20) => Ok(Outcome::DamageDealt {
+                attacker: PersistId::new(u64::from_le_bytes(rest[0..8].try_into().unwrap())),
+                target: PersistId::new(u64::from_le_bytes(rest[8..16].try_into().unwrap())),
+                amount: i32::from_le_bytes(rest[16..20].try_into().unwrap()),
             }),
-            (1, 0) => Ok(Outcome::Destroyed),
+            (1, 8) => Ok(Outcome::Destroyed {
+                by: PersistId::new(u64::from_le_bytes(rest[0..8].try_into().unwrap())),
+            }),
             _ => Err(CodecError("outcome: bad tag or length")),
         }
     }

@@ -17,6 +17,16 @@
 //! a golden regenerated without a version bump hides a rules change as a
 //! determinism pass — the one failure this whole apparatus exists to prevent.
 //!
+//! # What the chain does not cover
+//!
+//! State hashes, and only those. A rules change that alters *events* without
+//! altering any state field moves nothing here — adding attribution to
+//! `Outcome::DamageDealt` did not shift a single chain. That is not a defect
+//! in the golden so much as the same fact `Craft::damage_dealt` exists for: an
+//! outcome that leaves no trace in the emitter's own state is invisible to
+//! everything downstream that works from state hashes, adjudication included.
+//! A game that wants an outcome checked has to write it down.
+//!
 //! Regenerate with:
 //!
 //! ```sh

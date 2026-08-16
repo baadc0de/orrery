@@ -49,16 +49,17 @@
 //! and the cheats are adjudicable, in milliseconds, on every commit. The two
 //! measure different halves and the swarm is the one that accumulates hours.
 //!
-//! # A gap this crate ran into
+//! # A seam this crate needed, and got
 //!
-//! A rule cannot attribute an event to itself:
-//! [`StateView`](orrery_core::StateView) hands a step its own state and its
-//! neighbours', but never its own [`PersistId`](orrery_protocol::PersistId),
-//! so `Outcome::Destroyed` cannot name who landed the last hit and a damage
-//! event cannot name its attacker. Skirmish leaves those fields off rather
-//! than faking them. The fix is additive and belongs in `orrery_core` — the
-//! executor already knows which entity it is stepping — and is left to a
-//! change that owns that crate.
+//! Writing Skirmish surfaced a gap in the `Ruleset` contract: a rule could not
+//! attribute an event to itself. [`StateView`](orrery_core::StateView) handed
+//! a step its own state and its neighbours' but never its own
+//! [`PersistId`](orrery_protocol::PersistId), so damage could be resolved but
+//! not signed, and a kill could not name its killer — leaving a log of
+//! anonymous effects that a P5 kill-credit intent would have nothing to attach
+//! to. [`StateView::entity`](orrery_core::StateView::entity) closes it. The
+//! identity comes from the executor, which already knew it, rather than from
+//! the state, so a rule cannot claim to be an entity it is not.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]

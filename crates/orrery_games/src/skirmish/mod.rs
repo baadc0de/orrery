@@ -201,6 +201,9 @@ impl Ruleset for Skirmish {
     ) -> StepOutput<Outcome> {
         let mut events = Vec::new();
 
+        // Whose tick this is. From the executor, not from the state, so a
+        // craft cannot sign someone else's shot.
+        let me = view.entity();
         let own = view.own();
         let archetype = own.archetype;
         let limits = archetype.limits();
@@ -281,12 +284,13 @@ impl Ruleset for Skirmish {
                     damage_dealt = damage_dealt.saturating_add(amount.unsigned_abs().into());
                     cooldown = limits.cooldown_ticks;
                     events.push(Outcome::DamageDealt {
+                        attacker: me,
                         target: *target,
                         amount,
                     });
                 }
 
-                Order::Damage { amount } => {
+                Order::Damage { amount, from } => {
                     // Integer only, shields absorbing first, hull floored at
                     // zero — a negative hull would be a value-range violation
                     // manufactured by the rules themselves.
@@ -298,7 +302,7 @@ impl Ruleset for Skirmish {
                         hull = (hull - through).max(0);
                         if hull == 0 {
                             disabled = true;
-                            events.push(Outcome::Destroyed);
+                            events.push(Outcome::Destroyed { by: *from });
                         }
                     }
                 }
@@ -398,10 +402,21 @@ impl Game for Skirmish {
 
     fn deliver(&self, event: &Outcome) -> Option<(PersistId, Order)> {
         match event {
-            Outcome::DamageDealt { target, amount } => {
-                Some((*target, Order::Damage { amount: *amount }))
-            }
-            Outcome::Destroyed => None,
+            Outcome::DamageDealt {
+                attacker,
+                target,
+                amount,
+            } => Some((
+                *target,
+                Order::Damage {
+                    amount: *amount,
+                    from: *attacker,
+                },
+            )),
+            // A craft's death is news about itself. Nothing consumes it: the
+            // durable half of a kill is a P5 intent, adjudicated against this
+            // record rather than granted by it.
+            Outcome::Destroyed { .. } => None,
         }
     }
 

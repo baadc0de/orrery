@@ -83,6 +83,7 @@ pub struct ComponentTypeId(pub u32);
 /// itself fabricated neighbour state to justify an outcome produces checkable
 /// evidence against itself.
 pub struct StateView<'a, S> {
+    entity: PersistId,
     own: &'a mut S,
     neighbors: &'a BTreeMap<PersistId, S>,
     reads: Vec<PersistId>,
@@ -90,12 +91,26 @@ pub struct StateView<'a, S> {
 
 impl<'a, S> StateView<'a, S> {
     /// Build a view over one entity's own state and its neighbour snapshot.
-    pub fn new(own: &'a mut S, neighbors: &'a BTreeMap<PersistId, S>) -> Self {
+    pub fn new(entity: PersistId, own: &'a mut S, neighbors: &'a BTreeMap<PersistId, S>) -> Self {
         Self {
+            entity,
             own,
             neighbors,
             reads: Vec::new(),
         }
+    }
+
+    /// Which entity is being stepped.
+    ///
+    /// Supplied by the executor, never by the state, so a rule cannot claim to
+    /// be an entity it is not. Rules need it to *attribute* what they emit: a
+    /// cross-entity event travels to its target and is consumed there, so an
+    /// event that could not name its emitter would arrive anonymous — a game
+    /// could resolve damage but never say who dealt it, and the durable
+    /// consequences of a kill (credit, loot, the ledger rows a P5 intent
+    /// writes) have nobody to attach to.
+    pub fn entity(&self) -> PersistId {
+        self.entity
     }
 
     /// This entity's state.
@@ -284,7 +299,7 @@ mod tests {
         let mut neighbors = BTreeMap::new();
         neighbors.insert(PersistId::new(5), Bag(2));
         neighbors.insert(PersistId::new(6), Bag(3));
-        let mut view = StateView::new(&mut own, &neighbors);
+        let mut view = StateView::new(PersistId::new(1), &mut own, &neighbors);
 
         assert_eq!(view.neighbor(PersistId::new(5)), Some(&Bag(2)));
         assert_eq!(view.neighbor(PersistId::new(5)), Some(&Bag(2)));
@@ -303,7 +318,7 @@ mod tests {
         // neighbour frame the authority never actually consulted.
         let mut own = Bag(1);
         let neighbors = BTreeMap::new();
-        let mut view = StateView::new(&mut own, &neighbors);
+        let mut view = StateView::new(PersistId::new(1), &mut own, &neighbors);
         assert!(view.neighbor(PersistId::new(9)).is_none());
         assert!(view.recorded_reads().is_empty());
     }

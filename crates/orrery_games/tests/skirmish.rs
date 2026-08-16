@@ -11,7 +11,7 @@
 //!   `DamageInflation` is caught by *only* the expensive one.
 
 use orrery_core::{evaluate, Executor, InvariantKind, InvariantSample, QPos, QVel, Ruleset};
-use orrery_games::game::Tamper;
+use orrery_games::game::{Game, Tamper};
 use orrery_games::scenario::{adjudicate, play, Scenario, SCENARIOS};
 use orrery_games::skirmish::archetype::Archetype;
 use orrery_games::skirmish::invariants::INVARIANTS;
@@ -146,7 +146,10 @@ fn a_wreck_neither_steers_nor_shoots_but_still_takes_hits() {
                     pitch_urad: 0,
                 },
                 fire_at(2),
-                Order::Damage { amount: 10 },
+                Order::Damage {
+                    amount: 10,
+                    from: PersistId::new(2),
+                },
             ],
         )
         .expect("entity 1 is installed");
@@ -171,6 +174,7 @@ fn shields_absorb_before_hull_and_hull_floors_at_zero() {
             Tick::new(T),
             &[Order::Damage {
                 amount: limits.max_shield + 10,
+                from: PersistId::new(2),
             }],
         )
         .expect("entity 1 is installed");
@@ -184,11 +188,67 @@ fn shields_absorb_before_hull_and_hull_floors_at_zero() {
             Tick::new(T + 1),
             &[Order::Damage {
                 amount: limits.max_hull * 10,
+                from: PersistId::new(2),
             }],
         )
         .expect("entity 1 is installed");
     assert_eq!(world.state(entity).unwrap().hull, 0, "never negative");
-    assert_eq!(outcome.events, vec![Outcome::Destroyed]);
+    assert_eq!(
+        outcome.events,
+        vec![Outcome::Destroyed {
+            by: PersistId::new(2)
+        }]
+    );
+}
+
+#[test]
+fn every_effect_names_who_caused_it() {
+    // The executor tells a step which entity it is, so a shot can be
+    // attributed to its shooter and a kill to its killer. Without that, a
+    // disputed kill would have no window to re-execute and a P5 kill-credit
+    // intent would have nobody to attach to.
+    let mut world = world(&[
+        (1, craft_at(Archetype::Cruiser, 0)),
+        (2, craft_at(Archetype::Interceptor, 100_000)),
+    ]);
+
+    let shot = world
+        .step_entity(PersistId::new(1), Tick::new(T), &[fire_at(2)])
+        .expect("entity 1 is installed");
+    let Some(Outcome::DamageDealt {
+        attacker,
+        target,
+        amount,
+    }) = shot.events.first().cloned()
+    else {
+        panic!("a cruiser at 100 m should have hit: {:?}", shot.events)
+    };
+    assert_eq!(
+        attacker,
+        PersistId::new(1),
+        "the shooter signs its own shot"
+    );
+    assert_eq!(target, PersistId::new(2));
+
+    // And the damage arrives carrying the same name, which is what lets the
+    // victim's own log say who killed it.
+    let delivered = Skirmish::honest()
+        .deliver(&Outcome::DamageDealt {
+            attacker,
+            target,
+            amount,
+        })
+        .expect("damage is delivered to its target");
+    assert_eq!(
+        delivered,
+        (
+            PersistId::new(2),
+            Order::Damage {
+                amount,
+                from: PersistId::new(1)
+            }
+        )
+    );
 }
 
 // --- the detection table (see `Tamper`) ---------------------------------

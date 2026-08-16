@@ -103,7 +103,7 @@ impl<R: Ruleset> Executor<R> {
     ) -> Option<TickOutcome<R::CoreEvent>> {
         let mut own = self.states.remove(&entity)?;
         let neighbors = &self.states;
-        let mut view = StateView::new(&mut own, neighbors);
+        let mut view = StateView::new(entity, &mut own, neighbors);
         let ordered = OrderedInputs::new(inputs);
         let mut rng = tick_rng(self.seed, entity, tick);
 
@@ -288,6 +288,89 @@ mod tests {
                 .state_hash
         };
         assert_ne!(at(900), at(901));
+    }
+
+    #[test]
+    fn a_step_is_told_which_entity_it_is() {
+        // Attribution depends on this: a rule emits cross-entity events that
+        // are consumed elsewhere, and one that could not name its emitter
+        // would produce a log of anonymous effects — damage nobody dealt.
+        // It comes from the executor rather than from the state, so a rule
+        // cannot claim to be an entity it is not.
+        struct Introspect;
+        impl Ruleset for Introspect {
+            type CoreState = Body;
+            type CoreInput = Nudge;
+            type CoreEvent = ();
+            fn id(&self) -> RulesetId {
+                RulesetId {
+                    version: 1,
+                    digest: [3; 32],
+                }
+            }
+            fn step(
+                &self,
+                view: &mut StateView<'_, Body>,
+                _inputs: &OrderedInputs<'_, Nudge>,
+                _rng: &mut crate::rng::TickRng,
+            ) -> StepOutput<()> {
+                // Recorded into state so the assertion is on what the rule
+                // actually saw, not on a value the test handed it.
+                let seen = view.entity().0 as i64;
+                view.own_mut().pos.x = seen;
+                StepOutput::default()
+            }
+        }
+
+        let mut exec = Executor::new(Introspect, UniverseSeed([5; 32]));
+        for id in [7, 9] {
+            exec.insert(PersistId::new(id), body());
+            exec.step_entity(PersistId::new(id), Tick::new(900), &[])
+                .expect("entity present");
+            assert_eq!(exec.state(PersistId::new(id)).unwrap().pos.x, id as i64);
+        }
+    }
+
+    #[test]
+    fn a_step_never_sees_itself_as_a_neighbour() {
+        // Own state is reached through `own`/`own_mut`; the neighbour map has
+        // the stepping entity removed for the duration. A rule that could
+        // reach itself both ways would have two aliases for one value, and
+        // only one of them recorded in the log.
+        struct SelfPeek;
+        impl Ruleset for SelfPeek {
+            type CoreState = Body;
+            type CoreInput = Nudge;
+            type CoreEvent = ();
+            fn id(&self) -> RulesetId {
+                RulesetId {
+                    version: 1,
+                    digest: [4; 32],
+                }
+            }
+            fn step(
+                &self,
+                view: &mut StateView<'_, Body>,
+                _inputs: &OrderedInputs<'_, Nudge>,
+                _rng: &mut crate::rng::TickRng,
+            ) -> StepOutput<()> {
+                let me = view.entity();
+                assert!(view.neighbor(me).is_none(), "reached itself");
+                StepOutput::default()
+            }
+        }
+
+        let mut exec = Executor::new(SelfPeek, UniverseSeed([5; 32]));
+        exec.insert(PersistId::new(1), body());
+        exec.insert(PersistId::new(2), body());
+        let outcome = exec
+            .step_entity(PersistId::new(1), Tick::new(900), &[])
+            .expect("entity present");
+        assert!(
+            outcome.neighbor_reads.is_empty(),
+            "a miss is not a read, and logging one would put a neighbour in \
+             the log that the rules never saw"
+        );
     }
 
     #[test]
