@@ -86,10 +86,11 @@ and the feature set.
 
 `.github/workflows/ci.yml` runs on every push and pull request: `rustfmt`,
 `clippy -D warnings`, the verifiable-core static gates
-(`scripts/core-gates.sh`), the P2/P3 harness `--self-test` modes, the workspace
-test suite, and the cross-platform determinism matrix.
+(`scripts/core-gates.sh`), the P1/P2/P3 harness and fdb-runner `--self-test`
+modes, the workspace test suite, the standalone tools' own test suites, and the
+cross-platform determinism matrix.
 
-Three things about it are worth knowing before you change anything it touches.
+Five things about it are worth knowing before you change anything it touches.
 
 **`clippy` is enforced at `-D warnings`, over two feature sets.** The default
 build and the `fdb` build compile different code, and the `fdb` half went
@@ -189,18 +190,44 @@ why every `apt-get` step in those jobs is conditioned on
 the box is an ssh-and-install away rather than a workflow edit. What it needs
 beyond a stock Ubuntu: the Bevy build dependencies, `foundationdb-clients`, and
 **`libclang-dev`** (`foundationdb-sys` runs bindgen, which the hosted images
-happen to satisfy and a bare box does not). And `p2-kill9` and `p3-island` stay on
-hosted runners on purpose: `scripts/fdb-dev.sh` hardcodes `127.0.0.1:4500` and
-stops the cluster with `pkill -f "fdbserver.*:4500"`, while the box runs its own
-`fdbserver` on that port for development. Teaching that harness to take its
-port and data directory from the environment is what those two jobs are waiting
-on.
+happen to satisfy and a bare box does not). And the jobs that need a
+FoundationDB *server* stay on GitHub-hosted runners — `p2-kill9` and the fdb
+test job — because provisioning a throwaway cluster means `sudo dpkg -i` on the
+server package, which that user cannot do. The box does run an `fdbserver`, and
+that is exactly the cluster those jobs must not be pointed at: it is a shared
+development database, and both of them write into whatever cluster they are
+given.
+
+`p3-island` used to be pinned there for the same stated reason and never had
+one — `scripts/p3-island-gate.sh` contains no FoundationDB reference at all,
+binds every listener on `127.0.0.1:0` and runs persistd with
+`--allow-volatile-leases` — so it now runs on the box with the other nightly
+jobs.
 
 The heavy harnesses — P2's kill-9 gate, which needs a real FoundationDB
 cluster, and P3's island gate, which needs eight peer processes and a real
 `kill -9` — cannot gate a pull request. They run nightly and on demand in
 `.github/workflows/nightly.yml`, alongside a soak that repeats the corpus ten
 times in one process to catch per-process nondeterminism.
+
+**The `fdb` feature has its own nightly test job, and a wrapper script is the
+reason it means anything.** `orrery_persistd` and `orrery_seed` carry a tier of
+tests that only compile under `--features fdb`, and every one of them opens
+with a guard that `eprintln!("skipping: …")` and returns `Ok` when it cannot
+find a cluster. That guard is right for a developer's `cargo test` and a trap
+for CI: `cargo test --features fdb` on a runner with no cluster is 27 passes
+that assert nothing. So `scripts/fdb-tests.sh` runs them — both packages in one
+invocation, per C-8 — captures stderr with `--nocapture`, fails on any
+`skipping:` line, and asserts a floor on how many tests actually executed. Its
+`--self-test` proves those assertions against synthetic logs and runs
+per-commit, alongside the P1/P2/P3 gate self-tests.
+
+**The standalone tools are tested per-commit too.** Each declares its own
+`[workspace]`, so `cargo test --workspace` reaches none of them; the `gates` job
+runs `cargo test` in `p1-swarm`, `p2-load`, `p2-dashboard` and
+`p4-streams-bench` explicitly, and `cargo check` in the three that have no tests
+at all. `p2-load` takes `orrery_persistd` with `features = ["fdb"]`, which is
+why that job installs the FoundationDB *client* on the hosted path.
 
 ## Build cache and target directories
 
@@ -290,6 +317,16 @@ genuinely cannot be shared are elsewhere, and they are the ones worth blocking
 on: the `.fdb-dev/` cluster, a harness's fixed ports, `git push` and branch
 deletion, `git worktree add/remove`, and the disk itself.
 
+The `.fdb-dev/` cluster is on that list because agents share *one* of it by
+default, not because they must. `scripts/fdb-dev.sh` takes
+`ORRERY_FDB_DEV_PORT` and `ORRERY_FDB_DEV_DIR` (and the cluster description,
+the memory sizes and the `fdbserver` path) from the environment, and identifies
+an instance by its data directory rather than by its port, so a worktree that
+wants a cluster of its own can have one and `stop` will never reach anyone
+else's. Take the lease when you want the *shared* cluster — which is what the
+tests find when `ORRERY_FDB_CLUSTER_FILE` is unset — and stand up your own when
+you want to write to one freely.
+
 So this arrangement is deliberately two-speed: **lanes are advisory, leases are
 exclusive.**
 
@@ -320,6 +357,10 @@ scripts/agent-lane.sh check <path>...        # does anyone else claim this?
 scripts/agent-lane.sh lease acquire fdb-dev  # exclusive; fails if someone holds it
 scripts/agent-lane.sh lease release fdb-dev
 ```
+
+The `fdb-dev` lease is about the *default* instance — the one at `.fdb-dev/` on
+port 4500 that every suite falls back to. An agent running its own instance on
+its own port needs no lease, and should not take one.
 
 A lane goes stale after 45 minutes without a heartbeat and is reaped
 automatically, taking any lease it held with it. A lease that outlives its

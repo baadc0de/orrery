@@ -70,6 +70,10 @@ jobs:
   runner:
     name: pick runner
     runs-on: ubuntu-latest
+    # Every job here declares one. A workflow with no bound falls back to
+    # GitHub's six hours, which is not a timeout so much as a way to notice
+    # tomorrow that something hung today.
+    timeout-minutes: 5
     outputs:
       clippy: ${{ steps.pick.outputs.clippy }}
       gates: ${{ steps.pick.outputs.gates }}
@@ -99,6 +103,7 @@ jobs:
   fmt:
     name: rustfmt
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
       - name: Install the pinned toolchain
@@ -241,6 +246,41 @@ jobs:
       - name: P1 swarm gate self-test
         run: scripts/p1-swarm-gate.sh --self-test
 
+      # The assertion logic in scripts/fdb-tests.sh — no `skipping:` line, a
+      # floor on executed tests, every fdb-gated target contributing — is what
+      # keeps nightly's fdb job from going green on a cluster that isn't there.
+      # It runs against synthetic logs, so it needs no cluster of its own and
+      # belongs with the other self-tests.
+      - name: fdb test runner self-test
+        run: scripts/fdb-tests.sh --self-test
+
+      # ── The standalone tools ────────────────────────────────────────────────
+      #
+      # Each of these declares its own `[workspace]`, so `cargo test
+      # --workspace` in the `test` job does not reach any of them and nothing
+      # else here would notice one rotting. `p4-streams-bench` was the only one
+      # wired up; the rest carry 48 more tests between them.
+      #
+      # `p2-load` takes `orrery_persistd` with `features = ["fdb"]`
+      # (p2-load/Cargo.toml), so it needs libfdb_c and the headers to build at
+      # all — the client package only, no cluster: its tests are unit tests.
+      - name: Install the FoundationDB client
+        # foundationdb-clients is already installed on the box.
+        if: runner.environment == 'github-hosted'
+        uses: ./.github/actions/foundationdb
+
+      - name: P1 swarm harness tests
+        working-directory: p1-swarm
+        run: cargo test
+
+      - name: P2 load rig tests
+        working-directory: p2-load
+        run: cargo test
+
+      - name: P2 dashboard tests
+        working-directory: p2-dashboard
+        run: cargo test
+
       # `p4-streams-bench` is a measurement, not a gate — its figures are in its
       # README and the channel-policy decision they justify is in
       # docs/02-networking.md §7. What CI owes it is that it still builds and
@@ -249,6 +289,18 @@ jobs:
       - name: P4 streams benchmark builds and self-tests
         working-directory: p4-streams-bench
         run: cargo test
+
+      # Compile checks only, and deliberately so: `p0-nat-test`, `p0-dashboard`
+      # and `p3-island` have zero tests between them. `cargo test` on any of
+      # them would be a build dressed up as a gate, which reads as coverage
+      # that does not exist. `p3-island`'s behaviour is asserted by the nightly
+      # island gate, and the two p0 tools by the NAT lab they were written for.
+      - name: The test-free tools still compile
+        run: |
+          set -euo pipefail
+          (cd p0-nat-test && cargo check --all-targets)
+          (cd p0-dashboard && cargo check --all-targets)
+          (cd p3-island && cargo check --all-targets)
 
   test:
     name: workspace tests
@@ -319,6 +371,9 @@ jobs:
           - { os: windows-latest,   label: x86_64-windows }
           - { os: macos-latest,     label: aarch64-macos }
     runs-on: ${{ matrix.os }}
+    # A cold Windows or macOS leg builds the headless spine from scratch; the
+    # corpus itself is seconds.
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7
       - name: Install the pinned toolchain
@@ -375,6 +430,7 @@ jobs:
     # itself the finding, and reporting "3 of 5 agreed" beats reporting nothing.
     if: always()
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7
       - name: Install the pinned toolchain

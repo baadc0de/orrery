@@ -17,15 +17,22 @@
 # so the fork-PR problem that constrains ci.yml does not exist here and the
 # self-hosted box is unconditionally safe to use.
 #
-# Two of the four jobs still stay on GitHub-hosted runners, and the reason is
-# specific rather than cautious: `scripts/fdb-dev.sh` hardcodes
-# `127.0.0.1:4500` and stops the cluster with `pkill -f "fdbserver.*:4500"`.
-# The box already runs its own `fdbserver` on port 4500 for development. A gate
-# that starts a cluster there would collide on the port, and one whose whole
-# premise is `kill -9` on the cluster is not something to point at a shared
-# development database. Moving `p2-kill9` and `p3-island` needs the harness to
-# take its port and its data directory from the environment first; until then
-# they run where they have a machine to themselves.
+# The two jobs that need a FoundationDB cluster stay on GitHub-hosted runners,
+# and the reason is now the accurate one. It is not `scripts/fdb-dev.sh`, which
+# takes its port and data directory from the environment
+# (`ORRERY_FDB_DEV_PORT`, `ORRERY_FDB_DEV_DIR`) and no longer stops anything by
+# port; and `scripts/p2-kill9-gate.sh` never called that harness in the first
+# place — it reads `ORRERY_FDB_CLUSTER_FILE` and nothing else. It is that
+# provisioning a throwaway cluster means `sudo dpkg -i` on the server package,
+# and the self-hosted runner is an unprivileged `ci` user with no sudo. The box
+# does run an `fdbserver`, and that is precisely the cluster these jobs must
+# not touch: it is a shared development database, and both of them write to
+# whatever cluster they are pointed at (docs/11-roadmap.md, C-8).
+#
+# `p3-island` was pinned here for the same stated reason and never had one:
+# `scripts/p3-island-gate.sh` contains no FoundationDB reference at all, runs
+# persistd with `--allow-volatile-leases`, and binds every listener on
+# `127.0.0.1:0`. Nothing in it collides with anything, so it runs on the box.
 
 name: Nightly gates
 
@@ -81,7 +88,14 @@ jobs:
 
   p3-island:
     name: P3 island gate (kill -9, 8 peers)
-    runs-on: ubuntu-latest
+    # No cluster and no fixed port: every listener in scripts/p3-island-gate.sh
+    # binds 127.0.0.1:0 and persistd runs with --allow-volatile-leases, so this
+    # gate collides with nothing the box is already doing.
+    runs-on: [self-hosted, orrery-hel1]
+    env:
+      # Overrides the workflow-level clear: the box has a persistent sccache at
+      # /var/cache/sccache, shared with the dev checkout on the same machine.
+      RUSTC_WRAPPER: sccache
     # The harness runs a 30 s island plus setup and teardown; the build
     # dominates. Bounded so a hung peer fails rather than burning the job limit.
     timeout-minutes: 45
@@ -90,6 +104,9 @@ jobs:
       - name: Install the pinned toolchain
         run: rustup show active-toolchain || rustup toolchain install
       - uses: actions/cache@v6
+        # The box keeps its target/ between runs; a cache round-trip would cost
+        # more than it saves there.
+        if: runner.environment == 'github-hosted'
         with:
           path: |
             ~/.cargo/registry/index
@@ -218,3 +235,70 @@ jobs:
             fi
           done
           echo "10 runs produced byte-identical digests"
+
+      # The three sibling jobs all upload theirs. A soak that fails on run 7 of
+      # 10 is diagnosed from the two digests that disagree, and without this
+      # they die with the runner.
+      - name: Upload the soak's digests
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: determinism-soak-digests
+          path: /tmp/soak-*.json
+          retention-days: 14
+          if-no-files-found: warn
+
+  fdb-tests:
+    name: fdb-gated tests (persistd + seed, against a real cluster)
+    # A throwaway single-node cluster, provisioned by the composite action and
+    # discarded with the runner. Never the box's development cluster: these
+    # suites write into whatever cluster they are given, at fixed keys, and
+    # `orrery_seed`'s gates wipe key ranges outright.
+    runs-on: ubuntu-latest
+    # The build dominates; the tests themselves are seconds against a local
+    # single-node cluster.
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install the pinned toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: nightly-fdb-${{ hashFiles('Cargo.toml', 'crates/*/Cargo.toml', 'vendor/*/Cargo.toml', 'rust-toolchain.toml') }}
+          restore-keys: nightly-fdb-
+
+      - name: Install FoundationDB with a local cluster
+        uses: ./.github/actions/foundationdb
+        with:
+          server: "true"
+
+      # The reason this goes through a wrapper script rather than a plain
+      # `cargo test --features fdb`: that command passes here whether or not
+      # the cluster exists. Twenty-two guards inside these suites
+      # `eprintln!("skipping: …")` and return `Ok` when they cannot find one,
+      # so the naive job is green on an unreachable cluster.
+      # `scripts/fdb-tests.sh` captures stderr, fails on any skip, and asserts
+      # a floor on the number of tests that actually executed — see its header.
+      #
+      # Both packages in one invocation, per C-8 (docs/11-roadmap.md): the bug
+      # that entry records passed when the suites were run separately and
+      # failed when they were run together, so running them apart would stop
+      # testing for its return.
+      - name: Run the fdb-gated suite
+        env:
+          ORRERY_FDB_CLUSTER_FILE: /etc/foundationdb/fdb.cluster
+        run: scripts/fdb-tests.sh
+
+      - name: Upload the run's log
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: fdb-tests-log
+          path: target/fdb-tests.log
+          retention-days: 14
+          if-no-files-found: warn
