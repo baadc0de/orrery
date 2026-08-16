@@ -45,6 +45,7 @@ bevy_ecs = { version = "0.19", default-features = false }
 bevy_math = { version = "0.19", default-features = false }
 bevy_platform = { version = "0.19", default-features = false }
 bevy_reflect = { version = "0.19", default-features = false }
+bevy_state = { version = "0.19", default-features = false }
 bevy_time = { version = "0.19", default-features = false }
 
 # Netcode stack (D4)
@@ -69,6 +70,20 @@ glam = { version = "0.32", features = ["serde"] }
 # internals (`server::uplink`) that feed the persistence uplink (D11);
 # upstreaming intent is a PR against simgine/bevy_replicon.
 bevy_replicon = { path = "vendor/bevy_replicon", version = "0.42.1" }
+# lightyear 0.29 (D4, D14): prediction, rollback and snapshot interpolation,
+# configured by `orrery_predict` and named nowhere else (docs/10-crates.md §7).
+# Default features minus the transports — Orrery's link is aeronet+iroh
+# (`orrery_net`), so none of lightyear's own IO backends are compiled in.
+lightyear = { version = "0.29", default-features = false, features = [
+    "std",
+    "client",
+    "server",
+    "replication",
+    "prediction",
+    "interpolation",
+    "input_native",
+] }
+
 # big_space 0.13 (Bevy 0.19) is not yet on crates.io; the WIP `bevy-0.19`
 # branch is the tracked P1 risk (docs/11-roadmap.md §P1). Pinned to the branch
 # commit so the workspace builds reproducibly; swap to the crates.io release
@@ -107,6 +122,17 @@ std_instead_of_core = "warn"
 too_many_arguments = "allow"
 type_complexity = "allow"
 unwrap_used = "warn"
+
+# lightyear's replication and prediction crates depend on `bevy_replicon` from
+# crates.io, and Orrery depends on the vendored fork. Without this patch cargo
+# resolves *both*, and two copies of replicon are two distinct `Replicated`
+# component types: `orrery_spatial`'s visibility mapping and lightyear's
+# replication would silently talk past each other rather than fail to compile.
+# The patch collapses them onto the fork, which is 0.42.1 plus the
+# `server::uplink` change-detection exposure (D11) — a superset, so it satisfies
+# lightyear's `^0.42.1` requirement.
+[patch.crates-io]
+bevy_replicon = { path = "vendor/bevy_replicon" }
 
 [workspace.lints.rust]
 missing_docs = "warn"

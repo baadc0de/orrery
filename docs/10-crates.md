@@ -357,22 +357,62 @@ The lightyear 0.29 configuration layer for per-entity authority (D8): fixed 60 H
 
 ```rust
 pub struct OrreryPredictPlugin { pub config: PredictConfig }
+
+#[derive(Resource)]
 pub struct PredictConfig {
-    pub tick_hz: u32,              // 60 (D16)
-    pub send_hz: u32,              // 20, ≤30 for small islands (D16)
-    pub rollback_ticks: u16,       // 9 (~150 ms) (D16)
-    pub interp_buffer: Duration,   // 100 ms (D16)
-    pub hit_rewind_cap: Duration,  // 200 ms (D16)
+    pub tick_hz: u32,                     // 60 (D16)
+    pub send_hz: u32,                     // 20, ≤30 for small islands (D16)
+    pub rollback_ticks: u16,              // 9 (~150 ms) (D16)
+    pub interp_buffer: Duration,          // 100 ms (D16)
+    pub hit_rewind_cap: Duration,         // 200 ms (D16)
+    pub redundant_input_ticks: u16,       // 20 (docs/05 §4)
+    pub presentation_cutoff_rtt: Duration,// 250 ms (D8)
+    pub frame_time: Duration,             // 16.67 ms, the budget invariant's basis
+}
+impl PredictConfig {
+    /// docs/05 §12's coupling invariants. The plugin refuses to build on a
+    /// defect: a partial retune runs, and is quietly wrong.
+    pub fn validate(&self) -> Vec<ConfigDefect>;
+    pub fn history_ticks(&self) -> u16;      // 16 — the prediction ring
+    pub fn pose_history_ticks(&self) -> u16; // 32 — the authority's pose ring
+}
+
+/// The lightyear ↔ universe tick offset map (D8, docs/05 §6). lightyear's
+/// tick is a session-relative u32; Orrery's is a universe-global u64.
+#[derive(Resource)]
+pub struct TickBridge { /* base + serial-number wraparound accounting */ }
+
+#[derive(Resource)]
+pub struct ReconciliationMonitor { /* per (authority, entity) tracks vs D16 bands */ }
+impl ReconciliationMonitor {
+    /// Integer residuals on the quantization lattice. Returns a signal on the
+    /// tick a violation first qualifies, and only then. Feeds the witness.
+    pub fn record_residual(&mut self, key: TrackKey, tick: Tick,
+                           pos_err_mm: i64, vel_err_mms: i64) -> Option<MonitorSignal>;
+    pub fn scan_correction_pattern(&self) -> Option<MonitorSignal>;
+    pub fn degrade(&mut self, reason: DegradedReason);
 }
 
 #[derive(Resource)]
-pub struct ReconciliationMonitor { /* per-entity error stats vs Tolerance bands */ }
-impl ReconciliationMonitor {
-    pub fn sustained_violation(&self, e: Entity) -> Option<ViolationWindow>; // feeds witness
+pub struct RollbackBudget { pub step_cost: Duration /* ≈1 ms */, /* … */ }
+impl RollbackBudget {
+    pub fn observe_step(&mut self, measured: Duration);
+    /// The D8 degradation ladder. Every answer is affordable by construction.
+    pub fn plan(&mut self, pending_ticks: u16, predicted_len: u16) -> ResimPlan;
 }
 
-#[derive(Resource)] pub struct RollbackBudget { pub resim_budget: Duration /* ≈1 ms */ }
+/// Attribution for a predicted entity, populated by `orrery_authority`. A
+/// residual with no authority attached is discarded, never guessed at.
+#[derive(Component)]
+pub struct PredictedBy { pub authority: NodeId, pub persist_id: PersistId }
+
+/// A game's predicted component, projected onto the lattice so lightyear's
+/// post-rollback correction can be read as witness evidence.
+pub trait ReconciliationResidual { fn pos_error_mm(&self) -> i64; fn vel_error_mms(&self) -> i64; }
+pub trait AppReconciliationExt { fn track_reconciliation<D: ReconciliationResidual + Component>(&mut self) -> &mut Self; }
 ```
+
+**Status (2026-08-16).** The configuration layer is landed and lightyear 0.29 builds against the pinned Bevy 0.19 unmodified — D14's pin holds and R-1's build-failure mode has not arrived. What did arrive is a capability gap: lightyear's per-entity **authority does not work** (its own docs say so — `lightyear_replication-0.29.0/src/lib.rs:67`), and it exposes no rollback event, so the monitor is fed from `VisualCorrection<D>` on the mispredicted entity instead. The full finding, including the D16-to-lightyear knob map and the `[patch.crates-io]` that keeps one copy of `bevy_replicon` in the graph, is [05-prediction-rollback.md](05-prediction-rollback.md) §13.
 
 ### 8. `orrery_witness` — validation and evidence
 
