@@ -262,10 +262,15 @@ pub fn connect_gateway(
     session.gateway = None;
 }
 
-/// Send the `Hello` once the aeronet session is established.
+/// Send the versioned `Hello` once the aeronet session is established.
 ///
 /// The client's own node id is the local iroh endpoint id (D3); it was captured
 /// on [`GatewaySession::gateway`]'s sibling fields by [`connect_gateway`].
+///
+/// This is the one site that bootstraps a session, so naming the protocol
+/// version here is what puts every Orrery client inside the gateway's `{V,
+/// V−1}` acceptance window. The unversioned `GatewayMsg::Hello` remains a
+/// valid bootstrap on the wire for peers that do not send this one.
 pub fn hello_gateway(mut session: ResMut<GatewaySession>, mut streams: Query<&mut IrohStreamIo>) {
     if session.state != GatewayState::Connecting || session.hello_sent {
         return;
@@ -276,9 +281,10 @@ pub fn hello_gateway(mut session: ResMut<GatewaySession>, mut streams: Query<&mu
     let Ok(mut streams) = streams.get_mut(entity) else {
         return;
     };
-    let msg = GatewayMsg::Hello {
+    let msg = GatewayMsg::VersionedHello {
         token: session.token.clone(),
         node: session.node,
+        version: orrery_protocol::PROTOCOL_VERSION,
     };
     GatewaySession::push_control(&mut streams, &msg);
     session.hello_sent = true;

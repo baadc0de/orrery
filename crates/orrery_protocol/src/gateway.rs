@@ -74,6 +74,40 @@ pub enum GatewayMsg {
         /// The signed, witness-attested intent.
         intent: Intent,
     },
+    /// Session bootstrap that names the protocol version the client speaks.
+    ///
+    /// A separate variant rather than a third field on [`GatewayMsg::Hello`]:
+    /// postcard keys variants positionally and fields by order within one, so
+    /// growing `Hello` would silently mis-decode every peer still sending the
+    /// two-field form. Appending leaves that encoding untouched.
+    ///
+    /// **Both bootstraps stay live.** A gateway accepts the unversioned
+    /// [`GatewayMsg::Hello`] without checking anything, so version enforcement
+    /// is opt-in: it binds the clients that send this variant, and becomes
+    /// universal only when `Hello` is removed.
+    VersionedHello {
+        /// The session token from `orrery_identity` login.
+        token: Vec<u8>,
+        /// The client's NodeId (transport identity, D3).
+        node: NodeId,
+        /// The [`crate::PROTOCOL_VERSION`] this client was built against.
+        version: u16,
+    },
+}
+
+impl GatewayMsg {
+    /// Whether a service speaking `current` accepts a peer offering `offered`:
+    /// the rolling-upgrade window of `{V, V−1}`
+    /// ([`crate::PROTOCOL_VERSION`]), so a cluster always deploys ahead of its
+    /// clients.
+    ///
+    /// `current` is a parameter rather than the constant because a gateway
+    /// carries its own version per instance, which is what lets a test drive
+    /// both ends of the window without touching the constant.
+    #[must_use]
+    pub const fn protocol_accepted(current: u16, offered: u16) -> bool {
+        offered == current || offered == current.saturating_sub(1)
+    }
 }
 
 /// A gateway → client message.
@@ -161,6 +195,29 @@ pub enum GatewayReply {
         /// The outcome.
         outcome: IntentOutcome,
     },
+    /// The gateway refused the session.
+    ///
+    /// A refused [`GatewayMsg::VersionedHello`] would otherwise be silent, and
+    /// silence here is indistinguishable from a slow gateway: the client would
+    /// re-dial and re-offer the same unacceptable version until it gave up,
+    /// with nothing to report but a timeout.
+    HelloRefused {
+        /// The gateway's NodeId.
+        gateway: NodeId,
+        /// The version the gateway itself speaks, so the client can report the
+        /// skew rather than only the failure.
+        protocol: u16,
+        /// Why the session was refused. See
+        /// [`GatewayReply::HELLO_REFUSED_PROTOCOL`].
+        reason: u8,
+    },
+}
+
+impl GatewayReply {
+    /// [`GatewayReply::HelloRefused`] reason: the offered protocol version is
+    /// outside the `{V, V−1}` window this gateway accepts
+    /// ([`GatewayMsg::protocol_accepted`]).
+    pub const HELLO_REFUSED_PROTOCOL: u8 = 1;
 }
 
 /// A single bulk diff uplink (D11 §2.1).
@@ -417,6 +474,54 @@ mod tests {
         let bytes = postcard::to_stdvec(&reply).unwrap();
         let back: GatewayReply = postcard::from_bytes(&bytes).unwrap();
         assert_eq!(back, reply);
+    }
+
+    #[test]
+    fn versioned_hello_roundtrips_and_leaves_the_unversioned_form_alone() {
+        let versioned = GatewayMsg::VersionedHello {
+            token: b"session-token".to_vec(),
+            node: node(1),
+            version: crate::PROTOCOL_VERSION,
+        };
+        let bytes = postcard::to_stdvec(&versioned).unwrap();
+        let back: GatewayMsg = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(back, versioned);
+
+        // The point of appending rather than growing `Hello`: a peer still
+        // sending the two-field form encodes exactly what it always did.
+        let unversioned = GatewayMsg::Hello {
+            token: b"session-token".to_vec(),
+            node: node(1),
+        };
+        let bytes = postcard::to_stdvec(&unversioned).unwrap();
+        assert_eq!(
+            postcard::from_bytes::<GatewayMsg>(&bytes).unwrap(),
+            unversioned
+        );
+    }
+
+    #[test]
+    fn hello_refused_roundtrips() {
+        let reply = GatewayReply::HelloRefused {
+            gateway: node(1),
+            protocol: 4,
+            reason: GatewayReply::HELLO_REFUSED_PROTOCOL,
+        };
+        let bytes = postcard::to_stdvec(&reply).unwrap();
+        let back: GatewayReply = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(back, reply);
+    }
+
+    #[test]
+    fn the_accepted_version_window_is_v_and_v_minus_one() {
+        assert!(GatewayMsg::protocol_accepted(3, 3));
+        assert!(GatewayMsg::protocol_accepted(3, 2));
+        assert!(!GatewayMsg::protocol_accepted(3, 1));
+        assert!(!GatewayMsg::protocol_accepted(3, 4));
+        // A service at the floor accepts only itself, rather than wrapping
+        // into the top of the u16 range.
+        assert!(GatewayMsg::protocol_accepted(0, 0));
+        assert!(!GatewayMsg::protocol_accepted(0, u16::MAX));
     }
 
     #[test]

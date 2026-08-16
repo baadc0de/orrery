@@ -20,7 +20,10 @@
 //!   the intent to the configured [`IntentExecutor`] and ack **only after**
 //!   its future resolves — a `Committed` ack implies a durable commit (RPO 0).
 //!   With no executor configured the reply is `Rejected`, never a fake commit.
-//! - [`GatewayMsg::Hello`] → acknowledge with the gateway node id + protocol
+//! - [`GatewayMsg::Hello`] / [`GatewayMsg::VersionedHello`] → acknowledge with
+//!   the gateway node id + protocol (the versioned form is checked against the
+//!   `{V, V−1}` window and refused with [`GatewayReply::HelloRefused`]; the
+//!   unversioned one is accepted unchecked)
 //!   version.
 //!
 //! The transport is the **raw** iroh endpoint — this crate is **Bevy-free**
@@ -2168,6 +2171,37 @@ async fn handle_connection(
             debug!(%remote, "gateway: undecodable message");
             continue;
         };
+        // A versioned bootstrap is an ordinary one once its version is inside
+        // the rolling-upgrade window, so the two share the admission path
+        // below rather than duplicating it. Enforcement is confined to the
+        // versioned form on purpose: the unversioned `Hello` stays accepted
+        // unchecked, so this gateway does not cut off a peer that has not
+        // adopted the new variant, and version checking is opt-in until
+        // `Hello` is retired.
+        let msg = match msg {
+            GatewayMsg::VersionedHello {
+                token,
+                node,
+                version,
+            } => {
+                if !GatewayMsg::protocol_accepted(protocol, version) {
+                    warn!(
+                        %remote,
+                        version, protocol,
+                        "gateway: refused a client outside the accepted protocol window"
+                    );
+                    let reply = GatewayReply::HelloRefused {
+                        gateway,
+                        protocol,
+                        reason: GatewayReply::HELLO_REFUSED_PROTOCOL,
+                    };
+                    send(Bytes::from(encode_stream_frame(&reply)));
+                    continue;
+                }
+                GatewayMsg::Hello { token, node }
+            }
+            other => other,
+        };
         match msg {
             GatewayMsg::Hello { token, node } => {
                 // The iroh transport identity is the authority identity; a
@@ -2201,6 +2235,10 @@ async fn handle_connection(
                     }
                 }
             }
+            // Normalized into `GatewayMsg::Hello` above. Spelled out rather
+            // than folded into a wildcard arm, so a future variant still fails
+            // to compile here instead of being silently dropped.
+            GatewayMsg::VersionedHello { .. } => {}
             GatewayMsg::Lease { message } => {
                 let Some(active_session) = session.as_ref() else {
                     continue;

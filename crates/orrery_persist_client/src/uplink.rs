@@ -252,7 +252,14 @@ impl UplinkScheduler {
         }
         self.record_reply_latency(entity, tick, received_at);
         if let Some(state) = self.entities.get_mut(&entity) {
-            state.last_acked_tick = Some(tick);
+            // Acks arrive on the unreliable, unordered lane, so a late or
+            // duplicated one carries an older tick than the highwater already
+            // recorded. Taking it verbatim would walk the highwater backwards
+            // and make an already-acked diff look unacked to anything reading
+            // it.
+            if state.last_acked_tick.is_none_or(|last| tick > last) {
+                state.last_acked_tick = Some(tick);
+            }
             if state.pending.as_ref().is_some_and(|d| d.tick == tick) {
                 state.pending = None;
             }
@@ -450,6 +457,29 @@ mod tests {
         sched.on_ack(PersistId::new(1), Tick::new(1), false);
         assert!(!sched.has_pending(PersistId::new(1)));
         assert_eq!(sched.last_acked_tick(PersistId::new(1)), Some(Tick::new(1)));
+    }
+
+    #[test]
+    fn a_late_or_duplicate_ack_does_not_walk_the_ack_highwater_back() {
+        // Acks ride the unreliable, unordered lane: the ack for tick 5 can be
+        // followed by a delayed copy of the one for tick 1. The highwater is
+        // the client's record of what the gateway has made durable, so a
+        // regression there reports acked state as unacked.
+        let cfg = cfg();
+        let mut sched = UplinkScheduler::new();
+        sched.register(PersistId::new(1), 4.0);
+        sched.queue(diff(1, 5, b"hp=50"));
+        sched.flush(&cfg, t(0));
+        sched.flush(&cfg, t(250));
+        sched.on_ack(PersistId::new(1), Tick::new(5), false);
+        assert_eq!(sched.last_acked_tick(PersistId::new(1)), Some(Tick::new(5)));
+
+        sched.on_ack(PersistId::new(1), Tick::new(1), false);
+        assert_eq!(sched.last_acked_tick(PersistId::new(1)), Some(Tick::new(5)));
+
+        // The duplicate of the newest ack is idempotent.
+        sched.on_ack(PersistId::new(1), Tick::new(5), false);
+        assert_eq!(sched.last_acked_tick(PersistId::new(1)), Some(Tick::new(5)));
     }
 
     #[test]

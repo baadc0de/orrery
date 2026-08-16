@@ -1669,6 +1669,11 @@ impl Rig<'_> {
                 tracing::warn!(session, ?cell, kind, "area load failed");
             }
             GatewayReply::HelloAck { .. } => {}
+            GatewayReply::HelloRefused {
+                protocol, reason, ..
+            } => {
+                tracing::warn!(session, protocol, reason, "gateway refused the session");
+            }
             // The rig neither claims leases nor presents a coordinator grant,
             // so these are the gateway telling it about a session shape it did
             // not ask for. Logged rather than ignored: silently dropping them
