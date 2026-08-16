@@ -210,7 +210,7 @@ pub type SharedExecutor = Arc<dyn IntentExecutor>;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use orrery_protocol::{Epoch, IntentOp};
+    use orrery_protocol::{CellEpoch, IntentOp};
 
     fn intent(id: u128, ops: usize) -> Intent {
         let key = iroh_base::SecretKey::from_bytes(&{
@@ -221,7 +221,7 @@ mod tests {
         let mut intent = Intent {
             intent_id: id,
             issuer: key.public(),
-            cell_epoch: Epoch::new(0),
+            cell_epoch: CellEpoch::new(0),
             ops: (0..ops)
                 .map(|i| IntentOp {
                     op: i as u16,

@@ -24,8 +24,8 @@ use orrery_persist_client::{
 };
 use orrery_persistd::Router;
 use orrery_protocol::{
-    CellId, ClaimBasis, ClaimKind, DiffUplink, Epoch, GatewayMsg, GridId, JournalRecord, LeaseMsg,
-    Lsn, PersistId, RecordKind, Tick,
+    CellEpoch, CellId, ClaimBasis, ClaimKind, DiffUplink, Epoch, GatewayMsg, GridId, JournalRecord,
+    LeaseMsg, Lsn, PersistId, RecordKind, Tick,
 };
 use tokio::sync::Mutex;
 
@@ -551,7 +551,7 @@ fn signed_intent(key: &iroh_base::SecretKey, id: u128) -> orrery_protocol::Inten
     let mut intent = orrery_protocol::Intent {
         intent_id: id,
         issuer: key.public(),
-        cell_epoch: Epoch::new(0),
+        cell_epoch: CellEpoch::new(0),
         ops: vec![orrery_protocol::IntentOp {
             op: 1,
             args: bytes::Bytes::from_static(b"trade"),

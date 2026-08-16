@@ -25,7 +25,7 @@ use orrery_persistd::{
 };
 use orrery_protocol::channels::{decode_datagram, decode_stream_frame};
 use orrery_protocol::{
-    Attestation, CellId, ClaimBasis, ClaimKind, CoordinatorInterestSnapshot, DiffUplink,
+    Attestation, CellEpoch, CellId, ClaimBasis, ClaimKind, CoordinatorInterestSnapshot, DiffUplink,
     EntityRekey, Epoch, GatewayMsg, GatewayReply, GridId, Intent, IntentOp, IntentOutcome,
     JournalRecord, Lease, LeaseFlags, LeaseId, LeaseMsg, Lsn, PersistId, RecordKind, SeqPair, Tick,
     UnixMillis, ENTITY_REKEY_VERSION,
@@ -520,7 +520,7 @@ fn signed_intent(id: u128, key: &iroh_base::SecretKey) -> Intent {
     let mut intent = Intent {
         intent_id: id,
         issuer: key.public(),
-        cell_epoch: Epoch::new(0),
+        cell_epoch: CellEpoch::new(0),
         ops: vec![IntentOp {
             op: 1,
             args: bytes::Bytes::from_static(b"trade"),

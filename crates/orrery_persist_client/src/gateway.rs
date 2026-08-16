@@ -649,7 +649,7 @@ mod tests {
         orrery_protocol::Intent {
             intent_id: id,
             issuer: node(1),
-            cell_epoch: orrery_protocol::Epoch::new(0),
+            cell_epoch: orrery_protocol::CellEpoch::new(0),
             ops: vec![],
             attestations: vec![],
             signature: sig(),

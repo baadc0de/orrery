@@ -389,7 +389,7 @@ pub fn drain_intents(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use orrery_protocol::{Attestation, Epoch, IntentOp, NodeId, Tick};
+    use orrery_protocol::{Attestation, CellEpoch, IntentOp, NodeId, Tick};
 
     fn node(n: u8) -> NodeId {
         let mut seed = [0u8; 32];
@@ -406,7 +406,7 @@ mod tests {
         Intent {
             intent_id: id,
             issuer: node(1),
-            cell_epoch: Epoch::new(0),
+            cell_epoch: CellEpoch::new(0),
             ops: vec![IntentOp {
                 op: 1,
                 args: bytes::Bytes::from_static(b"trade"),
