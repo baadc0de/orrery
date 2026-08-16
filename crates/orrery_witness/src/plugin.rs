@@ -319,6 +319,16 @@ pub struct WitnessSet {
 /// Left at zero the sweep never runs, so a host that does not set this keeps
 /// the previous behaviour rather than getting timeouts against a clock that is
 /// not advancing.
+///
+/// **Nothing in the workspace writes it, including
+/// [`OrreryClientPlugins`](https://docs.rs/orrery), and that is deliberate.**
+/// The units are universe ticks, which no plugin here can invent: the client
+/// facade would have to synthesize one from lightyear's session-relative
+/// timeline, and a timeout swept against a made-up clock is worse than one that
+/// does not run. So the timeout is opt-in, and opting in is one system in the
+/// game — the same system that already knows its universe tick writes it here.
+/// `orrery`'s group docs enumerate this alongside the other host-driven
+/// resources.
 #[derive(Debug, Clone, Copy, Resource)]
 pub struct WitnessClock(pub Tick);
 

@@ -138,10 +138,29 @@ than `Granted`: the entity was not being simulated optimistically beforehand,
 so game code has to promote it from proxy to simulated body rather than confirm
 a prediction.
 
+A `Deny` names a `claim_id` and no `lease_id`, and that bounds what it can
+undo: it refuses **the claim, and only the claim**. A peer that already holds a
+fence for the entity — the ordinary case of a weak holder asking to upgrade to
+strong ownership, which §4.2 routes through the same `Claim` message — keeps it,
+and returns to the grant it was upgrading from. The alternative was tried and is
+wrong in both directions: the registrar still has this peer down as the holder,
+so dropping the fence locally leaves the body written by nobody until the 10 s
+TTL runs out, and it does so without any registrar message having revoked
+anything. Only `Expire`, an invalidating `HeartbeatAck`, a fencing `BulkNack`
+and the holder's own `Divest` end a fence.
+
 An `Expire` addresses the loser by the token it *still believes it has
 installed* — parking has already bumped the row's own `lease_id` past it — and
 its `disposition` tells the loser where authority actually went, so a demoted
 peer renders the entity against its real holder instead of a stale local one.
+It carries no `seq`, so the loser **keeps the pair it last knew** rather than
+resetting the entity's row. INV-2 is the first reason, but the operative one is
+downstream: a peer that holds no fence resolves a late fencing `BulkNack`
+against the sequence pair alone (§2, and `orrery_persist_client::replies`), and
+a row left at `(0, 0)` is superseded by *every* row — including one the
+registrar had already moved past when the datagram left. That is how a
+duplicated NACK repoints `Authority.holder` at a stale peer, with no `Lost`
+event to show for it.
 
 `Divest.cursor` names the holder's last acked journal position so the registrar can require the state to be uplink-complete before regranting — the successor starts from exactly the state the predecessor last committed.
 
@@ -153,6 +172,7 @@ flowchart LR
     P -- Grant --> G[LocalGranted]
     P -- "Deny: roll back claim,<br/>reconcile to holder" --> R
     G -- "Heartbeat / renewed" --> G
+    G -- "Deny of an upgrade claim:<br/>roll back the claim, keep the fence" --> G
     G -- "Divest acked" --> R
     G -- "Expire (fenced)" --> R
     G -- "cluster unreachable<br/>past local expiry" --> V[LocalProvisional]
@@ -338,6 +358,21 @@ would have been refused anyway, each of which would otherwise cost a token:
 | Strong ownership | Traversal *stops* at a body another peer strong-owns (INV-5). This is where the frontier partition comes from. |
 | Plausibility gate | The peer reads its own coordinator grant and declines claims for cells outside it, rather than generating the §10 gate-failure telemetry. An absent or unparseable grant gates nothing: the gateway is the real arbiter, and a client that silently stopped claiming would be the worse failure. |
 | `Deny` back-off | 250 ms doubling to a 2 s cap, per entity, mirroring §10's own cooldown. A cooling body is *skipped*, not queued — a body still in contact is re-proposed by the next tick's solver output, so a retry queue would only duplicate what physics already reports. |
+
+**What the game supplies, and what the plugin drives.** The planner reads two
+resources per tick and they have different owners.
+`orrery_authority::ContactObservations` and `ContactTick::tick` are the game's:
+the solver's contact report for the step, and the universe tick it ran on.
+Neither can be synthesized here — the tick is *evidence*, since
+`ClaimBasis::Contact{tick}` is what §10's plausibility gate and the D9 input
+log read, and a claim naming a tick the contact did not happen on is not
+evidence of anything. `ContactTick::now_ms` is the opposite case and
+`OrreryAuthorityPlugin` drives it, from the same process origin as the lease
+expiry clock: it measures the two intervals above, and a client that left it at
+zero would compute every elapsed interval as zero — the bucket never refilling
+past the peer's first 64 lifetime claims, and one `Deny` cooling a body until
+the process exits. The client facade's group documents the host's half of this
+list, and `crates/orrery/tests/client_group.rs` pins it.
 
 A body with a claim already in flight is traversed *through* but not re-claimed:
 that is what optimism means here. Ephemeral bodies (§6) participate in the same

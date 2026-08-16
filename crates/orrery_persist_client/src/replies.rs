@@ -1079,6 +1079,116 @@ mod tests {
     }
 
     #[test]
+    fn a_stale_nack_after_a_reassigning_expiry_cannot_repoint_the_holder() {
+        // The fallback below — `current.seq.supersedes(authority.seq)` — is the
+        // only ordering left when this peer holds no fence, which is exactly
+        // the state a reassigning `Expire` leaves it in. So the pair the
+        // expiry stamps decides whether a late datagram can move the holder: a
+        // row reset to `(0, 0)` is beaten by *every* row, including one the
+        // registrar has already moved past, and the entity is silently
+        // repointed at a peer that no longer holds it. `revoke_local_lease`
+        // returns `None` on that path, so no `Lost` event reports it either.
+        let (mut app, session_entity) = reply_app();
+        app.add_plugins(OrreryAuthorityPlugin);
+        let persisted = PersistId::new(25);
+        let local_entity = app
+            .world_mut()
+            .spawn((
+                PersistIdentity(persisted),
+                Authority {
+                    holder: None,
+                    seq: SeqPair::default(),
+                },
+                AuthorityPhase::Remote,
+            ))
+            .id();
+        app.world_mut().resource_mut::<AuthorityState>().node = node(1);
+        let claim_id = begin_claim(&mut app, local_entity, persisted);
+        app.world_mut()
+            .resource_mut::<LeaseInbox>()
+            .0
+            .push(orrery_protocol::LeaseMsg::Grant {
+                claim_id,
+                entity: persisted,
+                lease_id: LeaseId(4),
+                seq: SeqPair {
+                    own_seq: 0,
+                    auth_seq: 5,
+                },
+                ttl_ms: 10_000,
+                prev_holder: None,
+            });
+        app.update();
+
+        // The registrar moves the lease to another peer.
+        app.world_mut()
+            .resource_mut::<LeaseInbox>()
+            .0
+            .push(orrery_protocol::LeaseMsg::Expire {
+                entity: persisted,
+                lease_id: LeaseId(4),
+                last_holder: Some(node(1)),
+                reason: orrery_protocol::ExpireReason::Timeout,
+                disposition: orrery_protocol::ExpireDisposition::Reassigned { to: node(8) },
+            });
+        app.update();
+        assert_eq!(
+            app.world().get::<Authority>(local_entity).map(|a| a.holder),
+            Some(Some(node(8)))
+        );
+        app.world_mut()
+            .resource_mut::<Messages<AuthorityEvent>>()
+            .clear();
+
+        // When: a NACK the gateway sent before the reassignment is delivered
+        // late, carrying the row that was current when it left.
+        push_nack(
+            &mut app,
+            session_entity,
+            persisted,
+            Tick::new(3),
+            Some(lease_row(
+                persisted,
+                Some(node(3)),
+                LeaseId(2),
+                SeqPair {
+                    own_seq: 0,
+                    auth_seq: 3,
+                },
+            )),
+        );
+        app.update();
+
+        // Then: the entity still renders against the holder the registrar
+        // named, and the stale row changed nothing.
+        let authority = app
+            .world()
+            .get::<Authority>(local_entity)
+            .expect("the entity keeps its authority component");
+        assert_eq!(
+            authority.holder,
+            Some(node(8)),
+            "a row the registrar has moved past must not repoint the holder"
+        );
+        assert_eq!(
+            authority.seq,
+            SeqPair {
+                own_seq: 0,
+                auth_seq: 5,
+            },
+            "and the pair never goes backwards (INV-2)"
+        );
+        assert!(
+            app.world_mut()
+                .resource_mut::<Messages<AuthorityEvent>>()
+                .drain()
+                .next()
+                .is_none(),
+            "nothing was lost, so nothing is reported lost"
+        );
+    }
+
+    #[test]
     fn hello_ack_naming_an_unsupported_protocol_ends_the_session() {
         let (mut app, session_entity) = hello_app();
         push_reply(

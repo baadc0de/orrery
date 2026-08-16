@@ -12,6 +12,24 @@
 //! only crate allowed to see both sides. Outside `orrery_predict` there is one
 //! kind of tick: [`orrery_protocol::Tick`].
 //!
+//! **The base is still the universe origin, and that is a real cost.**
+//! [`OrreryPredictPlugin`](crate::plugin::OrreryPredictPlugin) anchors the
+//! bridge at `(Tick(0), 0)` and calls [`TickBridge::advance`] every fixed tick,
+//! so the wrap epoch is maintained — but nothing re-anchors it. `orrery_net`
+//! does not: the coordinator's universe epoch and the converged clock offset
+//! reach no caller of [`TickBridge::anchor`] anywhere in the tree. Until they
+//! do, `base` is zero and [`TickBridge::resolve`] returns lightyear's own
+//! session-relative tick unchanged. What that costs is bounded and specific:
+//! the ticks [`ReconciliationMonitor`](crate::ReconciliationMonitor) stamps
+//! onto reconciliation residuals are session-relative, so a residual run is
+//! measured correctly *within* a session — the monitor only ever compares
+//! residuals to each other — while the tick it reports is not the universe
+//! tick a witness report or a journal record would name. Re-anchoring is the
+//! sync phase's job (docs/05 §6) and is not implemented; anchoring earlier
+//! than convergence would bake the offset error into every tick the session
+//! ever stamps, which is why the resource is not simply seeded from the
+//! coordinator's epoch on arrival.
+//!
 //! Wraparound is handled rather than assumed away. A `u32` at 60 Hz wraps after
 //! about 828 days, which is longer than any session and shorter than a
 //! universe; a bridge that ignored it would be a bug with a two-year fuse.
