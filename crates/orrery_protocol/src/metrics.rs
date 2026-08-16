@@ -69,6 +69,68 @@ pub const GATED_SERIES: [&str; 4] = [
 /// Series carried by the P2 artifact that no D16 target gates.
 pub const UNGATED_SERIES: [&str; 1] = [SERIES_GATEWAY_BULK_SERVER];
 
+/// Follower append latency: receipt of a chain batch through its durable
+/// acknowledgement, measured inside the follower `persistd`.
+pub const SERIES_CHAIN_FOLLOWER_APPEND: &str = "chain_follower_append_ms";
+/// Primary-to-follower lag in journal bytes: `primary.committed()` minus the
+/// highest origin LSN the follower has reported durable.
+pub const SERIES_CHAIN_LAG_BYTES: &str = "chain_lag_bytes";
+/// Primary-to-follower lag as age: how long the oldest unmirrored record has
+/// been committed on the primary. This is the form D11's RPO target is stated
+/// in; the byte gauge is what an LSN can measure directly.
+pub const SERIES_CHAIN_LAG_AGE: &str = "chain_lag_age_ms";
+/// Watermark probe latency: the reconnect round trip a primary performs before
+/// it may resend a tail.
+pub const SERIES_CHAIN_PROBE: &str = "chain_watermark_probe_ms";
+/// Reconnects per stream: sessions opened on one durable chain identity.
+pub const SERIES_CHAIN_RECONNECTS: &str = "chain_reconnects_total";
+/// Duplicate batches: appends the follower deduped against its durable index
+/// rather than storing again. Expected during reconnect, alarming when it
+/// rises above reconnect noise.
+pub const SERIES_CHAIN_DUPLICATE_BATCHES: &str = "chain_duplicate_batches_total";
+/// Stream restarts per shard set: how often the transport had to rebuild a
+/// stream, as distinct from how often a session was opened on a live one.
+pub const SERIES_CHAIN_STREAM_RESTARTS: &str = "chain_stream_restarts_total";
+/// Journal and fsync errors on either side of the chain.
+pub const SERIES_CHAIN_JOURNAL_ERRORS: &str = "chain_journal_errors_total";
+
+/// The chain signals `docs/13-chain-replication.md` §6 requires, in that
+/// section's order. §6 lists eight; these are nine because its third entry,
+/// "primary-to-follower lag in bytes and age", is two measurements.
+///
+/// The first entry is [`SERIES_JOURNAL_COMMIT`]: §6's "primary commit latency"
+/// is the D16 series already contracted above, and giving it a second name
+/// would be the drift this module exists to prevent.
+///
+/// These are deliberately **not** in [`UNGATED_SERIES`], and
+/// [`is_known_series`] deliberately does not accept them. That predicate
+/// answers a narrower question — whether a name may appear in the P2 latency
+/// artifact `p2-dashboard` folds — and four of these are counters and one is a
+/// byte gauge, none of which the [`LATENCY_BOUNDARIES_US`] lattice
+/// describes. Naming them here is what stops the eventual producer and the
+/// eventual consumer from inventing two spellings; promoting the latency
+/// members into the artifact contract is a decision for whoever wires the
+/// first one, not a side effect of writing them down.
+pub const CHAIN_SERIES: [&str; 9] = [
+    SERIES_JOURNAL_COMMIT,
+    SERIES_CHAIN_FOLLOWER_APPEND,
+    SERIES_CHAIN_LAG_BYTES,
+    SERIES_CHAIN_LAG_AGE,
+    SERIES_CHAIN_RECONNECTS,
+    SERIES_CHAIN_DUPLICATE_BATCHES,
+    SERIES_CHAIN_PROBE,
+    SERIES_CHAIN_STREAM_RESTARTS,
+    SERIES_CHAIN_JOURNAL_ERRORS,
+];
+
+/// The chain members measured in microseconds on the shared lattice, so a
+/// producer knows which of them [`bucket_index`] applies to.
+pub const CHAIN_LATENCY_SERIES: [&str; 3] = [
+    SERIES_JOURNAL_COMMIT,
+    SERIES_CHAIN_FOLLOWER_APPEND,
+    SERIES_CHAIN_PROBE,
+];
+
 /// Shared bucket boundaries in microseconds, ascending.
 ///
 /// A sample belongs to the first boundary greater than or equal to it; a
@@ -187,6 +249,22 @@ mod tests {
                 "{target_us} µs has only {below} boundaries at or below it"
             );
         }
+    }
+
+    #[test]
+    fn chain_series_are_unique_and_stay_out_of_the_latency_artifact() {
+        let mut names = CHAIN_SERIES.to_vec();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), CHAIN_SERIES.len(), "duplicate chain series");
+        // `journal_commit_ms` is shared with D16 on purpose; everything else
+        // is chain-only and must not be folded as a P2 latency series.
+        for name in CHAIN_SERIES.iter().filter(|&&s| s != SERIES_JOURNAL_COMMIT) {
+            assert!(!is_known_series(name), "{name} leaked into the P2 artifact");
+        }
+        assert!(CHAIN_LATENCY_SERIES
+            .iter()
+            .all(|name| CHAIN_SERIES.contains(name)));
     }
 
     #[test]

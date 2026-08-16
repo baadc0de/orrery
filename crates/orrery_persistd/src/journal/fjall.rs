@@ -46,6 +46,11 @@ const ADOPTIONS_KS: &str = "chain_adoptions";
 #[cfg(feature = "chain-grpc")]
 const ADOPTED_RECORDS_KS: &str = "adopted_chain_records";
 
+/// The widest postcard varint encoding of a `u64`, which is how a
+/// `DurableChainId`'s epoch is encoded at the tail of its chain key.
+#[cfg(feature = "chain-grpc")]
+const MAX_U64_VARINT_LEN: usize = 10;
+
 /// The fjall keyspace holding LSN-keyed journal records.
 const RECORDS_KS: &str = "records";
 /// LSN keys for records authored by this journal (and therefore eligible for
@@ -299,6 +304,14 @@ impl Journal {
         self.committer.committed()
     }
 
+    /// The byte span a segment covers before the cursor rolls to the next one.
+    ///
+    /// An [`Lsn`] is a `(segment, offset)` pair, so any byte distance that
+    /// crosses a segment boundary needs this stride to be expressible at all.
+    pub(crate) fn segment_size(&self) -> u64 {
+        self.segment_size
+    }
+
     /// The number of fsyncs issued since open (§4 group-commit observability:
     /// the count that proves adaptive batching is engaging).
     pub fn flush_count(&self) -> usize {
@@ -429,6 +442,71 @@ impl Journal {
                 Ok((lsn, entry.1.as_ref().to_vec()))
             })
             .collect()
+    }
+
+    /// The chain key of a mirrored record stored under a *sibling* chain
+    /// identity: one sharing `family` — the primary, follower and shard-set
+    /// prefix of a `DurableChainId` — but differing from `own_key`, which can
+    /// only be a difference of ownership epoch.
+    ///
+    /// `chain_record_prefix` length-prefixes the chain key, so siblings whose
+    /// epoch varint is a different width sort into different length buckets.
+    /// The scan therefore seeks once per width postcard can produce for a
+    /// `u64` (at most ten bytes), and inside the bucket holding `own_key` it
+    /// seeks the ranges either side of that key separately. It never walks
+    /// this chain's own rows, so the cost is a bounded number of seeks rather
+    /// than a scan of the mirrored history.
+    #[cfg(feature = "chain-grpc")]
+    pub(crate) fn chain_epoch_sibling(
+        &self,
+        family: &[u8],
+        own_key: &[u8],
+    ) -> Result<Option<Vec<u8>>, JournalError> {
+        let index = self.chain_records()?;
+        for width in 1..=MAX_U64_VARINT_LEN {
+            let length = family.len() + width;
+            let Ok(encoded_len) = u32::try_from(length) else {
+                continue;
+            };
+            let mut base = encoded_len.to_be_bytes().to_vec();
+            base.extend_from_slice(family);
+            let Some(end) = prefix_successor(&base) else {
+                continue;
+            };
+            let mut ranges = Vec::with_capacity(2);
+            if own_key.len() == length && own_key.starts_with(family) {
+                let own = chain_record_prefix(own_key);
+                if base < own {
+                    ranges.push((base.clone(), own.clone()));
+                }
+                if let Some(after) = prefix_successor(&own) {
+                    if after < end {
+                        ranges.push((after, end));
+                    }
+                }
+            } else {
+                ranges.push((base, end));
+            }
+            for (start, stop) in ranges {
+                let Some(entry) = index.range(start..stop).next() else {
+                    continue;
+                };
+                let entry = entry
+                    .into_inner()
+                    .map_err(|e| JournalError::Store(format!("scan chain index: {e}")))?;
+                let key = entry.0.as_ref();
+                let head: [u8; 4] = key
+                    .get(..4)
+                    .and_then(|head| head.try_into().ok())
+                    .ok_or_else(|| JournalError::Store("truncated chain index key".into()))?;
+                let sibling_len = u32::from_be_bytes(head) as usize;
+                let sibling = key
+                    .get(4..4 + sibling_len)
+                    .ok_or_else(|| JournalError::Store("truncated chain index key".into()))?;
+                return Ok(Some(sibling.to_vec()));
+            }
+        }
+        Ok(None)
     }
 
     /// Read provenance for one chain/origin dedupe key.
