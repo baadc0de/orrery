@@ -53,15 +53,18 @@ env:
 
 jobs:
   p1-swarm:
-    name: P1 swarm gate (32 peers, one simulated hour, clean + impaired)
+    name: P1 swarm gate (32 peers, one simulated hour, clean + impaired + witnessed)
     # Simulated hour, no cluster, no ports: 16 cores and a warm target/ turn this from tens of minutes into a few.
     runs-on: [self-hosted, orrery-hel1]
     env:
       # Overrides the workflow-level clear: the box has a persistent sccache at
       # /var/cache/sccache, shared with the dev checkout on the same machine.
       RUSTC_WRAPPER: sccache
-    # Two simulated hours take about five minutes of wall clock — the hour is
-    # simulated, so it costs what it costs to compute. The build dominates.
+    # Three simulated hours take about fifteen minutes of wall clock — the hour
+    # is simulated, so it costs what it costs to compute. The witnessed leg is
+    # the expensive one at roughly ten of those minutes, because every peer
+    # re-executes its witness set's logs as well as its own. The build still
+    # accounts for a good share of the rest.
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7
@@ -84,6 +87,7 @@ jobs:
         with:
           name: p1-swarm-evidence
           path: target/p1-swarm/
+          retention-days: 14
           if-no-files-found: warn
 
   p3-island:

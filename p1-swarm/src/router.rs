@@ -37,12 +37,16 @@ use std::collections::VecDeque;
 use bytes::Bytes;
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
+use serde::Serialize;
 
 use orrery_net::peer_link::StreamMode;
 use orrery_protocol::NodeId;
 
 /// Link conditions applied to every packet the router carries.
-#[derive(Debug, Clone, Copy)]
+///
+/// Serializable because a report that does not name the link it was measured
+/// over cannot be compared against another one.
+#[derive(Debug, Clone, Copy, Serialize)]
 pub struct Impairment {
     /// Fraction of packets dropped, 0.0–1.0.
     pub loss: f64,

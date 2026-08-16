@@ -7,13 +7,21 @@
 # thrashes cells at a boundary; a late-joining peer receives only its 27-cell
 # neighborhood.
 #
+# It also carries P4's witnessing clauses, which no other harness runs: the
+# third leg below is the only place `--witness` is passed anywhere in the tree,
+# and the three clauses guarded by it are dead code without it.
+#
 # Like the P2 and P3 gates this is a *proof harness*, not a convenience script:
 # `p1-swarm` exits non-zero unless every clause holds, and this wrapper writes no
-# success artifact unless it does.
+# success artifact unless it does. All three legs block, the witnessed one
+# included — the harness reads no clock and opens no socket, so a leg that holds
+# once holds every night until the code under it changes, which is the only
+# thing a nightly gate is meant to notice.
 #
 # The hour is *simulated*. Each peer's clock advances one 60 Hz tick per frame
 # rather than reading a wall clock, so the run costs what it costs to compute —
-# about three minutes — and is reproducible from its seed. Rates are therefore
+# a couple of minutes for each cruise-only leg and about ten for the witnessed
+# one — and is reproducible from its seed. Rates are therefore
 # bytes per simulated second, which is what the budget is about: the send cadence
 # is 20 Hz of sim ticks, not of wall seconds.
 set -euo pipefail
@@ -26,11 +34,28 @@ if [[ ${1:-} == --self-test ]]; then
   # Offline guard for CI images with no time to run a swarm. Deliberately
   # structural: it catches regression to a script that no longer proves the
   # criterion, without pretending to run 32 peers for an hour.
-  grep -Fq -- '--peers 32' "$0" || die 'self-test: the criterion population is not 32'
-  grep -Fq -- '--seconds 3600' "$0" || die 'self-test: the criterion hour is not run'
-  grep -Fq -- '--min-cells 64' "$0" || die 'self-test: the ≥64-cell roam is not required'
-  grep -Fq -- '--late-join-at' "$0" || die 'self-test: the late-join check is absent'
-  grep -Fq -- '--impaired' "$0" || die 'self-test: the impaired link run is absent'
+  #
+  # Searched against the *invocations* below rather than against the whole file,
+  # and this is not tidiness. Every pattern here also appears, literally, in the
+  # line that looks for it, so `grep -F -- '--peers 32' "$0"` matches its own
+  # source and can only pass — which is what the five checks that predate this
+  # comment were doing. Comment lines are stripped for the same reason: the
+  # commentary below names `--min-cells 64` while explaining why the witnessed
+  # leg does not use it.
+  legs="$(sed -n '/^readonly ROOT=/,$p' "$0" | grep -v '^[[:space:]]*#')"
+  has() { grep -Fq -- "$1" <<<"$legs"; }
+  has '--peers 32' || die 'self-test: the criterion population is not 32'
+  has '--seconds 3600' || die 'self-test: the criterion hour is not run'
+  has '--min-cells 64' || die 'self-test: the ≥64-cell roam is not required'
+  has '--late-join-at' || die 'self-test: the late-join check is absent'
+  has '--impaired' || die 'self-test: the impaired link run is absent'
+  # The witnessed leg by its signature rather than by the bare `--witness`
+  # token. Nothing else here pairs impairment with the witness, and that pairing
+  # is what brings P4's three witnessing clauses to life: without `--witness`
+  # they are guarded by a false flag and pass by never being asked.
+  has '--impaired --witness' \
+    || die 'self-test: the witnessed impaired leg is absent; the P4 clauses are dead code without it'
+  has '--max-shed' || die 'self-test: the witnessed leg has lost its own shed allowance'
   cargo run -q --manifest-path "$(dirname "$0")/../p1-swarm/Cargo.toml" -- --self-test \
     || die 'self-test: the harness no longer covers every criterion clause'
   echo "$NAME: self-test passed"
@@ -65,6 +90,38 @@ note 'impaired run: the same hour under 3% loss and 100 ms jitter spikes'
 "$BIN" --peers 32 --seconds 3600 --min-cells 64 --late-join-at 1800 --impaired --max-pops 0 \
   --json "$OUT/impaired.json" \
   || die 'the P1 criterion did not hold under the P4 impairment profile'
+
+# The witnessed leg, and the only one in which P4's three witnessing clauses are
+# alive at all: without `--witness`, `SwarmConfig.witnessing` is false and every
+# clause guarded by it — no false positive against an honest peer, the witness
+# keeps watching, the witness sees the stream it is judging — is dead code that
+# passes by never being asked. This leg is what makes the P4 half of the harness
+# a gate rather than a capability.
+#
+# Run last because it is the expensive one: every peer re-executes its witness
+# set's logs as well as its own, which is about ten wall minutes for the hour
+# against roughly two for each leg above.
+note 'witnessed run: the same impaired hour, every peer re-executing its witness set'
+# Its own clause parameters, and not because a witness is allowed to be worse.
+# `--witness` deals the awkward behavioural profiles — idle, burst, stall —
+# where the runs above are all cruise, so the least-travelled peer is an idle one
+# that legitimately never leaves its cell. Judging this leg at `--min-cells 64`
+# fails the roaming clause by construction and reads as a witnessing regression
+# when it is a parameterization mistake. The interest clauses are measured on the
+# cruise-only runs above; this leg is about the witness.
+#
+# The shed allowance is the same kind of thing. The witness lane makes a
+# transient real that the cruise-only runs do not have: at island formation a
+# peer recovering from a hitch serves its witnesses' repair burst on the
+# unsheddable control lane and sheds the cheap lane to afford it
+# (docs/03-replication.md §5.3a). What says transient rather than overrun is that
+# the count is *identical* at five simulated minutes and at one hour — 206 both
+# times. So the allowance is the measured number exactly, and not a round one: it
+# is a ratchet, and a run that moves it has found something.
+"$BIN" --peers 32 --seconds 3600 --min-cells 1 --max-pops 0 --max-shed 206 \
+  --late-join-at 1800 --impaired --witness --stamp-wall-clock \
+  --json "$OUT/witnessed.json" \
+  || die 'the P4 witnessing clauses did not hold over the impaired hour'
 
 date -u +%Y-%m-%dT%H:%M:%SZ > "$OUT/PASSED"
 note "every clause held on both links; reports in $OUT"
