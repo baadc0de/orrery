@@ -723,6 +723,16 @@ async fn main() -> anyhow::Result<()> {
         })
         .transpose()?;
 
+    // The durable ownership this process activated, as the intent executor's
+    // fence. Uniform across the shard set: `activate_topology` refuses a mixed
+    // epoch, so one epoch names the whole activation.
+    #[cfg(feature = "fdb")]
+    let activation_shards = topology.shards.clone();
+    #[cfg(feature = "fdb")]
+    let activation_owner = topology.node_id;
+    #[cfg(feature = "fdb")]
+    let activation_epoch = activation.epoch;
+
     let mut gateway_config = gateway_config(&cli, secret_key, |cluster_file, grid| {
         #[cfg(feature = "fdb")]
         {
@@ -730,7 +740,21 @@ async fn main() -> anyhow::Result<()> {
             let context = fdb_context
                 .as_ref()
                 .expect("FDB context exists when --fdb-cluster-file is set");
-            let exec = FdbIntentExecutor::from_context(context, grid);
+            // The ledger is fenced by the same activation the bulk path is:
+            // every intent transaction re-reads the ownership rows this
+            // startup committed, so a superseded process that still holds a
+            // live FDB handle cannot mint durable effects. The whole shard set
+            // is named because an `IntentOp` carries no cell — see
+            // `IntentFence`.
+            let exec = FdbIntentExecutor::fenced_from_context(
+                context,
+                grid,
+                orrery_persistd::IntentFence {
+                    shards: activation_shards.clone(),
+                    owner: activation_owner,
+                    epoch: activation_epoch,
+                },
+            );
             Ok(Some(Arc::new(exec) as SharedExecutor))
         }
         #[cfg(not(feature = "fdb"))]

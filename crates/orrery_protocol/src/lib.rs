@@ -54,7 +54,7 @@ pub use identity::{
     SESSION_TOKEN_V1_DOMAIN, SESSION_TOKEN_V1_VERSION,
 };
 pub use persist::{
-    AccountId, AssetId, Attestation, Checkpoint, EntityRekey, Epoch, Intent, IntentOp,
+    AccountId, AssetId, Attestation, CellEpoch, Checkpoint, EntityRekey, Epoch, Intent, IntentOp,
     IntentOutcome, ItemUid, JournalRecord, Lsn, PersistId, RecordKind, Tick, ENTITY_REKEY_VERSION,
     INTENT_PREIMAGE_TAG, REASON_BAD_SIGNATURE, REASON_CONTENTION_EXHAUSTED, REASON_EXECUTOR_ERROR,
     REASON_ISSUER_MISMATCH, REASON_NO_EXECUTOR, REASON_VALIDATION_FAILED,

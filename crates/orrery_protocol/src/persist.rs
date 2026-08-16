@@ -8,7 +8,8 @@
 //! storage dependency exists.
 //!
 //! Canonical scalars (D15): [`Tick`] = u64 universe ticks, [`PersistId`] = u64
-//! cluster-minted, [`Epoch`] = u64 shard-ownership fencing token, [`Lsn`] =
+//! cluster-minted, [`Epoch`] = u64 shard-ownership fencing token,
+//! [`CellEpoch`] = u64 witness-set epoch an intent binds to, [`Lsn`] =
 //! node-local journal position. [`CellId`] and [`GridId`] come from this crate.
 
 use serde::{Deserialize, Serialize};
@@ -72,6 +73,34 @@ impl Epoch {
 impl core::fmt::Display for Epoch {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(f, "epoch:{}", self.0)
+    }
+}
+
+/// A witness-set cell epoch (D10): the epoch of the cell's seeded witness set
+/// that an [`Intent`] is bound to.
+///
+/// **Not an [`Epoch`].** That token is minted cluster-side when a persistd
+/// node assumes a shard; this one is chosen peer-side and names the witness
+/// set whose K-of-N attestations the intent carries. The two are separate
+/// namespaces and are never comparable — they shared a type once, and the
+/// intent fence silently compared them.
+///
+/// Wire-identical to [`Epoch`]: both are a newtype over one u64, so the
+/// postcard encoding of an [`Intent`] is unchanged by the distinction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct CellEpoch(pub u64);
+
+impl CellEpoch {
+    /// A cell epoch from a raw u64.
+    #[must_use]
+    pub const fn new(epoch: u64) -> Self {
+        Self(epoch)
+    }
+}
+
+impl core::fmt::Display for CellEpoch {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "cell-epoch:{}", self.0)
     }
 }
 
@@ -258,7 +287,7 @@ pub struct Intent {
     /// The issuing peer.
     pub issuer: NodeId,
     /// The cell-epoch the intent is bound to (binds the seeded witness set).
-    pub cell_epoch: Epoch,
+    pub cell_epoch: CellEpoch,
     /// The operations to apply.
     pub ops: Vec<IntentOp>,
     /// K-of-N witness co-signatures (default K=3 of N≥5, D16).
@@ -383,6 +412,19 @@ mod tests {
     use super::*;
 
     #[test]
+    fn cell_epoch_is_wire_identical_to_epoch() {
+        // Splitting `Intent::cell_epoch` off `Epoch` is a type-system change
+        // only: both are one u64, so no encoded intent moved a byte.
+        for raw in [0u64, 1, 7, u64::MAX] {
+            assert_eq!(
+                postcard::to_stdvec(&CellEpoch::new(raw)).unwrap(),
+                postcard::to_stdvec(&Epoch::new(raw)).unwrap(),
+                "cell epoch {raw} must encode exactly as the ownership epoch did"
+            );
+        }
+    }
+
+    #[test]
     fn entity_rekey_payload_round_trips_with_explicit_version_and_source_record() {
         // Given: a committed cross-grid move with an exact source image and fence.
         let cells = CellId::ROOT.children();
@@ -440,7 +482,7 @@ mod tests {
         let intent = Intent {
             intent_id: 0x1122_3344_5566_7788_99aa_bbcc_ddee_ff00,
             issuer: node(1),
-            cell_epoch: Epoch::new(7),
+            cell_epoch: CellEpoch::new(7),
             ops: vec![IntentOp {
                 op: 3,
                 args: bytes::Bytes::from_static(b"trade"),
@@ -477,7 +519,7 @@ mod tests {
         let mut intent = Intent {
             intent_id: 0x1122_3344_5566_7788_99aa_bbcc_ddee_ff00,
             issuer: node(1),
-            cell_epoch: Epoch::new(7),
+            cell_epoch: CellEpoch::new(7),
             ops: vec![IntentOp {
                 op: 3,
                 args: bytes::Bytes::from_static(b"trade"),
@@ -514,7 +556,7 @@ mod tests {
         let mut intent = Intent {
             intent_id: 42,
             issuer: node(1),
-            cell_epoch: Epoch::new(0),
+            cell_epoch: CellEpoch::new(0),
             ops: vec![IntentOp {
                 op: 1,
                 args: bytes::Bytes::from_static(b"buy"),

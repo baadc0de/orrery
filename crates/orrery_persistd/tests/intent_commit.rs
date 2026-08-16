@@ -29,7 +29,7 @@ use orrery_persistd::{
 };
 use orrery_protocol::channels::decode_stream_frame;
 use orrery_protocol::{
-    CellId, Epoch, GatewayMsg, GatewayReply, GridId, Intent, IntentOp, IntentOutcome,
+    CellEpoch, CellId, Epoch, GatewayMsg, GatewayReply, GridId, Intent, IntentOp, IntentOutcome,
     REASON_BAD_SIGNATURE, REASON_ISSUER_MISMATCH, REASON_NO_EXECUTOR,
 };
 use tokio::sync::Mutex;
@@ -46,7 +46,7 @@ fn signed_intent(id: u128, key: &iroh_base::SecretKey, op: u16, args: &[u8]) -> 
     let mut intent = Intent {
         intent_id: id,
         issuer: key.public(),
-        cell_epoch: Epoch::new(0),
+        cell_epoch: CellEpoch::new(0),
         ops: vec![IntentOp {
             op,
             args: Bytes::copy_from_slice(args),
@@ -451,9 +451,18 @@ async fn fdb_committed_intent_survives_restart() {
     assert_eq!(bal, Some(750), "no double-apply across the restart");
 }
 
+/// The ledger fence, driven the way persistd drives it: ownership comes from a
+/// real `activate_shards` (so the epoch is cluster-minted and ≥ 1, never a
+/// hand-written 0), and the client keeps sending the default `cell_epoch` it
+/// has always sent — the two are different namespaces now and the fence does
+/// not read the intent at all.
+///
+/// Two shards, because `IntentFence` verifies the whole activated set: an
+/// `IntentOp` names no cell, so there is nothing to select a single shard by.
 #[cfg(feature = "fdb")]
 #[tokio::test]
 async fn fdb_fenced_intent_refuses_a_promoted_owner() {
+    use orrery_persistd::fence::{ActivationOutcome, ShardActivation};
     use orrery_persistd::{
         FdbIntentExecutor, FenceOutcome, FenceRow, FenceStatus, FenceStore, IntentExecutor,
         IntentFence,
@@ -464,51 +473,132 @@ async fn fdb_fenced_intent_refuses_a_promoted_owner() {
         return;
     };
     let grid = GridId::new(9_303);
-    let shard = CellId::ROOT;
+    let children = CellId::ROOT.children();
+    let shards = vec![children[0], children[1]];
     let fences = orrery_persistd::fence::FdbFenceStore::connect(&cluster).unwrap();
-    fences.retire(grid, shard).await.unwrap();
-    let owner = FenceRow {
-        owner: 73,
-        epoch: Epoch::new(0),
-        status: FenceStatus::Active,
+    for &shard in &shards {
+        fences.retire(grid, shard).await.unwrap();
+    }
+
+    let db = FdbIntentExecutor::connect(&cluster, grid)
+        .unwrap()
+        .database()
+        .clone();
+    // Idempotency rows outlive the test by an hour (the GC deadline), and a
+    // replay is answered before the fence is ever consulted. Clearing this
+    // test's three rows is what keeps a repeat run honest rather than
+    // vacuously green.
+    for intent_id in [0x9303_0001u128, 0x9303_0002, 0x9303_0003] {
+        let key = orrery_persistd::keyspace::intent_key(intent_id);
+        db.run(move |trx, _| async move {
+            trx.clear(&key);
+            Ok(())
+        })
+        .await
+        .unwrap();
+    }
+
+    // Ownership as persistd acquires it at startup: one atomic activation over
+    // the whole shard set, minting the epoch itself.
+    let requests: Vec<ShardActivation> = shards
+        .iter()
+        .map(|&shard| ShardActivation {
+            shard,
+            expected: None,
+        })
+        .collect();
+    let ActivationOutcome::Activated { rows } =
+        fences.activate_shards(grid, 73, &requests).await.unwrap()
+    else {
+        panic!("bootstrap activation must succeed");
     };
+    let epoch = rows[0].1.epoch;
     assert_eq!(
-        fences.fence(grid, shard, None, &owner).await.unwrap(),
-        FenceOutcome::Fenced
+        epoch,
+        Epoch::new(1),
+        "a cluster-minted ownership epoch starts at 1, which no client ever sends"
     );
+
     let exec = FdbIntentExecutor::fenced_from_database(
-        FdbIntentExecutor::connect(&cluster, grid)
-            .unwrap()
-            .database()
-            .clone(),
+        db.clone(),
         grid,
         IntentFence {
-            shard,
+            shards: shards.clone(),
             owner: 73,
-            epoch: Epoch::new(0),
+            epoch,
         },
     );
+    // `signed_intent` ships `CellEpoch::new(0)`, exactly as every production
+    // issuer does. Under the old conflated type this was rejected outright.
     let intent = signed_intent(0x9303_0001, &secret(33), 0, &credit_args(500_003, 3, 1));
-    assert!(matches!(
-        exec.execute(&intent).await,
-        Ok(IntentOutcome::Committed { .. })
-    ));
+    let committed = exec.execute(&intent).await.unwrap();
+    assert!(matches!(committed, IntentOutcome::Committed { .. }));
+    // Ledger rows are grid-independent, so compare against what this run
+    // observed rather than an absolute figure a repeat run would move.
+    let credited = read_balance(exec.database(), 500_003, 3).await;
+    let uncredited = read_balance(exec.database(), 500_004, 3).await;
 
-    // Promotion advances the fence. The old executor can no longer commit a
-    // distinct intent even though it still has a live database handle.
+    // Promotion advances the fence on one shard only. The old executor can no
+    // longer commit a distinct intent even though it still has a live database
+    // handle and still owns the other shard.
+    let previous = FenceRow {
+        owner: 73,
+        epoch,
+        status: FenceStatus::Active,
+    };
     let promoted = FenceRow {
         owner: 74,
-        epoch: Epoch::new(1),
+        epoch: Epoch::new(epoch.0 + 1),
         status: FenceStatus::Active,
     };
     assert_eq!(
         fences
-            .fence(grid, shard, Some(&owner), &promoted)
+            .fence(grid, shards[1], Some(&previous), &promoted)
             .await
             .unwrap(),
         FenceOutcome::Fenced
     );
     let stale = signed_intent(0x9303_0002, &secret(34), 0, &credit_args(500_004, 3, 1));
-    assert!(exec.execute(&stale).await.is_err());
-    fences.retire(grid, shard).await.unwrap();
+    assert!(
+        exec.execute(&stale).await.is_err(),
+        "a superseded executor may not mint a new ledger effect"
+    );
+    assert_eq!(
+        read_balance(exec.database(), 500_004, 3).await,
+        uncredited,
+        "the refused intent left no effect behind"
+    );
+
+    // Replay is deliberately not fenced: the idempotency row is read before
+    // the fence, so a superseded executor answering a retransmit returns the
+    // outcome it already committed rather than a spurious refusal. It is a
+    // durable fact, not a new effect.
+    assert_eq!(
+        exec.execute(&intent).await.unwrap(),
+        committed,
+        "a replayed intent returns its recorded outcome even after fencing"
+    );
+    assert_eq!(
+        read_balance(exec.database(), 500_003, 3).await,
+        credited,
+        "the replay did not re-apply the credit"
+    );
+
+    // Control: the refusal is the fence's doing and nothing else's. An
+    // equivalent intent, on the same database and past the same promotion,
+    // commits through an executor that carries no fence — exactly the state
+    // the reference binary shipped in before it was wired to
+    // `fenced_from_context`. It needs its own id: `stale` must stay
+    // uncommitted, or a repeat run would meet its idempotency row and be
+    // answered before ever reaching the fence.
+    let unfenced = FdbIntentExecutor::from_database(exec.database().clone(), grid);
+    let control = signed_intent(0x9303_0003, &secret(35), 0, &credit_args(500_005, 3, 1));
+    assert!(matches!(
+        unfenced.execute(&control).await.unwrap(),
+        IntentOutcome::Committed { .. }
+    ));
+
+    for &shard in &shards {
+        fences.retire(grid, shard).await.unwrap();
+    }
 }

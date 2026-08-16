@@ -20,8 +20,9 @@ use orrery_persistd::{FdbContext, FenceStore};
 use orrery_persistd::{Journal, JournalConfig, GATEWAY_ALPN};
 use orrery_protocol::channels::{decode_datagram, decode_stream_frame};
 use orrery_protocol::{
-    CellId, DiffUplink, Epoch, GatewayMsg, GatewayReply, GridId, Intent, IntentOp, IntentOutcome,
-    JournalRecord, Lsn, NodeId, PersistId, RecordKind, Tick, REASON_VALIDATION_FAILED,
+    CellEpoch, CellId, DiffUplink, Epoch, GatewayMsg, GatewayReply, GridId, Intent, IntentOp,
+    IntentOutcome, JournalRecord, Lsn, NodeId, PersistId, RecordKind, Tick,
+    REASON_VALIDATION_FAILED,
 };
 
 /// Locate the compiled `persistd` binary via `CARGO_BIN_EXE_persistd`, set by
@@ -277,7 +278,7 @@ async fn production_authority_rejects_intents_without_a_secure_validator() {
     let mut intent = Intent {
         intent_id: 71,
         issuer: client_key.public(),
-        cell_epoch: Epoch::new(0),
+        cell_epoch: CellEpoch::new(0),
         ops: vec![IntentOp {
             op: 1,
             args: Bytes::from_static(b"production-authority"),

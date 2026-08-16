@@ -22,6 +22,13 @@
 //!    `intent/{intent_id}` in the same transaction, so the ack the gateway
 //!    sends after `db.run` resolves implies a durable commit (RPO 0).
 //!
+//! **The ownership fence** sits between steps 0 and 1 when the executor
+//! carries one ([`IntentFence`]): every shard the node activated is re-read in
+//! this same transaction and must still name this owner at this epoch, so a
+//! superseded persistd that can still reach FDB is refused before any effect.
+//! That it comes *after* the idempotency read is deliberate — see the comment
+//! at the call site.
+//!
 //! **Bounded retries** (§7): `db.run` re-runs the closure on `not_committed`;
 //! after [`MAX_CONFLICT_RETRIES`] attempts the executor gives up with
 //! [`IntentError::ContentionExhausted`], which the gateway maps to a
@@ -86,10 +93,23 @@ pub struct FdbIntentExecutor {
 }
 
 /// The active shard ownership an intent executor is allowed to write under.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// **Every** named shard is verified, not one of them. An [`IntentOp`] carries
+/// no cell (`orrery_protocol::persist`), so an intent cannot be attributed to a
+/// shard and a per-shard fence would have nothing to select on. The executor
+/// therefore admits an intent only while the node still actively owns its
+/// whole shard set at `epoch` — the same set `--shard` activated at startup,
+/// which persistd already requires to share one epoch. Losing any one shard
+/// fences the executor completely, which is the conservative direction: a node
+/// that has been partially superseded is not a node that may still mint
+/// durable ledger effects.
+///
+/// [`IntentOp`]: orrery_protocol::IntentOp
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IntentFence {
-    /// The grid-relative shard that admits these intents.
-    pub shard: CellId,
+    /// The grid-relative shards that admit these intents, all of which must
+    /// still be actively owned at `epoch`.
+    pub shards: Vec<CellId>,
     /// Active persistd node id.
     pub owner: u64,
     /// Active fencing epoch.
@@ -181,43 +201,39 @@ impl FdbIntentExecutor {
     }
 }
 
-/// Require the active ownership row in the same transaction as an intent's
-/// idempotency row and effects. A promotion changes this key and fences a
-/// zombie executor before it can commit.
+/// Require every owned shard's active ownership row in the same transaction as
+/// an intent's idempotency row and effects. A promotion changes those keys and
+/// fences a zombie executor before it can commit.
+///
+/// The fence is entirely this read: the intent's own `cell_epoch` is a
+/// witness-set epoch chosen peer-side ([`orrery_protocol::CellEpoch`]) and has
+/// never been comparable with the shard-ownership epoch, so it takes no part.
 async fn require_intent_fence(
     trx: &foundationdb::Transaction,
     grid: GridId,
-    fence: IntentFence,
-    intent: &Intent,
+    fence: &IntentFence,
 ) -> Result<(), FdbBindingError> {
-    if intent.cell_epoch != fence.epoch {
-        return Err(FdbBindingError::new_custom_error(Box::new(
-            IntentError::Store(format!(
-                "intent epoch {} does not match active shard epoch {}",
-                intent.cell_epoch, fence.epoch
-            )),
-        )));
-    }
-    let key = keyspace::fence_key(grid, fence.shard);
-    let current: Option<FenceRow> = trx
-        .get(&key, false)
-        .await?
-        .map(|bytes| postcard::from_bytes(bytes.as_ref()))
-        .transpose()
-        .map_err(store_err("fence row decode"))?;
-    if current
-        != Some(FenceRow {
-            owner: fence.owner,
-            epoch: fence.epoch,
-            status: FenceStatus::Active,
-        })
-    {
-        return Err(FdbBindingError::new_custom_error(Box::new(
-            IntentError::Store(format!(
-                "intent fence mismatch for {grid}/{}: expected owner {} epoch {}, got {current:?}",
-                fence.shard, fence.owner, fence.epoch
-            )),
-        )));
+    let expected = FenceRow {
+        owner: fence.owner,
+        epoch: fence.epoch,
+        status: FenceStatus::Active,
+    };
+    for &shard in &fence.shards {
+        let key = keyspace::fence_key(grid, shard);
+        let current: Option<FenceRow> = trx
+            .get(&key, false)
+            .await?
+            .map(|bytes| postcard::from_bytes(bytes.as_ref()))
+            .transpose()
+            .map_err(store_err("fence row decode"))?;
+        if current != Some(expected) {
+            return Err(FdbBindingError::new_custom_error(Box::new(
+                IntentError::Store(format!(
+                    "intent fence mismatch for {grid}/{shard}: expected owner {} epoch {}, got {current:?}",
+                    fence.owner, fence.epoch
+                )),
+            )));
+        }
     }
     Ok(())
 }
@@ -227,7 +243,7 @@ impl IntentExecutor for FdbIntentExecutor {
     async fn execute(&self, intent: &Intent) -> Result<IntentOutcome, IntentError> {
         let intent = intent.clone();
         let grid = self.grid;
-        let fence = self.fence;
+        let fence = self.fence.clone();
         // The block is durably reserved before the transaction. Reusing this
         // exact vector across FDB retries makes retries safe, while a failed
         // overall attempt merely leaves a permanent, harmless gap.
@@ -243,6 +259,7 @@ impl IntentExecutor for FdbIntentExecutor {
             .run(|trx, _maybe_committed| {
                 let intent = intent.clone();
                 let minted = minted.clone();
+                let fence = fence.clone();
                 let attempt = attempts.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
                 async move {
                     if attempt > MAX_CONFLICT_RETRIES + 1 {
@@ -263,8 +280,17 @@ impl IntentExecutor for FdbIntentExecutor {
                         return Ok(row.outcome);
                     }
 
-                    if let Some(fence) = fence {
-                        require_intent_fence(&trx, grid, fence, &intent).await?;
+                    // The fence is checked AFTER the idempotency read, and
+                    // that ordering is deliberate: a superseded executor
+                    // replaying an intent it already committed returns the
+                    // recorded outcome un-fenced. Returning a durable fact
+                    // that is already in the database produces no new effect,
+                    // and refusing it instead would turn a retransmit (C-1:
+                    // intents ride the packet lane) into a spurious rejection
+                    // of a commit that did happen. Everything that could add
+                    // an effect is below this line.
+                    if let Some(fence) = &fence {
+                        require_intent_fence(&trx, grid, fence).await?;
                     }
 
                     // Step 1: reads register conflict ranges. The tick is

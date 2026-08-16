@@ -66,7 +66,7 @@ use orrery_persist_client::latency::LatencyHistogram;
 use orrery_persist_client::{IntentQueue, UplinkScheduler};
 use orrery_protocol::channels::{encode_datagram, encode_stream_frame, untag, Channel};
 use orrery_protocol::{
-    Attestation, CellId, DiffUplink, Epoch, GatewayMsg, GatewayReply, GridId, Intent, IntentOp,
+    Attestation, CellEpoch, CellId, DiffUplink, GatewayMsg, GatewayReply, GridId, Intent, IntentOp,
     IntentOutcome, NodeId, PersistId, RecordKind, Tick,
 };
 
@@ -1773,7 +1773,7 @@ fn signed_intent(id: u128, issuer: NodeId, signing_key: &SecretKey, kind: String
     let mut intent = Intent {
         intent_id: id,
         issuer,
-        cell_epoch: Epoch::new(0),
+        cell_epoch: CellEpoch::new(0),
         ops: vec![IntentOp {
             op: op_code(&kind),
             args: Bytes::from(kind.into_bytes()),

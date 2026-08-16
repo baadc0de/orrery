@@ -39,7 +39,7 @@ fn intent(id: u128) -> Intent {
     Intent {
         intent_id: id,
         issuer: node(1),
-        cell_epoch: orrery_protocol::Epoch::new(0),
+        cell_epoch: orrery_protocol::CellEpoch::new(0),
         ops: vec![IntentOp {
             op: 1,
             args: bytes::Bytes::from_static(b"trade"),
