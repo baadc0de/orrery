@@ -218,12 +218,19 @@ jobs:
           key: det-${{ matrix.label }}-${{ hashFiles('Cargo.toml', 'crates/*/Cargo.toml', 'vendor/*/Cargo.toml', 'rust-toolchain.toml') }}
           restore-keys: det-${{ matrix.label }}-
 
-      # The verifiable spine only: orrery_conformance depends on orrery_core and
-      # orrery_protocol and nothing else, so the whole matrix stays cheap. These
-      # crates are also the ones that *must* be portable — the rest of the
-      # workspace is service infrastructure that runs on Linux hosts.
-      - name: Test the verifiable spine
-        run: cargo test -p orrery_core -p orrery_protocol -p orrery_witness -p orrery_conformance
+      # The headless spine only: orrery_conformance depends on orrery_core and
+      # orrery_protocol and nothing else, so the whole matrix stays cheap on
+      # every platform. These are also the crates that *must* be portable —
+      # producing identical bytes everywhere is the core's entire claim.
+      #
+      # orrery_witness is deliberately not here. It enables Bevy by default now
+      # (`bevy` is in its default features, pulling bevy_app/bevy_ecs/orrery_net
+      # plus a full bevy dev-dependency), which would drag winit and its
+      # display stack onto all four runners — and require wayland dev packages
+      # on the Linux ones — for a crate whose portability is not what this
+      # matrix asserts. It is covered by the `workspace tests` job instead.
+      - name: Test the headless spine
+        run: cargo test -p orrery_core -p orrery_protocol -p orrery_conformance
 
       # Emits this platform's report. The `check` inside the test above already
       # compared against the committed golden; this artifact is what makes a
