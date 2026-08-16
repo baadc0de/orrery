@@ -1,0 +1,307 @@
+# Orrery's commit-time gates.
+#
+# The static rules in scripts/core-gates.sh — no Bevy in orrery_core's graph,
+# no std HashMap, no ambient inputs, no std transcendentals — are exactly the
+# kind that rot silently: nothing breaks the day someone writes
+# `Instant::now()` in the core, it just quietly stops being replayable. They
+# are enforced here so drift is caught at commit time rather than in the strike
+# pipeline months later.
+#
+# The determinism matrix is P4's non-negotiable deliverable
+# (docs/11-roadmap.md §P4): identical core replays on Windows/Linux/macOS
+# binaries every commit. It is a *cross-platform* check, so it cannot be done
+# by running the test suite on three machines — each would only prove it agrees
+# with itself. Every leg emits a digest artifact and a final job compares them.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# A new push to a branch makes the in-flight run obsolete. main is exempt: its
+# history is what the determinism corpus bisects against, so every commit there
+# gets a verdict.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  # .cargo/config.toml routes rustc through sccache so agent worktrees share one
+  # object cache (AGENTS.md § Build cache). Runners are ephemeral and have no
+  # sccache installed, so the wrapper is cleared here — the documented opt-out.
+  RUSTC_WRAPPER: ""
+  # Already off in .cargo/config.toml; restated because a cache miss on a fresh
+  # runner is the case where incremental artifacts cost the most and buy least.
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install the pinned toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+      - run: cargo fmt --all --check
+
+  clippy:
+    name: clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install the pinned toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+      # Four first-party crates take `bevy = { workspace = true }` with default
+      # features, which pulls bevy_winit and its display/audio stack, so three
+      # build scripts probe pkg-config: alsa-sys, libudev-sys and wayland-sys.
+      # A developer machine usually has these already; a runner does not.
+      #
+      # Only this job and `test` need them — the determinism matrix and both
+      # nightly gates build Bevy-free crates, which is why those legs stay cheap.
+      - name: Install Bevy's Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            g++ pkg-config libx11-dev libasound2-dev libudev-dev \
+            libwayland-dev libxkbcommon-dev
+
+      - uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: clippy-${{ runner.os }}-${{ hashFiles('Cargo.toml', 'crates/*/Cargo.toml', 'vendor/*/Cargo.toml', 'rust-toolchain.toml') }}
+          restore-keys: clippy-${{ runner.os }}-
+
+      # Vendored crates are excluded: vendor/bevy_replicon carries ~360 findings
+      # that are upstream's to fix, and holding third-party code to this repo's
+      # lint bar would mean either patching a vendored tree or turning the gate
+      # off entirely.
+      #
+      # `--no-deps` is load-bearing, not decoration. The vendored crates are the
+      # only ones that set `[lints] workspace = true`, so the pedantic/nursery
+      # levels in [workspace.lints] apply to them through their own manifests —
+      # `--exclude` drops them from *selection* but they are still path
+      # dependencies, and clippy would lint them anyway. `--no-deps` is what
+      # confines the run to the selected packages.
+      - name: clippy (default features)
+        run: |
+          cargo clippy --workspace --all-targets --no-deps \
+            --exclude bevy_replicon \
+            --exclude aeronet_iroh \
+            --exclude aeronet_tokio_runtime \
+            -- -D warnings
+
+      # The fdb feature compiles code the default build never sees. It went
+      # unlinted long enough for orrery_seed/tests/fdb_gates.rs to stop
+      # compiling entirely, so it gets its own pass.
+      #
+      # It needs the client package even though clippy never links: the
+      # `foundationdb-gen` build does `include_bytes!` on
+      # /usr/include/foundationdb/fdb.options, so the header is a *compile*
+      # input. No server here — running the fdb tests against a real cluster is
+      # nightly.yml's job.
+      - name: Install the FoundationDB client
+        uses: ./.github/actions/foundationdb
+
+      - name: clippy (fdb feature)
+        run: |
+          cargo clippy -p orrery_persistd -p orrery_seed --all-targets --no-deps \
+            --features orrery_persistd/fdb,orrery_seed/fdb \
+            -- -D warnings
+
+  gates:
+    name: static gates
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install the pinned toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: gates-${{ runner.os }}-${{ hashFiles('Cargo.toml', 'crates/*/Cargo.toml', 'vendor/*/Cargo.toml', 'rust-toolchain.toml') }}
+          restore-keys: gates-${{ runner.os }}-
+
+      # docs/06-verifiable-core.md §8's static gates.
+      - name: verifiable-core static gates
+        run: scripts/core-gates.sh
+
+      # The P2 and P3 harnesses need FoundationDB and a built cluster, so they
+      # cannot run per-commit — the real runs are in nightly.yml. Their
+      # `--self-test` modes exist precisely for this: they assert the scripts
+      # still contain the stages that make them proofs, catching a regression to
+      # a harness that no longer proves its criterion.
+      - name: P2 kill-9 gate self-test
+        run: scripts/p2-kill9-gate.sh --self-test
+      - name: P3 island gate self-test
+        run: scripts/p3-island-gate.sh --self-test
+
+  test:
+    name: workspace tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install the pinned toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+      - name: Install Bevy's Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            g++ pkg-config libx11-dev libasound2-dev libudev-dev \
+            libwayland-dev libxkbcommon-dev
+
+      - uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: test-${{ runner.os }}-${{ hashFiles('Cargo.toml', 'crates/*/Cargo.toml', 'vendor/*/Cargo.toml', 'rust-toolchain.toml') }}
+          restore-keys: test-${{ runner.os }}-
+
+      # The full workspace pulls bevy, iroh and tonic. It runs on one platform
+      # because that cost is not what the other legs are for: the portable spine
+      # is tested on all of them in `determinism` below.
+      #
+      # Vendored crates are excluded for the same reason clippy excludes them:
+      # bevy_replicon's own tests and doctests do not compile under this
+      # workspace's feature unification (`bevy/serialize` is off, so
+      # `Transform: Serialize` is unsatisfied). That is upstream's build to fix,
+      # and it is not what this repo is testing.
+      - run: |
+          cargo test --workspace \
+            --exclude bevy_replicon \
+            --exclude aeronet_iroh \
+            --exclude aeronet_tokio_runtime
+
+  determinism:
+    name: determinism (${{ matrix.label }})
+    strategy:
+      # One platform failing is the most informative signal this workflow
+      # produces — never cancel the others, because *which* platforms diverge
+      # is most of the diagnosis.
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest,    label: x86_64-linux }
+          - { os: ubuntu-24.04-arm, label: aarch64-linux }
+          - { os: windows-latest,   label: x86_64-windows }
+          - { os: macos-latest,     label: aarch64-macos }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install the pinned toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: det-${{ matrix.label }}-${{ hashFiles('Cargo.toml', 'crates/*/Cargo.toml', 'vendor/*/Cargo.toml', 'rust-toolchain.toml') }}
+          restore-keys: det-${{ matrix.label }}-
+
+      # The headless spine only: orrery_conformance depends on orrery_core and
+      # orrery_protocol and nothing else, so the whole matrix stays cheap on
+      # every platform. These are also the crates that *must* be portable —
+      # producing identical bytes everywhere is the core's entire claim.
+      #
+      # orrery_witness is deliberately not here. It enables Bevy by default now
+      # (`bevy` is in its default features, pulling bevy_app/bevy_ecs/orrery_net
+      # plus a full bevy dev-dependency), which would drag winit and its
+      # display stack onto all four runners — and require wayland dev packages
+      # on the Linux ones — for a crate whose portability is not what this
+      # matrix asserts. It is covered by the `workspace tests` job instead.
+      - name: Test the headless spine
+        run: cargo test -p orrery_core -p orrery_protocol -p orrery_conformance
+
+      # Emits this platform's report. The `check` inside the test above already
+      # compared against the committed golden; this artifact is what makes a
+      # failure diagnosable — it carries per-tick hashes, so the verdict job can
+      # name the first diverging tick instead of just saying "they differ".
+      - name: Emit this platform's determinism report
+        run: cargo run -q -p orrery_conformance -- emit --out report-${{ matrix.label }}.json
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: determinism-${{ matrix.label }}
+          path: report-${{ matrix.label }}.json
+          retention-days: 30
+
+  determinism-verdict:
+    name: determinism verdict
+    needs: determinism
+    # Runs even when a leg failed: a platform that could not produce a report is
+    # itself the finding, and reporting "3 of 5 agreed" beats reporting nothing.
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install the pinned toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: det-x86_64-linux-${{ hashFiles('Cargo.toml', 'crates/*/Cargo.toml', 'vendor/*/Cargo.toml', 'rust-toolchain.toml') }}
+          restore-keys: det-x86_64-linux-
+
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: determinism-*
+          path: reports
+          merge-multiple: true
+
+      - name: Compare every platform against the Linux baseline
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          baseline=reports/report-x86_64-linux.json
+          if [[ ! -f $baseline ]]; then
+            echo "::error::the x86_64-linux baseline report is missing — its leg failed"
+            exit 1
+          fi
+
+          others=(reports/report-*.json)
+          # The baseline compares against itself trivially; drop it so the count
+          # in the summary is the number of platforms actually corroborating.
+          compared=()
+          for f in "${others[@]}"; do
+            [[ $f == "$baseline" ]] || compared+=("$f")
+          done
+
+          echo "Comparing ${#compared[@]} platforms against x86_64-linux:"
+          for f in "${compared[@]}"; do echo "  $f"; done
+
+          # A partial matrix must not pass quietly: if a leg died, the ones
+          # that did report agreeing says nothing about the one that didn't.
+          # §8 names five targets; x86_64-macos is deliberately not among the
+          # four built here — that platform is not supported. Keep this count in
+          # step with the matrix above, or a dropped leg passes silently.
+          if (( ${#compared[@]} < 3 )); then
+            echo "::error::only ${#compared[@]} of 3 non-baseline platforms produced a report"
+            cargo run -q -p orrery_conformance -- compare --baseline "$baseline" "${compared[@]}" || true
+            exit 1
+          fi
+
+          cargo run -q -p orrery_conformance -- compare --baseline "$baseline" "${compared[@]}"

@@ -1,0 +1,499 @@
+{
+  "schema": 1,
+  "ruleset_version": 1,
+  "ruleset_digest": "c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0",
+  "target": "x86_64-linux-unix",
+  "cases": [
+    {
+      "name": "kinematic-single",
+      "entities": 1,
+      "ticks": 180,
+      "chain": "ece922bd65a33a1926ea3fed73032e0e2d805e291bb87954b2dea3ddb82f026e",
+      "final_states": [
+        {
+          "entity": 1,
+          "pos_mm": [
+            -36303,
+            -33794,
+            0
+          ],
+          "vel_mms": [
+            -250,
+            -1139,
+            0
+          ],
+          "heading_urad": 2787259,
+          "hp": 1000,
+          "shield": 250,
+          "roll_fold": 15733145493422041191
+        }
+      ]
+    },
+    {
+      "name": "kinematic-swarm",
+      "entities": 16,
+      "ticks": 180,
+      "chain": "0946fbd61a4511c9b006e11c59db7d3ef798770fa0d575ae8de15d63ed93ca89",
+      "final_states": [
+        {
+          "entity": 1,
+          "pos_mm": [
+            -1520,
+            22985,
+            0
+          ],
+          "vel_mms": [
+            1255,
+            -293,
+            0
+          ],
+          "heading_urad": 2098064,
+          "hp": 1000,
+          "shield": 250,
+          "roll_fold": 321098223819515382
+        },
+        {
+          "entity": 2,
+          "pos_mm": [
+            -6070,
+            22312,
+            0
+          ],
+          "vel_mms": [
+            -181,
+            219,
+            0
+          ],
+          "heading_urad": 1671237,
+          "hp": 1000,
+          "shield": 250,
+          "roll_fold": 14234980096867557085
+        },
+        {
+          "entity": 3,
+          "pos_mm": [
+            36596,
+            28831,
+            0
+          ],
+          "vel_mms": [
+            1062,
+            144,
+            0
+          ],
+          "heading_urad": 5803514,
+          "hp": 1000,
+          "shield": 250,
+          "roll_fold": 5076075890687518827
+        },
+        {
+          "entity": 4,
+          "pos_mm": [
+            -28049,
+            28693,
+            0
+          ],
+          "vel_mms": [
+            599,
+            910,
+            0
+          ],
+          "heading_urad": 1608608,
+          "hp": 1000,
+          "shield": 250,
+          "roll_fold": 1293128679722871488
+        },
+        {
+          "entity": 5,
+          "pos_mm": [
+            18560,
+            15110,
+            0
+          ],
+          "vel_mms": [
+            -555,
+            -1164,
+            0
+          ],
+          "heading_urad": -244484,
+          "hp": 1000,
+          "shield": 250,
+          "roll_fold": 10867907503643108808
+        },
+        {
+          "entity": 6,
+          "pos_mm": [
+            41570,
+            22840,
+            0
+          ],
+          "vel_mms": [
+            504,
+            132,
+            0
+          ],
+          "heading_urad": 6974587,
+          "hp": 1000,
+          "shield": 250,
+          "roll_fold": 9892894528599756223
+        },
+        {
+          "entity": 7,
+          "pos_mm": [
+            -13870,
+            32902,
+            0
+          ],
+          "vel_mms": [
+            1803,
+            -1868,
+            0
+          ],
+          "heading_urad": 5405008,
+          "hp": 1000,
+          "shield": 250,
+          "roll_fold": 11725129171478247937
+        },
+        {
+          "entity": 8,
+          "pos_mm": [
+            41306,
+            -16233,
+            0
+          ],
+          "vel_mms": [
+            296,
+            -53,
+            0
+          ],
+          "heading_urad": 6985341,
+          "hp": 1000,
+          "shield": 250,
+          "roll_fold": 5641485557124011510
+        },
+        {
+          "entity": 9,
+          "pos_mm": [
+            443,
+            -8818,
+            0
+          ],
+          "vel_mms": [
+            734,
+            1574,
+            0
+          ],
+          "heading_urad": 1464638,
+          "hp": 1000,
+          "shield": 250,
+          "roll_fold": 15433090859592149340
+        },
+        {
+          "entity": 10,
+          "pos_mm": [
+            3279,
+            -50514,
+            0
+          ],
+          "vel_mms": [
+            -1261,
+            -552,
+            0
+          ],
+          "heading_urad": 6028441,
+          "hp": 1000,
+          "shield": 250,
+          "roll_fold": 3841190160491336100
+        },
+        {
+          "entity": 11,
+          "pos_mm": [
+            26319,
+            -43074,
+            0
+          ],
+          "vel_mms": [
+            -327,
+            873,
+            0
+          ],
+          "heading_urad": 2390808,
+          "hp": 1000,
+          "shield": 250,
+          "roll_fold": 16183861214119666720
+        },
+        {
+          "entity": 12,
+          "pos_mm": [
+            -18075,
+            -24811,
+            0
+          ],
+          "vel_mms": [
+            -606,
+            403,
+            0
+          ],
+          "heading_urad": 6856961,
+          "hp": 1000,
+          "shield": 250,
+          "roll_fold": 3271079654034336234
+        },
+        {
+          "entity": 13,
+          "pos_mm": [
+            2440,
+            10762,
+            0
+          ],
+          "vel_mms": [
+            1323,
+            -832,
+            0
+          ],
+          "heading_urad": 5461646,
+          "hp": 1000,
+          "shield": 250,
+          "roll_fold": 17529681408664028501
+        },
+        {
+          "entity": 14,
+          "pos_mm": [
+            23776,
+            -25676,
+            0
+          ],
+          "vel_mms": [
+            343,
+            -392,
+            0
+          ],
+          "heading_urad": -253028,
+          "hp": 1000,
+          "shield": 250,
+          "roll_fold": 8124033114415124084
+        },
+        {
+          "entity": 15,
+          "pos_mm": [
+            20770,
+            -23823,
+            0
+          ],
+          "vel_mms": [
+            -472,
+            -466,
+            0
+          ],
+          "heading_urad": 4373628,
+          "hp": 1000,
+          "shield": 250,
+          "roll_fold": 13885341986833201684
+        },
+        {
+          "entity": 16,
+          "pos_mm": [
+            37560,
+            -8926,
+            0
+          ],
+          "vel_mms": [
+            290,
+            2308,
+            0
+          ],
+          "heading_urad": 883489,
+          "hp": 1000,
+          "shield": 250,
+          "roll_fold": 9860291655347291068
+        }
+      ]
+    },
+    {
+      "name": "combat-pair",
+      "entities": 2,
+      "ticks": 180,
+      "chain": "1b654a2477a121a62d46e26273d4abd40f79a72b195e8978b034c3158c33713d",
+      "final_states": [
+        {
+          "entity": 1,
+          "pos_mm": [
+            -16233,
+            28261,
+            0
+          ],
+          "vel_mms": [
+            -532,
+            751,
+            0
+          ],
+          "heading_urad": 504141,
+          "hp": -14,
+          "shield": 0,
+          "roll_fold": 17166488255596177413
+        },
+        {
+          "entity": 2,
+          "pos_mm": [
+            33975,
+            -37202,
+            0
+          ],
+          "vel_mms": [
+            -290,
+            895,
+            0
+          ],
+          "heading_urad": 1919020,
+          "hp": -48,
+          "shield": 0,
+          "roll_fold": 16398255907364794353
+        }
+      ]
+    },
+    {
+      "name": "combat-island",
+      "entities": 8,
+      "ticks": 600,
+      "chain": "ea9e59fdd47ec9833117b947a3753fb7cce58e1c1b43364bd91bd8c4bea22d69",
+      "final_states": [
+        {
+          "entity": 1,
+          "pos_mm": [
+            10557,
+            34507,
+            0
+          ],
+          "vel_mms": [
+            1109,
+            653,
+            0
+          ],
+          "heading_urad": 5725361,
+          "hp": -6,
+          "shield": 0,
+          "roll_fold": 845735849265059513
+        },
+        {
+          "entity": 2,
+          "pos_mm": [
+            47223,
+            -44810,
+            0
+          ],
+          "vel_mms": [
+            135,
+            -326,
+            0
+          ],
+          "heading_urad": 4807306,
+          "hp": -5,
+          "shield": 0,
+          "roll_fold": 8386319925793618716
+        },
+        {
+          "entity": 3,
+          "pos_mm": [
+            35457,
+            30998,
+            0
+          ],
+          "vel_mms": [
+            163,
+            -58,
+            0
+          ],
+          "heading_urad": 3373744,
+          "hp": -5,
+          "shield": 0,
+          "roll_fold": 4765245299822244110
+        },
+        {
+          "entity": 4,
+          "pos_mm": [
+            -4478,
+            -25443,
+            0
+          ],
+          "vel_mms": [
+            2,
+            61,
+            0
+          ],
+          "heading_urad": 2978847,
+          "hp": -9,
+          "shield": 0,
+          "roll_fold": 995755598677167728
+        },
+        {
+          "entity": 5,
+          "pos_mm": [
+            -31413,
+            -47983,
+            0
+          ],
+          "vel_mms": [
+            -992,
+            -251,
+            0
+          ],
+          "heading_urad": 7741504,
+          "hp": -53,
+          "shield": 0,
+          "roll_fold": 8202341025343415838
+        },
+        {
+          "entity": 6,
+          "pos_mm": [
+            -44321,
+            -45225,
+            0
+          ],
+          "vel_mms": [
+            -856,
+            288,
+            0
+          ],
+          "heading_urad": -62510,
+          "hp": -57,
+          "shield": 0,
+          "roll_fold": 16806386341484050391
+        },
+        {
+          "entity": 7,
+          "pos_mm": [
+            -41526,
+            -36395,
+            0
+          ],
+          "vel_mms": [
+            -315,
+            -258,
+            0
+          ],
+          "heading_urad": 6098308,
+          "hp": -31,
+          "shield": 0,
+          "roll_fold": 12610181896124353880
+        },
+        {
+          "entity": 8,
+          "pos_mm": [
+            -52138,
+            29548,
+            0
+          ],
+          "vel_mms": [
+            -704,
+            -165,
+            0
+          ],
+          "heading_urad": -278004,
+          "hp": -21,
+          "shield": 0,
+          "roll_fold": 17015274968912835061
+        }
+      ]
+    }
+  ]
+}

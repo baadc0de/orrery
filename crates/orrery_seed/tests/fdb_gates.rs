@@ -465,7 +465,9 @@ async fn wipe_leaves_ckpt_rows_intact() {
     wipe_scenario(temp.path(), "demo-2026-08-13").await;
     activate_fdb_checkpoint_fence(&fdb_cluster_file().unwrap(), GridId::new(9406)).await;
 
-    let rt = CellRuntime::open(&runtime_config(dir.path(), GridId::new(9406)), &store).unwrap();
+    let rt = CellRuntime::open(&runtime_config(dir.path(), GridId::new(9406)), &store)
+        .await
+        .unwrap();
     for i in 0..4u64 {
         rt.apply(record(GridId::new(9406), CellId::ROOT, i))
             .await
@@ -524,7 +526,9 @@ async fn cold_area_load_returns_seeded_entities() {
     wipe_scenario(temp.path(), "demo-2026-08-13").await;
     activate_fdb_checkpoint_fence(&cluster, grid).await;
 
-    let rt = CellRuntime::open(&runtime_config(dir.path(), grid), &store_ckpt).unwrap();
+    let rt = CellRuntime::open(&runtime_config(dir.path(), grid), &store_ckpt)
+        .await
+        .unwrap();
     for (i, cell) in cells.iter().copied().enumerate() {
         rt.apply(record(grid, cell, i as u64)).await.unwrap();
     }
@@ -533,7 +537,9 @@ async fn cold_area_load_returns_seeded_entities() {
 
     let live_store: Arc<dyn CheckpointStore> = Arc::new(MemCheckpointStore::new());
     let live = tokio::sync::Mutex::new(
-        CellRuntime::open(&runtime_config(dir.path(), grid), &live_store).unwrap(),
+        CellRuntime::open(&runtime_config(dir.path(), grid), &live_store)
+            .await
+            .unwrap(),
     );
     let router = ColdFallbackRouter::new(live, store_cold);
     let started = Instant::now();

@@ -82,6 +82,69 @@ and the feature set.
   phase (P0–P6) has a demo criterion that is a permanent regression harness and
   gates entry to the next phase. See [docs/11-roadmap.md](docs/11-roadmap.md).
 
+## CI
+
+`.github/workflows/ci.yml` runs on every push and pull request: `rustfmt`,
+`clippy -D warnings`, the verifiable-core static gates
+(`scripts/core-gates.sh`), the P2/P3 harness `--self-test` modes, the workspace
+test suite, and the cross-platform determinism matrix.
+
+Three things about it are worth knowing before you change anything it touches.
+
+**`clippy` is enforced at `-D warnings`, over two feature sets.** The default
+build and the `fdb` build compile different code, and the `fdb` half went
+unlinted long enough for `orrery_seed/tests/fdb_gates.rs` to stop compiling
+altogether. Both are gated now. `clippy` needs only metadata, so the `fdb` pass
+runs with no `libfdb_c` on the runner. Vendored crates under `vendor/` are
+excluded — their findings are upstream's to fix — and the run passes
+`--no-deps`, without which `--exclude` does not actually spare them: they are
+still path dependencies, and clippy lints those too. The workspace test job
+excludes the same three: `bevy_replicon`'s own tests and doctests do not compile
+under this workspace's feature unification, because `bevy/serialize` is off and
+they need `Transform: Serialize`.
+
+One thing to know while you are in there: **`[workspace.lints]` currently
+reaches only the vendored crates.** `vendor/aeronet_iroh`,
+`vendor/aeronet_tokio_runtime` and `vendor/bevy_replicon` are the only manifests
+with `[lints] workspace = true`, so the `pedantic`/`nursery`/`missing_docs`/
+`unwrap_used` levels configured at the workspace root apply to third-party code
+and to none of `crates/*`. That is backwards, and adopting it across the
+first-party crates is its own piece of work — a large one, since those levels
+have never been enforced there. The CI gate gates what is enforceable today:
+default `clippy` at `-D warnings`.
+
+**Determinism is checked *across* platforms, not on each one.** `orrery_core`'s
+own tests run an identical tick twice in-process and compare hashes, which
+catches VC-4/VC-8 violations but only ever proves one platform agrees with
+itself. `orrery_conformance` closes that: it runs a fixed corpus through a
+reference ruleset on the four supported targets (x86_64 Linux/Windows,
+aarch64 Linux/macOS — x86_64 macOS is one of docs/06 §8's five, deliberately
+dropped as unsupported), emits a digest of per-tick state hashes, and a
+final job compares them. Discrete state must be bit-identical; a mismatch is
+localized to the first diverging `(tick, entity)` and quantified against the §5
+bands so you can tell `libm` drift from a rules change.
+
+`crates/orrery_conformance/corpus/golden.json` is committed, and every platform
+also checks against it inside the ordinary test suite. **If you change the
+reference ruleset, bump `REFERENCE_RULESET.version` and regenerate the golden:**
+
+```sh
+cargo run -p orrery_conformance -- emit --out crates/orrery_conformance/corpus/golden.json --compact
+```
+
+Regenerating without bumping the version hides a rules change as a determinism
+pass, which is the one failure this whole apparatus exists to prevent.
+
+**`sccache` is cleared on runners.** `.cargo/config.toml` sets
+`build.rustc-wrapper = "sccache"` for local worktrees; the workflows set
+`RUSTC_WRAPPER: ""` because runners are ephemeral and have no sccache.
+
+The heavy harnesses — P2's kill-9 gate, which needs a real FoundationDB
+cluster, and P3's island gate, which needs eight peer processes and a real
+`kill -9` — cannot gate a pull request. They run nightly and on demand in
+`.github/workflows/nightly.yml`, alongside a soak that repeats the corpus ten
+times in one process to catch per-process nondeterminism.
+
 ## Build cache and target directories
 
 Agents work in parallel git worktrees, and a Rust `target/` is enormous: one

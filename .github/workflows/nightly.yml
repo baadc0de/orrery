@@ -1,0 +1,165 @@
+# The phase gates that need real processes, real crashes and a real cluster.
+#
+# P2's kill-9 harness and P3's island harness are proof harnesses: neither
+# writes a success artifact unless every clause of its phase's demo criterion
+# holds. That makes them slow and stateful — eight peers, a 10 s lease TTL, a
+# FoundationDB cluster — so they cannot gate a pull request. They run here
+# instead, nightly and on demand, which is the "kept green in CI thereafter"
+# half of the roadmap's demo-or-it-didn't-happen rule (docs/11-roadmap.md
+# §Sequencing principle 3).
+#
+# Their `--self-test` modes run per-commit in ci.yml; those check the scripts
+# still contain the stages that make them proofs, not that the proofs pass.
+
+name: Nightly gates
+
+on:
+  schedule:
+    # 03:00 UTC daily. Nothing depends on the hour; it is off-peak for runners.
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  RUSTC_WRAPPER: ""
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  p3-island:
+    name: P3 island gate (kill -9, 8 peers)
+    runs-on: ubuntu-latest
+    # The harness runs a 30 s island plus setup and teardown; the build
+    # dominates. Bounded so a hung peer fails rather than burning the job limit.
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install the pinned toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: nightly-p3-${{ hashFiles('Cargo.toml', 'crates/*/Cargo.toml', 'vendor/*/Cargo.toml', 'rust-toolchain.toml') }}
+          restore-keys: nightly-p3-
+
+      # Release binaries: the criterion is about what the registrar does inside
+      # a 10 s lease TTL, and debug builds change the timing enough to make a
+      # pass or a failure mean something different.
+      - name: Build the harness binaries
+        run: cargo build --release -p orrery_persistd -p orrery_coordinator
+
+      - name: Build the island harness
+        working-directory: p3-island
+        run: cargo build --release
+
+      # No FoundationDB here on purpose. Authority lives in the registrar, and
+      # the criterion is about what happens when a holder dies, so the volatile
+      # lease store is the honest configuration (see the script's header).
+      - name: Run the island gate
+        env:
+          PERSISTD_BIN: ${{ github.workspace }}/target/release/persistd
+          COORDINATOR_BIN: ${{ github.workspace }}/target/release/orrery-coordinator
+          P3_ISLAND_BIN: ${{ github.workspace }}/p3-island/target/release/p3-island
+        run: scripts/p3-island-gate.sh
+
+      - name: Upload the gate's evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: p3-island-evidence
+          path: p3-island-*/
+          retention-days: 14
+          if-no-files-found: warn
+
+  p2-kill9:
+    name: P2 kill-9 gate (FoundationDB)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install the pinned toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: nightly-p2-${{ hashFiles('Cargo.toml', 'crates/*/Cargo.toml', 'vendor/*/Cargo.toml', 'rust-toolchain.toml') }}
+          restore-keys: nightly-p2-
+
+      # FoundationDB 7.3.x per D11/D14: the client provides libfdb_c and the
+      # headers orrery_persistd links under the `fdb` feature, the server the
+      # single-node cluster the gate writes to.
+      - name: Install FoundationDB with a local cluster
+        uses: ./.github/actions/foundationdb
+        with:
+          server: "true"
+
+      - name: Build the fdb-enabled binaries
+        run: cargo build --release -p orrery_persistd --features fdb
+
+      - name: Build the load rig and dashboard
+        run: |
+          set -euo pipefail
+          # p2-load and p2-dashboard carry their own [workspace] tables and are
+          # excluded from the root workspace, so each builds on its own.
+          (cd p2-load && cargo build --release)
+          (cd p2-dashboard && cargo build --release)
+
+      - name: Run the kill-9 gate
+        env:
+          ORRERY_FDB_CLUSTER_FILE: /etc/foundationdb/fdb.cluster
+          PERSISTD_BIN: ${{ github.workspace }}/target/release/persistd
+          P2_LOAD_BIN: ${{ github.workspace }}/p2-load/target/release/p2-load
+          P2_DASHBOARD_BIN: ${{ github.workspace }}/p2-dashboard/target/release/p2-dashboard
+        run: scripts/p2-kill9-gate.sh
+
+      - name: Upload the gate's evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: p2-kill9-evidence
+          path: p2-kill9-*/
+          retention-days: 14
+          if-no-files-found: warn
+
+  determinism-soak:
+    name: determinism soak (extended corpus)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install the pinned toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+
+      # The per-commit matrix runs the corpus once per platform. Repeating it
+      # in one process targets a different failure: VC-4 and VC-8 violations
+      # (hash iteration order, address hashing) are per-*process* nondeterminism
+      # and can hide behind a corpus that happens to agree on one run.
+      - name: Repeat the corpus and require identical digests
+        run: |
+          set -euo pipefail
+          cargo build --release -p orrery_conformance
+          bin=target/release/orrery-conformance
+          "$bin" emit --out /tmp/soak-0.json --compact
+          for i in $(seq 1 9); do
+            "$bin" emit --out "/tmp/soak-$i.json" --compact
+            # `target` is the only field allowed to differ between reports, and
+            # it cannot differ here — same binary, same machine. A plain diff is
+            # the strictest check available.
+            if ! diff -q /tmp/soak-0.json "/tmp/soak-$i.json" >/dev/null; then
+              echo "::error::run $i differs from run 0 — a per-process nondeterminism (VC-4/VC-8)"
+              diff /tmp/soak-0.json "/tmp/soak-$i.json" || true
+              exit 1
+            fi
+          done
+          echo "10 runs produced byte-identical digests"

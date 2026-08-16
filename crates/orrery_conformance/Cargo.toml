@@ -1,0 +1,25 @@
+[package]
+name = "orrery_conformance"
+version = "0.1.0"
+edition = "2021"
+description = "Orrery cross-platform determinism conformance corpus: a reference Ruleset, a fixed replay corpus, and the per-platform digest CI compares across Windows/Linux/macOS (docs/06-verifiable-core.md §8)"
+license = "MIT OR Apache-2.0"
+
+# Bevy-free and headless, like `orrery_core` itself. This crate exists to be
+# built identically on every target in the matrix, so it takes no dependency
+# that could differ between them: no tokio, no OS services, no clock.
+[dependencies]
+orrery_core = { path = "../orrery_core" }
+orrery_protocol = { path = "../orrery_protocol" }
+# VC-6: continuous math goes through libm, never std transcendentals. The
+# corpus exists precisely to prove these agree across platforms.
+libm = "0.2"
+rand_chacha = "0.9"
+rand_core = "0.9"
+blake3 = "1.8"
+serde = { workspace = true }
+serde_json = "1"
+
+[[bin]]
+name = "orrery-conformance"
+path = "src/main.rs"

@@ -4,18 +4,32 @@
 //! `PersistId`s through the `seedmap/` subspace, and writes the resulting
 //! rows in blind batches.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
+#[cfg(feature = "fdb")]
+use std::collections::BTreeSet;
+#[cfg(feature = "fdb")]
 use std::sync::Arc;
 
+#[cfg(feature = "fdb")]
 use orrery_persistd::keyspace;
-use orrery_protocol::{CellId, GridId, PersistId};
+#[cfg(feature = "fdb")]
+use orrery_protocol::CellId;
+#[cfg(feature = "fdb")]
+use orrery_protocol::{GridId, PersistId};
 
+#[cfg(feature = "fdb")]
 use crate::content::ContentKey;
+#[cfg(feature = "fdb")]
 use crate::idmap::{self, BlockGrantCursor, SeedMap, SeedMapRow};
-use crate::manifest::{ManifestEntry, ManifestWriter};
+use crate::manifest::ManifestEntry;
+#[cfg(feature = "fdb")]
+use crate::manifest::ManifestWriter;
 use crate::scenario::ResolvedScenario;
+#[cfg(feature = "fdb")]
 use crate::seedtree::SeedRoot;
+#[cfg(feature = "fdb")]
 use crate::split::{split_cell, FieldOracle};
+#[cfg(feature = "fdb")]
 use crate::write::{self, EncodedRow};
 
 /// Writer options.
@@ -73,10 +87,12 @@ pub struct ApplyReport {
 }
 
 /// A closed-form oracle over one layer.
+#[cfg(feature = "fdb")]
 struct UniformOracle<'a> {
     layer: &'a crate::scenario::ResolvedLayer,
 }
 
+#[cfg(feature = "fdb")]
 impl FieldOracle for UniformOracle<'_> {
     fn field_mass(&self, cell: CellId) -> crate::field::Q16_16 {
         let quanta = self
@@ -265,7 +281,7 @@ pub async fn build_desired_rows(
         // hash of the derivation path — so index order is not key order. Sort
         // each cell's slice before emitting. This is not the global sort §9.3
         // rules out: it is bounded by one cell's population.
-        descriptors.sort_by(|a, b| (a.0, a.4).cmp(&(b.0, b.4)));
+        descriptors.sort_by_key(|d| (d.0, d.4));
 
         for (cell, _index, archetype, slot_key, content_key, local_pos) in descriptors {
             let seed_row = existing_seedmap.get(&content_key).cloned();
@@ -460,6 +476,8 @@ pub async fn load_existing_rows(
     Ok(out)
 }
 
+/// Stand-in for the FoundationDB read path when the `fdb` feature is off:
+/// there is no cluster to read, so every desired row is treated as absent.
 #[cfg(not(feature = "fdb"))]
 pub async fn load_existing_rows(
     _db: &(),
@@ -470,6 +488,7 @@ pub async fn load_existing_rows(
 }
 
 /// Flatten nested grids into grid 0.
+#[cfg(feature = "fdb")]
 fn flatten_to_single_grid(scenario: &mut ResolvedScenario) {
     let root = scenario
         .grids
@@ -490,6 +509,7 @@ fn flatten_to_single_grid(scenario: &mut ResolvedScenario) {
     }
 }
 
+#[cfg(feature = "fdb")]
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

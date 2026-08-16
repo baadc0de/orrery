@@ -497,7 +497,7 @@ pub fn emit_rows(
             );
             let entry = crate::manifest::ManifestEntry {
                 content_key: ck,
-                persist_id: persist_id,
+                persist_id,
                 grid: emit.grid,
                 cell,
                 value_digest: value_digest(&bag),
@@ -519,6 +519,9 @@ pub fn emit_rows(
 
 /// Encode one bag for the manifest digest or the write path (opaque path; the
 /// hex escape when the archetype declares one).
+// Every argument is a distinct part of the row identity the encoder needs;
+// bundling them into a struct would only move the same eight values.
+#[allow(clippy::too_many_arguments)]
 pub fn encode_bag(
     scenario: &ResolvedScenario,
     emit: &ResolvedEmit,

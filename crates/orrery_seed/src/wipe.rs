@@ -1,11 +1,16 @@
 //! Seeded-world wipe support.
 
+#[cfg(feature = "fdb")]
 use std::collections::BTreeSet;
 
+#[cfg(feature = "fdb")]
 use futures::TryStreamExt;
+#[cfg(feature = "fdb")]
 use orrery_persistd::keyspace;
+#[cfg(feature = "fdb")]
 use orrery_protocol::{CellId, GridId};
 
+#[cfg(feature = "fdb")]
 use crate::idmap;
 use crate::scenario::ResolvedScenario;
 
@@ -161,6 +166,8 @@ pub async fn run(
     Ok(())
 }
 
+/// Stand-in for the wipe path when the `fdb` feature is off: there is no
+/// cluster to wipe.
 #[cfg(not(feature = "fdb"))]
 pub async fn run(
     _source: &str,
@@ -170,6 +177,7 @@ pub async fn run(
     Err("wipe requires the `fdb` feature".to_string())
 }
 
+#[cfg(feature = "fdb")]
 fn flatten(mut scenario: ResolvedScenario) -> ResolvedScenario {
     let root = scenario
         .grids
