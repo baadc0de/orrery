@@ -9,11 +9,16 @@
 //! # What it wires
 //!
 //! ```text
-//! authored frames ──▶ AuthorityLog ──▶ Channel::State ──▶ island peers
-//!  island peers ──▶ Channel::State ──▶ Witness ──▶ signals
+//! authored frames ──▶ AuthorityLog ──▶ Channel::State ──▶ witness set (≤ 7)
+//!  witnessed peers ──▶ Channel::State ──▶ Witness ──▶ signals
 //!                                        └─ Gap ──▶ Channel::Control ──▶ authority
 //!                                                     └─ frames back ──▶ Witness
 //! ```
+//!
+//! The fan-out is the *witness set*, not the interest set — see [`WitnessSet`].
+//! Streaming a log to everyone in an island is what makes the D9 traffic bounded
+//! "by construction" untrue: §5.3 costs it at ~20–30 kb/s per link, negligible
+//! across seven links and ruinous across thirty-one.
 //!
 //! # Why gap repair rides the reliable lane
 //!
@@ -29,7 +34,7 @@ use bytes::Bytes;
 
 use orrery_core::store::AuthorityLog;
 use orrery_core::{log::HeadTransition, Ruleset};
-use orrery_net::channels::{decode_datagram, encode_datagram, Channel};
+use orrery_net::channels::{decode_witness, encode_witness, Channel};
 use orrery_net::peer_link::payload_budget;
 use orrery_net::{IslandMembership, PeerPacket, SendPacket};
 use orrery_protocol::{FrameHead, LogFrame, LogRangeRequest, NodeId, StateClaim, Tick, WitnessMsg};
@@ -83,6 +88,36 @@ pub struct Witnessed {
 /// The local authority's retained log (docs/06 §6).
 #[derive(Debug, Default, Resource)]
 pub struct AuthoredLog(pub AuthorityLog);
+
+/// The most links a peer streams its log over (docs/03-replication.md §5.3).
+///
+/// Witness records ride the replication datagrams, but **only on links to
+/// cell-epoch witness-set members** — never the whole interest set. The
+/// difference is the whole bandwidth argument: §5.3 puts a typical sender at
+/// ~20–30 kb/s of witness traffic *per link*, which is negligible across seven
+/// and ruinous across thirty-one.
+pub const MAX_WITNESS_LINKS: usize = 7;
+
+/// The peers this authority streams its log to.
+///
+/// # Who chooses this
+///
+/// Not this peer. D10 requires the witness set to be seeded per cell-epoch by
+/// the coordinator and **never self-chosen**, because a cheat that picks its own
+/// witnesses picks friendly ones. That seeding is P5's (`orrery_coordinator`
+/// witness-set seeding); until it exists this resource is left empty and
+/// [`publish_authored`] falls back to the first [`MAX_WITNESS_LINKS`] island
+/// peers in NodeId order.
+///
+/// That fallback is deterministic and bandwidth-correct, and it is **self-chosen
+/// — which is only tolerable because P4 files nothing**. Shadow mode is what
+/// makes an interim witness set safe; the moment reports carry consequences,
+/// this must come from the coordinator.
+#[derive(Debug, Default, Resource)]
+pub struct WitnessSet {
+    /// The peers to stream to. Empty means "fall back".
+    pub members: Vec<NodeId>,
+}
 
 /// The witness engine, as a resource.
 ///
@@ -153,6 +188,7 @@ where
     fn build(&self, app: &mut App) {
         app.init_resource::<AuthoredLog>()
             .init_resource::<WitnessLinkCounters>()
+            .init_resource::<WitnessSet>()
             .add_message::<PublishFrame>()
             .add_message::<PublishClaim>()
             .add_message::<Witnessed>()
@@ -182,10 +218,11 @@ pub fn publish_authored(
     mut claims: MessageReader<PublishClaim>,
     mut log: ResMut<AuthoredLog>,
     membership: Res<IslandMembership>,
+    witnesses: Res<WitnessSet>,
     mut out: MessageWriter<SendPacket>,
     mut counters: ResMut<WitnessLinkCounters>,
 ) {
-    let peers: Vec<NodeId> = membership.peer_ids().collect();
+    let peers: Vec<NodeId> = witness_links(&witnesses, &membership);
 
     for published in frames.read() {
         let heads: Vec<FrameHead> = published
@@ -200,7 +237,7 @@ pub fn publish_authored(
         log.0
             .record_frame(published.frame.clone(), published.transitions.clone());
 
-        let payload = Bytes::from(encode_datagram(&WitnessMsg::Frame {
+        let payload = Bytes::from(encode_witness(&WitnessMsg::Frame {
             frame: published.frame.clone(),
             heads,
         }));
@@ -217,7 +254,7 @@ pub fn publish_authored(
     for published in claims.read() {
         log.0
             .record_claim(published.claim.clone(), published.snapshot.clone());
-        let payload = Bytes::from(encode_datagram(&WitnessMsg::Claim(published.claim.clone())));
+        let payload = Bytes::from(encode_witness(&WitnessMsg::Claim(published.claim.clone())));
         for peer in &peers {
             counters.claims_published += 1;
             out.write(SendPacket {
@@ -227,6 +264,26 @@ pub fn publish_authored(
             });
         }
     }
+}
+
+/// The links this peer streams its log over.
+///
+/// The configured [`WitnessSet`] when there is one, otherwise the first
+/// [`MAX_WITNESS_LINKS`] island peers in NodeId order — see [`WitnessSet`] for
+/// why that fallback is interim and why shadow mode is what makes it safe.
+///
+/// Sorting matters: island rosters arrive in whatever order the coordinator
+/// built them, and an unsorted truncation would silently change which peers
+/// witness this one whenever the manifest reordered.
+#[must_use]
+pub fn witness_links(witnesses: &WitnessSet, membership: &IslandMembership) -> Vec<NodeId> {
+    if !witnesses.members.is_empty() {
+        return witnesses.members.clone();
+    }
+    let mut peers: Vec<NodeId> = membership.peer_ids().collect();
+    peers.sort_by_key(|node| *node.as_bytes());
+    peers.truncate(MAX_WITNESS_LINKS);
+    peers
 }
 
 /// Feeds inbound frames, claims and repairs into the witness.
@@ -244,8 +301,10 @@ pub fn ingest_peer_traffic<R>(
 {
     let mut witness = witness;
     for packet in packets.read() {
-        let Some(message) = decode_datagram::<WitnessMsg>(&packet.payload) else {
-            counters.undecodable += 1;
+        // Not witness traffic at all — replication shares this lane. Skipped
+        // before postcard sees it, and not counted as undecodable: a
+        // replication datagram is not a malformed witness message.
+        let Some(message) = decode_witness::<WitnessMsg>(&packet.payload) else {
             continue;
         };
 
@@ -325,7 +384,7 @@ pub fn ingest_peer_traffic<R>(
                     out.write(SendPacket {
                         to: packet.from,
                         channel: Channel::Control,
-                        payload: Bytes::from(encode_datagram(&WitnessMsg::RangeRequest(
+                        payload: Bytes::from(encode_witness(&WitnessMsg::RangeRequest(
                             LogRangeRequest {
                                 entity: response.entity,
                                 chain_epoch: 0,
@@ -365,7 +424,7 @@ fn deliver_frame<R: Ruleset + Send + Sync + 'static>(
                     out.write(SendPacket {
                         to: subject,
                         channel: Channel::Control,
-                        payload: Bytes::from(encode_datagram(&WitnessMsg::RangeRequest(
+                        payload: Bytes::from(encode_witness(&WitnessMsg::RangeRequest(
                             request.clone(),
                         ))),
                     });
@@ -409,7 +468,7 @@ pub fn serve_repair_requests(
         out.write(SendPacket {
             to: asked.from,
             channel: Channel::Control,
-            payload: Bytes::from(encode_datagram(&WitnessMsg::RangeResponse {
+            payload: Bytes::from(encode_witness(&WitnessMsg::RangeResponse {
                 response: served.response,
                 heads: served.heads,
                 resume_from: served.resume_from,

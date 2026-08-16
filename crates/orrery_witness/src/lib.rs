@@ -59,8 +59,8 @@ pub mod witness;
 
 #[cfg(feature = "bevy")]
 pub use plugin::{
-    AuthoredLog, PublishClaim, PublishFrame, WitnessLinkCounters, WitnessPlugin, WitnessState,
-    Witnessed,
+    AuthoredLog, PublishClaim, PublishFrame, WitnessLinkCounters, WitnessPlugin, WitnessSet,
+    WitnessState, Witnessed,
 };
 pub use report::{sign_report, verify_report, ReportError};
 pub use witness::{

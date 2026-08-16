@@ -6,10 +6,10 @@ use bytes::Bytes;
 use serde::Serialize;
 
 use orrery_core::CoreCodec;
-use orrery_net::channels::{encode_datagram, Channel};
+use orrery_net::channels::{encode_replication, Channel};
 use orrery_net::peer_link::SendPacket;
 use orrery_protocol::coord::PeerEntry;
-use orrery_protocol::{CellId, NodeId, UniverseSeed};
+use orrery_protocol::{CellId, NodeId, PersistId, UniverseSeed};
 
 use crate::bot::{Bot, TICK_HZ};
 use crate::router::{Impairment, Router, RouterCounters};
@@ -31,6 +31,9 @@ pub struct SwarmConfig {
     pub seed: u64,
     /// Tick at which a late joiner appears, if any.
     pub late_join_tick: Option<u64>,
+    /// Run the witness pipeline: every peer watches its witness set's entities
+    /// and re-executes their signed logs (P4's input).
+    pub witnessing: bool,
 }
 
 impl Default for SwarmConfig {
@@ -43,6 +46,7 @@ impl Default for SwarmConfig {
             impairment: Impairment::default(),
             seed: 1,
             late_join_tick: None,
+            witnessing: false,
         }
     }
 }
@@ -68,6 +72,12 @@ pub struct PeerReport {
     pub p99_upload_bits: u64,
     /// Packets the send path shed for want of budget.
     pub shed: u64,
+    /// This peer's behavioural profile.
+    pub profile: &'static str,
+    /// Chain gaps this peer detected — repairs, not accusations.
+    pub gaps: u64,
+    /// Signals this peer raised that would accuse an honest island-mate.
+    pub false_positives: u64,
     /// Replica entities held at the end of the run.
     pub replicas: usize,
     /// Of those, how many carried an interest tag.
@@ -114,6 +124,14 @@ pub struct SwarmReport {
     pub total_undecodable: u64,
     /// Replica entities held across the swarm at the end of the run.
     pub total_replicas: usize,
+    /// Whether the witness pipeline ran.
+    pub witnessing: bool,
+    /// Player-hours accumulated: peers times simulated seconds.
+    pub player_hours: f64,
+    /// Chain gaps detected across the swarm — expected under loss.
+    pub total_gaps: u64,
+    /// Signals raised against honest peers. **Every one is a false positive.**
+    pub total_false_positives: u64,
     /// Link statistics.
     pub link: LinkReport,
     /// The late-join check, if one ran.
@@ -177,7 +195,15 @@ impl Swarm {
         let seed = UniverseSeed(universe);
 
         let bots: Vec<Bot> = (0..config.peers)
-            .map(|index| Bot::new(index, config.peers, seed, config.cell_edge_m))
+            .map(|index| {
+                Bot::new(
+                    index,
+                    config.peers,
+                    seed,
+                    config.cell_edge_m,
+                    config.witnessing,
+                )
+            })
             .collect();
         let index_of = bots
             .iter()
@@ -269,7 +295,7 @@ impl Swarm {
             (
                 bot.node,
                 cell,
-                encode_datagram(&(body.to_canonical(), cell)),
+                encode_replication(&(body.to_canonical(), cell)),
             )
         };
         let peers: Vec<NodeId> = self.bots[index]
@@ -341,25 +367,55 @@ impl Swarm {
     #[must_use]
     pub fn run(mut self) -> SwarmReport {
         self.form_island();
+        if self.config.witnessing {
+            self.seed_witnesses();
+        }
         let ticks = self.config.seconds * TICK_HZ;
         let send_every = (TICK_HZ / self.config.send_hz.max(1)).max(1);
         let mut late_join = None;
 
+        let mut phase = [0u128; 6];
         for tick in 0..ticks {
+            let mut mark = std::time::Instant::now();
+            if self.config.witnessing {
+                // Before the tick runs: a claim commits to pre-step state.
+                for bot in &mut self.bots {
+                    bot.publish_claim(tick);
+                }
+            }
             for index in 0..self.bots.len() {
                 self.bots[index].step_core(tick, self.config.cell_edge_m);
             }
+            phase[0] += mark.elapsed().as_nanos();
+            mark = std::time::Instant::now();
             if tick % send_every == 0 {
                 for index in 0..self.bots.len() {
                     self.broadcast(index);
                 }
             }
+            if self.config.witnessing {
+                for bot in &mut self.bots {
+                    bot.publish(tick);
+                }
+            }
+            phase[1] += mark.elapsed().as_nanos();
+            mark = std::time::Instant::now();
             for bot in &mut self.bots {
                 bot.update();
-                bot.sample();
             }
+            phase[2] += mark.elapsed().as_nanos();
+            mark = std::time::Instant::now();
+            for bot in &mut self.bots {
+                bot.sample();
+                bot.drain_signals();
+            }
+            phase[3] += mark.elapsed().as_nanos();
+            mark = std::time::Instant::now();
             self.collect_sends(tick);
+            phase[4] += mark.elapsed().as_nanos();
+            mark = std::time::Instant::now();
             self.deliver(tick);
+            phase[5] += mark.elapsed().as_nanos();
 
             // Once a simulated second, sample each peer's rate and re-publish
             // the roster — the coordinator's manifest cadence.
@@ -380,8 +436,70 @@ impl Swarm {
         // the last tick is an artefact of stopping the clock mid-flight, not a
         // link that fails to deliver — but a link that is *still* holding work
         // after the drain is the latter, which is why the clause survives.
+        if std::env::var_os("P1_SWARM_PHASES").is_some() {
+            let names = [
+                "step",
+                "publish",
+                "app.update",
+                "sample",
+                "collect",
+                "deliver",
+            ];
+            for (name, nanos) in names.iter().zip(phase) {
+                eprintln!("p1-swarm: phase {name:>11}: {:>8.2}s", nanos as f64 / 1e9);
+            }
+        }
         let _ = self.deliver_due_all(ticks + u64::from(self.config.impairment.jitter_ticks) + 1);
         self.report(ticks, late_join)
+    }
+
+    /// Seed every peer's witness set and start it watching.
+    ///
+    /// Each bot streams its log to at most seven island-mates and watches
+    /// exactly those it is streamed to — the reciprocal arrangement a
+    /// coordinator-seeded cell-epoch set would produce, built here because
+    /// seeding is P5's. Every anchor is the subject's own signed claim at tick
+    /// zero, which is the only state a witness ever holds for someone else.
+    fn seed_witnesses(&mut self) {
+        use orrery_witness::plugin::MAX_WITNESS_LINKS;
+
+        let count = self.bots.len();
+        // Ring assignment: peer i is witnessed by the next `MAX_WITNESS_LINKS`
+        // peers around the ring. Deterministic, uniform, and it gives every peer
+        // both a witness set and a watch list without a central chooser.
+        let sets: Vec<Vec<usize>> = (0..count)
+            .map(|index| {
+                (1..=MAX_WITNESS_LINKS.min(count.saturating_sub(1)))
+                    .map(|offset| (index + offset) % count)
+                    .collect()
+            })
+            .collect();
+
+        // Anchors first: a watcher needs the subject's signed claim and the
+        // state it commits to, and both have to be taken before anyone steps.
+        let anchors: Vec<(PersistId, NodeId, orrery_protocol::StateClaim, _)> = (0..count)
+            .map(|index| {
+                let state = self.bots[index].state();
+                let entity = self.bots[index].entity();
+                let node = self.bots[index].node;
+                let anchor = self.bots[index]
+                    .chain
+                    .as_mut()
+                    .expect("witnessing")
+                    .anchor(0, &state);
+                (entity, node, anchor, state)
+            })
+            .collect();
+
+        for (index, witnesses) in sets.iter().enumerate() {
+            let members: Vec<NodeId> = witnesses.iter().map(|w| self.bots[*w].node).collect();
+            self.bots[index].set_witness_set(members);
+            // Each of those peers watches this one.
+            let (entity, node, anchor, state) = anchors[index].clone();
+            for watcher in witnesses {
+                self.bots[*watcher].watch(entity, node, anchor.clone(), state.clone());
+            }
+        }
     }
 
     /// Deliver every packet due by `tick`, discarding the payloads.
@@ -465,6 +583,9 @@ impl Swarm {
                     peak_upload_bits: peak,
                     p99_upload_bits: p99,
                     shed: bot.shed(),
+                    profile: bot.profile.name(),
+                    gaps: bot.signals.gaps,
+                    false_positives: bot.signals.false_positives(),
                     replicas,
                     tagged,
                     proxied,
@@ -495,6 +616,10 @@ impl Swarm {
             stranded_in_flight: self.router.in_flight(),
             total_undecodable: per_peer.iter().map(|p| p.undecodable).sum(),
             total_replicas: per_peer.iter().map(|p| p.replicas).sum(),
+            witnessing: self.config.witnessing,
+            player_hours: self.config.peers as f64 * self.config.seconds as f64 / 3_600.0,
+            total_gaps: per_peer.iter().map(|p| p.gaps).sum(),
+            total_false_positives: per_peer.iter().map(|p| p.false_positives).sum(),
             link: self.router.counters.into(),
             per_peer,
             late_join,
@@ -570,6 +695,28 @@ impl SwarmReport {
                 clause: "the harness observes what it sends",
                 detail: "no peer holds a single replica; every interest clause \
                          below would pass by describing an empty world"
+                    .to_owned(),
+            });
+        }
+        // P4's criterion, when the witness is running: every peer here is
+        // honest by construction — each logs exactly the inputs it applied — so
+        // any signal beyond a gap accuses someone who did nothing wrong. A gap
+        // is a question and is counted separately.
+        if self.witnessing && self.total_false_positives > 0 {
+            failures.push(CriterionFailure {
+                clause: "no false-positive discrepancy signal against an honest peer",
+                detail: format!(
+                    "{} signals raised across {:.0} player-hours ({} gaps, which are repairs \
+                     rather than accusations)",
+                    self.total_false_positives, self.player_hours, self.total_gaps
+                ),
+            });
+        }
+        if self.witnessing && self.total_gaps == 0 && self.link.dropped > 0 {
+            failures.push(CriterionFailure {
+                clause: "the witness sees the stream it is judging",
+                detail: "packets were dropped and no peer detected a single chain gap; \
+                         the witness is not following the logs it was given"
                     .to_owned(),
             });
         }

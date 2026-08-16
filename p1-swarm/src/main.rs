@@ -27,6 +27,34 @@
 //! because forming one is P3's criterion and is separately proven; what is
 //! under test here is what a peer does with a roster.
 //!
+//! # Witnessing (`--witness`) is P4's input, not yet P4's criterion
+//!
+//! With `--witness` every peer streams a real signed log to its witness set and
+//! re-executes what it is streamed. Every bot is honest by construction — each
+//! logs exactly the inputs it applied — so any signal beyond a chain gap is a
+//! false positive, which is what makes the count meaningful without a separate
+//! oracle for who was cheating.
+//!
+//! It works and it found real defects. What it does **not** yet do is accumulate
+//! P4's 500 honest player-hours, for two measured reasons:
+//!
+//! - **Repair traffic is unbounded.** A peer that hitches for a second drags its
+//!   witnesses through a multi-datagram refill on the *unsheddable* control
+//!   lane. At sixteen peers with a stalling quarter, upload reached 8.7 Mbps
+//!   against the 1 Mbps budget and 26 630 replication packets were shed to pay
+//!   for it. docs/03-replication.md §5.3 puts witness traffic at ~20–30 kb/s per
+//!   link and calls it bounded by construction; repair traffic is not covered by
+//!   that estimate and needs a budget of its own.
+//! - **Cost still grows past sixteen peers** faster than the peer count. Thirty-two
+//!   peers over five simulated minutes does not finish inside seven wall
+//!   minutes, where the same run without the witness takes seconds.
+//!
+//! And one it structurally cannot do: every bot here shares a binary and a
+//! `libm`, so re-execution is bit-identical by construction and the
+//! cross-platform divergence false positive — the one D9's whole apparatus
+//! exists to prevent — cannot occur. That belongs to the determinism matrix,
+//! extended to exchange logs *between* platform legs.
+//!
 //! # Time
 //!
 //! Simulated. Each peer's clock advances exactly one 60 Hz tick per frame, so
@@ -35,6 +63,8 @@
 //! costs to compute, and a run is reproducible.
 
 mod bot;
+mod chain;
+mod profile;
 mod router;
 mod swarm;
 
@@ -96,6 +126,15 @@ struct Args {
     #[arg(long)]
     report_only: bool,
 
+    /// Run the witness pipeline: every peer re-executes its witness set's
+    /// signed logs, and any signal against an honest peer is a false positive.
+    ///
+    /// Also deals the awkward behavioural profiles (idle / burst / stall), since
+    /// they exist to stress the witness rather than the spatial stack. **This is
+    /// P4's input and does not yet meet P4's criterion** — see the module docs.
+    #[arg(long)]
+    witness: bool,
+
     /// Structural self-check for CI images with no time to run a swarm.
     #[arg(long)]
     self_test: bool,
@@ -125,6 +164,7 @@ fn main() -> Result<()> {
         },
         seed: args.seed,
         late_join_tick,
+        witnessing: args.witness,
     };
 
     eprintln!(
@@ -159,6 +199,12 @@ fn main() -> Result<()> {
         "p1-swarm: {} boundary flips, {} proxy pops out of {} churn events",
         report.total_boundary_flips, report.total_proxy_pops, report.total_interest_churn,
     );
+    if report.witnessing {
+        eprintln!(
+            "p1-swarm: witness ran over {:.0} player-hours: {} chain gaps repaired, {} false positives",
+            report.player_hours, report.total_gaps, report.total_false_positives,
+        );
+    }
     if let Some(join) = &report.late_join {
         eprintln!(
             "p1-swarm: late joiner tracked {} of {} roster peers, {} of which were in its neighbourhood",
@@ -201,6 +247,8 @@ fn self_test() -> Result<()> {
         "sustained upload ≤ 1 Mbps",
         "no load shed to stay within budget",
         "the harness observes what it sends",
+        "no false-positive discrepancy signal against an honest peer",
+        "the witness sees the stream it is judging",
         "the late-join check is not vacuous",
         "interest churn absorbed without visible proxy pops",
         "no entity thrashes cells at a boundary",

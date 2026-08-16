@@ -230,6 +230,11 @@ pub fn ramped_proxy_rate(
 /// the last one they had, because a stale `HighRate` marker on something that
 /// has left the neighbourhood is indistinguishable from a current one wherever
 /// the tags are read.
+// A Bevy system's parameters are its dependencies, and this one genuinely needs
+// all of them: config, the AOI gate, a clock for the rescore cadence, two pieces
+// of carried state, and the two queries. Bundling them into a `SystemParam` to
+// satisfy the count would hide the dependency list rather than shorten it.
+#[allow(clippy::too_many_arguments)]
 pub fn update_interest_set(
     cfg: Res<SpatialConfig>,
     aoi: Res<AoiSubscription>,

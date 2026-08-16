@@ -38,11 +38,18 @@ use orrery_net::peer_link::{
 use orrery_net::plugin::Peer;
 use orrery_net::{IslandMembership, IslandSource};
 use orrery_protocol::coord::{IslandId, PeerEntry, TopologyRegime};
-use orrery_protocol::{CellId, NodeId, PersistId, Tick, UniverseSeed, DEFAULT_CELL_EDGE_M};
+use orrery_protocol::{
+    CellId, NodeId, PersistId, StateClaim, Tick, UniverseSeed, DEFAULT_CELL_EDGE_M,
+};
 use orrery_spatial::hysteresis::GridPosition;
 use orrery_spatial::interest::{HighRate, InterestSelection, Proxy};
 use orrery_spatial::plugin::{Cell, LocalPlayer};
 use orrery_spatial::{OrrerySpatialPlugin, SpatialConfig};
+use orrery_witness::plugin::{PublishClaim, PublishFrame, WitnessSet, WitnessState};
+use orrery_witness::{Watch, Witness, WitnessConfig, WitnessPlugin, WitnessSignal, Witnessed};
+
+use crate::chain::Chain;
+use crate::profile::Profile;
 
 /// The fixed simulation tick (VC-1).
 pub const TICK: Duration = Duration::from_nanos(16_666_667);
@@ -155,6 +162,38 @@ pub struct Bot {
     demoted_at: Vec<(Entity, u64, f32)>,
     /// Ticks elapsed, for the pop window.
     tick: u64,
+    /// This bot's behavioural profile.
+    pub profile: Profile,
+    /// The signed log this bot authors, when witnessing is on.
+    pub chain: Option<Chain>,
+    /// Witness signals raised against island-mates, by kind.
+    pub signals: SignalTally,
+}
+
+/// Witness signals a peer raised, by kind.
+///
+/// Every bot in the swarm is honest, so anything here except a gap is a **false
+/// positive** — that is what makes the count meaningful without a separate
+/// oracle for who was cheating. Gaps are counted separately because a gap is a
+/// question, not an accusation: it is the expected answer to a dropped datagram.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct SignalTally {
+    /// Chain gaps detected — repairs requested, not accusations.
+    pub gaps: u64,
+    /// Stage-1 invariant breaches. A false positive here.
+    pub invariant_breaches: u64,
+    /// Re-execution disagreeing with a signed claim. A false positive here.
+    pub claim_mismatches: u64,
+    /// Reports assembled. Always zero in shadow mode; a false positive here.
+    pub reports: u64,
+}
+
+impl SignalTally {
+    /// Signals that would accuse an honest peer.
+    #[must_use]
+    pub fn false_positives(&self) -> u64 {
+        self.invariant_breaches + self.claim_mismatches + self.reports
+    }
 }
 
 /// How long a replica survives without an update, in ticks.
@@ -241,10 +280,18 @@ pub fn apply_replicas(
             counters.wrong_channel += 1;
             continue;
         }
+        // Witness records share this lane and are sub-tagged as such; skipping
+        // them is not a decode failure. Counting them would make `undecodable`
+        // — the guard that catches the harness measuring an empty world — fire
+        // constantly and stop meaning anything.
         let Some((encoded, cell)) =
-            orrery_net::channels::decode_datagram::<(Vec<u8>, CellId)>(&packet.payload)
+            orrery_net::channels::decode_replication::<(Vec<u8>, CellId)>(&packet.payload)
         else {
-            counters.undecodable += 1;
+            if orrery_net::channels::decode_witness::<orrery_protocol::WitnessMsg>(&packet.payload)
+                .is_none()
+            {
+                counters.undecodable += 1;
+            }
             continue;
         };
         let Ok(body) = <Body as orrery_core::CoreCodec>::decode(&encoded) else {
@@ -279,7 +326,13 @@ pub fn apply_replicas(
 
 impl Bot {
     /// Build a bot at `index` of `count`, spread around a ring.
-    pub fn new(index: usize, count: usize, seed: UniverseSeed, cell_edge_m: f32) -> Self {
+    pub fn new(
+        index: usize,
+        count: usize,
+        seed: UniverseSeed,
+        cell_edge_m: f32,
+        witnessing: bool,
+    ) -> Self {
         let secret = bot_key(index);
         let node = secret.public();
         let entity = PersistId::new(index as u64 + 1);
@@ -337,6 +390,17 @@ impl Bot {
         )
         .add_systems(Update, (send_peer_packets, forget_departed_links).chain());
 
+        if witnessing {
+            // The witness adapter drains the same peer lane, so it slots in
+            // beside the send path rather than replacing anything.
+            app.add_plugins(WitnessPlugin::<Reference>::new())
+                .insert_resource(WitnessState(Witness::<Reference>::new(
+                    WitnessConfig::default(),
+                    seed,
+                    || Reference,
+                )));
+        }
+
         let start_grid = grid_of(&start, cell_edge_m);
         app.world_mut().spawn((
             LocalPlayer,
@@ -363,6 +427,16 @@ impl Bot {
             current_cell: Some(cell_of(start_grid)),
             interest_churn: 0,
             proxy_pops: 0,
+            profile: Profile::for_index(index, witnessing),
+            chain: witnessing.then(|| {
+                Chain::new(
+                    secret.clone(),
+                    entity,
+                    orrery_conformance::REFERENCE_RULESET,
+                    0,
+                )
+            }),
+            signals: SignalTally::default(),
             last_high_rate: Vec::new(),
             demoted_at: Vec::new(),
             tick: 0,
@@ -390,15 +464,20 @@ impl Bot {
     /// roaming, it is teleporting, and it would make every hysteresis and
     /// interest-churn number meaningless.
     pub fn step_core(&mut self, tick: u64, cell_edge_m: f32) {
-        let accel_mmss = if self.speed_mps() >= CRUISE_MPS {
-            0
-        } else {
-            self.accel_mmss
-        };
+        let accel_mmss =
+            self.profile
+                .accel_mmss(tick, self.speed_mps(), self.accel_mmss, CRUISE_MPS);
         let command = orrery_conformance::Command::Thrust {
             accel_mmss,
             turn_urad: self.turn_urad,
         };
+        // Log *before* executing, and log exactly what is about to be applied.
+        // A log written from what happened rather than what was asked would
+        // close the gap a cheat lives in by construction, and then the harness
+        // could not tell an honest bot from a careful one.
+        if let Some(chain) = &mut self.chain {
+            chain.log_input(tick, &command);
+        }
         self.executor
             .step_entity(self.entity, Tick::new(tick), &[command])
             .expect("entity present");
@@ -565,6 +644,118 @@ impl Bot {
         let world = self.app.world_mut();
         let mut query = world.query_filtered::<&Cell, With<LocalPlayer>>();
         query.single(world).ok().map(|cell| cell.0)
+    }
+
+    /// Start watching `subject`'s `entity`, anchored at a signed claim.
+    pub fn watch(&mut self, entity: PersistId, subject: NodeId, anchor: StateClaim, state: Body) {
+        let Some(mut witness) = self
+            .app
+            .world_mut()
+            .get_resource_mut::<WitnessState<Reference>>()
+        else {
+            return;
+        };
+        witness
+            .0
+            .watch(Watch {
+                entity,
+                subject,
+                anchor,
+                anchor_state: state,
+            })
+            .expect("the anchor is the subject's own signed claim");
+    }
+
+    /// Name the peers this bot streams its log to (docs/03 5.3, at most seven).
+    pub fn set_witness_set(&mut self, members: Vec<NodeId>) {
+        if let Some(mut set) = self.app.world_mut().get_resource_mut::<WitnessSet>() {
+            set.members = members;
+        }
+    }
+
+    /// Cut a claim for `tick` from the state *before* the tick executes.
+    ///
+    /// The ordering is the whole correctness of this: a `StateClaim` at tick T
+    /// commits to the state before T runs, and a witness compares it against the
+    /// hash it computed for T-1. Claiming post-step state instead labels every
+    /// commitment one tick late, and every honest authority in the swarm reads
+    /// as a cheat — which is exactly what this harness reported before the call
+    /// moved ahead of `step_core`.
+    pub fn publish_claim(&mut self, tick: u64) {
+        let state = self.executor.state(self.entity).expect("seeded").clone();
+        let sending = self.profile.is_sending(tick);
+        let Some(chain) = &mut self.chain else {
+            return;
+        };
+        let Some(claim) = chain.cut_claim(tick, &state) else {
+            return;
+        };
+        if !sending {
+            return;
+        }
+        self.app
+            .world_mut()
+            .resource_mut::<bevy_ecs::message::Messages<PublishClaim>>()
+            .write(PublishClaim {
+                claim,
+                snapshot: orrery_core::CoreCodec::to_canonical(&state),
+            });
+    }
+
+    /// Publish this tick's frame, if one is due.
+    ///
+    /// A stalling profile keeps authoring and keeps its log intact; it simply
+    /// does not hand the frame to the plugin, which is what a client hitch looks
+    /// like from outside. Every watcher then sees a gap it must repair.
+    pub fn publish(&mut self, tick: u64) {
+        let Some(chain) = &mut self.chain else {
+            return;
+        };
+        let sending = self.profile.is_sending(tick);
+        let Some(authored) = chain.cut_frame(tick) else {
+            return;
+        };
+        if !sending {
+            return;
+        }
+        self.app
+            .world_mut()
+            .resource_mut::<bevy_ecs::message::Messages<PublishFrame>>()
+            .write(PublishFrame {
+                frame: authored.frame,
+                transitions: authored.transitions,
+            });
+    }
+
+    /// Drain the witness signals this bot raised this tick.
+    pub fn drain_signals(&mut self) {
+        let Some(mut messages) = self
+            .app
+            .world_mut()
+            .get_resource_mut::<bevy_ecs::message::Messages<Witnessed>>()
+        else {
+            return;
+        };
+        for witnessed in messages.drain() {
+            match witnessed.signal {
+                WitnessSignal::Gap(_) => self.signals.gaps += 1,
+                WitnessSignal::InvariantBreach { .. } => self.signals.invariant_breaches += 1,
+                WitnessSignal::ClaimMismatch { .. } => self.signals.claim_mismatches += 1,
+                WitnessSignal::Report(_) => self.signals.reports += 1,
+            }
+        }
+    }
+
+    /// This bot's current core state, for seeding a watcher's anchor.
+    #[must_use]
+    pub fn state(&self) -> Body {
+        self.executor.state(self.entity).expect("seeded").clone()
+    }
+
+    /// The entity this bot authors.
+    #[must_use]
+    pub fn entity(&self) -> PersistId {
+        self.entity
     }
 
     /// Where this peer's inbound state packets went.

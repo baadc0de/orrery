@@ -139,6 +139,17 @@ pub struct Observation<'a, S> {
 /// One watched entity's running state.
 struct Watched<S> {
     subject: NodeId,
+    /// Tick of the claim this watch was anchored at — the earliest point a
+    /// repair could usefully start from.
+    anchor_tick: u64,
+    /// The tick a repair was last asked for, if one is outstanding.
+    ///
+    /// Without this a witness re-asks on *every* frame that fails to chain, and
+    /// live frames keep arriving throughout the catch-up: one hitch turns into
+    /// hundreds of overlapping requests, each making the authority scan and
+    /// re-serialise its retained window. A swarm with stalling peers ran
+    /// seventy times slower than one without, entirely here.
+    repair_pending: Option<u64>,
     head: ChainHash,
     /// Whether `head` reflects a verified fold, or is still the value a claim
     /// seeded. Until the first frame lands there is nothing to detect a gap
@@ -164,6 +175,8 @@ pub struct Witness<R: Ruleset> {
     /// was actually received rather than re-requested.
     log: AuthorityLog,
     counters: WitnessCounters,
+    /// Newest tick at which retention was last enforced.
+    last_pruned: u64,
 }
 
 /// A request to start watching an entity.
@@ -180,6 +193,20 @@ pub struct Watch<S> {
 }
 
 impl<R: Ruleset> Witness<R> {
+    /// Ticks of progress between retention sweeps.
+    ///
+    /// A quarter of the default 600-tick window: often enough that the window
+    /// never grows much past its nominal size, rare enough that the sweep is
+    /// amortised across hundreds of ingests.
+    const PRUNE_EVERY: u64 = 150;
+
+    /// Ticks of the subject's timeline before an unanswered repair is re-asked.
+    ///
+    /// Long enough that a multi-datagram refill completes without a second
+    /// request piling on, short enough that a genuinely lost repair is retried
+    /// well inside the 180-tick adjudication window.
+    const REPAIR_TIMEOUT_TICKS: u64 = 60;
+
     /// A witness that builds a fresh `Ruleset` whenever it needs one.
     ///
     /// A factory rather than a value because re-executing a window needs its
@@ -198,6 +225,7 @@ impl<R: Ruleset> Witness<R> {
             executor: Executor::new(ruleset_factory(), seed),
             watched: BTreeMap::new(),
             log: AuthorityLog::default(),
+            last_pruned: 0,
             counters: WitnessCounters::default(),
         }
     }
@@ -240,6 +268,8 @@ impl<R: Ruleset> Witness<R> {
             watch.entity,
             Watched {
                 subject: watch.subject,
+                anchor_tick: watch.anchor.tick.0,
+                repair_pending: None,
                 head: watch.anchor.input_head,
                 anchored: false,
                 last_sample: None,
@@ -365,11 +395,41 @@ impl<R: Ruleset> Witness<R> {
         // truncated heads precisely so a receiver can notice a hole cheaply.
         if let Some(slice) = frame.entities.iter().find(|slice| slice.entity == entity) {
             if anchored && slice.prev_head != expected_head.rolling() {
+                // One outstanding repair at a time. A frame arriving mid-repair
+                // still fails to chain — that is what "mid-repair" means — and
+                // asking again for the same hole achieves nothing but load. The
+                // request is re-issued only once `REPAIR_TIMEOUT_TICKS` of the
+                // subject's own timeline have passed without the hole closing,
+                // which is what keeps a *lost* repair from stalling the witness
+                // forever.
+                if let Some(asked_at) = watched.repair_pending {
+                    if frame.first_tick.0 < asked_at + Self::REPAIR_TIMEOUT_TICKS {
+                        return Ok(Vec::new());
+                    }
+                }
                 self.counters.gaps_detected += 1;
+                // Ask from where this witness actually stopped, not from the
+                // beginning of history. `from_tick: 0` looks harmless because
+                // retention bounds the answer, but it makes *every* repair a
+                // full-history request: the authority then scans and measures
+                // its whole retained window, the response is truncated to one
+                // datagram, and the requester asks again — so a peer that
+                // hitches once drags its witnesses through the entire window
+                // repeatedly. A swarm with stalling peers took three orders of
+                // magnitude longer than one without because of this line.
+                let resume = watched
+                    .computed
+                    .keys()
+                    .next_back()
+                    .map_or(watched.anchor_tick, |tick| tick + 1);
+                let asked_at = frame.first_tick.0;
+                if let Some(watched) = self.watched.get_mut(&entity) {
+                    watched.repair_pending = Some(asked_at);
+                }
                 return Ok(vec![WitnessSignal::Gap(LogRangeRequest {
                     entity,
                     chain_epoch: slice.chain_epoch,
-                    from_tick: Tick::new(0),
+                    from_tick: Tick::new(resume.min(frame.first_tick.0)),
                     to_tick: frame.first_tick,
                 })]);
             }
@@ -442,6 +502,9 @@ impl<R: Ruleset> Witness<R> {
                 if transition.entity == entity {
                     watched.head = transition.head;
                     watched.anchored = true;
+                    // The chain moved, so whatever hole was being repaired is
+                    // closed as far as this witness can tell.
+                    watched.repair_pending = None;
                 }
             }
         }
@@ -451,7 +514,48 @@ impl<R: Ruleset> Witness<R> {
         if let Some(signal) = self.check_pending_claims(entity) {
             signals.push(signal);
         }
+
+        let last_tick = frame.first_tick.0 + u64::from(frame.tick_count).saturating_sub(1);
+        self.prune_if_due(Tick::new(last_tick));
         Ok(signals)
+    }
+
+    /// Drop history older than the retention window.
+    ///
+    /// **Not an optimisation.** Without it a witness accumulates one state hash
+    /// per tick per watched entity for as long as it watches — and
+    /// [`Self::check_pending_claims`] rescans the retained claims on every
+    /// ingest, so the cost is quadratic in session length as well as unbounded
+    /// in memory. A 32-peer swarm watching seven neighbours each stalled inside
+    /// two simulated minutes before this existed.
+    ///
+    /// The window is the log's own retention (docs/06 §6: floor is the 180-tick
+    /// adjudication window, default 600). Anything older cannot be assembled
+    /// into a bundle, so keeping it buys nothing but a slower scan.
+    /// Prune at most once per [`Self::PRUNE_EVERY`] ticks of progress.
+    ///
+    /// Pruning walks the retained frames, so doing it on every ingest is itself
+    /// quadratic — a witness watching seven peers ingests hundreds of frames a
+    /// second and each one would rescan the whole window. Amortising keeps the
+    /// window bounded without paying for the bound continuously.
+    fn prune_if_due(&mut self, now: Tick) {
+        if now.0 < self.last_pruned.saturating_add(Self::PRUNE_EVERY) {
+            return;
+        }
+        self.last_pruned = now.0;
+        self.prune(now);
+    }
+
+    fn prune(&mut self, now: Tick) {
+        let floor = now.0.saturating_sub(self.log.retention().effective_ticks());
+        self.log.prune(now);
+        for watched in self.watched.values_mut() {
+            watched.computed.retain(|tick, _| *tick >= floor);
+            // One claim below the floor is kept: a claim at tick T is compared
+            // against the hash for T-1, so evicting on the same boundary as the
+            // hashes would drop the comparison a surviving claim still needs.
+            watched.claims.retain(|tick, _| *tick + 1 >= floor);
+        }
     }
 
     /// Ingest a signed claim and compare it against what re-execution produced.
