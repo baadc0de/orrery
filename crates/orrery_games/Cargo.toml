@@ -1,0 +1,22 @@
+[package]
+name = "orrery_games"
+version = "0.1.0"
+edition = "2021"
+description = "Orrery's reference games: complete Ruleset implementations the trust apparatus is measured against, plus the deterministic harness that plays, replays and adjudicates them (docs/11-roadmap.md §P4)"
+license = "MIT OR Apache-2.0"
+
+# Bevy-free and headless, like `orrery_core` and `orrery_conformance`. A
+# reference game is built identically on every target in the determinism
+# matrix, so it takes no dependency that could differ between them: no tokio,
+# no OS services, no clock.
+[dependencies]
+orrery_core = { path = "../orrery_core" }
+orrery_protocol = { path = "../orrery_protocol" }
+# VC-6: continuous math goes through libm, never std transcendentals.
+libm = "0.2"
+# The harness's pilot and its sample-loss model are seeded ChaCha8 — harness
+# code, not core rules, but deterministic for the same reason.
+rand_chacha = "0.9"
+rand_core = "0.9"
+# The chain digest over per-tick state hashes.
+blake3 = "1.8"

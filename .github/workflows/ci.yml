@@ -233,10 +233,18 @@ jobs:
           key: det-${{ matrix.label }}-${{ hashFiles('Cargo.toml', 'crates/*/Cargo.toml', 'vendor/*/Cargo.toml', 'rust-toolchain.toml') }}
           restore-keys: det-${{ matrix.label }}-
 
-      # The headless spine only: orrery_conformance depends on orrery_core and
-      # orrery_protocol and nothing else, so the whole matrix stays cheap on
-      # every platform. These are also the crates that *must* be portable —
-      # producing identical bytes everywhere is the core's entire claim.
+      # The headless spine only: orrery_conformance and orrery_games depend on
+      # orrery_core and orrery_protocol and nothing else, so the whole matrix
+      # stays cheap on every platform. These are also the crates that *must* be
+      # portable — producing identical bytes everywhere is the core's entire
+      # claim.
+      #
+      # orrery_games is here for the same reason orrery_conformance is, one
+      # level up: its committed golden chains (crates/orrery_games/src/golden.rs)
+      # are checked inside the ordinary test suite, so each target compares the
+      # reference game's own per-tick hashes against the same bytes. That is
+      # what makes "the reference game is deterministic across platforms" a
+      # per-commit fact rather than an inference from the corpus kernel.
       #
       # orrery_witness is deliberately not here. It enables Bevy by default now
       # (`bevy` is in its default features, pulling bevy_app/bevy_ecs/orrery_net
@@ -245,7 +253,7 @@ jobs:
       # on the Linux ones — for a crate whose portability is not what this
       # matrix asserts. It is covered by the `workspace tests` job instead.
       - name: Test the headless spine
-        run: cargo test -p orrery_core -p orrery_protocol -p orrery_conformance
+        run: cargo test -p orrery_core -p orrery_protocol -p orrery_conformance -p orrery_games
 
       # Emits this platform's report. The `check` inside the test above already
       # compared against the committed golden; this artifact is what makes a

@@ -135,6 +135,22 @@ cargo run -p orrery_conformance -- emit --out crates/orrery_conformance/corpus/g
 Regenerating without bumping the version hides a rules change as a determinism
 pass, which is the one failure this whole apparatus exists to prevent.
 
+`orrery_games` — the reference games P4 measures against — rides the same
+matrix and carries the same obligation. Its golden chains live in
+`crates/orrery_games/src/golden.rs`, one per scenario per game, and every
+target checks them inside the ordinary test suite. **If you change a game's
+rules, its pilot, its spawns or its scenario table, bump that game's
+`RulesetId` version and regenerate:**
+
+```sh
+cargo test -p orrery_games --test battery -- --ignored --nocapture emit_goldens
+cargo fmt -p orrery_games
+```
+
+`scripts/core-gates.sh` scans `orrery_games` alongside `orrery_core` — the
+determinism rules are about the rules code, so a `HashMap` or a
+`SystemTime::now` inside a `Ruleset` fails the same gate it would in the core.
+
 **`sccache` is cleared on runners.** `.cargo/config.toml` sets
 `build.rustc-wrapper = "sccache"` for local worktrees; the workflows set
 `RUSTC_WRAPPER: ""` because runners are ephemeral and have no sccache.
