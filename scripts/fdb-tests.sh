@@ -69,8 +69,16 @@ die() { echo "::error::$*" >&2; exit 1; }
 
 # ── Assertions over a captured log ───────────────────────────────────────────
 check_log() {
-  local log="$1"
-  [[ -r "$log" ]] || die "no test log at $log"
+  local raw="$1" log
+  [[ -r "$raw" ]] || die "no test log at $raw"
+
+  # The workflows set `CARGO_TERM_COLOR: always`, which survives a pipe and
+  # would put escape sequences through the middle of every line these
+  # assertions read. The run below asks for `never`; this strips them anyway,
+  # so `--check` works on a log captured by anything.
+  log="$(mktemp)"
+  trap 'rm -f "$log"' RETURN
+  sed -e 's/\x1b\[[0-9;]*m//g' "$raw" > "$log"
 
   # 1. Skips. Anything that announced itself as skipped means the cluster was
   #    not there, and a suite that did not run is not a suite that passed.
@@ -125,9 +133,9 @@ check_log() {
 # ── Self-test ────────────────────────────────────────────────────────────────
 #
 # The same idiom as the P2 and P3 gates: prove the assertions still assert,
-# per-commit, on a runner with no cluster anywhere near it. Four synthetic logs
-# — the shape libtest and cargo actually emit — one for each way the tier can
-# go dark.
+# per-commit, on a runner with no cluster anywhere near it. Five synthetic logs
+# in the shape cargo and libtest actually emit — one healthy, one healthy but
+# colourised, and one for each way the tier can go dark.
 self_test() {
   local tmp fixture rc failures=0
   tmp="$(mktemp -d)"
@@ -166,6 +174,11 @@ self_test() {
 
   # 7 targets × 32 + 120 unit tests = 344, over the 320 floor.
   fixture="$tmp/good.log";    emit_log "$fixture" none 32;            expect "a real run passes" pass "$fixture"
+  # The same log with `CARGO_TERM_COLOR=always` escapes through it.
+  sed -e 's/^     Running/     \x1b[1;32mRunning\x1b[0m/' \
+      -e 's/result: ok\./result: \x1b[32mok\x1b[0m./' "$tmp/good.log" > "$tmp/colour.log"
+  expect "a colourised run still parses" pass "$tmp/colour.log"
+
   fixture="$tmp/skipped.log"; emit_log "$fixture" skip 32;            expect "a skipped run is red" fail "$fixture"
   fixture="$tmp/thin.log";    emit_log "$fixture" none 1;             expect "a run under the floor is red" fail "$fixture"
   # 40 apiece so the six remaining targets still clear the floor: this case has
@@ -173,7 +186,7 @@ self_test() {
   fixture="$tmp/absent.log";  emit_log "$fixture" none 40 fence_split; expect "a missing fdb target is red" fail "$fixture"
 
   (( failures == 0 )) || die "$failures self-test case(s) failed"
-  echo "fdb-tests self-test: 4/4"
+  echo "fdb-tests self-test: 5/5"
 }
 
 # ── Entry ────────────────────────────────────────────────────────────────────
@@ -217,6 +230,8 @@ mkdir -p "$(dirname "$LOG")"
 set +e
 (
   cd "$ROOT"
+  # The workflows force colour on; a log that has to be parsed does not want it.
+  CARGO_TERM_COLOR=never \
   cargo test -p orrery_persistd -p orrery_seed \
     --features orrery_persistd/fdb,orrery_seed/fdb \
     -- --nocapture
