@@ -170,9 +170,12 @@ cell subscribers, redistribution across sibling gateways, and field-host
 promotion (P6). The Bevy coordinator client in `orrery_net` landed with P1:
 `orrery_net::coordinator` drives `IslandMembership` from coordinator manifests,
 with the connected-peer derivation retained only as the no-coordinator
-fallback. What is still missing there is one wire: `IslandMembership` does not
-yet feed `orrery_authority::IslandBinding`, which is where the ephemeral
-namespace and the in-island tiebreak read the island id and manifest epoch.
+fallback. The last wire landed with the `orrery` facade: its
+`bind_island_membership` mirrors `IslandMembership` into
+`orrery_authority::IslandBinding`, where the ephemeral namespace and the
+in-island tiebreak read the island id and manifest epoch. Before it, nothing
+outside a unit test wrote that binding, so `EphemeralRegistry::spawn` bailed
+on its first line in every real app.
 
 **Crates.** `orrery_coordinator` ships the `orrery-coordinator` service:
 authenticated presence in, island manifests and signed interest grants out,

@@ -246,11 +246,11 @@ The missing ecosystem piece (verified [absent from crates.io as of Aug 2026](htt
 
 ```rust
 /// Registers the iroh IO layer with aeronet_io. One endpoint per app.
-pub struct OrreryTransportPlugin {
-    pub secret_key: iroh::SecretKey,     // this process's NodeId (D3)
-    pub relays: RelayMode,               // SelfHosted(RelayMap) | Custom | Disabled
-    pub runtime: RuntimeHandle,          // shared tokio runtime, or Owned
-}
+/// Landed as `aeronet_iroh::IrohPlugin`, and it carries no configuration:
+/// `orrery_net::OrreryNetPlugin` adds it and assembles the endpoint builder
+/// from `NetConfig` (relay mode, optional secret key) in its Startup system,
+/// with the tokio runtime in the `IrohRuntime` resource.
+pub struct IrohPlugin;
 
 #[derive(Component)] pub struct IrohEndpoint { /* wraps iroh::Endpoint */ }
 #[derive(Component)] pub struct IrohSessionIo;   // marker on aeronet session entities
@@ -265,7 +265,7 @@ pub enum PathKind { Direct, Relayed { relay: RelayUrl } }
 
 ### 4. `orrery_net` — session lifecycle
 
-Owns everything about being *on the network* that is not replication: bootstrapping the endpoint via `OrreryTransportPlugin`, authenticating with `orrery_identity`, the coordinator client, island membership, peer connect/disconnect tracking, channel policy (datagrams = state, streams = control/bulk — D3), and relay-path telemetry aggregation. Enforces the ≤ 1 Mbps peer upload budget (D16) as the input to the priority accumulator configured by `orrery_predict`.
+Owns everything about being *on the network* that is not replication: bootstrapping the endpoint via aeronet's `IrohPlugin`, which it adds itself, authenticating with `orrery_identity`, the coordinator client, island membership, peer connect/disconnect tracking, channel policy (datagrams = state, streams = control/bulk — D3), and relay-path telemetry aggregation. Enforces the ≤ 1 Mbps peer upload budget (D16) as the input to the priority accumulator configured by `orrery_predict`.
 
 **Features:** `otel` (span + metric export).
 
@@ -466,7 +466,7 @@ impl AreaLoader<'_, '_> {
 
 ### 10. `orrery` — client facade
 
-Re-exports the six client plugins, defines `OrreryClientPlugins<R: Ruleset>` (a Bevy `PluginGroup` in dependency order: transport → net → spatial → authority → predict → witness → persist_client) and `OrreryConfig` aggregating the per-plugin configs. Games depend on this one crate for the client side; individual plugins remain overridable through the standard `PluginGroupBuilder` (`.set(…)`, `.disable::<…>()`).
+Landed. Defines `OrreryClientPlugins<R: Ruleset>` — a Bevy `PluginGroup` in dependency order: net → spatial → authority → *island binding* → predict → witness → persist_client — and `OrreryConfig` aggregating the per-plugin configs. There is no separate transport plugin: `OrreryNetPlugin` adds aeronet's `IrohPlugin` itself. The island-binding member is the facade's own one system, mirroring `orrery_net::IslandMembership` into `orrery_authority::IslandBinding` — the wire crosses two crates neither of which may depend on the other. `AoiVisibilityPlugin` is deliberately **not** a member: it is built out of replicon's registries and panics unless `RepliconPlugins` was added first, so a game adds it after its own replication setup. Games depend on this one crate for the client side; individual plugins remain overridable through the standard `PluginGroupBuilder` (`.set(…)`, `.disable::<…>()`).
 
 ### 11. `orrery_persistd` — persistence cluster harness
 
@@ -633,10 +633,10 @@ Contributions upstream are the mitigation for single-maintainer bus factor (D17.
 
 - **Feature unification vs. wire format.** `u128-cells` changes `CellId`'s width and therefore every key and message containing one. Cargo feature unification could silently enable it workspace-wide from one stray dependency edge. Mitigation: the feature set is folded into `RULES_DIGEST` and `PROTOCOL_VERSION` negotiation — mixed builds refuse to connect rather than corrupt keyspaces. `hilbert` is safe: storage-side only, never on the wire (D5).
 - **Rules/protocol skew.** Cluster deploys before clients (N/N−1 protocol acceptance) but `RULES_DIGEST` is exact: during a game hotfix window, old clients are refused at the gateway with an update-required error rather than adjudicated against different rules. Intents queued offline under an old digest are replayed through `Ruleset::validate_intent` on the new build — idempotency via `intent_id`, rejection is normal and surfaced to the player.
-- **Tokio-in-Bevy boundary.** iroh is tokio-based; `OrreryTransportPlugin` owns (or borrows via `RuntimeHandle`) a single shared runtime so games embedding their own tokio don't end up with two. Bevy-free services are plain tokio binaries and never touch this seam.
+- **Tokio-in-Bevy boundary.** iroh is tokio-based; `OrreryNetPlugin` owns the single shared runtime (the `IrohRuntime` resource `aeronet_iroh` reads) so games embedding their own tokio don't end up with two. Bevy-free services are plain tokio binaries and never touch this seam.
 - **Upstream breaking release mid-cycle.** Exact pins mean a lightyear/replicon/aeronet release can never break a build; the cost is deliberate upgrade work each Orrery minor. If an upstream *security* fix forces an off-cycle bump, layering rules 3–4 bound which crates can be affected.
 - **Cyclic-dependency pressure.** The witness→persist_client submission path is the recurring temptation; the event-type decoupling (rule 5) is load-bearing. New cross-plugin flows must route through `orrery_protocol` types or move down a layer.
-- **Facade drift.** `OrreryClientPlugins` must keep plugin registration order = dependency order (transport before net before spatial…); a CI test builds a headless `App` with the group and asserts each plugin's required resources exist.
+- **Facade drift.** `OrreryClientPlugins` must keep plugin registration order = dependency order (net before spatial before authority…); `crates/orrery/tests/client_group.rs` builds a headless `App` with the group and asserts both — each member plugin's resources exist, and the members build in the declared order (observed by probe plugins inserted with `add_before`, since `PluginGroupBuilder` keeps its order private).
 
 ## See also
 
