@@ -144,11 +144,27 @@ registrar's divest request with D7's per-tier deadline rules; and
 `PLAYER_BOUND` is enforced rather than merely declared. **The demo criterion
 runs and holds** — see below.
 
-Remaining P3 follow-on: the Bevy coordinator client in `orrery_net` (island
-membership there is still derived from the connected-peer stand-in rather than
-from manifests), coordinator-driven island drain, `Expire` fan-out to cell
-subscribers, contact-island propagation, redistribution across sibling
-gateways, ephemeral in-island claims, and field-host promotion.
+The client-side halves of D7 have since landed too. **Contact-island
+propagation** is a planner in `orrery_authority`: a breadth-first walk of each
+tick's contact graph from every body the peer writes, batched under D7's
+64-per-tick cap and spent against a client-side copy of the §10 claim bucket
+(the cap alone is 3840 claims/s at 60 Hz against a 20/s bucket, so treating it
+as a budget rate-limits an honest pile collapse into the strike telemetry),
+stopped at strong-owned bodies, pre-filtered by the peer's own interest
+coverage, and backed off per entity after a `Deny`. **Ephemeral in-island
+claims** give projectiles and VFX a spawner-partitioned island-scoped identity,
+initial authority by construction, and transfer by a single broadcast resolved
+under D7 §4.4's total order — with a write marker distinct from the persistence
+one, so no ephemeral path can uplink.
+
+Remaining P3 follow-on: coordinator-driven island drain, `Expire` fan-out to
+cell subscribers, redistribution across sibling gateways, and field-host
+promotion (P6). The Bevy coordinator client in `orrery_net` landed with P1:
+`orrery_net::coordinator` drives `IslandMembership` from coordinator manifests,
+with the connected-peer derivation retained only as the no-coordinator
+fallback. What is still missing there is one wire: `IslandMembership` does not
+yet feed `orrery_authority::IslandBinding`, which is where the ephemeral
+namespace and the in-island tiebreak read the island id and manifest epoch.
 
 **Crates.** `orrery_coordinator` ships the `orrery-coordinator` service:
 authenticated presence in, island manifests and signed interest grants out,
@@ -156,8 +172,9 @@ Bevy-free over iroh (docs/10-crates.md §6). `orrery_authority` implements
 optimistic weak/strong claims,
 `auth_seq`/`own_seq`, correlation-safe lease control, inherited grants
 (`ClaimId::REGISTRAR` → `AuthorityEvent::Inherited`), holder-initiated
-`LeaseClient::divest`, and loss-of-authority reconciliation; contact-island
-propagation remains follow-on. `orrery_persistd` implements the actor-owned
+`LeaseClient::divest`, loss-of-authority reconciliation, the contact-island
+propagation planner, and the registrar-free ephemeral path (`IslandClient`,
+`EphemeralRegistry`, `IslandAuthoritative`). `orrery_persistd` implements the actor-owned
 lease registrar, strict gateway fencing, committed rekey, the `SuccessorPolicy`
 seam with its coordinator-interest-ranked default, and `AuthorityMetrics`.
 `orrery_predict` and `orrery_coordinator` retain their P1/P4 scaffolding;

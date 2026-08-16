@@ -30,10 +30,20 @@ Normative source: [ADR-0007](adr/0007-authority-and-leases.md) (boundaries with 
 > operable outside tests. `PLAYER_BOUND` is enforced: a character parks and is
 > reclaimable only by the identity in `Lease::bound_to`.
 >
+> The two client-side halves of the model now exist as well.
+> **Contact-island propagation** (§5) is a planner in `orrery_authority`:
+> a breadth-first walk of the tick's contact graph from every body this peer
+> writes, batched under the 64-per-tick cap, spent against a client-side copy of
+> §10's claim bucket, stopped at strong-owned bodies, pre-filtered by the peer's
+> own interest coverage, and backed off per-entity after a `Deny`. **Ephemeral
+> entities** (§6) have an island-scoped identity partitioned by spawner, an
+> in-island claim resolved by the §4.4 total order with no arbiter, and a
+> *separate* write marker from the persistence one, so no ephemeral path can
+> uplink.
+>
 > Still deferred: coordinator-driven island drain, `Expire` fan-out to cell
-> subscribers, contact-island propagation, redistribution across sibling
-> gateways, and field-host promotion. The design flows below describe those
-> future capabilities as well.
+> subscribers, redistribution across sibling gateways, and field-host
+> promotion. The design flows below describe those future capabilities as well.
 
 ## 1. The two-tier model
 
@@ -303,6 +313,39 @@ For contested physics per §D13: when a body under peer P's authority contacts a
 - **Quantize both sides** (§D8): the writer quantizes replicated physics state *before* integrating each step, readers apply the same quantization, so both sides idle at bit-identical resting states. Without this, resting jitter re-dirties bodies, keeps contact islands "live," and generates a permanent trickle of claim churn and delta traffic.
 - Weak authority naturally decays: when a body sleeps and its holder leaves the neighborhood, the holder divests (`Divest{to: None}` on cell-exit) and the entity parks.
 
+**As implemented.** `orrery_authority::contact` is a *planner*, not a loop over
+contacts, and the reason is arithmetic. The batch cap is 64 entities per tick;
+at the 60 Hz sim tick of §D16 that is 3840 claims/s against §10's bucket of
+**20/s sustained, burst 64**. A peer that emitted its permitted batch every tick
+would be rate-limited into `Deny{RateLimited}` within three ticks of a pile
+collapse and would then, because §10 feeds sustained bucket-camping into the
+D10 telemetry pipeline, look exactly like a griefer while playing the game as
+designed. So the per-tick cap is a *ceiling* and the token bucket is the
+*budget*: the client carries a copy of the registrar's bucket, spends against
+it, and defers the remainder **in contact order**, which acquires the pile
+progressively outwards from the point of contact — the same shape the physics
+has.
+
+The traversal is breadth-first from every body this peer already writes,
+following contacts in the order the solver reported them, so "contact order" is
+a definition rather than an accident, and two peers pushing one pile from
+opposite ends each expand from their own frontier and meet in the middle — the
+per-entity partition this section describes. Three filters drop claims that
+would have been refused anyway, each of which would otherwise cost a token:
+
+| Filter | Rule |
+|---|---|
+| Strong ownership | Traversal *stops* at a body another peer strong-owns (INV-5). This is where the frontier partition comes from. |
+| Plausibility gate | The peer reads its own coordinator grant and declines claims for cells outside it, rather than generating the §10 gate-failure telemetry. An absent or unparseable grant gates nothing: the gateway is the real arbiter, and a client that silently stopped claiming would be the worse failure. |
+| `Deny` back-off | 250 ms doubling to a 2 s cap, per entity, mirroring §10's own cooldown. A cooling body is *skipped*, not queued — a body still in contact is re-proposed by the next tick's solver output, so a retry queue would only duplicate what physics already reports. |
+
+A body with a claim already in flight is traversed *through* but not re-claimed:
+that is what optimism means here. Ephemeral bodies (§6) participate in the same
+traversal — a projectile is exactly a body entering its target's contact island
+— but their claims resolve in-island and are therefore **not** charged to the
+registrar's bucket, only to the per-tick cap, which is a wire-traffic limit as
+much as a registrar one.
+
 ## 6. Ephemeral entities
 
 Projectiles, VFX, debris, and other non-persistent spawns never touch the registrar. Authority is the spawner's, in-island, by construction (Fusion's spawner-gets-initial-authority rule); IDs come from an island-scoped namespace; transfer, if ever needed, is an in-island claim under the same seq-pair comparison with no `Grant` round-trip. If an ephemeral entity causes a durable consequence (a rocket destroys a placed structure), the *consequence* travels the witness-attested intent path (§D11) — the projectile itself is never persisted.
@@ -316,7 +359,46 @@ A dumb projectile (cannon shell, torpedo) is the canonical ephemeral entity:
 3. **Impact.** Contact with the target transfers weak authority to the target's peer (§5). The target's authority validates the impact against its pose ring (§D8), applies damage, and replicates the result.
 4. **Durable consequence.** If the projectile destroys a placed structure, the *consequence* travels the witness-attested intent path (§D11) — the projectile itself is never persisted.
 
-A guided missile adds one wrinkle: mid-flight authority transfer. When the missile enters the target's contact island (proximity threshold, ruleset-defined), the target's peer files a weak claim. The registrar grants it (higher `auth_seq` wins). From that point, the target's authority simulates the terminal phase — evasion, countermeasure interaction, impact. The shooter retains *attribution* (kill credit) but loses *simulation authority*.
+A guided missile adds one wrinkle: mid-flight authority transfer. When the missile enters the target's contact island (proximity threshold, ruleset-defined), the target's peer files an **in-island** weak claim — not a registrar one; the missile is ephemeral, and the higher `auth_seq` is what wins, arbitrated by every peer independently rather than by the cluster. From that point, the target's authority simulates the terminal phase — evasion, countermeasure interaction, impact. The shooter retains *attribution* (kill credit) but loses *simulation authority*.
+
+### 6.2 As implemented
+
+`orrery_authority::ephemeral` replaces arbitration with construction at three
+points, because there is nothing to ask:
+
+- **Identity.** `EphemeralId = (island, spawner NodeId, spawner-monotonic seq)`.
+  The namespace is *partitioned* by spawner rather than allocated centrally, so
+  minting is a local increment — no allocator, no round trip, and it works
+  unchanged in the §4.4 degraded mode where there is no cluster at all. Two
+  peers cannot collide by construction, which is why an island merge needs no
+  renumbering pass; `island` is carried so an id is self-describing about the
+  namespace it came from, not because uniqueness depends on it. A peer with no
+  island assignment refuses to mint: an ambiguous id is worse than no spawn.
+- **Initial authority.** The spawner's, and *no message is sent* — a spawn is
+  not a transfer, and peers learn it from the replicated entity itself.
+- **Transfer.** One broadcast `IslandClaim{entity, claimant, seq, tick, epoch}`,
+  no reply, applied locally *before* it leaves. With no arbiter the comparison
+  has to be a total order, so it reuses §4.4's verbatim: `SeqPair` first
+  (INV-3/INV-4), then the *earlier* `tick` — at equal sequence both claimants
+  incremented from the same base, so neither had seen the other, and the
+  interaction that happened first is the one every peer agrees happened first —
+  then lowest `blake3(entity ‖ tick ‖ claimant ‖ island epoch)`. Raw
+  lowest-`NodeId` is deliberately not the rule: NodeIds are self-generated
+  keypairs, so an attacker could grind one that wins every contest offline. The
+  manifest epoch travels *inside* the claim rather than being read locally, so
+  peers holding different manifests still compute the same digest for the same
+  claim.
+
+The rule that ephemeral state is never persisted is enforced by the type system
+rather than by discipline: an ephemeral entity carries `IslandAuthoritative`,
+never `LocallyAuthoritative`, and persistence uplinks key off the latter. The
+two claim paths likewise have separate outboxes and separate client interfaces
+(`IslandClient` vs `LeaseClient`), so no ephemeral claim has a route into
+gateway traffic.
+
+The island id and manifest epoch reach this crate through an `IslandBinding`
+resource that the transport layer pushes on manifest application; authority is
+the lower layer and never reaches up into `orrery_net` for it.
 
 ## 7. Parked entities
 

@@ -8,6 +8,9 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod contact;
+pub mod ephemeral;
+
 use std::collections::BTreeMap;
 use std::time::Duration;
 
@@ -16,8 +19,19 @@ use bevy_ecs::prelude::*;
 use bevy_ecs::system::SystemParam;
 use bevy_platform::time::Instant;
 use orrery_protocol::{
-    ClaimBasis, ClaimId, ClaimKind, DenyReason, ExpireDisposition, GridId, LeaseId, LeaseMsg,
-    NodeId, PersistId, SeqPair, Tick,
+    ClaimBasis, ClaimId, ClaimKind, DenyReason, ExpireDisposition, GridId, IslandId, LeaseId,
+    LeaseMsg, NodeId, PersistId, SeqPair, Tick,
+};
+
+pub use contact::{
+    propagate_contact_islands, ContactBody, ContactBurst, ContactClaim, ContactNode,
+    ContactObservations, ContactPropagator, ContactStatus, ContactTick, InterestCoverage,
+    CONTACT_BATCH_CAP,
+};
+pub use ephemeral::{
+    process_island_claims, Ephemeral, EphemeralId, EphemeralOutcome, EphemeralRegistry,
+    IslandAuthoritative, IslandAuthorityEvent, IslandClaim, IslandClient, IslandInbox,
+    IslandOutbox,
 };
 
 /// Registrar TTL from D7/D16, in milliseconds.
@@ -611,6 +625,42 @@ pub fn maintain_leases(
     let _ = phases; // keeps the system extensible without reading world state on the hot path.
 }
 
+/// The island this peer belongs to, as the coordinator most recently said.
+///
+/// Kept here rather than read from `orrery_net::IslandMembership` because
+/// authority is the lower layer: the ephemeral namespace and the in-island
+/// tiebreak both need the island id and the manifest epoch, and neither may
+/// depend on the transport crate that happens to receive the manifest. The
+/// net layer pushes; this crate never pulls.
+#[derive(Debug, Default, Resource)]
+pub struct IslandBinding {
+    /// The island this peer belongs to, if the coordinator has assigned one.
+    pub island: Option<IslandId>,
+    /// The manifest epoch that assignment came from.
+    pub epoch: u32,
+}
+
+/// Mirror the current island binding into the ephemeral registry.
+///
+/// Runs unconditionally rather than on change detection: the registry is the
+/// only thing that mints ephemeral ids, and a peer that spawned a projectile
+/// into a stale namespace would be minting ids nobody else recognises.
+pub fn track_island_binding(
+    binding: Res<IslandBinding>,
+    state: Res<AuthorityState>,
+    mut registry: ResMut<ephemeral::EphemeralRegistry>,
+) {
+    if binding.is_changed() {
+        registry.set_island(binding.island, binding.epoch);
+    }
+    // Compared rather than change-detected: `advance_lease_clock` writes
+    // `AuthorityState` every frame, so its change flag says nothing about the
+    // identity, and re-stamping it would dirty the registry every frame.
+    if registry.node() != state.node {
+        registry.set_node(state.node);
+    }
+}
+
 /// Persistent identity component owned by authority. `orrery_persist_client`
 /// retains its legacy wrapper and maps it during migration.
 #[derive(Debug, Clone, Copy, Component)]
@@ -624,12 +674,36 @@ impl Plugin for OrreryAuthorityPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<AuthorityState>()
             .init_resource::<InterestGrant>()
+            .init_resource::<IslandBinding>()
             .init_resource::<LeaseInbox>()
             .init_resource::<LeaseOutbox>()
+            .init_resource::<contact::ContactObservations>()
+            .init_resource::<contact::ContactPropagator>()
+            .init_resource::<contact::ContactTick>()
+            .init_resource::<contact::InterestCoverage>()
+            .init_resource::<ephemeral::EphemeralRegistry>()
+            .init_resource::<ephemeral::IslandInbox>()
+            .init_resource::<ephemeral::IslandOutbox>()
             .add_message::<AuthorityEvent>()
+            .add_message::<ephemeral::IslandAuthorityEvent>()
             .add_systems(
                 Update,
-                (advance_lease_clock, process_lease_replies, maintain_leases).chain(),
+                (
+                    advance_lease_clock,
+                    track_island_binding,
+                    // Replies first: a body granted or denied this frame must
+                    // be seen with its settled status before the propagator
+                    // decides whether to claim it again.
+                    process_lease_replies,
+                    ephemeral::process_island_claims,
+                    // Verdicts reach the planner's back-off state *before* it
+                    // plans, or a body refused this frame is re-claimed in the
+                    // same frame it was refused.
+                    contact::absorb_contact_denials,
+                    contact::propagate_contact_islands,
+                    maintain_leases,
+                )
+                    .chain(),
             );
     }
 }
