@@ -324,18 +324,30 @@ fn client_connects_hellos_and_uplinks_to_real_gateway() {
         }
     }
     wait_until(&mut app, |world| {
-        matches!(
-            world.get::<AuthorityPhase>(entity),
-            Some(AuthorityPhase::Remote)
-        )
+        !world
+            .resource::<UplinkScheduler>()
+            .has_pending(PersistId::new(1))
     });
 
-    // Then: the lease-bearing NACK revokes every local writer marker and never appends.
+    // Then: the write never appends — but the row the NACK carried names *this*
+    // peer, because the lease is still this peer's and only the token in the
+    // diff was stale. A row naming the holder it is answering is not a
+    // revocation, so the live grant survives; treating it as one would let a
+    // client revoke its own authority by mis-stamping one diff.
     assert!(app
         .world()
         .get::<orrery_authority::LocallyAuthoritative>(entity)
-        .is_none());
-    assert_eq!(app.world().resource::<UplinkScheduler>().len(), 0);
+        .is_some());
+    assert!(matches!(
+        app.world().get::<AuthorityPhase>(entity),
+        Some(AuthorityPhase::LocalGranted { lease_id: held, .. }) if *held == lease_id
+    ));
+    assert!(
+        !app.world()
+            .resource::<UplinkScheduler>()
+            .has_pending(PersistId::new(1)),
+        "the rejected diff is dropped rather than resent"
+    );
     assert_eq!(
         rt.block_on(async {
             runtime

@@ -33,8 +33,7 @@ orrery/
 │       ├── mygame_client/      # Bevy app composing OrreryClientPlugins
 │       ├── mygame_persistd/    # MyRules linked into the persistd harness
 │       └── mygame_field_host/  # MyRules + gameplay plugins on FieldHostPlugins
-├── deploy/                     # iroh-relay config, FDB manifests, otel collector
-└── xtask/                      # lockstep release tooling, wire-corpus compat tests
+└── deploy/                     # iroh-relay config, FDB manifests, otel collector
 ```
 
 The `orrery` facade is a fourteenth, purely compositional workspace member: it defines the `OrreryClientPlugins` plugin group named in D15 and a `prelude`. It contains no logic; a `PluginGroup` must live in a crate that depends on every member plugin, and none of the thirteen functional crates can do that without inverting the spine.
@@ -124,7 +123,7 @@ Layering rules (the first two are normative from D15; the rest are containment r
 
 Every serialized thing crosses this crate: `CellId`, intents, leases, attestations, evidence bundles, input-log records, coordinator/identity/gateway message enums, and the protocol version constant. It is engine-agnostic (glam for vector math, `iroh-base` for `NodeId`/signature types — no Bevy, no tokio) so servers, tools, and tests link it without an engine.
 
-**Features:** `postcard` (default encoding), `bitcode` (alternative, benchmarked per release), `u128-cells` (extended-range `CellId`, D5 — wire-incompatible, see [Edge cases](#edge-cases-and-failure-modes)), `hilbert` (storage-side Hilbert index via [lindel](https://crates.io/crates/lindel), D5).
+**Features:** `postcard` (default encoding), `bitcode` (alternative, benchmarked per release), `u128-cells` (extended-range `CellId`, D5 — wire-incompatible, see [Edge cases](#edge-cases-and-failure-modes)). `bitcode` and `u128-cells` are declared but inert: `channels.rs` encodes with postcard unconditionally, and no `cfg` site reads `u128-cells`. A storage-side `hilbert` index (D5) is designed but declared by no manifest.
 
 ```rust
 /// D5: offset-binary coords (21 bits/axis), Morton-interleaved into 63 bits,
@@ -613,7 +612,7 @@ fn main() {
 
 - **Lockstep versions.** All `orrery_*` crates (facade included) share one version and are released together, Bevy-style; pre-1.0, a minor bump is the breaking-change unit. `xtask release` bumps the workspace atomically and runs the wire-corpus tests.
 - **Pinned upstreams per release.** `[workspace.dependencies]` carries the D14 pin table; the churn-prone trio is pinned exactly — `lightyear = "=0.29.0"`, `bevy_replicon = "=0.42.1"`, `aeronet = "=0.21.0"` — because [lightyear shipped four breaking releases in ten months](https://github.com/cBournhonesque/lightyear/releases) (0.25→0.29: Predicted/Confirmed entity merge, timeline refactor, tick `u16`→`u32`). [iroh is semver-stable since 1.0](https://crates.io/crates/iroh) and gets a caret req. Upstream upgrades land only at Orrery minor releases, each with a migration note.
-- **Wire compatibility is decoupled from crate versions.** `orrery_protocol::PROTOCOL_VERSION` governs interop; services accept version N and N−1 so the cluster always deploys ahead of clients. A golden corpus of encoded messages in `xtask` guards decode compatibility across releases.
+- **Wire compatibility is decoupled from crate versions.** `orrery_protocol::PROTOCOL_VERSION` governs interop; services accept version N and N−1 so the cluster always deploys ahead of clients, enforced by `GatewayMsg::protocol_accepted` against the version a client names in `GatewayMsg::VersionedHello` — the unversioned `GatewayMsg::Hello` is still accepted unchecked, so enforcement is opt-in until that variant is retired. A byte-golden corpus of encoded messages guarding decode compatibility across releases is designed and unbuilt, deferred until the wire format settles.
 - **`RULES_DIGEST` is exact-match**, versioned by the game, orthogonal to both of the above.
 - **big_space exception:** until the 0.19 port is merged upstream (D14 tracked risk), the workspace pins a git revision of our port branch — the only non-crates.io dependency allowed.
 
@@ -631,7 +630,7 @@ Contributions upstream are the mitigation for single-maintainer bus factor (D17.
 
 ## Edge cases and failure modes
 
-- **Feature unification vs. wire format.** `u128-cells` changes `CellId`'s width and therefore every key and message containing one. Cargo feature unification could silently enable it workspace-wide from one stray dependency edge. Mitigation: the feature set is folded into `RULES_DIGEST` and `PROTOCOL_VERSION` negotiation — mixed builds refuse to connect rather than corrupt keyspaces. `hilbert` is safe: storage-side only, never on the wire (D5).
+- **Feature unification vs. wire format.** `u128-cells` would change `CellId`'s width and therefore every key and message containing one. Cargo feature unification could silently enable it workspace-wide from one stray dependency edge. The designed mitigation is to fold the feature set into `RULES_DIGEST` and `PROTOCOL_VERSION` negotiation, so mixed builds refuse to connect rather than corrupt keyspaces; that fold is unbuilt and the feature is inert (declared in `orrery_protocol/Cargo.toml`, read by no `cfg`), so the hazard is latent rather than mitigated. A storage-side `hilbert` index would be safe either way: never on the wire (D5).
 - **Rules/protocol skew.** Cluster deploys before clients (N/N−1 protocol acceptance) but `RULES_DIGEST` is exact: during a game hotfix window, old clients are refused at the gateway with an update-required error rather than adjudicated against different rules. Intents queued offline under an old digest are replayed through `Ruleset::validate_intent` on the new build — idempotency via `intent_id`, rejection is normal and surfaced to the player.
 - **Tokio-in-Bevy boundary.** iroh is tokio-based; `OrreryNetPlugin` owns the single shared runtime (the `IrohRuntime` resource `aeronet_iroh` reads) so games embedding their own tokio don't end up with two. Bevy-free services are plain tokio binaries and never touch this seam.
 - **Upstream breaking release mid-cycle.** Exact pins mean a lightyear/replicon/aeronet release can never break a build; the cost is deliberate upgrade work each Orrery minor. If an upstream *security* fix forces an off-cycle bump, layering rules 3–4 bound which crates can be affected.

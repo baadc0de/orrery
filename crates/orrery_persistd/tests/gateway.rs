@@ -3864,3 +3864,92 @@ fn a_holder_that_parks_instead_of_handing_over_still_answers_the_claimant() {
         fixture.server.shutdown().await;
     });
 }
+
+/// The version a refused [`GatewayMsg::VersionedHello`] came back with, or
+/// `None` if the gateway answered something else (an ack included).
+async fn hello_refusal(connection: &lanes::GatewayLanes) -> Option<(u16, u8)> {
+    match connection.next_payload(Duration::from_millis(250)).await {
+        Some(packet) => match decode_stream_frame(&packet) {
+            Some(GatewayReply::HelloRefused {
+                protocol, reason, ..
+            }) => Some((protocol, reason)),
+            _ => None,
+        },
+        None => None,
+    }
+}
+
+#[test]
+fn versioned_hello_is_accepted_across_the_rolling_window_and_refused_outside_it() {
+    // The gateway's own version is per-instance, so this drives all four cases
+    // against one server without touching `PROTOCOL_VERSION`.
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = Arc::new(Mutex::new({
+            let store: Arc<dyn orrery_persistd::checkpoint::CheckpointStore> =
+                Arc::new(orrery_persistd::checkpoint::MemCheckpointStore::new());
+            CellRuntime::open(&runtime_config(dir.path()), &store)
+                .await
+                .unwrap()
+        }));
+        let router: Arc<dyn Router> = runtime.clone();
+        let issuer = support::issuer();
+        let server = GatewayServer::spawn(
+            GatewayConfig {
+                protocol_version: 4,
+                ..support::authority_config(node(1), GridId::ROOT, vec![CellId::ROOT])
+            },
+            router,
+        )
+        .await
+        .unwrap();
+        let (_client, connection) = raw_connection(secret(1), server.addr()).await;
+
+        // V and V−1 are the rolling-upgrade window: a cluster deploys ahead of
+        // its clients, so the version below the gateway's own is accepted.
+        for version in [4u16, 3] {
+            connection
+                .send_control(&GatewayMsg::VersionedHello {
+                    token: session_token(&issuer, node(1), 900, 200),
+                    node: node(1),
+                    version,
+                })
+                .await;
+            assert!(
+                receives_hello_ack(&connection).await,
+                "version {version} is inside the window"
+            );
+        }
+
+        // Anything else is refused with a typed reply naming the gateway's own
+        // version, not dropped: silence here is indistinguishable from a slow
+        // gateway, and the client would re-offer the same version forever.
+        for version in [2u16, 5, 0] {
+            connection
+                .send_control(&GatewayMsg::VersionedHello {
+                    token: session_token(&issuer, node(1), 900, 200),
+                    node: node(1),
+                    version,
+                })
+                .await;
+            assert_eq!(
+                hello_refusal(&connection).await,
+                Some((4, GatewayReply::HELLO_REFUSED_PROTOCOL)),
+                "version {version} is outside the window"
+            );
+        }
+
+        // The unversioned bootstrap is still accepted unchecked, which is what
+        // makes enforcement opt-in until `GatewayMsg::Hello` is retired.
+        connection
+            .send_control(&GatewayMsg::Hello {
+                token: session_token(&issuer, node(1), 900, 200),
+                node: node(1),
+            })
+            .await;
+        assert!(receives_hello_ack(&connection).await);
+
+        server.shutdown().await;
+    });
+}
