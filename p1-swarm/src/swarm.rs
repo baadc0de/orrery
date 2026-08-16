@@ -90,6 +90,8 @@ pub struct PeerReport {
     pub repairs_overflowed: u64,
     /// Repair requests this peer could not answer from its retained log.
     pub repairs_unservable: u64,
+    /// Frames it folded on a retry, after the hole in front of them closed.
+    pub frames_recovered: u64,
     /// Watches this peer resumed at a later anchor after abandoning a hole.
     pub reanchors: u64,
     /// Subject ticks it gave up on doing so — the blind half of coverage.
@@ -156,6 +158,8 @@ pub struct SwarmReport {
     pub total_gaps: u64,
     /// Signals raised against honest peers. **Every one is a false positive.**
     pub total_false_positives: u64,
+    /// Frames folded on a retry rather than dropped and re-requested.
+    pub total_frames_recovered: u64,
     /// Watches resumed at a later anchor after a hole was abandoned.
     pub total_reanchors: u64,
     /// Subject ticks abandoned unjudged by those resumes.
@@ -690,6 +694,7 @@ impl Swarm {
                     stalled: bot.signals.stalled,
                     repairs_overflowed: bot.repairs_overflowed(),
                     repairs_unservable: bot.repairs_unservable(),
+                    frames_recovered: witness.frames_recovered,
                     reanchors: witness.reanchors,
                     unjudged_ticks: witness.unjudged_ticks,
                     judged_ticks: witness.judged_ticks,
@@ -730,6 +735,7 @@ impl Swarm {
             player_hours: self.config.peers as f64 * self.config.seconds as f64 / 3_600.0,
             total_gaps: per_peer.iter().map(|p| p.gaps).sum(),
             total_false_positives: per_peer.iter().map(|p| p.false_positives).sum(),
+            total_frames_recovered: per_peer.iter().map(|p| p.frames_recovered).sum(),
             total_reanchors: per_peer.iter().map(|p| p.reanchors).sum(),
             total_unjudged_ticks: per_peer.iter().map(|p| p.unjudged_ticks).sum(),
             total_judged_ticks: per_peer.iter().map(|p| p.judged_ticks).sum(),

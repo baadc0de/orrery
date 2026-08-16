@@ -41,17 +41,21 @@
 //! the cost that grew faster than the peer count is linear again — 32 peers
 //! over 60 simulated seconds runs in about ten wall seconds.
 //!
-//! What stands between the harness and those hours is no longer throughput but
-//! two measured numbers, and the report prints them side by side because
-//! neither is readable alone:
+//! At eight and sixteen peers it now holds the criterion: **zero false
+//! positives at 100% observation coverage**, over runs of 30, 120 and 300
+//! simulated seconds. Both numbers are printed together because neither is
+//! readable alone — a witness that has stopped watching also reports zero.
 //!
-//! - **False positives are a rate, not a transient.** Roughly 0.7 `Stalled`
-//!   escalations per simulated second at eight peers, every one against a bot
-//!   that answered every repair it was asked for. The criterion is zero.
-//! - **Observation coverage is ~83%.** The rest is timeline a witness was shown
-//!   while a hole was open and the repair that followed did not recover. Until
-//!   that closes, a low false-positive count is partly an artefact of a witness
-//!   that judged less.
+//! At thirty-two the failure has moved out of the witness and into the budget.
+//! Peak upload reaches 1006 kbps against the 1 Mbps allowance and ~15 000
+//! replication packets are shed; the shed frames are holes, the holes are
+//! repairs, and the repairs are what push coverage back to 81% and the false
+//! positives back to 263. The same population without `--witness` sits at
+//! 739 kbps and passes every clause, so what does not fit is the witness lane
+//! itself: seven links per peer at the 20 Hz frame cadence, against
+//! docs/03-replication.md §5.3's 20–30 kb/s per link. That is a parameter
+//! question — link count, frame cadence, or the share witnessing may have —
+//! rather than a defect, and it is what P4 has to settle next.
 //!
 //! Coverage is printed at all because of what it caught. Before re-anchoring
 //! existed, a watch that gave up on a hole stopped judging its subject
@@ -60,6 +64,11 @@
 //! twenty-five simulated seconds and stayed frozen: identical gap, stall and
 //! overflow totals at 30 s and at 120 s. The hours would have accumulated and
 //! the false-positive count would have been zero for the worst possible reason.
+//!
+//! Note what the profiles do to the roaming figures: `--witness` runs assign
+//! idle, burst and stall behaviours where the plain run is all cruise, so the
+//! least-travelled peer legitimately visits one cell. The interest clauses are
+//! measured on the cruise-only run; these runs are about the witness.
 //!
 //! And one it structurally cannot do: every bot here shares a binary and a
 //! `libm`, so re-execution is bit-identical by construction and the

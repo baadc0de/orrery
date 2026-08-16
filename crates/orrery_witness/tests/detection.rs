@@ -12,6 +12,7 @@
 
 use orrery_core::invariants::checks;
 use orrery_core::log::{claim_hash, sign_claim, sign_frame, HeadTransition};
+use orrery_core::store::AuthorityLog;
 use orrery_core::{
     state_hash, CodecError, CoreCodec, Executor, Invariant, InvariantKind, InvariantSample,
     InvariantViolation, OrderedInputs, QPos, QVel, Quantized, Ruleset, StateView, StepOutput,
@@ -969,4 +970,90 @@ fn coverage_counts_the_timeline_shown_not_the_timeline_judged() {
         "but it is still being shown timeline, and that is what it is measured against"
     );
     assert_eq!(witness.counters().reanchors, 0, "nothing to resume from");
+}
+
+#[test]
+fn frames_that_arrive_during_a_repair_are_kept_rather_than_re_requested() {
+    // A repair takes a round trip, and the subject does not stop sending for
+    // it. Every frame that arrives while the answer is in flight fails to chain
+    // — that is what "mid-repair" means — and used to be dropped on the spot.
+    // So a hole cost not just the frames that were lost but everything sent
+    // while it was being filled, and closing it left the witness behind by
+    // exactly the round trip, which opened the next hole. That is the
+    // amplification the repair budget's own notes describe: more repairs in
+    // flight crowd the state lane, which opens more holes.
+    let mut authority = Authority::new(1);
+    let mut witness = watching(WitnessConfig::default(), &mut authority);
+    let mut log = AuthorityLog::default();
+
+    let record = |authority: &mut Authority, log: &mut AuthorityLog, tick: u64| {
+        let sent = authority.send(tick);
+        log.record_frame(
+            sent.frame.clone(),
+            vec![HeadTransition {
+                entity: ENTITY,
+                prev_head: ChainHash::EMPTY,
+                head: ChainHash::EMPTY,
+            }],
+        );
+        sent
+    };
+
+    let first = record(&mut authority, &mut log, T0);
+    witness
+        .ingest_frame(&first.frame, &[])
+        .expect("the first frame chains from the anchor");
+    let _lost = record(&mut authority, &mut log, T0 + 3);
+
+    // The frame that reveals the hole, and four more behind it while the repair
+    // is outstanding. None of them can chain yet.
+    let revealing = record(&mut authority, &mut log, T0 + 6);
+    let signals = witness.ingest_frame(&revealing.frame, &[]).expect("a gap");
+    let [WitnessSignal::Gap(request)] = signals.as_slice() else {
+        panic!("expected one gap, got {signals:?}");
+    };
+    let request = request.clone();
+    for round in 3..7u64 {
+        let sent = record(&mut authority, &mut log, T0 + round * 3);
+        let quiet = witness
+            .ingest_frame(&sent.frame, &[])
+            .expect("held, not refused");
+        assert!(
+            quiet.is_empty(),
+            "one hole is one repair, however many frames pile up behind it: {quiet:?}"
+        );
+    }
+    let accepted_before = witness.counters().frames_accepted;
+    assert_eq!(
+        witness.counters().gaps_detected,
+        1,
+        "the frames behind the hole must not each ask for it again"
+    );
+
+    // The answer covers only what was lost. Everything held behind it should
+    // fold off the back of it, with no second request.
+    let served = log.serve_range(&request, usize::MAX);
+    witness
+        .ingest_wire_frames(&served.response.frames, &served.heads)
+        .expect("a correctly served repair is not a rejection");
+
+    assert!(
+        witness.catching_up(ENTITY).is_none(),
+        "the hole is closed and judgement has resumed"
+    );
+    assert_eq!(
+        witness.counters().gaps_detected,
+        1,
+        "closing the hole must not open another"
+    );
+    assert_eq!(
+        witness.counters().frames_recovered,
+        5,
+        "the frame that revealed the hole and the four behind it were kept"
+    );
+    assert_eq!(
+        witness.counters().frames_accepted - accepted_before,
+        6,
+        "one repaired frame plus the five that were held"
+    );
 }
