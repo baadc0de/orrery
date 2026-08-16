@@ -25,6 +25,7 @@
 #![warn(missing_docs)]
 
 pub mod actor;
+pub mod adjudication;
 pub mod checkpoint;
 pub mod cluster;
 mod crc;
@@ -42,6 +43,7 @@ pub mod runtime;
 pub use actor::{
     CellActorHandle, EntityRecord, FencedApply, Reject, RekeyError, SnapshotPage, Tombstone,
 };
+pub use adjudication::{AdjudicationExecutor, RETAINED_BUILDS};
 pub use checkpoint::{
     spawn_checkpoint_scheduler, spawn_checkpoint_scheduler_direct, CheckpointConfig,
     CheckpointData, CheckpointError, CheckpointScheduler, CheckpointStore, ColdCellReader,

@@ -25,6 +25,33 @@ Three precedents anchor the "No" and "Prevented" rows. Information exposure is i
 
 The detection machinery is a direct descendant of [PeerReview (SOSP 2007)](https://dl.acm.org/doi/10.1145/1294261.1294279): each node keeps a tamper-evident, hash-chained, signed log of the nondeterministic events (here: per-tick inputs plus periodic state-claim hashes, per D9); any auditor holding a log segment and a start state can deterministically re-execute the node's reference implementation (here: the `Ruleset` verifiable core) and compare outcomes; a mismatch yields *unforgeable evidence* — the signed log itself convicts its author, and a forged accusation is impossible because the accused's signature won't verify. Orrery scopes this down from PeerReview's full-node accountability to the verifiable core only (persistent-value-touching rules), makes auditing *continuous but cheap* (witness-set members re-execute the streamed logs as they arrive, and prediction errors during interaction arm escalation — no scheduled full audits), and centralizes final adjudication in the cluster, which links the same `Ruleset` and therefore reproduces the replay bit-for-bit for discrete outcomes and within tolerance bands for continuous state.
 
+> **Implementation status (2026-08-16).** Stages 1–3 are implemented in
+> `orrery_witness` and stage 4 in `orrery_persistd::AdjudicationExecutor`.
+> Landed: stage-1 stateless invariants, stage-1c continuous log re-execution
+> against the subject's own signed claims, gap detection as a
+> `LogRangeRequest` rather than an accusation, escalation bounded at the
+> 180-tick window, `DiscrepancyReport` assembly and signing, and version-keyed
+> routing over the last three retained rules builds.
+>
+> **Shadow mode is the default** (`WitnessConfig::shadow_mode = true`): every
+> check runs, every detection is counted, and nothing is filed. D17 risk 3 is
+> that false-positive strikes on honest players kill witness-based trust, and
+> no amount of correct detection logic substitutes for measuring the real
+> cross-platform drift distribution first.
+>
+> **A verdict rests only on what the subject signed.** The bundle's
+> `claimed_hashes`/`computed_hashes` are the *reporter's* per-tick numbers and
+> carry no subject signature; judging on them would let a reporter convict an
+> honest peer by inventing numbers. They are advisory locators, and the
+> `StateClaim`s are what an authority is held to — which is why a window must
+> end at a claim tick.
+>
+> Not yet here: transport. Nothing streams frames or claims, and gap repair
+> surfaces as a request the caller is expected to send — that wiring lives in
+> `orrery_net` alongside the Bevy plugin adapter, and the two land together.
+> Stage 5 responses (authority correction, annulment, strikes) and §4
+> attestation are P5.
+
 ## 3. The passive pipeline
 
 The pipeline runs in `orrery_witness` (client side), `orrery_core` (replay), and `orrery_persistd`'s adjudication executor (cluster side). Numbered stages:

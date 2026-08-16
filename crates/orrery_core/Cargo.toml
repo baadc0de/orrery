@@ -1,0 +1,35 @@
+[package]
+name = "orrery_core"
+version = "0.1.0"
+edition = "2021"
+description = "Orrery verifiable core (D9): the Ruleset trait, fixed-tick executor, seeded RNG, quantization and tolerance bands, tamper-evident input logs, and the headless replay harness"
+license = "MIT OR Apache-2.0"
+
+# Engine-agnostic and headless (D9, docs/10-crates.md §2): no Bevy, no tokio,
+# no OS services. The same build links into game clients (witness-side
+# re-execution), `orrery_field_host` (parked-cell catch-up) and `persistd`
+# (adjudication), so anything platform-specific in here would make those three
+# disagree — which is exactly the failure the crate exists to detect.
+[features]
+# Helper types for discrete-outcome fixed-point math. Not yet implemented;
+# reserved so the feature name is stable for games that will want it.
+fixed-point = []
+
+[dependencies]
+orrery_protocol = { path = "../orrery_protocol" }
+# VC-3: all randomness is ChaCha8, seeded per (universe_seed, entity, tick).
+rand_chacha = "0.9"
+rand_core = "0.9"
+# Chain hashing, RNG seed derivation, and state hashing.
+blake3 = "1.8"
+# VC-6: continuous math goes through libm rather than std transcendentals, so
+# three OSes and two architectures agree to within the tolerance bands.
+libm = "0.2"
+# Signing keys are transport identities (D3).
+iroh-base = { workspace = true }
+bytes = { workspace = true }
+postcard = { workspace = true }
+serde = { workspace = true }
+
+[dev-dependencies]
+proptest = "1.11"
