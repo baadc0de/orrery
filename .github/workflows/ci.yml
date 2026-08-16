@@ -104,9 +104,16 @@ jobs:
 
       # The fdb feature compiles code the default build never sees. It went
       # unlinted long enough for orrery_seed/tests/fdb_gates.rs to stop
-      # compiling entirely, so it gets its own pass. `clippy` only needs
-      # metadata, not a link, so this works with no libfdb_c on the runner —
-      # the *tests* still need a real cluster and run in nightly.yml.
+      # compiling entirely, so it gets its own pass.
+      #
+      # It needs the client package even though clippy never links: the
+      # `foundationdb-gen` build does `include_bytes!` on
+      # /usr/include/foundationdb/fdb.options, so the header is a *compile*
+      # input. No server here — running the fdb tests against a real cluster is
+      # nightly.yml's job.
+      - name: Install the FoundationDB client
+        uses: ./.github/actions/foundationdb
+
       - name: clippy (fdb feature)
         run: |
           cargo clippy -p orrery_persistd -p orrery_seed --all-targets --no-deps \

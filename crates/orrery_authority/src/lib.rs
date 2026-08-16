@@ -690,11 +690,17 @@ mod tests {
         // Then: local authority is installed, and the event says it was
         // inherited rather than confirming a prediction this peer was running.
         assert!(app.world().get::<LocallyAuthoritative>(inherited).is_some());
+        // `advance_lease_clock` derives `now_ms` from a process-wide start
+        // instant, so it is only zero if this test happens to be the first in
+        // the process to run. Asserting an absolute expiry makes the test a
+        // race that a loaded CI runner loses; the invariant under test is that
+        // the grant's TTL is applied to the clock the grant was processed on.
+        let now_ms = app.world().resource::<AuthorityState>().now_ms;
         assert_eq!(
             app.world().get::<AuthorityPhase>(inherited),
             Some(&AuthorityPhase::LocalGranted {
                 lease_id: LeaseId(4),
-                expires_at_ms: 10_000,
+                expires_at_ms: now_ms + 10_000,
             })
         );
         assert!(app
@@ -908,11 +914,17 @@ mod tests {
             },
         ]);
         app.update();
+        // `advance_lease_clock` derives `now_ms` from a process-wide start
+        // instant, so it is only zero if this test happens to be the first in
+        // the process to run. Asserting an absolute expiry makes the test a
+        // race that a loaded CI runner loses; the invariant under test is that
+        // the grant's TTL is applied to the clock the grant was processed on.
+        let now_ms = app.world().resource::<AuthorityState>().now_ms;
         assert_eq!(
             app.world().get::<AuthorityPhase>(expired),
             Some(&AuthorityPhase::LocalGranted {
                 lease_id: LeaseId(9),
-                expires_at_ms: 10_000,
+                expires_at_ms: now_ms + 10_000,
             })
         );
         assert!(app.world().get::<LocallyAuthoritative>(expired).is_some());
@@ -1391,6 +1403,9 @@ mod tests {
                 invalid: Vec::new(),
             });
         app.update();
+        // Absolute is correct here, unlike the plugin-driven tests: this app
+        // never registers `advance_lease_clock`, so `now_ms` is exactly what
+        // `set_now_ms` put there and the deadline is fully determined.
         assert_eq!(
             app.world().get::<AuthorityPhase>(e),
             Some(&AuthorityPhase::LocalGranted {

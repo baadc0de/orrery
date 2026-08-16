@@ -96,29 +96,13 @@ jobs:
           key: nightly-p2-${{ hashFiles('Cargo.toml', 'crates/*/Cargo.toml', 'vendor/*/Cargo.toml', 'rust-toolchain.toml') }}
           restore-keys: nightly-p2-
 
-      # FoundationDB 7.3.x per D11/D14. Both packages are needed: the client
-      # provides libfdb_c, which orrery_persistd links when the `fdb` feature is
-      # on, and the server provides the single-node cluster the gate writes to.
-      - name: Install FoundationDB 7.3
-        run: |
-          set -euo pipefail
-          version=7.3.43
-          base="https://github.com/apple/foundationdb/releases/download/${version}"
-          curl -fsSL -o /tmp/fdb-clients.deb "${base}/foundationdb-clients_${version}-1_amd64.deb"
-          curl -fsSL -o /tmp/fdb-server.deb  "${base}/foundationdb-server_${version}-1_amd64.deb"
-          sudo dpkg -i /tmp/fdb-clients.deb /tmp/fdb-server.deb
-          # The server package starts and self-configures a local cluster; give
-          # it a moment, then prove it is actually writable rather than assuming.
-          for _ in $(seq 1 30); do
-            if fdbcli -C /etc/foundationdb/fdb.cluster --exec 'status minimal' 2>/dev/null | grep -q 'is available'; then
-              echo "FoundationDB is available"
-              exit 0
-            fi
-            sleep 2
-          done
-          echo "::error::FoundationDB did not become available"
-          fdbcli -C /etc/foundationdb/fdb.cluster --exec 'status' || true
-          exit 1
+      # FoundationDB 7.3.x per D11/D14: the client provides libfdb_c and the
+      # headers orrery_persistd links under the `fdb` feature, the server the
+      # single-node cluster the gate writes to.
+      - name: Install FoundationDB with a local cluster
+        uses: ./.github/actions/foundationdb
+        with:
+          server: "true"
 
       - name: Build the fdb-enabled binaries
         run: cargo build --release -p orrery_persistd --features fdb

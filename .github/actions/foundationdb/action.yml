@@ -1,0 +1,65 @@
+# Install FoundationDB 7.3.x (D11, D14) on an Ubuntu runner.
+#
+# Factored out because two workflows need it at the same version and a drift
+# between them would be invisible until one of them failed oddly.
+#
+# The clients package is needed more often than it looks. `foundationdb-gen`
+# does `include_bytes!("/usr/include/foundationdb/fdb.options")`, so the header
+# is required to *compile* the crate — `cargo clippy` needs it just as much as
+# a real build does, even though clippy never links. Only jobs that actually
+# talk to a cluster need the server on top.
+
+name: Install FoundationDB
+description: Install the FoundationDB client library, and optionally a local single-node cluster.
+
+inputs:
+  version:
+    description: FoundationDB version to install (7.3.x per D14).
+    required: false
+    default: "7.3.43"
+  server:
+    description: Also install and start a local single-node cluster.
+    required: false
+    default: "false"
+
+runs:
+  using: composite
+  steps:
+    - name: Install FoundationDB ${{ inputs.version }}
+      shell: bash
+      run: |
+        set -euo pipefail
+        version='${{ inputs.version }}'
+        base="https://github.com/apple/foundationdb/releases/download/${version}"
+
+        curl -fsSL -o /tmp/fdb-clients.deb \
+          "${base}/foundationdb-clients_${version}-1_amd64.deb"
+        sudo dpkg -i /tmp/fdb-clients.deb
+
+        # Prove the header the build actually consumes is present, rather than
+        # trusting that the package contained what we expect.
+        test -r /usr/include/foundationdb/fdb.options \
+          || { echo "::error::fdb.options missing after installing the client"; exit 1; }
+        echo "FoundationDB client ${version} installed"
+
+        if [[ '${{ inputs.server }}' != 'true' ]]; then
+          exit 0
+        fi
+
+        curl -fsSL -o /tmp/fdb-server.deb \
+          "${base}/foundationdb-server_${version}-1_amd64.deb"
+        sudo dpkg -i /tmp/fdb-server.deb
+
+        # The server package starts and self-configures a local cluster; wait
+        # for it, then prove it is actually available rather than assuming.
+        for _ in $(seq 1 30); do
+          if fdbcli -C /etc/foundationdb/fdb.cluster --exec 'status minimal' 2>/dev/null \
+             | grep -q 'is available'; then
+            echo "FoundationDB cluster is available"
+            exit 0
+          fi
+          sleep 2
+        done
+        echo "::error::FoundationDB did not become available"
+        fdbcli -C /etc/foundationdb/fdb.cluster --exec 'status' || true
+        exit 1
