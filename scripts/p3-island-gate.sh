@@ -21,12 +21,26 @@ if [[ ${1:-} == --self-test ]]; then
   # Offline guard for CI images without built binaries. Deliberately
   # structural: it catches regression to a script that no longer proves the
   # criterion, without pretending to run an island locally.
-  grep -Fq -- '--dev-seed' "$0" || die 'self-test: entity seeding absent'
-  grep -Fq -- '--coordinator-key' "$0" || die 'self-test: interest handout absent'
-  grep -Fq 'orrery-coordinator' "$0" || die 'self-test: live coordinator absent'
-  grep -Fq -- '--metrics-jsonl' "$0" || die 'self-test: duplicate-authority read absent'
-  grep -Fq 'p3-island' "$0" || die 'self-test: island harness absent'
-  grep -Fq 'kill -9' "$0" || die 'self-test: kill -9 documentation absent'
+  #
+  # Searched against the script body rather than the whole file, and this is not
+  # tidiness. Every pattern below also appears, literally, in the line that looks
+  # for it, so `grep -Fq 'X' "$0"` matches its own source and can only pass.
+  # Verified 2026-08-17: with the entire body of this script deleted, the checks
+  # that predate this comment still reported the stages present. Comment lines
+  # are stripped too, so prose naming a stage cannot stand in for the stage.
+  body="$(sed -n '/^: /,$p' "$0" | grep -v '^[[:space:]]*#')"
+  has() { grep -Fq -- "$1" <<<"$body"; }
+  has '--dev-seed' || die 'self-test: entity seeding absent'
+  has '--coordinator-key' || die 'self-test: interest handout absent'
+  has 'orrery-coordinator' || die 'self-test: live coordinator absent'
+  has '--metrics-jsonl' || die 'self-test: duplicate-authority read absent'
+  has 'p3-island' || die 'self-test: island harness absent'
+  # The SIGKILL itself is issued inside the p3-island binary, not here, so this
+  # script cannot assert it structurally — what it can assert is that it drives
+  # the criterion's shape. The old check looked for the literal `kill -9`, which
+  # appears in this file only in prose.
+  has '--entities-per-peer' || die 'self-test: per-peer entity load absent'
+  has '--duration-secs' || die 'self-test: run duration absent'
   echo 'self-test: island, seeding, interest, and invariant stages present'
   exit 0
 fi

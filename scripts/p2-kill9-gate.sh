@@ -16,12 +16,21 @@ if [[ ${1:-} == --self-test ]]; then
   # this deliberately structural; it catches accidental regression to the old
   # single-node/incomplete script without pretending to execute a durability
   # test locally.
-  grep -Fq 'start_follower' "$0" || die 'self-test: follower startup absent'
-  grep -Fq -- '--promote-from' "$0" || die 'self-test: promotion absent'
-  grep -Fq 'verify-recovery' "$0" || die 'self-test: recovery verifier absent'
-  grep -Fq 'zombie' "$0" || die 'self-test: zombie fence proof absent'
-  grep -Fq 'prove_epoch_fork_refused' "$0" || die 'self-test: primary-restart epoch-fork proof absent'
-  grep -Fq 'p2-dashboard --gate' "$0" || die 'self-test: latency gate absent'
+  #
+  # Searched against the script body rather than the whole file, and this is not
+  # tidiness. Every pattern below also appears, literally, in the line that looks
+  # for it, so `grep -Fq 'X' "$0"` matches its own source and can only pass.
+  # Verified 2026-08-17: with the entire body of this script deleted, the checks
+  # that predate this comment still reported the stages present. Comment lines
+  # are stripped too, so prose naming a stage cannot stand in for the stage.
+  body="$(sed -n '/^: /,$p' "$0" | grep -v '^[[:space:]]*#')"
+  has() { grep -Fq -- "$1" <<<"$body"; }
+  has 'start_follower' || die 'self-test: follower startup absent'
+  has '--promote-from' || die 'self-test: promotion absent'
+  has 'verify-recovery' || die 'self-test: recovery verifier absent'
+  has 'zombie' || die 'self-test: zombie fence proof absent'
+  has 'prove_epoch_fork_refused' || die 'self-test: primary-restart epoch-fork proof absent'
+  has '--gate --json' || die 'self-test: latency gate absent'
   echo 'self-test: two-process proof stages present'
   exit 0
 fi
