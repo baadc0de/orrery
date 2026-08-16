@@ -47,6 +47,11 @@
 //! because neither is readable alone — a witness that has stopped watching also
 //! reports zero.
 //!
+//! Since it holds, it gates: `scripts/p1-swarm-gate.sh` runs the impaired hour
+//! with `--witness` as its third leg, nightly and blocking, and that is the only
+//! place in the tree the witness pipeline runs at all. Every clause guarded by
+//! `SwarmConfig.witnessing` was dead code before it existed.
+//!
 //! # What thirty-two peers cost, and which dial paid for it
 //!
 //! Thirty-two used to fail, and not as a bandwidth nuisance: peak upload reached
@@ -149,6 +154,15 @@ struct Args {
     #[arg(long)]
     impaired: bool,
 
+    /// Move the impaired profile's loss within the criterion's 3–5% band.
+    ///
+    /// The band has only ever been run at its 3% floor. This is how the other
+    /// end gets exercised — on demand rather than nightly, because a second
+    /// witnessed hour would not fit the job's timeout. Ignored without
+    /// `--impaired`, which is the flag that selects the profile at all.
+    #[arg(long)]
+    loss: Option<f64>,
+
     /// Proxy pops tolerated before the clause fails.
     ///
     /// Zero on a clean link — that is P1's criterion. Under loss a peer ranks
@@ -229,7 +243,8 @@ fn main() -> Result<()> {
         cell_edge_m: bot::default_cell_edge_m(),
         send_hz: 20,
         impairment: if args.impaired {
-            Impairment::p4_profile()
+            args.loss
+                .map_or_else(Impairment::p4_profile, Impairment::p4_profile_at_loss)
         } else {
             Impairment::default()
         },

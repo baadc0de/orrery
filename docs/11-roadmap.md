@@ -255,9 +255,17 @@ impairment produce zero reports (D17 risk 3). Of the three things that gate
 being able to measure it at all, two are now in place — the cross-platform
 determinism CI (`.github/workflows/ci.yml`, four targets, per commit) and the
 reference game (`orrery_games`) — and what is outstanding is the **accumulation
-of hours**: `p1-swarm --witness` runs the pipeline, but nothing yet runs it
-long enough, across enough platforms, to produce the number the gate is stated
-in.
+of hours**: `p1-swarm --witness` runs the pipeline, and the nightly swarm gate
+now runs *it* — a third leg, 32 peers for a simulated hour under the impairment
+profile, blocking on all three witnessing clauses, accruing 32 player-hours a
+night on x86_64 Linux (`scripts/p1-swarm-gate.sh`,
+`.github/workflows/nightly.yml`). Measured over that hour before it landed:
+coverage 95.98% against the 95% floor, zero false positives, 156 728 chain gaps
+repaired. What is outstanding is narrower than it was — the other three
+determinism targets, and a ledger that adds the nights up. Each report is
+stamped with its seed, its full impairment profile, its target triple and its
+commit sha, and deliberately not with a wall clock unless asked, so summing them
+later is bookkeeping rather than archaeology.
 
 **The bandwidth blocker at 32 peers is settled: it was the frame cadence.** At
 the criterion population the witness lane wanted 384 kb/s per peer against
@@ -271,7 +279,10 @@ and **false positives 582 → 0**; under the 3% loss / 100 ms jitter profile,
 coverage 96.0% and false positives 0. Eight and sixteen peers hold at 0 shed, 0
 false positives, 100% coverage. Over the criterion's full simulated hour at 32
 peers: **32 accumulated player-hours, zero false positives, 100% coverage**,
-lane at 194 kb/s. The 500-hour gate is now a matter of running the harness
+lane at 194 kb/s; the same hour *under* the impairment profile holds at
+**95.98% coverage and zero false positives**, lane at 194 kb/s, 206 packets
+shed — the same 206 as at five minutes, so a transient at island formation
+rather than an overrun. The 500-hour gate is now a matter of running the harness
 across the four determinism targets rather than of anything being in the way.
 
 No D16 parameter moved. The witness set stays at N ≥ 5, ≤ 7 links — dropping to

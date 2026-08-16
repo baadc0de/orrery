@@ -21,9 +21,9 @@
 # The hour is *simulated*. Each peer's clock advances one 60 Hz tick per frame
 # rather than reading a wall clock, so the run costs what it costs to compute —
 # a couple of minutes for each cruise-only leg and about ten for the witnessed
-# one — and is reproducible from its seed. Rates are therefore
-# bytes per simulated second, which is what the budget is about: the send cadence
-# is 20 Hz of sim ticks, not of wall seconds.
+# one — and is reproducible from its seed. Rates are therefore bytes per
+# simulated second, which is what the budget is about: the send cadence is 20 Hz
+# of sim ticks, not of wall seconds.
 set -euo pipefail
 
 readonly NAME=p1-swarm-gate
@@ -124,4 +124,4 @@ note 'witnessed run: the same impaired hour, every peer re-executing its witness
   || die 'the P4 witnessing clauses did not hold over the impaired hour'
 
 date -u +%Y-%m-%dT%H:%M:%SZ > "$OUT/PASSED"
-note "every clause held on both links; reports in $OUT"
+note "every clause held on all three legs, the witnessed one included; reports in $OUT"
