@@ -36,6 +36,11 @@ pub struct SwarmConfig {
     /// Run the witness pipeline: every peer watches its witness set's entities
     /// and re-executes their signed logs (P4's input).
     pub witnessing: bool,
+    /// Wall-clock stamp for the report, when one was asked for.
+    ///
+    /// Read by the caller rather than by the swarm: nothing inside the run may
+    /// consult a clock, or the run stops being a function of its seed.
+    pub started_at_unix_secs: Option<u64>,
 }
 
 impl Default for SwarmConfig {
@@ -49,6 +54,7 @@ impl Default for SwarmConfig {
             seed: 1,
             late_join_tick: None,
             witnessing: false,
+            started_at_unix_secs: None,
         }
     }
 }
@@ -119,9 +125,39 @@ pub struct PeerReport {
     pub undecodable: u64,
 }
 
+/// Everything needed to reproduce a run, and to say which code produced it.
+///
+/// Deliberately free of wall clock. The harness's whole claim is that a run is
+/// a function of its seed (see the module docs on time), and a timestamp folded
+/// in here would make two identical runs compare unequal — which is exactly the
+/// comparison an accumulated ledger of player-hours will want to make. A caller
+/// that wants the clock asks for it, and it lands in
+/// [`SwarmReport::started_at_unix_secs`] beside the body rather than inside it.
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct RunIdentity {
+    /// Seed for the impairment RNG and the universe.
+    pub seed: u64,
+    /// The link conditions the run was carried over, in full.
+    pub impairment: Impairment,
+    /// Target triple the harness was compiled for. P4's 500 hours are counted
+    /// *across* platforms, so a report that does not name its own is unusable
+    /// for the gate it is evidence for.
+    pub target: &'static str,
+    /// Commit the harness was built from, or `unknown` outside a git checkout.
+    pub commit: &'static str,
+}
+
 /// The whole run.
 #[derive(Debug, Clone, Serialize)]
 pub struct SwarmReport {
+    /// What produced this run, and what it would take to produce it again.
+    pub identity: RunIdentity,
+    /// Unix seconds at which the run started, when the caller asked for a
+    /// stamp (`--stamp-wall-clock`).
+    ///
+    /// Outside [`RunIdentity`] on purpose: it is the one field that makes two
+    /// runs of the same seed differ.
+    pub started_at_unix_secs: Option<u64>,
     /// Peers in the swarm.
     pub peers: usize,
     /// Simulated seconds run.
@@ -746,6 +782,13 @@ impl Swarm {
         );
 
         SwarmReport {
+            identity: RunIdentity {
+                seed: self.config.seed,
+                impairment: self.config.impairment,
+                target: env!("P1_SWARM_TARGET"),
+                commit: env!("P1_SWARM_COMMIT"),
+            },
+            started_at_unix_secs: self.config.started_at_unix_secs,
             peers: self.bots.len(),
             seconds: self.config.seconds,
             ticks,
@@ -823,18 +866,45 @@ pub struct CriterionFailure {
     pub detail: String,
 }
 
+/// The thresholds a run is judged against.
+///
+/// Named rather than positional because the legs do not share them: the
+/// witnessed run deals behavioural profiles the cruise-only run does not, and
+/// three of these numbers move with it (see `scripts/p1-swarm-gate.sh`). Four
+/// bare scalars at a call site is how a leg silently gets judged against
+/// another leg's allowances.
+#[derive(Debug, Clone, Copy)]
+pub struct Criterion {
+    /// The D6/D16 per-peer upload budget, bits per simulated second.
+    pub budget_bits: u64,
+    /// Distinct interest cells the least-travelled peer must have visited.
+    pub min_cells: usize,
+    /// Visible proxy pops tolerated.
+    pub max_pops: u64,
+    /// Packets the send path may shed for want of budget.
+    ///
+    /// Zero is the criterion. It is a knob only because the witness lane makes
+    /// the transient at island formation real: a peer recovering from a hitch
+    /// serves its witnesses' repair burst on the unsheddable control lane and
+    /// sheds the cheap lane to afford it (docs/03-replication.md §5.3a). That
+    /// count is flat between five minutes and an hour, which is what
+    /// distinguishes it from an overrun.
+    pub max_shed: u64,
+}
+
 impl SwarmReport {
     /// Check the report against the P1 demo criterion.
     ///
     /// Every clause, or the run does not count — the phase gate is the whole
     /// sentence, not the convenient half of it.
     #[must_use]
-    pub fn against_criterion(
-        &self,
-        budget_bits: u64,
-        min_cells: usize,
-        max_pops: u64,
-    ) -> Vec<CriterionFailure> {
+    pub fn against_criterion(&self, criterion: Criterion) -> Vec<CriterionFailure> {
+        let Criterion {
+            budget_bits,
+            min_cells,
+            max_pops,
+            max_shed,
+        } = criterion;
         let mut failures = Vec::new();
 
         if self.worst_peak_upload_bits > budget_bits {
@@ -846,13 +916,13 @@ impl SwarmReport {
                 ),
             });
         }
-        if self.total_shed > 0 {
+        if self.total_shed > max_shed {
             // Shedding means the budget was reached, which the criterion treats
             // as a failure rather than a success of the backstop: a peer that
             // had to drop state did not stay *within* budget, it was held to it.
             failures.push(CriterionFailure {
                 clause: "no load shed to stay within budget",
-                detail: format!("{} packets shed", self.total_shed),
+                detail: format!("{} packets shed (allowance {max_shed})", self.total_shed),
             });
         }
         // Guard against the harness measuring an empty world. Every clause
@@ -902,11 +972,16 @@ impl SwarmReport {
         // more watches died; with re-anchoring the same runs hold 83.4% → 82.9%
         // → 83.0%, which is a steady state rather than a slope.
         //
-        // The threshold is the phase's target, not today's number: the residual
-        // ~17% is timeline shown to a witness while a hole was open that the
-        // repair which followed did not recover, and closing it is the next
-        // measurement P4 needs. This clause fails until it is closed, alongside
-        // the false-positive clause it exists to make readable.
+        // Those figures predate the frame cadence being derived from the lane's
+        // budget share (docs/03-replication.md §5.3a, docs/11-roadmap.md §P4).
+        // At the criterion population the clause now holds rather than fails:
+        // 100.0% on a clean link and 96.0% under the 3% loss / 100 ms jitter
+        // profile, both at 32 peers. The residual under loss is timeline shown
+        // to a witness while a hole was open that the repair which followed did
+        // not recover — four points of it, and the margin over this threshold
+        // is only one. Raising the threshold to today's number, or lowering it
+        // to accommodate a run that misses, are both measurements rather than
+        // edits; the number here is the phase's target and stays put.
         const MIN_COVERAGE: f64 = 0.95;
         if self.witnessing && self.observation_coverage < MIN_COVERAGE {
             failures.push(CriterionFailure {
@@ -991,5 +1066,244 @@ impl SwarmReport {
             }
         }
         failures
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The P1 criterion as the gate's clean leg states it.
+    const STRICT: Criterion = Criterion {
+        budget_bits: 1_000_000,
+        min_cells: 64,
+        max_pops: 0,
+        max_shed: 0,
+    };
+
+    /// A report in which every clause holds, witnessing included.
+    ///
+    /// The tests below each break exactly one thing and assert which clause
+    /// notices, which is only meaningful against a baseline that raises
+    /// nothing. Built by hand rather than by running a swarm: what is under
+    /// test is the judgement, and a judgement that can only be exercised by a
+    /// forty-second simulation is a judgement nobody exercises.
+    fn passing() -> SwarmReport {
+        SwarmReport {
+            identity: RunIdentity {
+                seed: 1,
+                impairment: Impairment::p4_profile(),
+                target: "test",
+                commit: "test",
+            },
+            started_at_unix_secs: None,
+            peers: 32,
+            seconds: 3_600,
+            ticks: 3_600 * TICK_HZ,
+            per_peer: Vec::new(),
+            worst_peak_upload_bits: 973_000,
+            worst_p99_upload_bits: 906_000,
+            min_cells_visited: 81,
+            total_shed: 0,
+            total_boundary_flips: 0,
+            total_proxy_pops: 0,
+            total_interest_churn: 8_426,
+            stranded_in_flight: 0,
+            total_undecodable: 0,
+            total_replicas: 992,
+            witnessing: true,
+            player_hours: 32.0,
+            total_gaps: 13_009,
+            total_false_positives: 0,
+            total_frames_recovered: 0,
+            total_reanchors: 0,
+            total_unjudged_ticks: 0,
+            total_judged_ticks: 3_864_390,
+            total_shown_ticks: 4_026_190,
+            observation_coverage: 0.96,
+            replication_bytes: 0,
+            witness_bytes: 0,
+            control_bytes: 0,
+            witness_lane_share: 0.45,
+            witness_lane_bits_per_sec: 194_000,
+            link: LinkReport {
+                delivered: 2_147_904,
+                dropped: 66_520,
+                delayed: 0,
+                bytes: 0,
+            },
+            late_join: Some(LateJoinReport {
+                neighbourhood: 27,
+                roster: 31,
+                in_neighbourhood: 15,
+                tracked: 15,
+            }),
+        }
+    }
+
+    /// Clauses `report` raises, by name.
+    fn clauses(report: &SwarmReport, criterion: Criterion) -> Vec<&'static str> {
+        report
+            .against_criterion(criterion)
+            .into_iter()
+            .map(|failure| failure.clause)
+            .collect()
+    }
+
+    #[test]
+    fn a_witnessed_run_that_holds_raises_nothing() {
+        assert!(clauses(&passing(), STRICT).is_empty());
+    }
+
+    // Clause: no false-positive discrepancy signal against an honest peer.
+
+    #[test]
+    fn a_signal_against_an_honest_peer_fails_the_run() {
+        let mut report = passing();
+        report.total_false_positives = 1;
+        assert!(clauses(&report, STRICT)
+            .contains(&"no false-positive discrepancy signal against an honest peer"));
+    }
+
+    #[test]
+    fn the_false_positive_clause_is_silent_when_the_witness_did_not_run() {
+        // Not merely untested: without `--witness` the counter is structurally
+        // zero, and a clause that fired on it would be judging a run that never
+        // made a claim.
+        let mut report = passing();
+        report.witnessing = false;
+        report.total_false_positives = 7;
+        assert!(clauses(&report, STRICT).is_empty());
+    }
+
+    // Clause: the witness keeps watching for the whole run.
+
+    #[test]
+    fn coverage_below_the_floor_fails_the_run() {
+        let mut report = passing();
+        report.observation_coverage = 0.949;
+        assert!(clauses(&report, STRICT).contains(&"the witness keeps watching for the whole run"));
+    }
+
+    #[test]
+    fn coverage_at_the_floor_holds() {
+        // The comparison is `<`, so the floor itself passes. Worth pinning: the
+        // impaired leg runs four points above it, which is not much room in
+        // which to discover an off-by-one.
+        let mut report = passing();
+        report.observation_coverage = 0.95;
+        assert!(clauses(&report, STRICT).is_empty());
+    }
+
+    #[test]
+    fn a_blind_witness_is_caught_even_with_zero_findings() {
+        // The failure this clause exists for: a watch that gave up reports no
+        // findings for the same reason an honest swarm does.
+        let mut report = passing();
+        report.observation_coverage = 0.0;
+        report.total_judged_ticks = 0;
+        report.total_false_positives = 0;
+        assert_eq!(
+            clauses(&report, STRICT),
+            vec!["the witness keeps watching for the whole run"]
+        );
+    }
+
+    #[test]
+    fn the_coverage_clause_is_silent_when_the_witness_did_not_run() {
+        let mut report = passing();
+        report.witnessing = false;
+        report.observation_coverage = 0.0;
+        report.total_judged_ticks = 0;
+        report.total_shown_ticks = 0;
+        assert!(clauses(&report, STRICT).is_empty());
+    }
+
+    // Clause: the witness sees the stream it is judging.
+
+    #[test]
+    fn a_lossy_link_with_no_detected_gap_fails_the_run() {
+        let mut report = passing();
+        report.total_gaps = 0;
+        assert!(clauses(&report, STRICT).contains(&"the witness sees the stream it is judging"));
+    }
+
+    #[test]
+    fn no_gaps_on_a_clean_link_is_not_a_finding() {
+        // Zero gaps is the *expected* reading when nothing was dropped; the
+        // clause is about a witness that missed the drops, not about the drops.
+        let mut report = passing();
+        report.identity.impairment = Impairment::default();
+        report.total_gaps = 0;
+        report.link.dropped = 0;
+        report.observation_coverage = 1.0;
+        assert!(clauses(&report, STRICT).is_empty());
+    }
+
+    #[test]
+    fn the_stream_clause_is_silent_when_the_witness_did_not_run() {
+        let mut report = passing();
+        report.witnessing = false;
+        report.total_gaps = 0;
+        assert!(clauses(&report, STRICT).is_empty());
+    }
+
+    // The witnessed leg's own thresholds.
+
+    #[test]
+    fn the_witnessed_legs_thresholds_do_not_reach_the_witnessing_clauses() {
+        // The relaxations `scripts/p1-swarm-gate.sh` gives the witnessed leg are
+        // about roaming and about the island-formation shed transient. If either
+        // silenced a witnessing clause the leg would be theatre, so pin that
+        // neither does: the run below is judged with every allowance open and
+        // still fails on the witness.
+        let witnessed = Criterion {
+            min_cells: 1,
+            max_pops: 64,
+            max_shed: 512,
+            ..STRICT
+        };
+        let mut report = passing();
+        report.min_cells_visited = 1;
+        report.total_shed = 206;
+        report.total_proxy_pops = 3;
+        assert!(clauses(&report, witnessed).is_empty());
+
+        report.total_false_positives = 1;
+        report.observation_coverage = 0.5;
+        report.total_gaps = 0;
+        assert_eq!(
+            clauses(&report, witnessed),
+            vec![
+                "no false-positive discrepancy signal against an honest peer",
+                "the witness keeps watching for the whole run",
+                "the witness sees the stream it is judging",
+            ]
+        );
+    }
+
+    #[test]
+    fn the_shed_allowance_is_a_ceiling_not_an_exemption() {
+        let mut report = passing();
+        report.total_shed = 513;
+        let witnessed = Criterion {
+            max_shed: 512,
+            ..STRICT
+        };
+        assert!(clauses(&report, witnessed).contains(&"no load shed to stay within budget"));
+    }
+
+    #[test]
+    fn the_identity_block_carries_no_wall_clock() {
+        // The reproducible body must be a function of the seed alone: two runs
+        // of one seed may differ only in the sidecar.
+        let stamped = SwarmReport {
+            started_at_unix_secs: Some(1_755_300_000),
+            ..passing()
+        };
+        assert_eq!(
+            serde_json::to_string(&stamped.identity).unwrap(),
+            serde_json::to_string(&passing().identity).unwrap()
+        );
     }
 }

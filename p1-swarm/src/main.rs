@@ -47,6 +47,11 @@
 //! because neither is readable alone — a witness that has stopped watching also
 //! reports zero.
 //!
+//! Since it holds, it gates: `scripts/p1-swarm-gate.sh` runs the impaired hour
+//! with `--witness` as its third leg, nightly and blocking, and that is the only
+//! place in the tree the witness pipeline runs at all. Every clause guarded by
+//! `SwarmConfig.witnessing` was dead code before it existed.
+//!
 //! # What thirty-two peers cost, and which dial paid for it
 //!
 //! Thirty-two used to fail, and not as a bandwidth nuisance: peak upload reached
@@ -122,7 +127,7 @@ use anyhow::{bail, Result};
 use clap::Parser;
 
 use router::Impairment;
-use swarm::{Swarm, SwarmConfig};
+use swarm::{Criterion, Swarm, SwarmConfig};
 
 /// The D6/D16 peer upload budget.
 const BUDGET_BITS: u64 = 1_000_000;
@@ -149,6 +154,21 @@ struct Args {
     #[arg(long)]
     impaired: bool,
 
+    /// Move the impaired profile's loss within the criterion's 3–5% band.
+    ///
+    /// The band had only ever been run at its 3% floor, and the other end does
+    /// not hold: the witnessed hour at 5% judges **93.8%** of the timeline it
+    /// is shown against the 95% floor, with zero false positives across the
+    /// same 32 player-hours. Coverage is the clause that fails, not the
+    /// findings — 234 930 gaps rather than 156 728, and the repairs do not all
+    /// land before the window they belong to closes. The gate runs the floor
+    /// nightly; closing the band is P4's next measurement, not a knob.
+    ///
+    /// Ignored without `--impaired`, which is the flag that selects the profile
+    /// at all.
+    #[arg(long)]
+    loss: Option<f64>,
+
     /// Proxy pops tolerated before the clause fails.
     ///
     /// Zero on a clean link — that is P1's criterion. Under loss a peer ranks
@@ -159,6 +179,18 @@ struct Args {
     /// demotion ramp produced 2870 pops in a five-minute run.
     #[arg(long, default_value_t = 0)]
     max_pops: u64,
+
+    /// Packets the send path may shed for want of budget before the clause
+    /// fails.
+    ///
+    /// Zero is the criterion, and zero is what the cruise-only runs hold on
+    /// both links. The witness lane makes a small transient real: at island
+    /// formation a peer recovering from a hitch serves its witnesses' repair
+    /// burst on the unsheddable control lane and sheds the cheap lane to afford
+    /// it. What says that is a transient and not an overrun is that the count
+    /// is the same at five simulated minutes as at one hour.
+    #[arg(long, default_value_t = 0)]
+    max_shed: u64,
 
     /// Seed for impairment and the universe.
     #[arg(long, default_value_t = 1)]
@@ -185,6 +217,15 @@ struct Args {
     #[arg(long)]
     witness: bool,
 
+    /// Stamp the report with the wall-clock second the run started.
+    ///
+    /// Off by default, and outside the report's identity block when on: a run
+    /// is a function of its seed, and a timestamp inside the reproducible body
+    /// would make two identical runs compare unequal. Evidence uploads want it;
+    /// a developer comparing two seeds does not.
+    #[arg(long)]
+    stamp_wall_clock: bool,
+
     /// Structural self-check for CI images with no time to run a swarm.
     #[arg(long)]
     self_test: bool,
@@ -208,13 +249,19 @@ fn main() -> Result<()> {
         cell_edge_m: bot::default_cell_edge_m(),
         send_hz: 20,
         impairment: if args.impaired {
-            Impairment::p4_profile()
+            args.loss
+                .map_or_else(Impairment::p4_profile, Impairment::p4_profile_at_loss)
         } else {
             Impairment::default()
         },
         seed: args.seed,
         late_join_tick,
         witnessing: args.witness,
+        started_at_unix_secs: args.stamp_wall_clock.then(|| {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |since| since.as_secs())
+        }),
     };
 
     eprintln!(
@@ -234,6 +281,17 @@ fn main() -> Result<()> {
     );
 
     let report = Swarm::new(config).run();
+
+    // Printed as well as serialized: a nightly log is often all that survives a
+    // failed job, and a figure that cannot be traced to a seed and a commit is
+    // not evidence.
+    eprintln!(
+        "p1-swarm: seed {}, target {}, commit {}, witness {}",
+        report.identity.seed,
+        report.identity.target,
+        report.identity.commit,
+        if report.witnessing { "on" } else { "off" },
+    );
 
     eprintln!(
         "p1-swarm: worst peak upload {} kbps (budget {} kbps), worst p99 {} kbps",
@@ -298,7 +356,12 @@ fn main() -> Result<()> {
         eprintln!("p1-swarm: report written to {path}");
     }
 
-    let failures = report.against_criterion(BUDGET_BITS, args.min_cells, args.max_pops);
+    let failures = report.against_criterion(Criterion {
+        budget_bits: BUDGET_BITS,
+        min_cells: args.min_cells,
+        max_pops: args.max_pops,
+        max_shed: args.max_shed,
+    });
     if failures.is_empty() {
         eprintln!("p1-swarm: every clause of the P1 criterion holds");
         return Ok(());
@@ -330,13 +393,23 @@ fn self_test() -> Result<()> {
         "the harness observes what it sends",
         "no false-positive discrepancy signal against an honest peer",
         "the witness sees the stream it is judging",
+        // The third witnessing clause, and the one the other two are unreadable
+        // without: a witness that has stopped watching also accuses nobody.
+        "the witness keeps watching for the whole run",
+        "the link drains",
         "the late-join check is not vacuous",
         "interest churn absorbed without visible proxy pops",
         "no entity thrashes cells at a boundary",
         "roaming across ≥64 interest cells",
         "a late joiner receives only its 27-cell neighborhood",
     ] {
-        if !source.contains(clause) {
+        // Matched at the push site — `clause: "…"` — rather than anywhere in
+        // the file. The unit tests in that module name every clause they
+        // exercise, so a bare substring search would be satisfied by the test
+        // that was meant to be protecting it, and deleting the clause itself
+        // would go unnoticed. This form also asserts the stronger thing: the
+        // string is wired to a failure, not merely mentioned.
+        if !source.contains(&format!("clause: {clause:?}")) {
             bail!("self-test: criterion clause absent: {clause}");
         }
     }

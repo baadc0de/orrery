@@ -37,12 +37,16 @@ use std::collections::VecDeque;
 use bytes::Bytes;
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
+use serde::Serialize;
 
 use orrery_net::peer_link::StreamMode;
 use orrery_protocol::NodeId;
 
 /// Link conditions applied to every packet the router carries.
-#[derive(Debug, Clone, Copy)]
+///
+/// Serializable because a report that does not name the link it was measured
+/// over cannot be compared against another one.
+#[derive(Debug, Clone, Copy, Serialize)]
 pub struct Impairment {
     /// Fraction of packets dropped, 0.0–1.0.
     pub loss: f64,
@@ -73,10 +77,21 @@ impl Impairment {
     ///
     /// 100 ms at 60 Hz is six ticks — the delay a witness must absorb without
     /// deciding a chain has a hole that will never fill.
+    ///
+    /// 3% is the *floor* of the criterion's 3–5% band, and it is what the
+    /// nightly gate runs. The other end is reachable through
+    /// [`Self::p4_profile_at_loss`] rather than hardcoded, because a band that
+    /// only ever gets exercised at one end is a band in name.
     #[must_use]
     pub fn p4_profile() -> Self {
+        Self::p4_profile_at_loss(0.03)
+    }
+
+    /// The P4 profile at a chosen point in the criterion's 3–5% loss band.
+    #[must_use]
+    pub fn p4_profile_at_loss(loss: f64) -> Self {
         Self {
-            loss: 0.03,
+            loss,
             jitter_ticks: 6,
             jitter_rate: 0.10,
             retransmit_ticks: 3,
@@ -551,6 +566,14 @@ mod tests {
         assert_eq!(profile.jitter_ticks, 6, "100 ms at 60 Hz");
         assert!(!profile.is_clean());
         assert!(Impairment::default().is_clean());
+
+        // The far end of the band differs in loss and in nothing else — the
+        // jitter spike is stated separately by the criterion.
+        let worst = Impairment::p4_profile_at_loss(0.05);
+        assert!((0.03..=0.05).contains(&worst.loss));
+        assert_eq!(worst.jitter_ticks, profile.jitter_ticks);
+        assert_eq!(worst.jitter_rate, profile.jitter_rate);
+        assert_eq!(worst.retransmit_ticks, profile.retransmit_ticks);
     }
 }
 
