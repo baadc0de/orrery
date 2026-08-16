@@ -98,7 +98,10 @@ altogether. Both are gated now. `clippy` needs only metadata, so the `fdb` pass
 runs with no `libfdb_c` on the runner. Vendored crates under `vendor/` are
 excluded — their findings are upstream's to fix — and the run passes
 `--no-deps`, without which `--exclude` does not actually spare them: they are
-still path dependencies, and clippy lints those too.
+still path dependencies, and clippy lints those too. The workspace test job
+excludes the same three: `bevy_replicon`'s own tests and doctests do not compile
+under this workspace's feature unification, because `bevy/serialize` is off and
+they need `Transform: Serialize`.
 
 One thing to know while you are in there: **`[workspace.lints]` currently
 reaches only the vendored crates.** `vendor/aeronet_iroh`,

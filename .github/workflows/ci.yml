@@ -169,9 +169,19 @@ jobs:
           restore-keys: test-${{ runner.os }}-
 
       # The full workspace pulls bevy, iroh and tonic. It runs on one platform
-      # because that cost is not what the other four legs are for: the portable
-      # spine is tested on all of them in `determinism` below.
-      - run: cargo test --workspace
+      # because that cost is not what the other legs are for: the portable spine
+      # is tested on all of them in `determinism` below.
+      #
+      # Vendored crates are excluded for the same reason clippy excludes them:
+      # bevy_replicon's own tests and doctests do not compile under this
+      # workspace's feature unification (`bevy/serialize` is off, so
+      # `Transform: Serialize` is unsatisfied). That is upstream's build to fix,
+      # and it is not what this repo is testing.
+      - run: |
+          cargo test --workspace \
+            --exclude bevy_replicon \
+            --exclude aeronet_iroh \
+            --exclude aeronet_tokio_runtime
 
   determinism:
     name: determinism (${{ matrix.label }})
