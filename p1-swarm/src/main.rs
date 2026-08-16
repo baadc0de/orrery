@@ -41,21 +41,50 @@
 //! the cost that grew faster than the peer count is linear again — 32 peers
 //! over 60 simulated seconds runs in about ten wall seconds.
 //!
-//! At eight and sixteen peers it now holds the criterion: **zero false
-//! positives at 100% observation coverage**, over runs of 30, 120 and 300
-//! simulated seconds. Both numbers are printed together because neither is
-//! readable alone — a witness that has stopped watching also reports zero.
+//! It holds the criterion at eight, sixteen and thirty-two peers: **zero false
+//! positives at 100% observation coverage** on a clean link, and zero at 96%
+//! under the 3% loss / 100 ms jitter profile. Both numbers are printed together
+//! because neither is readable alone — a witness that has stopped watching also
+//! reports zero.
 //!
-//! At thirty-two the failure has moved out of the witness and into the budget.
-//! Peak upload reaches 1006 kbps against the 1 Mbps allowance and ~15 000
-//! replication packets are shed; the shed frames are holes, the holes are
-//! repairs, and the repairs are what push coverage back to 81% and the false
-//! positives back to 263. The same population without `--witness` sits at
-//! 739 kbps and passes every clause, so what does not fit is the witness lane
-//! itself: seven links per peer at the 20 Hz frame cadence, against
-//! docs/03-replication.md §5.3's 20–30 kb/s per link. That is a parameter
-//! question — link count, frame cadence, or the share witnessing may have —
-//! rather than a defect, and it is what P4 has to settle next.
+//! # What thirty-two peers cost, and which dial paid for it
+//!
+//! Thirty-two used to fail, and not as a bandwidth nuisance: peak upload reached
+//! 1006 kbps against the 1 Mbps allowance, ~15 000 replication packets were
+//! shed, and because the backstop shed log frames and replication updates
+//! indifferently, every shed frame opened a chain hole, every hole became a
+//! repair on the unsheddable control lane, coverage fell to 81% and 582 signals
+//! were raised against bots that are honest by construction. A false-positive
+//! count taken at 81% coverage is a statement about which frames arrived.
+//!
+//! The lane was at 384 kbps per peer against docs/03-replication.md §5.3's
+//! 0.15–0.2 Mbps, and the cause was neither the seven links nor the 2 Hz claims
+//! but the **frame cadence**: one frame per 20 Hz send, of which ~250 of 316
+//! wire bytes — signature, ruleset digest, head pair, datagram framing — is paid
+//! per *frame* rather than per tick. Frames now cover ten ticks at 6 Hz, derived
+//! from a declared 20% share of the peer budget (docs/03-replication.md §5.3a),
+//! which is still four times faster than the 250 ms sustained-violation window
+//! that has to elapse before any signal is actionable.
+//!
+//! | 32 peers, 300 simulated seconds, clean link | 20 Hz frames | 6 Hz frames |
+//! |---|---|---|
+//! | Witness lane per peer | 384 kbps wanted | **190 kbps** (share: 200) |
+//! | Worst peak upload | **1006 kbps** | 973 kbps |
+//! | Replication packets shed | 14 630 | 200 |
+//! | Observation coverage | 81.3% | **100.0%** |
+//! | False positives | 582 | **0** |
+//!
+//! Over the criterion's full simulated hour the lane sits at 194 kbps across
+//! **32 accumulated player-hours, zero false positives, 100% coverage**.
+//!
+//! The residual 200 shed packets are replication bytes belonging to the four
+//! stalling peers in the densest part of the crowd, and the count is *identical*
+//! at five minutes and at one hour — a transient at island formation rather than
+//! a sustained overrun. What produces it is the preference order working: a peer
+//! recovering from a client hitch serves its witnesses' repair burst on the
+//! control lane, which is never shed, and sheds the cheap lane to afford it.
+//! Which is why the report prints the per-lane split — so the next overrun names
+//! its own cause instead of being attributed to whichever lane was suspected.
 //!
 //! Coverage is printed at all because of what it caught. Before re-anchoring
 //! existed, a watch that gave up on a hole stopped judging its subject
@@ -211,6 +240,16 @@ fn main() -> Result<()> {
         report.worst_peak_upload_bits / 1_000,
         BUDGET_BITS / 1_000,
         report.worst_p99_upload_bits / 1_000,
+    );
+    eprintln!(
+        "p1-swarm: witness lane {} kbps per peer against its {} kbps share ({:.0}% of all bytes sent); \
+         replication {} kB, witness {} kB, control {} kB",
+        report.witness_lane_bits_per_sec / 1_000,
+        BUDGET_BITS * orrery_witness::plugin::WITNESS_LANE_SHARE_PCT / 100 / 1_000,
+        report.witness_lane_share * 100.0,
+        report.replication_bytes / 1_000,
+        report.witness_bytes / 1_000,
+        report.control_bytes / 1_000,
     );
     eprintln!(
         "p1-swarm: least-travelled peer visited {} cells; {} packets shed; link carried {} delivered / {} dropped",

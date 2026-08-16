@@ -178,7 +178,35 @@ effective_priority(E, L) =
 
 - **Send rate: 20 Hz default, up to 30 Hz for small islands** (D8) against the 60 Hz sim tick — i.e. every 3rd (resp. 2nd) tick. Send ticks are the only baseline-eligible ticks.
 - Per-link byte budget = peer upload budget (**≤1 Mbps** sustained, D6) divided across active links by link class: interest-set links weighted above proxy-only links. Field hosts use datacenter budgets (hot-cell egress ≤ 35 Mbps at the 128-player ceiling, D6).
-- Datagrams are coalesced per link per send tick (one or two QUIC datagrams; no head-of-line blocking against control streams, D3). Witness log records (`LogFrame`s, plus 2 Hz `StateClaim`s, D9) ride in the same datagrams at low priority — but **only on links to cell-epoch witness-set members** (≤ 7 links; in the promoted regime, to the field host only), never the whole interest set. They are small (sparse input records + truncated rolling heads) and share the accumulator; a witness that detects a chain gap from the rolling heads repairs it with `LogRangeRequest`/`Response` over the reliable control stream. Wire shapes and streaming rules are canonical in [06-verifiable-core.md](06-verifiable-core.md); this document agrees with it.
+- Datagrams are coalesced per link per send tick (one or two QUIC datagrams; no head-of-line blocking against control streams, D3). Witness log records (`LogFrame`s, plus 2 Hz `StateClaim`s, D9) ride the same state lane at low priority — but **only on links to cell-epoch witness-set members** (≤ 7 links; in the promoted regime, to the field host only), never the whole interest set. A witness that detects a chain gap from the rolling heads repairs it with `LogRangeRequest`/`Response` over the reliable control stream. Wire shapes are canonical in [06-verifiable-core.md](06-verifiable-core.md); this document owns what the lane may *spend*, which is §5.3a.
+
+### 5.3a The witness lane's budget share, and the cadence that holds it
+
+**The lane gets 20% of the peer upload budget — 0.2 Mbps of the ≤ 1 Mbps ceiling — and the frame cadence is derived from that share rather than inherited from the send rate.** `orrery_witness::plugin::WITNESS_LANE_SHARE_PCT` is the share and `frame_interval_ticks` is the derivation; at the D16 defaults it yields **one frame per 10 ticks — 6 Hz — covering ten ticks each**, against the 20 Hz send rate and the unchanged 2 Hz claim cadence.
+
+Frames used to be cut one per send, so that the chain a witness follows lined up with the datagrams it already received. That alignment bought nothing a witness uses, and it cost a great deal:
+
+| Per frame, on the wire | Bytes | Per *frame* or per *tick*? |
+|---|---|---|
+| IP+UDP+QUIC framing | 60 | frame |
+| ed25519 frame signature | 64 | frame |
+| `RulesetId` (32-byte build digest + version) | 33 | frame |
+| Full `(prev_head, head)` pair for the signature preimage | 67 | frame |
+| Tick base, slice framing, rolling heads | ~26 | frame |
+| Sparse `InputRecord`s | 20 each | **tick** |
+
+About **250 of a 316-byte frame is paid per frame**, so the fixed cost per tick of audited timeline falls almost linearly with the cadence: at 3 ticks per frame the lane wants ~55 kb/s per link and at 10 it wants ~26 kb/s, for the same audited timeline and the same signatures over it.
+
+Nothing is lost by the stretch, because nothing downstream is that fast. [07-witnessing.md](07-witnessing.md) §3 arms an audit only on a violation *sustained past the 250 ms window* — a single spike is packet loss, not a cheat — and the adjudication window cap is 3 s. A frame every **167 ms** lands strictly before the earliest tick at which any signal it carries could be acted on.
+
+Two rules bound the dial:
+
+- **The cadence divides the claim interval.** §3's adjudication windows must end at a claim tick; a cadence coprime with the 30-tick claim interval puts most claims mid-frame, where a witness holding a partial fold defers instead of judging — visible only as observation coverage falling, never as an error.
+- **The claim cadence itself is not on the dial.** A claim is the re-anchor point a witness restarts from after a hole, so stretching it lengthens exactly the window in which a witness is shown timeline it cannot judge. At ~4 kb/s per link claims are a sixth of the lane; there is nothing there worth buying with coverage.
+
+**Witness records are not sheddable** (`orrery_net::budget::is_sheddable`), which reads backwards against "low priority" until you follow what shedding one costs. A replication datagram dropped over budget is superseded 50 ms later by the next; a log frame dropped over budget is a hole in a hash chain, and the hole is repaired by a `LogRangeRequest` and its response on the **control lane, which cannot be shed at all**. Shedding the witness lane therefore does not relieve an overrun, it deepens one — and moves the cost somewhere the backstop cannot reach. The lane is bounded at *source* by its share instead, which is what makes "low priority" mean *low in what it may spend* rather than *first to be dropped once spent*.
+
+The measurement is in §8.
 - The persistence uplink is a separate consumer: `orrery_persist_client` schedules replicon change-detection diffs to the gateway at ~1–4 Hz per entity with its own accumulator instance over the same code path (D11). Uplinked diffs are keyed by the entity's **`PersistId`** — a replicated component, written only by the entity's owner and maintained by `orrery_persist_client`, that is the canonical Bevy `Entity` ↔ `PersistId` mapping on every peer ([08-persistence.md](08-persistence.md)).
 
 ### 5.4 Terrain replication
@@ -236,7 +264,7 @@ Assume each peer authors ~6 changing entities (player + held/contested objects),
 |---|---|---|
 | Upload per peer | 7 links × 20 Hz × (6×25 B + 60 B) | ≈ 235 kbps |
 | Receive per peer | 7 senders × 20 Hz × (6×25 B + 60 B) | ≈ 235 kbps |
-| Witness log stream (upload) | ≤ 7 witness links × 20–30 kbps (1–2 authored core entities, [06-verifiable-core.md](06-verifiable-core.md)) | ≈ 0.15–0.2 Mbps |
+| Witness log stream (upload) | ≤ 7 witness links × 27 kbps (6 Hz frames + 2 Hz claims, 1–2 authored core entities, §5.3a) | ≈ 0.19 Mbps |
 | Headroom vs 1 Mbps | — | ~2× |
 
 ### Interest mesh (9–32, partial mesh)
@@ -251,7 +279,7 @@ n = 32 players, ~100 additional replicable world entities in a typical AOI. Conn
 | **Receive total** | | **≈ 260–300 kbps** — consistent with Donnybrook's ~12·n kb/s ⇒ 384 kbps at n = 32 (D6) |
 | Upload, typical | own player high-rate to ~10 subscribers + proxies to rest | ≈ 150 kbps |
 | Upload, worst case (everyone's focus) | 31 links × 20 Hz × (25 B + 60 B) | ≈ 420 kbps |
-| Witness log stream (upload) | ≤ 7 witness links × 20–30 kbps typical (1–2 authored core entities); worst case 8 core entities ≈ 60 kbps/link | ≈ 0.15–0.2 Mbps typical, ≈ 0.4 Mbps worst |
+| Witness log stream (upload) | ≤ 7 witness links × 27 kbps typical (§5.3a); worst case 8 core entities ≈ 55 kbps/link | ≈ 0.19 Mbps typical, ≈ 0.39 Mbps worst |
 
 The worst-case upload row is the empirical mesh ceiling: at n = 64 it would be ≈ 870 kbps for a *single* authored entity — the reason promotion triggers at **>32 sustained** (D6) rather than at a bandwidth alarm.
 
@@ -262,13 +290,34 @@ n = 64 in the hot cell, scaled to the 128-player ceiling; the field host holds c
 | Flow | Arithmetic | Result |
 |---|---|---|
 | Peer upload | 1 link × 20 Hz × (2×25 B + 60 B) + intents ≈ 10 kbps | ≈ 28 kbps |
-| Witness log stream (upload) | logs go to the **field host only** in this regime: 1 link × 20–30 kbps (1–2 authored core entities) | ≈ 20–30 kbps per peer |
+| Witness log stream (upload) | logs go to the **field host only** in this regime: 1 link, and §5.3a's derivation gives the whole share to it — cadence tightens to the 20 Hz send rate again | ≤ 0.2 Mbps per peer |
 | Peer receive | 96 kbps (24 high-rate) + ~150 proxies × 2 Hz × 40 B = 96 kbps + 20 Hz × 60 B | ≈ 200 kbps |
 | Field host receive | 64 peers × 28 kbps + 64 log streams × 20–30 kbps | ≈ 1.8 Mbps + ≈ 1.3–1.9 Mbps logs |
 | Field host send (n = 64) | 64 peers × 200 kbps | ≈ 12.8 Mbps |
 | Field host send (n = 128 ceiling) | 128 peers × 200 kbps, plus proxy-set growth | ≈ 25.6+ Mbps — inside the ≤ 35 Mbps hot-cell egress budget (D6) |
 
-Witness-stream compute is as bounded as its bandwidth: a sender produces **one `LogFrame` signature per send per link** — 20 Hz × ≤ 7 links = ≤ 140 signatures/s, ~2–3 ms/s of CPU — and a witness verifies 20 frames/s per watched authority ([06-verifiable-core.md](06-verifiable-core.md)).
+Witness-stream compute is bounded by the same dial as its bandwidth: a sender produces **one `LogFrame` signature per frame per link** — at §5.3a's 6 Hz cadence, 6 Hz × ≤ 7 links = ≤ 42 signatures/s, under 1 ms/s of CPU — and a witness verifies 6 frames/s per watched authority ([06-verifiable-core.md](06-verifiable-core.md)). The cadence therefore buys signature cost at the same rate it buys bytes, which is worth knowing before anyone proposes raising it.
+
+### Measured, at the criterion population
+
+`p1-swarm --peers 32 --seconds 300 --witness` (32 peers, 5 simulated minutes, clean link, mixed cruise/idle/burst/stall profiles), before and after the lane got a share and a derived cadence:
+
+| | Frames at 20 Hz (one per send) | Frames at 6 Hz (derived from the share) |
+|---|---|---|
+| Witness lane, per peer | 384 kb/s wanted, 267 kb/s achieved under shedding | **190 kb/s**, against its 200 kb/s share |
+| Worst peak upload | **1006 kb/s** — over the ≤ 1 Mbps budget | 973 kb/s |
+| Replication packets shed | 14 630 | 200 |
+| Chain gaps | 9 224 | 2 072 |
+| Observation coverage | **81.3%** | **100.0%** |
+| False positives against honest peers | 582 | **0** |
+
+(The 20 Hz column's peak is *over* the ceiling because control-lane traffic is charged even when it cannot be shed; the 6 Hz column's is a true ceiling, since the backstop trims the last burst below it.)
+
+The two rows that matter are the last two, and they are the reason a witness lane over budget is not merely a bandwidth problem. Shed replication *and* shed frames were indistinguishable to the backstop; every shed frame opened a hole; the holes became repairs; the repairs crowded the lane further; and coverage fell to 81%, at which point the false-positive count is a statement about which frames arrived rather than about the rules. A false-positive rate measured under shedding cannot exit P4 whatever its value.
+
+The same run at 8 and 16 peers holds at 0 shed, 0 false positives and 100% coverage, with the lane flat at 190 kb/s — flat because it is ≤ 7 links regardless of island size, which is the whole point of fanning out to the witness set rather than the interest set. Over the criterion's full simulated hour at 32 peers the lane sits at 194 kb/s across **32 accumulated player-hours, zero false positives and 100% coverage**; under the 3% loss / 100 ms jitter profile, coverage 96.0% and false positives zero.
+
+The residual 200 shed packets are replication rather than witness bytes, they belong to the four stalling peers in the densest part of the crowd, and **the count is identical at five minutes and at one hour** — so they are a transient at island formation, not a sustained overrun. What produces them is the designed order of preference: a peer recovering from a client hitch serves its witnesses' repair burst on the unsheddable control lane and sheds the cheap lane to afford it. The witness lane is inside its share throughout.
 
 ## 9. Failure modes
 

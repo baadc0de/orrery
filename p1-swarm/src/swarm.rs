@@ -177,6 +177,28 @@ pub struct SwarmReport {
     /// blind within about twenty-five simulated seconds and this figure decayed
     /// towards zero while the run kept accumulating player-hours.
     pub observation_coverage: f64,
+    /// Wire bytes the swarm spent on replicated entity state.
+    pub replication_bytes: u64,
+    /// Wire bytes the swarm spent on the verifiable-core lane: log frames and
+    /// state claims (docs/03-replication.md §7).
+    pub witness_bytes: u64,
+    /// Wire bytes the swarm spent on the reliable lane, gap repairs included.
+    pub control_bytes: u64,
+    /// The witness lane's share of everything sent, 0.0–1.0.
+    ///
+    /// A share of *traffic*, not of budget — informative about the mix, and not
+    /// the number the cadence is chosen against. Use
+    /// [`Self::witness_lane_bits_per_sec`] for that.
+    pub witness_lane_share: f64,
+    /// The witness lane's sustained cost, in bits per simulated second **per
+    /// peer**.
+    ///
+    /// The figure `orrery_witness::plugin::WITNESS_LANE_SHARE_PCT` bounds, and
+    /// the one docs/03-replication.md §5.3 states as `≈ 0.15–0.2 Mbps`. Printing
+    /// it beside the peak upload is what turns "a peer went over budget" into
+    /// "this lane went over its share" — or, when it has not, points the
+    /// finding at the other lane.
+    pub witness_lane_bits_per_sec: u64,
     /// Link statistics.
     pub link: LinkReport,
     /// The late-join check, if one ran.
@@ -709,6 +731,20 @@ impl Swarm {
             })
             .collect();
 
+        // Summed across the swarm rather than taken from the worst peer: the
+        // share is a property of the traffic mix, and one peer's mix is noisy
+        // when profiles differ.
+        let lanes = self.bots.iter().map(Bot::lanes).fold(
+            orrery_net::budget::LaneTally::default(),
+            |mut total, peer| {
+                total.replication_bytes += peer.replication_bytes;
+                total.witness_bytes += peer.witness_bytes;
+                total.control_bytes += peer.control_bytes;
+                total.replication_shed += peer.replication_shed;
+                total
+            },
+        );
+
         SwarmReport {
             peers: self.bots.len(),
             seconds: self.config.seconds,
@@ -752,6 +788,14 @@ impl Swarm {
                 } else {
                     judged as f64 / shown as f64
                 }
+            },
+            replication_bytes: lanes.replication_bytes,
+            witness_bytes: lanes.witness_bytes,
+            control_bytes: lanes.control_bytes,
+            witness_lane_share: lanes.witness_share(),
+            witness_lane_bits_per_sec: {
+                let peer_seconds = self.config.peers as u64 * self.config.seconds.max(1);
+                lanes.witness_bytes * 8 / peer_seconds.max(1)
             },
             link: self.router.counters.into(),
             per_peer,
