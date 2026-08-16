@@ -29,6 +29,34 @@ env:
   CARGO_INCREMENTAL: 0
 
 jobs:
+  p1-swarm:
+    name: P1 swarm gate (32 peers, one simulated hour, clean + impaired)
+    runs-on: ubuntu-latest
+    # Two simulated hours take about five minutes of wall clock — the hour is
+    # simulated, so it costs what it costs to compute. The build dominates.
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install the pinned toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+      - name: Install Bevy's Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            g++ pkg-config libx11-dev libasound2-dev libudev-dev \
+            libwayland-dev libxkbcommon-dev
+
+      - name: Run the swarm gate
+        run: scripts/p1-swarm-gate.sh
+
+      - name: Upload the gate's evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: p1-swarm-evidence
+          path: target/p1-swarm/
+          if-no-files-found: warn
+
   p3-island:
     name: P3 island gate (kill -9, 8 peers)
     runs-on: ubuntu-latest

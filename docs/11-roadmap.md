@@ -63,6 +63,10 @@ they happened to connect.
 
 **Demo criterion.** 32 synthetic peers (headless bot harness, scripted roaming across ≥64 interest cells) run for one hour: every peer's sustained upload stays ≤ 1 Mbps; interest-set membership churn is absorbed without visible proxy pops; no entity thrashes cells at a boundary; a late-joining peer receives only its 27-cell neighborhood.
 
+**Met**, by `p1-swarm` (`scripts/p1-swarm-gate.sh`), on a clean link and under P4's 3% loss / 100 ms jitter profile. Measured over the criterion's hour: worst peak upload 719 kbps against the 1 Mbps budget, 133 cells for the least-travelled peer, zero boundary flips and zero proxy pops across 75 k interest-set churn events, and a late joiner tracking only peers inside its neighbourhood. The hour is simulated — each peer's clock advances one 60 Hz tick per frame — so the run costs ~2.5 minutes and is reproducible from its seed.
+
+The harness runs the shipping plugins; only the socket is stood in for, by an in-process router with seeded impairment (transport is P0's criterion, and P4 needs loss to be a reproducible parameter rather than a netem setup). Island *formation* is likewise installed rather than negotiated, because forming one is P3's criterion and is separately proven.
+
 **Upstream milestone.** big_space 0.19 port PR upstream; visibility-API ergonomics feedback/patches to bevy_replicon.
 
 ## P2 — Persistence MVP

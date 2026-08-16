@@ -29,6 +29,8 @@ exclude = [
     "p0-dashboard",
     "p2-load",
     "p2-dashboard",
+    "p3-island",
+    "p1-swarm",
 ]
 
 # Pinned versions per D14 (docs/adr/0014-pinned-versions.md), ecosystem as of Aug 2026.

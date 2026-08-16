@@ -151,6 +151,12 @@ jobs:
       - name: P3 island gate self-test
         run: scripts/p3-island-gate.sh --self-test
 
+      # P1's harness needs no cluster and its hour is simulated, so unlike the
+      # two above it *can* run for real — it does, nightly. Per-commit it gets
+      # the same structural self-test, which is the cheap half.
+      - name: P1 swarm gate self-test
+        run: scripts/p1-swarm-gate.sh --self-test
+
   test:
     name: workspace tests
     runs-on: ubuntu-latest

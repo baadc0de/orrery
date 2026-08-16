@@ -1,0 +1,57 @@
+[package]
+name = "p1-swarm"
+version = "0.1.0"
+edition = "2021"
+description = "P1 replication harness: N headless peers roaming a cell grid, proving the upload budget, interest churn, hysteresis and late-join scope the phase gate requires"
+license = "MIT"
+
+# Standalone tool, following the `p2-load` / `p3-island` precedent: its own
+# `[workspace]` so it builds against its own lockfile.
+#
+# Unlike `p3-island`, which deliberately avoided the Bevy stack because the
+# property under test was registrar-side, this harness *is* the Bevy stack —
+# `orrery_spatial`'s AOI and interest selection, `orrery_net`'s send path and
+# upload meter, `orrery_witness`'s log stream. Every decision under test is made
+# by the shipping plugins.
+#
+# What it does not use is a real socket. Peers are coupled by an in-process
+# router that moves bytes between their session buffers, for two reasons: the
+# criterion's assertions are all about what a peer *decides* to send and how it
+# reacts to what it receives, and P4's follow-on criterion demands injected
+# impairment (3–5% loss, 100 ms jitter) which is a parameter here and a netem
+# setup over a real link. Transport itself is P0's criterion, already met.
+[workspace]
+
+[[bin]]
+name = "p1-swarm"
+path = "src/main.rs"
+
+[dependencies]
+orrery_protocol = { path = "../crates/orrery_protocol" }
+orrery_net = { path = "../crates/orrery_net" }
+orrery_spatial = { path = "../crates/orrery_spatial" }
+orrery_core = { path = "../crates/orrery_core" }
+orrery_witness = { path = "../crates/orrery_witness" }
+# The reference ruleset: kinematic movement plus an integer combat core. Using
+# the conformance kernel rather than a harness-local toy means the bots exercise
+# the same rules the determinism matrix pins.
+orrery_conformance = { path = "../crates/orrery_conformance" }
+
+# Versions mirror the root workspace's D14 pins exactly (a standalone
+# `[workspace]` cannot inherit `workspace.dependencies`).
+bevy_app = { version = "0.19", default-features = false }
+bevy_ecs = { version = "0.19", default-features = false }
+bevy_math = { version = "0.19", default-features = false }
+bevy_time = { version = "0.19", default-features = false }
+aeronet_io = "0.21.0"
+bevy_platform = { version = "0.19", default-features = false, features = ["std"] }
+iroh-base = { version = "1.0.3", default-features = false, features = ["key"] }
+bytes = "1"
+glam = { version = "0.32", features = ["serde"] }
+libm = "0.2"
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+rand = "0.9"
+rand_chacha = "0.9"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

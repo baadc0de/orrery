@@ -12,11 +12,13 @@
 //! (docs/01-spatial-model.md §6). Proxies refresh between 1 and 4 Hz (D16),
 //! nearer proxies refreshing faster.
 
+use core::time::Duration;
 use std::collections::{HashMap, HashSet};
 use std::ops::RangeInclusive;
 
 use bevy_ecs::prelude::*;
 use bevy_math::Vec3;
+use bevy_time::{Real, Time};
 
 use crate::config::SpatialConfig;
 use crate::hysteresis::GridPosition;
@@ -82,7 +84,9 @@ pub fn rank_by_distance<K: Copy>(
 
 /// Split a ranked list into the bounded high-rate set and the proxies.
 ///
-/// The first `cap` (nearest) entries are high-rate; the rest are proxies.
+/// The first `cap` (nearest) entries are high-rate; the rest are proxies. This
+/// is the memoryless cut — see [`select_high_rate`] for the one the design
+/// actually specifies, which this is the `incumbents.is_empty()` case of.
 #[must_use]
 pub fn split_high_rate<K: Copy>(ranked: Vec<(K, f32)>, cap: usize) -> (Vec<K>, Vec<(K, f32)>) {
     let cap = cap.min(ranked.len());
@@ -91,6 +95,74 @@ pub fn split_high_rate<K: Copy>(ranked: Vec<(K, f32)>, cap: usize) -> (Vec<K>, V
         near.iter().map(|(k, _)| *k).collect(),
         far.iter().map(|(k, d)| (*k, *d)).collect(),
     )
+}
+
+/// The margin a challenger must beat an incumbent by to take its slot (D6,
+/// docs/03-replication.md §4.1).
+pub const EVICTION_MARGIN: f32 = 0.15;
+
+/// How often set membership is re-evaluated (docs/03-replication.md §4.1).
+///
+/// Membership is *sticky between rescores*. Together with the margin this is
+/// what bounds flap frequency: §9.5 names two near-tied entities alternating in
+/// and out of the 24 slots as the failure, because each swap resets an
+/// interpolation buffer and churns a baseline, and a player sees that as a
+/// stutter.
+pub const RESCORE_HZ: f32 = 1.0;
+
+/// Choose the high-rate set, keeping incumbents unless clearly beaten.
+///
+/// `ranked` is nearest-first with **squared** distances. An incumbent holds its
+/// slot until a challenger is more than [`EVICTION_MARGIN`] closer; free slots
+/// go to the best challengers regardless.
+///
+/// Comparing on squared distance means the margin is squared too: being 15%
+/// closer is `d_challenger · 1.15² ≤ d_incumbent`. Applying the raw 15% to
+/// squared values would silently ask for a ~7% margin instead.
+#[must_use]
+pub fn select_high_rate<K: Copy + PartialEq>(
+    ranked: &[(K, f32)],
+    incumbents: &[K],
+    cap: usize,
+) -> Vec<K> {
+    let margin = (1.0 + EVICTION_MARGIN) * (1.0 + EVICTION_MARGIN);
+
+    // Incumbents that are still candidates at all, best first.
+    let mut held: Vec<(K, f32)> = ranked
+        .iter()
+        .filter(|(key, _)| incumbents.contains(key))
+        .copied()
+        .collect();
+    let mut challengers: Vec<(K, f32)> = ranked
+        .iter()
+        .filter(|(key, _)| !incumbents.contains(key))
+        .copied()
+        .collect();
+
+    // Free slots go to the best challengers: holding a slot empty against a
+    // newcomer would bound flap by starving the set.
+    while held.len() < cap && !challengers.is_empty() {
+        held.push(challengers.remove(0));
+    }
+
+    // Contested slots: the worst incumbent yields only to a decisively better
+    // challenger. Both lists are sorted, so one pass from each end suffices.
+    for challenger in challengers {
+        let Some((worst_index, worst)) = held
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1 .1.total_cmp(&b.1 .1))
+            .map(|(index, entry)| (index, entry.1))
+        else {
+            break;
+        };
+        if challenger.1 * margin <= worst {
+            held[worst_index] = challenger;
+        }
+    }
+
+    held.sort_by(|a, b| a.1.total_cmp(&b.1));
+    held.into_iter().map(|(key, _)| key).collect()
 }
 
 /// The proxy refresh rate for an entity at `dist` grid units, within
@@ -102,6 +174,41 @@ pub fn proxy_rate_hz(dist: f32, proxy_hz: &RangeInclusive<f32>) -> f32 {
     let max_hz = *proxy_hz.end();
     let t = (dist / AOI_RADIUS_GRID).clamp(0.0, 1.0);
     max_hz - t * (max_hz - min_hz)
+}
+
+/// How long a freshly demoted entity's proxy stream takes to decay from the
+/// maximum rate to its scored one (docs/03-replication.md §9.5).
+pub const DEMOTION_RAMP: Duration = Duration::from_secs(5);
+
+/// The rate a demoted entity actually gets, ramping down from the maximum.
+///
+/// **This is what makes churn invisible.** §9.5's answer to interest-set
+/// flapping is not to prevent demotion — a crowd moving past you genuinely
+/// changes who your nearest two dozen entities are — but to cover it: a
+/// just-demoted entity keeps streaming at the top of the proxy range and decays
+/// to its scored rate over [`DEMOTION_RAMP`], so an entity that re-promotes
+/// shortly after never went below a rate the client could interpolate through.
+/// Dropping it straight to a distance-scored 1 Hz is the stutter the player
+/// sees.
+///
+/// Returns the scored rate unchanged for an entity that has been a proxy longer
+/// than the ramp, or was never in the set to begin with.
+#[must_use]
+pub fn ramped_proxy_rate(
+    scored_hz: f32,
+    since_demotion: Option<Duration>,
+    proxy_hz: &RangeInclusive<f32>,
+) -> f32 {
+    let Some(elapsed) = since_demotion else {
+        return scored_hz;
+    };
+    if elapsed >= DEMOTION_RAMP {
+        return scored_hz;
+    }
+    let max_hz = *proxy_hz.end();
+    let t = elapsed.as_secs_f32() / DEMOTION_RAMP.as_secs_f32();
+    // Never *below* the scored rate: the ramp is a floor, not a replacement.
+    (max_hz - t * (max_hz - scored_hz)).max(scored_hz)
 }
 
 /// Recompute the high-rate set and proxy tags from positions (P1 core).
@@ -126,8 +233,11 @@ pub fn proxy_rate_hz(dist: f32, proxy_hz: &RangeInclusive<f32>) -> f32 {
 pub fn update_interest_set(
     cfg: Res<SpatialConfig>,
     aoi: Res<AoiSubscription>,
+    time: Res<Time<Real>>,
     mut commands: Commands,
     mut selection: ResMut<InterestSelection>,
+    mut last_rescore: Local<Option<Duration>>,
+    mut demoted_at: Local<Vec<(Entity, Duration)>>,
     player: Query<&GridPosition, With<LocalPlayer>>,
     candidates: Query<(Entity, &GridPosition, &Cell), Without<LocalPlayer>>,
 ) {
@@ -142,13 +252,81 @@ pub fn update_interest_set(
         .collect();
 
     let ranked = rank_by_distance(center.0, in_aoi.iter().copied());
-    let (high_rate, proxies) = split_high_rate(ranked, cfg.high_rate_cap);
+
+    // Membership is re-evaluated at `RESCORE_HZ`, not every frame. Between
+    // rescores incumbents keep their slots — that stickiness, with the eviction
+    // margin, is what bounds flap (docs/03-replication.md §4.1, §9.5). An
+    // entity that has left the AOI drops out regardless, because it is no
+    // longer a candidate at all.
+    let now = time.elapsed();
+    let previously_high: Vec<Entity> = selection.high_rate.clone();
+    let period = Duration::from_secs_f32(1.0 / RESCORE_HZ.max(f32::EPSILON));
+    let due = last_rescore.is_none_or(|last| now.saturating_sub(last) >= period);
+    let incumbents: Vec<Entity> = if due {
+        *last_rescore = Some(now);
+        selection.high_rate.clone()
+    } else {
+        // Not due: hold the set as it stands, minus anyone no longer eligible.
+        selection
+            .high_rate
+            .iter()
+            .copied()
+            .filter(|entity| ranked.iter().any(|(key, _)| key == entity))
+            .collect()
+    };
+
+    let high_rate = if due {
+        select_high_rate(&ranked, &incumbents, cfg.high_rate_cap)
+    } else {
+        let mut held = incumbents.clone();
+        // Fill vacancies immediately even off-cadence: a slot left empty until
+        // the next rescore is a second of an entity nobody is watching.
+        for (key, _) in &ranked {
+            if held.len() >= cfg.high_rate_cap {
+                break;
+            }
+            if !held.contains(key) {
+                held.push(*key);
+            }
+        }
+        held
+    };
+    let proxies: Vec<(Entity, f32)> = ranked
+        .iter()
+        .filter(|(key, _)| !high_rate.contains(key))
+        .copied()
+        .collect();
 
     let high: HashSet<Entity> = high_rate.iter().copied().collect();
-    // Each proxy's refresh rate, from its linear distance.
+
+    // Anyone who just lost a slot starts their demotion ramp now.
+    for entity in &previously_high {
+        if !high.contains(entity) && !demoted_at.iter().any(|(e, _)| e == entity) {
+            demoted_at.push((*entity, now));
+        }
+    }
+    // A re-promoted entity is no longer ramping, and a ramp expires on time.
+    //
+    // Deliberately *not* conditioned on the entity still being a candidate: the
+    // ramp is a function of time since demotion, and dropping the record the
+    // moment an entity blips out of the AOI for a frame would hand it the bare
+    // scored rate the instant it came back. The 5 s expiry keeps the list
+    // bounded without needing that.
+    demoted_at
+        .retain(|(entity, at)| !high.contains(entity) && now.saturating_sub(*at) < DEMOTION_RAMP);
+
+    // Each proxy's refresh rate: scored by distance, floored by the ramp for
+    // anyone recently demoted (docs/03-replication.md §9.5).
     let proxy_rates: Vec<(Entity, f32)> = proxies
         .iter()
-        .map(|(entity, squared)| (*entity, proxy_rate_hz(squared.sqrt(), &cfg.proxy_hz)))
+        .map(|(entity, squared)| {
+            let scored = proxy_rate_hz(squared.sqrt(), &cfg.proxy_hz);
+            let since = demoted_at
+                .iter()
+                .find(|(e, _)| e == entity)
+                .map(|(_, at)| now.saturating_sub(*at));
+            (*entity, ramped_proxy_rate(scored, since, &cfg.proxy_hz))
+        })
         .collect();
     let rates: HashMap<Entity, f32> = proxy_rates.iter().copied().collect();
 
@@ -203,6 +381,116 @@ mod tests {
         let (near, far) = split_high_rate(vec![(0u8, 1.0), (1, 2.0)], 24);
         assert_eq!(near, vec![0, 1]);
         assert!(far.is_empty());
+    }
+
+    #[test]
+    fn an_incumbent_holds_its_slot_against_a_marginally_closer_challenger() {
+        // The failure this exists for: two near-tied entities alternating in
+        // and out of the set, each swap resetting an interpolation buffer and
+        // churning a baseline. A player sees that as a stutter.
+        // Squared distances: incumbent at 100 (d=10), challenger at 90 (d≈9.49)
+        // — 5% closer, well inside the 15% margin.
+        let held = select_high_rate(&[(1u8, 90.0), (0u8, 100.0)], &[0], 1);
+        assert_eq!(held, vec![0], "a 5% edge does not take a slot");
+    }
+
+    #[test]
+    fn a_decisively_closer_challenger_does_take_the_slot() {
+        // The margin must not become a moat: an entity that really is much
+        // nearer has to get high-rate treatment, or the set stops tracking the
+        // world at all.
+        // Challenger at d=8 vs incumbent d=10 is 20% closer, past the margin.
+        let held = select_high_rate(&[(1u8, 64.0), (0u8, 100.0)], &[0], 1);
+        assert_eq!(held, vec![1]);
+    }
+
+    #[test]
+    fn the_margin_is_applied_in_the_space_the_distances_are_in() {
+        // `rank_by_distance` returns *squared* distances. Applying 15% to a
+        // squared value asks for a ~7% margin instead — the kind of error that
+        // halves a mitigation without failing anything.
+        // Exactly 15% closer: d = 10 / 1.15 = 8.6957, squared = 75.6.
+        let boundary = 100.0 / ((1.0 + EVICTION_MARGIN) * (1.0 + EVICTION_MARGIN));
+        assert_eq!(
+            select_high_rate(&[(1u8, boundary * 0.99), (0u8, 100.0)], &[0], 1),
+            vec![1],
+            "just past the margin evicts"
+        );
+        assert_eq!(
+            select_high_rate(&[(1u8, boundary * 1.01), (0u8, 100.0)], &[0], 1),
+            vec![0],
+            "just inside it does not"
+        );
+    }
+
+    #[test]
+    fn free_slots_go_to_challengers_without_any_margin() {
+        // Stickiness must not starve the set. An empty slot held against a
+        // newcomer would bound flap by replicating nothing.
+        let held = select_high_rate(&[(0u8, 1.0), (1u8, 2.0), (2u8, 3.0)], &[0], 3);
+        assert_eq!(held, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn an_incumbent_that_left_the_candidates_loses_its_slot() {
+        // Walking out of the AOI ends membership regardless of the margin —
+        // the margin protects near-ties, not absentees.
+        let held = select_high_rate(&[(1u8, 500.0)], &[0], 1);
+        assert_eq!(held, vec![1]);
+    }
+
+    #[test]
+    fn with_no_incumbents_selection_is_just_the_nearest() {
+        // The first frame, and the property `split_high_rate` already had.
+        let ranked: [(u8, f32); 3] = [(0, 3.0), (1, 1.0), (2, 2.0)];
+        let mut sorted = ranked;
+        sorted.sort_by(|a, b| a.1.total_cmp(&b.1));
+        assert_eq!(select_high_rate(&sorted, &[], 2), vec![1, 2]);
+    }
+
+    #[test]
+    fn a_just_demoted_entity_streams_at_the_top_of_the_range() {
+        // §9.5's actual answer to flapping: not preventing demotion, but
+        // covering it. An entity dropped straight to its distance-scored 1 Hz
+        // is the stutter a player sees.
+        let hz = 1.0..=4.0;
+        assert_eq!(ramped_proxy_rate(1.0, Some(Duration::ZERO), &hz), 4.0);
+    }
+
+    #[test]
+    fn the_ramp_decays_to_the_scored_rate_and_stops_there() {
+        let hz = 1.0..=4.0;
+        let scored = 1.5;
+        let early = ramped_proxy_rate(scored, Some(Duration::from_secs(1)), &hz);
+        let late = ramped_proxy_rate(scored, Some(Duration::from_secs(4)), &hz);
+        assert!(early > late, "the ramp decays");
+        assert!(late > scored, "but has not arrived yet at 4 s");
+        assert_eq!(
+            ramped_proxy_rate(scored, Some(DEMOTION_RAMP), &hz),
+            scored,
+            "and lands exactly on the scored rate"
+        );
+    }
+
+    #[test]
+    fn the_ramp_is_a_floor_and_never_slows_an_entity_down() {
+        // A near proxy already scores above the ramp; taking the ramp's value
+        // unconditionally would *reduce* its rate for five seconds.
+        let hz = 1.0..=4.0;
+        assert_eq!(
+            ramped_proxy_rate(4.0, Some(Duration::from_secs(2)), &hz),
+            4.0
+        );
+    }
+
+    #[test]
+    fn an_entity_that_was_never_in_the_set_gets_its_scored_rate() {
+        let hz = 1.0..=4.0;
+        assert_eq!(ramped_proxy_rate(1.2, None, &hz), 1.2);
+        assert_eq!(
+            ramped_proxy_rate(1.2, Some(DEMOTION_RAMP + Duration::from_secs(1)), &hz),
+            1.2
+        );
     }
 
     #[test]
