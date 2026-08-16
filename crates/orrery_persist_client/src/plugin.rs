@@ -143,9 +143,9 @@ mod tests {
             .add_plugins(OrreryPersistClientPlugin::default());
         let session_entity = app
             .world_mut()
-            .spawn(aeronet_io::Session::new(
-                bevy_platform::time::Instant::now(),
-                1024,
+            .spawn((
+                aeronet_io::Session::new(bevy_platform::time::Instant::now(), 1024),
+                aeronet_iroh::stream::IrohStreamIo::detached(),
             ))
             .id();
         {
@@ -158,25 +158,21 @@ mod tests {
             .spawn((LocalPlayer, Cell(cell(0, 0, 0))))
             .id();
 
+        // Subscribes are counted on the reliable lane, not the datagram lane:
+        // a subscribe that reappeared on `Session::send` would be the C-1
+        // regression this whole change is about, and counting both lanes
+        // together would hide it.
         let count_subscribes = |app: &App| -> usize {
             app.world()
-                .get::<aeronet_io::Session>(session_entity)
+                .get::<aeronet_iroh::stream::IrohStreamIo>(session_entity)
                 .unwrap()
                 .send
                 .iter()
-                .filter(|bytes| {
-                    let Some((_, payload)) = orrery_net::channels::untag(bytes) else {
-                        return false;
-                    };
-                    let Ok(len) = usize::try_from(u32::from_le_bytes(
-                        payload[..4].try_into().unwrap_or_default(),
-                    )) else {
-                        return false;
-                    };
+                .filter(|message| {
                     matches!(
-                        payload
-                            .get(4..4 + len)
-                            .and_then(|f| postcard::from_bytes::<GatewayMsg>(f).ok()),
+                        orrery_protocol::channels::decode_stream_frame::<GatewayMsg>(
+                            &message.payload
+                        ),
                         Some(GatewayMsg::Subscribe { .. })
                     )
                 })
@@ -184,7 +180,7 @@ mod tests {
         };
         let drain_send = |app: &mut App| {
             app.world_mut()
-                .get_mut::<aeronet_io::Session>(session_entity)
+                .get_mut::<aeronet_iroh::stream::IrohStreamIo>(session_entity)
                 .unwrap()
                 .send
                 .clear();
@@ -203,8 +199,9 @@ mod tests {
             "the loader holds the AOI neighborhood"
         );
 
-        // Stationary: no further subscribe (the 50 ms floor is a retry floor,
-        // not a trigger — it cannot fire inside one window).
+        // Stationary: no further subscribe. The backstop is 2 s and fires only
+        // on an incomplete round, so a client that is not moving does not
+        // re-ask for cells it already holds.
         app.update();
         app.update();
         assert_eq!(count_subscribes(&app), 1, "no resubscribe while stationary");

@@ -58,73 +58,109 @@ fn app() -> App {
     app
 }
 
-/// Simulate the client sending its buffered datagrams/streams to the gateway
-/// and the gateway replying. This stands in for the aeronet session transport:
-/// drains the client's send buffer into the gateway, and pushes the gateway's
-/// replies into the client's recv buffer (which `process_replies` consumes).
+/// A connected session: the datagram lane and the reliable lane, which the IO
+/// layer inserts together and which the client's systems therefore both
+/// require.
+fn connect(app: &mut App) -> Entity {
+    let session_entity = app
+        .world_mut()
+        .spawn((
+            aeronet_io::Session::new(bevy_platform::time::Instant::now(), 1024),
+            aeronet_iroh::stream::IrohStreamIo::detached(),
+        ))
+        .id();
+    let mut session = app.world_mut().resource_mut::<GatewaySession>();
+    session.session = Some(session_entity);
+    session.state = GatewayState::Connected;
+    session_entity
+}
+
+/// Simulate the client sending its buffered messages to the gateway and the
+/// gateway replying. This stands in for the aeronet session transport, on both
+/// lanes: diffs leave on the datagram lane and are acked there, while area
+/// loads and intents leave on the reliable lane and are answered there — the
+/// same split `orrery_persistd`'s `handle_connection` implements, so a
+/// regression that put control traffic back on datagrams fails here.
 fn pump(app: &mut App, gateway: &mut FakeGateway) {
     let session_entity = app
         .world()
         .resource::<GatewaySession>()
         .session
         .expect("session connected");
-    let mut replies: Vec<bytes::Bytes> = Vec::new();
+    let mut datagram_replies: Vec<bytes::Bytes> = Vec::new();
+    let mut stream_replies: Vec<bytes::Bytes> = Vec::new();
     {
         let mut session = app
             .world_mut()
             .get_mut::<aeronet_io::Session>(session_entity)
             .expect("session component");
-        let sends = std::mem::take(&mut session.send);
-        for bytes in sends {
-            // Decode the tagged datagram or stream frame.
+        for bytes in std::mem::take(&mut session.send) {
             let (channel, payload) = orrery_net::channels::untag(&bytes).unwrap();
-            match channel {
-                orrery_net::channels::Channel::State => {
-                    let msg: GatewayMsg = postcard::from_bytes(payload).unwrap();
-                    if let GatewayMsg::Diff { diff } = msg {
-                        gateway.diffs.push(diff.clone());
-                        replies.push(bytes::Bytes::from(GatewaySession::encode_datagram(
-                            &GatewayReply::BulkAck {
-                                entity: diff.entity,
-                                tick: diff.tick,
-                                lsn: orrery_protocol::Lsn::new(1, 0),
-                                provisional: false,
-                            },
-                        )));
-                    }
-                }
-                orrery_net::channels::Channel::Control => {
-                    let len = u32::from_le_bytes(payload[..4].try_into().unwrap()) as usize;
-                    let msg: GatewayMsg = postcard::from_bytes(&payload[4..4 + len]).unwrap();
-                    match msg {
-                        // Subscribe carries the grid (P-7); the driver asserts it stays ROOT in v1.
-                        GatewayMsg::Subscribe { grid, cells } => {
-                            assert_eq!(grid, GridId::ROOT);
-                            gateway.subscribes.extend(cells);
-                        }
-                        GatewayMsg::SubmitIntent { intent } => {
-                            gateway.intents.push(intent.clone());
-                            replies.push(GatewaySession::encode_stream(&GatewayReply::IntentAck {
-                                intent_id: intent.intent_id,
-                                outcome: IntentOutcome::Committed {
-                                    tick: Tick::new(9),
-                                    minted: vec![],
-                                },
-                            }));
-                        }
-                        _ => {}
-                    }
-                }
+            assert_eq!(
+                channel,
+                orrery_net::channels::Channel::State,
+                "only bulk state may ride the datagram lane"
+            );
+            let msg: GatewayMsg = postcard::from_bytes(payload).unwrap();
+            if let GatewayMsg::Diff { diff } = msg {
+                gateway.diffs.push(diff.clone());
+                datagram_replies.push(bytes::Bytes::from(GatewaySession::encode_datagram(
+                    &GatewayReply::BulkAck {
+                        entity: diff.entity,
+                        tick: diff.tick,
+                        lsn: orrery_protocol::Lsn::new(1, 0),
+                        provisional: false,
+                    },
+                )));
             }
         }
     }
-    // Push the gateway's replies into the client's recv buffer.
-    let mut session = app
+    {
+        let mut streams = app
+            .world_mut()
+            .get_mut::<aeronet_iroh::stream::IrohStreamIo>(session_entity)
+            .expect("reliable lane component");
+        for message in std::mem::take(&mut streams.send) {
+            let msg: GatewayMsg =
+                orrery_protocol::channels::decode_stream_frame(&message.payload).unwrap();
+            match msg {
+                // Subscribe carries the grid (P-7); the driver asserts it stays ROOT in v1.
+                GatewayMsg::Subscribe { grid, cells } => {
+                    assert_eq!(grid, GridId::ROOT);
+                    gateway.subscribes.extend(cells);
+                }
+                GatewayMsg::SubmitIntent { intent } => {
+                    gateway.intents.push(intent.clone());
+                    stream_replies.push(GatewaySession::encode_stream(&GatewayReply::IntentAck {
+                        intent_id: intent.intent_id,
+                        outcome: IntentOutcome::Committed {
+                            tick: Tick::new(9),
+                            minted: vec![],
+                        },
+                    }));
+                }
+                _ => {}
+            }
+        }
+    }
+    {
+        let mut session = app
+            .world_mut()
+            .get_mut::<aeronet_io::Session>(session_entity)
+            .expect("session component");
+        for reply in datagram_replies {
+            session.recv.push(aeronet_io::packet::RecvPacket {
+                recv_at: bevy_platform::time::Instant::now(),
+                payload: reply,
+            });
+        }
+    }
+    let mut streams = app
         .world_mut()
-        .get_mut::<aeronet_io::Session>(session_entity)
-        .expect("session component");
-    for reply in replies {
-        session.recv.push(aeronet_io::packet::RecvPacket {
+        .get_mut::<aeronet_iroh::stream::IrohStreamIo>(session_entity)
+        .expect("reliable lane component");
+    for reply in stream_replies {
+        streams.recv.push(aeronet_iroh::stream::RecvMessage {
             recv_at: bevy_platform::time::Instant::now(),
             payload: reply,
         });
@@ -137,18 +173,7 @@ fn client_feeds_cell_actors_end_to_end() {
     let mut gateway = FakeGateway::default();
 
     // Connect the gateway session.
-    let session_entity = app
-        .world_mut()
-        .spawn(aeronet_io::Session::new(
-            bevy_platform::time::Instant::now(),
-            1024,
-        ))
-        .id();
-    {
-        let mut session = app.world_mut().resource_mut::<GatewaySession>();
-        session.session = Some(session_entity);
-        session.state = GatewayState::Connected;
-    }
+    let session_entity = connect(&mut app);
 
     // Register an entity and queue a diff.
     {
@@ -224,18 +249,7 @@ fn area_load_subscribes_nearest_first() {
     let mut app = app();
     let mut gateway = FakeGateway::default();
 
-    let session_entity = app
-        .world_mut()
-        .spawn(aeronet_io::Session::new(
-            bevy_platform::time::Instant::now(),
-            1024,
-        ))
-        .id();
-    {
-        let mut session = app.world_mut().resource_mut::<GatewaySession>();
-        session.session = Some(session_entity);
-        session.state = GatewayState::Connected;
-    }
+    let _session_entity = connect(&mut app);
 
     // Subscribe to a 27-cell neighborhood.
     let center = orrery_protocol::CellId::from_coords(glam::IVec3::ZERO, 21).unwrap();

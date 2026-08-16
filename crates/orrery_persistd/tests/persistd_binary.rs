@@ -4,6 +4,7 @@
 //! identity across restarts, the stdout JSON address line, and graceful signal
 //! handling. They do NOT require FoundationDB.
 
+mod lanes;
 mod support;
 
 use std::net::{SocketAddr, TcpListener};
@@ -17,9 +18,7 @@ use orrery_persistd::journal::{AdaptiveCommitMode, GroupCommitConfig};
 #[cfg(feature = "fdb")]
 use orrery_persistd::{FdbContext, FenceStore};
 use orrery_persistd::{Journal, JournalConfig, GATEWAY_ALPN};
-use orrery_protocol::channels::{
-    decode_datagram, decode_stream_frame, encode_datagram, encode_stream_frame,
-};
+use orrery_protocol::channels::{decode_datagram, decode_stream_frame};
 use orrery_protocol::{
     CellId, DiffUplink, Epoch, GatewayMsg, GatewayReply, GridId, Intent, IntentOp, IntentOutcome,
     JournalRecord, Lsn, NodeId, PersistId, RecordKind, Tick, REASON_VALIDATION_FAILED,
@@ -261,20 +260,18 @@ async fn production_authority_rejects_intents_without_a_secure_validator() {
         )
         .await
         .expect("connect to production gateway");
+    // Read admission before attaching, or the lane reader consumes it.
     let mut admission = connection.accept_uni().await.expect("gateway admission");
     assert_eq!(admission.read_to_end(16).await.unwrap(), vec![0]);
+    let connection = lanes::GatewayLanes::attach(connection);
     connection
-        .send_datagram(Bytes::from(encode_stream_frame(&GatewayMsg::Hello {
+        .send_control(&GatewayMsg::Hello {
             token: process_session_token(client_key.public()),
             node: client_key.public(),
-        })))
-        .expect("send hello");
-    let hello = tokio::time::timeout(Duration::from_secs(5), connection.read_datagram())
-        .await
-        .expect("hello reply timeout")
-        .expect("hello reply");
+        })
+        .await;
     assert!(matches!(
-        decode_stream_frame(&hello),
+        connection.next_reply(Duration::from_secs(5)).await,
         Some(GatewayReply::HelloAck { .. })
     ));
     let mut intent = Intent {
@@ -292,14 +289,12 @@ async fn production_authority_rejects_intents_without_a_secure_validator() {
 
     // When: the intent crosses the real binary gateway surface.
     connection
-        .send_datagram(Bytes::from(encode_stream_frame(
-            &GatewayMsg::SubmitIntent { intent },
-        )))
-        .expect("submit intent");
-    let reply = tokio::time::timeout(Duration::from_secs(5), connection.read_datagram())
+        .send_control(&GatewayMsg::SubmitIntent { intent })
+        .await;
+    let reply = connection
+        .next_payload(Duration::from_secs(5))
         .await
-        .expect("intent reply timeout")
-        .expect("intent reply");
+        .expect("intent reply timeout");
 
     // Then: validation fails closed before the missing-executor fallback.
     assert!(matches!(
@@ -311,7 +306,7 @@ async fn production_authority_rejects_intents_without_a_secure_validator() {
             },
         })
     ));
-    connection.close(0u32.into(), b"test complete");
+    connection.conn().close(0u32.into(), b"test complete");
     client.close().await;
     stop(&mut child);
 }
@@ -576,16 +571,18 @@ async fn primary_ack_is_mirrored_to_the_passive_follower_journal() {
         .connect(target, GATEWAY_ALPN)
         .await
         .expect("connect to primary gateway");
+    // Read admission before attaching, or the lane reader consumes it.
     let mut admission = conn.accept_uni().await.expect("gateway admission");
     assert_eq!(admission.read_to_end(16).await.unwrap(), vec![0]);
+    let conn = lanes::GatewayLanes::attach(conn);
 
     let author = client_key.public();
-    conn.send_datagram(Bytes::from(encode_stream_frame(&GatewayMsg::Hello {
+    conn.send_control(&GatewayMsg::Hello {
         token: process_session_token(author),
         node: author,
-    })))
-    .expect("send hello");
-    conn.send_datagram(Bytes::from(encode_stream_frame(&GatewayMsg::Lease {
+    })
+    .await;
+    conn.send_control(&GatewayMsg::Lease {
         message: orrery_protocol::LeaseMsg::Claim {
             claim_id: orrery_protocol::ClaimId(1),
             entity: PersistId::new(77),
@@ -596,13 +593,13 @@ async fn primary_ack_is_mirrored_to_the_passive_follower_journal() {
             observed: Default::default(),
             tick: Tick::new(11),
         },
-    })))
-    .expect("send lease claim");
+    })
+    .await;
     let (lease_id, authority_seq) = loop {
-        let packet = tokio::time::timeout(Duration::from_secs(5), conn.read_datagram())
+        let packet = conn
+            .next_payload(Duration::from_secs(5))
             .await
-            .expect("claim reply timeout")
-            .expect("claim reply");
+            .expect("claim reply timeout");
         let Some(GatewayReply::Lease {
             message: orrery_protocol::LeaseMsg::Grant { lease_id, seq, .. },
         }) = decode_stream_frame(&packet)
@@ -611,7 +608,7 @@ async fn primary_ack_is_mirrored_to_the_passive_follower_journal() {
         };
         break (lease_id, seq);
     };
-    conn.send_datagram(Bytes::from(encode_datagram(&GatewayMsg::Diff {
+    conn.send_state(&GatewayMsg::Diff {
         diff: DiffUplink {
             cell: CellId::ROOT,
             grid: GridId::ROOT,
@@ -623,8 +620,7 @@ async fn primary_ack_is_mirrored_to_the_passive_follower_journal() {
             lease_id: Some(lease_id),
             authority_seq: Some(authority_seq),
         },
-    })))
-    .expect("send diff");
+    });
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     loop {
@@ -632,8 +628,9 @@ async fn primary_ack_is_mirrored_to_the_passive_follower_journal() {
             tokio::time::Instant::now() < deadline,
             "primary never acknowledged diff"
         );
-        let packet = tokio::time::timeout(Duration::from_millis(250), conn.read_datagram()).await;
-        let Ok(Ok(packet)) = packet else { continue };
+        let Some(packet) = conn.next_payload(Duration::from_millis(250)).await else {
+            continue;
+        };
         if let Some(GatewayReply::BulkAck { entity, tick, .. }) = decode_datagram(&packet) {
             if entity == PersistId::new(77) && tick == Tick::new(11) {
                 break;

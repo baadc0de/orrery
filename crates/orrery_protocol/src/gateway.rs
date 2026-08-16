@@ -220,15 +220,34 @@ pub const AREA_LOAD_ERR_COLD: u8 = 2;
 
 /// The maximum size of one encoded area-page frame on the wire, in bytes.
 ///
-/// The lane is packet-only (D3 datagrams; the reliable-stream class of
-/// docs/08-persistence.md §2.1 does not exist in this build), so every frame
-/// must fit one datagram. The budget derives from the 1280-byte IPv6 minimum
-/// MTU minus QUIC/UDP/IP headers and the channel tag — deliberately
-/// conservative so it holds on any path QUIC will run over. A cell whose
-/// entities do not fit is split across as many sequenced [`AreaPage`] frames
-/// as needed (`page_seq`/`chunk_index`/`total_chunks`); tune the budget here,
-/// in one place.
-pub const MAX_AREA_PAGE_FRAME_BYTES: usize = 1100;
+/// Area pages ride the reliable stream lane (C-1), so this is no longer an MTU
+/// figure: QUIC re-segments a stream write across as many packets as the path
+/// needs and retransmits what is lost. What remains bounded is the *message*,
+/// because both readers refuse a length prefix larger than
+/// [`MAX_RELIABLE_MESSAGE_BYTES`](crate::channels::MAX_RELIABLE_MESSAGE_BYTES)
+/// before allocating for it, and because a receiver holding partial chunks for
+/// 27 cells wants each chunk's footprint knowable in advance.
+///
+/// 64 KiB is that bound, with an order of magnitude of headroom under the
+/// message cap. Against the old 1100-byte MTU budget it cuts a large cell's
+/// chunk count — and with it the reassembly bookkeeping and the per-chunk
+/// postcard header tax — by ~60×, which is most of what leaving the packet
+/// lane buys. A cell whose entities still do not fit is split across as many
+/// sequenced [`AreaPage`] frames as needed
+/// (`page_seq`/`chunk_index`/`total_chunks`); tune the budget here, in one
+/// place.
+pub const MAX_AREA_PAGE_FRAME_BYTES: usize = 64 * 1024;
+
+/// The chunker bounds the payload it packs; the frame it emits adds postcard
+/// and channel headers on top. Raise the budget to the message cap itself and
+/// a maximal chunk encodes just past it, at which point the peer's reader
+/// refuses the whole message — a failure that looks like a silently missing
+/// cell, not an overflow. Checked at compile time, where a bad edit cannot
+/// reach a test run.
+const _: () = assert!(
+    MAX_AREA_PAGE_FRAME_BYTES < crate::channels::MAX_RELIABLE_MESSAGE_BYTES,
+    "area-page budget must leave headroom under the reliable message cap"
+);
 
 /// A page of an area load (D11 §9).
 ///
@@ -237,12 +256,15 @@ pub const MAX_AREA_PAGE_FRAME_BYTES: usize = 1100;
 /// ≥ checkpoint freshness) from cold FDB range-scan pages.
 ///
 /// A cell whose entities exceed [`MAX_AREA_PAGE_FRAME_BYTES`] is split across
-/// several sequenced chunks. The wire is unordered datagrams (D3), so a chunk
-/// carries the full identity of its page, not just an intra-page index:
+/// several sequenced chunks. The chunk coordinates outlived the datagram lane
+/// they were designed for, and deliberately: the reliable lane delivers each
+/// chunk exactly once and in order *within one connection*, but a page split
+/// across a reconnect is re-sent from the start, so a chunk still carries the
+/// full identity of its page rather than just an intra-page index.
 ///
-/// - `page_seq` is the gateway's per-send counter for the page (a retried send
-///   has a different `page_seq`, so stale chunks of an old send never mix with
-///   the retry);
+/// - `page_seq` is the gateway's per-send counter for the page (a re-sent page
+///   has a different `page_seq`, so chunks of an interrupted send never mix
+///   with the re-send);
 /// - `chunk_index` is this chunk's index within the page;
 /// - `total_chunks` is the page's chunk count (every chunk carries it, so any
 ///   arrival order completes the set — a page is complete when all
@@ -250,8 +272,7 @@ pub const MAX_AREA_PAGE_FRAME_BYTES: usize = 1100;
 ///
 /// A single-chunk page is `chunk_index: 0, total_chunks: 1`. The client
 /// reassembles all chunks of a page before presenting it; a partial set is
-/// held (never surfaced as complete) until the client's retry floor leads to
-/// a re-request.
+/// held (never surfaced as complete) until a re-subscribe supersedes it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AreaPage {
     /// The cell this page covers.
@@ -364,7 +385,7 @@ mod tests {
     }
 
     #[test]
-    fn single_frame_page_fits_the_datagram_budget() {
+    fn single_frame_page_fits_the_frame_budget() {
         // The budget constant is what the gateway chunks against; a minimal
         // single-frame page must fit well under it (the chunked path is
         // exercised end-to-end in orrery_persistd/tests/area_load.rs).

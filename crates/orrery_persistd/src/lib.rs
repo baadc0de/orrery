@@ -38,6 +38,7 @@ pub mod journal;
 pub mod keyspace;
 pub mod lease;
 pub mod placement;
+pub mod reliable;
 pub mod runtime;
 
 pub use actor::{
@@ -89,4 +90,5 @@ pub use lease::{
     MemLeaseStore, LEASE_TTL_MS,
 };
 pub use placement::{RendezvousHasher, RendezvousNode, RendezvousWeight};
+pub use reliable::{Lane, ReliableSender};
 pub use runtime::{payload_crc, CellRuntime, RuntimeConfig};

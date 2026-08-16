@@ -4,8 +4,8 @@
 //!
 //! This closes the client loop: bulk acks/nacks update the scheduler's
 //! pending state, area pages fill the loader, and intent acks update the
-//! queue. It runs on the aeronet session's recv buffer, which the IO layer
-//! drains each update.
+//! queue. It runs on both of the session's inbound buffers — the datagram
+//! lane's and the reliable lane's — which the IO layer fills each update.
 
 use bevy_ecs::prelude::*;
 use bevy_ecs::system::SystemParam;
@@ -35,39 +35,30 @@ pub(crate) fn process_replies(mut context: ReplyProcessingContext) {
     let Some(entity) = context.session.session else {
         return;
     };
-    let Ok(mut io) = context.sessions.get_mut(entity) else {
-        return;
-    };
-    if io.recv.is_empty() {
+
+    // Both lanes are drained into one list before anything is decoded, so the
+    // routing below is written once and does not care which lane a reply came
+    // in on. Datagrams first: a bulk ack that arrived in the same update as an
+    // area page is the older of the two by construction, since the page's lane
+    // is the one that waits for retransmits.
+    let mut inbound: Vec<bytes::Bytes> = Vec::new();
+    if let Ok(mut io) = context.sessions.get_mut(entity) {
+        inbound.extend(std::mem::take(&mut io.recv).into_iter().map(|p| p.payload));
+    }
+    if let Ok(mut streams) = context.streams.get_mut(entity) {
+        inbound.extend(
+            std::mem::take(&mut streams.recv)
+                .into_iter()
+                .map(|m| m.payload),
+        );
+    }
+    if inbound.is_empty() {
         return;
     }
 
-    let recv = std::mem::take(&mut io.recv);
-    for packet in recv {
-        let (channel, payload) = match orrery_net::channels::untag(&packet.payload) {
-            Some(pair) => pair,
-            None => continue,
-        };
-        let reply = match channel {
-            orrery_net::channels::Channel::State => match postcard::from_bytes(payload) {
-                Ok(reply) => reply,
-                Err(_) => continue,
-            },
-            orrery_net::channels::Channel::Control => {
-                // Length-prefixed stream frame.
-                let Ok(len) = usize::try_from(u32::from_le_bytes(
-                    payload[..4].try_into().unwrap_or_default(),
-                )) else {
-                    continue;
-                };
-                let Some(frame) = payload.get(4..4 + len) else {
-                    continue;
-                };
-                match postcard::from_bytes(frame) {
-                    Ok(reply) => reply,
-                    Err(_) => continue,
-                }
-            }
+    for packet in inbound {
+        let Some(reply) = decode_reply(&packet) else {
+            continue;
         };
         match reply {
             GatewayReply::BulkAck {
@@ -149,6 +140,23 @@ pub(crate) fn process_replies(mut context: ReplyProcessingContext) {
     }
 }
 
+/// Decode one tagged payload into a [`GatewayReply`], from either lane.
+///
+/// The tag says which encoding the payload carries; the lane it arrived on
+/// does not, and deliberately is not consulted. A gateway is free to answer a
+/// control message on the datagram lane if it is small enough to fit, and a
+/// receiver that refused it on lane grounds would drop a well-formed reply for
+/// a reason its sender cannot observe.
+fn decode_reply(payload: &[u8]) -> Option<GatewayReply> {
+    let (channel, body) = orrery_net::channels::untag(payload)?;
+    match channel {
+        orrery_net::channels::Channel::State => postcard::from_bytes(body).ok(),
+        orrery_net::channels::Channel::Control => {
+            orrery_protocol::channels::decode_stream_frame(payload)
+        }
+    }
+}
+
 #[derive(SystemParam)]
 pub(crate) struct ReplyProcessingContext<'w, 's> {
     commands: Commands<'w, 's>,
@@ -163,6 +171,7 @@ pub(crate) struct ReplyProcessingContext<'w, 's> {
     authority_events: Option<ResMut<'w, Messages<AuthorityEvent>>>,
     identities: Query<'w, 's, (Entity, &'static PersistIdentity)>,
     sessions: Query<'w, 's, &'static mut aeronet_io::Session>,
+    streams: Query<'w, 's, &'static mut aeronet_iroh::stream::IrohStreamIo>,
 }
 
 fn reconcile_lease_nack(

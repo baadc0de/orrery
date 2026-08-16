@@ -32,11 +32,13 @@ pub struct LoadedPage {
 /// An incomplete multi-chunk page for one cell, held until every chunk of its
 /// sequence arrives.
 ///
-/// The lane is unreliable and unordered (D3 datagrams), so a partial set is
-/// **held, never surfaced as a complete [`LoadedPage`]** — a client holding
-/// chunks 0 and 2 of a 3-chunk page must not present a partial page. The
-/// loader's retry floor re-requests the cell set, and a re-sent page (a new
-/// `page_seq`) supersedes the stale partial.
+/// The reliable lane delivers a page's chunks in order and without loss, so
+/// within one connection a partial set is only ever a page still arriving.
+/// Across a reconnect it can be a page that will never finish, which is why a
+/// partial is **held, never surfaced as a complete [`LoadedPage`]** — a client
+/// holding chunks 0 and 2 of a 3-chunk page must not present a partial page.
+/// The re-subscribe backstop re-requests the cell set, and the re-sent page (a
+/// new `page_seq`) supersedes the stale partial.
 #[derive(Debug, Default)]
 struct PartialPage {
     /// The page sequence these chunks belong to.
@@ -61,11 +63,12 @@ pub struct AreaLoader {
     pub cells: Vec<CellId>,
     /// Pages received so far, keyed by cell.
     pub pages: Vec<LoadedPage>,
-    /// The time the last subscribe round was issued (the retry floor, not the
-    /// subscribe trigger — see [`drive_area_loader`]).
+    /// The time the last subscribe round was issued (the backstop clock, not
+    /// the subscribe trigger — see [`drive_area_loader`]).
     pub last_subscribe: Option<Instant>,
     /// The cell set of the last issued subscribe round. A subscribe is issued
-    /// only when the current set differs from this (plus the retry floor).
+    /// when the current set differs from this, or when the backstop fires on
+    /// an incomplete round.
     pub last_sent: Vec<CellId>,
     /// The time the first page of the current area arrived (for the < 50 ms
     /// first-page-in target, D16). Cleared when the subscribed cell set
@@ -123,7 +126,7 @@ impl AreaLoader {
     /// Single-chunk pages (`total_chunks: 1`) record immediately. Multi-chunk
     /// pages accumulate until every chunk of the page's `page_seq` has
     /// arrived; only the complete page is recorded — a partial set is never
-    /// presented as complete (the lane is unreliable, D3). Chunks are keyed by
+    /// presented as complete. Chunks are keyed by
     /// `(page_seq, chunk_index)` and every chunk carries `total_chunks`, so
     /// any arrival order completes the set; a re-sent page (a new `page_seq`)
     /// supersedes the stale partial.
@@ -179,6 +182,32 @@ impl AreaLoader {
         });
     }
 
+    /// Whether an unchanged subscription is due to be re-issued: the round is
+    /// still missing pages *and* the backstop interval has elapsed.
+    ///
+    /// Both halves matter, and the first is the one that changed with the
+    /// lane. An unconditional periodic re-issue re-asks for cells the gateway
+    /// already answered, which is the load amplification PR #15/#16 found; a
+    /// re-issue gated on a gap asks only when there is something outstanding
+    /// to ask about, so a healthy subscription costs exactly one subscribe.
+    #[must_use]
+    pub fn round_is_overdue(&self, now: Instant, cells_per_round: usize) -> bool {
+        let requested = self.cells.len().min(cells_per_round);
+        let answered = self
+            .cells
+            .iter()
+            .take(cells_per_round)
+            .filter(|cell| self.pages.iter().any(|page| page.cell == **cell))
+            .count();
+        if answered >= requested {
+            return false;
+        }
+        self.last_subscribe.is_none_or(|last| {
+            now.saturating_duration_since(last)
+                >= std::time::Duration::from_millis(RESUBSCRIBE_BACKSTOP_MS)
+        })
+    }
+
     /// Begin a new subscription round: replace the subscribed cell set, drop
     /// every page and partial whose cell left the subscription, and clear
     /// [`AreaLoader::first_page_at`] so the new round measures its own
@@ -231,28 +260,36 @@ pub fn order_nearest_first(center: CellId, cells: Vec<CellId>) -> Vec<CellId> {
     ranked.into_iter().map(|(cell, _)| cell).collect()
 }
 
-/// The retry floor between subscribe rounds, in milliseconds.
+/// The minimum interval between two subscribes of the *same* cell set, in
+/// milliseconds.
 ///
-/// This is a **floor, not the trigger**: a subscribe is issued when the cell
-/// set changes ([`drive_area_loader`]); the floor only rate-limits re-issues
-/// of an unchanged set (the retry that re-requests pages lost on the
-/// unreliable lane) and back-to-back crossings. 50 ms matches the D16
-/// first-page-in budget so a lost page is retried within one measurement
-/// window.
-const SUBSCRIBE_RETRY_FLOOR_MS: u64 = 50;
+/// The old value here was 50 ms, and it was a retry: the request rode the
+/// unreliable lane, so a page that never arrived had to be asked for again,
+/// and one measurement window (the D16 < 50 ms first-page-in budget) was the
+/// natural period. That mechanism is what PR #15/#16 caught amplifying — a
+/// gateway slow enough to miss the window gets the whole 27-cell set asked for
+/// again, twenty times a second, per client, for as long as it stays slow.
+///
+/// On the reliable lane the retry has nothing left to recover. A subscribe is
+/// delivered or the connection is gone, and a gone connection re-subscribes on
+/// reconnect anyway ([`AreaLoader::begin_round`] runs again for the new
+/// session). What remains is a backstop against a gateway that accepted a
+/// subscribe and answered part of it — 2 s, two orders of magnitude off the
+/// page-in budget, and gated on the round actually being incomplete, so a
+/// fully-answered subscription is never re-issued at all.
+const RESUBSCRIBE_BACKSTOP_MS: u64 = 2_000;
 
 /// The Bevy system that drives the area loader.
 ///
 /// Issues a [`GatewayMsg::Subscribe`] when the subscribed cell set differs
 /// from the last-sent set (the AOI system updates `loader.cells` on a
-/// crossing), or when the retry floor has elapsed since the last issue — the
-/// retry re-requests pages that never completed on the unreliable lane.
-/// Pages are recorded as they arrive.
+/// crossing), and otherwise only when the round is still missing pages and the
+/// backstop interval has elapsed. Pages are recorded as they arrive.
 pub fn drive_area_loader(
     cfg: Res<PersistClientConfig>,
     session: Res<GatewaySession>,
     mut loader: ResMut<AreaLoader>,
-    mut sessions: Query<&mut aeronet_io::Session>,
+    mut streams: Query<&mut aeronet_iroh::stream::IrohStreamIo>,
 ) {
     if !session.is_connected() {
         return;
@@ -260,26 +297,19 @@ pub fn drive_area_loader(
     let Some(entity) = session.session else {
         return;
     };
-    let Ok(mut io) = sessions.get_mut(entity) else {
+    let Ok(mut streams) = streams.get_mut(entity) else {
         return;
     };
 
     // The AOI system updates `loader.cells` on a crossing; here we detect the
-    // change and issue the subscribe. An unchanged set is only re-issued past
-    // the retry floor (lost-page retry), never per-update.
+    // change and issue the subscribe.
     let subscribed = loader.cells.clone();
     if subscribed.is_empty() {
         return;
     }
     let now = Instant::now();
-    if subscribed == loader.last_sent {
-        let retry_due = loader.last_subscribe.is_none_or(|last| {
-            now.saturating_duration_since(last)
-                >= std::time::Duration::from_millis(SUBSCRIBE_RETRY_FLOOR_MS)
-        });
-        if !retry_due {
-            return;
-        }
+    if subscribed == loader.last_sent && !loader.round_is_overdue(now, cfg.area_cells_per_round) {
+        return;
     }
     loader.last_subscribe = Some(now);
     loader.last_sent = subscribed.clone();
@@ -293,7 +323,7 @@ pub fn drive_area_loader(
         grid: loader.grid,
         cells: round,
     };
-    io.send.push(GatewaySession::encode_stream(&msg));
+    GatewaySession::push_control(&mut streams, &msg);
 }
 
 /// Wire the spatial AOI into the area loader (D5 → D11 §9).
@@ -526,6 +556,67 @@ mod tests {
         assert!(
             loader.page_count() <= round_b.len(),
             "page count bounded by the subscription"
+        );
+    }
+
+    #[test]
+    fn a_fully_answered_round_is_never_resubscribed() {
+        // The C-1 amplification, as a unit. The old policy re-issued an
+        // unchanged cell set on a 50 ms floor whether or not anything was
+        // outstanding, so a gateway slow enough to miss one window got the
+        // whole 27-cell set asked for again twenty times a second, per client,
+        // for as long as it stayed slow. A round the gateway has fully
+        // answered must cost exactly one subscribe, however long the client
+        // sits in it.
+        let center = cell(0, 0, 0);
+        let cells = order_nearest_first(center, center.neighbors27());
+        let mut loader = AreaLoader::new();
+        loader.begin_round(cells.clone());
+        for c in &cells {
+            loader.record(LoadedPage {
+                cell: *c,
+                entities: vec![PersistId::new(1)],
+                payloads: vec![bytes::Bytes::from_static(b"x")],
+                live: true,
+            });
+        }
+        let issued = Instant::now();
+        loader.last_subscribe = Some(issued);
+
+        // Far past the backstop, and still nothing to ask about.
+        let much_later = issued + std::time::Duration::from_millis(RESUBSCRIBE_BACKSTOP_MS * 100);
+        assert!(!loader.round_is_overdue(much_later, 27));
+    }
+
+    #[test]
+    fn an_incomplete_round_waits_for_the_backstop_before_resubscribing() {
+        // The backstop exists for a gateway that answered part of a subscribe
+        // and stopped. It must fire — a client that never re-asks is stuck —
+        // but not before the interval, or it becomes the amplification again
+        // under a different name.
+        let center = cell(0, 0, 0);
+        let cells = order_nearest_first(center, center.neighbors27());
+        let mut loader = AreaLoader::new();
+        loader.begin_round(cells.clone());
+        // One cell answered out of 27.
+        loader.record(LoadedPage {
+            cell: cells[0],
+            entities: vec![PersistId::new(1)],
+            payloads: vec![bytes::Bytes::from_static(b"x")],
+            live: true,
+        });
+        let issued = Instant::now();
+        loader.last_subscribe = Some(issued);
+
+        let inside = issued + std::time::Duration::from_millis(RESUBSCRIBE_BACKSTOP_MS / 2);
+        assert!(
+            !loader.round_is_overdue(inside, 27),
+            "an incomplete round does not re-ask inside the backstop"
+        );
+        let outside = issued + std::time::Duration::from_millis(RESUBSCRIBE_BACKSTOP_MS + 1);
+        assert!(
+            loader.round_is_overdue(outside, 27),
+            "an incomplete round re-asks once the backstop elapses"
         );
     }
 }
