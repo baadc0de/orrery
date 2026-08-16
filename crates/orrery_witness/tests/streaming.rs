@@ -520,6 +520,81 @@ fn the_log_goes_to_the_witness_set_not_the_whole_island() {
 }
 
 #[test]
+fn a_catching_up_witness_defers_judgement_rather_than_accusing() {
+    // The rule the whole gap path rests on: a witness whose own re-execution
+    // stopped at a hole has an incomplete trajectory, and comparing a claim
+    // against ticks it never ran is exactly how an honest peer that dropped a
+    // packet gets accused.
+    let (mut authority, mut witness, mut source) = pair();
+    let subject = subject_key().public();
+
+    for round in 0..3u64 {
+        authority
+            .world_mut()
+            .resource_mut::<Messages<PublishFrame>>()
+            .write(source.send(T0 + round * 3));
+        authority.update();
+        pump(&mut authority, &mut witness, subject, |_| round == 1);
+        witness.update();
+    }
+
+    let state = witness.world().resource::<WitnessState<Kinematic>>();
+    let catchup = state
+        .0
+        .catching_up(ENTITY)
+        .expect("the witness knows it is behind");
+    assert_eq!(catchup.attempts, 1);
+    assert!(!catchup.reported, "one hole is not yet a stall");
+    assert_eq!(
+        state.0.counters().claim_mismatches,
+        0,
+        "nothing is judged while the trajectory has a hole in it"
+    );
+}
+
+#[test]
+fn a_hole_that_never_closes_escalates_once_and_only_once() {
+    // The floor under "defer judgement": without it, stalling forever would be
+    // a way to stay unjudged. With it, refusing to answer is itself the
+    // finding — and it is a statement about the subject, not about each packet
+    // that reveals it.
+    let (mut authority, mut witness, mut source) = pair();
+    let subject = subject_key().public();
+
+    let mut stalls = 0;
+    let mut gaps = 0;
+    // The backoff is linear in attempts, so reaching the escalation threshold
+    // takes a few hundred ticks of the subject timeline — that patience is the
+    // point, not an accident of the test length.
+    for round in 0..200u64 {
+        authority
+            .world_mut()
+            .resource_mut::<Messages<PublishFrame>>()
+            .write(source.send(T0 + round * 3));
+        authority.update();
+        // Rounds 1..4 are lost, opening a hole; everything after arrives and
+        // fails to chain across it. Repairs are never pumped back, so the hole
+        // never closes — the shape of a peer that will not answer.
+        pump(&mut authority, &mut witness, subject, |_| {
+            (1..4).contains(&round)
+        });
+        witness.update();
+        for signal in signals(&mut witness) {
+            match signal.signal {
+                WitnessSignal::Gap(_) => gaps += 1,
+                WitnessSignal::Stalled { .. } => stalls += 1,
+                _ => {}
+            }
+        }
+    }
+    assert!(gaps > 0, "the hole is noticed");
+    assert_eq!(
+        stalls, 1,
+        "escalated exactly once for one stuck subject, not once per frame"
+    );
+}
+
+#[test]
 fn a_peer_alone_in_its_island_still_retains_what_it_authored() {
     // Retention is not a side effect of broadcasting. A peer with nobody
     // listening still has to be able to justify its last three seconds, because

@@ -87,8 +87,8 @@ impl Chain {
         let record = InputRecord {
             tick_off: offset,
             seq: 0,
-            source: RecordSource::Player {
-                node: self.key.public(),
+            // The frame's own signer: no 32-byte key per record.
+            source: RecordSource::OwnPlayer {
                 input_seq: tick as u32,
             },
             payload: bytes::Bytes::from(command.to_canonical()),

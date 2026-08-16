@@ -16,13 +16,14 @@ license = "MIT OR Apache-2.0"
 # takes the crate with `default-features = false`.
 [features]
 default = ["bevy"]
-bevy = ["dep:bevy_app", "dep:bevy_ecs", "dep:orrery_net"]
+bevy = ["dep:bevy_app", "dep:bevy_ecs", "dep:bevy_time", "dep:orrery_net"]
 
 [dependencies]
 orrery_core = { path = "../orrery_core" }
 orrery_net = { path = "../orrery_net", optional = true }
 bevy_app = { workspace = true, optional = true }
 bevy_ecs = { workspace = true, optional = true }
+bevy_time = { workspace = true, optional = true }
 orrery_protocol = { path = "../orrery_protocol" }
 iroh-base = { workspace = true }
 blake3 = "1.8"

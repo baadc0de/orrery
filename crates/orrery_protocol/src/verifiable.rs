@@ -73,7 +73,25 @@ pub struct UniverseSeed(pub [u8; 32]);
 /// Where one logged input came from (docs/06 §6).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RecordSource {
-    /// A player or system command, with the source's own sequence number.
+    /// A command from the **frame's own signer** — the overwhelmingly common
+    /// case, and the reason it has a variant of its own.
+    ///
+    /// An authority logs its own player's inputs every tick, and repeating a
+    /// 32-byte public key on each of them is the single largest avoidable cost
+    /// in the witness stream: at 60 Hz across a seven-link witness set it is
+    /// ~13 kB/s of key material per peer, and it inflates every gap repair that
+    /// carries those records.
+    ///
+    /// Attribution is not weakened. The signer is bound by the frame signature
+    /// already, so "whose input" is answered by the same thing that answers
+    /// "who wrote this frame" — which is strictly *harder* to equivocate over
+    /// than a per-record field would be.
+    OwnPlayer {
+        /// The signer's monotonic input sequence, checked for legality on
+        /// replay but never used to re-sort (VC-2).
+        input_seq: u32,
+    },
+    /// A command from some peer other than the frame's signer.
     Player {
         /// The commanding peer.
         node: NodeId,
