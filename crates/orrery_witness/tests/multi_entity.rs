@@ -429,18 +429,33 @@ fn a_multi_frame_repair_of_multi_entity_frames_closes_the_hole() {
         0,
         "not one frame of a correct answer may be refused"
     );
-    assert_eq!(witness.counters().frames_accepted, 6);
+    // Seven, not six: the anchor frame, the five the repair carried, and the
+    // live frame that revealed the gap — which the witness held while the
+    // repair was outstanding and folded the moment the hole closed, rather than
+    // dropping it and needing it sent again.
+    assert_eq!(witness.counters().frames_accepted, 7);
+    assert_eq!(
+        witness.counters().frames_recovered,
+        1,
+        "the frame behind the hole was recovered, not re-requested"
+    );
     assert!(
         witness.catching_up(A).is_none(),
         "the hole is closed, so judgement resumes"
     );
 
-    // And the chain is genuinely whole: the frame that revealed the gap now
-    // chains onto it.
+    // And the chain is genuinely whole. The live frame is already folded, so
+    // re-delivering it is a duplicate — which must read as one, not as a fresh
+    // hole in front of a witness that has moved past it.
     let after = witness
         .ingest_wire_frame(&frame, &heads)
-        .expect("the live frame chains once the hole is filled");
+        .expect("a duplicate is not a rejection");
     assert!(after.is_empty(), "{after:?}");
+    assert_eq!(
+        witness.counters().frames_accepted,
+        7,
+        "a duplicate is ignored rather than folded twice"
+    );
 }
 
 #[test]

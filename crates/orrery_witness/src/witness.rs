@@ -97,6 +97,44 @@ pub struct WitnessCounters {
     /// Not a fault on anyone's part — it is the count of judgements correctly
     /// *not* made, and a witness reporting many of them is one on a bad link.
     pub judgements_deferred: u64,
+    /// Subject ticks this witness re-executed, and can therefore judge.
+    ///
+    /// The numerator of observation coverage.
+    pub judged_ticks: u64,
+    /// Subject ticks this witness was shown, judged or not.
+    ///
+    /// The denominator. Counted from the *advance* of each watch's newest seen
+    /// tick, so a repair re-delivering a range is not counted twice, and
+    /// counted whether the frame could be folded or was set aside — a frame the
+    /// witness could not chain is still timeline it was shown and did not
+    /// judge. That is what makes the ratio detect a watch which has quietly
+    /// stopped: judging freezes while the subject keeps talking, so the two
+    /// diverge. Measured against `judged_ticks` alone the same watch looks
+    /// perfect, because a witness that judges nothing also misjudges nothing.
+    pub shown_ticks: u64,
+    /// Frames folded on a retry, after the hole in front of them closed.
+    ///
+    /// Timeline that used to be thrown away: a frame that could not chain when
+    /// it arrived was dropped, so everything a subject sent while a repair was
+    /// in flight had to be asked for all over again.
+    pub frames_recovered: u64,
+    /// Frames dropped because the deferral buffer for their subject was full.
+    pub deferrals_overflowed: u64,
+    /// Watches resumed at a later anchor after a hole was abandoned.
+    ///
+    /// Each one is a window this witness gave up on and a point at which it
+    /// started judging again. A subject with a rising count is either on a bad
+    /// link or exploiting one, and the two are told apart by
+    /// [`Self::unjudged_ticks`] against the session length rather than by this
+    /// count alone.
+    pub reanchors: u64,
+    /// Subject ticks abandoned unjudged by those re-anchors.
+    ///
+    /// The denominator of observation coverage. A witness that reports zero
+    /// findings across a long session has proven nothing unless this is small
+    /// beside the ticks it actually judged — which is the distinction between
+    /// "saw nothing wrong" and "saw nothing".
+    pub unjudged_ticks: u64,
 }
 
 /// Why an ingest was refused.
@@ -145,10 +183,15 @@ impl core::error::Error for WitnessError {}
 /// "the hashes happen to be missing" makes it an accident rather than a rule.
 ///
 /// The loophole this deliberately does *not* leave open: a cheat could stall
-/// forever to stay unjudged. That is what [`Catchup::attempts`] and
-/// [`WitnessSignal::Stalled`] are for — persistent failure to fill a hole is
-/// itself reportable, so the state has a floor. [`Witness::sweep`] is what
-/// keeps that floor under a subject that stops sending altogether.
+/// forever to stay unjudged. Three things close it. [`Catchup::attempts`] and
+/// [`WitnessSignal::Stalled`] make persistent failure to fill a hole itself
+/// reportable, so the state has a floor. [`Witness::sweep`] keeps that floor
+/// under a subject that stops sending altogether. And [`Witness::try_reanchor`]
+/// puts a *ceiling* on how long the state lasts: a hole that is never filled is
+/// eventually abandoned and judging resumes at a later signed anchor, so the
+/// most a stall can buy is one unjudged window rather than permanent silence.
+/// The report alone was not enough for that, because in shadow mode nothing
+/// acts on a report.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Catchup {
     /// Subject tick at which the hole was first noticed.
@@ -226,6 +269,20 @@ enum GapCheck {
     Signal(WitnessSignal),
 }
 
+/// Where a held frame sits: its subject's key bytes, then its first tick.
+///
+/// The key is the subject's raw bytes rather than the `NodeId` itself because
+/// the buffer is scanned by range — every frame held for one subject, in tick
+/// order — and that needs a total order the key type does not provide.
+type DeferredKey = ([u8; 32], u64);
+
+/// A frame held behind a hole, with the sibling heads it arrived with.
+///
+/// The heads travel with it: they are the caller's, not something this witness
+/// can reconstruct later, and re-offering the frame without them would fail
+/// verification for a reason that has nothing to do with the frame.
+type DeferredFrame = (LogFrame, Vec<(ChainHash, ChainHash)>);
+
 /// One watched entity's running state.
 ///
 /// The executor is **per entity**, not shared across the witness. See
@@ -241,6 +298,14 @@ struct Watched<R: Ruleset> {
     chain_epoch: u32,
     /// Set while this subject's chain has a hole being repaired.
     catchup: Option<Catchup>,
+    /// Newest subject tick this watch has already counted as shown, once any
+    /// frame has arrived. `None` until the first one does, so that frame
+    /// contributes the whole span it covers rather than only its advance —
+    /// otherwise every watch judges one tick more than it was ever shown and
+    /// coverage reads fractionally over 100%.
+    newest_seen: Option<u64>,
+    /// Newest subject tick actually folded into the chain, once one has been.
+    folded_through: Option<u64>,
     head: ChainHash,
     /// Whether `head` reflects a verified fold, or is still the value a claim
     /// seeded. Until the first frame lands there is nothing to detect a gap
@@ -297,6 +362,14 @@ pub struct Witness<R: Ruleset> {
     /// was actually received rather than re-requested.
     log: AuthorityLog,
     counters: WitnessCounters,
+    /// Frames that could not chain when they arrived, held until the hole in
+    /// front of them closes. Keyed by subject key bytes and first tick, so one
+    /// buffered frame serves every watched entity it covers and the drain runs
+    /// in tick order.
+    deferred: BTreeMap<DeferredKey, DeferredFrame>,
+    /// Set while draining, so a frame that defers again cannot re-enter the
+    /// drain it is being drained by.
+    draining: bool,
     /// Newest tick at which retention was last enforced.
     last_pruned: u64,
 }
@@ -328,6 +401,14 @@ impl<R: Ruleset> Witness<R> {
     /// request piling on, short enough that a genuinely lost repair is retried
     /// well inside the 180-tick adjudication window.
     const REPAIR_TIMEOUT_TICKS: u64 = 60;
+
+    /// Frames held per subject while a hole in front of them is repaired.
+    ///
+    /// A repair round trip is [`Self::REPAIR_TIMEOUT_TICKS`] of the subject's
+    /// timeline; at the three-tick frames the 20 Hz send cadence cuts that is
+    /// twenty frames, and the cap is set above it so an answer that arrives on
+    /// time never finds the buffer already full.
+    const MAX_DEFERRED_FRAMES: usize = 32;
 
     /// Repairs asked for without the hole closing before the subject is
     /// reported as stalled rather than merely behind.
@@ -367,6 +448,8 @@ impl<R: Ruleset> Witness<R> {
             watched: BTreeMap::new(),
             samples: BTreeMap::new(),
             log: AuthorityLog::default(),
+            deferred: BTreeMap::new(),
+            draining: false,
             last_pruned: 0,
             counters: WitnessCounters::default(),
         }
@@ -439,6 +522,8 @@ impl<R: Ruleset> Witness<R> {
                 anchor_tick: watch.anchor.tick.0,
                 chain_epoch: watch.anchor.chain_epoch,
                 catchup: None,
+                newest_seen: None,
+                folded_through: None,
                 head: watch.anchor.input_head,
                 anchored: false,
                 claims,
@@ -641,9 +726,55 @@ impl<R: Ruleset> Witness<R> {
         // truncated heads precisely so a receiver can notice a hole cheaply. A
         // hole in any followed entity blocks the whole frame: one signature
         // covers every slice, so a frame cannot be half-folded.
+        let last_tick = frame.first_tick.0 + u64::from(frame.tick_count).saturating_sub(1);
+
+        // A frame entirely behind the fold is a duplicate, not a hole. Repairs
+        // answer in whole frames and the buffer re-offers what it held, so the
+        // same frame legitimately arrives twice; without this the second copy
+        // fails the `prev_head` check — the witness has moved past it — and is
+        // read as missing chain, so a correct answer manufactures the gap it
+        // was sent to close.
+        if !entities.is_empty()
+            && entities.iter().all(|entity| {
+                self.watched[entity]
+                    .folded_through
+                    .is_some_and(|folded| last_tick <= folded)
+            })
+        {
+            return Ok(Vec::new());
+        }
+
+        // Counted before anything can turn the frame away: what the witness was
+        // *shown* is the denominator of its coverage, and a frame it sets aside
+        // is exactly the case that has to land in it.
+        for entity in &entities {
+            if let Some(watched) = self.watched.get_mut(entity) {
+                let advance = match watched.newest_seen {
+                    Some(seen) => last_tick.saturating_sub(seen),
+                    None => last_tick.saturating_sub(frame.first_tick.0) + 1,
+                };
+                watched.newest_seen = Some(match watched.newest_seen {
+                    Some(seen) => seen.max(last_tick),
+                    None => last_tick,
+                });
+                self.counters.shown_ticks += advance;
+            }
+        }
+
         let mut signals = Vec::new();
         let mut blocked = false;
         for entity in &entities {
+            // A drain is *speculative*: the frame is being re-offered on the
+            // chance that the hole in front of it has closed, and it was
+            // already accounted for when it first arrived. Running it back
+            // through the repair machinery would ask for a hole that is already
+            // being repaired and, worse, spend one of the attempts the stall
+            // threshold counts — so a witness would escalate a subject for the
+            // retries the witness itself performed.
+            if self.draining {
+                blocked |= !self.chains(*entity, frame);
+                continue;
+            }
             match self.repair_check(*entity, frame) {
                 GapCheck::Clear => {}
                 GapCheck::Waiting => blocked = true,
@@ -654,7 +785,10 @@ impl<R: Ruleset> Witness<R> {
             }
         }
         if blocked {
-            self.counters.frames_deferred += 1;
+            if !self.draining {
+                self.counters.frames_deferred += 1;
+            }
+            self.buffer_deferred(subject, frame, sibling_heads);
             return Ok(signals);
         }
 
@@ -704,6 +838,10 @@ impl<R: Ruleset> Witness<R> {
             if let Some(slice) = frame.entities.iter().find(|slice| slice.entity == *entity) {
                 watched.chain_epoch = slice.chain_epoch;
             }
+            watched.folded_through = Some(match watched.folded_through {
+                Some(folded) => folded.max(last_tick),
+                None => last_tick,
+            });
         }
         self.log.record_frame(frame.clone(), transitions);
 
@@ -714,9 +852,83 @@ impl<R: Ruleset> Witness<R> {
             }
         }
 
-        let last_tick = frame.first_tick.0 + u64::from(frame.tick_count).saturating_sub(1);
         self.prune_if_due(Tick::new(last_tick));
+
+        // The chain moved, so frames held behind the hole may chain now. This
+        // is what stops a repair from leaving the witness behind by exactly the
+        // round trip it took: without it, everything the subject sent while the
+        // repair was in flight is gone and has to be asked for again, which is
+        // how one hole becomes a queue of them.
+        signals.extend(self.drain_deferred(subject));
         Ok(signals)
+    }
+
+    /// Hold a frame that could not chain, so the repair in front of it does not
+    /// cost the timeline that arrived while it was outstanding.
+    ///
+    /// Bounded per subject. The buffer only has to span a repair round trip —
+    /// [`Self::REPAIR_TIMEOUT_TICKS`] of the subject's timeline, which at the
+    /// three-tick frames the send cadence produces is twenty frames — and a
+    /// subject whose hole is not closing is one the escalation path already
+    /// handles. Past the cap the oldest goes, because the oldest is the one the
+    /// repair is most likely to have covered already.
+    fn buffer_deferred(
+        &mut self,
+        subject: NodeId,
+        frame: &LogFrame,
+        sibling_heads: &[(ChainHash, ChainHash)],
+    ) {
+        let key = (*subject.as_bytes(), frame.first_tick.0);
+        self.deferred
+            .insert(key, (frame.clone(), sibling_heads.to_vec()));
+        let held = self.held_for(subject);
+        if held.len() > Self::MAX_DEFERRED_FRAMES {
+            let oldest = held[0];
+            self.deferred.remove(&oldest);
+            self.counters.deferrals_overflowed += 1;
+        }
+    }
+
+    /// Keys of the frames held for `subject`, in tick order.
+    fn held_for(&self, subject: NodeId) -> Vec<DeferredKey> {
+        let bytes = *subject.as_bytes();
+        self.deferred
+            .range((bytes, 0)..=(bytes, u64::MAX))
+            .map(|(key, _)| *key)
+            .collect()
+    }
+
+    /// Re-offer the frames held for `subject`, oldest first, until one of them
+    /// still cannot chain.
+    ///
+    /// Stopping at the first refusal is not an optimisation: the frames are in
+    /// tick order, so a frame that cannot chain means every frame behind it
+    /// cannot either, and offering them would only re-open the same repair
+    /// once per frame.
+    fn drain_deferred(&mut self, subject: NodeId) -> Vec<WitnessSignal> {
+        if self.draining {
+            return Vec::new();
+        }
+        self.draining = true;
+        let mut signals = Vec::new();
+        for key in self.held_for(subject) {
+            let Some((frame, siblings)) = self.deferred.remove(&key) else {
+                continue;
+            };
+            match self.ingest_frame(&frame, &siblings) {
+                Ok(produced) => signals.extend(produced),
+                // Counted where it was decided; a frame that will not verify is
+                // not a reason to hold on to the ones behind it.
+                Err(_) => continue,
+            }
+            // `ingest_frame` puts it straight back when it still cannot chain.
+            if self.deferred.contains_key(&key) {
+                break;
+            }
+            self.counters.frames_recovered += 1;
+        }
+        self.draining = false;
+        signals
     }
 
     /// Re-execute one entity's slice of a verified frame.
@@ -770,6 +982,7 @@ impl<R: Ruleset> Witness<R> {
                     .insert(tick, orrery_core::CoreCodec::to_canonical(state));
             }
             recorded.push((tick, state_hash));
+            self.counters.judged_ticks += 1;
         }
         while watched.recent.len() > Self::RECENT_SNAPSHOTS {
             let oldest = *watched.recent.keys().next().expect("len > 0");
@@ -780,6 +993,19 @@ impl<R: Ruleset> Witness<R> {
             self.log.record_tick_hash(entity, Tick::new(tick), hash);
         }
         Ok(())
+    }
+
+    /// Whether one entity's slice of `frame` chains onto what this witness has
+    /// folded. The plain chain question, with none of the repair bookkeeping
+    /// [`Self::repair_check`] does on top of it.
+    fn chains(&self, entity: PersistId, frame: &LogFrame) -> bool {
+        let Some(watched) = self.watched.get(&entity) else {
+            return true;
+        };
+        let Some(slice) = frame.entities.iter().find(|slice| slice.entity == entity) else {
+            return true;
+        };
+        !watched.anchored || slice.prev_head == watched.head.rolling()
     }
 
     /// Decide what a frame that does not chain means for one entity.
@@ -957,6 +1183,13 @@ impl<R: Ruleset> Witness<R> {
             watched.snapshotted.retain(|tick| *tick + 1 >= floor);
             watched.reported.retain(|tick| *tick + 1 >= floor);
         }
+        // A frame held behind a hole is only worth holding while a bundle could
+        // still be assembled from it. Past the floor the per-subject cap is no
+        // longer what bounds the buffer — a subject that went quiet mid-hole
+        // would otherwise leave its frames there for the rest of the session.
+        self.deferred
+            .retain(|(_, first_tick), _| *first_tick >= floor);
+
         // Stage-1 samples are kept for entities this peer does not witness, so
         // nothing else bounds them.
         self.samples.retain(|_, (_, tick)| tick.0 + 1 >= floor);
@@ -993,12 +1226,19 @@ impl<R: Ruleset> Witness<R> {
             .ok_or(WitnessError::NotWatched)?;
         verify_claim(claim, watched.subject).map_err(|_| WitnessError::ClaimRejected)?;
 
-        let snapshot = claim.tick.0.checked_sub(1).and_then(|previous| {
-            let watched = self.watched.get(&claim.entity)?;
-            if *watched.computed.get(&previous)? != claim.state_hash {
-                return None;
-            }
-            watched.recent.get(&previous).cloned()
+        // A hole that will never be filled must not silence this watch for the
+        // rest of the session. If this claim is a point the witness can resume
+        // from, it resumes here, before anything else reads the watch.
+        let resumed = self.try_reanchor(claim);
+
+        let snapshot = resumed.or_else(|| {
+            claim.tick.0.checked_sub(1).and_then(|previous| {
+                let watched = self.watched.get(&claim.entity)?;
+                if *watched.computed.get(&previous)? != claim.state_hash {
+                    return None;
+                }
+                watched.recent.get(&previous).cloned()
+            })
         });
 
         if let Some(watched) = self.watched.get_mut(&claim.entity) {
@@ -1010,6 +1250,103 @@ impl<R: Ruleset> Witness<R> {
         self.log
             .record_claim(claim.clone(), snapshot.unwrap_or_default());
         Ok(self.check_pending_claims(claim.entity))
+    }
+
+    /// Resume a watch that gave up on a hole, at a later signed claim.
+    ///
+    /// # Why abandoning a window is better than waiting forever
+    ///
+    /// Once a hole has survived [`Self::MAX_REPAIR_ATTEMPTS`] the witness has
+    /// no way to compute the ticks inside it: re-execution needs the inputs,
+    /// and the inputs were in the frames that never arrived. Before this, that
+    /// state was terminal — [`Self::repair_step`] returned
+    /// [`GapCheck::Waiting`] on every subsequent tick without ever asking
+    /// again, and [`Self::check_pending_claims`] declines to judge while a
+    /// catchup is open. The subject was therefore never judged again, silently
+    /// and for as long as the process lived.
+    ///
+    /// Measured in `p1-swarm --witness`, every watch reached that state within
+    /// about twenty-five simulated seconds, after which the witness counters
+    /// did not move again: identical gap, stall and overflow totals at 30 s and
+    /// at 120 s of an eight-peer run. The escalation the design relies on to
+    /// stop "stall forever to stay unjudged" ([`Catchup`]) does fire — but it
+    /// only *reports*, and in shadow mode nothing acts on a report, so stalling
+    /// was in fact a way to stay unjudged.
+    ///
+    /// Abandoning the window converts blind-forever into blind-for-one-window.
+    /// The abandoned ticks are counted, not forgotten
+    /// ([`WitnessCounters::unjudged_ticks`]), so coverage stays a number an
+    /// operator can read rather than an assumption.
+    ///
+    /// # What makes the new anchor trustworthy
+    ///
+    /// Exactly what makes the original one trustworthy in [`Self::watch`]: a
+    /// claim the subject signed, plus the state it commits to. The state comes
+    /// from what replication delivered — stage-1 samples, which every
+    /// interested peer already holds (docs/06 §3) — and is accepted only when
+    /// [`orrery_core::state_hash`] over it equals the claim's `state_hash`. The
+    /// witness is not taking the subject's word for its state: it is taking the
+    /// subject's *signature*, checked against bytes it received independently.
+    /// A subject cannot re-anchor a witness onto a state it did not commit to,
+    /// because it would have to forge its own signature to do it.
+    ///
+    /// Returns the canonical anchor state when it resumes, so the caller can
+    /// retain it as the snapshot a bundle opens at.
+    fn try_reanchor(&mut self, claim: &StateClaim) -> Option<Vec<u8>> {
+        let watched = self.watched.get(&claim.entity)?;
+        let catchup = watched.catchup?;
+        // Only a hole that has been given up on. A repair still in flight is
+        // one the witness expects to fold, and skipping past it would throw
+        // away judgeable ticks that were about to arrive.
+        if catchup.attempts < Self::MAX_REPAIR_ATTEMPTS || !catchup.reported {
+            return None;
+        }
+        // Forward only. A retained claim from inside the abandoned window would
+        // move the anchor *backwards*, to a point the witness already could not
+        // reach, and the next frame would not chain to it either.
+        if claim.tick.0 <= watched.anchor_tick {
+            return None;
+        }
+        let (state, _) = self.samples.get(&claim.entity)?;
+        if orrery_core::state_hash(state) != claim.state_hash {
+            return None;
+        }
+        let state = state.clone();
+        let canonical = orrery_core::CoreCodec::to_canonical(&state);
+
+        // A fresh executor, not a rewound one: the old one's trajectory stopped
+        // at the hole, and every tick after it would otherwise be computed from
+        // a state the subject left behind.
+        let mut executor = Executor::new((self.ruleset_factory)(), self.seed);
+        executor.insert(claim.entity, state);
+
+        let abandoned = claim.tick.0.saturating_sub(catchup.since);
+        self.counters.reanchors += 1;
+        self.counters.unjudged_ticks += abandoned;
+
+        let watched = self.watched.get_mut(&claim.entity)?;
+        watched.anchor_tick = claim.tick.0;
+        watched.chain_epoch = claim.chain_epoch;
+        watched.catchup = None;
+        watched.head = claim.input_head;
+        // Anchored, unlike a fresh `watch`: this head is the subject's own
+        // signed full head at this tick, so the very next frame is a thing the
+        // witness can check rather than one it has to take on faith. If that
+        // frame does not chain to it, ordinary gap detection re-opens a repair
+        // — which is the right answer, because a frame that does not chain to a
+        // signed head really is missing chain.
+        watched.anchored = true;
+        watched.folded_through = None;
+        watched.executor = executor;
+        watched.computed.clear();
+        watched.recent.clear();
+        watched.snapshotted.clear();
+        watched.reported.clear();
+        // Claims from inside the abandoned window can never be judged now —
+        // their ticks will not be re-executed — and keeping them would have
+        // `check_pending_claims` rescan them for the life of the watch.
+        watched.claims.retain(|tick, _| *tick >= claim.tick.0);
+        Some(canonical)
     }
 
     /// Compare every claim whose tick has been re-executed and not yet judged.

@@ -35,19 +35,40 @@
 //! false positive, which is what makes the count meaningful without a separate
 //! oracle for who was cheating.
 //!
-//! It works and it found real defects. What it does **not** yet do is accumulate
-//! P4's 500 honest player-hours, for two measured reasons:
+//! It works and it found real defects. Both of the reasons it could not
+//! accumulate P4's 500 honest player-hours are now closed: the repair budget
+//! bounded the traffic that reached 8.7 Mbps against a 1 Mbps allowance, and
+//! the cost that grew faster than the peer count is linear again — 32 peers
+//! over 60 simulated seconds runs in about ten wall seconds.
 //!
-//! - **Repair traffic is unbounded.** A peer that hitches for a second drags its
-//!   witnesses through a multi-datagram refill on the *unsheddable* control
-//!   lane. At sixteen peers with a stalling quarter, upload reached 8.7 Mbps
-//!   against the 1 Mbps budget and 26 630 replication packets were shed to pay
-//!   for it. docs/03-replication.md §5.3 puts witness traffic at ~20–30 kb/s per
-//!   link and calls it bounded by construction; repair traffic is not covered by
-//!   that estimate and needs a budget of its own.
-//! - **Cost still grows past sixteen peers** faster than the peer count. Thirty-two
-//!   peers over five simulated minutes does not finish inside seven wall
-//!   minutes, where the same run without the witness takes seconds.
+//! At eight and sixteen peers it now holds the criterion: **zero false
+//! positives at 100% observation coverage**, over runs of 30, 120 and 300
+//! simulated seconds. Both numbers are printed together because neither is
+//! readable alone — a witness that has stopped watching also reports zero.
+//!
+//! At thirty-two the failure has moved out of the witness and into the budget.
+//! Peak upload reaches 1006 kbps against the 1 Mbps allowance and ~15 000
+//! replication packets are shed; the shed frames are holes, the holes are
+//! repairs, and the repairs are what push coverage back to 81% and the false
+//! positives back to 263. The same population without `--witness` sits at
+//! 739 kbps and passes every clause, so what does not fit is the witness lane
+//! itself: seven links per peer at the 20 Hz frame cadence, against
+//! docs/03-replication.md §5.3's 20–30 kb/s per link. That is a parameter
+//! question — link count, frame cadence, or the share witnessing may have —
+//! rather than a defect, and it is what P4 has to settle next.
+//!
+//! Coverage is printed at all because of what it caught. Before re-anchoring
+//! existed, a watch that gave up on a hole stopped judging its subject
+//! permanently — and nothing in the report said so, because a witness that
+//! judges nothing also accuses nobody. Every witness counter froze at about
+//! twenty-five simulated seconds and stayed frozen: identical gap, stall and
+//! overflow totals at 30 s and at 120 s. The hours would have accumulated and
+//! the false-positive count would have been zero for the worst possible reason.
+//!
+//! Note what the profiles do to the roaming figures: `--witness` runs assign
+//! idle, burst and stall behaviours where the plain run is all cruise, so the
+//! least-travelled peer legitimately visits one cell. The interest clauses are
+//! measured on the cruise-only run; these runs are about the witness.
 //!
 //! And one it structurally cannot do: every bot here shares a binary and a
 //! `libm`, so re-execution is bit-identical by construction and the
@@ -203,6 +224,27 @@ fn main() -> Result<()> {
         eprintln!(
             "p1-swarm: witness ran over {:.0} player-hours: {} chain gaps repaired, {} false positives",
             report.player_hours, report.total_gaps, report.total_false_positives,
+        );
+        // Printed beside the false-positive count, never apart from it: the one
+        // is only readable against the other.
+        eprintln!(
+            "p1-swarm: witness judged {:.1}% of the timeline it was shown ({} of {} ticks, \
+             {} abandoned across {} re-anchors); {} frames deferred, {} judgements deferred",
+            report.observation_coverage * 100.0,
+            report.total_judged_ticks,
+            report.total_shown_ticks,
+            report.total_unjudged_ticks,
+            report.total_reanchors,
+            report
+                .per_peer
+                .iter()
+                .map(|p| p.frames_deferred)
+                .sum::<u64>(),
+            report
+                .per_peer
+                .iter()
+                .map(|p| p.judgements_deferred)
+                .sum::<u64>(),
         );
     }
     if let Some(join) = &report.late_join {

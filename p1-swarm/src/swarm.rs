@@ -90,6 +90,20 @@ pub struct PeerReport {
     pub repairs_overflowed: u64,
     /// Repair requests this peer could not answer from its retained log.
     pub repairs_unservable: u64,
+    /// Frames it folded on a retry, after the hole in front of them closed.
+    pub frames_recovered: u64,
+    /// Watches this peer resumed at a later anchor after abandoning a hole.
+    pub reanchors: u64,
+    /// Subject ticks it gave up on doing so — the blind half of coverage.
+    pub unjudged_ticks: u64,
+    /// Subject ticks it actually re-executed and could judge against.
+    pub judged_ticks: u64,
+    /// Subject ticks it was shown, judged or not — the coverage denominator.
+    pub shown_ticks: u64,
+    /// Frames it could not chain because a repair was outstanding.
+    pub frames_deferred: u64,
+    /// Claim comparisons it correctly declined to make while catching up.
+    pub judgements_deferred: u64,
     /// Replica entities held at the end of the run.
     pub replicas: usize,
     /// Of those, how many carried an interest tag.
@@ -144,6 +158,25 @@ pub struct SwarmReport {
     pub total_gaps: u64,
     /// Signals raised against honest peers. **Every one is a false positive.**
     pub total_false_positives: u64,
+    /// Frames folded on a retry rather than dropped and re-requested.
+    pub total_frames_recovered: u64,
+    /// Watches resumed at a later anchor after a hole was abandoned.
+    pub total_reanchors: u64,
+    /// Subject ticks abandoned unjudged by those resumes.
+    pub total_unjudged_ticks: u64,
+    /// Subject ticks re-executed and available to judge against.
+    pub total_judged_ticks: u64,
+    /// Subject ticks shown to a witness, judged or not.
+    pub total_shown_ticks: u64,
+    /// Share of watched ticks this swarm actually judged, 0.0–1.0.
+    ///
+    /// **The number that makes a false-positive count mean anything.** A
+    /// witness that has stopped observing reports zero findings for the same
+    /// reason an honest island does, and nothing else in this report tells the
+    /// two apart. Before re-anchoring existed every watch went permanently
+    /// blind within about twenty-five simulated seconds and this figure decayed
+    /// towards zero while the run kept accumulating player-hours.
+    pub observation_coverage: f64,
     /// Link statistics.
     pub link: LinkReport,
     /// The late-join check, if one ran.
@@ -292,10 +325,11 @@ impl Swarm {
     ///
     /// The payload is the ruleset's own canonical encoding, so the wire cost is
     /// the size the real thing would be rather than a guess.
-    fn broadcast(&mut self, index: usize) {
+    fn broadcast(&mut self, index: usize, tick: u64) {
         let (node, cell, payload) = {
             let bot = &mut self.bots[index];
             let cell = bot.cell().expect("committed");
+            let entity = bot.entity();
             let body = bot.body();
             // The body bytes plus the authority's *committed* cell. D2 makes
             // the commitment a single-writer value emitted by the holder: a
@@ -304,10 +338,15 @@ impl Swarm {
             // boundary would flip cells on every packet and flap in and out of
             // the receiver's AOI for reasons that have nothing to do with where
             // it is.
+            // The entity and the tick travel with the state. Both are things
+            // real replication carries anyway — prediction needs the tick and
+            // interest needs the identity — and without them a receiver holds
+            // bytes it cannot attribute to a subject or line up against a
+            // claim.
             (
                 bot.node,
                 cell,
-                encode_replication(&(body.to_canonical(), cell)),
+                encode_replication(&(body.to_canonical(), cell, entity, tick + 1)),
             )
         };
         let peers: Vec<NodeId> = self.bots[index]
@@ -442,9 +481,18 @@ impl Swarm {
             }
             phase[0] += mark.elapsed().as_nanos();
             mark = std::time::Instant::now();
-            if tick % send_every == 0 {
+            // The last tick of each send window, not the first. Broadcasting
+            // at `t` ships the state *after* `t` stepped, which is the state a
+            // claim at `t + 1` commits to — so sending on the window's last
+            // tick is what makes the replicated state and the signed claim the
+            // same object. On the window's first tick the two are one tick
+            // apart forever, and no receiver can check a claim against a state
+            // it was actually sent, which is the corroboration stage 1 and
+            // re-anchoring both rest on. Same cadence and same number of
+            // sends; only the phase moves.
+            if tick % send_every == send_every - 1 {
                 for index in 0..self.bots.len() {
-                    self.broadcast(index);
+                    self.broadcast(index, tick);
                 }
             }
             if self.config.witnessing {
@@ -627,6 +675,7 @@ impl Swarm {
                 let tagged = bot.tracked();
                 let proxied = bot.proxies();
                 let undecodable = bot.replica_counters().undecodable;
+                let witness = bot.witness_counters();
                 PeerReport {
                     index,
                     cells_visited: bot.visited.len(),
@@ -645,6 +694,13 @@ impl Swarm {
                     stalled: bot.signals.stalled,
                     repairs_overflowed: bot.repairs_overflowed(),
                     repairs_unservable: bot.repairs_unservable(),
+                    frames_recovered: witness.frames_recovered,
+                    reanchors: witness.reanchors,
+                    unjudged_ticks: witness.unjudged_ticks,
+                    judged_ticks: witness.judged_ticks,
+                    shown_ticks: witness.shown_ticks,
+                    frames_deferred: witness.frames_deferred,
+                    judgements_deferred: witness.judgements_deferred,
                     replicas,
                     tagged,
                     proxied,
@@ -679,6 +735,24 @@ impl Swarm {
             player_hours: self.config.peers as f64 * self.config.seconds as f64 / 3_600.0,
             total_gaps: per_peer.iter().map(|p| p.gaps).sum(),
             total_false_positives: per_peer.iter().map(|p| p.false_positives).sum(),
+            total_frames_recovered: per_peer.iter().map(|p| p.frames_recovered).sum(),
+            total_reanchors: per_peer.iter().map(|p| p.reanchors).sum(),
+            total_unjudged_ticks: per_peer.iter().map(|p| p.unjudged_ticks).sum(),
+            total_judged_ticks: per_peer.iter().map(|p| p.judged_ticks).sum(),
+            total_shown_ticks: per_peer.iter().map(|p| p.shown_ticks).sum(),
+            observation_coverage: {
+                let judged: u64 = per_peer.iter().map(|p| p.judged_ticks).sum();
+                let shown: u64 = per_peer.iter().map(|p| p.shown_ticks).sum();
+                // Shown, not judged-plus-abandoned. A witness that stops
+                // judging also stops abandoning, so measuring against its own
+                // abandonments scores a watch that died at 100% — which is the
+                // reading this clause exists to refuse.
+                if shown == 0 {
+                    0.0
+                } else {
+                    judged as f64 / shown as f64
+                }
+            },
             link: self.router.counters.into(),
             per_peer,
             late_join,
@@ -768,6 +842,41 @@ impl SwarmReport {
                     "{} signals raised across {:.0} player-hours ({} gaps, which are repairs \
                      rather than accusations)",
                     self.total_false_positives, self.player_hours, self.total_gaps
+                ),
+            });
+        }
+        // The clause above is only worth reading if the witness was still
+        // watching. A count of zero findings proves nothing about a witness
+        // that went blind, and going blind is what used to happen: a watch that
+        // gave up on a hole never asked again and never judged again, so within
+        // about twenty-five simulated seconds every watch that had met loss was
+        // finished and the run accumulated player-hours against a witness that
+        // had stopped looking.
+        //
+        // The signature of that failure is decay. Measured at eight peers over
+        // 30/120/300 simulated seconds it ran 82.2% → 76.8% → 75.8%, falling as
+        // more watches died; with re-anchoring the same runs hold 83.4% → 82.9%
+        // → 83.0%, which is a steady state rather than a slope.
+        //
+        // The threshold is the phase's target, not today's number: the residual
+        // ~17% is timeline shown to a witness while a hole was open that the
+        // repair which followed did not recover, and closing it is the next
+        // measurement P4 needs. This clause fails until it is closed, alongside
+        // the false-positive clause it exists to make readable.
+        const MIN_COVERAGE: f64 = 0.95;
+        if self.witnessing && self.observation_coverage < MIN_COVERAGE {
+            failures.push(CriterionFailure {
+                clause: "the witness keeps watching for the whole run",
+                detail: format!(
+                    "{:.1}% of the timeline shown to a witness was judged ({} of {} ticks, \
+                     {} abandoned across {} re-anchors); below {:.0}% a false-positive count \
+                     of zero says more about the witness than about the swarm",
+                    self.observation_coverage * 100.0,
+                    self.total_judged_ticks,
+                    self.total_shown_ticks,
+                    self.total_unjudged_ticks,
+                    self.total_reanchors,
+                    MIN_COVERAGE * 100.0,
                 ),
             });
         }
