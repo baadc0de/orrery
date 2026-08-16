@@ -1,19 +1,32 @@
-//! Integration test for the big_space → replicon visibility mapping (P1).
+//! Integration test for the cell → replicon visibility mapping (P1).
 //!
-//! A client's [`AoiSubscription`] gates which replicated entities it can see:
-//! an entity with a [`Cell`] in the 27-cell neighborhood is visible, one
-//! outside is not. This is the base interest-group gate the roadmap's P1 demo
-//! builds on ("a late-joining peer receives only its 27-cell neighborhood").
+//! Each client's [`ClientAoi`] gates which replicated entities it can see: an
+//! entity whose committed [`Cell`] is in that client's subscription is visible,
+//! one outside is not. This is the base interest-group gate the P1 demo builds
+//! on — *"a late-joining peer receives only its 27-cell neighborhood"*.
+//!
+//! # Reading visibility back
+//!
+//! `ClientVisibility::set` had no public inverse, so until now these tests
+//! could only assert on the *input* to the decision. `is_visible` is the
+//! counterpart, added to the vendored replicon fork — P1's upstream milestone
+//! is "visibility-API ergonomics feedback/patches to bevy_replicon"
+//! (docs/11-roadmap.md §P1), and this is that patch. It is additive and changes
+//! no behaviour, so it should upstream cleanly.
+//!
+//! With it, these tests assert the thing that actually matters: which entities
+//! a given client can see.
 
 use bevy::prelude::*;
 use bevy_replicon::prelude::*;
 use bevy_replicon::server::visibility::client_visibility::ClientVisibility;
-use orrery_protocol::CellId;
+use orrery_net::{IslandMembership, IslandSource};
+use orrery_protocol::coord::{IslandId, PeerEntry, TopologyRegime};
+use orrery_protocol::{CellId, NodeId};
 use orrery_spatial::plugin::{AoiSubscription, Cell, LocalPlayer};
-use orrery_spatial::visibility::AoiVisibilityBit;
+use orrery_spatial::visibility::{AoiVisibilityBit, ClientAoi, ClientNode};
 use orrery_spatial::{AoiVisibilityPlugin, OrrerySpatialPlugin};
 
-/// Build a server app with the spatial + visibility plugins.
 fn server_app() -> App {
     let mut app = App::new();
     app.add_plugins((
@@ -26,30 +39,160 @@ fn server_app() -> App {
     app
 }
 
+fn node(n: u8) -> NodeId {
+    let mut seed = [0u8; 32];
+    seed[0] = n;
+    iroh_base::SecretKey::from_bytes(&seed).public()
+}
+
+fn cell(x: i32) -> CellId {
+    CellId::from_coords(glam::IVec3::new(x, 0, 0), CellId::MAX_LEVEL).unwrap()
+}
+
+fn island(peers: Vec<PeerEntry>) -> IslandMembership {
+    IslandMembership {
+        island: Some(IslandId::new(1)),
+        epoch: 1,
+        peers,
+        regime: TopologyRegime::Mesh,
+        source: IslandSource::Coordinator,
+    }
+}
+
 #[test]
-fn aoi_gates_replicated_visibility() {
+fn each_client_is_gated_by_its_own_manifest_entry() {
+    // Two peers standing in different places. Before this, one `AoiSubscription`
+    // was applied to every client, so whatever the *local* player could see,
+    // every connected peer was replicated.
     let mut server = server_app();
-
-    // The client's AOI is centered on the origin cell.
     let origin = CellId::from_coords(glam::IVec3::ZERO, CellId::MAX_LEVEL).unwrap();
-    server.world_mut().resource_mut::<AoiSubscription>().cells = origin.neighbors27();
 
-    // A replicated entity inside the AOI (origin cell) and one far outside.
-    let _inside = server.world_mut().spawn((Replicated, Cell(origin))).id();
-    let far_cell = CellId::from_coords(glam::IVec3::new(100, 0, 0), CellId::MAX_LEVEL).unwrap();
-    let _outside = server.world_mut().spawn((Replicated, Cell(far_cell))).id();
+    *server.world_mut().resource_mut::<IslandMembership>() = island(vec![
+        PeerEntry {
+            node: node(1),
+            cells: origin.neighbors27(),
+        },
+        PeerEntry {
+            node: node(2),
+            cells: vec![cell(100)],
+        },
+    ]);
 
-    // A client entity with a visibility mask.
-    let client = server.world_mut().spawn(ClientVisibility::default()).id();
+    let here = server.world_mut().spawn((Replicated, Cell(origin))).id();
+    let there = server.world_mut().spawn((Replicated, Cell(cell(100)))).id();
 
-    // Run the visibility system.
+    let near = server
+        .world_mut()
+        .spawn((
+            ClientVisibility::default(),
+            ClientNode(node(1)),
+            ClientAoi::default(),
+        ))
+        .id();
+    let far = server
+        .world_mut()
+        .spawn((
+            ClientVisibility::default(),
+            ClientNode(node(2)),
+            ClientAoi::default(),
+        ))
+        .id();
+
     server.update();
 
-    // The AoiVisibilityBit resource was registered (proves the scope
-    // registration ran) and the system ran without panicking over the client
-    // and both entities.
-    assert!(server.world().get_resource::<AoiVisibilityBit>().is_some());
-    assert!(server.world().get::<ClientVisibility>(client).is_some());
+    let bit = server.world().resource::<AoiVisibilityBit>().0;
+    let sees = |server: &App, client: Entity, entity: Entity| {
+        server
+            .world()
+            .get::<ClientVisibility>(client)
+            .expect("visibility")
+            .is_visible(entity, bit)
+    };
+
+    // Each peer sees what is in its own cells, and only that.
+    assert!(sees(&server, near, here));
+    assert!(!sees(&server, near, there));
+    assert!(sees(&server, far, there));
+    assert!(
+        !sees(&server, far, here),
+        "the distant peer must not inherit the local player's neighbourhood"
+    );
+}
+
+#[test]
+fn a_client_with_no_manifest_entry_subscribes_to_nothing() {
+    // Fail closed. Replicating to a client whose interest has not been
+    // established is the direction that leaks the world.
+    let mut server = server_app();
+    let origin = CellId::from_coords(glam::IVec3::ZERO, CellId::MAX_LEVEL).unwrap();
+    *server.world_mut().resource_mut::<IslandMembership>() = island(Vec::new());
+    let entity = server.world_mut().spawn((Replicated, Cell(origin))).id();
+
+    let client = server
+        .world_mut()
+        .spawn((
+            ClientVisibility::default(),
+            ClientNode(node(9)),
+            ClientAoi::default(),
+        ))
+        .id();
+    server.update();
+
+    assert!(server
+        .world()
+        .get::<ClientAoi>(client)
+        .expect("aoi")
+        .cells
+        .is_empty());
+    let bit = server.world().resource::<AoiVisibilityBit>().0;
+    assert!(
+        !server
+            .world()
+            .get::<ClientVisibility>(client)
+            .expect("visibility")
+            .is_visible(entity, bit),
+        "an unestablished client must not be replicated anything"
+    );
+}
+
+#[test]
+fn moving_into_a_clients_cells_makes_an_entity_visible_to_it() {
+    // The gate has to *open* as well as close, or "fail closed" would just be
+    // "closed" — and nothing would ever replicate.
+    let mut server = server_app();
+    let origin = CellId::from_coords(glam::IVec3::ZERO, CellId::MAX_LEVEL).unwrap();
+    *server.world_mut().resource_mut::<IslandMembership>() = island(vec![PeerEntry {
+        node: node(1),
+        cells: vec![origin],
+    }]);
+    let mover = server.world_mut().spawn((Replicated, Cell(cell(100)))).id();
+    let client = server
+        .world_mut()
+        .spawn((
+            ClientVisibility::default(),
+            ClientNode(node(1)),
+            ClientAoi::default(),
+        ))
+        .id();
+
+    server.update();
+    let bit = server.world().resource::<AoiVisibilityBit>().0;
+    let sees = |server: &App| {
+        server
+            .world()
+            .get::<ClientVisibility>(client)
+            .expect("visibility")
+            .is_visible(mover, bit)
+    };
+    assert!(!sees(&server), "starts outside the client's cells");
+
+    *server.world_mut().get_mut::<Cell>(mover).unwrap() = Cell(origin);
+    server.update();
+    assert!(sees(&server), "and becomes visible on arrival");
+
+    *server.world_mut().get_mut::<Cell>(mover).unwrap() = Cell(cell(100));
+    server.update();
+    assert!(!sees(&server), "and hidden again on departure");
 }
 
 #[test]
@@ -72,10 +215,7 @@ fn aoi_contains_gates_cells() {
     let aoi = AoiSubscription {
         cells: origin.neighbors27(),
     };
-    // Inside: the origin and a neighbor.
     assert!(aoi.contains(origin));
     assert!(aoi.contains(origin.neighbor(glam::IVec3::new(1, 0, 0)).unwrap()));
-    // Outside: far away.
-    let far = CellId::from_coords(glam::IVec3::new(100, 0, 0), CellId::MAX_LEVEL).unwrap();
-    assert!(!aoi.contains(far));
+    assert!(!aoi.contains(cell(100)));
 }

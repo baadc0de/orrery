@@ -12,7 +12,7 @@
 //! (docs/01-spatial-model.md §6). Proxies refresh between 1 and 4 Hz (D16),
 //! nearer proxies refreshing faster.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ops::RangeInclusive;
 
 use bevy_ecs::prelude::*;
@@ -20,7 +20,7 @@ use bevy_math::Vec3;
 
 use crate::config::SpatialConfig;
 use crate::hysteresis::GridPosition;
-use crate::plugin::LocalPlayer;
+use crate::plugin::{AoiSubscription, Cell, LocalPlayer};
 
 /// The AOI radius in grid units (one 3×3×3 cell block extends 1.5 cells from
 /// its center). Used to interpolate proxy refresh rates across the visible
@@ -107,42 +107,64 @@ pub fn proxy_rate_hz(dist: f32, proxy_hz: &RangeInclusive<f32>) -> f32 {
 /// Recompute the high-rate set and proxy tags from positions (P1 core).
 ///
 /// Nearest `high_rate_cap` entities get the [`HighRate`] marker; every other
-/// in-AOI candidate gets a [`Proxy`] with a distance-interpolated rate. Tags
-/// are reconciled so each entity holds exactly one of the two.
+/// **in-AOI** candidate gets a [`Proxy`] with a distance-interpolated rate.
+/// Tags are reconciled so each entity holds at most one of the two.
+///
+/// # Cells gate this, distance only orders it
+///
+/// Only entities whose committed [`Cell`] is in the AOI are ranked at all.
+/// Cells are the coarse filter and distance is the second stage (D5/D6) — a
+/// version that ranked every entity in the world would hand a 1 Hz proxy to
+/// something a hundred kilometres away, and the receive-cost bound the whole
+/// Donnybrook pattern rests on is over the *in-range* population, not the
+/// global one.
+///
+/// Entities outside the AOI are stripped of both tags rather than left holding
+/// the last one they had, because a stale `HighRate` marker on something that
+/// has left the neighbourhood is indistinguishable from a current one wherever
+/// the tags are read.
 pub fn update_interest_set(
     cfg: Res<SpatialConfig>,
+    aoi: Res<AoiSubscription>,
     mut commands: Commands,
     mut selection: ResMut<InterestSelection>,
     player: Query<&GridPosition, With<LocalPlayer>>,
-    candidates: Query<(Entity, &GridPosition), Without<LocalPlayer>>,
+    candidates: Query<(Entity, &GridPosition, &Cell), Without<LocalPlayer>>,
 ) {
     let Ok(center) = player.single() else {
         return;
     };
 
-    let ranked = rank_by_distance(center.0, candidates.iter().map(|(e, p)| (e, p.0)));
+    let in_aoi: Vec<(Entity, Vec3)> = candidates
+        .iter()
+        .filter(|(_, _, cell)| aoi.contains(cell.0))
+        .map(|(entity, pos, _)| (entity, pos.0))
+        .collect();
+
+    let ranked = rank_by_distance(center.0, in_aoi.iter().copied());
     let (high_rate, proxies) = split_high_rate(ranked, cfg.high_rate_cap);
 
     let high: HashSet<Entity> = high_rate.iter().copied().collect();
-    // Compute each proxy's refresh rate once, from its linear distance.
+    // Each proxy's refresh rate, from its linear distance.
     let proxy_rates: Vec<(Entity, f32)> = proxies
         .iter()
-        .map(|(e, d)| (*e, proxy_rate_hz(d.sqrt(), &cfg.proxy_hz)))
+        .map(|(entity, squared)| (*entity, proxy_rate_hz(squared.sqrt(), &cfg.proxy_hz)))
         .collect();
+    let rates: HashMap<Entity, f32> = proxy_rates.iter().copied().collect();
 
-    for entity in candidates.iter().map(|(e, _)| e) {
-        if high.contains(&entity) {
-            commands.entity(entity).remove::<Proxy>().insert(HighRate);
-        } else {
-            let rate = proxy_rates
-                .iter()
-                .find(|(e, _)| *e == entity)
-                .map(|(_, r)| *r)
-                .expect("every proxy has a recorded rate");
+    for (entity, _, cell) in &candidates {
+        if !aoi.contains(cell.0) {
             commands
                 .entity(entity)
                 .remove::<HighRate>()
-                .insert(Proxy { rate_hz: rate });
+                .remove::<Proxy>();
+        } else if high.contains(&entity) {
+            commands.entity(entity).remove::<Proxy>().insert(HighRate);
+        } else if let Some(rate_hz) = rates.get(&entity) {
+            commands
+                .entity(entity)
+                .remove::<HighRate>()
+                .insert(Proxy { rate_hz: *rate_hz });
         }
     }
 
