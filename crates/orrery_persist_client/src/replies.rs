@@ -275,10 +275,10 @@ mod tests {
         push_reply(
             &mut app,
             session_entity,
-            Bytes::from(GatewaySession::encode_stream(&GatewayReply::InterestAck {
+            GatewaySession::encode_stream(&GatewayReply::InterestAck {
                 epoch: Some(orrery_protocol::Epoch::new(4)),
                 reason: orrery_protocol::INTEREST_ACK_OK,
-            })),
+            }),
         );
         app.update();
 
@@ -295,10 +295,10 @@ mod tests {
         push_reply(
             &mut app,
             session_entity,
-            Bytes::from(GatewaySession::encode_stream(&GatewayReply::InterestAck {
+            GatewaySession::encode_stream(&GatewayReply::InterestAck {
                 epoch: None,
                 reason: orrery_protocol::INTEREST_ACK_UNTRUSTED,
-            })),
+            }),
         );
         app.update();
 

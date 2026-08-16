@@ -2,6 +2,7 @@
 
 use std::path::PathBuf;
 
+#[cfg(feature = "fdb")]
 use crate::apply;
 use crate::scenario::ResolvedScenario;
 
@@ -90,6 +91,9 @@ pub async fn run(
     })
 }
 
+/// Stand-in for the verify path when the `fdb` feature is off: without a
+/// cluster there is nothing to verify against, so this reports rather than
+/// pretending to have checked.
 #[cfg(not(feature = "fdb"))]
 pub async fn run(
     _source: &str,
@@ -100,6 +104,7 @@ pub async fn run(
     Err("verify requires the `fdb` feature".to_string())
 }
 
+#[cfg(feature = "fdb")]
 fn flatten(mut scenario: ResolvedScenario) -> ResolvedScenario {
     let root = scenario
         .grids

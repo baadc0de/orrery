@@ -7,13 +7,15 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(feature = "fdb")]
+use std::time::Instant;
 
-use orrery_protocol::CellId;
 use rand::seq::SliceRandom;
 use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
 
+#[cfg(feature = "fdb")]
 use crate::seedtree::SeedRoot;
 
 /// The transaction budget, in bytes.

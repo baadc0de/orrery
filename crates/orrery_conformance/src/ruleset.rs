@@ -1,0 +1,337 @@
+//! The reference ruleset the conformance corpus executes.
+//!
+//! This is deliberately *not* a game. It is the smallest kernel that still
+//! exercises both halves of the determinism contract, because a corpus that
+//! only moved integers around would pass on every platform while proving
+//! nothing about the half that actually drifts:
+//!
+//! - **VC-5, discrete.** Hit points, shields and damage rolls are integers
+//!   derived from the seeded per-`(entity, tick)` RNG. These must be
+//!   bit-identical on every target; there is no tolerance band for a hit point.
+//! - **VC-6, continuous.** Thrust is applied along a heading through
+//!   `libm::sin`/`libm::cos`, and drag through `libm::sqrt`. These are the
+//!   calls that would differ between a platform's libm and Rust's std
+//!   intrinsics, which is exactly the divergence the matrix exists to catch.
+//!
+//! Cross-entity effects travel only as events — an attacker emits
+//! `DamageApplied`, the target consumes it as an input on the *next* tick — so
+//! each entity's window replays self-contained.
+
+use orrery_core::quantize::{QPos, QVel, Quantized};
+use orrery_core::rng::TickRng;
+use orrery_core::ruleset::{
+    CodecError, ComponentTypeId, CoreClass, CoreCodec, OrderedInputs, Ruleset, StateView,
+    StepOutput,
+};
+use orrery_protocol::{PersistId, RulesetId};
+use rand_core::RngCore;
+
+/// The fixed tick duration in seconds (VC-1). A constant, never a measurement.
+const DT: f64 = 1.0 / orrery_core::executor::TICK_HZ as f64;
+
+/// Velocity lost to drag per second, as a fraction.
+const DRAG_PER_SEC: f64 = 0.15;
+
+/// The reference build's identity.
+///
+/// Bump `version` whenever the rules change: the committed golden digest is
+/// only meaningful against a fixed ruleset, and a silent rule change would
+/// present as a determinism failure rather than as what it is.
+pub const REFERENCE_RULESET: RulesetId = RulesetId {
+    version: 1,
+    digest: [0xC0; 32],
+};
+
+/// One entity's verifiable state.
+///
+/// Continuous fields are held *on the lattice* — `QPos`/`QVel` are integer
+/// millimetre quanta — rather than as floats: the quantized value is what the
+/// next tick reads (VC-7), so the f64 excursion inside `step` never survives a
+/// tick boundary and platform drift cannot accumulate across a window.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Body {
+    /// Position, on the millimetre lattice.
+    pub pos: QPos,
+    /// Velocity, on the millimetre-per-second lattice.
+    pub vel: QVel,
+    /// Heading in micro-radians. Integer, so the *input* to the transcendental
+    /// is bit-identical everywhere and only `libm` itself is under test.
+    pub heading_urad: i64,
+    /// Hit points (VC-5, discrete — bit-exact or it is a deviation).
+    pub hp: i32,
+    /// Shield points (VC-5, discrete).
+    pub shield: i32,
+    /// A running fold of every RNG draw, so a divergence in the seeded stream
+    /// shows up in the state hash even on a tick where no outcome depended on
+    /// it.
+    pub roll_fold: u64,
+}
+
+/// The canonical encoding's byte length: seven `i64`, two `i32`, one `u64`.
+const BODY_ENCODED_LEN: usize = 7 * 8 + 4 + 4 + 8;
+
+impl Quantized for Body {
+    fn quantize(&mut self) {
+        // Idempotent: `step` already wrote lattice points. Re-snapping is cheap
+        // insurance against a future rule that forgets to.
+        let (x, y, z) = self.pos.to_metres();
+        self.pos = QPos::from_metres(x, y, z);
+        let (vx, vy, vz) = self.vel.to_metres_per_sec();
+        self.vel = QVel::from_metres_per_sec(vx, vy, vz);
+    }
+}
+
+impl CoreCodec for Body {
+    fn encode(&self, out: &mut Vec<u8>) {
+        // Fixed field order, little-endian, no map iteration: two builds that
+        // encoded this differently would manufacture a false deviation.
+        for v in [
+            self.pos.x,
+            self.pos.y,
+            self.pos.z,
+            self.vel.x,
+            self.vel.y,
+            self.vel.z,
+            self.heading_urad,
+        ] {
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        out.extend_from_slice(&self.hp.to_le_bytes());
+        out.extend_from_slice(&self.shield.to_le_bytes());
+        out.extend_from_slice(&self.roll_fold.to_le_bytes());
+    }
+
+    fn decode(bytes: &[u8]) -> Result<Self, CodecError> {
+        if bytes.len() != BODY_ENCODED_LEN {
+            return Err(CodecError("body: wrong length"));
+        }
+        let i64_at = |o: usize| i64::from_le_bytes(bytes[o..o + 8].try_into().unwrap());
+        let i32_at = |o: usize| i32::from_le_bytes(bytes[o..o + 4].try_into().unwrap());
+        Ok(Self {
+            pos: QPos {
+                x: i64_at(0),
+                y: i64_at(8),
+                z: i64_at(16),
+            },
+            vel: QVel {
+                x: i64_at(24),
+                y: i64_at(32),
+                z: i64_at(40),
+            },
+            heading_urad: i64_at(48),
+            hp: i32_at(56),
+            shield: i32_at(60),
+            roll_fold: u64::from_le_bytes(bytes[64..72].try_into().unwrap()),
+        })
+    }
+}
+
+/// One input to a core rule, in the authority's total order (VC-2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Command {
+    /// Accelerate along the current heading, then turn.
+    Thrust {
+        /// Acceleration magnitude in millimetres per second squared.
+        accel_mmss: i64,
+        /// Heading change applied after the thrust, in micro-radians.
+        turn_urad: i64,
+    },
+    /// Attack another entity. Emits `DamageApplied`, which the target consumes
+    /// on the next tick.
+    Attack {
+        /// The entity being attacked.
+        target: PersistId,
+        /// Base power, before the seeded roll.
+        power: u32,
+    },
+    /// Damage arriving from another entity's previous tick.
+    Damage {
+        /// Amount, already rolled by the attacker.
+        amount: i32,
+    },
+}
+
+impl CoreCodec for Command {
+    fn encode(&self, out: &mut Vec<u8>) {
+        match self {
+            Command::Thrust {
+                accel_mmss,
+                turn_urad,
+            } => {
+                out.push(0);
+                out.extend_from_slice(&accel_mmss.to_le_bytes());
+                out.extend_from_slice(&turn_urad.to_le_bytes());
+            }
+            Command::Attack { target, power } => {
+                out.push(1);
+                out.extend_from_slice(&target.0.to_le_bytes());
+                out.extend_from_slice(&power.to_le_bytes());
+            }
+            Command::Damage { amount } => {
+                out.push(2);
+                out.extend_from_slice(&amount.to_le_bytes());
+            }
+        }
+    }
+
+    fn decode(bytes: &[u8]) -> Result<Self, CodecError> {
+        let (tag, rest) = bytes.split_first().ok_or(CodecError("command: empty"))?;
+        match (tag, rest.len()) {
+            (0, 16) => Ok(Command::Thrust {
+                accel_mmss: i64::from_le_bytes(rest[0..8].try_into().unwrap()),
+                turn_urad: i64::from_le_bytes(rest[8..16].try_into().unwrap()),
+            }),
+            (1, 12) => Ok(Command::Attack {
+                target: PersistId::new(u64::from_le_bytes(rest[0..8].try_into().unwrap())),
+                power: u32::from_le_bytes(rest[8..12].try_into().unwrap()),
+            }),
+            (2, 4) => Ok(Command::Damage {
+                amount: i32::from_le_bytes(rest[0..4].try_into().unwrap()),
+            }),
+            _ => Err(CodecError("command: bad tag or length")),
+        }
+    }
+}
+
+/// A deterministic outcome event.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Outcome {
+    /// Damage the target must consume on its next tick.
+    DamageApplied {
+        /// Who takes it.
+        target: PersistId,
+        /// How much.
+        amount: i32,
+    },
+}
+
+impl CoreCodec for Outcome {
+    fn encode(&self, out: &mut Vec<u8>) {
+        let Outcome::DamageApplied { target, amount } = self;
+        out.push(0);
+        out.extend_from_slice(&target.0.to_le_bytes());
+        out.extend_from_slice(&amount.to_le_bytes());
+    }
+
+    fn decode(bytes: &[u8]) -> Result<Self, CodecError> {
+        if bytes.len() != 13 || bytes[0] != 0 {
+            return Err(CodecError("outcome: bad encoding"));
+        }
+        Ok(Outcome::DamageApplied {
+            target: PersistId::new(u64::from_le_bytes(bytes[1..9].try_into().unwrap())),
+            amount: i32::from_le_bytes(bytes[9..13].try_into().unwrap()),
+        })
+    }
+}
+
+/// The reference kernel: kinematic movement over `libm`, plus an integer
+/// combat core.
+pub struct Reference;
+
+impl Ruleset for Reference {
+    type CoreState = Body;
+    type CoreInput = Command;
+    type CoreEvent = Outcome;
+
+    fn id(&self) -> RulesetId {
+        REFERENCE_RULESET
+    }
+
+    fn classify_component(&self, _component: ComponentTypeId) -> CoreClass {
+        CoreClass::Core
+    }
+
+    fn step(
+        &self,
+        view: &mut StateView<'_, Body>,
+        inputs: &OrderedInputs<'_, Command>,
+        rng: &mut TickRng,
+    ) -> StepOutput<Outcome> {
+        let mut events = Vec::new();
+
+        // Read state off the lattice into f64 for the continuous pass. The
+        // conversion is exact — every quantum is representable — so the only
+        // platform-dependent step below is `libm` itself.
+        let (mut px, mut py, mut pz) = view.own().pos.to_metres();
+        let (mut vx, mut vy, mut vz) = view.own().vel.to_metres_per_sec();
+        let mut heading = view.own().heading_urad;
+        let mut hp = view.own().hp;
+        let mut shield = view.own().shield;
+        let mut roll_fold = view.own().roll_fold;
+
+        // Log order is normative (VC-2) and never re-sorted. The index
+        // weighting on damage makes order observable in the result, so a replay
+        // that sorted differently produces a visibly different state rather
+        // than silently agreeing.
+        for (index, command) in inputs.iter().enumerate() {
+            match command {
+                Command::Thrust {
+                    accel_mmss,
+                    turn_urad,
+                } => {
+                    let accel = *accel_mmss as f64 / 1_000.0;
+                    let theta = heading as f64 / 1_000_000.0;
+                    // VC-6: libm, not std. This is the line the matrix tests.
+                    vx += accel * libm::cos(theta) * DT;
+                    vy += accel * libm::sin(theta) * DT;
+                    heading = heading.wrapping_add(*turn_urad);
+                }
+                Command::Attack { target, power } => {
+                    // VC-3/VC-5: the roll is integer and seeded, so the damage
+                    // an attack deals is bit-identical on every target.
+                    let roll = rng.next_u32();
+                    roll_fold = roll_fold.rotate_left(7) ^ u64::from(roll);
+                    let amount = (*power as i32).saturating_add((roll % 8) as i32);
+                    // Reading the target closes the input set: the read is
+                    // recorded, so a replay never needs the neighbour's live
+                    // state, and an authority that fabricates neighbour state
+                    // produces checkable evidence against itself.
+                    let alive = view.neighbor(*target).is_some_and(|b| b.hp > 0);
+                    if alive {
+                        events.push(Outcome::DamageApplied {
+                            target: *target,
+                            amount,
+                        });
+                    }
+                }
+                Command::Damage { amount } => {
+                    // Integer only, shields absorbing first.
+                    let scaled = amount.saturating_add(index as i32);
+                    let absorbed = scaled.min(shield.max(0));
+                    shield -= absorbed;
+                    hp -= scaled - absorbed;
+                }
+            }
+        }
+
+        // Drag, then integrate. `sqrt` is the second transcendental under test.
+        let speed = libm::sqrt(vx * vx + vy * vy + vz * vz);
+        if speed > 0.0 {
+            let retained = 1.0 - DRAG_PER_SEC * DT;
+            vx *= retained;
+            vy *= retained;
+            vz *= retained;
+        }
+        px += vx * DT;
+        py += vy * DT;
+        pz += vz * DT;
+
+        // Every tick folds one draw whether or not it attacked, so a divergence
+        // in the RNG stream itself is visible in the state hash even when no
+        // outcome depended on it.
+        roll_fold = roll_fold.rotate_left(11) ^ u64::from(rng.next_u32());
+
+        let state = view.own_mut();
+        // Back onto the lattice (VC-7). The executor quantizes again after the
+        // step; doing it here too means the value this rule believes and the
+        // value that gets hashed are the same one.
+        state.pos = QPos::from_metres(px, py, pz);
+        state.vel = QVel::from_metres_per_sec(vx, vy, vz);
+        state.heading_urad = heading;
+        state.hp = hp;
+        state.shield = shield;
+        state.roll_fold = roll_fold;
+
+        StepOutput { events }
+    }
+}
