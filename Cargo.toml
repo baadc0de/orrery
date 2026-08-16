@@ -17,6 +17,8 @@ members = [
     "crates/orrery_seed",
     "crates/orrery_games",
     "crates/orrery_conformance",
+    # The facade sits on top of the spine: it depends on every client plugin.
+    "crates/orrery",
 ]
 
 # The P2 latency rig and gate are standalone tools (the p0-nat-test /

@@ -1,0 +1,39 @@
+[package]
+name = "orrery"
+version = "0.1.0"
+edition = "2021"
+description = "Orrery client facade: the OrreryClientPlugins group, the aggregate OrreryConfig, and the prelude"
+license = "MIT OR Apache-2.0"
+
+# Purely compositional (D15, docs/10-crates.md §10). It contains no subsystem
+# logic: a `PluginGroup` has to live in a crate that depends on every member
+# plugin, and none of the functional crates can do that without inverting the
+# dependency spine. The one system it owns is there for the same reason — the
+# `IslandMembership` -> `IslandBinding` wire crosses `orrery_net` and
+# `orrery_authority`, and authority is the lower layer, so neither end may
+# reach for the other.
+
+[dependencies]
+orrery_authority = { path = "../orrery_authority" }
+# The `Ruleset` bound `WitnessPlugin` is generic over.
+orrery_core = { path = "../orrery_core" }
+orrery_net = { path = "../orrery_net" }
+orrery_persist_client = { path = "../orrery_persist_client" }
+orrery_predict = { path = "../orrery_predict" }
+orrery_protocol = { path = "../orrery_protocol" }
+orrery_spatial = { path = "../orrery_spatial" }
+orrery_witness = { path = "../orrery_witness" }
+bevy_app = { workspace = true }
+bevy_ecs = { workspace = true }
+# `NetConfig::relay_mode` is an `iroh::RelayMode`, and `OrreryConfig`'s default
+# has to name `Disabled` (see the type docs).
+iroh = { workspace = true }
+
+[dev-dependencies]
+bevy = { workspace = true }
+# lightyear's replication backend calls `init_state`, which needs the
+# `StateTransition` schedule `StatesPlugin` installs; `MinimalPlugins` has no
+# states. A real game gets it from `DefaultPlugins`.
+bevy_state = { workspace = true }
+# The test `Ruleset`: real, Bevy-free, and already in the workspace.
+orrery_games = { path = "../orrery_games" }
