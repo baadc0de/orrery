@@ -34,7 +34,8 @@ fdb = ["dep:foundationdb"]
 orrery_protocol = { path = "../orrery_protocol" }
 # Adjudication re-runs the same verifiable core the accused peer ran (D9/D12).
 orrery_core = { path = "../orrery_core" }
-orrery_witness = { path = "../orrery_witness" }
+# Bevy-free service: the witness plugin adapter stays out of this binary.
+orrery_witness = { path = "../orrery_witness", default-features = false }
 bytes = { workspace = true }
 postcard = { workspace = true }
 serde = { workspace = true }

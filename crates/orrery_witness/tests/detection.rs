@@ -279,7 +279,7 @@ impl Authority {
         };
 
         let next_tick = first_tick + 3;
-        let claim = ((next_tick - T0) % CLAIM_EVERY == 0).then(|| {
+        let claim = (next_tick - T0).is_multiple_of(CLAIM_EVERY).then(|| {
             let claimed = if self.cheat_multiplier > 1 {
                 &self.cheat_state
             } else {

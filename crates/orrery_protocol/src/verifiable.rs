@@ -280,6 +280,70 @@ pub struct LogRangeResponse {
 /// The adjudication window ceiling: 3 s at 60 Hz (D16).
 pub const MAX_ADJUDICATION_TICKS: u64 = 180;
 
+/// One entity's full head transition, sent alongside a [`LogFrame`].
+///
+/// A frame's signature commits to every entity's *full* 32-byte
+/// `(prev_head, head)` pair, but the slices carry only [`RollingHead`]s. A
+/// receiver recomputes the full pair by folding — which it can only do for
+/// entities whose history it has been following. For the rest it has to be
+/// told, or it cannot rebuild the preimage and check the signature at all.
+///
+/// Supplying these is not a trust concession. A receiver uses its own fold for
+/// anything it is following and ignores the sender's version, and a sender that
+/// lies about the rest only makes its own frame fail to verify.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FrameHead {
+    /// The entity this pair belongs to.
+    pub entity: PersistId,
+    /// Full chain head before the frame's records.
+    pub prev_head: ChainHash,
+    /// Full chain head after them.
+    pub head: ChainHash,
+}
+
+/// Verifiable-core traffic between peers (docs/06 §6, docs/07 §3).
+///
+/// # Which lane each rides
+///
+/// [`Self::Frame`] and [`Self::Claim`] go on `Channel::State` with replication:
+/// they are the steady 20 Hz stream, and a lost one is repaired by
+/// [`Self::RangeRequest`] rather than retransmitted. Everything else rides
+/// `Channel::Control`, because a repair that could itself be dropped would turn
+/// one lost datagram into a permanent hole.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WitnessMsg {
+    /// A signed frame, with the full head pairs a partial follower needs.
+    Frame {
+        /// The frame.
+        frame: LogFrame,
+        /// Full head pairs for the frame's entities. A receiver uses its own
+        /// fold where it has one.
+        heads: Vec<FrameHead>,
+    },
+    /// A periodic signed commitment to quantized state.
+    Claim(StateClaim),
+    /// Fill a hole in a chain. Never an accusation.
+    RangeRequest(LogRangeRequest),
+    /// Frames answering a [`Self::RangeRequest`], with their head pairs.
+    ///
+    /// May be **partial**: an authority serves what fits in one packet and the
+    /// requester asks again for the remainder. A 180-tick window does not fit
+    /// in an MTU, and silently truncating would leave the requester believing
+    /// the gap was unfillable.
+    RangeResponse {
+        /// The frames, in tick order. Empty means the authority cannot serve
+        /// the range — retention, or refusal.
+        response: LogRangeResponse,
+        /// Full head pairs for every entity in `response.frames`.
+        heads: Vec<FrameHead>,
+        /// First tick still missing after these frames, if any. `None` means
+        /// the request was served completely.
+        resume_from: Option<Tick>,
+    },
+    /// A self-verifying accusation, bound to its reporter.
+    Report(Box<DiscrepancyReport>),
+}
+
 /// How a claimed trajectory failed against a replayed one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DeviationKind {
