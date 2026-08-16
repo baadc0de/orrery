@@ -2,7 +2,7 @@
 //! placement, route writes to the owning actor, and recover actors from the
 //! journal (§3.4 restart-and-recovery).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use orrery_protocol::{
@@ -10,7 +10,8 @@ use orrery_protocol::{
 };
 
 use crate::actor::{
-    self, CellActorHandle, EntityRecord, SnapshotPage, Tombstone, TOMBSTONE_RETENTION_MS,
+    self, CellActorHandle, EntityRecord, SnapshotPage, SupersededRow, Tombstone,
+    TOMBSTONE_RETENTION_MS,
 };
 use crate::checkpoint::{CheckpointData, CheckpointStore};
 use crate::crc::crc32c;
@@ -185,6 +186,7 @@ impl CheckpointTarget {
             .checkpoint_snapshot()
             .await
             .map_err(|_| crate::checkpoint::CheckpointError::Store("actor gone".into()))?;
+        let superseded = snap.superseded.clone();
         let data = CheckpointData {
             shard: snap.shard,
             grid: snap.grid,
@@ -194,17 +196,24 @@ impl CheckpointTarget {
             entities: snap.entities,
             by_cell: snap.by_cell,
             tombstones: snap.tombstones,
+            superseded: snap.superseded,
             taken_at_ms: now,
         };
         store.checkpoint(&data).await?;
         // The store's GC pass cleared the expired tombstone rows (D11 §6,
-        // P-6); drop them from the same actor incarnation now so the next
-        // checkpoint does not rewrite them. Safe on failure: an interrupted
-        // checkpoint re-runs and clears them again, so a stale actor entry
-        // cannot resurrect a row.
-        self.handle.prune_tombstones(now).await.map_err(|_| {
-            crate::checkpoint::CheckpointError::Store("actor gone after checkpoint".into())
-        })?;
+        // P-6) and the vacated rows this checkpoint carried (P-9); drop both
+        // from the same actor incarnation now so the next checkpoint does not
+        // rewrite or re-clear them. Only the pairs that travelled with this
+        // checkpoint are dropped — the actor may have recorded more since the
+        // snapshot, and those are the next checkpoint's work. Safe on
+        // failure: an interrupted checkpoint re-runs and clears them again,
+        // so a stale actor entry cannot resurrect a row.
+        self.handle
+            .prune_checkpointed(now, superseded)
+            .await
+            .map_err(|_| {
+                crate::checkpoint::CheckpointError::Store("actor gone after checkpoint".into())
+            })?;
         Ok(())
     }
 }
@@ -277,6 +286,7 @@ impl CellRuntime {
                         state: ckpt.entities,
                         by_cell: ckpt.by_cell,
                         tombstones: ckpt.tombstones,
+                        superseded: ckpt.superseded,
                     },
                 );
             }
@@ -381,6 +391,7 @@ impl CellRuntime {
                     &mut seed.state,
                     &mut seed.by_cell,
                     &mut seed.tombstones,
+                    &mut seed.superseded,
                     &rec,
                     now_ms,
                 );
@@ -404,6 +415,7 @@ impl CellRuntime {
                     seed.state,
                     seed.by_cell,
                     seed.tombstones,
+                    seed.superseded,
                     watermark,
                     &joins,
                 ),
@@ -603,23 +615,34 @@ impl CellRuntime {
                 // Whichever has further coverage wins; the durable tier is
                 // the base the checkpoint guarantees, the live actor the tail
                 // it may not yet have checkpointed.
-                let (mut state, mut by_cell, mut tombstones, mut watermark) = ckpt.map_or_else(
-                    || {
-                        (
-                            HashMap::new(),
-                            HashMap::new(),
-                            HashMap::new(),
-                            Lsn::new(0, 0),
-                        )
-                    },
-                    |c| (c.entities, c.by_cell, c.tombstones, c.watermark),
-                );
+                let (mut state, mut by_cell, mut tombstones, mut superseded, mut watermark) = ckpt
+                    .map_or_else(
+                        || {
+                            (
+                                HashMap::new(),
+                                HashMap::new(),
+                                HashMap::new(),
+                                HashSet::new(),
+                                Lsn::new(0, 0),
+                            )
+                        },
+                        |c| {
+                            (
+                                c.entities,
+                                c.by_cell,
+                                c.tombstones,
+                                c.superseded,
+                                c.watermark,
+                            )
+                        },
+                    );
                 if let Some(old) = self.actors.remove(&shard) {
                     if let Ok(snap) = old.checkpoint_snapshot().await {
                         if snap.ckpt_watermark >= watermark {
                             state = snap.entities;
                             by_cell = snap.by_cell;
                             tombstones = snap.tombstones;
+                            superseded = snap.superseded;
                             watermark = snap.ckpt_watermark;
                         }
                     }
@@ -636,6 +659,7 @@ impl CellRuntime {
                         state,
                         by_cell,
                         tombstones,
+                        superseded,
                         watermark,
                         &self.joins,
                     ),
@@ -678,23 +702,34 @@ impl CellRuntime {
                 .load(*shard, self.grid)
                 .await
                 .map_err(|e| crate::fence::FenceError::Store(e.to_string()))?;
-            let (mut state, mut by_cell, mut tombstones, mut watermark) = ckpt.map_or_else(
-                || {
-                    (
-                        HashMap::new(),
-                        HashMap::new(),
-                        HashMap::new(),
-                        Lsn::new(0, 0),
-                    )
-                },
-                |c| (c.entities, c.by_cell, c.tombstones, c.watermark),
-            );
+            let (mut state, mut by_cell, mut tombstones, mut superseded, mut watermark) = ckpt
+                .map_or_else(
+                    || {
+                        (
+                            HashMap::new(),
+                            HashMap::new(),
+                            HashMap::new(),
+                            HashSet::new(),
+                            Lsn::new(0, 0),
+                        )
+                    },
+                    |c| {
+                        (
+                            c.entities,
+                            c.by_cell,
+                            c.tombstones,
+                            c.superseded,
+                            c.watermark,
+                        )
+                    },
+                );
             if let Some(old) = self.actors.remove(shard) {
                 if let Ok(snapshot) = old.checkpoint_snapshot().await {
                     if snapshot.ckpt_watermark >= watermark {
                         state = snapshot.entities;
                         by_cell = snapshot.by_cell;
                         tombstones = snapshot.tombstones;
+                        superseded = snapshot.superseded;
                         watermark = snapshot.ckpt_watermark;
                     }
                 }
@@ -711,6 +746,7 @@ impl CellRuntime {
                     state,
                     by_cell,
                     tombstones,
+                    superseded,
                     watermark,
                     &self.joins,
                 ),
@@ -781,6 +817,11 @@ impl CellRuntime {
             let partition = snap.children.get(child).cloned().unwrap_or_default();
             let child_by_cell = snap.by_cell.get(child).cloned().unwrap_or_default();
             let child_tombstones = snap.tombstones.get(child).cloned().unwrap_or_default();
+            // The parent's pending row clears travel with the partition: a
+            // split never touches the parent's durable rows, so a vacated key
+            // left behind here would become a ghost no later checkpoint can
+            // reach (§3.5, P-9).
+            let child_superseded = snap.superseded.get(child).cloned().unwrap_or_default();
             self.actors.insert(
                 *child,
                 actor::spawn_preloaded(
@@ -792,6 +833,7 @@ impl CellRuntime {
                     partition,
                     child_by_cell,
                     child_tombstones,
+                    child_superseded,
                     snap.ckpt_watermark,
                     &self.joins,
                 ),
@@ -945,7 +987,12 @@ impl CellRuntime {
         if let Some(ckpt) = store.load(shard, self.grid).await? {
             watermark = Some(ckpt.watermark);
             handle
-                .restore_entities(ckpt.entities, ckpt.by_cell, ckpt.tombstones)
+                .restore_entities(
+                    ckpt.entities,
+                    ckpt.by_cell,
+                    ckpt.tombstones,
+                    ckpt.superseded,
+                )
                 .await
                 .map_err(|_| {
                     crate::checkpoint::CheckpointError::Store("actor gone during restore".into())
@@ -1053,12 +1100,14 @@ impl CellRuntime {
 }
 
 /// One shard's recovered hot state (entity bag, per-entity cells, despawn
-/// markers) — the checkpoint seed folded with the replayed journal tail.
+/// markers, pending row clears) — the checkpoint seed folded with the replayed
+/// journal tail.
 #[derive(Default)]
 struct RecoveredState {
     state: HashMap<PersistId, EntityRecord>,
     by_cell: HashMap<PersistId, CellId>,
     tombstones: HashMap<PersistId, Tombstone>,
+    superseded: HashSet<SupersededRow>,
 }
 
 /// The deepest shard in `shards` whose subtree contains `cell` — the same
@@ -1092,8 +1141,17 @@ fn recover_rekey(
     {
         let seed = seeds.entry(source).or_default();
         seed.state.remove(&rekey.entity);
+        // The source keeps no tombstone (the entity is alive in the
+        // destination shard), so its vacated row is only ever cleared because
+        // the recovery records it here, exactly as the live path does.
+        actor::note_row_moved(&mut seed.superseded, &seed.by_cell, rekey.entity, None);
         seed.by_cell.remove(&rekey.entity);
-        seed.tombstones.remove(&rekey.entity);
+        actor::cancel_tombstone(
+            &mut seed.superseded,
+            &mut seed.tombstones,
+            rekey.entity,
+            None,
+        );
         coverage
             .entry(source)
             .and_modify(|covered| *covered = (*covered).max(lsn))
@@ -1111,8 +1169,19 @@ fn recover_rekey(
                 dirty: true,
             },
         );
+        actor::note_row_moved(
+            &mut seed.superseded,
+            &seed.by_cell,
+            rekey.entity,
+            Some(rekey.destination_cell),
+        );
         seed.by_cell.insert(rekey.entity, rekey.destination_cell);
-        seed.tombstones.remove(&rekey.entity);
+        actor::cancel_tombstone(
+            &mut seed.superseded,
+            &mut seed.tombstones,
+            rekey.entity,
+            Some(rekey.destination_cell),
+        );
         coverage
             .entry(destination)
             .and_modify(|covered| *covered = (*covered).max(lsn))
@@ -1144,14 +1213,18 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-/// Fold a record into an entity map and tombstone set (last-writer-wins per
-/// entity). Mirrors the actor's fold logic for the `open`-time replay, which
-/// runs before any actor exists; `now_ms` seeds the despawn markers' GC
-/// deadlines (P-6).
+/// Fold a record into an entity map, tombstone set, and superseded-row set
+/// (last-writer-wins per entity). Mirrors the actor's fold logic for the
+/// `open`-time replay, which runs before any actor exists; `now_ms` seeds the
+/// despawn markers' GC deadlines (P-6), and the superseded set carries the
+/// vacated `world/` keys the first checkpoint after recovery must clear
+/// (P-9) — which is also why the set need not be durable: replay re-derives
+/// it from the same records that created it.
 fn fold(
     state: &mut HashMap<PersistId, EntityRecord>,
     by_cell: &mut HashMap<PersistId, CellId>,
     tombstones: &mut HashMap<PersistId, Tombstone>,
+    superseded: &mut HashSet<SupersededRow>,
     record: &JournalRecord,
     now_ms: u64,
 ) {
@@ -1160,11 +1233,13 @@ fn fold(
             let entry = state.entry(record.entity).or_default();
             entry.components = record.payload.clone();
             entry.dirty = true;
+            actor::note_row_moved(superseded, by_cell, record.entity, Some(record.cell));
             by_cell.insert(record.entity, record.cell);
-            tombstones.remove(&record.entity);
+            actor::cancel_tombstone(superseded, tombstones, record.entity, Some(record.cell));
         }
         RecordKind::Despawn => {
             state.remove(&record.entity);
+            actor::note_row_moved(superseded, by_cell, record.entity, Some(record.cell));
             by_cell.remove(&record.entity);
             tombstones.insert(
                 record.entity,

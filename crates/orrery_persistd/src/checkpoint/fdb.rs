@@ -26,6 +26,15 @@
 //!   writes markers for entities dead and not yet GC'd, clears markers past
 //!   their deadline, and `read_cold`/`load` never surface a tombstone — so a
 //!   dead entity cannot be resurrected by a cold scan.
+//! - **A moved entity leaves exactly one row** (P-9): the `world/` key carries
+//!   the entity's cell, so a cell change writes a *new* key; the checkpoint
+//!   clears the vacated keys the actor recorded
+//!   ([`CheckpointData::superseded`]) in the same pass that writes the new
+//!   ones. Two live rows for one entity are not merely wasted space: both
+//!   readers rebuild `by_cell` from the key, and a `HashMap` keyed by
+//!   `PersistId` collapses them to whichever cell sorts higher in Morton
+//!   order — a stale-versus-fresh coin flip, and, across shards, two actors
+//!   recovering the same entity.
 //! - **Rows are grid-scoped** (P-7): the `world/` key carries the 4-byte
 //!   `GridId` (§6 calls `cell_id` grid-relative), so nested-grid content and
 //!   root-grid content with the same `CellId` cannot collide and per-grid
@@ -35,7 +44,7 @@
 //! It needs a **live cluster** to actually run; tests that use it self-skip when
 //! no cluster is reachable.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use foundationdb::{Database, KeySelector, RangeOption};
@@ -46,7 +55,7 @@ use orrery_protocol::{CellId, Epoch, GridId, Lsn, PersistId};
 use crate::keyspace;
 use crate::FdbContext;
 
-use crate::actor::{EntityRecord, SnapshotPage, Tombstone};
+use crate::actor::{EntityRecord, SnapshotPage, SupersededRow, Tombstone};
 use crate::checkpoint::{CheckpointData, CheckpointError, CheckpointStore, ColdCellReader};
 use crate::fence::{FenceRow, FenceStatus};
 
@@ -113,23 +122,30 @@ impl From<&CheckpointData> for CheckpointMeta {
     }
 }
 
+/// One shard subtree's `world/` rows, as the scan reconstructs them.
+#[derive(Default)]
+struct WorldRows {
+    entities: HashMap<PersistId, EntityRecord>,
+    by_cell: HashMap<PersistId, CellId>,
+    tombstones: HashMap<PersistId, Tombstone>,
+    /// Rows the scan proved redundant: an entity with more than one row in the
+    /// subtree keeps one, and the rest are reported here so the next
+    /// checkpoint clears them (P-9). Nothing else can find these — the writer
+    /// that left them behind has long forgotten the cell.
+    superseded: HashSet<SupersededRow>,
+}
+
 /// Scan the `world/` rows of `shard`'s subtree in `grid`, rebuilding the entity
 /// bag, the per-entity cell map, and the despawn markers (P-2: rows are keyed
 /// by the entity's cell, which each key records; P-6: tombstone rows are
-/// decoded, never surfaced as entities; P-7: the scan is grid-scoped). Shared
-/// by [`FdbCheckpointStore::load`] — P-8 — and [`ColdCellReader::read_cold`].
+/// decoded, never surfaced as entities; P-7: the scan is grid-scoped; P-9: a
+/// duplicated entity keeps one row and reports the others). Shared by
+/// [`FdbCheckpointStore::load`] — P-8 — and [`ColdCellReader::read_cold`].
 async fn scan_world(
     trx: &foundationdb::Transaction,
     grid: GridId,
     shard: CellId,
-) -> Result<
-    (
-        HashMap<PersistId, EntityRecord>,
-        HashMap<PersistId, CellId>,
-        HashMap<PersistId, Tombstone>,
-    ),
-    foundationdb::FdbBindingError,
-> {
+) -> Result<WorldRows, foundationdb::FdbBindingError> {
     let start = keyspace::world_range_start(grid, shard);
     let end = keyspace::world_range_end(grid, shard);
     let opt = RangeOption {
@@ -137,9 +153,7 @@ async fn scan_world(
         end: KeySelector::first_greater_or_equal(end.as_slice()),
         ..RangeOption::default()
     };
-    let mut entities = HashMap::new();
-    let mut by_cell = HashMap::new();
-    let mut tombstones = HashMap::new();
+    let mut rows = WorldRows::default();
     let mut stream = trx.get_ranges_keyvalues(opt, false);
     while let Some(kv) = stream.try_next().await? {
         // Key: w + grid(4) + cell(8) + entity(8). The cell (the entity's home,
@@ -160,14 +174,20 @@ async fn scan_world(
         let value = kv.value();
         match value.first() {
             Some(&keyspace::LIVE_TAG) => {
-                entities.insert(
+                rows.entities.insert(
                     entity,
                     EntityRecord {
                         components: bytes::Bytes::copy_from_slice(&value[1..]),
                         dirty: false,
                     },
                 );
-                by_cell.insert(entity, cell);
+                // Keys arrive in Morton order, so a second live row for the
+                // same entity supersedes the first — the same one a
+                // `HashMap` insert would have kept, made explicit and
+                // reported instead of silently dropped (P-9).
+                if let Some(previous) = rows.by_cell.insert(entity, cell) {
+                    rows.superseded.insert((entity, previous));
+                }
             }
             Some(&keyspace::TOMBSTONE_TAG) => {
                 // A despawn marker (P-6): never an entity. Decode it so recovery
@@ -180,14 +200,28 @@ async fn scan_world(
                     Ok(t) => t,
                     Err(e) => return Err(e),
                 };
-                tombstones.insert(entity, tombstone);
+                rows.tombstones.insert(entity, tombstone);
             }
             // Unknown tag: a row written by a future version; skip it rather
             // than fail the whole scan.
             _ => {}
         }
     }
-    Ok((entities, by_cell, tombstones))
+    // A despawn marker and a live row for one entity can only coexist at two
+    // different cells (one cell is one key). P-6 is unambiguous about which
+    // wins: a dead entity must not be resurrected by a cold scan, and at a
+    // shared cell the marker already overwrites the row. So the stray live
+    // row is dropped and reported.
+    for (entity, tomb) in &rows.tombstones {
+        if let Some(cell) = rows.by_cell.get(entity).copied() {
+            if cell != tomb.cell {
+                rows.entities.remove(entity);
+                rows.by_cell.remove(entity);
+                rows.superseded.insert((*entity, cell));
+            }
+        }
+    }
+    Ok(rows)
 }
 
 /// An FDB-backed checkpoint store.
@@ -251,6 +285,21 @@ impl CheckpointStore for FdbCheckpointStore {
             })
             .collect();
 
+        // Every key this checkpoint *writes*, live rows and despawn markers
+        // alike. A superseded pair naming one of them is stale bookkeeping —
+        // the entity left the cell and came back before the clear ran — and
+        // clearing it would delete the row this same checkpoint just wrote.
+        let written: HashSet<[u8; 21]> = entries
+            .iter()
+            .map(|(key, _)| *key)
+            .chain(
+                data.tombstones
+                    .iter()
+                    .filter(|(_, tomb)| tomb.gc_deadline_ms > data.taken_at_ms)
+                    .map(|(entity, tomb)| keyspace::world_key(data.grid, tomb.cell, *entity)),
+            )
+            .collect();
+
         // Write entity rows in parallel bounded chunks to avoid FDB commit latency spikes.
         let chunk_futures: Vec<_> = entries
             .chunks(2000)
@@ -292,6 +341,7 @@ impl CheckpointStore for FdbCheckpointStore {
         let data = data.clone();
         db.run(|trx, _| {
             let data = data.clone();
+            let written = written.clone();
             async move {
                 require_active_fence(&trx, data.grid, data.shard, data.node_id, data.epoch).await?;
                 for (entity, tombstone) in &data.tombstones {
@@ -304,6 +354,24 @@ impl CheckpointStore for FdbCheckpointStore {
                         })?;
                         trx.set(&key, &value);
                     }
+                }
+                // Clear the vacated `world/` keys (P-9). This runs *after*
+                // the row chunks above committed, never before: a clear that
+                // outran its replacement write would be data loss, whereas a
+                // clear that never runs is retried by the next checkpoint —
+                // the actor keeps the pair until this transaction commits.
+                for &(entity, cell) in &data.superseded {
+                    // The fence read above authorizes this shard's subtree and
+                    // nothing else; a pair naming a foreign cell is not this
+                    // checkpoint's to clear.
+                    if !data.shard.is_prefix_of(cell) {
+                        continue;
+                    }
+                    let key = keyspace::world_key(data.grid, cell, entity);
+                    if written.contains(&key) {
+                        continue;
+                    }
+                    trx.clear(&key);
                 }
                 let encoded = postcard::to_stdvec(&CheckpointMeta::from(&data)).map_err(|e| {
                     foundationdb::FdbBindingError::new_custom_error(Box::new(
@@ -339,16 +407,17 @@ impl CheckpointStore for FdbCheckpointStore {
             // Rebuild the entity bag, cell map, and tombstone set from the
             // `world/` rows the checkpoint wrote — the `ckpt/` value is the
             // watermark only (P-8).
-            let (entities, by_cell, tombstones) = scan_world(&trx, grid, shard).await?;
+            let rows = scan_world(&trx, grid, shard).await?;
             Ok(Some(CheckpointData {
                 shard,
                 grid,
                 node_id: meta.node_id,
                 epoch: meta.epoch,
                 watermark: meta.watermark,
-                entities,
-                by_cell,
-                tombstones,
+                entities: rows.entities,
+                by_cell: rows.by_cell,
+                tombstones: rows.tombstones,
+                superseded: rows.superseded,
                 taken_at_ms: meta.taken_at_ms,
             }))
         })
@@ -384,11 +453,13 @@ impl ColdCellReader for FdbCheckpointStore {
     ) -> Result<Option<SnapshotPage>, CheckpointError> {
         let db = Arc::clone(&self.db);
         db.run(|trx, _| async move {
-            let (entities, _, _) = scan_world(&trx, grid, cell).await?;
-            if entities.is_empty() {
+            let rows = scan_world(&trx, grid, cell).await?;
+            if rows.entities.is_empty() {
                 return Ok(None);
             }
-            Ok(Some(SnapshotPage { entities }))
+            Ok(Some(SnapshotPage {
+                entities: rows.entities,
+            }))
         })
         .await
         .map_err(|e: foundationdb::FdbBindingError| {
@@ -424,6 +495,7 @@ mod tests {
             entities,
             by_cell: HashMap::new(),
             tombstones: HashMap::new(),
+            superseded: HashSet::new(),
             taken_at_ms: 1_700_000_000_000,
         };
         let meta = CheckpointMeta::from(&data);

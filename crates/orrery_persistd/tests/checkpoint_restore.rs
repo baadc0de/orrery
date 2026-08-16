@@ -153,6 +153,7 @@ async fn actor_serves_rows_present_only_in_the_checkpoint() {
             entities,
             by_cell,
             tombstones: std::collections::HashMap::new(),
+            superseded: std::collections::HashSet::new(),
             taken_at_ms: 1_700_000_000_000,
         })
         .await
@@ -662,7 +663,7 @@ async fn fdb_subtree_keying_and_watermark_only_checkpoint() {
         return;
     };
     use orrery_persistd::{CheckpointData, EntityRecord};
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
 
     // Level-18 shard from docs/01-spatial-model §3.3 (subtree
     // `0x...4C01..=0x...4FFF`) plus two level-21 cells under it and one outside.
@@ -699,6 +700,7 @@ async fn fdb_subtree_keying_and_watermark_only_checkpoint() {
         entities,
         by_cell,
         tombstones: HashMap::new(),
+        superseded: HashSet::new(),
         taken_at_ms: 1_700_000_000_000,
     };
     activate_fdb_fence(&cluster, data.grid, data.shard, data.node_id, data.epoch).await;
@@ -788,7 +790,7 @@ async fn fdb_tombstones_write_gc_and_isolate_grids() {
         return;
     };
     use orrery_persistd::{CheckpointData, EntityRecord, Tombstone};
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
 
     let shard = CellId::from_bits(0xA924_9249_2492_4E00).unwrap();
     let cell = CellId::from_bits(0xA924_9249_2492_4D65).unwrap();
@@ -818,6 +820,7 @@ async fn fdb_tombstones_write_gc_and_isolate_grids() {
             (PersistId::new(2), tomb(1_900_000_000_000)),
             (PersistId::new(3), tomb(100)),
         ]),
+        superseded: HashSet::new(),
         taken_at_ms: 1_700_000_000_000,
     };
     activate_fdb_fence(&cluster, data.grid, data.shard, data.node_id, data.epoch).await;
@@ -867,6 +870,7 @@ async fn fdb_tombstones_write_gc_and_isolate_grids() {
         entities: HashMap::from([(PersistId::new(3), rec(3))]),
         by_cell: HashMap::from([(PersistId::new(3), cell)]),
         tombstones: HashMap::new(),
+        superseded: HashSet::new(),
         taken_at_ms: 1_700_000_000_000,
     };
     activate_fdb_fence(
