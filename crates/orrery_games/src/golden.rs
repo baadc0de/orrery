@@ -1,0 +1,71 @@
+//! Committed chain digests, per game and scenario.
+//!
+//! A golden is the same instrument `orrery_conformance` uses, pointed at a
+//! game instead of at a corpus kernel: a blake3 chain over every per-tick
+//! state hash of a fixed scenario. Two things make it worth committing.
+//!
+//! **It runs on four platforms.** `orrery_games` is in the determinism
+//! matrix's headless spine (`.github/workflows/ci.yml`), so every leg checks
+//! its own chain against these bytes. Cross-platform agreement is therefore
+//! asserted per commit rather than inferred — a `libm` divergence that
+//! survived quantization on one target fails that target's leg by name.
+//!
+//! **It notices a rules change nobody meant to make.** Any edit to a step, a
+//! limit, a spawn or the pilot moves these values. That is the intended
+//! friction: regenerate them *and* bump
+//! [`SKIRMISH_RULESET`](crate::skirmish::SKIRMISH_RULESET)`.version`, because
+//! a golden regenerated without a version bump hides a rules change as a
+//! determinism pass — the one failure this whole apparatus exists to prevent.
+//!
+//! # What the chain does not cover
+//!
+//! State hashes, and only those. A rules change that alters *events* without
+//! altering any state field moves nothing here — adding attribution to
+//! `Outcome::DamageDealt` did not shift a single chain. That is not a defect
+//! in the golden so much as the same fact `Craft::damage_dealt` exists for: an
+//! outcome that leaves no trace in the emitter's own state is invisible to
+//! everything downstream that works from state hashes, adjudication included.
+//! A game that wants an outcome checked has to write it down.
+//!
+//! Regenerate with:
+//!
+//! ```sh
+//! cargo test -p orrery_games --test battery -- --ignored --nocapture emit_goldens
+//! cargo fmt -p orrery_games
+//! ```
+
+/// Skirmish, by scenario name.
+pub const SKIRMISH: [(&str, [u8; 32]); 4] = [
+    (
+        "solo",
+        [
+            0xe2, 0xbc, 0x93, 0x46, 0x4e, 0xd0, 0x63, 0x26, 0x41, 0x6e, 0x00, 0xf2, 0xbb, 0x32,
+            0x60, 0xdb, 0x9f, 0x92, 0xd9, 0x4b, 0x85, 0x34, 0x27, 0x1e, 0x40, 0x9e, 0x66, 0x8d,
+            0xf7, 0x47, 0xc6, 0x15,
+        ],
+    ),
+    (
+        "duel",
+        [
+            0xe0, 0xcc, 0x13, 0xa1, 0xfa, 0xcf, 0x3c, 0xf5, 0xff, 0x90, 0x4d, 0xa5, 0xfe, 0x21,
+            0xe1, 0x04, 0x58, 0xdd, 0xa0, 0x0a, 0x78, 0x0b, 0x00, 0xb4, 0x07, 0x40, 0x6a, 0x82,
+            0x76, 0x7f, 0x62, 0x91,
+        ],
+    ),
+    (
+        "island",
+        [
+            0x74, 0xcd, 0x09, 0x2a, 0xab, 0x70, 0x53, 0x5d, 0xa7, 0xfa, 0x30, 0x98, 0xa8, 0xe5,
+            0x27, 0xdf, 0x2f, 0x3d, 0x61, 0x74, 0x97, 0xd1, 0xa8, 0x0c, 0x54, 0xf6, 0x75, 0xbf,
+            0x68, 0x87, 0x4e, 0x0f,
+        ],
+    ),
+    (
+        "island-lossy",
+        [
+            0x4e, 0xed, 0xe4, 0xab, 0x33, 0x7e, 0x61, 0x9c, 0x50, 0x52, 0xb1, 0x03, 0x5e, 0x4b,
+            0xba, 0x4f, 0x7f, 0xbb, 0xdb, 0xba, 0xdf, 0xc2, 0xf0, 0xbd, 0xa1, 0x4d, 0xa3, 0xf3,
+            0x2f, 0xd4, 0x5a, 0x00,
+        ],
+    ),
+];

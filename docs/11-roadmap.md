@@ -211,7 +211,7 @@ cannot occur by construction.
 
 **Goal.** Scoped determinism (D9) and passive witnessing (D10) with **no enforcement**: logs, replay, adjudication, and discrepancy telemetry only. This phase exists to calibrate tolerance bands against reality before anyone can be striked.
 
-**Crates.** `orrery_core` (`Ruleset` trait, fixed-tick executor, `rand_chacha` seeded per `(universe_seed, entity, tick)`, quantization, tolerance comparators, signed hash-chained input logs, headless replay harness) — **landed**, see [06-verifiable-core.md](06-verifiable-core.md); `orrery_witness` (invariant validators, discrepancy detection, evidence assembly) — **landed**, shadow-mode by default; `orrery_persistd` (adjudication executor linking the same `Ruleset`) — **landed** as version-keyed routing over the 3 retained builds; reference game (kinematic movement + integer combat core).
+**Crates.** `orrery_core` (`Ruleset` trait, fixed-tick executor, `rand_chacha` seeded per `(universe_seed, entity, tick)`, quantization, tolerance comparators, signed hash-chained input logs, headless replay harness) — **landed**, see [06-verifiable-core.md](06-verifiable-core.md); `orrery_witness` (invariant validators, discrepancy detection, evidence assembly) — **landed**, shadow-mode by default; `orrery_persistd` (adjudication executor linking the same `Ruleset`) — **landed** as version-keyed routing over the 3 retained builds; `orrery_games` (the reference games: kinematic movement + integer combat core) — **landed**.
 
 The core was built as a side track (sequencing principle 2), so it proceeded
 independently of the P1/P3 tracks. It now has its consumers: `orrery_witness`
@@ -223,9 +223,45 @@ the phase is no longer blocked on wiring.
 What remains is the part the phase actually exists for, and it is measurement
 rather than construction: **the false-positive rate**. Shadow mode stays on
 until ≥ 500 honest player-hours across all three platforms under injected
-impairment produce zero reports (D17 risk 3). Still outstanding for that: the
-cross-platform determinism CI, the reference game to measure against, and the
-bot harness to accumulate the hours.
+impairment produce zero reports (D17 risk 3). Of the three things that gate
+being able to measure it at all, two are now in place — the cross-platform
+determinism CI (`.github/workflows/ci.yml`, four targets, per commit) and the
+reference game (`orrery_games`) — and what is outstanding is the **accumulation
+of hours**: `p1-swarm --witness` runs the pipeline, but nothing yet runs it
+long enough, across enough platforms, to produce the number the gate is stated
+in.
+
+**The reference game (`orrery_games`).** Skirmish — small craft, kinematic
+movement over `libm`, integer combat with cooldowns, weapon reach and a death
+state — plus the harness that plays it, records what an authority would have
+logged, runs stage 1 the way an ordinary peer does, and re-executes the log the
+way a witness does. Three things about it are worth stating here rather than
+leaving in the crate:
+
+- It is where `Ruleset::invariants()` first returns anything. P4's "continuous
+  cheap checks — speed/acceleration caps, teleport detection, rate limits,
+  impossible values" existed as a seam in `orrery_core` and as a consumer in
+  `orrery_witness`; until a game published validators, every peer in the tree
+  was evaluating an empty slice.
+- It ships its own cheats, because the demo criterion is a modified client. The
+  three are chosen so each is caught by a different stage: a 1.5× speed
+  multiplier (the criterion's own, caught by stage 1 *and* out of band on
+  replay), an inflated damage roll (**invisible** to every cheap check — every
+  field it touches stays legal — and caught only by re-executing the attacker's
+  window), and an ignored weapon cooldown (rate limit, then replay). The middle
+  one is why stage 1 is a filter and not a verdict.
+- The first run of its own battery found a false positive in its own
+  acceleration cap: the obvious limit, `a_max · dt` per tick, is wrong for
+  rules where drag and a speed clamp also move the velocity, and it fires on
+  honest play within ten seconds. That is the failure mode of D17 risk 3 in
+  miniature, found by a test rather than by a player, which is the argument for
+  the crate in one sentence.
+
+It is deliberately *not* a substitute for `p1-swarm`: the swarm runs the real
+witness over an impaired link and answers whether the pipeline holds up; this
+answers whether the rules are honest-safe and the cheats are adjudicable, in
+milliseconds, on every commit, on four platforms. The swarm is still the thing
+that accumulates the hours.
 
 **Deliverables.**
 - PeerReview-style tamper-evident logs streamed to the cell-epoch witness set (piggybacked on the 20 Hz replication datagrams, gap repair over the reliable control stream); any holder of a segment + t₀ claim can re-execute a window ≤ 3 s (180 ticks) and produce self-verifying evidence.

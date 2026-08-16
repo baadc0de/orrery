@@ -15,6 +15,7 @@ members = [
     "crates/orrery_persist_client",
     "crates/orrery_persistd",
     "crates/orrery_seed",
+    "crates/orrery_games",
     "crates/orrery_conformance",
 ]
 

@@ -115,6 +115,7 @@ Layering rules (the first two are normative from D15; the rest are containment r
 | `orrery` (facade) | lib | yes | all six client plugins |
 | `orrery_persistd` | lib+bin | **none** | foundationdb-rs 0.11, fjall 3.x, iroh, tokio, tonic |
 | `orrery_seed` | lib+bin | **none** | toml, serde, blake3, rand_chacha 0.9, postcard, foundationdb-rs 0.11 (opt, `fdb` feature) |
+| `orrery_games` | lib | **none** | libm, rand_chacha 0.9, blake3 |
 | `orrery_coordinator` | bin | **none** | iroh, tokio, tonic |
 | `orrery_identity` | bin | **none** | iroh, tokio, foundationdb-rs 0.11, argon2 |
 | `orrery_field_host` | bin+lib | **headless** (MinimalPlugins) | bevy 0.19 (no render/winit) |
@@ -531,6 +532,12 @@ fn main() -> anyhow::Result<()> {
 ```
 
 The same `MyRules` value is linked into three other places: the client (witness re-execution inside `OrreryClientPlugins::<MyRules>`), the game's field host, and offline tooling (`ReplayHarness` CLI). `Ruleset::RULES_DIGEST` is exchanged at every gateway and coordinator handshake; a digest mismatch refuses the session — adjudication is meaningless across differing rules builds.
+
+### The reference games in-tree
+
+`orrery_games` is that shape, shipped: `Ruleset` implementations depending only on `orrery_core` and `orrery_protocol`, with no Bevy and no tokio. It exists because P4's exit gate is a *measurement* — a false-positive rate over honest play — and a measurement needs rules that can refuse. `orrery_conformance`'s kernel deliberately cannot: it has no caps, no cooldowns, no reach, so nothing about it can be checked cheaply or disagreed with, and a false-positive rate taken over it would be a statement about arithmetic rather than about play.
+
+Three things distinguish it from an example game. It is **plural** — the harness is generic over a `Game` trait and the test battery runs over a catalogue, because the false-positive rate is a property of the rules being played and one kernel cannot tell you which shape of play a number came from. It ships **cheats** — P4's demo criterion is a modified client, so each game builds its own tampered variants, which keep the honest `RulesetId` because a cheater claims to be running the rules. And it is held to the **determinism gates**: `scripts/core-gates.sh` scans it alongside `orrery_core`, and its committed golden chains are checked on all four targets of the determinism matrix.
 
 ## Client app composition
 
