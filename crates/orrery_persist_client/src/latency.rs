@@ -8,44 +8,39 @@
 //! - intent commit p99 < 10 ms
 //! - area first-page-in < 50 ms
 //!
-//! Bucket boundaries are chosen to place several buckets across each target so
-//! that p50/p90/p99 resolve within one bucket width of the true value. Memory
-//! is constant (independent of sample count). The histogram is mergeable so
-//! per-process histograms can be combined into a global view.
+//! The bucket boundaries and the D16 series names are **not** defined here.
+//! They live in [`orrery_protocol::metrics`], the one definition every
+//! producer and consumer of the P2 artifact shares — the journal recorder, the
+//! gateway's server-side timer, this histogram, and the `p2-dashboard` gate.
+//! This module re-exports them so a consumer whose only dependency is this
+//! crate reaches the contract without a new dependency edge.
+//!
+//! Memory is constant (independent of sample count). The histogram is
+//! mergeable so per-process histograms can be combined into a global view.
 //!
 //! Do NOT introduce a `Vec`-and-sort approach here: a 30-minute run at 10k
 //! entities × 4 Hz would produce ~72M samples, which does not fit in memory.
 
 use std::time::Duration;
 
-/// The number of bucket boundaries (22 boundaries → 23 buckets).
-const NUM_BOUNDARIES: usize = 22;
+pub use orrery_protocol::metrics::{
+    bucket_index, bucket_upper_us, is_known_series, GATED_SERIES, LATENCY_BOUNDARIES_US,
+    NUM_LATENCY_BUCKETS, SERIES_AREA_FIRST_PAGE, SERIES_BULK_ACK, SERIES_GATEWAY_BULK_SERVER,
+    SERIES_INTENT_COMMIT, SERIES_JOURNAL_COMMIT, UNGATED_SERIES,
+};
 
-/// Bucket boundaries in microseconds, from 50 µs to 1 s.
-///
-/// Each boundary is the exclusive upper bound of the corresponding bucket. The
-/// final bucket (overflow, index NUM_BOUNDARIES) has no upper bound.
-///
-/// Rationale (D16 targets in parentheses):
-/// - 50 µs, 100 µs, 200 µs, 500 µs: sub-millisecond ranges
-/// - 1 ms, 2 ms: journal commit < 2 ms target spans two buckets
-/// - 3 ms, 5 ms: bulk ack p99 < 5 ms target spans two buckets
-/// - 7 ms, 10 ms: intent commit p99 < 10 ms target spans two buckets
-/// - 15 ms, 20 ms, 30 ms, 50 ms: area first-page-in < 50 ms spans four buckets
-/// - 75 ms, 100 ms, 150 ms, 200 ms, 300 ms, 500 ms, 750 ms, 1 s: wide tail
-const BOUNDARIES_US: [u64; NUM_BOUNDARIES] = [
-    50, 100, 200, 500, 1000, 2000, 3000, 5000, 7000, 10000, 15000, 20000, 30000, 50000, 75000,
-    100000, 150000, 200000, 300000, 500000, 750000, 1000000,
-];
+/// The number of bucket boundaries.
+const NUM_BOUNDARIES: usize = LATENCY_BOUNDARIES_US.len();
 
 /// The number of buckets (boundaries + 1 for the overflow bucket).
-const NUM_BUCKETS: usize = NUM_BOUNDARIES + 1;
+const NUM_BUCKETS: usize = NUM_LATENCY_BUCKETS;
 
 /// A bounded-memory latency histogram with fixed bucket boundaries.
 ///
 /// Records latency samples into buckets whose boundaries are chosen to cover
 /// the four D16 targets with several buckets per target. Memory is constant
-/// (184 bytes for the bucket array) regardless of sample count.
+/// (one `u64` per bucket, `NUM_LATENCY_BUCKETS` of them) regardless of
+/// sample count.
 ///
 /// # Merge
 ///
@@ -60,8 +55,8 @@ const NUM_BUCKETS: usize = NUM_BOUNDARIES + 1;
 /// the true value. The actual maximum is tracked separately.
 #[derive(Debug, Clone)]
 pub struct LatencyHistogram {
-    /// Per-bucket counters. Bucket `i` covers `[BOUNDARIES_US[i-1], BOUNDARIES_US[i])`
-    /// for `i < NUM_BOUNDARIES`, and `[BOUNDARIES_US[NUM_BOUNDARIES-1], ∞)` for the
+    /// Per-bucket counters. Bucket `i` covers `[LATENCY_BOUNDARIES_US[i-1], LATENCY_BOUNDARIES_US[i])`
+    /// for `i < NUM_BOUNDARIES`, and `[LATENCY_BOUNDARIES_US[NUM_BOUNDARIES-1], ∞)` for the
     /// overflow bucket at index `NUM_BOUNDARIES`.
     buckets: [u64; NUM_BUCKETS],
     /// Total number of samples recorded.
@@ -93,19 +88,11 @@ impl LatencyHistogram {
     /// Record a latency sample.
     pub fn record(&mut self, latency: Duration) {
         let micros = latency.as_micros() as u64;
-        // `partition_point` finds the first boundary where `micros <= boundary`.
-        // Since boundaries are sorted ascending and the predicate `|&b| micros > b`
-        // is true for all boundaries less than `micros`, the result is the bucket
-        // index. If `micros` exceeds all boundaries, the result is `NUM_BOUNDARIES`,
-        // which is the overflow bucket index.
-        let idx = BOUNDARIES_US.partition_point(|&b| micros > b);
-        // If micros exceeds all boundaries, idx == NUM_BOUNDARIES, which is
-        // a valid bucket index (the overflow bucket).
-        if idx >= self.buckets.len() {
-            // Safety: this should never happen since partition_point returns
-            // at most NUM_BOUNDARIES, and NUM_BOUNDARIES == NUM_BUCKETS - 1.
-            return;
-        }
+        // The shared bucket predicate, so a sample recorded here lands in the
+        // same bucket the journal recorder and the gateway would give it.
+        let idx = bucket_index(micros);
+        // `bucket_index` returns at most `NUM_BOUNDARIES`, the overflow
+        // bucket, so this index is always in range.
         self.buckets[idx] += 1;
         self.total += 1;
 
@@ -179,9 +166,9 @@ impl LatencyHistogram {
         for (i, &count) in self.buckets.iter().enumerate() {
             cumulative += count;
             if cumulative >= target {
-                // Return the upper bound of this bucket.
                 if i < NUM_BOUNDARIES {
-                    return Duration::from_micros(BOUNDARIES_US[i]);
+                    // The shared reconstruction rule: the bucket's upper bound.
+                    return Duration::from_micros(bucket_upper_us(i, 0));
                 }
                 // Overflow bucket: return the tracked max, or Duration::MAX if none.
                 return self.max.unwrap_or(Duration::MAX);
@@ -367,26 +354,39 @@ mod tests {
     }
 
     #[test]
-    fn boundaries_cover_d16_targets() {
-        // Verify the bucket boundaries cover the D16 targets with at least
-        // two buckets per target.
-        let targets_us: [(u64, &str); 4] = [
-            (2000, "journal commit < 2 ms"),
-            (5000, "bulk ack p99 < 5 ms"),
-            (10_000, "intent commit p99 < 10 ms"),
-            (50_000, "area first-page-in < 50 ms"),
-        ];
-        for (target_us, name) in &targets_us {
-            let mut count = 0;
-            for &b in &BOUNDARIES_US {
-                if b <= *target_us {
-                    count += 1;
-                }
-            }
-            assert!(
-                count >= 2,
-                "{name}: target {target_us} µs has only {count} bucket(s) below it, expected >= 2"
+    fn producer_and_consumer_agree_on_the_bucket() {
+        // The round trip the P2 artifact is: a producer records a sample,
+        // drains the bucket at its reported upper bound, writes that number
+        // into JSONL, and the gate re-records it. Both sides must then report
+        // the same percentile, or the gate is reading a different number from
+        // the one the rig measured.
+        for micros in [
+            1, 49, 50, 51, 999, 1_000, 1_100, 1_500, 1_999, 2_000, 4_999, 30_001, 999_999,
+        ] {
+            let mut producer = LatencyHistogram::new();
+            producer.record(Duration::from_micros(micros));
+            let reported = producer.p99();
+
+            let mut consumer = LatencyHistogram::new();
+            consumer.record(reported);
+            assert_eq!(
+                consumer.p99(),
+                reported,
+                "{micros} µs reported as {reported:?} must re-read to the same bucket"
             );
         }
+    }
+
+    #[test]
+    fn the_journal_band_no_longer_collapses_onto_the_gate_threshold() {
+        // The defect the shared lattice fixes: with 1 ms and 2 ms adjacent,
+        // every journal p99 anywhere in the 1.0–2.0 ms band reported as
+        // exactly the 2 ms D16 threshold, and passed on the equality case.
+        let mut hist = LatencyHistogram::new();
+        for _ in 0..100 {
+            hist.record(Duration::from_micros(1_100));
+        }
+        assert_eq!(hist.p99(), Duration::from_micros(1_250));
+        assert!(hist.p99() < Duration::from_micros(2_000));
     }
 }

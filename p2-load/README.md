@@ -67,7 +67,7 @@ One JSON object per line on stdout; logs on stderr. Three record kinds:
 {"type":"run_footer","note":"duration elapsed; diffs=… acks=… intents=…"}
 ```
 
-`sample.series` is one of the four D16 keys:
+`sample.series` is one of the four gated D16 keys:
 
 | series               | source                                                  |
 |----------------------|---------------------------------------------------------|
@@ -76,11 +76,25 @@ One JSON object per line on stdout; logs on stderr. Three record kinds:
 | `intent_commit_ms`   | `IntentQueue::on_ack` (submit → commit round trip)      |
 | `area_first_page_ms` | `Subscribe` send → first `AreaPage`, per session        |
 
+persistd appends a fifth series, `gateway_bulk_server_ms` (receipt through
+send call, the server-side half of `bulk_ack_ms`), to the same artifact. D16
+sets no target for it; `p2-dashboard` folds and reports it and never gates on
+it. The rig itself never emits it.
+
+The names, the bucket boundaries and the reconstruction rule are **one
+definition** — `orrery_protocol::metrics`, re-exported through
+`orrery_persist_client::latency` — shared by the rig, persistd's journal and
+gateway recorders, and the gate. There is no per-tool copy to keep in step.
+
 `value_us` is the **bucket upper bound** of the rig-side histogram bucket the
 sample landed in — the same bucketing `LatencyHistogram`'s own percentile
 methods report, so the gate (`p2-dashboard`) reconstructs percentiles that
-agree bucket-for-bucket with the rig's live view. `CellId`, `PersistId` and
-`Tick` serialize as their plain numeric newtype values (the wire form).
+agree bucket-for-bucket with the rig's live view. The lattice refines the
+sub-2 ms band (…, 1000, 1250, 1500, 1750, 2000, …) precisely because that is
+the band the `journal_commit_ms` target gates on: with 1 ms and 2 ms adjacent,
+every p99 in between read out as exactly the 2 ms threshold. `CellId`,
+`PersistId` and `Tick` serialize as their plain numeric newtype values (the
+wire form).
 
 ## Usage
 

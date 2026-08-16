@@ -13,6 +13,18 @@ against the demo-criterion targets verbatim
 | `intent_commit_ms`   | < 10 ms                     |
 | `area_first_page_ms` | < 50 ms                     |
 
+A fifth series, `gateway_bulk_server_ms`, is the server-side half of
+`bulk_ack_ms`: persistd measures receipt-through-send-call and appends it to
+the same artifact, so a bulk-ack regression can be attributed to server work
+or to the wire without re-running. D16 sets no target for it, so it is folded
+and reported with `"gate": "not_gated"` and never contributes to the verdict —
+present or absent.
+
+The series names, the histogram boundaries and the bucket-reconstruction rule
+are **one definition**, `orrery_protocol::metrics`, re-exported through
+`orrery_persist_client::latency` and shared with `p2-load` and persistd. That
+is what makes a percentile reported here the same number the rig measured.
+
 The sibling tool is [`p0-dashboard`](../p0-dashboard/README.md): same shape
 (read JSONL, compute percentiles, print a pass/fail table, `--gate` exits
 non-zero), different numbers.
@@ -37,10 +49,16 @@ object per line:
 - `{"type":"run_footer","note":"..."}` — end-of-run marker; counted, not gated.
 
 Per series the report carries `n`, `p50_us`, `p99_us`, `max_us`, the threshold
-it was gated against, and a per-series verdict (`pass` / `fail` /
-`missing_data`). A series with **no samples fails the gate** — the D16 demo
-criterion requires all four series measured, and an empty series cannot pass
-by omission.
+it was gated against (`null` for an ungated series), and a per-series verdict
+(`pass` / `fail` / `missing_data` / `not_gated`). A **gated** series with no
+samples fails the gate — the D16 demo criterion requires all four measured,
+and an empty series cannot pass by omission.
+
+A `sample` or `sample_batch` record naming a series outside the contract above
+is counted in the report's `unknown_series` field, and the distinct names are
+listed in `unknown_series_names`. It does not gate — a producer that grows a new series should not fail a nightly run —
+but a *typo* in one of the gated names now shows up there instead of vanishing
+into the fold.
 
 ## Build
 
@@ -75,17 +93,21 @@ The `--json` `Report` is the stable machine contract:
 
 ```json
 {
-  "records": 402,
+  "records": 406,
   "malformed": 0,
+  "unknown_series": 0,
+  "unknown_series_names": [],
   "gate": "pass",
   "run": { "gateway": "ea4a…", "entities": 10000, "cells": 128, "sessions": 6,
            "diff_hz": 2.0, "intent_mix": {"trade": 0.02, "craft": 0.01},
            "duration_secs": 30 },
   "series": {
-    "bulk_ack_ms":      { "n": 100, "p50_us": 2000, "p99_us": 3000,
+    "bulk_ack_ms":      { "n": 100, "p50_us": 1500, "p99_us": 3000,
                           "max_us": 3000, "threshold_us": 5000, "gate": "pass" },
     "journal_commit_ms": { "n": 100, "p50_us": 1000, "p99_us": 1000,
                           "max_us": 900,  "threshold_us": 2000, "gate": "pass" },
+    "gateway_bulk_server_ms": { "n": 100, "p50_us": 500, "p99_us": 3000,
+                          "max_us": 3000, "threshold_us": null, "gate": "not_gated" },
     "…": "…"
   }
 }
@@ -105,8 +127,9 @@ The `--json` `Report` is the stable machine contract:
 
 ## Test data
 
-`testdata/demo.jsonl` is a synthetic 30 s run whose four series all land
-below their D16 targets, so the dashboard is exercisable without a cluster:
+`testdata/demo.jsonl` is a synthetic 30 s run whose four gated series all land
+below their D16 targets, plus a `gateway_bulk_server_ms` block so the ungated
+path is exercised too. The dashboard is runnable on it without a cluster:
 
 ```sh
 ./p2-dashboard testdata/demo.jsonl          # prints the human table

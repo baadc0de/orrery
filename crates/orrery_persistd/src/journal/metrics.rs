@@ -4,7 +4,10 @@
 //! durable resolution of its [`AppendHandle`].  It deliberately keeps only
 //! fixed bucket counters: recording is one relaxed counter increment (plus a
 //! CAS only when a new maximum is observed), and reporting can emit compact
-//! `{ value_us, count }` batches for the P2 JSONL artifact.
+//! `{ value_us, count }` batches for the P2 JSONL artifact under the
+//! [`SERIES_JOURNAL_COMMIT`] key.
+//!
+//! [`SERIES_JOURNAL_COMMIT`]: orrery_protocol::metrics::SERIES_JOURNAL_COMMIT
 //!
 //! [`Journal::append`]: super::Journal::append
 //! [`AppendHandle`]: super::AppendHandle
@@ -13,16 +16,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-/// Boundaries shared with the P2 latency artifact's D16 histogram.
-///
-/// A sample belongs to the first boundary greater than or equal to it. The
-/// final bucket is overflow and is serialized at the observed maximum.
-const BOUNDARIES_US: [u64; 25] = [
-    50, 100, 200, 500, 1_000, 1_250, 1_500, 1_750, 2_000, 3_000, 5_000, 7_000, 10_000, 15_000,
-    20_000, 30_000, 50_000, 75_000, 100_000, 150_000, 200_000, 300_000, 500_000, 750_000,
-    1_000_000,
-];
-const NUM_BUCKETS: usize = BOUNDARIES_US.len() + 1;
+use orrery_protocol::metrics::{bucket_index, bucket_upper_us, NUM_LATENCY_BUCKETS};
+
+/// Buckets, boundaries and the reconstruction rule all come from
+/// [`orrery_protocol::metrics`] — the same definition the gateway, the client
+/// histogram and the `p2-dashboard` gate use. This module's doc used to claim
+/// its own table was "shared with the P2 latency artifact's D16 histogram";
+/// it was a fourth copy, and the finest one. It is now the shared table.
+const NUM_BUCKETS: usize = NUM_LATENCY_BUCKETS;
 
 /// One compact journal-latency batch, suitable for a `sample_batch` JSONL
 /// record. `value_us` is the bucket's upper bound; overflow uses the observed
@@ -253,7 +254,7 @@ impl JournalCommitMetrics {
 
     pub(crate) fn record(&self, latency: Duration) {
         let micros = u64::try_from(latency.as_micros()).unwrap_or(u64::MAX);
-        let index = BOUNDARIES_US.partition_point(|&boundary| micros > boundary);
+        let index = bucket_index(micros);
         self.buckets[index].fetch_add(1, Ordering::Relaxed);
         self.max_us.fetch_max(micros, Ordering::Relaxed);
     }
@@ -265,7 +266,7 @@ fn samples_for(buckets: &[u64; NUM_BUCKETS], max_us: u64) -> Vec<JournalCommitSa
         .enumerate()
         .filter_map(|(index, &count)| {
             (count != 0).then_some(JournalCommitSample {
-                value_us: BOUNDARIES_US.get(index).copied().unwrap_or(max_us),
+                value_us: bucket_upper_us(index, max_us),
                 count,
             })
         })

@@ -729,10 +729,10 @@ fn observe_fencing_rejection(
     });
 }
 
-const BULK_LATENCY_BOUNDARIES_US: [u64; 22] = [
-    50, 100, 200, 500, 1_000, 2_000, 3_000, 5_000, 7_000, 10_000, 15_000, 20_000, 30_000, 50_000,
-    75_000, 100_000, 150_000, 200_000, 300_000, 500_000, 750_000, 1_000_000,
-];
+/// The shared D16 lattice (`orrery_protocol::metrics`), not a local copy:
+/// the server-side histogram must bucket a sample exactly as the client and
+/// the gate do, or the two halves of `bulk_ack_ms` are not comparable.
+use orrery_protocol::metrics::LATENCY_BOUNDARIES_US as BULK_LATENCY_BOUNDARIES_US;
 const NUM_BULK_LATENCY_BUCKETS: usize = BULK_LATENCY_BOUNDARIES_US.len() + 1;
 
 /// One compact server-side bulk latency histogram bucket.

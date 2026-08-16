@@ -169,6 +169,12 @@ artifact = pathlib.Path(sys.argv[1]); verification = pathlib.Path(sys.argv[2]); 
 v=json.loads(verification.read_text()); l=json.loads(latency.read_text())
 if not v.get('pass', False): raise SystemExit('recovery verifier returned a non-pass report')
 if l.get('gate') != 'pass': raise SystemExit('latency dashboard returned a non-pass report')
+# The merged artifact is written by persistd and p2-load and read by the
+# dashboard, all three off one series-name definition (orrery_protocol::
+# metrics). An unrecognized name here means a producer drifted from it, which
+# used to show up as samples silently dropped and a clean report.
+if l.get('unknown_series', 0):
+    raise SystemExit(f"latency artifact carried unrecognized series: {l.get('unknown_series_names')}")
 artifact.write_text(json.dumps({
   'kind':'p2_two_process_kill9_gate',
   'created_at':datetime.datetime.now(datetime.timezone.utc).isoformat(),
