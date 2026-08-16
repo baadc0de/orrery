@@ -240,6 +240,9 @@ pub(crate) struct ReplyProcessingContext<'w, 's> {
 /// Refusing a row costs no liveness: `sweep_lease_expiry` drops a local fence a
 /// heartbeat before its TTL whatever the gateway says, so a peer that really
 /// has lost the lease still stops writing.
+// Every argument is one piece of `ReplyProcessingContext` this needs; bundling
+// them into a struct would only re-borrow the same fields under a new name.
+#[allow(clippy::too_many_arguments)]
 fn reconcile_lease_nack(
     commands: &mut Commands,
     scheduler: &mut UplinkScheduler,
