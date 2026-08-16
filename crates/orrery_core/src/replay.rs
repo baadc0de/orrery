@@ -253,7 +253,10 @@ pub fn verify_bundle<R: Ruleset>(
     if span == 0 || span > MAX_ADJUDICATION_TICKS {
         return Verdict::Unadjudicable(UnadjudicableReason::WindowOutOfRange);
     }
-    if bundle.claimed_hashes.len() as u64 != span {
+    // `claimed_hashes` is advisory (see the verdict section below), so its
+    // length is a well-formedness check rather than something a verdict rests
+    // on — a bundle whose hint does not describe its own window is malformed.
+    if !bundle.claimed_hashes.is_empty() && bundle.claimed_hashes.len() as u64 != span {
         return Verdict::Unadjudicable(UnadjudicableReason::Malformed);
     }
 
@@ -297,28 +300,26 @@ pub fn verify_bundle<R: Ruleset>(
         Err(_) => return Verdict::Unadjudicable(UnadjudicableReason::Malformed),
     };
 
-    // State hashes are over quantized canonical bytes, so this comparison is
-    // exact and covers discrete state (VC-5) with no tolerance at all. The
-    // continuous-state band comparison in `tolerance` applies to trajectories
-    // the harness can decode into positions; hash equality is the stronger
-    // check and the one a bundle carries the data for.
-    for (offset, claimed) in bundle.claimed_hashes.iter().enumerate() {
-        let tick = Tick::new(bundle.window_start.0 + offset as u64);
-        let Some(computed) = trace.at(tick) else {
-            return Verdict::Unadjudicable(UnadjudicableReason::IncompleteChain);
-        };
-        if computed != *claimed {
-            return Verdict::Confirms {
-                at: tick,
-                kind: DeviationKind::DiscreteMismatch,
-            };
-        }
+    // A verdict may rest ONLY on what the subject signed.
+    //
+    // `claimed_hashes` is a per-tick trajectory the *reporter* supplies, and
+    // the subject never signs it — it exists so an adjudicator can jump
+    // straight to the first divergent tick instead of scanning. Reaching a
+    // verdict from it would let a malicious reporter convict an honest peer by
+    // inventing numbers, which is the exact failure a self-verifying bundle is
+    // supposed to make impossible. The signed assertions are the `StateClaim`s,
+    // so those are what the replay is judged against.
+    //
+    // This is why a window must end at a claim tick (docs/06 §7): a window with
+    // no signed claim in it contains nothing the subject can be held to.
+    if bundle.disputed_claims.is_empty() {
+        return Verdict::Unadjudicable(UnadjudicableReason::Malformed);
     }
 
-    // Claims inside the window must chain, or the authority equivocated about
-    // its own history even though every individual signature checks out.
     let mut previous = claim_hash(&bundle.t0_claim);
     for claim in &bundle.disputed_claims {
+        // Claims must chain, or the authority equivocated about its own
+        // history even though every individual signature checks out.
         if claim.prev_claim != previous {
             return Verdict::Confirms {
                 at: claim.tick,
@@ -326,6 +327,27 @@ pub fn verify_bundle<R: Ruleset>(
             };
         }
         previous = claim_hash(claim);
+
+        // A claim at tick T commits to the state *before* T executes, which is
+        // the state after T-1. Comparing against T itself would accuse every
+        // honest authority of being one tick ahead of itself.
+        let Some(commits_to) = claim.tick.0.checked_sub(1) else {
+            continue;
+        };
+        if commits_to < bundle.window_start.0 || claim.tick.0 > bundle.window_end.0 {
+            continue;
+        }
+        let Some(computed) = trace.at(Tick::new(commits_to)) else {
+            return Verdict::Unadjudicable(UnadjudicableReason::IncompleteChain);
+        };
+        // State hashes are over quantized canonical bytes, so this is exact and
+        // covers discrete state (VC-5) with no tolerance at all.
+        if computed != claim.state_hash {
+            return Verdict::Confirms {
+                at: claim.tick,
+                kind: DeviationKind::DiscreteMismatch,
+            };
+        }
     }
 
     Verdict::Exonerates

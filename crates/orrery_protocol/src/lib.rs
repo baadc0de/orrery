@@ -60,7 +60,7 @@ pub use persist::{
 };
 pub use protocol::PROTOCOL_VERSION;
 pub use verifiable::{
-    ChainHash, DeviationKind, EntitySlice, EvidenceBundle, ForgeryProof, InputRecord, LogFrame,
-    RecordSource, RollingHead, RulesetId, StateClaim, UnadjudicableReason, UniverseSeed, Verdict,
-    MAX_ADJUDICATION_TICKS,
+    ChainHash, DeviationKind, DiscrepancyReport, EntitySlice, EvidenceBundle, ForgeryProof,
+    InputRecord, LogFrame, LogRangeRequest, LogRangeResponse, RecordSource, RollingHead, RulesetId,
+    StateClaim, UnadjudicableReason, UniverseSeed, Verdict, MAX_ADJUDICATION_TICKS,
 };

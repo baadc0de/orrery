@@ -313,8 +313,10 @@ fn a_witness_that_replays_the_same_window_reaches_the_same_hashes() {
 
 #[test]
 fn a_forged_trajectory_in_a_real_bundle_is_confirmed() {
-    // The accusation path, end to end: everything is genuine except one
-    // claimed hash, and the verdict names the tick it first diverges.
+    // The accusation path, end to end. Everything is genuine except the state
+    // the authority *signed* for the closing claim — which is the only thing
+    // that can convict it, since `claimed_hashes` and `computed_hashes` are
+    // the reporter's own numbers and carry no signature.
     let (log, _) = run_authority(60, Retention::default());
     let window = (Tick::new(T0), Tick::new(T0 + 30));
     let claimed = log
@@ -323,15 +325,43 @@ fn a_forged_trajectory_in_a_real_bundle_is_confirmed() {
     let mut bundle = log
         .assemble_bundle(ENTITY, window, claimed)
         .expect("window is servable");
-    // `claimed_hashes` is what the authority asserted and what gets judged;
-    // `computed_hashes` is only the reporter's hint about where to look, so
-    // corrupting that one would change no verdict at all.
-    bundle.claimed_hashes[7] = [0xEE; 32];
+
+    let mut falsified = bundle.disputed_claims[0].clone();
+    falsified.state_hash = [0xEE; 32];
+    sign_claim(&key(), &mut falsified);
+    let at = falsified.tick;
+    bundle.disputed_claims = vec![falsified];
 
     assert!(matches!(
         verify_bundle(Kinematic, SEED, key().public(), &bundle),
-        Verdict::Confirms { at, .. } if at == Tick::new(T0 + 7)
+        Verdict::Confirms { at: first, .. } if first == at
     ));
+}
+
+#[test]
+fn fabricating_the_advisory_hashes_convicts_nobody() {
+    // The same bundle, with the reporter's advisory numbers replaced wholesale.
+    // An honest authority has to survive that, or a witness could strike anyone
+    // it disliked by filing well-formed nonsense.
+    let (log, _) = run_authority(60, Retention::default());
+    let window = (Tick::new(T0), Tick::new(T0 + 30));
+    let claimed = log
+        .claimed_hashes(ENTITY, window)
+        .expect("window is retained");
+    let mut bundle = log
+        .assemble_bundle(ENTITY, window, claimed)
+        .expect("window is servable");
+    for hash in &mut bundle.claimed_hashes {
+        *hash = [0x11; 32];
+    }
+    for hash in &mut bundle.computed_hashes {
+        *hash = [0x22; 32];
+    }
+
+    assert_eq!(
+        verify_bundle(Kinematic, SEED, key().public(), &bundle),
+        Verdict::Exonerates
+    );
 }
 
 #[test]

@@ -302,21 +302,63 @@ fn an_adjudicator_is_a_pure_function_of_the_bundle() {
 }
 
 #[test]
-fn a_falsified_trajectory_is_confirmed_at_the_tick_it_diverges() {
-    // The accusation case: the authority claims a state its own logged inputs
-    // do not produce. The verdict has to name the first divergent tick, not
-    // merely that something was wrong somewhere.
+fn a_signed_claim_the_inputs_do_not_produce_is_confirmed() {
+    // The accusation case, and note what it takes: the authority has to have
+    // *signed* a state its own logged inputs do not produce. Nothing weaker
+    // convicts, because nothing weaker is attributable to it.
     let authority = key(1);
     let produced = produce(&authority);
     let mut bundle = bundle(&produced);
-    bundle.claimed_hashes[5] = [0xFF; 32];
+    let mut falsified = bundle.disputed_claims[0].clone();
+    falsified.state_hash = [0xFF; 32];
+    sign_claim(&authority, &mut falsified);
+    bundle.disputed_claims = vec![falsified];
 
     assert_eq!(
         verify_bundle(Kinematic, SEED, authority.public(), &bundle),
         Verdict::Confirms {
-            at: Tick::new(T0 + 5),
+            at: Tick::new(T0 + WINDOW),
             kind: DeviationKind::DiscreteMismatch,
         }
+    );
+}
+
+#[test]
+fn a_reporter_cannot_convict_an_honest_peer_by_inventing_a_trajectory() {
+    // The property that makes a bundle self-verifying rather than merely
+    // detailed. `claimed_hashes` and `computed_hashes` are the reporter's own
+    // numbers; the subject never signs them. A verdict that rested on them
+    // would let anyone strike anyone.
+    let authority = key(1);
+    let produced = produce(&authority);
+    let mut bundle = bundle(&produced);
+    for hash in &mut bundle.claimed_hashes {
+        *hash = [0xAB; 32];
+    }
+    for hash in &mut bundle.computed_hashes {
+        *hash = [0xCD; 32];
+    }
+
+    assert_eq!(
+        verify_bundle(Kinematic, SEED, authority.public(), &bundle),
+        Verdict::Exonerates,
+        "an honest authority must survive a reporter that fabricated the hint"
+    );
+}
+
+#[test]
+fn a_window_with_no_signed_claim_proves_nothing() {
+    // A window that ends nowhere near a claim contains no assertion the
+    // subject can be held to. That is undecidable, not exoneration and not
+    // guilt — and it is why docs/06 §7 requires a window to end at a claim.
+    let authority = key(1);
+    let produced = produce(&authority);
+    let mut bundle = bundle(&produced);
+    bundle.disputed_claims.clear();
+
+    assert_eq!(
+        verify_bundle(Kinematic, SEED, authority.public(), &bundle),
+        Verdict::Unadjudicable(UnadjudicableReason::Malformed)
     );
 }
 
@@ -527,6 +569,20 @@ fn a_neighbour_read_is_logged_and_does_not_feed_the_step_as_an_input() {
         .expect("entity present")
         .state_hash;
 
+    // A claim at T0+1 commits to the state after T0 executed. Without one the
+    // window carries nothing signed, and nothing signed means nothing to judge.
+    let mut end_claim = StateClaim {
+        entity: ENTITY,
+        chain_epoch: 0,
+        tick: Tick::new(T0 + 1),
+        input_head: head,
+        state_hash: expected,
+        prev_claim: claim_hash(&t0_claim),
+        ruleset: RULESET,
+        sig: authority.sign(b"unsigned"),
+    };
+    sign_claim(&authority, &mut end_claim);
+
     let verdict = verify_bundle(
         Kinematic,
         SEED,
@@ -540,7 +596,7 @@ fn a_neighbour_read_is_logged_and_does_not_feed_the_step_as_an_input() {
             t0_snapshot: bytes::Bytes::from(snapshot),
             frames: vec![frame],
             sibling_heads: vec![Vec::new()],
-            disputed_claims: Vec::new(),
+            disputed_claims: vec![end_claim],
             claimed_hashes: vec![expected],
             computed_hashes: vec![expected],
         },
@@ -631,6 +687,20 @@ fn a_multi_entity_frame_needs_its_sibling_heads_to_verify() {
     };
     sign_claim(&authority, &mut t0_claim);
 
+    let mut end_claim = StateClaim {
+        entity: ENTITY,
+        chain_epoch: 0,
+        tick: Tick::new(T0 + 1),
+        input_head: subject_head,
+        // Deliberately wrong: this test is about whether the frame can be
+        // verified at all, so the window is judgeable and lands on a verdict.
+        state_hash: [0; 32],
+        prev_claim: claim_hash(&t0_claim),
+        ruleset: RULESET,
+        sig: authority.sign(b"unsigned"),
+    };
+    sign_claim(&authority, &mut end_claim);
+
     let make = |sibling_heads: Vec<Vec<(ChainHash, ChainHash)>>| EvidenceBundle {
         ruleset: RULESET,
         entity: ENTITY,
@@ -640,7 +710,7 @@ fn a_multi_entity_frame_needs_its_sibling_heads_to_verify() {
         t0_snapshot: bytes::Bytes::from(snapshot.clone()),
         frames: vec![frame.clone()],
         sibling_heads,
-        disputed_claims: Vec::new(),
+        disputed_claims: vec![end_claim.clone()],
         claimed_hashes: vec![[0; 32]],
         computed_hashes: vec![[0; 32]],
     };
