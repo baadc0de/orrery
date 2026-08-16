@@ -151,9 +151,32 @@ cargo fmt -p orrery_games
 determinism rules are about the rules code, so a `HashMap` or a
 `SystemTime::now` inside a `Ruleset` fails the same gate it would in the core.
 
-**`sccache` is cleared on runners.** `.cargo/config.toml` sets
-`build.rustc-wrapper = "sccache"` for local worktrees; the workflows set
-`RUSTC_WRAPPER: ""` because runners are ephemeral and have no sccache.
+**`sccache` is cleared on GitHub-hosted runners, and deliberately not on the
+self-hosted one.** `.cargo/config.toml` sets `build.rustc-wrapper = "sccache"`
+for local worktrees; the workflows set `RUSTC_WRAPPER: ""` at the top because a
+GitHub runner is ephemeral and has nothing to hit. The jobs that can land on
+`orrery-hel1-1` set it back to `sccache`, because that box keeps a persistent
+`target/` and a cache at `/var/cache/sccache` that is **shared with the dev
+checkout on the same machine** — same dependency graph, so a CI build starts
+warm off whatever was compiled by hand there, and vice versa.
+
+**The heavy Linux jobs run on a self-hosted box.** `clippy`, `static gates` and
+`workspace tests` run on `orrery-hel1-1` for pushes and same-repository pull
+requests, and fall back to `ubuntu-latest` for fork pull requests; `p1-swarm`
+and the determinism soak run there nightly. Measured on the workspace test
+job: 305–549 s hosted, 182 s cold on the box, **48 s warm**.
+
+Three things to know before changing any of it. The repository is public, so
+the security posture is layered and the in-workflow runner guard is the
+*weakest* of the three layers — see the comment on the `runner` job in
+`ci.yml`. The runner is an unprivileged `ci` user with **no sudo**, which is
+why every `apt-get` step in those jobs is conditioned on
+`runner.environment == 'github-hosted'`. And `p2-kill9` and `p3-island` stay on
+hosted runners on purpose: `scripts/fdb-dev.sh` hardcodes `127.0.0.1:4500` and
+stops the cluster with `pkill -f "fdbserver.*:4500"`, while the box runs its own
+`fdbserver` on that port for development. Teaching that harness to take its
+port and data directory from the environment is what those two jobs are waiting
+on.
 
 The heavy harnesses — P2's kill-9 gate, which needs a real FoundationDB
 cluster, and P3's island gate, which needs eight peer processes and a real

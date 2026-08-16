@@ -11,6 +11,22 @@
 # Their `--self-test` modes run per-commit in ci.yml; those check the scripts
 # still contain the stages that make them proofs, not that the proofs pass.
 
+# ── Where these run ──────────────────────────────────────────────────────────
+#
+# Nightly fires on a schedule and on workflow_dispatch, never on a pull request,
+# so the fork-PR problem that constrains ci.yml does not exist here and the
+# self-hosted box is unconditionally safe to use.
+#
+# Two of the four jobs still stay on GitHub-hosted runners, and the reason is
+# specific rather than cautious: `scripts/fdb-dev.sh` hardcodes
+# `127.0.0.1:4500` and stops the cluster with `pkill -f "fdbserver.*:4500"`.
+# The box already runs its own `fdbserver` on port 4500 for development. A gate
+# that starts a cluster there would collide on the port, and one whose whole
+# premise is `kill -9` on the cluster is not something to point at a shared
+# development database. Moving `p2-kill9` and `p3-island` needs the harness to
+# take its port and its data directory from the environment first; until then
+# they run where they have a machine to themselves.
+
 name: Nightly gates
 
 on:
@@ -31,7 +47,12 @@ env:
 jobs:
   p1-swarm:
     name: P1 swarm gate (32 peers, one simulated hour, clean + impaired)
-    runs-on: ubuntu-latest
+    # Simulated hour, no cluster, no ports: 16 cores and a warm target/ turn this from tens of minutes into a few.
+    runs-on: [self-hosted, orrery-hel1]
+    env:
+      # Overrides the workflow-level clear: the box has a persistent sccache at
+      # /var/cache/sccache, shared with the dev checkout on the same machine.
+      RUSTC_WRAPPER: sccache
     # Two simulated hours take about five minutes of wall clock — the hour is
     # simulated, so it costs what it costs to compute. The build dominates.
     timeout-minutes: 45
@@ -40,6 +61,7 @@ jobs:
       - name: Install the pinned toolchain
         run: rustup show active-toolchain || rustup toolchain install
       - name: Install Bevy's Linux build dependencies
+        if: runner.environment == 'github-hosted'
         run: |
           sudo apt-get update
           sudo apt-get install --no-install-recommends -y \
@@ -162,7 +184,12 @@ jobs:
 
   determinism-soak:
     name: determinism soak (extended corpus)
-    runs-on: ubuntu-latest
+    # Ten corpus repeats in one process. Bevy-free and cheap, but it still paid a cold build every night.
+    runs-on: [self-hosted, orrery-hel1]
+    env:
+      # Overrides the workflow-level clear: the box has a persistent sccache at
+      # /var/cache/sccache, shared with the dev checkout on the same machine.
+      RUSTC_WRAPPER: sccache
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
