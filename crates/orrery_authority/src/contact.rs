@@ -515,11 +515,28 @@ pub fn propagate_contact_islands(
 /// is *evidence*: `ClaimBasis::Contact{tick}` names the simulation tick the
 /// contact happened on, which the registrar's plausibility gate and the D9
 /// input log both read, while the back-off and token bucket run on wall time.
+///
+/// The two halves have different owners, and that split is the whole contract:
+///
+/// - `now_ms` is driven by [`advance_contact_clock`], which
+///   [`crate::OrreryAuthorityPlugin`] installs. It has to be, because a clock
+///   left at zero makes every elapsed interval zero: the §10 token bucket never
+///   refills past the peer's first [`CLAIM_BURST`] lifetime claims, and one
+///   `Deny` cools a body forever, since `0 < 0 + 250` is checked against a
+///   `now_ms` that never reaches 250.
+/// - `tick` is supplied by the host, from the same physics step that fills
+///   [`ContactObservations`]. No crate here can invent it: it names a universe
+///   tick, and a claim is only evidence if it names the tick the contact
+///   actually happened on.
 #[derive(Debug, Resource)]
 pub struct ContactTick {
     /// Universe tick of the physics step that produced the contacts.
+    ///
+    /// Host-supplied; see the type docs.
     pub tick: Tick,
     /// Client-process monotonic milliseconds, for back-off and rate limiting.
+    ///
+    /// Driven by [`advance_contact_clock`]; see the type docs.
     pub now_ms: u64,
 }
 
@@ -530,6 +547,15 @@ impl Default for ContactTick {
             now_ms: 0,
         }
     }
+}
+
+/// Advance the propagation clock once per update.
+///
+/// Shares its origin with [`crate::advance_lease_clock`], so a peer's claim
+/// back-off and its lease expiry floor are measured against one monotonic zero.
+/// `tick` is deliberately untouched: it belongs to the host's physics step.
+pub fn advance_contact_clock(mut tick: ResMut<ContactTick>) {
+    tick.now_ms = crate::process_uptime_ms();
 }
 
 /// Feed registrar verdicts back into the planner's back-off state.
@@ -568,7 +594,16 @@ pub fn absorb_contact_denials(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use orrery_protocol::IslandId;
+    use std::thread::sleep;
+    use std::time::Duration;
+
+    use bevy_app::App;
+    use orrery_protocol::{DenyReason, IslandId, LeaseMsg};
+
+    use crate::{
+        AuthorityPhase, AuthorityState, LeaseInbox, LeaseOutbox, OrreryAuthorityPlugin,
+        PersistIdentity,
+    };
 
     fn node_id(seed: u8) -> orrery_protocol::NodeId {
         let mut bytes = [0u8; 32];
@@ -843,5 +878,127 @@ mod tests {
         // handout must not silently stop playing.
         coverage.refresh(&InterestGrant::default());
         assert!(!propagator.plan(&observations, &coverage, 5_000).is_empty());
+    }
+
+    /// A headless client carrying the shipped plugin, with `n` claimable
+    /// bodies present as entities so their claims reach the outbox.
+    fn driven_app(n: u64) -> App {
+        let mut app = App::new();
+        app.add_plugins(OrreryAuthorityPlugin);
+        for id in 1..=n {
+            app.world_mut()
+                .spawn((PersistIdentity(PersistId::new(id)), AuthorityPhase::Remote));
+        }
+        app
+    }
+
+    /// Re-report the pile: `propagate_contact_islands` clears the report every
+    /// frame, so a solver that keeps touching keeps filling it.
+    fn report(app: &mut App, n: u64) {
+        *app.world_mut().resource_mut::<ContactObservations>() = chain(n);
+    }
+
+    fn claimed(app: &mut App) -> Vec<PersistId> {
+        std::mem::take(&mut app.world_mut().resource_mut::<LeaseOutbox>().0)
+            .into_iter()
+            .filter_map(|message| match message {
+                LeaseMsg::Claim { entity, .. } => Some(entity),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_shipped_plugin_refills_the_claim_budget_as_time_passes() {
+        // The failure this catches: shipping the planner with nothing driving
+        // `ContactTick::now_ms`. Every elapsed interval is then zero, the
+        // bucket never refills, and a peer stops claiming for the rest of the
+        // session after its first `CLAIM_BURST` claims — the pile is acquired
+        // once and never again. Nothing here passes a clock by hand; the
+        // plugin's own driver is the clock under test.
+        let mut app = driven_app(70);
+
+        report(&mut app, 70);
+        app.update();
+        assert_eq!(
+            claimed(&mut app).len(),
+            CLAIM_BURST as usize,
+            "the first frame spends the whole burst"
+        );
+
+        // Two frames of a real app are microseconds apart: no whole token.
+        report(&mut app, 70);
+        app.update();
+        assert!(
+            claimed(&mut app).is_empty(),
+            "an empty bucket must not refill within one frame"
+        );
+
+        sleep(Duration::from_millis(200));
+        report(&mut app, 70);
+        app.update();
+        let refilled = claimed(&mut app);
+        assert!(
+            !refilled.is_empty(),
+            "200 ms is four tokens at {CLAIM_RATE_PER_SEC}/s and the pile is still in contact"
+        );
+        assert_eq!(
+            refilled[0],
+            PersistId::new(CLAIM_BURST + 1),
+            "the carried-over frontier leads, in contact order"
+        );
+        assert!(refilled.len() <= 70 - CLAIM_BURST as usize);
+    }
+
+    #[test]
+    fn the_shipped_plugin_expires_a_deny_back_off() {
+        // The failure this catches: the other half of a clock stuck at zero.
+        // `note_deny` stamps `until_ms = 0 + 250` and `cooling` compares
+        // against a `now_ms` that never reaches it, so one refusal blacklists a
+        // body permanently — for the whole session, in every composition a game
+        // would ship.
+        let mut app = driven_app(1);
+        let body = PersistId::new(1);
+
+        report(&mut app, 1);
+        app.update();
+        assert_eq!(claimed(&mut app), vec![body]);
+        let claim_id = app
+            .world()
+            .resource::<AuthorityState>()
+            .pending_claims
+            .get(&body)
+            .copied();
+
+        // The registrar refuses it, and the verdict reaches the planner's
+        // back-off state through the shipped systems.
+        app.world_mut()
+            .resource_mut::<LeaseInbox>()
+            .0
+            .push(LeaseMsg::Deny {
+                claim_id,
+                entity: body,
+                reason: DenyReason::RateLimited,
+                retry_after_ms: 0,
+            });
+        report(&mut app, 1);
+        app.update();
+        assert!(
+            claimed(&mut app).is_empty(),
+            "a body refused this frame must not be re-proposed in it"
+        );
+
+        report(&mut app, 1);
+        app.update();
+        assert!(claimed(&mut app).is_empty(), "still inside the cooldown");
+
+        sleep(Duration::from_millis(DENY_COOLDOWN_MS + 50));
+        report(&mut app, 1);
+        app.update();
+        assert_eq!(
+            claimed(&mut app),
+            vec![body],
+            "the back-off is a cooldown, not a blacklist"
+        );
     }
 }

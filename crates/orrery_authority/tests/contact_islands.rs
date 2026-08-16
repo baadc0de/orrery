@@ -55,11 +55,12 @@ fn body(node: ContactNode, status: ContactStatus) -> ContactBody {
     }
 }
 
-fn set_tick(app: &mut App, tick: u64, now_ms: u64) {
-    *app.world_mut().resource_mut::<ContactTick>() = ContactTick {
-        tick: Tick::new(tick),
-        now_ms,
-    };
+/// Publish the universe tick the solver stepped, which is the half of
+/// [`ContactTick`] the host owns. `now_ms` is deliberately not written here:
+/// the plugin drives it, and a test that set it by hand would be checking a
+/// clock no shipping app has.
+fn set_tick(app: &mut App, tick: u64) {
+    app.world_mut().resource_mut::<ContactTick>().tick = Tick::new(tick);
 }
 
 /// Spawn `count` persistent bodies in a chain, the first one already held.
@@ -101,7 +102,7 @@ fn a_contact_report_becomes_weak_claims_stamped_with_the_tick_contact_happened_o
     // stamped with the wrong tick is unfalsifiable evidence.
     let mut app = peer(2);
     let _entities = pile(&mut app, 4);
-    set_tick(&mut app, 1_234, 0);
+    set_tick(&mut app, 1_234);
     report_chain(&mut app, 4);
 
     app.update();
@@ -146,7 +147,7 @@ fn a_registrar_denial_stops_the_next_ticks_reclaim_of_the_same_body() {
     // client look like a griefer.
     let mut app = peer(2);
     let entities = pile(&mut app, 2);
-    set_tick(&mut app, 10, 0);
+    set_tick(&mut app, 10);
     report_chain(&mut app, 2);
     app.update();
 
@@ -177,7 +178,7 @@ fn a_registrar_denial_stops_the_next_ticks_reclaim_of_the_same_body() {
             },
             retry_after_ms: 250,
         });
-    set_tick(&mut app, 11, 16);
+    set_tick(&mut app, 11);
     report_chain(&mut app, 2);
     app.update();
     assert!(
@@ -186,7 +187,9 @@ fn a_registrar_denial_stops_the_next_ticks_reclaim_of_the_same_body() {
     );
 
     // Still contested a quarter-second later, and now the back-off has lapsed.
-    set_tick(&mut app, 30, 300);
+    // Real time, because the plugin's own driver is what the planner reads.
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    set_tick(&mut app, 30);
     report_chain(&mut app, 2);
     app.update();
     assert!(
@@ -233,7 +236,7 @@ fn a_projectile_impact_claims_the_crate_and_keeps_the_projectile_off_the_registr
         });
     app.world_mut().spawn(Ephemeral(incoming));
 
-    set_tick(&mut app, 60, 0);
+    set_tick(&mut app, 60);
     {
         let mut observations = app.world_mut().resource_mut::<ContactObservations>();
         observations.observe(body(

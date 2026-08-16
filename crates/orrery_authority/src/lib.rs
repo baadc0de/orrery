@@ -24,9 +24,9 @@ use orrery_protocol::{
 };
 
 pub use contact::{
-    propagate_contact_islands, ContactBody, ContactBurst, ContactClaim, ContactNode,
-    ContactObservations, ContactPropagator, ContactStatus, ContactTick, InterestCoverage,
-    CONTACT_BATCH_CAP,
+    advance_contact_clock, propagate_contact_islands, ContactBody, ContactBurst, ContactClaim,
+    ContactNode, ContactObservations, ContactPropagator, ContactStatus, ContactTick,
+    InterestCoverage, CONTACT_BATCH_CAP,
 };
 pub use ephemeral::{
     process_island_claims, Ephemeral, EphemeralId, EphemeralOutcome, EphemeralRegistry,
@@ -262,13 +262,24 @@ impl AuthorityState {
     }
 }
 
-/// Advance the client-process monotonic safety clock once per update.
-pub fn advance_lease_clock(mut state: ResMut<AuthorityState>) {
+/// Milliseconds since this process first read a client clock.
+///
+/// One origin for every client-process clock this crate drives, so
+/// [`AuthorityState::now_ms`] and [`contact::ContactTick::now_ms`] are
+/// comparable: they measure lease expiry and claim back-off against the same
+/// monotonic zero, and two independently anchored clocks would disagree by
+/// however long the app took to reach the second one.
+pub(crate) fn process_uptime_ms() -> u64 {
     static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
-    state.now_ms = START
+    START
         .get_or_init(std::time::Instant::now)
         .elapsed()
-        .as_millis() as u64;
+        .as_millis() as u64
+}
+
+/// Advance the client-process monotonic safety clock once per update.
+pub fn advance_lease_clock(mut state: ResMut<AuthorityState>) {
+    state.now_ms = process_uptime_ms();
 }
 
 /// Ergonomic command interface for systems that initiate claims.
@@ -375,7 +386,10 @@ pub fn process_lease_replies(
     mut commands: Commands,
     mut inbox: ResMut<LeaseInbox>,
     mut state: ResMut<AuthorityState>,
-    entities: Query<(Entity, &crate::PersistIdentity), With<AuthorityPhase>>,
+    // `Option<&Authority>` because the expiry path must not reset the pair it
+    // stamps: INV-2 says the sequences never decrease, and an entity's last
+    // known pair is the only value on hand that satisfies it.
+    entities: Query<(Entity, &crate::PersistIdentity, Option<&Authority>), With<AuthorityPhase>>,
     mut events: MessageWriter<AuthorityEvent>,
 ) {
     for message in std::mem::take(&mut inbox.0) {
@@ -403,7 +417,8 @@ pub fn process_lease_replies(
                 if !(inherited || is_current_claim) || !advances_fence {
                     continue;
                 }
-                if let Some((entity_ref, _)) = entities.iter().find(|(_, id)| id.0 == entity) {
+                if let Some((entity_ref, _, _)) = entities.iter().find(|(_, id, _)| id.0 == entity)
+                {
                     state.pending_claims.remove(&entity);
                     let expiry = state.now_ms.saturating_add(u64::from(ttl_ms));
                     state.leases.insert(
@@ -448,13 +463,30 @@ pub fn process_lease_replies(
                 if claim_id.is_none() || state.pending_claims.get(&entity) != claim_id.as_ref() {
                     continue;
                 }
-                if let Some((entity_ref, _)) = entities.iter().find(|(_, id)| id.0 == entity) {
+                if let Some((entity_ref, _, _)) = entities.iter().find(|(_, id, _)| id.0 == entity)
+                {
                     state.pending_claims.remove(&entity);
-                    state.leases.remove(&entity);
-                    commands
-                        .entity(entity_ref)
-                        .remove::<LocallyAuthoritative>()
-                        .insert(AuthorityPhase::Remote);
+                    // A `Deny` refuses the *claim*, and the claim is all it can
+                    // refuse: it carries no `lease_id` (docs/04 §3), so it says
+                    // nothing about a fence this peer already holds. Dropping
+                    // one here would take a weakly held body away from its
+                    // legitimate writer the moment a strong upgrade was
+                    // refused, while the registrar still names this peer as the
+                    // holder — an entity nobody writes until the TTL runs out.
+                    // Only expiry, revocation and divestiture end a fence.
+                    if let Some(lease) = state.leases.get(&entity) {
+                        commands
+                            .entity(entity_ref)
+                            .insert(AuthorityPhase::LocalGranted {
+                                lease_id: lease.lease_id,
+                                expires_at_ms: lease.expires_at_ms,
+                            });
+                    } else {
+                        commands
+                            .entity(entity_ref)
+                            .remove::<LocallyAuthoritative>()
+                            .insert(AuthorityPhase::Remote);
+                    }
                     events.write(AuthorityEvent::Denied {
                         entity: entity_ref,
                         reason,
@@ -475,6 +507,18 @@ pub fn process_lease_replies(
                     continue;
                 }
                 if let Some(lease) = state.leases.remove(&entity) {
+                    // The pair carries over: `Expire` has no `seq` field
+                    // (docs/04 §3), and INV-2 forbids the sequences going
+                    // backwards. Resetting to the default would leave the row
+                    // at `(0, 0)`, which *any* later row supersedes — so a
+                    // duplicated or reordered gateway NACK naming a peer the
+                    // registrar has already moved past would repoint the
+                    // holder, on the strength of a datagram that lost its race.
+                    let known = entities
+                        .get(lease.entity)
+                        .ok()
+                        .and_then(|(_, _, authority)| authority)
+                        .map_or_else(SeqPair::default, |authority| authority.seq);
                     let mut entity_commands = lease_commands(&mut commands, lease.entity);
                     // The disposition names where authority actually went, so
                     // the loser can render the entity against its real holder
@@ -482,12 +526,12 @@ pub fn process_lease_replies(
                     if let ExpireDisposition::Reassigned { to } = disposition {
                         entity_commands.insert(Authority {
                             holder: Some(to),
-                            seq: SeqPair::default(),
+                            seq: known,
                         });
                     } else {
                         entity_commands.insert(Authority {
                             holder: None,
-                            seq: SeqPair::default(),
+                            seq: known,
                         });
                     }
                     events.write(AuthorityEvent::Lost {
@@ -690,6 +734,7 @@ impl Plugin for OrreryAuthorityPlugin {
                 Update,
                 (
                     advance_lease_clock,
+                    advance_contact_clock,
                     track_island_binding,
                     // Replies first: a body granted or denied this frame must
                     // be seen with its settled status before the propagator
@@ -921,7 +966,10 @@ mod tests {
                 claim_id: ClaimId::REGISTRAR,
                 entity: PersistId::new(63),
                 lease_id: LeaseId(2),
-                seq: SeqPair::default(),
+                seq: SeqPair {
+                    own_seq: 1,
+                    auth_seq: 4,
+                },
                 ttl_ms: 10_000,
                 prev_holder: None,
             });
@@ -950,6 +998,18 @@ mod tests {
         assert_eq!(
             app.world().get::<Authority>(lost).map(|a| a.holder),
             Some(Some(node_id(6)))
+        );
+        // And the pair does not go backwards. `Expire` carries no `seq`
+        // (docs/04 §3), so the loser keeps the last one it knew: stamping the
+        // default would leave a row at `(0, 0)` that every later row
+        // supersedes, and the next stale gateway NACK would repoint the holder
+        // (INV-2, and `orrery_persist_client::replies`).
+        assert_eq!(
+            app.world().get::<Authority>(lost).map(|a| a.seq),
+            Some(SeqPair {
+                own_seq: 1,
+                auth_seq: 4,
+            })
         );
     }
 
@@ -1278,40 +1338,122 @@ mod tests {
     }
 
     #[test]
-    fn grant_enables_and_deny_removes_the_only_uplink_marker() {
+    fn a_grant_installs_the_only_uplink_marker_and_a_denied_claim_never_does() {
         let mut app = App::new();
         app.add_plugins(OrreryAuthorityPlugin);
         let e = app
             .world_mut()
             .spawn((PersistIdentity(PersistId::new(4)), AuthorityPhase::Remote))
             .id();
+        let refused = app
+            .world_mut()
+            .spawn((PersistIdentity(PersistId::new(5)), AuthorityPhase::Remote))
+            .id();
         let first_claim = begin_test_claim(&mut app, e, PersistId::new(4));
-        app.world_mut()
-            .resource_mut::<LeaseInbox>()
-            .0
-            .push(LeaseMsg::Grant {
+        let refused_claim = begin_test_claim(&mut app, refused, PersistId::new(5));
+        app.world_mut().resource_mut::<LeaseInbox>().0.extend([
+            LeaseMsg::Grant {
                 claim_id: first_claim,
                 entity: PersistId::new(4),
                 lease_id: LeaseId(2),
                 seq: SeqPair::default(),
                 ttl_ms: 10_000,
                 prev_holder: None,
-            });
+            },
+            LeaseMsg::Deny {
+                claim_id: Some(refused_claim),
+                entity: PersistId::new(5),
+                reason: DenyReason::NotEligible,
+                retry_after_ms: 0,
+            },
+        ]);
         app.update();
         assert!(app.world().get::<LocallyAuthoritative>(e).is_some());
-        let second_claim = begin_test_claim(&mut app, e, PersistId::new(4));
+        assert!(
+            app.world().get::<LocallyAuthoritative>(refused).is_none(),
+            "a claim that was never granted must not carry the uplink marker"
+        );
+        assert_eq!(
+            app.world().get::<AuthorityPhase>(refused),
+            Some(&AuthorityPhase::Remote)
+        );
+        let _ = CellId::ROOT;
+    }
+
+    #[test]
+    fn denying_an_upgrade_claim_leaves_the_fence_the_peer_already_holds() {
+        // The failure this catches: dropping a live lease because a *later*
+        // claim on the same body was refused. A `Deny` names a `claim_id` and
+        // no `lease_id` (docs/04 §3), so it can only refuse the claim; the
+        // registrar still has this peer down as the holder, and a client that
+        // stopped writing here would leave the body unwritten by anyone until
+        // the 10 s TTL ran out — while `LeaseClient::claim` never checked for a
+        // held lease before sending the upgrade in the first place.
+        let mut app = App::new();
+        app.add_plugins(OrreryAuthorityPlugin);
+        let held = app
+            .world_mut()
+            .spawn((PersistIdentity(PersistId::new(6)), AuthorityPhase::Remote))
+            .id();
+        let weak_claim = begin_test_claim(&mut app, held, PersistId::new(6));
+        app.world_mut()
+            .resource_mut::<LeaseInbox>()
+            .0
+            .push(LeaseMsg::Grant {
+                claim_id: weak_claim,
+                entity: PersistId::new(6),
+                lease_id: LeaseId(3),
+                seq: SeqPair::default(),
+                ttl_ms: 10_000,
+                prev_holder: None,
+            });
+        app.update();
+        let granted = app
+            .world()
+            .get::<AuthorityPhase>(held)
+            .copied()
+            .expect("the weak claim was granted");
+
+        // When: the strong upgrade for the same body is refused.
+        let upgrade = begin_test_claim(&mut app, held, PersistId::new(6));
+        app.world_mut()
+            .resource_mut::<Messages<AuthorityEvent>>()
+            .clear();
         app.world_mut()
             .resource_mut::<LeaseInbox>()
             .0
             .push(LeaseMsg::Deny {
-                claim_id: Some(second_claim),
-                entity: PersistId::new(4),
-                reason: DenyReason::NotEligible,
+                claim_id: Some(upgrade),
+                entity: PersistId::new(6),
+                reason: DenyReason::StrongHeld,
                 retry_after_ms: 0,
             });
         app.update();
-        assert!(app.world().get::<LocallyAuthoritative>(e).is_none());
-        let _ = CellId::ROOT;
+
+        // Then: the refusal is reported and the weak fence is untouched.
+        assert!(
+            app.world().get::<LocallyAuthoritative>(held).is_some(),
+            "only expiry, revocation or divestiture ends a fence"
+        );
+        assert_eq!(app.world().get::<AuthorityPhase>(held), Some(&granted));
+        assert_eq!(
+            app.world()
+                .resource::<AuthorityState>()
+                .local_lease_id(PersistId::new(6)),
+            Some(LeaseId(3))
+        );
+        let events: Vec<_> = app
+            .world_mut()
+            .resource_mut::<Messages<AuthorityEvent>>()
+            .drain()
+            .collect();
+        assert!(matches!(
+            events.as_slice(),
+            [AuthorityEvent::Denied {
+                entity: denied,
+                reason: DenyReason::StrongHeld,
+            }] if *denied == held
+        ));
     }
 
     #[test]
