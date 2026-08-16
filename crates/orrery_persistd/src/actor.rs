@@ -6,7 +6,7 @@
 //! mutable access. The actor applies a diff, appends to the journal, and only
 //! then acks — the ack *is* the durability contract (§2.1).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use tokio::sync::{mpsc, oneshot};
@@ -45,6 +45,73 @@ pub struct Tombstone {
     /// Wall-clock time past which the checkpoint GC pass clears the row,
     /// as unix milliseconds.
     pub gc_deadline_ms: u64,
+}
+
+/// A durable `world/` row an actor has moved off but not yet cleared.
+///
+/// The `world/` key carries the entity's **own cell** in its bytes
+/// (`keyspace::world_key`), so every cell change writes the entity to a *new*
+/// key and leaves the old one addressable. Nothing else clears it: the
+/// checkpoint only ever `set`s at the current cell, and the tombstone GC pass
+/// clears only the despawn marker's own key. A superseded row is therefore the
+/// one way the durable tier can end up holding two live rows for one entity —
+/// which a cold scan or a recovery seed collapses by Morton order, silently
+/// serving whichever cell sorts higher.
+///
+/// The actor records the vacated `(entity, cell)` pair here the moment its
+/// hot state moves, the checkpoint clears exactly those keys in the same pass
+/// that writes the new ones, and the runtime prunes the pair only after that
+/// checkpoint commits — the `prune_tombstones` post-commit template.
+///
+/// The set is **derived, not durable**, and deliberately so: every transition
+/// that records one is a journal record, so a checkpoint that dies before its
+/// clears commit leaves its watermark unadvanced, and the replay past that
+/// watermark re-derives the same pairs. No new durable state has to be
+/// consistent with the rows for the mechanism to converge.
+pub type SupersededRow = (PersistId, CellId);
+
+/// Move `entity`'s durable-row bookkeeping from wherever `by_cell` currently
+/// places it to `now_at` — `None` when the entity leaves this actor entirely
+/// (despawn is *not* that case: a despawn keeps a row, as a tombstone).
+///
+/// Call this **before** updating `by_cell`; it reads the outgoing cell there.
+pub(crate) fn note_row_moved(
+    superseded: &mut HashSet<SupersededRow>,
+    by_cell: &HashMap<PersistId, CellId>,
+    entity: PersistId,
+    now_at: Option<CellId>,
+) {
+    if let Some(previous) = by_cell.get(&entity).copied() {
+        if now_at != Some(previous) {
+            superseded.insert((entity, previous));
+        }
+    }
+    // Moving *into* a cell revives whatever row that key holds, so a pair
+    // recorded by an earlier move away from it is no longer superseded.
+    if let Some(cell) = now_at {
+        superseded.remove(&(entity, cell));
+    }
+}
+
+/// Drop `entity`'s despawn marker, recording the marker's own `world/` row as
+/// superseded when it does not sit at `now_at`.
+///
+/// A re-spawn (or an arriving rekey) cancels the marker in hot state, but the
+/// marker *row* is keyed by the cell the entity died in. If the entity comes
+/// back somewhere else, nothing rewrites that key and nothing GCs it — the
+/// actor has forgotten the tombstone whose deadline drives the GC pass — so it
+/// is recorded here instead.
+pub(crate) fn cancel_tombstone(
+    superseded: &mut HashSet<SupersededRow>,
+    tombstones: &mut HashMap<PersistId, Tombstone>,
+    entity: PersistId,
+    now_at: Option<CellId>,
+) {
+    if let Some(tomb) = tombstones.remove(&entity) {
+        if now_at != Some(tomb.cell) {
+            superseded.insert((entity, tomb.cell));
+        }
+    }
 }
 
 /// An opaque entity record: component bytes plus a dirty flag (§3.1).
@@ -181,6 +248,9 @@ pub struct CheckpointSnapshot {
     pub by_cell: HashMap<PersistId, orrery_protocol::CellId>,
     /// Despawn markers not yet past their GC deadline (D11 §6).
     pub tombstones: HashMap<PersistId, Tombstone>,
+    /// `world/` rows this actor has vacated and the checkpoint must clear
+    /// ([`SupersededRow`]).
+    pub superseded: HashSet<SupersededRow>,
     /// The journal LSN covered by the last checkpoint.
     pub ckpt_watermark: Lsn,
 }
@@ -206,6 +276,12 @@ pub struct SplitSnapshot {
     /// Each partition's despawn markers (a child actor inherits the tombstones
     /// of the entities that lived in its subtree).
     pub tombstones: HashMap<orrery_protocol::CellId, HashMap<PersistId, Tombstone>>,
+    /// Each partition's superseded rows, by the child whose subtree holds the
+    /// vacated key. A split spawns children from the parent's in-memory
+    /// partition and never touches the parent's durable rows, so a pending
+    /// clear that did not travel with the partition would be laundered into a
+    /// permanent ghost.
+    pub superseded: HashMap<orrery_protocol::CellId, HashSet<SupersededRow>>,
     /// The journal LSN covered by the last checkpoint.
     pub ckpt_watermark: Lsn,
 }
@@ -289,6 +365,10 @@ pub(crate) enum CellMsg {
         by_cell: HashMap<PersistId, orrery_protocol::CellId>,
         /// Despawn markers carried by the checkpoint (D11 §6).
         tombstones: HashMap<PersistId, Tombstone>,
+        /// Superseded `world/` rows carried by the checkpoint — the durable
+        /// tier reports the duplicates its own scan found, so a restore
+        /// adopts the clean-up an older writer never performed.
+        superseded: HashSet<SupersededRow>,
         /// The new checkpoint watermark.
         watermark: Lsn,
         /// Reply channel.
@@ -311,13 +391,17 @@ pub(crate) enum CellMsg {
         /// Reply channel.
         reply: oneshot::Sender<()>,
     },
-    /// Drop tombstones whose GC deadline has passed (D11 §6, checkpoint GC
-    /// pass). The durable rows were cleared by the checkpoint that just
-    /// committed; dropping them here stops the next checkpoint from rewriting
-    /// them.
-    PruneTombstones {
+    /// Drop the bookkeeping a just-committed checkpoint made durable: the
+    /// tombstones whose GC deadline has passed (D11 §6, checkpoint GC pass)
+    /// and the superseded rows it cleared. Both were acted on by the
+    /// checkpoint that just committed; dropping them here stops the next
+    /// checkpoint from rewriting or re-clearing them.
+    PruneCheckpointed {
         /// Wall-clock "now", as unix milliseconds.
         now_ms: u64,
+        /// Exactly the superseded rows the committed checkpoint carried —
+        /// never the live set, which may have grown since the snapshot.
+        superseded: HashSet<SupersededRow>,
         /// Reply channel.
         reply: oneshot::Sender<()>,
     },
@@ -410,6 +494,9 @@ pub struct CellActorState {
     pub by_cell: HashMap<PersistId, orrery_protocol::CellId>,
     /// Despawn markers not yet past their GC deadline (D11 §6).
     pub tombstones: HashMap<PersistId, Tombstone>,
+    /// `world/` rows this actor has vacated and the next checkpoint must
+    /// clear ([`SupersededRow`]).
+    pub superseded: HashSet<SupersededRow>,
     /// The journal LSN covered by the last checkpoint.
     pub ckpt_watermark: Lsn,
     /// Actor-owned lease registrar; no gateway path mutates it directly.
@@ -484,12 +571,14 @@ async fn actor_loop(env: &mut ActorEnv, mut rx: mpsc::Receiver<CellMsg>) {
                 entities,
                 by_cell,
                 tombstones,
+                superseded,
                 watermark,
                 reply,
             } => {
                 env.state.entities = entities;
                 env.state.by_cell = by_cell;
                 env.state.tombstones = tombstones;
+                env.state.superseded = superseded;
                 env.state.ckpt_watermark = watermark;
                 let _ = reply.send(());
             }
@@ -501,10 +590,17 @@ async fn actor_loop(env: &mut ActorEnv, mut rx: mpsc::Receiver<CellMsg>) {
                 fold(env, &record, now_ms());
                 let _ = reply.send(());
             }
-            CellMsg::PruneTombstones { now_ms, reply } => {
+            CellMsg::PruneCheckpointed {
+                now_ms,
+                superseded,
+                reply,
+            } => {
                 env.state
                     .tombstones
                     .retain(|_, t| t.gc_deadline_ms > now_ms);
+                for row in &superseded {
+                    env.state.superseded.remove(row);
+                }
                 let _ = reply.send(());
             }
             CellMsg::ClaimLease {
@@ -672,10 +768,21 @@ fn install_rekey(env: &mut ActorEnv, transfer: RekeyTransfer) -> Result<(), Reke
         };
     }
     env.state.entities.insert(transfer.entity, transfer.record);
+    note_row_moved(
+        &mut env.state.superseded,
+        &env.state.by_cell,
+        transfer.entity,
+        Some(transfer.destination_cell),
+    );
     env.state
         .by_cell
         .insert(transfer.entity, transfer.destination_cell);
-    env.state.tombstones.remove(&transfer.entity);
+    cancel_tombstone(
+        &mut env.state.superseded,
+        &mut env.state.tombstones,
+        transfer.entity,
+        Some(transfer.destination_cell),
+    );
     env.state.leases.restore(transfer.lease);
     env.state
         .lease_cells
@@ -693,8 +800,17 @@ fn retire_rekey(
     }
     env.state.pending_rekeys.remove(&entity);
     env.state.entities.remove(&entity);
+    // The source side of a cross-shard move: no tombstone (the entity lives
+    // on in the destination shard), so the vacated key is only ever cleared
+    // because it is recorded here.
+    note_row_moved(&mut env.state.superseded, &env.state.by_cell, entity, None);
     env.state.by_cell.remove(&entity);
-    env.state.tombstones.remove(&entity);
+    cancel_tombstone(
+        &mut env.state.superseded,
+        &mut env.state.tombstones,
+        entity,
+        None,
+    );
     env.state.leases.remove(entity);
     env.state.lease_cells.remove(&entity);
     Ok(())
@@ -708,6 +824,15 @@ fn complete_local_rekey(env: &mut ActorEnv, transfer: RekeyTransfer) -> Result<(
         return Err(RekeyError::DestinationConflict);
     }
     env.state.pending_rekeys.remove(&transfer.entity);
+    // An intra-shard move keeps one actor and one row, but the row's *key*
+    // still changes, so the source key is superseded exactly as it is in the
+    // cross-shard case.
+    note_row_moved(
+        &mut env.state.superseded,
+        &env.state.by_cell,
+        transfer.entity,
+        Some(transfer.destination_cell),
+    );
     env.state
         .by_cell
         .insert(transfer.entity, transfer.destination_cell);
@@ -900,12 +1025,35 @@ fn fold(env: &mut ActorEnv, record: &JournalRecord, now_ms: u64) {
             let entry = env.state.entities.entry(record.entity).or_default();
             entry.components = record.payload.clone();
             entry.dirty = true;
+            // An ordinary diff at a new cell moves the durable row's key as
+            // surely as a rekey does: the vacated key must be cleared, or the
+            // checkpoint leaves a second live row behind.
+            note_row_moved(
+                &mut env.state.superseded,
+                &env.state.by_cell,
+                record.entity,
+                Some(record.cell),
+            );
             env.state.by_cell.insert(record.entity, record.cell);
             // A re-spawn (id reuse across a despawn) cancels the marker.
-            env.state.tombstones.remove(&record.entity);
+            cancel_tombstone(
+                &mut env.state.superseded,
+                &mut env.state.tombstones,
+                record.entity,
+                Some(record.cell),
+            );
         }
         RecordKind::Despawn => {
             env.state.entities.remove(&record.entity);
+            // The marker is keyed by the despawn record's cell; if the live
+            // row sits at a different one, the marker does not overwrite it
+            // and the stale row would outlive the entity.
+            note_row_moved(
+                &mut env.state.superseded,
+                &env.state.by_cell,
+                record.entity,
+                Some(record.cell),
+            );
             env.state.by_cell.remove(&record.entity);
             // Tombstone, never plain deletion: the `world/` row must be
             // overwritten by the marker at the next checkpoint, not left to
@@ -925,8 +1073,22 @@ fn fold(env: &mut ActorEnv, record: &JournalRecord, now_ms: u64) {
                     && env.state.by_cell.get(&rekey.entity) == Some(&rekey.source_cell)
                 {
                     env.state.entities.remove(&rekey.entity);
+                    // Deliberately no tombstone here (the entity is alive
+                    // elsewhere), so the source row needs the superseded
+                    // record instead — otherwise nothing ever clears it.
+                    note_row_moved(
+                        &mut env.state.superseded,
+                        &env.state.by_cell,
+                        rekey.entity,
+                        None,
+                    );
                     env.state.by_cell.remove(&rekey.entity);
-                    env.state.tombstones.remove(&rekey.entity);
+                    cancel_tombstone(
+                        &mut env.state.superseded,
+                        &mut env.state.tombstones,
+                        rekey.entity,
+                        None,
+                    );
                     env.state.leases.remove(rekey.entity);
                     env.state.lease_cells.remove(&rekey.entity);
                 }
@@ -940,10 +1102,21 @@ fn fold(env: &mut ActorEnv, record: &JournalRecord, now_ms: u64) {
                             dirty: true,
                         },
                     );
+                    note_row_moved(
+                        &mut env.state.superseded,
+                        &env.state.by_cell,
+                        rekey.entity,
+                        Some(rekey.destination_cell),
+                    );
                     env.state
                         .by_cell
                         .insert(rekey.entity, rekey.destination_cell);
-                    env.state.tombstones.remove(&rekey.entity);
+                    cancel_tombstone(
+                        &mut env.state.superseded,
+                        &mut env.state.tombstones,
+                        rekey.entity,
+                        Some(rekey.destination_cell),
+                    );
                 }
             }
         }
@@ -996,6 +1169,7 @@ fn checkpoint_snapshot(env: &ActorEnv) -> CheckpointSnapshot {
         entities: env.state.entities.clone(),
         by_cell: env.state.by_cell.clone(),
         tombstones: env.state.tombstones.clone(),
+        superseded: env.state.superseded.clone(),
         ckpt_watermark: env.state.ckpt_watermark,
     }
 }
@@ -1010,6 +1184,8 @@ fn split_snapshot(env: &ActorEnv) -> SplitSnapshot {
         children.iter().map(|&c| (c, HashMap::new())).collect();
     let mut tombstones: HashMap<_, HashMap<_, _>> =
         children.iter().map(|&c| (c, HashMap::new())).collect();
+    let mut superseded: HashMap<_, HashSet<_>> =
+        children.iter().map(|&c| (c, HashSet::new())).collect();
     for (entity, record) in &env.state.entities {
         let cell = env
             .state
@@ -1043,6 +1219,17 @@ fn split_snapshot(env: &ActorEnv) -> SplitSnapshot {
             .expect("child present")
             .insert(*entity, *tomb);
     }
+    for &(entity, cell) in &env.state.superseded {
+        // The vacated key lives under exactly one child's subtree; that child
+        // inherits the pending clear, because after the split only it can
+        // fence a write to that key.
+        let child = children
+            .iter()
+            .find(|c| c.is_prefix_of(cell))
+            .copied()
+            .unwrap_or(env.state.shard);
+        superseded.entry(child).or_default().insert((entity, cell));
+    }
     SplitSnapshot {
         shard: env.state.shard,
         grid: env.state.grid,
@@ -1050,6 +1237,7 @@ fn split_snapshot(env: &ActorEnv) -> SplitSnapshot {
         children: out,
         by_cell,
         tombstones,
+        superseded,
         ckpt_watermark: env.state.ckpt_watermark,
     }
 }
@@ -1387,6 +1575,7 @@ impl CellActorHandle {
         entities: HashMap<PersistId, EntityRecord>,
         by_cell: HashMap<PersistId, orrery_protocol::CellId>,
         tombstones: HashMap<PersistId, Tombstone>,
+        superseded: HashSet<SupersededRow>,
     ) -> Result<(), Reject> {
         let (reply, rx) = oneshot::channel();
         self.tx
@@ -1394,6 +1583,7 @@ impl CellActorHandle {
                 entities,
                 by_cell,
                 tombstones,
+                superseded,
                 watermark: Lsn::new(0, 0),
                 reply,
             })
@@ -1422,13 +1612,24 @@ impl CellActorHandle {
         rx.await.map_err(|_| Reject::JournalClosed)
     }
 
-    /// Drop tombstones past `now_ms`, after the checkpoint cleared their rows
-    /// (D11 §6 checkpoint GC pass). Awaiting this before the next checkpoint is
-    /// what stops the marker from being rewritten forever.
-    pub async fn prune_tombstones(&self, now_ms: u64) -> Result<(), Reject> {
+    /// Drop the bookkeeping a just-committed checkpoint discharged: tombstones
+    /// past `now_ms`, whose rows the checkpoint cleared (D11 §6 checkpoint GC
+    /// pass), and `superseded` — exactly the rows that checkpoint carried and
+    /// therefore cleared. Awaiting this before the next checkpoint is what
+    /// stops the marker from being rewritten, and the clear from being
+    /// reissued, forever.
+    pub async fn prune_checkpointed(
+        &self,
+        now_ms: u64,
+        superseded: HashSet<SupersededRow>,
+    ) -> Result<(), Reject> {
         let (reply, rx) = oneshot::channel();
         self.tx
-            .send(CellMsg::PruneTombstones { now_ms, reply })
+            .send(CellMsg::PruneCheckpointed {
+                now_ms,
+                superseded,
+                reply,
+            })
             .await
             .map_err(|_| Reject::JournalClosed)?;
         rx.await.map_err(|_| Reject::JournalClosed)
@@ -1466,6 +1667,7 @@ pub fn spawn(
         HashMap::new(),
         HashMap::new(),
         HashMap::new(),
+        HashSet::new(),
         Lsn::new(0, 0),
         joins,
     )
@@ -1484,6 +1686,7 @@ pub fn spawn_preloaded(
     entities: HashMap<PersistId, EntityRecord>,
     by_cell: HashMap<PersistId, orrery_protocol::CellId>,
     tombstones: HashMap<PersistId, Tombstone>,
+    superseded: HashSet<SupersededRow>,
     ckpt_watermark: Lsn,
     joins: &Arc<ActorJoinSet>,
 ) -> CellActorHandle {
@@ -1496,6 +1699,7 @@ pub fn spawn_preloaded(
         entities,
         by_cell,
         tombstones,
+        superseded,
         ckpt_watermark,
         registrar_now_ms,
         joins,
@@ -1512,6 +1716,7 @@ fn spawn_preloaded_with_recovery_now<F>(
     entities: HashMap<PersistId, EntityRecord>,
     by_cell: HashMap<PersistId, orrery_protocol::CellId>,
     tombstones: HashMap<PersistId, Tombstone>,
+    superseded: HashSet<SupersededRow>,
     ckpt_watermark: Lsn,
     recovery_now: F,
     joins: &Arc<ActorJoinSet>,
@@ -1528,6 +1733,7 @@ where
             entities,
             by_cell,
             tombstones,
+            superseded,
             ckpt_watermark,
             leases: LeaseRegistrar::default(),
             lease_cells: HashMap::new(),
@@ -1630,6 +1836,7 @@ mod tests {
             HashMap::new(),
             HashMap::new(),
             HashMap::new(),
+            HashSet::new(),
             Lsn::new(0, 0),
             move || recovery_now,
             &joins,

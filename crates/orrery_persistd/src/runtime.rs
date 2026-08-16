@@ -2,7 +2,7 @@
 //! placement, route writes to the owning actor, and recover actors from the
 //! journal (§3.4 restart-and-recovery).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use orrery_protocol::{
@@ -10,7 +10,8 @@ use orrery_protocol::{
 };
 
 use crate::actor::{
-    self, CellActorHandle, EntityRecord, SnapshotPage, Tombstone, TOMBSTONE_RETENTION_MS,
+    self, CellActorHandle, EntityRecord, SnapshotPage, SupersededRow, Tombstone,
+    TOMBSTONE_RETENTION_MS,
 };
 use crate::checkpoint::{CheckpointData, CheckpointStore};
 use crate::crc::crc32c;
@@ -185,6 +186,7 @@ impl CheckpointTarget {
             .checkpoint_snapshot()
             .await
             .map_err(|_| crate::checkpoint::CheckpointError::Store("actor gone".into()))?;
+        let superseded = snap.superseded.clone();
         let data = CheckpointData {
             shard: snap.shard,
             grid: snap.grid,
@@ -194,17 +196,24 @@ impl CheckpointTarget {
             entities: snap.entities,
             by_cell: snap.by_cell,
             tombstones: snap.tombstones,
+            superseded: snap.superseded,
             taken_at_ms: now,
         };
         store.checkpoint(&data).await?;
         // The store's GC pass cleared the expired tombstone rows (D11 §6,
-        // P-6); drop them from the same actor incarnation now so the next
-        // checkpoint does not rewrite them. Safe on failure: an interrupted
-        // checkpoint re-runs and clears them again, so a stale actor entry
-        // cannot resurrect a row.
-        self.handle.prune_tombstones(now).await.map_err(|_| {
-            crate::checkpoint::CheckpointError::Store("actor gone after checkpoint".into())
-        })?;
+        // P-6) and the vacated rows this checkpoint carried (P-9); drop both
+        // from the same actor incarnation now so the next checkpoint does not
+        // rewrite or re-clear them. Only the pairs that travelled with this
+        // checkpoint are dropped — the actor may have recorded more since the
+        // snapshot, and those are the next checkpoint's work. Safe on
+        // failure: an interrupted checkpoint re-runs and clears them again,
+        // so a stale actor entry cannot resurrect a row.
+        self.handle
+            .prune_checkpointed(now, superseded)
+            .await
+            .map_err(|_| {
+                crate::checkpoint::CheckpointError::Store("actor gone after checkpoint".into())
+            })?;
         Ok(())
     }
 }
@@ -262,6 +271,7 @@ impl CellRuntime {
         // folds only the journal tail past each checkpoint's watermark.
         let mut seeds: HashMap<CellId, RecoveredState> = HashMap::new();
         let mut ckpt_watermarks: HashMap<CellId, Lsn> = HashMap::new();
+        let mut ckpt_epochs: HashMap<CellId, Epoch> = HashMap::new();
         for &shard in &config.shards {
             let loaded = checkpoints
                 .load(shard, config.grid)
@@ -271,12 +281,14 @@ impl CellRuntime {
                 })?;
             if let Some(ckpt) = loaded {
                 ckpt_watermarks.insert(shard, ckpt.watermark);
+                ckpt_epochs.insert(shard, ckpt.epoch);
                 seeds.insert(
                     shard,
                     RecoveredState {
                         state: ckpt.entities,
                         by_cell: ckpt.by_cell,
                         tombstones: ckpt.tombstones,
+                        superseded: ckpt.superseded,
                     },
                 );
             }
@@ -287,7 +299,10 @@ impl CellRuntime {
         // go (C-2). One pass, not `shards × journal`, keeps `open`
         // proportional to the journal length no matter how the shard set
         // grows.
-        let mut max_epoch_by_shard: HashMap<CellId, Epoch> = HashMap::new();
+        let mut gate = ReplayGate::new(config.shards.clone());
+        for (&shard, &epoch) in &ckpt_epochs {
+            gate.seed(shard, epoch);
+        }
         // The freshest journal position folded into each shard's state: the
         // checkpoint watermark advanced by every kept tail record past it.
         // This is the actor's `ckpt_watermark` after open.
@@ -296,9 +311,28 @@ impl CellRuntime {
             .scan_from(Lsn::new(0, 0))
             .collect::<Result<Vec<_>, _>>()?;
         for stored in stored_records {
+            // The journal key's own position, which is not always the record's
+            // `lsn`: a mirrored row keeps its origin LSN in the encoded record
+            // while taking an independent local key (journal/fjall.rs). The
+            // watermark and the coverage below are positions in *this*
+            // journal, so they are compared against this one.
+            let position = stored.lsn;
             let rec = stored.record;
-            verify_crc(&rec)?;
+            // P-7: storage cell ids are grid-relative, so a record from
+            // another grid names a different entity universe. The live write
+            // path refuses it (`CellRuntime::actor`'s grid guard) and so does
+            // the rekey branch below; the plain diff path never did.
+            if rec.grid != config.grid {
+                continue;
+            }
+            // Resolve the owning shard *before* verifying the payload. A
+            // corrupt record for a shard this node does not host is a fault
+            // this node can neither see the consequences of nor repair, and
+            // failing `open` on it bricks startup for a shard it was never
+            // going to serve.
+            let owner = deepest_shard(&config.shards, rec.cell);
             if rec.kind == RecordKind::Rekey {
+                verify_crc(&rec)?;
                 let rekey = actor::decode_entity_rekey(&rec).map_err(|error| {
                     crate::journal::JournalError::Corrupt {
                         lsn: rec.lsn,
@@ -311,26 +345,23 @@ impl CellRuntime {
                         msg: "rekey crosses an unavailable runtime grid".into(),
                     });
                 }
-                let source_shard =
-                    deepest_shard(&config.shards, rekey.source_cell).ok_or_else(|| {
-                        crate::journal::JournalError::Store(
-                            "committed rekey source actor unavailable".into(),
-                        )
-                    })?;
-                let max_seen = max_epoch_by_shard
-                    .entry(source_shard)
-                    .or_insert(Epoch::new(0));
-                if rec.epoch < *max_seen {
+                // `decode_entity_rekey` proved `rec.cell == rekey.source_cell`,
+                // so the owner resolved above is the source shard.
+                let source_shard = owner.ok_or_else(|| {
+                    crate::journal::JournalError::Store(
+                        "committed rekey source actor unavailable".into(),
+                    )
+                })?;
+                if !gate.admit(source_shard, rec.epoch) {
                     continue;
                 }
-                *max_seen = (*max_seen).max(rec.epoch);
                 recover_rekey(
                     &config.shards,
                     &ckpt_watermarks,
                     &mut seeds,
                     &mut coverage,
                     &rekey,
-                    rec.lsn,
+                    position,
                 )?;
                 let migration = lease_store
                     .migrate(
@@ -358,16 +389,13 @@ impl CellRuntime {
                 }
                 continue;
             }
-            let Some(shard) = deepest_shard(&config.shards, rec.cell) else {
+            let Some(shard) = owner else {
                 continue;
             };
-            // C-2: drop iff a strictly higher epoch was already observed at a
-            // lower LSN (a zombie write from a superseded ownership epoch).
-            let max_seen = max_epoch_by_shard.entry(shard).or_insert(Epoch::new(0));
-            if rec.epoch < *max_seen {
+            verify_crc(&rec)?;
+            if !gate.admit(shard, rec.epoch) {
                 continue;
             }
-            *max_seen = (*max_seen).max(rec.epoch);
             // The watermark strictly bounds the tail: the checkpoint covers
             // LSNs `1..=watermark`, but the very first record of a journal is
             // LSN 0:0 — equal to the absent-checkpoint watermark, not covered
@@ -375,17 +403,18 @@ impl CellRuntime {
             let covered_through = ckpt_watermarks.get(&shard).copied();
             // Records at or below the checkpoint watermark are already folded
             // into the seed; only the tail past it is replayed (§3.4 step 3).
-            if covered_through.is_none_or(|w| rec.lsn > w) {
+            if covered_through.is_none_or(|w| position > w) {
                 let seed = seeds.entry(shard).or_default();
                 fold(
                     &mut seed.state,
                     &mut seed.by_cell,
                     &mut seed.tombstones,
+                    &mut seed.superseded,
                     &rec,
                     now_ms,
                 );
                 let covered = coverage.entry(shard).or_insert(Lsn::new(0, 0));
-                *covered = (*covered).max(rec.lsn);
+                *covered = (*covered).max(position);
             }
         }
 
@@ -404,6 +433,7 @@ impl CellRuntime {
                     seed.state,
                     seed.by_cell,
                     seed.tombstones,
+                    seed.superseded,
                     watermark,
                     &joins,
                 ),
@@ -603,23 +633,34 @@ impl CellRuntime {
                 // Whichever has further coverage wins; the durable tier is
                 // the base the checkpoint guarantees, the live actor the tail
                 // it may not yet have checkpointed.
-                let (mut state, mut by_cell, mut tombstones, mut watermark) = ckpt.map_or_else(
-                    || {
-                        (
-                            HashMap::new(),
-                            HashMap::new(),
-                            HashMap::new(),
-                            Lsn::new(0, 0),
-                        )
-                    },
-                    |c| (c.entities, c.by_cell, c.tombstones, c.watermark),
-                );
+                let (mut state, mut by_cell, mut tombstones, mut superseded, mut watermark) = ckpt
+                    .map_or_else(
+                        || {
+                            (
+                                HashMap::new(),
+                                HashMap::new(),
+                                HashMap::new(),
+                                HashSet::new(),
+                                Lsn::new(0, 0),
+                            )
+                        },
+                        |c| {
+                            (
+                                c.entities,
+                                c.by_cell,
+                                c.tombstones,
+                                c.superseded,
+                                c.watermark,
+                            )
+                        },
+                    );
                 if let Some(old) = self.actors.remove(&shard) {
                     if let Ok(snap) = old.checkpoint_snapshot().await {
                         if snap.ckpt_watermark >= watermark {
                             state = snap.entities;
                             by_cell = snap.by_cell;
                             tombstones = snap.tombstones;
+                            superseded = snap.superseded;
                             watermark = snap.ckpt_watermark;
                         }
                     }
@@ -636,6 +677,7 @@ impl CellRuntime {
                         state,
                         by_cell,
                         tombstones,
+                        superseded,
                         watermark,
                         &self.joins,
                     ),
@@ -678,23 +720,34 @@ impl CellRuntime {
                 .load(*shard, self.grid)
                 .await
                 .map_err(|e| crate::fence::FenceError::Store(e.to_string()))?;
-            let (mut state, mut by_cell, mut tombstones, mut watermark) = ckpt.map_or_else(
-                || {
-                    (
-                        HashMap::new(),
-                        HashMap::new(),
-                        HashMap::new(),
-                        Lsn::new(0, 0),
-                    )
-                },
-                |c| (c.entities, c.by_cell, c.tombstones, c.watermark),
-            );
+            let (mut state, mut by_cell, mut tombstones, mut superseded, mut watermark) = ckpt
+                .map_or_else(
+                    || {
+                        (
+                            HashMap::new(),
+                            HashMap::new(),
+                            HashMap::new(),
+                            HashSet::new(),
+                            Lsn::new(0, 0),
+                        )
+                    },
+                    |c| {
+                        (
+                            c.entities,
+                            c.by_cell,
+                            c.tombstones,
+                            c.superseded,
+                            c.watermark,
+                        )
+                    },
+                );
             if let Some(old) = self.actors.remove(shard) {
                 if let Ok(snapshot) = old.checkpoint_snapshot().await {
                     if snapshot.ckpt_watermark >= watermark {
                         state = snapshot.entities;
                         by_cell = snapshot.by_cell;
                         tombstones = snapshot.tombstones;
+                        superseded = snapshot.superseded;
                         watermark = snapshot.ckpt_watermark;
                     }
                 }
@@ -711,6 +764,7 @@ impl CellRuntime {
                     state,
                     by_cell,
                     tombstones,
+                    superseded,
                     watermark,
                     &self.joins,
                 ),
@@ -781,6 +835,11 @@ impl CellRuntime {
             let partition = snap.children.get(child).cloned().unwrap_or_default();
             let child_by_cell = snap.by_cell.get(child).cloned().unwrap_or_default();
             let child_tombstones = snap.tombstones.get(child).cloned().unwrap_or_default();
+            // The parent's pending row clears travel with the partition: a
+            // split never touches the parent's durable rows, so a vacated key
+            // left behind here would become a ghost no later checkpoint can
+            // reach (§3.5, P-9).
+            let child_superseded = snap.superseded.get(child).cloned().unwrap_or_default();
             self.actors.insert(
                 *child,
                 actor::spawn_preloaded(
@@ -792,6 +851,7 @@ impl CellRuntime {
                     partition,
                     child_by_cell,
                     child_tombstones,
+                    child_superseded,
                     snap.ckpt_watermark,
                     &self.joins,
                 ),
@@ -924,9 +984,18 @@ impl CellRuntime {
     /// construction, bounded by construction: the replay is the tail, not the
     /// whole journal.
     ///
-    /// The epoch predicate is decision C-2 (docs/11-roadmap.md §P2), identical
-    /// to [`CellRuntime::open`]'s: scan in LSN order, drop a record iff its
-    /// epoch is below the running maximum seen so far.
+    /// The epoch predicate is decision C-2 (docs/11-roadmap.md §P2), and it is
+    /// literally [`CellRuntime::open`]'s: both drive [`ReplayGate`], so the
+    /// dispatch rule (deepest hosted shard, not any prefix match) and the
+    /// order of the epoch and watermark filters cannot drift apart again. The
+    /// gate is seeded from the checkpoint's epoch precisely because this scan
+    /// starts at the watermark and cannot see the records `open` folds before
+    /// it — see [`ReplayGate::seed`].
+    ///
+    /// Note this method has no production caller: startup goes through
+    /// [`CellRuntime::open_with_lease_store`], which recovers as it opens. It
+    /// is a public entry point for tests and tooling, so its predicate still
+    /// has to be the real one.
     ///
     /// Returns the number of journal records replayed.
     pub async fn restore(
@@ -941,11 +1010,18 @@ impl CellRuntime {
         // Load the checkpoint and fold its entity bag and despawn markers
         // into the actor. The watermark W bounds the replay below; `None` when
         // there is no checkpoint, meaning the whole journal is the tail.
+        let mut gate = ReplayGate::new(self.actors.keys().copied().collect());
         let mut watermark = None;
         if let Some(ckpt) = store.load(shard, self.grid).await? {
             watermark = Some(ckpt.watermark);
+            gate.seed(shard, ckpt.epoch);
             handle
-                .restore_entities(ckpt.entities, ckpt.by_cell, ckpt.tombstones)
+                .restore_entities(
+                    ckpt.entities,
+                    ckpt.by_cell,
+                    ckpt.tombstones,
+                    ckpt.superseded,
+                )
                 .await
                 .map_err(|_| {
                     crate::checkpoint::CheckpointError::Store("actor gone during restore".into())
@@ -964,11 +1040,32 @@ impl CellRuntime {
         // which is below no checkpoint and must replay.
         let scan_from = watermark.unwrap_or(Lsn::new(0, 0));
         let mut replayed = 0usize;
-        let mut max_epoch = Epoch::new(0);
         for item in self.journal.scan_from(scan_from) {
             let stored =
                 item.map_err(|e| crate::checkpoint::CheckpointError::Store(format!("{e}")))?;
+            // The local journal position, not the record's own `lsn`, for the
+            // same reason `open` uses it: a mirrored row's encoded LSN belongs
+            // to the origin's journal, and the watermark is a position here.
+            let position = stored.lsn;
             let rec = &stored.record;
+            if rec.grid != self.grid {
+                continue;
+            }
+            // Same dispatch as `open`: the deepest hosted shard owning the
+            // record's own cell. For a rekey that is the source shard, which
+            // is also the shard whose epoch gates it.
+            let Some(owner) = gate.owner(rec.cell) else {
+                continue;
+            };
+            verify_crc(rec)
+                .map_err(|e| crate::checkpoint::CheckpointError::Store(format!("{e}")))?;
+            // The gate is advanced for every record `open` would advance it
+            // for, not only the ones this shard folds — otherwise a rekey
+            // arriving from another shard would be judged against a running
+            // maximum that had never seen that shard's writes.
+            if !gate.admit(owner, rec.epoch) {
+                continue;
+            }
             let rekey = if rec.kind == RecordKind::Rekey {
                 Some(actor::decode_entity_rekey(rec).map_err(|error| {
                     crate::checkpoint::CheckpointError::Store(error.to_string())
@@ -976,27 +1073,15 @@ impl CellRuntime {
             } else {
                 None
             };
-            let relevant = rekey.as_ref().map_or_else(
-                || shard.is_prefix_of(rec.cell),
-                |rekey| {
-                    shard.is_prefix_of(rekey.source_cell)
-                        || shard.is_prefix_of(rekey.destination_cell)
-                },
-            );
+            let relevant = rekey.as_ref().map_or(owner == shard, |rekey| {
+                owner == shard || gate.owner(rekey.destination_cell) == Some(shard)
+            });
             if !relevant {
                 continue;
             }
-            if watermark.is_some_and(|w| rec.lsn <= w) {
+            if watermark.is_some_and(|w| position <= w) {
                 continue;
             }
-            // C-2: drop iff a strictly higher epoch was already observed at a
-            // lower LSN (a zombie write from a superseded ownership epoch).
-            if rec.epoch < max_epoch {
-                continue;
-            }
-            max_epoch = max_epoch.max(rec.epoch);
-            verify_crc(rec)
-                .map_err(|e| crate::checkpoint::CheckpointError::Store(format!("{e}")))?;
             if let Some(rekey) = rekey {
                 let migration = self
                     .lease_store
@@ -1053,12 +1138,77 @@ impl CellRuntime {
 }
 
 /// One shard's recovered hot state (entity bag, per-entity cells, despawn
-/// markers) — the checkpoint seed folded with the replayed journal tail.
+/// markers, pending row clears) — the checkpoint seed folded with the replayed
+/// journal tail.
 #[derive(Default)]
 struct RecoveredState {
     state: HashMap<PersistId, EntityRecord>,
     by_cell: HashMap<PersistId, CellId>,
     tombstones: HashMap<PersistId, Tombstone>,
+    superseded: HashSet<SupersededRow>,
+}
+
+/// The C-2 replay predicate (docs/11-roadmap.md §P2), in one place.
+///
+/// Both recovery paths — [`CellRuntime::open`] and [`CellRuntime::restore`] —
+/// drive this, because they used to implement C-2 twice and the two copies had
+/// drifted: `open` advanced the running maximum before the watermark filter
+/// while `restore` skipped at the watermark first, and `open` dispatched by
+/// deepest shard while `restore` matched on `is_prefix_of`. Under a nested
+/// shard set that second difference alone made them fold different records —
+/// a record inside a child shard is a prefix match for its parent, but the
+/// parent is not the actor that owns it.
+///
+/// The predicate is per shard, never global: a node's own journal has
+/// non-decreasing epochs per shard, and a record is a zombie only relative to
+/// the shard whose ownership it claims.
+struct ReplayGate {
+    shards: Vec<CellId>,
+    max_epoch: HashMap<CellId, Epoch>,
+}
+
+impl ReplayGate {
+    fn new(shards: Vec<CellId>) -> Self {
+        Self {
+            shards,
+            max_epoch: HashMap::new(),
+        }
+    }
+
+    /// Seed a shard's running maximum from the epoch its checkpoint was taken
+    /// under.
+    ///
+    /// This is what lets `restore` reach `open`'s answer at all. `restore`
+    /// scans from the watermark, so it structurally cannot see the
+    /// pre-watermark records whose epochs `open` folds into the running
+    /// maximum before it ever reaches the tail. The checkpoint's own epoch is
+    /// precisely the maximum those records left behind — it is the epoch the
+    /// owning actor held when it wrote them — so seeding from it reconstructs
+    /// the state of the gate at the watermark instead of restarting it at
+    /// zero and admitting a zombie the tail happens to contain.
+    fn seed(&mut self, shard: CellId, epoch: Epoch) {
+        let entry = self.max_epoch.entry(shard).or_insert(Epoch::new(0));
+        *entry = (*entry).max(epoch);
+    }
+
+    /// The shard that owns `cell`: the deepest hosted shard whose subtree
+    /// contains it, the same most-specific rule [`CellRuntime::actor`] routes
+    /// live writes by.
+    fn owner(&self, cell: CellId) -> Option<CellId> {
+        deepest_shard(&self.shards, cell)
+    }
+
+    /// C-2: admit `epoch` for `shard` unless a strictly higher epoch was
+    /// already seen at a lower LSN (a zombie write from a superseded ownership
+    /// epoch), advancing the running maximum when it is admitted.
+    fn admit(&mut self, shard: CellId, epoch: Epoch) -> bool {
+        let max_seen = self.max_epoch.entry(shard).or_insert(Epoch::new(0));
+        if epoch < *max_seen {
+            return false;
+        }
+        *max_seen = (*max_seen).max(epoch);
+        true
+    }
 }
 
 /// The deepest shard in `shards` whose subtree contains `cell` — the same
@@ -1092,8 +1242,17 @@ fn recover_rekey(
     {
         let seed = seeds.entry(source).or_default();
         seed.state.remove(&rekey.entity);
+        // The source keeps no tombstone (the entity is alive in the
+        // destination shard), so its vacated row is only ever cleared because
+        // the recovery records it here, exactly as the live path does.
+        actor::note_row_moved(&mut seed.superseded, &seed.by_cell, rekey.entity, None);
         seed.by_cell.remove(&rekey.entity);
-        seed.tombstones.remove(&rekey.entity);
+        actor::cancel_tombstone(
+            &mut seed.superseded,
+            &mut seed.tombstones,
+            rekey.entity,
+            None,
+        );
         coverage
             .entry(source)
             .and_modify(|covered| *covered = (*covered).max(lsn))
@@ -1111,8 +1270,19 @@ fn recover_rekey(
                 dirty: true,
             },
         );
+        actor::note_row_moved(
+            &mut seed.superseded,
+            &seed.by_cell,
+            rekey.entity,
+            Some(rekey.destination_cell),
+        );
         seed.by_cell.insert(rekey.entity, rekey.destination_cell);
-        seed.tombstones.remove(&rekey.entity);
+        actor::cancel_tombstone(
+            &mut seed.superseded,
+            &mut seed.tombstones,
+            rekey.entity,
+            Some(rekey.destination_cell),
+        );
         coverage
             .entry(destination)
             .and_modify(|covered| *covered = (*covered).max(lsn))
@@ -1144,14 +1314,18 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-/// Fold a record into an entity map and tombstone set (last-writer-wins per
-/// entity). Mirrors the actor's fold logic for the `open`-time replay, which
-/// runs before any actor exists; `now_ms` seeds the despawn markers' GC
-/// deadlines (P-6).
+/// Fold a record into an entity map, tombstone set, and superseded-row set
+/// (last-writer-wins per entity). Mirrors the actor's fold logic for the
+/// `open`-time replay, which runs before any actor exists; `now_ms` seeds the
+/// despawn markers' GC deadlines (P-6), and the superseded set carries the
+/// vacated `world/` keys the first checkpoint after recovery must clear
+/// (P-9) — which is also why the set need not be durable: replay re-derives
+/// it from the same records that created it.
 fn fold(
     state: &mut HashMap<PersistId, EntityRecord>,
     by_cell: &mut HashMap<PersistId, CellId>,
     tombstones: &mut HashMap<PersistId, Tombstone>,
+    superseded: &mut HashSet<SupersededRow>,
     record: &JournalRecord,
     now_ms: u64,
 ) {
@@ -1160,11 +1334,13 @@ fn fold(
             let entry = state.entry(record.entity).or_default();
             entry.components = record.payload.clone();
             entry.dirty = true;
+            actor::note_row_moved(superseded, by_cell, record.entity, Some(record.cell));
             by_cell.insert(record.entity, record.cell);
-            tombstones.remove(&record.entity);
+            actor::cancel_tombstone(superseded, tombstones, record.entity, Some(record.cell));
         }
         RecordKind::Despawn => {
             state.remove(&record.entity);
+            actor::note_row_moved(superseded, by_cell, record.entity, Some(record.cell));
             by_cell.remove(&record.entity);
             tombstones.insert(
                 record.entity,

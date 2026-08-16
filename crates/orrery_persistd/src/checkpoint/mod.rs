@@ -10,12 +10,12 @@
 //! service; [`FdbCheckpointStore`] (feature `fdb`) maps the same keyspace onto
 //! FoundationDB exactly as D11 §6 specifies.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 
 use orrery_protocol::{CellId, Epoch, GridId, Lsn, PersistId};
 
-use crate::actor::{EntityRecord, SnapshotPage, Tombstone};
+use crate::actor::{EntityRecord, SnapshotPage, SupersededRow, Tombstone};
 
 #[cfg(feature = "fdb")]
 pub mod fdb;
@@ -52,6 +52,14 @@ pub struct CheckpointData {
     /// The store writes these as tombstone rows and clears rows whose deadline
     /// has passed (the checkpoint GC pass).
     pub tombstones: HashMap<PersistId, Tombstone>,
+    /// `world/` rows the actor has vacated ([`SupersededRow`]). The store
+    /// **clears** these keys in the same pass that writes the entity bag, so
+    /// an entity that changed cell leaves exactly one row behind rather than
+    /// one per cell it has ever occupied. On [`CheckpointStore::load`] the
+    /// field runs the other way: a store that can see its own keyspace
+    /// reports the duplicate rows its scan found, so a restore adopts a
+    /// clean-up an older writer never performed.
+    pub superseded: HashSet<SupersededRow>,
     /// Wall-clock time the checkpoint was taken, as unix milliseconds.
     pub taken_at_ms: u64,
 }
@@ -189,6 +197,7 @@ mod tests {
             entities,
             by_cell: HashMap::new(),
             tombstones: HashMap::new(),
+            superseded: HashSet::new(),
             taken_at_ms: 1_700_000_000_000,
         }
     }

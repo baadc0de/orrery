@@ -153,6 +153,7 @@ async fn actor_serves_rows_present_only_in_the_checkpoint() {
             entities,
             by_cell,
             tombstones: std::collections::HashMap::new(),
+            superseded: std::collections::HashSet::new(),
             taken_at_ms: 1_700_000_000_000,
         })
         .await
@@ -662,7 +663,7 @@ async fn fdb_subtree_keying_and_watermark_only_checkpoint() {
         return;
     };
     use orrery_persistd::{CheckpointData, EntityRecord};
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
 
     // Level-18 shard from docs/01-spatial-model §3.3 (subtree
     // `0x...4C01..=0x...4FFF`) plus two level-21 cells under it and one outside.
@@ -699,6 +700,7 @@ async fn fdb_subtree_keying_and_watermark_only_checkpoint() {
         entities,
         by_cell,
         tombstones: HashMap::new(),
+        superseded: HashSet::new(),
         taken_at_ms: 1_700_000_000_000,
     };
     activate_fdb_fence(&cluster, data.grid, data.shard, data.node_id, data.epoch).await;
@@ -788,7 +790,7 @@ async fn fdb_tombstones_write_gc_and_isolate_grids() {
         return;
     };
     use orrery_persistd::{CheckpointData, EntityRecord, Tombstone};
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
 
     let shard = CellId::from_bits(0xA924_9249_2492_4E00).unwrap();
     let cell = CellId::from_bits(0xA924_9249_2492_4D65).unwrap();
@@ -818,6 +820,7 @@ async fn fdb_tombstones_write_gc_and_isolate_grids() {
             (PersistId::new(2), tomb(1_900_000_000_000)),
             (PersistId::new(3), tomb(100)),
         ]),
+        superseded: HashSet::new(),
         taken_at_ms: 1_700_000_000_000,
     };
     activate_fdb_fence(&cluster, data.grid, data.shard, data.node_id, data.epoch).await;
@@ -867,6 +870,7 @@ async fn fdb_tombstones_write_gc_and_isolate_grids() {
         entities: HashMap::from([(PersistId::new(3), rec(3))]),
         by_cell: HashMap::from([(PersistId::new(3), cell)]),
         tombstones: HashMap::new(),
+        superseded: HashSet::new(),
         taken_at_ms: 1_700_000_000_000,
     };
     activate_fdb_fence(
@@ -986,4 +990,449 @@ async fn fdb_tombstone_end_to_end_lifecycle() {
     rt2.close().await.unwrap();
 
     store.delete(CellId::ROOT, GridId::new(9007)).await.unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// P-9: a moved entity leaves exactly one `world/` row.
+//
+// `MemCheckpointStore` cannot express this bug — it stores one opaque
+// postcard blob per (grid, shard), so a superseded key has nowhere to exist.
+// Only a real keyspace shows it, which is why these are fdb-gated and read the
+// rows back with a raw range scan instead of through `load`: `load` rebuilds a
+// `HashMap<PersistId, _>` and would collapse the very duplicate under test.
+// ---------------------------------------------------------------------------
+
+/// Every `world/` row in `grid`, as `(cell, entity, tag)` in key order.
+#[cfg(feature = "fdb")]
+async fn world_rows(cluster: &str, grid: GridId) -> Vec<(CellId, PersistId, u8)> {
+    use foundationdb::{KeySelector, RangeOption};
+    use futures::TryStreamExt;
+
+    let db = orrery_persistd::FdbContext::connect(cluster)
+        .unwrap()
+        .database();
+    let start = orrery_persistd::keyspace::world_range_start(grid, CellId::ROOT);
+    let end = orrery_persistd::keyspace::world_range_end(grid, CellId::ROOT);
+    db.run(|trx, _| {
+        let (start, end) = (start.clone(), end.clone());
+        async move {
+            let opt = RangeOption {
+                begin: KeySelector::first_greater_or_equal(start),
+                end: KeySelector::first_greater_or_equal(end),
+                ..RangeOption::default()
+            };
+            let mut out = Vec::new();
+            let mut stream = trx.get_ranges_keyvalues(opt, false);
+            while let Some(kv) = stream.try_next().await? {
+                let raw = kv.key();
+                assert_eq!(raw.len(), 21, "world key layout");
+                let cell = CellId::from_bits(u64::from_be_bytes(raw[5..13].try_into().unwrap()))
+                    .expect("cell bits");
+                let entity = PersistId::new(u64::from_be_bytes(raw[13..21].try_into().unwrap()));
+                out.push((cell, entity, kv.value()[0]));
+            }
+            Ok(out)
+        }
+    })
+    .await
+    .expect("world scan")
+}
+
+#[cfg(feature = "fdb")]
+fn rekey_record(rekey: &orrery_protocol::EntityRekey) -> JournalRecord {
+    let payload = bytes::Bytes::from(postcard::to_allocvec(rekey).unwrap());
+    JournalRecord {
+        lsn: Lsn::new(0, 0),
+        cell: rekey.source_cell,
+        grid: rekey.source_grid,
+        entity: rekey.entity,
+        tick: Tick::new(7),
+        epoch: Epoch::new(0),
+        author: test_node(1),
+        kind: RecordKind::Rekey,
+        crc: payload_crc(&payload),
+        payload,
+    }
+}
+
+/// Grant `entity` a lease on `source` and commit its rekey to `destination`.
+#[cfg(feature = "fdb")]
+async fn rekey_entity(
+    rt: &CellRuntime,
+    grid: GridId,
+    entity: PersistId,
+    source: CellId,
+    destination: CellId,
+    image: &'static [u8],
+) {
+    use orrery_persistd::{ClaimResult, Router};
+
+    let actor = rt.actor(grid, source).expect("source actor").clone();
+    let ClaimResult::Granted(grant) = actor
+        .claim_lease(
+            entity,
+            source,
+            test_node(13),
+            orrery_protocol::ClaimKind::Strong,
+            20,
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("source lease must be granted");
+    };
+    let rekey = orrery_protocol::EntityRekey {
+        version: orrery_protocol::ENTITY_REKEY_VERSION,
+        entity,
+        source_grid: grid,
+        source_cell: source,
+        destination_grid: grid,
+        destination_cell: destination,
+        expected_lease_id: grant.lease_id,
+        source_record: bytes::Bytes::from_static(image),
+    };
+    Router::commit_rekey(rt, rekey_record(&rekey))
+        .await
+        .unwrap();
+}
+
+/// A runtime over `shards` in one grid of the shared dev cluster.
+#[cfg(feature = "fdb")]
+fn sharded_config(dir: &std::path::Path, grid: GridId, shards: Vec<CellId>) -> RuntimeConfig {
+    RuntimeConfig {
+        shards,
+        ..runtime_config_in(dir, grid)
+    }
+}
+
+/// A cross-shard rekey must leave the entity with one row, at the destination.
+///
+/// The source actor drops the entity without a tombstone (deliberately — it is
+/// alive elsewhere), so before P-9 nothing on any path cleared the source key
+/// and the shard kept a second live row for the same `PersistId` forever.
+#[cfg(feature = "fdb")]
+#[tokio::test]
+async fn fdb_cross_shard_rekey_leaves_one_world_row() {
+    let Some(cluster) = fdb_cluster_file() else {
+        eprintln!("skipping: ORRERY_FDB_CLUSTER_FILE not set and no .fdb-dev/fdb.cluster");
+        return;
+    };
+    let grid = GridId::new(9210);
+    let shards = CellId::ROOT.children()[..2].to_vec();
+    for shard in &shards {
+        activate_fdb_fence(&cluster, grid, *shard, 0, Epoch::new(0)).await;
+    }
+    let store = std::sync::Arc::new(
+        orrery_persistd::checkpoint::FdbCheckpointStore::connect(&cluster).unwrap(),
+    );
+    for shard in &shards {
+        store.delete(*shard, grid).await.unwrap();
+    }
+
+    let source = shards[0].children()[5];
+    let destination = shards[1].children()[2];
+    let entity = PersistId::new(77);
+    let dir = tempfile::tempdir().unwrap();
+    let rt = CellRuntime::open(
+        &sharded_config(dir.path(), grid, shards.clone()),
+        &store_dyn(&store),
+    )
+    .await
+    .unwrap();
+
+    // The source row has to be durable before the move, or there is no
+    // superseded key to leave behind.
+    rt.apply(mk_record_in(
+        grid,
+        source,
+        entity.0,
+        RecordKind::Spawn,
+        b"moved-component-bytes",
+    ))
+    .await
+    .unwrap();
+    rt.checkpoint(store.as_ref()).await.unwrap();
+    assert_eq!(
+        world_rows(&cluster, grid).await,
+        vec![(source, entity, orrery_persistd::keyspace::LIVE_TAG)],
+        "the spawn is durable at the source cell"
+    );
+
+    rekey_entity(
+        &rt,
+        grid,
+        entity,
+        source,
+        destination,
+        b"moved-component-bytes",
+    )
+    .await;
+    rt.checkpoint(store.as_ref()).await.unwrap();
+
+    assert_eq!(
+        world_rows(&cluster, grid).await,
+        vec![(destination, entity, orrery_persistd::keyspace::LIVE_TAG)],
+        "one row, at the destination: the source key was cleared, not orphaned"
+    );
+
+    rt.close().await.unwrap();
+    for shard in &shards {
+        store.delete(*shard, grid).await.unwrap();
+    }
+}
+
+/// The same, carried through a full restart: the reopened runtime is seeded
+/// from the durable rows alone, so a surviving source row would resurrect the
+/// entity in the source shard — two actors owning one entity.
+#[cfg(feature = "fdb")]
+#[tokio::test]
+async fn fdb_rekey_then_restart_recovers_one_shard_only() {
+    let Some(cluster) = fdb_cluster_file() else {
+        eprintln!("skipping: ORRERY_FDB_CLUSTER_FILE not set and no .fdb-dev/fdb.cluster");
+        return;
+    };
+    let grid = GridId::new(9211);
+    let shards = CellId::ROOT.children()[..2].to_vec();
+    for shard in &shards {
+        activate_fdb_fence(&cluster, grid, *shard, 0, Epoch::new(0)).await;
+    }
+    let store = std::sync::Arc::new(
+        orrery_persistd::checkpoint::FdbCheckpointStore::connect(&cluster).unwrap(),
+    );
+    for shard in &shards {
+        store.delete(*shard, grid).await.unwrap();
+    }
+
+    let source = shards[0].children()[1];
+    let destination = shards[1].children()[7];
+    let entity = PersistId::new(78);
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let rt = CellRuntime::open(
+            &sharded_config(dir.path(), grid, shards.clone()),
+            &store_dyn(&store),
+        )
+        .await
+        .unwrap();
+        rt.apply(mk_record_in(
+            grid,
+            source,
+            entity.0,
+            RecordKind::Spawn,
+            b"restart-component-bytes",
+        ))
+        .await
+        .unwrap();
+        rt.checkpoint(store.as_ref()).await.unwrap();
+        rekey_entity(
+            &rt,
+            grid,
+            entity,
+            source,
+            destination,
+            b"restart-component-bytes",
+        )
+        .await;
+        rt.checkpoint(store.as_ref()).await.unwrap();
+        rt.close().await.unwrap();
+    }
+
+    // A fresh journal directory: recovery has to come from the durable rows,
+    // not from replaying the rekey record a second time.
+    let cold_dir = tempfile::tempdir().unwrap();
+    let recovered = CellRuntime::open(
+        &sharded_config(cold_dir.path(), grid, shards.clone()),
+        &store_dyn(&store),
+    )
+    .await
+    .unwrap();
+    assert!(
+        recovered
+            .read(grid, shards[0])
+            .await
+            .unwrap()
+            .entities
+            .is_empty(),
+        "the source shard recovers nothing: its row is gone, not merely shadowed"
+    );
+    let page = recovered.read(grid, shards[1]).await.unwrap();
+    assert_eq!(
+        page.entities[&entity].components.as_ref(),
+        b"restart-component-bytes"
+    );
+    assert_eq!(
+        world_rows(&cluster, grid).await,
+        vec![(destination, entity, orrery_persistd::keyspace::LIVE_TAG)]
+    );
+    recovered.close().await.unwrap();
+    for shard in &shards {
+        store.delete(*shard, grid).await.unwrap();
+    }
+}
+
+/// Ordinary intra-shard movement leaves one row too — and it is the commoner
+/// case by far: an entity crossing a cell boundary inside its own shard moves
+/// its key on a plain `ComponentDiff`, with no rekey record anywhere.
+#[cfg(feature = "fdb")]
+#[tokio::test]
+async fn fdb_intra_shard_movement_leaves_one_world_row() {
+    let Some(cluster) = fdb_cluster_file() else {
+        eprintln!("skipping: ORRERY_FDB_CLUSTER_FILE not set and no .fdb-dev/fdb.cluster");
+        return;
+    };
+    let grid = GridId::new(9212);
+    activate_fdb_checkpoint_fence(&cluster, grid).await;
+    let store = std::sync::Arc::new(
+        orrery_persistd::checkpoint::FdbCheckpointStore::connect(&cluster).unwrap(),
+    );
+    store.delete(CellId::ROOT, grid).await.unwrap();
+
+    let cells = CellId::ROOT.children();
+    let entity = PersistId::new(79);
+    let dir = tempfile::tempdir().unwrap();
+    let rt = CellRuntime::open(&runtime_config_in(dir.path(), grid), &store_dyn(&store))
+        .await
+        .unwrap();
+
+    rt.apply(mk_record_in(
+        grid,
+        cells[0],
+        entity.0,
+        RecordKind::Spawn,
+        b"first-cell",
+    ))
+    .await
+    .unwrap();
+    rt.checkpoint(store.as_ref()).await.unwrap();
+
+    // A plain diff at a different cell: no rekey involved, key still moves.
+    rt.apply(mk_record_in(
+        grid,
+        cells[3],
+        entity.0,
+        RecordKind::ComponentDiff,
+        b"second-cell",
+    ))
+    .await
+    .unwrap();
+    rt.checkpoint(store.as_ref()).await.unwrap();
+    assert_eq!(
+        world_rows(&cluster, grid).await,
+        vec![(cells[3], entity, orrery_persistd::keyspace::LIVE_TAG)],
+        "a diff at a new cell moves the row rather than duplicating it"
+    );
+
+    // And the intra-shard rekey, which stays inside one actor's mailbox.
+    rekey_entity(&rt, grid, entity, cells[3], cells[6], b"second-cell").await;
+    rt.checkpoint(store.as_ref()).await.unwrap();
+    assert_eq!(
+        world_rows(&cluster, grid).await,
+        vec![(cells[6], entity, orrery_persistd::keyspace::LIVE_TAG)],
+        "a local rekey moves the row too"
+    );
+
+    // A despawn writes its marker at the record's cell; the live row it leaves
+    // behind must not outlive the entity.
+    rt.apply(mk_record_in(
+        grid,
+        cells[6],
+        entity.0,
+        RecordKind::Despawn,
+        b"gone",
+    ))
+    .await
+    .unwrap();
+    rt.checkpoint(store.as_ref()).await.unwrap();
+    assert_eq!(
+        world_rows(&cluster, grid).await,
+        vec![(cells[6], entity, orrery_persistd::keyspace::TOMBSTONE_TAG)],
+        "the despawn marker replaces the row, and there is only ever one"
+    );
+
+    rt.close().await.unwrap();
+    store.delete(CellId::ROOT, grid).await.unwrap();
+}
+
+/// A split must not launder a pending clear. `split` spawns children from the
+/// parent's in-memory partition and never touches the parent's durable rows,
+/// so a vacated key that did not travel with the partition becomes a ghost no
+/// later checkpoint can reach: the parent actor is gone, and only the child
+/// owning that subtree can fence a write to the key.
+#[cfg(feature = "fdb")]
+#[tokio::test]
+async fn fdb_split_carries_the_pending_row_clear_to_the_child() {
+    let Some(cluster) = fdb_cluster_file() else {
+        eprintln!("skipping: ORRERY_FDB_CLUSTER_FILE not set and no .fdb-dev/fdb.cluster");
+        return;
+    };
+    let grid = GridId::new(9213);
+    let fence =
+        std::sync::Arc::new(orrery_persistd::fence::FdbFenceStore::connect(&cluster).unwrap());
+    let store = std::sync::Arc::new(
+        orrery_persistd::checkpoint::FdbCheckpointStore::connect(&cluster).unwrap(),
+    );
+    store.delete(CellId::ROOT, grid).await.unwrap();
+
+    // The runtime's own fence store is the FDB one, so the epochs `split`
+    // writes are the epochs the checkpoint's fence read requires. Chaining off
+    // whatever row the last run left behind keeps the test rerunnable against
+    // the shared cluster.
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = runtime_config_in(dir.path(), grid);
+    config.fence = fence.clone();
+    let mut rt = CellRuntime::open(&config, &store_dyn(&store))
+        .await
+        .unwrap();
+    let existing = fence.read(grid, CellId::ROOT).await.unwrap();
+    let parent_epoch = rt
+        .fence_shard(CellId::ROOT, existing.as_ref(), store.as_ref())
+        .await
+        .unwrap();
+    let parent_row = FenceRow {
+        owner: 0,
+        epoch: parent_epoch,
+        status: FenceStatus::Active,
+    };
+
+    // Both cells sit in one child's subtree, so exactly one child inherits the
+    // clear the parent never got to perform.
+    let cells = CellId::ROOT.children()[0].children();
+    let entity = PersistId::new(80);
+    rt.apply(mk_record_in(
+        grid,
+        cells[2],
+        entity.0,
+        RecordKind::Spawn,
+        b"pre-split",
+    ))
+    .await
+    .unwrap();
+    rt.checkpoint(store.as_ref()).await.unwrap();
+    rt.apply(mk_record_in(
+        grid,
+        cells[4],
+        entity.0,
+        RecordKind::ComponentDiff,
+        b"post-move",
+    ))
+    .await
+    .unwrap();
+
+    // The move is journalled but not yet checkpointed: the clear is pending in
+    // the parent actor at the moment it is split away.
+    let children = rt.split(CellId::ROOT, &parent_row).await.unwrap();
+    assert_eq!(children.len(), 8);
+    rt.checkpoint(store.as_ref()).await.unwrap();
+
+    assert_eq!(
+        world_rows(&cluster, grid).await,
+        vec![(cells[4], entity, orrery_persistd::keyspace::LIVE_TAG)],
+        "the child inherited the parent's pending clear"
+    );
+
+    rt.close().await.unwrap();
+    for (child, _) in &children {
+        store.delete(*child, grid).await.unwrap();
+    }
+    store.delete(CellId::ROOT, grid).await.unwrap();
 }
