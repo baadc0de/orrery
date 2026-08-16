@@ -233,32 +233,116 @@ Two things follow for agents sharing this machine:
   design. A healthy report has a high hit *rate* with a non-zero non-cacheable
   count.
 
-## Device-local memory
+## Working alongside other agents
 
-Durable, machine-local agent context lives in
-[`.agents/memory/`](.agents/memory/README.md) — git-ignored, never committed.
-Check its `INDEX.md` for notes on decisions, project state, environment quirks,
-and open threads. Add or update entries there (dated, one file per topic) rather
-than losing context between sessions. Never store secrets in it.
+Several agents work this repository at once, each in its own git worktree. The
+worktrees isolate the filesystem and nothing else: there is one `.git`, one
+sccache, one disk, one FoundationDB dev cluster, one set of harness ports, one
+GitHub remote. Everything below exists because of that asymmetry.
 
-## Device-local agent protocol (if present)
+**Be clear about what a collision actually is.** Two agents editing the same
+file in two worktrees do *not* clobber each other — separate checkouts, separate
+inodes, and neither can see the other's buffer. What they produce is a merge
+conflict, discovered later and further from the decision that caused it. That is
+worth knowing about in advance, but it is not a reason to stop. The things that
+genuinely cannot be shared are elsewhere, and they are the ones worth blocking
+on: the `.fdb-dev/` cluster, a harness's fixed ports, `git push` and branch
+deletion, `git worktree add/remove`, and the disk itself.
 
-Some machines carry a local protocol for delegating work to other coding agents.
-It is **not** part of this repository — like `.agents/memory/`, it is git-ignored
-and machine-specific, and most checkouts will not have it.
+So this arrangement is deliberately two-speed: **lanes are advisory, leases are
+exclusive.**
 
-**Codex-to-Codex exception.** When a Codex agent delegates to another Codex
-agent, do not use the `cx` tool or this device-local protocol. Use Codex-native
-subagents, tasks, and workflows instead. This exception takes precedence over
-the delegation instructions below. Still use `sccache` and Git worktrees when
-they are appropriate to the task; this exception only bypasses the `cx` tool
-and protocol.
+### Where the shared state lives
 
-**If `.agents/protocol.md` exists, read it before delegating any task**; it is
-authoritative for how work is handed off on that machine. It typically defines
-a driver under `.agents/bin/`, a worktree-per-task layout, a document bus for
-briefs and reports, and the rule that a delegated agent's self-reported
-verification is re-run by the orchestrator rather than trusted.
+In the git *common* directory — `$(git rev-parse --path-format=absolute
+--git-common-dir)`, which every worktree of this clone resolves to the same
+absolute path, and which is never committed. Nowhere else has both properties: a
+tracked path is copied per worktree and eventually committed by accident, and a
+git-ignored path is per-worktree too.
 
-If it is absent, there is nothing to do — do the work directly, and do not
-invent a protocol or create `.agents/` scaffolding to imitate one.
+That last point was a live bug rather than a hypothetical. `.agents/memory/` is
+git-ignored, so it existed only in whichever checkout created it and was
+invisible from every other worktree — machine-local memory that was really
+main-checkout-local memory. It now lives in the common directory, with
+`.agents/memory` as a symlink into it. Run `scripts/agent-lane.sh init` once in
+a new worktree to create that link.
+
+### The driver
+
+`scripts/agent-lane.sh` is committed, so every worktree gets a copy — the same
+reason `.cargo/config.toml` is committed.
+
+```
+scripts/agent-lane.sh register --task "..." --paths crates/orrery_witness/,p1-swarm/
+scripts/agent-lane.sh list                   # who else is working, on what, where
+scripts/agent-lane.sh check <path>...        # does anyone else claim this?
+scripts/agent-lane.sh lease acquire fdb-dev  # exclusive; fails if someone holds it
+scripts/agent-lane.sh lease release fdb-dev
+```
+
+A lane goes stale after 45 minutes without a heartbeat and is reaped
+automatically, taking any lease it held with it. A lease that outlives its
+holder is the failure mode that makes the next agent wait on nobody, so releases
+are not left to good manners.
+
+### What is automatic
+
+`.claude/settings.json` wires four hooks through `scripts/agent-lane-hook.sh`:
+
+| Hook | Does |
+|---|---|
+| `SessionStart` | registers the lane and injects the current lane table into context |
+| `UserPromptSubmit` | heartbeats |
+| `PreToolUse` on `Edit`/`Write`/`NotebookEdit` | if another live lane claims the path, asks before proceeding |
+| `SessionEnd` | releases the lane and its leases |
+
+The pre-edit hook returns `ask`, never `deny`, for the reason above: the edit is
+safe, the merge is the question, and that judgement is not a hook's to make.
+
+Every hook is best-effort and exits zero on any failure. A coordination ledger
+that can block work is worse than no ledger.
+
+**What is not automatic is the useful part.** The hook registers a lane with no
+task and no paths, which tells a peer nothing. Declare them yourself once you
+know what you are doing:
+
+```
+scripts/agent-lane.sh register --task "P4: bound witness bandwidth at 32 peers" \
+  --paths crates/orrery_witness/,p1-swarm/,docs/03-replication.md
+```
+
+### Talking to another agent directly
+
+Sessions on this machine can message each other natively — `ListAgents` to see
+them, `SendMessage` to write to one by name. Use it when the ledger is not
+enough: you need a decision from whoever holds a lease, you are about to change
+an interface they are building against, or their lane says they are somewhere
+you are heading.
+
+Prefer the ledger for anything a peer can read at their own pace. A message
+interrupts; a lane does not.
+
+### Handing work to a subagent
+
+Within one session, use the `Agent` tool and its worktree isolation rather than
+inventing a protocol. Subagents inherit this repository's hooks, so a subagent
+that edits into another agent's lane is caught by the same check.
+
+### Codex delegation — suspended
+
+The `cx` tool and Codex-to-Codex delegation are **out of credits and disabled**.
+Do not route work to Codex, and do not add a fallback that tries. Revisit after
+Thursday evening; until then this section is the whole story, and work that
+would have been delegated is done here.
+
+### Device-local memory
+
+Durable, machine-local context lives in `.agents/memory/` — a symlink into the
+shared store, git-ignored, never committed. Check its `INDEX.md` for notes on
+decisions, project state, environment quirks, and open threads. Add or update
+entries there (dated, one file per topic) rather than losing context between
+sessions. Never store secrets in it.
+
+Notes written there are now read by every agent on this machine, which is the
+point, and worth a sentence of care: write what a peer would need, not what you
+would need.

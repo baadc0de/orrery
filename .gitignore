@@ -18,10 +18,12 @@ p2-abba-*/
 p2-gateway-*/
 p3-island-*/
 
-# Device-local agent memory (never committed — lives only on this machine)
-.agents/memory/
+# Device-local agent state: memory, lanes and leases. Never committed.
+# The real store is the git common directory (see scripts/agent-lane.sh);
+# .agents/memory is a symlink into it, so every worktree sees one set of notes.
+.agents/
 
 # Local single-node FoundationDB dev cluster (slice 3 test harness).
 # Never committed. See .fdb-dev/README.md.
 .fdb-dev/
-opencode.json
+.omo
