@@ -30,10 +30,12 @@
 
 use bevy_app::prelude::*;
 use bevy_ecs::prelude::*;
+use bevy_time::{Real, Time};
 use bytes::Bytes;
 
 use orrery_core::store::AuthorityLog;
 use orrery_core::{log::HeadTransition, Ruleset};
+use orrery_net::budget::{Bandwidth, RateMeter, UploadBudget};
 use orrery_net::channels::{decode_witness, encode_witness, Channel};
 use orrery_net::peer_link::payload_budget;
 use orrery_net::{IslandMembership, PeerPacket, SendPacket};
@@ -189,6 +191,14 @@ where
         app.init_resource::<AuthoredLog>()
             .init_resource::<WitnessLinkCounters>()
             .init_resource::<WitnessSet>()
+            .init_resource::<RepairBudget>()
+            .init_resource::<PendingRepairs>()
+            // Declared rather than assumed: serving repairs meters against the
+            // peer upload budget and needs a clock, and a host that adds this
+            // plugin without the net stack should get working defaults instead
+            // of a system that fails parameter validation at runtime.
+            .init_resource::<UploadBudget>()
+            .init_resource::<Time<Real>>()
             .add_message::<PublishFrame>()
             .add_message::<PublishClaim>()
             .add_message::<Witnessed>()
@@ -436,6 +446,55 @@ fn deliver_frame<R: Ruleset + Send + Sync + 'static>(
     }
 }
 
+/// The share of a peer's upload budget that serving repairs may spend.
+///
+/// Repairs ride the reliable lane and are never shed — a dropped repair turns
+/// one lost datagram into a permanent hole. But "never shed" is not "never
+/// bounded": measured at sixteen peers with a stalling quarter, unbounded
+/// repair serving reached 8.7 Mbps against a 1 Mbps budget and shed 26 630
+/// *replication* packets to pay for it. One peer's hitch became everyone's
+/// problem, which is backwards.
+///
+/// Metering and queueing instead preserves the guarantee the design rests on —
+/// a queued repair still arrives, just later — while capping what one stalling
+/// peer costs its island. The requester side already tolerates the delay: it
+/// holds a single outstanding repair with a backoff and escalates to
+/// [`crate::WitnessSignal::Stalled`] only after several attempts.
+///
+/// Fifteen percent is a starting point, and raising it does **not** help:
+/// measured at 8 peers, moving the share to 60% took stalled subjects from 28
+/// to 51 and detected gaps from 328 to 726. More repair bandwidth puts more
+/// repairs in flight, which crowds the state lane, which opens more holes. The
+/// path amplifies under load, so the answer is fewer round trips (a stream
+/// lane), not a larger slice. docs/03-replication.md §9.3 reserves twenty
+/// percent for the proxy floor and this sits beside it.
+#[derive(Debug, Clone, Copy, Resource)]
+pub struct RepairBudget {
+    /// Fraction of the peer upload budget repairs may spend.
+    pub share: f32,
+    /// Most requests held while waiting for budget.
+    pub queue_limit: usize,
+}
+
+impl Default for RepairBudget {
+    fn default() -> Self {
+        Self {
+            share: 0.15,
+            queue_limit: 64,
+        }
+    }
+}
+
+/// Repairs accepted but not yet paid for.
+#[derive(Debug, Default, Resource)]
+pub struct PendingRepairs {
+    queue: std::collections::VecDeque<RepairRequest>,
+    /// Requests dropped because the queue was full.
+    pub overflowed: u64,
+    /// Requests waiting on budget right now.
+    pub deferred: u64,
+}
+
 /// A repair this peer has been asked to serve.
 #[derive(Debug, Clone, Message)]
 pub struct RepairRequest {
@@ -445,34 +504,87 @@ pub struct RepairRequest {
     pub request: LogRangeRequest,
 }
 
-/// Answers repair requests from the local authority log.
+/// Answers repair requests from the local authority log, within budget.
+///
+/// Requests that do not fit this frame's allowance are queued rather than
+/// dropped: the reliable lane promises a repair *arrives*, not that it arrives
+/// immediately, and the requester holds one outstanding repair on a backoff
+/// precisely so it can wait.
+///
+/// # Why this needs so many round trips
+///
+/// Each answer is capped at one datagram, so refilling a one-second hole takes
+/// roughly twenty exchanges *per witness*, and the same frames are served once
+/// per witness. D3 puts control and bulk traffic on reliable **streams**, which
+/// have no such cap — but `orrery_net`'s peer lane is datagram-only today, a
+/// deferral noted when the witness transport landed. That, rather than this
+/// budget, is the binding constraint on repair throughput.
+#[allow(clippy::too_many_arguments)]
 pub fn serve_repair_requests(
     mut requests: MessageReader<RepairRequest>,
     log: Res<AuthoredLog>,
+    upload: Res<UploadBudget>,
+    repair: Res<RepairBudget>,
+    time: Res<Time<Real>>,
+    mut pending: ResMut<PendingRepairs>,
+    mut meter: Local<Option<RateMeter>>,
     mut out: MessageWriter<SendPacket>,
     mut counters: ResMut<WitnessLinkCounters>,
 ) {
     for asked in requests.read() {
+        if pending.queue.len() >= repair.queue_limit {
+            // A peer that cannot serve is exactly the peer that gets asked
+            // repeatedly. Drop the *oldest*: the requester's own backoff has
+            // most likely superseded it already.
+            pending.queue.pop_front();
+            pending.overflowed += 1;
+        }
+        pending.queue.push_back(asked.clone());
+    }
+
+    let now = time.elapsed();
+    let allowance = UploadBudget {
+        sustained: Bandwidth::from_bits_per_sec(
+            (upload.sustained.bits_per_sec() as f64 * f64::from(repair.share)) as u64,
+        ),
+        window: upload.window,
+    };
+    let meter = meter.get_or_insert_with(|| RateMeter::new(allowance.window));
+
+    while let Some(asked) = pending.queue.front().cloned() {
         let served = log
             .0
             .serve_range(&asked.request, payload_budget(ASSUMED_MTU));
+        // An empty answer is still sent. Silence is indistinguishable from a
+        // dropped repair, and a witness that cannot tell "I have nothing" from
+        // "you ignored me" would eventually report an honest peer for the
+        // second when it was the first.
+        let payload = encode_witness(&WitnessMsg::RangeResponse {
+            response: served.response.clone(),
+            heads: served.heads.clone(),
+            resume_from: served.resume_from,
+        });
+
+        if meter.would_exceed(now, payload.len() as u64, allowance) {
+            // Out of allowance for this window. The request stays queued and is
+            // served once budget frees up: the reliable lane promises a repair
+            // *arrives*, not that it arrives immediately, and the requester is
+            // sitting on a backoff rather than spinning.
+            break;
+        }
+        pending.queue.pop_front();
+        meter.record(now, payload.len() as u64);
+
         if served.response.frames.is_empty() {
             counters.repairs_unservable += 1;
         } else {
             counters.repairs_served += 1;
         }
-        // An empty answer is still sent. Silence is indistinguishable from a
-        // dropped repair, and a witness that cannot tell "I have nothing" from
-        // "you ignored me" would eventually report an honest peer for the
-        // second when it was the first.
         out.write(SendPacket {
             to: asked.from,
             channel: Channel::Control,
-            payload: Bytes::from(encode_witness(&WitnessMsg::RangeResponse {
-                response: served.response,
-                heads: served.heads,
-                resume_from: served.resume_from,
-            })),
+            payload: Bytes::from(payload),
         });
     }
+    pending.deferred = pending.queue.len() as u64;
 }

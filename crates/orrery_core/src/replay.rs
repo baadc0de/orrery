@@ -208,7 +208,9 @@ impl<R: Ruleset> ReplayHarness<R> {
                     // themselves `CoreInput`s to feed the step.
                     if !matches!(
                         record.source,
-                        RecordSource::Player { .. } | RecordSource::InboundEvent { .. }
+                        RecordSource::OwnPlayer { .. }
+                            | RecordSource::Player { .. }
+                            | RecordSource::InboundEvent { .. }
                     ) {
                         continue;
                     }

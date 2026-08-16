@@ -186,13 +186,18 @@ pub struct SignalTally {
     pub claim_mismatches: u64,
     /// Reports assembled. Always zero in shadow mode; a false positive here.
     pub reports: u64,
+    /// Subjects reported as stalled — a hole never filled.
+    ///
+    /// A false positive in this swarm: every bot answers repairs, so a stall
+    /// means the repair path could not keep up, not that a peer refused.
+    pub stalled: u64,
 }
 
 impl SignalTally {
     /// Signals that would accuse an honest peer.
     #[must_use]
     pub fn false_positives(&self) -> u64 {
-        self.invariant_breaches + self.claim_mismatches + self.reports
+        self.invariant_breaches + self.claim_mismatches + self.reports + self.stalled
     }
 }
 
@@ -683,16 +688,12 @@ impl Bot {
     /// moved ahead of `step_core`.
     pub fn publish_claim(&mut self, tick: u64) {
         let state = self.executor.state(self.entity).expect("seeded").clone();
-        let sending = self.profile.is_sending(tick);
         let Some(chain) = &mut self.chain else {
             return;
         };
         let Some(claim) = chain.cut_claim(tick, &state) else {
             return;
         };
-        if !sending {
-            return;
-        }
         self.app
             .world_mut()
             .resource_mut::<bevy_ecs::message::Messages<PublishClaim>>()
@@ -704,20 +705,22 @@ impl Bot {
 
     /// Publish this tick's frame, if one is due.
     ///
-    /// A stalling profile keeps authoring and keeps its log intact; it simply
-    /// does not hand the frame to the plugin, which is what a client hitch looks
-    /// like from outside. Every watcher then sees a gap it must repair.
+    /// A stalling profile still authors, retains and publishes: a client hitch
+    /// is a *transport* failure, not a logging one. The peer keeps its log and
+    /// can answer for it; what fails is the send, which the swarm models by
+    /// dropping that peer's outbound packets for the window.
+    ///
+    /// Withholding the frame from the plugin instead — the harness's first
+    /// attempt — left the authority unable to serve the very frames it had
+    /// hidden, so twenty-eight repairs came back unservable and the witnesses
+    /// escalated against a peer that had done nothing wrong.
     pub fn publish(&mut self, tick: u64) {
         let Some(chain) = &mut self.chain else {
             return;
         };
-        let sending = self.profile.is_sending(tick);
         let Some(authored) = chain.cut_frame(tick) else {
             return;
         };
-        if !sending {
-            return;
-        }
         self.app
             .world_mut()
             .resource_mut::<bevy_ecs::message::Messages<PublishFrame>>()
@@ -739,6 +742,11 @@ impl Bot {
         for witnessed in messages.drain() {
             match witnessed.signal {
                 WitnessSignal::Gap(_) => self.signals.gaps += 1,
+                // A subject that never fills a hole. Against this swarm that is
+                // a false positive like any other — every bot answers repairs,
+                // so a stall here means the repair path failed to keep up, not
+                // that anyone refused.
+                WitnessSignal::Stalled { .. } => self.signals.stalled += 1,
                 WitnessSignal::InvariantBreach { .. } => self.signals.invariant_breaches += 1,
                 WitnessSignal::ClaimMismatch { .. } => self.signals.claim_mismatches += 1,
                 WitnessSignal::Report(_) => self.signals.reports += 1,
@@ -756,6 +764,24 @@ impl Bot {
     #[must_use]
     pub fn entity(&self) -> PersistId {
         self.entity
+    }
+
+    /// Repair requests this peer dropped for want of queue space.
+    #[must_use]
+    pub fn repairs_overflowed(&self) -> u64 {
+        self.app
+            .world()
+            .get_resource::<orrery_witness::plugin::PendingRepairs>()
+            .map_or(0, |pending| pending.overflowed)
+    }
+
+    /// Repair requests this peer could not answer from its retained log.
+    #[must_use]
+    pub fn repairs_unservable(&self) -> u64 {
+        self.app
+            .world()
+            .get_resource::<orrery_witness::plugin::WitnessLinkCounters>()
+            .map_or(0, |c| c.repairs_unservable)
     }
 
     /// Where this peer's inbound state packets went.

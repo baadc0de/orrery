@@ -64,5 +64,6 @@ pub use plugin::{
 };
 pub use report::{sign_report, verify_report, ReportError};
 pub use witness::{
-    Observation, Watch, Witness, WitnessConfig, WitnessCounters, WitnessError, WitnessSignal,
+    Catchup, Observation, Watch, Witness, WitnessConfig, WitnessCounters, WitnessError,
+    WitnessSignal,
 };

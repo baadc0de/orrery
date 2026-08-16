@@ -68,6 +68,13 @@ pub struct WitnessCounters {
     pub reports_raised: u64,
     /// Reports actually filed, always zero in shadow mode.
     pub reports_filed: u64,
+    /// Subjects that failed to fill a hole across repeated repairs.
+    pub stalled: u64,
+    /// Claim comparisons skipped because the witness was catching up.
+    ///
+    /// Not a fault on anyone's part — it is the count of judgements correctly
+    /// *not* made, and a witness reporting many of them is one on a bad link.
+    pub judgements_deferred: u64,
 }
 
 /// Why an ingest was refused.
@@ -99,6 +106,35 @@ impl core::fmt::Display for WitnessError {
 
 impl core::error::Error for WitnessError {}
 
+/// A subject whose chain has a hole the witness is waiting to have filled.
+///
+/// **A witness in this state does not judge.** Its own re-execution stopped at
+/// the hole, so every tick after it is unknown; comparing a claim against a
+/// trajectory the witness never computed is how an honest peer that dropped a
+/// packet gets accused. The design says as much — a gap is a
+/// `LogRangeRequest`, never an accusation — but leaving that to fall out of
+/// "the hashes happen to be missing" makes it an accident rather than a rule.
+///
+/// The loophole this deliberately does *not* leave open: a cheat could stall
+/// forever to stay unjudged. That is what [`Catchup::attempts`] and
+/// [`WitnessSignal::Stalled`] are for — persistent failure to fill a hole is
+/// itself reportable, so the state has a floor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Catchup {
+    /// Subject tick at which the hole was first noticed.
+    pub since: u64,
+    /// Repairs asked for and not yet answered.
+    pub attempts: u32,
+    /// Whether this episode has already been escalated.
+    ///
+    /// An escalation is a statement about a *situation*, not about the packet
+    /// that happened to reveal it. Without this the witness re-raises on every
+    /// subsequent frame that fails to chain — thirty-six times per hole in a
+    /// measured run — and an operator counting reports would see the retry rate
+    /// rather than the number of subjects in trouble.
+    pub reported: bool,
+}
+
 /// Something the caller must act on.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WitnessSignal {
@@ -121,6 +157,19 @@ pub enum WitnessSignal {
         /// The claim tick the disagreement was found at.
         at: Tick,
     },
+    /// A subject has failed to fill a hole across repeated repairs.
+    ///
+    /// Distinct from [`WitnessSignal::Gap`], which is a question. This is the
+    /// point at which not answering has itself become the finding — the only
+    /// thing that stops "stall forever" being a way to avoid being judged.
+    Stalled {
+        /// The entity whose chain is stuck.
+        entity: PersistId,
+        /// How long it has been stuck, in the subject's own ticks.
+        since: u64,
+        /// Repairs asked for without the hole closing.
+        attempts: u32,
+    },
     /// A report was assembled. `None` in shadow mode: the witness still did
     /// every check and still counted, but nothing leaves.
     Report(Option<Box<DiscrepancyReport>>),
@@ -142,14 +191,8 @@ struct Watched<S> {
     /// Tick of the claim this watch was anchored at — the earliest point a
     /// repair could usefully start from.
     anchor_tick: u64,
-    /// The tick a repair was last asked for, if one is outstanding.
-    ///
-    /// Without this a witness re-asks on *every* frame that fails to chain, and
-    /// live frames keep arriving throughout the catch-up: one hitch turns into
-    /// hundreds of overlapping requests, each making the authority scan and
-    /// re-serialise its retained window. A swarm with stalling peers ran
-    /// seventy times slower than one without, entirely here.
-    repair_pending: Option<u64>,
+    /// Set while this subject's chain has a hole being repaired.
+    catchup: Option<Catchup>,
     head: ChainHash,
     /// Whether `head` reflects a verified fold, or is still the value a claim
     /// seeded. Until the first frame lands there is nothing to detect a gap
@@ -206,6 +249,15 @@ impl<R: Ruleset> Witness<R> {
     /// request piling on, short enough that a genuinely lost repair is retried
     /// well inside the 180-tick adjudication window.
     const REPAIR_TIMEOUT_TICKS: u64 = 60;
+
+    /// Repairs asked for without the hole closing before the subject is
+    /// reported as stalled rather than merely behind.
+    ///
+    /// The backoff is linear in attempts, so this is roughly fifteen seconds of
+    /// the subject's timeline — comfortably longer than a rate-limited refill
+    /// of a full retention window, and well inside it a peer that simply will
+    /// not answer stops being given the benefit of the doubt.
+    const MAX_REPAIR_ATTEMPTS: u32 = 5;
 
     /// A witness that builds a fresh `Ruleset` whenever it needs one.
     ///
@@ -269,7 +321,7 @@ impl<R: Ruleset> Witness<R> {
             Watched {
                 subject: watch.subject,
                 anchor_tick: watch.anchor.tick.0,
-                repair_pending: None,
+                catchup: None,
                 head: watch.anchor.input_head,
                 anchored: false,
                 last_sample: None,
@@ -317,6 +369,17 @@ impl<R: Ruleset> Witness<R> {
                 })
             }
         }
+    }
+
+    /// Whether this witness is waiting on a repair for `entity`, and since when.
+    ///
+    /// A witness in this state is knowingly behind and does not judge — see
+    /// [`Catchup`].
+    #[must_use]
+    pub fn catching_up(&self, entity: PersistId) -> Option<Catchup> {
+        self.watched
+            .get(&entity)
+            .and_then(|watched| watched.catchup)
     }
 
     /// Whether this witness is following `entity`.
@@ -402,9 +465,34 @@ impl<R: Ruleset> Witness<R> {
                 // subject's own timeline have passed without the hole closing,
                 // which is what keeps a *lost* repair from stalling the witness
                 // forever.
-                if let Some(asked_at) = watched.repair_pending {
-                    if frame.first_tick.0 < asked_at + Self::REPAIR_TIMEOUT_TICKS {
+                let now = frame.first_tick.0;
+                if let Some(catchup) = watched.catchup {
+                    if now
+                        < catchup.since + Self::REPAIR_TIMEOUT_TICKS * u64::from(catchup.attempts)
+                    {
                         return Ok(Vec::new());
+                    }
+                    if catchup.attempts >= Self::MAX_REPAIR_ATTEMPTS {
+                        if catchup.reported {
+                            // Already said. Repeating it on every frame adds
+                            // nothing an operator can act on.
+                            return Ok(Vec::new());
+                        }
+                        if let Some(watched) = self.watched.get_mut(&entity) {
+                            if let Some(catchup) = watched.catchup.as_mut() {
+                                catchup.reported = true;
+                            }
+                        }
+                        // Asking again has stopped being the answer. Not
+                        // filling a hole across this many chances is the
+                        // finding — and is what keeps "stall forever" from
+                        // being a way to stay unjudged.
+                        self.counters.stalled += 1;
+                        return Ok(vec![WitnessSignal::Stalled {
+                            entity,
+                            since: catchup.since,
+                            attempts: catchup.attempts,
+                        }]);
                     }
                 }
                 self.counters.gaps_detected += 1;
@@ -422,9 +510,21 @@ impl<R: Ruleset> Witness<R> {
                     .keys()
                     .next_back()
                     .map_or(watched.anchor_tick, |tick| tick + 1);
-                let asked_at = frame.first_tick.0;
                 if let Some(watched) = self.watched.get_mut(&entity) {
-                    watched.repair_pending = Some(asked_at);
+                    watched.catchup = Some(match watched.catchup {
+                        // Same hole, another attempt: the clock runs from when
+                        // it was *first* noticed, so a subject cannot reset its
+                        // own deadline by making the witness ask again.
+                        Some(catchup) => Catchup {
+                            attempts: catchup.attempts + 1,
+                            ..catchup
+                        },
+                        None => Catchup {
+                            since: now,
+                            attempts: 1,
+                            reported: false,
+                        },
+                    });
                 }
                 return Ok(vec![WitnessSignal::Gap(LogRangeRequest {
                     entity,
@@ -469,7 +569,9 @@ impl<R: Ruleset> Witness<R> {
             for record in &slice.records {
                 if !matches!(
                     record.source,
-                    RecordSource::Player { .. } | RecordSource::InboundEvent { .. }
+                    RecordSource::OwnPlayer { .. }
+                        | RecordSource::Player { .. }
+                        | RecordSource::InboundEvent { .. }
                 ) {
                     continue;
                 }
@@ -503,8 +605,9 @@ impl<R: Ruleset> Witness<R> {
                     watched.head = transition.head;
                     watched.anchored = true;
                     // The chain moved, so whatever hole was being repaired is
-                    // closed as far as this witness can tell.
-                    watched.repair_pending = None;
+                    // closed as far as this witness can tell, and judging can
+                    // resume.
+                    watched.catchup = None;
                 }
             }
         }
@@ -591,6 +694,15 @@ impl<R: Ruleset> Witness<R> {
     /// would make every honest authority look like a cheat.
     fn check_pending_claims(&mut self, entity: PersistId) -> Option<WitnessSignal> {
         let watched = self.watched.get(&entity)?;
+        // A witness with a hole in the chain has an incomplete trajectory, and
+        // comparing a claim against ticks it never executed is precisely how an
+        // honest peer that dropped a packet gets accused. It falls out of the
+        // missing hashes anyway; saying it here makes it a rule rather than an
+        // accident, and gives the deferral a name in the counters.
+        if watched.catchup.is_some() {
+            self.counters.judgements_deferred += 1;
+            return None;
+        }
         let mut diverged: Option<Tick> = None;
         for (tick, claim) in &watched.claims {
             let Some(previous) = tick.checked_sub(1) else {

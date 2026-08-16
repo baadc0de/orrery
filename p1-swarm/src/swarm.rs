@@ -78,6 +78,16 @@ pub struct PeerReport {
     pub gaps: u64,
     /// Signals this peer raised that would accuse an honest island-mate.
     pub false_positives: u64,
+    /// Of those, stage-1 invariant breaches.
+    pub invariant_breaches: u64,
+    /// Of those, re-execution disagreeing with a signed claim.
+    pub claim_mismatches: u64,
+    /// Of those, subjects whose hole was never filled.
+    pub stalled: u64,
+    /// Repair requests this peer dropped for want of queue space.
+    pub repairs_overflowed: u64,
+    /// Repair requests this peer could not answer from its retained log.
+    pub repairs_unservable: u64,
     /// Replica entities held at the end of the run.
     pub replicas: usize,
     /// Of those, how many carried an interest tag.
@@ -325,6 +335,19 @@ impl Swarm {
     fn collect_sends(&mut self, tick: u64) {
         for index in 0..self.bots.len() {
             let node = self.bots[index].node;
+            if !self.bots[index].profile.is_sending(tick) {
+                // The peer is hitching. Its packets are built and then never
+                // leave — which is what a client stall actually is, and it
+                // leaves the peer's own log intact so it can still answer for
+                // itself when its witnesses come asking.
+                let world = self.bots[index].app.world_mut();
+                let mut query =
+                    world.query::<(&orrery_net::plugin::Peer, &mut aeronet_io::Session)>();
+                for (_, mut session) in query.iter_mut(world) {
+                    session.send.clear();
+                }
+                continue;
+            }
             let mut outbound: Vec<(NodeId, Bytes)> = Vec::new();
             {
                 let world = self.bots[index].app.world_mut();
@@ -586,6 +609,11 @@ impl Swarm {
                     profile: bot.profile.name(),
                     gaps: bot.signals.gaps,
                     false_positives: bot.signals.false_positives(),
+                    invariant_breaches: bot.signals.invariant_breaches,
+                    claim_mismatches: bot.signals.claim_mismatches,
+                    stalled: bot.signals.stalled,
+                    repairs_overflowed: bot.repairs_overflowed(),
+                    repairs_unservable: bot.repairs_unservable(),
                     replicas,
                     tagged,
                     proxied,
