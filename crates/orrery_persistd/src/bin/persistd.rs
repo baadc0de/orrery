@@ -54,6 +54,7 @@ use orrery_persistd::{
 };
 #[cfg(feature = "fdb")]
 use orrery_persistd::{FdbContext, FdbIntentExecutor};
+use orrery_protocol::metrics::{SERIES_GATEWAY_BULK_SERVER, SERIES_JOURNAL_COMMIT};
 use orrery_protocol::{
     CellId, Epoch, GridId, IssuerKey, IssuerKeyId, NodeId, REASON_VALIDATION_FAILED,
 };
@@ -314,7 +315,7 @@ fn write_gateway_bulk_latency(
             &mut writer,
             &serde_json::json!({
                 "type": "sample_batch",
-                "series": "gateway_bulk_server_ms",
+                "series": SERIES_GATEWAY_BULK_SERVER,
                 "value_us": sample.value_us,
                 "count": sample.count,
             }),
@@ -400,7 +401,7 @@ fn write_journal_metric_batches(
             &mut writer,
             &serde_json::json!({
                 "type": "sample_batch",
-                "series": "journal_commit_ms",
+                "series": SERIES_JOURNAL_COMMIT,
                 "value_us": sample.value_us,
                 "count": sample.count,
             }),

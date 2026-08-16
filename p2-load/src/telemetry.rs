@@ -19,19 +19,17 @@ use serde::Serialize;
 
 use orrery_persist_client::latency::LatencyHistogram;
 
-/// The four D16 series keys — the wire contract with `p2-dashboard`.
+/// The D16 series keys — the wire contract with `p2-dashboard` — re-exported
+/// from the one definition in `orrery_protocol::metrics`. The rig used to
+/// declare its own four; that copy is gone.
+///
 /// `journal_commit_ms` is server-internal (D16): the rig has no wire access
-/// to it, so no samples are ever drained under this key — the gateway
-/// operator appends them out of band (see README). The constant exists so
-/// the contract's four names live in one place.
-#[allow(dead_code)]
-pub const SERIES_JOURNAL_COMMIT: &str = "journal_commit_ms";
-/// Client-observed bulk ack (D16: p99 < 5 ms).
-pub const SERIES_BULK_ACK: &str = "bulk_ack_ms";
-/// Intent commit (D16: p99 < 10 ms).
-pub const SERIES_INTENT_COMMIT: &str = "intent_commit_ms";
-/// Area first page-in (D16: < 50 ms).
-pub const SERIES_AREA_FIRST_PAGE: &str = "area_first_page_ms";
+/// to it, so no samples are ever drained under that key — the gateway
+/// operator appends them out of band (see README).
+#[allow(unused_imports)]
+pub use orrery_persist_client::latency::{
+    SERIES_AREA_FIRST_PAGE, SERIES_BULK_ACK, SERIES_INTENT_COMMIT, SERIES_JOURNAL_COMMIT,
+};
 
 #[allow(dead_code)]
 fn now_ms() -> u64 {
@@ -201,27 +199,22 @@ impl TelemetrySink {
 /// histogram's tracked max — the same value the histogram itself reports for
 /// a percentile landing in overflow.
 ///
-/// The boundary table mirrors the client crate's (kept in lockstep with
-/// `orrery_persist_client/src/latency.rs`; both cite the same D16 rationale).
-/// The client crate does not export the table, and a percentile landing in
-/// the overflow bucket reports the tracked max — so the round-trip through
-/// this table lands the consumer's histogram in the same bucket the rig
-/// recorded, which is what "percentiles agree on both sides of the wire"
-/// reduces to.
+/// The boundary table used to be copied here, deliberately, because the
+/// client crate did not export it. It does now
+/// (`orrery_protocol::metrics`, re-exported through
+/// `orrery_persist_client::latency`), so this is the shared rule and not a
+/// mirror of it: the round trip through it lands the consumer's histogram in
+/// the same bucket the rig recorded, which is what "percentiles agree on both
+/// sides of the wire" reduces to.
 fn bucket_upper_us(hist: &LatencyHistogram, index: usize) -> u64 {
-    const BOUNDARIES_US: [u64; 22] = [
-        50, 100, 200, 500, 1_000, 2_000, 3_000, 5_000, 7_000, 10_000, 15_000, 20_000, 30_000,
-        50_000, 75_000, 100_000, 150_000, 200_000, 300_000, 500_000, 750_000, 1_000_000,
-    ];
-    BOUNDARIES_US
-        .get(index)
-        .copied()
-        .unwrap_or_else(|| hist.max().map_or(0, |d| d.as_micros() as u64))
+    let observed_max_us = hist.max().map_or(0, |d| d.as_micros() as u64);
+    orrery_persist_client::latency::bucket_upper_us(index, observed_max_us)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use orrery_persist_client::latency::{bucket_index, NUM_LATENCY_BUCKETS};
     use std::time::Duration;
 
     #[test]
@@ -231,14 +224,14 @@ mod tests {
         for _ in 0..10 {
             hist.record(Duration::from_micros(1_500));
         }
-        assert_eq!(sink.take_delta(SERIES_BULK_ACK, &hist), vec![(2_000, 10)]);
+        assert_eq!(sink.take_delta(SERIES_BULK_ACK, &hist), vec![(1_500, 10)]);
         // A second drain with no new samples emits nothing.
         assert!(sink.take_delta(SERIES_BULK_ACK, &hist).is_empty());
         // New samples drain on the next pass.
         for _ in 0..5 {
             hist.record(Duration::from_micros(1_500));
         }
-        assert_eq!(sink.take_delta(SERIES_BULK_ACK, &hist), vec![(2_000, 5)]);
+        assert_eq!(sink.take_delta(SERIES_BULK_ACK, &hist), vec![(1_500, 5)]);
     }
 
     #[test]
@@ -264,7 +257,7 @@ mod tests {
             source.record(Duration::from_micros(12_000));
         }
         let second = sink.take_delta(SERIES_BULK_ACK, &source);
-        assert_eq!(second, vec![(2_000, 5), (15_000, 2)]);
+        assert_eq!(second, vec![(1_500, 5), (15_000, 2)]);
         replay_batches(&mut reconstructed, &second);
 
         assert_eq!(reconstructed.total(), source.total());
@@ -287,18 +280,37 @@ mod tests {
 
     #[test]
     fn bucket_upper_bound_mirrors_histogram_boundaries() {
-        // The 2 000 µs boundary is the D16 journal-commit bucket edge
-        // (latency.rs boundaries table). A 1 500 µs sample must serialize at
-        // the 2 000 µs upper bound — the same value the histogram's p50
-        // reports for it — so the gate's reconstruction and the rig's live
-        // view agree bucket-for-bucket.
+        // A 1 500 µs sample must serialize at the upper bound of the bucket
+        // it landed in — the same value the histogram's own p50 reports for
+        // it — so the gate's reconstruction and the rig's live view agree
+        // bucket-for-bucket. On the shared lattice that bound is 1 500 µs,
+        // not the 2 000 µs D16 threshold.
         let mut hist = LatencyHistogram::new();
         hist.record(Duration::from_micros(1_500));
-        assert_eq!(hist.p50().as_micros(), 2_000);
-        // The bucket index of the 1 500 µs sample is the first boundary
-        // ≥ 1 500, which is 1 000 < 1 500 ≤ 2 000 → index 5.
-        assert_eq!(bucket_upper_us(&hist, 5), 2_000);
-        // The overflow bucket (index 22) carries the histogram max.
-        assert_eq!(bucket_upper_us(&hist, 22), 1_500);
+        assert_eq!(hist.p50().as_micros(), 1_500);
+        assert_eq!(
+            bucket_upper_us(&hist, bucket_index(1_500)),
+            hist.p50().as_micros() as u64
+        );
+        // The overflow bucket carries the histogram max.
+        assert_eq!(bucket_upper_us(&hist, NUM_LATENCY_BUCKETS - 1), 1_500);
+    }
+
+    #[test]
+    fn every_drained_bucket_replays_into_the_bucket_it_came_from() {
+        // The producer/consumer contract in one assertion: whatever the rig
+        // drains, the gate re-records into the same bucket, so the two report
+        // the same percentile.
+        let sink = TelemetrySink::new();
+        let mut source = LatencyHistogram::new();
+        for micros in [40, 900, 1_100, 1_600, 4_200, 9_000, 44_000, 1_400_000] {
+            source.record(Duration::from_micros(micros));
+        }
+        let batches = sink.take_delta(SERIES_BULK_ACK, &source);
+        let mut reconstructed = LatencyHistogram::new();
+        replay_batches(&mut reconstructed, &batches);
+        assert_eq!(reconstructed.total(), source.total());
+        assert_eq!(reconstructed.p50(), source.p50());
+        assert_eq!(reconstructed.p99(), source.p99());
     }
 }

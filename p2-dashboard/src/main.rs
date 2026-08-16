@@ -11,16 +11,25 @@
 //! | `intent_commit_ms`   | < 10 ms                     |
 //! | `area_first_page_ms` | < 50 ms                     |
 //!
+//! A fifth series, `gateway_bulk_server_ms`, is the server-side half of
+//! `bulk_ack_ms` that persistd appends to the same artifact. D16 sets no
+//! target for it, so it is folded and reported for attribution and never
+//! contributes to the verdict — present or absent. It used to be silently
+//! discarded while the report printed zero malformed records.
+//!
 //! The JSONL input carries raw µs samples (one `sample`, or a compact
 //! `sample_batch` with an explicit count); this tool buckets them into the bounded-memory
 //! [`LatencyHistogram`] from the client crate, exactly as the rig does —
 //! percentiles come out of one code path on both sides of the wire, so the
 //! gate's reading and the rig's live CPU-side reading mean the same thing.
+//! The series names, the boundaries and the reconstruction rule are one
+//! definition in `orrery_protocol::metrics`, reached here through the client
+//! crate's re-export.
 //!
 //! `--json` carries the stable machine contract (a `Report` struct); `--gate`
 //! makes the process exit non-zero when any series misses its threshold.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
@@ -31,17 +40,27 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use serde::{Deserialize, Serialize};
 
-use orrery_persist_client::latency::LatencyHistogram;
+use orrery_persist_client::latency::{
+    is_known_series, LatencyHistogram, GATED_SERIES, SERIES_AREA_FIRST_PAGE, SERIES_BULK_ACK,
+    SERIES_INTENT_COMMIT, SERIES_JOURNAL_COMMIT, UNGATED_SERIES,
+};
 
-/// The four D16 series keys, in canonical report order. These are the wire
-/// keys in the JSONL stream and the field names in the `Report`; they are the
-/// contract between `p2-load` and this dashboard.
-const SERIES_KEYS: [&str; 4] = [
-    "journal_commit_ms",
-    "bulk_ack_ms",
-    "intent_commit_ms",
-    "area_first_page_ms",
+/// Every series this gate folds, in canonical report order: the four gated
+/// D16 keys first, then the ungated ones. The keys, the bucket boundaries and
+/// the reconstruction rule all come from `orrery_protocol::metrics` through
+/// the client crate's re-export — one definition, shared with the rig that
+/// produces the stream and the persistd that appends to it.
+const SERIES_KEYS: [&str; GATED_SERIES.len() + UNGATED_SERIES.len()] = [
+    GATED_SERIES[0],
+    GATED_SERIES[1],
+    GATED_SERIES[2],
+    GATED_SERIES[3],
+    UNGATED_SERIES[0],
 ];
+
+/// How many of [`SERIES_KEYS`] carry a D16 threshold. The rest are folded and
+/// reported, never gated.
+const NUM_GATED: usize = GATED_SERIES.len();
 
 /// D16 defaults (docs/adr/0016-parameter-reference.md) as **µs ceilings** on
 /// the p99. These
@@ -84,8 +103,9 @@ struct SeriesSummary {
     p99_us: Option<u64>,
     /// Exact max, µs.
     max_us: Option<u64>,
-    /// The threshold this series is gated against (µs).
-    threshold_us: u64,
+    /// The threshold this series is gated against (µs), or `None` for a
+    /// series D16 sets no target for.
+    threshold_us: Option<u64>,
     /// Whether this series met its threshold.
     gate: SeriesGate,
 }
@@ -101,6 +121,9 @@ enum SeriesGate {
     /// No samples were recorded for this series. A series the run never
     /// sampled cannot pass the D16 demo criterion by omission.
     MissingData,
+    /// D16 sets no target for this series: it is reported for attribution
+    /// and never contributes to the verdict, present or absent.
+    NotGated,
 }
 
 /// The overall gate verdict.
@@ -151,6 +174,14 @@ struct Report {
     records: usize,
     /// Lines that failed to parse.
     malformed: usize,
+    /// Sample records naming a series this contract does not define. These
+    /// are counted and reported but never gated: a producer that grows a new
+    /// series should not fail a nightly run, while a *typo* in one of the
+    /// gated names shows up here instead of vanishing.
+    unknown_series: usize,
+    /// The distinct series names behind `unknown_series`, sorted. A count
+    /// alone does not tell an operator which producer drifted.
+    unknown_series_names: Vec<String>,
     /// Whether the run's p99s all met their thresholds.
     gate: GateVerdict,
     /// The run context echoed from the `run_header` record, when present.
@@ -241,29 +272,31 @@ fn run() -> Result<ExitCode> {
 /// The fully-parsed input: per-series histograms plus the run context.
 struct Loaded {
     /// One histogram per series, indexed by position in [`SERIES_KEYS`].
-    histograms: [LatencyHistogram; 4],
+    histograms: [LatencyHistogram; SERIES_KEYS.len()],
     /// The run context from the `run_header` record, if one was present.
     run_ctx: Option<RunContext>,
     /// Total non-empty lines read.
     records: usize,
     /// Lines that failed to parse.
     malformed: usize,
+    /// Sample records naming a series outside the shared contract.
+    unknown_series: usize,
+    /// The distinct names behind `unknown_series`.
+    unknown_series_names: BTreeSet<String>,
 }
 
 /// Read every JSONL file once and fold it into the histogram set. Sample
-/// values stream through constant memory (the 22-bucket layout is fixed), so
-/// a 30-minute soak at 10k entities × 4 Hz is not a memory problem here
-/// either — the same argument as in the client crate's `latency` module.
+/// values stream through constant memory (the bucket layout is fixed by
+/// `orrery_protocol::metrics`), so a 30-minute soak at 10k entities × 4 Hz is
+/// not a memory problem here either — the same argument as in the client
+/// crate's `latency` module.
 fn load(files: &[PathBuf]) -> Result<Loaded> {
-    let mut histograms = [
-        LatencyHistogram::new(),
-        LatencyHistogram::new(),
-        LatencyHistogram::new(),
-        LatencyHistogram::new(),
-    ];
+    let mut histograms = std::array::from_fn(|_| LatencyHistogram::new());
     let mut run_ctx: Option<RunContext> = None;
     let mut records = 0usize;
     let mut malformed = 0usize;
+    let mut unknown_series = 0usize;
+    let mut unknown_series_names = BTreeSet::new();
 
     for path in files {
         let file =
@@ -277,7 +310,12 @@ fn load(files: &[PathBuf]) -> Result<Loaded> {
             }
             records += 1;
             match serde_json::from_str::<Record>(line) {
-                Ok(record) => ingest(&mut histograms, &mut run_ctx, record),
+                Ok(record) => {
+                    if let Some(name) = ingest(&mut histograms, &mut run_ctx, record) {
+                        unknown_series += 1;
+                        unknown_series_names.insert(name);
+                    }
+                }
                 Err(e) => {
                     malformed += 1;
                     eprintln!(
@@ -295,44 +333,59 @@ fn load(files: &[PathBuf]) -> Result<Loaded> {
         run_ctx,
         records,
         malformed,
+        unknown_series,
+        unknown_series_names,
     })
 }
 
-/// Fold one JSONL record into the live state.
-fn ingest(histograms: &mut [LatencyHistogram; 4], run_ctx: &mut Option<RunContext>, r: Record) {
+/// Fold one JSONL record into the live state. Returns the series name for a
+/// sample record the shared contract does not define — the one case the
+/// caller counts, since it is the only way a producer/consumer name mismatch
+/// can be seen at all.
+fn ingest(
+    histograms: &mut [LatencyHistogram; SERIES_KEYS.len()],
+    run_ctx: &mut Option<RunContext>,
+    r: Record,
+) -> Option<String> {
     match r.kind.as_str() {
         "run_header" => {
             if r.run.is_some() {
                 *run_ctx = r.run;
             }
+            None
         }
         "sample" | "sample_batch" => {
-            if let (Some(series), Some(value_us)) = (r.series, r.value_us) {
-                if let Some(idx) = SERIES_KEYS.iter().position(|&k| k == series) {
-                    let count = if r.kind == "sample_batch" {
-                        r.count.unwrap_or(0)
-                    } else {
-                        1
-                    };
-                    for _ in 0..count {
-                        histograms[idx].record(Duration::from_micros(value_us));
-                    }
-                }
+            let (Some(series), Some(value_us)) = (r.series, r.value_us) else {
+                return None;
+            };
+            let Some(idx) = SERIES_KEYS.iter().position(|&k| k == series) else {
+                debug_assert!(!is_known_series(&series));
+                return Some(series);
+            };
+            let count = if r.kind == "sample_batch" {
+                r.count.unwrap_or(0)
+            } else {
+                1
+            };
+            for _ in 0..count {
+                histograms[idx].record(Duration::from_micros(value_us));
             }
+            None
         }
         // run_footer and unknown kinds carry no latency data.
-        _ => {}
+        _ => None,
     }
 }
 
-/// The D16 threshold for one series, by wire key.
-fn threshold_for(t: &ThresholdsUs, key: &str) -> u64 {
+/// The D16 threshold for one series, by wire key, or `None` for a series D16
+/// sets no target for.
+fn threshold_for(t: &ThresholdsUs, key: &str) -> Option<u64> {
     match key {
-        "journal_commit_ms" => t.journal_commit_ms,
-        "bulk_ack_ms" => t.bulk_ack_ms,
-        "intent_commit_ms" => t.intent_commit_ms,
-        "area_first_page_ms" => t.area_first_page_ms,
-        _ => u64::MAX,
+        SERIES_JOURNAL_COMMIT => Some(t.journal_commit_ms),
+        SERIES_BULK_ACK => Some(t.bulk_ack_ms),
+        SERIES_INTENT_COMMIT => Some(t.intent_commit_ms),
+        SERIES_AREA_FIRST_PAGE => Some(t.area_first_page_ms),
+        _ => None,
     }
 }
 
@@ -354,12 +407,17 @@ fn report_and_maybe_gate(cli: &Cli, thresholds: &ThresholdsUs, loaded: &Loaded) 
             )
         };
         let threshold_us = threshold_for(thresholds, key);
-        let gate = match p99_us {
-            None => SeriesGate::MissingData,
-            Some(p99) if p99 <= threshold_us => SeriesGate::Pass,
-            Some(_) => SeriesGate::Fail,
+        let gate = match (threshold_us, p99_us) {
+            // Ungated series are reported for attribution only: a missing
+            // `gateway_bulk_server_ms` must not fail a run the way a missing
+            // D16 series does.
+            (None, _) => SeriesGate::NotGated,
+            (Some(_), None) => SeriesGate::MissingData,
+            (Some(t), Some(p99)) if p99 <= t => SeriesGate::Pass,
+            (Some(_), Some(_)) => SeriesGate::Fail,
         };
-        if gate != SeriesGate::Pass {
+        debug_assert_eq!(i < NUM_GATED, threshold_us.is_some());
+        if gate != SeriesGate::Pass && gate != SeriesGate::NotGated {
             any_fail = true;
         }
         series.insert(
@@ -378,6 +436,8 @@ fn report_and_maybe_gate(cli: &Cli, thresholds: &ThresholdsUs, loaded: &Loaded) 
     let report = Report {
         records: loaded.records,
         malformed: loaded.malformed,
+        unknown_series: loaded.unknown_series,
+        unknown_series_names: loaded.unknown_series_names.iter().cloned().collect(),
         gate: if any_fail {
             GateVerdict::Fail
         } else {
@@ -414,7 +474,13 @@ fn report_and_maybe_gate(cli: &Cli, thresholds: &ThresholdsUs, loaded: &Loaded) 
 fn print_human(r: &Report) {
     println!("P2 latency dashboard");
     println!("====================");
-    println!("records: {} ({} malformed)", r.records, r.malformed);
+    println!(
+        "records: {} ({} malformed, {} unknown series)",
+        r.records, r.malformed, r.unknown_series
+    );
+    if !r.unknown_series_names.is_empty() {
+        println!("unknown series: {}", r.unknown_series_names.join(", "));
+    }
     if let Some(run) = &r.run {
         println!();
         println!("run context:");
@@ -445,10 +511,12 @@ fn print_human(r: &Report) {
             SeriesGate::Pass => "PASS",
             SeriesGate::Fail => "FAIL",
             SeriesGate::MissingData => "MISSING",
+            SeriesGate::NotGated => "—",
         };
+        let threshold = s.threshold_us.map_or_else(|| "—".into(), |v| v.to_string());
         println!(
             "{:<22} {:>9} {:>9} {:>9} {:>11} {:>9}",
-            key, p50, p99, max, s.threshold_us, gate
+            key, p50, p99, max, threshold, gate
         );
     }
     println!();
@@ -470,6 +538,7 @@ fn print_human(r: &Report) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use orrery_persist_client::latency::SERIES_GATEWAY_BULK_SERVER;
     use std::io::Write;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -604,6 +673,11 @@ mod tests {
 
     #[test]
     fn sample_batch_folds_exactly_like_repeated_samples() {
+        // Rewritten with the shared lattice. This test used to assert that
+        // 100 journal samples at 1 500 µs report a p99 of 2 000 µs — which is
+        // exactly the D16 threshold this gate compares `p99 <= t` against, so
+        // it encoded the collapse as correct. On the shared boundaries the
+        // 1.5 ms band has its own bucket and the reported p99 is 1 500 µs.
         let path = tmp("batch");
         let lines = vec![
             sample_batch("journal_commit_ms", 1_500, 100),
@@ -614,25 +688,89 @@ mod tests {
         write_jsonl(&path, &lines);
         let loaded = load(std::slice::from_ref(&path)).unwrap();
         assert_eq!(loaded.histograms[0].total(), 100);
-        assert_eq!(loaded.histograms[0].p99(), Duration::from_micros(2_000));
+        assert_eq!(loaded.histograms[0].p99(), Duration::from_micros(1_500));
+        assert!(
+            loaded.histograms[0].p99() < Duration::from_micros(ThresholdsUs::D16.journal_commit_ms)
+        );
         assert_eq!(loaded.histograms[3].total(), 100);
         let _ = std::fs::remove_file(path);
     }
 
     #[test]
-    fn percentiles_compose_with_the_client_histogram() {
-        // Cross-check the p99 this gate reports against a hand-computed bucket
-        // upper bound: 100 samples at 1500 µs fall entirely in the 1–2 ms
-        // bucket (boundaries table in crates/orrery_persist_client/src/
-        // latency.rs), so both p50 and p99 report the bucket's 2000 µs upper
-        // bound while max tracks the true 1500 µs.
-        let mut hist = LatencyHistogram::new();
-        for _ in 0..100 {
-            hist.record(Duration::from_micros(1_500));
-        }
-        assert_eq!(hist.p50(), Duration::from_micros(2_000));
-        assert_eq!(hist.p99(), Duration::from_micros(2_000));
-        assert_eq!(hist.max(), Some(Duration::from_micros(1_500)));
+    fn the_journal_band_resolves_instead_of_pinning_to_the_threshold() {
+        // Rewritten. The old version asserted that a 1 500 µs sample reports
+        // p50 == p99 == 2 000 µs, the D16 journal threshold — the defect, not
+        // the contract: with 1 ms and 2 ms adjacent, *every* journal p99
+        // anywhere in the 1.0–2.0 ms band read out as the threshold and
+        // passed on `p99 <= threshold`. Three points across that band must
+        // now report three different numbers, all below the threshold.
+        let readings: Vec<u64> = [1_100u64, 1_400, 1_900]
+            .into_iter()
+            .map(|micros| {
+                let mut hist = LatencyHistogram::new();
+                for _ in 0..100 {
+                    hist.record(Duration::from_micros(micros));
+                }
+                assert_eq!(hist.max(), Some(Duration::from_micros(micros)));
+                hist.p99().as_micros() as u64
+            })
+            .collect();
+        assert_eq!(readings, vec![1_250, 1_500, 2_000]);
+        assert!(readings[0] < readings[1] && readings[1] < readings[2]);
         assert_eq!(LatencyHistogram::new().p99(), Duration::ZERO);
+    }
+
+    #[test]
+    fn gateway_bulk_server_series_is_folded_and_never_gates() {
+        // The fifth series persistd emits. It must be recognized (not counted
+        // as unknown), reported, and inert in the verdict.
+        let path = tmp("fifth");
+        let mut lines = conforming();
+        for _ in 0..50u64 {
+            lines.push(sample(SERIES_GATEWAY_BULK_SERVER, 300_000));
+        }
+        write_jsonl(&path, &lines);
+        let cli = gate_cli(vec![path.clone()]);
+        let loaded = load(&cli.files).expect("test jsonl loads");
+        assert_eq!(loaded.unknown_series, 0);
+        let idx = SERIES_KEYS
+            .iter()
+            .position(|&k| k == SERIES_GATEWAY_BULK_SERVER)
+            .expect("the fifth series has a slot");
+        assert_eq!(loaded.histograms[idx].total(), 50);
+        // 300 ms would fail every D16 threshold; the run still passes.
+        assert_eq!(
+            report_and_maybe_gate(&cli, &ThresholdsUs::D16, &loaded),
+            ExitCode::SUCCESS
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn an_absent_fifth_series_does_not_fail_the_gate() {
+        // The nightly artifact contains it only when persistd was configured
+        // to export it, so absence must read as `not_gated`, not `missing`.
+        assert_eq!(run_gate_on(conforming()), ExitCode::SUCCESS);
+    }
+
+    #[test]
+    fn a_series_outside_the_contract_is_counted_rather_than_discarded() {
+        // A typo in a gated name used to vanish into the default arm while
+        // the report printed zero malformed records.
+        let path = tmp("unknown");
+        let mut lines = conforming();
+        lines.push(sample("bulk_ack_us", 1_000));
+        lines.push(sample_batch("journal_commit_millis", 1_000, 7));
+        write_jsonl(&path, &lines);
+        let loaded = load(std::slice::from_ref(&path)).expect("test jsonl loads");
+        assert_eq!(loaded.unknown_series, 2, "both records are counted once");
+        assert_eq!(loaded.malformed, 0, "they parse; they are just not ours");
+        // Counting them is diagnostic, not gating.
+        let cli = gate_cli(vec![path.clone()]);
+        assert_eq!(
+            report_and_maybe_gate(&cli, &ThresholdsUs::D16, &loaded),
+            ExitCode::SUCCESS
+        );
+        let _ = std::fs::remove_file(path);
     }
 }

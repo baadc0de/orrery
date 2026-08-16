@@ -399,4 +399,8 @@
 {"type": "sample", "series": "area_first_page_ms", "value_us": 28000}
 {"type": "sample", "series": "area_first_page_ms", "value_us": 12000}
 {"type": "sample", "series": "area_first_page_ms", "value_us": 28000}
+{"type": "sample_batch", "series": "gateway_bulk_server_ms", "value_us": 500, "count": 60}
+{"type": "sample_batch", "series": "gateway_bulk_server_ms", "value_us": 1000, "count": 25}
+{"type": "sample_batch", "series": "gateway_bulk_server_ms", "value_us": 1500, "count": 10}
+{"type": "sample_batch", "series": "gateway_bulk_server_ms", "value_us": 3000, "count": 5}
 {"type": "run_footer", "note": "duration elapsed; 400 samples"}
