@@ -278,7 +278,9 @@ pub fn apply_replicas(
     tick: Res<SimTick>,
     mut counters: ResMut<ReplicaCounters>,
     existing: Query<(Entity, &Replica)>,
+    witness: Option<ResMut<WitnessState<Reference>>>,
 ) {
+    let mut witness = witness;
     for packet in packets.read() {
         counters.seen += 1;
         if packet.channel != orrery_net::channels::Channel::State {
@@ -289,9 +291,12 @@ pub fn apply_replicas(
         // them is not a decode failure. Counting them would make `undecodable`
         // — the guard that catches the harness measuring an empty world — fire
         // constantly and stop meaning anything.
-        let Some((encoded, cell)) =
-            orrery_net::channels::decode_replication::<(Vec<u8>, CellId)>(&packet.payload)
-        else {
+        let Some((encoded, cell, entity, at)) = orrery_net::channels::decode_replication::<(
+            Vec<u8>,
+            CellId,
+            orrery_protocol::PersistId,
+            u64,
+        )>(&packet.payload) else {
             if orrery_net::channels::decode_witness::<orrery_protocol::WitnessMsg>(&packet.payload)
                 .is_none()
             {
@@ -303,6 +308,19 @@ pub fn apply_replicas(
             counters.bad_body += 1;
             continue;
         };
+        // Stage 1, on everything received, witnessed or not (docs/06 §3) — and
+        // the sample store a blind watch re-anchors from. The state is the
+        // authority's own, stamped with the tick it belongs to, so a claim's
+        // `state_hash` either matches it or does not; nothing here is inferred
+        // from the receiver's clock.
+        if let Some(witness) = witness.as_mut() {
+            witness.0.observe(orrery_witness::Observation {
+                entity,
+                state: &body,
+                tick: orrery_protocol::Tick::new(at),
+            });
+        }
+
         // Position is for distance ranking; the *cell* is the authority's own
         // committed value, never recomputed here (D2).
         let grid = grid_of(&body.pos, edge.0);
@@ -802,6 +820,15 @@ impl Bot {
             .world()
             .get_resource::<orrery_witness::plugin::WitnessLinkCounters>()
             .map_or(0, |c| c.repairs_unservable)
+    }
+
+    /// This peer's witness counters, or zeroes if it witnesses nobody.
+    #[must_use]
+    pub fn witness_counters(&self) -> orrery_witness::WitnessCounters {
+        self.app
+            .world()
+            .get_resource::<WitnessState<Reference>>()
+            .map_or_else(Default::default, |state| state.0.counters())
     }
 
     /// Where this peer's inbound state packets went.

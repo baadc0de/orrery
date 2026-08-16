@@ -303,6 +303,16 @@ impl Authority {
         Sent { frame, claim }
     }
 
+    /// Start cheating from wherever the honest trajectory currently is.
+    ///
+    /// Used to prove a witness is judging *now* rather than to set up a cheat
+    /// from the beginning: a divergence introduced after some event is only
+    /// caught if the watch survived that event.
+    fn start_cheating(&mut self, multiplier: i64) {
+        self.cheat_multiplier = multiplier;
+        self.cheat_state = self.executor.state(ENTITY).expect("entity present").clone();
+    }
+
     /// What the authority tells the world its state is.
     fn advertised(&self) -> Body {
         if self.cheat_multiplier > 1 {
@@ -782,4 +792,181 @@ fn a_subject_that_goes_quiet_inside_a_hole_is_still_escalated() {
     }
     assert_eq!(stalled, 1, "escalated once, on a subject that said nothing");
     assert_eq!(witness.counters().stalled, 1);
+}
+
+/// Drive `witness` to the point where it has given up on a hole it opened.
+///
+/// Returns the local tick the sweeps reached, so a caller can carry on from a
+/// clock that has already advanced.
+fn abandoned_hole(witness: &mut Witness<Kinematic>, authority: &mut Authority) -> u64 {
+    witness
+        .ingest_frame(&authority.send(T0).frame, &[])
+        .expect("the first frame lands");
+    let _lost = authority.send(T0 + 3);
+    let third = authority.send(T0 + 6);
+    let opened = witness.ingest_frame(&third.frame, &[]).expect("a gap");
+    assert!(matches!(opened.as_slice(), [WitnessSignal::Gap(_)]));
+
+    // Nobody ever answers the repair.
+    let mut now = T0 + 6;
+    for _ in 0..40 {
+        now += 30;
+        witness.sweep(Tick::new(now));
+    }
+    assert_eq!(witness.counters().stalled, 1, "the hole was given up on");
+    now
+}
+
+#[test]
+fn a_hole_that_never_fills_is_abandoned_so_the_subject_is_judged_again() {
+    // The failure this closes: a witness that gave up on a hole used to stop
+    // judging the subject *permanently*. `repair_step` never asked again once
+    // the escalation was reported, and `check_pending_claims` declines to judge
+    // while a catchup is open, so the watch was finished — silently, for the
+    // life of the process. Measured in `p1-swarm --witness`, every watch
+    // reached that state inside about twenty-five simulated seconds and the
+    // counters never moved again, which made "zero false positives over 500
+    // player-hours" a statement about a witness that had stopped looking.
+    let mut authority = Authority::new(1);
+    let mut witness = watching(WitnessConfig::default(), &mut authority);
+    abandoned_hole(&mut witness, &mut authority);
+
+    // The subject keeps talking. A claim it signs, over a state replication
+    // independently delivered, is a point the witness can resume from.
+    let mut tick = T0 + 9;
+    let resumed = loop {
+        let sent = authority.send(tick);
+        witness
+            .ingest_frame(&sent.frame, &[])
+            .expect("deferred while blind, never refused");
+        tick += 3;
+        if let Some(claim) = sent.claim {
+            let advertised = authority.advertised();
+            witness.observe(Observation {
+                entity: ENTITY,
+                state: &advertised,
+                tick: claim.tick,
+            });
+            witness.ingest_claim(&claim).expect("the claim is signed");
+            if witness.counters().reanchors == 1 {
+                break claim.tick.0;
+            }
+        }
+        assert!(tick < T0 + 400, "the witness never resumed");
+    };
+    assert!(
+        witness.catching_up(ENTITY).is_none(),
+        "resumed, rather than still waiting on a hole nobody will fill"
+    );
+    assert!(
+        witness.counters().unjudged_ticks > 0,
+        "the abandoned window is counted, not quietly forgotten"
+    );
+
+    // And it is really judging again, not merely accepting bytes: a cheat that
+    // starts *after* the resume is caught.
+    let accepted_before = witness.counters().frames_accepted;
+    authority.start_cheating(3);
+    let mut signals = Vec::new();
+    for index in 0..=(CLAIM_EVERY / 3) {
+        let sent = authority.send(resumed + index * 3);
+        signals.extend(
+            witness
+                .ingest_frame(&sent.frame, &[])
+                .expect("frames chain to the resumed anchor"),
+        );
+        if let Some(claim) = sent.claim {
+            if let Some(signal) = witness.ingest_claim(&claim).expect("the claim is signed") {
+                signals.push(signal);
+            }
+        }
+    }
+    assert!(
+        witness.counters().frames_accepted > accepted_before,
+        "the chain picked up from the new anchor"
+    );
+    assert!(
+        signals
+            .iter()
+            .any(|signal| matches!(signal, WitnessSignal::ClaimMismatch { .. })),
+        "a cheat after the resume is caught: {signals:?}"
+    );
+}
+
+#[test]
+fn a_resume_is_refused_unless_the_state_matches_what_the_subject_signed() {
+    // The anchor is the one thing a witness cannot check by re-execution, so it
+    // is checked by signature and hash instead. A state the subject never
+    // committed to must not move the anchor, however genuine the claim beside
+    // it — otherwise stalling would be a way to hand a witness a starting point
+    // of the subject's choosing, which is worse than the stall.
+    let mut authority = Authority::new(1);
+    let mut witness = watching(WitnessConfig::default(), &mut authority);
+    abandoned_hole(&mut witness, &mut authority);
+
+    let mut tick = T0 + 9;
+    let claim = loop {
+        let sent = authority.send(tick);
+        witness.ingest_frame(&sent.frame, &[]).expect("deferred");
+        tick += 3;
+        if let Some(claim) = sent.claim {
+            break claim;
+        }
+        assert!(tick < T0 + 400, "no claim was ever cut");
+    };
+
+    // One millimetre off what the claim commits to.
+    let mut wrong = authority.advertised();
+    wrong.pos.x += 1;
+    witness.observe(Observation {
+        entity: ENTITY,
+        state: &wrong,
+        tick: claim.tick,
+    });
+    witness.ingest_claim(&claim).expect("the claim is signed");
+
+    assert_eq!(witness.counters().reanchors, 0, "the anchor did not move");
+    assert!(
+        witness.catching_up(ENTITY).is_some(),
+        "still blind, which is the honest state to be in"
+    );
+}
+
+#[test]
+fn coverage_counts_the_timeline_shown_not_the_timeline_judged() {
+    // The trap this avoids: measuring a witness against its own output. A watch
+    // that has stopped judging has also stopped abandoning, disputing and
+    // repairing, so every ratio built from what it *did* scores it perfectly at
+    // the moment it stops being worth anything. The denominator has to be what
+    // the subject put in front of it.
+    let mut authority = Authority::new(1);
+    let mut witness = watching(WitnessConfig::default(), &mut authority);
+    abandoned_hole(&mut witness, &mut authority);
+
+    let judged_while_blind = witness.counters().judged_ticks;
+    let shown_while_blind = witness.counters().shown_ticks;
+
+    // The subject keeps streaming into a witness that cannot fold any of it.
+    // No re-anchor is possible: replication delivered nothing, so there is no
+    // state to check a claim against.
+    let mut tick = T0 + 9;
+    for _ in 0..20 {
+        let sent = authority.send(tick);
+        witness.ingest_frame(&sent.frame, &[]).expect("deferred");
+        if let Some(claim) = sent.claim {
+            witness.ingest_claim(&claim).expect("the claim is signed");
+        }
+        tick += 3;
+    }
+
+    assert_eq!(
+        witness.counters().judged_ticks,
+        judged_while_blind,
+        "a blind watch judges nothing further"
+    );
+    assert!(
+        witness.counters().shown_ticks > shown_while_blind,
+        "but it is still being shown timeline, and that is what it is measured against"
+    );
+    assert_eq!(witness.counters().reanchors, 0, "nothing to resume from");
 }

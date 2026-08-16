@@ -97,6 +97,36 @@ pub struct WitnessCounters {
     /// Not a fault on anyone's part — it is the count of judgements correctly
     /// *not* made, and a witness reporting many of them is one on a bad link.
     pub judgements_deferred: u64,
+    /// Subject ticks this witness re-executed, and can therefore judge.
+    ///
+    /// The numerator of observation coverage.
+    pub judged_ticks: u64,
+    /// Subject ticks this witness was shown, judged or not.
+    ///
+    /// The denominator. Counted from the *advance* of each watch's newest seen
+    /// tick, so a repair re-delivering a range is not counted twice, and
+    /// counted whether the frame could be folded or was set aside — a frame the
+    /// witness could not chain is still timeline it was shown and did not
+    /// judge. That is what makes the ratio detect a watch which has quietly
+    /// stopped: judging freezes while the subject keeps talking, so the two
+    /// diverge. Measured against `judged_ticks` alone the same watch looks
+    /// perfect, because a witness that judges nothing also misjudges nothing.
+    pub shown_ticks: u64,
+    /// Watches resumed at a later anchor after a hole was abandoned.
+    ///
+    /// Each one is a window this witness gave up on and a point at which it
+    /// started judging again. A subject with a rising count is either on a bad
+    /// link or exploiting one, and the two are told apart by
+    /// [`Self::unjudged_ticks`] against the session length rather than by this
+    /// count alone.
+    pub reanchors: u64,
+    /// Subject ticks abandoned unjudged by those re-anchors.
+    ///
+    /// The denominator of observation coverage. A witness that reports zero
+    /// findings across a long session has proven nothing unless this is small
+    /// beside the ticks it actually judged — which is the distinction between
+    /// "saw nothing wrong" and "saw nothing".
+    pub unjudged_ticks: u64,
 }
 
 /// Why an ingest was refused.
@@ -145,10 +175,15 @@ impl core::error::Error for WitnessError {}
 /// "the hashes happen to be missing" makes it an accident rather than a rule.
 ///
 /// The loophole this deliberately does *not* leave open: a cheat could stall
-/// forever to stay unjudged. That is what [`Catchup::attempts`] and
-/// [`WitnessSignal::Stalled`] are for — persistent failure to fill a hole is
-/// itself reportable, so the state has a floor. [`Witness::sweep`] is what
-/// keeps that floor under a subject that stops sending altogether.
+/// forever to stay unjudged. Three things close it. [`Catchup::attempts`] and
+/// [`WitnessSignal::Stalled`] make persistent failure to fill a hole itself
+/// reportable, so the state has a floor. [`Witness::sweep`] keeps that floor
+/// under a subject that stops sending altogether. And [`Witness::try_reanchor`]
+/// puts a *ceiling* on how long the state lasts: a hole that is never filled is
+/// eventually abandoned and judging resumes at a later signed anchor, so the
+/// most a stall can buy is one unjudged window rather than permanent silence.
+/// The report alone was not enough for that, because in shadow mode nothing
+/// acts on a report.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Catchup {
     /// Subject tick at which the hole was first noticed.
@@ -241,6 +276,8 @@ struct Watched<R: Ruleset> {
     chain_epoch: u32,
     /// Set while this subject's chain has a hole being repaired.
     catchup: Option<Catchup>,
+    /// Newest subject tick any frame for this watch has carried, folded or not.
+    newest_seen: u64,
     head: ChainHash,
     /// Whether `head` reflects a verified fold, or is still the value a claim
     /// seeded. Until the first frame lands there is nothing to detect a gap
@@ -439,6 +476,7 @@ impl<R: Ruleset> Witness<R> {
                 anchor_tick: watch.anchor.tick.0,
                 chain_epoch: watch.anchor.chain_epoch,
                 catchup: None,
+                newest_seen: watch.anchor.tick.0,
                 head: watch.anchor.input_head,
                 anchored: false,
                 claims,
@@ -641,6 +679,18 @@ impl<R: Ruleset> Witness<R> {
         // truncated heads precisely so a receiver can notice a hole cheaply. A
         // hole in any followed entity blocks the whole frame: one signature
         // covers every slice, so a frame cannot be half-folded.
+        // Counted before anything can turn the frame away: what the witness was
+        // *shown* is the denominator of its coverage, and a frame it sets aside
+        // is exactly the case that has to land in it.
+        let last_tick = frame.first_tick.0 + u64::from(frame.tick_count).saturating_sub(1);
+        for entity in &entities {
+            if let Some(watched) = self.watched.get_mut(entity) {
+                let advance = last_tick.saturating_sub(watched.newest_seen);
+                watched.newest_seen = watched.newest_seen.max(last_tick);
+                self.counters.shown_ticks += advance;
+            }
+        }
+
         let mut signals = Vec::new();
         let mut blocked = false;
         for entity in &entities {
@@ -714,7 +764,6 @@ impl<R: Ruleset> Witness<R> {
             }
         }
 
-        let last_tick = frame.first_tick.0 + u64::from(frame.tick_count).saturating_sub(1);
         self.prune_if_due(Tick::new(last_tick));
         Ok(signals)
     }
@@ -770,6 +819,7 @@ impl<R: Ruleset> Witness<R> {
                     .insert(tick, orrery_core::CoreCodec::to_canonical(state));
             }
             recorded.push((tick, state_hash));
+            self.counters.judged_ticks += 1;
         }
         while watched.recent.len() > Self::RECENT_SNAPSHOTS {
             let oldest = *watched.recent.keys().next().expect("len > 0");
@@ -993,12 +1043,19 @@ impl<R: Ruleset> Witness<R> {
             .ok_or(WitnessError::NotWatched)?;
         verify_claim(claim, watched.subject).map_err(|_| WitnessError::ClaimRejected)?;
 
-        let snapshot = claim.tick.0.checked_sub(1).and_then(|previous| {
-            let watched = self.watched.get(&claim.entity)?;
-            if *watched.computed.get(&previous)? != claim.state_hash {
-                return None;
-            }
-            watched.recent.get(&previous).cloned()
+        // A hole that will never be filled must not silence this watch for the
+        // rest of the session. If this claim is a point the witness can resume
+        // from, it resumes here, before anything else reads the watch.
+        let resumed = self.try_reanchor(claim);
+
+        let snapshot = resumed.or_else(|| {
+            claim.tick.0.checked_sub(1).and_then(|previous| {
+                let watched = self.watched.get(&claim.entity)?;
+                if *watched.computed.get(&previous)? != claim.state_hash {
+                    return None;
+                }
+                watched.recent.get(&previous).cloned()
+            })
         });
 
         if let Some(watched) = self.watched.get_mut(&claim.entity) {
@@ -1010,6 +1067,102 @@ impl<R: Ruleset> Witness<R> {
         self.log
             .record_claim(claim.clone(), snapshot.unwrap_or_default());
         Ok(self.check_pending_claims(claim.entity))
+    }
+
+    /// Resume a watch that gave up on a hole, at a later signed claim.
+    ///
+    /// # Why abandoning a window is better than waiting forever
+    ///
+    /// Once a hole has survived [`Self::MAX_REPAIR_ATTEMPTS`] the witness has
+    /// no way to compute the ticks inside it: re-execution needs the inputs,
+    /// and the inputs were in the frames that never arrived. Before this, that
+    /// state was terminal — [`Self::repair_step`] returned
+    /// [`GapCheck::Waiting`] on every subsequent tick without ever asking
+    /// again, and [`Self::check_pending_claims`] declines to judge while a
+    /// catchup is open. The subject was therefore never judged again, silently
+    /// and for as long as the process lived.
+    ///
+    /// Measured in `p1-swarm --witness`, every watch reached that state within
+    /// about twenty-five simulated seconds, after which the witness counters
+    /// did not move again: identical gap, stall and overflow totals at 30 s and
+    /// at 120 s of an eight-peer run. The escalation the design relies on to
+    /// stop "stall forever to stay unjudged" ([`Catchup`]) does fire — but it
+    /// only *reports*, and in shadow mode nothing acts on a report, so stalling
+    /// was in fact a way to stay unjudged.
+    ///
+    /// Abandoning the window converts blind-forever into blind-for-one-window.
+    /// The abandoned ticks are counted, not forgotten
+    /// ([`WitnessCounters::unjudged_ticks`]), so coverage stays a number an
+    /// operator can read rather than an assumption.
+    ///
+    /// # What makes the new anchor trustworthy
+    ///
+    /// Exactly what makes the original one trustworthy in [`Self::watch`]: a
+    /// claim the subject signed, plus the state it commits to. The state comes
+    /// from what replication delivered — stage-1 samples, which every
+    /// interested peer already holds (docs/06 §3) — and is accepted only when
+    /// [`orrery_core::state_hash`] over it equals the claim's `state_hash`. The
+    /// witness is not taking the subject's word for its state: it is taking the
+    /// subject's *signature*, checked against bytes it received independently.
+    /// A subject cannot re-anchor a witness onto a state it did not commit to,
+    /// because it would have to forge its own signature to do it.
+    ///
+    /// Returns the canonical anchor state when it resumes, so the caller can
+    /// retain it as the snapshot a bundle opens at.
+    fn try_reanchor(&mut self, claim: &StateClaim) -> Option<Vec<u8>> {
+        let watched = self.watched.get(&claim.entity)?;
+        let catchup = watched.catchup?;
+        // Only a hole that has been given up on. A repair still in flight is
+        // one the witness expects to fold, and skipping past it would throw
+        // away judgeable ticks that were about to arrive.
+        if catchup.attempts < Self::MAX_REPAIR_ATTEMPTS || !catchup.reported {
+            return None;
+        }
+        // Forward only. A retained claim from inside the abandoned window would
+        // move the anchor *backwards*, to a point the witness already could not
+        // reach, and the next frame would not chain to it either.
+        if claim.tick.0 <= watched.anchor_tick {
+            return None;
+        }
+        let (state, _) = self.samples.get(&claim.entity)?;
+        if orrery_core::state_hash(state) != claim.state_hash {
+            return None;
+        }
+        let state = state.clone();
+        let canonical = orrery_core::CoreCodec::to_canonical(&state);
+
+        // A fresh executor, not a rewound one: the old one's trajectory stopped
+        // at the hole, and every tick after it would otherwise be computed from
+        // a state the subject left behind.
+        let mut executor = Executor::new((self.ruleset_factory)(), self.seed);
+        executor.insert(claim.entity, state);
+
+        let abandoned = claim.tick.0.saturating_sub(catchup.since);
+        self.counters.reanchors += 1;
+        self.counters.unjudged_ticks += abandoned;
+
+        let watched = self.watched.get_mut(&claim.entity)?;
+        watched.anchor_tick = claim.tick.0;
+        watched.chain_epoch = claim.chain_epoch;
+        watched.catchup = None;
+        watched.head = claim.input_head;
+        // Anchored, unlike a fresh `watch`: this head is the subject's own
+        // signed full head at this tick, so the very next frame is a thing the
+        // witness can check rather than one it has to take on faith. If that
+        // frame does not chain to it, ordinary gap detection re-opens a repair
+        // — which is the right answer, because a frame that does not chain to a
+        // signed head really is missing chain.
+        watched.anchored = true;
+        watched.executor = executor;
+        watched.computed.clear();
+        watched.recent.clear();
+        watched.snapshotted.clear();
+        watched.reported.clear();
+        // Claims from inside the abandoned window can never be judged now —
+        // their ticks will not be re-executed — and keeping them would have
+        // `check_pending_claims` rescan them for the life of the watch.
+        watched.claims.retain(|tick, _| *tick >= claim.tick.0);
+        Some(canonical)
     }
 
     /// Compare every claim whose tick has been re-executed and not yet judged.

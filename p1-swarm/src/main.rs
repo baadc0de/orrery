@@ -35,19 +35,31 @@
 //! false positive, which is what makes the count meaningful without a separate
 //! oracle for who was cheating.
 //!
-//! It works and it found real defects. What it does **not** yet do is accumulate
-//! P4's 500 honest player-hours, for two measured reasons:
+//! It works and it found real defects. Both of the reasons it could not
+//! accumulate P4's 500 honest player-hours are now closed: the repair budget
+//! bounded the traffic that reached 8.7 Mbps against a 1 Mbps allowance, and
+//! the cost that grew faster than the peer count is linear again — 32 peers
+//! over 60 simulated seconds runs in about ten wall seconds.
 //!
-//! - **Repair traffic is unbounded.** A peer that hitches for a second drags its
-//!   witnesses through a multi-datagram refill on the *unsheddable* control
-//!   lane. At sixteen peers with a stalling quarter, upload reached 8.7 Mbps
-//!   against the 1 Mbps budget and 26 630 replication packets were shed to pay
-//!   for it. docs/03-replication.md §5.3 puts witness traffic at ~20–30 kb/s per
-//!   link and calls it bounded by construction; repair traffic is not covered by
-//!   that estimate and needs a budget of its own.
-//! - **Cost still grows past sixteen peers** faster than the peer count. Thirty-two
-//!   peers over five simulated minutes does not finish inside seven wall
-//!   minutes, where the same run without the witness takes seconds.
+//! What stands between the harness and those hours is no longer throughput but
+//! two measured numbers, and the report prints them side by side because
+//! neither is readable alone:
+//!
+//! - **False positives are a rate, not a transient.** Roughly 0.7 `Stalled`
+//!   escalations per simulated second at eight peers, every one against a bot
+//!   that answered every repair it was asked for. The criterion is zero.
+//! - **Observation coverage is ~83%.** The rest is timeline a witness was shown
+//!   while a hole was open and the repair that followed did not recover. Until
+//!   that closes, a low false-positive count is partly an artefact of a witness
+//!   that judged less.
+//!
+//! Coverage is printed at all because of what it caught. Before re-anchoring
+//! existed, a watch that gave up on a hole stopped judging its subject
+//! permanently — and nothing in the report said so, because a witness that
+//! judges nothing also accuses nobody. Every witness counter froze at about
+//! twenty-five simulated seconds and stayed frozen: identical gap, stall and
+//! overflow totals at 30 s and at 120 s. The hours would have accumulated and
+//! the false-positive count would have been zero for the worst possible reason.
 //!
 //! And one it structurally cannot do: every bot here shares a binary and a
 //! `libm`, so re-execution is bit-identical by construction and the
@@ -203,6 +215,27 @@ fn main() -> Result<()> {
         eprintln!(
             "p1-swarm: witness ran over {:.0} player-hours: {} chain gaps repaired, {} false positives",
             report.player_hours, report.total_gaps, report.total_false_positives,
+        );
+        // Printed beside the false-positive count, never apart from it: the one
+        // is only readable against the other.
+        eprintln!(
+            "p1-swarm: witness judged {:.1}% of the timeline it was shown ({} of {} ticks, \
+             {} abandoned across {} re-anchors); {} frames deferred, {} judgements deferred",
+            report.observation_coverage * 100.0,
+            report.total_judged_ticks,
+            report.total_shown_ticks,
+            report.total_unjudged_ticks,
+            report.total_reanchors,
+            report
+                .per_peer
+                .iter()
+                .map(|p| p.frames_deferred)
+                .sum::<u64>(),
+            report
+                .per_peer
+                .iter()
+                .map(|p| p.judgements_deferred)
+                .sum::<u64>(),
         );
     }
     if let Some(join) = &report.late_join {
