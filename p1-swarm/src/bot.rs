@@ -483,9 +483,13 @@ impl Bot {
         if let Some(chain) = &mut self.chain {
             chain.log_input(tick, &command);
         }
-        self.executor
+        let outcome = self
+            .executor
             .step_entity(self.entity, Tick::new(tick), &[command])
             .expect("entity present");
+        if let Some(chain) = &mut self.chain {
+            chain.log_tick_hash(outcome.state_hash);
+        }
 
         let grid = grid_of(&self.body().pos, cell_edge_m);
         let world = self.app.world_mut();
@@ -503,6 +507,17 @@ impl Bot {
             .resource_mut::<Time<Real>>()
             .advance_by(TICK);
         self.app.world_mut().resource_mut::<SimTick>().0 = self.tick;
+        // The witness times its repairs in subject ticks, so it needs this
+        // bot's tick rather than wall time. Without it a peer that goes quiet
+        // inside an open hole is never escalated, because every other repair
+        // check needs a frame to arrive before it runs.
+        if let Some(mut clock) = self
+            .app
+            .world_mut()
+            .get_resource_mut::<orrery_witness::WitnessClock>()
+        {
+            clock.0 = Tick::new(self.tick);
+        }
         self.app.update();
     }
 
@@ -721,12 +736,14 @@ impl Bot {
         let Some(authored) = chain.cut_frame(tick) else {
             return;
         };
+        let entity = self.entity;
         self.app
             .world_mut()
             .resource_mut::<bevy_ecs::message::Messages<PublishFrame>>()
             .write(PublishFrame {
                 frame: authored.frame,
                 transitions: authored.transitions,
+                tick_hashes: vec![(entity, authored.tick_hashes)],
             });
     }
 

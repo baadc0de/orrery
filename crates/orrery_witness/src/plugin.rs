@@ -39,7 +39,9 @@ use orrery_net::budget::{Bandwidth, RateMeter, UploadBudget};
 use orrery_net::channels::{decode_witness, encode_witness, Channel};
 use orrery_net::peer_link::payload_budget;
 use orrery_net::{IslandMembership, PeerPacket, SendPacket};
-use orrery_protocol::{FrameHead, LogFrame, LogRangeRequest, NodeId, StateClaim, Tick, WitnessMsg};
+use orrery_protocol::{
+    FrameHead, LogFrame, LogRangeRequest, NodeId, PersistId, StateClaim, Tick, WitnessMsg,
+};
 
 use crate::witness::{Witness, WitnessSignal};
 
@@ -61,6 +63,16 @@ pub struct PublishFrame {
     pub frame: LogFrame,
     /// Full head transitions the frame's signature commits to.
     pub transitions: Vec<HeadTransition>,
+    /// Per-tick state hashes this frame's ticks produced, per entity, in tick
+    /// order from `frame.first_tick`.
+    ///
+    /// Retained rather than sent. `EvidenceBundle::claimed_hashes` comes from
+    /// here, so an authority that never supplies them can serve repairs but
+    /// cannot assemble a bundle to answer for *itself* — every self-authored
+    /// window fails `IncompleteHashes`, which is not a state a peer should be
+    /// able to reach silently. Empty is allowed for a caller that has not
+    /// wired it up yet.
+    pub tick_hashes: Vec<(PersistId, Vec<[u8; 32]>)>,
 }
 
 /// A claim this peer authored, on its way out.
@@ -119,6 +131,27 @@ pub const MAX_WITNESS_LINKS: usize = 7;
 pub struct WitnessSet {
     /// The peers to stream to. Empty means "fall back".
     pub members: Vec<NodeId>,
+}
+
+/// The simulation tick the app is on, for repair timeouts.
+///
+/// Every other repair check hangs off a frame arriving, which only closes
+/// "stall forever to stay unjudged" for a subject that keeps sending. A subject
+/// that goes quiet has to be timed out against someone else's clock, and the
+/// only clock with the right units is the app's own tick — the engine reasons in
+/// subject ticks throughout, and wall time would need a conversion that a
+/// hitching peer makes wrong exactly when it matters.
+///
+/// Left at zero the sweep never runs, so a host that does not set this keeps
+/// the previous behaviour rather than getting timeouts against a clock that is
+/// not advancing.
+#[derive(Debug, Clone, Copy, Resource)]
+pub struct WitnessClock(pub Tick);
+
+impl Default for WitnessClock {
+    fn default() -> Self {
+        Self(Tick::new(0))
+    }
 }
 
 /// The witness engine, as a resource.
@@ -198,6 +231,7 @@ where
             // plugin without the net stack should get working defaults instead
             // of a system that fails parameter validation at runtime.
             .init_resource::<UploadBudget>()
+            .init_resource::<WitnessClock>()
             .init_resource::<Time<Real>>()
             .add_message::<PublishFrame>()
             .add_message::<PublishClaim>()
@@ -208,6 +242,9 @@ where
                 (
                     publish_authored,
                     ingest_peer_traffic::<R>,
+                    // After ingest, so a repair that landed this frame has
+                    // already closed its hole and is not chased again.
+                    sweep_repairs::<R>,
                     // Serving runs after ingest so a request that arrived this
                     // frame is answered in it: a repair that waits a frame per
                     // hop turns a 180-tick refill into seconds of round trips.
@@ -218,11 +255,23 @@ where
     }
 }
 
+/// Ticks of authored progress between retention sweeps on the local log.
+///
+/// Matches the witness engine's own cadence, and for the same reason: pruning
+/// walks the retained frames, so doing it per frame is quadratic in session
+/// length, while never doing it leaves the log growing for the whole session —
+/// and `serve_range` scans that deque linearly on every repair, so an unpruned
+/// log makes repair-serving cost grow without bound. The budget added in
+/// [`RepairBudget`] caps the bandwidth, not the scan.
+const AUTHORED_PRUNE_EVERY: u64 = 150;
+
 /// Retains what this peer authored and broadcasts it to its island.
 ///
 /// Retention happens whether or not anyone is listening: the log is what makes
 /// this peer able to *answer* a dispute, and a peer alone in an island still
-/// has to be able to justify the last three seconds.
+/// has to be able to justify the last three seconds. It is also *bounded* —
+/// "the last three seconds", not "everything since launch".
+#[allow(clippy::too_many_arguments)]
 pub fn publish_authored(
     mut frames: MessageReader<PublishFrame>,
     mut claims: MessageReader<PublishClaim>,
@@ -231,8 +280,10 @@ pub fn publish_authored(
     witnesses: Res<WitnessSet>,
     mut out: MessageWriter<SendPacket>,
     mut counters: ResMut<WitnessLinkCounters>,
+    mut last_pruned: Local<Option<u64>>,
 ) {
     let peers: Vec<NodeId> = witness_links(&witnesses, &membership);
+    let mut newest: Option<u64> = None;
 
     for published in frames.read() {
         let heads: Vec<FrameHead> = published
@@ -246,6 +297,18 @@ pub fn publish_authored(
             .collect();
         log.0
             .record_frame(published.frame.clone(), published.transitions.clone());
+        for (entity, hashes) in &published.tick_hashes {
+            for (offset, hash) in hashes.iter().enumerate() {
+                log.0.record_tick_hash(
+                    *entity,
+                    Tick::new(published.frame.first_tick.0 + offset as u64),
+                    *hash,
+                );
+            }
+        }
+        let last_tick =
+            published.frame.first_tick.0 + u64::from(published.frame.tick_count).saturating_sub(1);
+        newest = Some(newest.map_or(last_tick, |held: u64| held.max(last_tick)));
 
         let payload = Bytes::from(encode_witness(&WitnessMsg::Frame {
             frame: published.frame.clone(),
@@ -272,6 +335,17 @@ pub fn publish_authored(
                 channel: Channel::State,
                 payload: payload.clone(),
             });
+        }
+    }
+
+    if let Some(now) = newest {
+        if now
+            >= last_pruned
+                .unwrap_or(0)
+                .saturating_add(AUTHORED_PRUNE_EVERY)
+        {
+            *last_pruned = Some(now);
+            log.0.prune(Tick::new(now));
         }
     }
 }
@@ -341,22 +415,15 @@ pub fn ingest_peer_traffic<R>(
 
         match message {
             WitnessMsg::Frame { frame, heads } => {
-                deliver_frame(
-                    witness,
-                    packet.from,
-                    &frame,
-                    &heads,
-                    &mut signals,
-                    &mut out,
-                    &mut counters,
-                );
+                let produced = witness.ingest_wire_frame(&frame, &heads);
+                route(witness, produced, &mut signals, &mut out, &mut counters);
             }
             WitnessMsg::Claim(claim) => match witness.ingest_claim(&claim) {
                 Ok(Some(signal)) => {
-                    signals.write(Witnessed {
-                        subject: packet.from,
-                        signal,
-                    });
+                    // Attributed to the authority the engine holds responsible,
+                    // never to whoever handed the message over — see `route`.
+                    let subject = witness.subject(claim.entity).unwrap_or(packet.from);
+                    signals.write(Witnessed { subject, signal });
                 }
                 Ok(None) => {}
                 Err(_) => counters.refused += 1,
@@ -375,29 +442,33 @@ pub fn ingest_peer_traffic<R>(
                     counters.repairs_unservable += 1;
                     continue;
                 }
-                for frame in &response.frames {
-                    counters.repaired_frames += 1;
-                    deliver_frame(
-                        witness,
-                        packet.from,
-                        frame,
-                        &heads,
-                        &mut signals,
-                        &mut out,
-                        &mut counters,
-                    );
-                }
+                counters.repaired_frames += response.frames.len() as u64;
+                // The whole run at once, not frame by frame: the response
+                // carries one head pair per entity for the *whole* answer, so
+                // only the engine can thread them forward correctly. See
+                // `Witness::ingest_wire_frames`.
+                let produced = witness.ingest_wire_frames(&response.frames, &heads);
+                route(witness, produced, &mut signals, &mut out, &mut counters);
+
                 if let Some(resume) = resume_from {
                     // A 180-tick window does not fit one datagram, so the
                     // authority serves what fits and says where to continue.
+                    let Some(subject) = witness.subject(response.entity) else {
+                        counters.refused += 1;
+                        continue;
+                    };
                     counters.repairs_requested += 1;
                     out.write(SendPacket {
-                        to: packet.from,
+                        to: subject,
                         channel: Channel::Control,
                         payload: Bytes::from(encode_witness(&WitnessMsg::RangeRequest(
                             LogRangeRequest {
                                 entity: response.entity,
-                                chain_epoch: 0,
+                                // The epoch the gap is actually in. A hardcoded
+                                // zero is right only until the first authority
+                                // handoff increments one, and then it silently
+                                // asks about a chain that no longer exists.
+                                chain_epoch: witness.chain_epoch(response.entity).unwrap_or(0),
                                 from_tick: resume,
                                 to_tick: Tick::new(
                                     resume.0 + orrery_protocol::MAX_ADJUDICATION_TICKS,
@@ -415,34 +486,100 @@ pub fn ingest_peer_traffic<R>(
     }
 }
 
-/// Ingest one frame and route whatever the engine says about it.
-#[allow(clippy::too_many_arguments)]
-fn deliver_frame<R: Ruleset + Send + Sync + 'static>(
+/// Chases repairs that have gone unanswered, on the app's own tick.
+///
+/// A subject that stops sending entirely never trips the frame-driven repair
+/// check, because that check needs a frame to run on. Without this a peer can
+/// go quiet inside an open hole and stay unjudged indefinitely — the cheap
+/// version of the stall the escalation threshold exists to close.
+///
+/// Runs once per distinct tick: the engine's backoff is measured in ticks, so
+/// sweeping several times on the same one would only re-ask questions it has
+/// already asked.
+pub fn sweep_repairs<R>(
+    witness: Option<ResMut<WitnessState<R>>>,
+    clock: Res<WitnessClock>,
+    mut signals: MessageWriter<Witnessed>,
+    mut out: MessageWriter<SendPacket>,
+    mut counters: ResMut<WitnessLinkCounters>,
+    mut swept: Local<Option<Tick>>,
+) where
+    R: Ruleset + Send + Sync + 'static,
+    R::CoreState: Send + Sync,
+    R::CoreInput: Send + Sync,
+{
+    let Some(mut witness) = witness else {
+        return;
+    };
+    if clock.0 .0 == 0 || *swept == Some(clock.0) {
+        return;
+    }
+    *swept = Some(clock.0);
+    let produced = witness.0.sweep(clock.0);
+    route(
+        &mut witness.0,
+        Ok(produced),
+        &mut signals,
+        &mut out,
+        &mut counters,
+    );
+}
+
+/// Route whatever the engine decided: repairs to the authority, signals to the
+/// app.
+///
+/// # Why not `packet.from`
+///
+/// The engine verifies every frame against the key of the authority it was
+/// asked to watch, so a forged frame cannot enter a chain however it arrives.
+/// What arrival order *can* do is open a hole: a peer that replays the
+/// subject's own genuine frames out of order makes the chain fail to fold, and
+/// if the resulting `LogRangeRequest` went back to whoever delivered the frame,
+/// that peer would collect the repair traffic it provoked and simply not answer
+/// it — until the witness escalated `Stalled` against an authority that was
+/// never asked. Attribution has the same problem in the other direction: a
+/// signal stamped with the carrier names the wrong peer in every report and
+/// counter downstream.
+///
+/// So both the address and the attribution come from the engine, which knows
+/// which key it holds responsible. The carrier is a delivery detail.
+fn route<R: Ruleset + Send + Sync + 'static>(
     witness: &mut Witness<R>,
-    subject: NodeId,
-    frame: &LogFrame,
-    heads: &[FrameHead],
+    produced: Result<Vec<WitnessSignal>, crate::witness::WitnessError>,
     signals: &mut MessageWriter<Witnessed>,
     out: &mut MessageWriter<SendPacket>,
     counters: &mut WitnessLinkCounters,
 ) {
-    match witness.ingest_wire_frame(frame, heads) {
-        Ok(produced) => {
-            for signal in produced {
-                if let WitnessSignal::Gap(request) = &signal {
-                    counters.repairs_requested += 1;
-                    out.write(SendPacket {
-                        to: subject,
-                        channel: Channel::Control,
-                        payload: Bytes::from(encode_witness(&WitnessMsg::RangeRequest(
-                            request.clone(),
-                        ))),
-                    });
-                }
-                signals.write(Witnessed { subject, signal });
-            }
+    let Ok(produced) = produced else {
+        counters.refused += 1;
+        return;
+    };
+    for signal in produced {
+        let entity = match &signal {
+            WitnessSignal::Gap(request) => request.entity,
+            WitnessSignal::InvariantBreach { entity, .. }
+            | WitnessSignal::ClaimMismatch { entity, .. }
+            | WitnessSignal::Stalled { entity, .. } => *entity,
+            // Only `raise` produces one, and the app calls that directly. There
+            // is no entity to attribute it to here and nothing to route.
+            WitnessSignal::Report(_) => continue,
+        };
+        let Some(subject) = witness.subject(entity) else {
+            // A signal about an entity the engine no longer holds has nobody to
+            // attribute it to, and guessing is exactly what this function
+            // exists to avoid.
+            counters.refused += 1;
+            continue;
+        };
+        if let WitnessSignal::Gap(request) = &signal {
+            counters.repairs_requested += 1;
+            out.write(SendPacket {
+                to: subject,
+                channel: Channel::Control,
+                payload: Bytes::from(encode_witness(&WitnessMsg::RangeRequest(request.clone()))),
+            });
         }
-        Err(_) => counters.refused += 1,
+        signals.write(Witnessed { subject, signal });
     }
 }
 
@@ -474,6 +611,28 @@ pub struct RepairBudget {
     pub share: f32,
     /// Most requests held while waiting for budget.
     pub queue_limit: usize,
+    /// Most requests any one peer may hold in that queue.
+    ///
+    /// A global limit alone is not a fairness policy. The queue drops its
+    /// oldest entry when full, so without a per-peer cap one peer asking hard
+    /// enough evicts every other witness's repair indefinitely — entirely
+    /// inside the metered budget, because the cost of *queueing* is not
+    /// metered. And since an unfilled hole escalates to
+    /// [`crate::WitnessSignal::Stalled`], that turns one noisy peer into false
+    /// findings against a third party, which is the failure this whole subsystem
+    /// is arranged to avoid.
+    ///
+    /// Four is enough for a peer serving a multi-datagram refill under the
+    /// resume protocol, which holds one request outstanding at a time.
+    ///
+    /// The loop this breaks is the expensive part. An evicted repair is a hole
+    /// that stays open, and a hole that stays open is re-asked — so eviction
+    /// manufactures the very traffic that causes the next eviction. Measured
+    /// over `p1-swarm --peers 16 --seconds 180 --witness`, with the rest of this
+    /// change in place: queue overflows fell from 3920 to 794, chain gaps from
+    /// 6576 to 968, and `Stalled` escalations against honest bots — every one of
+    /// them a false positive by construction — from 1004 to 92.
+    pub per_peer_limit: usize,
 }
 
 impl Default for RepairBudget {
@@ -481,6 +640,7 @@ impl Default for RepairBudget {
         Self {
             share: 0.15,
             queue_limit: 64,
+            per_peer_limit: 4,
         }
     }
 }
@@ -493,6 +653,18 @@ pub struct PendingRepairs {
     pub overflowed: u64,
     /// Requests waiting on budget right now.
     pub deferred: u64,
+}
+
+impl PendingRepairs {
+    /// Requests queued on behalf of one peer.
+    ///
+    /// The number the per-peer cap exists to bound. A single total is not
+    /// enough to tell a busy island from one peer crowding everyone out, and
+    /// those want opposite responses.
+    #[must_use]
+    pub fn queued_for(&self, peer: NodeId) -> usize {
+        self.queue.iter().filter(|held| held.from == peer).count()
+    }
 }
 
 /// A repair this peer has been asked to serve.
@@ -532,10 +704,26 @@ pub fn serve_repair_requests(
     mut counters: ResMut<WitnessLinkCounters>,
 ) {
     for asked in requests.read() {
-        if pending.queue.len() >= repair.queue_limit {
-            // A peer that cannot serve is exactly the peer that gets asked
-            // repeatedly. Drop the *oldest*: the requester's own backoff has
-            // most likely superseded it already.
+        // Drop within the *asking* peer's own share first. A requester that
+        // cannot be served is exactly the one that asks repeatedly, and its own
+        // backoff has most likely superseded its older requests already — so
+        // dropping its oldest costs it nothing. Dropping the queue's oldest
+        // instead would make one peer's persistence everyone else's loss.
+        let held = pending
+            .queue
+            .iter()
+            .filter(|held| held.from == asked.from)
+            .count();
+        if held >= repair.per_peer_limit {
+            if let Some(index) = pending
+                .queue
+                .iter()
+                .position(|held| held.from == asked.from)
+            {
+                pending.queue.remove(index);
+                pending.overflowed += 1;
+            }
+        } else if pending.queue.len() >= repair.queue_limit {
             pending.queue.pop_front();
             pending.overflowed += 1;
         }

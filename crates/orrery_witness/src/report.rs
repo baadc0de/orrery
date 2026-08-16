@@ -35,9 +35,18 @@ impl core::error::Error for ReportError {}
 /// bundle itself — a bundle is up to 180 ticks of frames, and re-serializing it
 /// to verify one signature would make report checking cost proportional to the
 /// evidence rather than constant.
+///
+/// # Panics
+///
+/// If the bundle does not serialize, which cannot happen for a type built
+/// entirely from `Serialize` fields. Swallowing the error into an empty vector
+/// would be far worse than a panic: every report would then digest to the hash
+/// of the empty string, so any two reports would carry interchangeable
+/// signatures and the binding this function exists to create would silently not
+/// exist.
 #[must_use]
 fn preimage(subject: NodeId, reporter: NodeId, bundle: &EvidenceBundle) -> Vec<u8> {
-    let encoded = postcard::to_stdvec(bundle).unwrap_or_default();
+    let encoded = postcard::to_stdvec(bundle).expect("an evidence bundle is serializable");
     let mut hasher = blake3::Hasher::new();
     hasher.update(&encoded);
     let digest = hasher.finalize();

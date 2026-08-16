@@ -30,6 +30,12 @@ pub struct Chain {
     previous_claim: [u8; 32],
     /// Records accumulated since the last frame was cut.
     pending: Vec<InputRecord>,
+    /// State hashes the pending frame's ticks produced, in tick order.
+    ///
+    /// Retained alongside the frame so this bot can assemble a bundle to answer
+    /// for *itself* — a log with frames but no per-tick hashes can serve a
+    /// repair and still fail `IncompleteHashes` on every self-authored window.
+    pending_hashes: Vec<[u8; 32]>,
     /// Tick the pending frame starts at.
     frame_start: u64,
     /// The chain head as it stood before the pending records — the `prev_head`
@@ -43,6 +49,8 @@ pub struct AuthoredFrame {
     pub frame: LogFrame,
     /// Full head pairs the signature covers.
     pub transitions: Vec<HeadTransition>,
+    /// State hash produced by each tick the frame covers, in tick order.
+    pub tick_hashes: Vec<[u8; 32]>,
 }
 
 impl Chain {
@@ -61,6 +69,7 @@ impl Chain {
             head: ChainHash::EMPTY,
             previous_claim: [0; 32],
             pending: Vec::new(),
+            pending_hashes: Vec::new(),
             frame_start: first_tick,
             frame_base: ChainHash::EMPTY,
         }
@@ -95,6 +104,14 @@ impl Chain {
         };
         self.head = fold(self.head, &record);
         self.pending.push(record);
+    }
+
+    /// Retain the state hash the tick just executed produced.
+    ///
+    /// Called right after the step, so the hash lands in the same frame as the
+    /// input that produced it.
+    pub fn log_tick_hash(&mut self, hash: [u8; 32]) {
+        self.pending_hashes.push(hash);
     }
 
     /// Cut a frame if one is due at `tick`, returning it for publication.
@@ -132,7 +149,11 @@ impl Chain {
         };
         self.frame_start = tick + 1;
         self.frame_base = self.head;
-        Some(AuthoredFrame { frame, transitions })
+        Some(AuthoredFrame {
+            frame,
+            transitions,
+            tick_hashes: core::mem::take(&mut self.pending_hashes),
+        })
     }
 
     /// Cut a claim if one is due at `tick`.

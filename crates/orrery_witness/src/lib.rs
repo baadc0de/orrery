@@ -19,9 +19,21 @@
 //!    This is *the* signal for entities nobody is interacting with, which
 //!    prediction error cannot provide.
 //! 3. **Stage 2 — escalation.** A hard invariant breach, or a re-execution
-//!    mismatch, arms an audit over a window bounded at 180 ticks.
+//!    mismatch, arms an audit over a window bounded by
+//!    [`WitnessConfig::window_ticks`]. [`Witness::audit_window`] computes that
+//!    window: it opens at the last claim the witness and the subject
+//!    demonstrably agreed on and closes at the disputed claim.
 //! 4. **Stage 3 — report.** The window is assembled into a
-//!    [`DiscrepancyReport`] whose evidence stands on its own.
+//!    [`DiscrepancyReport`] whose evidence stands on its own, by
+//!    [`Witness::raise`].
+//!
+//! **Stages 2 and 3 are driven by the app, not by this crate.** Nothing here
+//! arms a window on its own and nothing files: the engine emits
+//! [`WitnessSignal::ClaimMismatch`], and it is the host that decides whether to
+//! call `audit_window` and `raise`. That is a P4 posture rather than an
+//! omission — the phase is passive by design — but it means a host that only
+//! counts signals is running stages 1a and 1c and nothing else. The `p1-swarm`
+//! harness does exactly that, deliberately.
 //!
 //! # Shadow mode is the default, and that is the point
 //!
@@ -59,8 +71,8 @@ pub mod witness;
 
 #[cfg(feature = "bevy")]
 pub use plugin::{
-    AuthoredLog, PublishClaim, PublishFrame, WitnessLinkCounters, WitnessPlugin, WitnessSet,
-    WitnessState, Witnessed,
+    AuthoredLog, PendingRepairs, PublishClaim, PublishFrame, RepairBudget, WitnessClock,
+    WitnessLinkCounters, WitnessPlugin, WitnessSet, WitnessState, Witnessed,
 };
 pub use report::{sign_report, verify_report, ReportError};
 pub use witness::{
