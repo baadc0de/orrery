@@ -1,3 +1,9 @@
+#![allow(unexpected_cfgs)]
+// `orrery_persist_client/tests/gateway_live.rs` pulls this module in by
+// `#[path]`, and that crate declares no `fdb` feature — so the `fdb` gate
+// below, correct for this crate, reads as an unexpected cfg over there and
+// trips CI's `-D warnings`. Scoped to this shared support module rather than
+// to either crate.
 #![allow(
     dead_code,
     reason = "each integration-test binary uses a different subset of the shared fixture"
