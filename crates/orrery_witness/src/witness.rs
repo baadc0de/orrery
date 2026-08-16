@@ -289,6 +289,56 @@ impl<R: Ruleset> Witness<R> {
         }
     }
 
+    /// Whether this witness is following `entity`.
+    #[must_use]
+    pub fn watches(&self, entity: PersistId) -> bool {
+        self.watched.contains_key(&entity)
+    }
+
+    /// Ingest a frame as it arrived on the wire, with its full head pairs.
+    ///
+    /// [`Self::ingest_frame`] wants sibling heads positionally — the entities
+    /// this witness does *not* follow, in slice order. A sender cannot produce
+    /// that list, because it does not know what any given receiver follows, so
+    /// on the wire every entity's pair travels and the selection happens here.
+    /// Doing it in the caller would duplicate the rule that picks the watched
+    /// entity, and the two would drift.
+    ///
+    /// Pairs for followed entities are ignored: this witness folded those
+    /// itself, and taking the sender's word for them would let an authority
+    /// choose the head its own frame is checked against.
+    ///
+    /// # Errors
+    ///
+    /// [`WitnessError::FrameRejected`] if a pair is missing for an entity this
+    /// witness cannot fold — the preimage cannot be rebuilt, so the signature
+    /// cannot be checked. Otherwise as [`Self::ingest_frame`].
+    pub fn ingest_wire_frame(
+        &mut self,
+        frame: &LogFrame,
+        heads: &[orrery_protocol::FrameHead],
+    ) -> Result<Vec<WitnessSignal>, WitnessError> {
+        let watched = frame
+            .entities
+            .iter()
+            .map(|slice| slice.entity)
+            .find(|entity| self.watched.contains_key(entity))
+            .ok_or(WitnessError::NotWatched)?;
+
+        let mut siblings = Vec::with_capacity(frame.entities.len().saturating_sub(1));
+        for slice in &frame.entities {
+            if slice.entity == watched {
+                continue;
+            }
+            let Some(pair) = heads.iter().find(|head| head.entity == slice.entity) else {
+                self.counters.frames_rejected += 1;
+                return Err(WitnessError::FrameRejected);
+            };
+            siblings.push((pair.prev_head, pair.head));
+        }
+        self.ingest_frame(frame, &siblings)
+    }
+
     /// Ingest a signed frame and re-execute the ticks it covers.
     ///
     /// # Errors

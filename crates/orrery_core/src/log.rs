@@ -40,9 +40,7 @@ pub fn fold(previous: ChainHash, record: &InputRecord) -> ChainHash {
 /// Fold a whole run of records.
 #[must_use]
 pub fn fold_all(previous: ChainHash, records: &[InputRecord]) -> ChainHash {
-    records
-        .iter()
-        .fold(previous, |head, record| fold(head, record))
+    records.iter().fold(previous, fold)
 }
 
 /// One entity's live chain, as the authority maintains it.

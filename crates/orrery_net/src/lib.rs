@@ -12,6 +12,7 @@
 pub mod channels;
 pub mod coordinator;
 pub mod island;
+pub mod peer_link;
 pub mod plugin;
 
 /// The async runtime the IO layer and the coordinator session share.
@@ -25,4 +26,5 @@ pub use coordinator::{
 };
 pub use island::{IslandMembership, IslandSource, NetEvent};
 pub use orrery_protocol::coord::{IslandId, TopologyRegime};
+pub use peer_link::{PeerLinkCounters, PeerPacket, SendPacket};
 pub use plugin::OrreryNetPlugin;
