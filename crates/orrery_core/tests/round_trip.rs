@@ -157,10 +157,10 @@ fn run_authority(ticks: u64, retention: Retention) -> (AuthorityLog, Executor<Ki
     // authority cannot rewrite its own history one claim at a time even when
     // every individual signature is valid.
     let mut previous_claim = [0u8; 32];
-    let mut claim_at = |log: &mut AuthorityLog,
-                        executor: &Executor<Kinematic>,
-                        tick: u64,
-                        previous: &mut [u8; 32]| {
+    let claim_at = |log: &mut AuthorityLog,
+                    executor: &Executor<Kinematic>,
+                    tick: u64,
+                    previous: &mut [u8; 32]| {
         let state = executor.state(ENTITY).expect("entity present");
         let snapshot = state.to_canonical();
         let mut claim = StateClaim {
@@ -230,7 +230,7 @@ fn run_authority(ticks: u64, retention: Retention) -> (AuthorityLog, Executor<Ki
         log.record_frame(frame, transitions);
 
         tick += 3;
-        if (tick - T0) % CLAIM_EVERY == 0 {
+        if (tick - T0).is_multiple_of(CLAIM_EVERY) {
             claim_at(&mut log, &executor, tick, &mut previous_claim);
         }
     }

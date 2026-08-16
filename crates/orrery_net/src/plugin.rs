@@ -89,12 +89,26 @@ impl Plugin for OrreryNetPlugin {
             .init_resource::<PeerRegistry>()
             .init_resource::<IslandMembership>()
             .init_resource::<PathTelemetry>()
+            .init_resource::<crate::peer_link::PeerLinkCounters>()
             .add_message::<NetEvent>()
+            .add_message::<crate::peer_link::PeerPacket>()
+            .add_message::<crate::peer_link::SendPacket>()
             .add_plugins(CoordinatorPlugin {
                 config: self.coordinator.clone(),
             })
             .add_systems(Startup, open_endpoint)
-            .add_systems(Update, (track_peers, track_paths))
+            .add_systems(
+                Update,
+                (
+                    track_peers,
+                    track_paths,
+                    // Receive before send, so a reply built this frame goes out
+                    // this frame rather than waiting for the next one.
+                    crate::peer_link::receive_peer_packets,
+                    crate::peer_link::send_peer_packets,
+                )
+                    .chain(),
+            )
             .add_observer(on_session_request);
 
         // Only one of the two drives membership. Running both would have the
