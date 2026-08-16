@@ -812,16 +812,21 @@ impl GatewayLink {
     }
 
     /// Write a control payload on the reliable lane.
+    ///
+    /// A message the gateway's reader would refuse is dropped here rather than
+    /// written: writing it would tear the stream and take every message queued
+    /// behind it. The cap is checked before the frame is built, so an oversize
+    /// message does not get an allocation on its way to being refused.
     async fn send_control(&self, msg: &GatewayMsg) {
         let payload = encode_stream_frame(msg);
-        let mut framed = Vec::with_capacity(payload.len() + 4);
-        #[allow(clippy::cast_possible_truncation)] // Bounded by the message cap below.
-        framed.extend_from_slice(&(payload.len() as u32).to_le_bytes());
-        framed.extend_from_slice(&payload);
         if payload.len() > orrery_protocol::channels::MAX_RELIABLE_MESSAGE_BYTES {
             tracing::warn!(len = payload.len(), "control message too large to send");
             return;
         }
+        let mut framed = Vec::with_capacity(payload.len() + 4);
+        #[allow(clippy::cast_possible_truncation)] // Bounded by the cap just checked.
+        framed.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        framed.extend_from_slice(&payload);
         let mut control = self.control.lock().await;
         if control.is_none() {
             match self.conn.open_uni().await {
