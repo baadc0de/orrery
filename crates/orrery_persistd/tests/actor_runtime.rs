@@ -2936,3 +2936,185 @@ fn corruption_is_detected_on_scan() {
     assert_eq!(payload_crc(b""), 0);
     assert_eq!(payload_crc(b"123456789"), 0xE306_9283);
 }
+
+/// One synthetic journal, two recovery paths, one answer.
+///
+/// `CellRuntime::restore`'s doc claimed its C-2 predicate was identical to
+/// `open`'s and it was not: `open` advanced the running maximum epoch before
+/// the watermark filter while `restore` skipped at the watermark first, and
+/// `open` dispatched to the deepest matching shard while `restore` matched any
+/// prefix. Under a nested shard set both differences bite at once — the parent
+/// is a prefix of every cell in the child, and the pre-watermark records that
+/// establish the epoch are exactly the ones `restore` cannot see.
+///
+/// The journal below is built by hand because the actor stamps its own epoch
+/// onto anything routed through `apply`: two records at epoch 5 covered by the
+/// checkpoint, then two zombies at epoch 3 in the tail, one pair per shard.
+#[tokio::test]
+async fn open_and_restore_fold_a_nested_journal_identically() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = runtime_config(dir.path(), false);
+    let nested = CellId::ROOT.children()[0];
+    config.shards = vec![CellId::ROOT, nested];
+    // Owned by the nested shard, and a prefix match for the root shard.
+    let nested_cell = nested.children()[2];
+    // Owned by the root shard: no deeper shard covers it.
+    let root_cell = CellId::ROOT.children()[3];
+
+    let at_epoch = |cell: CellId, entity: u64, epoch: u64| JournalRecord {
+        epoch: Epoch::new(epoch),
+        ..mk_record(cell, entity, RecordKind::Spawn, b"synthetic")
+    };
+    let journal = orrery_persistd::Journal::open(&config.journal).unwrap();
+    let mut positions = Vec::new();
+    for record in [
+        at_epoch(nested_cell, 1, 5),
+        at_epoch(root_cell, 2, 5),
+        // Superseded-at-write-time zombies: below the epoch already seen at a
+        // lower LSN in their own shard.
+        at_epoch(nested_cell, 3, 3),
+        at_epoch(root_cell, 4, 3),
+    ] {
+        let handle = journal.append(record).unwrap();
+        handle.committed().await.unwrap();
+        positions.push(handle.lsn());
+    }
+    journal.close().await.unwrap();
+    // The fjall lock is released on drop, not on close.
+    drop(journal);
+
+    // A checkpoint per shard at epoch 5, covering the first two records.
+    let checkpoints = Arc::new(MemCheckpointStore::new());
+    let watermark = positions[1];
+    for (shard, entity, cell) in [(nested, 1u64, nested_cell), (CellId::ROOT, 2, root_cell)] {
+        checkpoints
+            .checkpoint(&CheckpointData {
+                shard,
+                grid: GridId::ROOT,
+                node_id: 0,
+                epoch: Epoch::new(5),
+                watermark,
+                entities: std::collections::HashMap::from([(
+                    PersistId::new(entity),
+                    orrery_persistd::EntityRecord {
+                        components: bytes::Bytes::from_static(b"synthetic"),
+                        dirty: false,
+                    },
+                )]),
+                by_cell: std::collections::HashMap::from([(PersistId::new(entity), cell)]),
+                tombstones: std::collections::HashMap::new(),
+                superseded: std::collections::HashSet::new(),
+                taken_at_ms: 1_700_000_000_000,
+            })
+            .await
+            .unwrap();
+    }
+
+    let rt = CellRuntime::open(&config, &(checkpoints.clone() as Arc<dyn CheckpointStore>))
+        .await
+        .unwrap();
+    let opened: Vec<_> = vec![
+        rt.read(GridId::ROOT, nested).await.unwrap().entities,
+        rt.read(GridId::ROOT, CellId::ROOT).await.unwrap().entities,
+    ];
+    assert_eq!(
+        opened[0].keys().copied().collect::<Vec<_>>(),
+        vec![PersistId::new(1)],
+        "the nested shard keeps its checkpointed entity and drops its zombie"
+    );
+    assert_eq!(
+        opened[1].keys().copied().collect::<Vec<_>>(),
+        vec![PersistId::new(2)],
+        "the root shard serves only what it owns — the nested cell is not its \
+         entity, prefix match or not"
+    );
+
+    // The same journal through the other path, onto the same actors.
+    for shard in [nested, CellId::ROOT] {
+        rt.restore(shard, checkpoints.as_ref()).await.unwrap();
+    }
+    assert_eq!(
+        rt.read(GridId::ROOT, nested).await.unwrap().entities.len(),
+        opened[0].len(),
+        "restore folds the nested shard exactly as open did"
+    );
+    assert_eq!(
+        rt.read(GridId::ROOT, CellId::ROOT)
+            .await
+            .unwrap()
+            .entities
+            .len(),
+        opened[1].len(),
+        "restore folds the root shard exactly as open did"
+    );
+
+    rt.close().await.unwrap();
+}
+
+/// A corrupt record for a shard this node does not host must not fail `open`.
+///
+/// The CRC check used to run before the record was dispatched, so one bad
+/// payload anywhere in a shared journal bricked startup for every node that
+/// read it — including the ones with no actor for that cell, which can neither
+/// observe the damage nor repair it.
+#[tokio::test]
+async fn open_tolerates_a_corrupt_record_for_a_foreign_shard() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = runtime_config(dir.path(), false);
+    let hosted = CellId::ROOT.children()[0];
+    let foreign = CellId::ROOT.children()[4];
+    config.shards = vec![hosted];
+
+    let journal = orrery_persistd::Journal::open(&config.journal).unwrap();
+    let mut corrupt = mk_record(foreign, 9, RecordKind::Spawn, b"payload");
+    corrupt.crc ^= 0xffff_ffff;
+    for record in [mk_record(hosted, 8, RecordKind::Spawn, b"payload"), corrupt] {
+        let handle = journal.append(record).unwrap();
+        handle.committed().await.unwrap();
+    }
+    journal.close().await.unwrap();
+    // The fjall lock is released on drop, not on close.
+    drop(journal);
+
+    let rt = CellRuntime::open(&config, &mem_store())
+        .await
+        .expect("a corrupt foreign-shard record is not this node's to fail on");
+    let page = rt.read(GridId::ROOT, hosted).await.unwrap();
+    assert_eq!(page.entities.len(), 1);
+    rt.close().await.unwrap();
+}
+
+/// A record from another grid is not this runtime's to fold. The live write
+/// path has always refused it (`CellRuntime::actor`'s grid guard) and so has
+/// the rekey branch of recovery; the plain diff path did not, so recovery
+/// admitted rows the running node would have rejected.
+#[tokio::test]
+async fn open_skips_records_from_another_grid() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = runtime_config(dir.path(), false);
+
+    let journal = orrery_persistd::Journal::open(&config.journal).unwrap();
+    let foreign = JournalRecord {
+        grid: GridId::new(77),
+        ..mk_record(CellId::ROOT, 6, RecordKind::Spawn, b"other-grid")
+    };
+    for record in [
+        mk_record(CellId::ROOT, 5, RecordKind::Spawn, b"this-grid"),
+        foreign,
+    ] {
+        let handle = journal.append(record).unwrap();
+        handle.committed().await.unwrap();
+    }
+    journal.close().await.unwrap();
+    // The fjall lock is released on drop, not on close.
+    drop(journal);
+
+    let rt = CellRuntime::open(&config, &mem_store()).await.unwrap();
+    let page = rt.read(GridId::ROOT, CellId::ROOT).await.unwrap();
+    assert_eq!(
+        page.entities.len(),
+        1,
+        "the same cell id under another grid is another universe (P-7)"
+    );
+    rt.close().await.unwrap();
+}
