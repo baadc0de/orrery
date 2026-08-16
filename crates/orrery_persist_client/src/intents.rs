@@ -4,7 +4,7 @@
 //! Critical operations (trades, currency, progression, structure placement)
 //! are the only path for durable consequences. The client signs the intent,
 //! gathers K-of-N attestations from the seeded witness set, and submits it to
-//! the gateway over a reliable stream. While the gateway is unreachable the
+//! the gateway on the reliable stream lane. While the gateway is unreachable the
 //! intent queues locally (the D12 posture: P2P sim continues, durable commits
 //! pause) and replays on reconnect — idempotency keys make replay safe.
 //!
@@ -17,6 +17,31 @@
 //! plugin's reconnect system calls it via [`disconnect_gateway`]. A per-intent
 //! in-flight timeout (default 10 s) also retriggers requeue so an unacked
 //! intent is retransmitted without a full disconnect cycle.
+//!
+//! # Why at-least-once survived the move to a reliable lane
+//!
+//! Submissions ride the reliable stream lane now (C-1), so an intent is no
+//! longer lost to a dropped datagram — and none of the machinery above is
+//! therefore redundant, because none of it was ever really about datagram
+//! loss. The window it covers is the one QUIC cannot close: the gateway
+//! receives a submission, commits it durably, and the connection dies before
+//! the ack reaches the client. The client cannot distinguish that from a
+//! submission that never arrived, so it must replay — and replay must not
+//! commit twice.
+//!
+//! That is what the `intent/{intent_id}` idempotency row on the gateway side
+//! is for, and it is why the pairing stays: **at-least-once delivery plus an
+//! idempotency key is a route to exactly-once *outcomes*, and a better
+//! transport does not supply one.** Removing either half because the wire got
+//! more reliable would trade a safety property for a redundancy that is not
+//! there.
+//!
+//! What did change is what the in-flight timeout *means*. It was a
+//! retransmit timer for a lost submission; on a reliable lane a submission on
+//! a live connection cannot be lost without the connection dying, and a dying
+//! connection already requeues. It is now a liveness backstop for a gateway
+//! that accepted an intent and never answered — a stalled executor, a lost
+//! reply — which is why it is measured in seconds and not in round trips.
 
 use std::collections::VecDeque;
 use std::time::Duration;
@@ -75,6 +100,13 @@ struct QueuedIntent {
 }
 
 /// Default in-flight timeout before an unacked intent is requeued (10 s).
+///
+/// A liveness backstop, not a retransmit timer — see the [module
+/// docs](self#why-at-least-once-survived-the-move-to-a-reliable-lane). It is
+/// deliberately far above the D16 intent-commit budget (p99 < 10 ms) so it
+/// never fires on a gateway that is merely slow; a client that resubmits at
+/// the commit budget would amplify load against exactly the gateway that is
+/// already struggling.
 const INFLIGHT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The intent queue (docs/10-crates.md §9).
@@ -329,14 +361,14 @@ impl IntentQueue {
 
 /// The Bevy system that drains the intent queue to the gateway.
 ///
-/// When connected, queued intents are transmitted over the reliable stream.
+/// When connected, queued intents are written to the session's reliable lane.
 /// Before draining, any `InFlight` intent older than the in-flight timeout is
-/// requeued so it is retransmitted even without a disconnect (a lost reliable
-/// stream or a stalled gateway would otherwise strand it forever).
+/// requeued so a gateway that accepted an intent and never answered does not
+/// strand it forever.
 pub fn drain_intents(
     session: Res<GatewaySession>,
     mut queue: ResMut<IntentQueue>,
-    mut sessions: Query<&mut aeronet_io::Session>,
+    mut streams: Query<&mut aeronet_iroh::stream::IrohStreamIo>,
 ) {
     if !session.is_connected() {
         return;
@@ -344,13 +376,13 @@ pub fn drain_intents(
     let Some(entity) = session.session else {
         return;
     };
-    let Ok(mut io) = sessions.get_mut(entity) else {
+    let Ok(mut streams) = streams.get_mut(entity) else {
         return;
     };
     let _ = queue.requeue_expired();
     for intent in queue.drain() {
         let msg = orrery_protocol::GatewayMsg::SubmitIntent { intent };
-        io.send.push(GatewaySession::encode_stream(&msg));
+        GatewaySession::push_control(&mut streams, &msg);
     }
 }
 

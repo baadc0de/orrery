@@ -8,6 +8,7 @@
 //! client → gateway → cell-actor path — but Bevy-free, using the raw iroh
 //! endpoint directly (D15).
 
+mod lanes;
 mod support;
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -22,9 +23,7 @@ use orrery_persistd::{
     payload_crc, CellRuntime, ClaimResult, GatewayConfig, GatewayServer, JournalConfig,
     MemFenceStore, Router, RuntimeConfig, GATEWAY_ALPN,
 };
-use orrery_protocol::channels::{
-    decode_datagram, decode_stream_frame, encode_datagram, encode_stream_frame,
-};
+use orrery_protocol::channels::{decode_datagram, decode_stream_frame};
 use orrery_protocol::{
     Attestation, CellId, ClaimBasis, ClaimKind, CoordinatorInterestSnapshot, DiffUplink,
     EntityRekey, Epoch, GatewayMsg, GatewayReply, GridId, Intent, IntentOp, IntentOutcome,
@@ -317,10 +316,14 @@ fn session_token(
     support::session_token(issuer, bound_node, issued_at_ms, ttl_ms)
 }
 
+/// Dial the gateway, complete admission, and start draining both lanes.
+///
+/// The endpoint is returned alongside because dropping it closes the
+/// connection.
 async fn raw_connection(
     key: iroh_base::SecretKey,
     address: iroh::EndpointAddr,
-) -> (iroh::Endpoint, iroh::endpoint::Connection) {
+) -> (iroh::Endpoint, lanes::GatewayLanes) {
     let endpoint = iroh::endpoint::Builder::new(iroh::endpoint::presets::N0)
         .alpns(vec![GATEWAY_ALPN.to_vec()])
         .relay_mode(RelayMode::Disabled)
@@ -329,9 +332,11 @@ async fn raw_connection(
         .await
         .unwrap();
     let connection = endpoint.connect(address, GATEWAY_ALPN).await.unwrap();
+    // Read admission before attaching: the lane reader accepts every inbound
+    // stream from that point on, and would otherwise consume it.
     let mut admission = connection.accept_uni().await.unwrap();
     assert_eq!(admission.read_to_end(16).await.unwrap(), vec![0u8]);
-    (endpoint, connection)
+    (endpoint, lanes::GatewayLanes::attach(connection))
 }
 
 async fn seed_entity(runtime: &Arc<Mutex<CellRuntime>>, entity: PersistId, cell: CellId) {
@@ -363,7 +368,7 @@ async fn seed_entity(runtime: &Arc<Mutex<CellRuntime>>, entity: PersistId, cell:
 }
 
 async fn claim_reply(
-    connection: &iroh::endpoint::Connection,
+    connection: &lanes::GatewayLanes,
     entity: PersistId,
     grid: GridId,
     cell: CellId,
@@ -371,7 +376,7 @@ async fn claim_reply(
     basis: ClaimBasis,
 ) -> LeaseMsg {
     connection
-        .send_datagram(Bytes::from(encode_stream_frame(&GatewayMsg::Lease {
+        .send_control(&GatewayMsg::Lease {
             message: LeaseMsg::Claim {
                 claim_id: orrery_protocol::ClaimId(1),
                 entity,
@@ -382,12 +387,12 @@ async fn claim_reply(
                 observed: Default::default(),
                 tick: Tick::new(1),
             },
-        })))
-        .unwrap();
+        })
+        .await;
     loop {
-        let packet = tokio::time::timeout(Duration::from_secs(5), connection.read_datagram())
+        let packet = connection
+            .next_payload(Duration::from_secs(5))
             .await
-            .unwrap()
             .unwrap();
         if let Some(GatewayReply::Lease { message }) = decode_stream_frame(&packet) {
             return message;
@@ -395,28 +400,28 @@ async fn claim_reply(
     }
 }
 
-async fn receives_hello_ack(connection: &iroh::endpoint::Connection) -> bool {
+async fn receives_hello_ack(connection: &lanes::GatewayLanes) -> bool {
     matches!(
-        tokio::time::timeout(Duration::from_millis(150), connection.read_datagram()).await,
-        Ok(Ok(packet))
+        connection.next_payload(Duration::from_millis(150)).await,
+        Some(packet)
             if matches!(decode_stream_frame(&packet), Some(GatewayReply::HelloAck { .. }))
     )
 }
 
 async fn heartbeat_reply(
-    connection: &iroh::endpoint::Connection,
+    connection: &lanes::GatewayLanes,
     lease_ids: Vec<orrery_protocol::LeaseId>,
     tick: Tick,
 ) -> (Vec<orrery_protocol::Lease>, Vec<orrery_protocol::LeaseId>) {
     connection
-        .send_datagram(Bytes::from(encode_stream_frame(&GatewayMsg::Lease {
+        .send_control(&GatewayMsg::Lease {
             message: LeaseMsg::Heartbeat { lease_ids, tick },
-        })))
-        .unwrap();
+        })
+        .await;
     loop {
-        let packet = tokio::time::timeout(Duration::from_secs(5), connection.read_datagram())
+        let packet = connection
+            .next_payload(Duration::from_secs(5))
             .await
-            .unwrap()
             .unwrap();
         if let Some(GatewayReply::Lease {
             message: LeaseMsg::HeartbeatAck { leases, invalid },
@@ -427,14 +432,12 @@ async fn heartbeat_reply(
     }
 }
 
-async fn diff_reply(connection: &iroh::endpoint::Connection, diff: DiffUplink) -> GatewayReply {
-    connection
-        .send_datagram(Bytes::from(encode_datagram(&GatewayMsg::Diff { diff })))
-        .unwrap();
+async fn diff_reply(connection: &lanes::GatewayLanes, diff: DiffUplink) -> GatewayReply {
+    connection.send_state(&GatewayMsg::Diff { diff });
     loop {
-        let packet = tokio::time::timeout(Duration::from_secs(5), connection.read_datagram())
+        let packet = connection
+            .next_payload(Duration::from_secs(5))
             .await
-            .unwrap()
             .unwrap();
         if let Some(reply @ (GatewayReply::BulkAck { .. } | GatewayReply::BulkNack { .. })) =
             decode_datagram(&packet)
@@ -454,7 +457,7 @@ async fn journal_len(runtime: &Arc<Mutex<CellRuntime>>) -> usize {
 }
 
 async fn assert_diff_denied_without_mutation(
-    connection: &iroh::endpoint::Connection,
+    connection: &lanes::GatewayLanes,
     actor: &orrery_persistd::CellActorHandle,
     runtime: &Arc<Mutex<CellRuntime>>,
     entity: PersistId,
@@ -466,24 +469,22 @@ async fn assert_diff_denied_without_mutation(
         .commit_metrics()
         .snapshot()
         .total();
-    connection
-        .send_datagram(Bytes::from(encode_datagram(&GatewayMsg::Diff {
-            diff: DiffUplink {
-                cell: CellId::ROOT,
-                grid: GridId::ROOT,
-                entity,
-                tick: Tick::new(2),
-                kind: RecordKind::Spawn,
-                payload: Bytes::from_static(b"unauthorized"),
-                seq: 1,
-                lease_id: None,
-                authority_seq: None,
-            },
-        })))
-        .unwrap();
-    let packet = tokio::time::timeout(Duration::from_secs(1), connection.read_datagram())
+    connection.send_state(&GatewayMsg::Diff {
+        diff: DiffUplink {
+            cell: CellId::ROOT,
+            grid: GridId::ROOT,
+            entity,
+            tick: Tick::new(2),
+            kind: RecordKind::Spawn,
+            payload: Bytes::from_static(b"unauthorized"),
+            seq: 1,
+            lease_id: None,
+            authority_seq: None,
+        },
+    });
+    let packet = connection
+        .next_payload(Duration::from_secs(1))
         .await
-        .unwrap()
         .unwrap();
     assert!(matches!(
         decode_datagram(&packet),
@@ -600,18 +601,20 @@ fn gateway_closes_the_client_to_actor_path() {
         let conn = client.connect(server_addr, GATEWAY_ALPN).await.unwrap();
 
         // Admission: the gateway streams [ACCEPTED] (byte 0) on a uni stream.
+        // Read it before attaching, or the lane reader consumes it.
         let mut admission = conn.accept_uni().await.unwrap();
         let msg = admission.read_to_end(16).await.unwrap();
         assert_eq!(msg, vec![0u8]);
+        let conn = lanes::GatewayLanes::attach(conn);
 
         // A claimed NodeId that does not equal the iroh-authenticated remote
         // identity must not activate lease traffic.
-        conn.send_datagram(Bytes::from(encode_stream_frame(&GatewayMsg::Hello {
+        conn.send_control(&GatewayMsg::Hello {
             token: b"bad-node".to_vec(),
             node: node(2),
-        })))
-        .unwrap();
-        conn.send_datagram(Bytes::from(encode_stream_frame(&GatewayMsg::Lease {
+        })
+        .await;
+        conn.send_control(&GatewayMsg::Lease {
             message: orrery_protocol::LeaseMsg::Claim {
                 claim_id: orrery_protocol::ClaimId(1),
                 entity: PersistId::new(999),
@@ -622,17 +625,17 @@ fn gateway_closes_the_client_to_actor_path() {
                 observed: Default::default(),
                 tick: Tick::new(0),
             },
-        })))
-        .unwrap();
+        })
+        .await;
 
         // A matching Hello binds the session and activates control traffic.
-        conn.send_datagram(Bytes::from(encode_stream_frame(&GatewayMsg::Hello {
+        conn.send_control(&GatewayMsg::Hello {
             token: session_token(&issuer, node(1), 900, 200),
             node: node(1),
-        })))
-        .unwrap();
+        })
+        .await;
 
-        conn.send_datagram(Bytes::from(encode_stream_frame(&GatewayMsg::Lease {
+        conn.send_control(&GatewayMsg::Lease {
             message: orrery_protocol::LeaseMsg::Claim {
                 claim_id: orrery_protocol::ClaimId(2),
                 entity: PersistId::new(1),
@@ -643,13 +646,10 @@ fn gateway_closes_the_client_to_actor_path() {
                 observed: Default::default(),
                 tick: Tick::new(1),
             },
-        })))
-        .unwrap();
+        })
+        .await;
         let grant = loop {
-            let pkt = tokio::time::timeout(Duration::from_secs(5), conn.read_datagram())
-                .await
-                .unwrap()
-                .unwrap();
+            let pkt = conn.next_payload(Duration::from_secs(5)).await.unwrap();
             let Some(GatewayReply::Lease {
                 message: orrery_protocol::LeaseMsg::Grant { lease_id, seq, .. },
             }) = decode_stream_frame(&pkt)
@@ -674,18 +674,15 @@ fn gateway_closes_the_client_to_actor_path() {
 
         // Session-indexed heartbeats fan back to the owning actor and return
         // the renewed row on the typed reliable-control reply.
-        conn.send_datagram(Bytes::from(encode_stream_frame(&GatewayMsg::Lease {
+        conn.send_control(&GatewayMsg::Lease {
             message: orrery_protocol::LeaseMsg::Heartbeat {
                 lease_ids: vec![grant.0, orrery_protocol::LeaseId(999)],
                 tick: Tick::new(2),
             },
-        })))
-        .unwrap();
+        })
+        .await;
         let renewed = loop {
-            let pkt = tokio::time::timeout(Duration::from_secs(5), conn.read_datagram())
-                .await
-                .unwrap()
-                .unwrap();
+            let pkt = conn.next_payload(Duration::from_secs(5)).await.unwrap();
             let Some(GatewayReply::Lease {
                 message: orrery_protocol::LeaseMsg::HeartbeatAck { leases, invalid },
             }) = decode_stream_frame(&pkt)
@@ -702,7 +699,7 @@ fn gateway_closes_the_client_to_actor_path() {
 
         // A stale pair is rejected before reaching the actor and carries the
         // current registrar row so the holder can recover without a lookup.
-        conn.send_datagram(Bytes::from(encode_datagram(&GatewayMsg::Diff {
+        conn.send_state(&GatewayMsg::Diff {
             diff: DiffUplink {
                 cell: CellId::ROOT,
                 grid: GridId::ROOT,
@@ -714,12 +711,8 @@ fn gateway_closes_the_client_to_actor_path() {
                 lease_id: Some(orrery_protocol::LeaseId(0)),
                 authority_seq: Some(Default::default()),
             },
-        })))
-        .unwrap();
-        let pkt = tokio::time::timeout(Duration::from_secs(5), conn.read_datagram())
-            .await
-            .unwrap()
-            .unwrap();
+        });
+        let pkt = conn.next_payload(Duration::from_secs(5)).await.unwrap();
         let Some(GatewayReply::BulkNack {
             lease: Some(current),
             ..
@@ -733,7 +726,7 @@ fn gateway_closes_the_client_to_actor_path() {
         // Missing fencing fields are also lease failures, not a generic
         // malformed-diff response: the actor returns its current row so a
         // client can recover the pair without an out-of-band lookup.
-        conn.send_datagram(Bytes::from(encode_datagram(&GatewayMsg::Diff {
+        conn.send_state(&GatewayMsg::Diff {
             diff: DiffUplink {
                 cell: CellId::ROOT,
                 grid: GridId::ROOT,
@@ -745,12 +738,8 @@ fn gateway_closes_the_client_to_actor_path() {
                 lease_id: None,
                 authority_seq: None,
             },
-        })))
-        .unwrap();
-        let pkt = tokio::time::timeout(Duration::from_secs(5), conn.read_datagram())
-            .await
-            .unwrap()
-            .unwrap();
+        });
+        let pkt = conn.next_payload(Duration::from_secs(5)).await.unwrap();
         let Some(GatewayReply::BulkNack {
             lease: Some(current),
             ..
@@ -762,7 +751,7 @@ fn gateway_closes_the_client_to_actor_path() {
         assert_eq!(current.seq, grant.1);
 
         // Bulk diff.
-        conn.send_datagram(Bytes::from(encode_datagram(&GatewayMsg::Diff {
+        conn.send_state(&GatewayMsg::Diff {
             diff: DiffUplink {
                 cell: CellId::ROOT,
                 grid: GridId::ROOT,
@@ -774,26 +763,23 @@ fn gateway_closes_the_client_to_actor_path() {
                 lease_id: Some(grant.0),
                 authority_seq: Some(grant.1),
             },
-        })))
-        .unwrap();
+        });
 
         // Intent — signed by the gateway's own identity (the fixture has no
         // executor configured, so the honest outcome is a rejection, never a
         // fake commit; the commit path is covered by tests/intent_commit.rs).
         let intent = signed_intent(7, &secret(1));
-        conn.send_datagram(Bytes::from(encode_stream_frame(
-            &GatewayMsg::SubmitIntent {
-                intent: intent.clone(),
-            },
-        )))
-        .unwrap();
+        conn.send_control(&GatewayMsg::SubmitIntent {
+            intent: intent.clone(),
+        })
+        .await;
 
         // Subscribe to the (single) shard cell.
-        conn.send_datagram(Bytes::from(encode_stream_frame(&GatewayMsg::Subscribe {
+        conn.send_control(&GatewayMsg::Subscribe {
             grid: GridId::ROOT,
             cells: vec![CellId::ROOT],
-        })))
-        .unwrap();
+        })
+        .await;
 
         // Collect the replies: expect a bulk ack, an area page, and an intent ack.
         let mut got_ack = false;
@@ -803,10 +789,8 @@ fn gateway_closes_the_client_to_actor_path() {
             if got_ack && got_page && got_intent {
                 break;
             }
-            let pkt = match tokio::time::timeout(Duration::from_secs(5), conn.read_datagram()).await
-            {
-                Ok(Ok(p)) => p,
-                _ => break,
+            let Some(pkt) = conn.next_payload(Duration::from_secs(5)).await else {
+                break;
             };
             if let Some(GatewayReply::BulkAck { entity, tick, .. }) = decode_datagram(&pkt) {
                 got_ack = entity == PersistId::new(1) && tick == Tick::new(1);
@@ -942,11 +926,11 @@ fn gateway_gates_client_claims_against_committed_location_and_authoritative_inte
         .unwrap();
         let (_client, connection) = raw_connection(secret(1), server.addr()).await;
         connection
-            .send_datagram(Bytes::from(encode_stream_frame(&GatewayMsg::Hello {
+            .send_control(&GatewayMsg::Hello {
                 token: session_token(&issuer, node(1), 900, 200),
                 node: node(1),
-            })))
-            .unwrap();
+            })
+            .await;
         assert!(receives_hello_ack(&connection).await);
 
         // When: a weak contact targets its exact committed, covered cell.
@@ -975,11 +959,11 @@ fn gateway_gates_client_claims_against_committed_location_and_authoritative_inte
 
         // When: invalid locations, interest, or client-owned basis are submitted.
         connection
-            .send_datagram(Bytes::from(encode_stream_frame(&GatewayMsg::Subscribe {
+            .send_control(&GatewayMsg::Subscribe {
                 grid: GridId::ROOT,
                 cells: vec![cells[1]],
-            })))
-            .unwrap();
+            })
+            .await;
         let denied = [
             (
                 PersistId::new(399),
@@ -1032,11 +1016,11 @@ fn gateway_gates_client_claims_against_committed_location_and_authoritative_inte
 
         let (_stale_client, stale_connection) = raw_connection(secret(2), server.addr()).await;
         stale_connection
-            .send_datagram(Bytes::from(encode_stream_frame(&GatewayMsg::Hello {
+            .send_control(&GatewayMsg::Hello {
                 token: session_token(&issuer, node(2), 900, 200),
                 node: node(2),
-            })))
-            .unwrap();
+            })
+            .await;
         assert!(receives_hello_ack(&stale_connection).await);
         let stale_reply = claim_reply(
             &stale_connection,
@@ -1131,16 +1115,16 @@ fn gateway_rejects_unverified_raw_iroh_hellos_before_authority_activation() {
 
         for (index, token) in invalid_tokens.into_iter().enumerate() {
             connection
-                .send_datagram(Bytes::from(encode_stream_frame(&GatewayMsg::Hello {
+                .send_control(&GatewayMsg::Hello {
                     token,
                     node: node(1),
-                })))
-                .unwrap();
+                })
+                .await;
             assert!(!receives_hello_ack(&connection).await);
 
             let entity = PersistId::new(100 + u64::try_from(index).unwrap());
             connection
-                .send_datagram(Bytes::from(encode_stream_frame(&GatewayMsg::Lease {
+                .send_control(&GatewayMsg::Lease {
                     message: orrery_protocol::LeaseMsg::Claim {
                         claim_id: orrery_protocol::ClaimId(1),
                         entity,
@@ -1151,8 +1135,8 @@ fn gateway_rejects_unverified_raw_iroh_hellos_before_authority_activation() {
                         observed: Default::default(),
                         tick: Tick::new(1),
                     },
-                })))
-                .unwrap();
+                })
+                .await;
             assert!(!receives_hello_ack(&connection).await);
             assert!(actor
                 .validate_lease(entity, node(1), orrery_protocol::LeaseId(0), 0)
@@ -1164,11 +1148,11 @@ fn gateway_rejects_unverified_raw_iroh_hellos_before_authority_activation() {
         }
 
         connection
-            .send_datagram(Bytes::from(encode_stream_frame(&GatewayMsg::Hello {
+            .send_control(&GatewayMsg::Hello {
                 token: session_token(&issuer, node(1), 900, 200),
                 node: node(2),
-            })))
-            .unwrap();
+            })
+            .await;
         assert!(!receives_hello_ack(&connection).await);
         assert_diff_denied_without_mutation(&connection, &actor, &runtime, PersistId::new(198))
             .await;
@@ -1180,11 +1164,11 @@ fn gateway_rejects_unverified_raw_iroh_hellos_before_authority_activation() {
             .unwrap();
         let (_client, deny_connection) = raw_connection(secret(1), deny_server.addr()).await;
         deny_connection
-            .send_datagram(Bytes::from(encode_stream_frame(&GatewayMsg::Hello {
+            .send_control(&GatewayMsg::Hello {
                 token: session_token(&issuer, node(1), 900, 200),
                 node: node(1),
-            })))
-            .unwrap();
+            })
+            .await;
         assert!(!receives_hello_ack(&deny_connection).await);
         assert_diff_denied_without_mutation(
             &deny_connection,
@@ -1234,42 +1218,42 @@ fn gateway_graces_only_the_established_matching_token_during_identity_outage() {
 
         let (_first_client, first) = raw_connection(secret(1), server.addr()).await;
         first
-            .send_datagram(Bytes::from(encode_stream_frame(&GatewayMsg::Hello {
+            .send_control(&GatewayMsg::Hello {
                 token: token.clone(),
                 node: node(1),
-            })))
-            .unwrap();
+            })
+            .await;
         assert!(receives_hello_ack(&first).await);
 
         clock.0.store(1_200, Ordering::SeqCst);
         health.0.store(false, Ordering::SeqCst);
         let (_grace_client, grace) = raw_connection(secret(1), server.addr()).await;
         grace
-            .send_datagram(Bytes::from(encode_stream_frame(&GatewayMsg::Hello {
+            .send_control(&GatewayMsg::Hello {
                 token: token.clone(),
                 node: node(1),
-            })))
-            .unwrap();
+            })
+            .await;
         assert!(receives_hello_ack(&grace).await);
 
         let (_new_client, newly_expired) = raw_connection(secret(2), server.addr()).await;
         newly_expired
-            .send_datagram(Bytes::from(encode_stream_frame(&GatewayMsg::Hello {
+            .send_control(&GatewayMsg::Hello {
                 token: session_token(&issuer, node(2), 900, 200),
                 node: node(2),
-            })))
-            .unwrap();
+            })
+            .await;
         assert!(!receives_hello_ack(&newly_expired).await);
         assert_diff_denied_without_mutation(&newly_expired, &actor, &runtime, PersistId::new(200))
             .await;
 
         let (_changed_client, changed_token) = raw_connection(secret(1), server.addr()).await;
         changed_token
-            .send_datagram(Bytes::from(encode_stream_frame(&GatewayMsg::Hello {
+            .send_control(&GatewayMsg::Hello {
                 token: session_token(&issuer, node(1), 901, 200),
                 node: node(1),
-            })))
-            .unwrap();
+            })
+            .await;
         assert!(!receives_hello_ack(&changed_token).await);
         assert_diff_denied_without_mutation(&changed_token, &actor, &runtime, PersistId::new(201))
             .await;
@@ -1277,11 +1261,11 @@ fn gateway_graces_only_the_established_matching_token_during_identity_outage() {
         health.0.store(true, Ordering::SeqCst);
         let (_healthy_client, healthy) = raw_connection(secret(1), server.addr()).await;
         healthy
-            .send_datagram(Bytes::from(encode_stream_frame(&GatewayMsg::Hello {
+            .send_control(&GatewayMsg::Hello {
                 token,
                 node: node(1),
-            })))
-            .unwrap();
+            })
+            .await;
         assert!(!receives_hello_ack(&healthy).await);
         assert_diff_denied_without_mutation(&healthy, &actor, &runtime, PersistId::new(202)).await;
         server.shutdown().await;
@@ -1316,11 +1300,11 @@ fn stale_inflight_claim_grant_is_parked_without_indexing_replacement() {
         .await
         .unwrap();
         let (old_client, old) = raw_connection(secret(1), server.addr()).await;
-        old.send_datagram(Bytes::from(encode_stream_frame(&GatewayMsg::Hello {
+        old.send_control(&GatewayMsg::Hello {
             token: support::valid_session_token(node(1)),
             node: node(1),
-        })))
-        .unwrap();
+        })
+        .await;
         assert!(receives_hello_ack(&old).await);
         let old_claim = tokio::spawn(async move {
             let reply = claim_reply(
@@ -1342,11 +1326,11 @@ fn stale_inflight_claim_grant_is_parked_without_indexing_replacement() {
         // When: a replacement for the same peer authenticates while that route is blocked.
         let (replacement_client, replacement) = raw_connection(secret(1), server.addr()).await;
         replacement
-            .send_datagram(Bytes::from(encode_stream_frame(&GatewayMsg::Hello {
+            .send_control(&GatewayMsg::Hello {
                 token: support::valid_session_token(node(1)),
                 node: node(1),
-            })))
-            .unwrap();
+            })
+            .await;
 
         // Then: registry access remains responsive, and the exact stale grant is compensated.
         assert!(receives_hello_ack(&replacement).await);
@@ -1453,11 +1437,11 @@ fn pending_heartbeat_releases_peer_state_and_stale_session_gets_no_current_rows(
         .await
         .unwrap();
         let (old_client, old) = raw_connection(secret(1), server.addr()).await;
-        old.send_datagram(Bytes::from(encode_stream_frame(&GatewayMsg::Hello {
+        old.send_control(&GatewayMsg::Hello {
             token: support::valid_session_token(node(1)),
             node: node(1),
-        })))
-        .unwrap();
+        })
+        .await;
         assert!(receives_hello_ack(&old).await);
         assert!(matches!(
             claim_reply(
@@ -1483,11 +1467,11 @@ fn pending_heartbeat_releases_peer_state_and_stale_session_gets_no_current_rows(
         // When: a replacement for the same peer authenticates while renewal is blocked.
         let (replacement_client, replacement) = raw_connection(secret(1), server.addr()).await;
         replacement
-            .send_datagram(Bytes::from(encode_stream_frame(&GatewayMsg::Hello {
+            .send_control(&GatewayMsg::Hello {
                 token: support::valid_session_token(node(1)),
                 node: node(1),
-            })))
-            .unwrap();
+            })
+            .await;
 
         // Then: it promptly owns the registry, while the released stale reply is invalidated.
         assert!(receives_hello_ack(&replacement).await);
@@ -1546,11 +1530,11 @@ fn gateway_rate_limits_claims_by_retained_node_id() {
 
         let (first_client, first) = raw_connection(secret(1), server.addr()).await;
         first
-            .send_datagram(Bytes::from(encode_stream_frame(&GatewayMsg::Hello {
+            .send_control(&GatewayMsg::Hello {
                 token: support::valid_session_token(node(1)),
                 node: node(1),
-            })))
-            .unwrap();
+            })
+            .await;
         assert!(receives_hello_ack(&first).await);
         for entity in 1..=32 {
             assert!(matches!(
@@ -1569,11 +1553,11 @@ fn gateway_rate_limits_claims_by_retained_node_id() {
 
         let (replacement_client, replacement) = raw_connection(secret(1), server.addr()).await;
         replacement
-            .send_datagram(Bytes::from(encode_stream_frame(&GatewayMsg::Hello {
+            .send_control(&GatewayMsg::Hello {
                 token: support::valid_session_token(node(1)),
                 node: node(1),
-            })))
-            .unwrap();
+            })
+            .await;
         assert!(receives_hello_ack(&replacement).await);
         for entity in 33..=64 {
             assert!(matches!(
@@ -1640,11 +1624,11 @@ fn gateway_rate_limits_claims_by_retained_node_id() {
 
         let (other_client, other) = raw_connection(secret(2), server.addr()).await;
         other
-            .send_datagram(Bytes::from(encode_stream_frame(&GatewayMsg::Hello {
+            .send_control(&GatewayMsg::Hello {
                 token: support::valid_session_token(node(2)),
                 node: node(2),
-            })))
-            .unwrap();
+            })
+            .await;
         assert!(receives_hello_ack(&other).await);
         assert!(matches!(
             claim_reply(
@@ -1691,11 +1675,11 @@ fn gateway_replacement_session_exclusively_owns_inherited_leases() {
         .await
         .unwrap();
         let (old_client, old) = raw_connection(secret(1), server.addr()).await;
-        old.send_datagram(Bytes::from(encode_stream_frame(&GatewayMsg::Hello {
+        old.send_control(&GatewayMsg::Hello {
             token: support::valid_session_token(node(1)),
             node: node(1),
-        })))
-        .unwrap();
+        })
+        .await;
         assert!(receives_hello_ack(&old).await);
         let LeaseMsg::Grant { lease_id, seq, .. } = claim_reply(
             &old,
@@ -1712,24 +1696,21 @@ fn gateway_replacement_session_exclusively_owns_inherited_leases() {
 
         // When: a second connection with the same verified NodeId replaces it.
         let (new_client, new) = raw_connection(secret(1), server.addr()).await;
-        new.send_datagram(Bytes::from(encode_stream_frame(&GatewayMsg::Hello {
+        new.send_control(&GatewayMsg::Hello {
             token: support::valid_session_token(node(1)),
             node: node(1),
-        })))
-        .unwrap();
+        })
+        .await;
         assert!(receives_hello_ack(&new).await);
-        new.send_datagram(Bytes::from(encode_stream_frame(&GatewayMsg::Lease {
+        new.send_control(&GatewayMsg::Lease {
             message: LeaseMsg::Heartbeat {
                 lease_ids: vec![lease_id],
                 tick: Tick::new(2),
             },
-        })))
-        .unwrap();
+        })
+        .await;
         let renewed = loop {
-            let packet = tokio::time::timeout(Duration::from_secs(5), new.read_datagram())
-                .await
-                .unwrap()
-                .unwrap();
+            let packet = new.next_payload(Duration::from_secs(5)).await.unwrap();
             if let Some(GatewayReply::Lease {
                 message: LeaseMsg::HeartbeatAck { leases, invalid },
             }) = decode_stream_frame(&packet)
@@ -1741,18 +1722,15 @@ fn gateway_replacement_session_exclusively_owns_inherited_leases() {
         assert_eq!(renewed.0.first().map(|row| row.lease_id), Some(lease_id));
 
         // Then: the superseded generation can neither renew nor write.
-        old.send_datagram(Bytes::from(encode_stream_frame(&GatewayMsg::Lease {
+        old.send_control(&GatewayMsg::Lease {
             message: LeaseMsg::Heartbeat {
                 lease_ids: vec![lease_id],
                 tick: Tick::new(3),
             },
-        })))
-        .unwrap();
+        })
+        .await;
         let old_heartbeat = loop {
-            let packet = tokio::time::timeout(Duration::from_secs(5), old.read_datagram())
-                .await
-                .unwrap()
-                .unwrap();
+            let packet = old.next_payload(Duration::from_secs(5)).await.unwrap();
             if let Some(GatewayReply::Lease {
                 message: LeaseMsg::HeartbeatAck { leases, invalid },
             }) = decode_stream_frame(&packet)
@@ -1778,7 +1756,7 @@ fn gateway_replacement_session_exclusively_owns_inherited_leases() {
                 ..
             } if denied == entity
         ));
-        old.send_datagram(Bytes::from(encode_datagram(&GatewayMsg::Diff {
+        old.send_state(&GatewayMsg::Diff {
             diff: DiffUplink {
                 cell: CellId::ROOT,
                 grid: GridId::ROOT,
@@ -1790,12 +1768,8 @@ fn gateway_replacement_session_exclusively_owns_inherited_leases() {
                 lease_id: Some(lease_id),
                 authority_seq: Some(seq),
             },
-        })))
-        .unwrap();
-        let packet = tokio::time::timeout(Duration::from_secs(5), old.read_datagram())
-            .await
-            .unwrap()
-            .unwrap();
+        });
+        let packet = old.next_payload(Duration::from_secs(5)).await.unwrap();
         assert!(matches!(
             decode_datagram(&packet),
             Some(GatewayReply::BulkNack { entity: denied, .. }) if denied == entity
@@ -1804,18 +1778,15 @@ fn gateway_replacement_session_exclusively_owns_inherited_leases() {
         // Closing the old generation must not park the lease transferred to the new one.
         drop(old);
         old_client.close().await;
-        new.send_datagram(Bytes::from(encode_stream_frame(&GatewayMsg::Lease {
+        new.send_control(&GatewayMsg::Lease {
             message: LeaseMsg::Heartbeat {
                 lease_ids: vec![lease_id],
                 tick: Tick::new(4),
             },
-        })))
-        .unwrap();
+        })
+        .await;
         let post_close_renewal = loop {
-            let packet = tokio::time::timeout(Duration::from_secs(5), new.read_datagram())
-                .await
-                .unwrap()
-                .unwrap();
+            let packet = new.next_payload(Duration::from_secs(5)).await.unwrap();
             if let Some(GatewayReply::Lease {
                 message: LeaseMsg::HeartbeatAck { leases, invalid },
             }) = decode_stream_frame(&packet)
@@ -1831,7 +1802,7 @@ fn gateway_replacement_session_exclusively_owns_inherited_leases() {
                 .map(|row| (row.lease_id, row.seq)),
             Some((lease_id, seq))
         );
-        new.send_datagram(Bytes::from(encode_datagram(&GatewayMsg::Diff {
+        new.send_state(&GatewayMsg::Diff {
             diff: DiffUplink {
                 cell: CellId::ROOT,
                 grid: GridId::ROOT,
@@ -1843,12 +1814,8 @@ fn gateway_replacement_session_exclusively_owns_inherited_leases() {
                 lease_id: Some(lease_id),
                 authority_seq: Some(seq),
             },
-        })))
-        .unwrap();
-        let packet = tokio::time::timeout(Duration::from_secs(5), new.read_datagram())
-            .await
-            .unwrap()
-            .unwrap();
+        });
+        let packet = new.next_payload(Duration::from_secs(5)).await.unwrap();
         assert!(matches!(
             decode_datagram(&packet),
             Some(GatewayReply::BulkAck { entity: accepted, .. }) if accepted == entity
@@ -1923,21 +1890,21 @@ fn gateway_peer_registry_rejects_capacity_then_evicts_expired_idle_peer() {
         .unwrap();
         let (first_client, first) = raw_connection(secret(1), server.addr()).await;
         first
-            .send_datagram(Bytes::from(encode_stream_frame(&GatewayMsg::Hello {
+            .send_control(&GatewayMsg::Hello {
                 token: session_token(&issuer, node(1), 900, 200),
                 node: node(1),
-            })))
-            .unwrap();
+            })
+            .await;
         assert!(receives_hello_ack(&first).await);
         let (_second_client, second) = raw_connection(secret(2), server.addr()).await;
 
         // When: another NodeId authenticates while the sole slot is occupied.
         second
-            .send_datagram(Bytes::from(encode_stream_frame(&GatewayMsg::Hello {
+            .send_control(&GatewayMsg::Hello {
                 token: session_token(&issuer, node(2), 900, 200),
                 node: node(2),
-            })))
-            .unwrap();
+            })
+            .await;
 
         // Then: capacity rejects it without replacing the established peer.
         assert!(!receives_hello_ack(&second).await);
@@ -1951,11 +1918,11 @@ fn gateway_peer_registry_rejects_capacity_then_evicts_expired_idle_peer() {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         loop {
             second
-                .send_datagram(Bytes::from(encode_stream_frame(&GatewayMsg::Hello {
+                .send_control(&GatewayMsg::Hello {
                     token: session_token(&issuer, node(2), 900, 200),
                     node: node(2),
-                })))
-                .unwrap();
+                })
+                .await;
             if receives_hello_ack(&second).await {
                 break;
             }
@@ -1993,11 +1960,11 @@ fn gateway_lease_capacity_denies_before_actor_mutation_after_reconnect() {
         .await
         .unwrap();
         let (old_client, old) = raw_connection(secret(1), server.addr()).await;
-        old.send_datagram(Bytes::from(encode_stream_frame(&GatewayMsg::Hello {
+        old.send_control(&GatewayMsg::Hello {
             token: support::valid_session_token(node(1)),
             node: node(1),
-        })))
-        .unwrap();
+        })
+        .await;
         assert!(receives_hello_ack(&old).await);
         let LeaseMsg::Grant { lease_id, .. } = claim_reply(
             &old,
@@ -2015,11 +1982,11 @@ fn gateway_lease_capacity_denies_before_actor_mutation_after_reconnect() {
         // When: a replacement generation reconnects and claims another eligible entity.
         let (_replacement_client, replacement) = raw_connection(secret(1), server.addr()).await;
         replacement
-            .send_datagram(Bytes::from(encode_stream_frame(&GatewayMsg::Hello {
+            .send_control(&GatewayMsg::Hello {
                 token: support::valid_session_token(node(1)),
                 node: node(1),
-            })))
-            .unwrap();
+            })
+            .await;
         assert!(receives_hello_ack(&replacement).await);
         let inherited = heartbeat_reply(&replacement, vec![lease_id], Tick::new(1)).await;
         assert!(inherited.1.is_empty());
@@ -2105,11 +2072,11 @@ fn gateway_rejects_client_rekey_without_mutation() {
         .unwrap();
         let (_client, connection) = raw_connection(secret(1), server.addr()).await;
         connection
-            .send_datagram(Bytes::from(encode_stream_frame(&GatewayMsg::Hello {
+            .send_control(&GatewayMsg::Hello {
                 token: support::valid_session_token(node(1)),
                 node: node(1),
-            })))
-            .unwrap();
+            })
+            .await;
         assert!(receives_hello_ack(&connection).await);
         let LeaseMsg::Grant { lease_id, seq, .. } = claim_reply(
             &connection,
@@ -2140,22 +2107,22 @@ fn gateway_rejects_client_rekey_without_mutation() {
         // When: the client repeatedly sends the legacy control-lane rekey.
         for _ in 0..3 {
             connection
-                .send_datagram(Bytes::from(encode_stream_frame(&GatewayMsg::Lease {
+                .send_control(&GatewayMsg::Lease {
                     message: LeaseMsg::Rekey {
                         entity,
                         old_cell: source,
                         new_cell: destination,
                     },
-                })))
-                .unwrap();
+                })
+                .await;
         }
 
         // Then: the gateway does not activate movement authority, and every
         // durable/hot observable remains exactly as it was.
         for _ in 0..3 {
-            let packet = tokio::time::timeout(Duration::from_secs(1), connection.read_datagram())
+            let packet = connection
+                .next_payload(Duration::from_secs(1))
                 .await
-                .unwrap()
                 .unwrap();
             assert!(matches!(
                 decode_stream_frame(&packet),
@@ -2179,24 +2146,22 @@ fn gateway_rejects_client_rekey_without_mutation() {
             source_record: snapshot_before.entities[&entity].components.clone(),
         })
         .unwrap();
-        connection
-            .send_datagram(Bytes::from(encode_datagram(&GatewayMsg::Diff {
-                diff: DiffUplink {
-                    cell: source,
-                    grid: GridId::ROOT,
-                    entity,
-                    tick: Tick::new(9),
-                    kind: RecordKind::Rekey,
-                    payload: Bytes::from(rekey_payload),
-                    seq: 9,
-                    lease_id: Some(lease_id),
-                    authority_seq: Some(seq),
-                },
-            })))
-            .unwrap();
-        let packet = tokio::time::timeout(Duration::from_secs(1), connection.read_datagram())
+        connection.send_state(&GatewayMsg::Diff {
+            diff: DiffUplink {
+                cell: source,
+                grid: GridId::ROOT,
+                entity,
+                tick: Tick::new(9),
+                kind: RecordKind::Rekey,
+                payload: Bytes::from(rekey_payload),
+                seq: 9,
+                lease_id: Some(lease_id),
+                authority_seq: Some(seq),
+            },
+        });
+        let packet = connection
+            .next_payload(Duration::from_secs(1))
             .await
-            .unwrap()
             .unwrap();
         assert!(matches!(
             decode_datagram(&packet),
@@ -2272,11 +2237,11 @@ fn rekeyed_entity_rejects_stale_presented_cell_with_current_lease() {
         .unwrap();
         let (_client, connection) = raw_connection(secret(1), server.addr()).await;
         connection
-            .send_datagram(Bytes::from(encode_stream_frame(&GatewayMsg::Hello {
+            .send_control(&GatewayMsg::Hello {
                 token: support::valid_session_token(node(1)),
                 node: node(1),
-            })))
-            .unwrap();
+            })
+            .await;
         assert!(receives_hello_ack(&connection).await);
         let LeaseMsg::Grant { lease_id, seq, .. } = claim_reply(
             &connection,
@@ -2326,24 +2291,22 @@ fn rekeyed_entity_rejects_stale_presented_cell_with_current_lease() {
             .count();
 
         // When: the same holder presents its current fence with the obsolete source cell.
-        connection
-            .send_datagram(Bytes::from(encode_datagram(&GatewayMsg::Diff {
-                diff: DiffUplink {
-                    cell: source,
-                    grid: GridId::ROOT,
-                    entity,
-                    tick: Tick::new(8),
-                    kind: RecordKind::ComponentDiff,
-                    payload: Bytes::from_static(b"must-not-journal"),
-                    seq: 8,
-                    lease_id: Some(lease_id),
-                    authority_seq: Some(seq),
-                },
-            })))
-            .unwrap();
-        let packet = tokio::time::timeout(Duration::from_secs(5), connection.read_datagram())
+        connection.send_state(&GatewayMsg::Diff {
+            diff: DiffUplink {
+                cell: source,
+                grid: GridId::ROOT,
+                entity,
+                tick: Tick::new(8),
+                kind: RecordKind::ComponentDiff,
+                payload: Bytes::from_static(b"must-not-journal"),
+                seq: 8,
+                lease_id: Some(lease_id),
+                authority_seq: Some(seq),
+            },
+        });
+        let packet = connection
+            .next_payload(Duration::from_secs(5))
             .await
-            .unwrap()
             .unwrap();
 
         // Then: the wire NACK carries the destination lease and actor/journal state is unchanged.
@@ -2395,24 +2358,22 @@ fn rekeyed_entity_rejects_stale_presented_cell_with_current_lease() {
         );
 
         // When: the holder retries with the same current fence at the committed destination.
-        connection
-            .send_datagram(Bytes::from(encode_datagram(&GatewayMsg::Diff {
-                diff: DiffUplink {
-                    cell: destination,
-                    grid: GridId::ROOT,
-                    entity,
-                    tick: Tick::new(9),
-                    kind: RecordKind::ComponentDiff,
-                    payload: Bytes::from_static(b"destination-applied"),
-                    seq: 9,
-                    lease_id: Some(lease_id),
-                    authority_seq: Some(seq),
-                },
-            })))
-            .unwrap();
-        let packet = tokio::time::timeout(Duration::from_secs(5), connection.read_datagram())
+        connection.send_state(&GatewayMsg::Diff {
+            diff: DiffUplink {
+                cell: destination,
+                grid: GridId::ROOT,
+                entity,
+                tick: Tick::new(9),
+                kind: RecordKind::ComponentDiff,
+                payload: Bytes::from_static(b"destination-applied"),
+                seq: 9,
+                lease_id: Some(lease_id),
+                authority_seq: Some(seq),
+            },
+        });
+        let packet = connection
+            .next_payload(Duration::from_secs(5))
             .await
-            .unwrap()
             .unwrap();
 
         // Then: the live gateway acknowledges durability and only the destination advances.
@@ -2506,11 +2467,11 @@ fn reviewed_authority_narrative() {
         let (stale_client, stale_connection) = raw_connection(secret(3), server.addr()).await;
         let stale_journal = journal_len(&runtime).await;
         stale_connection
-            .send_datagram(Bytes::from(encode_stream_frame(&GatewayMsg::Hello {
+            .send_control(&GatewayMsg::Hello {
                 token: session_token(&secret(42), node(3), 1, 1),
                 node: node(3),
-            })))
-            .unwrap();
+            })
+            .await;
         assert!(!receives_hello_ack(&stale_connection).await);
         assert!(matches!(
             diff_reply(
@@ -2539,11 +2500,11 @@ fn reviewed_authority_narrative() {
         // When: a valid signed token is paired with missing coordinator interest.
         let (missing_client, missing_connection) = raw_connection(secret(2), server.addr()).await;
         missing_connection
-            .send_datagram(Bytes::from(encode_stream_frame(&GatewayMsg::Hello {
+            .send_control(&GatewayMsg::Hello {
                 token: support::valid_session_token(node(2)),
                 node: node(2),
-            })))
-            .unwrap();
+            })
+            .await;
         assert!(receives_hello_ack(&missing_connection).await);
         let missing_journal = journal_len(&runtime).await;
         assert!(matches!(
@@ -2566,11 +2527,11 @@ fn reviewed_authority_narrative() {
 
         // When: the reviewed holder presents a valid token but the wrong interest cell.
         let (old_client, old) = raw_connection(secret(1), server.addr()).await;
-        old.send_datagram(Bytes::from(encode_stream_frame(&GatewayMsg::Hello {
+        old.send_control(&GatewayMsg::Hello {
             token: support::valid_session_token(node(1)),
             node: node(1),
-        })))
-        .unwrap();
+        })
+        .await;
         assert!(receives_hello_ack(&old).await);
         let wrong_interest_journal = journal_len(&runtime).await;
         assert!(matches!(
@@ -2635,11 +2596,11 @@ fn reviewed_authority_narrative() {
         // When: a replacement connection inherits the lease generation.
         let (replacement_client, replacement) = raw_connection(secret(1), server.addr()).await;
         replacement
-            .send_datagram(Bytes::from(encode_stream_frame(&GatewayMsg::Hello {
+            .send_control(&GatewayMsg::Hello {
                 token: support::valid_session_token(node(1)),
                 node: node(1),
-            })))
-            .unwrap();
+            })
+            .await;
         assert!(receives_hello_ack(&replacement).await);
         let replacement_heartbeat =
             heartbeat_reply(&replacement, vec![lease_id], Tick::new(4)).await;
@@ -2861,20 +2822,14 @@ fn reviewed_authority_narrative() {
 ///
 /// Unlike [`claim_reply`] this sends nothing: reassignment grants and expiry
 /// notices arrive unprompted, which is the whole point of the push path.
-async fn pushed_lease(
-    connection: &iroh::endpoint::Connection,
-    within: Duration,
-) -> Option<LeaseMsg> {
+async fn pushed_lease(connection: &lanes::GatewayLanes, within: Duration) -> Option<LeaseMsg> {
     let deadline = tokio::time::Instant::now() + within;
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
             return None;
         }
-        let Ok(Ok(packet)) = tokio::time::timeout(remaining, connection.read_datagram()).await
-        else {
-            return None;
-        };
+        let packet = connection.next_payload(remaining).await?;
         if let Some(GatewayReply::Lease { message }) = decode_stream_frame(&packet) {
             return Some(message);
         }
@@ -2888,8 +2843,8 @@ struct HandoffFixture {
     runtime: Arc<Mutex<CellRuntime>>,
     server: GatewayServer,
     _endpoints: Vec<iroh::Endpoint>,
-    holder: iroh::endpoint::Connection,
-    successor: iroh::endpoint::Connection,
+    holder: lanes::GatewayLanes,
+    successor: lanes::GatewayLanes,
     entity: PersistId,
     cell: CellId,
 }
@@ -2929,7 +2884,7 @@ async fn handoff_fixture(config: GatewayConfig) -> HandoffFixture {
     for seed in [1u8, 2] {
         let (endpoint, connection) = raw_connection(secret(seed), server.addr()).await;
         connection
-            .send_datagram(Bytes::from(encode_stream_frame(&GatewayMsg::Hello {
+            .send_control(&GatewayMsg::Hello {
                 token: session_token(
                     &issuer,
                     node(seed),
@@ -2937,8 +2892,8 @@ async fn handoff_fixture(config: GatewayConfig) -> HandoffFixture {
                     support::TOKEN_TTL_MS,
                 ),
                 node: node(seed),
-            })))
-            .unwrap();
+            })
+            .await;
         assert!(receives_hello_ack(&connection).await);
         endpoints.push(endpoint);
         connections.push(connection);
@@ -2999,7 +2954,7 @@ fn disconnected_holder_lease_is_reassigned_to_an_interested_peer() {
 
         // When: the holder's session dies without divesting — the `kill -9`
         // case the phase exists to survive.
-        fixture.holder.close(0u32.into(), b"gone");
+        fixture.holder.conn().close(0u32.into(), b"gone");
 
         // Then: the registrar pushes the lease to the interested peer, on a
         // freshly advanced fence, naming who it succeeded.
@@ -3126,7 +3081,7 @@ fn negotiated_divestiture_hands_the_lease_to_the_named_successor() {
         // When: it consents to hand the lease to the named peer.
         fixture
             .holder
-            .send_datagram(Bytes::from(encode_stream_frame(&GatewayMsg::Lease {
+            .send_control(&GatewayMsg::Lease {
                 message: LeaseMsg::Divest {
                     entity: fixture.entity,
                     lease_id,
@@ -3134,8 +3089,8 @@ fn negotiated_divestiture_hands_the_lease_to_the_named_successor() {
                     final_seq: seq,
                     cursor: Some(cursor),
                 },
-            })))
-            .unwrap();
+            })
+            .await;
 
         // Then: the successor is granted the lease...
         let inherited = pushed_lease(&fixture.successor, Duration::from_secs(5))
@@ -3216,7 +3171,7 @@ fn divestiture_without_a_committed_cursor_is_refused_and_the_holder_keeps_writin
         for cursor in [Some(Lsn::new(u64::MAX, u64::MAX)), None] {
             fixture
                 .holder
-                .send_datagram(Bytes::from(encode_stream_frame(&GatewayMsg::Lease {
+                .send_control(&GatewayMsg::Lease {
                     message: LeaseMsg::Divest {
                         entity: fixture.entity,
                         lease_id,
@@ -3224,8 +3179,8 @@ fn divestiture_without_a_committed_cursor_is_refused_and_the_holder_keeps_writin
                         final_seq: seq,
                         cursor,
                     },
-                })))
-                .unwrap();
+                })
+                .await;
 
             // Then: the registrar refuses, definitively.
             let refused = pushed_lease(&fixture.holder, Duration::from_secs(5))
@@ -3246,7 +3201,7 @@ fn divestiture_without_a_committed_cursor_is_refused_and_the_holder_keeps_writin
         for _ in 0..80 {
             fixture
                 .holder
-                .send_datagram(Bytes::from(encode_stream_frame(&GatewayMsg::Lease {
+                .send_control(&GatewayMsg::Lease {
                     message: LeaseMsg::Divest {
                         entity: fixture.entity,
                         lease_id,
@@ -3254,8 +3209,8 @@ fn divestiture_without_a_committed_cursor_is_refused_and_the_holder_keeps_writin
                         final_seq: seq,
                         cursor: None,
                     },
-                })))
-                .unwrap();
+                })
+                .await;
         }
         // Then: the NodeId-scoped budget cuts it off — a refused divest still
         // costs an actor round trip, so it is not an unmetered path in.
@@ -3354,19 +3309,14 @@ fn single_writer_invariant_checker_flags_a_fenced_out_second_writer() {
 }
 
 /// Present a coordinator-signed interest grant and return the gateway's answer.
-async fn present_grant(
-    connection: &iroh::endpoint::Connection,
-    grant: Vec<u8>,
-) -> (Option<Epoch>, u8) {
+async fn present_grant(connection: &lanes::GatewayLanes, grant: Vec<u8>) -> (Option<Epoch>, u8) {
     connection
-        .send_datagram(Bytes::from(encode_stream_frame(
-            &GatewayMsg::InterestGrant { grant },
-        )))
-        .unwrap();
+        .send_control(&GatewayMsg::InterestGrant { grant })
+        .await;
     loop {
-        let packet = tokio::time::timeout(Duration::from_secs(5), connection.read_datagram())
+        let packet = connection
+            .next_payload(Duration::from_secs(5))
             .await
-            .unwrap()
             .unwrap();
         if let Some(GatewayReply::InterestAck { epoch, reason }) = decode_stream_frame(&packet) {
             return (epoch, reason);
@@ -3441,7 +3391,7 @@ fn a_peer_carrying_its_coordinator_grant_unlocks_claims_and_redistribution() {
         for seed in [1u8, 2] {
             let (endpoint, connection) = raw_connection(secret(seed), server.addr()).await;
             connection
-                .send_datagram(Bytes::from(encode_stream_frame(&GatewayMsg::Hello {
+                .send_control(&GatewayMsg::Hello {
                     token: session_token(
                         &issuer,
                         node(seed),
@@ -3449,8 +3399,8 @@ fn a_peer_carrying_its_coordinator_grant_unlocks_claims_and_redistribution() {
                         support::TOKEN_TTL_MS,
                     ),
                     node: node(seed),
-                })))
-                .unwrap();
+                })
+                .await;
             assert!(receives_hello_ack(&connection).await);
             endpoints.push(endpoint);
             connections.push(connection);
@@ -3513,7 +3463,7 @@ fn a_peer_carrying_its_coordinator_grant_unlocks_claims_and_redistribution() {
         // And: redistribution now has a candidate, so a lost holder's lease
         // moves instead of parking. This is the whole point of the transport:
         // the mechanism was already built, and interest is what switches it on.
-        holder.close(0u32.into(), b"gone");
+        holder.conn().close(0u32.into(), b"gone");
         let inherited = pushed_lease(&successor, Duration::from_secs(5))
             .await
             .expect("the interested peer inherits the lease");
@@ -3569,7 +3519,7 @@ fn an_interest_grant_is_refused_with_a_reason_the_peer_can_act_on() {
         .unwrap();
         let (_client, connection) = raw_connection(secret(1), server.addr()).await;
         connection
-            .send_datagram(Bytes::from(encode_stream_frame(&GatewayMsg::Hello {
+            .send_control(&GatewayMsg::Hello {
                 token: session_token(
                     &issuer,
                     node(1),
@@ -3577,8 +3527,8 @@ fn an_interest_grant_is_refused_with_a_reason_the_peer_can_act_on() {
                     support::TOKEN_TTL_MS,
                 ),
                 node: node(1),
-            })))
-            .unwrap();
+            })
+            .await;
         assert!(receives_hello_ack(&connection).await);
         let cell = CellId::ROOT.children()[0];
 
@@ -3639,15 +3589,15 @@ fn an_interest_grant_is_refused_with_a_reason_the_peer_can_act_on() {
 
 /// Send a claim without waiting for its reply, so the caller can watch what
 /// the *other* peer is asked to do first.
-fn send_claim(
-    connection: &iroh::endpoint::Connection,
+async fn send_claim(
+    connection: &lanes::GatewayLanes,
     claim_id: orrery_protocol::ClaimId,
     entity: PersistId,
     cell: CellId,
     kind: ClaimKind,
 ) {
     connection
-        .send_datagram(Bytes::from(encode_stream_frame(&GatewayMsg::Lease {
+        .send_control(&GatewayMsg::Lease {
             message: LeaseMsg::Claim {
                 claim_id,
                 entity,
@@ -3658,8 +3608,8 @@ fn send_claim(
                 observed: Default::default(),
                 tick: Tick::new(1),
             },
-        })))
-        .unwrap();
+        })
+        .await;
 }
 
 #[test]
@@ -3684,7 +3634,8 @@ fn a_strong_claim_asks_the_holder_to_divest_instead_of_refusing_the_claimant() {
             fixture.entity,
             fixture.cell,
             ClaimKind::Strong,
-        );
+        )
+        .await;
 
         // Then: the registrar asks the holder rather than answering the
         // claimant, naming the claimant as the successor to hand it to.
@@ -3713,7 +3664,7 @@ fn a_strong_claim_asks_the_holder_to_divest_instead_of_refusing_the_claimant() {
         // When: the holder consents.
         fixture
             .holder
-            .send_datagram(Bytes::from(encode_stream_frame(&GatewayMsg::Lease {
+            .send_control(&GatewayMsg::Lease {
                 message: LeaseMsg::Divest {
                     entity: fixture.entity,
                     lease_id,
@@ -3721,8 +3672,8 @@ fn a_strong_claim_asks_the_holder_to_divest_instead_of_refusing_the_claimant() {
                     final_seq: seq,
                     cursor: Some(cursor),
                 },
-            })))
-            .unwrap();
+            })
+            .await;
 
         // Then: the claimant's *own* claim is what gets answered — its pending
         // correlation resolves rather than looking like an unsolicited grant.
@@ -3772,7 +3723,8 @@ fn an_unanswered_request_takes_weak_authority_but_never_strong_ownership() {
             fixture.entity,
             fixture.cell,
             ClaimKind::Strong,
-        );
+        )
+        .await;
         assert!(matches!(
             pushed_lease(&fixture.holder, Duration::from_secs(5)).await,
             Some(LeaseMsg::Divest { .. })
@@ -3818,7 +3770,8 @@ fn an_unanswered_request_takes_weak_authority_but_never_strong_ownership() {
             fixture.entity,
             fixture.cell,
             ClaimKind::Strong,
-        );
+        )
+        .await;
         assert!(matches!(
             pushed_lease(&fixture.successor, Duration::from_secs(5)).await,
             Some(LeaseMsg::Divest { .. })
@@ -3857,7 +3810,8 @@ fn a_holder_that_parks_instead_of_handing_over_still_answers_the_claimant() {
             fixture.entity,
             fixture.cell,
             ClaimKind::Strong,
-        );
+        )
+        .await;
         assert!(matches!(
             pushed_lease(&fixture.holder, Duration::from_secs(5)).await,
             Some(LeaseMsg::Divest { .. })
@@ -3866,7 +3820,7 @@ fn a_holder_that_parks_instead_of_handing_over_still_answers_the_claimant() {
         // When: the holder releases it to nobody.
         fixture
             .holder
-            .send_datagram(Bytes::from(encode_stream_frame(&GatewayMsg::Lease {
+            .send_control(&GatewayMsg::Lease {
                 message: LeaseMsg::Divest {
                     entity: fixture.entity,
                     lease_id,
@@ -3874,8 +3828,8 @@ fn a_holder_that_parks_instead_of_handing_over_still_answers_the_claimant() {
                     final_seq: seq,
                     cursor: None,
                 },
-            })))
-            .unwrap();
+            })
+            .await;
 
         // Then: the claimant is told, rather than waiting out a deadline for a
         // request that has already been resolved.

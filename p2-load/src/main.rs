@@ -10,11 +10,14 @@
 //! Design notes:
 //!
 //! - **Transport.** The rig speaks the gateway wire surface directly over raw
-//!   iroh datagrams + stream-framed control frames on one packet lane
-//!   (roadmap decision C-1: there is no reliable-stream class in P2). The
-//!   aeronet session stack is a Bevy client convenience; the persistd gateway
-//!   is raw iroh (`crates/orrery_persistd/src/gateway.rs`), so the rig dials
-//!   it without linking Bevy.
+//!   iroh, on both lanes: unreliable datagrams for bulk diffs and reliable
+//!   unidirectional streams for control — subscribes, intents, hello (roadmap
+//!   decision C-1). It must ride the same lanes the shipped client does, or it
+//!   would be measuring a path nobody runs. The aeronet session stack is a
+//!   Bevy client convenience; the persistd gateway is raw iroh
+//!   (`crates/orrery_persistd/src/gateway.rs`), so the rig dials it without
+//!   linking Bevy — at the cost of owning the ~60 lines of stream framing that
+//!   `aeronet_iroh::stream` gives the client for free.
 //! - **Measurement.** Diffs are registered in the *real* D16 1–4 Hz
 //!   `UplinkScheduler` and intents in the real `IntentQueue`; acks feed the
 //!   shared bounded-memory `LatencyHistogram`s, and the JSONL stream is
@@ -98,6 +101,13 @@ const SESSION_FLUSH_PHASE_SLOTS: usize = 20;
 /// times the D16 bulk target is enough to expose a backlog without turning a
 /// failed gateway into an unbounded test hang.
 const FINAL_REPLY_DRAIN: Duration = Duration::from_millis(50);
+
+/// How long the final drain sleeps when nothing has arrived yet.
+///
+/// Short enough that a reply landing mid-drain is still credited well inside
+/// [`FINAL_REPLY_DRAIN`], long enough that the drain is not a spin loop
+/// competing with the reader tasks it is waiting on.
+const DRAIN_POLL_INTERVAL: Duration = Duration::from_millis(1);
 
 /// The per-session flush byte budget, = the D16 client default
 /// (`PersistClientConfig::flush_budget_bytes`, 1024). One session sustains
@@ -208,7 +218,10 @@ async fn run() -> Result<()> {
 
     let mut sessions = Vec::new();
     for i in 0..cli.sessions {
-        let conn = dial(&endpoint, cli.addr, cli.gateway)
+        // One token per session: it is bound to this endpoint's NodeId and
+        // carries its own issue time, so it is minted rather than shared.
+        let token = session_token(&cli, endpoint.id())?;
+        let conn = dial(&endpoint, cli.addr, cli.gateway, token)
             .await
             .with_context(|| format!("dial session {i}"))?;
         sessions.push(conn);
@@ -377,7 +390,8 @@ fn parse_lsn(raw: &str) -> Result<orrery_protocol::Lsn> {
 
 async fn read_gateway_state(cli: &Cli, expected: &[DiffEvidence]) -> Result<Vec<RecoveredDiff>> {
     let (endpoint, _) = bind_endpoint(None).await?;
-    let conn = dial(&endpoint, cli.addr, cli.gateway).await?;
+    let token = session_token(cli, endpoint.id())?;
+    let conn = dial(&endpoint, cli.addr, cli.gateway, token).await?;
     let wanted_ids: BTreeSet<_> = expected.iter().map(|diff| diff.entity).collect();
 
     // ROOT is only a covering discovery scan; its reply cell is not evidence
@@ -425,13 +439,14 @@ fn recovery_inventory(cli: &Cli) -> Result<Inventory> {
 
 /// Read complete area pages for the requested physical cells.
 async fn read_snapshot_pages(
-    conn: &Connection,
+    conn: &GatewayLink,
     cells: &[CellId],
 ) -> Result<BTreeMap<CellId, BTreeMap<u32, (Vec<PersistId>, Vec<Bytes>)>>> {
-    // Subscribe travels on the QUIC packet lane.  A P2 recovery scan may
-    // cover hundreds of physical leaves, so never encode them all into one
-    // datagram (which is bounded to roughly an MTU).  This bound leaves ample
-    // room for the tagged postcard frame and is independent of page payload
+    // Subscribe travels on the reliable lane, which frames whole messages and
+    // no longer bounds a request to one MTU — so this batch size is now about
+    // the *reply*, not the request: one subscribe of hundreds of leaves is one
+    // burst of hundreds of pages the recovery reader must hold at once. 64
+    // keeps that working set bounded, and is independent of page payload
     // chunking, which the gateway handles separately.
     const CELLS_PER_SUBSCRIBE: usize = 64;
     let mut pages = BTreeMap::new();
@@ -443,7 +458,7 @@ async fn read_snapshot_pages(
 
 /// Read one datagram-safe batch of area pages.
 async fn read_snapshot_batch(
-    conn: &Connection,
+    conn: &GatewayLink,
     cells: &[CellId],
 ) -> Result<BTreeMap<CellId, BTreeMap<u32, (Vec<PersistId>, Vec<Bytes>)>>> {
     let wanted: BTreeSet<_> = cells.iter().copied().collect();
@@ -456,7 +471,8 @@ async fn read_snapshot_batch(
             grid: GridId::ROOT,
             cells: cells.to_vec(),
         },
-    );
+    )
+    .await;
     let mut chunks = BTreeMap::new();
     let mut totals = BTreeMap::new();
     while wanted.iter().any(|cell| {
@@ -731,15 +747,136 @@ async fn bind_endpoint(secret_key: Option<&str>) -> Result<(Endpoint, SecretKey)
     Ok((endpoint, signing_key))
 }
 
+/// One gateway session's two lanes.
+///
+/// The rig speaks the gateway wire surface directly over raw iroh, so it owns
+/// the plumbing the Bevy client gets from `aeronet_iroh`: a datagram lane for
+/// bulk diffs, and a reliable unidirectional stream for control — subscribes,
+/// intents, hello — framed `[u32 LE length][payload]` exactly as the gateway's
+/// reader expects. Inbound traffic from both lanes lands in one queue, stamped
+/// on arrival, because the D16 series are measured from the moment a reply
+/// reaches this process and not from when the loop got around to it.
+struct GatewayLink {
+    conn: Connection,
+    /// The outbound control stream, opened on the first control message.
+    control: tokio::sync::Mutex<Option<iroh::endpoint::SendStream>>,
+    inbound: tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<(Bytes, Instant)>>,
+}
+
+impl GatewayLink {
+    /// Start draining both lanes of an admitted connection.
+    ///
+    /// Must run *after* the admission uni-stream has been read: the stream
+    /// reader accepts every inbound stream from here on.
+    fn attach(conn: Connection) -> Self {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let datagrams = conn.clone();
+        let datagram_tx = tx.clone();
+        tokio::spawn(async move {
+            while let Ok(pkt) = datagrams.read_datagram().await {
+                if datagram_tx.send((pkt, Instant::now())).is_err() {
+                    return;
+                }
+            }
+        });
+        let streams = conn.clone();
+        tokio::spawn(async move {
+            while let Ok(mut recv) = streams.accept_uni().await {
+                let tx = tx.clone();
+                tokio::spawn(async move {
+                    loop {
+                        let mut prefix = [0u8; 4];
+                        if recv.read_exact(&mut prefix).await.is_err() {
+                            return;
+                        }
+                        let len = u32::from_le_bytes(prefix) as usize;
+                        if len > orrery_protocol::channels::MAX_RELIABLE_MESSAGE_BYTES {
+                            return;
+                        }
+                        let mut payload = vec![0u8; len];
+                        if recv.read_exact(&mut payload).await.is_err() {
+                            return;
+                        }
+                        if tx.send((Bytes::from(payload), Instant::now())).is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        Self {
+            conn,
+            control: tokio::sync::Mutex::new(None),
+            inbound: tokio::sync::Mutex::new(rx),
+        }
+    }
+
+    /// Write a control payload on the reliable lane.
+    async fn send_control(&self, msg: &GatewayMsg) {
+        let payload = encode_stream_frame(msg);
+        let mut framed = Vec::with_capacity(payload.len() + 4);
+        #[allow(clippy::cast_possible_truncation)] // Bounded by the message cap below.
+        framed.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        framed.extend_from_slice(&payload);
+        if payload.len() > orrery_protocol::channels::MAX_RELIABLE_MESSAGE_BYTES {
+            tracing::warn!(len = payload.len(), "control message too large to send");
+            return;
+        }
+        let mut control = self.control.lock().await;
+        if control.is_none() {
+            match self.conn.open_uni().await {
+                Ok(stream) => *control = Some(stream),
+                Err(e) => {
+                    tracing::warn!(error = %e, "opening the control stream failed");
+                    return;
+                }
+            }
+        }
+        let Some(stream) = control.as_mut() else {
+            return;
+        };
+        if let Err(e) = stream.write_chunk(Bytes::from(framed)).await {
+            tracing::warn!(error = %e, "control stream write failed");
+        }
+    }
+
+    /// Send a bulk-state message on the datagram lane.
+    fn send_state(&self, msg: &GatewayMsg) {
+        if let Err(e) = self.conn.send_datagram(Bytes::from(encode_datagram(msg))) {
+            tracing::warn!(error = %e, "gateway datagram send failed");
+        }
+    }
+
+    /// The next inbound payload from either lane, with its arrival instant.
+    async fn next_inbound(&self, timeout: Duration) -> Option<(Bytes, Instant)> {
+        let mut inbound = self.inbound.lock().await;
+        tokio::time::timeout(timeout, inbound.recv()).await.ok()?
+    }
+
+    /// An inbound payload if one is already queued, without awaiting.
+    ///
+    /// The run loop is a fixed-cadence pump, not a select over sockets, so it
+    /// drains what has arrived and moves on. The arrival instant travels with
+    /// the payload because it was taken in the reader task — a busy frame
+    /// must not show up in the D16 series as gateway latency.
+    fn try_next_inbound(&self) -> Option<(Bytes, Instant)> {
+        self.inbound.try_lock().ok()?.try_recv().ok()
+    }
+}
+
 /// Dial the gateway and complete the admission + hello handshake.
 ///
 /// Mirrors the persistd gateway's session shape (`handle_connection` in
 /// crates/orrery_persistd/src/gateway.rs): the server streams one admission
-/// uni (`[ACCEPTED]`) on connect, then speaks tagged datagrams + stream-framed
-/// control frames. The rig must read the admission stream before its hello is
-/// answered (the server sends the `HelloAck` as a stream frame on the packet
-/// lane, per C-1).
-async fn dial(endpoint: &Endpoint, addr: SocketAddr, gateway: NodeId) -> Result<Connection> {
+/// uni (`[ACCEPTED]`) on connect, then speaks tagged datagrams and reliable
+/// control streams. The admission stream must be read before the lane readers
+/// start, or they consume it.
+async fn dial(
+    endpoint: &Endpoint,
+    addr: SocketAddr,
+    gateway: NodeId,
+    token: Vec<u8>,
+) -> Result<GatewayLink> {
     let endpoint_addr = EndpointAddr::new(gateway).with_ip_addr(addr);
     let conn = endpoint
         .connect(endpoint_addr, GATEWAY_ALPN)
@@ -762,16 +899,18 @@ async fn dial(endpoint: &Endpoint, addr: SocketAddr, gateway: NodeId) -> Result<
             byte[0]
         );
     }
+    let link = GatewayLink::attach(conn);
 
     // Hello, then require the ack to name the gateway we dialed.
     send_msg(
-        &conn,
+        &link,
         &GatewayMsg::Hello {
-            token: b"p2-load".to_vec(),
+            token,
             node: endpoint.id(),
         },
-    );
-    let reply = recv_reply(&conn, Duration::from_secs(10))
+    )
+    .await;
+    let reply = recv_reply(&link, Duration::from_secs(10))
         .await
         .context("await HelloAck")?;
     match reply {
@@ -789,59 +928,59 @@ async fn dial(endpoint: &Endpoint, addr: SocketAddr, gateway: NodeId) -> Result<
         }
         other => bail!("expected HelloAck, got {other:?}"),
     }
-    Ok(conn)
+    Ok(link)
 }
 
+/// One payload that arrived on one session, from either lane.
+///
+/// There is no longer a `Closed` variant: with a reader task per lane, a torn
+/// connection is not an event that races the payloads ahead of it in the queue
+/// — it is a state, read off the connection itself, and reading it that way
+/// avoids reporting a close while replies from that session are still queued.
 #[derive(Debug)]
-enum InboundEvent {
-    Datagram {
-        session: usize,
-        packet: Bytes,
-        received_at: Instant,
-    },
-    Closed {
-        session: usize,
-        error: String,
-    },
+struct InboundEvent {
+    session: usize,
+    packet: Bytes,
+    received_at: Instant,
 }
 
-/// Send one `GatewayMsg` on the packet lane. Bulk diffs are tagged datagrams;
-/// Hello/Subscribe/SubmitIntent are stream-framed control frames (C-1: one
-/// lane; the tag + length prefix is what routes them server-side).
-fn send_msg(conn: &Connection, msg: &GatewayMsg) {
-    let bytes = match msg {
-        GatewayMsg::Diff { .. } => Bytes::from(encode_datagram(msg)),
-        _ => Bytes::from(encode_stream_frame(msg)),
-    };
-    if let Err(e) = conn.send_datagram(bytes) {
-        tracing::warn!(error = %e, "gateway datagram send failed");
+/// Send one `GatewayMsg` on whichever lane the channel policy assigns it.
+///
+/// Bulk diffs are tagged datagrams; Hello/Subscribe/SubmitIntent are control
+/// payloads on the reliable stream lane (C-1). The rig must send on the same
+/// lanes the shipped client does — measuring the datagram path while the game
+/// uses streams would measure something nobody runs.
+async fn send_msg(link: &GatewayLink, msg: &GatewayMsg) {
+    match msg {
+        GatewayMsg::Diff { .. } => link.send_state(msg),
+        _ => link.send_control(msg).await,
     }
 }
 
-/// Await the next decodable `GatewayReply` (any channel) within `timeout`.
-async fn recv_reply(conn: &Connection, timeout: Duration) -> Result<GatewayReply> {
+/// Await the next decodable `GatewayReply` from either lane within `timeout`.
+async fn recv_reply(link: &GatewayLink, timeout: Duration) -> Result<GatewayReply> {
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
             bail!("timeout waiting for gateway reply");
         }
-        let pkt = match tokio::time::timeout(remaining, conn.read_datagram()).await {
-            Ok(Ok(pkt)) => pkt,
-            Ok(Err(e)) => bail!("gateway connection closed: {e}"),
-            Err(_) => bail!("timeout waiting for gateway reply"),
+        let Some((pkt, _)) = link.next_inbound(remaining).await else {
+            bail!("timeout waiting for gateway reply");
         };
-        let Some((channel, rest)) = untag(&pkt) else {
-            continue;
-        };
-        let reply: Option<GatewayReply> = match channel {
-            Channel::State => postcard::from_bytes(rest).ok(),
-            Channel::Control => orrery_protocol::channels::decode_stream_frame(&pkt),
-        };
-        if let Some(reply) = reply {
+        if let Some(reply) = decode_reply(&pkt) {
             return Ok(reply);
         }
-        tracing::debug!("gateway: undecodable reply datagram");
+        tracing::debug!("gateway: undecodable reply");
+    }
+}
+
+/// Decode a reply on its channel tag, not on the lane that carried it.
+fn decode_reply(pkt: &[u8]) -> Option<GatewayReply> {
+    let (channel, rest) = untag(pkt)?;
+    match channel {
+        Channel::State => postcard::from_bytes(rest).ok(),
+        Channel::Control => orrery_protocol::channels::decode_stream_frame(pkt),
     }
 }
 
@@ -1135,7 +1274,7 @@ struct Rig<'a> {
     endpoint: Endpoint,
     /// Private half of `endpoint.id()`, used for canonical issuer signatures.
     intent_signing_key: SecretKey,
-    sessions: Vec<Connection>,
+    sessions: Vec<GatewayLink>,
     inventory: Inventory,
     diff_hz: f64,
     intent_mix: IntentMix,
@@ -1184,7 +1323,8 @@ impl Rig<'_> {
                     grid: GridId::ROOT,
                     cells,
                 },
-            );
+            )
+            .await;
             area_pending[i] = Some(Instant::now());
         }
 
@@ -1199,41 +1339,23 @@ impl Rig<'_> {
             .map(|session| start + session_phase_period * session_flush_phase(session) as u32)
             .collect::<Vec<_>>();
 
-        let (inbound_tx, mut inbound_rx) = tokio::sync::mpsc::unbounded_channel();
-        for (session, conn) in self.sessions.iter().enumerate() {
-            let conn = conn.clone();
-            let tx = inbound_tx.clone();
-            tokio::spawn(async move {
-                loop {
-                    match conn.read_datagram().await {
-                        Ok(packet) => {
-                            let received_at = Instant::now();
-                            if tx
-                                .send(InboundEvent::Datagram {
-                                    session,
-                                    packet,
-                                    received_at,
-                                })
-                                .is_err()
-                            {
-                                break;
-                            }
-                        }
-                        Err(error) => {
-                            let _ = tx.send(InboundEvent::Closed {
-                                session,
-                                error: error.to_string(),
-                            });
-                            break;
-                        }
-                    }
-                }
-            });
-        }
-
         while start.elapsed() < self.duration {
-            // ── Receive: drain all events received from background tasks ──
-            while let Ok(event) = inbound_rx.try_recv() {
+            // ── Receive: drain both lanes of every session ────────────────
+            //
+            // Each `GatewayLink` runs its own reader tasks and stamps arrival
+            // there; this loop only takes what has already landed, so the D16
+            // series measure the gateway rather than this loop's cadence.
+            let mut inbound = Vec::new();
+            for (session, link) in self.sessions.iter().enumerate() {
+                while let Some((packet, received_at)) = link.try_next_inbound() {
+                    inbound.push(InboundEvent {
+                        session,
+                        packet,
+                        received_at,
+                    });
+                }
+            }
+            for event in inbound {
                 self.handle_inbound(
                     event,
                     &mut schedulers,
@@ -1271,6 +1393,11 @@ impl Rig<'_> {
                         kind: RecordKind::ComponentDiff,
                         payload: synthetic_payload(p.entity, tick_now, self.cli.diff_payload_bytes),
                         seq: tick_now,
+                        // The rig claims no leases: it measures the gateway's
+                        // latency, not its authority arbitration, and a diff
+                        // presenting a lease it does not hold would be nacked.
+                        lease_id: None,
+                        authority_seq: None,
                     });
                 }
                 flush_index += 1;
@@ -1308,7 +1435,8 @@ impl Rig<'_> {
                     send_msg(
                         &self.sessions[session],
                         &GatewayMsg::Diff { diff: diff.clone() },
-                    );
+                    )
+                    .await;
                     self.pending_diffs.insert(
                         (diff.entity, diff.tick),
                         DiffEvidence {
@@ -1337,7 +1465,8 @@ impl Rig<'_> {
                 send_msg(
                     &self.sessions[(intent.intent_id as usize) % sessions],
                     &GatewayMsg::SubmitIntent { intent },
-                );
+                )
+                .await;
             }
 
             // ── Telemetry drain (bounded-memory histograms → JSONL) ──────
@@ -1376,26 +1505,30 @@ impl Rig<'_> {
             if remaining.is_zero() {
                 break;
             }
-            tokio::select! {
-                Some(event) = inbound_rx.recv() => {
-                    self.handle_inbound(
-                        event,
-                        &mut schedulers,
-                        &mut intents,
-                        &mut stats,
-                        &mut area_pending,
-                    );
-                    while let Ok(event) = inbound_rx.try_recv() {
-                        self.handle_inbound(
-                            event,
-                            &mut schedulers,
-                            &mut intents,
-                            &mut stats,
-                            &mut area_pending,
-                        );
-                    }
+            let mut inbound = Vec::new();
+            for (session, link) in self.sessions.iter().enumerate() {
+                while let Some((packet, received_at)) = link.try_next_inbound() {
+                    inbound.push(InboundEvent {
+                        session,
+                        packet,
+                        received_at,
+                    });
                 }
-                _ = tokio::time::sleep(remaining) => break,
+            }
+            if inbound.is_empty() {
+                // Nothing landed this pass: yield the drain interval in small
+                // slices rather than busy-spinning the whole 500 ms.
+                tokio::time::sleep(remaining.min(DRAIN_POLL_INTERVAL)).await;
+                continue;
+            }
+            for event in inbound {
+                self.handle_inbound(
+                    event,
+                    &mut schedulers,
+                    &mut intents,
+                    &mut stats,
+                    &mut area_pending,
+                );
             }
         }
 
@@ -1427,27 +1560,18 @@ impl Rig<'_> {
         stats: &mut RunStats,
         area_pending: &mut [Option<Instant>],
     ) {
-        match event {
-            InboundEvent::Datagram {
-                session,
-                packet,
-                received_at,
-            } => self.handle_reply(
-                session,
-                &packet,
-                received_at,
-                schedulers,
-                intents,
-                stats,
-                area_pending,
-            ),
-            InboundEvent::Closed { session, error } => {
-                tracing::warn!(session, error, "gateway read failed");
-            }
-        }
+        self.handle_reply(
+            event.session,
+            &event.packet,
+            event.received_at,
+            schedulers,
+            intents,
+            stats,
+            area_pending,
+        );
     }
 
-    /// Handle one inbound datagram from session `i`.
+    /// Handle one inbound reply from session `i`, from either lane.
     #[allow(clippy::too_many_arguments)]
     fn handle_reply(
         &mut self,
@@ -1459,14 +1583,7 @@ impl Rig<'_> {
         stats: &mut RunStats,
         area_pending: &mut [Option<Instant>],
     ) {
-        let Some((channel, rest)) = untag(pkt) else {
-            return;
-        };
-        let reply: Option<GatewayReply> = match channel {
-            Channel::State => postcard::from_bytes(rest).ok(),
-            Channel::Control => orrery_protocol::channels::decode_stream_frame(pkt),
-        };
-        let Some(reply) = reply else {
+        let Some(reply) = decode_reply(pkt) else {
             tracing::debug!(session, "undecodable gateway reply");
             return;
         };
@@ -1502,6 +1619,10 @@ impl Rig<'_> {
                 entity,
                 tick,
                 reason,
+                // The rig holds no leases, so a nack's current-holder hint has
+                // nothing here to reconcile against. That path is exercised by
+                // the shipped client's `process_replies`.
+                lease: _,
             } => {
                 if let Some(sched) = schedulers.get_mut(session) {
                     sched.on_nack_at(entity, tick, received_at);
@@ -1543,6 +1664,26 @@ impl Rig<'_> {
                 tracing::warn!(session, ?cell, kind, "area load failed");
             }
             GatewayReply::HelloAck { .. } => {}
+            // The rig neither claims leases nor presents a coordinator grant,
+            // so these are the gateway telling it about a session shape it did
+            // not ask for. Logged rather than ignored: silently dropping them
+            // would hide a gateway that thinks this connection is something
+            // other than a load generator.
+            GatewayReply::Lease { message } => {
+                tracing::warn!(
+                    session,
+                    ?message,
+                    "unexpected lease control on a rig session"
+                );
+            }
+            GatewayReply::InterestAck { epoch, reason } => {
+                tracing::warn!(
+                    session,
+                    ?epoch,
+                    reason,
+                    "unexpected interest ack on a rig session"
+                );
+            }
         }
     }
 
@@ -1573,6 +1714,46 @@ impl Rig<'_> {
     fn make_intent(&self, id: u128, kind: String) -> Intent {
         signed_intent(id, self.endpoint.id(), &self.intent_signing_key, kind)
     }
+}
+
+/// Mint the session token the gateway's `Hello` check requires.
+///
+/// The token is bound to `node` — the rig's own iroh identity — because the
+/// gateway refuses a token whose claimed node is not the connection's
+/// authenticated remote. Without `--issuer-secret` this falls back to a
+/// placeholder, which only a gateway configured with no verifier will admit.
+/// A real `persistd` refuses it, and the refusal is quieter than it looks: the
+/// connection stays up and the hello simply goes unanswered. Hence the warning.
+fn session_token(cli: &Cli, node: NodeId) -> Result<Vec<u8>> {
+    let Some(secret) = cli.issuer_secret.as_deref() else {
+        tracing::warn!(
+            "no --issuer-secret: sending a placeholder session token, which a gateway \
+             started with --issuer-key will refuse"
+        );
+        return Ok(b"p2-load".to_vec());
+    };
+    let issuer: SecretKey = secret
+        .parse()
+        .context("invalid --issuer-secret (expected hex)")?;
+    let issued_at_ms = u64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .context("system clock is before the Unix epoch")?
+            .as_millis(),
+    )
+    .context("system clock is beyond the u64 millisecond range")?;
+    let claims = orrery_protocol::SessionTokenClaimsV1::new(
+        orrery_protocol::AccountId::new(cli.account_id),
+        node,
+        orrery_protocol::UnixMillis::new(issued_at_ms),
+        orrery_protocol::SessionTokenTtlMs::new(orrery_protocol::MAX_SESSION_TOKEN_TTL_MS),
+        orrery_protocol::SessionStanding::Good,
+        orrery_protocol::IssuerKeyId::new(cli.issuer_key_id),
+    );
+    orrery_protocol::SessionTokenV1::sign(claims, &issuer)
+        .map_err(|e| anyhow::anyhow!("sign session token: {e:?}"))?
+        .encode()
+        .map_err(|e| anyhow::anyhow!("encode session token: {e:?}"))
 }
 
 /// Build and canonically sign one load-generated intent. Kept separate from
@@ -1825,6 +2006,8 @@ mod tests {
                         kind: RecordKind::ComponentDiff,
                         payload: synthetic_payload(placement.entity, frame_index, 64),
                         seq: frame_index,
+                        lease_id: None,
+                        authority_seq: None,
                     });
                 }
 
@@ -2022,6 +2205,9 @@ mod tests {
             output: None,
             diff_payload_bytes: 64,
             secret_key: None,
+            issuer_secret: None,
+            issuer_key_id: 1,
+            account_id: 1,
         };
         let mut rig = Rig {
             cli: &cli,
@@ -2089,6 +2275,9 @@ mod tests {
             output: None,
             diff_payload_bytes: 64,
             secret_key: None,
+            issuer_secret: None,
+            issuer_key_id: 1,
+            account_id: 1,
         };
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("acks.jsonl");

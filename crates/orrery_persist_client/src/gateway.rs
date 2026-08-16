@@ -1,10 +1,22 @@
 //! The gateway session: connect, hello, and the channel policy (D3).
 //!
 //! The client talks to the gateway over one aeronet session. Per the channel
-//! policy (docs/02-networking.md §7), bulk diffs ride unreliable datagrams and
-//! area load + intents ride reliable streams. This module tracks the session
-//! lifecycle and exposes the two channels, plus the session event stream that
-//! drives the uplink scheduler's reconnect/resend behavior.
+//! policy (docs/02-networking.md §7), bulk diffs ride unreliable datagrams —
+//! `aeronet_io::Session` — and area load, intents and lease control ride the
+//! reliable stream lane, `aeronet_iroh::stream::IrohStreamIo`. This module
+//! tracks the session lifecycle and exposes the two channels, plus the session
+//! event stream that drives the uplink scheduler's reconnect/resend behavior.
+//!
+//! # The reliable lane is part of a live session, not an option on one
+//!
+//! The IO layer inserts `IrohStreamIo` alongside `aeronet_io::Session` in one
+//! command, so a session either has both or neither. The systems that write
+//! control messages therefore *require* the component rather than falling back
+//! to a datagram: a fallback would put area loads and intents back on the lane
+//! this work moved them off, and it would do it silently, under exactly the
+//! conditions (a session mid-setup, a torn connection) where the silence is
+//! hardest to notice. A session without the lane is a session that is not up
+//! yet, and the systems treat it as such.
 //!
 //! Exponential backoff (D3): on disconnect, the reconnect delay starts at
 //! `INITIAL_RECONNECT_DELAY` and doubles each attempt up to
@@ -18,6 +30,7 @@ use bevy_platform::time::Instant;
 use bytes::Bytes;
 
 use aeronet_iroh::iroh;
+use aeronet_iroh::stream::{IrohStreamIo, SendMessage, StreamMode};
 use orrery_authority::{AuthorityState, InterestGrant, LeaseOutbox};
 use orrery_net::channels::{tag, Channel};
 use orrery_protocol::{GatewayMsg, GatewayReply, NodeId, PROTOCOL_VERSION};
@@ -153,21 +166,33 @@ impl GatewaySession {
         postcard::from_bytes(rest).ok()
     }
 
-    /// Encode a gateway message as a stream frame (area load + intents).
+    /// Encode a gateway message as a control payload for the reliable lane
+    /// (area load, intents, hello, lease control).
     ///
-    /// Reliable stream traffic is length-prefixed so the receiver can frame
-    /// multiple messages on one stream, and tagged with the control channel so
-    /// the receiver can route it without a separate framing layer (D3: streams
-    /// = control/bulk). Generic over the message type so both directions
-    /// (client [`GatewayMsg`] and gateway [`GatewayReply`]) share one encoding.
+    /// Delegates to `orrery_protocol`'s encoder rather than reimplementing the
+    /// framing: the gateway decodes with that crate's counterpart, and two
+    /// copies of a wire format drift in exactly one direction. Generic over
+    /// the message type so both directions (client [`GatewayMsg`] and gateway
+    /// [`GatewayReply`]) share one encoding.
     #[must_use]
     pub fn encode_stream<T: serde::Serialize>(msg: &T) -> Bytes {
-        let payload = postcard::to_stdvec(msg).expect("gateway message is serializable");
-        let mut out = Vec::with_capacity(payload.len() + 5);
-        out.push(orrery_net::channels::TAG_CONTROL);
-        out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
-        out.extend_from_slice(&payload);
-        Bytes::from(out)
+        Bytes::from(orrery_protocol::channels::encode_stream_frame(msg))
+    }
+
+    /// Queue a control message on a session's reliable lane.
+    ///
+    /// [`StreamMode::Shared`] puts every client-side control message on one
+    /// ordered stream, which is what this traffic wants: an intent submitted
+    /// after a subscribe should reach the gateway after it, and all of it is
+    /// small enough that head-of-line blocking between messages costs nothing
+    /// worth a stream per message. The *gateway* splits its side into two
+    /// lanes, because its area pages are the large half — see
+    /// `orrery_persistd::reliable`.
+    pub fn push_control<T: serde::Serialize>(streams: &mut IrohStreamIo, msg: &T) {
+        streams.send.push(SendMessage {
+            payload: Self::encode_stream(msg),
+            mode: StreamMode::Shared,
+        });
     }
 }
 
@@ -241,24 +266,21 @@ pub fn connect_gateway(
 ///
 /// The client's own node id is the local iroh endpoint id (D3); it was captured
 /// on [`GatewaySession::gateway`]'s sibling fields by [`connect_gateway`].
-pub fn hello_gateway(
-    mut session: ResMut<GatewaySession>,
-    mut sessions: Query<&mut aeronet_io::Session>,
-) {
+pub fn hello_gateway(mut session: ResMut<GatewaySession>, mut streams: Query<&mut IrohStreamIo>) {
     if session.state != GatewayState::Connecting || session.hello_sent {
         return;
     }
     let Some(entity) = session.session else {
         return;
     };
-    let Ok(mut io) = sessions.get_mut(entity) else {
+    let Ok(mut streams) = streams.get_mut(entity) else {
         return;
     };
     let msg = GatewayMsg::Hello {
         token: session.token.clone(),
         node: session.node,
     };
-    io.send.push(GatewaySession::encode_stream(&msg));
+    GatewaySession::push_control(&mut streams, &msg);
     session.hello_sent = true;
 }
 
@@ -268,7 +290,7 @@ pub fn hello_gateway(
 pub fn flush_lease_control(
     outbox: Option<ResMut<LeaseOutbox>>,
     session: Res<GatewaySession>,
-    mut sessions: Query<&mut aeronet_io::Session>,
+    mut streams: Query<&mut IrohStreamIo>,
 ) {
     let Some(mut outbox) = outbox else {
         return;
@@ -279,14 +301,11 @@ pub fn flush_lease_control(
     let Some(entity) = session.session else {
         return;
     };
-    let Ok(mut io) = sessions.get_mut(entity) else {
+    let Ok(mut streams) = streams.get_mut(entity) else {
         return;
     };
     for message in std::mem::take(&mut outbox.0) {
-        io.send
-            .push(GatewaySession::encode_stream(&GatewayMsg::Lease {
-                message,
-            }));
+        GatewaySession::push_control(&mut streams, &GatewayMsg::Lease { message });
     }
 }
 
@@ -298,7 +317,7 @@ pub fn flush_lease_control(
 pub fn flush_interest_grant(
     interest: Option<ResMut<InterestGrant>>,
     session: Res<GatewaySession>,
-    mut sessions: Query<&mut aeronet_io::Session>,
+    mut streams: Query<&mut IrohStreamIo>,
 ) {
     let Some(mut interest) = interest else {
         return;
@@ -317,18 +336,16 @@ pub fn flush_interest_grant(
     let Some(entity) = session.session else {
         return;
     };
-    let Ok(mut io) = sessions.get_mut(entity) else {
+    let Ok(mut streams) = streams.get_mut(entity) else {
         return;
     };
     let Some(grant) = interest.grant.clone() else {
         interest.pending = false;
         return;
     };
-    io.send
-        .push(GatewaySession::encode_stream(&GatewayMsg::InterestGrant {
-            grant,
-        }));
-    // Cleared on the ack, not here: a dropped datagram must be re-presented.
+    GatewaySession::push_control(&mut streams, &GatewayMsg::InterestGrant { grant });
+    // Cleared on the ack, not here: the reliable lane delivers the grant, but
+    // a gateway that has not yet acted on it has not accepted it.
 }
 
 /// Mirror the iroh-authenticated local identity into optional authority state.
@@ -456,9 +473,9 @@ mod tests {
             .add_systems(bevy_app::Update, hello_gateway);
         let session_entity = app
             .world_mut()
-            .spawn(aeronet_io::Session::new(
-                bevy_platform::time::Instant::now(),
-                1024,
+            .spawn((
+                aeronet_io::Session::new(bevy_platform::time::Instant::now(), 1024),
+                IrohStreamIo::detached(),
             ))
             .id();
         {
@@ -472,18 +489,26 @@ mod tests {
         app.update();
         let sent = app
             .world()
-            .get::<aeronet_io::Session>(session_entity)
+            .get::<IrohStreamIo>(session_entity)
             .unwrap()
             .send
             .len();
         assert_eq!(sent, 1, "hello sent once");
         assert!(app.world().resource::<GatewaySession>().hello_sent);
+        assert!(
+            app.world()
+                .get::<aeronet_io::Session>(session_entity)
+                .unwrap()
+                .send
+                .is_empty(),
+            "the hello must not also go out on the datagram lane"
+        );
 
         // A second update does not resend while unacked.
         app.update();
         let sent = app
             .world()
-            .get::<aeronet_io::Session>(session_entity)
+            .get::<IrohStreamIo>(session_entity)
             .unwrap()
             .send
             .len();

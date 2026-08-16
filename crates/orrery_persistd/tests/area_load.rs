@@ -20,6 +20,7 @@
 //!   centre first, the cold cell served from the durable tier
 //!   (`area_load_end_to_end`, FDB-gated).
 
+mod lanes;
 mod support;
 
 use std::collections::HashMap;
@@ -38,7 +39,7 @@ use orrery_persistd::{
 };
 #[cfg(feature = "fdb")]
 use orrery_persistd::{FenceOutcome, FenceRow, FenceStatus, FenceStore};
-use orrery_protocol::channels::{decode_stream_frame, encode_datagram, encode_stream_frame};
+use orrery_protocol::channels::decode_stream_frame;
 use orrery_protocol::{
     CellId, ClaimBasis, ClaimKind, DenyReason, DiffUplink, GatewayMsg, GatewayReply, GridId,
     JournalRecord, Lease, LeaseFlags, LeaseId, LeaseMsg, Lsn, NodeId, PersistId, RecordKind,
@@ -101,14 +102,14 @@ fn runtime_config(dir: &std::path::Path) -> RuntimeConfig {
 }
 
 /// A dialed client: the endpoint (kept alive — dropping it closes the
-/// connection) and the admitted connection.
+/// connection) and both lanes of the admitted connection.
 struct Client {
     _endpoint: iroh::Endpoint,
-    conn: iroh::endpoint::Connection,
+    conn: lanes::GatewayLanes,
 }
 
-/// Dial `server` and complete the admission handshake, returning the raw iroh
-/// connection (the same wire surface the aeronet client speaks).
+/// Dial `server` and complete the admission handshake, returning both lanes of
+/// the connection (the same wire surface the aeronet client speaks).
 async fn dial(server: &GatewayServer) -> Client {
     let endpoint = iroh::endpoint::Builder::new(iroh::endpoint::presets::N0)
         .alpns(vec![GATEWAY_ALPN.to_vec()])
@@ -119,21 +120,19 @@ async fn dial(server: &GatewayServer) -> Client {
         .unwrap();
     let node = endpoint.id();
     let conn = endpoint.connect(server.addr(), GATEWAY_ALPN).await.unwrap();
-    // Admission: the gateway streams [ACCEPTED] (byte 0) on a uni stream.
+    // Admission: the gateway streams [ACCEPTED] (byte 0) on a uni stream. Read
+    // it before attaching, or the lane reader consumes it.
     let mut admission = conn.accept_uni().await.unwrap();
     let msg = admission.read_to_end(16).await.unwrap();
     assert_eq!(msg, vec![0u8]);
-    conn.send_datagram(Bytes::from(encode_stream_frame(&GatewayMsg::Hello {
+    let conn = lanes::GatewayLanes::attach(conn);
+    conn.send_control(&GatewayMsg::Hello {
         token: support::valid_session_token(node),
         node,
-    })))
-    .unwrap();
-    let pkt = tokio::time::timeout(Duration::from_secs(5), conn.read_datagram())
-        .await
-        .expect("hello reply")
-        .expect("hello datagram");
+    })
+    .await;
     assert!(matches!(
-        decode_stream_frame(&pkt),
+        conn.next_reply(Duration::from_secs(5)).await,
         Some(GatewayReply::HelloAck { .. })
     ));
     Client {
@@ -142,19 +141,16 @@ async fn dial(server: &GatewayServer) -> Client {
     }
 }
 
-/// Send a [`GatewayMsg`] as a stream frame.
-fn send_stream(conn: &iroh::endpoint::Connection, msg: &GatewayMsg) {
-    conn.send_datagram(Bytes::from(encode_stream_frame(msg)))
-        .unwrap();
+/// Send a [`GatewayMsg`] on the reliable control lane.
+async fn send_stream(conn: &lanes::GatewayLanes, msg: &GatewayMsg) {
+    conn.send_control(msg).await;
 }
 
-/// Read the next decodable stream-frame reply within `secs` seconds.
-async fn recv_reply(conn: &iroh::endpoint::Connection, secs: u64) -> GatewayReply {
-    let pkt = tokio::time::timeout(Duration::from_secs(secs), conn.read_datagram())
+/// Read the next decodable reply, from either lane, within `secs` seconds.
+async fn recv_reply(conn: &mut lanes::GatewayLanes, secs: u64) -> GatewayReply {
+    conn.next_reply(Duration::from_secs(secs))
         .await
         .expect("reply within timeout")
-        .expect("datagram readable");
-    decode_stream_frame(&pkt).expect("stream-frame reply")
 }
 
 /// A scripted router: each cell's read resolves on demand, with every read
@@ -320,8 +316,8 @@ async fn first_page_precedes_last_cell_read() {
     let server = GatewayServer::spawn(gateway_config(GridId::ROOT), router.clone())
         .await
         .unwrap();
-    let client = dial(&server).await;
-    let conn = &client.conn;
+    let mut client = dial(&server).await;
+    let conn = &mut client.conn;
 
     send_stream(
         conn,
@@ -329,7 +325,8 @@ async fn first_page_precedes_last_cell_read() {
             grid: GridId::ROOT,
             cells: neighbourhood.clone(),
         },
-    );
+    )
+    .await;
 
     // The first page must be observable *before* the gated read is released —
     // a buffered trailing flush could never produce it here.
@@ -397,8 +394,8 @@ async fn every_requested_cell_gets_a_page() {
     let server = GatewayServer::spawn(gateway_config(GridId::ROOT), router)
         .await
         .unwrap();
-    let client = dial(&server).await;
-    let conn = &client.conn;
+    let mut client = dial(&server).await;
+    let conn = &mut client.conn;
 
     send_stream(
         conn,
@@ -406,7 +403,8 @@ async fn every_requested_cell_gets_a_page() {
             grid: GridId::ROOT,
             cells: neighbourhood.clone(),
         },
-    );
+    )
+    .await;
 
     let mut seen = Vec::new();
     for _ in 0..27 {
@@ -434,8 +432,8 @@ async fn failed_scan_is_a_distinct_reply_not_an_empty_page() {
     let server = GatewayServer::spawn(gateway_config(GridId::ROOT), Arc::new(FailingColdRouter))
         .await
         .unwrap();
-    let client = dial(&server).await;
-    let conn = &client.conn;
+    let mut client = dial(&server).await;
+    let conn = &mut client.conn;
     let c = cell(3, 0, 0);
     send_stream(
         conn,
@@ -443,7 +441,8 @@ async fn failed_scan_is_a_distinct_reply_not_an_empty_page() {
             grid: GridId::ROOT,
             cells: vec![c],
         },
-    );
+    )
+    .await;
     match recv_reply(conn, 10).await {
         GatewayReply::AreaLoadError { cell, kind } => {
             assert_eq!(cell, c);
@@ -454,16 +453,28 @@ async fn failed_scan_is_a_distinct_reply_not_an_empty_page() {
     server.shutdown().await;
 }
 
-/// Seed one cell with 200 entities × 256-byte bags and collect the raw frames
-/// the gateway sends for it, plus the server (for the send-failure counter).
+/// One entity's component bag in the chunked-page fixture.
+const CHUNKED_CELL_BAG_BYTES: usize = 256;
+
+/// How many entities the chunked-page fixture seeds into one cell.
+///
+/// Derived from the budget rather than written down, so the fixture keeps
+/// chunking when the budget moves — a hard-coded count that stopped exceeding
+/// the budget would leave `oversized_cell_arrives_intact` passing while
+/// testing nothing.
+const CHUNKED_CELL_ENTITIES: u64 =
+    (2 * MAX_AREA_PAGE_FRAME_BYTES / CHUNKED_CELL_BAG_BYTES + 1) as u64;
+
+/// Seed one cell past the area-page frame budget and collect the raw frames the
+/// gateway sends for it, plus the server (for the send-failure counter).
 async fn collect_chunked_frames() -> (Vec<Bytes>, GatewayServer) {
     let c = cell(0, 0, 0);
     let mut entities = HashMap::new();
-    for i in 0..200u64 {
+    for i in 0..CHUNKED_CELL_ENTITIES {
         entities.insert(
             PersistId::new(i),
             EntityRecord {
-                components: Bytes::from(vec![0xAB; 256]),
+                components: Bytes::from(vec![0xAB; CHUNKED_CELL_BAG_BYTES]),
                 dirty: false,
             },
         );
@@ -480,24 +491,25 @@ async fn collect_chunked_frames() -> (Vec<Bytes>, GatewayServer) {
     let server = GatewayServer::spawn(gateway_config(GridId::ROOT), router)
         .await
         .unwrap();
-    let client = dial(&server).await;
-    let conn = &client.conn;
+    let mut client = dial(&server).await;
+    let conn = &mut client.conn;
     send_stream(
         conn,
         &GatewayMsg::Subscribe {
             grid: GridId::ROOT,
             cells: vec![c],
         },
-    );
+    )
+    .await;
 
-    // 200 × 256 B of bags cannot fit one 1100-byte frame: read until the
-    // `last` frame of the cell's sequence arrives.
+    // The seeded cell cannot fit one frame: read until the `last` frame of the
+    // cell's sequence arrives.
     let mut frames = Vec::new();
     for _ in 0..64 {
-        let pkt = tokio::time::timeout(Duration::from_secs(10), conn.read_datagram())
+        let pkt = conn
+            .next_payload(Duration::from_secs(10))
             .await
-            .expect("frames arrive")
-            .expect("datagram readable");
+            .expect("frames arrive");
         let last = matches!(
             decode_stream_frame(&pkt),
             Some(GatewayReply::AreaPage { page, .. })
@@ -514,8 +526,7 @@ async fn collect_chunked_frames() -> (Vec<Bytes>, GatewayServer) {
 #[tokio::test]
 async fn oversized_cell_arrives_intact() {
     let (frames, server) = collect_chunked_frames().await;
-    // More than one frame (200 × 256 B ≫ 1100 B), every frame under the
-    // budget.
+    // More than one frame, and every frame under the budget.
     assert!(frames.len() > 1, "the page was chunked");
     for frame in &frames {
         assert!(
@@ -548,17 +559,19 @@ async fn oversized_cell_arrives_intact() {
         seen_last |= page.chunk_index + 1 == page.total_chunks;
         assembled.extend(page.entities);
         assert!(
-            page.payloads.iter().all(|p| p.len() == 256),
-            "every 256-byte bag arrived intact"
+            page.payloads
+                .iter()
+                .all(|p| p.len() == CHUNKED_CELL_BAG_BYTES),
+            "every bag arrived intact"
         );
     }
     assert!(seen_last, "the sequence terminated with a last frame");
     assembled.sort_by_key(|p| p.0);
     assembled.dedup();
     assert_eq!(
-        assembled.len(),
-        200,
-        "all 200 PersistIds arrived intact, no duplicates"
+        assembled.len() as u64,
+        CHUNKED_CELL_ENTITIES,
+        "every PersistId arrived intact, no duplicates"
     );
     server.shutdown().await;
 }
@@ -566,15 +579,16 @@ async fn oversized_cell_arrives_intact() {
 #[tokio::test]
 async fn oversize_send_is_counted_not_silent() {
     // The chunked-page path must never trip the send-failure counter: chunking
-    // keeps every frame sendable, so a failure here would mean a real
-    // regression (today `send_datagram` returns Err(TooLarge) and the gateway
-    // discards it with `let _ =`).
+    // keeps every frame under the reliable lane's message cap, so a failure
+    // here would mean a real regression — an oversize message is refused at
+    // the sender rather than written, precisely so it cannot tear the stream
+    // and take every page queued behind it.
     let (frames, server) = collect_chunked_frames().await;
     assert!(!frames.is_empty());
     assert_eq!(
         server.area_page_send_failures(),
         0,
-        "no send was discarded: every frame fit the datagram budget"
+        "no send was discarded: every frame fit the frame budget"
     );
     server.shutdown().await;
 }
@@ -597,8 +611,8 @@ async fn subscribe_does_not_block_diffs() {
     let server = GatewayServer::spawn(gateway_config(GridId::ROOT), router.clone())
         .await
         .unwrap();
-    let client = dial(&server).await;
-    let conn = &client.conn;
+    let mut client = dial(&server).await;
+    let conn = &mut client.conn;
 
     send_stream(
         conn,
@@ -614,7 +628,8 @@ async fn subscribe_does_not_block_diffs() {
                 tick: Tick::new(1),
             },
         },
-    );
+    )
+    .await;
     let (lease_id, authority_seq) = match recv_reply(conn, 5).await {
         GatewayReply::Lease {
             message:
@@ -632,7 +647,7 @@ async fn subscribe_does_not_block_diffs() {
     };
 
     // The diff first: its route task pends forever on `apply`.
-    conn.send_datagram(Bytes::from(encode_datagram(&GatewayMsg::Diff {
+    conn.send_state(&GatewayMsg::Diff {
         diff: DiffUplink {
             cell: CellId::ROOT,
             grid: GridId::ROOT,
@@ -644,8 +659,7 @@ async fn subscribe_does_not_block_diffs() {
             lease_id: Some(lease_id),
             authority_seq: Some(authority_seq),
         },
-    })))
-    .unwrap();
+    });
     // Then the subscribe on the same connection.
     let centre = cell(0, 0, 0);
     let neighbourhood = centre.neighbors27();
@@ -655,7 +669,8 @@ async fn subscribe_does_not_block_diffs() {
             grid: GridId::ROOT,
             cells: neighbourhood,
         },
-    );
+    )
+    .await;
 
     // The subscribe must complete even though the diff's route is still
     // pending: what arrives while a read can never resolve — 27 pages, or
@@ -712,8 +727,8 @@ async fn area_load_end_to_end_live_cells() {
     let server = GatewayServer::spawn(gateway_config(GridId::ROOT), router)
         .await
         .unwrap();
-    let client = dial(&server).await;
-    let conn = &client.conn;
+    let mut client = dial(&server).await;
+    let conn = &mut client.conn;
 
     let centre = cell(0, 0, 0);
     let cells = order_nearest_first(centre, centre.neighbors27());
@@ -723,7 +738,8 @@ async fn area_load_end_to_end_live_cells() {
             grid: GridId::ROOT,
             cells: cells.clone(),
         },
-    );
+    )
+    .await;
 
     let mut order = Vec::new();
     let mut live_entities = HashMap::new();
@@ -875,8 +891,8 @@ async fn area_load_end_to_end_cold_cell_served() {
     let server = GatewayServer::spawn(gateway_config(grid), router)
         .await
         .unwrap();
-    let client = dial(&server).await;
-    let conn = &client.conn;
+    let mut client = dial(&server).await;
+    let conn = &mut client.conn;
 
     let centre = cell(4, 0, 0);
     let cells = order_nearest_first(centre, centre.neighbors27());
@@ -886,7 +902,8 @@ async fn area_load_end_to_end_cold_cell_served() {
             grid,
             cells: cells.clone(),
         },
-    );
+    )
+    .await;
 
     let mut cold_served = false;
     let mut pages = 0;

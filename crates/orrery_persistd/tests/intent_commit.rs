@@ -14,6 +14,7 @@
 //!   cluster drop (the idempotency row and the ledger row are both readable
 //!   after reopening).
 
+mod lanes;
 mod support;
 
 use std::sync::Arc;
@@ -26,7 +27,7 @@ use orrery_persistd::{
     CellRuntime, GatewayConfig, GatewayServer, JournalConfig, MemFenceStore, MemIntentExecutor,
     Router, RuntimeConfig, GATEWAY_ALPN,
 };
-use orrery_protocol::channels::{decode_stream_frame, encode_stream_frame};
+use orrery_protocol::channels::decode_stream_frame;
 use orrery_protocol::{
     CellId, Epoch, GatewayMsg, GatewayReply, GridId, Intent, IntentOp, IntentOutcome,
     REASON_BAD_SIGNATURE, REASON_ISSUER_MISMATCH, REASON_NO_EXECUTOR,
@@ -81,7 +82,7 @@ fn runtime_config(dir: &std::path::Path) -> RuntimeConfig {
 /// locally-closes the connection).
 struct Session {
     server: GatewayServer,
-    conn: iroh::endpoint::Connection,
+    conn: lanes::GatewayLanes,
     _client: iroh::Endpoint,
     _dir: tempfile::TempDir,
     _runtime: Arc<Mutex<CellRuntime>>,
@@ -111,20 +112,18 @@ async fn connect(config: GatewayConfig, key: &iroh_base::SecretKey) -> Session {
         .unwrap();
     let conn = client.connect(addr, GATEWAY_ALPN).await.unwrap();
     // Admission: the gateway streams [ACCEPTED] on a uni stream.
+    // Read admission before attaching, or the lane reader consumes it.
     let mut admission = conn.accept_uni().await.unwrap();
     let msg = admission.read_to_end(16).await.unwrap();
     assert_eq!(msg, vec![0u8]);
-    conn.send_datagram(Bytes::from(encode_stream_frame(&GatewayMsg::Hello {
+    let conn = lanes::GatewayLanes::attach(conn);
+    conn.send_control(&GatewayMsg::Hello {
         token: support::valid_session_token(key.public()),
         node: key.public(),
-    })))
-    .unwrap();
-    let reply = tokio::time::timeout(Duration::from_secs(5), conn.read_datagram())
-        .await
-        .expect("hello reply")
-        .expect("hello datagram");
+    })
+    .await;
     assert!(matches!(
-        decode_stream_frame(&reply),
+        conn.next_reply(Duration::from_secs(5)).await,
         Some(GatewayReply::HelloAck { .. })
     ));
     Session {
@@ -137,17 +136,15 @@ async fn connect(config: GatewayConfig, key: &iroh_base::SecretKey) -> Session {
 }
 
 /// Send `intent` and read back the `IntentAck` outcome.
-async fn submit(conn: &iroh::endpoint::Connection, intent: Intent) -> IntentOutcome {
+async fn submit(conn: &lanes::GatewayLanes, intent: Intent) -> IntentOutcome {
     let intent_id = intent.intent_id;
-    conn.send_datagram(Bytes::from(encode_stream_frame(
-        &GatewayMsg::SubmitIntent { intent },
-    )))
-    .unwrap();
+    conn.send_control(&GatewayMsg::SubmitIntent { intent })
+        .await;
     for _ in 0..8 {
-        let pkt = tokio::time::timeout(Duration::from_secs(5), conn.read_datagram())
+        let pkt = conn
+            .next_payload(Duration::from_secs(5))
             .await
-            .expect("timed out waiting for IntentAck")
-            .expect("datagram");
+            .expect("timed out waiting for IntentAck");
         if let Some(GatewayReply::IntentAck {
             intent_id: got,
             outcome,
@@ -157,7 +154,7 @@ async fn submit(conn: &iroh::endpoint::Connection, intent: Intent) -> IntentOutc
             return outcome;
         }
     }
-    panic!("no IntentAck after 8 datagrams");
+    panic!("no IntentAck after 8 inbound messages");
 }
 
 #[tokio::test]

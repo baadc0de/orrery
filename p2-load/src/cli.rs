@@ -152,6 +152,27 @@ pub struct Cli {
     /// Rig-local iroh secret key (hex), pinning the rig's NodeId across runs.
     #[arg(long)]
     pub secret_key: Option<String>,
+
+    /// Identity issuer secret key (hex) the rig signs its own session token
+    /// with, paired with `--issuer-key-id`.
+    ///
+    /// `persistd` refuses to start without at least one `--issuer-key`, and it
+    /// binds the token to the connection's authenticated NodeId — so a rig
+    /// that cannot mint a token cannot get past `Hello`, whatever else it can
+    /// measure. Give the gateway `--issuer-key <id>@<public key of this
+    /// secret>` and the two agree. Without it the rig sends a placeholder
+    /// token, which only a gateway configured with no verifier will admit.
+    #[arg(long)]
+    pub issuer_secret: Option<String>,
+
+    /// The issuer key id carried in the rig's session token. Must match the
+    /// id half of the gateway's `--issuer-key <id>@<key>`.
+    #[arg(long, default_value_t = 1)]
+    pub issuer_key_id: u32,
+
+    /// The account id the rig's session token claims.
+    #[arg(long, default_value_t = 1)]
+    pub account_id: u64,
 }
 
 impl Cli {

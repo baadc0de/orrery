@@ -12,10 +12,10 @@
 //!   entities are scheduled by a per-entity priority accumulator and sent as
 //!   unreliable datagrams; unacked diffs stay buffered and are resent on
 //!   reconnect (records are idempotent, keyed by `(entity, tick)`).
-//! - **Area load/subscribe** — the 27-cell neighborhood (D5) is requested over
-//!   a reliable stream and streamed back **nearest-first** (center cell, then
-//!   face/edge/corner neighbors by distance), so the client can spawn-in
-//!   against page one (D16: < 50 ms to first page-in).
+//! - **Area load/subscribe** — the 27-cell neighborhood (D5) is requested on
+//!   the reliable stream lane and streamed back **nearest-first** (center
+//!   cell, then face/edge/corner neighbors by distance), so the client can
+//!   spawn-in against page one (D16: < 50 ms to first page-in).
 //! - **Intent queue** — signed, witness-attested critical writes (D11 §2.2)
 //!   with the netsplit posture (D12): while the gateway is unreachable the
 //!   queue persists locally and durable commits pause; on reconnect, queued
@@ -29,11 +29,12 @@
 //! `aeronet_io` sessions; the iroh dialing and session lifecycle live in
 //! `orrery_net`.
 //!
-//! This slice is the P2 client: the scheduler, the area loader, the intent
-//! queue, and the replicon change-detection wiring (feeding [`DiffUplink`]s
-//! from replicon diffs) are implemented and unit-tested against an in-memory
-//! gateway harness. The iroh stream plumbing lands with the full P2
-//! integration.
+//! Both lanes are the real ones: bulk diffs use `aeronet_io::Session`'s
+//! datagram buffers and control traffic uses `aeronet_iroh::stream`'s
+//! `IrohStreamIo`. `tests/gateway_live.rs` drives the whole surface — hello,
+//! lease control, a multi-chunk area page and an intent commit — against a
+//! real `orrery_persistd` gateway over iroh, so the wire contract is checked
+//! against the server that implements it rather than against a fake.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -57,3 +58,21 @@ pub use intents::{IntentQueue, IntentStatus, IntentTicket, PredictedEffects};
 pub use latency::LatencyHistogram;
 pub use plugin::{OrreryPersistClientPlugin, PersistClientSet};
 pub use uplink::UplinkScheduler;
+
+#[cfg(test)]
+mod wire_contract_tests {
+    /// The reliable-lane message cap must agree with the transport's own.
+    ///
+    /// `orrery_protocol` defines the cap because `orrery_persistd` is
+    /// Bevy-free and cannot link `aeronet_iroh`; this crate links both, so it
+    /// is the only place the two can be compared. A drift would not fail
+    /// loudly — the larger side would emit messages the smaller side refuses,
+    /// and the loss would surface as a reply that never arrives.
+    #[test]
+    fn reliable_message_cap_matches_the_transport() {
+        assert_eq!(
+            orrery_protocol::channels::MAX_RELIABLE_MESSAGE_BYTES as u64,
+            orrery_net::peer_link::MAX_STREAM_MESSAGE_LEN,
+        );
+    }
+}

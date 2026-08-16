@@ -3,16 +3,28 @@
 //!
 //! The gateway boundary is split into two logical channels: **state** (bulk
 //! diffs) over unreliable datagrams and **control** (area load, intents, hello)
-//! over what the client treats as reliable streams (D3: datagrams = state,
-//! streams = control/bulk). This module owns the one-byte tag that prefixes
-//! every datagram so the receiver can route it without a separate framing
-//! layer, plus the encode/decode helpers both sides use — so `orrery_persistd`
-//! (Bevy-free) and `orrery_persist_client` (Bevy) share **one** wire surface,
-//! not two drifted copies.
+//! over reliable QUIC streams (D3: datagrams = state, streams = control/bulk).
+//! This module owns the one-byte tag that prefixes every payload so the
+//! receiver can route it without a separate framing layer, plus the
+//! encode/decode helpers both sides use — so `orrery_persistd` (Bevy-free) and
+//! `orrery_persist_client` (Bevy) share **one** wire surface, not two drifted
+//! copies.
 //!
-//! Frame layouts (each carried inside one iroh datagram):
-//! - **state**: `[TAG_STATE (0)] [ postcard ]`
-//! - **stream/control**: `[TAG_CONTROL (1)] [ u32 LE length ] [ postcard ]`
+//! Payload layouts:
+//! - **state**: `[TAG_STATE (0)] [ postcard ]`, one iroh datagram each
+//! - **control**: `[TAG_CONTROL (1)] [ u32 LE length ] [ postcard ]`, one
+//!   stream-lane message each
+//!
+//! # Why the control payload keeps its own length prefix
+//!
+//! The stream lane already delimits messages — the transport writes
+//! `[u32 LE length][payload]` and hands the reader whole payloads — so the
+//! inner prefix is, on that lane, redundant. It stays for two reasons. One
+//! decoder then serves both lanes, which matters because the *receiving* side
+//! of both the gateway and the client still accepts a control payload that
+//! arrives as a datagram; and the tag is what tells a receiver which of the two
+//! kinds it is holding regardless of how it arrived. Five bytes on a lane whose
+//! messages are pages and intents is not a trade worth making twice.
 
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -42,11 +54,29 @@ impl Channel {
     }
 }
 
-/// The one-byte tag prefixing every datagram so the receiver can route it to
+/// The one-byte tag prefixing every payload so the receiver can route it to
 /// the right channel. `State` is the default (most traffic).
 pub const TAG_STATE: u8 = 0;
-/// Tag for control datagrams (rare; most control rides streams).
+/// Tag for control payloads: area load, intents, hello, lease control.
 pub const TAG_CONTROL: u8 = 1;
+
+/// The largest control message either side will write to — or accept from —
+/// the reliable stream lane, in bytes.
+///
+/// A stream message is length-prefixed, and the length is chosen by the
+/// *sender*, which on the receiving side means it is attacker-chosen. Both
+/// readers therefore compare the prefix against this cap **before** reserving
+/// a buffer for it, so a peer cannot name a gigabyte and have one allocated.
+///
+/// This must equal the transport's own cap — `aeronet_iroh`'s
+/// `MAX_STREAM_MESSAGE_LEN`, re-exported as
+/// `orrery_net::peer_link::MAX_STREAM_MESSAGE_LEN` — because the Bevy client
+/// rides that implementation while `orrery_persistd` (Bevy-free, D15) speaks
+/// raw iroh and cannot link it. A drift between the two would not fail loudly:
+/// the larger side would emit messages the smaller side refuses, and the loss
+/// would surface as a missing reply. `orrery_persist_client` links both and
+/// asserts they agree.
+pub const MAX_RELIABLE_MESSAGE_BYTES: usize = 1024 * 1024;
 
 /// Tag a datagram payload with its channel. Returns a new `Vec` with the tag
 /// prepended.
@@ -168,7 +198,9 @@ pub fn decode_datagram<T: DeserializeOwned>(payload: &[u8]) -> Option<T> {
 ///
 /// Reliable-stream traffic is length-prefixed so one channel can carry many
 /// messages, and tagged so the receiver can route it without a separate
-/// framing layer. Both directions share this encoding.
+/// framing layer. Both directions share this encoding. See the [module
+/// docs](self#why-the-control-payload-keeps-its-own-length-prefix) for why the
+/// prefix survives the move onto a lane that already frames.
 ///
 /// # Panics
 ///

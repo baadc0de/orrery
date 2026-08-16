@@ -3,8 +3,10 @@
 //!
 //! This is the server mirror of `orrery_persist_client::gateway`. A client
 //! connects over iroh (ALPN `orrery/gateway/0`), completes the aeronet-style
-//! admission handshake (one uni-stream carrying `[ACCEPTED]`), then streams
-//! tagged datagrams carrying [`GatewayMsg`]s:
+//! admission handshake (one uni-stream carrying `[ACCEPTED]`), then speaks two
+//! lanes (D3): unreliable datagrams for bulk state, and reliable
+//! unidirectional streams for control (see [`crate::reliable`]). Both carry
+//! tagged [`GatewayMsg`]s, and the tag — not the lane — is what routes them:
 //!
 //! - [`GatewayMsg::Diff`] → route to the owning cell actor (journal append +
 //!   fold) and ack with the durable LSN (the ack *is* the durability contract,
@@ -23,8 +25,9 @@
 //!
 //! The transport is the **raw** iroh endpoint — this crate is **Bevy-free**
 //! (D15) and does not run the aeronet session stack. It speaks exactly the wire
-//! surface `aeronet_iroh`'s client side expects (admission uni-stream, then
-//! datagrams), so the existing gateway client connects unmodified.
+//! surface `aeronet_iroh`'s client side expects: the admission uni-stream, then
+//! datagrams and `[u32 LE length][payload]`-framed uni-streams, so the existing
+//! gateway client connects unmodified.
 //!
 //! Because `CellRuntime` is `Send` but not `Sync` (its `CellActorHandle`s hold
 //! `JoinHandle`s), the gateway shares it behind a `tokio::sync::Mutex`. For a
@@ -62,6 +65,7 @@ use crate::intent::{
 };
 use crate::lease::registrar_now_ms;
 use crate::payload_crc;
+use crate::reliable;
 
 /// The ALPN the gateway advertises and accepts. Matches the client's
 /// `orrery_persist_client::gateway::GATEWAY_ALPN`.
@@ -2097,34 +2101,65 @@ async fn handle_connection(
         return;
     }
 
+    // The reliable lanes are opened lazily on first use, so a connection that
+    // only ever uplinks diffs costs the peer no stream. Starting the receiver
+    // *after* `send_admission` matters: it accepts every inbound uni-stream
+    // from the moment it runs, and the client's own admission read would
+    // otherwise be racing it.
+    let reliable = reliable::spawn(Arc::clone(&conn), remote, Arc::clone(&send_failures));
+    let (inbound_tx, mut inbound_rx) = tokio::sync::mpsc::unbounded_channel::<Bytes>();
+    reliable::spawn_receiver(Arc::clone(&conn), remote, inbound_tx.clone());
+    spawn_datagram_reader(Arc::clone(&conn), remote, inbound_tx);
+
+    // One `send` for every reply path, routing on the tag the payload already
+    // carries: state replies (bulk acks and nacks) stay on datagrams, where a
+    // stale ack is worth less than a timely one, and every control reply rides
+    // the ordered reliable lane. Callers do not choose a lane — the channel
+    // policy (D3) does, in one place.
     let send: Arc<dyn Fn(Bytes) + Send + Sync> = {
         let conn = Arc::clone(&conn);
+        let reliable = reliable.clone();
+        let send_failures = Arc::clone(&send_failures);
         Arc::new(move |bytes: Bytes| {
+            if matches!(untag(&bytes), Some((Channel::Control, _))) {
+                reliable.send(reliable::Lane::Control, bytes);
+                return;
+            }
             let len = bytes.len();
             if let Err(e) = conn.send_datagram(bytes) {
-                // Never swallow a failed send: an oversize page or a torn
+                // Never swallow a failed send: an oversize payload or a torn
                 // connection is counted and logged, not silently dropped.
                 send_failures.fetch_add(1, Ordering::Relaxed);
                 warn!(?e, %remote, len, "gateway: reply datagram send failed");
             }
         })
     };
+    // Area pages take the second reliable lane, so a 27-cell page-in never
+    // sits in front of an intent ack the D16 table budgets at p99 < 10 ms.
+    let send_area: Arc<dyn Fn(Bytes) + Send + Sync> = {
+        let reliable = reliable.clone();
+        Arc::new(move |bytes: Bytes| reliable.send(reliable::Lane::Area, bytes))
+    };
     let inflight_diffs = Arc::new(Semaphore::new(MAX_INFLIGHT_DIFF_ROUTES_PER_CONN));
     let inflight_control = Arc::new(Semaphore::new(MAX_INFLIGHT_CONTROL_ROUTES_PER_CONN));
     let inflight_intents = Arc::new(Semaphore::new(MAX_INFLIGHT_INTENT_ROUTES_PER_CONN));
     let mut session: Option<PeerSession> = None;
 
+    // Both lanes feed one queue, so the dispatch below is written once and does
+    // not care which lane a message arrived on. The channel closes when both
+    // feeder tasks have ended, which is how a torn connection ends this loop.
     loop {
-        let pkt = match conn.read_datagram().await {
-            Ok(pkt) => pkt,
-            Err(e) => {
-                debug!(?e, %remote, "gateway: connection closed");
-                break;
-            }
+        let Some(pkt) = inbound_rx.recv().await else {
+            debug!(%remote, "gateway: connection closed");
+            break;
         };
         let Some((channel, _)) = untag(&pkt) else {
             continue;
         };
+        // A control payload is accepted from either lane. Clients send it on
+        // the stream lane now, but the encoding is lane-independent and a
+        // receiver that insisted on the lane would reject a well-formed
+        // message for a reason the sender cannot see.
         let msg: Option<GatewayMsg> = match channel {
             Channel::State => decode_datagram(&pkt),
             Channel::Control => decode_stream_frame(&pkt),
@@ -2553,7 +2588,8 @@ async fn handle_connection(
                 }
             }
             GatewayMsg::Subscribe { grid, cells } => {
-                let send = Arc::clone(&send);
+                // Pages answer on the area lane, not the control lane.
+                let send = Arc::clone(&send_area);
                 let router = Arc::clone(&router);
                 let permit = Arc::clone(&inflight_control).acquire_owned().await;
                 match permit {
@@ -3051,6 +3087,33 @@ fn send_intent_reply(
     send(Bytes::from(encode_stream_frame(&reply)));
 }
 
+/// Feed the connection's datagrams into the shared inbound queue.
+///
+/// Its counterpart is [`reliable::spawn_receiver`]. Both write to the same
+/// queue and the task ends when its source does, so the queue closes — and the
+/// receive loop with it — only once *both* lanes are gone.
+fn spawn_datagram_reader(
+    conn: Arc<iroh::endpoint::Connection>,
+    remote: NodeId,
+    sink: tokio::sync::mpsc::UnboundedSender<Bytes>,
+) {
+    tokio::spawn(async move {
+        loop {
+            match conn.read_datagram().await {
+                Ok(pkt) => {
+                    if sink.send(pkt).is_err() {
+                        return;
+                    }
+                }
+                Err(e) => {
+                    debug!(?e, %remote, "gateway: datagram lane closed");
+                    return;
+                }
+            }
+        }
+    });
+}
+
 /// Send the `[ACCEPTED]` admission response on a fresh uni stream.
 async fn send_admission(conn: &iroh::endpoint::Connection) -> Result<(), String> {
     let mut stream = conn
@@ -3308,13 +3371,14 @@ async fn route_subscribe(
 /// Split one cell's page into as many sequenced [`AreaPage`] frames as needed
 /// to keep every encoded frame under [`MAX_AREA_PAGE_FRAME_BYTES`].
 ///
-/// The lane is packet-only (D3 datagrams; the reliable-stream class of
-/// docs/08-persistence.md §2.1 does not exist in this build), so an oversized
-/// frame is rejected by QUIC and lost — chunking is the P2 answer: sequence
-/// the frames (`page_index`/`last`) and let the client reassemble. The frame
-/// cap is conservative; if one entity's bag alone cannot fit, its frame is
-/// emitted oversize and the send is counted (an entity that big is a Ruleset
-/// bug, not a transport problem).
+/// Pages ride the reliable lane, so this is no longer about fitting an MTU —
+/// QUIC re-segments a stream write for us. It is about bounding the *message*:
+/// the peer's reader refuses a length prefix past
+/// `MAX_RELIABLE_MESSAGE_BYTES` before allocating for it, and a receiver
+/// holding partial chunks for 27 cells wants each chunk's footprint knowable
+/// in advance. If one entity's bag alone cannot fit, its frame is emitted
+/// oversize, refused at the sender, and counted (an entity that big is a
+/// Ruleset bug, not a transport problem).
 fn chunk_area_page(
     cell: CellId,
     entities: Vec<PersistId>,
