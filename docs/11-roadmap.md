@@ -59,6 +59,7 @@ they happened to connect.
 - big_space ported to Bevy 0.19 (tracked risk, D14) and integrated: `GridCell` ↔ interest-level `CellId` (128 m edge). **Resolved** — big_space 0.13 builds against Bevy 0.19 from the upstream `bevy-0.19` branch, and the `big_space` feature is now default rather than opt-in. The workspace still pins a git revision until that branch is released.
 - Replicon visibility mapped from the 3×3×3 neighborhood; bounded high-rate interest set (24 entities) with 1–4 Hz extrapolated proxies beyond it — the Donnybrook pattern, whose measured ~12·n kb/s receive scaling is why the set is bounded ([Donnybrook, SIGCOMM 2008](https://www.microsoft.com/en-us/research/wp-content/uploads/2016/02/donnybrook.pdf)).
 - Handoff hysteresis (10% of cell edge) verified against oscillation on the cell boundary.
+- Peer upload budget metered and enforced at the send path (≤ 1 Mbps sustained, D6/D16): wire bytes including per-datagram overhead, a sliding window, per-link rates for the accumulator to apportion, and an oversubscription signal. State sheds at the ceiling, control never does. Priority-ordered shedding by relevance class stays with `orrery_predict`'s accumulator (docs/03-replication.md §9.3).
 
 **Demo criterion.** 32 synthetic peers (headless bot harness, scripted roaming across ≥64 interest cells) run for one hour: every peer's sustained upload stays ≤ 1 Mbps; interest-set membership churn is absorbed without visible proxy pops; no entity thrashes cells at a boundary; a late-joining peer receives only its 27-cell neighborhood.
 

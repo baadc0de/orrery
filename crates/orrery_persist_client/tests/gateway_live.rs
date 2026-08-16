@@ -57,6 +57,9 @@ fn client_app(gateway: &orrery_persistd::GatewayServer, client_key: &iroh_base::
                 relay_mode: aeronet_iroh::iroh::RelayMode::Disabled,
                 secret_key: Some(client_key.clone()),
             },
+            // No coordinator: this exercises the gateway path, and membership
+            // falls back to the connected-session set.
+            ..Default::default()
         },
     ));
     app.add_plugins(OrreryAuthorityPlugin);
