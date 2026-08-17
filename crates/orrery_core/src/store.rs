@@ -24,12 +24,46 @@ use orrery_protocol::{
     PersistId, StateClaim, Tick, MAX_ADJUDICATION_TICKS,
 };
 
-use crate::log::{fold, HeadTransition};
+use crate::log::{claim_hash, fold, HeadTransition};
 
 /// Postcard cost of one [`FrameHead`]: two 32-byte hashes plus a varint id.
 ///
 /// Deliberately an over-estimate, so a budget is never overshot by rounding.
 const SERVED_HEAD_BYTES: usize = 32 + 32 + 10;
+
+/// Distinct claims retained per tick.
+///
+/// One is the honest case. Two is what it takes to *hold* a producer to a
+/// double-signed tick — an equivocation is proven by a conflicting pair, and a
+/// third claim adds nothing a pair does not already establish. The cap is what
+/// keeps a peer that streams claims at a witness from growing its retention
+/// without bound: a witness retains whatever a subject signs, so "keep them
+/// all" is an allocation a stranger controls.
+const MAX_CLAIMS_PER_TICK: usize = 2;
+
+/// What retaining a claim did — see [`AuthorityLog::record_claim`].
+///
+/// Returned rather than silently absorbed because a store that quietly
+/// resolves a duplicate is a store that hides a producer bug. p1-swarm signed
+/// tick 0 twice for the whole of P4 and it was found by accident; the fix
+/// there was in the producer, and a producer that repeats the mistake should
+/// hear about it from the first component that can see it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClaimRecord {
+    /// Nothing was retained at this tick; the claim is now.
+    Recorded,
+    /// The identical claim was already retained. Idempotent: re-recording a
+    /// claim (a witness re-anchoring on one it already holds) is not a fault.
+    Repeated,
+    /// A *different* claim is already retained at this tick: the producer
+    /// signed one tick twice. Both are kept — see [`MAX_CLAIMS_PER_TICK`] —
+    /// and `held` is the [`claim_hash`] of the one that was already there, so
+    /// a caller can name the pair without digging it back out of the store.
+    Conflict {
+        /// Hash of the claim already retained at this tick.
+        held: [u8; 32],
+    },
+}
 
 /// What an authority could serve of a [`LogRangeRequest`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -123,6 +157,90 @@ impl Default for EntityHistory {
     }
 }
 
+impl EntityHistory {
+    /// Index range of the claims retained at `tick`, in retention order.
+    ///
+    /// `claims` is kept sorted by tick (see [`AuthorityLog::record_claim`]),
+    /// which is what makes this a bisection rather than a scan and what lets
+    /// [`Self::chain_from`] walk tick groups in order.
+    fn range_at(&self, tick: u64) -> (usize, usize) {
+        (
+            self.claims.partition_point(|held| held.claim.tick.0 < tick),
+            self.claims
+                .partition_point(|held| held.claim.tick.0 <= tick),
+        )
+    }
+
+    /// The claims following `t0` that chain from it, one per tick.
+    ///
+    /// Returns how long the chaining prefix is, and the claims themselves. At
+    /// a tick with two retained claims the one whose `prev_claim` continues
+    /// the chain is taken; where neither does, the earliest-retained one is —
+    /// which is what a single-claim tick would have produced, so a genuine
+    /// break is reported exactly as it was before this selection existed.
+    fn follow(&self, t0: usize, window: (Tick, Tick)) -> (usize, Vec<StateClaim>) {
+        let (start, end) = window;
+        let mut previous = claim_hash(&self.claims[t0].claim);
+        let mut chained = 0usize;
+        let mut broken = false;
+        let mut disputed = Vec::new();
+        let mut index = self.range_at(start.0).1;
+        while index < self.claims.len() {
+            let tick = self.claims[index].claim.tick.0;
+            if tick > end.0 {
+                break;
+            }
+            let (group_start, group_end) = self.range_at(tick);
+            let pick = (group_start..group_end)
+                .find(|candidate| self.claims[*candidate].claim.prev_claim == previous)
+                .unwrap_or(group_start);
+            if broken || self.claims[pick].claim.prev_claim != previous {
+                broken = true;
+            } else {
+                chained += 1;
+            }
+            previous = claim_hash(&self.claims[pick].claim);
+            disputed.push(self.claims[pick].claim.clone());
+            index = group_end;
+        }
+        (chained, disputed)
+    }
+
+    /// The claim to open a window at, with the claims that follow it.
+    ///
+    /// # Why selection, and not just "the first claim at the tick"
+    ///
+    /// A bundle whose `t0_claim` and `disputed_claims` do not chain is a
+    /// conviction: `verify_bundle` reads the break as the authority having
+    /// equivocated about its own history. So when a tick holds two claims, the
+    /// choice of which one opens the window decides a verdict — and taking the
+    /// first retained one convicted p1-swarm's honest bots, because the anchor
+    /// was retained first while every later claim chained from the run loop's
+    /// duplicate.
+    ///
+    /// The candidate is therefore chosen by what the *rest of the retained
+    /// history* says: the one the following claims actually chain from, so a
+    /// break survives into the bundle only when no retained claim at the tick
+    /// explains it. A snapshot outranks chaining, because a window that cannot
+    /// be opened at all silences a witness, and a break with an openable
+    /// window is adjudicable evidence rather than a mute report.
+    fn chain_from(&self, window: (Tick, Tick)) -> Option<(&RetainedClaim, Vec<StateClaim>)> {
+        let (first, last) = self.range_at(window.0 .0);
+        let mut best: Option<((bool, usize), usize, Vec<StateClaim>)> = None;
+        for candidate in first..last {
+            let (chained, disputed) = self.follow(candidate, window);
+            let score = (!self.claims[candidate].snapshot.is_empty(), chained);
+            // Strictly better wins, so a tie keeps the earliest retained
+            // candidate and selection stays a pure function of the log.
+            if best.as_ref().is_none_or(|(held, _, _)| score > *held) {
+                best = Some((score, candidate, disputed));
+            }
+        }
+        let (_, candidate, disputed) = best?;
+        Some((&self.claims[candidate], disputed))
+    }
+}
+
 /// An authority's retained log across every entity it holds.
 ///
 /// Frames are stored once for all entities rather than per entity: one frame
@@ -135,6 +253,8 @@ pub struct AuthorityLog {
     retention: Retention,
     entities: BTreeMap<PersistId, EntityHistory>,
     frames: VecDeque<(LogFrame, Vec<HeadTransition>)>,
+    conflicting_claims: u64,
+    conflicting_tick_hashes: u64,
 }
 
 impl Default for AuthorityLog {
@@ -151,6 +271,8 @@ impl AuthorityLog {
             retention,
             entities: BTreeMap::new(),
             frames: VecDeque::new(),
+            conflicting_claims: 0,
+            conflicting_tick_hashes: 0,
         }
     }
 
@@ -180,17 +302,59 @@ impl AuthorityLog {
     }
 
     /// Record the per-tick state hash an entity's execution produced.
+    ///
+    /// Last write wins, and a write that *changes* a retained hash is counted
+    /// in [`Self::conflicting_tick_hashes`]. Unlike a claim, a tick hash is
+    /// never judged — `claimed_hashes` is reporter-supplied and
+    /// [`verify_bundle`](crate::verify_bundle) reaches a verdict only from
+    /// signed claims — so overwriting one cannot convict anybody. It can still
+    /// only happen if the same tick was executed twice to different ends,
+    /// which is a producer bug worth being able to see.
     pub fn record_tick_hash(&mut self, entity: PersistId, tick: Tick, hash: [u8; 32]) {
-        self.entities
-            .entry(entity)
-            .or_default()
+        let history = self.entities.entry(entity).or_default();
+        let conflict = history
             .hashes
-            .insert(tick.0, hash);
+            .insert(tick.0, hash)
+            .is_some_and(|held| held != hash);
+        if conflict {
+            self.conflicting_tick_hashes += 1;
+        }
     }
 
     /// Retain a frame the authority sent, with the transitions it commits to.
+    ///
+    /// A frame identical to one already retained is dropped. Frames are
+    /// checked for contiguity at assembly, so a repeat would not corrupt a
+    /// bundle — it would make the window *unservable*
+    /// ([`BundleError::IncompleteFrames`], because the repeat does not start
+    /// where its predecessor ended) and mute a witness that had done nothing
+    /// wrong. A byte-identical frame carries no information either way.
     pub fn record_frame(&mut self, frame: LogFrame, transitions: Vec<HeadTransition>) {
+        if self
+            .frames
+            .iter()
+            .any(|(held, _)| held.first_tick == frame.first_tick && *held == frame)
+        {
+            return;
+        }
         self.frames.push_back((frame, transitions));
+    }
+
+    /// Ticks at which a producer signed two different claims.
+    ///
+    /// Non-zero means a producer bug (or an equivocating subject, when this log
+    /// is a witness's): the store resolves the duplicate so it cannot
+    /// manufacture a verdict, and counts it so the resolution is not the same
+    /// thing as the fault going unnoticed.
+    #[must_use]
+    pub fn conflicting_claims(&self) -> u64 {
+        self.conflicting_claims
+    }
+
+    /// Ticks whose retained state hash was overwritten with a different one.
+    #[must_use]
+    pub fn conflicting_tick_hashes(&self) -> u64 {
+        self.conflicting_tick_hashes
     }
 
     /// Retain a claim and the quantized snapshot it commits to.
@@ -198,12 +362,73 @@ impl AuthorityLog {
     /// The snapshot is kept because a claim is a hash, not state: an
     /// adjudicator needs somewhere to start replaying from, and the claim only
     /// proves that the served bytes are the ones committed to.
-    pub fn record_claim(&mut self, claim: StateClaim, snapshot: Vec<u8>) {
-        self.entities
-            .entry(claim.entity)
-            .or_default()
+    ///
+    /// # One tick, two claims
+    ///
+    /// Claims are retained sorted by tick, at most [`MAX_CLAIMS_PER_TICK`] per
+    /// tick, and a repeat of a claim already held is idempotent. Sorting is not
+    /// tidiness: [`Self::assemble_bundle`] walks tick groups in order, and a
+    /// witness retains claims as they arrive from a subject that owes it no
+    /// ordering.
+    ///
+    /// A *conflicting* pair — same tick, different claim — is kept rather than
+    /// resolved here, because at record time the log cannot know which of the
+    /// two the producer went on to chain from, and picking wrong is what
+    /// manufactures a false conviction. The choice belongs where the evidence
+    /// to make it exists: assembly, which can see what the following claims
+    /// chain to. The return value reports the conflict so a caller need not
+    /// discover its own double-signing by adjudication.
+    ///
+    /// A claim recorded without a snapshot inherits a sibling's when both
+    /// commit to the same `state_hash` at that tick. The snapshot is a
+    /// commitment to *state*, not to a chain position, and
+    /// [`verify_bundle`](crate::verify_bundle) checks it against the claim's
+    /// own `state_hash` — so sharing it is sound, and refusing to would leave
+    /// the chaining claim unopenable and the window unservable. This is the
+    /// witness case exactly: it is handed a snapshot with the anchor and none
+    /// with the streamed claims that follow.
+    pub fn record_claim(&mut self, claim: StateClaim, snapshot: Vec<u8>) -> ClaimRecord {
+        let tick = claim.tick.0;
+        let history = self.entities.entry(claim.entity).or_default();
+        let (first, last) = history.range_at(tick);
+
+        if let Some(index) = (first..last).find(|held| history.claims[*held].claim == claim) {
+            if history.claims[index].snapshot.is_empty() && !snapshot.is_empty() {
+                history.claims[index].snapshot = snapshot;
+            }
+            return ClaimRecord::Repeated;
+        }
+
+        let snapshot = if snapshot.is_empty() {
+            (first..last)
+                .find(|held| {
+                    let sibling = &history.claims[*held];
+                    sibling.claim.state_hash == claim.state_hash && !sibling.snapshot.is_empty()
+                })
+                .map_or(snapshot, |held| history.claims[held].snapshot.clone())
+        } else {
+            snapshot
+        };
+
+        let outcome = if first == last {
+            ClaimRecord::Recorded
+        } else {
+            ClaimRecord::Conflict {
+                held: claim_hash(&history.claims[first].claim),
+            }
+        };
+        history
             .claims
-            .push_back(RetainedClaim { claim, snapshot });
+            .insert(last, RetainedClaim { claim, snapshot });
+        if last + 1 - first > MAX_CLAIMS_PER_TICK {
+            // Keep the earliest and the newest: those are the two a following
+            // claim can chain from, and the pair that proves the conflict.
+            history.claims.remove(first + 1);
+        }
+        if matches!(outcome, ClaimRecord::Conflict { .. }) {
+            self.conflicting_claims += 1;
+        }
+        outcome
     }
 
     /// Answer a [`LogRangeRequest`] with as many retained frames as fit.
@@ -329,10 +554,12 @@ impl AuthorityLog {
             .get(&entity)
             .ok_or(BundleError::NoClaimAtStart)?;
 
-        let t0 = history
-            .claims
-            .iter()
-            .find(|retained| retained.claim.tick == start)
+        // The claim that opens the window is the one the rest of the retained
+        // claims chain from — not merely the first one held at that tick. See
+        // `EntityHistory::chain_from`: with one claim per tick these are the
+        // same claim, and with two the difference is a verdict.
+        let (t0, disputed_claims) = history
+            .chain_from((start, end))
             .ok_or(BundleError::NoClaimAtStart)?;
         if t0.snapshot.is_empty() {
             return Err(BundleError::SnapshotEvicted);
@@ -387,13 +614,6 @@ impl AuthorityLog {
         if frames.is_empty() {
             return Err(BundleError::IncompleteFrames);
         }
-
-        let disputed_claims = history
-            .claims
-            .iter()
-            .filter(|retained| retained.claim.tick > start && retained.claim.tick <= end)
-            .map(|retained| retained.claim.clone())
-            .collect();
 
         Ok(EvidenceBundle {
             ruleset: t0.claim.ruleset,
@@ -526,6 +746,209 @@ mod tests {
         assert_eq!(bundle.t0_snapshot.as_ref(), &[1, 2, 3]);
         assert_eq!(bundle.claimed_hashes.len(), 6);
         assert_eq!(bundle.frames.len(), 2);
+    }
+
+    /// A claim at `tick` chaining from `previous`, otherwise like [`claim`].
+    fn chained_claim(tick: u64, previous: [u8; 32], state: u8) -> StateClaim {
+        let mut built = claim(tick);
+        built.prev_claim = previous;
+        built.state_hash = [state; 32];
+        crate::log::sign_claim(&iroh_base::SecretKey::from_bytes(&[1; 32]), &mut built);
+        built
+    }
+
+    #[test]
+    fn a_tick_claimed_twice_is_reported_rather_than_silently_resolved() {
+        // A store that quietly picks one of two claims hides a producer bug:
+        // p1-swarm signed tick 0 twice for the whole of P4 and it surfaced by
+        // accident. Recording the same claim again is not a fault; recording a
+        // different one at the same tick is.
+        let mut log = AuthorityLog::default();
+        let first = chained_claim(100, [0; 32], 1);
+        assert_eq!(
+            log.record_claim(first.clone(), vec![1]),
+            ClaimRecord::Recorded
+        );
+        assert_eq!(
+            log.record_claim(first.clone(), vec![1]),
+            ClaimRecord::Repeated
+        );
+        assert_eq!(log.conflicting_claims(), 0);
+
+        let second = chained_claim(100, claim_hash(&first), 1);
+        assert_eq!(
+            log.record_claim(second, Vec::new()),
+            ClaimRecord::Conflict {
+                held: claim_hash(&first)
+            }
+        );
+        assert_eq!(log.conflicting_claims(), 1);
+    }
+
+    #[test]
+    fn a_second_claim_at_a_tick_inherits_the_snapshot_of_the_state_it_shares() {
+        // The witness case: it is handed a snapshot with the anchor and none
+        // with the claims that stream in after. A snapshot commits to a state
+        // hash, not to a chain position, so the two claims at one tick share
+        // it — and without that the chaining claim could not open a window at
+        // all, which silences a witness instead of convicting anyone.
+        let mut log = AuthorityLog::default();
+        let anchor = chained_claim(100, [0; 32], 1);
+        log.record_claim(anchor.clone(), vec![1, 2, 3]);
+        log.record_claim(chained_claim(100, claim_hash(&anchor), 1), Vec::new());
+        for tick in 100..106 {
+            log.record_tick_hash(ENTITY, Tick::new(tick), [tick as u8; 32]);
+        }
+        for first in [100, 103] {
+            let (frame, transitions) = frame(first, vec![ENTITY]);
+            log.record_frame(frame, transitions);
+        }
+        let bundle = log
+            .assemble_bundle(ENTITY, (Tick::new(100), Tick::new(106)), vec![[0; 32]; 6])
+            .expect("the shared snapshot makes the window servable");
+        assert_eq!(bundle.t0_snapshot.as_ref(), &[1, 2, 3]);
+
+        // A differing state at the same tick is a different commitment; there
+        // is nothing to share, and the window opens at the claim that can.
+        let mut other = AuthorityLog::default();
+        other.record_claim(anchor.clone(), vec![1, 2, 3]);
+        other.record_claim(chained_claim(100, claim_hash(&anchor), 9), Vec::new());
+        for tick in 100..106 {
+            other.record_tick_hash(ENTITY, Tick::new(tick), [tick as u8; 32]);
+        }
+        for first in [100, 103] {
+            let (frame, transitions) = frame(first, vec![ENTITY]);
+            other.record_frame(frame, transitions);
+        }
+        let bundle = other
+            .assemble_bundle(ENTITY, (Tick::new(100), Tick::new(106)), vec![[0; 32]; 6])
+            .expect("openable at the claim that has a snapshot");
+        assert_eq!(bundle.t0_claim.state_hash, [1; 32]);
+    }
+
+    #[test]
+    fn a_window_opens_at_the_claim_the_later_claims_chain_from() {
+        // The false-conviction shape, at the unit level: two claims at the
+        // window start, and the claim inside the window chains from the second.
+        // Taking the first would put a break into the bundle that the retained
+        // history does not contain.
+        let mut log = AuthorityLog::default();
+        let anchor = chained_claim(100, [0; 32], 1);
+        let duplicate = chained_claim(100, claim_hash(&anchor), 1);
+        let later = chained_claim(103, claim_hash(&duplicate), 2);
+        log.record_claim(anchor, vec![1, 2, 3]);
+        log.record_claim(duplicate.clone(), Vec::new());
+        log.record_claim(later.clone(), vec![4]);
+        for tick in 100..106 {
+            log.record_tick_hash(ENTITY, Tick::new(tick), [tick as u8; 32]);
+        }
+        for first in [100, 103] {
+            let (frame, transitions) = frame(first, vec![ENTITY]);
+            log.record_frame(frame, transitions);
+        }
+
+        let bundle = log
+            .assemble_bundle(ENTITY, (Tick::new(100), Tick::new(106)), vec![[0; 32]; 6])
+            .expect("window is servable");
+        assert_eq!(bundle.t0_claim, duplicate);
+        assert_eq!(bundle.disputed_claims, vec![later]);
+    }
+
+    #[test]
+    fn a_break_no_retained_claim_explains_still_reaches_the_bundle() {
+        // Selection must not launder a real discrepancy. When nothing retained
+        // at the tick chains, the bundle carries the break exactly as it did
+        // before selection existed — this is evidence, not a bug.
+        let mut log = AuthorityLog::default();
+        let anchor = chained_claim(100, [0; 32], 1);
+        let orphan = chained_claim(103, [0x11; 32], 2);
+        log.record_claim(anchor.clone(), vec![1]);
+        log.record_claim(orphan.clone(), vec![2]);
+        for tick in 100..106 {
+            log.record_tick_hash(ENTITY, Tick::new(tick), [0; 32]);
+        }
+        for first in [100, 103] {
+            let (frame, transitions) = frame(first, vec![ENTITY]);
+            log.record_frame(frame, transitions);
+        }
+        let bundle = log
+            .assemble_bundle(ENTITY, (Tick::new(100), Tick::new(106)), vec![[0; 32]; 6])
+            .expect("window is servable");
+        assert_eq!(bundle.t0_claim, anchor);
+        assert_eq!(bundle.disputed_claims, vec![orphan]);
+    }
+
+    #[test]
+    fn claims_are_retained_in_tick_order_however_they_arrive() {
+        // A witness retains what a subject sends it, and a subject owes it no
+        // ordering. `assemble_bundle` walks the claims in order, so arrival
+        // order must not decide what a bundle contains.
+        let mut log = AuthorityLog::default();
+        let first = chained_claim(100, [0; 32], 1);
+        let second = chained_claim(103, claim_hash(&first), 2);
+        log.record_claim(second.clone(), vec![2]);
+        log.record_claim(first.clone(), vec![1]);
+        for tick in 100..106 {
+            log.record_tick_hash(ENTITY, Tick::new(tick), [0; 32]);
+        }
+        for start in [100, 103] {
+            let (frame, transitions) = frame(start, vec![ENTITY]);
+            log.record_frame(frame, transitions);
+        }
+        let bundle = log
+            .assemble_bundle(ENTITY, (Tick::new(100), Tick::new(106)), vec![[0; 32]; 6])
+            .expect("window is servable");
+        assert_eq!(bundle.t0_claim, first);
+        assert_eq!(bundle.disputed_claims, vec![second]);
+    }
+
+    #[test]
+    fn a_third_claim_at_one_tick_keeps_the_first_and_the_newest() {
+        // Retention a stranger controls has to be bounded: a witness retains
+        // whatever its subject signs. Two is what proves a conflict; the pair
+        // kept is the earliest and the newest, which are the two a following
+        // claim can chain from.
+        let mut log = AuthorityLog::default();
+        let first = chained_claim(100, [0; 32], 1);
+        let second = chained_claim(100, claim_hash(&first), 1);
+        let third = chained_claim(100, claim_hash(&second), 1);
+        log.record_claim(first.clone(), vec![1]);
+        log.record_claim(second, vec![2]);
+        log.record_claim(third.clone(), vec![3]);
+        let history = log.entities.get(&ENTITY).expect("entity retained");
+        assert_eq!(history.claims.len(), MAX_CLAIMS_PER_TICK);
+        assert_eq!(history.claims[0].claim, first);
+        assert_eq!(history.claims[1].claim, third);
+        assert_eq!(log.conflicting_claims(), 2);
+    }
+
+    #[test]
+    fn a_repeated_frame_does_not_make_the_window_unservable() {
+        // Frames are checked for contiguity at assembly, so a byte-identical
+        // repeat would fail `IncompleteFrames` and mute a witness rather than
+        // corrupt a bundle. It carries no information; it is dropped.
+        let mut log = AuthorityLog::default();
+        log.record_claim(claim(100), vec![1]);
+        for tick in 100..106 {
+            log.record_tick_hash(ENTITY, Tick::new(tick), [0; 32]);
+        }
+        for start in [100, 100, 103] {
+            let (frame, transitions) = frame(start, vec![ENTITY]);
+            log.record_frame(frame, transitions);
+        }
+        assert!(log
+            .assemble_bundle(ENTITY, (Tick::new(100), Tick::new(106)), vec![[0; 32]; 6])
+            .is_ok());
+    }
+
+    #[test]
+    fn a_tick_hash_overwritten_with_a_different_one_is_counted() {
+        let mut log = AuthorityLog::default();
+        log.record_tick_hash(ENTITY, Tick::new(100), [1; 32]);
+        log.record_tick_hash(ENTITY, Tick::new(100), [1; 32]);
+        assert_eq!(log.conflicting_tick_hashes(), 0);
+        log.record_tick_hash(ENTITY, Tick::new(100), [2; 32]);
+        assert_eq!(log.conflicting_tick_hashes(), 1);
     }
 
     #[test]

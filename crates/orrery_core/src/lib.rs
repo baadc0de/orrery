@@ -90,5 +90,5 @@ pub use ruleset::{
     state_hash, CodecError, ComponentTypeId, CoreClass, CoreCodec, OrderedInputs, Ruleset,
     StateView, StepOutput,
 };
-pub use store::{AuthorityLog, BundleError, Retention};
+pub use store::{AuthorityLog, BundleError, ClaimRecord, Retention};
 pub use tolerance::{Tolerance, ToleranceOutcome, TrajectorySample};
