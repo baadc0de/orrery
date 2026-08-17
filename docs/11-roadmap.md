@@ -211,9 +211,37 @@ processes, so the `kill -9` is a real SIGKILL rather than a dropped task, and
 each peer obtains its interest grant from the coordinator rather than having
 one minted for it — a fixture that signs its own authorization would prove
 nothing about the path production uses. Observed on an 8-peer island of 400
-entities: **50/50 of the victim's entities reassigned to survivors in ~10.9 s,
+entities: **50/50 of the victim's entities reassigned to survivors in ~9.9 s,
 0 lost, 0 duplicate-authority observations**, reproduced across runs. The gate
 writes no success artifact unless every clause holds.
+
+**Both dispositions stop the clock, because the criterion names both.** An
+earlier harness counted only inheritance, so a run in which every entity
+legitimately *parked* could exit its settle loop no earlier than the deadline
+and failed by construction — a gate strictly stronger than the criterion it
+cited, and silently so. Parking is now measured, and the way it is measured is
+forced by what is observable: the registrar tells only the *previous* holder
+that a lease parked, and that peer is the one that was killed, so no survivor
+and no third party is told anything. The one non-invasive witness is the
+registrar's own `parked_without_successor` counter in persistd's
+`--metrics-jsonl`, incremented by `Redistributor::place` at the moment it
+decides. Reassignment is therefore timed per entity, off the timestamp the
+inheriting peer puts on the grant; parking is timed per cohort, at the poll
+that first sees the exported counter cover every entity still outstanding. A
+*claim* is not an instrument here: a weak claim over a weak-held row is granted
+even against a live holder, and a strong claim against one becomes a divest
+request whose unanswered deadline hands the entity over — a harness probing
+that way would perform the redistribution it claims to observe. The probe that
+remains runs only after the clock has stopped, and proves only what it can:
+that an entity with no disposition still exists and still answers, i.e. that it
+is not lost.
+
+`P3_VICTIM_CLAIM_KIND` picks which half a run exercises. `weak` is the
+contested-physics case and redistributes; `strong` is the case D7 §5 refuses to
+redistribute without consent, so every one of the victim's rows parks. Both are
+correct registrar behaviour and both are exercised: **50/50 reassigned in
+~9.9 s** and **50/50 parked, observed in ~10.7 s**, each against a 12.05 s
+budget, 0 lost and 0 duplicate-authority observations in both.
 
 One finding worth recording, because it changes what "within the TTL" means in
 practice: **a `kill -9` is resolved by the slow path, not the fast one**. QUIC
@@ -222,8 +250,13 @@ so the gateway never sees a connection drop for a SIGKILLed peer; the lease
 TTL lapsing is what redistributes its entities (§4.3's `else silent` branch).
 The fast path is real, and covered by the disconnect test, but it is what a
 *graceful* exit or a torn connection takes. The harness therefore budgets the
-TTL plus the registrar's once-a-second sweep granularity and the up-to-one
-heartbeat interval of TTL already spent before the kill.
+TTL plus the granularity of every instrument between the disposition and the
+harness: the registrar's once-a-second expiry sweep, the once-a-second metrics
+export that is the only witness to a park, and the harness's own 50 ms poll of
+that export, which carries no timestamp of its own. The heartbeat interval is
+deliberately *not* a term — a lease expires one TTL after the last heartbeat,
+and the last heartbeat is at or before the kill, so heartbeat age moves the
+expiry earlier and needs no budget.
 
 The cooperative-handoff half is proven at the wire level in
 `orrery_persistd/tests/gateway.rs` rather than in the island harness: both

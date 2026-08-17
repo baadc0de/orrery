@@ -16,6 +16,14 @@ use orrery_protocol::{
 
 use crate::wire::Session;
 
+/// Wall-clock milliseconds, for the one event the orchestrator times against.
+fn unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| since.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 /// D16 lease cadence: renew every 2.5 s against a 10 s TTL.
 const HEARTBEAT_INTERVAL: Duration = Duration::from_millis(2_500);
 /// Bulk uplink cadence, at the top of the 1–4 Hz per-entity band (D11 §2.1).
@@ -38,7 +46,18 @@ pub enum PeerEvent {
     /// The peer's own claim was refused.
     Denied { entity: u64, reason: String },
     /// The registrar handed this peer a lease it never asked for.
-    Inherited { entity: u64, lease_id: u64 },
+    ///
+    /// `at_ms` is the wall-clock instant this peer *received* the grant, and
+    /// it is what stops the orchestrator's clock for a reassigned entity.
+    /// Reading the settle time off the orchestrator's own poll would measure
+    /// the poll interval; reading it off the receipt measures redistribution.
+    /// Peer and orchestrator are processes on one host, so the two readings
+    /// come from the same system clock.
+    Inherited {
+        entity: u64,
+        lease_id: u64,
+        at_ms: u64,
+    },
     /// A held lease ended.
     Lost { entity: u64, disposition: String },
     /// The peer finished its run cleanly.
@@ -53,6 +72,10 @@ pub struct PeerConfig {
     pub token: Vec<u8>,
     pub cell: CellId,
     pub entities: Vec<u64>,
+    /// The tier this peer claims at. Weak is the criterion's contested-physics
+    /// case; strong is the case the registrar refuses to redistribute (D7 §5),
+    /// which is how the harness exercises parking.
+    pub kind: ClaimKind,
     pub duration: Duration,
     pub log: std::path::PathBuf,
 }
@@ -122,7 +145,7 @@ pub async fn run(config: PeerConfig) -> Result<()> {
                 entity,
                 grid: GridId::ROOT,
                 cell: config.cell,
-                kind: ClaimKind::Weak,
+                kind: config.kind,
                 basis: ClaimBasis::Contact { tick: Tick::new(0) },
                 observed: SeqPair::default(),
                 tick: Tick::new(0),
@@ -277,6 +300,7 @@ fn apply_unsolicited(
                 emit(&PeerEvent::Inherited {
                     entity: entity.0,
                     lease_id: lease_id.0,
+                    at_ms: unix_ms(),
                 });
             }
         }

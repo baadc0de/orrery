@@ -30,26 +30,60 @@ if [[ ${1:-} == --self-test ]]; then
   # are stripped too, so prose naming a stage cannot stand in for the stage.
   body="$(sed -n '/^: /,$p' "$0" | grep -v '^[[:space:]]*#')"
   has() { grep -Fq -- "$1" <<<"$body"; }
-  has '--dev-seed' || die 'self-test: entity seeding absent'
-  has '--coordinator-key' || die 'self-test: interest handout absent'
-  # The two flags `persistd` refuses to start without in this configuration.
-  # Neither was checked here, and the sibling P2 gate shows what that costs:
-  # it omitted `--issuer-key` from the day `f33568b` began requiring one and
-  # nothing said so until a nightly run months of commits later. Matched with
-  # their operands attached — bare `--issuer-key` is a prefix of the harness's
-  # own `--issuer-secret` argument name and would pass on a script that had
-  # lost the gateway's key entirely.
-  has '--issuer-key "1@$ISSUER_PUBLIC"' || die 'self-test: gateway identity issuer key absent'
-  has '--allow-volatile-leases' || die 'self-test: volatile lease store absent'
-  has 'orrery-coordinator' || die 'self-test: live coordinator absent'
-  has '--metrics-jsonl' || die 'self-test: duplicate-authority read absent'
-  has 'p3-island' || die 'self-test: island harness absent'
-  # The SIGKILL itself is issued inside the p3-island binary, not here, so this
-  # script cannot assert it structurally — what it can assert is that it drives
-  # the criterion's shape. The old check looked for the literal `kill -9`, which
-  # appears in this file only in prose.
-  has '--entities-per-peer' || die 'self-test: per-peer entity load absent'
-  has '--duration-secs' || die 'self-test: run duration absent'
+  # A stage is asserted against *its own invocation*, not against the body at
+  # large, because a pattern free-floating in the body proves nothing about the
+  # process it is supposed to configure. Two clauses were vacuous exactly this
+  # way until 2026-08-17: `orrery-coordinator` and `p3-island` were matched
+  # anywhere in the body, and both appear in the `: "${VAR:?...}"` usage
+  # messages at the top — so deleting the coordinator launch, or the harness
+  # invocation, left the self-test reporting both stages present. The launches
+  # also share flag spellings (`--issuer-key "1@$ISSUER_PUBLIC"` is passed to
+  # both daemons), which a body-wide grep cannot tell apart either.
+  #
+  # One invocation: from the line that runs the named binary through the last
+  # of its continuation lines.
+  launch() {
+    awk -v bin="\"\$$1\" \\" '$0 == bin { inside = 1 }
+                                 inside { print; if ($0 !~ /\\$/) exit }' <<<"$body"
+  }
+  runs() { grep -Fq -- "$2" <<<"$(launch "$1")"; }
+
+  # persistd: the registrar under test, and the two flags it refuses to start
+  # without in this configuration. Neither key was checked here once, and the
+  # sibling P2 gate shows what that costs: it omitted `--issuer-key` from the
+  # day `f33568b` began requiring one and nothing said so until a nightly run
+  # months of commits later. Matched with their operands attached — bare
+  # `--issuer-key` is a prefix of the harness's own `--issuer-secret` argument
+  # name and would pass on a script that had lost the gateway's key entirely.
+  runs PERSISTD_BIN '--dev-seed' || die 'self-test: entity seeding absent'
+  runs PERSISTD_BIN '--coordinator-key' || die 'self-test: interest handout absent'
+  runs PERSISTD_BIN '--issuer-key "1@$ISSUER_PUBLIC"' || die 'self-test: gateway identity issuer key absent'
+  runs PERSISTD_BIN '--allow-volatile-leases' || die 'self-test: volatile lease store absent'
+  # Half the criterion — an entity that *parks* rather than being reassigned —
+  # is observable nowhere but the registrar's own exported authority counters,
+  # so a gate whose persistd exports none cannot measure it, and the harness
+  # below has to be pointed at the same file.
+  runs PERSISTD_BIN '--metrics-jsonl "$out/metrics.jsonl"' || die 'self-test: registrar authority counters not exported'
+
+  # The coordinator: interest is minted by a live one, not by the harness.
+  runs COORDINATOR_BIN '--interest-secret "$COORDINATOR_SECRET"' || die 'self-test: live coordinator absent'
+  runs COORDINATOR_BIN '--issuer-key "1@$ISSUER_PUBLIC"' || die 'self-test: coordinator identity issuer key absent'
+
+  # The harness. The SIGKILL itself is issued inside the p3-island binary, not
+  # here, so this script cannot assert it structurally — what it can assert is
+  # that it drives the criterion's shape. The old check looked for the literal
+  # `kill -9`, which appears in this file only in prose.
+  runs P3_ISLAND_BIN '--peers "$PEERS"' || die 'self-test: island harness absent'
+  runs P3_ISLAND_BIN '--entities-per-peer' || die 'self-test: per-peer entity load absent'
+  runs P3_ISLAND_BIN '--duration-secs' || die 'self-test: run duration absent'
+  runs P3_ISLAND_BIN '--metrics-jsonl' || die 'self-test: duplicate-authority and disposition read absent'
+  runs P3_ISLAND_BIN '--victim-claim-kind' || die 'self-test: victim claim tier not selectable'
+
+  # A proof harness is only a proof if its verdict is load-bearing: the gate
+  # must die on a non-zero harness exit, and the success artifact must be
+  # written nowhere else.
+  has 'island_status -ne 0' || die 'self-test: harness verdict not enforced'
+  has 'touch "$out/PASSED"' || die 'self-test: success artifact absent'
   echo 'self-test: island, seeding, interest, and invariant stages present'
   exit 0
 fi
@@ -64,6 +98,12 @@ done
 PEERS=${P3_PEERS:-8}
 ENTITIES_PER_PEER=${P3_ENTITIES_PER_PEER:-50}
 DURATION_SECS=${P3_DURATION_SECS:-30}
+# The tier the victim claims at, and with it which half of the criterion the
+# run exercises. `weak` is the contested-physics case, which redistributes;
+# `strong` is the case D7 §5 refuses to redistribute without consent, so every
+# one of the victim's entities parks instead. Both are correct registrar
+# behaviour and the criterion accepts both.
+VICTIM_CLAIM_KIND=${P3_VICTIM_CLAIM_KIND:-weak}
 # The island's cell. Level 21 origin, matching the harness default.
 CELL=${P3_CELL:-0x8000000000000000}
 
@@ -169,6 +209,7 @@ set +e
   --issuer-secret "$ISSUER_SECRET" \
   --peers "$PEERS" \
   --entities-per-peer "$ENTITIES_PER_PEER" \
+  --victim-claim-kind "$VICTIM_CLAIM_KIND" \
   --cell "$CELL" \
   --duration-secs "$DURATION_SECS" \
   --metrics-jsonl "$out/metrics.jsonl" \
