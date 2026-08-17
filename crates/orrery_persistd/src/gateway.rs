@@ -3912,7 +3912,22 @@ async fn route_session_diff(
     authority_metrics: Arc<AuthorityMetrics>,
     received_at: Instant,
 ) {
-    let Some(_peer) = session.lock_current().await else {
+    // Liveness only, and the guard must not outlive this check.
+    //
+    // `route_diff` below awaits an actor mailbox round trip and then the
+    // journal fsync, so a `PeerState` lock held across it serializes every
+    // diff from this peer behind the slowest commit — collapsing the
+    // connection's `MAX_INFLIGHT_DIFF_ROUTES_PER_CONN` concurrent routes to
+    // exactly one, which is worse than the eight-route cap that constant's
+    // comment was written to replace.
+    //
+    // This read `let Some(_peer) = ...`, and the leading underscore is not
+    // enough: a named binding lives to the end of the scope, where a bare `_`
+    // would have dropped it immediately. Nothing here reads the guard's
+    // contents. `PeerSession` already avoids the same trap for the account
+    // field (see its `account` doc comment). Covered by
+    // `session_diffs_do_not_serialize_on_the_peer_lock`.
+    if session.lock_current().await.is_none() {
         send(Bytes::from(encode_datagram(&GatewayReply::BulkNack {
             entity: diff.entity,
             tick: diff.tick,
@@ -3920,7 +3935,7 @@ async fn route_session_diff(
             lease: None,
         })));
         return;
-    };
+    }
     route_diff(
         send,
         DiffRoute {
@@ -5311,5 +5326,138 @@ mod tests {
             })
         ));
         monitor.shutdown();
+    }
+
+    /// A router whose apply blocks until released, announcing each arrival.
+    struct BlockingApplyRouter {
+        entered: tokio::sync::mpsc::Sender<()>,
+        release: Arc<tokio::sync::Semaphore>,
+    }
+
+    #[async_trait::async_trait]
+    impl Router for BlockingApplyRouter {
+        async fn apply(
+            &self,
+            _record: JournalRecord,
+        ) -> Result<Arc<crate::journal::AppendHandle>, Reject> {
+            self.entered
+                .send(())
+                .await
+                .map_err(|_| Reject::JournalClosed)?;
+            // A semaphore, not a `Notify`: `notify_waiters` stores no permit,
+            // so a task that has not reached the await yet would miss the
+            // wake and hang. Permits are stored, so the release cannot be lost.
+            let permit = self
+                .release
+                .acquire()
+                .await
+                .map_err(|_| Reject::JournalClosed)?;
+            permit.forget();
+            Ok(crate::journal::AppendHandle::completed(Lsn::new(7, 11)))
+        }
+
+        async fn read(&self, _grid: GridId, _cell: CellId) -> Result<SnapshotPage, Reject> {
+            Err(Reject::JournalClosed)
+        }
+
+        async fn has_actor(&self, _grid: GridId, _cell: CellId) -> bool {
+            false
+        }
+    }
+
+    struct AlwaysDurableAdmission;
+
+    impl BulkAckAdmission for AlwaysDurableAdmission {
+        fn assess(&self, _grid: GridId, _cell: CellId) -> BulkAckDisposition {
+            BulkAckDisposition::Durable
+        }
+    }
+
+    #[tokio::test]
+    async fn session_diffs_do_not_serialize_on_the_peer_lock() {
+        // A connection admits `MAX_INFLIGHT_DIFF_ROUTES_PER_CONN` concurrent
+        // routes precisely so one durability wave does not stall the diffs
+        // behind it. Holding the `PeerState` guard across the journal wait
+        // quietly reduced that to one. This pins the concurrency rather than
+        // the spelling, so re-introducing any guard over `route_diff` fails
+        // here rather than in a load test months later.
+        let registry = Arc::new(PeerRegistry::new(2, 10_000, MAX_PEER_LIVE_LEASES));
+        let node = iroh::SecretKey::from_bytes(&[9; 32]).public();
+        let authorization = GatewayAuthorization::Valid(SessionTokenClaimsV1::new(
+            orrery_protocol::AccountId::new(1),
+            node,
+            UnixMillis::new(0),
+            orrery_protocol::SessionTokenTtlMs::new(1_000),
+            orrery_protocol::SessionStanding::Good,
+            orrery_protocol::IssuerKeyId::new(1),
+        ));
+        let session = registry
+            .activate(node, authorization, b"conn", None, 0, 0)
+            .await
+            .expect("valid peer is admitted");
+
+        let (entered_tx, mut entered_rx) = tokio::sync::mpsc::channel(4);
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        let router: Arc<dyn Router> = Arc::new(BlockingApplyRouter {
+            entered: entered_tx,
+            release: Arc::clone(&release),
+        });
+        let admission: SharedBulkAckAdmission = Arc::new(AlwaysDurableAdmission);
+        let bulk_metrics = Arc::new(GatewayBulkMetrics::default());
+
+        let mut routes = Vec::new();
+        for entity in [1u64, 2] {
+            let session = session.clone();
+            let router = Arc::clone(&router);
+            let admission = Arc::clone(&admission);
+            let bulk_metrics = Arc::clone(&bulk_metrics);
+            routes.push(tokio::spawn(async move {
+                let send = |_bytes: Bytes| {};
+                route_session_diff(
+                    &send,
+                    DiffUplink {
+                        cell: CellId::ROOT,
+                        grid: GridId::ROOT,
+                        entity: PersistId::new(entity),
+                        tick: orrery_protocol::Tick::new(1),
+                        kind: orrery_protocol::RecordKind::ComponentDiff,
+                        payload: Bytes::from_static(b"state"),
+                        seq: 1,
+                        lease_id: None,
+                        authority_seq: None,
+                    },
+                    &session,
+                    &router,
+                    &admission,
+                    &bulk_metrics,
+                    Arc::new(AuthorityMetrics::default()),
+                    Instant::now(),
+                )
+                .await;
+            }));
+        }
+
+        // Both diffs must be inside the journal at once. Serialized on the
+        // peer lock the second never arrives, and this times out.
+        for reached in 1..=2 {
+            tokio::time::timeout(std::time::Duration::from_secs(10), entered_rx.recv())
+                .await
+                .unwrap_or_else(|_| {
+                    panic!(
+                        "only {} of 2 diffs reached the journal; the peer lock is serializing them",
+                        reached - 1
+                    )
+                })
+                .expect("router channel stays open");
+        }
+
+        release.add_permits(2);
+        for route in routes {
+            tokio::time::timeout(std::time::Duration::from_secs(10), route)
+                .await
+                .expect("routes finish once released")
+                .expect("route task does not panic");
+        }
+        drop(registry);
     }
 }
