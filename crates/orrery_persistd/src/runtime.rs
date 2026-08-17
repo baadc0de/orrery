@@ -590,14 +590,36 @@ impl CellRuntime {
     /// grid-relative, so the same raw cell under a different grid is a
     /// different entity universe — this runtime must never serve it.
     pub fn actor(&self, grid: GridId, cell: CellId) -> Option<&CellActorHandle> {
+        let shard = self.owning_shard(grid, cell)?;
+        self.actors.get(&shard)
+    }
+
+    /// The **shard** whose actor owns `cell` — the same deepest-prefix rule
+    /// [`CellRuntime::actor`] applies, but naming the owner instead of
+    /// handing back its mailbox.
+    ///
+    /// This is the identity a batch has to fold on. A shard holds very many
+    /// leaf cells, so grouping work by the leaf cell a caller presents groups
+    /// by something finer than the mailbox it lands in: at one entity per
+    /// cell, every leaf group holds exactly one entry and the fold does
+    /// nothing. Grouping by the shard folds on the thing that is actually
+    /// shared — one actor turn.
+    #[must_use]
+    pub fn owning_shard(&self, grid: GridId, cell: CellId) -> Option<CellId> {
         if grid != self.grid {
             return None;
         }
         self.actors
-            .iter()
-            .filter(|(shard, _)| shard.is_prefix_of(cell))
-            .max_by_key(|(shard, _)| shard.level())
-            .map(|(_, handle)| handle)
+            .keys()
+            .filter(|shard| shard.is_prefix_of(cell))
+            .max_by_key(|shard| shard.level())
+            .copied()
+    }
+
+    /// The shard cells this runtime hosts an actor for.
+    #[must_use]
+    pub fn shard_cells(&self) -> Vec<CellId> {
+        self.actors.keys().copied().collect()
     }
 
     /// Clone every live actor handle, so a caller can await their mailboxes

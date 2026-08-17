@@ -51,17 +51,64 @@ async fn lock_entity_gates(
     guards
 }
 
-/// Group a renewal batch's indices by the cell each entry routes to, keeping
-/// request order inside each group so the positional reply stays aligned.
-fn group_by_route(routes: &[CellId]) -> Vec<(CellId, Vec<usize>)> {
-    let mut groups: Vec<(CellId, Vec<usize>)> = Vec::new();
-    for (index, cell) in routes.iter().enumerate() {
-        match groups.iter_mut().find(|(grouped, _)| grouped == cell) {
+/// One entry of a batched renewal: a pair to renew and the cell the session
+/// index says holds it.
+///
+/// The cell travels *with* each entry rather than parameterising the whole
+/// batch, because the batch is a peer's whole heartbeat and a peer's leases
+/// are spread over as many cells as it holds entities. Which of those cells
+/// share a mailbox is the router's knowledge, not the caller's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LeaseRenewal {
+    /// The cell the caller believes owns the row (a hint; the router
+    /// re-resolves the committed cell per entity).
+    pub cell: CellId,
+    /// The entity whose lease is being renewed.
+    pub entity: PersistId,
+    /// The fencing token the holder presents for that entity.
+    pub lease_id: LeaseId,
+}
+
+/// Group a batch's indices by route key, keeping request order inside each
+/// group so the positional reply stays aligned.
+fn group_by_route<K: Copy + PartialEq>(routes: &[K]) -> Vec<(K, Vec<usize>)> {
+    let mut groups: Vec<(K, Vec<usize>)> = Vec::new();
+    for (index, key) in routes.iter().enumerate() {
+        match groups.iter_mut().find(|(grouped, _)| grouped == key) {
             Some((_, members)) => members.push(index),
-            None => groups.push((*cell, vec![index])),
+            None => groups.push((*key, vec![index])),
         }
     }
     groups
+}
+
+/// Group a batch's indices by the **actor** that owns each entry's route cell.
+///
+/// This is the fold that matters. An actor owns a shard and a shard holds very
+/// many leaf cells, so grouping by the leaf cell groups by something strictly
+/// finer than the mailbox: measured on the P2 workload, 2079 entities sat in
+/// 2079 distinct leaf cells — one member per group — and the batched path cost
+/// exactly what the unbatched one did. Resolving each route cell to its owning
+/// shard first collapses all of those into one group per actor.
+///
+/// A route cell no shard covers keeps its own `None` group; those entries have
+/// no actor to renew against and are answered `None` individually, never
+/// silently merged with a routable group.
+pub(crate) fn group_by_actor(
+    shards: &[CellId],
+    routes: &[CellId],
+) -> Vec<(Option<CellId>, Vec<usize>)> {
+    let keys: Vec<Option<CellId>> = routes
+        .iter()
+        .map(|cell| {
+            shards
+                .iter()
+                .filter(|shard| shard.is_prefix_of(*cell))
+                .max_by_key(|shard| shard.level())
+                .copied()
+        })
+        .collect();
+    group_by_route(&keys)
 }
 
 async fn gated_mutex_actor(
@@ -204,13 +251,20 @@ pub trait Router: Send + Sync {
     ) -> Result<Option<Lease>, Reject> {
         Err(Reject::JournalClosed)
     }
-    /// Renew a whole batch of one session's leases.
+    /// Renew a whole batch of one session's leases, each entry naming its own
+    /// cell.
     ///
     /// A peer heartbeats every lease it holds every 2.5 s. Renewing them one
     /// message at a time costs one actor turn per held entity through a
     /// bounded mailbox — 50 turns for a peer holding 50 entities — even though
     /// the rows share an actor and each check is independent of the others.
-    /// Routers that own actor handles fold a batch into one turn per actor.
+    ///
+    /// The caller hands over **all** of a grid's renewals for one peer and the
+    /// router folds them by the actor that owns each, because which cells
+    /// share a mailbox is the router's knowledge: an actor owns a shard, and a
+    /// shard holds very many leaf cells. Keying the batch on the leaf cell
+    /// instead — which the caller *can* see — folds nothing on the workload
+    /// that matters, where each entity sits in a leaf cell of its own.
     ///
     /// The reply is **positional**: one entry per requested pair, in request
     /// order, `None` where that pair did not renew. Batching must not blur the
@@ -223,17 +277,23 @@ pub trait Router: Send + Sync {
     async fn heartbeat_leases(
         &self,
         grid: GridId,
-        cell: CellId,
         holder: NodeId,
-        renew: &[(PersistId, LeaseId)],
+        renew: &[LeaseRenewal],
         now_ms: u64,
     ) -> Result<Vec<Option<Lease>>, Reject> {
         let mut rows = Vec::with_capacity(renew.len());
-        for (entity, lease_id) in renew {
+        for entry in renew {
             rows.push(
-                self.heartbeat_lease(grid, cell, *entity, holder, *lease_id, now_ms)
-                    .await
-                    .unwrap_or(None),
+                self.heartbeat_lease(
+                    grid,
+                    entry.cell,
+                    entry.entity,
+                    holder,
+                    entry.lease_id,
+                    now_ms,
+                )
+                .await
+                .unwrap_or(None),
             );
         }
         Ok(rows)
@@ -377,30 +437,36 @@ impl Router for CellRuntime {
     async fn heartbeat_leases(
         &self,
         grid: GridId,
-        cell: CellId,
         holder: NodeId,
-        renew: &[(PersistId, LeaseId)],
+        renew: &[LeaseRenewal],
         now_ms: u64,
     ) -> Result<Vec<Option<Lease>>, Reject> {
         let _guards = lock_entity_gates(
             renew
                 .iter()
-                .map(|(entity, _)| self.entity_gate(grid, *entity)),
+                .map(|entry| self.entity_gate(grid, entry.entity)),
         )
         .await;
         // Routing stays per entity: a lease that migrated since the grant is
         // owned by another actor, and a batch may straddle the two. Only the
         // mailbox turn is folded.
         let mut routes = Vec::with_capacity(renew.len());
-        for (entity, _) in renew {
-            routes.push(self.lease_location(*entity).await?.unwrap_or(cell));
+        for entry in renew {
+            routes.push(
+                self.lease_location(entry.entity)
+                    .await?
+                    .unwrap_or(entry.cell),
+            );
         }
         let mut rows = vec![None; renew.len()];
-        for (route_cell, members) in group_by_route(&routes) {
-            let Some(actor) = self.actor(grid, route_cell).cloned() else {
+        for (shard, members) in group_by_actor(&self.shard_cells(), &routes) {
+            let Some(actor) = shard.and_then(|shard| self.actor(grid, shard)).cloned() else {
                 continue;
             };
-            let batch: Vec<_> = members.iter().map(|index| renew[*index]).collect();
+            let batch: Vec<_> = members
+                .iter()
+                .map(|index| (renew[*index].entity, renew[*index].lease_id))
+                .collect();
             let renewed = actor.heartbeat_leases(batch, holder, now_ms).await?;
             for (index, row) in members.into_iter().zip(renewed) {
                 rows[index] = row;
@@ -524,13 +590,11 @@ impl Router for Arc<CellRuntime> {
     async fn heartbeat_leases(
         &self,
         grid: GridId,
-        cell: CellId,
         holder: NodeId,
-        renew: &[(PersistId, LeaseId)],
+        renew: &[LeaseRenewal],
         now_ms: u64,
     ) -> Result<Vec<Option<Lease>>, Reject> {
-        <CellRuntime as Router>::heartbeat_leases(self.as_ref(), grid, cell, holder, renew, now_ms)
-            .await
+        <CellRuntime as Router>::heartbeat_leases(self.as_ref(), grid, holder, renew, now_ms).await
     }
     async fn validate_lease(
         &self,
@@ -707,44 +771,50 @@ impl Router for tokio::sync::Mutex<CellRuntime> {
     async fn heartbeat_leases(
         &self,
         grid: GridId,
-        cell: CellId,
         holder: NodeId,
-        renew: &[(PersistId, LeaseId)],
+        renew: &[LeaseRenewal],
         now_ms: u64,
     ) -> Result<Vec<Option<Lease>>, Reject> {
-        let (gates, store, runtime_grid) = {
+        let (gates, store, runtime_grid, shards) = {
             let runtime = self.lock().await;
             (
                 renew
                     .iter()
-                    .map(|(entity, _)| runtime.entity_gate(grid, *entity))
+                    .map(|entry| runtime.entity_gate(grid, entry.entity))
                     .collect::<Vec<_>>(),
                 runtime.lease_store_handle(),
                 runtime.grid(),
+                runtime.shard_cells(),
             )
         };
         let _guards = lock_entity_gates(gates).await;
         let mut routes = Vec::with_capacity(renew.len());
-        for (entity, _) in renew {
+        for entry in renew {
             routes.push(if runtime_grid == grid {
                 store
-                    .locate(grid, *entity)
+                    .locate(grid, entry.entity)
                     .await
                     .map_err(|_| Reject::LeaseStore)?
-                    .unwrap_or(cell)
+                    .unwrap_or(entry.cell)
             } else {
-                cell
+                entry.cell
             });
         }
         let mut rows = vec![None; renew.len()];
-        for (route_cell, members) in group_by_route(&routes) {
+        for (shard, members) in group_by_actor(&shards, &routes) {
             // The runtime lock is taken to resolve the handle and released
             // before the mailbox is awaited, exactly as the single-entity
             // paths do: a heartbeat batch must never hold the whole node.
-            let Some(actor) = self.lock().await.actor(grid, route_cell).cloned() else {
+            let Some(shard) = shard else {
                 continue;
             };
-            let batch: Vec<_> = members.iter().map(|index| renew[*index]).collect();
+            let Some(actor) = self.lock().await.actor(grid, shard).cloned() else {
+                continue;
+            };
+            let batch: Vec<_> = members
+                .iter()
+                .map(|index| (renew[*index].entity, renew[*index].lease_id))
+                .collect();
             let renewed = actor.heartbeat_leases(batch, holder, now_ms).await?;
             for (index, row) in members.into_iter().zip(renewed) {
                 rows[index] = row;
@@ -856,13 +926,12 @@ impl Router for Arc<tokio::sync::Mutex<CellRuntime>> {
     async fn heartbeat_leases(
         &self,
         grid: GridId,
-        cell: CellId,
         holder: NodeId,
-        renew: &[(PersistId, LeaseId)],
+        renew: &[LeaseRenewal],
         now_ms: u64,
     ) -> Result<Vec<Option<Lease>>, Reject> {
         self.as_ref()
-            .heartbeat_leases(grid, cell, holder, renew, now_ms)
+            .heartbeat_leases(grid, holder, renew, now_ms)
             .await
     }
     async fn validate_lease(
@@ -995,13 +1064,12 @@ impl<R: Router + Send + Sync> Router for ColdFallbackRouter<R> {
     async fn heartbeat_leases(
         &self,
         grid: GridId,
-        cell: CellId,
         holder: NodeId,
-        renew: &[(PersistId, LeaseId)],
+        renew: &[LeaseRenewal],
         now_ms: u64,
     ) -> Result<Vec<Option<Lease>>, Reject> {
         self.live
-            .heartbeat_leases(grid, cell, holder, renew, now_ms)
+            .heartbeat_leases(grid, holder, renew, now_ms)
             .await
     }
     async fn validate_lease(
@@ -1281,37 +1349,50 @@ impl Router for Cluster {
     async fn heartbeat_leases(
         &self,
         grid: GridId,
-        cell: CellId,
         holder: NodeId,
-        renew: &[(PersistId, LeaseId)],
+        renew: &[LeaseRenewal],
         now_ms: u64,
     ) -> Result<Vec<Option<Lease>>, Reject> {
         let _guards = lock_entity_gates(
             renew
                 .iter()
-                .map(|(entity, _)| self.entity_gates.gate(grid, *entity)),
+                .map(|entry| self.entity_gates.gate(grid, entry.entity)),
         )
         .await;
         let mut routes = Vec::with_capacity(renew.len());
-        for (entity, _) in renew {
+        for entry in renew {
             routes.push(
-                self.committed_entity_cell(grid, *entity)
+                self.committed_entity_cell(grid, entry.entity)
                     .await?
-                    .unwrap_or(cell),
+                    .unwrap_or(entry.cell),
             );
         }
+        // Two folds, each on the thing that is actually shared at its level:
+        // here the **node** that HRW placement assigns the route cell to, and
+        // then, inside that node, the actor that owns it. Grouping by the
+        // route cell at this level would send one message per leaf cell to a
+        // node that was going to put them all in one mailbox anyway.
+        let hasher = RendezvousHasher::new(self.nodes.clone());
+        let owners: Vec<Option<u64>> = routes.iter().map(|cell| hasher.owner(*cell)).collect();
         let mut rows = vec![None; renew.len()];
-        for (route_cell, members) in group_by_route(&routes) {
-            // Each group lands on the node that owns that cell, and the
-            // runtime's own batched path folds it into one mailbox turn there.
-            let Some(runtime) = self.runtime_for(grid, route_cell) else {
+        for (owner, members) in group_by_route(&owners) {
+            let Some(runtime) = owner.and_then(|owner| self.runtimes.get(&owner)) else {
                 continue;
             };
-            let batch: Vec<_> = members.iter().map(|index| renew[*index]).collect();
+            // Each entry carries the cell *it* resolved to, so the node's own
+            // fold sees the true owning shard per entity rather than one
+            // representative cell for the whole group.
+            let batch: Vec<_> = members
+                .iter()
+                .map(|index| LeaseRenewal {
+                    cell: routes[*index],
+                    entity: renew[*index].entity,
+                    lease_id: renew[*index].lease_id,
+                })
+                .collect();
             let renewed = <tokio::sync::Mutex<CellRuntime> as Router>::heartbeat_leases(
                 runtime.as_ref(),
                 grid,
-                route_cell,
                 holder,
                 &batch,
                 now_ms,

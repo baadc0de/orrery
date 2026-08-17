@@ -124,13 +124,29 @@ Six messages, defined in `orrery_protocol`, postcard-encoded on the reliable con
 | `Expire` | registrar → holder + cell subscribers | `{entity, lease_id, last_holder, reason: Timeout\|Disconnect\|Revoked\|Parked, disposition: Reassigned{to}\|Parked\|Free}` |
 
 A `Heartbeat` is one message per peer per 2.5 s naming every lease it holds,
-and it costs **one actor turn per `(grid, cell)` group** — not one per entity.
-The rows in a group share an actor and each renewal is an independent check
-against its own row, so folding them into a single mailbox turn changes nothing
-about arbitration and takes a peer holding 50 entities in one cell from 50
-turns to 1. The ack stays per entity: every pair that did not renew is named
-individually in `invalid`, including one whose whole group failed to route,
-because that list is what stops a holder writing an entity it no longer owns.
+and it costs **one actor turn per owning actor** — not one per entity, and not
+one per cell. The rows an actor owns share a mailbox and each renewal is an
+independent check against its own row, so folding them into a single turn
+changes nothing about arbitration.
+
+The fold is keyed on the **actor**, not the leaf cell, and the difference is
+the whole point. An actor owns a *shard*, and a shard contains very many leaf
+cells; a peer's leases are spread across them. Measured on the P2 kill-9
+workload: 2079 entities in 2079 **distinct** leaf cells — a cell-keyed fold is
+2079 groups of one and costs exactly what no folding costs. Grouping by the
+shard that owns each cell collapses the same batch to one turn.
+
+The gateway does not do that grouping: it hands the router every renewal for a
+grid, each carrying its own cell, and the router resolves each to its owning
+actor. Shard layout is the router's knowledge — a copy of it on the gateway
+side would go stale on the first rekey — and routing stays **per entity**, so a
+lease that migrated to another actor since its grant is still renewed by the
+actor that holds it now, even when one batch straddles two.
+
+The ack stays per entity: every pair that did not renew is named individually
+in `invalid`, including one whose whole group failed to route and the tail of a
+router answer that came back short, because that list is what stops a holder
+writing an entity it no longer owns.
 
 `claim_id` makes delayed control replies safe: a client ignores a `Grant` or
 `Deny` that does not correspond to its pending claim, ignores grants that do
