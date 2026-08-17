@@ -89,6 +89,16 @@ self_test() {
     || die 'self-test: the dedup lookup is gone; a re-dispatched nightly would double-count'
   has 'flock' \
     || die 'self-test: the append is no longer serialized'
+  has 'unique_by(.run_key)' \
+    || die 'self-test: total no longer dedups across shards; a restored shard would double its hours'
+  has 'def platform' \
+    || die 'self-test: the target-to-platform fold is gone; the criterion is counted per platform'
+  has 'MISSING' \
+    || die 'self-test: total no longer names the platforms at zero; a Linux-only ledger would read as progress'
+  has 'command -v shasum' \
+    || die 'self-test: the coreutils-free digest fallback is gone; this cannot run on a macOS runner'
+  has 'mkdir "$LEDGER.lock.d"' \
+    || die 'self-test: the flock-free lock is gone; the append cannot be serialized off Linux'
 
   # Functional half. The structural checks above cannot tell a clause that is
   # read from one that is read and ignored, and every case below costs
@@ -163,6 +173,56 @@ self_test() {
   grep -q 'hours 64' <<<"$total" \
     || die "self-test: two banked 32-hour runs did not total 64 ('$total')"
 
+  # ── The platform half of the criterion ────────────────────────────────────
+  #
+  # Two hours on one platform are not the criterion's hours however many there
+  # are, so `total` has to say which platforms the figure is made of and name
+  # the ones at zero. Both directions are checked, because a report that always
+  # says MISSING is as useless as one that never does.
+  local view
+  view="$("$0" total 2>&1)"
+  grep -q 'macos: 0 hours — MISSING' <<<"$view" \
+    || die 'self-test: a Linux-only ledger did not name macOS as missing'
+  grep -q '1 of 3 platforms represented' <<<"$view" \
+    || die 'self-test: a Linux-only ledger did not say how many platforms it covers'
+
+  st_bank 4 '.identity.target = "x86_64-pc-windows-msvc"' \
+    || die 'self-test: a Windows-target run was refused'
+  st_bank 5 '.identity.target = "aarch64-apple-darwin"' \
+    || die 'self-test: a macOS-target run was refused'
+  view="$("$0" total 2>&1)"
+  grep -q 'windows: 32 hours (x86_64-pc-windows-msvc)' <<<"$view" \
+    || die "self-test: hours on a Windows target were not attributed to the windows platform ('$view')"
+  grep -q 'macos: 32 hours (aarch64-apple-darwin)' <<<"$view" \
+    || die "self-test: hours on aarch64-apple-darwin were not attributed to the macos platform ('$view')"
+  grep -q 'all 3 platforms the criterion names have banked hours' <<<"$view" \
+    || die "self-test: a ledger covering all three platforms did not say so ('$view')"
+
+  # The two digest spellings have to be the same number: a run banked on a macOS
+  # runner and the same run banked on Linux would otherwise carry two different
+  # `run_key`s, and the deduplication that makes this ledger append-only would
+  # silently stop working across platforms. Checked where both are installed,
+  # which is every Linux runner and developer box.
+  if command -v sha256sum >/dev/null && command -v shasum >/dev/null; then
+    local gnu perl
+    gnu=$(printf 'orrery' | sha256sum | cut -c1-16)
+    perl=$(printf 'orrery' | shasum -a 256 | cut -c1-16)
+    [[ $gnu == "$perl" ]] \
+      || die "self-test: sha256sum and shasum disagree ($gnu vs $perl); a run key would depend on its platform"
+  fi
+
+  # The nightly banks on three runners, each carrying its own shard, and `total`
+  # runs over the concatenation. A shard restored twice must not double its
+  # hours — `append` dedups within a file and cannot see across them.
+  local merged doubled
+  merged="$(cat "$P4_LEDGER_FILE" "$P4_LEDGER_FILE")"
+  printf '%s\n' "$merged" > "$dir/merged.jsonl"
+  doubled="$(P4_LEDGER_FILE="$dir/merged.jsonl" "$0" total 2>&1)"
+  [[ $(grep -c . <<<"$doubled") == $(grep -c . <<<"$view") ]] \
+    || die 'self-test: a doubled shard changed the shape of the total'
+  diff <(echo "$view") <(echo "$doubled") >/dev/null \
+    || die "self-test: concatenating a shard with itself changed the totals; run_key dedup is not applied"
+
   rm -rf "$dir"
   trap - EXIT
   echo "$NAME: self-test passed"
@@ -172,6 +232,50 @@ readonly ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 readonly LEDGER="${P4_LEDGER_FILE:-$ROOT/target/p4-ledger/hours.jsonl}"
 
 need() { command -v "$1" >/dev/null || die "$1 is required and not on PATH"; }
+
+# ── Running off Linux ────────────────────────────────────────────────────────
+#
+# The criterion is "across all three platforms", so this script has to run on a
+# `macos-latest` and a `windows-latest` runner as well as on the box. Two of the
+# tools it reached for are GNU coreutils/util-linux and are not on either:
+#
+#   * `sha256sum` — a stock macOS ships `shasum` instead. Both are SHA-256 over
+#     stdin printing the hash first, so the only difference is the name; the
+#     digest is the dedup key, and a key that differed by platform would bank
+#     every hour twice.
+#   * `flock` — util-linux, absent on macOS and on the Git Bash that runs this
+#     on a Windows runner.
+#
+# Neither fallback weakens anything: the digest is the same number, and the
+# `mkdir` lock is the atomic primitive every platform's filesystem provides.
+sha256_hex() {
+  if command -v sha256sum >/dev/null; then
+    sha256sum
+  elif command -v shasum >/dev/null; then
+    shasum -a 256
+  else
+    die 'neither sha256sum nor shasum is on PATH; cannot compute the run key'
+  fi
+}
+
+ledger_lock() {
+  if command -v flock >/dev/null; then
+    exec 9>>"$LEDGER.lock"
+    flock 9
+    return
+  fi
+  # A stale directory blocks rather than corrupts, which is the right way round
+  # for an append-only ledger; the wait is bounded so a stale one is a loud
+  # failure and not a hung nightly.
+  local waited=0
+  until mkdir "$LEDGER.lock.d" 2>/dev/null; do
+    waited=$(( waited + 1 ))
+    (( waited > 60 )) && die "the ledger lock $LEDGER.lock.d is still held after ${waited}s"
+    sleep 1
+  done
+  # shellcheck disable=SC2064  # expand now: this is the directory to remove.
+  trap "rmdir '$LEDGER.lock.d' 2>/dev/null || true" EXIT
+}
 
 # The trees the false-positive rate is a property of: the witness that judges,
 # the executor it re-executes on, the rules it re-executes, and the harness that
@@ -197,13 +301,13 @@ pipeline_id() {
     hash=$(git -C "$ROOT" rev-parse "$commit:$tree") || die "no tree $tree at $commit"
     hashes+="$tree=$hash"$'\n'
   done
-  printf '%s' "$hashes" | sha256sum | cut -c1-16
+  printf '%s' "$hashes" | sha256_hex | cut -c1-16
 }
 
 cmd_append() {
   local report=${1:-}
   [[ -n $report && -r $report ]] || die "append: unreadable report '${report:-<none>}'"
-  need jq; need sha256sum; need flock
+  need jq
 
   # Every clause read out of the report first, so a refusal can name the number
   # it refused on rather than saying "invalid".
@@ -249,14 +353,13 @@ cmd_append() {
   target=$(jq -r '.identity.target' "$report")
   # The identity verbatim, canonicalized so that key stability does not depend
   # on the field order serde happens to emit.
-  key=$(jq -cS '.identity' "$report" | sha256sum | cut -c1-16)
+  key=$(jq -cS '.identity' "$report" | sha256_hex | cut -c1-16)
   pipeline=$(pipeline_id "$commit")
 
   mkdir -p "$(dirname "$LEDGER")"
   # One writer at a time. The nightly is a single job today, and a ledger whose
   # append is not atomic is a ledger that loses a line the first time it is not.
-  exec 9>>"$LEDGER.lock"
-  flock 9
+  ledger_lock
 
   if [[ -r $LEDGER ]] && grep -Fq "\"run_key\":\"$key\"" "$LEDGER"; then
     note "already banked: run_key $key (seed $seed, commit ${commit:0:12}); nothing appended"
@@ -289,6 +392,34 @@ cmd_append() {
   note "banked $hours player-hours: run_key $key, seed $seed, loss $loss, target $target, pipeline $pipeline"
 }
 
+# The criterion's figure, and the thing `total` is progress against.
+readonly HOURS_GOAL=500
+
+# Shared between all three views below.
+#
+#   * `banked` — `append` refuses a duplicate within one ledger file and cannot
+#     see across files. The nightly banks on three runners now, each keeping its
+#     own shard artifact, and `total` is run over the concatenation; without this
+#     a shard downloaded twice would double every hour it holds. `run_key` is the
+#     run identity verbatim, so the de-duplication here is the same one `append`
+#     performs and not a looser one.
+#   * `platform` — the report stamps a target *triple*; the criterion speaks of
+#     *platforms*. aarch64 and x86_64 macOS are one platform and two triples. The
+#     per-triple lines keep the distinction visible; this fold is what the
+#     criterion is actually counted against.
+readonly JQ_PRELUDE='
+  def banked: unique_by(.run_key);
+  # serde emits 32.0 where the swarm accumulated exactly 32 hours, and jq keeps
+  # the literal. A ledger read by a human should not print two spellings of the
+  # same number next to each other.
+  def hrs: (. * 1000 | round) / 1000;
+  def platform:
+    if test("linux") then "linux"
+    elif test("windows") then "windows"
+    elif test("darwin") then "macos"
+    else "other" end;
+'
+
 cmd_total() {
   need jq
   [[ -r $LEDGER ]] || { note "no ledger at $LEDGER; nothing banked yet"; return 0; }
@@ -296,32 +427,69 @@ cmd_total() {
   # Grouped by pipeline *and* target, and never summed across the first: hours
   # are only comparable within a pipeline version, and the criterion's "across
   # all three platforms" is a statement about the second.
-  jq -rs '
-    group_by(.pipeline + " " + .target)
+  jq -rs "$JQ_PRELUDE"'
+    banked
+    | group_by(.pipeline + " " + .target)
     | map({
         pipeline: .[0].pipeline,
         target: .[0].target,
         runs: length,
-        hours: (map(.player_hours) | add),
+        hours: (map(.player_hours) | add | hrs),
         commits: (map(.commit[0:12]) | unique | length)
       })
     | sort_by(.pipeline, .target)[]
     | "pipeline \(.pipeline)  target \(.target)  runs \(.runs)  commits \(.commits)  hours \(.hours)"
   ' "$LEDGER"
 
-  jq -rs '
-    "— " + (length | tostring) + " banked run(s), "
-    + (map(.player_hours) | add | tostring) + " player-hours in total; "
+  jq -rs "$JQ_PRELUDE"'
+    banked
+    | "— " + (length | tostring) + " banked run(s), "
+    + (map(.player_hours) | add | hrs | tostring) + " player-hours in total; "
     + (map(.target) | unique | length | tostring) + " target(s), "
+    + (map(.target | platform) | unique | length | tostring) + " platform(s), "
     + (map(.pipeline) | unique | length | tostring) + " pipeline version(s)"
   ' "$LEDGER"
 
-  # The criterion is 500 hours across all three platforms, so a per-pipeline sum
-  # on one target is a progress figure and not the gate. Printed as one.
-  jq -rs '
-    group_by(.pipeline) | map({p: .[0].pipeline, h: (map(.player_hours) | add)})
+  # ── Progress, per platform, because that is the shape of the criterion ──────
+  #
+  # "≥ 500 honest player-hours across all three platforms" is not one number: a
+  # pipeline holding 500 hours of which every one is Linux has not met it, and a
+  # single figure says it has. So each pipeline prints its running total *and*
+  # the platforms that total is made of, naming the ones at zero — the missing
+  # platform is the binding constraint on this criterion and it should not take
+  # arithmetic to see it.
+  #
+  # What is deliberately *not* asserted here is how the 500 divide. The roadmap
+  # says "≥ 500 … across all three platforms" and does not say whether that is
+  # 500 in total with every platform represented or 500 apiece; this prints both
+  # halves and leaves the reading to the record rather than inventing a gate.
+  jq -rs --argjson goal "$HOURS_GOAL" "$JQ_PRELUDE"'
+    banked
+    | group_by(.pipeline)
+    | map({
+        p: .[0].pipeline,
+        h: (map(.player_hours) | add | hrs),
+        by: (group_by(.target | platform)
+             | map({ k: (.[0].target | platform),
+                     h: (map(.player_hours) | add | hrs),
+                     triples: (map(.target) | unique | join(", ")) }))
+      })
     | sort_by(-.h)[]
-    | "  pipeline \(.p): \(.h) of 500 hours (\((.h * 100 / 500) | floor)%)"
+    | . as $g
+    | "  pipeline \($g.p): \($g.h) of \($goal) hours (\(($g.h * 100 / $goal) | floor)%)",
+      ( ["linux", "windows", "macos"]
+        | map(. as $want | { k: $want, hit: ($g.by | map(select(.k == $want)) | first) })
+        | map(if .hit
+              then "    \(.k): \(.hit.h) hours (\(.hit.triples))"
+              else "    \(.k): 0 hours — MISSING, and the criterion names it"
+              end)[] ),
+      ( ($g.by | map(select(.k == "other")) | .[]
+         | "    unrecognised target(s): \(.triples) — \(.h) hours counted against no platform") ),
+      ( ($g.by | map(select(.k != "other")) | length) as $covered
+        | if $covered == 3
+          then "    all 3 platforms the criterion names have banked hours"
+          else "    \($covered) of 3 platforms represented; the criterion cannot be met until all 3 are"
+          end )
   ' "$LEDGER"
 }
 
