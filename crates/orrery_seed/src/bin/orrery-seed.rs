@@ -57,6 +57,26 @@ struct VerifyArgs {
     single_grid: bool,
 }
 
+/// `shards`: collapse an emitted manifest into the shard set the seeded world
+/// occupies (docs/12-world-seeding.md §9.3, docs/08-persistence.md §3.1).
+///
+/// It reads a manifest and touches no cluster, so it builds and runs without
+/// the `fdb` feature — a harness can derive the deployment's shard set from an
+/// artifact long after the seeding run that produced it.
+#[derive(Debug, Parser)]
+struct ShardsArgs {
+    /// The manifest emitted by `verify --emit-manifest`.
+    #[arg(value_name = "MANIFEST")]
+    manifest: PathBuf,
+    /// The grid whose shards to report. persistd owns one grid per process.
+    #[arg(long, default_value_t = 0)]
+    grid: u32,
+    /// Emit a JSON object (`grid`, `shard_level`, `entries`, `shards`) instead
+    /// of one `--shard` operand per line.
+    #[arg(long)]
+    json: bool,
+}
+
 #[derive(Debug, Parser)]
 struct WipeArgs {
     #[arg(value_name = "SCENARIO")]
@@ -99,7 +119,7 @@ async fn dispatch(args: Vec<std::ffi::OsString>) -> Result<ExitCode, String> {
     }
     let explicit = matches!(
         args[1].to_string_lossy().as_ref(),
-        "plan" | "apply" | "verify" | "wipe"
+        "plan" | "apply" | "verify" | "wipe" | "shards"
     );
     let command = if explicit {
         Some(args[1].to_string_lossy().to_string())
@@ -121,6 +141,10 @@ async fn dispatch(args: Vec<std::ffi::OsString>) -> Result<ExitCode, String> {
         Some("verify") => {
             let parsed = VerifyArgs::try_parse_from(argv).map_err(|e| e.to_string())?;
             run_verify(parsed).await
+        }
+        Some("shards") => {
+            let parsed = ShardsArgs::try_parse_from(argv).map_err(|e| e.to_string())?;
+            run_shards(&parsed)
         }
         Some("wipe") => {
             let parsed = WipeArgs::try_parse_from(argv).map_err(|e| e.to_string())?;
@@ -211,6 +235,45 @@ async fn run_verify(args: VerifyArgs) -> Result<ExitCode, String> {
     println!("verify: {} rows checked", report.checked_rows);
     if let Some(path) = report.emit_manifest {
         println!("verify: manifest written to {}", path.display());
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Print the shard set a seeded world occupies.
+///
+/// Default output is one `--shard` operand per line, so a harness can splice it
+/// straight into a persistd command line. An empty shard set is an error and
+/// not an empty list: it means the manifest named no entity in this grid, and a
+/// deployment derived from it would silently own nothing.
+fn run_shards(args: &ShardsArgs) -> Result<ExitCode, String> {
+    use std::io::BufReader;
+
+    let grid = orrery_protocol::GridId::new(args.grid);
+    let file = std::fs::File::open(&args.manifest)
+        .map_err(|e| format!("open {}: {e}", args.manifest.display()))?;
+    let set = orrery_seed::shards::shard_set_from_manifest(BufReader::new(file), grid)?;
+    if set.shards.is_empty() {
+        return Err(format!(
+            "{} names no entity in {grid}: there is no shard set to deploy",
+            args.manifest.display()
+        ));
+    }
+    if args.json {
+        let doc = serde_json::json!({
+            "grid": args.grid,
+            "shard_level": orrery_protocol::SHARD_LEVEL,
+            "entries": set.entries,
+            "skipped_other_grid": set.skipped_other_grid,
+            "shards": set.flag_operands(),
+        });
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&doc).map_err(|e| e.to_string())?
+        );
+    } else {
+        for operand in set.flag_operands() {
+            println!("{operand}");
+        }
     }
     Ok(ExitCode::SUCCESS)
 }

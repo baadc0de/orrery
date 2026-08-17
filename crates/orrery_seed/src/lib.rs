@@ -79,6 +79,7 @@ pub mod place;
 pub mod plan;
 pub mod scenario;
 pub mod seedtree;
+pub mod shards;
 pub mod split;
 pub mod validate;
 pub mod verify;

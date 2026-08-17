@@ -96,6 +96,28 @@ if [[ ${1:-} == --self-test ]]; then
   runs 'refuse_an_already_activated_cluster' || die 'self-test: fresh-cluster pre-flight absent'
   runs 'seed_world' || die 'self-test: durable world seeding absent'
   has '--emit-manifest' || die 'self-test: seeder manifest emission absent'
+  # Every persistd here used to start with no `--shard`, and persistd's
+  # `resolve_shards` defaults an absent flag to `vec![CellId::ROOT]`: one
+  # shard, one single-writer actor for the whole 10 000-entity world. The
+  # measured cost was `router_apply` at 721 ms of a 723 ms acknowledged diff
+  # (99.7 %) while `journal_commit_ms` sat at 1.03 ms — the mailbox, not the
+  # disk — and the run ended with 8 760 leases withdrawn mid-flight. The
+  # deployment under test is 128 actors (docs/11-roadmap.md §P2); running one
+  # measures a topology the criterion never describes.
+  runs 'derive_shard_set' || die 'self-test: shard-set derivation absent'
+  # Matched with the operand attached: a bare `--shard` also appears in prose,
+  # and `shard_flags` alone survives deleting every use of the array.
+  has '"${shard_flags[@]}"' || die 'self-test: derived shard set is not passed to persistd'
+  # The shard set is part of `DurableChainId` (persistd's `canonical_shard_set`
+  # feeds `Topology::chain_id`), so a follower or a promoted node started on a
+  # different set is a different chain and the mirror handshake fails. All four
+  # persistd invocations must carry the same list; count them here rather than
+  # discovering it as an unreadable handshake error minutes in.
+  # Five: passive follower, fenced primary, the epoch-fork probe, the promoted
+  # follower, the zombie. `body` starts at the first `: ` line, i.e. after this
+  # block, so these clauses cannot match their own source.
+  [[ $(grep -cF -- '"${shard_flags[@]}"' <<<"$body") -ge 5 ]] \
+    || die 'self-test: not every persistd invocation carries the shard set'
   has '--manifest "$out/manifest.json"' || die 'self-test: rig is not driven from the seeded inventory'
   # The evidence check. `[[ -s acks.jsonl ]]` passed on 1024 lines of
   # `IntentOutcome::Rejected` and zero durable writes: a non-empty file is not
@@ -186,6 +208,10 @@ sessions=${P2_GATE_SESSIONS:-125}
 primary_pid=''
 follower_pid=''
 zombie_pid=''
+# The shard set every persistd below owns. Derived from the seeded manifest by
+# `derive_shard_set`; never a literal, because the number of shards is a
+# property of the scenario, not of this script.
+shard_flags=()
 cleanup() {
   for pid in "$zombie_pid" "$primary_pid" "$follower_pid"; do
     [[ -n $pid ]] && kill "$pid" 2>/dev/null || true
@@ -262,7 +288,7 @@ issuer_public=$(public_key_of "$secret_issuer") || die 'could not derive the ide
 note "identity issuer $issuer_key_id@$issuer_public"
 
 start_follower() {
-  "$PERSISTD_BIN" --node-id 2 --chain-epoch 1 --chain-primary 1 \
+  "$PERSISTD_BIN" --node-id 2 --chain-epoch 1 --chain-primary 1 "${shard_flags[@]}" \
     --chain-listen "127.0.0.1:$chain_port" --dir "$out/follower-data" \
     --metrics-jsonl "$out/follower-metrics.jsonl" \
     >"$out/follower.json" 2>"$out/follower.stderr" & follower_pid=$!
@@ -271,6 +297,7 @@ start_follower() {
 }
 start_primary() {
   "$PERSISTD_BIN" --node-id 1 --chain-epoch 1 --chain-follower "2@$follower_chain" \
+    "${shard_flags[@]}" \
     --bind "127.0.0.1:$gateway_port" --dir "$out/primary-data" \
     --secret-key "$secret_primary" --fdb-cluster-file "$ORRERY_FDB_CLUSTER_FILE" \
     --issuer-key "$issuer_key_id@$issuer_public" \
@@ -294,6 +321,7 @@ prove_epoch_fork_refused() {
   # neither `--promote-from` nor an FDB cluster file.
   note 'proving a bumped chain epoch is refused, not forked'
   if timeout 120 "$PERSISTD_BIN" --node-id 2 --chain-epoch 2 --chain-primary 1 \
+    "${shard_flags[@]}" \
     --chain-listen "127.0.0.1:$fork_port" --dir "$out/follower-data" \
     >"$out/epoch-fork.json" 2>"$out/epoch-fork.stderr"; then
     die 'follower accepted a bumped chain epoch on an already-mirrored journal'
@@ -315,6 +343,7 @@ start_promoted_follower() {
   kill -TERM "$follower_pid"; wait "$follower_pid" || true; follower_pid=''
   prove_epoch_fork_refused
   "$PERSISTD_BIN" --node-id 2 --chain-epoch 2 --chain-primary 1 --promote-from 1 \
+    "${shard_flags[@]}" \
     --chain-listen "127.0.0.1:$chain_port" --bind "127.0.0.1:$gateway_port" \
     --dir "$out/follower-data" --secret-key "$secret_follower" \
     --issuer-key "$issuer_key_id@$issuer_public" \
@@ -345,7 +374,44 @@ seed_world() {
   [[ -s $out/manifest.json ]] || die 'seeder emitted no manifest'
 }
 
+# The deployment the criterion describes, derived from the world just seeded.
+#
+# persistd's `resolve_shards` turns an absent `--shard` into `vec![CellId::ROOT]`
+# — one shard, and therefore *one* single-writer cell actor for the entire
+# world. That is what this harness used to ask for, and the measured effect on
+# the 10 000-entity demo profile was a mailbox queue, not a durability problem:
+# per acknowledged diff, `router_apply` 721 ms of a 723 ms total (99.7 %) with
+# `journal_wait` at 1.5 ms and `journal_commit_ms` averaging 1.03 ms against a
+# 2 ms D16 budget. The registrar then withdrew 8 760 of 10 000 leases because
+# their holders could not be served inside the lease term.
+#
+# The designed deployment (docs/11-roadmap.md §P2, docs/08-persistence.md §3.1)
+# is one actor per level-`SHARD_LEVEL` cell, and `orrery_protocol::shard_of`
+# is the canonical collapse from an entity's interest cell to its shard. The
+# seeder owns the manifest format, so the collapse is a seeder subcommand
+# (`orrery-seed shards`) rather than a `jq` expression here: reimplementing
+# `ancestor_at(SHARD_LEVEL)` in shell would duplicate a packed-bit encoding,
+# and a shard set that is subtly wrong does not fail loudly — it leaves part of
+# the world addressed to an actor no process owns.
+#
+# Nothing here is a constant: the demo profile spans 128 shards today and a
+# scenario edit moves that without touching this script.
+derive_shard_set() {
+  local list=$out/shard-set.txt
+  "$ORRERY_SEED_BIN" shards "$out/manifest.json" --grid 0 >"$list" \
+    || die "could not derive the shard set from $out/manifest.json"
+  mapfile -t shards <"$list"
+  [[ ${#shards[@]} -gt 0 ]] || die 'the seeded manifest collapsed to an empty shard set'
+  shard_flags=()
+  local shard
+  for shard in "${shards[@]}"; do
+    shard_flags+=(--shard "$shard")
+  done
+  note "shard set derived from the seeded manifest: ${#shards[@]} shard(s)"
+}
+
 seed_world
+derive_shard_set
 note "starting passive follower"
 start_follower
 note "starting fenced primary"
@@ -408,6 +474,7 @@ start_promoted_follower
 # actor fence rejects a fresh process carrying the old owner identity.
 note 'proving old primary is fenced (zombie admission)'
 "$PERSISTD_BIN" --node-id 1 --chain-epoch 1 --chain-follower "2@$follower_chain" \
+  "${shard_flags[@]}" \
   --bind "127.0.0.1:$zombie_port" --dir "$out/primary-data" \
   --secret-key "$secret_primary" --fdb-cluster-file "$ORRERY_FDB_CLUSTER_FILE" \
   --issuer-key "$issuer_key_id@$issuer_public" \

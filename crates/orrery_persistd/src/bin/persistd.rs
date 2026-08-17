@@ -1926,6 +1926,47 @@ mod tests {
         );
     }
 
+    /// The deployment the P2 criterion describes is one actor per level-18
+    /// shard, and the kill-9 gate's seeded world spans 128 of them. That is a
+    /// shard set two orders of magnitude larger than any flag list this binary
+    /// had been given, so the two O(n²) admission checks it goes through are
+    /// exercised here at the real size: `validate_shards` compares every pair
+    /// for prefix containment, and `canonical_shard_set` must produce one
+    /// stable encoding regardless of the flag order the harness emitted.
+    #[test]
+    fn a_full_interest_lattice_of_shards_is_accepted_and_canonical() {
+        // 8×4×4 = 128 distinct level-18 cells: siblings at one level, so no
+        // cell is a prefix of another and the whole set is a legal deployment.
+        let shards: Vec<CellId> = (0..128)
+            .map(|i| {
+                let x = i % 8;
+                let y = (i / 8) % 4;
+                let z = i / 32;
+                CellId::from_coords(IVec3::new(x, y, z), orrery_protocol::SHARD_LEVEL)
+                    .expect("in range")
+            })
+            .collect();
+        assert_eq!(shards.len(), 128);
+        validate_shards(&shards).expect("a disjoint level-18 shard set is a legal deployment");
+
+        // Order independence, at a size where an accidental order-sensitive
+        // encoding would make the primary's and follower's `DurableChainId`
+        // disagree and the mirror handshake fail for a reason no log names.
+        let mut reversed = shards.clone();
+        reversed.reverse();
+        assert_eq!(
+            canonical_shard_set(GridId::ROOT, &shards),
+            canonical_shard_set(GridId::ROOT, &reversed),
+        );
+
+        // And a shard set is not silently truncated: the encoding carries all
+        // 128 cells (version + grid + count + 8 bytes each).
+        assert_eq!(
+            canonical_shard_set(GridId::ROOT, &shards).len(),
+            1 + 4 + 4 + 128 * 8
+        );
+    }
+
     #[test]
     fn duplicate_chain_followers_are_rejected() {
         let followers = vec![

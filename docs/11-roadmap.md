@@ -85,6 +85,7 @@ The harness runs the shipping plugins; only the socket is stood in for, by an in
 
 **Deliverables.**
 - Single-writer cell actor runtime with rendezvous-hash placement over shard cells (8×8×8 interest cells per shard).
+  - The gate deploys that topology rather than assuming it. `persistd` defaults an absent `--shard` to `vec![CellId::ROOT]` — one shard, one actor, the whole world through one mailbox — and `scripts/p2-kill9-gate.sh` used to start every node that way. Measured on the 10 000-entity `demo` profile: 8 921 of 10 000 leases withdrawn mid-run, `router_apply` 7.50 ms of a 7.81 ms acknowledged diff, with `journal_commit_ms` at 0.46 ms against its 2 ms budget — a mailbox queue, not a durability defect. The gate now derives the set the seeded world occupies (`orrery-seed shards`, docs/12 §9.3: 128 level-18 shards for this scenario, never a literal) and passes it to all five `persistd` invocations, since the shard set is part of `DurableChainId`.
 - Journal with adaptive group commit (fsync immediately when the disk is idle, ~0.5 ms batching under load; commit < 2 ms server-internal); optional chain replication to one async follower (default on, RPO ≤ ~100 ms for bulk on node loss).
 - FDB 7.3.x checkpointing on the 20 s jittered cadence, immediate on cell quiesce; keyspace exactly as D11 (`world/{cell_id}/{entity_id}`, `player/…`, `ledger/…`, `lease/…`, `chunk/…`).
 - Area load: 27-cell FDB range scans + live actor deltas, streamed nearest-first.
