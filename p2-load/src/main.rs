@@ -1690,21 +1690,22 @@ impl Rig<'_> {
     /// `(lease_id, seq)` the rig carries on its diffs stays valid across them.
     async fn heartbeat_leases(&self) {
         let sessions = self.sessions.len().max(1);
-        let mut per_session: Vec<Vec<LeaseId>> = vec![Vec::new(); sessions];
+        let mut per_session: Vec<Vec<(PersistId, LeaseId)>> = vec![Vec::new(); sessions];
         for (index, placement) in self.inventory.iter().enumerate() {
             if let Some(lease) = self.leases.get(&placement.entity) {
-                per_session[scheduler_shard(index, sessions)].push(lease.lease_id);
+                per_session[scheduler_shard(index, sessions)]
+                    .push((placement.entity, lease.lease_id));
             }
         }
-        for (session, lease_ids) in per_session.into_iter().enumerate() {
-            if lease_ids.is_empty() {
+        for (session, renew) in per_session.into_iter().enumerate() {
+            if renew.is_empty() {
                 continue;
             }
             send_msg(
                 &self.sessions[session],
                 &GatewayMsg::Lease {
                     message: LeaseMsg::Heartbeat {
-                        lease_ids,
+                        renew,
                         tick: Tick::new(0),
                     },
                 },
@@ -2179,10 +2180,14 @@ impl Rig<'_> {
                     if invalid.is_empty() {
                         return;
                     }
+                    // Matched on the pair, not the bare token: `LeaseId` is a
+                    // per-row counter, so an id-only match would drop every
+                    // entity this rig holds at the same counter value and
+                    // wildly overstate `leases_lost`.
                     let dropped: Vec<PersistId> = self
                         .leases
                         .iter()
-                        .filter(|(_, held)| invalid.contains(&held.lease_id))
+                        .filter(|(entity, held)| invalid.contains(&(**entity, held.lease_id)))
                         .map(|(entity, _)| *entity)
                         .collect();
                     for entity in &dropped {

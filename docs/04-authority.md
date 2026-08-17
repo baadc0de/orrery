@@ -120,7 +120,7 @@ Six messages, defined in `orrery_protocol`, postcard-encoded on the reliable con
 | `Grant` | registrar → peer | `claim_id`, `entity`, `lease_id`, `seq: SeqPair` (authoritative), `ttl_ms: 10_000`, `prev_holder` |
 | `Deny` | registrar → peer | `claim_id`, `entity`, `reason: Held{holder, seq} \| StrongHeld \| NotEligible \| RateLimited \| Parked`, `retry_after_ms` |
 | `Divest` | both | registrar → holder: request `{entity, lease_id, to: Option<NodeId>, deadline_ms}`; holder → registrar: consent/offer `{entity, lease_id, to: Option<NodeId>, final_seq, cursor: JournalCursor}`. `to: None` = release/park. |
-| `Heartbeat` | both | peer → registrar: `{lease_ids: Vec<u64>, tick}` (one batch per peer per 2.5 s covering all held leases); registrar → peer echo: `{renewed_until}` |
+| `Heartbeat` | both | peer → registrar: `{renew: Vec<(entity, lease_id)>, tick}` (one batch per peer per 2.5 s covering all held leases); registrar → peer `HeartbeatAck{leases: Vec<Lease>, invalid: Vec<(entity, lease_id)>}` |
 | `Expire` | registrar → holder + cell subscribers | `{entity, lease_id, last_holder, reason: Timeout\|Disconnect\|Revoked\|Parked, disposition: Reassigned{to}\|Parked\|Free}` |
 
 `claim_id` makes delayed control replies safe: a client ignores a `Grant` or
@@ -471,6 +471,16 @@ Leases are **entity-keyed, not cell-keyed**: an entity crossing a cell boundary 
 - On the *committed* cell change, the storage row re-keys `world/{old_cell}/{entity}` → `world/{new_cell}/{entity}` in one journal record (one FDB transaction at checkpoint), and the lease row migrates between cell actors as part of the same handoff — invisible on the wire; `lease_id` and `seq` are preserved. The same applies when the committed change is a *frame migration* between nested grids ([01-spatial-model.md](01-spatial-model.md) §13.3): the row re-keys from the source grid's keyspace to the destination's, and the lease — entity-keyed, not cell- or grid-keyed — is untouched.
 - If the destination cell belongs to another island, the coordinator's island merge/handoff governs (see [02-networking.md](02-networking.md)); if the destination is *promoted*, the entity's holder receives a `Divest{to: field_host}` on entry — the warrant covers entities that migrate in.
 - Heartbeats are unaffected: they are batched per peer, not per cell.
+
+A renewal names **both** the entity and the token, and so does every refusal in
+the ack. `lease_id` is a *per-row* counter — it is a fence for one entity, not a
+handle in a peer-global namespace — so every entity a peer freshly claims sits at
+`lease_id = 1`. A batch of bare ids is therefore ambiguous in both directions:
+the registrar cannot resolve a requested id to one row without scanning the
+peer's whole lease set (quadratic in the entities one peer holds, and one actor
+round trip per match), and a peer cannot tell which of its entities an `invalid`
+id refers to, so it drops all of them. Pairing with the entity makes both sides
+a map lookup and keeps refusals surgical.
 
 ## 10. Rate limits and anti-grief
 
