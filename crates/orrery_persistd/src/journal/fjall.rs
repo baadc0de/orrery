@@ -1052,9 +1052,14 @@ mod tests {
         let metrics = journal.commit_metrics();
         let mut cursor = metrics.snapshot();
 
+        // What this pins is that one append is metered exactly once at the
+        // durable boundary — not *when* the boundary is crossed. It used to
+        // assert `snapshot().total() == 0` between the append and its commit,
+        // which raced the group-commit thread: D11's adaptive commit fsyncs
+        // immediately when the disk is idle, so the sample can legitimately
+        // land before the next statement runs. That assertion held on an idle
+        // box and failed under CI load, which is the wrong way round.
         let handle = journal.append(mk_record(42)).expect("append");
-        // Staging an append has not crossed the durable boundary yet.
-        assert_eq!(metrics.snapshot().total(), 0);
         handle.committed().await.expect("commit");
 
         let delta = metrics.delta(&mut cursor);
