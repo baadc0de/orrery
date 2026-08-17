@@ -916,6 +916,34 @@ async fn area_load_end_to_end_cold_cell_served() {
 #[cfg(feature = "fdb")]
 const UNREACHABLE_CLUSTER_BOUND: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// How long the FoundationDB client is given to abandon an unreachable cluster
+/// before this process is allowed to exit.
+///
+/// This is not tidiness, it is the fix for a `SIGSEGV` that failed the whole
+/// nightly `fdb-gated tests` job on run `31990682224` *after* all nine tests in
+/// this binary had passed. The C client's network thread is process-global and
+/// is never stopped — `orrery_persistd::fdb`'s boot guard is deliberately
+/// leaked, because the client must outlive every database handle. A handle
+/// pointed at a cluster nothing answers on leaves that thread in a connect,
+/// fail, back off, connect loop, and a process that returns from `main` in the
+/// middle of one of those iterations dies in the C client rather than exiting.
+///
+/// Measured on the sixteen-thread development box, this binary's exit status
+/// over fifteen runs of *this test alone*: 3 of 15 crashed as it stood, 4 of 15
+/// with the handle leaked instead of dropped, and 0 of 15 once the handle is
+/// dropped and the client given this long to notice. The middle number is the
+/// one that decides the shape of the fix — it says the trigger is the churning
+/// connection at process exit and not the destruction of the handle, so
+/// isolating this test into a binary of its own would not have helped. It also
+/// rules out any interaction with the eight cluster-backed tests it shares this
+/// binary with: they exited cleanly 20 times out of 20 without it.
+///
+/// A second and a half is roughly five times the client's own retry backoff.
+/// The wait costs this suite nothing that matters: it is one and a half
+/// seconds on a test that already spends ten proving the bound.
+#[cfg(feature = "fdb")]
+const FDB_CLIENT_QUIESCE: std::time::Duration = std::time::Duration::from_millis(1500);
+
 /// A durable read against a cluster nothing is listening on fails inside the
 /// transaction budget instead of hanging forever.
 ///
@@ -954,4 +982,10 @@ async fn unreachable_fdb_cluster_fails_inside_the_transaction_bound() {
         "durable read against an unreachable cluster took {elapsed:?}, over the \
          {UNREACHABLE_CLUSTER_BOUND:?} bound: {err}"
     );
+
+    // Ordered, not incidental: the handle goes first so the client stops
+    // retrying, then the wait lets it finish doing so. See
+    // [`FDB_CLIENT_QUIESCE`] for the crash this prevents.
+    drop(store);
+    tokio::time::sleep(FDB_CLIENT_QUIESCE).await;
 }
