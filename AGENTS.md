@@ -347,6 +347,103 @@ tests at all — see the inventory above, which is the table the lane iterates.
 `p2-load` takes `orrery_persistd` with `features = ["fdb"]`, which is why that
 job installs the FoundationDB *client* on the hosted path.
 
+### Where every gate stands: `scripts/gate-status.sh`
+
+There was no single way to find out what every gate in this repository
+currently says. The phase gates (P1 swarm, P2 kill-9, P3 island, P4
+accumulate/ledger), the static gates, the `fdb` tier and the determinism corpus
+report in different places — `scripts/*.sh`, two workflows, and the evidence
+directories the nightly uploads — so answering "where does every gate stand,
+with numbers" meant reading five files and running things by hand. Nobody does
+that, which is how a vacuous self-test and an unrun `p4-*` self-test both
+survived for weeks.
+
+```
+./scripts/gate-status.sh              # --fast: static gates + every --self-test
+./scripts/gate-status.sh --full       # also every harness whose prerequisites hold here
+./scripts/gate-status.sh --inspect    # run nothing; report from evidence on disk
+./scripts/gate-status.sh --self-test  # its own structural + functional check
+```
+
+**The gate list is discovered, never typed.** Scripts come from a `find` over
+`scripts/`, jobs from the `jobs:` keys of `nightly.yml` and `ci.yml`, and the
+static gates from the text of `check.sh`'s `lane_gates`. A typed inventory is
+the thing that rots: it stays green while the tree moves under it. What the
+script does hold is one `gate_<key>_{tier,prereq,run,evidence}` trio per gate it
+knows how to run and read — and a gate discovered with no trio is reported
+`UNKNOWN` and exits 2. So adding a gate and forgetting this script breaks the
+report loudly instead of dropping a gate from it silently.
+
+**A skip is never a pass.** Five statuses that do not collapse into each other:
+`PASSED`, `FAILED`, `NOT RUN` (runnable, this mode did not run it, no evidence
+on disk), `SKIPPED` (a prerequisite is missing — no cluster, no hosted runner —
+so the gate was *not evaluated* and nothing is claimed), and `UNKNOWN`. The
+exit status carries the same distinction: 0 nothing failed, 1 a gate failed, 2
+the report has a hole in it. A run that skipped every heavy harness exits 0 and
+says so in every line of its summary; it does not say the gates passed.
+
+**Numbers come out of the gates' own reports**, never re-derived: settle times
+and disposition counts from `p3-island-*/report.json`, player-hours and
+false-positive counts from `target/p1-swarm/*.json`, latency percentiles and
+the recovery cutoff from `p2-kill9-*/artifact.json`, banked hours from the P4
+ledger, executed test counts from `target/fdb-tests.log`. A figure this script
+computed itself would be a second implementation of the gate, and the two would
+disagree exactly when it mattered.
+
+**The mode is printed in the banner, in the summary, and in every JSONL
+record**, because a fast run must never be read as a full one. The machine-
+readable half is `target/gate-status/gate-status.jsonl`, one record per row, so
+two nights can be diffed.
+
+**What this box cannot answer, and why.** `p2-kill9` consumes its cluster —
+`--chain-epoch 1` is an assertion against an FDB fence that only moves forward
+— so it needs a *fresh throwaway* cluster and the script refuses the box's
+shared development one by probing it for an `actor/` activation row. The `fdb`
+tier wipes key ranges (C-8), so it will not run without
+`GATE_STATUS_FDB_IS_THROWAWAY=1` asserting the cluster is disposable. The
+cross-platform determinism matrix, `p4-platform-ledger` and the Windows and
+macOS accumulation legs need hosted runners this machine does not have. Every
+one of those is `SKIPPED` with the reason printed, not quietly absent.
+
+**Measured on the box, `--full`, at `607550c` with a nightly running
+concurrently: 28 minutes**, of which `p1-swarm` is 982 s and the `test` lane
+507 s; `p3-island` 72 s, the `p4` probe 27 s, the determinism soak 10 s,
+`clippy` 40 s, `fmt` 3 s. `--fast` is 18 s. What it reported: P1 held all five
+legs (0 boundary flips, 0 proxy pops, 138 cells on the least-travelled peer,
+773760 bits worst p99 upload, 162 shed on the witnessed hour, 0 false positives
+at 0.9999992 observation coverage, and the conviction and armed-honest controls
+both clean); P3 settled 50 victim entities across 7 successors in 9939 ms
+against a 12050 ms budget with 0 duplicate authority and 0 lost; the soak's ten
+corpus runs produced one digest. Six gates were `SKIPPED` and none of them read
+as a pass.
+
+**It needs one line in `check.sh` that is not there yet.** `check.sh
+--self-test` asserts that every script in `scripts/` dispatching on
+`--self-test` is invoked by `lane_gates`, and `gate-status.sh` is one — so the
+per-commit `gates` job fails until
+
+```
+    run scripts/gate-status.sh --self-test
+```
+
+is added to `lane_gates` beside the other seven (`scripts/check.sh:214`). That
+is the coverage clause doing exactly its job; the self-test costs 0.9 s and
+needs no cluster, no binaries and no network.
+
+**Evidence is read as it is found, and that is a limitation with teeth.**
+`--inspect` and the evidence half of `--fast` tell you what a gate last said,
+not what it says about `HEAD`: a `target/p1-swarm/` left by a run three commits
+ago reads as `PASSED` with that run's numbers. Each JSONL record stamps the
+commit of the *report*, not of the evidence. Treat an evidence-derived row as a
+citation of an artifact, and re-run `--full` when the answer has to be about
+the working tree.
+
+**One gate is restated rather than delegated**, and it is worth knowing:
+`determinism-soak` has no script of its own — its body is inline in
+`nightly.yml` — so `gate-status.sh` reproduces the ten-repeat loop. A change to
+the workflow's version does not reach it. Giving that job a script in
+`scripts/` would close the gap.
+
 ## Build cache and target directories
 
 Agents work in parallel git worktrees, and a Rust `target/` is enormous: one

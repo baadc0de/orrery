@@ -213,6 +213,12 @@ lane_gates() {
     run scripts/p4-accumulate.sh --self-test
     run scripts/p4-ledger.sh --self-test
 
+    # The gate reporter's own. It is the script that says which gates ran and
+    # what they measured, so a report that has quietly stopped discovering a
+    # gate is exactly as bad as a gate that has quietly stopped failing. Its
+    # self-test runs nothing and takes about a second.
+    run scripts/gate-status.sh --self-test
+
     # And this script's own, which nothing ran either: ci.yml calls the four
     # lanes and never `--self-test`, so the lane table's agreement with the tree
     # — and, now, the coverage clause below — were checked only when a human
