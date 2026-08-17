@@ -41,6 +41,20 @@ env:
   # Already off in .cargo/config.toml; restated because a cache miss on a fresh
   # runner is the case where incremental artifacts cost the most and buy least.
   CARGO_INCREMENTAL: 0
+  # The self-hosted jobs DO set the wrapper back (see each job's env), and
+  # /var/cache/sccache is shared between the `ci` and `baadc0de` users — one
+  # sccache server per user, two servers writing one disk cache. Under
+  # concurrent load a server occasionally dies mid-build and every in-flight
+  # `sccache rustc` fails with `Connection reset by peer (os error 104)`,
+  # failing the job on a third-party crate that has nothing to do with the
+  # change. Seven occurrences on 2026-08-16/17, every one cleared by a re-run.
+  #
+  # This makes sccache fall back to running the compiler directly when it
+  # cannot reach its server, which is the correct degradation: the cache is an
+  # optimisation, and losing it should cost build time, not a red PR. It does
+  # not paper over a real compile error — rustc still runs and still fails on
+  # one.
+  SCCACHE_IGNORE_SERVER_IO_ERROR: "1"
 
 jobs:
   # Which runner the heavy Linux jobs get, decided per event.
