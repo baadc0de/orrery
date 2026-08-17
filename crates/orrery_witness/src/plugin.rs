@@ -338,6 +338,41 @@ impl Default for WitnessClock {
     }
 }
 
+/// The key this peer signs discrepancy reports with (docs/07 §3 stage 3).
+///
+/// **Optional, and absent by default.** [`Witness::raise`] needs a signing
+/// key, and no other resource carries one this crate can reach:
+/// `orrery_net`'s `NetConfig::secret_key` is consumed straight into the iroh
+/// endpoint builder, and the endpoint's key is not handed back out. So filing
+/// is opt-in — a host that wants its witness to escalate inserts this, and one
+/// that does not gets detection and counters exactly as before.
+///
+/// Being absent is *not* the same as shadow mode, and the counters keep them
+/// apart: shadow mode
+/// ([`WitnessConfig::shadow_mode`](crate::WitnessConfig::shadow_mode), true by
+/// default) means the window was assembled and deliberately not filed, while a
+/// missing identity means the escalation never got that far. A witness that
+/// conflated them would report "filed nothing" identically for a considered
+/// posture and a misconfiguration.
+#[derive(Debug, Clone, Resource)]
+pub struct WitnessIdentity(pub iroh_base::SecretKey);
+
+/// A signed report on its way out of this peer.
+///
+/// The adapter does not send it: reports go to the *cluster*, over the gateway
+/// session, and this crate has no gateway session — `orrery_persist_client`
+/// does, and the two crates sit side by side on the dependency spine (D15).
+/// So the message is the seam, and the `orrery` facade owns the one system
+/// that carries it across.
+#[derive(Debug, Clone, Message)]
+pub struct ReportFiled {
+    /// The accused authority, echoed from the report for a consumer that only
+    /// wants to count.
+    pub subject: NodeId,
+    /// The self-verifying accusation, signed by [`WitnessIdentity`].
+    pub report: Box<orrery_protocol::DiscrepancyReport>,
+}
+
 /// The witness engine, as a resource.
 ///
 /// Generic over the ruleset because re-execution *is* the signal: a witness
@@ -368,6 +403,20 @@ pub struct WitnessLinkCounters {
     pub undecodable: u64,
     /// Inbound messages refused by the engine.
     pub refused: u64,
+    /// Reports assembled, signed and handed to the transport.
+    pub escalations_filed: u64,
+    /// Windows raised while shadow mode was on, and therefore not filed.
+    ///
+    /// Separate from [`escalations_unidentified`](Self::escalations_unidentified):
+    /// this is the deliberate P4 posture, that one is a host that never wired
+    /// a key up.
+    pub escalations_shadowed: u64,
+    /// Mismatches this witness could not turn into a window it can prove
+    /// anything over — no agreed claim close enough, or a window the retained
+    /// log cannot assemble.
+    pub escalations_unservable: u64,
+    /// Mismatches left unescalated because no [`WitnessIdentity`] is present.
+    pub escalations_unidentified: u64,
 }
 
 /// Streams the verifiable core between island peers and drives a [`Witness`].
@@ -420,6 +469,7 @@ where
             .add_message::<PublishFrame>()
             .add_message::<PublishClaim>()
             .add_message::<Witnessed>()
+            .add_message::<ReportFiled>()
             .add_message::<RepairRequest>()
             .add_systems(
                 Update,
@@ -557,11 +607,14 @@ pub fn witness_links(witnesses: &WitnessSet, membership: &IslandMembership) -> V
 }
 
 /// Feeds inbound frames, claims and repairs into the witness.
+#[allow(clippy::too_many_arguments)]
 pub fn ingest_peer_traffic<R>(
     mut packets: MessageReader<PeerPacket>,
     witness: Option<ResMut<WitnessState<R>>>,
+    identity: Option<Res<WitnessIdentity>>,
     mut signals: MessageWriter<Witnessed>,
     mut out: MessageWriter<SendPacket>,
+    mut reports: MessageWriter<ReportFiled>,
     mut counters: ResMut<WitnessLinkCounters>,
     mut requests: MessageWriter<RepairRequest>,
 ) where
@@ -569,6 +622,7 @@ pub fn ingest_peer_traffic<R>(
     R::CoreState: Send + Sync,
     R::CoreInput: Send + Sync,
 {
+    let identity = identity.as_ref().map(|identity| &identity.0);
     let mut witness = witness;
     for packet in packets.read() {
         // Not witness traffic at all — replication shares this lane. Skipped
@@ -602,18 +656,37 @@ pub fn ingest_peer_traffic<R>(
         match message {
             WitnessMsg::Frame { frame, heads } => {
                 let produced = witness.ingest_wire_frame(&frame, &heads);
-                route(witness, produced, &mut signals, &mut out, &mut counters);
+                route(
+                    witness,
+                    produced,
+                    identity,
+                    &mut signals,
+                    &mut out,
+                    &mut reports,
+                    &mut counters,
+                );
             }
-            WitnessMsg::Claim(claim) => match witness.ingest_claim(&claim) {
-                Ok(Some(signal)) => {
-                    // Attributed to the authority the engine holds responsible,
-                    // never to whoever handed the message over — see `route`.
-                    let subject = witness.subject(claim.entity).unwrap_or(packet.from);
-                    signals.write(Witnessed { subject, signal });
-                }
-                Ok(None) => {}
-                Err(_) => counters.refused += 1,
-            },
+            WitnessMsg::Claim(claim) => {
+                // Through `route` like every other produced signal, rather
+                // than written straight out. A claim is the *only* thing that
+                // produces `ClaimMismatch` on this path, so a shortcut here
+                // meant the escalation `route` performs never ran for the one
+                // signal it exists for. Attribution is unchanged: `route`
+                // reads the subject from the engine, which is what the
+                // previous `unwrap_or(packet.from)` fallback was never
+                // reached for — `ingest_claim` returns a signal only for a
+                // watched entity, and a watched entity always has a subject.
+                let produced = witness.ingest_claim(&claim).map(Vec::from_iter);
+                route(
+                    witness,
+                    produced,
+                    identity,
+                    &mut signals,
+                    &mut out,
+                    &mut reports,
+                    &mut counters,
+                );
+            }
             // Handled above, before the witness is consulted.
             WitnessMsg::RangeRequest(_) => unreachable!("routed before this match"),
             WitnessMsg::RangeResponse {
@@ -634,7 +707,15 @@ pub fn ingest_peer_traffic<R>(
                 // only the engine can thread them forward correctly. See
                 // `Witness::ingest_wire_frames`.
                 let produced = witness.ingest_wire_frames(&response.frames, &heads);
-                route(witness, produced, &mut signals, &mut out, &mut counters);
+                route(
+                    witness,
+                    produced,
+                    identity,
+                    &mut signals,
+                    &mut out,
+                    &mut reports,
+                    &mut counters,
+                );
 
                 if let Some(resume) = resume_from {
                     // A 180-tick window does not fit one datagram, so the
@@ -683,11 +764,14 @@ pub fn ingest_peer_traffic<R>(
 /// Runs once per distinct tick: the engine's backoff is measured in ticks, so
 /// sweeping several times on the same one would only re-ask questions it has
 /// already asked.
+#[allow(clippy::too_many_arguments)]
 pub fn sweep_repairs<R>(
     witness: Option<ResMut<WitnessState<R>>>,
+    identity: Option<Res<WitnessIdentity>>,
     clock: Res<WitnessClock>,
     mut signals: MessageWriter<Witnessed>,
     mut out: MessageWriter<SendPacket>,
+    mut reports: MessageWriter<ReportFiled>,
     mut counters: ResMut<WitnessLinkCounters>,
     mut swept: Local<Option<Tick>>,
 ) where
@@ -706,8 +790,10 @@ pub fn sweep_repairs<R>(
     route(
         &mut witness.0,
         Ok(produced),
+        identity.as_ref().map(|identity| &identity.0),
         &mut signals,
         &mut out,
+        &mut reports,
         &mut counters,
     );
 }
@@ -733,8 +819,10 @@ pub fn sweep_repairs<R>(
 fn route<R: Ruleset + Send + Sync + 'static>(
     witness: &mut Witness<R>,
     produced: Result<Vec<WitnessSignal>, crate::witness::WitnessError>,
+    identity: Option<&iroh_base::SecretKey>,
     signals: &mut MessageWriter<Witnessed>,
     out: &mut MessageWriter<SendPacket>,
+    reports: &mut MessageWriter<ReportFiled>,
     counters: &mut WitnessLinkCounters,
 ) {
     let Ok(produced) = produced else {
@@ -742,14 +830,20 @@ fn route<R: Ruleset + Send + Sync + 'static>(
         return;
     };
     for signal in produced {
+        // A report carries its own subject and covers a window rather than a
+        // moment, so there is no entity to attribute it to below. It used to
+        // be discarded here, which meant the one artefact the whole subsystem
+        // exists to produce could never leave the process.
+        if let WitnessSignal::Report(report) = signal {
+            file_report(report, reports, counters);
+            continue;
+        }
         let entity = match &signal {
             WitnessSignal::Gap(request) => request.entity,
             WitnessSignal::InvariantBreach { entity, .. }
             | WitnessSignal::ClaimMismatch { entity, .. }
             | WitnessSignal::Stalled { entity, .. } => *entity,
-            // Only `raise` produces one, and the app calls that directly. There
-            // is no entity to attribute it to here and nothing to route.
-            WitnessSignal::Report(_) => continue,
+            WitnessSignal::Report(_) => unreachable!("filed before this match"),
         };
         let Some(subject) = witness.subject(entity) else {
             // A signal about an entity the engine no longer holds has nobody to
@@ -770,8 +864,68 @@ fn route<R: Ruleset + Send + Sync + 'static>(
                 mode: StreamMode::Shared,
             });
         }
+        // Stage 2 → stage 3, and the only place either happens. `audit_window`
+        // already computes the window from the mismatch tick — it opens at the
+        // last claim witness and subject demonstrably agreed on — so this
+        // arms nothing of its own.
+        if let WitnessSignal::ClaimMismatch { entity, at } = &signal {
+            escalate(witness, identity, *entity, *at, reports, counters);
+        }
         signals.write(Witnessed { subject, signal });
     }
+}
+
+/// Turn one mismatch into a filed report, or count why it could not be one.
+///
+/// Every outcome is counted separately. "Nothing was filed" has four causes
+/// here — no key, no provable window, an unassemblable one, and shadow mode —
+/// and only the last is a posture rather than a problem.
+fn escalate<R: Ruleset + Send + Sync + 'static>(
+    witness: &mut Witness<R>,
+    identity: Option<&iroh_base::SecretKey>,
+    entity: PersistId,
+    at: Tick,
+    reports: &mut MessageWriter<ReportFiled>,
+    counters: &mut WitnessLinkCounters,
+) {
+    let Some(key) = identity else {
+        counters.escalations_unidentified += 1;
+        return;
+    };
+    let Some(window) = witness.audit_window(entity, at) else {
+        // No agreed claim close enough. The honest answer: there is no window
+        // this witness can prove anything over, and filing an unprovable one
+        // is how a witness convicts itself of fabricating evidence.
+        counters.escalations_unservable += 1;
+        return;
+    };
+    match witness.raise(key, entity, window) {
+        Ok(signal) => {
+            if let WitnessSignal::Report(report) = signal {
+                file_report(report, reports, counters);
+            }
+        }
+        Err(_) => counters.escalations_unservable += 1,
+    }
+}
+
+/// Hand a raised report to the transport, or count the shadow-mode non-filing.
+fn file_report(
+    report: Option<Box<orrery_protocol::DiscrepancyReport>>,
+    reports: &mut MessageWriter<ReportFiled>,
+    counters: &mut WitnessLinkCounters,
+) {
+    let Some(report) = report else {
+        // Shadow mode: the window was assembled and counted, and nothing
+        // leaves. That is the whole P4 posture, not a failure.
+        counters.escalations_shadowed += 1;
+        return;
+    };
+    counters.escalations_filed += 1;
+    reports.write(ReportFiled {
+        subject: report.subject,
+        report,
+    });
 }
 
 /// The share of a peer's upload budget that serving repairs may spend.
@@ -874,14 +1028,15 @@ pub struct RepairRequest {
 /// immediately, and the requester holds one outstanding repair on a backoff
 /// precisely so it can wait.
 ///
-/// # Why this needs so many round trips
+/// # What bounds an answer now
 ///
-/// Each answer is capped at one datagram, so refilling a one-second hole takes
-/// roughly twenty exchanges *per witness*, and the same frames are served once
-/// per witness. D3 puts control and bulk traffic on reliable **streams**, which
-/// have no such cap — but `orrery_net`'s peer lane is datagram-only today, a
-/// deferral noted when the witness transport landed. That, rather than this
-/// budget, is the binding constraint on repair throughput.
+/// This used to say the answer was capped at one datagram, and it no longer
+/// is: `orrery_net`'s peer lane carries `Channel::Control` on QUIC streams
+/// (`orrery_net::peer_link`), which have no MTU. An answer is sized by
+/// [`repair_response_budget`] instead — the share of the upload budget repairs
+/// may spend, floored at the old one-packet budget so this can never serve
+/// less than it did. The share, not the packet size, is the binding
+/// constraint, and raising it does not help (see [`RepairBudget`]).
 #[allow(clippy::too_many_arguments)]
 pub fn serve_repair_requests(
     mut requests: MessageReader<RepairRequest>,

@@ -13,6 +13,13 @@
 //! and `orrery_authority`, authority is the lower layer of the two, and the net
 //! layer pushes rather than the authority layer pulling.
 //!
+//! There is now a second such system, [`queue_filed_reports`], and it is here
+//! for the same reason: `orrery_witness` files a signed `DiscrepancyReport`
+//! and has no gateway session, `orrery_persist_client` has the session and
+//! must not learn about witnessing, and only this crate depends on both. The
+//! exception is meant to stay this narrow — both systems move a value between
+//! two resources and decide nothing.
+//!
 //! ```no_run
 //! use bevy::prelude::*;
 //! use orrery::prelude::*;
@@ -36,10 +43,10 @@ use orrery_authority::{track_island_binding, IslandBinding, OrreryAuthorityPlugi
 use orrery_core::Ruleset;
 use orrery_net::plugin::NetConfig;
 use orrery_net::{CoordinatorConfig, IslandMembership, OrreryNetPlugin};
-use orrery_persist_client::{OrreryPersistClientPlugin, PersistClientConfig};
+use orrery_persist_client::{OrreryPersistClientPlugin, PersistClientConfig, ReportQueue};
 use orrery_predict::{ConfigDefect, OrreryPredictPlugin, PredictConfig};
 use orrery_spatial::{OrrerySpatialPlugin, SpatialConfig};
-use orrery_witness::WitnessPlugin;
+use orrery_witness::{ReportFiled, WitnessPlugin};
 
 pub mod prelude;
 
@@ -186,6 +193,50 @@ pub fn bind_island_membership(
     }
 }
 
+/// Carries a filed discrepancy report from the witness to the gateway egress.
+///
+/// The facade's **second** cross-crate system, and it exists for exactly the
+/// reason the first one does — see this module's docs. `orrery_witness` files
+/// reports and has no gateway session; `orrery_persist_client` owns the
+/// gateway session and must not learn about witnessing. The two sit side by
+/// side on the dependency spine (D15), neither may reach for the other, and
+/// this crate is the only one that depends on both.
+///
+/// The exception stays narrow deliberately: this moves a value between two
+/// resources and decides nothing. The judgement about *whether* to file lives
+/// in `orrery_witness` (shadow mode, the audit window, the signing identity),
+/// and the judgement about how to send lives in `orrery_persist_client` (the
+/// bounded queue, the reliable lane).
+pub fn queue_filed_reports(
+    mut filed: MessageReader<ReportFiled>,
+    mut reports: ResMut<ReportQueue>,
+) {
+    for report in filed.read() {
+        reports.push(report.report.clone());
+    }
+}
+
+/// Installs [`queue_filed_reports`].
+///
+/// A `PluginGroup` can only add plugins, so this carries the wire the same way
+/// [`OrreryIslandBindingPlugin`] carries the other one. It is a member of
+/// [`OrreryClientPlugins`] rather than something a game adds, because a client
+/// with both the witness and the persist plugin and not this wire is a client
+/// whose reports are assembled, signed, and dropped on the floor.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct OrreryEscalationPlugin;
+
+impl Plugin for OrreryEscalationPlugin {
+    fn build(&self, app: &mut App) {
+        // Before the drain, so a report filed this frame leaves in it rather
+        // than waiting a frame per hop.
+        app.add_systems(
+            bevy_app::Update,
+            queue_filed_reports.before(orrery_persist_client::drain_reports),
+        );
+    }
+}
+
 /// Installs [`bind_island_membership`], ordered before its consumer.
 ///
 /// A `PluginGroup` can only add plugins, so the facade's one system needs one
@@ -226,6 +277,8 @@ impl Plugin for OrreryIslandBindingPlugin {
 /// 5. [`OrreryPredictPlugin`] — lightyear's client stack, per D8/D16.
 /// 6. [`WitnessPlugin<R>`] — the log stream and the discrepancy path.
 /// 7. [`OrreryPersistClientPlugin`] — the gateway session, uplink, area loader.
+/// 8. [`OrreryEscalationPlugin`] — this crate's other wire, from the witness's
+///    filed reports to the gateway's report queue.
 ///
 /// # What the host must drive
 ///
@@ -241,6 +294,15 @@ impl Plugin for OrreryIslandBindingPlugin {
 /// | [`ContactObservations`](orrery_authority::ContactObservations) | the physics step's contact report | contact-island weak claims: the planner sees an empty graph and proposes nothing (D7 §5) |
 /// | [`ContactTick::tick`](orrery_authority::ContactTick) | the universe tick that step ran on | every weak claim carries `ClaimBasis::Contact{tick: 0}` as its evidence, which the registrar's plausibility gate reads |
 /// | [`WitnessClock`](orrery_witness::plugin::WitnessClock) | the same universe tick | the repair-timeout sweep, which is the only check a subject that goes *silent* can trip (D10) |
+///
+/// One more resource is host-supplied and is *configuration* rather than
+/// per-frame state, so it is not in the table:
+/// [`WitnessIdentity`](orrery_witness::WitnessIdentity), the key a witness
+/// signs discrepancy reports with. Absent, the witness detects and counts and
+/// escalates nothing — filing is opt-in, and shadow mode
+/// ([`WitnessConfig::shadow_mode`](orrery_witness::WitnessConfig::shadow_mode))
+/// is on by default besides. No plugin here can invent it: `NetConfig`'s
+/// secret key is consumed into the iroh endpoint and never handed back.
 ///
 /// `ContactTick::now_ms` is **not** on that list, and neither is
 /// [`TickBridge`](orrery_predict::TickBridge): those are clocks rather than
@@ -312,6 +374,10 @@ where
             .add(OrreryPersistClientPlugin {
                 config: config.persist,
             })
+            // After both endpoints exist: the wire is between them, and
+            // ordering against `drain_reports` names a system the persist
+            // plugin registers.
+            .add(OrreryEscalationPlugin)
     }
 }
 

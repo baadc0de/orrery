@@ -48,6 +48,7 @@ pub mod latency;
 pub mod plugin;
 pub mod queue_store;
 pub mod replies;
+pub mod reports;
 pub mod uplink;
 
 pub use area::{order_nearest_first, sync_aoi_to_loader, AreaLoader, LoadedPage};
@@ -57,6 +58,7 @@ pub use gateway::{GatewayConfig, GatewaySession, GatewayState, SessionEvent};
 pub use intents::{IntentQueue, IntentStatus, IntentTicket, PredictedEffects};
 pub use latency::LatencyHistogram;
 pub use plugin::{OrreryPersistClientPlugin, PersistClientSet};
+pub use reports::{drain_reports, ReportOutcome, ReportQueue, DEFAULT_REPORT_QUEUE_CAPACITY};
 pub use uplink::UplinkScheduler;
 
 #[cfg(test)]

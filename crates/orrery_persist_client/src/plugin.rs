@@ -19,6 +19,7 @@ use crate::gateway::{
 };
 use crate::intents::{drain_intents, IntentQueue};
 use crate::replies::process_replies;
+use crate::reports::{drain_reports, ReportQueue};
 use crate::uplink::{flush_uplink, UplinkScheduler};
 
 /// The system set for the persist-client systems, so the rest of the stack can
@@ -45,6 +46,7 @@ impl Plugin for OrreryPersistClientPlugin {
             .init_resource::<UplinkScheduler>()
             .init_resource::<AreaLoader>()
             .insert_resource(queue)
+            .init_resource::<ReportQueue>()
             .init_resource::<UplinkSeq>()
             .add_message::<bevy_replicon::server::uplink::ComponentDiff>()
             .configure_sets(Update, PersistClientSet::Flush)
@@ -53,6 +55,10 @@ impl Plugin for OrreryPersistClientPlugin {
                 (
                     flush_uplink,
                     drain_intents,
+                    // Reports leave on the same lane and in the same set as
+                    // intents, and for the same reason: both are reliable
+                    // control traffic the game has already decided to send.
+                    drain_reports,
                     // The AOI wiring runs first so a crossing updates the
                     // loader's cell set before the driver issues the subscribe
                     // (D16: < 50 ms to first page-in). `sync_aoi_to_loader`
