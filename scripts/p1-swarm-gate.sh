@@ -44,18 +44,42 @@ if [[ ${1:-} == --self-test ]]; then
   # leg does not use it.
   legs="$(sed -n '/^readonly ROOT=/,$p' "$0" | grep -v '^[[:space:]]*#')"
   has() { grep -Fq -- "$1" <<<"$legs"; }
+  # And one record per `"$BIN"` invocation, continuations folded in. `has` can
+  # only say that a flag appears on *some* leg, and there are five of them: the
+  # checks that are about a particular leg have to read that leg. Measured
+  # 2026-08-17 — with `--witness` deleted from the witnessed hour below, `has
+  # '--impaired --witness'` still passed, because the conviction and control
+  # legs pair the same two flags on 8 peers for five minutes. The clause read as
+  # a guard on the hour and was a guard on nothing.
+  # awk rather than `sed -e :a ... ta`, which is GNU-only: BSD sed rejects a
+  # label or a branch followed by `;`, and the sibling P4 scripts run their
+  # self-tests on macOS and Windows runners. Same idiom everywhere is worth more
+  # than a shorter one here.
+  flat="$(awk '{ sub(/^[ \t]+/, ""); buf = buf $0
+                 if (buf ~ /\\$/) { sub(/\\$/, " ", buf); next }
+                 print buf; buf = "" }
+               END { if (buf != "") print buf }' <<<"$legs" \
+    | grep '^"\$BIN"' || true)"
+  [[ -n $flat ]] || die 'self-test: no harness invocations found; the leg parse has drifted'
   has '--peers 32' || die 'self-test: the criterion population is not 32'
   has '--seconds 3600' || die 'self-test: the criterion hour is not run'
   has '--min-cells 64' || die 'self-test: the ≥64-cell roam is not required'
   has '--late-join-at' || die 'self-test: the late-join check is absent'
   has '--impaired' || die 'self-test: the impaired link run is absent'
-  # The witnessed leg by its signature rather than by the bare `--witness`
-  # token. Nothing else here pairs impairment with the witness, and that pairing
-  # is what brings P4's three witnessing clauses to life: without `--witness`
-  # they are guarded by a false flag and pass by never being asked.
-  has '--impaired --witness' \
-    || die 'self-test: the witnessed impaired leg is absent; the P4 clauses are dead code without it'
-  has '--max-shed' || die 'self-test: the witnessed leg has lost its own shed allowance'
+  # The witnessed leg, identified as the criterion *hour* that runs a witness —
+  # the conviction and control legs are five simulated minutes on 8 peers and
+  # cannot stand in for it. Without `--witness` on this leg,
+  # `SwarmConfig.witnessing` is false and P4's three witnessing clauses are
+  # guarded by a false flag and pass by never being asked.
+  # `|| true` because a leg that has lost the flag is exactly what this is
+  # looking for, and under `set -e` an empty grep would exit 1 with no message.
+  witnessed="$(grep -F -- '--seconds 3600' <<<"$flat" | grep -F -- '--witness' || true)"
+  [[ -n $witnessed ]] \
+    || die 'self-test: the witnessed criterion hour is absent; the P4 clauses are dead code without it'
+  grep -Fq -- '--impaired' <<<"$witnessed" \
+    || die 'self-test: the witnessed hour runs a clean link; P4 measures the witness under impairment'
+  grep -Fq -- '--max-shed' <<<"$witnessed" \
+    || die 'self-test: the witnessed leg has lost its own shed allowance'
   # The conviction leg, by the flag that arms it. `--cheat` is what fields a
   # modified client, takes every witness out of shadow mode and turns the filed
   # reports over to an adjudicator; without it the six clauses of P4's demo

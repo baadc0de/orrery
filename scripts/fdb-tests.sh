@@ -133,16 +133,17 @@ check_log() {
 # ── Self-test ────────────────────────────────────────────────────────────────
 #
 # The same idiom as the P2 and P3 gates: prove the assertions still assert,
-# per-commit, on a runner with no cluster anywhere near it. Five synthetic logs
+# per-commit, on a runner with no cluster anywhere near it. Six synthetic logs
 # in the shape cargo and libtest actually emit — one healthy, one healthy but
-# colourised, and one for each way the tier can go dark.
+# colourised, and one for each way the tier can go dark: skipped, thin, a target
+# missing, and a target present having asserted nothing.
 self_test() {
   local tmp fixture rc failures=0
   tmp="$(mktemp -d)"
   trap 'rm -rf "$tmp"' RETURN
 
   emit_log() {
-    local out="$1" skip="$2" per="$3" omit="${4:-}"
+    local out="$1" skip="$2" per="$3" omit="${4:-}" zero="${5:-}"
     : > "$out"
     {
       echo "   Compiling orrery_persistd v0.1.0"
@@ -154,7 +155,11 @@ self_test() {
         [[ "$t" == "$omit" ]] && continue
         echo "     Running tests/${t}.rs (target/debug/deps/${t}-2)"
         [[ "$skip" == "skip" ]] && echo "skipping: ORRERY_FDB_CLUSTER_FILE is absent"
-        echo "test result: ok. ${per} passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.00s"
+        # `$zero` is the target that ran and asserted nothing — a compiled-away
+        # `#[cfg]` block, or a file whose tests all moved out of it.
+        local n="$per"
+        [[ "$t" == "$zero" ]] && n=0
+        echo "test result: ok. ${n} passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.00s"
       done
     } >> "$out"
   }
@@ -184,9 +189,16 @@ self_test() {
   # 40 apiece so the six remaining targets still clear the floor: this case has
   # to fail because fence_split is missing, not because the total is thin.
   fixture="$tmp/absent.log";  emit_log "$fixture" none 40 fence_split; expect "a missing fdb target is red" fail "$fixture"
+  # A target that ran and asserted nothing. `check_log` has always refused this
+  # — "a target that is present with a zero count is as dark as one that never
+  # ran" — and until now no fixture exercised the clause: measured 2026-08-17,
+  # relaxing `(( count > 0 ))` to `(( count >= 0 ))` left all five cases green.
+  # 60 apiece keeps the total at 480, well over the floor, so this can only be
+  # red for the reason it names.
+  fixture="$tmp/silent.log";  emit_log "$fixture" none 60 '' fence_split; expect "a target that ran zero tests is red" fail "$fixture"
 
   (( failures == 0 )) || die "$failures self-test case(s) failed"
-  echo "fdb-tests self-test: 5/5"
+  echo "fdb-tests self-test: 6/6"
 }
 
 # ── Entry ────────────────────────────────────────────────────────────────────

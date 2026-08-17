@@ -227,6 +227,20 @@ self_test() {
   diff <(echo "$view") <(echo "$doubled") >/dev/null \
     || die "self-test: concatenating a shard with itself changed the totals; run_key dedup is not applied"
 
+  # The dedup key is the *whole* run identity and not the seed inside it. This
+  # is the one clause the structural half genuinely cannot see: `has '.identity'`
+  # matches `.identity.seed` too, measured 2026-08-17 — narrowing the key that
+  # far left every case above green. It matters because the three platform legs
+  # deliberately run the same seed on the same night
+  # (scripts/p4-accumulate.sh), so a seed-only key would bank whichever runner
+  # finished first and silently drop the other two platforms' hours. Last,
+  # because it adds a line the shard comparison above is holding still.
+  before=$(st_lines)
+  st_bank 1 '.identity.target = "x86_64-pc-windows-msvc"' \
+    || die 'self-test: the same seed run on a second platform was refused'
+  (( $(st_lines) == before + 1 )) \
+    || die 'self-test: one seed on two targets banked once; the dedup key is not the run identity'
+
   rm -rf "$dir"
   trap - EXIT
   echo "$NAME: self-test passed"
