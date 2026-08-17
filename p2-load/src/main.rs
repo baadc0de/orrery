@@ -1254,8 +1254,8 @@ impl ManifestInventory {
         // the array is what the shipped seeder actually produces (verified
         // against `scenarios/p2demo.toml --profile ci`), and the JSONL form is
         // what the document specifies and what earlier fixtures use.
-        let text = std::fs::read_to_string(path)
-            .with_context(|| format!("read {}", path.display()))?;
+        let text =
+            std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
         if text.trim_start().starts_with('[') {
             let entries: Vec<ManifestEntry> = serde_json::from_str(&text)
                 .with_context(|| format!("parse {} as a JSON manifest array", path.display()))?;
@@ -1614,7 +1614,11 @@ impl Rig<'_> {
                                 }
                             }
                             other => {
-                                tracing::debug!(session, ?other, "lease control during claim phase");
+                                tracing::debug!(
+                                    session,
+                                    ?other,
+                                    "lease control during claim phase"
+                                );
                             }
                         }
                     }
@@ -1652,10 +1656,7 @@ impl Rig<'_> {
         tracing::info!(
             leases = self.leases.len(),
             claim_secs = elapsed.as_secs_f64(),
-            rate_limited = denials
-                .get("RateLimited")
-                .copied()
-                .unwrap_or_default(),
+            rate_limited = denials.get("RateLimited").copied().unwrap_or_default(),
             "claim phase complete"
         );
         if self.emit_json {
@@ -1899,7 +1900,11 @@ impl Rig<'_> {
                     .get(&intent.intent_id)
                     .copied()
                     .unwrap_or((intent.intent_id as usize) % sessions);
-                send_msg(&self.sessions[session], &GatewayMsg::SubmitIntent { intent }).await;
+                send_msg(
+                    &self.sessions[session],
+                    &GatewayMsg::SubmitIntent { intent },
+                )
+                .await;
             }
 
             // ── Telemetry drain (bounded-memory histograms → JSONL) ──────
@@ -2179,14 +2184,16 @@ impl Rig<'_> {
                         self.leases.remove(&entity);
                         stats.leases_lost += 1;
                     }
-                    tracing::warn!(session, ?entity, ?lease_id, ?reason, "lease expired mid-run");
-                }
-                other => {
                     tracing::warn!(
                         session,
-                        ?other,
-                        "unexpected lease control on a rig session"
+                        ?entity,
+                        ?lease_id,
+                        ?reason,
+                        "lease expired mid-run"
                     );
+                }
+                other => {
+                    tracing::warn!(session, ?other, "unexpected lease control on a rig session");
                 }
             },
             GatewayReply::InterestAck { epoch, reason } => {
