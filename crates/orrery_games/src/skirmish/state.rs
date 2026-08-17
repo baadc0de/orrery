@@ -55,9 +55,14 @@ pub struct Craft {
     /// Ticks until the weapon may fire again.
     pub cooldown: u16,
     /// Shots fired, ever. Monotone: the fire-rate check reads it.
+    ///
+    /// Rolls, not landings. Whether a shot reached anything is resolved in the
+    /// *target's* step, which this craft's own replay never runs, so counting
+    /// hits here would be counting something this entity cannot know alone.
     pub shots: u32,
-    /// Damage dealt, ever. Monotone: this is what makes an inflated roll
-    /// adjudicable at the attacker.
+    /// Damage rolled, ever. Monotone: this is what makes an inflated roll
+    /// adjudicable at the attacker. Rolled rather than landed, for the same
+    /// reason [`shots`](Craft::shots) is.
     pub damage_dealt: u64,
 }
 

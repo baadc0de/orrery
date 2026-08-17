@@ -48,6 +48,21 @@ fn fire_at(target: u64) -> Order {
     }
 }
 
+/// Damage as the [`Skirmish::deliver`] bridge would produce it: the attacker's
+/// identity, and the position and archetype the target derives reach from.
+fn damage_from(from: u64, archetype: Archetype, x_mm: i64, amount: i32) -> Order {
+    Order::Damage {
+        amount,
+        from: PersistId::new(from),
+        from_pos: QPos {
+            x: x_mm,
+            y: 0,
+            z: 0,
+        },
+        from_archetype: archetype,
+    }
+}
+
 fn island() -> &'static Scenario {
     SCENARIOS
         .iter()
@@ -107,7 +122,12 @@ fn the_weapon_comes_back_exactly_on_its_cooldown() {
 }
 
 #[test]
-fn a_shot_beyond_reach_is_not_a_shot() {
+fn a_shot_beyond_reach_lands_on_nobody() {
+    // Reach is enforced in the *target's* step, not the shooter's. The shot
+    // is real — the round left the barrel, the roll is in the shooter's own
+    // state, the weapon is hot — and it simply never arrives. Resolving it
+    // the other way would mean the shooter read the target's live position,
+    // which the single-entity world an adjudicator builds cannot supply.
     let reach = Archetype::Interceptor.limits().range_mm;
     let mut world = world(&[
         (1, craft_at(Archetype::Interceptor, 0)),
@@ -117,15 +137,27 @@ fn a_shot_beyond_reach_is_not_a_shot() {
         .step_entity(PersistId::new(1), Tick::new(T), &[fire_at(2)])
         .expect("entity 1 is installed");
 
-    assert!(
-        outcome.events.is_empty(),
-        "out of reach, so nothing happens"
+    let shooter = world.state(PersistId::new(1)).unwrap();
+    assert_eq!(shooter.shots, 1, "the shooter fired");
+    assert_eq!(
+        shooter.cooldown,
+        Archetype::Interceptor.limits().cooldown_ticks,
+        "and paid the cooldown for it, in reach or not"
     );
-    let craft = world.state(PersistId::new(1)).unwrap();
-    assert_eq!(craft.shots, 0);
-    // And crucially the weapon is not on cooldown: a refused order costs
-    // nothing, so a craft that keeps asking fires the instant it closes.
-    assert_eq!(craft.cooldown, 0);
+
+    let (target, damage) = Skirmish::honest()
+        .deliver(outcome.events.first().expect("a shot was emitted"))
+        .expect("damage is addressed to its target");
+    let before = world.state(target).unwrap().clone();
+    world
+        .step_entity(target, Tick::new(T + 1), &[damage])
+        .expect("entity 2 is installed");
+    let after = world.state(target).unwrap();
+    assert_eq!(
+        (after.hull, after.shield),
+        (before.hull, before.shield),
+        "out of reach, so nothing arrives"
+    );
 }
 
 #[test]
@@ -146,10 +178,7 @@ fn a_wreck_neither_steers_nor_shoots_but_still_takes_hits() {
                     pitch_urad: 0,
                 },
                 fire_at(2),
-                Order::Damage {
-                    amount: 10,
-                    from: PersistId::new(2),
-                },
+                damage_from(2, Archetype::Interceptor, 100_000, 10),
             ],
         )
         .expect("entity 1 is installed");
@@ -172,10 +201,12 @@ fn shields_absorb_before_hull_and_hull_floors_at_zero() {
         .step_entity(
             entity,
             Tick::new(T),
-            &[Order::Damage {
-                amount: limits.max_shield + 10,
-                from: PersistId::new(2),
-            }],
+            &[damage_from(
+                2,
+                Archetype::Interceptor,
+                100_000,
+                limits.max_shield + 10,
+            )],
         )
         .expect("entity 1 is installed");
     let craft = world.state(entity).unwrap();
@@ -186,10 +217,12 @@ fn shields_absorb_before_hull_and_hull_floors_at_zero() {
         .step_entity(
             entity,
             Tick::new(T + 1),
-            &[Order::Damage {
-                amount: limits.max_hull * 10,
-                from: PersistId::new(2),
-            }],
+            &[damage_from(
+                2,
+                Archetype::Interceptor,
+                100_000,
+                limits.max_hull * 10,
+            )],
         )
         .expect("entity 1 is installed");
     assert_eq!(world.state(entity).unwrap().hull, 0, "never negative");
@@ -215,13 +248,17 @@ fn every_effect_names_who_caused_it() {
     let shot = world
         .step_entity(PersistId::new(1), Tick::new(T), &[fire_at(2)])
         .expect("entity 1 is installed");
-    let Some(Outcome::DamageDealt {
-        attacker,
-        target,
-        amount,
-    }) = shot.events.first().cloned()
+    let Some(
+        event @ Outcome::DamageDealt {
+            attacker,
+            target,
+            amount,
+            attacker_pos,
+            attacker_archetype,
+        },
+    ) = shot.events.first().cloned()
     else {
-        panic!("a cruiser at 100 m should have hit: {:?}", shot.events)
+        panic!("a cruiser should have fired: {:?}", shot.events)
     };
     assert_eq!(
         attacker,
@@ -229,15 +266,17 @@ fn every_effect_names_who_caused_it() {
         "the shooter signs its own shot"
     );
     assert_eq!(target, PersistId::new(2));
+    // Where it was fired from and what fired it, because that is what the
+    // target resolves reach against — and deriving reach from the archetype
+    // rather than trusting a scalar is what keeps the attacker from granting
+    // itself a longer gun.
+    assert_eq!(attacker_pos, QPos { x: 0, y: 0, z: 0 });
+    assert_eq!(attacker_archetype, Archetype::Cruiser);
 
     // And the damage arrives carrying the same name, which is what lets the
     // victim's own log say who killed it.
     let delivered = Skirmish::honest()
-        .deliver(&Outcome::DamageDealt {
-            attacker,
-            target,
-            amount,
-        })
+        .deliver(&event)
         .expect("damage is delivered to its target");
     assert_eq!(
         delivered,
@@ -245,7 +284,9 @@ fn every_effect_names_who_caused_it() {
             PersistId::new(2),
             Order::Damage {
                 amount,
-                from: PersistId::new(1)
+                from: PersistId::new(1),
+                from_pos: QPos { x: 0, y: 0, z: 0 },
+                from_archetype: Archetype::Cruiser,
             }
         )
     );

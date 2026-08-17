@@ -70,5 +70,7 @@ pub mod scenario;
 pub mod skirmish;
 
 pub use game::{for_each_game, Game, GameMeta, GameVisitor, Tamper, CATALOGUE};
-pub use scenario::{adjudicate, play, Divergence, Flag, Play, Scenario, SCENARIOS};
+pub use scenario::{
+    adjudicate, adjudicate_isolated, play, Divergence, Flag, Play, Scenario, SCENARIOS,
+};
 pub use skirmish::Skirmish;

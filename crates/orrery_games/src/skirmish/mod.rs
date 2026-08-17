@@ -33,10 +33,15 @@
 //!
 //! 1. The weapon cools by one tick.
 //! 2. Orders apply in log order (VC-2), never re-sorted: thrust along the
-//!    facing *then* turn; fire if the weapon is ready and the target is alive,
-//!    present and in reach; absorb damage into shield, then hull.
+//!    facing *then* turn; fire if the weapon is ready; absorb damage into
+//!    shield, then hull, if it was fired from inside its own reach.
 //! 3. Speed is clamped to the archetype ceiling, drag applies, position
 //!    integrates, everything continuous snaps back onto the lattice (VC-7).
+//!
+//! Step 2 splits a shot across two entities' steps on purpose. The attacker
+//! decides *that* it fired and how hard; the target decides whether the shot
+//! reached it. Neither reads the other's live state, which is what lets a
+//! witness re-execute either one alone — see [`order`].
 
 pub mod archetype;
 pub mod invariants;
@@ -93,7 +98,7 @@ const GOLDEN_ANGLE_URAD: i64 = 2_399_963;
 /// rules, and a silent rules change would present as a determinism failure
 /// rather than as what it is.
 pub const SKIRMISH_RULESET: RulesetId = RulesetId {
-    version: 1,
+    version: 2,
     digest: [0x5C; 32],
 };
 
@@ -260,22 +265,19 @@ impl Ruleset for Skirmish {
                     if cooldown > 0 && self.honours_cooldown() {
                         continue;
                     }
-                    // Reading the target closes the input set: the read is
-                    // recorded, so a replay never needs the neighbour's live
-                    // state, and an authority that fabricates neighbour state
-                    // to justify a hit produces evidence against itself.
-                    let Some(other) = view.neighbor(*target) else {
-                        continue;
-                    };
-                    if !other.alive()
-                        || origin.distance_squared(other.pos) > reach_sq(limits.range_mm)
-                    {
-                        continue;
-                    }
+                    // Nothing about the target is read. The adjudicator holds
+                    // one entity — `ReplayHarness::load_claimed_snapshot`
+                    // installs the state its claim commits to and no other —
+                    // so a neighbour read here would resolve one way under
+                    // play and another under replay, and an honest craft would
+                    // hash-mismatch. Whether the shot connects is the target's
+                    // question, answered on the `Damage` arm below from what
+                    // this event carries.
+                    //
                     // VC-3/VC-5: the roll is integer and seeded, so the damage
                     // a shot deals is bit-identical on every platform. Drawn
-                    // only when the shot actually happens, so the RNG stream
-                    // records what was fired rather than what was asked for.
+                    // whenever the weapon fires, which is now the only thing
+                    // the attacker's side decides.
                     let roll = rng.next_u32() % limits.damage_spread.max(1);
                     let amount = self.damage(
                         i32::try_from(limits.damage_base.saturating_add(roll)).unwrap_or(i32::MAX),
@@ -287,10 +289,29 @@ impl Ruleset for Skirmish {
                         attacker: me,
                         target: *target,
                         amount,
+                        attacker_pos: origin,
+                        attacker_archetype: archetype,
                     });
                 }
 
-                Order::Damage { amount, from } => {
+                Order::Damage {
+                    amount,
+                    from,
+                    from_pos,
+                    from_archetype,
+                } => {
+                    // Reach, resolved where both sides of the comparison are
+                    // own state: this craft's position at the top of its tick,
+                    // and the attacker's, which arrived in the event. The
+                    // reach itself is derived from the attacker's *archetype*
+                    // rather than read off the wire, so a tampered build
+                    // cannot grant itself a longer gun — the archetype is
+                    // hashed into the attacker's own state and `value-range`
+                    // refuses a craft that relabels it.
+                    let reach = from_archetype.limits().range_mm;
+                    if origin.distance_squared(*from_pos) > reach_sq(reach) {
+                        continue;
+                    }
                     // Integer only, shields absorbing first, hull floored at
                     // zero — a negative hull would be a value-range violation
                     // manufactured by the rules themselves.
@@ -406,11 +427,15 @@ impl Game for Skirmish {
                 attacker,
                 target,
                 amount,
+                attacker_pos,
+                attacker_archetype,
             } => Some((
                 *target,
                 Order::Damage {
                     amount: *amount,
                     from: *attacker,
+                    from_pos: *attacker_pos,
+                    from_archetype: *attacker_archetype,
                 },
             )),
             // A craft's death is news about itself. Nothing consumes it: the
