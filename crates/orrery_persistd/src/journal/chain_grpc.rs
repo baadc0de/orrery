@@ -430,6 +430,7 @@ struct FollowerReplica {
     journal: Arc<Journal>,
     state: Mutex<FollowerState>,
     sessions_opened: AtomicU64,
+    duplicate_batches: AtomicU64,
     fail_next_ack: AtomicBool,
 }
 
@@ -454,6 +455,7 @@ impl FollowerReplica {
                 cursor,
             }),
             sessions_opened: AtomicU64::new(0),
+            duplicate_batches: AtomicU64::new(0),
             fail_next_ack: AtomicBool::new(false),
         })
     }
@@ -572,6 +574,12 @@ impl FollowerReplica {
                     ));
                 }
             }
+            // Every row of this batch was already durable and matched its
+            // provenance, so the append is a no-op replay — docs/13 §6's
+            // duplicate batch count. It is expected during reconnect and
+            // alarming above reconnect noise, which is only distinguishable
+            // if the two are counted separately.
+            self.duplicate_batches.fetch_add(1, Ordering::Relaxed);
             return Ok(progress(state.cursor));
         }
         if request.batch_seq != expected_seq
@@ -833,6 +841,7 @@ impl std::fmt::Debug for ChainGrpcServer {
             .debug_struct("ChainGrpcServer")
             .field("addr", &self.addr)
             .field("sessions_opened", &self.sessions_opened())
+            .field("duplicate_batches", &self.duplicate_batches())
             .finish_non_exhaustive()
     }
 }
@@ -848,9 +857,25 @@ impl ChainGrpcServer {
     ///
     /// This diagnostic is useful for asserting that batches reuse one live
     /// stream and that failure recovery establishes exactly one replacement.
+    ///
+    /// It does **not** measure topology flap. A primary's watermark probe is
+    /// [`GrpcChainTransport::follower_watermark`], which delegates to
+    /// `reconnect`, and every reconnect opens a session — so a chain that is
+    /// merely retrying a failed push drives this counter at the retry rate
+    /// (~100/s), with no stream having been lost at all.
     #[must_use]
     pub fn sessions_opened(&self) -> u64 {
         self.replica.sessions_opened.load(Ordering::Relaxed)
+    }
+
+    /// Batches the follower deduped against its durable provenance index
+    /// instead of storing again — docs/13 §6's duplicate batch count.
+    ///
+    /// Counted only on the fully-matching idempotent replay: a retry whose
+    /// provenance disagrees is a failed precondition, not a duplicate.
+    #[must_use]
+    pub fn duplicate_batches(&self) -> u64 {
+        self.replica.duplicate_batches.load(Ordering::Relaxed)
     }
 
     /// Deterministically close all current HTTP/2 connections while continuing
@@ -1565,6 +1590,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(decode_progress(reply).1, Some(Lsn::new(0, 10)));
+        assert_eq!(replica.duplicate_batches.load(Ordering::Relaxed), 0);
         let retry = replica
             .append(batch_request(&id, nonce, 0, None, &[record(10, 1)]))
             .await
@@ -1578,6 +1604,10 @@ mod tests {
                 .len(),
             1
         );
+        // The dedupe is the docs/13 §6 duplicate batch signal, and it is only
+        // separable from reconnect noise if the replay is counted where it
+        // happens rather than inferred from the unchanged record count.
+        assert_eq!(replica.duplicate_batches.load(Ordering::Relaxed), 1);
         journal.close().await.unwrap();
     }
 
