@@ -108,7 +108,10 @@ jobs:
       - uses: actions/checkout@v7
       - name: Install the pinned toolchain
         run: rustup show active-toolchain || rustup toolchain install
-      - run: cargo fmt --all --check
+      # Every workspace, not just the root one: `cargo fmt --all` stops at the
+      # workspace boundary and the seven standalone tools each declare their
+      # own. scripts/check.sh holds the list.
+      - run: scripts/check.sh fmt
 
   clippy:
     name: clippy
@@ -157,30 +160,10 @@ jobs:
           key: clippy-${{ runner.os }}-${{ hashFiles('Cargo.toml', 'crates/*/Cargo.toml', 'vendor/*/Cargo.toml', 'rust-toolchain.toml') }}
           restore-keys: clippy-${{ runner.os }}-
 
-      # Vendored crates are excluded: vendor/bevy_replicon carries ~360 findings
-      # that are upstream's to fix, and holding third-party code to this repo's
-      # lint bar would mean either patching a vendored tree or turning the gate
-      # off entirely.
-      #
-      # `--no-deps` is load-bearing, not decoration. The vendored crates are the
-      # only ones that set `[lints] workspace = true`, so the pedantic/nursery
-      # levels in [workspace.lints] apply to them through their own manifests —
-      # `--exclude` drops them from *selection* but they are still path
-      # dependencies, and clippy would lint them anyway. `--no-deps` is what
-      # confines the run to the selected packages.
-      - name: clippy (default features)
-        run: |
-          cargo clippy --workspace --all-targets --no-deps \
-            --exclude bevy_replicon \
-            --exclude aeronet_iroh \
-            --exclude aeronet_tokio_runtime \
-            -- -D warnings
-
-      # The fdb feature compiles code the default build never sees. It went
-      # unlinted long enough for orrery_seed/tests/fdb_gates.rs to stop
-      # compiling entirely, so it gets its own pass.
-      #
-      # It needs the client package even though clippy never links: the
+      # The second clippy pass covers the `fdb` feature, which compiles code the
+      # default build never sees — it went unlinted long enough for
+      # orrery_seed/tests/fdb_gates.rs to stop compiling entirely. That pass
+      # needs the client package even though clippy never links: the
       # `foundationdb-gen` build does `include_bytes!` on
       # /usr/include/foundationdb/fdb.options, so the header is a *compile*
       # input. No server here — running the fdb tests against a real cluster is
@@ -190,11 +173,11 @@ jobs:
         if: runner.environment == 'github-hosted'
         uses: ./.github/actions/foundationdb
 
-      - name: clippy (fdb feature)
-        run: |
-          cargo clippy -p orrery_persistd -p orrery_seed --all-targets --no-deps \
-            --features orrery_persistd/fdb,orrery_seed/fdb \
-            -- -D warnings
+      # Both passes, and the `--exclude`/`--no-deps` reasoning that makes them
+      # mean something, live in scripts/check.sh so this job is reproducible
+      # locally with one command.
+      - name: clippy (default features, then the fdb feature)
+        run: scripts/check.sh clippy
 
   gates:
     name: static gates
@@ -226,41 +209,6 @@ jobs:
           key: gates-${{ runner.os }}-${{ hashFiles('Cargo.toml', 'crates/*/Cargo.toml', 'vendor/*/Cargo.toml', 'rust-toolchain.toml') }}
           restore-keys: gates-${{ runner.os }}-
 
-      # docs/06-verifiable-core.md §8's static gates.
-      - name: verifiable-core static gates
-        run: scripts/core-gates.sh
-
-      # The P2 and P3 harnesses need FoundationDB and a built cluster, so they
-      # cannot run per-commit — the real runs are in nightly.yml. Their
-      # `--self-test` modes exist precisely for this: they assert the scripts
-      # still contain the stages that make them proofs, catching a regression to
-      # a harness that no longer proves its criterion.
-      - name: P2 kill-9 gate self-test
-        run: scripts/p2-kill9-gate.sh --self-test
-      - name: P3 island gate self-test
-        run: scripts/p3-island-gate.sh --self-test
-
-      # P1's harness needs no cluster and its hour is simulated, so unlike the
-      # two above it *can* run for real — it does, nightly. Per-commit it gets
-      # the same structural self-test, which is the cheap half.
-      - name: P1 swarm gate self-test
-        run: scripts/p1-swarm-gate.sh --self-test
-
-      # The assertion logic in scripts/fdb-tests.sh — no `skipping:` line, a
-      # floor on executed tests, every fdb-gated target contributing — is what
-      # keeps nightly's fdb job from going green on a cluster that isn't there.
-      # It runs against synthetic logs, so it needs no cluster of its own and
-      # belongs with the other self-tests.
-      - name: fdb test runner self-test
-        run: scripts/fdb-tests.sh --self-test
-
-      # ── The standalone tools ────────────────────────────────────────────────
-      #
-      # Each of these declares its own `[workspace]`, so `cargo test
-      # --workspace` in the `test` job does not reach any of them and nothing
-      # else here would notice one rotting. `p4-streams-bench` was the only one
-      # wired up; the rest carry 48 more tests between them.
-      #
       # `p2-load` takes `orrery_persistd` with `features = ["fdb"]`
       # (p2-load/Cargo.toml), so it needs libfdb_c and the headers to build at
       # all — the client package only, no cluster: its tests are unit tests.
@@ -269,38 +217,13 @@ jobs:
         if: runner.environment == 'github-hosted'
         uses: ./.github/actions/foundationdb
 
-      - name: P1 swarm harness tests
-        working-directory: p1-swarm
-        run: cargo test
-
-      - name: P2 load rig tests
-        working-directory: p2-load
-        run: cargo test
-
-      - name: P2 dashboard tests
-        working-directory: p2-dashboard
-        run: cargo test
-
-      # `p4-streams-bench` is a measurement, not a gate — its figures are in its
-      # README and the channel-policy decision they justify is in
-      # docs/02-networking.md §7. What CI owes it is that it still builds and
-      # its unit tests still pass: it has its own workspace, so nothing else
-      # here would notice it rotting.
-      - name: P4 streams benchmark builds and self-tests
-        working-directory: p4-streams-bench
-        run: cargo test
-
-      # Compile checks only, and deliberately so: `p0-nat-test`, `p0-dashboard`
-      # and `p3-island` have zero tests between them. `cargo test` on any of
-      # them would be a build dressed up as a gate, which reads as coverage
-      # that does not exist. `p3-island`'s behaviour is asserted by the nightly
-      # island gate, and the two p0 tools by the NAT lab they were written for.
-      - name: The test-free tools still compile
-        run: |
-          set -euo pipefail
-          (cd p0-nat-test && cargo check --all-targets)
-          (cd p0-dashboard && cargo check --all-targets)
-          (cd p3-island && cargo check --all-targets)
+      # docs/06-verifiable-core.md §8's static gates, the four harness
+      # `--self-test` modes, and the standalone tools' own suites. Which of the
+      # eight workspaces gets `cargo test` and which gets `cargo check`, and why,
+      # is in scripts/check.sh's lane table — the same table its `--self-test`
+      # holds against the filesystem so a new workspace cannot appear unchecked.
+      - name: static gates, harness self-tests, standalone tools
+        run: scripts/check.sh gates
 
   test:
     name: workspace tests
@@ -351,11 +274,7 @@ jobs:
       # workspace's feature unification (`bevy/serialize` is off, so
       # `Transform: Serialize` is unsatisfied). That is upstream's build to fix,
       # and it is not what this repo is testing.
-      - run: |
-          cargo test --workspace \
-            --exclude bevy_replicon \
-            --exclude aeronet_iroh \
-            --exclude aeronet_tokio_runtime
+      - run: scripts/check.sh test
 
   determinism:
     name: determinism (${{ matrix.label }})

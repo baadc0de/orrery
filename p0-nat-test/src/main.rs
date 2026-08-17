@@ -30,7 +30,9 @@ use tracing_subscriber::EnvFilter;
 
 use crate::cli::Cli;
 use crate::net::EndpointHandle;
-use crate::session::{HostHandle, MeshHandle, PathState, SessionEvent, SessionHandle, SessionOptions};
+use crate::session::{
+    HostHandle, MeshHandle, PathState, SessionEvent, SessionHandle, SessionOptions,
+};
 use crate::telemetry::{emit, TelemetryContext};
 
 /// A running test session: a host accepting connections, a peer dialing one,
@@ -112,19 +114,11 @@ async fn main() -> Result<()> {
                 .iter()
                 .position(|id| *id == endpoint.node_id())
                 .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "local NodeId not found in roster; pass --mesh-index"
-                    )
+                    anyhow::anyhow!("local NodeId not found in roster; pass --mesh-index")
                 })?,
         };
         let n = roster.len();
-        let mesh = MeshHandle::spawn(
-            endpoint.clone(),
-            roster,
-            self_index,
-            options,
-            tx.clone(),
-        );
+        let mesh = MeshHandle::spawn(endpoint.clone(), roster, self_index, options, tx.clone());
         let ctx = TelemetryContext {
             node: endpoint.node_id(),
             role: "mesh",
@@ -194,7 +188,15 @@ async fn run_event_loop(
                     None
                 };
                 if last_path.get(peer) != Some(&Some(path.clone())) {
-                    emit(ctx, peer, &SessionEvent::Path { peer, path: path.clone() }, ttd_ms);
+                    emit(
+                        ctx,
+                        peer,
+                        &SessionEvent::Path {
+                            peer,
+                            path: path.clone(),
+                        },
+                        ttd_ms,
+                    );
                     last_path[peer] = Some(path);
                 }
             }

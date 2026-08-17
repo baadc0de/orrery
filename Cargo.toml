@@ -27,6 +27,16 @@ members = [
 # members, while still path-depending on `orrery_protocol` and
 # `orrery_persist_client`. Excluded here so a workspace-level command does
 # not try to build them as members.
+#
+# This list is documentation, not mechanism. `members` above is explicit —
+# no globs — and each tool declares its own `[workspace]`, either of which is
+# already enough to keep cargo from adopting it. `p4-streams-bench` went four
+# months absent from this list with no consequence at all, which is the proof:
+# its omission was cosmetic, not a bug. It is listed now so that the seven
+# standalone tools read the same here as they do in `scripts/check.sh`'s lane
+# table, which is the list that actually governs what gets checked — and whose
+# `--self-test` holds itself against the filesystem rather than against this
+# file.
 exclude = [
     "p0-nat-test",
     "p0-dashboard",
@@ -34,6 +44,7 @@ exclude = [
     "p2-dashboard",
     "p3-island",
     "p1-swarm",
+    "p4-streams-bench",
 ]
 
 # Pinned versions per D14 (docs/adr/0014-pinned-versions.md), ecosystem as of Aug 2026.

@@ -92,7 +92,81 @@ and the feature set.
 modes, the workspace test suite, the standalone tools' own test suites, and the
 cross-platform determinism matrix.
 
-Five things about it are worth knowing before you change anything it touches.
+### Running it here: `scripts/check.sh`
+
+Four of those jobs — `fmt`, `clippy`, `gates`, `test` — have no command bodies
+of their own any more. They install a toolchain, apt packages and the
+FoundationDB client, restore a cache, set the sccache wrapper, and then invoke
+one lane of `scripts/check.sh`. So the way to find out whether a change passes
+is to run it, not to push and wait:
+
+```
+./scripts/check.sh              # every lane, in CI's order
+./scripts/check.sh clippy       # one lane, exactly the commands the job runs
+./scripts/check.sh --list       # what a lane would run, without running it
+./scripts/check.sh --self-test  # the lane table still matches the filesystem
+./scripts/check.sh doctor       # delegates to dev-cache.sh: is sccache working?
+```
+
+**Scope the claim, because overclaiming it is how it stops being trusted.**
+The script is the body of those four jobs and nothing else. `determinism` and
+`determinism-verdict` keep four more cargo commands — a cross-platform matrix
+is not something one machine can reproduce — and `nightly.yml` carries six
+cargo invocations of its own plus the four gate scripts it runs *for real*,
+including the two heavy harnesses that need an FDB cluster and eight peer
+processes. Neither workflow is reproduced here.
+
+**Measured, on the shared 16-thread box at `CARGO_BUILD_JOBS=3` with two other
+agents building concurrently: 13 min 50 s** into a fresh worktree — empty
+`target/` directories in all eight workspaces, warm sccache. The second run,
+fully warm and with nothing changed, was **78 s**: `fmt` 3 s, `clippy` 1 s,
+`gates` 10 s, `test` 64 s. So the honest shape of it is that the first run in a
+new worktree costs a quarter of an hour and every run after it costs a minute,
+and `fmt` costs 3 s either way — run that one before every commit regardless.
+
+### Eight workspaces, and only one of them is "the" workspace
+
+`cargo test --workspace` reaches the root workspace. Each standalone tool
+declares its own `[workspace]` table, so it reaches none of *them* — three red
+CIs in one week came from that blind spot. The inventory, which is also
+`scripts/check.sh`'s lane table:
+
+| Workspace | Role in the lanes |
+|---|---|
+| `.` (root, 14 first-party crates + 3 vendored) | `clippy` and `test` lanes; `fmt` like any other. 1820 tests |
+| `p1-swarm` | `cargo test` in `gates` — 43 tests |
+| `p2-load` | `cargo test` in `gates` — 28 tests |
+| `p2-dashboard` | `cargo test` in `gates` — 9 tests |
+| `p4-streams-bench` | `cargo test` in `gates` — 7 tests |
+| `p0-nat-test` | `cargo check --all-targets` — no tests |
+| `p0-dashboard` | `cargo check --all-targets` — no tests |
+| `p3-island` | `cargo check --all-targets` — no tests; asserted by the nightly island gate |
+
+The four tool suites are 87 tests between them, which is the number that would
+go unrun if the `gates` lane stopped visiting them.
+
+`--self-test` compares that table against the filesystem — every directory
+whose `Cargo.toml` declares `[workspace]` must appear in it — so a ninth
+workspace cannot be added and silently go unchecked. It is a two-source check
+by construction: the table cannot match itself.
+
+**`fmt` is where this actually bit.** `cargo fmt --all` means "every member of
+*this* workspace", so the root-only invocation the workflow used to run reached
+zero of the 27 `.rs` files under the seven tools. Widening it found exactly one
+dirty workspace, `p0-nat-test`. Note the flip side at the root: the three
+vendored crates *are* root members, so `cargo fmt --all` holds `vendor/` to
+default rustfmt even though clippy deliberately excludes it.
+
+**`CARGO_TARGET_DIR` is never exported by the script.** An already-set value
+always wins, and `--isolate` (per-lane directories, local use only) is opt-in.
+Two reasons, both live: each pinned self-hosted runner keeps one warm `target/`
+for its one job, and relocating it makes the first post-merge run cold on all
+three; and an agent harness sets one per task, so an unconditional export would
+collapse isolated lanes onto a single exclusively-locked directory — they would
+queue, not merely share.
+
+Five things about the workflow itself are worth knowing before you change
+anything it touches.
 
 **`clippy` is enforced at `-D warnings`, over two feature sets.** The default
 build and the `fdb` build compile different code, and the `fdb` half went
@@ -115,10 +189,10 @@ mechanism. That is backwards, and adopting the table wholesale is still its own
 piece of work.
 
 But do not read it as "no lint levels apply to `crates/*`", because one of them
-does and it bites. Thirteen of the fourteen first-party crates set
-`#![warn(missing_docs)]` in their own `lib.rs` — every one except
-`orrery_conformance` — and CI runs `clippy --workspace --all-targets --no-deps
--- -D warnings`, which promotes that warning to an error. **An undocumented
+does and it bites. All fourteen first-party crates set
+`#![warn(missing_docs)]` in their own `lib.rs`, and CI runs `clippy --workspace
+--all-targets --no-deps -- -D warnings`, which promotes that warning to an
+error. **An undocumented
 public item fails CI today.** What is genuinely unadopted is the rest:
 `pedantic`, `nursery` and `unwrap_used` have never been enforced on first-party
 code, and turning them on is the large piece of work.
@@ -157,9 +231,12 @@ cargo test -p orrery_games --test battery -- --ignored --nocapture emit_goldens
 cargo fmt -p orrery_games
 ```
 
-`scripts/core-gates.sh` scans `orrery_games` alongside `orrery_core` — the
-determinism rules are about the rules code, so a `HashMap` or a
-`SystemTime::now` inside a `Ruleset` fails the same gate it would in the core.
+`scripts/core-gates.sh` scans `orrery_games` and `orrery_conformance`
+alongside `orrery_core` — the determinism rules are about the rules code, so a
+`HashMap` or a `SystemTime::now` inside a `Ruleset` fails the same gate it would
+in the core. A fourth clause, scoped to the two ruleset crates, refuses a live
+neighbour read: cross-entity effects travel as events, because the adjudicator
+installs exactly one entity and a neighbour read is always `None` at replay.
 
 **`sccache` is cleared on GitHub-hosted runners, and deliberately not on the
 self-hosted one.** `.cargo/config.toml` sets `build.rustc-wrapper = "sccache"`
@@ -233,11 +310,12 @@ invocation, per C-8 — captures stderr with `--nocapture`, fails on any
 per-commit, alongside the P1/P2/P3 gate self-tests.
 
 **The standalone tools are tested per-commit too.** Each declares its own
-`[workspace]`, so `cargo test --workspace` reaches none of them; the `gates` job
-runs `cargo test` in `p1-swarm`, `p2-load`, `p2-dashboard` and
-`p4-streams-bench` explicitly, and `cargo check` in the three that have no tests
-at all. `p2-load` takes `orrery_persistd` with `features = ["fdb"]`, which is
-why that job installs the FoundationDB *client* on the hosted path.
+`[workspace]`, so `cargo test --workspace` reaches none of them; the `gates`
+lane runs `cargo test` in `p1-swarm`, `p2-load`, `p2-dashboard` and
+`p4-streams-bench`, and `cargo check --all-targets` in the three that have no
+tests at all — see the inventory above, which is the table the lane iterates.
+`p2-load` takes `orrery_persistd` with `features = ["fdb"]`, which is why that
+job installs the FoundationDB *client* on the hosted path.
 
 ## Build cache and target directories
 
