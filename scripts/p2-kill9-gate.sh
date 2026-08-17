@@ -25,11 +25,38 @@ if [[ ${1:-} == --self-test ]]; then
   # are stripped too, so prose naming a stage cannot stand in for the stage.
   body="$(sed -n '/^: /,$p' "$0" | grep -v '^[[:space:]]*#')"
   has() { grep -Fq -- "$1" <<<"$body"; }
-  has 'start_follower' || die 'self-test: follower startup absent'
+  # A shell function definition contains its own name, so `has 'seed_world'`
+  # is satisfied by `seed_world() {` alone — the stage can be defined and never
+  # invoked and the clause still reports it present. Measured 2026-08-17 by
+  # deleting each call site in turn: seven of the fifteen clauses passed on a
+  # script that no longer ran the stage at all (follower startup, promotion,
+  # the epoch-fork proof, the zombie fence, seeding, the fresh-cluster
+  # pre-flight, and the server-span attribution check). `runs` matches a bare
+  # call line instead — `name` on a line of its own, at any indentation — and
+  # never `name() {`, because the definition has a `(` where this wants
+  # end-of-line. It is deliberately literal: wrapping a stage in an `if` would
+  # trip it. That is the right direction for a structural check — a false
+  # alarm here is one grep to read, while a silent one cost the run.
+  runs() { grep -Eq -- "^[[:space:]]*$1[[:space:]]*$" <<<"$body"; }
+  runs 'start_follower' || die 'self-test: follower startup absent'
+  # The fenced primary never had a clause of its own — the `--issuer-key` one
+  # below is about its flags, not about it running — so deleting the call left
+  # every clause green on a script that starts no writable node at all. That is
+  # precisely the "incomplete script" this offline guard exists to catch.
+  runs 'start_primary' || die 'self-test: fenced primary startup absent'
   has '--promote-from' || die 'self-test: promotion absent'
+  runs 'start_promoted_follower' || die 'self-test: promotion is defined but never run'
   has 'verify-recovery' || die 'self-test: recovery verifier absent'
-  has 'zombie' || die 'self-test: zombie fence proof absent'
-  has 'prove_epoch_fork_refused' || die 'self-test: primary-restart epoch-fork proof absent'
+  # `zombie` alone matched `zombie_port`, `zombie_pid` and
+  # `zombie-metrics.jsonl` — all of which survive deleting the entire stale-
+  # owner admission proof. These two strings exist only inside it, and they are
+  # its two halves: the process must be *expected to fail*, and the failure
+  # must be *recognizably a fence*.
+  has 'zombie primary unexpectedly passed startup admission' \
+    || die 'self-test: zombie fence proof absent'
+  has 'zombie failed, but not with recognizable fence admission evidence' \
+    || die 'self-test: zombie fence evidence assertion absent'
+  runs 'prove_epoch_fork_refused' || die 'self-test: primary-restart epoch-fork proof absent'
   has '--gate --json' || die 'self-test: latency gate absent'
   # `persistd` has refused to start without an identity issuer key since
   # `f33568b feat(p3): complete strict persistence authority path`, and this
@@ -52,7 +79,10 @@ if [[ ${1:-} == --self-test ]]; then
   # attributes, so if persistd ever writes one under a gated name the merged
   # p99 drops and this gate passes on a measurement it never made. The check
   # is cheap and belongs here, where the two files meet.
-  has 'server_side_spans_never_gate' || die 'self-test: server-span attribution check absent'
+  # Matched at its call site, with the operand attached: the bare name is also
+  # the `def` line, which survives deleting the call.
+  has "server_side_spans_never_gate(l.get('series')" \
+    || die 'self-test: server-span attribution check absent'
   # Every bulk write the gateway routes is fenced (`strict_authority: true`,
   # unconditionally, in `route_session_diff`), and a lease claim names a cell
   # the registrar can already resolve for the entity — so the world has to be
@@ -63,8 +93,8 @@ if [[ ${1:-} == --self-test ]]; then
   # this check does not make the gate pass wrongly — it makes a rerun's
   # startup refusal unreadable, which is how a whole debugging pass went into
   # the wrong subsystem once already.
-  has 'refuse_an_already_activated_cluster' || die 'self-test: fresh-cluster pre-flight absent'
-  has 'seed_world' || die 'self-test: durable world seeding absent'
+  runs 'refuse_an_already_activated_cluster' || die 'self-test: fresh-cluster pre-flight absent'
+  runs 'seed_world' || die 'self-test: durable world seeding absent'
   has '--emit-manifest' || die 'self-test: seeder manifest emission absent'
   has '--manifest "$out/manifest.json"' || die 'self-test: rig is not driven from the seeded inventory'
   # The evidence check. `[[ -s acks.jsonl ]]` passed on 1024 lines of
@@ -359,6 +389,14 @@ start_promoted_follower
 # intent idempotency rows directly from FDB.  Its cutoff binds comparison to
 # the chain prefix actually adopted during promotion, so a post-cutoff ack is
 # never silently demanded from an asynchronous mirror.
+#
+# Deliberately no `--manifest` here, and adding one would be a regression. The
+# verifier re-reads each entity's leaf at the cell its *acknowledgement* names,
+# which is the claim under proof; it used to reload the rig's inventory and,
+# absent a manifest, synthesise a 128-cell lattice instead. Both lattices sit
+# at INTEREST_LEVEL and a level-21 request matches only itself, so every leaf
+# read landed on an empty cell: measured 2026-08-17, 99 of 100 durable entities
+# reported MissingBulk against a promoted node that held all 100.
 "$P2_LOAD_BIN" --verify-recovery --ack-log "$out/acks.jsonl" \
   --gateway "$promoted_gateway" --addr "$promoted_addr" \
   --issuer-secret "$secret_issuer" --issuer-key-id "$issuer_key_id" \
