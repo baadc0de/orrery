@@ -205,6 +205,14 @@ prove_epoch_fork_refused() {
     >"$out/epoch-fork.json" 2>"$out/epoch-fork.stderr"; then
     die 'follower accepted a bumped chain epoch on an already-mirrored journal'
   fi
+  # A refusal happens before the readiness line. A follower that printed one
+  # opened the mirror, accepted the bumped epoch, and then sat there serving it
+  # until `timeout` killed it — which leaves the same non-zero status a refusal
+  # does. Without this check the two are indistinguishable and the run reports
+  # the weaker `not as a chain-epoch fork` instead of what actually happened.
+  if [[ -s $out/epoch-fork.json ]]; then
+    die 'follower accepted a bumped chain epoch: it opened the mirror and served it until the harness killed it'
+  fi
   grep -Fq 'restart handshake' "$out/epoch-fork.stderr" \
     || die 'follower rejected the bumped epoch, but not as a chain-epoch fork'
 }
