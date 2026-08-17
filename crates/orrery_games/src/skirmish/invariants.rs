@@ -174,6 +174,12 @@ fn teleport(sample: &InvariantSample<'_, Craft>) -> Result<(), InvariantViolatio
 
 /// No more shots than the cooldown allows over the elapsed time.
 ///
+/// `shots` counts rolls rather than landings — whether a shot connected is
+/// decided in the *target's* step — which leaves this check reading exactly
+/// what it always meant to read: how often this craft's weapon discharged.
+/// The cooldown gate is still the only thing that bounds that, so the arithmetic
+/// below is unchanged.
+///
 /// The `+ 1` is the boundary shot: a craft whose weapon came ready in the tick
 /// before the previous sample fires immediately after it, which is legal and
 /// would otherwise read as one shot too many on samples that happen to
