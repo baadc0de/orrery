@@ -771,6 +771,14 @@ async fn main() -> anyhow::Result<()> {
     }
     gateway_config.bulk_metrics = bulk_metrics;
     gateway_config.authority_metrics = Arc::clone(&authority_metrics);
+    // Read before the config is consumed by `spawn`. Reported on the readiness
+    // line because "can this cluster adjudicate a discrepancy report" is not
+    // otherwise observable from outside the process: without an adjudicator
+    // every report comes back `REPORT_REFUSED_NO_ADJUDICATOR`, which a witness
+    // sees and an operator does not. It is `false` in a stock build by design
+    // — registering a build means linking a `Ruleset`
+    // (docs/09-services-and-ops.md §1).
+    let adjudicator_configured = gateway_config.adjudicator.is_some();
     tracing::info!(
         elapsed_ms = startup_started.elapsed().as_millis(),
         "persistd startup: starting gateway"
@@ -820,6 +828,7 @@ async fn main() -> anyhow::Result<()> {
             "ownership_epoch": activation.epoch.0,
             "recovery_cutoff": recovery_cutoff,
             "bulk_ack_fence_monitor": fence_freshness_monitor.is_some(),
+            "adjudicator": adjudicator_configured,
             "dev_seeded_entities": dev_seeded,
         });
         // Write manually so a BrokenPipe (harness closed stdout) does not

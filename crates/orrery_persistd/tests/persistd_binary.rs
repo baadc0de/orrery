@@ -404,6 +404,24 @@ fn stdout_contains_json_address_line() {
 }
 
 #[test]
+fn readiness_reports_whether_the_cluster_can_adjudicate() {
+    // Whether a report can be judged here is not otherwise visible from
+    // outside the process: without an adjudicator every escalation comes back
+    // `REPORT_REFUSED_NO_ADJUDICATOR`, which the witness sees and the operator
+    // does not. `false` is the correct answer for a stock build — registering
+    // a rules build means linking a `Ruleset` into the deployed binary
+    // (docs/09-services-and-ops.md §1) — so what is asserted is that the field
+    // is present and honest, not that it is set.
+    let (_dir, mut child, ready) =
+        spawn_persistd(&["--bind".to_string(), "127.0.0.1:0".to_string()]);
+    assert_eq!(
+        ready["adjudicator"], false,
+        "a stock persistd links no Ruleset and must say so"
+    );
+    stop(&mut child);
+}
+
+#[test]
 fn stdout_lines_are_json_only() {
     // Assert that the first stdout line is JSON (starts with '{') even when
     // no --secret-key is used (ephemeral identity).

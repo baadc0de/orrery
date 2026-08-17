@@ -1694,6 +1694,23 @@ impl Rig<'_> {
                     "unexpected interest ack on a rig session"
                 );
             }
+            // Same reasoning as the two above: the rig files no discrepancy
+            // reports, so a verdict addressed to it means the gateway has this
+            // connection confused with a witnessing peer.
+            GatewayReply::ReportVerdict {
+                subject,
+                entity,
+                reason,
+                ..
+            } => {
+                tracing::warn!(
+                    session,
+                    ?subject,
+                    ?entity,
+                    reason,
+                    "unexpected report verdict on a rig session"
+                );
+            }
         }
     }
 

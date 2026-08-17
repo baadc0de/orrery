@@ -24,8 +24,8 @@
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    CellId, Epoch, GridId, Intent, IntentOutcome, Lease, LeaseId, LeaseMsg, Lsn, NodeId, PersistId,
-    SeqPair, Tick,
+    CellId, DiscrepancyReport, Epoch, GridId, Intent, IntentOutcome, Lease, LeaseId, LeaseMsg, Lsn,
+    NodeId, PersistId, SeqPair, Tick, Verdict,
 };
 
 /// A client → gateway message (docs/10-crates.md §9).
@@ -92,6 +92,29 @@ pub enum GatewayMsg {
         node: NodeId,
         /// The [`crate::PROTOCOL_VERSION`] this client was built against.
         version: u16,
+    },
+    /// Escalate a signed discrepancy report to the cluster's adjudicator
+    /// (docs/07-witnessing.md §3, stage 3 → stage 4).
+    ///
+    /// This is the only message a *witness* sends about somebody else, and the
+    /// cluster believes none of it: the bundle inside is self-verifying and is
+    /// re-run against the rules build it pins. The signature binds the
+    /// accusation to an account, which is what makes the per-account rate
+    /// limit (§7, "observer is the liar") mean anything.
+    ///
+    /// Appended rather than folded into an existing variant for the reason
+    /// [`GatewayMsg::VersionedHello`] gives: postcard keys variants
+    /// positionally, so growing one mis-decodes every deployed peer.
+    Report {
+        /// The self-verifying accusation. Boxed because an
+        /// [`crate::EvidenceBundle`] is up to
+        /// [`crate::MAX_ADJUDICATION_TICKS`] of frames and every other variant
+        /// here is tens of bytes — an unboxed one would set the size of the
+        /// whole enum, and therefore of every diff uplink's stack copy. The
+        /// encoded form still fits the reliable lane's
+        /// [`crate::channels::MAX_RELIABLE_MESSAGE_BYTES`], which is what it
+        /// rides.
+        report: Box<DiscrepancyReport>,
     },
 }
 
@@ -210,6 +233,31 @@ pub enum GatewayReply {
         /// Why the session was refused. See
         /// [`GatewayReply::HELLO_REFUSED_PROTOCOL`].
         reason: u8,
+    },
+    /// A [`GatewayMsg::Report`] was adjudicated, or refused.
+    ///
+    /// **Never silence.** A reporter that files and hears nothing cannot tell
+    /// a cluster with no adjudicator configured from one that judged the
+    /// evidence and exonerated the subject, and the two call for opposite
+    /// responses: the first is an operator's gap, the second is the witness
+    /// being wrong. The refusal codes are the
+    /// [`REPORT_ADJUDICATED`](crate::REPORT_ADJUDICATED) family.
+    ReportVerdict {
+        /// The accused peer the report named, echoed so a reporter with
+        /// several escalations open can match the answer to the accusation.
+        subject: NodeId,
+        /// The entity the bundle covered.
+        entity: PersistId,
+        /// The bundle's `window_end` — the disputed claim tick. With
+        /// `subject` and `entity` this identifies the window, and a witness
+        /// escalates a given window once.
+        window_end: Tick,
+        /// The verdict, when the report was adjudicated at all. `None`
+        /// whenever `reason` is nonzero.
+        verdict: Option<Verdict>,
+        /// [`REPORT_ADJUDICATED`](crate::REPORT_ADJUDICATED) when `verdict` is
+        /// present, otherwise why the cluster would not judge it.
+        reason: u16,
     },
 }
 
@@ -474,6 +522,252 @@ mod tests {
         let bytes = postcard::to_stdvec(&reply).unwrap();
         let back: GatewayReply = postcard::from_bytes(&bytes).unwrap();
         assert_eq!(back, reply);
+    }
+
+    /// A minimal but structurally complete report, for the wire tests below.
+    fn report() -> Box<DiscrepancyReport> {
+        use crate::{ChainHash, EvidenceBundle, RulesetId, StateClaim};
+        let subject = iroh_base::SecretKey::from_bytes(&[3; 32]);
+        let ruleset = RulesetId {
+            version: 2,
+            digest: [9; 32],
+        };
+        Box::new(DiscrepancyReport {
+            subject: subject.public(),
+            bundle: EvidenceBundle {
+                ruleset,
+                entity: PersistId::new(11),
+                window_start: Tick::new(100),
+                window_end: Tick::new(130),
+                t0_claim: StateClaim {
+                    entity: PersistId::new(11),
+                    chain_epoch: 0,
+                    tick: Tick::new(100),
+                    input_head: ChainHash::EMPTY,
+                    state_hash: [1; 32],
+                    prev_claim: [0; 32],
+                    ruleset,
+                    sig: subject.sign(b"claim"),
+                },
+                t0_snapshot: bytes::Bytes::from_static(b"state"),
+                frames: Vec::new(),
+                sibling_heads: Vec::new(),
+                disputed_claims: Vec::new(),
+                claimed_hashes: vec![[3; 32]; 30],
+                computed_hashes: vec![[4; 32]; 30],
+            },
+            reporter: node(5),
+            reporter_sig: subject.sign(b"report"),
+        })
+    }
+
+    #[test]
+    fn report_and_verdict_roundtrip() {
+        // Both halves of the escalation exchange cross the reliable lane and
+        // feed a strike ledger, so both have to survive the trip intact.
+        let msg = GatewayMsg::Report { report: report() };
+        let bytes = postcard::to_stdvec(&msg).unwrap();
+        assert_eq!(postcard::from_bytes::<GatewayMsg>(&bytes).unwrap(), msg);
+        // And it rides the reliable lane, which is what makes a bundle-sized
+        // message admissible at all.
+        assert!(
+            crate::channels::encode_stream_frame(&msg).len()
+                <= crate::channels::MAX_RELIABLE_MESSAGE_BYTES
+        );
+
+        for reply in [
+            GatewayReply::ReportVerdict {
+                subject: node(3),
+                entity: PersistId::new(11),
+                window_end: Tick::new(130),
+                verdict: Some(Verdict::Confirms {
+                    at: Tick::new(117),
+                    kind: crate::DeviationKind::DiscreteMismatch,
+                }),
+                reason: crate::REPORT_ADJUDICATED,
+            },
+            GatewayReply::ReportVerdict {
+                subject: node(3),
+                entity: PersistId::new(11),
+                window_end: Tick::new(130),
+                verdict: None,
+                reason: crate::REPORT_REFUSED_NO_ADJUDICATOR,
+            },
+        ] {
+            let bytes = postcard::to_stdvec(&reply).unwrap();
+            assert_eq!(postcard::from_bytes::<GatewayReply>(&bytes).unwrap(), reply);
+        }
+    }
+
+    #[test]
+    fn appending_the_report_variants_moved_no_existing_discriminant() {
+        // postcard keys enum variants positionally, so a variant inserted
+        // anywhere but the end silently re-points every deployed peer's
+        // messages at the wrong arm. Round-trips inside one build cannot catch
+        // that — both ends shift together — so the discriminants are pinned
+        // here as literals.
+        let release = LeaseMsg::Heartbeat {
+            lease_ids: vec![LeaseId(1)],
+            tick: Tick::new(0),
+        };
+        let msgs: [(GatewayMsg, u8); 8] = [
+            (
+                GatewayMsg::Hello {
+                    token: Vec::new(),
+                    node: node(1),
+                },
+                0,
+            ),
+            (
+                GatewayMsg::Lease {
+                    message: release.clone(),
+                },
+                1,
+            ),
+            (GatewayMsg::InterestGrant { grant: Vec::new() }, 2),
+            (
+                GatewayMsg::Diff {
+                    diff: DiffUplink {
+                        cell: CellId::ROOT,
+                        grid: GridId::ROOT,
+                        entity: PersistId::new(1),
+                        tick: Tick::new(0),
+                        kind: RecordKind::ComponentDiff,
+                        payload: bytes::Bytes::new(),
+                        seq: 0,
+                        lease_id: None,
+                        authority_seq: None,
+                    },
+                },
+                3,
+            ),
+            (
+                GatewayMsg::Subscribe {
+                    grid: GridId::ROOT,
+                    cells: Vec::new(),
+                },
+                4,
+            ),
+            (
+                GatewayMsg::SubmitIntent {
+                    intent: Intent {
+                        intent_id: 1,
+                        issuer: node(1),
+                        cell_epoch: crate::CellEpoch::new(0),
+                        ops: Vec::new(),
+                        attestations: Vec::new(),
+                        signature: iroh_base::SecretKey::from_bytes(&[1; 32]).sign(b"x"),
+                    },
+                },
+                5,
+            ),
+            (
+                GatewayMsg::VersionedHello {
+                    token: Vec::new(),
+                    node: node(1),
+                    version: 1,
+                },
+                6,
+            ),
+            (GatewayMsg::Report { report: report() }, 7),
+        ];
+        for (msg, discriminant) in msgs {
+            assert_eq!(
+                postcard::to_stdvec(&msg).unwrap()[0],
+                discriminant,
+                "GatewayMsg discriminant moved: {msg:?}"
+            );
+        }
+
+        let replies: [(GatewayReply, u8); 10] = [
+            (
+                GatewayReply::HelloAck {
+                    gateway: node(1),
+                    protocol: 1,
+                },
+                0,
+            ),
+            (GatewayReply::Lease { message: release }, 1),
+            (
+                GatewayReply::InterestAck {
+                    epoch: None,
+                    reason: INTEREST_ACK_OK,
+                },
+                2,
+            ),
+            (
+                GatewayReply::BulkAck {
+                    entity: PersistId::new(1),
+                    tick: Tick::new(0),
+                    lsn: Lsn::new(0, 0),
+                    provisional: false,
+                },
+                3,
+            ),
+            (
+                GatewayReply::BulkNack {
+                    entity: PersistId::new(1),
+                    tick: Tick::new(0),
+                    reason: 0,
+                    lease: None,
+                },
+                4,
+            ),
+            (
+                GatewayReply::AreaPage {
+                    cell: CellId::ROOT,
+                    page: AreaPage {
+                        cell: CellId::ROOT,
+                        page_seq: 0,
+                        chunk_index: 0,
+                        total_chunks: 1,
+                        entities: Vec::new(),
+                        payloads: Vec::new(),
+                        live: true,
+                    },
+                },
+                5,
+            ),
+            (
+                GatewayReply::AreaLoadError {
+                    cell: CellId::ROOT,
+                    kind: AREA_LOAD_ERR_LIVE,
+                },
+                6,
+            ),
+            (
+                GatewayReply::IntentAck {
+                    intent_id: 1,
+                    outcome: IntentOutcome::Rejected { reason: 1 },
+                },
+                7,
+            ),
+            (
+                GatewayReply::HelloRefused {
+                    gateway: node(1),
+                    protocol: 1,
+                    reason: GatewayReply::HELLO_REFUSED_PROTOCOL,
+                },
+                8,
+            ),
+            (
+                GatewayReply::ReportVerdict {
+                    subject: node(1),
+                    entity: PersistId::new(1),
+                    window_end: Tick::new(0),
+                    verdict: Some(Verdict::Exonerates),
+                    reason: crate::REPORT_ADJUDICATED,
+                },
+                9,
+            ),
+        ];
+        for (reply, discriminant) in replies {
+            assert_eq!(
+                postcard::to_stdvec(&reply).unwrap()[0],
+                discriminant,
+                "GatewayReply discriminant moved: {reply:?}"
+            );
+        }
     }
 
     #[test]

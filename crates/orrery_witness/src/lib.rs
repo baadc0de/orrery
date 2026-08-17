@@ -27,13 +27,14 @@
 //!    [`DiscrepancyReport`] whose evidence stands on its own, by
 //!    [`Witness::raise`].
 //!
-//! **Stages 2 and 3 are driven by the app, not by this crate.** Nothing here
-//! arms a window on its own and nothing files: the engine emits
-//! [`WitnessSignal::ClaimMismatch`], and it is the host that decides whether to
-//! call `audit_window` and `raise`. That is a P4 posture rather than an
-//! omission — the phase is passive by design — but it means a host that only
-//! counts signals is running stages 1a and 1c and nothing else. The `p1-swarm`
-//! harness does exactly that, deliberately.
+//! **Stages 2 and 3 are engine-driven, and filing is opt-in.** The engine
+//! decides nothing about escalation on its own; the `bevy` adapter arms the
+//! window and calls `raise` when a [`WitnessSignal::ClaimMismatch`] comes back,
+//! but only if the host inserted a [`WitnessIdentity`] to sign with — and even
+//! then, shadow mode files nothing. A host that inserts no identity gets
+//! stages 1a and 1c and the counters, which is what the `p1-swarm` harness
+//! does, deliberately. A host with no Bevy at all drives `audit_window` and
+//! `raise` itself, as `orrery_persistd`'s tests do.
 //!
 //! # Shadow mode is the default, and that is the point
 //!
@@ -71,8 +72,9 @@ pub mod witness;
 
 #[cfg(feature = "bevy")]
 pub use plugin::{
-    AuthoredLog, PendingRepairs, PublishClaim, PublishFrame, RepairBudget, WitnessClock,
-    WitnessLinkCounters, WitnessPlugin, WitnessSet, WitnessState, Witnessed,
+    AuthoredLog, PendingRepairs, PublishClaim, PublishFrame, RepairBudget, ReportFiled,
+    WitnessClock, WitnessIdentity, WitnessLinkCounters, WitnessPlugin, WitnessSet, WitnessState,
+    Witnessed,
 };
 pub use report::{sign_report, verify_report, ReportError};
 pub use witness::{

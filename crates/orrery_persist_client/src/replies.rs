@@ -22,6 +22,7 @@ use orrery_protocol::{GatewayReply, Lease, LeaseId, PersistId};
 use crate::area::AreaLoader;
 use crate::gateway::{GatewayConfig, GatewaySession, GatewayState};
 use crate::intents::IntentQueue;
+use crate::reports::{ReportOutcome, ReportQueue};
 use crate::uplink::UplinkScheduler;
 
 /// Consume gateway replies from the session recv buffer.
@@ -33,6 +34,7 @@ use crate::uplink::UplinkScheduler;
 ///   scheduler (the ack is the durability contract, D11 §2.1).
 /// - [`GatewayReply::AreaPage`] → the area loader.
 /// - [`GatewayReply::IntentAck`] → the intent queue.
+/// - [`GatewayReply::ReportVerdict`] → the report queue (docs/07 §3 stage 4).
 pub(crate) fn process_replies(mut context: ReplyProcessingContext) {
     let Some(entity) = context.session.session else {
         return;
@@ -105,6 +107,31 @@ pub(crate) fn process_replies(mut context: ReplyProcessingContext) {
             }
             GatewayReply::IntentAck { intent_id, outcome } => {
                 context.queue.on_ack(intent_id, outcome);
+            }
+            GatewayReply::ReportVerdict {
+                subject,
+                entity,
+                window_end,
+                verdict,
+                reason,
+            } => {
+                // Kept whole rather than reduced to a boolean: `None` with a
+                // refusal code and `Some(Exonerates)` are opposite situations,
+                // and only one of them is about the accused.
+                if verdict.is_none() {
+                    tracing::warn!(
+                        %subject,
+                        reason,
+                        "gateway: refused a discrepancy report"
+                    );
+                }
+                context.reports.record_outcome(ReportOutcome {
+                    subject,
+                    entity,
+                    window_end,
+                    verdict,
+                    reason,
+                });
             }
             GatewayReply::HelloAck { gateway, protocol } => {
                 // The gateway accepted our hello; the session is now up. If the
@@ -217,6 +244,7 @@ pub(crate) struct ReplyProcessingContext<'w, 's> {
     scheduler: ResMut<'w, UplinkScheduler>,
     loader: ResMut<'w, AreaLoader>,
     queue: ResMut<'w, IntentQueue>,
+    reports: ResMut<'w, ReportQueue>,
     lease_inbox: Option<ResMut<'w, LeaseInbox>>,
     interest: Option<ResMut<'w, InterestGrant>>,
     authority_state: Option<ResMut<'w, AuthorityState>>,
@@ -334,7 +362,8 @@ mod tests {
         app.init_resource::<GatewaySession>()
             .init_resource::<UplinkScheduler>()
             .init_resource::<AreaLoader>()
-            .init_resource::<IntentQueue>();
+            .init_resource::<IntentQueue>()
+            .init_resource::<ReportQueue>();
         let session_entity = app
             .world_mut()
             .spawn(aeronet_io::Session::new(
@@ -546,7 +575,8 @@ mod tests {
         app.insert_resource(GatewaySession::default())
             .insert_resource(scheduler)
             .insert_resource(AreaLoader::default())
-            .insert_resource(IntentQueue::default());
+            .insert_resource(IntentQueue::default())
+            .init_resource::<ReportQueue>();
         let session_entity = app
             .world_mut()
             .spawn(aeronet_io::Session::new(
@@ -1238,7 +1268,8 @@ mod tests {
         app.init_resource::<GatewaySession>()
             .init_resource::<UplinkScheduler>()
             .init_resource::<AreaLoader>()
-            .init_resource::<IntentQueue>();
+            .init_resource::<IntentQueue>()
+            .init_resource::<ReportQueue>();
         let gateway = node(1);
         app.insert_resource(GatewayConfig::new(
             iroh::EndpointAddr::new(gateway),
@@ -1266,7 +1297,8 @@ mod tests {
         app.init_resource::<GatewaySession>()
             .init_resource::<UplinkScheduler>()
             .init_resource::<AreaLoader>()
-            .init_resource::<IntentQueue>();
+            .init_resource::<IntentQueue>()
+            .init_resource::<ReportQueue>();
 
         // We configured gateway A, but the ack claims to be gateway B.
         let gateway_a = node(1);
@@ -1318,7 +1350,8 @@ mod tests {
         app.init_resource::<GatewaySession>()
             .init_resource::<UplinkScheduler>()
             .init_resource::<AreaLoader>()
-            .init_resource::<IntentQueue>();
+            .init_resource::<IntentQueue>()
+            .init_resource::<ReportQueue>();
 
         let gateway = node(1);
         app.insert_resource(GatewayConfig::new(
