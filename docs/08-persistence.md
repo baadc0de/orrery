@@ -253,6 +253,32 @@ What an **acked** write survives, by failure and mode:
 
 Unacked in-flight diffs are always the client's to resend; the table is about acked data. The zombie row is the **residual split-brain window** the epoch fence cannot close: a partitioned former owner can keep acking for up to the 3 s read-version staleness bound before downgrading to provisional acks (§2.1). Because the bound sits below failure-detection + re-placement time, a successor is normally not yet serving during that window, so the residual is a bounded theoretical exposure, not an expected loss path; records journaled under the superseded epoch are discarded at replay and the client's resend to the new owner closes the gap. We state the journal-only column because chain replication is a deployment toggle: single-node dev setups run with it off and accept the 20 s window.
 
+### 4.2 Closing the store, and the upstream drop we do not trust
+
+`Journal::close` stops the group committer, waits for its exit, and issues a
+final `SyncData` persist. Everything durable is settled at that point; releasing
+the fjall handle afterwards is only thread joins and the directory lock.
+
+We do not release it inline, because fjall 3.1.9's `DatabaseInner::drop` can
+park forever. It shuts its worker pool down with *blocking* sends of
+`WorkerMessage::Close` into the same `flume::bounded(1_000)` channel the workers
+use for flush and compaction work, in a loop whose exit condition only those
+sends can advance — so once the channel fills and nothing is draining it, the
+drop never returns and never re-reads the counter it is waiting on. Upstream
+tracks this as [fjall-rs/fjall#260](https://github.com/fjall-rs/fjall/issues/260)
+(see also #183); we added the production reproduction and the observation that
+it needs no active writers, since the drop loop fills the channel by itself.
+
+So `Journal::drop` hands the handles to a detached thread and waits
+`ORRERY_JOURNAL_CLOSE_TIMEOUT_MS` (default 30 s) for it. If the budget expires
+the handle is abandoned: its worker threads and the directory lock leak until
+the process exits, and a `tracing::error!` names the upstream issue. That trade
+is deliberate — a leak that ends at process exit costs less than a test binary
+that hangs until CI kills the runner, which is exactly what this bug did to us
+twice. A process that then fails to reopen the same journal directory is a
+diagnosable failure; a hang is not. Remove the workaround when the fix lands
+upstream (D14 governs the bump).
+
 ## 5. FoundationDB as the system of record
 
 Why FDB (pinned **7.3.x**, 7.4 tracked as upgrade candidate; `foundationdb-rs` 0.11 — D14):
