@@ -33,6 +33,12 @@
 # `scripts/p3-island-gate.sh` contains no FoundationDB reference at all, runs
 # persistd with `--allow-volatile-leases`, and binds every listener on
 # `127.0.0.1:0`. Nothing in it collides with anything, so it runs on the box.
+#
+# It failed its first run there, and the move is not why. The harness had gone
+# deaf to the gateway's control replies when `8fd8c22` put them on a reliable
+# stream, and the same failure — `only 0/50 claims answered`, eight peers each
+# reporting an unanswered hello — reproduces on a developer's shell with no CI
+# in sight. Fixed in `p3-island/src/wire.rs`; the job stays where it is.
 
 name: Nightly gates
 
