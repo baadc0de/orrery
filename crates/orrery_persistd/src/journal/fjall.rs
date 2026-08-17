@@ -64,11 +64,87 @@ const ORIGINATED_INDEX_VERSION: &[u8] = b"1";
 /// The fjall keyspace holding per-segment metadata (future: cell index footers).
 const SEGMENTS_KS: &str = "segments";
 
+/// How long [`Journal`]'s drop waits for fjall to release its worker threads
+/// before it abandons the store handle.
+///
+/// fjall 3.1.9 shuts its worker pool down from `DatabaseInner::drop` by
+/// *blocking* sends of `WorkerMessage::Close` into the same
+/// `flume::bounded(1_000)` channel that carries flush and compaction work,
+/// inside a loop whose exit condition only those sends can advance. When the
+/// channel is full the send parks and the loop body never runs again, so the
+/// drop never returns (fjall-rs/fjall#260, open since 2026-03-01; see also
+/// #183). It is a race against the workers draining, which is why it shows up
+/// on a loaded CI runner and not on an idle laptop.
+///
+/// We cannot fix a `Drop` we do not own, but we can decline to wait on it
+/// forever. Nothing durable is at stake by then: [`Journal::close`] has
+/// already stopped the committer and issued a `SyncData` persist, so this drop
+/// is only thread joins and the directory lock. Abandoning it leaks those; not
+/// abandoning it hangs the process. A test binary that fails in
+/// [`STORE_CLOSE_TIMEOUT`] and names the upstream bug is worth more than one
+/// that stalls a pinned runner until CI kills it.
+const STORE_CLOSE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Environment override for [`STORE_CLOSE_TIMEOUT`], in milliseconds.
+pub const STORE_CLOSE_TIMEOUT_ENV: &str = "ORRERY_JOURNAL_CLOSE_TIMEOUT_MS";
+
+/// [`STORE_CLOSE_TIMEOUT`], or the environment override when it parses.
+fn store_close_timeout() -> Duration {
+    std::env::var(STORE_CLOSE_TIMEOUT_ENV)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .map_or(STORE_CLOSE_TIMEOUT, Duration::from_millis)
+}
+
+/// A fjall handle whose drop is deferred to [`Journal`]'s own `Drop`.
+///
+/// Field order cannot do this job: a guard declared after the handles drops
+/// *after* them, by which point the hang has already happened, and one
+/// declared before them cannot reach them. So each handle is held in an
+/// `Option` that `Journal::drop` empties before the fields drop, and every
+/// read goes through `Deref` — which is why the call sites are unchanged.
+struct Deferred<T>(Option<T>);
+
+impl<T> std::ops::Deref for Deferred<T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        self.0
+            .as_ref()
+            .expect("journal store handle used after it was disposed")
+    }
+}
+
+/// Drop `value` on a detached thread, waiting at most `budget` for it.
+///
+/// Returns whether the drop finished inside the budget.
+fn drop_within<T: Send + 'static>(value: T, budget: Duration) -> bool {
+    let (done_tx, done_rx) = std::sync::mpsc::sync_channel::<()>(1);
+    match std::thread::Builder::new()
+        .name("journal-dispose".to_string())
+        .spawn(move || {
+            drop(value);
+            // The receiver is gone if we already gave up. That is the point.
+            let _ = done_tx.send(());
+        }) {
+        // Dropping the join handle detaches the thread. On timeout it stays
+        // parked in fjall's shutdown loop for the life of the process, which
+        // is strictly better than parking our caller there instead.
+        Ok(_detached) => done_rx.recv_timeout(budget).is_ok(),
+        // `spawn` consumed the closure, so a spawn failure has already dropped
+        // `value` on this thread — the pre-workaround behaviour, hang and all.
+        Err(error) => {
+            tracing::error!(%error, "could not spawn the journal dispose thread");
+            true
+        }
+    }
+}
+
 /// The per-node journal (docs/08-persistence.md §4).
 pub struct Journal {
-    db: Database,
-    records: Keyspace,
-    originated_records: Keyspace,
+    db: Deferred<Database>,
+    records: Deferred<Keyspace>,
+    originated_records: Deferred<Keyspace>,
     /// Monotonic next-LSN cursor, guarded by a mutex (segment advances too).
     cursor: std::sync::Mutex<Lsn>,
     segment_size: u64,
@@ -87,6 +163,30 @@ pub struct Journal {
     /// nothing outside this crate may reach it.
     #[cfg(test)]
     scan_fault: std::sync::atomic::AtomicBool,
+}
+
+impl Drop for Journal {
+    /// Hand the fjall handles to [`drop_within`] rather than dropping them
+    /// here, so a wedged `DatabaseInner::drop` cannot hang whoever released
+    /// the last `Arc<Journal>` — in practice `CellRuntime::close`, at the end
+    /// of a test.
+    fn drop(&mut self) {
+        let budget = store_close_timeout();
+        let handles = (
+            self.db.0.take(),
+            self.records.0.take(),
+            self.originated_records.0.take(),
+        );
+        if !drop_within(handles, budget) {
+            tracing::error!(
+                timeout_ms = budget.as_millis() as u64,
+                "journal store drop did not finish: fjall's DatabaseInner::drop is \
+                 blocked (fjall-rs/fjall#260). Abandoning the handle — its worker \
+                 threads and the journal directory lock stay held until this process \
+                 exits."
+            );
+        }
+    }
 }
 
 impl Journal {
@@ -166,9 +266,9 @@ impl Journal {
         );
 
         Ok(Self {
-            db,
-            records,
-            originated_records,
+            db: Deferred(Some(db)),
+            records: Deferred(Some(records)),
+            originated_records: Deferred(Some(originated_records)),
             cursor: std::sync::Mutex::new(next_lsn),
             segment_size: 128 * 1024 * 1024,
             committer,
@@ -384,7 +484,7 @@ impl Journal {
             };
         }
         let start = lsn_key(from);
-        let records = &self.records;
+        let records: &Keyspace = &self.records;
         let iter = self.originated_records.range(start..).map(move |entry| {
             let key = entry
                 .key()
@@ -792,7 +892,7 @@ impl Journal {
         let end = prefix_successor(&prefix).ok_or_else(|| {
             JournalError::Store("adopted chain identity has no finite key-range successor".into())
         })?;
-        let records = &self.records;
+        let records: &Keyspace = &self.records;
         let iter = adopted
             .range(adoption_record_key(&source_key, from)..end)
             .map(move |entry| {
@@ -1354,5 +1454,51 @@ mod tests {
         replicator.shutdown().await;
         primary.close().await.unwrap();
         follower.close().await.unwrap();
+    }
+
+    /// A value whose `Drop` blocks until it is released, standing in for
+    /// fjall's wedged shutdown loop without needing to lose the race for real.
+    struct WedgedDrop(Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>);
+
+    impl Drop for WedgedDrop {
+        fn drop(&mut self) {
+            let (lock, cvar) = &*self.0;
+            let mut released = lock.lock().unwrap();
+            while !*released {
+                released = cvar.wait(released).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn drop_within_reports_a_drop_that_finishes() {
+        assert!(drop_within(vec![1u8, 2, 3], Duration::from_secs(30)));
+    }
+
+    #[test]
+    fn drop_within_gives_up_on_a_wedged_drop() {
+        let gate = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let wedged = WedgedDrop(Arc::clone(&gate));
+
+        // The whole point of the workaround: a `Drop` that never returns costs
+        // the caller the budget, not the process.
+        let start = std::time::Instant::now();
+        assert!(!drop_within(wedged, Duration::from_millis(200)));
+        assert!(start.elapsed() >= Duration::from_millis(200));
+
+        // Let the detached thread finish so the test process leaks nothing.
+        let (lock, cvar) = &*gate;
+        *lock.lock().unwrap() = true;
+        cvar.notify_all();
+    }
+
+    #[test]
+    fn store_close_timeout_defaults_when_the_override_is_absent_or_junk() {
+        // Not `set_var`: these tests share a process, and the override is read
+        // per drop. Parsing is the part worth pinning down.
+        let parse = |raw: &str| raw.trim().parse::<u64>().ok().map(Duration::from_millis);
+        assert_eq!(parse(" 250 "), Some(Duration::from_millis(250)));
+        assert_eq!(parse("later"), None);
+        assert_eq!(STORE_CLOSE_TIMEOUT, Duration::from_secs(30));
     }
 }
