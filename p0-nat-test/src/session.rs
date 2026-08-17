@@ -262,7 +262,10 @@ async fn run_mesh_dial_task(
         }
     };
     let _ = events
-        .send(SessionEvent::Connected { peer, remote: target })
+        .send(SessionEvent::Connected {
+            peer,
+            remote: target,
+        })
         .await;
     run_datagram_loop_for(conn, peer, options, events, shutdown_rx).await
 }
@@ -276,9 +279,7 @@ async fn run_mesh_accept_task(
 ) -> Result<()> {
     let conn = accept(endpoint.inner()).await?;
     let remote = conn.remote_id();
-    let _ = events
-        .send(SessionEvent::Connected { peer, remote })
-        .await;
+    let _ = events.send(SessionEvent::Connected { peer, remote }).await;
     run_datagram_loop_for(conn, peer, options, events, shutdown_rx).await
 }
 
