@@ -79,12 +79,15 @@ note() { echo "$NAME: $*" >&2; }
 usage() {
   cat >&2 <<'USAGE'
 usage: p4-accumulate.sh [--index N] [--seconds S] [--dry-run]
+       p4-accumulate.sh --probe
        p4-accumulate.sh --self-test
 
   --index N     which point of the sweep to run (default: days since the epoch,
                 so consecutive nightlies differ without any stored state)
   --seconds S   simulated seconds (default 3600, the criterion's hour)
   --dry-run     print the run this index selects and exit
+  --probe       run the short fixed-seed comparability run and write its report
+                to $P4_ACCUM_OUT/probe-<target>.json; banks nothing
 
   P4_LEDGER_FILE  ledger path, passed through to scripts/p4-ledger.sh
   P1_SWARM_BIN    prebuilt harness; built from p1-swarm/ when unset
@@ -127,6 +130,27 @@ self_test() {
     || die 'self-test: the shed allowance is gone; the budget backstop would go unjudged'
   has 'BAND=' \
     || die 'self-test: the loss band is gone'
+  # Off-Linux, both of these: cargo emits `p1-swarm.exe` on a Windows runner,
+  # and a leg that only knows the unsuffixed name dies before it runs a tick.
+  has 'p1-swarm.exe' \
+    || die 'self-test: the Windows binary name is gone; the leg cannot find its harness on a Windows runner'
+  has 'PROBE_SEED' \
+    || die 'self-test: the comparability probe is gone; hours would be banked per platform with nothing saying the platforms agree'
+  has '--probe) probe=1' \
+    || die 'self-test: --probe is unreachable; the nightly step that compares the platforms would run the hour instead'
+
+  # The probe's report has to be a function of its parameters and of nothing
+  # else — it is compared byte for byte against another platform's. A wall-clock
+  # stamp inside it would make every such comparison fail for the one reason
+  # that means nothing. Checked on the probe's own body, since the banking leg
+  # legitimately stamps and a whole-file search would match that.
+  local probe_body
+  probe_body="$(sed -n '/^run_probe() {/,/^}/p' "$0" | grep -v '^[[:space:]]*#')"
+  [[ -n $probe_body ]] || die 'self-test: run_probe is gone'
+  grep -Fq -- '--stamp-wall-clock' <<<"$probe_body" \
+    && die 'self-test: the comparability probe stamps a wall clock; no two platforms could ever agree'
+  grep -Fq -- '--witness' <<<"$probe_body" \
+    || die 'self-test: the comparability probe does not run the witness, so it compares the wrong pipeline'
 
   # Functional half: the sweep must actually sweep. Consecutive indices have to
   # produce distinct (seed, loss) pairs — that is the whole property this leg
@@ -154,6 +178,16 @@ self_test() {
   grep -Fq '@0.03' <<<"$seen" || die "self-test: the sweep never runs the band's 3% floor"
   grep -Fq '@0.05' <<<"$seen" || die "self-test: the sweep never runs the band's 5% ceiling"
 
+  # The seed is a function of the sweep index alone. That is what makes the
+  # three platform legs run the *same* hour on the same night, which is what
+  # makes a divergence between their reports visible at all; a seed derived from
+  # the runner would bank three unrelated hours that could never be compared.
+  local first second
+  read -r first _ <<<"$(sweep_point 12345)"
+  read -r second _ <<<"$(sweep_point 12345)"
+  [[ $first == "$second" ]] \
+    || die 'self-test: one index produced two seeds; the platform legs would not share an hour'
+
   echo "$NAME: self-test passed"
 }
 
@@ -177,17 +211,101 @@ sweep_point() {
   echo "$index ${BAND[index % ${#BAND[@]}]}"
 }
 
+# Where the release harness lands, built if it is not already there.
+#
+# `.exe` is not a detail: on a `windows-latest` runner these scripts run under
+# Git Bash and cargo emits `p1-swarm.exe`, so the unsuffixed path this used to
+# hard-code does not exist and the leg would die at "harness binary missing"
+# before it ran a tick. Both spellings are tried rather than switching on
+# `$OSTYPE` — the question is which file cargo produced, and the filesystem
+# answers it.
+ensure_bin() {
+  local bin=${P1_SWARM_BIN:-}
+  if [[ -n $bin ]]; then
+    [[ -x $bin ]] || die "harness binary missing at $bin"
+    echo "$bin"
+    return
+  fi
+  note 'building the harness (release: a simulated hour is not a debug workload)'
+  cargo build --release -q --manifest-path "$ROOT/p1-swarm/Cargo.toml" 1>&2
+  local candidate
+  for candidate in "$ROOT/p1-swarm/target/release/p1-swarm" \
+                   "$ROOT/p1-swarm/target/release/p1-swarm.exe"; do
+    if [[ -x $candidate ]]; then echo "$candidate"; return; fi
+  done
+  die "harness binary missing at $ROOT/p1-swarm/target/release/p1-swarm[.exe]"
+}
+
+# ── The comparability probe ──────────────────────────────────────────────────
+#
+# The accumulation leg runs on three platforms now, and hours banked on three
+# platforms are only worth banking separately if the runs are *comparable*.
+#
+# `SwarmReport` is a pure function of its parameters. Everything in it is
+# computed from the seeded simulation; the wall-clock phase timings go to stderr
+# and never into the report, and the one field that is not a function of the
+# parameters — `started_at_unix_secs` — exists only when `--stamp-wall-clock` is
+# passed, which this mode does not pass. Two identical-seed runs on one box
+# produce byte-identical JSON, measured.
+#
+# So the cross-platform question has a byte-exact answer: run the same seed on
+# each platform and every field except `identity.target` must match. That is a
+# far stronger check than comparing a handful of summary numbers, and it costs
+# two simulated minutes rather than an hour — the same 32 peers, the same
+# witnessed pipeline, the same impairment, fewer ticks of it.
+#
+# It is deliberately not banked. Two simulated minutes are not one of the
+# criterion's hours.
+readonly PROBE_SEED=7
+readonly PROBE_LOSS=0.04
+readonly PROBE_SECONDS=120
+
+run_probe() {
+  local bin
+  bin=$(ensure_bin)
+  mkdir -p "$OUT"
+  local staged="$OUT/probe.json"
+  note "comparability probe: seed $PROBE_SEED, loss $PROBE_LOSS, $PROBE_SECONDS simulated seconds at 32 peers"
+  # No `--stamp-wall-clock` here, unlike the banking leg: the whole point is a
+  # report that is a function of its parameters and of nothing else, so that a
+  # diff against another platform's means what it looks like it means.
+  "$bin" --peers 32 --seconds "$PROBE_SECONDS" --min-cells 1 --max-pops 0 \
+    --max-shed "$MAX_SHED" --late-join-at "$(( PROBE_SECONDS / 2 ))" \
+    --impaired --loss "$PROBE_LOSS" --seed "$PROBE_SEED" --witness \
+    --json "$staged" \
+    || die 'the comparability probe did not hold'
+
+  # Named after the triple the binary was *compiled* for, read back out of the
+  # report rather than derived from `uname`: the report is what will be
+  # compared, and a name taken from the runner would disagree with it on any
+  # cross-built leg. Naming the artifact this way is also what lets the
+  # comparison job tell three uploaded reports apart without being told which
+  # runner produced which.
+  local target
+  target=$(jq -r '.identity.target' "$staged")
+  [[ -n $target && $target != null ]] || die 'the probe report does not name its target triple'
+  mv "$staged" "$OUT/probe-$target.json"
+  note "probe report written to $OUT/probe-$target.json"
+}
+
 main() {
-  local index='' seconds=3600 dry=0
+  local index='' seconds=3600 dry=0 probe=0
   while (( $# )); do
     case $1 in
       --index) index=${2:-}; shift 2 ;;
       --seconds) seconds=${2:-}; shift 2 ;;
       --dry-run) dry=1; shift ;;
+      --probe) probe=1; shift ;;
       -h | --help) usage; exit 0 ;;
       *) usage; die "unknown argument '$1'" ;;
     esac
   done
+
+  if (( probe )); then
+    run_probe
+    return
+  fi
+
   [[ -z $index ]] && index=$(( $(date -u +%s) / 86400 ))
   [[ $index =~ ^[0-9]+$ ]] || die "--index must be a non-negative integer, got '$index'"
 
@@ -196,13 +314,8 @@ main() {
   note "index $index → seed $seed, loss $loss, $seconds simulated seconds at 32 peers"
   (( dry )) && exit 0
 
-  local bin=${P1_SWARM_BIN:-}
-  if [[ -z $bin ]]; then
-    note 'building the harness (release: a simulated hour is not a debug workload)'
-    cargo build --release -q --manifest-path "$ROOT/p1-swarm/Cargo.toml"
-    bin="$ROOT/p1-swarm/target/release/p1-swarm"
-  fi
-  [[ -x $bin ]] || die "harness binary missing at $bin"
+  local bin
+  bin=$(ensure_bin)
 
   mkdir -p "$OUT"
   local report="$OUT/accum-$seed-$loss.json"
@@ -210,6 +323,13 @@ main() {
   # The witnessed leg, at this night's point of the band. Every clause the gate's
   # witnessed leg blocks on blocks here too — the harness exits non-zero unless
   # they hold, and a leg that fails is a finding, not an hour.
+  #
+  # The seed comes from the sweep index and not from the runner, so all three
+  # platforms run the *same* hour on the same night. `RunIdentity` carries the
+  # target triple, so those are three distinct runs the ledger banks separately
+  # — and three runs of one seed across three platforms are worth more than
+  # three unrelated ones, because a divergence between them is then visible in
+  # the reports themselves.
   if ! "$bin" --peers 32 --seconds "$seconds" --min-cells 1 --max-pops 0 \
       --max-shed "$MAX_SHED" --late-join-at "$(( seconds / 2 ))" \
       --impaired --loss "$loss" --seed "$seed" --witness --stamp-wall-clock \
