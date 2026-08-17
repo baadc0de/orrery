@@ -477,46 +477,63 @@ async fn read_gateway_state(cli: &Cli, expected: &[DiffEvidence]) -> Result<Vec<
     let wanted_ids: BTreeSet<_> = expected.iter().map(|diff| diff.entity).collect();
 
     // ROOT is only a covering discovery scan; its reply cell is not evidence
-    // of the storage cell for every returned row.
+    // of the storage cell for every returned row. It is kept for the
+    // diagnostic below, not for the proof.
     let root = read_snapshot_pages(&conn, &[CellId::ROOT]).await?;
-    let root_diffs = recovered_snapshot_diffs(wanted_ids.clone(), root)?;
+    let discovered: BTreeSet<_> = recovered_snapshot_diffs(wanted_ids.clone(), root)?
+        .into_iter()
+        .map(|diff| diff.entity)
+        .collect();
 
-    // A leased writer cannot move an entity between cells (the gateway denies
-    // a client `LeaseMsg::Rekey`, and `apply_fenced` pins `record.cell` to the
-    // committed one), so a recovered entity's storage leaf is exactly its
-    // inventory cell. Re-read those leaves so the AreaPage cell retained below
-    // is a physical identity assertion rather than the enclosing ROOT page.
-    let inventory: BTreeMap<_, _> = recovery_inventory(cli)?
-        .into_iter()
-        .map(|placement| (placement.entity, placement))
-        .collect();
-    let cells: Vec<_> = root_diffs
-        .iter()
-        .map(|diff| {
-            let placement = inventory.get(&diff.entity).with_context(|| {
-                format!(
-                    "recovered entity {:?} is absent from P2 inventory",
-                    diff.entity
-                )
-            })?;
-            Ok(placement.cell)
-        })
-        .collect::<Result<BTreeSet<_>>>()?
-        .into_iter()
-        .collect();
+    let cells = recovery_leaf_cells(expected);
     let leaves = read_snapshot_pages(&conn, &cells).await?;
     endpoint.close().await;
-    recovered_snapshot_diffs(wanted_ids, leaves)
+    let recovered = recovered_snapshot_diffs(wanted_ids, leaves)?;
+
+    // Both "the promoted node does not hold it at all" and "it holds it
+    // somewhere other than the leaf it was acknowledged at" reach the
+    // comparator as `MissingBulk`, and the two point at different subsystems —
+    // durability versus placement. The covering scan above separates them, so
+    // the next reader of a failed gate does not have to guess.
+    let at_leaf: BTreeSet<_> = recovered.iter().map(|diff| diff.entity).collect();
+    let misplaced: Vec<_> = discovered.difference(&at_leaf).copied().collect();
+    if !misplaced.is_empty() {
+        tracing::warn!(
+            count = misplaced.len(),
+            first = ?misplaced.first(),
+            "recovery: entities the covering ROOT scan returned are absent from the leaf they were acknowledged at"
+        );
+    }
+    Ok(recovered)
 }
 
-/// Load the same inventory used by the P2 traffic generator.
-fn recovery_inventory(cli: &Cli) -> Result<Inventory> {
-    match &cli.manifest {
-        Some(path) => Ok(ManifestInventory::load(path)
-            .with_context(|| format!("load manifest {}", path.display()))?
-            .inventory),
-        None => Ok(synthetic_inventory(cli.entities, cli.cells)),
-    }
+/// The physical leaves to re-read, taken from the acknowledgements themselves.
+///
+/// `DiffEvidence::cell` is the cell the gateway acknowledged the write at, and
+/// a leased writer cannot move an entity between cells (the gateway denies a
+/// client `LeaseMsg::Rekey`, and `apply_fenced` pins `record.cell` to the
+/// committed one) — so the acknowledged cell *is* the claim under proof, and
+/// finding the entity in that leaf's page is a physical identity assertion
+/// rather than the enclosing ROOT page.
+///
+/// This deliberately consults neither `--manifest` nor `--entities`/`--cells`.
+/// It used to reload the rig's inventory and, with no manifest, fall back to
+/// `synthetic_inventory` — and the kill-9 gate never passed `--manifest` to
+/// its verify step. The fallback synthesised a 128-cell lattice at
+/// `INTEREST_LEVEL`, and `read_snapshot` matches a requested cell against
+/// stored cells by prefix, so a level-21 request matches only itself: every
+/// leaf read landed on a cell nothing was stored in. Measured 2026-08-17: 99
+/// of 100 seeded entities reported `MissingBulk` while the promoted node
+/// demonstrably held all 100, the hundredth surviving on a single coincidental
+/// collision between the two lattices. Deriving the cells from the ack log
+/// removes the second source of the same fact, and with it the drift.
+fn recovery_leaf_cells(expected: &[DiffEvidence]) -> Vec<CellId> {
+    expected
+        .iter()
+        .map(|diff| diff.cell)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
 }
 
 /// Read complete area pages for the requested physical cells.
@@ -2422,6 +2439,76 @@ mod tests {
         let inv2 = synthetic_inventory(1_000, 100);
         let distinct2: std::collections::BTreeSet<_> = inv2.iter().map(|p| p.cell).collect();
         assert!(distinct2.len() >= 100, "got {}", distinct2.len());
+    }
+
+    #[test]
+    fn recovery_rereads_the_leaves_the_acks_name_not_a_synthesised_lattice() {
+        // Regression for the P2 kill-9 gate's `MissingBulk` wall. The recovery
+        // reader used to re-read leaves from the *rig's inventory*, falling
+        // back to `synthetic_inventory` when no `--manifest` was given — and
+        // the gate's verify invocation gives none. Both lattices sit at
+        // `INTEREST_LEVEL`, and `read_snapshot` matches a requested cell
+        // against a stored cell by prefix, so a level-21 request matches only
+        // itself: the reader asked for 100 cells that held nothing and
+        // reported 99 of 100 durable entities missing (the hundredth was a
+        // lone coincidental collision). Measured 2026-08-17 against a promoted
+        // node that provably held all 100.
+        //
+        // The two lattices below are deliberately disjoint, which is what
+        // makes this check non-vacuous: a reader sourcing cells from anywhere
+        // but the acknowledgements cannot produce this set.
+        let seeded: Vec<CellId> = [(3i32, 5, 7), (11, 13, 17), (-4, 9, -2)]
+            .into_iter()
+            .map(|(x, y, z)| {
+                CellId::from_coords(glam::IVec3::new(x, y, z), orrery_protocol::INTEREST_LEVEL)
+                    .expect("interest-level coordinate is in range")
+            })
+            .collect();
+        // Two entities share a leaf, so the plan must also de-duplicate: the
+        // gateway answers one page per requested cell and a repeated cell is a
+        // repeated page, not a second proof.
+        let acked: Vec<DiffEvidence> = [
+            (1u64, seeded[0]),
+            (2, seeded[1]),
+            (3, seeded[1]),
+            (4, seeded[2]),
+        ]
+        .into_iter()
+        .map(|(id, cell)| DiffEvidence {
+            grid: GridId::ROOT,
+            cell,
+            entity: PersistId::new(id),
+            tick: Tick::new(9),
+            lsn: orrery_protocol::Lsn::new(0, id),
+            payload_digest: String::new(),
+        })
+        .collect();
+
+        let planned = recovery_leaf_cells(&acked);
+        let expected: Vec<CellId> = seeded
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        assert_eq!(
+            planned, expected,
+            "the plan must be exactly the acknowledged leaves, de-duplicated"
+        );
+
+        // The failure this guards: the synthesised lattice the old fallback
+        // produced for these same entity ids shares no cell with the acked
+        // ones, so every read landed on an empty leaf.
+        let synthesised: BTreeSet<_> =
+            synthetic_inventory(crate::cli::DEFAULT_ENTITIES, crate::cli::DEFAULT_CELLS)
+                .into_iter()
+                .filter(|placement| placement.entity <= PersistId::new(4))
+                .map(|placement| placement.cell)
+                .collect();
+        assert!(
+            synthesised.is_disjoint(&planned.iter().copied().collect()),
+            "the fixture no longer separates the two sources; pick different seeded coordinates"
+        );
     }
 
     #[test]
