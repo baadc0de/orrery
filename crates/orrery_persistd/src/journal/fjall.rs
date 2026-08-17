@@ -79,6 +79,14 @@ pub struct Journal {
     metrics: Arc<JournalCommitMetrics>,
     /// Committed records, published for chain replication (§4).
     published: broadcast::Sender<JournalRecord>,
+    /// Test-only fault injection for [`Journal::scan_originated_from`].
+    ///
+    /// The replicator's unrecoverable read path is a *per-item* error inside
+    /// the scan, and `spawn_chain` takes a concrete `Arc<Journal>` — there is
+    /// no seam to mock. This flag is that seam, and it lives here because
+    /// nothing outside this crate may reach it.
+    #[cfg(test)]
+    scan_fault: std::sync::atomic::AtomicBool,
 }
 
 impl Journal {
@@ -167,7 +175,18 @@ impl Journal {
             closed: std::sync::atomic::AtomicBool::new(false),
             metrics,
             published,
+            #[cfg(test)]
+            scan_fault: std::sync::atomic::AtomicBool::new(false),
         })
+    }
+
+    /// Test hook: make every subsequent outbound scan yield one read error
+    /// instead of records, reproducing a primary whose journal has become
+    /// unreadable under a live replicator.
+    #[cfg(test)]
+    pub(crate) fn inject_scan_fault(&self) {
+        self.scan_fault
+            .store(true, std::sync::atomic::Ordering::Release);
     }
 
     /// Append a record and return a handle that resolves once the record is
@@ -356,6 +375,14 @@ impl Journal {
     /// journal so a node that also mirrors another primary never sends those
     /// mirrored records back around a replication ring.
     pub(crate) fn scan_originated_from<'a>(&'a self, from: Lsn) -> JournalScan<'a> {
+        #[cfg(test)]
+        if self.scan_fault.load(std::sync::atomic::Ordering::Acquire) {
+            return JournalScan {
+                iter: Box::new(std::iter::once(Err(JournalError::Store(
+                    "injected originated scan failure".into(),
+                )))),
+            };
+        }
         let start = lsn_key(from);
         let records = &self.records;
         let iter = self.originated_records.range(start..).map(move |entry| {
