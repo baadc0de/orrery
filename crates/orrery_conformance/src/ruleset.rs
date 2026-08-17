@@ -14,8 +14,10 @@
 //!   intrinsics, which is exactly the divergence the matrix exists to catch.
 //!
 //! Cross-entity effects travel only as events — an attacker emits
-//! `DamageApplied`, the target consumes it as an input on the *next* tick — so
-//! each entity's window replays self-contained.
+//! `DamageApplied`, the target consumes it as an input on the *next* tick — and
+//! no rule reads a neighbour's live state, so each entity's window replays
+//! self-contained against a one-entity executor. `scripts/core-gates.sh` holds
+//! it there; `corpus`'s isolated case proves it by construction.
 
 use orrery_core::quantize::{QPos, QVel, Quantized};
 use orrery_core::rng::TickRng;
@@ -38,7 +40,7 @@ const DRAG_PER_SEC: f64 = 0.15;
 /// only meaningful against a fixed ruleset, and a silent rule change would
 /// present as a determinism failure rather than as what it is.
 pub const REFERENCE_RULESET: RulesetId = RulesetId {
-    version: 1,
+    version: 2,
     digest: [0xC0; 32],
 };
 
@@ -282,24 +284,33 @@ impl Ruleset for Reference {
                     let roll = rng.next_u32();
                     roll_fold = roll_fold.rotate_left(7) ^ u64::from(roll);
                     let amount = (*power as i32).saturating_add((roll % 8) as i32);
-                    // Reading the target closes the input set: the read is
-                    // recorded, so a replay never needs the neighbour's live
-                    // state, and an authority that fabricates neighbour state
-                    // produces checkable evidence against itself.
-                    let alive = view.neighbor(*target).is_some_and(|b| b.hp > 0);
-                    if alive {
-                        events.push(Outcome::DamageApplied {
-                            target: *target,
-                            amount,
-                        });
-                    }
+                    // The attacker does not look at the target. `StateView`
+                    // records a neighbour read, but nothing replays one: no
+                    // `NeighborFrame` producer exists yet (docs/06 §3), and
+                    // `ReplayHarness::load_claimed_snapshot` installs exactly
+                    // one entity, so at replay every neighbour read is `None`.
+                    // A rule that branched on the target's liveness would
+                    // therefore adjudicate differently than it executed — and
+                    // invisibly, because the roll above is folded into
+                    // `roll_fold` *before* any such branch, leaving the
+                    // attacker's own state hash identical either way while the
+                    // emitted event differs. Liveness is the target's own
+                    // business, decided in its `Damage` arm below.
+                    events.push(Outcome::DamageApplied {
+                        target: *target,
+                        amount,
+                    });
                 }
                 Command::Damage { amount } => {
-                    // Integer only, shields absorbing first.
+                    // Integer only, shields absorbing first. A destroyed body
+                    // absorbs nothing further: this is the alive check, moved
+                    // to the only step that can see the state it tests.
                     let scaled = amount.saturating_add(index as i32);
-                    let absorbed = scaled.min(shield.max(0));
-                    shield -= absorbed;
-                    hp -= scaled - absorbed;
+                    if hp > 0 {
+                        let absorbed = scaled.min(shield.max(0));
+                        shield -= absorbed;
+                        hp -= scaled - absorbed;
+                    }
                 }
             }
         }

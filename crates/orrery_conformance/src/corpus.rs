@@ -8,7 +8,7 @@
 
 use std::collections::BTreeMap;
 
-use orrery_core::executor::Executor;
+use orrery_core::executor::{Executor, TickOutcome};
 use orrery_core::quantize::{QPos, QVel};
 use orrery_protocol::{PersistId, Tick, UniverseSeed};
 use rand_chacha::rand_core::{RngCore, SeedableRng};
@@ -33,16 +33,28 @@ pub struct Case {
     /// The universe seed byte, expanded to the full 32-byte seed.
     pub seed_byte: u8,
     /// Whether entities attack each other, exercising the discrete path and
-    /// the recorded neighbour reads.
+    /// the cross-entity event flow.
     pub combat: bool,
+    /// Execute each entity in its own single-entity [`Executor`], the shape
+    /// `orrery_games::scenario::adjudicate_isolated` gives an adjudicator.
+    ///
+    /// The world, the input schedule and the event flow are identical either
+    /// way; the only difference is that an isolated executor holds no
+    /// neighbours, so `StateView::neighbor` always answers `None` — exactly as
+    /// it does at replay, where `ReplayHarness::load_claimed_snapshot` installs
+    /// one entity. A rule that read a neighbour's live state would therefore
+    /// produce a *different chain* here than in the shared run, which is the
+    /// divergence this axis exists to surface.
+    ///
+    pub isolated: bool,
 }
 
 /// The corpus.
 ///
 /// Deliberately small and fast — this runs on every commit, on every target.
 /// Breadth comes from the cases differing in the axes that break determinism
-/// (entity count, window length, whether cross-entity events flow), not from
-/// running the same case for longer.
+/// (entity count, window length, whether cross-entity events flow, whether each
+/// entity runs in its own executor), not from running the same case for longer.
 pub const CASES: &[Case] = &[
     Case {
         name: "kinematic-single",
@@ -50,6 +62,7 @@ pub const CASES: &[Case] = &[
         ticks: 180,
         seed_byte: 0x11,
         combat: false,
+        isolated: false,
     },
     Case {
         name: "kinematic-swarm",
@@ -57,6 +70,7 @@ pub const CASES: &[Case] = &[
         ticks: 180,
         seed_byte: 0x22,
         combat: false,
+        isolated: false,
     },
     Case {
         name: "combat-pair",
@@ -64,6 +78,7 @@ pub const CASES: &[Case] = &[
         ticks: 180,
         seed_byte: 0x33,
         combat: true,
+        isolated: false,
     },
     Case {
         name: "combat-island",
@@ -71,6 +86,19 @@ pub const CASES: &[Case] = &[
         ticks: 600,
         seed_byte: 0x44,
         combat: true,
+        isolated: false,
+    },
+    // Same axes as `combat-island`, executed one entity per executor. Its
+    // chain is asserted equal to the shared run's in the crate's own tests:
+    // that equality is the property, and this entry is what carries it across
+    // the matrix and into the committed golden.
+    Case {
+        name: "combat-isolated",
+        entities: 8,
+        ticks: 600,
+        seed_byte: 0x44,
+        combat: true,
+        isolated: true,
     },
 ];
 
@@ -208,7 +236,8 @@ fn commands_for(case: &Case, entity: u64, tick: u64) -> Vec<Command> {
         });
     }
     if case.combat && case.entities > 1 && rng.next_u32() % 3 == 0 {
-        // Attack a neighbour that is never self, so a read is always recorded.
+        // Attack another entity, never self, so the cross-entity event path is
+        // always the one exercised.
         let offset = 1 + u64::from(rng.next_u32()) % (case.entities - 1);
         let target = ((entity - 1 + offset) % case.entities) + 1;
         out.push(Command::Attack {
@@ -219,15 +248,79 @@ fn commands_for(case: &Case, entity: u64, tick: u64) -> Vec<Command> {
     out
 }
 
+/// How a case's entities are held: all in one executor, or one executor each.
+///
+/// Both arms drive the same `Reference` ruleset over the same seed, the same
+/// world and the same input schedule. What differs is what a step can *see*:
+/// a shared executor exposes every other entity through `StateView::neighbor`,
+/// an isolated one exposes nothing — which is what an adjudicator has, since
+/// `ReplayHarness::load_claimed_snapshot` installs exactly one entity. Running
+/// both and requiring the same chain is how a neighbour read stops being
+/// invisible.
+enum Stage {
+    /// One executor over the whole world.
+    Shared(Executor<Reference>),
+    /// One single-entity executor per entity, in `PersistId` order.
+    Isolated(BTreeMap<PersistId, Executor<Reference>>),
+}
+
+impl Stage {
+    /// Build the case's world into the requested arrangement.
+    fn new(case: &Case) -> Self {
+        let seed = UniverseSeed([case.seed_byte; 32]);
+        let world = seed_world(case);
+        if case.isolated {
+            let mut executors = BTreeMap::new();
+            for (id, body) in world {
+                let mut executor = Executor::new(Reference, seed);
+                executor.insert(id, body);
+                executors.insert(id, executor);
+            }
+            Stage::Isolated(executors)
+        } else {
+            let mut executor = Executor::new(Reference, seed);
+            for (id, body) in world {
+                executor.insert(id, body);
+            }
+            Stage::Shared(executor)
+        }
+    }
+
+    /// Every entity, in `PersistId` order (VC-4: a BTreeMap walk either way).
+    fn entities(&self) -> Vec<PersistId> {
+        match self {
+            Stage::Shared(executor) => executor.entities().copied().collect(),
+            Stage::Isolated(executors) => executors.keys().copied().collect(),
+        }
+    }
+
+    /// Advance one entity by one tick.
+    fn step(&mut self, id: PersistId, tick: Tick, inputs: &[Command]) -> TickOutcome<Outcome> {
+        match self {
+            Stage::Shared(executor) => executor.step_entity(id, tick, inputs),
+            Stage::Isolated(executors) => executors
+                .get_mut(&id)
+                .and_then(|executor| executor.step_entity(id, tick, inputs)),
+        }
+        .expect("entity is present for the whole case")
+    }
+
+    /// An entity's current state.
+    fn state(&self, id: PersistId) -> &Body {
+        match self {
+            Stage::Shared(executor) => executor.state(id),
+            Stage::Isolated(executors) => executors.get(&id).and_then(|e| e.state(id)),
+        }
+        .expect("entity present")
+    }
+}
+
 /// Run one case and digest it.
 ///
 /// `detail` controls whether the per-tick hashes are retained. The chain value
 /// is identical either way — retaining detail must never change the result.
 pub fn run_case(case: &Case, detail: bool) -> CaseDigest {
-    let mut executor = Executor::new(Reference, UniverseSeed([case.seed_byte; 32]));
-    for (id, body) in seed_world(case) {
-        executor.insert(id, body);
-    }
+    let mut stage = Stage::new(case);
 
     // Events emitted on tick N become inputs on tick N+1, which is what keeps
     // each entity's replay self-contained.
@@ -242,8 +335,7 @@ pub fn run_case(case: &Case, detail: bool) -> CaseDigest {
         // Entities step in `PersistId` order — a BTreeMap walk, never a hash
         // iteration (VC-4). Collected first because stepping borrows the
         // executor mutably.
-        let ids: Vec<PersistId> = executor.entities().copied().collect();
-        for id in ids {
+        for id in stage.entities() {
             let mut inputs = commands_for(case, id.0, tick.0);
             // Inbound damage is appended after the entity's own commands, so
             // the total order is a property of the schedule rather than of map
@@ -252,9 +344,7 @@ pub fn run_case(case: &Case, detail: bool) -> CaseDigest {
                 inputs.extend(inbound);
             }
 
-            let outcome = executor
-                .step_entity(id, tick, &inputs)
-                .expect("entity is present for the whole case");
+            let outcome = stage.step(id, tick, &inputs);
 
             chain = *blake3::Hasher::new()
                 .update(&chain)
@@ -283,13 +373,11 @@ pub fn run_case(case: &Case, detail: bool) -> CaseDigest {
         pending = next_pending;
     }
 
-    let final_states = executor
+    let final_states = stage
         .entities()
-        .copied()
-        .collect::<Vec<_>>()
         .into_iter()
         .map(|id| {
-            let b = executor.state(id).expect("entity present");
+            let b = stage.state(id);
             FinalState {
                 entity: id.0,
                 pos_mm: [b.pos.x, b.pos.y, b.pos.z],
