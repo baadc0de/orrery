@@ -226,11 +226,53 @@ Recommended alerts:
 - watermark regression,
 - or stream churn that suggests the topology is flapping.
 
+Two of those need a caveat about what the counters actually measure.
+
+**Reconnect count is a probe count, not a churn count.** A primary's watermark
+probe is `GrpcChainTransport::follower_watermark`, which delegates straight to
+`reconnect`, and every reconnect opens a session on the follower. So
+`chain_reconnects_total` rises once per probe: a chain that is merely retrying a
+failed push re-probes every 10 ms and drives it at roughly 100/s with no stream
+having been lost at all. Alert on `chain_stream_restarts_total` for topology
+flap, and read the session count next to the stall signals below.
+
+**Duplicate batches are counted where they happen.** The follower increments
+`chain_duplicate_batches_total` on the idempotent-replay branch — a batch whose
+every row was already durable and whose provenance matched — and nowhere else.
+A retry whose provenance disagrees is a failed precondition, not a duplicate,
+which is what keeps the "above reconnect noise" alert meaningful.
+
 Every batch and ACK should carry `stream_id`, `batch_seq`, `first_lsn`, `durable_through`, and `follower_watermark` in logs so replay investigations can correlate the two journals.
 
 The series names for these signals are declared once, in `orrery_protocol::metrics` (`CHAIN_SERIES`), for the same reason the D16 latency names are: a producer and a consumer in different processes must spell them identically. Nothing emits them yet — `ChainReplicator::snapshot` is the reading a reporter would publish, and wiring it into `persistd`'s delta reporter is the next step.
 
-One caveat about the lag alarm, because it is the only alarm here: it advances only on a *successful* probe or push. A chain that cannot make progress at all therefore holds its last value rather than growing, which is why a wedged chain reports itself as a fault instead of relying on lag alone.
+One caveat about the lag alarm, because it used to be the only alarm here: it
+advances only on a *successful* probe or push — `update_progress` is its sole
+writer, and so is the follower watermark's. A chain that cannot make progress
+therefore **freezes** both readings rather than growing them, and a follower
+killed while the chain was caught up freezes them at zero. Gating an alert on
+`lag_bytes > 0` cannot fire for that case at all: with no further appends the
+replicator parks on the commit broadcast and makes no transport call to fail.
+
+`ChainSnapshot` carries four more readings for exactly that reason, and they
+are the ones that move when the first four do not:
+
+| Reading | What it is |
+|---|---|
+| `running` | whether the replication task is alive. It exits on shutdown and on a fault, but it can also *panic* — at the `expect` guarding the adopted-history scan — and a panicked task publishes no fault at all. |
+| `progress_age_ms` | time since the last successful probe or push: the age of `watermark` and `lag_bytes`, and the `chain_lag_age_ms` series. Measured entirely on the primary; nothing is added to the wire, and `ProgressReply` is positional postcard inside an opaque protobuf field, where a new field would be a hard cross-build incompatibility. |
+| `failed_pushes` | pushes failed since the last successful one, reset by any progress. Zero on a healthy chain; climbing at the retry rate on a wedged one. |
+| `behind` | whether the primary has committed past the follower watermark *right now*, read live from the journal rather than from the frozen gauge. Always false for a promotion-adopted chain, whose watermark is in the source's LSN space. |
+
+`ChainSnapshot::stalled_for(grace)` is the composite an alert should read: the
+chain has stopped, or it owes work (`behind`, or failing pushes) that it has
+made no progress on for longer than `grace`.
+
+Two conditions are faults rather than degradation, and stop the chain outright:
+`FollowerAhead`, a follower holding history this primary never wrote, and
+`PrimaryScanFailed`, the primary's own journal read failing under a live
+replicator. A retried transport error is neither — it is degradation, and
+`failed_pushes` is where it shows up.
 
 ## 7. Rollout and acceptance gates
 
