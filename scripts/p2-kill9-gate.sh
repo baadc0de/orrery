@@ -31,6 +31,21 @@ if [[ ${1:-} == --self-test ]]; then
   has 'zombie' || die 'self-test: zombie fence proof absent'
   has 'prove_epoch_fork_refused' || die 'self-test: primary-restart epoch-fork proof absent'
   has '--gate --json' || die 'self-test: latency gate absent'
+  # `persistd` has refused to start without an identity issuer key since
+  # `f33568b feat(p3): complete strict persistence authority path`, and this
+  # script did not pass one. Nothing noticed, because the only thing that runs
+  # it is nightly: the P2 durability criterion was simply unrunnable, and the
+  # first nightly said so with `Error: authority requires at least one
+  # --issuer-key <key-id>@<public-key>` in `primary.stderr`. Two clauses,
+  # because the gap has two halves and either alone still fails: the gateway
+  # must trust an issuer, and the rig must be able to mint a token that issuer
+  # signed.
+  # Matched with their operands attached, and that is load-bearing: plain
+  # `--issuer-key` is a prefix of the rig's `--issuer-key-id`, so the shorter
+  # pattern passes on a script that has lost every gateway key and kept only
+  # the rig's key id.
+  has '--issuer-key "$issuer_key_id@$issuer_public"' || die 'self-test: gateway identity issuer key absent'
+  has '--issuer-secret "$secret_issuer"' || die 'self-test: load rig session-token minting absent'
   echo 'self-test: two-process proof stages present'
   exit 0
 fi
@@ -64,6 +79,12 @@ fork_port=${P2_GATE_FORK_PORT:-7780}
 [[ $gateway_port =~ ^[0-9]+$ && $chain_port =~ ^[0-9]+$ && $zombie_port =~ ^[0-9]+$ && $fork_port =~ ^[0-9]+$ ]] || die 'ports must be numeric'
 secret_primary=${P2_GATE_PRIMARY_SECRET_KEY:-000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f}
 secret_follower=${P2_GATE_FOLLOWER_SECRET_KEY:-101112131415161718191a1b1c1d1e1f000102030405060708090a0b0c0d0e0f}
+# The identity issuer. Its public half is what the gateway trusts and its
+# private half is what the rig signs its session token with, so the two come
+# from one place — a secret here and a derivation below — rather than a pair of
+# constants that can silently drift apart.
+secret_issuer=${P2_GATE_ISSUER_SECRET_KEY:-202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f}
+issuer_key_id=${P2_GATE_ISSUER_KEY_ID:-1}
 duration=${P2_GATE_DURATION_SECS:-30}
 entities=${P2_GATE_ENTITIES:-10000}
 cells=${P2_GATE_CELLS:-128}
@@ -100,6 +121,53 @@ print(value[field])
 PY
 }
 
+# Derive an ed25519 public key from a 32-byte secret, hex in and hex out.
+#
+# `iroh::SecretKey::public()` is plain ed25519, and `--issuer-key` wants the
+# public half in the same hex a `NodeId` parses from. No binary this job builds
+# will derive one — `p3-island` has `--print-keys`, but that is a different
+# tool in a different workspace — so the derivation happens here, through
+# `openssl`, which is the one dependency both a GitHub-hosted runner and the
+# self-hosted box are certain to have.
+#
+# The known-answer check is not decoration. A silently wrong public key starts
+# `persistd` happily and then fails the run minutes later as an unanswered
+# hello, which reads like a registrar defect and is not one.
+public_key_of() {
+  python3 - "$1" <<'PY'
+import binascii, subprocess, sys
+
+PKCS8_ED25519_PREFIX = binascii.unhexlify('302e020100300506032b657004220420')
+SPKI_ED25519_PREFIX = binascii.unhexlify('302a300506032b6570032100')
+
+
+def public_of(secret_hex):
+    seed = binascii.unhexlify(secret_hex.strip())
+    if len(seed) != 32:
+        raise SystemExit('an issuer secret is 32 hex-encoded bytes')
+    der = subprocess.run(
+        ['openssl', 'pkey', '-inform', 'DER', '-pubout', '-outform', 'DER'],
+        input=PKCS8_ED25519_PREFIX + seed,
+        capture_output=True,
+        check=True,
+    ).stdout
+    if not der.startswith(SPKI_ED25519_PREFIX) or len(der) != len(SPKI_ED25519_PREFIX) + 32:
+        raise SystemExit('openssl returned an unexpected ed25519 public key encoding')
+    return binascii.hexlify(der[len(SPKI_ED25519_PREFIX):]).decode()
+
+
+# RFC 8032 section 7.1, test vector 1.
+if public_of('9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60') != (
+    'd75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a'
+):
+    raise SystemExit('ed25519 derivation failed its RFC 8032 known-answer check')
+
+print(public_of(sys.argv[1]))
+PY
+}
+issuer_public=$(public_key_of "$secret_issuer") || die 'could not derive the identity issuer public key'
+note "identity issuer $issuer_key_id@$issuer_public"
+
 start_follower() {
   "$PERSISTD_BIN" --node-id 2 --chain-epoch 1 --chain-primary 1 \
     --chain-listen "127.0.0.1:$chain_port" --dir "$out/follower-data" \
@@ -112,6 +180,7 @@ start_primary() {
   "$PERSISTD_BIN" --node-id 1 --chain-epoch 1 --chain-follower "2@$follower_chain" \
     --bind "127.0.0.1:$gateway_port" --dir "$out/primary-data" \
     --secret-key "$secret_primary" --fdb-cluster-file "$ORRERY_FDB_CLUSTER_FILE" \
+    --issuer-key "$issuer_key_id@$issuer_public" \
     --metrics-jsonl "$out/primary-metrics.jsonl" >"$out/primary.json" 2>"$out/primary.stderr" & primary_pid=$!
   wait_json "$out/primary.json" "$primary_pid" primary
   primary_gateway=$(json_field "$out/primary.json" node_id)
@@ -147,6 +216,7 @@ start_promoted_follower() {
   "$PERSISTD_BIN" --node-id 2 --chain-epoch 2 --chain-primary 1 --promote-from 1 \
     --chain-listen "127.0.0.1:$chain_port" --bind "127.0.0.1:$gateway_port" \
     --dir "$out/follower-data" --secret-key "$secret_follower" \
+    --issuer-key "$issuer_key_id@$issuer_public" \
     --fdb-cluster-file "$ORRERY_FDB_CLUSTER_FILE" --metrics-jsonl "$out/promoted-metrics.jsonl" \
     >"$out/promoted.json" 2>"$out/promoted.stderr" & follower_pid=$!
   wait_json "$out/promoted.json" "$follower_pid" promoted-follower
@@ -162,6 +232,7 @@ start_primary
 note "driving ${entities} entities across ${cells} cells"
 "$P2_LOAD_BIN" --gateway "$primary_gateway" --addr "$primary_addr" \
   --entities "$entities" --cells "$cells" --sessions "$sessions" --duration-secs "$duration" \
+  --issuer-secret "$secret_issuer" --issuer-key-id "$issuer_key_id" \
   --json --ack-log "$out/acks.jsonl" >"$out/load-before.jsonl" 2>"$out/load-before.stderr"
 [[ -s $out/acks.jsonl ]] || die 'load completed without durable acknowledgement evidence'
 
@@ -175,6 +246,7 @@ start_promoted_follower
 # never silently demanded from an asynchronous mirror.
 "$P2_LOAD_BIN" --verify-recovery --ack-log "$out/acks.jsonl" \
   --gateway "$promoted_gateway" --addr "$promoted_addr" \
+  --issuer-secret "$secret_issuer" --issuer-key-id "$issuer_key_id" \
   --fdb-cluster-file "$ORRERY_FDB_CLUSTER_FILE" --recovery-cutoff "$recovery_cutoff" \
   --output "$out/recovery-verification.json"
 
@@ -185,6 +257,7 @@ note 'proving old primary is fenced (zombie admission)'
 "$PERSISTD_BIN" --node-id 1 --chain-epoch 1 --chain-follower "2@$follower_chain" \
   --bind "127.0.0.1:$zombie_port" --dir "$out/primary-data" \
   --secret-key "$secret_primary" --fdb-cluster-file "$ORRERY_FDB_CLUSTER_FILE" \
+  --issuer-key "$issuer_key_id@$issuer_public" \
   --metrics-jsonl "$out/zombie-metrics.jsonl" >"$out/zombie.json" 2>"$out/zombie.stderr" & zombie_pid=$!
 if wait "$zombie_pid"; then
   zombie_pid=''

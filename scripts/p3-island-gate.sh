@@ -32,6 +32,15 @@ if [[ ${1:-} == --self-test ]]; then
   has() { grep -Fq -- "$1" <<<"$body"; }
   has '--dev-seed' || die 'self-test: entity seeding absent'
   has '--coordinator-key' || die 'self-test: interest handout absent'
+  # The two flags `persistd` refuses to start without in this configuration.
+  # Neither was checked here, and the sibling P2 gate shows what that costs:
+  # it omitted `--issuer-key` from the day `f33568b` began requiring one and
+  # nothing said so until a nightly run months of commits later. Matched with
+  # their operands attached — bare `--issuer-key` is a prefix of the harness's
+  # own `--issuer-secret` argument name and would pass on a script that had
+  # lost the gateway's key entirely.
+  has '--issuer-key "1@$ISSUER_PUBLIC"' || die 'self-test: gateway identity issuer key absent'
+  has '--allow-volatile-leases' || die 'self-test: volatile lease store absent'
   has 'orrery-coordinator' || die 'self-test: live coordinator absent'
   has '--metrics-jsonl' || die 'self-test: duplicate-authority read absent'
   has 'p3-island' || die 'self-test: island harness absent'
