@@ -259,7 +259,9 @@ of hours**: `p1-swarm --witness` runs the pipeline, and the nightly swarm gate
 now runs *it* — a third leg, 32 peers for a simulated hour under the impairment
 profile, blocking on all three witnessing clauses, accruing 32 player-hours a
 night on x86_64 Linux (`scripts/p1-swarm-gate.sh`,
-`.github/workflows/nightly.yml`). Measured over that hour before it landed:
+`.github/workflows/nightly.yml`). The gate's fourth and fifth legs close the
+criterion's *other* half — a modified client convicted at population, and an
+armed honest island that files nothing — see below. Measured over that hour before it landed:
 coverage 95.98% against the 95% floor, zero false positives, 156 728 chain gaps
 repaired. What is outstanding is narrower than it was, and one part of it is
 newly visible: **the criterion's loss band is 3–5% and only its floor held.**
@@ -330,6 +332,73 @@ stamped with its seed, its full impairment profile, its target triple and its
 commit sha, and deliberately not with a wall clock unless asked, so summing them
 later is bookkeeping rather than archaeology.
 
+**The demo criterion's other half is closed: a modified client is convicted at
+population.** Both ends of it were proven separately and neither was proven in a
+swarm — `orrery_witness`'s own tests drive a cheating authority to
+`Verdict::Confirms`, `orrery_persistd`'s carry a signed report over a real
+gateway, and `p1-swarm` had no `WitnessIdentity`, no cheat and no adjudicator:
+every escalation it ever raised was counted as `escalations_unidentified` and
+nothing was filed. `p1-swarm --cheat` closes it end to end, and the nightly gate
+runs it as a fourth leg with an armed-but-honest control as a fifth.
+
+Measured at the population the criterion names — `--peers 8 --seconds 300
+--impaired --witness --cheat speed`:
+
+| P4 demo criterion, 8-peer island, 3% loss / 100 ms jitter | |
+|---|---|
+| Modified peers fielded | 1 (`Tamper::SpeedMultiplier`, the criterion's own 1.5×) |
+| First tick its build diverged from the shipping rules | **0** |
+| First tick an independent re-run returned `Confirms` | **32** |
+| Detection latency against the 180-tick window (D16) | **32 ticks**, 0.53 s |
+| Reports filed against it → verdicts | 41 → **41 `Confirms`**, 0 exonerates, 0 forged, 0 unadjudicable |
+| Reports filed against an honest peer | **0** |
+| Observation coverage / false positives | **100.0%** / **0** |
+| Same island, witnesses armed, nobody modified | **0 reports filed** |
+
+Three findings came out of building it, and each one would have made the leg
+pass while proving nothing.
+
+**The named cheat is inert at these parameters unless it is aimed.**
+`Tamper::SpeedMultiplier` raises an archetype's ceilings by 1.5×, and the swarm's
+roam requests `accel_mmss` 60 000 — *exactly* an interceptor's
+`max_accel_mmss`. On that slot `clamp(0, 60_000)` and `clamp(0, 90_000)` return
+the same number, the tampered peer's state is byte-identical to an honest one's,
+nothing is detected and nothing is filed: every conviction clause holds over a
+swarm in which nothing happened. Neither *speed* ceiling binds either — the bots
+cruise at 32 m/s against 120 and 60 — so the acceleration clamp is the whole of
+this cheat here. Modified peers are pinned to the cruiser slot (ceiling 20 000,
+so 20 000 honest against 30 000 tampered, 167 mm/s of velocity per thrusting
+tick against a 10 mm/s band), a unit test asserts both halves, and a `--cheat`
+whose build never diverges fails a clause of its own rather than passing the
+rest.
+
+**Stage 1 never fires on it, and that is correct.** A cruising bot thrusts about
+one tick in nineteen, so across a 20 Hz sample gap the cheat's contribution stays
+well inside `skirmish/acceleration-cap`'s allowance. It is caught by
+re-execution and only by re-execution — the argument for stage 1 being a filter
+rather than a verdict, arriving from the opposite direction to the
+`DamageInflation` cheat that was written to make it.
+
+**A latent adjudication defect, found by being the first thing to adjudicate a
+swarm bundle.** `p1-swarm` anchors every watch at tick 0 and then published a
+*second* claim at tick 0 on the first tick — same entity, head and state hash,
+different `prev_claim`, therefore a different `claim_hash`. A witness retains
+both; `AuthorityLog::assemble_bundle` takes the anchor as `t0_claim` while the
+tick-30 claim chains from the duplicate; `verify_bundle` walks
+`disputed_claims` checking `claim.prev_claim == claim_hash(previous)`, finds the
+break, and returns **`Confirms { DiscreteMismatch }` against an authority that
+did nothing wrong**. Shadow mode is why nothing saw it: no `p1-swarm` bundle had
+ever been adjudicated. Fixed in the harness's own chain authoring, with a test
+that fails without the fix.
+
+The conviction leg is cheap — eight peers, five simulated minutes, about seven
+wall seconds — because detection happens 32 ticks in and everything after it is
+confirmation. It also stops filing after one window, which is the right
+behaviour rather than a defect: a subject that diverges permanently never agrees
+with its witness again, so `audit_window` runs out of agreed claims 180 ticks
+past the anchor and every later mismatch is counted as
+`escalations_unservable`.
+
 **The bandwidth blocker at 32 peers is settled: it was the frame cadence.** At
 the criterion population the witness lane wanted 384 kb/s per peer against
 [03-replication.md](03-replication.md) §5.3's 0.15–0.2 Mbps, which took the peer
@@ -377,7 +446,11 @@ leaving in the crate:
   cheap checks — speed/acceleration caps, teleport detection, rate limits,
   impossible values" existed as a seam in `orrery_core` and as a consumer in
   `orrery_witness`; until a game published validators, every peer in the tree
-  was evaluating an empty slice.
+  was evaluating an empty slice. **That included the swarm**, for as long as it
+  played `orrery_conformance`'s corpus kernel: every accumulated player-hour ran
+  stage 1 against `&[]`, and the false-positive count was a statement about log
+  re-execution alone. `p1-swarm` plays Skirmish now, so the cheap checks run on
+  every sample every peer receives and the invariant term in that count is live.
 - It ships its own cheats, because the demo criterion is a modified client. The
   three are chosen so each is caught by a different stage: a 1.5× speed
   multiplier (the criterion's own, caught by stage 1 *and* out of band on
@@ -392,11 +465,13 @@ leaving in the crate:
   miniature, found by a test rather than by a player, which is the argument for
   the crate in one sentence.
 
-It is deliberately *not* a substitute for `p1-swarm`: the swarm runs the real
-witness over an impaired link and answers whether the pipeline holds up; this
-answers whether the rules are honest-safe and the cheats are adjudicable, in
-milliseconds, on every commit, on four platforms. The swarm is still the thing
-that accumulates the hours.
+It is deliberately *not* a substitute for `p1-swarm`, and the two are now
+coupled rather than parallel: the swarm plays this game, over an impaired link,
+with the real witness, and answers whether the pipeline holds up; the battery
+here answers whether the rules are honest-safe and the cheats are adjudicable,
+in milliseconds, on every commit, on four platforms. The swarm is still the
+thing that accumulates the hours — and, since `--cheat`, the thing that convicts
+a modified one.
 
 **Deliverables.**
 - PeerReview-style tamper-evident logs streamed to the cell-epoch witness set (on the state lane beside replication, at a cadence derived from the lane's budget share — [03-replication.md](03-replication.md) §5.3a; gap repair over the reliable control stream); any holder of a segment + t₀ claim can re-execute a window ≤ 3 s (180 ticks) and produce self-verifying evidence.
@@ -406,6 +481,16 @@ that accumulates the hours.
 - Cross-platform determinism CI: identical core replays on Windows/Linux/macOS binaries every commit (ε_pos 1 cm, ε_vel 1 cm/s, 250 ms sustained-error window for continuous state; bit-exact for discrete outcomes).
 
 **Demo criterion.** A modified client applying a 1.5× speed multiplier joins an 8-peer island: detected, escalated, replay-adjudicated with a deviation verdict within one adjudication window of the violation. Simultaneously, ≥ 500 honest player-hours (bot + human mix) across all three platforms under injected impairment (3–5% packet loss, 100 ms jitter spikes) produce **zero** false-positive discrepancy reports. False-positive rate is the phase's primary tunable; the phase does not exit until it holds.
+
+*Status.* The first sentence **holds** and gates nightly: 8 peers, 3% loss and
+100 ms jitter, one peer on `Skirmish::cheating(SpeedMultiplier)` — divergence at
+tick 0, `Verdict::Confirms` at tick 32 against a 180-tick window, 41 of 41
+reports confirmed, zero filed against any of the seven honest peers, and the
+same island with every witness armed and nobody modified filing nothing. The
+second sentence is bounded only by **accumulation**: the pipeline holds at both
+ends of the 3–5% band at 32 peers with zero false positives and full observation
+coverage, and what is outstanding is running the harness on the other three
+determinism targets and adding the nights up.
 
 **Upstream milestone.** Publish the determinism conformance suite (quantization + `libm` math corpus) as a standalone repo; upstream any platform-drift fixes it surfaces.
 
