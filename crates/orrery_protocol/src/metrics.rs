@@ -58,6 +58,27 @@ pub const SERIES_AREA_FIRST_PAGE: &str = "area_first_page_ms";
 /// calling every nightly artifact malformed.
 pub const SERIES_GATEWAY_BULK_SERVER: &str = "gateway_bulk_server_ms";
 
+/// Server-side intent latency: gateway receipt of a `SubmitIntent` through the
+/// send call that answers it, measured inside `persistd`.
+///
+/// The server-side half of [`SERIES_INTENT_COMMIT`], and deliberately **not**
+/// that name. The gated series is a client round trip; this span is strictly
+/// shorter, and a consumer that folds both into one histogram — which is
+/// exactly what `p2-dashboard` does, by series name and with no source field —
+/// would deflate the gated p99 rather than measure anything. Separate name,
+/// separate histogram, no target.
+pub const SERIES_GATEWAY_INTENT_SERVER: &str = "gateway_intent_server_ms";
+
+/// Server-side area-load latency: gateway receipt of a `Subscribe` through the
+/// send call carrying its **first** `AreaPage` frame, measured inside
+/// `persistd`.
+///
+/// The server-side half of [`SERIES_AREA_FIRST_PAGE`], ungated for the same
+/// reason as [`SERIES_GATEWAY_INTENT_SERVER`]. A subscribe that names no cell,
+/// or whose every cell read fails, sends no page and contributes no sample —
+/// the refusals are counted instead.
+pub const SERIES_GATEWAY_AREA_FIRST_PAGE_SERVER: &str = "gateway_area_first_page_server_ms";
+
 /// The four gated D16 series, in canonical report order.
 pub const GATED_SERIES: [&str; 4] = [
     SERIES_JOURNAL_COMMIT,
@@ -67,7 +88,17 @@ pub const GATED_SERIES: [&str; 4] = [
 ];
 
 /// Series carried by the P2 artifact that no D16 target gates.
-pub const UNGATED_SERIES: [&str; 1] = [SERIES_GATEWAY_BULK_SERVER];
+///
+/// Every member is a *server-internal* span produced by `persistd`, named so
+/// it can never be folded into the gated series it attributes. Growing this
+/// array is a deliberate cross-workspace change: `p2-dashboard`'s `SERIES_KEYS`
+/// is fixed-length over `GATED_SERIES.len() + UNGATED_SERIES.len()`, so a new
+/// member is a compile error there until the gate is taught to fold it.
+pub const UNGATED_SERIES: [&str; 3] = [
+    SERIES_GATEWAY_BULK_SERVER,
+    SERIES_GATEWAY_INTENT_SERVER,
+    SERIES_GATEWAY_AREA_FIRST_PAGE_SERVER,
+];
 
 /// Follower append latency: receipt of a chain batch through its durable
 /// acknowledgement, measured inside the follower `persistd`.
@@ -265,6 +296,25 @@ mod tests {
         assert!(CHAIN_LATENCY_SERIES
             .iter()
             .all(|name| CHAIN_SERIES.contains(name)));
+    }
+
+    #[test]
+    fn no_ungated_series_shadows_a_gated_one() {
+        // The whole point of a separate name: a server-internal span is
+        // strictly shorter than the client round trip it attributes, and a
+        // consumer folds by name alone.
+        for ungated in UNGATED_SERIES {
+            assert!(
+                !GATED_SERIES.contains(&ungated),
+                "{ungated} would deflate a gated p99"
+            );
+        }
+        let mut names = GATED_SERIES.to_vec();
+        names.extend_from_slice(&UNGATED_SERIES);
+        let total = names.len();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), total, "duplicate series name");
     }
 
     #[test]
