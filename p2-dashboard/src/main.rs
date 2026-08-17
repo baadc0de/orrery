@@ -50,12 +50,19 @@ use orrery_persist_client::latency::{
 /// the reconstruction rule all come from `orrery_protocol::metrics` through
 /// the client crate's re-export — one definition, shared with the rig that
 /// produces the stream and the persistd that appends to it.
+///
+/// The length is derived, so growing `UNGATED_SERIES` upstream is a compile
+/// error here rather than a series silently counted as unknown. That is the
+/// intended failure: this workspace is excluded from the root one, so nothing
+/// else would notice.
 const SERIES_KEYS: [&str; GATED_SERIES.len() + UNGATED_SERIES.len()] = [
     GATED_SERIES[0],
     GATED_SERIES[1],
     GATED_SERIES[2],
     GATED_SERIES[3],
     UNGATED_SERIES[0],
+    UNGATED_SERIES[1],
+    UNGATED_SERIES[2],
 ];
 
 /// How many of [`SERIES_KEYS`] carry a D16 threshold. The rest are folded and
@@ -539,6 +546,12 @@ fn print_human(r: &Report) {
 mod tests {
     use super::*;
     use orrery_persist_client::latency::SERIES_GATEWAY_BULK_SERVER;
+
+    /// The two server-side spans persistd added alongside the bulk one. Named
+    /// through `UNGATED_SERIES` rather than imported: the client crate
+    /// re-exports the array, and the array is the contract this gate folds.
+    const SERIES_GATEWAY_INTENT_SERVER: &str = UNGATED_SERIES[1];
+    const SERIES_GATEWAY_AREA_FIRST_PAGE_SERVER: &str = UNGATED_SERIES[2];
     use std::io::Write;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -744,6 +757,80 @@ mod tests {
             ExitCode::SUCCESS
         );
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn server_side_spans_are_folded_separately_from_the_gated_round_trips() {
+        // The failure this guards is silent and one-directional: a server
+        // span is strictly shorter than the client round trip it attributes,
+        // so folding it into the gated series would *lower* the p99 and pass
+        // a gate that measured nothing. Same artifact, same fold, four
+        // distinct histograms.
+        let path = tmp("server-spans");
+        let mut lines = conforming();
+        for _ in 0..40u64 {
+            lines.push(sample(SERIES_GATEWAY_INTENT_SERVER, 200));
+            lines.push(sample(SERIES_GATEWAY_AREA_FIRST_PAGE_SERVER, 500));
+        }
+        write_jsonl(&path, &lines);
+        let cli = gate_cli(vec![path.clone()]);
+        let loaded = load(&cli.files).expect("test jsonl loads");
+        assert_eq!(loaded.unknown_series, 0, "both names are in the contract");
+
+        let slot = |key: &str| {
+            SERIES_KEYS
+                .iter()
+                .position(|&k| k == key)
+                .expect("every contract series has a slot")
+        };
+        assert_eq!(
+            loaded.histograms[slot(SERIES_GATEWAY_INTENT_SERVER)].total(),
+            40
+        );
+        assert_eq!(
+            loaded.histograms[slot(SERIES_GATEWAY_AREA_FIRST_PAGE_SERVER)].total(),
+            40
+        );
+
+        // The gated p99s are exactly what `conforming()` alone produces: the
+        // server spans landed nowhere near them.
+        let baseline = {
+            let base = tmp("server-spans-baseline");
+            write_jsonl(&base, &conforming());
+            let loaded = load(std::slice::from_ref(&base)).expect("baseline loads");
+            let p99s: Vec<_> = GATED_SERIES
+                .iter()
+                .map(|&key| loaded.histograms[slot(key)].p99())
+                .collect();
+            let _ = std::fs::remove_file(base);
+            p99s
+        };
+        let observed: Vec<_> = GATED_SERIES
+            .iter()
+            .map(|&key| loaded.histograms[slot(key)].p99())
+            .collect();
+        assert_eq!(observed, baseline, "a server span moved a gated p99");
+
+        assert_eq!(
+            report_and_maybe_gate(&cli, &ThresholdsUs::D16, &loaded),
+            ExitCode::SUCCESS
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn every_ungated_series_is_reported_and_none_of_them_gates() {
+        for key in UNGATED_SERIES {
+            assert!(
+                threshold_for(&ThresholdsUs::D16, key).is_none(),
+                "{key} acquired a D16 threshold"
+            );
+            assert!(
+                SERIES_KEYS.contains(&key),
+                "{key} is in the contract but has no slot in the fold"
+            );
+        }
+        assert_eq!(NUM_GATED, GATED_SERIES.len());
     }
 
     #[test]

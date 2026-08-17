@@ -19,9 +19,13 @@
 //! On startup the binary prints the gateway's [`EndpointAddr`] as a single-line
 //! JSON object on stdout (tracing stays on stderr) so a harness can find the
 //! address. The two signals that trigger graceful shutdown are SIGTERM and
-//! Ctrl-C. `--metrics-jsonl` appends primary-side `journal_commit_ms`
-//! `sample_batch` records to a separate P2 artifact file; it never alters the
-//! stdout readiness contract.
+//! Ctrl-C. `--metrics-jsonl` appends `sample_batch` records and gateway
+//! counter records to a separate P2 artifact file; it never alters the stdout
+//! readiness contract. The gateway counters themselves are collected
+//! unconditionally — the flag opens a sink, it does not start the
+//! measurement — but `persistd` has no scrape or admin surface, so on a node
+//! started without it those counters stay in-process until the D12 OTel
+//! bridge lands.
 //!
 //! The demo path this enables: start the binary with `--secret-key`, load it,
 //! `kill -9` the process, restart from the same FDB cluster and secret key, and
@@ -47,14 +51,17 @@ use orrery_persistd::journal::{
 };
 use orrery_persistd::{
     ActivationOutcome, AuthorityMetrics, CellRuntime, CheckpointScheduler,
-    CoordinatorHandoutAuthority, DurableChainId, FenceFreshnessConfig, FenceStore,
-    GatewayBulkMetrics, GatewayConfig, GatewayServer, GrpcChainTransport, IntentExecutor,
-    IntentValidator, IntentVerdict, JournalConfig, MemCheckpointStore, RuntimeConfig,
-    ShardActivation,
+    CoordinatorHandoutAuthority, DurableChainId, FenceFreshnessConfig, FenceStore, GatewayConfig,
+    GatewayMetrics, GatewayServer, GatewayServerLatency, GatewayServerLatencySnapshot,
+    GrpcChainTransport, IntentExecutor, IntentValidator, IntentVerdict, JournalConfig,
+    MemCheckpointStore, RuntimeConfig, ShardActivation,
 };
 #[cfg(feature = "fdb")]
 use orrery_persistd::{FdbContext, FdbIntentExecutor};
-use orrery_protocol::metrics::{SERIES_GATEWAY_BULK_SERVER, SERIES_JOURNAL_COMMIT};
+use orrery_protocol::metrics::{
+    SERIES_GATEWAY_AREA_FIRST_PAGE_SERVER, SERIES_GATEWAY_BULK_SERVER,
+    SERIES_GATEWAY_INTENT_SERVER, SERIES_JOURNAL_COMMIT,
+};
 use orrery_protocol::{
     CellId, Epoch, GridId, IssuerKey, IssuerKeyId, NodeId, REASON_VALIDATION_FAILED,
 };
@@ -159,9 +166,16 @@ struct Cli {
     #[arg(long, value_name = "RAW|X,Y,Z@LEVEL")]
     shard: Vec<ShardSpec>,
 
-    /// Append server-internal journal commit latency batches to this JSONL
-    /// file. Only an active gateway node emits these records; chain followers
-    /// remain passive and do not produce a D16 measurement stream.
+    /// Append server-internal latency batches and gateway counter records to
+    /// this JSONL file.
+    ///
+    /// A chain follower runs this reporter too, and the record set is the
+    /// difference between the two roles rather than the reporter's presence: a
+    /// follower has a journal, so it emits `journal_commit_ms` batches for its
+    /// own mirrored appends, and has no gateway, so its gateway counters never
+    /// move. Its `journal_commit_ms` is the follower's local commit latency,
+    /// not the primary's — do not merge the two files and read one p99 off
+    /// the result.
     #[arg(long, value_name = "PATH")]
     metrics_jsonl: Option<PathBuf>,
 }
@@ -189,15 +203,16 @@ impl MetricsReporter {
     }
 }
 
-/// Start a compact JSONL reporter for the active node's local journal.
+/// Start a compact JSONL reporter for one node's local journal and gateway.
 ///
-/// The caller deliberately invokes this only after the follower early-return:
-/// a passive follower mirrors records but must not be treated as the primary's
-/// server-internal commit-latency source.
+/// Both roles run it. A follower passes a gateway metrics handle nothing ever
+/// increments, so its file carries journal batches and no gateway records —
+/// which is the honest shape, because a follower does have a journal whose
+/// commit latency is worth seeing and does not have a gateway.
 fn spawn_metrics_reporter(
     path: PathBuf,
     journal: Arc<Journal>,
-    bulk_metrics: Option<Arc<GatewayBulkMetrics>>,
+    gateway_metrics: Arc<GatewayMetrics>,
     authority_metrics: Arc<AuthorityMetrics>,
 ) -> anyhow::Result<MetricsReporter> {
     let file = OpenOptions::new().create(true).append(true).open(&path)?;
@@ -206,63 +221,57 @@ fn spawn_metrics_reporter(
         let metrics = journal.commit_metrics();
         let mut cursor = metrics.snapshot();
         let mut stage_cursor = metrics.stage_snapshot();
-        let mut bulk_cursor = bulk_metrics.as_ref().map(|metrics| metrics.snapshot());
-        let mut bulk_latency_cursor = bulk_metrics
-            .as_ref()
-            .map(|metrics| metrics.latency_snapshot());
+        let mut bulk_cursor = gateway_metrics.bulk.snapshot();
+        let mut bulk_latency_cursor = gateway_metrics.bulk.latency_snapshot();
+        let mut intent_latency_cursor = gateway_metrics.intent.latency().snapshot();
+        let mut area_latency_cursor = gateway_metrics.area.latency().snapshot();
+        let mut intent_cursor = orrery_persistd::GatewayIntentSnapshot::default();
+        let mut area_cursor = orrery_persistd::GatewayAreaSnapshot::default();
+        let mut report_cursor = orrery_persistd::GatewayReportSnapshot::default();
         let mut authority_cursor = orrery_persistd::AuthoritySnapshot::default();
         let mut interval = tokio::time::interval(METRICS_REPORT_INTERVAL);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut writer = BufWriter::new(file);
 
+        // One drain path, called from both the interval tick and the final
+        // flush. Two copies of this chain is how a record ends up emitted
+        // every second and lost on shutdown, or the reverse.
+        let mut drain = move |writer: &mut BufWriter<std::fs::File>| -> std::io::Result<()> {
+            write_journal_metric_batches(&mut *writer, &metrics.delta(&mut cursor))?;
+            write_journal_stage_delta(&mut *writer, metrics.stage_delta(&mut stage_cursor))?;
+            write_gateway_bulk_latency(&mut *writer, &gateway_metrics, &mut bulk_latency_cursor)?;
+            write_gateway_server_latency(
+                &mut *writer,
+                SERIES_GATEWAY_INTENT_SERVER,
+                gateway_metrics.intent.latency(),
+                &mut intent_latency_cursor,
+            )?;
+            write_gateway_server_latency(
+                &mut *writer,
+                SERIES_GATEWAY_AREA_FIRST_PAGE_SERVER,
+                gateway_metrics.area.latency(),
+                &mut area_latency_cursor,
+            )?;
+            write_gateway_bulk_delta(&mut *writer, &gateway_metrics, &mut bulk_cursor)?;
+            write_gateway_intent(&mut *writer, &gateway_metrics, &mut intent_cursor)?;
+            write_gateway_area(&mut *writer, &gateway_metrics, &mut area_cursor)?;
+            write_gateway_report(&mut *writer, &gateway_metrics, &mut report_cursor)?;
+            write_gateway_authority(&mut *writer, &authority_metrics, &mut authority_cursor)?;
+            writer.flush()
+        };
+
         loop {
             tokio::select! {
                 _ = interval.tick() => {}
                 _ = &mut stopped => {
-                    if let Err(error) = write_journal_metric_batches(&mut writer, &metrics.delta(&mut cursor))
-                        .and_then(|()| write_journal_stage_delta(&mut writer, metrics.stage_delta(&mut stage_cursor)))
-                        .and_then(|()| write_gateway_bulk_delta(&mut writer, bulk_metrics.as_deref(), bulk_cursor.as_mut()))
-                        .and_then(|()| write_gateway_bulk_latency(&mut writer, bulk_metrics.as_deref(), bulk_latency_cursor.as_mut()))
-                        .and_then(|()| write_gateway_authority(&mut writer, &authority_metrics, &mut authority_cursor))
-                        .and_then(|()| writer.flush())
-                    {
+                    if let Err(error) = drain(&mut writer) {
                         tracing::warn!(path = %path.display(), %error, "failed to flush final journal metrics");
                     }
                     break;
                 }
             }
 
-            if let Err(error) =
-                write_journal_metric_batches(&mut writer, &metrics.delta(&mut cursor))
-                    .and_then(|()| {
-                        write_journal_stage_delta(
-                            &mut writer,
-                            metrics.stage_delta(&mut stage_cursor),
-                        )
-                    })
-                    .and_then(|()| {
-                        write_gateway_bulk_latency(
-                            &mut writer,
-                            bulk_metrics.as_deref(),
-                            bulk_latency_cursor.as_mut(),
-                        )
-                    })
-                    .and_then(|()| {
-                        write_gateway_bulk_delta(
-                            &mut writer,
-                            bulk_metrics.as_deref(),
-                            bulk_cursor.as_mut(),
-                        )
-                    })
-                    .and_then(|()| {
-                        write_gateway_authority(
-                            &mut writer,
-                            &authority_metrics,
-                            &mut authority_cursor,
-                        )
-                    })
-                    .and_then(|()| writer.flush())
-            {
+            if let Err(error) = drain(&mut writer) {
                 tracing::warn!(path = %path.display(), %error, "failed to write journal metrics; stopping reporter");
                 break;
             }
@@ -272,6 +281,12 @@ fn spawn_metrics_reporter(
 }
 
 /// Append the authority counters whenever any of them moved.
+///
+/// All seven of them. `divest_requested` and `handoff_timed_out` were absent
+/// for long enough to matter: the second is the zombie-host symptom
+/// docs/09-services-and-ops.md §10 builds a runbook around — a holder that
+/// answers no divest request — and a runbook whose symptom has no counter is
+/// a paragraph, not a procedure.
 ///
 /// These are absolute totals, not interval deltas: `duplicate_authority` is an
 /// invariant that must read zero for the life of the process, and a gauge that
@@ -295,22 +310,22 @@ fn write_gateway_authority(
             "parked_without_successor": snapshot.parked_without_successor,
             "divested": snapshot.divested,
             "divest_rejected": snapshot.divest_rejected,
+            "divest_requested": snapshot.divest_requested,
+            "handoff_timed_out": snapshot.handoff_timed_out,
         }),
     )
     .map_err(std::io::Error::other)?;
     writer.write_all(b"\n")
 }
 
-/// Export the server receipt-through-send-call histogram in dashboard form.
+/// Export the server receipt-through-send-call bulk histogram in dashboard
+/// form.
 fn write_gateway_bulk_latency(
     mut writer: impl Write,
-    metrics: Option<&GatewayBulkMetrics>,
-    cursor: Option<&mut orrery_persistd::GatewayBulkLatencySnapshot>,
+    metrics: &GatewayMetrics,
+    cursor: &mut orrery_persistd::GatewayBulkLatencySnapshot,
 ) -> std::io::Result<()> {
-    let (Some(metrics), Some(cursor)) = (metrics, cursor) else {
-        return Ok(());
-    };
-    for sample in metrics.latency_delta(cursor) {
+    for sample in metrics.bulk.latency_delta(cursor) {
         serde_json::to_writer(
             &mut writer,
             &serde_json::json!({
@@ -326,16 +341,134 @@ fn write_gateway_bulk_latency(
     Ok(())
 }
 
+/// Export one server-side span histogram under its own ungated series name.
+///
+/// The name is a parameter and the two callers pass
+/// `gateway_intent_server_ms` and `gateway_area_first_page_server_ms` — never
+/// `intent_commit_ms` or `area_first_page_ms`. Those are client round trips
+/// gated by D16, and `p2-dashboard` folds by series name into one histogram
+/// with no source field: a server span written under a gated name would lower
+/// that p99 and pass a gate it never measured.
+fn write_gateway_server_latency(
+    mut writer: impl Write,
+    series: &str,
+    latency: &GatewayServerLatency,
+    cursor: &mut GatewayServerLatencySnapshot,
+) -> std::io::Result<()> {
+    for sample in latency.delta(cursor) {
+        serde_json::to_writer(
+            &mut writer,
+            &serde_json::json!({
+                "type": "sample_batch",
+                "series": series,
+                "value_us": sample.value_us,
+                "count": sample.count,
+            }),
+        )
+        .map_err(std::io::Error::other)?;
+        writer.write_all(b"\n")?;
+    }
+    Ok(())
+}
+
+/// Append the intent-path counters whenever any of them moved.
+fn write_gateway_intent(
+    mut writer: impl Write,
+    metrics: &GatewayMetrics,
+    cursor: &mut orrery_persistd::GatewayIntentSnapshot,
+) -> std::io::Result<()> {
+    let snapshot = metrics.intent.snapshot();
+    if snapshot == *cursor {
+        return Ok(());
+    }
+    *cursor = snapshot;
+    serde_json::to_writer(
+        &mut writer,
+        &serde_json::json!({
+            "type": "gateway_intent",
+            "replies": snapshot.replies,
+            "committed": snapshot.committed,
+            "rejected": snapshot.rejected,
+            "rejected_no_executor": snapshot.rejected_no_executor,
+            "lane_saturated": snapshot.lane_saturated,
+            "server_us_sum": snapshot.server_us_sum,
+            "server_us_max": snapshot.server_us_max,
+        }),
+    )
+    .map_err(std::io::Error::other)?;
+    writer.write_all(b"\n")
+}
+
+/// Append the area-load counters whenever any of them moved.
+fn write_gateway_area(
+    mut writer: impl Write,
+    metrics: &GatewayMetrics,
+    cursor: &mut orrery_persistd::GatewayAreaSnapshot,
+) -> std::io::Result<()> {
+    let snapshot = metrics.area.snapshot();
+    if snapshot == *cursor {
+        return Ok(());
+    }
+    *cursor = snapshot;
+    serde_json::to_writer(
+        &mut writer,
+        &serde_json::json!({
+            "type": "gateway_area",
+            "subscribes": snapshot.subscribes,
+            "first_pages": snapshot.first_pages,
+            "frames": snapshot.frames,
+            "cell_read_errors": snapshot.cell_read_errors,
+            "first_page_us_sum": snapshot.first_page_us_sum,
+            "first_page_us_max": snapshot.first_page_us_max,
+        }),
+    )
+    .map_err(std::io::Error::other)?;
+    writer.write_all(b"\n")
+}
+
+/// Append the discrepancy-report outcome and refusal split whenever it moved.
+///
+/// Absolute totals, like the authority record and for the same reason: a
+/// refusal that happened one interval ago is the thing an operator is looking
+/// for, and an interval gauge that resets would hide it.
+fn write_gateway_report(
+    mut writer: impl Write,
+    metrics: &GatewayMetrics,
+    cursor: &mut orrery_persistd::GatewayReportSnapshot,
+) -> std::io::Result<()> {
+    let snapshot = metrics.report.snapshot();
+    if snapshot == *cursor {
+        return Ok(());
+    }
+    *cursor = snapshot;
+    serde_json::to_writer(
+        &mut writer,
+        &serde_json::json!({
+            "type": "gateway_report",
+            "verdicts": snapshot.verdicts,
+            "adjudicated": snapshot.adjudicated,
+            "confirms": snapshot.confirms,
+            "exonerates": snapshot.exonerates,
+            "evidence_forged": snapshot.evidence_forged,
+            "unadjudicable": snapshot.unadjudicable,
+            "refused_no_adjudicator": snapshot.refused_no_adjudicator,
+            "refused_rate_limited": snapshot.refused_rate_limited,
+            "refused_reporter_mismatch": snapshot.refused_reporter_mismatch,
+            "refused_no_session": snapshot.refused_no_session,
+            "refused_other": snapshot.refused_other,
+        }),
+    )
+    .map_err(std::io::Error::other)?;
+    writer.write_all(b"\n")
+}
+
 /// Append one compact interval aggregate for gateway stages outside Fjall.
 fn write_gateway_bulk_delta(
     mut writer: impl Write,
-    metrics: Option<&GatewayBulkMetrics>,
-    cursor: Option<&mut orrery_persistd::GatewayBulkSnapshot>,
+    metrics: &GatewayMetrics,
+    cursor: &mut orrery_persistd::GatewayBulkSnapshot,
 ) -> std::io::Result<()> {
-    let (Some(metrics), Some(cursor)) = (metrics, cursor) else {
-        return Ok(());
-    };
-    let delta = metrics.delta(cursor);
+    let delta = metrics.bulk.delta(cursor);
     if delta.acknowledgements == 0 {
         return Ok(());
     }
@@ -641,20 +774,21 @@ async fn main() -> anyhow::Result<()> {
     // This executes only on an active node: passive followers returned above
     // before opening a runtime. Capture the journal before handing the runtime
     // to the gateway/router so reporter lifetime is independent of routing.
-    let bulk_metrics = cli
-        .metrics_jsonl
-        .as_ref()
-        .map(|_| Arc::new(GatewayBulkMetrics::default()));
-    // Authority telemetry is always collected, unlike the optional bulk
-    // histograms: the single-writer invariant must be observable on any node
-    // that serves leases, whether or not a metrics file was requested.
+    // Server-side telemetry is always collected, on the authority-metrics
+    // precedent: the flag opens a sink, it does not start the measurement.
+    // A counter that only exists when someone remembered a flag is a
+    // debugging session scheduled in advance, not telemetry. What this does
+    // not do is make them reachable — there is no scrape or admin surface on
+    // this binary, so without `--metrics-jsonl` they stay in-process until
+    // the D12 OTel bridge reads them.
+    let gateway_metrics = Arc::new(GatewayMetrics::default());
     let authority_metrics = Arc::new(AuthorityMetrics::default());
     let metrics_reporter = if let Some(path) = cli.metrics_jsonl.clone() {
         let journal = Arc::clone(runtime.journal());
         Some(spawn_metrics_reporter(
             path,
             journal,
-            bulk_metrics.clone(),
+            Arc::clone(&gateway_metrics),
             Arc::clone(&authority_metrics),
         )?)
     } else {
@@ -769,7 +903,7 @@ async fn main() -> anyhow::Result<()> {
     if let Some(monitor) = &fence_freshness_monitor {
         gateway_config.bulk_ack_admission = monitor.clone();
     }
-    gateway_config.bulk_metrics = bulk_metrics;
+    gateway_config.metrics = Arc::clone(&gateway_metrics);
     gateway_config.authority_metrics = Arc::clone(&authority_metrics);
     // Read before the config is consumed by `spawn`. Reported on the readiness
     // line because "can this cluster adjudicate a discrepancy report" is not
@@ -937,7 +1071,7 @@ async fn run_follower(cli: &Cli, topology: &Topology) -> anyhow::Result<()> {
             spawn_metrics_reporter(
                 path,
                 Arc::clone(&journal),
-                None,
+                Arc::new(GatewayMetrics::default()),
                 Arc::new(AuthorityMetrics::default()),
             )
         })
@@ -1575,6 +1709,54 @@ mod tests {
                 }),
             ]
         );
+    }
+
+    #[test]
+    fn gateway_authority_record_carries_every_counter() {
+        // Five of the seven were emitted for a while. The two that were not
+        // are `divest_requested` and `handoff_timed_out`, and the second is
+        // the zombie-host symptom docs/09-services-and-ops.md §10's runbook
+        // turns on: a holder that answers no divest request. The snapshot is
+        // the schema's only source, so the assertion is on the key set.
+        let metrics = AuthorityMetrics::default();
+        // A cursor that differs from the (all-zero) snapshot, so the record is
+        // written: the writer is deliberately change-triggered.
+        let mut cursor = orrery_persistd::AuthoritySnapshot {
+            divest_requested: 1,
+            ..orrery_persistd::AuthoritySnapshot::default()
+        };
+        let mut output = Vec::new();
+        write_gateway_authority(&mut output, &metrics, &mut cursor)
+            .expect("JSONL serialization succeeds");
+
+        let record: serde_json::Value =
+            serde_json::from_str(std::str::from_utf8(&output).expect("JSONL is UTF-8").trim())
+                .expect("valid JSONL record");
+        assert_eq!(record["type"], "gateway_authority");
+        for field in [
+            "duplicate_authority",
+            "reassigned",
+            "parked_without_successor",
+            "divested",
+            "divest_rejected",
+            "divest_requested",
+            "handoff_timed_out",
+        ] {
+            assert!(
+                record.get(field).is_some(),
+                "gateway_authority dropped {field}"
+            );
+        }
+        let object = record.as_object().expect("record is an object");
+        assert_eq!(
+            object.len(),
+            8,
+            "seven counters plus the type tag: {object:?}"
+        );
+        // p3-island's reader takes `duplicate_authority` and ignores every
+        // other key, so widening the record is safe for the one parser there
+        // is (`p3-island/src/main.rs`).
+        assert_eq!(record["duplicate_authority"], 0);
     }
 
     #[test]
