@@ -389,6 +389,59 @@ pub const REASON_CONTENTION_EXHAUSTED: u16 = 5;
 /// The executor failed for a non-conflict reason (store unavailable, …).
 pub const REASON_EXECUTOR_ERROR: u16 = 6;
 
+/// [`GatewayReply::ReportVerdict`] reason: the report was adjudicated, and the
+/// reply's `verdict` carries the answer.
+///
+/// # Why this is its own numbering rather than more `REASON_*`
+///
+/// The `REASON_*` codes above are `IntentOutcome::Rejected` reasons: they
+/// answer "why was this durable write refused", and the space below `7` is
+/// partly a `Ruleset`'s to extend. A refused *report* is a different question
+/// on a different message, so it gets its own space rather than borrowing
+/// numbers whose meaning a game may redefine. The two never appear in the same
+/// field.
+///
+/// [`GatewayReply::ReportVerdict`]: crate::GatewayReply::ReportVerdict
+pub const REPORT_ADJUDICATED: u16 = 0;
+/// [`GatewayReply::ReportVerdict`] reason: this gateway has no adjudication
+/// executor configured, so nothing here can judge the evidence.
+///
+/// The honest answer to a report the cluster cannot adjudicate, and the
+/// counterpart of [`REASON_NO_EXECUTOR`] on the intent path: silence would
+/// leave a witness re-filing forever against a gateway that was never going to
+/// answer. It is deliberately reachable in a default build — the executor is
+/// registered by the deployed binary the game team links its `Ruleset` into
+/// (docs/09-services-and-ops.md §1), not by this crate.
+///
+/// [`GatewayReply::ReportVerdict`]: crate::GatewayReply::ReportVerdict
+pub const REPORT_REFUSED_NO_ADJUDICATOR: u16 = 1;
+/// [`GatewayReply::ReportVerdict`] reason: this account is over its report
+/// rate limit (docs/07-witnessing.md §7, "observer is the liar").
+///
+/// Not a strike, and never confused with one: `Unadjudicable` verdicts carry
+/// no weight either, so a reporter cannot be punished for a flood — only shed.
+///
+/// [`GatewayReply::ReportVerdict`]: crate::GatewayReply::ReportVerdict
+pub const REPORT_REFUSED_RATE_LIMITED: u16 = 2;
+/// [`GatewayReply::ReportVerdict`] reason: the report's `reporter` is not the
+/// connection's authenticated transport identity.
+///
+/// The same binding [`REASON_ISSUER_MISMATCH`] enforces for intents, and it is
+/// what makes the per-account limit above meaningful: without it a flooder
+/// would simply spend somebody else's budget.
+///
+/// [`GatewayReply::ReportVerdict`]: crate::GatewayReply::ReportVerdict
+pub const REPORT_REFUSED_REPORTER_MISMATCH: u16 = 3;
+/// [`GatewayReply::ReportVerdict`] reason: the connection has no established
+/// session, so there is no account to bill the report to.
+///
+/// Rate limiting is per *account* (§7), which a pre-`Hello` connection does
+/// not have. Accepting reports there would leave the one unmetered path into
+/// the adjudicator.
+///
+/// [`GatewayReply::ReportVerdict`]: crate::GatewayReply::ReportVerdict
+pub const REPORT_REFUSED_NO_SESSION: u16 = 4;
+
 /// A checkpoint watermark (D11 §3.4, §6 `ckpt/{shard}` row).
 ///
 /// Records which journal LSN the last checkpoint covered, plus the epoch it
