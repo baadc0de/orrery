@@ -207,6 +207,27 @@ Commentary on the load-bearing choices:
 - **`classify_component`** is the single source of truth for §2's table; `orrery_persist_client` uses it to route bulk diffs vs. intents, `orrery_witness` uses it to decide what to watch.
 - **`invariants()`** supplies the stage-1 witness checks. Every interested peer runs them on received state regardless of witness-set membership, and cell actors run them on inbound bulk diffs — mandatory in cells with fewer than N witness candidates, sampled elsewhere (§D11). They are the only validation most bulk-class state ever gets, which is why they live on the `Ruleset` rather than in `orrery_witness`.
 
+> **Implementation status of the neighbour-read path.** The recording half of
+> that bullet is not built. `RecordSource::NeighborFrame`
+> (`orrery_protocol/src/verifiable.rs`) carries `neighbor: PersistId` and
+> nothing else — not the quantized fields this section says it does — and no
+> production code path constructs one; `Executor::step_entity` collects
+> `TickOutcome::neighbor_reads` and no logger consumes it. Until a producer
+> exists, **a neighbour read is unadjudicable**, not merely unrecorded: the
+> adjudicator installs exactly one entity
+> (`ReplayHarness::load_claimed_snapshot`), so its neighbour map is empty and a
+> rule that consulted a neighbour resolves differently under replay than it did
+> under play — a mismatch against an *honest* peer. `orrery_witness` states the
+> same conclusion from the other end and isolates each entity for it; see the
+> `Witness` type documentation in `crates/orrery_witness/src/witness.rs`
+> ("Core steps should not read neighbours", ~line 346). Reference-game rules are
+> written to that restriction: `orrery_games`' Skirmish splits a shot across the
+> attacker's and the target's own steps rather than reading the target, and
+> `orrery_games::scenario::adjudicate_isolated` is the harness clause that holds
+> it there. This is a gap in the implementation, not a narrowing of the decision
+> above: neighbour reads remain permitted by §3 and by D9, and become
+> adjudicable when `NeighborFrame` gains a producer that records the fields.
+
 ## 4. Determinism rules (hard requirements on core code)
 
 These are contractual for any code reachable from `step`, `validate_intent`, `park_tick`, or `catch_up`. CI enforces what it can (§8); the rest is review discipline.
