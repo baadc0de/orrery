@@ -53,15 +53,17 @@ use orrery_protocol::channels::{
     decode_datagram, decode_stream_frame, encode_datagram, encode_stream_frame, untag, Channel,
 };
 use orrery_protocol::{
-    verify_interest_grant, AreaPage, CellId, CoordinatorInterestSnapshot, DiffUplink, Epoch,
-    GatewayMsg, GatewayReply, GridId, Intent, IntentOutcome, IssuerKey, JournalRecord, LeaseId,
-    LeaseMsg, Lsn, NodeId, PersistId, SessionTokenClaimsV1, SessionTokenV1,
-    SessionTokenVerificationError, SessionTokenVerifier, UnixMillis, MAX_AREA_PAGE_FRAME_BYTES,
-    MAX_SESSION_TOKEN_TTL_MS, PROTOCOL_VERSION, REASON_BAD_SIGNATURE, REASON_ISSUER_MISMATCH,
-    REASON_NO_EXECUTOR,
+    verify_interest_grant, AccountId, AreaPage, CellId, CoordinatorInterestSnapshot, DiffUplink,
+    DiscrepancyReport, Epoch, GatewayMsg, GatewayReply, GridId, Intent, IntentOutcome, IssuerKey,
+    JournalRecord, LeaseId, LeaseMsg, Lsn, NodeId, PersistId, SessionTokenClaimsV1, SessionTokenV1,
+    SessionTokenVerificationError, SessionTokenVerifier, Tick, UnixMillis, Verdict,
+    MAX_AREA_PAGE_FRAME_BYTES, MAX_SESSION_TOKEN_TTL_MS, PROTOCOL_VERSION, REASON_BAD_SIGNATURE,
+    REASON_ISSUER_MISMATCH, REASON_NO_EXECUTOR, REPORT_ADJUDICATED, REPORT_REFUSED_NO_ADJUDICATOR,
+    REPORT_REFUSED_NO_SESSION, REPORT_REFUSED_RATE_LIMITED, REPORT_REFUSED_REPORTER_MISMATCH,
 };
 
 use crate::actor::{FencedApply, Reject};
+use crate::adjudication::AdjudicationExecutor;
 use crate::cluster::Router;
 use crate::intent::{
     error_outcome, IntentVerdict, PermissiveValidator, SharedExecutor, SharedValidator,
@@ -260,6 +262,129 @@ const MAX_INFLIGHT_INTENT_ROUTES_PER_CONN: usize = 16;
 const MAX_PEER_REGISTRY_ENTRIES: usize = 4_096;
 
 const MAX_PEER_LIVE_LEASES: usize = 256;
+
+/// The adjudication executor a gateway routes discrepancy reports to
+/// (docs/07-witnessing.md §3 stage 4).
+///
+/// `Arc<AdjudicationExecutor>` rather than `Arc<dyn …>`: the executor is
+/// already the indirection — it boxes one worker closure per retained rules
+/// build — so a second trait object would only hide the seam. It is shared
+/// across connections because retention is a *cluster* property (D16 keeps
+/// three builds), not a session's.
+pub type SharedAdjudicator = Arc<AdjudicationExecutor>;
+
+/// Reports one account may file per second, sustained.
+///
+/// Derived rather than invented: a witness watches at most
+/// `MAX_WITNESS_LINKS` = 7 subjects, escalates a given divergence episode
+/// **once** (`Catchup::reported` in `orrery_witness`), and every window it can
+/// file spans up to `MAX_ADJUDICATION_TICKS` = 180 ticks, i.e. three seconds.
+/// An honest reporter therefore tops out near 7 reports per 3 s ≈ 2.3/s, and
+/// only if every one of its subjects diverged at once.
+const REPORTS_PER_SECOND: u64 = 3;
+
+/// Reports one account may file back to back before the sustained rate binds.
+///
+/// One per watched subject, twice over: a witness that rejoins an island and
+/// re-anchors seven watches can legitimately find several stale divergences in
+/// the same frame, and shedding those would lose exactly the evidence the
+/// phase exists to collect.
+const REPORT_BURST: u64 = 16;
+
+/// Accounts the report limiter tracks at once.
+///
+/// The limiter is the one piece of gateway state keyed by *account* rather
+/// than by connection, so it needs its own bound: without one, a flooder
+/// cycling accounts turns rate limiting into unbounded memory. At the cap the
+/// limiter first drops entries that have refilled to full — those are
+/// indistinguishable from absent ones — and refuses only if none has.
+const MAX_REPORT_LIMITER_ACCOUNTS: usize = 4_096;
+
+/// Per-account report admission (docs/07-witnessing.md §7, "observer is the
+/// liar": report spam is rate-limited per account, never struck).
+///
+/// Per **account**, which is why this cannot live on `PeerState` the way
+/// `ClaimBucket` does: that map is keyed by `NodeId`, and one account may hold
+/// several. Metering per connection would leave the limit worth as many
+/// multiples as the flooder cares to dial.
+struct ReportLimiter {
+    buckets: tokio::sync::Mutex<HashMap<AccountId, ReportBucket>>,
+}
+
+impl ReportLimiter {
+    fn new() -> Self {
+        Self {
+            buckets: tokio::sync::Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Whether `account` may file one report at `now_ms`.
+    async fn admit(&self, account: AccountId, now_ms: u64) -> bool {
+        let mut buckets = self.buckets.lock().await;
+        if !buckets.contains_key(&account) && buckets.len() >= MAX_REPORT_LIMITER_ACCOUNTS {
+            // A bucket at full tokens says exactly what an absent one says, so
+            // reclaiming those costs nothing. Anything still spending is the
+            // state this limiter exists to keep.
+            buckets.retain(|_, bucket| !bucket.is_full(now_ms));
+            if buckets.len() >= MAX_REPORT_LIMITER_ACCOUNTS {
+                return false;
+            }
+        }
+        buckets
+            .entry(account)
+            .or_insert_with(|| ReportBucket::new(now_ms))
+            .take(now_ms)
+    }
+}
+
+/// One account's report token bucket. Same shape as [`ClaimBucket`], in
+/// thousandths of a token so the refill is exact at millisecond resolution.
+#[derive(Debug, Clone, Copy)]
+struct ReportBucket {
+    token_millis: u64,
+    updated_ms: u64,
+}
+
+impl ReportBucket {
+    const TOKEN_MILLIS_PER_REPORT: u64 = 1_000;
+    const BURST_TOKEN_MILLIS: u64 = REPORT_BURST * Self::TOKEN_MILLIS_PER_REPORT;
+
+    const fn new(now_ms: u64) -> Self {
+        Self {
+            token_millis: Self::BURST_TOKEN_MILLIS,
+            updated_ms: now_ms,
+        }
+    }
+
+    fn refill(&mut self, now_ms: u64) {
+        if now_ms > self.updated_ms {
+            let replenished = now_ms
+                .saturating_sub(self.updated_ms)
+                .saturating_mul(REPORTS_PER_SECOND);
+            self.token_millis = self
+                .token_millis
+                .saturating_add(replenished)
+                .min(Self::BURST_TOKEN_MILLIS);
+            self.updated_ms = now_ms;
+        }
+    }
+
+    fn take(&mut self, now_ms: u64) -> bool {
+        self.refill(now_ms);
+        if self.token_millis < Self::TOKEN_MILLIS_PER_REPORT {
+            false
+        } else {
+            self.token_millis -= Self::TOKEN_MILLIS_PER_REPORT;
+            true
+        }
+    }
+
+    fn is_full(&self, now_ms: u64) -> bool {
+        let mut probe = *self;
+        probe.refill(now_ms);
+        probe.token_millis >= Self::BURST_TOKEN_MILLIS
+    }
+}
 
 /// Decides whether a successful bulk route can make the normal durable-ack
 /// claim.
@@ -987,6 +1112,19 @@ pub struct GatewayConfig {
     /// ([`REASON_NO_EXECUTOR`]) rather than acking a commit that never
     /// happened — the inverted RPO-0 the stub had.
     pub executor: Option<SharedExecutor>,
+    /// The discrepancy-report adjudicator (docs/07-witnessing.md §3 stage 4).
+    /// `None` means this gateway cannot judge evidence, so it refuses reports
+    /// with [`REPORT_REFUSED_NO_ADJUDICATOR`] rather than dropping them — the
+    /// same honesty [`executor`](Self::executor) owes intents, for the same
+    /// reason: silence is indistinguishable from a slow cluster, and a witness
+    /// would re-file against it forever.
+    ///
+    /// **The default is `None` and stays `None`.** Adjudication re-runs a
+    /// concrete `Ruleset`, and docs/09-services-and-ops.md §1 is normative that
+    /// "the game team links its `Ruleset` and builds the deployed binary" —
+    /// so this crate ships the registration seam and registers nothing. A
+    /// cluster with an adjudicator is one somebody built one into.
+    pub adjudicator: Option<SharedAdjudicator>,
     /// The intent admission validator (D11 §2.2, first stage). Defaults to
     /// the permissive stub so the harness runs unconfigured; a linked
     /// `Ruleset` swaps in real validation.
@@ -1048,6 +1186,7 @@ impl Default for GatewayConfig {
             bind: "127.0.0.1:0".parse().expect("static valid loopback addr"),
             protocol_version: PROTOCOL_VERSION,
             executor: None,
+            adjudicator: None,
             validator: Arc::new(PermissiveValidator),
             bulk_ack_admission: Arc::new(FreshBulkAckAdmission),
             interest_authority: Arc::new(DenyAllInterestAuthority),
@@ -1158,6 +1297,14 @@ struct PeerRegistry {
 struct PeerSession {
     node: NodeId,
     generation: SessionGeneration,
+    /// The account this session authenticated as.
+    ///
+    /// Copied out of the established identity rather than read through the
+    /// mutex on every use: the per-account report limit is consulted on the
+    /// receive loop, where taking a peer lock would serialize reports behind
+    /// whatever lease operation currently holds it. A session's account cannot
+    /// change — a token naming a different one activates a new generation.
+    account: AccountId,
     state: Arc<tokio::sync::Mutex<PeerState>>,
 }
 
@@ -1337,10 +1484,12 @@ impl PeerRegistry {
                 lease.owner = SessionLeaseOwner::Active(generation);
             }
         }
+        let account = peer.established.claims.account;
         drop(peer);
         Some(PeerSession {
             node,
             generation,
+            account,
             state,
         })
     }
@@ -1352,13 +1501,14 @@ impl PeerRegistry {
     /// negotiated handoff.
     async fn current_session(&self, node: NodeId) -> Option<PeerSession> {
         let state = Arc::clone(self.entries.lock().await.get(&node)?);
-        let generation = {
+        let (generation, account) = {
             let peer = state.lock().await;
-            peer.current?
+            (peer.current?, peer.established.claims.account)
         };
         Some(PeerSession {
             node,
             generation,
+            account,
             state,
         })
     }
@@ -1895,6 +2045,7 @@ impl GatewayServer {
         let gateway = endpoint.id();
         let protocol = config.protocol_version;
         let executor = config.executor;
+        let adjudicator = config.adjudicator;
         let validator = config.validator;
         let bulk_ack_admission = config.bulk_ack_admission;
         let interest_authority = config.interest_authority;
@@ -1920,6 +2071,9 @@ impl GatewayServer {
             pending: tokio::sync::Mutex::new(HashMap::new()),
         });
         let lease_sweep_clock = config.lease_sweep_clock;
+        // One limiter per gateway, not per connection: the limit is per
+        // account (docs/07 §7) and an account may hold several connections.
+        let report_limiter = Arc::new(ReportLimiter::new());
         let (shutdown, rx) = oneshot::channel();
         let send_failures = Arc::new(AtomicU64::new(0));
         let join = tokio::spawn(accept_loop(
@@ -1928,10 +2082,12 @@ impl GatewayServer {
             gateway,
             protocol,
             executor,
+            adjudicator,
             validator,
             bulk_ack_admission,
             Arc::clone(&interest_authority),
             admission,
+            report_limiter,
             bulk_metrics,
             redistributor,
             lease_sweep_clock,
@@ -2004,10 +2160,12 @@ async fn accept_loop(
     gateway: NodeId,
     protocol: u16,
     executor: Option<SharedExecutor>,
+    adjudicator: Option<SharedAdjudicator>,
     validator: SharedValidator,
     bulk_ack_admission: SharedBulkAckAdmission,
     interest_authority: SharedInterestAuthority,
     admission: GatewayAdmission,
+    report_limiter: Arc<ReportLimiter>,
     bulk_metrics: Option<Arc<GatewayBulkMetrics>>,
     redistributor: Arc<Redistributor>,
     lease_sweep_clock: SharedClaimClock,
@@ -2031,10 +2189,12 @@ async fn accept_loop(
                 let Some(incoming) = incoming else { break };
                 let router = Arc::clone(&router);
                 let executor = executor.clone();
+                let adjudicator = adjudicator.clone();
                 let validator = Arc::clone(&validator);
                 let bulk_ack_admission = Arc::clone(&bulk_ack_admission);
                 let interest_authority = Arc::clone(&interest_authority);
                 let admission = admission.clone();
+                let report_limiter = Arc::clone(&report_limiter);
                 let bulk_metrics = bulk_metrics.clone();
                 let redistributor = Arc::clone(&redistributor);
                 let send_failures = Arc::clone(&send_failures);
@@ -2044,10 +2204,12 @@ async fn accept_loop(
                     gateway,
                     protocol,
                     executor,
+                    adjudicator,
                     validator,
                     bulk_ack_admission,
                     interest_authority,
                     admission,
+                    report_limiter,
                     bulk_metrics,
                     redistributor,
                     send_failures,
@@ -2073,10 +2235,12 @@ async fn handle_connection(
     gateway: NodeId,
     protocol: u16,
     executor: Option<SharedExecutor>,
+    adjudicator: Option<SharedAdjudicator>,
     validator: SharedValidator,
     bulk_ack_admission: SharedBulkAckAdmission,
     interest_authority: SharedInterestAuthority,
     admission: GatewayAdmission,
+    report_limiter: Arc<ReportLimiter>,
     bulk_metrics: Option<Arc<GatewayBulkMetrics>>,
     redistributor: Arc<Redistributor>,
     send_failures: Arc<AtomicU64>,
@@ -2669,6 +2833,41 @@ async fn handle_connection(
                     }
                 }
             }
+            GatewayMsg::Report { report } => {
+                // Edge checks first, on the receive loop: both are constant
+                // time and both decide whether the expensive part runs at all.
+                if report.reporter != remote {
+                    warn!(%remote, "gateway: report filed in another peer's name");
+                    send_report_refusal(send.as_ref(), &report, REPORT_REFUSED_REPORTER_MISMATCH);
+                    continue;
+                }
+                let Some(account) = session.as_ref().map(|session| session.account) else {
+                    // No session, no account, nothing to bill the report to.
+                    send_report_refusal(send.as_ref(), &report, REPORT_REFUSED_NO_SESSION);
+                    continue;
+                };
+                if !report_limiter
+                    .admit(account, admission.claim_clock.now_ms())
+                    .await
+                {
+                    send_report_refusal(send.as_ref(), &report, REPORT_REFUSED_RATE_LIMITED);
+                    continue;
+                }
+                let Some(adjudicator) = adjudicator.clone() else {
+                    send_report_refusal(send.as_ref(), &report, REPORT_REFUSED_NO_ADJUDICATOR);
+                    continue;
+                };
+                // Replay is CPU-bound — a full 180-tick single-entity window
+                // is budgeted at < 5 ms (docs/07 §7) — so it goes to the
+                // blocking pool rather than occupying a runtime worker that
+                // owes other connections their bulk acks.
+                let send = Arc::clone(&send);
+                let permit = Arc::clone(&inflight_control).acquire_owned().await;
+                tokio::task::spawn_blocking(move || {
+                    let _permit = permit;
+                    adjudicate_report(send.as_ref(), &adjudicator, &report);
+                });
+            }
         }
     }
     if let Some(session) = session {
@@ -3112,6 +3311,54 @@ async fn execute_admitted_intent(
         },
     };
     send_intent_reply(send, intent_id, outcome);
+}
+
+/// Re-run one report's evidence and answer with the verdict.
+///
+/// The executor believes nothing the reporter said: it checks the reporter
+/// signature, routes by the `RulesetId` the bundle pins, and re-executes.
+/// Whatever comes back — including `EvidenceForged`, which strikes the
+/// reporter that sent it — goes to the reporter, because a reporter that
+/// cannot see its own verdict cannot tell a cheat it caught from a bundle it
+/// assembled wrong.
+fn adjudicate_report(
+    send: &(dyn Fn(Bytes) + Send + Sync),
+    adjudicator: &AdjudicationExecutor,
+    report: &DiscrepancyReport,
+) {
+    let verdict = adjudicator.adjudicate(report);
+    send_report_verdict(send, report, Some(verdict), REPORT_ADJUDICATED);
+}
+
+/// Refuse a report with a stable code and no verdict.
+///
+/// Never silence: a witness that files into a gateway with no adjudicator
+/// configured, or over its account's rate limit, has to be able to tell that
+/// from an exoneration — the two call for opposite responses.
+fn send_report_refusal(
+    send: &(dyn Fn(Bytes) + Send + Sync),
+    report: &DiscrepancyReport,
+    reason: u16,
+) {
+    send_report_verdict(send, report, None, reason);
+}
+
+/// Encode and send one report's answer. Every path uses this helper so a
+/// report has exactly one reply, refusals included.
+fn send_report_verdict(
+    send: &(dyn Fn(Bytes) + Send + Sync),
+    report: &DiscrepancyReport,
+    verdict: Option<Verdict>,
+    reason: u16,
+) {
+    let reply = GatewayReply::ReportVerdict {
+        subject: report.subject,
+        entity: report.bundle.entity,
+        window_end: Tick::new(report.bundle.window_end.0),
+        verdict,
+        reason,
+    };
+    send(Bytes::from(encode_stream_frame(&reply)));
 }
 
 /// Encode and send an intent result. Every path uses this helper so an intent
