@@ -20,7 +20,7 @@
 //! | chains match the golden | an unintended rules change, and cross-platform drift |
 
 use orrery_games::game::{for_each_game, Game, GameVisitor, Tamper, CATALOGUE};
-use orrery_games::scenario::{adjudicate, check_codec, play, SCENARIOS};
+use orrery_games::scenario::{adjudicate, adjudicate_isolated, check_codec, play, SCENARIOS};
 
 /// Declare a test that runs over every game in the catalogue.
 macro_rules! game_test {
@@ -164,6 +164,55 @@ game_test!(every_tamper_is_adjudicable, Adjudicable, {
         assert!(
             divergence.is_some(),
             "{}: {} re-executed as honest — replay cannot see it",
+            G::META.name,
+            tamper.name()
+        );
+    }
+});
+
+game_test!(
+    honest_play_adjudicates_entity_by_entity,
+    IsolatedAdjudication,
+    {
+        // The world the *shipped* adjudicator actually builds. A bundle carries
+        // one claim, so `ReplayHarness::load_claimed_snapshot` installs one state
+        // and the step that follows sees an empty neighbour map. Re-executing an
+        // honest window that way has to clear, or every honest peer whose rules
+        // read a neighbour is convicted the first time anybody asks.
+        //
+        // `honest_play_is_self_verifying` cannot catch that: it installs the whole
+        // population into one executor, which makes every neighbour read succeed
+        // and the property pass against a world the pipeline cannot construct.
+        for scenario in SCENARIOS {
+            let honest = play(G::honest(), scenario);
+            assert_eq!(
+                adjudicate_isolated(G::honest, scenario, &honest),
+                None,
+                "{}/{}: honest play did not re-execute against a single-entity \
+             executor — a rule read state no adjudicator has",
+                G::META.name,
+                scenario.name
+            );
+        }
+    }
+);
+
+game_test!(every_tamper_is_adjudicable_in_isolation, IsolatedTamper, {
+    // And the isolated path keeps the cheats visible. A fix that made honest
+    // play replay cleanly by removing what a cheat perturbs would pass the
+    // clause above and be worthless.
+    let scenario = SCENARIOS
+        .iter()
+        .find(|s| s.name == "island")
+        .expect("the island scenario is in the table");
+    for tamper in Tamper::ALL {
+        let Some(cheat) = G::tampered(*tamper) else {
+            continue;
+        };
+        let cheated = play(cheat, scenario);
+        assert!(
+            adjudicate_isolated(G::honest, scenario, &cheated).is_some(),
+            "{}: {} re-executed as honest under single-entity replay",
             G::META.name,
             tamper.name()
         );

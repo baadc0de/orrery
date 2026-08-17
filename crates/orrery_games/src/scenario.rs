@@ -359,27 +359,88 @@ pub fn adjudicate<G: Game>(game: G, scenario: &Scenario, play: &Play<G>) -> Opti
             let computed = executor
                 .state(entry.entity)
                 .expect("the entity was just stepped");
-            let (claimed_pos, claimed_vel) = G::trajectory(&entry.state);
-            let (computed_pos, computed_vel) = G::trajectory(computed);
-            let sample = orrery_core::TrajectorySample {
-                tick: record.tick,
-                claimed_pos,
-                claimed_vel,
-                computed_pos,
-                computed_vel,
-            };
-            return Some(Divergence {
-                tick: record.tick,
-                entity: entry.entity,
-                kind: if tolerance.exceeds(&sample) {
-                    DeviationKind::ContinuousOutOfBand
-                } else {
-                    DeviationKind::DiscreteMismatch
-                },
-            });
+            return Some(divergence::<G>(record.tick, entry, computed, &tolerance));
         }
     }
     None
+}
+
+/// Re-execute a recorded log the way the *shipped* adjudicator does: one
+/// entity per executor, with no neighbours installed at all.
+///
+/// [`adjudicate`] installs the whole population into a single executor, which
+/// is convenient and is not the world a witness builds.
+/// [`ReplayHarness::load_claimed_snapshot`](orrery_core::ReplayHarness::load_claimed_snapshot)
+/// loads the one state its claim commits to, so the step that follows sees an
+/// empty neighbour map. A rule that reads a neighbour therefore behaves
+/// differently under adjudication than it did under play, and a harness that
+/// never built that world would score the difference as a pass — a false
+/// conviction of an honest peer, discovered in the field.
+///
+/// `make` builds a fresh ruleset per entity, because an [`Executor`] owns the
+/// one it drives.
+pub fn adjudicate_isolated<G: Game>(
+    make: impl Fn() -> G,
+    scenario: &Scenario,
+    play: &Play<G>,
+) -> Option<Divergence> {
+    let seed = UniverseSeed([scenario.seed_byte; 32]);
+    let mut executors: BTreeMap<PersistId, Executor<G>> = BTreeMap::new();
+    for slot in 0..scenario.entities {
+        let entity = PersistId::new(slot + 1);
+        let game = make();
+        let state = game.spawn(entity, slot);
+        let mut executor = Executor::new(game, seed);
+        executor.insert(entity, state);
+        executors.insert(entity, executor);
+    }
+
+    let tolerance = Tolerance::default();
+    for record in &play.log {
+        for entry in &record.entries {
+            let executor = executors
+                .get_mut(&entry.entity)
+                .expect("the log names an entity the scenario spawned");
+            let outcome = executor
+                .step_entity(entry.entity, record.tick, &entry.inputs)
+                .expect("each executor holds the entity it was built for");
+            if outcome.state_hash == entry.hash {
+                continue;
+            }
+            let computed = executor
+                .state(entry.entity)
+                .expect("the entity was just stepped");
+            return Some(divergence::<G>(record.tick, entry, computed, &tolerance));
+        }
+    }
+    None
+}
+
+/// Classify a hash mismatch as continuous or discrete.
+fn divergence<G: Game>(
+    tick: Tick,
+    entry: &Entry<G>,
+    computed: &G::CoreState,
+    tolerance: &Tolerance,
+) -> Divergence {
+    let (claimed_pos, claimed_vel) = G::trajectory(&entry.state);
+    let (computed_pos, computed_vel) = G::trajectory(computed);
+    let sample = orrery_core::TrajectorySample {
+        tick,
+        claimed_pos,
+        claimed_vel,
+        computed_pos,
+        computed_vel,
+    };
+    Divergence {
+        tick,
+        entity: entry.entity,
+        kind: if tolerance.exceeds(&sample) {
+            DeviationKind::ContinuousOutOfBand
+        } else {
+            DeviationKind::DiscreteMismatch
+        },
+    }
 }
 
 /// Re-encode and decode every state in a log, and report the first failure.
