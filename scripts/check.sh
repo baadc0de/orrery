@@ -7,7 +7,7 @@
 #   ./scripts/check.sh gates        static gates, harness self-tests, tool tests
 #   ./scripts/check.sh test         the root workspace's test suite
 #   ./scripts/check.sh doctor       delegate to dev-cache.sh: is the cache wired up?
-#   ./scripts/check.sh --self-test  the lane table still matches the filesystem
+#   ./scripts/check.sh --self-test  the lane table and self-test coverage hold
 #   ./scripts/check.sh --list       what each lane would run, without running it
 #
 # Why this exists. `.github/workflows/ci.yml` used to be the only place the
@@ -180,9 +180,14 @@ lane_clippy() {
         -- -D warnings
 }
 
-# ci.yml `gates`, verbatim: the static gates, the four harness self-tests, and
-# the standalone tools. The gate scripts are owned elsewhere and invoked here,
-# never reimplemented.
+# ci.yml `gates`, verbatim: the static gates, every harness self-test in
+# `scripts/`, and the standalone tools. The gate scripts are owned elsewhere and
+# invoked here, never reimplemented.
+#
+# This block is one half of `--self-test`'s coverage clause, and the other half
+# is a `find` over `scripts/`. Adding a `--self-test` to a script and not adding
+# a line here now fails the clause rather than passing silently, so the shape of
+# this list is load-bearing: one `run scripts/<name>.sh --self-test` per line.
 lane_gates() {
     lane_target_dir
     # docs/06-verifiable-core.md §8's static gates.
@@ -196,6 +201,23 @@ lane_gates() {
     run scripts/p3-island-gate.sh --self-test
     run scripts/p1-swarm-gate.sh --self-test
     run scripts/fdb-tests.sh --self-test
+
+    # The two P4 scripts, which until now ran their self-tests only in
+    # nightly.yml. That is where the cost of an uncovered self-test was
+    # actually paid: `p4-ledger.sh --self-test` counted ledger lines with `wc
+    # -l`, BSD `wc` pads its output to a fixed width, and the macOS leg of the
+    # nightly failed on `[[ "       1" == 1 ]]` on every run until it was
+    # found. A per-commit invocation would have caught it on the commit that
+    # introduced it. Together they cost about 0.6s and need no cluster, no
+    # binaries and no network — there was never a reason for them to be nightly.
+    run scripts/p4-accumulate.sh --self-test
+    run scripts/p4-ledger.sh --self-test
+
+    # And this script's own, which nothing ran either: ci.yml calls the four
+    # lanes and never `--self-test`, so the lane table's agreement with the tree
+    # — and, now, the coverage clause below — were checked only when a human
+    # remembered to. It is a few `find`s and a `grep`; it belongs in the gate.
+    run scripts/check.sh --self-test
 
     # Each standalone tool declares its own `[workspace]`, so the `test` lane's
     # `cargo test --workspace` reaches none of them.
@@ -258,6 +280,32 @@ discovered_workspaces() {
     ) | sort
 }
 
+# Every script in `scripts/` that *dispatches* on `--self-test`, as opposed to
+# merely mentioning it. The distinction matters both ways: this file's own prose
+# says `--self-test` a dozen times, and a script that documented the flag in its
+# usage without handling it would be recorded as covered while dying on an
+# unknown argument. So the pattern is the dispatch itself — a `[[ $1 == ... ]]`
+# comparison or a `case` arm — which is the thing that makes the flag work.
+scripts_supporting_self_test() {
+    local script
+    while IFS= read -r script; do
+        grep -qE '(==[[:space:]]*"?--self-test"?|^[[:space:]]*"?--self-test"?\))' "$script" \
+            || continue
+        echo "scripts/${script##*/}"
+    done < <(find "$ROOT/scripts" -maxdepth 1 -name '*.sh' | sort)
+}
+
+# The self-tests `lane_gates` actually invokes, read out of its body. Scoped to
+# that function for the usual reason — the rest of this file is full of the
+# strings it is looking for, and a whole-file grep would find this very
+# expression and report the coverage complete.
+lane_gates_self_tests() {
+    sed -n '/^lane_gates() {/,/^}/p' "$0" \
+        | grep -v '^[[:space:]]*#' \
+        | sed -n 's|^[[:space:]]*run \(scripts/[a-z0-9.-]*\.sh\) --self-test.*|\1|p' \
+        | sort -u
+}
+
 self_test() {
     # The table's own lines, and nothing else in this file.
     local table
@@ -309,6 +357,38 @@ self_test() {
     else
         note 'self-test: no .github/workflows/ci.yml here; skipped the delegation clause'
     fi
+
+    # ── Coverage: every --self-test in scripts/ is invoked by a lane ──────────
+    #
+    # The defect this exists for: `scripts/p4-accumulate.sh` and
+    # `scripts/p4-ledger.sh` both grew a `--self-test` and neither was ever run
+    # per commit, so a portability bug in one of them reached the nightly and
+    # failed the macOS leg on every run for weeks. Writing a self-test nobody
+    # calls is the easy mistake — nothing about it looks wrong — so the check
+    # has to be structural rather than a list somebody remembers to update.
+    #
+    # The two sides come from sources that cannot drift together: one is a
+    # `find` over `scripts/`, the other is the text of `lane_gates` above. A
+    # clause that read both out of one array would pass on a script nothing
+    # runs, which is precisely the state being fixed.
+    local supported invoked uncovered phantom
+    supported="$(scripts_supporting_self_test)"
+    invoked="$(lane_gates_self_tests)"
+    [[ -n $invoked ]] || die 'self-test: no --self-test invocations found in lane_gates; the parse has drifted'
+
+    uncovered="$(comm -23 <(echo "$supported") <(echo "$invoked"))"
+    phantom="$(comm -13 <(echo "$supported") <(echo "$invoked"))"
+    if [[ -n $uncovered ]]; then
+        note 'self-test: these scripts accept --self-test and no lane runs it:'
+        sed 's/^/  /' <<<"$uncovered" >&2
+        die 'self-test: a self-test nothing invokes is not a check, it is a comment'
+    fi
+    if [[ -n $phantom ]]; then
+        note 'self-test: lane_gates runs --self-test on scripts that do not accept it:'
+        sed 's/^/  /' <<<"$phantom" >&2
+        die 'self-test: the gates lane would fail on an unrecognized argument'
+    fi
+    note "self-test: all $(wc -l <<<"$supported") self-tests in scripts/ run in the gates lane"
 
     echo "$NAME: self-test passed"
 }

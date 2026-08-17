@@ -88,8 +88,8 @@ and the feature set.
 
 `.github/workflows/ci.yml` runs on every push and pull request: `rustfmt`,
 `clippy -D warnings`, the verifiable-core static gates
-(`scripts/core-gates.sh`), the P1/P2/P3 harness and fdb-runner `--self-test`
-modes, the workspace test suite, the standalone tools' own test suites, and the
+(`scripts/core-gates.sh`), every `--self-test` mode in `scripts/`, the
+workspace test suite, the standalone tools' own test suites, and the
 cross-platform determinism matrix.
 
 ### Running it here: `scripts/check.sh`
@@ -104,7 +104,7 @@ is to run it, not to push and wait:
 ./scripts/check.sh              # every lane, in CI's order
 ./scripts/check.sh clippy       # one lane, exactly the commands the job runs
 ./scripts/check.sh --list       # what a lane would run, without running it
-./scripts/check.sh --self-test  # the lane table still matches the filesystem
+./scripts/check.sh --self-test  # the lane table and the self-test coverage hold
 ./scripts/check.sh doctor       # delegates to dev-cache.sh: is the cache working?
 ```
 
@@ -161,6 +161,30 @@ zero of the 27 `.rs` files under the seven tools. Widening it found exactly one
 dirty workspace, `p0-nat-test`. Note the flip side at the root: the three
 vendored crates *are* root members, so `cargo fmt --all` holds `vendor/` to
 default rustfmt even though clippy deliberately excludes it.
+
+### A `--self-test` nothing runs is not a check
+
+A second clause covers the gate scripts themselves.
+`scripts/p4-accumulate.sh` and `scripts/p4-ledger.sh` each grew a `--self-test` that only `nightly.yml` ever
+called, and the cost was not hypothetical: `p4-ledger.sh --self-test` counted
+ledger lines with `wc -l`, BSD `wc` pads its output to a fixed width, and the
+nightly's macOS leg failed on `[[ "       1" == 1 ]]` on every run until it was
+found. No per-commit check invoked it, so nothing could have caught it earlier.
+
+So `check.sh --self-test` now `find`s every script in `scripts/` that
+*dispatches* on `--self-test` and asserts the `gates` lane invokes each one.
+The two sides are the filesystem and the text of `lane_gates`, which is what
+makes it a check rather than a restatement — a clause reading both out of one
+list would pass on exactly the script nothing runs. Adding a gate script with a
+self-test and forgetting to wire it up now fails the gate.
+
+**Writing one that can fail.** Structural self-tests grep the script's own body
+for the stages that make it a proof, and the failure mode is subtle: a pattern
+that also appears somewhere harmless — a `${VAR:?usage}` message, an output
+path template, another leg of the same harness — passes on a script that has
+lost the stage entirely. The rule is to mutation-check each clause: break the
+*guarded stage*, confirm the self-test fails, restore. Breaking the stage and
+the check line together proves nothing, which is how vacuous clauses survive.
 
 **`CARGO_TARGET_DIR` is never exported by the script.** An already-set value
 always wins, and `--isolate` (per-lane directories, local use only) is opt-in.
@@ -312,8 +336,8 @@ for CI: `cargo test --features fdb` on a runner with no cluster is 27 passes
 that assert nothing. So `scripts/fdb-tests.sh` runs them — both packages in one
 invocation, per C-8 — captures stderr with `--nocapture`, fails on any
 `skipping:` line, and asserts a floor on how many tests actually executed. Its
-`--self-test` proves those assertions against synthetic logs and runs
-per-commit, alongside the P1/P2/P3 gate self-tests.
+`--self-test` proves those assertions against six synthetic logs and runs
+per-commit, alongside every other self-test in `scripts/`.
 
 **The standalone tools are tested per-commit too.** Each declares its own
 `[workspace]`, so `cargo test --workspace` reaches none of them; the `gates`
