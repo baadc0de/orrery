@@ -130,7 +130,11 @@ self_test() {
     fi
     echo "$dir/r.json"
   }
-  st_lines() { if [[ -r $P4_LEDGER_FILE ]]; then wc -l < "$P4_LEDGER_FILE"; else echo 0; fi; }
+  # `awk END{print NR}`, not `wc -l`: BSD wc pads its count to a fixed width,
+  # so on macOS this returned "       1" and every `[[ $(st_lines) == 1 ]]`
+  # below compared a padded string against a bare one and failed. That is
+  # exactly how the nightly's macOS leg failed while Linux stayed green.
+  st_lines() { if [[ -r $P4_LEDGER_FILE ]]; then awk 'END { print NR }' "$P4_LEDGER_FILE"; else echo 0; fi; }
   st_bank() { "$0" append "$(st_report "$1" "$2")" >/dev/null 2>&1; }
 
   st_bank 1 '' || die 'self-test: a passing witnessed hour was refused'
