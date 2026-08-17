@@ -1,0 +1,28 @@
+# Line endings.
+#
+# The Windows runner image sets `core.autocrlf=true`, so without this every
+# checked-out `*.sh` arrives with CRLF and dies on its shebang — `bash` reads
+# `#!/usr/bin/env bash\r` and looks for an interpreter whose name ends in a
+# carriage return. That is what the P4 accumulation leg's Windows job works
+# around by setting `core.autocrlf=input` before checkout; this makes the
+# workaround unnecessary and protects the other 14 scripts in the tree, none of
+# which had any reason to expect a Windows checkout until now.
+#
+# `text=auto` lets git normalise to LF in the index for anything it detects as
+# text, and the explicit rules below remove the guesswork for the file types
+# where a wrong guess is a broken build rather than a cosmetic diff.
+* text=auto
+
+*.sh text eol=lf
+*.rs text eol=lf
+*.toml text eol=lf
+*.md text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.json text eol=lf
+
+# Fixtures compared byte-for-byte. `golden.json` is the cross-platform
+# determinism corpus and `demo.jsonl` is the dashboard's committed sample; a
+# line-ending rewrite on either is a silent test failure on one platform only.
+crates/orrery_conformance/corpus/golden.json -text -eol
+p2-dashboard/testdata/*.jsonl -text -eol
