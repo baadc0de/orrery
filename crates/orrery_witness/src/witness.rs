@@ -367,8 +367,8 @@ struct Watched<R: Ruleset> {
     catchup: Option<Catchup>,
     /// Newest subject tick this watch has already counted as shown, once any
     /// frame has arrived. `None` until the first one does, so that frame
-    /// contributes the whole span it covers rather than only its advance —
-    /// otherwise every watch judges one tick more than it was ever shown and
+    /// contributes the whole span from the anchor rather than only its advance
+    /// — otherwise every watch judges more ticks than it was ever shown and
     /// coverage reads fractionally over 100%.
     newest_seen: Option<u64>,
     /// Newest subject tick actually folded into the chain, once one has been.
@@ -867,7 +867,16 @@ impl<R: Ruleset> Witness<R> {
             if let Some(watched) = self.watched.get_mut(entity) {
                 let advance = match watched.newest_seen {
                     Some(seen) => last_tick.saturating_sub(seen),
-                    None => last_tick.saturating_sub(frame.first_tick.0) + 1,
+                    // The first frame contributes from the *anchor*, not from
+                    // its own start. A watch whose opening frames were lost
+                    // repairs from `anchor_tick` and judges what comes back, so
+                    // charging only this frame's span would put judged ticks in
+                    // the numerator that were never in the denominator — and
+                    // coverage would read fractionally over 100%, which is the
+                    // one reading this ratio must never produce.
+                    None => {
+                        last_tick.saturating_sub(frame.first_tick.0.min(watched.anchor_tick)) + 1
+                    }
                 };
                 watched.newest_seen = Some(match watched.newest_seen {
                     Some(seen) => seen.max(last_tick),
