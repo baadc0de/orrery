@@ -571,7 +571,11 @@ row. A digest over the key would be a function of the minted `PersistId` and the
 
 Canonical order is **`(grid, cell, ContentKey)` ascending** — generation order, so the manifest streams out without a sort pass. (Sorting by `ContentKey`, which is uniformly random, would require an external sort: 470 MB at 10 M entities.)
 
-`content/version` records `(content_build, manifest_digest, scenario_seed, config_digest, toolchain, seeded_at)`.
+**On disk the manifest is JSONL** — one JSON object per line, UTF-8, LF-terminated, no enclosing array. That is not a free choice: the previous sentence fixes the order *so the manifest streams out without a sort pass*, and the sentence before it sizes the artefact at 470 MB. A pretty-printed JSON array satisfies neither. It is only valid once closed, so the producer must hold every entry in memory until the last one is known; a consumer must parse the whole document before it can look at the first row; and the indentation inflates the payload for nothing. With one object per line the producer's memory is bounded by a single entry, the file is valid after every line, and `split`, `sort -m`, `head` or a byte range all work on it — which is what "streams out" has to mean at ten million rows.
+
+`content/version` records `(content_build, manifest_digest, scenario_seed, config_digest, toolchain, seeded_at)`. When it is written into the manifest file it is the **last** line, wrapped as `{"content_version": {…}}`, and that position is forced rather than chosen: `manifest_digest` covers every entry, so it does not exist until the stream has ended. A reader that wants only the inventory skips any line carrying `content_version`; a reader that wants the stamp seeks to the last line. An entry line never carries that key, so the two are told apart by shape.
+
+**The digest is not the file.** `manifest_digest` is folded from each entry's canonical fixed-width encoding — the same discipline as `ContentKey` — and never from the serialized bytes. Changing how the manifest is written therefore cannot move the digest, which is what keeps gate A4 ("identical manifest digest, zero rows changed") and the `content/version` row meaning the same thing across a format change. A golden test that pins the *digest* is unaffected; a golden test that pins the *bytes* of an emitted file is not, and shifts once as a reviewed diff.
 
 ### 9.4 Diff and three-way patch
 
@@ -743,7 +747,7 @@ duration   = "30m"
 
 The rig consumes the manifest for its entity/cell inventory and the `motion` block as a **trajectory program**, not a trace — which is why `kepler` and `profile` matter: a closed-form `(entity, tick) → position` is a few hundred bytes of parameters where a recorded trace of 10 000 entities at 60 Hz for 30 minutes is gigabytes.
 
-**The `kill -9` assertion is a manifest comparison.** Take a manifest snapshot before the kill (`verify --emit-manifest pre.json`), restart, snapshot again, and assert: every `ContentKey` present before is present after, with an identical `value_digest` for every entity whose last acked diff preceded the kill. Bulk loss is bounded by the journal/replication window by design, so the assertion is over *acked* state, and the rig supplies the ack watermark. That is the P2 demo criterion, mechanized.
+**The `kill -9` assertion is a manifest comparison.** Take a manifest snapshot before the kill (`verify --emit-manifest pre.json`), restart, snapshot again, and assert: every `ContentKey` present before is present after, with an identical `value_digest` for every entity whose last acked diff preceded the kill. Bulk loss is bounded by the journal/replication window by design, so the assertion is over *acked* state, and the rig supplies the ack watermark. That is the P2 demo criterion, mechanized. Both snapshots are JSONL (§9.3) whatever the file is named — the P2 gate calls it `manifest.json` — so the comparison itself streams: the entries are already in canonical order, and the two files can be walked in lockstep without loading either.
 
 ### 12.4 Telemetry
 

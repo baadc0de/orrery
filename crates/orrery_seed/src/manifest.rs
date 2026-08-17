@@ -205,6 +205,18 @@ impl ManifestWriter {
     /// in canonical order with no sort pass, and a producer that cannot
     /// deliver that order is a bug, not a data condition.
     pub fn push(&mut self, e: ManifestEntry) {
+        self.push_entry(&e);
+    }
+
+    /// Push one entry by reference — the streaming form. Identical to
+    /// [`ManifestWriter::push`]; it exists so a caller that already owns the
+    /// entry (or borrows it out of a row it is about to serialize) does not
+    /// have to clone it just to fold it into the digest.
+    ///
+    /// # Panics
+    ///
+    /// Panics on an out-of-order entry, as [`ManifestWriter::push`] does.
+    pub fn push_entry(&mut self, e: &ManifestEntry) {
         let key = (e.grid, e.cell, e.content_key);
         if let Some(last) = self.last {
             assert!(
@@ -213,7 +225,7 @@ impl ManifestWriter {
             );
         }
         self.last = Some(key);
-        self.digest.push(&e);
+        self.digest.push(e);
     }
 
     /// Entries so far.
@@ -226,6 +238,124 @@ impl ManifestWriter {
     #[must_use]
     pub fn finish(self, stamp: &ToolchainStamp) -> [u8; 32] {
         self.digest.finalize(stamp)
+    }
+}
+
+/// A streaming JSONL manifest sink: one JSON object per line, written
+/// straight through to `out` as each entry arrives.
+///
+/// **Why JSONL, and why streaming.** §9.3 fixes the canonical order at
+/// `(grid, cell, ContentKey)` ascending and states the reason in as many
+/// words — "generation order, so the manifest streams out without a sort
+/// pass" — then sizes the artefact at "470 MB at 10 M entities". A format
+/// that is only valid once it is closed (one pretty-printed JSON array)
+/// honours neither clause: the producer must hold every entry until the last
+/// one is known, and the consumer must parse the whole document before it
+/// sees the first row. Line-delimited JSON is the shape those two sentences
+/// describe — the file is valid after every line, a consumer reads it row by
+/// row, and `split`, `sort -m` or a byte range all work on it. The writer's
+/// memory is then bounded by one entry rather than by the world.
+///
+/// The `content/version` record (§9.3: `(content_build, manifest_digest,
+/// scenario_seed, config_digest, toolchain, seeded_at)`) is written as a
+/// **trailer**, not a header, and that is forced: its `manifest_digest`
+/// covers every entry, so it does not exist until the last entry has been
+/// folded in. A consumer that wants it seeks to the last line; one that only
+/// wants the inventory skips any line carrying `content_version`, wherever
+/// it appears.
+///
+/// The digest itself is unchanged by any of this: [`ManifestDigest`] hashes
+/// the canonical fixed-width encoding of each entry, never the serialized
+/// JSON bytes, so gate A4 ("identical manifest digest, zero rows changed")
+/// and `content/version` mean exactly what they meant before.
+#[derive(Debug)]
+pub struct ManifestSink<W: std::io::Write> {
+    out: W,
+    writer: ManifestWriter,
+    // One reusable line buffer. Serializing into it and clearing it keeps the
+    // sink's high-water mark at the longest single entry — the property that
+    // makes manifest emission independent of world size.
+    line: Vec<u8>,
+}
+
+impl<W: std::io::Write> ManifestSink<W> {
+    /// A fresh sink over `out`. Wrap a file in a `BufWriter`: this type does
+    /// one `write_all` per entry and does not buffer across entries.
+    pub fn new(out: W) -> Self {
+        Self {
+            out,
+            writer: ManifestWriter::new(),
+            line: Vec::new(),
+        }
+    }
+
+    /// Serialize one entry as a line and fold it into the digest.
+    ///
+    /// # Errors
+    ///
+    /// Returns the underlying write error, or a serialization error (which
+    /// only a non-serializable entry could produce).
+    ///
+    /// # Panics
+    ///
+    /// Panics on an out-of-order entry, as [`ManifestWriter::push_entry`]
+    /// does: §9.3's order is a property of the format, not of the data.
+    pub fn push(&mut self, e: &ManifestEntry) -> std::io::Result<()> {
+        self.writer.push_entry(e);
+        self.line.clear();
+        serde_json::to_writer(&mut self.line, e).map_err(std::io::Error::other)?;
+        self.line.push(b'\n');
+        self.out.write_all(&self.line)
+    }
+
+    /// Entries written so far.
+    #[must_use]
+    pub fn entries(&self) -> u64 {
+        self.writer.entries()
+    }
+
+    /// The underlying writer, for a caller that needs its state (a byte
+    /// count, a temp file's path) without giving up the sink.
+    pub fn get_ref(&self) -> &W {
+        &self.out
+    }
+
+    /// Write the `content/version` trailer line and flush, returning the
+    /// manifest digest the entries produced.
+    ///
+    /// `record` is serialized under a `content_version` key so a reader can
+    /// tell the trailer from an entry by shape alone (an entry carries no
+    /// such field), which is how the P2 load rig already discriminates the
+    /// two.
+    ///
+    /// # Errors
+    ///
+    /// Returns the underlying write or flush error.
+    pub fn finish<R: serde::Serialize>(
+        mut self,
+        record: &R,
+        stamp: &ToolchainStamp,
+    ) -> std::io::Result<[u8; 32]> {
+        self.line.clear();
+        let mut trailer = std::collections::BTreeMap::new();
+        trailer.insert("content_version", record);
+        serde_json::to_writer(&mut self.line, &trailer).map_err(std::io::Error::other)?;
+        self.line.push(b'\n');
+        self.out.write_all(&self.line)?;
+        self.out.flush()?;
+        Ok(self.writer.finish(stamp))
+    }
+
+    /// Flush without a trailer, for a caller that has no `content/version`
+    /// record to stamp. The manifest is still a complete, valid JSONL
+    /// inventory: every line stands alone.
+    ///
+    /// # Errors
+    ///
+    /// Returns the underlying flush error.
+    pub fn finish_without_record(mut self, stamp: &ToolchainStamp) -> std::io::Result<[u8; 32]> {
+        self.out.flush()?;
+        Ok(self.writer.finish(stamp))
     }
 }
 
@@ -297,6 +427,43 @@ mod tests {
         b.push(&e1);
         let db = b.finalize(&stamp);
         assert_ne!(da, db, "the rolling digest covers entry order");
+    }
+
+    #[test]
+    fn sink_digest_is_independent_of_the_serialization() {
+        // Gate A4 ("identical manifest digest, zero rows changed") reads the
+        // digest, and the digest is folded from each entry's canonical
+        // fixed-width encoding — never from the JSON bytes. So moving the
+        // file from one pretty-printed array to JSONL cannot move it: the
+        // sink and a bare `ManifestWriter` over the same entries agree.
+        let entries = [
+            entry(0xA924_9249_2492_4D65, 1, "props"),
+            entry(0xA924_9249_2492_4D66, 2, "props"),
+            entry(0xA924_9249_2492_4D67, 3, "crates"),
+        ];
+        let stamp = ToolchainStamp::current();
+
+        let mut writer = ManifestWriter::new();
+        for e in &entries {
+            writer.push_entry(e);
+        }
+        let from_writer = writer.finish(&stamp);
+
+        let mut out = Vec::new();
+        let mut sink = ManifestSink::new(&mut out);
+        for e in &entries {
+            sink.push(e).expect("write");
+        }
+        let from_sink = sink.finish_without_record(&stamp).expect("flush");
+
+        assert_eq!(from_writer, from_sink, "the digest is not over the JSON");
+        // …and the bytes really are one line per entry, each parseable alone.
+        let text = String::from_utf8(out).expect("utf8");
+        assert_eq!(text.lines().count(), entries.len());
+        for (line, expected) in text.lines().zip(&entries) {
+            let decoded: ManifestEntry = serde_json::from_str(line).expect("line");
+            assert_eq!(&decoded, expected);
+        }
     }
 
     #[test]
