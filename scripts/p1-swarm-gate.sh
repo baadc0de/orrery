@@ -115,10 +115,18 @@ note 'witnessed run: the same impaired hour, every peer re-executing its witness
 # peer recovering from a hitch serves its witnesses' repair burst on the
 # unsheddable control lane and sheds the cheap lane to afford it
 # (docs/03-replication.md §5.3a). What says transient rather than overrun is that
-# the count is *identical* at five simulated minutes and at one hour — 206 both
-# times. So the allowance is the measured number exactly, and not a round one: it
-# is a ratchet, and a run that moves it has found something.
-"$BIN" --peers 32 --seconds 3600 --min-cells 1 --max-pops 0 --max-shed 206 \
+# the count is *identical* at five simulated minutes and at one hour. So the
+# allowance is the measured number exactly, and not a round one: it is a ratchet,
+# and a run that moves it has found something.
+#
+# It moved once, from 206 to 230, and the thing it found is recorded in
+# docs/11-roadmap.md §P4: watches that lost their first frame used to go blind
+# for the rest of the session, asking for no repair at all. Repairing them
+# instead is more traffic on the unsheddable control lane, so the cheap lane is
+# shed to afford it — the same mechanism this comment already describes, at a
+# slightly higher level. 230 at 3% loss, 255 at 5%; the allowance tracks the
+# leg that runs here.
+"$BIN" --peers 32 --seconds 3600 --min-cells 1 --max-pops 0 --max-shed 230 \
   --late-join-at 1800 --impaired --witness --stamp-wall-clock \
   --json "$OUT/witnessed.json" \
   || die 'the P4 witnessing clauses did not hold over the impaired hour'
