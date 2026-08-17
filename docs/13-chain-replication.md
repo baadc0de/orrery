@@ -92,6 +92,34 @@ dedupe or watermark lookup.
 
 This prevents a stale primary from resuming onto a new follower session without an intentional restart handshake.
 
+A follower reopened under a *different* epoch of the same chain family
+(primary, follower, shard set) is refused rather than forked: rebuilding an
+empty cursor under a fresh key would take a silent full re-stream into a second
+physical copy of every record, at a healthy zero-byte lag, and leave promotion
+permanently ambiguous. The refusal keys off two durable traces, and it needs
+both:
+
+- the mirrored-record provenance index, which carries a row per record; and
+- the chain-state row, written by every follower load — **including a load that
+  went on to receive nothing**.
+
+The second was added after `scripts/p2-kill9-gate.sh`'s
+`prove_epoch_fork_refused` leg walked straight through the refusal on
+2026-08-17. Its load produced no durable writes at all (see §6 below), so the
+mirror was empty, the record index held nothing, and the follower reopened at
+the bumped epoch and served it. The proof was conditional on the traffic ahead
+of it; opening the mirror is itself the durable fact the epoch is pinned to.
+
+### What an empty mirror means
+
+The chain is downstream of the journal ack path, and the journal is downstream
+of the gateway's authority fence. A record that is never appended is never
+mirrored. **An empty follower mirror after a load is therefore evidence about
+the writes, not about chain replication** — check the primary's durable-ack
+count and its `journal_commit_ms` samples before looking at the chain at all. A
+primary that mirrored nothing because it committed nothing logs no chain line,
+reports no `ChainFault`, and is behaving correctly.
+
 ### 3.2 Append batch
 
 Records move in batches so the transport amortizes framing and syscalls:
@@ -320,3 +348,28 @@ Tie this design to the P2 demo criterion in [11-roadmap.md](11-roadmap.md):
 - and confirm the chain lag alert stays within the documented envelope during steady-state load.
 
 If that gate is green, the chain is good enough for the next persistence phase. If it is not, keep the design narrow and fix the recovery path before widening the topology.
+
+**The gate is not green, and the chain is not what is blocking it.** As of
+2026-08-17 `scripts/p2-kill9-gate.sh` drives 541,224 diffs into the primary and
+receives **zero** acknowledgements, durable or provisional, and zero committed
+intents. Both halves are refusals, and neither is in this design:
+
+- Every `DiffUplink` the rig sends carries `lease_id: None`
+  (`p2-load/src/main.rs:1401`, deliberately — the rig measures gateway latency,
+  not authority arbitration), while `route_session_diff` sets
+  `strict_authority: true` unconditionally
+  (`crates/orrery_persistd/src/gateway.rs:3930`). `route_diff` substitutes the
+  never-granted `LeaseId(0)` and `apply_fenced` rejects each one before the
+  journal sees a byte.
+- Every intent is rejected with `REASON_VALIDATION_FAILED`, because
+  `ProductionIntentValidator` (`crates/orrery_persistd/src/bin/persistd.rs:71`)
+  rejects unconditionally — persistd ships no ruleset.
+
+So the gate's `acks.jsonl` is 1,024 recorded *rejections*, which satisfies its
+`[[ -s $out/acks.jsonl ]]` non-empty check, and its `bulk_ack_ms` histogram is
+fed by `UplinkScheduler::on_nack_at`
+(`crates/orrery_persist_client/src/uplink.rs:279`), which records reply latency
+for a NACK exactly as for an ACK. The D16 latency gate is therefore measuring
+the round trip of a refusal. Closing the P2 criterion needs a leased write path
+in the rig; until then the mirror is correctly empty and no change to this
+document's mechanism will move the gate.
