@@ -310,6 +310,10 @@ before and after, same seed:
 | Deferred frames not recovered, after | 2 of 219 641 | 3 of 335 096 |
 | Replication packets shed, before → after | 206 → 230 | 229 → 255 |
 
+Those figures were taken with the swarm playing `orrery_conformance`'s corpus
+kernel; it plays `orrery_games`' Skirmish now, and the seeded numbers moved with
+it. See *Re-measured on Skirmish* below.
+
 **The band holds at both ends.** The witnessed hour at 5% loss now judges
 essentially all of the timeline it is shown, still with zero false positives.
 `MIN_COVERAGE` did not move — the phase's target was met, not lowered — and no
@@ -317,12 +321,13 @@ D16 parameter moved either. The residual at both ends is the two or three frames
 still held behind an open hole when the run stops, which is the run ending
 mid-repair rather than a loss.
 
-One consequence the gate has to absorb: repairing the watches that used to be
-dead is repair traffic, so the swarm asks for 5–6% more chain gaps and sheds
+One consequence the gate had to absorb: repairing the watches that used to be
+dead is repair traffic, so the swarm asked for 5–6% more chain gaps and shed
 **230 packets at 3% loss against the nightly leg's `--max-shed 206` ratchet**
 (255 at 5%). That allowance is a measured ratchet whose own comment says a run
-that moves it has found something; this run found something, and the number
-wants re-baselining to the post-fix figure rather than the clause being relaxed.
+that moves it has found something; that run found something, and the number was
+re-baselined to the post-fix figure rather than the clause being relaxed. It has
+since been re-baselined again, to 162, for a different reason — see below.
 
 The gate runs the 3% floor nightly and `p1-swarm --loss 0.05` reproduces the
 other end on demand. The rest of what is outstanding: the other three
@@ -331,6 +336,39 @@ a ledger that adds the nights up. Each report is
 stamped with its seed, its full impairment profile, its target triple and its
 commit sha, and deliberately not with a wall clock unless asked, so summing them
 later is bookkeeping rather than archaeology.
+
+**Re-measured on Skirmish.** Swapping the ruleset was a physics migration, not a
+rename: Skirmish applies drag and a per-archetype speed clamp where the corpus
+kernel applied neither, so every trajectory in the swarm moved and with it the
+crowd density that decides how much any peer has to send. Every seeded number in
+the gate was re-measured rather than adjusted, at 32 peers, same seed, at five
+simulated minutes *and* at the criterion's hour:
+
+| 32 peers, one simulated hour | corpus kernel | Skirmish |
+|---|---|---|
+| Least-travelled peer, cells visited (cruise-only legs) | 81 | **138** |
+| Replication packets shed, `--witness` at 3% loss | 230 | **162** |
+| Replication packets shed, `--witness` at 5% loss | 255 | **172** |
+| Observation coverage, 3% / 5% | 100.0% / 100.0% | **100.0% / 100.0%** |
+| False positives, 3% / 5% | 0 / 0 | **0 / 0** |
+| Chain gaps repaired, 3% / 5% | 164 164 / 250 007 | 164 022 / 250 123 |
+| Witness lane per peer | 194 kb/s | 180 kb/s |
+| Worst peak upload, `--witness` | 973 kb/s | 921 kb/s |
+
+Both shed figures are **identical at five simulated minutes and at one hour**,
+which is the test that still distinguishes the island-formation transient from a
+sustained overrun; the `--max-shed` ratchet on the nightly leg tracks the
+measured number and is now 162. `--min-cells 64` is untouched and clears by more
+than it did. `MIN_COVERAGE` did not move, and no D16 parameter moved.
+
+Turning `Ruleset::invariants()` on was the live risk in that swap — `p1-swarm`
+fails the run on any false positive, and Skirmish's stage-1 checks were tuned
+against its own pilot rather than against a 20 Hz bot under 3–5% loss. They
+hold: **zero** stage-1 breaches across 64 accumulated player-hours at both ends
+of the band. The check that could have fired is `skirmish/acceleration-cap`
+under packet reordering, where a jittered sample can arrive stamped *behind* its
+predecessor; `checks::exceeds_acceleration` returns `false` on a zero-tick gap,
+so a reordered pair is declined rather than accused.
 
 **The demo criterion's other half is closed: a modified client is convicted at
 population.** Both ends of it were proven separately and neither was proven in a

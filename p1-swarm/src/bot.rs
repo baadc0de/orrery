@@ -393,7 +393,7 @@ pub fn apply_replicas(
             }
             continue;
         };
-        let Ok(body) = <Craft as orrery_core::CoreCodec>::decode(&encoded) else {
+        let Ok(craft) = <Craft as orrery_core::CoreCodec>::decode(&encoded) else {
             counters.bad_body += 1;
             continue;
         };
@@ -405,14 +405,14 @@ pub fn apply_replicas(
         if let Some(witness) = witness.as_mut() {
             witness.0.observe(orrery_witness::Observation {
                 entity,
-                state: &body,
+                state: &craft,
                 tick: orrery_protocol::Tick::new(at),
             });
         }
 
         // Position is for distance ranking; the *cell* is the authority's own
         // committed value, never recomputed here (D2).
-        let grid = grid_of(&body.pos, edge.0);
+        let grid = grid_of(&craft.pos, edge.0);
         match existing
             .iter()
             .find(|(_, replica)| replica.0 == packet.from)

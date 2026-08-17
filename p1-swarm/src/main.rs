@@ -141,13 +141,18 @@
 //! | Observation coverage | 81.3% | **100.0%** |
 //! | False positives | 582 | **0** |
 //!
-//! Over the criterion's full simulated hour the lane sits at 194 kbps across
-//! **32 accumulated player-hours, zero false positives, 100% coverage**.
+//! That table was measured on `orrery_conformance`'s corpus kernel. Skirmish
+//! applies drag and a per-archetype speed clamp where the kernel applied
+//! neither, so every trajectory moved and the seeded figures moved with them:
+//! over the criterion's hour under the impairment profile the lane sits at
+//! **180 kbps**, worst peak upload **921 kbps**, **162 packets shed**, across
+//! **32 accumulated player-hours with zero false positives and 100% coverage**
+//! — and 172 shed at the 5% end of the band, also at zero and 100%.
 //!
-//! The residual 200 shed packets are replication bytes belonging to the four
-//! stalling peers in the densest part of the crowd, and the count is *identical*
-//! at five minutes and at one hour — a transient at island formation rather than
-//! a sustained overrun. What produces it is the preference order working: a peer
+//! The residual shed packets are replication bytes belonging to the stalling
+//! peers in the densest part of the crowd, and the count is *identical* at five
+//! simulated minutes and at one hour — a transient at island formation rather
+//! than a sustained overrun. What produces it is the preference order working: a peer
 //! recovering from a client hitch serves its witnesses' repair burst on the
 //! control lane, which is never shed, and sheds the cheap lane to afford it.
 //! Which is why the report prints the per-lane split — so the next overrun names
@@ -255,11 +260,15 @@ struct Args {
     /// it. What says that is a transient and not an overrun is that the count
     /// is the same at five simulated minutes as at one hour.
     ///
-    /// The gate's witnessed leg passes 206, which was the measured number
-    /// exactly. It is **230** since watches stopped dying on their first lost
-    /// frame (docs/11-roadmap.md §P4): repairing a watch that used to go blind
-    /// is repair traffic, and the burst it adds is shed from the cheap lane
-    /// like any other. 255 at the 5% end of the band.
+    /// The gate's witnessed leg has passed 206, then 230, and now **162** — the
+    /// measured number exactly, each time (docs/11-roadmap.md §P4). 206 → 230
+    /// when watches stopped dying on their first lost frame, which is more
+    /// repair traffic and so more of the cheap lane shed to pay for it. 230 →
+    /// 162 when the bots moved from `orrery_conformance`'s corpus kernel to
+    /// `orrery_games`' Skirmish: drag and a per-archetype speed clamp move every
+    /// trajectory in the swarm, and with it the crowd density that decides how
+    /// much any peer has to send. 172 at the 5% end of the band. Both are
+    /// identical at five simulated minutes and at one hour.
     #[arg(long, default_value_t = 0)]
     max_shed: u64,
 
