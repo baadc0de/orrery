@@ -156,12 +156,19 @@ impl Ruleset for Kinematic {
 // ── Fixtures ─────────────────────────────────────────────────────────────
 
 const ENTITY: PersistId = PersistId::new(4_242);
+/// A second subject's entity, for the one counter a single subject cannot
+/// reach — see [`Authority::for_subject`].
+const OTHER: PersistId = PersistId::new(4_243);
 const SEED: UniverseSeed = UniverseSeed([0x77; 32]);
 const T0: u64 = 3_000;
 const CLAIM_EVERY: u64 = 30;
 
 fn subject_key() -> iroh_base::SecretKey {
     iroh_base::SecretKey::from_bytes(&[21; 32])
+}
+
+fn second_key() -> iroh_base::SecretKey {
+    iroh_base::SecretKey::from_bytes(&[0x2c; 32])
 }
 
 fn witness_key() -> iroh_base::SecretKey {
@@ -190,6 +197,14 @@ struct Sent {
 /// An authority that logs honestly and, if `cheat_multiplier > 1`, claims a
 /// trajectory faster than its own logged inputs can produce.
 struct Authority {
+    /// The key every frame and claim is signed with, and the entity it holds.
+    ///
+    /// Parameters rather than constants because one counter — frames swept out
+    /// of the deferral buffer by retention — is only reachable with a *second*
+    /// subject: a witness prunes on the ingest path, so a subject whose frames
+    /// are stranded needs some other subject still feeding the witness ticks.
+    key: iroh_base::SecretKey,
+    entity: PersistId,
     executor: Executor<Kinematic>,
     head: ChainHash,
     previous_claim: [u8; 32],
@@ -199,9 +214,15 @@ struct Authority {
 
 impl Authority {
     fn new(cheat_multiplier: i64) -> Self {
+        Self::for_subject(subject_key(), ENTITY, cheat_multiplier)
+    }
+
+    fn for_subject(key: iroh_base::SecretKey, entity: PersistId, cheat_multiplier: i64) -> Self {
         let mut executor = Executor::new(Kinematic, SEED);
-        executor.insert(ENTITY, body());
+        executor.insert(entity, body());
         Self {
+            key,
+            entity,
             executor,
             head: ChainHash::EMPTY,
             previous_claim: [0; 32],
@@ -211,24 +232,24 @@ impl Authority {
     }
 
     fn anchor(&mut self) -> (StateClaim, Body) {
-        let state = self.executor.state(ENTITY).expect("seeded").clone();
+        let state = self.executor.state(self.entity).expect("seeded").clone();
         let mut claim = StateClaim {
-            entity: ENTITY,
+            entity: self.entity,
             chain_epoch: 0,
             tick: Tick::new(T0),
             input_head: self.head,
             state_hash: state_hash(&state),
             prev_claim: self.previous_claim,
             ruleset: RULESET,
-            sig: subject_key().sign(b"unsigned"),
+            sig: self.key.sign(b"unsigned"),
         };
-        sign_claim(&subject_key(), &mut claim);
+        sign_claim(&self.key, &mut claim);
         self.previous_claim = claim_hash(&claim);
         (claim, state)
     }
 
     fn send(&mut self, first_tick: u64) -> Sent {
-        let key = subject_key();
+        let key = self.key.clone();
         let prev_head = self.head;
         let mut records = Vec::new();
 
@@ -249,7 +270,7 @@ impl Authority {
                 records.push(record);
             }
             self.executor
-                .step_entity(ENTITY, Tick::new(tick), &inputs)
+                .step_entity(self.entity, Tick::new(tick), &inputs)
                 .expect("entity present");
 
             // The cheat: advance a private trajectory faster than the rules
@@ -257,11 +278,15 @@ impl Authority {
             // is signed and chained — lying there is caught immediately.
             self.cheat_state.vel.x = SPEED_CAP * self.cheat_multiplier;
             self.cheat_state.pos.x += self.cheat_state.vel.x;
-            self.cheat_state.entropy = self.executor.state(ENTITY).expect("entity present").entropy;
+            self.cheat_state.entropy = self
+                .executor
+                .state(self.entity)
+                .expect("entity present")
+                .entropy;
         }
 
         let transitions = vec![HeadTransition {
-            entity: ENTITY,
+            entity: self.entity,
             prev_head,
             head: self.head,
         }];
@@ -270,7 +295,7 @@ impl Authority {
             first_tick: Tick::new(first_tick),
             tick_count: 3,
             entities: vec![EntitySlice {
-                entity: ENTITY,
+                entity: self.entity,
                 chain_epoch: 0,
                 prev_head: prev_head.rolling(),
                 records,
@@ -284,10 +309,10 @@ impl Authority {
             let claimed = if self.cheat_multiplier > 1 {
                 &self.cheat_state
             } else {
-                self.executor.state(ENTITY).expect("entity present")
+                self.executor.state(self.entity).expect("entity present")
             };
             let mut claim = StateClaim {
-                entity: ENTITY,
+                entity: self.entity,
                 chain_epoch: 0,
                 tick: Tick::new(next_tick),
                 input_head: self.head,
@@ -311,7 +336,11 @@ impl Authority {
     /// caught if the watch survived that event.
     fn start_cheating(&mut self, multiplier: i64) {
         self.cheat_multiplier = multiplier;
-        self.cheat_state = self.executor.state(ENTITY).expect("entity present").clone();
+        self.cheat_state = self
+            .executor
+            .state(self.entity)
+            .expect("entity present")
+            .clone();
     }
 
     /// What the authority tells the world its state is.
@@ -319,23 +348,33 @@ impl Authority {
         if self.cheat_multiplier > 1 {
             self.cheat_state.clone()
         } else {
-            self.executor.state(ENTITY).expect("entity present").clone()
+            self.executor
+                .state(self.entity)
+                .expect("entity present")
+                .clone()
         }
     }
 }
 
 fn watching(config: WitnessConfig, authority: &mut Authority) -> Witness<Kinematic> {
     let mut witness = Witness::new(config, SEED, || Kinematic);
+    watch_also(&mut witness, authority);
+    witness
+}
+
+/// Add `authority`'s entity to an existing witness, anchored at a fresh claim.
+fn watch_also(witness: &mut Witness<Kinematic>, authority: &mut Authority) {
+    let entity = authority.entity;
+    let subject = authority.key.public();
     let (anchor, anchor_state) = authority.anchor();
     witness
         .watch(Watch {
-            entity: ENTITY,
-            subject: subject_key().public(),
+            entity,
+            subject,
             anchor,
             anchor_state,
         })
         .expect("the anchor is signed by the subject");
-    witness
 }
 
 /// Stream `frames` three-tick frames into the witness, collecting signals.
@@ -1056,4 +1095,308 @@ fn frames_that_arrive_during_a_repair_are_kept_rather_than_re_requested() {
         6,
         "one repaired frame plus the five that were held"
     );
+}
+
+// ── The deferral ledger ──────────────────────────────────────────────────
+//
+// Coverage is one minus whatever is in flight through repair: `shown_ticks` is
+// charged the moment a frame arrives, ahead of the branch that sets it aside,
+// while `judged_ticks` only moves inside a fold. So the coverage deficit P4
+// measures *is* the deferral buffer, and attributing it means every frame that
+// went in came out of a named door. There are six: recovered, overflowed,
+// pruned, dropped by a drain, replaced by a later copy, or still held. The
+// tests below each drive one of them, and each asserts the ledger closes —
+// because a counter that is merely non-zero attributes nothing.
+
+/// Every frame set aside has since left by one of the six named doors, or is
+/// still in the buffer.
+fn ledger_balances(witness: &Witness<Kinematic>) -> bool {
+    let counters = witness.counters();
+    counters.frames_deferred
+        == counters.frames_recovered
+            + counters.deferrals_overflowed
+            + counters.deferrals_pruned
+            + counters.deferrals_dropped_in_drain
+            + counters.deferrals_replaced
+            + counters.deferrals_stale
+            + counters.deferrals_held
+}
+
+/// Open a hole and leave it open: the first frame folds, the second is lost,
+/// and the third reveals the gap and is held behind it.
+fn open_hole(witness: &mut Witness<Kinematic>, authority: &mut Authority) {
+    witness
+        .ingest_frame(&authority.send(T0).frame, &[])
+        .expect("the first frame chains from the anchor");
+    let _lost = authority.send(T0 + 3);
+    let revealing = authority.send(T0 + 6);
+    let opened = witness.ingest_frame(&revealing.frame, &[]).expect("a gap");
+    assert!(matches!(opened.as_slice(), [WitnessSignal::Gap(_)]));
+}
+
+#[test]
+fn frames_dropped_for_want_of_buffer_space_are_counted_as_such() {
+    // The buffer is bounded per subject and the oldest goes when it is full.
+    // That is the right call — the oldest is the one the repair in flight is
+    // likeliest to have covered — but it is still timeline the witness was
+    // shown and will not judge, and until this counter reached the report it
+    // was the one loss an operator could not see.
+    let mut authority = Authority::new(1);
+    let mut witness = watching(WitnessConfig::default(), &mut authority);
+    open_hole(&mut witness, &mut authority);
+
+    // Thirty-nine more behind the one that revealed it: forty deferrals against
+    // a buffer that holds thirty-two.
+    for round in 3..42u64 {
+        witness
+            .ingest_frame(&authority.send(T0 + round * 3).frame, &[])
+            .expect("held, not refused");
+    }
+
+    let counters = witness.counters();
+    assert_eq!(counters.frames_deferred, 40, "forty frames were set aside");
+    assert_eq!(
+        counters.deferrals_held, 32,
+        "the buffer holds its cap and no more"
+    );
+    assert_eq!(
+        counters.deferrals_overflowed, 8,
+        "the eight the cap displaced are named rather than merely absent"
+    );
+    assert!(ledger_balances(&witness));
+}
+
+#[test]
+fn a_frame_re_delivered_while_its_own_copy_is_held_displaces_it() {
+    // A repair can re-serve a frame that is already sitting in the buffer. The
+    // buffer keys on the frame's identity, so the second copy takes the first
+    // one's place: one deferral in, one frame out, and no other counter moves.
+    // Small, and it has to be counted anyway — an unaccounted frame is exactly
+    // what makes an attribution a lower bound instead of an answer.
+    let mut authority = Authority::new(1);
+    let mut witness = watching(WitnessConfig::default(), &mut authority);
+    witness
+        .ingest_frame(&authority.send(T0).frame, &[])
+        .expect("the first frame chains from the anchor");
+    let _lost = authority.send(T0 + 3);
+    let revealing = authority.send(T0 + 6);
+
+    witness.ingest_frame(&revealing.frame, &[]).expect("a gap");
+    witness
+        .ingest_frame(&revealing.frame, &[])
+        .expect("the same frame again, still behind the same hole");
+
+    let counters = witness.counters();
+    assert_eq!(counters.frames_deferred, 2);
+    assert_eq!(counters.deferrals_replaced, 1);
+    assert_eq!(counters.deferrals_held, 1, "one frame, held once");
+    assert!(ledger_balances(&witness));
+}
+
+#[test]
+fn a_held_frame_that_will_not_verify_leaves_the_ledger_by_its_own_door() {
+    // The drain takes a frame out of the buffer before re-offering it, so a
+    // frame the second attempt refuses is gone. `frames_rejected` records the
+    // refusal; nothing recorded the *deferral* that ended with it, so a frame
+    // could be set aside and never appear in any column again.
+    let mut authority = Authority::new(1);
+    let mut witness = watching(WitnessConfig::default(), &mut authority);
+    let mut log = AuthorityLog::default();
+
+    witness
+        .ingest_frame(&authority.send(T0).frame, &[])
+        .expect("the first frame chains from the anchor");
+    let lost = authority.send(T0 + 3);
+    log.record_frame(
+        lost.frame.clone(),
+        vec![HeadTransition {
+            entity: ENTITY,
+            prev_head: ChainHash::EMPTY,
+            head: ChainHash::EMPTY,
+        }],
+    );
+
+    // The frame behind the hole chains perfectly and is signed by nobody. Gap
+    // detection runs first, so it is held without its signature ever being
+    // looked at — the refusal comes on the retry.
+    let mut tampered = authority.send(T0 + 6).frame;
+    tampered.sig = subject_key().sign(b"not this frame");
+    let opened = witness.ingest_frame(&tampered, &[]).expect("a gap");
+    let [WitnessSignal::Gap(request)] = opened.as_slice() else {
+        panic!("expected one gap, got {opened:?}");
+    };
+    let request = request.clone();
+    assert_eq!(witness.counters().deferrals_held, 1);
+
+    let served = log.serve_range(&request, usize::MAX);
+    witness
+        .ingest_wire_frames(&served.response.frames, &served.heads)
+        .expect("the repair itself is well formed");
+
+    let counters = witness.counters();
+    assert_eq!(
+        counters.deferrals_dropped_in_drain, 1,
+        "the held frame ended here and the ledger says so"
+    );
+    assert_eq!(counters.frames_recovered, 0, "it was not recovered");
+    assert_eq!(counters.deferrals_held, 0, "and it is not still held");
+    assert_eq!(counters.frames_rejected, 1);
+    assert!(ledger_balances(&witness));
+}
+
+#[test]
+fn a_repair_that_lands_closes_the_ledger_with_nothing_dropped() {
+    // The healthy case, and the reason the other four are readable: when the
+    // repair arrives in time every deferral comes back out as a fold. A run
+    // whose ledger is all `frames_recovered` has no coverage deficit to
+    // attribute, which is what makes a run that does one worth reading.
+    let mut authority = Authority::new(1);
+    let mut witness = watching(WitnessConfig::default(), &mut authority);
+    let mut log = AuthorityLog::default();
+
+    let record = |authority: &mut Authority, log: &mut AuthorityLog, tick: u64| {
+        let sent = authority.send(tick);
+        log.record_frame(
+            sent.frame.clone(),
+            vec![HeadTransition {
+                entity: ENTITY,
+                prev_head: ChainHash::EMPTY,
+                head: ChainHash::EMPTY,
+            }],
+        );
+        sent
+    };
+
+    let first = record(&mut authority, &mut log, T0);
+    witness
+        .ingest_frame(&first.frame, &[])
+        .expect("the first frame chains from the anchor");
+    let _lost = record(&mut authority, &mut log, T0 + 3);
+    let revealing = record(&mut authority, &mut log, T0 + 6);
+    let opened = witness.ingest_frame(&revealing.frame, &[]).expect("a gap");
+    let [WitnessSignal::Gap(request)] = opened.as_slice() else {
+        panic!("expected one gap, got {opened:?}");
+    };
+    let request = request.clone();
+    for round in 3..7u64 {
+        let sent = record(&mut authority, &mut log, T0 + round * 3);
+        witness.ingest_frame(&sent.frame, &[]).expect("held");
+    }
+
+    let served = log.serve_range(&request, usize::MAX);
+    witness
+        .ingest_wire_frames(&served.response.frames, &served.heads)
+        .expect("a correctly served repair is not a rejection");
+
+    let counters = witness.counters();
+    assert_eq!(counters.frames_deferred, 5);
+    assert_eq!(counters.frames_recovered, 5);
+    assert_eq!(counters.deferrals_held, 0);
+    assert_eq!(counters.deferrals_pruned, 0);
+    assert_eq!(counters.deferrals_dropped_in_drain, 0);
+    assert_eq!(counters.deferrals_overflowed, 0);
+    assert_eq!(counters.deferrals_replaced, 0);
+    assert!(ledger_balances(&witness));
+}
+
+#[test]
+fn frames_stranded_by_a_re_anchor_are_not_reported_as_recovered() {
+    // A watch that gives up on a hole and resumes at a later anchor leaves
+    // every frame it was holding behind the new anchor. The drain accepts them
+    // as duplicates — their ticks are behind the fold — and they leave the
+    // buffer without a single one being re-executed. Counting that as recovery
+    // would report the *most* expensive loss in the path as the healthy case:
+    // those ticks are in `unjudged_ticks`, which is the opposite column.
+    let mut authority = Authority::new(1);
+    let mut witness = watching(WitnessConfig::default(), &mut authority);
+    abandoned_hole(&mut witness, &mut authority);
+
+    let mut tick = T0 + 9;
+    let resumed = loop {
+        let sent = authority.send(tick);
+        witness.ingest_frame(&sent.frame, &[]).expect("deferred");
+        tick += 3;
+        if let Some(claim) = sent.claim {
+            let advertised = authority.advertised();
+            witness.observe(Observation {
+                entity: ENTITY,
+                state: &advertised,
+                tick: claim.tick,
+            });
+            witness.ingest_claim(&claim).expect("the claim is signed");
+            if witness.counters().reanchors == 1 {
+                break claim.tick.0;
+            }
+        }
+        assert!(tick < T0 + 400, "the witness never resumed");
+    };
+    let stranded = witness.counters().deferrals_held;
+    assert!(stranded > 0, "the resume left frames behind it");
+
+    // One frame off the new anchor is enough to run the drain over them.
+    witness
+        .ingest_frame(&authority.send(resumed).frame, &[])
+        .expect("chains to the resumed anchor");
+
+    let counters = witness.counters();
+    assert_eq!(
+        counters.deferrals_stale, stranded,
+        "every stranded frame is named as stale, not as recovered"
+    );
+    assert_eq!(
+        counters.frames_recovered, 0,
+        "nothing was folded on a retry — the hole was abandoned, not filled"
+    );
+    assert!(
+        counters.unjudged_ticks > 0,
+        "and the ticks are counted lost"
+    );
+    assert!(ledger_balances(&witness));
+}
+
+#[test]
+fn frames_held_for_a_subject_that_went_quiet_are_swept_and_counted() {
+    // The quietest door in the path, and the only one that needs two subjects
+    // to reach: retention runs on the ingest path, so a subject whose frames
+    // are stranded behind a hole nobody will fill is swept by the ticks some
+    // *other* subject keeps delivering. In a swarm every witness watches
+    // several peers, so this is the ordinary case rather than a corner — and a
+    // frame that leaves this way was counted as timeline shown and will never
+    // be judged.
+    let mut quiet = Authority::for_subject(second_key(), OTHER, 1);
+    let mut talkative = Authority::new(1);
+    let mut witness = watching(WitnessConfig::default(), &mut talkative);
+    watch_also(&mut witness, &mut quiet);
+
+    // The quiet subject opens a hole and then says nothing more.
+    witness
+        .ingest_frame(&quiet.send(T0).frame, &[])
+        .expect("the first frame chains from the anchor");
+    let _lost = quiet.send(T0 + 3);
+    for round in 2..6u64 {
+        witness
+            .ingest_frame(&quiet.send(T0 + round * 3).frame, &[])
+            .expect("held behind the hole");
+    }
+    let stranded = witness.counters().deferrals_held;
+    assert_eq!(stranded, 4, "four frames held for a subject that stopped");
+
+    // The other subject carries the witness past the retention window. Nothing
+    // in that traffic touches the quiet subject's buffer except the sweep.
+    let mut tick = T0;
+    for _ in 0..300 {
+        witness
+            .ingest_frame(&talkative.send(tick).frame, &[])
+            .expect("an unbroken chain from the other subject");
+        tick += 3;
+    }
+
+    let counters = witness.counters();
+    assert_eq!(
+        counters.deferrals_pruned, stranded,
+        "the stranded frames left through retention and the ledger says so"
+    );
+    assert_eq!(counters.deferrals_held, 0, "the buffer is empty again");
+    assert_eq!(counters.frames_recovered, 0, "none of them was ever folded");
+    assert!(ledger_balances(&witness));
 }

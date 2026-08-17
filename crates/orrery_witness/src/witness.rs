@@ -117,9 +117,56 @@ pub struct WitnessCounters {
     /// Timeline that used to be thrown away: a frame that could not chain when
     /// it arrived was dropped, so everything a subject sent while a repair was
     /// in flight had to be asked for all over again.
+    ///
+    /// Counted from the fold itself, not from the frame leaving the buffer. A
+    /// held frame the drain discards because its ticks are already behind the
+    /// fold also leaves the buffer, and counting it here would report timeline
+    /// as recovered that no re-execution ever touched — which is precisely the
+    /// reading a coverage attribution must not be given.
     pub frames_recovered: u64,
+    /// Held frames discarded because their ticks were already behind the fold.
+    ///
+    /// The two ways that happens are opposite in meaning and share this
+    /// counter, so read it beside [`Self::reanchors`]. A repair that answered
+    /// in whole frames can cover a frame that was also held, and discarding the
+    /// held copy costs nothing — the ticks were judged, by the repair. A watch
+    /// that re-anchored past its hole leaves every frame it was holding behind
+    /// the new anchor, and discarding those costs everything they carried:
+    /// those ticks are in [`Self::unjudged_ticks`], not in
+    /// [`Self::judged_ticks`].
+    pub deferrals_stale: u64,
     /// Frames dropped because the deferral buffer for their subject was full.
     pub deferrals_overflowed: u64,
+    /// Held frames dropped by the retention sweep before the hole closed.
+    ///
+    /// A frame held behind a hole is only worth holding while a bundle could
+    /// still be assembled from it, so [`Witness::prune`] evicts the ones that
+    /// fell past the floor. That is the right call and it is still a loss: the
+    /// ticks those frames carried were counted as shown and will never be
+    /// judged, and without this counter they leave the ledger by a door nobody
+    /// is watching.
+    pub deferrals_pruned: u64,
+    /// Held frames that failed verification when the drain re-offered them.
+    ///
+    /// [`Witness::drain_deferred`] takes a frame out of the buffer before it
+    /// re-offers it, so a frame the second attempt refuses is gone. Refusing it
+    /// is correct — it will not verify on a third try either — but the frame is
+    /// neither recovered nor still held, and the deferral ledger has to say so.
+    pub deferrals_dropped_in_drain: u64,
+    /// Held frames displaced by a later copy of themselves.
+    ///
+    /// The buffer is keyed by subject and first tick, so a frame re-delivered
+    /// while its own copy is still held replaces that copy rather than
+    /// accumulating beside it. One frame in, one frame out — but the frame that
+    /// left was counted going in, so the ledger needs the offsetting entry.
+    pub deferrals_replaced: u64,
+    /// Frames still held behind an open hole when the counters were read.
+    ///
+    /// Not accumulated: filled in by [`Witness::counters`] from the buffer's
+    /// current occupancy, because it is a level rather than a flow. Read at the
+    /// end of a run it is the balance of the deferral ledger — the frames that
+    /// were set aside and neither came back nor were dropped.
+    pub deferrals_held: u64,
     /// Watches resumed at a later anchor after a hole was abandoned.
     ///
     /// Each one is a window this witness gave up on and a point at which it
@@ -413,10 +460,16 @@ impl<R: Ruleset> Witness<R> {
     /// Repairs asked for without the hole closing before the subject is
     /// reported as stalled rather than merely behind.
     ///
-    /// The backoff is linear in attempts, so this is roughly fifteen seconds of
-    /// the subject's timeline — comfortably longer than a rate-limited refill
-    /// of a full retention window, and well inside it a peer that simply will
-    /// not answer stops being given the benefit of the doubt.
+    /// There is no backoff between the asks. [`Self::repair_step`] compares
+    /// against `since + REPAIR_TIMEOUT_TICKS * attempts` with `since` pinned to
+    /// when the hole was *first* noticed, so the deadline moves by a constant
+    /// [`Self::REPAIR_TIMEOUT_TICKS`] each attempt and the interval between
+    /// asks is a flat 60 ticks. The whole budget is therefore 300 ticks of the
+    /// subject's timeline — **five seconds at 60 Hz**, not the fifteen a
+    /// per-attempt backoff would give. Long enough for a rate-limited refill of
+    /// a full retention window to land, and short enough that a peer which
+    /// simply will not answer stops being given the benefit of the doubt inside
+    /// one adjudication window rather than across three.
     const MAX_REPAIR_ATTEMPTS: u32 = 5;
 
     /// Re-executed states kept per entity, in ticks.
@@ -456,9 +509,19 @@ impl<R: Ruleset> Witness<R> {
     }
 
     /// Everything observed so far.
+    ///
+    /// [`WitnessCounters::deferrals_held`] is filled in here rather than
+    /// accumulated: it is the buffer's occupancy at the moment of the read, and
+    /// it is what closes the deferral ledger. Every frame counted in
+    /// [`WitnessCounters::frames_deferred`] has since been recovered,
+    /// overflowed, pruned, dropped by a drain, discarded as stale, replaced by
+    /// a later copy of itself, or is still sitting here.
     #[must_use]
     pub fn counters(&self) -> WitnessCounters {
-        self.counters
+        WitnessCounters {
+            deferrals_held: self.deferred.len() as u64,
+            ..self.counters
+        }
     }
 
     /// Whether this witness would file, or only count.
@@ -879,8 +942,17 @@ impl<R: Ruleset> Witness<R> {
         sibling_heads: &[(ChainHash, ChainHash)],
     ) {
         let key = (*subject.as_bytes(), frame.first_tick.0);
-        self.deferred
-            .insert(key, (frame.clone(), sibling_heads.to_vec()));
+        // A repair can re-serve a frame whose own copy is still held. The map
+        // keys on the frame's identity, so the second copy takes the first
+        // one's place — one frame leaves the buffer without being recovered or
+        // dropped, and the ledger only balances if that is said out loud.
+        if self
+            .deferred
+            .insert(key, (frame.clone(), sibling_heads.to_vec()))
+            .is_some()
+        {
+            self.counters.deferrals_replaced += 1;
+        }
         let held = self.held_for(subject);
         if held.len() > Self::MAX_DEFERRED_FRAMES {
             let oldest = held[0];
@@ -915,17 +987,32 @@ impl<R: Ruleset> Witness<R> {
             let Some((frame, siblings)) = self.deferred.remove(&key) else {
                 continue;
             };
+            let folded_before = self.counters.frames_accepted;
             match self.ingest_frame(&frame, &siblings) {
                 Ok(produced) => signals.extend(produced),
-                // Counted where it was decided; a frame that will not verify is
-                // not a reason to hold on to the ones behind it.
-                Err(_) => continue,
+                // The rejection itself was counted where it was decided; this
+                // counts the *held* frame that went with it. It was taken out
+                // of the buffer to be re-offered and does not go back, so a
+                // deferral ends here that no other counter would name.
+                Err(_) => {
+                    self.counters.deferrals_dropped_in_drain += 1;
+                    continue;
+                }
             }
             // `ingest_frame` puts it straight back when it still cannot chain.
             if self.deferred.contains_key(&key) {
                 break;
             }
-            self.counters.frames_recovered += 1;
+            // Left the buffer, but not necessarily through a fold: a frame
+            // whose ticks are already behind the fold is accepted as a
+            // duplicate without being re-executed. Telling the two apart is
+            // what keeps `frames_recovered` a count of timeline the witness
+            // actually got back.
+            if self.counters.frames_accepted > folded_before {
+                self.counters.frames_recovered += 1;
+            } else {
+                self.counters.deferrals_stale += 1;
+            }
         }
         self.draining = false;
         signals
@@ -1038,6 +1125,18 @@ impl<R: Ruleset> Witness<R> {
     /// once [`Self::REPAIR_TIMEOUT_TICKS`] of the subject's own timeline have
     /// passed without the hole closing, which is what keeps a *lost* repair
     /// from stalling the witness forever.
+    ///
+    /// # `now` comes from two different clocks
+    ///
+    /// [`Self::repair_check`] passes the *subject's* tick, taken off the frame
+    /// that failed to chain; [`Self::sweep`] passes the caller's *local* tick.
+    /// They are compared against the same `catchup.since`, which was written by
+    /// whichever path opened the hole. In `p1-swarm` both are one global
+    /// simulated tick and the difference cannot show, which is exactly why it
+    /// is written down: against a real peer whose tick base is its own, an
+    /// offset between the two makes the timeout fire early or never, and the
+    /// symptom would be a stall count that tracks clock skew rather than link
+    /// quality.
     fn repair_step(
         &mut self,
         entity: PersistId,
@@ -1187,8 +1286,10 @@ impl<R: Ruleset> Witness<R> {
         // still be assembled from it. Past the floor the per-subject cap is no
         // longer what bounds the buffer — a subject that went quiet mid-hole
         // would otherwise leave its frames there for the rest of the session.
+        let held_before = self.deferred.len();
         self.deferred
             .retain(|(_, first_tick), _| *first_tick >= floor);
+        self.counters.deferrals_pruned += (held_before - self.deferred.len()) as u64;
 
         // Stage-1 samples are kept for entities this peer does not witness, so
         // nothing else bounds them.

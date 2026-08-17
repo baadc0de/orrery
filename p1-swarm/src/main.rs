@@ -332,16 +332,29 @@ fn main() -> Result<()> {
             report.total_shown_ticks,
             report.total_unjudged_ticks,
             report.total_reanchors,
-            report
-                .per_peer
-                .iter()
-                .map(|p| p.frames_deferred)
-                .sum::<u64>(),
-            report
-                .per_peer
-                .iter()
-                .map(|p| p.judgements_deferred)
-                .sum::<u64>(),
+            report.total_frames_deferred,
+            report.total_judgements_deferred,
+        );
+        // Coverage is one minus what is in flight through repair, so the line
+        // above is only half a finding without this one: it says how much was
+        // missed, and this says where it went. A deficit that cannot be spent
+        // against these six columns is a deficit with an unnamed cause.
+        eprintln!(
+            "p1-swarm: of {} deferred frames — {} recovered, {} stale, {} overflowed, \
+             {} pruned, {} dropped in drain, {} replaced, {} still held; ledger {}",
+            report.total_frames_deferred,
+            report.total_frames_recovered,
+            report.total_deferrals_stale,
+            report.total_deferrals_overflowed,
+            report.total_deferrals_pruned,
+            report.total_deferrals_dropped_in_drain,
+            report.total_deferrals_replaced,
+            report.total_deferrals_held,
+            if report.deferral_ledger_balances {
+                "balances"
+            } else {
+                "DOES NOT BALANCE"
+            },
         );
     }
     if let Some(join) = &report.late_join {
