@@ -6,14 +6,14 @@
 #   ./scripts/check.sh clippy       both feature sets, -D warnings
 #   ./scripts/check.sh gates        static gates, harness self-tests, tool tests
 #   ./scripts/check.sh test         the root workspace's test suite
-#   ./scripts/check.sh doctor       delegate to dev-cache.sh: is sccache wired up?
+#   ./scripts/check.sh doctor       delegate to dev-cache.sh: is the cache wired up?
 #   ./scripts/check.sh --self-test  the lane table still matches the filesystem
 #   ./scripts/check.sh --list       what each lane would run, without running it
 #
 # Why this exists. `.github/workflows/ci.yml` used to be the only place the
 # commands existed, so the only way to find out whether a change passed was to
 # push and wait — one agent round-trip per miss. The four per-commit jobs now
-# carry environment (runner selection, toolchain, apt, cache, the sccache
+# carry environment (runner selection, toolchain, apt, cache, the rustc
 # wrapper, the FoundationDB client) and delegate their bodies here.
 #
 # **Scope the claim.** This script is the whole body of ci.yml's `fmt`,
@@ -219,8 +219,9 @@ lane_test() {
         --exclude aeronet_tokio_runtime
 }
 
-# Not a CI lane: CI sets `RUSTC_WRAPPER: ""` because a runner is ephemeral and
-# has nothing to hit. Locally sccache is a build prerequisite (AGENTS.md
+# Not a CI lane: CI clears `RUSTC_WRAPPER` for GitHub-hosted runners, which are
+# ephemeral and have nothing to hit; the self-hosted jobs put it back. Locally
+# kache is a build prerequisite (AGENTS.md
 # § Build cache), and `scripts/dev-cache.sh` already knows how to prove it is
 # taking effect — including running a build and watching the request count
 # move. Delegated rather than reimplemented.

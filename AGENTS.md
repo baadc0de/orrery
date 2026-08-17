@@ -96,7 +96,7 @@ cross-platform determinism matrix.
 
 Four of those jobs — `fmt`, `clippy`, `gates`, `test` — have no command bodies
 of their own any more. They install a toolchain, apt packages and the
-FoundationDB client, restore a cache, set the sccache wrapper, and then invoke
+FoundationDB client, restore a cache, set the rustc wrapper, and then invoke
 one lane of `scripts/check.sh`. So the way to find out whether a change passes
 is to run it, not to push and wait:
 
@@ -105,7 +105,7 @@ is to run it, not to push and wait:
 ./scripts/check.sh clippy       # one lane, exactly the commands the job runs
 ./scripts/check.sh --list       # what a lane would run, without running it
 ./scripts/check.sh --self-test  # the lane table still matches the filesystem
-./scripts/check.sh doctor       # delegates to dev-cache.sh: is sccache working?
+./scripts/check.sh doctor       # delegates to dev-cache.sh: is the cache working?
 ```
 
 **Scope the claim, because overclaiming it is how it stops being trusted.**
@@ -118,11 +118,16 @@ processes. Neither workflow is reproduced here.
 
 **Measured, on the shared 16-thread box at `CARGO_BUILD_JOBS=3` with two other
 agents building concurrently: 13 min 50 s** into a fresh worktree — empty
-`target/` directories in all eight workspaces, warm sccache. The second run,
+`target/` directories in all eight workspaces, warm cache. The second run,
 fully warm and with nothing changed, was **78 s**: `fmt` 3 s, `clippy` 1 s,
 `gates` 10 s, `test` 64 s. So the honest shape of it is that the first run in a
 new worktree costs a quarter of an hour and every run after it costs a minute,
 and `fmt` costs 3 s either way — run that one before every commit regardless.
+
+Those figures were measured under the previous build cache (sccache), before the
+2026-08-17 move to kache. The shape holds — a cold worktree is dominated by the
+dependency graph and a warm one by `test` — but treat the absolute numbers as
+stale until someone re-measures them.
 
 ### Eight workspaces, and only one of them is "the" workspace
 
@@ -238,14 +243,15 @@ in the core. A fourth clause, scoped to the two ruleset crates, refuses a live
 neighbour read: cross-entity effects travel as events, because the adjudicator
 installs exactly one entity and a neighbour read is always `None` at replay.
 
-**`sccache` is cleared on GitHub-hosted runners, and deliberately not on the
-self-hosted one.** `.cargo/config.toml` sets `build.rustc-wrapper = "sccache"`
-for local worktrees; the workflows set `RUSTC_WRAPPER: ""` at the top because a
-GitHub runner is ephemeral and has nothing to hit. The jobs that can land on
-`orrery-hel1-1` set it back to `sccache`, because that box keeps a persistent
-`target/` and a cache at `/var/cache/sccache` that is **shared with the dev
-checkout on the same machine** — same dependency graph, so a CI build starts
-warm off whatever was compiled by hand there, and vice versa.
+**The rustc wrapper is cleared on GitHub-hosted runners, and deliberately not
+on the self-hosted one.** `.cargo/config.toml` sets
+`build.rustc-wrapper = "kache"` for local worktrees; the workflows set
+`RUSTC_WRAPPER: ""` at the top because a GitHub-hosted runner is ephemeral and
+has nothing to hit. The jobs that can land on `orrery-hel1-1` set it back to
+`kache`, because that box keeps a persistent `target/` and a shared cache at
+`/var/cache/kache/shared` that **both build identities publish to and restore
+from** — same dependency graph, so a CI build starts warm off whatever was
+compiled by hand in the dev checkout, and vice versa.
 
 **The heavy Linux jobs run on a self-hosted box.** `clippy`, `static gates` and
 `workspace tests` run on `orrery-hel1-1` for pushes and same-repository pull
@@ -337,9 +343,10 @@ entire dependency graph, are compiled once per machine and reused everywhere.
 
 | Setting | Location | Committed? |
 |---|---|---|
-| `build.rustc-wrapper = "sccache"` | `.cargo/config.toml` | yes — worktrees each get a copy of tracked files, so this is the only way a setting reaches all of them |
+| `build.rustc-wrapper = "kache"` | `.cargo/config.toml` | yes — worktrees each get a copy of tracked files, so this is the only way a setting reaches all of them |
 | `build.incremental = false` | `.cargo/config.toml` | yes |
-| cache directory and size cap | `~/.config/sccache/config` | no — machine-local |
+| local store size cap, shared remote | `~/.config/kache/config.toml` | no — machine-local, one per build identity |
+| the cache daemon | `kache@<user>.service` (systemd) | no — machine-local |
 
 The standalone tools (`p2-load`, `p3-island`, `p0-*`) each declare their own
 `[workspace]`, so each has its own `target/`. They still inherit the repo's
@@ -348,21 +355,88 @@ not add a per-tool `.cargo/config.toml`, which would shadow it and silently
 drop that tool back to uncached builds.
 
 **Incremental compilation is off deliberately, and the two reasons compound.**
-sccache cannot cache an incremental unit — it marks them non-cacheable — so
+An incremental unit is not cacheable by a plain rustc wrapper, so
 leaving it on would defeat the cache for exactly the crates being worked on,
 while still writing the artifacts to disk. If you are a human tight-looping
 edits on one crate, that trade is not in your favour: use `CARGO_INCREMENTAL=1`
 for that session, which overrides the file.
 
-### This makes sccache a build prerequisite
+### This makes kache a build prerequisite
 
-If it is missing, install it (`pacman -S sccache`, or
-`cargo install sccache --locked`) or opt out for one command with an empty
-wrapper, which takes precedence over the config file:
+If it is missing, install it (see
+[kache](https://github.com/kunobi-ninja/kache)) or opt out for one command with
+an empty wrapper, which takes precedence over the config file:
 
 ```
 RUSTC_WRAPPER= cargo build
 ```
+
+### How it is set up on this box
+
+Two build identities compile here: the dev user (you, and every agent worktree)
+and `ci`, which the three GitHub Actions runners run as. They share one cache
+through a content-addressed directory:
+
+| Piece | Where |
+|---|---|
+| shared cache | `/var/cache/kache/shared`, group `kache`, `2775` + a default ACL granting the group `rwx` |
+| local store | `~/.cache/kache` per identity, capped at 25 GiB |
+| daemon | `kache@<user>.service`, a systemd **system** unit, one instance per identity |
+| shared-cache pruning | `kache-prune-shared.timer`, daily |
+
+`cache.local_max_size` is the size cap — **not** `max_size`, which kache ignores
+silently, leaving you on the 50 GiB default while your config claims otherwise.
+`cache.auto_gc` is on by default and enforces the cap opportunistically, so the
+local stores look after themselves.
+
+The shared remote does not: `kache gc` evicts the local stores only, so a
+filesystem remote grows without bound. `kache-prune-shared.timer` drops objects
+untouched for 21 days. Deleting them is always safe — they are content-addressed
+and immutable, so a pruned object is a cache miss and nothing worse.
+
+The default ACL is the part worth understanding: it makes every new object
+group-writable **regardless of the writing process's umask**. Without it a
+runner with `umask 022` would publish objects the dev user could not overwrite,
+and the sharing would rot silently in one direction.
+
+A systemd *system* unit rather than kache's own `kache daemon install`, which
+writes a **user** unit: a user unit needs lingering and a D-Bus session, and
+`ci` is a service account with neither.
+
+Two `kache doctor` checks are expected to fail here and are not problems: it
+reports the daemon service as "not installed" because it only recognises its own
+user unit, and it counts daemon processes machine-wide rather than per uid, so
+it sees the other identity's daemon and reports one too many.
+
+**Why not sccache**, since the repo used it until 2026-08-17.
+
+The intermittent CI failures — `Connection reset by peer (os error 104)`,
+`Failed to read response header` — had a specific cause, and it was not cache
+corruption. All three runners run as `ci` and shared **one** sccache server.
+Whichever job's client spawned it owned that process inside *that runner's*
+process tree, so when that job finished, the runner's cleanup killed it —
+`Terminate orphan process: pid (N) (sccache)` — and every in-flight compile in
+the other two jobs died with it. Across 15 retrieved failures the correlation is
+exact: each one begins 15–50 ms after a *different* job on a *different* runner
+logged that kill. (PR #52's `SCCACHE_IGNORE_SERVER_IO_ERROR=1` did not help; one
+of the 15 failed fatally with it set.)
+
+kache is immune for two independent reasons. Its daemon is a systemd system
+unit in `system.slice`, not a descendant of any job, so a runner's orphan reaper
+never sees it. And because kache compiles **in the invoking process**, a dead
+daemon costs remote lookups, not builds: with `kache@baadc0de` stopped
+outright, a full rebuild of `p3-island` from an empty `target/` took 3.45 s
+against 3.28 s with it running.
+
+Two further sccache problems made the shared cache worth leaving anyway. It runs
+the compiler inside its server, so the server's uid owns the output objects and
+it panics outright if it cannot stat the calling user's toolchain — which it
+cannot, because `/home/<user>` is `0750`. And it writes cache entries `0600`, so
+`/var/cache/sccache` was never actually shared: 20,520 entries readable only by
+the dev user, 4,965 only by `ci`, each server's LRU evicting files it could not
+read. Upstream documents that arrangement as unsupported — *"The local storage
+only supports a single sccache server at a time. Multiple concurrent servers
+will race and cause spurious build failures."*
 
 ### Working with it
 
@@ -374,27 +448,33 @@ RUSTC_WRAPPER= cargo build
 ```
 
 `prune` is the lever to pull when disk gets tight, and pulling it is cheap:
-sources are in git and the rebuild refills from the cache. Measured on the
-`p3-island` tool, deleting its whole `target/` and rebuilding: **100% cache hit
-rate, 304/304 units**, 21 s cold versus 14 s warm — the residual is linking and
-cargo's own bookkeeping, which no object cache can remove.
+sources are in git and the rebuild refills from the cache. Measured 2026-08-17
+on the `p3-island` tool, deleting its whole `target/` and rebuilding: **25 s
+with a cold cache, 3.3 s warm** (330 cache hits). The residual is linking and
+cargo's own bookkeeping, which no object cache can remove. For comparison, the
+same measurement under sccache was 21 s cold and **14 s** warm — the warm case
+is where the difference shows, because sccache's entries were unreadable across
+build identities and a warm cache was warm for one user only.
 
 Two things follow for agents sharing this machine:
 
 - **Prune freely, and prune your own worktree before a long build.** You are not
   destroying anyone's work; you are dropping a derived artifact that another
   agent's build already paid to compute.
-- **Do not read `Non-cacheable calls` in the stats as breakage.** Linking,
-  `build.rs` executions, and a few binary crate-type units are not cacheable by
-  design. A healthy report has a high hit *rate* with a non-zero non-cacheable
-  count.
+- **Do not read a less-than-100% hit rate as breakage.** Linking, `build.rs`
+  executions and a few binary crate-type units are not cacheable by design, and
+  the crate you are actively editing is *supposed* to miss. `kache why-miss
+  <crate>` explains any individual miss, which beats guessing.
+- **A miss on the crate you are editing is not a miss on its dependencies.**
+  The dependency graph is the part the shared cache pays for, and it is the
+  overwhelming majority of a cold build.
 
 ## Working alongside other agents
 
 Several agents work this repository at once, each in its own git worktree. The
 worktrees isolate the filesystem and nothing else: there is one `.git`, one
-sccache, one disk, one FoundationDB dev cluster, one set of harness ports, one
-GitHub remote. Everything below exists because of that asymmetry.
+build cache, one disk, one FoundationDB dev cluster, one set of harness ports,
+one GitHub remote. Everything below exists because of that asymmetry.
 
 **Be clear about what a collision actually is.** Two agents editing the same
 file in two worktrees do *not* clobber each other — separate checkouts, separate

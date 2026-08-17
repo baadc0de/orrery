@@ -84,9 +84,10 @@ jobs:
     # Simulated hour, no cluster, no ports: 16 cores and a warm target/ turn this from tens of minutes into a few.
     runs-on: [self-hosted, orrery-hel1]
     env:
-      # Overrides the workflow-level clear: the box has a persistent sccache at
-      # /var/cache/sccache, shared with the dev checkout on the same machine.
-      RUSTC_WRAPPER: sccache
+      # Overrides the workflow-level clear: the box has a persistent build
+      # cache at /var/cache/kache/shared, shared with the dev checkout on the
+      # same machine.
+      RUSTC_WRAPPER: kache
     # Three simulated hours take about fifteen minutes of wall clock — the hour
     # is simulated, so it costs what it costs to compute. The witnessed leg is
     # the expensive one at roughly ten of those minutes, because every peer
@@ -183,10 +184,10 @@ jobs:
         shell: bash
     env:
       # Overrides the workflow-level clear on the box only, which has a
-      # persistent sccache at /var/cache/sccache. The hosted runners have none;
-      # pointing `RUSTC_WRAPPER` at a binary that is not installed fails every
-      # compile.
-      RUSTC_WRAPPER: ${{ matrix.platform == 'linux' && 'sccache' || '' }}
+      # persistent build cache at /var/cache/kache/shared. The hosted runners
+      # have none; pointing `RUSTC_WRAPPER` at a binary that is not installed
+      # fails every compile.
+      RUSTC_WRAPPER: ${{ matrix.platform == 'linux' && 'kache' || '' }}
     permissions:
       contents: read
       # The ledger is carried between nights as an artifact of this workflow,
@@ -207,7 +208,7 @@ jobs:
       - name: Install the pinned toolchain
         run: rustup show active-toolchain || rustup toolchain install
 
-      # The box keeps its target/ between runs and has sccache; a cache
+      # The box keeps its target/ between runs and has kache; a cache
       # round-trip there would cost more than it saves. The hosted legs would
       # otherwise pay a cold build of the whole dependency graph every night.
       - uses: actions/cache@v6
@@ -481,9 +482,10 @@ jobs:
     # gate collides with nothing the box is already doing.
     runs-on: [self-hosted, orrery-hel1]
     env:
-      # Overrides the workflow-level clear: the box has a persistent sccache at
-      # /var/cache/sccache, shared with the dev checkout on the same machine.
-      RUSTC_WRAPPER: sccache
+      # Overrides the workflow-level clear: the box has a persistent build
+      # cache at /var/cache/kache/shared, shared with the dev checkout on the
+      # same machine.
+      RUSTC_WRAPPER: kache
     # The harness runs a 30 s island plus setup and teardown; the build
     # dominates. Bounded so a hung peer fails rather than burning the job limit.
     timeout-minutes: 45
@@ -592,9 +594,10 @@ jobs:
     # Ten corpus repeats in one process. Bevy-free and cheap, but it still paid a cold build every night.
     runs-on: [self-hosted, orrery-hel1]
     env:
-      # Overrides the workflow-level clear: the box has a persistent sccache at
-      # /var/cache/sccache, shared with the dev checkout on the same machine.
-      RUSTC_WRAPPER: sccache
+      # Overrides the workflow-level clear: the box has a persistent build
+      # cache at /var/cache/kache/shared, shared with the dev checkout on the
+      # same machine.
+      RUSTC_WRAPPER: kache
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7

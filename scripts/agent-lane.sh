@@ -5,7 +5,7 @@
 # Agents here work in parallel git worktrees. Worktrees isolate the *filesystem*,
 # so two agents editing the same file do not clobber each other — the collision
 # surfaces later, at merge, which is the expensive place to find it. What they do
-# not isolate is everything else: one `.git` directory, one sccache, one disk,
+# not isolate is everything else: one `.git` directory, one build cache, one disk,
 # one FoundationDB dev cluster, one set of harness ports, one GitHub remote.
 #
 # This script is the shared ledger for both halves. Lanes announce what an agent
