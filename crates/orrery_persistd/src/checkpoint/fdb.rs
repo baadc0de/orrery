@@ -35,6 +35,13 @@
 //!   `PersistId` collapses them to whichever cell sorts higher in Morton
 //!   order — a stale-versus-fresh coin flip, and, across shards, two actors
 //!   recovering the same entity.
+//! - **Rows without a watermark are still state** (P-11): the two reads
+//!   [`FdbCheckpointStore::load`] performs are independent (§3.4 step 2). A
+//!   shard whose subtree has rows but no `ckpt/` row — freshly seeded
+//!   (docs/12-world-seeding.md §11.4 makes that the seeder's contract), split
+//!   but not yet checkpointed, or interrupted mid-first-checkpoint — loads its
+//!   rows at watermark 0:0 and replays the whole journal on top. Only a shard
+//!   with *neither* is absent.
 //! - **Rows are grid-scoped** (P-7): the `world/` key carries the 4-byte
 //!   `GridId` (§6 calls `cell_id` grid-relative), so nested-grid content and
 //!   root-grid content with the same `CellId` cannot collide and per-grid
@@ -395,19 +402,75 @@ impl CheckpointStore for FdbCheckpointStore {
     ) -> Result<Option<CheckpointData>, CheckpointError> {
         let db = Arc::clone(&self.db);
         db.run(|trx, _| async move {
+            // §3.4 step 2 is **two independent reads**: the range scan that
+            // rebuilds the shard's state, and the `ckpt/` read that says how
+            // far the journal has already been folded into it. They are read
+            // together here — a scan gated behind the watermark row made the
+            // watermark's *absence* mean "this shard has no state", which is
+            // exactly what it does not mean (P-11 below).
             let raw = trx.get(&keyspace::ckpt_key(grid, shard), false).await?;
+            // Rebuild the entity bag, cell map, and tombstone set from the
+            // `world/` rows — the `ckpt/` value is the watermark only (P-8),
+            // so the bag never comes from it.
+            let rows = scan_world(&trx, grid, shard).await?;
             let Some(bytes) = raw else {
-                return Ok(None);
+                // **A seeded shard has rows and no watermark** (P-11):
+                // `orrery-seed` writes `world/` rows and deliberately no
+                // `ckpt/` row (docs/12-world-seeding.md §11.4), and so does
+                // every shard that has state but has not checkpointed yet —
+                // a split child loading its share of the parent's rows
+                // (§3.5), a first-ever checkpoint that committed row chunks
+                // and died before its meta transaction, a shard whose
+                // watermark row was lost. Returning `None` here recovered an
+                // *empty* shard from a cluster holding the whole world:
+                // `committed_entity_cell` then resolves nothing, every lease
+                // claim is denied `NotEligible`, and no bulk write is ever
+                // fenced through.
+                //
+                // The rows are adopted at watermark 0:0, i.e. the whole
+                // journal is the tail. That is safe in all four cases, not
+                // just after seeding, because replay is a *state-replacing*
+                // fold (`CellRuntime::fold` assigns `entry.components`; it
+                // never accumulates a delta), so re-folding records already
+                // covered by the rows re-derives the same state rather than
+                // double-applying it — and the epoch gate rebuilds its
+                // running maximum (C-2) from those same records instead of
+                // being seeded mid-journal from a watermark we do not have.
+                // The cost is a longer replay, not a wrong one.
+                //
+                // Boundary, deliberately not papered over: watermark 0:0 is
+                // indistinguishable from "covers the first record", so the
+                // record at journal position 0:0 is filtered out of the
+                // replay. That ambiguity is the watermark type's, not this
+                // branch's — a genuine checkpoint taken before the first
+                // append writes the same 0:0 — and it costs the first record
+                // of a fresh journal, against a whole world recovered.
+                if rows.entities.is_empty() && rows.tombstones.is_empty() {
+                    return Ok(None);
+                }
+                return Ok(Some(CheckpointData {
+                    shard,
+                    grid,
+                    // No checkpoint was taken, so there is no taker, no epoch
+                    // it was taken under, and no time it was taken at. Zeroed
+                    // rather than guessed: the fence row is the authority on
+                    // the *current* epoch, and seeding the gate with it would
+                    // reject the very tail this load exists to replay.
+                    node_id: 0,
+                    epoch: Epoch::new(0),
+                    watermark: Lsn::new(0, 0),
+                    entities: rows.entities,
+                    by_cell: rows.by_cell,
+                    tombstones: rows.tombstones,
+                    superseded: rows.superseded,
+                    taken_at_ms: 0,
+                }));
             };
             let meta: CheckpointMeta = postcard::from_bytes(bytes.as_ref()).map_err(|e| {
                 foundationdb::FdbBindingError::new_custom_error(Box::new(CheckpointError::Store(
                     format!("decode: {e}"),
                 )))
             })?;
-            // Rebuild the entity bag, cell map, and tombstone set from the
-            // `world/` rows the checkpoint wrote — the `ckpt/` value is the
-            // watermark only (P-8).
-            let rows = scan_world(&trx, grid, shard).await?;
             Ok(Some(CheckpointData {
                 shard,
                 grid,
