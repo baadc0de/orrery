@@ -18,7 +18,10 @@
 //!
 //! On startup the binary prints the gateway's [`EndpointAddr`] as a single-line
 //! JSON object on stdout (tracing stays on stderr) so a harness can find the
-//! address. The two signals that trigger graceful shutdown are SIGTERM and
+//! address. Log verbosity on that stderr stream is `RUST_LOG`; with the
+//! variable unset the filter is `info`, which is what this binary has always
+//! emitted. Nothing tracing writes ever reaches stdout, so raising the filter
+//! cannot disturb the readiness contract. The two signals that trigger graceful shutdown are SIGTERM and
 //! Ctrl-C. `--metrics-jsonl` appends `sample_batch` records and gateway
 //! counter records to a separate P2 artifact file; it never alters the stdout
 //! readiness contract. The gateway counters themselves are collected
@@ -43,6 +46,7 @@ use clap::Parser;
 use glam::IVec3;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
+use tracing_subscriber::EnvFilter;
 
 use orrery_persistd::cluster::{ColdFallbackRouter, Router};
 use orrery_persistd::gateway::SessionTokenV1Authorizer;
@@ -545,12 +549,36 @@ fn write_journal_metric_batches(
     Ok(())
 }
 
+/// Tracing filter used when `RUST_LOG` is unset or unparseable.
+///
+/// `tracing_subscriber::fmt::Subscriber::DEFAULT_MAX_LEVEL` is INFO, which is
+/// what this binary emitted for its whole life before it had a filter at all,
+/// so an operator who sets nothing sees exactly the same stderr as before.
+const DEFAULT_LOG_FILTER: &str = "info";
+
+/// Build the stderr tracing filter from a `RUST_LOG` value.
+///
+/// The builder form `tracing_subscriber::fmt()` installs no `EnvFilter` on
+/// `init()` — only the free function `fmt::init()` does — so before this
+/// existed `persistd` ignored `RUST_LOG` outright and no `debug!` in the
+/// gateway could be turned on in a harness run. A malformed value falls back
+/// to [`DEFAULT_LOG_FILTER`] rather than aborting startup: a mistyped
+/// environment variable must not take a persistence authority down.
+fn log_filter(rust_log: Option<&str>) -> EnvFilter {
+    rust_log
+        .and_then(|value| EnvFilter::try_new(value).ok())
+        .unwrap_or_else(|| EnvFilter::new(DEFAULT_LOG_FILTER))
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     // tracing to stderr (D12) so stdout is reserved for the JSON address line.
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
+        .with_env_filter(log_filter(
+            std::env::var(EnvFilter::DEFAULT_ENV).ok().as_deref(),
+        ))
         .init();
 
     let topology = resolve_topology(&cli)?;
@@ -1644,6 +1672,46 @@ fn parse_shard_coords(s: &str) -> Result<CellId, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The filter an unset `RUST_LOG` produces must admit exactly what the
+    /// unfiltered `fmt()` builder admitted, or every harness that reads this
+    /// binary's stderr changes shape at once.
+    #[test]
+    fn absent_rust_log_keeps_the_previous_info_default() {
+        use tracing_subscriber::layer::Layer;
+        let hint = Layer::<tracing_subscriber::Registry>::max_level_hint(&log_filter(None));
+        assert_eq!(
+            hint,
+            Some(tracing_subscriber::fmt::Subscriber::DEFAULT_MAX_LEVEL)
+        );
+    }
+
+    /// The defect this replaced: `RUST_LOG` reached nothing, so a `debug!` in
+    /// the gateway could not be turned on during an incident.
+    #[test]
+    fn rust_log_raises_the_filter_for_a_targeted_module() {
+        use tracing_subscriber::layer::Layer;
+        let filter = log_filter(Some("orrery_persistd::journal=debug"));
+        let hint = Layer::<tracing_subscriber::Registry>::max_level_hint(&filter);
+        assert_eq!(hint, Some(tracing_subscriber::filter::LevelFilter::DEBUG));
+    }
+
+    /// A mistyped `RUST_LOG` must not abort a persistence authority at boot.
+    #[test]
+    fn malformed_rust_log_falls_back_to_the_default() {
+        use tracing_subscriber::layer::Layer;
+        assert!(
+            EnvFilter::try_new("orrery_persistd=notalevel").is_err(),
+            "the fixture must actually be a parse error"
+        );
+        let hint = Layer::<tracing_subscriber::Registry>::max_level_hint(&log_filter(Some(
+            "orrery_persistd=notalevel",
+        )));
+        assert_eq!(
+            hint,
+            Some(tracing_subscriber::fmt::Subscriber::DEFAULT_MAX_LEVEL)
+        );
+    }
 
     fn cli(fdb_cluster_file: Option<PathBuf>) -> Cli {
         Cli {
