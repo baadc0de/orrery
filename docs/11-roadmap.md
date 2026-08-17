@@ -337,6 +337,75 @@ stamped with its seed, its full impairment profile, its target triple and its
 commit sha, and deliberately not with a wall clock unless asked, so summing them
 later is bookkeeping rather than archaeology.
 
+**The hours now accumulate, and the ledger says what they are hours of.**
+`scripts/p4-accumulate.sh` runs one witnessed hour a night and
+`scripts/p4-ledger.sh` banks it; the nightly's `p4-accumulate` job carries the
+ledger between nights. The gate could not be the thing that accumulated, and the
+reason is structural rather than an oversight: it runs `--seed 1` at the band's
+floor every night — no seed flag appeared anywhere in `scripts/` or `.github/`
+before this — and `RunIdentity` carries no wall clock, so consecutive nightlies
+on one commit produced byte-identical identities. Thirty-two hours re-run three
+hundred times are thirty-two hours. The accumulation leg varies the seed with
+the date and sweeps 3% → 4% → 5% on a three-day cycle, so each night is a
+distinct sample of the band the criterion names; the ledger deduplicates on
+`RunIdentity` verbatim, so a re-dispatched nightly adds nothing and a re-run at
+a new seed adds a line.
+
+*Running total, and what it is a total of.* **0 banked hours as of this
+change** — the first line lands on the next nightly. A total is only meaningful
+within a *pipeline version*, so every line carries one: the git tree hashes of
+`orrery_witness`, `orrery_core`, `orrery_games` and `p1-swarm` at the run's own
+commit, hashed together, and `p4-ledger.sh total` groups by it rather than
+summing across it. That is what makes the pre-#44 boundary auditable rather than
+a footnote: hours banked while the swarm played `orrery_conformance`'s corpus
+kernel ran stage 1 against an empty invariant slice and are not hours of the
+same measurement. At `431aa10` that digest is `52afc77a6583c7a6`; the 500 are
+counted against it and reset when any of those four trees changes.
+
+*What the ledger can and cannot claim.* It can claim honest player-hours on
+**`x86_64-unknown-linux-gnu` only**. Every runner that can execute the
+accumulation leg today is Linux — the nightly's self-hosted box and
+`ubuntu-latest` — and the criterion says *across all three platforms*, so a
+Linux-only ledger cannot satisfy it however many hours it holds. The `target`
+field is recorded per line and `total` groups on it precisely so that the
+shortfall is visible rather than implied. Closing it needs the accumulation job
+on `windows-latest` and `macos-latest` runners, which the per-commit determinism
+matrix already proves the core builds and replays identically on; what is
+untested there is `p1-swarm` itself, which pulls Bevy and has only ever been
+built on Linux. That is the next piece of work on this criterion, and it is
+larger than the ledger was.
+
+*What a night costs.* The accumulation leg is 615 s of wall clock measured on
+the self-hosted box (32 peers, one simulated hour, witnessed, 4% loss, with two
+other nightly jobs running), plus its build. The nightly ran three jobs on that
+box; it now runs four, and the box also hosts three CI runners and a developer
+checkout. The job is bounded at 45 minutes like its siblings.
+
+**A correction to the shed figures above, found while choosing this leg's
+allowance.** The table records 162 packets shed at 3% loss and 172 at 5% as
+though the loss point moved it. Both are seed 1. Measured across 72 (seed, loss)
+cells — seeds 20670–20741 against all three band points, 32 peers, witnessed —
+the three points agree on their means to within 1.1 packets while the seeds
+spread 149–183 at every one of them:
+
+| shed, 32 peers, witnessed | min | mean | max | cells |
+|---|---|---|---|---|
+| 3% loss | 155 | 168.5 | 177 | 24 |
+| 4% loss | 149 | 168.7 | 182 | 24 |
+| 5% loss | 154 | 167.6 | 183 | 24 |
+
+**The shed count is a function of the seed, not of the loss point**, and 162 →
+172 is inside the noise a seed change produces at a *fixed* loss. The gate's
+ratchet is unaffected and unchanged — it is one fixed seed, which is exactly the
+condition under which an exact ratchet means something — but a swept leg pinned
+at the observed maximum would fail about one night in twenty-four for no reason
+but its seed, and a failed leg banks nothing. The accumulation leg therefore
+carries a *bound* on the island-formation transient, 200, roughly 9% above the
+observed maximum, with the per-run count recorded on every banked line so a
+shift in the distribution stays visible. The transient settles early enough to
+sample cheaply: seed 1 at 3% sheds 162 at 30 simulated seconds, at 5 minutes and
+at the hour; seed 5 at 4% sheds 180 at all three.
+
 **Re-measured on Skirmish.** Swapping the ruleset was a physics migration, not a
 rename: Skirmish applies drag and a per-archetype speed clamp where the corpus
 kernel applied neither, so every trajectory in the swarm moved and with it the
@@ -528,7 +597,12 @@ same island with every witness armed and nobody modified filing nothing. The
 second sentence is bounded only by **accumulation**: the pipeline holds at both
 ends of the 3–5% band at 32 peers with zero false positives and full observation
 coverage, and what is outstanding is running the harness on the other three
-determinism targets and adding the nights up.
+determinism targets. Adding the nights up is no longer outstanding: the nightly
+`p4-accumulate` job banks one distinct witnessed hour per night, swept across
+the band, into a deduplicated ledger (`scripts/p4-ledger.sh total` is the
+running figure). It stands at **0 hours** until the first nightly, and every
+hour it will ever hold is `x86_64-unknown-linux-gnu` — one of the three
+platforms the criterion names.
 
 **Upstream milestone.** Publish the determinism conformance suite (quantization + `libm` math corpus) as a standalone repo; upstream any platform-drift fixes it surfaces.
 
