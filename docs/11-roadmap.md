@@ -362,24 +362,103 @@ kernel ran stage 1 against an empty invariant slice and are not hours of the
 same measurement. At `431aa10` that digest is `52afc77a6583c7a6`; the 500 are
 counted against it and reset when any of those four trees changes.
 
-*What the ledger can and cannot claim.* It can claim honest player-hours on
-**`x86_64-unknown-linux-gnu` only**. Every runner that can execute the
-accumulation leg today is Linux — the nightly's self-hosted box and
+*What the ledger can and cannot claim.* Until this change it could claim honest
+player-hours on **`x86_64-unknown-linux-gnu` only**. Every runner that could
+execute the accumulation leg was Linux — the nightly's self-hosted box and
 `ubuntu-latest` — and the criterion says *across all three platforms*, so a
-Linux-only ledger cannot satisfy it however many hours it holds. The `target`
+Linux-only ledger could not satisfy it however many hours it held. The `target`
 field is recorded per line and `total` groups on it precisely so that the
-shortfall is visible rather than implied. Closing it needs the accumulation job
-on `windows-latest` and `macos-latest` runners, which the per-commit determinism
-matrix already proves the core builds and replays identically on; what is
-untested there is `p1-swarm` itself, which pulls Bevy and has only ever been
-built on Linux. That is the next piece of work on this criterion, and it is
-larger than the ledger was.
+shortfall was visible rather than implied.
 
-*What a night costs.* The accumulation leg is 615 s of wall clock measured on
-the self-hosted box (32 peers, one simulated hour, witnessed, 4% loss, with two
-other nightly jobs running), plus its build. The nightly ran three jobs on that
-box; it now runs four, and the box also hosts three CI runners and a developer
-checkout. The job is bounded at 45 minutes like its siblings.
+**The accumulation leg is now a three-way matrix** — the box, `windows-latest`,
+`macos-latest` — each leg keeping its own ledger shard, and `p4-ledger.sh total`
+reports progress per platform and names the platforms at zero rather than
+printing one number that a Linux-only ledger could satisfy. What follows is what
+is established about that and what is not, because the two are different.
+
+*What was established, and how.* Everything below was measured on the box; a CI
+run on the other two platforms is what will settle the rest, and this record is
+written before one has happened.
+
+- **The dependency graph resolves on all three.** `cargo tree --target` on
+  `p1-swarm` yields 395 crates for `x86_64-unknown-linux-gnu`, 400 for
+  `x86_64-pc-windows-msvc`, 405 for `aarch64-apple-darwin`. What the two
+  non-Linux targets add is `windows`/`windows-sys`/`wmi`/`ipconfig` and
+  `objc2-*`/`core-foundation`/`security-framework` — system bindings pulled by
+  iroh's interface and certificate discovery. **No windowing, audio or input
+  backend appears on any of them**, which is the Bevy-on-a-headless-runner
+  hazard not being there: `p1-swarm` takes `bevy_app`, `bevy_ecs`, `bevy_math`
+  and `bevy_time` with `default-features = false` and nothing else of Bevy.
+- **A local cross-compile proves nothing either way, and the reason is this
+  box.** `cargo check --target x86_64-pc-windows-msvc` fails in `cc-rs` with
+  `failed to find tool "lib.exe"`, and `--target aarch64-apple-darwin` fails
+  compiling `ring-0.17.14/crypto/curve25519/curve25519.c`. Both are `ring`
+  building C for a target whose toolchain and SDK are not installed here — not
+  a statement about Windows or macOS. **Only a CI run can answer question 1.**
+- **The reports are comparable, byte for byte.** Two runs of one seed (424242,
+  4% loss, 32 peers, 120 simulated seconds, witnessed) produce **identical**
+  `--json` output. `SwarmReport` is a pure function of its parameters: the
+  wall-clock phase timings go to stderr and never into it, and the only field
+  that is not — `started_at_unix_secs` — appears only under
+  `--stamp-wall-clock`. So the cross-platform question is a diff, not a
+  judgement call, and `p4-accumulate.sh --probe` is what asks it: the same seed
+  at every platform, `identity.target` the only field allowed to differ. The
+  nightly's `p4-platform-ledger` job runs that diff and fails on a divergence.
+- **What a run costs.** The leg is single-threaded — 99% of one core, 108 MB
+  RSS, 9.26 s of CPU for 60 simulated seconds — so about 555 s per witnessed
+  hour on a Zen 4 core, and the 615 s recorded below is the same figure with two
+  other nightly jobs competing. A hosted runner is slower per core and pays a
+  cold build of ~400 crates, which the per-platform cargo cache is there to
+  amortise; the legs are bounded at 180 minutes (Windows) and 150 (macOS),
+  well under the 6-hour job ceiling. The repository is public, so hosted minutes
+  are not billed.
+
+*Three things that would have stopped the leg off Linux, found by reading and
+fixed here.* None of them needed a runner to find, and each would have failed
+the first night:
+
+1. `scripts/p4-accumulate.sh` hard-coded `p1-swarm/target/release/p1-swarm`.
+   Cargo emits `p1-swarm.exe` on Windows, so the leg would have died at
+   `harness binary missing` before running a tick. Both spellings are tried now.
+2. `scripts/p4-ledger.sh` required `flock` and `sha256sum` — util-linux and GNU
+   coreutils, neither of which is on a stock macOS runner or in the Git Bash a
+   Windows runner uses. It falls back to `shasum -a 256` and to an atomic
+   `mkdir` lock; the self-test checks that the two digest spellings agree,
+   because a `run_key` that differed by platform would silently bank every hour
+   twice.
+3. There is no `.gitattributes` in this repository, and the Windows runner image
+   sets `core.autocrlf=true`. Every `scripts/*.sh` would have been checked out
+   with CRLF and died on the carriage return in its shebang. The Windows leg
+   sets `core.autocrlf=input` before its checkout.
+
+*What is still unknown.* **Whether `p1-swarm` compiles and holds its clauses on
+Windows and macOS is not yet known** — it has never been built there, and no CI
+run has happened on this work. The dependency graph resolving is a necessary
+condition and not a sufficient one. If a leg fails, the failure lands in that
+platform's job and in its probe artifact, `fail-fast: false` keeps it from
+taking the other two down, and the ledger banks nothing for it — which is the
+correct outcome, because an hour that does not satisfy the witnessing clauses is
+not an hour.
+
+*One thing these legs do not prove, whatever they report.* Within a single run
+every peer shares one binary and one `libm`, so re-execution is bit-identical by
+construction and the cross-platform divergence false positive cannot occur
+(`p1-swarm`'s module docs say so). An hour banked on `windows-latest` is
+evidence that the witness pipeline holds **on Windows**; it is not evidence that
+a Windows witness re-executing a macOS subject's log agrees with it. That is a
+different experiment — the determinism matrix extended to exchange logs between
+its platform legs — and whether the criterion's "across all three platforms"
+means the first or the second is not settled by its wording. `p4-ledger.sh
+total` reports both halves for the same reason: the running total against 500,
+and the per-platform split it is made of, without asserting how the 500 divide.
+
+*What a night costs now.* Three accumulation legs instead of one. The box's leg
+is unchanged at 615 s plus its build and stays bounded at 45 minutes; the two
+hosted legs add a `windows-latest` and a `macos-latest` job to a nightly that
+previously used hosted runners only for the two FoundationDB jobs, plus one
+short comparison job back on the box. The comparability probe costs about 20 s
+per leg — two simulated minutes at the same 32 peers — and runs before the hour
+so that a platform which cannot hold the clauses is found cheaply.
 
 **A correction to the shed figures above, found while choosing this leg's
 allowance.** The table records 162 packets shed at 3% loss and 172 at 5% as
