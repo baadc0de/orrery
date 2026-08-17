@@ -576,7 +576,9 @@ async fn main() -> anyhow::Result<()> {
     // tracing to stderr (D12) so stdout is reserved for the JSON address line.
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
-        .with_env_filter(log_filter(std::env::var(EnvFilter::DEFAULT_ENV).ok().as_deref()))
+        .with_env_filter(log_filter(
+            std::env::var(EnvFilter::DEFAULT_ENV).ok().as_deref(),
+        ))
         .init();
 
     let topology = resolve_topology(&cli)?;
