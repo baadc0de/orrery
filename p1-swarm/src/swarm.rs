@@ -6,15 +6,31 @@ use bytes::Bytes;
 use serde::Serialize;
 
 use orrery_core::CoreCodec;
+use orrery_games::game::Tamper;
 use orrery_net::channels::{encode_replication, Channel};
 use orrery_net::peer_link::{SendPacket, StreamMode};
 use orrery_protocol::coord::PeerEntry;
-use orrery_protocol::{CellId, NodeId, PersistId, UniverseSeed};
+use orrery_protocol::{CellId, NodeId, PersistId, UniverseSeed, MAX_ADJUDICATION_TICKS};
 
-use crate::bot::{Bot, TICK_HZ};
+use crate::adjudicate::{Adjudicator, Docket};
+use crate::bot::{Bot, BotSpec, TICK_HZ};
 use aeronet_iroh::stream::{IrohStreamIo, RecvMessage};
 
 use crate::router::{Impairment, Router, RouterCounters};
+
+/// The harness's modified clients: which cheat, and how many peers run it.
+///
+/// P4's demo criterion names one — "a modified client applying a 1.5× speed
+/// multiplier joins an 8-peer island" — but the count is a parameter because a
+/// single cheat proves detection and says nothing about whether the honest
+/// peers around it stay unaccused as the population of cheats grows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CheatSpec {
+    /// The tamper the modified peers' authority runs.
+    pub tamper: Tamper,
+    /// How many peers run it.
+    pub count: usize,
+}
 
 /// How the swarm is configured for a run.
 #[derive(Debug, Clone, Copy)]
@@ -36,6 +52,22 @@ pub struct SwarmConfig {
     /// Run the witness pipeline: every peer watches its witness set's entities
     /// and re-executes their signed logs (P4's input).
     pub witnessing: bool,
+    /// The modified clients to field, if any.
+    pub cheats: Option<CheatSpec>,
+    /// Take every peer's witness out of shadow mode, so a raised window is
+    /// actually filed.
+    ///
+    /// Implied by [`SwarmConfig::cheats`] — a conviction leg that files nothing
+    /// convicts nobody — but separable from it, and the separation is what makes
+    /// the control leg worth running. Shadow mode files nothing *by
+    /// construction*, so "an unmodified swarm files no report at all" is a
+    /// tautology under it and a real assertion under this: every witness in an
+    /// entirely honest swarm is armed, and still files zero.
+    ///
+    /// P4's own posture is shadow mode, and the honest legs keep it (D17
+    /// risk 3): enforcement stays off until the false-positive rate has been
+    /// measured, and these two legs are what measure it.
+    pub enforcing: bool,
     /// Wall-clock stamp for the report, when one was asked for.
     ///
     /// Read by the caller rather than by the swarm: nothing inside the run may
@@ -54,6 +86,8 @@ impl Default for SwarmConfig {
             seed: 1,
             late_join_tick: None,
             witnessing: false,
+            cheats: None,
+            enforcing: false,
             started_at_unix_secs: None,
         }
     }
@@ -82,6 +116,15 @@ pub struct PeerReport {
     pub shed: u64,
     /// This peer's behavioural profile.
     pub profile: &'static str,
+    /// The cheat this peer's authority runs, or `null` for the shipping build.
+    pub tamper: Option<&'static str>,
+    /// First tick this peer's build produced state the shipping rules would
+    /// not have. `null` on an honest peer — and on a modified one whose cheat
+    /// turned out to be inert, which is a finding rather than a pass.
+    pub first_tampered_tick: Option<u64>,
+    /// Simulated tick at which an independent re-run of a filed report first
+    /// returned `Verdict::Confirms` against this peer.
+    pub convicted_at_tick: Option<u64>,
     /// Chain gaps this peer detected — repairs, not accusations.
     pub gaps: u64,
     /// Signals this peer raised that would accuse an honest island-mate.
@@ -92,6 +135,36 @@ pub struct PeerReport {
     pub claim_mismatches: u64,
     /// Of those, subjects whose hole was never filled.
     pub stalled: u64,
+    /// Of those, reports actually **filed** against an honest island-mate.
+    ///
+    /// Zero on every leg that leaves shadow mode on, which is every leg but the
+    /// conviction one — and zero on that one too, or the demo criterion is not
+    /// met.
+    pub reports: u64,
+    /// Non-gap signals this peer raised against a subject the harness modified.
+    /// Findings, not false positives.
+    pub signals_against_tampered: u64,
+    /// Reports this peer filed against a subject the harness modified.
+    pub reports_against_tampered: u64,
+    /// Reports this peer assembled, signed and handed to the transport.
+    pub escalations_filed: u64,
+    /// Windows it raised while in shadow mode, and therefore did not file.
+    pub escalations_shadowed: u64,
+    /// Mismatches it could not turn into a provable window.
+    ///
+    /// The expected tail of a conviction leg rather than a defect: a subject
+    /// that diverges permanently never agrees with its witness again, so after
+    /// the last claim inside `MAX_ADJUDICATION_TICKS` of the anchor there is no
+    /// agreed point left to open a window at. The convictions have already
+    /// happened by then.
+    pub escalations_unservable: u64,
+    /// Mismatches left unescalated for want of a `WitnessIdentity`.
+    ///
+    /// **Must be zero when witnessing.** Every peer is handed its own transport
+    /// key as an identity; a non-zero count here means the harness went back to
+    /// detecting without being able to file, which is what it did before this
+    /// lane and which no other counter distinguishes from honest silence.
+    pub escalations_unidentified: u64,
     /// Repair requests this peer dropped for want of queue space.
     pub repairs_overflowed: u64,
     /// Repair requests this peer could not answer from its retained log.
@@ -224,6 +297,17 @@ pub struct SwarmReport {
     pub total_gaps: u64,
     /// Signals raised against honest peers. **Every one is a false positive.**
     pub total_false_positives: u64,
+    /// The conviction half of P4's demo criterion, when a modified client was
+    /// fielded. `null` on the honest legs.
+    pub conviction: Option<ConvictionReport>,
+    /// Reports assembled, signed and handed to the transport, swarm-wide.
+    pub total_escalations_filed: u64,
+    /// Windows raised in shadow mode and therefore not filed, swarm-wide.
+    pub total_escalations_shadowed: u64,
+    /// Mismatches no witness could turn into a provable window, swarm-wide.
+    pub total_escalations_unservable: u64,
+    /// Mismatches left unescalated for want of an identity, swarm-wide.
+    pub total_escalations_unidentified: u64,
     /// Frames folded on a retry rather than dropped and re-requested.
     pub total_frames_recovered: u64,
     /// Watches resumed at a later anchor after a hole was abandoned.
@@ -327,6 +411,53 @@ impl From<RouterCounters> for LinkReport {
     }
 }
 
+/// What happened to the modified clients the harness fielded.
+///
+/// P4's demo criterion in one struct: *a modified client applying a 1.5× speed
+/// multiplier joins an 8-peer island — detected, escalated, replay-adjudicated
+/// with a deviation verdict within one adjudication window of the violation*,
+/// while the honest peers beside it are accused of nothing.
+#[derive(Debug, Clone, Serialize)]
+pub struct ConvictionReport {
+    /// The cheat that was fielded.
+    pub tamper: &'static str,
+    /// Peers running it.
+    pub tampered_peers: usize,
+    /// Of those, how many diverged from the shipping rules at all.
+    ///
+    /// **The anti-vacuity number.** `Tamper::SpeedMultiplier` is inert on an
+    /// interceptor slot at this roam's requested acceleration, and a cheat that
+    /// never changes a byte is never reported — so every clause below would
+    /// hold over a swarm in which nothing happened.
+    pub tampered_peers_that_diverged: usize,
+    /// Of those, how many an independent re-run of a filed report convicted.
+    pub tampered_peers_convicted: usize,
+    /// Earliest tick any modified peer's build diverged.
+    pub first_tampered_tick: Option<u64>,
+    /// The worst gap, in ticks, between a modified peer diverging and a
+    /// `Verdict::Confirms` being reached against it.
+    ///
+    /// Measured on the tick the swarm drained the report, not on the bundle's
+    /// window end: the window end is when the *evidence* stops, and the
+    /// criterion is about how long a deviation survives in the running system,
+    /// which includes the frames and claims still crossing the link.
+    pub worst_detection_ticks: Option<u64>,
+    /// Reports filed against a modified peer.
+    pub reports_against_tampered: u64,
+    /// Reports filed against a peer that was not modified. **Must be zero.**
+    pub reports_against_honest: u64,
+    /// Reports re-run by the in-process adjudicator.
+    pub adjudicated: u64,
+    /// Of those, verdicts that proved a deviation.
+    pub confirms: u64,
+    /// Of those, verdicts that cleared the accused.
+    pub exonerates: u64,
+    /// Of those, verdicts that struck the reporter instead.
+    pub evidence_forged: u64,
+    /// Of those, verdicts that decided nothing.
+    pub unadjudicable: u64,
+}
+
 /// What a late joiner could see on arrival.
 #[derive(Debug, Clone, Serialize)]
 pub struct LateJoinReport {
@@ -349,6 +480,27 @@ pub struct Swarm {
     samples: Vec<Vec<u64>>,
     /// NodeId → swarm index, for routing.
     index_of: BTreeMap<NodeId, usize>,
+    /// The in-process cluster that re-runs filed reports.
+    adjudicator: Adjudicator,
+    /// Every verdict it reached.
+    docket: Docket,
+}
+
+/// Which swarm indices run the modified build.
+///
+/// **Only cruising slots.** An idling bot never asks for thrust, and a cheat
+/// that raises an acceleration ceiling changes nothing for a peer that never
+/// accelerates — so dealing the modified build to `Profile::Idle` would field a
+/// cheater whose state is byte-identical to an honest one's and let the
+/// conviction clauses pass over a swarm in which nothing happened. The profiles
+/// are dealt round-robin over `Profile::ALL`, so every fourth index cruises.
+fn tampered_indices(peers: usize, count: usize) -> Vec<usize> {
+    (0..peers)
+        .filter(|index| {
+            crate::profile::Profile::for_index(*index, true) == crate::profile::Profile::Cruise
+        })
+        .take(count)
+        .collect()
 }
 
 impl Swarm {
@@ -359,15 +511,29 @@ impl Swarm {
         universe[0..8].copy_from_slice(&config.seed.to_le_bytes());
         let seed = UniverseSeed(universe);
 
+        let tampered = config
+            .cheats
+            .map(|cheats| tampered_indices(config.peers, cheats.count))
+            .unwrap_or_default();
+
         let bots: Vec<Bot> = (0..config.peers)
             .map(|index| {
-                Bot::new(
+                Bot::new(BotSpec {
                     index,
-                    config.peers,
+                    count: config.peers,
                     seed,
-                    config.cell_edge_m,
-                    config.witnessing,
-                )
+                    cell_edge_m: config.cell_edge_m,
+                    witnessing: config.witnessing,
+                    cheat: config
+                        .cheats
+                        .filter(|_| tampered.contains(&index))
+                        .map(|cheats| cheats.tamper),
+                    // Enforcement is a property of the *run*, not of the peer:
+                    // a swarm in which only the cheater's watchers filed would
+                    // prove nothing about honest peers being left alone, since
+                    // nobody else was in a position to accuse anyone.
+                    enforcing: config.enforcing,
+                })
             })
             .collect();
         let index_of = bots
@@ -381,6 +547,29 @@ impl Swarm {
             bots,
             router: Router::new(config.impairment, config.seed),
             index_of,
+            adjudicator: Adjudicator::new(seed),
+            docket: Docket::default(),
+        }
+    }
+
+    /// Tell every peer which of its island-mates the harness modified.
+    ///
+    /// The oracle is the harness's, never the witness's: the engine is shown
+    /// nothing, and all this decides is which column a raised signal is counted
+    /// in. Without it a run with `--cheat` would report the convictions it is
+    /// meant to produce as false positives and fail its own honest clause.
+    fn declare_tampered(&mut self) {
+        let tampered: Vec<NodeId> = self
+            .bots
+            .iter()
+            .filter(|bot| bot.tamper().is_some())
+            .map(|bot| bot.node)
+            .collect();
+        if tampered.is_empty() {
+            return;
+        }
+        for bot in &mut self.bots {
+            bot.set_tampered_subjects(tampered.clone());
         }
     }
 
@@ -450,8 +639,8 @@ impl Swarm {
             let bot = &mut self.bots[index];
             let cell = bot.cell().expect("committed");
             let entity = bot.entity();
-            let body = bot.body();
-            // The body bytes plus the authority's *committed* cell. D2 makes
+            let craft = bot.craft();
+            // The craft bytes plus the authority's *committed* cell. D2 makes
             // the commitment a single-writer value emitted by the holder: a
             // receiver that recomputed it from the position would get the raw
             // geometric cell with no hysteresis, so a peer sitting on a
@@ -466,7 +655,7 @@ impl Swarm {
             (
                 bot.node,
                 cell,
-                encode_replication(&(body.to_canonical(), cell, entity, tick + 1)),
+                encode_replication(&(craft.to_canonical(), cell, entity, tick + 1)),
             )
         };
         let peers: Vec<NodeId> = self.bots[index]
@@ -580,6 +769,7 @@ impl Swarm {
     #[must_use]
     pub fn run(mut self) -> SwarmReport {
         self.form_island();
+        self.declare_tampered();
         if self.config.witnessing {
             self.seed_witnesses();
         }
@@ -630,6 +820,23 @@ impl Swarm {
             for bot in &mut self.bots {
                 bot.sample();
                 bot.drain_signals();
+            }
+            // Stage 4, in the same tick the report was filed. The cluster is
+            // in-process and believes nothing the reporter said: it checks the
+            // reporter's signature, then re-runs the bundle under the shipping
+            // rules. Adjudicating here rather than at the end of the run is
+            // what makes the *tick* meaningful — the criterion bounds how long
+            // a deviation survives, and a verdict reached in a batch after the
+            // hour would have no time in it at all.
+            //
+            // Unconditional, not gated on `--cheat`: a leg that files nothing
+            // costs nothing here, and gating it would make "an unmodified
+            // swarm files nothing" a clause the harness could not have
+            // observed being broken.
+            for index in 0..self.bots.len() {
+                for report in self.bots[index].drain_reports() {
+                    self.docket.record(&self.adjudicator, &report, tick);
+                }
             }
             phase[3] += mark.elapsed().as_nanos();
             mark = std::time::Instant::now();
@@ -784,6 +991,7 @@ impl Swarm {
     }
 
     fn report(mut self, ticks: u64, late_join: Option<LateJoinReport>) -> SwarmReport {
+        let docket = core::mem::take(&mut self.docket);
         let per_peer: Vec<PeerReport> = (0..self.bots.len())
             .map(|index| {
                 let mut samples = self.samples[index].clone();
@@ -796,6 +1004,8 @@ impl Swarm {
                 let proxied = bot.proxies();
                 let undecodable = bot.replica_counters().undecodable;
                 let witness = bot.witness_counters();
+                let links = bot.link_counters();
+                let convicted_at_tick = docket.first_conviction(bot.node);
                 PeerReport {
                     index,
                     cells_visited: bot.visited.len(),
@@ -807,11 +1017,21 @@ impl Swarm {
                     p99_upload_bits: p99,
                     shed: bot.shed(),
                     profile: bot.profile.name(),
+                    tamper: bot.tamper().map(Tamper::name),
+                    first_tampered_tick: bot.first_tampered_tick(),
+                    convicted_at_tick,
                     gaps: bot.signals.gaps,
                     false_positives: bot.signals.false_positives(),
                     invariant_breaches: bot.signals.invariant_breaches,
                     claim_mismatches: bot.signals.claim_mismatches,
                     stalled: bot.signals.stalled,
+                    reports: bot.signals.reports,
+                    signals_against_tampered: bot.signals.signals_against_tampered,
+                    reports_against_tampered: bot.signals.reports_against_tampered,
+                    escalations_filed: links.escalations_filed,
+                    escalations_shadowed: links.escalations_shadowed,
+                    escalations_unservable: links.escalations_unservable,
+                    escalations_unidentified: links.escalations_unidentified,
                     repairs_overflowed: bot.repairs_overflowed(),
                     repairs_unservable: bot.repairs_unservable(),
                     frames_recovered: witness.frames_recovered,
@@ -885,6 +1105,43 @@ impl Swarm {
             player_hours: self.config.peers as f64 * self.config.seconds as f64 / 3_600.0,
             total_gaps: per_peer.iter().map(|p| p.gaps).sum(),
             total_false_positives: per_peer.iter().map(|p| p.false_positives).sum(),
+            conviction: self.config.cheats.map(|cheats| ConvictionReport {
+                tamper: cheats.tamper.name(),
+                tampered_peers: per_peer.iter().filter(|p| p.tamper.is_some()).count(),
+                tampered_peers_that_diverged: per_peer
+                    .iter()
+                    .filter(|p| p.tamper.is_some() && p.first_tampered_tick.is_some())
+                    .count(),
+                tampered_peers_convicted: per_peer
+                    .iter()
+                    .filter(|p| p.tamper.is_some() && p.convicted_at_tick.is_some())
+                    .count(),
+                first_tampered_tick: per_peer.iter().filter_map(|p| p.first_tampered_tick).min(),
+                worst_detection_ticks: per_peer
+                    .iter()
+                    .filter_map(|p| {
+                        Some(p.convicted_at_tick?.saturating_sub(p.first_tampered_tick?))
+                    })
+                    .max(),
+                reports_against_tampered: per_peer.iter().map(|p| p.reports_against_tampered).sum(),
+                // `reports` on an honest subject and nothing else: the same
+                // counter the false-positive clause reads, surfaced here
+                // because the conviction leg is where it can be non-zero for
+                // an interesting reason.
+                reports_against_honest: per_peer.iter().map(|p| p.reports).sum(),
+                adjudicated: docket.adjudicated,
+                confirms: docket.confirms,
+                exonerates: docket.exonerates,
+                evidence_forged: docket.evidence_forged,
+                unadjudicable: docket.unadjudicable,
+            }),
+            total_escalations_filed: per_peer.iter().map(|p| p.escalations_filed).sum(),
+            total_escalations_shadowed: per_peer.iter().map(|p| p.escalations_shadowed).sum(),
+            total_escalations_unservable: per_peer.iter().map(|p| p.escalations_unservable).sum(),
+            total_escalations_unidentified: per_peer
+                .iter()
+                .map(|p| p.escalations_unidentified)
+                .sum(),
             total_frames_recovered: per_peer.iter().map(|p| p.frames_recovered).sum(),
             total_reanchors: per_peer.iter().map(|p| p.reanchors).sum(),
             total_unjudged_ticks: per_peer.iter().map(|p| p.unjudged_ticks).sum(),
@@ -988,6 +1245,27 @@ pub struct Criterion {
     /// count is flat between five minutes and an hour, which is what
     /// distinguishes it from an overrun.
     pub max_shed: u64,
+    /// Ticks a deviation may survive between first changing the subject's state
+    /// and an independent re-run of a filed report confirming it.
+    ///
+    /// P4's demo criterion says *within one adjudication window*, and the window
+    /// is [`MAX_ADJUDICATION_TICKS`] — 180 ticks, 3 s. From `orrery_protocol`
+    /// rather than a number chosen here: it is the wire-level bound every
+    /// adjudicator enforces, and a harness judging against its own constant
+    /// would be measuring itself.
+    pub max_detection_ticks: u64,
+}
+
+impl Default for Criterion {
+    fn default() -> Self {
+        Self {
+            budget_bits: 1_000_000,
+            min_cells: 64,
+            max_pops: 0,
+            max_shed: 0,
+            max_detection_ticks: MAX_ADJUDICATION_TICKS,
+        }
+    }
 }
 
 impl SwarmReport {
@@ -1002,6 +1280,7 @@ impl SwarmReport {
             min_cells,
             max_pops,
             max_shed,
+            max_detection_ticks,
         } = criterion;
         let mut failures = Vec::new();
 
@@ -1114,6 +1393,98 @@ impl SwarmReport {
                     .to_owned(),
             });
         }
+        // P4's *other* half — the demo criterion proper. Only alive when the
+        // harness fielded a modified client, and every clause below exists
+        // because a plausible-looking pass could be reached without it.
+        if let Some(conviction) = &self.conviction {
+            // Vacuity first, because everything after it is measured against a
+            // cheat that had to have done something. `Tamper::SpeedMultiplier`
+            // raises an archetype's ceilings by 1.5×, and this roam requests
+            // exactly the interceptor's `max_accel_mmss` — so on that slot both
+            // builds clamp to the same number and produce byte-identical state.
+            // The modified peers are pinned to the cruiser slot for that
+            // reason; this clause is what says so out loud, and what catches
+            // the next cheat that turns out to be inert at these parameters.
+            if conviction.tampered_peers_that_diverged < conviction.tampered_peers {
+                failures.push(CriterionFailure {
+                    clause: "the modified client actually diverges from the shipping rules",
+                    detail: format!(
+                        "{} of {} modified peers produced state the shipping rules would not have; \
+                         the rest ran a cheat that is inert at these parameters, and every clause \
+                         below would hold over a swarm in which nothing happened",
+                        conviction.tampered_peers_that_diverged, conviction.tampered_peers,
+                    ),
+                });
+            }
+            if conviction.tampered_peers_convicted < conviction.tampered_peers {
+                failures.push(CriterionFailure {
+                    clause: "a modified client is convicted on replay",
+                    detail: format!(
+                        "{} of {} modified peers reached Verdict::Confirms under independent \
+                         re-execution ({} reports adjudicated: {} confirms, {} exonerates, \
+                         {} evidence-forged, {} unadjudicable)",
+                        conviction.tampered_peers_convicted,
+                        conviction.tampered_peers,
+                        conviction.adjudicated,
+                        conviction.confirms,
+                        conviction.exonerates,
+                        conviction.evidence_forged,
+                        conviction.unadjudicable,
+                    ),
+                });
+            }
+            // The other side of the same coin, and the one D17 risk 3 is
+            // about. A pipeline that convicts the cheat by accusing everybody
+            // has not met this criterion, it has failed the other one.
+            if conviction.reports_against_honest > 0 {
+                failures.push(CriterionFailure {
+                    clause: "no report is filed against an honest peer",
+                    detail: format!(
+                        "{} reports were filed against peers the harness did not modify, \
+                         alongside {} against peers it did",
+                        conviction.reports_against_honest, conviction.reports_against_tampered,
+                    ),
+                });
+            }
+            if let Some(ticks) = conviction.worst_detection_ticks {
+                if ticks > max_detection_ticks {
+                    failures.push(CriterionFailure {
+                        clause: "a modified client is convicted within one adjudication window",
+                        detail: format!(
+                            "the worst deviation survived {ticks} ticks between first changing \
+                             the subject's state and being confirmed, against a window of \
+                             {max_detection_ticks}",
+                        ),
+                    });
+                }
+            }
+        } else if self.witnessing && self.total_escalations_filed > 0 {
+            // Nobody was modified and something was filed anyway. Only reachable
+            // under `--enforce`, which is exactly the configuration in which
+            // "files nothing at all" is a claim worth checking rather than a
+            // tautology of shadow mode.
+            failures.push(CriterionFailure {
+                clause: "an unmodified swarm files no report at all",
+                detail: format!(
+                    "{} reports were filed across a swarm in which every peer runs the shipping \
+                     rules",
+                    self.total_escalations_filed
+                ),
+            });
+        }
+        // Filing is opt-in and the opt-in is a `WitnessIdentity` per peer. A
+        // non-zero count here is the harness silently back in the posture it
+        // spent this whole lane leaving: detecting, and unable to file.
+        if self.witnessing && self.total_escalations_unidentified > 0 {
+            failures.push(CriterionFailure {
+                clause: "every witness can sign what it raises",
+                detail: format!(
+                    "{} escalations stopped for want of a WitnessIdentity; the peer detected a \
+                     deviation and had no key to file it under",
+                    self.total_escalations_unidentified
+                ),
+            });
+        }
         if self.total_proxy_pops > max_pops {
             failures.push(CriterionFailure {
                 clause: "interest churn absorbed without visible proxy pops",
@@ -1186,6 +1557,7 @@ mod tests {
         min_cells: 64,
         max_pops: 0,
         max_shed: 0,
+        max_detection_ticks: MAX_ADJUDICATION_TICKS,
     };
 
     /// A report in which every clause holds, witnessing included.
@@ -1222,6 +1594,11 @@ mod tests {
             player_hours: 32.0,
             total_gaps: 13_009,
             total_false_positives: 0,
+            conviction: None,
+            total_escalations_filed: 0,
+            total_escalations_shadowed: 0,
+            total_escalations_unservable: 0,
+            total_escalations_unidentified: 0,
             total_frames_recovered: 0,
             total_reanchors: 0,
             total_unjudged_ticks: 0,
@@ -1292,6 +1669,146 @@ mod tests {
         let mut report = passing();
         report.witnessing = false;
         report.total_false_positives = 7;
+        assert!(clauses(&report, STRICT).is_empty());
+    }
+
+    // Clauses: P4's demo criterion, the conviction half.
+
+    /// A conviction leg in which every clause holds: one modified peer, it
+    /// diverged, it was convicted, and nobody else was accused.
+    fn convicting() -> SwarmReport {
+        SwarmReport {
+            conviction: Some(ConvictionReport {
+                tamper: Tamper::SpeedMultiplier.name(),
+                tampered_peers: 1,
+                tampered_peers_that_diverged: 1,
+                tampered_peers_convicted: 1,
+                first_tampered_tick: Some(0),
+                worst_detection_ticks: Some(32),
+                reports_against_tampered: 42,
+                reports_against_honest: 0,
+                adjudicated: 42,
+                confirms: 42,
+                exonerates: 0,
+                evidence_forged: 0,
+                unadjudicable: 0,
+            }),
+            total_escalations_filed: 42,
+            ..passing()
+        }
+    }
+
+    #[test]
+    fn a_conviction_leg_that_holds_raises_nothing() {
+        assert!(clauses(&convicting(), STRICT).is_empty());
+    }
+
+    #[test]
+    fn a_cheat_that_never_diverged_fails_the_run() {
+        // The vacuity trap this clause exists for, and it is not hypothetical:
+        // `Tamper::SpeedMultiplier` clamps to the same number as the shipping
+        // build on an interceptor slot at this roam's requested acceleration.
+        // Fielded there, the modified peer is byte-identical to an honest one —
+        // nothing to report, nothing filed, and "no report against an honest
+        // peer" and "convicted within one window" both hold over a swarm in
+        // which nothing happened.
+        let mut report = convicting();
+        let conviction = report.conviction.as_mut().expect("a conviction leg");
+        conviction.tampered_peers_that_diverged = 0;
+        conviction.tampered_peers_convicted = 0;
+        conviction.first_tampered_tick = None;
+        conviction.worst_detection_ticks = None;
+        conviction.reports_against_tampered = 0;
+        conviction.adjudicated = 0;
+        conviction.confirms = 0;
+        report.total_escalations_filed = 0;
+        let raised = clauses(&report, STRICT);
+        assert!(raised.contains(&"the modified client actually diverges from the shipping rules"));
+        assert!(raised.contains(&"a modified client is convicted on replay"));
+    }
+
+    #[test]
+    fn a_modified_peer_nobody_convicted_fails_the_run() {
+        let mut report = convicting();
+        report
+            .conviction
+            .as_mut()
+            .expect("a conviction leg")
+            .tampered_peers_convicted = 0;
+        assert!(clauses(&report, STRICT).contains(&"a modified client is convicted on replay"));
+    }
+
+    #[test]
+    fn convicting_the_cheat_by_accusing_everybody_fails_the_run() {
+        // D17 risk 3 in one assertion: a pipeline that reaches the right
+        // verdict about the modified peer and files against honest ones has
+        // failed the criterion it was measuring, not met the one it was aiming
+        // at.
+        let mut report = convicting();
+        report
+            .conviction
+            .as_mut()
+            .expect("a conviction leg")
+            .reports_against_honest = 3;
+        assert!(clauses(&report, STRICT).contains(&"no report is filed against an honest peer"));
+    }
+
+    #[test]
+    fn a_conviction_past_the_adjudication_window_fails_the_run() {
+        let mut report = convicting();
+        report
+            .conviction
+            .as_mut()
+            .expect("a conviction leg")
+            .worst_detection_ticks = Some(MAX_ADJUDICATION_TICKS + 1);
+        assert!(clauses(&report, STRICT)
+            .contains(&"a modified client is convicted within one adjudication window"));
+    }
+
+    #[test]
+    fn a_conviction_at_the_window_holds() {
+        // The comparison is `>`, so the window itself passes. Worth pinning for
+        // the same reason the coverage floor is: the measured leg runs a long
+        // way inside it, which is not much room in which to notice an
+        // off-by-one.
+        let mut report = convicting();
+        report
+            .conviction
+            .as_mut()
+            .expect("a conviction leg")
+            .worst_detection_ticks = Some(MAX_ADJUDICATION_TICKS);
+        assert!(clauses(&report, STRICT).is_empty());
+    }
+
+    #[test]
+    fn an_unmodified_swarm_that_files_anything_fails_the_run() {
+        let mut report = passing();
+        report.total_escalations_filed = 1;
+        assert!(clauses(&report, STRICT).contains(&"an unmodified swarm files no report at all"));
+    }
+
+    #[test]
+    fn the_conviction_clauses_are_silent_on_an_honest_leg() {
+        // `conviction` is `None` without `--cheat`, and a clause that fired on
+        // it would be judging a run that never fielded a modified client.
+        assert!(clauses(&passing(), STRICT).is_empty());
+    }
+
+    #[test]
+    fn a_witness_that_cannot_sign_fails_the_run() {
+        // The posture this whole lane exists to leave. Nothing else in the
+        // report distinguishes "detected and could not file" from "found
+        // nothing to file": both read as zero reports.
+        let mut report = passing();
+        report.total_escalations_unidentified = 5;
+        assert!(clauses(&report, STRICT).contains(&"every witness can sign what it raises"));
+    }
+
+    #[test]
+    fn the_signing_clause_is_silent_when_the_witness_did_not_run() {
+        let mut report = passing();
+        report.witnessing = false;
+        report.total_escalations_unidentified = 5;
         assert!(clauses(&report, STRICT).is_empty());
     }
 
@@ -1410,6 +1927,33 @@ mod tests {
             ..STRICT
         };
         assert!(clauses(&report, witnessed).contains(&"no load shed to stay within budget"));
+    }
+
+    #[test]
+    fn the_modified_build_is_only_ever_dealt_to_a_cruising_slot() {
+        // An idling bot never asks for thrust, so a cheat that raises an
+        // acceleration ceiling changes nothing about it: dealt there, the
+        // modified peer would be byte-identical to an honest one and the whole
+        // conviction leg would pass over a swarm in which nothing happened.
+        // The vacuity clause would catch it — but catching it as a failed
+        // nightly is worse than never dealing it.
+        for count in 1..=8 {
+            for index in tampered_indices(32, count) {
+                assert_eq!(
+                    crate::profile::Profile::for_index(index, true),
+                    crate::profile::Profile::Cruise,
+                    "index {index} runs a profile that may never thrust",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_demo_criterions_eight_peer_island_can_field_a_cheat() {
+        // "A modified client applying a 1.5× speed multiplier joins an 8-peer
+        // island" — stated literally, so the population the criterion names has
+        // to have a cruising slot to deal it to.
+        assert_eq!(tampered_indices(8, 1), vec![0]);
     }
 
     #[test]

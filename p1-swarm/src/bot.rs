@@ -28,8 +28,12 @@ use bevy_ecs::prelude::*;
 use bevy_math::Vec3;
 use bevy_time::{Real, Time};
 
-use orrery_conformance::{Body, Reference};
-use orrery_core::{Executor, QPos, QVel};
+use orrery_core::{Executor, QPos};
+use orrery_games::game::Tamper;
+use orrery_games::skirmish::archetype::Archetype;
+use orrery_games::skirmish::order::Order;
+use orrery_games::skirmish::state::Craft;
+use orrery_games::skirmish::{Skirmish, SKIRMISH_RULESET};
 use orrery_net::budget::{UploadBudget, UploadMeter};
 use orrery_net::peer_link::{
     forget_departed_links, receive_peer_packets, send_peer_packets, PeerLinkCounters, PeerPacket,
@@ -45,7 +49,10 @@ use orrery_spatial::hysteresis::GridPosition;
 use orrery_spatial::interest::{HighRate, InterestSelection, Proxy};
 use orrery_spatial::plugin::{Cell, LocalPlayer};
 use orrery_spatial::{OrrerySpatialPlugin, SpatialConfig};
-use orrery_witness::plugin::{PublishClaim, PublishFrame, WitnessSet, WitnessState};
+use orrery_witness::plugin::{
+    PublishClaim, PublishFrame, ReportFiled, WitnessIdentity, WitnessLinkCounters, WitnessSet,
+    WitnessState,
+};
 use orrery_witness::{Watch, Witness, WitnessConfig, WitnessPlugin, WitnessSignal, Witnessed};
 
 use crate::chain::Chain;
@@ -109,6 +116,43 @@ const POP_WINDOW_TICKS: u64 = 60;
 /// back; with the ramp, a sub-second round trip never gets near it.
 const RAMP_FLOOR_HZ: f32 = 2.5;
 
+/// How one bot is built.
+///
+/// Named rather than positional because two of these fields are what separate
+/// a modified client from an honest one, and a bare `bool, Option<Tamper>` pair
+/// at the end of a seven-argument call is how a leg of the gate silently ends
+/// up fielding the wrong swarm.
+#[derive(Debug, Clone, Copy)]
+pub struct BotSpec {
+    /// Index in the swarm.
+    pub index: usize,
+    /// Peers in the swarm.
+    pub count: usize,
+    /// The universe seed.
+    pub seed: UniverseSeed,
+    /// Interest-cell edge in metres.
+    pub cell_edge_m: f32,
+    /// Run the witness pipeline on this peer.
+    pub witnessing: bool,
+    /// The tamper this peer's **authority** executes with.
+    ///
+    /// `None` is the shipping build. `Some(_)` is P4's modified client: the
+    /// rules that step this bot's own body are the tampered ones, while the
+    /// [`Witness`] it runs over its island-mates stays honest. That asymmetry
+    /// is deliberate — a tampered witness would re-execute *other* peers under
+    /// raised ceilings and accuse the honest cruisers among them, which is a
+    /// statement about the cheat rather than about the pipeline. What P4 asks
+    /// is whether honest witnesses convict a modified authority.
+    pub cheat: Option<Tamper>,
+    /// Whether this peer's witness files what it raises, or only counts it.
+    ///
+    /// The inverse of [`WitnessConfig::shadow_mode`], which defaults to `true`
+    /// and short-circuits `raise` — so a run left at the default measures
+    /// detection and files nothing, which is P4's posture for the honest legs
+    /// and useless for the conviction one.
+    pub enforcing: bool,
+}
+
 /// A synthetic peer.
 pub struct Bot {
     /// This peer's identity.
@@ -117,14 +161,32 @@ pub struct Bot {
     pub index: usize,
     /// The headless app running the real plugins.
     pub app: App,
-    /// The core executor holding this bot's own body.
-    executor: Executor<Reference>,
+    /// The core executor holding this bot's own craft, under whichever build
+    /// this peer runs — tampered or not.
+    executor: Executor<Skirmish>,
+    /// A second executor running the *shipping* rules over the same logged
+    /// orders, for a bot the harness modified.
+    ///
+    /// The dual-execution probe, and the only thing that can say *when* a cheat
+    /// first changed anything. Without it "detected within one adjudication
+    /// window" has no `t = 0`: `ReportFiled` carries no tick, the swarm knows
+    /// which build it handed out but not which tick that build first mattered
+    /// on, and a cheat that is inert at these parameters — which
+    /// `Tamper::SpeedMultiplier` is on an interceptor slot, see
+    /// [`BotSpec::cheat`] — would satisfy every conviction clause by producing
+    /// byte-identical state and never being reported at all.
+    honest_shadow: Option<Executor<Skirmish>>,
+    /// First tick at which the tampered build produced a different state hash
+    /// than the shipping one would have from the same orders.
+    first_tampered_tick: Option<u64>,
+    /// The tamper this bot's authority runs, if any.
+    tamper: Option<Tamper>,
     /// The entity this bot authors.
     entity: PersistId,
     /// Heading change per tick, in micro-radians — its share of the circle.
-    turn_urad: i64,
+    turn_urad: i32,
     /// Thrust magnitude in mm/s².
-    accel_mmss: i64,
+    accel_mmss: i32,
     /// Cells this bot has committed to, in order of first visit.
     pub visited: Vec<CellId>,
     /// Times the committed cell changed.
@@ -168,29 +230,56 @@ pub struct Bot {
     pub chain: Option<Chain>,
     /// Witness signals raised against island-mates, by kind.
     pub signals: SignalTally,
+    /// The peers the harness modified, so a signal against one of them is not
+    /// counted as an accusation against an honest peer.
+    ///
+    /// Installed by the swarm, which is the only thing that knows: the bot
+    /// itself must not be able to tell, or the false-positive count would be
+    /// measuring the oracle instead of the witness.
+    tampered_subjects: Vec<NodeId>,
 }
 
-/// Witness signals a peer raised, by kind.
+/// Witness signals a peer raised, by kind and by whether the accused was one of
+/// the harness's own modified clients.
 ///
-/// Every bot in the swarm is honest, so anything here except a gap is a **false
-/// positive** — that is what makes the count meaningful without a separate
-/// oracle for who was cheating. Gaps are counted separately because a gap is a
-/// question, not an accusation: it is the expected answer to a dropped datagram.
+/// Every bot in a run without `--cheat` is honest, so anything here except a gap
+/// is a **false positive** — that is what makes the count meaningful without a
+/// separate oracle for who was cheating. Gaps are counted separately because a
+/// gap is a question, not an accusation: it is the expected answer to a dropped
+/// datagram.
+///
+/// With `--cheat` the swarm *has* an oracle — it handed out the tampered build —
+/// so the counters below split on it. The four that feed
+/// [`false_positives`](Self::false_positives) keep their original meaning:
+/// signals against a peer that did nothing wrong. Signals against a modified
+/// client are the finding the run exists to produce and are counted apart.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct SignalTally {
     /// Chain gaps detected — repairs requested, not accusations.
     pub gaps: u64,
-    /// Stage-1 invariant breaches. A false positive here.
+    /// Stage-1 invariant breaches against an honest peer. A false positive.
     pub invariant_breaches: u64,
-    /// Re-execution disagreeing with a signed claim. A false positive here.
+    /// Re-execution disagreeing with an honest peer's signed claim. A false
+    /// positive.
     pub claim_mismatches: u64,
-    /// Reports assembled. Always zero in shadow mode; a false positive here.
+    /// Reports **filed** against an honest peer. A false positive.
+    ///
+    /// Counted from `Messages<ReportFiled>` rather than from `Witnessed`. The
+    /// adapter's `route` intercepts `WitnessSignal::Report` and files it before
+    /// the signal is written out (`orrery_witness::plugin`), so the `Witnessed`
+    /// arm for it can never fire and this counter was structurally zero for as
+    /// long as it existed.
     pub reports: u64,
-    /// Subjects reported as stalled — a hole never filled.
+    /// Honest subjects reported as stalled — a hole never filled.
     ///
     /// A false positive in this swarm: every bot answers repairs, so a stall
     /// means the repair path could not keep up, not that a peer refused.
     pub stalled: u64,
+    /// Non-gap signals raised against a peer the harness modified. Findings,
+    /// not false positives.
+    pub signals_against_tampered: u64,
+    /// Reports filed against a peer the harness modified.
+    pub reports_against_tampered: u64,
 }
 
 impl SignalTally {
@@ -278,7 +367,7 @@ pub fn apply_replicas(
     tick: Res<SimTick>,
     mut counters: ResMut<ReplicaCounters>,
     existing: Query<(Entity, &Replica)>,
-    witness: Option<ResMut<WitnessState<Reference>>>,
+    witness: Option<ResMut<WitnessState<Skirmish>>>,
 ) {
     let mut witness = witness;
     for packet in packets.read() {
@@ -304,7 +393,7 @@ pub fn apply_replicas(
             }
             continue;
         };
-        let Ok(body) = <Body as orrery_core::CoreCodec>::decode(&encoded) else {
+        let Ok(craft) = <Craft as orrery_core::CoreCodec>::decode(&encoded) else {
             counters.bad_body += 1;
             continue;
         };
@@ -316,14 +405,14 @@ pub fn apply_replicas(
         if let Some(witness) = witness.as_mut() {
             witness.0.observe(orrery_witness::Observation {
                 entity,
-                state: &body,
+                state: &craft,
                 tick: orrery_protocol::Tick::new(at),
             });
         }
 
         // Position is for distance ranking; the *cell* is the authority's own
         // committed value, never recomputed here (D2).
-        let grid = grid_of(&body.pos, edge.0);
+        let grid = grid_of(&craft.pos, edge.0);
         match existing
             .iter()
             .find(|(_, replica)| replica.0 == packet.from)
@@ -348,14 +437,17 @@ pub fn apply_replicas(
 }
 
 impl Bot {
-    /// Build a bot at `index` of `count`, spread around a ring.
-    pub fn new(
-        index: usize,
-        count: usize,
-        seed: UniverseSeed,
-        cell_edge_m: f32,
-        witnessing: bool,
-    ) -> Self {
+    /// Build a bot from `spec`, spread around a ring with its swarm.
+    pub fn new(spec: BotSpec) -> Self {
+        let BotSpec {
+            index,
+            count,
+            seed,
+            cell_edge_m,
+            witnessing,
+            cheat,
+            enforcing,
+        } = spec;
         let secret = bot_key(index);
         let node = secret.public();
         let entity = PersistId::new(index as u64 + 1);
@@ -371,19 +463,39 @@ impl Bot {
         let arc = CROWD_ARC_RAD * share;
         let start = QPos::from_metres(libm::cos(arc) * radius_m, 0.0, libm::sin(arc) * radius_m);
 
-        let mut executor = Executor::new(Reference, seed);
-        executor.insert(
-            entity,
-            Body {
-                pos: start,
-                vel: QVel::default(),
-                // Tangent to the ring, so the bot travels around it.
-                heading_urad: ((arc + core::f64::consts::FRAC_PI_2) * 1_000_000.0) as i64,
-                hp: 100,
-                shield: 25,
-                roll_fold: 0,
-            },
-        );
+        // Tangent to the ring, so the bot travels around it. `Craft::spawned`
+        // takes the yaw back into `[0, TAU)`, which `skirmish/value-range`
+        // requires of every sample.
+        let yaw_urad = ((arc + core::f64::consts::FRAC_PI_2) * 1_000_000.0) as i32;
+
+        // **The cheat is inert on an interceptor, and that is the whole reason
+        // this is not `Archetype::for_slot`.** `Tamper::SpeedMultiplier` raises
+        // the archetype's ceilings by 1.5×, and the roam below asks for
+        // `accel_mmss` 60 000 — exactly the interceptor's `max_accel_mmss`, so
+        // `clamp(0, 60_000)` and `clamp(0, 90_000)` return the same number and
+        // the tampered build produces byte-identical state. The speed ceiling
+        // does not bind either: both archetypes cruise far under it, held there
+        // by the profile rather than by the clamp. On a cruiser the same
+        // request clamps to 20 000 honestly and to 30 000 tampered, so the
+        // divergence is 167 mm/s of velocity per thrusting tick — sixteen D16
+        // velocity bands, and unmistakable in a state hash. A modified client
+        // pinned to the other slot would satisfy every conviction clause in
+        // this harness by never diverging at all.
+        let archetype = if cheat.is_some() {
+            Archetype::Cruiser
+        } else {
+            Archetype::for_slot(index as u64)
+        };
+        let craft = Craft::spawned(archetype, start, yaw_urad);
+
+        let rules = cheat.map_or_else(Skirmish::honest, Skirmish::cheating);
+        let mut executor = Executor::new(rules, seed);
+        executor.insert(entity, craft.clone());
+        let honest_shadow = cheat.map(|_| {
+            let mut shadow = Executor::new(Skirmish::honest(), seed);
+            shadow.insert(entity, craft);
+            shadow
+        });
 
         let mut app = App::new();
         app.add_plugins(OrrerySpatialPlugin {
@@ -416,12 +528,26 @@ impl Bot {
         if witnessing {
             // The witness adapter drains the same peer lane, so it slots in
             // beside the send path rather than replacing anything.
-            app.add_plugins(WitnessPlugin::<Reference>::new())
-                .insert_resource(WitnessState(Witness::<Reference>::new(
-                    WitnessConfig::default(),
+            app.add_plugins(WitnessPlugin::<Skirmish>::new())
+                .insert_resource(WitnessState(Witness::<Skirmish>::new(
+                    WitnessConfig {
+                        shadow_mode: !enforcing,
+                        ..WitnessConfig::default()
+                    },
                     seed,
-                    || Reference,
-                )));
+                    // The **shipping** rules, on every peer including a
+                    // modified one — see `BotSpec::cheat`. A witness re-executes
+                    // the rules an authority *claims* to be running, and the
+                    // claim is what it is held to.
+                    Skirmish::honest,
+                )))
+                // Filing is opt-in and this is the opt-in: without an identity
+                // `escalate` counts `escalations_unidentified` and stops, which
+                // is what the harness did for as long as it had no adjudicator
+                // to hand a report to. The peer's own transport key, because a
+                // report binds an accusation to an account and this peer has
+                // exactly one.
+                .insert_resource(WitnessIdentity(secret.clone()));
         }
 
         let start_grid = grid_of(&start, cell_edge_m);
@@ -436,12 +562,24 @@ impl Bot {
             index,
             app,
             executor,
+            honest_shadow,
+            first_tampered_tick: None,
+            tamper: cheat,
             entity,
             // ω = v/r, so the bot actually follows the orbit it started on.
             // Picking a turn rate independently of the speed makes it spiral
             // into whatever radius the two happen to imply — which is how the
             // first version ended up circling 200 m and visiting ten cells.
-            turn_urad: ((CRUISE_MPS / radius_m) / TICK_HZ as f64 * 1_000_000.0) as i64,
+            //
+            // `v` is `CRUISE_MPS` rather than a measured speed, and under
+            // Skirmish that is an approximation rather than an identity: these
+            // rules apply drag, so a bot coasts *down* through the cutoff and
+            // thrusts back over it instead of sitting at it exactly. The
+            // sawtooth is one thrust tick's worth wide — under 1 m/s on a
+            // cruiser — so the orbit it actually follows is within a few
+            // percent of the one it started on, which is what this needs to be
+            // right about.
+            turn_urad: ((CRUISE_MPS / radius_m) / TICK_HZ as f64 * 1_000_000.0) as i32,
             accel_mmss: 60_000,
             visited: vec![cell_of(start_grid)],
             crossings: 0,
@@ -451,65 +589,81 @@ impl Bot {
             interest_churn: 0,
             proxy_pops: 0,
             profile: Profile::for_index(index, witnessing),
-            chain: witnessing.then(|| {
-                Chain::new(
-                    secret.clone(),
-                    entity,
-                    orrery_conformance::REFERENCE_RULESET,
-                    0,
-                )
-            }),
+            // The *honest* ruleset id, even on a tampered build. That is the
+            // point of `Skirmish::id` reporting `SKIRMISH_RULESET` whatever the
+            // tamper: a modified client claims to be running the rules, and the
+            // claim is what a witness holds it to. A cheat that announced
+            // itself would be routed to no adjudicable build and resolve as
+            // `UnknownRuleset` — never a strike.
+            chain: witnessing.then(|| Chain::new(secret.clone(), entity, SKIRMISH_RULESET, 0)),
             signals: SignalTally::default(),
+            tampered_subjects: Vec::new(),
             last_high_rate: Vec::new(),
             demoted_at: Vec::new(),
             tick: 0,
         }
     }
 
-    /// This bot's authored body.
+    /// This bot's authored craft.
     #[must_use]
-    pub fn body(&self) -> &Body {
+    pub fn craft(&self) -> &Craft {
         self.executor.state(self.entity).expect("seeded")
     }
 
     /// The bot's current speed in metres per second.
     #[must_use]
     pub fn speed_mps(&self) -> f64 {
-        let (vx, vy, vz) = self.body().vel.to_metres_per_sec();
+        let (vx, vy, vz) = self.craft().vel.to_metres_per_sec();
         libm::sqrt(vx * vx + vy * vy + vz * vz)
     }
 
     /// Advance the core by one tick and mirror the result into the ECS.
     ///
-    /// Thrust cuts out at [`CRUISE_MPS`]. The reference ruleset has no drag, so
-    /// a constant thrust is a constant *acceleration* — left alone the bots
-    /// reach several km/s and cross a cell every other tick, which is not
-    /// roaming, it is teleporting, and it would make every hysteresis and
+    /// Thrust cuts out at [`CRUISE_MPS`], which is far below either archetype's
+    /// ceiling. Letting the rules' own speed clamp hold the bots instead would
+    /// pin an interceptor at 120 m/s — a 128 m cell every other tick, which is
+    /// teleporting rather than roaming and would make every hysteresis and
     /// interest-churn number meaningless.
+    ///
+    /// A modified build steps a second, honest executor over the same order, so
+    /// the harness knows the first tick on which the cheat actually changed
+    /// anything — see [`Bot::first_tampered_tick`].
     pub fn step_core(&mut self, tick: u64, cell_edge_m: f32) {
         let accel_mmss =
             self.profile
                 .accel_mmss(tick, self.speed_mps(), self.accel_mmss, CRUISE_MPS);
-        let command = orrery_conformance::Command::Thrust {
+        let order = Order::Thrust {
             accel_mmss,
-            turn_urad: self.turn_urad,
+            yaw_urad: self.turn_urad,
+            // Level flight: the roam is a circle in the XZ plane, and a pitch
+            // term would make the orbit a helix the cell-visit numbers were
+            // never chosen against.
+            pitch_urad: 0,
         };
         // Log *before* executing, and log exactly what is about to be applied.
         // A log written from what happened rather than what was asked would
         // close the gap a cheat lives in by construction, and then the harness
         // could not tell an honest bot from a careful one.
         if let Some(chain) = &mut self.chain {
-            chain.log_input(tick, &command);
+            chain.log_input(tick, &order);
         }
         let outcome = self
             .executor
-            .step_entity(self.entity, Tick::new(tick), &[command])
+            .step_entity(self.entity, Tick::new(tick), core::slice::from_ref(&order))
             .expect("entity present");
+        if let Some(shadow) = &mut self.honest_shadow {
+            let honest = shadow
+                .step_entity(self.entity, Tick::new(tick), &[order])
+                .expect("entity present");
+            if self.first_tampered_tick.is_none() && honest.state_hash != outcome.state_hash {
+                self.first_tampered_tick = Some(tick);
+            }
+        }
         if let Some(chain) = &mut self.chain {
             chain.log_tick_hash(outcome.state_hash);
         }
 
-        let grid = grid_of(&self.body().pos, cell_edge_m);
+        let grid = grid_of(&self.craft().pos, cell_edge_m);
         let world = self.app.world_mut();
         let mut query = world.query_filtered::<(&mut GridPosition, &Cell), With<LocalPlayer>>();
         let Ok((mut position, _)) = query.single_mut(world) else {
@@ -698,11 +852,11 @@ impl Bot {
     }
 
     /// Start watching `subject`'s `entity`, anchored at a signed claim.
-    pub fn watch(&mut self, entity: PersistId, subject: NodeId, anchor: StateClaim, state: Body) {
+    pub fn watch(&mut self, entity: PersistId, subject: NodeId, anchor: StateClaim, state: Craft) {
         let Some(mut witness) = self
             .app
             .world_mut()
-            .get_resource_mut::<WitnessState<Reference>>()
+            .get_resource_mut::<WitnessState<Skirmish>>()
         else {
             return;
         };
@@ -779,6 +933,11 @@ impl Bot {
     }
 
     /// Drain the witness signals this bot raised this tick.
+    ///
+    /// Every non-gap signal is attributed by *subject*: against an honest peer
+    /// it is a false positive, against one the harness modified it is the
+    /// finding the conviction leg exists to produce. Before `--cheat` there was
+    /// no distinction to draw, because there was nobody to draw it against.
     pub fn drain_signals(&mut self) {
         let Some(mut messages) = self
             .app
@@ -787,24 +946,105 @@ impl Bot {
         else {
             return;
         };
-        for witnessed in messages.drain() {
+        let drained: Vec<Witnessed> = messages.drain().collect();
+        for witnessed in drained {
+            if let WitnessSignal::Gap(_) = witnessed.signal {
+                // A question, not an accusation, whoever it is addressed to.
+                self.signals.gaps += 1;
+                continue;
+            }
+            if self.tampered_subjects.contains(&witnessed.subject) {
+                self.signals.signals_against_tampered += 1;
+                continue;
+            }
             match witnessed.signal {
-                WitnessSignal::Gap(_) => self.signals.gaps += 1,
-                // A subject that never fills a hole. Against this swarm that is
-                // a false positive like any other — every bot answers repairs,
-                // so a stall here means the repair path failed to keep up, not
-                // that anyone refused.
+                // A subject that never fills a hole. Against an honest peer
+                // that is a false positive like any other — every bot answers
+                // repairs, so a stall means the repair path failed to keep up,
+                // not that anyone refused.
                 WitnessSignal::Stalled { .. } => self.signals.stalled += 1,
                 WitnessSignal::InvariantBreach { .. } => self.signals.invariant_breaches += 1,
                 WitnessSignal::ClaimMismatch { .. } => self.signals.claim_mismatches += 1,
-                WitnessSignal::Report(_) => self.signals.reports += 1,
+                // Unreachable, and left as a no-op rather than folded into
+                // `reports`. The adapter's `route` files a raised report and
+                // `continue`s before it ever reaches `Witnessed`
+                // (`orrery_witness::plugin`), so this arm counted nothing for
+                // as long as it existed. Reports are counted where they
+                // actually arrive — see `drain_reports`.
+                WitnessSignal::Report(_) => {}
+                WitnessSignal::Gap(_) => unreachable!("counted above"),
             }
         }
     }
 
+    /// Drain the discrepancy reports this bot's witness filed this tick.
+    ///
+    /// Tallies them by subject and hands them back for adjudication. Nothing is
+    /// here at all unless the peer was built `enforcing` *and* holds a
+    /// [`WitnessIdentity`]: shadow mode short-circuits `raise`, and a missing
+    /// identity stops `escalate` a step earlier still.
+    pub fn drain_reports(&mut self) -> Vec<orrery_protocol::DiscrepancyReport> {
+        let Some(mut messages) = self
+            .app
+            .world_mut()
+            .get_resource_mut::<bevy_ecs::message::Messages<ReportFiled>>()
+        else {
+            return Vec::new();
+        };
+        let filed: Vec<ReportFiled> = messages.drain().collect();
+        filed
+            .into_iter()
+            .map(|filed| {
+                if self.tampered_subjects.contains(&filed.subject) {
+                    self.signals.reports_against_tampered += 1;
+                } else {
+                    self.signals.reports += 1;
+                }
+                *filed.report
+            })
+            .collect()
+    }
+
+    /// Tell this bot which peers the harness modified.
+    ///
+    /// The oracle, and it is deliberately external: the witness engine is never
+    /// shown it, so a signal is still raised or not raised on the evidence
+    /// alone. All this changes is which column the harness counts it in.
+    pub fn set_tampered_subjects(&mut self, subjects: Vec<NodeId>) {
+        self.tampered_subjects = subjects;
+    }
+
+    /// The tamper this bot's authority runs, if it is a modified client.
+    #[must_use]
+    pub fn tamper(&self) -> Option<Tamper> {
+        self.tamper
+    }
+
+    /// The first tick on which this bot's build produced state the shipping
+    /// rules would not have, or `None` if it never did.
+    ///
+    /// `None` on an honest bot is the expected reading. `None` on a *modified*
+    /// one is the finding that the cheat is inert at these parameters, and the
+    /// swarm fails a clause on it rather than letting the conviction clauses
+    /// pass over byte-identical state.
+    #[must_use]
+    pub fn first_tampered_tick(&self) -> Option<u64> {
+        self.first_tampered_tick
+    }
+
+    /// What this peer's witness adapter did with the escalations it raised.
+    #[must_use]
+    pub fn link_counters(&self) -> WitnessLinkCounters {
+        self.app
+            .world()
+            .get_resource::<WitnessLinkCounters>()
+            .copied()
+            .unwrap_or_default()
+    }
+
     /// This bot's current core state, for seeding a watcher's anchor.
     #[must_use]
-    pub fn state(&self) -> Body {
+    pub fn state(&self) -> Craft {
         self.executor.state(self.entity).expect("seeded").clone()
     }
 
@@ -837,7 +1077,7 @@ impl Bot {
     pub fn witness_counters(&self) -> orrery_witness::WitnessCounters {
         self.app
             .world()
-            .get_resource::<WitnessState<Reference>>()
+            .get_resource::<WitnessState<Skirmish>>()
             .map_or_else(Default::default, |state| state.0.counters())
     }
 
@@ -898,4 +1138,97 @@ pub fn cell_of(grid: Vec3) -> CellId {
 #[must_use]
 pub fn default_cell_edge_m() -> f32 {
     DEFAULT_CELL_EDGE_M as f32
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// One tick of this harness's roam under `rules`, on `archetype`.
+    fn hash_after_a_thrust(rules: Skirmish, archetype: Archetype) -> [u8; 32] {
+        let entity = PersistId::new(1);
+        let mut executor = Executor::new(rules, UniverseSeed([7; 32]));
+        executor.insert(
+            entity,
+            Craft::spawned(archetype, QPos::from_metres(1_000.0, 0.0, 0.0), 0),
+        );
+        executor
+            .step_entity(
+                entity,
+                Tick::new(0),
+                &[Order::Thrust {
+                    // Exactly what `step_core` asks for.
+                    accel_mmss: 60_000,
+                    yaw_urad: 213,
+                    pitch_urad: 0,
+                }],
+            )
+            .expect("seeded")
+            .state_hash
+    }
+
+    #[test]
+    fn the_speed_cheat_is_inert_on_an_interceptor_and_bites_on_a_cruiser() {
+        // **The reason `Bot::new` pins a modified peer to the cruiser slot**,
+        // asserted rather than argued for in a comment.
+        //
+        // `Tamper::SpeedMultiplier` raises an archetype's ceilings by 1.5×. The
+        // interceptor's `max_accel_mmss` is 60 000 and this roam requests
+        // 60 000, so `clamp(0, 60_000)` and `clamp(0, 90_000)` return the same
+        // number: the tampered build produces byte-identical state, files
+        // nothing, and every conviction clause would hold over a swarm in which
+        // nothing happened. The cruiser's ceiling is 20 000, so the same request
+        // clamps to 20 000 honestly and to 30 000 tampered.
+        //
+        // Neither *speed* ceiling binds at all — the bots cruise at 32 m/s
+        // against 120 and 60 — so the acceleration clamp is the whole of this
+        // cheat's effect at these parameters.
+        let cheating = Skirmish::cheating(Tamper::SpeedMultiplier);
+        assert_eq!(
+            hash_after_a_thrust(Skirmish::honest(), Archetype::Interceptor),
+            hash_after_a_thrust(cheating, Archetype::Interceptor),
+            "the speed cheat is inert on an interceptor at this roam's requested \
+             acceleration; if that ever stops being true, the archetype pin in `Bot::new` \
+             is solving a problem that no longer exists and should go",
+        );
+        assert_ne!(
+            hash_after_a_thrust(Skirmish::honest(), Archetype::Cruiser),
+            hash_after_a_thrust(cheating, Archetype::Cruiser),
+            "the speed cheat must change a cruiser's state, or the conviction leg has \
+             nothing to convict",
+        );
+    }
+
+    #[test]
+    fn only_a_modified_bot_reports_a_tampered_tick_and_it_is_the_first_one() {
+        // The dual-execution probe is what gives "convicted within one
+        // adjudication window" a t = 0. Without it the harness knows which
+        // build it handed out and not which tick that build first mattered on.
+        let spec = BotSpec {
+            index: 0,
+            count: 8,
+            seed: UniverseSeed([3; 32]),
+            cell_edge_m: default_cell_edge_m(),
+            witnessing: true,
+            cheat: None,
+            enforcing: false,
+        };
+        let mut honest = Bot::new(spec);
+        let mut modified = Bot::new(BotSpec {
+            cheat: Some(Tamper::SpeedMultiplier),
+            enforcing: true,
+            ..spec
+        });
+        for tick in 0..120 {
+            honest.step_core(tick, spec.cell_edge_m);
+            modified.step_core(tick, spec.cell_edge_m);
+        }
+        assert_eq!(honest.first_tampered_tick(), None);
+        assert_eq!(
+            modified.first_tampered_tick(),
+            Some(0),
+            "both builds start at rest, so the very first tick asks for full thrust and \
+             the two clamps already disagree",
+        );
+    }
 }

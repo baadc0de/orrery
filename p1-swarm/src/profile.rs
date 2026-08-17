@@ -76,7 +76,7 @@ impl Profile {
     /// legal input, not an absence of one — the tick is still logged and still
     /// draws from the RNG, which is what keeps a witness on the same trajectory.
     #[must_use]
-    pub fn accel_mmss(self, tick: u64, speed_mps: f64, full: i64, cruise_mps: f64) -> i64 {
+    pub fn accel_mmss(self, tick: u64, speed_mps: f64, full: i32, cruise_mps: f64) -> i32 {
         match self {
             Self::Idle => 0,
             Self::Burst => {
@@ -150,8 +150,13 @@ mod tests {
 
     #[test]
     fn cruise_cuts_thrust_at_speed() {
-        // The reference ruleset has no drag: constant thrust is constant
-        // acceleration, and a bot left alone reaches kilometres per second.
+        // Skirmish does have drag, and a per-archetype speed clamp above it —
+        // but both sit far above the 32 m/s these bots roam at, so neither is
+        // what holds a bot at cruise. This cutoff is. Without it the clamp
+        // would be, and every bot would sit pinned at its archetype ceiling:
+        // an interceptor at 120 m/s crosses a 128 m cell every other tick,
+        // which is not roaming, and every hysteresis and churn figure measured
+        // over it would be meaningless.
         assert_eq!(Profile::Cruise.accel_mmss(0, 0.0, 60_000, 32.0), 60_000);
         assert_eq!(Profile::Cruise.accel_mmss(0, 32.0, 60_000, 32.0), 0);
     }

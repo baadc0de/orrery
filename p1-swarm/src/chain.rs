@@ -11,9 +11,10 @@
 //! the upload budget the witness lane may spend, because that is the thing it
 //! was actually failing (docs/03-replication.md §5.3a).
 
-use orrery_conformance::{Body, Command};
 use orrery_core::log::{claim_hash, fold, sign_claim, sign_frame, HeadTransition};
 use orrery_core::{state_hash, CoreCodec};
+use orrery_games::skirmish::order::Order;
+use orrery_games::skirmish::state::Craft;
 use orrery_protocol::{
     ChainHash, EntitySlice, InputRecord, LogFrame, PersistId, RecordSource, RulesetId, StateClaim,
     Tick,
@@ -57,6 +58,22 @@ pub struct Chain {
     /// for *itself* — a log with frames but no per-tick hashes can serve a
     /// repair and still fail `IncompleteHashes` on every self-authored window.
     pending_hashes: Vec<[u8; 32]>,
+    /// The newest tick a claim has already been cut for, so a tick cannot be
+    /// claimed twice.
+    ///
+    /// **This is load-bearing for adjudication, not tidiness.** The swarm takes
+    /// each bot's anchor at tick 0 and then runs `publish_claim(0)` on the very
+    /// first tick, so tick 0 used to be signed *twice* — the same entity, head
+    /// and state hash, but a different `prev_claim`, and therefore a different
+    /// `claim_hash`. A witness retains the anchor and the duplicate both;
+    /// `AuthorityLog::assemble_bundle` picks the first claim it holds at
+    /// `window_start` (the anchor) while the claim at tick 30 chains from the
+    /// *duplicate*. `verify_bundle` walks `disputed_claims` checking
+    /// `claim.prev_claim == claim_hash(previous)` and would find the break —
+    /// returning `Confirms { kind: DiscreteMismatch }` against an authority that
+    /// had done nothing wrong. Nothing caught it because shadow mode meant no
+    /// p1-swarm bundle had ever been adjudicated.
+    claimed_through: Option<u64>,
     /// Tick the pending frame starts at.
     frame_start: u64,
     /// The chain head as it stood before the pending records — the `prev_head`
@@ -91,6 +108,7 @@ impl Chain {
             previous_claim: [0; 32],
             pending: Vec::new(),
             pending_hashes: Vec::new(),
+            claimed_through: None,
             frame_start: first_tick,
             frame_base: ChainHash::EMPTY,
         }
@@ -100,9 +118,10 @@ impl Chain {
     ///
     /// A witness holds state for exactly one claim — the anchor — and is held to
     /// the subject's own signature for everything after it.
-    pub fn anchor(&mut self, tick: u64, state: &Body) -> StateClaim {
+    pub fn anchor(&mut self, tick: u64, state: &Craft) -> StateClaim {
         let claim = self.sign_claim_at(tick, state);
         self.previous_claim = claim_hash(&claim);
+        self.claimed_through = Some(tick);
         claim
     }
 
@@ -112,7 +131,7 @@ impl Chain {
     /// tick still advances state and still draws from the RNG, so a log that
     /// skipped it would put every witness on a different trajectory for reasons
     /// that have nothing to do with cheating.
-    pub fn log_input(&mut self, tick: u64, command: &Command) {
+    pub fn log_input(&mut self, tick: u64, command: &Order) {
         let offset = (tick - self.frame_start) as u16;
         let record = InputRecord {
             tick_off: offset,
@@ -177,17 +196,19 @@ impl Chain {
         })
     }
 
-    /// Cut a claim if one is due at `tick`.
-    pub fn cut_claim(&mut self, tick: u64, state: &Body) -> Option<StateClaim> {
-        if !tick.is_multiple_of(CLAIM_EVERY) {
+    /// Cut a claim if one is due at `tick`, and if this tick has not been
+    /// claimed already — see the `claimed_through` field.
+    pub fn cut_claim(&mut self, tick: u64, state: &Craft) -> Option<StateClaim> {
+        if !tick.is_multiple_of(CLAIM_EVERY) || self.claimed_through == Some(tick) {
             return None;
         }
         let claim = self.sign_claim_at(tick, state);
         self.previous_claim = claim_hash(&claim);
+        self.claimed_through = Some(tick);
         Some(claim)
     }
 
-    fn sign_claim_at(&self, tick: u64, state: &Body) -> StateClaim {
+    fn sign_claim_at(&self, tick: u64, state: &Craft) -> StateClaim {
         let mut claim = StateClaim {
             entity: self.entity,
             chain_epoch: 0,
@@ -200,5 +221,63 @@ impl Chain {
         };
         sign_claim(&self.key, &mut claim);
         claim
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use orrery_core::QPos;
+    use orrery_games::skirmish::archetype::Archetype;
+
+    fn craft() -> Craft {
+        Craft::spawned(Archetype::Cruiser, QPos::from_metres(1_000.0, 0.0, 0.0), 0)
+    }
+
+    #[test]
+    fn a_tick_is_only_ever_claimed_once_and_the_next_claim_chains_to_that_one() {
+        // The swarm anchors every watch at tick 0 and then runs
+        // `publish_claim(0)` on the first tick, so tick 0 used to be signed
+        // twice: same entity, head and state hash, different `prev_claim`, and
+        // therefore a different `claim_hash`.
+        //
+        // A witness retains both. `AuthorityLog::assemble_bundle` takes the
+        // *first* claim it holds at `window_start` — the anchor — while the
+        // claim at tick 30 chains from the duplicate, so `verify_bundle`'s
+        // `claim.prev_claim == claim_hash(previous)` walk finds a break and
+        // returns `Confirms { kind: DiscreteMismatch }` against an authority
+        // that had done nothing wrong. Shadow mode meant no p1-swarm bundle had
+        // ever been adjudicated, so nothing in the tree could see it.
+        let key = iroh_base::SecretKey::from_bytes(&[9u8; 32]);
+        let mut chain = Chain::new(
+            key,
+            PersistId::new(1),
+            orrery_games::skirmish::SKIRMISH_RULESET,
+            0,
+        );
+        let state = craft();
+
+        let anchor = chain.anchor(0, &state);
+        assert!(
+            chain.cut_claim(0, &state).is_none(),
+            "tick 0 was already claimed by the anchor",
+        );
+
+        for tick in 1..CLAIM_EVERY {
+            chain.log_input(
+                tick,
+                &orrery_games::skirmish::order::Order::Fire {
+                    target: PersistId::new(2),
+                },
+            );
+        }
+        let next = chain
+            .cut_claim(CLAIM_EVERY, &state)
+            .expect("a claim is due");
+        assert_eq!(
+            next.prev_claim,
+            claim_hash(&anchor),
+            "the next claim must chain to the anchor an adjudicator will start from",
+        );
     }
 }
