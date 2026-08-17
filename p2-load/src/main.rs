@@ -795,14 +795,21 @@ fn aggregate_bulk_latency(schedulers: &[UplinkScheduler]) -> LatencyHistogram {
     combined
 }
 
-/// Every durable ack must have produced a `bulk_ack_ms` sample.
+/// Every *distinct* durable ack must have produced a `bulk_ack_ms` sample.
 ///
-/// Nacks are deliberately **not** counted: `UplinkScheduler::on_nack_at` no
-/// longer records a reply-latency sample, because a refusal round trip is not
-/// a write's acknowledgement latency and folding it into the gated series let
-/// a run with zero successful writes report a p99 of 1.25–1.75 ms.
+/// Two exclusions, both deliberate:
+///
+/// - **Nacks.** `UplinkScheduler::on_nack_at` no longer records a
+///   reply-latency sample: a refusal round trip is not a write's
+///   acknowledgement latency, and folding it into the gated series let a run
+///   with zero successful writes report a p99 of 1.25–1.75 ms.
+/// - **Duplicate acks.** The bulk lane is unreliable and unordered and an
+///   unacked diff is resent, so the gateway can answer the same
+///   `(entity, tick)` twice. The scheduler samples the first reply and
+///   discards the send instant with it, so a duplicate can never be a sample
+///   and must not be demanded of the histogram.
 fn check_bulk_reply_coverage(sampled: u64, stats: &RunStats) -> Result<()> {
-    let expected = stats.durable_diff_acks;
+    let expected = stats.first_durable_diff_acks;
     if sampled != expected {
         bail!(
             "bulk latency coverage incomplete after {} ms drain: sampled {} of {} durable acks",
@@ -1371,6 +1378,13 @@ struct RunStats {
     /// qualify as durable recovery evidence.
     diff_acks: u64,
     durable_diff_acks: u64,
+    /// Durable acks that were the first for their `(entity, tick)` — one per
+    /// distinct send, which is exactly what the scheduler samples.
+    first_durable_diff_acks: u64,
+    /// Durable acks for an `(entity, tick)` already credited. The bulk lane is
+    /// unreliable and unordered and unacked diffs are resent, so these exist;
+    /// they are not evidence and not latency samples.
+    duplicate_durable_diff_acks: u64,
     provisional_diff_acks: u64,
     diff_nacks: u64,
     intents_sent: u64,
@@ -1980,6 +1994,7 @@ impl Rig<'_> {
             diffs = stats.diffs_sent,
             acks = stats.diff_acks,
             durable_acks = stats.durable_diff_acks,
+            duplicate_durable_acks = stats.duplicate_durable_diff_acks,
             provisional_acks = stats.provisional_diff_acks,
             // Rejections are reported, always. 541 408 of them were invisible
             // in this line once, and the summary said the run went fine.
@@ -2060,12 +2075,23 @@ impl Rig<'_> {
                 if !provisional {
                     stats.durable_diff_acks += 1;
                     if let Some(mut evidence) = self.pending_diffs.remove(&(entity, tick)) {
+                        // First durable ack for this exact send. The
+                        // scheduler samples latency on exactly these, so this
+                        // is the count the coverage check compares against.
+                        stats.first_durable_diff_acks += 1;
                         evidence.lsn = lsn;
                         if let Some(log) = &mut self.ack_log {
                             log.record(&AckRecord::Diff(evidence));
                         }
                     } else {
-                        tracing::warn!(?entity, ?tick, "durable bulk ack had no outbound evidence");
+                        // A duplicate of an already-credited ack: the bulk
+                        // lane is unreliable *and* unordered, and an unacked
+                        // diff is resent, so the gateway can answer the same
+                        // `(entity, tick)` more than once. Counted in
+                        // `diff_acks`, deliberately not in the coverage
+                        // denominator.
+                        stats.duplicate_durable_diff_acks += 1;
+                        tracing::debug!(?entity, ?tick, "duplicate durable bulk ack");
                     }
                 } else {
                     // Deliberately retain the outbound record: a provisional
@@ -2596,6 +2622,7 @@ mod tests {
         // count either, which is what let a zero-write run gate green.
         let stats = RunStats {
             durable_diff_acks: 2,
+            first_durable_diff_acks: 2,
             diff_nacks: 3,
             ..RunStats::default()
         };
@@ -2612,6 +2639,18 @@ mod tests {
         };
         assert!(check_bulk_reply_coverage(541_408, &all_rejected).is_err());
         assert!(check_bulk_reply_coverage(0, &all_rejected).is_ok());
+
+        // A duplicate durable ack is not a sample and must not be demanded of
+        // the histogram: the gateway can answer one resent `(entity, tick)`
+        // twice, and the second reply finds no send instant to measure from.
+        let with_duplicates = RunStats {
+            durable_diff_acks: 15_601,
+            first_durable_diff_acks: 15_542,
+            duplicate_durable_diff_acks: 59,
+            ..RunStats::default()
+        };
+        assert!(check_bulk_reply_coverage(15_542, &with_duplicates).is_ok());
+        assert!(check_bulk_reply_coverage(15_541, &with_duplicates).is_err());
     }
 
     #[test]
