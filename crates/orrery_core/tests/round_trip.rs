@@ -148,6 +148,23 @@ fn inputs_at(tick: u64) -> Vec<Thrust> {
 /// This is the shape a real authority has: execute at 60 Hz, batch three ticks
 /// into a frame at 20 Hz, claim every 30 ticks, retain.
 fn run_authority(ticks: u64, retention: Retention) -> (AuthorityLog, Executor<Kinematic>) {
+    run_authority_inner(ticks, retention, false)
+}
+
+/// As [`run_authority`], but the producer signs `T0` twice before it starts —
+/// an anchor claim and then the run loop's first claim, the p1-swarm shape.
+fn run_authority_double_signing_t0(
+    ticks: u64,
+    retention: Retention,
+) -> (AuthorityLog, Executor<Kinematic>) {
+    run_authority_inner(ticks, retention, true)
+}
+
+fn run_authority_inner(
+    ticks: u64,
+    retention: Retention,
+    double_sign_t0: bool,
+) -> (AuthorityLog, Executor<Kinematic>) {
     let authority = key();
     let mut executor = Executor::new(Kinematic, SEED);
     executor.insert(ENTITY, body());
@@ -179,6 +196,26 @@ fn run_authority(ticks: u64, retention: Retention) -> (AuthorityLog, Executor<Ki
     };
 
     claim_at(&mut log, &executor, T0, &mut previous_claim);
+    if double_sign_t0 {
+        // The second claim commits to the same state at the same tick — the
+        // executor has not stepped — and differs only in `prev_claim`, which
+        // now names the anchor. A witness receives it with no snapshot of its
+        // own, because it already holds the anchor's.
+        let state = executor.state(ENTITY).expect("entity present");
+        let mut duplicate = StateClaim {
+            entity: ENTITY,
+            chain_epoch: 0,
+            tick: Tick::new(T0),
+            input_head: log.head(ENTITY),
+            state_hash: state_hash(state),
+            prev_claim: previous_claim,
+            ruleset: RULESET,
+            sig: authority.sign(b"unsigned"),
+        };
+        sign_claim(&authority, &mut duplicate);
+        previous_claim = claim_hash(&duplicate);
+        log.record_claim(duplicate, Vec::new());
+    }
 
     let mut tick = T0;
     while tick < T0 + ticks {
@@ -469,4 +506,39 @@ fn the_retained_head_matches_folding_the_frames_that_were_sent() {
         }
     }
     assert_eq!(head, log.head(ENTITY));
+}
+
+#[test]
+fn a_tick_signed_twice_does_not_convict_the_authority_that_signed_it() {
+    // p1-swarm's own bug, seen from the store side: the anchor at T0 and the
+    // run loop's first claim at T0 are two signed claims at one tick, and every
+    // later claim chains from the second. `assemble_bundle` used to take the
+    // *first* claim it held at `window_start`, so the claim at T0+30 chained
+    // from a hash the bundle never mentions, `verify_bundle` found the break,
+    // and an authority that had executed the window correctly was convicted of
+    // a `DiscreteMismatch` it did not commit. The producer bug is real and
+    // fixed in p1-swarm; the store must not turn it into a false conviction for
+    // the next producer that makes it.
+    let (log, _) = run_authority_double_signing_t0(90, Retention::default());
+    let window = (Tick::new(T0), Tick::new(T0 + 60));
+    let claimed = log
+        .claimed_hashes(ENTITY, window)
+        .expect("window is retained");
+    let bundle = log
+        .assemble_bundle(ENTITY, window, claimed)
+        .expect("window is servable");
+
+    assert_eq!(
+        verify_bundle(Kinematic, SEED, key().public(), &bundle),
+        Verdict::Exonerates,
+        "an honest trajectory must not be convicted by its own evidence store"
+    );
+
+    // Chain-consistent by construction: the t0 claim the bundle carries is the
+    // one the rest of the retained claims actually chain from.
+    let mut previous = claim_hash(&bundle.t0_claim);
+    for claim in &bundle.disputed_claims {
+        assert_eq!(claim.prev_claim, previous, "bundle claims must chain");
+        previous = claim_hash(claim);
+    }
 }
