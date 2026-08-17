@@ -7,7 +7,9 @@ Guidance for AI coding agents working in this repository.
 **Orrery** is an in-development set of Rust crates for the Bevy game engine (0.19):
 peer-to-peer multiplayer (QUIC transport with NAT hole punching via iroh) and a
 persistent-universe backend. The repository contains the accepted architecture,
-active P0–P2 implementation, test tools, and incomplete milestone harnesses.
+active P0–P4 implementation — P4 landed as construction and open as
+*measurement*, with witnessing in shadow mode — test tools, and incomplete
+milestone harnesses.
 
 ## Reading path (normative order)
 
@@ -104,15 +106,22 @@ excludes the same three: `bevy_replicon`'s own tests and doctests do not compile
 under this workspace's feature unification, because `bevy/serialize` is off and
 they need `Transform: Serialize`.
 
-One thing to know while you are in there: **`[workspace.lints]` currently
-reaches only the vendored crates.** `vendor/aeronet_iroh`,
-`vendor/aeronet_tokio_runtime` and `vendor/bevy_replicon` are the only manifests
-with `[lints] workspace = true`, so the `pedantic`/`nursery`/`missing_docs`/
-`unwrap_used` levels configured at the workspace root apply to third-party code
-and to none of `crates/*`. That is backwards, and adopting it across the
-first-party crates is its own piece of work — a large one, since those levels
-have never been enforced there. The CI gate gates what is enforceable today:
-default `clippy` at `-D warnings`.
+One thing to know while you are in there: **`[workspace.lints]` still reaches
+only the vendored crates.** `vendor/aeronet_iroh`, `vendor/aeronet_tokio_runtime`
+and `vendor/bevy_replicon` are the only manifests with `[lints] workspace = true`,
+so the `pedantic`/`nursery`/`missing_docs`/`unwrap_used` levels configured at the
+workspace root apply to third-party code and to none of `crates/*` through that
+mechanism. That is backwards, and adopting the table wholesale is still its own
+piece of work.
+
+But do not read it as "no lint levels apply to `crates/*`", because one of them
+does and it bites. Thirteen of the fourteen first-party crates set
+`#![warn(missing_docs)]` in their own `lib.rs` — every one except
+`orrery_conformance` — and CI runs `clippy --workspace --all-targets --no-deps
+-- -D warnings`, which promotes that warning to an error. **An undocumented
+public item fails CI today.** What is genuinely unadopted is the rest:
+`pedantic`, `nursery` and `unwrap_used` have never been enforced on first-party
+code, and turning them on is the large piece of work.
 
 **Determinism is checked *across* platforms, not on each one.** `orrery_core`'s
 own tests run an identical tick twice in-process and compare hashes, which
@@ -193,10 +202,11 @@ beyond a stock Ubuntu: the Bevy build dependencies, `foundationdb-clients`, and
 happen to satisfy and a bare box does not). And the jobs that need a
 FoundationDB *server* stay on GitHub-hosted runners — `p2-kill9` and the fdb
 test job — because provisioning a throwaway cluster means `sudo dpkg -i` on the
-server package, which that user cannot do. The box does run an `fdbserver`, and
-that is exactly the cluster those jobs must not be pointed at: it is a shared
-development database, and both of them write into whatever cluster they are
-given.
+server package, which that user cannot do. The box does run an `fdbserver` — in
+a Docker container, see [Working alongside other agents](#working-alongside-other-agents)
+— and that is exactly the cluster those jobs must not be pointed at: it is a
+shared development database, and both of them write into whatever cluster they
+are given.
 
 `p3-island` used to be pinned there for the same stated reason and never had
 one — `scripts/p3-island-gate.sh` contains no FoundationDB reference at all,
@@ -317,15 +327,42 @@ genuinely cannot be shared are elsewhere, and they are the ones worth blocking
 on: the `.fdb-dev/` cluster, a harness's fixed ports, `git push` and branch
 deletion, `git worktree add/remove`, and the disk itself.
 
-The `.fdb-dev/` cluster is on that list because agents share *one* of it by
-default, not because they must. `scripts/fdb-dev.sh` takes
-`ORRERY_FDB_DEV_PORT` and `ORRERY_FDB_DEV_DIR` (and the cluster description,
-the memory sizes and the `fdbserver` path) from the environment, and identifies
-an instance by its data directory rather than by its port, so a worktree that
-wants a cluster of its own can have one and `stop` will never reach anyone
-else's. Take the lease when you want the *shared* cluster — which is what the
-tests find when `ORRERY_FDB_CLUSTER_FILE` is unset — and stand up your own when
-you want to write to one freely.
+The `.fdb-dev/` cluster is on that list because agents share *one* of it, and on
+this machine there is no second one to stand up on a whim.
+`scripts/fdb-dev.sh` is written as if there were: `ORRERY_FDB_DEV_PORT`,
+`ORRERY_FDB_DEV_DIR`, the cluster description, the memory sizes and the
+`FDBSERVER` path all come from the environment, and an instance is identified by
+its data directory rather than by its port, so `stop` can never reach an
+instance it did not start. **But `start` cannot run here: there is no
+`fdbserver` binary on this box.** `foundationdb-clients` is installed — that is
+`fdbcli`, `fdbbackup` and `libfdb_c`, which is what the builds and
+`foundationdb-sys`'s bindgen actually need — and the *server* package is not.
+The `fdbserver` you can see in `ps` is root-owned and lives in a container.
+
+The dev cluster is that container: **`orrery-fdb`, image
+`foundationdb/foundationdb:7.3.63`, host networking, serving `127.0.0.1:4500`,
+with the main checkout's `.fdb-dev/data` bind-mounted at `/var/fdb/data`.** So
+the route to it is its cluster file, not the script — and that file lives in the
+*main checkout*, which is why a worktree cannot find it by looking around:
+
+```
+export ORRERY_FDB_CLUSTER_FILE="$(git rev-parse --path-format=absolute --git-common-dir)/../.fdb-dev/fdb.cluster"
+fdbcli -C "$ORRERY_FDB_CLUSTER_FILE" --exec 'status minimal'   # docker:docker@127.0.0.1:4500
+```
+
+Set it explicitly, and do not rely on the fallback: most fdb-gated tests look
+for a `.fdb-dev/fdb.cluster` by walking up from the crate directory, a walk that
+finds nothing from a worktree. The tests then `eprintln!("skipping: …")` and
+pass — green assertions about nothing, which is exactly the trap
+`scripts/fdb-tests.sh` exists to close. That script refuses to default the
+variable at all.
+
+**Never `stop`, `reset` or `pkill` any of it.** One container serves every agent
+on this box and the tests' default fallback, and it is a *shared development
+database*: whatever you write stays. Take the `fdb-dev` lease before you write
+to it. If you need a cluster you can clobber, run a second container on another
+port and point `ORRERY_FDB_CLUSTER_FILE` at its cluster file — an agent running
+its own instance needs no lease, and should not take one.
 
 So this arrangement is deliberately two-speed: **lanes are advisory, leases are
 exclusive.**

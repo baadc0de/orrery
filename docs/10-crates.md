@@ -125,6 +125,8 @@ Every serialized thing crosses this crate: `CellId`, intents, leases, attestatio
 
 **Features:** `postcard` (default encoding), `bitcode` (alternative, benchmarked per release), `u128-cells` (extended-range `CellId`, D5 — wire-incompatible, see [Edge cases](#edge-cases-and-failure-modes)). `bitcode` and `u128-cells` are declared but inert: `channels.rs` encodes with postcard unconditionally, and no `cfg` site reads `u128-cells`. A storage-side `hilbert` index (D5) is designed but declared by no manifest.
 
+The crate also carries a `metrics` module — unconditional, not a feature — whose contents are not wire types and are here on purpose: the D16 latency series names (`journal_commit_ms`, `bulk_ack_ms`, `intent_commit_ms`, `area_first_page_ms`, plus the ungated `gateway_bulk_server_ms`) and the shared histogram bucket lattice. Four processes have to agree on them — `orrery_persistd`'s journal recorder and gateway timer, the client-side histogram `p2-load` measures with, and the `p2-dashboard` gate that reconstructs percentiles from the JSONL artifact — and `orrery_protocol` is the only crate all four already depend on. It is a stepping stone toward D12's OpenTelemetry surface, not a resolution of it: when the OTel bridge lands these names become the instrument names and these boundaries the bucket hints.
+
 ```rust
 /// D5: offset-binary coords (21 bits/axis), Morton-interleaved into 63 bits,
 /// truncated to 3·level bits, then a single 1 sentinel bit, then zeros.
@@ -471,7 +473,7 @@ Landed. Defines `OrreryClientPlugins<R: Ruleset>` — a Bevy `PluginGroup` in de
 
 **Bevy-free** (D15). A library harness plus a reference binary: gateway (iroh endpoint at a well-known address), single-writer cell actors, the segmented append-only journal (group commit, ~2 ms fsync — via [fjall 3.x](https://github.com/fjall-rs/fjall) or raw segment files), FoundationDB checkpoint/restore on the 20 s jittered cadence, the lease registrar (CAS rows), intent validation (`Ruleset::validate_intent` + FDB serializable transactions, < 10 ms p99), the adjudication executor (`ReplayHarness<R>`), and hotspot cell splitting. Internal service-to-service traffic uses tonic/gRPC where boring is better (D12). Games do not run this binary — they link their rules into their own (next section).
 
-**Features:** `journal-fjall` (default) / `journal-raw`, `chain-replication` (default on — D11: journal follower, RPO ≤ ~100 ms), `hilbert` (storage keys via `orrery_protocol/hilbert`), `otel` (default).
+**Features:** the manifest default is `["journal-fjall", "chain-grpc"]`. `journal-fjall` backs the journal with fjall 3.x; `journal-raw` (declared, unimplemented) is the raw-segment alternative and only one may be set. `chain-grpc` adds the cross-process chain transport (hyper/prost/tonic); `chain-replication` is a non-default placeholder for future transport options — the in-process chain transport is always compiled in, so chain replication is not gated on it. `fdb` links the FoundationDB C client and enables `FdbCheckpointStore` and the cluster-gated test tier. An `otel` feature and a `hilbert` storage-key feature are designed and declared by no manifest.
 
 ```rust
 pub struct PersistdHarness<R: Ruleset> { /* … */ }
@@ -563,7 +565,7 @@ use mygame_rules::MyRules;               // impl Ruleset — no Bevy anywhere be
 use orrery_persistd::{PersistdConfig, PersistdHarness};
 
 fn main() -> anyhow::Result<()> {
-    orrery_persistd::telemetry::init()?;                 // OpenTelemetry (D12)
+    orrery_persistd::telemetry::init()?;                 // OpenTelemetry (D12) — designed, not built
     let cfg = PersistdConfig::load("persistd.toml")?;
     let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
     rt.block_on(PersistdHarness::new(MyRules::default(), cfg)?.run())
@@ -610,7 +612,7 @@ fn main() {
 
 ## Versioning and release policy
 
-- **Lockstep versions.** All `orrery_*` crates (facade included) share one version and are released together, Bevy-style; pre-1.0, a minor bump is the breaking-change unit. `xtask release` bumps the workspace atomically and runs the wire-corpus tests.
+- **Lockstep versions.** All `orrery_*` crates (facade included) share one version and are released together, Bevy-style; pre-1.0, a minor bump is the breaking-change unit. All fourteen currently sit at `0.1.0`. The release automation that would enforce it — an `xtask release` that bumps the workspace atomically and runs a wire-corpus test — is designed and unbuilt: there is no `xtask/` in the tree and no wire-corpus tests, so the invariant is held by hand today.
 - **Pinned upstreams per release.** `[workspace.dependencies]` carries the D14 pin table; the churn-prone trio is pinned exactly — `lightyear = "=0.29.0"`, `bevy_replicon = "=0.42.1"`, `aeronet = "=0.21.0"` — because [lightyear shipped four breaking releases in ten months](https://github.com/cBournhonesque/lightyear/releases) (0.25→0.29: Predicted/Confirmed entity merge, timeline refactor, tick `u16`→`u32`). [iroh is semver-stable since 1.0](https://crates.io/crates/iroh) and gets a caret req. Upstream upgrades land only at Orrery minor releases, each with a migration note.
 - **Wire compatibility is decoupled from crate versions.** `orrery_protocol::PROTOCOL_VERSION` governs interop; services accept version N and N−1 so the cluster always deploys ahead of clients, enforced by `GatewayMsg::protocol_accepted` against the version a client names in `GatewayMsg::VersionedHello` — the unversioned `GatewayMsg::Hello` is still accepted unchecked, so enforcement is opt-in until that variant is retired. A byte-golden corpus of encoded messages guarding decode compatibility across releases is designed and unbuilt, deferred until the wire format settles.
 - **`RULES_DIGEST` is exact-match**, versioned by the game, orthogonal to both of the above.
