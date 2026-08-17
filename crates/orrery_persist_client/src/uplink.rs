@@ -271,13 +271,29 @@ impl UplinkScheduler {
     /// A nack (invariant violation, stale epoch) drops the pending diff — the
     /// gateway rejected it, so resending is pointless. The caller is expected
     /// to surface the rejection to the game.
+    ///
+    /// A nack is **not** a bulk-ack latency sample. `bulk_ack_ms` is the D16
+    /// gate on how long a durable write takes to be acknowledged; a refusal
+    /// round trip never touched the journal and is systematically shorter. The
+    /// two were folded together until a P2 evidence run reported a p99 of
+    /// 1.25–1.75 ms on 541 408 diffs and *zero* successful writes — the gate
+    /// passed on the latency of being told no. The refusal is still surfaced,
+    /// as a count, by every caller that keeps one.
     pub fn on_nack(&mut self, entity: PersistId, tick: Tick) {
         self.on_nack_at(entity, tick, Instant::now());
     }
 
     /// Record a gateway nack using its wire-receipt instant.
+    ///
+    /// `received_at` is retained in the signature: the caller stamps replies on
+    /// the wire, and a future ungated `bulk_nack_ms` series would be measured
+    /// from exactly this instant. It deliberately feeds no gated histogram
+    /// today — see [`on_nack`](Self::on_nack).
     pub fn on_nack_at(&mut self, entity: PersistId, tick: Tick, received_at: Instant) {
-        self.record_reply_latency(entity, tick, received_at);
+        let _ = received_at;
+        // Drop the send-time bookkeeping for this diff without sampling it, so
+        // a nacked send cannot later be credited to a duplicate reply.
+        self.sent_at.remove(&(entity, tick));
         if let Some(state) = self.entities.get_mut(&entity) {
             if state.pending.as_ref().is_some_and(|d| d.tick == tick) {
                 state.pending = None;
@@ -626,6 +642,35 @@ mod tests {
             sched.ack_latency().max().unwrap() < Duration::from_millis(10),
             "handler delay leaked into wire latency"
         );
+    }
+
+    #[test]
+    fn nacks_never_enter_the_gated_bulk_ack_histogram() {
+        // D16's `bulk_ack_ms` gate is on durable acknowledgement latency. A
+        // refusal round trip never reached the journal and is systematically
+        // faster, so counting it let a run of 541 408 rejections and zero
+        // writes report a healthy p99. The nack must still clear the pending
+        // diff — it just must not be a sample.
+        let cfg = cfg();
+        let mut sched = UplinkScheduler::new();
+        let entity = PersistId::new(1);
+        sched.register(entity, 4.0);
+        sched.queue(diff(1, 1, b"hp=50"));
+        sched.flush(&cfg, t(0));
+        sched.flush(&cfg, t(250));
+
+        sched.on_nack_at(entity, Tick::new(1), Instant::now());
+        assert_eq!(
+            sched.ack_latency().total(),
+            0,
+            "a nack was folded into the gated bulk-ack series"
+        );
+        assert_eq!(sched.last_acked_tick(entity), None);
+
+        // And a duplicate ack for the same nacked send cannot resurrect a
+        // sample from the dropped send instant.
+        sched.on_ack_at(entity, Tick::new(1), false, Instant::now());
+        assert_eq!(sched.ack_latency().total(), 0);
     }
 
     #[test]

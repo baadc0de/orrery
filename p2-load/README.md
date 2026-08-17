@@ -24,12 +24,35 @@ one binary, one `--json` contract, tracing on stderr, JSON on stdout.
   (`orrery_persist_client`) at `--diff-hz`, flushed at 20 Hz against the D16
   1024-byte flush budget (`size = payload + 64`), and fanned out over
   `--sessions` iroh connections.
-- **Moves entities across cells.** Movement is a closed-form trajectory
-  program (docs/12-world-seeding.md §12.3): each entity walks a small circle
-  centered on its inventory cell, radius just over one cell, so cell
-  crossings are continuous and the diff stream exercises cross-cell routing.
-  A recorded trace of 10k entities at 60 Hz for 30 minutes is gigabytes; the
-  program is a few hundred bytes.
+- **Claims a lease per entity, before any load.** Every bulk write the
+  gateway routes is fenced (`route_session_diff` sets
+  `strict_authority: true`, unconditionally), so a diff without a granted
+  `(lease_id, authority_seq)` is rejected before the journal. The rig sends a
+  strong `Explicit` `LeaseMsg::Claim` per entity on the session that will
+  write it, paced by the registrar's own per-`NodeId` bucket (64 burst, then
+  20/s), and renews with a batched `Heartbeat` every 3 s against the 10 s
+  TTL. The phase costs about two seconds at any scale up to the demo's
+  10 000 entities. **There is no unleased write path**: a denied claim, a
+  refused renewal, or a lease-bearing NACK fails the run. That fallback is
+  precisely how a run of 541 408 rejections passed for a durability
+  measurement.
+- **Needs a seeded world.** A claim names the entity's *committed* cell and
+  the registrar refuses one it cannot resolve, so an entity that was never
+  journaled cannot be claimed and therefore cannot be written. Seed with
+  `orrery-seed` and pass the emitted manifest as `--manifest`; `--entities`
+  synthesizes a placement that only works against a world seeded to match it
+  (`persistd --dev-seed <count>@<cell>` for a volatile harness).
+- **Writes at the committed cell.** Entities do not move between cells. A
+  leased writer cannot: `apply_fenced` admits a diff only where
+  `by_cell[entity] == record.cell`, and the gateway answers a client-sent
+  `LeaseMsg::Rekey` with an unconditional `Deny{NotEligible}`. Cross-cell
+  coverage comes from the *placement* spanning ≥ `--cells` distinct cells,
+  which is where that guarantee always lived.
+- **One NodeId per session.** The gateway's peer registry is keyed by
+  `NodeId` and only a peer's newest session is current, so N connections from
+  one endpoint leave N−1 sessions whose every diff is nacked before routing.
+  Each session binds its own endpoint; with `--secret-key` the family of
+  identities is derived deterministically from it.
 - **Interleaves intents.** `--intent-mix trade=0.02,craft=0.01` upgrades 2%
   of diff sends to a `trade` intent and 1% to a `craft` intent (the §12.3
   `intent_mix` semantics: fractions of the diff rate, not additive). Intents
@@ -117,19 +140,43 @@ wire form).
 
 ## Usage
 
-```sh
-# Start a single-node gateway (in-memory stores for a smoke run; add
-# --fdb-cluster-file for the durable tier):
-persistd --dir /tmp/p2-node --secret-key <hex>
-# …prints {"node_id":"…","endpoint_addr":"EndpointAddr { … }"} on stdout.
+The rig writes under a lease, and a lease needs an entity that already
+exists durably, so **the world is seeded first**. Two ways, and only the
+first is a durable one:
 
-# Run the load (values from the persistd line above):
+```sh
+# Durable: seed FDB, then take the seeder's manifest as the inventory.
+ORRERY_FDB_CLUSTER_FILE=/etc/foundationdb/fdb.cluster \
+  orrery-seed apply crates/orrery_seed/scenarios/p2demo.toml \
+  --profile demo --allow-opaque --single-grid
+ORRERY_FDB_CLUSTER_FILE=/etc/foundationdb/fdb.cluster \
+  orrery-seed verify crates/orrery_seed/scenarios/p2demo.toml \
+  --profile demo --single-grid --emit-manifest manifest.json
+
+persistd --dir /tmp/p2-node --secret-key <hex> \
+  --fdb-cluster-file /etc/foundationdb/fdb.cluster --issuer-key 1@<pub>
+# …prints {"node_id":"…","bind_addr":"…"} on stdout.
+
 p2-load --gateway <node_id> --addr 127.0.0.1:7777 \
-        --entities 1000 --cells 128 --sessions 13 \
+        --manifest manifest.json --sessions 125 \
+        --issuer-secret <hex> --issuer-key-id 1 \
         --duration-secs 60 --json --ack-log acks.jsonl > run.jsonl
 
 # Gate it:
 p2-dashboard --gate run.jsonl
+```
+
+```sh
+# Volatile smoke run: --dev-seed spawns placeholder entities through the
+# actor, which is what gives them a committed cell. It is refused whenever
+# --fdb-cluster-file is set, so this configuration is not durable and is not
+# the gate.
+persistd --dir /tmp/p2-node --secret-key <hex> --allow-volatile-leases \
+  --issuer-key 1@<pub> --dev-seed 1000@0,0,0@21
+p2-load --gateway <node_id> --addr 127.0.0.1:7777 \
+        --entities 1000 --cells 1 --sessions 13 \
+        --issuer-secret <hex> --issuer-key-id 1 \
+        --duration-secs 60 --json --ack-log acks.jsonl > run.jsonl
 ```
 
 For the P2 static mirror topology, start the follower first, then the primary
