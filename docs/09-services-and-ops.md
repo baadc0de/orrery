@@ -181,19 +181,38 @@ OpenTelemetry everywhere (D12): traces on the intent path (client → gateway �
 
 SLO / metrics table (targets from D16 where given; alert thresholds are ops defaults, tune per game):
 
+Every row's **Source** names the process that actually produces the number
+today, or says plainly that nothing does. Three of these rows read "persistd
+gateway" for years while their only producer repo-wide was the `p2-load` rig:
+a client-observed round trip is measured at the client, and a name that
+mislocates it sends an operator to the wrong process on the worst day.
+
 | Metric | Source | Target / SLO | Alert |
 |---|---|---|---|
-| Bulk ack p99, client-observed (in-region) | persistd gateway | **< 5 ms** | > 10 ms for 5 min |
-| Intent commit p99 (in-region) | persistd gateway | **< 10 ms** | > 25 ms for 5 min |
-| Area first page-in | persistd gateway | **< 50 ms** | p95 > 100 ms |
+| Bulk ack p99, client-observed (in-region) | client — `orrery_persist_client`'s uplink scheduler, exercised by the `p2-load` rig (`bulk_ack_ms`) | **< 5 ms** | > 10 ms for 5 min |
+| Intent commit p99 (in-region) | client — `orrery_persist_client`'s intent queue, exercised by the `p2-load` rig (`intent_commit_ms`) | **< 10 ms** | > 25 ms for 5 min |
+| Area first page-in | client — `Subscribe` → first `AreaPage`, `p2-load` rig (`area_first_page_ms`) | **< 50 ms** | p95 > 100 ms |
+| Gateway server spans: bulk, intent, area first page | persistd gateway (`gateway_bulk_server_ms`, `gateway_intent_server_ms`, `gateway_area_first_page_server_ms`) | none — attribution, not a target | server span approaching the client target above it |
+| Report outcomes and refusals | persistd gateway (`gateway_report`) | shadow mode: refusals explained, not zero | `refused_no_adjudicator` ≠ 0 on a cluster that linked a `Ruleset` |
+| Authority: duplicate writes, handoffs, timeouts | persistd gateway (`gateway_authority`, seven counters) | `duplicate_authority` = **0** | any `duplicate_authority`; `handoff_timed_out` rising = zombie host (§10) |
 | Hole-punch success rate | `orrery_net` client telemetry | ~90% direct | < 85% sustained |
 | Relayed-connection ratio | client telemetry + relay egress | ~5–10% | > 12% per region |
 | Rollback frequency / depth | `orrery_predict` monitor | game-tuned baseline | sustained deviation from baseline (also a witness signal, D10) |
 | Discrepancy report rate | `orrery_witness` → audit | baseline per CCU | spike = cheat wave or bad tolerance bands |
 | False-positive strike rate | adjudication outcomes | ≈ 0 (shadow mode first, D17.3) | any confirmed FP |
-| Journal commit (server-internal) / chain-follower lag | persistd | **< 2 ms** (adaptive group commit: fsync-when-idle, ~0.5 ms batching under load) / ≤ 100 ms | commit p99 > 2 ms or follower lag > 1 s |
+| Journal commit (server-internal) | persistd (`journal_commit_ms`, both primary and follower — each reports its *own* journal) | **< 2 ms** (adaptive group commit: fsync-when-idle, ~0.5 ms batching under load) | commit p99 > 2 ms |
+| Chain-follower lag | persistd, **in-process only** — `ChainSnapshot` carries `lag_bytes`, `progress_age_ms`, `failed_pushes` and `behind`; `orrery_protocol::metrics::CHAIN_SERIES` names the wire spellings and nothing writes them to the artifact yet | ≤ 100 ms | follower lag > 1 s |
 | FDB load ratio | FDB metrics | < 75% | > 75% |
 | Lease-expiry orphan rate | lease registrar | baseline | spike = peer-crash wave or netsplit |
+
+**How these reach an operator today, and how they do not.** `persistd`
+collects every gateway counter unconditionally — the flag opens a sink, it
+does not start the measurement — and `--metrics-jsonl` appends them, plus the
+latency `sample_batch` records, to a file. That is the whole surface: there is
+no scrape endpoint and no admin socket, so on a node started without the flag
+these counters are correct, live, and reachable by nothing until a restart.
+The OTel bridge above is what closes that, and until it lands "turn on
+metrics" means "restart with `--metrics-jsonl`".
 
 **Audit pipeline**: discrepancy reports (evidence bundles) and periodic state-hash cross-checks stream from persistd's adjudication executor into ClickHouse-or-similar (ops choice, D12). It answers: which accounts generate discrepancies, whether tolerance bands (ε_pos = 1 cm, ε_vel = 1 cm/s, 250 ms window) are producing honest-player noise, and post-incident forensics joined against the journal-derived event archive (D11). The strike pipeline launches in **shadow mode** — telemetry only — until false-positive rates are characterized (D17.3).
 

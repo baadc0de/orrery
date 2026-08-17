@@ -67,19 +67,38 @@ One JSON object per line on stdout; logs on stderr. Three record kinds:
 {"type":"run_footer","note":"duration elapsed; diffs=… acks=… intents=…"}
 ```
 
-`sample.series` is one of the four gated D16 keys:
+`sample.series` is one of the four gated D16 keys. Three of them the rig
+measures itself, from the client side; the fourth it cannot see:
 
 | series               | source                                                  |
 |----------------------|---------------------------------------------------------|
-| `journal_commit_ms`  | **server-internal** — see "What this does not claim"    |
-| `bulk_ack_ms`        | `UplinkScheduler::on_ack` (send → durable-ack round trip) |
-| `intent_commit_ms`   | `IntentQueue::on_ack` (submit → commit round trip)      |
-| `area_first_page_ms` | `Subscribe` send → first `AreaPage`, per session        |
+| `journal_commit_ms`  | **persistd** — the journal's group-commit recorder, appended by `--metrics-jsonl`; see "What this does not claim" |
+| `bulk_ack_ms`        | this rig — `UplinkScheduler::on_ack` (send → durable-ack round trip) |
+| `intent_commit_ms`   | this rig — `IntentQueue::on_ack` (submit → commit round trip)      |
+| `area_first_page_ms` | this rig — `Subscribe` send → first `AreaPage`, per session        |
 
-persistd appends a fifth series, `gateway_bulk_server_ms` (receipt through
-send call, the server-side half of `bulk_ack_ms`), to the same artifact. D16
-sets no target for it; `p2-dashboard` folds and reports it and never gates on
-it. The rig itself never emits it.
+persistd appends three further series to the same artifact, none of which the
+rig ever emits and none of which D16 gates:
+
+| series                             | source                                                        |
+|------------------------------------|---------------------------------------------------------------|
+| `gateway_bulk_server_ms`           | persistd — diff receipt → ack send call                        |
+| `gateway_intent_server_ms`         | persistd — `SubmitIntent` receipt → reply send call             |
+| `gateway_area_first_page_server_ms`| persistd — `Subscribe` receipt → first `AreaPage` send call     |
+
+Each is the server-side half of the gated round trip above it, and each has
+its **own name on purpose**. `p2-dashboard` folds by series name into one
+histogram per name, with no source field, and `scripts/p2-kill9-gate.sh`
+concatenates this rig's file with persistd's before gating — so a server span
+recorded under a gated name would be folded into the client's histogram,
+*lower* the gated p99 (a server span is strictly shorter than the round trip
+containing it), and pass a gate it never measured. The gate folds and reports
+these three and never fails on them.
+
+persistd also appends non-latency counter records — `gateway_authority`,
+`gateway_bulk_stage_delta`, `gateway_intent`, `gateway_area` and
+`gateway_report` — which carry no `series` field and which the dashboard
+ignores.
 
 The names, the bucket boundaries and the reconstruction rule are **one
 definition** — `orrery_protocol::metrics`, re-exported through
