@@ -14,8 +14,20 @@
 //!
 //! Real: `orrery_spatial`'s hysteresis, AOI and bounded interest selection;
 //! `orrery_net`'s send path, channel policy and upload meter with wire-byte
-//! accounting; `orrery_conformance`'s reference ruleset driving the motion.
-//! Every number the report prints is produced by shipping code.
+//! accounting; `orrery_games`' Skirmish driving the motion. Every number the
+//! report prints is produced by shipping code.
+//!
+//! The ruleset used to be `orrery_conformance`'s reference kernel, and swapping
+//! it was not a rename. The corpus kernel is deliberately *not* a game: it
+//! publishes no archetype limits, so `Ruleset::invariants()` falls through to
+//! `orrery_core`'s `&[]` default and **every player-hour this harness had ever
+//! accumulated ran stage 1 against an empty slice**. `SignalTally`'s
+//! `invariant_breaches` was a dead term in the false-positive sum, and "no
+//! false-positive discrepancy signal against an honest peer" was measuring
+//! log re-execution alone. Skirmish publishes five checks — speed cap,
+//! acceleration cap, teleport, fire rate, value range — and they run on every
+//! sample every peer receives. It also ships its own cheats, which is what
+//! makes the conviction leg below possible at all.
 //!
 //! Not real: the socket. Peers are coupled by an in-process router. Transport
 //! is P0's criterion and is already met; what P1 asks about is what a peer
@@ -27,7 +39,8 @@
 //! because forming one is P3's criterion and is separately proven; what is
 //! under test here is what a peer does with a roster.
 //!
-//! # Witnessing (`--witness`) is P4's input, not yet P4's criterion
+//! # Witnessing (`--witness`) is one half of P4's criterion; `--cheat` is the
+//! other
 //!
 //! With `--witness` every peer streams a real signed log to its witness set and
 //! re-executes what it is streamed. Every bot is honest by construction — each
@@ -35,7 +48,51 @@
 //! false positive, which is what makes the count meaningful without a separate
 //! oracle for who was cheating.
 //!
-//! It works and it found real defects. Both of the reasons it could not
+//! That measures the false-positive rate and says nothing about whether the
+//! pipeline catches anybody, and the two are only evidence together: a witness
+//! tuned until it accuses nobody passes the honest legs perfectly. `--cheat`
+//! closes it. It hands N peers a tampered `Skirmish` build, arms every witness
+//! (`--enforce`, implied), and re-runs each filed `DiscrepancyReport` through
+//! an in-process adjudicator built on `orrery_witness::verify_report` and
+//! `orrery_core::verify_bundle` — which believes nothing the reporter said.
+//!
+//! Measured at the criterion's own population, `--peers 8 --seconds 300
+//! --impaired --witness --cheat speed`: the modified peer diverges on **tick 0**
+//! and is confirmed on **tick 32**, against a 180-tick adjudication window. 41
+//! reports are filed against it, every one of them `Verdict::Confirms` under
+//! independent re-execution, and **zero** against any of the seven honest peers.
+//! The same island with every witness armed and nobody modified (`--witness
+//! --enforce`) files nothing at all.
+//!
+//! Three things about that number are worth keeping.
+//!
+//! **The cheat had to be aimed.** `Tamper::SpeedMultiplier` raises an
+//! archetype's ceilings by 1.5×, and this roam requests `accel_mmss` 60 000 —
+//! *exactly* the interceptor's `max_accel_mmss`. On that slot both builds clamp
+//! to the same number and the tampered peer is byte-identical to an honest one:
+//! nothing to detect, nothing filed, and every conviction clause passing over a
+//! swarm in which nothing happened. Modified peers are pinned to the cruiser
+//! slot, whose ceiling is 20 000, and `bot::tests` asserts both halves of that.
+//! Neither speed ceiling ever binds — 32 m/s against 120 and 60 — so the
+//! acceleration clamp is the whole of this cheat at these parameters.
+//!
+//! **It stops filing after one window, and that is correct.** A subject that
+//! diverges permanently never agrees with its witness again, so `audit_window`
+//! runs out of agreed claims 180 ticks past the anchor and everything after is
+//! `escalations_unservable` — 4026 of them over five minutes at eight peers.
+//! The convictions all happen in the first 32 ticks.
+//!
+//! **Stage 1 never fires on it.** The cheat is worth 167 mm/s of velocity per
+//! *thrusting* tick, and a cruising bot thrusts about one tick in nineteen, so
+//! across a 20 Hz sample gap the change stays well inside
+//! `skirmish/acceleration-cap`'s per-tick allowance. It is caught by
+//! re-execution and only by re-execution — which is the argument for stage 1
+//! being a filter rather than a verdict, arriving from the direction the
+//! `DamageInflation` cheat was supposed to make it.
+//!
+//! ## The honest half
+//!
+//! `--witness` works and it found real defects. Both of the reasons it could not
 //! accumulate P4's 500 honest player-hours are now closed: the repair budget
 //! bounded the traffic that reached 8.7 Mbps against a 1 Mbps allowance, and
 //! the cost that grew faster than the peer count is linear again — 32 peers
@@ -51,9 +108,11 @@
 //! frame each rather than anything about the repairs.
 //!
 //! Since it holds, it gates: `scripts/p1-swarm-gate.sh` runs the impaired hour
-//! with `--witness` as its third leg, nightly and blocking, and that is the only
-//! place in the tree the witness pipeline runs at all. Every clause guarded by
-//! `SwarmConfig.witnessing` was dead code before it existed.
+//! with `--witness` as its third leg, then the conviction and control islands as
+//! its fourth and fifth — nightly and blocking, and the only place in the tree
+//! the witness pipeline runs at all. Every clause guarded by
+//! `SwarmConfig.witnessing` was dead code before the third leg existed, and the
+//! six guarded by `SwarmReport::conviction` were dead code before the fourth.
 //!
 //! # What thirty-two peers cost, and which dial paid for it
 //!
@@ -120,17 +179,19 @@
 //! since the send cadence is 20 Hz of sim ticks. An hour of play costs what it
 //! costs to compute, and a run is reproducible.
 
+mod adjudicate;
 mod bot;
 mod chain;
 mod profile;
 mod router;
 mod swarm;
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use clap::Parser;
 
+use orrery_games::game::Tamper;
 use router::Impairment;
-use swarm::{Criterion, Swarm, SwarmConfig};
+use swarm::{CheatSpec, Criterion, Swarm, SwarmConfig};
 
 /// The D6/D16 peer upload budget.
 const BUDGET_BITS: u64 = 1_000_000;
@@ -227,6 +288,34 @@ struct Args {
     #[arg(long)]
     witness: bool,
 
+    /// Field modified clients: `<tamper>[:count]`, e.g. `speed` or `speed:2`.
+    ///
+    /// P4's demo criterion, and the half `--witness` alone cannot reach. It
+    /// hands `count` peers a tampered `Skirmish` build and re-runs each filed
+    /// report through an in-process adjudicator that believes nothing the
+    /// reporter said. Implies `--witness` and `--enforce`: without a witness
+    /// there is nobody to detect anything, and in shadow mode nobody files.
+    ///
+    /// The tampers are `orrery_games`' three. Only `speed` is expressible by
+    /// this roam — the bots never fire, so an inflated damage roll and an
+    /// ignored cooldown change nothing they do — and a cheat that turns out to
+    /// be inert fails the "actually diverges" clause rather than passing every
+    /// clause over byte-identical state.
+    #[arg(long, value_name = "TAMPER[:COUNT]")]
+    cheat: Option<String>,
+
+    /// Take every witness out of shadow mode: file what it raises.
+    ///
+    /// Shadow mode is P4's posture and the default (D17 risk 3) — check
+    /// everything, file nothing, until the false-positive rate has been
+    /// measured. That makes "an unmodified swarm files no report at all" a
+    /// tautology on every honest leg, which is what this flag exists to break:
+    /// an entirely honest swarm with every witness *armed* filing zero is a
+    /// measurement, and it is the control the conviction leg is only evidence
+    /// against.
+    #[arg(long)]
+    enforce: bool,
+
     /// Stamp the report with the wall-clock second the run started.
     ///
     /// Off by default, and outside the report's identity block when on: a run
@@ -241,12 +330,54 @@ struct Args {
     self_test: bool,
 }
 
+/// Parse `--cheat <tamper>[:count]`.
+///
+/// The names are the ones `orrery_games` prints, shortened at the first hyphen:
+/// a flag value and a `Tamper::name` that drift apart is how a gate ends up
+/// fielding a different cheat than its comment says it does.
+fn parse_cheat(spec: &str) -> Result<CheatSpec> {
+    let (name, count) = match spec.split_once(':') {
+        Some((name, count)) => (
+            name,
+            count
+                .parse::<usize>()
+                .with_context(|| format!("{count:?} is not a peer count"))?,
+        ),
+        None => (spec, 1),
+    };
+    let tamper = Tamper::ALL
+        .iter()
+        .copied()
+        .find(|tamper| tamper.name() == name || tamper.name().starts_with(&format!("{name}-")))
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "unknown tamper {name:?}; known: {}",
+                Tamper::ALL
+                    .iter()
+                    .map(|tamper| tamper.name())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        })?;
+    if count == 0 {
+        bail!("a cheat count of zero fields no modified client at all");
+    }
+    Ok(CheatSpec { tamper, count })
+}
+
 fn main() -> Result<()> {
     let args = Args::parse();
 
     if args.self_test {
         return self_test();
     }
+
+    let cheats = args
+        .cheat
+        .as_deref()
+        .map(parse_cheat)
+        .transpose()
+        .context("--cheat")?;
 
     let late_join_tick = args
         .late_join_at
@@ -266,7 +397,16 @@ fn main() -> Result<()> {
         },
         seed: args.seed,
         late_join_tick,
-        witnessing: args.witness,
+        // `--cheat` implies `--witness`: a modified client in a swarm with no
+        // witness is a peer nobody is re-executing, and every conviction clause
+        // would fail for want of a detector rather than for want of a
+        // conviction.
+        witnessing: args.witness || cheats.is_some(),
+        cheats,
+        // Implied by `--cheat` for the same reason `--witness` is: a modified
+        // client every witness is forbidden to file against is detected and
+        // never convicted.
+        enforcing: args.enforce || cheats.is_some(),
         started_at_unix_secs: args.stamp_wall_clock.then(|| {
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -379,6 +519,43 @@ fn main() -> Result<()> {
             },
         );
     }
+    if let Some(conviction) = &report.conviction {
+        eprintln!(
+            "p1-swarm: cheat {} on {} peer(s): {} diverged, {} convicted on replay; \
+             worst detection {} ticks (window {})",
+            conviction.tamper,
+            conviction.tampered_peers,
+            conviction.tampered_peers_that_diverged,
+            conviction.tampered_peers_convicted,
+            conviction
+                .worst_detection_ticks
+                .map_or_else(|| "n/a".to_owned(), |ticks| ticks.to_string()),
+            orrery_protocol::MAX_ADJUDICATION_TICKS,
+        );
+        // The two report counts side by side, for the same reason coverage is
+        // printed beside the false-positive count: a pipeline that convicts by
+        // accusing everybody produces a fine number in the first column.
+        eprintln!(
+            "p1-swarm: {} reports filed against the modified peer(s), {} against honest peers; \
+             {} adjudicated — {} confirms, {} exonerates, {} evidence-forged, {} unadjudicable",
+            conviction.reports_against_tampered,
+            conviction.reports_against_honest,
+            conviction.adjudicated,
+            conviction.confirms,
+            conviction.exonerates,
+            conviction.evidence_forged,
+            conviction.unadjudicable,
+        );
+    }
+    if report.witnessing {
+        eprintln!(
+            "p1-swarm: escalations — {} filed, {} shadowed, {} unservable, {} unidentified",
+            report.total_escalations_filed,
+            report.total_escalations_shadowed,
+            report.total_escalations_unservable,
+            report.total_escalations_unidentified,
+        );
+    }
     if let Some(join) = &report.late_join {
         eprintln!(
             "p1-swarm: late joiner tracked {} of {} roster peers, {} of which were in its neighbourhood",
@@ -396,6 +573,7 @@ fn main() -> Result<()> {
         min_cells: args.min_cells,
         max_pops: args.max_pops,
         max_shed: args.max_shed,
+        ..Criterion::default()
     });
     if failures.is_empty() {
         eprintln!("p1-swarm: every clause of the P1 criterion holds");
@@ -431,6 +609,16 @@ fn self_test() -> Result<()> {
         // The third witnessing clause, and the one the other two are unreadable
         // without: a witness that has stopped watching also accuses nobody.
         "the witness keeps watching for the whole run",
+        // P4's demo criterion, the conviction half. The first is the
+        // anti-vacuity guard: `Tamper::SpeedMultiplier` is inert on an
+        // interceptor slot at this roam's requested acceleration, so without it
+        // the three that follow would hold over byte-identical state.
+        "the modified client actually diverges from the shipping rules",
+        "a modified client is convicted on replay",
+        "no report is filed against an honest peer",
+        "a modified client is convicted within one adjudication window",
+        "an unmodified swarm files no report at all",
+        "every witness can sign what it raises",
         "the link drains",
         "the late-join check is not vacuous",
         "interest churn absorbed without visible proxy pops",
@@ -448,11 +636,45 @@ fn self_test() -> Result<()> {
             bail!("self-test: criterion clause absent: {clause}");
         }
     }
-    if !include_str!("bot.rs").contains("OrrerySpatialPlugin") {
+    let bot = include_str!("bot.rs");
+    if !bot.contains("OrrerySpatialPlugin") {
         bail!("self-test: the harness no longer runs the real spatial stack");
     }
-    if !include_str!("bot.rs").contains("send_peer_packets") {
+    if !bot.contains("send_peer_packets") {
         bail!("self-test: the harness no longer runs the real send path");
+    }
+    // The four wires the conviction half hangs off, each of which fails
+    // *silently* if it goes: a swarm on the corpus kernel runs stage 1 against
+    // an empty slice, a witness with no identity counts
+    // `escalations_unidentified` and files nothing, one left in shadow mode
+    // assembles windows and files nothing, and a filed report nobody re-runs is
+    // an accusation rather than a verdict. None of them turns a green run red
+    // on its own, which is why they are asserted structurally.
+    if !bot.contains("Skirmish") {
+        bail!("self-test: the bots no longer play a ruleset that publishes stage-1 invariants");
+    }
+    if !bot.contains("WitnessIdentity") {
+        bail!("self-test: no witness can sign a report; escalation stops at `unidentified`");
+    }
+    if !bot.contains("shadow_mode: !enforcing") {
+        bail!(
+            "self-test: shadow mode is no longer a parameter; a conviction leg would file nothing"
+        );
+    }
+    if !bot.contains("honest_shadow") {
+        bail!("self-test: the dual-execution probe is gone; detection latency has no t = 0");
+    }
+    if !include_str!("adjudicate.rs").contains("verify_bundle") {
+        bail!(
+            "self-test: filed reports are no longer re-executed; a verdict would be the \
+               reporter's own word"
+        );
+    }
+    if !bot.contains("Archetype::Cruiser") {
+        bail!(
+            "self-test: modified peers are no longer pinned to the low-limit archetype; the \
+               speed cheat is inert on the other one"
+        );
     }
     eprintln!("p1-swarm: self-test passed — every criterion clause present, real stack wired");
     Ok(())

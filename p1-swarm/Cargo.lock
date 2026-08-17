@@ -3427,20 +3427,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7c87def4c32ab89d880effc9e097653c8da5d6ef28e6b539d313baaacfbafcbe"
 
 [[package]]
-name = "orrery_conformance"
-version = "0.1.0"
-dependencies = [
- "blake3",
- "libm",
- "orrery_core",
- "orrery_protocol",
- "rand_chacha",
- "rand_core 0.9.5",
- "serde",
- "serde_json",
-]
-
-[[package]]
 name = "orrery_core"
 version = "0.1.0"
 dependencies = [
@@ -3453,6 +3439,18 @@ dependencies = [
  "rand_chacha",
  "rand_core 0.9.5",
  "serde",
+]
+
+[[package]]
+name = "orrery_games"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "libm",
+ "orrery_core",
+ "orrery_protocol",
+ "rand_chacha",
+ "rand_core 0.9.5",
 ]
 
 [[package]]
@@ -3536,8 +3534,8 @@ dependencies = [
  "glam",
  "iroh-base",
  "libm",
- "orrery_conformance",
  "orrery_core",
+ "orrery_games",
  "orrery_net",
  "orrery_protocol",
  "orrery_spatial",

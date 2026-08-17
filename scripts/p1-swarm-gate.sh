@@ -56,6 +56,21 @@ if [[ ${1:-} == --self-test ]]; then
   has '--impaired --witness' \
     || die 'self-test: the witnessed impaired leg is absent; the P4 clauses are dead code without it'
   has '--max-shed' || die 'self-test: the witnessed leg has lost its own shed allowance'
+  # The conviction leg, by the flag that arms it. `--cheat` is what fields a
+  # modified client, takes every witness out of shadow mode and turns the filed
+  # reports over to an adjudicator; without it the six clauses of P4's demo
+  # criterion are guarded by a `None` and pass by never being asked, exactly as
+  # the three witnessing clauses did before `--witness` ran anywhere.
+  has '--cheat speed' \
+    || die 'self-test: the conviction leg is absent; P4 demo-criterion clauses are dead code without it'
+  # The population the criterion names, and the only place in this file it
+  # appears. The witnessed legs above run 32.
+  has '--peers 8' || die 'self-test: the demo criterion 8-peer island is not run'
+  # The control, by the flag that makes it one. Shadow mode files nothing on
+  # every other leg here, so an honest island run *without* this proves nothing
+  # about false-positive filing that shadow mode had not already decided.
+  has '--witness --enforce' \
+    || die 'self-test: the armed honest control is absent; "files nothing" would be shadow mode restating itself'
   cargo run -q --manifest-path "$(dirname "$0")/../p1-swarm/Cargo.toml" -- --self-test \
     || die 'self-test: the harness no longer covers every criterion clause'
   echo "$NAME: self-test passed"
@@ -131,5 +146,47 @@ note 'witnessed run: the same impaired hour, every peer re-executing its witness
   --json "$OUT/witnessed.json" \
   || die 'the P4 witnessing clauses did not hold over the impaired hour'
 
+# The conviction leg: P4's demo criterion stated literally — "a modified client
+# applying a 1.5× speed multiplier joins an 8-peer island: detected, escalated,
+# replay-adjudicated with a deviation verdict within one adjudication window of
+# the violation". The three legs above measure the *other* half, the
+# false-positive rate over honest play; this one measures whether the pipeline
+# catches anybody at all. Neither is evidence without the other: a witness tuned
+# until it accuses nobody passes the first three trivially.
+#
+# `--cheat` implies `--witness` and takes every peer out of shadow mode, so this
+# is the only leg in the tree where a report is actually filed and adjudicated.
+# Six clauses live here and nowhere else — that the cheat diverges at all, that
+# it is convicted on replay, that no honest peer is reported, that the
+# conviction lands inside the 180-tick window, that an unmodified swarm files
+# nothing, and that every witness holds a key it can sign with.
+#
+# Eight peers and five minutes, which is the criterion's own population and
+# about seven wall seconds — the cheapest leg here by two orders of magnitude,
+# because detection happens 32 ticks in and everything after it is confirmation.
+# The roaming and shed allowances are open for the same reason the witnessed leg
+# relaxes them: this leg is about the conviction, and the interest clauses are
+# measured on the cruise-only runs above.
+note 'conviction run: an 8-peer island with one modified client, impaired link'
+"$BIN" --peers 8 --seconds 300 --min-cells 1 --max-shed 64 \
+  --late-join-at 150 --impaired --witness --cheat speed --stamp-wall-clock \
+  --json "$OUT/conviction.json" \
+  || die "P4's demo criterion did not hold: the modified client was not convicted, or an honest peer was"
+
+# And the control: the same island, every witness still armed, and nobody
+# modified. It must file *nothing*.
+#
+# `--enforce` without `--cheat` is what makes this a measurement rather than a
+# restatement of shadow mode. The legs above all file nothing because shadow
+# mode forbids it; this one files nothing having been allowed to. Without it the
+# conviction leg proves the pipeline accuses somebody, not that it accuses the
+# right somebody — a witness that filed against everyone would pass every clause
+# that only ever looks at the cheat.
+note 'control run: the same island, witnesses armed, nobody modified — must file nothing'
+"$BIN" --peers 8 --seconds 300 --min-cells 1 --max-shed 64 \
+  --late-join-at 150 --impaired --witness --enforce \
+  --json "$OUT/control.json" \
+  || die 'an entirely honest island filed a report with enforcement on'
+
 date -u +%Y-%m-%dT%H:%M:%SZ > "$OUT/PASSED"
-note "every clause held on all three legs, the witnessed one included; reports in $OUT"
+note "every clause held on all five legs, the witnessed and conviction ones included; reports in $OUT"
