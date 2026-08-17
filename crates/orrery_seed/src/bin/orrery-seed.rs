@@ -48,6 +48,9 @@ struct VerifyArgs {
     profile: Option<String>,
     #[arg(long)]
     full: bool,
+    /// Write the §9.3 manifest here: JSONL, one entry per line in
+    /// `(grid, cell, ContentKey)` order, with the `content/version` record as
+    /// the last line. Streamed, so the file's size is not bounded by memory.
     #[arg(long, value_name = "PATH")]
     emit_manifest: Option<PathBuf>,
     #[arg(long)]

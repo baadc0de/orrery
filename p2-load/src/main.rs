@@ -1256,11 +1256,11 @@ struct ManifestEntry {
 
 impl ManifestInventory {
     fn load(path: &Path) -> Result<Self> {
-        // `orrery-seed verify --emit-manifest` writes a pretty-printed JSON
-        // *array*, not the JSONL docs/12 §9.3 describes. Both are accepted:
-        // the array is what the shipped seeder actually produces (verified
-        // against `scenarios/p2demo.toml --profile ci`), and the JSONL form is
-        // what the document specifies and what earlier fixtures use.
+        // `orrery-seed verify --emit-manifest` writes the JSONL docs/12 §9.3
+        // describes: one entry per line, with a `content_version` trailer as
+        // the last line. The pretty-printed JSON *array* branch below is a
+        // compatibility path for manifests emitted before that was fixed —
+        // the seeder no longer produces one.
         let text =
             std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
         if text.trim_start().starts_with('[') {
