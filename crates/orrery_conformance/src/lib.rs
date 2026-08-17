@@ -28,6 +28,11 @@
 //! would call that a pass. The chain cannot: any tick that differed is in it
 //! permanently.
 
+// The last of the fourteen first-party crates to adopt it. CI runs
+// `clippy --workspace --all-targets -- -D warnings`, so this makes an
+// undocumented public item a build failure rather than a warning nobody reads.
+#![warn(missing_docs)]
+
 pub mod compare;
 pub mod corpus;
 pub mod ruleset;

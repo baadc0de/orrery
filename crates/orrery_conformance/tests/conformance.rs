@@ -15,7 +15,7 @@
 //! artifact comparison.
 
 use orrery_conformance::compare::{compare, Divergence};
-use orrery_conformance::corpus::{run_all, run_case, Report, CASES};
+use orrery_conformance::corpus::{run_all, run_case, Case, Report, CASES};
 use orrery_conformance::ruleset::{Body, Command, Outcome};
 use orrery_core::quantize::{QPos, QVel};
 use orrery_core::ruleset::CoreCodec;
@@ -230,6 +230,39 @@ fn combat_cases_actually_exercise_the_discrete_path() {
             case.name
         );
     }
+}
+
+#[test]
+fn isolating_every_entity_changes_nothing() {
+    // The sharp end of the neighbour rule. `combat-isolated` runs each entity
+    // in its own single-entity executor, so `StateView::neighbor` answers
+    // `None` for everything — which is exactly what an adjudicator sees, since
+    // `ReplayHarness::load_claimed_snapshot` installs one entity.
+    //
+    // If a rule ever branches on a neighbour's live state, this equality is
+    // what breaks. It has to be asserted here rather than left to the golden,
+    // because such a branch can be invisible in the attacker's own state hash:
+    // the reference ruleset draws its roll and folds it into `roll_fold`
+    // *before* any liveness test, so the attacker hashes identically either way
+    // and only the emitted event differs. `verify_bundle` would pass; the
+    // target's chain would be wrong.
+    let isolated = CASES
+        .iter()
+        .find(|c| c.isolated)
+        .expect("the corpus carries an isolated case");
+    let shared = Case {
+        name: "shared-twin",
+        isolated: false,
+        ..*isolated
+    };
+
+    let a = run_case(isolated, false);
+    let b = run_case(&shared, false);
+    assert_eq!(
+        a.chain, b.chain,
+        "isolated execution diverges from shared — a rule is reading a neighbour's live state"
+    );
+    assert_eq!(a.final_states, b.final_states);
 }
 
 #[test]

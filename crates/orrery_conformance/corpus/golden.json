@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "ruleset_version": 1,
+  "ruleset_version": 2,
   "ruleset_digest": "c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0",
   "target": "x86_64-linux-unix",
   "cases": [
@@ -313,7 +313,7 @@
       "name": "combat-pair",
       "entities": 2,
       "ticks": 180,
-      "chain": "1b654a2477a121a62d46e26273d4abd40f79a72b195e8978b034c3158c33713d",
+      "chain": "3a906ddc33bd8bdfe5deab87a5f6a47aebe43ec29512bf9ebeeae5455990c60a",
       "final_states": [
         {
           "entity": 1,
@@ -345,7 +345,7 @@
             0
           ],
           "heading_urad": 1919020,
-          "hp": -48,
+          "hp": -7,
           "shield": 0,
           "roll_fold": 16398255907364794353
         }
@@ -355,7 +355,7 @@
       "name": "combat-island",
       "entities": 8,
       "ticks": 600,
-      "chain": "ea9e59fdd47ec9833117b947a3753fb7cce58e1c1b43364bd91bd8c4bea22d69",
+      "chain": "41a1d8263eb06ebf7f7aad40e6166d6eb397b0a3c9249b7b5ff7828f2ece4c39",
       "final_states": [
         {
           "entity": 1,
@@ -438,7 +438,7 @@
             0
           ],
           "heading_urad": 7741504,
-          "hp": -53,
+          "hp": -9,
           "shield": 0,
           "roll_fold": 8202341025343415838
         },
@@ -455,7 +455,7 @@
             0
           ],
           "heading_urad": -62510,
-          "hp": -57,
+          "hp": -21,
           "shield": 0,
           "roll_fold": 16806386341484050391
         },
@@ -472,7 +472,7 @@
             0
           ],
           "heading_urad": 6098308,
-          "hp": -31,
+          "hp": -14,
           "shield": 0,
           "roll_fold": 12610181896124353880
         },
@@ -489,7 +489,151 @@
             0
           ],
           "heading_urad": -278004,
+          "hp": -4,
+          "shield": 0,
+          "roll_fold": 17015274968912835061
+        }
+      ]
+    },
+    {
+      "name": "combat-isolated",
+      "entities": 8,
+      "ticks": 600,
+      "chain": "41a1d8263eb06ebf7f7aad40e6166d6eb397b0a3c9249b7b5ff7828f2ece4c39",
+      "final_states": [
+        {
+          "entity": 1,
+          "pos_mm": [
+            10557,
+            34507,
+            0
+          ],
+          "vel_mms": [
+            1109,
+            653,
+            0
+          ],
+          "heading_urad": 5725361,
+          "hp": -6,
+          "shield": 0,
+          "roll_fold": 845735849265059513
+        },
+        {
+          "entity": 2,
+          "pos_mm": [
+            47223,
+            -44810,
+            0
+          ],
+          "vel_mms": [
+            135,
+            -326,
+            0
+          ],
+          "heading_urad": 4807306,
+          "hp": -5,
+          "shield": 0,
+          "roll_fold": 8386319925793618716
+        },
+        {
+          "entity": 3,
+          "pos_mm": [
+            35457,
+            30998,
+            0
+          ],
+          "vel_mms": [
+            163,
+            -58,
+            0
+          ],
+          "heading_urad": 3373744,
+          "hp": -5,
+          "shield": 0,
+          "roll_fold": 4765245299822244110
+        },
+        {
+          "entity": 4,
+          "pos_mm": [
+            -4478,
+            -25443,
+            0
+          ],
+          "vel_mms": [
+            2,
+            61,
+            0
+          ],
+          "heading_urad": 2978847,
+          "hp": -9,
+          "shield": 0,
+          "roll_fold": 995755598677167728
+        },
+        {
+          "entity": 5,
+          "pos_mm": [
+            -31413,
+            -47983,
+            0
+          ],
+          "vel_mms": [
+            -992,
+            -251,
+            0
+          ],
+          "heading_urad": 7741504,
+          "hp": -9,
+          "shield": 0,
+          "roll_fold": 8202341025343415838
+        },
+        {
+          "entity": 6,
+          "pos_mm": [
+            -44321,
+            -45225,
+            0
+          ],
+          "vel_mms": [
+            -856,
+            288,
+            0
+          ],
+          "heading_urad": -62510,
           "hp": -21,
+          "shield": 0,
+          "roll_fold": 16806386341484050391
+        },
+        {
+          "entity": 7,
+          "pos_mm": [
+            -41526,
+            -36395,
+            0
+          ],
+          "vel_mms": [
+            -315,
+            -258,
+            0
+          ],
+          "heading_urad": 6098308,
+          "hp": -14,
+          "shield": 0,
+          "roll_fold": 12610181896124353880
+        },
+        {
+          "entity": 8,
+          "pos_mm": [
+            -52138,
+            29548,
+            0
+          ],
+          "vel_mms": [
+            -704,
+            -165,
+            0
+          ],
+          "heading_urad": -278004,
+          "hp": -4,
           "shield": 0,
           "roll_fold": 17015274968912835061
         }
