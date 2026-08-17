@@ -161,16 +161,36 @@ async fn chain_replicates_records_to_follower() {
 /// index can see them before the client durability boundary. This transport
 /// makes any premature replication directly observable without introducing a
 /// follower commit of its own.
-#[derive(Default)]
+///
+/// It captures the primary's committed cursor *at the moment of the push*,
+/// which is what makes the check timing-free: the assertion is a property of
+/// each mirrored record rather than of an interval the test slept through.
 struct RecordingTransport {
-    records: std::sync::Mutex<Vec<JournalRecord>>,
+    primary: Arc<Journal>,
+    records: std::sync::Mutex<Vec<(Lsn, Lsn)>>,
+}
+
+impl RecordingTransport {
+    fn new(primary: &Arc<Journal>) -> Self {
+        Self {
+            primary: Arc::clone(primary),
+            records: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    fn pushed(&self) -> Vec<(Lsn, Lsn)> {
+        self.records.lock().unwrap().clone()
+    }
 }
 
 #[async_trait::async_trait]
 impl ChainTransport for RecordingTransport {
     async fn append(&self, record: JournalRecord) -> Result<Lsn, JournalError> {
         let lsn = record.lsn;
-        self.records.lock().unwrap().push(record);
+        self.records
+            .lock()
+            .unwrap()
+            .push((lsn, self.primary.committed()));
         Ok(lsn)
     }
 
@@ -194,10 +214,20 @@ async fn chain_waits_for_primary_commit_before_mirroring() {
         })
         .unwrap(),
     );
-    let transport = Arc::new(RecordingTransport::default());
+    // Commit one record first, so the primary's committed cursor is past
+    // `Lsn::new(0, 0)` before the staged row exists. Without it the very first
+    // record's LSN *is* the empty-journal cursor and the check below could not
+    // tell a premature push from a legitimate one.
+    primary
+        .append(mk_record(CellId::ROOT, 0, RecordKind::Spawn, b"committed"))
+        .unwrap()
+        .committed()
+        .await
+        .unwrap();
+    let transport = Arc::new(RecordingTransport::new(&primary));
     // Stage the row before spawning the replicator. Its initial correctness
     // scan therefore deterministically encounters the originated index entry
-    // while the primary committed watermark is still empty.
+    // while the primary committed watermark is still behind it.
     let handle = primary
         .append(mk_record(CellId::ROOT, 1, RecordKind::Spawn, b"pending"))
         .unwrap();
@@ -207,23 +237,28 @@ async fn chain_waits_for_primary_commit_before_mirroring() {
         &ChainConfig::default(),
     );
 
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    assert!(
-        transport.records.lock().unwrap().is_empty(),
-        "an uncommitted primary record must not reach the follower"
-    );
-
     tokio::time::timeout(Duration::from_secs(2), handle.committed())
         .await
         .expect("primary commit timed out")
         .unwrap();
     let deadline = std::time::Instant::now() + Duration::from_secs(2);
-    while transport.records.lock().unwrap().len() != 1 {
+    while transport.pushed().len() != 2 {
         assert!(
             std::time::Instant::now() < deadline,
             "committed record was not mirrored after the commit wakeup"
         );
         tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    // The invariant the old fixed-window sleep was approximating: nothing is
+    // mirrored before it is durable. This holds at every instant, so the test
+    // no longer races the 500 ms batch window it configured above.
+    for (mirrored, committed) in transport.pushed() {
+        assert!(
+            mirrored <= committed,
+            "an uncommitted primary record ({mirrored}) reached the follower \
+             while the committed cursor was {committed}"
+        );
     }
 
     replicator.shutdown().await;
@@ -472,14 +507,22 @@ async fn ring_does_not_amplify() {
         handle.committed().await.unwrap();
     }
 
-    // Let replication settle, then count.
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    // Wait for replication to settle rather than assuming a fixed window: a
+    // positive assertion behind a sleep is a load-sensitive failure, and this
+    // is the same poll-to-deadline shape the rest of the file uses.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while record_count(&node1) != N as usize {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "node 1 did not receive the N replicas"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
     assert_eq!(
         record_count(&node0),
         N as usize,
         "node 0 holds the N originals"
     );
-    assert_eq!(record_count(&node1), N as usize, "node 1 holds N replicas");
 
     // Counts must be stable: any re-replication loop would keep growing them.
     tokio::time::sleep(Duration::from_millis(500)).await;
@@ -605,6 +648,135 @@ async fn lag_alarm_fires_above_threshold() {
     // The second append of the batch is stalled forever; shutdown races it.
     replicator.shutdown().await;
     primary.close().await.unwrap();
+}
+
+/// A working transport that can be killed mid-flight, the way a follower
+/// process dies: pushes fail, and the watermark probe answers `None` — which
+/// is what the gRPC transport reports for a failed probe too
+/// (`follower_watermark` is `reconnect().ok().flatten()`), so a dead follower
+/// is indistinguishable from an empty one on that path.
+struct KillableTransport {
+    sink: Arc<JournalChainSink>,
+    dead: std::sync::atomic::AtomicBool,
+}
+
+impl KillableTransport {
+    fn new(sink: Arc<JournalChainSink>) -> Self {
+        Self {
+            sink,
+            dead: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    fn kill(&self) {
+        self.dead.store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    fn dead(&self) -> bool {
+        self.dead.load(std::sync::atomic::Ordering::Acquire)
+    }
+}
+
+#[async_trait::async_trait]
+impl ChainTransport for KillableTransport {
+    async fn append(&self, record: JournalRecord) -> Result<Lsn, JournalError> {
+        if self.dead() {
+            return Err(JournalError::Store("follower transport is gone".into()));
+        }
+        orrery_persistd::ChainSink::append(&*self.sink, record).await
+    }
+
+    async fn follower_watermark(&self) -> Option<Lsn> {
+        if self.dead() {
+            return None;
+        }
+        orrery_persistd::ChainSink::watermark(&*self.sink).await
+    }
+}
+
+#[tokio::test]
+async fn a_chain_wedged_after_catching_up_does_not_read_green() {
+    // Given: a chain that has caught all the way up, so the lag gauge — the
+    // chain's only alarm before this — reads a healthy zero.
+    let primary_dir = tempfile::tempdir().unwrap();
+    let follower_dir = tempfile::tempdir().unwrap();
+    let primary = Arc::new(Journal::open(&journal_config(primary_dir.path())).unwrap());
+    let follower = Arc::new(Journal::open(&journal_config(follower_dir.path())).unwrap());
+    let transport = Arc::new(KillableTransport::new(Arc::new(JournalChainSink::new(
+        Arc::clone(&follower),
+    ))));
+    let replicator = orrery_persistd::spawn_chain(
+        Arc::clone(&primary),
+        transport.clone(),
+        &ChainConfig {
+            follower: 5,
+            ..ChainConfig::default()
+        },
+    );
+
+    for i in 0..3u64 {
+        let record = mk_record(CellId::ROOT, i, RecordKind::Spawn, &i.to_le_bytes());
+        primary.append(record).unwrap().committed().await.unwrap();
+    }
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while replicator.follower_watermark() != Some(primary.committed()) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the chain never caught up"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let healthy = replicator.snapshot();
+    assert_eq!(healthy.lag_bytes, 0);
+    assert!(!healthy.stalled_for(Duration::from_millis(50)));
+
+    // When: the follower transport dies while the chain is caught up, and the
+    // primary keeps committing. `update_progress` is the sole writer of the
+    // watermark and the lag gauge and runs only on a successful probe or push,
+    // so both now FREEZE at their caught-up readings instead of growing.
+    transport.kill();
+    for i in 3..6u64 {
+        let record = mk_record(CellId::ROOT, i, RecordKind::Spawn, &i.to_le_bytes());
+        primary.append(record).unwrap().committed().await.unwrap();
+    }
+
+    // Then: the snapshot says so anyway.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let wedged = loop {
+        let snapshot = replicator.snapshot();
+        if snapshot.stalled_for(Duration::from_millis(50)) {
+            break snapshot;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "a chain that cannot reach its follower must not report healthy"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+    assert_eq!(
+        wedged.lag_bytes, 0,
+        "the byte gauge is exactly as green as it was while healthy"
+    );
+    assert_eq!(
+        wedged.watermark, healthy.watermark,
+        "and so is the watermark"
+    );
+    assert!(
+        wedged.fault.is_none(),
+        "a retryable transport failure is degradation, not a fault"
+    );
+    assert!(wedged.running, "and the task is still alive, retrying");
+    // The three readings that do move.
+    assert!(
+        wedged.behind,
+        "live state: the primary is past the follower"
+    );
+    assert!(wedged.failed_pushes > 0, "and the pushes are failing");
+    assert!(wedged.progress_age_ms >= 50, "and nothing has progressed");
+
+    replicator.shutdown().await;
+    primary.close().await.unwrap();
+    follower.close().await.unwrap();
 }
 
 /// A transport whose follower already holds history this primary never wrote:

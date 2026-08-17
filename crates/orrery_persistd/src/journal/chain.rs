@@ -113,6 +113,14 @@ pub enum ChainFault {
         /// This primary's committed LSN, or `None` for an empty journal.
         committed: Option<Lsn>,
     },
+    /// The primary's own journal scan failed, so the loop can no longer read
+    /// the records it exists to mirror.
+    ///
+    /// The underlying [`JournalError`] is deliberately *not* carried here.
+    /// This enum is `Copy` and compared by value by every consumer; a variant
+    /// holding an error message would be neither. The error is logged at the
+    /// break instead, and the fault is the part an operator polls for.
+    PrimaryScanFailed,
 }
 
 impl core::fmt::Display for ChainFault {
@@ -129,12 +137,22 @@ impl core::fmt::Display for ChainFault {
                     "follower watermark {remote} is ahead of an empty primary journal"
                 ),
             },
+            Self::PrimaryScanFailed => {
+                write!(f, "the primary journal scan failed; see the chain log")
+            }
         }
     }
 }
 
 /// A point-in-time reading of one chain's health, for a delta reporter or an
 /// operator endpoint to publish under the docs/13 §6 chain series.
+///
+/// The first four fields used to be the whole reading, and all four report a
+/// healthy chain while the replicator is wedged: `lag_bytes` and `watermark`
+/// are written only by [`update_progress`], which runs only on a *successful*
+/// probe or push, so both **freeze** at their last value — zero, if the
+/// follower died while the chain was caught up. The remaining fields are the
+/// ones that move when nothing else does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ChainSnapshot {
     /// The follower node id this chain streams to.
@@ -145,6 +163,41 @@ pub struct ChainSnapshot {
     pub lag_bytes: u64,
     /// Set once the chain has stopped for a reason retrying cannot fix.
     pub fault: Option<ChainFault>,
+    /// Whether the replication task is still alive. A task that panicked sets
+    /// no fault, so this is the only field that reports one.
+    pub running: bool,
+    /// Milliseconds since the last successful probe or push — the age of
+    /// `watermark` and `lag_bytes`, and the D16 `chain_lag_age_ms` reading.
+    pub progress_age_ms: u64,
+    /// Pushes that have failed since the last successful one; zero on a
+    /// healthy chain, and climbing at the retry rate on a wedged one.
+    pub failed_pushes: u64,
+    /// Whether the primary has committed past `watermark` *right now*, read
+    /// live from the journal rather than from the frozen gauge.
+    ///
+    /// Always `false` for a promotion-adopted chain, whose watermark lives in
+    /// the source's LSN space and is not comparable with this journal's
+    /// committed cursor; `failed_pushes` is the stall primitive there.
+    pub behind: bool,
+}
+
+impl ChainSnapshot {
+    /// Whether this chain is wedged: stopped outright, or owing work it has
+    /// made no progress on for longer than `grace`.
+    ///
+    /// This is deliberately *not* gated on `lag_bytes > 0`, which cannot fire
+    /// for the headline case: a follower killed while the chain is caught up
+    /// leaves the gauge at 0, and with no further appends the loop parks on
+    /// the commit broadcast without making a transport call at all. Live
+    /// state (`behind`) and failed pushes are what still move.
+    #[must_use]
+    pub fn stalled_for(&self, grace: Duration) -> bool {
+        if self.fault.is_some() || !self.running {
+            return true;
+        }
+        (self.behind || self.failed_pushes > 0)
+            && u128::from(self.progress_age_ms) >= grace.as_millis()
+    }
 }
 
 /// The durable landing point on the follower for replicated records.
@@ -216,25 +269,93 @@ impl ShutdownSignal {
     }
 }
 
-/// A running chain-replication task: subscribes to the primary journal's
-/// committed records and pushes them to the follower.
-pub struct ChainReplicator {
+/// Everything the replication task publishes and [`ChainReplicator`] reads.
+///
+/// Bundled rather than threaded through as five separate `Arc`s because one
+/// progress update writes four of them at once, and the added fields are only
+/// meaningful next to the frozen ones.
+#[derive(Debug)]
+struct ChainState {
     /// The follower's durable watermark, updated as the transport reports it.
-    watermark: Arc<std::sync::Mutex<Option<Lsn>>>,
+    watermark: std::sync::Mutex<Option<Lsn>>,
     /// Replication lag: `primary.committed()` minus the follower's reported
     /// durable watermark. LSN offsets are byte positions, so the raw gap is in
     /// bytes; [`ChainReplicator::lag_bytes`] exposes it and the alarm compares
     /// it against [`ChainConfig::lag_alarm`]'s byte budget (D11's "~100 ms of
     /// journal" mapped to bytes — see [`lag_alarm_bytes`]).
-    lag_bytes: Arc<std::sync::atomic::AtomicU64>,
+    lag_bytes: std::sync::atomic::AtomicU64,
     /// Set when the loop stopped for a reason retrying cannot fix.
-    fault: Arc<std::sync::Mutex<Option<ChainFault>>>,
+    fault: std::sync::Mutex<Option<ChainFault>>,
+    /// The spawn instant `last_progress_ms` is measured from. An `Instant`
+    /// does not fit in an atomic, and the age is all any consumer wants.
+    started: std::time::Instant,
+    /// Milliseconds after `started` of the last successful probe or push.
+    last_progress_ms: std::sync::atomic::AtomicU64,
+    /// Pushes failed since the last successful one.
+    failed_pushes: std::sync::atomic::AtomicU64,
+}
+
+impl ChainState {
+    fn new() -> Self {
+        Self {
+            watermark: std::sync::Mutex::new(None),
+            lag_bytes: std::sync::atomic::AtomicU64::new(0),
+            fault: std::sync::Mutex::new(None),
+            started: std::time::Instant::now(),
+            last_progress_ms: std::sync::atomic::AtomicU64::new(0),
+            failed_pushes: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    fn elapsed_ms(&self) -> u64 {
+        u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX)
+    }
+
+    /// Stamp a successful probe or push. Progress clears the failure run: the
+    /// counter answers "is this chain moving", not "has it ever failed".
+    fn note_progress(&self) {
+        self.last_progress_ms
+            .store(self.elapsed_ms(), std::sync::atomic::Ordering::Release);
+        self.failed_pushes
+            .store(0, std::sync::atomic::Ordering::Release);
+    }
+
+    fn note_failed_push(&self) {
+        self.failed_pushes
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    }
+
+    fn progress_age_ms(&self) -> u64 {
+        self.elapsed_ms().saturating_sub(
+            self.last_progress_ms
+                .load(std::sync::atomic::Ordering::Acquire),
+        )
+    }
+
+    fn set_fault(&self, fault: ChainFault) {
+        *self.fault.lock().expect("chain fault lock") = Some(fault);
+    }
+}
+
+/// A running chain-replication task: subscribes to the primary journal's
+/// committed records and pushes them to the follower.
+pub struct ChainReplicator {
+    /// The primary journal, kept so a snapshot can compare *live* committed
+    /// state against the follower watermark. The lag gauge cannot: it is
+    /// written only on success, so it holds its last value when the chain
+    /// wedges instead of growing.
+    journal: Arc<Journal>,
+    /// State published by the task.
+    state: Arc<ChainState>,
     /// Join handle; awaited on shutdown.
     join: tokio::task::JoinHandle<()>,
     /// Signals the task to stop.
     shutdown: Arc<ShutdownSignal>,
     /// The follower node id (for diagnostics).
     follower: u64,
+    /// Whether the watermark and `journal.committed()` share an LSN space.
+    /// False for a promotion-adopted chain, which re-exports another node's.
+    comparable_watermark: bool,
 }
 
 impl ChainReplicator {
@@ -247,7 +368,7 @@ impl ChainReplicator {
     /// The highest LSN durably persisted on the follower, if known.
     #[must_use]
     pub fn follower_watermark(&self) -> Option<Lsn> {
-        *self.watermark.lock().expect("chain watermark lock")
+        *self.state.watermark.lock().expect("chain watermark lock")
     }
 
     /// The current replication lag in journal bytes: `primary.committed()`
@@ -256,9 +377,15 @@ impl ChainReplicator {
     /// LSN), so the difference is a byte gap; the lag alarm fires (a
     /// `tracing::warn!`) while this exceeds the [`ChainConfig::lag_alarm`]
     /// byte budget.
+    ///
+    /// Read it together with [`ChainReplicator::progress_age`]: this gauge
+    /// advances only on a successful probe or push, so a wedged chain holds
+    /// whatever it last read rather than growing.
     #[must_use]
     pub fn lag_bytes(&self) -> u64 {
-        self.lag_bytes.load(std::sync::atomic::Ordering::Acquire)
+        self.state
+            .lag_bytes
+            .load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// The fault that stopped this chain, if one did.
@@ -267,7 +394,55 @@ impl ChainReplicator {
     /// transport error is retried and is not a fault.
     #[must_use]
     pub fn fault(&self) -> Option<ChainFault> {
-        *self.fault.lock().expect("chain fault lock")
+        *self.state.fault.lock().expect("chain fault lock")
+    }
+
+    /// Whether the replication task is still alive.
+    ///
+    /// The task exits on shutdown, on a fault, and when the commit broadcast
+    /// closes — but it can also **panic**, at the bare `expect` guarding the
+    /// adopted-history scan, and a panicked task publishes no fault at all.
+    /// This accessor is what makes that case observable.
+    #[must_use]
+    pub fn running(&self) -> bool {
+        !self.join.is_finished()
+    }
+
+    /// Time since the last successful probe or push: the age of both
+    /// [`ChainReplicator::follower_watermark`] and
+    /// [`ChainReplicator::lag_bytes`], since nothing else writes them.
+    #[must_use]
+    pub fn progress_age(&self) -> Duration {
+        Duration::from_millis(self.state.progress_age_ms())
+    }
+
+    /// Pushes that have failed since the last successful one.
+    #[must_use]
+    pub fn failed_pushes(&self) -> u64 {
+        self.state
+            .failed_pushes
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Whether the primary has committed past the follower's reported
+    /// watermark right now — the live read the frozen gauge cannot give.
+    ///
+    /// Always `false` for a promotion-adopted chain: its watermark is in the
+    /// source's LSN space, so the comparison would be meaningless rather than
+    /// merely stale.
+    #[must_use]
+    pub fn behind(&self) -> bool {
+        if !self.comparable_watermark {
+            return false;
+        }
+        match (
+            self.journal.committed_watermark(),
+            self.follower_watermark(),
+        ) {
+            (Some(committed), Some(durable)) => committed > durable,
+            (Some(_), None) => true,
+            (None, _) => false,
+        }
     }
 
     /// Everything a reporter needs about this chain in one consistent read.
@@ -278,6 +453,10 @@ impl ChainReplicator {
             watermark: self.follower_watermark(),
             lag_bytes: self.lag_bytes(),
             fault: self.fault(),
+            running: self.running(),
+            progress_age_ms: self.state.progress_age_ms(),
+            failed_pushes: self.failed_pushes(),
+            behind: self.behind(),
         }
     }
 
@@ -372,9 +551,7 @@ fn spawn_chain_from(
     config: &ChainConfig,
     source: ChainSource,
 ) -> ChainReplicator {
-    let watermark = Arc::new(std::sync::Mutex::new(None));
-    let lag_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let fault = Arc::new(std::sync::Mutex::new(None));
+    let state = Arc::new(ChainState::new());
     let shutdown = Arc::new(ShutdownSignal::default());
     // An adopted chain re-exports records that keep their *source* LSNs, so
     // the follower echoes a watermark from the source's LSN space while
@@ -385,9 +562,8 @@ fn spawn_chain_from(
     let batch_max = config.batch_max.max(1);
     let alarm_bytes = lag_alarm_bytes(config.lag_alarm);
     let mut rx = journal.subscribe();
-    let wm = Arc::clone(&watermark);
-    let lag = Arc::clone(&lag_bytes);
-    let flt = Arc::clone(&fault);
+    let handle = Arc::clone(&journal);
+    let st = Arc::clone(&state);
     let sd = Arc::clone(&shutdown);
 
     let join = tokio::spawn(async move {
@@ -418,11 +594,11 @@ fn spawn_chain_from(
                     if bound_watermark && committed.is_none_or(|local| remote > local) {
                         let reason = ChainFault::FollowerAhead { remote, committed };
                         tracing::error!(follower, %reason, "chain: replication stopped");
-                        *flt.lock().expect("chain fault lock") = Some(reason);
+                        st.set_fault(reason);
                         break;
                     }
                     cursor = Some(remote);
-                    update_progress(&journal, &wm, &lag, alarm_bytes, follower, remote);
+                    update_progress(&journal, &st, alarm_bytes, follower, remote);
                 }
                 needs_probe = false;
             }
@@ -454,7 +630,11 @@ fn spawn_chain_from(
             let batch = match batch {
                 Ok(batch) => batch,
                 Err(error) => {
+                    // The loop cannot read what it exists to mirror, and the
+                    // gauges it leaves behind still say zero. Publish the
+                    // fault before exiting so the chain is not silently down.
                     tracing::error!(follower, ?error, "chain: primary journal scan failed");
+                    st.set_fault(ChainFault::PrimaryScanFailed);
                     break;
                 }
             };
@@ -465,8 +645,7 @@ fn spawn_chain_from(
                     &*transport,
                     &batch,
                     &sd,
-                    &wm,
-                    &lag,
+                    &st,
                     alarm_bytes,
                     follower,
                 )
@@ -503,12 +682,12 @@ fn spawn_chain_from(
     });
 
     ChainReplicator {
-        watermark,
-        lag_bytes,
-        fault,
+        journal: handle,
+        state,
         join,
         shutdown,
         follower,
+        comparable_watermark: bound_watermark,
     }
 }
 
@@ -531,17 +710,24 @@ impl PushOutcome {
     }
 }
 
+/// Publish one successful probe or push.
+///
+/// This is the *only* writer of the watermark and the lag gauge, which is why
+/// it also stamps the progress clock: a chain that stops calling this holds
+/// both readings unchanged, and the age is the only thing left that moves.
 fn update_progress(
     journal: &Journal,
-    wm: &std::sync::Mutex<Option<Lsn>>,
-    lag: &std::sync::atomic::AtomicU64,
+    state: &ChainState,
     alarm_bytes: u64,
     follower: u64,
     durable: Lsn,
 ) {
-    *wm.lock().expect("chain watermark lock") = Some(durable);
+    *state.watermark.lock().expect("chain watermark lock") = Some(durable);
+    state.note_progress();
     if let Some(bytes) = lag_in_bytes(journal.committed(), durable, journal.segment_size()) {
-        lag.store(bytes, std::sync::atomic::Ordering::Release);
+        state
+            .lag_bytes
+            .store(bytes, std::sync::atomic::Ordering::Release);
         if bytes > alarm_bytes {
             tracing::warn!(
                 follower,
@@ -557,14 +743,12 @@ fn update_progress(
 /// a stalled transport cannot wedge [`ChainReplicator::shutdown`] forever. The
 /// result is the follower's durable watermark after the entire batch, avoiding
 /// both a second probe and a per-record RPC on transports that support batching.
-#[allow(clippy::too_many_arguments)]
 async fn push_batch(
     journal: &Journal,
     transport: &dyn ChainTransport,
     records: &[JournalRecord],
     shutdown: &ShutdownSignal,
-    wm: &std::sync::Mutex<Option<Lsn>>,
-    lag: &std::sync::atomic::AtomicU64,
+    state: &ChainState,
     alarm_bytes: u64,
     follower: u64,
 ) -> PushOutcome {
@@ -582,7 +766,7 @@ async fn push_batch(
     };
     match pushed {
         Ok(durable) if durable >= records.last().expect("non-empty batch").lsn => {
-            update_progress(journal, wm, lag, alarm_bytes, follower, durable);
+            update_progress(journal, state, alarm_bytes, follower, durable);
             PushOutcome {
                 last: Some(durable),
                 complete: true,
@@ -595,6 +779,7 @@ async fn push_batch(
                 durable_lsn = %durable,
                 "chain: follower returned a regressed batch watermark"
             );
+            state.note_failed_push();
             PushOutcome {
                 last: None,
                 complete: false,
@@ -602,6 +787,9 @@ async fn push_batch(
         }
         Err(error) => {
             tracing::warn!(follower, ?error, "chain: follower batch append failed");
+            // A retried transport error is not a fault, but a *run* of them is
+            // the only thing that moves while the lag gauge stays frozen.
+            state.note_failed_push();
             PushOutcome {
                 last: None,
                 complete: false,
@@ -817,6 +1005,71 @@ mod lag_alarm_tests {
         assert_eq!(batches.len(), 1);
         assert_eq!(batches[0].len(), 3);
         assert!(batches[0].windows(2).all(|pair| pair[0] < pair[1]));
+        replicator.shutdown().await;
+        journal.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_primary_scan_failure_faults_and_stops_the_task() {
+        // The unrecoverable read is a *per-item* error inside the outbound
+        // scan, and `spawn_chain` takes a concrete journal, so this test lives
+        // in-crate: `inject_scan_fault` is the only seam that reaches it. The
+        // outer-scan `expect` is a different branch — it panics the task, and
+        // `running()` is what observes that one.
+        let dir = tempfile::tempdir().unwrap();
+        let journal = Arc::new(
+            Journal::open(&JournalConfig {
+                dir: dir.path().to_path_buf(),
+                commit: GroupCommitConfig {
+                    mode: AdaptiveCommitMode::AlwaysBatch,
+                    batch_window: Duration::from_millis(1),
+                    batch_max_records: 128,
+                    batch_max_bytes: 1 << 20,
+                },
+            })
+            .unwrap(),
+        );
+        journal
+            .append(test_record(1))
+            .unwrap()
+            .committed()
+            .await
+            .unwrap();
+        journal.inject_scan_fault();
+
+        let transport = Arc::new(BatchSpy {
+            batches: Mutex::new(Vec::new()),
+        });
+        let replicator = spawn_chain(
+            Arc::clone(&journal),
+            Arc::clone(&transport) as Arc<dyn ChainTransport>,
+            &ChainConfig {
+                follower: 11,
+                ..ChainConfig::default()
+            },
+        );
+
+        let snapshot = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let snapshot = replicator.snapshot();
+                if snapshot.fault.is_some() && !snapshot.running {
+                    break snapshot;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("a scan failure must fault, not exit quietly");
+
+        assert_eq!(snapshot.fault, Some(ChainFault::PrimaryScanFailed));
+        assert!(!snapshot.running);
+        // The reason the fault has to exist: the task broke out of the loop
+        // before ever pushing, so the two original gauges still read healthy.
+        assert_eq!(snapshot.lag_bytes, 0);
+        assert_eq!(snapshot.watermark, None);
+        assert!(snapshot.stalled_for(Duration::ZERO));
+        assert!(transport.batches.lock().expect("batch spy lock").is_empty());
+
         replicator.shutdown().await;
         journal.close().await.unwrap();
     }
