@@ -20,6 +20,7 @@ use orrery_persistd::{
 };
 // Not re-exported at the crate root: `lib.rs` belongs to another lane, and the
 // module path is public and does the job.
+use orrery_persistd::cluster::LeaseRenewal;
 use orrery_persistd::lease::CLAIM_HERD_DAMPER_MS;
 
 use orrery_protocol::{
@@ -2545,10 +2546,18 @@ async fn a_renewal_batch_renews_each_pair_against_its_own_row() {
     // A pair the holder no longer owns, and a pair for an entity with no row.
     let stale = (held[2].0, LeaseId(held[2].1 .0 + 1));
     let absent = (PersistId::new(999), LeaseId(1));
-    let batch = vec![held[0], held[1], stale, held[3], absent, held[4]];
+    let pairs = [held[0], held[1], stale, held[3], absent, held[4]];
+    let batch: Vec<_> = pairs
+        .iter()
+        .map(|&(entity, lease_id)| LeaseRenewal {
+            cell: CellId::ROOT,
+            entity,
+            lease_id,
+        })
+        .collect();
 
     let rows = rt
-        .heartbeat_leases(GridId::ROOT, CellId::ROOT, holder, &batch, 1)
+        .heartbeat_leases(GridId::ROOT, holder, &batch, 1)
         .await
         .unwrap();
 
@@ -2558,7 +2567,7 @@ async fn a_renewal_batch_renews_each_pair_against_its_own_row() {
         .enumerate()
         .filter(|(index, row)| {
             row.as_ref()
-                .is_some_and(|row| row.holder == Some(holder) && row.lease_id == batch[*index].1)
+                .is_some_and(|row| row.holder == Some(holder) && row.lease_id == pairs[*index].1)
         })
         .map(|(index, _)| index)
         .collect();
@@ -2583,12 +2592,77 @@ async fn a_renewal_batch_renews_each_pair_against_its_own_row() {
 
     // A batch from someone who holds none of it renews none of it.
     let rows = rt
-        .heartbeat_leases(GridId::ROOT, CellId::ROOT, stranger, &batch, 2)
+        .heartbeat_leases(GridId::ROOT, stranger, &batch, 2)
         .await
         .unwrap();
     assert!(rows
         .iter()
         .all(|row| row.as_ref().is_none_or(|row| row.holder != Some(stranger))));
+
+    rt.close().await.unwrap();
+}
+
+/// One entity per leaf cell renews correctly through the shard-level fold.
+///
+/// The gateway-side test measures that this shape costs one turn; this one
+/// checks the answer is still right when the fold spans many cells: a real
+/// runtime, one shard (the root), and every entity committed in a leaf cell of
+/// its own — the P2 shape. Each pair must renew against its own row, and the
+/// reply must stay positional across the whole batch.
+#[tokio::test]
+async fn a_renewal_batch_spanning_many_cells_of_one_shard_renews_each_row() {
+    let dir = tempfile::tempdir().unwrap();
+    let rt = CellRuntime::open(&runtime_config(dir.path(), false), &mem_store())
+        .await
+        .unwrap();
+    let holder = test_node(23);
+    // 64 distinct level-2 cells, all inside the root shard this runtime owns.
+    let cells: Vec<CellId> = CellId::ROOT
+        .children()
+        .into_iter()
+        .flat_map(|child| child.children().into_iter())
+        .collect();
+    assert_eq!(cells.len(), 64);
+
+    let mut batch = Vec::new();
+    for (index, &cell) in cells.iter().enumerate() {
+        let entity = PersistId::new(3000 + index as u64);
+        let ClaimResult::Granted(row) = rt
+            .claim_lease(GridId::ROOT, cell, entity, holder, ClaimKind::Weak, 0)
+            .await
+            .unwrap()
+        else {
+            panic!("claim in cell {cell:?} should be granted");
+        };
+        batch.push(LeaseRenewal {
+            cell,
+            entity,
+            lease_id: row.lease_id,
+        });
+    }
+    // The premise: distinct cells, one entity each.
+    assert_eq!(
+        batch
+            .iter()
+            .map(|entry| entry.cell)
+            .collect::<std::collections::HashSet<_>>()
+            .len(),
+        batch.len()
+    );
+
+    let rows = rt
+        .heartbeat_leases(GridId::ROOT, holder, &batch, 1)
+        .await
+        .unwrap();
+
+    assert_eq!(rows.len(), batch.len(), "one answer per requested pair");
+    for (entry, row) in batch.iter().zip(&rows) {
+        let row = row.as_ref().expect("every held pair renews");
+        assert_eq!(row.entity, entry.entity, "the reply stays positional");
+        assert_eq!(row.holder, Some(holder));
+        assert_eq!(row.lease_id, entry.lease_id);
+        assert_eq!(row.expires_at, 1 + LEASE_TTL_MS);
+    }
 
     rt.close().await.unwrap();
 }

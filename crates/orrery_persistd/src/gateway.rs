@@ -64,7 +64,7 @@ use orrery_protocol::{
 
 use crate::actor::{FencedApply, Reject};
 use crate::adjudication::AdjudicationExecutor;
-use crate::cluster::Router;
+use crate::cluster::{LeaseRenewal, Router};
 use crate::intent::{
     error_outcome, IntentVerdict, PermissiveValidator, SharedExecutor, SharedValidator,
 };
@@ -1648,12 +1648,21 @@ enum SessionLeaseOwner {
     Parking(SessionGeneration),
 }
 
-/// Renew a session's due leases, one actor turn per `(grid, cell)` group.
+/// Renew a session's due leases, one router call per grid.
 ///
-/// A heartbeat arrives every 2.5 s naming every lease the peer holds, and all
-/// of them usually sit in one cell — so the whole batch is one mailbox turn,
-/// not one per entity. The measured shape: a peer holding 50 entities in one
-/// cell cost 50 turns and now costs 1.
+/// A heartbeat arrives every 2.5 s naming every lease the peer holds. Those
+/// leases share an *actor* — an actor owns a shard, and a shard holds very
+/// many leaf cells — but they do not share a leaf cell: measured on the P2
+/// workload, 2079 entities sat in 2079 distinct leaf cells, so grouping here
+/// by `(grid, cell)` produced 2079 groups of one and folded nothing.
+///
+/// The gateway therefore does not group by cell at all. It hands the router
+/// every renewal for a grid, each carrying its own cell, and the router folds
+/// them by the actor that owns each — shard layout is the router's knowledge,
+/// and teaching the gateway to resolve shards would put a copy of the routing
+/// table on the wrong side of the [`Router`] boundary and stale it on the
+/// first rekey. Grouping by grid is kept because `grid` scopes the cell-id
+/// space itself (P-7): two grids are two entity universes, not two groups.
 ///
 /// The ack stays per entity. Every pair that did not renew is named
 /// individually in the returned `invalid` list, whether it failed on its own
@@ -1667,26 +1676,35 @@ async fn renew_session_leases(
     renewable: &[SessionLease],
     now_ms: u64,
 ) -> (Vec<orrery_protocol::Lease>, Vec<(PersistId, LeaseId)>) {
-    let mut groups: Vec<((GridId, CellId), Vec<&SessionLease>)> = Vec::new();
+    let mut groups: Vec<(GridId, Vec<&SessionLease>)> = Vec::new();
     for lease in renewable {
-        let key = (lease.grid, lease.cell);
-        match groups.iter_mut().find(|(grouped, _)| *grouped == key) {
+        match groups
+            .iter_mut()
+            .find(|(grouped, _)| *grouped == lease.grid)
+        {
             Some((_, members)) => members.push(lease),
-            None => groups.push((key, vec![lease])),
+            None => groups.push((lease.grid, vec![lease])),
         }
     }
     let mut rows = Vec::with_capacity(renewable.len());
     let mut invalid = Vec::new();
-    for ((grid, cell), members) in groups {
+    for (grid, members) in groups {
         let batch: Vec<_> = members
             .iter()
-            .map(|lease| (lease.entity, lease.lease_id))
+            .map(|lease| LeaseRenewal {
+                cell: lease.cell,
+                entity: lease.entity,
+                lease_id: lease.lease_id,
+            })
             .collect();
-        let renewed = router
-            .heartbeat_leases(grid, cell, holder, &batch, now_ms)
-            .await;
+        let renewed = router.heartbeat_leases(grid, holder, &batch, now_ms).await;
         let Ok(renewed) = renewed else {
-            invalid.extend(batch);
+            invalid.extend(
+                batch
+                    .iter()
+                    .map(|entry| (entry.entity, entry.lease_id))
+                    .collect::<Vec<_>>(),
+            );
             continue;
         };
         let mut answered = 0;
@@ -5441,6 +5459,11 @@ mod tests {
         /// fan the batch back out one entity at a time (the shape before the
         /// batched method existed).
         batched: bool,
+        /// The shard cells this router hosts actors for. A real router folds a
+        /// batch by the actor that owns each entry, and an actor owns a whole
+        /// shard subtree — so this double resolves cells to shards with the
+        /// *production* grouping function rather than inventing its own rule.
+        shards: Vec<CellId>,
         turns: Arc<AtomicUsize>,
         batch_sizes: Arc<Mutex<Vec<usize>>>,
         refuse: Option<PersistId>,
@@ -5493,30 +5516,44 @@ mod tests {
         async fn heartbeat_leases(
             &self,
             grid: GridId,
-            cell: CellId,
             holder: NodeId,
-            renew: &[(PersistId, LeaseId)],
+            renew: &[LeaseRenewal],
             now_ms: u64,
         ) -> Result<Vec<Option<orrery_protocol::Lease>>, Reject> {
             if !self.batched {
                 // Exactly what a router with no actor of its own does.
                 let mut rows = Vec::with_capacity(renew.len());
-                for (entity, lease_id) in renew {
+                for entry in renew {
                     rows.push(
-                        self.heartbeat_lease(grid, cell, *entity, holder, *lease_id, now_ms)
-                            .await?,
+                        self.heartbeat_lease(
+                            grid,
+                            entry.cell,
+                            entry.entity,
+                            holder,
+                            entry.lease_id,
+                            now_ms,
+                        )
+                        .await?,
                     );
                 }
                 return Ok(rows);
             }
-            self.turns.fetch_add(1, Ordering::SeqCst);
-            self.batch_sizes.lock().expect("sizes").push(renew.len());
-            let answered = if self.short { 1 } else { renew.len() };
-            Ok(renew
-                .iter()
-                .take(answered)
-                .map(|(entity, lease_id)| self.row(*entity, *lease_id))
-                .collect())
+            let routes: Vec<CellId> = renew.iter().map(|entry| entry.cell).collect();
+            let mut rows = vec![None; renew.len()];
+            for (_shard, members) in crate::cluster::group_by_actor(&self.shards, &routes) {
+                // One mailbox turn per owning actor: this is the instrument.
+                self.turns.fetch_add(1, Ordering::SeqCst);
+                self.batch_sizes.lock().expect("sizes").push(members.len());
+                for index in members {
+                    rows[index] = self.row(renew[index].entity, renew[index].lease_id);
+                }
+            }
+            if self.short {
+                // A genuinely truncated reply, not a padded one: the caller
+                // must treat the missing tail as refused, not as absent rows.
+                rows.truncate(1);
+            }
+            Ok(rows)
         }
     }
 
@@ -5550,6 +5587,7 @@ mod tests {
             let turns = Arc::new(AtomicUsize::new(0));
             let router: Arc<dyn Router> = Arc::new(CountingRenewalRouter {
                 batched,
+                shards: vec![CellId::ROOT],
                 turns: Arc::clone(&turns),
                 batch_sizes: Arc::new(Mutex::new(Vec::new())),
                 refuse: None,
@@ -5568,20 +5606,103 @@ mod tests {
         );
     }
 
-    /// Entities in different cells cannot share a turn — one per group.
+    /// `count` leaf cells, all distinct, all inside `shard`.
+    ///
+    /// This is the shape the P2 criterion actually runs: one entity per leaf
+    /// cell, every one of them owned by the same actor.
+    fn leaf_cells_under(shard: CellId, count: usize) -> Vec<CellId> {
+        let mut level = vec![shard];
+        while level.len() < count {
+            level = level
+                .into_iter()
+                .flat_map(|cell| cell.children().into_iter())
+                .collect();
+        }
+        level.truncate(count);
+        level
+    }
+
+    /// One entity per leaf cell — the P2 workload — is still one actor turn.
+    ///
+    /// The leaf cell is the wrong key to fold on: an actor owns a *shard*, and
+    /// a shard holds very many leaf cells. Tonight's P2 evidence had 2079
+    /// entities in 2079 distinct leaf cells, so a leaf-keyed batch is 2079
+    /// groups of one and costs exactly what no batching costs. Folding by the
+    /// owning actor instead: **50 turns before, 1 after**, on a workload where
+    /// no two entities share a cell.
     #[tokio::test]
-    async fn a_heartbeat_spanning_two_cells_costs_one_turn_per_cell() {
+    async fn fifty_entities_in_fifty_distinct_cells_of_one_shard_cost_one_turn() {
+        const HELD: usize = 50;
+        let holder = iroh::SecretKey::from_bytes(&[15; 32]).public();
+        let shard = CellId::ROOT.children()[0];
+        let cells = leaf_cells_under(shard, HELD);
+        assert_eq!(
+            cells.iter().collect::<HashSet<_>>().len(),
+            HELD,
+            "the workload is one entity per cell, not one cell for all"
+        );
+        let leases: Vec<SessionLease> = cells
+            .iter()
+            .enumerate()
+            .map(|(index, &cell)| SessionLease {
+                entity: PersistId::new(index as u64 + 1),
+                lease_id: LeaseId(1),
+                grid: GridId::ROOT,
+                cell,
+                owner: SessionLeaseOwner::Active(SessionGeneration(1)),
+            })
+            .collect();
+
+        let mut measured = Vec::new();
+        for batched in [false, true] {
+            let turns = Arc::new(AtomicUsize::new(0));
+            let router: Arc<dyn Router> = Arc::new(CountingRenewalRouter {
+                batched,
+                shards: vec![shard],
+                turns: Arc::clone(&turns),
+                batch_sizes: Arc::new(Mutex::new(Vec::new())),
+                refuse: None,
+                short: false,
+                holder,
+            });
+            let (rows, invalid) = renew_session_leases(&router, holder, &leases, 0).await;
+            assert_eq!(rows.len(), HELD, "every held row is acked");
+            assert!(invalid.is_empty(), "nothing was refused: {invalid:?}");
+            measured.push(turns.load(Ordering::SeqCst));
+        }
+        assert_eq!(
+            measured,
+            vec![HELD, 1],
+            "one turn per entity before, one turn for the whole shard after"
+        );
+    }
+
+    /// Entities under different **shards** cannot share a turn — one per actor.
+    ///
+    /// The fold is by owning actor, so this is the boundary that still costs a
+    /// turn, and a batch that straddles two shards is answered positionally
+    /// across both.
+    #[tokio::test]
+    async fn a_heartbeat_spanning_two_shards_costs_one_turn_per_shard() {
         let holder = iroh::SecretKey::from_bytes(&[12; 32]).public();
-        let cells = CellId::ROOT.children();
-        let mut leases = session_leases(4, cells[0]);
-        leases.extend(session_leases(4, cells[1]).into_iter().map(|mut lease| {
-            lease.entity = PersistId::new(lease.entity.0 + 100);
-            lease
-        }));
+        let shards = CellId::ROOT.children();
+        let mut leases: Vec<SessionLease> = Vec::new();
+        for (shard_index, shard) in shards[..2].iter().enumerate() {
+            for (index, cell) in leaf_cells_under(*shard, 4).into_iter().enumerate() {
+                leases.push(SessionLease {
+                    entity: PersistId::new((shard_index * 100 + index) as u64 + 1),
+                    lease_id: LeaseId(1),
+                    grid: GridId::ROOT,
+                    cell,
+                    owner: SessionLeaseOwner::Active(SessionGeneration(1)),
+                });
+            }
+        }
         let turns = Arc::new(AtomicUsize::new(0));
         let sizes = Arc::new(Mutex::new(Vec::new()));
         let router: Arc<dyn Router> = Arc::new(CountingRenewalRouter {
             batched: true,
+            shards: shards[..2].to_vec(),
             turns: Arc::clone(&turns),
             batch_sizes: Arc::clone(&sizes),
             refuse: None,
@@ -5609,6 +5730,7 @@ mod tests {
         let turns = Arc::new(AtomicUsize::new(0));
         let router: Arc<dyn Router> = Arc::new(CountingRenewalRouter {
             batched: true,
+            shards: vec![CellId::ROOT],
             turns: Arc::clone(&turns),
             batch_sizes: Arc::new(Mutex::new(Vec::new())),
             refuse: Some(refused),
@@ -5633,6 +5755,7 @@ mod tests {
         let leases = session_leases(4, CellId::ROOT);
         let router: Arc<dyn Router> = Arc::new(CountingRenewalRouter {
             batched: true,
+            shards: vec![CellId::ROOT],
             turns: Arc::new(AtomicUsize::new(0)),
             batch_sizes: Arc::new(Mutex::new(Vec::new())),
             refuse: None,
