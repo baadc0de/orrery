@@ -61,10 +61,13 @@ pub use fence::{
 pub use gateway::{
     AuthorityMetrics, AuthoritySnapshot, BulkAckAdmission, BulkAckDisposition,
     CoordinatorHandoutAuthority, DuplicateAuthoritySample, FreshBulkAckAdmission,
-    GatewayBulkLatencySnapshot, GatewayBulkMetrics, GatewayBulkSample, GatewayBulkSnapshot,
-    GatewayConfig, GatewayError, GatewayServer, NearestInterestSuccessorPolicy, ParkOnLossPolicy,
-    RegistrarSweepClock, SharedAdjudicator, SharedBulkAckAdmission, SharedSuccessorPolicy,
-    SuccessorCandidate, SuccessorPolicy, SuccessorRequest, GATEWAY_ALPN, MAX_INTEREST_PEERS,
+    GatewayAreaMetrics, GatewayAreaSnapshot, GatewayBulkLatencySnapshot, GatewayBulkMetrics,
+    GatewayBulkSample, GatewayBulkSnapshot, GatewayConfig, GatewayError, GatewayIntentMetrics,
+    GatewayIntentSnapshot, GatewayMetrics, GatewayReportMetrics, GatewayReportSnapshot,
+    GatewayServer, GatewayServerLatency, GatewayServerLatencySnapshot,
+    NearestInterestSuccessorPolicy, ParkOnLossPolicy, RegistrarSweepClock, SharedAdjudicator,
+    SharedBulkAckAdmission, SharedSuccessorPolicy, SuccessorCandidate, SuccessorPolicy,
+    SuccessorRequest, GATEWAY_ALPN, MAX_INTEREST_PEERS,
 };
 #[cfg(feature = "fdb")]
 pub use intent::{FdbIntentExecutor, IntentFence};

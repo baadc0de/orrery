@@ -863,7 +863,11 @@ fn observe_fencing_rejection(
 use orrery_protocol::metrics::LATENCY_BOUNDARIES_US as BULK_LATENCY_BOUNDARIES_US;
 const NUM_BULK_LATENCY_BUCKETS: usize = BULK_LATENCY_BOUNDARIES_US.len() + 1;
 
-/// One compact server-side bulk latency histogram bucket.
+/// One compact server-side latency histogram bucket.
+///
+/// Shared by every gateway histogram on the D16 lattice — the bulk total, the
+/// intent server span and the area first-page span — because the JSONL
+/// `sample_batch` record they all drain into has exactly this shape.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GatewayBulkSample {
     /// Bucket upper bound in microseconds; overflow uses the observed maximum.
@@ -1069,6 +1073,387 @@ fn elapsed_us(started: Instant) -> u64 {
     u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX)
 }
 
+/// A fixed-memory latency histogram on the shared D16 lattice.
+///
+/// [`GatewayBulkMetrics`] keeps its own copy of these buckets inline, next to
+/// the per-stage sums only the bulk path has. The intent and area paths
+/// measure one span each and need nothing else, so they share this.
+#[derive(Debug)]
+pub struct GatewayServerLatency {
+    buckets: [AtomicU64; NUM_BULK_LATENCY_BUCKETS],
+    max_us: AtomicU64,
+}
+
+impl Default for GatewayServerLatency {
+    fn default() -> Self {
+        Self {
+            buckets: [const { AtomicU64::new(0) }; NUM_BULK_LATENCY_BUCKETS],
+            max_us: AtomicU64::new(0),
+        }
+    }
+}
+
+/// Point-in-time view of a [`GatewayServerLatency`], usable as a drain cursor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GatewayServerLatencySnapshot {
+    buckets: [u64; NUM_BULK_LATENCY_BUCKETS],
+    max_us: u64,
+}
+
+impl Default for GatewayServerLatencySnapshot {
+    fn default() -> Self {
+        Self {
+            buckets: [0; NUM_BULK_LATENCY_BUCKETS],
+            max_us: 0,
+        }
+    }
+}
+
+impl GatewayServerLatency {
+    fn record(&self, micros: u64) {
+        let index = BULK_LATENCY_BOUNDARIES_US.partition_point(|&boundary| micros > boundary);
+        self.buckets[index].fetch_add(1, Ordering::Relaxed);
+        self.max_us.fetch_max(micros, Ordering::Relaxed);
+    }
+
+    /// Capture every bucket and the observed maximum.
+    #[must_use]
+    pub fn snapshot(&self) -> GatewayServerLatencySnapshot {
+        GatewayServerLatencySnapshot {
+            buckets: self
+                .buckets
+                .each_ref()
+                .map(|bucket| bucket.load(Ordering::Relaxed)),
+            max_us: self.max_us.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Return the buckets added since `previous` and advance that cursor.
+    ///
+    /// The reported `value_us` is the bucket's upper bound — the overflow
+    /// bucket reports the observed maximum — which is the one reconstruction
+    /// rule `orrery_protocol::metrics` defines, so a percentile computed from
+    /// the artifact means what the server measured.
+    pub fn delta(&self, previous: &mut GatewayServerLatencySnapshot) -> Vec<GatewayBulkSample> {
+        let current = self.snapshot();
+        let samples = current
+            .buckets
+            .iter()
+            .zip(previous.buckets.iter())
+            .enumerate()
+            .filter_map(|(index, (&now, &before))| {
+                let count = now.saturating_sub(before);
+                (count != 0).then_some(GatewayBulkSample {
+                    value_us: BULK_LATENCY_BOUNDARIES_US
+                        .get(index)
+                        .copied()
+                        .unwrap_or(current.max_us),
+                    count,
+                })
+            })
+            .collect();
+        *previous = current;
+        samples
+    }
+
+    /// Total samples recorded since the process started.
+    #[must_use]
+    pub fn total(&self) -> u64 {
+        self.buckets
+            .iter()
+            .map(|bucket| bucket.load(Ordering::Relaxed))
+            .sum()
+    }
+}
+
+/// A point-in-time read of [`GatewayIntentMetrics`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct GatewayIntentSnapshot {
+    /// Definitive intent acknowledgements sent, refusals included.
+    pub replies: u64,
+    /// Acknowledgements reporting a durable commit.
+    pub committed: u64,
+    /// Acknowledgements reporting a rejection, for any reason.
+    pub rejected: u64,
+    /// Rejections because no executor is configured: this gateway cannot
+    /// commit an intent at all, which reads as a deployment fault rather than
+    /// a `Ruleset` verdict.
+    pub rejected_no_executor: u64,
+    /// Intents refused because the bounded execution lane was full. Counted
+    /// separately because the wire reason is indistinguishable from an
+    /// executor error, and the operator response is the opposite one.
+    pub lane_saturated: u64,
+    /// Summed receipt-through-reply server span, microseconds.
+    pub server_us_sum: u64,
+    /// Largest receipt-through-reply server span, microseconds.
+    pub server_us_max: u64,
+}
+
+/// Always-on intent-path telemetry: the receipt-through-reply server span and
+/// the outcome split behind it.
+///
+/// The span is emitted under `gateway_intent_server_ms`, never under the gated
+/// `intent_commit_ms`: this measurement starts when the gateway has already
+/// received the submission and ends at its send call, so it is strictly
+/// shorter than the client round trip D16 budgets at p99 < 10 ms.
+#[derive(Debug, Default)]
+pub struct GatewayIntentMetrics {
+    replies: AtomicU64,
+    committed: AtomicU64,
+    rejected: AtomicU64,
+    rejected_no_executor: AtomicU64,
+    lane_saturated: AtomicU64,
+    server_us_sum: AtomicU64,
+    server_us_max: AtomicU64,
+    latency: GatewayServerLatency,
+}
+
+impl GatewayIntentMetrics {
+    /// Read every counter.
+    #[must_use]
+    pub fn snapshot(&self) -> GatewayIntentSnapshot {
+        let load = |counter: &AtomicU64| counter.load(Ordering::Relaxed);
+        GatewayIntentSnapshot {
+            replies: load(&self.replies),
+            committed: load(&self.committed),
+            rejected: load(&self.rejected),
+            rejected_no_executor: load(&self.rejected_no_executor),
+            lane_saturated: load(&self.lane_saturated),
+            server_us_sum: load(&self.server_us_sum),
+            server_us_max: load(&self.server_us_max),
+        }
+    }
+
+    /// The receipt-through-reply histogram, for the JSONL reporter.
+    #[must_use]
+    pub fn latency(&self) -> &GatewayServerLatency {
+        &self.latency
+    }
+
+    fn record_lane_saturated(&self) {
+        self.lane_saturated.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_reply(&self, outcome: &IntentOutcome, server_us: u64) {
+        self.replies.fetch_add(1, Ordering::Relaxed);
+        match outcome {
+            IntentOutcome::Committed { .. } => {
+                self.committed.fetch_add(1, Ordering::Relaxed);
+            }
+            IntentOutcome::Rejected { reason } => {
+                self.rejected.fetch_add(1, Ordering::Relaxed);
+                if *reason == REASON_NO_EXECUTOR {
+                    self.rejected_no_executor.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+        self.server_us_sum.fetch_add(server_us, Ordering::Relaxed);
+        self.server_us_max.fetch_max(server_us, Ordering::Relaxed);
+        self.latency.record(server_us);
+    }
+}
+
+/// A point-in-time read of [`GatewayAreaMetrics`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct GatewayAreaSnapshot {
+    /// `Subscribe` messages routed.
+    pub subscribes: u64,
+    /// Subscribes that produced a first `AreaPage` frame, and therefore a
+    /// latency sample.
+    pub first_pages: u64,
+    /// `AreaPage` frames sent, across every chunk of every cell.
+    pub frames: u64,
+    /// Cell reads that failed and answered with an `AreaLoadError`.
+    pub cell_read_errors: u64,
+    /// Summed receipt-through-first-page server span, microseconds.
+    pub first_page_us_sum: u64,
+    /// Largest receipt-through-first-page server span, microseconds.
+    pub first_page_us_max: u64,
+}
+
+/// Always-on area-load telemetry: the receipt-through-first-page server span
+/// and the frame and failure counts around it.
+///
+/// The span is emitted under `gateway_area_first_page_server_ms`, never under
+/// the gated `area_first_page_ms`, for the same reason the intent span carries
+/// its own name.
+#[derive(Debug, Default)]
+pub struct GatewayAreaMetrics {
+    subscribes: AtomicU64,
+    first_pages: AtomicU64,
+    frames: AtomicU64,
+    cell_read_errors: AtomicU64,
+    first_page_us_sum: AtomicU64,
+    first_page_us_max: AtomicU64,
+    latency: GatewayServerLatency,
+}
+
+impl GatewayAreaMetrics {
+    /// Read every counter.
+    #[must_use]
+    pub fn snapshot(&self) -> GatewayAreaSnapshot {
+        let load = |counter: &AtomicU64| counter.load(Ordering::Relaxed);
+        GatewayAreaSnapshot {
+            subscribes: load(&self.subscribes),
+            first_pages: load(&self.first_pages),
+            frames: load(&self.frames),
+            cell_read_errors: load(&self.cell_read_errors),
+            first_page_us_sum: load(&self.first_page_us_sum),
+            first_page_us_max: load(&self.first_page_us_max),
+        }
+    }
+
+    /// The receipt-through-first-page histogram, for the JSONL reporter.
+    #[must_use]
+    pub fn latency(&self) -> &GatewayServerLatency {
+        &self.latency
+    }
+
+    fn record_subscribe(&self) {
+        self.subscribes.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_frame(&self) {
+        self.frames.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_cell_read_error(&self) {
+        self.cell_read_errors.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_first_page(&self, server_us: u64) {
+        self.first_pages.fetch_add(1, Ordering::Relaxed);
+        self.first_page_us_sum
+            .fetch_add(server_us, Ordering::Relaxed);
+        self.first_page_us_max
+            .fetch_max(server_us, Ordering::Relaxed);
+        self.latency.record(server_us);
+    }
+}
+
+/// A point-in-time read of [`GatewayReportMetrics`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct GatewayReportSnapshot {
+    /// Every answer sent for a discrepancy report, refusals included. A report
+    /// has exactly one reply, so this is also the number of reports handled.
+    pub verdicts: u64,
+    /// Reports that reached the adjudicator and came back with a verdict.
+    pub adjudicated: u64,
+    /// Verdicts proving a deviation.
+    pub confirms: u64,
+    /// Verdicts finding re-execution matched within the tolerance bands. The
+    /// denominator of the shadow-mode false-positive rate (D17.3).
+    pub exonerates: u64,
+    /// Verdicts finding the *reporter* fabricated evidence.
+    pub evidence_forged: u64,
+    /// Verdicts that could not decide.
+    pub unadjudicable: u64,
+    /// Refused because this gateway has no adjudicator linked. A stock build
+    /// refuses every report this way by design (docs/09 §1), which is exactly
+    /// why it needs its own counter and not an "errors" bucket.
+    pub refused_no_adjudicator: u64,
+    /// Refused because the reporter's account is over its D16 report budget.
+    pub refused_rate_limited: u64,
+    /// Refused because the report was filed in another peer's name.
+    pub refused_reporter_mismatch: u64,
+    /// Refused because the connection has no bound account to bill.
+    pub refused_no_session: u64,
+    /// Refused with a reason code this build does not know. Non-zero means a
+    /// refusal path was added without a counter.
+    pub refused_other: u64,
+}
+
+/// Always-on discrepancy-report telemetry, split by outcome and refusal
+/// reason.
+///
+/// Recorded at the single reply choke point, so the split is exhaustive by
+/// construction: a report that produced no reply is a bug in the gateway, not
+/// a gap here. The refusal split is what makes shadow mode legible — a cluster
+/// answering every report `REPORT_REFUSED_NO_ADJUDICATOR` looks, from the
+/// witness side alone, exactly like one that exonerates everybody.
+#[derive(Debug, Default)]
+pub struct GatewayReportMetrics {
+    verdicts: AtomicU64,
+    adjudicated: AtomicU64,
+    confirms: AtomicU64,
+    exonerates: AtomicU64,
+    evidence_forged: AtomicU64,
+    unadjudicable: AtomicU64,
+    refused_no_adjudicator: AtomicU64,
+    refused_rate_limited: AtomicU64,
+    refused_reporter_mismatch: AtomicU64,
+    refused_no_session: AtomicU64,
+    refused_other: AtomicU64,
+}
+
+impl GatewayReportMetrics {
+    /// Read every counter.
+    #[must_use]
+    pub fn snapshot(&self) -> GatewayReportSnapshot {
+        let load = |counter: &AtomicU64| counter.load(Ordering::Relaxed);
+        GatewayReportSnapshot {
+            verdicts: load(&self.verdicts),
+            adjudicated: load(&self.adjudicated),
+            confirms: load(&self.confirms),
+            exonerates: load(&self.exonerates),
+            evidence_forged: load(&self.evidence_forged),
+            unadjudicable: load(&self.unadjudicable),
+            refused_no_adjudicator: load(&self.refused_no_adjudicator),
+            refused_rate_limited: load(&self.refused_rate_limited),
+            refused_reporter_mismatch: load(&self.refused_reporter_mismatch),
+            refused_no_session: load(&self.refused_no_session),
+            refused_other: load(&self.refused_other),
+        }
+    }
+
+    fn record(&self, verdict: Option<&Verdict>, reason: u16) {
+        self.verdicts.fetch_add(1, Ordering::Relaxed);
+        if let Some(verdict) = verdict {
+            self.adjudicated.fetch_add(1, Ordering::Relaxed);
+            let counter = match verdict {
+                Verdict::Confirms { .. } => &self.confirms,
+                Verdict::Exonerates => &self.exonerates,
+                Verdict::EvidenceForged(_) => &self.evidence_forged,
+                Verdict::Unadjudicable(_) => &self.unadjudicable,
+            };
+            counter.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        let counter = match reason {
+            REPORT_REFUSED_NO_ADJUDICATOR => &self.refused_no_adjudicator,
+            REPORT_REFUSED_RATE_LIMITED => &self.refused_rate_limited,
+            REPORT_REFUSED_REPORTER_MISMATCH => &self.refused_reporter_mismatch,
+            REPORT_REFUSED_NO_SESSION => &self.refused_no_session,
+            _ => &self.refused_other,
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Every always-on server-side gateway counter, in one shareable handle.
+///
+/// Collection is unconditional — the precedent is [`AuthorityMetrics`], and
+/// the reason is the same: a counter that only exists when someone remembered
+/// a flag is not telemetry, it is a debugging session you have to schedule in
+/// advance. The JSONL sink stays optional; the counters do not.
+///
+/// **What this does not do.** `persistd` has no scrape endpoint and no admin
+/// surface, so a node started without `--metrics-jsonl` accumulates these and
+/// exposes them to nothing. This keeps them warm and correct for the D12 OTel
+/// bridge that will read them; it does **not** make them reachable on a
+/// running node without a restart.
+#[derive(Debug, Default)]
+pub struct GatewayMetrics {
+    /// Bulk acknowledgement stages and the server-side bulk histogram.
+    pub bulk: GatewayBulkMetrics,
+    /// Intent receipt-through-reply span and outcome split.
+    pub intent: GatewayIntentMetrics,
+    /// Area-load receipt-through-first-page span and frame counts.
+    pub area: GatewayAreaMetrics,
+    /// Discrepancy-report outcome and refusal split.
+    pub report: GatewayReportMetrics,
+}
+
 /// The current single-node policy: its ownership is always fresh.
 #[derive(Debug, Default)]
 pub struct FreshBulkAckAdmission;
@@ -1143,8 +1528,12 @@ pub struct GatewayConfig {
     pub identity_clock: SharedGatewayClock,
     /// Identity-service health used only for established-token expiry grace.
     pub identity_health: SharedIdentityHealth,
-    /// Bulk acknowledgement stage telemetry shared with the metrics reporter.
-    pub bulk_metrics: Option<Arc<GatewayBulkMetrics>>,
+    /// Always-on server-side telemetry: bulk stages, the intent and area
+    /// server spans, and the report outcome split. Share the handle to read
+    /// it; a fresh one is created when the caller does not, and collection is
+    /// unconditional either way (see [`GatewayMetrics`] for what that does and
+    /// does not buy).
+    pub metrics: Arc<GatewayMetrics>,
     /// Maximum retained authority peers, capped at 4,096.
     pub peer_registry_capacity: usize,
     /// Maximum live leases tracked for one authenticated NodeId, capped at 256.
@@ -1193,7 +1582,7 @@ impl Default for GatewayConfig {
             authorizer: Arc::new(DenyAllGatewayAuthorizer),
             identity_clock: Arc::new(SystemGatewayClock),
             identity_health: Arc::new(AvailableIdentityHealth),
-            bulk_metrics: None,
+            metrics: Arc::new(GatewayMetrics::default()),
             peer_registry_capacity: MAX_PEER_REGISTRY_ENTRIES,
             peer_lease_capacity: MAX_PEER_LIVE_LEASES,
             peer_idle_retention_ms: MAX_SESSION_TOKEN_TTL_MS,
@@ -2019,6 +2408,7 @@ pub struct GatewayServer {
     endpoint: Arc<Endpoint>,
     interest_authority: SharedInterestAuthority,
     authority_metrics: Arc<AuthorityMetrics>,
+    metrics: Arc<GatewayMetrics>,
     send_failures: Arc<AtomicU64>,
     shutdown: oneshot::Sender<()>,
     join: tokio::task::JoinHandle<()>,
@@ -2060,7 +2450,7 @@ impl GatewayServer {
                 config.peer_lease_capacity,
             )),
         };
-        let bulk_metrics = config.bulk_metrics;
+        let metrics = Arc::clone(&config.metrics);
         let authority_metrics = Arc::clone(&config.authority_metrics);
         let redistributor = Arc::new(Redistributor {
             peers: Arc::clone(&admission.peers),
@@ -2088,7 +2478,7 @@ impl GatewayServer {
             Arc::clone(&interest_authority),
             admission,
             report_limiter,
-            bulk_metrics,
+            Arc::clone(&metrics),
             redistributor,
             lease_sweep_clock,
             Arc::clone(&send_failures),
@@ -2098,6 +2488,7 @@ impl GatewayServer {
             endpoint,
             interest_authority,
             authority_metrics,
+            metrics,
             send_failures,
             shutdown,
             join,
@@ -2133,6 +2524,14 @@ impl GatewayServer {
         &self.authority_metrics
     }
 
+    /// The always-on server-side telemetry: bulk stages, the intent and area
+    /// server spans, and the report outcome split. Collected whether or not a
+    /// metrics sink was configured.
+    #[must_use]
+    pub fn metrics(&self) -> &Arc<GatewayMetrics> {
+        &self.metrics
+    }
+
     /// The number of reply datagram sends that failed since startup (e.g. an
     /// oversize frame rejected by QUIC). Every failure is also logged with the
     /// remote and the byte length; this counter is the always-on signal that a
@@ -2166,7 +2565,7 @@ async fn accept_loop(
     interest_authority: SharedInterestAuthority,
     admission: GatewayAdmission,
     report_limiter: Arc<ReportLimiter>,
-    bulk_metrics: Option<Arc<GatewayBulkMetrics>>,
+    metrics: Arc<GatewayMetrics>,
     redistributor: Arc<Redistributor>,
     lease_sweep_clock: SharedClaimClock,
     send_failures: Arc<AtomicU64>,
@@ -2195,7 +2594,7 @@ async fn accept_loop(
                 let interest_authority = Arc::clone(&interest_authority);
                 let admission = admission.clone();
                 let report_limiter = Arc::clone(&report_limiter);
-                let bulk_metrics = bulk_metrics.clone();
+                let metrics = Arc::clone(&metrics);
                 let redistributor = Arc::clone(&redistributor);
                 let send_failures = Arc::clone(&send_failures);
                 tokio::spawn(handle_connection(
@@ -2210,7 +2609,7 @@ async fn accept_loop(
                     interest_authority,
                     admission,
                     report_limiter,
-                    bulk_metrics,
+                    metrics,
                     redistributor,
                     send_failures,
                 ));
@@ -2241,7 +2640,7 @@ async fn handle_connection(
     interest_authority: SharedInterestAuthority,
     admission: GatewayAdmission,
     report_limiter: Arc<ReportLimiter>,
-    bulk_metrics: Option<Arc<GatewayBulkMetrics>>,
+    metrics: Arc<GatewayMetrics>,
     redistributor: Arc<Redistributor>,
     send_failures: Arc<AtomicU64>,
 ) {
@@ -2754,7 +3153,7 @@ async fn handle_connection(
                 let send = Arc::clone(&send);
                 let router = Arc::clone(&router);
                 let bulk_ack_admission = Arc::clone(&bulk_ack_admission);
-                let bulk_metrics = bulk_metrics.clone();
+                let metrics = Arc::clone(&metrics);
                 let authority_metrics = Arc::clone(&redistributor.metrics);
                 let permit = Arc::clone(&inflight_diffs).acquire_owned().await;
                 match permit {
@@ -2767,7 +3166,7 @@ async fn handle_connection(
                                 &active_session,
                                 &router,
                                 &bulk_ack_admission,
-                                bulk_metrics.as_deref(),
+                                &metrics.bulk,
                                 authority_metrics,
                                 received_at,
                             )
@@ -2781,7 +3180,7 @@ async fn handle_connection(
                             &active_session,
                             &router,
                             &bulk_ack_admission,
-                            bulk_metrics.as_deref(),
+                            &metrics.bulk,
                             authority_metrics,
                             received_at,
                         )
@@ -2790,18 +3189,44 @@ async fn handle_connection(
                 }
             }
             GatewayMsg::Subscribe { grid, cells } => {
+                // Stamped before the permit wait, like the diff arm above: the
+                // D16 span a client observes starts when the request lands,
+                // and a subscribe that queues behind 27 cold scans has spent
+                // that time whether or not this task was running.
+                let received_at = Instant::now();
                 // Pages answer on the area lane, not the control lane.
                 let send = Arc::clone(&send_area);
                 let router = Arc::clone(&router);
+                let metrics = Arc::clone(&metrics);
                 let permit = Arc::clone(&inflight_control).acquire_owned().await;
                 match permit {
                     Ok(permit) => {
                         tokio::spawn(async move {
                             let _permit = permit;
-                            route_subscribe(send.as_ref(), grid, cells, remote, &router).await;
+                            route_subscribe(
+                                send.as_ref(),
+                                grid,
+                                cells,
+                                remote,
+                                &router,
+                                &metrics.area,
+                                received_at,
+                            )
+                            .await;
                         });
                     }
-                    Err(_) => route_subscribe(send.as_ref(), grid, cells, remote, &router).await,
+                    Err(_) => {
+                        route_subscribe(
+                            send.as_ref(),
+                            grid,
+                            cells,
+                            remote,
+                            &router,
+                            &metrics.area,
+                            received_at,
+                        )
+                        .await;
+                    }
                 }
             }
             GatewayMsg::SubmitIntent { intent } => {
@@ -2810,17 +3235,36 @@ async fn handle_connection(
                 // bounded lane. In particular, never await a semaphore here:
                 // waiting would recreate the receive-loop HOL blocking this
                 // lane is intended to prevent.
+                // Receipt, before the first edge check: an intent refused
+                // for a bad signature is measured over the same span as one
+                // that commits, so the histogram cannot be flattered by
+                // counting only the cheap exits.
+                let received_at = Instant::now();
                 if let Err(outcome) = admit_intent(&intent, remote, validator.as_ref()) {
-                    send_intent_reply(send.as_ref(), intent.intent_id, outcome);
+                    send_intent_reply(
+                        send.as_ref(),
+                        intent.intent_id,
+                        outcome,
+                        &metrics.intent,
+                        received_at,
+                    );
                     continue;
                 }
                 match reserve_intent_lane(Arc::clone(&inflight_intents)) {
                     Ok(permit) => {
                         let send = Arc::clone(&send);
                         let executor = executor.clone();
+                        let metrics = Arc::clone(&metrics);
                         tokio::spawn(async move {
                             let _permit = permit;
-                            execute_admitted_intent(send.as_ref(), intent, &executor).await;
+                            execute_admitted_intent(
+                                send.as_ref(),
+                                intent,
+                                &executor,
+                                &metrics.intent,
+                                received_at,
+                            )
+                            .await;
                         });
                     }
                     Err(outcome) => {
@@ -2829,7 +3273,14 @@ async fn handle_connection(
                         // and may submit a new, idempotently keyed intent on
                         // its normal retry policy.
                         warn!(%remote, intent_id = intent.intent_id, "gateway: intent lane saturated");
-                        send_intent_reply(send.as_ref(), intent.intent_id, outcome);
+                        metrics.intent.record_lane_saturated();
+                        send_intent_reply(
+                            send.as_ref(),
+                            intent.intent_id,
+                            outcome,
+                            &metrics.intent,
+                            received_at,
+                        );
                     }
                 }
             }
@@ -2838,23 +3289,43 @@ async fn handle_connection(
                 // time and both decide whether the expensive part runs at all.
                 if report.reporter != remote {
                     warn!(%remote, "gateway: report filed in another peer's name");
-                    send_report_refusal(send.as_ref(), &report, REPORT_REFUSED_REPORTER_MISMATCH);
+                    send_report_refusal(
+                        send.as_ref(),
+                        &report,
+                        REPORT_REFUSED_REPORTER_MISMATCH,
+                        &metrics.report,
+                    );
                     continue;
                 }
                 let Some(account) = session.as_ref().map(|session| session.account) else {
                     // No session, no account, nothing to bill the report to.
-                    send_report_refusal(send.as_ref(), &report, REPORT_REFUSED_NO_SESSION);
+                    send_report_refusal(
+                        send.as_ref(),
+                        &report,
+                        REPORT_REFUSED_NO_SESSION,
+                        &metrics.report,
+                    );
                     continue;
                 };
                 if !report_limiter
                     .admit(account, admission.claim_clock.now_ms())
                     .await
                 {
-                    send_report_refusal(send.as_ref(), &report, REPORT_REFUSED_RATE_LIMITED);
+                    send_report_refusal(
+                        send.as_ref(),
+                        &report,
+                        REPORT_REFUSED_RATE_LIMITED,
+                        &metrics.report,
+                    );
                     continue;
                 }
                 let Some(adjudicator) = adjudicator.clone() else {
-                    send_report_refusal(send.as_ref(), &report, REPORT_REFUSED_NO_ADJUDICATOR);
+                    send_report_refusal(
+                        send.as_ref(),
+                        &report,
+                        REPORT_REFUSED_NO_ADJUDICATOR,
+                        &metrics.report,
+                    );
                     continue;
                 };
                 // Replay is CPU-bound — a full 180-tick single-entity window
@@ -2862,10 +3333,11 @@ async fn handle_connection(
                 // blocking pool rather than occupying a runtime worker that
                 // owes other connections their bulk acks.
                 let send = Arc::clone(&send);
+                let metrics = Arc::clone(&metrics);
                 let permit = Arc::clone(&inflight_control).acquire_owned().await;
                 tokio::task::spawn_blocking(move || {
                     let _permit = permit;
-                    adjudicate_report(send.as_ref(), &adjudicator, &report);
+                    adjudicate_report(send.as_ref(), &adjudicator, &report, &metrics.report);
                 });
             }
         }
@@ -3296,6 +3768,8 @@ async fn execute_admitted_intent(
     send: &(dyn Fn(Bytes) + Send + Sync),
     intent: Intent,
     executor: &Option<SharedExecutor>,
+    metrics: &GatewayIntentMetrics,
+    received_at: Instant,
 ) {
     let intent_id = intent.intent_id;
 
@@ -3310,7 +3784,7 @@ async fn execute_admitted_intent(
             Err(err) => error_outcome(&err),
         },
     };
-    send_intent_reply(send, intent_id, outcome);
+    send_intent_reply(send, intent_id, outcome, metrics, received_at);
 }
 
 /// Re-run one report's evidence and answer with the verdict.
@@ -3325,9 +3799,10 @@ fn adjudicate_report(
     send: &(dyn Fn(Bytes) + Send + Sync),
     adjudicator: &AdjudicationExecutor,
     report: &DiscrepancyReport,
+    metrics: &GatewayReportMetrics,
 ) {
     let verdict = adjudicator.adjudicate(report);
-    send_report_verdict(send, report, Some(verdict), REPORT_ADJUDICATED);
+    send_report_verdict(send, report, Some(verdict), REPORT_ADJUDICATED, metrics);
 }
 
 /// Refuse a report with a stable code and no verdict.
@@ -3339,8 +3814,9 @@ fn send_report_refusal(
     send: &(dyn Fn(Bytes) + Send + Sync),
     report: &DiscrepancyReport,
     reason: u16,
+    metrics: &GatewayReportMetrics,
 ) {
-    send_report_verdict(send, report, None, reason);
+    send_report_verdict(send, report, None, reason, metrics);
 }
 
 /// Encode and send one report's answer. Every path uses this helper so a
@@ -3350,7 +3826,12 @@ fn send_report_verdict(
     report: &DiscrepancyReport,
     verdict: Option<Verdict>,
     reason: u16,
+    metrics: &GatewayReportMetrics,
 ) {
+    // One choke point, so the outcome split is exhaustive by construction:
+    // four refusal exits and one adjudication exit all pass through here, and
+    // a future fifth refusal cannot forget to be counted.
+    metrics.record(verdict.as_ref(), reason);
     let reply = GatewayReply::ReportVerdict {
         subject: report.subject,
         entity: report.bundle.entity,
@@ -3367,7 +3848,13 @@ fn send_intent_reply(
     send: &(dyn Fn(Bytes) + Send + Sync),
     intent_id: u128,
     outcome: IntentOutcome,
+    metrics: &GatewayIntentMetrics,
+    received_at: Instant,
 ) {
+    // Measured up to the send call, not past it: everything after is the
+    // wire, which is precisely the part `intent_commit_ms` covers and this
+    // series must not.
+    metrics.record_reply(&outcome, elapsed_us(received_at));
     let reply = GatewayReply::IntentAck { intent_id, outcome };
     send(Bytes::from(encode_stream_frame(&reply)));
 }
@@ -3421,7 +3908,7 @@ async fn route_session_diff(
     session: &PeerSession,
     router: &Arc<dyn Router>,
     bulk_ack_admission: &SharedBulkAckAdmission,
-    bulk_metrics: Option<&GatewayBulkMetrics>,
+    bulk_metrics: &GatewayBulkMetrics,
     authority_metrics: Arc<AuthorityMetrics>,
     received_at: Instant,
 ) {
@@ -3466,7 +3953,7 @@ async fn route_diff(
     route: DiffRoute,
     router: &Arc<dyn Router>,
     bulk_ack_admission: &SharedBulkAckAdmission,
-    bulk_metrics: Option<&GatewayBulkMetrics>,
+    bulk_metrics: &GatewayBulkMetrics,
 ) {
     let DiffRoute {
         diff,
@@ -3569,15 +4056,13 @@ async fn route_diff(
                 provisional,
             };
             send(Bytes::from(encode_datagram(&reply)));
-            if let Some(bulk_metrics) = bulk_metrics {
-                bulk_metrics.record(
-                    route_queue_us,
-                    router_apply_us,
-                    journal_wait_us,
-                    elapsed_us(reply_started),
-                    elapsed_us(received_at),
-                );
-            }
+            bulk_metrics.record(
+                route_queue_us,
+                router_apply_us,
+                journal_wait_us,
+                elapsed_us(reply_started),
+                elapsed_us(received_at),
+            );
         }
         Err(_) => {
             let reply = GatewayReply::BulkNack {
@@ -3608,12 +4093,21 @@ async fn route_subscribe(
     cells: Vec<CellId>,
     remote: NodeId,
     router: &Arc<dyn Router>,
+    metrics: &GatewayAreaMetrics,
+    received_at: Instant,
 ) {
     // A per-send page counter: each cell's page (and each chunk of it) is
     // stamped with a distinct `page_seq`, so a client's reassembly never mixes
     // chunks of two sends of the same cell (a retried subscribe re-sends the
     // page under a new seq).
     let mut page_seq = 0u32;
+    // The whole span lives inside this one scope — the Subscribe arrived
+    // before it and the first frame leaves inside it — so an `Instant` and a
+    // bool are the entire measurement. `first_page` flips on the send call
+    // that carries the first frame, page or not: a subscribe whose every cell
+    // read failed sends no page and contributes no sample.
+    let mut first_page = true;
+    metrics.record_subscribe();
     for cell in cells {
         // Live cells come from actor memory (authoritative, ≥ checkpoint
         // freshness); cold cells from the durable tier range scan
@@ -3636,6 +4130,11 @@ async fn route_subscribe(
                 page_seq = page_seq.wrapping_add(1);
                 for frame in chunk_area_page(cell, entities, payloads, live, page_seq) {
                     send(Bytes::from(frame));
+                    metrics.record_frame();
+                    if first_page {
+                        first_page = false;
+                        metrics.record_first_page(elapsed_us(received_at));
+                    }
                 }
             }
             Err(e) => {
@@ -3645,6 +4144,7 @@ async fn route_subscribe(
                     orrery_protocol::AREA_LOAD_ERR_COLD
                 };
                 warn!(?e, ?cell, %grid, %remote, kind, "gateway: area-load cell read failed");
+                metrics.record_cell_read_error();
                 send(Bytes::from(encode_stream_frame(
                     &GatewayReply::AreaLoadError { cell, kind },
                 )));
@@ -4691,7 +5191,7 @@ mod tests {
             },
             &router,
             &admission,
-            Some(&metrics),
+            &metrics,
         )
         .await;
 
@@ -4795,7 +5295,7 @@ mod tests {
             },
             &router,
             &admission,
-            None,
+            &GatewayBulkMetrics::default(),
         )
         .await;
         let bytes = sent
