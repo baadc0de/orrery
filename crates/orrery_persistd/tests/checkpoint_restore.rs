@@ -1416,3 +1416,92 @@ async fn fdb_split_carries_the_pending_row_clear_to_the_child() {
     }
     store.delete(CellId::ROOT, grid).await.unwrap();
 }
+
+#[cfg(feature = "fdb")]
+#[tokio::test]
+async fn fdb_seeded_shard_loads_without_a_ckpt_row() {
+    // P-11: `orrery-seed` writes `world/` rows and deliberately **no**
+    // `ckpt/{grid}/{shard}` row (docs/12-world-seeding.md §11.4), so a freshly
+    // seeded world is a shard with state and no watermark. Recovery has to
+    // adopt it: with an empty entity bag `committed_entity_cell` resolves
+    // nothing, every lease claim is denied `NotEligible`, and no bulk write is
+    // ever fenced through — a whole cluster's world invisible behind one
+    // missing 13-byte key.
+    //
+    // The rows below are written the way the seeder writes them — raw
+    // `world/` keys through `keyspace`, no checkpoint transaction — so the
+    // test reproduces the seeder's output rather than a checkpoint with a
+    // hole punched in it.
+    let Some(cluster) = support::fdb_cluster_file() else {
+        eprintln!("skipping: ORRERY_FDB_CLUSTER_FILE not set and no .fdb-dev/fdb.cluster");
+        return;
+    };
+    use orrery_persistd::keyspace;
+
+    // Its own grid, like every other fdb test here: the shared cluster holds
+    // other agents' rows (P-7 makes grids disjoint by construction).
+    const GRID: GridId = GridId::new(9008);
+    let c1 = CellId::from_coords(glam::IVec3::new(3, 4, 5), 18).unwrap();
+    let c2 = CellId::from_coords(glam::IVec3::new(-6, 7, -8), 18).unwrap();
+    // A shard that has never held a row, in the same grid: the "no watermark
+    // and no rows" case must stay `None`, or every unseeded shard would start
+    // reporting a phantom checkpoint.
+    let barren = CellId::from_coords(glam::IVec3::new(-1, -1, -1), 1).unwrap();
+    assert!(!barren.is_prefix_of(c1) && !barren.is_prefix_of(c2));
+
+    let ctx = orrery_persistd::FdbContext::connect(&cluster).unwrap();
+    let store = Arc::new(orrery_persistd::checkpoint::FdbCheckpointStore::from_context(&ctx));
+    // The cluster is shared and long-lived: start from a known-empty subtree
+    // rather than assuming one.
+    store.delete(CellId::ROOT, GRID).await.unwrap();
+
+    let db = ctx.database();
+    db.run(|trx, _| async move {
+        for (entity, cell) in [(1u64, c1), (2, c1), (3, c2)] {
+            trx.set(
+                &keyspace::world_key(GRID, cell, PersistId::new(entity)),
+                &keyspace::encode_live_value(&entity.to_le_bytes()),
+            );
+        }
+        Ok(())
+    })
+    .await
+    .unwrap();
+
+    // The store adopts the seeded rows at watermark 0:0 — no checkpoint was
+    // taken, so the whole journal is the tail (§3.4 steps 2–3).
+    let loaded = store
+        .load(CellId::ROOT, GRID)
+        .await
+        .unwrap()
+        .expect("a seeded shard with world rows is not an absent checkpoint");
+    assert_eq!(loaded.entities.len(), 3, "every seeded row is recovered");
+    assert_eq!(loaded.by_cell.get(&PersistId::new(1)), Some(&c1));
+    assert_eq!(loaded.by_cell.get(&PersistId::new(3)), Some(&c2));
+    assert_eq!(loaded.watermark, Lsn::new(0, 0), "replay the whole journal");
+    assert_eq!(loaded.epoch, Epoch::new(0), "no epoch was ever taken under");
+    assert!(
+        store.load(barren, GRID).await.unwrap().is_none(),
+        "a shard with neither rows nor watermark is still absent"
+    );
+
+    // The load is only worth anything if the actor serves it: this is the read
+    // `committed_entity_cell` fails on when recovery drops the seeded world.
+    let dir = tempfile::tempdir().unwrap();
+    let rt = CellRuntime::open(&runtime_config_in(dir.path(), GRID), &store_dyn(&store))
+        .await
+        .unwrap();
+    let page = rt.read(GRID, c1).await.unwrap();
+    assert_eq!(
+        page.entities.len(),
+        2,
+        "the recovered actor serves the seeded cell's entities"
+    );
+    assert_eq!(
+        page.entities[&PersistId::new(1)].components.as_ref(),
+        &1u64.to_le_bytes()
+    );
+    rt.close().await.unwrap();
+
+    store.delete(CellId::ROOT, GRID).await.unwrap();
+}
