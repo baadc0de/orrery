@@ -564,12 +564,16 @@ pub fn process_lease_replies(
                 // An explicit failed heartbeat wins over any row carried for
                 // status. This drops the local fence immediately instead of
                 // waiting for the conservative expiry floor.
+                //
+                // Matched on the entity as well as the token: `LeaseId` is a
+                // per-row counter, so one refused `LeaseId(1)` would otherwise
+                // drop every other entity this peer holds at its first token.
                 let invalidated: Vec<_> = state
                     .leases
                     .iter()
                     .filter_map(|(persist, local)| {
                         invalid
-                            .contains(&local.lease_id)
+                            .contains(&(*persist, local.lease_id))
                             .then_some((*persist, local.clone()))
                     })
                     .collect();
@@ -661,7 +665,11 @@ pub fn maintain_leases(
     }
     if state.last_heartbeat.elapsed() >= HEARTBEAT_INTERVAL && !state.leases.is_empty() {
         outbox.0.push(LeaseMsg::Heartbeat {
-            lease_ids: state.leases.values().map(|lease| lease.lease_id).collect(),
+            renew: state
+                .leases
+                .iter()
+                .map(|(persist, lease)| (*persist, lease.lease_id))
+                .collect(),
             tick: Tick::new(state.now_ms),
         });
         state.last_heartbeat = Instant::now();
@@ -1565,13 +1573,78 @@ mod tests {
             .0
             .push(LeaseMsg::HeartbeatAck {
                 leases: Vec::new(),
-                invalid: vec![LeaseId(3)],
+                invalid: vec![(PersistId::new(5), LeaseId(3))],
             });
         app.update();
         assert!(app.world().get::<LocallyAuthoritative>(e).is_none());
         assert_eq!(
             app.world().get::<AuthorityPhase>(e),
             Some(&AuthorityPhase::Remote)
+        );
+    }
+
+    /// A refusal drops exactly the entity it names.
+    ///
+    /// `LeaseId` is a per-row counter, so a peer holding several freshly
+    /// claimed entities holds several `LeaseId(1)`s. Matching an ack's
+    /// `invalid` list on the bare token therefore dropped every one of them —
+    /// the holder stops writing entities the registrar never refused.
+    #[test]
+    fn an_invalid_ack_does_not_drop_a_sibling_at_the_same_token() {
+        let mut app = App::new();
+        app.add_plugins(OrreryAuthorityPlugin);
+        let refused = PersistId::new(1);
+        let kept = PersistId::new(2);
+        let mut spawn = |persisted: PersistId| {
+            let entity = app
+                .world_mut()
+                .spawn((PersistIdentity(persisted), AuthorityPhase::Remote))
+                .id();
+            let claim_id = begin_test_claim(&mut app, entity, persisted);
+            app.world_mut()
+                .resource_mut::<LeaseInbox>()
+                .0
+                .push(LeaseMsg::Grant {
+                    claim_id,
+                    entity: persisted,
+                    // Both entities are freshly claimed, so both sit at the
+                    // first token: the collision is the normal case, not a
+                    // contrived one.
+                    lease_id: LeaseId(1),
+                    seq: SeqPair::default(),
+                    ttl_ms: 10_000,
+                    prev_holder: None,
+                });
+            app.update();
+            entity
+        };
+        let refused_entity = spawn(refused);
+        let kept_entity = spawn(kept);
+        assert!(app
+            .world()
+            .get::<LocallyAuthoritative>(kept_entity)
+            .is_some());
+
+        app.world_mut()
+            .resource_mut::<LeaseInbox>()
+            .0
+            .push(LeaseMsg::HeartbeatAck {
+                leases: Vec::new(),
+                invalid: vec![(refused, LeaseId(1))],
+            });
+        app.update();
+
+        assert!(
+            app.world()
+                .get::<LocallyAuthoritative>(refused_entity)
+                .is_none(),
+            "the refused entity must stop writing"
+        );
+        assert!(
+            app.world()
+                .get::<LocallyAuthoritative>(kept_entity)
+                .is_some(),
+            "a sibling at the same per-row token keeps its fence"
         );
     }
 

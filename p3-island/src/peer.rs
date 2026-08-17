@@ -216,7 +216,10 @@ pub async fn run(config: PeerConfig) -> Result<()> {
                 if !held.is_empty() {
                     session.send_control(&GatewayMsg::Lease {
                         message: LeaseMsg::Heartbeat {
-                            lease_ids: held.values().map(|state| state.lease_id).collect(),
+                            renew: held
+                                .iter()
+                                .map(|(entity, state)| (*entity, state.lease_id))
+                                .collect(),
                             tick: Tick::new(started.elapsed().as_millis() as u64),
                         },
                     })?;
