@@ -422,6 +422,21 @@ pub(crate) enum CellMsg {
         now_ms: u64,
         reply: oneshot::Sender<Result<Option<Lease>, Reject>>,
     },
+    /// Renew a batch of one session's leases in a single mailbox turn.
+    ///
+    /// One peer heartbeats every lease it holds every 2.5 s, and the rows all
+    /// belong to this actor: sending them one at a time makes a holder of N
+    /// entities cost N turns through a bounded mailbox for no arbitration
+    /// benefit, since each renewal is an independent check against its own
+    /// row. The reply is positional — one entry per requested pair, `None`
+    /// where the pair did not renew — so the ack still names every invalid
+    /// pair individually and a holder stops writing that entity promptly.
+    HeartbeatLeases {
+        renew: Vec<(PersistId, LeaseId)>,
+        holder: NodeId,
+        now_ms: u64,
+        reply: oneshot::Sender<Result<Vec<Option<Lease>>, Reject>>,
+    },
     /// Return the current row while checking its fencing token.
     ValidateLease {
         entity: PersistId,
@@ -627,6 +642,14 @@ async fn actor_loop(env: &mut ActorEnv, mut rx: mpsc::Receiver<CellMsg>) {
                 reply,
             } => {
                 let _ = reply.send(heartbeat_lease(env, entity, holder, lease_id, now_ms));
+            }
+            CellMsg::HeartbeatLeases {
+                renew,
+                holder,
+                now_ms,
+                reply,
+            } => {
+                let _ = reply.send(heartbeat_leases(env, &renew, holder, now_ms));
             }
             CellMsg::ValidateLease {
                 entity,
@@ -894,8 +917,44 @@ fn heartbeat_lease(
     Ok(row)
 }
 
+/// Renew every pair in one batch against this actor's registrar.
+///
+/// The registrar is cloned once for the whole batch rather than once per pair:
+/// heartbeats never change a durable sequence or token, so the batch has no
+/// partial-durability problem to unwind, and each pair is still checked
+/// against its own row exactly as the single-entity path checks it.
+fn heartbeat_leases(
+    env: &mut ActorEnv,
+    renew: &[(PersistId, LeaseId)],
+    holder: NodeId,
+    now_ms: u64,
+) -> Result<Vec<Option<Lease>>, Reject> {
+    let mut next = env.state.leases.clone();
+    let rows = renew
+        .iter()
+        .map(|(entity, lease_id)| {
+            next.heartbeat(*entity, holder, *lease_id, now_ms);
+            next.current(*entity)
+        })
+        .collect();
+    env.state.leases = next;
+    Ok(rows)
+}
+
 fn with_fresh_recovery_ttl(mut row: Lease, now_ms: u64) -> Lease {
-    row.expires_at = now_ms.saturating_add(crate::lease::LEASE_TTL_MS);
+    // The registrar clock is process-local, so a durable instant minted in a
+    // previous process means nothing here — which is why a held row is
+    // restored with a full fresh TTL. A *parked* row carries no TTL; when it
+    // is a crashed strong owner's, `expires_at` is its reservation deadline,
+    // and it is re-armed for the same reason and in the same direction: the
+    // owner gets its full window measured from this process's clock.
+    row.expires_at = if row.holder.is_some() {
+        now_ms.saturating_add(crate::lease::LEASE_TTL_MS)
+    } else if row.flags.contains(orrery_protocol::LeaseFlags::STRONG_HELD) {
+        now_ms.saturating_add(crate::lease::STRONG_PARK_GRACE_MS)
+    } else {
+        0
+    };
     row
 }
 
@@ -912,8 +971,11 @@ async fn park_lease(
         return Ok(Some(current));
     }
     let mut next = env.state.leases.clone();
+    // Parking is a registrar-clock event like expiry, and this path has no
+    // caller-supplied instant: a disconnect is observed by the gateway, not
+    // scheduled by it.
     let row = next
-        .disconnect(holder)
+        .disconnect(holder, crate::lease::registrar_now_ms())
         .into_iter()
         .find(|row| row.entity == entity)
         .expect("checked holder");
@@ -1404,6 +1466,27 @@ impl CellActorHandle {
                 entity,
                 holder,
                 lease_id,
+                now_ms,
+                reply,
+            })
+            .await
+            .map_err(|_| Reject::JournalClosed)?;
+        rx.await.map_err(|_| Reject::JournalClosed)?
+    }
+    /// Renew a batch of this session's leases in one mailbox turn.
+    ///
+    /// Returns one entry per requested pair, in request order.
+    pub async fn heartbeat_leases(
+        &self,
+        renew: Vec<(PersistId, LeaseId)>,
+        holder: NodeId,
+        now_ms: u64,
+    ) -> Result<Vec<Option<Lease>>, Reject> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(CellMsg::HeartbeatLeases {
+                renew,
+                holder,
                 now_ms,
                 reply,
             })

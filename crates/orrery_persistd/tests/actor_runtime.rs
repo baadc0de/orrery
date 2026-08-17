@@ -18,6 +18,9 @@ use orrery_persistd::{
     LeaseStore, LeaseStoreError, MemLeaseStore, Reject, RekeyError, Router, RuntimeConfig,
     LEASE_TTL_MS,
 };
+// Not re-exported at the crate root: `lib.rs` belongs to another lane, and the
+// module path is public and does the job.
+use orrery_persistd::lease::CLAIM_HERD_DAMPER_MS;
 
 use orrery_protocol::{
     CellId, ClaimKind, DenyReason, EntityRekey, Epoch, GridId, JournalRecord, Lease, LeaseFlags,
@@ -2442,30 +2445,150 @@ async fn concurrent_weak_claims_are_serialized_with_monotonic_fencing() {
     let second = actor.claim_lease(entity, CellId::ROOT, test_node(16), ClaimKind::Weak, 0);
     let (first, second) = tokio::join!(first, second);
     let outcomes = [first.unwrap(), second.unwrap()];
-    let mut granted: Vec<_> = outcomes
+    let granted: Vec<_> = outcomes
         .iter()
         .filter_map(|outcome| match outcome {
             ClaimResult::Granted(row) => Some(row.clone()),
             ClaimResult::Denied(_) => None,
         })
         .collect();
-    // D7 lets a weak claim replace another weak holder. The mailbox still
-    // serializes that race: each successful transition receives the next
-    // fencing token and sequence, leaving one unambiguous final row.
-    assert_eq!(granted.len(), 2);
-    granted.sort_by_key(|row| row.lease_id);
-    assert_eq!(granted[0].lease_id.0, 1);
-    assert_eq!(granted[1].lease_id.0, 2);
-    assert_eq!(granted[0].seq.auth_seq, 1);
-    assert_eq!(granted[1].seq.auth_seq, 2);
+    let denied: Vec<_> = outcomes
+        .iter()
+        .filter_map(|outcome| match outcome {
+            ClaimResult::Denied(reason) => Some(reason.clone()),
+            ClaimResult::Granted(_) => None,
+        })
+        .collect();
+    // The registrar arbitrates the race rather than serving it. Granting both
+    // in turn is not "serialized": the second grant invalidates the token the
+    // first claimant just installed, and the first claimant is never told —
+    // it keeps simulating an entity somebody else now owns. Exactly one wins;
+    // the loser is refused, and the refusal names the winner and its pair so
+    // the loser rolls its optimistic claim back onto the right stream
+    // (docs/04-authority.md §4.1).
+    assert_eq!(granted.len(), 1, "one winner: {outcomes:?}");
+    let winner = &granted[0];
+    assert_eq!(winner.lease_id.0, 1);
+    assert_eq!(winner.seq.auth_seq, 1);
+    assert_eq!(
+        denied,
+        vec![DenyReason::Held {
+            holder: winner.holder.unwrap(),
+            seq: winner.seq,
+        }],
+        "the loser is told who won"
+    );
 
-    let winner = &granted[1];
     let current = actor
         .validate_lease(entity, winner.holder.unwrap(), winner.lease_id, 0)
         .await
         .unwrap()
         .expect("single durable winner row");
     assert_eq!(current, *winner);
+
+    // The damper bounds the herd; it does not make weak authority sticky. A
+    // claim arriving after the window is a real interaction and still takes
+    // the lease, with the next fencing token and the next authority sequence.
+    let steal_at = CLAIM_HERD_DAMPER_MS + 1;
+    let ClaimResult::Granted(stolen) = actor
+        .claim_lease(
+            entity,
+            CellId::ROOT,
+            test_node(17),
+            ClaimKind::Weak,
+            steal_at,
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("a weak steal past the herd window is still granted");
+    };
+    assert_eq!(stolen.lease_id.0, 2);
+    assert_eq!(stolen.seq.auth_seq, 2);
+
+    rt.close().await.unwrap();
+}
+
+/// A whole heartbeat batch renews through one actor, pair by pair.
+///
+/// The gateway-side unit test measures the turn count; this one measures the
+/// answer, against a real runtime: every valid pair renews, every invalid pair
+/// is still named on its own, and the batch's outcome is positional so an ack
+/// cannot be attributed to the wrong entity.
+#[tokio::test]
+async fn a_renewal_batch_renews_each_pair_against_its_own_row() {
+    let dir = tempfile::tempdir().unwrap();
+    let rt = CellRuntime::open(&runtime_config(dir.path(), false), &mem_store())
+        .await
+        .unwrap();
+    let holder = test_node(21);
+    let stranger = test_node(22);
+    let mut held = Vec::new();
+    for id in 900..905u64 {
+        let entity = PersistId::new(id);
+        let ClaimResult::Granted(row) = rt
+            .claim_lease(
+                GridId::ROOT,
+                CellId::ROOT,
+                entity,
+                holder,
+                ClaimKind::Weak,
+                0,
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("claim {id} should be granted");
+        };
+        held.push((entity, row.lease_id));
+    }
+    // A pair the holder no longer owns, and a pair for an entity with no row.
+    let stale = (held[2].0, LeaseId(held[2].1 .0 + 1));
+    let absent = (PersistId::new(999), LeaseId(1));
+    let batch = vec![held[0], held[1], stale, held[3], absent, held[4]];
+
+    let rows = rt
+        .heartbeat_leases(GridId::ROOT, CellId::ROOT, holder, &batch, 1)
+        .await
+        .unwrap();
+
+    assert_eq!(rows.len(), batch.len(), "one answer per requested pair");
+    let renewed: Vec<_> = rows
+        .iter()
+        .enumerate()
+        .filter(|(index, row)| {
+            row.as_ref()
+                .is_some_and(|row| row.holder == Some(holder) && row.lease_id == batch[*index].1)
+        })
+        .map(|(index, _)| index)
+        .collect();
+    assert_eq!(
+        renewed,
+        vec![0, 1, 3, 5],
+        "exactly the pairs the peer holds"
+    );
+    // The stale pair still returns the row, so the holder learns the truth
+    // rather than merely that something failed; the absent one has no row.
+    assert_eq!(rows[2].as_ref().unwrap().lease_id, held[2].1);
+    assert!(rows[4].is_none());
+
+    // The renewal moved the TTL for the pairs it accepted, and only those.
+    let extended = rt
+        .inspect_lease(GridId::ROOT, held[0].0)
+        .await
+        .unwrap()
+        .0
+        .expect("renewed row");
+    assert_eq!(extended.expires_at, 1 + LEASE_TTL_MS);
+
+    // A batch from someone who holds none of it renews none of it.
+    let rows = rt
+        .heartbeat_leases(GridId::ROOT, CellId::ROOT, stranger, &batch, 2)
+        .await
+        .unwrap();
+    assert!(rows
+        .iter()
+        .all(|row| row.as_ref().is_none_or(|row| row.holder != Some(stranger))));
 
     rt.close().await.unwrap();
 }
@@ -2526,8 +2649,17 @@ async fn fenced_append_rechecks_the_lease_inside_the_actor_mailbox() {
     else {
         panic!("initial claim should be granted");
     };
+    // Past the claim-herd window, so this is an ordinary weak steal and not
+    // the tail of a herd: the point under test is the fence recheck, which
+    // needs a successor to exist at all.
     let ClaimResult::Granted(successor) = actor
-        .claim_lease(entity, CellId::ROOT, test_node(20), ClaimKind::Weak, 1)
+        .claim_lease(
+            entity,
+            CellId::ROOT,
+            test_node(20),
+            ClaimKind::Weak,
+            CLAIM_HERD_DAMPER_MS + 1,
+        )
         .await
         .unwrap()
     else {
@@ -2540,7 +2672,7 @@ async fn fenced_append_rechecks_the_lease_inside_the_actor_mailbox() {
             original_holder,
             original.lease_id,
             original.seq,
-            1,
+            CLAIM_HERD_DAMPER_MS + 1,
         )
         .await
         .unwrap();

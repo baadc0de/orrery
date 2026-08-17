@@ -123,6 +123,15 @@ Six messages, defined in `orrery_protocol`, postcard-encoded on the reliable con
 | `Heartbeat` | both | peer → registrar: `{renew: Vec<(entity, lease_id)>, tick}` (one batch per peer per 2.5 s covering all held leases); registrar → peer `HeartbeatAck{leases: Vec<Lease>, invalid: Vec<(entity, lease_id)>}` |
 | `Expire` | registrar → holder + cell subscribers | `{entity, lease_id, last_holder, reason: Timeout\|Disconnect\|Revoked\|Parked, disposition: Reassigned{to}\|Parked\|Free}` |
 
+A `Heartbeat` is one message per peer per 2.5 s naming every lease it holds,
+and it costs **one actor turn per `(grid, cell)` group** — not one per entity.
+The rows in a group share an actor and each renewal is an independent check
+against its own row, so folding them into a single mailbox turn changes nothing
+about arbitration and takes a peer holding 50 entities in one cell from 50
+turns to 1. The ack stays per entity: every pair that did not renew is named
+individually in `invalid`, including one whose whole group failed to route,
+because that list is what stops a holder writing an entity it no longer owns.
+
 `claim_id` makes delayed control replies safe: a client ignores a `Grant` or
 `Deny` that does not correspond to its pending claim, ignores grants that do
 not advance its installed fence, and accepts `Expire` only for its installed
@@ -205,6 +214,21 @@ sequenceDiagram
 ```
 
 Both peers predicted with the *same* pair; INV-4's equal-pair rule is resolved by the registrar's serialization, and the loser's misprediction is absorbed by the normal §D8 rollback machinery — during the few in-flight milliseconds, other observers may briefly apply the loser's stream, which the winner's granted stream then supersedes.
+
+**The claim-herd damper (as implemented).** "Serialized" has to mean
+*arbitrated*, not *served in turn*. A weak claim may replace a weak holder
+(INV-4), so a naive registrar grants every claimant in the herd above one after
+another — each grant bumping the token the previous winner has only just
+installed, and no loser ever told. The registrar therefore refuses a competing
+weak claim for **150 ms after an unpark** — the 9-tick rollback budget — with
+`Deny{Held{winner, seq}, retry_after_ms}`, which is exactly the message the
+diagram shows: the loser learns who won and with which pair, rolls the claim
+back, and reconciles. A claim arriving after the window is a real interaction
+against a peer that is visibly simulating the entity and still takes the lease
+under INV-4; the damper bounds the race, it does not make weak authority
+sticky. This is also what a design that broadcasts lease expiry to interested
+peers (§7) would need in order to be safe: it manufactures the herd, and until
+now nothing absorbed it.
 
 ### 4.2 Cooperative handoff — negotiated divestiture
 
@@ -299,6 +323,28 @@ holder.
 | weak, no eligible candidate | `Parked` |
 | weak, grant or push failed | `Parked` (grant unwound first) |
 | `STRONG_HELD` | `Parked`, `own_seq` intact — never regranted without consent |
+
+"Never regranted without consent" binds the **pull** side too, not just this
+push side: a claim for a parked `STRONG_HELD` row is answered `Deny{Parked}`
+unless it comes from the identity that owned it. The park is what records that
+identity — `holder` is the only place it lives while the lease is live, so
+parking moves it into `bound_to`, the same durable field a player binding uses
+(a player binding is stronger and is never overwritten). A row parked by an
+older build names no owner; it stays claimable rather than being stranded for
+good, which is the one case where the old regrant behavior survives.
+
+The reservation is a **grace period of 30 s** (3× TTL), not a life sentence,
+and this is where §4.3 and §7 have to be reconciled rather than one of them
+winning: a crashed owner is usually back within seconds and handing its entity
+to whoever walks past meanwhile is the theft strong ownership exists to
+prevent, but reserving it forever for a node key that may never return strands
+the entity, because nothing in the protocol releases it. Past the grace, §7's
+"the first `Claim` by anyone unparks it" resumes. Permanent reservation is what
+`PLAYER_BOUND` is for, and that check has no deadline. The deadline is a
+registrar-clock instant carried in the parked row's otherwise-unused
+`expires_at`, so actor recovery re-arms it with a full fresh window exactly as
+it re-arms a held row's TTL — a durable instant from a previous process's
+monotonic epoch means nothing.
 
 The `alt` branch above is also how **field-host loss** resolves (§8): a field host is just a holder with many leases, and the gateway observing its connection drop triggers the **fast path** — immediate unconditional divestiture of every lease it held, while the coordinator re-promotes from the warm pool — **< 10 s player-facing** (the figure [02-networking.md](02-networking.md) and [09-services-and-ops.md](09-services-and-ops.md) reference). Only a *zombie* host — connection alive, heartbeats silent — falls to the **slow path** of lease-TTL expiry, **< 30 s worst case**.
 

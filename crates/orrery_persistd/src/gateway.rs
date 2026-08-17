@@ -1648,6 +1648,72 @@ enum SessionLeaseOwner {
     Parking(SessionGeneration),
 }
 
+/// Renew a session's due leases, one actor turn per `(grid, cell)` group.
+///
+/// A heartbeat arrives every 2.5 s naming every lease the peer holds, and all
+/// of them usually sit in one cell — so the whole batch is one mailbox turn,
+/// not one per entity. The measured shape: a peer holding 50 entities in one
+/// cell cost 50 turns and now costs 1.
+///
+/// The ack stays per entity. Every pair that did not renew is named
+/// individually in the returned `invalid` list, whether it failed on its own
+/// row or because its whole group failed to route, because that list is what
+/// stops a holder writing an entity it no longer owns. The current row is
+/// still returned even when it refuses the renewal: the holder needs to see
+/// who has it now, not merely that it lost it.
+async fn renew_session_leases(
+    router: &Arc<dyn Router>,
+    holder: NodeId,
+    renewable: &[SessionLease],
+    now_ms: u64,
+) -> (Vec<orrery_protocol::Lease>, Vec<(PersistId, LeaseId)>) {
+    let mut groups: Vec<((GridId, CellId), Vec<&SessionLease>)> = Vec::new();
+    for lease in renewable {
+        let key = (lease.grid, lease.cell);
+        match groups.iter_mut().find(|(grouped, _)| *grouped == key) {
+            Some((_, members)) => members.push(lease),
+            None => groups.push((key, vec![lease])),
+        }
+    }
+    let mut rows = Vec::with_capacity(renewable.len());
+    let mut invalid = Vec::new();
+    for ((grid, cell), members) in groups {
+        let batch: Vec<_> = members
+            .iter()
+            .map(|lease| (lease.entity, lease.lease_id))
+            .collect();
+        let renewed = router
+            .heartbeat_leases(grid, cell, holder, &batch, now_ms)
+            .await;
+        let Ok(renewed) = renewed else {
+            invalid.extend(batch);
+            continue;
+        };
+        let mut answered = 0;
+        for (lease, row) in members.iter().zip(renewed) {
+            answered += 1;
+            match row {
+                Some(row) => {
+                    let current = row.holder == Some(holder)
+                        && row.lease_id == lease.lease_id
+                        && row.expires_at > now_ms;
+                    rows.push(row);
+                    if !current {
+                        invalid.push((lease.entity, lease.lease_id));
+                    }
+                }
+                None => invalid.push((lease.entity, lease.lease_id)),
+            }
+        }
+        // A router that answers short has said nothing about the tail, and a
+        // silent tail is exactly the ack blur batching must not introduce.
+        for lease in members.iter().skip(answered) {
+            invalid.push((lease.entity, lease.lease_id));
+        }
+    }
+    (rows, invalid)
+}
+
 /// Resolve a batched renewal against the session's lease index.
 ///
 /// Returns the rows to renew and the pairs to refuse. `LeaseId` is a *per-row*
@@ -3013,11 +3079,15 @@ async fn handle_connection(
                             }
                             Ok(crate::lease::ClaimResult::Denied(reason)) => {
                                 let _ = active_session.complete_lease_claim(None).await;
+                                // A herd loser is refused for a bounded reason,
+                                // so tell it when coming back is worth anything
+                                // rather than leaving it to spin or to give up.
+                                let retry_after_ms = crate::lease::retry_after_ms(&reason);
                                 LeaseMsg::Deny {
                                     claim_id: Some(claim_id),
                                     entity,
                                     reason,
-                                    retry_after_ms: 0,
+                                    retry_after_ms,
                                 }
                             }
                             Err(_) => {
@@ -3047,35 +3117,11 @@ async fn handle_connection(
                         let (renewable, mut invalid) =
                             resolve_renewals(&peer.leases, active_session.generation, &renew);
                         drop(peer);
-                        // Exactly one actor round trip per renewable row: the
-                        // renewal names its entity, so the session index is a
-                        // map lookup rather than a scan, and a holder of N
-                        // entities costs N turns instead of N per requested id.
-                        let mut rows = Vec::with_capacity(renewable.len());
-                        for lease in renewable {
-                            match router
-                                .heartbeat_lease(
-                                    lease.grid,
-                                    lease.cell,
-                                    lease.entity,
-                                    remote,
-                                    lease.lease_id,
-                                    registrar_now_ms(),
-                                )
-                                .await
-                            {
-                                Ok(Some(row)) => {
-                                    let current = row.holder == Some(remote)
-                                        && row.lease_id == lease.lease_id
-                                        && row.expires_at > registrar_now_ms();
-                                    rows.push(row);
-                                    if !current {
-                                        invalid.push((lease.entity, lease.lease_id));
-                                    }
-                                }
-                                Ok(None) | Err(_) => invalid.push((lease.entity, lease.lease_id)),
-                            }
-                        }
+                        let (rows, refused) =
+                            renew_session_leases(&router, remote, &renewable, registrar_now_ms())
+                                .await;
+                        let mut rows = rows;
+                        invalid.extend(refused);
                         if active_session.lock_current().await.is_none() {
                             rows.clear();
                             invalid = renew;
@@ -4296,6 +4342,7 @@ fn encode_chunk(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
 
     use super::*;
@@ -4304,6 +4351,7 @@ mod tests {
         FenceFreshnessConfig, FenceFreshnessMonitor, FenceOutcome, FenceRow, FenceStatus,
         FenceStore, MemFenceStore,
     };
+    use orrery_protocol::{LeaseFlags, SeqPair};
 
     fn successor_node(seed: u8) -> NodeId {
         iroh::SecretKey::from_bytes(&[seed; 32]).public()
@@ -5386,6 +5434,224 @@ mod tests {
         }
     }
 
+    /// A router that records how many renewal round trips it was asked for,
+    /// batched and unbatched, and can refuse one named pair.
+    struct CountingRenewalRouter {
+        /// Whether this router folds a batch, or leaves the trait default to
+        /// fan the batch back out one entity at a time (the shape before the
+        /// batched method existed).
+        batched: bool,
+        turns: Arc<AtomicUsize>,
+        batch_sizes: Arc<Mutex<Vec<usize>>>,
+        refuse: Option<PersistId>,
+        /// Answer with fewer rows than were asked for.
+        short: bool,
+        holder: NodeId,
+    }
+
+    impl CountingRenewalRouter {
+        fn row(&self, entity: PersistId, lease_id: LeaseId) -> Option<orrery_protocol::Lease> {
+            (self.refuse != Some(entity)).then_some(orrery_protocol::Lease {
+                entity,
+                holder: Some(self.holder),
+                seq: SeqPair::default(),
+                lease_id,
+                expires_at: u64::MAX,
+                flags: LeaseFlags::default(),
+                bound_to: None,
+            })
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Router for CountingRenewalRouter {
+        async fn apply(
+            &self,
+            _record: JournalRecord,
+        ) -> Result<Arc<crate::journal::AppendHandle>, Reject> {
+            Err(Reject::JournalClosed)
+        }
+        async fn read(&self, _grid: GridId, _cell: CellId) -> Result<SnapshotPage, Reject> {
+            Err(Reject::JournalClosed)
+        }
+        async fn has_actor(&self, _grid: GridId, _cell: CellId) -> bool {
+            false
+        }
+        async fn heartbeat_lease(
+            &self,
+            _grid: GridId,
+            _cell: CellId,
+            entity: PersistId,
+            _holder: NodeId,
+            lease_id: LeaseId,
+            _now_ms: u64,
+        ) -> Result<Option<orrery_protocol::Lease>, Reject> {
+            self.turns.fetch_add(1, Ordering::SeqCst);
+            self.batch_sizes.lock().expect("sizes").push(1);
+            Ok(self.row(entity, lease_id))
+        }
+        async fn heartbeat_leases(
+            &self,
+            grid: GridId,
+            cell: CellId,
+            holder: NodeId,
+            renew: &[(PersistId, LeaseId)],
+            now_ms: u64,
+        ) -> Result<Vec<Option<orrery_protocol::Lease>>, Reject> {
+            if !self.batched {
+                // Exactly what a router with no actor of its own does.
+                let mut rows = Vec::with_capacity(renew.len());
+                for (entity, lease_id) in renew {
+                    rows.push(
+                        self.heartbeat_lease(grid, cell, *entity, holder, *lease_id, now_ms)
+                            .await?,
+                    );
+                }
+                return Ok(rows);
+            }
+            self.turns.fetch_add(1, Ordering::SeqCst);
+            self.batch_sizes.lock().expect("sizes").push(renew.len());
+            let answered = if self.short { 1 } else { renew.len() };
+            Ok(renew
+                .iter()
+                .take(answered)
+                .map(|(entity, lease_id)| self.row(*entity, *lease_id))
+                .collect())
+        }
+    }
+
+    fn session_leases(count: u64, cell: CellId) -> Vec<SessionLease> {
+        (1..=count)
+            .map(|id| SessionLease {
+                entity: PersistId::new(id),
+                lease_id: LeaseId(1),
+                grid: GridId::ROOT,
+                cell,
+                owner: SessionLeaseOwner::Active(SessionGeneration(1)),
+            })
+            .collect()
+    }
+
+    /// One heartbeat from a peer holding N entities is one actor turn, not N.
+    ///
+    /// This is the turns-per-heartbeat instrument: `renew_session_leases` asks
+    /// the router exactly once per `(grid, cell)` group, and the router folds
+    /// each group into one mailbox turn. Measured here for a peer holding 50
+    /// entities in one cell: **50 turns before, 1 after** — every 2.5 s,
+    /// through one bounded mailbox, per peer.
+    #[tokio::test]
+    async fn one_heartbeat_from_a_holder_of_fifty_costs_one_actor_turn() {
+        const HELD: u64 = 50;
+        let holder = iroh::SecretKey::from_bytes(&[11; 32]).public();
+        let leases = session_leases(HELD, CellId::ROOT);
+
+        let mut measured = Vec::new();
+        for batched in [false, true] {
+            let turns = Arc::new(AtomicUsize::new(0));
+            let router: Arc<dyn Router> = Arc::new(CountingRenewalRouter {
+                batched,
+                turns: Arc::clone(&turns),
+                batch_sizes: Arc::new(Mutex::new(Vec::new())),
+                refuse: None,
+                short: false,
+                holder,
+            });
+            let (rows, invalid) = renew_session_leases(&router, holder, &leases, 0).await;
+            assert_eq!(rows.len(), HELD as usize, "every held row is acked");
+            assert!(invalid.is_empty(), "nothing was refused: {invalid:?}");
+            measured.push(turns.load(Ordering::SeqCst));
+        }
+        assert_eq!(
+            measured,
+            vec![HELD as usize, 1],
+            "one entity per turn before, one turn for the whole batch after"
+        );
+    }
+
+    /// Entities in different cells cannot share a turn — one per group.
+    #[tokio::test]
+    async fn a_heartbeat_spanning_two_cells_costs_one_turn_per_cell() {
+        let holder = iroh::SecretKey::from_bytes(&[12; 32]).public();
+        let cells = CellId::ROOT.children();
+        let mut leases = session_leases(4, cells[0]);
+        leases.extend(session_leases(4, cells[1]).into_iter().map(|mut lease| {
+            lease.entity = PersistId::new(lease.entity.0 + 100);
+            lease
+        }));
+        let turns = Arc::new(AtomicUsize::new(0));
+        let sizes = Arc::new(Mutex::new(Vec::new()));
+        let router: Arc<dyn Router> = Arc::new(CountingRenewalRouter {
+            batched: true,
+            turns: Arc::clone(&turns),
+            batch_sizes: Arc::clone(&sizes),
+            refuse: None,
+            short: false,
+            holder,
+        });
+
+        let (rows, invalid) = renew_session_leases(&router, holder, &leases, 0).await;
+
+        assert_eq!(turns.load(Ordering::SeqCst), 2);
+        assert_eq!(*sizes.lock().expect("sizes"), vec![4, 4]);
+        assert_eq!(rows.len(), 8);
+        assert!(invalid.is_empty());
+    }
+
+    /// Batching must not blur the ack: one bad pair in a batch invalidates
+    /// that pair and nothing else, so the holder stops writing exactly one
+    /// entity and keeps writing the other 49.
+    #[tokio::test]
+    async fn a_refused_pair_inside_a_batch_is_acked_alone() {
+        const HELD: u64 = 50;
+        let holder = iroh::SecretKey::from_bytes(&[13; 32]).public();
+        let refused = PersistId::new(7);
+        let leases = session_leases(HELD, CellId::ROOT);
+        let turns = Arc::new(AtomicUsize::new(0));
+        let router: Arc<dyn Router> = Arc::new(CountingRenewalRouter {
+            batched: true,
+            turns: Arc::clone(&turns),
+            batch_sizes: Arc::new(Mutex::new(Vec::new())),
+            refuse: Some(refused),
+            short: false,
+            holder,
+        });
+
+        let (rows, invalid) = renew_session_leases(&router, holder, &leases, 0).await;
+
+        assert_eq!(turns.load(Ordering::SeqCst), 1);
+        assert_eq!(invalid, vec![(refused, LeaseId(1))]);
+        assert_eq!(rows.len(), HELD as usize - 1);
+        assert!(rows.iter().all(|row| row.entity != refused));
+    }
+
+    /// A router that answers short has said nothing about the tail, and a
+    /// silent tail is an entity the holder keeps writing while believing it is
+    /// still the authority. Every unanswered pair is refused instead.
+    #[tokio::test]
+    async fn an_unanswered_tail_of_a_batch_is_refused_rather_than_dropped() {
+        let holder = iroh::SecretKey::from_bytes(&[14; 32]).public();
+        let leases = session_leases(4, CellId::ROOT);
+        let router: Arc<dyn Router> = Arc::new(CountingRenewalRouter {
+            batched: true,
+            turns: Arc::new(AtomicUsize::new(0)),
+            batch_sizes: Arc::new(Mutex::new(Vec::new())),
+            refuse: None,
+            short: true,
+            holder,
+        });
+
+        let (rows, invalid) = renew_session_leases(&router, holder, &leases, 0).await;
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            invalid,
+            leases[1..]
+                .iter()
+                .map(|lease| (lease.entity, lease.lease_id))
+                .collect::<Vec<_>>()
+        );
+    }
+
     struct AlwaysDurableAdmission;
 
     impl BulkAckAdmission for AlwaysDurableAdmission {
@@ -5481,13 +5747,13 @@ mod tests {
         }
         drop(registry);
     }
-    /// One held entity costs one actor round trip, not one per requested id.
+    /// One held entity resolves to one renewable row, not one per requested id.
     ///
-    /// The count asserted here *is* the round-trip count: the heartbeat arm
-    /// awaits `router.heartbeat_lease` exactly once per row `resolve_renewals`
-    /// returns. Resolving by bare `LeaseId` returned every held row for every
-    /// requested id — 50 entities all sitting at `LeaseId(1)` produced 2500
-    /// sequential turns through one bounded cell mailbox every 2.5 s.
+    /// Resolving by bare `LeaseId` returned every held row for every requested
+    /// id — 50 entities all sitting at `LeaseId(1)` produced 2500 sequential
+    /// turns through one bounded cell mailbox every 2.5 s. This bounds the
+    /// *batch*; `one_heartbeat_from_a_holder_of_fifty_costs_one_actor_turn`
+    /// then counts the turns that batch actually costs.
     #[test]
     fn renewal_costs_one_round_trip_per_held_entity() {
         const HELD: u64 = 50;
