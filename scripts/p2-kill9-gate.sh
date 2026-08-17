@@ -53,6 +53,25 @@ if [[ ${1:-} == --self-test ]]; then
   # p99 drops and this gate passes on a measurement it never made. The check
   # is cheap and belongs here, where the two files meet.
   has 'server_side_spans_never_gate' || die 'self-test: server-span attribution check absent'
+  # Every bulk write the gateway routes is fenced (`strict_authority: true`,
+  # unconditionally, in `route_session_diff`), and a lease claim names a cell
+  # the registrar can already resolve for the entity — so the world has to be
+  # seeded before anything can be claimed, and therefore before anything can be
+  # written. Without this stage the run drives 500k rejections and calls the
+  # refusals durability.
+  has 'seed_world' || die 'self-test: durable world seeding absent'
+  has '--emit-manifest' || die 'self-test: seeder manifest emission absent'
+  has '--manifest "$out/manifest.json"' || die 'self-test: rig is not driven from the seeded inventory'
+  # The evidence check. `[[ -s acks.jsonl ]]` passed on 1024 lines of
+  # `IntentOutcome::Rejected` and zero durable writes: a non-empty file is not
+  # evidence of a durable acknowledgement. Count the `"type":"diff"` records —
+  # p2-load writes one only for a *non-provisional* bulk ack — and require
+  # more than zero. Matched with the operand attached: bare `durable_acks`
+  # appears in prose and in the rig's own log line, so the shorter pattern
+  # would pass on a script that had lost the assertion entirely.
+  has 'durable_acks=$(grep -c' || die 'self-test: durable-acknowledgement count absent'
+  has 'load produced no durable bulk acknowledgement' \
+    || die 'self-test: durable-acknowledgement assertion absent'
   echo 'self-test: two-process proof stages present'
   exit 0
 fi
@@ -61,10 +80,18 @@ fi
 : "${PERSISTD_BIN:?set PERSISTD_BIN to an fdb-enabled persistd binary}"
 : "${P2_LOAD_BIN:?set P2_LOAD_BIN to the p2-load binary}"
 : "${P2_DASHBOARD_BIN:?set P2_DASHBOARD_BIN to the p2-dashboard binary}"
+# The seeder. Fenced writes need a claimable world and a claim needs a
+# committed cell, so this binary is now on the critical path of the durability
+# proof, not an optional convenience. Build it with
+# `cargo build --release -p orrery_seed --features orrery_seed/fdb`.
+ORRERY_SEED_BIN=${ORRERY_SEED_BIN:-"$(pwd)/target/release/orrery-seed"}
+P2_SCENARIO=${P2_SCENARIO:-"$(pwd)/crates/orrery_seed/scenarios/p2demo.toml"}
+P2_SEED_PROFILE=${P2_SEED_PROFILE:-demo}
 [[ -r $ORRERY_FDB_CLUSTER_FILE ]] || die "FDB cluster file is not readable: $ORRERY_FDB_CLUSTER_FILE"
-for tool in "$PERSISTD_BIN" "$P2_LOAD_BIN" "$P2_DASHBOARD_BIN"; do
+for tool in "$PERSISTD_BIN" "$P2_LOAD_BIN" "$P2_DASHBOARD_BIN" "$ORRERY_SEED_BIN"; do
   [[ -x $tool ]] || die "not an executable: $tool"
 done
+[[ -r $P2_SCENARIO ]] || die "seed scenario is not readable: $P2_SCENARIO"
 
 out=${P2_GATE_OUT:-"$(pwd)/p2-kill9-$(date -u +%Y%m%dT%H%M%SZ)"}
 [[ ! -e $out ]] || die "refusing to overwrite existing output directory: $out"
@@ -93,8 +120,10 @@ secret_follower=${P2_GATE_FOLLOWER_SECRET_KEY:-101112131415161718191a1b1c1d1e1f0
 secret_issuer=${P2_GATE_ISSUER_SECRET_KEY:-202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f}
 issuer_key_id=${P2_GATE_ISSUER_KEY_ID:-1}
 duration=${P2_GATE_DURATION_SECS:-30}
-entities=${P2_GATE_ENTITIES:-10000}
-cells=${P2_GATE_CELLS:-128}
+# Entity count and cell coverage now come from the seeded scenario
+# (`P2_SEED_PROFILE` selects the rung: `demo` is the 10 000-entity P2 criterion,
+# `ci` is the same topology 100x smaller). They are no longer rig arguments:
+# the rig must claim leases at the cells the seeder actually committed.
 sessions=${P2_GATE_SESSIONS:-125}
 
 primary_pid=''
@@ -240,16 +269,46 @@ start_promoted_follower() {
   recovery_cutoff=$(json_field "$out/promoted.json" recovery_cutoff)
 }
 
+# Seed the durable world, then take its manifest as the rig's inventory.
+#
+# This is not a convenience: the gateway fences every bulk write
+# (`strict_authority: true`), a fenced write needs a lease, and the registrar
+# only grants a lease for an entity whose *committed cell* it can already
+# resolve. An unseeded world is therefore unwritable, which is exactly how a
+# 30-second run produced 541 408 rejections and zero journal appends while the
+# summary line said nothing about it.
+seed_world() {
+  note "seeding the durable world from $(basename "$P2_SCENARIO") (profile $P2_SEED_PROFILE)"
+  ORRERY_FDB_CLUSTER_FILE="$ORRERY_FDB_CLUSTER_FILE" "$ORRERY_SEED_BIN" apply "$P2_SCENARIO" \
+    --profile "$P2_SEED_PROFILE" --allow-opaque --single-grid \
+    >"$out/seed-apply.log" 2>&1 || die "seeding failed; see $out/seed-apply.log"
+  ORRERY_FDB_CLUSTER_FILE="$ORRERY_FDB_CLUSTER_FILE" "$ORRERY_SEED_BIN" verify "$P2_SCENARIO" \
+    --profile "$P2_SEED_PROFILE" --single-grid --emit-manifest "$out/manifest.json" \
+    >"$out/seed-verify.log" 2>&1 || die "seed verification failed; see $out/seed-verify.log"
+  [[ -s $out/manifest.json ]] || die 'seeder emitted no manifest'
+}
+
+seed_world
 note "starting passive follower"
 start_follower
 note "starting fenced primary"
 start_primary
-note "driving ${entities} entities across ${cells} cells"
+note "driving the seeded inventory (${sessions} sessions, ${duration}s)"
+# Inventory comes from the manifest, not `--entities`/`--cells`: the rig claims
+# a lease per entity at the cell the seeder committed it to, and a synthesized
+# placement would name cells the registrar cannot resolve.
 "$P2_LOAD_BIN" --gateway "$primary_gateway" --addr "$primary_addr" \
-  --entities "$entities" --cells "$cells" --sessions "$sessions" --duration-secs "$duration" \
+  --manifest "$out/manifest.json" --sessions "$sessions" --duration-secs "$duration" \
   --issuer-secret "$secret_issuer" --issuer-key-id "$issuer_key_id" \
   --json --ack-log "$out/acks.jsonl" >"$out/load-before.jsonl" 2>"$out/load-before.stderr"
-[[ -s $out/acks.jsonl ]] || die 'load completed without durable acknowledgement evidence'
+# A non-empty ack log is not evidence. It was 1024 lines of rejected intents on
+# the run this check was supposed to catch. Count the durable bulk records —
+# p2-load writes a `"type":"diff"` line only for a non-provisional `BulkAck` —
+# and require at least one.
+durable_acks=$(grep -c '"type":"diff"' "$out/acks.jsonl" || true)
+[[ ${durable_acks:-0} -gt 0 ]] \
+  || die "load produced no durable bulk acknowledgement (ack log has $(wc -l <"$out/acks.jsonl") records, none of them a durable diff); see $out/load-before.stderr"
+note "durable bulk acknowledgements before the kill: $durable_acks"
 
 note 'SIGKILL primary and promote follower'
 kill -KILL "$primary_pid"; wait "$primary_pid" 2>/dev/null || true; primary_pid=''
