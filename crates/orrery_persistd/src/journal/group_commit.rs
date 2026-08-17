@@ -223,11 +223,21 @@ impl CommitterHandle {
     }
 
     /// Wait until the committer task has exited (releasing its store clone).
+    ///
+    /// The `notified()` future is created *before* the flag is read, and that
+    /// order is load-bearing. `Notify::notify_waiters` — which the committer
+    /// calls on its way out — stores no permit: it wakes only the waiters
+    /// already registered at the moment it runs. Reading the flag first left a
+    /// window in which the committer could set the flag and notify an empty
+    /// waiter set, after which `notified().await` blocked forever. That is a
+    /// hang in `Journal::close`, and through it in `CellRuntime::close`, so it
+    /// stalled whichever test happened to lose the race rather than failing it.
     pub(crate) async fn wait_exit(&self) {
+        let notified = self.state.exited.notified();
         if self.state.exited_flag.load(Ordering::Acquire) {
             return;
         }
-        self.state.exited.notified().await;
+        notified.await;
     }
 }
 
