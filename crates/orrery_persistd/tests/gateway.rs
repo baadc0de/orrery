@@ -3269,6 +3269,13 @@ fn single_writer_invariant_checker_flags_a_fenced_out_second_writer() {
         // legitimate contested-object case.
         let fixture = handoff_fixture(GatewayConfig::default()).await;
         let (first_lease_id, first_seq) = claim_for_holder(&fixture).await;
+        // Past the claim-herd window: a *second* claim inside it is the tail
+        // of a herd racing for a just-unparked entity and is refused, which
+        // the herd test covers. This one is the later, deliberate takeover.
+        tokio::time::sleep(Duration::from_millis(
+            orrery_persistd::lease::CLAIM_HERD_DAMPER_MS + 20,
+        ))
+        .await;
         let stolen = claim_reply(
             &fixture.successor,
             fixture.entity,
