@@ -382,6 +382,17 @@ through a content-addressed directory:
 | shared cache | `/var/cache/kache/shared`, group `kache`, `2775` + a default ACL granting the group `rwx` |
 | local store | `~/.cache/kache` per identity, capped at 25 GiB |
 | daemon | `kache@<user>.service`, a systemd **system** unit, one instance per identity |
+| shared-cache pruning | `kache-prune-shared.timer`, daily |
+
+`cache.local_max_size` is the size cap — **not** `max_size`, which kache ignores
+silently, leaving you on the 50 GiB default while your config claims otherwise.
+`cache.auto_gc` is on by default and enforces the cap opportunistically, so the
+local stores look after themselves.
+
+The shared remote does not: `kache gc` evicts the local stores only, so a
+filesystem remote grows without bound. `kache-prune-shared.timer` drops objects
+untouched for 21 days. Deleting them is always safe — they are content-addressed
+and immutable, so a pruned object is a cache miss and nothing worse.
 
 The default ACL is the part worth understanding: it makes every new object
 group-writable **regardless of the writing process's umask**. Without it a
