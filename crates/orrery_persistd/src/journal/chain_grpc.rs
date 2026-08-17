@@ -404,7 +404,20 @@ fn refuse_sibling_epoch(
     key: &[u8],
 ) -> Result<(), JournalError> {
     let family = chain_family_key(chain)?;
-    let Some(sibling) = journal.chain_epoch_sibling(&family, key)? else {
+    // Two durable traces, because one of them is not always left. The record
+    // index carries a row per *mirrored record*, so a follower that opened
+    // this directory at an earlier epoch and received nothing is invisible
+    // there — and that is not a hypothetical: `scripts/p2-kill9-gate.sh` ran
+    // its load against a gateway that refused every unleased diff, mirrored
+    // zero records, and then walked through this refusal at the bumped epoch.
+    // The chain-state row is written by every `FollowerReplica::load`, empty
+    // cursor included, so it is the trace that answers "was this directory
+    // ever opened under a different epoch of this chain".
+    let sibling = match journal.chain_epoch_sibling(&family, key)? {
+        Some(sibling) => Some(sibling),
+        None => journal.chain_state_epoch_sibling(&family, key)?,
+    };
+    let Some(sibling) = sibling else {
         return Ok(());
     };
     let epoch = postcard::from_bytes::<DurableChainId>(&sibling)

@@ -697,3 +697,159 @@ async fn primary_ack_is_mirrored_to_the_passive_follower_journal() {
     );
     journal.close().await.expect("close inspected journal");
 }
+
+/// The other half of the mirroring contract, and the one the P2 kill-9 gate
+/// tripped over: a diff the strict-authority fence refuses is never appended,
+/// so it is never mirrored either. An empty follower mirror after a load is
+/// therefore evidence about *the writes*, not about chain replication.
+///
+/// `scripts/p2-kill9-gate.sh` reached `prove_epoch_fork_refused` and reported
+/// that the follower held no mirrored record at all. The chain was healthy:
+/// the rig (`p2-load`) sends every `DiffUplink` with `lease_id: None` — see the
+/// comment at `p2-load/src/main.rs:1401` — while `route_session_diff` sets
+/// `strict_authority: true` unconditionally (`gateway.rs:3930`), so
+/// `route_diff` substitutes the never-granted `LeaseId(0)` and `apply_fenced`
+/// rejects every uplink before the journal sees a byte. Nothing was
+/// acknowledged, nothing was committed, and the mirror was correctly empty.
+///
+/// This is the same topology as
+/// `primary_ack_is_mirrored_to_the_passive_follower_journal` with exactly one
+/// difference — the lease claim is gone — so the pair localizes the emptiness
+/// to the fence rather than to the chain.
+#[tokio::test]
+async fn an_unleased_diff_is_nacked_and_never_reaches_the_follower_mirror() {
+    let client_key = iroh::SecretKey::generate();
+    let follower_args = vec![
+        "--node-id".into(),
+        "2".into(),
+        "--chain-epoch".into(),
+        "9".into(),
+        "--chain-primary".into(),
+        "1".into(),
+        "--chain-listen".into(),
+        "127.0.0.1:0".into(),
+    ];
+    let follower_dir = tempfile::tempdir().expect("follower temp dir");
+    let (mut follower, follower_ready) = spawn_persistd_in(follower_dir.path(), &follower_args);
+    let chain_addr = follower_ready["chain_addr"]
+        .as_str()
+        .expect("follower chain listener")
+        .to_owned();
+    let bind_addr = free_loopback_addr();
+    let primary_args = vec![
+        "--node-id".into(),
+        "1".into(),
+        "--chain-epoch".into(),
+        "9".into(),
+        "--chain-follower".into(),
+        format!("2@{chain_addr}"),
+        "--bind".into(),
+        bind_addr.to_string(),
+    ];
+    let primary_dir = tempfile::tempdir().expect("primary temp dir");
+    seed_process_entity(
+        primary_dir.path(),
+        1,
+        PersistId::new(78),
+        client_key.public(),
+    )
+    .await;
+    let (mut primary, primary_ready) = spawn_persistd_in(primary_dir.path(), &primary_args);
+    let primary_id = primary_ready["node_id"]
+        .as_str()
+        .expect("primary iroh node id")
+        .parse::<NodeId>()
+        .expect("valid primary node id");
+
+    let client = Builder::new(N0)
+        .alpns(vec![GATEWAY_ALPN.to_vec()])
+        .relay_mode(RelayMode::Disabled)
+        .secret_key(client_key.clone())
+        .bind()
+        .await
+        .expect("client endpoint");
+    let target = iroh::EndpointAddr::new(primary_id).with_ip_addr(bind_addr);
+    let conn = client
+        .connect(target, GATEWAY_ALPN)
+        .await
+        .expect("connect to primary gateway");
+    let mut admission = conn.accept_uni().await.expect("gateway admission");
+    assert_eq!(admission.read_to_end(16).await.unwrap(), vec![0]);
+    let conn = lanes::GatewayLanes::attach(conn);
+
+    let author = client_key.public();
+    conn.send_control(&GatewayMsg::Hello {
+        token: process_session_token(author),
+        node: author,
+    })
+    .await;
+
+    // The rig's exact uplink shape: no lease, no authority sequence.
+    conn.send_state(&GatewayMsg::Diff {
+        diff: DiffUplink {
+            cell: CellId::ROOT,
+            grid: GridId::ROOT,
+            entity: PersistId::new(78),
+            tick: Tick::new(12),
+            kind: RecordKind::ComponentDiff,
+            payload: Bytes::from_static(b"unleased-diff"),
+            seq: 1,
+            lease_id: None,
+            authority_seq: None,
+        },
+    });
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "primary neither acked nor nacked an unleased diff"
+        );
+        let Some(packet) = conn.next_payload(Duration::from_millis(250)).await else {
+            continue;
+        };
+        match decode_datagram(&packet) {
+            Some(GatewayReply::BulkNack { entity, tick, .. })
+                if entity == PersistId::new(78) && tick == Tick::new(12) =>
+            {
+                break;
+            }
+            Some(GatewayReply::BulkAck { entity, tick, .. })
+                if entity == PersistId::new(78) && tick == Tick::new(12) =>
+            {
+                panic!("an unleased diff was acknowledged; the authority fence did not run")
+            }
+            _ => continue,
+        }
+    }
+
+    // The same bounded interval the mirroring test gives the chain task, so a
+    // record that *would* have crossed the process boundary had time to.
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    drop(conn);
+    client.close().await;
+    stop(&mut primary);
+    stop(&mut follower);
+
+    let journal = Journal::open(&JournalConfig {
+        dir: follower_dir.path().join("node-2"),
+        commit: GroupCommitConfig {
+            mode: AdaptiveCommitMode::Adaptive,
+            ..GroupCommitConfig::default()
+        },
+    })
+    .expect("open mirrored follower journal");
+    let mirrored = journal
+        .scan_from(Lsn::new(0, 0))
+        .map(|item| item.expect("valid mirrored record").record)
+        .collect::<Vec<_>>();
+    assert!(
+        mirrored.is_empty(),
+        "a refused diff must not be mirrored; follower holds {:?}",
+        mirrored
+            .iter()
+            .map(|record| (record.lsn, record.entity, record.tick))
+            .collect::<Vec<_>>()
+    );
+    journal.close().await.expect("close inspected journal");
+}
