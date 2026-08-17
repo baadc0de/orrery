@@ -16,12 +16,52 @@
 //!   torn connection.
 //! - Peers claim their entities, uplink fenced diffs, and heartbeat. Each
 //!   writes a JSONL event log the orchestrator reads back.
-//! - One peer is SIGKILLed. After the settle window, every entity it held must
-//!   be accounted for: inherited by a survivor (a `Grant` carrying the
-//!   registrar correlation), or parked — which the orchestrator proves by
-//!   claiming it, since a parked entity is claimable by anyone.
-//! - Anything neither inherited nor claimable is a **lost entity**, which is
-//!   the failure the phase exists to rule out.
+//! - One peer is SIGKILLed. Every entity it held must then reach a
+//!   *disposition*: inherited by a survivor (a `Grant` carrying the registrar
+//!   correlation), or parked at the registrar. The criterion counts both, so
+//!   the clock has to stop on either.
+//! - Anything with no disposition, and which no longer answers a claim, is a
+//!   **lost entity** — the failure the phase exists to rule out.
+//!
+//! ## How each half of the criterion is observed, and why
+//!
+//! **Reassignment** is observed on the survivor: the inheriting peer logs the
+//! grant with the wall-clock instant it arrived, so the settle time is the
+//! registrar's latency and not the orchestrator's poll interval.
+//!
+//! **Parking is not observable from any peer.** The registrar tells only the
+//! *previous* holder that a lease parked (`Expire`), and that peer is the one
+//! that was killed. Nothing is sent to anybody else, and the heartbeat read
+//! path returns rows only for leases the asking session already holds, so a
+//! survivor cannot poll for it either.
+//!
+//! That leaves two instruments, and only one of them is honest:
+//!
+//! - *Claiming the entity.* A claim is not an observation — it changes what it
+//!   measures. A `Weak` claim over a weak-held row is **granted even when the
+//!   holder is live and unexpired** (`lease.rs::claim`), so a successful weak
+//!   probe cannot tell "this was parked" from "I just stole it from the dying
+//!   victim". A `Strong` claim is worse rather than better: the gateway turns
+//!   a strong claim against a live holder into a cooperative *handoff request*
+//!   (D7 §4.2, `gateway.rs`'s `contested` branch), and when the holder never
+//!   answers — a SIGKILLed peer never answers — the weak-tier deadline rule
+//!   hands the entity to the claimant unconditionally. A harness probing that
+//!   way would be *performing* the redistribution it claims to be measuring.
+//!   So no claim may be issued while the victim's lease could still be live.
+//! - *The registrar's own disposition counters*, exported to persistd's
+//!   `--metrics-jsonl` (`reassigned`, `parked_without_successor`). These are
+//!   incremented by `Redistributor::place` at the moment it decides, they are
+//!   registrar-attested rather than harness-inferred, and reading them
+//!   disturbs nothing. Their cost is granularity: the exporter appends at
+//!   1 Hz and its record carries no timestamp, so a park is *observed* up to
+//!   one export interval — plus the harness's own poll interval — after it
+//!   happened. That is a bounded overstatement of the settle time, which is
+//!   the safe direction, and the settle budget below names both as terms.
+//!
+//! So: reassignment stops the clock per entity, parking stops it per cohort,
+//! and the claim probe is demoted to what it can actually prove — that an
+//! entity with no disposition still exists and still answers, i.e. that it is
+//! not lost.
 
 mod peer;
 mod wire;
@@ -42,8 +82,22 @@ use orrery_protocol::{
 use crate::peer::{PeerConfig, PeerEvent};
 use crate::wire::Session;
 
+/// The peer the criterion kills. Its rows are the ones whose disposition is
+/// measured, and the survivors are what a successor policy can choose from.
+const VICTIM_INDEX: usize = 0;
+
 /// D16 lease TTL: the window the criterion measures against.
 const LEASE_TTL: Duration = Duration::from_secs(10);
+
+/// The registrar's expiry sweep period (`gateway.rs`'s accept loop): a lease
+/// that lapses just after a sweep waits up to this long to be noticed.
+const REGISTRAR_SWEEP_INTERVAL: Duration = Duration::from_secs(1);
+
+/// persistd's `METRICS_REPORT_INTERVAL`: how long a disposition can sit in the
+/// registrar's counters before it appears in `--metrics-jsonl`. This is the
+/// lag of the only instrument that can see a park, so it is measurement error
+/// in the *late* direction — never early.
+const METRICS_EXPORT_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Slack added to the TTL before the criterion is judged to have failed.
 ///
@@ -51,12 +105,68 @@ const LEASE_TTL: Duration = Duration::from_secs(10);
 /// dead process from a dead path until its own idle timeout, so the gateway
 /// resolves a SIGKILLed peer by the *slow* path of docs/04-authority.md §4.3 —
 /// the lease TTL lapsing 10 s after that peer's last heartbeat — rather than
-/// the fast path of an observed disconnect. Two things then sit between the
-/// kill and the redistribution: up to one heartbeat interval of TTL that had
-/// already elapsed before the kill, and up to one tick of the registrar's
-/// once-a-second expiry sweep. This is that granularity, not a fudge factor;
-/// the criterion is still that redistribution is bounded by the TTL.
-const SETTLE_GRANULARITY: Duration = Duration::from_secs(2);
+/// the fast path of an observed disconnect.
+///
+/// The budget is the sum of exactly three terms, and every one of them is
+/// granularity rather than fudge — each is a quantum some instrument between
+/// the disposition and this harness rounds up to:
+///
+/// 1. the registrar's once-a-second expiry sweep, which is when a lapsed lease
+///    is *noticed*;
+/// 2. persistd's once-a-second metrics export, which is when a park becomes
+///    *visible*, there being no other witness to one;
+/// 3. this loop's own poll interval, which is when a visible park is *read*.
+///    The record carries no timestamp of its own (`write_gateway_authority` in
+///    persistd emits counters only), so a park can be timed no more finely
+///    than the read that first sees it. Leaving this term out would make the
+///    gate reject a park that happened inside the TTL purely because the
+///    harness looked 50 ms later — stricter than the criterion, and by an
+///    accident of the harness rather than a property of the registrar.
+///
+/// The heartbeat interval is deliberately **not** a term — a lease expires one
+/// TTL after the last heartbeat, and the last heartbeat is at or before the
+/// kill, so heartbeat age moves the expiry *earlier* and needs no budget. The
+/// criterion is still that the disposition is bounded by the TTL; these three
+/// are what stand between the disposition and the harness learning of it.
+const SETTLE_GRANULARITY: Duration = Duration::from_millis(
+    REGISTRAR_SWEEP_INTERVAL.as_millis() as u64
+        + METRICS_EXPORT_INTERVAL.as_millis() as u64
+        + SETTLE_POLL_INTERVAL.as_millis() as u64,
+);
+
+/// How long the harness waits, *after* the clock has stopped, for the
+/// registrar's exported counters to account for every one of the victim's
+/// rows. The clock stops on the first evidence, which is usually earlier than
+/// the export that corroborates it, so a plain read here would almost always
+/// predate it. Nothing measured depends on this wait; the cross-check does.
+const ATTESTATION_WAIT: Duration = Duration::from_secs(5);
+
+/// How often the settle loop re-reads the peer logs and the metrics file.
+///
+/// It bounds one half of the measurement and not the other. A reassignment is
+/// timestamped by the peer that received the grant, so no amount of polling
+/// changes that number. A park has no timestamp anywhere — only the counter
+/// that moved — so it is timed by the read that first sees it, and this
+/// interval is the error in that reading. It is therefore a term of
+/// `SETTLE_GRANULARITY`, not a free parameter: shortening it tightens the
+/// budget rather than loosening the measurement.
+const SETTLE_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+/// The claim tier a peer asks for, as a CLI value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum ClaimTier {
+    Weak,
+    Strong,
+}
+
+impl From<ClaimTier> for ClaimKind {
+    fn from(tier: ClaimTier) -> Self {
+        match tier {
+            ClaimTier::Weak => ClaimKind::Weak,
+            ClaimTier::Strong => ClaimKind::Strong,
+        }
+    }
+}
 
 #[derive(Debug, Parser)]
 #[command(
@@ -92,6 +202,17 @@ struct Cli {
     /// Entities each peer claims. The criterion's victim holds ~50.
     #[arg(long, default_value_t = 50)]
     entities_per_peer: u32,
+
+    /// The tier the victim claims its entities at.
+    ///
+    /// `weak` is the criterion's contested-physics case, and it redistributes.
+    /// `strong` is the case that *parks*: D7 §5 refuses to redistribute strong
+    /// ownership without consent, so `Redistributor::place` returns `Parked`
+    /// for every one of the victim's entities. Both are correct registrar
+    /// behaviour and the criterion accepts both, which is exactly why the gate
+    /// has to be able to run — and stop its clock — on either.
+    #[arg(long, value_enum, default_value_t = ClaimTier::Weak)]
+    victim_claim_kind: ClaimTier,
 
     /// The cell the island occupies.
     #[arg(long, default_value = "0x8000000000000000")]
@@ -165,6 +286,7 @@ struct PeerSpec {
     token: String,
     cell: u64,
     entities: Vec<u64>,
+    kind: ClaimKind,
     duration_secs: u64,
     log: PathBuf,
 }
@@ -179,6 +301,7 @@ async fn run_peer(spec_path: PathBuf) -> Result<()> {
         token: decode_hex(&spec.token)?,
         cell: CellId::from_bits(spec.cell).context("peer spec cell is not a valid CellId")?,
         entities: spec.entities,
+        kind: spec.kind,
         duration: Duration::from_secs(spec.duration_secs),
         log: spec.log,
     })
@@ -199,6 +322,14 @@ async fn orchestrate(cli: Cli) -> Result<Outcome> {
     let coordinator_addr = endpoint_addr(&cli.coordinator_node, &cli.coordinator_addr)?;
 
     anyhow::ensure!(cli.peers >= 2, "redistribution needs at least two peers");
+    // Half the criterion is unmeasurable without the registrar's own counters:
+    // nothing tells a third party that one specific row parked. A harness that
+    // ran without them could only ever prove the reassignment half, which is
+    // stricter than the criterion and silently so.
+    let metrics_jsonl = cli
+        .metrics_jsonl
+        .as_deref()
+        .context("--metrics-jsonl is required: the parked half of the criterion is observable only in persistd's authority counters")?;
     // Survivors must still be running while the proof is collected: a peer
     // that exits mid-window stops writing the log the accounting reads, and
     // its own leases park, which would look like the victim's redistribution
@@ -235,6 +366,14 @@ async fn orchestrate(cli: Cli) -> Result<Outcome> {
             token: encode_hex(&mint_token(&issuer, node)?),
             cell: cell.to_bits(),
             entities,
+            // Only the victim's tier is a parameter: the survivors are the
+            // island's contested physics objects either way, and it is the
+            // victim's rows whose disposition the criterion is about.
+            kind: if usize::from(index) == VICTIM_INDEX {
+                cli.victim_claim_kind.into()
+            } else {
+                ClaimKind::Weak
+            },
             duration_secs: cli.duration_secs,
             log: log.clone(),
         };
@@ -274,8 +413,7 @@ async fn orchestrate(cli: Cli) -> Result<Outcome> {
     tracing::info!(peers = cli.peers, total_entities, "island formed");
 
     // ── The kill ────────────────────────────────────────────────────────
-    let victim_index = 0usize;
-    let victim_entities: BTreeSet<u64> = read_events(&logs[victim_index])?
+    let victim_entities: BTreeSet<u64> = read_events(&logs[VICTIM_INDEX])?
         .into_iter()
         .filter_map(|event| match event {
             PeerEvent::Claimed { entity, .. } | PeerEvent::Inherited { entity, .. } => Some(entity),
@@ -286,10 +424,13 @@ async fn orchestrate(cli: Cli) -> Result<Outcome> {
         !victim_entities.is_empty(),
         "the victim held nothing; there is no redistribution to prove"
     );
-    let victim_node = peer_nodes[victim_index];
-    let victim_pid = children[victim_index]
+    let victim_node = peer_nodes[VICTIM_INDEX];
+    let victim_pid = children[VICTIM_INDEX]
         .id()
         .context("victim process has already exited")?;
+    // The registrar's disposition counters are absolute totals, so the deltas
+    // that belong to this kill are measured from a baseline taken before it.
+    let baseline = read_authority_counters(metrics_jsonl)?;
     // SIGKILL, not a graceful shutdown: the criterion is about a peer that
     // never gets to say goodbye.
     unsafe {
@@ -301,23 +442,53 @@ async fn orchestrate(cli: Cli) -> Result<Outcome> {
         "kill -9 sent to the victim peer"
     );
     let killed_at = tokio::time::Instant::now();
+    // The peer that inherits a lease timestamps the grant off the same system
+    // clock, so the two readings are directly subtractable.
+    let killed_at_unix_ms = unix_ms();
 
     // ── Settle ──────────────────────────────────────────────────────────
-    // Poll rather than sleep a fixed window: the criterion is *how long*
-    // redistribution takes, so a fixed sleep would measure the harness's own
-    // patience instead. Reassignment is the fast path — a dropped connection
-    // is noticed immediately — so wait for it and fall through to the parked
-    // check only when the TTL is spent.
-    let mut inherited: BTreeMap<u64, usize> = BTreeMap::new();
-    loop {
-        inherited.clear();
+    // Poll rather than sleep a fixed window: the criterion is *how long* the
+    // registrar takes to dispose of the victim's rows, so a fixed sleep would
+    // measure the harness's own patience instead. Two dispositions count, and
+    // they are observed differently (see the module header):
+    //
+    //   reassigned — per entity, timestamped by the survivor that got the
+    //                grant, so the poll interval is not in the number;
+    //   parked     — per cohort, from the registrar's own
+    //                `parked_without_successor` counter, because nothing tells
+    //                a third party that one specific row parked.
+    //
+    // The loop therefore stops as soon as *both* halves together account for
+    // every entity the victim held — not, as it did before, only when every
+    // one of them was inherited, which no run that legitimately parks can ever
+    // satisfy and which is stricter than the criterion it cites.
+    let mut inherited: BTreeMap<u64, u64> = BTreeMap::new();
+    let mut inherited_by: BTreeMap<u64, usize> = BTreeMap::new();
+    let mut parked_observed_in_ms: Option<u64> = None;
+    let mut parked_delta = 0u64;
+    // Aggregate counters can only be attributed to the victim while the
+    // survivors keep their own leases; a survivor that lost one during the
+    // window would be counted here as one of the victim's rows settling.
+    // Checked rather than assumed.
+    let mut survivor_losses: Vec<u64> = Vec::new();
+    let settled = loop {
+        survivor_losses.clear();
         for (index, log) in logs.iter().enumerate() {
-            if index == victim_index {
+            if index == VICTIM_INDEX {
                 continue;
             }
             for event in read_events(log)? {
-                if let PeerEvent::Inherited { entity, .. } = event {
-                    inherited.insert(entity, index);
+                match event {
+                    PeerEvent::Inherited { entity, at_ms, .. }
+                        if victim_entities.contains(&entity) =>
+                    {
+                        inherited
+                            .entry(entity)
+                            .or_insert_with(|| at_ms.saturating_sub(killed_at_unix_ms));
+                        inherited_by.insert(entity, index);
+                    }
+                    PeerEvent::Lost { entity, .. } => survivor_losses.push(entity),
+                    _ => {}
                 }
             }
         }
@@ -325,19 +496,68 @@ async fn orchestrate(cli: Cli) -> Result<Outcome> {
             .iter()
             .filter(|entity| !inherited.contains_key(entity))
             .count();
-        if outstanding == 0 || killed_at.elapsed() >= LEASE_TTL + SETTLE_GRANULARITY {
-            break;
+        if outstanding == 0 {
+            break true;
         }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    // The clock stops here. Probing the remainder is verification, not
-    // settling: an entity nobody inherited was parked at the registrar the
-    // moment its holder's session tore down.
-    let settled_in_ms = killed_at.elapsed().as_millis() as u64;
+        // Whatever was not inherited can only have parked, and the registrar's
+        // counter is the only honest witness to that. Reading it costs the
+        // entities nothing — a probe claim would consume them.
+        parked_delta = read_authority_counters(metrics_jsonl)?
+            .parked
+            .saturating_sub(baseline.parked);
+        if parked_delta >= outstanding as u64 {
+            parked_observed_in_ms = Some(killed_at.elapsed().as_millis() as u64);
+            break true;
+        }
+        if killed_at.elapsed() >= settle_budget {
+            break false;
+        }
+        tokio::time::sleep(SETTLE_POLL_INTERVAL).await;
+    };
+    // The clock stops here. What follows is accounting, not settling.
+    //
+    // A settled run is timed by its evidence, not by the loop: the last
+    // inherit's own timestamp, and — when anything parked — the poll at which
+    // the export showed the cohort covered. An unsettled run is timed by the
+    // deadline it ran into, which is the only number that can be true about it.
+    let reassigned_in_ms = inherited.values().copied().max().unwrap_or(0);
+    let settled_in_ms = if settled {
+        reassigned_in_ms.max(parked_observed_in_ms.unwrap_or(0))
+    } else {
+        killed_at.elapsed().as_millis() as u64
+    };
 
-    // Anything not inherited must be parked, and a parked entity is claimable
-    // by anyone (D7 §7). Proving it by claiming is stronger than reading the
-    // registrar's own opinion of itself.
+    // The registrar's own account of the same window, waited for rather than
+    // snatched: it must record a disposition — reassigned or parked — for every
+    // row the victim held. This is the criterion restated in the registrar's
+    // numbers instead of the harness's, and it is a pass clause of its own, so
+    // a run cannot be settled by the harness's reading of the peer logs alone.
+    let attestation_deadline = tokio::time::Instant::now() + ATTESTATION_WAIT;
+    let final_counters = loop {
+        let counters = read_authority_counters(metrics_jsonl)?;
+        let attested = counters.reassigned.saturating_sub(baseline.reassigned)
+            + counters.parked.saturating_sub(baseline.parked);
+        if attested >= victim_entities.len() as u64
+            || tokio::time::Instant::now() >= attestation_deadline
+        {
+            break counters;
+        }
+        tokio::time::sleep(SETTLE_POLL_INTERVAL).await;
+    };
+    let parked_attested = final_counters.parked.saturating_sub(baseline.parked);
+
+    // Anything with no disposition of its own is checked entity by entity, and
+    // the check is deliberately narrow about what it proves. A claim is not an
+    // observation: a weak claim over a weak-held row is granted even against a
+    // live holder, so a grant here says "this entity still exists at the
+    // registrar and still answers" — that it is **not lost**, which is the
+    // clause the phase exists to rule out — and nothing at all about whether
+    // it was parked. The parked figure in the report is the registrar's own
+    // counter for that reason.
+    //
+    // It runs only after the clock has stopped, because a claim issued while
+    // the victim's lease might still be live would take the entity and settle
+    // it by hand.
     let probe_secret = peer_secret(u8::MAX);
     let probe_node = probe_secret.public();
     let probe_token = mint_token(&issuer, probe_node)?;
@@ -380,7 +600,7 @@ async fn orchestrate(cli: Cli) -> Result<Outcome> {
         "probe interest grant was refused"
     );
 
-    let mut parked = Vec::new();
+    let mut claimable = Vec::new();
     let mut lost = Vec::new();
     let mut claim_id = 1u64;
     for entity in &victim_entities {
@@ -388,43 +608,71 @@ async fn orchestrate(cli: Cli) -> Result<Outcome> {
             continue;
         }
         match probe_claim(&probe, ClaimId(claim_id), PersistId::new(*entity), cell).await? {
-            Some(_) => parked.push(*entity),
+            Some(_) => claimable.push(*entity),
             None => lost.push(*entity),
         }
         claim_id += 1;
     }
 
-    let duplicate_authority = cli
-        .metrics_jsonl
-        .as_deref()
-        .map(read_duplicate_authority)
-        .transpose()?;
+    let duplicate_authority = final_counters.duplicate;
+    let reassigned_attested = final_counters
+        .reassigned
+        .saturating_sub(baseline.reassigned);
 
     for mut child in children {
         let _ = child.kill().await;
     }
 
-    let no_duplicates = duplicate_authority.unwrap_or(0) == 0;
-    // Every clause of the criterion, and no others: nothing lost, no tick on
-    // which two peers both believed they were the writer, and all of it inside
-    // the lease TTL.
-    let passed = lost.is_empty()
-        && no_duplicates
-        && settled_in_ms <= (LEASE_TTL + SETTLE_GRANULARITY).as_millis() as u64;
+    // Every clause of the criterion, and no others: every entity disposed of —
+    // reassigned *or* parked — inside the budget, nothing lost, and no tick on
+    // which two peers both believed they were the writer. `settled` is carried
+    // separately from the elapsed comparison on purpose: a loop that ran out of
+    // deadline reports exactly the budget in milliseconds, and `<=` alone would
+    // let that read as a pass.
+    let attribution_sound = survivor_losses.is_empty();
+    let dispositions_attested = reassigned_attested + parked_attested;
+    let passed = settled
+        && dispositions_attested >= victim_entities.len() as u64
+        && settled_in_ms <= settle_budget.as_millis() as u64
+        && lost.is_empty()
+        && duplicate_authority == 0
+        && attribution_sound;
     let report = serde_json::json!({
         "peers": cli.peers,
         "entities_total": total_entities,
         "victim_node": victim_node.to_string(),
+        "victim_claim_kind": format!("{:?}", ClaimKind::from(cli.victim_claim_kind)),
         "victim_entities": victim_entities.len(),
+        // Reassignment is counted per entity off the survivors' logs;
+        // `reassigned_attested` is the registrar's own count of the same thing
+        // over the same window, carried so the two can be compared.
         "reassigned": inherited.len(),
-        "parked": parked.len(),
+        "reassigned_attested": reassigned_attested,
+        "successors": inherited_by.values().collect::<BTreeSet<_>>().len(),
+        // Parking is the registrar's counter, never the probe's grant count.
+        // `parked` is that counter once it has caught up; `parked_delta` is
+        // what it read at the poll that stopped the clock.
+        "parked": parked_attested,
+        "parked_when_clock_stopped": parked_delta,
+        "dispositions_attested": dispositions_attested,
+        // What the probe actually proves: entities with no disposition of their
+        // own that still exist and still answer a claim.
+        "claimable_after_settle": claimable.len(),
         "lost": lost,
+        "settled": settled,
         "settled_in_ms": settled_in_ms,
+        "reassigned_in_ms": reassigned_in_ms,
+        "parked_observed_in_ms": parked_observed_in_ms,
+        // How late the parked half of the measurement can be, by construction:
+        // the export that makes a park visible, plus the poll that reads it.
+        "park_observation_lag_ms": (METRICS_EXPORT_INTERVAL + SETTLE_POLL_INTERVAL).as_millis()
+            as u64,
         "lease_ttl_ms": LEASE_TTL.as_millis() as u64,
-        "settle_budget_ms": (LEASE_TTL + SETTLE_GRANULARITY).as_millis() as u64,
-        // `None` means no metrics file was given, which is not the same as a
-        // clean zero — the gate script always passes one.
+        "settle_budget_ms": settle_budget.as_millis() as u64,
         "duplicate_authority": duplicate_authority,
+        // A survivor losing a lease inside the window would put dispositions
+        // that are not the victim's into the counters the clock reads.
+        "survivor_leases_lost": survivor_losses.len(),
         "passed": passed,
     });
     Ok(Outcome { passed, report })
@@ -442,7 +690,15 @@ unsafe fn libc_kill(pid: i32) {
         .ok();
 }
 
-/// Try to claim an entity, returning its granted lease id when it is free.
+/// Try to claim an entity, returning its granted lease id when the registrar
+/// answers with one.
+///
+/// A grant proves the row exists and still answers — not that it was parked:
+/// `lease.rs::claim` grants a weak claim over a weak-held row whose holder is
+/// live and unexpired. The tier stays `Weak` deliberately: a `Strong` claim
+/// against a live holder is turned into a cooperative handoff request whose
+/// unanswered deadline hands the entity over, which is a harness resolving the
+/// redistribution rather than observing it.
 async fn probe_claim(
     session: &Session,
     claim_id: ClaimId,
@@ -519,15 +775,33 @@ fn read_events(path: &PathBuf) -> Result<Vec<PeerEvent>> {
         .collect())
 }
 
-/// The highest `duplicate_authority` total persistd reported.
+/// The registrar's own authority counters, as last exported.
 ///
-/// The counter is absolute rather than an interval delta precisely so a
-/// violation one tick before the read is still visible here.
-fn read_duplicate_authority(path: &std::path::Path) -> Result<u64> {
+/// These are the harness's only non-invasive window into what the registrar
+/// decided: `parked` is the sole witness that an entity parked rather than
+/// being reassigned, and `duplicate_authority` is the single-writer invariant.
+#[derive(Debug, Clone, Copy, Default)]
+struct AuthorityCounters {
+    /// Ticks on which two peers both believed they held authority.
+    duplicate: u64,
+    /// Lost leases handed to a successor.
+    reassigned: u64,
+    /// Lost leases parked because no successor was eligible — or because the
+    /// tier forbids redistributing them at all (D7 §5).
+    parked: u64,
+}
+
+/// Read the highest total persistd has reported for each authority counter.
+///
+/// Every counter is an absolute total rather than an interval delta, precisely
+/// so an event one tick before the read is still visible; taking the maximum
+/// rather than the last line is the same statement, and is robust to a record
+/// being appended while this read is in flight.
+fn read_authority_counters(path: &std::path::Path) -> Result<AuthorityCounters> {
     let Ok(contents) = std::fs::read_to_string(path) else {
-        return Ok(0);
+        return Ok(AuthorityCounters::default());
     };
-    let mut highest = 0;
+    let mut counters = AuthorityCounters::default();
     for line in contents.lines() {
         let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
             continue;
@@ -535,14 +809,25 @@ fn read_duplicate_authority(path: &std::path::Path) -> Result<u64> {
         if value.get("type").and_then(|t| t.as_str()) != Some("gateway_authority") {
             continue;
         }
-        highest = highest.max(
+        let field = |name: &str| {
             value
-                .get("duplicate_authority")
+                .get(name)
                 .and_then(serde_json::Value::as_u64)
-                .unwrap_or(0),
-        );
+                .unwrap_or(0)
+        };
+        counters.duplicate = counters.duplicate.max(field("duplicate_authority"));
+        counters.reassigned = counters.reassigned.max(field("reassigned"));
+        counters.parked = counters.parked.max(field("parked_without_successor"));
     }
-    Ok(highest)
+    Ok(counters)
+}
+
+/// Wall-clock milliseconds, matching the stamp a peer puts on an inherit.
+fn unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| since.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 fn mint_token(issuer: &iroh::SecretKey, node: NodeId) -> Result<Vec<u8>> {
@@ -604,4 +889,55 @@ fn decode_hex(value: &str) -> Result<Vec<u8>> {
 
 fn encode_hex(bytes: &[u8]) -> String {
     data_encoding::HEXLOWER.encode(bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The parked half of the criterion rides entirely on one field name in
+    /// persistd's export. If that name ever moves, `parked` reads zero for
+    /// every run, and the gate silently becomes the reassign-only gate this
+    /// harness was fixed to stop being — while still passing the weak run,
+    /// which is what would keep the regression invisible. So the wire name is
+    /// pinned here rather than trusted.
+    #[test]
+    fn parked_is_read_from_the_registrars_own_counter() {
+        let dir = std::env::temp_dir().join(format!("p3-counters-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("metrics.jsonl");
+        std::fs::write(
+            &path,
+            concat!(
+                "{\"type\":\"gateway_bulk_latency\",\"parked_without_successor\":99}\n",
+                "{\"type\":\"gateway_authority\",\"duplicate_authority\":0,",
+                "\"reassigned\":3,\"parked_without_successor\":7}\n",
+                // A later record with lower totals cannot exist, but a torn
+                // trailing line can: the read takes the maximum, so a partial
+                // append never walks a counter backwards.
+                "{\"type\":\"gateway_authority\",\"reassigned\":1}\n",
+                "{\"type\":\"gateway_auth\n",
+            ),
+        )
+        .unwrap();
+        let counters = read_authority_counters(&path).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(counters.parked, 7, "parked_without_successor not read");
+        assert_eq!(counters.reassigned, 3, "reassigned walked backwards");
+        assert_eq!(counters.duplicate, 0);
+    }
+
+    /// The budget must cover every instrument between a disposition and this
+    /// harness learning of it, or a park that happened inside the TTL fails
+    /// the gate on the harness's own reading cadence. The report publishes
+    /// that lag as `park_observation_lag_ms`; this ties the two together, so
+    /// dropping a term from one without the other cannot go unnoticed.
+    #[test]
+    fn the_settle_budget_covers_the_park_observation_lag() {
+        let published_lag = METRICS_EXPORT_INTERVAL + SETTLE_POLL_INTERVAL;
+        assert!(
+            SETTLE_GRANULARITY >= REGISTRAR_SWEEP_INTERVAL + published_lag,
+            "settle budget {SETTLE_GRANULARITY:?} does not cover sweep + {published_lag:?}"
+        );
+    }
 }
