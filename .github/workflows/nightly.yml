@@ -10,6 +10,17 @@
 #
 # Their `--self-test` modes run per-commit in ci.yml; those check the scripts
 # still contain the stages that make them proofs, not that the proofs pass.
+#
+# One job here is not a gate. `p4-accumulate` produces evidence rather than
+# guarding against a regression: P4 exits on 500 accumulated honest player-hours
+# and the gates cannot supply them, because a gate is required to re-run the
+# same thing every night and 32 hours re-run three hundred times are 32 hours.
+# It varies its seed, sweeps the criterion's 3–5% loss band, and appends one
+# deduplicated line per banked run to a ledger carried between nights. A leg
+# that fails there is a finding and banks nothing; it does not fail the other
+# jobs. Its two scripts self-test in this workflow rather than in ci.yml,
+# because scripts/check.sh enumerates the four *gate* self-tests it runs and
+# these are not gates.
 
 # ── Where these run ──────────────────────────────────────────────────────────
 #
@@ -93,6 +104,135 @@ jobs:
         with:
           name: p1-swarm-evidence
           path: target/p1-swarm/
+          retention-days: 14
+          if-no-files-found: warn
+
+  p4-accumulate:
+    name: P4 hour accumulation (one witnessed hour, swept across the loss band)
+    # Deliberately not part of the swarm gate above, and not a gate at all. That
+    # job re-runs one fixed hour — seed 1, 3% loss — every night, which is what
+    # a regression harness should do and is exactly why it accumulates nothing:
+    # its report's `RunIdentity` is byte-identical from one night to the next.
+    # This job varies the seed and sweeps the 3–5% band, so each night is a
+    # distinct honest hour towards P4's 500 (docs/11-roadmap.md §P4).
+    runs-on: [self-hosted, orrery-hel1]
+    env:
+      RUSTC_WRAPPER: sccache
+    # The hour costs 615 s measured on this box (32 peers, witnessed, 4% loss,
+    # while two other jobs were running); the build is the rest. Bounded well
+    # above that so a hang fails rather than burning the schedule.
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      # The ledger is carried between nights as an artifact of this workflow,
+      # so the job must read its own previous artifacts. That is the whole of
+      # the extra permission this storage choice costs — see the download step.
+      actions: read
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install the pinned toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+
+      # These run nowhere else: scripts/check.sh enumerates the four gate
+      # self-tests it runs per commit and these two scripts are not gates, so
+      # this is the only place a structural regression in them is noticed.
+      - name: Self-test both scripts
+        run: |
+          scripts/p4-accumulate.sh --self-test
+          scripts/p4-ledger.sh --self-test
+
+      # ── Why the ledger lives in an artifact ────────────────────────────────
+      #
+      # It has to outlive the runner, and the four candidates cost different
+      # things:
+      #
+      #   * A dedicated branch or an in-repo file needs `contents: write` on a
+      #     public repository whose nightly runs on a self-hosted machine shared
+      #     with a development checkout. That is a token that can rewrite the
+      #     repository, held by a job on a box three CI runners and a developer
+      #     already share. The ledger is not worth that, and an in-repo file
+      #     additionally means a commit every night and a five-way append race.
+      #   * A release asset needs the same write scope, plus a release to hang
+      #     it on.
+      #   * An artifact needs `actions: read` and a download step, and nothing
+      #     else. It is the only option here that grants no write scope at all.
+      #
+      # What it costs, stated plainly: the chain is only as long as its gaps.
+      # Each night restores the whole ledger and re-uploads it, so history
+      # survives indefinitely *provided* no retention window passes without a
+      # successful run. Retention is set to 90 days below rather than the 14 the
+      # sibling jobs use, so recovering from a broken nightly is a matter of
+      # months rather than a fortnight — but a 90-day silence still loses every
+      # banked hour, and there is no second copy. That is the trade: no write
+      # permission anywhere, at the price of a durability floor set by a
+      # retention clock. The running total is therefore also written into
+      # docs/11-roadmap.md §P4 by hand at each milestone, which is a human
+      # checkpoint rather than a backup.
+      - name: Restore the ledger from the last night that banked
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p target/p4-ledger
+          # Newest artifact of this name that has not expired. `// empty` so a
+          # first run — or one after a full retention gap — yields nothing and
+          # starts a fresh ledger rather than failing.
+          id=$(gh api --paginate \
+            "repos/$GITHUB_REPOSITORY/actions/artifacts?name=p4-hour-ledger&per_page=100" \
+            --jq '[.artifacts[] | select(.expired == false)] | sort_by(.created_at) | last | .id // empty')
+          if [ -z "$id" ]; then
+            echo "::warning::no unexpired p4-hour-ledger artifact; starting a new ledger"
+            echo "restored=0" >> "$GITHUB_ENV"
+            exit 0
+          fi
+          gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$id/zip" > ledger.zip
+          unzip -o -d target/p4-ledger ledger.zip
+          rm -f ledger.zip
+          lines=$(wc -l < target/p4-ledger/hours.jsonl)
+          echo "restored $lines banked run(s) from artifact $id"
+          echo "restored=$lines" >> "$GITHUB_ENV"
+
+      - name: Run the accumulation leg and bank its hour
+        run: scripts/p4-accumulate.sh
+
+      # The failure this guards is silent and total: a restore that half-worked
+      # followed by a successful append uploads a one-line ledger over the whole
+      # history, and nothing else would notice. The ledger only ever grows.
+      - name: Refuse to publish a ledger shorter than the one restored
+        run: |
+          set -euo pipefail
+          now=$(wc -l < target/p4-ledger/hours.jsonl)
+          if [ "$now" -lt "${restored:-0}" ]; then
+            echo "::error::ledger shrank from ${restored:-0} to $now lines; refusing to publish it"
+            exit 1
+          fi
+          echo "ledger holds $now banked run(s) (restored ${restored:-0})"
+          {
+            echo '### P4 player-hour ledger'
+            echo '```'
+            scripts/p4-ledger.sh total 2>&1
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # Always: a leg that failed banked nothing, and the ledger in hand is
+      # still the one the next night must inherit. Not re-uploading it would
+      # make a single failed night the start of the retention clock on
+      # everything before it.
+      - name: Publish the ledger for the next night
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: p4-hour-ledger
+          path: target/p4-ledger/hours.jsonl
+          retention-days: 90
+          if-no-files-found: warn
+
+      - name: Upload the leg's report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: p4-accumulate-evidence
+          path: target/p4-accumulate/
           retention-days: 14
           if-no-files-found: warn
 
