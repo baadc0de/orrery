@@ -46,6 +46,13 @@ if [[ ${1:-} == --self-test ]]; then
   # the rig's key id.
   has '--issuer-key "$issuer_key_id@$issuer_public"' || die 'self-test: gateway identity issuer key absent'
   has '--issuer-secret "$secret_issuer"' || die 'self-test: load rig session-token minting absent'
+  # The merge below concatenates the client rig's samples with persistd's into
+  # one fold, and the dashboard folds by series name with no source field. A
+  # server-internal span is strictly shorter than the client round trip it
+  # attributes, so if persistd ever writes one under a gated name the merged
+  # p99 drops and this gate passes on a measurement it never made. The check
+  # is cheap and belongs here, where the two files meet.
+  has 'server_side_spans_never_gate' || die 'self-test: server-span attribution check absent'
   echo 'self-test: two-process proof stages present'
   exit 0
 fi
@@ -290,6 +297,20 @@ if l.get('gate') != 'pass': raise SystemExit('latency dashboard returned a non-p
 # used to show up as samples silently dropped and a clean report.
 if l.get('unknown_series', 0):
     raise SystemExit(f"latency artifact carried unrecognized series: {l.get('unknown_series_names')}")
+# persistd's own spans ride this artifact under their own names
+# (gateway_*_server_ms) and must stay attribution-only. If one ever arrives
+# under a gated name it is folded into the client's histogram and lowers the
+# p99 this gate reads -- the one way this harness can pass without having
+# measured anything. The check is named so the offline self-test can find it.
+def server_side_spans_never_gate(series):
+    gated = {'journal_commit_ms', 'bulk_ack_ms', 'intent_commit_ms', 'area_first_page_ms'}
+    for name, summary in series.items():
+        server_span = name.startswith('gateway_') and name.endswith('_server_ms')
+        if server_span and (name in gated or summary.get('gate') != 'not_gated'):
+            raise SystemExit(f'server-internal span {name} is being gated')
+        if name in gated and summary.get('gate') == 'not_gated':
+            raise SystemExit(f'gated series {name} lost its threshold')
+server_side_spans_never_gate(l.get('series') or {})
 artifact.write_text(json.dumps({
   'kind':'p2_two_process_kill9_gate',
   'created_at':datetime.datetime.now(datetime.timezone.utc).isoformat(),
