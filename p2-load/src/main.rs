@@ -28,10 +28,28 @@
 //!   deterministic placement of `--entities` PersistIds over ≥ `--cells`
 //!   interest cells. The placement must not collapse to one cell — every
 //!   pre-existing load path in the repo hardcodes `CellId::ROOT`.
-//! - **Trajectory.** Movement is a closed-form `(entity, tick) → position`
-//!   program (docs/12-world-seeding.md §12.3): each entity orbits its cell
-//!   with a period chosen so crossings are continuous, which is what
-//!   exercises cross-cell routing without a multi-gigabyte trace.
+//! - **Authority.** Every bulk diff the rig sends is *fenced*: the gateway
+//!   sets `strict_authority: true` unconditionally
+//!   (`crates/orrery_persistd/src/gateway.rs`, `route_session_diff`), so a
+//!   diff without a granted `(lease_id, authority_seq)` is rejected before the
+//!   journal. The rig therefore claims a strong lease per entity before it
+//!   drives any load, renews them on a heartbeat, and refuses to fall back to
+//!   unleased writes — the fallback is exactly how a run of 541 408 rejections
+//!   passed for a durability measurement.
+//! - **One NodeId per session.** The gateway's peer registry is keyed by
+//!   `NodeId` and only the *newest* session of a peer is current
+//!   (`PeerRegistry::activate` sets `peer.current`); every older session's
+//!   `lock_current()` returns `None` and its diffs are nacked before routing.
+//!   A rig fanning 125 connections out of one endpoint therefore had 124 dead
+//!   sessions. Each session gets its own endpoint, which also gives it its own
+//!   claim-rate bucket (that bucket is `NodeId`-scoped: 64 burst, 20/s).
+//! - **Cells are pinned.** A leased writer cannot move an entity between
+//!   cells: `apply_fenced` admits a diff only when
+//!   `by_cell[entity] == record.cell` (`orrery_persistd/src/actor.rs`), and the
+//!   gateway answers a client-sent `LeaseMsg::Rekey` with an unconditional
+//!   `Deny{NotEligible}`. Cross-cell coverage therefore comes from the
+//!   *placement* (≥ `--cells` distinct cells), not from motion. See
+//!   docs/08-persistence.md §2.1.
 //!
 //! Telemetry posture: **the OTel bridge (D12) is deferred.** This crate
 //! deliberately adds no `opentelemetry` dependency — that stack would be a
@@ -66,8 +84,9 @@ use orrery_persist_client::latency::LatencyHistogram;
 use orrery_persist_client::{IntentQueue, UplinkScheduler};
 use orrery_protocol::channels::{encode_datagram, encode_stream_frame, untag, Channel};
 use orrery_protocol::{
-    Attestation, CellEpoch, CellId, DiffUplink, GatewayMsg, GatewayReply, GridId, Intent, IntentOp,
-    IntentOutcome, NodeId, PersistId, RecordKind, Tick,
+    Attestation, CellEpoch, CellId, ClaimBasis, ClaimId, ClaimKind, DiffUplink, GatewayMsg,
+    GatewayReply, GridId, Intent, IntentOp, IntentOutcome, LeaseId, LeaseMsg, NodeId, PersistId,
+    RecordKind, SeqPair, Tick,
 };
 
 use cli::Cli;
@@ -125,6 +144,32 @@ const DIFF_OVERHEAD_BYTES: usize = 64;
 /// of fraction resolution, comfortably under the 0.01–0.1 mixes in D16-shaped
 /// workloads.
 const MIX_MODULUS: u64 = 1_000_000;
+
+/// The registrar's per-`NodeId` claim burst
+/// (`ClaimBucket::BURST_CLAIMS` in `crates/orrery_persistd/src/gateway.rs`,
+/// and `orrery_authority::contact::CLAIM_BURST`). Re-declared rather than
+/// imported: this crate is a separate workspace and links neither.
+const CLAIM_BURST: usize = 64;
+
+/// The registrar's per-`NodeId` claim refill rate
+/// (`ClaimBucket::CLAIMS_PER_SECOND`, `CLAIM_RATE_PER_SEC`).
+const CLAIM_RATE_PER_SEC: usize = 20;
+
+/// How long one claim round waits for its replies before pacing the next one.
+/// One second is the bucket's refill quantum, so a round that emitted a full
+/// `CLAIM_RATE_PER_SEC` batch has exactly earned the next one when it ends.
+const CLAIM_ROUND: Duration = Duration::from_secs(1);
+
+/// Hard ceiling on the whole claim phase. The phase is `entities / sessions`
+/// claims per NodeId, paced by the bucket above; this bounds a gateway that
+/// simply stops answering instead of denying.
+const CLAIM_PHASE_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Lease renewal cadence. `LEASE_TTL_MS` is 10 s
+/// (`crates/orrery_persistd/src/lease.rs`); renewing at 3 s survives two lost
+/// heartbeats. Heartbeats are batched per session and are *not* charged to the
+/// claim bucket.
+const LEASE_HEARTBEAT: Duration = Duration::from_secs(3);
 
 fn main() -> ExitCode {
     match tokio::runtime::Builder::new_multi_thread()
@@ -213,20 +258,36 @@ async fn run() -> Result<()> {
     )?;
 
     // ── Transport ────────────────────────────────────────────────────────
-    let (endpoint, intent_signing_key) = bind_endpoint(cli.secret_key.as_deref()).await?;
-    tracing::info!(node = %endpoint.id(), addr = %cli.addr, "rig endpoint up");
-
+    //
+    // One endpoint — one NodeId — per session. The gateway's peer registry is
+    // keyed by NodeId and `PeerRegistry::activate` makes only the newest
+    // session of a peer current, so N connections from one endpoint leave
+    // N−1 sessions whose `lock_current()` is `None`: every diff on them is
+    // nacked at `route_session_diff` before authority is even consulted. The
+    // claim-rate bucket is NodeId-scoped too, so distinct identities are also
+    // what makes a 10 000-entity claim phase finish in about a second instead
+    // of eight minutes.
+    let mut endpoints = Vec::new();
+    let mut signing_keys = Vec::new();
     let mut sessions = Vec::new();
     for i in 0..cli.sessions {
+        let (endpoint, signing_key) =
+            bind_endpoint(session_secret_key(cli.secret_key.as_deref(), i)?.as_deref()).await?;
         // One token per session: it is bound to this endpoint's NodeId and
         // carries its own issue time, so it is minted rather than shared.
         let token = session_token(&cli, endpoint.id())?;
         let conn = dial(&endpoint, cli.addr, cli.gateway, token)
             .await
             .with_context(|| format!("dial session {i}"))?;
+        endpoints.push(endpoint);
+        signing_keys.push(signing_key);
         sessions.push(conn);
     }
-    tracing::info!(sessions = sessions.len(), "gateway sessions connected");
+    tracing::info!(
+        sessions = sessions.len(),
+        node = %endpoints[0].id(),
+        "gateway sessions connected (one NodeId each; first shown)"
+    );
 
     // ── Ack log (kill-9 harness input) ───────────────────────────────────
     let ack_log = match &cli.ack_log {
@@ -249,12 +310,12 @@ async fn run() -> Result<()> {
     }
 
     // ── The run ──────────────────────────────────────────────────────────
-    let rig_endpoint = endpoint.clone();
-    let rig = Rig {
+    let rig_endpoints = endpoints.clone();
+    let mut rig = Rig {
         cli: &cli,
         emit_json: cli.json,
-        endpoint,
-        intent_signing_key,
+        endpoints,
+        signing_keys,
         sessions,
         inventory,
         diff_hz,
@@ -262,23 +323,44 @@ async fn run() -> Result<()> {
         duration,
         ack_log,
         pending_diffs: HashMap::new(),
+        leases: HashMap::new(),
+        intent_sessions: HashMap::new(),
     };
+
+    // ── Authority first. No lease, no load. ──────────────────────────────
+    let claim = rig.claim_leases().await;
+    if let Err(e) = &claim {
+        if cli.json {
+            telemetry::run_footer(&format!("claim phase failed: {e:#}"));
+        }
+    }
+    let claim_elapsed = claim?;
+
     let outcome = rig.drive().await;
 
     if cli.json {
         match &outcome {
             Ok(stats) => telemetry::run_footer(&format!(
-                "duration elapsed; diffs={} acks={} intents={} intent_acks={}",
-                stats.diffs_sent, stats.diff_acks, stats.intents_sent, stats.intent_acks
+                "duration elapsed; claim_secs={:.2} diffs={} acks={} durable_acks={} nacks={} \
+                 intents={} intent_acks={}",
+                claim_elapsed.as_secs_f64(),
+                stats.diffs_sent,
+                stats.diff_acks,
+                stats.durable_diff_acks,
+                stats.diff_nacks,
+                stats.intents_sent,
+                stats.intent_acks
             )),
             Err(e) => telemetry::run_footer(&format!("run failed: {e:#}")),
         }
     }
     outcome?;
 
-    // Close the endpoint cleanly so iroh does not log an ungraceful abort at
+    // Close the endpoints cleanly so iroh does not log an ungraceful abort at
     // drop time.
-    rig_endpoint.close().await;
+    for endpoint in rig_endpoints {
+        endpoint.close().await;
+    }
     Ok(())
 }
 
@@ -399,11 +481,11 @@ async fn read_gateway_state(cli: &Cli, expected: &[DiffEvidence]) -> Result<Vec<
     let root = read_snapshot_pages(&conn, &[CellId::ROOT]).await?;
     let root_diffs = recovered_snapshot_diffs(wanted_ids.clone(), root)?;
 
-    // The rig's closed-form trajectory maps a recovered synthetic
-    // `(entity,tick)` to precisely one storage leaf. Re-read those leaves so
-    // the AreaPage cell retained below is a physical identity assertion. This
-    // admits valid successors that moved after their last pre-kill ack without
-    // treating the enclosing ROOT page as their cell.
+    // A leased writer cannot move an entity between cells (the gateway denies
+    // a client `LeaseMsg::Rekey`, and `apply_fenced` pins `record.cell` to the
+    // committed one), so a recovered entity's storage leaf is exactly its
+    // inventory cell. Re-read those leaves so the AreaPage cell retained below
+    // is a physical identity assertion rather than the enclosing ROOT page.
     let inventory: BTreeMap<_, _> = recovery_inventory(cli)?
         .into_iter()
         .map(|placement| (placement.entity, placement))
@@ -417,7 +499,7 @@ async fn read_gateway_state(cli: &Cli, expected: &[DiffEvidence]) -> Result<Vec<
                     diff.entity
                 )
             })?;
-            Ok(moved_cell(placement, diff.tick.0))
+            Ok(placement.cell)
         })
         .collect::<Result<BTreeSet<_>>>()?
         .into_iter()
@@ -713,11 +795,17 @@ fn aggregate_bulk_latency(schedulers: &[UplinkScheduler]) -> LatencyHistogram {
     combined
 }
 
+/// Every durable ack must have produced a `bulk_ack_ms` sample.
+///
+/// Nacks are deliberately **not** counted: `UplinkScheduler::on_nack_at` no
+/// longer records a reply-latency sample, because a refusal round trip is not
+/// a write's acknowledgement latency and folding it into the gated series let
+/// a run with zero successful writes report a p99 of 1.25–1.75 ms.
 fn check_bulk_reply_coverage(sampled: u64, stats: &RunStats) -> Result<()> {
-    let expected = stats.durable_diff_acks + stats.diff_nacks;
+    let expected = stats.durable_diff_acks;
     if sampled != expected {
         bail!(
-            "bulk latency coverage incomplete after {} ms drain: sampled {} of {} durable ack/nack replies",
+            "bulk latency coverage incomplete after {} ms drain: sampled {} of {} durable acks",
             FINAL_REPLY_DRAIN.as_millis(),
             sampled,
             expected
@@ -729,6 +817,26 @@ fn check_bulk_reply_coverage(sampled: u64, stats: &RunStats) -> Result<()> {
 /// Bind the rig-local iroh endpoint (relay disabled — the rig is
 /// gateway-colocated by design, docs/11-roadmap.md §P2 "gateway-colocated
 /// load generator"; a relayed path would inflate the client-observed series).
+/// Derive session `index`'s iroh secret from the rig's `--secret-key`.
+///
+/// Each session needs its own NodeId (see `run`), so a pinned rig identity has
+/// to fan out into a pinned *family* of identities rather than one. Derivation
+/// is `blake3(secret_key_hex || index)`, so `--secret-key` still reproduces the
+/// same NodeIds across runs. Without `--secret-key` each session generates its
+/// own ephemeral key.
+fn session_secret_key(secret_key: Option<&str>, index: u32) -> Result<Option<String>> {
+    let Some(root) = secret_key else {
+        return Ok(None);
+    };
+    // Reject a malformed root here rather than at the Nth derivation.
+    root.parse::<SecretKey>()
+        .context("invalid --secret-key (expected hex)")?;
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(root.as_bytes());
+    hasher.update(&index.to_le_bytes());
+    Ok(Some(hasher.finalize().to_hex().to_string()))
+}
+
 async fn bind_endpoint(secret_key: Option<&str>) -> Result<(Endpoint, SecretKey)> {
     // The endpoint identity is also the intent issuer. Keep its private key
     // alongside the endpoint so load-generated intents are signed by the
@@ -1007,9 +1115,14 @@ type Inventory = Vec<Placement>;
 /// Entities round-robin over a lattice of cell coordinates centered on the
 /// origin at the interest level (D16 cell edge 128 m). The lattice side is
 /// the cube root of the requested cell count, so `--cells 128` yields a
-/// 6×6×4-ish lattice whose distinct-cell count is ≥ the request. The
-/// trajectory program (`Trajectory`) moves each entity across cell
-/// boundaries, so placement is the *initial* state, not the coverage.
+/// 6×6×4-ish lattice whose distinct-cell count is ≥ the request. Placement is
+/// the *whole* cross-cell coverage: a leased writer cannot move an entity
+/// between cells, because the gateway denies a client `LeaseMsg::Rekey` and
+/// `apply_fenced` admits a diff only at the entity's committed cell.
+///
+/// The synthetic placement is only usable against a world seeded to match it —
+/// a claim names a committed cell, and an entity that was never written has
+/// none. Prefer `--manifest` from `orrery-seed`.
 fn synthetic_inventory(entities: u64, cells: u32) -> Inventory {
     let cells = cells.max(1) as u64;
     // Lattice side: ceil(cbrt(cells)) per axis, clamped to the interest-level
@@ -1035,47 +1148,6 @@ fn synthetic_inventory(entities: u64, cells: u32) -> Inventory {
         });
     }
     inventory
-}
-
-/// A closed-form trajectory program (docs/12-world-seeding.md §12.3): each
-/// entity walks a small circle centered on its cell's origin, with a radius
-/// just over one cell diagonal so the walk crosses cell boundaries
-/// continuously. Position is a pure function of `(entity, tick)` — seekable,
-/// stateless, and a few hundred bytes for the whole fleet.
-struct Trajectory {
-    /// Angular speed, rad/tick, per entity (derived from its id so the fleet
-    /// does not cross cells in lockstep).
-    omega: f64,
-    /// Phase offset, rad.
-    phase: f64,
-}
-
-impl Trajectory {
-    /// The trajectory for one entity. The crossing rate comes out at roughly
-    /// one cell per few seconds at 4 Hz — enough to exercise cross-cell
-    /// routing continuously without churning the shard map.
-    fn for_entity(entity: PersistId) -> Self {
-        let h = entity.0.wrapping_mul(0x9E37_79B9_7F4A_7C15);
-        Self {
-            // ω spread over [0.01, 0.05] rad/tick.
-            omega: 0.01 + 0.04 * ((h >> 32) as f64 / u32::MAX as f64),
-            phase: (h as u32) as f64 / u32::MAX as f64 * std::f64::consts::TAU,
-        }
-    }
-
-    /// The cell offset (in interest cells, each axis in `{-1, 0, 1}`) of this
-    /// entity at `tick`, relative to its inventory cell. The walk crosses a
-    /// boundary whenever the offset changes — the cell the diff is routed to
-    /// changes with it, which is the coverage the rig exists to produce.
-    fn cell_offset(&self, tick: u64) -> (i32, i32) {
-        let a = self.phase + self.omega * tick as f64;
-        // Radius 1.5 cells: the circle's projection on each axis crosses the
-        // cell boundary twice per period.
-        let r = 1.5;
-        let dx = (r * a.cos()).round() as i32;
-        let dz = (r * a.sin()).round() as i32;
-        (dx, dz)
-    }
 }
 
 /// One `[[workload]]` block from a scenario TOML (docs/12-world-seeding.md
@@ -1177,6 +1249,20 @@ struct ManifestEntry {
 
 impl ManifestInventory {
     fn load(path: &Path) -> Result<Self> {
+        // `orrery-seed verify --emit-manifest` writes a pretty-printed JSON
+        // *array*, not the JSONL docs/12 §9.3 describes. Both are accepted:
+        // the array is what the shipped seeder actually produces (verified
+        // against `scenarios/p2demo.toml --profile ci`), and the JSONL form is
+        // what the document specifies and what earlier fixtures use.
+        let text = std::fs::read_to_string(path)
+            .with_context(|| format!("read {}", path.display()))?;
+        if text.trim_start().starts_with('[') {
+            let entries: Vec<ManifestEntry> = serde_json::from_str(&text)
+                .with_context(|| format!("parse {} as a JSON manifest array", path.display()))?;
+            return Ok(Self {
+                inventory: Self::placements(entries),
+            });
+        }
         let file = std::fs::File::open(path)?;
         let reader = BufReader::new(file);
         let mut inventory = Vec::new();
@@ -1207,6 +1293,28 @@ impl ManifestInventory {
             }
         }
         Ok(Self { inventory })
+    }
+
+    /// Root-grid placements from decoded manifest entries. Non-root-grid rows
+    /// are skipped with a warning (P2 loads root-grid inventories only, P-7).
+    fn placements(entries: Vec<ManifestEntry>) -> Inventory {
+        entries
+            .into_iter()
+            .filter_map(|entry| {
+                if entry.grid.is_some_and(|g| g != GridId::ROOT) {
+                    tracing::warn!(
+                        entity = ?entry.persist_id,
+                        "manifest entry in a non-root grid skipped (P2 loads root-grid \
+                         inventories only)"
+                    );
+                    return None;
+                }
+                Some(Placement {
+                    entity: entry.persist_id,
+                    cell: entry.cell,
+                })
+            })
+            .collect()
     }
 }
 
@@ -1267,6 +1375,22 @@ struct RunStats {
     diff_nacks: u64,
     intents_sent: u64,
     intent_acks: u64,
+    /// Leases the registrar took back mid-run (a `HeartbeatAck` `invalid` row
+    /// or an unsolicited `Expire`). Non-zero fails the run: a rig that keeps
+    /// writing after losing authority is measuring rejections again.
+    leases_lost: u64,
+}
+
+/// One entity's granted authority: the fencing token and the exact sequence
+/// pair `apply_fenced` compares against (`row.seq == authority_seq`).
+#[derive(Debug, Clone, Copy)]
+struct GrantedLease {
+    lease_id: LeaseId,
+    seq: SeqPair,
+    /// The committed cell the lease was granted at. Every diff for this entity
+    /// must name it: `apply_fenced` requires `by_cell[entity] == record.cell`,
+    /// and a client cannot rekey (the gateway denies `LeaseMsg::Rekey`).
+    cell: CellId,
 }
 
 /// The rig, mid-run.
@@ -1276,9 +1400,12 @@ struct Rig<'a> {
     /// than a read of `cli.json` so a future integration harness can run the
     /// drive loop silently without rebuilding the CLI.
     emit_json: bool,
-    endpoint: Endpoint,
-    /// Private half of `endpoint.id()`, used for canonical issuer signatures.
-    intent_signing_key: SecretKey,
+    /// One endpoint per session, index-aligned with `sessions`.
+    endpoints: Vec<Endpoint>,
+    /// Private halves of `endpoints[i].id()`, used for canonical issuer
+    /// signatures. An intent must be signed by the identity that authenticated
+    /// the connection carrying it, so this is index-aligned too.
+    signing_keys: Vec<SecretKey>,
     sessions: Vec<GatewayLink>,
     inventory: Inventory,
     diff_hz: f64,
@@ -1289,9 +1416,288 @@ struct Rig<'a> {
     /// cell fields, so retaining the exact outbound evidence is required for
     /// the post-crash state proof.
     pending_diffs: HashMap<(PersistId, Tick), DiffEvidence>,
+    /// Granted authority, per entity. An entity absent here is never written:
+    /// there is no unleased path out of this rig.
+    leases: HashMap<PersistId, GrantedLease>,
+    /// Which session (and therefore which issuer identity) minted each
+    /// in-flight intent, so it is submitted on the connection whose
+    /// authenticated NodeId the gateway binds it to.
+    intent_sessions: HashMap<u128, usize>,
 }
 
 impl Rig<'_> {
+    /// Claim a strong lease on every inventory entity before any load runs.
+    ///
+    /// Returns the phase's wall time. The rig refuses to proceed with a
+    /// partial grant set: a diff without a lease is rejected at the gateway
+    /// before it reaches the journal (`strict_authority: true`), so a silent
+    /// fallback would once again measure refusals and call them durability.
+    ///
+    /// Shape of the phase:
+    ///
+    /// - An entity is claimed on the session that will send its diffs
+    ///   (`scheduler_shard`), because the lease is bound to *that* session's
+    ///   NodeId and `apply_fenced` compares the record's author against the
+    ///   lease holder.
+    /// - `ClaimKind::Strong` with `ClaimBasis::Explicit`. A weak claim would
+    ///   additionally require coordinator-signed interest
+    ///   (`interest_authority.allows`), which the P2 gate has no coordinator
+    ///   to mint; a strong claim skips that check and, once held, cannot be
+    ///   stolen out from under the run.
+    /// - The claimed cell is the inventory cell, which must equal the entity's
+    ///   *committed* cell or the registrar denies the claim as `NotEligible`
+    ///   (`gateway.rs`: `plausible` requires
+    ///   `committed_entity_cell(grid, entity) == cell`). Entities must already
+    ///   exist durably — seed them (`orrery-seed`, or `persistd --dev-seed`)
+    ///   before running the rig.
+    /// - Pacing is the registrar's own bucket: `CLAIM_BURST` in the first
+    ///   round and `CLAIM_RATE_PER_SEC` per second thereafter, *per session*.
+    async fn claim_leases(&mut self) -> Result<Duration> {
+        let started = Instant::now();
+        let sessions = self.sessions.len().max(1);
+
+        // Outstanding claims per session, in inventory order.
+        let mut outstanding: Vec<Vec<Placement>> = vec![Vec::new(); sessions];
+        for (index, placement) in self.inventory.iter().enumerate() {
+            outstanding[scheduler_shard(index, sessions)].push(*placement);
+        }
+        let total = self.inventory.len();
+        let per_session_max = outstanding.iter().map(Vec::len).max().unwrap_or(0);
+        tracing::info!(
+            entities = total,
+            sessions,
+            per_session = per_session_max,
+            claim_burst = CLAIM_BURST,
+            claim_rate_per_sec = CLAIM_RATE_PER_SEC,
+            "claiming leases (strong/explicit) before load"
+        );
+
+        // Correlation ids are per-session and start at 1 (`ClaimId::0` is
+        // reserved for registrar-initiated grants).
+        let mut next_claim_id: Vec<u64> = vec![1; sessions];
+        let mut in_flight: Vec<HashMap<ClaimId, Placement>> = vec![HashMap::new(); sessions];
+        let mut denials: BTreeMap<String, u64> = BTreeMap::new();
+        let deadline = tokio::time::Instant::now() + CLAIM_PHASE_TIMEOUT;
+        let mut round = 0usize;
+
+        while self.leases.len() < total {
+            if tokio::time::Instant::now() >= deadline {
+                bail!(
+                    "claim phase timed out after {:?}: granted {} of {} leases ({} still in \
+                     flight). Denials so far: {:?}",
+                    CLAIM_PHASE_TIMEOUT,
+                    self.leases.len(),
+                    total,
+                    in_flight.iter().map(HashMap::len).sum::<usize>(),
+                    denials
+                );
+            }
+            let budget = if round == 0 {
+                CLAIM_BURST
+            } else {
+                CLAIM_RATE_PER_SEC
+            };
+            round += 1;
+
+            let mut emitted = 0usize;
+            for session in 0..sessions {
+                for _ in 0..budget {
+                    let Some(placement) = outstanding[session].pop() else {
+                        break;
+                    };
+                    let claim_id = ClaimId(next_claim_id[session]);
+                    next_claim_id[session] += 1;
+                    in_flight[session].insert(claim_id, placement);
+                    send_msg(
+                        &self.sessions[session],
+                        &GatewayMsg::Lease {
+                            message: LeaseMsg::Claim {
+                                claim_id,
+                                entity: placement.entity,
+                                grid: GridId::ROOT,
+                                cell: placement.cell,
+                                kind: ClaimKind::Strong,
+                                basis: ClaimBasis::Explicit,
+                                observed: SeqPair::default(),
+                                tick: Tick::new(0),
+                            },
+                        },
+                    )
+                    .await;
+                    emitted += 1;
+                }
+            }
+
+            // Collect for one refill quantum, whether or not this round had
+            // anything left to send: replies to earlier rounds are still
+            // arriving, and a `RateLimited` denial is requeued below.
+            let round_end = tokio::time::Instant::now() + CLAIM_ROUND;
+            loop {
+                let remaining = round_end.saturating_duration_since(tokio::time::Instant::now());
+                if remaining.is_zero() {
+                    break;
+                }
+                let mut got_any = false;
+                for session in 0..sessions {
+                    while let Some((packet, _)) = self.sessions[session].try_next_inbound() {
+                        got_any = true;
+                        let Some(reply) = decode_reply(&packet) else {
+                            continue;
+                        };
+                        let GatewayReply::Lease { message } = reply else {
+                            // Bulk/area traffic cannot exist yet; anything
+                            // else here is the gateway talking about a session
+                            // shape the rig did not ask for.
+                            tracing::debug!(session, "non-lease reply during claim phase");
+                            continue;
+                        };
+                        match message {
+                            LeaseMsg::Grant {
+                                claim_id,
+                                entity,
+                                lease_id,
+                                seq,
+                                ..
+                            } => {
+                                let cell = in_flight[session]
+                                    .remove(&claim_id)
+                                    .map(|placement| placement.cell);
+                                let Some(cell) = cell else {
+                                    tracing::warn!(
+                                        session,
+                                        ?entity,
+                                        "grant for a claim this session never made"
+                                    );
+                                    continue;
+                                };
+                                self.leases.insert(
+                                    entity,
+                                    GrantedLease {
+                                        lease_id,
+                                        seq,
+                                        cell,
+                                    },
+                                );
+                            }
+                            LeaseMsg::Deny {
+                                claim_id,
+                                entity,
+                                reason,
+                                retry_after_ms,
+                            } => {
+                                let placement = claim_id
+                                    .and_then(|claim_id| in_flight[session].remove(&claim_id));
+                                *denials.entry(format!("{reason:?}")).or_default() += 1;
+                                match (reason, placement) {
+                                    // The registrar's own back-pressure: requeue
+                                    // and let the pacing above absorb it.
+                                    (orrery_protocol::DenyReason::RateLimited, Some(p)) => {
+                                        tracing::debug!(
+                                            session,
+                                            ?entity,
+                                            retry_after_ms,
+                                            "claim rate limited; requeued"
+                                        );
+                                        outstanding[session].push(p);
+                                    }
+                                    (reason, _) => {
+                                        // Everything else is definitive. Fail
+                                        // now, with the reason, rather than
+                                        // degrading to unleased writes.
+                                        bail!(
+                                            "gateway denied the lease claim for {entity:?} on \
+                                             session {session}: {reason:?}. The rig has no \
+                                             unleased write path — seed the entity durably (its \
+                                             committed cell is what a claim names) and rerun."
+                                        );
+                                    }
+                                }
+                            }
+                            other => {
+                                tracing::debug!(session, ?other, "lease control during claim phase");
+                            }
+                        }
+                    }
+                }
+                if !got_any {
+                    tokio::time::sleep(remaining.min(DRAIN_POLL_INTERVAL)).await;
+                }
+            }
+            tracing::debug!(
+                round,
+                emitted,
+                granted = self.leases.len(),
+                total,
+                "claim round complete"
+            );
+
+            // Nothing left to send and nothing left in flight, yet short of
+            // the inventory: replies were lost, not denied. Requeue them.
+            if outstanding.iter().all(Vec::is_empty)
+                && in_flight.iter().all(HashMap::is_empty)
+                && self.leases.len() < total
+            {
+                let mut requeued = 0usize;
+                for (index, placement) in self.inventory.iter().enumerate() {
+                    if !self.leases.contains_key(&placement.entity) {
+                        outstanding[scheduler_shard(index, sessions)].push(*placement);
+                        requeued += 1;
+                    }
+                }
+                tracing::warn!(requeued, "claims with no reply; retrying");
+            }
+        }
+
+        let elapsed = started.elapsed();
+        tracing::info!(
+            leases = self.leases.len(),
+            claim_secs = elapsed.as_secs_f64(),
+            rate_limited = denials
+                .get("RateLimited")
+                .copied()
+                .unwrap_or_default(),
+            "claim phase complete"
+        );
+        if self.emit_json {
+            telemetry::run_footer(&format!(
+                "claim phase: {} leases in {:.2}s",
+                self.leases.len(),
+                elapsed.as_secs_f64()
+            ));
+        }
+        Ok(elapsed)
+    }
+
+    /// Renew every held lease on its owning session.
+    ///
+    /// One batched `Heartbeat` per session. Heartbeats do not change the
+    /// durable sequence or the token (`lease.rs::heartbeat`), so the
+    /// `(lease_id, seq)` the rig carries on its diffs stays valid across them.
+    async fn heartbeat_leases(&self) {
+        let sessions = self.sessions.len().max(1);
+        let mut per_session: Vec<Vec<LeaseId>> = vec![Vec::new(); sessions];
+        for (index, placement) in self.inventory.iter().enumerate() {
+            if let Some(lease) = self.leases.get(&placement.entity) {
+                per_session[scheduler_shard(index, sessions)].push(lease.lease_id);
+            }
+        }
+        for (session, lease_ids) in per_session.into_iter().enumerate() {
+            if lease_ids.is_empty() {
+                continue;
+            }
+            send_msg(
+                &self.sessions[session],
+                &GatewayMsg::Lease {
+                    message: LeaseMsg::Heartbeat {
+                        lease_ids,
+                        tick: Tick::new(0),
+                    },
+                },
+            )
+            .await;
+        }
+    }
+
     /// Drive the load loop until the duration elapses.
     async fn drive(mut self) -> Result<RunStats> {
         let cfg = PersistClientConfig {
@@ -1343,6 +1749,7 @@ impl Rig<'_> {
         let mut next_session_flush = (0..sessions)
             .map(|session| start + session_phase_period * session_flush_phase(session) as u32)
             .collect::<Vec<_>>();
+        let mut next_heartbeat = start + LEASE_HEARTBEAT;
 
         while start.elapsed() < self.duration {
             // ── Receive: drain both lanes of every session ────────────────
@@ -1372,6 +1779,15 @@ impl Rig<'_> {
 
             let now = Instant::now();
 
+            // ── Renew authority ──────────────────────────────────────────
+            // Leases expire 10 s after their last renewal, so a 30 s run that
+            // did not heartbeat would start being fenced out a third of the
+            // way in and report the rejections as latency.
+            if now >= next_heartbeat {
+                self.heartbeat_leases().await;
+                next_heartbeat = now + LEASE_HEARTBEAT;
+            }
+
             // ── Load: queue each entity's diff for this global frame ─────
             //
             // Queueing is global so a state change is available to its owner
@@ -1388,21 +1804,28 @@ impl Rig<'_> {
                     if !generation_cohort_is_due(index, sessions, phase_slots, flush_index) {
                         continue;
                     }
+                    // No lease, no write. An entity whose lease the registrar
+                    // withdrew mid-run is dropped from the load rather than
+                    // written unfenced; `stats.leases_lost` fails the run.
+                    let Some(lease) = self.leases.get(&p.entity).copied() else {
+                        continue;
+                    };
                     let tick_now = flush_index;
-                    let cell = moved_cell(p, tick_now);
                     schedulers[shard].queue(DiffUplink {
-                        cell,
+                        // The committed cell the lease was granted at, not a
+                        // trajectory position: `apply_fenced` admits a diff
+                        // only where `by_cell[entity] == record.cell`, and a
+                        // client cannot rekey (the gateway denies
+                        // `LeaseMsg::Rekey` unconditionally).
+                        cell: lease.cell,
                         grid: GridId::ROOT,
                         entity: p.entity,
                         tick: Tick::new(tick_now),
                         kind: RecordKind::ComponentDiff,
                         payload: synthetic_payload(p.entity, tick_now, self.cli.diff_payload_bytes),
                         seq: tick_now,
-                        // The rig claims no leases: it measures the gateway's
-                        // latency, not its authority arbitration, and a diff
-                        // presenting a lease it does not hold would be nacked.
-                        lease_id: None,
-                        authority_seq: None,
+                        lease_id: Some(lease.lease_id),
+                        authority_seq: Some(lease.seq),
                     });
                 }
                 flush_index += 1;
@@ -1429,9 +1852,13 @@ impl Rig<'_> {
                     // decision is deterministic per (entity, send index).
                     if let Some(kind) = self.intent_for(diff.entity, diff.seq) {
                         let id = intent_id(diff.entity, diff.seq);
-                        let intent = self.make_intent(id, kind);
+                        let intent = self.make_intent(session, id, kind);
                         if intents.submit(intent).is_some() {
                             stats.intents_sent += 1;
+                            // The gateway binds `intent.issuer` to the
+                            // connection's authenticated NodeId, so the intent
+                            // must leave on the session whose key signed it.
+                            self.intent_sessions.insert(id, session);
                         }
                         // The diff is still sent: the intent is *in addition
                         // to* the bulk stream (trades/crafts do not replace
@@ -1467,11 +1894,12 @@ impl Rig<'_> {
             // A load phase produces only its matching intent subset, so this
             // control traffic is phased with the bulk work as well.
             for intent in intents.drain() {
-                send_msg(
-                    &self.sessions[(intent.intent_id as usize) % sessions],
-                    &GatewayMsg::SubmitIntent { intent },
-                )
-                .await;
+                let session = self
+                    .intent_sessions
+                    .get(&intent.intent_id)
+                    .copied()
+                    .unwrap_or((intent.intent_id as usize) % sessions);
+                send_msg(&self.sessions[session], &GatewayMsg::SubmitIntent { intent }).await;
             }
 
             // ── Telemetry drain (bounded-memory histograms → JSONL) ──────
@@ -1548,12 +1976,33 @@ impl Rig<'_> {
             acks = stats.diff_acks,
             durable_acks = stats.durable_diff_acks,
             provisional_acks = stats.provisional_diff_acks,
+            // Rejections are reported, always. 541 408 of them were invisible
+            // in this line once, and the summary said the run went fine.
+            diff_nacks = stats.diff_nacks,
+            leases = self.leases.len(),
+            leases_lost = stats.leases_lost,
             intents = stats.intents_sent,
             intent_acks = stats.intent_acks,
             bulk_p99_us = aggregate_bulk_latency(&schedulers).p99().as_micros() as u64,
             intent_p99_us = intents.intent_latency().p99().as_micros() as u64,
             "run complete"
         );
+        if stats.leases_lost > 0 {
+            bail!(
+                "the registrar withdrew {} lease(s) mid-run: the rig stopped writing those \
+                 entities rather than falling back to unfenced writes, but the run's durability \
+                 evidence is incomplete",
+                stats.leases_lost
+            );
+        }
+        if stats.durable_diff_acks == 0 {
+            bail!(
+                "no durable bulk acknowledgement in the whole run ({} diffs sent, {} nacked): \
+                 nothing was journaled, so there is no durability evidence to gate on",
+                stats.diffs_sent,
+                stats.diff_nacks
+            );
+        }
         Ok(stats)
     }
 
@@ -1624,16 +2073,32 @@ impl Rig<'_> {
                 entity,
                 tick,
                 reason,
-                // The rig holds no leases, so a nack's current-holder hint has
-                // nothing here to reconcile against. That path is exercised by
-                // the shipped client's `process_replies`.
-                lease: _,
+                lease,
             } => {
                 if let Some(sched) = schedulers.get_mut(session) {
                     sched.on_nack_at(entity, tick, received_at);
                 }
                 stats.diff_nacks += 1;
-                tracing::debug!(session, ?entity, ?tick, reason, "bulk nack");
+                // The rig holds a lease for every entity it writes, so the
+                // current-holder row in a nack is actionable: it says the
+                // fencing token the rig is carrying is no longer the live one.
+                let held = self.leases.get(&entity).map(|held| held.lease_id);
+                let fenced_out = lease
+                    .as_ref()
+                    .is_some_and(|row| held.is_some_and(|held| row.lease_id != held));
+                if fenced_out {
+                    self.leases.remove(&entity);
+                    stats.leases_lost += 1;
+                    tracing::warn!(
+                        session,
+                        ?entity,
+                        ?tick,
+                        ?lease,
+                        "fenced out: the rig's lease is no longer the live row"
+                    );
+                } else {
+                    tracing::debug!(session, ?entity, ?tick, reason, ?lease, "bulk nack");
+                }
             }
             GatewayReply::IntentAck { intent_id, outcome } => {
                 let evidence_outcome = match &outcome {
@@ -1674,18 +2139,56 @@ impl Rig<'_> {
             } => {
                 tracing::warn!(session, protocol, reason, "gateway refused the session");
             }
-            // The rig neither claims leases nor presents a coordinator grant,
-            // so these are the gateway telling it about a session shape it did
-            // not ask for. Logged rather than ignored: silently dropping them
-            // would hide a gateway that thinks this connection is something
-            // other than a load generator.
-            GatewayReply::Lease { message } => {
-                tracing::warn!(
-                    session,
-                    ?message,
-                    "unexpected lease control on a rig session"
-                );
-            }
+            // The rig holds leases, so lease control mid-run is meaningful:
+            // it is the registrar telling the rig it has lost authority. A
+            // withdrawn lease drops the entity from the load and is counted;
+            // it never silently degrades into an unfenced write.
+            GatewayReply::Lease { message } => match message {
+                LeaseMsg::HeartbeatAck { invalid, .. } => {
+                    if invalid.is_empty() {
+                        return;
+                    }
+                    let dropped: Vec<PersistId> = self
+                        .leases
+                        .iter()
+                        .filter(|(_, held)| invalid.contains(&held.lease_id))
+                        .map(|(entity, _)| *entity)
+                        .collect();
+                    for entity in &dropped {
+                        self.leases.remove(entity);
+                    }
+                    stats.leases_lost += dropped.len() as u64;
+                    tracing::warn!(
+                        session,
+                        invalid = invalid.len(),
+                        dropped = dropped.len(),
+                        "registrar refused to renew leases"
+                    );
+                }
+                LeaseMsg::Expire {
+                    entity,
+                    lease_id,
+                    reason,
+                    ..
+                } => {
+                    if self
+                        .leases
+                        .get(&entity)
+                        .is_some_and(|held| held.lease_id == lease_id)
+                    {
+                        self.leases.remove(&entity);
+                        stats.leases_lost += 1;
+                    }
+                    tracing::warn!(session, ?entity, ?lease_id, ?reason, "lease expired mid-run");
+                }
+                other => {
+                    tracing::warn!(
+                        session,
+                        ?other,
+                        "unexpected lease control on a rig session"
+                    );
+                }
+            },
             GatewayReply::InterestAck { epoch, reason } => {
                 tracing::warn!(
                     session,
@@ -1738,8 +2241,13 @@ impl Rig<'_> {
     /// epoch. The P2 gateway verifies the issuer signature before durable
     /// execution, so the rig signs the canonical preimage with the same key
     /// that established this endpoint's authenticated NodeId.
-    fn make_intent(&self, id: u128, kind: String) -> Intent {
-        signed_intent(id, self.endpoint.id(), &self.intent_signing_key, kind)
+    fn make_intent(&self, session: usize, id: u128, kind: String) -> Intent {
+        signed_intent(
+            id,
+            self.endpoints[session].id(),
+            &self.signing_keys[session],
+            kind,
+        )
     }
 }
 
@@ -1822,17 +2330,6 @@ fn intent_id(entity: PersistId, send_index: u64) -> u128 {
     ((entity.0 as u128) << 64) | send_index as u128
 }
 
-/// The cell an entity's trajectory has moved it into at `tick`.
-fn moved_cell(p: &Placement, tick: u64) -> CellId {
-    let traj = Trajectory::for_entity(p.entity);
-    let (dx, dz) = traj.cell_offset(tick);
-    if dx == 0 && dz == 0 {
-        return p.cell;
-    }
-    let (coords, level) = p.cell.coords();
-    CellId::from_coords(coords + glam::IVec3::new(dx, 0, dz), level).unwrap_or(p.cell)
-}
-
 /// A synthetic component payload: deterministic per (entity, tick), exactly
 /// `len` bytes. Deterministic so a despawn/respawn comparison can spot
 /// corruption; sized to the D16 flush-budget math (`payload + 64`).
@@ -1887,26 +2384,6 @@ mod tests {
         let inv2 = synthetic_inventory(1_000, 100);
         let distinct2: std::collections::BTreeSet<_> = inv2.iter().map(|p| p.cell).collect();
         assert!(distinct2.len() >= 100, "got {}", distinct2.len());
-    }
-
-    #[test]
-    fn trajectory_moves_entities_across_cells() {
-        // The closed-form program must actually cross cell boundaries: an
-        // entity whose cell offset never changes is confined. Sample the
-        // first 100 entities over 4 000 ticks (~17 min at 4 Hz) and require
-        // every one to leave its inventory cell at least once.
-        for i in 1..=100u64 {
-            let entity = PersistId::new(i);
-            let traj = Trajectory::for_entity(entity);
-            let mut left = false;
-            for tick in 0..4_000u64 {
-                if traj.cell_offset(tick) != (0, 0) {
-                    left = true;
-                    break;
-                }
-            }
-            assert!(left, "entity {i} never left its inventory cell");
-        }
     }
 
     #[test]
@@ -2026,7 +2503,7 @@ mod tests {
                     }
                     payloads_allocated += 1;
                     schedulers[scheduler_shard(index, sessions)].queue(DiffUplink {
-                        cell: moved_cell(placement, frame_index),
+                        cell: placement.cell,
                         grid: GridId::ROOT,
                         entity: placement.entity,
                         tick: Tick::new(frame_index),
@@ -2106,14 +2583,28 @@ mod tests {
 
     #[test]
     fn final_drain_requires_complete_durable_reply_coverage() {
+        // Coverage is durable acks only. A nack is not a sample any more
+        // (`UplinkScheduler::on_nack_at`), so the three nacks below must not
+        // be demanded of the histogram — and must not be able to *supply* the
+        // count either, which is what let a zero-write run gate green.
         let stats = RunStats {
             durable_diff_acks: 2,
-            diff_nacks: 1,
+            diff_nacks: 3,
             ..RunStats::default()
         };
-        assert!(check_bulk_reply_coverage(3, &stats).is_ok());
-        let error = check_bulk_reply_coverage(2, &stats).unwrap_err();
-        assert!(format!("{error:#}").contains("sampled 2 of 3"));
+        assert!(check_bulk_reply_coverage(2, &stats).is_ok());
+        let error = check_bulk_reply_coverage(5, &stats).unwrap_err();
+        assert!(format!("{error:#}").contains("sampled 5 of 2"));
+
+        // The pathological shape this whole lane exists to catch: every diff
+        // rejected, nothing durable. It cannot produce a covered run.
+        let all_rejected = RunStats {
+            diffs_sent: 541_408,
+            diff_nacks: 541_408,
+            ..RunStats::default()
+        };
+        assert!(check_bulk_reply_coverage(541_408, &all_rejected).is_err());
+        assert!(check_bulk_reply_coverage(0, &all_rejected).is_ok());
     }
 
     #[test]
@@ -2212,7 +2703,7 @@ mod tests {
 
     #[tokio::test]
     async fn area_load_error_is_ignored_for_latency_tracking() {
-        let (endpoint, intent_signing_key) = bind_endpoint(None).await.expect("bind test endpoint");
+        let (endpoint, signing_key) = bind_endpoint(None).await.expect("bind test endpoint");
         let cli = Cli {
             gateway: node(1),
             addr: SocketAddr::from(([127, 0, 0, 1], 1)),
@@ -2239,8 +2730,8 @@ mod tests {
         let mut rig = Rig {
             cli: &cli,
             emit_json: false,
-            endpoint,
-            intent_signing_key,
+            endpoints: vec![endpoint],
+            signing_keys: vec![signing_key],
             sessions: Vec::new(),
             inventory: Vec::new(),
             diff_hz: 2.0,
@@ -2248,6 +2739,8 @@ mod tests {
             duration: Duration::from_secs(1),
             ack_log: None,
             pending_diffs: HashMap::new(),
+            leases: HashMap::new(),
+            intent_sessions: HashMap::new(),
         };
         let mut sched = vec![UplinkScheduler::new()];
         let mut intents = IntentQueue::new(1024);
@@ -2282,7 +2775,7 @@ mod tests {
 
     #[tokio::test]
     async fn provisional_bulk_ack_is_not_written_as_durable_evidence() {
-        let (endpoint, intent_signing_key) = bind_endpoint(None).await.expect("bind test endpoint");
+        let (endpoint, signing_key) = bind_endpoint(None).await.expect("bind test endpoint");
         let cli = Cli {
             gateway: node(1),
             addr: SocketAddr::from(([127, 0, 0, 1], 1)),
@@ -2321,8 +2814,8 @@ mod tests {
         let mut rig = Rig {
             cli: &cli,
             emit_json: false,
-            endpoint,
-            intent_signing_key,
+            endpoints: vec![endpoint],
+            signing_keys: vec![signing_key],
             sessions: Vec::new(),
             inventory: Vec::new(),
             diff_hz: 2.0,
@@ -2330,6 +2823,8 @@ mod tests {
             duration: Duration::from_secs(1),
             ack_log: Some(AckLog::open(&path).unwrap()),
             pending_diffs,
+            leases: HashMap::new(),
+            intent_sessions: HashMap::new(),
         };
         let mut sched = vec![UplinkScheduler::new()];
         let mut intents = IntentQueue::new(1024);
