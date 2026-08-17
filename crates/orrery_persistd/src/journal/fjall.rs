@@ -536,6 +536,51 @@ impl Journal {
         Ok(None)
     }
 
+    /// The chain key of a *sibling* chain identity that has previously been
+    /// opened against this journal: one sharing `family` but differing from
+    /// `own_key`, which can only be a difference of ownership epoch.
+    ///
+    /// This is the companion of [`Journal::chain_epoch_sibling`], and it exists
+    /// because that one answers a strictly narrower question than the fork
+    /// check needs. The record index only holds a row once a record has been
+    /// mirrored, so a follower that opened this directory at one epoch and
+    /// received nothing left no trace there — and the P2 kill-9 gate's
+    /// `prove_epoch_fork_refused` leg walked straight through the refusal on
+    /// exactly that path, because the load it ran ahead of the check had every
+    /// diff refused by the authority fence and mirrored nothing.
+    ///
+    /// The chain-state keyspace is the honest record of *opening*: it is
+    /// written on every [`FollowerReplica`] load, empty cursor included. Its
+    /// keys are the bare `chain_key` with no length prefix and the epoch is
+    /// the encoding's last field, so one prefix range over `family` finds any
+    /// sibling epoch directly.
+    ///
+    /// [`FollowerReplica`]: crate::journal::chain_grpc
+    #[cfg(feature = "chain-grpc")]
+    pub(crate) fn chain_state_epoch_sibling(
+        &self,
+        family: &[u8],
+        own_key: &[u8],
+    ) -> Result<Option<Vec<u8>>, JournalError> {
+        let state = self
+            .db
+            .keyspace(CHAIN_STATE_KS, fjall::KeyspaceCreateOptions::default)
+            .map_err(|e| JournalError::Store(format!("open chain state: {e}")))?;
+        let Some(end) = prefix_successor(family) else {
+            return Ok(None);
+        };
+        for entry in state.range(family.to_vec()..end) {
+            let entry = entry
+                .into_inner()
+                .map_err(|e| JournalError::Store(format!("scan chain state: {e}")))?;
+            let key = entry.0.as_ref();
+            if key != own_key {
+                return Ok(Some(key.to_vec()));
+            }
+        }
+        Ok(None)
+    }
+
     /// Read provenance for one chain/origin dedupe key.
     #[cfg(feature = "chain-grpc")]
     pub(crate) fn chain_grpc_record(

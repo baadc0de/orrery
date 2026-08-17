@@ -319,3 +319,93 @@ async fn a_bumped_epoch_refuses_rather_than_forking_the_mirrored_namespace() {
     );
     journal.close().await.unwrap();
 }
+
+#[tokio::test]
+async fn a_bumped_epoch_is_refused_even_when_the_mirror_received_nothing() {
+    // The refusal above was keyed off the mirrored-record index, so it only
+    // fired once a record had actually crossed. That made the strongest proof
+    // in `scripts/p2-kill9-gate.sh` — `prove_epoch_fork_refused` — conditional
+    // on the load ahead of it having produced durable writes, and in the
+    // 2026-08-17 run it had not: every `p2-load` diff arrives with
+    // `lease_id: None` and the gateway's strict-authority path refused all
+    // 541,408 of them, so the follower mirrored zero records and then opened
+    // happily at the bumped epoch. The gate reported the follower defect it
+    // exists to catch, on a follower that was behaving correctly.
+    //
+    // Opening the mirror is itself durable — `FollowerReplica::load` writes
+    // the chain-state row on every load, empty cursor included — so that is
+    // what the refusal keys off now.
+    let dir = tempfile::tempdir().unwrap();
+    let mut journal = Arc::new(Journal::open(&config(dir.path())).unwrap());
+    let server = spawn_chain_grpc(
+        "127.0.0.1:0".parse().unwrap(),
+        Arc::clone(&journal),
+        chain(),
+    )
+    .await
+    .unwrap();
+    // No transport, no records: the primary never had anything to mirror.
+    server.shutdown().await;
+    journal.close().await.unwrap();
+    drop(journal);
+
+    journal = Arc::new(Journal::open(&config(dir.path())).unwrap());
+    assert!(
+        journal
+            .scan_from(Lsn::new(0, 0))
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+            .is_empty(),
+        "the premise of this test is an empty mirror"
+    );
+    let next = DurableChainId {
+        epoch: chain().epoch + 1,
+        ..chain()
+    };
+    let refused = spawn_chain_grpc("127.0.0.1:0".parse().unwrap(), Arc::clone(&journal), next)
+        .await
+        .expect_err("an empty mirror opened at one epoch still pins that epoch");
+    assert!(
+        refused.to_string().contains("restart handshake"),
+        "refusal must name the missing handshake: {refused}"
+    );
+
+    // Reopening at the *same* epoch is the ordinary follower restart and stays
+    // permitted — the check is about a changed epoch, not about reopening.
+    let reopened = spawn_chain_grpc(
+        "127.0.0.1:0".parse().unwrap(),
+        Arc::clone(&journal),
+        chain(),
+    )
+    .await
+    .expect("the same epoch is an ordinary follower restart");
+    reopened.shutdown().await;
+    journal.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn an_unrelated_chain_family_is_not_a_sibling_epoch() {
+    // The chain-state scan is a prefix range over primary/follower/shard-set,
+    // so a different shard set must not read as a forked epoch of this one.
+    let dir = tempfile::tempdir().unwrap();
+    let journal = Arc::new(Journal::open(&config(dir.path())).unwrap());
+    let server = spawn_chain_grpc(
+        "127.0.0.1:0".parse().unwrap(),
+        Arc::clone(&journal),
+        chain(),
+    )
+    .await
+    .unwrap();
+    server.shutdown().await;
+
+    let other = DurableChainId {
+        shard_set: b"root/8-15".to_vec(),
+        epoch: chain().epoch + 1,
+        ..chain()
+    };
+    let opened = spawn_chain_grpc("127.0.0.1:0".parse().unwrap(), Arc::clone(&journal), other)
+        .await
+        .expect("a different shard set is a different chain, not a forked epoch");
+    opened.shutdown().await;
+    journal.close().await.unwrap();
+}
