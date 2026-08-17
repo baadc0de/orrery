@@ -189,10 +189,10 @@ mechanism. That is backwards, and adopting the table wholesale is still its own
 piece of work.
 
 But do not read it as "no lint levels apply to `crates/*`", because one of them
-does and it bites. Thirteen of the fourteen first-party crates set
-`#![warn(missing_docs)]` in their own `lib.rs` — every one except
-`orrery_conformance` — and CI runs `clippy --workspace --all-targets --no-deps
--- -D warnings`, which promotes that warning to an error. **An undocumented
+does and it bites. All fourteen first-party crates set
+`#![warn(missing_docs)]` in their own `lib.rs`, and CI runs `clippy --workspace
+--all-targets --no-deps -- -D warnings`, which promotes that warning to an
+error. **An undocumented
 public item fails CI today.** What is genuinely unadopted is the rest:
 `pedantic`, `nursery` and `unwrap_used` have never been enforced on first-party
 code, and turning them on is the large piece of work.
@@ -231,9 +231,12 @@ cargo test -p orrery_games --test battery -- --ignored --nocapture emit_goldens
 cargo fmt -p orrery_games
 ```
 
-`scripts/core-gates.sh` scans `orrery_games` alongside `orrery_core` — the
-determinism rules are about the rules code, so a `HashMap` or a
-`SystemTime::now` inside a `Ruleset` fails the same gate it would in the core.
+`scripts/core-gates.sh` scans `orrery_games` and `orrery_conformance`
+alongside `orrery_core` — the determinism rules are about the rules code, so a
+`HashMap` or a `SystemTime::now` inside a `Ruleset` fails the same gate it would
+in the core. A fourth clause, scoped to the two ruleset crates, refuses a live
+neighbour read: cross-entity effects travel as events, because the adjudicator
+installs exactly one entity and a neighbour read is always `None` at replay.
 
 **`sccache` is cleared on GitHub-hosted runners, and deliberately not on the
 self-hosted one.** `.cargo/config.toml` sets `build.rustc-wrapper = "sccache"`
