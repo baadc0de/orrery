@@ -120,6 +120,49 @@ count and its `journal_commit_ms` samples before looking at the chain at all. A
 primary that mirrored nothing because it committed nothing logs no chain line,
 reports no `ChainFault`, and is behaving correctly.
 
+#### Measured 2026-08-17: what stopped the writes
+
+Traced end to end on a private single-node FDB (a second container on 4521, so
+the box's shared cluster was only ever read from), release binaries, the gate's
+`ci` seed profile, 15 s of load. The run never reached the chain at all: the
+rig aborted in its claim phase with `gateway denied the lease claim for
+PersistId(23) … NotEligible`, and the ack log was empty. The chain of causes,
+each link read out of the tree at the cited line:
+
+- `orrery-seed` commits `world/{grid}/{cell}/{entity}` rows and *deliberately*
+  no `ckpt/{grid}/{shard}` row (docs/12-world-seeding.md §11.4). Confirmed on
+  the cluster after seeding: 100 `w` keys, zero `c` keys.
+- `FdbCheckpointStore::load` (`checkpoint/fdb.rs:391`) reads the `ckpt/` row
+  *first* and returns `None` when it is absent — the `world/` scan that
+  rebuilds `entities`/`by_cell` is inside the `Some` branch. So a seeded world
+  is invisible to recovery: the actor comes up with an empty bag.
+- A claim is granted only if it is `plausible`, and `plausible` requires
+  `router.committed_entity_cell()` to resolve the entity to the claimed cell
+  (`gateway.rs:2861`). That resolver asks the durable lease index and then the
+  live actors (`cluster.rs:252`); `ColdFallbackRouter` forwards it verbatim to
+  the live router (`cluster.rs:781`), so the cold tier — the one place the
+  seeded world exists — is never consulted. Every claim is denied.
+- `route_session_diff` fences every bulk write unconditionally, so with no
+  lease nothing is appended, nothing is mirrored, and the follower's data
+  directory stays at its empty-boot size.
+
+The counter-experiment isolates it to that one missing row. Same binaries,
+same cluster, same seeded world, with a single synthetic `ckpt/{0}/{ROOT}`
+value planted by hand (node 1, watermark `0:0`, epoch 1) and nothing else
+changed: **2 795 durable bulk acknowledgements**, a follower mirror holding
+exactly those 2 795 records (all `ComponentDiff`, `epoch 1`, `grid 0`, read
+back by scanning the follower journal directly), and
+`prove_epoch_fork_refused` passing on it. Chain replication moved every
+acknowledged record; nothing under `journal/` was ever at fault.
+
+The repair therefore belongs upstream of the journal, and there are two honest
+places for it — recovery seeding a shard from `world/` rows when the subtree
+has rows but no checkpoint watermark (the watermark is then `0:0`, i.e. replay
+the whole journal on top, which is exactly right), or `committed_entity_cell`
+falling back to the cold reader. Planting the row from the harness is *not* one
+of them: `scripts/p2-kill9-gate.sh` would then be proving durability against a
+world it had doctored, which is the one thing the gate exists to refuse.
+
 ### 3.2 Append batch
 
 Records move in batches so the transport amortizes framing and syscalls:

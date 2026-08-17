@@ -105,28 +105,50 @@ self_test() {
   body="$(sed -n '/^readonly ROOT=/,$p' "$0" | grep -v '^[[:space:]]*#')"
   has() { grep -Fq -- "$1" <<<"$body"; }
 
-  has '--witness' \
+  # Banking is downstream of the run's own exit status and must stay there: a
+  # failed hour is a finding, and a finding that banks hours is a false record.
+  # Checked first because the `if !` is also what delimits the leg below.
+  has 'if ! "$bin"' \
+    || die 'self-test: the leg no longer branches on the harness exit status; a failed run could bank'
+
+  # The banking leg's own invocation, continuations folded into one line.
+  # Reading these off the whole body is not enough and this was measured
+  # 2026-08-17: `run_probe` passes `--peers 32`, `--impaired`, `--witness` and
+  # `--max-shed` too, so the banking leg could lose any of them and every one of
+  # these clauses still matched — on the probe, which banks nothing. A clause
+  # that is satisfied by a different leg than the one it names is not a check.
+  # Folded with awk and not with `sed -e :a ... ta`: this self-test runs on the
+  # macOS and Windows legs of the nightly too, and BSD sed rejects a label or a
+  # branch followed by `;` — shipping a GNU-only expression in the one script
+  # whose job is to be portable is the bug this file was already caught by once.
+  local leg
+  leg="$(sed -n '/^  if ! "$bin"/,/^  fi$/p' "$0" \
+    | awk '{ sub(/^[ \t]+/, ""); buf = buf $0
+             if (buf ~ /\\$/) { sub(/\\$/, " ", buf); next }
+             print buf; buf = "" }
+           END { if (buf != "") print buf }' \
+    | grep -F 'if ! "$bin"' || true)"
+  [[ -n $leg ]] || die 'self-test: the banking leg could not be located; the parse has drifted'
+  on_leg() { grep -Fq -- "$1" <<<"$leg"; }
+
+  on_leg '--witness' \
     || die 'self-test: the leg is not witnessed; it would accumulate hours no witness watched'
-  has '--impaired' \
+  on_leg '--impaired' \
     || die "self-test: the leg runs a clean link; the criterion's hours are impaired hours"
-  has '--loss "$loss"' \
+  on_leg '--loss "$loss"' \
     || die 'self-test: the loss is no longer swept; every night would re-run one point of the band'
-  has '--seed "$seed"' \
+  on_leg '--seed "$seed"' \
     || die 'self-test: the seed is no longer varied; consecutive nights would share a RunIdentity'
-  has '--peers 32' \
+  on_leg '--peers 32' \
     || die 'self-test: the criterion population is not 32'
-  has '--stamp-wall-clock' \
+  on_leg '--stamp-wall-clock' \
     || die 'self-test: the run is no longer stamped, so a banked line cannot be placed in time'
   # By the append specifically. `p4-ledger.sh total` prints a running figure and
   # is not what banks anything, so the bare script name would keep matching a
   # leg that had stopped recording its hour.
   has 'p4-ledger.sh" append' \
     || die 'self-test: the leg banks nothing; the hours would die with the runner'
-  # Banking is downstream of the run's own exit status and must stay there: a
-  # failed hour is a finding, and a finding that banks hours is a false record.
-  has 'if ! "$bin"' \
-    || die 'self-test: the leg no longer branches on the harness exit status; a failed run could bank'
-  has '--max-shed' \
+  on_leg '--max-shed' \
     || die 'self-test: the shed allowance is gone; the budget backstop would go unjudged'
   has 'BAND=' \
     || die 'self-test: the loss band is gone'

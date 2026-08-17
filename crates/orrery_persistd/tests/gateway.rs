@@ -410,12 +410,15 @@ async fn receives_hello_ack(connection: &lanes::GatewayLanes) -> bool {
 
 async fn heartbeat_reply(
     connection: &lanes::GatewayLanes,
-    lease_ids: Vec<orrery_protocol::LeaseId>,
+    renew: Vec<(PersistId, orrery_protocol::LeaseId)>,
     tick: Tick,
-) -> (Vec<orrery_protocol::Lease>, Vec<orrery_protocol::LeaseId>) {
+) -> (
+    Vec<orrery_protocol::Lease>,
+    Vec<(PersistId, orrery_protocol::LeaseId)>,
+) {
     connection
         .send_control(&GatewayMsg::Lease {
-            message: LeaseMsg::Heartbeat { lease_ids, tick },
+            message: LeaseMsg::Heartbeat { renew, tick },
         })
         .await;
     loop {
@@ -676,7 +679,11 @@ fn gateway_closes_the_client_to_actor_path() {
         // the renewed row on the typed reliable-control reply.
         conn.send_control(&GatewayMsg::Lease {
             message: orrery_protocol::LeaseMsg::Heartbeat {
-                lease_ids: vec![grant.0, orrery_protocol::LeaseId(999)],
+                renew: vec![
+                    (PersistId::new(1), grant.0),
+                    // Never held: refused by entity, with its token echoed.
+                    (PersistId::new(999), orrery_protocol::LeaseId(999)),
+                ],
                 tick: Tick::new(2),
             },
         })
@@ -691,7 +698,10 @@ fn gateway_closes_the_client_to_actor_path() {
             };
             break (leases, invalid);
         };
-        assert_eq!(renewed.1, vec![orrery_protocol::LeaseId(999)]);
+        assert_eq!(
+            renewed.1,
+            vec![(PersistId::new(999), orrery_protocol::LeaseId(999))]
+        );
         assert_eq!(renewed.0.len(), 1);
         assert_eq!(renewed.0[0].lease_id, grant.0);
         assert_eq!(renewed.0[0].seq, grant.1);
@@ -1371,9 +1381,9 @@ fn stale_inflight_claim_grant_is_parked_without_indexing_replacement() {
         assert!(router.live.lock().await.is_none());
         assert_eq!(router.parked.lock().await.as_slice(), &[lease_id]);
         let replacement_heartbeat =
-            heartbeat_reply(&replacement, vec![lease_id], Tick::new(2)).await;
+            heartbeat_reply(&replacement, vec![(entity, lease_id)], Tick::new(2)).await;
         assert!(replacement_heartbeat.0.is_empty());
-        assert_eq!(replacement_heartbeat.1, vec![lease_id]);
+        assert_eq!(replacement_heartbeat.1, vec![(entity, lease_id)]);
         assert!(matches!(
             claim_reply(
                 &replacement,
@@ -1394,7 +1404,7 @@ fn stale_inflight_claim_grant_is_parked_without_indexing_replacement() {
             lease.entity == entity && lease.holder == Some(node(1)) && lease.lease_id == lease_id
         }));
         let replacement_heartbeat =
-            heartbeat_reply(&replacement, vec![lease_id], Tick::new(3)).await;
+            heartbeat_reply(&replacement, vec![(entity, lease_id)], Tick::new(3)).await;
         assert_eq!(
             replacement_heartbeat.0.first().map(|lease| (
                 lease.entity,
@@ -1456,7 +1466,7 @@ fn pending_heartbeat_releases_peer_state_and_stale_session_gets_no_current_rows(
             LeaseMsg::Grant { lease_id: granted, .. } if granted == lease_id
         ));
         let old_heartbeat = tokio::spawn(async move {
-            let reply = heartbeat_reply(&old, vec![lease_id], Tick::new(2)).await;
+            let reply = heartbeat_reply(&old, vec![(entity, lease_id)], Tick::new(2)).await;
             (old, reply)
         });
         tokio::time::timeout(Duration::from_secs(5), entered_rx.recv())
@@ -1481,9 +1491,9 @@ fn pending_heartbeat_releases_peer_state_and_stale_session_gets_no_current_rows(
             .expect("released heartbeat returns")
             .expect("heartbeat task does not panic");
         assert!(stale_heartbeat.0.is_empty());
-        assert_eq!(stale_heartbeat.1, vec![lease_id]);
+        assert_eq!(stale_heartbeat.1, vec![(entity, lease_id)]);
         let replacement_heartbeat =
-            heartbeat_reply(&replacement, vec![lease_id], Tick::new(3)).await;
+            heartbeat_reply(&replacement, vec![(entity, lease_id)], Tick::new(3)).await;
         assert_eq!(
             replacement_heartbeat.0.first().map(|row| row.lease_id),
             Some(lease_id)
@@ -1704,7 +1714,7 @@ fn gateway_replacement_session_exclusively_owns_inherited_leases() {
         assert!(receives_hello_ack(&new).await);
         new.send_control(&GatewayMsg::Lease {
             message: LeaseMsg::Heartbeat {
-                lease_ids: vec![lease_id],
+                renew: vec![(entity, lease_id)],
                 tick: Tick::new(2),
             },
         })
@@ -1724,7 +1734,7 @@ fn gateway_replacement_session_exclusively_owns_inherited_leases() {
         // Then: the superseded generation can neither renew nor write.
         old.send_control(&GatewayMsg::Lease {
             message: LeaseMsg::Heartbeat {
-                lease_ids: vec![lease_id],
+                renew: vec![(entity, lease_id)],
                 tick: Tick::new(3),
             },
         })
@@ -1739,7 +1749,7 @@ fn gateway_replacement_session_exclusively_owns_inherited_leases() {
             }
         };
         assert!(old_heartbeat.0.is_empty());
-        assert_eq!(old_heartbeat.1, vec![lease_id]);
+        assert_eq!(old_heartbeat.1, vec![(entity, lease_id)]);
         assert!(matches!(
             claim_reply(
                 &old,
@@ -1780,7 +1790,7 @@ fn gateway_replacement_session_exclusively_owns_inherited_leases() {
         old_client.close().await;
         new.send_control(&GatewayMsg::Lease {
             message: LeaseMsg::Heartbeat {
-                lease_ids: vec![lease_id],
+                renew: vec![(entity, lease_id)],
                 tick: Tick::new(4),
             },
         })
@@ -1988,7 +1998,8 @@ fn gateway_lease_capacity_denies_before_actor_mutation_after_reconnect() {
             })
             .await;
         assert!(receives_hello_ack(&replacement).await);
-        let inherited = heartbeat_reply(&replacement, vec![lease_id], Tick::new(1)).await;
+        let inherited =
+            heartbeat_reply(&replacement, vec![(first_entity, lease_id)], Tick::new(1)).await;
         assert!(inherited.1.is_empty());
         assert_eq!(inherited.0.first().map(|row| row.lease_id), Some(lease_id));
         let journal_before = journal_len(&runtime).await;
@@ -2588,7 +2599,7 @@ fn reviewed_authority_narrative() {
             } if accepted == entity && tick == Tick::new(2)
         ));
         let journal_after_fenced_write = journal_len(&runtime).await;
-        let heartbeat = heartbeat_reply(&old, vec![lease_id], Tick::new(3)).await;
+        let heartbeat = heartbeat_reply(&old, vec![(entity, lease_id)], Tick::new(3)).await;
         assert!(heartbeat.1.is_empty());
         assert_eq!(heartbeat.0.first().map(|row| row.lease_id), Some(lease_id));
         assert_eq!(journal_len(&runtime).await, journal_after_fenced_write);
@@ -2603,7 +2614,7 @@ fn reviewed_authority_narrative() {
             .await;
         assert!(receives_hello_ack(&replacement).await);
         let replacement_heartbeat =
-            heartbeat_reply(&replacement, vec![lease_id], Tick::new(4)).await;
+            heartbeat_reply(&replacement, vec![(entity, lease_id)], Tick::new(4)).await;
         assert!(replacement_heartbeat.1.is_empty());
         assert_eq!(
             replacement_heartbeat
@@ -2615,9 +2626,9 @@ fn reviewed_authority_narrative() {
 
         // Then: the old generation gets definitive control and bulk denials with no append.
         let superseded_journal = journal_len(&runtime).await;
-        let old_heartbeat = heartbeat_reply(&old, vec![lease_id], Tick::new(5)).await;
+        let old_heartbeat = heartbeat_reply(&old, vec![(entity, lease_id)], Tick::new(5)).await;
         assert!(old_heartbeat.0.is_empty());
-        assert_eq!(old_heartbeat.1, vec![lease_id]);
+        assert_eq!(old_heartbeat.1, vec![(entity, lease_id)]);
         assert!(matches!(
             diff_reply(
                 &old,

@@ -607,7 +607,7 @@ mod tests {
         // that — both ends shift together — so the discriminants are pinned
         // here as literals.
         let release = LeaseMsg::Heartbeat {
-            lease_ids: vec![LeaseId(1)],
+            renew: vec![(PersistId::new(1), LeaseId(1))],
             tick: Tick::new(0),
         };
         let msgs: [(GatewayMsg, u8); 8] = [

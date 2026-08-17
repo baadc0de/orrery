@@ -187,6 +187,19 @@ On assuming shard `S` (cold start, node replacement, or relocation):
 
 Recovery time is bounded by checkpoint size + ≤20 s of journal tail — seconds, not minutes, per the [Cornell copy-on-update analysis](https://www.cs.cornell.edu/~tuancao/2009-VLDB-Checkpoint.pdf).
 
+**Step 2 is two independent reads here, and one dependent read in the code.**
+`FdbCheckpointStore::load` (`checkpoint/fdb.rs:391`) reads `ckpt/{S}` first and
+returns `None` when that row is absent; the `world/` scan that rebuilds the
+entity bag and `by_cell` sits inside the `Some` branch. An absent watermark
+therefore means "no state", not "replay from `0:0`" — so a shard whose `world/`
+rows were committed by something that has no journal position, which is
+precisely `orrery-seed` (docs/12-world-seeding.md §11.4 states it writes no
+`ckpt/` row, by design), comes up empty. Measured 2026-08-17: the P2 kill-9
+gate seeds 100 entities, the primary recovers zero, `committed_entity_cell`
+resolves nothing, every lease claim is denied `NotEligible`, the fenced write
+path refuses every diff, and the chain mirror is empty for want of anything to
+mirror (docs/13-chain-replication.md §"What an empty mirror means").
+
 ### 3.5 Hotspot split / relocate
 
 Range-sharding on a space-filling curve concentrates a crowd's writes on one shard — the [FDB #11510 hotspot pattern](https://github.com/apple/foundationdb/issues/11510) — so the actor tier splits *ahead* of the storage tier feeling it. Telemetry per actor: player count in shard (from coordinator presence), mailbox depth, append rate.

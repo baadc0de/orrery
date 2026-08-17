@@ -59,6 +59,11 @@ if [[ ${1:-} == --self-test ]]; then
   # seeded before anything can be claimed, and therefore before anything can be
   # written. Without this stage the run drives 500k rejections and calls the
   # refusals durability.
+  # The gate consumes its cluster (see the pre-flight's own comment). Losing
+  # this check does not make the gate pass wrongly — it makes a rerun's
+  # startup refusal unreadable, which is how a whole debugging pass went into
+  # the wrong subsystem once already.
+  has 'refuse_an_already_activated_cluster' || die 'self-test: fresh-cluster pre-flight absent'
   has 'seed_world' || die 'self-test: durable world seeding absent'
   has '--emit-manifest' || die 'self-test: seeder manifest emission absent'
   has '--manifest "$out/manifest.json"' || die 'self-test: rig is not driven from the seeded inventory'
@@ -92,6 +97,28 @@ for tool in "$PERSISTD_BIN" "$P2_LOAD_BIN" "$P2_DASHBOARD_BIN" "$ORRERY_SEED_BIN
   [[ -x $tool ]] || die "not an executable: $tool"
 done
 [[ -r $P2_SCENARIO ]] || die "seed scenario is not readable: $P2_SCENARIO"
+
+# This gate consumes its cluster. `activate_shards` bumps `actor/{shard}` on
+# every activation and `start_primary` asserts `--chain-epoch 1` against the
+# epoch that bump produces, so a second run against the same FDB cannot get
+# past startup — it dies with `--chain-epoch 1 is an assertion; FDB fence
+# activation would produce epoch 2`, or, if the promoted node still owns the
+# shard, `owned by node 2 at epoch 2`. Both are true statements about the
+# cluster that read like a defect in the code under test; that misreading cost
+# a full debugging pass on 2026-08-17. CI gets a fresh cluster per job and
+# never sees this. Advisory only: without `fdbcli` the run proceeds exactly as
+# it did before.
+refuse_an_already_activated_cluster() {
+  command -v fdbcli >/dev/null 2>&1 || {
+    note 'fdbcli not on PATH; skipping the fresh-cluster pre-flight'
+    return 0
+  }
+  local rows
+  rows=$(timeout 30 fdbcli -C "$ORRERY_FDB_CLUSTER_FILE" --exec 'getrangekeys a b 1' 2>/dev/null \
+    | grep -c '^`') || true
+  [[ ${rows:-0} -eq 0 ]] || die "this cluster already carries an actor/ activation row from an earlier run, and the primary below asserts --chain-epoch 1 against a fence that only ever moves forward; point ORRERY_FDB_CLUSTER_FILE at a fresh cluster"
+}
+refuse_an_already_activated_cluster
 
 out=${P2_GATE_OUT:-"$(pwd)/p2-kill9-$(date -u +%Y%m%dT%H%M%SZ)"}
 [[ ! -e $out ]] || die "refusing to overwrite existing output directory: $out"
@@ -297,10 +324,24 @@ note "driving the seeded inventory (${sessions} sessions, ${duration}s)"
 # Inventory comes from the manifest, not `--entities`/`--cells`: the rig claims
 # a lease per entity at the cell the seeder committed it to, and a synthesized
 # placement would name cells the registrar cannot resolve.
-"$P2_LOAD_BIN" --gateway "$primary_gateway" --addr "$primary_addr" \
+#
+# A claim-phase failure here is reported against the *gateway*, and the rig's
+# advice ("seed the entity durably") is already satisfied by `seed_world` — so
+# name the seam it is actually about. Measured 2026-08-17: the seeder writes
+# `world/` rows and no `ckpt/` row by design, `FdbCheckpointStore::load`
+# returns `None` without that row, the primary recovers an empty bag, and
+# `committed_entity_cell` cannot resolve an entity the cluster demonstrably
+# holds. Every claim is then `NotEligible` and the run has nothing to make
+# durable (docs/08-persistence.md §3.4, docs/13-chain-replication.md §3.1).
+if ! "$P2_LOAD_BIN" --gateway "$primary_gateway" --addr "$primary_addr" \
   --manifest "$out/manifest.json" --sessions "$sessions" --duration-secs "$duration" \
   --issuer-secret "$secret_issuer" --issuer-key-id "$issuer_key_id" \
-  --json --ack-log "$out/acks.jsonl" >"$out/load-before.jsonl" 2>"$out/load-before.stderr"
+  --json --ack-log "$out/acks.jsonl" >"$out/load-before.jsonl" 2>"$out/load-before.stderr"; then
+  if grep -Fq 'NotEligible' "$out/load-before.stderr"; then
+    die "the rig could not claim a lease on a seeded entity: the primary recovered no world state, so the registrar cannot resolve the entity's committed cell. See $out/load-before.stderr and docs/08-persistence.md §3.4"
+  fi
+  die "the load rig failed; see $out/load-before.stderr"
+fi
 # A non-empty ack log is not evidence. It was 1024 lines of rejected intents on
 # the run this check was supposed to catch. Count the durable bulk records —
 # p2-load writes a `"type":"diff"` line only for a non-provisional `BulkAck` —

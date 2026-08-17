@@ -254,19 +254,27 @@ pub enum LeaseMsg {
     },
     /// Batched holder renewal.
     Heartbeat {
-        /// Fencing tokens the holder asks to renew.
-        lease_ids: Vec<LeaseId>,
+        /// Entity/token pairs the holder asks to renew. The entity is part of
+        /// the name because `LeaseId` is a *per-row* counter (`lease.rs`
+        /// increments `row.lease_id` on acquire), so `LeaseId(1)` identifies
+        /// nothing on its own: every freshly claimed entity carries it. A
+        /// registrar given bare ids has to search its whole session set per
+        /// requested id, which is quadratic in the entities one peer holds.
+        renew: Vec<(PersistId, LeaseId)>,
         /// Holder's current universe tick.
         tick: Tick,
     },
     /// Registrar response to a batched renewal. Rows include both successful
     /// renewals and the current state for stale ids; `invalid` explicitly
-    /// identifies IDs that were not renewed so clients stop writing promptly.
+    /// identifies renewals that were refused so clients stop writing promptly.
     HeartbeatAck {
-        /// Current rows returned for session-indexed IDs.
+        /// Current rows returned for the entities named in the renewal.
         leases: Vec<Lease>,
-        /// IDs which were absent, expired, wrong-holder, or stale.
-        invalid: Vec<LeaseId>,
+        /// Renewals which were absent, expired, wrong-holder, or stale. Keyed
+        /// by entity for the same reason as [`LeaseMsg::Heartbeat::renew`]: a
+        /// bare id would invalidate every other entity the holder happens to
+        /// hold at the same per-row counter value.
+        invalid: Vec<(PersistId, LeaseId)>,
     },
     /// Expiry or revocation notification.
     Expire {
@@ -320,7 +328,10 @@ mod tests {
     #[test]
     fn lease_message_roundtrips() {
         let message = LeaseMsg::Heartbeat {
-            lease_ids: vec![LeaseId(7), LeaseId(9)],
+            renew: vec![
+                (PersistId::new(4), LeaseId(7)),
+                (PersistId::new(9), LeaseId(1)),
+            ],
             tick: Tick::new(12),
         };
         let bytes = postcard::to_stdvec(&message).unwrap();

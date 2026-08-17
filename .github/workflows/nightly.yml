@@ -561,8 +561,18 @@ jobs:
         with:
           server: "true"
 
+      # `orrery-seed` seeds the durable world the gate then writes to, and the
+      # gate's tool check requires the binary before it does anything at all —
+      # so it is built here, not left to the gate to discover missing. Its
+      # `fdb` feature is what compiles `apply`/`verify` (the `plan` verb needs
+      # no C client), and the feature is spelled `orrery_seed/fdb` because
+      # `-p` selects the package while `--features` resolves against the
+      # workspace root.
       - name: Build the fdb-enabled binaries
-        run: cargo build --release -p orrery_persistd --features fdb
+        run: |
+          set -euo pipefail
+          cargo build --release -p orrery_persistd --features fdb
+          cargo build --release -p orrery_seed --features orrery_seed/fdb
 
       - name: Build the load rig and dashboard
         run: |
@@ -578,6 +588,7 @@ jobs:
           PERSISTD_BIN: ${{ github.workspace }}/target/release/persistd
           P2_LOAD_BIN: ${{ github.workspace }}/p2-load/target/release/p2-load
           P2_DASHBOARD_BIN: ${{ github.workspace }}/p2-dashboard/target/release/p2-dashboard
+          ORRERY_SEED_BIN: ${{ github.workspace }}/target/release/orrery-seed
         run: scripts/p2-kill9-gate.sh
 
       - name: Upload the gate's evidence

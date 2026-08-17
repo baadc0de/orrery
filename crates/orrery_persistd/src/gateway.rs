@@ -1648,6 +1648,46 @@ enum SessionLeaseOwner {
     Parking(SessionGeneration),
 }
 
+/// Resolve a batched renewal against the session's lease index.
+///
+/// Returns the rows to renew and the pairs to refuse. `LeaseId` is a *per-row*
+/// counter ([`crate::lease`] bumps it on acquire), so a renewal only names one
+/// lease when it is paired with its entity: every entity a peer freshly claims
+/// carries `LeaseId(1)`. Keying on the entity makes this one map lookup per
+/// requested renewal and, downstream, one actor round trip per *held* lease —
+/// where filtering the session set by bare id cost O(requested x held) of both,
+/// i.e. quadratic in the entities a single peer holds.
+fn resolve_renewals(
+    leases: &HashMap<PersistId, SessionLease>,
+    generation: SessionGeneration,
+    renew: &[(PersistId, LeaseId)],
+) -> (Vec<SessionLease>, Vec<(PersistId, LeaseId)>) {
+    let mut renewable = Vec::with_capacity(renew.len().min(leases.len()));
+    let mut invalid = Vec::new();
+    let mut seen = HashSet::with_capacity(renew.len());
+    for &(entity, lease_id) in renew {
+        // A holder that repeats a pair within one batch gets one renewal, not
+        // one actor turn per copy; the answer would be identical, and the ack
+        // still carries it once.
+        if !seen.insert((entity, lease_id)) {
+            continue;
+        }
+        match leases.get(&entity) {
+            Some(lease)
+                if lease.lease_id == lease_id
+                    && lease.owner == SessionLeaseOwner::Active(generation) =>
+            {
+                renewable.push(*lease);
+            }
+            // Absent, superseded, or held by a previous generation of this
+            // session: refused explicitly so the holder stops writing rather
+            // than waiting out its conservative expiry floor.
+            _ => invalid.push((entity, lease_id)),
+        }
+    }
+    (renewable, invalid)
+}
+
 enum LeaseClaimCompletion {
     Granted,
     Compensate(SessionLease),
@@ -2994,70 +3034,51 @@ async fn handle_connection(
                             message,
                         })));
                     }
-                    LeaseMsg::Heartbeat { lease_ids, .. } => {
+                    LeaseMsg::Heartbeat { renew, .. } => {
                         let Some(peer) = active_session.lock_current().await else {
                             send(Bytes::from(encode_stream_frame(&GatewayReply::Lease {
                                 message: LeaseMsg::HeartbeatAck {
                                     leases: Vec::new(),
-                                    invalid: lease_ids,
+                                    invalid: renew,
                                 },
                             })));
                             continue;
                         };
-                        let indexed_leases = lease_ids
-                            .iter()
-                            .map(|lease_id| {
-                                (
-                                    *lease_id,
-                                    peer.leases
-                                        .values()
-                                        .filter(|lease| {
-                                            lease.lease_id == *lease_id
-                                                && lease.owner
-                                                    == SessionLeaseOwner::Active(
-                                                        active_session.generation,
-                                                    )
-                                        })
-                                        .copied()
-                                        .collect::<Vec<_>>(),
-                                )
-                            })
-                            .collect::<Vec<_>>();
+                        let (renewable, mut invalid) =
+                            resolve_renewals(&peer.leases, active_session.generation, &renew);
                         drop(peer);
-                        let mut rows = Vec::with_capacity(lease_ids.len());
-                        let mut invalid = Vec::new();
-                        for (lease_id, leases) in indexed_leases {
-                            if leases.is_empty() {
-                                invalid.push(lease_id);
-                            }
-                            for lease in leases {
-                                match router
-                                    .heartbeat_lease(
-                                        lease.grid,
-                                        lease.cell,
-                                        lease.entity,
-                                        remote,
-                                        lease_id,
-                                        registrar_now_ms(),
-                                    )
-                                    .await
-                                {
-                                    Ok(Some(row)) => {
-                                        let current = row.holder == Some(remote)
-                                            && row.lease_id == lease_id
-                                            && row.expires_at > registrar_now_ms();
-                                        rows.push(row);
-                                        if !current {
-                                            invalid.push(lease_id);
-                                        }
+                        // Exactly one actor round trip per renewable row: the
+                        // renewal names its entity, so the session index is a
+                        // map lookup rather than a scan, and a holder of N
+                        // entities costs N turns instead of N per requested id.
+                        let mut rows = Vec::with_capacity(renewable.len());
+                        for lease in renewable {
+                            match router
+                                .heartbeat_lease(
+                                    lease.grid,
+                                    lease.cell,
+                                    lease.entity,
+                                    remote,
+                                    lease.lease_id,
+                                    registrar_now_ms(),
+                                )
+                                .await
+                            {
+                                Ok(Some(row)) => {
+                                    let current = row.holder == Some(remote)
+                                        && row.lease_id == lease.lease_id
+                                        && row.expires_at > registrar_now_ms();
+                                    rows.push(row);
+                                    if !current {
+                                        invalid.push((lease.entity, lease.lease_id));
                                     }
-                                    Ok(None) | Err(_) => invalid.push(lease_id),
                                 }
+                                Ok(None) | Err(_) => invalid.push((lease.entity, lease.lease_id)),
                             }
                         }
                         if active_session.lock_current().await.is_none() {
                             rows.clear();
-                            invalid = lease_ids;
+                            invalid = renew;
                         }
                         send(Bytes::from(encode_stream_frame(&GatewayReply::Lease {
                             message: LeaseMsg::HeartbeatAck {
@@ -5459,5 +5480,137 @@ mod tests {
                 .expect("route task does not panic");
         }
         drop(registry);
+    }
+    /// One held entity costs one actor round trip, not one per requested id.
+    ///
+    /// The count asserted here *is* the round-trip count: the heartbeat arm
+    /// awaits `router.heartbeat_lease` exactly once per row `resolve_renewals`
+    /// returns. Resolving by bare `LeaseId` returned every held row for every
+    /// requested id — 50 entities all sitting at `LeaseId(1)` produced 2500
+    /// sequential turns through one bounded cell mailbox every 2.5 s.
+    #[test]
+    fn renewal_costs_one_round_trip_per_held_entity() {
+        const HELD: u64 = 50;
+        let generation = SessionGeneration(3);
+        let mut leases = HashMap::new();
+        let mut renew = Vec::new();
+        for id in 1..=HELD {
+            let entity = PersistId::new(id);
+            // Every fresh claim mints LeaseId(1); this collision is the whole
+            // reason the id alone cannot name a row.
+            leases.insert(
+                entity,
+                SessionLease {
+                    entity,
+                    lease_id: LeaseId(1),
+                    grid: GridId::ROOT,
+                    cell: CellId::ROOT,
+                    owner: SessionLeaseOwner::Active(generation),
+                },
+            );
+            renew.push((entity, LeaseId(1)));
+        }
+
+        let (renewable, invalid) = resolve_renewals(&leases, generation, &renew);
+
+        assert_eq!(
+            renewable.len(),
+            HELD as usize,
+            "round trips must be O(N) in held entities, not O(N^2)"
+        );
+        assert!(invalid.is_empty(), "every held lease renews: {invalid:?}");
+        let distinct: HashSet<_> = renewable.iter().map(|lease| lease.entity).collect();
+        assert_eq!(distinct.len(), HELD as usize, "each entity resolves once");
+    }
+
+    /// A stale token refuses its own entity and nothing else.
+    ///
+    /// Under bare-id acking this was unexpressible: `invalid: [LeaseId(1)]`
+    /// told the holder to drop every entity it happened to hold at that
+    /// per-row counter value.
+    #[test]
+    fn a_stale_token_invalidates_only_its_own_entity() {
+        let generation = SessionGeneration(1);
+        let held: Vec<_> = (1..=3).map(PersistId::new).collect();
+        let leases: HashMap<_, _> = held
+            .iter()
+            .map(|entity| {
+                (
+                    *entity,
+                    SessionLease {
+                        entity: *entity,
+                        lease_id: LeaseId(1),
+                        grid: GridId::ROOT,
+                        cell: CellId::ROOT,
+                        owner: SessionLeaseOwner::Active(generation),
+                    },
+                )
+            })
+            .collect();
+
+        let (renewable, invalid) = resolve_renewals(
+            &leases,
+            generation,
+            &[
+                (held[0], LeaseId(1)),
+                // Superseded token on a still-held entity.
+                (held[1], LeaseId(2)),
+                (held[2], LeaseId(1)),
+                // Never held at all.
+                (PersistId::new(99), LeaseId(1)),
+            ],
+        );
+
+        assert_eq!(
+            invalid,
+            vec![(held[1], LeaseId(2)), (PersistId::new(99), LeaseId(1))]
+        );
+        let renewed: Vec<_> = renewable.iter().map(|lease| lease.entity).collect();
+        assert_eq!(renewed, vec![held[0], held[2]]);
+    }
+
+    /// A batch repeating one pair still costs one turn.
+    #[test]
+    fn repeated_pairs_in_one_batch_cost_one_round_trip() {
+        let generation = SessionGeneration(7);
+        let entity = PersistId::new(4);
+        let leases = HashMap::from([(
+            entity,
+            SessionLease {
+                entity,
+                lease_id: LeaseId(2),
+                grid: GridId::ROOT,
+                cell: CellId::ROOT,
+                owner: SessionLeaseOwner::Active(generation),
+            },
+        )]);
+
+        let (renewable, invalid) =
+            resolve_renewals(&leases, generation, &[(entity, LeaseId(2)); 16]);
+
+        assert_eq!(renewable.len(), 1);
+        assert!(invalid.is_empty());
+    }
+
+    /// Leases left over from a superseded session generation are refused.
+    #[test]
+    fn a_parking_generation_lease_does_not_renew() {
+        let generation = SessionGeneration(2);
+        let entity = PersistId::new(8);
+        let leases = HashMap::from([(
+            entity,
+            SessionLease {
+                entity,
+                lease_id: LeaseId(1),
+                grid: GridId::ROOT,
+                cell: CellId::ROOT,
+                owner: SessionLeaseOwner::Parking(SessionGeneration(1)),
+            },
+        )]);
+
+        let (renewable, invalid) = resolve_renewals(&leases, generation, &[(entity, LeaseId(1))]);
+
+        assert!(renewable.is_empty());
+        assert_eq!(invalid, vec![(entity, LeaseId(1))]);
     }
 }
