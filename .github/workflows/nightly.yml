@@ -11,7 +11,7 @@
 # Their `--self-test` modes run per-commit in ci.yml; those check the scripts
 # still contain the stages that make them proofs, not that the proofs pass.
 #
-# One job here is not a gate. `p4-accumulate` produces evidence rather than
+# Two jobs here are not gates. `p4-accumulate` produces evidence rather than
 # guarding against a regression: P4 exits on 500 accumulated honest player-hours
 # and the gates cannot supply them, because a gate is required to re-run the
 # same thing every night and 32 hours re-run three hundred times are 32 hours.
@@ -20,7 +20,17 @@
 # that fails there is a finding and banks nothing; it does not fail the other
 # jobs. Its two scripts self-test in this workflow rather than in ci.yml,
 # because scripts/check.sh enumerates the four *gate* self-tests it runs and
-# these are not gates.
+# these are not gates. (That enumeration is worth a look next time someone
+# touches it: the two `p4-*` self-tests run only here, so a structural
+# regression in them survives a whole day of commits.)
+#
+# It is a three-way matrix as of this change — the box, `windows-latest` and
+# `macos-latest` — because the criterion is 500 hours *across all three
+# platforms* and every runner that could execute the leg before was Linux.
+# `p4-platform-ledger` follows it: it requires the three platforms' fixed-seed
+# probe reports to be identical field for field, and totals the three ledger
+# shards into one per-platform view. A platform whose probe diverges is a
+# finding about that platform, not a reason to widen the comparison.
 
 # ── Where these run ──────────────────────────────────────────────────────────
 #
@@ -108,20 +118,75 @@ jobs:
           if-no-files-found: warn
 
   p4-accumulate:
-    name: P4 hour accumulation (one witnessed hour, swept across the loss band)
+    name: P4 hour accumulation (${{ matrix.platform }}, one witnessed hour, swept across the loss band)
     # Deliberately not part of the swarm gate above, and not a gate at all. That
     # job re-runs one fixed hour — seed 1, 3% loss — every night, which is what
     # a regression harness should do and is exactly why it accumulates nothing:
     # its report's `RunIdentity` is byte-identical from one night to the next.
     # This job varies the seed and sweeps the 3–5% band, so each night is a
     # distinct honest hour towards P4's 500 (docs/11-roadmap.md §P4).
-    runs-on: [self-hosted, orrery-hel1]
+    #
+    # ── Why this is a matrix ───────────────────────────────────────────────────
+    #
+    # The criterion is 500 hours **across all three platforms**, and until this
+    # change every runner that could execute the leg was Linux — the self-hosted
+    # box and `ubuntu-latest`. A Linux-only ledger cannot satisfy the criterion
+    # however many hours it holds, which is why `p4-ledger.sh` records a `target`
+    # per line and groups `total` on it: the shortfall was visible, and this is
+    # what closes it.
+    #
+    # The per-commit determinism matrix in ci.yml already proves `orrery_core`
+    # replays identically on x86_64 Windows and aarch64 macOS. It does **not**
+    # build `p1-swarm`, which pulls Bevy (headless: `bevy_app`, `bevy_ecs`,
+    # `bevy_math`, `bevy_time`, all `default-features = false`, so no windowing
+    # or audio backend is in the tree) and had only ever been built on Linux.
+    # Whether it builds on the other two, and whether it produces the *same*
+    # numbers there, is what these legs establish. `fail-fast: false` because a
+    # platform that cannot hold the hour is a finding about that platform and
+    # must not cancel the two that can.
+    #
+    # ── Cost ──────────────────────────────────────────────────────────────────
+    #
+    # The leg is a single-threaded simulation: measured at 99% of one core and
+    # 108 MB RSS on the box, 9.26 s of CPU for 60 simulated seconds, so ~555 s
+    # for the criterion's hour on a Zen 4 core (615 s is the figure measured with
+    # two other nightly jobs competing). A hosted runner is slower per core and
+    # pays a cold build of ~400 crates that the box does not, which is what the
+    # cache below is for. Bounded per platform rather than at one number, and all
+    # of them far under the 6-hour job ceiling. The repository is public, so
+    # hosted minutes — macOS included — are not billed.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux
+            runs-on: [self-hosted, orrery-hel1]
+            # The historical artifact name, kept: it *is* the Linux shard, and
+            # renaming it would orphan every hour banked before this change.
+            shard: p4-hour-ledger
+            timeout: 45
+          - platform: windows
+            runs-on: windows-latest
+            shard: p4-hour-ledger-windows
+            timeout: 180
+          - platform: macos
+            runs-on: macos-latest
+            shard: p4-hour-ledger-macos
+            timeout: 150
+    runs-on: ${{ matrix.runs-on }}
+    timeout-minutes: ${{ matrix.timeout }}
+    defaults:
+      run:
+        # Explicit, because the Windows leg would otherwise get PowerShell and
+        # every step here is a POSIX shell script. `bash` on a Windows runner is
+        # the Git Bash that ships with the image.
+        shell: bash
     env:
-      RUSTC_WRAPPER: sccache
-    # The hour costs 615 s measured on this box (32 peers, witnessed, 4% loss,
-    # while two other jobs were running); the build is the rest. Bounded well
-    # above that so a hang fails rather than burning the schedule.
-    timeout-minutes: 45
+      # Overrides the workflow-level clear on the box only, which has a
+      # persistent sccache at /var/cache/sccache. The hosted runners have none;
+      # pointing `RUSTC_WRAPPER` at a binary that is not installed fails every
+      # compile.
+      RUSTC_WRAPPER: ${{ matrix.platform == 'linux' && 'sccache' || '' }}
     permissions:
       contents: read
       # The ledger is carried between nights as an artifact of this workflow,
@@ -129,17 +194,68 @@ jobs:
       # the extra permission this storage choice costs — see the download step.
       actions: read
     steps:
+      # Before the checkout, and only on Windows. The runner image sets
+      # `core.autocrlf=true`, which would rewrite every `scripts/*.sh` with CRLF
+      # line endings; bash then fails on the carriage return in the shebang line
+      # and every script in this job dies before its first statement. There is no
+      # `.gitattributes` in this repository to prevent it.
+      - name: Check out with LF line endings
+        if: matrix.platform == 'windows'
+        run: git config --global core.autocrlf input
+
       - uses: actions/checkout@v7
       - name: Install the pinned toolchain
         run: rustup show active-toolchain || rustup toolchain install
 
+      # The box keeps its target/ between runs and has sccache; a cache
+      # round-trip there would cost more than it saves. The hosted legs would
+      # otherwise pay a cold build of the whole dependency graph every night.
+      - uses: actions/cache@v6
+        if: runner.environment == 'github-hosted'
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            p1-swarm/target
+          key: nightly-p4-${{ matrix.platform }}-${{ hashFiles('p1-swarm/Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: nightly-p4-${{ matrix.platform }}-
+
       # These run nowhere else: scripts/check.sh enumerates the four gate
       # self-tests it runs per commit and these two scripts are not gates, so
-      # this is the only place a structural regression in them is noticed.
+      # this is the only place a structural regression in them is noticed. On
+      # the two hosted legs it is also the first thing that would notice the
+      # scripts reaching for a tool the platform does not have — `flock` and
+      # `sha256sum` are neither on macOS nor in Git Bash, and both now have
+      # fallbacks the self-test checks for.
       - name: Self-test both scripts
         run: |
           scripts/p4-accumulate.sh --self-test
           scripts/p4-ledger.sh --self-test
+
+      # ── The comparability probe ────────────────────────────────────────────
+      #
+      # Hours banked on three platforms are only worth banking separately if the
+      # runs are comparable, and `SwarmReport` makes that question byte-exact:
+      # every field in it is computed from the seeded simulation, so two runs of
+      # one seed produce identical JSON (measured on the box) and the only field
+      # that may legitimately differ across platforms is `identity.target`.
+      #
+      # Two simulated minutes at the same 32 peers and the same witnessed
+      # pipeline, before the hour rather than after: if the harness does not
+      # build or does not hold its clauses here, that is the finding, and it
+      # costs ~20 s rather than ~10 min to reach it.
+      - name: Comparability probe (short fixed-seed run, banks nothing)
+        run: scripts/p4-accumulate.sh --probe
+
+      - name: Upload the probe's report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: p4-probe-${{ matrix.platform }}
+          path: target/p4-accumulate/probe-*.json
+          retention-days: 14
+          if-no-files-found: warn
 
       # ── Why the ledger lives in an artifact ────────────────────────────────
       #
@@ -168,9 +284,18 @@ jobs:
       # retention clock. The running total is therefore also written into
       # docs/11-roadmap.md §P4 by hand at each milestone, which is a human
       # checkpoint rather than a backup.
-      - name: Restore the ledger from the last night that banked
+      #
+      # One shard per platform, and never one shared artifact: three legs
+      # running concurrently cannot append to the same file, and an
+      # upload-artifact name is claimed by whichever leg finishes last. The
+      # shards are disjoint by construction — `RunIdentity` carries the target
+      # triple — and `p4-ledger.sh total` de-duplicates on `run_key` when the
+      # comparison job below concatenates them, so a shard restored twice adds
+      # nothing.
+      - name: Restore this platform's ledger shard
         env:
           GH_TOKEN: ${{ github.token }}
+          SHARD: ${{ matrix.shard }}
         run: |
           set -euo pipefail
           mkdir -p target/p4-ledger
@@ -178,15 +303,17 @@ jobs:
           # first run — or one after a full retention gap — yields nothing and
           # starts a fresh ledger rather than failing.
           id=$(gh api --paginate \
-            "repos/$GITHUB_REPOSITORY/actions/artifacts?name=p4-hour-ledger&per_page=100" \
+            "repos/$GITHUB_REPOSITORY/actions/artifacts?name=$SHARD&per_page=100" \
             --jq '[.artifacts[] | select(.expired == false)] | sort_by(.created_at) | last | .id // empty')
           if [ -z "$id" ]; then
-            echo "::warning::no unexpired p4-hour-ledger artifact; starting a new ledger"
+            echo "::warning::no unexpired $SHARD artifact; starting a new ledger shard"
             echo "restored=0" >> "$GITHUB_ENV"
             exit 0
           fi
           gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$id/zip" > ledger.zip
-          unzip -o -d target/p4-ledger ledger.zip
+          # `unzip` rather than python3 would be shorter and is not on every one
+          # of these three images; python3 is.
+          python3 -c "import sys, zipfile; zipfile.ZipFile('ledger.zip').extractall('target/p4-ledger')"
           rm -f ledger.zip
           lines=$(wc -l < target/p4-ledger/hours.jsonl)
           echo "restored $lines banked run(s) from artifact $id"
@@ -198,7 +325,7 @@ jobs:
       # The failure this guards is silent and total: a restore that half-worked
       # followed by a successful append uploads a one-line ledger over the whole
       # history, and nothing else would notice. The ledger only ever grows.
-      - name: Refuse to publish a ledger shorter than the one restored
+      - name: Refuse to publish a shard shorter than the one restored
         run: |
           set -euo pipefail
           now=$(wc -l < target/p4-ledger/hours.jsonl)
@@ -206,23 +333,23 @@ jobs:
             echo "::error::ledger shrank from ${restored:-0} to $now lines; refusing to publish it"
             exit 1
           fi
-          echo "ledger holds $now banked run(s) (restored ${restored:-0})"
+          echo "shard holds $now banked run(s) (restored ${restored:-0})"
           {
-            echo '### P4 player-hour ledger'
+            echo "### P4 player-hour ledger — ${{ matrix.platform }} shard"
             echo '```'
             scripts/p4-ledger.sh total 2>&1
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
-      # Always: a leg that failed banked nothing, and the ledger in hand is
+      # Always: a leg that failed banked nothing, and the shard in hand is
       # still the one the next night must inherit. Not re-uploading it would
       # make a single failed night the start of the retention clock on
       # everything before it.
-      - name: Publish the ledger for the next night
+      - name: Publish this platform's shard for the next night
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: p4-hour-ledger
+          name: ${{ matrix.shard }}
           path: target/p4-ledger/hours.jsonl
           retention-days: 90
           if-no-files-found: warn
@@ -231,9 +358,120 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: p4-accumulate-evidence
+          name: p4-accumulate-evidence-${{ matrix.platform }}
           path: target/p4-accumulate/
           retention-days: 14
+          if-no-files-found: warn
+
+  p4-platform-ledger:
+    name: P4 cross-platform comparison and combined ledger
+    # `always()`: the interesting case is precisely the one where a platform leg
+    # failed. Two probes that agree and a third leg that did not build is the
+    # finding this job exists to report, and a `needs` that skipped on failure
+    # would swallow it.
+    needs: p4-accumulate
+    if: always()
+    runs-on: [self-hosted, orrery-hel1]
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Collect every probe report
+        uses: actions/download-artifact@v7
+        with:
+          pattern: p4-probe-*
+          path: probes
+
+      - name: Collect every ledger shard
+        uses: actions/download-artifact@v7
+        with:
+          pattern: p4-hour-ledger*
+          path: shards
+
+      # ── Are the platforms comparable? ──────────────────────────────────────
+      #
+      # The probe ran the same seed, the same population and the same impairment
+      # on every platform that got that far, with no wall-clock stamp, so the
+      # reports are pure functions of their parameters. `identity.target` is the
+      # one field that may differ. Everything else differing is a cross-platform
+      # divergence in the simulation — which is exactly the class of defect D9's
+      # apparatus exists to prevent, and a reason to stop banking hours on the
+      # platform that disagrees rather than a reason to loosen the comparison.
+      #
+      # One caveat this job cannot close, and it belongs on the record: within a
+      # single run every peer shares one binary and one `libm`, so a run on
+      # Windows proves the pipeline holds *on Windows*. It does not exercise a
+      # witness on one platform re-executing a subject's log from another. That
+      # is a different experiment (p1-swarm's module docs name it) and the
+      # criterion's "across all three platforms" is not obviously the same claim.
+      - name: Require every platform's probe to agree
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          reports=(probes/*/probe-*.json)
+          if [ ${#reports[@]} -eq 0 ]; then
+            echo "::error::no probe reports at all; no platform got as far as running one"
+            exit 1
+          fi
+          echo "### P4 cross-platform comparability probe" >> "$GITHUB_STEP_SUMMARY"
+          # `identity.target` is stripped, and nothing else is. A second field
+          # ever needing to be stripped is a finding to write down, not a line
+          # to add here quietly.
+          strip() { jq -S 'del(.identity.target)' "$1"; }
+          reference=${reports[0]}
+          status=0
+          {
+            echo '```'
+            echo "reference: $(jq -r '.identity.target' "$reference")"
+          } >> "$GITHUB_STEP_SUMMARY"
+          for report in "${reports[@]}"; do
+            target=$(jq -r '.identity.target' "$report")
+            if diff -q <(strip "$reference") <(strip "$report") >/dev/null; then
+              echo "  $target: identical to the reference" >> "$GITHUB_STEP_SUMMARY"
+            else
+              echo "  $target: DIVERGES from the reference" >> "$GITHUB_STEP_SUMMARY"
+              echo "::error::$target diverges from $(jq -r '.identity.target' "$reference") on the same seed"
+              diff <(strip "$reference") <(strip "$report") | head -60 || true
+              status=1
+            fi
+          done
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          if [ ${#reports[@]} -lt 3 ]; then
+            echo "::warning::only ${#reports[@]} of 3 platforms produced a probe report"
+          fi
+          exit "$status"
+
+      # The shards are disjoint by target and `total` de-duplicates on
+      # `run_key`, so concatenating them is the whole of the merge.
+      - name: Total the ledger across every platform
+        if: always()
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          mkdir -p target/p4-ledger
+          shards=(shards/*/hours.jsonl)
+          if [ ${#shards[@]} -eq 0 ]; then
+            echo "::warning::no ledger shards; nothing has banked yet"
+            exit 0
+          fi
+          cat "${shards[@]}" > target/p4-ledger/hours.jsonl
+          {
+            echo '### P4 player-hour ledger — all platforms'
+            echo '```'
+            scripts/p4-ledger.sh total 2>&1
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          scripts/p4-ledger.sh total
+
+      # The combined view is derived and could be rebuilt from the shards, but a
+      # reader chasing "how many hours does P4 have" should not have to.
+      - name: Upload the combined ledger
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: p4-hour-ledger-combined
+          path: target/p4-ledger/hours.jsonl
+          retention-days: 90
           if-no-files-found: warn
 
   p3-island:
