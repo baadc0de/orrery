@@ -262,14 +262,69 @@ night on x86_64 Linux (`scripts/p1-swarm-gate.sh`,
 `.github/workflows/nightly.yml`). Measured over that hour before it landed:
 coverage 95.98% against the 95% floor, zero false positives, 156 728 chain gaps
 repaired. What is outstanding is narrower than it was, and one part of it is
-newly visible: **the criterion's loss band is 3–5% and only its floor holds.**
-The same witnessed hour at 5% loss judges 93.8% of the timeline it is shown,
-below the 95% floor, still with zero false positives across 32 player-hours —
-234 930 chain gaps against 156 728, and the repairs do not all land before the
-window they belong to closes. The gate therefore runs the 3% floor nightly and
-`p1-swarm --loss 0.05` reproduces the 5% figure on demand; closing that gap is
-a measurement P4 owes, and lowering the coverage floor to accommodate it is not
-one. The rest of what is outstanding: the other three determinism targets, and
+newly visible: **the criterion's loss band is 3–5% and only its floor held.**
+The same witnessed hour at 5% loss judged 93.8% of the timeline it was shown,
+below the 95% floor, with zero false positives across 32 player-hours and
+234 930 chain gaps against 156 728. That deficit is now attributed and closed,
+and the attribution is worth recording because the obvious explanation was the
+wrong one.
+
+**The deficit was never the repair path.** Instrumenting every way a frame can
+leave the witness's deferral buffer — folded on a retry, discarded as already
+behind the fold, displaced by the per-subject cap, swept past the retention
+floor, refused by the drain that re-offered it, replaced by a later copy, or
+still held at the end of the run — the ledger balances at essentially 100%
+recovered: at 5% loss, 314 101 of 314 105 deferred frames folded on a retry,
+four still held, and **zero** through any other door. Repairs were landing.
+
+What the per-peer figures said instead: every peer's coverage came out at an
+exact k/7 of the timeline it was shown, seven being the witness set. **The unit
+of loss was a whole watch, judging its subject's entire hour or none of it** —
+9 dead watches of 224 at 3% loss, which is 1 − 9/224 = 95.98% to four places,
+and 14 of 224 at 5%, which is 93.75%. What killed them was the first frame after
+the anchor. A watch had no verified head until one landed, so the signature
+preimage was rebuilt from the anchor claim's head regardless — and a frame that
+did not chain to it failed *verification* rather than gap detection. A rejection
+asks for no repair and moves no head, so every frame after it failed identically
+for the life of the watch, while the coverage denominator kept climbing because
+the subject was still talking; re-anchoring could not rescue it either, because
+resuming needs a `Catchup` that was never opened. One lost datagram in one place
+cost a whole subject for the rest of the session.
+
+The anchor's `input_head` is signed by the subject, which is exactly the
+argument the re-anchor path already makes for the head it resumes on, so a watch
+is now checked from its first frame and a first frame that does not chain opens
+a repair from `anchor_tick`. Measured over the criterion's hour at 32 peers,
+before and after, same seed:
+
+| 32 peers, one simulated hour, `--witness` | 3% loss | 5% loss |
+|---|---|---|
+| Observation coverage, before | 95.98% | **93.75%** |
+| Observation coverage, after | **100.0%** | **100.0%** |
+| Watches that never folded a frame, before | 9 of 224 | 14 of 224 |
+| Watches that never folded a frame, after | 0 | 0 |
+| False positives, before and after | 0 | 0 |
+| Chain gaps repaired, before → after | 156 728 → 164 164 | 234 930 → 250 007 |
+| Deferred frames not recovered, after | 2 of 219 641 | 3 of 335 096 |
+| Replication packets shed, before → after | 206 → 230 | 229 → 255 |
+
+**The band holds at both ends.** The witnessed hour at 5% loss now judges
+essentially all of the timeline it is shown, still with zero false positives.
+`MIN_COVERAGE` did not move — the phase's target was met, not lowered — and no
+D16 parameter moved either. The residual at both ends is the two or three frames
+still held behind an open hole when the run stops, which is the run ending
+mid-repair rather than a loss.
+
+One consequence the gate has to absorb: repairing the watches that used to be
+dead is repair traffic, so the swarm asks for 5–6% more chain gaps and sheds
+**230 packets at 3% loss against the nightly leg's `--max-shed 206` ratchet**
+(255 at 5%). That allowance is a measured ratchet whose own comment says a run
+that moves it has found something; this run found something, and the number
+wants re-baselining to the post-fix figure rather than the clause being relaxed.
+
+The gate runs the 3% floor nightly and `p1-swarm --loss 0.05` reproduces the
+other end on demand. The rest of what is outstanding: the other three
+determinism targets, and
 a ledger that adds the nights up. Each report is
 stamped with its seed, its full impairment profile, its target triple and its
 commit sha, and deliberately not with a wall clock unless asked, so summing them
@@ -287,10 +342,11 @@ and **false positives 582 → 0**; under the 3% loss / 100 ms jitter profile,
 coverage 96.0% and false positives 0. Eight and sixteen peers hold at 0 shed, 0
 false positives, 100% coverage. Over the criterion's full simulated hour at 32
 peers: **32 accumulated player-hours, zero false positives, 100% coverage**,
-lane at 194 kb/s; the same hour *under* the impairment profile holds at
+lane at 194 kb/s; the same hour *under* the impairment profile held at
 **95.98% coverage and zero false positives**, lane at 194 kb/s, 206 packets
 shed — the same 206 as at five minutes, so a transient at island formation
-rather than an overrun. The 500-hour gate is now a matter of running the harness
+rather than an overrun. That 95.98% was the dead-watch deficit above and is
+**100.0%** since; the shed figure moved with it, to 230. The 500-hour gate is now a matter of running the harness
 across the four determinism targets rather than of anything being in the way.
 
 No D16 parameter moved. The witness set stays at N ≥ 5, ≤ 7 links — dropping to

@@ -42,10 +42,13 @@
 //! over 60 simulated seconds runs in about ten wall seconds.
 //!
 //! It holds the criterion at eight, sixteen and thirty-two peers: **zero false
-//! positives at 100% observation coverage** on a clean link, and zero at 96%
-//! under the 3% loss / 100 ms jitter profile. Both numbers are printed together
-//! because neither is readable alone — a witness that has stopped watching also
-//! reports zero.
+//! positives at 100% observation coverage** on a clean link, and zero at 100%
+//! across the whole of the criterion's 3–5% loss band. Both numbers are printed
+//! together because neither is readable alone — a witness that has stopped
+//! watching also reports zero. That pairing is what caught the last coverage
+//! defect: the impaired band read 96.0% at 3% and 93.8% at 5% while reporting
+//! nothing, and the deficit turned out to be whole watches killed by one lost
+//! frame each rather than anything about the repairs.
 //!
 //! Since it holds, it gates: `scripts/p1-swarm-gate.sh` runs the impaired hour
 //! with `--witness` as its third leg, nightly and blocking, and that is the only
@@ -156,13 +159,14 @@ struct Args {
 
     /// Move the impaired profile's loss within the criterion's 3–5% band.
     ///
-    /// The band had only ever been run at its 3% floor, and the other end does
-    /// not hold: the witnessed hour at 5% judges **93.8%** of the timeline it
-    /// is shown against the 95% floor, with zero false positives across the
-    /// same 32 player-hours. Coverage is the clause that fails, not the
-    /// findings — 234 930 gaps rather than 156 728, and the repairs do not all
-    /// land before the window they belong to closes. The gate runs the floor
-    /// nightly; closing the band is P4's next measurement, not a knob.
+    /// The band had only ever been run at its 3% floor, and running the other
+    /// end is what found the coverage defect: at 5% the witnessed hour judged
+    /// **93.8%** of the timeline it was shown against the 95% floor, and the
+    /// per-peer figures came out at exact sevenths — whole watches that never
+    /// folded a frame, not repairs arriving late. Both ends now judge
+    /// **100.0%** with zero false positives (docs/11-roadmap.md §P4). The gate
+    /// runs the floor nightly; this flag is what keeps the other end from
+    /// going unexercised again.
     ///
     /// Ignored without `--impaired`, which is the flag that selects the profile
     /// at all.
@@ -189,6 +193,12 @@ struct Args {
     /// burst on the unsheddable control lane and sheds the cheap lane to afford
     /// it. What says that is a transient and not an overrun is that the count
     /// is the same at five simulated minutes as at one hour.
+    ///
+    /// The gate's witnessed leg passes 206, which was the measured number
+    /// exactly. It is **230** since watches stopped dying on their first lost
+    /// frame (docs/11-roadmap.md §P4): repairing a watch that used to go blind
+    /// is repair traffic, and the burst it adds is shed from the cheap lane
+    /// like any other. 255 at the 5% end of the band.
     #[arg(long, default_value_t = 0)]
     max_shed: u64,
 

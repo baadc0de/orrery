@@ -1072,13 +1072,22 @@ impl SwarmReport {
         //
         // Those figures predate the frame cadence being derived from the lane's
         // budget share (docs/03-replication.md §5.3a, docs/11-roadmap.md §P4).
-        // At the criterion population the clause now holds rather than fails:
-        // 100.0% on a clean link and 96.0% under the 3% loss / 100 ms jitter
-        // profile, both at 32 peers. The residual under loss is timeline shown
-        // to a witness while a hole was open that the repair which followed did
-        // not recover — four points of it, and the margin over this threshold
-        // is only one. Raising the threshold to today's number, or lowering it
-        // to accommodate a run that misses, are both measurements rather than
+        // At the criterion population the clause now holds rather than fails,
+        // and at both ends of the criterion's 3–5% loss band: **100.0% clean,
+        // 100.0% at 3% loss, 100.0% at 5%**, all at 32 peers with zero false
+        // positives.
+        //
+        // It read 96.0% and 93.8% under loss until watches stopped dying on
+        // their first lost frame. What that deficit was is worth keeping here,
+        // because the plausible reading was wrong: it was not timeline the
+        // repair failed to recover — the deferral ledger balances at
+        // essentially 100% recovered at both ends — it was whole *watches*, 9
+        // of 224 at 3% and 14 at 5%, each shown its subject's entire hour and
+        // judging none of it. Coverage is the only figure in this report that
+        // could see them.
+        //
+        // Raising the threshold to today's number, or lowering it to
+        // accommodate a run that misses, are both measurements rather than
         // edits; the number here is the phase's target and stays put.
         const MIN_COVERAGE: f64 = 0.95;
         if self.witnessing && self.observation_coverage < MIN_COVERAGE {
