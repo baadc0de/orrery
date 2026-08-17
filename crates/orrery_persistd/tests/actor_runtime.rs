@@ -354,6 +354,90 @@ async fn committed_rekey_moves_entity_then_recovers_destination() {
 }
 
 #[tokio::test]
+async fn a_rekey_for_unhosted_shards_does_not_brick_open() {
+    // Given: a journal holding a committed rekey between two shards that the
+    // *next* process does not host — exactly what a chain follower's journal
+    // accumulates, since it mirrors every record of the node it replicates and
+    // a cross-node entity move is a rekey naming two foreign cells.
+    let dir = tempfile::tempdir().unwrap();
+    let cells = CellId::ROOT.children();
+    let mut config = runtime_config(dir.path(), false);
+    config.shards = vec![cells[0], cells[1], cells[2]];
+    let checkpoints = mem_store();
+    let store = Arc::new(MemLeaseStore::new());
+    let moved = PersistId::new(5_701);
+    let local = PersistId::new(5_702);
+    let holder = test_node(23);
+    let rt = CellRuntime::open_with_lease_store(&config, &checkpoints, store.clone())
+        .await
+        .unwrap();
+    rt.apply(mk_record(
+        cells[0],
+        moved.0,
+        RecordKind::Spawn,
+        b"foreign-image",
+    ))
+    .await
+    .unwrap();
+    rt.apply(mk_record(
+        cells[2],
+        local.0,
+        RecordKind::Spawn,
+        b"hosted-image",
+    ))
+    .await
+    .unwrap();
+    let source = rt.actor(GridId::ROOT, cells[0]).unwrap().clone();
+    let ClaimResult::Granted(grant) = source
+        .claim_lease(moved, cells[0], holder, ClaimKind::Strong, 30)
+        .await
+        .unwrap()
+    else {
+        panic!("source lease must be granted");
+    };
+    Router::commit_rekey(
+        &rt,
+        rekey_record(&EntityRekey {
+            version: ENTITY_REKEY_VERSION,
+            entity: moved,
+            source_grid: GridId::ROOT,
+            source_cell: cells[0],
+            destination_grid: GridId::ROOT,
+            destination_cell: cells[1],
+            expected_lease_id: grant.lease_id,
+            source_record: bytes::Bytes::from_static(b"foreign-image"),
+        }),
+    )
+    .await
+    .unwrap();
+    rt.close().await.unwrap();
+
+    // When: the node restarts hosting only the shard that rekey never named.
+    // `open` used to fail here — the source `ok_or_else` in the replay branch
+    // and the destination one inside `recover_rekey` both raised on a shard
+    // this node has no actor for, so one mirrored move crash-looped the node.
+    config.shards = vec![cells[2]];
+    let recovered = CellRuntime::open_with_lease_store(&config, &checkpoints, store.clone())
+        .await
+        .expect("a rekey for unhosted shards must not fail open");
+
+    // Then: it serves the shard it does host, and claims neither of the others.
+    let page = recovered.read(GridId::ROOT, cells[2]).await.unwrap();
+    assert_eq!(page.entities[&local].components.as_ref(), b"hosted-image");
+    assert!(recovered.actor(GridId::ROOT, cells[0]).is_none());
+    assert!(recovered.actor(GridId::ROOT, cells[1]).is_none());
+    // The mirrored record is still on disk; it was skipped, not dropped.
+    let rekeys = recovered
+        .journal()
+        .scan_from(Lsn::new(0, 0))
+        .filter(|item| item.as_ref().unwrap().record.kind == RecordKind::Rekey)
+        .count();
+    assert_eq!(rekeys, 1);
+
+    recovered.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn stalled_lease_recovery_is_cancellable_and_reopen_remains_destination_only() {
     // Given: a committed rekey whose successful recovery is destination-only.
     let dir = tempfile::tempdir().unwrap();

@@ -347,11 +347,20 @@ impl CellRuntime {
                 }
                 // `decode_entity_rekey` proved `rec.cell == rekey.source_cell`,
                 // so the owner resolved above is the source shard.
-                let source_shard = owner.ok_or_else(|| {
-                    crate::journal::JournalError::Store(
-                        "committed rekey source actor unavailable".into(),
-                    )
-                })?;
+                //
+                // A rekey naming a shard this node does not host is skipped
+                // for the same reason the plain-diff path skips one, and this
+                // branch used to be the exception that bricked startup: a
+                // follower's journal accumulates the *mirrored* rekeys of
+                // every node it replicates, so one cross-node entity move
+                // plus a restart failed `open` outright. The live write path
+                // only ever emits a rekey when it hosts both actors
+                // (`committed_rekey_plan`), so a foreign rekey here is never
+                // this node's to replay — and the lease reconciliation below
+                // is not its business either.
+                let Some(source_shard) = owner else {
+                    continue;
+                };
                 if !gate.admit(source_shard, rec.epoch) {
                     continue;
                 }
@@ -362,7 +371,7 @@ impl CellRuntime {
                     &mut coverage,
                     &rekey,
                     position,
-                )?;
+                );
                 let migration = lease_store
                     .migrate(
                         rekey.source_grid,
@@ -1222,6 +1231,13 @@ fn deepest_shard(shards: &[CellId], cell: CellId) -> Option<CellId> {
         .copied()
 }
 
+/// Fold one committed rekey into the shards this node hosts.
+///
+/// Each half is applied independently, because a node need not host both.
+/// Requiring the destination — which is what this used to do — bricked `open`
+/// on any journal holding a rekey out of this node's shard set, and a
+/// follower's journal holds exactly those. An unhosted half is nothing this
+/// node can seed, repair, or serve, so it is skipped rather than raised.
 fn recover_rekey(
     shards: &[CellId],
     checkpoint_watermarks: &HashMap<CellId, Lsn>,
@@ -1229,66 +1245,63 @@ fn recover_rekey(
     coverage: &mut HashMap<CellId, Lsn>,
     rekey: &EntityRekey,
     lsn: Lsn,
-) -> Result<(), crate::journal::JournalError> {
-    let source = deepest_shard(shards, rekey.source_cell).ok_or_else(|| {
-        crate::journal::JournalError::Store("committed rekey source actor unavailable".into())
-    })?;
-    let destination = deepest_shard(shards, rekey.destination_cell).ok_or_else(|| {
-        crate::journal::JournalError::Store("committed rekey destination actor unavailable".into())
-    })?;
-    if checkpoint_watermarks
-        .get(&source)
-        .is_none_or(|watermark| lsn > *watermark)
-    {
-        let seed = seeds.entry(source).or_default();
-        seed.state.remove(&rekey.entity);
-        // The source keeps no tombstone (the entity is alive in the
-        // destination shard), so its vacated row is only ever cleared because
-        // the recovery records it here, exactly as the live path does.
-        actor::note_row_moved(&mut seed.superseded, &seed.by_cell, rekey.entity, None);
-        seed.by_cell.remove(&rekey.entity);
-        actor::cancel_tombstone(
-            &mut seed.superseded,
-            &mut seed.tombstones,
-            rekey.entity,
-            None,
-        );
-        coverage
-            .entry(source)
-            .and_modify(|covered| *covered = (*covered).max(lsn))
-            .or_insert(lsn);
+) {
+    if let Some(source) = deepest_shard(shards, rekey.source_cell) {
+        if checkpoint_watermarks
+            .get(&source)
+            .is_none_or(|watermark| lsn > *watermark)
+        {
+            let seed = seeds.entry(source).or_default();
+            seed.state.remove(&rekey.entity);
+            // The source keeps no tombstone (the entity is alive in the
+            // destination shard), so its vacated row is only ever cleared because
+            // the recovery records it here, exactly as the live path does.
+            actor::note_row_moved(&mut seed.superseded, &seed.by_cell, rekey.entity, None);
+            seed.by_cell.remove(&rekey.entity);
+            actor::cancel_tombstone(
+                &mut seed.superseded,
+                &mut seed.tombstones,
+                rekey.entity,
+                None,
+            );
+            coverage
+                .entry(source)
+                .and_modify(|covered| *covered = (*covered).max(lsn))
+                .or_insert(lsn);
+        }
     }
-    if checkpoint_watermarks
-        .get(&destination)
-        .is_none_or(|watermark| lsn > *watermark)
-    {
-        let seed = seeds.entry(destination).or_default();
-        seed.state.insert(
-            rekey.entity,
-            EntityRecord {
-                components: rekey.source_record.clone(),
-                dirty: true,
-            },
-        );
-        actor::note_row_moved(
-            &mut seed.superseded,
-            &seed.by_cell,
-            rekey.entity,
-            Some(rekey.destination_cell),
-        );
-        seed.by_cell.insert(rekey.entity, rekey.destination_cell);
-        actor::cancel_tombstone(
-            &mut seed.superseded,
-            &mut seed.tombstones,
-            rekey.entity,
-            Some(rekey.destination_cell),
-        );
-        coverage
-            .entry(destination)
-            .and_modify(|covered| *covered = (*covered).max(lsn))
-            .or_insert(lsn);
+    if let Some(destination) = deepest_shard(shards, rekey.destination_cell) {
+        if checkpoint_watermarks
+            .get(&destination)
+            .is_none_or(|watermark| lsn > *watermark)
+        {
+            let seed = seeds.entry(destination).or_default();
+            seed.state.insert(
+                rekey.entity,
+                EntityRecord {
+                    components: rekey.source_record.clone(),
+                    dirty: true,
+                },
+            );
+            actor::note_row_moved(
+                &mut seed.superseded,
+                &seed.by_cell,
+                rekey.entity,
+                Some(rekey.destination_cell),
+            );
+            seed.by_cell.insert(rekey.entity, rekey.destination_cell);
+            actor::cancel_tombstone(
+                &mut seed.superseded,
+                &mut seed.tombstones,
+                rekey.entity,
+                Some(rekey.destination_cell),
+            );
+            coverage
+                .entry(destination)
+                .and_modify(|covered| *covered = (*covered).max(lsn))
+                .or_insert(lsn);
+        }
     }
-    Ok(())
 }
 
 /// Re-verify a record's payload crc (§4.1 replay integrity).
