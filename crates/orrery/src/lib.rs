@@ -212,6 +212,11 @@ pub fn queue_filed_reports(
     mut reports: ResMut<ReportQueue>,
 ) {
     for report in filed.read() {
+        // A clone, because a message reader borrows and other readers (a
+        // game's own telemetry, most obviously) are entitled to see the same
+        // message. It is one bundle per divergence episode, not per frame —
+        // the engine signals a disputed claim once — so the copy is paid at
+        // the rate accusations happen rather than at the tick rate.
         reports.push(report.report.clone());
     }
 }
