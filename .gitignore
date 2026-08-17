@@ -29,6 +29,10 @@ p2-abba-*/
 p2-gateway-*/
 p3-island-*/
 
+# Agent worktrees. These are full checkouts with their own .git, so a stray
+# `git add -A` stages three embedded repositories instead of ignoring them.
+.claude/worktrees/
+
 # Device-local agent state: memory, lanes and leases. Never committed.
 # The real store is the git common directory (see scripts/agent-lane.sh);
 # .agents/memory is a symlink into it, so every worktree sees one set of notes.

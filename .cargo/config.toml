@@ -5,23 +5,31 @@
 # reaches all of them without per-agent setup.
 
 [build]
-# Route rustc through sccache so the dependency graph is compiled once per
+# Route rustc through kache so the dependency graph is compiled once per
 # machine rather than once per worktree. See AGENTS.md § Build cache.
 #
-# This makes `sccache` a build prerequisite. If it is missing, either install
-# it (`pacman -S sccache`, or `cargo install sccache --locked`) or opt out for
-# one command with an empty wrapper, which takes precedence over this file:
+# This makes `kache` a build prerequisite. If it is missing, install it from
+# https://github.com/kunobi-ninja/kache, or opt out for one command with an
+# empty wrapper, which takes precedence over this file:
 #
 #     RUSTC_WRAPPER= cargo build
-rustc-wrapper = "sccache"
+#
+# Why kache and not sccache: sccache runs the compiler inside its own server
+# process, so it writes the output objects as the server's uid and panics if it
+# cannot stat the calling user's toolchain — and it writes cache entries 0600,
+# which made the "shared" cache unreadable across the box's two build users.
+# kache compiles in the invoking process and honours the cache directory's
+# permissions, so one cache genuinely serves both.
+rustc-wrapper = "kache"
 
 # Incremental compilation is off deliberately, and the two reasons compound.
 #
-# sccache cannot cache an incremental unit — it marks them non-cacheable — so
-# leaving this on would silently defeat the cache for exactly the workspace
-# crates being worked on, while still writing the artifacts to disk. And those
-# artifacts are not small: one worktree had accumulated 17 GiB of
-# `target/debug/incremental` alone.
+# An incremental unit is not a cacheable one for a plain rustc wrapper, so
+# leaving this on would defeat the cache for exactly the workspace crates being
+# worked on, while still writing the artifacts to disk. And those artifacts are
+# not small: one worktree had accumulated 17 GiB of `target/debug/incremental`
+# alone. (kache does expose incremental-aware settings that sccache had no
+# equivalent for; nobody has evaluated them here, so this stays off.)
 #
 # The trade is real: a human tight-looping edits on a single crate loses
 # incremental's advantage. Turn it back on for that session with

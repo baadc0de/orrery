@@ -34,9 +34,10 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
-  # .cargo/config.toml routes rustc through sccache so agent worktrees share one
-  # object cache (AGENTS.md § Build cache). Runners are ephemeral and have no
-  # sccache installed, so the wrapper is cleared here — the documented opt-out.
+  # .cargo/config.toml routes rustc through kache so agent worktrees share one
+  # object cache (AGENTS.md § Build cache). GitHub-hosted runners are ephemeral
+  # and have no kache installed, so the wrapper is cleared here — the documented
+  # opt-out. The self-hosted steps below put it back.
   RUSTC_WRAPPER: ""
   # Already off in .cargo/config.toml; restated because a cache miss on a fresh
   # runner is the case where incremental artifacts cost the most and buy least.
@@ -46,7 +47,7 @@ jobs:
   # Which runner the heavy Linux jobs get, decided per event.
   #
   # `orrery-hel1-1` is a self-hosted box with a persistent `target/` and a
-  # shared sccache, which is worth 5-9 minutes a run — but this repository is
+  # shared build cache, which is worth 5-9 minutes a run — but this repository is
   # **public**, and a self-hosted runner is not ephemeral. A pull request from
   # a fork carries its own `build.rs` and its own test code, and running
   # `cargo test` on it is arbitrary code execution on hardware that survives
@@ -123,13 +124,15 @@ jobs:
       - uses: actions/checkout@v7
       - name: Install the pinned toolchain
         run: rustup show active-toolchain || rustup toolchain install
-      - name: Route rustc through the shared sccache
-        # The workflow env clears RUSTC_WRAPPER because a GitHub runner is
-        # ephemeral and has nothing to hit. The self-hosted box is the opposite
-        # case: /var/cache/sccache is shared with the dev checkout on the same
-        # machine, so a CI build starts warm off whatever was compiled there.
+      - name: Route rustc through the shared build cache
+        # The workflow env clears RUSTC_WRAPPER because a GitHub-hosted runner
+        # is ephemeral and has nothing to hit. The self-hosted box is the
+        # opposite case: /var/cache/kache/shared is a content-addressed cache
+        # this runner's `ci` uid and the dev checkout both publish to and
+        # restore from, so a CI build starts warm off whatever was compiled by
+        # hand there, and vice versa.
         if: runner.environment == 'self-hosted'
-        run: echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
+        run: echo "RUSTC_WRAPPER=kache" >> "$GITHUB_ENV"
       # Four first-party crates take `bevy = { workspace = true }` with default
       # features, which pulls bevy_winit and its display/audio stack, so three
       # build scripts probe pkg-config: alsa-sys, libudev-sys and wayland-sys.
@@ -189,13 +192,15 @@ jobs:
       - uses: actions/checkout@v7
       - name: Install the pinned toolchain
         run: rustup show active-toolchain || rustup toolchain install
-      - name: Route rustc through the shared sccache
-        # The workflow env clears RUSTC_WRAPPER because a GitHub runner is
-        # ephemeral and has nothing to hit. The self-hosted box is the opposite
-        # case: /var/cache/sccache is shared with the dev checkout on the same
-        # machine, so a CI build starts warm off whatever was compiled there.
+      - name: Route rustc through the shared build cache
+        # The workflow env clears RUSTC_WRAPPER because a GitHub-hosted runner
+        # is ephemeral and has nothing to hit. The self-hosted box is the
+        # opposite case: /var/cache/kache/shared is a content-addressed cache
+        # this runner's `ci` uid and the dev checkout both publish to and
+        # restore from, so a CI build starts warm off whatever was compiled by
+        # hand there, and vice versa.
         if: runner.environment == 'self-hosted'
-        run: echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
+        run: echo "RUSTC_WRAPPER=kache" >> "$GITHUB_ENV"
       - uses: actions/cache@v6
         # The self-hosted box keeps its target/ between runs; a cache
         # round-trip would cost more than it saves there.
@@ -235,13 +240,15 @@ jobs:
       - uses: actions/checkout@v7
       - name: Install the pinned toolchain
         run: rustup show active-toolchain || rustup toolchain install
-      - name: Route rustc through the shared sccache
-        # The workflow env clears RUSTC_WRAPPER because a GitHub runner is
-        # ephemeral and has nothing to hit. The self-hosted box is the opposite
-        # case: /var/cache/sccache is shared with the dev checkout on the same
-        # machine, so a CI build starts warm off whatever was compiled there.
+      - name: Route rustc through the shared build cache
+        # The workflow env clears RUSTC_WRAPPER because a GitHub-hosted runner
+        # is ephemeral and has nothing to hit. The self-hosted box is the
+        # opposite case: /var/cache/kache/shared is a content-addressed cache
+        # this runner's `ci` uid and the dev checkout both publish to and
+        # restore from, so a CI build starts warm off whatever was compiled by
+        # hand there, and vice versa.
         if: runner.environment == 'self-hosted'
-        run: echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
+        run: echo "RUSTC_WRAPPER=kache" >> "$GITHUB_ENV"
       - name: Install Bevy's Linux build dependencies
         # Pre-installed on the self-hosted box, and the `ci` user has no sudo
         # by design — see the `runner` job.
