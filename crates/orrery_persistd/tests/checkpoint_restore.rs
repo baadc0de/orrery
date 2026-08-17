@@ -12,8 +12,9 @@ use std::time::Duration;
 
 use orrery_persistd::checkpoint::{CheckpointStore, MemCheckpointStore};
 use orrery_persistd::journal::{AdaptiveCommitMode, GroupCommitConfig};
+use orrery_persistd::lease::LeaseStore;
 use orrery_persistd::{
-    payload_crc, spawn_checkpoint_scheduler, CellRuntime, CheckpointConfig, JournalConfig,
+    payload_crc, spawn_checkpoint_scheduler, CellRuntime, CheckpointConfig, Journal, JournalConfig,
     RuntimeConfig,
 };
 
@@ -1504,4 +1505,234 @@ async fn fdb_seeded_shard_loads_without_a_ckpt_row() {
     rt.close().await.unwrap();
 
     store.delete(CellId::ROOT, GRID).await.unwrap();
+}
+
+#[tokio::test]
+async fn checkpoint_at_zero_still_replays_the_journals_first_record() {
+    // A journal's very first record is assigned LSN 0:0 (the empty journal
+    // opens with `next_lsn = 0:0` and `append` stamps it), and a checkpoint
+    // taken before that append stores watermark 0:0 as well. The watermark is
+    // an *inclusive* upper bound with no encoding for "covers nothing", so a
+    // naive `position > watermark` filter reads that 0:0 as "the first record
+    // is already covered" and silently drops it — a durability hole exactly
+    // one record wide, on the newest journal in the cluster.
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(MemCheckpointStore::new());
+
+    let rt = CellRuntime::open(&runtime_config(dir.path()), &store_dyn(&store))
+        .await
+        .unwrap();
+    // Checkpoint an empty actor: entities {}, watermark 0:0.
+    rt.checkpoint(store.as_ref()).await.unwrap();
+    let ckpt = store
+        .load(CellId::ROOT, GridId::ROOT)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(ckpt.entities.is_empty(), "checkpoint precedes every append");
+    assert_eq!(
+        ckpt.watermark,
+        Lsn::new(0, 0),
+        "a checkpoint before the first append covers nothing, and says so as 0:0"
+    );
+
+    // Exactly one record, which the journal stamps at position 0:0 — the same
+    // value the watermark holds.
+    let lsn = rt
+        .apply(mk_record(CellId::ROOT, 7, RecordKind::Spawn, b"seven"))
+        .await
+        .unwrap();
+    assert_eq!(lsn, Lsn::new(0, 0), "the first record ever written is 0:0");
+    rt.close().await.unwrap();
+
+    // Kill -9. `open` seeds from the checkpoint and folds the tail; the tail
+    // is that one record, and it is not covered by anything.
+    let rt2 = CellRuntime::open(&runtime_config(dir.path()), &store_dyn(&store))
+        .await
+        .unwrap();
+    let page = rt2.read(GridId::ROOT, CellId::ROOT).await.unwrap();
+    assert_eq!(
+        page.entities
+            .get(&PersistId::new(7))
+            .map(|e| e.components.as_ref()),
+        Some(&b"seven"[..]),
+        "open must replay the record at 0:0 over a 0:0 watermark"
+    );
+
+    // The explicit restore path answers the same way (§3.4 step 3): it is a
+    // second implementation of the same filter, and the two must agree.
+    let replayed = rt2.restore(CellId::ROOT, store.as_ref()).await.unwrap();
+    assert_eq!(replayed, 1, "restore replays the record at 0:0 as well");
+    let page = rt2.read(GridId::ROOT, CellId::ROOT).await.unwrap();
+    assert_eq!(
+        page.entities
+            .get(&PersistId::new(7))
+            .map(|e| e.components.as_ref()),
+        Some(&b"seven"[..]),
+    );
+    rt2.close().await.unwrap();
+}
+
+/// Build the 0:0 rekey scenario and recover it, returning the snapshot of
+/// `shard`.
+///
+/// Every shard in `shards` is seeded from a checkpoint that covers *nothing*
+/// (watermark 0:0) and holds `entity` at `source`, over a journal whose one
+/// and only record is the committed rekey to `destination` — at position 0:0,
+/// the same value the watermark carries.
+async fn rekey_at_zero_snapshot(
+    shards: Vec<CellId>,
+    shard: CellId,
+) -> orrery_persistd::actor::CheckpointSnapshot {
+    let dir = tempfile::tempdir().unwrap();
+    let (source, destination) = (rekey_source(), rekey_destination());
+    let entity = PersistId::new(9);
+    let lease_id = orrery_protocol::LeaseId(77);
+
+    let store = Arc::new(MemCheckpointStore::new());
+    for &seeded in &shards {
+        store
+            .checkpoint(&orrery_persistd::checkpoint::CheckpointData {
+                shard: seeded,
+                grid: GridId::ROOT,
+                node_id: 0,
+                epoch: Epoch::new(0),
+                watermark: Lsn::new(0, 0),
+                entities: std::iter::once((
+                    entity,
+                    orrery_persistd::EntityRecord {
+                        components: bytes::Bytes::from_static(b"before"),
+                        dirty: false,
+                    },
+                ))
+                .collect(),
+                by_cell: std::iter::once((entity, source)).collect(),
+                tombstones: Default::default(),
+                superseded: Default::default(),
+                taken_at_ms: 0,
+            })
+            .await
+            .unwrap();
+    }
+
+    // The registrar still shows the pre-rekey location, exactly as it does
+    // after a crash between the journal commit and the lease migration —
+    // which is what `open` reconciles the rekey against.
+    let leases = Arc::new(orrery_persistd::MemLeaseStore::new());
+    leases
+        .put(
+            GridId::ROOT,
+            source,
+            &orrery_protocol::Lease {
+                entity,
+                holder: Some(test_node(1)),
+                seq: orrery_protocol::SeqPair {
+                    own_seq: 1,
+                    auth_seq: 1,
+                },
+                lease_id,
+                expires_at: u64::MAX,
+                flags: orrery_protocol::LeaseFlags(0),
+                bound_to: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    let rekey = orrery_protocol::EntityRekey {
+        version: 1,
+        entity,
+        source_grid: GridId::ROOT,
+        source_cell: source,
+        destination_grid: GridId::ROOT,
+        destination_cell: destination,
+        expected_lease_id: lease_id,
+        source_record: bytes::Bytes::from_static(b"after"),
+    };
+    let payload = bytes::Bytes::from(postcard::to_allocvec(&rekey).unwrap());
+    let record = JournalRecord {
+        lsn: Lsn::new(0, 0), // assigned by the journal
+        cell: source,
+        grid: GridId::ROOT,
+        entity,
+        tick: Tick::new(1),
+        epoch: Epoch::new(0),
+        author: test_node(1),
+        kind: RecordKind::Rekey,
+        crc: payload_crc(&payload),
+        payload,
+    };
+
+    // Straight to the journal: the point is a journal whose only record sits
+    // at position 0:0, which no live write path can be talked into producing
+    // twice.
+    let mut config = runtime_config(dir.path());
+    config.shards = shards;
+    let journal = Journal::open(&config.journal).unwrap();
+    let handle = journal.append(record).unwrap();
+    assert_eq!(handle.lsn(), Lsn::new(0, 0), "the first record is 0:0");
+    handle.committed().await.unwrap();
+    journal.close().await.unwrap();
+    // The fjall directory lock is held by the open handle, not released by
+    // `close`; the runtime below opens the same directory.
+    drop(handle);
+    drop(journal);
+
+    let rt = CellRuntime::open_with_lease_store(&config, &store_dyn(&store), leases)
+        .await
+        .unwrap();
+    let snap = rt.actor_snapshot(shard).await.unwrap();
+    rt.close().await.unwrap();
+    snap
+}
+
+fn rekey_source() -> CellId {
+    CellId::ROOT.children()[0]
+}
+
+fn rekey_destination() -> CellId {
+    CellId::ROOT.children()[1]
+}
+
+#[tokio::test]
+async fn checkpoint_at_zero_still_replays_a_rekey_at_the_journals_first_record() {
+    // `recover_rekey` carries its own copy of the coverage predicate, so the
+    // 0:0 boundary has to hold there too: fixing one path and not the other
+    // leaves the two halves of recovery disagreeing about which records a
+    // checkpoint accounts for. Dropping this record strands the entity in the
+    // cell it has already left, with the registrar row saying otherwise.
+    let snap = rekey_at_zero_snapshot(vec![CellId::ROOT], CellId::ROOT).await;
+    let entity = PersistId::new(9);
+    assert_eq!(
+        snap.by_cell.get(&entity),
+        Some(&rekey_destination()),
+        "the rekey at 0:0 must be folded, not skipped as already covered"
+    );
+    assert_eq!(
+        snap.entities
+            .get(&entity)
+            .map(|record| record.components.as_ref()),
+        Some(&b"after"[..]),
+        "and it carries the destination's component image"
+    );
+}
+
+#[tokio::test]
+async fn checkpoint_at_zero_still_vacates_the_source_shard_on_a_rekey_at_zero() {
+    // The same record seen by a node that hosts only the *source* shard: the
+    // destination half is another node's business, so the source removal is
+    // the whole of the fold — and it is a separate coverage check, which the
+    // shared-shard case above cannot observe (there the destination half puts
+    // the entity straight back).
+    let source = rekey_source();
+    let snap = rekey_at_zero_snapshot(vec![source], source).await;
+    let entity = PersistId::new(9);
+    assert!(
+        !snap.by_cell.contains_key(&entity),
+        "the source shard must let go of an entity the rekey at 0:0 moved away"
+    );
+    assert!(
+        !snap.entities.contains_key(&entity),
+        "and must not keep serving its pre-rekey row"
+    );
 }
