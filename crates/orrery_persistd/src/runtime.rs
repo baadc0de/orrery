@@ -270,7 +270,7 @@ impl CellRuntime {
         // Seed every shard from the durable tier first, so the replay below
         // folds only the journal tail past each checkpoint's watermark.
         let mut seeds: HashMap<CellId, RecoveredState> = HashMap::new();
-        let mut ckpt_watermarks: HashMap<CellId, Lsn> = HashMap::new();
+        let mut ckpt_coverage: HashMap<CellId, CheckpointCoverage> = HashMap::new();
         let mut ckpt_epochs: HashMap<CellId, Epoch> = HashMap::new();
         for &shard in &config.shards {
             let loaded = checkpoints
@@ -280,7 +280,7 @@ impl CellRuntime {
                     crate::journal::JournalError::Store(format!("checkpoint load: {error}"))
                 })?;
             if let Some(ckpt) = loaded {
-                ckpt_watermarks.insert(shard, ckpt.watermark);
+                ckpt_coverage.insert(shard, CheckpointCoverage::from_watermark(ckpt.watermark));
                 ckpt_epochs.insert(shard, ckpt.epoch);
                 seeds.insert(
                     shard,
@@ -306,7 +306,10 @@ impl CellRuntime {
         // The freshest journal position folded into each shard's state: the
         // checkpoint watermark advanced by every kept tail record past it.
         // This is the actor's `ckpt_watermark` after open.
-        let mut coverage: HashMap<CellId, Lsn> = ckpt_watermarks.clone();
+        let mut coverage: HashMap<CellId, Lsn> = ckpt_coverage
+            .iter()
+            .filter_map(|(&shard, covered)| covered.through().map(|through| (shard, through)))
+            .collect();
         let stored_records = journal
             .scan_from(Lsn::new(0, 0))
             .collect::<Result<Vec<_>, _>>()?;
@@ -366,7 +369,7 @@ impl CellRuntime {
                 }
                 recover_rekey(
                     &config.shards,
-                    &ckpt_watermarks,
+                    &ckpt_coverage,
                     &mut seeds,
                     &mut coverage,
                     &rekey,
@@ -405,14 +408,16 @@ impl CellRuntime {
             if !gate.admit(shard, rec.epoch) {
                 continue;
             }
-            // The watermark strictly bounds the tail: the checkpoint covers
-            // LSNs `1..=watermark`, but the very first record of a journal is
-            // LSN 0:0 — equal to the absent-checkpoint watermark, not covered
-            // by it. Only filter when a checkpoint exists.
-            let covered_through = ckpt_watermarks.get(&shard).copied();
             // Records at or below the checkpoint watermark are already folded
             // into the seed; only the tail past it is replayed (§3.4 step 3).
-            if covered_through.is_none_or(|w| position > w) {
+            // [`CheckpointCoverage`] is what keeps "covers nothing" distinct
+            // from "covers the record at 0:0" — the first record of a journal
+            // sits at exactly the position an empty checkpoint reports.
+            let covered = ckpt_coverage
+                .get(&shard)
+                .copied()
+                .unwrap_or(CheckpointCoverage::NONE);
+            if !covered.covers(position) {
                 let seed = seeds.entry(shard).or_default();
                 fold(
                     &mut seed.state,
@@ -1017,12 +1022,13 @@ impl CellRuntime {
         })?;
 
         // Load the checkpoint and fold its entity bag and despawn markers
-        // into the actor. The watermark W bounds the replay below; `None` when
-        // there is no checkpoint, meaning the whole journal is the tail.
+        // into the actor. Its coverage bounds the replay below; a shard with
+        // no checkpoint — or one whose watermark covers nothing — has the
+        // whole journal as its tail.
         let mut gate = ReplayGate::new(self.actors.keys().copied().collect());
-        let mut watermark = None;
+        let mut covered = CheckpointCoverage::NONE;
         if let Some(ckpt) = store.load(shard, self.grid).await? {
-            watermark = Some(ckpt.watermark);
+            covered = CheckpointCoverage::from_watermark(ckpt.watermark);
             gate.seed(shard, ckpt.epoch);
             handle
                 .restore_entities(
@@ -1041,13 +1047,13 @@ impl CellRuntime {
         }
 
         // Replay the journal tail, tracking the running maximum epoch (C-2)
-        // and re-verifying crc. Start the scan at the loaded watermark (the
+        // and re-verifying crc. Start the scan at the covered position (the
         // [brief-mandated `scan_from(watermark)`](docs/08-persistence.md §3.4)
-        // bounds the read); the strict `lsn > watermark` filter then keeps the
-        // tail past it. With no checkpoint the watermark is 0:0 and the tail
-        // is the whole journal — except LSN 0:0 itself, the very first record,
-        // which is below no checkpoint and must replay.
-        let scan_from = watermark.unwrap_or(Lsn::new(0, 0));
+        // bounds the read); the coverage filter below then keeps the tail past
+        // it. A checkpoint that covers nothing — none at all, or one whose
+        // watermark is the 0:0 sentinel — scans and replays the whole journal,
+        // first record included.
+        let scan_from = covered.through().unwrap_or(Lsn::new(0, 0));
         let mut replayed = 0usize;
         for item in self.journal.scan_from(scan_from) {
             let stored =
@@ -1088,7 +1094,7 @@ impl CellRuntime {
             if !relevant {
                 continue;
             }
-            if watermark.is_some_and(|w| position <= w) {
+            if covered.covers(position) {
                 continue;
             }
             if let Some(rekey) = rekey {
@@ -1155,6 +1161,75 @@ struct RecoveredState {
     by_cell: HashMap<PersistId, CellId>,
     tombstones: HashMap<PersistId, Tombstone>,
     superseded: HashSet<SupersededRow>,
+}
+
+/// How much of *this node's* journal a loaded checkpoint already accounts for.
+///
+/// The durable `ckpt/{shard}` row stores the watermark as a bare [`Lsn`]
+/// (docs/08-persistence.md §6), an **inclusive** upper bound: recovery replays
+/// `lsn > watermark`. That encoding has no value for "covers nothing" — and
+/// `0:0`, the value every empty checkpoint carries, is also a perfectly valid
+/// record position, because a fresh journal opens at `next_lsn = 0:0` and
+/// `append` stamps that onto the first record it ever stores
+/// (`journal/fjall.rs::next_lsn_after`). Read literally, a `0:0` watermark
+/// therefore swallows the first record of the journal: a checkpoint taken
+/// before the first append, and the row-only load `FdbCheckpointStore` (a
+/// shard seeded by `orrery-seed`, a split child, a lost meta row) synthesises
+/// at `0:0`, both claim coverage they do not have.
+///
+/// This type is the read-side adjudication of that ambiguity, and it resolves
+/// it in the only direction that cannot lose data: **`0:0` means "covers
+/// nothing"**, so position `0:0` is always replayed.
+///
+/// The cost of that choice is bounded and one-sided. When a `0:0` watermark
+/// really did cover the record at `0:0` — a checkpoint taken after exactly one
+/// append — this replays that one record a second time, which is a no-op:
+/// replay is a *state-replacing* fold ([`fold`] assigns `entry.components`, it
+/// never accumulates a delta), so re-folding a covered record re-derives the
+/// same state. The converse mistake is unbounded: the record is gone for good.
+///
+/// **Why not change what is stored.** Making the watermark an `Option<Lsn>`
+/// (or an exclusive bound) would be an at-rest format change to `ckpt/{shard}`
+/// governed by docs/08-persistence.md §16, which versions *component* payloads
+/// and journal/archive records — it has no scheme for the checkpoint meta row
+/// itself, so every existing checkpoint would have to be re-read under a rule
+/// that is not written down. Keeping the at-rest bytes exactly as they are and
+/// fixing the *interpretation* costs nothing at rest: an existing checkpoint
+/// with a non-zero watermark behaves identically, and one with a `0:0`
+/// watermark replays at most one extra, idempotent record.
+///
+/// The complementary fix — never assigning `0:0` to a record, so the sentinel
+/// stops colliding with a real position — belongs to the journal
+/// (`journal/fjall.rs`) and would not retire this rule anyway: journals that
+/// already hold a record at `0:0` outlive the change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CheckpointCoverage(Option<Lsn>);
+
+impl CheckpointCoverage {
+    /// A shard with no checkpoint at all: the whole journal is the tail.
+    const NONE: Self = Self(None);
+
+    /// Interpret a durable watermark, mapping the `0:0` sentinel to "covers
+    /// nothing" per the type docs.
+    fn from_watermark(watermark: Lsn) -> Self {
+        if watermark == Lsn::new(0, 0) {
+            Self::NONE
+        } else {
+            Self(Some(watermark))
+        }
+    }
+
+    /// Whether the checkpoint already folded the record at `position`, i.e.
+    /// whether replay must skip it (§3.4 step 3).
+    fn covers(self, position: Lsn) -> bool {
+        self.0.is_some_and(|through| position <= through)
+    }
+
+    /// The last position known covered, if any — the lower bound a `scan_from`
+    /// may start at without skipping a record that still has to be replayed.
+    fn through(self) -> Option<Lsn> {
+        self.0
+    }
 }
 
 /// The C-2 replay predicate (docs/11-roadmap.md §P2), in one place.
@@ -1240,16 +1315,18 @@ fn deepest_shard(shards: &[CellId], cell: CellId) -> Option<CellId> {
 /// node can seed, repair, or serve, so it is skipped rather than raised.
 fn recover_rekey(
     shards: &[CellId],
-    checkpoint_watermarks: &HashMap<CellId, Lsn>,
+    checkpoint_coverage: &HashMap<CellId, CheckpointCoverage>,
     seeds: &mut HashMap<CellId, RecoveredState>,
     coverage: &mut HashMap<CellId, Lsn>,
     rekey: &EntityRekey,
     lsn: Lsn,
 ) {
     if let Some(source) = deepest_shard(shards, rekey.source_cell) {
-        if checkpoint_watermarks
+        if !checkpoint_coverage
             .get(&source)
-            .is_none_or(|watermark| lsn > *watermark)
+            .copied()
+            .unwrap_or(CheckpointCoverage::NONE)
+            .covers(lsn)
         {
             let seed = seeds.entry(source).or_default();
             seed.state.remove(&rekey.entity);
@@ -1271,9 +1348,11 @@ fn recover_rekey(
         }
     }
     if let Some(destination) = deepest_shard(shards, rekey.destination_cell) {
-        if checkpoint_watermarks
+        if !checkpoint_coverage
             .get(&destination)
-            .is_none_or(|watermark| lsn > *watermark)
+            .copied()
+            .unwrap_or(CheckpointCoverage::NONE)
+            .covers(lsn)
         {
             let seed = seeds.entry(destination).or_default();
             seed.state.insert(
