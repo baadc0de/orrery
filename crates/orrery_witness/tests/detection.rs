@@ -1400,3 +1400,83 @@ fn frames_held_for_a_subject_that_went_quiet_are_swept_and_counted() {
     assert_eq!(counters.frames_recovered, 0, "none of them was ever folded");
     assert!(ledger_balances(&witness));
 }
+
+#[test]
+fn a_watch_whose_first_frame_is_lost_repairs_rather_than_going_blind() {
+    // The whole of P4's coverage deficit, and it is not the deferral path: at
+    // 32 peers under the criterion's impairment profile every peer's coverage
+    // came out at exactly k/7 of the timeline it was shown, k whole watches out
+    // of the seven each peer keeps. A watch judges its subject's entire hour or
+    // none of it, and what decides which is whether the *first* frame after the
+    // anchor arrived.
+    //
+    // Why it used to be none of it: until a frame lands there is no verified
+    // head, so the signature preimage is rebuilt from the anchor claim's head.
+    // A frame that does not chain to it therefore fails its signature check
+    // rather than its chain check — a rejection, not a gap. No repair is asked
+    // for, the head never moves, and every frame after it fails identically for
+    // the rest of the session. `try_reanchor` cannot save it either: resuming
+    // needs a `Catchup`, and no `Catchup` was ever opened.
+    //
+    // The anchor's head is signed by the subject, which is exactly the argument
+    // `try_reanchor` already makes for trusting the head it resumes on. A watch
+    // can therefore be checked from its first frame, and a first frame that
+    // does not chain is what it looks like: a hole.
+    let mut authority = Authority::new(1);
+    let mut witness = watching(WitnessConfig::default(), &mut authority);
+    let mut log = AuthorityLog::default();
+
+    // The frame that would have chained off the anchor never arrives.
+    let lost = authority.send(T0);
+    log.record_frame(
+        lost.frame.clone(),
+        vec![HeadTransition {
+            entity: ENTITY,
+            prev_head: ChainHash::EMPTY,
+            head: ChainHash::EMPTY,
+        }],
+    );
+
+    let second = authority.send(T0 + 3);
+    let opened = witness
+        .ingest_frame(&second.frame, &[])
+        .expect("a frame that does not chain to a signed anchor is a hole, not a forgery");
+    let [WitnessSignal::Gap(request)] = opened.as_slice() else {
+        panic!("expected one gap, got {opened:?}");
+    };
+    let request = request.clone();
+    assert_eq!(
+        request.from_tick.0, T0,
+        "the repair starts at the anchor, which is the earliest point it can"
+    );
+    assert_eq!(
+        witness.counters().frames_rejected,
+        0,
+        "and it was not refused: refusing it is what used to end the watch"
+    );
+    assert_eq!(witness.counters().watches_unanchored, 1, "still blind");
+
+    let served = log.serve_range(&request, usize::MAX);
+    witness
+        .ingest_wire_frames(&served.response.frames, &served.heads)
+        .expect("the repair is well formed");
+
+    assert_eq!(
+        witness.counters().watches_unanchored,
+        0,
+        "the watch anchored off the repair rather than spending the run blind"
+    );
+    assert!(
+        witness.catching_up(ENTITY).is_none(),
+        "and the hole is closed"
+    );
+
+    // And it judges: the frame that revealed the hole was held, not thrown
+    // away, so both it and the repaired one were re-executed.
+    assert_eq!(
+        witness.counters().judged_ticks,
+        6,
+        "two three-tick frames, neither of them lost to the anchor"
+    );
+    assert!(ledger_balances(&witness));
+}

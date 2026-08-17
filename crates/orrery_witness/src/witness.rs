@@ -72,6 +72,19 @@ pub struct WitnessCounters {
     pub frames_accepted: u64,
     /// Frames rejected — bad signature, broken chain, illegal order.
     pub frames_rejected: u64,
+    /// Of those, ones refused by a watch that has never folded anything.
+    ///
+    /// **A watch in this state is finished, and nothing else says so.** Until a
+    /// frame lands there is no verified head, so the preimage is rebuilt from
+    /// the anchor claim's; a frame that does not chain to it therefore fails
+    /// its *signature* check rather than its chain check, which is a rejection
+    /// and not a gap. No repair is asked for, the head never moves, and every
+    /// subsequent frame fails the same way for the rest of the session — while
+    /// [`Self::shown_ticks`] keeps climbing, because the subject is still
+    /// talking. It is the one path to a permanently blind watch that
+    /// re-anchoring cannot reach, since resuming needs a [`Catchup`] that was
+    /// never opened.
+    pub frames_rejected_unanchored: u64,
     /// Frames set aside because a repair for that chain is still outstanding.
     ///
     /// Not a rejection and not an acceptance: the frame was well-formed and the
@@ -140,7 +153,7 @@ pub struct WitnessCounters {
     /// Held frames dropped by the retention sweep before the hole closed.
     ///
     /// A frame held behind a hole is only worth holding while a bundle could
-    /// still be assembled from it, so [`Witness::prune`] evicts the ones that
+    /// still be assembled from it, so the retention sweep evicts the ones that
     /// fell past the floor. That is the right call and it is still a loss: the
     /// ticks those frames carried were counted as shown and will never be
     /// judged, and without this counter they leave the ledger by a door nobody
@@ -148,7 +161,7 @@ pub struct WitnessCounters {
     pub deferrals_pruned: u64,
     /// Held frames that failed verification when the drain re-offered them.
     ///
-    /// [`Witness::drain_deferred`] takes a frame out of the buffer before it
+    /// The drain takes a frame out of the buffer before it
     /// re-offers it, so a frame the second attempt refuses is gone. Refusing it
     /// is correct — it will not verify on a third try either — but the frame is
     /// neither recovered nor still held, and the deferral ledger has to say so.
@@ -160,6 +173,13 @@ pub struct WitnessCounters {
     /// accumulating beside it. One frame in, one frame out — but the frame that
     /// left was counted going in, so the ledger needs the offsetting entry.
     pub deferrals_replaced: u64,
+    /// Watches that have been shown frames and have never folded one.
+    ///
+    /// Not accumulated: a level, filled in by [`Witness::counters`]. Read at
+    /// the end of a run it is the count of watches that spent the session
+    /// blind, and it is the unit the coverage deficit actually comes in — a
+    /// watch either judges its subject's whole timeline or none of it.
+    pub watches_unanchored: u64,
     /// Frames still held behind an open hole when the counters were read.
     ///
     /// Not accumulated: filled in by [`Witness::counters`] from the buffer's
@@ -354,9 +374,13 @@ struct Watched<R: Ruleset> {
     /// Newest subject tick actually folded into the chain, once one has been.
     folded_through: Option<u64>,
     head: ChainHash,
-    /// Whether `head` reflects a verified fold, or is still the value a claim
-    /// seeded. Until the first frame lands there is nothing to detect a gap
-    /// against.
+    /// Whether `head` is a head this witness will check the next frame against.
+    ///
+    /// True from the moment a watch is opened, because a claim's `input_head`
+    /// is the subject's own signed head at the claim's tick — the same
+    /// argument [`Witness::try_reanchor`] makes for the head it resumes on. It
+    /// is only ever false for a watch that has neither an anchor nor a fold,
+    /// which cannot exist.
     anchored: bool,
     claims: BTreeMap<u64, StateClaim>,
     computed: BTreeMap<u64, [u8; 32]>,
@@ -452,9 +476,17 @@ impl<R: Ruleset> Witness<R> {
     /// Frames held per subject while a hole in front of them is repaired.
     ///
     /// A repair round trip is [`Self::REPAIR_TIMEOUT_TICKS`] of the subject's
-    /// timeline; at the three-tick frames the 20 Hz send cadence cuts that is
-    /// twenty frames, and the cap is set above it so an answer that arrives on
-    /// time never finds the buffer already full.
+    /// timeline. The number was chosen against the three-tick frames the 20 Hz
+    /// send cadence used to cut — twenty of them in that window, with the cap
+    /// set above it so an answer arriving on time never found the buffer
+    /// already full. Frames now cover ten ticks at 6 Hz
+    /// ([`crate::plugin::frame_interval_ticks`]), which is six frames in the same window, so the
+    /// cap has five times the headroom it was sized for. Measured over the
+    /// criterion's impaired hour at 32 peers it is never reached: not one
+    /// overflow at either end of the 3–5% loss band. Left where it is rather
+    /// than tightened — a cap that never binds costs a bounded buffer's worth
+    /// of memory and nothing else, and the cadence is derived from a budget
+    /// share that can move again.
     const MAX_DEFERRED_FRAMES: usize = 32;
 
     /// Repairs asked for without the hole closing before the subject is
@@ -520,6 +552,11 @@ impl<R: Ruleset> Witness<R> {
     pub fn counters(&self) -> WitnessCounters {
         WitnessCounters {
             deferrals_held: self.deferred.len() as u64,
+            watches_unanchored: self
+                .watched
+                .values()
+                .filter(|watched| watched.newest_seen.is_some() && watched.folded_through.is_none())
+                .count() as u64,
             ..self.counters
         }
     }
@@ -588,7 +625,23 @@ impl<R: Ruleset> Witness<R> {
                 newest_seen: None,
                 folded_through: None,
                 head: watch.anchor.input_head,
-                anchored: false,
+                // Checked from the very first frame, not from the second.
+                //
+                // Taking the first frame on faith looks harmless and ends the
+                // watch: with no head to check against, the signature preimage
+                // is rebuilt from the anchor's head anyway, so a frame that
+                // does not chain to it fails *verification* instead of gap
+                // detection. That is a rejection, which asks for no repair and
+                // moves no head — so every frame after it fails identically,
+                // for the life of the watch, while the coverage denominator
+                // keeps climbing. `try_reanchor` cannot rescue it either: it
+                // resumes a [`Catchup`], and no `Catchup` was ever opened.
+                //
+                // Measured at 32 peers over the criterion's impaired hour, that
+                // was the entire coverage deficit and nothing else was: every
+                // peer judged exactly k of its seven watches in full and the
+                // rest not at all — 9 dead watches of 224 at 3% loss, 14 at 5%.
+                anchored: true,
                 claims,
                 computed: BTreeMap::new(),
                 recent: BTreeMap::new(),
@@ -865,7 +918,7 @@ impl<R: Ruleset> Witness<R> {
                 prev_heads.push(watched.head);
             } else {
                 let Some(pair) = sibling_heads.get(sibling_cursor) else {
-                    self.counters.frames_rejected += 1;
+                    self.count_rejection(&entities);
                     return Err(WitnessError::FrameRejected);
                 };
                 sibling_cursor += 1;
@@ -875,7 +928,7 @@ impl<R: Ruleset> Witness<R> {
 
         let transitions =
             orrery_core::log::verify_frame(frame, subject, &prev_heads).map_err(|_| {
-                self.counters.frames_rejected += 1;
+                self.count_rejection(&entities);
                 WitnessError::FrameRejected
             })?;
         self.counters.frames_accepted += 1;
@@ -924,6 +977,23 @@ impl<R: Ruleset> Witness<R> {
         // how one hole becomes a queue of them.
         signals.extend(self.drain_deferred(subject));
         Ok(signals)
+    }
+
+    /// Count a refused frame, and separately when it was refused by a watch
+    /// that has never folded anything.
+    ///
+    /// The distinction is the whole point: an ordinary rejection is one bad
+    /// frame, and a rejection against an unanchored watch is a watch that will
+    /// reject every frame it is ever shown.
+    fn count_rejection(&mut self, entities: &[PersistId]) {
+        self.counters.frames_rejected += 1;
+        if entities.iter().any(|entity| {
+            self.watched
+                .get(entity)
+                .is_some_and(|watched| watched.folded_through.is_none())
+        }) {
+            self.counters.frames_rejected_unanchored += 1;
+        }
     }
 
     /// Hold a frame that could not chain, so the repair in front of it does not

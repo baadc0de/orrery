@@ -335,10 +335,22 @@ fn main() -> Result<()> {
             report.total_frames_deferred,
             report.total_judgements_deferred,
         );
+        // The two ways a witness loses timeline, printed apart because they are
+        // not the same failure. A watch that never anchored loses its subject's
+        // *whole* run and asks for nothing while it does; a deferral loses at
+        // most the frames a repair did not overtake. Reading the deficit
+        // against the wrong one is how it stayed unattributed.
+        eprintln!(
+            "p1-swarm: {} watches never folded a frame ({} frames refused, {} of them by a \
+             watch with no anchor); each is its subject's whole timeline shown and none judged",
+            report.total_watches_unanchored,
+            report.total_frames_rejected,
+            report.total_frames_rejected_unanchored,
+        );
         // Coverage is one minus what is in flight through repair, so the line
         // above is only half a finding without this one: it says how much was
         // missed, and this says where it went. A deficit that cannot be spent
-        // against these six columns is a deficit with an unnamed cause.
+        // against these seven columns is a deficit with an unnamed cause.
         eprintln!(
             "p1-swarm: of {} deferred frames — {} recovered, {} stale, {} overflowed, \
              {} pruned, {} dropped in drain, {} replaced, {} still held; ledger {}",

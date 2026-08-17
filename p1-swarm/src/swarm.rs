@@ -106,6 +106,18 @@ pub struct PeerReport {
     pub judged_ticks: u64,
     /// Subject ticks it was shown, judged or not — the coverage denominator.
     pub shown_ticks: u64,
+    /// Frames it refused: bad signature, broken chain, illegal order.
+    pub frames_rejected: u64,
+    /// Of those, ones refused by a watch that had never folded anything —
+    /// a watch that will refuse every frame it is shown for the rest of the
+    /// run, and asks for no repair while it does.
+    pub frames_rejected_unanchored: u64,
+    /// Watches that were shown frames and never folded one.
+    ///
+    /// The unit the coverage deficit comes in: a watch judges its subject's
+    /// whole timeline or none of it, so this times the run length is the
+    /// deficit, to the tick.
+    pub watches_unanchored: u64,
     /// Frames it could not chain because a repair was outstanding.
     pub frames_deferred: u64,
     /// Of those, ones dropped because the subject's deferral buffer was full.
@@ -222,6 +234,12 @@ pub struct SwarmReport {
     pub total_judged_ticks: u64,
     /// Subject ticks shown to a witness, judged or not.
     pub total_shown_ticks: u64,
+    /// Frames refused across the swarm.
+    pub total_frames_rejected: u64,
+    /// Of those, ones refused by a watch that had never folded anything.
+    pub total_frames_rejected_unanchored: u64,
+    /// Watches across the swarm that were shown frames and never folded one.
+    pub total_watches_unanchored: u64,
     /// Frames set aside across the swarm because a repair was outstanding.
     pub total_frames_deferred: u64,
     /// Claim comparisons correctly declined while catching up.
@@ -801,6 +819,9 @@ impl Swarm {
                     unjudged_ticks: witness.unjudged_ticks,
                     judged_ticks: witness.judged_ticks,
                     shown_ticks: witness.shown_ticks,
+                    frames_rejected: witness.frames_rejected,
+                    frames_rejected_unanchored: witness.frames_rejected_unanchored,
+                    watches_unanchored: witness.watches_unanchored,
                     frames_deferred: witness.frames_deferred,
                     deferrals_overflowed: witness.deferrals_overflowed,
                     deferrals_pruned: witness.deferrals_pruned,
@@ -869,6 +890,12 @@ impl Swarm {
             total_unjudged_ticks: per_peer.iter().map(|p| p.unjudged_ticks).sum(),
             total_judged_ticks: per_peer.iter().map(|p| p.judged_ticks).sum(),
             total_shown_ticks: per_peer.iter().map(|p| p.shown_ticks).sum(),
+            total_frames_rejected: per_peer.iter().map(|p| p.frames_rejected).sum(),
+            total_frames_rejected_unanchored: per_peer
+                .iter()
+                .map(|p| p.frames_rejected_unanchored)
+                .sum(),
+            total_watches_unanchored: per_peer.iter().map(|p| p.watches_unanchored).sum(),
             total_frames_deferred: per_peer.iter().map(|p| p.frames_deferred).sum(),
             total_judgements_deferred: per_peer.iter().map(|p| p.judgements_deferred).sum(),
             total_deferrals_overflowed: per_peer.iter().map(|p| p.deferrals_overflowed).sum(),
@@ -1191,6 +1218,9 @@ mod tests {
             total_unjudged_ticks: 0,
             total_judged_ticks: 3_864_390,
             total_shown_ticks: 4_026_190,
+            total_frames_rejected: 0,
+            total_frames_rejected_unanchored: 0,
+            total_watches_unanchored: 0,
             total_frames_deferred: 0,
             total_judgements_deferred: 0,
             total_deferrals_overflowed: 0,
