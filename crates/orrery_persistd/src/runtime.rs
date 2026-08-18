@@ -40,9 +40,10 @@ pub(crate) struct EntityStripeGates {
     stripes: [Arc<tokio::sync::Mutex<()>>; ENTITY_STRIPE_COUNT],
     /// Per-stripe count of *completed* entity migrations.
     ///
-    /// This is the invalidation half of the gate. The gate's job (docs
-    /// §3.6) is that an entity's committed location is read and acted on
-    /// atomically with respect to a migration of that entity — and
+    /// This is the invalidation half of the gate. The gate's job
+    /// (docs/08-persistence.md §2.1) is that an entity's committed location
+    /// is read and acted on atomically with respect to a migration of that
+    /// entity — and
     /// `LeaseStore::migrate`, reached only from `CommittedRekeyPlan::execute`
     /// under this same gate, is the only operation that ever changes that
     /// location (`put` refuses to overwrite a different existing one). A

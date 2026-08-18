@@ -86,13 +86,19 @@ pub struct RouteStageSnapshot {
     pub mailbox_us_sum: u64,
     /// Longest single actor round trip.
     pub mailbox_us_max: u64,
-    /// Batched lease operations that took a whole set of entity gates at once.
+    /// Multi-gate acquisitions by a batched lease operation.
+    ///
+    /// One per *actor group*, not one per batch: `heartbeat_leases` takes a
+    /// group's gates around its own mailbox turn and releases them before the
+    /// next group's, so a batch that used to be one 77-gate lock is now many
+    /// one-gate locks. Compare `batch_hold_us_sum` and this counter together
+    /// — a rise here with a fall there is the whole point, not a regression.
     pub batch_locks: u64,
-    /// Total gates those batches held (summed set sizes).
+    /// Total gates those acquisitions held (summed set sizes).
     pub batch_gates_sum: u64,
-    /// Summed time a batch held its whole gate set.
+    /// Summed time an acquisition held its gate set.
     pub batch_hold_us_sum: u64,
-    /// Longest single batch hold.
+    /// Longest single hold.
     pub batch_hold_us_max: u64,
 }
 

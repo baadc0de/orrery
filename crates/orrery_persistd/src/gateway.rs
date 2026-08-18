@@ -306,6 +306,14 @@ const MAX_INGRESS_QUEUE_WAIT_US: u64 = 25_000;
 /// away either; it moved from the receive loop onto the entity stripes, where
 /// the offloaded lease lane can now contend with live diff traffic.
 ///
+/// **That gate hold has since been removed** (docs/08-persistence.md §2.1.1:
+/// `heartbeat_leases` resolves locations with no gate held and takes gates
+/// per actor group around the mailbox turn alone). On the same gate the
+/// entity-gate wait is now 0.011–0.015 ms mean / 5–21 ms max with this valve
+/// **off**, and `shed_slow_route` was 0 on every run at every budget down to
+/// 25 ms — this valve no longer fires on the P2 workload. It is retained as a
+/// bound for workloads that study did not run, not because that one needs it.
+///
 /// A deadline only bounds a wait it is evaluated *after*, so this one is
 /// evaluated around the whole router round trip, against the diff's age since
 /// arrival — the same clock and the same budget as the ingress check, applied

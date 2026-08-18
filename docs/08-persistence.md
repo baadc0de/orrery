@@ -166,7 +166,50 @@ The mechanism behind the curve's shape is worth stating, because it is why a *ge
 
 **What this does not fix.** The gate still fails, and now on someone else's number. In every valved run `bulk_ack_ms` p99 tracks `journal_commit_ms` p99 within one histogram bucket (20/10, 150/150, 40/30, 15/15, 20/20, 30/10, 50/30, 75/50, 150/75) — with the entity gate bounded, the residual client-observed tail *is* the group committer, whose own D16 target is 2 ms and which missed it on every run in this study, before and after. That is `journal/**`, frozen to this lane, so it is reported here rather than fixed. Nothing on this curve reaches the 5 ms `bulk_ack_ms` D16 target, and no setting of this valve can: the valve cannot bound a wait that begins after the record is durable.
 
-The underlying defect is also still there, only bounded: the diff write path takes a per-entity mutex and then performs an **FDB read transaction under it** (`LeaseStore::locate`, 0.40 ms mean — 98 % of the diff path's own gate hold), and the batched heartbeat path performs one such read *per entity* while holding that entity's whole batch of gates. Getting the locate out from under the gate — a cached location invalidated by the (server-only) rekey path — would shrink the queue rather than shed into it, and would plausibly move the whole curve down. It touches `runtime.rs` and `lease.rs` and is a separate change.
+The underlying defect was still there, only bounded: the diff write path takes a per-entity mutex and then performs an **FDB read transaction under it** (`LeaseStore::locate`, 0.40 ms mean — 98 % of the diff path's own gate hold), and the batched heartbeat path performed one such read *per entity* while holding that entity's whole batch of gates. That is what the next paragraph removes.
+
+### 2.1.1 Taking the entity gate off the read path
+
+**What the gate protects, before moving anything out from under it.** Every lease path in `cluster.rs` follows one shape: take the entity's stripe gate, resolve the entity's committed cell, act on the actor that owns it (`claim_lease`, `heartbeat_lease`, `validate_lease`, `park_lease`, `apply_fenced`, and `gated_mutex_actor` for the `Mutex<CellRuntime>` router). The migration side, `commit_rekey`, takes **one** gate — the entity's — and holds it across `CommittedRekeyPlan::execute`, which journals the rekey, calls `LeaseStore::migrate`, and installs the entity at the destination actor. The invariant is therefore narrower than "one writer per entity": the actors already serialise per entity in their own mailboxes. It is that **an entity's committed location is read, and acted on, atomically with respect to a migration of that entity** — and `migrate`, reached only from `execute` under that gate, is the *only* operation that ever changes that location (`LeaseStore::put` refuses to overwrite a different existing one and answers `LocationConflict` instead). The gate does not make the read possible; it makes the read's answer still true when it is used.
+
+That is a property a counter can prove after the fact. `EntityStripeGates` now carries a per-stripe count of completed migrations, bumped inside `execute` immediately after `migrate` while the gate is still held. A reader samples the counter **before** it locates and re-reads it once it holds the gate: unchanged means no migration completed in the window, so the location read outside the gate is the one the gate would have shown. Changed sends that one entry down the original shape — gate held across its own `locate` — rather than routing it to an actor that no longer owns the entity. `heartbeat_leases` therefore resolves every location with **no gate held at all**, and then takes gates **per actor group**, around one mailbox turn and nothing else, still in `lock_entity_gates`'s deduplicated stripe order so no new multi-gate acquisition can cycle. `tests/heartbeat_gate_hold.rs` pins both halves: a single-entity renewal for an entity *inside* a parked batch must still get its gate, and an entity migrated while the batch is parked must be re-resolved rather than answered `None`.
+
+**Measured.** Six configurations, three interleaved runs each, one box, one pair of binaries differing only in this change, 30 s / 125 sessions / 10 000 entities / 128 shards. Per fenced apply:
+
+| leg | budget | entity-gate wait | `LeaseStore::locate` | actor mailbox | `router_apply` | `journal_wait` |
+|---|---|---|---|---|---|---|
+| before | off | 7.56–8.64 ms (max 2.08–2.17 s) | 0.39–0.44 ms | 0.006 ms | 8.11–9.16 ms | 2.33–3.29 ms |
+| before | 50 ms | 0.75–0.80 ms (max 50 ms) | 0.39–0.44 ms | 0.006 ms | 1.21 ms | 2.32–2.41 ms |
+| before | 25 ms | 0.51–0.53 ms (max 26 ms) | 0.40–0.42 ms | 0.006 ms | 0.93–0.97 ms | 2.34–2.91 ms |
+| **after** | **off** | **0.011–0.015 ms** (max 5.3–20.6 ms) | 0.48–0.50 ms | 0.006 ms | **0.50–0.53 ms** | 2.27–2.43 ms |
+| after | 50 ms | 0.012–0.013 ms (max 4.9–6.3 ms) | 0.47–0.48 ms | 0.007 ms | 0.50–0.51 ms | 2.41–2.68 ms |
+| after | 25 ms | 0.011–0.013 ms (max 4.3–12.3 ms) | 0.47–0.50 ms | 0.006 ms | 0.49–0.52 ms | 2.55–2.85 ms |
+
+The gate wait falls by **~600×** in the mean and from 2.1 s to 5–21 ms at the max, with the valve *off* — that is, without shedding anything. `locate` costs the same 0.4–0.5 ms it always did; it is simply no longer anyone else's wait. `router_apply` is now `locate` plus 20 µs.
+
+And the batch hold that caused it:
+
+| leg | batch locks / run | gates per lock | hold mean | hold max |
+|---|---|---|---|---|
+| before | 1 125 | 77.0 | 16.17–16.32 ms | 39–63 ms |
+| after | 90 000 | 1.0 | 0.012–0.015 ms | 1.1–2.3 ms |
+
+Read the first column with the second: the *lock* is now the per-actor-group acquisition, so one heartbeat that used to be a single 77-gate lock is many small ones. The comparable quantity is gate-microseconds and the blocking window per stripe: 1 125 × 77 gates held 16.3 ms each becomes 90 000 × 1 gate held 0.014 ms each — the same gates, taken for **1 100× less time each**. Note also what "1.0 gates per lock" says about the fold: on this workload a peer's 77 entities sit in 77 distinct shards, so `group_by_actor` produces 77 singleton groups and buys no mailbox batching here. That is unchanged by this work and is why folding was never where the cost was.
+
+**The re-measured trade curve**, same runs, "shed" being `shed_slow_route` over offers (`shed_stale` and `shed_saturated` were 0 on all 18 runs):
+
+| leg | route budget | shed | `bulk_ack_ms` p99 | durable acks |
+|---|---|---|---|---|
+| before | off | 0 % | 200 / 150 / 200 ms | 540.3–541.5 k |
+| before | 50 ms | 1.29–1.52 % | 30 / 30 / 30 ms | 532.9–534.1 k |
+| before | 25 ms | 1.82–2.22 % | 20 / 20 / 30 ms | 529.1–530.8 k |
+| **after** | **off** | **0 %** | **15 / 15 / 15 ms** | **540.9–541.3 k** |
+| after | 50 ms | 0 % | 15 / 15 / 15 ms | 540.5–541.4 k |
+| after | 25 ms | 0 % | 15 / 20 / 20 ms | 540.9–541.4 k |
+
+**There is no curve left to sit on.** `off` after the change dominates every point before it on all three axes at once — it sheds nothing, answers in 15 ms at p99, and durably acknowledges more diffs than any valved run of the old code. The monotone trade the previous section described was a trade against the gate hold, and with the hold gone the valve does not fire: at a 25 ms budget, the tightest setting measured here, `shed_slow_route` was **0 on every run**, because the gate wait it is watching never comes near 25 ms any more. So the valve is no longer load-bearing on this workload, and the honest reading is that its default is now a policy choice with no measured cost either way — inert at 25 ms, and inert at `off`. It is kept enabled at 25 ms as a bound for the workloads this study did not run, not because anything here needs it; the case for disabling it by default is that a valve that never fires is a valve nobody has tested.
+
+**What is left is the committer, and only the committer.** After the change `bulk_ack_ms` p99 equals `journal_commit_ms` p99 exactly on every run (15/15, 15/15, 15/15 at `off`; 15/15, 20/20, 20/15 at 25 ms), against a 2 ms D16 target for the commit itself. The client-observed bulk tail is now entirely the group commit path — `journal/**`, frozen to this lane and reported rather than fixed.
 
 **Epoch-fenced acks (split-brain guard).** An actor may issue durable acks only while its shard-ownership epoch (§3.4) is **confirmed fresh**: it heartbeats an FDB read version roughly every **1 s** and treats its epoch as stale after a **3 s staleness bound** — deliberately below the failure-detection + re-placement time, so a partitioned former owner falls silent before a replacement can be fenced in and serving. While stale, the actor downgrades to **provisional acks**, which the client treats as unacked (kept buffered, resent to the new owner). Every `JournalRecord` carries the epoch it was appended under, so recovery replay discards records from a superseded epoch; §4.1 quantifies the residual window.
 
