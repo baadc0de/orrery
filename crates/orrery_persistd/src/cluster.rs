@@ -490,6 +490,43 @@ pub trait Router: Send + Sync {
     }
 }
 
+/// The pre-change fenced-apply implementation, retained as a differential
+/// oracle.
+///
+/// This is a verbatim copy of what `<CellRuntime as Router>::apply_fenced`
+/// did before the bulk write path stopped reading FoundationDB: take the
+/// entity gate, resolve the route with one `LeaseStore::locate`, ask the
+/// actor that owns the resolved cell. It exists so a test can assert the two
+/// implementations return the same discriminant **and** the same
+/// `Option<Lease>` payload over an enumerated state matrix — the accept-set
+/// equivalence argument turned into a checked fact rather than a comment.
+///
+/// Not `#[cfg(test)]`: the matrix that uses it is an integration test, and
+/// the same matrix has to run under both `MemLeaseStore` (default features)
+/// and `FdbLeaseStore` (`--features fdb`). Nothing in `persistd` calls it.
+impl CellRuntime {
+    #[doc(hidden)]
+    pub async fn apply_fenced_via_locate(
+        &self,
+        record: JournalRecord,
+        holder: NodeId,
+        lease_id: LeaseId,
+        authority_seq: orrery_protocol::SeqPair,
+        now_ms: u64,
+    ) -> Result<FencedApply, Reject> {
+        let gate = self.entity_gate(record.grid, record.entity);
+        let _guard = gate.lock_owned().await;
+        let route_cell = self
+            .lease_location(record.entity)
+            .await?
+            .unwrap_or(record.cell);
+        self.actor(record.grid, route_cell)
+            .ok_or(Reject::JournalClosed)?
+            .start_fenced_diff(record, holder, lease_id, authority_seq, now_ms)
+            .await
+    }
+}
+
 /// A router over a single runtime (one-node deployment).
 ///
 /// Direct dispatch into the actor mailbox without lock acquisition, pipelining
