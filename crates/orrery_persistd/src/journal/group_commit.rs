@@ -48,8 +48,15 @@ pub enum AdaptiveCommitMode {
 pub struct GroupCommitConfig {
     /// The commit mode.
     pub mode: AdaptiveCommitMode,
-    /// Optional time to accumulate a batch under load. The production default
-    /// is zero; deterministic tests can still request a non-zero window.
+    /// Optional time to accumulate a batch under load.
+    ///
+    /// [`Default`] is zero — but zero is *not* what production runs, and the
+    /// difference has misdirected one investigation already. Every `Journal`
+    /// `persistd` opens (primary, follower, promotion recovery) overrides this
+    /// to 200 µs, so the deployment the P2 gate measures has a timer in the
+    /// commit path and the `Default` used by the measurement rigs does not.
+    /// [`apply_batch_window_override`] makes the value settable at run time so
+    /// the two can be compared without a rebuild per point.
     pub batch_window: Duration,
     /// Hard cap on records per batch (prevents unbounded batches).
     pub batch_max_records: usize,
@@ -259,6 +266,7 @@ pub(crate) fn spawn_committer(
     recovered_committed: Option<Lsn>,
     metrics: Arc<JournalCommitMetrics>,
 ) -> CommitterHandle {
+    let config = apply_batch_window_override(config);
     let state = Arc::new(CommitterState {
         config,
         queue: CommitQueue::new(),
@@ -281,6 +289,41 @@ pub(crate) fn spawn_committer(
         .expect("spawn journal committer thread");
 
     CommitterHandle { state }
+}
+
+/// Environment override for [`GroupCommitConfig::batch_window`], in
+/// microseconds (`ORRERY_JOURNAL_BATCH_WINDOW_US`).
+///
+/// The batch window is the one group-commit constant whose best value is a
+/// property of the *device and the arrival rate*, not of the code: it trades
+/// the p50 of a lone append against the fsync rate the store has to sustain,
+/// and the crossover between the two moves with both. Every embedding of the
+/// journal — `persistd`, the actor runtime, the measurement rigs — carries its
+/// own literal, so a sweep otherwise costs one rebuild per point and cannot be
+/// interleaved with a baseline on a box whose runs vary. Reading it here, at
+/// the one place every embedding funnels through, makes the window measurable
+/// in situ; absent the variable the caller's value is used unchanged.
+///
+/// `0` is a meaningful setting (take whatever is queued, no timer), so an
+/// absent or unparseable value is the only thing that falls through.
+fn apply_batch_window_override(mut config: GroupCommitConfig) -> GroupCommitConfig {
+    if let Some(window) = parse_batch_window(std::env::var(BATCH_WINDOW_ENV).ok().as_deref()) {
+        config.batch_window = window;
+    }
+    config
+}
+
+/// The variable [`apply_batch_window_override`] reads.
+const BATCH_WINDOW_ENV: &str = "ORRERY_JOURNAL_BATCH_WINDOW_US";
+
+/// Parse the override's *value*, separately from reading it.
+///
+/// Split out so the contract is testable without a process-global write:
+/// `set_var` in one test races every other test in the binary that opens a
+/// journal, and the committer this configures is exactly what those tests
+/// exercise.
+fn parse_batch_window(raw: Option<&str>) -> Option<Duration> {
+    raw?.trim().parse::<u64>().ok().map(Duration::from_micros)
 }
 
 fn run_committer(state: Arc<CommitterState>, commit: CommitFn) {
@@ -447,6 +490,47 @@ mod tests {
         let config = GroupCommitConfig::default();
         assert_eq!(config.mode, AdaptiveCommitMode::Adaptive);
         assert_eq!(config.batch_window, Duration::ZERO);
+    }
+
+    #[test]
+    fn batch_window_override_parses_zero_and_rejects_junk() {
+        // `0` is the adaptive no-timer setting and must survive the parse: an
+        // `unwrap_or_default`-style fallback or a `> 0` guard would silently
+        // turn "flush what is queued" into "keep the caller's window", which
+        // is the one value a sweep most needs to be able to ask for.
+        assert_eq!(parse_batch_window(Some("0")), Some(Duration::ZERO));
+        assert_eq!(
+            parse_batch_window(Some("2000")),
+            Some(Duration::from_micros(2000))
+        );
+        assert_eq!(
+            parse_batch_window(Some(" 500 ")),
+            Some(Duration::from_micros(500))
+        );
+        // Absent or unreadable leaves the caller's value alone -- signalled by
+        // `None`, never by a zero window, which would be an fsync per wake.
+        assert_eq!(parse_batch_window(None), None);
+        assert_eq!(parse_batch_window(Some("")), None);
+        assert_eq!(parse_batch_window(Some("2ms")), None);
+        assert_eq!(parse_batch_window(Some("-1")), None);
+    }
+
+    #[test]
+    fn batch_window_override_replaces_the_callers_window() {
+        // The override has to reach a config whose window is already non-zero:
+        // `persistd` passes 200 us, not the `Default` zero, so an override
+        // applied only to a defaulted field would be inert in the one binary
+        // the gate measures.
+        let config = GroupCommitConfig {
+            batch_window: Duration::from_micros(200),
+            ..GroupCommitConfig::default()
+        };
+        let mut overridden = config.clone();
+        if let Some(window) = parse_batch_window(Some("2000")) {
+            overridden.batch_window = window;
+        }
+        assert_eq!(config.batch_window, Duration::from_micros(200));
+        assert_eq!(overridden.batch_window, Duration::from_micros(2000));
     }
 
     #[tokio::test]
