@@ -3329,7 +3329,7 @@ fn spawn_boundary_reporter(metrics: Arc<GatewayMetrics>) {
             route_stage_cursor = route_stage;
             if route_delta.applies > 0 || route_delta.batch_locks > 0 {
                 out.push_str(&format!(
-                    "{{\"type\":\"{}\",\"applies\":{},\"gate_wait_us_sum\":{},\"gate_wait_us_max\":{},\"locate_us_sum\":{},\"locate_us_max\":{},\"mailbox_us_sum\":{},\"mailbox_us_max\":{},\"batch_locks\":{},\"batch_gates_sum\":{},\"batch_hold_us_sum\":{},\"batch_hold_us_max\":{},\"mailbox_turns\":{},\"locate_fallbacks\":{},\"location_audits\":{},\"location_mismatches\":{}}}\n",
+                    "{{\"type\":\"{}\",\"applies\":{},\"gate_wait_us_sum\":{},\"gate_wait_us_max\":{},\"locate_us_sum\":{},\"locate_us_max\":{},\"mailbox_us_sum\":{},\"mailbox_us_max\":{},\"batch_locks\":{},\"batch_gates_sum\":{},\"batch_hold_us_sum\":{},\"batch_hold_us_max\":{},\"mailbox_turns\":{},\"locate_fallbacks\":{},\"location_audits\":{},\"location_mismatches\":{},\"location_audit_errors\":{},\"location_audit_us_sum\":{},\"location_audit_us_max\":{}}}\n",
                     ROUTE_STAGE_RECORD_KIND,
                     route_delta.applies,
                     route_delta.gate_wait_us_sum,
@@ -3346,6 +3346,9 @@ fn spawn_boundary_reporter(metrics: Arc<GatewayMetrics>) {
                     route_delta.locate_fallbacks,
                     route_delta.location_audits,
                     route_delta.location_mismatches,
+                    route_delta.location_audit_errors,
+                    route_delta.location_audit_us_sum,
+                    route_delta.location_audit_us_max,
                 ));
             }
             ingress_cursor = ingress;

@@ -308,13 +308,58 @@ actor admitting a write against a registrar row that is not the durably
 located one. So a **sampled audit** ships: one in `ORRERY_FENCED_LOCATION_AUDIT_N`
 accepted fenced diffs (default 1000 in release, **1** under
 `debug_assertions`, so the whole test suite audits every accept) still
-performs the locate, under the gate it was accepted with, and increments
-`location_mismatches` with a `warn!` when the durable location falls outside
-the accepting actor's shard. **That counter must be zero.** It rides the
-`gateway_route_stage` boundary record with two others: `locate_fallbacks`,
-which is structurally ~0 because `strict_authority` pins `record.cell` at the
-grant cell for the entity's life, and `mailbox_turns`, whose ratio to
-`applies` must sit at 1.0 and can never exceed 2.0.
+performs the locate and increments `location_mismatches` with a `warn!` when
+the durable location falls outside the accepting actor's shard. **That counter
+must be zero.** Three properties of the audit are load-bearing, and each is
+pinned by a test rather than asserted here:
+
+* **It runs with the entity gate released.** Only the *decision* to sample is
+  made under the gate. An audit is a FoundationDB read, and the first version
+  ran it inside the critical section, after `RouteStageMetrics::record` — so
+  it was excluded from all three stage timers and its cost came back as the
+  *next* diff's `gate_wait_us`. At a 5 ms locate with eight concurrent accepts
+  on one entity that measured `applies=8 locate_us_sum=0 gate_wait_us_sum=171433`
+  for a 49.5 ms wall. `tests/fenced_route_audit_gate.rs` reproduces the shape
+  at a 25 ms locate and fails at 732 ms of `gate_wait_us_sum` if the audit is
+  moved back inside.
+* **Releasing the gate does not weaken it.** The sample can no longer be
+  pinned to its accept by holding the gate, so it is pinned the way
+  `heartbeat_leases` phase 1 pins its own off-gate reads (§2.1.1): the
+  entity's stripe migration counter is read under the gate and re-read after
+  the locate, and a sample that straddled a migration is discarded rather than
+  judged. `location_mismatches` therefore has no known false-positive source
+  — which is what lets it stay a stop-ship number.
+* **No locate outcome is invisible.** `location_audits` counts samples that
+  reached a verdict; `location_audit_errors` counts samples that did not — a
+  store error, a discarded straddling sample, *and* `locate` answering `None`.
+  `None` belongs with the failures: an accepted fenced diff has a live
+  registrar row, a row is only granted through `claim_lease`, and `claim_lease`
+  writes the location key in the same call, so a missing key means the audit
+  read nothing, not that it read agreement. Folding it into the clean count
+  would let a lease store that has lost its location index report health
+  forever. The two buckets are disjoint and exhaustive, so `location_audits
+  == 0` while accepts flow is itself the alarm that the audit stopped running.
+
+Its cost is its own stage, `location_audit_us_sum` / `_max`, deliberately not
+folded into `locate_us`: `locate_us` is the route's own read, on the critical
+path of the routing decision, and mixing a background sample into it would
+make "the route reads nothing" unfalsifiable from the counters. **The
+sampling rate stays at 1 in 1000.** At the 99 k diffs/s this change sustains
+(§2.1.3) that is ~99 locates/s against the ~99 000/s it removed — 0.1 %. §5.1
+of [14-capacity.md](14-capacity.md) measured the FDB client thread at 25.8 %
+of a core while serving ~18 000 locates/s, i.e. ~14 µs of that thread each, so
+99/s is ~0.14 % of one core: below the noise floor of every other number in
+this document, and with the reads off the gate it buys no latency at all.
+Lowering it buys nothing measurable; raising it trades away the only
+production evidence that J holds.
+
+So the section title is exact only with that footnote. **FoundationDB is off
+the bulk *routing* path — every accepted fenced diff, without exception —
+and off the bulk write path but for a 0.1 % audit sample that runs after the
+entity gate is released and is counted in a stage of its own.** The
+`gateway_route_stage` boundary record carries the audit counters next to
+`locate_fallbacks` and `mailbox_turns`, whose ratio to `applies` must sit at
+1.0 and can never exceed 2.0.
 
 **Out of scope, deliberately.** `Cluster::apply_fenced` keeps its locate:
 `committed_entity_cell` there is doing real cross-runtime routing — the
