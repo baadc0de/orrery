@@ -510,25 +510,47 @@ silently, leaving you on the 50 GiB default while your config claims otherwise.
 `cache.auto_gc` is on by default and enforces the cap opportunistically, so the
 local stores look after themselves.
 
-The shared remote does not: `kache gc` evicts the local stores only, so a
-filesystem remote grows without bound. `kache-prune-shared.timer` holds it under
-a size cap (80 GiB, hourly) by evicting least-recently-read objects. Deleting
-them is always safe — they are content-addressed and immutable, so a pruned
-object is a cache miss and nothing worse.
+The shared remote does not: `kache gc` evicts the local stores only, and neither
+`CacheFileConfig` nor `RemoteFileConfig` has a remote size or retention key, so a
+filesystem remote grows without bound. Reported upstream as
+[kache#774](https://github.com/kunobi-ninja/kache/issues/774); until it lands,
+`kache-prune-shared.timer` holds it under a size cap (80 GiB, hourly) by evicting
+least-recently-read objects. Deleting them is always safe — they are
+content-addressed and immutable, so a pruned object is a cache miss and nothing
+worse.
 
 **Size, not age**, and the first version got this wrong. An age policy cannot
 fire on a cache that is being read continuously: the remote reached 319 GiB in a
 single day with **zero** objects untouched for even 24 hours, because every
 build re-reads the whole hot set. The disk hit 94% before anyone noticed.
 
-**`kache gc` leaks blobs.** Measured 2026-08-18 on kache 0.14.2: after a gc that
-evicted all 456 entries, `kache stats` reported `Store: 0 B (0 entries)` while
-`~/.cache/kache/store/blobs` still held **37 GB**. The index row goes, the
-content-addressed blob stays. Both local stores were 10x their accounted size.
-Until that is fixed upstream, treat the reported store size as a lower bound and
-check the directory: reclaiming is just stopping `kache@<user>`, deleting
-`~/.cache/kache`, and starting it again — the local store is a cache and refills
-from the shared remote.
+**A blob leak was suspected here and does not reproduce.** On 2026-08-18 we
+recorded `kache stats` reporting `Store: 0 B (0 entries)` while
+`~/.cache/kache/store/blobs` still held 37 GB, and wrote it up as a gc bug. Retested
+against 0.14.2 in isolated stores: age-based eviction of every entry, size-pressure
+eviction, and `purge`, each with and without a remote configured. **All six reclaimed
+correctly** — blob rows, blob files and directory bytes all tracked the entry count
+down, and `doctor --verify` reported 0 orphaned blobs throughout. The live 24 GiB store
+audits clean too: 5747 blob rows, 5747 files, no unreferenced rows, no refcount drift.
+The two upstream bugs that would explain the observation (kache#275 orphaned blob
+files, kache#276 refcount leak on unreadable `meta.json`) are both fixed, and the
+`entry_blobs` join table that #276 asked for exists.
+
+So the 37 GB reading was most likely a measurement error — most plausibly one
+identity's store `du`'d against the other identity's `kache stats`, which is easy to do
+here and which `doctor` hints at when it reports more daemon processes than expected.
+**Do not carry the leak claim forward.** If it recurs, capture the state before
+reclaiming anything, because the distinction that identifies it is invisible afterwards:
+a blob *file* with no `blobs` row is kache#275, whereas a `blobs` row that survives
+with `refcount > 0` and no `entry_blobs` referent is a different bug. This SQL
+separates them:
+
+```sql
+SELECT COUNT(*) FROM blobs WHERE hash NOT IN (SELECT hash FROM entry_blobs);
+```
+
+The reclaim itself is still just stopping `kache@<user>`, deleting `~/.cache/kache` and
+starting it again — the local store is a cache and refills from the shared remote.
 
 The default ACL is the part worth understanding: it makes every new object
 group-writable **regardless of the writing process's umask**. Without it a
