@@ -541,6 +541,18 @@ saturates. The prediction was right about its mechanism and wrong about its
 conclusion, for the reason it named itself: it priced an FDB read per diff,
 and there is no longer one.
 
+**The verdict on "expect the knee to move down", in one line: right for the
+wrong reason.** Every physical effect it named is real and was found — reads
+leave RAM and get a disk tail, FDB's commits do fsync the journal's array,
+FDB's CPU does rise. None of them moves the knee, because the load that would
+have amplified them through `LeaseStore::locate` no longer exists, and what
+remains is 0.1 % of the array's write load and 0.1 core.
+
+Raw evidence for everything below — 73 point directories, per-point extracted
+summaries, per-run FDB status samples and the reduced tables — is under
+`~/ssd-study` on the box this was measured on; the reduced tables are
+`ALL-POINTS.tsv` and `REPORT.tsv` there.
+
 ### 11.1 What was run
 
 | | ssd arm | memory arm |
@@ -788,6 +800,14 @@ FoundationDB the *server* is not the limit there: commit latency never exceeded
 27.9 ms (`ssd`) or 8.0 ms (`memory`), read latency 3.72/0.10 ms, GRV
 3.82/0.86 ms, **conflicts exactly zero** in every sample on both arms, and
 `fdbserver` at 0.86/0.42 cores.
+
+One artifact of the saturated point, so nobody reads it as a server failure:
+at ~1 300 intents/s the rig's own `durable_acks` footer falls to
+2 501–2 560/s while the gateway's per-second counter still acknowledges
+35 298–35 397 bulk diffs/s and sheds 0.1 %. The bulk writes are being made
+durable; the rig's drive loop is too busy signing and tracking intents to
+*process* their replies. Every intent number above is corroborated
+server-side, which is why the conclusion does not rest on that counter.
 
 **What `ssd` costs, from FDB's own side.** Same 60 s points, `status json`
 every 2 s, min/median/max over the samples in which that arm was under test:

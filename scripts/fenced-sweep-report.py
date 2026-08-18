@@ -196,7 +196,10 @@ def fold(rows: list[dict]) -> None:
     by = collections.defaultdict(list)
     for r in rows:
         by[(r["point"], r["arm"])].append(r)
-    points = sorted({p for p, _ in by}, key=lambda p: (p[0], int(re.sub(r"\D", "", p) or 0)))
+    # `point` is empty for a one-off directory whose name carries no label
+    # (`<arm>` alone rather than `<arm>-<label>-r<n>`), so index it defensively:
+    # a reducer that raises on a stray directory loses the whole table with it.
+    points = sorted({p for p, _ in by}, key=lambda p: (p[:1], int(re.sub(r"\D", "", p) or 0)))
     # Arm names come from the directory prefix, so this folds any two-armed
     # study, not just the binary one it was written for: the ssd/memory engine
     # arms of `fenced-ssd-driver.sh` fold here too. `before`/`after` keep their
