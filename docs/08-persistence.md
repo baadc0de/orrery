@@ -247,20 +247,44 @@ shard, so `actor(locate(e))` — the old route — is that same actor. The accep
 set is identical with or without the read.
 
 J has exactly **four enforcement sites**, all in `actor.rs`, and all of them
-now go through `checked_row_cell`, which asserts `shard.is_prefix_of(cell)`
-and returns the cell it checked — so the assertion and the write are one
+go through `checked_row_cell`, which asserts `shard.is_prefix_of(cell)` and
+returns the cell it checked — so the assertion and the write are one
 expression and a later edit cannot move the row without moving the check:
 
-| site | why the row is in-shard |
-|---|---|
-| `claim_lease` | the claim is routed to `actor(locate().unwrap_or(cell))` and stores `location = cell`; `LeaseStore::put` answers `LocationConflict` rather than overwrite a different location, so even a misrouted claim cannot manufacture a violation |
-| `install_rekey` | runs at `actor(destination_cell)`, immediately after `migrate` set `location = destination_cell` |
-| `complete_local_rekey` | the intra-shard case of the same move; source and destination are one actor |
-| actor-spawn recovery | seeded from `load_cell(shard)`, which is a **prefix range scan** of `lease_cell_key` under that shard — in-shard by construction |
+| site | why the row is in-shard | pinned by |
+|---|---|---|
+| `claim_lease` | the claim is routed to `actor(locate().unwrap_or(cell))` and stores `location = cell`; `LeaseStore::put` answers `LocationConflict` rather than overwrite a different location, so even a misrouted claim cannot manufacture a violation | `tests/lease_location_conflict.rs` |
+| `install_rekey` | runs at `actor(destination_cell)`, immediately after `migrate` set `location = destination_cell` | `tests/fenced_route_invariant_j.rs` |
+| `complete_local_rekey` | the intra-shard case of the same move; source and destination are one actor | `tests/fenced_route_invariant_j.rs` |
+| actor-spawn recovery | seeded from `load_cell(shard)`, which is a **prefix range scan** of `lease_cell_key` under that shard — in-shard by construction | `tests/fenced_route_invariant_j.rs` |
 
 `tests/fenced_route_invariant_j.rs` walks every actor and checks J directly
 after grant, park, sweep, cross-shard rekey, intra-shard rekey, `split`,
 `activate_shards` and recovery, under both lease stores.
+
+The `LocationConflict` guard in row 1 is the one that stops a misrouted claim
+from *creating* a J violation, and it was load-bearing and untested: replacing
+`LocationConflict(_) => return Denied(NotEligible)` with `{}` survived the
+full suite, and the actor would have fallen through, installed
+`lease_cells[e]` at a cell whose durable location belongs to another shard,
+and returned a `Granted` row for an entity it does not own.
+`tests/lease_location_conflict.rs` routes a claim to the wrong shard's actor
+through a lying location index and now fails that mutation at `Granted` where
+`Denied(NotEligible)` is required.
+
+**`checked_row_cell` is a real `assert!`, not a `debug_assert!`.** It was the
+latter, which compiles out of release — the configuration the capacity sweep
+and production both run — so the four enforcement sites above were four
+enforcement sites in the test suite and none at all where it matters. The
+promotion is free: none of the four callers is on the bulk write path (a
+lease grant, a rekey install, its intra-shard twin, and one row per entry at
+actor-spawn recovery), so it runs **zero** times per fenced diff, and
+`is_prefix_of` is a `u64` range containment measured at **0.98 ns** per call
+in a release build. Panicking is the intended response rather than a
+degradation: past that point the actor would be admitting fenced writes
+against a row whose durable location it does not own — silent divergence of
+the accept set, with no local recovery — and failing the shard closed is
+strictly safer than serving it.
 
 **Why a reject still reads.** J says nothing about a *rejecting* actor.
 Cross-shard duplicate `by_cell` entries are reachable — an unfenced diff at a

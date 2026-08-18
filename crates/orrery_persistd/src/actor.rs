@@ -775,7 +775,7 @@ fn prepare_rekey(
     ))
 }
 
-/// Invariant J's four enforcement points, made a test-suite failure rather
+/// Invariant J's four enforcement points, made a **process** failure rather
 /// than a code comment.
 ///
 /// Returns the cell it checked, so the assertion and the write are one
@@ -793,8 +793,23 @@ fn prepare_rekey(
 /// by J it is the actor the locate would have named, so the accept set is
 /// unchanged. If one of these fires, that argument is false and the change
 /// that rests on it has to come out — see docs/08-persistence.md §2.
+///
+/// A real `assert!`, not a `debug_assert!`. It was the latter, which compiles
+/// out of exactly the configuration the capacity sweep and production run, so
+/// the documented "four enforcement sites" were four enforcement sites in the
+/// test suite and none at all where it matters. The cost of promoting it is
+/// nil: none of the four callers is on the bulk write path — a lease grant, a
+/// rekey install, its intra-shard twin, and one row per entry at actor-spawn
+/// recovery, so **zero** calls per fenced diff — and `is_prefix_of` is a
+/// range containment on a `u64`, measured at 0.98 ns per call in release.
+/// Panicking is the correct response and not a severity judgement made
+/// lightly: past this point the actor would be admitting fenced writes
+/// against a row whose durable location it does not own, which is silent
+/// divergence of the accept set, and there is no local recovery from it —
+/// the actor's supervisor failing the shard closed is strictly safer than
+/// serving it.
 fn checked_row_cell(shard: CellId, cell: CellId, site: &str) -> CellId {
-    debug_assert!(
+    assert!(
         shard.is_prefix_of(cell),
         "invariant J: {site} installed a registrar row at {cell:?}, outside shard {shard:?}"
     );
