@@ -21,7 +21,7 @@ use orrery_persistd::{Journal, JournalConfig, GATEWAY_ALPN};
 use orrery_protocol::channels::{decode_datagram, decode_stream_frame};
 use orrery_protocol::{
     CellEpoch, CellId, DiffUplink, Epoch, GatewayMsg, GatewayReply, GridId, Intent, IntentOp,
-    IntentOutcome, JournalRecord, Lsn, NodeId, PersistId, RecordKind, Tick,
+    IntentOutcome, JournalRecord, Lsn, NodeId, PersistId, RecordKind, Tick, REASON_NO_EXECUTOR,
     REASON_VALIDATION_FAILED,
 };
 
@@ -234,8 +234,19 @@ fn authority_startup_requires_an_identity_issuer_key() {
     assert!(stderr.contains("authority requires at least one --issuer-key"));
 }
 
+/// The deployed binary's admission filter is a *filter*, not a blanket
+/// refusal.
+///
+/// It used to be the latter: `ProductionIntentValidator` ignored its argument
+/// and answered `Reject { REASON_VALIDATION_FAILED }` to everything, which
+/// made D16's "intent commit p99 < 10 ms" unmeasurable by construction — the
+/// P2 gate's own run recorded `committed: 0, rejected: 1024`. So the assertion
+/// here is two-sided on purpose: a well-formed intent must get *past*
+/// validation (this node has no executor, so the honest answer beyond it is
+/// `REASON_NO_EXECUTOR`), and a malformed one must still be refused. Either
+/// half alone is satisfied by a validator that is a constant function.
 #[tokio::test]
-async fn production_authority_rejects_intents_without_a_secure_validator() {
+async fn production_authority_admits_well_formed_intents_and_refuses_malformed_ones() {
     // Given: the production binary's authority configuration and an
     // authenticated peer submitting a correctly signed intent.
     let client_key = iroh::SecretKey::generate();
@@ -275,38 +286,77 @@ async fn production_authority_rejects_intents_without_a_secure_validator() {
         connection.next_reply(Duration::from_secs(5)).await,
         Some(GatewayReply::HelloAck { .. })
     ));
-    let mut intent = Intent {
-        intent_id: 71,
-        issuer: client_key.public(),
-        cell_epoch: CellEpoch::new(0),
-        ops: vec![IntentOp {
-            op: 1,
-            args: Bytes::from_static(b"production-authority"),
-        }],
-        attestations: Vec::new(),
-        signature: client_key.sign(b"placeholder"),
+    let signed = |intent_id: u128, ops: Vec<IntentOp>| {
+        let mut intent = Intent {
+            intent_id,
+            issuer: client_key.public(),
+            cell_epoch: CellEpoch::new(0),
+            ops,
+            attestations: Vec::new(),
+            signature: client_key.sign(b"placeholder"),
+        };
+        intent.sign(&client_key);
+        intent
     };
-    intent.sign(&client_key);
 
-    // When: the intent crosses the real binary gateway surface.
+    // When: a well-formed, `Ruleset`-opaque intent crosses the real binary
+    // gateway surface.
     connection
-        .send_control(&GatewayMsg::SubmitIntent { intent })
+        .send_control(&GatewayMsg::SubmitIntent {
+            intent: signed(
+                71,
+                vec![IntentOp {
+                    op: 1,
+                    args: Bytes::from_static(b"production-authority"),
+                }],
+            ),
+        })
         .await;
     let reply = connection
         .next_payload(Duration::from_secs(5))
         .await
         .expect("intent reply timeout");
 
-    // Then: validation fails closed before the missing-executor fallback.
-    assert!(matches!(
-        decode_stream_frame(&reply),
-        Some(GatewayReply::IntentAck {
-            intent_id: 71,
-            outcome: IntentOutcome::Rejected {
-                reason: REASON_VALIDATION_FAILED,
-            },
+    // Then: it passes admission and reaches the executor seam, which this
+    // node (started without --fdb-cluster-file) does not have.
+    let ack: Option<GatewayReply> = decode_stream_frame(&reply);
+    assert!(
+        matches!(
+            ack,
+            Some(GatewayReply::IntentAck {
+                intent_id: 71,
+                outcome: IntentOutcome::Rejected {
+                    reason: REASON_NO_EXECUTOR,
+                },
+            })
+        ),
+        "a well-formed intent must get past validation: {ack:?}"
+    );
+
+    // And: an intent with nothing to commit is still refused by the filter,
+    // before the executor seam is consulted at all.
+    connection
+        .send_control(&GatewayMsg::SubmitIntent {
+            intent: signed(72, Vec::new()),
         })
-    ));
+        .await;
+    let reply = connection
+        .next_payload(Duration::from_secs(5))
+        .await
+        .expect("intent reply timeout");
+    let ack: Option<GatewayReply> = decode_stream_frame(&reply);
+    assert!(
+        matches!(
+            ack,
+            Some(GatewayReply::IntentAck {
+                intent_id: 72,
+                outcome: IntentOutcome::Rejected {
+                    reason: REASON_VALIDATION_FAILED,
+                },
+            })
+        ),
+        "a malformed intent must still be refused: {ack:?}"
+    );
     connection.conn().close(0u32.into(), b"test complete");
     client.close().await;
     stop(&mut child);
