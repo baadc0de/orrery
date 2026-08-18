@@ -276,11 +276,14 @@ fn spawn_metrics_reporter(
 
 /// Append the authority counters whenever any of them moved.
 ///
-/// All seven of them. `divest_requested` and `handoff_timed_out` were absent
-/// for long enough to matter: the second is the zombie-host symptom
-/// docs/09-services-and-ops.md §10 builds a runbook around — a holder that
-/// answers no divest request — and a runbook whose symptom has no counter is
-/// a paragraph, not a procedure.
+/// All ten of them, and the count has grown twice for the same reason. First
+/// `divest_requested` and `handoff_timed_out`: the second is the zombie-host
+/// symptom docs/09-services-and-ops.md §10 builds a runbook around — a holder
+/// that answers no divest request — and a runbook whose symptom has no counter
+/// is a paragraph, not a procedure. Then `misrouted_diffs`, `unindexed_diffs`
+/// and `misroute_throttled`, which docs/08-persistence.md §2.1.2 names as the
+/// alarm on the fenced route's expensive branch while they lived only in
+/// process memory — the same failure one layer out.
 ///
 /// These are absolute totals, not interval deltas: `duplicate_authority` is an
 /// invariant that must read zero for the life of the process, and a gauge that

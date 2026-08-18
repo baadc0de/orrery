@@ -393,9 +393,16 @@ has inserted the entry, every removal (`divest_lease`, `unwind_grant`,
 that has already made the router reject the write anyway, and a failed renewal
 reports `invalid` without touching the map. The rekey case that made this a
 probe rather than a refusal keeps its entry throughout — only the *cell*
-moves. Shape 2 accordingly has **no legitimate producer**, which is why
-`unindexed_diffs` is expected at a flat zero rather than at a rekey-shaped
-spike. It is still a probe and not a refusal, so if that argument is ever
+moves. Shape 2 accordingly has no legitimate *admissible* producer — no honest client
+gets a shape-2 diff **accepted**. That is not the same as never emitting one,
+and an earlier draft of this paragraph said `unindexed_diffs` was expected at a
+flat zero. It is not. Two ordinary paths emit shape-2 diffs from an honest
+client, both on the way *out* of authority: diffs already queued in the client's
+`UplinkScheduler` when a `divest_lease` has removed the gateway's entry — the
+client drops `LocallyAuthoritative` but nothing unregisters the scheduler, whose
+only `unregister` caller is `reconcile_lease_nack` — and a reconnect that loses
+the race with `cleanup_peer_session`. So the shape to expect is a bounded spike
+that decays, and the alarm is a *sustained* non-zero, not a non-zero. It is still a probe and not a refusal, so if that argument is ever
 falsified by a new grant path the cost is a metered 32/s rather than a hard
 stop.
 
