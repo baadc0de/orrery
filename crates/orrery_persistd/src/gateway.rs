@@ -245,6 +245,36 @@ impl IdentityHealth for AvailableIdentityHealth {
 /// tick per session while still bounding a misbehaving peer's task count.
 const MAX_INFLIGHT_DIFF_ROUTES_PER_CONN: usize = 128;
 
+/// How long a bulk diff may sit in the connection's inbound queue before the
+/// receive loop drops it instead of routing it.
+///
+/// # Why a deadline and not a bigger cap
+///
+/// The measured defect (docs/11-roadmap.md §P2) was not sustained overload: a
+/// 30 s run sent and acknowledged the same ~540 000 diffs, so arrival and
+/// service rates matched. It was a *standing queue* — a transient (the claim
+/// phase, whose lease work runs inline in this loop) built a backlog that
+/// never drained, because at ~100 % utilisation there is no slack to drain it
+/// with. A larger [`MAX_INFLIGHT_DIFF_ROUTES_PER_CONN`], or a faster route,
+/// changes how long the backlog takes to form and nothing else. The only
+/// thing that removes a standing queue is destroying work, which is what this
+/// deadline does: it *is* the slack.
+///
+/// # Why 25 ms
+///
+/// D16 budgets the whole client-observed round trip at p99 < 5 ms. A diff
+/// that has already spent five budgets waiting to be *looked at* cannot be
+/// acknowledged usefully — and this lane is QUIC datagrams, so the honest
+/// answer to "I cannot serve this in time" is the same one the network would
+/// have given: drop it. The client holds one pending diff per entity and
+/// resends until it is acked (`UplinkScheduler::flush`), so the write is not
+/// lost, it is re-offered — usually as a *newer* tick, which is strictly
+/// better than the stale one being dropped here.
+///
+/// Chosen well above the healthy p50 (0.05 ms) so it never fires on a
+/// gateway that is keeping up: this is a shed valve, not a rate limit.
+const MAX_INGRESS_QUEUE_WAIT_US: u64 = 25_000;
+
 /// Slow control reads are separately bounded so they cannot consume the bulk
 /// acknowledgement budget.  In particular, an FDB cold area-load must not
 /// head-of-line block a durability acknowledgement on the same connection.
@@ -1549,6 +1579,132 @@ impl GatewayBoundaryMetrics {
     }
 }
 
+/// What the receive loop did with every bulk diff it took off the inbound
+/// queue: routed it, or refused it and said so.
+///
+/// # Why refusals are counted rather than queued
+///
+/// [`SERIES_GATEWAY_INGRESS_QUEUE`] exists because the gateway used to accept
+/// work it could not route in time and hide the delay: the datagram reader
+/// pushed into an unbounded channel that the receive loop stopped draining
+/// whenever the connection's route cap was saturated, so a client saw 2 s
+/// while the gateway's own span read 30 ms. Every honest answer to that is
+/// one of three — route faster, refuse visibly, or push back on the peer —
+/// and the bulk lane's contract (unreliable datagrams, idempotent
+/// `(entity, tick)` records, client-side resend; docs/08-persistence.md §2.1)
+/// makes refusal the cheapest correct one. These counters are what makes it
+/// *visible*: a silent drop is exactly as dishonest as a hidden queue, so
+/// overload now reads as a number here and in the operator log instead of as
+/// latency in someone else's histogram.
+///
+/// Both refusals drop the datagram without a reply, deliberately. A
+/// `BulkNack` means "this write was rejected, do not resend it"
+/// (`UplinkScheduler::on_nack`, docs/08-persistence.md §3.5) and would
+/// discard the peer's pending diff; silence leaves it pending, so the client
+/// re-offers it on its own cadence. Un-acked is the one state the bulk
+/// contract already defines as lossy — "the unacked tail is lost by design
+/// (bulk class)", docs/08-persistence.md §9 — and P2's criterion promises
+/// RPO 0 for *acked* intents and "bulk loss bounded by the journal/
+/// replication window", never delivery of something never acknowledged.
+#[derive(Debug, Default)]
+pub struct GatewayIngressMetrics {
+    admitted: AtomicU64,
+    shed_saturated: AtomicU64,
+    shed_stale: AtomicU64,
+}
+
+impl GatewayIngressMetrics {
+    /// One diff dispatched to a route task (or routed inline).
+    pub fn record_admitted(&self) {
+        self.admitted.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// One diff dropped because every route slot on this connection was busy.
+    pub fn record_shed_saturated(&self) {
+        self.shed_saturated.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// One diff dropped because it had already waited past
+    /// [`MAX_INGRESS_QUEUE_WAIT_US`] in the inbound queue.
+    pub fn record_shed_stale(&self) {
+        self.shed_stale.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Capture the cumulative totals.
+    #[must_use]
+    pub fn snapshot(&self) -> GatewayIngressSnapshot {
+        GatewayIngressSnapshot {
+            admitted: self.admitted.load(Ordering::Relaxed),
+            shed_saturated: self.shed_saturated.load(Ordering::Relaxed),
+            shed_stale: self.shed_stale.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// A point-in-time read of [`GatewayIngressMetrics`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct GatewayIngressSnapshot {
+    /// Diffs the receive loop routed.
+    pub admitted: u64,
+    /// Diffs dropped with every route slot busy.
+    pub shed_saturated: u64,
+    /// Diffs dropped for having outlived [`MAX_INGRESS_QUEUE_WAIT_US`] in the
+    /// inbound queue.
+    pub shed_stale: u64,
+}
+
+impl GatewayIngressSnapshot {
+    /// Every diff this gateway refused, whatever the reason.
+    #[must_use]
+    pub fn shed(&self) -> u64 {
+        self.shed_saturated.saturating_add(self.shed_stale)
+    }
+}
+
+/// The receive loop's verdict on one inbound diff.
+///
+/// A three-way enum rather than an `Option<permit>` because the two refusals
+/// are different operational events — a saturated route cap is a slow
+/// downstream, a stale queue entry is a burst this connection has not yet
+/// worked off — and an operator reading one counter must not have to guess
+/// which happened.
+enum DiffAdmission {
+    /// Route it; the permit bounds the connection's concurrent routes.
+    Route(OwnedSemaphorePermit),
+    /// Refuse: it has waited longer than the ack could still be worth.
+    ShedStale,
+    /// Refuse: every route slot on this connection is occupied.
+    ShedSaturated,
+}
+
+/// Decide whether one diff is routed, on the two bounds that matter, without
+/// ever awaiting.
+///
+/// **Never make this `async`.** The whole defect was one `.await` here: the
+/// receive loop parked on `Semaphore::acquire_owned` while the datagram
+/// reader kept filling an unbounded channel behind it, which is how a 30 ms
+/// server span became a 2 s client observation. `reserve_intent_lane` avoids
+/// the same trap on the intent lane for the same reason, and this is the bulk
+/// lane's version of it. Split out so the policy is directly testable and so
+/// a future `.await` has to be added deliberately rather than by editing a
+/// long match arm.
+///
+/// Staleness is checked *before* the permit, so a diff nobody can still use
+/// does not consume a route slot a fresh one could have had — which is how
+/// the backlog gets worked off rather than merely re-ordered.
+fn admit_diff_route(lane: &Arc<Semaphore>, ingress_queue_us: u64) -> DiffAdmission {
+    if ingress_queue_us > MAX_INGRESS_QUEUE_WAIT_US {
+        return DiffAdmission::ShedStale;
+    }
+    match Arc::clone(lane).try_acquire_owned() {
+        Ok(permit) => DiffAdmission::Route(permit),
+        // `NoPermits` is the saturation case. `Closed` cannot happen — this
+        // semaphore is never closed — and if it ever did, refusing is the
+        // same correct answer, because no route could be spawned either way.
+        Err(_) => DiffAdmission::ShedSaturated,
+    }
+}
+
 /// Every always-on server-side gateway counter, in one shareable handle.
 ///
 /// Collection is unconditional — the precedent is [`AuthorityMetrics`], and
@@ -1573,6 +1729,8 @@ pub struct GatewayMetrics {
     pub report: GatewayReportMetrics,
     /// Transport-boundary spans that bracket [`GatewayBulkMetrics`]'s own.
     pub boundary: GatewayBoundaryMetrics,
+    /// Bulk-ingress admission: routed, or refused and counted.
+    pub ingress: GatewayIngressMetrics,
 }
 
 /// The current single-node policy: its ownership is always fresh.
@@ -2822,36 +2980,76 @@ pub const BOUNDARY_JSONL_ENV: &str = "ORRERY_GATEWAY_BOUNDARY_JSONL";
 /// drain itself is not the thing being measured.
 const BOUNDARY_REPORT_INTERVAL: Duration = Duration::from_millis(250);
 
+/// The record kind carrying [`GatewayIngressMetrics`] in the boundary sink.
+///
+/// Not a `sample_batch`, deliberately: these are cumulative counts, not a
+/// latency population, and folding them into a histogram would invent a
+/// percentile out of a total. `p2-dashboard` ignores record kinds it does not
+/// know (its `Record` documents exactly that) and counts unrecognized
+/// *series* names, so a new kind is additive — it rides the same merged
+/// artifact without touching the frozen gate.
+const INGRESS_RECORD_KIND: &str = "gateway_ingress";
+
 /// Append the transport-boundary histograms to [`BOUNDARY_JSONL_ENV`]'s file
-/// on a fixed interval, as `sample_batch` records.
+/// on a fixed interval, as `sample_batch` records, plus the bulk-ingress
+/// admission counters as [`INGRESS_RECORD_KIND`] records.
 ///
 /// A no-op when the variable is unset or the file cannot be opened: telemetry
 /// never takes a gateway down, and the counters keep accumulating either way.
+/// Shedding is *also* logged here rather than only at the drop site: a
+/// per-datagram warning under overload is a log flood, and one line per drain
+/// interval carrying the totals is the same information an operator can
+/// actually read. This is the "overload is a number, not a latency" half of
+/// the contract in [`GatewayIngressMetrics`] — the JSONL half only exists
+/// when a sink is configured, the log line always does.
 fn spawn_boundary_reporter(metrics: Arc<GatewayMetrics>) {
-    let Ok(path) = std::env::var(BOUNDARY_JSONL_ENV) else {
-        return;
-    };
-    let file = match std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-    {
-        Ok(file) => file,
-        Err(e) => {
-            warn!(
-                ?e,
-                path, "gateway: boundary metrics sink could not be opened"
-            );
-            return;
-        }
+    // The sink is optional; the reporter is not. Shed counters reach the log
+    // on every node, configured sink or none, because the deployment that
+    // most needs to hear "I am dropping writes" is the one nobody remembered
+    // to point at a JSONL file.
+    let file = match std::env::var(BOUNDARY_JSONL_ENV) {
+        Err(_) => None,
+        Ok(path) => match std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+        {
+            Ok(file) => Some(file),
+            Err(e) => {
+                warn!(
+                    ?e,
+                    path, "gateway: boundary metrics sink could not be opened"
+                );
+                None
+            }
+        },
     };
     tokio::spawn(async move {
         use std::io::Write as _;
         let mut file = file;
         let mut cursors: [GatewayServerLatencySnapshot; GATEWAY_BOUNDARY_SERIES.len()] =
             std::array::from_fn(|_| GatewayServerLatencySnapshot::default());
+        let mut ingress_cursor = GatewayIngressSnapshot::default();
         loop {
             tokio::time::sleep(BOUNDARY_REPORT_INTERVAL).await;
+            let ingress = metrics.ingress.snapshot();
+            // Warned, not debugged: a gateway that refused a durable write is
+            // an operational event even when refusing is the correct answer,
+            // and it is the event this admission path exists to make sayable.
+            // Totals, so a reader never has to add up interval deltas to
+            // learn how much a run shed.
+            if ingress.shed() != ingress_cursor.shed() {
+                warn!(
+                    shed_saturated = ingress.shed_saturated,
+                    shed_stale = ingress.shed_stale,
+                    admitted = ingress.admitted,
+                    "gateway: shedding bulk diffs at ingress"
+                );
+            }
+            let Some(sink) = file.as_mut() else {
+                ingress_cursor = ingress;
+                continue;
+            };
             let mut out = String::new();
             for ((series, latency), cursor) in metrics
                 .boundary
@@ -2866,10 +3064,23 @@ fn spawn_boundary_reporter(metrics: Arc<GatewayMetrics>) {
                     ));
                 }
             }
+            // Cumulative totals rather than an interval delta, and emitted
+            // whenever any of them moved: a run's shed count is then the last
+            // such record, not a sum a reader has to reconstruct.
+            if ingress != ingress_cursor {
+                out.push_str(&format!(
+                    "{{\"type\":\"{}\",\"admitted\":{},\"shed_saturated\":{},\"shed_stale\":{}}}\n",
+                    INGRESS_RECORD_KIND,
+                    ingress.admitted,
+                    ingress.shed_saturated,
+                    ingress.shed_stale
+                ));
+            }
+            ingress_cursor = ingress;
             if out.is_empty() {
                 continue;
             }
-            if let Err(e) = file.write_all(out.as_bytes()).and_then(|()| file.flush()) {
+            if let Err(e) = sink.write_all(out.as_bytes()).and_then(|()| sink.flush()) {
                 warn!(?e, "gateway: boundary metrics sink write failed");
                 return;
             }
@@ -3089,7 +3300,8 @@ async fn handle_connection(
         // the loop then does. Every inbound message contributes, including
         // the ones that are refused: a backlog is not caused only by the
         // messages that survive it.
-        metrics.boundary.record_ingress(elapsed_us(transport_at));
+        let ingress_queue_us = elapsed_us(transport_at);
+        metrics.boundary.record_ingress(ingress_queue_us);
         let Some((channel, _)) = untag(&pkt) else {
             continue;
         };
@@ -3482,14 +3694,19 @@ async fn handle_connection(
                     continue;
                 };
                 let received_at = Instant::now();
-                let send = Arc::clone(&send);
-                let router = Arc::clone(&router);
-                let bulk_ack_admission = Arc::clone(&bulk_ack_admission);
-                let metrics = Arc::clone(&metrics);
-                let authority_metrics = Arc::clone(&redistributor.metrics);
-                let permit = Arc::clone(&inflight_diffs).acquire_owned().await;
-                match permit {
-                    Ok(permit) => {
+                // Admission is decided here, in the loop, and never waits.
+                // Waiting for a route slot is what made this loop the
+                // producer of its own backlog: the datagram reader behind it
+                // never stops, so every microsecond parked here is another
+                // datagram accumulating in memory with an ageing stamp.
+                match admit_diff_route(&inflight_diffs, ingress_queue_us) {
+                    DiffAdmission::Route(permit) => {
+                        metrics.ingress.record_admitted();
+                        let send = Arc::clone(&send);
+                        let router = Arc::clone(&router);
+                        let bulk_ack_admission = Arc::clone(&bulk_ack_admission);
+                        let metrics = Arc::clone(&metrics);
+                        let authority_metrics = Arc::clone(&redistributor.metrics);
                         tokio::spawn(async move {
                             let _permit = permit;
                             route_session_diff(
@@ -3505,18 +3722,29 @@ async fn handle_connection(
                             .await;
                         });
                     }
-                    Err(_) => {
-                        route_session_diff(
-                            send.as_ref(),
-                            diff,
-                            &active_session,
-                            &router,
-                            &bulk_ack_admission,
-                            &metrics.bulk,
-                            authority_metrics,
-                            received_at,
-                        )
-                        .await
+                    // Both refusals drop the datagram in silence, and the
+                    // silence is the message: an un-acked diff stays pending
+                    // in the peer's scheduler and is re-offered, where a
+                    // `BulkNack` would tell it to discard the write. See
+                    // `GatewayIngressMetrics` for why that is the honest
+                    // answer on this lane, and where the count surfaces.
+                    DiffAdmission::ShedStale => {
+                        metrics.ingress.record_shed_stale();
+                        debug!(
+                            %remote,
+                            entity = ?diff.entity,
+                            ingress_queue_us,
+                            "gateway: shed stale diff"
+                        );
+                    }
+                    DiffAdmission::ShedSaturated => {
+                        metrics.ingress.record_shed_saturated();
+                        debug!(
+                            %remote,
+                            entity = ?diff.entity,
+                            cap = MAX_INFLIGHT_DIFF_ROUTES_PER_CONN,
+                            "gateway: shed diff, route cap saturated"
+                        );
                     }
                 }
             }
@@ -5092,6 +5320,57 @@ mod tests {
             }
         );
         drop(held);
+    }
+
+    #[test]
+    fn a_saturated_diff_lane_sheds_rather_than_waiting_for_a_route_slot() {
+        // The defect this pins: the receive loop used to `await` here, and
+        // an unbounded reader kept filling the queue behind it. Waiting is
+        // not one of the answers any more — a full lane refuses, now, and
+        // says which bound it hit.
+        let lane = Arc::new(Semaphore::new(1));
+        let held = admit_diff_route(&lane, 0);
+        assert!(matches!(held, DiffAdmission::Route(_)), "first slot routes");
+
+        assert!(
+            matches!(admit_diff_route(&lane, 0), DiffAdmission::ShedSaturated),
+            "a full lane refuses immediately instead of queueing behind it"
+        );
+
+        drop(held);
+        assert!(
+            matches!(admit_diff_route(&lane, 0), DiffAdmission::Route(_)),
+            "the slot is reusable once the route that held it finished"
+        );
+    }
+
+    #[test]
+    fn a_diff_that_outlived_the_ingress_deadline_is_shed_without_taking_a_slot() {
+        // Staleness is checked before the permit, and that ordering is the
+        // point: a backlog is worked off by refusing the entries whose ack
+        // can no longer be worth anything, so the slot goes to a fresh diff.
+        let lane = Arc::new(Semaphore::new(1));
+
+        assert!(
+            matches!(
+                admit_diff_route(&lane, MAX_INGRESS_QUEUE_WAIT_US + 1),
+                DiffAdmission::ShedStale
+            ),
+            "a diff past the ingress deadline is refused"
+        );
+        assert_eq!(
+            lane.available_permits(),
+            1,
+            "a shed diff must not consume the route slot a fresh one could use"
+        );
+
+        assert!(
+            matches!(
+                admit_diff_route(&lane, MAX_INGRESS_QUEUE_WAIT_US),
+                DiffAdmission::Route(_)
+            ),
+            "the deadline is inclusive: exactly at the bound is still routed"
+        );
     }
 
     #[test]
