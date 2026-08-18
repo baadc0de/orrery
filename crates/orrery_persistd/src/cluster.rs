@@ -117,12 +117,19 @@ pub struct RouteStageSnapshot {
     pub mailbox_turns: u64,
     /// Fenced applies that fell back to `LeaseStore::locate`.
     ///
-    /// Structurally ~0: under `strict_authority` the admission predicate
-    /// requires `by_cell[e] == record.cell` *before* the fold that would move
-    /// it, so a fenced diff cannot relocate an entity and `record.cell` stays
-    /// pinned at the grant cell for the entity's life. A hot fallback means
-    /// that reasoning is wrong somewhere — and that the FDB read is back at
-    /// close to full rate, plus a wasted mailbox turn.
+    /// Expected ~0, but **not** structurally zero, and the difference is
+    /// worth keeping straight. `strict_authority` pins the cell a fenced diff
+    /// can be *admitted* at — the actor requires `by_cell[e] == record.cell`
+    /// before the fold that would move it — but it says nothing about the
+    /// cell a diff *arrives* with, which the client puts in its `DiffUplink`.
+    /// What holds the fallback near zero is a check, not an invariant: the
+    /// gateway refuses a diff whose cell is not the one that session's lease
+    /// for that entity was granted at (`AuthoritySnapshot::misrouted_diffs`),
+    /// so a mismatched cell costs a NACK rather than a locate.
+    ///
+    /// A hot fallback is therefore a real alarm: the FDB read is back at
+    /// close to full rate, plus a wasted mailbox turn. Its cost is bounded
+    /// while it is being investigated — see `fenced_locate_fallback_permits`.
     pub locate_fallbacks: u64,
     /// Sampled accepts that paid for a location audit **and got an answer**
     /// (see `fenced_location_audit_due`).
@@ -304,6 +311,51 @@ pub fn fenced_location_audit_every() -> u64 {
     });
     *EVERY
 }
+
+/// How many fenced-route fallback `LeaseStore::locate` reads may be in flight
+/// at once, process-wide (`ORRERY_FENCED_LOCATE_FALLBACK_PERMITS`, 0 = no
+/// bound).
+///
+/// The fallback is the expensive branch of the route — an FDB read plus a
+/// second mailbox turn — and which diffs take it is not entirely the server's
+/// choice: the cell a diff declares arrives on the wire. The gateway now
+/// refuses a diff whose cell is not the one this session's lease was granted
+/// at, which removes the vector it was reachable through, but "no vector we
+/// know of" is not a bound. This is the bound.
+///
+/// Bounded process-wide rather than per connection because the resource it
+/// protects is process-wide: `libfdb_c` runs **one** network thread per
+/// process, and docs/14-capacity.md §5.1 measured that thread as the binding
+/// constraint on a whole box. A per-connection cap of `k` with `n`
+/// connections bounds nothing at `n · k`; the shared thread does not care
+/// which connection saturated it.
+///
+/// It is a queue, not a shed: a diff that waits here is still routed. What
+/// sheds it, if the wait is long enough, is the route-admission budget the
+/// gateway already applies from the diff's *arrival*
+/// (`MAX_ROUTE_ADMISSION_WAIT_US`), which counts what it drops. So the
+/// expensive branch degrades into an existing, measured valve instead of into
+/// FDB-thread saturation that takes every other subsystem down with it.
+///
+/// 64 by default: far above the ~0 concurrent fallbacks a healthy node takes
+/// (see `RouteStageSnapshot::locate_fallbacks`), far below the thousands a
+/// connection fleet could otherwise put in flight.
+#[must_use]
+pub fn fenced_locate_fallback_permits() -> usize {
+    static PERMITS: LazyLock<usize> = LazyLock::new(|| {
+        std::env::var("ORRERY_FENCED_LOCATE_FALLBACK_PERMITS")
+            .ok()
+            .and_then(|raw| raw.parse().ok())
+            .unwrap_or(64)
+    });
+    *PERMITS
+}
+
+static LOCATE_FALLBACK_GATE: LazyLock<Option<tokio::sync::Semaphore>> =
+    LazyLock::new(|| match fenced_locate_fallback_permits() {
+        0 => None,
+        permits => Some(tokio::sync::Semaphore::new(permits)),
+    });
 
 static ROUTE_STAGE: LazyLock<Arc<RouteStageMetrics>> =
     LazyLock::new(|| Arc::new(RouteStageMetrics::default()));
@@ -886,7 +938,20 @@ impl Router for CellRuntime {
         // the pre-change route would have asked whoever the locate named.
         stages.record_locate_fallback();
         let locate_started = Instant::now();
+        // Bounded concurrency on the expensive branch. See
+        // `fenced_locate_fallback_permits`: the wait is inside `locate_us`
+        // deliberately, because from the route's point of view it is part of
+        // the cost of the read it is waiting to make.
+        let permit = match &*LOCATE_FALLBACK_GATE {
+            Some(gate) => Some(
+                gate.acquire()
+                    .await
+                    .expect("the fallback permit pool is never closed"),
+            ),
+            None => None,
+        };
         let route_cell = self.lease_location(entity).await?.unwrap_or(presented);
+        drop(permit);
         let locate_us = stage_elapsed_us(locate_started);
         let resolved = self.actor(grid, route_cell).ok_or(Reject::JournalClosed)?;
         // Compared by shard, not by handle identity: `CellRuntime::split`

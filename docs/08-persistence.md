@@ -300,6 +300,65 @@ anything but `row.is_some()` — and `tests/fenced_route_bounds.rs` asserts the
 bound, including that a fallback resolving to the actor that already answered
 does not re-send.
 
+**What actually keeps the fallback cold — a bounded probe, not an
+invariant.** The first version of this section justified `locate_fallbacks`
+staying near zero by saying `strict_authority` "pins `record.cell` at the
+grant cell for the entity's life". That is a statement about which diffs are
+**admitted**, not about which cell **arrives**: `route_diff` builds the record
+as `cell: diff.cell` straight from the client's `DiffUplink`, and the actor's
+`by_cell[e] == record.cell` conjunct is evaluated *after* the route has
+already chosen an actor. So a peer holding a perfectly valid lease that
+presented any other cell took the fallback on **every** diff — one FDB locate
+plus a second mailbox turn, i.e. the pre-change cost plus a turn — at its own
+chosen rate. Since §5.1 of [14-capacity.md](14-capacity.md) identifies the
+single `libfdb_c` network thread as the binding constraint on the whole box,
+capacity was bimodal on an unvalidated field on the wire.
+
+**Validating the cell against the grant does not work, and it is worth saying
+why.** The gateway's `SessionLease.cell` is the cell the lease was *granted*
+at, and a registrar-driven `commit_rekey` moves an entity without telling the
+gateway anything: the NACK the holder receives carries a `Lease`, which has no
+cell in it. So the holder's first legitimate write at the new cell presents a
+cell the session index has never heard of and is indistinguishable, at that
+instant, from a client addressing the wrong cell. Refusing on the mismatch was
+implemented first and failed two existing gateway tests, including
+`rekeyed_entity_rejects_stale_presented_cell_with_current_lease`, which asserts
+exactly that write is acknowledged. A cheap gateway-side check cannot be
+authoritative about an entity's cell, because the only authority is the actor.
+
+So the mismatch buys a **probe**, and the probe is what is bounded:
+
+* **Per connection, a token bucket.** A diff whose cell the session index does
+  not name is routed if the connection can pay a token (`MisrouteBucket`: 32/s,
+  burst 256) and answered with a `BulkNack` without routing if it cannot.
+  `misrouted_diffs` counts the mismatches, `misroute_throttled` the refusals.
+* **An admitted probe repairs the index.** `route_diff` now reports whether
+  the router *admitted* the record, and admission is proof of location — the
+  actor admitted it only because its own `by_cell[entity]` names that cell and
+  its registrar row names this holder's live lease. So a rekey costs one token
+  per entity and then routes at full speed forever, while a peer whose cell is
+  simply wrong is never admitted, never repairs anything, and settles at 32
+  fallbacks a second instead of its own send rate. The bucket is sized for the
+  repair case: a 256-entity mass rekey drains the burst and does not stall.
+* **Across connections, a permit pool.** `ORRERY_FENCED_LOCATE_FALLBACK_PERMITS`
+  (default 64) caps concurrent fallback locates process-wide. Process-wide
+  rather than per connection on purpose: the resource being protected is one
+  thread per *process*, and a per-connection cap of `k` across `n` connections
+  bounds nothing at `n · k`. It queues rather than sheds — a diff that waits is
+  still routed — and what sheds it, if the wait runs long, is the
+  route-admission budget the gateway already applies from the diff's arrival,
+  which counts what it drops. The expensive branch therefore degrades into an
+  existing, measured valve instead of into FDB-thread saturation.
+
+`locate_fallbacks` is still expected at ~0 and is still the alarm if it is
+not. What has changed is the honesty of the reason: it is low because a probe
+allowance holds it low and a pool bounds what gets past the allowance, not
+because the protocol makes it impossible. The inline gateway test
+`a_diff_at_an_unindexed_cell_probes_once_repairs_the_index_and_is_then_throttled`
+pins the probe, the repair and the throttle, and
+`tests/fenced_locate_fallback_bound.rs` pins the pool at a peak of 2 in-flight
+locates against 8 concurrent fallbacks.
+
 **One accepted divergence, in writing.** A rekey whose `LeaseStore::migrate`
 committed and then reported failure (FDB's `commit_unknown_result`, or
 `execute` returning `Err(RekeyError::LeaseStore)`) leaves the source actor
