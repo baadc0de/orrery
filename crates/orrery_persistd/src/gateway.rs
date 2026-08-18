@@ -276,6 +276,79 @@ const MAX_INFLIGHT_DIFF_ROUTES_PER_CONN: usize = 128;
 /// gateway that is keeping up: this is a shed valve, not a rate limit.
 const MAX_INGRESS_QUEUE_WAIT_US: u64 = 25_000;
 
+/// The same budget, enforced where the wait actually is.
+///
+/// [`MAX_INGRESS_QUEUE_WAIT_US`] is evaluated on a diff's arrival age at the
+/// instant the receive loop dequeues it. That was a real bound while the loop
+/// was the queue. It is not one now: with lease work moved onto its own lane
+/// the loop is instant (`gateway_ingress_queue_ms` p99 0.05 ms), so the check
+/// passes for everything and bounds nothing — and the standing queue did not
+/// go away, it moved downstream of admission.
+///
+/// Measured on the merged branch (three gate runs, 30 s, 125 sessions,
+/// 10 000 entities, 128 shards), per acknowledged diff:
+///
+/// | stage                      | mean      | max      |
+/// |----------------------------|-----------|----------|
+/// | `route_queue` (spawn→task) | 0.005 ms  | 0.45 ms  |
+/// | `router_apply`             | 7.8–8.7 ms| 2.2 s    |
+/// | ├ entity gate wait         | 7.2–8.2 ms| 2.2 s    |
+/// | ├ `LeaseStore::locate`     | 0.40 ms   | 15 ms    |
+/// | └ actor mailbox round trip | 0.006 ms  | 1.0 ms   |
+/// | `journal_wait`             | 2.0–4.3 ms| 35–275 ms|
+///
+/// So it is not the tokio scheduler (`route_queue` is noise), not the actor
+/// mailbox (0.006 ms — the actors are idle), and not primarily the committer.
+/// It is the striped per-entity mutex inside `CellRuntime::apply_fenced`,
+/// which is held across an FDB read and which the lease lane's batched
+/// heartbeats take 77 at a time for 16 ms mean / 50 ms max
+/// (`crate::cluster::RouteStageMetrics`). The head-of-line block did not go
+/// away either; it moved from the receive loop onto the entity stripes, where
+/// the offloaded lease lane can now contend with live diff traffic.
+///
+/// A deadline only bounds a wait it is evaluated *after*, so this one is
+/// evaluated around the whole router round trip, against the diff's age since
+/// arrival — the same clock and the same budget as the ingress check, applied
+/// where the time is actually spent.
+///
+/// **It stops at the journal, deliberately.** Once the actor has admitted the
+/// record, the write is going to be durable; refusing to wait for the ack
+/// after that would drop an acknowledgement for a write that happened, which
+/// is a different and worse kind of dishonesty. `journal_wait` is therefore
+/// outside this valve — and it is also frozen to another lane.
+const MAX_ROUTE_ADMISSION_WAIT_US: u64 = 25_000;
+
+/// Environment override for [`MAX_ROUTE_ADMISSION_WAIT_US`].
+///
+/// This valve has a genuine trade behind it (see docs/08-persistence.md
+/// §3.6): the budget buys tail latency with shed rate, and where to sit on
+/// that curve is an operator's call, not a compile-time one. Read once, so a
+/// running node's policy cannot change under it.
+const ROUTE_ADMISSION_WAIT_ENV: &str = "ORRERY_GATEWAY_MAX_ROUTE_WAIT_US";
+
+/// The configured route-admission budget, in microseconds.
+///
+/// `0` disables the valve — which is exactly the merged branch's behaviour,
+/// and therefore the "before" leg of any A/B against it.
+fn route_admission_budget_us() -> u64 {
+    static BUDGET: std::sync::LazyLock<u64> =
+        std::sync::LazyLock::new(|| match std::env::var(ROUTE_ADMISSION_WAIT_ENV) {
+            Ok(raw) => match raw.trim().parse::<u64>() {
+                Ok(value) => value,
+                Err(_) => {
+                    warn!(
+                        raw,
+                        default = MAX_ROUTE_ADMISSION_WAIT_US,
+                        "gateway: unparseable route-admission budget; using the default"
+                    );
+                    MAX_ROUTE_ADMISSION_WAIT_US
+                }
+            },
+            Err(_) => MAX_ROUTE_ADMISSION_WAIT_US,
+        });
+    *BUDGET
+}
+
 /// Slow control reads are separately bounded so they cannot consume the bulk
 /// acknowledgement budget.  In particular, an FDB cold area-load must not
 /// head-of-line block a durability acknowledgement on the same connection.
@@ -1655,6 +1728,7 @@ pub struct GatewayIngressMetrics {
     admitted: AtomicU64,
     shed_saturated: AtomicU64,
     shed_stale: AtomicU64,
+    shed_slow_route: AtomicU64,
 }
 
 impl GatewayIngressMetrics {
@@ -1674,6 +1748,17 @@ impl GatewayIngressMetrics {
         self.shed_stale.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// One diff dropped because the router could not admit it to a journal
+    /// within [`MAX_ROUTE_ADMISSION_WAIT_US`] of its arrival.
+    ///
+    /// Counted apart from [`Self::record_shed_stale`] for the reason that
+    /// enum has three arms at all: "it aged out before I looked at it" and
+    /// "it aged out while I was routing it" are different subsystems, and an
+    /// operator reading one number must not have to guess which queue grew.
+    pub fn record_shed_slow_route(&self) {
+        self.shed_slow_route.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Capture the cumulative totals.
     #[must_use]
     pub fn snapshot(&self) -> GatewayIngressSnapshot {
@@ -1681,6 +1766,7 @@ impl GatewayIngressMetrics {
             admitted: self.admitted.load(Ordering::Relaxed),
             shed_saturated: self.shed_saturated.load(Ordering::Relaxed),
             shed_stale: self.shed_stale.load(Ordering::Relaxed),
+            shed_slow_route: self.shed_slow_route.load(Ordering::Relaxed),
         }
     }
 }
@@ -1695,13 +1781,23 @@ pub struct GatewayIngressSnapshot {
     /// Diffs dropped for having outlived [`MAX_INGRESS_QUEUE_WAIT_US`] in the
     /// inbound queue.
     pub shed_stale: u64,
+    /// Diffs dropped for having outlived [`MAX_ROUTE_ADMISSION_WAIT_US`]
+    /// *downstream* of admission, waiting on the router.
+    ///
+    /// This one overlaps `admitted` on purpose and is not a subtraction bug:
+    /// the receive loop admitted the diff and the route task then refused it,
+    /// so a run's served count is `admitted - shed_slow_route`, while
+    /// `shed_saturated` and `shed_stale` are disjoint from `admitted`.
+    pub shed_slow_route: u64,
 }
 
 impl GatewayIngressSnapshot {
     /// Every diff this gateway refused, whatever the reason.
     #[must_use]
     pub fn shed(&self) -> u64 {
-        self.shed_saturated.saturating_add(self.shed_stale)
+        self.shed_saturated
+            .saturating_add(self.shed_stale)
+            .saturating_add(self.shed_slow_route)
     }
 }
 
@@ -1934,6 +2030,18 @@ pub struct GatewayConfig {
     /// kept, because stealing by timeout is exactly what "not stealable"
     /// forbids.
     pub handoff_deadline_ms: u32,
+    /// How long, from a diff's arrival, the router has to admit it to a
+    /// journal before the gateway sheds it ([`MAX_ROUTE_ADMISSION_WAIT_US`]).
+    /// Zero disables the valve.
+    ///
+    /// Config rather than a process global so a test can state the policy it
+    /// is testing — `tests/gateway_ingress.rs` needs the valve *off* to hold
+    /// a connection at its route cap — and so a second gateway in one process
+    /// is not silently bound to the first one's environment. The default
+    /// still reads [`ROUTE_ADMISSION_WAIT_ENV`], so an operator moving the
+    /// operating point needs no code and persistd's own frozen
+    /// `..GatewayConfig::default()` construction needs no edit.
+    pub route_admission_wait_us: u64,
 }
 
 impl Default for GatewayConfig {
@@ -1961,6 +2069,7 @@ impl Default for GatewayConfig {
             authority_metrics: Arc::new(AuthorityMetrics::default()),
             lease_sweep_clock: Arc::new(RegistrarSweepClock),
             handoff_deadline_ms: 300,
+            route_admission_wait_us: route_admission_budget_us(),
         }
     }
 }
@@ -2955,6 +3064,7 @@ impl GatewayServer {
             pending: tokio::sync::Mutex::new(HashMap::new()),
         });
         let lease_sweep_clock = config.lease_sweep_clock;
+        let route_admission_wait_us = config.route_admission_wait_us;
         // One limiter per gateway, not per connection: the limit is per
         // account (docs/07 §7) and an account may hold several connections.
         let report_limiter = Arc::new(ReportLimiter::new());
@@ -2977,6 +3087,7 @@ impl GatewayServer {
             redistributor,
             lease_sweep_clock,
             Arc::clone(&send_failures),
+            route_admission_wait_us,
             rx,
         ));
         Ok(Self {
@@ -3085,6 +3196,15 @@ const INGRESS_RECORD_KIND: &str = "gateway_ingress";
 /// [`INGRESS_RECORD_KIND`].
 const LEASE_RECORD_KIND: &str = "gateway_lease";
 
+/// The fenced-apply stage decomposition, on the same additive-record footing.
+///
+/// `gateway_bulk_stage_delta` (persistd's own reporter, frozen to this lane)
+/// reports the whole of `Router::apply_fenced` as one `router_apply` number.
+/// This record splits that number into the striped entity gate, the
+/// `LeaseStore::locate` read, and the actor round trip — see
+/// [`crate::cluster::RouteStageMetrics`].
+const ROUTE_STAGE_RECORD_KIND: &str = "gateway_route_stage";
+
 /// Append the transport-boundary histograms to [`BOUNDARY_JSONL_ENV`]'s file
 /// on a fixed interval, as `sample_batch` records, plus the bulk-ingress
 /// admission counters as [`INGRESS_RECORD_KIND`] records.
@@ -3126,6 +3246,8 @@ fn spawn_boundary_reporter(metrics: Arc<GatewayMetrics>) {
             std::array::from_fn(|_| GatewayServerLatencySnapshot::default());
         let mut ingress_cursor = GatewayIngressSnapshot::default();
         let mut lease_cursor = GatewayLeaseSnapshot::default();
+        let route_stages = crate::cluster::route_stage_metrics();
+        let mut route_stage_cursor = crate::cluster::RouteStageSnapshot::default();
         loop {
             tokio::time::sleep(BOUNDARY_REPORT_INTERVAL).await;
             let ingress = metrics.ingress.snapshot();
@@ -3139,6 +3261,7 @@ fn spawn_boundary_reporter(metrics: Arc<GatewayMetrics>) {
                 warn!(
                     shed_saturated = ingress.shed_saturated,
                     shed_stale = ingress.shed_stale,
+                    shed_slow_route = ingress.shed_slow_route,
                     admitted = ingress.admitted,
                     "gateway: shedding bulk diffs at ingress"
                 );
@@ -3174,17 +3297,43 @@ fn spawn_boundary_reporter(metrics: Arc<GatewayMetrics>) {
             // such record, not a sum a reader has to reconstruct.
             if ingress != ingress_cursor {
                 out.push_str(&format!(
-                    "{{\"type\":\"{}\",\"admitted\":{},\"shed_saturated\":{},\"shed_stale\":{}}}\n",
+                    "{{\"type\":\"{}\",\"admitted\":{},\"shed_saturated\":{},\"shed_stale\":{},\"shed_slow_route\":{}}}\n",
                     INGRESS_RECORD_KIND,
                     ingress.admitted,
                     ingress.shed_saturated,
-                    ingress.shed_stale
+                    ingress.shed_stale,
+                    ingress.shed_slow_route
                 ));
             }
             if lease != lease_cursor {
                 out.push_str(&format!(
                     "{{\"type\":\"{}\",\"queued\":{},\"refused\":{}}}\n",
                     LEASE_RECORD_KIND, lease.queued, lease.refused
+                ));
+            }
+            // An interval delta, not a total, and deliberately unlike the two
+            // above: these are sums over a varying number of applies, so only
+            // a delta divided by its own `applies` is a mean anyone can read.
+            // Check your denominators: `applies` is per fenced apply, not per
+            // acknowledgement and not per flush.
+            let route_stage = route_stages.snapshot();
+            let route_delta = route_stage.delta(route_stage_cursor);
+            route_stage_cursor = route_stage;
+            if route_delta.applies > 0 || route_delta.batch_locks > 0 {
+                out.push_str(&format!(
+                    "{{\"type\":\"{}\",\"applies\":{},\"gate_wait_us_sum\":{},\"gate_wait_us_max\":{},\"locate_us_sum\":{},\"locate_us_max\":{},\"mailbox_us_sum\":{},\"mailbox_us_max\":{},\"batch_locks\":{},\"batch_gates_sum\":{},\"batch_hold_us_sum\":{},\"batch_hold_us_max\":{}}}\n",
+                    ROUTE_STAGE_RECORD_KIND,
+                    route_delta.applies,
+                    route_delta.gate_wait_us_sum,
+                    route_delta.gate_wait_us_max,
+                    route_delta.locate_us_sum,
+                    route_delta.locate_us_max,
+                    route_delta.mailbox_us_sum,
+                    route_delta.mailbox_us_max,
+                    route_delta.batch_locks,
+                    route_delta.batch_gates_sum,
+                    route_delta.batch_hold_us_sum,
+                    route_delta.batch_hold_us_max,
                 ));
             }
             ingress_cursor = ingress;
@@ -3219,6 +3368,7 @@ async fn accept_loop(
     redistributor: Arc<Redistributor>,
     lease_sweep_clock: SharedClaimClock,
     send_failures: Arc<AtomicU64>,
+    route_admission_wait_us: u64,
     mut shutdown: oneshot::Receiver<()>,
 ) {
     loop {
@@ -3262,6 +3412,7 @@ async fn accept_loop(
                     metrics,
                     redistributor,
                     send_failures,
+                    route_admission_wait_us,
                 ));
             }
         }
@@ -3293,6 +3444,7 @@ async fn handle_connection(
     metrics: Arc<GatewayMetrics>,
     redistributor: Arc<Redistributor>,
     send_failures: Arc<AtomicU64>,
+    route_admission_wait_us: u64,
 ) {
     let conn = match incoming.accept() {
         Ok(accepting) => match accepting.await {
@@ -3625,8 +3777,10 @@ async fn handle_connection(
                                 &router,
                                 &bulk_ack_admission,
                                 &metrics.bulk,
+                                &metrics.ingress,
                                 authority_metrics,
                                 received_at,
+                                route_admission_wait_us,
                             )
                             .await;
                         });
@@ -4807,8 +4961,10 @@ async fn route_session_diff(
     router: &Arc<dyn Router>,
     bulk_ack_admission: &SharedBulkAckAdmission,
     bulk_metrics: &GatewayBulkMetrics,
+    ingress_metrics: &GatewayIngressMetrics,
     authority_metrics: Arc<AuthorityMetrics>,
     received_at: Instant,
+    budget_us: u64,
 ) {
     // Liveness only, and the guard must not outlive this check.
     //
@@ -4841,11 +4997,13 @@ async fn route_session_diff(
             author: session.node,
             received_at,
             strict_authority: true,
+            budget_us,
             authority_metrics,
         },
         router,
         bulk_ack_admission,
         bulk_metrics,
+        ingress_metrics,
     )
     .await;
 }
@@ -4856,6 +5014,55 @@ struct DiffRoute {
     received_at: Instant,
     strict_authority: bool,
     authority_metrics: Arc<AuthorityMetrics>,
+    /// How long, since `received_at`, the router has to admit this diff to a
+    /// journal before it is shed. Zero disables the valve. Carried per route
+    /// rather than read from the process config inside `route_diff` so a test
+    /// can state the policy it is testing; the receive loop passes
+    /// [`route_admission_budget_us`].
+    budget_us: u64,
+}
+
+/// What the router did with a record, once, so the whole round trip can sit
+/// inside one timed future rather than being spliced by an early `return`.
+enum RouteAdmission {
+    /// The record reached (or failed to reach) the journal.
+    Journaled(Result<Arc<crate::journal::AppendHandle>, Reject>),
+    /// The fence refused it; the live row travels back for the NACK.
+    Fenced {
+        lease: Option<orrery_protocol::Lease>,
+        lease_id: LeaseId,
+        fence_now_ms: u64,
+    },
+}
+
+/// Run the router round trip under the route-admission budget, measured from
+/// the diff's *arrival*, not from here.
+///
+/// `None` means the budget was already spent before the call or ran out
+/// during it. Dropping the future cancels it, which is safe at every point it
+/// can be dropped: waiting on the entity gate and the `LeaseStore::locate`
+/// read leave no trace, and if it is dropped after the actor took the mailbox
+/// message the actor still journals the record — the client simply gets no
+/// ack for a write that happened, and re-offers it, where the fold is
+/// last-writer-wins per `(entity, tick)` and the replay is a no-op.
+///
+/// A zero budget disables the valve outright, which is the merged branch's
+/// behaviour and therefore the "before" leg of an A/B against it.
+async fn within_route_budget<T>(
+    received_at: Instant,
+    budget: u64,
+    route: impl std::future::Future<Output = T>,
+) -> Option<T> {
+    if budget == 0 {
+        return Some(route.await);
+    }
+    let remaining = budget.saturating_sub(elapsed_us(received_at));
+    if remaining == 0 {
+        return None;
+    }
+    tokio::time::timeout(Duration::from_micros(remaining), route)
+        .await
+        .ok()
 }
 
 /// Journal a bulk diff via the owning cell actor, then ack with the durable
@@ -4867,12 +5074,14 @@ async fn route_diff(
     router: &Arc<dyn Router>,
     bulk_ack_admission: &SharedBulkAckAdmission,
     bulk_metrics: &GatewayBulkMetrics,
+    ingress_metrics: &GatewayIngressMetrics,
 ) {
     let DiffRoute {
         diff,
         author,
         received_at,
         strict_authority,
+        budget_us,
         authority_metrics,
     } = route;
     let route_started = Instant::now();
@@ -4893,45 +5102,80 @@ async fn route_diff(
         payload: diff.payload,
         crc,
     };
-    let result = if strict_authority {
-        // The actor performs this comparison and append in one mailbox turn.
-        // A missing pair deliberately uses the never-granted zero token so it
-        // still returns the current row in the lease-specific NACK.
-        let (lease_id, authority_seq) = diff
-            .lease_id
-            .zip(diff.authority_seq)
-            .unwrap_or((LeaseId(0), Default::default()));
-        let fence_now_ms = registrar_now_ms();
-        match router
-            .apply_fenced(record, author, lease_id, authority_seq, fence_now_ms)
-            .await
-        {
-            Ok(FencedApply::Accepted(handle)) => Ok(handle),
-            Ok(FencedApply::Rejected(lease)) => {
-                // The single-writer invariant checker (D7 §5): a fenced-out
-                // write whose live row names a *different* unexpired holder is
-                // two peers believing they were the writer at once.
-                observe_fencing_rejection(
-                    &authority_metrics,
-                    entity,
-                    tick,
-                    author,
-                    lease_id,
-                    lease.as_ref(),
-                    fence_now_ms,
-                );
-                send(Bytes::from(encode_datagram(&GatewayReply::BulkNack {
-                    entity,
-                    tick,
-                    reason: 2,
+    // The valve, and the only reason it is here rather than in the receive
+    // loop: this `await` is where the queue is (`MAX_ROUTE_ADMISSION_WAIT_US`).
+    let admission = within_route_budget(received_at, budget_us, async {
+        if strict_authority {
+            // The actor performs this comparison and append in one mailbox
+            // turn. A missing pair deliberately uses the never-granted zero
+            // token so it still returns the current row in the lease-specific
+            // NACK.
+            let (lease_id, authority_seq) = diff
+                .lease_id
+                .zip(diff.authority_seq)
+                .unwrap_or((LeaseId(0), Default::default()));
+            let fence_now_ms = registrar_now_ms();
+            match router
+                .apply_fenced(record, author, lease_id, authority_seq, fence_now_ms)
+                .await
+            {
+                Ok(FencedApply::Accepted(handle)) => RouteAdmission::Journaled(Ok(handle)),
+                Ok(FencedApply::Rejected(lease)) => RouteAdmission::Fenced {
                     lease,
-                })));
-                return;
+                    lease_id,
+                    fence_now_ms,
+                },
+                Err(error) => RouteAdmission::Journaled(Err(error)),
             }
-            Err(error) => Err(error),
+        } else {
+            RouteAdmission::Journaled(router.apply(record).await)
         }
-    } else {
-        router.apply(record).await
+    })
+    .await;
+
+    let result = match admission {
+        // Refused, in silence, on exactly the convention the two ingress
+        // refusals already set: an un-acked diff stays pending in the peer's
+        // scheduler and is re-offered, usually as a newer tick, where a
+        // `BulkNack` would tell it to discard the write. The count is the
+        // honest part — see `GatewayIngressMetrics::record_shed_slow_route`.
+        None => {
+            ingress_metrics.record_shed_slow_route();
+            debug!(
+                entity = ?entity,
+                ?tick,
+                waited_us = elapsed_us(received_at),
+                budget_us,
+                "gateway: shed diff, router did not admit it inside its budget"
+            );
+            return;
+        }
+        Some(RouteAdmission::Fenced {
+            lease,
+            lease_id,
+            fence_now_ms,
+        }) => {
+            // The single-writer invariant checker (D7 §5): a fenced-out
+            // write whose live row names a *different* unexpired holder is
+            // two peers believing they were the writer at once.
+            observe_fencing_rejection(
+                &authority_metrics,
+                entity,
+                tick,
+                author,
+                lease_id,
+                lease.as_ref(),
+                fence_now_ms,
+            );
+            send(Bytes::from(encode_datagram(&GatewayReply::BulkNack {
+                entity,
+                tick,
+                reason: 2,
+                lease,
+            })));
+            return;
+        }
+        Some(RouteAdmission::Journaled(result)) => result,
     };
     let router_apply_us = elapsed_us(route_started);
     let journal_wait_started = Instant::now();
@@ -5695,6 +5939,231 @@ mod tests {
         );
     }
 
+    /// A router that never answers: it reports that it was entered, then
+    /// parks forever. Stands in for the entity-gate convoy the valve exists
+    /// to bound, without needing a real registrar to build one.
+    struct StalledRouter {
+        entered: Arc<AtomicU64>,
+    }
+
+    #[async_trait::async_trait]
+    impl Router for StalledRouter {
+        async fn apply(
+            &self,
+            _record: JournalRecord,
+        ) -> Result<Arc<crate::journal::AppendHandle>, Reject> {
+            self.entered.fetch_add(1, Ordering::Relaxed);
+            std::future::pending::<()>().await;
+            unreachable!("the stalled router never answers")
+        }
+
+        async fn read(&self, _grid: GridId, _cell: CellId) -> Result<SnapshotPage, Reject> {
+            Err(Reject::JournalClosed)
+        }
+
+        async fn has_actor(&self, _grid: GridId, _cell: CellId) -> bool {
+            false
+        }
+    }
+
+    fn valve_route(received_at: Instant, budget_us: u64) -> DiffRoute {
+        DiffRoute {
+            diff: DiffUplink {
+                cell: CellId::ROOT,
+                grid: GridId::ROOT,
+                entity: PersistId::new(31),
+                tick: orrery_protocol::Tick::new(5),
+                kind: orrery_protocol::RecordKind::ComponentDiff,
+                payload: Bytes::from_static(b"state"),
+                seq: 5,
+                lease_id: None,
+                authority_seq: None,
+            },
+            author: successor_node(9),
+            received_at,
+            strict_authority: false,
+            authority_metrics: Arc::new(AuthorityMetrics::default()),
+            budget_us,
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_router_that_cannot_admit_a_diff_inside_its_budget_sheds_it_and_says_so() {
+        // The defect the whole change is about: the ingress deadline is
+        // evaluated on arrival age at dequeue, so once the receive loop went
+        // instant it always passed and nothing bounded the wait that
+        // followed. This is that bound, and it is evaluated after the wait.
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let capture = Arc::clone(&sent);
+        let send = move |bytes| capture.lock().expect("capture lock").push(bytes);
+        let entered = Arc::new(AtomicU64::new(0));
+        let router: Arc<dyn Router> = Arc::new(StalledRouter {
+            entered: Arc::clone(&entered),
+        });
+        let admission: SharedBulkAckAdmission = Arc::new(AlwaysDurableAdmission);
+        let bulk = GatewayBulkMetrics::default();
+        let ingress = GatewayIngressMetrics::default();
+
+        // The outer deadline is a hundred budgets and exists only so that a
+        // valve deleted from `within_route_budget` fails this test loudly
+        // instead of hanging a CI job: `StalledRouter` never answers, so
+        // without the inner bound there is nothing else to end the await.
+        tokio::time::timeout(
+            Duration::from_micros(25_000 * 100),
+            route_diff(
+                &send,
+                valve_route(Instant::now(), 25_000),
+                &router,
+                &admission,
+                &bulk,
+                &ingress,
+            ),
+        )
+        .await
+        .expect("the route budget, not the test harness, must end this route");
+
+        assert_eq!(
+            entered.load(Ordering::Relaxed),
+            1,
+            "the router was reached; this is a downstream refusal, not an ingress one"
+        );
+        let counted = ingress.snapshot();
+        assert_eq!(counted.shed_slow_route, 1, "the refusal is a number");
+        assert_eq!(
+            (counted.shed_stale, counted.shed_saturated),
+            (0, 0),
+            "and it is its own number: the ingress queue was not what grew"
+        );
+        assert!(
+            sent.lock().expect("capture lock").is_empty(),
+            "silence, not a BulkNack: a nack would tell the peer to discard a write it should re-offer"
+        );
+        assert_eq!(
+            bulk.snapshot().acknowledgements,
+            0,
+            "a shed diff is not an acknowledged one"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_diff_already_past_its_budget_on_arrival_never_reaches_the_router() {
+        // Little's law in one assertion: work that cannot be answered in time
+        // must not occupy the router either, or the valve relieves the client
+        // and not the queue.
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let capture = Arc::clone(&sent);
+        let send = move |bytes| capture.lock().expect("capture lock").push(bytes);
+        let entered = Arc::new(AtomicU64::new(0));
+        let router: Arc<dyn Router> = Arc::new(StalledRouter {
+            entered: Arc::clone(&entered),
+        });
+        let admission: SharedBulkAckAdmission = Arc::new(AlwaysDurableAdmission);
+        let ingress = GatewayIngressMetrics::default();
+
+        // Real `std::time::Instant` arithmetic, not `tokio::time::advance`:
+        // the arrival stamp is a `std::time::Instant` and tokio's paused
+        // clock does not move it. That is not a detail of the test — a valve
+        // that measured tokio time would stop bounding anything the moment a
+        // caller paused the clock.
+        let arrived = Instant::now() - Duration::from_micros(25_001);
+        route_diff(
+            &send,
+            valve_route(arrived, 25_000),
+            &router,
+            &admission,
+            &GatewayBulkMetrics::default(),
+            &ingress,
+        )
+        .await;
+
+        assert_eq!(
+            entered.load(Ordering::Relaxed),
+            0,
+            "the budget is spent; the router must not be entered at all"
+        );
+        assert_eq!(ingress.snapshot().shed_slow_route, 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_router_that_answers_inside_the_budget_is_acknowledged_not_shed() {
+        // The mutation check for the two above: with the valve set to the
+        // shipped budget and a router that answers, nothing is shed. Delete
+        // the deadline arithmetic and this still passes, which is the point —
+        // it is here so a valve that fires on a healthy gateway fails loudly.
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let capture = Arc::clone(&sent);
+        let send = move |bytes| capture.lock().expect("capture lock").push(bytes);
+        let router: Arc<dyn Router> = Arc::new(SuccessfulRouter);
+        let admission: SharedBulkAckAdmission = Arc::new(AlwaysDurableAdmission);
+        let ingress = GatewayIngressMetrics::default();
+
+        route_diff(
+            &send,
+            valve_route(Instant::now(), MAX_ROUTE_ADMISSION_WAIT_US),
+            &router,
+            &admission,
+            &GatewayBulkMetrics::default(),
+            &ingress,
+        )
+        .await;
+
+        assert_eq!(ingress.snapshot().shed_slow_route, 0);
+        assert!(
+            matches!(
+                decode_datagram(&sent.lock().expect("capture lock").pop().expect("reply")),
+                Some(GatewayReply::BulkAck { .. })
+            ),
+            "a gateway that is keeping up acknowledges"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_zero_budget_is_the_valve_switched_off() {
+        // This is the "before" leg of every A/B in docs/08-persistence.md
+        // §3.6: with the budget at zero the route waits exactly as the merged
+        // branch did, so the two legs differ in one number and not in code.
+        let entered = Arc::new(AtomicU64::new(0));
+        let router: Arc<dyn Router> = Arc::new(StalledRouter {
+            entered: Arc::clone(&entered),
+        });
+        let admission: SharedBulkAckAdmission = Arc::new(AlwaysDurableAdmission);
+        let ingress = GatewayIngressMetrics::default();
+        let send = |_bytes: Bytes| {};
+
+        let route = tokio::spawn({
+            let router = Arc::clone(&router);
+            let admission = Arc::clone(&admission);
+            async move {
+                route_diff(
+                    &send,
+                    valve_route(Instant::now(), 0),
+                    &router,
+                    &admission,
+                    &GatewayBulkMetrics::default(),
+                    &GatewayIngressMetrics::default(),
+                )
+                .await;
+            }
+        });
+
+        tokio::time::advance(Duration::from_secs(60)).await;
+        assert!(
+            !route.is_finished(),
+            "a zero budget must wait, however long the router takes"
+        );
+        route.abort();
+        assert_eq!(ingress.snapshot().shed_slow_route, 0);
+    }
+
+    #[test]
+    fn the_two_deadlines_are_one_budget() {
+        // One staleness policy, evaluated twice: once on arrival age at
+        // dequeue and once around the router round trip. If these ever
+        // diverge silently, `shed_stale` and `shed_slow_route` stop being
+        // two views of the same rule and start being two rules.
+        assert_eq!(MAX_ROUTE_ADMISSION_WAIT_US, MAX_INGRESS_QUEUE_WAIT_US);
+    }
+
     #[test]
     fn claim_bucket_allows_d16_burst_then_refills_at_twenty_per_second() {
         let mut bucket = ClaimBucket::new(0);
@@ -6235,10 +6704,12 @@ mod tests {
                 author: iroh::SecretKey::from_bytes(&[1; 32]).public(),
                 received_at: Instant::now(),
                 strict_authority: false,
+                budget_us: 0,
             },
             &router,
             &admission,
             &metrics,
+            &GatewayIngressMetrics::default(),
         )
         .await;
 
@@ -6339,10 +6810,12 @@ mod tests {
                 author: iroh::SecretKey::from_bytes(&[2; 32]).public(),
                 received_at: Instant::now(),
                 strict_authority: false,
+                budget_us: 0,
             },
             &router,
             &admission,
             &GatewayBulkMetrics::default(),
+            &GatewayIngressMetrics::default(),
         )
         .await;
         let bytes = sent
@@ -6785,8 +7258,10 @@ mod tests {
                     &router,
                     &admission,
                     &bulk_metrics,
+                    &GatewayIngressMetrics::default(),
                     Arc::new(AuthorityMetrics::default()),
                     Instant::now(),
+                    0,
                 )
                 .await;
             }));

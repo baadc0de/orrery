@@ -14,7 +14,9 @@
 //! that the process-local shim is a distributed failover transport.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, LazyLock};
+use std::time::Instant;
 
 use orrery_protocol::{CellId, ClaimKind, Lease, LeaseId, NodeId, PersistId};
 
@@ -28,6 +30,165 @@ use crate::journal::{
 };
 use crate::placement::{RendezvousHasher, RendezvousNode};
 use crate::runtime::{CellRuntime, EntityStripeGates};
+
+/// The three waits inside one `Router::apply_fenced`, counted separately.
+///
+/// `gateway_bulk_stage_delta` calls the whole of `apply_fenced` "router_apply",
+/// and on the 2026-08-18 gate that one number was 8.198 ms mean against the
+/// 2.734 ms mean measured before the lease lane moved off the receive loop —
+/// which reads as an actor mailbox that has started to queue. It is not one
+/// wait. It is three, and they live in different subsystems:
+///
+/// * `gate_wait` — the 1024-way striped per-entity mutex, held across both
+///   waits below so a rekey cannot interleave with a fenced append.
+/// * `locate` — `LeaseStore::locate`, which under `--fdb-cluster-file` is a
+///   **FoundationDB read transaction**, one per admitted diff. Not a mailbox,
+///   not a disk: a network round trip to the cluster, on the write path.
+/// * `mailbox` — the actor round trip proper: `start_fenced_diff` send, queue,
+///   turn, reply.
+///
+/// Splitting them is the whole point of the exercise. A staleness valve has to
+/// go *after* the wait it bounds, and "router_apply" names three candidate
+/// waits at once; placing against the aggregate is guessing.
+///
+/// Counted process-globally rather than per-runtime because `CellRuntime` is
+/// frozen to this lane and cannot take a field. A node runs one gateway over
+/// one router, so the process aggregate *is* the router's.
+#[derive(Debug, Default)]
+pub struct RouteStageMetrics {
+    applies: AtomicU64,
+    gate_wait_us_sum: AtomicU64,
+    gate_wait_us_max: AtomicU64,
+    locate_us_sum: AtomicU64,
+    locate_us_max: AtomicU64,
+    mailbox_us_sum: AtomicU64,
+    mailbox_us_max: AtomicU64,
+    batch_locks: AtomicU64,
+    batch_gates_sum: AtomicU64,
+    batch_hold_us_sum: AtomicU64,
+    batch_hold_us_max: AtomicU64,
+}
+
+/// A point-in-time read of [`RouteStageMetrics`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RouteStageSnapshot {
+    /// Fenced applies that completed all three stages.
+    pub applies: u64,
+    /// Summed wait on the striped per-entity gate.
+    pub gate_wait_us_sum: u64,
+    /// Longest single wait on the striped per-entity gate.
+    pub gate_wait_us_max: u64,
+    /// Summed `LeaseStore::locate` time (an FDB read under `fdb`).
+    pub locate_us_sum: u64,
+    /// Longest single `LeaseStore::locate`.
+    pub locate_us_max: u64,
+    /// Summed actor round trip.
+    pub mailbox_us_sum: u64,
+    /// Longest single actor round trip.
+    pub mailbox_us_max: u64,
+    /// Batched lease operations that took a whole set of entity gates at once.
+    pub batch_locks: u64,
+    /// Total gates those batches held (summed set sizes).
+    pub batch_gates_sum: u64,
+    /// Summed time a batch held its whole gate set.
+    pub batch_hold_us_sum: u64,
+    /// Longest single batch hold.
+    pub batch_hold_us_max: u64,
+}
+
+impl RouteStageMetrics {
+    fn record(&self, gate_wait_us: u64, locate_us: u64, mailbox_us: u64) {
+        self.applies.fetch_add(1, Ordering::Relaxed);
+        for (sum, max, value) in [
+            (&self.gate_wait_us_sum, &self.gate_wait_us_max, gate_wait_us),
+            (&self.locate_us_sum, &self.locate_us_max, locate_us),
+            (&self.mailbox_us_sum, &self.mailbox_us_max, mailbox_us),
+        ] {
+            sum.fetch_add(value, Ordering::Relaxed);
+            max.fetch_max(value, Ordering::Relaxed);
+        }
+    }
+
+    fn record_batch_hold(&self, gates: usize, hold_us: u64) {
+        self.batch_locks.fetch_add(1, Ordering::Relaxed);
+        self.batch_gates_sum
+            .fetch_add(gates as u64, Ordering::Relaxed);
+        self.batch_hold_us_sum.fetch_add(hold_us, Ordering::Relaxed);
+        self.batch_hold_us_max.fetch_max(hold_us, Ordering::Relaxed);
+    }
+
+    /// Read every counter.
+    #[must_use]
+    pub fn snapshot(&self) -> RouteStageSnapshot {
+        let load = |v: &AtomicU64| v.load(Ordering::Relaxed);
+        RouteStageSnapshot {
+            applies: load(&self.applies),
+            gate_wait_us_sum: load(&self.gate_wait_us_sum),
+            gate_wait_us_max: load(&self.gate_wait_us_max),
+            locate_us_sum: load(&self.locate_us_sum),
+            locate_us_max: load(&self.locate_us_max),
+            mailbox_us_sum: load(&self.mailbox_us_sum),
+            mailbox_us_max: load(&self.mailbox_us_max),
+            batch_locks: load(&self.batch_locks),
+            batch_gates_sum: load(&self.batch_gates_sum),
+            batch_hold_us_sum: load(&self.batch_hold_us_sum),
+            batch_hold_us_max: load(&self.batch_hold_us_max),
+        }
+    }
+}
+
+impl RouteStageSnapshot {
+    /// This snapshot minus an earlier one: sums subtract, maxima do not — a
+    /// maximum is a run-high, exactly as in `GatewayBulkMetrics`' own delta.
+    #[must_use]
+    pub fn delta(self, previous: Self) -> Self {
+        let sub = |current: u64, previous: u64| current.saturating_sub(previous);
+        Self {
+            applies: sub(self.applies, previous.applies),
+            gate_wait_us_sum: sub(self.gate_wait_us_sum, previous.gate_wait_us_sum),
+            gate_wait_us_max: self.gate_wait_us_max,
+            locate_us_sum: sub(self.locate_us_sum, previous.locate_us_sum),
+            locate_us_max: self.locate_us_max,
+            mailbox_us_sum: sub(self.mailbox_us_sum, previous.mailbox_us_sum),
+            mailbox_us_max: self.mailbox_us_max,
+            batch_locks: sub(self.batch_locks, previous.batch_locks),
+            batch_gates_sum: sub(self.batch_gates_sum, previous.batch_gates_sum),
+            batch_hold_us_sum: sub(self.batch_hold_us_sum, previous.batch_hold_us_sum),
+            batch_hold_us_max: self.batch_hold_us_max,
+        }
+    }
+}
+
+static ROUTE_STAGE: LazyLock<Arc<RouteStageMetrics>> =
+    LazyLock::new(|| Arc::new(RouteStageMetrics::default()));
+
+/// The process-wide fenced-apply stage decomposition.
+#[must_use]
+pub fn route_stage_metrics() -> Arc<RouteStageMetrics> {
+    Arc::clone(&ROUTE_STAGE)
+}
+
+/// A batch's whole gate set, timed until it drops.
+///
+/// A guard rather than a pair of statements because the batched paths have
+/// `?` in them: an early return still releases the gates, so it must still
+/// record the hold, or the metric under-counts exactly the slow cases.
+struct HeldGates {
+    #[allow(dead_code)]
+    guards: Vec<tokio::sync::OwnedMutexGuard<()>>,
+    gates: usize,
+    started: Instant,
+}
+
+impl Drop for HeldGates {
+    fn drop(&mut self) {
+        ROUTE_STAGE.record_batch_hold(self.gates, stage_elapsed_us(self.started));
+    }
+}
+
+fn stage_elapsed_us(since: Instant) -> u64 {
+    u64::try_from(since.elapsed().as_micros()).unwrap_or(u64::MAX)
+}
 
 /// Lock a batch's entity gates without inventing a deadlock.
 ///
@@ -356,16 +517,28 @@ impl Router for CellRuntime {
         authority_seq: orrery_protocol::SeqPair,
         now_ms: u64,
     ) -> Result<FencedApply, Reject> {
+        // Three timed stages, not one. See `RouteStageMetrics` for why the
+        // aggregate this function reports as `router_apply` was not a usable
+        // answer to "where is the queue".
+        let stages = route_stage_metrics();
+        let started = Instant::now();
         let gate = self.entity_gate(record.grid, record.entity);
         let _guard = gate.lock_owned().await;
+        let gate_wait_us = stage_elapsed_us(started);
+        let locate_started = Instant::now();
         let route_cell = self
             .lease_location(record.entity)
             .await?
             .unwrap_or(record.cell);
-        self.actor(record.grid, route_cell)
+        let locate_us = stage_elapsed_us(locate_started);
+        let mailbox_started = Instant::now();
+        let applied = self
+            .actor(record.grid, route_cell)
             .ok_or(Reject::JournalClosed)?
             .start_fenced_diff(record, holder, lease_id, authority_seq, now_ms)
-            .await
+            .await;
+        stages.record(gate_wait_us, locate_us, stage_elapsed_us(mailbox_started));
+        applied
     }
 
     async fn read(&self, grid: GridId, cell: CellId) -> Result<SnapshotPage, Reject> {
@@ -441,12 +614,21 @@ impl Router for CellRuntime {
         renew: &[LeaseRenewal],
         now_ms: u64,
     ) -> Result<Vec<Option<Lease>>, Reject> {
-        let _guards = lock_entity_gates(
+        let guards = lock_entity_gates(
             renew
                 .iter()
                 .map(|entry| self.entity_gate(grid, entry.entity)),
         )
         .await;
+        // How long this batch keeps that whole set is the number that decides
+        // whether the diff path's `gate_wait` is the diff path's own fault.
+        let held = guards.len();
+        let hold_started = Instant::now();
+        let _guards = HeldGates {
+            guards,
+            gates: held,
+            started: hold_started,
+        };
         // Routing stays per entity: a lease that migrated since the grant is
         // owned by another actor, and a batch may straddle the two. Only the
         // mailbox turn is folded.

@@ -42,8 +42,27 @@ use orrery_protocol::{
 /// the test observes that the receive loop is still alive.
 const PROBE: PersistId = PersistId::new(9_999_999);
 
+/// A gateway with the downstream route valve **off**.
+///
+/// The saturation test below holds a connection at its route cap by parking
+/// every route in the router, and the valve exists precisely to stop a route
+/// from parking. With it on at its default 25 ms the parked routes are shed,
+/// the permits come back, and the cap is never reached — so this states the
+/// policy the test is about instead of inheriting one that contradicts it.
 fn gateway_config() -> GatewayConfig {
-    support::authority_config(support::node(7), GridId::ROOT, vec![CellId::ROOT])
+    GatewayConfig {
+        route_admission_wait_us: 0,
+        ..support::authority_config(support::node(7), GridId::ROOT, vec![CellId::ROOT])
+    }
+}
+
+/// The same gateway with the valve on, at a budget short enough that a test
+/// does not have to sleep through the shipped one.
+fn valved_gateway_config(route_admission_wait_us: u64) -> GatewayConfig {
+    GatewayConfig {
+        route_admission_wait_us,
+        ..support::authority_config(support::node(7), GridId::ROOT, vec![CellId::ROOT])
+    }
 }
 
 /// A router whose every append parks forever, counting arrivals.
@@ -70,6 +89,24 @@ impl Router for ParkingRouter {
 
     async fn has_actor(&self, _grid: GridId, _cell: CellId) -> bool {
         true
+    }
+}
+
+/// A router that answers immediately, with a completed handle.
+struct AnsweringRouter;
+
+#[async_trait::async_trait]
+impl Router for AnsweringRouter {
+    async fn apply(&self, _record: JournalRecord) -> Result<Arc<AppendHandle>, Reject> {
+        Ok(AppendHandle::completed(orrery_protocol::Lsn::new(1, 1)))
+    }
+
+    async fn read(&self, _grid: GridId, _cell: CellId) -> Result<SnapshotPage, Reject> {
+        Err(Reject::JournalClosed)
+    }
+
+    async fn has_actor(&self, _grid: GridId, _cell: CellId) -> bool {
+        false
     }
 }
 
@@ -197,6 +234,124 @@ async fn a_saturated_bulk_lane_sheds_the_excess_and_keeps_serving_the_connection
         ),
         other => panic!("saturated connection stopped serving: {other:?}"),
     }
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_router_that_will_not_answer_is_shed_downstream_and_counted_separately() {
+    // The regression this pins is the one the lease-lane offload created.
+    // `MAX_INGRESS_QUEUE_WAIT_US` is evaluated on arrival age at the instant
+    // the receive loop dequeues a message. Once the loop went instant
+    // (`gateway_ingress_queue_ms` p99 0.05 ms) that check passed for
+    // everything and bounded nothing, while the standing queue moved
+    // downstream of it — into the entity gate inside `Router::apply_fenced`.
+    // A deadline only bounds a wait it is evaluated *after*, so here the same
+    // budget is applied around the router round trip, and the refusal is its
+    // own counter because it is its own queue.
+    //
+    // `ParkingRouter` never answers, so every admitted diff must come back as
+    // `shed_slow_route` and none as an ack. Ten milliseconds rather than the
+    // shipped 25 so this does not become a sleep test.
+    let router = Arc::new(ParkingRouter {
+        entered: AtomicUsize::new(0),
+    });
+    let server = GatewayServer::spawn(valved_gateway_config(10_000), router.clone())
+        .await
+        .expect("spawn gateway");
+    let metrics = Arc::clone(server.metrics());
+    let client = dial(&server).await;
+
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut sent = 0u64;
+    while metrics.ingress.snapshot().shed_slow_route == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "no diff was ever shed downstream after {sent} sends, against a \
+             router that never answers: the route-admission budget is not \
+             being applied around the router round trip"
+        );
+        for _ in 0..32 {
+            sent += 1;
+            client
+                .conn
+                .send_state(&diff(PersistId::new(sent), RecordKind::ComponentDiff));
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    let shed = metrics.ingress.snapshot();
+    assert!(
+        router.entered.load(Ordering::SeqCst) > 0,
+        "the diffs reached the router: this is a refusal downstream of \
+         admission, not the ingress check firing again: {shed:?}"
+    );
+    assert!(
+        shed.admitted > 0,
+        "a downstream refusal is preceded by an admission, and the two \
+         overlap by design: {shed:?}"
+    );
+    assert_eq!(
+        (shed.shed_stale, shed.shed_saturated),
+        (0, 0),
+        "and it is counted apart from the two ingress refusals, because an \
+         operator reading one number must not have to guess which queue \
+         grew: {shed:?}"
+    );
+
+    // The silence convention, unchanged from the ingress refusals: an
+    // un-acked diff stays pending in the peer's scheduler and is re-offered,
+    // where a `BulkNack` would tell it to discard the write. The rekey probe
+    // is answered inline before any routing, so its reply is the only one
+    // this connection can produce.
+    client.conn.send_state(&diff(PROBE, RecordKind::Rekey));
+    match client.conn.next_reply(Duration::from_secs(10)).await {
+        Some(GatewayReply::BulkNack { entity, .. }) => assert_eq!(
+            entity, PROBE,
+            "a diff shed downstream is answered with silence, not with a nack"
+        ),
+        other => panic!("shedding connection stopped serving: {other:?}"),
+    }
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_gateway_that_is_keeping_up_sheds_nothing_downstream() {
+    // The mutation check for the test above. `ParkingRouter` is what makes
+    // that one fire; against a router that answers, the same budget must
+    // never refuse anything — a valve that trips on a healthy gateway is a
+    // throughput bug wearing a metric.
+    let router = Arc::new(AnsweringRouter);
+    let server = GatewayServer::spawn(valved_gateway_config(10_000), router)
+        .await
+        .expect("spawn gateway");
+    let metrics = Arc::clone(server.metrics());
+    let client = dial(&server).await;
+
+    for entity in 1..=64u64 {
+        client
+            .conn
+            .send_state(&diff(PersistId::new(entity), RecordKind::ComponentDiff));
+    }
+    // Every reply, then a full budget of quiet on top, so a late shed still
+    // lands inside the observation window.
+    let mut acked = 0;
+    while acked < 64 {
+        match client.conn.next_reply(Duration::from_secs(10)).await {
+            Some(GatewayReply::BulkAck { .. }) => acked += 1,
+            other => panic!("an answering router must acknowledge: {other:?}"),
+        }
+    }
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let shed = metrics.ingress.snapshot();
+    assert_eq!(
+        (shed.shed_slow_route, shed.shed_stale, shed.shed_saturated),
+        (0, 0, 0),
+        "nothing is refused on a gateway that is keeping up: {shed:?}"
+    );
+    assert_eq!(shed.admitted, 64, "{shed:?}");
 
     server.shutdown().await;
 }
