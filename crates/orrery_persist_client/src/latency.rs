@@ -29,6 +29,96 @@ pub use orrery_protocol::metrics::{
     SERIES_INTENT_COMMIT, SERIES_JOURNAL_COMMIT, UNGATED_SERIES,
 };
 
+// Client-side stage attribution for a bulk diff, in the order the stages
+// occur. Together they decompose the whole life of one acknowledged diff:
+//
+// ```text
+// queue()      flush()          socket write        reply lands     handler
+//   |--queue-----|-----send----------|------wire---------|--dispatch--|
+//                 \______________ bulk_ack_ms ___________/
+// ```
+//
+// # Why these are defined here and not in `orrery_protocol::metrics`
+//
+// They belong beside [`UNGATED_SERIES`], for exactly the reason that array's
+// doc comment gives: one definition shared by the producer (`p2-load`, via
+// this crate) and the consumer (`p2-dashboard`, via this crate's re-export).
+// They are declared in this crate instead only because `orrery_protocol` was
+// frozen to another lane when this attribution was added. Moving them into
+// `orrery_protocol::metrics::UNGATED_SERIES` (crates/orrery_protocol/src/
+// metrics.rs) and deleting [`CLIENT_UNGATED_SERIES`] is the correct final
+// home; the names and semantics do not change when it happens.
+//
+// # None of them is gated
+//
+// D16 sets no target for any of them. They exist so a `bulk_ack_ms`
+// regression can be attributed to rig backlog, the rig's own send path, the
+// wire, or the client's ack handling — the client-side counterpart of
+// `gateway_bulk_server_ms`. Deliberately **not** prefixed `gateway_`: the
+// P2 gate harness refuses to run if a `gateway_*_server_ms` name is gated,
+// and these are not server spans.
+/// Enqueue through flush selection: how long a queued diff waited for a send
+/// slot inside the rig's own priority/byte-budget scheduler.
+///
+/// This is *rig backlog*. It is upstream of anything the server can affect,
+/// and it is the number that says whether the rig is offering more load than
+/// it has capacity to send.
+pub const SERIES_CLIENT_BULK_QUEUE: &str = "client_bulk_queue_ms";
+
+/// Flush selection through the socket write that put the diff on the wire:
+/// the rig's own send path (payload work, per-diff bookkeeping, and the
+/// serialized walk over the flush batch).
+pub const SERIES_CLIENT_BULK_SEND: &str = "client_bulk_send_ms";
+
+/// Socket write through the instant the acknowledging datagram was taken off
+/// the socket by the receiving task: network plus everything the server did.
+///
+/// This is the span D16's "client-observed bulk ack" is actually about — the
+/// part of the round trip the server and the network own.
+pub const SERIES_CLIENT_BULK_WIRE: &str = "client_bulk_wire_ms";
+
+/// Reply arrival through the client handler that consumed it: the client's
+/// own ack-handling backlog, excluded from every other series by construction
+/// because replies are stamped in the reader task.
+pub const SERIES_CLIENT_BULK_DISPATCH: &str = "client_bulk_dispatch_ms";
+
+/// QUIC's own smoothed round-trip estimate for the session, sampled as a
+/// gauge rather than measured per operation.
+///
+/// This is the discriminator between "the network is slow" and "something at
+/// one end is queueing". `client_bulk_wire_ms` is measured by the application
+/// — socket write to the instant a reply is taken off the socket — so it
+/// carries every queue between those two points, at both ends. The QUIC RTT
+/// is computed inside the endpoint driver from ACK timing, so it sees the
+/// path and almost none of the application. When `client_bulk_wire_ms` is two
+/// orders of magnitude above this, the wire is exonerated and the time is
+/// queueing.
+///
+/// It is not free of the same effect: an endpoint driver that is itself
+/// scheduled late inflates its own RTT estimate. It is the closest available
+/// proxy for path time, not a ground truth, and it is reported as such.
+pub const SERIES_CLIENT_QUIC_RTT: &str = "client_quic_rtt_ms";
+
+/// The client-side attribution series, in canonical report order.
+///
+/// `p2-dashboard`'s `SERIES_KEYS` is fixed-length over `GATED_SERIES.len() +
+/// UNGATED_SERIES.len() + CLIENT_UNGATED_SERIES.len()`, so growing this array
+/// is a compile error there until the gate is taught to fold the new member —
+/// the same guard `UNGATED_SERIES` already carries.
+pub const CLIENT_UNGATED_SERIES: [&str; 5] = [
+    SERIES_CLIENT_BULK_QUEUE,
+    SERIES_CLIENT_BULK_SEND,
+    SERIES_CLIENT_BULK_WIRE,
+    SERIES_CLIENT_BULK_DISPATCH,
+    SERIES_CLIENT_QUIC_RTT,
+];
+
+/// Whether `name` is a series this crate's client-side attribution defines.
+#[must_use]
+pub fn is_client_series(name: &str) -> bool {
+    CLIENT_UNGATED_SERIES.contains(&name)
+}
+
 /// The number of bucket boundaries.
 const NUM_BOUNDARIES: usize = LATENCY_BOUNDARIES_US.len();
 

@@ -70,6 +70,7 @@ use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::net::SocketAddr;
 use std::path::Path;
 use std::process::ExitCode;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
@@ -133,6 +134,12 @@ const DRAIN_POLL_INTERVAL: Duration = Duration::from_millis(1);
 /// `budget / (payload + 64)` diffs per flush (uplink.rs:160-163); the startup
 /// fan-out assert is checked against exactly this number.
 const FLUSH_BUDGET_BYTES: usize = 1024;
+
+/// How often each session's QUIC RTT estimate is sampled into
+/// `client_quic_rtt_ms`. It is a smoothed gauge, not a per-operation
+/// measurement, so sampling it faster than the transport updates it would
+/// only reweight the same value.
+const RTT_SAMPLE_INTERVAL: Duration = Duration::from_millis(250);
 
 /// The uplink scheduler's per-diff overhead estimate (`size = payload + 64`,
 /// uplink.rs flush). The fan-out math sizes sessions against this constant.
@@ -805,11 +812,48 @@ fn scheduler_shards(
 /// population reported to the P2 dashboard. `LatencyHistogram::merge` keeps
 /// the same bounded-memory bucket semantics as a single scheduler.
 fn aggregate_bulk_latency(schedulers: &[UplinkScheduler]) -> LatencyHistogram {
+    aggregate(schedulers, UplinkScheduler::ack_latency)
+}
+
+/// Combine one per-scheduler histogram across every connection shard.
+fn aggregate(
+    schedulers: &[UplinkScheduler],
+    pick: fn(&UplinkScheduler) -> &LatencyHistogram,
+) -> LatencyHistogram {
     let mut combined = LatencyHistogram::new();
     for scheduler in schedulers {
-        combined.merge(scheduler.ack_latency());
+        combined.merge(pick(scheduler));
     }
     combined
+}
+
+/// Drain every client-side bulk series — the gated round trip and the four
+/// stages that decompose it — into the JSONL stream in one place.
+///
+/// One function because they must be drained together: a report that has
+/// `bulk_ack_ms` from the end of the run and its attribution from the middle
+/// of it decomposes two different populations.
+fn drain_bulk_series(sink: &telemetry::TelemetrySink, schedulers: &[UplinkScheduler]) {
+    sink.drain_histogram(
+        telemetry::SERIES_BULK_ACK,
+        &aggregate_bulk_latency(schedulers),
+    );
+    sink.drain_histogram(
+        telemetry::SERIES_CLIENT_BULK_QUEUE,
+        &aggregate(schedulers, UplinkScheduler::queue_latency),
+    );
+    sink.drain_histogram(
+        telemetry::SERIES_CLIENT_BULK_SEND,
+        &aggregate(schedulers, UplinkScheduler::send_latency),
+    );
+    sink.drain_histogram(
+        telemetry::SERIES_CLIENT_BULK_WIRE,
+        &aggregate(schedulers, UplinkScheduler::wire_latency),
+    );
+    sink.drain_histogram(
+        telemetry::SERIES_CLIENT_BULK_DISPATCH,
+        &aggregate(schedulers, UplinkScheduler::dispatch_latency),
+    );
 }
 
 /// Every *distinct* durable ack must have produced a `bulk_ack_ms` sample.
@@ -890,6 +934,15 @@ async fn bind_endpoint(secret_key: Option<&str>) -> Result<(Endpoint, SecretKey)
 /// reaches this process and not from when the loop got around to it.
 struct GatewayLink {
     conn: Connection,
+    /// Datagrams the reader task below has taken off the connection.
+    ///
+    /// The transport's own `frame_rx.datagram` counts what the endpoint driver
+    /// has decoded. The difference between the two is how many replies are
+    /// sitting in the connection's inbound queue *after* the driver and
+    /// *before* this process looks at them — the one gap in the round trip
+    /// that neither `client_bulk_wire_ms` (which ends when the reader task
+    /// stamps) nor the QUIC RTT (computed in the driver) can see.
+    datagrams_read: Arc<std::sync::atomic::AtomicU64>,
     /// The outbound control stream, opened on the first control message.
     control: tokio::sync::Mutex<Option<iroh::endpoint::SendStream>>,
     inbound: tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<(Bytes, Instant)>>,
@@ -904,8 +957,11 @@ impl GatewayLink {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let datagrams = conn.clone();
         let datagram_tx = tx.clone();
+        let datagrams_read = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let read_counter = Arc::clone(&datagrams_read);
         tokio::spawn(async move {
             while let Ok(pkt) = datagrams.read_datagram().await {
+                read_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 if datagram_tx.send((pkt, Instant::now())).is_err() {
                     return;
                 }
@@ -938,9 +994,25 @@ impl GatewayLink {
         });
         Self {
             conn,
+            datagrams_read,
             control: tokio::sync::Mutex::new(None),
             inbound: tokio::sync::Mutex::new(rx),
         }
+    }
+
+    /// Replies the endpoint driver has decoded but this process has not yet
+    /// taken off the connection.
+    ///
+    /// Zero means the reader task is keeping up and the whole of
+    /// `client_bulk_wire_ms` is on the far side of this socket. A depth that
+    /// grows with the run is this process falling behind, and the delay it
+    /// implies is `depth / (replies per second on this session)`.
+    fn rx_backlog(&self) -> u64 {
+        let decoded = self.conn.stats().frame_rx.datagram;
+        let read = self
+            .datagrams_read
+            .load(std::sync::atomic::Ordering::Relaxed);
+        decoded.saturating_sub(read)
     }
 
     /// Write a control payload on the reliable lane.
@@ -982,6 +1054,20 @@ impl GatewayLink {
         if let Err(e) = self.conn.send_datagram(Bytes::from(encode_datagram(msg))) {
             tracing::warn!(error = %e, "gateway datagram send failed");
         }
+    }
+
+    /// QUIC's current smoothed round-trip estimate for this connection.
+    ///
+    /// Computed inside the endpoint driver from ACK timing, so unlike
+    /// `client_bulk_wire_ms` it does not carry the application's own read
+    /// loop. Reading the two side by side is what separates a slow path from
+    /// a queue at one end of it.
+    /// `None` while no path is open (the connection is establishing or gone).
+    /// The selected path is the one application data is actually riding.
+    fn quic_rtt(&self) -> Option<Duration> {
+        let paths = self.conn.paths();
+        let selected = paths.iter().find(iroh::endpoint::Path::is_selected);
+        selected.or_else(|| paths.iter().next()).map(|p| p.rtt())
     }
 
     /// The next inbound payload from either lane, with its arrival instant.
@@ -1783,6 +1869,9 @@ impl Rig<'_> {
             .map(|session| start + session_phase_period * session_flush_phase(session) as u32)
             .collect::<Vec<_>>();
         let mut next_heartbeat = start + LEASE_HEARTBEAT;
+        let mut quic_rtt = LatencyHistogram::new();
+        let mut next_rtt_sample = start;
+        let mut max_rx_backlog = 0u64;
 
         while start.elapsed() < self.duration {
             // ── Receive: drain both lanes of every session ────────────────
@@ -1819,6 +1908,20 @@ impl Rig<'_> {
             if now >= next_heartbeat {
                 self.heartbeat_leases().await;
                 next_heartbeat = now + LEASE_HEARTBEAT;
+            }
+
+            // ── Path time ────────────────────────────────────────────────
+            // One RTT gauge per session per sampling tick. Cheap (a stats
+            // read), and the only number in the run that measures the wire
+            // without the application on top of it.
+            if now >= next_rtt_sample {
+                for link in &self.sessions {
+                    if let Some(rtt) = link.quic_rtt() {
+                        quic_rtt.record(rtt);
+                    }
+                    max_rx_backlog = max_rx_backlog.max(link.rx_backlog());
+                }
+                next_rtt_sample = now + RTT_SAMPLE_INTERVAL;
             }
 
             // ── Load: queue each entity's diff for this global frame ─────
@@ -1902,6 +2005,13 @@ impl Rig<'_> {
                         &GatewayMsg::Diff { diff: diff.clone() },
                     )
                     .await;
+                    // The datagram is now on the socket. Reporting the
+                    // instant splits `bulk_ack_ms` into the rig's own send
+                    // path and the wire; without it the flush-selection
+                    // stamp is all the scheduler has, and everything this
+                    // loop does between selecting a diff and writing it is
+                    // reported as gateway latency.
+                    sched.on_sent_at(diff.entity, diff.tick, Instant::now());
                     self.pending_diffs.insert(
                         (diff.entity, diff.tick),
                         DiffEvidence {
@@ -1945,8 +2055,8 @@ impl Rig<'_> {
             // stays silent there. The drain logic itself is covered by the
             // telemetry module's tests.
             if self.emit_json {
-                let bulk_latency = aggregate_bulk_latency(&schedulers);
-                sink.drain_histogram(telemetry::SERIES_BULK_ACK, &bulk_latency);
+                drain_bulk_series(&sink, &schedulers);
+                sink.drain_histogram(telemetry::SERIES_CLIENT_QUIC_RTT, &quic_rtt);
                 sink.drain_histogram(telemetry::SERIES_INTENT_COMMIT, intents.intent_latency());
             }
 
@@ -2003,8 +2113,8 @@ impl Rig<'_> {
         }
 
         if self.emit_json {
-            let bulk_latency = aggregate_bulk_latency(&schedulers);
-            sink.drain_histogram(telemetry::SERIES_BULK_ACK, &bulk_latency);
+            drain_bulk_series(&sink, &schedulers);
+            sink.drain_histogram(telemetry::SERIES_CLIENT_QUIC_RTT, &quic_rtt);
             sink.drain_histogram(telemetry::SERIES_INTENT_COMMIT, intents.intent_latency());
         }
         check_bulk_reply_coverage(aggregate_bulk_latency(&schedulers).total(), &stats)?;
@@ -2022,6 +2132,10 @@ impl Rig<'_> {
             intents = stats.intents_sent,
             intent_acks = stats.intent_acks,
             bulk_p99_us = aggregate_bulk_latency(&schedulers).p99().as_micros() as u64,
+            // The deepest the transport's inbound queue got on any one
+            // session. A bulk-ack tail with this at zero did not accrue on
+            // this side of the socket.
+            max_rx_backlog,
             intent_p99_us = intents.intent_latency().p99().as_micros() as u64,
             "run complete"
         );

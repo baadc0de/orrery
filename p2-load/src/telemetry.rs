@@ -31,6 +31,16 @@ pub use orrery_persist_client::latency::{
     SERIES_AREA_FIRST_PAGE, SERIES_BULK_ACK, SERIES_INTENT_COMMIT, SERIES_JOURNAL_COMMIT,
 };
 
+/// The client-side stage attribution for `bulk_ack_ms` — rig backlog, the
+/// rig's send path, the wire, and the rig's ack handling. Ungated (D16 sets no
+/// target for them); they exist so a bulk-ack tail can be attributed without
+/// re-running, the client-side counterpart of `gateway_bulk_server_ms`.
+#[allow(unused_imports)]
+pub use orrery_persist_client::latency::{
+    SERIES_CLIENT_BULK_DISPATCH, SERIES_CLIENT_BULK_QUEUE, SERIES_CLIENT_BULK_SEND,
+    SERIES_CLIENT_BULK_WIRE, SERIES_CLIENT_QUIC_RTT,
+};
+
 #[allow(dead_code)]
 fn now_ms() -> u64 {
     SystemTime::now()

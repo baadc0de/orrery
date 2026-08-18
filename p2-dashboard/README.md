@@ -20,6 +20,16 @@ or to the wire without re-running. D16 sets no target for it, so it is folded
 and reported with `"gate": "not_gated"` and never contributes to the verdict —
 present or absent.
 
+Five more, `client_bulk_{queue,send,wire,dispatch}_ms` and
+`client_quic_rtt_ms`, are the client side of the same attribution: the rig's
+own scheduler wait, its send path, the socket-write-to-reply span, its ack
+handling, and QUIC's own path RTT. `bulk_ack_ms` is `send + wire` exactly, so
+the five say which side of the socket a bulk-ack tail is on. Ungated, for the
+same reason and with the same consequence: present or absent, they never
+change the verdict. Their names live in `orrery_persist_client::latency`
+rather than `orrery_protocol::metrics` only because that crate was frozen when
+they were added; `CLIENT_UNGATED_SERIES` documents the move.
+
 The series names, the histogram boundaries and the bucket-reconstruction rule
 are **one definition**, `orrery_protocol::metrics`, re-exported through
 `orrery_persist_client::latency` and shared with `p2-load` and persistd. That
