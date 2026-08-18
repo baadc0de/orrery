@@ -2344,6 +2344,19 @@ impl Rig<'_> {
                     stats.intent_acks += 1;
                 }
                 intents.on_ack(intent_id, outcome);
+                // Retire the settled intent, which is what `IntentQueue`'s
+                // contract asks of a client that has observed the terminal
+                // status — and what the rig was not doing.
+                //
+                // Without this the queue never gives a slot back, so it fills
+                // to its 1024 capacity and `submit` returns `None` for the rest
+                // of the run. At a 3 % mix and 18 000 diffs/s that takes under
+                // two seconds: every `intent_commit_ms` sample in a 30 s point
+                // came from the opening burst, while sessions were still
+                // connecting, and `--intent-mix` had no effect on anything past
+                // it. The intent rate is now the mix, for the whole run.
+                intents.retire(intent_id);
+                self.intent_sessions.remove(&intent_id);
             }
             GatewayReply::AreaPage { .. } => {
                 if let Some(t0) = area_pending.get_mut(session).and_then(|s| s.take()) {
