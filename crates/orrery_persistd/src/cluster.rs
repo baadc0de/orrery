@@ -122,10 +122,14 @@ pub struct RouteStageSnapshot {
     /// can be *admitted* at — the actor requires `by_cell[e] == record.cell`
     /// before the fold that would move it — but it says nothing about the
     /// cell a diff *arrives* with, which the client puts in its `DiffUplink`.
-    /// What holds the fallback near zero is a check, not an invariant: the
-    /// gateway refuses a diff whose cell is not the one that session's lease
-    /// for that entity was granted at (`AuthoritySnapshot::misrouted_diffs`),
-    /// so a mismatched cell costs a NACK rather than a locate.
+    /// What holds the fallback near zero is a rate, not an invariant: the
+    /// gateway lets a diff whose cell its own lease index does not name
+    /// through only against a per-connection token bucket
+    /// (`AuthoritySnapshot::misrouted_diffs` / `misroute_throttled`), and an
+    /// *admitted* one repairs the index so the next diff needs no token. It
+    /// cannot simply be refused — a registrar-driven rekey moves an entity
+    /// without telling the gateway, and the holder's first write at the new
+    /// cell is exactly this shape.
     ///
     /// A hot fallback is therefore a real alarm: the FDB read is back at
     /// close to full rate, plus a wasted mailbox turn. Its cost is bounded
@@ -318,10 +322,11 @@ pub fn fenced_location_audit_every() -> u64 {
 ///
 /// The fallback is the expensive branch of the route — an FDB read plus a
 /// second mailbox turn — and which diffs take it is not entirely the server's
-/// choice: the cell a diff declares arrives on the wire. The gateway now
-/// refuses a diff whose cell is not the one this session's lease was granted
-/// at, which removes the vector it was reachable through, but "no vector we
-/// know of" is not a bound. This is the bound.
+/// choice: the cell a diff declares arrives on the wire. The gateway meters
+/// the connection that sends an unindexed cell (`MisrouteBucket`), which
+/// bounds the rate one peer can ask for the branch, but "one peer" is not
+/// "the fleet" and "no vector we know of" is not a bound at all. This is the
+/// bound.
 ///
 /// Bounded process-wide rather than per connection because the resource it
 /// protects is process-wide: `libfdb_c` runs **one** network thread per
