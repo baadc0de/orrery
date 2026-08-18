@@ -519,6 +519,30 @@ rig that can offer more than one box's `p2-load` can, which this study did not
 have. The *old* knee is the number that moved and is measurable: 40 000
 nominal / ~33.6 k delivered before, versus at least 99 k delivered after.
 
+**Re-measured after the review fixes.** Four changes since the table above
+touch this path — the sampled audit moved off the entity gate, `checked_row_cell`
+became a real `assert!`, the gateway gained one `HashMap` lookup per diff
+against a lock it already takes, and the fallback locate gained a permit pool
+— so the 20 000 and 80 000 points were re-run, two repeats, arms interleaved
+in one session, the merged branch tip against the fixed binary:
+
+| nominal/s | arm | delivered/s | durable acks/s | shed % | `gate_wait` ms/apply | FDB thread mean |
+|---|---|---|---|---|---|---|
+| 20 000 | merged tip | 18 029–18 034 | 18 028–18 033 | 0.00–0.01 | 0.000 | 6.5–8.2 % |
+| 20 000 | **+ fixes** | 17 936–18 032 | 17 936–18 031 | 0.00 | 0.000 | 6.6–7.6 % |
+| 80 000 | merged tip | 65 808–66 031 | 65 803–66 027 | 0.01 | 0.001–0.002 | 7.5–9.0 % |
+| 80 000 | **+ fixes** | 66 197–66 330 | 66 193–66 326 | 0.01 | 0.000 | 8.9 % |
+
+The arms are inside this box's own run-to-run spread at both points, and every
+route invariant held on all four runs: `mailbox_turns / applies` exactly 1.0,
+`locate_fallbacks` 0, `location_mismatches` 0, `leases_lost` 0, and
+`diff_nacks` **0** — the last being the end-to-end evidence that `p2-load`
+addresses its diffs at the cell it was granted, so the new per-connection
+probe bucket never fires on the workload. `bulk_ack_ms` p99 is the one number
+that moves visibly and is the one this box is worst at reproducing: 9–15 ms
+against 7–300 ms at 20 000, where the 300 ms is a single run's fsync
+excursion and the repeat of the same binary answered in 7 ms.
+
 **Superseded, and why it is left visible.** The first published version of
 this table had an `offered/s` column carrying the nominal figures, a "120 k"
 row and a "160 k" row read as two operating points, and a claim that the new
