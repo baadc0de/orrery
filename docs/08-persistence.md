@@ -473,6 +473,33 @@ queueing, no fjall and no Orrery code in the path. Four repeats of the same
 3.2, 5.5 and 4.4 ms — the device's own throughput moves 3× and its tail 1.7×
 between identical runs on an otherwise quiet box.
 
+**What that storage is.** `SSDPFKKW010X7` is a Solidigm P41 Plus — a *consumer*
+1 TB drive using **QLC NAND behind a dynamic SLC cache** — and
+`/sys/block/nvme0n1/queue/write_cache` reads `write back` with no power-loss
+protection. Two consequences follow directly, and together they account for both
+the level and the variance:
+
+- **No PLP means every `fdatasync` must reach NAND.** A drive with a
+  power-protected write cache can acknowledge a flush from DRAM in tens of
+  microseconds; this one cannot, and RAID1 pays that cost on both mirrors before
+  the barrier completes. That is the ~0.3 ms floor and the 3–5 ms p99.
+- **A dynamic SLC cache in front of QLC is bimodal by construction.** Sustained
+  writing fills the SLC region, after which the drive folds to QLC and write
+  latency degrades for as long as folding continues, recovering when the drive
+  next gets idle time. That is the shape §4.3 measures — regimes tens of seconds
+  long that recover, and that appear in either order between runs — and it fits
+  better than the `md2` write-intent bitmap, whose 64 MiB chunk at the journal's
+  ~2.5 MB/s predicts a boundary crossing every ~27 s but only *one slow barrier*
+  per crossing, not a sustained slow period. The bitmap remains worth ruling out
+  (`mdadm --grow --bitmap=none`, reversible; the cost is a full 920 GB resync
+  after an unclean shutdown instead of a dirty-chunk-only one), but it is the
+  second suspect, not the first.
+
+Neither is fixable in this repository. Both are reasons to read every number in
+this section as a property of *this box*, and to re-measure before carrying the
+conclusion to hardware with power-loss-protected write cache — where the barrier
+p99 the sizing below asks for is routine rather than out of reach.
+
 **The gate is not what makes it worse.** The open-loop rig
 (`tests/journal_arrival_rate.rs`) drives the same committer at the same rate
 with no actors, no FDB, no follower and no connections. Four back-to-back 30 s
