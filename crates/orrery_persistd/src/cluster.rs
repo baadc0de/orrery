@@ -282,17 +282,27 @@ impl RouteStageSnapshot {
 /// it, which is the only way to give up the signal and should not be the
 /// default anywhere.
 fn fenced_location_audit_due() -> bool {
+    static SEEN: AtomicU64 = AtomicU64::new(0);
+    match fenced_location_audit_every() {
+        0 => false,
+        every => SEEN.fetch_add(1, Ordering::Relaxed).is_multiple_of(every),
+    }
+}
+
+/// The resolved sampling interval, so a test can pin the documented default
+/// instead of inferring it from a counter.
+///
+/// Resolved once, on first use: setting the environment variable after an
+/// accept has already routed does nothing.
+#[must_use]
+pub fn fenced_location_audit_every() -> u64 {
     static EVERY: LazyLock<u64> = LazyLock::new(|| {
         std::env::var("ORRERY_FENCED_LOCATION_AUDIT_N")
             .ok()
             .and_then(|raw| raw.parse().ok())
             .unwrap_or(if cfg!(debug_assertions) { 1 } else { 1000 })
     });
-    static SEEN: AtomicU64 = AtomicU64::new(0);
-    match *EVERY {
-        0 => false,
-        every => SEEN.fetch_add(1, Ordering::Relaxed).is_multiple_of(every),
-    }
+    *EVERY
 }
 
 static ROUTE_STAGE: LazyLock<Arc<RouteStageMetrics>> =
