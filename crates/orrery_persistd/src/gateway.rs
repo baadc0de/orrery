@@ -1507,6 +1507,18 @@ impl GatewayReportMetrics {
 /// ingress backlog, upstream of every span it already measures.
 pub const SERIES_GATEWAY_INGRESS_QUEUE: &str = "gateway_ingress_queue_ms";
 
+/// The age a bulk diff had already reached when the receive loop refused it.
+///
+/// Separate from [`SERIES_GATEWAY_INGRESS_QUEUE`] on purpose. Both are "time
+/// spent in the inbound queue", but they answer different questions, and
+/// pooling them made the ingress series stop meaning anything: once refusals
+/// exist, a histogram over *every* arrival measures the age of a backlog being
+/// destroyed rather than the delay the gateway imposed on work it actually
+/// did, so it no longer predicts client-observed latency. It is the shed
+/// records that carry the long waits, by construction — they are shed *for*
+/// waiting.
+pub const SERIES_GATEWAY_SHED_AGE: &str = "gateway_shed_age_ms";
+
 /// A reply being handed to the transport through the instant the transport's
 /// send call returns: the gateway's hand-off cost, and nothing after it.
 ///
@@ -1530,9 +1542,10 @@ pub const SERIES_GATEWAY_REPLY_HANDOFF: &str = "gateway_reply_handoff_ms";
 /// Asserting either without this number is guessing.
 pub const SERIES_GATEWAY_SEND_BUFFER: &str = "gateway_send_buffer_bytes";
 
-/// The three transport-boundary series, in canonical report order.
-pub const GATEWAY_BOUNDARY_SERIES: [&str; 3] = [
+/// The four transport-boundary series, in canonical report order.
+pub const GATEWAY_BOUNDARY_SERIES: [&str; 4] = [
     SERIES_GATEWAY_INGRESS_QUEUE,
+    SERIES_GATEWAY_SHED_AGE,
     SERIES_GATEWAY_REPLY_HANDOFF,
     SERIES_GATEWAY_SEND_BUFFER,
 ];
@@ -1541,8 +1554,10 @@ pub const GATEWAY_BOUNDARY_SERIES: [&str; 3] = [
 /// every other gateway span so a percentile means the same thing across them.
 #[derive(Debug, Default)]
 pub struct GatewayBoundaryMetrics {
-    /// [`SERIES_GATEWAY_INGRESS_QUEUE`].
+    /// [`SERIES_GATEWAY_INGRESS_QUEUE`]. Admitted messages only.
     pub ingress_queue: GatewayServerLatency,
+    /// [`SERIES_GATEWAY_SHED_AGE`]. Refused bulk diffs only.
+    pub shed_age: GatewayServerLatency,
     /// [`SERIES_GATEWAY_REPLY_HANDOFF`].
     pub reply_handoff: GatewayServerLatency,
     /// [`SERIES_GATEWAY_SEND_BUFFER`], in bytes.
@@ -1556,6 +1571,15 @@ impl GatewayBoundaryMetrics {
         self.ingress_queue.record(micros);
     }
 
+    /// Record the age of a bulk diff the receive loop refused.
+    ///
+    /// Deliberately not folded into [`Self::record_ingress`]: a refused diff
+    /// waited, but it was never served, and a series that mixes the two stops
+    /// being a predictor of what the client sees.
+    pub fn record_shed_age(&self, micros: u64) {
+        self.shed_age.record(micros);
+    }
+
     /// Record one reply hand-off: `micros` on the send call, and the datagram
     /// buffer occupancy observed straight after it.
     pub fn record_reply(&self, micros: u64, buffered_bytes: u64) {
@@ -1563,16 +1587,17 @@ impl GatewayBoundaryMetrics {
         self.send_buffer.record(buffered_bytes);
     }
 
-    /// The three histograms paired with their series names, in report order.
+    /// The four histograms paired with their series names, in report order.
     ///
     /// A slice rather than three accessors so a reporter drains them in a
     /// loop: the one that matters lives in `persistd`'s binary, which this
     /// lane may not edit, and a caller-side loop is what makes wiring it up a
     /// single added line rather than three.
     #[must_use]
-    pub fn series(&self) -> [(&'static str, &GatewayServerLatency); 3] {
+    pub fn series(&self) -> [(&'static str, &GatewayServerLatency); 4] {
         [
             (SERIES_GATEWAY_INGRESS_QUEUE, &self.ingress_queue),
+            (SERIES_GATEWAY_SHED_AGE, &self.shed_age),
             (SERIES_GATEWAY_REPLY_HANDOFF, &self.reply_handoff),
             (SERIES_GATEWAY_SEND_BUFFER, &self.send_buffer),
         ]
@@ -3295,13 +3320,18 @@ async fn handle_connection(
             debug!(%remote, "gateway: connection closed");
             break;
         };
-        // Recorded before the decode and before any per-variant stamp, so it
+        // Measured before the decode and before any per-variant stamp, so it
         // is exactly the wait this loop imposed and contains none of the work
-        // the loop then does. Every inbound message contributes, including
-        // the ones that are refused: a backlog is not caused only by the
-        // messages that survive it.
+        // the loop then does.
+        //
+        // Recorded where the OUTCOME is known, not here. A diff that is about
+        // to be refused did wait, but it was never served, and a histogram
+        // over every arrival therefore measures the age of a backlog being
+        // destroyed rather than the delay the gateway imposed on work it
+        // actually did — which is precisely how this series stopped predicting
+        // client-observed latency once refusals landed. Refused diffs go to
+        // `gateway_shed_age_ms` instead; see the two shed arms below.
         let ingress_queue_us = elapsed_us(transport_at);
-        metrics.boundary.record_ingress(ingress_queue_us);
         let Some((channel, _)) = untag(&pkt) else {
             continue;
         };
@@ -3317,6 +3347,11 @@ async fn handle_connection(
             debug!(%remote, "gateway: undecodable message");
             continue;
         };
+        // Served by definition — only the bulk lane refuses. Diffs record in
+        // their own arm, once admission has decided.
+        if !matches!(msg, GatewayMsg::Diff { .. }) {
+            metrics.boundary.record_ingress(ingress_queue_us);
+        }
         // A versioned bootstrap is an ordinary one once its version is inside
         // the rolling-upgrade window, so the two share the admission path
         // below rather than duplicating it. Enforcement is confined to the
@@ -3702,6 +3737,7 @@ async fn handle_connection(
                 match admit_diff_route(&inflight_diffs, ingress_queue_us) {
                     DiffAdmission::Route(permit) => {
                         metrics.ingress.record_admitted();
+                        metrics.boundary.record_ingress(ingress_queue_us);
                         let send = Arc::clone(&send);
                         let router = Arc::clone(&router);
                         let bulk_ack_admission = Arc::clone(&bulk_ack_admission);
@@ -3730,6 +3766,7 @@ async fn handle_connection(
                     // answer on this lane, and where the count surfaces.
                     DiffAdmission::ShedStale => {
                         metrics.ingress.record_shed_stale();
+                        metrics.boundary.record_shed_age(ingress_queue_us);
                         debug!(
                             %remote,
                             entity = ?diff.entity,
@@ -3739,6 +3776,7 @@ async fn handle_connection(
                     }
                     DiffAdmission::ShedSaturated => {
                         metrics.ingress.record_shed_saturated();
+                        metrics.boundary.record_shed_age(ingress_queue_us);
                         debug!(
                             %remote,
                             entity = ?diff.entity,
@@ -5401,9 +5439,17 @@ mod tests {
     #[test]
     fn boundary_metrics_land_in_their_own_series_and_drain_exactly_once() {
         let metrics = GatewayBoundaryMetrics::default();
-        // 3 ms of ingress backlog, a 120 µs hand-off, 4 096 bytes already in
-        // the driver's datagram buffer behind it.
+        // 3 ms of ingress backlog on a diff that was SERVED, a 120 µs
+        // hand-off, 4 096 bytes already in the driver's datagram buffer behind
+        // it — and a 2 s wait on a diff that was REFUSED.
+        //
+        // The refused one is the point of this test. Both are "time in the
+        // inbound queue", and pooling them is what made the ingress series
+        // stop predicting client-observed latency: refused diffs are refused
+        // *for* waiting, so they carry every long sample by construction and
+        // drag a healthy served-latency distribution into the seconds.
         metrics.record_ingress(3_000);
+        metrics.record_shed_age(2_000_000);
         metrics.record_reply(120, 4_096);
 
         let mut cursors: [GatewayServerLatencySnapshot; GATEWAY_BOUNDARY_SERIES.len()] =
@@ -5426,6 +5472,13 @@ mod tests {
                     }]
                 ),
                 (
+                    SERIES_GATEWAY_SHED_AGE,
+                    vec![GatewayBulkSample {
+                        value_us: 2_000_000,
+                        count: 1
+                    }]
+                ),
+                (
                     SERIES_GATEWAY_REPLY_HANDOFF,
                     vec![GatewayBulkSample {
                         value_us: 200,
@@ -5441,7 +5494,8 @@ mod tests {
                 ),
             ],
             "each measurement belongs to exactly one series, at its bucket's \
-             upper bound on the shared lattice"
+             upper bound on the shared lattice — and a refused diff's two-second \
+             wait must NOT appear in the served-latency series"
         );
 
         let second: Vec<Vec<GatewayBulkSample>> = metrics
