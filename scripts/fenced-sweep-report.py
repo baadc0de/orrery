@@ -197,9 +197,15 @@ def fold(rows: list[dict]) -> None:
     for r in rows:
         by[(r["point"], r["arm"])].append(r)
     points = sorted({p for p, _ in by}, key=lambda p: (p[0], int(re.sub(r"\D", "", p) or 0)))
+    # Arm names come from the directory prefix, so this folds any two-armed
+    # study, not just the binary one it was written for: the ssd/memory engine
+    # arms of `fenced-ssd-driver.sh` fold here too. `before`/`after` keep their
+    # order when present; anything else sorts alphabetically after them.
+    order = {"before": 0, "after": 1}
+    arms = sorted({a for _, a in by}, key=lambda a: (order.get(a, 2), a))
     print("\t".join(["point", "arm", "n"] + FIELDS))
     for point in points:
-        for arm in ("before", "after"):
+        for arm in arms:
             group = by.get((point, arm))
             if not group:
                 continue
