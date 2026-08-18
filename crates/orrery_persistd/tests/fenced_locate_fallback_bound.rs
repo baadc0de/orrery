@@ -7,10 +7,13 @@
 //! at once, so a peer that could steer diffs onto the branch could steer the
 //! whole box's throughput with them.
 //!
-//! The gateway now refuses the diff shape that steered it
-//! (`AuthoritySnapshot::misrouted_diffs`), but "no vector we know of" is not
-//! a bound, so this is the bound: a permit pool, and this file is what says
-//! the pool is real.
+//! The gateway now meters the diff shapes that steered it — both a wrong
+//! cell and an entity the session holds no lease for
+//! (`AuthoritySnapshot::misrouted_diffs` / `unindexed_diffs`) — but "no
+//! vector we know of" is not a bound, so this is the bound: a permit pool,
+//! and this file is what says the pool is real. Note what it bounds:
+//! **concurrency, not rate.** The rate bound is the gateway's per-connection
+//! bucket, and this pool is what still holds when a vector slips past it.
 //!
 //! Its own test binary because the permit count resolves once per process
 //! from the environment.

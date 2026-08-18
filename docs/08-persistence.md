@@ -326,20 +326,54 @@ implemented first and failed two existing gateway tests, including
 exactly that write is acknowledged. A cheap gateway-side check cannot be
 authoritative about an entity's cell, because the only authority is the actor.
 
-So the mismatch buys a **probe**, and the probe is what is bounded:
+So the mismatch buys a **probe**, and the probe is what is bounded. There are
+**two** diff shapes the session index fails to confirm, and it is worth naming
+them separately because they have different causes and different endings:
 
-* **Per connection, a token bucket.** A diff whose cell the session index does
-  not name is routed if the connection can pay a token (`MisrouteBucket`: 32/s,
-  burst 256) and answered with a `BulkNack` without routing if it cannot.
-  `misrouted_diffs` counts the mismatches, `misroute_throttled` the refusals.
-* **An admitted probe repairs the index.** `route_diff` now reports whether
-  the router *admitted* the record, and admission is proof of location — the
-  actor admitted it only because its own `by_cell[entity]` names that cell and
-  its registrar row names this holder's live lease. So a rekey costs one token
-  per entity and then routes at full speed forever, while a peer whose cell is
-  simply wrong is never admitted, never repairs anything, and settles at 32
-  fallbacks a second instead of its own send rate. The bucket is sized for the
-  repair case: a 256-entity mass rekey drains the burst and does not stall.
+1. the index holds an entry for the entity naming **another cell** — the rekey
+   case, and the abuse case that mimics it;
+2. the index holds **no entry at all** — an entity this session was never
+   granted a lease for.
+
+Shape 2 needs no lease, no rekey and no setup: it is the cheapest way a peer
+can reach the expensive branch, because an entity with no row anywhere is
+`Rejected(None)` at the router, and `Rejected(None)` is exactly the answer that
+does *not* short-circuit — it takes the fallback and spends its locate. **It
+was not bounded at all until this was written down.** The predicate was
+`indexed.is_some_and(...)`, so shape 2 read as "not misrouted": it took no
+token, incremented no counter, could not be throttled, and routed. A probe of
+1000 diffs at a foreign cell for an unheld entity measured
+`routed_to_router=1000  misrouted_diffs=0  misroute_throttled=0`. Of the three
+bounds below, only the third — the process-wide permit pool — applied to it,
+and a permit pool caps **concurrency, not rate**. This is not a regression
+against the pre-change route (every fenced diff paid an unconditional locate
+then, so one locate per diff *is* the old cost), but it was a bound this
+section claimed and the code did not have.
+
+Both shapes now take the same path:
+
+* **Per connection, a token bucket.** A diff whose route the session index
+  does not confirm — either shape — is routed if the connection can pay a
+  token (`MisrouteBucket`: 32/s, burst 256) and answered with a `BulkNack`
+  without routing if it cannot. `misrouted_diffs` counts both shapes,
+  `unindexed_diffs` the subset that is shape 2, and `misroute_throttled` the
+  refusals. All three are exported on the `gateway_authority` JSONL record;
+  they were in-process counters that nothing scraped, which made the alarm
+  this section names unreadable in ops even where it did fire.
+* **An admitted probe repairs the index — shape 1 only.** `route_diff` reports
+  whether the router *admitted* the record, and admission is proof of location
+  — the actor admitted it only because its own `by_cell[entity]` names that
+  cell and its registrar row names this holder's live lease. So a rekey costs
+  one token per entity and then routes at full speed forever. A peer whose
+  cell is simply wrong is never admitted, never repairs anything, and settles
+  at 32 fallbacks a second instead of its own send rate. The bucket is sized
+  for the repair case: a 256-entity mass rekey drains the burst and does not
+  stall. Shape 2 is **deliberately not repaired**: the repair writes through
+  `get_mut`, so it cannot fabricate a `SessionLease` the gateway never granted
+  — an invented entry would enter `lease_capacity` accounting,
+  `resolve_renewals` and `cleanup_peer_session`'s park loop, and admission does
+  not name the row's owner generation. Shape 2 therefore also settles at 32/s,
+  by never leaving the metered path rather than by never being admitted.
 * **Across connections, a permit pool.** `ORRERY_FENCED_LOCATE_FALLBACK_PERMITS`
   (default 64) caps concurrent fallback locates process-wide. Process-wide
   rather than per connection on purpose: the resource being protected is one
@@ -350,12 +384,35 @@ So the mismatch buys a **probe**, and the probe is what is bounded:
   which counts what it drops. The expensive branch therefore degrades into an
   existing, measured valve instead of into FDB-thread saturation.
 
+**Why metering shape 2 is safe, stated as the argument rather than assumed.**
+Treating "no entry" as unproven would be wrong if a legitimate write could
+outrun its own index entry. It cannot: a peer learns it holds a lease only
+from `LeaseMsg::Grant`, both emitters send it *after* `complete_lease_claim`
+has inserted the entry, every removal (`divest_lease`, `unwind_grant`,
+`cleanup_peer_session`, the compensation path) is paired with a `park_lease`
+that has already made the router reject the write anyway, and a failed renewal
+reports `invalid` without touching the map. The rekey case that made this a
+probe rather than a refusal keeps its entry throughout — only the *cell*
+moves. Shape 2 accordingly has **no legitimate producer**, which is why
+`unindexed_diffs` is expected at a flat zero rather than at a rekey-shaped
+spike. It is still a probe and not a refusal, so if that argument is ever
+falsified by a new grant path the cost is a metered 32/s rather than a hard
+stop.
+
+One detection consequence is accepted in exchange: a throttled diff is not
+routed, so it can no longer raise `duplicate_authority` against a *different*
+live holder. The first 256 still do, so the detector still fires — it simply
+cannot be driven at a peer's chosen rate, which is the point of the bucket.
+
 `locate_fallbacks` is still expected at ~0 and is still the alarm if it is
 not. What has changed is the honesty of the reason: it is low because a probe
 allowance holds it low and a pool bounds what gets past the allowance, not
 because the protocol makes it impossible. The inline gateway test
 `a_diff_at_an_unindexed_cell_probes_once_repairs_the_index_and_is_then_throttled`
-pins the probe, the repair and the throttle, and
+pins the probe, the repair and the throttle for shape 1;
+`diffs_for_an_entity_this_session_holds_no_lease_for_are_metered_too` reruns
+the 1000-diff probe above and pins shape 2 at 256 routed, 744 throttled, 1000
+counted, and no fabricated index entry; and
 `tests/fenced_locate_fallback_bound.rs` pins the pool at a peak of 2 in-flight
 locates against 8 concurrent fallbacks.
 
@@ -432,9 +489,16 @@ sampling rate stays at 1 in 1000.** At the 99 k diffs/s this change sustains
 of [14-capacity.md](14-capacity.md) measured the FDB client thread at 25.8 %
 of a core while serving ~18 000 locates/s, i.e. ~14 µs of that thread each, so
 99/s is ~0.14 % of one core: below the noise floor of every other number in
-this document, and with the reads off the gate it buys no latency at all.
-Lowering it buys nothing measurable; raising it trades away the only
-production evidence that J holds.
+this document.
+
+Its **latency** cost is not zero, and an earlier draft of this paragraph said
+it was. Taking the audit off the entity gate means it costs no other diff
+anything — that is what `tests/fenced_route_audit_gate.rs` pins — but
+`apply_fenced` still `await`s `finish_location_audit` before it returns, so the
+**sampled diff's own** route return is delayed by its own locate. At 1 in 1000
+that is one diff in a thousand paying roughly one FDB read on top of its
+route, and no other diff paying anything for it. Lowering the rate buys nothing
+measurable; raising it trades away the only production evidence that J holds.
 
 So the section title is exact only with that footnote. **FoundationDB is off
 the bulk *routing* path — every accepted fenced diff, without exception —

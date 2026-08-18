@@ -123,13 +123,19 @@ pub struct RouteStageSnapshot {
     /// before the fold that would move it — but it says nothing about the
     /// cell a diff *arrives* with, which the client puts in its `DiffUplink`.
     /// What holds the fallback near zero is a rate, not an invariant: the
-    /// gateway lets a diff whose cell its own lease index does not name
+    /// gateway lets a diff whose route its own lease index does not confirm
     /// through only against a per-connection token bucket
-    /// (`AuthoritySnapshot::misrouted_diffs` / `misroute_throttled`), and an
-    /// *admitted* one repairs the index so the next diff needs no token. It
-    /// cannot simply be refused — a registrar-driven rekey moves an entity
-    /// without telling the gateway, and the holder's first write at the new
-    /// cell is exactly this shape.
+    /// (`AuthoritySnapshot::misrouted_diffs` / `unindexed_diffs` /
+    /// `misroute_throttled`), and an *admitted* one repairs the index so the
+    /// next diff needs no token. It cannot simply be refused — a registrar-
+    /// driven rekey moves an entity without telling the gateway, and the
+    /// holder's first write at the new cell is exactly this shape.
+    ///
+    /// "Does not confirm" covers two shapes, and the second used to be free:
+    /// an index entry naming another cell, **and no index entry at all**. An
+    /// entity with no row anywhere is `Rejected(None)`, which is the one
+    /// answer that does not short-circuit, so it lands here too — see
+    /// docs/08-persistence.md §2.1.2.
     ///
     /// A hot fallback is therefore a real alarm: the FDB read is back at
     /// close to full rate, plus a wasted mailbox turn. Its cost is bounded

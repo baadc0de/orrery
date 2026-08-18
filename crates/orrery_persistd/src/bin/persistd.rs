@@ -300,6 +300,14 @@ fn write_gateway_authority(
         &serde_json::json!({
             "type": "gateway_authority",
             "duplicate_authority": snapshot.duplicate_authority,
+            // docs/08-persistence.md §2.1.2 names these three as the alarm for
+            // a peer steering diffs onto the fenced route's expensive branch.
+            // They were counted in-process and never scraped, so the alarm
+            // existed only in a `snapshot()` nobody read; a documented alarm
+            // that is not exported is a paragraph, like the two below it.
+            "misrouted_diffs": snapshot.misrouted_diffs,
+            "unindexed_diffs": snapshot.unindexed_diffs,
+            "misroute_throttled": snapshot.misroute_throttled,
             "reassigned": snapshot.reassigned,
             "parked_without_successor": snapshot.parked_without_successor,
             "divested": snapshot.divested,
@@ -1847,11 +1855,13 @@ mod tests {
 
     #[test]
     fn gateway_authority_record_carries_every_counter() {
-        // Five of the seven were emitted for a while. The two that were not
-        // are `divest_requested` and `handoff_timed_out`, and the second is
-        // the zombie-host symptom docs/09-services-and-ops.md §10's runbook
-        // turns on: a holder that answers no divest request. The snapshot is
-        // the schema's only source, so the assertion is on the key set.
+        // Five of the ten were emitted for a while. Of the five that were
+        // not, `handoff_timed_out` is the zombie-host symptom
+        // docs/09-services-and-ops.md §10's runbook turns on — a holder that
+        // answers no divest request — and the three misroute counters are the
+        // alarm docs/08-persistence.md §2.1.2 names for a peer steering diffs
+        // onto the fenced route's expensive branch. The snapshot is the
+        // schema's only source, so the assertion is on the key set.
         let metrics = AuthorityMetrics::default();
         // A cursor that differs from the (all-zero) snapshot, so the record is
         // written: the writer is deliberately change-triggered.
@@ -1869,6 +1879,9 @@ mod tests {
         assert_eq!(record["type"], "gateway_authority");
         for field in [
             "duplicate_authority",
+            "misrouted_diffs",
+            "unindexed_diffs",
+            "misroute_throttled",
             "reassigned",
             "parked_without_successor",
             "divested",
@@ -1884,8 +1897,8 @@ mod tests {
         let object = record.as_object().expect("record is an object");
         assert_eq!(
             object.len(),
-            8,
-            "seven counters plus the type tag: {object:?}"
+            11,
+            "ten counters plus the type tag: {object:?}"
         );
         // p3-island's reader takes `duplicate_authority` and ignores every
         // other key, so widening the record is safe for the one parser there
