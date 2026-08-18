@@ -48,7 +48,8 @@ use clap::Parser;
 use serde::{Deserialize, Serialize};
 
 use orrery_persist_client::latency::{
-    is_client_series, is_known_series, LatencyHistogram, CLIENT_UNGATED_SERIES, GATED_SERIES,
+    is_byte_series, is_client_series, is_gateway_boundary_series, is_known_series,
+    LatencyHistogram, CLIENT_UNGATED_SERIES, GATED_SERIES, GATEWAY_BOUNDARY_SERIES,
     SERIES_AREA_FIRST_PAGE, SERIES_BULK_ACK, SERIES_INTENT_COMMIT, SERIES_JOURNAL_COMMIT,
     UNGATED_SERIES,
 };
@@ -63,7 +64,11 @@ use orrery_persist_client::latency::{
 /// error here rather than a series silently counted as unknown. That is the
 /// intended failure: this workspace is excluded from the root one, so nothing
 /// else would notice.
-const SERIES_KEYS: [&str; GATED_SERIES.len() + UNGATED_SERIES.len() + CLIENT_UNGATED_SERIES.len()] = [
+const SERIES_KEYS: [&str;
+    GATED_SERIES.len()
+        + UNGATED_SERIES.len()
+        + GATEWAY_BOUNDARY_SERIES.len()
+        + CLIENT_UNGATED_SERIES.len()] = [
     GATED_SERIES[0],
     GATED_SERIES[1],
     GATED_SERIES[2],
@@ -71,16 +76,129 @@ const SERIES_KEYS: [&str; GATED_SERIES.len() + UNGATED_SERIES.len() + CLIENT_UNG
     UNGATED_SERIES[0],
     UNGATED_SERIES[1],
     UNGATED_SERIES[2],
+    GATEWAY_BOUNDARY_SERIES[0],
+    GATEWAY_BOUNDARY_SERIES[1],
+    GATEWAY_BOUNDARY_SERIES[2],
     CLIENT_UNGATED_SERIES[0],
     CLIENT_UNGATED_SERIES[1],
     CLIENT_UNGATED_SERIES[2],
     CLIENT_UNGATED_SERIES[3],
     CLIENT_UNGATED_SERIES[4],
+    CLIENT_UNGATED_SERIES[5],
 ];
 
 /// How many of [`SERIES_KEYS`] carry a D16 threshold. The rest are folded and
 /// reported, never gated.
 const NUM_GATED: usize = GATED_SERIES.len();
+
+/// Which gated series' spans strictly *contain* which other gated series'
+/// spans, as `(outer, &[inner…])`.
+///
+/// # The problem this fixes
+///
+/// The four D16 series are presented as four independent gates, and three of
+/// them are not independent of each other. `bulk_ack_ms` is, by construction,
+/// a journal commit plus routing plus two trips over the wire: the client
+/// stamps at flush selection and stops when the acknowledging datagram lands,
+/// and that acknowledgement is only sent once the journal has reported the
+/// record durable. `intent_commit_ms` contains a durable commit for the same
+/// reason. So `bulk_ack_ms` (5 ms) cannot pass while `journal_commit_ms`
+/// (2 ms) fails at 100 ms, and neither can `intent_commit_ms` (10 ms).
+///
+/// A run in that state printed three `FAIL` rows as three peers. A reader
+/// with three failures and no stated relation between them opens three
+/// investigations, two of which are the same investigation. Worse, the two
+/// dependents carry no information at all in that state: they were going to
+/// fail whatever else was true of them.
+///
+/// # Is the gate, as presented, fair and useful?
+///
+/// Fair, yes — every threshold is a real D16 target measured over the span it
+/// names, and the durable ack really did take that long. Useful, no: a
+/// verdict table's job is to say what to look at, and this one said "look at
+/// three things" when there was one thing.
+///
+/// The fix is *not* to suppress or relax the dependents. A dependent that
+/// fails still fails; the exit code, the per-series verdicts and every
+/// threshold are byte-for-byte what they were, and
+/// `containment_changes_no_verdict` is the guard on that. What changes is the
+/// ordering the report hands the reader: each failing series is classified as
+/// a **root** (nothing it contains is also failing, so its excess is its own)
+/// or a **consequence** (something it contains is failing, so it cannot pass
+/// until that does), and the roots are named first.
+///
+/// # What the containment claim does and does not assert
+///
+/// Per operation it is exact: the acknowledgement for one diff strictly
+/// encloses the commit that diff waited on, so that diff's `bulk_ack_ms`
+/// sample is greater than that commit's `journal_commit_ms` sample.
+///
+/// Across *percentiles* it is an implication, not an identity: the two series
+/// count different populations — `journal_commit_ms` samples group commits,
+/// `bulk_ack_ms` samples acknowledged diffs, and one group commit answers
+/// many diffs. A committer that is slow on 1 % of its commits can be slow for
+/// far more than 1 % of the diffs riding them, so the dependent's p99 is
+/// pushed *up* by the root's tail, never held below it. The report says
+/// "cannot pass while its inner series fails" on that basis, and never
+/// asserts a numeric identity between the two p99s.
+const CONTAINMENT: [(&str, &[&str]); 2] = [
+    (SERIES_BULK_ACK, &[SERIES_JOURNAL_COMMIT]),
+    (SERIES_INTENT_COMMIT, &[SERIES_JOURNAL_COMMIT]),
+];
+
+/// The gated series whose spans `key` strictly contains. Empty for a series
+/// that contains no other gated span.
+fn contained_by(key: &str) -> &'static [&'static str] {
+    CONTAINMENT
+        .iter()
+        .find(|(outer, _)| *outer == key)
+        .map_or(&[][..], |(_, inner)| *inner)
+}
+
+/// Where a failing series sits in the containment order.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum FailureRole {
+    /// This series fails and nothing it contains does: the excess is its own,
+    /// and this is where the investigation starts.
+    Root,
+    /// This series fails and so does something it contains. It cannot pass
+    /// until that one does, so on its own it carries no new information.
+    Consequence {
+        /// The failing inner series, in report order.
+        of: Vec<&'static str>,
+    },
+}
+
+/// The unit a series' numbers are in. The histogram lattice is a set of
+/// integers and knows nothing about units; two attribution members are byte
+/// gauges that share it because 50 B … 1 MiB is the range it covers. Printing
+/// those under a "µs" header would be a lie told by a column title.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum SeriesUnit {
+    /// Microseconds.
+    Us,
+    /// Bytes.
+    Bytes,
+}
+
+impl SeriesUnit {
+    fn of(key: &str) -> Self {
+        if is_byte_series(key) {
+            Self::Bytes
+        } else {
+            Self::Us
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Us => "µs",
+            Self::Bytes => "B",
+        }
+    }
+}
 
 /// D16 defaults (docs/adr/0016-parameter-reference.md) as **µs ceilings** on
 /// the p99. These
@@ -128,6 +246,18 @@ struct SeriesSummary {
     threshold_us: Option<u64>,
     /// Whether this series met its threshold.
     gate: SeriesGate,
+    /// The unit `p50`/`p99`/`max` are in. Microseconds for every latency
+    /// series; bytes for the two send-buffer gauges that share the lattice.
+    unit: SeriesUnit,
+    /// The gated series whose spans this one strictly contains ([`CONTAINMENT`]).
+    /// Empty for every ungated series and for the innermost gated one.
+    #[serde(skip_serializing_if = "<[_]>::is_empty")]
+    contains: &'static [&'static str],
+    /// Set only on a failing series: whether this failure is a root cause or
+    /// a consequence of a failing series it contains. Never affects
+    /// [`SeriesSummary::gate`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    failure_role: Option<FailureRole>,
 }
 
 /// Per-series gate outcome.
@@ -209,6 +339,12 @@ struct Report {
     run: Option<RunContext>,
     /// Per-series summaries, keyed by the wire series name.
     series: BTreeMap<&'static str, SeriesSummary>,
+    /// The failing series that are not explained by another failing series
+    /// they contain — what to look at first, in report order. Empty on a
+    /// passing run. A reader who fixes every entry here has addressed every
+    /// failure in the run, because the rest are downstream of these.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    root_causes: Vec<&'static str>,
 }
 
 /// One JSONL record (the subset of fields the dashboard needs). Unknown extra
@@ -379,7 +515,11 @@ fn ingest(
                 return None;
             };
             let Some(idx) = SERIES_KEYS.iter().position(|&k| k == series) else {
-                debug_assert!(!is_known_series(&series) && !is_client_series(&series));
+                debug_assert!(
+                    !is_known_series(&series)
+                        && !is_client_series(&series)
+                        && !is_gateway_boundary_series(&series)
+                );
                 return Some(series);
             };
             let count = if r.kind == "sample_batch" {
@@ -413,6 +553,36 @@ fn threshold_for(t: &ThresholdsUs, key: &str) -> Option<u64> {
 /// exit code under `--gate`. This is the whole gate; `run()` is just this
 /// plus file IO, so the tests exercise the exact binary path.
 fn report_and_maybe_gate(cli: &Cli, thresholds: &ThresholdsUs, loaded: &Loaded) -> ExitCode {
+    let report = build_report(thresholds, loaded);
+
+    if cli.json {
+        match serde_json::to_string_pretty(&report) {
+            Ok(json) => println!("{json}"),
+            Err(e) => {
+                eprintln!("error: report serialization failed: {e}");
+                return ExitCode::from(2);
+            }
+        }
+    } else {
+        print_human(&report);
+    }
+
+    if cli.gate {
+        if report.gate == GateVerdict::Pass {
+            ExitCode::SUCCESS
+        } else {
+            eprintln!("GATE FAILED: one or more D16 series missed its p99 target");
+            ExitCode::FAILURE
+        }
+    } else {
+        ExitCode::SUCCESS
+    }
+}
+
+/// Summarize every series and adjudicate the verdict. Split out of
+/// [`report_and_maybe_gate`] so the containment tests can assert on the whole
+/// report rather than on an exit code that compresses it to one bit.
+fn build_report(thresholds: &ThresholdsUs, loaded: &Loaded) -> Report {
     let mut series = BTreeMap::new();
     let mut any_fail = false;
     for (i, key) in SERIES_KEYS.iter().enumerate() {
@@ -449,11 +619,46 @@ fn report_and_maybe_gate(cli: &Cli, thresholds: &ThresholdsUs, loaded: &Loaded) 
                 max_us,
                 threshold_us,
                 gate,
+                unit: SeriesUnit::of(key),
+                contains: contained_by(key),
+                // Filled in below, once every series' own verdict is known: a
+                // series' role depends on the verdicts of the series it
+                // contains, which may sort after it.
+                failure_role: None,
             },
         );
     }
 
-    let report = Report {
+    // Second pass: classify the failures against the containment order. This
+    // reads verdicts and writes only `failure_role`, so no verdict, threshold
+    // or exit code can move here — see `containment_changes_no_verdict`.
+    let failing: BTreeSet<&str> = series
+        .iter()
+        .filter(|(_, s)| !matches!(s.gate, SeriesGate::Pass | SeriesGate::NotGated))
+        .map(|(key, _)| *key)
+        .collect();
+    let mut root_causes = Vec::new();
+    for key in SERIES_KEYS {
+        if !failing.contains(key) {
+            continue;
+        }
+        let inner_failing: Vec<&'static str> = contained_by(key)
+            .iter()
+            .copied()
+            .filter(|inner| failing.contains(inner))
+            .collect();
+        let role = if inner_failing.is_empty() {
+            root_causes.push(key);
+            FailureRole::Root
+        } else {
+            FailureRole::Consequence { of: inner_failing }
+        };
+        if let Some(summary) = series.get_mut(key) {
+            summary.failure_role = Some(role);
+        }
+    }
+
+    Report {
         records: loaded.records,
         malformed: loaded.malformed,
         unknown_series: loaded.unknown_series,
@@ -465,29 +670,7 @@ fn report_and_maybe_gate(cli: &Cli, thresholds: &ThresholdsUs, loaded: &Loaded) 
         },
         run: loaded.run_ctx.clone(),
         series,
-    };
-
-    if cli.json {
-        match serde_json::to_string_pretty(&report) {
-            Ok(json) => println!("{json}"),
-            Err(e) => {
-                eprintln!("error: report serialization failed: {e}");
-                return ExitCode::from(2);
-            }
-        }
-    } else {
-        print_human(&report);
-    }
-
-    if cli.gate {
-        if report.gate == GateVerdict::Pass {
-            ExitCode::SUCCESS
-        } else {
-            eprintln!("GATE FAILED: one or more D16 series missed its p99 target");
-            ExitCode::FAILURE
-        }
-    } else {
-        ExitCode::SUCCESS
+        root_causes,
     }
 }
 
@@ -519,10 +702,10 @@ fn print_human(r: &Report) {
     }
     println!();
     println!(
-        "{:<22} {:>9} {:>9} {:>9} {:>11} {:>9}",
-        "series", "p50 µs", "p99 µs", "max µs", "threshold", "gate"
+        "{:<34} {:>10} {:>9} {:>9} {:>9} {:>5} {:>11} {:>9}",
+        "series", "n", "p50", "p99", "max", "unit", "threshold", "gate"
     );
-    println!("{}", "-".repeat(74));
+    println!("{}", "-".repeat(100));
     for (key, s) in &r.series {
         let p50 = s.p50_us.map_or_else(|| "—".into(), |v| v.to_string());
         let p99 = s.p99_us.map_or_else(|| "—".into(), |v| v.to_string());
@@ -535,11 +718,19 @@ fn print_human(r: &Report) {
         };
         let threshold = s.threshold_us.map_or_else(|| "—".into(), |v| v.to_string());
         println!(
-            "{:<22} {:>9} {:>9} {:>9} {:>11} {:>9}",
-            key, p50, p99, max, threshold, gate
+            "{:<34} {:>10} {:>9} {:>9} {:>9} {:>5} {:>11} {:>9}",
+            key,
+            s.n,
+            p50,
+            p99,
+            max,
+            s.unit.label(),
+            threshold,
+            gate
         );
     }
     println!();
+    print_containment(r);
     // p50/p99 are histogram bucket *upper bounds*; max is the exact observed
     // value. So `max` legitimately reads below `p99` whenever every sample sat
     // low inside its bucket. Say so, or the table looks impossible.
@@ -555,10 +746,52 @@ fn print_human(r: &Report) {
     );
 }
 
+/// Print the containment structure of the verdict: which failures are root
+/// causes and which are consequences of them.
+///
+/// Printed under the table rather than folded into it, because it is not a
+/// per-series fact — it is the relation *between* the rows, and a table
+/// column cannot say "this row cannot pass while that row fails".
+///
+/// Silent on a passing run: containment only ever answers "which of these
+/// failures do I look at", and with no failures there is no question.
+fn print_containment(r: &Report) {
+    let failures: Vec<(&&str, &SeriesSummary)> = r
+        .series
+        .iter()
+        .filter(|(_, s)| s.failure_role.is_some())
+        .collect();
+    if failures.is_empty() {
+        return;
+    }
+    println!("verdict structure (these gates are nested, not independent):");
+    for key in &r.root_causes {
+        println!("  {key:<22} ROOT CAUSE — nothing it contains is also failing");
+    }
+    for (key, s) in &failures {
+        if let Some(FailureRole::Consequence { of }) = &s.failure_role {
+            println!(
+                "  {:<22} consequence of {} — it contains that span, so it cannot pass while it fails",
+                key,
+                of.join(", ")
+            );
+        }
+    }
+    println!();
+    let (n, roots) = (failures.len(), r.root_causes.len());
+    println!(
+        "{n} failing series, {roots} root cause(s): {}.",
+        r.root_causes.join(", ")
+    );
+    println!("Every failing series still fails and every threshold is unchanged; this");
+    println!("says which one to open first, not which one to excuse.");
+    println!();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use orrery_persist_client::latency::SERIES_GATEWAY_BULK_SERVER;
+    use orrery_persist_client::latency::{SERIES_CLIENT_SEND_BUFFER, SERIES_GATEWAY_BULK_SERVER};
 
     /// The two server-side spans persistd added alongside the bulk one. Named
     /// through `UNGATED_SERIES` rather than imported: the client crate
@@ -656,6 +889,143 @@ mod tests {
         let exit = report_and_maybe_gate(&cli, &thresholds, &loaded);
         let _ = std::fs::remove_file(&path);
         exit
+    }
+
+    /// Build the full report for `lines` the way the binary would.
+    fn report_on(lines: Vec<serde_json::Value>) -> Report {
+        let path = tmp("report");
+        write_jsonl(&path, &lines);
+        let loaded = load(std::slice::from_ref(&path)).expect("test jsonl loads");
+        let report = build_report(&ThresholdsUs::D16, &loaded);
+        let _ = std::fs::remove_file(&path);
+        report
+    }
+
+    /// A run in which the journal committer is the thing that is broken: the
+    /// commit p99 lands at 100 ms, and the round trips that contain a commit
+    /// inherit it. This is the clean-box shape the D16 report used to present
+    /// as three unrelated failures.
+    fn slow_committer() -> Vec<serde_json::Value> {
+        let mut v = vec![run_header()];
+        for _ in 0..100u64 {
+            v.push(sample(SERIES_JOURNAL_COMMIT, 100_000));
+            v.push(sample(SERIES_BULK_ACK, 100_500));
+            v.push(sample(SERIES_INTENT_COMMIT, 101_000));
+            v.push(sample(SERIES_AREA_FIRST_PAGE, 3_000));
+        }
+        v
+    }
+
+    #[test]
+    fn nested_failures_report_one_root_cause_and_two_consequences() {
+        let r = report_on(slow_committer());
+        assert_eq!(
+            r.root_causes,
+            vec![SERIES_JOURNAL_COMMIT],
+            "the commit is the only failure that is not explained by another"
+        );
+        assert_eq!(
+            r.series[SERIES_JOURNAL_COMMIT].failure_role,
+            Some(FailureRole::Root)
+        );
+        for outer in [SERIES_BULK_ACK, SERIES_INTENT_COMMIT] {
+            assert_eq!(
+                r.series[outer].failure_role,
+                Some(FailureRole::Consequence {
+                    of: vec![SERIES_JOURNAL_COMMIT]
+                }),
+                "{outer} contains the commit that failed"
+            );
+        }
+    }
+
+    /// The whole point of the containment layer is that it is presentation.
+    /// Every per-series verdict, every threshold and the overall gate are what
+    /// they were before it existed — a consequence still FAILs, and the gate
+    /// still exits non-zero.
+    #[test]
+    fn containment_changes_no_verdict() {
+        let r = report_on(slow_committer());
+        for key in [SERIES_JOURNAL_COMMIT, SERIES_BULK_ACK, SERIES_INTENT_COMMIT] {
+            assert_eq!(
+                r.series[key].gate,
+                SeriesGate::Fail,
+                "{key} is a consequence but must still fail"
+            );
+        }
+        assert_eq!(r.series[SERIES_AREA_FIRST_PAGE].gate, SeriesGate::Pass);
+        assert_eq!(
+            r.series[SERIES_BULK_ACK].threshold_us,
+            Some(ThresholdsUs::D16.bulk_ack_ms)
+        );
+        assert_eq!(r.gate, GateVerdict::Fail);
+        assert_ne!(run_gate_on(slow_committer()), ExitCode::SUCCESS);
+    }
+
+    /// Containment classifies, it does not excuse: when the span a dependent
+    /// contains is healthy, the dependent's own excess is its own, and it is
+    /// reported as the root.
+    #[test]
+    fn a_dependent_failing_over_a_healthy_inner_span_is_its_own_root() {
+        let mut lines = conforming();
+        for _ in 0..300u64 {
+            lines.push(sample(SERIES_BULK_ACK, 20_000));
+        }
+        let r = report_on(lines);
+        assert_eq!(r.series[SERIES_JOURNAL_COMMIT].gate, SeriesGate::Pass);
+        assert_eq!(r.root_causes, vec![SERIES_BULK_ACK]);
+        assert_eq!(
+            r.series[SERIES_BULK_ACK].failure_role,
+            Some(FailureRole::Root)
+        );
+    }
+
+    /// A passing run has no failures to order, so it makes no containment
+    /// claim at all.
+    #[test]
+    fn a_passing_run_names_no_root_cause() {
+        let r = report_on(conforming());
+        assert!(r.root_causes.is_empty());
+        assert!(r.series.values().all(|s| s.failure_role.is_none()));
+    }
+
+    /// The three transport-boundary spans the gateway emits are folded,
+    /// counted and never gated — like every other attribution series.
+    #[test]
+    fn gateway_boundary_series_are_folded_and_never_gate() {
+        let mut lines = conforming();
+        for key in GATEWAY_BOUNDARY_SERIES {
+            for _ in 0..50u64 {
+                lines.push(sample_batch(key, 750_000, 1));
+            }
+        }
+        let r = report_on(lines);
+        assert_eq!(r.unknown_series, 0, "{:?}", r.unknown_series_names);
+        for key in GATEWAY_BOUNDARY_SERIES {
+            let summary = &r.series[key];
+            assert_eq!(summary.n, 50, "{key} was not folded");
+            assert_eq!(summary.gate, SeriesGate::NotGated, "{key} must not gate");
+            assert!(summary.threshold_us.is_none());
+        }
+        assert_eq!(r.gate, GateVerdict::Pass, "attribution never fails a run");
+    }
+
+    /// The two send-buffer gauges are bytes on a lattice built for
+    /// microseconds. The report has to say so, or a reader multiplies a byte
+    /// count by 1000 in their head.
+    #[test]
+    fn send_buffer_gauges_are_reported_in_bytes_and_latencies_in_micros() {
+        let mut lines = conforming();
+        lines.push(sample_batch(SERIES_CLIENT_SEND_BUFFER, 500, 1));
+        let r = report_on(lines);
+        assert_eq!(r.series[SERIES_CLIENT_SEND_BUFFER].unit, SeriesUnit::Bytes);
+        assert_eq!(
+            r.series[GATEWAY_BOUNDARY_SERIES[2]].unit,
+            SeriesUnit::Bytes,
+            "gateway_send_buffer_bytes is the server-side gauge"
+        );
+        assert_eq!(r.series[SERIES_BULK_ACK].unit, SeriesUnit::Us);
+        assert_eq!(r.series[GATEWAY_BOUNDARY_SERIES[0]].unit, SeriesUnit::Us);
     }
 
     #[test]

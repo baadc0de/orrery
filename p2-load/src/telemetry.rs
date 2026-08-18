@@ -38,7 +38,7 @@ pub use orrery_persist_client::latency::{
 #[allow(unused_imports)]
 pub use orrery_persist_client::latency::{
     SERIES_CLIENT_BULK_DISPATCH, SERIES_CLIENT_BULK_QUEUE, SERIES_CLIENT_BULK_SEND,
-    SERIES_CLIENT_BULK_WIRE, SERIES_CLIENT_QUIC_RTT,
+    SERIES_CLIENT_BULK_WIRE, SERIES_CLIENT_QUIC_RTT, SERIES_CLIENT_SEND_BUFFER,
 };
 
 #[allow(dead_code)]

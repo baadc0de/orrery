@@ -99,19 +99,91 @@ pub const SERIES_CLIENT_BULK_DISPATCH: &str = "client_bulk_dispatch_ms";
 /// proxy for path time, not a ground truth, and it is reported as such.
 pub const SERIES_CLIENT_QUIC_RTT: &str = "client_quic_rtt_ms";
 
+/// Bytes resident in this process's outbound QUIC datagram buffer at the
+/// moment a diff has just been handed to the transport — **bytes, not
+/// microseconds**, on the shared bucket lattice because its range (50 B …
+/// 1 MiB) is the range that lattice covers.
+///
+/// The client-side half of `gateway_send_buffer_bytes`, and the measurement
+/// that settles the endpoint-driver question from this end.
+/// `client_bulk_send_ms` ends when `send_datagram` returns, and that call
+/// returns as soon as the endpoint driver has *buffered* the payload — not
+/// when it goes out. A datagram waiting in that buffer is invisible to
+/// [`SERIES_CLIENT_QUIC_RTT`] as well, because the RTT estimate is computed
+/// from ACK timing on packets that already left. So a queue there would show
+/// up in `client_bulk_wire_ms` and in nothing else, which is exactly the
+/// shape of an unattributed gap. This gauge is how that hypothesis is tested
+/// rather than asserted: non-zero occupancy is the driver queueing, and a
+/// p99 of zero rules it out on this side.
+pub const SERIES_CLIENT_SEND_BUFFER: &str = "client_send_buffer_bytes";
+
 /// The client-side attribution series, in canonical report order.
 ///
 /// `p2-dashboard`'s `SERIES_KEYS` is fixed-length over `GATED_SERIES.len() +
 /// UNGATED_SERIES.len() + CLIENT_UNGATED_SERIES.len()`, so growing this array
 /// is a compile error there until the gate is taught to fold the new member —
 /// the same guard `UNGATED_SERIES` already carries.
-pub const CLIENT_UNGATED_SERIES: [&str; 5] = [
+pub const CLIENT_UNGATED_SERIES: [&str; 6] = [
     SERIES_CLIENT_BULK_QUEUE,
     SERIES_CLIENT_BULK_SEND,
     SERIES_CLIENT_BULK_WIRE,
     SERIES_CLIENT_BULK_DISPATCH,
     SERIES_CLIENT_QUIC_RTT,
+    SERIES_CLIENT_SEND_BUFFER,
 ];
+
+/// The gateway's transport-boundary series: the two spans and the one gauge
+/// that bracket `gateway_bulk_server_ms` on the server side.
+///
+/// The producer is `orrery_persistd::gateway`, which spells these names in
+/// its own consts because it cannot depend on this crate. Their permanent
+/// home is `orrery_protocol::metrics::UNGATED_SERIES`, beside
+/// `gateway_bulk_server_ms`; they are here only for as long as that file is
+/// frozen, on the same reasoning and with the same fate as
+/// [`CLIENT_UNGATED_SERIES`]. Nothing can assert the two spellings equal —
+/// neither crate can see the other — so the guard is the gate itself: an
+/// unrecognized series name lands in the dashboard's `unknown_series_names`
+/// and `scripts/p2-kill9-gate.sh` fails the run on a non-empty list.
+///
+/// None of them is gated, and none can be: they carry the `gateway_*_ms`
+/// shape the P2 harness refuses to see carry a threshold.
+pub const GATEWAY_BOUNDARY_SERIES: [&str; 3] = [
+    SERIES_GATEWAY_INGRESS_QUEUE,
+    SERIES_GATEWAY_REPLY_HANDOFF,
+    SERIES_GATEWAY_SEND_BUFFER,
+];
+
+/// Endpoint-driver dequeue of an inbound datagram through the instant the
+/// gateway's connection receive loop picks that message up: the gateway's own
+/// ingress backlog, upstream of every span `gateway_bulk_server_ms` measures.
+pub const SERIES_GATEWAY_INGRESS_QUEUE: &str = "gateway_ingress_queue_ms";
+
+/// A gateway reply being handed to the transport through the instant the
+/// transport's send call returns.
+pub const SERIES_GATEWAY_REPLY_HANDOFF: &str = "gateway_reply_handoff_ms";
+
+/// Bytes resident in the gateway connection's outbound QUIC datagram buffer
+/// just after a reply was handed to it — bytes, not microseconds. The
+/// server-side counterpart of [`SERIES_CLIENT_SEND_BUFFER`].
+pub const SERIES_GATEWAY_SEND_BUFFER: &str = "gateway_send_buffer_bytes";
+
+/// Whether `name` is one of the gateway transport-boundary series.
+#[must_use]
+pub fn is_gateway_boundary_series(name: &str) -> bool {
+    GATEWAY_BOUNDARY_SERIES.contains(&name)
+}
+
+/// Whether `name` is reported in bytes rather than microseconds.
+///
+/// Two members of the attribution set are byte gauges sharing the latency
+/// bucket lattice, because the lattice's range happens to be the range they
+/// need. Nothing about a histogram knows its unit, so the unit is carried by
+/// the name and read back here — a report that printed 1 048 576 bytes as
+/// "1 048 576 µs" would be a lie told by a column header.
+#[must_use]
+pub fn is_byte_series(name: &str) -> bool {
+    name == SERIES_CLIENT_SEND_BUFFER || name == SERIES_GATEWAY_SEND_BUFFER
+}
 
 /// Whether `name` is a series this crate's client-side attribution defines.
 #[must_use]
@@ -173,6 +245,21 @@ impl LatencyHistogram {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Record a sample already expressed in the lattice's own units.
+    ///
+    /// The bucket lattice is a set of integers; nothing in it is inherently
+    /// microseconds. [`record`](Self::record) is the microsecond spelling and
+    /// stays the one every latency series uses. This is for the byte gauges
+    /// ([`is_byte_series`]), which share the lattice because 50 B … 1 MiB is
+    /// the range it covers, and which would otherwise have to launder a byte
+    /// count through a `Duration` at every call site to say so.
+    pub fn record_units(&mut self, units: u64) {
+        // The unit is carried by the series name, not by the storage: min and
+        // max stay `Duration`s holding that many "micros" so every reader —
+        // percentiles, merge, the JSONL drain — works unchanged.
+        self.record(Duration::from_micros(units));
     }
 
     /// Record a latency sample.
