@@ -775,6 +775,32 @@ fn prepare_rekey(
     ))
 }
 
+/// Invariant J's four enforcement points, made a test-suite failure rather
+/// than a code comment.
+///
+/// Returns the cell it checked, so the assertion and the write are one
+/// expression: a later edit cannot move the row without moving the check.
+///
+/// **(J)** if an actor's registrar holds a row for entity `e`, then
+/// `LeaseStore::locate(e)` names a cell inside that actor's shard subtree (or
+/// is `None`). `lease_cells` is the actor's mirror of exactly that durable
+/// key, written in the same turn as the durable write, so asserting the row
+/// goes in under this actor's own shard is asserting J at the moment it could
+/// first be broken.
+///
+/// J is what lets `CellRuntime::apply_fenced` route by `record.cell` instead
+/// of reading FoundationDB per diff: an actor that *accepts* holds a row, so
+/// by J it is the actor the locate would have named, so the accept set is
+/// unchanged. If one of these fires, that argument is false and the change
+/// that rests on it has to come out — see docs/08-persistence.md §2.
+fn checked_row_cell(shard: CellId, cell: CellId, site: &str) -> CellId {
+    debug_assert!(
+        shard.is_prefix_of(cell),
+        "invariant J: {site} installed a registrar row at {cell:?}, outside shard {shard:?}"
+    );
+    cell
+}
+
 fn install_rekey(env: &mut ActorEnv, transfer: RekeyTransfer) -> Result<(), RekeyError> {
     if let Some(existing) = env.state.entities.get(&transfer.entity) {
         let idempotent = existing == &transfer.record
@@ -807,9 +833,10 @@ fn install_rekey(env: &mut ActorEnv, transfer: RekeyTransfer) -> Result<(), Reke
         Some(transfer.destination_cell),
     );
     env.state.leases.restore(transfer.lease);
-    env.state
-        .lease_cells
-        .insert(transfer.entity, transfer.destination_cell);
+    env.state.lease_cells.insert(
+        transfer.entity,
+        checked_row_cell(env.state.shard, transfer.destination_cell, "install_rekey"),
+    );
     Ok(())
 }
 
@@ -859,9 +886,14 @@ fn complete_local_rekey(env: &mut ActorEnv, transfer: RekeyTransfer) -> Result<(
     env.state
         .by_cell
         .insert(transfer.entity, transfer.destination_cell);
-    env.state
-        .lease_cells
-        .insert(transfer.entity, transfer.destination_cell);
+    env.state.lease_cells.insert(
+        transfer.entity,
+        checked_row_cell(
+            env.state.shard,
+            transfer.destination_cell,
+            "complete_local_rekey",
+        ),
+    );
     env.state.leases.restore(transfer.lease);
     Ok(())
 }
@@ -897,7 +929,10 @@ async fn claim_lease(
                 ));
             }
         }
-        env.state.lease_cells.insert(entity, cell);
+        env.state.lease_cells.insert(
+            entity,
+            checked_row_cell(env.state.shard, cell, "claim_lease"),
+        );
     }
     env.state.leases = next;
     Ok(result)
@@ -1853,7 +1888,10 @@ where
                 // registrar after a durable transition failure.
                 return;
             }
-            env.state.lease_cells.insert(row.entity, cell);
+            env.state.lease_cells.insert(
+                row.entity,
+                checked_row_cell(env.state.shard, cell, "actor recovery"),
+            );
             env.state.leases.restore(row);
         }
         actor_loop(&mut env, rx).await;

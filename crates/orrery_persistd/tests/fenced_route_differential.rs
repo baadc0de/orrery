@@ -501,7 +501,13 @@ async fn run_matrix(
         let new = settle(
             Router::apply_fenced(
                 &rt_new,
-                mk_record(grid_new, cell, *entity, RecordKind::ComponentDiff, b"fenced"),
+                mk_record(
+                    grid_new,
+                    cell,
+                    *entity,
+                    RecordKind::ComponentDiff,
+                    b"fenced",
+                ),
                 token.holder,
                 token.lease_id,
                 token.seq,
@@ -513,7 +519,13 @@ async fn run_matrix(
         let old = settle(
             rt_old
                 .apply_fenced_via_locate(
-                    mk_record(grid_old, cell, *entity, RecordKind::ComponentDiff, b"fenced"),
+                    mk_record(
+                        grid_old,
+                        cell,
+                        *entity,
+                        RecordKind::ComponentDiff,
+                        b"fenced",
+                    ),
                     token.holder,
                     token.lease_id,
                     token.seq,
@@ -570,6 +582,20 @@ async fn run_matrix(
         unexpected.is_empty(),
         "fenced route diverged from the locate oracle: {unexpected:#?}"
     );
+    // And it must actually happen, or the exemption above is a hole waiting
+    // for a real divergence to fall through it. Exactly one scenario in the
+    // matrix reaches it: the cross-shard failed migration whose presented
+    // cell *is* hosted, so the fast path can reach the source actor at all.
+    let accepted_divergences = divergences
+        .iter()
+        .filter(|(scenario, _, _)| {
+            scenario.pending == Pending::ToOtherShard && scenario.presented_hosted
+        })
+        .count();
+    assert_eq!(
+        accepted_divergences, 1,
+        "the documented NACK-payload divergence must be the one that fires: {divergences:#?}"
+    );
 
     rt_new.close().await.unwrap();
     rt_old.close().await.unwrap();
@@ -584,9 +610,11 @@ fn same_outcome(new: &Outcome, old: &Outcome) -> bool {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn fenced_route_matches_the_locate_oracle_over_the_state_matrix() {
-    run_matrix(GridId::ROOT, GridId::ROOT, || {
-        Arc::new(MemLeaseStore::new())
-    })
+    run_matrix(
+        GridId::ROOT,
+        GridId::ROOT,
+        || Arc::new(MemLeaseStore::new()),
+    )
     .await;
 }
 
