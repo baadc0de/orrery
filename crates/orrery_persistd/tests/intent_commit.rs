@@ -602,3 +602,94 @@ async fn fdb_fenced_intent_refuses_a_promoted_owner() {
         fences.retire(grid, shard).await.unwrap();
     }
 }
+
+/// A 128-shard ownership fence is verified inside **every** intent
+/// transaction, on the critical path of a commit D16 budgets at p99 < 10 ms.
+///
+/// This measures that cost at the deployment size the P2 criterion describes
+/// (docs/11-roadmap.md §P2). `#[ignore]` because it needs a cluster it can
+/// hammer and because a wall-clock figure is evidence for a human, not a gate
+/// on a shared box. Run with:
+///
+/// ```text
+/// ORRERY_FDB_CLUSTER_FILE=... cargo test -p orrery_persistd --features fdb \
+///   --test intent_commit -- --ignored --nocapture fdb_fenced_intent_latency
+/// ```
+#[cfg(feature = "fdb")]
+#[tokio::test]
+#[ignore = "measurement against a live cluster, not a gate"]
+async fn fdb_fenced_intent_latency_at_128_shards() {
+    use orrery_persistd::fence::{ActivationOutcome, ShardActivation};
+    use orrery_persistd::{FdbIntentExecutor, FenceStore, IntentExecutor, IntentFence};
+
+    let Some(cluster) = fdb_cluster_file() else {
+        eprintln!("skipping: ORRERY_FDB_CLUSTER_FILE not set and no .fdb-dev/fdb.cluster");
+        return;
+    };
+    let grid = GridId::new(9_401);
+    // 128 disjoint level-18 cells, the shard set the kill-9 gate derives from
+    // the demo scenario, in the sorted order activation requires.
+    let mut shards: Vec<CellId> = (0..128)
+        .map(|i| {
+            let x = i % 8;
+            let y = (i / 8) % 4;
+            let z = i / 32;
+            CellId::from_coords(glam::IVec3::new(x, y, z), orrery_protocol::SHARD_LEVEL)
+                .expect("in range")
+        })
+        .collect();
+    shards.sort_unstable_by_key(|shard| shard.to_bits());
+    let fences = orrery_persistd::fence::FdbFenceStore::connect(&cluster).unwrap();
+    for &shard in &shards {
+        fences.retire(grid, shard).await.unwrap();
+    }
+    let requests: Vec<ShardActivation> = shards
+        .iter()
+        .map(|&shard| ShardActivation {
+            shard,
+            expected: None,
+        })
+        .collect();
+    let ActivationOutcome::Activated { rows } =
+        fences.activate_shards(grid, 91, &requests).await.unwrap()
+    else {
+        panic!("bootstrap activation must succeed");
+    };
+    let epoch = rows[0].1.epoch;
+
+    let exec = FdbIntentExecutor::fenced_from_context(
+        &orrery_persistd::FdbContext::connect(&cluster).unwrap(),
+        grid,
+        IntentFence {
+            shards: shards.clone(),
+            owner: 91,
+            epoch,
+        },
+    );
+
+    let mut samples = Vec::new();
+    for i in 0..200u128 {
+        // A fresh id per iteration: a replay is answered from the idempotency
+        // row before the fence is read at all, which would measure nothing.
+        let id = 0x9401_0000_0000u128 + (std::process::id() as u128) * 1_000_000 + i;
+        let intent = signed_intent(id, &secret(41), 0, &credit_args(590_001, 4, 1));
+        let started = std::time::Instant::now();
+        let outcome = exec.execute(&intent).await.expect("commit");
+        samples.push(started.elapsed());
+        assert!(matches!(outcome, IntentOutcome::Committed { .. }));
+    }
+    samples.sort_unstable();
+    let p = |q: f64| samples[((samples.len() - 1) as f64 * q) as usize];
+    println!(
+        "fenced intent commit, {} shards, n={}: p50 {:?} p99 {:?} max {:?}",
+        shards.len(),
+        samples.len(),
+        p(0.50),
+        p(0.99),
+        samples[samples.len() - 1]
+    );
+
+    for &shard in &shards {
+        fences.retire(grid, shard).await.unwrap();
+    }
+}
