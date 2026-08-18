@@ -377,6 +377,18 @@ persistence.
   fsyncing; and FDB's own CPU rises from ~0.2 cores. **Expect the knee to move
   down, not up.** It was not measured here and should be before a demo is
   sized on this document.
+
+  > **Measured (2026-08-19): the knee does not move, and this prediction was
+  > right about the mechanism and wrong about the conclusion — see §11.** It
+  > was made while every fenced bulk diff did an FDB read (§5.1), and #86
+  > removed that read. On the bulk path the two engines are indistinguishable
+  > to 143 000 delivered records/s. The mechanism it names is real and was
+  > found exactly where the mechanism says it should be — on the *intent*
+  > path, which still rides FDB: `ssd` costs a 37× worse FDB read tail, a 3.5×
+  > worse commit tail and 2× the `fdbserver` CPU. It moves intent latency by
+  > one histogram bucket and moves the knee not at all. The prediction is left
+  > standing here because it was reasoning, correctly labelled as reasoning,
+  > and because §11 is only legible next to it.
 * **Everything is loopback.** Rig, gateway, follower and FDB are all on
   127.0.0.1, so no packet touched `eno1`. Every NIC figure in §5 and §6 is
   computed from payload sizes, not measured.
@@ -414,6 +426,25 @@ lease locates/s, which is a queue an intent has to cross twice. This is a
 hypothesis consistent with every point measured, not a proven cause; the
 experiment that would settle it is to serve `LeaseStore::locate` from the
 actor's own in-memory lease index (it already tracks the cell) and re-measure.
+
+> **Superseded (2026-08-19): the table above measures the first second of each
+> run, and is left visible because the reason it is wrong is worth keeping.**
+> "The intent rate was a fixed 1024 per run throughout" is the tell. It was
+> fixed at 1024 because `p2-load` never called `IntentQueue::retire`, so the
+> 1024-entry queue filled — in under two seconds at a 3 % mix and 18 000
+> diffs/s — and `submit` returned `None` for the rest of the run. Every one of
+> those 1024 samples comes from the opening burst, while sessions are still
+> connecting. The column is a cold gateway's response to 1024 simultaneous
+> intents, at five different session counts.
+>
+> The rig now retires a settled intent, and §11.7 re-measures the series with
+> 5 000–40 000 samples spread across each run. What survives: the FDB client
+> thread is indeed the mechanism, and the correlation was pointing at the
+> right resource. What changes: intent p50 at the P2 operating point is
+> **6–8 ms**, not 15–20 ms, so D16's 10 ms budget is missed in the *tail*
+> only; and intent latency is set by the **intent** rate, not the bulk rate —
+> holding intents at ~1 000/s while bulk falls from 35 k to 18.6 k records/s
+> leaves p50 unchanged at 15–20 ms.
 
 ## 9. You have outgrown this box when…
 
