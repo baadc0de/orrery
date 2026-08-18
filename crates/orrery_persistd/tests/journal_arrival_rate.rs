@@ -105,6 +105,40 @@ fn open_loop_arrival_rate() {
     )));
     let submitted = Arc::new(AtomicUsize::new(0));
 
+    // Per-second stage trace. The gate's committer does not degrade at a
+    // constant rate: it runs at one service time for the first ~22 s and at
+    // another, four to twelve times worse, after that. A run summary averages
+    // the two regimes together and hides the transition entirely, which is how
+    // a 20 s rig and a 30 s gate can disagree by an order of magnitude on the
+    // same code. Print the same per-flush quantities `persistd`'s reporter
+    // writes, once a second, so the onset is visible rather than inferred.
+    let trace = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let tracer = {
+        let journal = Arc::clone(&journal);
+        let trace = Arc::clone(&trace);
+        std::thread::spawn(move || {
+            let mut cursor = journal.commit_metrics().stage_snapshot();
+            let mut second = 0u64;
+            println!("sec flushes  records sync_us/flush  qwait_us/flush  rec/flush");
+            while trace.load(Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_secs(1));
+                let d = journal.commit_metrics().stage_delta(&mut cursor);
+                // Denominator: `record_group` is called once per flush, so a
+                // stage sum divides by `flushes`, never by `records`.
+                let f = d.flushes.max(1) as f64;
+                println!(
+                    "{second:3} {:7} {:8} {:13.0} {:15.0} {:10.1}",
+                    d.flushes,
+                    d.records,
+                    d.sync_data_us_sum as f64 / f,
+                    d.queue_wait_us_sum as f64 / f,
+                    d.records as f64 / f,
+                );
+                second += 1;
+            }
+        })
+    };
+
     let period = Duration::from_nanos(1_000_000_000 / bursts_per_sec);
     let total_bursts = seconds * bursts_per_sec;
     let started = Instant::now();
@@ -138,6 +172,8 @@ fn open_loop_arrival_rate() {
         }
     });
     let wall = started.elapsed();
+    trace.store(false, Ordering::Relaxed);
+    tracer.join().expect("stage tracer");
     let flushes = journal.flush_count();
     let stages = journal.commit_metrics().stage_snapshot();
     rt.block_on(journal.close()).expect("close");

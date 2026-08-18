@@ -425,6 +425,123 @@ twice. A process that then fails to reopen the same journal directory is a
 diagnosable failure; a hang is not. Remove the workaround when the fix lands
 upstream (D14 governs the bump).
 
+### 4.3 Where the D16 journal tail actually comes from
+
+P2's `journal_commit_ms` p99 sits around 15 ms against a 2 ms budget, and
+`bulk_ack_ms` tracks it. The standing explanation was fjall's single writer:
+`Batch::commit` and `Database::persist` take one `Mutex<Writer>`
+(fjall-3.1.9 `src/batch/mod.rs`), so the store cannot overlap a write with an
+fsync, and a single server at ρ ≈ 0.78 with 1 ms of service would indeed give a
+p99 in the low tens of milliseconds. **Measured, that is not what is happening.**
+This section records the measurement so the explanation is not re-derived.
+
+**Denominators first.** `JournalStageSnapshot` takes *one sample per flush* —
+`record_group` is called once per flush with `flushes: 1, records: N`. Per-flush
+cost is `stage_sum / flushes`. Dividing by `records` understates every stage by
+the records-per-flush factor, which is ~30 at the production window; that error
+has already sent one investigation the wrong way.
+
+**Utilisation is not the constraint.** Thirty-two `p2-kill9` runs on a dedicated
+cluster, 128 shards, ~17.7 k records/s, medians per batch window:
+
+| `batch_window` | n | flush/s | rec/flush | sync_data µs/flush | service ms | ρ | jc p50 | jc p99 (spread) | ack p50 | ack p99 |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 0 µs | 3 | 755 | 24.2 | 747 | 0.756 | 0.57 | 1.00 | **15.0** (15–300) | 1.50 | 20.0 |
+| 200 µs *(production)* | 8 | 566 | 31.9 | 922 | 0.934 | 0.54 | 1.00 | **15.0** (9–150) | 2.00 | 17.5 |
+| 500 µs | 6 | 370 | 49.0 | 1010 | 1.028 | 0.38 | 1.00 | **9.5** (2–150) | 1.75 | 12.5 |
+| 1000 µs | 6 | 357 | 51.0 | 958 | 0.976 | 0.35 | 1.50 | **9.0** (2.5–150) | 2.25 | 12.0 |
+| 2000 µs | 6 | 316 | 56.8 | 452 | 0.473 | 0.15 | 2.50 | **3.5** (3–15) | 3.00 | 6.0 |
+| 5000 µs | 3 | 159 | 114.7 | 500 | 0.543 | 0.09 | 3.50 | **6.0** (6–9) | 4.50 | 10.0 |
+
+ρ = flush-rate × per-flush service (`fjall_batch_commit` + `sync_data` +
+`resolve`; `fjall_batch_commit` is always 0 because §4's commit callback folds
+staging into the one `SyncData` and attributes the pair there). At the
+production window ρ ≈ 0.54, **not** 0.78 — the single server is roughly half
+idle. An M/M/1 sojourn at ρ = 0.45 with 0.76 ms of service predicts a 6.3 ms
+p99; the same run measured 15.0. At ρ = 0.15 with 0.47 ms of service it predicts
+0.6 ms; the run measured 3.0. The single-server model over-predicts at one end
+and under-predicts at the other by 5×, so whatever sets the tail is not the
+occupancy of that server. What is left is the *shape* of the service time.
+
+**The service time is the device's fsync, and it is erratic.** `fio`, 8 KiB
+write + `fdatasync`, one thread, 60 s, on the same `md2` (RAID1 of two Solidigm
+SSDPFKKW010X7 NVMe, internal write-intent bitmap): 893 fsync/s, p50 **0.30 ms**,
+p75 1.58, p90 **2.38**, p95 2.74, p99 **3.72**, p99.9 34.9, max 92.3 ms. About
+**12 % of bare `fdatasync` calls already exceed the 2 ms budget** with no
+queueing, no fjall and no Orrery code in the path. Four repeats of the same
+15 s job minutes apart returned 1452, 997, 463 and 444 fsync/s with p99 3.4,
+3.2, 5.5 and 4.4 ms — the device's own throughput moves 3× and its tail 1.7×
+between identical runs on an otherwise quiet box.
+
+**What that storage is.** `SSDPFKKW010X7` is a Solidigm P41 Plus — a *consumer*
+1 TB drive using **QLC NAND behind a dynamic SLC cache** — and
+`/sys/block/nvme0n1/queue/write_cache` reads `write back` with no power-loss
+protection. Two consequences follow directly, and together they account for both
+the level and the variance:
+
+- **No PLP means every `fdatasync` must reach NAND.** A drive with a
+  power-protected write cache can acknowledge a flush from DRAM in tens of
+  microseconds; this one cannot, and RAID1 pays that cost on both mirrors before
+  the barrier completes. That is the ~0.3 ms floor and the 3–5 ms p99.
+- **A dynamic SLC cache in front of QLC is bimodal by construction.** Sustained
+  writing fills the SLC region, after which the drive folds to QLC and write
+  latency degrades for as long as folding continues, recovering when the drive
+  next gets idle time. That is the shape §4.3 measures — regimes tens of seconds
+  long that recover, and that appear in either order between runs — and it fits
+  better than the `md2` write-intent bitmap, whose 64 MiB chunk at the journal's
+  ~2.5 MB/s predicts a boundary crossing every ~27 s but only *one slow barrier*
+  per crossing, not a sustained slow period. The bitmap remains worth ruling out
+  (`mdadm --grow --bitmap=none`, reversible; the cost is a full 920 GB resync
+  after an unclean shutdown instead of a dirty-chunk-only one), but it is the
+  second suspect, not the first.
+
+Neither is fixable in this repository. Both are reasons to read every number in
+this section as a property of *this box*, and to re-measure before carrying the
+conclusion to hardware with power-loss-protected write cache — where the barrier
+p99 the sizing below asks for is routine rather than out of reach.
+
+**The gate is not what makes it worse.** The open-loop rig
+(`tests/journal_arrival_rate.rs`) drives the same committer at the same rate
+with no actors, no FDB, no follower and no connections. Four back-to-back 30 s
+solo runs at the production window: per-flush `sync_data` 1993 / 379 / 552 /
+461 µs and `journal_commit_ms` p99 **14.4 / 0.90 / 3.36 / 3.45 ms**. The first
+of those reproduces the gate's 15 ms tail with none of the gate's components
+present. Adding a second full journal writing to the same device concurrently —
+the load the chain follower contributes and the rig otherwise lacks — gave
+419 µs and p99 1.11 ms, i.e. *better* than the solo run before it, consistent
+with the device parallelising (1 thread 444–1452 fsync/s, 4 threads 3171, 8
+threads 5117). The often-quoted "rig does 0.93 ms p99" is a real number from a
+20 s run in a fast device period; it is not a property of the rig.
+
+**Conclusion.** The tail is the storage device's `fdatasync` latency
+distribution, not fjall's writer mutex and not the gate's topology. Two
+consequences bind:
+
+1. **D16's 2 ms `journal_commit_ms` p99 is below this hardware's floor.** A
+   durable ack costs at least one durability barrier, and one bare barrier on
+   `md2` has a p99 of 3.2–5.5 ms. No group-commit tuning, no removal of the
+   single writer, and no `journal-raw` segment format can put 99 % of acks
+   inside 2 ms here. Sizing what a raw journal would have to achieve therefore
+   yields a storage requirement, not a code one: **a barrier whose p99 is
+   ≤ ~1.5 ms sustained at ≥ 400 barriers/s** (the observed demand at a 1 ms
+   window is ~357/s, well inside the 444–1452/s the device already delivers —
+   throughput was never binding). That is a power-loss-protected write cache,
+   not a file format. Concurrency does not substitute: 8 parallel fsync streams
+   raise aggregate throughput 4–11× but move per-barrier p99 the wrong way,
+   3.2 ms → 15.1 ms.
+2. **A batch window is a real but partial win.** 2 ms of window cuts the median
+   `journal_commit_ms` p99 from 15.0 to 3.5 ms and `bulk_ack_ms` p99 from 17.5
+   to 6.0, and — visible in the spread column — it also makes runs far more
+   *repeatable*, because a third of the flush rate is a third of the device
+   pressure. It buys that by delaying every ack that would otherwise have gone
+   out immediately: p50 rises 1.0 → 2.5 ms. That trade is self-defeating
+   against a 2 ms p99 target, since a 2 ms window puts the *median* at the
+   budget. We therefore keep `persistd`'s 200 µs and leave the window settable
+   per deployment (`ORRERY_JOURNAL_BATCH_WINDOW_US`, applied in
+   `journal::group_commit`) rather than raising the constant: on storage whose
+   barrier p99 is under 1 ms the small window is the right shape, and on this
+   box no window is right.
+
 ## 5. FoundationDB as the system of record
 
 Why FDB (pinned **7.3.x**, 7.4 tracked as upgrade candidate; `foundationdb-rs` 0.11 — D14):
