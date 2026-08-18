@@ -46,7 +46,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use iroh::{Endpoint, EndpointAddr, RelayMode};
-use tokio::sync::{oneshot, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{mpsc, oneshot, OwnedSemaphorePermit, Semaphore};
+use tokio::task::JoinHandle;
 use tracing::{debug, warn};
 
 use orrery_protocol::channels::{
@@ -275,6 +276,87 @@ const MAX_INFLIGHT_DIFF_ROUTES_PER_CONN: usize = 128;
 /// gateway that is keeping up: this is a shed valve, not a rate limit.
 const MAX_INGRESS_QUEUE_WAIT_US: u64 = 25_000;
 
+/// The same budget, enforced where the wait actually is.
+///
+/// [`MAX_INGRESS_QUEUE_WAIT_US`] is evaluated on a diff's arrival age at the
+/// instant the receive loop dequeues it. That was a real bound while the loop
+/// was the queue. It is not one now: with lease work moved onto its own lane
+/// the loop is instant (`gateway_ingress_queue_ms` p99 0.05 ms), so the check
+/// passes for everything and bounds nothing — and the standing queue did not
+/// go away, it moved downstream of admission.
+///
+/// Measured on the merged branch (three gate runs, 30 s, 125 sessions,
+/// 10 000 entities, 128 shards), per acknowledged diff:
+///
+/// | stage                      | mean      | max      |
+/// |----------------------------|-----------|----------|
+/// | `route_queue` (spawn→task) | 0.005 ms  | 0.45 ms  |
+/// | `router_apply`             | 7.8–8.7 ms| 2.2 s    |
+/// | ├ entity gate wait         | 7.2–8.2 ms| 2.2 s    |
+/// | ├ `LeaseStore::locate`     | 0.40 ms   | 15 ms    |
+/// | └ actor mailbox round trip | 0.006 ms  | 1.0 ms   |
+/// | `journal_wait`             | 2.0–4.3 ms| 35–275 ms|
+///
+/// So it is not the tokio scheduler (`route_queue` is noise), not the actor
+/// mailbox (0.006 ms — the actors are idle), and not primarily the committer.
+/// It is the striped per-entity mutex inside `CellRuntime::apply_fenced`,
+/// which is held across an FDB read and which the lease lane's batched
+/// heartbeats take 77 at a time for 16 ms mean / 50 ms max
+/// (`crate::cluster::RouteStageMetrics`). The head-of-line block did not go
+/// away either; it moved from the receive loop onto the entity stripes, where
+/// the offloaded lease lane can now contend with live diff traffic.
+///
+/// **That gate hold has since been removed** (docs/08-persistence.md §2.1.1:
+/// `heartbeat_leases` resolves locations with no gate held and takes gates
+/// per actor group around the mailbox turn alone). On the same gate the
+/// entity-gate wait is now 0.011–0.015 ms mean / 5–21 ms max with this valve
+/// **off**, and `shed_slow_route` was 0 on every run at every budget down to
+/// 25 ms — this valve no longer fires on the P2 workload. It is retained as a
+/// bound for workloads that study did not run, not because that one needs it.
+///
+/// A deadline only bounds a wait it is evaluated *after*, so this one is
+/// evaluated around the whole router round trip, against the diff's age since
+/// arrival — the same clock and the same budget as the ingress check, applied
+/// where the time is actually spent.
+///
+/// **It stops at the journal, deliberately.** Once the actor has admitted the
+/// record, the write is going to be durable; refusing to wait for the ack
+/// after that would drop an acknowledgement for a write that happened, which
+/// is a different and worse kind of dishonesty. `journal_wait` is therefore
+/// outside this valve — and it is also frozen to another lane.
+const MAX_ROUTE_ADMISSION_WAIT_US: u64 = 25_000;
+
+/// Environment override for [`MAX_ROUTE_ADMISSION_WAIT_US`].
+///
+/// This valve has a genuine trade behind it (see docs/08-persistence.md
+/// §3.6): the budget buys tail latency with shed rate, and where to sit on
+/// that curve is an operator's call, not a compile-time one. Read once, so a
+/// running node's policy cannot change under it.
+const ROUTE_ADMISSION_WAIT_ENV: &str = "ORRERY_GATEWAY_MAX_ROUTE_WAIT_US";
+
+/// The configured route-admission budget, in microseconds.
+///
+/// `0` disables the valve — which is exactly the merged branch's behaviour,
+/// and therefore the "before" leg of any A/B against it.
+fn route_admission_budget_us() -> u64 {
+    static BUDGET: std::sync::LazyLock<u64> =
+        std::sync::LazyLock::new(|| match std::env::var(ROUTE_ADMISSION_WAIT_ENV) {
+            Ok(raw) => match raw.trim().parse::<u64>() {
+                Ok(value) => value,
+                Err(_) => {
+                    warn!(
+                        raw,
+                        default = MAX_ROUTE_ADMISSION_WAIT_US,
+                        "gateway: unparseable route-admission budget; using the default"
+                    );
+                    MAX_ROUTE_ADMISSION_WAIT_US
+                }
+            },
+            Err(_) => MAX_ROUTE_ADMISSION_WAIT_US,
+        });
+    *BUDGET
+}
+
 /// Slow control reads are separately bounded so they cannot consume the bulk
 /// acknowledgement budget.  In particular, an FDB cold area-load must not
 /// head-of-line block a durability acknowledgement on the same connection.
@@ -289,6 +371,24 @@ const MAX_INFLIGHT_CONTROL_ROUTES_PER_CONN: usize = 8;
 /// queued behind an `await acquire`: it is an immediate, definitive refusal.
 /// This prevents a peer from turning queued tasks into unbounded memory use.
 const MAX_INFLIGHT_INTENT_ROUTES_PER_CONN: usize = 16;
+
+/// How many lease operations one connection may have waiting on its lease
+/// worker.
+///
+/// The lane is a FIFO of one, by construction (`serve_lease_message` explains
+/// why the fencing protocol needs it to be), so this bounds only the *backlog*
+/// — the memory a peer can make the gateway hold by offering lease work faster
+/// than it can be served. Sized well above anything a correct client produces:
+/// a holder heartbeats its whole lease set in one batched message every
+/// `LEASE_TTL_MS / 2`, and claims are already limited per peer by
+/// `PeerState::claim_bucket`, so reaching this depth means a peer is
+/// misbehaving rather than busy.
+const MAX_QUEUED_LEASE_OPS_PER_CONN: usize = 1_024;
+
+/// What a claimant is told to wait when its own connection's lease lane is
+/// full. Long enough that the retry lands after the backlog drained, short
+/// enough not to read as a refusal.
+const LEASE_LANE_RETRY_AFTER_MS: u32 = 50;
 
 const MAX_PEER_REGISTRY_ENTRIES: usize = 4_096;
 
@@ -1636,6 +1736,7 @@ pub struct GatewayIngressMetrics {
     admitted: AtomicU64,
     shed_saturated: AtomicU64,
     shed_stale: AtomicU64,
+    shed_slow_route: AtomicU64,
 }
 
 impl GatewayIngressMetrics {
@@ -1655,6 +1756,17 @@ impl GatewayIngressMetrics {
         self.shed_stale.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// One diff dropped because the router could not admit it to a journal
+    /// within [`MAX_ROUTE_ADMISSION_WAIT_US`] of its arrival.
+    ///
+    /// Counted apart from [`Self::record_shed_stale`] for the reason that
+    /// enum has three arms at all: "it aged out before I looked at it" and
+    /// "it aged out while I was routing it" are different subsystems, and an
+    /// operator reading one number must not have to guess which queue grew.
+    pub fn record_shed_slow_route(&self) {
+        self.shed_slow_route.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Capture the cumulative totals.
     #[must_use]
     pub fn snapshot(&self) -> GatewayIngressSnapshot {
@@ -1662,6 +1774,7 @@ impl GatewayIngressMetrics {
             admitted: self.admitted.load(Ordering::Relaxed),
             shed_saturated: self.shed_saturated.load(Ordering::Relaxed),
             shed_stale: self.shed_stale.load(Ordering::Relaxed),
+            shed_slow_route: self.shed_slow_route.load(Ordering::Relaxed),
         }
     }
 }
@@ -1676,14 +1789,69 @@ pub struct GatewayIngressSnapshot {
     /// Diffs dropped for having outlived [`MAX_INGRESS_QUEUE_WAIT_US`] in the
     /// inbound queue.
     pub shed_stale: u64,
+    /// Diffs dropped for having outlived [`MAX_ROUTE_ADMISSION_WAIT_US`]
+    /// *downstream* of admission, waiting on the router.
+    ///
+    /// This one overlaps `admitted` on purpose and is not a subtraction bug:
+    /// the receive loop admitted the diff and the route task then refused it,
+    /// so a run's served count is `admitted - shed_slow_route`, while
+    /// `shed_saturated` and `shed_stale` are disjoint from `admitted`.
+    pub shed_slow_route: u64,
 }
 
 impl GatewayIngressSnapshot {
     /// Every diff this gateway refused, whatever the reason.
     #[must_use]
     pub fn shed(&self) -> u64 {
-        self.shed_saturated.saturating_add(self.shed_stale)
+        self.shed_saturated
+            .saturating_add(self.shed_stale)
+            .saturating_add(self.shed_slow_route)
     }
+}
+
+/// What the receive loop did with every lease operation it took off the
+/// inbound queue: queued it on this connection's lease lane, or refused it
+/// because the lane was already full.
+///
+/// Counted for the same reason as [`GatewayIngressMetrics`]: the refusal path
+/// drops two of the three lease kinds without a reply (see
+/// `refuse_saturated_lease` for why silence is the honest answer there), and a
+/// silent drop that is not also a number is indistinguishable from a stall.
+#[derive(Debug, Default)]
+pub struct GatewayLeaseMetrics {
+    queued: AtomicU64,
+    refused: AtomicU64,
+}
+
+impl GatewayLeaseMetrics {
+    /// One lease operation handed to a connection's lease worker.
+    pub fn record_queued(&self) {
+        self.queued.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// One lease operation refused with the connection's lane at
+    /// [`MAX_QUEUED_LEASE_OPS_PER_CONN`].
+    pub fn record_refused(&self) {
+        self.refused.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Capture the cumulative totals.
+    #[must_use]
+    pub fn snapshot(&self) -> GatewayLeaseSnapshot {
+        GatewayLeaseSnapshot {
+            queued: self.queued.load(Ordering::Relaxed),
+            refused: self.refused.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// A point-in-time read of [`GatewayLeaseMetrics`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct GatewayLeaseSnapshot {
+    /// Lease operations dispatched to a lease worker.
+    pub queued: u64,
+    /// Lease operations refused with the connection's lane full.
+    pub refused: u64,
 }
 
 /// The receive loop's verdict on one inbound diff.
@@ -1756,6 +1924,8 @@ pub struct GatewayMetrics {
     pub boundary: GatewayBoundaryMetrics,
     /// Bulk-ingress admission: routed, or refused and counted.
     pub ingress: GatewayIngressMetrics,
+    /// Lease-lane admission: queued off the receive loop, or refused.
+    pub lease: GatewayLeaseMetrics,
 }
 
 /// The current single-node policy: its ownership is always fresh.
@@ -1868,6 +2038,18 @@ pub struct GatewayConfig {
     /// kept, because stealing by timeout is exactly what "not stealable"
     /// forbids.
     pub handoff_deadline_ms: u32,
+    /// How long, from a diff's arrival, the router has to admit it to a
+    /// journal before the gateway sheds it ([`MAX_ROUTE_ADMISSION_WAIT_US`]).
+    /// Zero disables the valve.
+    ///
+    /// Config rather than a process global so a test can state the policy it
+    /// is testing — `tests/gateway_ingress.rs` needs the valve *off* to hold
+    /// a connection at its route cap — and so a second gateway in one process
+    /// is not silently bound to the first one's environment. The default
+    /// still reads [`ROUTE_ADMISSION_WAIT_ENV`], so an operator moving the
+    /// operating point needs no code and persistd's own frozen
+    /// `..GatewayConfig::default()` construction needs no edit.
+    pub route_admission_wait_us: u64,
 }
 
 impl Default for GatewayConfig {
@@ -1895,6 +2077,7 @@ impl Default for GatewayConfig {
             authority_metrics: Arc::new(AuthorityMetrics::default()),
             lease_sweep_clock: Arc::new(RegistrarSweepClock),
             handoff_deadline_ms: 300,
+            route_admission_wait_us: route_admission_budget_us(),
         }
     }
 }
@@ -2889,6 +3072,7 @@ impl GatewayServer {
             pending: tokio::sync::Mutex::new(HashMap::new()),
         });
         let lease_sweep_clock = config.lease_sweep_clock;
+        let route_admission_wait_us = config.route_admission_wait_us;
         // One limiter per gateway, not per connection: the limit is per
         // account (docs/07 §7) and an account may hold several connections.
         let report_limiter = Arc::new(ReportLimiter::new());
@@ -2911,6 +3095,7 @@ impl GatewayServer {
             redistributor,
             lease_sweep_clock,
             Arc::clone(&send_failures),
+            route_admission_wait_us,
             rx,
         ));
         Ok(Self {
@@ -3015,6 +3200,19 @@ const BOUNDARY_REPORT_INTERVAL: Duration = Duration::from_millis(250);
 /// artifact without touching the frozen gate.
 const INGRESS_RECORD_KIND: &str = "gateway_ingress";
 
+/// The lease-lane admission counters, on the same additive-record footing as
+/// [`INGRESS_RECORD_KIND`].
+const LEASE_RECORD_KIND: &str = "gateway_lease";
+
+/// The fenced-apply stage decomposition, on the same additive-record footing.
+///
+/// `gateway_bulk_stage_delta` (persistd's own reporter, frozen to this lane)
+/// reports the whole of `Router::apply_fenced` as one `router_apply` number.
+/// This record splits that number into the striped entity gate, the
+/// `LeaseStore::locate` read, and the actor round trip — see
+/// [`crate::cluster::RouteStageMetrics`].
+const ROUTE_STAGE_RECORD_KIND: &str = "gateway_route_stage";
+
 /// Append the transport-boundary histograms to [`BOUNDARY_JSONL_ENV`]'s file
 /// on a fixed interval, as `sample_batch` records, plus the bulk-ingress
 /// admission counters as [`INGRESS_RECORD_KIND`] records.
@@ -3055,9 +3253,13 @@ fn spawn_boundary_reporter(metrics: Arc<GatewayMetrics>) {
         let mut cursors: [GatewayServerLatencySnapshot; GATEWAY_BOUNDARY_SERIES.len()] =
             std::array::from_fn(|_| GatewayServerLatencySnapshot::default());
         let mut ingress_cursor = GatewayIngressSnapshot::default();
+        let mut lease_cursor = GatewayLeaseSnapshot::default();
+        let route_stages = crate::cluster::route_stage_metrics();
+        let mut route_stage_cursor = crate::cluster::RouteStageSnapshot::default();
         loop {
             tokio::time::sleep(BOUNDARY_REPORT_INTERVAL).await;
             let ingress = metrics.ingress.snapshot();
+            let lease = metrics.lease.snapshot();
             // Warned, not debugged: a gateway that refused a durable write is
             // an operational event even when refusing is the correct answer,
             // and it is the event this admission path exists to make sayable.
@@ -3067,12 +3269,21 @@ fn spawn_boundary_reporter(metrics: Arc<GatewayMetrics>) {
                 warn!(
                     shed_saturated = ingress.shed_saturated,
                     shed_stale = ingress.shed_stale,
+                    shed_slow_route = ingress.shed_slow_route,
                     admitted = ingress.admitted,
                     "gateway: shedding bulk diffs at ingress"
                 );
             }
+            if lease.refused != lease_cursor.refused {
+                warn!(
+                    refused = lease.refused,
+                    queued = lease.queued,
+                    "gateway: refusing lease operations, lane full"
+                );
+            }
             let Some(sink) = file.as_mut() else {
                 ingress_cursor = ingress;
+                lease_cursor = lease;
                 continue;
             };
             let mut out = String::new();
@@ -3094,14 +3305,47 @@ fn spawn_boundary_reporter(metrics: Arc<GatewayMetrics>) {
             // such record, not a sum a reader has to reconstruct.
             if ingress != ingress_cursor {
                 out.push_str(&format!(
-                    "{{\"type\":\"{}\",\"admitted\":{},\"shed_saturated\":{},\"shed_stale\":{}}}\n",
+                    "{{\"type\":\"{}\",\"admitted\":{},\"shed_saturated\":{},\"shed_stale\":{},\"shed_slow_route\":{}}}\n",
                     INGRESS_RECORD_KIND,
                     ingress.admitted,
                     ingress.shed_saturated,
-                    ingress.shed_stale
+                    ingress.shed_stale,
+                    ingress.shed_slow_route
+                ));
+            }
+            if lease != lease_cursor {
+                out.push_str(&format!(
+                    "{{\"type\":\"{}\",\"queued\":{},\"refused\":{}}}\n",
+                    LEASE_RECORD_KIND, lease.queued, lease.refused
+                ));
+            }
+            // An interval delta, not a total, and deliberately unlike the two
+            // above: these are sums over a varying number of applies, so only
+            // a delta divided by its own `applies` is a mean anyone can read.
+            // Check your denominators: `applies` is per fenced apply, not per
+            // acknowledgement and not per flush.
+            let route_stage = route_stages.snapshot();
+            let route_delta = route_stage.delta(route_stage_cursor);
+            route_stage_cursor = route_stage;
+            if route_delta.applies > 0 || route_delta.batch_locks > 0 {
+                out.push_str(&format!(
+                    "{{\"type\":\"{}\",\"applies\":{},\"gate_wait_us_sum\":{},\"gate_wait_us_max\":{},\"locate_us_sum\":{},\"locate_us_max\":{},\"mailbox_us_sum\":{},\"mailbox_us_max\":{},\"batch_locks\":{},\"batch_gates_sum\":{},\"batch_hold_us_sum\":{},\"batch_hold_us_max\":{}}}\n",
+                    ROUTE_STAGE_RECORD_KIND,
+                    route_delta.applies,
+                    route_delta.gate_wait_us_sum,
+                    route_delta.gate_wait_us_max,
+                    route_delta.locate_us_sum,
+                    route_delta.locate_us_max,
+                    route_delta.mailbox_us_sum,
+                    route_delta.mailbox_us_max,
+                    route_delta.batch_locks,
+                    route_delta.batch_gates_sum,
+                    route_delta.batch_hold_us_sum,
+                    route_delta.batch_hold_us_max,
                 ));
             }
             ingress_cursor = ingress;
+            lease_cursor = lease;
             if out.is_empty() {
                 continue;
             }
@@ -3132,6 +3376,7 @@ async fn accept_loop(
     redistributor: Arc<Redistributor>,
     lease_sweep_clock: SharedClaimClock,
     send_failures: Arc<AtomicU64>,
+    route_admission_wait_us: u64,
     mut shutdown: oneshot::Receiver<()>,
 ) {
     loop {
@@ -3175,6 +3420,7 @@ async fn accept_loop(
                     metrics,
                     redistributor,
                     send_failures,
+                    route_admission_wait_us,
                 ));
             }
         }
@@ -3206,6 +3452,7 @@ async fn handle_connection(
     metrics: Arc<GatewayMetrics>,
     redistributor: Arc<Redistributor>,
     send_failures: Arc<AtomicU64>,
+    route_admission_wait_us: u64,
 ) {
     let conn = match incoming.accept() {
         Ok(accepting) => match accepting.await {
@@ -3307,6 +3554,19 @@ async fn handle_connection(
         let reliable = reliable.clone();
         Arc::new(move |bytes: Bytes| reliable.send(reliable::Lane::Area, bytes))
     };
+    // The lease lane. One worker, one queue, strictly FIFO: it is the whole
+    // point that this is not a spawn per message — see `serve_lease_message`
+    // for the ordering the fencing protocol requires and where that is read
+    // from. The receive loop's only remaining cost for a lease operation is a
+    // channel push.
+    let (lease_tx, lease_worker) = spawn_lease_lane(LeaseContext {
+        send: Arc::clone(&send),
+        router: Arc::clone(&router),
+        redistributor: Arc::clone(&redistributor),
+        interest_authority: Arc::clone(&interest_authority),
+        claim_clock: Arc::clone(&admission.claim_clock),
+        remote,
+    });
     let inflight_diffs = Arc::new(Semaphore::new(MAX_INFLIGHT_DIFF_ROUTES_PER_CONN));
     let inflight_control = Arc::new(Semaphore::new(MAX_INFLIGHT_CONTROL_ROUTES_PER_CONN));
     let inflight_intents = Arc::new(Semaphore::new(MAX_INFLIGHT_INTENT_ROUTES_PER_CONN));
@@ -3421,266 +3681,39 @@ async fn handle_connection(
             // to compile here instead of being silently dropped.
             GatewayMsg::VersionedHello { .. } => {}
             GatewayMsg::Lease { message } => {
-                let Some(active_session) = session.as_ref() else {
+                let Some(active_session) = session.clone() else {
                     continue;
                 };
-                match message {
-                    LeaseMsg::Claim {
-                        claim_id,
-                        entity,
-                        grid,
-                        cell,
-                        kind,
-                        basis,
-                        ..
-                    } => {
-                        let Some(mut peer) = active_session.lock_current().await else {
-                            send(Bytes::from(encode_stream_frame(&GatewayReply::Lease {
-                                message: LeaseMsg::Deny {
-                                    claim_id: Some(claim_id),
-                                    entity,
-                                    reason: orrery_protocol::DenyReason::NotEligible,
-                                    retry_after_ms: 0,
-                                },
-                            })));
-                            continue;
-                        };
-                        let claim_now_ms = admission.claim_clock.now_ms();
-                        if !peer.claim_bucket.take(claim_now_ms) {
-                            let retry_after_ms = peer.claim_bucket.retry_after_ms();
-                            send(Bytes::from(encode_stream_frame(&GatewayReply::Lease {
-                                message: LeaseMsg::Deny {
-                                    claim_id: Some(claim_id),
-                                    entity,
-                                    reason: orrery_protocol::DenyReason::RateLimited,
-                                    retry_after_ms,
-                                },
-                            })));
-                            continue;
-                        }
-                        drop(peer);
-                        if !active_session.try_reserve_lease_slot().await {
-                            send(Bytes::from(encode_stream_frame(&GatewayReply::Lease {
-                                message: LeaseMsg::Deny {
-                                    claim_id: Some(claim_id),
-                                    entity,
-                                    reason: orrery_protocol::DenyReason::NotEligible,
-                                    retry_after_ms: 0,
-                                },
-                            })));
-                            continue;
-                        }
-                        let now_ms = registrar_now_ms();
-                        let player_basis = matches!(
-                            basis,
-                            orrery_protocol::ClaimBasis::Contact { .. }
-                                | orrery_protocol::ClaimBasis::Explicit
+                // Handed to this connection's lease worker instead of being
+                // served here. The queue is what preserves the ordering the
+                // fencing protocol depends on; `serve_lease_message` records
+                // which ordering that is and where it is relied on.
+                //
+                // `try_send`, never `send().await`: waiting for lane capacity
+                // would put the head-of-line block back, one indirection
+                // further down, which is the same mistake the intent lane
+                // documents at `reserve_intent_lane`.
+                match lease_tx.try_send(LeaseWork {
+                    session: active_session,
+                    message,
+                }) {
+                    Ok(()) => metrics.lease.record_queued(),
+                    Err(mpsc::error::TrySendError::Full(work)) => {
+                        metrics.lease.record_refused();
+                        warn!(
+                            %remote,
+                            cap = MAX_QUEUED_LEASE_OPS_PER_CONN,
+                            "gateway: lease lane saturated"
                         );
-                        let committed_cell = if player_basis {
-                            router
-                                .committed_entity_cell(grid, entity)
-                                .await
-                                .ok()
-                                .flatten()
-                        } else {
-                            None
-                        };
-                        let plausible = committed_cell.is_some_and(|resolved| {
-                            resolved == cell
-                                && match kind {
-                                    orrery_protocol::ClaimKind::Weak => {
-                                        interest_authority.allows(remote, grid, resolved, now_ms)
-                                    }
-                                    orrery_protocol::ClaimKind::Strong => true,
-                                }
-                        });
-                        // A strong claim on something another peer is
-                        // actively holding is a *request*, not a refusal
-                        // (D7 §4.2): the registrar asks the holder to divest
-                        // rather than telling the claimant no. The reply then
-                        // arrives on the holder's answer or on the deadline,
-                        // so nothing is sent here.
-                        let contested = if plausible
-                            && matches!(kind, orrery_protocol::ClaimKind::Strong)
-                        {
-                            match router.inspect_lease(grid, entity).await {
-                                Ok((Some(row), Some(committed_cell), _)) => row
-                                    .holder
-                                    .filter(|holder| *holder != remote && row.expires_at > now_ms)
-                                    .map(|holder| PendingHandoff {
-                                        entity,
-                                        grid,
-                                        cell: committed_cell,
-                                        holder,
-                                        holder_lease_id: row.lease_id,
-                                        claimant: remote,
-                                        claim_id,
-                                        kind,
-                                        strong_held: row
-                                            .flags
-                                            .contains(orrery_protocol::LeaseFlags::STRONG_HELD),
-                                    }),
-                                _ => None,
-                            }
-                        } else {
-                            None
-                        };
-                        if let Some(pending) = contested {
-                            if redistributor.request_divest(&router, pending).await {
-                                // The reservation is released now and retaken
-                                // when the handoff lands, so a peer waiting on
-                                // a deadline does not sit on lease capacity.
-                                let _ = active_session.complete_lease_claim(None).await;
-                                continue;
-                            }
-                        }
-                        let outcome = if plausible {
-                            router
-                                .claim_lease(grid, cell, entity, remote, kind, now_ms)
-                                .await
-                        } else {
-                            Ok(crate::lease::ClaimResult::Denied(
-                                orrery_protocol::DenyReason::NotEligible,
-                            ))
-                        };
-                        let message = match outcome {
-                            Ok(crate::lease::ClaimResult::Granted(row)) => {
-                                let lease = SessionLease {
-                                    entity,
-                                    lease_id: row.lease_id,
-                                    grid,
-                                    cell,
-                                    owner: SessionLeaseOwner::Active(active_session.generation),
-                                };
-                                match active_session.complete_lease_claim(Some(lease)).await {
-                                    LeaseClaimCompletion::Granted => LeaseMsg::Grant {
-                                        claim_id,
-                                        entity,
-                                        lease_id: row.lease_id,
-                                        seq: row.seq,
-                                        ttl_ms: crate::lease::LEASE_TTL_MS as u32,
-                                        prev_holder: None,
-                                    },
-                                    LeaseClaimCompletion::Compensate(compensation) => {
-                                        let parked = router
-                                            .park_lease(grid, cell, entity, remote, row.lease_id)
-                                            .await
-                                            .is_ok();
-                                        if parked {
-                                            let mut peer = active_session.state.lock().await;
-                                            if peer.leases.get(&compensation.entity)
-                                                == Some(&compensation)
-                                            {
-                                                peer.leases.remove(&compensation.entity);
-                                            }
-                                        }
-                                        LeaseMsg::Deny {
-                                            claim_id: Some(claim_id),
-                                            entity,
-                                            reason: orrery_protocol::DenyReason::NotEligible,
-                                            retry_after_ms: 0,
-                                        }
-                                    }
-                                    LeaseClaimCompletion::Denied => LeaseMsg::Deny {
-                                        claim_id: Some(claim_id),
-                                        entity,
-                                        reason: orrery_protocol::DenyReason::NotEligible,
-                                        retry_after_ms: 0,
-                                    },
-                                }
-                            }
-                            Ok(crate::lease::ClaimResult::Denied(reason)) => {
-                                let _ = active_session.complete_lease_claim(None).await;
-                                // A herd loser is refused for a bounded reason,
-                                // so tell it when coming back is worth anything
-                                // rather than leaving it to spin or to give up.
-                                let retry_after_ms = crate::lease::retry_after_ms(&reason);
-                                LeaseMsg::Deny {
-                                    claim_id: Some(claim_id),
-                                    entity,
-                                    reason,
-                                    retry_after_ms,
-                                }
-                            }
-                            Err(_) => {
-                                let _ = active_session.complete_lease_claim(None).await;
-                                LeaseMsg::Deny {
-                                    claim_id: Some(claim_id),
-                                    entity,
-                                    reason: orrery_protocol::DenyReason::NotEligible,
-                                    retry_after_ms: 100,
-                                }
-                            }
-                        };
-                        send(Bytes::from(encode_stream_frame(&GatewayReply::Lease {
-                            message,
-                        })));
+                        refuse_saturated_lease(send.as_ref(), &work.message);
                     }
-                    LeaseMsg::Heartbeat { renew, .. } => {
-                        let Some(peer) = active_session.lock_current().await else {
-                            send(Bytes::from(encode_stream_frame(&GatewayReply::Lease {
-                                message: LeaseMsg::HeartbeatAck {
-                                    leases: Vec::new(),
-                                    invalid: renew,
-                                },
-                            })));
-                            continue;
-                        };
-                        let (renewable, mut invalid) =
-                            resolve_renewals(&peer.leases, active_session.generation, &renew);
-                        drop(peer);
-                        let (rows, refused) =
-                            renew_session_leases(&router, remote, &renewable, registrar_now_ms())
-                                .await;
-                        let mut rows = rows;
-                        invalid.extend(refused);
-                        if active_session.lock_current().await.is_none() {
-                            rows.clear();
-                            invalid = renew;
-                        }
-                        send(Bytes::from(encode_stream_frame(&GatewayReply::Lease {
-                            message: LeaseMsg::HeartbeatAck {
-                                leases: rows,
-                                invalid,
-                            },
-                        })));
+                    // The worker outlives this loop by construction — it is
+                    // joined below, after the loop ends — so a closed lane
+                    // means the worker task itself is gone and there is
+                    // nothing left to serve the operation with.
+                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                        warn!(%remote, "gateway: lease worker is gone");
                     }
-                    LeaseMsg::Divest {
-                        entity,
-                        lease_id,
-                        to,
-                        final_seq,
-                        cursor,
-                    } => {
-                        let message = divest_lease(
-                            active_session,
-                            &router,
-                            &redistributor,
-                            admission.claim_clock.now_ms(),
-                            DivestRequest {
-                                entity,
-                                lease_id,
-                                to,
-                                final_seq,
-                                cursor,
-                            },
-                        )
-                        .await;
-                        send(Bytes::from(encode_stream_frame(&GatewayReply::Lease {
-                            message,
-                        })));
-                    }
-                    LeaseMsg::Rekey { entity, .. } => {
-                        send(Bytes::from(encode_stream_frame(&GatewayReply::Lease {
-                            message: LeaseMsg::Deny {
-                                claim_id: None,
-                                entity,
-                                reason: orrery_protocol::DenyReason::NotEligible,
-                                retry_after_ms: 0,
-                            },
-                        })));
-                    }
-                    _ => {}
                 }
             }
             GatewayMsg::InterestGrant { grant } => {
@@ -3752,8 +3785,10 @@ async fn handle_connection(
                                 &router,
                                 &bulk_ack_admission,
                                 &metrics.bulk,
+                                &metrics.ingress,
                                 authority_metrics,
                                 received_at,
+                                route_admission_wait_us,
                             )
                             .await;
                         });
@@ -3947,6 +3982,15 @@ async fn handle_connection(
             }
         }
     }
+    // Drain the lane before tearing the session down. `cleanup_peer_session`
+    // parks this peer's leases, and a lease operation still in flight after
+    // that would be operating on a session the registrar has already
+    // released — which the inline arm could never do, because the loop *was*
+    // the worker.
+    drop(lease_tx);
+    if let Err(e) = lease_worker.await {
+        warn!(?e, %remote, "gateway: lease worker did not finish cleanly");
+    }
     if let Some(session) = session {
         cleanup_peer_session(
             &session,
@@ -3955,6 +3999,408 @@ async fn handle_connection(
             admission.clock.now_ms().0,
         )
         .await;
+    }
+}
+
+/// One lease operation, with the session it was received under.
+///
+/// The session is captured at *receive* time rather than read again in the
+/// worker, because that is what the inline arm did: it bound
+/// `session.as_ref()` the moment the message came off the inbound queue. A
+/// worker that re-read the connection's current session instead would serve
+/// an operation under a generation the peer never addressed it to.
+struct LeaseWork {
+    session: PeerSession,
+    message: LeaseMsg,
+}
+
+/// Everything one connection's lease worker needs, cloned once at connection
+/// setup rather than threaded through the message loop.
+struct LeaseContext {
+    send: Arc<dyn Fn(Bytes) + Send + Sync>,
+    router: Arc<dyn Router>,
+    redistributor: Arc<Redistributor>,
+    interest_authority: SharedInterestAuthority,
+    claim_clock: SharedClaimClock,
+    remote: NodeId,
+}
+
+/// Refuse one lease operation that could not be queued, without lying to the
+/// peer about what happened to it.
+///
+/// Only a claim has an honest refusal here. `Deny { RateLimited }` is exactly
+/// true of a full per-connection lane — it *is* a per-peer limit — and it
+/// carries a retry delay, so the claimant comes back rather than spinning.
+/// A heartbeat has no such reply: `HeartbeatAck { invalid: renew }` would tell
+/// a holder its leases are gone and make it stop writing to entities it still
+/// legitimately owns, which is a far worse answer than silence, and the holder
+/// re-heartbeats well inside `LEASE_TTL_MS`. A divest likewise resolves on the
+/// handoff deadline. Both are counted by `GatewayLeaseMetrics::record_refused`
+/// and logged at the call site, so the drop is a number an operator can read
+/// rather than an unexplained stall.
+fn refuse_saturated_lease(send: &(dyn Fn(Bytes) + Send + Sync), message: &LeaseMsg) {
+    if let LeaseMsg::Claim {
+        claim_id, entity, ..
+    } = message
+    {
+        send(Bytes::from(encode_stream_frame(&GatewayReply::Lease {
+            message: LeaseMsg::Deny {
+                claim_id: Some(*claim_id),
+                entity: *entity,
+                reason: orrery_protocol::DenyReason::RateLimited,
+                retry_after_ms: LEASE_LANE_RETRY_AFTER_MS,
+            },
+        })));
+    }
+}
+
+/// Start one connection's lease lane: a queue and the single task that drains
+/// it.
+///
+/// One task, not one per message. `serve_lease_message` records why the
+/// fencing protocol requires that, and `a_blocked_lease_operation_does_not_let_the_next_one_overtake_it`
+/// pins it.
+fn spawn_lease_lane(cx: LeaseContext) -> (mpsc::Sender<LeaseWork>, JoinHandle<()>) {
+    let (tx, mut rx) = mpsc::channel::<LeaseWork>(MAX_QUEUED_LEASE_OPS_PER_CONN);
+    let worker = tokio::spawn(async move {
+        while let Some(work) = rx.recv().await {
+            serve_lease_message(&cx, work).await;
+        }
+    });
+    (tx, worker)
+}
+
+/// Serve one lease operation: claim, heartbeat, divest or rekey.
+///
+/// # Why this is not on the receive loop
+///
+/// This body has sixteen `.await` points, several of them per-`(grid, cell)`
+/// actor round trips, and it used to run inline in `handle_connection`'s
+/// dispatch. Every microsecond it spent was a microsecond the connection's
+/// bulk diffs sat in the inbound queue ageing toward
+/// `MAX_INGRESS_QUEUE_WAIT_US`, after which they are shed — so lease work,
+/// not actor saturation, was what a quarter of the offered diffs were being
+/// destroyed for. Measured on the P2 rig: 128 actors at 37.8 % utilisation
+/// (17 684 diffs/s x 2.734 ms mean `router_apply` = 48.4 actor-seconds per
+/// wall second), while 25.1 % of diffs were shed for queue age. The actors
+/// were never the limit; this dispatch was.
+///
+/// # What ordering it needs, and where that is read from
+///
+/// A fencing protocol cannot be reordered, so this is not free to run
+/// concurrently per message. Read out of the code rather than assumed:
+///
+/// * **Per entity.** `PeerState::leases` is keyed by `PersistId`, and
+///   `complete_lease_claim` decides Granted/Compensate/Denied by comparing
+///   the entry already indexed at that key. A divest that removed the entry
+///   after a claim inserted it, but was *applied* before it, would leave the
+///   session indexing a lease the registrar no longer records.
+/// * **Per session.** `resolve_renewals` refuses any lease whose owner is not
+///   `Active(self.generation)`, and `try_reserve_lease_slot` /
+///   `complete_lease_claim` are a reserve-then-commit pair over
+///   `pending_lease_claims`. A second claim overtaking the first between
+///   those two halves would see a capacity figure that the first claim has
+///   reserved against but not yet spent.
+/// * **Not per connection-wide message order.** Nothing here reads or writes
+///   state shared with the diff, intent, subscribe or report arms, so those
+///   lanes were already free to run beside lease work (they spawn), and
+///   moving lease work off the loop does not change what they observe.
+///
+/// A per-connection FIFO worker is therefore the smallest shape that is
+/// *exactly* as ordered as the inline arm was: strictly one lease operation
+/// at a time, in arrival order, per connection — which subsumes both the
+/// per-entity and per-session requirements, since a peer's entities and its
+/// session are reachable only through its own connection. Naive
+/// `tokio::spawn` per message would satisfy neither.
+///
+/// Two orderings are deliberately *not* preserved, both already reachable
+/// before this change:
+///
+/// * A `Hello` is still served on the receive loop, so a re-`Hello` can
+///   activate a new generation while an operation for the old one is queued.
+///   That operation then finds `lock_current()` returning `None` and is
+///   denied, or completes into the `Compensate` park path — the same two
+///   outcomes `Redistributor` and `cleanup_peer_session` already produce
+///   concurrently (see `cleanup_peer_session_releases_peer_state_while_park_is_pending`).
+/// * The registrar's own paths (`Redistributor::request_divest`,
+///   `expire_handoff`, the TTL sweep) never ran on this loop and are
+///   unaffected.
+///
+/// # The peer mutex
+///
+/// `lock_current` returns an `OwnedMutexGuard` over the whole `PeerState`,
+/// which is shared with the diff path. Holding one across an await serialises
+/// every other operation on the connection — that is the bug that once cost
+/// this project a 2 s bulk p99. Every guard below is dropped before the first
+/// actor round trip, and this worker does not add one.
+#[allow(clippy::too_many_lines)]
+async fn serve_lease_message(cx: &LeaseContext, work: LeaseWork) {
+    let LeaseContext {
+        send,
+        router,
+        redistributor,
+        interest_authority,
+        claim_clock,
+        remote,
+    } = cx;
+    let send = send.as_ref();
+    let remote = *remote;
+    let LeaseWork {
+        session: active_session,
+        message,
+    } = work;
+    let active_session = &active_session;
+    match message {
+        LeaseMsg::Claim {
+            claim_id,
+            entity,
+            grid,
+            cell,
+            kind,
+            basis,
+            ..
+        } => {
+            let Some(mut peer) = active_session.lock_current().await else {
+                send(Bytes::from(encode_stream_frame(&GatewayReply::Lease {
+                    message: LeaseMsg::Deny {
+                        claim_id: Some(claim_id),
+                        entity,
+                        reason: orrery_protocol::DenyReason::NotEligible,
+                        retry_after_ms: 0,
+                    },
+                })));
+                return;
+            };
+            let claim_now_ms = claim_clock.now_ms();
+            if !peer.claim_bucket.take(claim_now_ms) {
+                let retry_after_ms = peer.claim_bucket.retry_after_ms();
+                send(Bytes::from(encode_stream_frame(&GatewayReply::Lease {
+                    message: LeaseMsg::Deny {
+                        claim_id: Some(claim_id),
+                        entity,
+                        reason: orrery_protocol::DenyReason::RateLimited,
+                        retry_after_ms,
+                    },
+                })));
+                return;
+            }
+            drop(peer);
+            if !active_session.try_reserve_lease_slot().await {
+                send(Bytes::from(encode_stream_frame(&GatewayReply::Lease {
+                    message: LeaseMsg::Deny {
+                        claim_id: Some(claim_id),
+                        entity,
+                        reason: orrery_protocol::DenyReason::NotEligible,
+                        retry_after_ms: 0,
+                    },
+                })));
+                return;
+            }
+            let now_ms = registrar_now_ms();
+            let player_basis = matches!(
+                basis,
+                orrery_protocol::ClaimBasis::Contact { .. } | orrery_protocol::ClaimBasis::Explicit
+            );
+            let committed_cell = if player_basis {
+                router
+                    .committed_entity_cell(grid, entity)
+                    .await
+                    .ok()
+                    .flatten()
+            } else {
+                None
+            };
+            let plausible = committed_cell.is_some_and(|resolved| {
+                resolved == cell
+                    && match kind {
+                        orrery_protocol::ClaimKind::Weak => {
+                            interest_authority.allows(remote, grid, resolved, now_ms)
+                        }
+                        orrery_protocol::ClaimKind::Strong => true,
+                    }
+            });
+            // A strong claim on something another peer is
+            // actively holding is a *request*, not a refusal
+            // (D7 §4.2): the registrar asks the holder to divest
+            // rather than telling the claimant no. The reply then
+            // arrives on the holder's answer or on the deadline,
+            // so nothing is sent here.
+            let contested = if plausible && matches!(kind, orrery_protocol::ClaimKind::Strong) {
+                match router.inspect_lease(grid, entity).await {
+                    Ok((Some(row), Some(committed_cell), _)) => row
+                        .holder
+                        .filter(|holder| *holder != remote && row.expires_at > now_ms)
+                        .map(|holder| PendingHandoff {
+                            entity,
+                            grid,
+                            cell: committed_cell,
+                            holder,
+                            holder_lease_id: row.lease_id,
+                            claimant: remote,
+                            claim_id,
+                            kind,
+                            strong_held: row
+                                .flags
+                                .contains(orrery_protocol::LeaseFlags::STRONG_HELD),
+                        }),
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            if let Some(pending) = contested {
+                if redistributor.request_divest(router, pending).await {
+                    // The reservation is released now and retaken
+                    // when the handoff lands, so a peer waiting on
+                    // a deadline does not sit on lease capacity.
+                    let _ = active_session.complete_lease_claim(None).await;
+                    return;
+                }
+            }
+            let outcome = if plausible {
+                router
+                    .claim_lease(grid, cell, entity, remote, kind, now_ms)
+                    .await
+            } else {
+                Ok(crate::lease::ClaimResult::Denied(
+                    orrery_protocol::DenyReason::NotEligible,
+                ))
+            };
+            let message = match outcome {
+                Ok(crate::lease::ClaimResult::Granted(row)) => {
+                    let lease = SessionLease {
+                        entity,
+                        lease_id: row.lease_id,
+                        grid,
+                        cell,
+                        owner: SessionLeaseOwner::Active(active_session.generation),
+                    };
+                    match active_session.complete_lease_claim(Some(lease)).await {
+                        LeaseClaimCompletion::Granted => LeaseMsg::Grant {
+                            claim_id,
+                            entity,
+                            lease_id: row.lease_id,
+                            seq: row.seq,
+                            ttl_ms: crate::lease::LEASE_TTL_MS as u32,
+                            prev_holder: None,
+                        },
+                        LeaseClaimCompletion::Compensate(compensation) => {
+                            let parked = router
+                                .park_lease(grid, cell, entity, remote, row.lease_id)
+                                .await
+                                .is_ok();
+                            if parked {
+                                let mut peer = active_session.state.lock().await;
+                                if peer.leases.get(&compensation.entity) == Some(&compensation) {
+                                    peer.leases.remove(&compensation.entity);
+                                }
+                            }
+                            LeaseMsg::Deny {
+                                claim_id: Some(claim_id),
+                                entity,
+                                reason: orrery_protocol::DenyReason::NotEligible,
+                                retry_after_ms: 0,
+                            }
+                        }
+                        LeaseClaimCompletion::Denied => LeaseMsg::Deny {
+                            claim_id: Some(claim_id),
+                            entity,
+                            reason: orrery_protocol::DenyReason::NotEligible,
+                            retry_after_ms: 0,
+                        },
+                    }
+                }
+                Ok(crate::lease::ClaimResult::Denied(reason)) => {
+                    let _ = active_session.complete_lease_claim(None).await;
+                    // A herd loser is refused for a bounded reason,
+                    // so tell it when coming back is worth anything
+                    // rather than leaving it to spin or to give up.
+                    let retry_after_ms = crate::lease::retry_after_ms(&reason);
+                    LeaseMsg::Deny {
+                        claim_id: Some(claim_id),
+                        entity,
+                        reason,
+                        retry_after_ms,
+                    }
+                }
+                Err(_) => {
+                    let _ = active_session.complete_lease_claim(None).await;
+                    LeaseMsg::Deny {
+                        claim_id: Some(claim_id),
+                        entity,
+                        reason: orrery_protocol::DenyReason::NotEligible,
+                        retry_after_ms: 100,
+                    }
+                }
+            };
+            send(Bytes::from(encode_stream_frame(&GatewayReply::Lease {
+                message,
+            })));
+        }
+        LeaseMsg::Heartbeat { renew, .. } => {
+            let Some(peer) = active_session.lock_current().await else {
+                send(Bytes::from(encode_stream_frame(&GatewayReply::Lease {
+                    message: LeaseMsg::HeartbeatAck {
+                        leases: Vec::new(),
+                        invalid: renew,
+                    },
+                })));
+                return;
+            };
+            let (renewable, mut invalid) =
+                resolve_renewals(&peer.leases, active_session.generation, &renew);
+            drop(peer);
+            let (rows, refused) =
+                renew_session_leases(router, remote, &renewable, registrar_now_ms()).await;
+            let mut rows = rows;
+            invalid.extend(refused);
+            if active_session.lock_current().await.is_none() {
+                rows.clear();
+                invalid = renew;
+            }
+            send(Bytes::from(encode_stream_frame(&GatewayReply::Lease {
+                message: LeaseMsg::HeartbeatAck {
+                    leases: rows,
+                    invalid,
+                },
+            })));
+        }
+        LeaseMsg::Divest {
+            entity,
+            lease_id,
+            to,
+            final_seq,
+            cursor,
+        } => {
+            let message = divest_lease(
+                active_session,
+                router,
+                redistributor,
+                claim_clock.now_ms(),
+                DivestRequest {
+                    entity,
+                    lease_id,
+                    to,
+                    final_seq,
+                    cursor,
+                },
+            )
+            .await;
+            send(Bytes::from(encode_stream_frame(&GatewayReply::Lease {
+                message,
+            })));
+        }
+        LeaseMsg::Rekey { entity, .. } => {
+            send(Bytes::from(encode_stream_frame(&GatewayReply::Lease {
+                message: LeaseMsg::Deny {
+                    claim_id: None,
+                    entity,
+                    reason: orrery_protocol::DenyReason::NotEligible,
+                    retry_after_ms: 0,
+                },
+            })));
+        }
+        _ => {}
     }
 }
 
@@ -4523,8 +4969,10 @@ async fn route_session_diff(
     router: &Arc<dyn Router>,
     bulk_ack_admission: &SharedBulkAckAdmission,
     bulk_metrics: &GatewayBulkMetrics,
+    ingress_metrics: &GatewayIngressMetrics,
     authority_metrics: Arc<AuthorityMetrics>,
     received_at: Instant,
+    budget_us: u64,
 ) {
     // Liveness only, and the guard must not outlive this check.
     //
@@ -4557,11 +5005,13 @@ async fn route_session_diff(
             author: session.node,
             received_at,
             strict_authority: true,
+            budget_us,
             authority_metrics,
         },
         router,
         bulk_ack_admission,
         bulk_metrics,
+        ingress_metrics,
     )
     .await;
 }
@@ -4572,6 +5022,55 @@ struct DiffRoute {
     received_at: Instant,
     strict_authority: bool,
     authority_metrics: Arc<AuthorityMetrics>,
+    /// How long, since `received_at`, the router has to admit this diff to a
+    /// journal before it is shed. Zero disables the valve. Carried per route
+    /// rather than read from the process config inside `route_diff` so a test
+    /// can state the policy it is testing; the receive loop passes
+    /// [`route_admission_budget_us`].
+    budget_us: u64,
+}
+
+/// What the router did with a record, once, so the whole round trip can sit
+/// inside one timed future rather than being spliced by an early `return`.
+enum RouteAdmission {
+    /// The record reached (or failed to reach) the journal.
+    Journaled(Result<Arc<crate::journal::AppendHandle>, Reject>),
+    /// The fence refused it; the live row travels back for the NACK.
+    Fenced {
+        lease: Option<orrery_protocol::Lease>,
+        lease_id: LeaseId,
+        fence_now_ms: u64,
+    },
+}
+
+/// Run the router round trip under the route-admission budget, measured from
+/// the diff's *arrival*, not from here.
+///
+/// `None` means the budget was already spent before the call or ran out
+/// during it. Dropping the future cancels it, which is safe at every point it
+/// can be dropped: waiting on the entity gate and the `LeaseStore::locate`
+/// read leave no trace, and if it is dropped after the actor took the mailbox
+/// message the actor still journals the record — the client simply gets no
+/// ack for a write that happened, and re-offers it, where the fold is
+/// last-writer-wins per `(entity, tick)` and the replay is a no-op.
+///
+/// A zero budget disables the valve outright, which is the merged branch's
+/// behaviour and therefore the "before" leg of an A/B against it.
+async fn within_route_budget<T>(
+    received_at: Instant,
+    budget: u64,
+    route: impl std::future::Future<Output = T>,
+) -> Option<T> {
+    if budget == 0 {
+        return Some(route.await);
+    }
+    let remaining = budget.saturating_sub(elapsed_us(received_at));
+    if remaining == 0 {
+        return None;
+    }
+    tokio::time::timeout(Duration::from_micros(remaining), route)
+        .await
+        .ok()
 }
 
 /// Journal a bulk diff via the owning cell actor, then ack with the durable
@@ -4583,12 +5082,14 @@ async fn route_diff(
     router: &Arc<dyn Router>,
     bulk_ack_admission: &SharedBulkAckAdmission,
     bulk_metrics: &GatewayBulkMetrics,
+    ingress_metrics: &GatewayIngressMetrics,
 ) {
     let DiffRoute {
         diff,
         author,
         received_at,
         strict_authority,
+        budget_us,
         authority_metrics,
     } = route;
     let route_started = Instant::now();
@@ -4609,45 +5110,80 @@ async fn route_diff(
         payload: diff.payload,
         crc,
     };
-    let result = if strict_authority {
-        // The actor performs this comparison and append in one mailbox turn.
-        // A missing pair deliberately uses the never-granted zero token so it
-        // still returns the current row in the lease-specific NACK.
-        let (lease_id, authority_seq) = diff
-            .lease_id
-            .zip(diff.authority_seq)
-            .unwrap_or((LeaseId(0), Default::default()));
-        let fence_now_ms = registrar_now_ms();
-        match router
-            .apply_fenced(record, author, lease_id, authority_seq, fence_now_ms)
-            .await
-        {
-            Ok(FencedApply::Accepted(handle)) => Ok(handle),
-            Ok(FencedApply::Rejected(lease)) => {
-                // The single-writer invariant checker (D7 §5): a fenced-out
-                // write whose live row names a *different* unexpired holder is
-                // two peers believing they were the writer at once.
-                observe_fencing_rejection(
-                    &authority_metrics,
-                    entity,
-                    tick,
-                    author,
-                    lease_id,
-                    lease.as_ref(),
-                    fence_now_ms,
-                );
-                send(Bytes::from(encode_datagram(&GatewayReply::BulkNack {
-                    entity,
-                    tick,
-                    reason: 2,
+    // The valve, and the only reason it is here rather than in the receive
+    // loop: this `await` is where the queue is (`MAX_ROUTE_ADMISSION_WAIT_US`).
+    let admission = within_route_budget(received_at, budget_us, async {
+        if strict_authority {
+            // The actor performs this comparison and append in one mailbox
+            // turn. A missing pair deliberately uses the never-granted zero
+            // token so it still returns the current row in the lease-specific
+            // NACK.
+            let (lease_id, authority_seq) = diff
+                .lease_id
+                .zip(diff.authority_seq)
+                .unwrap_or((LeaseId(0), Default::default()));
+            let fence_now_ms = registrar_now_ms();
+            match router
+                .apply_fenced(record, author, lease_id, authority_seq, fence_now_ms)
+                .await
+            {
+                Ok(FencedApply::Accepted(handle)) => RouteAdmission::Journaled(Ok(handle)),
+                Ok(FencedApply::Rejected(lease)) => RouteAdmission::Fenced {
                     lease,
-                })));
-                return;
+                    lease_id,
+                    fence_now_ms,
+                },
+                Err(error) => RouteAdmission::Journaled(Err(error)),
             }
-            Err(error) => Err(error),
+        } else {
+            RouteAdmission::Journaled(router.apply(record).await)
         }
-    } else {
-        router.apply(record).await
+    })
+    .await;
+
+    let result = match admission {
+        // Refused, in silence, on exactly the convention the two ingress
+        // refusals already set: an un-acked diff stays pending in the peer's
+        // scheduler and is re-offered, usually as a newer tick, where a
+        // `BulkNack` would tell it to discard the write. The count is the
+        // honest part — see `GatewayIngressMetrics::record_shed_slow_route`.
+        None => {
+            ingress_metrics.record_shed_slow_route();
+            debug!(
+                entity = ?entity,
+                ?tick,
+                waited_us = elapsed_us(received_at),
+                budget_us,
+                "gateway: shed diff, router did not admit it inside its budget"
+            );
+            return;
+        }
+        Some(RouteAdmission::Fenced {
+            lease,
+            lease_id,
+            fence_now_ms,
+        }) => {
+            // The single-writer invariant checker (D7 §5): a fenced-out
+            // write whose live row names a *different* unexpired holder is
+            // two peers believing they were the writer at once.
+            observe_fencing_rejection(
+                &authority_metrics,
+                entity,
+                tick,
+                author,
+                lease_id,
+                lease.as_ref(),
+                fence_now_ms,
+            );
+            send(Bytes::from(encode_datagram(&GatewayReply::BulkNack {
+                entity,
+                tick,
+                reason: 2,
+                lease,
+            })));
+            return;
+        }
+        Some(RouteAdmission::Journaled(result)) => result,
     };
     let router_apply_us = elapsed_us(route_started);
     let journal_wait_started = Instant::now();
@@ -5411,6 +5947,231 @@ mod tests {
         );
     }
 
+    /// A router that never answers: it reports that it was entered, then
+    /// parks forever. Stands in for the entity-gate convoy the valve exists
+    /// to bound, without needing a real registrar to build one.
+    struct StalledRouter {
+        entered: Arc<AtomicU64>,
+    }
+
+    #[async_trait::async_trait]
+    impl Router for StalledRouter {
+        async fn apply(
+            &self,
+            _record: JournalRecord,
+        ) -> Result<Arc<crate::journal::AppendHandle>, Reject> {
+            self.entered.fetch_add(1, Ordering::Relaxed);
+            std::future::pending::<()>().await;
+            unreachable!("the stalled router never answers")
+        }
+
+        async fn read(&self, _grid: GridId, _cell: CellId) -> Result<SnapshotPage, Reject> {
+            Err(Reject::JournalClosed)
+        }
+
+        async fn has_actor(&self, _grid: GridId, _cell: CellId) -> bool {
+            false
+        }
+    }
+
+    fn valve_route(received_at: Instant, budget_us: u64) -> DiffRoute {
+        DiffRoute {
+            diff: DiffUplink {
+                cell: CellId::ROOT,
+                grid: GridId::ROOT,
+                entity: PersistId::new(31),
+                tick: orrery_protocol::Tick::new(5),
+                kind: orrery_protocol::RecordKind::ComponentDiff,
+                payload: Bytes::from_static(b"state"),
+                seq: 5,
+                lease_id: None,
+                authority_seq: None,
+            },
+            author: successor_node(9),
+            received_at,
+            strict_authority: false,
+            authority_metrics: Arc::new(AuthorityMetrics::default()),
+            budget_us,
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_router_that_cannot_admit_a_diff_inside_its_budget_sheds_it_and_says_so() {
+        // The defect the whole change is about: the ingress deadline is
+        // evaluated on arrival age at dequeue, so once the receive loop went
+        // instant it always passed and nothing bounded the wait that
+        // followed. This is that bound, and it is evaluated after the wait.
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let capture = Arc::clone(&sent);
+        let send = move |bytes| capture.lock().expect("capture lock").push(bytes);
+        let entered = Arc::new(AtomicU64::new(0));
+        let router: Arc<dyn Router> = Arc::new(StalledRouter {
+            entered: Arc::clone(&entered),
+        });
+        let admission: SharedBulkAckAdmission = Arc::new(AlwaysDurableAdmission);
+        let bulk = GatewayBulkMetrics::default();
+        let ingress = GatewayIngressMetrics::default();
+
+        // The outer deadline is a hundred budgets and exists only so that a
+        // valve deleted from `within_route_budget` fails this test loudly
+        // instead of hanging a CI job: `StalledRouter` never answers, so
+        // without the inner bound there is nothing else to end the await.
+        tokio::time::timeout(
+            Duration::from_micros(25_000 * 100),
+            route_diff(
+                &send,
+                valve_route(Instant::now(), 25_000),
+                &router,
+                &admission,
+                &bulk,
+                &ingress,
+            ),
+        )
+        .await
+        .expect("the route budget, not the test harness, must end this route");
+
+        assert_eq!(
+            entered.load(Ordering::Relaxed),
+            1,
+            "the router was reached; this is a downstream refusal, not an ingress one"
+        );
+        let counted = ingress.snapshot();
+        assert_eq!(counted.shed_slow_route, 1, "the refusal is a number");
+        assert_eq!(
+            (counted.shed_stale, counted.shed_saturated),
+            (0, 0),
+            "and it is its own number: the ingress queue was not what grew"
+        );
+        assert!(
+            sent.lock().expect("capture lock").is_empty(),
+            "silence, not a BulkNack: a nack would tell the peer to discard a write it should re-offer"
+        );
+        assert_eq!(
+            bulk.snapshot().acknowledgements,
+            0,
+            "a shed diff is not an acknowledged one"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_diff_already_past_its_budget_on_arrival_never_reaches_the_router() {
+        // Little's law in one assertion: work that cannot be answered in time
+        // must not occupy the router either, or the valve relieves the client
+        // and not the queue.
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let capture = Arc::clone(&sent);
+        let send = move |bytes| capture.lock().expect("capture lock").push(bytes);
+        let entered = Arc::new(AtomicU64::new(0));
+        let router: Arc<dyn Router> = Arc::new(StalledRouter {
+            entered: Arc::clone(&entered),
+        });
+        let admission: SharedBulkAckAdmission = Arc::new(AlwaysDurableAdmission);
+        let ingress = GatewayIngressMetrics::default();
+
+        // Real `std::time::Instant` arithmetic, not `tokio::time::advance`:
+        // the arrival stamp is a `std::time::Instant` and tokio's paused
+        // clock does not move it. That is not a detail of the test — a valve
+        // that measured tokio time would stop bounding anything the moment a
+        // caller paused the clock.
+        let arrived = Instant::now() - Duration::from_micros(25_001);
+        route_diff(
+            &send,
+            valve_route(arrived, 25_000),
+            &router,
+            &admission,
+            &GatewayBulkMetrics::default(),
+            &ingress,
+        )
+        .await;
+
+        assert_eq!(
+            entered.load(Ordering::Relaxed),
+            0,
+            "the budget is spent; the router must not be entered at all"
+        );
+        assert_eq!(ingress.snapshot().shed_slow_route, 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_router_that_answers_inside_the_budget_is_acknowledged_not_shed() {
+        // The mutation check for the two above: with the valve set to the
+        // shipped budget and a router that answers, nothing is shed. Delete
+        // the deadline arithmetic and this still passes, which is the point —
+        // it is here so a valve that fires on a healthy gateway fails loudly.
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let capture = Arc::clone(&sent);
+        let send = move |bytes| capture.lock().expect("capture lock").push(bytes);
+        let router: Arc<dyn Router> = Arc::new(SuccessfulRouter);
+        let admission: SharedBulkAckAdmission = Arc::new(AlwaysDurableAdmission);
+        let ingress = GatewayIngressMetrics::default();
+
+        route_diff(
+            &send,
+            valve_route(Instant::now(), MAX_ROUTE_ADMISSION_WAIT_US),
+            &router,
+            &admission,
+            &GatewayBulkMetrics::default(),
+            &ingress,
+        )
+        .await;
+
+        assert_eq!(ingress.snapshot().shed_slow_route, 0);
+        assert!(
+            matches!(
+                decode_datagram(&sent.lock().expect("capture lock").pop().expect("reply")),
+                Some(GatewayReply::BulkAck { .. })
+            ),
+            "a gateway that is keeping up acknowledges"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_zero_budget_is_the_valve_switched_off() {
+        // This is the "before" leg of every A/B in docs/08-persistence.md
+        // §3.6: with the budget at zero the route waits exactly as the merged
+        // branch did, so the two legs differ in one number and not in code.
+        let entered = Arc::new(AtomicU64::new(0));
+        let router: Arc<dyn Router> = Arc::new(StalledRouter {
+            entered: Arc::clone(&entered),
+        });
+        let admission: SharedBulkAckAdmission = Arc::new(AlwaysDurableAdmission);
+        let ingress = GatewayIngressMetrics::default();
+        let send = |_bytes: Bytes| {};
+
+        let route = tokio::spawn({
+            let router = Arc::clone(&router);
+            let admission = Arc::clone(&admission);
+            async move {
+                route_diff(
+                    &send,
+                    valve_route(Instant::now(), 0),
+                    &router,
+                    &admission,
+                    &GatewayBulkMetrics::default(),
+                    &GatewayIngressMetrics::default(),
+                )
+                .await;
+            }
+        });
+
+        tokio::time::advance(Duration::from_secs(60)).await;
+        assert!(
+            !route.is_finished(),
+            "a zero budget must wait, however long the router takes"
+        );
+        route.abort();
+        assert_eq!(ingress.snapshot().shed_slow_route, 0);
+    }
+
+    #[test]
+    fn the_two_deadlines_are_one_budget() {
+        // One staleness policy, evaluated twice: once on arrival age at
+        // dequeue and once around the router round trip. If these ever
+        // diverge silently, `shed_stale` and `shed_slow_route` stop being
+        // two views of the same rule and start being two rules.
+        assert_eq!(MAX_ROUTE_ADMISSION_WAIT_US, MAX_INGRESS_QUEUE_WAIT_US);
+    }
+
     #[test]
     fn claim_bucket_allows_d16_burst_then_refills_at_twenty_per_second() {
         let mut bucket = ClaimBucket::new(0);
@@ -5951,10 +6712,12 @@ mod tests {
                 author: iroh::SecretKey::from_bytes(&[1; 32]).public(),
                 received_at: Instant::now(),
                 strict_authority: false,
+                budget_us: 0,
             },
             &router,
             &admission,
             &metrics,
+            &GatewayIngressMetrics::default(),
         )
         .await;
 
@@ -6055,10 +6818,12 @@ mod tests {
                 author: iroh::SecretKey::from_bytes(&[2; 32]).public(),
                 received_at: Instant::now(),
                 strict_authority: false,
+                budget_us: 0,
             },
             &router,
             &admission,
             &GatewayBulkMetrics::default(),
+            &GatewayIngressMetrics::default(),
         )
         .await;
         let bytes = sent
@@ -6501,8 +7266,10 @@ mod tests {
                     &router,
                     &admission,
                     &bulk_metrics,
+                    &GatewayIngressMetrics::default(),
                     Arc::new(AuthorityMetrics::default()),
                     Instant::now(),
+                    0,
                 )
                 .await;
             }));
@@ -6662,5 +7429,256 @@ mod tests {
 
         assert!(renewable.is_empty());
         assert_eq!(invalid, vec![(entity, LeaseId(1))]);
+    }
+
+    /// A router whose renewals block until released, recording arrival order.
+    ///
+    /// The instrument for the lease lane: `entered` says *when* an operation
+    /// reached the router, so a second arrival while the first is still
+    /// blocked is visible as an extra message rather than having to be
+    /// inferred from a timing.
+    struct GatedRenewalRouter {
+        entered: tokio::sync::mpsc::UnboundedSender<PersistId>,
+        release: Arc<Semaphore>,
+        holder: NodeId,
+    }
+
+    #[async_trait::async_trait]
+    impl Router for GatedRenewalRouter {
+        async fn apply(
+            &self,
+            _record: JournalRecord,
+        ) -> Result<Arc<crate::journal::AppendHandle>, Reject> {
+            Err(Reject::JournalClosed)
+        }
+        async fn read(&self, _grid: GridId, _cell: CellId) -> Result<SnapshotPage, Reject> {
+            Err(Reject::JournalClosed)
+        }
+        async fn has_actor(&self, _grid: GridId, _cell: CellId) -> bool {
+            false
+        }
+        async fn heartbeat_leases(
+            &self,
+            _grid: GridId,
+            _holder: NodeId,
+            renew: &[LeaseRenewal],
+            _now_ms: u64,
+        ) -> Result<Vec<Option<orrery_protocol::Lease>>, Reject> {
+            for entry in renew {
+                let _ = self.entered.send(entry.entity);
+            }
+            let permit = Arc::clone(&self.release)
+                .acquire_owned()
+                .await
+                .expect("release semaphore stays open");
+            drop(permit);
+            Ok(renew
+                .iter()
+                .map(|entry| {
+                    Some(orrery_protocol::Lease {
+                        entity: entry.entity,
+                        holder: Some(self.holder),
+                        seq: SeqPair::default(),
+                        lease_id: entry.lease_id,
+                        expires_at: u64::MAX,
+                        flags: LeaseFlags::default(),
+                        bound_to: None,
+                    })
+                })
+                .collect())
+        }
+    }
+
+    /// Give `session` `count` leases, through the same reserve-then-commit
+    /// pair a granted claim uses.
+    async fn hold_leases(session: &PeerSession, count: u64) -> Vec<PersistId> {
+        let mut held = Vec::new();
+        for id in 1..=count {
+            let entity = PersistId::new(id);
+            assert!(
+                session.try_reserve_lease_slot().await,
+                "capacity for a test lease"
+            );
+            assert!(
+                matches!(
+                    session
+                        .complete_lease_claim(Some(SessionLease {
+                            entity,
+                            lease_id: LeaseId(1),
+                            grid: GridId::ROOT,
+                            cell: CellId::ROOT,
+                            owner: SessionLeaseOwner::Active(session.generation),
+                        }))
+                        .await,
+                    LeaseClaimCompletion::Granted
+                ),
+                "a reserved claim commits"
+            );
+            held.push(entity);
+        }
+        held
+    }
+
+    fn valid_authorization(node: NodeId) -> GatewayAuthorization {
+        GatewayAuthorization::Valid(SessionTokenClaimsV1::new(
+            orrery_protocol::AccountId::new(1),
+            node,
+            UnixMillis::new(0),
+            orrery_protocol::SessionTokenTtlMs::new(1_000),
+            orrery_protocol::SessionStanding::Good,
+            orrery_protocol::IssuerKeyId::new(1),
+        ))
+    }
+
+    /// The lease lane is a FIFO of one: a blocked operation is never overtaken.
+    ///
+    /// This is the property that makes moving lease work off the receive loop
+    /// safe. Authority is a fencing protocol — a claim that overtook a
+    /// heartbeat, or a divest that overtook a claim, would reorder the
+    /// reserve-then-commit pair (`try_reserve_lease_slot` /
+    /// `complete_lease_claim`) and the per-entity index it writes
+    /// (`PeerState::leases`). `tokio::spawn` per message is the obvious fix
+    /// and it fails here: with the first operation held inside the router, a
+    /// spawned second one reaches the router immediately, and the arrival
+    /// channel below carries two entries instead of one.
+    #[tokio::test]
+    async fn a_blocked_lease_operation_does_not_let_the_next_one_overtake_it() {
+        const HELD: u64 = 3;
+        let node = iroh::SecretKey::from_bytes(&[21; 32]).public();
+        let registry = Arc::new(PeerRegistry::new(2, 10_000, MAX_PEER_LIVE_LEASES));
+        let session = registry
+            .activate(node, valid_authorization(node), b"lane", None, 0, 0)
+            .await
+            .expect("valid peer is admitted");
+        let held = hold_leases(&session, HELD).await;
+
+        let (entered_tx, mut entered_rx) = tokio::sync::mpsc::unbounded_channel();
+        let release = Arc::new(Semaphore::new(0));
+        let router: Arc<dyn Router> = Arc::new(GatedRenewalRouter {
+            entered: entered_tx,
+            release: Arc::clone(&release),
+            holder: node,
+        });
+        let (lease_tx, worker) = spawn_lease_lane(LeaseContext {
+            send: Arc::new(|_bytes: Bytes| {}),
+            router,
+            redistributor: Arc::new(parking_redistributor(Arc::clone(&registry))),
+            interest_authority: Arc::new(DenyAllInterestAuthority),
+            claim_clock: Arc::new(SystemClaimClock::default()),
+            remote: node,
+        });
+
+        // Three heartbeats, offered back to back exactly as the receive loop
+        // offers them: one entity each, so each is one router round trip.
+        for entity in &held {
+            lease_tx
+                .send(LeaseWork {
+                    session: session.clone(),
+                    message: LeaseMsg::Heartbeat {
+                        renew: vec![(*entity, LeaseId(1))],
+                        tick: orrery_protocol::Tick::new(1),
+                    },
+                })
+                .await
+                .expect("the lane accepts every offered operation");
+        }
+
+        // The first reaches the router and blocks there.
+        let first = tokio::time::timeout(Duration::from_secs(10), entered_rx.recv())
+            .await
+            .expect("the first heartbeat reaches the router")
+            .expect("arrival channel stays open");
+        assert_eq!(first, held[0]);
+
+        // And nothing follows it while it is held. The window is generous in
+        // the direction that matters: a serial lane never produces a second
+        // arrival however long this waits, while a spawn-per-message lane
+        // produces one in microseconds.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(
+            matches!(
+                entered_rx.try_recv(),
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+            ),
+            "a second lease operation overtook the one still in flight"
+        );
+
+        // Released, the rest run — in arrival order, not in whatever order
+        // the runtime happens to wake them.
+        release.add_permits(HELD as usize);
+        let mut order = vec![first];
+        for _ in 1..HELD {
+            order.push(
+                tokio::time::timeout(Duration::from_secs(10), entered_rx.recv())
+                    .await
+                    .expect("every queued heartbeat is served")
+                    .expect("arrival channel stays open"),
+            );
+        }
+        assert_eq!(order, held, "the lane serves in arrival order");
+
+        drop(lease_tx);
+        tokio::time::timeout(Duration::from_secs(10), worker)
+            .await
+            .expect("the worker ends with its queue")
+            .expect("the worker does not panic");
+        drop(registry);
+    }
+
+    /// A refused lease operation answers a claimant and lies to nobody else.
+    #[test]
+    fn a_full_lease_lane_refuses_a_claim_and_stays_silent_to_a_holder() {
+        let entity = PersistId::new(7);
+        let replies = Arc::new(Mutex::new(Vec::new()));
+        let send = {
+            let replies = Arc::clone(&replies);
+            move |bytes: Bytes| {
+                replies.lock().expect("replies").push(bytes);
+            }
+        };
+
+        refuse_saturated_lease(
+            &send,
+            &LeaseMsg::Claim {
+                claim_id: orrery_protocol::ClaimId(3),
+                entity,
+                grid: GridId::ROOT,
+                cell: CellId::ROOT,
+                kind: orrery_protocol::ClaimKind::Weak,
+                basis: orrery_protocol::ClaimBasis::Explicit,
+                observed: SeqPair::default(),
+                tick: orrery_protocol::Tick::new(1),
+            },
+        );
+        let frame = replies.lock().expect("replies").pop().expect("one reply");
+        let reply: GatewayReply = decode_stream_frame(&frame).expect("a decodable reply");
+        assert!(
+            matches!(
+                reply,
+                GatewayReply::Lease {
+                    message: LeaseMsg::Deny {
+                        claim_id: Some(claim_id),
+                        entity: denied,
+                        reason: orrery_protocol::DenyReason::RateLimited,
+                        retry_after_ms: LEASE_LANE_RETRY_AFTER_MS,
+                    }
+                } if claim_id == orrery_protocol::ClaimId(3) && denied == entity
+            ),
+            "a claimant is told to come back, with a delay"
+        );
+
+        // A holder is not. `HeartbeatAck { invalid }` would make it stop
+        // writing to entities it still owns, and it re-heartbeats anyway.
+        refuse_saturated_lease(
+            &send,
+            &LeaseMsg::Heartbeat {
+                renew: vec![(entity, LeaseId(1))],
+                tick: orrery_protocol::Tick::new(1),
+            },
+        );
+        assert!(
+            replies.lock().expect("replies").is_empty(),
+            "a refused heartbeat is counted, never answered with a lie"
+        );
     }
 }

@@ -106,7 +106,110 @@ So the receive loop now decides admission without ever waiting, on two bounds. A
 
 Silence, not a `BulkNack`, is deliberate. A nack means *rejected, do not resend* — the client drops the pending diff (§3.5) — whereas an un-acked diff stays pending and is re-offered on the next flush, usually as a newer tick, which is what this lane's idempotent `(entity, tick)` records are for. Dropping an un-acked diff is also the one loss this contract already permits: the ack *is* the durability promise, and "the unacked tail is lost by design (bulk class)" (§9). P2's demo criterion promises RPO 0 for acked intents and bulk loss "bounded by the journal/replication window" ([11-roadmap.md](11-roadmap.md) §P2); a diff refused at ingress was never acknowledged, so nothing that was promised is withdrawn. It is the same load-shedding order §11 states explicitly: bulk sheds first, intents last.
 
-Measured on three interleaved before/after runs of the same gate on the same box: `bulk_ack_ms` p99 1 945 / 1 985 / 2 018 ms before, **20 / 30 / 50 ms after**, with 24–25 % of diffs shed and the acked remainder (402 807 – 405 444 of ~540 000) fully recovered by the post-kill verifier. One honest caveat, and one former one. `gateway_ingress_queue_ms` initially got *worse* (2 530–3 253 ms p99), because the histogram sampled every inbound message including the shed ones — so it measured the age of the backlog being destroyed rather than the delay being served, and stopped predicting client-observed latency. That is now fixed by splitting it: `gateway_ingress_queue_ms` records only messages the gateway **served**, and refused diffs go to `gateway_shed_age_ms`. Both are "time in the inbound queue", but a refused diff is refused *for* waiting, so pooling them guaranteed the served-latency distribution was dragged into the seconds by exactly the samples that were never served. The remaining caveat is that the queue itself is still unbounded — the loop can be stalled by the lease/claim work it runs inline, which is what lets a backlog form at all; bounding that is the next step, not this one.
+Measured on three interleaved before/after runs of the same gate on the same box: `bulk_ack_ms` p99 1 945 / 1 985 / 2 018 ms before, **20 / 30 / 50 ms after**, with 24–25 % of diffs shed and the acked remainder (402 807 – 405 444 of ~540 000) fully recovered by the post-kill verifier. One honest caveat, and one former one. `gateway_ingress_queue_ms` initially got *worse* (2 530–3 253 ms p99), because the histogram sampled every inbound message including the shed ones — so it measured the age of the backlog being destroyed rather than the delay being served, and stopped predicting client-observed latency. That is now fixed by splitting it: `gateway_ingress_queue_ms` records only messages the gateway **served**, and refused diffs go to `gateway_shed_age_ms`. Both are "time in the inbound queue", but a refused diff is refused *for* waiting, so pooling them guaranteed the served-latency distribution was dragged into the seconds by exactly the samples that were never served. The remaining caveat was that the loop could be stalled by the lease/claim work it ran inline, which is what let a backlog form at all. That is the next paragraph.
+
+
+**The lease lane: authority work runs beside the receive loop, not inside it.** The shed rate above — a quarter of every diff offered — was not the cell actors being the limit. On the same runs the actors were at **37.8 %** utilisation (17 684 diffs/s x 2.734 ms mean `router_apply` = 48.4 actor-seconds per wall second against 128 actors). What consumed the deadline was the receive loop's own `GatewayMsg::Lease` arm: ~263 lines with **sixteen `.await` points and no `spawn`**, so a claim, a heartbeat or a divest — including `PeerState` locks and one actor round trip per `(grid, cell)` a peer holds entities in — ran to completion before the next inbound datagram was even looked at. `Subscribe` and `SubmitIntent` had already been moved off the loop; lease had not.
+
+Lease work now goes to a **per-connection worker with its own queue** (`spawn_lease_lane`). Not a `tokio::spawn` per message: authority is a fencing protocol, and two operations on one entity may not reorder. What the code actually requires is **per-entity** order (`PeerState::leases` is keyed by entity and `complete_lease_claim` decides on the entry already indexed there) and **per-session** order (`try_reserve_lease_slot` / `complete_lease_claim` are a reserve-then-commit pair over `pending_lease_claims`); a single FIFO worker per connection is the smallest shape that gives both, and is *exactly* as ordered as the inline arm was. The queue is bounded (`MAX_QUEUED_LEASE_OPS_PER_CONN`) and full-lane refusal is a `Deny { RateLimited }` to a claimant and silence to a holder — a `HeartbeatAck { invalid }` would tell a holder to stop writing to entities it still owns, which is worse than the retry it will make anyway. Counts ride the boundary sink as `{"type":"gateway_lease"}`.
+
+Measured on three interleaved before/after runs of the kill-9 gate, same box, same binaries otherwise:
+
+| | before | after |
+|---|---|---|
+| `gateway_ingress_queue_ms` p99 (served messages) | 750 / 500 / 1 500 ms | **0.05 / 0.05 / 0.05 ms** |
+| diffs shed for queue age | 138 238 / 146 090 / 146 150 (25.6 / 27.0 / 27.0 %) | **0 / 0 / 0** |
+| durable bulk acks (of ~540 000 offered) | 402 466 / 394 542 / 394 994 | **536 140 / 541 264 / 539 296** |
+| `bulk_ack_ms` p99 | 30 / 30 / 30 ms | 500 / 150 / 200 ms |
+
+The head-of-line block is gone outright: the wait a served message spends in the inbound queue drops four orders of magnitude, nothing is shed for age any more, and the gateway durably acknowledges **every diff offered to it** (a2 and a3 acked 100 % of offers) — a third more durable writes than the shedding gateway managed.
+
+The cost is that the ingress deadline no longer fires, and it was the only thing bounding client-observed latency. That is not an accident of this change, it is the same standing-queue result one stage later: with the loop no longer the constriction, the queue re-forms downstream of admission, where a per-arrival deadline cannot see it, and `bulk_ack_ms` p99 rises to 150–500 ms. Note also that the "before" p99 is a **survivorship** number — it is the distribution over the 75 % of diffs that were *not* shed, while the shed quarter has no latency at all — so the two columns' last row are not measured over the same population, and per *offer* the change is a strict improvement.
+
+The valve that can still see that queue is `MAX_INFLIGHT_DIFF_ROUTES_PER_CONN`, which at 128 per connection x 125 sessions bounds nothing in practice (`shed_saturated` stayed 0 on every run above). One exploratory run at **8** — not the committed value — turned the invisible downstream queue back into visible shedding: 52 275 shed saturated (9.7 %), 488 629 durable acks, `bulk_ack_ms` p99 100 ms. So the trade curve is real and is a policy choice, not a defect: 25.6 % shed / 30 ms, 9.7 % / 100 ms, 0 % / 150–500 ms. Choosing a point on it is a separate change from removing the head-of-line block, which is what this one does.
+
+**Where the queue actually went, and the valve that can see it.** The paragraph above ended on a guess with two candidates. Neither was right, and the first job of this change was to stop guessing: `gateway_bulk_stage_delta` already splits the server span into `route_queue` / `router_apply` / `journal_wait` / `reply`, and `router_apply` — the whole of `Router::apply_fenced` — held it. But `router_apply` is not one wait, it is three, in three different subsystems, so `crate::cluster::RouteStageMetrics` now splits it again and rides the boundary sink as `{"type":"gateway_route_stage"}`. Four runs of the merged branch, 30 s, 125 sessions, 10 000 entities, 128 shards, per acknowledged diff:
+
+| stage | mean | max |
+|---|---|---|
+| `route_queue` — spawn to route task | 0.005 ms | 0.22–0.45 ms |
+| `router_apply` | 7.8–9.5 ms | 2.15–2.21 s |
+| — entity-gate wait | 7.2–9.0 ms | 2.15–2.21 s |
+| — `LeaseStore::locate` (an FDB read) | 0.40–0.42 ms | 3.6–15.4 ms |
+| — actor mailbox round trip | **0.006 ms** | 0.27–1.0 ms |
+| `journal_wait` | 1.6–4.3 ms | 35–275 ms |
+
+So it is **not** the tokio scheduler (`route_queue` is noise), **not** the cell actors (a 6 µs mailbox round trip — they are idle, which is consistent with the 37.8 % utilisation measured before the offload), and not primarily the committer. It is the **1024-way striped per-entity mutex** in `CellRuntime::apply_fenced`, which is held across an FDB read transaction — and which the now-concurrent lease lane takes **77 gates at a time for 16 ms mean / 50 ms max** (`heartbeat_leases` locks a peer's whole renewal set, then resolves each entry's route with its own `LeaseStore::locate` while holding all of them). That is the head-of-line block: it did not disappear when lease work left the receive loop, it moved onto the entity stripes, where a batched heartbeat and live diff traffic for the same entities now collide instead of taking turns.
+
+A deadline bounds only a wait it is evaluated *after*. `MAX_INGRESS_QUEUE_WAIT_US` is evaluated on arrival age at dequeue, and with the loop instant it always passes. `MAX_ROUTE_ADMISSION_WAIT_US` is the same 25 ms budget and the same arrival clock, evaluated around the router round trip: a diff the router cannot admit to a journal inside its budget is dropped, silently on the wire and loudly in telemetry, as `shed_slow_route` — its own counter, beside `shed_stale` and `shed_saturated`, because an operator reading one number must not have to guess which of three queues grew. It **stops at the journal** deliberately: once the actor has admitted the record the write is going to be durable, and refusing to wait for that ack would withhold an acknowledgement for a write that happened. `journal_wait` is therefore outside the valve (and is frozen to another lane).
+
+The budget is `GatewayConfig::route_admission_wait_us`, defaulting to the constant and overridable per node with `ORRERY_GATEWAY_MAX_ROUTE_WAIT_US`; `0` disables the valve, which is exactly the pre-change behaviour and therefore the "before" leg of every A/B below — the two legs differ in one number, not in code.
+
+**The trade curve.** Interleaved runs of the kill-9 gate on one box, one binary. "Offered" is `admitted + shed_stale + shed_saturated`; served is `admitted - shed_slow_route`. `shed_stale` and `shed_saturated` were **0 on every run**, before and after.
+
+| route budget | shed | `bulk_ack_ms` p99 | durable acks | `router_apply` mean | gate wait max |
+|---|---|---|---|---|---|
+| off (merged branch) | 0 % | 150 / 300 / 150 / 150 ms | 540.3–541.0 k | 8.0–9.5 ms | 2.15–2.21 s |
+| 500 ms | 0.55 % | 150 ms | 537.9 k | 2.79 ms | 500 ms |
+| 250 ms | 0.82 % | 75 ms | 536.8 k | 1.94 ms | 250 ms |
+| 100 ms | 1.05 / 1.19 % | 50 / 30 ms | 534.4–535.1 k | 1.39–1.47 ms | 100 ms |
+| 50 ms | 1.34 / 1.45 % | 30 / 30 ms | 533.4 k | 1.20–1.23 ms | 50 ms |
+| **25 ms (shipped)** | 2.08 / 2.13 / 2.23 % | 20 / 40 / 150 ms | 528.6–529.6 k | 0.92–0.96 ms | 25 ms |
+| 10 ms | 4.19 / 4.65 % | 15 / 15 ms | 515.5–518.0 k | 0.58–0.59 ms | 10 ms |
+| 5 ms | 5.92 % | 20 ms | 509.3 k | 0.45 ms | 5 ms |
+| *(prior)* route cap 8/conn | 9.7 % | 100 ms | 488.6 k | — | — |
+| *(prior)* ingress deadline only | 25.6–27.0 % | 30 ms | 394.5–402.5 k | — | — |
+
+Read the whole table rather than one row. **Both halves are now within reach of one point where they were not before**: at a 50–100 ms budget the gateway sheds 1.0–1.5 % of offers and answers in the tens of milliseconds, against 25 % shed for the same tail before the lease lane and 150–300 ms tail for zero shed after it. The `MAX_INFLIGHT_DIFF_ROUTES_PER_CONN = 8` point is off the frontier entirely — every budget from 5 ms to 500 ms dominates it on all three axes — and so is 5 ms, which sheds more than 10 ms for a worse p99. Everything from 10 ms to 500 ms is a genuine monotone trade with no dominating point, so **choosing among those is a policy call, not a defect to fix**. The shipped default is 25 ms because it is the number the ingress deadline already carries: one staleness policy, evaluated in two places, rather than two numbers that can drift.
+
+The mechanism behind the curve's shape is worth stating, because it is why a *generous* budget works at all. The gate wait is a convoy with positive feedback — a held stripe makes waiters, waiters make the connection slower, a slower connection makes more waiters — and shedding the head of the convoy breaks the feedback. That is why 100 ms sheds only 1.2 % and still caps the tail at 30 ms: once the convoy cannot form, almost nothing comes near even a generous deadline. It is also why the valve *reduces* mean `router_apply` by 6–9x while refusing 1–2 % of work.
+
+**What this does not fix.** The gate still fails, and now on someone else's number. In every valved run `bulk_ack_ms` p99 tracks `journal_commit_ms` p99 within one histogram bucket (20/10, 150/150, 40/30, 15/15, 20/20, 30/10, 50/30, 75/50, 150/75) — with the entity gate bounded, the residual client-observed tail *is* the group committer, whose own D16 target is 2 ms and which missed it on every run in this study, before and after. That is `journal/**`, frozen to this lane, so it is reported here rather than fixed. Nothing on this curve reaches the 5 ms `bulk_ack_ms` D16 target, and no setting of this valve can: the valve cannot bound a wait that begins after the record is durable.
+
+The underlying defect was still there, only bounded: the diff write path takes a per-entity mutex and then performs an **FDB read transaction under it** (`LeaseStore::locate`, 0.40 ms mean — 98 % of the diff path's own gate hold), and the batched heartbeat path performed one such read *per entity* while holding that entity's whole batch of gates. That is what the next paragraph removes.
+
+### 2.1.1 Taking the entity gate off the read path
+
+**What the gate protects, before moving anything out from under it.** Every lease path in `cluster.rs` follows one shape: take the entity's stripe gate, resolve the entity's committed cell, act on the actor that owns it (`claim_lease`, `heartbeat_lease`, `validate_lease`, `park_lease`, `apply_fenced`, and `gated_mutex_actor` for the `Mutex<CellRuntime>` router). The migration side, `commit_rekey`, takes **one** gate — the entity's — and holds it across `CommittedRekeyPlan::execute`, which journals the rekey, calls `LeaseStore::migrate`, and installs the entity at the destination actor. The invariant is therefore narrower than "one writer per entity": the actors already serialise per entity in their own mailboxes. It is that **an entity's committed location is read, and acted on, atomically with respect to a migration of that entity** — and `migrate`, reached only from `execute` under that gate, is the *only* operation that ever changes that location (`LeaseStore::put` refuses to overwrite a different existing one and answers `LocationConflict` instead). The gate does not make the read possible; it makes the read's answer still true when it is used.
+
+That is a property a counter can prove after the fact. `EntityStripeGates` now carries a per-stripe count of completed migrations, bumped inside `execute` immediately after `migrate` while the gate is still held. A reader samples the counter **before** it locates and re-reads it once it holds the gate: unchanged means no migration completed in the window, so the location read outside the gate is the one the gate would have shown. Changed sends that one entry down the original shape — gate held across its own `locate` — rather than routing it to an actor that no longer owns the entity. `heartbeat_leases` therefore resolves every location with **no gate held at all**, and then takes gates **per actor group**, around one mailbox turn and nothing else, still in `lock_entity_gates`'s deduplicated stripe order so no new multi-gate acquisition can cycle. `tests/heartbeat_gate_hold.rs` pins both halves: a single-entity renewal for an entity *inside* a parked batch must still get its gate, and an entity migrated while the batch is parked must be re-resolved rather than answered `None`.
+
+**Measured.** Six configurations, three interleaved runs each, one box, one pair of binaries differing only in this change, 30 s / 125 sessions / 10 000 entities / 128 shards. Per fenced apply:
+
+| leg | budget | entity-gate wait | `LeaseStore::locate` | actor mailbox | `router_apply` | `journal_wait` |
+|---|---|---|---|---|---|---|
+| before | off | 7.56–8.64 ms (max 2.08–2.17 s) | 0.39–0.44 ms | 0.006 ms | 8.11–9.16 ms | 2.33–3.29 ms |
+| before | 50 ms | 0.75–0.80 ms (max 50 ms) | 0.39–0.44 ms | 0.006 ms | 1.21 ms | 2.32–2.41 ms |
+| before | 25 ms | 0.51–0.53 ms (max 26 ms) | 0.40–0.42 ms | 0.006 ms | 0.93–0.97 ms | 2.34–2.91 ms |
+| **after** | **off** | **0.011–0.015 ms** (max 5.3–20.6 ms) | 0.48–0.50 ms | 0.006 ms | **0.50–0.53 ms** | 2.27–2.43 ms |
+| after | 50 ms | 0.012–0.013 ms (max 4.9–6.3 ms) | 0.47–0.48 ms | 0.007 ms | 0.50–0.51 ms | 2.41–2.68 ms |
+| after | 25 ms | 0.011–0.013 ms (max 4.3–12.3 ms) | 0.47–0.50 ms | 0.006 ms | 0.49–0.52 ms | 2.55–2.85 ms |
+
+The gate wait falls by **~600×** in the mean and from 2.1 s to 5–21 ms at the max, with the valve *off* — that is, without shedding anything. `locate` costs the same 0.4–0.5 ms it always did; it is simply no longer anyone else's wait. `router_apply` is now `locate` plus 20 µs.
+
+And the batch hold that caused it:
+
+| leg | batch locks / run | gates per lock | hold mean | hold max |
+|---|---|---|---|---|
+| before | 1 125 | 77.0 | 16.17–16.32 ms | 39–63 ms |
+| after | 90 000 | 1.0 | 0.012–0.015 ms | 1.1–2.3 ms |
+
+Read the first column with the second: the *lock* is now the per-actor-group acquisition, so one heartbeat that used to be a single 77-gate lock is many small ones. The comparable quantity is gate-microseconds and the blocking window per stripe: 1 125 × 77 gates held 16.3 ms each becomes 90 000 × 1 gate held 0.014 ms each — the same gates, taken for **1 100× less time each**. Note also what "1.0 gates per lock" says about the fold: on this workload a peer's 77 entities sit in 77 distinct shards, so `group_by_actor` produces 77 singleton groups and buys no mailbox batching here. That is unchanged by this work and is why folding was never where the cost was.
+
+**The re-measured trade curve**, same runs, "shed" being `shed_slow_route` over offers (`shed_stale` and `shed_saturated` were 0 on all 18 runs):
+
+| leg | route budget | shed | `bulk_ack_ms` p99 | durable acks |
+|---|---|---|---|---|
+| before | off | 0 % | 200 / 150 / 200 ms | 540.3–541.5 k |
+| before | 50 ms | 1.29–1.52 % | 30 / 30 / 30 ms | 532.9–534.1 k |
+| before | 25 ms | 1.82–2.22 % | 20 / 20 / 30 ms | 529.1–530.8 k |
+| **after** | **off** | **0 %** | **15 / 15 / 15 ms** | **540.9–541.3 k** |
+| after | 50 ms | 0 % | 15 / 15 / 15 ms | 540.5–541.4 k |
+| after | 25 ms | 0 % | 15 / 20 / 20 ms | 540.9–541.4 k |
+
+**There is no curve left to sit on.** `off` after the change dominates every point before it on all three axes at once — it sheds nothing, answers in 15 ms at p99, and durably acknowledges more diffs than any valved run of the old code. The monotone trade the previous section described was a trade against the gate hold, and with the hold gone the valve does not fire: at a 25 ms budget, the tightest setting measured here, `shed_slow_route` was **0 on every run**, because the gate wait it is watching never comes near 25 ms any more. So the valve is no longer load-bearing on this workload, and the honest reading is that its default is now a policy choice with no measured cost either way — inert at 25 ms, and inert at `off`. It is kept enabled at 25 ms as a bound for the workloads this study did not run, not because anything here needs it; the case for disabling it by default is that a valve that never fires is a valve nobody has tested.
+
+**What is left is the committer, and only the committer.** After the change `bulk_ack_ms` p99 equals `journal_commit_ms` p99 exactly on every run (15/15, 15/15, 15/15 at `off`; 15/15, 20/20, 20/15 at 25 ms), against a 2 ms D16 target for the commit itself. The client-observed bulk tail is now entirely the group commit path — `journal/**`, frozen to this lane and reported rather than fixed.
 
 **Epoch-fenced acks (split-brain guard).** An actor may issue durable acks only while its shard-ownership epoch (§3.4) is **confirmed fresh**: it heartbeats an FDB read version roughly every **1 s** and treats its epoch as stale after a **3 s staleness bound** — deliberately below the failure-detection + re-placement time, so a partitioned former owner falls silent before a replacement can be fenced in and serving. While stale, the actor downgrades to **provisional acks**, which the client treats as unacked (kept buffered, resent to the new owner). Every `JournalRecord` carries the epoch it was appended under, so recovery replay discards records from a superseded epoch; §4.1 quantifies the residual window.
 
@@ -664,7 +767,7 @@ Every column is linear in players — no quadratic terms — and the 100 k colum
 | Zombie actor after partition | epoch fence (§3.4): its checkpoint txn conflicts on `actor/{shard}` and aborts; its journal appends are ignored at replay (superseded epoch); its durable acks stop within the 3 s read-version staleness bound (§2.1) — past it, only provisional acks the client treats as unacked (residual window quantified in §4.1) |
 | Gateway routes to stale actor during split | actor NACKs (carrying the registrar row when the rejection was a fence, `GatewayReply::BulkNack.lease`); the client drops the rejected diff and the entity's next diff routes to the new owner; bulk path absorbs the <1 s window |
 | FDB unavailable (netsplit posture, D12) | bulk path keeps journaling and acking (durability window widens to journal+follower); checkpoints and intents queue; P2P sim continues — degraded, not dead |
-| Gateway ingress backlog (burst, or a stalled receive loop) | diffs older than 25 ms in the inbound queue, and diffs arriving with every route slot busy, are dropped un-acked and counted (`gateway_ingress` counters, `WARN` totals); the client's pending diff is re-offered on its next flush (§2.1) |
+| Gateway ingress backlog (burst, or a stalled receive loop) | diffs older than 25 ms in the inbound queue, diffs arriving with every route slot busy, and diffs the router cannot admit to a journal within 25 ms of arrival, are dropped un-acked and counted (`gateway_ingress` counters — `shed_stale`, `shed_saturated`, `shed_slow_route` — with `WARN` totals); the client's pending diff is re-offered on its next flush (§2.1) |
 | Journal disk full / fsync stall | bulk acks shed first (clients buffer unacked diffs); intents unaffected (FDB path); alarm before shed via watermark telemetry |
 | Checkpoint > 10 MB | multi-transaction batches; watermark row commits last → partial checkpoint is invisible and re-run idempotently |
 | Entity > 100 KB | row sharding `world/{cell}/{entity}/{k}`; read as one range |
