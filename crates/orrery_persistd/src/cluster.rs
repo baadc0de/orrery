@@ -67,6 +67,13 @@ pub struct RouteStageMetrics {
     batch_gates_sum: AtomicU64,
     batch_hold_us_sum: AtomicU64,
     batch_hold_us_max: AtomicU64,
+    mailbox_turns: AtomicU64,
+    locate_fallbacks: AtomicU64,
+    location_audits: AtomicU64,
+    location_mismatches: AtomicU64,
+    location_audit_errors: AtomicU64,
+    location_audit_us_sum: AtomicU64,
+    location_audit_us_max: AtomicU64,
 }
 
 /// A point-in-time read of [`RouteStageMetrics`].
@@ -100,6 +107,81 @@ pub struct RouteStageSnapshot {
     pub batch_hold_us_sum: u64,
     /// Longest single hold.
     pub batch_hold_us_max: u64,
+    /// Actor mailbox turns those fenced applies spent.
+    ///
+    /// One per apply on the fast path. The route is bounded at **two** — ask
+    /// the presented cell's owner, and at most one forwarded turn after a
+    /// rowless reject — so `mailbox_turns / applies` is a number that must
+    /// sit at 1.0 and can never exceed 2.0. It is the cheapest check that the
+    /// fallback has not become the path.
+    pub mailbox_turns: u64,
+    /// Fenced applies that fell back to `LeaseStore::locate`.
+    ///
+    /// Expected ~0, but **not** structurally zero, and the difference is
+    /// worth keeping straight. `strict_authority` pins the cell a fenced diff
+    /// can be *admitted* at — the actor requires `by_cell[e] == record.cell`
+    /// before the fold that would move it — but it says nothing about the
+    /// cell a diff *arrives* with, which the client puts in its `DiffUplink`.
+    /// What holds the fallback near zero is a rate, not an invariant: the
+    /// gateway lets a diff whose route its own lease index does not confirm
+    /// through only against a per-connection token bucket
+    /// (`AuthoritySnapshot::misrouted_diffs` / `unindexed_diffs` /
+    /// `misroute_throttled`), and an *admitted* one repairs the index so the
+    /// next diff needs no token. It cannot simply be refused — a registrar-
+    /// driven rekey moves an entity without telling the gateway, and the
+    /// holder's first write at the new cell is exactly this shape.
+    ///
+    /// "Does not confirm" covers two shapes, and the second used to be free:
+    /// an index entry naming another cell, **and no index entry at all**. An
+    /// entity with no row anywhere is `Rejected(None)`, which is the one
+    /// answer that does not short-circuit, so it lands here too — see
+    /// docs/08-persistence.md §2.1.2.
+    ///
+    /// A hot fallback is therefore a real alarm: the FDB read is back at
+    /// close to full rate, plus a wasted mailbox turn. Its cost is bounded
+    /// while it is being investigated — see `fenced_locate_fallback_permits`.
+    pub locate_fallbacks: u64,
+    /// Sampled accepts that paid for a location audit **and got an answer**
+    /// (see `fenced_location_audit_due`).
+    ///
+    /// A sample whose `locate` errored or answered `None` is *not* counted
+    /// here — it is counted in [`Self::location_audit_errors`]. The two are
+    /// disjoint and together they are every sample taken, so no locate
+    /// outcome is invisible: `location_audits == 0` with accepts flowing is
+    /// itself the alarm that the audit is not running.
+    pub location_audits: u64,
+    /// Audited accepts where the durable location named a cell **outside**
+    /// the accepting actor's shard.
+    ///
+    /// Invariant J says this is impossible. A nonzero value is a stop-ship:
+    /// it means an actor admitted a fenced write against a registrar row that
+    /// is not the durably-located one, which is exactly the silent failure
+    /// the per-diff locate used to make unreachable.
+    pub location_mismatches: u64,
+    /// Samples that could not produce a verdict: `LeaseStore::locate`
+    /// returned an error, or returned `None`.
+    ///
+    /// `None` belongs here rather than with the clean audits. A fenced diff
+    /// is only ever *accepted* against a live registrar row, and a row is
+    /// only ever granted through `claim_lease`, which writes the durable
+    /// location key in the same call — so an accepted entity always has a
+    /// location key, and `locate` answering `None` means the audit read
+    /// nothing, not that it read agreement. Folding that into
+    /// `location_audits` would let a lease store that has lost its location
+    /// index report a clean bill of health forever.
+    pub location_audit_errors: u64,
+    /// Summed wall time the sampled audits spent, **outside** the entity
+    /// gate.
+    ///
+    /// Its own stage rather than a share of `locate_us`: `locate_us` is the
+    /// route's own read, on the critical path of the routing decision, and
+    /// mixing a background sample into it would make the headline "the route
+    /// reads nothing" unfalsifiable from the counters. Before this was split
+    /// out the audit was billed to nobody — it ran after `record()`, with the
+    /// gate held, so its cost reappeared as the *next* diff's `gate_wait_us`.
+    pub location_audit_us_sum: u64,
+    /// Longest single sampled audit.
+    pub location_audit_us_max: u64,
 }
 
 impl RouteStageMetrics {
@@ -113,6 +195,34 @@ impl RouteStageMetrics {
             sum.fetch_add(value, Ordering::Relaxed);
             max.fetch_max(value, Ordering::Relaxed);
         }
+    }
+
+    fn record_mailbox_turn(&self) {
+        self.mailbox_turns.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_locate_fallback(&self) {
+        self.locate_fallbacks.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_location_audit(&self, mismatched: bool, audit_us: u64) {
+        self.location_audits.fetch_add(1, Ordering::Relaxed);
+        if mismatched {
+            self.location_mismatches.fetch_add(1, Ordering::Relaxed);
+        }
+        self.record_location_audit_time(audit_us);
+    }
+
+    fn record_location_audit_error(&self, audit_us: u64) {
+        self.location_audit_errors.fetch_add(1, Ordering::Relaxed);
+        self.record_location_audit_time(audit_us);
+    }
+
+    fn record_location_audit_time(&self, audit_us: u64) {
+        self.location_audit_us_sum
+            .fetch_add(audit_us, Ordering::Relaxed);
+        self.location_audit_us_max
+            .fetch_max(audit_us, Ordering::Relaxed);
     }
 
     fn record_batch_hold(&self, gates: usize, hold_us: u64) {
@@ -139,6 +249,13 @@ impl RouteStageMetrics {
             batch_gates_sum: load(&self.batch_gates_sum),
             batch_hold_us_sum: load(&self.batch_hold_us_sum),
             batch_hold_us_max: load(&self.batch_hold_us_max),
+            mailbox_turns: load(&self.mailbox_turns),
+            locate_fallbacks: load(&self.locate_fallbacks),
+            location_audits: load(&self.location_audits),
+            location_mismatches: load(&self.location_mismatches),
+            location_audit_errors: load(&self.location_audit_errors),
+            location_audit_us_sum: load(&self.location_audit_us_sum),
+            location_audit_us_max: load(&self.location_audit_us_max),
         }
     }
 }
@@ -161,9 +278,95 @@ impl RouteStageSnapshot {
             batch_gates_sum: sub(self.batch_gates_sum, previous.batch_gates_sum),
             batch_hold_us_sum: sub(self.batch_hold_us_sum, previous.batch_hold_us_sum),
             batch_hold_us_max: self.batch_hold_us_max,
+            mailbox_turns: sub(self.mailbox_turns, previous.mailbox_turns),
+            locate_fallbacks: sub(self.locate_fallbacks, previous.locate_fallbacks),
+            location_audits: sub(self.location_audits, previous.location_audits),
+            location_mismatches: sub(self.location_mismatches, previous.location_mismatches),
+            location_audit_errors: sub(self.location_audit_errors, previous.location_audit_errors),
+            location_audit_us_sum: sub(self.location_audit_us_sum, previous.location_audit_us_sum),
+            location_audit_us_max: self.location_audit_us_max,
         }
     }
 }
+
+/// One in `ORRERY_FENCED_LOCATION_AUDIT_N` accepted fenced diffs pays for a
+/// real `LeaseStore::locate` purely to check invariant J.
+///
+/// Default 1000 in release — 0.1 % of the FDB load this change removes, in
+/// exchange for turning the one silent failure mode into a monitored one —
+/// and **1** under `debug_assertions` and in the test suite, so every existing
+/// test that routes a fenced diff becomes a test of the route. `0` disables
+/// it, which is the only way to give up the signal and should not be the
+/// default anywhere.
+fn fenced_location_audit_due() -> bool {
+    static SEEN: AtomicU64 = AtomicU64::new(0);
+    match fenced_location_audit_every() {
+        0 => false,
+        every => SEEN.fetch_add(1, Ordering::Relaxed).is_multiple_of(every),
+    }
+}
+
+/// The resolved sampling interval, so a test can pin the documented default
+/// instead of inferring it from a counter.
+///
+/// Resolved once, on first use: setting the environment variable after an
+/// accept has already routed does nothing.
+#[must_use]
+pub fn fenced_location_audit_every() -> u64 {
+    static EVERY: LazyLock<u64> = LazyLock::new(|| {
+        std::env::var("ORRERY_FENCED_LOCATION_AUDIT_N")
+            .ok()
+            .and_then(|raw| raw.parse().ok())
+            .unwrap_or(if cfg!(debug_assertions) { 1 } else { 1000 })
+    });
+    *EVERY
+}
+
+/// How many fenced-route fallback `LeaseStore::locate` reads may be in flight
+/// at once, process-wide (`ORRERY_FENCED_LOCATE_FALLBACK_PERMITS`, 0 = no
+/// bound).
+///
+/// The fallback is the expensive branch of the route — an FDB read plus a
+/// second mailbox turn — and which diffs take it is not entirely the server's
+/// choice: the cell a diff declares arrives on the wire. The gateway meters
+/// the connection that sends an unindexed cell (`MisrouteBucket`), which
+/// bounds the rate one peer can ask for the branch, but "one peer" is not
+/// "the fleet" and "no vector we know of" is not a bound at all. This is the
+/// bound.
+///
+/// Bounded process-wide rather than per connection because the resource it
+/// protects is process-wide: `libfdb_c` runs **one** network thread per
+/// process, and docs/14-capacity.md §5.1 measured that thread as the binding
+/// constraint on a whole box. A per-connection cap of `k` with `n`
+/// connections bounds nothing at `n · k`; the shared thread does not care
+/// which connection saturated it.
+///
+/// It is a queue, not a shed: a diff that waits here is still routed. What
+/// sheds it, if the wait is long enough, is the route-admission budget the
+/// gateway already applies from the diff's *arrival*
+/// (`MAX_ROUTE_ADMISSION_WAIT_US`), which counts what it drops. So the
+/// expensive branch degrades into an existing, measured valve instead of into
+/// FDB-thread saturation that takes every other subsystem down with it.
+///
+/// 64 by default: far above the ~0 concurrent fallbacks a healthy node takes
+/// (see `RouteStageSnapshot::locate_fallbacks`), far below the thousands a
+/// connection fleet could otherwise put in flight.
+#[must_use]
+pub fn fenced_locate_fallback_permits() -> usize {
+    static PERMITS: LazyLock<usize> = LazyLock::new(|| {
+        std::env::var("ORRERY_FENCED_LOCATE_FALLBACK_PERMITS")
+            .ok()
+            .and_then(|raw| raw.parse().ok())
+            .unwrap_or(64)
+    });
+    *PERMITS
+}
+
+static LOCATE_FALLBACK_GATE: LazyLock<Option<tokio::sync::Semaphore>> =
+    LazyLock::new(|| match fenced_locate_fallback_permits() {
+        0 => None,
+        permits => Some(tokio::sync::Semaphore::new(permits)),
+    });
 
 static ROUTE_STAGE: LazyLock<Arc<RouteStageMetrics>> =
     LazyLock::new(|| Arc::new(RouteStageMetrics::default()));
@@ -490,6 +693,143 @@ pub trait Router: Send + Sync {
     }
 }
 
+/// A sampled invariant-J audit that has been *decided* under the entity gate
+/// and not yet run.
+///
+/// Split from its execution so the `LeaseStore::locate` it performs happens
+/// with the gate released - see [`CellRuntime::begin_location_audit`].
+struct PendingLocationAudit {
+    grid: GridId,
+    entity: PersistId,
+    accepting_shard: CellId,
+    /// The entity stripe's migration counter as of the accept.
+    mark: u64,
+}
+
+/// Route-side helpers for the fenced bulk path.
+impl CellRuntime {
+    /// Sampled proof that invariant J held for an accepted fenced diff.
+    ///
+    /// The accept-set equivalence argument has exactly one silent failure
+    /// mode: an actor holding a registrar row for an entity whose durable
+    /// location sits in another actor's shard. Nothing else about a wrong
+    /// route is silent - every other way it can go wrong is a `Rejected` the
+    /// client sees as a `BulkNack`. So this ships, at 1-in-N, rather than
+    /// living only in the test suite: a safety argument with a production
+    /// counter proving it is the strongest form available here.
+    ///
+    /// Decided under the entity gate, **executed after it is released.** The
+    /// earlier version ran the whole read with the gate held, which put a
+    /// FoundationDB round trip back on the accept path of every sampled diff
+    /// and - because `RouteStageMetrics::record` had already run - billed it
+    /// to nobody: measured at a 5 ms locate with 8 concurrent accepts on one
+    /// entity, the audit's cost reappeared as 171 ms of the *next* diffs'
+    /// `gate_wait_us`. The sample can no longer be pinned to the accept by
+    /// holding the gate, so it is pinned the way `heartbeat_leases` phase 1
+    /// pins its own off-gate reads: the entity's stripe migration counter is
+    /// sampled under the gate and re-checked after the read, and a sample
+    /// that straddles a migration is discarded rather than judged.
+    fn begin_location_audit(
+        &self,
+        grid: GridId,
+        entity: PersistId,
+        accepting_shard: Option<CellId>,
+    ) -> Option<PendingLocationAudit> {
+        let accepting_shard = accepting_shard?;
+        if !fenced_location_audit_due() {
+            return None;
+        }
+        Some(PendingLocationAudit {
+            grid,
+            entity,
+            accepting_shard,
+            mark: self.entity_migration_mark(grid, entity),
+        })
+    }
+
+    /// Run a sampled audit that [`CellRuntime::begin_location_audit`] decided
+    /// to take. Must be called with the entity gate **released**.
+    ///
+    /// Every outcome lands in a counter. `Ok(Some)` is a verdict -
+    /// `location_audits`, plus `location_mismatches` when the durable
+    /// location falls outside the accepting actor's shard. `Ok(None)`, a
+    /// store error, and a sample that straddled a migration all land in
+    /// `location_audit_errors`: they are samples that were paid for and
+    /// produced no evidence, and folding any of them into the clean count
+    /// would let a lease store that has lost its location index read as a
+    /// clean bill of health forever.
+    async fn finish_location_audit(&self, audit: PendingLocationAudit, stages: &RouteStageMetrics) {
+        let started = Instant::now();
+        let located = self.lease_location(audit.entity).await;
+        // The read straddled a relocation of this entity's stripe, so it
+        // says nothing about the accept it was sampled for. Discarding it is
+        // what keeps `location_mismatches` a stop-ship number rather than a
+        // number with a known false-positive source.
+        let stable = self.entity_migration_mark(audit.grid, audit.entity) == audit.mark;
+        let audit_us = stage_elapsed_us(started);
+        let located = match located {
+            Ok(Some(cell)) if stable => cell,
+            // An audit is not an admission path: a store error costs the
+            // sample, not the write that was already accepted.
+            _ => {
+                stages.record_location_audit_error(audit_us);
+                return;
+            }
+        };
+        let owner = self.owning_shard(audit.grid, located);
+        let mismatched = owner != Some(audit.accepting_shard);
+        stages.record_location_audit(mismatched, audit_us);
+        if mismatched {
+            tracing::warn!(
+                grid = ?audit.grid,
+                entity = ?audit.entity,
+                ?located,
+                ?owner,
+                accepting_shard = ?audit.accepting_shard,
+                "fenced apply: durable location is outside the accepting actor's shard \
+                 (invariant J violated; the accept set is no longer provably unchanged)"
+            );
+        }
+    }
+
+    /// The pre-change fenced-apply implementation, retained as a
+    /// differential oracle.
+    ///
+    /// A verbatim copy of what `<CellRuntime as Router>::apply_fenced` did
+    /// before the bulk write path stopped reading FoundationDB: take the
+    /// entity gate, resolve the route with one `LeaseStore::locate`, ask the
+    /// actor that owns the resolved cell. It exists so a test can assert the
+    /// two implementations return the same discriminant **and** the same
+    /// `Option<Lease>` payload over an enumerated state matrix — the
+    /// accept-set equivalence argument turned into a checked fact rather than
+    /// a comment.
+    ///
+    /// Not `#[cfg(test)]`: the matrix that uses it is an integration test,
+    /// and the same matrix has to run under both `MemLeaseStore` (default
+    /// features) and `FdbLeaseStore` (`--features fdb`). Nothing in
+    /// `persistd` calls it.
+    #[doc(hidden)]
+    pub async fn apply_fenced_via_locate(
+        &self,
+        record: JournalRecord,
+        holder: NodeId,
+        lease_id: LeaseId,
+        authority_seq: orrery_protocol::SeqPair,
+        now_ms: u64,
+    ) -> Result<FencedApply, Reject> {
+        let gate = self.entity_gate(record.grid, record.entity);
+        let _guard = gate.lock_owned().await;
+        let route_cell = self
+            .lease_location(record.entity)
+            .await?
+            .unwrap_or(record.cell);
+        self.actor(record.grid, route_cell)
+            .ok_or(Reject::JournalClosed)?
+            .start_fenced_diff(record, holder, lease_id, authority_seq, now_ms)
+            .await
+    }
+}
+
 /// A router over a single runtime (one-node deployment).
 ///
 /// Direct dispatch into the actor mailbox without lock acquisition, pipelining
@@ -526,24 +866,134 @@ impl Router for CellRuntime {
         // Three timed stages, not one. See `RouteStageMetrics` for why the
         // aggregate this function reports as `router_apply` was not a usable
         // answer to "where is the queue".
+        //
+        // The middle stage — one FoundationDB read per fenced bulk diff —
+        // used to be unconditional, and docs/14-capacity.md §5.1 measured it
+        // as the single binding constraint on a whole box. It is gone from
+        // the accept path. The reason it can go is that the locate never
+        // entered the fence: `CellMsg::ApplyFencedDiff` evaluates five
+        // conjuncts against *actor-local* state (`pending_rekeys`,
+        // `by_cell[e] == record.cell`, and holder/lease_id/seq/expiry against
+        // the actor's own registrar row), and this function never rewrites
+        // `record.cell`. The locate only chose which actor evaluated them.
+        //
+        // Invariant J is what makes choosing by `record.cell` the same
+        // choice: if an actor holds a registrar row for `e` then `locate(e)`
+        // names a cell in that actor's shard, so an actor that *accepts* is
+        // the actor the locate would have picked. J is enforced at four row
+        // install sites (all of which go through `checked_row_cell` in
+        // `actor.rs`) and backed by `LeaseStore::put` refusing to overwrite a
+        // different location. It is also audited in production: see
+        // `fenced_location_audit_due`.
+        //
+        // J does not say a rejecting actor is the right one — cross-shard
+        // duplicate `by_cell` entries are reachable — so a reject *without* a
+        // row is not proof of absence, and only then does the locate happen.
+        // `Rejected(Some(row))` is proof: a row present means, by J, this is
+        // the location owner, and the NACK payload the D7 §5 duplicate-
+        // authority detector consumes is the one it would have got before.
         let stages = route_stage_metrics();
         let started = Instant::now();
         let gate = self.entity_gate(record.grid, record.entity);
-        let _guard = gate.lock_owned().await;
+        let guard = gate.lock_owned().await;
         let gate_wait_us = stage_elapsed_us(started);
+        let grid = record.grid;
+        let entity = record.entity;
+        let presented = record.cell;
+        // One clone per diff: a `bytes::Bytes` Arc bump plus ~64 bytes of
+        // `Copy` scalars, against the 0.48–2.79 ms round trip it replaces.
+        let forwarded = record.clone();
+        // `mailbox_us` sums the turns rather than spanning them: on the
+        // fallback the locate sits *between* two turns, and a span would
+        // count it in both stages at once. The three stages have to stay
+        // disjoint or the decomposition stops answering "where is the queue".
+        let mut mailbox_us = 0;
+        let mut asked: Option<CellId> = None;
+        let mut fast: Option<Result<FencedApply, Reject>> = None;
+        if let Some(actor) = self.actor(grid, presented) {
+            asked = Some(actor.shard());
+            let turn = Instant::now();
+            let answer = actor
+                .start_fenced_diff(record, holder, lease_id, authority_seq, now_ms)
+                .await;
+            mailbox_us += stage_elapsed_us(turn);
+            stages.record_mailbox_turn();
+            // The only short-circuit, and deliberately the only one: an
+            // accept, or a reject that carries the live row.
+            if matches!(
+                answer,
+                Ok(FencedApply::Accepted(_)) | Ok(FencedApply::Rejected(Some(_)))
+            ) {
+                stages.record(gate_wait_us, 0, mailbox_us);
+                // Decided here, run below: the sampled audit is a real
+                // `LeaseStore::locate`, and running it before this `drop`
+                // would put FoundationDB back under the entity gate on the
+                // accept path. See `CellRuntime::begin_location_audit`.
+                let audit = if matches!(answer, Ok(FencedApply::Accepted(_))) {
+                    self.begin_location_audit(grid, entity, asked)
+                } else {
+                    None
+                };
+                drop(guard);
+                if let Some(audit) = audit {
+                    self.finish_location_audit(audit, &stages).await;
+                }
+                return answer;
+            }
+            fast = Some(answer);
+        }
+        // Fallback: exactly one locate, at most one more mailbox turn, no
+        // loop. Entered when the presented cell has no actor here, when its
+        // owner rejected without a row, or when its mailbox is gone — the
+        // last because a closed mailbox is not an answer about the fence, and
+        // the pre-change route would have asked whoever the locate named.
+        stages.record_locate_fallback();
         let locate_started = Instant::now();
-        let route_cell = self
-            .lease_location(record.entity)
-            .await?
-            .unwrap_or(record.cell);
+        // Bounded concurrency on the expensive branch. See
+        // `fenced_locate_fallback_permits`: the wait is inside `locate_us`
+        // deliberately, because from the route's point of view it is part of
+        // the cost of the read it is waiting to make.
+        let permit = match &*LOCATE_FALLBACK_GATE {
+            Some(gate) => Some(
+                gate.acquire()
+                    .await
+                    .expect("the fallback permit pool is never closed"),
+            ),
+            None => None,
+        };
+        let route_cell = self.lease_location(entity).await?.unwrap_or(presented);
+        drop(permit);
         let locate_us = stage_elapsed_us(locate_started);
-        let mailbox_started = Instant::now();
-        let applied = self
-            .actor(record.grid, route_cell)
-            .ok_or(Reject::JournalClosed)?
-            .start_fenced_diff(record, holder, lease_id, authority_seq, now_ms)
+        let resolved = self.actor(grid, route_cell).ok_or(Reject::JournalClosed)?;
+        // Compared by shard, not by handle identity: `CellRuntime::split`
+        // swaps handles, and re-sending to the actor that already answered
+        // would be a second turn for the same answer.
+        if asked == Some(resolved.shard()) {
+            stages.record(gate_wait_us, locate_us, mailbox_us);
+            return fast.expect("a shard was asked, so it produced an answer");
+        }
+        let turn = Instant::now();
+        let resolved_shard = resolved.shard();
+        let applied = resolved
+            .start_fenced_diff(forwarded, holder, lease_id, authority_seq, now_ms)
             .await;
-        stages.record(gate_wait_us, locate_us, stage_elapsed_us(mailbox_started));
+        mailbox_us += stage_elapsed_us(turn);
+        stages.record_mailbox_turn();
+        stages.record(gate_wait_us, locate_us, mailbox_us);
+        // A forwarded accept is audited exactly like a fast-path one. It used
+        // to be exempt, which was backwards: this is the branch where the
+        // presented cell was *not* the owner, so it is the branch where a
+        // false J would be most likely to show, and leaving it out meant the
+        // audit could not see the accepts it was best placed to judge.
+        let audit = if matches!(applied, Ok(FencedApply::Accepted(_))) {
+            self.begin_location_audit(grid, entity, Some(resolved_shard))
+        } else {
+            None
+        };
+        drop(guard);
+        if let Some(audit) = audit {
+            self.finish_location_audit(audit, &stages).await;
+        }
         applied
     }
 
@@ -629,16 +1079,28 @@ impl Router for CellRuntime {
         // atomic load, so the reads happen with every gate free. Sampling the
         // mark strictly before the locate it guards is what makes that proof
         // hold.
-        let mut marks = Vec::with_capacity(renew.len());
-        let mut routes = Vec::with_capacity(renew.len());
-        for entry in renew {
-            marks.push(self.entity_migration_mark(grid, entry.entity));
-            routes.push(
-                self.lease_location(entry.entity)
+        // Concurrently, not one after another. Phase 1 is `renew.len()`
+        // independent reads with no gate held, and a peer's heartbeat batch
+        // is as wide as the set of entities it holds — 77 entries was 77
+        // serial FoundationDB round trips, ~38 ms at the P2 operating point,
+        // for work that shares nothing. The mark is still sampled strictly
+        // before the read it guards: `try_join_all` polls each future up to
+        // its first await before moving on, and the sample is before that
+        // await, so concurrency cannot reorder a sample past its own read.
+        // Nothing is memoised and phase 2's under-the-gate re-check is
+        // unchanged, so the proof is the one that was already here.
+        let (marks, routes): (Vec<u64>, Vec<CellId>) =
+            futures::future::try_join_all(renew.iter().map(|entry| async move {
+                let mark = self.entity_migration_mark(grid, entry.entity);
+                let route = self
+                    .lease_location(entry.entity)
                     .await?
-                    .unwrap_or(entry.cell),
-            );
-        }
+                    .unwrap_or(entry.cell);
+                Ok::<_, Reject>((mark, route))
+            }))
+            .await?
+            .into_iter()
+            .unzip();
         let shards = self.shard_cells();
         let mut rows = vec![None; renew.len()];
         // Entries whose stripe saw a migration land between their locate and
@@ -914,6 +1376,17 @@ impl Router for tokio::sync::Mutex<CellRuntime> {
         authority_seq: orrery_protocol::SeqPair,
         now_ms: u64,
     ) -> Result<FencedApply, Reject> {
+        // Deliberately still gate-then-locate, unlike `CellRuntime`'s.
+        //
+        // This impl is not on the shipped P2 path (`persistd` wires
+        // `ColdFallbackRouter<Arc<CellRuntime>>`, which delegates to
+        // `CellRuntime`), and the ask-the-owner-first route rests on
+        // invariant J holding for the *same* actor set the gate serialises
+        // against. Making it consistent "for tidiness" would be re-deriving
+        // that argument for a different structure by assumption rather than
+        // by proof. If this path ever ships, prove J for it first, then take
+        // the differential matrix in `tests/fenced_route_differential.rs`
+        // with it.
         let (_guard, handle) =
             gated_mutex_actor(self, record.grid, record.cell, record.entity).await?;
         handle
@@ -1014,20 +1487,36 @@ impl Router for tokio::sync::Mutex<CellRuntime> {
         // held, then take each actor group's gates around its mailbox turn
         // only, with the stripe migration counter standing in for the
         // atomicity the old whole-batch hold bought.
-        let mut marks = Vec::with_capacity(renew.len());
-        let mut routes = Vec::with_capacity(renew.len());
-        for entry in renew {
-            marks.push(entity_gates.migration_mark(grid, entry.entity));
-            routes.push(if runtime_grid == grid {
-                store
-                    .locate(grid, entry.entity)
-                    .await
-                    .map_err(|_| Reject::LeaseStore)?
-                    .unwrap_or(entry.cell)
-            } else {
-                entry.cell
-            });
-        }
+        // Concurrently, not one after another. Phase 1 is `renew.len()`
+        // independent reads with no gate held, and a peer's heartbeat batch
+        // is as wide as the set of entities it holds — 77 entries was 77
+        // serial FoundationDB round trips, ~38 ms at the P2 operating point,
+        // for work that shares nothing. The mark is still sampled strictly
+        // before the read it guards: `try_join_all` polls each future up to
+        // its first await before moving on, and the sample is before that
+        // await, so concurrency cannot reorder a sample past its own read.
+        // Nothing is memoised and phase 2's under-the-gate re-check is
+        // unchanged, so the proof is the one that was already here.
+        let (marks, routes): (Vec<u64>, Vec<CellId>) =
+            futures::future::try_join_all(renew.iter().map(|entry| {
+                let (entity_gates, store) = (&entity_gates, &store);
+                async move {
+                    let mark = entity_gates.migration_mark(grid, entry.entity);
+                    let route = if runtime_grid == grid {
+                        store
+                            .locate(grid, entry.entity)
+                            .await
+                            .map_err(|_| Reject::LeaseStore)?
+                            .unwrap_or(entry.cell)
+                    } else {
+                        entry.cell
+                    };
+                    Ok::<_, Reject>((mark, route))
+                }
+            }))
+            .await?
+            .into_iter()
+            .unzip();
         let mut rows = vec![None; renew.len()];
         let mut restale: Vec<usize> = Vec::new();
         for (shard, members) in group_by_actor(&shards, &routes) {
@@ -1626,16 +2115,28 @@ impl Router for Cluster {
         // Locate with no gate held and prove afterwards that nothing
         // migrated, exactly as the node-level impl does; at this level the
         // "locate" is `committed_entity_cell`, which can walk every runtime.
-        let mut marks = Vec::with_capacity(renew.len());
-        let mut routes = Vec::with_capacity(renew.len());
-        for entry in renew {
-            marks.push(self.entity_gates.migration_mark(grid, entry.entity));
-            routes.push(
-                self.committed_entity_cell(grid, entry.entity)
+        // Concurrently, not one after another. Phase 1 is `renew.len()`
+        // independent reads with no gate held, and a peer's heartbeat batch
+        // is as wide as the set of entities it holds — 77 entries was 77
+        // serial FoundationDB round trips, ~38 ms at the P2 operating point,
+        // for work that shares nothing. The mark is still sampled strictly
+        // before the read it guards: `try_join_all` polls each future up to
+        // its first await before moving on, and the sample is before that
+        // await, so concurrency cannot reorder a sample past its own read.
+        // Nothing is memoised and phase 2's under-the-gate re-check is
+        // unchanged, so the proof is the one that was already here.
+        let (marks, routes): (Vec<u64>, Vec<CellId>) =
+            futures::future::try_join_all(renew.iter().map(|entry| async move {
+                let mark = self.entity_gates.migration_mark(grid, entry.entity);
+                let route = self
+                    .committed_entity_cell(grid, entry.entity)
                     .await?
-                    .unwrap_or(entry.cell),
-            );
-        }
+                    .unwrap_or(entry.cell);
+                Ok::<_, Reject>((mark, route))
+            }))
+            .await?
+            .into_iter()
+            .unzip();
         // Two folds, each on the thing that is actually shared at its level:
         // here the **node** that HRW placement assigns the route cell to, and
         // then, inside that node, the actor that owns it. Grouping by the
@@ -1760,6 +2261,16 @@ impl Router for Cluster {
         authority_seq: orrery_protocol::SeqPair,
         now_ms: u64,
     ) -> Result<FencedApply, Reject> {
+        // This one keeps its locate for a reason that is not tidiness.
+        //
+        // `Cluster::committed_entity_cell` is doing real cross-runtime
+        // routing — `record.cell` may name a cell hosted by a *different*
+        // runtime, and picking the wrong runtime is not "ask an actor that
+        // will reject", it is "ask a node that does not have the shard". The
+        // `CellRuntime` change is an *actor-selection* change inside one
+        // runtime whose whole safety argument is invariant J over that
+        // runtime's own actors; J says nothing about which runtime holds a
+        // shard. Applying it here needs its own proof. Do not.
         let gate = self.entity_gates.gate(record.grid, record.entity);
         let _guard = gate.lock_owned().await;
         let route_cell = self

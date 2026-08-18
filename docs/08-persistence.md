@@ -211,6 +211,324 @@ Read the first column with the second: the *lock* is now the per-actor-group acq
 
 **What is left is the committer, and only the committer.** After the change `bulk_ack_ms` p99 equals `journal_commit_ms` p99 exactly on every run (15/15, 15/15, 15/15 at `off`; 15/15, 20/20, 20/15 at 25 ms), against a 2 ms D16 target for the commit itself. The client-observed bulk tail is now entirely the group commit path — `journal/**`, frozen to this lane and reported rather than fixed.
 
+### 2.1.2 Taking FoundationDB off the bulk write path
+
+§2.1.1 got the FDB read out from under the entity gate. It left the read
+itself: one `LeaseStore::locate` — a FoundationDB read transaction — per
+fenced bulk diff, on the write path, which is a direct contradiction of §2's
+"bulk writes reach FDB only at the 20 s checkpoint". [14-capacity.md](14-capacity.md)
+§5.1 then measured what that costs: `libfdb_c` runs **one** network thread per
+process, and that thread was the binding constraint on a whole 16-thread box —
+25.8 % of a core at the P2 operating point, 100 % at collapse, with fifteen
+threads, the NVMe array, the NIC, FDB's own server and RAM all idle beside it.
+
+**The read is gone from the accept path.** `CellRuntime::apply_fenced` now
+asks `actor(record.cell)` — the owner of the cell the client declared —
+directly, and consults `locate` only when that owner rejects *without* a row
+(or when there is no actor for the presented cell here, or its mailbox is
+gone). It is not a cache: nothing is memoised, nothing can go stale, there is
+no TTL and no invalidation hook. The decision is simply made by the component
+whose own state the decision is defined over.
+
+**Why the accept set is unchanged.** The locate was never part of the fence.
+`CellMsg::ApplyFencedDiff` evaluates five conjuncts against the receiving
+actor's *own* state — no pending rekey, `by_cell[e] == record.cell`, and
+holder / `lease_id` / `seq` / expiry against its own registrar row — and
+`apply_fenced` never rewrites `record.cell`. The locate only chose *which
+actor* evaluated them. So the whole question is whether a different actor can
+evaluate the same predicate to true, and one invariant answers it:
+
+> **(J)** If an actor's `LeaseRegistrar` holds a row for entity `e`, then
+> `LeaseStore::locate(e)` names a cell inside that actor's shard subtree (or
+> is `None`).
+
+Given J, an actor that *accepts* holds a live row, so `locate(e)` is in its
+shard, so `actor(locate(e))` — the old route — is that same actor. The accept
+set is identical with or without the read.
+
+J has exactly **four enforcement sites**, all in `actor.rs`, and all of them
+go through `checked_row_cell`, which asserts `shard.is_prefix_of(cell)` and
+returns the cell it checked — so the assertion and the write are one
+expression and a later edit cannot move the row without moving the check:
+
+| site | why the row is in-shard | pinned by |
+|---|---|---|
+| `claim_lease` | the claim is routed to `actor(locate().unwrap_or(cell))` and stores `location = cell`; `LeaseStore::put` answers `LocationConflict` rather than overwrite a different location, so even a misrouted claim cannot manufacture a violation | `tests/lease_location_conflict.rs` |
+| `install_rekey` | runs at `actor(destination_cell)`, immediately after `migrate` set `location = destination_cell` | `tests/fenced_route_invariant_j.rs` |
+| `complete_local_rekey` | the intra-shard case of the same move; source and destination are one actor | `tests/fenced_route_invariant_j.rs` |
+| actor-spawn recovery | seeded from `load_cell(shard)`, which is a **prefix range scan** of `lease_cell_key` under that shard — in-shard by construction | `tests/fenced_route_invariant_j.rs` |
+
+`tests/fenced_route_invariant_j.rs` walks every actor and checks J directly
+after grant, park, sweep, cross-shard rekey, intra-shard rekey, `split`,
+`activate_shards` and recovery, under both lease stores.
+
+The `LocationConflict` guard in row 1 is the one that stops a misrouted claim
+from *creating* a J violation, and it was load-bearing and untested: replacing
+`LocationConflict(_) => return Denied(NotEligible)` with `{}` survived the
+full suite, and the actor would have fallen through, installed
+`lease_cells[e]` at a cell whose durable location belongs to another shard,
+and returned a `Granted` row for an entity it does not own.
+`tests/lease_location_conflict.rs` routes a claim to the wrong shard's actor
+through a lying location index and now fails that mutation at `Granted` where
+`Denied(NotEligible)` is required.
+
+**`checked_row_cell` is a real `assert!`, not a `debug_assert!`.** It was the
+latter, which compiles out of release — the configuration the capacity sweep
+and production both run — so the four enforcement sites above were four
+enforcement sites in the test suite and none at all where it matters. The
+promotion is free: none of the four callers is on the bulk write path (a
+lease grant, a rekey install, its intra-shard twin, and one row per entry at
+actor-spawn recovery), so it runs **zero** times per fenced diff, and
+`is_prefix_of` is a `u64` range containment measured at **0.98 ns** per call
+in a release build. Panicking is the intended response rather than a
+degradation: past that point the actor would be admitting fenced writes
+against a row whose durable location it does not own — silent divergence of
+the accept set, with no local recovery — and failing the shard closed is
+strictly safer than serving it.
+
+**Why a reject still reads.** J says nothing about a *rejecting* actor.
+Cross-shard duplicate `by_cell` entries are reachable — an unfenced diff at a
+new cell in another shard writes `by_cell` there without clearing the old
+actor's entry — so the cell owner's "I have no row" is not proof of absence,
+and the locate runs. `Rejected(Some(row))` *is* proof: a row present means, by
+J, this is the location owner, so the NACK carries the same live row it always
+did, and the D7 §5 duplicate-authority detector (`observe_fencing_rejection`,
+which returns early on `None`) and the client's `reconcile_lease_nack` keep
+working at full fidelity. The fallback is bounded by construction — **one**
+locate, **at most two** mailbox turns, no loop, and no short-circuit on
+anything but `row.is_some()` — and `tests/fenced_route_bounds.rs` asserts the
+bound, including that a fallback resolving to the actor that already answered
+does not re-send.
+
+**What actually keeps the fallback cold — a bounded probe, not an
+invariant.** The first version of this section justified `locate_fallbacks`
+staying near zero by saying `strict_authority` "pins `record.cell` at the
+grant cell for the entity's life". That is a statement about which diffs are
+**admitted**, not about which cell **arrives**: `route_diff` builds the record
+as `cell: diff.cell` straight from the client's `DiffUplink`, and the actor's
+`by_cell[e] == record.cell` conjunct is evaluated *after* the route has
+already chosen an actor. So a peer holding a perfectly valid lease that
+presented any other cell took the fallback on **every** diff — one FDB locate
+plus a second mailbox turn, i.e. the pre-change cost plus a turn — at its own
+chosen rate. Since §5.1 of [14-capacity.md](14-capacity.md) identifies the
+single `libfdb_c` network thread as the binding constraint on the whole box,
+capacity was bimodal on an unvalidated field on the wire.
+
+**Validating the cell against the grant does not work, and it is worth saying
+why.** The gateway's `SessionLease.cell` is the cell the lease was *granted*
+at, and a registrar-driven `commit_rekey` moves an entity without telling the
+gateway anything: the NACK the holder receives carries a `Lease`, which has no
+cell in it. So the holder's first legitimate write at the new cell presents a
+cell the session index has never heard of and is indistinguishable, at that
+instant, from a client addressing the wrong cell. Refusing on the mismatch was
+implemented first and failed two existing gateway tests, including
+`rekeyed_entity_rejects_stale_presented_cell_with_current_lease`, which asserts
+exactly that write is acknowledged. A cheap gateway-side check cannot be
+authoritative about an entity's cell, because the only authority is the actor.
+
+So the mismatch buys a **probe**, and the probe is what is bounded. There are
+**two** diff shapes the session index fails to confirm, and it is worth naming
+them separately because they have different causes and different endings:
+
+1. the index holds an entry for the entity naming **another cell** — the rekey
+   case, and the abuse case that mimics it;
+2. the index holds **no entry at all** — an entity this session was never
+   granted a lease for.
+
+Shape 2 needs no lease, no rekey and no setup: it is the cheapest way a peer
+can reach the expensive branch, because an entity with no row anywhere is
+`Rejected(None)` at the router, and `Rejected(None)` is exactly the answer that
+does *not* short-circuit — it takes the fallback and spends its locate. **It
+was not bounded at all until this was written down.** The predicate was
+`indexed.is_some_and(...)`, so shape 2 read as "not misrouted": it took no
+token, incremented no counter, could not be throttled, and routed. A probe of
+1000 diffs at a foreign cell for an unheld entity measured
+`routed_to_router=1000  misrouted_diffs=0  misroute_throttled=0`. Of the three
+bounds below, only the third — the process-wide permit pool — applied to it,
+and a permit pool caps **concurrency, not rate**. This is not a regression
+against the pre-change route (every fenced diff paid an unconditional locate
+then, so one locate per diff *is* the old cost), but it was a bound this
+section claimed and the code did not have.
+
+Both shapes now take the same path:
+
+* **Per connection, a token bucket.** A diff whose route the session index
+  does not confirm — either shape — is routed if the connection can pay a
+  token (`MisrouteBucket`: 32/s, burst 256) and answered with a `BulkNack`
+  without routing if it cannot. `misrouted_diffs` counts both shapes,
+  `unindexed_diffs` the subset that is shape 2, and `misroute_throttled` the
+  refusals. All three are exported on the `gateway_authority` JSONL record;
+  they were in-process counters that nothing scraped, which made the alarm
+  this section names unreadable in ops even where it did fire.
+* **An admitted probe repairs the index — shape 1 only.** `route_diff` reports
+  whether the router *admitted* the record, and admission is proof of location
+  — the actor admitted it only because its own `by_cell[entity]` names that
+  cell and its registrar row names this holder's live lease. So a rekey costs
+  one token per entity and then routes at full speed forever. A peer whose
+  cell is simply wrong is never admitted, never repairs anything, and settles
+  at 32 fallbacks a second instead of its own send rate. The bucket is sized
+  for the repair case: a 256-entity mass rekey drains the burst and does not
+  stall. Shape 2 is **deliberately not repaired**: the repair writes through
+  `get_mut`, so it cannot fabricate a `SessionLease` the gateway never granted
+  — an invented entry would enter `lease_capacity` accounting,
+  `resolve_renewals` and `cleanup_peer_session`'s park loop, and admission does
+  not name the row's owner generation. Shape 2 therefore also settles at 32/s,
+  by never leaving the metered path rather than by never being admitted.
+* **Across connections, a permit pool.** `ORRERY_FENCED_LOCATE_FALLBACK_PERMITS`
+  (default 64) caps concurrent fallback locates process-wide. Process-wide
+  rather than per connection on purpose: the resource being protected is one
+  thread per *process*, and a per-connection cap of `k` across `n` connections
+  bounds nothing at `n · k`. It queues rather than sheds — a diff that waits is
+  still routed — and what sheds it, if the wait runs long, is the
+  route-admission budget the gateway already applies from the diff's arrival,
+  which counts what it drops. The expensive branch therefore degrades into an
+  existing, measured valve instead of into FDB-thread saturation.
+
+**Why metering shape 2 is safe, stated as the argument rather than assumed.**
+Treating "no entry" as unproven would be wrong if a legitimate write could
+outrun its own index entry. It cannot: a peer learns it holds a lease only
+from `LeaseMsg::Grant`, both emitters send it *after* `complete_lease_claim`
+has inserted the entry, every removal (`divest_lease`, `unwind_grant`,
+`cleanup_peer_session`, the compensation path) is paired with a `park_lease`
+that has already made the router reject the write anyway, and a failed renewal
+reports `invalid` without touching the map. The rekey case that made this a
+probe rather than a refusal keeps its entry throughout — only the *cell*
+moves. Shape 2 accordingly has no legitimate *admissible* producer — no honest client
+gets a shape-2 diff **accepted**. That is not the same as never emitting one,
+and an earlier draft of this paragraph said `unindexed_diffs` was expected at a
+flat zero. It is not. Two ordinary paths emit shape-2 diffs from an honest
+client, both on the way *out* of authority: diffs already queued in the client's
+`UplinkScheduler` when a `divest_lease` has removed the gateway's entry — the
+client drops `LocallyAuthoritative` but nothing unregisters the scheduler, whose
+only `unregister` caller is `reconcile_lease_nack` — and a reconnect that loses
+the race with `cleanup_peer_session`. So the shape to expect is a bounded spike
+that decays, and the alarm is a *sustained* non-zero, not a non-zero. It is still a probe and not a refusal, so if that argument is ever
+falsified by a new grant path the cost is a metered 32/s rather than a hard
+stop.
+
+One detection consequence is accepted in exchange: a throttled diff is not
+routed, so it can no longer raise `duplicate_authority` against a *different*
+live holder. The first 256 still do, so the detector still fires — it simply
+cannot be driven at a peer's chosen rate, which is the point of the bucket.
+
+`locate_fallbacks` is still expected at ~0 and is still the alarm if it is
+not. What has changed is the honesty of the reason: it is low because a probe
+allowance holds it low and a pool bounds what gets past the allowance, not
+because the protocol makes it impossible. The inline gateway test
+`a_diff_at_an_unindexed_cell_probes_once_repairs_the_index_and_is_then_throttled`
+pins the probe, the repair and the throttle for shape 1;
+`diffs_for_an_entity_this_session_holds_no_lease_for_are_metered_too` reruns
+the 1000-diff probe above and pins shape 2 at 256 routed, 744 throttled, 1000
+counted, and no fabricated index entry; and
+`tests/fenced_locate_fallback_bound.rs` pins the pool at a peak of 2 in-flight
+locates against 8 concurrent fallbacks.
+
+**One accepted divergence, in writing.** A rekey whose `LeaseStore::migrate`
+committed and then reported failure (FDB's `commit_unknown_result`, or
+`execute` returning `Err(RekeyError::LeaseStore)`) leaves the source actor
+holding both its `pending_rekeys` reservation and its row while the durable
+location already names the destination. Where the destination is in another
+shard, the two routes disagree on the NACK *payload*: the old one asked the
+destination and got `Rejected(None)`; the new one asks the source, which
+rejects on conjunct 1 and hands back its live row. Both reject — admission is
+identical — and the new payload is the more useful one, being the row the
+client still holds. This is the only divergence in the state matrix, and
+`tests/fenced_route_differential.rs` asserts both that it is the only one and
+that it does fire.
+
+**The margin being spent, stated as a precondition.** Before this change every
+fenced diff re-read shared FoundationDB truth, so a location moved
+out-of-band by another writer would have been noticed on the next diff. Now
+only the actor's own state witnesses it. The requirement is therefore explicit:
+
+> **One `persistd` process writes a grid's lease keyspace.**
+
+That is true today — every `Router` implementation is in-process, and
+`LeaseStore::migrate` is reachable at runtime only from `commit_rekey`, which
+has no production caller (the gateway answers a client `LeaseMsg::Rekey` with
+an unconditional `Deny{NotEligible}` and NACKs a `RecordKind::Rekey` diff) —
+but it is now load-bearing rather than incidental. Cross-node exclusion
+continues to rest on the durable shard-fence epochs of §3.4, unchanged.
+
+**Monitored, not assumed.** The one silent failure mode is J being false: an
+actor admitting a write against a registrar row that is not the durably
+located one. So a **sampled audit** ships: one in `ORRERY_FENCED_LOCATION_AUDIT_N`
+accepted fenced diffs (default 1000 in release, **1** under
+`debug_assertions`, so the whole test suite audits every accept) still
+performs the locate and increments `location_mismatches` with a `warn!` when
+the durable location falls outside the accepting actor's shard. **That counter
+must be zero.** Three properties of the audit are load-bearing, and each is
+pinned by a test rather than asserted here:
+
+* **It runs with the entity gate released.** Only the *decision* to sample is
+  made under the gate. An audit is a FoundationDB read, and the first version
+  ran it inside the critical section, after `RouteStageMetrics::record` — so
+  it was excluded from all three stage timers and its cost came back as the
+  *next* diff's `gate_wait_us`. At a 5 ms locate with eight concurrent accepts
+  on one entity that measured `applies=8 locate_us_sum=0 gate_wait_us_sum=171433`
+  for a 49.5 ms wall. `tests/fenced_route_audit_gate.rs` reproduces the shape
+  at a 25 ms locate and fails at 732 ms of `gate_wait_us_sum` if the audit is
+  moved back inside.
+* **Releasing the gate does not weaken it.** The sample can no longer be
+  pinned to its accept by holding the gate, so it is pinned the way
+  `heartbeat_leases` phase 1 pins its own off-gate reads (§2.1.1): the
+  entity's stripe migration counter is read under the gate and re-read after
+  the locate, and a sample that straddled a migration is discarded rather than
+  judged. `location_mismatches` therefore has no known false-positive source
+  — which is what lets it stay a stop-ship number.
+* **No locate outcome is invisible.** `location_audits` counts samples that
+  reached a verdict; `location_audit_errors` counts samples that did not — a
+  store error, a discarded straddling sample, *and* `locate` answering `None`.
+  `None` belongs with the failures: an accepted fenced diff has a live
+  registrar row, a row is only granted through `claim_lease`, and `claim_lease`
+  writes the location key in the same call, so a missing key means the audit
+  read nothing, not that it read agreement. Folding it into the clean count
+  would let a lease store that has lost its location index report health
+  forever. The two buckets are disjoint and exhaustive, so `location_audits
+  == 0` while accepts flow is itself the alarm that the audit stopped running.
+
+Its cost is its own stage, `location_audit_us_sum` / `_max`, deliberately not
+folded into `locate_us`: `locate_us` is the route's own read, on the critical
+path of the routing decision, and mixing a background sample into it would
+make "the route reads nothing" unfalsifiable from the counters. **The
+sampling rate stays at 1 in 1000.** At the 99 k diffs/s this change sustains
+(§2.1.3) that is ~99 locates/s against the ~99 000/s it removed — 0.1 %. §5.1
+of [14-capacity.md](14-capacity.md) measured the FDB client thread at 25.8 %
+of a core while serving ~18 000 locates/s, i.e. ~14 µs of that thread each, so
+99/s is ~0.14 % of one core: below the noise floor of every other number in
+this document.
+
+Its **latency** cost is not zero, and an earlier draft of this paragraph said
+it was. Taking the audit off the entity gate means it costs no other diff
+anything — that is what `tests/fenced_route_audit_gate.rs` pins — but
+`apply_fenced` still `await`s `finish_location_audit` before it returns, so the
+**sampled diff's own** route return is delayed by its own locate. At 1 in 1000
+that is one diff in a thousand paying roughly one FDB read on top of its
+route, and no other diff paying anything for it. Lowering the rate buys nothing
+measurable; raising it trades away the only production evidence that J holds.
+
+So the section title is exact only with that footnote. **FoundationDB is off
+the bulk *routing* path — every accepted fenced diff, without exception —
+and off the bulk write path but for a 0.1 % audit sample that runs after the
+entity gate is released and is counted in a stage of its own.** The
+`gateway_route_stage` boundary record carries the audit counters next to
+`locate_fallbacks` and `mailbox_turns`, whose ratio to `applies` must sit at
+1.0 and can never exceed 2.0.
+
+**Out of scope, deliberately.** `Cluster::apply_fenced` keeps its locate:
+`committed_entity_cell` there is doing real cross-runtime routing — the
+presented cell may be hosted by a *different* runtime — and J is a statement
+about one runtime's own actors, so it says nothing about which runtime holds a
+shard. `Mutex<CellRuntime>::apply_fenced` keeps its locate too; it is not on
+the shipped path and would need J re-proved for its structure. Both sites
+carry that reason in a comment.
+
+The same change made phase 1 of `heartbeat_leases` — the other per-entity FDB
+read stream, described in §2.1.1 — resolve its locations **concurrently**
+rather than one at a time. The proof is untouched: each future samples its own
+stripe mark before its own read, and phase 2's under-the-gate re-check is
+unchanged. A 77-entry renewal was 77 serial round trips.
+
 **Epoch-fenced acks (split-brain guard).** An actor may issue durable acks only while its shard-ownership epoch (§3.4) is **confirmed fresh**: it heartbeats an FDB read version roughly every **1 s** and treats its epoch as stale after a **3 s staleness bound** — deliberately below the failure-detection + re-placement time, so a partitioned former owner falls silent before a replacement can be fenced in and serving. While stale, the actor downgrades to **provisional acks**, which the client treats as unacked (kept buffered, resent to the new owner). Every `JournalRecord` carries the epoch it was appended under, so recovery replay discards records from a superseded epoch; §4.1 quantifies the residual window.
 
 **Every gateway bulk write is fenced.** `route_session_diff` sets `strict_authority: true` unconditionally, so a `DiffUplink` without a granted `(lease_id, authority_seq)` is substituted with the never-granted `LeaseId(0)` and rejected by `apply_fenced` before it reaches the journal. Two consequences bind every client of this path, the P2 load rig (`p2-load`) included:
@@ -222,7 +540,92 @@ Read the first column with the second: the *lock* is now the per-actor-group acq
 
 **Bulk-path validation.** The cell actor runs the stateless `Ruleset` invariant validators (D9/D10 — the same speed/acceleration/rate/impossible-value checks witnesses run) on inbound diffs: **mandatory** for entities in cells with fewer than N witness candidates — closing the solo-player-in-an-empty-cell hole, where no witness set exists to observe the author — and **sampled** elsewhere. Violations are rejected (NACK) or flagged to the adjudication pipeline.
 
-### 2.2 Critical path
+### 2.1.3 What it bought, in delivered records
+
+The study is `scripts/fenced-sweep-*.sh`: the pre-change and post-change
+binaries interleaved over the same points on the same box, against the same
+10 000-entity seeded world, reduced by `scripts/fenced-sweep-report.py`. Raw
+output is one directory per point.
+
+**Read the delivered column, not the nominal one.** `offered/s` in the first
+version of this table was `entities × diff_hz` — nominal demand, a dial
+setting, not load that arrived. `p2-load`'s fan-out assert allows
+`sessions × 160` diffs/s (`check_fan_out`), five of the six rate points were
+provisioned with exactly zero margin against that, and the rig drops the
+excess silently on the client (`UplinkScheduler::queue` is newest-wins). The
+rig tops out at about **99.3 k diffs/s** on this box whatever the session
+count, so the "120 k" and "160 k" points are the **same** delivered operating
+point and neither reached its nominal setting. See the correction in
+[14-capacity.md](14-capacity.md) §2.
+
+| nominal/s | rig cap/s | arm | delivered/s | durable acks/s | shed % | `locate` ms/apply | intent p99 | FDB thread mean |
+|---|---|---|---|---|---|---|---|---|
+| 20 000 | 20 000 | before | 16 417–18 031 | 16 123–18 027 | 0.03–1.79 | 0.51–0.69 | 40–100 ms | 25.0–25.4 % |
+| 20 000 | 20 000 | **after** | 17 915–18 022 | **17 915–18 021** | **0.00** | **0.00** | 15–30 ms | **8.2–8.3 %** |
+| 40 000 | 40 000 | before | 33 601–33 906 | 33 434–33 455 | 0.50–1.33 | 1.00–1.07 | 50–75 ms | 38.7–40.9 % |
+| 40 000 | 40 000 | **after** | 34 056 | **34 055** | **0.00** | **0.00** | 75 ms | **6.8 %** |
+| 60 000 | 80 000 | before | 48 896 | 44 671 | 8.64 | 2.26 | 500 ms | 57.2 % |
+| 60 000 | 80 000 | **after** | 49 667 | **49 663** | **0.01** | **0.00** | 200 ms | **7.0 %** |
+| 80 000 | 80 000 | before | 65 989 | 58 327 | 11.61 | 3.04 | 1.0 s | 75.8 % |
+| 80 000 | 80 000 | **after** | 66 330 | **66 267** | **0.01** | **0.00** | 500 ms | **8.8 %** |
+| 120 000 | 120 000 | before | 97 962 | 35 041 | 61.94 | 12.11 | 2 s | 96.6 % |
+| 120 000 | 120 000 | **after** | 99 436 | **99 428** | **0.01** | **0.00** | 750 ms | **11.1 %** |
+| 160 000 | 160 000 | before | 99 536 | 29 385 | 68.61 | 12.79 | 3 s | 95.2 % |
+| 160 000 | 160 000 | **after** | 99 324 | **99 317** | **0.01** | **0.00** | 750 ms | **10.8 %** |
+
+**The headline, stated in what was measured.** At the rig's ceiling — about
+**99 k diffs/s delivered on both arms**, the last two rows, which are one
+operating point reached two ways — the pre-change binary made **29 k–35 k
+records durable per second** and shed 62–69 % of them, while the post-change
+binary made **99.3 k** durable and shed 0.01 %. Same load in, **~3× the
+writes made durable**, and the FDB client thread fell from ~95–97 % of a core
+to ~11 %.
+
+**The knee was not found, and the study cannot claim one.** At 99 k delivered
+the after arm sheds 0.01 %, commits intents in 750 ms, and acknowledges
+essentially everything that arrives; nothing about it looks like a limit. What
+ran out was the load generator. The honest statement of the new service
+ceiling is **">= 99 k delivered records/s, not located"** — finding it needs a
+rig that can offer more than one box's `p2-load` can, which this study did not
+have. The *old* knee is the number that moved and is measurable: 40 000
+nominal / ~33.6 k delivered before, versus at least 99 k delivered after.
+
+**Re-measured after the review fixes.** Four changes since the table above
+touch this path — the sampled audit moved off the entity gate, `checked_row_cell`
+became a real `assert!`, the gateway gained one `HashMap` lookup per diff
+against a lock it already takes, and the fallback locate gained a permit pool
+— so the 20 000 and 80 000 points were re-run, two repeats, arms interleaved
+in one session, the merged branch tip against the fixed binary:
+
+| nominal/s | arm | delivered/s | durable acks/s | shed % | `gate_wait` ms/apply | FDB thread mean |
+|---|---|---|---|---|---|---|
+| 20 000 | merged tip | 18 029–18 034 | 18 028–18 033 | 0.00–0.01 | 0.000 | 6.5–8.2 % |
+| 20 000 | **+ fixes** | 17 936–18 032 | 17 936–18 031 | 0.00 | 0.000 | 6.6–7.6 % |
+| 80 000 | merged tip | 65 808–66 031 | 65 803–66 027 | 0.01 | 0.001–0.002 | 7.5–9.0 % |
+| 80 000 | **+ fixes** | 66 197–66 330 | 66 193–66 326 | 0.01 | 0.000 | 8.9 % |
+
+The arms are inside this box's own run-to-run spread at both points, and every
+route invariant held on all four runs: `mailbox_turns / applies` exactly 1.0,
+`locate_fallbacks` 0, `location_mismatches` 0, `leases_lost` 0, and
+`diff_nacks` **0** — the last being the end-to-end evidence that `p2-load`
+addresses its diffs at the cell it was granted, so the new per-connection
+probe bucket never fires on the workload. `bulk_ack_ms` p99 is the one number
+that moves visibly and is the one this box is worst at reproducing: 9–15 ms
+against 7–300 ms at 20 000, where the 300 ms is a single run's fsync
+excursion and the repeat of the same binary answered in 7 ms.
+
+**Superseded, and why it is left visible.** The first published version of
+this table had an `offered/s` column carrying the nominal figures, a "120 k"
+row and a "160 k" row read as two operating points, and a claim that the new
+knee sat above 160 k. All three are wrong in the same way: they are the dial,
+not the delivery. The numbers are not quietly overwritten because the error
+was not arithmetic — it was reporting a setting as a measurement, which is
+the kind of mistake that recurs unless the tooling makes it impossible.
+`scripts/fenced-sweep-report.py` now prints `delivered_per_s`,
+`rig_cap_per_s` and `delivered_pct` beside the nominal, and warns to stderr
+when any point delivered under 95 % of it.
+
+## 2.2 Critical path
 
 ```mermaid
 sequenceDiagram

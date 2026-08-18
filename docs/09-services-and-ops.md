@@ -194,7 +194,8 @@ mislocates it sends an operator to the wrong process on the worst day.
 | Area first page-in | client — `Subscribe` → first `AreaPage`, `p2-load` rig (`area_first_page_ms`) | **< 50 ms** | p95 > 100 ms |
 | Gateway server spans: bulk, intent, area first page | persistd gateway (`gateway_bulk_server_ms`, `gateway_intent_server_ms`, `gateway_area_first_page_server_ms`) | none — attribution, not a target | server span approaching the client target above it |
 | Report outcomes and refusals | persistd gateway (`gateway_report`) | shadow mode: refusals explained, not zero | `refused_no_adjudicator` ≠ 0 on a cluster that linked a `Ruleset` |
-| Authority: duplicate writes, handoffs, timeouts | persistd gateway (`gateway_authority`, seven counters) | `duplicate_authority` = **0** | any `duplicate_authority`; `handoff_timed_out` rising = zombie host (§10) |
+| Authority: duplicate writes, handoffs, timeouts | persistd gateway (`gateway_authority`, ten counters) | `duplicate_authority` = **0** | any `duplicate_authority`; `handoff_timed_out` rising = zombie host (§10) |
+| Fenced route: peers steering onto the expensive branch | persistd gateway (`gateway_authority`: `misrouted_diffs`, `unindexed_diffs`, `misroute_throttled`) | `unindexed_diffs` flat | `unindexed_diffs` rising sustained, especially with `misroute_throttled` rising alongside it — a peer is buying fallback locates (docs/08 §2.1.2). Brief spikes are ordinary: a divest or a lost reconnect race leaves already-queued diffs unindexed. |
 | Hole-punch success rate | `orrery_net` client telemetry | ~90% direct | < 85% sustained |
 | Relayed-connection ratio | client telemetry + relay egress | ~5–10% | > 12% per region |
 | Rollback frequency / depth | `orrery_predict` monitor | game-tuned baseline | sustained deviation from baseline (also a witness signal, D10) |

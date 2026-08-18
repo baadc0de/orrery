@@ -860,6 +860,51 @@ pub struct DuplicateAuthoritySample {
 pub struct AuthoritySnapshot {
     /// Fenced writes that arrived while a *different* peer held a live lease.
     pub duplicate_authority: u64,
+    /// Bulk diffs whose presented cell is not the one this session's lease
+    /// for that entity is indexed at.
+    ///
+    /// Not a fencing event, and not necessarily an error: a registrar-driven
+    /// `commit_rekey` moves an entity without telling the gateway, and the
+    /// holder's first write at the new cell counts here once before the index
+    /// is repaired. It is a **capacity** number. Such a diff misses the
+    /// fenced route's fast path and pays one `LeaseStore::locate` plus a
+    /// second mailbox turn — the pre-change FoundationDB cost, plus a turn —
+    /// and the cell it turns on arrives on the wire. See `locate_fallbacks`
+    /// in `crate::cluster::RouteStageSnapshot`.
+    ///
+    /// Healthy shape: small, and **not** growing with a peer's diff rate. A
+    /// value that tracks a peer's throughput is a peer addressing an entity
+    /// at a cell it will never be admitted at.
+    ///
+    /// Counts **both** shapes the index fails to confirm: an entry naming a
+    /// different cell, and no entry at all. The second used to be invisible
+    /// here, which made this counter blind to the one vector that needs no
+    /// lease to drive — see `unindexed_diffs`.
+    pub misrouted_diffs: u64,
+    /// The subset of `misrouted_diffs` where the session's lease index held
+    /// **no** entry for the entity, as opposed to an entry naming another
+    /// cell.
+    ///
+    /// Split out because the two have different healthy values and different
+    /// causes. A rekey drives `misrouted_diffs` and leaves this at zero: the
+    /// entry exists throughout, only its cell moves. This one has no
+    /// legitimate producer at all — `complete_lease_claim` inserts the entry
+    /// before either `LeaseMsg::Grant` emitter sends it, and every removal is
+    /// paired with a `park_lease` that already makes the router reject — so
+    /// **any** sustained value is a peer writing at entities it holds no
+    /// lease for. Unlike the rekey case it is never repaired, so it settles
+    /// at `MisrouteBucket::PROBES_PER_SECOND` rather than decaying to zero.
+    pub unindexed_diffs: u64,
+    /// Those of `misrouted_diffs` (either shape) that were answered with a
+    /// `BulkNack` without routing, because the connection's probe bucket was
+    /// empty.
+    ///
+    /// Zero on a healthy node, including through a rekey: the bucket bursts
+    /// to 256 and one admitted probe repairs the index. Nonzero means one
+    /// connection is presenting routes that are never admitted, fast enough
+    /// to exhaust its allowance — and if `unindexed_diffs` is moving with it,
+    /// that connection is doing so at entities it holds no lease for.
+    pub misroute_throttled: u64,
     /// Leases placed with a selected successor, by crash redistribution or by
     /// negotiated handoff.
     pub reassigned: u64,
@@ -886,6 +931,9 @@ pub struct AuthoritySnapshot {
 #[derive(Debug, Default)]
 pub struct AuthorityMetrics {
     duplicate_authority: AtomicU64,
+    misrouted_diffs: AtomicU64,
+    unindexed_diffs: AtomicU64,
+    misroute_throttled: AtomicU64,
     reassigned: AtomicU64,
     parked_without_successor: AtomicU64,
     divested: AtomicU64,
@@ -901,6 +949,9 @@ impl AuthorityMetrics {
     pub fn snapshot(&self) -> AuthoritySnapshot {
         AuthoritySnapshot {
             duplicate_authority: self.duplicate_authority.load(Ordering::Relaxed),
+            misrouted_diffs: self.misrouted_diffs.load(Ordering::Relaxed),
+            unindexed_diffs: self.unindexed_diffs.load(Ordering::Relaxed),
+            misroute_throttled: self.misroute_throttled.load(Ordering::Relaxed),
             reassigned: self.reassigned.load(Ordering::Relaxed),
             parked_without_successor: self.parked_without_successor.load(Ordering::Relaxed),
             divested: self.divested.load(Ordering::Relaxed),
@@ -918,6 +969,23 @@ impl AuthorityMetrics {
 
     fn record_reassigned(&self) {
         self.reassigned.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// One bulk diff whose route this session's lease index does not confirm:
+    /// either it names another cell, or it names nothing.
+    fn record_misrouted_diff(&self) {
+        self.misrouted_diffs.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// One of those where the index held no entry for the entity at all.
+    /// Always paired with `record_misrouted_diff`, never on its own.
+    fn record_unindexed_diff(&self) {
+        self.unindexed_diffs.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// One of those refused a probe because the connection's bucket was empty.
+    fn record_misroute_throttled(&self) {
+        self.misroute_throttled.fetch_add(1, Ordering::Relaxed);
     }
 
     fn record_parked_without_successor(&self) {
@@ -2283,6 +2351,7 @@ struct PeerState {
     lease_capacity: usize,
     idle_since_ms: Option<u64>,
     claim_bucket: ClaimBucket,
+    misroute_bucket: MisrouteBucket,
 }
 
 struct PeerRegistry {
@@ -2442,6 +2511,7 @@ impl PeerRegistry {
                     lease_capacity: self.lease_capacity,
                     idle_since_ms: Some(now_ms),
                     claim_bucket: ClaimBucket::new(claim_now_ms),
+                    misroute_bucket: MisrouteBucket::new(claim_now_ms),
                 }));
                 entries.insert(node, Arc::clone(&state));
                 state
@@ -3329,7 +3399,7 @@ fn spawn_boundary_reporter(metrics: Arc<GatewayMetrics>) {
             route_stage_cursor = route_stage;
             if route_delta.applies > 0 || route_delta.batch_locks > 0 {
                 out.push_str(&format!(
-                    "{{\"type\":\"{}\",\"applies\":{},\"gate_wait_us_sum\":{},\"gate_wait_us_max\":{},\"locate_us_sum\":{},\"locate_us_max\":{},\"mailbox_us_sum\":{},\"mailbox_us_max\":{},\"batch_locks\":{},\"batch_gates_sum\":{},\"batch_hold_us_sum\":{},\"batch_hold_us_max\":{}}}\n",
+                    "{{\"type\":\"{}\",\"applies\":{},\"gate_wait_us_sum\":{},\"gate_wait_us_max\":{},\"locate_us_sum\":{},\"locate_us_max\":{},\"mailbox_us_sum\":{},\"mailbox_us_max\":{},\"batch_locks\":{},\"batch_gates_sum\":{},\"batch_hold_us_sum\":{},\"batch_hold_us_max\":{},\"mailbox_turns\":{},\"locate_fallbacks\":{},\"location_audits\":{},\"location_mismatches\":{},\"location_audit_errors\":{},\"location_audit_us_sum\":{},\"location_audit_us_max\":{}}}\n",
                     ROUTE_STAGE_RECORD_KIND,
                     route_delta.applies,
                     route_delta.gate_wait_us_sum,
@@ -3342,6 +3412,13 @@ fn spawn_boundary_reporter(metrics: Arc<GatewayMetrics>) {
                     route_delta.batch_gates_sum,
                     route_delta.batch_hold_us_sum,
                     route_delta.batch_hold_us_max,
+                    route_delta.mailbox_turns,
+                    route_delta.locate_fallbacks,
+                    route_delta.location_audits,
+                    route_delta.location_mismatches,
+                    route_delta.location_audit_errors,
+                    route_delta.location_audit_us_sum,
+                    route_delta.location_audit_us_max,
                 ));
             }
             ingress_cursor = ingress;
@@ -4704,6 +4781,60 @@ async fn cleanup_peer_session(
     }
 }
 
+/// A connection's allowance for routing bulk diffs at a cell its own lease
+/// index does not name.
+///
+/// Such a diff misses the fenced route's fast path and pays a
+/// `LeaseStore::locate` plus a second mailbox turn. It is not necessarily
+/// abuse — a registrar-driven rekey moves an entity without telling the
+/// gateway, and the first write at the new cell looks exactly like this — so
+/// the allowance is a bucket rather than a refusal, and an admitted probe
+/// repairs the index so the next diff needs no token at all.
+///
+/// Sized for the repair case, not the abuse case: a mass rekey should not
+/// stall, so the burst covers 256 entities at once, and the steady rate is
+/// 32/s because past the repair there is nothing legitimate left to spend it
+/// on. What a wrong cell buys at 32/s is bounded work; what it bought before
+/// was the client's own choice of rate.
+#[derive(Debug, Clone, Copy)]
+struct MisrouteBucket {
+    token_millis: u64,
+    updated_ms: u64,
+}
+
+impl MisrouteBucket {
+    const PROBES_PER_SECOND: u64 = 32;
+    const BURST_PROBES: u64 = 256;
+    const TOKEN_MILLIS_PER_PROBE: u64 = 1_000;
+    const BURST_TOKEN_MILLIS: u64 = Self::BURST_PROBES * Self::TOKEN_MILLIS_PER_PROBE;
+
+    const fn new(now_ms: u64) -> Self {
+        Self {
+            token_millis: Self::BURST_TOKEN_MILLIS,
+            updated_ms: now_ms,
+        }
+    }
+
+    fn take(&mut self, now_ms: u64) -> bool {
+        if now_ms > self.updated_ms {
+            let replenished = now_ms
+                .saturating_sub(self.updated_ms)
+                .saturating_mul(Self::PROBES_PER_SECOND);
+            self.token_millis = self
+                .token_millis
+                .saturating_add(replenished)
+                .min(Self::BURST_TOKEN_MILLIS);
+            self.updated_ms = now_ms;
+        }
+        if self.token_millis < Self::TOKEN_MILLIS_PER_PROBE {
+            false
+        } else {
+            self.token_millis -= Self::TOKEN_MILLIS_PER_PROBE;
+            true
+        }
+    }
+}
+
 struct ClaimBucket {
     token_millis: u64,
     updated_ms: u64,
@@ -4986,19 +5117,134 @@ async fn route_session_diff(
     // This read `let Some(_peer) = ...`, and the leading underscore is not
     // enough: a named binding lives to the end of the scope, where a bare `_`
     // would have dropped it immediately. Nothing here reads the guard's
-    // contents. `PeerSession` already avoids the same trap for the account
-    // field (see its `account` doc comment). Covered by
-    // `session_diffs_do_not_serialize_on_the_peer_lock`.
-    if session.lock_current().await.is_none() {
-        send(Bytes::from(encode_datagram(&GatewayReply::BulkNack {
-            entity: diff.entity,
-            tick: diff.tick,
-            reason: 2,
-            lease: None,
-        })));
-        return;
+    // contents beyond the one lookup below, and the guard is dropped at the
+    // end of this block, never across the route. `PeerSession` already avoids
+    // the same trap for the account field (see its `account` doc comment).
+    // Covered by `session_diffs_do_not_serialize_on_the_peer_lock`.
+    let indexed = {
+        let Some(peer) = session.lock_current().await else {
+            send(Bytes::from(encode_datagram(&GatewayReply::BulkNack {
+                entity: diff.entity,
+                tick: diff.tick,
+                reason: 2,
+                lease: None,
+            })));
+            return;
+        };
+        peer.leases.get(&diff.entity).copied()
+    };
+    // The cell a diff is routed by comes off the wire, and it selects between
+    // a cheap path and an expensive one.
+    //
+    // `record.cell` is `diff.cell`, straight from the client's `DiffUplink`,
+    // and the actor's `by_cell[e] == record.cell` conjunct is evaluated
+    // *after* the route has chosen an actor. So a peer holding a perfectly
+    // valid lease that presents some other cell misses the fenced route's
+    // fast path on every diff and pays its fallback: one `LeaseStore::locate`
+    // -- an FDB read, the resource docs/14-capacity.md 5.1 measured as the
+    // binding constraint on a whole box -- plus a second mailbox turn, at the
+    // peer's chosen rate. Capacity was bimodal on an unvalidated field with
+    // nothing rate-limiting the expensive branch.
+    //
+    // It is **not** a refusal, and the first draft of this was. The session's
+    // indexed cell is the cell the lease was *granted* at, and a registrar-
+    // driven `commit_rekey` moves an entity without telling the gateway, so a
+    // holder writing at the new cell presents one the index has never heard
+    // of -- legitimately: `rekeyed_entity_rejects_stale_presented_cell_with_
+    // current_lease` asserts that write is acknowledged, and refusing on a
+    // mismatch broke it.
+    //
+    // So a mismatch buys a **probe**, from a per-connection token bucket, and
+    // an admitted probe corrects the index below. A rekey then costs one
+    // token per entity and routes at full speed afterwards, while a peer
+    // whose cell is simply wrong is never admitted, never corrects the index,
+    // and is throttled to `MisrouteBucket::PROBES_PER_SECOND` fallbacks a
+    // second. `cluster::fenced_locate_fallback_permits` bounds what every
+    // connection together can have in flight; this bounds one connection's
+    // share of the queue for it.
+    //
+    // **A missing index entry is the same vector, and it used to be free.**
+    // The predicate was `indexed.is_some_and(...)`, so an entity this session
+    // holds no lease for -- the one shape a peer can pick with no setup at
+    // all -- read as "not misrouted", took no token, incremented nothing, and
+    // routed. On the router side an entity with no row anywhere is
+    // `Rejected(None)`, and `Rejected(None)` is exactly the answer that does
+    // *not* short-circuit: it takes the fallback and spends one
+    // `LeaseStore::locate` (`tests/fenced_route_bounds.rs`, "still exactly
+    // one locate"). So the bucket, the repair and the `misrouted_diffs` alarm
+    // all missed the cheapest way to reach the expensive branch, and only the
+    // process-wide permit pool applied -- which caps *concurrency*, not rate.
+    //
+    // Treating `None` as unproven is safe because there is no legitimate
+    // producer of it. A peer learns it holds a lease only from `LeaseMsg::
+    // Grant`, and both emitters send it *after* `complete_lease_claim` has
+    // inserted the entry, so no diff can outrun its own index entry; every
+    // removal (`divest_lease`, `unwind_grant`, `cleanup_peer_session`, the
+    // compensation path) is paired with a `park_lease` that has already made
+    // the router reject the write anyway; and a failed renewal reports
+    // `invalid` without touching the map. The rekey case that made this a
+    // probe rather than a refusal keeps its entry throughout -- only the
+    // *cell* moves.
+    //
+    // It is still a probe and not a refusal, so if that reasoning is ever
+    // falsified by a new grant path the cost is a metered 32/s rather than a
+    // hard stop. What an unindexed probe deliberately does **not** do is
+    // repair: the repair below writes only through `get_mut`, so it cannot
+    // invent a `SessionLease` the gateway never granted. An invented entry
+    // would enter `lease_capacity` accounting, `resolve_renewals` and
+    // `cleanup_peer_session`'s park loop, which is a much larger change than
+    // this bound, and admission does not tell us the row's owner generation.
+    //
+    // One detection consequence, accepted: a throttled diff is no longer
+    // routed, so it can no longer raise `duplicate_authority` against a
+    // *different* live holder. The first `MisrouteBucket::BURST_PROBES` of
+    // them still do, so the detector still fires -- it simply cannot be
+    // driven at a peer's chosen rate, which is the point of the bucket.
+    let unproven = match indexed {
+        Some(lease) => lease.cell != diff.cell || lease.grid != diff.grid,
+        None => true,
+    };
+    // Kept for the repair below: only an entry that exists can be corrected.
+    let misrouted = unproven && indexed.is_some();
+    if unproven {
+        authority_metrics.record_misrouted_diff();
+        if indexed.is_none() {
+            authority_metrics.record_unindexed_diff();
+        }
+        let probe = match session.lock_current().await {
+            Some(mut peer) => peer.misroute_bucket.take(registrar_now_ms()),
+            None => false,
+        };
+        if !probe {
+            authority_metrics.record_misroute_throttled();
+            debug!(
+                entity = ?diff.entity,
+                tick = ?diff.tick,
+                presented_cell = ?diff.cell,
+                presented_grid = ?diff.grid,
+                indexed = ?indexed.map(|lease| (lease.grid, lease.cell)),
+                "gateway: throttled a bulk diff whose route this session's lease index does not prove"
+            );
+            // No row travels back, and none is owed. Where the index names a
+            // lease of ours, the row the router would have returned names
+            // *this* session's own holder, so `observe_fencing_rejection`
+            // returns early on it either way -- it fires only for a
+            // **different** unexpired holder. Where the index names nothing,
+            // there is nothing this session is entitled to be told about:
+            // handing back a row for an entity it holds no lease for would
+            // turn a throttled write into a free registrar read.
+            send(Bytes::from(encode_datagram(&GatewayReply::BulkNack {
+                entity: diff.entity,
+                tick: diff.tick,
+                reason: 2,
+                lease: None,
+            })));
+            return;
+        }
     }
-    route_diff(
+    let entity = diff.entity;
+    let (grid, cell) = (diff.grid, diff.cell);
+    let admitted = route_diff(
         send,
         DiffRoute {
             diff,
@@ -5014,6 +5260,19 @@ async fn route_session_diff(
         ingress_metrics,
     )
     .await;
+    // Only ever reached by an admitted probe, so it costs a lock on a path
+    // that already paid for a fallback locate -- and it is what stops the
+    // next diff paying the same price. An admission is proof of the location:
+    // the actor admitted it only because its own `by_cell[entity]` names this
+    // cell and its registrar row names this holder's live lease.
+    if misrouted && admitted {
+        if let Some(mut peer) = session.lock_current().await {
+            if let Some(indexed) = peer.leases.get_mut(&entity) {
+                indexed.grid = grid;
+                indexed.cell = cell;
+            }
+        }
+    }
 }
 
 struct DiffRoute {
@@ -5076,6 +5335,12 @@ async fn within_route_budget<T>(
 /// Journal a bulk diff via the owning cell actor, then ack with the durable
 /// LSN (or nack on rejection). The gateway fills in the server-assigned
 /// `epoch`/`lsn`/`author`/`crc` (docs/08-persistence.md §2.1).
+///
+/// Returns whether the router **admitted** the record — took it into a
+/// journal at the cell the diff named. Not whether it committed, and not
+/// whether the client was acknowledged: the caller uses it as proof of the
+/// entity's location, and admission is where that is decided
+/// (`by_cell[entity] == record.cell`, inside the actor's fence).
 async fn route_diff(
     send: &(dyn Fn(Bytes) + Send + Sync),
     route: DiffRoute,
@@ -5083,7 +5348,7 @@ async fn route_diff(
     bulk_ack_admission: &SharedBulkAckAdmission,
     bulk_metrics: &GatewayBulkMetrics,
     ingress_metrics: &GatewayIngressMetrics,
-) {
+) -> bool {
     let DiffRoute {
         diff,
         author,
@@ -5156,7 +5421,7 @@ async fn route_diff(
                 budget_us,
                 "gateway: shed diff, router did not admit it inside its budget"
             );
-            return;
+            return false;
         }
         Some(RouteAdmission::Fenced {
             lease,
@@ -5181,10 +5446,13 @@ async fn route_diff(
                 reason: 2,
                 lease,
             })));
-            return;
+            return false;
         }
         Some(RouteAdmission::Journaled(result)) => result,
     };
+    // Past this point the record is in a journal at `diff.cell`, whatever the
+    // durability wait below reports.
+    let admitted = result.is_ok();
     let router_apply_us = elapsed_us(route_started);
     let journal_wait_started = Instant::now();
 
@@ -5239,6 +5507,7 @@ async fn route_diff(
             send(Bytes::from(encode_datagram(&reply)));
         }
     }
+    admitted
 }
 
 /// Serve an area load: read each requested cell from its owning actor and
@@ -7199,6 +7468,406 @@ mod tests {
                 .map(|lease| (lease.entity, lease.lease_id))
                 .collect::<Vec<_>>()
         );
+    }
+
+    /// A router that counts what the gateway actually asked it to route, and
+    /// can be told whether the fence admits it.
+    struct CountingFencedRouter {
+        fenced: Arc<AtomicUsize>,
+        admits: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl Router for CountingFencedRouter {
+        async fn apply(
+            &self,
+            _record: JournalRecord,
+        ) -> Result<Arc<crate::journal::AppendHandle>, Reject> {
+            Err(Reject::JournalClosed)
+        }
+        async fn apply_fenced(
+            &self,
+            _record: JournalRecord,
+            _holder: NodeId,
+            _lease_id: LeaseId,
+            _authority_seq: orrery_protocol::SeqPair,
+            _now_ms: u64,
+        ) -> Result<FencedApply, Reject> {
+            self.fenced.fetch_add(1, Ordering::SeqCst);
+            if self.admits {
+                Ok(FencedApply::Accepted(
+                    crate::journal::AppendHandle::completed(Lsn::new(7, 11)),
+                ))
+            } else {
+                Ok(FencedApply::Rejected(None))
+            }
+        }
+        async fn read(&self, _grid: GridId, _cell: CellId) -> Result<SnapshotPage, Reject> {
+            Err(Reject::JournalClosed)
+        }
+        async fn has_actor(&self, _grid: GridId, _cell: CellId) -> bool {
+            false
+        }
+    }
+
+    /// The cell a bulk diff declares reaches the router straight off the wire,
+    /// and it decides whether the route is cheap or expensive.
+    ///
+    /// A diff at a cell this session's lease index does not name misses the
+    /// fenced route's fast path and pays its fallback: one
+    /// `LeaseStore::locate` — the FoundationDB read docs/14-capacity.md §5.1
+    /// measured as the binding constraint on a whole box — plus a second
+    /// mailbox turn. Nothing bounded how often a peer could ask for that.
+    ///
+    /// Refusing outright is wrong, and was the first attempt: a registrar-
+    /// driven rekey moves an entity without telling the gateway, so the
+    /// holder's first legitimate write at the new cell looks exactly like the
+    /// abuse (`rekeyed_entity_rejects_stale_presented_cell_with_current_lease`
+    /// asserts that write is acknowledged). So the mismatch buys a probe from
+    /// a per-connection bucket, and an admitted probe repairs the index.
+    #[tokio::test]
+    async fn a_diff_at_an_unindexed_cell_probes_once_repairs_the_index_and_is_then_throttled() {
+        let registry = Arc::new(PeerRegistry::new(2, 10_000, MAX_PEER_LIVE_LEASES));
+        let node = iroh::SecretKey::from_bytes(&[21; 32]).public();
+        let authorization = GatewayAuthorization::Valid(SessionTokenClaimsV1::new(
+            orrery_protocol::AccountId::new(1),
+            node,
+            UnixMillis::new(0),
+            orrery_protocol::SessionTokenTtlMs::new(1_000),
+            orrery_protocol::SessionStanding::Good,
+            orrery_protocol::IssuerKeyId::new(1),
+        ));
+        let session = registry
+            .activate(node, authorization, b"conn", None, 0, 0)
+            .await
+            .expect("valid peer is admitted");
+
+        let granted_cell = CellId::ROOT.children()[0];
+        let elsewhere = CellId::ROOT.children()[1];
+        let entity = PersistId::new(4_242);
+        let indexed_lease = SessionLease {
+            entity,
+            lease_id: LeaseId(9),
+            grid: GridId::ROOT,
+            cell: granted_cell,
+            owner: SessionLeaseOwner::Active(session.generation),
+        };
+        session
+            .state
+            .lock()
+            .await
+            .leases
+            .insert(entity, indexed_lease);
+
+        let fenced = Arc::new(AtomicUsize::new(0));
+        let admission: SharedBulkAckAdmission = Arc::new(AlwaysDurableAdmission);
+        let bulk_metrics = Arc::new(GatewayBulkMetrics::default());
+        let authority = Arc::new(AuthorityMetrics::default());
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let capture = {
+            let sent = Arc::clone(&sent);
+            move |bytes: Bytes| sent.lock().expect("capture lock").push(bytes)
+        };
+        let uplink = |cell: CellId, tick: u64| DiffUplink {
+            cell,
+            grid: GridId::ROOT,
+            entity,
+            tick: orrery_protocol::Tick::new(tick),
+            kind: orrery_protocol::RecordKind::ComponentDiff,
+            payload: Bytes::from_static(b"state"),
+            seq: 1,
+            lease_id: Some(LeaseId(9)),
+            authority_seq: Some(orrery_protocol::SeqPair::default()),
+        };
+
+        // -- a probe is routed, and an admitted probe repairs the index -----
+        let admitting: Arc<dyn Router> = Arc::new(CountingFencedRouter {
+            fenced: Arc::clone(&fenced),
+            admits: true,
+        });
+        route_session_diff(
+            &capture,
+            uplink(elsewhere, 1),
+            &session,
+            &admitting,
+            &admission,
+            &bulk_metrics,
+            &GatewayIngressMetrics::default(),
+            Arc::clone(&authority),
+            Instant::now(),
+            0,
+        )
+        .await;
+        assert_eq!(
+            fenced.load(Ordering::SeqCst),
+            1,
+            "the first diff at an unindexed cell must still be routed: a rekey looks like this"
+        );
+        assert_eq!(authority.snapshot().misrouted_diffs, 1);
+        assert_eq!(authority.snapshot().misroute_throttled, 0);
+        assert_eq!(
+            session.state.lock().await.leases[&entity].cell,
+            elsewhere,
+            "an admitted probe is proof of the entity's cell, and repairs the index"
+        );
+
+        route_session_diff(
+            &capture,
+            uplink(elsewhere, 2),
+            &session,
+            &admitting,
+            &admission,
+            &bulk_metrics,
+            &GatewayIngressMetrics::default(),
+            Arc::clone(&authority),
+            Instant::now(),
+            0,
+        )
+        .await;
+        assert_eq!(fenced.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            authority.snapshot().misrouted_diffs,
+            1,
+            "the repaired index costs no further probes: a rekey is one token, not a rate"
+        );
+
+        // -- an exhausted bucket refuses without routing ---------------------
+        // A peer whose cell is simply wrong never gets an admission, so it
+        // never repairs the index, so it drains its allowance and stops.
+        {
+            let mut peer = session.state.lock().await;
+            peer.leases.insert(entity, indexed_lease);
+            peer.misroute_bucket = MisrouteBucket {
+                token_millis: 0,
+                // Far future, so `take` cannot replenish under this test.
+                updated_ms: u64::MAX,
+            };
+        }
+        let rejecting: Arc<dyn Router> = Arc::new(CountingFencedRouter {
+            fenced: Arc::clone(&fenced),
+            admits: false,
+        });
+        sent.lock().expect("capture lock").clear();
+        route_session_diff(
+            &capture,
+            uplink(elsewhere, 3),
+            &session,
+            &rejecting,
+            &admission,
+            &bulk_metrics,
+            &GatewayIngressMetrics::default(),
+            Arc::clone(&authority),
+            Instant::now(),
+            0,
+        )
+        .await;
+        assert_eq!(
+            fenced.load(Ordering::SeqCst),
+            2,
+            "with no probe left, the diff must not reach the router at all"
+        );
+        assert_eq!(authority.snapshot().misrouted_diffs, 2);
+        assert_eq!(authority.snapshot().misroute_throttled, 1);
+        let bytes = sent.lock().expect("capture lock").pop().expect("a reply");
+        assert!(
+            matches!(
+                decode_datagram(&bytes),
+                Some(GatewayReply::BulkNack { entity: e, tick, lease: None, .. })
+                    if e == entity && tick == orrery_protocol::Tick::new(3)
+            ),
+            "the client must be told, not left waiting"
+        );
+
+        // And a diff at the indexed cell still routes, with the bucket empty:
+        // the throttle is on the expensive branch, not on the connection.
+        route_session_diff(
+            &capture,
+            uplink(granted_cell, 4),
+            &session,
+            &rejecting,
+            &admission,
+            &bulk_metrics,
+            &GatewayIngressMetrics::default(),
+            Arc::clone(&authority),
+            Instant::now(),
+            0,
+        )
+        .await;
+        assert_eq!(fenced.load(Ordering::SeqCst), 3);
+        assert_eq!(authority.snapshot().misrouted_diffs, 2);
+
+        drop(registry);
+    }
+
+    /// The cheapest way onto the fenced route's expensive branch needs no
+    /// lease at all, and it used to be free.
+    ///
+    /// The probe predicate was `indexed.is_some_and(...)`, so an entity this
+    /// session holds no lease for read as "not misrouted": no token, no
+    /// counter, no throttle, and the diff routed. On the router side an
+    /// entity with no row anywhere is `Rejected(None)`, which is precisely
+    /// the answer that does *not* short-circuit — it takes the fallback and
+    /// spends one `LeaseStore::locate` (`tests/fenced_route_bounds.rs`,
+    /// "still exactly one locate"). So a peer could drive one FoundationDB
+    /// read per diff at its own send rate against entities it does not hold,
+    /// while `misrouted_diffs` — the counter docs/08-persistence.md §2.1.2
+    /// names as the alarm for exactly that — read zero throughout.
+    ///
+    /// The reviewer's probe was 1000 diffs at a foreign cell for an entity
+    /// absent from `peer.leases`, and it measured `routed_to_router=1000
+    /// misrouted_diffs=0 misroute_throttled=0`. This is that probe.
+    ///
+    /// The bucket is pinned at `updated_ms: u64::MAX` so `take` cannot
+    /// replenish: what the router sees is then exactly the burst, and the
+    /// assertion is a count rather than a bound that a slow machine could
+    /// satisfy by accident.
+    #[tokio::test]
+    async fn diffs_for_an_entity_this_session_holds_no_lease_for_are_metered_too() {
+        const DIFFS: u64 = 1_000;
+
+        let registry = Arc::new(PeerRegistry::new(2, 10_000, MAX_PEER_LIVE_LEASES));
+        let node = iroh::SecretKey::from_bytes(&[22; 32]).public();
+        let authorization = GatewayAuthorization::Valid(SessionTokenClaimsV1::new(
+            orrery_protocol::AccountId::new(1),
+            node,
+            UnixMillis::new(0),
+            orrery_protocol::SessionTokenTtlMs::new(1_000),
+            orrery_protocol::SessionStanding::Good,
+            orrery_protocol::IssuerKeyId::new(1),
+        ));
+        let session = registry
+            .activate(node, authorization, b"conn", None, 0, 0)
+            .await
+            .expect("valid peer is admitted");
+
+        // The whole point: nothing is inserted into `peer.leases`. The peer
+        // presents a `lease_id` it was never granted, which is what a peer
+        // with no lease at all has to do.
+        let foreign = CellId::ROOT.children()[1];
+        let entity = PersistId::new(9_101);
+        {
+            let mut peer = session.state.lock().await;
+            assert!(peer.leases.is_empty(), "the fixture holds no lease");
+            peer.misroute_bucket = MisrouteBucket {
+                token_millis: MisrouteBucket::BURST_TOKEN_MILLIS,
+                updated_ms: u64::MAX,
+            };
+        }
+
+        let fenced = Arc::new(AtomicUsize::new(0));
+        let admission: SharedBulkAckAdmission = Arc::new(AlwaysDurableAdmission);
+        let bulk_metrics = Arc::new(GatewayBulkMetrics::default());
+        let authority = Arc::new(AuthorityMetrics::default());
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let capture = {
+            let sent = Arc::clone(&sent);
+            move |bytes: Bytes| sent.lock().expect("capture lock").push(bytes)
+        };
+        let uplink = |tick: u64| DiffUplink {
+            cell: foreign,
+            grid: GridId::ROOT,
+            entity,
+            tick: orrery_protocol::Tick::new(tick),
+            kind: orrery_protocol::RecordKind::ComponentDiff,
+            payload: Bytes::from_static(b"state"),
+            seq: 1,
+            lease_id: Some(LeaseId(9)),
+            authority_seq: Some(orrery_protocol::SeqPair::default()),
+        };
+
+        let rejecting: Arc<dyn Router> = Arc::new(CountingFencedRouter {
+            fenced: Arc::clone(&fenced),
+            admits: false,
+        });
+        for tick in 1..=DIFFS {
+            route_session_diff(
+                &capture,
+                uplink(tick),
+                &session,
+                &rejecting,
+                &admission,
+                &bulk_metrics,
+                &GatewayIngressMetrics::default(),
+                Arc::clone(&authority),
+                Instant::now(),
+                0,
+            )
+            .await;
+        }
+
+        let snapshot = authority.snapshot();
+        assert_eq!(
+            fenced.load(Ordering::SeqCst) as u64,
+            MisrouteBucket::BURST_PROBES,
+            "an unleased entity must buy the same bounded probe a wrong cell does, \
+             not one fallback locate per diff at the peer's send rate"
+        );
+        assert_eq!(
+            snapshot.misrouted_diffs, DIFFS,
+            "the documented alarm must see this vector"
+        );
+        assert_eq!(
+            snapshot.unindexed_diffs, DIFFS,
+            "and must say which vector it is"
+        );
+        assert_eq!(
+            snapshot.misroute_throttled,
+            DIFFS - MisrouteBucket::BURST_PROBES,
+            "everything past the burst is refused without routing"
+        );
+        let bytes = sent.lock().expect("capture lock").pop().expect("a reply");
+        assert!(
+            matches!(
+                decode_datagram(&bytes),
+                Some(GatewayReply::BulkNack { entity: e, tick, lease: None, .. })
+                    if e == entity && tick == orrery_protocol::Tick::new(DIFFS)
+            ),
+            "a throttled peer is told, and told without a row it holds no lease for"
+        );
+
+        // An *admitted* unindexed probe must not invent an index entry. The
+        // repair path writes through `get_mut` precisely so it cannot: a
+        // `SessionLease` the gateway never granted would enter
+        // `lease_capacity` accounting, `resolve_renewals` and the park loop in
+        // `cleanup_peer_session`, and admission does not name the row's owner
+        // generation. So this vector is metered forever rather than repaired,
+        // which is what makes `unindexed_diffs` a level and not a spike.
+        {
+            let mut peer = session.state.lock().await;
+            peer.misroute_bucket = MisrouteBucket {
+                token_millis: MisrouteBucket::BURST_TOKEN_MILLIS,
+                updated_ms: u64::MAX,
+            };
+        }
+        let admitting: Arc<dyn Router> = Arc::new(CountingFencedRouter {
+            fenced: Arc::clone(&fenced),
+            admits: true,
+        });
+        route_session_diff(
+            &capture,
+            uplink(DIFFS + 1),
+            &session,
+            &admitting,
+            &admission,
+            &bulk_metrics,
+            &GatewayIngressMetrics::default(),
+            Arc::clone(&authority),
+            Instant::now(),
+            0,
+        )
+        .await;
+        assert_eq!(
+            fenced.load(Ordering::SeqCst) as u64,
+            MisrouteBucket::BURST_PROBES + 1,
+            "a refilled bucket routes the probe"
+        );
+        assert!(
+            session.state.lock().await.leases.is_empty(),
+            "an admitted probe must not fabricate a lease the gateway never granted"
+        );
+        assert_eq!(authority.snapshot().unindexed_diffs, DIFFS + 1);
+
+        drop(registry);
     }
 
     struct AlwaysDurableAdmission;
