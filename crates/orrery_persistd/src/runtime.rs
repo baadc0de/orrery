@@ -38,25 +38,60 @@ pub(crate) const ENTITY_STRIPE_COUNT: usize = 1_024;
 
 pub(crate) struct EntityStripeGates {
     stripes: [Arc<tokio::sync::Mutex<()>>; ENTITY_STRIPE_COUNT],
+    /// Per-stripe count of *completed* entity migrations.
+    ///
+    /// This is the invalidation half of the gate. The gate's job (docs
+    /// §3.6) is that an entity's committed location is read and acted on
+    /// atomically with respect to a migration of that entity — and
+    /// `LeaseStore::migrate`, reached only from `CommittedRekeyPlan::execute`
+    /// under this same gate, is the only operation that ever changes that
+    /// location (`put` refuses to overwrite a different existing one). A
+    /// reader that samples this counter *before* it locates, and finds it
+    /// unchanged once it holds the gate, therefore knows no migration
+    /// completed in between, so the location it read out of the gate is the
+    /// one it would have read inside it.
+    migrations: [std::sync::atomic::AtomicU64; ENTITY_STRIPE_COUNT],
 }
 
 impl Default for EntityStripeGates {
     fn default() -> Self {
         Self {
             stripes: std::array::from_fn(|_| Arc::new(tokio::sync::Mutex::new(()))),
+            migrations: std::array::from_fn(|_| std::sync::atomic::AtomicU64::new(0)),
         }
     }
 }
 
 impl EntityStripeGates {
-    pub(crate) fn gate(&self, grid: GridId, entity: PersistId) -> Arc<tokio::sync::Mutex<()>> {
+    fn stripe(grid: GridId, entity: PersistId) -> usize {
         let mut mixed = entity.0 ^ u64::from(grid.0).wrapping_mul(0x9e37_79b9_7f4a_7c15);
         mixed = (mixed ^ (mixed >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
         mixed = (mixed ^ (mixed >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
         mixed ^= mixed >> 31;
         let bytes = mixed.to_le_bytes();
-        let stripe = usize::from(u16::from_le_bytes([bytes[0], bytes[1]]) & 1_023);
-        Arc::clone(&self.stripes[stripe])
+        usize::from(u16::from_le_bytes([bytes[0], bytes[1]]) & 1_023)
+    }
+
+    pub(crate) fn gate(&self, grid: GridId, entity: PersistId) -> Arc<tokio::sync::Mutex<()>> {
+        Arc::clone(&self.stripes[Self::stripe(grid, entity)])
+    }
+
+    /// Sample the migration counter for `entity`'s stripe.
+    ///
+    /// `SeqCst` on both ends rather than `Relaxed`: the pairing that matters
+    /// is between this load and a `migrated` store made under a *different*
+    /// lock than the one the reader will take, so there is no mutex
+    /// acquire/release edge to lean on.
+    pub(crate) fn migration_mark(&self, grid: GridId, entity: PersistId) -> u64 {
+        self.migrations[Self::stripe(grid, entity)].load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Record that a migration of `entity` has finished changing its
+    /// committed location. Must be called while still holding `entity`'s
+    /// gate, and after the `LeaseStore::migrate` it reports.
+    pub(crate) fn migrated(&self, grid: GridId, entity: PersistId) {
+        self.migrations[Self::stripe(grid, entity)]
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }
 }
 
@@ -117,6 +152,12 @@ pub(crate) struct CommittedRekeyPlan {
     source: CellActorHandle,
     destination: CellActorHandle,
     lease_store: Arc<dyn LeaseStore>,
+    /// The gate table whose migration counter this plan bumps once the
+    /// committed location has actually moved. The plan carries it rather
+    /// than the caller doing the bump because the bump has to happen at one
+    /// exact point — after `LeaseStore::migrate`, still under the entity's
+    /// gate — and only `execute` can see that point.
+    gates: Arc<EntityStripeGates>,
     rekey: EntityRekey,
     record: JournalRecord,
     local: bool,
@@ -159,6 +200,13 @@ impl CommittedRekeyPlan {
                 return Err(actor::RekeyError::LeaseMigrationRejected);
             }
         }
+        // Past this point the committed location *is* the destination, so
+        // any location sampled outside this gate before now is stale. The
+        // bump happens here rather than at the end of `execute` because the
+        // steps below can fail with the location already moved, and a reader
+        // that missed the bump would route to the source actor for good.
+        self.gates
+            .migrated(self.rekey.source_grid, self.rekey.entity);
         if self.local {
             return self.source.complete_local_rekey(transfer).await;
         }
@@ -584,6 +632,16 @@ impl CellRuntime {
         Arc::clone(&self.lease_store)
     }
 
+    pub(crate) fn entity_gates_handle(&self) -> Arc<EntityStripeGates> {
+        Arc::clone(&self.entity_gates)
+    }
+
+    /// Sample this entity's stripe migration counter (see
+    /// [`EntityStripeGates::migration_mark`]).
+    pub(crate) fn entity_migration_mark(&self, grid: GridId, entity: PersistId) -> u64 {
+        self.entity_gates.migration_mark(grid, entity)
+    }
+
     /// Start a bounded-staleness monitor for the exact active fence rows this
     /// runtime currently hosts. Inject the returned monitor as the gateway's
     /// bulk-ack admission policy before exposing the gateway after activation.
@@ -965,6 +1023,7 @@ impl CellRuntime {
             source,
             destination,
             lease_store: Arc::clone(&self.lease_store),
+            gates: Arc::clone(&self.entity_gates),
             rekey,
             record,
         })

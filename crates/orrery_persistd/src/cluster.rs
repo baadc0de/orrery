@@ -614,45 +614,83 @@ impl Router for CellRuntime {
         renew: &[LeaseRenewal],
         now_ms: u64,
     ) -> Result<Vec<Option<Lease>>, Reject> {
-        let guards = lock_entity_gates(
-            renew
-                .iter()
-                .map(|entry| self.entity_gate(grid, entry.entity)),
-        )
-        .await;
-        // How long this batch keeps that whole set is the number that decides
-        // whether the diff path's `gate_wait` is the diff path's own fault.
-        let held = guards.len();
-        let hold_started = Instant::now();
-        let _guards = HeldGates {
-            guards,
-            gates: held,
-            started: hold_started,
-        };
-        // Routing stays per entity: a lease that migrated since the grant is
-        // owned by another actor, and a batch may straddle the two. Only the
-        // mailbox turn is folded.
+        // Phase 1 holds nothing at all. Routing stays per entity — a lease
+        // that migrated since the grant is owned by another actor, and a
+        // batch may straddle the two — but one `LeaseStore::locate` per entry
+        // is an FDB round trip, and the gate is not what makes that read
+        // *readable*, only what makes it *stable*. The stripe's migration
+        // counter proves the same stability afterwards for the price of an
+        // atomic load, so the reads happen with every gate free. Sampling the
+        // mark strictly before the locate it guards is what makes that proof
+        // hold.
+        let mut marks = Vec::with_capacity(renew.len());
         let mut routes = Vec::with_capacity(renew.len());
         for entry in renew {
+            marks.push(self.entity_migration_mark(grid, entry.entity));
             routes.push(
                 self.lease_location(entry.entity)
                     .await?
                     .unwrap_or(entry.cell),
             );
         }
+        let shards = self.shard_cells();
         let mut rows = vec![None; renew.len()];
-        for (shard, members) in group_by_actor(&self.shard_cells(), &routes) {
+        // Entries whose stripe saw a migration land between their locate and
+        // their gate. Re-answered one at a time below with the gate held
+        // across the locate, which is what this batch used to do for every
+        // entry unconditionally.
+        let mut restale: Vec<usize> = Vec::new();
+        for (shard, members) in group_by_actor(&shards, &routes) {
             let Some(actor) = shard.and_then(|shard| self.actor(grid, shard)).cloned() else {
                 continue;
             };
-            let batch: Vec<_> = members
+            // Phase 2 takes gates per actor group, not per batch, and holds
+            // them across one mailbox turn and nothing else. The order is
+            // still `lock_entity_gates`'s deduplicated stripe address, so
+            // groups that share a stripe still cannot cycle.
+            let guards = lock_entity_gates(
+                members
+                    .iter()
+                    .map(|index| self.entity_gate(grid, renew[*index].entity)),
+            )
+            .await;
+            let held = guards.len();
+            let _guards = HeldGates {
+                guards,
+                gates: held,
+                started: Instant::now(),
+            };
+            let mut fresh = Vec::with_capacity(members.len());
+            for index in members {
+                if self.entity_migration_mark(grid, renew[index].entity) == marks[index] {
+                    fresh.push(index);
+                } else {
+                    restale.push(index);
+                }
+            }
+            if fresh.is_empty() {
+                continue;
+            }
+            let batch: Vec<_> = fresh
                 .iter()
                 .map(|index| (renew[*index].entity, renew[*index].lease_id))
                 .collect();
             let renewed = actor.heartbeat_leases(batch, holder, now_ms).await?;
-            for (index, row) in members.into_iter().zip(renewed) {
+            for (index, row) in fresh.into_iter().zip(renewed) {
                 rows[index] = row;
             }
+        }
+        for index in restale {
+            rows[index] = <Self as Router>::heartbeat_lease(
+                self,
+                grid,
+                renew[index].cell,
+                renew[index].entity,
+                holder,
+                renew[index].lease_id,
+                now_ms,
+            )
+            .await?;
         }
         Ok(rows)
     }
@@ -957,21 +995,23 @@ impl Router for tokio::sync::Mutex<CellRuntime> {
         renew: &[LeaseRenewal],
         now_ms: u64,
     ) -> Result<Vec<Option<Lease>>, Reject> {
-        let (gates, store, runtime_grid, shards) = {
+        let (entity_gates, store, runtime_grid, shards) = {
             let runtime = self.lock().await;
             (
-                renew
-                    .iter()
-                    .map(|entry| runtime.entity_gate(grid, entry.entity))
-                    .collect::<Vec<_>>(),
+                runtime.entity_gates_handle(),
                 runtime.lease_store_handle(),
                 runtime.grid(),
                 runtime.shard_cells(),
             )
         };
-        let _guards = lock_entity_gates(gates).await;
+        // Same two phases as the `CellRuntime` impl: locate with no gate
+        // held, then take each actor group's gates around its mailbox turn
+        // only, with the stripe migration counter standing in for the
+        // atomicity the old whole-batch hold bought.
+        let mut marks = Vec::with_capacity(renew.len());
         let mut routes = Vec::with_capacity(renew.len());
         for entry in renew {
+            marks.push(entity_gates.migration_mark(grid, entry.entity));
             routes.push(if runtime_grid == grid {
                 store
                     .locate(grid, entry.entity)
@@ -983,6 +1023,7 @@ impl Router for tokio::sync::Mutex<CellRuntime> {
             });
         }
         let mut rows = vec![None; renew.len()];
+        let mut restale: Vec<usize> = Vec::new();
         for (shard, members) in group_by_actor(&shards, &routes) {
             // The runtime lock is taken to resolve the handle and released
             // before the mailbox is awaited, exactly as the single-entity
@@ -993,14 +1034,49 @@ impl Router for tokio::sync::Mutex<CellRuntime> {
             let Some(actor) = self.lock().await.actor(grid, shard).cloned() else {
                 continue;
             };
-            let batch: Vec<_> = members
+            let guards = lock_entity_gates(
+                members
+                    .iter()
+                    .map(|index| entity_gates.gate(grid, renew[*index].entity)),
+            )
+            .await;
+            let held = guards.len();
+            let _guards = HeldGates {
+                guards,
+                gates: held,
+                started: Instant::now(),
+            };
+            let mut fresh = Vec::with_capacity(members.len());
+            for index in members {
+                if entity_gates.migration_mark(grid, renew[index].entity) == marks[index] {
+                    fresh.push(index);
+                } else {
+                    restale.push(index);
+                }
+            }
+            if fresh.is_empty() {
+                continue;
+            }
+            let batch: Vec<_> = fresh
                 .iter()
                 .map(|index| (renew[*index].entity, renew[*index].lease_id))
                 .collect();
             let renewed = actor.heartbeat_leases(batch, holder, now_ms).await?;
-            for (index, row) in members.into_iter().zip(renewed) {
+            for (index, row) in fresh.into_iter().zip(renewed) {
                 rows[index] = row;
             }
+        }
+        for index in restale {
+            rows[index] = <Self as Router>::heartbeat_lease(
+                self,
+                grid,
+                renew[index].cell,
+                renew[index].entity,
+                holder,
+                renew[index].lease_id,
+                now_ms,
+            )
+            .await?;
         }
         Ok(rows)
     }
@@ -1453,7 +1529,13 @@ impl Router for Cluster {
             .get(&source_owner)
             .ok_or(crate::actor::RekeyError::ActorUnavailable)?;
         let plan = runtime.lock().await.committed_rekey_plan(record)?;
-        plan.execute().await
+        let outcome = plan.execute().await;
+        // `plan.execute` bumped the *node's* stripe table; this level has its
+        // own, and its readers sample this one. Bump it while still holding
+        // this level's gate, and unconditionally: an execute that failed
+        // after `LeaseStore::migrate` still moved the committed location.
+        self.entity_gates.migrated(rekey.source_grid, rekey.entity);
+        outcome
     }
 
     async fn read(&self, grid: GridId, cell: CellId) -> Result<SnapshotPage, Reject> {
@@ -1535,14 +1617,13 @@ impl Router for Cluster {
         renew: &[LeaseRenewal],
         now_ms: u64,
     ) -> Result<Vec<Option<Lease>>, Reject> {
-        let _guards = lock_entity_gates(
-            renew
-                .iter()
-                .map(|entry| self.entity_gates.gate(grid, entry.entity)),
-        )
-        .await;
+        // Locate with no gate held and prove afterwards that nothing
+        // migrated, exactly as the node-level impl does; at this level the
+        // "locate" is `committed_entity_cell`, which can walk every runtime.
+        let mut marks = Vec::with_capacity(renew.len());
         let mut routes = Vec::with_capacity(renew.len());
         for entry in renew {
+            marks.push(self.entity_gates.migration_mark(grid, entry.entity));
             routes.push(
                 self.committed_entity_cell(grid, entry.entity)
                     .await?
@@ -1557,14 +1638,42 @@ impl Router for Cluster {
         let hasher = RendezvousHasher::new(self.nodes.clone());
         let owners: Vec<Option<u64>> = routes.iter().map(|cell| hasher.owner(*cell)).collect();
         let mut rows = vec![None; renew.len()];
+        let mut restale: Vec<usize> = Vec::new();
         for (owner, members) in group_by_route(&owners) {
             let Some(runtime) = owner.and_then(|owner| self.runtimes.get(&owner)) else {
                 continue;
             };
+            // The cluster gate is held around the delegated call and nothing
+            // else. It is *not* held across the locates above, and the node
+            // below takes its own gates for its own mailbox turn, so this is
+            // a nested hold of two distinct tables, each in stripe order.
+            let guards = lock_entity_gates(
+                members
+                    .iter()
+                    .map(|index| self.entity_gates.gate(grid, renew[*index].entity)),
+            )
+            .await;
+            let held = guards.len();
+            let _guards = HeldGates {
+                guards,
+                gates: held,
+                started: Instant::now(),
+            };
+            let mut fresh = Vec::with_capacity(members.len());
+            for index in members {
+                if self.entity_gates.migration_mark(grid, renew[index].entity) == marks[index] {
+                    fresh.push(index);
+                } else {
+                    restale.push(index);
+                }
+            }
+            if fresh.is_empty() {
+                continue;
+            }
             // Each entry carries the cell *it* resolved to, so the node's own
             // fold sees the true owning shard per entity rather than one
             // representative cell for the whole group.
-            let batch: Vec<_> = members
+            let batch: Vec<_> = fresh
                 .iter()
                 .map(|index| LeaseRenewal {
                     cell: routes[*index],
@@ -1580,9 +1689,21 @@ impl Router for Cluster {
                 now_ms,
             )
             .await?;
-            for (index, row) in members.into_iter().zip(renewed) {
+            for (index, row) in fresh.into_iter().zip(renewed) {
                 rows[index] = row;
             }
+        }
+        for index in restale {
+            rows[index] = <Self as Router>::heartbeat_lease(
+                self,
+                grid,
+                renew[index].cell,
+                renew[index].entity,
+                holder,
+                renew[index].lease_id,
+                now_ms,
+            )
+            .await?;
         }
         Ok(rows)
     }
