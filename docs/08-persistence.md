@@ -469,7 +469,68 @@ unchanged. A 77-entry renewal was 77 serial round trips.
 
 **Bulk-path validation.** The cell actor runs the stateless `Ruleset` invariant validators (D9/D10 — the same speed/acceleration/rate/impossible-value checks witnesses run) on inbound diffs: **mandatory** for entities in cells with fewer than N witness candidates — closing the solo-player-in-an-empty-cell hole, where no witness set exists to observe the author — and **sampled** elsewhere. Violations are rejected (NACK) or flagged to the adjudication pipeline.
 
-### 2.2 Critical path
+### 2.1.3 What it bought, in delivered records
+
+The study is `scripts/fenced-sweep-*.sh`: the pre-change and post-change
+binaries interleaved over the same points on the same box, against the same
+10 000-entity seeded world, reduced by `scripts/fenced-sweep-report.py`. Raw
+output is one directory per point.
+
+**Read the delivered column, not the nominal one.** `offered/s` in the first
+version of this table was `entities × diff_hz` — nominal demand, a dial
+setting, not load that arrived. `p2-load`'s fan-out assert allows
+`sessions × 160` diffs/s (`check_fan_out`), five of the six rate points were
+provisioned with exactly zero margin against that, and the rig drops the
+excess silently on the client (`UplinkScheduler::queue` is newest-wins). The
+rig tops out at about **99.3 k diffs/s** on this box whatever the session
+count, so the "120 k" and "160 k" points are the **same** delivered operating
+point and neither reached its nominal setting. See the correction in
+[14-capacity.md](14-capacity.md) §2.
+
+| nominal/s | rig cap/s | arm | delivered/s | durable acks/s | shed % | `locate` ms/apply | intent p99 | FDB thread mean |
+|---|---|---|---|---|---|---|---|---|
+| 20 000 | 20 000 | before | 16 417–18 031 | 16 123–18 027 | 0.03–1.79 | 0.51–0.69 | 40–100 ms | 25.0–25.4 % |
+| 20 000 | 20 000 | **after** | 17 915–18 022 | **17 915–18 021** | **0.00** | **0.00** | 15–30 ms | **8.2–8.3 %** |
+| 40 000 | 40 000 | before | 33 601–33 906 | 33 434–33 455 | 0.50–1.33 | 1.00–1.07 | 50–75 ms | 38.7–40.9 % |
+| 40 000 | 40 000 | **after** | 34 056 | **34 055** | **0.00** | **0.00** | 75 ms | **6.8 %** |
+| 60 000 | 80 000 | before | 48 896 | 44 671 | 8.64 | 2.26 | 500 ms | 57.2 % |
+| 60 000 | 80 000 | **after** | 49 667 | **49 663** | **0.01** | **0.00** | 200 ms | **7.0 %** |
+| 80 000 | 80 000 | before | 65 989 | 58 327 | 11.61 | 3.04 | 1.0 s | 75.8 % |
+| 80 000 | 80 000 | **after** | 66 330 | **66 267** | **0.01** | **0.00** | 500 ms | **8.8 %** |
+| 120 000 | 120 000 | before | 97 962 | 35 041 | 61.94 | 12.11 | 2 s | 96.6 % |
+| 120 000 | 120 000 | **after** | 99 436 | **99 428** | **0.01** | **0.00** | 750 ms | **11.1 %** |
+| 160 000 | 160 000 | before | 99 536 | 29 385 | 68.61 | 12.79 | 3 s | 95.2 % |
+| 160 000 | 160 000 | **after** | 99 324 | **99 317** | **0.01** | **0.00** | 750 ms | **10.8 %** |
+
+**The headline, stated in what was measured.** At the rig's ceiling — about
+**99 k diffs/s delivered on both arms**, the last two rows, which are one
+operating point reached two ways — the pre-change binary made **29 k–35 k
+records durable per second** and shed 62–69 % of them, while the post-change
+binary made **99.3 k** durable and shed 0.01 %. Same load in, **~3× the
+writes made durable**, and the FDB client thread fell from ~95–97 % of a core
+to ~11 %.
+
+**The knee was not found, and the study cannot claim one.** At 99 k delivered
+the after arm sheds 0.01 %, commits intents in 750 ms, and acknowledges
+essentially everything that arrives; nothing about it looks like a limit. What
+ran out was the load generator. The honest statement of the new service
+ceiling is **">= 99 k delivered records/s, not located"** — finding it needs a
+rig that can offer more than one box's `p2-load` can, which this study did not
+have. The *old* knee is the number that moved and is measurable: 40 000
+nominal / ~33.6 k delivered before, versus at least 99 k delivered after.
+
+**Superseded, and why it is left visible.** The first published version of
+this table had an `offered/s` column carrying the nominal figures, a "120 k"
+row and a "160 k" row read as two operating points, and a claim that the new
+knee sat above 160 k. All three are wrong in the same way: they are the dial,
+not the delivery. The numbers are not quietly overwritten because the error
+was not arithmetic — it was reporting a setting as a measurement, which is
+the kind of mistake that recurs unless the tooling makes it impossible.
+`scripts/fenced-sweep-report.py` now prints `delivered_per_s`,
+`rig_cap_per_s` and `delivered_pct` beside the nominal, and warns to stderr
+when any point delivered under 95 % of it.
+
+## 2.2 Critical path
 
 ```mermaid
 sequenceDiagram

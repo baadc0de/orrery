@@ -6,6 +6,24 @@ thread named specifically (rather than "the busiest thread", which after the
 change is no longer it), the new `gateway_route_stage` counters, and a
 before/after fold that reports min-max across repeats — never a median,
 because this box swings by up to 2x on per-flush fsync cost.
+
+**`nominal_per_s` is not load that arrived.** It is `entities × diff_hz` —
+what the world would generate if nothing throttled it — and the rig cannot
+necessarily send it. `p2-load`'s own fan-out assert allows `sessions × 160`
+diffs/s (`check_fan_out`), so a point provisioned at exactly that has zero
+margin, and above about 99 k diffs/s this box's rig runs out regardless of
+sessions. Under-delivery is silent: `UplinkScheduler::queue` is newest-wins,
+so the diffs that do not fit are dropped by the *client*, not shed by the
+gateway, and nothing in the server's telemetry can see it.
+
+Reporting the nominal number alone produced a published table in which the
+120 k and 160 k rows were the same operating point — 97 767 and 99 337
+diffs/s delivered on the before arm, 99 238 and 99 126 on the after arm — and
+in which "the knee moved" could not be told from "the rig ran out". So this
+prints `delivered_per_s` (measured, from the rig's own `diffs=` count),
+`rig_cap_per_s` (`sessions × 160`) and `delivered_pct` next to it. Read
+`delivered_per_s` first. A point whose `delivered_per_s` is far below its
+`nominal_per_s`, or at its `rig_cap_per_s`, measured the rig.
 """
 from __future__ import annotations
 
@@ -103,7 +121,23 @@ def row(d: pathlib.Path) -> dict:
         "label": d.name,
         "arm": d.name.split("-")[0],
         "point": "-".join(d.name.split("-")[1:-1]),
-        "offered_per_s": point.get("sessions", 0) and 10_000 * point.get("diff_hz", 0),
+        # Nominal demand. Kept, because it is what a sizing question is asked
+        # in, but never on its own: see the module docstring.
+        "nominal_per_s": point.get("sessions", 0) and 10_000 * point.get("diff_hz", 0),
+        # What the rig actually put on the wire, from its own `run complete`
+        # line. This is the load the box saw.
+        "delivered_per_s": round(load.get("diffs", 0) / dur) if load.get("diffs") else None,
+        # The rig's own ceiling for this point, from `check_fan_out`:
+        # `FLUSH_BUDGET_BYTES / (payload + DIFF_OVERHEAD_BYTES) * FLUSH_HZ`
+        # per session, which is 160 diffs/s/session at the study's payload.
+        # A point with `nominal_per_s == rig_cap_per_s` was provisioned with
+        # zero margin and will under-deliver.
+        "rig_cap_per_s": 160 * point.get("sessions", 0) or None,
+        "delivered_pct": round(
+            100 * load.get("diffs", 0) / dur / (10_000 * point.get("diff_hz", 1)), 1
+        )
+        if load.get("diffs") and point.get("diff_hz")
+        else None,
         "durable_acks_per_s": round(load.get("durable_acks", 0) / dur),
         "shed_pct": round(100 * ing.get("shed_slow_route", 0) / ing["admitted"], 2)
         if ing.get("admitted")
@@ -137,7 +171,10 @@ def row(d: pathlib.Path) -> dict:
 
 
 FIELDS = [
-    "offered_per_s",
+    "nominal_per_s",
+    "delivered_per_s",
+    "rig_cap_per_s",
+    "delivered_pct",
     "durable_acks_per_s",
     "shed_pct",
     "intent_p99_ms",
@@ -185,6 +222,21 @@ def main() -> int:
         print("no completed points", file=sys.stderr)
         return 1
     fold(rows)
+    starved = sorted(
+        {
+            r["point"]
+            for r in rows
+            if r["delivered_pct"] is not None and r["delivered_pct"] < 95
+        }
+    )
+    if starved:
+        print(
+            "\nWARNING: the rig delivered <95% of nominal at: "
+            + ", ".join(starved)
+            + "\nThose rows measure the load generator, not the box. Compare arms by "
+            "delivered_per_s, and report an unreached knee as '>= <delivered>, not located'.",
+            file=sys.stderr,
+        )
     return 0
 
 

@@ -54,6 +54,45 @@ Offered load is `entities × diff_hz` — what the world would generate if nothi
 throttled it. It is deliberately **not** `diffs_sent`, which the rig's uplink
 scheduler caps and which re-counts a shed diff when the client re-offers it.
 
+> **Correction (2026-08-18): a nominal offered load is not a delivered one,
+> and every table below is labelled with the nominal.** The reasoning above is
+> half right — `diffs_sent` does re-count re-offers — but reporting only the
+> nominal number hid something worse. `p2-load`'s fan-out assert
+> (`check_fan_out`) allows `sessions × 160` diffs/s, so a point provisioned at
+> exactly `entities × diff_hz == sessions × 160` has **zero** margin, and the
+> rig silently drops what does not fit: `UplinkScheduler::queue` is
+> newest-wins, on the client, where no server counter can see it. Six of the
+> eight rate points in §3.1 — 20 000, 40 000, 80 000, 120 000, 160 000 and
+> 320 000 — are provisioned with exactly zero margin.
+>
+> Re-measured on the same rig and box for the `fdb-off-bulk-path` study, with
+> the pre-change binary — i.e. this document's own configuration — the
+> delivered rate was:
+>
+> | nominal/s | sessions | rig cap/s | delivered/s (measured) | delivered |
+> |---|---|---|---|---|
+> | 20 000 | 125 | 20 000 | 16 417–18 031 | 82–90 % |
+> | 40 000 | 250 | 40 000 | 33 601–33 906 | 84–85 % |
+> | 60 000 | 500 | 80 000 | 48 896 | 82 % |
+> | 80 000 | 500 | 80 000 | 65 989 | 82 % |
+> | 120 000 | 750 | 120 000 | 97 962 | 82 % |
+> | 160 000 | 1000 | 160 000 | 99 536 | 62 % |
+>
+> **The rig tops out at about 99.3 k diffs/s on this box**, whatever the
+> session count: the 120 000 and 160 000 rows are the *same* delivered
+> operating point, ~98–99.5 k, and no point in the sweep ever delivered its
+> nominal load. Read the tables below as "at a nominal setting of N", never as
+> "with N records/s arriving". `scripts/fenced-sweep-report.py` now prints
+> `delivered_per_s`, `rig_cap_per_s` and `delivered_pct` beside the nominal
+> and warns when delivery falls below 95 %, so this cannot recur;
+> `scripts/p2-capacity-report.py`, which produced the tables below, does not.
+>
+> What this does **not** change: §5's conclusion about which resource binds.
+> That was measured per-thread on the box, and at the delivered rates above it
+> stands unaltered — 25.8 % of one core at ~18 k delivered, 100 % at collapse.
+> What it changes is the x-axis label, and any statement of the form "the knee
+> is at N offered" where N was above ~99 k: those points were never reached.
+
 ## 3. The sweep
 
 10 000 entities, 128 shards, 30 s, `--intent-mix trade=0.02,craft=0.01`
@@ -64,7 +103,14 @@ alone, and the two legs share their session counts so the effects separate.
 
 ### 3.1 Rate leg (offered load rising)
 
-| offered/s | hz | sessions | durable acks/s | shed % | intent p99 | busiest thread (mean / peak) | persistd cores | keeping up? |
+The first column is **nominal** — `entities × diff_hz`, the sweep's setting.
+It is not what the rig delivered; see the correction in §2 for the measured
+delivery, which is 82–90 % of nominal below 120 000 and hard-capped at about
+99.3 k diffs/s above it. The 120 000, 160 000 and 320 000 rows therefore all
+sit at roughly the same delivered load, and their *labels* are the sweep's
+request, not the box's input.
+
+| nominal/s | hz | sessions | durable acks/s | shed % | intent p99 | busiest thread (mean / peak) | persistd cores | keeping up? |
 |---|---|---|---|---|---|---|---|---|
 | 20 000 | 2 | 125 | 17 982–18 039 | 0.00–0.01 | 15–20 ms | 25.8 % / 43–45 % | 1.31–1.36 | yes |
 | 30 000 | 3 | 250 | 27 622–27 681 | 1.94–2.15 | 100–150 ms | 35.3–35.4 % / 41–47 % | 1.85–1.95 | marginal |
@@ -77,15 +123,22 @@ alone, and the two legs share their session counts so the effects separate.
 
 Two knees, and they are different events:
 
-* **Service knee at 40 000 offered / ~33.6 k durable records/s.** The last
+* **Service knee at 40 000 nominal / ~33.6 k durable records/s.** The last
   configuration where shedding is ~1 %, intents commit inside 100 ms and the
-  ack rate still climbs. This is the number to size against.
-* **Throughput turnover between 80 000 and 120 000 offered.** Peak achieved
-  throughput is **59 k durable records/s** at 80 000 offered, but that point is
-  already shedding 10 % of writes and taking a second to commit an intent.
-  Past it the box does not plateau, it **collapses**: 120 000 offered yields
-  *less* than 40 000 offered did, and at 320 000 offered the box makes 33–64
-  records durable per second — a factor of 300 below its own baseline.
+  ack rate still climbs. This is the number to size against. Note that the rig
+  delivered ~33.9 k/s at that setting, so on this leg the box was acknowledging
+  essentially everything that reached it — the knee is a statement about the
+  *delivered* ~34 k, and "40 000" is the dial it was reached from.
+* **Throughput turnover between 80 000 and 120 000 nominal.** Peak achieved
+  throughput is **59 k durable records/s** at 80 000 nominal (~66 k delivered),
+  but that point is already shedding 10 % of writes and taking a second to
+  commit an intent. Past it the box does not plateau, it **collapses**:
+  120 000 nominal yields *less* than 40 000 nominal did, and at 320 000
+  nominal the box makes 33–64 records durable per second — a factor of 300
+  below its own baseline. The collapse is real and is not a delivery artifact:
+  the 120 000 and 320 000 rows deliver roughly the same ~99 k, and produce
+  35 k and 33–64 durable acks/s respectively, so what separates them is
+  retry-storm dynamics inside the box, not how much load arrived.
 
 The collapse is not a measurement artifact. At 320 000 offered, FDB reports
 82 639 transactions *started* per second and 1 657 reads/s served, against 33
@@ -93,6 +146,11 @@ durable acks/s: `persistd` is spending its entire FDB budget on transactions
 that time out and retry.
 
 ### 3.2 Concurrency leg (sessions rising, rate fixed at 2 Hz)
+
+Nominal 20 000/s throughout; measured delivery on this leg is 18 4xx–18 7xx
+diffs/s (92–93 % of nominal), flat across the session counts, so the
+comparisons *within* this leg are sound and only the absolute x-axis label is
+optimistic.
 
 | sessions | durable acks/s | shed % | `LeaseStore::locate` per apply | intent p99 | persistd cores | rig cores |
 |---|---|---|---|---|---|---|
