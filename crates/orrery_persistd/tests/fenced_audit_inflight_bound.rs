@@ -1,28 +1,36 @@
-//! The sampled invariant-J audit must not put FoundationDB back under the
-//! entity gate, and it must be billed to a stage of its own.
+//! Detaching the invariant-J audit bounds it, and a sample the bound refuses
+//! is still a number.
 //!
-//! The audit is a real `LeaseStore::locate`. It used to run inside
-//! `apply_fenced`'s entity-gate critical section, *after*
-//! `RouteStageMetrics::record` had already been called — so its cost was
-//! excluded from all three stage timers and reappeared, misattributed, as the
-//! next diff's `gate_wait_us`. With a 5 ms locate and eight concurrent
-//! accepts on one entity that read as `applies=8 locate_us_sum=0
-//! gate_wait_us_sum=171433` for a 49.5 ms wall.
+//! "Just spawn it" is a fix with a well-known failure mode: nothing upstream
+//! throttles a detached task, so a burst of accepts becomes a burst of
+//! concurrent `LeaseStore::locate` reads and the diagnostic starts costing
+//! more than the thing it is diagnosing. `fenced_location_audit_inflight` is
+//! the bound. Two things have to be true of it, and the second is what stops
+//! the bound from re-introducing the defect it was added beside:
 //!
-//! This pins the fix from both sides: the concurrent accepts must not
-//! serialize behind each other's audits (`gate_wait_us_sum` stays small), and
-//! the time the audits do cost must appear in `location_audit_us_sum` rather
-//! than nowhere.
+//! 1. **The bound never reaches the write.** Refusing a sample must not
+//!    refuse, delay or nack the accept it was sampled from — the audit is
+//!    still a diagnostic when it declines to run.
+//! 2. **A refused sample is counted.** `location_audits_dropped` exists so
+//!    that `decided == audits + errors + dropped` stays an identity. Without
+//!    it a saturated audit pool would silently shrink the sample and
+//!    `location_audits` would read as "the audit is running fine" while it
+//!    was mostly not running at all — the same class of invisibility as the
+//!    shed this whole change is about.
 //!
-//! Its own test binary because `RouteStageMetrics` is process-global: a
-//! second test taking deltas in parallel would read this one's work.
+//! The bound is pinned to **one** here so that concurrent accepts contend for
+//! it deterministically. Its own test binary for two reasons:
+//! `ORRERY_FENCED_LOCATION_AUDIT_INFLIGHT` resolves once per process, and
+//! `RouteStageMetrics` is process-global.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use orrery_persistd::checkpoint::{CheckpointStore, MemCheckpointStore};
-use orrery_persistd::cluster::{route_stage_metrics, settle_location_audits};
+use orrery_persistd::cluster::{
+    fenced_location_audit_inflight, route_stage_metrics, settle_location_audits,
+};
 use orrery_persistd::journal::{AdaptiveCommitMode, GroupCommitConfig};
 use orrery_persistd::{
     payload_crc, CellRuntime, ClaimResult, FencedApply, JournalConfig, LeaseMigrate, LeasePut,
@@ -33,11 +41,10 @@ use orrery_protocol::{
     RecordKind, Tick,
 };
 
-/// Deliberately far above any plausible scheduling jitter on a loaded box, so
-/// the assertions below are about where the cost is charged, not about how
-/// fast the box is.
-const LOCATE_DELAY: Duration = Duration::from_millis(25);
-const ACCEPTS: usize = 8;
+/// Long enough that the single permit is still held when the next accept
+/// arrives, without the test depending on how fast this box is.
+const SLOW_LOCATE: Duration = Duration::from_millis(50);
+const ACCEPTS: u64 = 12;
 
 fn test_node(n: u8) -> NodeId {
     let mut seed = [0u8; 32];
@@ -60,25 +67,26 @@ fn mk_record(cell: CellId, entity: PersistId, tick: u64, payload: &[u8]) -> Jour
     }
 }
 
-/// A lease store whose `locate` costs real wall time, like the FDB one.
-#[derive(Default)]
-struct SlowLocateLeaseStore {
+struct SlowLocateStore {
     inner: MemLeaseStore,
-    locates: AtomicUsize,
-    slow: std::sync::atomic::AtomicBool,
+    slow: AtomicBool,
+    concurrent: AtomicUsize,
+    peak: AtomicUsize,
 }
 
-impl SlowLocateLeaseStore {
-    fn locates(&self) -> usize {
-        self.locates.load(Ordering::Acquire)
-    }
-    fn go_slow(&self) {
-        self.slow.store(true, Ordering::Release);
+impl SlowLocateStore {
+    fn new() -> Self {
+        Self {
+            inner: MemLeaseStore::new(),
+            slow: AtomicBool::new(false),
+            concurrent: AtomicUsize::new(0),
+            peak: AtomicUsize::new(0),
+        }
     }
 }
 
 #[async_trait::async_trait]
-impl LeaseStore for SlowLocateLeaseStore {
+impl LeaseStore for SlowLocateStore {
     async fn load_cell(
         &self,
         grid: GridId,
@@ -99,9 +107,11 @@ impl LeaseStore for SlowLocateLeaseStore {
         grid: GridId,
         entity: PersistId,
     ) -> Result<Option<CellId>, LeaseStoreError> {
-        self.locates.fetch_add(1, Ordering::AcqRel);
-        if self.slow.load(Ordering::Acquire) {
-            tokio::time::sleep(LOCATE_DELAY).await;
+        if self.slow.load(Ordering::SeqCst) {
+            let now = self.concurrent.fetch_add(1, Ordering::SeqCst) + 1;
+            self.peak.fetch_max(now, Ordering::SeqCst);
+            tokio::time::sleep(SLOW_LOCATE).await;
+            self.concurrent.fetch_sub(1, Ordering::SeqCst);
         }
         self.inner.locate(grid, entity).await
     }
@@ -128,19 +138,22 @@ impl LeaseStore for SlowLocateLeaseStore {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn the_sampled_audit_runs_with_the_entity_gate_released_and_is_billed_to_itself() {
-    // Audit every accept, so eight accepts buy eight audits and the effect is
-    // at its largest. In release this is one in a thousand.
+async fn a_refused_audit_sample_costs_a_counter_not_a_write() {
     std::env::set_var("ORRERY_FENCED_LOCATION_AUDIT_N", "1");
+    std::env::set_var("ORRERY_FENCED_LOCATION_AUDIT_INFLIGHT", "1");
+    assert_eq!(
+        fenced_location_audit_inflight(),
+        1,
+        "the bound under test must be the one this binary set"
+    );
 
-    let shard = CellId::ROOT.children()[0];
-    let cell = shard.children()[0];
-    let holder = test_node(31);
+    let cell = CellId::ROOT.children()[0];
+    let holder = test_node(41);
     let dir = tempfile::tempdir().unwrap();
-    let store = Arc::new(SlowLocateLeaseStore::default());
+    let store = Arc::new(SlowLocateStore::new());
     let checkpoints: Arc<dyn CheckpointStore> = Arc::new(MemCheckpointStore::new());
     let config = RuntimeConfig {
-        shards: vec![shard],
+        shards: vec![CellId::ROOT],
         grid: GridId::ROOT,
         journal: JournalConfig {
             dir: dir.path().to_path_buf(),
@@ -164,7 +177,7 @@ async fn the_sampled_audit_runs_with_the_entity_gate_released_and_is_billed_to_i
         .unwrap(),
     );
 
-    let entity = PersistId::new(9_101);
+    let entity = PersistId::new(7_711);
     rt.apply(mk_record(cell, entity, 1, b"seed")).await.unwrap();
     let ClaimResult::Granted(grant) = Router::claim_lease(
         &*rt,
@@ -180,9 +193,8 @@ async fn the_sampled_audit_runs_with_the_entity_gate_released_and_is_billed_to_i
         panic!("the entity must be granted a lease");
     };
 
-    // Only now does `locate` become expensive: the setup above uses it too.
-    store.go_slow();
-    let locates_before = store.locates();
+    // Only now is `locate` expensive: the setup above uses it too.
+    store.slow.store(true, Ordering::SeqCst);
     let before = route_stage_metrics().snapshot();
 
     let mut running = Vec::new();
@@ -191,7 +203,7 @@ async fn the_sampled_audit_runs_with_the_entity_gate_released_and_is_billed_to_i
         running.push(tokio::spawn(async move {
             Router::apply_fenced(
                 &*rt,
-                mk_record(cell, entity, 100 + tick as u64, b"diff"),
+                mk_record(cell, entity, 100 + tick, b"diff"),
                 holder,
                 grant.lease_id,
                 grant.seq,
@@ -200,6 +212,8 @@ async fn the_sampled_audit_runs_with_the_entity_gate_released_and_is_billed_to_i
             .await
         }));
     }
+    // Claim 1: every accept is served. A permit the audit could not get is
+    // not the write's problem.
     for task in running {
         let applied = task.await.unwrap().unwrap();
         let FencedApply::Accepted(handle) = applied else {
@@ -208,52 +222,43 @@ async fn the_sampled_audit_runs_with_the_entity_gate_released_and_is_billed_to_i
         handle.committed().await.unwrap();
     }
 
-    // The audits are detached (2026-08-19), so they outlive the accepts that
-    // decided them. Their *cost* is still the subject here; what changed is
-    // that it has to be waited for rather than assumed landed.
     assert!(
         settle_location_audits(Duration::from_secs(30)).await,
-        "a decided audit never landed in a counter: {:?}",
+        "the decided audits never landed in a counter: {:?}",
         route_stage_metrics().snapshot().delta(before)
     );
     let delta = route_stage_metrics().snapshot().delta(before);
-    let audit_locates = store.locates() - locates_before;
 
-    assert_eq!(delta.applies, ACCEPTS as u64);
+    assert_eq!(delta.applies, ACCEPTS, "{delta:?}");
     assert_eq!(
-        delta.locate_fallbacks, 0,
-        "every accept took the fast path, so no locate belongs to routing"
+        delta.location_audits_decided, ACCEPTS,
+        "at one-in-one the sampler decides on every accept: {delta:?}"
     );
+    // Claim 2: the identity is closed, which is the only thing that makes
+    // `location_audits` readable as a sample rate at all.
     assert_eq!(
-        delta.locate_us_sum, 0,
-        "the route's own locate stage must stay empty; the audit has its own"
+        delta.location_audits + delta.location_audit_errors + delta.location_audits_dropped,
+        delta.location_audits_decided,
+        "decided == audits + errors + dropped, always: {delta:?}"
     );
-    assert_eq!(
-        audit_locates, ACCEPTS,
-        "one sampled audit per accept at N=1, and nothing else reads the store"
-    );
-    assert_eq!(delta.location_audits, ACCEPTS as u64);
-    assert_eq!(delta.location_mismatches, 0);
-    assert_eq!(delta.location_audit_errors, 0);
-
-    // The audits cost real time, and that time is now attributable.
-    let floor = (ACCEPTS as u64) * u64::try_from(LOCATE_DELAY.as_micros()).unwrap() * 8 / 10;
     assert!(
-        delta.location_audit_us_sum >= floor,
-        "the audits' own stage must carry their cost: {} us < {floor} us",
-        delta.location_audit_us_sum
+        delta.location_audits_dropped > 0,
+        "a one-permit pool against {ACCEPTS} concurrent 50 ms audits must refuse \
+         some of them; if it refused none the bound is not being applied: {delta:?}"
     );
-
-    // The point of the fix. With the audit inside the critical section each
-    // accept waits for every earlier accept's audit, and the sum grows as
-    // n(n-1)/2 * delay -- 700 ms at these settings. Off the gate, the accepts
-    // queue only behind one another's mailbox turns.
-    let ceiling = u64::try_from(LOCATE_DELAY.as_micros()).unwrap() * 4;
     assert!(
-        delta.gate_wait_us_sum < ceiling,
-        "the audit must not be held under the entity gate: gate_wait_us_sum={} >= {ceiling}",
-        delta.gate_wait_us_sum
+        delta.location_audits > 0,
+        "and it must still take some, or the diagnostic has stopped: {delta:?}"
+    );
+    assert_eq!(
+        store.peak.load(Ordering::SeqCst),
+        1,
+        "the bound is a bound: never more than one audit read in flight"
     );
 
-    Arc::try_unwrap(rt).ok().unwrap().close().await.unwrap();
+    Arc::into_inner(rt)
+        .expect("the only handle")
+        .close()
+        .await
+        .unwrap();
 }

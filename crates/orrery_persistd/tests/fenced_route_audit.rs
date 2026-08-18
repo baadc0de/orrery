@@ -28,7 +28,7 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use orrery_persistd::checkpoint::{CheckpointStore, MemCheckpointStore};
-use orrery_persistd::cluster::{route_stage_metrics, RouteStageSnapshot};
+use orrery_persistd::cluster::{route_stage_metrics, settle_location_audits, RouteStageSnapshot};
 use orrery_persistd::journal::{AdaptiveCommitMode, GroupCommitConfig};
 use orrery_persistd::{
     payload_crc, CellRuntime, ClaimResult, FencedApply, JournalConfig, LeaseMigrate, LeasePut,
@@ -181,7 +181,21 @@ fn mark() -> RouteStageSnapshot {
     route_stage_metrics().snapshot()
 }
 
-fn since(previous: RouteStageSnapshot) -> RouteStageSnapshot {
+/// The delta since `previous`, **after** every decided audit has landed.
+///
+/// The audit runs on a detached task since 2026-08-19 — it used to be awaited
+/// inside `apply_fenced`, where the gateway's route-admission timeout could
+/// cancel it and shed the diff with it (see `fenced_audit_never_sheds.rs`).
+/// So "the accept returned" no longer implies "its sample is counted", and
+/// every assertion below would otherwise be a race. The settle is asserted
+/// rather than best-effort: an audit that never lands is itself the defect
+/// this counter set exists to make impossible.
+async fn since(previous: RouteStageSnapshot) -> RouteStageSnapshot {
+    assert!(
+        settle_location_audits(Duration::from_secs(30)).await,
+        "a decided audit never landed in a counter: {:?}",
+        route_stage_metrics().snapshot().delta(previous)
+    );
     route_stage_metrics().snapshot().delta(previous)
 }
 
@@ -247,7 +261,7 @@ async fn the_sampled_location_audit_can_fire_and_counts_every_outcome() {
     // flat forever and every "must be zero" reading is vacuous.
     let before = mark();
     accept(&rt, 10, healthy, cell_a, holder, grant.lease_id, grant.seq).await;
-    let delta = since(before);
+    let delta = since(before).await;
     assert_eq!(delta.applies, 1);
     assert_eq!(
         delta.location_audits, 1,
@@ -264,7 +278,7 @@ async fn the_sampled_location_audit_can_fire_and_counts_every_outcome() {
     store.set(Locates::At(cell_b));
     let before = mark();
     accept(&rt, 11, healthy, cell_a, holder, grant.lease_id, grant.seq).await;
-    let delta = since(before);
+    let delta = since(before).await;
     assert_eq!(delta.location_audits, 1);
     assert_eq!(
         delta.location_mismatches, 1,
@@ -277,7 +291,7 @@ async fn the_sampled_location_audit_can_fire_and_counts_every_outcome() {
     store.set(Locates::Nowhere);
     let before = mark();
     accept(&rt, 12, healthy, cell_a, holder, grant.lease_id, grant.seq).await;
-    let delta = since(before);
+    let delta = since(before).await;
     assert_eq!(
         delta.location_audits, 0,
         "a missing location key is not a verdict"
@@ -292,7 +306,7 @@ async fn the_sampled_location_audit_can_fire_and_counts_every_outcome() {
     store.set(Locates::Erroring);
     let before = mark();
     accept(&rt, 13, healthy, cell_a, holder, grant.lease_id, grant.seq).await;
-    let delta = since(before);
+    let delta = since(before).await;
     assert_eq!(delta.location_audits, 0);
     assert_eq!(delta.location_mismatches, 0);
     assert_eq!(
@@ -342,7 +356,7 @@ async fn the_sampled_location_audit_can_fire_and_counts_every_outcome() {
         other.seq,
     )
     .await;
-    let delta = since(before);
+    let delta = since(before).await;
     assert_eq!(
         delta.locate_fallbacks, 1,
         "shard A rejects without a row, so the route falls back exactly once"

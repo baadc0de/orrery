@@ -476,16 +476,38 @@ pinned by a test rather than asserted here:
   the locate, and a sample that straddled a migration is discarded rather than
   judged. `location_mismatches` therefore has no known false-positive source
   — which is what lets it stay a stop-ship number.
-* **No locate outcome is invisible.** `location_audits` counts samples that
-  reached a verdict; `location_audit_errors` counts samples that did not — a
-  store error, a discarded straddling sample, *and* `locate` answering `None`.
-  `None` belongs with the failures: an accepted fenced diff has a live
-  registrar row, a row is only granted through `claim_lease`, and `claim_lease`
-  writes the location key in the same call, so a missing key means the audit
-  read nothing, not that it read agreement. Folding it into the clean count
-  would let a lease store that has lost its location index report health
-  forever. The two buckets are disjoint and exhaustive, so `location_audits
-  == 0` while accepts flow is itself the alarm that the audit stopped running.
+* **No locate outcome is invisible.** `location_audits_decided` counts the
+  samples the sampler chose, and is the denominator of the other three:
+  `location_audits` counts samples that reached a verdict,
+  `location_audit_errors` counts samples that ran and produced none — a store
+  error, a discarded straddling sample, *and* `locate` answering `None` — and
+  `location_audits_dropped` counts samples that never ran at all. `None`
+  belongs with the errors: an accepted fenced diff has a live registrar row, a
+  row is only granted through `claim_lease`, and `claim_lease` writes the
+  location key in the same call, so a missing key means the audit read
+  nothing, not that it read agreement. Folding it into the clean count would
+  let a lease store that has lost its location index report health forever. A
+  *drop* is kept apart from both because it says nothing about the store: it
+  is the audit declining a sample, and folding it into the errors would let a
+  saturated audit pool read as a sick registrar. The three buckets are
+  disjoint and exhaustive of the decided ones —
+
+  ```text
+  location_audits_decided
+    == location_audits + location_audit_errors + location_audits_dropped
+  ```
+
+  — so `location_audits == 0` while accepts flow is itself the alarm that the
+  audit stopped running, and no decided sample can go missing.
+* **It cannot refuse a write.** The audit is detached: `apply_fenced` decides
+  it under the gate, captures what it needs, and spawns it after the route has
+  already answered. It is bounded process-wide by
+  `ORRERY_FENCED_LOCATION_AUDIT_INFLIGHT` (512), which is a `try_acquire` and
+  not a queue — a diagnostic that falls behind should shrink its sample, not
+  grow a backlog of stale ones — and a refused sample is counted rather than
+  dropped silently. `tests/fenced_audit_never_sheds.rs` pins the first half
+  end to end through a real gateway with the audit read made six route budgets
+  long; `tests/fenced_audit_inflight_bound.rs` pins the second.
 
 Its cost is its own stage, `location_audit_us_sum` / `_max`, deliberately not
 folded into `locate_us`: `locate_us` is the route's own read, on the critical
@@ -498,19 +520,38 @@ of a core while serving ~18 000 locates/s, i.e. ~14 µs of that thread each, so
 99/s is ~0.14 % of one core: below the noise floor of every other number in
 this document.
 
-Its **latency** cost is not zero, and an earlier draft of this paragraph said
-it was. Taking the audit off the entity gate means it costs no other diff
-anything — that is what `tests/fenced_route_audit_gate.rs` pins — but
-`apply_fenced` still `await`s `finish_location_audit` before it returns, so the
-**sampled diff's own** route return is delayed by its own locate. At 1 in 1000
-that is one diff in a thousand paying roughly one FDB read on top of its
-route, and no other diff paying anything for it. Lowering the rate buys nothing
-measurable; raising it trades away the only production evidence that J holds.
+Its **latency** cost on the request path is now zero, and getting there took
+two corrections rather than one.
 
-So the section title is exact only with that footnote. **FoundationDB is off
-the bulk *routing* path — every accepted fenced diff, without exception —
-and off the bulk write path but for a 0.1 % audit sample that runs after the
-entity gate is released and is counted in a stage of its own.** The
+**Superseded 2026-08-19, and why it is left visible.** The paragraph that
+stood here said: *"`apply_fenced` still `await`s `finish_location_audit`
+before it returns, so the **sampled diff's own** route return is delayed by
+its own locate. At 1 in 1000 that is one diff in a thousand paying roughly one
+FDB read on top of its route, and no other diff paying anything for it."* The
+arithmetic is right and the conclusion is wrong, because it priced a delay and
+the delay was not the cost. The gateway runs `apply_fenced` inside
+`within_route_budget(received_at, MAX_ROUTE_ADMISSION_WAIT_US, …)` — a 25 ms
+`tokio::time::timeout` measured from the diff's *arrival* — so a sampled diff
+whose audit overran the remaining budget did not pay a delay, it was
+**cancelled**: counted `shed_slow_route`, never acknowledged, and its audit
+landed in no counter at all. The 0.1 % diagnostic was dropping bulk writes.
+
+It was also the *only* thing dropping them. Across the 73 point directories of
+[14-capacity.md](14-capacity.md) §11 — both storage engines, three orders of
+magnitude of shed rate — the identity `shed_slow_route == (decided audits) −
+(completed audits)` held **exactly**, at every single point, with
+`location_audit_us_max` clamped in the 20.8–26.5 ms band that a 25 ms budget
+produces. Bulk shed attributable to actual route slowness was zero in the
+whole study. The claim is left visible rather than quietly rewritten because
+the error was structural, not arithmetic: a diagnostic had been placed inside
+a valve that sheds, and nothing about "it is only 0.1 %" makes that safe.
+
+So the audit is off the request path entirely. `apply_fenced` decides the
+sample under the entity gate — including the stripe migration mark that pins
+it — and spawns it; the route returns without it. **FoundationDB is off the
+bulk *routing* path — every accepted fenced diff, without exception — and off
+the bulk write path but for a 0.1 % audit sample that runs detached, bounded,
+after the route has answered, and is counted in a stage of its own.** The
 `gateway_route_stage` boundary record carries the audit counters next to
 `locate_fallbacks` and `mailbox_turns`, whose ratio to `applies` must sit at
 1.0 and can never exceed 2.0.
