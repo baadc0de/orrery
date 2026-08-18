@@ -168,21 +168,42 @@ pub const CHAIN_LATENCY_SERIES: [&str; 3] = [
 /// sample above the last boundary lands in the overflow bucket, which has no
 /// upper bound and is serialized at the observed maximum.
 ///
-/// Rationale, D16 targets in parentheses:
+/// Rationale, D16 targets in parentheses. Two rules shape this table, and both
+/// come from how the gate reads it: a percentile is reported as its bucket's
+/// **upper bound**, and the gate asserts `p99 <= threshold`.
+///
+/// **Every threshold needs boundaries below it.** A lattice that jumps
+/// straight to a threshold reports every p99 in the whole preceding band as
+/// exactly that threshold, and then passes on the equality case — so the band
+/// is un-failable. That already happened here once, when 1 ms → 2 ms made
+/// every journal p99 in between read as exactly 2 ms.
+///
+/// **The top boundary must exceed anything worth reporting.** A sample past it
+/// lands in the overflow bucket, which is serialized at the observed
+/// *maximum* — so once more than 1 % of samples exceed the top, the reported
+/// p99 silently becomes the max. Measured on the P2 gate on 2026-08-18, that
+/// made `bulk_ack_ms` report a p99 of 2 104 ms that was in fact its max, with
+/// the true p99 known only to be somewhere above 1 s.
+///
 /// - 50, 100, 200, 500 µs: sub-millisecond ranges.
-/// - 1, 1.25, 1.5, 1.75, 2 ms: the journal-commit band (< 2 ms). The gate
-///   compares `p99 <= 2_000`, so a lattice that jumps 1 ms → 2 ms reports
-///   every p99 in that whole band as exactly the threshold and passes on the
-///   equality case. These four sub-2 ms boundaries are the reason this table
-///   is 25 entries and not 22.
-/// - 3, 5 ms: the bulk-ack band (p99 < 5 ms).
-/// - 7, 10 ms: the intent-commit band (p99 < 10 ms).
-/// - 15, 20, 30, 50 ms: the area first-page band (< 50 ms).
+/// - 1, 1.25, 1.5, 1.75, 2 ms: the journal-commit band (< 2 ms).
+/// - 2.5 through 5 ms in 500 µs steps: the bulk-ack band (p99 < 5 ms), which
+///   used to be a single 3 ms → 5 ms jump, i.e. a 2 ms-wide un-failable window
+///   immediately below the tightest threshold in the table.
+/// - 6 through 10 ms: the intent-commit band (p99 < 10 ms).
+/// - 15, 20, 30, 40, 50 ms: the area first-page band (< 50 ms).
 /// - 75 ms through 1 s: the wide tail.
-pub const LATENCY_BOUNDARIES_US: [u64; 25] = [
-    50, 100, 200, 500, 1_000, 1_250, 1_500, 1_750, 2_000, 3_000, 5_000, 7_000, 10_000, 15_000,
-    20_000, 30_000, 50_000, 75_000, 100_000, 150_000, 200_000, 300_000, 500_000, 750_000,
-    1_000_000,
+/// - 1.5 s through 10 s: past every threshold, and there purely so a p99 in
+///   the seconds is a percentile rather than a maximum wearing one's name.
+///
+/// Extending this table is a **refinement**: every boundary that has ever been
+/// in it is still in it, so a `sample_batch` record from an older artifact
+/// re-buckets to the identical value and old evidence stays readable.
+pub const LATENCY_BOUNDARIES_US: [u64; 38] = [
+    50, 100, 200, 500, 1_000, 1_250, 1_500, 1_750, 2_000, 2_500, 3_000, 3_500, 4_000, 4_500, 5_000,
+    6_000, 7_000, 8_000, 9_000, 10_000, 15_000, 20_000, 30_000, 40_000, 50_000, 75_000, 100_000,
+    150_000, 200_000, 300_000, 500_000, 750_000, 1_000_000, 1_500_000, 2_000_000, 3_000_000,
+    5_000_000, 10_000_000,
 ];
 
 /// Bucket count: one per boundary, plus the unbounded overflow bucket.
@@ -248,9 +269,52 @@ mod tests {
 
     #[test]
     fn overflow_reports_the_observed_maximum() {
-        let index = bucket_index(2_000_000);
+        let index = bucket_index(20_000_000);
         assert_eq!(index, LATENCY_BOUNDARIES_US.len());
-        assert_eq!(bucket_upper_us(index, 2_000_000), 2_000_000);
+        assert_eq!(bucket_upper_us(index, 20_000_000), 20_000_000);
+    }
+
+    #[test]
+    fn a_second_scale_percentile_is_a_percentile_and_not_a_maximum() {
+        // The overflow bucket is serialized at the observed maximum, so a p99
+        // that lands in it stops being a percentile. `bulk_ack_ms` did exactly
+        // that on 2026-08-18: a reported p99 of 2 104 ms that was its max.
+        // Anything below the top boundary must resolve to a real bucket.
+        for micros in [1_500_000, 2_000_000, 3_000_000, 5_000_000, 10_000_000] {
+            let index = bucket_index(micros);
+            assert!(
+                index < LATENCY_BOUNDARIES_US.len(),
+                "{micros} µs must be a bucket, not the overflow that degenerates to max"
+            );
+            assert_eq!(bucket_upper_us(index, 0), micros);
+        }
+    }
+
+    #[test]
+    fn the_band_below_each_threshold_is_narrow() {
+        // A percentile reports as its bucket's upper bound and the gate asserts
+        // `p99 <= threshold`, so every p99 inside the bucket that ENDS at a
+        // threshold reports as exactly that threshold and passes. That band is
+        // un-failable, and no lattice can remove it — the sample one microsecond
+        // under a boundary is in that boundary's bucket by definition. What a
+        // lattice controls is how WIDE the un-failable band is, and that is the
+        // property worth pinning: 1 ms → 2 ms once made the entire top half of
+        // the journal budget un-failable.
+        for threshold in [2_000_u64, 5_000, 10_000, 50_000] {
+            let idx = bucket_index(threshold);
+            assert_eq!(
+                bucket_upper_us(idx, 0),
+                threshold,
+                "{threshold} µs must be a boundary, not sit inside a wider bucket"
+            );
+            let lower = LATENCY_BOUNDARIES_US[idx - 1];
+            let width = threshold - lower;
+            assert!(
+                width * 4 <= threshold,
+                "the un-failable band below {threshold} µs is {width} µs wide \
+                 ({lower}..={threshold}); keep it under a quarter of the target"
+            );
+        }
     }
 
     #[test]
