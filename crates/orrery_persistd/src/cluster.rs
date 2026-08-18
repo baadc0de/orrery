@@ -708,9 +708,10 @@ impl Router for CellRuntime {
         // choice: if an actor holds a registrar row for `e` then `locate(e)`
         // names a cell in that actor's shard, so an actor that *accepts* is
         // the actor the locate would have picked. J is enforced at four row
-        // install sites (see the `debug_assert`s in `actor.rs`) and backed by
-        // `LeaseStore::put` refusing to overwrite a different location. It is
-        // also audited in production: see `fenced_location_audit_due`.
+        // install sites (all of which go through `checked_row_cell` in
+        // `actor.rs`) and backed by `LeaseStore::put` refusing to overwrite a
+        // different location. It is also audited in production: see
+        // `fenced_location_audit_due`.
         //
         // J does not say a rejecting actor is the right one — cross-shard
         // duplicate `by_cell` entries are reachable — so a reject *without* a
@@ -729,14 +730,20 @@ impl Router for CellRuntime {
         // One clone per diff: a `bytes::Bytes` Arc bump plus ~64 bytes of
         // `Copy` scalars, against the 0.48–2.79 ms round trip it replaces.
         let forwarded = record.clone();
-        let mailbox_started = Instant::now();
+        // `mailbox_us` sums the turns rather than spanning them: on the
+        // fallback the locate sits *between* two turns, and a span would
+        // count it in both stages at once. The three stages have to stay
+        // disjoint or the decomposition stops answering "where is the queue".
+        let mut mailbox_us = 0;
         let mut asked: Option<CellId> = None;
         let mut fast: Option<Result<FencedApply, Reject>> = None;
         if let Some(actor) = self.actor(grid, presented) {
             asked = Some(actor.shard());
+            let turn = Instant::now();
             let answer = actor
                 .start_fenced_diff(record, holder, lease_id, authority_seq, now_ms)
                 .await;
+            mailbox_us += stage_elapsed_us(turn);
             stages.record_mailbox_turn();
             // The only short-circuit, and deliberately the only one: an
             // accept, or a reject that carries the live row.
@@ -744,7 +751,7 @@ impl Router for CellRuntime {
                 answer,
                 Ok(FencedApply::Accepted(_)) | Ok(FencedApply::Rejected(Some(_)))
             ) {
-                stages.record(gate_wait_us, 0, stage_elapsed_us(mailbox_started));
+                stages.record(gate_wait_us, 0, mailbox_us);
                 if matches!(answer, Ok(FencedApply::Accepted(_))) {
                     self.audit_fenced_location(grid, entity, asked, &stages)
                         .await;
@@ -767,14 +774,16 @@ impl Router for CellRuntime {
         // swaps handles, and re-sending to the actor that already answered
         // would be a second turn for the same answer.
         if asked == Some(resolved.shard()) {
-            stages.record(gate_wait_us, locate_us, stage_elapsed_us(mailbox_started));
+            stages.record(gate_wait_us, locate_us, mailbox_us);
             return fast.expect("a shard was asked, so it produced an answer");
         }
+        let turn = Instant::now();
         let applied = resolved
             .start_fenced_diff(forwarded, holder, lease_id, authority_seq, now_ms)
             .await;
+        mailbox_us += stage_elapsed_us(turn);
         stages.record_mailbox_turn();
-        stages.record(gate_wait_us, locate_us, stage_elapsed_us(mailbox_started));
+        stages.record(gate_wait_us, locate_us, mailbox_us);
         applied
     }
 

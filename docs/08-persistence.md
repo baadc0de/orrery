@@ -211,6 +211,125 @@ Read the first column with the second: the *lock* is now the per-actor-group acq
 
 **What is left is the committer, and only the committer.** After the change `bulk_ack_ms` p99 equals `journal_commit_ms` p99 exactly on every run (15/15, 15/15, 15/15 at `off`; 15/15, 20/20, 20/15 at 25 ms), against a 2 ms D16 target for the commit itself. The client-observed bulk tail is now entirely the group commit path — `journal/**`, frozen to this lane and reported rather than fixed.
 
+### 2.1.2 Taking FoundationDB off the bulk write path
+
+§2.1.1 got the FDB read out from under the entity gate. It left the read
+itself: one `LeaseStore::locate` — a FoundationDB read transaction — per
+fenced bulk diff, on the write path, which is a direct contradiction of §2's
+"bulk writes reach FDB only at the 20 s checkpoint". [14-capacity.md](14-capacity.md)
+§5.1 then measured what that costs: `libfdb_c` runs **one** network thread per
+process, and that thread was the binding constraint on a whole 16-thread box —
+25.8 % of a core at the P2 operating point, 100 % at collapse, with fifteen
+threads, the NVMe array, the NIC, FDB's own server and RAM all idle beside it.
+
+**The read is gone from the accept path.** `CellRuntime::apply_fenced` now
+asks `actor(record.cell)` — the owner of the cell the client declared —
+directly, and consults `locate` only when that owner rejects *without* a row
+(or when there is no actor for the presented cell here, or its mailbox is
+gone). It is not a cache: nothing is memoised, nothing can go stale, there is
+no TTL and no invalidation hook. The decision is simply made by the component
+whose own state the decision is defined over.
+
+**Why the accept set is unchanged.** The locate was never part of the fence.
+`CellMsg::ApplyFencedDiff` evaluates five conjuncts against the receiving
+actor's *own* state — no pending rekey, `by_cell[e] == record.cell`, and
+holder / `lease_id` / `seq` / expiry against its own registrar row — and
+`apply_fenced` never rewrites `record.cell`. The locate only chose *which
+actor* evaluated them. So the whole question is whether a different actor can
+evaluate the same predicate to true, and one invariant answers it:
+
+> **(J)** If an actor's `LeaseRegistrar` holds a row for entity `e`, then
+> `LeaseStore::locate(e)` names a cell inside that actor's shard subtree (or
+> is `None`).
+
+Given J, an actor that *accepts* holds a live row, so `locate(e)` is in its
+shard, so `actor(locate(e))` — the old route — is that same actor. The accept
+set is identical with or without the read.
+
+J has exactly **four enforcement sites**, all in `actor.rs`, and all of them
+now go through `checked_row_cell`, which asserts `shard.is_prefix_of(cell)`
+and returns the cell it checked — so the assertion and the write are one
+expression and a later edit cannot move the row without moving the check:
+
+| site | why the row is in-shard |
+|---|---|
+| `claim_lease` | the claim is routed to `actor(locate().unwrap_or(cell))` and stores `location = cell`; `LeaseStore::put` answers `LocationConflict` rather than overwrite a different location, so even a misrouted claim cannot manufacture a violation |
+| `install_rekey` | runs at `actor(destination_cell)`, immediately after `migrate` set `location = destination_cell` |
+| `complete_local_rekey` | the intra-shard case of the same move; source and destination are one actor |
+| actor-spawn recovery | seeded from `load_cell(shard)`, which is a **prefix range scan** of `lease_cell_key` under that shard — in-shard by construction |
+
+`tests/fenced_route_invariant_j.rs` walks every actor and checks J directly
+after grant, park, sweep, cross-shard rekey, intra-shard rekey, `split`,
+`activate_shards` and recovery, under both lease stores.
+
+**Why a reject still reads.** J says nothing about a *rejecting* actor.
+Cross-shard duplicate `by_cell` entries are reachable — an unfenced diff at a
+new cell in another shard writes `by_cell` there without clearing the old
+actor's entry — so the cell owner's "I have no row" is not proof of absence,
+and the locate runs. `Rejected(Some(row))` *is* proof: a row present means, by
+J, this is the location owner, so the NACK carries the same live row it always
+did, and the D7 §5 duplicate-authority detector (`observe_fencing_rejection`,
+which returns early on `None`) and the client's `reconcile_lease_nack` keep
+working at full fidelity. The fallback is bounded by construction — **one**
+locate, **at most two** mailbox turns, no loop, and no short-circuit on
+anything but `row.is_some()` — and `tests/fenced_route_bounds.rs` asserts the
+bound, including that a fallback resolving to the actor that already answered
+does not re-send.
+
+**One accepted divergence, in writing.** A rekey whose `LeaseStore::migrate`
+committed and then reported failure (FDB's `commit_unknown_result`, or
+`execute` returning `Err(RekeyError::LeaseStore)`) leaves the source actor
+holding both its `pending_rekeys` reservation and its row while the durable
+location already names the destination. Where the destination is in another
+shard, the two routes disagree on the NACK *payload*: the old one asked the
+destination and got `Rejected(None)`; the new one asks the source, which
+rejects on conjunct 1 and hands back its live row. Both reject — admission is
+identical — and the new payload is the more useful one, being the row the
+client still holds. This is the only divergence in the state matrix, and
+`tests/fenced_route_differential.rs` asserts both that it is the only one and
+that it does fire.
+
+**The margin being spent, stated as a precondition.** Before this change every
+fenced diff re-read shared FoundationDB truth, so a location moved
+out-of-band by another writer would have been noticed on the next diff. Now
+only the actor's own state witnesses it. The requirement is therefore explicit:
+
+> **One `persistd` process writes a grid's lease keyspace.**
+
+That is true today — every `Router` implementation is in-process, and
+`LeaseStore::migrate` is reachable at runtime only from `commit_rekey`, which
+has no production caller (the gateway answers a client `LeaseMsg::Rekey` with
+an unconditional `Deny{NotEligible}` and NACKs a `RecordKind::Rekey` diff) —
+but it is now load-bearing rather than incidental. Cross-node exclusion
+continues to rest on the durable shard-fence epochs of §3.4, unchanged.
+
+**Monitored, not assumed.** The one silent failure mode is J being false: an
+actor admitting a write against a registrar row that is not the durably
+located one. So a **sampled audit** ships: one in `ORRERY_FENCED_LOCATION_AUDIT_N`
+accepted fenced diffs (default 1000 in release, **1** under
+`debug_assertions`, so the whole test suite audits every accept) still
+performs the locate, under the gate it was accepted with, and increments
+`location_mismatches` with a `warn!` when the durable location falls outside
+the accepting actor's shard. **That counter must be zero.** It rides the
+`gateway_route_stage` boundary record with two others: `locate_fallbacks`,
+which is structurally ~0 because `strict_authority` pins `record.cell` at the
+grant cell for the entity's life, and `mailbox_turns`, whose ratio to
+`applies` must sit at 1.0 and can never exceed 2.0.
+
+**Out of scope, deliberately.** `Cluster::apply_fenced` keeps its locate:
+`committed_entity_cell` there is doing real cross-runtime routing — the
+presented cell may be hosted by a *different* runtime — and J is a statement
+about one runtime's own actors, so it says nothing about which runtime holds a
+shard. `Mutex<CellRuntime>::apply_fenced` keeps its locate too; it is not on
+the shipped path and would need J re-proved for its structure. Both sites
+carry that reason in a comment.
+
+The same change made phase 1 of `heartbeat_leases` — the other per-entity FDB
+read stream, described in §2.1.1 — resolve its locations **concurrently**
+rather than one at a time. The proof is untouched: each future samples its own
+stripe mark before its own read, and phase 2's under-the-gate re-check is
+unchanged. A 77-entry renewal was 77 serial round trips.
+
 **Epoch-fenced acks (split-brain guard).** An actor may issue durable acks only while its shard-ownership epoch (§3.4) is **confirmed fresh**: it heartbeats an FDB read version roughly every **1 s** and treats its epoch as stale after a **3 s staleness bound** — deliberately below the failure-detection + re-placement time, so a partitioned former owner falls silent before a replacement can be fenced in and serving. While stale, the actor downgrades to **provisional acks**, which the client treats as unacked (kept buffered, resent to the new owner). Every `JournalRecord` carries the epoch it was appended under, so recovery replay discards records from a superseded epoch; §4.1 quantifies the residual window.
 
 **Every gateway bulk write is fenced.** `route_session_diff` sets `strict_authority: true` unconditionally, so a `DiffUplink` without a granted `(lease_id, authority_seq)` is substituted with the never-granted `LeaseId(0)` and rejected by `apply_fenced` before it reaches the journal. Two consequences bind every client of this path, the P2 load rig (`p2-load`) included:
