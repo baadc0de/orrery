@@ -5,6 +5,8 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use futures::{StreamExt, TryStreamExt};
+
 use orrery_protocol::{
     CellId, EntityRekey, Epoch, GridId, JournalRecord, Lsn, PersistId, RecordKind,
 };
@@ -22,6 +24,15 @@ use crate::fence::{
 use crate::journal::{Journal, JournalConfig};
 use crate::lease::{LeaseMigrate, LeaseStore, MemLeaseStore};
 use crate::placement::{RendezvousHasher, RendezvousNode};
+
+/// How many durable checkpoint loads recovery has in flight at once.
+///
+/// The same bound, for the same reason, as `persistd`'s startup fence
+/// pre-read: deep enough that per-read latency stops dominating recovery of a
+/// large shard set, shallow enough that a node owning thousands of shards does
+/// not open thousands of simultaneous store futures while it is also replaying
+/// its journal.
+const CHECKPOINT_LOAD_CONCURRENCY: usize = 32;
 
 pub(crate) const ENTITY_STRIPE_COUNT: usize = 1_024;
 
@@ -272,13 +283,35 @@ impl CellRuntime {
         let mut seeds: HashMap<CellId, RecoveredState> = HashMap::new();
         let mut ckpt_coverage: HashMap<CellId, CheckpointCoverage> = HashMap::new();
         let mut ckpt_epochs: HashMap<CellId, Epoch> = HashMap::new();
-        for &shard in &config.shards {
-            let loaded = checkpoints
-                .load(shard, config.grid)
+        // One durable read per shard, concurrently. It was one sequential
+        // store round trip per shard on the recovery critical path, which is
+        // 128 serialized loads at the deployment docs/11-roadmap.md §P2
+        // describes and grows linearly with the shard set.
+        //
+        // `buffered` preserves input order, so the collect below surfaces the
+        // **first shard in `config.shards` order** that failed rather than
+        // whichever load happened to lose a race — recovery still fails with
+        // one deterministic, reproducible error. Recovery is read-only up to
+        // this point, so a failure here leaves nothing half-built: `open`
+        // returns an error and no actor has been spawned.
+        //
+        // Cancellation-safety (this function's contract) is unchanged: the
+        // in-flight loads are futures owned by this one future, so dropping it
+        // drops them and leaves no detached worker.
+        let loads: Vec<Option<CheckpointData>> =
+            futures::stream::iter(config.shards.iter().copied())
+                .map(|shard| {
+                    let checkpoints = Arc::clone(checkpoints);
+                    async move { checkpoints.load(shard, config.grid).await }
+                })
+                .buffered(CHECKPOINT_LOAD_CONCURRENCY)
+                .try_collect()
                 .await
                 .map_err(|error| {
                     crate::journal::JournalError::Store(format!("checkpoint load: {error}"))
                 })?;
+
+        for (&shard, loaded) in config.shards.iter().zip(loads) {
             if let Some(ckpt) = loaded {
                 ckpt_coverage.insert(shard, CheckpointCoverage::from_watermark(ckpt.watermark));
                 ckpt_epochs.insert(shard, ckpt.epoch);

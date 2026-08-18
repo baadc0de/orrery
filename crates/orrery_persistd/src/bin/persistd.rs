@@ -43,6 +43,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use clap::Parser;
+use futures::{StreamExt, TryStreamExt};
 use glam::IVec3;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
@@ -50,14 +51,15 @@ use tracing_subscriber::EnvFilter;
 
 use orrery_persistd::cluster::{ColdFallbackRouter, Router};
 use orrery_persistd::gateway::SessionTokenV1Authorizer;
+use orrery_persistd::intent::BaselineIntentValidator;
 use orrery_persistd::journal::{
     spawn_chain, spawn_chain_grpc, AdaptiveCommitMode, ChainConfig, GroupCommitConfig, Journal,
 };
 use orrery_persistd::{
     ActivationOutcome, AuthorityMetrics, CellRuntime, CheckpointScheduler,
-    CoordinatorHandoutAuthority, DurableChainId, FenceFreshnessConfig, FenceStore, GatewayConfig,
-    GatewayMetrics, GatewayServer, GatewayServerLatency, GatewayServerLatencySnapshot,
-    GrpcChainTransport, IntentExecutor, IntentValidator, IntentVerdict, JournalConfig,
+    CoordinatorHandoutAuthority, DurableChainId, FenceFreshnessConfig, FenceRow, FenceStore,
+    GatewayConfig, GatewayMetrics, GatewayServer, GatewayServerLatency,
+    GatewayServerLatencySnapshot, GrpcChainTransport, IntentExecutor, JournalConfig,
     MemCheckpointStore, RuntimeConfig, ShardActivation,
 };
 #[cfg(feature = "fdb")]
@@ -66,21 +68,9 @@ use orrery_protocol::metrics::{
     SERIES_GATEWAY_AREA_FIRST_PAGE_SERVER, SERIES_GATEWAY_BULK_SERVER,
     SERIES_GATEWAY_INTENT_SERVER, SERIES_JOURNAL_COMMIT,
 };
-use orrery_protocol::{
-    CellId, Epoch, GridId, IssuerKey, IssuerKeyId, NodeId, REASON_VALIDATION_FAILED,
-};
+use orrery_protocol::{CellId, Epoch, GridId, IssuerKey, IssuerKeyId, NodeId};
 
 type SharedExecutor = Arc<dyn IntentExecutor>;
-
-struct ProductionIntentValidator;
-
-impl IntentValidator for ProductionIntentValidator {
-    fn validate(&self, _intent: &orrery_protocol::Intent) -> IntentVerdict {
-        IntentVerdict::Reject {
-            reason: REASON_VALIDATION_FAILED,
-        }
-    }
-}
 
 /// Command-line configuration for the `persistd` binary.
 #[derive(Debug, Parser)]
@@ -1141,6 +1131,15 @@ async fn run_follower(cli: &Cli, topology: &Topology) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// How many `actor/{shard}` rows the startup pre-read has in flight at once.
+///
+/// Bounded rather than unbounded: a node owning thousands of shards must not
+/// open thousands of simultaneous FDB futures at the one moment it is also
+/// replaying a journal. 32 is deep enough that the round-trip latency of a
+/// local cluster (~0.1–1 ms, docs/08-persistence.md §5) stops dominating
+/// startup and shallow enough to stay a polite client.
+const STARTUP_FENCE_READ_CONCURRENCY: usize = 32;
+
 #[derive(Debug)]
 struct StartupActivation {
     epoch: Epoch,
@@ -1158,10 +1157,31 @@ async fn activate_topology(
     fence: &dyn FenceStore,
     durable: bool,
 ) -> anyhow::Result<StartupActivation> {
+    // The pre-read of every shard's current row, concurrently. It was one
+    // sequential round trip per shard, which at the 128-shard deployment of
+    // docs/11-roadmap.md §P2 is 128 serialized FDB reads on the startup
+    // critical path and grows linearly from there.
+    //
+    // Nothing about the ownership transition moves here. These reads are
+    // side-effect-free, and the transition itself is still the single
+    // all-or-nothing `activate_shards` transaction below (fence/fdb.rs
+    // re-reads the whole compare set inside it, so a row that changed between
+    // this pre-read and the commit is caught there, exactly as before). A
+    // partial failure therefore cannot leave the node half-activated: it
+    // fails here, before any row is written.
+    //
+    // `buffered` preserves input order, so `try_collect` surfaces the first
+    // failing shard in *shard order* rather than whichever read lost a race,
+    // and the role checks below still run in a deterministic order.
+    let rows: Vec<Option<FenceRow>> = futures::stream::iter(topology.shards.iter().copied())
+        .map(|shard| async move { fence.read(GridId::ROOT, shard).await })
+        .buffered(STARTUP_FENCE_READ_CONCURRENCY)
+        .try_collect()
+        .await?;
+
     let mut requests = Vec::with_capacity(topology.shards.len());
     let mut source_epoch = None;
-    for &shard in &topology.shards {
-        let current = fence.read(GridId::ROOT, shard).await?;
+    for (&shard, current) in topology.shards.iter().zip(rows) {
         match topology.role {
             TopologyRole::Promotion { primary, .. } => {
                 let Some(row) = current else {
@@ -1310,7 +1330,14 @@ where
             cli.issuer_key.iter().map(|key| key.0.clone()),
         )),
         interest_authority,
-        validator: Arc::new(ProductionIntentValidator),
+        // The deployed admission filter. Not the library's
+        // `PermissiveValidator` (which admits everything, and is a bring-up
+        // default), and no longer a blanket refusal: it enforces the intent
+        // envelope's shape, the one op this cluster's executor interprets,
+        // and the account binding of a ledger credit. Its doc comment states
+        // exactly what it does not check — every durable invariant, which a
+        // linked `Ruleset` and the FDB transaction still owe.
+        validator: Arc::new(BaselineIntentValidator),
         ..GatewayConfig::default()
     })
 }
@@ -1571,12 +1598,24 @@ fn chain_node_id(node_id: u64) -> orrery_protocol::NodeId {
     iroh::SecretKey::from_bytes(&seed).public()
 }
 
+/// The shard set this process owns, in the canonical order the rest of
+/// startup requires.
+///
+/// The sort is not cosmetic: `fence::validate_activation_set` refuses an
+/// activation whose shards are not *strictly sorted by `CellId` bits*, so a
+/// `--shard` list in any other order dies at durable activation with
+/// "shards must be strictly sorted by CellId bits" — a message about an
+/// internal invariant, produced by a flag order the operator had no reason to
+/// think was significant. Nothing downstream depends on flag order
+/// (`canonical_shard_set` already sorts for the durable chain identity), so
+/// the canonical order is established once, here.
 fn resolve_shards(shards: &[ShardSpec]) -> anyhow::Result<Vec<CellId>> {
-    let shards: Vec<CellId> = if shards.is_empty() {
+    let mut shards: Vec<CellId> = if shards.is_empty() {
         vec![CellId::ROOT]
     } else {
         shards.iter().map(|spec| spec.0).collect()
     };
+    shards.sort_unstable_by_key(|shard| shard.to_bits());
 
     validate_shards(&shards)?;
     Ok(shards)
@@ -1598,19 +1637,46 @@ fn validate_followers(followers: &[ChainFollower], node_id: u64) -> anyhow::Resu
     Ok(())
 }
 
+/// Reject a shard set that is not a partition: no duplicates, and no cell
+/// inside another's subtree.
+///
+/// # Why sorting makes this a neighbour test
+///
+/// The obvious implementation compares every pair, which is 8 128 comparisons
+/// at the 128-shard deployment P2 describes and 8 million at 4 096 — a wall
+/// well before the shard counts a real deployment implies. Sorting by raw
+/// `CellId` bits removes the quadratic factor, and the reason it is *safe* to
+/// only compare neighbours is a property of the encoding, not an assumption:
+///
+/// - A cell's subtree is exactly the contiguous id range
+///   `[id − lsb + 1, id + lsb − 1]`, where `lsb` is the level sentinel bit
+///   (`CellId::subtree_range`). Every such range **contains its own cell's
+///   id** — the sentinel sits in the middle of the range.
+/// - Those ranges form a laminar family: two cells' subtrees are either
+///   nested or disjoint, because the Morton prefix of one is a prefix of the
+///   other or it is not.
+/// - So if `A` contains `B`, then `B`'s id lies in `A`'s range, and *every id
+///   numerically between them* lies in `A`'s range too — every cell sorted
+///   between `A` and `B` therefore also overlaps `A`. An overlapping pair at
+///   distance `k > 1` in sorted order thus implies an overlapping pair at
+///   distance `k − 1`, and by induction one at distance 1.
+///
+/// Comparing adjacent pairs is therefore complete: it cannot miss an overlap.
+/// (Duplicates sort adjacent too, so the same pass names them, with the
+/// message they had before.) `a_full_interest_lattice_of_shards_is_accepted_and_canonical`
+/// and `sorted_overlap_detection_matches_the_all_pairs_definition` hold this
+/// against the all-pairs definition it replaces.
 fn validate_shards(shards: &[CellId]) -> anyhow::Result<()> {
-    let mut seen = std::collections::HashSet::new();
-    for &shard in shards {
-        if !seen.insert(shard) {
-            anyhow::bail!("duplicate --shard {shard}");
-        }
-    }
+    let mut sorted: Vec<CellId> = shards.to_vec();
+    sorted.sort_unstable_by_key(|shard| shard.to_bits());
 
-    for (idx, &left) in shards.iter().enumerate() {
-        for &right in &shards[idx + 1..] {
-            if left.is_prefix_of(right) || right.is_prefix_of(left) {
-                anyhow::bail!("overlapping --shard values: {left} and {right}");
-            }
+    for pair in sorted.windows(2) {
+        let (left, right) = (pair[0], pair[1]);
+        if left == right {
+            anyhow::bail!("duplicate --shard {left}");
+        }
+        if left.is_prefix_of(right) || right.is_prefix_of(left) {
+            anyhow::bail!("overlapping --shard values: {left} and {right}");
         }
     }
 
@@ -1967,6 +2033,142 @@ mod tests {
         );
     }
 
+    /// The all-pairs definition `validate_shards` used to be, kept as the
+    /// oracle the sorted implementation is held against (and as the slow half
+    /// of the scaling measurement below).
+    fn overlaps_all_pairs(shards: &[CellId]) -> bool {
+        for (idx, &left) in shards.iter().enumerate() {
+            for &right in &shards[idx + 1..] {
+                if left == right || left.is_prefix_of(right) || right.is_prefix_of(left) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// A deterministic pseudo-random cell at `level`, spread over the whole
+    /// coordinate range that level admits.
+    fn scattered_cell(seed: u64, level: u8) -> CellId {
+        let mut h = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0xD1B5_4A32_D192_ED03;
+        h ^= h >> 33;
+        h = h.wrapping_mul(0xFF51_AFD7_ED55_8CCD);
+        h ^= h >> 29;
+        let half = 1i64 << (level - 1);
+        let axis = |shift: u32| -> i32 {
+            let v = ((h >> shift) & ((1u64 << level) - 1)) as i64;
+            (v - half) as i32
+        };
+        CellId::from_coords(IVec3::new(axis(0), axis(21), axis(42)), level).expect("in range")
+    }
+
+    /// The sorted neighbour test must accept exactly what the all-pairs
+    /// comparison accepted — no overlap missed, none invented.
+    ///
+    /// The interesting cases are the ones the Morton encoding makes
+    /// non-obvious: a parent whose id sorts *below* its child, a parent whose
+    /// id sorts *above* it, and disjoint cells that sort between an
+    /// overlapping pair. The scattered mixed-level sets below produce all
+    /// three; the two hand-built cases pin the ancestor relation explicitly.
+    #[test]
+    fn sorted_overlap_detection_matches_the_all_pairs_definition() {
+        let mut checked_overlapping = 0_u32;
+        let mut checked_disjoint = 0_u32;
+        for trial in 0..2_000_u64 {
+            // Mixed levels, so ancestors and descendants really do occur.
+            let shards: Vec<CellId> = (0..6)
+                .map(|i| {
+                    let level = 1 + ((trial + i) % 4) as u8;
+                    scattered_cell(trial * 7 + i, level)
+                })
+                .collect();
+            let expected = overlaps_all_pairs(&shards);
+            let actual = validate_shards(&shards).is_err();
+            assert_eq!(
+                expected, actual,
+                "trial {trial} disagreed on {shards:?} (all-pairs says overlapping={expected})"
+            );
+            if expected {
+                checked_overlapping += 1;
+            } else {
+                checked_disjoint += 1;
+            }
+        }
+        // The differential is only evidence if both answers occurred.
+        assert!(checked_overlapping > 0, "no overlapping set was generated");
+        assert!(checked_disjoint > 0, "no disjoint set was generated");
+
+        // A parent and a descendant, with unrelated disjoint cells sorted
+        // between them — the case the neighbour test has to survive.
+        let parent = CellId::from_coords(IVec3::new(0, 0, 0), 2).expect("in range");
+        let child = parent.children()[7];
+        assert!(parent.is_prefix_of(child));
+        let mut nested = vec![child, parent];
+        nested.push(CellId::from_coords(IVec3::new(-2, -2, -2), 2).expect("in range"));
+        nested.push(CellId::from_coords(IVec3::new(1, 1, 1), 2).expect("in range"));
+        assert!(overlaps_all_pairs(&nested));
+        assert!(
+            validate_shards(&nested).is_err(),
+            "a parent and its descendant must be refused however the set is ordered"
+        );
+
+        // The root contains everything, in either sort position.
+        assert!(validate_shards(&[CellId::ROOT, child]).is_err());
+        assert!(validate_shards(&[child, CellId::ROOT]).is_err());
+
+        // And a duplicate is still named as a duplicate, not as an overlap.
+        let err = validate_shards(&[child, child]).expect_err("duplicate must be rejected");
+        assert!(
+            err.to_string().contains("duplicate --shard"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// The complexity change, measured rather than asserted.
+    ///
+    /// `#[ignore]` because a wall-clock ratio is not a sound gate on a shared,
+    /// concurrently-loaded box — the ratio it prints is evidence for a human
+    /// (and for the PR), while
+    /// `sorted_overlap_detection_matches_the_all_pairs_definition` is what
+    /// actually guards the behaviour. Run with:
+    /// `cargo test -p orrery_persistd --bin persistd -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "measurement, not a gate: prints a wall-clock comparison"]
+    fn validate_shards_scaling_measurement() {
+        for count in [128_u64, 1024, 4096] {
+            // A disjoint set (the legal deployment, and the worst case for
+            // both implementations: neither can exit early).
+            let shards: Vec<CellId> = (0..count)
+                .map(|i| {
+                    let x = (i % 16) as i32;
+                    let y = ((i / 16) % 16) as i32;
+                    let z = (i / 256) as i32;
+                    CellId::from_coords(IVec3::new(x, y, z), orrery_protocol::SHARD_LEVEL)
+                        .expect("in range")
+                })
+                .collect();
+            assert_eq!(shards.len() as u64, count);
+            validate_shards(&shards).expect("disjoint set is legal");
+
+            let started = Instant::now();
+            for _ in 0..20 {
+                assert!(!overlaps_all_pairs(&shards));
+            }
+            let all_pairs = started.elapsed() / 20;
+
+            let started = Instant::now();
+            for _ in 0..20 {
+                validate_shards(&shards).expect("disjoint set is legal");
+            }
+            let sorted = started.elapsed() / 20;
+
+            println!(
+                "validate_shards n={count}: all-pairs {:?} vs sorted {:?}",
+                all_pairs, sorted
+            );
+        }
+    }
+
     #[test]
     fn duplicate_chain_followers_are_rejected() {
         let followers = vec![
@@ -2077,6 +2279,185 @@ mod tests {
             .await
             .expect_err("stale former primary must be rejected");
         assert!(err.to_string().contains("owned by node 1"));
+    }
+
+    /// A [`FenceStore`] whose `read` takes measurable time and records how
+    /// many reads were ever in flight at once. Everything else delegates to
+    /// the in-memory store, so the activation itself behaves normally.
+    struct ObservedFenceStore {
+        inner: orrery_persistd::MemFenceStore,
+        read_delay: Duration,
+        in_flight: std::sync::atomic::AtomicUsize,
+        max_in_flight: std::sync::atomic::AtomicUsize,
+        reads: std::sync::atomic::AtomicUsize,
+    }
+
+    impl ObservedFenceStore {
+        fn new(read_delay: Duration) -> Self {
+            Self {
+                inner: orrery_persistd::MemFenceStore::new(),
+                read_delay,
+                in_flight: std::sync::atomic::AtomicUsize::new(0),
+                max_in_flight: std::sync::atomic::AtomicUsize::new(0),
+                reads: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl FenceStore for ObservedFenceStore {
+        async fn read(
+            &self,
+            grid: GridId,
+            shard: CellId,
+        ) -> Result<Option<FenceRow>, orrery_persistd::FenceError> {
+            use std::sync::atomic::Ordering;
+            self.reads.fetch_add(1, Ordering::Relaxed);
+            let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            self.max_in_flight.fetch_max(now, Ordering::SeqCst);
+            tokio::time::sleep(self.read_delay).await;
+            self.in_flight.fetch_sub(1, Ordering::SeqCst);
+            self.inner.read(grid, shard).await
+        }
+
+        async fn fence(
+            &self,
+            grid: GridId,
+            shard: CellId,
+            expected: Option<&orrery_persistd::FenceRow>,
+            new: &orrery_persistd::FenceRow,
+        ) -> Result<orrery_persistd::FenceOutcome, orrery_persistd::FenceError> {
+            self.inner.fence(grid, shard, expected, new).await
+        }
+
+        async fn activate_shards(
+            &self,
+            grid: GridId,
+            owner: u64,
+            shards: &[ShardActivation],
+        ) -> Result<ActivationOutcome, orrery_persistd::FenceError> {
+            self.inner.activate_shards(grid, owner, shards).await
+        }
+
+        async fn begin_split(
+            &self,
+            grid: GridId,
+            parent: CellId,
+            parent_expected: &orrery_persistd::FenceRow,
+            children: &[(CellId, orrery_persistd::FenceRow)],
+        ) -> Result<orrery_persistd::FenceOutcome, orrery_persistd::FenceError> {
+            self.inner
+                .begin_split(grid, parent, parent_expected, children)
+                .await
+        }
+
+        async fn retire(
+            &self,
+            grid: GridId,
+            shard: CellId,
+        ) -> Result<(), orrery_persistd::FenceError> {
+            self.inner.retire(grid, shard).await
+        }
+    }
+
+    fn lattice(count: usize) -> Vec<ShardSpec> {
+        (0..count)
+            .map(|i| {
+                let x = (i % 16) as i32;
+                let y = ((i / 16) % 16) as i32;
+                let z = (i / 256) as i32;
+                ShardSpec(
+                    CellId::from_coords(IVec3::new(x, y, z), orrery_protocol::SHARD_LEVEL)
+                        .expect("in range"),
+                )
+            })
+            .collect()
+    }
+
+    /// Startup must read the shard set's fence rows concurrently.
+    ///
+    /// It read them one at a time, so durable activation cost one full store
+    /// round trip per shard — 128 of them in the deployment P2 describes, and
+    /// linearly more beyond it. The guarded property is *overlap*: with a
+    /// 20 ms read, a sequential pre-read of 64 shards cannot finish in under
+    /// 1.28 s and can never have two reads in flight.
+    ///
+    /// The concurrency observation is the primary assertion because it is not
+    /// a timing threshold; the elapsed bound is a generous backstop (a
+    /// concurrent pre-read is ~40 ms of sleep here) that stays true on a
+    /// loaded box.
+    #[tokio::test]
+    async fn startup_reads_the_shard_set_concurrently() {
+        use std::sync::atomic::Ordering;
+
+        let mut cli = cli(None);
+        cli.node_id = Some(1);
+        cli.shard = lattice(64);
+        let topology = resolve_topology(&cli).expect("single-node topology");
+        assert_eq!(topology.shards.len(), 64);
+
+        let store = ObservedFenceStore::new(Duration::from_millis(20));
+        let started = Instant::now();
+        let activation = activate_topology(&topology, &store, false)
+            .await
+            .expect("cold activation");
+        let elapsed = started.elapsed();
+
+        assert_eq!(activation.epoch.0, 1);
+        assert_eq!(
+            store.reads.load(Ordering::SeqCst),
+            64,
+            "every shard is still pre-read exactly once"
+        );
+        assert!(
+            store.max_in_flight.load(Ordering::SeqCst) > 1,
+            "the pre-read is sequential: never more than one read in flight"
+        );
+        assert!(
+            store.max_in_flight.load(Ordering::SeqCst) <= STARTUP_FENCE_READ_CONCURRENCY,
+            "the pre-read must stay bounded, got {}",
+            store.max_in_flight.load(Ordering::SeqCst)
+        );
+        assert!(
+            elapsed < Duration::from_millis(1_000),
+            "64 sequential 20 ms reads would take 1.28 s; took {elapsed:?}"
+        );
+    }
+
+    /// Concurrency must not cost the deterministic refusal: the shard the
+    /// error names is the first one *in shard order* that is owned elsewhere,
+    /// not whichever read happened to land first.
+    #[tokio::test]
+    async fn a_foreign_owner_is_reported_for_the_first_shard_in_order() {
+        let mut cli = cli(None);
+        cli.node_id = Some(2);
+        cli.shard = lattice(8);
+        let topology = resolve_topology(&cli).expect("single-node topology");
+
+        let store = orrery_persistd::MemFenceStore::new();
+        // Two foreign owners, on the third and sixth shards in order.
+        for (index, owner) in [(2_usize, 7_u64), (5, 9)] {
+            let outcome = store
+                .activate_shards(
+                    GridId::ROOT,
+                    owner,
+                    &[ShardActivation {
+                        shard: topology.shards[index],
+                        expected: None,
+                    }],
+                )
+                .await
+                .expect("seed a foreign row");
+            assert!(matches!(outcome, ActivationOutcome::Activated { .. }));
+        }
+
+        let err = activate_topology(&topology, &store, false)
+            .await
+            .expect_err("a foreign owner must refuse startup");
+        assert!(
+            err.to_string().contains("owned by node 7"),
+            "the first foreign shard in order must be the one reported: {err}"
+        );
     }
 
     #[test]

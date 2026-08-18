@@ -66,7 +66,8 @@ use crate::actor::{FencedApply, Reject};
 use crate::adjudication::AdjudicationExecutor;
 use crate::cluster::{LeaseRenewal, Router};
 use crate::intent::{
-    error_outcome, IntentVerdict, PermissiveValidator, SharedExecutor, SharedValidator,
+    error_outcome, IntentContext, IntentVerdict, PermissiveValidator, SharedExecutor,
+    SharedValidator,
 };
 use crate::lease::registrar_now_ms;
 use crate::payload_crc;
@@ -3325,7 +3326,14 @@ async fn handle_connection(
                 // that commits, so the histogram cannot be flattered by
                 // counting only the cheap exits.
                 let received_at = Instant::now();
-                if let Err(outcome) = admit_intent(&intent, remote, validator.as_ref()) {
+                // The session is what an account-scoped admission check has to
+                // authorize against; an intent submitted before `Hello` is
+                // answered simply carries no account (`IntentContext`).
+                let cx = IntentContext {
+                    issuer: remote,
+                    account: session.as_ref().map(|session| session.account),
+                };
+                if let Err(outcome) = admit_intent(&intent, validator.as_ref(), &cx) {
                     send_intent_reply(
                         send.as_ref(),
                         intent.intent_id,
@@ -3805,10 +3813,15 @@ fn reserve_intent_lane(lane: Arc<Semaphore>) -> Result<OwnedSemaphorePermit, Int
 ///    attestation-excluding preimage. Failed signatures never reach the
 ///    validator.
 /// 2. **Issuer binding** — `intent.issuer` must be the connection's
-///    authenticated `remote` id: a peer may not submit intents in another's
-///    name.
-/// 3. **Admission** — the [`PermissiveValidator`] default admits everything;
-///    a linked `Ruleset` rejects with its own reason code.
+///    authenticated id (`cx.issuer`): a peer may not submit intents in
+///    another's name.
+/// 3. **Admission** — the configured [`crate::intent::IntentValidator`]. The
+///    library default is [`PermissiveValidator`], which admits everything;
+///    the deployed binary runs [`crate::intent::BaselineIntentValidator`], and
+///    a linked `Ruleset` rejects with its own reason code. It is handed the
+///    connection context (`cx`) as well as the intent, because an
+///    account-scoped check has nothing to authorize against otherwise — the
+///    intent itself is entirely peer-authored.
 /// 4. **Execution** — the configured [`IntentExecutor`]'s future must resolve
 ///    before the ack is sent, so a `Committed` outcome implies a durable
 ///    commit (RPO 0). With no executor configured the reply is
@@ -3816,8 +3829,8 @@ fn reserve_intent_lane(lane: Arc<Semaphore>) -> Result<OwnedSemaphorePermit, Int
 ///    happen (the pre-existing stub's inverted RPO-0).
 fn admit_intent(
     intent: &Intent,
-    remote: NodeId,
     validator: &dyn crate::intent::IntentValidator,
+    cx: &IntentContext,
 ) -> Result<(), IntentOutcome> {
     // 1. Signature (docs/08-persistence.md §2.2: signature checks at the
     //    edge, before any transaction work).
@@ -3829,14 +3842,14 @@ fn admit_intent(
 
     // 2. Issuer binding (the connection's authenticated id is the only
     //    identity the gateway can trust).
-    if intent.issuer != remote {
+    if intent.issuer != cx.issuer {
         return Err(IntentOutcome::Rejected {
             reason: REASON_ISSUER_MISMATCH,
         });
     }
 
     // 3. Admission (the Ruleset stub for now).
-    let precheck = match validator.validate(intent) {
+    let precheck = match validator.validate(intent, cx) {
         IntentVerdict::Admit(precheck) => precheck,
         IntentVerdict::Reject { reason } => return Err(IntentOutcome::Rejected { reason }),
     };

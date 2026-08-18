@@ -218,11 +218,29 @@ async fn require_intent_fence(
         epoch: fence.epoch,
         status: FenceStatus::Active,
     };
-    for &shard in &fence.shards {
+    // Issue every row's read **concurrently**, then check them in shard
+    // order.
+    //
+    // This runs inside the intent's own transaction, on the critical path of
+    // a commit D16 budgets at p99 < 10 ms, and the fence covers the node's
+    // whole shard set — 128 rows in the deployment docs/11-roadmap.md §P2
+    // describes. Awaiting each `get` in turn made that 128 *serialized*
+    // round trips per intent, at ~0.1–1 ms each (docs/08-persistence.md §5),
+    // which is the commit budget several times over before any effect is
+    // written. FDB's client is built for exactly this: the reads are
+    // independent, each registers its own conflict range whichever order it
+    // resolves in, and the transaction's snapshot makes the result identical
+    // either way.
+    //
+    // `join_all` keeps the results in shard order, so a superseded node still
+    // fails with the *first* shard it no longer owns rather than whichever
+    // read lost a race — the message is reproducible across retries.
+    let reads = fence.shards.iter().map(|&shard| {
         let key = keyspace::fence_key(grid, shard);
-        let current: Option<FenceRow> = trx
-            .get(&key, false)
-            .await?
+        async move { (shard, trx.get(&key, false).await) }
+    });
+    for (shard, raw) in futures::future::join_all(reads).await {
+        let current: Option<FenceRow> = raw?
             .map(|bytes| postcard::from_bytes(bytes.as_ref()))
             .transpose()
             .map_err(store_err("fence row decode"))?;
