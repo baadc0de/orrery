@@ -24,6 +24,19 @@ on:
 # A new push to a branch makes the in-flight run obsolete. main is exempt: its
 # history is what the determinism corpus bisects against, so every commit there
 # gets a verdict.
+#
+# That verdict is the ONLY thing main's own push run owes. `pull_request` builds
+# and tests `refs/pull/N/merge` — the PR already merged into main — so re-running
+# `clippy`, `static gates` and `workspace tests` after the merge re-tests a tree
+# that has already passed, on the three jobs that are pinned to the self-hosted
+# box. Measured on one main run: 802 s of self-hosted time (clippy 76 s, gates
+# 355 s, tests 371 s) against 228 s of hosted. Those three are therefore
+# `pull_request`-only; `rustfmt` stays everywhere as a cheap tripwire, and the
+# determinism matrix stays because the corpus needs a verdict per main commit.
+#
+# The residual gap is a direct push to main, which now gets rustfmt and
+# determinism but not the heavy trio. Closing it is branch protection's job, not
+# a duplicate CI run's.
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
@@ -70,6 +83,8 @@ jobs:
   # first two layers stays inside one home directory.
   runner:
     name: pick runner
+    # Already proven on the PR's merge commit; see the note by `concurrency`.
+    if: github.event_name != 'push'
     runs-on: ubuntu-latest
     # Every job here declares one. A workflow with no bound falls back to
     # GitHub's six hours, which is not a timeout so much as a way to notice
@@ -116,6 +131,8 @@ jobs:
 
   clippy:
     name: clippy
+    # Already proven on the PR's merge commit; see the note by `concurrency`.
+    if: github.event_name != 'push'
     needs: runner
     runs-on: ${{ fromJSON(needs.runner.outputs.clippy) }}
     # A self-hosted job queues forever if the box is down; fail instead.
@@ -184,6 +201,8 @@ jobs:
 
   gates:
     name: static gates
+    # Already proven on the PR's merge commit; see the note by `concurrency`.
+    if: github.event_name != 'push'
     needs: runner
     runs-on: ${{ fromJSON(needs.runner.outputs.gates) }}
     # A self-hosted job queues forever if the box is down; fail instead.
@@ -232,6 +251,8 @@ jobs:
 
   test:
     name: workspace tests
+    # Already proven on the PR's merge commit; see the note by `concurrency`.
+    if: github.event_name != 'push'
     needs: runner
     runs-on: ${{ fromJSON(needs.runner.outputs.tests) }}
     # A self-hosted job queues forever if the box is down; fail instead.
