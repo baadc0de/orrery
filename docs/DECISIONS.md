@@ -64,4 +64,5 @@ ADR file.
 | [11-roadmap.md](11-roadmap.md) | D17 | Build phases, milestones, risks |
 | [12-world-seeding.md](12-world-seeding.md) | D11 | World seeding, deterministic generation, content diff and patch |
 | [13-chain-replication.md](13-chain-replication.md) | D11, D12 | Cross-process journal mirroring and recovery |
+| [14-capacity.md](14-capacity.md) | D11, D12, D16 | Measured single-box capacity envelope: the knee, what binds first, entities and players |
 | [references.md](references.md) | D1–D17 | Annotated bibliography |

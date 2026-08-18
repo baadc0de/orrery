@@ -845,6 +845,13 @@ Two tiers of defense against the crowd-event failure mode ([FDB issue #11510](ht
 
 ## 13. Scaling math
 
+This table is a *model*, and one box has now been measured against it:
+[14-capacity.md](14-capacity.md) sweeps a single `persistd` + FDB host to
+its knee and finds ~40 k offered records/s, bound not by journal bandwidth
+but by the single FoundationDB client network thread that `apply_fenced`'s
+`LeaseStore::locate` puts one read on per bulk diff — against the
+~150 k appends/s per node this table assumes.
+
 **Shared capacity assumptions** — the sizing basis for the whole backend; [09-services-and-ops.md](09-services-and-ops.md) §11 cites this table rather than restating it (invented for sizing, not ADR-normative):
 
 | Assumption | Value | At 10 k CCU |

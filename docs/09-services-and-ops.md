@@ -234,6 +234,9 @@ metrics" means "restart with `--metrics-jsonl`".
 
 ## 11. Capacity planning: worked example at 10k CCU
 
+For what *one* machine actually does — the demo-sizing question, measured
+rather than modelled — see [14-capacity.md](14-capacity.md).
+
 Assumptions are the shared capacity table in [08-persistence.md](08-persistence.md) §13 (game-dependent; stated so they can be re-derived): 2 authored core entities per player; 4 hot world entities per player → 40k hot entities; 10 diff records/s per player → 100k records/s cluster-wide at ~260 B/record → ~26 MB/s journal ingest; 0.05 intents/s per player → **500 intents/s** average, 10× event peaks; checkpoint dirty set ~40k entities per 20 s window. Ops-local additions: mean island size 20 → ~500 islands; 2% of islands over the mesh ceiling.
 
 | Component | Load at 10k CCU | Provisioning |
