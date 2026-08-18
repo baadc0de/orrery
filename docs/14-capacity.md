@@ -500,3 +500,418 @@ The harness clears and re-seeds the cluster on every point (the P2 path
 consumes its cluster: `activate_shards` bumps `actor/{shard}` epochs), deletes
 the ~1 GB of journal data as soon as the run's numbers are in the JSONL, and
 takes `P2_CAP_LOAD_CPUS` to pin the rig.
+
+## 11. The FoundationDB storage engine: `ssd` versus `memory`, measured
+
+§7 said of `configure single ssd`: *"reads leave RAM and land on this QLC
+RAID1 … FDB commits add fsyncs to the same `md2` array the journal is already
+fsyncing … **Expect the knee to move down, not up.**"* That was reasoning, not
+a measurement, and it was written while **every fenced bulk diff did an FDB
+read** (§5.1). #86 removed that read. This section is the measurement, taken
+2026-08-19 on the same box with the post-#86 binary.
+
+**The answer, in one paragraph.** Two FoundationDB clusters differing only in
+`configure new single {ssd,memory}`, driven by the same `persistd` binary over
+the same points with the arms interleaved, delivered the same throughput to
+within 2 % at every load from 18 k to 143 k records/s, shed 0.003–0.008 % on
+both, and lost no lease on either. Neither arm's knee was reached: the load
+generator ran out first. Where `ssd` *does* cost something is the path that
+still rides FoundationDB — **intents** — and there it buys a 37× worse FDB read
+tail, a 3.5× worse commit tail, 2× the `fdbserver` CPU and one histogram
+bucket of intent latency, without moving the point at which the intent path
+saturates. The prediction was right about its mechanism and wrong about its
+conclusion, for the reason it named itself: it priced an FDB read per diff,
+and there is no longer one.
+
+### 11.1 What was run
+
+| | ssd arm | memory arm |
+|---|---|---|
+| container / port | `orrery-fdb-ssdarm`, 4601 | `orrery-fdb-memarm`, 4602 |
+| configured | `configure new single ssd` | `configure new single memory` |
+| `status json` reports | `storage_engine: ssd-2`, `log_engine: ssd-2` | `storage_engine: memory`, `log_engine: ssd-2` |
+| data dir | its own, on `md2` | its own, on `md2` |
+
+One variable; everything else held: the same `persistd` binary, the same rig,
+the same 10 000-entity `p2demo` world re-seeded per point, the same box.
+`p2-capacity-sweep.sh` records the engine each point actually ran against, read
+back from `status json` into `point.json` — an engine-arm table that infers the
+engine from a directory name is one mislabelled run away from being wrong.
+
+Two things before any number:
+
+* **The `memory` arm is not a "no disk" arm.** Its *storage* engine is in RAM;
+  its transaction log is `ssd-2` and still fsyncs to `md2`. The comparison is
+  storage-engine reads and B-tree writes, not disk versus no disk.
+* **Both arms load the world.** Every point's `orrery-seed verify` checked
+  30 000 rows and the rig took 10 000 leases before writing a diff. A silently
+  empty world is the failure mode that produced a misleading study earlier in
+  this project; here it is checked per point.
+
+Arms are interleaved point by point, and which arm runs first alternates with
+the repeat, because this box's per-flush fsync cost has two regimes that differ
+~2× and switch on a tens-of-seconds scale
+([08-persistence.md](08-persistence.md) §4.3) — blocking the arms would
+attribute a regime to the engine. Every point ran at least twice; tables report
+min–max across repeats.
+
+**Warm-up:** none detectable. The first point ever run on the fresh `ssd`
+cluster delivered 18 363/s; the same configuration ten points later delivered
+18 475–18 477/s, a 0.6 % difference in the direction of *faster*. No point was
+discarded as warm-up.
+
+### 11.2 What "keeps up" means here
+
+Unchanged from §2 and fixed before the sweep ran: `shed_slow_route / admitted
+≤ 1 %`; the durable ack rate still rising when offered load rises;
+`intent_commit_ms` p99 ≤ 100 ms; `leases_lost = 0`. One addition: a point whose
+**delivered** rate falls well short of its nominal setting is reported as a
+measurement of the rig, not of the box.
+
+Which criteria were met, and where: criteria 1, 2 and 4 hold at **every** point
+of the rate leg on **both** arms. Criterion 3 is the one that fails, it fails
+on both arms alike, and §11.7 shows that as published it was measuring
+something else.
+
+### 11.3 The rig quantizes offered load, which decides which points exist
+
+§2's correction concluded that "the rig tops out at about 99.3 k diffs/s on
+this box, whatever the session count". There is a ceiling, but that is not the
+mechanism, and the mechanism decides which operating points are reachable at
+all.
+
+`p2-load` generates an entity's diffs on a **whole number of 50 ms flush
+frames**: `registration_phase_slots` is `ceil(FLUSH_HZ / diff_hz)`,
+`FLUSH_HZ = 20`, and an entity emits once per that many frames. The effective
+per-entity rate is `20 / ceil(20 / diff_hz)`:
+
+| `--diff-hz` | 2 | 4 | 6 | 8 | 12 | 16 | 20 |
+|---|---|---|---|---|---|---|---|
+| effective Hz | 2.00 | 4.00 | 5.00 | 6.67 | 10.0 | 10.0 | 20.0 |
+| ceiling as % of nominal | 100 | 100 | 83.3 | 83.3 | 83.3 | **62.5** | 100 |
+
+Measured delivery follows that row: 92 % at hz 2, 88 % at hz 4, 83 % at
+hz 6/8/12, **62 %** at hz 16, 70 % at hz 20. So the "120 000" and "160 000"
+points of every sweep in this document are the same 10 Hz × 10 000 = 100 000/s
+operating point *by construction*, and hz 16 was never a higher offered load
+than hz 12. This supersedes the reading in §2 that the two coincided because
+the rig ran out of CPU: at those points it ran out of **frames**.
+
+For anyone extending the sweep: with 10 000 entities the reachable delivered
+rates are 10 000 × {2, 2.5, 3.33, 4, 5, 6.67, 10, 20}. Nothing exists between
+100 k and 200 k, and raising `--diff-hz` inside that gap *lowers* delivery.
+
+### 11.4 The rate leg
+
+Sessions provisioned at **2× the rig's own `check_fan_out` capacity**
+(`sessions × 160 ≥ 2 × entities × diff_hz`) at every point; the earlier sweep
+ran six of eight rate points at exactly 1.0×. `margin_x` is 2.00 in every row
+below, so under-delivery here is §11.3's frame quantization, not the fan-out
+cap. 30 s per point, two repeats, arms interleaved, min–max across repeats,
+`--intent-mix` at its 3 % default:
+
+| nominal/s | sessions | arm | delivered/s | durable acks/s | shed % | journal fsync busy | journal wait/ack | persistd cores | fdbserver cores |
+|---|---|---|---|---|---|---|---|---|---|
+| 20 000 | 250 | memory | 18 417–18 421 | 18 416–18 420 | 0.003 | 69–71 % | 5.7–13.2 ms | 1.00 | 0.05 |
+| 20 000 | 250 | **ssd** | 18 475–18 477 | 18 475–18 477 | 0.003 | 19–63 % | 0.9–4.8 ms | 1.02–1.11 | 0.06–0.07 |
+| 40 000 | 500 | memory | 35 067–35 170 | 35 065–35 168 | 0.004 | 64–73 % | 4.3–8.5 ms | 1.55 | 0.06 |
+| 40 000 | 500 | **ssd** | 35 127–35 143 | 35 125–35 142 | 0.003–0.004 | 68–69 % | 4.9–5.2 ms | 1.54–1.56 | 0.08 |
+| 60 000 | 750 | memory | 49 539–49 598 | 49 535–49 594 | 0.007–0.008 | 68–69 % | 6.1–13.1 ms | 2.00–2.13 | 0.06 |
+| 60 000 | 750 | **ssd** | 49 648–49 669 | 49 644–49 665 | 0.008–0.009 | 64–69 % | 5.8–13.2 ms | 2.00–2.09 | 0.09 |
+| 80 000 | 1 000 | memory | 65 170–66 333 | 65 166–66 329 | 0.006–0.007 | 63–76 % | 7.3–43.6 ms | 2.46–2.58 | 0.07 |
+| 80 000 | 1 000 | **ssd** | 66 325–66 332 | 66 320–66 328 | 0.007 | 65–78 % | 8.3–11.7 ms | 2.59–2.61 | 0.10 |
+| 120 000 | 1 500 | memory | 98 539–99 621 | 98 532–99 605 | 0.007 | 71–74 % | 12.6–29.6 ms | 3.44–3.61 | 0.08 |
+| 120 000 | 1 500 | **ssd** | 98 681–99 639 | 98 674–99 632 | 0.007 | 72–75 % | 13.9–25.2 ms | 3.56–3.60 | 0.10 |
+| 160 000 | 2 000 | memory | 99 413–99 721 | 99 339–99 677 | 0.007 | 73–79 % | 12.1–23.1 ms | 3.78–3.90 | 0.08 |
+| 160 000 | 2 000 | **ssd** | 99 090–99 790 | 99 077–99 778 | 0.008 | 70–79 % | 12.8–32.2 ms | 3.76–4.03 | 0.10 |
+| 200 000 | 2 500 | memory | 138 400–140 817 | 137 736–140 111 | 0.008 | 67 % | 46.2–56.2 ms | 4.79–4.82 | 0.08 |
+| 200 000 | 2 500 | **ssd** | 140 483–142 867 | 139 918–142 313 | 0.008 | 66–67 % | 43.0–50.2 ms | 4.81–4.85 | 0.10 |
+
+`leases_lost`, `diff_nacks`, `locate_fallbacks` and `location_mismatches` are
+**0** in all 28 runs, and `mailbox_turns / applies` is exactly 1.0 — the
+post-#86 fast path answered every routing question without FoundationDB on both
+engines.
+
+**No knee on either arm.** Shedding stays three orders of magnitude below its
+1 % threshold at every point, and the durable ack rate is still climbing
+steeply at the last one (138–143 k against 99 k at the point before). Stated
+honestly:
+
+> **ssd: ≥ 142 900 delivered records/s, knee not located.**
+> **memory: ≥ 140 800 delivered records/s, knee not located.**
+> The arms are within 1.5 % of each other, inside this box's run-to-run spread.
+
+### 11.5 What binds, per arm
+
+At the top point (200 000 nominal, 2 500 sessions, ~140 k delivered), every
+candidate with its measurement. Both arms share a row wherever they agree,
+which is nearly everywhere:
+
+| candidate | at ~140 k delivered | binding? |
+|---|---|---|
+| the load generator | `p2-load` at 3.24–3.28 cores, its **single drive-loop thread at 73 % mean / 82 % peak** of one core, delivering 70 % of nominal | **yes — the ceiling that was reached** |
+| `persistd` CPU total | 4.79–4.85 cores of 16 (30 % of the box), spread evenly over 16 tokio workers at ~20 % each | no |
+| journal group-commit thread | 66–67 % of wall inside `sync_data`, 133–154 flushes/s, ~1 000 records per flush against an 8 192 cap | no — closest server-side resource |
+| the NVMe array | 38–41 % `%util`, aqu-sz 3.8–4.6, 73–79 MB/s written, ~220 flush ops/s per member | no |
+| the `libfdb_c` client thread | **12.6–12.9 %** of one core (97–99 % before #86) | no — but see §11.7 |
+| `fdbserver` CPU | memory 0.08 cores, **ssd 0.10 cores** | no |
+| FDB commit / read / conflicts | zero conflicts in every sample on either arm | no |
+| RAM | never a factor on 62 GB | no |
+| the NIC | loopback only (§7) | not exercised |
+
+Three deserve their evidence spelled out.
+
+**The rig is the ceiling, and it is a frame-deadline ceiling rather than a
+starved one.** `p2-load` runs one drive loop that must visit 2 500 sessions
+twenty times a second; per-thread sampling puts that loop thread at 73 % mean,
+82 % peak of one core while the process as a whole uses 3.3 cores. It misses
+50 ms frame deadlines rather than running out of CPU outright — the same
+mechanism as §11.3's quantization, seen from the other side.
+
+**The journal's fsync duty cycle is the closest server-side resource, and it is
+not engine-sensitive.** `sync_data_us_sum / duration` — the fraction of wall
+time the single group-commit thread spends inside `fdatasync` — is 17–19 % at
+18 k, 63–78 % at 66–100 k and 66–67 % at 140 k. It does not rise monotonically,
+because group commit absorbs load by batching: at 140 k the journal writes
+~1 000 records per flush at 134 flushes/s. The device's two regimes move this
+number more than load does — the same arm and point, two repeats, 19 % and 63 %.
+
+**The FDB client thread is no longer a bulk-path candidate on either engine.**
+It peaked at 12.9 % of one core across all 28 rate-leg runs. #86's claim holds
+on `ssd` as well as on `memory` — which is precisely why §7's prediction does
+not.
+
+### 11.6 Device contention between FDB's fsyncs and the journal's
+
+This is the mechanism §7 expected to hurt, and the one genuinely new thing
+`ssd` introduces. It is real, it is measurable, and it is one part in a
+thousand of the write load.
+
+At matched delivered load the arms' device counters overlap: at ~99 k
+delivered, `md2` wrote 74.2–79.2 MB/s on `ssd` against 68.1–76.5 MB/s on
+`memory`, at 300–352 versus 282–334 flush ops/s per NVMe member, `%util`
+49.4–49.9 % versus 49.3–52.6 %. The number a contending fsync stream would
+inflate — the journal's own per-flush `sync_data` cost — is 2.91–3.65 ms on
+`ssd` and 3.06–4.01 ms on `memory` there: each inside the other's spread, and
+both inside the ~2× regime swing this box shows between repeats of one
+configuration.
+
+Sampling FoundationDB's own `status json` every 2 s during 60 s points settles
+why. **FDB writes 78 kB/s** (median; 32–775 kB/s across samples) on the `ssd`
+arm and 77 kB/s (34–201) on `memory`, against the journal's ~70 MB/s. FDB's
+fsyncs do land on the same array, exactly as predicted — and they are 0.1 % of
+what is already there.
+
+### 11.7 `intent_commit_ms`, and where `ssd` does cost something
+
+**The measurement was broken first, in a way that made the engine question
+unanswerable.** `IntentQueue` keeps a settled intent until the client calls
+`retire()`; `p2-load` never did. The queue holds 1024, so after 1024
+submissions `submit` returns `None` for the rest of the run — which is why
+every run in this project reports exactly `intents=1024` whatever its duration,
+rate or `--intent-mix`. At a 3 % mix and 18 000 diffs/s the cap is hit in under
+two seconds: on a 30 s, 1 500-session point, **all 1 024 `intent_commit_ms`
+samples fall in the first 3.7 % of the rig's JSONL stream**, while sessions are
+still connecting. §8's table is a cold gateway answering a burst of 1 024
+simultaneous intents, not intent latency under load. The rig now retires a
+settled intent.
+
+Re-measured with the fixed rig — `--intent-mix` scaled per point to hold the
+intent rate near 200/s while bulk rises (`ia*`), then bulk held while the
+intent rate rises (`ib*`) — 30 s, two repeats, min–max:
+
+| point | bulk delivered/s | intents/s | arm | samples | p50 | p90 | p99 | server p50 | FDB client thread |
+|---|---|---|---|---|---|---|---|---|---|
+| ia20k | 18 465–18 483 | ~203 | memory | 6 083–6 086 | 7–8 ms | 10–40 ms | 150 ms | 5–6 ms | 18.2–18.3 % |
+| ia20k | | | **ssd** | 6 070–6 083 | 6–8 ms | 8–15 ms | 150 ms | 3.5–6 ms | 18.4–19.8 % |
+| ia80k | 66 333 | ~191 | memory | 5 723 | 9 ms | 15 ms | 150 ms | 6–7 ms | 20.8–21.9 % |
+| ia80k | | | **ssd** | 5 723 | 15 ms | 20 ms | 200 ms | 8 ms | 22.8–23.4 % |
+| ia200k | 127 083–129 067 | ~170 | memory | 5 107–5 145 | 20 ms | 50–100 ms | 200–300 ms | 7–8 ms | 20.9–23.1 % |
+| ia200k | | | **ssd** | 5 033–5 077 | 20 ms | 50 ms | 200 ms | 7–8 ms | 23.4–23.7 % |
+| ib40k-hi | 35 100–35 237 | ~1 032 | memory | 30 956–31 067 | 15 ms | 75–100 ms | 200 ms | 10–15 ms | 66.2–68.9 % |
+| ib40k-hi | | | **ssd** | 30 929–31 013 | 20 ms | 100 ms | 300 ms | 20 ms | 73.9–75.1 % |
+| ib40k-xhi | 35 090–35 123 | ~1 300 | memory | 39 287–40 407 | 750 ms | 1.0 s | 1.5 s | 750 ms | **94.3 %** |
+| ib40k-xhi | | | **ssd** | 38 262–38 905 | 750 ms | 1.0 s | 1.5 s | 750 ms | **94.5 %** |
+
+Five thousand to forty thousand samples per run instead of 1 024, spread across
+the whole run. What that buys:
+
+* **p50 is 6–8 ms at the P2 operating point** — at, not far above, D16's 10 ms
+  budget, on both engines. The budget is missed in the **tail**, not the
+  middle. §8 reported 15–20 ms for the same configuration because it was
+  measuring the burst.
+* **The tail is the server's.** Client p99 and the gateway's own
+  receipt-to-reply p99 agree at every point, so the 150–300 ms excursions
+  happen inside `persistd`, not in the rig's queue.
+* **Intent latency is set by the intent rate, not the bulk rate.** Holding
+  ~1 000 intents/s while bulk falls from 35 300 to 18 600 records/s leaves p50
+  unchanged (15 ms memory, 20 ms ssd). Holding bulk and raising intents from
+  200 to 1 300/s moves p50 from 15 ms to 750 ms.
+* **The intent path saturates between ~1 030 and ~1 300 intents/s on both
+  engines** — 50× the latency for 26 % more rate. This, not the bulk path, is
+  the knee this box still has.
+
+**What runs out there is the FoundationDB client's network thread — the same
+single thread as before #86.** Its utilisation against intent rate, both arms,
+bulk held at 35 k: 18–24 % at ~200 intents/s, 66–75 % at ~1 030, and
+**94.3–94.5 %, peaking at 100–101 %, at ~1 300**, which is where p50 becomes
+750 ms. One intent is *one* serializable FDB transaction that reads the
+idempotency row and then re-reads the `actor/{shard}` row of **every shard this
+node activated** — 128 of them, concurrently (`IntentFence`, `intent/fdb.rs`) —
+before it writes. At 1 300 intents/s that is ~170 000 FDB operations per second
+on one thread. #86 took the bulk path off that thread and left the intent path
+on it: §5.1's conclusion has not been repealed, it has been relocated.
+
+FoundationDB the *server* is not the limit there: commit latency never exceeded
+27.9 ms (`ssd`) or 8.0 ms (`memory`), read latency 3.72/0.10 ms, GRV
+3.82/0.86 ms, **conflicts exactly zero** in every sample on both arms, and
+`fdbserver` at 0.86/0.42 cores.
+
+**What `ssd` costs, from FDB's own side.** Same 60 s points, `status json`
+every 2 s, min/median/max over the samples in which that arm was under test:
+
+| | ssd | memory |
+|---|---|---|
+| commit latency | 0.85 / 3.39 / **27.92** ms | 1.98 / 3.37 / **8.03** ms |
+| read latency | 0.01 / 0.02 / **3.72** ms | 0.01 / 0.01 / **0.10** ms |
+| GRV latency | 0.06 / 0.45 / 3.82 ms | 0.06 / 0.11 / 0.86 ms |
+| bytes written | 32 / 78 / 775 kB/s | 34 / 77 / 201 kB/s |
+| conflicts | 0 | 0 |
+| `fdbserver` CPU | 0.02–0.81 cores | 0.22–0.42 cores |
+
+The **medians are identical**. The entire cost of `ssd` is in the tail — a 37×
+worse read tail and a 3.5× worse commit tail, for 2× the CPU — which is what a
+QLC B-tree read on a page-cache miss looks like. It reaches intent latency as
+one histogram bucket (p50 15→20 ms, p90 75–100→100–150 ms, p99 200→300 ms at
+~1 030 intents/s) and it does **not** move the saturation point, because the
+client thread runs out before FoundationDB does.
+
+### 11.8 Checkpoints: a smear, not a pulse
+
+The 20 s checkpoint writes the world to FoundationDB, so on `ssd` it is real
+disk I/O beside the journal's. Finding it needs runs longer than a 30 s point,
+which contains barely one wave: 120 s points, both arms, twice, intent rate
+held at ~50/s so FDB commits are dominated by checkpoint work, with FDB's
+`status json` sampled every 2 s alongside.
+
+**There is no 20 s signature on either arm in anything measured.**
+Autocorrelation of the FDB write rate at lag 20 s is 0.03 (`ssd`) and 0.04
+(`memory`); of `persistd`'s per-second journal fsync cost, −0.04 and 0.00; of
+the per-second journal-wait excursion, −0.03. The FDB write rate is flat at
+42–65 kB/s (`ssd`) and 34–61 kB/s (`memory`), at 50–66 commits/s.
+
+That is the design working rather than an absence of checkpoints:
+`spawn_checkpoint_scheduler` jitters each shard's period over
+`[interval − jitter, interval + jitter]` = **[15 s, 25 s]**, seeded from the
+shard id, so 128 shards checkpoint at 128 different phases. The aggregate is
+deliberately smooth — and at ~50 kB/s against the journal's ~70 MB/s it could
+not be seen in tail latency even if it were pulsed.
+
+One caution for anyone repeating this. Both 120 s runs of the *first* repeat
+show a ~16 s window, starting ~20 s in, where per-flush fsync cost drops from
+~2.5–3.5 ms to ~0.48 ms — on **both** arms, and not at the same offset in the
+second repeat. It is the device's two regimes
+([08-persistence.md](08-persistence.md) §4.3). A single 120 s run would have
+read it as a periodic signature.
+### 11.9 The concurrency leg
+
+The rate at 2 Hz, sessions raised alone, as in §3.2 — but run *after* the rig
+fix, so the 3 % default mix now means ~545 intents/s rather than 1 024 intents
+in the first second. That makes this leg a joint bulk+intent load, and it is
+not comparable to §3.2's numbers; it is comparable across arms, which is what
+it is here for. One repeat per point, 30 s:
+
+| sessions | arm | delivered/s | shed % | intents | intent p50 | persistd cores | rig cores | FDB client thread |
+|---|---|---|---|---|---|---|---|---|
+| 500 | memory | 18 550 | 0.004 | 16 358 | 15 ms | 1.50 | 0.59 | 36.0 % |
+| 500 | **ssd** | 18 583 | 0.005 | 16 400 | 15 ms | 1.58 | 0.61 | 40.5 % |
+| 1 000 | memory | 18 592 | 0.006 | 16 396 | 15 ms | 1.60 | 0.77 | 38.1 % |
+| 1 000 | **ssd** | 18 610 | 0.005 | 16 420 | 15 ms | 1.65 | 0.75 | 41.2 % |
+| 2 000 | memory | 18 683 | 0.006 | 16 467 | 20 ms | 1.74 | 1.09 | 38.6 % |
+| 2 000 | **ssd** | 18 673 | 0.014 | 16 459 | 30 ms | 1.72 | 1.02 | 41.1 % |
+| 3 000 | memory | 18 630 | 0.015 | 16 415 | 30 ms | 1.80 | 1.37 | 36.9 % |
+| 3 000 | **ssd** | 18 687 | 0.027 | 16 473 | 40 ms | 1.76 | 1.28 | 39.6 % |
+
+Six-fold the connections and the delivered rate does not move (18.55–18.69 k),
+`leases_lost` stays 0, and shedding rises from 0.004 % to 0.027 % — still 37×
+below its threshold. What connection count costs is CPU on both sides: 0.30
+cores of `persistd` and 0.78 cores of rig between 500 and 3 000 sessions. The
+`ssd` arm's intent p50 is one bucket above `memory`'s at 2 000 and 3 000
+sessions, consistent with §11.7 and with nothing else in this leg.
+
+### 11.10 Which engine should a demo run, and why
+
+**Run `ssd`.** §7 already required it for durability — the `memory` engine
+loses anything its transaction log cannot replay — and this section removes the
+capacity objection that made that requirement uncomfortable. At the P2
+operating point the engines are indistinguishable on the bulk path; what `ssd`
+costs is 0.1 of one core of `fdbserver` CPU, one histogram bucket of intent
+tail, and a read tail that only matters if you are running the intent path near
+its saturation point. There is no throughput reason to prefer `memory`, and
+there is a durability reason not to.
+
+Two operator notes specific to `ssd`:
+
+* Its data directory is real disk on the same array as the journal. It is
+  small — FDB wrote at most 0.8 MB/s in any sample here against the journal's
+  ~70 MB/s — and it grows with the size of the world, not with the diff rate.
+* `fdbserver` CPU is the number that moves: budget ~2× the `memory` arm's, and
+  watch it against **intent** rate, not diff rate.
+
+And one that applies to both engines, from §11.7: the operator check in §9 —
+"FDB client thread utilisation > 60 % of one core" — is still the right check
+and still trips first, but on this build it is driven by intents. At ~1 000
+intents/s it reads 66–75 %; at ~1 300 it reads 94 % and intent p50 is 750 ms.
+Divide by ~13 to convert intents/s into "% of that thread" on a 128-shard node.
+
+### 11.11 Reproducing
+
+```bash
+# two throwaway clusters, one per engine, on their own ports and data dirs
+for arm in ssd memory; do
+  port=$([ "$arm" = ssd ] && echo 4601 || echo 4602)
+  docker run -d --name orrery-fdb-$arm --network host \
+    -e FDB_PORT=$port -e FDB_NETWORKING_MODE=host -e FDB_COORDINATOR_PORT=$port \
+    -e FDB_CLUSTER_FILE_CONTENTS="$arm:$arm@127.0.0.1:$port" \
+    -v /some/dir-$arm:/var/fdb/data foundationdb/foundationdb:7.3.63
+  docker exec orrery-fdb-$arm fdbcli --exec "configure new single $arm"
+  fdbcli -C /some/$arm.cluster --exec 'status minimal'    # must say available
+done
+
+cargo build --release -p orrery_persistd --features fdb -p orrery_seed --features orrery_seed/fdb
+(cd p2-load && cargo build --release)
+
+export P2_CAP_OUT=$PWD/sweep PERSISTD_BIN=target/release/persistd
+export ORRERY_SEED_BIN=target/release/orrery-seed P2_LOAD_BIN=p2-load/target/release/p2-load
+export SSD_CLUSTER_FILE=/some/ssd.cluster MEM_CLUSTER_FILE=/some/memory.cluster
+export SSD_FDB_CONTAINER=orrery-fdb-ssd MEM_FDB_CONTAINER=orrery-fdb-memory
+
+# rate leg: two repeats, arms interleaved, sessions at 2x the fan-out cap
+scripts/fenced-ssd-driver.sh 2 r20k:250:2 r40k:500:4 r60k:750:6 r80k:1000:8 \
+                               r120k:1500:12 r160k:2000:16 r200k:2500:20
+# intent leg: the fifth field is --intent-mix (P2_CAP_INTENT_MIX)
+scripts/fenced-ssd-driver.sh 2 ib40k-hi:500:4:30:trade=0.02,craft=0.01
+# checkpoint leg: 120 s, so a shard checkpoints five times inside one run
+scripts/fenced-ssd-driver.sh 2 k40k:500:4:120:trade=0.001,craft=0.0005
+
+python3 scripts/fenced-sweep-report.py sweep/*/     # delivered, never nominal
+```
+
+`fenced-ssd-driver.sh` alternates which arm runs first on even repeats;
+`fenced-sweep-report.py` folds whatever arm names the directories carry, warns
+when a point delivered under 95 % of nominal, and prints `delivered_per_s`
+beside `rig_cap_per_s` so a rig-limited row cannot be read as a box result.
+
+**Instrumentation used here that the harness does not do for you:** the
+per-thread `pidstat` for `p2-load` (the harness samples `persistd`'s threads
+only), and `fdbcli --exec 'status json'` sampled every 2 s for FDB's own commit
+and read latency, conflict rate and write volume. Both are two-line additions
+around a run; §11.5 through §11.8 rest on them.
+
+**One warning if you re-run the rate leg on a current rig.** Its numbers were
+taken with the pre-fix `p2-load`, whose intent queue capped a run at 1 024
+intents; the intent load in those rows is therefore negligible. On the fixed
+rig the same 3 % default mix at 140 k diffs/s asks for ~4 000 intents/s, which
+is three times the intent path's saturation point (§11.7) and turns a bulk
+sweep into an intent sweep. Set `P2_CAP_INTENT_MIX` low when what you want is
+the bulk path.
