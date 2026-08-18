@@ -299,7 +299,7 @@ mod tests {
                     count: 1
                 },
                 JournalCommitSample {
-                    value_us: 3_000,
+                    value_us: 2_500,
                     count: 1
                 },
                 JournalCommitSample {

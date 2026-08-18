@@ -511,9 +511,24 @@ silently, leaving you on the 50 GiB default while your config claims otherwise.
 local stores look after themselves.
 
 The shared remote does not: `kache gc` evicts the local stores only, so a
-filesystem remote grows without bound. `kache-prune-shared.timer` drops objects
-untouched for 21 days. Deleting them is always safe — they are content-addressed
-and immutable, so a pruned object is a cache miss and nothing worse.
+filesystem remote grows without bound. `kache-prune-shared.timer` holds it under
+a size cap (80 GiB, hourly) by evicting least-recently-read objects. Deleting
+them is always safe — they are content-addressed and immutable, so a pruned
+object is a cache miss and nothing worse.
+
+**Size, not age**, and the first version got this wrong. An age policy cannot
+fire on a cache that is being read continuously: the remote reached 319 GiB in a
+single day with **zero** objects untouched for even 24 hours, because every
+build re-reads the whole hot set. The disk hit 94% before anyone noticed.
+
+**`kache gc` leaks blobs.** Measured 2026-08-18 on kache 0.14.2: after a gc that
+evicted all 456 entries, `kache stats` reported `Store: 0 B (0 entries)` while
+`~/.cache/kache/store/blobs` still held **37 GB**. The index row goes, the
+content-addressed blob stays. Both local stores were 10x their accounted size.
+Until that is fixed upstream, treat the reported store size as a lower bound and
+check the directory: reclaiming is just stopping `kache@<user>`, deleting
+`~/.cache/kache`, and starting it again — the local store is a cache and refills
+from the shared remote.
 
 The default ACL is the part worth understanding: it makes every new object
 group-writable **regardless of the writing process's umask**. Without it a

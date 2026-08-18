@@ -5488,7 +5488,10 @@ mod tests {
                 (
                     SERIES_GATEWAY_SEND_BUFFER,
                     vec![GatewayBulkSample {
-                        value_us: 5_000,
+                        // 4 096 B lands in (4 000, 4 500] since the lattice
+                        // gained 500 µs steps through the bulk-ack band; it
+                        // used to round all the way up to 5 000.
+                        value_us: 4_500,
                         count: 1
                     }]
                 ),
