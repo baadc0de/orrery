@@ -42,7 +42,7 @@ use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use iroh::{Endpoint, EndpointAddr, RelayMode};
@@ -1431,6 +1431,124 @@ impl GatewayReportMetrics {
     }
 }
 
+/// Server-side transport-boundary series: the two spans that sit *outside*
+/// [`SERIES_GATEWAY_BULK_SERVER`]'s receipt-through-send-call measurement.
+///
+/// # Why these exist
+///
+/// A P2 evidence run put `client_bulk_wire_ms` p99 at 2104 ms against a
+/// `gateway_bulk_server_ms` p99 of 150 ms. Both numbers are honest and they
+/// describe the same round trip, so roughly 1 950 ms of it was in neither —
+/// it sat between the rig's socket write and the instant the gateway's own
+/// span *starts*, or between the gateway's send call and the reply reaching
+/// the rig. Those are different subsystems, and a report that cannot name
+/// which one owns the gap sends the reader to guess.
+///
+/// The gateway's measured span begins at `received_at`, stamped in the
+/// connection's receive loop after a message has been taken off the inbound
+/// queue and decoded. Between the endpoint driver handing a datagram to
+/// [`spawn_datagram_reader`] and that stamp there is one unbounded queue and
+/// one serialized loop, and until now nothing measured either. That is what
+/// [`SERIES_GATEWAY_INGRESS_QUEUE`] is.
+///
+/// # Why the names are spelled here and not in `orrery_protocol::metrics`
+///
+/// They belong beside `UNGATED_SERIES`, next to `gateway_bulk_server_ms`,
+/// for exactly the reason that array's doc comment gives: one definition
+/// shared by the producer and the consumer. They are declared here only
+/// because `orrery_protocol` is frozen to another lane. The consumer half is
+/// `orrery_persist_client::latency::GATEWAY_BOUNDARY_SERIES`, whose doc
+/// comment carries the same note.
+///
+/// The guard against the two spellings drifting is not a unit test — neither
+/// crate can see the other, so any test either could write would compare a
+/// literal to itself. It is the gate: `p2-dashboard` folds by series name and
+/// reports anything it does not recognize under `unknown_series_names`, and
+/// `scripts/p2-kill9-gate.sh` fails the run when that list is non-empty. A
+/// typo here does not silently vanish; it fails P2.
+///
+/// # None of them is gated
+///
+/// D16 sets no target for any of them, and they carry the `gateway_*_ms`
+/// shape the P2 harness refuses to see gated. They are attribution.
+///
+/// Endpoint-driver dequeue of an inbound datagram through the instant the
+/// connection's receive loop picks that message up — the gateway's own
+/// ingress backlog, upstream of every span it already measures.
+pub const SERIES_GATEWAY_INGRESS_QUEUE: &str = "gateway_ingress_queue_ms";
+
+/// A reply being handed to the transport through the instant the transport's
+/// send call returns: the gateway's hand-off cost, and nothing after it.
+///
+/// `quinn::Connection::send_datagram` enqueues into the endpoint driver's
+/// datagram buffer and returns; it does not wait for the packet to leave the
+/// NIC. So this span closes the *near* half of the egress boundary and
+/// [`SERIES_GATEWAY_SEND_BUFFER`] observes the far half.
+pub const SERIES_GATEWAY_REPLY_HANDOFF: &str = "gateway_reply_handoff_ms";
+
+/// Bytes resident in the connection's outbound QUIC datagram buffer at the
+/// moment a reply has just been handed to it — **bytes, not microseconds**,
+/// recorded on the shared bucket lattice because its range (50 B … 1 MiB) is
+/// the range that lattice covers.
+///
+/// This is the measurement that decides the endpoint-driver question. A QUIC
+/// datagram send can sit in the driver's queue without that ever appearing in
+/// the path RTT, because the RTT estimate is computed from ACK timing on
+/// packets that *did* go out. If that queue is where the missing round-trip
+/// time lives, this gauge is non-zero; if it reads zero at p99, the driver
+/// accepted and drained every datagram immediately and the time is elsewhere.
+/// Asserting either without this number is guessing.
+pub const SERIES_GATEWAY_SEND_BUFFER: &str = "gateway_send_buffer_bytes";
+
+/// The three transport-boundary series, in canonical report order.
+pub const GATEWAY_BOUNDARY_SERIES: [&str; 3] = [
+    SERIES_GATEWAY_INGRESS_QUEUE,
+    SERIES_GATEWAY_REPLY_HANDOFF,
+    SERIES_GATEWAY_SEND_BUFFER,
+];
+
+/// The transport-boundary histograms, sharing the D16 bucket lattice with
+/// every other gateway span so a percentile means the same thing across them.
+#[derive(Debug, Default)]
+pub struct GatewayBoundaryMetrics {
+    /// [`SERIES_GATEWAY_INGRESS_QUEUE`].
+    pub ingress_queue: GatewayServerLatency,
+    /// [`SERIES_GATEWAY_REPLY_HANDOFF`].
+    pub reply_handoff: GatewayServerLatency,
+    /// [`SERIES_GATEWAY_SEND_BUFFER`], in bytes.
+    pub send_buffer: GatewayServerLatency,
+}
+
+impl GatewayBoundaryMetrics {
+    /// Record one inbound message's wait between transport dequeue and the
+    /// receive loop picking it up.
+    pub fn record_ingress(&self, micros: u64) {
+        self.ingress_queue.record(micros);
+    }
+
+    /// Record one reply hand-off: `micros` on the send call, and the datagram
+    /// buffer occupancy observed straight after it.
+    pub fn record_reply(&self, micros: u64, buffered_bytes: u64) {
+        self.reply_handoff.record(micros);
+        self.send_buffer.record(buffered_bytes);
+    }
+
+    /// The three histograms paired with their series names, in report order.
+    ///
+    /// A slice rather than three accessors so a reporter drains them in a
+    /// loop: the one that matters lives in `persistd`'s binary, which this
+    /// lane may not edit, and a caller-side loop is what makes wiring it up a
+    /// single added line rather than three.
+    #[must_use]
+    pub fn series(&self) -> [(&'static str, &GatewayServerLatency); 3] {
+        [
+            (SERIES_GATEWAY_INGRESS_QUEUE, &self.ingress_queue),
+            (SERIES_GATEWAY_REPLY_HANDOFF, &self.reply_handoff),
+            (SERIES_GATEWAY_SEND_BUFFER, &self.send_buffer),
+        ]
+    }
+}
+
 /// Every always-on server-side gateway counter, in one shareable handle.
 ///
 /// Collection is unconditional — the precedent is [`AuthorityMetrics`], and
@@ -1453,6 +1571,8 @@ pub struct GatewayMetrics {
     pub area: GatewayAreaMetrics,
     /// Discrepancy-report outcome and refusal split.
     pub report: GatewayReportMetrics,
+    /// Transport-boundary spans that bracket [`GatewayBulkMetrics`]'s own.
+    pub boundary: GatewayBoundaryMetrics,
 }
 
 /// The current single-node policy: its ownership is always fresh.
@@ -2591,6 +2711,7 @@ impl GatewayServer {
         let report_limiter = Arc::new(ReportLimiter::new());
         let (shutdown, rx) = oneshot::channel();
         let send_failures = Arc::new(AtomicU64::new(0));
+        spawn_boundary_reporter(Arc::clone(&metrics));
         let join = tokio::spawn(accept_loop(
             endpoint.clone(),
             router,
@@ -2673,6 +2794,87 @@ impl GatewayServer {
         self.endpoint.close().await;
         let _ = self.join.await;
     }
+}
+
+/// Environment variable naming a JSONL file the transport-boundary series are
+/// appended to. Unset — the default — collects the histograms in memory and
+/// writes nothing, exactly as every other gateway counter behaves without
+/// `--metrics-jsonl`.
+///
+/// # This is a bridge, and it should not survive
+///
+/// The right home for this is `persistd`'s own reporter loop, beside
+/// `write_gateway_server_latency`, which already takes a series name and a
+/// [`GatewayServerLatency`] and would need one added call over
+/// [`GatewayBoundaryMetrics::series`] — see
+/// `crates/orrery_persistd/src/bin/persistd.rs:345` (the function) and its
+/// call sites in the reporter loop. That file is frozen to another lane while
+/// this measurement is being taken, and a boundary you cannot read is a
+/// boundary you cannot attribute, so the histograms get their own opt-in sink
+/// here instead. When `bin/` is writable, move the drain into the reporter,
+/// delete this and its environment variable, and nothing else changes: the
+/// records emitted are byte-for-byte the `sample_batch` contract
+/// `p2-dashboard` already parses.
+pub const BOUNDARY_JSONL_ENV: &str = "ORRERY_GATEWAY_BOUNDARY_JSONL";
+
+/// How often the boundary sink drains. Short enough that a run terminated
+/// between ticks loses a quarter second of samples, long enough that the
+/// drain itself is not the thing being measured.
+const BOUNDARY_REPORT_INTERVAL: Duration = Duration::from_millis(250);
+
+/// Append the transport-boundary histograms to [`BOUNDARY_JSONL_ENV`]'s file
+/// on a fixed interval, as `sample_batch` records.
+///
+/// A no-op when the variable is unset or the file cannot be opened: telemetry
+/// never takes a gateway down, and the counters keep accumulating either way.
+fn spawn_boundary_reporter(metrics: Arc<GatewayMetrics>) {
+    let Ok(path) = std::env::var(BOUNDARY_JSONL_ENV) else {
+        return;
+    };
+    let file = match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        Ok(file) => file,
+        Err(e) => {
+            warn!(
+                ?e,
+                path, "gateway: boundary metrics sink could not be opened"
+            );
+            return;
+        }
+    };
+    tokio::spawn(async move {
+        use std::io::Write as _;
+        let mut file = file;
+        let mut cursors: [GatewayServerLatencySnapshot; GATEWAY_BOUNDARY_SERIES.len()] =
+            std::array::from_fn(|_| GatewayServerLatencySnapshot::default());
+        loop {
+            tokio::time::sleep(BOUNDARY_REPORT_INTERVAL).await;
+            let mut out = String::new();
+            for ((series, latency), cursor) in metrics
+                .boundary
+                .series()
+                .into_iter()
+                .zip(cursors.iter_mut())
+            {
+                for sample in latency.delta(cursor) {
+                    out.push_str(&format!(
+                        "{{\"type\":\"sample_batch\",\"series\":\"{}\",\"value_us\":{},\"count\":{}}}\n",
+                        series, sample.value_us, sample.count
+                    ));
+                }
+            }
+            if out.is_empty() {
+                continue;
+            }
+            if let Err(e) = file.write_all(out.as_bytes()).and_then(|()| file.flush()) {
+                warn!(?e, "gateway: boundary metrics sink write failed");
+                return;
+            }
+        }
+    });
 }
 
 /// Accept client connections forever, spawning one handler task per connection,
@@ -2798,8 +3000,26 @@ async fn handle_connection(
     // from the moment it runs, and the client's own admission read would
     // otherwise be racing it.
     let reliable = reliable::spawn(Arc::clone(&conn), remote, Arc::clone(&send_failures));
-    let (inbound_tx, mut inbound_rx) = tokio::sync::mpsc::unbounded_channel::<Bytes>();
-    reliable::spawn_receiver(Arc::clone(&conn), remote, inbound_tx.clone());
+    // Every inbound message carries the instant the transport handed it over,
+    // so the receive loop can measure its own backlog (D16 attribution;
+    // `SERIES_GATEWAY_INGRESS_QUEUE`).
+    let (inbound_tx, mut inbound_rx) = tokio::sync::mpsc::unbounded_channel::<(Bytes, Instant)>();
+    // The reliable receiver writes plain `Bytes` and lives outside this file,
+    // so its stamp is taken by a one-hop forwarder here instead. Control
+    // traffic is not the bulk path and the extra hop costs it nothing that
+    // matters; the bulk lane is stamped at `read_datagram` itself, below.
+    let (reliable_tx, mut reliable_rx) = tokio::sync::mpsc::unbounded_channel::<Bytes>();
+    reliable::spawn_receiver(Arc::clone(&conn), remote, reliable_tx);
+    {
+        let inbound_tx = inbound_tx.clone();
+        tokio::spawn(async move {
+            while let Some(pkt) = reliable_rx.recv().await {
+                if inbound_tx.send((pkt, Instant::now())).is_err() {
+                    return;
+                }
+            }
+        });
+    }
     spawn_datagram_reader(Arc::clone(&conn), remote, inbound_tx);
 
     // One `send` for every reply path, routing on the tag the payload already
@@ -2811,13 +3031,33 @@ async fn handle_connection(
         let conn = Arc::clone(&conn);
         let reliable = reliable.clone();
         let send_failures = Arc::clone(&send_failures);
+        let metrics = Arc::clone(&metrics);
+        // Read once, here, while the connection's datagram buffer is still
+        // empty: `datagram_send_buffer_space` reports the space *left*, and
+        // the configured size is not otherwise observable. Sampling it after
+        // the first send would build the baseline out of an already-occupied
+        // buffer and understate every later occupancy.
+        let datagram_buffer_capacity =
+            u64::try_from(conn.datagram_send_buffer_space()).unwrap_or(u64::MAX);
         Arc::new(move |bytes: Bytes| {
             if matches!(untag(&bytes), Some((Channel::Control, _))) {
                 reliable.send(reliable::Lane::Control, bytes);
                 return;
             }
             let len = bytes.len();
-            if let Err(e) = conn.send_datagram(bytes) {
+            // The hand-off boundary, measured on both halves: how long the
+            // transport took to accept the datagram, and how much is already
+            // queued in the endpoint driver behind it. `send_datagram`
+            // returns as soon as the driver has buffered the payload, so the
+            // occupancy — not the call — is what says whether the driver is
+            // where a reply waits.
+            let handed_at = Instant::now();
+            let outcome = conn.send_datagram(bytes);
+            let handoff_us = elapsed_us(handed_at);
+            let buffered = datagram_buffer_capacity
+                .saturating_sub(u64::try_from(conn.datagram_send_buffer_space()).unwrap_or(0));
+            metrics.boundary.record_reply(handoff_us, buffered);
+            if let Err(e) = outcome {
                 // Never swallow a failed send: an oversize payload or a torn
                 // connection is counted and logged, not silently dropped.
                 send_failures.fetch_add(1, Ordering::Relaxed);
@@ -2840,10 +3080,16 @@ async fn handle_connection(
     // not care which lane a message arrived on. The channel closes when both
     // feeder tasks have ended, which is how a torn connection ends this loop.
     loop {
-        let Some(pkt) = inbound_rx.recv().await else {
+        let Some((pkt, transport_at)) = inbound_rx.recv().await else {
             debug!(%remote, "gateway: connection closed");
             break;
         };
+        // Recorded before the decode and before any per-variant stamp, so it
+        // is exactly the wait this loop imposed and contains none of the work
+        // the loop then does. Every inbound message contributes, including
+        // the ones that are refused: a backlog is not caused only by the
+        // messages that survive it.
+        metrics.boundary.record_ingress(elapsed_us(transport_at));
         let Some((channel, _)) = untag(&pkt) else {
             continue;
         };
@@ -3965,13 +4211,17 @@ fn send_intent_reply(
 fn spawn_datagram_reader(
     conn: Arc<iroh::endpoint::Connection>,
     remote: NodeId,
-    sink: tokio::sync::mpsc::UnboundedSender<Bytes>,
+    sink: tokio::sync::mpsc::UnboundedSender<(Bytes, Instant)>,
 ) {
     tokio::spawn(async move {
         loop {
             match conn.read_datagram().await {
                 Ok(pkt) => {
-                    if sink.send(pkt).is_err() {
+                    // Stamped here, the instant the endpoint driver gave the
+                    // datagram up: everything between this and the receive
+                    // loop's own `received_at` is gateway ingress backlog,
+                    // and it used to be invisible at both ends of the wire.
+                    if sink.send((pkt, Instant::now())).is_err() {
                         return;
                     }
                 }
@@ -4862,6 +5112,68 @@ mod tests {
         assert!(
             !bucket.take(1_000),
             "refill does not exceed sustained D16 rate"
+        );
+    }
+
+    /// The transport-boundary histograms must land on the same bucket lattice
+    /// every other D16 series uses, record into the series they name, and
+    /// drain once — a cursor that re-emitted would double the ingress tail in
+    /// the artifact and make the gateway look slower every 250 ms.
+    #[test]
+    fn boundary_metrics_land_in_their_own_series_and_drain_exactly_once() {
+        let metrics = GatewayBoundaryMetrics::default();
+        // 3 ms of ingress backlog, a 120 µs hand-off, 4 096 bytes already in
+        // the driver's datagram buffer behind it.
+        metrics.record_ingress(3_000);
+        metrics.record_reply(120, 4_096);
+
+        let mut cursors: [GatewayServerLatencySnapshot; GATEWAY_BOUNDARY_SERIES.len()] =
+            std::array::from_fn(|_| GatewayServerLatencySnapshot::default());
+        let drained: Vec<(&str, Vec<GatewayBulkSample>)> = metrics
+            .series()
+            .into_iter()
+            .zip(cursors.iter_mut())
+            .map(|((series, latency), cursor)| (series, latency.delta(cursor)))
+            .collect();
+
+        assert_eq!(
+            drained,
+            vec![
+                (
+                    SERIES_GATEWAY_INGRESS_QUEUE,
+                    vec![GatewayBulkSample {
+                        value_us: 3_000,
+                        count: 1
+                    }]
+                ),
+                (
+                    SERIES_GATEWAY_REPLY_HANDOFF,
+                    vec![GatewayBulkSample {
+                        value_us: 200,
+                        count: 1
+                    }]
+                ),
+                (
+                    SERIES_GATEWAY_SEND_BUFFER,
+                    vec![GatewayBulkSample {
+                        value_us: 5_000,
+                        count: 1
+                    }]
+                ),
+            ],
+            "each measurement belongs to exactly one series, at its bucket's \
+             upper bound on the shared lattice"
+        );
+
+        let second: Vec<Vec<GatewayBulkSample>> = metrics
+            .series()
+            .into_iter()
+            .zip(cursors.iter_mut())
+            .map(|((_, latency), cursor)| latency.delta(cursor))
+            .collect();
+        assert!(
+            second.iter().all(Vec::is_empty),
+            "a drained sample must not be emitted again by the next tick"
         );
     }
 

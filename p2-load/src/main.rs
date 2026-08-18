@@ -856,6 +856,20 @@ fn drain_bulk_series(sink: &telemetry::TelemetrySink, schedulers: &[UplinkSchedu
     );
 }
 
+/// Combine every link's send-buffer occupancy into one population.
+///
+/// Drained beside the bulk series rather than with the RTT gauge: it is the
+/// far half of the same `client_bulk_send_ms` boundary those series bracket,
+/// and reading it against a different slice of the run would compare a queue
+/// depth to a latency that is not the one it caused.
+fn aggregate_send_buffer(links: &[GatewayLink]) -> LatencyHistogram {
+    let mut combined = LatencyHistogram::new();
+    for link in links {
+        combined.merge(&link.send_buffer_histogram());
+    }
+    combined
+}
+
 /// Every *distinct* durable ack must have produced a `bulk_ack_ms` sample.
 ///
 /// Two exclusions, both deliberate:
@@ -946,6 +960,23 @@ struct GatewayLink {
     /// The outbound control stream, opened on the first control message.
     control: tokio::sync::Mutex<Option<iroh::endpoint::SendStream>>,
     inbound: tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<(Bytes, Instant)>>,
+    /// Bytes already queued in the endpoint driver's outbound datagram buffer
+    /// at the moment a diff was handed to it (`client_send_buffer_bytes`).
+    ///
+    /// `send_datagram` returns once the driver has *buffered* the payload, so
+    /// `client_bulk_send_ms` ends before the packet exists on the wire, and
+    /// the QUIC RTT — computed from ACKs on packets that already went out —
+    /// cannot see the wait either. Anything queued here lands in
+    /// `client_bulk_wire_ms` and in no other series, which is precisely the
+    /// signature of an unattributed round-trip gap. Measuring it is what
+    /// turns "the endpoint driver might be queueing" into a number.
+    send_buffer: std::sync::Mutex<LatencyHistogram>,
+    /// The buffer's configured size, read once while it is still empty:
+    /// `datagram_send_buffer_space` reports the space *left* and quinn does
+    /// not expose the capacity. Sampling this after a send would build the
+    /// baseline from an already-occupied buffer and understate every
+    /// occupancy that follows.
+    send_buffer_capacity: u64,
 }
 
 impl GatewayLink {
@@ -992,11 +1023,15 @@ impl GatewayLink {
                 });
             }
         });
+        let send_buffer_capacity =
+            u64::try_from(conn.datagram_send_buffer_space()).unwrap_or(u64::MAX);
         Self {
             conn,
             datagrams_read,
             control: tokio::sync::Mutex::new(None),
             inbound: tokio::sync::Mutex::new(rx),
+            send_buffer: std::sync::Mutex::new(LatencyHistogram::new()),
+            send_buffer_capacity,
         }
     }
 
@@ -1051,9 +1086,27 @@ impl GatewayLink {
 
     /// Send a bulk-state message on the datagram lane.
     fn send_state(&self, msg: &GatewayMsg) {
-        if let Err(e) = self.conn.send_datagram(Bytes::from(encode_datagram(msg))) {
+        let outcome = self.conn.send_datagram(Bytes::from(encode_datagram(msg)));
+        // Sampled immediately after the hand-off, so it includes this
+        // datagram: the question is how much the driver is holding when a
+        // diff joins the queue, not how much it holds between sends.
+        let occupancy = self
+            .send_buffer_capacity
+            .saturating_sub(u64::try_from(self.conn.datagram_send_buffer_space()).unwrap_or(0));
+        if let Ok(mut hist) = self.send_buffer.lock() {
+            hist.record_units(occupancy);
+        }
+        if let Err(e) = outcome {
             tracing::warn!(error = %e, "gateway datagram send failed");
         }
+    }
+
+    /// A copy of this link's send-buffer occupancy histogram, for the drain.
+    fn send_buffer_histogram(&self) -> LatencyHistogram {
+        self.send_buffer
+            .lock()
+            .map(|hist| hist.clone())
+            .unwrap_or_default()
     }
 
     /// QUIC's current smoothed round-trip estimate for this connection.
@@ -2056,6 +2109,10 @@ impl Rig<'_> {
             // telemetry module's tests.
             if self.emit_json {
                 drain_bulk_series(&sink, &schedulers);
+                sink.drain_histogram(
+                    telemetry::SERIES_CLIENT_SEND_BUFFER,
+                    &aggregate_send_buffer(&self.sessions),
+                );
                 sink.drain_histogram(telemetry::SERIES_CLIENT_QUIC_RTT, &quic_rtt);
                 sink.drain_histogram(telemetry::SERIES_INTENT_COMMIT, intents.intent_latency());
             }
@@ -2114,6 +2171,10 @@ impl Rig<'_> {
 
         if self.emit_json {
             drain_bulk_series(&sink, &schedulers);
+            sink.drain_histogram(
+                telemetry::SERIES_CLIENT_SEND_BUFFER,
+                &aggregate_send_buffer(&self.sessions),
+            );
             sink.drain_histogram(telemetry::SERIES_CLIENT_QUIC_RTT, &quic_rtt);
             sink.drain_histogram(telemetry::SERIES_INTENT_COMMIT, intents.intent_latency());
         }

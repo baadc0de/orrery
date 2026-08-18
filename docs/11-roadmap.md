@@ -95,6 +95,79 @@ The harness runs the shipping plugins; only the socket is stood in for, by an in
 
 **Demo criterion.** With 10k entities across 100+ cells under synthetic load: `kill -9` the entire cluster, restart it, and the world resumes — zero acked intents lost (RPO 0), bulk loss bounded by the journal/replication window, clients (netsplit posture, D12) having queued intents and continued simulating. Measured against D16 targets in-region: journal commit < 2 ms server-internal, client-observed bulk ack p99 < 5 ms, intent commit p99 < 10 ms, area first page-in < 50 ms.
 
+**The bulk-ack tail is the gateway's own inbound queue, and it is now measured
+(2026-08-18).** The P2 report had a hole in it: `client_bulk_wire_ms` p99 read
+2 104 ms while `gateway_bulk_server_ms` p99 read 150 ms, and roughly 1 950 ms of
+the same round trip was in neither number. An earlier lane had already ruled
+out the rig (flush-selection to socket write 0.05/0.10/1.50 ms) and the path
+(QUIC's own smoothed RTT 0.2/3.0/7.0 ms), which left two candidate subsystems
+the report could not tell apart: the gap sat either between the rig's socket
+write and the *start* of the gateway's measured span, or between the gateway's
+send call and the reply reaching the rig.
+
+Both boundaries are now instrumented from both sides, so the two spans meet.
+The gateway stamps every inbound message the instant the endpoint driver hands
+it over (`gateway_ingress_queue_ms`: transport dequeue → the connection receive
+loop picking it up, which is where `gateway_bulk_server_ms` begins), times the
+hand-off of every reply (`gateway_reply_handoff_ms`), and samples how much is
+resident in the connection's outbound QUIC datagram buffer behind that reply
+(`gateway_send_buffer_bytes`). The rig samples the symmetric egress gauge
+(`client_send_buffer_bytes`); its ingress half was already covered by
+`client_bulk_dispatch_ms`, which is stamped in the reader task.
+
+Measured on the full kill-9 gate — 128 shards, 125 sessions, 10 000 entities at
+2 Hz for 30 s, 540 944 durable acks, on a box also building for a sibling lane:
+
+| series | n | p50 | p99 | max |
+|---|---|---|---|---|
+| `client_bulk_wire_ms` | 540 944 | 5 ms | **2 047.5 ms** | 2 047.5 ms |
+| `gateway_ingress_queue_ms` | 551 878 | 0.05 ms | **2 045.2 ms** | 2 045.2 ms |
+| `gateway_bulk_server_ms` | 532 032 | 1.75 ms | 30 ms | 2 022 ms |
+| `gateway_reply_handoff_ms` | 539 208 | 0.05 ms | 0.5 ms | 3 ms |
+| `gateway_send_buffer_bytes` | 539 208 | 50 B | 1 000 B | 1 500 B |
+| `client_send_buffer_bytes` | 540 944 | 200 B | 1 000 B | 1 000 B |
+
+**The gateway owns the gap, on its ingress side.** The client-observed wire p99
+and the gateway's own ingress-queue p99 agree to within 2 ms across half a
+million samples: essentially all of the round trip the server span did not
+account for was spent sitting in the per-connection inbound queue, after
+`read_datagram` returned and before the receive loop reached the message.
+`handle_connection` feeds both lanes into one unbounded channel and drains it
+in one serialized loop that awaits a bulk-route permit inline, so a connection
+whose in-flight bound is saturated stops reading its own queue while the
+endpoint driver keeps filling it.
+
+**The endpoint-driver hypothesis is ruled out, not argued away.** A QUIC
+datagram send can queue inside the driver without ever appearing in the path
+RTT, which made it the obvious alternative explanation. It is not what this is:
+the outbound datagram buffer never held more than 1.5 KB at either end — one or
+two datagrams — and the hand-off call itself is a 0.5 ms p99. Nothing is
+waiting to be sent at either end; the wait is entirely on the gateway's read
+side.
+
+**The verdict table now states its own containment relation.** `bulk_ack_ms` is
+by construction a journal commit plus routing plus the wire, and
+`intent_commit_ms` contains a durable commit too, so neither can pass while
+`journal_commit_ms` fails — yet the report listed all three as independent
+`FAIL`s, which invites three debugging passes for one cause. `p2-dashboard`
+now classifies each failure as a **root** (nothing it contains is also failing)
+or a **consequence**, and names the roots first. On this run: three failing
+series, one root cause, `journal_commit_ms`. No threshold moved, no series was
+suppressed or downgraded, and every failing series still fails — the exit code
+is byte-for-byte what it was, guarded by `containment_changes_no_verdict`.
+
+**Both boundary sets are attribution only.** None of the new series carries a
+D16 threshold, and the harness now refuses to let *any* `gateway_*` name be
+gated, where it previously only checked the `gateway_*_server_ms` shape.
+
+**Not yet closed.** The ingress queue is measured, not bounded — the fix (a
+bounded inbound queue, or moving the bulk permit wait off the receive loop so a
+saturated connection stops accepting rather than silently buffering) is
+`handle_connection`'s, and is not in this change. `journal_commit_ms` was also
+moving under a concurrent lane during this run (p99 10 ms here against 100 ms
+on the clean-box baseline), so its absolute value is not a number to tune
+against; the attribution above does not depend on it.
+
 **Open defects blocking the demo criterion.** Found 2026-08-13 by tracing the seeder's read/write path through the landed code; each was read at the cited location, not inferred. Full detail, consequences and acceptance-gate mapping in [12-world-seeding.md](12-world-seeding.md) §2.
 
 | # | Location | Defect |

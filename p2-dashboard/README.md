@@ -20,13 +20,25 @@ or to the wire without re-running. D16 sets no target for it, so it is folded
 and reported with `"gate": "not_gated"` and never contributes to the verdict —
 present or absent.
 
-Five more, `client_bulk_{queue,send,wire,dispatch}_ms` and
-`client_quic_rtt_ms`, are the client side of the same attribution: the rig's
+Three more, `gateway_ingress_queue_ms`, `gateway_reply_handoff_ms` and
+`gateway_send_buffer_bytes`, bracket that span at the transport boundary:
+`gateway_bulk_server_ms` starts when the connection's receive loop picks a
+message up, and the queue between the endpoint driver handing the datagram over
+and that instant is where the 2026-08-18 gate run found essentially all of the
+round trip neither end could account for.
+
+Six more, `client_bulk_{queue,send,wire,dispatch}_ms`,
+`client_quic_rtt_ms` and `client_send_buffer_bytes`, are the client side of the
+same attribution: the rig's
 own scheduler wait, its send path, the socket-write-to-reply span, its ack
 handling, and QUIC's own path RTT. `bulk_ack_ms` is `send + wire` exactly, so
 the five say which side of the socket a bulk-ack tail is on. Ungated, for the
 same reason and with the same consequence: present or absent, they never
-change the verdict. Their names live in `orrery_persist_client::latency`
+change the verdict. `client_send_buffer_bytes` and
+`gateway_send_buffer_bytes` are **bytes**, not microseconds — they share the µs
+bucket lattice because 50 B … 1 MiB is the range it covers, and the report
+carries a `unit` per series so nothing reads a byte count as a latency. Their
+names live in `orrery_persist_client::latency`
 rather than `orrery_protocol::metrics` only because that crate was frozen when
 they were added; `CLIENT_UNGATED_SERIES` documents the move.
 
@@ -58,11 +70,31 @@ object per line:
   materialized into a `Vec` and sorted, on either side of the wire).
 - `{"type":"run_footer","note":"..."}` — end-of-run marker; counted, not gated.
 
-Per series the report carries `n`, `p50_us`, `p99_us`, `max_us`, the threshold
-it was gated against (`null` for an ungated series), and a per-series verdict
-(`pass` / `fail` / `missing_data` / `not_gated`). A **gated** series with no
-samples fails the gate — the D16 demo criterion requires all four measured,
-and an empty series cannot pass by omission.
+Per series the report carries `n`, `p50_us`, `p99_us`, `max_us`, its `unit`,
+the threshold it was gated against (`null` for an ungated series), and a
+per-series verdict (`pass` / `fail` / `missing_data` / `not_gated`). A **gated**
+series with no samples fails the gate — the D16 demo criterion requires all
+four measured, and an empty series cannot pass by omission.
+
+### The gated series are nested, and the report says so
+
+`bulk_ack_ms` is by construction a journal commit plus routing plus the wire,
+and `intent_commit_ms` contains a durable commit too. So neither can pass while
+`journal_commit_ms` fails — and a report that lists all three as independent
+`FAIL`s invites three debugging passes for one cause.
+
+Each failing series is therefore classified: a **root** when nothing it
+contains is also failing (its excess is its own), a **consequence** when
+something it contains is failing. `contains` names the inner series,
+`failure_role` carries the classification, and the report's `root_causes` lists
+the roots in order — what to look at first. The human output prints the same
+thing under the table.
+
+This is presentation, and only presentation. No threshold moves, no series is
+suppressed or downgraded, a failing consequence still reads `"gate": "fail"`,
+and `--gate` exits exactly as it did before — `containment_changes_no_verdict`
+is the guard on that. A dependent that fails over a *healthy* inner span is its
+own root, because then the excess really is its own.
 
 A `sample` or `sample_batch` record naming a series outside the contract above
 is counted in the report's `unknown_series` field, and the distinct names are

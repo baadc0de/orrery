@@ -109,7 +109,28 @@ rig ever emits and none of which D16 gates:
 | `gateway_intent_server_ms`         | persistd — `SubmitIntent` receipt → reply send call             |
 | `gateway_area_first_page_server_ms`| persistd — `Subscribe` receipt → first `AreaPage` send call     |
 
-The rig emits five more, all ungated, which decompose `bulk_ack_ms` from the
+persistd appends three more that bracket the spans above — the *transport
+boundary*, which those spans by construction cannot see. `gateway_bulk_server_ms`
+starts when the connection's receive loop picks a message up; between the
+endpoint driver handing that datagram over and that instant there is one queue,
+and until 2026-08-18 nothing measured it. It turned out to hold essentially all
+of the round trip neither end could account for (2.05 s at p99 against a 30 ms
+server span, docs/11-roadmap.md §P2), so it is now part of the artifact:
+
+| series                      | source                                                       |
+|-----------------------------|--------------------------------------------------------------|
+| `gateway_ingress_queue_ms`  | persistd — transport dequeue → receive loop picks it up       |
+| `gateway_reply_handoff_ms`  | persistd — reply handed to the transport → send call returns  |
+| `gateway_send_buffer_bytes` | persistd — **bytes** queued in the outbound datagram buffer   |
+
+These three do not ride `--metrics-jsonl`: that reporter lives in persistd's
+binary, which was frozen to another lane when they were added, so the gateway
+writes them to the path in `ORRERY_GATEWAY_BOUNDARY_JSONL` instead. The records
+are the same `sample_batch` contract and `scripts/p2-kill9-gate.sh` merges them
+into the same stream; when the drain moves into persistd's own reporter the
+variable and the extra files go away and nothing else changes.
+
+The rig emits six more, all ungated, which decompose `bulk_ack_ms` from the
 *client* side. `gateway_bulk_server_ms` answers "how much of the round trip
 was the server"; these answer "and where is the rest":
 
@@ -120,6 +141,7 @@ was the server"; these answer "and where is the rest":
 | `client_bulk_wire_ms`     | the socket write → the reply's arrival instant              |
 | `client_bulk_dispatch_ms` | the reply's arrival → the handler that consumed it          |
 | `client_quic_rtt_ms`      | QUIC's own smoothed path RTT, sampled per session at 4 Hz   |
+| `client_send_buffer_bytes`| **bytes** queued in this process's outbound datagram buffer |
 
 `bulk_ack_ms` is `send + wire`, exactly: its clock starts where the flush
 selects a diff, not where the diff was queued. So `client_bulk_queue_ms` — the
@@ -134,6 +156,18 @@ which.
 sampled rather than derived — it is the closest available proxy for path time,
 not a ground truth, because an endpoint driver scheduled late inflates its own
 estimate too.
+
+`client_send_buffer_bytes` and `gateway_send_buffer_bytes` are **bytes**, not
+microseconds, and they share the µs bucket lattice only because 50 B … 1 MiB is
+the range it covers — `p2-dashboard` prints their unit in its own column.
+They exist for one question. `send_datagram` returns as soon as the endpoint
+driver has *buffered* a payload, so `client_bulk_send_ms` ends before the
+packet is on the wire, and the RTT gauge — computed from ACKs on packets that
+already left — cannot see the wait either. A datagram queued in that driver
+would therefore land in `client_bulk_wire_ms` and in no other series, which is
+exactly the shape of an unattributed gap. Measured at both ends on the
+2026-08-18 gate run, the buffer never held more than 1.5 KB, which is how that
+hypothesis was ruled out rather than argued about.
 
 Each server span is the server-side half of the gated round trip above it, and each has
 its **own name on purpose**. `p2-dashboard` folds by series name into one

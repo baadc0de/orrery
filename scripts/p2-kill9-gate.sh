@@ -182,6 +182,16 @@ mkdir -p "$out" "$out/primary-data" "$out/follower-data"
 : >"$out/follower-metrics.jsonl"
 : >"$out/promoted-metrics.jsonl"
 : >"$out/zombie-metrics.jsonl"
+# The gateway's transport-boundary spans (`gateway_ingress_queue_ms`,
+# `gateway_reply_handoff_ms`, `gateway_send_buffer_bytes`) do not ride
+# `--metrics-jsonl`: that reporter lives in persistd's binary, which was frozen
+# to another lane when the boundary was instrumented, so the gateway writes
+# them to its own sink instead (`ORRERY_GATEWAY_BOUNDARY_JSONL`). The records
+# are the same `sample_batch` contract, and they are merged into the same
+# telemetry stream below. When the drain moves into persistd's reporter, delete
+# these two files, the two env assignments and the two merge entries.
+: >"$out/primary-boundary.jsonl"
+: >"$out/promoted-boundary.jsonl"
 
 # Use explicit, non-overlapping ports to make logs and a failed rerun easy to
 # diagnose.  The defaults are only for a dedicated local P2 runner.
@@ -296,6 +306,7 @@ start_follower() {
   follower_chain=$(json_field "$out/follower.json" chain_addr)
 }
 start_primary() {
+  ORRERY_GATEWAY_BOUNDARY_JSONL="$out/primary-boundary.jsonl" \
   "$PERSISTD_BIN" --node-id 1 --chain-epoch 1 --chain-follower "2@$follower_chain" \
     "${shard_flags[@]}" \
     --bind "127.0.0.1:$gateway_port" --dir "$out/primary-data" \
@@ -342,6 +353,7 @@ start_promoted_follower() {
   # promotion: the promoted instance adopts the same on-disk mirror.
   kill -TERM "$follower_pid"; wait "$follower_pid" || true; follower_pid=''
   prove_epoch_fork_refused
+  ORRERY_GATEWAY_BOUNDARY_JSONL="$out/promoted-boundary.jsonl" \
   "$PERSISTD_BIN" --node-id 2 --chain-epoch 2 --chain-primary 1 --promote-from 1 \
     "${shard_flags[@]}" \
     --chain-listen "127.0.0.1:$chain_port" --bind "127.0.0.1:$gateway_port" \
@@ -487,7 +499,8 @@ zombie_pid=''
 grep -Eqi 'fence|owner|activation|epoch' "$out/zombie.stderr" || die 'zombie failed, but not with recognizable fence admission evidence'
 
 # Keep all raw telemetry, then gate the merged evidence in one invocation.
-cat "$out/load-before.jsonl" "$out/primary-metrics.jsonl" "$out/promoted-metrics.jsonl" >"$out/telemetry.jsonl"
+cat "$out/load-before.jsonl" "$out/primary-metrics.jsonl" "$out/promoted-metrics.jsonl" \
+    "$out/primary-boundary.jsonl" "$out/promoted-boundary.jsonl" >"$out/telemetry.jsonl"
 "$P2_DASHBOARD_BIN" --gate --json "$out/telemetry.jsonl" >"$out/latency-report.json"
 
 python3 - "$out/artifact.json" "$out/recovery-verification.json" "$out/latency-report.json" "$recovery_cutoff" <<'PY'
@@ -510,7 +523,12 @@ if l.get('unknown_series', 0):
 def server_side_spans_never_gate(series):
     gated = {'journal_commit_ms', 'bulk_ack_ms', 'intent_commit_ms', 'area_first_page_ms'}
     for name, summary in series.items():
-        server_span = name.startswith('gateway_') and name.endswith('_server_ms')
+        # Every `gateway_*` name, not only the `_server_ms` ones: the
+        # transport-boundary spans (`gateway_ingress_queue_ms`,
+        # `gateway_reply_handoff_ms`, `gateway_send_buffer_bytes`) are
+        # server-internal for exactly the same reason and would corrupt a
+        # gated histogram in exactly the same way.
+        server_span = name.startswith('gateway_')
         if server_span and (name in gated or summary.get('gate') != 'not_gated'):
             raise SystemExit(f'server-internal span {name} is being gated')
         if name in gated and summary.get('gate') == 'not_gated':
