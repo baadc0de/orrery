@@ -64,7 +64,8 @@ After the applicable ADRs, use this expansion reading path:
 | 12 | [docs/11-roadmap.md](docs/11-roadmap.md) | Build phases (P0–P6), milestones, tracked risks |
 | 13 | [docs/12-world-seeding.md](docs/12-world-seeding.md) | World seeder: TOML scenario runner, generator bank, content diff/patch (expands 08 §17) |
 | 14 | [docs/13-chain-replication.md](docs/13-chain-replication.md) | Cross-process journal mirroring, reconnect, and recovery |
-| 15 | [docs/references.md](docs/references.md) | Annotated bibliography, organized by topic |
+| 15 | [docs/14-capacity.md](docs/14-capacity.md) | Measured single-box capacity envelope: the knee, what binds, and when you have outgrown one box |
+| 16 | [docs/references.md](docs/references.md) | Annotated bibliography, organized by topic |
 
 Also read [README.md](README.md) — it summarizes the architecture, the status,
 and the feature set.

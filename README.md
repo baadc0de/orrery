@@ -83,7 +83,8 @@ graph LR
 | 13 | [docs/11-roadmap.md](docs/11-roadmap.md) | Build phases, milestones, tracked risks |
 | 14 | [docs/12-world-seeding.md](docs/12-world-seeding.md) | World seeder: TOML scenario runner, generator bank, content diff/patch |
 | 15 | [docs/13-chain-replication.md](docs/13-chain-replication.md) | Cross-process journal mirroring, durable chain identity, ordered batches, reconnect and recovery |
-| 16 | [docs/references.md](docs/references.md) | Annotated bibliography, organized by topic |
+| 16 | [docs/14-capacity.md](docs/14-capacity.md) | Measured single-box capacity envelope, binding constraints, and outgrown-when thresholds |
+| 17 | [docs/references.md](docs/references.md) | Annotated bibliography, organized by topic |
 
 ## Acknowledgments
 
