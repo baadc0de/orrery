@@ -16,6 +16,16 @@ network thread inside `persistd`, because every fenced bulk diff does an FDB
 read. Fifteen of the box's sixteen threads, the NVMe array, the NIC, FDB's own
 server process and RAM are all still idle at that point.
 
+> **That answer is this document's original one and describes the pre-#86
+> binary; §3–§8 are all measurements of it and are kept as such.** #86 took
+> FoundationDB off the fenced bulk path
+> ([08-persistence.md](08-persistence.md) §2.1.3), and §11 re-measures the box
+> on both FDB storage engines afterwards. The short answer for the current
+> build: **the bulk path has no located knee below ~143 000 delivered
+> records/s on either engine**, and the one thread still binds — but it is
+> reached through *intents* now, at about 1 300 intents/s, not through bulk
+> diffs.
+
 ## 1. The box, and what was on it
 
 | | |
@@ -450,6 +460,14 @@ actor's own in-memory lease index (it already tracks the cell) and re-measure.
 
 Operator-checkable, in the order they trip:
 
+> **Still current after #86, with one substitution (§11.7).** Check 1 is the
+> right check and still trips first — but on the current build that thread is
+> driven by **intents**, not by bulk diffs: it reads 66–75 % of one core at
+> ~1 000 intents/s and 94 % at ~1 300, where intent p50 becomes 750 ms. The
+> bulk numbers in check 1's cell ("at 40 % you are at the knee") describe the
+> pre-#86 binary. Check 4's threshold is unchanged and is now measurable:
+> `p2-load` no longer stops submitting intents after 1 024 of them.
+
 | # | Check | Threshold | Where |
 |---|---|---|---|
 | 1 | FDB client thread utilisation | **> 60 % of one core** | `pidstat -t -p $(pgrep -f 'persistd.*--fdb-cluster-file')`, or `top -H`: the busiest thread, named `persistd`, that is not the main thread. Absent on a node with no `--fdb-cluster-file`. At 40 % you are at the knee; at 75 % you are at peak throughput and shedding 10 %; at 95 % you are collapsing. |
@@ -649,7 +667,7 @@ which is nearly everywhere:
 
 | candidate | at ~140 k delivered | binding? |
 |---|---|---|
-| the load generator | `p2-load` at 3.24–3.28 cores, its **single drive-loop thread at 73 % mean / 82 % peak** of one core, delivering 70 % of nominal | **yes — the ceiling that was reached** |
+| the load generator | `p2-load` at 3.0–3.3 cores, its **single drive-loop thread at 74–76 % mean, 79–80 % peak** of one core, delivering 63–71 % of nominal | **yes — the ceiling that was reached** |
 | `persistd` CPU total | 4.79–4.85 cores of 16 (30 % of the box), spread evenly over 16 tokio workers at ~20 % each | no |
 | journal group-commit thread | 66–67 % of wall inside `sync_data`, 133–154 flushes/s, ~1 000 records per flush against an 8 192 cap | no — closest server-side resource |
 | the NVMe array | 38–41 % `%util`, aqu-sz 3.8–4.6, 73–79 MB/s written, ~220 flush ops/s per member | no |
@@ -663,10 +681,14 @@ Three deserve their evidence spelled out.
 
 **The rig is the ceiling, and it is a frame-deadline ceiling rather than a
 starved one.** `p2-load` runs one drive loop that must visit 2 500 sessions
-twenty times a second; per-thread sampling puts that loop thread at 73 % mean,
-82 % peak of one core while the process as a whole uses 3.3 cores. It misses
-50 ms frame deadlines rather than running out of CPU outright — the same
-mechanism as §11.3's quantization, seen from the other side.
+twenty times a second; per-thread sampling — which the harness does for
+`persistd` but not for the rig — puts that loop thread at **74.4 % mean, 79 %
+peak** of one core while the process as a whole uses 3.19 cores and delivers
+125 942/s. Re-running the identical point with the rig **pinned to 8 of the 16
+threads** delivered 127 817/s — 1.5 % *more*, with the loop thread at 76 % —
+so the rig is not short of CPU. It is short of time inside a 50 ms frame,
+which is §11.3's quantization seen from the other side, and no amount of extra
+cores fixes it.
 
 **The journal's fsync duty cycle is the closest server-side resource, and it is
 not engine-sensitive.** `sync_data_us_sum / duration` — the fraction of wall
