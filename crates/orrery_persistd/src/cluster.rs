@@ -860,16 +860,28 @@ impl Router for CellRuntime {
         // atomic load, so the reads happen with every gate free. Sampling the
         // mark strictly before the locate it guards is what makes that proof
         // hold.
-        let mut marks = Vec::with_capacity(renew.len());
-        let mut routes = Vec::with_capacity(renew.len());
-        for entry in renew {
-            marks.push(self.entity_migration_mark(grid, entry.entity));
-            routes.push(
-                self.lease_location(entry.entity)
+        // Concurrently, not one after another. Phase 1 is `renew.len()`
+        // independent reads with no gate held, and a peer's heartbeat batch
+        // is as wide as the set of entities it holds — 77 entries was 77
+        // serial FoundationDB round trips, ~38 ms at the P2 operating point,
+        // for work that shares nothing. The mark is still sampled strictly
+        // before the read it guards: `try_join_all` polls each future up to
+        // its first await before moving on, and the sample is before that
+        // await, so concurrency cannot reorder a sample past its own read.
+        // Nothing is memoised and phase 2's under-the-gate re-check is
+        // unchanged, so the proof is the one that was already here.
+        let (marks, routes): (Vec<u64>, Vec<CellId>) =
+            futures::future::try_join_all(renew.iter().map(|entry| async move {
+                let mark = self.entity_migration_mark(grid, entry.entity);
+                let route = self
+                    .lease_location(entry.entity)
                     .await?
-                    .unwrap_or(entry.cell),
-            );
-        }
+                    .unwrap_or(entry.cell);
+                Ok::<_, Reject>((mark, route))
+            }))
+            .await?
+            .into_iter()
+            .unzip();
         let shards = self.shard_cells();
         let mut rows = vec![None; renew.len()];
         // Entries whose stripe saw a migration land between their locate and
@@ -1256,20 +1268,36 @@ impl Router for tokio::sync::Mutex<CellRuntime> {
         // held, then take each actor group's gates around its mailbox turn
         // only, with the stripe migration counter standing in for the
         // atomicity the old whole-batch hold bought.
-        let mut marks = Vec::with_capacity(renew.len());
-        let mut routes = Vec::with_capacity(renew.len());
-        for entry in renew {
-            marks.push(entity_gates.migration_mark(grid, entry.entity));
-            routes.push(if runtime_grid == grid {
-                store
-                    .locate(grid, entry.entity)
-                    .await
-                    .map_err(|_| Reject::LeaseStore)?
-                    .unwrap_or(entry.cell)
-            } else {
-                entry.cell
-            });
-        }
+        // Concurrently, not one after another. Phase 1 is `renew.len()`
+        // independent reads with no gate held, and a peer's heartbeat batch
+        // is as wide as the set of entities it holds — 77 entries was 77
+        // serial FoundationDB round trips, ~38 ms at the P2 operating point,
+        // for work that shares nothing. The mark is still sampled strictly
+        // before the read it guards: `try_join_all` polls each future up to
+        // its first await before moving on, and the sample is before that
+        // await, so concurrency cannot reorder a sample past its own read.
+        // Nothing is memoised and phase 2's under-the-gate re-check is
+        // unchanged, so the proof is the one that was already here.
+        let (marks, routes): (Vec<u64>, Vec<CellId>) =
+            futures::future::try_join_all(renew.iter().map(|entry| {
+                let (entity_gates, store) = (&entity_gates, &store);
+                async move {
+                    let mark = entity_gates.migration_mark(grid, entry.entity);
+                    let route = if runtime_grid == grid {
+                        store
+                            .locate(grid, entry.entity)
+                            .await
+                            .map_err(|_| Reject::LeaseStore)?
+                            .unwrap_or(entry.cell)
+                    } else {
+                        entry.cell
+                    };
+                    Ok::<_, Reject>((mark, route))
+                }
+            }))
+            .await?
+            .into_iter()
+            .unzip();
         let mut rows = vec![None; renew.len()];
         let mut restale: Vec<usize> = Vec::new();
         for (shard, members) in group_by_actor(&shards, &routes) {
@@ -1868,16 +1896,28 @@ impl Router for Cluster {
         // Locate with no gate held and prove afterwards that nothing
         // migrated, exactly as the node-level impl does; at this level the
         // "locate" is `committed_entity_cell`, which can walk every runtime.
-        let mut marks = Vec::with_capacity(renew.len());
-        let mut routes = Vec::with_capacity(renew.len());
-        for entry in renew {
-            marks.push(self.entity_gates.migration_mark(grid, entry.entity));
-            routes.push(
-                self.committed_entity_cell(grid, entry.entity)
+        // Concurrently, not one after another. Phase 1 is `renew.len()`
+        // independent reads with no gate held, and a peer's heartbeat batch
+        // is as wide as the set of entities it holds — 77 entries was 77
+        // serial FoundationDB round trips, ~38 ms at the P2 operating point,
+        // for work that shares nothing. The mark is still sampled strictly
+        // before the read it guards: `try_join_all` polls each future up to
+        // its first await before moving on, and the sample is before that
+        // await, so concurrency cannot reorder a sample past its own read.
+        // Nothing is memoised and phase 2's under-the-gate re-check is
+        // unchanged, so the proof is the one that was already here.
+        let (marks, routes): (Vec<u64>, Vec<CellId>) =
+            futures::future::try_join_all(renew.iter().map(|entry| async move {
+                let mark = self.entity_gates.migration_mark(grid, entry.entity);
+                let route = self
+                    .committed_entity_cell(grid, entry.entity)
                     .await?
-                    .unwrap_or(entry.cell),
-            );
-        }
+                    .unwrap_or(entry.cell);
+                Ok::<_, Reject>((mark, route))
+            }))
+            .await?
+            .into_iter()
+            .unzip();
         // Two folds, each on the thing that is actually shared at its level:
         // here the **node** that HRW placement assigns the route cell to, and
         // then, inside that node, the actor that owns it. Grouping by the
