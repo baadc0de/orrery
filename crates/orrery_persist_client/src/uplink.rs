@@ -19,6 +19,33 @@
 //! round trip into the ack-latency histogram. A resent diff carries the
 //! latest send instant, so a retransmission is not credited with the original
 //! send time.
+//!
+//! # Stage attribution
+//!
+//! `bulk_ack_ms` alone cannot say *where* a round trip went, which is how a
+//! 75 ms client p99 sat next to a 7 ms server-side p99 with nothing to point
+//! at. The scheduler therefore also keeps the four disjoint stages of one
+//! acknowledged diff, under the names in [`crate::latency`]:
+//!
+//! ```text
+//!  queue()      flush()        on_sent_at()       received_at    on_ack_at()
+//!    |--queue-----|----send---------|-----wire---------|--dispatch--|
+//!                  \_____________ bulk_ack_ms _________/
+//! ```
+//!
+//! - `client_bulk_queue_ms` — the diff waiting for a send slot in *this*
+//!   scheduler. Rig backlog; nothing the server can affect.
+//! - `client_bulk_send_ms` — flush selection through the caller's socket
+//!   write, reported by [`UplinkScheduler::on_sent_at`].
+//! - `client_bulk_wire_ms` — socket write through reply arrival: the network
+//!   and the server.
+//! - `client_bulk_dispatch_ms` — reply arrival through the handler that
+//!   consumed it.
+//!
+//! `bulk_ack_ms` is unchanged by any of this: it still starts at flush
+//! selection, so `send + wire` sums to it and `queue`/`dispatch` sit outside
+//! it. A caller that never calls [`UplinkScheduler::on_sent_at`] gets the
+//! gated series exactly as before and no send/wire samples.
 
 use std::collections::{HashMap, VecDeque};
 use std::time::Duration;
@@ -41,6 +68,10 @@ struct EntityState {
     rate_hz: f32,
     /// The next diff to send, if any (the newest unacked change).
     pending: Option<DiffUplink>,
+    /// When `pending` was handed to [`UplinkScheduler::queue`]. Newest-wins
+    /// replacement moves it: the diff that eventually goes on the wire is the
+    /// newest one, so the wait it experienced starts at *its* queue call.
+    pending_queued_at: Option<Instant>,
     /// The last tick a diff was sent for this entity.
     last_sent_tick: Option<Tick>,
     /// The highest tick acked by the gateway for this entity.
@@ -62,6 +93,24 @@ const MAX_SEND_ORDER_ENTRIES: usize = MAX_IN_FLIGHT_SEND_TIMES * 2;
 
 type SendKey = (PersistId, Tick);
 
+/// The per-send instants one in-flight diff carries.
+///
+/// Kept as a struct rather than a bare `Instant` so the ack path can decompose
+/// the round trip instead of only totalling it. `wire_at` is `None` until the
+/// caller reports the socket write with
+/// [`UplinkScheduler::on_sent_at`](UplinkScheduler::on_sent_at); a caller that
+/// never reports one (the Bevy plugin path, which hands the datagram to
+/// `aeronet` rather than to a socket) simply contributes no send/wire samples,
+/// and `bulk_ack_ms` is unaffected either way.
+#[derive(Debug, Clone, Copy)]
+struct SendStamps {
+    /// When [`UplinkScheduler::flush`] selected it. This is where
+    /// `bulk_ack_ms` starts, and it is unchanged by this attribution.
+    selected_at: Instant,
+    /// When the caller reported the socket write, if it reported one.
+    wire_at: Option<Instant>,
+}
+
 /// The per-entity diff uplink scheduler (D11 §2.1, docs/10-crates.md §9).
 ///
 /// A [`Resource`] holding the accumulator state for every locally-authoritative
@@ -80,12 +129,22 @@ pub struct UplinkScheduler {
     last_elapsed: Option<Duration>,
     /// Bulk-ack latency histogram (D16: bulk ack p99 < 5 ms).
     ack_latency: LatencyHistogram,
+    /// Enqueue → flush selection: rig backlog (`client_bulk_queue_ms`).
+    queue_latency: LatencyHistogram,
+    /// Flush selection → socket write: the caller's own send path
+    /// (`client_bulk_send_ms`).
+    send_latency: LatencyHistogram,
+    /// Socket write → reply arrival: wire plus server (`client_bulk_wire_ms`).
+    wire_latency: LatencyHistogram,
+    /// Reply arrival → handler: the client's ack-handling backlog
+    /// (`client_bulk_dispatch_ms`).
+    dispatch_latency: LatencyHistogram,
     /// Latest wire-send timestamp for every in-flight `(entity, tick)`.
     ///
     /// This is deliberately not stored in `EntityState`: a newly queued tick
     /// may supersede the entity's pending diff before the older durable reply
     /// arrives. Both replies still need latency samples.
-    sent_at: HashMap<SendKey, (Instant, u64)>,
+    sent_at: HashMap<SendKey, (SendStamps, u64)>,
     sent_order: VecDeque<(SendKey, u64)>,
     send_generation: u64,
 }
@@ -105,6 +164,7 @@ impl UplinkScheduler {
             acc: 0.0,
             rate_hz,
             pending: None,
+            pending_queued_at: None,
             last_sent_tick: None,
             last_acked_tick: None,
             last_seq: 0,
@@ -128,8 +188,21 @@ impl UplinkScheduler {
     /// registered first; unregistered entities are ignored (the caller decides
     /// what is locally-authoritative).
     pub fn queue(&mut self, diff: DiffUplink) {
+        self.queue_at(diff, Instant::now());
+    }
+
+    /// Queue a diff, stamping it with an explicit enqueue instant.
+    ///
+    /// The stamp is the start of `client_bulk_queue_ms`, the rig-backlog
+    /// stage: how long this diff waited for a send slot in the priority and
+    /// byte-budget scheduler before [`flush`](Self::flush) picked it. That
+    /// wait is deliberately *not* part of `bulk_ack_ms` — it is time the
+    /// server has no way to influence — but it is the number that says
+    /// whether the offered load exceeds what the scheduler can carry.
+    pub fn queue_at(&mut self, diff: DiffUplink, now: Instant) {
         if let Some(state) = self.entities.get_mut(&diff.entity) {
             state.pending = Some(diff);
+            state.pending_queued_at = Some(now);
         }
     }
 
@@ -211,16 +284,65 @@ impl UplinkScheduler {
             // Record the send instant for ack-latency sampling. Updated on
             // every send (including resends) so a retransmitted diff is not
             // credited with the original send time.
+            if let Some(queued_at) = state.pending_queued_at {
+                // Rig backlog: the wait between this diff being queued and
+                // winning a send slot. Recorded once per *send*, so a resend
+                // re-records the (now longer) wait of the same diff, exactly
+                // as the send instant is re-stamped below.
+                self.queue_latency
+                    .record(now.checked_duration_since(queued_at).unwrap_or_default());
+            }
             let key = (diff.entity, diff.tick);
             self.send_generation = self.send_generation.wrapping_add(1);
             let generation = self.send_generation;
-            self.sent_at.insert(key, (now, generation));
+            self.sent_at.insert(
+                key,
+                (
+                    SendStamps {
+                        selected_at: now,
+                        wire_at: None,
+                    },
+                    generation,
+                ),
+            );
             self.sent_order.push_back((key, generation));
             self.prune_send_times();
             out.push(diff);
         }
 
         out
+    }
+
+    /// Report that the diff for `(entity, tick)` has just been written to the
+    /// socket at `wire_at`.
+    ///
+    /// Optional: a caller that never calls it still gets `bulk_ack_ms`, which
+    /// is measured from flush selection either way. Calling it splits the
+    /// round trip into `client_bulk_send_ms` (flush selection → this instant)
+    /// and `client_bulk_wire_ms` (this instant → reply arrival), which is the
+    /// only way to tell the caller's own send path apart from the network and
+    /// the server.
+    ///
+    /// A report for a `(entity, tick)` with no live send record — a diff
+    /// already acked, already nacked, or evicted by the in-flight bound — is
+    /// ignored rather than sampled: there is no selection instant to measure
+    /// from.
+    pub fn on_sent_at(&mut self, entity: PersistId, tick: Tick, wire_at: Instant) {
+        let Some((stamps, _)) = self.sent_at.get_mut(&(entity, tick)) else {
+            return;
+        };
+        // A duplicate report for the same send keeps the first write: the
+        // datagram left the process once, and the later call is bookkeeping.
+        if stamps.wire_at.is_some() {
+            return;
+        }
+        stamps.wire_at = Some(wire_at);
+        let selected_at = stamps.selected_at;
+        self.send_latency.record(
+            wire_at
+                .checked_duration_since(selected_at)
+                .unwrap_or_default(),
+        );
     }
 
     /// Record a gateway ack for `entity` at `tick`.
@@ -250,6 +372,16 @@ impl UplinkScheduler {
         if provisional {
             return;
         }
+        // Client ack-handling backlog: `received_at` is stamped in the reader
+        // task when the datagram came off the socket, so the gap to *now* is
+        // time this process spent before looking at the reply. It is excluded
+        // from every other series by construction, which is precisely why it
+        // has to be measured somewhere or it is invisible.
+        self.dispatch_latency.record(
+            Instant::now()
+                .checked_duration_since(received_at)
+                .unwrap_or_default(),
+        );
         self.record_reply_latency(entity, tick, received_at);
         if let Some(state) = self.entities.get_mut(&entity) {
             // Acks arrive on the unreliable, unordered lane, so a late or
@@ -262,6 +394,7 @@ impl UplinkScheduler {
             }
             if state.pending.as_ref().is_some_and(|d| d.tick == tick) {
                 state.pending = None;
+                state.pending_queued_at = None;
             }
         }
     }
@@ -297,6 +430,7 @@ impl UplinkScheduler {
         if let Some(state) = self.entities.get_mut(&entity) {
             if state.pending.as_ref().is_some_and(|d| d.tick == tick) {
                 state.pending = None;
+                state.pending_queued_at = None;
             }
         }
     }
@@ -319,16 +453,57 @@ impl UplinkScheduler {
         &self.ack_latency
     }
 
+    /// Rig backlog: enqueue → flush selection (`client_bulk_queue_ms`).
+    #[must_use]
+    pub fn queue_latency(&self) -> &LatencyHistogram {
+        &self.queue_latency
+    }
+
+    /// The caller's send path: flush selection → socket write
+    /// (`client_bulk_send_ms`). Empty unless the caller reports writes with
+    /// [`on_sent_at`](Self::on_sent_at).
+    #[must_use]
+    pub fn send_latency(&self) -> &LatencyHistogram {
+        &self.send_latency
+    }
+
+    /// Wire plus server: socket write → reply arrival
+    /// (`client_bulk_wire_ms`). Empty unless the caller reports writes with
+    /// [`on_sent_at`](Self::on_sent_at).
+    #[must_use]
+    pub fn wire_latency(&self) -> &LatencyHistogram {
+        &self.wire_latency
+    }
+
+    /// The client's own ack handling: reply arrival → handler
+    /// (`client_bulk_dispatch_ms`).
+    #[must_use]
+    pub fn dispatch_latency(&self) -> &LatencyHistogram {
+        &self.dispatch_latency
+    }
+
     #[cfg(test)]
     pub(crate) fn in_flight_bookkeeping_len(&self) -> (usize, usize) {
         (self.sent_at.len(), self.sent_order.len())
     }
 
     fn record_reply_latency(&mut self, entity: PersistId, tick: Tick, received_at: Instant) {
-        if let Some((sent_at, _)) = self.sent_at.remove(&(entity, tick)) {
-            self.ack_latency.record(
+        let Some((stamps, _)) = self.sent_at.remove(&(entity, tick)) else {
+            return;
+        };
+        // The gated series, unchanged: flush selection → reply arrival.
+        self.ack_latency.record(
+            received_at
+                .checked_duration_since(stamps.selected_at)
+                .unwrap_or_default(),
+        );
+        // The wire half, only when the caller reported an actual socket
+        // write. Without one there is nothing to subtract and a sample here
+        // would silently be the gated series under a second name.
+        if let Some(wire_at) = stamps.wire_at {
+            self.wire_latency.record(
                 received_at
-                    .checked_duration_since(sent_at)
+                    .checked_duration_since(wire_at)
                     .unwrap_or_default(),
             );
         }
@@ -703,6 +878,148 @@ mod tests {
             latency < Duration::from_secs(1),
             "latency must be absurdly small, got {latency:?}"
         );
+    }
+
+    #[test]
+    fn queue_stage_measures_the_wait_for_a_send_slot_not_the_round_trip() {
+        // The rig-backlog stage: an entity that becomes dirty long before it
+        // wins a byte-budget slot has waited, and that wait is invisible in
+        // `bulk_ack_ms` because the gated clock starts at flush selection.
+        let cfg = cfg();
+        let mut sched = UplinkScheduler::new();
+        let entity = PersistId::new(1);
+        sched.register(entity, 4.0);
+
+        let queued_at = Instant::now();
+        sched.queue_at(diff(1, 1, b"hp=50"), queued_at);
+        std::thread::sleep(Duration::from_millis(20));
+        sched.flush(&cfg, t(0));
+        assert_eq!(
+            sched.queue_latency().total(),
+            0,
+            "the baseline flush selects nothing, so nothing waited yet"
+        );
+        sched.flush(&cfg, t(250));
+
+        assert_eq!(sched.queue_latency().total(), 1);
+        assert!(
+            sched.queue_latency().min().unwrap() >= Duration::from_millis(20),
+            "the 20 ms the diff spent queued was not attributed to the queue stage"
+        );
+        // And it stayed out of the gated series.
+        sched.on_ack_at(entity, Tick::new(1), false, Instant::now());
+        assert_eq!(sched.ack_latency().total(), 1);
+        assert!(
+            sched.ack_latency().max().unwrap() < Duration::from_millis(20),
+            "rig backlog leaked into the gated bulk-ack series"
+        );
+    }
+
+    #[test]
+    fn send_and_wire_stages_partition_the_gated_round_trip() {
+        // `bulk_ack_ms` = send + wire, exactly. This is the decomposition the
+        // whole attribution exists for: if the two halves do not add up to
+        // the gated number, attributing a regression to one of them is a
+        // guess.
+        let cfg = cfg();
+        let mut sched = UplinkScheduler::new();
+        let entity = PersistId::new(1);
+        sched.register(entity, 4.0);
+        sched.queue(diff(1, 1, b"hp=50"));
+        sched.flush(&cfg, t(0));
+        sched.flush(&cfg, t(250));
+
+        std::thread::sleep(Duration::from_millis(10));
+        let wire_at = Instant::now();
+        sched.on_sent_at(entity, Tick::new(1), wire_at);
+        std::thread::sleep(Duration::from_millis(10));
+        let received_at = Instant::now();
+        sched.on_ack_at(entity, Tick::new(1), false, received_at);
+
+        assert_eq!(sched.send_latency().total(), 1);
+        assert_eq!(sched.wire_latency().total(), 1);
+        let send = sched.send_latency().max().unwrap();
+        let wire = sched.wire_latency().max().unwrap();
+        let total = sched.ack_latency().max().unwrap();
+        assert!(
+            send >= Duration::from_millis(10),
+            "send stage {send:?} lost the 10 ms before the socket write"
+        );
+        assert!(
+            wire >= Duration::from_millis(10),
+            "wire stage {wire:?} lost the 10 ms the reply took"
+        );
+        // Instant arithmetic, so the partition is exact up to the clock.
+        let sum = send + wire;
+        assert!(
+            sum.abs_diff(total) < Duration::from_millis(1),
+            "send {send:?} + wire {wire:?} = {sum:?} does not partition bulk ack {total:?}"
+        );
+    }
+
+    #[test]
+    fn an_unreported_socket_write_leaves_the_wire_stage_empty_rather_than_duplicating_the_gate() {
+        // A caller that cannot stamp its own socket write (the Bevy plugin
+        // hands the datagram to aeronet, not to a socket) must contribute no
+        // wire sample at all. Falling back to the selection instant would
+        // republish `bulk_ack_ms` under a second name and make the wire look
+        // like it owned the whole round trip.
+        let cfg = cfg();
+        let mut sched = UplinkScheduler::new();
+        let entity = PersistId::new(1);
+        sched.register(entity, 4.0);
+        sched.queue(diff(1, 1, b"hp=50"));
+        sched.flush(&cfg, t(0));
+        sched.flush(&cfg, t(250));
+        sched.on_ack_at(entity, Tick::new(1), false, Instant::now());
+
+        assert_eq!(sched.ack_latency().total(), 1);
+        assert_eq!(sched.send_latency().total(), 0);
+        assert_eq!(sched.wire_latency().total(), 0);
+    }
+
+    #[test]
+    fn dispatch_stage_captures_the_handler_delay_the_other_stages_exclude() {
+        // `receipt_timestamp_excludes_delayed_handler_work` proves the delay
+        // stays out of the gated series. It has to land somewhere, or a
+        // client that sits on its replies for 20 ms reports a healthy gate
+        // and nothing says why the game felt slow.
+        let cfg = cfg();
+        let mut sched = UplinkScheduler::new();
+        let entity = PersistId::new(1);
+        sched.register(entity, 4.0);
+        sched.queue(diff(1, 1, b"hp=50"));
+        sched.flush(&cfg, t(0));
+        sched.flush(&cfg, t(250));
+
+        let received_at = Instant::now();
+        std::thread::sleep(Duration::from_millis(20));
+        sched.on_ack_at(entity, Tick::new(1), false, received_at);
+
+        assert_eq!(sched.dispatch_latency().total(), 1);
+        assert!(
+            sched.dispatch_latency().min().unwrap() >= Duration::from_millis(20),
+            "the 20 ms handler delay was not attributed to the dispatch stage"
+        );
+    }
+
+    #[test]
+    fn a_send_report_for_an_unknown_diff_is_ignored() {
+        // Acked, nacked or evicted sends have no selection instant left. A
+        // sample computed from a missing one would be latency measured from
+        // nothing.
+        let cfg = cfg();
+        let mut sched = UplinkScheduler::new();
+        let entity = PersistId::new(1);
+        sched.register(entity, 4.0);
+        sched.queue(diff(1, 1, b"hp=50"));
+        sched.flush(&cfg, t(0));
+        sched.flush(&cfg, t(250));
+        sched.on_ack_at(entity, Tick::new(1), false, Instant::now());
+
+        sched.on_sent_at(entity, Tick::new(1), Instant::now());
+        sched.on_sent_at(PersistId::new(99), Tick::new(7), Instant::now());
+        assert_eq!(sched.send_latency().total(), 0);
     }
 
     #[test]

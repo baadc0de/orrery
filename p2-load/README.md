@@ -109,7 +109,33 @@ rig ever emits and none of which D16 gates:
 | `gateway_intent_server_ms`         | persistd — `SubmitIntent` receipt → reply send call             |
 | `gateway_area_first_page_server_ms`| persistd — `Subscribe` receipt → first `AreaPage` send call     |
 
-Each is the server-side half of the gated round trip above it, and each has
+The rig emits five more, all ungated, which decompose `bulk_ack_ms` from the
+*client* side. `gateway_bulk_server_ms` answers "how much of the round trip
+was the server"; these answer "and where is the rest":
+
+| series                    | span                                                       |
+|---------------------------|------------------------------------------------------------|
+| `client_bulk_queue_ms`    | `UplinkScheduler::queue` → the flush that selected the diff |
+| `client_bulk_send_ms`     | that flush → the socket write (`on_sent_at`)                |
+| `client_bulk_wire_ms`     | the socket write → the reply's arrival instant              |
+| `client_bulk_dispatch_ms` | the reply's arrival → the handler that consumed it          |
+| `client_quic_rtt_ms`      | QUIC's own smoothed path RTT, sampled per session at 4 Hz   |
+
+`bulk_ack_ms` is `send + wire`, exactly: its clock starts where the flush
+selects a diff, not where the diff was queued. So `client_bulk_queue_ms` — the
+uplink scheduler's own rate wait — is *outside* the gated number, and so is
+`client_bulk_dispatch_ms`, which begins after it stops. Reading `send`,
+`wire` and `client_quic_rtt_ms` together is what separates "the rig was slow
+to write the datagram" from "the path is slow" from "the far side is slow";
+they were folded into one 75 ms number until 2026-08-18, and nobody could say
+which.
+
+`client_quic_rtt_ms` is a gauge, not a per-operation measurement, and it is
+sampled rather than derived — it is the closest available proxy for path time,
+not a ground truth, because an endpoint driver scheduled late inflates its own
+estimate too.
+
+Each server span is the server-side half of the gated round trip above it, and each has
 its **own name on purpose**. `p2-dashboard` folds by series name into one
 histogram per name, with no source field, and `scripts/p2-kill9-gate.sh`
 concatenates this rig's file with persistd's before gating — so a server span

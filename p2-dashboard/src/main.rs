@@ -17,6 +17,13 @@
 //! contributes to the verdict — present or absent. It used to be silently
 //! discarded while the report printed zero malformed records.
 //!
+//! Four more, `client_bulk_{queue,send,wire,dispatch}_ms`, are the *client*
+//! side of the same attribution: the rig's own backlog, its send path, the
+//! wire, and its ack handling. `bulk_ack_ms` covers `send + wire` only, so
+//! the four decompose a bulk-ack tail into a part the server owns and three
+//! parts it does not. Ungated, for the same reason and with the same
+//! consequence: present or absent, they never change the verdict.
+//!
 //! The JSONL input carries raw µs samples (one `sample`, or a compact
 //! `sample_batch` with an explicit count); this tool buckets them into the bounded-memory
 //! [`LatencyHistogram`] from the client crate, exactly as the rig does —
@@ -41,8 +48,9 @@ use clap::Parser;
 use serde::{Deserialize, Serialize};
 
 use orrery_persist_client::latency::{
-    is_known_series, LatencyHistogram, GATED_SERIES, SERIES_AREA_FIRST_PAGE, SERIES_BULK_ACK,
-    SERIES_INTENT_COMMIT, SERIES_JOURNAL_COMMIT, UNGATED_SERIES,
+    is_client_series, is_known_series, LatencyHistogram, CLIENT_UNGATED_SERIES, GATED_SERIES,
+    SERIES_AREA_FIRST_PAGE, SERIES_BULK_ACK, SERIES_INTENT_COMMIT, SERIES_JOURNAL_COMMIT,
+    UNGATED_SERIES,
 };
 
 /// Every series this gate folds, in canonical report order: the four gated
@@ -55,7 +63,7 @@ use orrery_persist_client::latency::{
 /// error here rather than a series silently counted as unknown. That is the
 /// intended failure: this workspace is excluded from the root one, so nothing
 /// else would notice.
-const SERIES_KEYS: [&str; GATED_SERIES.len() + UNGATED_SERIES.len()] = [
+const SERIES_KEYS: [&str; GATED_SERIES.len() + UNGATED_SERIES.len() + CLIENT_UNGATED_SERIES.len()] = [
     GATED_SERIES[0],
     GATED_SERIES[1],
     GATED_SERIES[2],
@@ -63,6 +71,11 @@ const SERIES_KEYS: [&str; GATED_SERIES.len() + UNGATED_SERIES.len()] = [
     UNGATED_SERIES[0],
     UNGATED_SERIES[1],
     UNGATED_SERIES[2],
+    CLIENT_UNGATED_SERIES[0],
+    CLIENT_UNGATED_SERIES[1],
+    CLIENT_UNGATED_SERIES[2],
+    CLIENT_UNGATED_SERIES[3],
+    CLIENT_UNGATED_SERIES[4],
 ];
 
 /// How many of [`SERIES_KEYS`] carry a D16 threshold. The rest are folded and
@@ -366,7 +379,7 @@ fn ingest(
                 return None;
             };
             let Some(idx) = SERIES_KEYS.iter().position(|&k| k == series) else {
-                debug_assert!(!is_known_series(&series));
+                debug_assert!(!is_known_series(&series) && !is_client_series(&series));
                 return Some(series);
             };
             let count = if r.kind == "sample_batch" {
@@ -816,6 +829,73 @@ mod tests {
             ExitCode::SUCCESS
         );
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn client_attribution_series_are_folded_counted_and_never_gated() {
+        // The four client-side stage series ride the same artifact as the
+        // gated ones. Three things have to hold at once, and each has broken
+        // a gate run before:
+        //   1. they must not be counted as unknown - the harness's python
+        //      check fails the whole run on `unknown_series`;
+        //   2. they must not acquire a threshold - a stage series failing the
+        //      gate would fail a run the server is meeting;
+        //   3. folding them must not move a gated p99.
+        let mut lines = conforming();
+        let slot = |key: &str| SERIES_KEYS.iter().position(|&k| k == key).unwrap();
+        let gated_before = {
+            let path = tmp("client-attr-base");
+            write_jsonl(&path, &lines);
+            let loaded = load(std::slice::from_ref(&path)).expect("baseline loads");
+            let p99s: Vec<_> = GATED_SERIES
+                .iter()
+                .map(|&key| loaded.histograms[slot(key)].p99())
+                .collect();
+            let _ = std::fs::remove_file(&path);
+            p99s
+        };
+
+        // Stage samples large enough to fail every D16 threshold if gated,
+        // and to dominate any histogram they were wrongly folded into.
+        for key in CLIENT_UNGATED_SERIES {
+            lines.push(sample_batch(key, 300_000, 100));
+        }
+        let path = tmp("client-attr");
+        write_jsonl(&path, &lines);
+        let cli = gate_cli(vec![path.clone()]);
+        let loaded = load(&cli.files).expect("test jsonl loads");
+
+        assert_eq!(
+            loaded.unknown_series, 0,
+            "client attribution read as unknown ({:?}); the P2 harness fails the whole run on that",
+            loaded.unknown_series_names
+        );
+        for key in CLIENT_UNGATED_SERIES {
+            assert_eq!(
+                loaded.histograms[slot(key)].total(),
+                100,
+                "{key} was not folded"
+            );
+            assert!(
+                threshold_for(&ThresholdsUs::D16, key).is_none(),
+                "{key} acquired a D16 threshold"
+            );
+        }
+        let gated_after: Vec<_> = GATED_SERIES
+            .iter()
+            .map(|&key| loaded.histograms[slot(key)].p99())
+            .collect();
+        assert_eq!(
+            gated_after, gated_before,
+            "a client stage moved a gated p99"
+        );
+
+        assert_eq!(
+            report_and_maybe_gate(&cli, &ThresholdsUs::D16, &loaded),
+            ExitCode::SUCCESS,
+            "300 ms of ungated client attribution failed a conforming run"
+        );
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
