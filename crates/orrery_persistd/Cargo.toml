@@ -62,6 +62,10 @@ tonic = { version = "0.14.6", default-features = false, features = ["codegen"], 
 name = "journal_latency"
 harness = false
 
+[[bench]]
+name = "lease_renewal"
+harness = false
+
 [dev-dependencies]
 blake3 = "1.8"
 tempfile = "3"

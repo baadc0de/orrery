@@ -953,6 +953,12 @@ async fn claim_lease(
     Ok(result)
 }
 
+/// Renew one pair against this actor's registrar.
+///
+/// In place, not against a clone. Every other registrar mutation here writes
+/// the durable tier partway through and needs a copy to abandon when that
+/// write fails; a heartbeat has no durable half at all. See
+/// [`heartbeat_leases`] for the full argument and what it costs.
 fn heartbeat_lease(
     env: &mut ActorEnv,
     entity: PersistId,
@@ -960,34 +966,49 @@ fn heartbeat_lease(
     lease_id: LeaseId,
     now_ms: u64,
 ) -> Result<Option<Lease>, Reject> {
-    let mut next = env.state.leases.clone();
-    next.heartbeat(entity, holder, lease_id, now_ms);
-    let row = next.current(entity);
-    env.state.leases = next;
-    Ok(row)
+    env.state.leases.heartbeat(entity, holder, lease_id, now_ms);
+    Ok(env.state.leases.current(entity))
 }
 
 /// Renew every pair in one batch against this actor's registrar.
 ///
-/// The registrar is cloned once for the whole batch rather than once per pair:
-/// heartbeats never change a durable sequence or token, so the batch has no
-/// partial-durability problem to unwind, and each pair is still checked
-/// against its own row exactly as the single-entity path checks it.
+/// **The registrar is not copied.** Every other mutation in this file builds a
+/// `next` and installs it only after the durable write succeeds, because a
+/// half-applied claim or sweep must be abandonable. A heartbeat has nothing to
+/// abandon: it writes no journal record and no `LeaseStore` row, it advances no
+/// sequence and mints no token, and `LeaseRegistrar::heartbeat` either sets one
+/// row's `expires_at` or leaves the registrar untouched. There is no failure
+/// between the first pair and the last for a copy to unwind to.
+///
+/// The copy was the whole cost of the path. A renewal batch is grouped by the
+/// actor that owns each entity (`cluster::group_by_actor`), and at the P2
+/// operating point a session's 40 leases sit in 40 different shards — so the
+/// batch is 40 groups of one, each turn cloning that shard's entire registrar
+/// to renew a single row. Both hash maps are copied whole, so the cost is the
+/// *shard's* population, not the batch's: ~3 100 rows copied per heartbeat to
+/// update 40 `expires_at` fields, and it grows with the world while the
+/// renewal that pays it does not. `benches/lease_renewal.rs` isolates the
+/// copy by holding everything else fixed and growing the registrar: on one
+/// shard of 10 000 rows a batch costs 0.072 ms with the copy and 0.018 ms
+/// without it.
+///
+/// Semantics are unchanged, not merely similar: the old code mutated `next`
+/// in the same loop, so each pair already saw the preceding pairs' writes, and
+/// nothing between the clone and the install could observe `env.state.leases`
+/// — this function is synchronous and the actor is single-writer.
 fn heartbeat_leases(
     env: &mut ActorEnv,
     renew: &[(PersistId, LeaseId)],
     holder: NodeId,
     now_ms: u64,
 ) -> Result<Vec<Option<Lease>>, Reject> {
-    let mut next = env.state.leases.clone();
-    let rows = renew
-        .iter()
-        .map(|(entity, lease_id)| {
-            next.heartbeat(*entity, holder, *lease_id, now_ms);
-            next.current(*entity)
-        })
-        .collect();
-    env.state.leases = next;
+    let mut rows = Vec::with_capacity(renew.len());
+    for (entity, lease_id) in renew {
+        env.state
+            .leases
+            .heartbeat(*entity, holder, *lease_id, now_ms);
+        rows.push(env.state.leases.current(*entity));
+    }
     Ok(rows)
 }
 

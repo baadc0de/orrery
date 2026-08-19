@@ -1,14 +1,21 @@
-//! Phase 1 of a heartbeat batch resolves its locations concurrently.
+//! A heartbeat batch resolves its locations concurrently.
 //!
-//! `heartbeat_leases` holds no gate while it locates, which was the fix that
-//! `heartbeat_gate_hold.rs` pins. It still issued those locates one after
+//! The locate phase holds no gate while it reads, which was the fix that
+//! `heartbeat_gate_hold.rs` pins. It still issued those reads one after
 //! another: a peer renewing 77 leases made 77 serial FoundationDB round trips
 //! — ~38 ms at the P2 operating point — for reads that share nothing and are
 //! each validated by their own stripe mark afterwards.
 //!
-//! This pins the concurrency, because it is the kind of thing a later edit
+//! That phase is now the **fallback**: the route asks the actor owning each
+//! entry's presented cell first and locates only for entries it has no row
+//! for (docs/08-persistence.md §2.2.4). So this batch is built to miss —
+//! every lease is claimed in one shard and renewed against a cell in the
+//! other — because a batch that hits would take no locate at all and this
+//! file would pass without testing anything.
+//!
+//! It pins the concurrency, because it is the kind of thing a later edit
 //! reverts by accident: the store's `locate` refuses to answer until every
-//! entry in the batch has entered it. A serial phase 1 can never satisfy
+//! entry in the batch has entered it. A serial locate phase can never satisfy
 //! that, so it hangs, and the timeout is the assertion.
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -113,7 +120,11 @@ impl LeaseStore for BarrierLocateStore {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_renewal_batch_resolves_its_locations_concurrently() {
     let dir = tempfile::tempdir().unwrap();
-    let cell = CellId::ROOT;
+    // Two shards: the leases live in `home`, the renewals present `away`. The
+    // presented cell's actor holds no row for any of them, so every entry
+    // takes the fallback and every entry locates.
+    let roots = CellId::ROOT.children();
+    let (home, away) = (roots[0], roots[1]);
     let holder = test_node(52);
     let store = Arc::new(BarrierLocateStore {
         inner: MemLeaseStore::new(),
@@ -122,7 +133,7 @@ async fn a_renewal_batch_resolves_its_locations_concurrently() {
     });
     let checkpoints: Arc<dyn CheckpointStore> = Arc::new(MemCheckpointStore::new());
     let config = RuntimeConfig {
-        shards: vec![cell],
+        shards: vec![home, away],
         grid: GridId::ROOT,
         journal: JournalConfig {
             dir: dir.path().to_path_buf(),
@@ -147,11 +158,11 @@ async fn a_renewal_batch_resolves_its_locations_concurrently() {
     let mut renew = Vec::with_capacity(BATCH);
     for index in 0..BATCH {
         let entity = PersistId::new(6_200 + index as u64);
-        rt.apply(mk_record(cell, entity)).await.unwrap();
+        rt.apply(mk_record(home, entity)).await.unwrap();
         let ClaimResult::Granted(grant) = Router::claim_lease(
             &rt,
             GridId::ROOT,
-            cell,
+            home,
             entity,
             holder,
             ClaimKind::Weak,
@@ -163,7 +174,7 @@ async fn a_renewal_batch_resolves_its_locations_concurrently() {
         };
         renew.push(LeaseRenewal {
             entity,
-            cell,
+            cell: away,
             lease_id: grant.lease_id,
         });
     }
@@ -175,8 +186,8 @@ async fn a_renewal_batch_resolves_its_locations_concurrently() {
     )
     .await
     .expect(
-        "phase 1 must have all its locates in flight at once; a serial loop never releases \
-         the barrier",
+        "the locate phase must have all its reads in flight at once; a serial loop never \
+         releases the barrier",
     )
     .unwrap();
     store.armed.store(false, Ordering::Release);

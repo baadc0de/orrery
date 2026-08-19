@@ -1493,6 +1493,212 @@ because that is the variable the runs differ in.
 | un-r6 | 164.8 ms | 150 ms | 150 ms | 150 ms | 4 ms | 57.84 s |
 | un-r15 | 201.0 ms | 100 ms | 100 ms | 150 ms | 4 ms | 62.27 s |
 
+### 2.2.3 The renewal path's own cost: 40 mailbox turns, one after another
+
+§2.2.1 diagnosed the intent tail as the rig's *synchronized* renewal pass, and
+§2.2.2 phased the pass away. That removed the herd; it did not look at what one
+renewal costs the server. This does, because the number is not small: at the P2
+operating point the cluster serves ~200 intents/s and ~3 333 lease renewals/s
+(250 sessions x 40 entities, `LEASE_HEARTBEAT` 3 s). The renewal path had never
+had the scrutiny §2.1.2 gave the fenced bulk path.
+
+**The rig.** `benches/lease_renewal.rs` — one `CellRuntime`, 128 level-18
+shards, 10 000 entities each in its own leaf cell, 250 sessions of 40, nothing
+running but renewals. Measure-only, like `journal_latency`; it isolates
+`Router::heartbeat_leases` from the bulk, journal and intent work it is mixed
+with in the sweep.
+
+**What it found.** `heartbeat_leases` has two phases: resolve every entry's
+location holding no gate, then take gates per actor group around one mailbox
+turn. Phase 1 was made concurrent when FoundationDB came off the bulk path
+(§2.1.2). Phase 2 was left a `for` loop — and phase 2 is the expensive half,
+because the fold that builds the groups only collapses leases that share an
+**actor**. A session's 40 leases sit in 40 different shards, so the batch is 40
+groups of one, and the loop is 40 mailbox round trips end to end for renewals
+that share nothing. On a loaded node each of those turns queues behind a
+different actor's journal work, so a serial loop waits out every queue in
+sequence instead of overlapping them.
+
+The ablation is what identifies it rather than a plausible story about it:
+holding the shard count, the entity count, the batch size and the locate count
+fixed, and changing only *how many actors a batch spans*, moves the whole cost.
+
+| batch spans | per-batch p50 | per renewal |
+|---|---|---|
+| 40 actors (the P2 layout) | 0.301 ms | 7.6 us |
+| 1 actor (`--blocked`, same registrars) | 0.029 ms | 0.7 us |
+
+**The change.** Phase 2's groups dispatch concurrently, in all three `Router`
+implementations. Concurrency does not weaken the gate discipline, because that
+discipline was never per-batch: `lock_entity_gates` acquires in ascending
+stripe address and every other lease path takes exactly one gate. Ascending
+acquisition by every holder is what excludes a cycle, and it holds between two
+groups of one batch exactly as it held between two batches. Two groups sharing
+a stripe serialize on it — the same wait the serial loop paid unconditionally.
+Each group's work is otherwise untouched: the same under-the-gate re-check of
+the stripe mark against phase 1's sample, the same one mailbox turn inside the
+hold, the same stale entries deferred to a re-resolve.
+
+Alongside it, the actor stops copying its registrar to renew a lease. Every
+other mutation in `actor.rs` builds a `next` and installs it after the durable
+write succeeds, because a half-applied claim or sweep must be abandonable; a
+heartbeat writes no journal record and no `LeaseStore` row, advances no
+sequence and mints no token, so it has nothing to abandon. The copy was of both
+hash maps whole, so it cost the *shard's* population rather than the batch's,
+and it grew with the world while the renewal paying it did not.
+
+**Measured, same rig, 4 000 batches:**
+
+| | p50 | p99 | max | per renewal |
+|---|---|---|---|---|
+| before | 0.301 ms | 0.385 ms | 0.731 ms | 7.6 us |
+| **after** | **0.060 ms** | **0.078 ms** | **0.097 ms** | **1.5 us** |
+
+**5.0x at p50, 4.9x at p99, 7.5x at the max.** The registrar copy is the
+smaller of the two terms at P2's ~78 rows per shard and the larger one as
+shards consolidate: on a single-shard 10 000-row registrar it alone is
+0.072 ms -> 0.018 ms per batch.
+
+Pinned by `tests/heartbeat_group_concurrency.rs`, with no timing threshold: one
+group is held on an entity gate something else owns, and a second group on a
+different actor must still land. A serial loop has not started the second group,
+so it cannot ever satisfy it. Mutation-checked — reverting the loop fails with
+`a heartbeat batch must dispatch its actor groups concurrently; a serial loop
+never reaches the second group while the first is held: Elapsed(())`.
+
+**What this leaves.** Every renewal is still one `LeaseStore::locate` after
+this change — the count is unchanged at 1.000 per renewal, it is just no longer
+serialized. §2.2.4 removes it.
+
+### 2.2.4 FoundationDB is off the renewal path
+
+§2.1.2 took FoundationDB off the fenced bulk write path. This is the same
+change on the other lease path, and it rests on the same invariant.
+
+**What it cost.** `heartbeat_leases` resolved every entry with one
+`LeaseStore::locate`. §2.2.3 made those concurrent, so a batch waited about one
+locate rather than forty — but the *count* never moved, and the count is what
+lands on FoundationDB. At the P2 operating point the renewal path issues
+~3 333 locates/s (250 sessions x 40 entities every 3 s), and under
+`--fdb-cluster-file` each is a read transaction on the single `libfdb_c`
+network thread that docs/14-capacity.md §5.1 measured as the entire capacity of
+one box. docs/08 §2 says bulk writes reach FoundationDB at the 20 s checkpoint;
+it does not say heartbeats reach it every 3 s per lease.
+
+**The change.** `<CellRuntime as Router>::heartbeat_leases` asks the actor that
+owns the cell the holder *presented* and consults `locate` only for the entries
+that actor has no row for. Zero store reads on the path that renews.
+
+Why the answer set is unchanged is invariant J, unmodified from §2.1.2:
+
+> (J) if an actor's registrar holds a row for entity `e`, then `locate(e)`
+> names a cell inside that actor's shard subtree (or is `None`).
+
+The locate never entered the renewal decision. `LeaseRegistrar::heartbeat`
+compares the presented holder and fencing token against the actor's own row and
+nothing else, and the route never rewrites `entry.cell`; the locate only chose
+which actor did the comparing. Given J, an actor that answers *with a row* is
+the actor the locate would have named — and where `locate` is `None` the old
+route fell back to the presented cell, which is this same actor. J is enforced
+at the four row-install sites through `checked_row_cell` and backed by
+`LeaseStore::put` refusing to overwrite a different location.
+
+J says nothing about an actor that has **no** row, so a `None` is not proof of
+absence — the entity may have been rekeyed into another shard, or live on a
+cell this runtime does not host at all — and only those entries pay for a
+locate. The fallback is the retained pre-change body, run once over exactly the
+missed entries: one locate each, no loop, and no short-circuit on anything but
+`row.is_some()`.
+
+The batch's phase structure collapses with it. There is no off-gate locate left
+to protect, so there is no stripe migration mark to sample before it and
+re-check under the gate: the fast path is a pure grouping followed by one gated
+mailbox turn per actor. The marks live on inside the fallback, which is the old
+two-phase body unchanged.
+
+**One accepted divergence, decided rather than discovered.** The two routes can
+only differ where J is violated: an actor holding a row for an entity whose
+durable location sits in another shard. That is reachable in exactly the state
+§2.1.2 named — a rekey whose `LeaseStore::migrate` committed and whose later
+steps then failed, leaving the source holding both the reservation and the row.
+Routing by `locate` answers `None`, so the holder is told its lease is invalid
+and re-claims; asking the owner answers the source's live row and renews it.
+The new payload is the more useful one, and it is not a hole in single-writer
+safety: a write is admitted by `LeaseRegistrar::admits_write` against the
+actor's own row, never by a renewal acknowledgement, and `install_rekey`
+restores the prepare-time snapshot, so the renewed expiry does not outlive the
+rekey under either route. What differs is what the holder is *told*, not who
+may write.
+
+**Not silent when it is wrong.** The renewal accept path feeds the same sampled
+invariant-J audit the fenced path ships — a real `locate` on one in
+`ORRERY_FENCED_LOCATION_AUDIT_N` accepts, run on a detached task after the
+route has answered, never under a gate and never inside the caller's budget,
+counting every case where the durable location sits outside the accepting
+actor's shard. That counter must be zero. It is also the whole of the residual
+read traffic below: 0.001 locates per renewal is the 1-in-1000 sample, not the
+route.
+
+**Measured** (`benches/lease_renewal.rs`, P2 shape, `--locate-us` standing in
+for a store round trip), per-batch p50 for one session's 40 renewals:
+
+| store `locate` | before §2.2.3 | after §2.2.4 | |
+|---|---|---|---|
+| 0 us (in-process) | 0.295 ms | 0.064 ms | 4.6x |
+| 500 us | 1.476 ms | 0.075 ms | **19.7x** |
+| 2 000 us | 3.534 ms | 0.081 ms | **43.6x** |
+
+Store reads: **1.000 per renewal -> 0.001**. The line that matters is not any
+one factor but the shape of the column: the renewal path's cost no longer
+depends on the lease store's latency at all.
+
+**Checked, not asserted.** `tests/heartbeat_route_differential.rs` holds the
+new route and `CellRuntime::heartbeat_leases_via_locate` — the pre-change body,
+retained verbatim as an oracle — to the same `Option<Lease>` per entry over an
+enumerated matrix: six states for where the row actually is (at the presented
+cell, at a sibling cell of the same shard, moved by a committed rekey, on an
+unhosted cell, absent, and J-violating) crossed with what the holder presents
+(current token, wrong holder, wrong token, past expiry), each run alone and
+mixed into one batch so positional alignment across fast-path and fallback
+entries is checked too. The matrix pins the oracle's answer per state, so a
+scenario that silently stopped building its condition fails rather than
+comparing equal to an oracle looking at the same nothing; it asserts every arm
+the route can produce appears; and it asserts the accepted divergence above is
+the only one **and** that it fires.
+
+Mutation-checked, two ways:
+* trust a rowless answer as absence (drop the fallback) -> the differential
+  fails on all eight `Rekeyed` cases: a renewal that should have followed the
+  entity to its new actor answers `None` and costs the peer a lease it holds.
+* route by `locate` again -> `heartbeat_route_bounds` fails with `a renewal
+  batch whose rows are where the holder presented them must not read the lease
+  store: left: 64, right: 0`.
+
+**Three tests had to be retargeted, and that is worth saying rather than
+quietly doing.** `heartbeat_gate_hold.rs`'s two tests and
+`heartbeat_locate_concurrency.rs` are all about the locate phase, and after
+this change a batch whose rows are where the holder presented them never
+enters it — so all three passed while exercising nothing, which is the exact
+failure mode §2.2.1's `--gate-self-test` exists to catch one level up. Each now
+builds a batch that *misses* (leases claimed in one shard, renewals presenting
+a cell in the other) so it reaches the fallback the phase moved into, and each
+was re-checked against the mutation it was written for: gates taken across the
+locates fails `a renewal batch must not hold its gates across locate` in
+5.01 s; ignoring the stale stripe mark fails `the renewal must follow the
+entity to its new actor`; a serial locate loop fails `the locate phase must
+have all its reads in flight at once`.
+
+**The deployment precondition §2.1.2 started spending is now spent by both
+lease paths**: one `persistd` process writes a grid's lease keyspace. Before
+this, a renewal re-read shared FoundationDB truth; now the actor's own state
+witnesses the location for renewals as well as for fenced writes.
+
+**Out of scope, deliberately.** `Mutex<CellRuntime>` and `Cluster` keep the
+locate-based route. Neither is the shipped single-node path, `Cluster`'s
+`committed_entity_cell` is real cross-runtime routing rather than actor
+selection, and J would need re-proving at each — the same boundary §2.1.2 drew,
+for the same reasons.
+
 ## 3. Cell actor model
 
 ### 3.1 Single writer, mailbox, state
