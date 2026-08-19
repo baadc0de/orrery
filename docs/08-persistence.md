@@ -1846,6 +1846,96 @@ section pins — GRV mean 0.220 ms inside its 0.217–0.226 ms band, 10 000 leas
 held, `leases_lost` 0, recovery verified, gate red on `journal_commit_ms` —
 so the instrumentation costs nothing measurable.
 
+### 2.2.7 The intent fence read 128 rows per intent
+
+§2.2.6 closed the renewal path. The intent path's own decomposition — which has
+existed since `intent::stages` and which nothing had read against this question
+— says where an intent's time goes, and one line in it is not a latency at all:
+
+> `fence_reads` **2 030 976** over 15 867 intents = **128.0 per intent**
+
+One FDB read per hosted shard, per intent, at the P2 operating point:
+**67 699 reads/s**, more than twenty times the renewal locates §2.2.4 took off
+the same single `libfdb_c` network thread docs/14-capacity.md §5.1 measured as
+one box's whole capacity. It was 22.5 % of an intent's mean server span.
+
+**Every number here is printed by `scripts/p2-intent-fence-report.py` from
+`docs/data/p2-intent-fence-2026-08-19.jsonl`**, and `--self-test` holds both
+the numbers and this section's hedges to it.
+
+#### The change is not a weakening
+
+The obvious narrowing is unavailable and the code already says so: an
+`IntentOp` carries no cell, so an intent cannot be attributed to a shard and a
+per-shard fence has nothing to select on. The whole-set fence is deliberate —
+"a node that has been partially superseded is not a node that may still mint
+durable ledger effects".
+
+The keyspace offers a better one. Fence keys are `'a' ‖ grid ‖ shard_bits`
+(`keyspace::fence_key`), so a grid's rows are **contiguous**, and
+`require_intent_fence` now reads them with **one range read** instead of 128
+point reads. Nothing about the fence's meaning moves: the same rows are read
+inside the same transaction, so they register the same read conflict ranges and
+a superseded node still cannot commit; the same values are compared against the
+same expected row; the check still runs in shard order, so the error still
+names the first shard the node no longer owns. A range read's conflict range
+spans the whole span rather than 128 points, which also conflicts on a row
+*inserted* into it — strictly stricter, in the conservative direction this
+fence already argues for.
+
+#### Measured: five interleaved pairs
+
+| | pre (n=5) | post (n=5) | |
+|---|---|---|---|
+| fence reads / intent | 128.0 | **1.0** | −99.2 %, disjoint |
+| fence stage | 1.64–1.73 ms | **0.23–0.26 ms** | **−86.1 %, disjoint** |
+| intent server span | 4.28–7.04 ms | **2.42–2.77 ms** | **−46.9 %, disjoint** |
+| commit stage | 2.16–4.99 ms | 1.90–2.24 ms | −27.7 %, overlapping |
+
+Delivered load is identical across arms (15 786–15 853 intents, 540 448–541 624
+durable acks), 10 000 leases held with `leases_lost` 0 in 10 of 10, recovery
+verified in 10 of 10.
+
+#### And one thing this section will not claim
+
+The worst journal fsync **separated by arm in all five pairs** — pre
+68.8–139.5 ms, post 13.0–30.5 ms, a disjoint −80.6 % — with `journal_commit_ms`
+p99 (−62.5 % median) and `intent_commit_ms` p99 (−50 %) following it.
+
+There is a mechanism that would explain it. On this rig FoundationDB's data
+directory and the journal are **on the same array**, so two million
+storage-server reads per run contend with the journal's fsync. The run order
+argues for it rather than against: each pair is pre-then-post, both arms write
+identical durable data, and a previous run's compaction would penalise the
+*post* run, not the pre one. There is even dose-response — `pre-r5`, the
+quietest pre run at 69.6 ms, has a commit stage indistinguishable from post's.
+
+**It is still not established here.** A five-of-five separation is p ≈ 0.03 on
+a sign test, which is thin for a claim this large, and the claim is large: if
+it is causal, part of what §2.2.2 attributed to the hardware floor — and what
+§2.2.5 repeated — was read load the intent path was inflicting on itself. The
+experiment that would settle it is FoundationDB's data directory on a device
+separate from the journal's, which this rig cannot arrange. Until then this is
+a hypothesis the data supports and a section may not promote.
+
+**`intent_commit_ms` passed once**, on `post-r3`: p99 10.0 ms against a 10.0 ms
+budget. That series failed in **43 of 43** runs of §2.2.2's baseline, whose
+best p99 ever recorded was 15.0 ms, and it failed in 9 of the 10 runs here. One
+pass in five post runs is not a passing gate, and this section does not say it
+is. What is defensible is narrower and still worth having: **every post run
+read at or better than the best of the 43-run baseline.**
+
+#### Reproducing
+
+```bash
+# §2.2.2's reproducing block builds the rig; then, per arm, with the fence
+# change applied and reverted:
+cargo build --release -p orrery_persistd --features orrery_persistd/fdb
+# interleaved, one arm per run, clearing the keyspace between runs, as §2.2.5
+python3 scripts/p2-intent-fence-report.py              # every number above
+python3 scripts/p2-intent-fence-report.py --self-test
+```
+
 ## 3. Cell actor model
 
 ### 3.1 Single writer, mailbox, state
