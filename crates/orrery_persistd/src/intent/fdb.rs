@@ -47,6 +47,7 @@ use crate::fence::{FenceRow, FenceStatus};
 use crate::keyspace;
 use crate::FdbContext;
 
+use super::stages;
 use super::{IntentError, IntentExecutor};
 
 /// The retry bound on `not_committed` conflicts (docs/08-persistence.md §7:
@@ -181,12 +182,22 @@ impl FdbIntentExecutor {
             return Ok(Vec::new());
         }
 
-        let mut allocator = self.allocator.lock().await;
+        // Two stages, not one, and the split is the whole reason to measure
+        // here: `alloc_wait` is the queue behind a process-wide mutex, and
+        // `alloc_refill` is the FDB transaction that mutex is held **across**
+        // roughly every `PERSIST_ID_BLOCK_GRANT` ids. A refill that lands in
+        // the tail stalls every concurrent intent, and averaged into one
+        // number it is invisible.
+        let mut allocator = stages::timed(|t| &mut t.alloc_wait_us, self.allocator.lock()).await;
         if allocator.remaining() < count {
             // Do not recycle an incomplete grant. Its ids remain permanently
             // reserved, including when this executor is dropped mid-flight.
             let len = PERSIST_ID_BLOCK_GRANT.max(count);
-            let start = reserve_id_block(&self.db, self.grid, len).await?;
+            let start = stages::timed(
+                |t| &mut t.alloc_refill_us,
+                reserve_id_block(&self.db, self.grid, len),
+            )
+            .await?;
             allocator.next = start;
             allocator.end = start
                 .checked_add(len)
@@ -235,11 +246,33 @@ async fn require_intent_fence(
     // `join_all` keeps the results in shard order, so a superseded node still
     // fails with the *first* shard it no longer owns rather than whichever
     // read lost a race — the message is reproducible across retries.
+    //
+    // Each read is timed individually as well as the fan-out as a whole,
+    // because those two numbers answer different questions and only their
+    // *difference* is diagnostic. The fan-out completes when the slowest read
+    // does, so `fence_us` large **with** `fence_read_max_us` large means the
+    // cluster served one read slowly; `fence_us` large with every individual
+    // read fast means the time went between the reads resolving and this task
+    // being polled again — a scheduler symptom wearing an FDB costume.
     let reads = fence.shards.iter().map(|&shard| {
         let key = keyspace::fence_key(grid, shard);
-        async move { (shard, trx.get(&key, false).await) }
+        async move {
+            let started = std::time::Instant::now();
+            let raw = trx.get(&key, false).await;
+            (shard, raw, started.elapsed().as_micros() as u64)
+        }
     });
-    for (shard, raw) in futures::future::join_all(reads).await {
+    let fence_started = std::time::Instant::now();
+    let results = futures::future::join_all(reads).await;
+    let fence_us = fence_started.elapsed().as_micros() as u64;
+    let read_max_us = results.iter().map(|&(_, _, us)| us).max().unwrap_or(0);
+    let reads_issued = results.len() as u64;
+    stages::trace(|t| {
+        t.fence_us += fence_us;
+        t.fence_reads += reads_issued;
+        t.fence_read_max_us = t.fence_read_max_us.max(read_max_us);
+    });
+    for (shard, raw, _read_us) in results {
         let current: Option<FenceRow> = raw?
             .map(|bytes| postcard::from_bytes(bytes.as_ref()))
             .transpose()
@@ -272,12 +305,21 @@ impl IntentExecutor for FdbIntentExecutor {
         // (non-retryable) error, which `run` surfaces verbatim.
         let attempts = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
 
+        // The retry loop's own instrumentation. Before this, `attempts` was
+        // maintained only to enforce the retry bound and was dropped when
+        // `execute` returned, so "does `db.run` retry at all?" had no answer
+        // available from any artifact in this repo — and "conflicts are zero"
+        // does not answer it, because `on_error` also fires on 1007, 1009,
+        // 1021, 1037 and 1213.
+        let hooks = std::sync::Arc::new(IntentRunnerHooks::default());
+
         let result: Result<IntentOutcome, FdbBindingError> = self
             .db
-            .run(|trx, _maybe_committed| {
+            .run_with_hooks(hooks.as_ref(), |trx, _maybe_committed| {
                 let intent = intent.clone();
                 let minted = minted.clone();
                 let fence = fence.clone();
+                let hooks = std::sync::Arc::clone(&hooks);
                 let attempt = attempts.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
                 async move {
                     if attempt > MAX_CONFLICT_RETRIES + 1 {
@@ -291,10 +333,26 @@ impl IntentExecutor for FdbIntentExecutor {
                     // return the recorded outcome unchanged. This is also the
                     // `commit_unknown_result` recovery path: a retried commit
                     // that actually landed is observed here as a replay.
+                    // The read version, taken explicitly and first.
+                    //
+                    // It is not an extra round trip: the idempotency read
+                    // below cannot return without one, so libfdb_c would fetch
+                    // it here anyway. Taking it by name turns GRV — which sits
+                    // on the critical path of every intent including a pure
+                    // replay, and which confirms liveness against the tlogs,
+                    // i.e. against the same md2 array the journal fsyncs to —
+                    // into a stage that can be blamed, instead of an invisible
+                    // prefix of the read that follows it.
+                    let read_version =
+                        stages::timed(|t| &mut t.grv_us, trx.get_read_version()).await?;
+
                     let ikey = keyspace::intent_key(intent.intent_id);
-                    if let Some(prev) = trx.get(&ikey, false).await? {
+                    let previous =
+                        stages::timed(|t| &mut t.idem_read_us, trx.get(&ikey, false)).await?;
+                    if let Some(prev) = previous {
                         let row: keyspace::IntentRow =
                             postcard::from_bytes(&prev).map_err(store_err("intent row decode"))?;
+                        hooks.mark_closure_end();
                         return Ok(row.outcome);
                     }
 
@@ -316,7 +374,9 @@ impl IntentExecutor for FdbIntentExecutor {
                     // cluster-issued, strictly-ordered stand-in, honest in a
                     // way the gateway's old AtomicU64 counter never was (the
                     // commit version cannot be read inside the transaction).
-                    let read_version = trx.get_read_version().await?;
+                    // It is the version taken at the top of this closure: the
+                    // binding caches it for the transaction's whole life, so
+                    // re-reading it here only ever returned the same number.
                     let tick = orrery_protocol::Tick::new(read_version as u64);
 
                     // Step 2: use ids from the executor's already-durable
@@ -335,14 +395,108 @@ impl IntentExecutor for FdbIntentExecutor {
                     let encoded =
                         postcard::to_stdvec(&row).map_err(store_err("intent row encode"))?;
                     trx.set(&ikey, &encoded);
+                    // The closure is done; everything after this point inside
+                    // `run_with_hooks` is the commit. Stamping here is what
+                    // lets `on_commit_success` report the commit in
+                    // microseconds — the hook's own `commit_duration_ms` is
+                    // milliseconds, too coarse against a 6-8 ms median.
+                    hooks.mark_closure_end();
                     Ok(outcome)
                 }
             })
             .await;
 
+        stages::trace(|t| {
+            t.attempts += u64::from(attempts.load(std::sync::atomic::Ordering::Relaxed));
+        });
+        hooks.fold_into_trace();
+
         match result {
             Ok(outcome) => Ok(outcome),
             Err(e) => Err(unwrap_binding_error(e)),
+        }
+    }
+}
+
+/// Retry-loop instrumentation for one intent's `db.run`.
+///
+/// `foundationdb`'s runner already offers exactly the observations this path
+/// was missing ([`foundationdb::Database::run_with_hooks`]); the only thing
+/// added here is microsecond resolution, which the hooks' own millisecond
+/// durations do not have. The commit is timed from a stamp the closure takes
+/// as its last act, so `commit_us` is the true gap between "the closure
+/// finished" and "the commit resolved" — the phase that fsyncs on the same
+/// md2 array as the journal.
+///
+/// One instance per `execute` call, so no field needs to be reset. All fields
+/// are `Mutex`-guarded rather than atomic because `run_with_hooks` takes
+/// `&H` across an await and therefore requires `Sync`; the locks are
+/// uncontended by construction (one intent, one task) and never held across
+/// an await.
+#[derive(Debug, Default)]
+struct IntentRunnerHooks {
+    closure_end: std::sync::Mutex<Option<std::time::Instant>>,
+    commit_us: std::sync::Mutex<u64>,
+    backoff_us: std::sync::Mutex<u64>,
+    last_err_code: std::sync::Mutex<u64>,
+}
+
+impl IntentRunnerHooks {
+    /// Stamp the moment the closure finished, on every exit path it has.
+    fn mark_closure_end(&self) {
+        if let Ok(mut slot) = self.closure_end.lock() {
+            *slot = Some(std::time::Instant::now());
+        }
+    }
+
+    /// Fold what the retry loop observed into the task's intent trace.
+    fn fold_into_trace(&self) {
+        let commit_us = self.commit_us.lock().map(|v| *v).unwrap_or(0);
+        let backoff_us = self.backoff_us.lock().map(|v| *v).unwrap_or(0);
+        let code = self.last_err_code.lock().map(|v| *v).unwrap_or(0);
+        stages::trace(|t| {
+            t.commit_us += commit_us;
+            t.backoff_us += backoff_us;
+            if code != 0 {
+                t.last_err_code = code;
+            }
+        });
+    }
+
+    fn note_error(&self, code: i32) {
+        if let Ok(mut slot) = self.last_err_code.lock() {
+            *slot = code.unsigned_abs().into();
+        }
+    }
+}
+
+impl foundationdb::RunnerHooks for IntentRunnerHooks {
+    async fn on_commit_error(
+        &self,
+        err: &foundationdb::TransactionCommitError,
+    ) -> foundationdb::FdbResult<()> {
+        self.note_error(err.code());
+        Ok(())
+    }
+
+    fn on_closure_error(&self, err: &foundationdb::FdbError) {
+        self.note_error(err.code());
+    }
+
+    fn on_error_duration(&self, duration_ms: u64) {
+        if let Ok(mut slot) = self.backoff_us.lock() {
+            *slot += duration_ms * 1_000;
+        }
+    }
+
+    fn on_commit_success(
+        &self,
+        _committed: &foundationdb::TransactionCommitted,
+        _commit_duration_ms: u64,
+    ) {
+        let started = self.closure_end.lock().ok().and_then(|slot| *slot);
+        if let (Some(started), Ok(mut slot)) = (started, self.commit_us.lock()) {
+            *slot += started.elapsed().as_micros() as u64;
         }
     }
 }

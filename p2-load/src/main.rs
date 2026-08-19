@@ -178,6 +178,37 @@ const CLAIM_PHASE_TIMEOUT: Duration = Duration::from_secs(120);
 /// claim bucket.
 const LEASE_HEARTBEAT: Duration = Duration::from_secs(3);
 
+/// Override for [`LEASE_HEARTBEAT`], in milliseconds
+/// (`P2_LOAD_LEASE_HEARTBEAT_MS`).
+///
+/// A study knob, not a deployment one. The renewal cadence is a *cause* of
+/// intent latency on this rig, not just a background chore: every session's
+/// whole entity set is renewed in one pass of the drive loop, so at 250
+/// sessions x 40 entities the gateway receives ~10 000 lease renewals inside a
+/// few milliseconds and turns each into a `LeaseStore::locate` -- an FDB read.
+/// Being able to move the period is what turns "the intent tail is periodic at
+/// exactly this cadence" from a coincidence into a causal claim: halve the
+/// frequency and the fraction of intents caught in a burst must halve with it.
+fn lease_heartbeat_period() -> Duration {
+    std::env::var("P2_LOAD_LEASE_HEARTBEAT_MS")
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .map_or(LEASE_HEARTBEAT, Duration::from_millis)
+}
+
+/// Whether to spread each session's renewal across the period instead of
+/// renewing every session in one pass (`P2_LOAD_HEARTBEAT_PHASED=1`).
+///
+/// Bulk flushes are already phased per session (`session_flush_phase`); the
+/// heartbeat is not, and that asymmetry is the whole of the burst. A real
+/// deployment's clients are not phase-aligned to each other, so a synchronized
+/// renewal is a property of this load generator rather than of the workload it
+/// stands for -- which is exactly why it has to be switchable rather than
+/// argued about.
+fn heartbeat_phased() -> bool {
+    std::env::var("P2_LOAD_HEARTBEAT_PHASED").is_ok_and(|v| v == "1")
+}
+
 fn main() -> ExitCode {
     match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -1844,7 +1875,14 @@ impl Rig<'_> {
     /// One batched `Heartbeat` per session. Heartbeats do not change the
     /// durable sequence or the token (`lease.rs::heartbeat`), so the
     /// `(lease_id, seq)` the rig carries on its diffs stays valid across them.
-    async fn heartbeat_leases(&self) {
+    ///
+    /// Renews the leases held by exactly the named sessions, rather than every
+    /// session at once as it used to. Which of the two it does is the
+    /// difference between the gateway receiving ~10 000 lease renewals inside
+    /// a few milliseconds and receiving them spread over three seconds -- and
+    /// each renewal is a `LeaseStore::locate`, i.e. an FDB read, so an
+    /// all-sessions pass is an FDB burst.
+    async fn heartbeat_sessions(&self, due: &[usize]) {
         let sessions = self.sessions.len().max(1);
         let mut per_session: Vec<Vec<(PersistId, LeaseId)>> = vec![Vec::new(); sessions];
         for (index, placement) in self.inventory.iter().enumerate() {
@@ -1854,7 +1892,7 @@ impl Rig<'_> {
             }
         }
         for (session, renew) in per_session.into_iter().enumerate() {
-            if renew.is_empty() {
+            if renew.is_empty() || !due.contains(&session) {
                 continue;
             }
             send_msg(
@@ -1921,7 +1959,21 @@ impl Rig<'_> {
         let mut next_session_flush = (0..sessions)
             .map(|session| start + session_phase_period * session_flush_phase(session) as u32)
             .collect::<Vec<_>>();
-        let mut next_heartbeat = start + LEASE_HEARTBEAT;
+        let heartbeat_period = lease_heartbeat_period();
+        let phased = heartbeat_phased();
+        // Phased: session `i` renews at `i/sessions` of the way through the
+        // period, so the same renewals reach the gateway spread evenly instead
+        // of all at once. Unphased (the default, and what every published
+        // number was measured on): one pass over every session.
+        let mut next_session_heartbeat: Vec<Instant> = (0..sessions)
+            .map(|session| {
+                if phased {
+                    start + heartbeat_period.mul_f64(session as f64 / sessions as f64)
+                } else {
+                    start + heartbeat_period
+                }
+            })
+            .collect();
         let mut quic_rtt = LatencyHistogram::new();
         let mut next_rtt_sample = start;
         let mut max_rx_backlog = 0u64;
@@ -1958,9 +2010,16 @@ impl Rig<'_> {
             // Leases expire 10 s after their last renewal, so a 30 s run that
             // did not heartbeat would start being fenced out a third of the
             // way in and report the rejections as latency.
-            if now >= next_heartbeat {
-                self.heartbeat_leases().await;
-                next_heartbeat = now + LEASE_HEARTBEAT;
+            let due: Vec<usize> = next_session_heartbeat
+                .iter()
+                .enumerate()
+                .filter_map(|(session, at)| (now >= *at).then_some(session))
+                .collect();
+            if !due.is_empty() {
+                self.heartbeat_sessions(&due).await;
+                for session in due {
+                    next_session_heartbeat[session] = now + heartbeat_period;
+                }
             }
 
             // ── Path time ────────────────────────────────────────────────
@@ -2198,6 +2257,18 @@ impl Rig<'_> {
             // this side of the socket.
             max_rx_backlog,
             intent_p99_us = intents.intent_latency().p99().as_micros() as u64,
+            // Same population, stopped at the ack's arrival instead of at the
+            // rig's handling of it. The difference between the two is this
+            // rig's dispatch delay, and it is the only way to tell a
+            // server-side tail from a client-side one without a new series.
+            intent_arrival_p50_us = intents.arrival_latency().p50().as_micros() as u64,
+            intent_arrival_p90_us = intents.arrival_latency().p90().as_micros() as u64,
+            intent_arrival_p99_us = intents.arrival_latency().p99().as_micros() as u64,
+            intent_arrival_max_us = intents
+                .arrival_latency()
+                .max()
+                .unwrap_or_default()
+                .as_micros() as u64,
             "run complete"
         );
         if stats.leases_lost > 0 {
@@ -2343,7 +2414,10 @@ impl Rig<'_> {
                 if matches!(outcome, IntentOutcome::Committed { .. }) {
                     stats.intent_acks += 1;
                 }
-                intents.on_ack(intent_id, outcome);
+                // The arrival stamp the bulk arms already use. It was
+                // dropped here, which put this rig's own poll cadence inside
+                // `intent_commit_ms` and inside no other D16 series.
+                intents.on_ack_at(intent_id, outcome, received_at);
                 // Retire the settled intent, which is what `IntentQueue`'s
                 // contract asks of a client that has observed the terminal
                 // status — and what the rig was not doing.

@@ -128,6 +128,18 @@ pub struct IntentQueue {
     store: Box<dyn QueueStore>,
     /// Intent-commit latency histogram (D16: intent commit p99 < 10 ms).
     intent_latency: LatencyHistogram,
+    /// The same round trip measured to the ack's **arrival**, not to the
+    /// moment this queue got around to handling it.
+    ///
+    /// [`Self::intent_latency`] stops at `on_ack`, which a client calls from
+    /// its own poll loop — so the caller's poll cadence is inside the gated
+    /// series and inside no other. Every other D16 series is arrival-stamped
+    /// (the bulk path threads a `received_at` through `on_ack_at`), and the
+    /// intent path was the one that was not, which made "the tail is
+    /// server-side" impossible to check from this end. Recorded only when the
+    /// caller supplies the stamp; the difference between the two histograms
+    /// **is** the client's own dispatch delay.
+    arrival_latency: LatencyHistogram,
 }
 
 impl Default for IntentQueue {
@@ -137,6 +149,7 @@ impl Default for IntentQueue {
             capacity: 4096,
             store: Box::new(crate::queue_store::MemQueueStore::new()),
             intent_latency: LatencyHistogram::new(),
+            arrival_latency: LatencyHistogram::new(),
         }
     }
 }
@@ -150,6 +163,7 @@ impl IntentQueue {
             capacity,
             store: Box::new(crate::queue_store::MemQueueStore::new()),
             intent_latency: LatencyHistogram::new(),
+            arrival_latency: LatencyHistogram::new(),
         }
     }
 
@@ -174,6 +188,7 @@ impl IntentQueue {
             capacity,
             store,
             intent_latency: LatencyHistogram::new(),
+            arrival_latency: LatencyHistogram::new(),
         }
     }
 
@@ -272,6 +287,32 @@ impl IntentQueue {
     /// On `Committed`, the submit→ack round trip is recorded in the
     /// intent-commit latency histogram (D16: intent commit p99 < 10 ms).
     pub fn on_ack(&mut self, intent_id: u128, outcome: IntentOutcome) -> Option<IntentTicket> {
+        self.on_ack_inner(intent_id, outcome, None)
+    }
+
+    /// [`Self::on_ack`], plus the instant the ack was taken off the socket.
+    ///
+    /// Both histograms move: the gated one to `Instant::now()` as before, and
+    /// [`Self::arrival_latency`] to `received_at`. Keeping the gated series
+    /// unchanged is deliberate — it is what D16 has always measured, and
+    /// silently redefining a failing series to a shorter span would be a way
+    /// of passing a gate rather than of answering it. The second histogram is
+    /// how much of that series is the caller's own poll loop.
+    pub fn on_ack_at(
+        &mut self,
+        intent_id: u128,
+        outcome: IntentOutcome,
+        received_at: Instant,
+    ) -> Option<IntentTicket> {
+        self.on_ack_inner(intent_id, outcome, Some(received_at))
+    }
+
+    fn on_ack_inner(
+        &mut self,
+        intent_id: u128,
+        outcome: IntentOutcome,
+        received_at: Option<Instant>,
+    ) -> Option<IntentTicket> {
         let entry = self
             .queue
             .iter_mut()
@@ -280,6 +321,13 @@ impl IntentQueue {
             IntentOutcome::Committed { tick, .. } => {
                 // Intent-latency: time from submission to commit ack.
                 self.intent_latency.record(entry.submitted_at.elapsed());
+                if let Some(received_at) = received_at {
+                    self.arrival_latency.record(
+                        received_at
+                            .checked_duration_since(entry.submitted_at)
+                            .unwrap_or_default(),
+                    );
+                }
                 IntentStatus::Committed(*tick)
             }
             IntentOutcome::Rejected { .. } => IntentStatus::Rejected(outcome.clone()),
@@ -356,6 +404,16 @@ impl IntentQueue {
     #[must_use]
     pub fn intent_latency(&self) -> &LatencyHistogram {
         &self.intent_latency
+    }
+
+    /// Submit-through-**arrival** latency, populated only by
+    /// [`Self::on_ack_at`].
+    ///
+    /// Empty on a client that calls [`Self::on_ack`]; a total of zero means
+    /// "not measured", never "zero delay".
+    #[must_use]
+    pub fn arrival_latency(&self) -> &LatencyHistogram {
+        &self.arrival_latency
     }
 }
 
@@ -537,6 +595,57 @@ mod tests {
         assert_eq!(queue.status(IntentTicket(1)), IntentStatus::Queued);
         // Intent 2 is still InFlight (not expired).
         assert_eq!(queue.status(IntentTicket(2)), IntentStatus::InFlight);
+    }
+
+    #[test]
+    fn arrival_latency_excludes_the_caller_poll_delay() {
+        let mut queue = IntentQueue::new(10);
+        queue.submit(intent(1)).unwrap();
+        queue.drain();
+        // The ack arrived now; the client only gets round to handling it after
+        // a poll interval, which is what the sleep below stands in for.
+        let received_at = Instant::now();
+        std::thread::sleep(Duration::from_millis(20));
+
+        queue.on_ack_at(
+            1,
+            IntentOutcome::Committed {
+                tick: Tick::new(1),
+                minted: vec![],
+            },
+            received_at,
+        );
+
+        assert_eq!(queue.intent_latency().total(), 1);
+        assert_eq!(queue.arrival_latency().total(), 1);
+        let handled = queue.intent_latency().max().unwrap();
+        let arrived = queue.arrival_latency().max().unwrap();
+        assert!(
+            handled >= arrived + Duration::from_millis(15),
+            "the gated series must still contain the 20 ms poll delay \
+             (handled {handled:?}, arrived {arrived:?}); if these two are equal the \
+             arrival stamp is being ignored and the split says nothing"
+        );
+    }
+
+    #[test]
+    fn arrival_latency_is_empty_when_no_stamp_is_supplied() {
+        let mut queue = IntentQueue::new(10);
+        queue.submit(intent(1)).unwrap();
+        queue.drain();
+        queue.on_ack(
+            1,
+            IntentOutcome::Committed {
+                tick: Tick::new(1),
+                minted: vec![],
+            },
+        );
+        assert_eq!(queue.intent_latency().total(), 1);
+        assert_eq!(
+            queue.arrival_latency().total(),
+            0,
+            "a total of zero must mean 'not measured', never 'zero delay'"
+        );
     }
 
     #[test]

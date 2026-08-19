@@ -894,6 +894,71 @@ the whole run. What that buys:
   engines** — 50× the latency for 26 % more rate. This, not the bulk path, is
   the knee this box still has.
 
+> **Superseded 2026-08-19 — the tail is decomposed, and it is two things.**
+> The p50 and saturation findings above stand unchanged. The **tail** rows do
+> not mean what this section implies.
+>
+> The "150 ms" in the `ia*` rows is **a load-generator artifact stacked on the
+> device**, not an intent-path cost. `IntentStageMetrics` splits the intent
+> span into `ingress / admit / spawn_wait / {alloc, grv, idem_read, fence,
+> commit, backoff} / reply` plus two explicit residuals. `p2-load` renewed
+> every session's whole entity set in one pass of its drive loop, so 10 000
+> lease renewals reached the gateway inside a few milliseconds every
+> `LEASE_HEARTBEAT` (3 s); inside a caught intent that time lands on **GRV**,
+> and phasing the same renewals across the period (`P2_LOAD_HEARTBEAT_PHASED`)
+> drops run-total GRV by an order of magnitude and removes the periodicity.
+> What phasing leaves behind is **FoundationDB's own commit fsync**, in the
+> same device stall window as `journal_commit_ms`. The `ib40k-xhi` saturation
+> rows are unaffected: at ~1 300 intents/s the FDB client thread is genuinely
+> at 94 %.
+>
+> **"The tail is the server's" is now open, not established.** Its original
+> evidence was one histogram bucket wide — both sides share the D16 lattice,
+> whose neighbours here are 100 / 150 / 200 ms, so two p99s in the same bucket
+> cannot agree to better than 50 ms, the width of the effect. The replacement
+> evidence has since been withdrawn as well, and §2.2.1 does not re-establish
+> the claim: over the 21 loaded runs the client's arrival-stamped excess over
+> the server's maximum is 0.15–11.17 ms and exceeds 1 ms in **4 of them**.
+> Bounding client-side time needs an instrument that does not exist yet.
+>
+> **The quantitative claims all live in
+> [08-persistence.md](08-persistence.md) §2.2.1**, where every one of them is
+> printed by `scripts/intent-tail-derive.py` from the raw sweep and carries the
+> population it is drawn from. This note points at them rather than restating
+> them, because the version of it published first *did* restate them and got
+> five wrong in the same direction.
+>
+> **What this note said on first publication, and what §2.2.1 says now** — left
+> visible for the same reason [08-persistence.md](08-persistence.md) §2.1.3's
+> own correction is:
+>
+> * *"the client's arrival-stamped maximum for a run is within 1 ms of the
+>   server's, 158.40 against 157.41 ms … the rig's poll cadence is worth ~2 ms
+>   at p50 and nothing at p99."* The 1 ms bound is **withdrawn** (see above);
+>   the poll-cadence figure is **deleted** — no artifact in the sweep produces
+>   it. `IntentQueue::on_ack_at` stamping the ack on arrival remains the right
+>   fix for the *measurement*; it is not evidence that the client side is quiet.
+> * *"`batch_locks` reads 10 000 in exactly the intervals that spike and 0 in
+>   every other."* **Corrected to 8 of 9.** One spike interval and one lock
+>   interval do not pair — a burst straddling a 250 ms report boundary.
+> * *"the whole stage set summing to within 20 µs of it."* **Deleted as
+>   imprecise.** §2.2.1 closes the arithmetic three ways instead, against both
+>   emitted residuals rather than against a hand-quoted tolerance.
+> * *"collapses the tail's GRV from 65 ms to 0.7 ms."* **Withdrawn**: it paired
+>   two single runs drawn from different legs. §2.2.1 states the run-total GRV
+>   ranges with the populations behind them.
+> * *"equal at the extremes (200.7/201.4, 175.9/175.3, 355.7/351.3 ms)."*
+>   **Withdrawn**: three hand-picked rows of six, with the two that disagree
+>   omitted. The supported claim is *the same device stall window*; the pooled
+>   correlation is mostly the regime switch moving both columns together, and
+>   within either regime it is much weaker.
+> * *"0.0 % of intents past 20 ms."* **Corrected to 0.03 %** (2 of 6 089).
+> * *"the decomposition at 972 intents/s agrees with the `status json` figures
+>   below."* **Deleted.** Those figures come from an artifact set the derive
+>   script does not read, so §2.2.1 makes no comparison against them and
+>   neither does this note.
+
+
 **What runs out there is the FoundationDB client's network thread — the same
 single thread as before #86.** Its utilisation against intent rate, both arms,
 bulk held at 35 k: 18–24 % at ~200 intents/s, 66–75 % at ~1 030, and
