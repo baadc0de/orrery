@@ -66,6 +66,7 @@ use orrery_protocol::{
 use crate::actor::{FencedApply, Reject};
 use crate::adjudication::AdjudicationExecutor;
 use crate::cluster::{LeaseRenewal, Router};
+use crate::intent::stages::{self, intent_stage_metrics, IntentStageSnapshot, IntentTrace};
 use crate::intent::{
     error_outcome, IntentContext, IntentVerdict, PermissiveValidator, SharedExecutor,
     SharedValidator,
@@ -3295,6 +3296,23 @@ const LEASE_RECORD_KIND: &str = "gateway_lease";
 /// [`crate::cluster::RouteStageMetrics`].
 const ROUTE_STAGE_RECORD_KIND: &str = "gateway_route_stage";
 
+/// The intent-path stage decomposition, on the same additive-record footing.
+///
+/// Emitted **twice** per interval: `"scope":"all"` over every intent that got
+/// a definitive reply, and `"scope":"slow"` over only those whose server span
+/// exceeded [`crate::intent::stages::slow_threshold_us`]. The second is the
+/// point — a p99 cannot be read out of a mean, and the tail's own stage
+/// decomposition is what attributes it. See [`crate::intent::stages`] for the
+/// denominators, which are **not** the same for the gateway stages and the
+/// FDB stages.
+const INTENT_STAGE_RECORD_KIND: &str = "gateway_intent_stage";
+
+/// The single slowest intent of a report interval, stage by stage.
+///
+/// A mean over the tail still averages; this is one real sample, so a 150 ms
+/// intent can be read off directly rather than reconstructed.
+const INTENT_EXEMPLAR_RECORD_KIND: &str = "gateway_intent_exemplar";
+
 /// Append the transport-boundary histograms to [`BOUNDARY_JSONL_ENV`]'s file
 /// on a fixed interval, as `sample_batch` records, plus the bulk-ingress
 /// admission counters as [`INGRESS_RECORD_KIND`] records.
@@ -3307,6 +3325,89 @@ const ROUTE_STAGE_RECORD_KIND: &str = "gateway_route_stage";
 /// actually read. This is the "overload is a number, not a latency" half of
 /// the contract in [`GatewayIngressMetrics`] — the JSONL half only exists
 /// when a sink is configured, the log line always does.
+/// Render one [`IntentStageSnapshot`] as an [`INTENT_STAGE_RECORD_KIND`]
+/// record.
+///
+/// Written field by field rather than through a serializer so the JSONL stays
+/// dependency-free and every key is greppable in this file — the same choice
+/// the route-stage record above makes.
+fn intent_stage_fields(scope: &str, d: &IntentStageSnapshot) -> String {
+    let mut out = format!("{{\"type\":\"{INTENT_STAGE_RECORD_KIND}\",\"scope\":\"{scope}\"");
+    for (key, value) in [
+        ("intents", d.intents),
+        ("executed", d.executed),
+        ("attempts", d.attempts),
+        ("alloc_refills", d.alloc_refills),
+        ("fence_reads", d.fence_reads),
+        ("ingress_us_sum", d.ingress_us_sum),
+        ("ingress_us_max", d.ingress_us_max),
+        ("admit_us_sum", d.admit_us_sum),
+        ("admit_us_max", d.admit_us_max),
+        ("spawn_wait_us_sum", d.spawn_wait_us_sum),
+        ("spawn_wait_us_max", d.spawn_wait_us_max),
+        ("exec_us_sum", d.exec_us_sum),
+        ("exec_us_max", d.exec_us_max),
+        ("alloc_wait_us_sum", d.alloc_wait_us_sum),
+        ("alloc_wait_us_max", d.alloc_wait_us_max),
+        ("alloc_refill_us_sum", d.alloc_refill_us_sum),
+        ("alloc_refill_us_max", d.alloc_refill_us_max),
+        ("grv_us_sum", d.grv_us_sum),
+        ("grv_us_max", d.grv_us_max),
+        ("idem_read_us_sum", d.idem_read_us_sum),
+        ("idem_read_us_max", d.idem_read_us_max),
+        ("fence_us_sum", d.fence_us_sum),
+        ("fence_us_max", d.fence_us_max),
+        ("fence_read_max_us", d.fence_read_max_us),
+        ("commit_us_sum", d.commit_us_sum),
+        ("commit_us_max", d.commit_us_max),
+        ("backoff_us_sum", d.backoff_us_sum),
+        ("backoff_us_max", d.backoff_us_max),
+        ("server_us_sum", d.server_us_sum),
+        ("server_us_max", d.server_us_max),
+        ("reply_us_sum", d.reply_us_sum),
+        ("reply_us_max", d.reply_us_max),
+        ("server_gap_us_sum", d.server_gap_us_sum),
+        ("server_gap_us_max", d.server_gap_us_max),
+        ("fdb_gap_us_sum", d.fdb_gap_us_sum),
+        ("fdb_gap_us_max", d.fdb_gap_us_max),
+    ] {
+        out.push_str(&format!(",\"{key}\":{value}"));
+    }
+    out.push_str("}\n");
+    out
+}
+
+/// Render one intent's whole trace as an [`INTENT_EXEMPLAR_RECORD_KIND`]
+/// record, including both derived gaps so a reader never has to subtract.
+fn intent_exemplar_record(t: &IntentTrace) -> String {
+    let mut out = format!("{{\"type\":\"{INTENT_EXEMPLAR_RECORD_KIND}\"");
+    for (key, value) in [
+        ("server_us", t.server_us),
+        ("ingress_us", t.ingress_us),
+        ("admit_us", t.admit_us),
+        ("spawn_wait_us", t.spawn_wait_us),
+        ("exec_us", t.exec_us),
+        ("alloc_wait_us", t.alloc_wait_us),
+        ("alloc_refill_us", t.alloc_refill_us),
+        ("grv_us", t.grv_us),
+        ("idem_read_us", t.idem_read_us),
+        ("fence_us", t.fence_us),
+        ("fence_read_max_us", t.fence_read_max_us),
+        ("fence_reads", t.fence_reads),
+        ("commit_us", t.commit_us),
+        ("backoff_us", t.backoff_us),
+        ("attempts", t.attempts),
+        ("last_err_code", t.last_err_code),
+        ("reply_us", t.reply_us),
+        ("server_gap_us", t.server_gap_us()),
+        ("fdb_gap_us", t.fdb_gap_us()),
+    ] {
+        out.push_str(&format!(",\"{key}\":{value}"));
+    }
+    out.push_str("}\n");
+    out
+}
+
 fn spawn_boundary_reporter(metrics: Arc<GatewayMetrics>) {
     // The sink is optional; the reporter is not. Shed counters reach the log
     // on every node, configured sink or none, because the deployment that
@@ -3338,6 +3439,9 @@ fn spawn_boundary_reporter(metrics: Arc<GatewayMetrics>) {
         let mut lease_cursor = GatewayLeaseSnapshot::default();
         let route_stages = crate::cluster::route_stage_metrics();
         let mut route_stage_cursor = crate::cluster::RouteStageSnapshot::default();
+        let intent_stages = intent_stage_metrics();
+        let mut intent_all_cursor = IntentStageSnapshot::default();
+        let mut intent_slow_cursor = IntentStageSnapshot::default();
         loop {
             tokio::time::sleep(BOUNDARY_REPORT_INTERVAL).await;
             let ingress = metrics.ingress.snapshot();
@@ -3434,6 +3538,25 @@ fn spawn_boundary_reporter(metrics: Arc<GatewayMetrics>) {
                     route_delta.location_audit_us_sum,
                     route_delta.location_audit_us_max,
                 ));
+            }
+            // Same delta discipline as the route stages above, and the same
+            // warning about denominators: gateway stages divide by `intents`,
+            // FDB stages by `executed`. The `slow` scope carries the tail's own
+            // decomposition; the exemplar carries one real tail sample.
+            let intent_all = intent_stages.all.snapshot();
+            let intent_slow = intent_stages.slow.snapshot();
+            let all_delta = intent_all.delta(intent_all_cursor);
+            let slow_delta = intent_slow.delta(intent_slow_cursor);
+            intent_all_cursor = intent_all;
+            intent_slow_cursor = intent_slow;
+            if all_delta.intents > 0 {
+                out.push_str(&intent_stage_fields("all", &all_delta));
+                if slow_delta.intents > 0 {
+                    out.push_str(&intent_stage_fields("slow", &slow_delta));
+                }
+                if let Some(exemplar) = intent_stages.take_exemplar() {
+                    out.push_str(&intent_exemplar_record(&exemplar));
+                }
             }
             ingress_cursor = ingress;
             lease_cursor = lease;
@@ -3971,13 +4094,26 @@ async fn handle_connection(
                     issuer: remote,
                     account: session.as_ref().map(|session| session.account),
                 };
-                if let Err(outcome) = admit_intent(&intent, validator.as_ref(), &cx) {
+                // The wait upstream of `received_at`, carried into the intent's
+                // own stage record. It is already summed into
+                // `gateway_ingress_queue_ms`, but that series is ~100:1 diffs
+                // by count, so an intent-specific ingress tail is
+                // arithmetically invisible in it.
+                let mut trace = IntentTrace {
+                    ingress_us: ingress_queue_us,
+                    ..IntentTrace::default()
+                };
+                let admit = admit_intent(&intent, validator.as_ref(), &cx);
+                trace.admit_us = elapsed_us(received_at);
+                if let Err(outcome) = admit {
                     send_intent_reply(
                         send.as_ref(),
                         intent.intent_id,
                         outcome,
                         &metrics.intent,
                         received_at,
+                        trace,
+                        false,
                     );
                     continue;
                 }
@@ -3986,6 +4122,11 @@ async fn handle_connection(
                         let send = Arc::clone(&send);
                         let executor = executor.clone();
                         let metrics = Arc::clone(&metrics);
+                        // Stamped on the receive loop, read as the spawned
+                        // task's first act: the difference is the runtime's
+                        // own queueing delay, which is otherwise billed to the
+                        // executor.
+                        let spawn_at = Instant::now();
                         tokio::spawn(async move {
                             let _permit = permit;
                             execute_admitted_intent(
@@ -3994,6 +4135,8 @@ async fn handle_connection(
                                 &executor,
                                 &metrics.intent,
                                 received_at,
+                                trace,
+                                spawn_at,
                             )
                             .await;
                         });
@@ -4011,6 +4154,8 @@ async fn handle_connection(
                             outcome,
                             &metrics.intent,
                             received_at,
+                            trace,
+                            false,
                         );
                     }
                 }
@@ -4965,27 +5110,52 @@ fn admit_intent(
 /// Execute an intent that already passed the edge checks, then send its
 /// definitive result. This is intentionally separate from [`admit_intent`]
 /// so an FDB await never occupies the connection receive loop.
+#[allow(clippy::too_many_arguments)]
 async fn execute_admitted_intent(
     send: &(dyn Fn(Bytes) + Send + Sync),
     intent: Intent,
     executor: &Option<SharedExecutor>,
     metrics: &GatewayIntentMetrics,
     received_at: Instant,
+    seed: IntentTrace,
+    spawn_at: Instant,
 ) {
     let intent_id = intent.intent_id;
+    let executed = executor.is_some();
 
-    // 4. Execution — ack only after the future resolves. An executor error
-    //    becomes a definitive rejection (bounded-retry refusal, §7).
-    let outcome = match executor {
-        None => IntentOutcome::Rejected {
-            reason: REASON_NO_EXECUTOR,
-        },
-        Some(exec) => match exec.execute(&intent).await {
-            Ok(outcome) => outcome,
-            Err(err) => error_outcome(&err),
-        },
-    };
-    send_intent_reply(send, intent_id, outcome, metrics, received_at);
+    // The trace is task-scoped rather than threaded through
+    // `IntentExecutor::execute`: that trait's one method takes only the
+    // intent, and widening the authority seam to carry a metrics handle would
+    // make every future executor implement observability to compile. The FDB
+    // executor writes its own phases into this same trace because it runs on
+    // this task.
+    let (outcome, trace) = stages::with_trace(async {
+        stages::trace(|t| {
+            *t = seed;
+            t.spawn_wait_us = elapsed_us(spawn_at);
+        });
+        // 4. Execution — ack only after the future resolves. An executor error
+        //    becomes a definitive rejection (bounded-retry refusal, §7).
+        match executor {
+            None => IntentOutcome::Rejected {
+                reason: REASON_NO_EXECUTOR,
+            },
+            Some(exec) => match stages::timed(|t| &mut t.exec_us, exec.execute(&intent)).await {
+                Ok(outcome) => outcome,
+                Err(err) => error_outcome(&err),
+            },
+        }
+    })
+    .await;
+    send_intent_reply(
+        send,
+        intent_id,
+        outcome,
+        metrics,
+        received_at,
+        trace,
+        executed,
+    );
 }
 
 /// Re-run one report's evidence and answer with the verdict.
@@ -5051,13 +5221,26 @@ fn send_intent_reply(
     outcome: IntentOutcome,
     metrics: &GatewayIntentMetrics,
     received_at: Instant,
+    mut trace: IntentTrace,
+    executed: bool,
 ) {
     // Measured up to the send call, not past it: everything after is the
     // wire, which is precisely the part `intent_commit_ms` covers and this
     // series must not.
-    metrics.record_reply(&outcome, elapsed_us(received_at));
+    let server_us = elapsed_us(received_at);
+    metrics.record_reply(&outcome, server_us);
+    trace.server_us = server_us;
     let reply = GatewayReply::IntentAck { intent_id, outcome };
+    // The encode and the lane push, timed: both are supposed to be free (an
+    // unbounded mpsc send), and a stage that is supposed to be free is exactly
+    // the one worth being able to prove is.
+    let reply_at = Instant::now();
     send(Bytes::from(encode_stream_frame(&reply)));
+    trace.reply_us = elapsed_us(reply_at);
+    // One fold per intent, at the single choke point every reply passes
+    // through — so `intents` is per definitive acknowledgement and can never
+    // drift from `GatewayIntentSnapshot::replies`.
+    intent_stage_metrics().record(&trace, executed);
 }
 
 /// Feed the connection's datagrams into the shared inbound queue.

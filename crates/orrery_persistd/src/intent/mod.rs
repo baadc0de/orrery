@@ -33,6 +33,9 @@ mod fdb;
 #[cfg(feature = "fdb")]
 pub use fdb::{FdbIntentExecutor, IntentFence};
 
+pub mod stages;
+pub use stages::{intent_stage_metrics, IntentStageMetrics, IntentStageSnapshot, IntentTrace};
+
 /// The result of admitting an [`Intent`] before execution.
 ///
 /// `Ruleset`-opaque in the wire (`IntentOp` is deliberately uninterpreted,
