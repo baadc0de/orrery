@@ -289,6 +289,16 @@ lane_gates() {
     # more writeback-resistant at the device and stalls the gate anyway.
     run scripts/p2-nvme-isolation-report.py --self-test
 
+    # docs/08 §4.7's, which ends the sequence §4.3 started by naming a cause
+    # rather than eliminating one. Three of its clauses are load-bearing in
+    # ways a later edit could quietly reverse: the worst barrier carrying an
+    # *ordinary* batch (which is what refutes the volume story), the tmpfs arm
+    # stalling at all (which is what removes storage), and the 256 MiB point
+    # reading clean at 60 s while stalling at 180 s (which is what stops the
+    # section claiming a fix it does not have). Losing any one of them leaves
+    # the conclusion standing on nothing, so all three are pinned.
+    run scripts/p2-barrier-shape-report.py --self-test
+
     # And this script's own, which nothing ran either: ci.yml calls the four
     # lanes and never `--self-test`, so the lane table's agreement with the tree
     # — and, now, the coverage clause below — were checked only when a human

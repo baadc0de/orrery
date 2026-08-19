@@ -28,6 +28,7 @@ pub use fjall::Journal;
 pub use group_commit::{AdaptiveCommitMode, GroupCommitConfig};
 pub use metrics::{
     JournalCommitMetrics, JournalCommitSample, JournalCommitSnapshot, JournalStageSnapshot,
+    SLOW_SYNC_THRESHOLD_US,
 };
 
 /// Configuration for a node's [`Journal`].

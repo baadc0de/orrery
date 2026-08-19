@@ -568,6 +568,11 @@ fn write_journal_stage_delta(
             "sync_data_us_max": delta.sync_data_us_max,
             "resolve_us_sum": delta.resolve_us_sum,
             "resolve_us_max": delta.resolve_us_max,
+            "sync_data_us_max_bytes": delta.sync_data_us_max_bytes,
+            "sync_data_us_max_records": delta.sync_data_us_max_records,
+            "slow_syncs": delta.slow_syncs,
+            "slow_sync_bytes_sum": delta.slow_sync_bytes_sum,
+            "slow_sync_records_sum": delta.slow_sync_records_sum,
         }),
     )
     .map_err(std::io::Error::other)?;

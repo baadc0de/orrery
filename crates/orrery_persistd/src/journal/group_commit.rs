@@ -435,6 +435,10 @@ fn run_committer(state: Arc<CommitterState>, commit: CommitFn) {
                     sync_data_us_max: duration_us(store_timings.sync_data),
                     resolve_us_sum: duration_us(resolve),
                     resolve_us_max: duration_us(resolve),
+                    // Derived inside `record_group` from `bytes`/`records`
+                    // above: only the recorder knows whether this flush set a
+                    // new maximum or crossed the slow threshold.
+                    ..JournalStageSnapshot::default()
                 });
             }
             Err(e) => {
