@@ -632,8 +632,13 @@ something else.
 > ```
 >
 > holds **exactly — zero deviation — at all 73 points**, on both engines, from
-> 12 shed to 7 244 shed; `location_audit_us_max` sits at 20 771–26 526 µs in
-> every one of them, clamped on the 25 ms budget, which is the signature.
+> 12 shed to 7 244 shed; `location_audit_us_max` sits at 11 555–26 526 µs
+> across them, bunched against the 25 ms budget, which is the signature.
+> (An earlier draft of this line said 20 771–26 526 µs "in every one of them".
+> Seven points sit below that floor — the lowest is `ssd-ib40k-xhi-r2` at
+> 11 555 µs — because a point whose audits are all cancelled early records a
+> maximum below the budget rather than at it. The clamping is the signature;
+> the floor was not a real one.)
 > **Bulk shed attributable to actual route slowness is zero in this entire
 > study.** So criterion 1 was satisfied by a diagnostic that could not have
 > failed it for the right reason, and the "no knee" conclusion rests on
@@ -662,7 +667,7 @@ something else.
 > is 0 on both, so invariant J still holds.)
 >
 > One number moved a long way and is worth its own line: `location_audit_us_max`
-> is **158 ms** and **929 ms** on those two points, against 20 771–26 526 µs at
+> is **158 ms** and **929 ms** on those two points, against 11 555–26 526 µs at
 > every point of the study. It was never a measurement of how long the audit
 > takes — an audit that would have exceeded the budget was cancelled before it
 > could record one, so the statistic was censored at the budget by
@@ -900,11 +905,23 @@ before it writes. At 1 300 intents/s that is ~170 000 FDB operations per second
 on one thread. #86 took the bulk path off that thread and left the intent path
 on it: §5.1's conclusion has not been repealed, it has been relocated.
 
-FoundationDB the *server* is not the limit there: in-window commit latency
-never exceeded 17.60 ms (`ssd`) or 8.03 ms (`memory`), read latency
-4.78/0.10 ms, GRV 4.29/0.86 ms, **conflicts exactly zero** in every sample on
-both arms, and `fdbserver` at 0.81/0.42 cores from FDB's own `status json`
-(0.86/0.45 from `pidstat`, a different instrument on the same processes).
+FoundationDB the *server* is not the limit there — with one caveat about
+which leg the evidence comes from, stated because this section exists to kill
+exactly that error. The `status json` figures below are from the **`ic` leg at
+~1 000 intents/s**, not from the ~1 300 intents/s saturation point: only
+`decomp-leg.sh` starts `fdb-sampler.sh`, and it runs `ic40k`/`ic20k` only, so
+no in-window `status json` exists for the saturated point at all. In-window
+commit latency never exceeded 17.60 ms (`ssd`) or 8.03 ms (`memory`), read
+latency 4.78/0.10 ms, GRV 4.29/0.86 ms, **conflicts exactly zero** in every
+sample on both arms, and `fdbserver` at 0.81/0.42 cores.
+
+At the saturated point itself the only in-window instrument is each point's own
+`pidstat.txt`, and it reads higher: `fdbserver` at **0.86 cores mean / 0.95
+peak** on `ssd` (`ib40k-xhi-r1`; 0.84/0.95 on r2) against 0.42/0.48 and
+0.43/0.50 on `memory` — close to a full core on a `configure single` cluster.
+The conclusion stands on the two measurements that *are* in-window there (the
+client thread at 94 %, and zero conflicts), but a reader sizing a cluster
+should use 0.86–0.95 cores, not 0.81.
 
 One artifact of the saturated point, so nobody reads it as a server failure:
 at ~1 300 intents/s the rig's own `durable_acks` footer falls to

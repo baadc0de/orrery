@@ -898,6 +898,22 @@ impl AuditOutcome {
     }
 }
 
+/// Closes the accounting for a sample whose task never finished.
+///
+/// **Not pinned by a test, and the review that found this said so rather than
+/// letting it read as covered.** Disarming this `drop` leaves every audit test
+/// green: the suite reaches the no-permit and missing-runtime paths, which
+/// count themselves explicitly in `spawn_location_audit`, but not the case
+/// this guard exists for — a spawned task dropped by the runtime at shutdown,
+/// possibly before its first poll. Constructing that deterministically means
+/// tearing a runtime down mid-audit, which is a race the test would have to
+/// win rather than assert.
+///
+/// So it is defence in depth for one counter, on a path that is already a
+/// 1-in-1000 diagnostic. If a later change makes runtime teardown reachable in
+/// a test, pin it then; until it is pinned, do not cite it as evidence that
+/// `location_audits_decided == audits + errors + dropped` holds under
+/// shutdown — it holds under every path the suite actually exercises.
 impl Drop for AuditOutcome {
     fn drop(&mut self) {
         if !self.settled {
