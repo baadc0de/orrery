@@ -174,7 +174,22 @@ refuse_an_already_activated_cluster
 
 out=${P2_GATE_OUT:-"$(pwd)/p2-kill9-$(date -u +%Y%m%dT%H%M%SZ)"}
 [[ ! -e $out ]] || die "refusing to overwrite existing output directory: $out"
-mkdir -p "$out" "$out/primary-data" "$out/follower-data"
+# Where the *journals* live, separable from where the evidence lives.
+#
+# docs/08-persistence.md §4.4 measured this run's own output as a contaminant
+# of the number the run reports: the gate writes `acks.jsonl` (~110 MB),
+# `telemetry.jsonl` and its stdout into this tree at ~4.7 MB/s, and buffered
+# writeback at that rate reproduces barrier stalls of exactly the size and
+# rarity that set `journal_commit_ms` p99 -- where the same barriers without it
+# top out at 0.46 ms. Until the two are separable, no gate number is taken with
+# the journal's device to itself.
+#
+# Defaults to `$out`, so an unset variable reproduces every previous run
+# exactly. Pointing it at another filesystem is what §4.4's first follow-up
+# asks for.
+data=${P2_GATE_DATA_DIR:-"$out"}
+[[ $data == "$out" ]] || mkdir -p "$data"
+mkdir -p "$out" "$data/primary-data" "$data/follower-data"
 # `SIGKILL` can land before a reporter's first tick.  Pre-create the files so
 # the merge step remains deterministic; the dashboard still rejects the run
 # if this leaves `journal_commit_ms` without samples.
@@ -299,7 +314,7 @@ note "identity issuer $issuer_key_id@$issuer_public"
 
 start_follower() {
   "$PERSISTD_BIN" --node-id 2 --chain-epoch 1 --chain-primary 1 "${shard_flags[@]}" \
-    --chain-listen "127.0.0.1:$chain_port" --dir "$out/follower-data" \
+    --chain-listen "127.0.0.1:$chain_port" --dir "$data/follower-data" \
     --metrics-jsonl "$out/follower-metrics.jsonl" \
     >"$out/follower.json" 2>"$out/follower.stderr" & follower_pid=$!
   wait_json "$out/follower.json" "$follower_pid" follower
@@ -309,7 +324,7 @@ start_primary() {
   ORRERY_GATEWAY_BOUNDARY_JSONL="$out/primary-boundary.jsonl" \
   "$PERSISTD_BIN" --node-id 1 --chain-epoch 1 --chain-follower "2@$follower_chain" \
     "${shard_flags[@]}" \
-    --bind "127.0.0.1:$gateway_port" --dir "$out/primary-data" \
+    --bind "127.0.0.1:$gateway_port" --dir "$data/primary-data" \
     --secret-key "$secret_primary" --fdb-cluster-file "$ORRERY_FDB_CLUSTER_FILE" \
     --issuer-key "$issuer_key_id@$issuer_public" \
     --metrics-jsonl "$out/primary-metrics.jsonl" >"$out/primary.json" 2>"$out/primary.stderr" & primary_pid=$!
@@ -333,7 +348,7 @@ prove_epoch_fork_refused() {
   note 'proving a bumped chain epoch is refused, not forked'
   if timeout 120 "$PERSISTD_BIN" --node-id 2 --chain-epoch 2 --chain-primary 1 \
     "${shard_flags[@]}" \
-    --chain-listen "127.0.0.1:$fork_port" --dir "$out/follower-data" \
+    --chain-listen "127.0.0.1:$fork_port" --dir "$data/follower-data" \
     >"$out/epoch-fork.json" 2>"$out/epoch-fork.stderr"; then
     die 'follower accepted a bumped chain epoch on an already-mirrored journal'
   fi
@@ -357,7 +372,7 @@ start_promoted_follower() {
   "$PERSISTD_BIN" --node-id 2 --chain-epoch 2 --chain-primary 1 --promote-from 1 \
     "${shard_flags[@]}" \
     --chain-listen "127.0.0.1:$chain_port" --bind "127.0.0.1:$gateway_port" \
-    --dir "$out/follower-data" --secret-key "$secret_follower" \
+    --dir "$data/follower-data" --secret-key "$secret_follower" \
     --issuer-key "$issuer_key_id@$issuer_public" \
     --fdb-cluster-file "$ORRERY_FDB_CLUSTER_FILE" --metrics-jsonl "$out/promoted-metrics.jsonl" \
     >"$out/promoted.json" 2>"$out/promoted.stderr" & follower_pid=$!
@@ -487,7 +502,7 @@ start_promoted_follower
 note 'proving old primary is fenced (zombie admission)'
 "$PERSISTD_BIN" --node-id 1 --chain-epoch 1 --chain-follower "2@$follower_chain" \
   "${shard_flags[@]}" \
-  --bind "127.0.0.1:$zombie_port" --dir "$out/primary-data" \
+  --bind "127.0.0.1:$zombie_port" --dir "$data/primary-data" \
   --secret-key "$secret_primary" --fdb-cluster-file "$ORRERY_FDB_CLUSTER_FILE" \
   --issuer-key "$issuer_key_id@$issuer_public" \
   --metrics-jsonl "$out/zombie-metrics.jsonl" >"$out/zombie.json" 2>"$out/zombie.stderr" & zombie_pid=$!

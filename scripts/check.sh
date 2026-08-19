@@ -256,6 +256,13 @@ lane_gates() {
     # wrong in a direction no number would catch.
     run scripts/p2-intent-fence-report.py --self-test
 
+    # docs/08 §4.5's. Its self-test pins a *null* and the reason the null is
+    # uninformative rather than negative -- that on the reference box the bare
+    # barrier's own tail is the size of the effect. A negative decays quietly
+    # and a null decays quieter still, so the check asserts the arms are still
+    # tied and the ranges still overlap, not merely that some number is stable.
+    run scripts/p2-evidence-split-report.py --self-test
+
     # docs/08 §4.4's. That section is the only one in this file whose argument
     # is a *negative* — a barrier 40x better than §4.3's bought no p99 — and a
     # negative decays quietly: every link of its elimination chain has to keep
