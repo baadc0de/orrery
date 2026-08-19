@@ -2264,7 +2264,11 @@ impl Rig<'_> {
             intent_arrival_p50_us = intents.arrival_latency().p50().as_micros() as u64,
             intent_arrival_p90_us = intents.arrival_latency().p90().as_micros() as u64,
             intent_arrival_p99_us = intents.arrival_latency().p99().as_micros() as u64,
-            intent_arrival_max_us = intents.arrival_latency().max().unwrap_or_default().as_micros() as u64,
+            intent_arrival_max_us = intents
+                .arrival_latency()
+                .max()
+                .unwrap_or_default()
+                .as_micros() as u64,
             "run complete"
         );
         if stats.leases_lost > 0 {
