@@ -95,6 +95,23 @@ The harness runs the shipping plugins; only the socket is stood in for, by an in
 
 **Demo criterion.** With 10k entities across 100+ cells under synthetic load: `kill -9` the entire cluster, restart it, and the world resumes — zero acked intents lost (RPO 0), bulk loss bounded by the journal/replication window, clients (netsplit posture, D12) having queued intents and continued simulating. Measured against D16 targets in-region: journal commit < 2 ms server-internal, client-observed bulk ack p99 < 5 ms, intent commit p99 < 10 ms, area first page-in < 50 ms.
 
+**Where the demo criterion stands, re-measured on the phased rig (2026-08-19).**
+`p2-load` now phases each session's lease renewal across the period by default
+([08-persistence.md](08-persistence.md) §2.2.2), so every P2 latency figure
+published before this date describes a configuration the rig no longer runs.
+Re-baselined over **43 full kill-9 gate runs** — 28 phased, 15 unphased,
+interleaved run by run, spanning both of this box's fsync regimes:
+`area_first_page_ms` **passes in 43 of 43**; `journal_commit_ms`,
+`bulk_ack_ms` and `intent_commit_ms` **fail in 43 of 43**, in both regimes, with
+**one root cause in every run** — `journal_commit_ms`, the device's fsync
+([08-persistence.md](08-persistence.md) §4.3). The criterion's durability half
+is met on every run: recovery verification true, durable acknowledgements in
+family, zero leases lost, the zombie primary fenced. **P2 does not pass**, and
+the honest statement of what phasing bought is not a pass but an attribution:
+`intent_commit_ms` p99 went from 150–200 ms (n=15, flat across a tenfold change
+in device cost) to 15–150 ms tracking `journal_commit_ms` within 0.67–1.50×
+(n=28). Full per-run numbers, both arms and both regimes, in §2.2.2.
+
 **The bulk-ack tail is the gateway's own inbound queue, and it is now measured
 (2026-08-18).** The P2 report had a hole in it: `client_bulk_wire_ms` p99 read
 2 104 ms while `gateway_bulk_server_ms` p99 read 150 ms, and roughly 1 950 ms of

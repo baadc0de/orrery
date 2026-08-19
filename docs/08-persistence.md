@@ -1179,7 +1179,285 @@ fsync correlation instead, which needs no configuration change at all.
 
 ### 2.2.2 The renewal pass is phased by default, and P2 is re-baselined
 
-PLACEHOLDER
+**The decision, verbatim, from the gate's owner (2026-08-19):**
+
+> p2 load should be diffuse in phase space, that's what actually happens with
+> real players and we should not optimize for a stampede corner case which
+> should be handled elsewhere for example with login queues.
+
+Two things follow, and the second is the one a later reader is most likely to
+undo by accident.
+
+**One default moved.** `P2_LOAD_HEARTBEAT_PHASED` now defaults to *phased*:
+session `i` renews at `i/sessions` of the way through the renewal period, so
+the same renewals reach the gateway spread across the period instead of in one
+pass of the drive loop. `P2_LOAD_HEARTBEAT_PHASED=0` restores the burst, and
+that opt-out is load-bearing: §2.2.1 is a diagnosis *of the unphased
+configuration*, and a diagnosis that cannot be re-run is a story. Nothing else
+changed — not the cadence, not the number of renewals, not the work the gateway
+does per renewal. `p2-load` already phased its **bulk** flushes per session
+(`session_flush_phase`) and did not phase its heartbeat; this removes that
+asymmetry and nothing more.
+
+**No server-side stampede mitigation is being built, and that is a decision,
+not an omission.** A synchronized renewal pass is a thundering herd. The
+project has placed herds with **admission control** — a login queue — and not
+with the persistence path; the named deliverable is in
+[11-roadmap.md](11-roadmap.md) §P6. There is therefore deliberately no jitter,
+no batching window and no shed inside the gateway's lease path, and adding one
+later should be argued as *reversing this decision*, not as filling a gap.
+
+The rationale is about the workload, not about the measurement. Real player
+populations are diffuse in phase space: players connect when they connect, and
+their per-session periodic chores are spread across the period by the same
+accident that spread their arrivals. A load generator that renews every session
+in one pass is not modelling a busy world; it is modelling a world in which
+every player logged in on the same tick and never drifted. That shape of load
+*does* occur — a region restart, a relay-region loss, a patch-day open — and it
+is real enough to own, which is why it is assigned rather than dismissed. It is
+assigned upstream of `persistd`, where the arrival rate is something an operator
+can choose, instead of downstream of it, where the only available response is to
+make durable writes cheaper by making them later.
+
+**§2.2.1 stands, unedited.** Its numbers describe the unphased rig, they are
+still what that configuration does, and `scripts/intent-tail-derive.py` still
+re-derives every one of them from the sweep artifacts. What changed is which
+configuration is the *default*, and therefore which numbers describe a P2 run
+someone starts today.
+
+**Which side of the doc gate these numbers are on, and why.** Everything below
+comes from a different experiment — the full `scripts/p2-kill9-gate.sh`, not
+the capacity sweep — so `intent-tail-derive.py` cannot produce it, and its
+`--audit-doc` is scoped to §2.2.1 (the end marker moved here when this section
+was added; the span audited before is audited still). The same discipline
+applies with a different emitter: every number in this section is printed by
+`scripts/p2-baseline-report.py`, which reads
+`docs/data/p2-phase-baseline-2026-08-19.jsonl` — all 43 runs, one JSON object
+each, in the tree. The sweep's artifacts were ~10 GB and could not be
+versioned; this baseline's reduce to 75 KB, so unlike §2.2.1 this section is
+re-derivable from a clean checkout with no cluster at all.
+
+#### The new baseline: the full kill-9 gate, both arms, interleaved
+
+What is measured is the thing the criterion is written against: 128 shards
+derived from the seeded `demo` world, 10 000 entities, 125 sessions at 2 Hz for
+30 s, `kill -9` the primary, promote the follower, verify every
+acknowledgement, fence the zombie. Runs were driven one at a time against a
+private FoundationDB (`configure new single ssd`, its own port and data
+directory), the keyspace cleared between runs because the gate consumes its
+cluster, and each run's ~1 GB of output reduced by
+`scripts/p2-baseline-extract.py` and deleted before the next one started.
+
+**The arms are interleaved run by run, and that is not tidiness.** This box
+swings about twofold on per-flush fsync cost on a tens-of-seconds scale (§4.3,
+[14-capacity.md](14-capacity.md) §7). A block of phased runs followed by a
+block of unphased ones would confound the arm with the device — which is the
+mistake this project has already made once, quoting an n=1 pass. So: **43 runs,
+28 phased and 15 unphased**, every range below carrying its n, and every run
+present in the tables at the end of this section.
+
+**Both fsync regimes are sampled, and the sweep's cut still bisects this
+workload.** By §2.2.1's rule — slow iff the run's worst journal `sync_data` is
+at or above 150 ms — the worst journal fsync ranges **19.8–201.0 ms** (n=43)
+and the population splits **37 fast / 6 slow**, with the cut falling in a real
+gap: the highest fast run is **144.6 ms** and the lowest slow run **156.6 ms**.
+Per arm that is **24 fast / 4 slow** phased and **13 fast / 2 slow** unphased.
+
+| series | budget | phased p99 | passes | unphased p99 | passes |
+|---|---|---|---|---|---|
+| `journal_commit_ms` | 2 ms | **15–100 ms** (n=28) | 0 of 28 | **15–150 ms** (n=15) | 0 of 15 |
+| `bulk_ack_ms` | 5 ms | **15–150 ms** (n=28) | 0 of 28 | **15–150 ms** (n=15) | 0 of 15 |
+| `intent_commit_ms` | 10 ms | **15–150 ms** (n=28) | 0 of 28 | **150–200 ms** (n=15) | 0 of 15 |
+| `area_first_page_ms` | 50 ms | **3–20 ms** (n=28) | 28 of 28 | **3.5–5 ms** (n=15) | 15 of 15 |
+
+Every p99 here is a **lattice bucket's upper bound**, never an interpolation
+(`orrery_protocol::metrics::LATENCY_BOUNDARIES_US`), and the gate compares that
+bound against the budget. The neighbours around the intent budget are 9, 10, 15
+and 20 ms, so a run printed at 15 ms has a true p99 somewhere in (10, 15]: a
+real miss of a 10 ms budget, and possibly a miss by microseconds. That
+resolution is why the medians below are quoted with their bucket histograms.
+
+#### Which series pass, which fail, and whether the failure follows the device
+
+* **`journal_commit_ms` (2 ms): FAILS, 0 of 43.** Phased **15–100 ms** (n=28),
+  unphased 15–150 ms (n=15); phased median **20 ms**, with 20 of 28 phased runs
+  in the 15 ms and 20 ms buckets. **Not regime-dependent — it fails in both.**
+  Phased fast regime **15–75 ms** (n=24), phased slow regime **40–100 ms**
+  (n=4). The quietest run measured — `ph-r28`, worst journal fsync 19.8 ms —
+  still reads a 15 ms p99 against a 2 ms budget. This is the device (§4.3),
+  and phasing was never going to touch it.
+* **`bulk_ack_ms` (5 ms): FAILS, 0 of 43.** Phased **15–150 ms** (n=28); phased
+  fast **15–75 ms** (n=24), phased slow **40–150 ms** (n=4). Not
+  regime-dependent for the same reason: `bulk_ack_ms` contains a journal
+  commit by construction, so it cannot pass while `journal_commit_ms` fails.
+  The dashboard classifies it as a **consequence** and names one root cause —
+  `journal_commit_ms` — in **43 of 43** runs.
+* **`intent_commit_ms` (10 ms): FAILS, 0 of 43 — and this is the number the
+  phasing changed.** Phased **15–150 ms** (n=28), median **17.5 ms**, with
+  **14 of 28** phased runs in the (10, 15] bucket and 20 of 28 at or below
+  20 ms. Unphased **150–200 ms** (n=15), median 150 ms. **Not
+  regime-dependent in the sense that matters — it fails in both:** phased fast
+  **15–50 ms** (n=24), phased slow **40–150 ms** (n=4). What *is* now
+  regime-dependent is its *size*, which is the point of the next section.
+* **`area_first_page_ms` (50 ms): PASSES, 43 of 43.** Phased **3–20 ms**
+  (n=28), unphased 3.5–5 ms (n=15). Passes in both regimes, in both arms, with
+  the worst single run (`ph-r3`, 20 ms) still less than half its budget.
+
+#### Does P2 pass? No — and what changed is the reason it fails
+
+**The honest answer is no, and it is not close, and it is not a regime story.**
+Three of the four D16 series miss in every one of the 43 runs, in both fsync
+regimes and in both arms. Stated with its n: `intent_commit_ms` fails in **28
+of 28** phased runs — **24 of 24** in the fast regime and **4 of 4** in the
+slow one. There is no regime of this box on which the phased gate passes.
+
+That is worth saying plainly because the previous time this series was called a
+pass it was **n=1** (`qph-loaded-r1`, client p99 15 ms / server p99 9 ms) while
+the other three phased runs of that study read 150 / 150 / 75 ms. This baseline
+does not reproduce that pass at any n: the closest 14 runs sit in the (10, 15]
+bucket, which is a miss.
+
+**What phasing did change is which subsystem owns the number**, and that
+change is unambiguous.
+
+* **Run-total GRV: 4.11–5.94 s phased (n=28) against 57.00–64.34 s unphased
+  (n=15).** The two populations do not overlap, and neither do their tail
+  terms: the tail's GRV mean is **0.14–6.71 ms** phased and **27.57–57.07 ms**
+  unphased.
+* **Unphased, `intent_commit_ms` did not follow the device at all.** It read
+  150 ms or 200 ms in all 15 unphased runs — 150–200 ms across the 13 fast-
+  regime runs and 150 ms in both slow-regime ones — while the device's worst
+  journal fsync underneath those runs ranged from 20.7 ms (`un-r7`) to 201.0 ms
+  (`un-r15`). A number that is flat across a tenfold change in device cost is
+  not measuring the device.
+* **Phased, it follows the device closely.** Intent p99 divided by journal p99
+  is **0.67–1.50×** over the 28 phased runs, against **1.00–13.33×** over the
+  15 unphased ones — and the single unphased run at 1.00× is `un-r6`, the one
+  whose journal p99 was itself 150 ms. Phased, `intent_commit_ms` is bounded by
+  the same device stall that already fails `journal_commit_ms`; unphased, it
+  was up to 13× larger than it.
+
+So the P2 verdict is unchanged — the gate is red — but its shape is simpler
+than it was this morning: **one root cause in 43 of 43 runs**, and it is the
+journal's fsync on a QLC RAID1 with no power-loss protection (§4.3). The
+load-generator artifact that used to sit on top of `intent_commit_ms`, and only
+on that series, is gone.
+
+#### What the gate still proves, on every run
+
+The latency verdict is the last thing `p2-kill9-gate.sh` computes; every
+durability proof runs before it, and **all 43 runs reached the latency step**,
+which means every one of them cleared the proofs:
+
+* **Recovery verification true in 43 of 43.** The promoted follower was checked
+  against every pre-crash acknowledgement, with the comparison bound to the
+  chain prefix adopted at promotion.
+* **Durable acknowledgements in family: 539 352–541 264 per run** (n=43), and
+  the ack log's durable-diff count equals the client's own `durable_acks`
+  counter in **43 of 43**.
+* **Zero leases lost, every run** (`leases_lost` max 0 over 43; 10 000 leases
+  held at the end of every run), and **zero diff nacks**.
+* **The zombie primary failed fenced admission and the bumped chain epoch was
+  refused rather than forked, in all 43** — those stages precede the latency
+  gate, and no run died before it.
+* **No unrecognized series in any run** (`unknown_series` max 0), so no
+  producer drifted from `orrery_protocol::metrics` and no sample was silently
+  dropped.
+
+#### Reproducing
+
+```bash
+# a throwaway FDB on its own port and data dir; the gate consumes its cluster
+docker run -d --name my-fdb --network host -e FDB_PORT=4610 \
+  -e FDB_NETWORKING_MODE=host -e FDB_COORDINATOR_PORT=4610 \
+  -v /some/dir:/var/fdb/data foundationdb/foundationdb:7.3.63
+fdbcli -C /some/fdb.cluster --exec 'configure new single ssd'
+
+cargo build --release -p orrery_persistd -p orrery_seed \
+  --features orrery_persistd/fdb,orrery_seed/fdb
+cargo build --release --manifest-path p2-load/Cargo.toml
+cargo build --release --manifest-path p2-dashboard/Cargo.toml
+
+export ORRERY_FDB_CLUSTER_FILE=/some/fdb.cluster
+export PERSISTD_BIN=target/release/persistd ORRERY_SEED_BIN=target/release/orrery-seed
+export P2_LOAD_BIN=p2-load/target/release/p2-load
+export P2_DASHBOARD_BIN=p2-dashboard/target/release/p2-dashboard
+
+# between runs: the primary asserts --chain-epoch 1 against a fence that only
+# ever moves forward, so a second run needs a cleared keyspace
+fdbcli -C "$ORRERY_FDB_CLUSTER_FILE" --exec 'writemode on; clearrange "" \xff'
+
+P2_GATE_OUT=$PWD/run-1 scripts/p2-kill9-gate.sh              # phased: the default
+P2_LOAD_HEARTBEAT_PHASED=0 P2_GATE_OUT=$PWD/run-2 \
+  scripts/p2-kill9-gate.sh                                   # §2.2.1's burst
+
+python3 scripts/p2-baseline-extract.py run-1 ph-r1 >ph-r1.json && rm -rf run-1
+python3 scripts/p2-baseline-report.py                        # every number above
+```
+
+`scripts/p2-baseline-extract.py` is what makes an n-run baseline fit on this
+box: it folds one gate directory into a few hundred bytes — the four gated
+series as the dashboard scored them, the recovery verdict, the durable-ack
+count, the client's own footer, the journal's worst `sync_data` and the
+gateway's intent stages — so the gigabyte can go immediately.
+
+#### Per run
+
+No aggregate above is quoted without these behind it. Ordered by the device,
+because that is the variable the runs differ in.
+
+**Phased — the new default** (n=28), `P2_LOAD_HEARTBEAT_PHASED` unset:
+
+| run | worst journal fsync | `journal_commit_ms` p99 | `bulk_ack_ms` p99 | `intent_commit_ms` p99 | `area_first_page_ms` p99 | run-total GRV |
+|---|---|---|---|---|---|---|
+| ph-r28 | 19.8 ms | 15 ms | 15 ms | 15 ms | 4 ms | 4.34 s |
+| ph-r24 | 20.2 ms | 15 ms | 15 ms | 15 ms | 4.5 ms | 4.11 s |
+| ph-r25 | 21.1 ms | 15 ms | 15 ms | 15 ms | 6 ms | 4.29 s |
+| ph-r15 | 21.4 ms | 15 ms | 15 ms | 15 ms | 4 ms | 4.28 s |
+| ph-r4 | 21.5 ms | 15 ms | 15 ms | 15 ms | 3.5 ms | 4.22 s |
+| ph-r5 | 23.9 ms | 15 ms | 15 ms | 15 ms | 3.5 ms | 4.16 s |
+| ph-r13 | 26.9 ms | 20 ms | 20 ms | 15 ms | 4 ms | 4.23 s |
+| ph-r21 | 28.7 ms | 20 ms | 20 ms | 20 ms | 4 ms | 4.46 s |
+| ph-r3 | 30.3 ms | 15 ms | 20 ms | 15 ms | 20 ms | 4.59 s |
+| ph-r11 | 30.3 ms | 20 ms | 20 ms | 15 ms | 4.5 ms | 4.43 s |
+| ph-r16 | 31.6 ms | 15 ms | 15 ms | 15 ms | 6 ms | 4.14 s |
+| ph-r10 | 32.6 ms | 15 ms | 15 ms | 15 ms | 4.5 ms | 4.21 s |
+| ph-r14 | 34.4 ms | 20 ms | 20 ms | 15 ms | 7 ms | 4.34 s |
+| ph-r27 | 34.4 ms | 15 ms | 15 ms | 15 ms | 3 ms | 4.25 s |
+| ph-r2 | 36.5 ms | 20 ms | 20 ms | 15 ms | 4 ms | 4.14 s |
+| ph-r9 | 38.6 ms | 20 ms | 20 ms | 20 ms | 4.5 ms | 4.32 s |
+| ph-r19 | 41.7 ms | 20 ms | 20 ms | 20 ms | 6 ms | 4.11 s |
+| ph-r8 | 68.6 ms | 20 ms | 30 ms | 20 ms | 3.5 ms | 4.53 s |
+| ph-r22 | 99.0 ms | 20 ms | 20 ms | 20 ms | 4 ms | 4.22 s |
+| ph-r6 | 133.1 ms | 20 ms | 30 ms | 20 ms | 4 ms | 4.26 s |
+| ph-r1 | 133.6 ms | 50 ms | 50 ms | 50 ms | 3.5 ms | 4.74 s |
+| ph-r23 | 134.9 ms | 50 ms | 50 ms | 40 ms | 4.5 ms | 4.41 s |
+| ph-r12 | 142.3 ms | 75 ms | 75 ms | 50 ms | 5 ms | 4.16 s |
+| ph-r7 | 144.6 ms | 30 ms | 30 ms | 30 ms | 3.5 ms | 4.64 s |
+| ph-r20 | 156.6 ms | 100 ms | 150 ms | 150 ms | 4.5 ms | 4.58 s |
+| ph-r17 | 168.2 ms | 40 ms | 40 ms | 40 ms | 4 ms | 5.94 s |
+| ph-r18 | 178.3 ms | 75 ms | 75 ms | 50 ms | 5 ms | 4.61 s |
+| ph-r26 | 185.0 ms | 100 ms | 100 ms | 75 ms | 5 ms | 4.74 s |
+
+**Unphased — the control** (n=15), `P2_LOAD_HEARTBEAT_PHASED=0`:
+
+| run | worst journal fsync | `journal_commit_ms` p99 | `bulk_ack_ms` p99 | `intent_commit_ms` p99 | `area_first_page_ms` p99 | run-total GRV |
+|---|---|---|---|---|---|---|
+| un-r7 | 20.7 ms | 15 ms | 15 ms | 200 ms | 5 ms | 57.00 s |
+| un-r10 | 21.1 ms | 15 ms | 15 ms | 200 ms | 4.5 ms | 59.30 s |
+| un-r11 | 22.0 ms | 15 ms | 15 ms | 200 ms | 4.5 ms | 62.86 s |
+| un-r14 | 25.5 ms | 15 ms | 20 ms | 150 ms | 4 ms | 59.96 s |
+| un-r1 | 25.8 ms | 20 ms | 20 ms | 150 ms | 3.5 ms | 62.60 s |
+| un-r8 | 30.3 ms | 20 ms | 20 ms | 150 ms | 4 ms | 58.21 s |
+| un-r2 | 72.3 ms | 30 ms | 30 ms | 150 ms | 3.5 ms | 64.34 s |
+| un-r5 | 105.1 ms | 50 ms | 50 ms | 150 ms | 5 ms | 57.87 s |
+| un-r12 | 106.2 ms | 75 ms | 75 ms | 150 ms | 4.5 ms | 58.57 s |
+| un-r4 | 117.3 ms | 40 ms | 50 ms | 150 ms | 4.5 ms | 59.46 s |
+| un-r9 | 132.9 ms | 75 ms | 75 ms | 150 ms | 3.5 ms | 58.82 s |
+| un-r13 | 137.2 ms | 40 ms | 40 ms | 150 ms | 4 ms | 57.02 s |
+| un-r3 | 141.5 ms | 75 ms | 75 ms | 150 ms | 4 ms | 62.62 s |
+| un-r6 | 164.8 ms | 150 ms | 150 ms | 150 ms | 4 ms | 57.84 s |
+| un-r15 | 201.0 ms | 100 ms | 100 ms | 150 ms | 4 ms | 62.27 s |
 
 ## 3. Cell actor model
 
