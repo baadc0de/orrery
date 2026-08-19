@@ -1,5 +1,15 @@
 //! The batched heartbeat path must not hold entity gates across I/O.
 //!
+//! The locate phase these tests are about is now the route's **fallback**:
+//! renewals are answered by the actor owning the presented cell, and only
+//! entries it has no row for read the lease store (docs/08-persistence.md
+//! §2.2.4). So both batches below are built to miss — the leases live in one
+//! shard and the renewals present a cell in another — because a batch that
+//! hits takes no locate at all and would pass these tests without entering
+//! the code they are about. The sampled invariant-J audit is turned off for
+//! the same reason: it is a real `locate`, and it would otherwise be the
+//! thing that trips the park.
+//!
 //! `heartbeat_leases` used to lock every renewed entity's gate up front and
 //! then issue one `LeaseStore::locate` per entry underneath the whole set, so
 //! a peer renewing 77 leases blocked every diff touching any of those 77
@@ -129,6 +139,7 @@ impl LeaseStore for ParkingLocateStore {
 /// return until the batch's last `locate` does, and the timeout below fires.
 #[tokio::test]
 async fn a_renewal_batch_holds_no_gate_while_it_resolves_locations() {
+    std::env::set_var("ORRERY_FENCED_LOCATION_AUDIT_N", "0");
     let dir = tempfile::tempdir().unwrap();
     let entered = Arc::new(Notify::new());
     let release = Arc::new(Notify::new());
@@ -140,9 +151,13 @@ async fn a_renewal_batch_holds_no_gate_while_it_resolves_locations() {
         release: Arc::clone(&release),
         armed: std::sync::atomic::AtomicBool::new(false),
     });
+    // The leases live in `home`; the renewals present `away`, whose actor has
+    // no row for any of them, so the whole batch takes the locate fallback.
+    let roots = CellId::ROOT.children();
+    let (home, away) = (roots[0], roots[1]);
     let rt = Arc::new(
         CellRuntime::open_with_lease_store(
-            &runtime_config(dir.path(), vec![CellId::ROOT]),
+            &runtime_config(dir.path(), vec![home, away]),
             &checkpoints(),
             Arc::clone(&store) as Arc<dyn LeaseStore>,
         )
@@ -157,7 +172,7 @@ async fn a_renewal_batch_holds_no_gate_while_it_resolves_locations() {
         let ClaimResult::Granted(row) = Router::claim_lease(
             rt.as_ref(),
             GridId::ROOT,
-            CellId::ROOT,
+            home,
             entity,
             holder,
             ClaimKind::Weak,
@@ -168,7 +183,7 @@ async fn a_renewal_batch_holds_no_gate_while_it_resolves_locations() {
             panic!("claim {id} should be granted");
         };
         batch.push(LeaseRenewal {
-            cell: CellId::ROOT,
+            cell: away,
             entity,
             lease_id: row.lease_id,
         });
@@ -225,6 +240,7 @@ async fn a_renewal_batch_holds_no_gate_while_it_resolves_locations() {
 /// costs the peer a lease it still holds.
 #[tokio::test]
 async fn a_renewal_whose_entity_migrates_under_it_is_re_resolved() {
+    std::env::set_var("ORRERY_FENCED_LOCATION_AUDIT_N", "0");
     let dir = tempfile::tempdir().unwrap();
     let cells = CellId::ROOT.children();
     let (source, destination) = (cells[0], cells[1]);
@@ -276,8 +292,11 @@ async fn a_renewal_whose_entity_migrates_under_it_is_re_resolved() {
     else {
         panic!("source lease must be granted");
     };
+    // Presenting the destination, which holds no row yet: that is what sends
+    // this renewal down the locate fallback, where the stale-location
+    // re-resolve lives.
     let renewals = vec![LeaseRenewal {
-        cell: source,
+        cell: destination,
         entity,
         lease_id: grant.lease_id,
     }];
