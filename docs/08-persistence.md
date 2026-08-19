@@ -1568,7 +1568,8 @@ never reaches the second group while the first is held: Elapsed(())`.
 
 **What this leaves.** Every renewal is still one `LeaseStore::locate` after
 this change — the count is unchanged at 1.000 per renewal, it is just no longer
-serialized. §2.2.4 removes it.
+serialized. §2.2.4 removes it, and §2.2.5 measures what that was worth on the
+gate.
 
 ### 2.2.4 FoundationDB is off the renewal path
 
@@ -1652,6 +1653,10 @@ Store reads: **1.000 per renewal -> 0.001**. The line that matters is not any
 one factor but the shape of the column: the renewal path's cost no longer
 depends on the lease store's latency at all.
 
+Those are bench numbers, on a rig with nothing running but renewals. What the
+change was worth on the real P2 gate — a disjoint 15.7 % cut in the intent
+path's read-version wait, and no movement in any gate series — is §2.2.5.
+
 **Checked, not asserted.** `tests/heartbeat_route_differential.rs` holds the
 new route and `CellRuntime::heartbeat_leases_via_locate` — the pre-change body,
 retained verbatim as an oracle — to the same `Option<Lease>` per entry over an
@@ -1698,6 +1703,89 @@ locate-based route. Neither is the shipped single-node path, `Cluster`'s
 `committed_entity_cell` is real cross-runtime routing rather than actor
 selection, and J would need re-proving at each — the same boundary §2.1.2 drew,
 for the same reasons.
+
+### 2.2.5 What §2.2.4 did to the gate: GRV, and nothing else
+
+§2.2.4 was measured on a bench. This is the same change measured on the rig the
+criterion is written against, and it exists because the bench cannot answer
+"does the P2 gate move" and the honest prediction from §2.2.2's data was *no*.
+
+**Every number here is printed by `scripts/p2-locate-removal-report.py`, which
+reads `docs/data/p2-locate-removal-2026-08-19.jsonl`; `--self-test` holds each
+load-bearing claim to that file.** The runs are ~2 KB each after
+`p2-baseline-extract.py`, so unlike §2.2.1 this section is re-derivable from a
+clean checkout with no cluster at all.
+
+**The experiment.** Two `persistd` binaries — `65a97c1` (pre) and `621637b`
+(post) — **interleaved run by run**, five pairs, on one private FoundationDB
+consumed and cleared between runs. Only `persistd` differs; the seeder, load
+rig and dashboard are one build each. Interleaving is not tidiness: §2.2.2
+established that this box swings about twofold on per-flush fsync cost on a
+tens-of-seconds scale, so blocked arms would confound the arm with the device.
+
+**What moved.** The intent path's own read-version wait, and it moved cleanly:
+
+| | pre (n=5) | post (n=5) | |
+|---|---|---|---|
+| GRV mean | 0.257–0.322 ms (med 0.261) | **0.217–0.226 ms** (med 0.220) | **−15.7 %** |
+| run-total GRV | 4.07–5.10 s (med 4.15) | **3.43–3.59 s** (med 3.49) | **−15.9 %** |
+
+The populations are **disjoint** on both, and they stay disjoint when the one
+pair whose device states differ sharply is dropped (`pre-r3` ran at a 289 ms
+worst fsync, `post-r3` at 120 ms): 0.257–0.270 against 0.217–0.226, −14.9 %.
+The post arm is also **six times tighter** — within-arm spread 1.04× against
+1.25× — which is what removing a contended resource looks like from the
+consumers still queueing behind it.
+
+This is worth stating plainly because the prediction was wrong. §2.2.2's phased
+GRV mean of 0.271 ms median was read here as "already at FoundationDB's
+uncontended round-trip floor, so there is no headroom". There was headroom: the
+~3 333 `locate` transactions/s the renewal path was issuing were still
+measurably in the intent path's way after phasing had spread them, and removing
+them is worth about a sixth of an intent's read-version wait.
+
+**What did not move, exactly as predicted.** The gate is **red in 10 of 10**,
+with `journal_commit_ms` the sole root cause in **10 of 10** and
+`bulk_ack_ms`/`intent_commit_ms` classified as its consequences. That was never
+in doubt: GRV is 0.22 ms against an `intent_commit_ms` p99 of 15–150 ms — under
+2 % of the number — and §2.2.2 established phased intent p99 is bounded at
+0.67–1.50× a journal p99 that misses its 2 ms budget by 7–100× because of
+fdatasync on QLC (§4.3). **A change that removes FoundationDB work cannot fix a
+gate whose binding constraint is a consumer SSD's flush.** Delivered load is
+unchanged too: 15 831–15 895 intents executed per run across both arms, and
+537 256–541 120 durable bulk acknowledgements. The one run below §2.2.2's
+539 352–541 264 band is `pre-r3`, the only slow-regime run in this set, where a
+289 ms worst fsync cut delivered records — the device, not the arm.
+
+**What the ten runs also bought.** They are the only end-to-end exercise of the
+new renewal route under real load, and the gate asserts exactly the property it
+could have broken: **10 000 leases held and `leases_lost` 0 in 10 of 10**, with
+zero diff nacks, zero duplicate durable acknowledgements, and recovery verified
+against every pre-crash acknowledgement in all ten — through a `kill -9` and a
+promotion each time. A route that asks the actor owning the presented cell,
+rather than the durable location index, keeps every lease in a 10 000-entity
+world alive for 30 s across a primary loss.
+
+#### Reproducing
+
+```bash
+# §2.2.2's reproducing block builds the rig; then, per arm:
+git checkout 65a97c1 && cargo build --release -p orrery_persistd \
+  --features orrery_persistd/fdb && cp target/release/persistd /tmp/persistd-pre
+git checkout 621637b && cargo build --release -p orrery_persistd \
+  --features orrery_persistd/fdb && cp target/release/persistd /tmp/persistd-post
+
+# interleaved, one arm per run, clearing the keyspace between runs
+for i in 1 2 3 4 5; do for arm in pre post; do
+  fdbcli -C "$ORRERY_FDB_CLUSTER_FILE" --exec 'writemode on; clearrange "" \xff'
+  PERSISTD_BIN=/tmp/persistd-$arm P2_GATE_OUT=$PWD/run scripts/p2-kill9-gate.sh
+  python3 scripts/p2-baseline-extract.py $PWD/run $arm-r$i phased >$arm-r$i.json
+  rm -rf $PWD/run
+done; done
+
+python3 scripts/p2-locate-removal-report.py              # every number above
+python3 scripts/p2-locate-removal-report.py --self-test
+```
 
 ## 3. Cell actor model
 
