@@ -99,8 +99,12 @@ def read_point(d: Path):
                 exemplars.append(rec)
 
     client = {}
-    load = d / "load.jsonl"
-    if load.exists():
+    # The rig writes the client series; persistd writes its own server spans to
+    # `--metrics-jsonl`. Both are read, because the whole point of the
+    # arrival-stamped client series is to be compared with the server one.
+    for load in (d / "load.jsonl", d / "primary-metrics.jsonl"):
+        if not load.exists():
+            continue
         for line in load.read_text().splitlines():
             try:
                 rec = json.loads(line)

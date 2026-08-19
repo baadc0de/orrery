@@ -894,6 +894,48 @@ the whole run. What that buys:
   engines** — 50× the latency for 26 % more rate. This, not the bulk path, is
   the knee this box still has.
 
+> **Superseded 2026-08-19 — the tail is decomposed, and it is two things.**
+> The p50 and saturation findings above stand unchanged. The **tail** rows do
+> not mean what this section implies, in two ways.
+>
+> First, the evidence for "the tail is the server's" was **one histogram bucket
+> wide**. Both sides share the D16 lattice, whose neighbours here are 100 /
+> 150 / 200 ms, so two p99s in the same bucket cannot agree to better than
+> 50 ms — the width of the effect. `IntentQueue::on_ack_at` now stamps the
+> intent ack on arrival (the bulk path always did), and the conclusion
+> survives on a stronger footing: the client's arrival-stamped **maximum** for
+> a run is within 1 ms of the server's, 158.40 against 157.41 ms. The rig's
+> poll cadence is worth ~2 ms at p50 and nothing at p99.
+>
+> Second, "inside `persistd`" is now specific, and most of it is **this rig**.
+> `IntentStageMetrics` splits the span into `ingress / admit / spawn_wait /
+> {alloc, grv, idem_read, fence, commit, backoff} / reply` plus two explicit
+> residuals. At ~200 intents/s the tail is a **3.000 s periodic stall** whose
+> period is `p2-load`'s `LEASE_HEARTBEAT`: the rig renewed every session's
+> whole entity set in one pass, so 10 000 lease renewals reached the gateway
+> inside a few milliseconds every three seconds, and the router's
+> `batch_locks` reads 10 000 in exactly the intervals that spike and 0 in
+> every other. Inside a caught intent the time is in **GRV** — 128.03 ms of a
+> 157.41 ms span, with the whole stage set summing to within 20 µs of it.
+> Phasing the same renewals across the period (`P2_LOAD_HEARTBEAT_PHASED`)
+> collapses the tail's GRV from 65 ms to 0.7 ms and removes the periodicity.
+>
+> What is left after that is **FoundationDB's own commit fsync**, and it is the
+> same device as `journal_commit_ms`: the journal's worst `sync_data` and FDB's
+> worst `commit` in the same run correlate at r = 0.888 over 21 runs and are
+> equal at the extremes (200.7/201.4, 175.9/175.3, 355.7/351.3 ms). Phased, in
+> the box's fast fsync regime, the same 250-session / 18 493 diffs/s /
+> 203 intents/s point measures **client p99 15 ms, server p99 9 ms**, 0.0 % of
+> intents past 20 ms.
+>
+> So the "150 ms" in the `ia*` rows is a rig artifact stacked on the device,
+> not an intent-path cost. The `ib40k-xhi` saturation rows are unaffected: at
+> ~1 300 intents/s the FDB client thread is genuinely at 94 %, and the
+> decomposition at 972 intents/s agrees with the `status json` figures below
+> (tail commit mean 16.8–17.7 ms against an in-window cap of 17.60 ms).
+> Full method and evidence: [08-persistence.md](08-persistence.md) §2.2.1.
+
+
 **What runs out there is the FoundationDB client's network thread — the same
 single thread as before #86.** Its utilisation against intent rate, both arms,
 bulk held at 35 k: 18–24 % at ~200 intents/s, 66–75 % at ~1 030, and

@@ -696,6 +696,240 @@ It checks nothing durable, and the gap is the point: balances, item ownership, s
 
 Two-stage validation, deliberately: the hot-state `Ruleset` check is a **fast admission filter** (reject obviously invalid intents without an FDB round trip, using live positions/inventory the actor already holds); the **FDB transaction is the sole authority** for ledger state — it re-reads and re-checks every durable invariant inside the transaction. Hot state mirrors ledger rows; it never owns them. This is the Diablo II lesson (D10) enforced structurally: no client, and no in-memory tier, can mint value.
 
+### 2.2.1 Where the D16 intent tail actually comes from
+
+`intent_commit_ms` misses D16's p99 < 10 ms in the **tail only**: at the P2
+operating point (~200 intents/s with bulk at 18.5 k diffs/s) p50 is 6–8 ms and
+p99 lands in the 100–150 ms bucket, on both storage engines, with FoundationDB
+reporting zero conflicts and its client thread at 18–24 % of one core. A p99
+twenty-five times the p50 at that utilisation is not saturation, and until
+2026-08-19 nothing on this path could say what it was: one number between
+gateway receipt and gateway reply, one number around it, and eight distinct
+waits inside them.
+
+**There are two tail sources stacked, and the larger one was hiding the
+smaller.** The first is an artifact of the load generator — a synchronized
+lease-renewal burst every 3 s, which lands on the intent's *get-read-version*
+because GRV is the first thing an intent transaction does. The second is the
+device, arriving as FoundationDB's own commit fsync, and it is the **same root
+cause as `journal_commit_ms` and `bulk_ack_ms`** (§4.3). With the first removed
+and the device in its fast regime, the same configuration measures a client p99
+of **15 ms** and a server p99 of **9 ms**.
+
+This section records the decomposition so it is not re-derived. The instrument
+is `crate::intent::stages` (`IntentStageMetrics`), on `RouteStageMetrics`'
+shape and for the same reason §2.1 needed that one.
+
+**Denominators first, because this is where the error gets made.** Two, not
+one. `intents` counts *definitive replies* and divides every gateway-side
+stage; `executed` counts intents that reached `IntentExecutor::execute` and
+divides every FDB stage. An intent refused at admission moves the first and not
+the second. (The failure this warning exists for is next door:
+`JournalStageSnapshot` samples once per *flush*, and dividing its sums by
+records understates every stage ~30x — §4.3.)
+
+**Both residuals are emitted, not left to be subtracted.** `server_gap` is
+server-span time no stage claims; `fdb_gap` is time inside `execute` that no
+FDB phase claims — the tokio delay between libfdb_c's network thread waking the
+intent future and a worker polling it, over every await hop. An unattributed
+gap is itself a finding, and this project has had one before (§2.1.3's audit,
+whose cost was excluded from every stage timer and reappeared as the next
+diff's gate wait).
+
+**A mean cannot answer a question about a p99**, so the whole field set is kept
+twice — over every intent and over only those past a 20 ms cut — and one
+exemplar per report interval carries the slowest intent's entire trace.
+
+#### The 130 ms, in one real sample
+
+Slowest of 6 075 intents in a 30 s point at 202.5 intents/s. Every number
+measured; nothing derived.
+
+| stage | µs | |
+|---|---|---|
+| `server_us` | **157 410** | receipt → reply |
+| `admit_us` | 43 | ed25519 verify + validator |
+| `spawn_wait_us` | 1 | `tokio::spawn` → first poll |
+| `exec_us` | 157 370 | inside `IntentExecutor::execute` |
+| — `grv_us` | **128 030** | **get-read-version** |
+| — `idem_read_us` | 1 020 | `intent/{id}` |
+| — `fence_us` | 6 990 | 128 concurrent reads; slowest single read 6 850 |
+| — `commit_us` | 21 290 | closure end → commit resolved |
+| — `alloc_wait_us` / `alloc_refill_us` | 0 / 0 | |
+| — `backoff_us` | 0 | `attempts` = 1: **no retry** |
+| — `fdb_gap_us` | 23 | tokio, all four await hops |
+| `server_gap_us` | 3 | |
+| `reply_us` | 1 | |
+
+The stages sum to 157.39 ms of 157.41 ms. **Twenty microseconds are
+unattributed.** The 130 ms is GRV — the transaction's first FoundationDB round
+trip, paid by every intent including a pure replay, and never measured before
+because it was an invisible prefix of the idempotency read. It is a stage now:
+the executor takes the read version explicitly and first, which costs no extra
+round trip because the read below it could not return without one.
+
+#### It is not load; it is a 3.000 s cadence
+
+Bulk held at 18.5 k diffs/s, intent rate swept, 30 s per point, two repeats
+with the order reversed on the second (§4.3: two fsync regimes differing ~2x,
+switching on a tens-of-seconds scale). `slow%` is the share past the 20 ms cut;
+TAIL columns are means over *those* intents.
+
+| intents/s | n | p50 | p99 | slow % | tail server | grv | fence | commit | fdb_gap | retries |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 47 | 1 414–1 417 | 7–8 ms | 150 ms | 3.8–4.4 | 85–92 ms | **74–81 ms** | 4.7–5.6 ms | 4.4–5.0 ms | 0.0 | 0 |
+| 203 | 6 080–6 090 | 6 ms | 150 ms | 3.4–3.5 | 82–84 ms | **65–67 ms** | 10.0–10.2 ms | 5.9–6.1 ms | 0.0 | 0 |
+| 485 | 14 518–14 543 | 8–10 ms | 150 ms | 6.1–6.4 | 81–85 ms | **51 ms** | 13.6–15.4 ms | 15.1–17.1 ms | 0.0 | 0 |
+| 972 | 29 101–29 171 | 15 ms | 200 ms | 24.1–24.4 | 68–69 ms | **31–33 ms** | 16.5–17.4 ms | 16.8–17.7 ms | 0.0 | 0 |
+
+A twentyfold change in intent rate leaves the tail's *size* alone (80–92 ms
+mean over the tail from 47/s to 485/s) and, between 47/s and 203/s, its
+*fraction* too. Load does not do that; a fixed periodic stall does, because it
+catches a fixed share of a uniform arrival stream.
+
+Sampling one intent per 250 ms report interval shows the shape directly
+(`scripts/intent-tail-periodicity.py`). In a 30 s point at 203 intents/s, nine
+intervals exceed 40 ms and the gaps between them are 11, 12, 12, 12, 12, 12,
+12, 12 intervals — **2 750 ms, then 3 000 ms seven times.** In exactly those
+intervals and no other, the router's `batch_locks` — `heartbeat_leases`' own
+batched gate acquisitions, from the `gateway_route_stage` record — reads
+**10 000**; everywhere else it reads 0.
+
+`LEASE_HEARTBEAT` is 3 s, and `p2-load` renewed **every session's whole entity
+set in one pass of its drive loop**: 250 sessions × 40 entities is 10 000 lease
+renewals arriving inside a few milliseconds, every three seconds. A ~130 ms
+stall every 3 000 ms catches 4.3 % of a uniform intent stream; measured,
+3.4–4.4 %.
+
+#### Moving the cadence, then moving only its shape
+
+Periodicity at a cadence is a coincidence until the cadence moves. Both knobs
+are the rig's (`P2_LOAD_LEASE_HEARTBEAT_MS`, `P2_LOAD_HEARTBEAT_PHASED`), and
+both defaults are unchanged, so every previously published number still means
+what it did.
+
+| renewal | slow % | predicted | tail server | tail grv | tail commit |
+|---|---|---|---|---|---|
+| one pass, 1.5 s | 9.4 | 8.6 | 81 ms | 59 ms | 11 ms |
+| one pass, 3 s *(published)* | 3.4–3.5 | — | 82–84 ms | 65–67 ms | 6 ms |
+| one pass, 6 s | 2.2 | 2.1 | 84 ms | 64 ms | 9 ms |
+| **phased over 3 s** | 3.8 | — | 68 ms | **0.7 ms** | **63 ms** |
+
+The first three change the frequency and leave the stall's size alone, which is
+what a fixed burst does and load does not. The fourth is the discriminating
+one: **only the shape changes** — the same 10 000 renewals in the same three
+seconds, spread instead of bunched — and GRV collapses by ~90x in the tail
+while the 3 s periodicity vanishes from the interval series entirely. It
+replicates in both repeats (0.7 ms and 0.5 ms against 65 ms and 24 ms).
+
+The second repeat of the cadence sweep does **not** scale cleanly, and its own
+decomposition says why: its `commit` term is 33–64 ms against 6–11 ms in the
+first. The box changed fsync regime between repeats and the device term
+overtook the burst term. That is what interleaving and repeating is for, and
+the stage split is what makes such a confound legible instead of fatal.
+
+**The synchronized renewal pass is a property of the load generator, not of the
+workload.** Real clients are not phase-aligned with each other; `p2-load`
+already phases its *bulk* flushes per session (`session_flush_phase`) and did
+not phase its heartbeat, and that asymmetry is the whole of the burst.
+
+#### What phasing leaves behind is the device, and it is the other two series
+
+Phasing alone does not make the series pass; it changes which stage owns the
+tail. Slowest of 6 078 intents in the phased point, on a run where the box was
+in its slow fsync regime:
+
+```
+server_us 203 620      exec_us 203 570
+  grv_us       177       idem_read_us     65
+  fence_us   2 320       commit_us   201 000   <-- all of it
+  fdb_gap_us    14       server_gap_us     3
+```
+
+Five slowest exemplars, commit column: 201.0, 147.7, 123.5, 116.6, 45.9 ms —
+and **aperiodic**, unlike the GRV term.
+
+That commit is FoundationDB's transaction-log fsync, on the same md2 QLC RAID1
+with no power-loss protection that produces the journal's tail — and the two
+are **the same event**, not merely two symptoms of one cause. Read out of the
+same artifact, one line per run (`scripts/intent-vs-journal-fsync.py`), the
+journal's worst `sync_data` and FoundationDB's worst `commit` in that run move
+together across every loaded point:
+
+| journal worst `sync_data` | FDB worst `commit` | point |
+|---|---|---|
+| 17.5 ms | 12.9 ms | phased, fast regime |
+| 26.4 / 32.7 ms | 42.8 / 33.6 ms | published config |
+| 64.0 ms | 63.4 ms | 485 intents/s |
+| 110.8 ms | 103.5 ms | 3 s cadence |
+| 169.4 ms | 175.8 ms | phased, slow regime |
+| 175.9 ms | 175.3 ms | 6 s cadence |
+| 200.7 ms | 201.4 ms | phased, slow regime |
+| 355.7 ms | 351.3 ms | 3 s cadence |
+
+Pearson r = **0.888** over 21 loaded runs (Spearman 0.752), and at the top the
+two columns are equal rather than merely ordered. Both are maxima over the same
+30 s window on the same device, so the identity at the extremes is the load-
+bearing part: the same single fsync is being observed by both subsystems.
+
+**So P2's three failing latency series are two problems, not three.** The
+journal's fsync tail, `bulk_ack_ms` behind it, and the residual of
+`intent_commit_ms` after the rig's burst is removed are **one device**. What is
+left over is a load-generator artifact that a real client population does not
+have. Phased, the same 250-session / 18 493 diffs/s / 203 intents/s point
+measures a client p99 of **15 ms** and a server p99 of **9 ms** with **0.0 %**
+of intents past the 20 ms cut when the box is in its fast fsync regime (FDB
+commit max 12.9 ms, journal worst fsync 17.5 ms), and a client p99 of 75 ms
+when it is not (commit max 102.9 ms, journal worst fsync 207.3 ms). The
+remaining variance in `intent_commit_ms` is the device's, run for run.
+
+#### What it is not, with the number that closes each
+
+| hypothesis | measured | verdict |
+|---|---|---|
+| Fence fan-out tail amplification — the transaction waits on the max of 128 concurrent reads, so the relevant statistic is the single-read p99.99, not the p99 `status json` reports | tail `fence` 1.9–17.4 ms; **slowest single fence read ≤ 19 ms** in every loaded point | not the tail |
+| Wake-up multiplication — ~131 wakes per intent from a thread outside the runtime, onto the injector queue, while 18.5 k diff routes/s hold the workers' local queues | `fdb_gap` mean 0.02 ms / max 0.47 ms; `spawn_wait` mean 0.002 ms / max 2.5 ms — flat *through* the stalled intervals | ruled out |
+| Silent `db.run` retries on 1007/1009/1021/1037/1213 (conflicts being zero says nothing about these) | `attempts − executed` = **0** across >150 000 intents | ruled out |
+| The process-wide `PersistId` allocator mutex, held across a refill transaction | 1–2 refills per 30 s run; `alloc_wait` mean 0–8 µs | not the tail |
+| The gateway receive loop, the reply lane, and the rig's own poll cadence — all inside `intent_commit_ms`, outside the server span | `ingress` mean 1–7 µs, `reply` mean 0 µs, `server_gap` mean 1–2 µs; arrival-stamped client max within 1 ms of the server max | ruled out at p99; the ~2 ms at p50 *is* the rig's poll loop |
+| FDB commit fsync — the device | tail `commit` 4.2–17.7 ms in the fast regime, 62.8–86.5 ms mean and 351 ms max in the slow one | real, and the same root cause as the other two series |
+| GRV | tail `grv` 19–81 ms with the burst present, **0.5–0.8 ms** with it phased away | first in line, and it is the burst |
+
+**On the evidence that said the tail was server-side.** It was one bucket wide:
+the client and gateway histograms share the D16 lattice, whose neighbours here
+are 100 / 150 / 200 ms, so two p99s in the same bucket cannot agree to better
+than 50 ms — the width of the thing being hunted. `IntentQueue::on_ack_at` now
+stamps the intent ack on arrival, as the bulk path already did, and the claim
+survives on a stronger footing: the client's arrival-stamped **maximum** for a
+run is within 1 ms of the server's (158.40 vs 157.41 ms).
+
+**On FDB's own `status json` figures.** They came from the `ic` leg at ~1 000
+intents/s and cap in-window commit latency at 17.60 ms (`ssd`). Nothing here
+contradicts them — at 972 intents/s the tail's commit mean is 16.8–17.7 ms.
+They were the wrong instrument for a 130 ms excursion three seconds apart: one
+synthetic probe transaction every two seconds cannot see it.
+
+#### What is not established
+
+* **Which resource the burst saturates such that GRV specifically queues.** The
+  gateway's own runtime and receive loop are excluded by measurement
+  (`spawn_wait`, `fdb_gap` and `ingress` are flat through the stalled
+  intervals). That leaves the single libfdb_c client network thread and
+  FoundationDB's own single-threaded `fdbserver`, and nothing measured here
+  separates them. The proximate stage and the cause of the burst are both
+  established; the resource between them is not.
+* **The intended device leg failed and is not used.** Holding the intent rate
+  while dropping `--diff-hz` to 0.05 (≈500 diffs/s, journal nearly idle) made
+  FoundationDB **worse by two orders of magnitude** — p50 750 ms, GRV 286–334 ms,
+  99.7 % of intents past the cut — at 4–6 % CPU on `fdbserver` and 10 % on
+  `persistd`, with the loaded control run beside it at 3.87 ms mean. Latency
+  with no utilisation anywhere, from a configuration change that was supposed
+  to *reduce* load. It is an open anomaly, not a device measurement. The device
+  question is answered by the fsync correlation instead, which needs no
+  configuration change at all.
+* Everything above is the `ssd` engine on one box; the published claim that the
+  tail is engine-independent was not re-tested.
+
 ## 3. Cell actor model
 
 ### 3.1 Single writer, mailbox, state
