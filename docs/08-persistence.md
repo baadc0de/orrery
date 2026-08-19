@@ -2442,6 +2442,15 @@ and demonstrably not sufficient, and the next question is not about hardware.
    one path and is testable in one run. Until that is done, **no gate number in
    this file has been taken with the journal's device to itself** — including
    §2.2.2's baseline and §4.3's own.
+
+   > **Done, and it is not the mechanism ([§4.6](#46-removing-every-co-tenant-and-what-is-left)).**
+   > `P2_GATE_DATA_DIR` landed in §4.5; §4.6 ran it here, 36 runs across three
+   > placements and two filesystems. Evidence on tmpfs does not remove the
+   > stall, moving FoundationDB off as well does not remove it, and XFS — 10×
+   > more writeback-resistant at the device than ext4 — does not remove it.
+   > 34 of 36 runs stalled. Job `D` is a real effect on the device and is not
+   > what the gate is measuring, so read the paragraph above as the hypothesis
+   > it was labelled as. Follow-up 2 below is now the only one standing.
    *(Done, as `P2_GATE_DATA_DIR` — see [§4.5](#45-separating-the-evidence-path-and-why-the-reference-box-cannot-answer-it),
    which also shows the reference box cannot measure what it buys: that box's
    bare barrier maximum is 78 ms against this one's 0.46 ms, so the test wants
@@ -2572,12 +2581,25 @@ correct and the note added there is the correction.
    two runs. Job `A` there tops out at 0.46 ms, so a surviving stall is
    unambiguous, and that is the box where the separation can be shown to work
    or not.
+
+   > **Done ([§4.6](#46-removing-every-co-tenant-and-what-is-left)): the stall
+   > survives.** Twelve `split` runs there, evidence on tmpfs, still stalled at
+   > 90–238 ms — and twelve more with FoundationDB moved off too. The null this
+   > section reported was the right reading of its own data for the right
+   > reason; the separation simply does not work anywhere.
 2. **Until then, keep the default.** `P2_GATE_DATA_DIR` unset reproduces
    history; nothing in this file needs re-deriving because of it.
 3. **§4.4's second follow-up is unchanged.** If the stalls survive separation
    on a device whose own tail is quiet, they are inside fjall or jbd2 — segment
    rotation, memtable flush, compaction — and nothing has looked there since
    §4.3 concluded the question was hardware.
+
+   > **They survive, and jbd2 is out too
+   > ([§4.6](#46-removing-every-co-tenant-and-what-is-left)).** The same stalls
+   > appear on XFS, which has no jbd2, at the same magnitude — so of the two
+   > named here only fjall remains, alongside one candidate this list did not
+   > anticipate: the *I/O shape* an LSM asks for, which no `fio` job in §4.4,
+   > §4.5 or here ever reproduced.
 
 #### Reproducing
 
@@ -2594,6 +2616,184 @@ fio --name=jobA --directory=<on the journal's fs> --rw=write --bs=8k \
 
 python3 scripts/p2-evidence-split-report.py
 python3 scripts/p2-evidence-split-report.py --self-test
+```
+
+### 4.6 Removing every co-tenant, and what is left
+
+[§4.4](#44-the-re-measurement-43-asked-for-power-loss-protected-storage)
+attributed the journal's 50–175 ms stalls to buffered writeback from the
+harness's own evidence files, on the strength of an `fio` job that reproduced
+their size and rarity, and labelled it circumstantial rather than attribution.
+[§4.5](#45-separating-the-evidence-path-and-why-the-reference-box-cannot-answer-it)
+built the knob to test it and showed the reference box could not run the test.
+This section runs it on §4.4's hardware. **The attribution does not survive.**
+
+```sh
+python3 scripts/p2-nvme-isolation-report.py             # every number below
+python3 scripts/p2-nvme-isolation-report.py --self-test # and its eliminations
+```
+
+**What was run.** Thirty-six `p2-kill9-gate.sh` runs on a fresh
+`c4d-standard-32-lssd` at `03b2b4c3`, six per cell of a 3 × 2 design, cell
+order rotating per repeat. The placements remove the journal's co-tenants one
+at a time:
+
+| placement | journals | FoundationDB | the harness's evidence |
+|---|---|---|---|
+| `together` | the device | the device | **the device** (§4.4's configuration) |
+| `split` | the device | the device | **tmpfs** — no harness byte reaches the device |
+| `isolated` | the device | **tmpfs** | **tmpfs** — the journal has the device to itself |
+
+The filesystem is the second factor, at the suggestion that started this leg:
+`ext4` on `/dev/nvme0n1` and `xfs` on `/dev/nvme1n1`, two *identical* Titanium
+local NVMes, so `fs` is a real factor rather than a mount option on one device
+queue. Every run verified its own layout with `df` rather than trusting the
+configuration, and the verification is in the data file.
+
+#### Nothing outside `persistd` is producing the stall
+
+| cell | n | `journal_commit_ms` p99 med | worst fsync med | range | stalls > 50 ms | µs/flush |
+|---|---|---|---|---|---|---|
+| ext4-together | 6 | 15.0 | 92.3 | 84–176 | 13 | 202.4 |
+| ext4-split | 6 | 40.0 | 149.2 | 90–238 | 11 | 200.8 |
+| ext4-isolated | 6 | 15.0 | 89.5 | 78–142 | 9 | 202.1 |
+| xfs-together | 6 | **8.5** | 94.6 | 22–189 | 8 | 179.2 |
+| xfs-split | 6 | 12.0 | 111.1 | 94–236 | 9 | 177.2 |
+| xfs-isolated | 6 | 17.5 | 180.2 | 47–236 | 8 | 179.9 |
+
+Read down the `worst fsync` column, which is the statistic §4.4 and §4.5 both
+use. Removing the harness's writes entirely does not remove the stall
+(`together` median 93.2 ms, `split` 125.1 ms). Removing FoundationDB as well
+does not remove it either (`isolated` 130.4 ms). **34 of 36 runs stalled**, 58
+stalls above 50 ms and 33 above 90 ms, and no cell of the six produced a clean
+set of runs. The two arms that were supposed to help are, if anything, slightly
+worse — with n = 6 and a max-of-run statistic that is noise, but *no arm is
+better*, and that is the finding.
+
+So the elimination §4.4 began now runs out of candidates outside the process:
+
+| candidate | removed by | result |
+|---|---|---|
+| the device | `fio` job `A`: 0.27–0.72 ms max over 112 800 barriers | cleared (§4.4, and again here on both filesystems) |
+| CPU scheduling | PSI, `mpstat`, run queue | cleared (§4.4) |
+| the harness's own writeback | `split`: evidence on tmpfs | **does not remove the stall** |
+| FoundationDB's co-tenancy | `isolated`: FDB's data directory on tmpfs too | **does not remove the stall** |
+| the filesystem's journal (jbd2) | `xfs`, which has no jbd2 | **does not remove the stall** |
+
+**What is left is inside `persistd`** — which is §4.4's second follow-up, and
+now the only one standing. But "inside `persistd`" splits into two candidates
+that this experiment cannot separate, and conflating them would send the next
+investigation the wrong way:
+
+1. **fjall's own work**, off the device entirely: segment rotation, memtable
+   flush, compaction, or the writer mutex held across one of them. The stall
+   would then be CPU or lock time that happens to be measured inside the
+   journal's sync stage.
+2. **The I/O fjall asks for, which is not the I/O `fio` was asked to do.** Job
+   `A` appends 8 KiB at a steady rate to a pre-sized file and calls
+   `fdatasync`. It never creates a file, never extends one, never renames or
+   deletes, never fsyncs a directory, and never presents a multi-megabyte
+   dirty set in one barrier. An LSM does all of those. **So the device and the
+   filesystem are cleared for `fio`'s I/O shape, not for fjall's** — and the
+   most economical hypothesis consistent with everything above is that a
+   memtable flush or compaction hands one `fdatasync` far more to persist than
+   the steady state does, on hardware where the steady state costs 200 µs.
+
+That hypothesis is attractive precisely because it explains the pattern that
+has survived every environmental change: two or three stalls per 30 s run,
+independent of placement, filesystem and device, in a system that writes a
+memtable-sized unit every so often by construction. It is also unmeasured.
+Both candidates need the same instrument — a stage timer inside the journal
+that separates fjall's own work from the `fdatasync` it wraps, and per-barrier
+bytes — which is what makes it one piece of work rather than two.
+
+#### The filesystem half, which cuts the other way
+
+XFS is dramatically better at the thing §4.4 blamed, and it does not help:
+
+| `fio` job | p99.9 | p99.99 | max |
+|---|---|---|---|
+| `A` ext4 — barriers only | 0.192 | 0.268 | 0.721 |
+| `D` ext4 — plus a 5 MB/s buffered writer | 2.023 | 35.914 | **37.390** |
+| `A` xfs — barriers only | 0.090 | 0.096 | 0.269 |
+| `D` xfs — plus the same writer | 2.998 | 3.555 | **3.935** |
+
+XFS is **10× more resistant to writeback interference at the device**, and the
+gate stalls on it at 22–236 ms regardless. If writeback were the gate's
+mechanism, this is the row that would have shown it.
+
+What XFS *does* buy is real and worth having: a tighter per-flush cost
+(177–180 µs against ext4's 200–202, populations that do not overlap) and a
+lower gated p99 — `xfs-together` reads a median **8.5 ms** against ext4's
+15.0. It gets there by redistributing the near tail, not by removing the far
+one: XFS carries slightly *more* mass just over 2 ms (4.16 % against 3.66 %)
+and slightly less above 15 ms. Note how narrow that makes the p99 here — the
+tail mass above 15 ms is ~0.8 % in both, so the 1 % point sits almost exactly
+on the boundary and the gated statistic swings a whole bucket on very little.
+Prefer the mass columns to the p99 when comparing these cells.
+
+#### Unchanged from §4.4
+
+The body of the distribution is where §4.4 left it: **92.5–96.1 % of journal
+commits land at or below 0.5 ms in every one of the 36 runs**. Durability held
+in all 36 — recovery verified, zero leases lost, zero diff nacks, 539 872–541 400
+durable acknowledgements. `area_first_page_ms` passed 36 of 36 and
+`intent_commit_ms` 24 of 36. **The gate is red in all 36.**
+
+#### What this does not establish
+
+* **It does not identify the mechanism inside `persistd`.** It removes every
+  external candidate and stops there. Naming fjall's segment rotation,
+  memtable flush or compaction would need instrumentation nobody has added.
+* **n = 6 per cell, and the worst-fsync statistic is a max of a run.** It is
+  the right statistic for "did the stall happen", and a poor one for ranking
+  arms that all stall. No ordering among the three placements is claimed.
+* **The two filesystems sit on two devices.** They are the same SKU in one
+  instance and job `A` agrees to within 0.5 ms, but a per-device difference is
+  not excluded by this design.
+* **XFS was not run on the reference box**, so its advantage is established on
+  this hardware only, and on the bulk path only.
+
+#### What follows
+
+1. **Instrument the journal writer, and record per-barrier bytes.** Every
+   external explanation is eliminated on hardware quiet enough to eliminate it,
+   so the next measurement is inside `persistd`: a stage timer separating
+   fjall's own work from the `fdatasync` it wraps, the bytes each barrier is
+   asked to persist, and enough of a trace to say whether a rotation, flush or
+   compaction was in flight when a 90 ms barrier happened. The bytes are the
+   cheap half and they discriminate between the two candidates above on their
+   own — a stall that arrives with a multi-megabyte barrier is the I/O-shape
+   story, and one that arrives with an ordinary 36 KB barrier is fjall's own
+   work.
+2. **Then re-run job `A` with fjall's syscall mix, not a steady append.** If
+   the bytes point at the I/O shape, the honest follow-up is an `fio` job (or a
+   small harness) that creates, extends, renames and deletes the way an LSM
+   does, to find out whether this device and filesystem stall on *that* while
+   staying flat on a steady 8 KiB append.
+3. **`P2_GATE_DATA_DIR` stays, and stays defaulted.** It cost nothing, it makes
+   the layout explicit, and §4.5's reason for keeping the default unchanged is
+   unaffected. What it is no longer is a fix.
+4. **Consider XFS for the journal's filesystem.** It is a smaller,
+   independently useful result: tighter per-flush cost and a lower gated p99 on
+   the same hardware, for a mount-time decision. It does not close the gate.
+
+#### Reproducing
+
+```sh
+# two identical local NVMes so the filesystem is a real factor, plus a tmpfs
+mkfs.ext4 -F /dev/nvme0n1 && mount -o noatime /dev/nvme0n1 /mnt/nvme
+mkfs.xfs  -f /dev/nvme1n1 && mount -o noatime /dev/nvme1n1 /mnt/xfs
+mount -t tmpfs -o size=24G tmpfs /mnt/evidence
+
+# together / split / isolated differ only in where these two point, plus which
+# cluster is used -- the `isolated` arm needs a third fdbserver whose --datadir
+# is on the tmpfs.
+P2_GATE_OUT=$ROOT/gate/$label                                  # together
+P2_GATE_OUT=/mnt/evidence/gate/$label P2_GATE_DATA_DIR=$ROOT/data/$label   # split, isolated
+
+# and verify rather than assume, every run
+df --output=fstype "$P2_GATE_OUT" "$P2_GATE_DATA_DIR/primary-data"
 ```
 
 ## 5. FoundationDB as the system of record

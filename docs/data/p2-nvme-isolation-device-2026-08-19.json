@@ -1,0 +1,71 @@
+{
+ "measured_utc": "2026-08-19",
+ "tree": "03b2b4c3",
+ "host": {
+  "provider": "gcp",
+  "machine_type": "c4d-standard-32-lssd",
+  "zone": "us-central1-b",
+  "vcpu": 32,
+  "ram_gb": 121,
+  "os": "Debian GNU/Linux 13 (trixie)",
+  "ext4_device": "/dev/nvme0n1 (Titanium local NVMe), ext4 noatime, write through, vwc=0",
+  "xfs_device": "/dev/nvme1n1 (identical Titanium local NVMe), xfs noatime, write through, vwc=0",
+  "evidence_device": "tmpfs 24G at /mnt/evidence",
+  "foundationdb": "7.3.77, ssd engine; one cluster per filesystem plus one on tmpfs for the isolated arm",
+  "note": "two identical local SSDs so `fs` is a real factor rather than a mount option on one device queue"
+ },
+ "fio": [
+  {
+   "job": "fio-A-ext4",
+   "description": "ext4: the gate's barrier shape, 2 writers at 470/s, no competing writer",
+   "numjobs": 2,
+   "barriers_per_s": 940.0,
+   "p50_ms": 0.105,
+   "p99_ms": 0.1382,
+   "p99_9_ms": 0.1915,
+   "p99_99_ms": 0.2683,
+   "max_ms": 0.7209
+  },
+  {
+   "job": "fio-D-ext4",
+   "description": "ext4: the same plus a 5 MB/s buffered writer",
+   "numjobs": 2,
+   "barriers_per_s": 940.0,
+   "p50_ms": 0.0234,
+   "p99_ms": 0.0412,
+   "p99_9_ms": 2.0234,
+   "p99_99_ms": 35.9137,
+   "max_ms": 37.3896
+  },
+  {
+   "job": "fio-A-xfs",
+   "description": "xfs: the gate's barrier shape, 2 writers at 470/s, no competing writer",
+   "numjobs": 2,
+   "barriers_per_s": 940.0,
+   "p50_ms": 0.0653,
+   "p99_ms": 0.0855,
+   "p99_9_ms": 0.0896,
+   "p99_99_ms": 0.0957,
+   "max_ms": 0.2685
+  },
+  {
+   "job": "fio-D-xfs",
+   "description": "xfs: the same plus a 5 MB/s buffered writer",
+   "numjobs": 2,
+   "barriers_per_s": 940.0,
+   "p50_ms": 0.0247,
+   "p99_ms": 1.4336,
+   "p99_9_ms": 2.9983,
+   "p99_99_ms": 3.5553,
+   "max_ms": 3.9353
+  }
+ ],
+ "quoted": {
+  "source": "docs/08 \u00a74.4 and \u00a74.5",
+  "nvme_ext4_jobA_max_ms": 0.46,
+  "nvme_ext4_jobD_p99_99_ms": 119.013,
+  "nvme_ext4_jobD_max_ms": 303.377,
+  "md2_jobA_max_ms": 77.957,
+  "md2_jobD_p99_99_ms": 94.896
+ }
+}

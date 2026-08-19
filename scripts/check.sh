@@ -277,6 +277,18 @@ lane_gates() {
     # aggregate would catch.
     run scripts/p2-nvme-report.py --self-test
 
+    # docs/08 §4.6's, and it guards the opposite risk from §4.4's. That section
+    # attributed the journal's stalls to writeback and this one removes every
+    # co-tenant in turn — the harness's evidence, then FoundationDB — and finds
+    # the stall still there on two filesystems. Its claims are therefore all
+    # *negatives*, and a negative is what a well-meaning data edit quietly
+    # turns into a positive: make one arm come out clean and the section reads
+    # as a fix rather than an elimination. So the self-test pins each arm still
+    # stalling, the per-run `df` proof that each layout was actually in effect,
+    # and the one comparison that carries the filesystem half — that xfs is far
+    # more writeback-resistant at the device and stalls the gate anyway.
+    run scripts/p2-nvme-isolation-report.py --self-test
+
     # And this script's own, which nothing ran either: ci.yml calls the four
     # lanes and never `--self-test`, so the lane table's agreement with the tree
     # — and, now, the coverage clause below — were checked only when a human
