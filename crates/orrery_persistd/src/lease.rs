@@ -17,6 +17,7 @@ use orrery_protocol::{
 
 #[cfg(feature = "fdb")]
 pub mod fdb;
+pub mod stages;
 #[cfg(feature = "fdb")]
 pub use fdb::FdbLeaseStore;
 

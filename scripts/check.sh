@@ -240,6 +240,15 @@ lane_gates() {
     # the ten runs exist to exercise at all.
     run scripts/p2-locate-removal-report.py --self-test
 
+    # docs/08 §2.2.6's. Its data is 30 metric records from one gate run, in
+    # the tree at 8 KB. What its self-test holds is the section's conclusion
+    # rather than its decimals: that the router still dominates the served
+    # span, that everything above it is small, that both peer-state lock
+    # acquisitions are still free, and that the stage identity is exact. A
+    # decomposition whose stages stopped adding up to the span they decompose
+    # would be an instrument measuring nothing, and it would say so quietly.
+    run scripts/p2-lease-stage-report.py --self-test
+
     # And this script's own, which nothing ran either: ci.yml calls the four
     # lanes and never `--self-test`, so the lane table's agreement with the tree
     # — and, now, the coverage clause below — were checked only when a human
@@ -313,13 +322,36 @@ discovered_workspaces() {
 # usage without handling it would be recorded as covered while dying on an
 # unknown argument. So the pattern is the dispatch itself — a `[[ $1 == ... ]]`
 # comparison or a `case` arm — which is the thing that makes the flag work.
+# Scripts whose `--self-test` is deliberately not per-commit, each with the
+# reason it cannot be. Modelled on §2.2.1's allow-lists: an exemption states
+# why, and it fails when the thing it exempts stops existing, so it cannot
+# outlive its subject and quietly widen.
+readonly SELF_TEST_NOT_PER_COMMIT=(
+    # Its three checks re-derive docs/08 §2.2.1 from ~10 GB of sweep
+    # artifacts that are not version-controlled and not reproducible from a
+    # checkout, so there is nothing for a per-commit lane to run them against.
+    scripts/intent-tail-derive.py
+)
+
 scripts_supporting_self_test() {
     local script
     while IFS= read -r script; do
-        grep -qE '(==[[:space:]]*"?--self-test"?|^[[:space:]]*"?--self-test"?\))' "$script" \
+        # Three idioms, because two languages are in scope: shell's `case`
+        # arm and `[[ $1 == --self-test ]]`, and Python's `"--self-test" in
+        # argv` -- spelled `sys.argv` or a local rebinding of it, both of
+        # which are in this tree. Matching the flag anywhere in the file
+        # instead would call every script that merely documents it supported.
+        grep -qE '(==[[:space:]]*"?--self-test"?|^[[:space:]]*"?--self-test"?\)|"--self-test"[[:space:]]+in[[:space:]]+(sys\.)?argv)' "$script" \
             || continue
         echo "scripts/${script##*/}"
-    done < <(find "$ROOT/scripts" -maxdepth 1 -name '*.sh' | sort)
+        # `.py` as well as `.sh`, since 2026-08-19. The clause was written when
+        # every self-test was a shell script and it kept looking only at those,
+        # so the three Python reporters docs/08 §2.2.2, §2.2.5 and §2.2.6 read
+        # their numbers from were outside it: their `--self-test` modes were
+        # invoked by the lane and their *registration* was enforced by nobody.
+        # A fourth would have been added unregistered and silently unrun, which
+        # is the exact failure this clause exists to make loud.
+    done < <(find "$ROOT/scripts" -maxdepth 1 \( -name '*.sh' -o -name '*.py' \) | sort)
 }
 
 # The self-tests `lane_gates` actually invokes, read out of its body. Scoped to
@@ -329,7 +361,7 @@ scripts_supporting_self_test() {
 lane_gates_self_tests() {
     sed -n '/^lane_gates() {/,/^}/p' "$0" \
         | grep -v '^[[:space:]]*#' \
-        | sed -n 's|^[[:space:]]*run \(scripts/[a-z0-9.-]*\.sh\) --self-test.*|\1|p' \
+        | sed -n 's|^[[:space:]]*run \(scripts/[a-z0-9._-]*\) --self-test.*|\1|p' \
         | sort -u
 }
 
@@ -401,6 +433,19 @@ self_test() {
     local supported invoked uncovered phantom
     supported="$(scripts_supporting_self_test)"
     invoked="$(lane_gates_self_tests)"
+    local exempt
+    exempt="$(printf '%s\n' "${SELF_TEST_NOT_PER_COMMIT[@]}" | sort -u)"
+    # An exemption for a script that no longer accepts `--self-test` (or no
+    # longer exists) is stale, and a stale exemption is how a list like this
+    # grows to cover things nobody decided to exempt.
+    local stale
+    stale="$(comm -13 <(echo "$supported") <(echo "$exempt"))"
+    if [[ -n $stale ]]; then
+        note 'self-test: these exemptions name scripts that do not accept --self-test:'
+        sed 's/^/  /' <<<"$stale" >&2
+        die 'self-test: an exemption must not outlive the self-test it exempts'
+    fi
+    supported="$(comm -23 <(echo "$supported") <(echo "$exempt"))"
     [[ -n $invoked ]] || die 'self-test: no --self-test invocations found in lane_gates; the parse has drifted'
 
     uncovered="$(comm -23 <(echo "$supported") <(echo "$invoked"))"
@@ -415,7 +460,8 @@ self_test() {
         sed 's/^/  /' <<<"$phantom" >&2
         die 'self-test: the gates lane would fail on an unrecognized argument'
     fi
-    note "self-test: all $(wc -l <<<"$supported") self-tests in scripts/ run in the gates lane"
+    note "self-test: all $(wc -l <<<"$supported") per-commit self-tests in scripts/ run in the \
+gates lane ($(wc -l <<<"$exempt") exempted)"
 
     echo "$NAME: self-test passed"
 }

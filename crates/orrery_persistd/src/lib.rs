@@ -86,6 +86,9 @@ pub use journal::{
     JournalConfig, JournalError, JournalScan, JournalStageSnapshot, MemChainTransport,
     StoredRecord,
 };
+pub use lease::stages::{
+    lease_stage_metrics, HeartbeatTrace, LeaseStageMetrics, LeaseStageSnapshot,
+};
 #[cfg(feature = "fdb")]
 pub use lease::FdbLeaseStore;
 pub use lease::{

@@ -72,6 +72,7 @@ use crate::intent::{
     SharedValidator,
 };
 use crate::lease::registrar_now_ms;
+use crate::lease::stages::{elapsed_us as lease_stage_us, lease_stage_metrics, HeartbeatTrace};
 use crate::payload_crc;
 use crate::reliable;
 
@@ -4574,32 +4575,63 @@ async fn serve_lease_message(cx: &LeaseContext, work: LeaseWork) {
             })));
         }
         LeaseMsg::Heartbeat { renew, .. } => {
+            // Five waits, timed separately. See `lease::stages` for why the
+            // aggregate this arm used to report as nothing at all was not a
+            // usable answer to "what does a renewal cost above the router".
+            let started = Instant::now();
+            let mut trace = HeartbeatTrace {
+                entries: renew.len() as u64,
+                ..HeartbeatTrace::default()
+            };
+            let session_started = Instant::now();
             let Some(peer) = active_session.lock_current().await else {
+                // A heartbeat on a session that is already gone is still a
+                // served heartbeat, and its cost is still real: it takes the
+                // lock, finds nothing, and encodes an ack refusing every pair.
+                // Recording it keeps `heartbeats` the count of messages served
+                // rather than the count that found a session.
+                trace.session_us = lease_stage_us(session_started);
+                let encode_started = Instant::now();
                 send(Bytes::from(encode_stream_frame(&GatewayReply::Lease {
                     message: LeaseMsg::HeartbeatAck {
                         leases: Vec::new(),
                         invalid: renew,
                     },
                 })));
+                trace.encode_us = lease_stage_us(encode_started);
+                trace.heartbeat_us = lease_stage_us(started);
+                lease_stage_metrics().record(&trace);
                 return;
             };
+            trace.session_us = lease_stage_us(session_started);
+            let resolve_started = Instant::now();
             let (renewable, mut invalid) =
                 resolve_renewals(&peer.leases, active_session.generation, &renew);
             drop(peer);
+            trace.resolve_us = lease_stage_us(resolve_started);
+            let route_started = Instant::now();
             let (rows, refused) =
                 renew_session_leases(router, remote, &renewable, registrar_now_ms()).await;
+            trace.route_us = lease_stage_us(route_started);
             let mut rows = rows;
             invalid.extend(refused);
-            if active_session.lock_current().await.is_none() {
+            let recheck_started = Instant::now();
+            let vanished = active_session.lock_current().await.is_none();
+            trace.recheck_us = lease_stage_us(recheck_started);
+            if vanished {
                 rows.clear();
                 invalid = renew;
             }
+            let encode_started = Instant::now();
             send(Bytes::from(encode_stream_frame(&GatewayReply::Lease {
                 message: LeaseMsg::HeartbeatAck {
                     leases: rows,
                     invalid,
                 },
             })));
+            trace.encode_us = lease_stage_us(encode_started);
+            trace.heartbeat_us = lease_stage_us(started);
+            lease_stage_metrics().record(&trace);
         }
         LeaseMsg::Divest {
             entity,

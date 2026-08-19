@@ -1787,6 +1787,65 @@ python3 scripts/p2-locate-removal-report.py              # every number above
 python3 scripts/p2-locate-removal-report.py --self-test
 ```
 
+### 2.2.6 Above the router, there is nothing left to take
+
+§2.2.3–§2.2.5 took the renewal path apart below the [`Router`] boundary and
+left it near 1.9 us per renewal on the bench. Nothing measured what a heartbeat
+costs *above* it — the peer-state lock, the resolve against the session's own
+lease table, the second lock, the ack encode. Five waits, no numbers. That is
+the position `router_apply` and `gateway_intent_server_ms` were in before
+`RouteStageMetrics` and `IntentStageMetrics` split them, so this is the same
+split for renewals: `crate::lease::stages`, emitted as `gateway_lease_stage`.
+
+**Every number here is printed by `scripts/p2-lease-stage-report.py` from
+`docs/data/p2-lease-stages-2026-08-19.jsonl`** — the 30 report intervals one
+P2 kill-9 gate run's primary emitted — and `--self-test` holds the section's
+conclusions to it.
+
+**One heartbeat, 125 sessions x 80 leases, 1 220 heartbeats over the run:**
+
+| stage | per heartbeat | per renewal | share |
+|---|---|---|---|
+| peer-state lock | 0.0 us | 0.00 us | 0.0 % |
+| resolve vs session table | 7.3 us | 0.09 us | 2.9 % |
+| **router call** | **235.5 us** | **2.94 us** | **94.0 %** |
+| second lock | 0.0 us | 0.00 us | 0.0 % |
+| ack encode + send | 5.7 us | 0.07 us | 2.3 % |
+| unattributed gap | 2.0 us | 0.02 us | 0.8 % |
+| **served span** | **250.5 us** | **3.13 us** | 100 % |
+
+**The answer is that there is nothing here.** Everything above the router is
+**6.0 %** of the served span, and the whole renewal path — router included —
+is **1.019 %** of one core across a 30 s run. The largest single item above the
+router is the resolve, at 7.3 us per heartbeat. Removing all of it would save
+six hundredths of one percent of a core.
+
+Two things in the table are worth naming rather than skipping past.
+
+**Both peer-state lock acquisitions are free.** They were the reason to suspect
+this layer at all — two async mutex acquisitions per heartbeat, one of them
+holding the session's whole lease table across the resolve. They measure 0.0 us
+per heartbeat and a 0.01 ms maximum across 1 220 of them, because the lease
+lane is per connection and nothing contends for a peer's own state.
+
+**The router costs more here than on the bench** — 2.94 us per renewal against
+1.9 us — and that difference is the real node doing bulk, journal and intent
+work at the same time. It is the right direction and the right size; a
+synthetic rig with nothing else running should be the optimistic bound.
+
+**What this closes.** The renewal path was worth examining because it ran at
+~3 333/s against ~200 intents/s and nobody had looked. It has now been looked
+at from the actor mailbox up to the wire, and after §2.2.4 it is not a
+meaningful consumer of anything. The instrument stays because it is what would
+catch that changing — an unattributed gap of 0.8 % is a decomposition that
+adds up, and `--self-test` fails if the stages stop summing to the span they
+decompose.
+
+The run itself is in family with §2.2.5's post arm on every number that
+section pins — GRV mean 0.220 ms inside its 0.217–0.226 ms band, 10 000 leases
+held, `leases_lost` 0, recovery verified, gate red on `journal_commit_ms` —
+so the instrumentation costs nothing measurable.
+
 ## 3. Cell actor model
 
 ### 3.1 Single writer, mailbox, state
