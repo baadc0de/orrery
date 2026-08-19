@@ -2201,6 +2201,22 @@ threads 5117). The often-quoted "rig does 0.93 ms p99" is a real number from a
 distribution, not fjall's writer mutex and not the gate's topology. Two
 consequences bind:
 
+> **Measured (2026-08-19): half of this is right and the headline is wrong —
+> see [§4.4](#44-the-re-measurement-43-asked-for-power-loss-protected-storage).**
+> The re-measurement this section asks for below was run on storage whose
+> barrier p99 is 0.089–0.095 ms, and `journal_commit_ms` p99 did not move: it
+> landed on 15 ms in 11 of 16 runs, the same modal value measured here. What
+> *did* follow the device is everything this section measured directly —
+> per-flush `sync_data` 922 → ~205 µs, p50 1.00 → 0.50 ms, ρ 0.54 → 0.11 — and
+> 96.19 % of durable acks now land inside the 2 ms budget. The p99 is set by
+> two or three stalls of 90–175 ms per run that the device cannot produce and
+> that co-located buffered writeback can. So consequence 1's *sizing* stands as
+> a necessary condition and is demonstrably not a sufficient one, and the
+> sentence above — "not fjall's writer mutex and not the gate's topology" — was
+> not established by the evidence in this section and is now the open question.
+> The paragraphs below are left standing because they are correct about this
+> box, and because §4.4 is only legible next to them.
+
 1. **D16's 2 ms `journal_commit_ms` p99 is below this hardware's floor.** A
    durable ack costs at least one durability barrier, and one bare barrier on
    `md2` has a p99 of 3.2–5.5 ms. No group-commit tuning, no removal of the
@@ -2225,6 +2241,223 @@ consequences bind:
    `journal::group_commit`) rather than raising the constant: on storage whose
    barrier p99 is under 1 ms the small window is the right shape, and on this
    box no window is right.
+
+### 4.4 The re-measurement §4.3 asked for: power-loss-protected storage
+
+§4.3 ends by naming a storage requirement — **a barrier whose p99 is ≤ ~1.5 ms
+sustained at ≥ 400 barriers/s** — and asking that its conclusion be re-measured
+"on hardware with power-loss-protected write cache, where the barrier p99 the
+sizing below asks for is routine rather than out of reach." This is that
+measurement. Every number here is re-derivable from the tree:
+
+```sh
+python3 scripts/p2-nvme-report.py             # every number below
+python3 scripts/p2-nvme-report.py --self-test # and the claims they support
+```
+
+**What was run.** The same `scripts/p2-kill9-gate.sh`, unmodified, at the same
+commit, against the same scenario (`p2demo`, profile `demo`: 10 000 entities,
+128 shards, 125 sessions, 30 s, phased renewals). Sixteen runs — eight against
+a FoundationDB cluster configured `single ssd` and eight against `single
+memory`, arms interleaved with the order alternating per repeat, so neither arm
+is always the one that runs first into a cold page cache. Two further runs were
+instrumented and are excluded from every aggregate below (`leg` distinguishes
+them in the data file). The host was a throwaway GCP `c4d-standard-32-lssd` —
+32 vCPU, 121 GB, one Titanium local NVMe carrying **both** journals, both FDB
+clusters and the harness's own output, ext4 `noatime`, FDB 7.3.77.
+
+#### The device is the one §4.3 asked for, by a wide margin
+
+`nvme id-ctrl` reports `vwc=0` and the kernel reports `write_cache: write
+through`: there is no volatile write cache to flush, which is the property §4.3
+predicted would change the numbers. The same `fio` job §4.3 used — 8 KiB write
++ `fdatasync`, buffered, one thread — reports:
+
+| | barriers/s | p50 | p99 | p99.9 | max |
+|---|---|---|---|---|---|
+| this device, 60 s | 29 653 | 0.023 | **0.085** | 0.091 | 1.103 |
+| this device, 4 × 15 s | 11 679–12 530 | 0.076–0.082 | **0.089–0.095** | 0.098–0.103 | 0.212–0.281 |
+| `md2`, 60 s (§4.3) | 893 | 0.30 | **3.72** | 34.9 | 92.3 |
+| `md2`, 4 × 15 s (§4.3) | 444–1452 | — | **3.2–5.5** | — | — |
+
+That clears §4.3's requirement by **16× on latency and 29× on rate**, and it
+clears it *repeatably*: four repeats span 0.089–0.095 ms, against 3.2–5.5 ms
+and a 3× swing in throughput on the QLC array. §4.3's concurrency result also
+inverts. There, eight parallel fsync streams moved per-barrier p99 3.2 → 15.1
+ms; here they move it 0.085 → 0.510 ms.
+
+#### The gated p99 did not follow
+
+| series | budget | reference box (§2.2.2, n=28 phased) | this box (n=16) | passing |
+|---|---|---|---|---|
+| `journal_commit_ms` p99 | 2 ms | 15–100 (med 20) | **15–40 (med 15)** | 0 of 16 |
+| `bulk_ack_ms` p99 | 5 ms | 15–150 | **15–40 (med 15)** | 0 of 16 |
+| `intent_commit_ms` p99 | 10 ms | 15–150 (med 17.5) | **8–40 (med 12.5)** | 8 of 16 |
+| `area_first_page_ms` p99 | 50 ms | 3–20 | **2.5–7 (med 3.25)** | 16 of 16 |
+| `journal_commit_ms` p50 | — | 1.00 ms | **0.50 ms** | — |
+| per-flush `sync_data` | — | 922 µs | **199–217 µs** | — |
+| ρ (writer utilisation) | — | 0.54 | **0.11** | — |
+
+Everything §4.3 measured *directly* improved by roughly the factor the device
+improved by. The one number that is gated did not move: `journal_commit_ms`
+p99 landed on 15 ms in **11 of 16** runs, which is the reference box's own
+modal value. A 40× better barrier bought no p99.
+
+Two series did cross. `intent_commit_ms` passes in **8 of 16** runs here
+against **0 of 43** there, and `area_first_page_ms` tightened from 3–20 ms to
+2.5–7 ms. Neither is the series that gates on a durability barrier.
+
+**The two FoundationDB storage engines are not separable here.** Identical
+medians on `journal_commit_ms` (15 / 15), `bulk_ack_ms` (15 / 15) and
+overlapping ranges on all four. On `intent_commit_ms` the `ssd` arm reads
+*better* (med 9.5 vs 17.5), which is the opposite direction from
+[14-capacity.md](14-capacity.md) §11.7 — but at n=8 per arm with ranges of
+8–20 against 8–40 that is not a result, and it is not offered as one. This
+experiment collected none of the FDB-internal counters §11.7 rests on.
+
+#### What the tail is, by elimination
+
+The gate's own journal instrumentation reports a worst `sync_data` of
+**51.9–174.8 ms** per 30 s run, on a device whose bare `fdatasync` maximum is
+0.27 ms. Three orders of magnitude sit between them. Each candidate was tested
+rather than argued, and the four `fio` jobs are in the data file:
+
+| candidate | test | p99.9 | p99.99 | max | verdict |
+|---|---|---|---|---|---|
+| the device + fs | `A` — the gate's own barrier shape: 2 writers, 470 barriers/s each, 120 s, same ext4 | 0.226 | 0.317 | **0.460** | cleared |
+| the fs under load | `B` — the same, unthrottled (33 981 barriers/s) | 0.272 | 0.285 | **0.829** | cleared |
+| the device alone | `C` — raw block device, `O_DIRECT` (with `vwc=0` the flush is a no-op) | 0.000 | 0.000 | **0.014** | cleared |
+| CPU scheduling | one gate run under PSI at 10 Hz + `mpstat`/`vmstat` | — | — | — | cleared: 95.5–97.3 % idle, CPU pressure `some avg10` peak **0.47 %**, run queue 12 of 32 |
+| **writeback** | `D` — job `A` plus a concurrent **5 MB/s buffered writer** | 0.247 | **119.013** | **303.377** | **reproduces** |
+
+`A` and `D` differ in one thing. Buffered writeback leaves the body of the
+distribution alone — p99.9 moves 0.226 → 0.247 ms — and manufactures a far tail
+of exactly the size and rarity the gate measures. That matters because the gate
+dirties page cache at that rate itself: it writes `acks.jsonl` (110 MB),
+`telemetry.jsonl` (15 MB) and the rig's stdout (15 MB) into `$P2_GATE_OUT`,
+**the same directory tree as `primary-data`**, over a 30 s run — about
+4.7 MB/s.
+
+#### Why two stalls set a p99
+
+One run kept its telemetry so the histogram could be read out rather than
+reduced to a percentile. Of 533 904 samples:
+
+| | samples | share |
+|---|---|---|
+| ≤ 0.5 ms | 513 582 | **96.19 %** |
+| > 2 ms (the D16 budget) | 17 959 | 3.36 % |
+| > 10 ms | 11 331 | 2.12 % |
+| > 15 ms | 7 420 | **1.39 %** |
+| > 50 ms | 2 668 | 0.50 % |
+
+The same run's journal recorded **two** discrete stall events: its running
+maximum stepped 1.02 → 3.69 → 89.57 → 94.54 ms and then stopped moving. Two
+stalls of ~90 ms, at 470 flushes/s and 37 records per flush, block
+
+```
+2 × 0.09 s × 470 flush/s × 37 rec/flush ≈ 3 100 records
+```
+
+directly, before the queue behind them drains; measured above 50 ms is 2 668.
+The order of magnitude agrees, which is the argument that these two events own
+the tail — **a reconciliation, not an independent measurement**, and offered as
+one.
+
+That reframes the budget. On the reference box the whole distribution was slow:
+a 0.3 ms floor, 12 % of bare barriers already over 2 ms, p50 1.00 ms. Here the
+floor is gone and 96 % of durable acks land inside a budget the system has
+never passed. What is left is a handful of rare, very large stalls per run —
+a different problem, with a different class of fix.
+
+#### The durability proofs, on every run
+
+The latency verdict is the last thing the gate computes, and all 16 runs
+reached it: recovery verification true in **16 of 16**, durable acknowledgements
+**539 199–541 608** (in family with §2.2.2's 539 352–541 264), **zero** leases
+lost and 10 000 held at the end of every run, **zero** diff nacks, the zombie
+primary refused fenced admission and the bumped chain epoch refused rather than
+forked on both engines, and no unrecognized series in any run.
+
+**P2's verdict is unchanged: the gate is red**, on two of four series, on both
+storage engines, on enterprise NVMe.
+
+#### What this does not establish
+
+* **The CPU changed too** — 32 Turin vCPUs against 8 Zen 4 cores. That is a
+  confound for every gate number here. It is *not* a confound for the device
+  claim, which rests on `fio` on both boxes rather than on the gate.
+* **The lattice is coarse above 2 ms.** "15 ms" is a bucket upper bound; the
+  true p99 sits in (10, 15]. Every value is far outside its budget either way,
+  but it is why the p99 column has so few distinct values.
+* **The writeback mechanism is demonstrated with `fio`, not inside `persistd`.**
+  Nobody instrumented fjall or jbd2 during a gate run. What is established is
+  that this filesystem produces 119–303 ms barrier stalls under the harness's
+  own write load and 0.46 ms without it, and that the gate's stalls are the same
+  size. That is strong circumstantial agreement and it is not attribution.
+* **n = 16, 30 s runs**, against §2.2.2's n = 28 phased. This sample cannot
+  detect an engine difference smaller than its own spread.
+* **One unmirrored device**, where the reference box journals to a RAID1 — which
+  favours this box — and **FDB 7.3.77** here against 7.3.63 in §2.2.2.
+
+The one claim this settles is the one it was run to settle, and it is a
+negative: **a power-loss-protected barrier at p99 0.09 ms does not put
+`journal_commit_ms` p99 inside 2 ms.** §4.3's storage requirement is necessary
+and demonstrably not sufficient, and the next question is not about hardware.
+
+#### What follows
+
+1. **Take the harness's evidence files off the journal's filesystem.** If job
+   `D` is the mechanism, giving `acks.jsonl` and the telemetry streams their own
+   device removes a measurement artifact from every future gate number. It costs
+   one path and is testable in one run. Until that is done, **no gate number in
+   this file has been taken with the journal's device to itself** — including
+   §2.2.2's baseline and §4.3's own.
+2. **Then re-measure the tail.** If the stalls survive a separated evidence
+   path, they are inside fjall or jbd2, and segment rotation, memtable flush and
+   compaction are the candidates. None has been looked at since §4.3 concluded
+   the question was hardware.
+3. **The batch window is still not the lever.** §4.3 kept the 200 µs window
+   reasoning that "on storage whose barrier p99 is under 1 ms the small window
+   is the right shape". This is that storage, and the reasoning holds for a
+   second reason it did not have: at ρ = 0.11 the writer is 89 % idle, so there
+   is nothing for a window to coalesce away.
+
+#### Reproducing
+
+```sh
+# a throwaway instance with a datacenter NVMe; c4d/c3 `-lssd` shapes carry one.
+# The binaries need at most GLIBC_2.34, so a dev box on a newer glibc can build
+# what a Debian 13 target runs — build locally and copy up rather than
+# installing a toolchain on the instance.
+gcloud compute instances create orrery-nvme-lab --zone us-central1-b \
+  --machine-type c4d-standard-32-lssd --image-family debian-13 \
+  --image-project debian-cloud --boot-disk-type hyperdisk-balanced --tags orrery-lab
+
+# two private clusters on the NVMe, one per engine. `fdbserver` is in /usr/sbin,
+# which is not on a normal user's PATH — a `nohup fdbserver` fails silently.
+/usr/sbin/fdbserver --cluster_file /mnt/nvme/ssd.cluster \
+  --public_address 127.0.0.1:4601 --listen_address 127.0.0.1:4601 \
+  --datadir /mnt/nvme/fdb-ssd/data --logdir /mnt/nvme/fdb-ssd/logs &
+fdbcli -C /mnt/nvme/ssd.cluster --exec 'configure new single ssd'   # and `memory` on :4602
+
+# per run, alternating arms; the primary asserts --chain-epoch 1 against a fence
+# that only moves forward, so clear the keyspace first. Extract regardless of
+# exit status: artifact.json is written only on a pass, and keeping only the
+# runs that passed is the one selection bias this experiment cannot afford.
+fdbcli -C "$ORRERY_FDB_CLUSTER_FILE" --exec 'writemode on; clearrange "" \xff'
+P2_GATE_OUT=/mnt/nvme/gate/$label scripts/p2-kill9-gate.sh
+python3 scripts/p2-baseline-extract.py /mnt/nvme/gate/$label $label phased
+```
+
+The elimination chain is four `fio` invocations on the mounted NVMe and one
+gate run with `mpstat`, `vmstat` and a 10 Hz PSI sampler alongside it; the job
+that matters is `D`, which is job `A` plus a second job at `rate=5m` with no
+`fsync`. Gate directories are ~1 GB each and were discarded after extraction,
+as `p2-baseline-extract.py` intends; what is versioned is
+`docs/data/p2-nvme-2026-08-19.jsonl` (18 run summaries) and
+`docs/data/p2-nvme-device-2026-08-19.json` (the `fio` reports, the histogram
+and the host's own description of its write cache).
 
 ## 5. FoundationDB as the system of record
 

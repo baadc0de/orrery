@@ -420,9 +420,13 @@ persistence.
 * **One node, one follower, one host.** Both `persistd` processes fsync to the
   same array. A real two-node chain does not.
 * **`bulk_ack_ms` and `journal_commit_ms` miss their D16 targets on this
-  hardware at every load, including idle**, and that is settled and separate
-  ([08-persistence.md](08-persistence.md) §4.3): it is the device's fsync, not
-  capacity.
+  hardware at every load, including idle**, and that is separate from capacity
+  ([08-persistence.md](08-persistence.md) §4.3). It is *not* settled, and the
+  half of that sentence reading "it is the device's fsync" was retracted on
+  2026-08-19: the same gate on a power-loss-protected NVMe whose barrier p99 is
+  0.09 ms still reads `journal_commit_ms` p99 15 ms in 11 of 16 runs
+  ([08-persistence.md](08-persistence.md) §4.4). What is settled is that it is
+  not capacity, which is all this document needs from it.
 
 ## 8. Why `intent_commit_ms` misses its target (a by-product)
 
@@ -1228,6 +1232,17 @@ Two operator notes specific to `ssd`:
   not a caution about this engine.)
 * `fdbserver` CPU is the number that moves: budget ~2× the `memory` arm's, and
   watch it against **intent** rate, not diff rate.
+
+**Independently supported on other hardware, for the bulk path only.** Sixteen
+interleaved `p2-kill9` runs on a datacenter NVMe (8 per engine,
+[08-persistence.md](08-persistence.md) §4.4) could not separate the engines on
+*any* gated series — identical medians on `journal_commit_ms` and
+`bulk_ack_ms`, overlapping ranges on all four. That corroborates "the engines
+are indistinguishable on the bulk path" on a second machine. It does **not**
+corroborate §11.7: that run read `intent_commit_ms` slightly *better* on `ssd`
+(med 9.5 vs 17.5 ms), on n=8 per arm with overlapping ranges and none of the
+FDB-internal counters §11.7 rests on. Treat §11.7 as unreplicated rather than
+contradicted, and note that the recommendation above never depended on it.
 
 And one that applies to both engines, from §11.7: the operator check in §9 —
 "FDB client thread utilisation > 60 % of one core" — is still the right check

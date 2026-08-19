@@ -256,6 +256,20 @@ lane_gates() {
     # wrong in a direction no number would catch.
     run scripts/p2-intent-fence-report.py --self-test
 
+    # docs/08 §4.4's. That section is the only one in this file whose argument
+    # is a *negative* — a barrier 40x better than §4.3's bought no p99 — and a
+    # negative decays quietly: every link of its elimination chain has to keep
+    # holding for the conclusion to mean anything, and none of them is visible
+    # in the headline. So the self-test pins the chain, not the number: the
+    # device cleared at the gate's own barrier shape, the filesystem cleared
+    # under saturation, CPU cleared by pressure and run queue, and writeback
+    # still reproducing the stall while leaving p99.9 alone. It also pins the
+    # two hedges — that the engines are not separable and that
+    # `intent_commit_ms` passes in some runs and not all — because an edit that
+    # turned either into a clean result would be wrong in a direction no
+    # aggregate would catch.
+    run scripts/p2-nvme-report.py --self-test
+
     # And this script's own, which nothing ran either: ci.yml calls the four
     # lanes and never `--self-test`, so the lane table's agreement with the tree
     # — and, now, the coverage clause below — were checked only when a human

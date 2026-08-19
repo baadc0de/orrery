@@ -112,6 +112,20 @@ the honest statement of what phasing bought is not a pass but an attribution:
 in device cost) to 15–150 ms tracking `journal_commit_ms` within 0.67–1.50×
 (n=28). Full per-run numbers, both arms and both regimes, in §2.2.2.
 
+**And the root cause is not the device — re-measured on enterprise NVMe
+(2026-08-19).** The same gate, unmodified, ran 16 more times on a
+power-loss-protected datacenter NVMe whose bare `fdatasync` p99 is 0.089–0.095
+ms against this box's 3.2–5.5 ms, eight runs per FoundationDB storage engine
+([08-persistence.md](08-persistence.md) §4.4). **P2 still does not pass**, and
+`journal_commit_ms` p99 still reads 15 ms in 11 of 16 runs. What a 40× better
+barrier bought is the body of the distribution — p50 1.00 → 0.50 ms, 96.19 % of
+durable acks now inside the 2 ms budget — and `intent_commit_ms`, which passes
+in 8 of 16 there against 0 of 43 here. The gated tail is set by two or three
+stalls of 90–175 ms per run that the device is measurably incapable of
+producing, and that co-located buffered writeback reproduces. So the P2 verdict
+is unchanged and its attribution is not: **the remaining work is not a hardware
+purchase.**
+
 **The bulk-ack tail is the gateway's own inbound queue, and it is now measured
 (2026-08-18).** The P2 report had a hole in it: `client_bulk_wire_ms` p99 read
 2 104 ms while `gateway_bulk_server_ms` p99 read 150 ms, and roughly 1 950 ms of

@@ -1,0 +1,254 @@
+{
+ "measured_utc": "2026-08-19",
+ "tree": "b4bc30c9",
+ "host": {
+  "provider": "gcp",
+  "machine_type": "c4d-standard-32-lssd",
+  "zone": "us-central1-b",
+  "vcpu": 32,
+  "ram_gb": 121,
+  "kernel": "6.12.101+deb13-cloud-amd64",
+  "os": "Debian GNU/Linux 13 (trixie)",
+  "glibc": "2.41",
+  "storage": "single Titanium local NVMe, ext4 rw,noatime",
+  "write_cache": "write through",
+  "nvme_vwc": 0,
+  "foundationdb": "7.3.77",
+  "note": "boot disk is a separate hyperdisk; the second local SSD was used only for the raw-device control"
+ },
+ "fio": [
+  {
+   "job": "t1-60s",
+   "description": "8 KiB write + fdatasync, 1 thread, 60 s (the docs/08 \u00a74.3 job)",
+   "target": null,
+   "numjobs": 1,
+   "runtime_s": 60.0,
+   "barriers_per_s": 29653.3,
+   "p50_ms": 0.0232,
+   "p99_ms": 0.0845,
+   "p99_9_ms": 0.0906,
+   "p99_99_ms": 0.1009,
+   "max_ms": 1.1027
+  },
+  {
+   "job": "t4-60s",
+   "description": "same, 4 threads, 60 s",
+   "target": null,
+   "numjobs": 1,
+   "runtime_s": 240.0,
+   "barriers_per_s": 4781.9,
+   "p50_ms": 0.105,
+   "p99_ms": 0.4649,
+   "p99_9_ms": 0.6431,
+   "p99_99_ms": 0.7414,
+   "max_ms": 1.4187
+  },
+  {
+   "job": "t8-60s",
+   "description": "same, 8 threads, 60 s",
+   "target": null,
+   "numjobs": 1,
+   "runtime_s": 480.0,
+   "barriers_per_s": 2789.2,
+   "p50_ms": 0.4362,
+   "p99_ms": 0.51,
+   "p99_9_ms": 0.8806,
+   "p99_99_ms": 0.897,
+   "max_ms": 127.8862
+  },
+  {
+   "job": "t1-15s-r1",
+   "description": "repeatability: 1 thread, 15 s, repeat 1",
+   "target": null,
+   "numjobs": 1,
+   "runtime_s": 15.0,
+   "barriers_per_s": 11679.2,
+   "p50_ms": 0.0824,
+   "p99_ms": 0.0947,
+   "p99_9_ms": 0.1029,
+   "p99_99_ms": 0.1275,
+   "max_ms": 0.2651
+  },
+  {
+   "job": "t1-15s-r2",
+   "description": "repeatability: 1 thread, 15 s, repeat 2",
+   "target": null,
+   "numjobs": 1,
+   "runtime_s": 15.0,
+   "barriers_per_s": 12529.5,
+   "p50_ms": 0.0763,
+   "p99_ms": 0.0886,
+   "p99_9_ms": 0.0978,
+   "p99_99_ms": 0.1234,
+   "max_ms": 0.2808
+  },
+  {
+   "job": "t1-15s-r3",
+   "description": "repeatability: 1 thread, 15 s, repeat 3",
+   "target": null,
+   "numjobs": 1,
+   "runtime_s": 15.0,
+   "barriers_per_s": 12347.2,
+   "p50_ms": 0.0783,
+   "p99_ms": 0.0896,
+   "p99_9_ms": 0.0998,
+   "p99_99_ms": 0.1183,
+   "max_ms": 0.2653
+  },
+  {
+   "job": "t1-15s-r4",
+   "description": "repeatability: 1 thread, 15 s, repeat 4",
+   "target": null,
+   "numjobs": 1,
+   "runtime_s": 15.0,
+   "barriers_per_s": 12520.0,
+   "p50_ms": 0.0763,
+   "p99_ms": 0.0896,
+   "p99_9_ms": 0.0978,
+   "p99_99_ms": 0.1152,
+   "max_ms": 0.2119
+  },
+  {
+   "job": "diagA",
+   "description": "the gate's own barrier shape: 2 writers, 470 barriers/s each, ext4, 120 s",
+   "target": "device+fs, isolated",
+   "numjobs": 2,
+   "runtime_s": 120.0,
+   "barriers_per_s": 940.0,
+   "p50_ms": 0.108,
+   "p99_ms": 0.1505,
+   "p99_9_ms": 0.2263,
+   "p99_99_ms": 0.3174,
+   "max_ms": 0.4595
+  },
+  {
+   "job": "diagB",
+   "description": "same 2 writers, unthrottled",
+   "target": "device+fs, saturated",
+   "numjobs": 2,
+   "runtime_s": 120.0,
+   "barriers_per_s": 33980.6,
+   "p50_ms": 0.0244,
+   "p99_ms": 0.2611,
+   "p99_9_ms": 0.2724,
+   "p99_99_ms": 0.2847,
+   "max_ms": 0.8287
+  },
+  {
+   "job": "diagC",
+   "description": "raw block device, O_DIRECT, 2 writers -- with vwc=0 the flush is a no-op",
+   "target": "device only",
+   "numjobs": 2,
+   "runtime_s": 120.0,
+   "barriers_per_s": 42882.5,
+   "p50_ms": 0.0002,
+   "p99_ms": 0.0003,
+   "p99_9_ms": 0.0003,
+   "p99_99_ms": 0.0004,
+   "max_ms": 0.0137
+  },
+  {
+   "job": "diagD",
+   "description": "diagA plus a concurrent 5 MB/s buffered writer",
+   "target": "device+fs+writeback",
+   "numjobs": 2,
+   "runtime_s": 120.0,
+   "barriers_per_s": 940.0,
+   "p50_ms": 0.1244,
+   "p99_ms": 0.1608,
+   "p99_9_ms": 0.2468,
+   "p99_99_ms": 119.0134,
+   "max_ms": 303.3773
+  }
+ ],
+ "reference_box_fio_quoted": {
+  "source": "docs/08-persistence.md \u00a74.3",
+  "storage": "md2, RAID1 of two Solidigm P41 Plus (consumer QLC, no PLP)",
+  "t1_60s": {
+   "barriers_per_s": 893,
+   "p50_ms": 0.3,
+   "p90_ms": 2.38,
+   "p99_ms": 3.72,
+   "p99_9_ms": 34.9,
+   "max_ms": 92.3
+  },
+  "t1_15s_repeats": {
+   "barriers_per_s": [
+    1452,
+    997,
+    463,
+    444
+   ],
+   "p99_ms": [
+    3.4,
+    3.2,
+    5.5,
+    4.4
+   ]
+  },
+  "eight_thread_p99_ms": 15.1,
+  "derived_storage_requirement": {
+   "p99_ms_at_most": 1.5,
+   "barriers_per_s_at_least": 400
+  }
+ },
+ "journal_commit_histogram_us": {
+  "100": 6,
+  "200": 10849,
+  "500": 502727,
+  "1000": 2262,
+  "1250": 45,
+  "1500": 6,
+  "2000": 50,
+  "3000": 96,
+  "3500": 65,
+  "4000": 306,
+  "4500": 30,
+  "5000": 150,
+  "6000": 609,
+  "7000": 1239,
+  "8000": 1389,
+  "9000": 1278,
+  "10000": 1466,
+  "15000": 3911,
+  "20000": 1154,
+  "30000": 1638,
+  "40000": 904,
+  "50000": 1056,
+  "75000": 1535,
+  "100000": 1133
+ },
+ "ccdf_stall_steps_ms": [
+  1.02,
+  3.69,
+  89.57,
+  94.54
+ ],
+ "instrumented": {
+  "label": "inst-ssd",
+  "cpu_idle_pct_range": [
+   95.5,
+   97.3
+  ],
+  "psi_cpu_some_avg10_max_pct": 0.47,
+  "psi_io_some_avg10_max_pct": 20.72,
+  "runqueue_max": 12,
+  "blocked_max": 1,
+  "vcpu": 32,
+  "stall_steps_ms": [
+   0.28,
+   1.19,
+   7.87,
+   89.52,
+   115.93
+  ]
+ },
+ "harness_writeback": {
+  "note": "bytes the gate writes buffered to the same filesystem its journals fsync to, one 30 s run",
+  "acks_jsonl_bytes": 109552418,
+  "telemetry_jsonl_bytes": 15360599,
+  "load_before_jsonl_bytes": 14979486,
+  "manifest_json_bytes": 2696775,
+  "approx_mb_per_s": 4.7
+ }
+}
