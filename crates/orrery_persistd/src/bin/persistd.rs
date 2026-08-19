@@ -220,6 +220,7 @@ fn spawn_metrics_reporter(
         let mut intent_latency_cursor = gateway_metrics.intent.latency().snapshot();
         let mut area_latency_cursor = gateway_metrics.area.latency().snapshot();
         let mut intent_cursor = orrery_persistd::GatewayIntentSnapshot::default();
+        let mut lease_stage_cursor = orrery_persistd::LeaseStageSnapshot::default();
         let mut area_cursor = orrery_persistd::GatewayAreaSnapshot::default();
         let mut report_cursor = orrery_persistd::GatewayReportSnapshot::default();
         let mut authority_cursor = orrery_persistd::AuthoritySnapshot::default();
@@ -248,6 +249,7 @@ fn spawn_metrics_reporter(
             )?;
             write_gateway_bulk_delta(&mut *writer, &gateway_metrics, &mut bulk_cursor)?;
             write_gateway_intent(&mut *writer, &gateway_metrics, &mut intent_cursor)?;
+            write_gateway_lease_stage(&mut *writer, &mut lease_stage_cursor)?;
             write_gateway_area(&mut *writer, &gateway_metrics, &mut area_cursor)?;
             write_gateway_report(&mut *writer, &gateway_metrics, &mut report_cursor)?;
             write_gateway_authority(&mut *writer, &authority_metrics, &mut authority_cursor)?;
@@ -398,6 +400,49 @@ fn write_gateway_intent(
             "lane_saturated": snapshot.lane_saturated,
             "server_us_sum": snapshot.server_us_sum,
             "server_us_max": snapshot.server_us_max,
+        }),
+    )
+    .map_err(std::io::Error::other)?;
+    writer.write_all(b"\n")
+}
+
+/// Append the renewal stage decomposition whenever it moved.
+///
+/// Its own record kind rather than a field on `gateway_lease`: these are stage
+/// *times*, and folding them in beside counters is how a reader ends up
+/// dividing a per-message sum by a per-lease count. Both denominators travel
+/// with the record for exactly that reason — see `lease::stages`.
+fn write_gateway_lease_stage(
+    mut writer: impl Write,
+    cursor: &mut orrery_persistd::LeaseStageSnapshot,
+) -> std::io::Result<()> {
+    let snapshot = orrery_persistd::lease_stage_metrics().snapshot();
+    if snapshot == *cursor {
+        return Ok(());
+    }
+    let d = snapshot.delta(cursor);
+    *cursor = snapshot;
+    serde_json::to_writer(
+        &mut writer,
+        &serde_json::json!({
+            "type": "gateway_lease_stage",
+            "heartbeats": d.heartbeats,
+            "renewals": d.renewals,
+            "entries_max": d.entries_max,
+            "session_us_sum": d.session_us_sum,
+            "session_us_max": d.session_us_max,
+            "resolve_us_sum": d.resolve_us_sum,
+            "resolve_us_max": d.resolve_us_max,
+            "route_us_sum": d.route_us_sum,
+            "route_us_max": d.route_us_max,
+            "recheck_us_sum": d.recheck_us_sum,
+            "recheck_us_max": d.recheck_us_max,
+            "encode_us_sum": d.encode_us_sum,
+            "encode_us_max": d.encode_us_max,
+            "heartbeat_us_sum": d.heartbeat_us_sum,
+            "heartbeat_us_max": d.heartbeat_us_max,
+            "gap_us_sum": d.gap_us_sum,
+            "gap_us_max": d.gap_us_max,
         }),
     )
     .map_err(std::io::Error::other)?;
