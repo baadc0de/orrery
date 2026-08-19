@@ -14,6 +14,12 @@ target
 # someone testing them standalone.
 vendor/*/Cargo.lock
 
+# Python bytecode. `scripts/` is a real Python surface now -- the derive gate,
+# the baseline extractor and its report -- and importing one script from
+# another (or from a throwaway analysis) leaves a __pycache__ next to it.
+__pycache__/
+*.pyc
+
 # Editor / OS
 .idea/
 .vscode/
