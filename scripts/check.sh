@@ -231,6 +231,15 @@ lane_gates() {
     # about nothing.
     run scripts/p2-baseline-report.py --self-test
 
+    # docs/08 §2.2.5's, for the same reason and on the same terms: its ten
+    # interleaved gate runs reduce to a 19 KB file in the tree, so the section
+    # is re-derivable from a clean checkout. What its self-test holds is the
+    # part an edit could quietly invert — that the pre and post GRV populations
+    # are still *disjoint*, still in that direction, and still disjoint with
+    # the one device-divergent pair dropped — plus the durability properties
+    # the ten runs exist to exercise at all.
+    run scripts/p2-locate-removal-report.py --self-test
+
     # And this script's own, which nothing ran either: ci.yml calls the four
     # lanes and never `--self-test`, so the lane table's agreement with the tree
     # — and, now, the coverage clause below — were checked only when a human
