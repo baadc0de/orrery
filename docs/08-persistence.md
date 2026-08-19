@@ -1918,6 +1918,35 @@ experiment that would settle it is FoundationDB's data directory on a device
 separate from the journal's, which this rig cannot arrange. Until then this is
 a hypothesis the data supports and a section may not promote.
 
+> **Weakened by [§4.4](#44-the-re-measurement-43-asked-for-power-loss-protected-storage)
+> (2026-08-19, after this section was written).** Two of its findings bear on
+> the paragraph above and both cut against it.
+>
+> First, §4.4 identifies a *better-supported* mechanism for the same symptom:
+> the harness dirties page cache at ~4.7 MB/s writing `acks.jsonl` and its
+> telemetry into the same directory tree as `primary-data`, and buffered
+> writeback at that rate reproduces barrier stalls of exactly the gate's size
+> and rarity (`fio` job `D`: p99.99 119 ms, max 303 ms) where the same barriers
+> without it top out at 0.46 ms. That load is present in *both* arms above, so
+> it cannot by itself explain their separation — but it is the larger term, and
+> the fence fan-out's share of the device is correspondingly smaller than this
+> paragraph assumes.
+>
+> Second, and more damaging to the statistics: §4.4 shows the gated tail is set
+> by **two or three discrete stalls per run**, not by a shifted distribution.
+> A five-run arm is therefore a handful of Bernoulli trials on a rare heavy-tail
+> event, and "worst fsync" is very nearly a coin flip per run. The sign test
+> quoted above treats each run as an independent sample of a stable quantity,
+> which is the wrong model for a statistic driven by two events. **p ≈ 0.03
+> overstates the evidence**, and the honest reading of the fsync column here is
+> that it is consistent with the hypothesis and close to uninformative about it.
+>
+> What §4.4 does **not** touch is this section's disjoint direct effects —
+> fence reads 128 → 1, fence stage −86.1 %, intent server span −46.9 % — none
+> of which are device-mediated. And it corroborates the direction
+> independently: on enterprise NVMe `intent_commit_ms` passes 8 of 16, against
+> 0 of 43 on the reference box.
+
 **`intent_commit_ms` passed once**, on `post-r3`: p99 10.0 ms against a 10.0 ms
 budget. That series failed in **43 of 43** runs of §2.2.2's baseline, whose
 best p99 ever recorded was 15.0 ms, and it failed in 9 of the 10 runs here. One
@@ -2413,6 +2442,10 @@ and demonstrably not sufficient, and the next question is not about hardware.
    one path and is testable in one run. Until that is done, **no gate number in
    this file has been taken with the journal's device to itself** — including
    §2.2.2's baseline and §4.3's own.
+   *(Done, as `P2_GATE_DATA_DIR` — see [§4.5](#45-separating-the-evidence-path-and-why-the-reference-box-cannot-answer-it),
+   which also shows the reference box cannot measure what it buys: that box's
+   bare barrier maximum is 78 ms against this one's 0.46 ms, so the test wants
+   running here.)*
 2. **Then re-measure the tail.** If the stalls survive a separated evidence
    path, they are inside fjall or jbd2, and segment rotation, memtable flush and
    compaction are the candidates. None has been looked at since §4.3 concluded
@@ -2458,6 +2491,110 @@ as `p2-baseline-extract.py` intends; what is versioned is
 `docs/data/p2-nvme-2026-08-19.jsonl` (18 run summaries) and
 `docs/data/p2-nvme-device-2026-08-19.json` (the `fio` reports, the histogram
 and the host's own description of its write cache).
+
+### 4.5 Separating the evidence path, and why the reference box cannot answer it
+
+[§4.4](#44-the-re-measurement-43-asked-for-power-loss-protected-storage) found
+the harness contaminating its own measurement — `acks.jsonl`, the telemetry
+streams and stdout dirtying page cache at ~4.7 MB/s in the same directory tree
+as `primary-data` — and asked, first, that they be moved off the journal's
+filesystem. This section does two things: it makes that separation possible,
+and it reports what it bought **on the reference box**, which is nothing
+detectable, for a reason worth writing down.
+
+**Every number here is printed by `scripts/p2-evidence-split-report.py`** from
+`docs/data/p2-evidence-split-2026-08-19.jsonl` and its device file;
+`--self-test` holds the null and the reason for it.
+
+#### The knob
+
+`scripts/p2-kill9-gate.sh` gains `P2_GATE_DATA_DIR`, which relocates
+`primary-data` and `follower-data` and nothing else. It **defaults to
+`$P2_GATE_OUT`**, so an unset variable reproduces every previous run exactly
+and no published number changes meaning. Pointing it elsewhere is what §4.4's
+first follow-up asks for, and on a box with a tmpfs it needs no second device:
+evidence on tmpfs is not a different device, it is *no* device, which is a
+stricter isolation than a second disk.
+
+#### The measurement, and the null
+
+Five interleaved pairs on the reference box, arm order alternating per repeat,
+journals on `md2` in both arms and the FoundationDB cluster's data directory
+left on `md2` in both so the only variable is the harness's own writes. Each
+run verified its own split with `df` rather than trusting the configuration.
+
+| pair | split | together | |
+|---|---|---|---|
+| r1 | 20.0 | 50.0 | split |
+| r2 | 40.0 | 15.0 | together |
+| r3 | 30.0 | 30.0 | tie |
+| r4 | 20.0 | 15.0 | together |
+| r5 | 15.0 | 75.0 | split |
+
+`journal_commit_ms` p99, in ms: **two wins each and a tie.** On the statistic
+§4.4 used — discrete steps in the running `sync_data` maximum — stalls above
+50 ms are 4 against 5, and above 90 ms 1 against 3. Nothing at these counts.
+Durability held in all ten: recovery verified, zero leases lost, 540 456–541 368
+durable acks.
+
+#### Why that is a null and not a refutation
+
+Running §4.4's own `fio` jobs on this box explains it:
+
+| job | p99.9 | p99.99 | max |
+|---|---|---|---|
+| **md2**, 2 writers at 470 barriers/s, **no competing writer** | 8.159 | 23.200 | **77.957** |
+| md2, the same **plus a 5 MB/s buffered writer** | 19.530 | 94.896 | 109.302 |
+| NVMe (§4.4), no competing writer | 0.226 | 0.317 | **0.460** |
+| NVMe (§4.4), plus the same writer | 0.247 | 119.013 | 303.377 |
+
+**On `md2` the bare barrier already produces a 78 ms stall with nothing else
+running.** The gate stalls this experiment tried to attribute are 22–152 ms —
+the same magnitude. Signal and noise are the same size here, so **no sample
+size separates them on this box**; the experiment is not underpowered, it is
+unrunnable. §4.4's box separates the two by **170×** on that maximum, which is
+precisely why it could see the effect at all.
+
+Writeback is nonetheless visible on `md2`: adding the same 5 MB/s writer moves
+p99.9 from 8.2 to 19.5 ms and p99.99 from 23.2 to 94.9 ms. §4.4's mechanism is
+present here too. It simply cannot be resolved through the gate's own metric
+against a 78 ms floor.
+
+This also retires an idea [§2.2.7](#227-the-intent-fence-read-128-rows-per-intent)
+left open. That section observed the worst journal fsync separating by arm and
+hedged the causal claim; the numbers above say the reference box cannot support
+*any* fsync-based attribution at n = 5, whatever the arm. The hedge was
+correct and the note added there is the correction.
+
+#### What follows
+
+1. **Re-run this on §4.4's hardware.** It is now one environment variable and
+   two runs. Job `A` there tops out at 0.46 ms, so a surviving stall is
+   unambiguous, and that is the box where the separation can be shown to work
+   or not.
+2. **Until then, keep the default.** `P2_GATE_DATA_DIR` unset reproduces
+   history; nothing in this file needs re-deriving because of it.
+3. **§4.4's second follow-up is unchanged.** If the stalls survive separation
+   on a device whose own tail is quiet, they are inside fjall or jbd2 — segment
+   rotation, memtable flush, compaction — and nothing has looked there since
+   §4.3 concluded the question was hardware.
+
+#### Reproducing
+
+```sh
+# together: the status quo, journal and evidence sharing one filesystem
+P2_GATE_OUT=$PWD/run scripts/p2-kill9-gate.sh
+# split: journals on disk, the harness's own output on a tmpfs
+P2_GATE_OUT=/tmp/run P2_GATE_DATA_DIR=$PWD/run-data scripts/p2-kill9-gate.sh
+
+# the two barrier jobs this section compares
+fio --name=jobA --directory=<on the journal's fs> --rw=write --bs=8k \
+    --fdatasync=1 --numjobs=2 --rate_iops=470 --runtime=120 --time_based --size=256m
+#   jobD is jobA with `--rw=write --bs=64k --rate=5m` running alongside it
+
+python3 scripts/p2-evidence-split-report.py
+python3 scripts/p2-evidence-split-report.py --self-test
+```
 
 ## 5. FoundationDB as the system of record
 

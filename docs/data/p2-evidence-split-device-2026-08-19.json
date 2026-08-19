@@ -1,0 +1,25 @@
+{
+  "host": {
+    "device": "/dev/md2",
+    "fs": "ext4",
+    "notes": "RAID1 of two Solidigm P41 Plus (consumer QLC, no PLP) -- the reference box of docs/08 \u00a74.3"
+  },
+  "jobA": {
+    "fio_version": "fio-3.41",
+    "max_ms": 77.9572,
+    "mean_ms": 1.6173,
+    "p99_99_ms": 23.1997,
+    "p99_9_ms": 8.1592,
+    "p99_ms": 5.4723,
+    "shape": "2 writers, 8 KiB write + fdatasync, 470 barriers/s each, 120 s"
+  },
+  "jobD": {
+    "fio_version": "fio-3.41",
+    "max_ms": 109.3016,
+    "mean_ms": 2.7014,
+    "p99_99_ms": 94.8961,
+    "p99_9_ms": 19.5297,
+    "p99_ms": 5.9965,
+    "shape": "jobA plus a concurrent 5 MB/s buffered writer"
+  }
+}
