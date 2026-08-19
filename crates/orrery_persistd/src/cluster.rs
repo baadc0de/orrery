@@ -69,9 +69,11 @@ pub struct RouteStageMetrics {
     batch_hold_us_max: AtomicU64,
     mailbox_turns: AtomicU64,
     locate_fallbacks: AtomicU64,
+    location_audits_decided: AtomicU64,
     location_audits: AtomicU64,
     location_mismatches: AtomicU64,
     location_audit_errors: AtomicU64,
+    location_audits_dropped: AtomicU64,
     location_audit_us_sum: AtomicU64,
     location_audit_us_max: AtomicU64,
 }
@@ -141,12 +143,29 @@ pub struct RouteStageSnapshot {
     /// close to full rate, plus a wasted mailbox turn. Its cost is bounded
     /// while it is being investigated — see `fenced_locate_fallback_permits`.
     pub locate_fallbacks: u64,
+    /// Accepts the 1-in-N sampler *chose* to audit, counted under the entity
+    /// gate at the moment of the choice.
+    ///
+    /// The denominator of every other audit counter, and the reason the set
+    /// of them is closed:
+    ///
+    /// ```text
+    /// location_audits_decided
+    ///   == location_audits + location_audit_errors + location_audits_dropped
+    /// ```
+    ///
+    /// once the in-flight audits have landed. Before 2026-08-19 there was no
+    /// such denominator, and a decided audit that never reached a counter was
+    /// invisible — which is exactly what was happening: see
+    /// [`Self::location_audits_dropped`].
+    pub location_audits_decided: u64,
     /// Sampled accepts that paid for a location audit **and got an answer**
     /// (see `fenced_location_audit_due`).
     ///
     /// A sample whose `locate` errored or answered `None` is *not* counted
-    /// here — it is counted in [`Self::location_audit_errors`]. The two are
-    /// disjoint and together they are every sample taken, so no locate
+    /// here — it is counted in [`Self::location_audit_errors`], and one that
+    /// never ran at all in [`Self::location_audits_dropped`]. The three are
+    /// disjoint and together they are every sample decided, so no locate
     /// outcome is invisible: `location_audits == 0` with accepts flowing is
     /// itself the alarm that the audit is not running.
     pub location_audits: u64,
@@ -170,6 +189,23 @@ pub struct RouteStageSnapshot {
     /// `location_audits` would let a lease store that has lost its location
     /// index report a clean bill of health forever.
     pub location_audit_errors: u64,
+    /// Decided samples that never ran to an outcome: no in-flight permit was
+    /// free (see [`fenced_location_audit_inflight`]), there was no async
+    /// runtime to detach onto, or the detached task was dropped before it
+    /// finished.
+    ///
+    /// Its own bucket rather than a fold into [`Self::location_audit_errors`],
+    /// because the two say different things to an operator. An *error* is
+    /// evidence that the lease store could not answer, and is a reason to go
+    /// and look at the lease store. A *drop* is the audit declining to take a
+    /// sample, and says nothing at all about the store; folding them would
+    /// let a saturated audit pool read as a sick registrar.
+    ///
+    /// Sustained nonzero means the diagnostic is under-sampling, not that
+    /// anything is wrong with the route — and it costs no diff. Since
+    /// 2026-08-19 the audit runs detached, after the accept it was sampled
+    /// for has already been answered.
+    pub location_audits_dropped: u64,
     /// Summed wall time the sampled audits spent, **outside** the entity
     /// gate.
     ///
@@ -203,6 +239,20 @@ impl RouteStageMetrics {
 
     fn record_locate_fallback(&self) {
         self.locate_fallbacks.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_location_audit_decided(&self) {
+        self.location_audits_decided.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A decided sample that produced no outcome at all.
+    ///
+    /// No time is recorded: `location_audit_us_max` is read as "how long a
+    /// `LeaseStore::locate` took", and a sample that was refused a permit
+    /// took no time, while one cancelled at shutdown took an arbitrary
+    /// fraction of one. Either would make that maximum mean something else.
+    fn record_location_audit_dropped(&self) {
+        self.location_audits_dropped.fetch_add(1, Ordering::Relaxed);
     }
 
     fn record_location_audit(&self, mismatched: bool, audit_us: u64) {
@@ -251,9 +301,11 @@ impl RouteStageMetrics {
             batch_hold_us_max: load(&self.batch_hold_us_max),
             mailbox_turns: load(&self.mailbox_turns),
             locate_fallbacks: load(&self.locate_fallbacks),
+            location_audits_decided: load(&self.location_audits_decided),
             location_audits: load(&self.location_audits),
             location_mismatches: load(&self.location_mismatches),
             location_audit_errors: load(&self.location_audit_errors),
+            location_audits_dropped: load(&self.location_audits_dropped),
             location_audit_us_sum: load(&self.location_audit_us_sum),
             location_audit_us_max: load(&self.location_audit_us_max),
         }
@@ -280,12 +332,61 @@ impl RouteStageSnapshot {
             batch_hold_us_max: self.batch_hold_us_max,
             mailbox_turns: sub(self.mailbox_turns, previous.mailbox_turns),
             locate_fallbacks: sub(self.locate_fallbacks, previous.locate_fallbacks),
+            location_audits_decided: sub(
+                self.location_audits_decided,
+                previous.location_audits_decided,
+            ),
             location_audits: sub(self.location_audits, previous.location_audits),
             location_mismatches: sub(self.location_mismatches, previous.location_mismatches),
             location_audit_errors: sub(self.location_audit_errors, previous.location_audit_errors),
+            location_audits_dropped: sub(
+                self.location_audits_dropped,
+                previous.location_audits_dropped,
+            ),
             location_audit_us_sum: sub(self.location_audit_us_sum, previous.location_audit_us_sum),
             location_audit_us_max: self.location_audit_us_max,
         }
+    }
+
+    /// Decided audits that have not yet landed in any of the three outcome
+    /// buckets — the audits currently in flight on detached tasks.
+    ///
+    /// Zero is the resting state. It is not an error for this to be positive
+    /// in a snapshot: the audit is deliberately asynchronous, so a snapshot
+    /// taken immediately after an accept can see its sample still running.
+    /// What would be an error is for it to stay positive with no accepts
+    /// flowing, which is a leaked task.
+    #[must_use]
+    pub fn location_audits_in_flight(self) -> u64 {
+        self.location_audits_decided
+            .saturating_sub(self.location_audits)
+            .saturating_sub(self.location_audit_errors)
+            .saturating_sub(self.location_audits_dropped)
+    }
+}
+
+/// Wait until every decided invariant-J audit has landed in a counter, or
+/// `within` elapses; `true` if they all landed.
+///
+/// The audit runs on a detached task (see
+/// [`CellRuntime::begin_location_audit`]), so "the accept returned" no longer
+/// implies "its sample is counted". Production never needs this — the
+/// counters are read on a 1 s reporter interval, which is four orders of
+/// magnitude longer than an audit. Tests do: an assertion on a delta is
+/// otherwise a race.
+///
+/// # Panics
+/// Never; the timeout is polled, not enforced by a timer that can fail.
+pub async fn settle_location_audits(within: std::time::Duration) -> bool {
+    let deadline = Instant::now() + within;
+    loop {
+        if route_stage_metrics().snapshot().location_audits_in_flight() == 0 {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
     }
 }
 
@@ -320,6 +421,35 @@ pub fn fenced_location_audit_every() -> u64 {
             .unwrap_or(if cfg!(debug_assertions) { 1 } else { 1000 })
     });
     *EVERY
+}
+
+/// How many detached invariant-J audits may be in flight at once,
+/// process-wide (`ORRERY_FENCED_LOCATION_AUDIT_INFLIGHT`, 0 = no bound).
+///
+/// The audit no longer rides the request path, so nothing upstream throttles
+/// how many of them can be started: a burst of accepts would spawn a task per
+/// sample and let them queue on the lease store without limit. That is the
+/// standard failure mode of "just detach it", and this is the bound that
+/// removes it. When no permit is free the sample is **declined and counted**
+/// (`location_audits_dropped`) rather than queued — a diagnostic that falls
+/// behind should shrink its sample, not grow a backlog of stale ones.
+///
+/// 512 by default. The audit fires once per `ORRERY_FENCED_LOCATION_AUDIT_N`
+/// accepts (1 000 in release), so at this study's top point — ~143 000
+/// accepts/s — the steady-state demand is ~143 audits/s; 512 permits is
+/// several seconds of slack against a lease store that has gone slow, and
+/// still a hard cap. Under `debug_assertions` the sampler is 1-in-1, so tests
+/// run at the full accept rate and the bound is what keeps a hot loop from
+/// spawning unboundedly there too.
+#[must_use]
+pub fn fenced_location_audit_inflight() -> usize {
+    static INFLIGHT: LazyLock<usize> = LazyLock::new(|| {
+        std::env::var("ORRERY_FENCED_LOCATION_AUDIT_INFLIGHT")
+            .ok()
+            .and_then(|raw| raw.parse().ok())
+            .unwrap_or(512)
+    });
+    *INFLIGHT
 }
 
 /// How many fenced-route fallback `LeaseStore::locate` reads may be in flight
@@ -366,6 +496,12 @@ static LOCATE_FALLBACK_GATE: LazyLock<Option<tokio::sync::Semaphore>> =
     LazyLock::new(|| match fenced_locate_fallback_permits() {
         0 => None,
         permits => Some(tokio::sync::Semaphore::new(permits)),
+    });
+
+static LOCATION_AUDIT_GATE: LazyLock<Option<Arc<tokio::sync::Semaphore>>> =
+    LazyLock::new(|| match fenced_location_audit_inflight() {
+        0 => None,
+        permits => Some(Arc::new(tokio::sync::Semaphore::new(permits))),
     });
 
 static ROUTE_STAGE: LazyLock<Arc<RouteStageMetrics>> =
@@ -697,13 +833,186 @@ pub trait Router: Send + Sync {
 /// and not yet run.
 ///
 /// Split from its execution so the `LeaseStore::locate` it performs happens
-/// with the gate released - see [`CellRuntime::begin_location_audit`].
+/// with the gate released — and, since 2026-08-19, off the request path
+/// entirely (see [`CellRuntime::begin_location_audit`]). It therefore owns
+/// everything it needs instead of borrowing the runtime: the lease store, the
+/// gate table, and the shard set as of the accept. The shard set is captured
+/// rather than re-read because the verdict is about the topology that
+/// *accepted* the diff; a `split` between the accept and the read would
+/// otherwise be judged against a shard map the accept never saw.
 struct PendingLocationAudit {
     grid: GridId,
     entity: PersistId,
     accepting_shard: CellId,
     /// The entity stripe's migration counter as of the accept.
     mark: u64,
+    /// The runtime's own grid, for the P-7 guard `owning_shard` applies.
+    runtime_grid: GridId,
+    /// The shard cells the runtime hosted an actor for, as of the accept.
+    shards: Vec<CellId>,
+    lease_store: Arc<dyn crate::lease::LeaseStore>,
+    gates: Arc<EntityStripeGates>,
+}
+
+impl PendingLocationAudit {
+    /// [`CellRuntime::owning_shard`]'s deepest-prefix rule, over the shard set
+    /// captured at the accept.
+    fn owning_shard(&self, grid: GridId, cell: CellId) -> Option<CellId> {
+        if grid != self.runtime_grid {
+            return None;
+        }
+        self.shards
+            .iter()
+            .filter(|shard| shard.is_prefix_of(cell))
+            .max_by_key(|shard| shard.level())
+            .copied()
+    }
+}
+
+/// Counts a decided audit that never produced an outcome, unless the audit
+/// disarms it by producing one.
+///
+/// The audit runs on a detached task, and a detached task can be dropped —
+/// at runtime shutdown, most obviously, and at any `.await` inside it or none
+/// at all if the executor never gets a turn. Without this the drop would
+/// leave the sample counted in `location_audits_decided` and nowhere else,
+/// which is the exact shape of the defect this change exists to remove: an
+/// audit outcome that is invisible. A `Drop` impl is the only construct that
+/// survives cancellation at an arbitrary point, which is why it is armed
+/// before the spawn and moved into the task rather than built inside it.
+struct AuditOutcome {
+    stages: Arc<RouteStageMetrics>,
+    settled: bool,
+}
+
+impl AuditOutcome {
+    fn new(stages: Arc<RouteStageMetrics>) -> Self {
+        Self {
+            stages,
+            settled: false,
+        }
+    }
+
+    fn settle(&mut self) {
+        self.settled = true;
+    }
+}
+
+/// Closes the accounting for a sample whose task never finished.
+///
+/// **Not pinned by a test, and the review that found this said so rather than
+/// letting it read as covered.** Disarming this `drop` leaves every audit test
+/// green: the suite reaches the no-permit and missing-runtime paths, which
+/// count themselves explicitly in `spawn_location_audit`, but not the case
+/// this guard exists for — a spawned task dropped by the runtime at shutdown,
+/// possibly before its first poll. Constructing that deterministically means
+/// tearing a runtime down mid-audit, which is a race the test would have to
+/// win rather than assert.
+///
+/// So it is defence in depth for one counter, on a path that is already a
+/// 1-in-1000 diagnostic. If a later change makes runtime teardown reachable in
+/// a test, pin it then; until it is pinned, do not cite it as evidence that
+/// `location_audits_decided == audits + errors + dropped` holds under
+/// shutdown — it holds under every path the suite actually exercises.
+impl Drop for AuditOutcome {
+    fn drop(&mut self) {
+        if !self.settled {
+            self.stages.record_location_audit_dropped();
+        }
+    }
+}
+
+/// Run a decided audit **detached**, bounded, and never on the request path.
+///
+/// Returns immediately. Every path out of here lands the sample in a counter:
+/// a refused permit and a missing runtime are counted here, an executed read
+/// is counted by [`finish_location_audit`], and a cancelled task is counted by
+/// [`AuditOutcome`]'s `Drop`.
+fn spawn_location_audit(audit: PendingLocationAudit, stages: &Arc<RouteStageMetrics>) {
+    // `try_acquire`, not `acquire`: this is the point of the bound. A sample
+    // that has to wait for a permit is a sample taken late about a route that
+    // has already moved on, and waiting is what would grow the backlog the
+    // bound exists to prevent.
+    let permit = match &*LOCATION_AUDIT_GATE {
+        Some(gate) => match Arc::clone(gate).try_acquire_owned() {
+            Ok(permit) => Some(permit),
+            Err(_) => {
+                stages.record_location_audit_dropped();
+                return;
+            }
+        },
+        None => None,
+    };
+    // `apply_fenced` is always polled by a runtime, so this is not a path
+    // anyone should reach — but `tokio::spawn` *panics* without one, and a
+    // diagnostic that can panic the write path is worse than a diagnostic
+    // that declines to run.
+    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        stages.record_location_audit_dropped();
+        return;
+    };
+    // Armed *here*, not inside the task: a task can be dropped before it is
+    // ever polled — a runtime shutting down between this `spawn` and the
+    // executor's first turn is enough — and a guard constructed in the future
+    // body would never exist to fire. Moved into the future, it drops with
+    // the future whether or not the body ever ran.
+    let outcome = AuditOutcome::new(Arc::clone(stages));
+    let stages = Arc::clone(stages);
+    handle.spawn(async move {
+        let _permit = permit;
+        finish_location_audit(audit, &stages, outcome).await;
+    });
+}
+
+/// Run a sampled audit that [`CellRuntime::begin_location_audit`] decided
+/// to take. Runs on a detached task, with the entity gate long released.
+///
+/// Every outcome lands in a counter. `Ok(Some)` is a verdict —
+/// `location_audits`, plus `location_mismatches` when the durable location
+/// falls outside the accepting actor's shard. `Ok(None)`, a store error, and
+/// a sample that straddled a migration all land in `location_audit_errors`:
+/// they are samples that were paid for and produced no evidence, and folding
+/// any of them into the clean count would let a lease store that has lost its
+/// location index read as a clean bill of health forever. A task dropped
+/// before it gets here lands in `location_audits_dropped`.
+async fn finish_location_audit(
+    audit: PendingLocationAudit,
+    stages: &Arc<RouteStageMetrics>,
+    mut outcome: AuditOutcome,
+) {
+    let started = Instant::now();
+    let located = audit.lease_store.locate(audit.grid, audit.entity).await;
+    // The read straddled a relocation of this entity's stripe, so it
+    // says nothing about the accept it was sampled for. Discarding it is
+    // what keeps `location_mismatches` a stop-ship number rather than a
+    // number with a known false-positive source.
+    let stable = audit.gates.migration_mark(audit.grid, audit.entity) == audit.mark;
+    let audit_us = stage_elapsed_us(started);
+    let located = match located {
+        Ok(Some(cell)) if stable => cell,
+        // An audit is not an admission path: a store error costs the
+        // sample, not the write that was already accepted.
+        _ => {
+            stages.record_location_audit_error(audit_us);
+            outcome.settle();
+            return;
+        }
+    };
+    let owner = audit.owning_shard(audit.grid, located);
+    let mismatched = owner != Some(audit.accepting_shard);
+    stages.record_location_audit(mismatched, audit_us);
+    outcome.settle();
+    if mismatched {
+        tracing::warn!(
+            grid = ?audit.grid,
+            entity = ?audit.entity,
+            ?located,
+            ?owner,
+            accepting_shard = ?audit.accepting_shard,
+            "fenced apply: durable location is outside the accepting actor's shard \
+             (invariant J violated; the accept set is no longer provably unchanged)"
+        );
+    }
 }
 
 /// Route-side helpers for the fenced bulk path.
@@ -718,17 +1027,45 @@ impl CellRuntime {
     /// living only in the test suite: a safety argument with a production
     /// counter proving it is the strongest form available here.
     ///
-    /// Decided under the entity gate, **executed after it is released.** The
-    /// earlier version ran the whole read with the gate held, which put a
-    /// FoundationDB round trip back on the accept path of every sampled diff
-    /// and - because `RouteStageMetrics::record` had already run - billed it
-    /// to nobody: measured at a 5 ms locate with 8 concurrent accepts on one
-    /// entity, the audit's cost reappeared as 171 ms of the *next* diffs'
-    /// `gate_wait_us`. The sample can no longer be pinned to the accept by
-    /// holding the gate, so it is pinned the way `heartbeat_leases` phase 1
-    /// pins its own off-gate reads: the entity's stripe migration counter is
-    /// sampled under the gate and re-checked after the read, and a sample
-    /// that straddles a migration is discarded rather than judged.
+    /// Decided under the entity gate, **executed on a detached task after the
+    /// route has already answered** (2026-08-19). Two earlier arrangements
+    /// were wrong, in opposite directions, and both are worth keeping in
+    /// view:
+    ///
+    /// 1. Running the whole read with the gate held put a FoundationDB round
+    ///    trip back on the accept path of every sampled diff and — because
+    ///    `RouteStageMetrics::record` had already run — billed it to nobody:
+    ///    measured at a 5 ms locate with 8 concurrent accepts on one entity,
+    ///    the audit's cost reappeared as 171 ms of the *next* diffs'
+    ///    `gate_wait_us`.
+    /// 2. Awaiting it after the gate drop, still inside `apply_fenced`, kept
+    ///    it inside the gateway's `within_route_budget` timeout
+    ///    (`MAX_ROUTE_ADMISSION_WAIT_US`, 25 ms from the diff's *arrival*).
+    ///    A sampled diff whose audit read overran the remaining budget had
+    ///    its whole route future cancelled: the diff was counted
+    ///    `shed_slow_route` and the audit landed in no counter at all. On
+    ///    docs/14-capacity.md §11's 73-point study that was **every**
+    ///    `shed_slow_route` in the study — the identity
+    ///    `shed_slow_route == decided − completed` held exactly at all 73
+    ///    points, both engines, over three orders of magnitude of shed rate,
+    ///    and `location_audit_us_max` sat clamped on the 25 ms budget at
+    ///    every one. A 0.1 % diagnostic sample was the only thing dropping
+    ///    bulk diffs.
+    ///
+    /// So the audit is off the request path entirely. It is a diagnostic:
+    /// nothing about the route's correctness depends on it, the client's
+    /// acknowledgement must not wait for it, and it must never be able to
+    /// refuse a write. What it must still do is be *counted*, which is why
+    /// every way it can fail to run has a bucket — see
+    /// [`RouteStageSnapshot::location_audits_dropped`] — and why the
+    /// in-flight bound is a `try_acquire`, not a queue.
+    ///
+    /// The sample can no longer be pinned to the accept by holding the gate,
+    /// so it is pinned the way `heartbeat_leases` phase 1 pins its own
+    /// off-gate reads: the entity's stripe migration counter is sampled under
+    /// the gate — here, before the task is spawned — and re-checked after the
+    /// read, and a sample that straddles a migration is discarded rather than
+    /// judged.
     fn begin_location_audit(
         &self,
         grid: GridId,
@@ -739,57 +1076,17 @@ impl CellRuntime {
         if !fenced_location_audit_due() {
             return None;
         }
+        route_stage_metrics().record_location_audit_decided();
         Some(PendingLocationAudit {
             grid,
             entity,
             accepting_shard,
             mark: self.entity_migration_mark(grid, entity),
+            runtime_grid: self.grid(),
+            shards: self.shard_cells(),
+            lease_store: self.lease_store_handle(),
+            gates: self.entity_gates_handle(),
         })
-    }
-
-    /// Run a sampled audit that [`CellRuntime::begin_location_audit`] decided
-    /// to take. Must be called with the entity gate **released**.
-    ///
-    /// Every outcome lands in a counter. `Ok(Some)` is a verdict -
-    /// `location_audits`, plus `location_mismatches` when the durable
-    /// location falls outside the accepting actor's shard. `Ok(None)`, a
-    /// store error, and a sample that straddled a migration all land in
-    /// `location_audit_errors`: they are samples that were paid for and
-    /// produced no evidence, and folding any of them into the clean count
-    /// would let a lease store that has lost its location index read as a
-    /// clean bill of health forever.
-    async fn finish_location_audit(&self, audit: PendingLocationAudit, stages: &RouteStageMetrics) {
-        let started = Instant::now();
-        let located = self.lease_location(audit.entity).await;
-        // The read straddled a relocation of this entity's stripe, so it
-        // says nothing about the accept it was sampled for. Discarding it is
-        // what keeps `location_mismatches` a stop-ship number rather than a
-        // number with a known false-positive source.
-        let stable = self.entity_migration_mark(audit.grid, audit.entity) == audit.mark;
-        let audit_us = stage_elapsed_us(started);
-        let located = match located {
-            Ok(Some(cell)) if stable => cell,
-            // An audit is not an admission path: a store error costs the
-            // sample, not the write that was already accepted.
-            _ => {
-                stages.record_location_audit_error(audit_us);
-                return;
-            }
-        };
-        let owner = self.owning_shard(audit.grid, located);
-        let mismatched = owner != Some(audit.accepting_shard);
-        stages.record_location_audit(mismatched, audit_us);
-        if mismatched {
-            tracing::warn!(
-                grid = ?audit.grid,
-                entity = ?audit.entity,
-                ?located,
-                ?owner,
-                accepting_shard = ?audit.accepting_shard,
-                "fenced apply: durable location is outside the accepting actor's shard \
-                 (invariant J violated; the accept set is no longer provably unchanged)"
-            );
-        }
     }
 
     /// The pre-change fenced-apply implementation, retained as a
@@ -925,10 +1222,10 @@ impl Router for CellRuntime {
                 Ok(FencedApply::Accepted(_)) | Ok(FencedApply::Rejected(Some(_)))
             ) {
                 stages.record(gate_wait_us, 0, mailbox_us);
-                // Decided here, run below: the sampled audit is a real
-                // `LeaseStore::locate`, and running it before this `drop`
-                // would put FoundationDB back under the entity gate on the
-                // accept path. See `CellRuntime::begin_location_audit`.
+                // Decided here, run on a detached task: the sampled audit
+                // is a real `LeaseStore::locate`, and neither the entity gate
+                // nor the route's own answer may wait for it. See
+                // `CellRuntime::begin_location_audit`.
                 let audit = if matches!(answer, Ok(FencedApply::Accepted(_))) {
                     self.begin_location_audit(grid, entity, asked)
                 } else {
@@ -936,7 +1233,7 @@ impl Router for CellRuntime {
                 };
                 drop(guard);
                 if let Some(audit) = audit {
-                    self.finish_location_audit(audit, &stages).await;
+                    spawn_location_audit(audit, &stages);
                 }
                 return answer;
             }
@@ -992,7 +1289,7 @@ impl Router for CellRuntime {
         };
         drop(guard);
         if let Some(audit) = audit {
-            self.finish_location_audit(audit, &stages).await;
+            spawn_location_audit(audit, &stages);
         }
         applied
     }

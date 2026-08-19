@@ -106,8 +106,16 @@ cp /proc/pressure/cpu "$out/cpu-pressure-before.txt"; cp /proc/pressure/io "$out
 # a knee that is really the rig's is told apart from one that is the box's.
 load_prefix=()
 [[ -n ${P2_CAP_LOAD_CPUS:-} ]] && load_prefix=(taskset -c "$P2_CAP_LOAD_CPUS")
+# The rig's default intent mix is 3 % of diff sends, which at a 30 s point is
+# ~1 000 intent samples — coarse enough that `intent_commit_ms` p99 lands on
+# one histogram bucket boundary and moves in factor-of-two steps. A study that
+# wants to say something defensible about intents raises it, and pays for it in
+# bulk load: an upgraded send is an intent *instead of* a diff, not as well as.
+intent_mix_flag=()
+[[ -n ${P2_CAP_INTENT_MIX:-} ]] && intent_mix_flag=(--intent-mix "$P2_CAP_INTENT_MIX")
 "${load_prefix[@]}" "$P2_LOAD_BIN" --gateway "$gateway" --addr "$addr" --manifest "$out/manifest.json" \
   --sessions "$sessions" --diff-hz "$diff_hz" --duration-secs "$duration" \
+  "${intent_mix_flag[@]}" \
   --issuer-secret "$secret_issuer" --issuer-key-id "$issuer_key_id" --json \
   >"$out/load.jsonl" 2>"$out/load.stderr" & load_pid=$!
 # Per-process CPU, sampled once a second for every process that competes for
@@ -134,6 +142,14 @@ wait "$primary_pid" 2>/dev/null || true; wait "$follower_pid" 2>/dev/null || tru
 primary_pid=''; follower_pid=''
 # ~1 GB of journal per run; every number is in the JSONL by now.
 rm -rf "$out/primary-data" "$out/follower-data"
-printf '{"label":"%s","sessions":%s,"diff_hz":%s,"duration_secs":%s,"load_exit":%s}\n' \
-  "$label" "$sessions" "$diff_hz" "$duration" "$load_status" >"$out/point.json"
+# `storage_engine` is recorded, not assumed: a point's cluster is whatever
+# `ORRERY_FDB_CLUSTER_FILE` pointed at, and an engine-arm study that infers the
+# engine from a directory name is one mislabelled run away from a wrong table.
+storage_engine=$(fdbcli -C "$ORRERY_FDB_CLUSTER_FILE" --exec 'status json' 2>/dev/null \
+  | python3 -c 'import json,sys
+try: print(json.load(sys.stdin)["cluster"]["configuration"]["storage_engine"])
+except Exception: print("unknown")' || echo unknown)
+printf '{"label":"%s","sessions":%s,"diff_hz":%s,"duration_secs":%s,"load_exit":%s,"intent_mix":"%s","storage_engine":"%s"}\n' \
+  "$label" "$sessions" "$diff_hz" "$duration" "$load_status" \
+  "${P2_CAP_INTENT_MIX:-trade=0.02,craft=0.01}" "$storage_engine" >"$out/point.json"
 note "$label done (load exit $load_status)"

@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import collections
 import json
+import os
 import pathlib
 import re
 import sys
@@ -109,6 +110,35 @@ def fdb_client_thread(path: pathlib.Path) -> tuple[float, float]:
     return (ranked[0][1], ranked[0][2]) if ranked else (float("nan"), float("nan"))
 
 
+def audits_vanished(rs: dict, applies: int) -> int | None:
+    """Sampled invariant-J audits that reached **no** counter at all.
+
+    Between #86 and 2026-08-19 `finish_location_audit` was awaited inside
+    `Router::apply_fenced`, which the gateway runs inside a 25 ms timeout
+    measured from the diff's arrival. An audit that overran the remaining
+    budget took its diff down with it: the diff was counted `shed_slow_route`
+    and the audit was counted nowhere. This is the "nowhere" count.
+
+    `location_audits_decided` is the denominator; a binary that predates it
+    has the count inferred from the accept rate and the sampling interval,
+    which is exactly the reconstruction the counter was added to make
+    unnecessary. Returns `None` for a binary with no audit counters at all
+    (pre-#86), where the question cannot be asked of the JSONL.
+    """
+    if "location_audits" not in rs:
+        return None
+    decided = rs.get("location_audits_decided")
+    if decided is None:
+        every = int(os.environ.get("ORRERY_FENCED_LOCATION_AUDIT_N", "1000")) or 1
+        decided = (applies + every - 1) // every
+    landed = (
+        rs.get("location_audits", 0)
+        + rs.get("location_audit_errors", 0)
+        + rs.get("location_audits_dropped", 0)
+    )
+    return max(0, decided - landed)
+
+
 def row(d: pathlib.Path) -> dict:
     point = json.loads((d / "point.json").read_text()) if (d / "point.json").exists() else {}
     load = run_complete(d / "load.stderr")
@@ -166,6 +196,18 @@ def row(d: pathlib.Path) -> dict:
         "locate_fallbacks": rs.get("locate_fallbacks"),
         "location_audits": rs.get("location_audits"),
         "location_mismatches": rs.get("location_mismatches"),
+        # Sampled audits that never landed in any counter, and how much of
+        # this point's shed they account for. `audit_shed_gap` is 0 when the
+        # shed column is *entirely* cancelled audits — which it was at all 73
+        # points of docs/14-capacity.md §11's study, exactly, on both engines.
+        # Read the pair together: `audits_vanished > 0` with
+        # `shed_slow_route > 0` and a gap of 0 means the shed number is a
+        # reading of the audit sampler, not of the box.
+        "audits_vanished": audits_vanished(rs, applies),
+        "audit_shed_gap": (ing.get("shed_slow_route", 0) - audits_vanished(rs, applies))
+        if audits_vanished(rs, applies) is not None and ing.get("admitted")
+        else None,
+        "location_audits_dropped": rs.get("location_audits_dropped"),
     }
     return r
 
@@ -187,6 +229,9 @@ FIELDS = [
     "turns_per_apply",
     "locate_fallbacks",
     "location_mismatches",
+    "audits_vanished",
+    "audit_shed_gap",
+    "location_audits_dropped",
     "leases_lost",
     "diff_nacks",
 ]
@@ -196,10 +241,19 @@ def fold(rows: list[dict]) -> None:
     by = collections.defaultdict(list)
     for r in rows:
         by[(r["point"], r["arm"])].append(r)
-    points = sorted({p for p, _ in by}, key=lambda p: (p[0], int(re.sub(r"\D", "", p) or 0)))
+    # `point` is empty for a one-off directory whose name carries no label
+    # (`<arm>` alone rather than `<arm>-<label>-r<n>`), so index it defensively:
+    # a reducer that raises on a stray directory loses the whole table with it.
+    points = sorted({p for p, _ in by}, key=lambda p: (p[:1], int(re.sub(r"\D", "", p) or 0)))
+    # Arm names come from the directory prefix, so this folds any two-armed
+    # study, not just the binary one it was written for: the ssd/memory engine
+    # arms of `fenced-ssd-driver.sh` fold here too. `before`/`after` keep their
+    # order when present; anything else sorts alphabetically after them.
+    order = {"before": 0, "after": 1}
+    arms = sorted({a for _, a in by}, key=lambda a: (order.get(a, 2), a))
     print("\t".join(["point", "arm", "n"] + FIELDS))
     for point in points:
-        for arm in ("before", "after"):
+        for arm in arms:
             group = by.get((point, arm))
             if not group:
                 continue
@@ -235,6 +289,25 @@ def main() -> int:
             + ", ".join(starved)
             + "\nThose rows measure the load generator, not the box. Compare arms by "
             "delivered_per_s, and report an unreached knee as '>= <delivered>, not located'.",
+            file=sys.stderr,
+        )
+    artifact = sorted(
+        {
+            r["label"]
+            for r in rows
+            if r.get("audit_shed_gap") is not None
+            and abs(r["audit_shed_gap"]) <= 1
+            and (r.get("audits_vanished") or 0) > 0
+        }
+    )
+    if artifact:
+        print(
+            "\nWARNING: shed_slow_route is accounted for by cancelled invariant-J audits at: "
+            + ", ".join(artifact)
+            + "\nOn those points the shed column reads the 1-in-N audit sampler against the "
+            "25 ms route-admission budget, not route slowness: bulk shed attributable to a "
+            "slow route is zero there. See docs/14-capacity.md §11.2. Fixed in the binary "
+            "on 2026-08-19; a JSONL captured before that needs this column read first.",
             file=sys.stderr,
         )
     return 0

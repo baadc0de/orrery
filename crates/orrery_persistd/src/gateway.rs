@@ -1864,6 +1864,18 @@ pub struct GatewayIngressSnapshot {
     /// the receive loop admitted the diff and the route task then refused it,
     /// so a run's served count is `admitted - shed_slow_route`, while
     /// `shed_saturated` and `shed_stale` are disjoint from `admitted`.
+    ///
+    /// **Read this counter's history before reading a number from it.** Every
+    /// nonzero reading taken between #86 and 2026-08-19 — which is all of
+    /// docs/14-capacity.md §11's 73-point study — was the sampled invariant-J
+    /// audit, not route slowness. The audit was awaited inside
+    /// `apply_fenced`, therefore inside the timeout below, so a sampled diff
+    /// whose audit read overran the budget was cancelled and counted here.
+    /// The identity `shed_slow_route == (decided audits) - (completed audits)`
+    /// held exactly at all 73 points, on both storage engines, over three
+    /// orders of magnitude of shed rate. The audit is detached now
+    /// (`crate::cluster::CellRuntime::begin_location_audit`) and this counter
+    /// means what it says again, but a historical JSONL does not.
     pub shed_slow_route: u64,
 }
 
@@ -3399,7 +3411,7 @@ fn spawn_boundary_reporter(metrics: Arc<GatewayMetrics>) {
             route_stage_cursor = route_stage;
             if route_delta.applies > 0 || route_delta.batch_locks > 0 {
                 out.push_str(&format!(
-                    "{{\"type\":\"{}\",\"applies\":{},\"gate_wait_us_sum\":{},\"gate_wait_us_max\":{},\"locate_us_sum\":{},\"locate_us_max\":{},\"mailbox_us_sum\":{},\"mailbox_us_max\":{},\"batch_locks\":{},\"batch_gates_sum\":{},\"batch_hold_us_sum\":{},\"batch_hold_us_max\":{},\"mailbox_turns\":{},\"locate_fallbacks\":{},\"location_audits\":{},\"location_mismatches\":{},\"location_audit_errors\":{},\"location_audit_us_sum\":{},\"location_audit_us_max\":{}}}\n",
+                    "{{\"type\":\"{}\",\"applies\":{},\"gate_wait_us_sum\":{},\"gate_wait_us_max\":{},\"locate_us_sum\":{},\"locate_us_max\":{},\"mailbox_us_sum\":{},\"mailbox_us_max\":{},\"batch_locks\":{},\"batch_gates_sum\":{},\"batch_hold_us_sum\":{},\"batch_hold_us_max\":{},\"mailbox_turns\":{},\"locate_fallbacks\":{},\"location_audits_decided\":{},\"location_audits\":{},\"location_mismatches\":{},\"location_audit_errors\":{},\"location_audits_dropped\":{},\"location_audit_us_sum\":{},\"location_audit_us_max\":{}}}\n",
                     ROUTE_STAGE_RECORD_KIND,
                     route_delta.applies,
                     route_delta.gate_wait_us_sum,
@@ -3414,9 +3426,11 @@ fn spawn_boundary_reporter(metrics: Arc<GatewayMetrics>) {
                     route_delta.batch_hold_us_max,
                     route_delta.mailbox_turns,
                     route_delta.locate_fallbacks,
+                    route_delta.location_audits_decided,
                     route_delta.location_audits,
                     route_delta.location_mismatches,
                     route_delta.location_audit_errors,
+                    route_delta.location_audits_dropped,
                     route_delta.location_audit_us_sum,
                     route_delta.location_audit_us_max,
                 ));
