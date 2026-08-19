@@ -219,6 +219,18 @@ lane_gates() {
     # self-test runs nothing and takes about a second.
     run scripts/gate-status.sh --self-test
 
+    # The one Python self-test that can run per-commit. docs/08 §2.2.2's
+    # numbers come from `scripts/p2-baseline-report.py` reading
+    # `docs/data/p2-phase-baseline-2026-08-19.jsonl`, which is in the tree — so
+    # unlike `intent-tail-derive.py`, whose three checks need ~10 GB of
+    # unversioned sweep artifacts and stay nightly, this one needs nothing but
+    # the checkout. It asserts the shape the section's argument reads from: both
+    # arms present, every run carrying all four gated series, a recovery verdict
+    # and the journal fsync the regime split is computed from. A summary that
+    # lost one of those would turn a sentence in that section into an assertion
+    # about nothing.
+    run scripts/p2-baseline-report.py --self-test
+
     # And this script's own, which nothing ran either: ci.yml calls the four
     # lanes and never `--self-test`, so the lane table's agreement with the tree
     # — and, now, the coverage clause below — were checked only when a human
