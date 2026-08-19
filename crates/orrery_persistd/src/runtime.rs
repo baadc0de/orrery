@@ -582,14 +582,30 @@ impl CellRuntime {
     }
 
     /// Ask every live actor to park registrar rows whose monotonic TTL passed.
+    ///
+    /// Concurrently, for the reason the batched renewal path dispatches its
+    /// actor groups concurrently (docs/08-persistence.md §2.2.3): a serial
+    /// loop is one mailbox round trip per actor, end to end, for work that
+    /// shares nothing. The sweep is milder than a renewal batch — it runs at
+    /// 1 Hz, not once per lease per 3 s — but it is one turn per *hosted
+    /// shard*, so its serial cost grows with the deployment while the tick
+    /// that pays it does not. It takes no entity gate at all, so unlike the
+    /// renewal path there is not even a lock order to reason about.
+    ///
+    /// An actor whose mailbox is gone is skipped, exactly as the serial loop
+    /// skipped it: a sweep is a periodic best-effort pass, and a dead actor's
+    /// rows are recovered by the next owner's startup, not here.
     pub async fn sweep_expired_leases(&self, now_ms: u64) -> Vec<crate::lease::ParkedLease> {
-        let mut parked = Vec::new();
-        for actor in self.actors.values() {
-            if let Ok(rows) = actor.sweep_leases(now_ms).await {
-                parked.extend(rows);
-            }
-        }
-        parked
+        futures::future::join_all(
+            self.actors
+                .values()
+                .map(|actor| async move { actor.sweep_leases(now_ms).await.ok() }),
+        )
+        .await
+        .into_iter()
+        .flatten()
+        .flatten()
+        .collect()
     }
 
     /// Read one registrar row, its committed cell, and its uplink watermark.
