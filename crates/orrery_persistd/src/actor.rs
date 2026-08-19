@@ -1068,7 +1068,21 @@ async fn park_lease(
     Ok(Some(row))
 }
 
+/// Park this actor's registrar rows whose monotonic TTL passed.
+///
+/// The copy below is load-bearing, unlike the one `heartbeat_leases` no longer
+/// makes: a sweep writes a durable row per parked lease and abandons the whole
+/// sweep if one fails, so it needs a state to abandon *to*. What it does not
+/// need is to make that copy in order to discover there is nothing to sweep,
+/// which is the steady state — holders renew every 3 s against a 10 s TTL, and
+/// the gateway sweeps every second, so the overwhelming majority of ticks park
+/// nothing. Copying both of the registrar's maps whole costs the *shard's*
+/// population, so the unguarded version paid for the whole world once per
+/// actor per second to answer "no".
 async fn sweep_leases(env: &mut ActorEnv, now_ms: u64) -> Result<Vec<ParkedLease>, Reject> {
+    if !env.state.leases.has_expired(now_ms) {
+        return Ok(Vec::new());
+    }
     let mut next = env.state.leases.clone();
     let expired = next.sweep_expired(now_ms);
     let mut parked = Vec::with_capacity(expired.len());

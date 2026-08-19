@@ -527,6 +527,22 @@ impl LeaseRegistrar {
             .collect()
     }
 
+    /// Whether [`Self::sweep_expired`] would park anything at `now_ms`.
+    ///
+    /// Exactly `sweep_expired`'s own predicate, read-only and allocating
+    /// nothing, so a caller that must copy the registrar to be able to abandon
+    /// a half-applied sweep can find out first whether there is anything to
+    /// apply. The two conditions are kept adjacent deliberately: a sweep that
+    /// parked a row this said nothing about would be a sweep whose copy was
+    /// skipped and whose durable write then had nothing to unwind to.
+    /// `tests/lease_sweep_cost.rs` holds them equal over a state matrix.
+    #[must_use]
+    pub fn has_expired(&self, now_ms: u64) -> bool {
+        self.leases
+            .values()
+            .any(|row| row.holder.is_some() && row.expires_at <= now_ms)
+    }
+
     /// Park silent holders whose registrar-clock TTL elapsed.
     ///
     /// Each entry carries the holder and fencing token the row had **before**
