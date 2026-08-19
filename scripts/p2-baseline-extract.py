@@ -10,7 +10,7 @@ Regime classification is the same rule `scripts/intent-tail-derive.py` uses
 >= 150 ms. It is repeated here rather than imported because that script reads
 the intent-tail sweep's directory layout, not the gate's.
 
-Usage: p2-baseline-extract.py <gate-out-dir> <label> [> summary.json]
+Usage: p2-baseline-extract.py <gate-out-dir> <label> [phased|unphased] [> summary.json]
 """
 
 from __future__ import annotations
@@ -51,11 +51,41 @@ def footer(path: pathlib.Path) -> dict:
     return {k: float(v) for k, v in re.findall(r"(\w+)=([0-9.]+)", clean)}
 
 
+def arm_of(label: str, explicit: str | None) -> str:
+    """Which arm a run belongs to: `phased` or `unphased`.
+
+    `p2-baseline-report.py` groups, sorts and computes every per-arm aggregate
+    on this key, and it is NOT derivable from the gate output — the rig records
+    its own cadence nowhere in the artifacts, so it has to come from the caller
+    who chose it. It was missing entirely until 2026-08-19, which made the
+    "Reproducing" recipe in docs/08 §2.2.2 exit `KeyError: 'arm'`: the recipe
+    ran the extractor and then the report with no step in between, and nothing
+    in the extractor's output could satisfy the report's very first `sorted`.
+
+    The default reads the label prefix used throughout that baseline (`ph-r*`
+    phased, `un-r*` unphased) so the documented recipe works verbatim; an
+    explicit third argument overrides it for any other naming.
+    """
+    if explicit is not None:
+        if explicit not in ("phased", "unphased"):
+            raise SystemExit(f"arm must be 'phased' or 'unphased', got {explicit!r}")
+        return explicit
+    if label.startswith("ph-"):
+        return "phased"
+    if label.startswith("un-"):
+        return "unphased"
+    raise SystemExit(
+        f"cannot infer arm from label {label!r}: pass 'phased' or 'unphased' "
+        f"as the third argument (labels starting ph-/un- are inferred)"
+    )
+
+
 def main(argv: list[str]) -> int:
     out = pathlib.Path(argv[1])
     label = argv[2]
+    arm = arm_of(label, argv[3] if len(argv) > 3 else None)
 
-    summary: dict = {"label": label, "dir": str(out)}
+    summary: dict = {"label": label, "arm": arm, "dir": str(out)}
 
     # -- the four gated series, as the dashboard scored them ---------------
     report_path = out / "latency-report.json"

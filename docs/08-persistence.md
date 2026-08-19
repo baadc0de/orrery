@@ -943,8 +943,17 @@ renewals arriving inside a few milliseconds, every three seconds.
 
 Periodicity at a cadence is a coincidence until the cadence moves. Both knobs
 are the rig's (`P2_LOAD_LEASE_HEARTBEAT_MS`, `P2_LOAD_HEARTBEAT_PHASED`), and
-both defaults are unchanged, so every previously published number still means
-what it did. Cadence leg, all eight runs, one row per run — no repeat is
+at the time this leg ran both defaults were unchanged, so every number
+published *before 2026-08-19* still means what it did.
+
+> **Corrected 2026-08-19.** This read "both defaults are unchanged, so every
+> previously published number still means what it did". §2.2.2 then moved one
+> of them: `P2_LOAD_HEARTBEAT_PHASED` now defaults to phased. The measurements
+> in this section are unaffected — they describe the unphased configuration and
+> are reproducible with `P2_LOAD_HEARTBEAT_PHASED=0` — but the consequence
+> clause is no longer true of the tree, and it is the one sentence in §2.2.1
+> that §2.2.2 withdraws. It is prose rather than a number, so the derive gate
+> cannot catch it; it is corrected here by hand. Cadence leg, all eight runs, one row per run — no repeat is
 averaged into another, because the two repeats of this leg landed in different
 fsync regimes and averaging them would hide that.
 
@@ -1314,12 +1323,32 @@ resolution is why the medians below are quoted with their bucket histograms.
 Three of the four D16 series miss in every one of the 43 runs, in both fsync
 regimes and in both arms. Stated with its n: `intent_commit_ms` fails in **28
 of 28** phased runs — **24 of 24** in the fast regime and **4 of 4** in the
-slow one. There is no regime of this box on which the phased gate passes.
+slow one. There is no regime **sampled in this baseline** on which the phased
+gate passes.
 
-That is worth saying plainly because the previous time this series was called a
-pass it was **n=1** (`qph-loaded-r1`, client p99 15 ms / server p99 9 ms) while
-the other three phased runs of that study read 150 / 150 / 75 ms. This baseline
-does not reproduce that pass at any n: the closest 14 runs sit in the (10, 15]
+That qualifier is load-bearing, and the counter-evidence is in this same
+document. The baseline spans worst-journal-fsync 19.8–201.0 ms and its
+`journal_commit_ms` p99 never fell below 15 ms — but this box has been measured
+quieter than any of the 43 runs. §2.2.1's `q-loaded-r1`, under comparable
+delivered bulk load, read a worst fsync of 7.5 ms and `journal_commit_ms` p99
+of **1.5 ms**, which *passes* the 2 ms budget; `qph-loaded-r1` read 8 ms at
+17.5 ms. No phased gate run was taken in that device state. And by the
+containment this section establishes — phased `intent_commit_ms` p99 is
+0.67–1.50× `journal_commit_ms` p99 — a phased run at journal p99 8 ms would
+predict intent p99 ≈ 5–12 ms, straddling the 10 ms budget rather than clearing
+or missing it.
+
+So the defensible statement is about the device states this baseline reached,
+not about the box: **P2 fails in every device state sampled here, and the
+states in which it might pass are quieter than any of the 43.** Whether such a
+state is reachable under sustained gate load, rather than glimpsed in a sweep,
+is not established either way and is the experiment that would settle it.
+
+This baseline also does not reproduce the one run that was once read as a pass
+— `qph-loaded-r1` at client p99 15 ms / server p99 9 ms — though that reading
+had already been retracted in this file (commit 465ccda) as one run of four,
+the other three being 150 / 150 / 75 ms. It is mentioned here only so a reader
+comparing the two sections does not think the numbers disagree: the closest 14 runs sit in the (10, 15]
 bucket, which is a miss.
 
 **What phasing did change is which subsystem owns the number**, and that
