@@ -249,6 +249,13 @@ lane_gates() {
     # would be an instrument measuring nothing, and it would say so quietly.
     run scripts/p2-lease-stage-report.py --self-test
 
+    # docs/08 §2.2.7's. Its self-test holds the section's *hedges* as much as
+    # its numbers: that exactly one run passed `intent_commit_ms` and that not
+    # every post run did, because the section's caution is a claim about this
+    # data and a later edit that made it read like a passing gate would be
+    # wrong in a direction no number would catch.
+    run scripts/p2-intent-fence-report.py --self-test
+
     # And this script's own, which nothing ran either: ci.yml calls the four
     # lanes and never `--self-test`, so the lane table's agreement with the tree
     # — and, now, the coverage clause below — were checked only when a human

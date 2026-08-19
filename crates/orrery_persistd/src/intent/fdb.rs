@@ -43,6 +43,8 @@ use orrery_protocol::{
     AccountId, AssetId, CellId, Epoch, GridId, Intent, IntentOutcome, PersistId,
 };
 
+use futures::TryStreamExt as _;
+
 use crate::fence::{FenceRow, FenceStatus};
 use crate::keyspace;
 use crate::FdbContext;
@@ -254,29 +256,70 @@ async fn require_intent_fence(
     // cluster served one read slowly; `fence_us` large with every individual
     // read fast means the time went between the reads resolving and this task
     // being polled again — a scheduler symptom wearing an FDB costume.
-    let reads = fence.shards.iter().map(|&shard| {
-        let key = keyspace::fence_key(grid, shard);
-        async move {
-            let started = std::time::Instant::now();
-            let raw = trx.get(&key, false).await;
-            (shard, raw, started.elapsed().as_micros() as u64)
-        }
-    });
+    // **One range read, not one point read per shard.** The fence keys are
+    // `'a' || grid || shard_bits` (`keyspace::fence_key`), so a grid's rows
+    // are contiguous and the whole set arrives in a single operation.
+    //
+    // Measured on the P2 gate before this: 128.0 reads per intent, 15 867
+    // intents in 30 s — **67 699 FDB reads/s**, more than 20x the renewal
+    // locates docs/08 §2.2.4 took off the same `libfdb_c` network thread that
+    // docs/14-capacity.md §5.1 measured as one box's whole capacity — and
+    // 22.5% of an intent's mean server span.
+    //
+    // Nothing about the fence's meaning changes. The same rows are read
+    // inside the same transaction, so they register the same read conflict
+    // ranges and a superseded node still cannot commit; the same values are
+    // compared against the same expected row; and the check still runs in
+    // shard order, so the error still names the first shard the node no
+    // longer owns rather than whichever read lost a race. A range read's
+    // conflict range spans the whole span rather than 128 points, which also
+    // conflicts on a row *inserted* into it — strictly stricter, and in the
+    // conservative direction this fence already argues for.
+    let (Some(lo), Some(hi)) = (
+        fence.shards.iter().map(|s| s.to_bits()).min(),
+        fence.shards.iter().map(|s| s.to_bits()).max(),
+    ) else {
+        return Ok(());
+    };
+    let start = keyspace::fence_key(grid, CellId::from_bits(lo).expect("shard round-trips"));
+    let mut end =
+        keyspace::fence_key(grid, CellId::from_bits(hi).expect("shard round-trips")).to_vec();
+    end.push(0); // exclusive end just past the last shard's key
     let fence_started = std::time::Instant::now();
-    let results = futures::future::join_all(reads).await;
+    let mut stream = trx.get_ranges_keyvalues(
+        foundationdb::RangeOption {
+            begin: foundationdb::KeySelector::first_greater_or_equal(start.as_slice()),
+            end: foundationdb::KeySelector::first_greater_or_equal(end.as_slice()),
+            ..foundationdb::RangeOption::default()
+        },
+        false,
+    );
+    let mut seen: std::collections::HashMap<u64, FenceRow> = std::collections::HashMap::new();
+    while let Some(kv) = stream.try_next().await? {
+        let key = kv.key();
+        if key.len() != 13 {
+            continue;
+        }
+        let bits = u64::from_be_bytes(key[5..13].try_into().expect("13-byte fence key"));
+        let row: FenceRow =
+            postcard::from_bytes(kv.value()).map_err(store_err("fence row decode"))?;
+        seen.insert(bits, row);
+    }
     let fence_us = fence_started.elapsed().as_micros() as u64;
-    let read_max_us = results.iter().map(|&(_, _, us)| us).max().unwrap_or(0);
-    let reads_issued = results.len() as u64;
     stages::trace(|t| {
         t.fence_us += fence_us;
-        t.fence_reads += reads_issued;
-        t.fence_read_max_us = t.fence_read_max_us.max(read_max_us);
+        // One FDB operation now, whatever the shard count. The rows verified
+        // are `fence.shards.len()`; the reads issued are what this counts,
+        // and the difference between the two is the change.
+        t.fence_reads += 1;
+        t.fence_read_max_us = t.fence_read_max_us.max(fence_us);
     });
-    for (shard, raw, _read_us) in results {
-        let current: Option<FenceRow> = raw?
-            .map(|bytes| postcard::from_bytes(bytes.as_ref()))
-            .transpose()
-            .map_err(store_err("fence row decode"))?;
+    let results: Vec<(CellId, Option<FenceRow>)> = fence
+        .shards
+        .iter()
+        .map(|&shard| (shard, seen.get(&shard.to_bits()).copied()))
+        .collect();
+    for (shard, current) in results {
         if current != Some(expected) {
             return Err(FdbBindingError::new_custom_error(Box::new(
                 IntentError::Store(format!(
