@@ -2198,6 +2198,14 @@ impl Rig<'_> {
             // this side of the socket.
             max_rx_backlog,
             intent_p99_us = intents.intent_latency().p99().as_micros() as u64,
+            // Same population, stopped at the ack's arrival instead of at the
+            // rig's handling of it. The difference between the two is this
+            // rig's dispatch delay, and it is the only way to tell a
+            // server-side tail from a client-side one without a new series.
+            intent_arrival_p50_us = intents.arrival_latency().p50().as_micros() as u64,
+            intent_arrival_p90_us = intents.arrival_latency().p90().as_micros() as u64,
+            intent_arrival_p99_us = intents.arrival_latency().p99().as_micros() as u64,
+            intent_arrival_max_us = intents.arrival_latency().max().unwrap_or_default().as_micros() as u64,
             "run complete"
         );
         if stats.leases_lost > 0 {
@@ -2343,7 +2351,10 @@ impl Rig<'_> {
                 if matches!(outcome, IntentOutcome::Committed { .. }) {
                     stats.intent_acks += 1;
                 }
-                intents.on_ack(intent_id, outcome);
+                // The arrival stamp the bulk arms already use. It was
+                // dropped here, which put this rig's own poll cadence inside
+                // `intent_commit_ms` and inside no other D16 series.
+                intents.on_ack_at(intent_id, outcome, received_at);
                 // Retire the settled intent, which is what `IntentQueue`'s
                 // contract asks of a client that has observed the terminal
                 // status — and what the rig was not doing.
