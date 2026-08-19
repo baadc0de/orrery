@@ -698,6 +698,14 @@ Two-stage validation, deliberately: the hot-state `Ruleset` check is a **fast ad
 
 ### 2.2.1 Where the D16 intent tail actually comes from
 
+> **The configuration this section measures is no longer the rig's default
+> (2026-08-19).** `p2-load` now phases each session's lease renewal across the
+> period; the single-pass burst diagnosed below is reached with
+> `P2_LOAD_HEARTBEAT_PHASED=0`. Nothing here is restated, re-derived or
+> withdrawn by that change — every number below is a measurement of the
+> unphased rig and remains one, which is precisely why the opt-out exists. The
+> decision, its rationale, and the re-baselined gate are §2.2.2.
+
 **Every quantitative claim in this section is printed by
 `scripts/intent-tail-derive.py`, which reads the raw sweep artifacts. A number
 that script does not print is not in this section.** That is a rule about this
@@ -1168,6 +1176,10 @@ fsync correlation instead, which needs no configuration change at all.
 * **CPU attribution.** `pidstat` and `vmstat` were captured for every run and
   are not read by the derive script, so no CPU percentage appears in this
   section.
+
+### 2.2.2 The renewal pass is phased by default, and P2 is re-baselined
+
+PLACEHOLDER
 
 ## 3. Cell actor model
 

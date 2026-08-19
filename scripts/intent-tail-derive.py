@@ -1811,7 +1811,19 @@ def self_test(sweep: Path) -> int:
 # --------------------------------------------------------------------------
 DOC = Path(__file__).resolve().parent.parent / "docs" / "08-persistence.md"
 SECTION_START = "### 2.2.1 Where the D16 intent tail"
-SECTION_END = "## 3. Cell actor model"
+# Where §2.2.1 stops. This used to be `## 3. Cell actor model` because §2.2.1
+# was the last subsection of §2.2, so "the rest of the file" and "the rest of
+# §2.2.1" were the same span. They stopped being the same on 2026-08-19, when
+# §2.2.2 was added, and leaving the old marker in place would have silently
+# widened this gate's remit from "§2.2.1" to "§2.2.1 and everything after it"
+# — a rule nobody wrote, enforcing the sweep's derivability on a section whose
+# numbers come from a different experiment entirely (the p2-kill9 gate, which
+# this script does not read).
+#
+# The span it covers is otherwise unchanged: every line audited before is
+# audited now. Widening it back is not a fix — a number belonging to §2.2.2
+# cannot be derived from the sweep, so the audit would fail on correct text.
+SECTION_END = "### 2.2.2 The renewal pass is phased by default"
 
 # Every exemption below is one entry with one reason. The reason is the entry's
 # whole justification: if a token cannot be described as *structure* — a
