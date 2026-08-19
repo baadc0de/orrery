@@ -95,6 +95,23 @@ The harness runs the shipping plugins; only the socket is stood in for, by an in
 
 **Demo criterion.** With 10k entities across 100+ cells under synthetic load: `kill -9` the entire cluster, restart it, and the world resumes — zero acked intents lost (RPO 0), bulk loss bounded by the journal/replication window, clients (netsplit posture, D12) having queued intents and continued simulating. Measured against D16 targets in-region: journal commit < 2 ms server-internal, client-observed bulk ack p99 < 5 ms, intent commit p99 < 10 ms, area first page-in < 50 ms.
 
+**Where the demo criterion stands, re-measured on the phased rig (2026-08-19).**
+`p2-load` now phases each session's lease renewal across the period by default
+([08-persistence.md](08-persistence.md) §2.2.2), so every P2 latency figure
+published before this date describes a configuration the rig no longer runs.
+Re-baselined over **43 full kill-9 gate runs** — 28 phased, 15 unphased,
+interleaved run by run, spanning both of this box's fsync regimes:
+`area_first_page_ms` **passes in 43 of 43**; `journal_commit_ms`,
+`bulk_ack_ms` and `intent_commit_ms` **fail in 43 of 43**, in both regimes, with
+**one root cause in every run** — `journal_commit_ms`, the device's fsync
+([08-persistence.md](08-persistence.md) §4.3). The criterion's durability half
+is met on every run: recovery verification true, durable acknowledgements in
+family, zero leases lost, the zombie primary fenced. **P2 does not pass**, and
+the honest statement of what phasing bought is not a pass but an attribution:
+`intent_commit_ms` p99 went from 150–200 ms (n=15, flat across a tenfold change
+in device cost) to 15–150 ms tracking `journal_commit_ms` within 0.67–1.50×
+(n=28). Full per-run numbers, both arms and both regimes, in §2.2.2.
+
 **The bulk-ack tail is the gateway's own inbound queue, and it is now measured
 (2026-08-18).** The P2 report had a hole in it: `client_bulk_wire_ms` p99 read
 2 104 ms while `gateway_bulk_server_ms` p99 read 150 ms, and roughly 1 950 ms of
@@ -819,6 +836,7 @@ platforms the criterion names.
 - Terrain pipeline: cell-aligned chunk deltas in the journal, compacted to ≤ 100 KB snapshot shards.
 - Event archive (Parquet on object storage) with retention config; griefing rollback via inverse-op replay by cell/actor/time-range.
 - Chaos suite: netsplit (cluster unreachable → intents queue, sim continues), relay-region loss, FDB node loss, coordinator restart.
+- **Admission control at the front door — a login queue — and the herds it owns.** A queue between "a client wants in" and "the cluster starts serving it", so that arrivals reach the gateway at a rate the cluster chose rather than at the rate the world produced them. Named here because it is where the thundering-herd cases were **assigned**, not deferred: a region restart, a relay-region loss, or a patch-day open all deliver a synchronized population, and every periodic per-session chore that population then runs — lease renewal first among them — stays synchronized for as long as nothing spreads it. The persistence path deliberately does not shape itself around that shape of load ([08-persistence.md](08-persistence.md) §2.2.2): real player populations are diffuse in phase space, so `persistd` is measured against a diffuse one, and the synchronized case is this deliverable's, with the chaos suite above as the place it is reproduced. Two things it owes, both of which the P2 work has already made concrete: an entry rate the cluster sets and can lower under pressure, and de-synchronization on admission, so that a herd let in together does not stay a herd on every subsequent period. What it is **not** is a persistence-tier mitigation — no jitter, batching or shed inside the gateway's lease path is planned, and adding one would be optimizing the durable path for a workload this project has decided belongs upstream of it.
 
 **Demo criterion.** A scripted 128-player crowd event (R6 upper bound) in one region: the hot cell is promoted within the hysteresis window, per-peer bandwidth stays within the ≤ 1 Mbps uplink budget and field-host egress within the ≤ 35 Mbps hot-cell budget (D6; the modeled n=128 load is ~25.6+ Mbps, inside budget) throughout, and demotion follows dispersal cleanly. Then the rollback demo: a griefer bulldozes a player town; an operator restores it to a timestamp via archive inverse-op replay, with the ledger untouched. Multi-region: EU-based peers joining a US island get relay/gateway routing that keeps added latency within the measured relay penalty from P0.
 

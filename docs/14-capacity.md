@@ -57,7 +57,13 @@ Stated before the data, and checkable in any run's own output:
    `durable_acks / duration` against `entities × diff_hz`.
 3. **`intent_commit_ms` p99 ≤ 100 ms** (10× its D16 target). Intents ride the
    same FDB client as the bulk path's lease locate (§5), so a bulk queue shows
-   up here first.
+   up here first. **Every measurement of this series in this document was taken
+   with the rig's lease renewals unphased, which is no longer the default
+   (2026-08-19).** The threshold above is left where it is — it is an alarm
+   level for a capacity sweep, not a D16 target — but a run started today
+   produces a much smaller number for a reason that has nothing to do with
+   capacity, and the two must not be compared. See §8's note and
+   [08-persistence.md](08-persistence.md) §2.2.2.
 4. **No lease withdrawn mid-run** (`leases_lost = 0`).
 
 Offered load is `entities × diff_hz` — what the world would generate if nothing
@@ -437,6 +443,22 @@ hypothesis consistent with every point measured, not a proven cause; the
 experiment that would settle it is to serve `LeaseStore::locate` from the
 actor's own in-memory lease index (it already tracks the cell) and re-measure.
 
+> **Superseded again (2026-08-19), on the rig rather than on the run: the
+> renewals are phased now.** Everything below this line, and everything in
+> §11.7, measures a rig that renewed every session's whole entity set in one
+> pass of its drive loop. That default is gone: `p2-load` phases each session's
+> renewal across the period, and `P2_LOAD_HEARTBEAT_PHASED=0` is now what
+> reproduces the burst. The decision behind the flip is the workload's shape,
+> not the measurement's — real player populations are diffuse in phase space,
+> and the synchronized case belongs to admission control (a login queue,
+> [11-roadmap.md](11-roadmap.md) §P6), not to the persistence path.
+>
+> **The re-baselined P2 gate — which series pass, which fail, and which
+> failures are the device's — is [08-persistence.md](08-persistence.md)
+> §2.2.2.** It is pointed at rather than restated here, for the same reason
+> §11.7's note points at §2.2.1: the version of that note that restated
+> numbers got five of them wrong in the same direction.
+
 > **Superseded (2026-08-19): the table above measures the first second of each
 > run, and is left visible because the reason it is wrong is worth keeping.**
 > "The intent rate was a fixed 1024 per run throughout" is the tell. It was
@@ -473,7 +495,7 @@ Operator-checkable, in the order they trip:
 | 1 | FDB client thread utilisation | **> 60 % of one core** | `pidstat -t -p $(pgrep -f 'persistd.*--fdb-cluster-file')`, or `top -H`: the busiest thread, named `persistd`, that is not the main thread. Absent on a node with no `--fdb-cluster-file`. At 40 % you are at the knee; at 75 % you are at peak throughput and shedding 10 %; at 95 % you are collapsing. |
 | 2 | Bulk shed rate | **> 1 %** of admitted | `shed_slow_route / admitted` in the `gateway_ingress` records of `ORRERY_GATEWAY_BOUNDARY_JSONL`, or the `gateway: shedding bulk diffs at ingress` warning, which is always logged. **On a binary between #86 and 2026-08-19 this check reads the sampled invariant-J audit rather than route slowness — see §11.2** — so a JSONL captured in that window needs `shed_slow_route` compared against the audit counters before it means anything. Fixed since. |
 | 3 | Durable ack rate vs offered | ack rate **stops rising** when you add load | `durable_acks / duration` from `p2-load`'s `run complete` line against `entities × diff_hz`. |
-| 4 | `intent_commit_ms` p99 | **> 100 ms** | `p2-dashboard --gate`. |
+| 4 | `intent_commit_ms` p99 | **> 100 ms** | `p2-dashboard --gate`. The alarm level is calibrated on the unphased rig (§2, §8); on the phased default it fires much later, and [08-persistence.md](08-persistence.md) §2.2.2 carries the current gate baseline. |
 | 5 | `persistd` RSS | **> 1 GB** for a ~10 k-entity world | backlog, not state. |
 | 6 | Registrar withdrawals | **any** `leases_lost > 0` | `p2-load` fails the run. Not seen anywhere in this sweep — if you see it, something other than this envelope is wrong. |
 
@@ -512,6 +534,10 @@ export FDB_PID=$(docker top my-fdb | awk '/fdbserver/{print $2}')
 
 scripts/p2-capacity-sweep.sh hz4-s250 250 4 30      # one point
 python3 scripts/p2-capacity-report.py sweep/*/      # one row per point
+
+# every point in this document predates 2026-08-19 and was measured with the
+# rig's lease renewals unphased; that is now an opt-out, not the default
+P2_LOAD_HEARTBEAT_PHASED=0 scripts/p2-capacity-sweep.sh hz4-s250 250 4 30
 ```
 
 The harness clears and re-seeds the cluster on every point (the P2 path
@@ -905,8 +931,10 @@ the whole run. What that buys:
 > every session's whole entity set in one pass of its drive loop, so 10 000
 > lease renewals reached the gateway inside a few milliseconds every
 > `LEASE_HEARTBEAT` (3 s); inside a caught intent that time lands on **GRV**,
-> and phasing the same renewals across the period (`P2_LOAD_HEARTBEAT_PHASED`)
-> drops run-total GRV by an order of magnitude and removes the periodicity.
+> and phasing the same renewals across the period (`P2_LOAD_HEARTBEAT_PHASED`,
+> **the default since 2026-08-19** — see §8's note and
+> [08-persistence.md](08-persistence.md) §2.2.2) drops run-total GRV by an
+> order of magnitude and removes the periodicity.
 > What phasing leaves behind is **FoundationDB's own commit fsync**, in the
 > same device stall window as `journal_commit_ms`. The `ib40k-xhi` saturation
 > rows are unaffected: at ~1 300 intents/s the FDB client thread is genuinely
