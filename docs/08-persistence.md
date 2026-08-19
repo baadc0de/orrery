@@ -716,7 +716,7 @@ a `TypeError`; every row names its leg, and a row drawn from more than one says
 **cross-leg**; every subset states the rule that made it a subset.
 
 The sweep artifacts (~10 GB of JSONL) are not version-controlled. What is in
-the tree is the script and two checks it carries.
+the tree is the script and three checks it carries.
 `scripts/intent-tail-derive.py --self-test` re-derives, from the raw files,
 every number the 2026-08-19 re-review established by hand — including the true
 values of the claims this rebuild deleted — and fails loudly if any of them
@@ -724,8 +724,22 @@ moves. `scripts/intent-tail-derive.py --audit-doc` reads this section back and
 fails if it contains a number the script does not print, which is the rule
 above made mechanical rather than promised. Structural numbers (section
 references, FDB error codes, configured constants) are a short explicit
-allow-list in the script; a number quoted here *as wrong* is allow-listed
-separately, because a false value is not derivable by construction.
+allow-list in the script, each entry carrying the reason it is structure rather
+than measurement; a number quoted here *as wrong* is listed separately, because
+a false value is not derivable by construction. Both lists fail the audit when
+an entry stops appearing here, so an exemption cannot outlive the sentence it
+was written for.
+
+`--audit-doc` compares **whole numeric tokens**, not substrings. Its first
+version asked whether each number here appeared anywhere in the script's report
+as a substring, which a report full of long floats answers "yes" to for nearly
+any short number, and it passed seven numbers this section quoted that the
+script never printed. So the third check exists:
+`scripts/intent-tail-derive.py --gate-self-test` plants wrong values — both
+one-digit corruptions of numbers quoted here and values chosen to be substrings
+of real printed ones — and fails unless the audit rejects every one of them.
+`--audit-doc` runs it first and refuses to report a pass without it, because a
+gate that can quietly stop enforcing is this section's own failure one level up.
 
 #### The rig, and the populations every number below is drawn from
 
@@ -735,7 +749,7 @@ legs plus one calibration run, 25 runs total:
 
 | leg | runs | what it varies | driver |
 |---|---|---|---|
-| rate | 8 | intent rate at fixed bulk: ~47 / ~203 / ~484 / ~970 per s, ×2 repeats with the order reversed | `run-sweep.sh` |
+| rate | 8 | intent rate at fixed bulk: 47.1–47.2 / 202.7–203.0 / 483.9–484.8 / 970.0–972.4 per s, ×2 repeats with the order reversed | `run-sweep.sh` |
 | cadence | 8 | the rig's lease-renewal pass: 1.5 s / 3 s / 6 s, and 3 s **phased**, ×2 repeats | `run-heartbeat.sh` |
 | device | 8 | bulk loaded vs quiet, × phased vs burst, ×2 repeats | `run-quiet.sh` |
 | calibration | 1 | the published operating point, run once first | — |
@@ -1004,7 +1018,7 @@ leaving q-loaded-r2's 24.5 ms in neither published range.
 journal's fsync tail, `bulk_ack_ms` behind it, and the residual of
 `intent_commit_ms` after the rig's burst is removed are **one device**. What is
 left over is a load-generator artifact that a real client population does not
-have. The same 250-session / ~203 intents/s point, phased, at 18 493 and
+have. The same 250-session / 203.0–203.3 intents/s point, phased, at 18 493 and
 18 491 delivered diffs/s, measures:
 
 | run | regime | client p99 | server p99 | past the 20 ms cut | FDB commit max | journal worst fsync |
@@ -1024,7 +1038,7 @@ read was "≤ 19 ms in every loaded point". It is not: over the 21 loaded runs t
 worst single fence read is **7.82–81.37 ms**, and even restricted to the 17
 loaded runs at ≤ 300 intents/s it reaches **41.18 ms** (hb6-r2). The whole
 fence stage's worst is **7.95–81.48 ms** (n=21) — so at the top the stage *is*
-one slow read. A single read taking 81 ms is eight times the D16 budget on its
+one slow read. A single read taking 81.37 ms is eight times the D16 budget on its
 own. (The stated bound came from folding `fence_read_max_us` as if it were a
 sum; it has no `_max` suffix, so a reader that keys on the suffix silently
 accumulates it. The derive script maxes it explicitly and the self-test pins the
@@ -1069,10 +1083,10 @@ Every range is over the 21 loaded runs unless the row says otherwise.
 
 | hypothesis | measured | verdict |
 |---|---|---|
-| Wake-up multiplication — the intent future is woken from a thread outside the runtime onto the injector queue while ~18.5 k diff routes/s hold the workers' local queues | `spawn_wait` mean **0.0025–0.0074 ms**, max **0.148–3.913 ms** (n=21) — this bounds the spawn hop only. `fdb_gap` mean **0.019–0.023 ms** and max **0.062–1.650 ms** (n=21) do **not** bound it: `fdb_gap` is synchronous CPU by construction, so it is near zero whatever the wake cost is | **bounded, not ruled out** — see below |
+| Wake-up multiplication — the intent future is woken from a thread outside the runtime onto the injector queue while ~18.5 k diff routes/s hold the workers' local queues | `spawn_wait` mean **0.0025–0.0074 ms**, max **0.148–3.913 ms** (n=21) — this bounds the spawn hop only. `fdb_gap` mean **0.0194–0.0234 ms** and max **0.062–1.650 ms** (n=21) do **not** bound it: `fdb_gap` is synchronous CPU by construction, so it is near zero whatever the wake cost is | **bounded, not ruled out** — see below |
 | Silent `db.run` retries on 1007/1009/1021/1037/1213 (conflicts being zero says nothing about these) | `attempts − executed` = **0** over **181 302** executed intents (n=21); `backoff` max **0.000 ms** in every run — though see the `fdb_gap` caveat: a sub-ms backoff cannot appear here | ruled out |
 | Gateway stages outside `execute` — ingress queue, reply handoff, unattributed span time | `ingress` mean **1.2–9.6 µs**, `reply` mean **0.66–0.97 µs**, `server_gap` mean **1.67–2.02 µs** (n=21 each) | ruled out |
-| The process-wide `PersistId` allocator mutex, held across a refill transaction | **1–8** refills per 30 s run; `alloc_wait` mean **0.1–129.6 µs**; `alloc_wait` max **0.01–66.56 ms**; `alloc_refill` max **1.49–66.55 ms**; an allocator phase is the largest in **13 of 2 479** exemplars (n=21) | **not the 130 ms tail, but a real ~10–66 ms contributor against a 10 ms budget — see below** |
+| The process-wide `PersistId` allocator mutex, held across a refill transaction | **1–8** refills per 30 s run; `alloc_wait` mean **0.1–129.6 µs**; `alloc_wait` max **0.01–66.56 ms**; `alloc_refill` max **1.49–66.55 ms**; an allocator phase is the largest in **13 of 2 479** exemplars (n=21) | **not the 130 ms tail, but a real contributor against a 10 ms budget — 9.82 ms (qph-loaded-r1) to 66.56 ms (qph-loaded-r2) — see below** |
 | Fence fan-out amplification — the transaction waits on the max of 128 concurrent reads | worst single fence read **7.82–81.37 ms** (n=21), **7.82–41.18 ms** restricted to the 17 runs at ≤ 300 intents/s; tail `fence` mean **1.90–17.42 ms** (n=21) | real and rate-dependent, but **not the tail**: see the 21-slowest-intent argument above |
 | FDB commit fsync — the device | tail `commit` mean **4.23–24.53 ms** over the 15 fast-regime runs and **33.20–86.49 ms** over the 6 slow-regime runs; worst single commit **12.90–351.32 ms** (n=21) | real, and the same root cause as the other two series |
 | GRV | tail `grv` mean **30.69–80.49 ms** over the 8 rate-leg runs with the burst present; **0.18–6.91 ms** over the 4 loaded phased runs | first in line, and it is the burst |
@@ -1095,8 +1109,8 @@ larger than 66.56 ms, and the 130 ms excursions are GRV. But it is not "not the
 tail" either: `qph-loaded-r1`'s slowest intent of the entire run is a 9.82 ms
 refill with a 9.81 ms wait on the mutex held across it, which is the whole D16
 budget in one stage, and `qph-loaded-r2` shows a 66.56 ms wait. The correct
-statement is the one in the table: a ~10–66 ms contributor against a 10 ms
-budget, in a minority of intents, on a path that serialises every intent behind
+statement is the one in the table: a contributor between qph-loaded-r1's
+9.82 ms and qph-loaded-r2's 66.56 ms against a 10 ms budget, in a minority of intents, on a path that serialises every intent behind
 one mutex. It is a defect worth fixing and it is not the thing being hunted here.
 
 **An elimination that is withdrawn.** The published section ruled out the

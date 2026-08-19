@@ -30,6 +30,17 @@ Usage::
     scripts/intent-tail-derive.py --self-test        # re-derive the known-false numbers
     scripts/intent-tail-derive.py --audit-doc        # no number in §2.2.1 that this
                                                      # script does not print
+    scripts/intent-tail-derive.py --gate-self-test   # plant wrong values and assert
+                                                     # --audit-doc catches them
+
+`--audit-doc` matches **whole numeric tokens**, not substrings. An earlier
+version asked whether each of the section's numbers appeared anywhere in this
+report as a substring, which a report full of long floats answers "yes" to for
+almost any short number, so it passed seven numbers the section quoted and this
+script never printed — and it passed a §2.2.1 carrying planted wrong values.
+`--audit-doc` now runs `--gate-self-test` first and refuses to report a pass
+unless the gate has just demonstrated, on generated plants, that it still
+catches an underived number.
 
 The sweep artifacts are not version-controlled (they are ~10 GB of JSONL);
 `--self-test` is what makes the derivation checkable without them being in the
@@ -53,6 +64,11 @@ CUT_US = 20_000
 
 # The reporter writes at most one record of each kind per interval.
 INTERVAL_MS = 250
+
+# The "low rate" subset rule, used by the fence section. It is stated here and
+# printed with the range it produces, because a subset whose threshold lives
+# only in the doc is a threshold nobody can check.
+LOW_RATE_CUT = 300
 
 # The regime split. This box has two fsync-cost regimes (docs/08 §4.3) and the
 # runs land in two clusters with nothing between 110.8 ms and 169.4 ms of worst
@@ -408,6 +424,19 @@ def median(xs):
     return xs[n // 2] if n % 2 else (xs[n // 2 - 1] + xs[n // 2]) / 2
 
 
+def round_sf(x: float, sig: int) -> float:
+    """Round to `sig` significant figures.
+
+    Prose labels ("the 130 ms sample", "the ~200 intents/s point") are
+    roundings of measured values. Doing the rounding here means the label is
+    printed by this script and therefore survives `--audit-doc`; doing it in
+    prose means it does not.
+    """
+    if x == 0:
+        return 0.0
+    return round(x, -int(math.floor(math.log10(abs(x)))) + (sig - 1))
+
+
 def pearson(xs, ys):
     n = len(xs)
     mx, my = mean(xs), mean(ys)
@@ -640,6 +669,21 @@ def section_headline(runs):
         n=1,
         stat="largest FDB phase on the slowest exemplar",
     )
+    # The section calls this exemplar "the 130 ms sample". That label is a
+    # rounding, so the rounding is derived here rather than done by hand in
+    # prose: a label the script does not print is a number the audit rejects.
+    dom = dominant_phase(e)
+    emit(
+        "headline.label",
+        f"the section's \"{round_sf(e[dom] / 1000.0, 2):g} ms\" label is "
+        f"{dom} = {e[dom]} us = {e[dom] / 1000.0:.3f} ms rounded to two "
+        f"significant figures; the span it sits in is "
+        f"{e['server_us'] / 1000.0:.3f} ms",
+        leg="calibration",
+        points=r.label,
+        n=1,
+        stat="the prose label, and the measured value it rounds",
+    )
     return r
 
 
@@ -670,6 +714,25 @@ def section_rate_leg(runs):
         )
     print("  (client/server percentiles are D16 lattice buckets, not interpolations)")
     print()
+    # The leg is described by four setpoint labels. A label is a claim, so the
+    # measured pair behind each one is printed rather than rounded in prose.
+    pairs = {}
+    for r in rate:
+        pairs.setdefault(r.label.split("-r")[0], []).append(r)
+    emit(
+        "rate.setpoints",
+        "; ".join(
+            f"{k}: {min(x.intent_rate for x in v):.1f}-"
+            f"{max(x.intent_rate for x in v):.1f} intents/s "
+            f"({', '.join(x.label for x in sorted(v, key=lambda x: x.label))})"
+            for k, v in sorted(pairs.items(),
+                               key=lambda kv: min(x.intent_rate for x in kv[1]))
+        ),
+        leg="rate",
+        points=", ".join(r.label for r in rate),
+        n=len(rate),
+        stat="measured rate of each setpoint pair; the leg table quotes these, not a rounding",
+    )
     lo = [r for r in rate if r.intent_rate < 600]
     emit(
         "rate.tail_server_below_600",
@@ -1250,11 +1313,11 @@ def section_fence(runs, loaded):
             f"{r.tail_mean_ms('fence_us'):>14.2f}m"
         )
     print()
-    at200 = [r for r in loaded if r.intent_rate < 300]
+    at200 = [r for r in loaded if r.intent_rate < LOW_RATE_CUT]
     emit(
         "fence.single_read_max_at_operating_point",
         Range([(r.fence_read_max_ms, r.label) for r in at200],
-              f"the {len(at200)} loaded runs at ~200 intents/s or below"),
+              f"the {len(at200)} loaded runs at <= {LOW_RATE_CUT} intents/s"),
         leg="all three legs + calibration",
         points=", ".join(r.label for r in at200),
         n=len(at200),
@@ -1750,30 +1813,63 @@ DOC = Path(__file__).resolve().parent.parent / "docs" / "08-persistence.md"
 SECTION_START = "### 2.2.1 Where the D16 intent tail"
 SECTION_END = "## 3. Cell actor model"
 
-# Numbers that are structure rather than measurement: section numbers, FDB
-# error codes, configured constants, dates, and the round figures the rig was
-# built from. Each is a deliberate entry; the list is short on purpose, because
-# a long allow-list is how this check stops working.
+# Every exemption below is one entry with one reason. The reason is the entry's
+# whole justification: if a token cannot be described as *structure* — a
+# cross-reference, an error code, a configured constant, a calendar date — then
+# it is a measurement, and a measurement belongs in this script's output rather
+# than on this list. A blanket range ("every integer 0-21, plus the round ones")
+# is not a reason, and the previous version of this list was exactly that: it
+# exempted most small integers a wrong claim would ever use.
+#
+# `--audit-doc` also fails on a *dead* entry, i.e. one that no longer appears in
+# the section. That is what stops the list growing back: an exemption cannot
+# outlive the sentence it was written for.
 AUDIT_ALLOW = {
-    "0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13",
-    "14", "15", "16", "17", "18", "19", "20", "21", "24", "25", "30", "40",
-    "64", "100", "128", "150", "200", "250", "300", "500", "1000", "5000",
-    "10000", "2026",
-    "0.05", "1.5", "3.0", "6.0",              # configured cadences / diff_hz
-    "0.752", "0.888",                          # printed as "Spearman = 0.752"
-    "1007", "1009", "1021", "1037", "1213",    # FDB error codes
-    "2.1", "2.1.3", "2.2", "2.2.1", "4.3", "08", "08-persistence",
-    "0.11.0", "0.11",                          # foundationdb crate version
+    # Cross-references to other sections of this document.
+    "2.1": "§2.1 cross-reference (RouteStageMetrics)",
+    "2.2": "§2.2 / §2.2.1 cross-reference — '2.2.1' tokenises as '2.2' then '1'",
+    "4.3": "§4.3 cross-reference (the two fsync regimes)",
+    # Calendar.
+    "2026": "the year in the date 2026-08-19",
+    "08": "the month in the date 2026-08-19",
+    # Third-party identifiers, not measurements.
+    "0.11": "vendored crate `foundationdb-0.11.0`; the version tokenises as '0.11' then '0'",
+    "1007": "FDB error code, named in the silent-retry hypothesis",
+    "1009": "FDB error code, named in the silent-retry hypothesis",
+    "1021": "FDB error code, named in the silent-retry hypothesis",
+    "1037": "FDB error code, named in the silent-retry hypothesis",
+    "1213": "FDB error code, named in the silent-retry hypothesis",
+    # A configured constant of the metrics lattice, not a measured value. Its
+    # neighbours 150 and 200 are printed by the script because measurements land
+    # in them; 100 is quoted only to state the lattice's spacing, and the same
+    # token labels the "100 ms term" that spacing cannot resolve better than.
+    "100": "D16 latency-lattice bucket boundary — a configured constant of the instrument",
 }
 
-# Numbers the section quotes *as wrong*, in the sentences that say so. They are
-# not derivable by construction: the point of printing them is that they are
-# not what the artifacts say.
-AUDIT_QUOTED_FALSE = {"19", "17.60", "157.39", "45.9", "116.6", "123.5", "147.7"}
+# Numbers the section quotes *as wrong*, inside the sentences that say "the
+# earlier text said X, and X is not what the artifacts say". A false value is
+# not derivable by construction, so it can never come out of this script. Each
+# entry names the withdrawn claim it belongs to, and a dead entry fails the
+# audit for the same reason a dead allow-list entry does.
+AUDIT_QUOTED_FALSE = {
+    "19": 'withdrawn: "the slowest single fence read was <= 19 ms in every loaded point"',
+    "10": 'withdrawn: "fence mean is 10-16x idem_read mean, every run"',
+    "16": 'withdrawn: "fence mean is 10-16x idem_read mean, every run"',
+    "2479": 'withdrawn: "fence is the largest FDB phase in exactly one of 2 479 exemplars"',
+    "62.8": 'withdrawn: "tail commit 62.8-86.5 ms in the slow regime" — a subset of a subset',
+    "86.5": 'withdrawn: "tail commit 62.8-86.5 ms in the slow regime" — a subset of a subset',
+    "0.5": 'withdrawn: "0.5-0.8 ms phased", which covered only the cadence leg\'s pair',
+    "0.8": 'withdrawn: "0.5-0.8 ms phased", which covered only the cadence leg\'s pair',
+}
+
+_TOKEN = re.compile(r"\d+(?:\.\d+)?")
 
 
 def _audit_norm(text: str) -> str:
-    text = text.replace("\u2009", " ").replace("–", "-").replace("—", "-")
+    # Thin space (the doc's thousands separator), en dash, em dash. Escaped
+    # rather than literal: an invisible character in a normaliser is how a
+    # normaliser stops normalising without anyone seeing the diff.
+    text = text.replace("\u2009", " ").replace("\u2013", "-").replace("\u2014", "-")
     # Digits inside an identifier (`qph-loaded-r2`, `p99`) are not numbers.
     # Mask them, or joining thousands separators invents "…-r2 207.3" -> 2207.3.
     text = re.sub(r"(?<=[A-Za-z])\d+", lambda m: "\x00" * len(m.group()), text)
@@ -1784,12 +1880,28 @@ def _audit_norm(text: str) -> str:
     return text
 
 
-def audit_doc(sweep: Path) -> int:
-    if not DOC.exists():
-        print(f"doc not found: {DOC}", file=sys.stderr)
-        return 2
-    import io
+def audit_tokens(text: str) -> set:
+    """The numeric tokens of a text, normalised. Tokens, not substrings.
+
+    The previous version of this gate asked whether each number in the section
+    appeared *anywhere* in the report as a substring, which a 585-line report
+    full of long floats answers "yes" to for almost any short number: `130`
+    matched inside `181302`, `66` inside `157366`, `0.019` inside `0.0194`.
+    Seven numbers the section quoted and this script never printed passed that
+    way, and so did a §2.2.1 carrying planted wrong values.
+    """
+    return set(_TOKEN.findall(_audit_norm(text)))
+
+
+def section_text() -> str:
+    body = DOC.read_text()
+    return body[body.index(SECTION_START):body.index(SECTION_END)]
+
+
+def derive_report(sweep: Path) -> str:
+    """This script's own output, captured — the only source of derived values."""
     import contextlib
+    import io
 
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf):
@@ -1806,28 +1918,186 @@ def audit_doc(sweep: Path) -> int:
         section_client(loaded)
         section_eliminations(loaded)
         section_quiet(runs)
-    printed = _audit_norm(buf.getvalue())
+    return buf.getvalue()
 
-    body = DOC.read_text()
-    section = body[body.index(SECTION_START):body.index(SECTION_END)]
-    text = _audit_norm(section)
-    tokens = sorted(set(re.findall(r"\d+(?:\.\d+)?", text)))
-    missing = [t for t in tokens
-               if t not in AUDIT_ALLOW and t not in AUDIT_QUOTED_FALSE
-               and t not in printed]
 
+def underived(section: str, printed: set) -> list:
+    """Tokens of `section` that no exemption covers and this script never printed.
+
+    Exact token equality against `printed`. This is the whole gate.
+    """
+    return [t for t in sorted(audit_tokens(section))
+            if t not in AUDIT_ALLOW
+            and t not in AUDIT_QUOTED_FALSE
+            and t not in printed]
+
+
+def _quote(section: str, token: str) -> str:
+    for line in _audit_norm(section).splitlines():
+        if token in _TOKEN.findall(line):
+            return line.strip()[:100]
+    return ""
+
+
+# --------------------------------------------------------------------------
+# The gate's own test.
+#
+# A gate that can stop enforcing without saying so is the same defect as the
+# section it guards, one level up. The previous round verified by hand, once,
+# that a planted wrong digit was caught; this makes that mechanical and runs it
+# every time `--audit-doc` runs, so "AUDIT PASSED" is never printed by a gate
+# that has been demonstrated not to catch anything.
+# --------------------------------------------------------------------------
+def _substring_plants(printed: set, want: int = 6) -> list:
+    """Wrong values chosen to be *substrings* of real printed values.
+
+    This is the exact shape the containment bug let through. They are generated
+    from the current report rather than hard-coded, so they cannot go stale when
+    the numbers move.
+    """
+    plants = []
+    for t in sorted((t for t in printed if "." not in t and len(t) >= 5),
+                    key=lambda t: (-len(t), t)):
+        for cut in (t[:3], t[1:4], t[:4], t[2:5]):
+            if (len(cut) >= 2
+                    and cut not in printed
+                    and cut not in AUDIT_ALLOW
+                    and cut not in AUDIT_QUOTED_FALSE
+                    and all(cut != c for c, _ in plants)):
+                plants.append((cut, t))
+                break
+        if len(plants) >= want:
+            break
+    return plants
+
+
+def _digit_plants(section: str, printed: set, want: int = 6) -> list:
+    """Values the section really quotes, with one digit changed."""
+    plants = []
+    for t in sorted(audit_tokens(section) & printed, key=lambda t: (-len(t), t)):
+        if len(t) < 3:
+            continue
+        for i in range(len(t) - 1, -1, -1):
+            if not t[i].isdigit():
+                continue
+            bad = t[:i] + str((int(t[i]) + 1) % 10) + t[i + 1:]
+            if (bad not in printed
+                    and bad not in AUDIT_ALLOW
+                    and bad not in AUDIT_QUOTED_FALSE
+                    and all(bad != c for c, _ in plants)):
+                plants.append((bad, t))
+                break
+        if len(plants) >= want:
+            break
+    return plants
+
+
+def gate_self_test(sweep: Path, report: str | None = None,
+                   verbose: bool = True) -> int:
+    """Plant wrong values in a copy of §2.2.1 and assert the gate FAILS on them.
+
+    `report` is threaded through from `audit_doc` so the enforcement is
+    demonstrated against the *same* report the verdict is computed from. Proving
+    the gate on one report and then judging the doc against another would leave
+    exactly the gap this test exists to close.
+    """
+    report = derive_report(sweep) if report is None else report
+    printed = audit_tokens(report)
+    norm_report = _audit_norm(report)
+    section = section_text()
+    failures = []
+
+    def check(name: str, ok: bool, detail: str = "") -> None:
+        if not ok:
+            failures.append(name)
+        if verbose:
+            print(f"  {'ok  ' if ok else 'FAIL'} {name:<62} {detail}")
+
+    # 0. Control: the gate must not flag a value the script *did* print.
+    #    Without this a gate that flagged everything would look like a working
+    #    gate. The control is synthetic on purpose — asserting instead that the
+    #    live section is clean would make a wrong number in the doc report as
+    #    "the gate is broken", which is a different defect with a different fix.
+    #    Whether the live section is clean is the audit's own verdict, below.
+    control = max((t for t in printed if "." in t), key=len, default="157413")
+    check("control: a value the script prints is not flagged",
+          control not in underived(section + f"\n\nCONTROL: {control} ms.\n", printed),
+          f"{control!r}")
+
+    # 1. Substring plants — the containment bug's own shape. Each is asserted to
+    #    be a substring of the report first, so the test really does cover the
+    #    case the old gate passed.
+    plants = _substring_plants(printed)
+    check("substring plants were generated from the report",
+          len(plants) >= 3, f"{len(plants)} plants")
+    for bad, real in plants:
+        check(f"plant {bad!r} is a substring of the report (old gate would pass it)",
+              bad in norm_report, f"inside {real!r}")
+        planted = section + f"\n\nPLANTED: the measured value is {bad} ms.\n"
+        check(f"plant {bad!r} is caught as a whole token", bad in underived(planted, printed))
+
+    # 2. One-digit corruptions of values the section really quotes.
+    dplants = _digit_plants(section, printed)
+    check("digit plants were generated from the section",
+          len(dplants) >= 3, f"{len(dplants)} plants")
+    for bad, real in dplants:
+        planted = _audit_norm(section).replace(real, bad, 1)
+        check(f"plant {bad!r}, one digit off the quoted {real!r}, is caught",
+              bad in underived(planted, printed))
+
+    # 3. Every exemption is live. A dead exemption is a hole waiting for a
+    #    number to be written into it — and the old list had eleven.
+    toks = audit_tokens(section)
+    for t, why in sorted(AUDIT_ALLOW.items()):
+        check(f"allow-list entry {t!r} is still used by the section", t in toks, why[:44])
+    for t, why in sorted(AUDIT_QUOTED_FALSE.items()):
+        check(f"quoted-false entry {t!r} is still used by the section", t in toks, why[:44])
+
+    if failures:
+        print(f"\nGATE SELF-TEST FAILED ({len(failures)} of the checks above): "
+              + "; ".join(failures[:4]))
+        return 1
+    if verbose:
+        print("\nGATE SELF-TEST PASSED: planted values are caught, and every "
+              "exemption is live.")
+    return 0
+
+
+def audit_doc(sweep: Path) -> int:
+    if not DOC.exists():
+        print(f"doc not found: {DOC}", file=sys.stderr)
+        return 2
+
+    report = derive_report(sweep)
+
+    # The gate demonstrates that it still enforces, on this very report, before
+    # it reports a pass.
+    print("gate self-test — planted wrong values must be caught:")
+    if gate_self_test(sweep, report=report) != 0:
+        print("\nAUDIT ABORTED: the gate does not enforce, so its verdict means nothing.")
+        return 1
+
+    printed = audit_tokens(report)
+    section = section_text()
+    tokens = audit_tokens(section)
+    missing = underived(section, printed)
+
+    print()
     print(f"audit: {DOC}")
     print(f"  {len(tokens)} numeric tokens in §2.2.1")
-    print(f"  {len(AUDIT_ALLOW & set(tokens))} structural (allow-list)")
-    print(f"  {len(AUDIT_QUOTED_FALSE & set(tokens))} quoted as wrong, by design")
+    print(f"  {len(printed)} numeric tokens printed by this script")
+    print(f"  {len(set(AUDIT_ALLOW) & tokens)} structural "
+          f"(allow-list, {len(AUDIT_ALLOW)} entries, all live)")
+    print(f"  {len(set(AUDIT_QUOTED_FALSE) & tokens)} quoted as wrong, by design "
+          f"({len(AUDIT_QUOTED_FALSE)} entries, all live)")
     print(f"  {len(missing)} not produced by this script")
     for t in missing:
-        line = next((l.strip() for l in text.splitlines() if t in l), "")
-        print(f"    UNDERIVED {t!r}  <-  {line[:100]}")
+        print(f"    UNDERIVED {t!r}  <-  {_quote(section, t)}")
     if missing:
         print("\nAUDIT FAILED: §2.2.1 quotes a number this script does not print.")
         return 1
-    print("\nAUDIT PASSED: every number in §2.2.1 is printed by this script.")
+    print("\nAUDIT PASSED: every number in §2.2.1 is printed by this script, "
+          "matched as a whole token.")
     return 0
 
 
@@ -1839,6 +2109,8 @@ def main(argv):
         return 2
     if "--self-test" in argv:
         return self_test(sweep)
+    if "--gate-self-test" in argv:
+        return gate_self_test(sweep)
     if "--audit-doc" in argv:
         return audit_doc(sweep)
 
