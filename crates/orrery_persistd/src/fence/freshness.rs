@@ -154,18 +154,38 @@ impl FenceFreshnessMonitor {
         state.mismatch = true;
     }
 
+    /// Confirm every watched row, in one batched read.
+    ///
+    /// This used to be a `for` loop over `FenceStore::read`, and on the
+    /// durable tier each of those is a whole transaction — so confirming a
+    /// 128-shard node once a second was 128 transactions a second, each with
+    /// its own read version, over rows that are adjacent in the keyspace.
+    /// `read_many` is one range read (docs/08-persistence.md §2.2.7 made the
+    /// same change on the intent path's fence, which watches the same rows).
+    ///
+    /// The decision is unchanged. The rows come back positionally, they are
+    /// compared against the same expectations in the same order, and the two
+    /// early exits are preserved exactly: any mismatch marks the monitor
+    /// mismatched and does not refresh the confirmation, and a store error
+    /// refreshes nothing at all. The only difference is that a mismatch no
+    /// longer *stops* the reads — they have already happened — which costs
+    /// nothing, because a mismatched monitor is a terminal state the node does
+    /// not poll its way out of.
     async fn poll_once(&self, store: &dyn FenceStore) {
-        for &(shard, expected) in &self.rows {
-            match store.read(self.grid, shard).await {
-                Ok(Some(actual)) if actual == expected => {}
-                Ok(_) => {
-                    self.state
-                        .write()
-                        .expect("fence freshness lock poisoned")
-                        .mismatch = true;
-                    return;
-                }
-                Err(_) => return,
+        let shards: Vec<CellId> = self.rows.iter().map(|&(shard, _)| shard).collect();
+        let Ok(actual) = store.read_many(self.grid, &shards).await else {
+            return;
+        };
+        if actual.len() != self.rows.len() {
+            return;
+        }
+        for (&(_, expected), got) in self.rows.iter().zip(actual) {
+            if got != Some(expected) {
+                self.state
+                    .write()
+                    .expect("fence freshness lock poisoned")
+                    .mismatch = true;
+                return;
             }
         }
         let mut state = self.state.write().expect("fence freshness lock poisoned");
@@ -207,6 +227,163 @@ mod tests {
     use crate::gateway::{BulkAckAdmission, BulkAckDisposition};
 
     use super::{FenceFreshnessConfig, FenceFreshnessMonitor};
+
+    /// A store that counts how many times the monitor asked it for rows, and
+    /// whether it asked one at a time or in a batch.
+    ///
+    /// Both counters exist because only their *ratio* is the property under
+    /// test: a poll that reads its rows individually is what this change
+    /// removed, and a poll that batches them is what replaced it. Counting
+    /// only rows would pass either way.
+    #[derive(Default)]
+    struct CountingFenceStore {
+        inner: MemFenceStore,
+        single_reads: std::sync::atomic::AtomicUsize,
+        batched_calls: std::sync::atomic::AtomicUsize,
+        rows_returned: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl FenceStore for CountingFenceStore {
+        async fn read(
+            &self,
+            grid: GridId,
+            shard: CellId,
+        ) -> Result<Option<crate::fence::FenceRow>, crate::fence::FenceError> {
+            self.single_reads
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.read(grid, shard).await
+        }
+        async fn read_many(
+            &self,
+            grid: GridId,
+            shards: &[CellId],
+        ) -> Result<Vec<Option<crate::fence::FenceRow>>, crate::fence::FenceError> {
+            self.batched_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.rows_returned
+                .fetch_add(shards.len(), std::sync::atomic::Ordering::SeqCst);
+            // Deliberately *not* delegating to `inner.read_many`: that would
+            // take the trait default, which loops over `read` and would make
+            // `single_reads` count this batch's rows too.
+            let mut out = Vec::with_capacity(shards.len());
+            for &shard in shards {
+                out.push(self.inner.read(grid, shard).await?);
+            }
+            Ok(out)
+        }
+        async fn fence(
+            &self,
+            grid: GridId,
+            shard: CellId,
+            expected: Option<&crate::fence::FenceRow>,
+            new: &crate::fence::FenceRow,
+        ) -> Result<FenceOutcome, crate::fence::FenceError> {
+            self.inner.fence(grid, shard, expected, new).await
+        }
+        async fn activate_shards(
+            &self,
+            grid: GridId,
+            owner: u64,
+            shards: &[crate::fence::ShardActivation],
+        ) -> Result<crate::fence::ActivationOutcome, crate::fence::FenceError> {
+            self.inner.activate_shards(grid, owner, shards).await
+        }
+        async fn begin_split(
+            &self,
+            grid: GridId,
+            parent: CellId,
+            parent_expected: &crate::fence::FenceRow,
+            children: &[(CellId, crate::fence::FenceRow)],
+        ) -> Result<FenceOutcome, crate::fence::FenceError> {
+            self.inner
+                .begin_split(grid, parent, parent_expected, children)
+                .await
+        }
+        async fn retire(
+            &self,
+            grid: GridId,
+            shard: CellId,
+        ) -> Result<(), crate::fence::FenceError> {
+            self.inner.retire(grid, shard).await
+        }
+    }
+
+    /// The monitor confirms its whole shard set with one batched read, not one
+    /// read per shard.
+    ///
+    /// On the durable tier a `FenceStore::read` is a whole transaction, so the
+    /// per-shard loop this replaced was one transaction per shard per second.
+    /// Counting rows alone would not notice the difference; counting *calls*
+    /// is the property.
+    #[tokio::test]
+    async fn a_poll_reads_its_shard_set_in_one_batch() {
+        const SHARDS: usize = 8;
+        let store = Arc::new(CountingFenceStore::default());
+        let shards: Vec<CellId> = CellId::ROOT.children().into_iter().take(SHARDS).collect();
+        let mut rows = Vec::new();
+        for &shard in &shards {
+            assert!(matches!(
+                store
+                    .fence(GridId::ROOT, shard, None, &row())
+                    .await
+                    .unwrap(),
+                FenceOutcome::Fenced
+            ));
+            rows.push((shard, row()));
+        }
+        // The rows the monitor starts from are read through `read`, so the
+        // window that matters starts after it is running.
+        let monitor = FenceFreshnessMonitor::start(
+            Arc::clone(&store) as Arc<dyn FenceStore>,
+            GridId::ROOT,
+            rows,
+            FenceFreshnessConfig {
+                poll_interval: Duration::from_millis(5),
+                max_staleness: Duration::from_secs(3),
+            },
+        )
+        .unwrap();
+        let singles_before = store.single_reads.load(std::sync::atomic::Ordering::SeqCst);
+        let batches_before = store
+            .batched_calls
+            .load(std::sync::atomic::Ordering::SeqCst);
+        // Asked about a cell the monitor actually owns: its rows are ROOT's
+        // children here, and `owns_cell` is a prefix test, so ROOT itself is
+        // not one of them.
+        tokio::time::timeout(Duration::from_millis(500), async {
+            loop {
+                if monitor.assess(GridId::ROOT, shards[0]) == BulkAckDisposition::Durable {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .expect("monitor confirms its rows");
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        let batches = store
+            .batched_calls
+            .load(std::sync::atomic::Ordering::SeqCst)
+            - batches_before;
+        let rows_seen = store
+            .rows_returned
+            .load(std::sync::atomic::Ordering::SeqCst);
+        let singles = store.single_reads.load(std::sync::atomic::Ordering::SeqCst) - singles_before;
+        assert!(batches >= 1, "the monitor must have polled at least once");
+        assert_eq!(
+            rows_seen,
+            batches * SHARDS,
+            "every poll must ask for the whole shard set at once",
+        );
+        // The counting store's `read_many` reaches `inner.read`, not `self.read`,
+        // so a batched poll leaves this at zero. A per-shard loop would not.
+        assert_eq!(
+            singles, 0,
+            "a poll must not read its shards one at a time: {singles} single reads across \
+             {batches} polls of {SHARDS} shards",
+        );
+    }
 
     fn row() -> crate::fence::FenceRow {
         crate::fence::FenceRow {

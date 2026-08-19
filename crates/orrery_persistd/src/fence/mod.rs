@@ -143,6 +143,31 @@ pub trait FenceStore: Send + Sync {
     /// Read the current fence row for `shard`, or `None` if none exists.
     async fn read(&self, grid: GridId, shard: CellId) -> Result<Option<FenceRow>, FenceError>;
 
+    /// Read many shards' fence rows, positionally.
+    ///
+    /// Defaulted to a loop over [`FenceStore::read`], so an implementation
+    /// that has nothing better to offer needs no change. A durable tier does
+    /// have something better: `actor/{grid}/{shard}` rows are contiguous
+    /// (`keyspace::fence_key`), so the whole set is one range read in one
+    /// transaction rather than one transaction per row — see
+    /// [`crate::fence::fdb::FdbFenceStore`] and docs/08-persistence.md §2.2.7,
+    /// which made the same change on the intent path's ownership fence.
+    ///
+    /// The reply is positional: `out[i]` is `shards[i]`'s row, `None` if it
+    /// has none. Callers compare against their own expectations in their own
+    /// order, so a batched read cannot reorder a decision.
+    async fn read_many(
+        &self,
+        grid: GridId,
+        shards: &[CellId],
+    ) -> Result<Vec<Option<FenceRow>>, FenceError> {
+        let mut out = Vec::with_capacity(shards.len());
+        for &shard in shards {
+            out.push(self.read(grid, shard).await?);
+        }
+        Ok(out)
+    }
+
     /// CAS `actor/{shard}` from `expected` to `new` in one transaction.
     ///
     /// `expected == None` means the shard is expected to have no row (cold

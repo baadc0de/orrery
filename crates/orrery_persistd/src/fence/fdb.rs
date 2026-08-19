@@ -21,6 +21,8 @@ use crate::fence::{
     validate_activation_set, ActivationOutcome, FenceError, FenceOutcome, FenceRow, FenceStatus,
     FenceStore, ShardActivation,
 };
+use futures::TryStreamExt as _;
+
 use crate::keyspace;
 use crate::FdbContext;
 
@@ -80,6 +82,67 @@ impl FenceStore for FdbFenceStore {
                     Ok(Some(row))
                 }
                 None => Ok(None),
+            }
+        })
+        .await
+        .map_err(|e: foundationdb::FdbBindingError| FenceError::Store(format!("read txn: {e}")))
+    }
+
+    /// One range read in one transaction, whatever the shard count.
+    ///
+    /// The default in [`FenceStore`] is a loop over [`FenceStore::read`], and
+    /// `read` here is a whole `db.run` — so the freshness monitor's
+    /// once-a-second confirmation of a 128-shard node was 128 transactions a
+    /// second, each with its own read version, for rows that are adjacent in
+    /// the keyspace. docs/08-persistence.md §2.2.7 made exactly this change on
+    /// the intent path's ownership fence; this is the same change on the
+    /// background monitor that watches the same rows.
+    ///
+    /// The rows are returned positionally against `shards`, so the caller's
+    /// comparison order is unchanged.
+    async fn read_many(
+        &self,
+        grid: GridId,
+        shards: &[CellId],
+    ) -> Result<Vec<Option<FenceRow>>, FenceError> {
+        let (Some(lo), Some(hi)) = (
+            shards.iter().map(|s| s.to_bits()).min(),
+            shards.iter().map(|s| s.to_bits()).max(),
+        ) else {
+            return Ok(Vec::new());
+        };
+        let db = Arc::clone(&self.db);
+        let start = keyspace::fence_key(grid, CellId::from_bits(lo).expect("shard round-trips"));
+        let mut end =
+            keyspace::fence_key(grid, CellId::from_bits(hi).expect("shard round-trips")).to_vec();
+        end.push(0);
+        let wanted: Vec<u64> = shards.iter().map(|s| s.to_bits()).collect();
+        db.run(move |trx, _| {
+            let (start, end, wanted) = (start, end.clone(), wanted.clone());
+            async move {
+                let mut stream = trx.get_ranges_keyvalues(
+                    foundationdb::RangeOption {
+                        begin: foundationdb::KeySelector::first_greater_or_equal(start.as_slice()),
+                        end: foundationdb::KeySelector::first_greater_or_equal(end.as_slice()),
+                        ..foundationdb::RangeOption::default()
+                    },
+                    false,
+                );
+                let mut seen: std::collections::HashMap<u64, FenceRow> =
+                    std::collections::HashMap::new();
+                while let Some(kv) = stream.try_next().await? {
+                    let key = kv.key();
+                    if key.len() != 13 {
+                        continue;
+                    }
+                    let bits =
+                        u64::from_be_bytes(key[5..13].try_into().expect("13-byte fence key"));
+                    let row = decode_row(kv.value()).map_err(|e| {
+                        foundationdb::FdbBindingError::new_custom_error(Box::new(e))
+                    })?;
+                    seen.insert(bits, row);
+                }
+                Ok(wanted.iter().map(|bits| seen.get(bits).copied()).collect())
             }
         })
         .await
