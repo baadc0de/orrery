@@ -197,16 +197,39 @@ fn lease_heartbeat_period() -> Duration {
 }
 
 /// Whether to spread each session's renewal across the period instead of
-/// renewing every session in one pass (`P2_LOAD_HEARTBEAT_PHASED=1`).
+/// renewing every session in one pass. **Phased is the default**;
+/// `P2_LOAD_HEARTBEAT_PHASED=0` opts back out to the single-pass burst.
 ///
 /// Bulk flushes are already phased per session (`session_flush_phase`); the
-/// heartbeat is not, and that asymmetry is the whole of the burst. A real
-/// deployment's clients are not phase-aligned to each other, so a synchronized
-/// renewal is a property of this load generator rather than of the workload it
-/// stands for -- which is exactly why it has to be switchable rather than
-/// argued about.
+/// heartbeat was not, and that asymmetry is the whole of the burst
+/// docs/08-persistence.md §2.2.1 diagnoses. The default moved on 2026-08-19
+/// by a decision recorded in docs/08-persistence.md §2.2.2, and the decision
+/// is about the *workload*, not about the measurement: a real player
+/// population is diffuse in phase space, so the load this rig stands for is
+/// diffuse too. A synchronized renewal pass is a thundering herd, and the
+/// project has deliberately placed herds with admission control (a login
+/// queue -- docs/11-roadmap.md) rather than shaping the persistence path
+/// around them. Measuring against a rig that manufactures one would be
+/// optimizing for a corner case that has an owner elsewhere.
+///
+/// The unphased pass stays reachable, and that is not politeness: §2.2.1's
+/// diagnosis is a claim about the unphased configuration, and a diagnosis
+/// that can no longer be reproduced is a story. `P2_LOAD_HEARTBEAT_PHASED=0`
+/// is how it is reproduced.
+///
+/// Any value other than `0` -- including an unset variable and the historical
+/// `=1` -- is phased, so every command line written before the flip still
+/// selects what it selected then.
 fn heartbeat_phased() -> bool {
-    std::env::var("P2_LOAD_HEARTBEAT_PHASED").is_ok_and(|v| v == "1")
+    heartbeat_phased_from(std::env::var("P2_LOAD_HEARTBEAT_PHASED").ok().as_deref())
+}
+
+/// The flag's decision, split out from the environment read so the default is
+/// covered by a test rather than by a comment. The default is the whole of
+/// this change; a silent revert to the burst would otherwise only be visible
+/// as a re-baselined number nobody could explain.
+fn heartbeat_phased_from(raw: Option<&str>) -> bool {
+    raw != Some("0")
 }
 
 fn main() -> ExitCode {
@@ -1961,10 +1984,11 @@ impl Rig<'_> {
             .collect::<Vec<_>>();
         let heartbeat_period = lease_heartbeat_period();
         let phased = heartbeat_phased();
-        // Phased: session `i` renews at `i/sessions` of the way through the
-        // period, so the same renewals reach the gateway spread evenly instead
-        // of all at once. Unphased (the default, and what every published
-        // number was measured on): one pass over every session.
+        // Phased (the default since 2026-08-19): session `i` renews at
+        // `i/sessions` of the way through the period, so the same renewals
+        // reach the gateway spread evenly instead of all at once. Unphased
+        // (`P2_LOAD_HEARTBEAT_PHASED=0`, and what every P2 number published
+        // before that date was measured on): one pass over every session.
         let mut next_session_heartbeat: Vec<Instant> = (0..sessions)
             .map(|session| {
                 if phased {
@@ -2831,6 +2855,20 @@ mod tests {
 
         assert_eq!(global, vec![1_000; slots]);
         assert!(per_session.iter().all(|counts| counts == &vec![8; slots]));
+    }
+
+    #[test]
+    fn heartbeat_is_phased_unless_explicitly_opted_out() {
+        // The default moved on 2026-08-19 (docs/08-persistence.md §2.2.2):
+        // absent is phased, and so is the historical `=1` that used to be the
+        // only way to get it.
+        assert!(heartbeat_phased_from(None));
+        assert!(heartbeat_phased_from(Some("1")));
+        // Exactly one spelling reproduces §2.2.1's unphased burst.
+        assert!(!heartbeat_phased_from(Some("0")));
+        // And nothing else does: a typo must not silently restore the herd.
+        assert!(heartbeat_phased_from(Some("false")));
+        assert!(heartbeat_phased_from(Some("")));
     }
 
     #[test]
