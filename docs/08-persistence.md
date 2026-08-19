@@ -1230,12 +1230,17 @@ comes from a different experiment — the full `scripts/p2-kill9-gate.sh`, not
 the capacity sweep — so `intent-tail-derive.py` cannot produce it, and its
 `--audit-doc` is scoped to §2.2.1 (the end marker moved here when this section
 was added; the span audited before is audited still). The same discipline
-applies with a different emitter: every number in this section is printed by
-`scripts/p2-baseline-report.py`, which reads
+applies with a different emitter: every **measured** number in this section is
+printed by `scripts/p2-baseline-report.py`, which reads
 `docs/data/p2-phase-baseline-2026-08-19.jsonl` — all 43 runs, one JSON object
-each, in the tree. The sweep's artifacts were ~10 GB and could not be
-versioned; this baseline's reduce to 75 KB, so unlike §2.2.1 this section is
-re-derivable from a clean checkout with no cluster at all.
+each, in the tree. What is *not* on that list is structure rather than
+measurement, and is named here so the distinction is not a loophole: the gate's
+own configuration (shards, entities, sessions, rate, duration), the D16 budgets,
+the lattice boundaries, and the size of the evidence file. The sweep's
+artifacts were ~10 GB and could not be versioned; this baseline's reduce to
+75 KB, so unlike §2.2.1 this section is re-derivable from a clean checkout with
+no cluster at all — `scripts/p2-baseline-report.py --self-test` holds the
+summaries to the shape the argument reads from.
 
 #### The new baseline: the full kill-9 gate, both arms, interleaved
 
