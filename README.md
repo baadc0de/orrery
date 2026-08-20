@@ -30,7 +30,7 @@ Design is complete and accepted; implementation is active across P0–P4.
 |---|---|---|
 | **P0** | QUIC transport, NAT hole punching | Transport adapter vendored; NAT lab and dashboard tools present |
 | **P1** | Spatial model, replication, prediction | Gate holds — 32-peer swarm runs clean, impaired and witnessed |
-| **P2** | Persistence: cell actors, journal, FoundationDB | Durability proofs hold on every run. **Latency gate is red** — see below |
+| **P2** | Persistence: cell actors, journal, FoundationDB | Durability holds. Indexed `journal-raw` is **gate-green (5/5)**; the Fjall backend currently landed on `main` remains red — see below |
 | **P3** | Per-entity authority and handoff | Gate holds — 8 peers, 400 entities, `kill -9`, every entity reassigned or parked inside the lease TTL |
 | **P4** | Verifiable core, witnessing | Built; witnessing runs in **shadow mode**. Enforcement is off until the false-positive rate is measured (D17 R-6) |
 | **P5–P6** | Intents, attestation, enforcement | Not started |
@@ -39,32 +39,34 @@ Two crates named in the design are **not yet present**: `orrery_identity` and
 `orrery_field_host`. The `orrery` name and crate prefix are provisional and
 mechanically replaceable.
 
-### The P2 latency gate is red, and this is the honest version
+### P2 has a gate-green journal candidate; the landed backend is still red
 
 `scripts/p2-kill9-gate.sh` proves **durability** on every run — recovery
 verified against every pre-crash acknowledgement, zero leases lost, zero
 nacks, the zombie primary refused fenced admission, a bumped chain epoch
 refused rather than forked.
 
-It does **not** currently meet three of the four D16 latency targets:
+On 2026-08-20, five full-duration alternating pairs ran on a qualified
+`c4d-standard-32-lssd` local NVMe. The indexed `journal-raw` implementation
+passed the complete gate in **5/5** runs; the Fjall control passed **0/5**.
+All ten runs passed recovery verification.
 
-| D16 series | Target | Measured |
-|---|---|---|
-| `journal_commit_ms` p99 | < 2 ms | **fails** |
-| `bulk_ack_ms` p99 | < 5 ms | **fails** (consequence of the above) |
-| `intent_commit_ms` p99 | < 10 ms | mixed — passes on some hardware |
-| `area_first_page_ms` p99 | < 50 ms | passes |
+| backend | full-gate passes | `journal_commit_ms` p99 | commits > 2 ms | commits > 15 ms |
+|---|---:|---:|---:|---:|
+| Fjall | 0/5 | **40 ms** median [15, 75] | **3.856%** median | **1.580%** median |
+| indexed `journal-raw` | **5/5** | **1 ms** in every run | **0.009%** median | **0.000%** |
 
-The cause is understood and is not the storage device. It is fjall 3.1.9's
-write backpressure: `Batch::commit` calls `local_backpressure()`, which sleeps
-in 100 ms steps while sealed memtables queue. That stall reproduces on tmpfs,
-where no block device is involved, and does not reproduce in two other stores
-under the same write pattern. 92.5–96.1 % of journal commits already land at or
-below 0.5 ms; this is a tail problem.
+This proves a passing journal implementation exists; it does **not** make the
+current `main` backend green. `main` still builds the Fjall journal, and neither
+the indexed implementation nor a dependency/default-backend decision has
+landed. Until that happens, running the gate from `main` exercises the red arm.
 
-The full investigation — including the two conclusions it retracted along the
-way — is [docs/08-persistence.md](docs/08-persistence.md) §4.3–§4.8. Every
-number in it is re-derivable from committed data by a script with a self-test.
+The Fjall root cause is its 100 ms-step write backpressure, not the device. The
+full investigation is [docs/08-persistence.md](docs/08-persistence.md)
+§4.3–§4.8; the indexed implementation, paired gate measurement and versioned
+evidence are in
+[docs/spikes/journal-raw-waldb.md](docs/spikes/journal-raw-waldb.md) §9.
+Every number is re-derived from committed data by a script with a self-test.
 
 ---
 
@@ -93,8 +95,8 @@ These are the accepted design targets. They describe what the architecture is
 - **Witnessing instead of trust.** Invariant checks on every peer, witness-set
   re-execution of streamed input logs, deterministic replay adjudication of
   disputed windows, K=3-of-N≥5 co-signed persistence intents, decaying strikes.
-- **Persistence that doesn't make the game wait.** The D16 budgets in the table
-  above, with the journal as the event source for history and forensics.
+- **Persistence that doesn't make the game wait.** The D16 budgets enforced by
+  the P2 gate, with the journal as the event source for history and forensics.
 - **Scoped determinism.** A game-supplied `Ruleset` defines a verifiable core
   used for replay adjudication and offline catch-up — never as the live sync
   model.

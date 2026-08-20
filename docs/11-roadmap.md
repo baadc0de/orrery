@@ -95,8 +95,26 @@ The harness runs the shipping plugins; only the socket is stood in for, by an in
 
 **Demo criterion.** With 10k entities across 100+ cells under synthetic load: `kill -9` the entire cluster, restart it, and the world resumes — zero acked intents lost (RPO 0), bulk loss bounded by the journal/replication window, clients (netsplit posture, D12) having queued intents and continued simulating. Measured against D16 targets in-region: journal commit < 2 ms server-internal, client-observed bulk ack p99 < 5 ms, intent commit p99 < 10 ms, area first page-in < 50 ms.
 
-**Where the demo criterion stands, re-measured on the phased rig (2026-08-19).**
-`p2-load` now phases each session's lease renewal across the period by default
+**Where the demo criterion stands — candidate green, landed default red
+(2026-08-20).** The indexed `journal-raw` implementation cleared the complete
+full-duration kill-9 gate in **5 of 5** runs on the same qualified
+`c4d-standard-32-lssd` local-NVMe shape used for the paired Fjall control;
+Fjall cleared **0 of 5**. `journal_commit_ms` p99 was 1 ms in every indexed
+run, and `bulk_ack_ms`, `intent_commit_ms` and `area_first_page_ms` all stayed
+inside their D16 budgets. All ten runs passed recovery verification, with
+540,640–541,256 durable acknowledgements per run, zero leases lost, zero diff
+nacks and zero duplicate durable acknowledgements.
+
+That establishes a gate-green implementation of the P2 criterion. It is not an
+unqualified pass for the current tree: `main` still builds the Fjall journal,
+and neither the indexed implementation nor the D11/D14 dependency and
+default-backend decision has landed. The precise state is therefore **indexed
+candidate green; landed default red**. The paired evidence and its
+mutation-checked report are in
+[spikes/journal-raw-waldb.md](spikes/journal-raw-waldb.md) §9.
+
+**Historical Fjall baseline, re-measured on the phased rig (2026-08-19).**
+`p2-load` phases each session's lease renewal across the period by default
 ([08-persistence.md](08-persistence.md) §2.2.2), so every P2 latency figure
 published before this date describes a configuration the rig no longer runs.
 Re-baselined over **43 full kill-9 gate runs** — 28 phased, 15 unphased,
@@ -106,8 +124,9 @@ interleaved run by run, spanning both of this box's fsync regimes:
 **one root cause in every run** — `journal_commit_ms`, the device's fsync
 ([08-persistence.md](08-persistence.md) §4.3). The criterion's durability half
 is met on every run: recovery verification true, durable acknowledgements in
-family, zero leases lost, the zombie primary fenced. **P2 does not pass**, and
-the honest statement of what phasing bought is not a pass but an attribution:
+family, zero leases lost, the zombie primary fenced. **P2 did not pass in this
+Fjall baseline**, and the honest statement of what phasing bought is not a pass
+but an attribution:
 `intent_commit_ms` p99 went from 150–200 ms (n=15, flat across a tenfold change
 in device cost) to 15–150 ms tracking `journal_commit_ms` within 0.67–1.50×
 (n=28). Full per-run numbers, both arms and both regimes, in §2.2.2.
@@ -116,15 +135,16 @@ in device cost) to 15–150 ms tracking `journal_commit_ms` within 0.67–1.50×
 (2026-08-19).** The same gate, unmodified, ran 16 more times on a
 power-loss-protected datacenter NVMe whose bare `fdatasync` p99 is 0.089–0.095
 ms against this box's 3.2–5.5 ms, eight runs per FoundationDB storage engine
-([08-persistence.md](08-persistence.md) §4.4). **P2 still does not pass**, and
-`journal_commit_ms` p99 still reads 15 ms in 11 of 16 runs. What a 40× better
+([08-persistence.md](08-persistence.md) §4.4). **P2 still did not pass in that
+Fjall experiment**, and `journal_commit_ms` p99 still reads 15 ms in 11 of 16
+runs. What a 40× better
 barrier bought is the body of the distribution — p50 1.00 → 0.50 ms, 96.19 % of
 durable acks now inside the 2 ms budget — and `intent_commit_ms`, which passes
 in 8 of 16 there against 0 of 43 here. The gated tail is set by two or three
 stalls of 90–175 ms per run that the device is measurably incapable of
-producing, and that co-located buffered writeback reproduces. So the P2 verdict
-is unchanged and its attribution is not: **the remaining work is not a hardware
-purchase.**
+producing, and that co-located buffered writeback reproduces. At that point the
+P2 verdict was unchanged and its attribution was not: **the remaining work was
+not a hardware purchase.**
 
 **The bulk-ack tail is the gateway's own inbound queue, and it is now measured
 (2026-08-18).** The P2 report had a hole in it: `client_bulk_wire_ms` p99 read
