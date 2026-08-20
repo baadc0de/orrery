@@ -18,9 +18,27 @@
 //!    increment. `PersistId`s are drawn from durable, process-local block
 //!    grants. Reserving a block serializes on `pid/next` only once per block;
 //!    individual intent transactions never read that hot key.
+//!
+//!    **Every read happens before every write**, across the whole intent and
+//!    not merely within one op: [`plan_ops`] reads and checks all the ops,
+//!    then [`apply_plan`] writes. Two reasons, and the second is a
+//!    correctness bug rather than a style preference. It is §7's order; and
+//!    `db.run` commits whatever the closure staged, so an executor that wrote
+//!    as it went and returned early on the third op's refusal would commit the
+//!    first two ops' effects along with the refusal.
 //! 3. **The outcome row.** The `IntentOutcome` is written to
 //!    `intent/{intent_id}` in the same transaction, so the ack the gateway
 //!    sends after `db.run` resolves implies a durable commit (RPO 0).
+//!
+//! **The anti-dupe invariant.** [`LEDGER_ITEM_TRANSFER_OP`] is the op that
+//! makes any of this matter. It reads `ledger/item/{item_uid}` before writing
+//! it, and *that read* is what registers the conflict range two concurrent
+//! transfers of the same item share: at most one of them can commit, and the
+//! loser's `db.run` retry re-reads the winner's owner and refuses with
+//! `REASON_NOT_ITEM_OWNER` — §7's "fails the check honestly". A durable
+//! refusal returns before [`apply_plan`] runs, so it writes nothing at all,
+//! not even an `intent/` row: a rejected intent is not a durable fact and a
+//! later resubmission must be free to succeed if the ledger has moved.
 //!
 //! **The ownership fence** sits between steps 0 and 1 when the executor
 //! carries one ([`IntentFence`]): every shard the node activated is re-read in
@@ -50,7 +68,10 @@ use crate::keyspace;
 use crate::FdbContext;
 
 use super::stages;
-use super::{IntentError, IntentExecutor};
+use super::{
+    IntentError, IntentExecutor, IntentPlan, ItemTransferArgs, OpsVerdict, PlannedWrite,
+    LEDGER_CREDIT_OP, LEDGER_ITEM_TRANSFER_OP,
+};
 
 /// The retry bound on `not_committed` conflicts (docs/08-persistence.md §7:
 /// "after 5 conflict retries … the gateway returns a definitive refusal").
@@ -473,8 +494,26 @@ impl IntentExecutor for FdbIntentExecutor {
                     // grant. The harness mints one id per op; a linked
                     // Ruleset names the real allocation.
 
-                    // Step 3: apply the ops' ledger effects (see `apply_ops`).
-                    apply_ops(&trx, &intent)?;
+                    // Steps 1-2 continued: read every durable row the ops
+                    // name and check them, staging the writes but applying
+                    // none of them. This is where the item row's conflict
+                    // range registers.
+                    let plan = match plan_ops(&trx, &intent).await? {
+                        PlanOutcome::Rejected(reason) => {
+                            // A durable invariant refused this intent. Nothing
+                            // has been staged and nothing is written — not the
+                            // effects, and deliberately not the `intent/` row
+                            // either. The transaction commits empty, which is
+                            // free, and the refusal travels back as an
+                            // ordinary outcome rather than an executor error.
+                            hooks.mark_closure_end();
+                            return Ok(IntentOutcome::Rejected { reason });
+                        }
+                        PlanOutcome::Planned(plan) => plan,
+                    };
+
+                    // Step 3: apply the ops' ledger effects (see `apply_plan`).
+                    apply_plan(&trx, &plan, &intent)?;
 
                     // Step 4 (§7 step 3): the outcome row, same transaction.
                     let outcome = IntentOutcome::Committed { tick, minted };
@@ -664,35 +703,170 @@ fn pid_overflow_error() -> FdbBindingError {
     )))
 }
 
-/// Apply the harness default op semantics.
+/// What [`plan_ops`] decided.
+enum PlanOutcome {
+    /// Every op's durable checks passed; these are the writes they earned.
+    Planned(IntentPlan),
+    /// A durable invariant refused the intent, with the wire reason code.
+    Rejected(u16),
+}
+
+/// Read and check every op the cluster interprets, staging the writes.
 ///
-/// Op id 0 is the ledger credit the tests use: `args` is
-/// `account u64 LE ‖ asset u64 LE ‖ delta i64 LE` (24 bytes), applied as a
-/// little-endian `MutationType::Add` on `ledger/bal/{account}/{asset}` — the
-/// credit side of §7's worked trade, blind-incremented. Every other op id is
-/// `Ruleset`-opaque and a no-op here by design (docs/08-persistence.md §2.2:
-/// the wire type only carries the op id and its encoded arguments).
-fn apply_ops(trx: &foundationdb::Transaction, intent: &Intent) -> Result<(), FdbBindingError> {
+/// This is §7 steps 1 and 2 for the whole intent. Two op ids are interpreted
+/// and every other is `Ruleset`-opaque and a no-op by design
+/// (docs/08-persistence.md §2.2: the wire type only carries the op id and its
+/// encoded arguments):
+///
+/// - [`LEDGER_CREDIT_OP`] — `account ‖ asset ‖ delta` (24 bytes), a blind
+///   little-endian `MutationType::Add` on `ledger/bal/{account}/{asset}`. It
+///   reads nothing, and that is exactly why it cannot be double-spent *or*
+///   prevented from minting value from nothing.
+/// - [`LEDGER_ITEM_TRANSFER_OP`] — the §7 trade. Reads
+///   `ledger/item/{item_uid}` and the buyer's balance, checks owner and
+///   sufficiency, and stages the ownership move plus both balance adds.
+///
+/// **The reads are the point.** `trx.get` inside a serializable transaction
+/// registers the key's read conflict range, so any concurrent commit that
+/// writes `ledger/item/{item_uid}` between this transaction's read version and
+/// its commit aborts it with `not_committed`. `db.run` then re-runs the whole
+/// closure, the item row is read again, and the check refuses honestly against
+/// the new owner. Two commits over one item row cannot both happen — which is
+/// D11's anti-duplication mechanism, stated as one `get`.
+async fn plan_ops(
+    trx: &foundationdb::Transaction,
+    intent: &Intent,
+) -> Result<PlanOutcome, FdbBindingError> {
+    let mut plan = IntentPlan::default();
     for op in &intent.ops {
-        if op.op != 0 {
-            continue;
+        let verdict = match op.op {
+            LEDGER_CREDIT_OP => {
+                if op.args.len() != 24 {
+                    OpsVerdict::Rejected(orrery_protocol::REASON_MALFORMED_OP)
+                } else {
+                    let field = |i: usize| {
+                        u64::from_le_bytes(op.args[i..i + 8].try_into().expect("slice len"))
+                    };
+                    let account = AccountId::new(field(0));
+                    let asset = AssetId::new(field(8));
+                    let delta = i64::from_le_bytes(op.args[16..24].try_into().expect("slice len"));
+                    // Deliberately *not* read: a blind `Add` has no read
+                    // conflict range, which is what keeps independent credits
+                    // from serializing on each other. The plan's view of this
+                    // balance stays unseeded, so a later op in the same intent
+                    // that needs the value reads it then.
+                    plan.credit(account, asset, delta);
+                    OpsVerdict::Applied
+                }
+            }
+            LEDGER_ITEM_TRANSFER_OP => match ItemTransferArgs::decode(&op.args) {
+                Err(_) => OpsVerdict::Rejected(orrery_protocol::REASON_MALFORMED_OP),
+                Ok(transfer) => {
+                    if !plan.has_item(transfer.item) {
+                        let row = read_item_row(trx, transfer.item).await?;
+                        plan.load_item(transfer.item, row);
+                    }
+                    if !plan.has_balance(transfer.buyer, transfer.asset) {
+                        let value = read_balance(trx, transfer.buyer, transfer.asset).await?;
+                        plan.load_balance(transfer.buyer, transfer.asset, value);
+                    }
+                    plan.transfer(&transfer)
+                }
+            },
+            _ => OpsVerdict::Applied,
+        };
+        if let OpsVerdict::Rejected(reason) = verdict {
+            return Ok(PlanOutcome::Rejected(reason));
         }
-        if op.args.len() != 24 {
-            return Err(FdbBindingError::new_custom_error(Box::new(
-                IntentError::Store(format!(
-                    "op 0 args must be 24 bytes (account‖asset‖delta), got {}",
-                    op.args.len()
-                )),
-            )));
+    }
+    Ok(PlanOutcome::Planned(plan))
+}
+
+/// Apply a checked plan's writes, then bank the trade receipt.
+///
+/// Called only after [`plan_ops`] has accepted every op, so nothing here can
+/// fail a durable check — which is the property that makes an early return
+/// impossible past this line, and therefore makes a partially applied intent
+/// impossible too.
+fn apply_plan(
+    trx: &foundationdb::Transaction,
+    plan: &IntentPlan,
+    intent: &Intent,
+) -> Result<(), FdbBindingError> {
+    for write in plan.writes() {
+        match write {
+            PlannedWrite::BalanceAdd {
+                account,
+                asset,
+                delta,
+            } => {
+                let key = keyspace::ledger_bal_key(*account, *asset);
+                // 16-byte little-endian delta so `Add` extends/keeps the i128
+                // width. Sign-extended, not zero-padded: a debit is a negative
+                // delta and `Add` is two's-complement, so the high bytes must
+                // carry the sign or `-500` would arrive as a very large
+                // positive number.
+                let param = i128::from(*delta).to_le_bytes();
+                trx.atomic_op(&key, &param, MutationType::Add);
+            }
+            PlannedWrite::ItemOwner { item, row } => {
+                let key = keyspace::ledger_item_key(*item);
+                let encoded = postcard::to_stdvec(row).map_err(store_err("item row encode"))?;
+                trx.set(&key, &encoded);
+            }
         }
-        let account = u64::from_le_bytes(op.args[0..8].try_into().expect("slice len"));
-        let asset = u64::from_le_bytes(op.args[8..16].try_into().expect("slice len"));
-        let delta = i64::from_le_bytes(op.args[16..24].try_into().expect("slice len"));
-        let key = keyspace::ledger_bal_key(AccountId::new(account), AssetId::new(asset));
-        // 16-byte little-endian delta so `Add` extends/keeps the i128 width.
-        let mut param = [0u8; 16];
-        param[..8].copy_from_slice(&delta.to_le_bytes());
-        trx.atomic_op(&key, &param, MutationType::Add);
+    }
+    if let Some(receipt) = plan.receipt(intent) {
+        // `ledger/receipt/{versionstamp}`: the key's 10-byte placeholder is
+        // replaced with this transaction's commit versionstamp, so the audit
+        // trail is ordered by commit order itself and needs no clock. One per
+        // intent — every versionstamped write in a transaction gets the same
+        // 10 bytes, so a second would be the same key written twice.
+        let key = keyspace::ledger_receipt_versionstamped_key();
+        let encoded = postcard::to_stdvec(&receipt).map_err(store_err("receipt row encode"))?;
+        trx.atomic_op(&key, &encoded, MutationType::SetVersionstampedKey);
     }
     Ok(())
+}
+
+/// Read and decode `ledger/item/{item}` inside `trx`.
+///
+/// **The read that makes the anti-dupe invariant work.** It registers the
+/// row's serializable read conflict range; everything else about the transfer
+/// is bookkeeping around it.
+async fn read_item_row(
+    trx: &foundationdb::Transaction,
+    item: orrery_protocol::ItemUid,
+) -> Result<Option<keyspace::ItemRow>, FdbBindingError> {
+    let key = keyspace::ledger_item_key(item);
+    let Some(value) = trx.get(&key, false).await? else {
+        return Ok(None);
+    };
+    let row: keyspace::ItemRow =
+        postcard::from_bytes(&value).map_err(store_err("item row decode"))?;
+    Ok(Some(row))
+}
+
+/// Read `ledger/bal/{account}/{asset}` inside `trx`, as the little-endian
+/// integer `MutationType::Add` maintains it. An absent row is zero.
+///
+/// Values are written as 16-byte little-endian `i128`s by [`apply_plan`], and
+/// FDB's `Add` zero-extends a shorter stored value to the parameter's width,
+/// so a row this cluster wrote is always 16 bytes. A shorter one — a row from
+/// an older writer, or a seeded fixture — is zero-extended here to match what
+/// `Add` would do to it, which keeps the value this read sees and the value a
+/// subsequent `Add` produces in agreement.
+async fn read_balance(
+    trx: &foundationdb::Transaction,
+    account: AccountId,
+    asset: AssetId,
+) -> Result<i128, FdbBindingError> {
+    let key = keyspace::ledger_bal_key(account, asset);
+    let Some(value) = trx.get(&key, false).await? else {
+        return Ok(0);
+    };
+    let mut buf = [0u8; 16];
+    let n = value.len().min(16);
+    buf[..n].copy_from_slice(&value[..n]);
+    Ok(i128::from_le_bytes(buf))
 }

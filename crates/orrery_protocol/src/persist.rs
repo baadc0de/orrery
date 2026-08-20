@@ -389,13 +389,43 @@ pub const REASON_CONTENTION_EXHAUSTED: u16 = 5;
 /// The executor failed for a non-conflict reason (store unavailable, …).
 pub const REASON_EXECUTOR_ERROR: u16 = 6;
 
+// The durable-invariant refusals of the item-ownership transfer
+// (docs/08-persistence.md §7's `Reject::NoSuchItem` / `Reject::NotOwner` /
+// `Reject::Insufficient`). They are **not** `REASON_EXECUTOR_ERROR`, and that
+// is the whole reason they exist: a trade refused because the item moved a
+// millisecond earlier is an ordinary, correct answer, while an executor error
+// is a server fault. Collapsing the two makes a working anti-dupe invariant
+// indistinguishable from a broken cluster on the operator's dashboard, and
+// makes the dupe gauntlet (P5) unable to tell a refused double-spend from a
+// crashed one. Each cause therefore gets its own code, in the same spirit as
+// [`crate::DenyReason::WrongOwner`] on the authority path.
+
+/// `ledger/item/{item_uid}` has no row: the item does not exist.
+pub const REASON_NO_SUCH_ITEM: u16 = 7;
+/// The durable `ledger/item/{item_uid}` row names a different owner than the
+/// transfer's divesting party. **This is also what a lost double-spend race
+/// looks like**: the loser's retry re-reads the row, sees the winner's owner,
+/// and fails its check honestly (docs/08-persistence.md §7).
+pub const REASON_NOT_ITEM_OWNER: u16 = 8;
+/// The debited party's `ledger/bal/{account}/{asset}` row does not cover the
+/// transfer's price.
+pub const REASON_INSUFFICIENT_BALANCE: u16 = 9;
+/// The transfer names one account as both parties. A self-transfer is not a
+/// trade: it would write an ownership row that already holds that value and
+/// bank a receipt for an event that did not happen.
+pub const REASON_ITEM_TRANSFER_TO_SELF: u16 = 10;
+/// An op this cluster's own executor interprets carried `args` it could not
+/// decode. A bad request, not a server fault — which is why it is a rejection
+/// reason rather than [`REASON_EXECUTOR_ERROR`].
+pub const REASON_MALFORMED_OP: u16 = 11;
+
 /// [`GatewayReply::ReportVerdict`] reason: the report was adjudicated, and the
 /// reply's `verdict` carries the answer.
 ///
 /// # Why this is its own numbering rather than more `REASON_*`
 ///
 /// The `REASON_*` codes above are `IntentOutcome::Rejected` reasons: they
-/// answer "why was this durable write refused", and the space below `7` is
+/// answer "why was this durable write refused", and the space below `12` is
 /// partly a `Ruleset`'s to extend. A refused *report* is a different question
 /// on a different message, so it gets its own space rather than borrowing
 /// numbers whose meaning a game may redefine. The two never appear in the same

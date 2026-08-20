@@ -53,10 +53,18 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # 2026-08-20, after the live shard handover (issue #119, D26 rule 3) added 11:
 # `shard_handover_fdb` (1, and the only one that needs the cluster),
 # `shard_handover` (5), `shard_handover_gateway` (2) and three fence unit
-# tests. The floor rises by those 11 — 320 -> 331 — because a floor that never
+# tests. The floor rose by those 11 — 320 -> 331 — because a floor that never
 # moves stops being a tripwire and becomes a number: every test added widens
 # the gap the tier can go dark inside without tripping it.
-FLOOR="${ORRERY_FDB_TEST_FLOOR:-331}"
+#
+# A full run measured 527 executed tests on 2026-08-21, after the item
+# ownership transfer (issue #145, D11 §7) added 14: five in `intent_commit`
+# that need the cluster — the trade itself, the four named durable refusals,
+# the replay, the two-transfer race and the conflicting-key assertion — and
+# nine `orrery_persistd` unit tests covering the op's args layout, its
+# admission arms and the `MemIntentExecutor` half of the same contract. The
+# floor rises by those 14: 331 -> 345.
+FLOOR="${ORRERY_FDB_TEST_FLOOR:-345}"
 
 # Every test file whose contents only mean anything against a real cluster. If
 # one of these reports no executed tests, the tier is dark again whatever the
@@ -188,7 +196,7 @@ self_test() {
     fi
   }
 
-  # 8 targets × 32 + 120 unit tests = 376, over the 331 floor.
+  # 8 targets × 32 + 120 unit tests = 376, over the 345 floor.
   fixture="$tmp/good.log";    emit_log "$fixture" none 32;            expect "a real run passes" pass "$fixture"
   # The same log with `CARGO_TERM_COLOR=always` escapes through it.
   sed -e 's/^     Running/     \x1b[1;32mRunning\x1b[0m/' \
