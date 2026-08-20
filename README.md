@@ -1,25 +1,152 @@
+<p align="center">
+  <img src="docs/assets/orrery-cover.png" alt="Orrery — a persistent-universe toolkit for Bevy" width="100%">
+</p>
+
 # Orrery
 
-Orrery is an in-development Rust workspace and architecture for the [Bevy](https://bevy.org) game engine (0.19), providing peer-to-peer multiplayer and a persistent-universe backend: QUIC transport with NAT hole punching via [iroh](https://github.com/n0-computer/iroh), per-entity authority with client-side prediction and rollback/reapply, witness-validated trust in an untrusted peer mesh, and a horizontally scalable, low-latency clustered persistence tier (in-memory cell actors and an append-only journal in front of FoundationDB). It targets very large universes with strong spatial locality — 32–128 players per area, 60 Hz fast action — and it is a framework, not a game: games supply a `Ruleset`, and every tunable is a configurable parameter with a stated default.
+An in-development Rust workspace and architecture for the [Bevy](https://bevy.org)
+game engine (0.19): peer-to-peer multiplayer and a persistent-universe backend.
 
-Normative source: the [ADR index](docs/DECISIONS.md) and the 17 [accepted ADRs](docs/adr/) (the applicable ADRs are normative over this README and every numbered doc).
+It targets very large universes with strong spatial locality — 32–128 players
+per area, 60 Hz fast action — and it is a framework, not a game. Games supply a
+`Ruleset`; every tunable is a configurable parameter with a stated default.
 
-## Status
+> **The cover art is aspirational; this README is not.** Where the two
+> disagree, believe the tables below. The architecture is decided and much of
+> it is built, but several headline properties are *targets that are currently
+> missed*, and they are named as such.
 
-**Design + active P0–P4 implementation.** The accepted architecture decisions and their expansion documents remain normative. The workspace contains the vendored iroh/aeronet transport adapter and P0 test/dashboard tools; `orrery_protocol`, `orrery_net`, `orrery_spatial`, `orrery_coordinator`, and `orrery_predict` for the P1 foundation; `orrery_persist_client`, `orrery_persistd`, and `orrery_seed` for P2; `orrery_authority` for P3; `orrery_core`, `orrery_witness`, `orrery_games` and `orrery_conformance` for P4; and the `orrery` client facade on top of them. P4 is landed as construction and open as *measurement*: witnessing runs in shadow mode until the false-positive rate is measured (D17 risk 3). Landed persistence work includes single-writer cell actors, adaptive group-commit journals on a dedicated OS thread, fencing and hotspot splits, checkpoint/restore and cold area reads, the iroh gateway, FDB-backed checkpoints and serializable intent execution, the TOML world seeder, and a static two-process `persistd` chain topology: a write-serving primary asynchronously mirrors its journal to a passive gRPC follower with durable chain identity, restart reconstruction, and dedupe. Standalone `p2-load` and `p2-dashboard` tools exercise and gate the latency series. The permanent two-process crash/recovery regression harness (`scripts/p2-kill9-gate.sh`) proves recovery with post-restart acknowledged-state verification, zombie primary fencing, and meets all D16 acceptance latency targets (`journal_commit_ms < 2ms`, `bulk_ack_ms < 5ms`, `intent_commit_ms < 10ms`, `area_first_page_ms < 50ms`).
+**Normative source:** the [ADR index](docs/DECISIONS.md) and the 17
+[accepted ADRs](docs/adr/). The applicable ADRs govern this README and every
+numbered document.
 
-The implemented P3 authority slice adds `orrery_authority`, signed and transport-bound gateway admission, actor-owned durable lease rows, strict fenced bulk uplinks, NodeId-scoped session and claim controls, lease-loss revocation in `orrery_persist_client`, and server-owned durable rekeying. On top of that, authority now **moves** rather than only parking: a lost lease — whether the holder's session dropped or its TTL lapsed — is offered to a successor chosen among peers with a live session and live coordinator interest covering the entity's cell, granted through the ordinary serialized claim path, and pushed to that peer over a registrar→peer control lane; the losing holder is told where authority went. Holder-initiated negotiated divestiture (`Divest{to, final_seq, cursor}`) is implemented with an enforced uplink-completeness gate, and an always-on single-writer invariant checker counts any fenced-out write that overlapped a different live holder. The `orrery-coordinator` service turns authenticated presence into island manifests and signed interest grants, which peers carry to gateways, so redistribution is operable outside tests; both directions of cooperative handoff are implemented, including the registrar asking a holder to divest on a claimant's behalf. **The P3 demo criterion runs and holds**: `scripts/p3-island-gate.sh` forms an 8-peer island of 400 entities, `kill -9`s a peer holding 50, and proves every one is reassigned or parked inside the lease TTL with no duplicate-authority observation and nothing lost. Weak authority also spreads by contact: `orrery_authority`'s contact propagator builds the per-tick contact graph, plans claim bursts against the peer's own interest coverage, backs off on denial, and propagates island membership for ephemeral bodies that have no persistent identity. Still future P3 work: coordinator-driven island drain, `Expire` fan-out to cell subscribers, redistribution across sibling gateways, and field-host promotion. `orrery_core` — the verifiable core (D9) — is present: the `Ruleset` contract, the fixed 60 Hz executor, seeded per-entity-per-tick randomness, the quantization lattice and tolerance-band comparator, the hash-chained tamper-evident input log, the stage-1 invariant checks every interested peer runs on received state, the authority-side retained log that can serve a disputed window, and a headless replay harness whose `verify_bundle` is a pure function of the evidence, so any holder of the same rules build reaches the same verdict without trusting whoever reported it. It is Bevy-free by construction and its determinism gates run in `scripts/core-gates.sh`, enforced on every commit by [`.github/workflows/ci.yml`](.github/workflows/ci.yml) — which also runs P4's cross-platform determinism matrix: `orrery_conformance` replays a fixed corpus through a reference ruleset on x86_64 Linux/Windows and aarch64 Linux/macOS, and a verdict job requires every platform's per-tick state hashes to agree bit-for-bit. `orrery_witness` is present and consumes those logs: it is a non-dev dependency of both the client facade and `orrery_persistd`, and it folds received log frames, verifies claim chains, re-executes a subject's signed input log against that subject's own committed state through the core's `ReplayHarness`, and assembles a disputed window into a self-verifying `DiscrepancyReport` that `orrery_persistd`'s adjudicator re-runs rather than believes. Its engine is Bevy-free, so the cluster, a headless bot harness and a game client run one implementation; a `bevy` feature adds the thin plugin adapter. Enforcement is deliberately off: `WitnessConfig::shadow_mode` defaults to `true`, because P4 exists to measure the false-positive rate before anything can strike. `orrery_games` supplies the reference rulesets that rate is measured over — the `skirmish` game, the tamper modes a modified client would use, and golden chains checked on all four determinism targets — and the nightly gates run the 32-peer swarm clean, impaired and witnessed. The identity-service and field-host crates are not yet present. The `orrery` facade crate composes the client side: `OrreryClientPlugins<R: Ruleset>` is a Bevy `PluginGroup` adding net → spatial → authority → island binding → predict → witness → persist_client in dependency order, with `OrreryConfig` aggregating the per-plugin configs. See [docs/11-roadmap.md](docs/11-roadmap.md) for the phase gates. The `orrery` name and crate prefix are provisional and mechanically replaceable; pinned dependency versions ([D14](docs/adr/0014-pinned-versions.md)) reflect the ecosystem as of August 2026 and are re-validated as implementation reaches each dependency.
+---
 
-## Features (as designed)
+## Status at a glance
 
-- **P2P QUIC with hole punching.** One iroh connection per peer pair carries unreliable datagrams (state replication) and reliable streams (control, bulk transfer) with no head-of-line blocking between them; ~90% of pairs connect directly, the rest ride a self-hosted relay fleet that doubles as the punch rendezvous.
-- **Per-entity authority, never a player host.** Exactly one authority per replicated entity; weak authority spreads by interaction, strong ownership by explicit grab, both arbitrated by cluster-side TTL leases (10 s TTL, 2.5 s heartbeat). No elected-host topology and no host migration — ever.
-- **Prediction and rollback, lightyear-configured.** 60 Hz fixed tick, 20 Hz send rate, rollback window ≤ 9 ticks (150 ms), 100 ms interpolation buffer for remote entities, bounded hit rewind ≤ 200 ms.
-- **Population-adaptive islands.** Full mesh ≤ 8 peers, Donnybrook-style interest mesh at 9–32 (24-entity high-rate set, 1–4 Hz proxies, ≤ 1 Mbps uplink), and coordinator-spawned headless field hosts above 32 sustained.
-- **One 64-bit `CellId`, three jobs.** A Morton-encoded hierarchical grid cell (default edge 128 m, aligned with `big_space`) is simultaneously the replication interest group (27-cell AOI), the storage shard-key prefix, and the authority/handoff unit.
-- **Witnessing instead of trust.** Cheap invariant checks on every peer, continuous witness-set re-execution of streamed input logs, prediction error as a free discrepancy signal during interactions, deterministic replay adjudication of disputed windows, K=3-of-N≥5 co-signed persistence intents, and decaying strikes (14-day half-life).
-- **Persistence that doesn't make the game wait.** Bulk diffs journal-commit inside the cluster in < 2 ms (adaptive group commit) with client-observed acks < 5 ms p99 in-region; critical operations (trades, loot, progression) commit as serializable FoundationDB transactions in < 10 ms p99; the journal is the event source for history, forensics, and griefing rollback. Area load streams the 27-cell neighborhood with < 50 ms to first page-in.
-- **Scoped determinism.** A game-supplied `Ruleset` defines a verifiable core (fixed tick, seeded RNG, quantized state, headless-runnable step function) used for replay adjudication and offline catch-up — never as the live sync model.
+Design is complete and accepted; implementation is active across P0–P4.
+
+| Phase | Subject | Where it stands |
+|---|---|---|
+| **P0** | QUIC transport, NAT hole punching | Transport adapter vendored; NAT lab and dashboard tools present |
+| **P1** | Spatial model, replication, prediction | Gate holds — 32-peer swarm runs clean, impaired and witnessed |
+| **P2** | Persistence: cell actors, journal, FoundationDB | Durability proofs hold on every run. **Latency gate is red** — see below |
+| **P3** | Per-entity authority and handoff | Gate holds — 8 peers, 400 entities, `kill -9`, every entity reassigned or parked inside the lease TTL |
+| **P4** | Verifiable core, witnessing | Built; witnessing runs in **shadow mode**. Enforcement is off until the false-positive rate is measured (D17 R-6) |
+| **P5–P6** | Intents, attestation, enforcement | Not started |
+
+Two crates named in the design are **not yet present**: `orrery_identity` and
+`orrery_field_host`. The `orrery` name and crate prefix are provisional and
+mechanically replaceable.
+
+### The P2 latency gate is red, and this is the honest version
+
+`scripts/p2-kill9-gate.sh` proves **durability** on every run — recovery
+verified against every pre-crash acknowledgement, zero leases lost, zero
+nacks, the zombie primary refused fenced admission, a bumped chain epoch
+refused rather than forked.
+
+It does **not** currently meet three of the four D16 latency targets:
+
+| D16 series | Target | Measured |
+|---|---|---|
+| `journal_commit_ms` p99 | < 2 ms | **fails** |
+| `bulk_ack_ms` p99 | < 5 ms | **fails** (consequence of the above) |
+| `intent_commit_ms` p99 | < 10 ms | mixed — passes on some hardware |
+| `area_first_page_ms` p99 | < 50 ms | passes |
+
+The cause is understood and is not the storage device. It is fjall 3.1.9's
+write backpressure: `Batch::commit` calls `local_backpressure()`, which sleeps
+in 100 ms steps while sealed memtables queue. That stall reproduces on tmpfs,
+where no block device is involved, and does not reproduce in two other stores
+under the same write pattern. 92.5–96.1 % of journal commits already land at or
+below 0.5 ms; this is a tail problem.
+
+The full investigation — including the two conclusions it retracted along the
+way — is [docs/08-persistence.md](docs/08-persistence.md) §4.3–§4.8. Every
+number in it is re-derivable from committed data by a script with a self-test.
+
+---
+
+## Design goals
+
+These are the accepted design targets. They describe what the architecture is
+*for*, not a claim that each is met today — see the status table above.
+
+- **P2P QUIC with hole punching.** One iroh connection per peer pair carrying
+  unreliable datagrams (state replication) and reliable streams (control, bulk)
+  with no head-of-line blocking between them; the rest ride a relay fleet that
+  doubles as the punch rendezvous.
+- **Per-entity authority, never a player host.** Exactly one authority per
+  replicated entity; weak authority spreads by interaction, strong ownership by
+  explicit grab, both arbitrated by cluster-side TTL leases (10 s TTL, 2.5 s
+  heartbeat). No elected-host topology and no host migration.
+- **Prediction and rollback.** 60 Hz fixed tick, 20 Hz send rate, rollback
+  window ≤ 9 ticks (150 ms), 100 ms interpolation buffer, bounded hit rewind
+  ≤ 200 ms.
+- **Population-adaptive islands.** Full mesh ≤ 8 peers, interest mesh at 9–32,
+  coordinator-spawned headless field hosts above 32 sustained.
+- **One 64-bit `CellId`, three jobs.** A Morton-encoded hierarchical grid cell
+  (default edge 128 m, aligned with `big_space`) is simultaneously the
+  replication interest group (27-cell AOI), the storage shard-key prefix, and
+  the authority/handoff unit.
+- **Witnessing instead of trust.** Invariant checks on every peer, witness-set
+  re-execution of streamed input logs, deterministic replay adjudication of
+  disputed windows, K=3-of-N≥5 co-signed persistence intents, decaying strikes.
+- **Persistence that doesn't make the game wait.** The D16 budgets in the table
+  above, with the journal as the event source for history and forensics.
+- **Scoped determinism.** A game-supplied `Ruleset` defines a verifiable core
+  used for replay adjudication and offline catch-up — never as the live sync
+  model.
+
+---
+
+## What is built
+
+**Client stack.** The `orrery` facade composes `OrreryClientPlugins<R: Ruleset>`
+— a Bevy `PluginGroup` adding net → spatial → authority → island binding →
+predict → witness → persist_client in dependency order, with `OrreryConfig`
+aggregating the per-plugin configs.
+
+**Persistence (P2).** Single-writer cell actors, adaptive group-commit journals
+on a dedicated OS thread, fencing and hotspot splits, checkpoint/restore and
+cold area reads, the iroh gateway, FDB-backed checkpoints and serializable
+intent execution, a TOML world seeder, and a static two-process chain topology
+where a write-serving primary asynchronously mirrors its journal to a passive
+gRPC follower.
+
+**Authority (P3).** Signed, transport-bound gateway admission; actor-owned
+durable lease rows; strict fenced bulk uplinks; lease-loss revocation. Authority
+*moves* rather than only parking: a lost lease is offered to a successor with a
+live session and coordinator interest covering the entity's cell, granted
+through the ordinary serialized claim path. Holder-initiated negotiated
+divestiture is implemented, with an always-on single-writer invariant checker.
+Still future: coordinator-driven island drain, `Expire` fan-out, redistribution
+across sibling gateways, field-host promotion.
+
+**Verifiable core (P4).** The `Ruleset` contract, fixed 60 Hz executor, seeded
+per-entity-per-tick randomness, quantization lattice and tolerance-band
+comparator, hash-chained tamper-evident input log, and a headless replay
+harness whose `verify_bundle` is a pure function of the evidence. Bevy-free by
+construction. `orrery_conformance` replays a fixed corpus on x86_64
+Linux/Windows and aarch64 Linux/macOS, and a verdict job requires every
+platform's per-tick state hashes to agree bit-for-bit.
+
+**Witnessing (P4).** Folds received log frames, verifies claim chains,
+re-executes a subject's signed input log against that subject's own committed
+state, and assembles a disputed window into a self-verifying
+`DiscrepancyReport` that the adjudicator re-runs rather than believes.
+`shadow_mode` defaults to `true`.
+
+### Workspace
+
+14 crates under [`crates/`](crates/), plus nine standalone tools that each
+declare their own workspace — `p0-nat-lab`, `p0-nat-test`, `p0-dashboard`,
+`p1-swarm`, `p2-load`, `p2-dashboard`, `p2-journal-bench`, `p3-island`,
+`p4-streams-bench`. `./scripts/check.sh` runs CI's four lanes locally;
+`./scripts/gate-status.sh` reports where every gate stands.
+
+---
 
 ## Architecture at a glance
 
@@ -35,14 +162,14 @@ graph LR
 
     subgraph island["Island · one replication session"]
         peers["Peer mesh<br/>full ≤ 8 · interest 9–32"]
-        fieldhost["orrery_field_host<br/>promoted &gt; 32 sustained"]
+        fieldhost["orrery_field_host<br/>promoted &gt; 32 sustained<br/>(not yet implemented)"]
         peers <--> fieldhost
     end
 
     subgraph backend["Operated backend services"]
         relays["iroh-relay fleet<br/>punch rendezvous + fallback"]
         coord["orrery_coordinator<br/>islands · witness seeding · promotion"]
-        identity["orrery_identity<br/>accounts · strikes · bans"]
+        identity["orrery_identity<br/>(not yet implemented)"]
         subgraph persistd["orrery_persistd deployment"]
             gateway["Gateway<br/>intent validation · lease routing"]
             actors["Single-writer cell actors<br/>lease registrar"]
@@ -64,28 +191,50 @@ graph LR
     coord -->|"spawns"| fieldhost
 ```
 
+---
+
 ## Reading path
 
-| Order | Document | Covers |
+Start with the ADRs. They are normative; everything else expands on them.
+
+| # | Document | Covers |
 |---|---|---|
-| 1 | [docs/DECISIONS.md](docs/DECISIONS.md) and [docs/adr/](docs/adr/) | ADR index plus the 17 independent accepted decisions. Normative. |
-| 2 | [docs/00-overview.md](docs/00-overview.md) | Goals, constraints, system diagram, subsystem tour, glossary |
-| 3 | [docs/01-spatial-model.md](docs/01-spatial-model.md) | Grid, `CellId` encoding, `big_space` integration, AOI, hysteresis, hotspots |
-| 4 | [docs/02-networking.md](docs/02-networking.md) | iroh, relays, islands, topology regimes, channels, bandwidth budgets |
-| 5 | [docs/03-replication.md](docs/03-replication.md) | replicon/lightyear stack, interest sets, delta compression, priority |
-| 6 | [docs/04-authority.md](docs/04-authority.md) | Weak/strong claims, leases, handoff, orphans, promotion interplay |
-| 7 | [docs/05-prediction-rollback.md](docs/05-prediction-rollback.md) | Timelines, prediction sets, reconciliation, interpolation, hit validation |
-| 8 | [docs/06-verifiable-core.md](docs/06-verifiable-core.md) | `Ruleset`, determinism scoping, signed input logs, replay harness |
-| 9 | [docs/07-witnessing.md](docs/07-witnessing.md) | Threat model, discrepancy protocol, adjudication, strikes, accepted limits |
-| 10 | [docs/08-persistence.md](docs/08-persistence.md) | Cell actors, journal, FDB schema, intents, terrain, event archive |
-| 11 | [docs/09-services-and-ops.md](docs/09-services-and-ops.md) | Service inventory, deployment, scaling, failure modes, telemetry |
-| 12 | [docs/10-crates.md](docs/10-crates.md) | Workspace layout, per-crate API sketches, dependency graph |
-| 13 | [docs/11-roadmap.md](docs/11-roadmap.md) | Build phases, milestones, tracked risks |
-| 14 | [docs/12-world-seeding.md](docs/12-world-seeding.md) | World seeder: TOML scenario runner, generator bank, content diff/patch |
-| 15 | [docs/13-chain-replication.md](docs/13-chain-replication.md) | Cross-process journal mirroring, durable chain identity, ordered batches, reconnect and recovery |
-| 16 | [docs/14-capacity.md](docs/14-capacity.md) | Measured single-box capacity envelope, binding constraints, and outgrown-when thresholds |
-| 17 | [docs/references.md](docs/references.md) | Annotated bibliography, organized by topic |
+| 1 | [DECISIONS.md](docs/DECISIONS.md) + [adr/](docs/adr/) | ADR index and the 17 accepted decisions. **Normative** |
+| 2 | [00-overview.md](docs/00-overview.md) | Goals, constraints, system diagram, subsystem tour, glossary |
+| 3 | [01-spatial-model.md](docs/01-spatial-model.md) | Grid, `CellId`, `big_space`, AOI, hysteresis, hotspots |
+| 4 | [02-networking.md](docs/02-networking.md) | iroh, relays, islands, topology regimes, channels, budgets |
+| 5 | [03-replication.md](docs/03-replication.md) | replicon/lightyear stack, interest sets, delta compression |
+| 6 | [04-authority.md](docs/04-authority.md) | Weak/strong claims, leases, handoff, orphans, promotion |
+| 7 | [05-prediction-rollback.md](docs/05-prediction-rollback.md) | Timelines, reconciliation, interpolation, hit validation |
+| 8 | [06-verifiable-core.md](docs/06-verifiable-core.md) | `Ruleset`, determinism scoping, signed input logs, replay |
+| 9 | [07-witnessing.md](docs/07-witnessing.md) | Threat model, discrepancy protocol, adjudication, strikes |
+| 10 | [08-persistence.md](docs/08-persistence.md) | Cell actors, journal, FDB schema, intents, terrain, archive |
+| 11 | [09-services-and-ops.md](docs/09-services-and-ops.md) | Service inventory, deployment, scaling, failure modes |
+| 12 | [10-crates.md](docs/10-crates.md) | Workspace layout, per-crate API sketches, dependency graph |
+| 13 | [11-roadmap.md](docs/11-roadmap.md) | Build phases, milestones, tracked risks |
+| 14 | [12-world-seeding.md](docs/12-world-seeding.md) | TOML scenario runner, generator bank, content diff/patch |
+| 15 | [13-chain-replication.md](docs/13-chain-replication.md) | Journal mirroring, chain identity, reconnect, recovery |
+| 16 | [14-capacity.md](docs/14-capacity.md) | Measured single-box capacity envelope and what binds first |
+| 17 | [references.md](docs/references.md) | Annotated bibliography |
+
+Working documents that decide nothing live in [docs/spikes/](docs/spikes/);
+measurement evidence lives in [docs/data/](docs/data/).
+
+---
 
 ## Acknowledgments
 
-This design builds directly on — and intends to contribute back to — [lightyear](https://github.com/cBournhonesque/lightyear), [bevy_replicon](https://github.com/simgine/bevy_replicon), [aeronet](https://github.com/aecsocket/aeronet), [iroh](https://github.com/n0-computer/iroh), and [big_space](https://github.com/aevyrie/big_space). The novel parts of Orrery are the pieces nobody ships: the iroh IO layer, the authority-lease protocol, the witnessing layer, the spatial cell system, and the persistence tier.
+This design builds directly on — and intends to contribute back to —
+[lightyear](https://github.com/cBournhonesque/lightyear),
+[bevy_replicon](https://github.com/simgine/bevy_replicon),
+[aeronet](https://github.com/aecsocket/aeronet),
+[iroh](https://github.com/n0-computer/iroh) and
+[big_space](https://github.com/aevyrie/big_space).
+
+The parts specific to Orrery are the iroh IO layer, the authority-lease
+protocol, the witnessing layer, the spatial cell system, and the persistence
+tier.
+
+Pinned dependency versions ([D14](docs/adr/0014-pinned-versions.md)) reflect the
+ecosystem as of August 2026 and are re-validated as implementation reaches each
+dependency.
