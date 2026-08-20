@@ -31,7 +31,7 @@ structurally cannot evaluate that predicate. What it *does* hold is the
 coordinator interest handout: `InterestAuthority::allows(peer, grid, cell,
 now_ms)` (`crates/orrery_persistd/src/gateway.rs:596-603`), backed by
 `snapshot_for(peer)` — a **peer-keyed** map
-(`gateway.rs:626`, `HashMap<NodeId, CoordinatorInterestSnapshot>`). There is no
+(`gateway.rs:723`, `HashMap<NodeId, CoordinatorInterestSnapshot>`). There is no
 `peers_covering(cell)` and no reverse index of any kind. The only way a gateway
 answers "who covers this cell" is to iterate its own session registry and
 call `allows` per peer, which is exactly what `Redistributor::candidates`
@@ -321,14 +321,14 @@ pass. Per `(grid, cell)` it is bounded by the cells one peer's grant may cover,
 - **Take docs/04 §3's "cell subscribers" literally.** Unimplementable at the
   registrar: the group has no registry (docs/03, line 113), the registrar sends
   no replicated positions, and the map it does hold is peer-keyed
-  (`gateway.rs:626`). Any implementation would be a *different* set wearing the
+  (`gateway.rs:723`). Any implementation would be a *different* set wearing the
   same name, which is worse than naming the difference.
 - **Build a reverse `peers_covering(cell)` index in `InterestAuthority`.** It
   would make enumeration `O(|A|)` instead of `O(|Sessions|)` — real, but it buys
   a factor the per-cell rule (rule 8) already recovers, and it adds a second
   structure that must be kept coherent with grant expiry, whose read path is
   currently the *only* place expiry is enforced (`allows` checks
-  `valid_until_ms` inline, `gateway.rs:600`). A stale reverse index would leak
+  `valid_until_ms` inline, `gateway.rs:610`). A stale reverse index would leak
   advisories to peers whose interest lapsed — a fresh correctness surface in
   exchange for a constant.
 - **A new `LeaseMsg::Observe`/`ExpireNotice` variant for non-holders.** Costs a
