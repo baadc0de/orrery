@@ -450,6 +450,11 @@ fn write_gateway_authority(
             "claims_denied_draining": snapshot.claims_denied_draining,
             "handovers_completed": snapshot.handovers_completed,
             "handovers_aborted": snapshot.handovers_aborted,
+            // A session the registrar gave up on because it went silent, not
+            // because its connection ended. It is the counter that says a peer
+            // left without saying so — and, since #157, the one that says the
+            // registrar stopped offering that peer other peers' leases.
+            "stale_sessions_reaped": snapshot.stale_sessions_reaped,
         }),
     )
     .map_err(std::io::Error::other)?;
@@ -2679,6 +2684,7 @@ mod tests {
             "claims_denied_draining",
             "handovers_completed",
             "handovers_aborted",
+            "stale_sessions_reaped",
         ] {
             assert!(
                 record.get(field).is_some(),
@@ -2688,8 +2694,8 @@ mod tests {
         let object = record.as_object().expect("record is an object");
         assert_eq!(
             object.len(),
-            21,
-            "twenty counters plus the type tag: {object:?}"
+            22,
+            "twenty-one counters plus the type tag: {object:?}"
         );
         // p3-island's reader takes `duplicate_authority` and ignores every
         // other key, so widening the record is safe for the one parser there

@@ -1128,6 +1128,14 @@ pub struct AuthoritySnapshot {
     /// Drains this node started and then rolled back, leaving the shard where
     /// it was.
     pub handovers_aborted: u64,
+    /// Sessions torn down by the registrar because nothing was heard on them
+    /// for a full lease TTL, rather than because their connection ended.
+    ///
+    /// Every increment is a peer whose transport had not yet noticed it was
+    /// gone, and — before #157 — a peer that would have gone on being offered
+    /// other peers' expiring leases. Zero on a cluster whose peers all
+    /// disconnect cleanly; on an island drain it is the peer count, once.
+    pub stale_sessions_reaped: u64,
 }
 
 /// Always-on authority telemetry.
@@ -1160,6 +1168,7 @@ pub struct AuthorityMetrics {
     claims_denied_draining: AtomicU64,
     handovers_completed: AtomicU64,
     handovers_aborted: AtomicU64,
+    stale_sessions_reaped: AtomicU64,
     last_duplicate: std::sync::Mutex<Option<DuplicateAuthoritySample>>,
 }
 
@@ -1194,6 +1203,7 @@ impl AuthorityMetrics {
             claims_denied_draining: self.claims_denied_draining.load(Ordering::Relaxed),
             handovers_completed: self.handovers_completed.load(Ordering::Relaxed),
             handovers_aborted: self.handovers_aborted.load(Ordering::Relaxed),
+            stale_sessions_reaped: self.stale_sessions_reaped.load(Ordering::Relaxed),
         }
     }
 
@@ -1201,6 +1211,12 @@ impl AuthorityMetrics {
     #[must_use]
     pub fn last_duplicate_authority(&self) -> Option<DuplicateAuthoritySample> {
         self.last_duplicate.lock().ok().and_then(|last| *last)
+    }
+
+    /// One session the registrar tore down for silence rather than for a
+    /// closed connection.
+    fn record_stale_session_reaped(&self) {
+        self.stale_sessions_reaped.fetch_add(1, Ordering::Relaxed);
     }
 
     fn record_reassigned(&self) {
@@ -2719,6 +2735,36 @@ enum LeaseClaimCompletion {
 /// peer just sent.
 type PeerNotifier = Arc<dyn Fn(Bytes) + Send + Sync>;
 
+/// How long a session may say nothing before the registrar stops believing in
+/// it: exactly [`crate::lease::LEASE_TTL_MS`], D7's own liveness budget.
+///
+/// The registrar used to take "the transport has not told us otherwise" as
+/// proof that a peer was there, and a `current` generation was cleared by
+/// exactly one event — `cleanup_peer_session`, which runs when the connection
+/// loop ends. A peer that stops without closing its QUIC connection (a
+/// `kill -9`, or an ordinary process exit that returns from `main` before the
+/// endpoint flushes a CONNECTION_CLOSE) therefore stays a *current*, and so a
+/// *candidate*, until quinn's idle timeout — tens of seconds, and unbounded
+/// from the registrar's point of view because nothing here sets it.
+///
+/// That is the defect measured in #157: with a whole island departing, every
+/// row expired on the sweep and was handed straight to another peer that was
+/// equally gone, on a **fresh** TTL, and the set went round again. Measured on
+/// the P3 island harness: 396 of 400 rows regranted in one sweep pass, 339 of
+/// them to a peer whose own rows were expiring in the same pass and 56 to the
+/// `kill -9` victim from the previous leg.
+///
+/// The value is forced, not tuned, in the same way D24 §(d) forces
+/// `DRAIN_GRACE`. Shorter than `LEASE_TTL_MS` and the registrar would evict a
+/// session whose leases it still considers live — it would be asserting a
+/// state its own row expiry contradicts. Longer and a dead session outlives
+/// the rows it holds, which is precisely the window that lets a reassignment
+/// start a TTL *after* the last peer is gone and puts `T_drain` past D24's
+/// `T_last_peer_gone + TTL + S`. Equal makes session liveness and row liveness
+/// one judgement on one clock, and introduces no third timer: the reaper runs
+/// on the sweep tick that already exists.
+const SESSION_SILENCE_LIMIT_MS: u64 = crate::lease::LEASE_TTL_MS;
+
 struct PeerState {
     established: EstablishedIdentity,
     current: Option<SessionGeneration>,
@@ -2728,9 +2774,31 @@ struct PeerState {
     pending_lease_claims: usize,
     lease_capacity: usize,
     idle_since_ms: Option<u64>,
+    /// When the registrar last received anything at all on this peer's
+    /// session, on [`registrar_now_ms`] — the same clock a lease row's
+    /// `expires_at` is stamped from, so "this session is stale" and "this row
+    /// has lapsed" are comparable facts rather than two clocks' opinions.
+    ///
+    /// An `Arc<AtomicU64>` and not a plain field because the receive loop
+    /// stamps it once per inbound message: taking the peer mutex on the diff
+    /// path would serialize every datagram behind whatever lease operation
+    /// currently holds it, which is the head-of-line block `spawn_lease_lane`
+    /// exists to avoid. Readers already hold the lock, so they pay nothing.
+    last_seen_ms: Arc<AtomicU64>,
     claim_bucket: ClaimBucket,
     misroute_bucket: MisrouteBucket,
     expire_fanout_bucket: ExpireFanoutBucket,
+}
+
+impl PeerState {
+    /// Whether this peer has spoken recently enough to be believed in.
+    ///
+    /// Read under the peer lock by everything that hands out authority, so a
+    /// session cannot pass the check and then be found stale between the check
+    /// and the grant.
+    fn heard_from_recently(&self, now_ms: u64) -> bool {
+        now_ms.saturating_sub(self.last_seen_ms.load(Ordering::Relaxed)) < SESSION_SILENCE_LIMIT_MS
+    }
 }
 
 struct PeerRegistry {
@@ -2754,12 +2822,24 @@ struct PeerSession {
     /// change — a token naming a different one activates a new generation.
     account: AccountId,
     state: Arc<tokio::sync::Mutex<PeerState>>,
+    /// The same cell as [`PeerState::last_seen_ms`], reachable without the
+    /// peer lock so the receive loop can stamp it per message.
+    last_seen_ms: Arc<AtomicU64>,
 }
 
 impl PeerSession {
     async fn lock_current(&self) -> Option<tokio::sync::OwnedMutexGuard<PeerState>> {
         let state = Arc::clone(&self.state).lock_owned().await;
         (state.current == Some(self.generation)).then_some(state)
+    }
+
+    /// Record that this peer just said something, on [`registrar_now_ms`].
+    ///
+    /// Any message counts, not just a lease renewal. The question this answers
+    /// is "is anyone still behind this connection", and a peer holding no
+    /// leases sends no heartbeats but does send everything else.
+    fn touch(&self, now_ms: u64) {
+        self.last_seen_ms.store(now_ms, Ordering::Relaxed);
     }
 
     /// Install this session's send path so the registrar can push to it.
@@ -2793,10 +2873,28 @@ impl PeerSession {
         peer.expire_fanout_bucket.take(now_ms)
     }
 
-    async fn try_reserve_lease_slot(&self) -> bool {
+    /// Reserve one slot in this session's live-lease index, or refuse.
+    ///
+    /// `now_ms` is [`registrar_now_ms`], and the liveness check happens here —
+    /// under the *same* lock that takes the slot and, later, indexes the
+    /// granted row — rather than at enumeration time, because an earlier
+    /// filter is a TOCTOU: `Redistributor::candidates` walks the registry and
+    /// then awaits a durable claim before it grants, and a session can end in
+    /// between. `cleanup_peer_session` clears `current` and snapshots the
+    /// leases to park under this same lock, so the two orderings are the only
+    /// two possible: either the reservation wins and cleanup parks the row it
+    /// finds indexed, or cleanup wins and `lock_current` refuses here.
+    async fn try_reserve_lease_slot(&self, now_ms: u64) -> bool {
         let Some(mut peer) = self.lock_current().await else {
             return false;
         };
+        // A session nobody has been heard on for a full lease TTL is not a
+        // session authority may be handed to (#157). Checked here and not only
+        // in `candidates` so that a peer that went silent between enumeration
+        // and grant is refused too.
+        if !peer.heard_from_recently(now_ms) {
+            return false;
+        }
         if peer.leases.len().saturating_add(peer.pending_lease_claims) >= peer.lease_capacity {
             return false;
         }
@@ -2899,6 +2997,7 @@ impl PeerRegistry {
                     pending_lease_claims: 0,
                     lease_capacity: self.lease_capacity,
                     idle_since_ms: Some(now_ms),
+                    last_seen_ms: Arc::new(AtomicU64::new(registrar_now_ms())),
                     claim_bucket: ClaimBucket::new(claim_now_ms),
                     misroute_bucket: MisrouteBucket::new(claim_now_ms),
                     expire_fanout_bucket: ExpireFanoutBucket::new(claim_now_ms),
@@ -2945,12 +3044,18 @@ impl PeerRegistry {
             }
         }
         let account = peer.established.claims.account;
+        // A completed handshake is the first thing this session is heard
+        // saying; without this a peer admitted into a long-lived registry
+        // entry would inherit whatever staleness the previous session left.
+        let last_seen_ms = Arc::clone(&peer.last_seen_ms);
+        last_seen_ms.store(registrar_now_ms(), Ordering::Relaxed);
         drop(peer);
         Some(PeerSession {
             node,
             generation,
             account,
             state,
+            last_seen_ms,
         })
     }
 
@@ -2961,20 +3066,39 @@ impl PeerRegistry {
     /// negotiated handoff.
     async fn current_session(&self, node: NodeId) -> Option<PeerSession> {
         let state = Arc::clone(self.entries.lock().await.get(&node)?);
-        let (generation, account) = {
+        let (generation, account, last_seen_ms) = {
             let peer = state.lock().await;
-            (peer.current?, peer.established.claims.account)
+            (
+                peer.current?,
+                peer.established.claims.account,
+                Arc::clone(&peer.last_seen_ms),
+            )
         };
         Some(PeerSession {
             node,
             generation,
             account,
             state,
+            last_seen_ms,
         })
     }
 
-    /// Every peer with a live session, and the leases it currently holds.
-    async fn live_peer_leases(&self) -> Vec<(NodeId, Vec<SessionLease>)> {
+    /// Every peer the registrar still believes in, and the leases it holds.
+    ///
+    /// Two conditions, and the second is what #157 added. A peer is a
+    /// candidate only if it has a current generation *and* has been heard from
+    /// inside [`SESSION_SILENCE_LIMIT_MS`]. Before that, `current` alone stood
+    /// for liveness — and `current` is cleared by exactly one event, the
+    /// connection loop ending, which a peer that stops without closing its
+    /// QUIC connection never causes. Such a session stayed a first-class
+    /// successor for as long as quinn kept the connection nominally open, and
+    /// every grant it received restarted a lease TTL that nothing would ever
+    /// renew or park.
+    ///
+    /// `now_ms` is [`registrar_now_ms`], the clock lease expiry is measured
+    /// on, so this predicate and row expiry cannot disagree about what "still
+    /// there" means.
+    async fn live_peer_leases(&self, now_ms: u64) -> Vec<(NodeId, Vec<SessionLease>)> {
         let entries = {
             let entries = self.entries.lock().await;
             entries
@@ -2988,6 +3112,9 @@ impl PeerRegistry {
             let Some(current) = peer.current else {
                 continue;
             };
+            if !peer.heard_from_recently(now_ms) {
+                continue;
+            }
             live.push((
                 node,
                 peer.leases
@@ -2998,6 +3125,43 @@ impl PeerRegistry {
             ));
         }
         live
+    }
+
+    /// Sessions with a current generation that nobody has been heard on for a
+    /// full [`SESSION_SILENCE_LIMIT_MS`].
+    ///
+    /// The reaper's input. These are sessions whose peer is gone but whose
+    /// connection the transport has not yet given up on, so nothing else will
+    /// ever run `cleanup_peer_session` for them.
+    async fn stale_sessions(&self, now_ms: u64) -> Vec<PeerSession> {
+        let entries = {
+            let entries = self.entries.lock().await;
+            entries
+                .iter()
+                .map(|(node, state)| (*node, Arc::clone(state)))
+                .collect::<Vec<_>>()
+        };
+        let mut stale = Vec::new();
+        for (node, state) in entries {
+            let session = {
+                let peer = state.lock().await;
+                let Some(generation) = peer.current else {
+                    continue;
+                };
+                if peer.heard_from_recently(now_ms) {
+                    continue;
+                }
+                PeerSession {
+                    node,
+                    generation,
+                    account: peer.established.claims.account,
+                    state: Arc::clone(&state),
+                    last_seen_ms: Arc::clone(&peer.last_seen_ms),
+                }
+            };
+            stale.push(session);
+        }
+        stale
     }
 
     async fn evict_idle(&self, now_ms: u64) {
@@ -3171,7 +3335,7 @@ impl Redistributor {
         now_ms: u64,
     ) -> Vec<SuccessorCandidate> {
         let mut candidates = Vec::new();
-        for (node, leases) in self.peers.live_peer_leases().await {
+        for (node, leases) in self.peers.live_peer_leases(now_ms).await {
             if node == exclude {
                 continue;
             }
@@ -3226,7 +3390,7 @@ impl Redistributor {
             None => {
                 let sessions = self
                     .peers
-                    .live_peer_leases()
+                    .live_peer_leases(now_ms)
                     .await
                     .into_iter()
                     .map(|(node, _)| node)
@@ -3332,11 +3496,15 @@ impl Redistributor {
         kind: orrery_protocol::ClaimKind,
     ) -> Option<orrery_protocol::Lease> {
         let session = self.peers.current_session(successor).await?;
-        if !session.try_reserve_lease_slot().await {
+        // One `now_ms` for the reservation and the claim, so the row's expiry
+        // and the liveness that justified granting it are stamped from the
+        // same reading of the clock.
+        let now_ms = registrar_now_ms();
+        if !session.try_reserve_lease_slot(now_ms).await {
             return None;
         }
         let granted = match router
-            .claim_lease(grid, cell, entity, successor, kind, registrar_now_ms())
+            .claim_lease(grid, cell, entity, successor, kind, now_ms)
             .await
         {
             Ok(crate::lease::ClaimResult::Granted(row)) => row,
@@ -4472,6 +4640,39 @@ async fn accept_loop(
                 // together — so enumerating that cell's audience once is the
                 // difference between `O(leases × sessions)` and
                 // `O(cells × sessions)`.
+                // Reap first, then sweep. A session nobody has been heard on
+                // for a full lease TTL is torn down here — `cleanup_peer_session`
+                // clears its `current` and parks every row it holds — and only
+                // then does the expiry sweep look for rows to redistribute.
+                //
+                // The order matters and the reap is the reason D24's premise
+                // holds again. Without it, the *only* thing that ever cleared
+                // `current` was the connection loop ending, so a peer that
+                // stopped without closing its QUIC connection stayed a
+                // successor candidate indefinitely; the sweep then expired its
+                // rows and handed them straight to another equally-gone peer
+                // on a fresh 10 s TTL, and the whole set went round again
+                // (#157: 396 of 400 rows regranted in one pass, measured).
+                // Reaping parks those rows by path 2 of D24 §(a) — session
+                // teardown — which no reassignment can postpone, so
+                // `T_drain ≤ T_last_peer_gone + TTL + S` is restored rather
+                // than widened: every peer is reaped by its own
+                // `last_seen + TTL`, and every `last_seen` is at most
+                // `T_last_peer_gone`.
+                for stale in admission.peers.stale_sessions(registrar_now_ms()).await {
+                    debug!(
+                        node = %stale.node,
+                        "gateway: reaping a session that has said nothing for a lease TTL"
+                    );
+                    redistributor.metrics.record_stale_session_reaped();
+                    cleanup_peer_session(
+                        &stale,
+                        &router,
+                        &redistributor,
+                        admission.clock.now_ms().0,
+                    )
+                    .await;
+                }
                 let mut audiences = ExpireAudiences::default();
                 for parked in router.sweep_expired_leases(lease_sweep_clock.now_ms()).await {
                     redistributor.redistribute(&router, parked, &mut audiences).await;
@@ -4694,6 +4895,15 @@ async fn handle_connection(
             debug!(%remote, "gateway: undecodable message");
             continue;
         };
+        // The registrar's own evidence that somebody is still behind this
+        // connection, and the thing that keeps this session a candidate for
+        // inheriting authority (#157). Stamped from a decodable message rather
+        // than from the raw packet so a peer cannot hold a session alive with
+        // noise, and lock-free so the diff path pays a relaxed store and not a
+        // peer-state lock.
+        if let Some(session) = session.as_ref() {
+            session.touch(registrar_now_ms());
+        }
         // Served by definition — only the bulk lane refuses. Diffs record in
         // their own arm, once admission has decided.
         if !matches!(msg, GatewayMsg::Diff { .. }) {
@@ -5360,7 +5570,14 @@ async fn serve_lease_message(cx: &LeaseContext, work: LeaseWork) {
                 })));
                 return;
             }
-            if !active_session.try_reserve_lease_slot().await {
+            // A claim is itself evidence the peer is there — the receive loop
+            // stamped this session before handing the message to the lease
+            // lane — so the liveness half of this check is a formality here
+            // and the capacity half is what refuses.
+            if !active_session
+                .try_reserve_lease_slot(registrar_now_ms())
+                .await
+            {
                 send(Bytes::from(encode_stream_frame(&GatewayReply::Lease {
                     message: LeaseMsg::Deny {
                         claim_id: Some(claim_id),
@@ -8365,7 +8582,7 @@ mod tests {
             )
             .await
             .expect("replacement preserves the established peer");
-        let admitted = replacement.try_reserve_lease_slot().await;
+        let admitted = replacement.try_reserve_lease_slot(registrar_now_ms()).await;
 
         // Then: the bound survives replacement, no admission is reserved, and
         // the live-lease index cannot grow before actor routing.
@@ -8376,6 +8593,304 @@ mod tests {
         assert!(!admitted);
         assert_eq!(peer.leases.len(), 1);
         assert_eq!(peer.pending_lease_claims, 0);
+    }
+
+    /// A router that holds one claim open at the seam `hand_to` awaits.
+    ///
+    /// The point is to make the enumerate-then-grant window *addressable*: the
+    /// grant is suspended after the successor's slot has been reserved and
+    /// before the row is granted, which is exactly where a concurrent cleanup
+    /// has to be able to intervene. Parking is not blocked, because the
+    /// cleanup under test has to be able to run to completion in that window.
+    struct HeldClaimRouter {
+        claim_entered: tokio::sync::mpsc::Sender<()>,
+        claim_release: Arc<tokio::sync::Notify>,
+        lease_id: LeaseId,
+        parked: Mutex<Vec<(NodeId, LeaseId)>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Router for HeldClaimRouter {
+        async fn apply(
+            &self,
+            _record: JournalRecord,
+        ) -> Result<Arc<crate::journal::AppendHandle>, Reject> {
+            Err(Reject::JournalClosed)
+        }
+
+        async fn read(&self, _grid: GridId, _cell: CellId) -> Result<SnapshotPage, Reject> {
+            Err(Reject::JournalClosed)
+        }
+
+        async fn has_actor(&self, _grid: GridId, _cell: CellId) -> bool {
+            true
+        }
+
+        async fn claim_lease(
+            &self,
+            _grid: GridId,
+            _cell: CellId,
+            entity: PersistId,
+            holder: NodeId,
+            _kind: orrery_protocol::ClaimKind,
+            _now_ms: u64,
+        ) -> Result<crate::lease::ClaimResult, Reject> {
+            self.claim_entered
+                .send(())
+                .await
+                .map_err(|_| Reject::JournalClosed)?;
+            self.claim_release.notified().await;
+            Ok(crate::lease::ClaimResult::Granted(orrery_protocol::Lease {
+                entity,
+                holder: Some(holder),
+                seq: orrery_protocol::SeqPair {
+                    own_seq: 0,
+                    auth_seq: 1,
+                },
+                lease_id: self.lease_id,
+                expires_at: u64::MAX,
+                flags: orrery_protocol::LeaseFlags::default(),
+                bound_to: None,
+            }))
+        }
+
+        async fn park_lease(
+            &self,
+            _grid: GridId,
+            _cell: CellId,
+            entity: PersistId,
+            holder: NodeId,
+            lease_id: LeaseId,
+        ) -> Result<Option<orrery_protocol::Lease>, Reject> {
+            self.parked
+                .lock()
+                .expect("parked lease lock")
+                .push((holder, lease_id));
+            Ok(Some(orrery_protocol::Lease {
+                entity,
+                holder: None,
+                seq: orrery_protocol::SeqPair {
+                    own_seq: 0,
+                    auth_seq: 1,
+                },
+                lease_id,
+                expires_at: 0,
+                flags: orrery_protocol::LeaseFlags::default(),
+                bound_to: None,
+            }))
+        }
+    }
+
+    fn test_authorization(seed: u8) -> GatewayAuthorization {
+        let node = iroh::SecretKey::from_bytes(&[seed; 32]).public();
+        GatewayAuthorization::Valid(SessionTokenClaimsV1::new(
+            orrery_protocol::AccountId::new(u64::from(seed)),
+            node,
+            UnixMillis::new(0),
+            orrery_protocol::SessionTokenTtlMs::new(1_000),
+            orrery_protocol::SessionStanding::Good,
+            orrery_protocol::IssuerKeyId::new(1),
+        ))
+    }
+
+    /// The enumerate-then-grant window, driven rather than raced.
+    ///
+    /// `Redistributor::candidates` walks the registry, and `hand_to` then
+    /// awaits a durable claim before it indexes anything. A successor chosen
+    /// in the first step can therefore finish its own `cleanup_peer_session`
+    /// during the second, and the question this settles is what the grant does
+    /// when it lands on it.
+    ///
+    /// The answer is that it cannot land: the reservation, the liveness check
+    /// and the index insert are all taken under the *same* peer lock that
+    /// cleanup uses to clear `current` and snapshot the rows it will park, so
+    /// the two orderings are the only two possible. Either the reservation
+    /// wins and cleanup parks a row it finds indexed, or cleanup wins and the
+    /// grant is compensated — which is the interleaving forced here, because
+    /// cleanup is run to completion while the claim is suspended.
+    #[tokio::test]
+    async fn a_grant_is_never_indexed_on_a_session_whose_cleanup_has_begun() {
+        // Given: a live session that has been picked as a successor, and a
+        // grant for it suspended mid-claim.
+        let registry = Arc::new(PeerRegistry::new(2, 10_000, MAX_PEER_LIVE_LEASES));
+        let node = iroh::SecretKey::from_bytes(&[7; 32]).public();
+        let successor = registry
+            .activate(node, test_authorization(7), b"successor", None, 0, 0)
+            .await
+            .expect("successor is admitted");
+        let entity = PersistId::new(71);
+        let granted_lease = LeaseId(71);
+        let (claim_entered_tx, mut claim_entered_rx) = tokio::sync::mpsc::channel(1);
+        let claim_release = Arc::new(tokio::sync::Notify::new());
+        let router = Arc::new(HeldClaimRouter {
+            claim_entered: claim_entered_tx,
+            claim_release: Arc::clone(&claim_release),
+            lease_id: granted_lease,
+            parked: Mutex::new(Vec::new()),
+        });
+        let redistributor = Arc::new(parking_redistributor(Arc::clone(&registry)));
+
+        let grant_router: Arc<dyn Router> = router.clone();
+        let granting = tokio::spawn({
+            let redistributor = Arc::clone(&redistributor);
+            async move {
+                redistributor
+                    .hand_to(
+                        &grant_router,
+                        GridId::ROOT,
+                        CellId::ROOT,
+                        entity,
+                        node,
+                        None,
+                        orrery_protocol::ClaimId::REGISTRAR,
+                        orrery_protocol::ClaimKind::Weak,
+                    )
+                    .await
+            }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), claim_entered_rx.recv())
+            .await
+            .expect("the grant reaches the claim seam")
+            .expect("the claim reports entry");
+        assert_eq!(
+            successor
+                .lock_current()
+                .await
+                .expect("the successor is still current inside the window")
+                .pending_lease_claims,
+            1,
+            "the window under test is the one after the slot is reserved"
+        );
+
+        // When: the successor's own session tears down completely, inside that
+        // window.
+        let cleanup_router: Arc<dyn Router> = router.clone();
+        cleanup_peer_session(&successor, &cleanup_router, &redistributor, 1).await;
+        claim_release.notify_one();
+
+        // Then: the grant is refused rather than completed, nothing is left
+        // indexed on the gone session, and the row the claim did create is
+        // parked here rather than left to expire.
+        let handed = tokio::time::timeout(std::time::Duration::from_secs(5), granting)
+            .await
+            .expect("the suspended grant returns")
+            .expect("the grant task does not panic");
+        assert!(
+            handed.is_none(),
+            "a grant must not be reported to a session whose cleanup has run"
+        );
+        let peer = successor.state.lock().await;
+        assert_eq!(peer.current, None);
+        assert!(
+            peer.leases.is_empty(),
+            "the gone session must own no lease index entry: {:?}",
+            peer.leases
+        );
+        assert_eq!(peer.pending_lease_claims, 0);
+        drop(peer);
+        assert_eq!(
+            router.parked.lock().expect("parked lease lock").as_slice(),
+            &[(node, granted_lease)],
+            "the compensating park is the fallback D24 needs: the row is parked \
+             now, not at the end of a fresh lease TTL"
+        );
+    }
+
+    /// A session nobody has been heard on for a lease TTL is not a peer.
+    ///
+    /// This is the defect #157 measured, and it is not the enumerate-then-grant
+    /// window: `current` is cleared by exactly one event — the connection loop
+    /// ending — so a peer that stops without closing its QUIC connection stays
+    /// *current*, and stayed a first-class successor, for as long as quinn kept
+    /// the connection nominally open. Every grant it received restarted a lease
+    /// TTL that nothing would ever renew or park.
+    #[tokio::test]
+    async fn a_session_silent_for_a_lease_ttl_is_neither_a_candidate_nor_a_grantee() {
+        // Given: two current sessions holding a lease each, one of which has
+        // said nothing for a full lease TTL.
+        let registry = Arc::new(PeerRegistry::new(4, 10_000, MAX_PEER_LIVE_LEASES));
+        let silent_node = iroh::SecretKey::from_bytes(&[8; 32]).public();
+        let talking_node = iroh::SecretKey::from_bytes(&[9; 32]).public();
+        let silent = registry
+            .activate(silent_node, test_authorization(8), b"silent", None, 0, 0)
+            .await
+            .expect("silent peer is admitted");
+        let talking = registry
+            .activate(talking_node, test_authorization(9), b"talking", None, 0, 0)
+            .await
+            .expect("talking peer is admitted");
+        for (session, entity, lease_id) in [
+            (&silent, PersistId::new(81), LeaseId(81)),
+            (&talking, PersistId::new(91), LeaseId(91)),
+        ] {
+            session.state.lock().await.leases.insert(
+                entity,
+                SessionLease {
+                    entity,
+                    lease_id,
+                    grid: GridId::ROOT,
+                    cell: CellId::ROOT,
+                    owner: SessionLeaseOwner::Active(session.generation),
+                },
+            );
+        }
+        // Both were heard from at `now`; the clock then advances by exactly the
+        // silence limit, and only one of them speaks again.
+        let now_ms = registrar_now_ms() + SESSION_SILENCE_LIMIT_MS;
+        talking.touch(now_ms);
+
+        // Then: the registrar offers authority to one of them and gives up on
+        // the other.
+        let live = registry.live_peer_leases(now_ms).await;
+        assert_eq!(
+            live.iter().map(|(node, _)| *node).collect::<Vec<_>>(),
+            vec![talking_node],
+            "a session past the silence limit is not an eligible successor"
+        );
+        assert_eq!(
+            registry
+                .stale_sessions(now_ms)
+                .await
+                .iter()
+                .map(|session| session.node)
+                .collect::<Vec<_>>(),
+            vec![silent_node],
+            "and it is exactly the session the sweep must reap"
+        );
+        assert!(
+            !silent.try_reserve_lease_slot(now_ms).await,
+            "the grant path refuses it under the same lock that would index it"
+        );
+        assert!(talking.try_reserve_lease_slot(now_ms).await);
+
+        // And reaping it parks what it held, by D24 §(a)'s session-teardown
+        // path rather than by waiting out an expiry.
+        let router = Arc::new(HeldClaimRouter {
+            claim_entered: tokio::sync::mpsc::channel(1).0,
+            claim_release: Arc::new(tokio::sync::Notify::new()),
+            lease_id: LeaseId(0),
+            parked: Mutex::new(Vec::new()),
+        });
+        let reap_router: Arc<dyn Router> = router.clone();
+        for stale in registry.stale_sessions(now_ms).await {
+            cleanup_peer_session(
+                &stale,
+                &reap_router,
+                &parking_redistributor(Arc::clone(&registry)),
+                now_ms,
+            )
+            .await;
+        }
+        assert_eq!(
+            router.parked.lock().expect("parked lease lock").as_slice(),
+            &[(silent_node, LeaseId(81))]
+        );
+        assert_eq!(silent.state.lock().await.current, None);
+        assert_eq!(
+            talking.state.lock().await.current,
+            Some(talking.generation),
+            "reaping one session must not disturb a live one"
+        );
     }
 
     #[tokio::test]
@@ -9935,7 +10450,7 @@ mod tests {
         for id in 1..=count {
             let entity = PersistId::new(id);
             assert!(
-                session.try_reserve_lease_slot().await,
+                session.try_reserve_lease_slot(registrar_now_ms()).await,
                 "capacity for a test lease"
             );
             assert!(
