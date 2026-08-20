@@ -1,6 +1,6 @@
 # ADR-0024: Island drain is peer-driven, and never an evacuation
 
-**Status:** Proposed · **Date:** 2026-08-20 · **Decision:** D24
+**Status:** Accepted · **Date:** 2026-08-20 · **Decision:** D24
 
 This decision is normative once accepted. See the [ADR index](../DECISIONS.md)
 for precedence, scope, and the complete decision set.
@@ -105,6 +105,20 @@ down is an island affected by the coordinator being down.
 
 A reviewer looking for the sentence that settles whether a coordinator→gateway
 edge exists should point at that one.
+
+**The one place that looked like a counter-example is the P6 promotion warrant,
+and it is couriered.** [docs/04](../04-authority.md) §8 step 1 has the
+coordinator issue `{cell_ids, host: NodeId, epoch, expiry, signature}` "to the
+field host and the registrar", which reads as a second delivery and would be
+the edge this record declines. It is not one: step 2 has the host send
+`Claim{basis: Promotion{warrant}}`, so the registrar receives the warrant **on
+the host's own claim** and verifies its signature against the coordinator's
+public keys — exactly the courier already used for interest handouts
+(`gateway.rs:619-622`: "the gateway needs no connection to the coordinator —
+the peer is the courier, exactly as it is for its identity token"). §8 step 1
+is reworded here to say so. Field-host promotion therefore adds no edge either,
+and a future record that wants one must argue for it on its own terms rather
+than inherit it from this wording.
 
 The drain predicate is per entity, and there is no island term in it. For an
 island `I` over cell set `C(I)`, with `E(I)` the persistent entities whose

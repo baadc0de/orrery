@@ -41,7 +41,7 @@ Normative source: [ADR-0007](adr/0007-authority-and-leases.md) (boundaries with 
 > *separate* write marker from the persistence one, so no ephemeral path can
 > uplink.
 >
-> Still deferred: coordinator-driven island drain, `Expire` fan-out to cell
+> Still deferred: `Expire` fan-out to cell
 > subscribers, redistribution across sibling gateways, and field-host
 > promotion. The design flows below describe those future capabilities as well.
 
@@ -522,7 +522,7 @@ An active entity hosted this way is simulated on an untrusted machine: bulk-clas
 
 When the coordinator promotes a cell (> 32 sustained, §D6), the field host must become authority for the cell's entities without touching players:
 
-1. `orrery_coordinator` issues a **promotion warrant** — `{cell_ids, host: NodeId, epoch, expiry, signature}` (design elaboration) — to the field host and the registrar.
+1. `orrery_coordinator` issues a **promotion warrant** — `{cell_ids, host: NodeId, epoch, expiry, signature}` (design elaboration) — to the field host. The registrar is not sent it directly: the host **carries** the warrant on its own claims (step 2) and the registrar verifies the signature against the coordinator's public keys, exactly as it does for interest handouts. Promotion therefore adds no coordinator→gateway edge ([D24](adr/0024-island-drain.md)).
 2. The host sends batched `Claim{basis: Promotion{warrant}}` for the cell's non-player entities. Warrant-bearing claims bypass the plausibility gate and rate limits (§10) and carry infrastructure priority: current weak holders get `Divest` requests with the 300 ms deadline, then unconditional divestiture.
 3. **Players keep strong ownership of their own characters** — `PLAYER_BOUND` leases are never claimed by the host; the host *validates* player state as any authority-peer would (§D6, §D8), and durable consequences still ride the intent path.
 4. Demotion reverses it: the host divests each entity to the nearest interacting peer (crash-redistribution candidate logic, but negotiated) or parks it, then the coordinator retires the warrant.

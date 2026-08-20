@@ -302,9 +302,9 @@ initial authority by construction, and transfer by a single broadcast resolved
 under D7 §4.4's total order — with a write marker distinct from the persistence
 one, so no ephemeral path can uplink.
 
-Remaining P3 follow-on: coordinator-driven island drain, `Expire` fan-out to
-cell subscribers, redistribution across sibling gateways, and field-host
-promotion (P6). The Bevy coordinator client in `orrery_net` landed with P1:
+Remaining P3 follow-on: peer-driven island drain
+([D24](adr/0024-island-drain.md)), `Expire` fan-out to cell subscribers,
+redistribution across sibling gateways, and field-host promotion (P6). The Bevy coordinator client in `orrery_net` landed with P1:
 `orrery_net::coordinator` drives `IslandMembership` from coordinator manifests,
 with the connected-peer derivation retained only as the no-coordinator
 fallback. The last wire landed with the `orrery` facade: its
