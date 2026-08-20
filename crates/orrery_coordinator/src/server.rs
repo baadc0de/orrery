@@ -40,7 +40,7 @@ use orrery_protocol::{
 };
 
 use crate::interest::InterestIssuer;
-use crate::registry::IslandRegistry;
+use crate::registry::{IslandDrain, IslandRegistry, MembershipChange};
 
 /// The admission response byte, mirroring the gateway's `ACCEPTED`.
 const ACCEPTED: u8 = 0;
@@ -215,9 +215,18 @@ struct Shared {
     issuer: InterestIssuer,
     grid: GridId,
     presence_clock: Arc<dyn PresenceClock>,
+    /// Wall clock, used only to stamp drain deadlines.
+    ///
+    /// Deliberately not `presence_clock`: that one is monotonic from an
+    /// arbitrary origin, which is right for a rate limiter and useless for a
+    /// deadline, because a deadline goes on the wire and has to mean something
+    /// on the recipient's clock too. This is the same clock that verifies
+    /// session-token expiry, for the same reason.
+    unix_clock: Arc<dyn TokenClock + Send + Sync>,
     presence_reports: AtomicU64,
     grants_issued: AtomicU64,
     manifests_pushed: AtomicU64,
+    drains_issued: AtomicU64,
 }
 
 impl Shared {
@@ -272,6 +281,44 @@ impl Shared {
             }
         }
     }
+
+    /// Order every drained island retired, addressed to the roster it held at
+    /// its last populated epoch.
+    ///
+    /// This is the one membership change that has no manifest to carry it: a
+    /// drained island has no roster left, so a peer told only in manifests
+    /// would learn about the drain by never hearing anything again. The
+    /// deadline is the coordinator's wall clock plus the configured grace —
+    /// D7's lease TTL by default, so the order expires no sooner than the
+    /// leases it is asking to see released.
+    async fn order_drains(&self, drains: &[IslandDrain], grace_ms: u64) {
+        if drains.is_empty() {
+            return;
+        }
+        let deadline = self.unix_clock.now_ms().0.saturating_add(grace_ms);
+        for drain in drains {
+            for node in &drain.peers {
+                let order = CoordMsg::Drain {
+                    island: drain.island,
+                    deadline,
+                };
+                if self.notify(*node, &order).await {
+                    self.drains_issued.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+    }
+
+    /// Ship a membership change: drains first, then manifests.
+    ///
+    /// Order matters for a peer that moved out of the last cell of one island
+    /// and into another. It receives the order retiring what it left before
+    /// the assignment naming what it joined, so it never has both islands live
+    /// at once — which is the state the drain exists to avoid.
+    async fn apply(&self, change: MembershipChange, grace_ms: u64) {
+        self.order_drains(&change.drains, grace_ms).await;
+        self.broadcast(change.manifests).await;
+    }
 }
 
 /// A point-in-time read of a coordinator's activity.
@@ -283,6 +330,8 @@ pub struct CoordinatorStats {
     pub grants_issued: u64,
     /// Island manifests delivered.
     pub manifests_pushed: u64,
+    /// Drain orders delivered.
+    pub drains_issued: u64,
     /// Peers with a live session.
     pub connected_peers: usize,
     /// Islands currently formed.
@@ -311,15 +360,18 @@ impl CoordinatorServer {
         }
         let endpoint = Arc::new(builder.bind().await.map_err(ServerError::Bind)?);
 
+        let token_clock = Arc::clone(&config.token_clock);
         let shared = Arc::new(Shared {
             registry: tokio::sync::Mutex::new(IslandRegistry::new()),
             peers: tokio::sync::Mutex::new(HashMap::new()),
             issuer: config.interest_issuer,
             grid: config.grid,
             presence_clock: config.presence_clock,
+            unix_clock: token_clock,
             presence_reports: AtomicU64::new(0),
             grants_issued: AtomicU64::new(0),
             manifests_pushed: AtomicU64::new(0),
+            drains_issued: AtomicU64::new(0),
         });
         let verifier = Arc::new(SessionTokenVerifier::new(
             ClockBox(config.token_clock),
@@ -359,6 +411,7 @@ impl CoordinatorServer {
             presence_reports: self.shared.presence_reports.load(Ordering::Relaxed),
             grants_issued: self.shared.grants_issued.load(Ordering::Relaxed),
             manifests_pushed: self.shared.manifests_pushed.load(Ordering::Relaxed),
+            drains_issued: self.shared.drains_issued.load(Ordering::Relaxed),
             connected_peers: self.shared.peers.lock().await.len(),
             islands: self.shared.registry.lock().await.island_count(),
         }
@@ -526,14 +579,15 @@ async fn handle_connection(
                 }
                 shared.presence_reports.fetch_add(1, Ordering::Relaxed);
 
-                let manifests = {
+                let (change, grace_ms) = {
                     let mut registry = shared.registry.lock().await;
-                    registry.report_presence(remote, cells)
+                    let grace_ms = registry.config.drain_grace_ms;
+                    (registry.report_presence(remote, cells), grace_ms)
                 };
                 // Interest first: a peer that receives its manifest and starts
                 // claiming should already hold the grant those claims need.
                 shared.issue_interest(remote).await;
-                shared.broadcast(manifests).await;
+                shared.apply(change, grace_ms).await;
             }
             // Everything else is coordinator→peer. A peer sending one is
             // confused rather than hostile; ignore it.
@@ -547,12 +601,18 @@ async fn handle_connection(
     if admitted {
         // Forget the peer, then tell whoever is left. A departed peer must not
         // linger in a manifest, or survivors will try to reach a ghost.
-        let manifests = {
+        let (change, grace_ms) = {
             let mut registry = shared.registry.lock().await;
-            registry.forget_peer(remote)
+            let grace_ms = registry.config.drain_grace_ms;
+            (registry.forget_peer(remote), grace_ms)
         };
+        // The drain order goes out while the departing peer's session is still
+        // in the table. Dropping it first would leave `notify` with nowhere to
+        // send, and the order is addressed to exactly that peer — it is the
+        // one that emptied the island.
+        shared.order_drains(&change.drains, grace_ms).await;
         shared.peers.lock().await.remove(&remote);
-        shared.broadcast(manifests).await;
+        shared.broadcast(change.manifests).await;
     }
 }
 

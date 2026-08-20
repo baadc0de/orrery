@@ -22,5 +22,5 @@ pub mod server;
 
 pub use client::{ClientError, CoordinatorClient};
 pub use interest::InterestIssuer;
-pub use registry::{CoordinatorConfig, IslandRegistry};
+pub use registry::{CoordinatorConfig, IslandDrain, IslandRegistry, MembershipChange};
 pub use server::{CoordinatorServer, CoordinatorStats, ServerConfig, ServerError};

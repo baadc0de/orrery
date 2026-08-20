@@ -11,7 +11,9 @@
 //!   surviving `island_id` (larger population wins), bump the epoch.
 //! - **Split:** the population separates into clusters with no overlapping
 //!   interest → partition the cell set and issue two manifests.
-//! - **Drain:** last peer leaves → release the island.
+//! - **Drain:** last peer leaves → release the island, and tell the peer
+//!   whose departure did it, so the retirement is an event and not just a
+//!   missing hash-map entry.
 //!
 //! P1 keeps the membership model coarse (cell-level presence, not per-tick
 //! positions) and in-memory; the wire server and FDB-journaled epochs land with
@@ -38,6 +40,16 @@ pub struct CoordinatorConfig {
     /// enough to survive ordinary presence jitter. The default is one minute,
     /// six presence intervals at the D16 cadence.
     pub interest_grant_ttl_ms: u64,
+    /// Grace stamped on a drain order, in milliseconds past the coordinator's
+    /// wall clock.
+    ///
+    /// The default is D7's **10 s** lease TTL, and that number is not a
+    /// coincidence: the drain finishes when the island's authority leases are
+    /// released or expire, and a lease nobody heartbeats expires in exactly
+    /// one TTL. A shorter grace would order a peer to be done before the
+    /// registrar could agree it was; a longer one would keep cells nominally
+    /// live after every lease over them had already lapsed.
+    pub drain_grace_ms: u64,
 }
 
 impl Default for CoordinatorConfig {
@@ -45,8 +57,50 @@ impl Default for CoordinatorConfig {
         Self {
             promotion_threshold: 32,
             interest_grant_ttl_ms: 60_000,
+            drain_grace_ms: 10_000,
         }
     }
+}
+
+/// An island retired because its last peer left (docs/02-networking.md §5).
+///
+/// The registry used to drain an island by deleting a hash-map entry, which
+/// made the event unobservable: nothing downstream could say *which* island
+/// had gone, or over which cells. This is that deletion made explicit, so the
+/// server can put a [`CoordMsg::Drain`](orrery_protocol::CoordMsg::Drain) on
+/// the wire before the record stops existing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IslandDrain {
+    /// The island that lost its last peer.
+    pub island: IslandId,
+    /// The cells it covered, sorted — the set now parked (D7): no live
+    /// authority, state served from the hot tier.
+    pub cells: Vec<CellId>,
+    /// The roster the island held at its last populated epoch.
+    ///
+    /// Today that is exactly the one peer whose departure emptied it, and it
+    /// is the addressee of the drain order. It is a list rather than a single
+    /// `NodeId` because the island is what drains, not the peer: a
+    /// coordinator-initiated evacuation, if one is ever decided on, would
+    /// retire an island with several names still in it.
+    pub peers: Vec<NodeId>,
+}
+
+/// Everything a membership change owes the peers it touched.
+///
+/// Manifests and drains travel together because they are two halves of one
+/// answer: a peer that moves between islands needs the roster of the island it
+/// joined *and* — if that island emptied behind it — the order retiring the
+/// one it left. Splitting them across two calls would let a caller ship one
+/// and forget the other, which is how the drain went unobserved in the first
+/// place.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MembershipChange {
+    /// Manifests whose islands survive and whose rosters changed. Every peer
+    /// a manifest names must receive it, not just the reporter.
+    pub manifests: Vec<IslandManifest>,
+    /// Islands this change retired.
+    pub drains: Vec<IslandDrain>,
 }
 
 /// A peer's coarse presence: which cells it occupies.
@@ -119,18 +173,34 @@ impl IslandRegistry {
     }
 
     /// Handle a peer's coarse presence update, forming/merging/splitting
-    /// islands as needed. Returns the manifest(s) the peer should apply.
+    /// islands as needed. Returns the manifest(s) to push and any island the
+    /// move drained.
     ///
     /// P1 model: a peer's cells are the AOI it covers; islands are formed per
     /// connected component of the cell-adjacency graph. This is deliberately
     /// coarse — the full merge/split evaluation (docs/02-networking.md §5) is
     /// the coordinator's P3 work.
-    pub fn report_presence(&mut self, node: NodeId, cells: Vec<CellId>) -> Vec<IslandManifest> {
+    ///
+    /// A *move* returns two manifests: the island joined, and the island left
+    /// when that one still has somebody in it. Returning only the joined one —
+    /// which is what this did — left the survivors of the vacated island
+    /// holding a roster that still named the mover, and blind to the epoch
+    /// bump its departure made. [`Self::forget_peer`] has always closed that
+    /// hole for a disconnect; to the roster left behind, a move is not a
+    /// different kind of departure.
+    pub fn report_presence(&mut self, node: NodeId, cells: Vec<CellId>) -> MembershipChange {
         let cells: HashSet<CellId> = cells.into_iter().collect();
 
-        // Leave any island this peer was in.
+        // Leave any island this peer was in — and remember which, because a
+        // survivor of it is owed the new roster and a drained one is owed an
+        // order. Neither is knowable once the peer is somewhere else.
+        let mut vacated = None;
+        let mut drains = Vec::new();
         if let Some(id) = self.island_of(node) {
-            self.remove_peer_from_island(node, id);
+            match self.remove_peer_from_island(node, id) {
+                Some(drain) => drains.push(drain),
+                None => vacated = Some(id),
+            }
         }
 
         {
@@ -170,26 +240,39 @@ impl IslandRegistry {
         island.peers.push(node);
         island.epoch += 1;
 
-        vec![self.manifest(island_id)]
+        let mut manifests = vec![self.manifest(island_id)];
+        // A peer whose new cells still overlap its old island rejoins the one
+        // it just left; the manifest above already describes it, and sending
+        // it twice would only invite a peer to act on the staler copy.
+        if let Some(vacated) = vacated.filter(|id| *id != island_id) {
+            manifests.push(self.manifest(vacated));
+        }
+        MembershipChange { manifests, drains }
     }
 
     /// Drop a peer entirely: its presence, and its place in any island.
     ///
-    /// Returns the manifests the *remaining* peers must apply. A departed peer
-    /// left in a roster is worse than a missing one — survivors would keep
-    /// trying to reach a ghost.
-    pub fn forget_peer(&mut self, node: NodeId) -> Vec<IslandManifest> {
+    /// Returns the manifests the *remaining* peers must apply, or the drain if
+    /// there are none left. A departed peer left in a roster is worse than a
+    /// missing one — survivors would keep trying to reach a ghost.
+    pub fn forget_peer(&mut self, node: NodeId) -> MembershipChange {
         let island = self.island_of(node);
         self.peers.remove(&node);
         let Some(island) = island else {
-            return Vec::new();
+            return MembershipChange::default();
         };
-        self.remove_peer_from_island(node, island);
-        // A drained island has no manifest left to send.
-        if self.islands.contains_key(&island) {
-            vec![self.manifest(island)]
-        } else {
-            Vec::new()
+        match self.remove_peer_from_island(node, island) {
+            // A drained island has no manifest left to send — only the order
+            // retiring it, which is the whole reason the drain is returned
+            // rather than swallowed.
+            Some(drain) => MembershipChange {
+                manifests: Vec::new(),
+                drains: vec![drain],
+            },
+            None => MembershipChange {
+                manifests: vec![self.manifest(island)],
+                drains: Vec::new(),
+            },
         }
     }
 
@@ -268,18 +351,35 @@ impl IslandRegistry {
         }
     }
 
-    /// Remove a peer from an island, draining it if empty.
-    fn remove_peer_from_island(&mut self, node: NodeId, island_id: IslandId) {
-        let drain = if let Some(island) = self.islands.get_mut(&island_id) {
-            island.peers.retain(|p| *p != node);
-            island.epoch += 1;
-            island.peers.is_empty()
-        } else {
-            false
-        };
-        if drain {
-            self.islands.remove(&island_id);
+    /// Remove a peer from an island, draining it if that emptied it.
+    ///
+    /// Returns the drain when the departure was the last one. The cells and
+    /// the final roster are captured *here* because this is the last moment
+    /// they exist: the `remove` below is the entirety of what "drain" has
+    /// meant so far, and after it nothing downstream can reconstruct what was
+    /// retired. Returning `None` is not "nothing happened" — the surviving
+    /// island's epoch has still been bumped, and its roster still owes every
+    /// remaining peer a manifest.
+    fn remove_peer_from_island(
+        &mut self,
+        node: NodeId,
+        island_id: IslandId,
+    ) -> Option<IslandDrain> {
+        let island = self.islands.get_mut(&island_id)?;
+        let last_roster = island.peers.clone();
+        island.peers.retain(|p| *p != node);
+        island.epoch += 1;
+        if !island.peers.is_empty() {
+            return None;
         }
+        let island = self.islands.remove(&island_id)?;
+        let mut cells: Vec<CellId> = island.cells.into_iter().collect();
+        cells.sort();
+        Some(IslandDrain {
+            island: island_id,
+            cells,
+            peers: last_roster,
+        })
     }
 }
 
@@ -300,9 +400,10 @@ mod tests {
     #[test]
     fn first_peer_forms_an_island() {
         let mut reg = IslandRegistry::new();
-        let manifests = reg.report_presence(node(1), vec![cell(0)]);
-        assert_eq!(manifests.len(), 1);
-        let m = &manifests[0];
+        let change = reg.report_presence(node(1), vec![cell(0)]);
+        assert_eq!(change.manifests.len(), 1);
+        assert!(change.drains.is_empty());
+        let m = &change.manifests[0];
         assert_eq!(m.epoch, 1);
         assert_eq!(m.cells, vec![cell(0)]);
         assert_eq!(m.peers.len(), 1);
@@ -315,9 +416,9 @@ mod tests {
     fn overlapping_peers_share_an_island() {
         let mut reg = IslandRegistry::new();
         reg.report_presence(node(1), vec![cell(0)]);
-        let manifests = reg.report_presence(node(2), vec![cell(0), cell(1)]);
-        assert_eq!(manifests.len(), 1);
-        let m = &manifests[0];
+        let change = reg.report_presence(node(2), vec![cell(0), cell(1)]);
+        assert_eq!(change.manifests.len(), 1);
+        let m = &change.manifests[0];
         assert_eq!(m.peers.len(), 2);
         assert_eq!(m.epoch, 2);
         assert_eq!(reg.island_count(), 1);
@@ -340,12 +441,77 @@ mod tests {
         reg.report_presence(node(2), vec![cell(0)]);
         assert_eq!(reg.island_count(), 1);
 
-        // Both peers move away from the shared cell.
-        reg.report_presence(node(1), vec![cell(50)]);
-        reg.report_presence(node(2), vec![cell(60)]);
+        let original = reg.island_of(node(1)).expect("shared island");
+
+        // Both peers move away from the shared cell. The first move leaves a
+        // survivor behind, so it drains nothing; the second empties the island.
+        let first = reg.report_presence(node(1), vec![cell(50)]);
+        assert!(
+            first.drains.is_empty(),
+            "an island with a peer still in it has not drained"
+        );
+        let second = reg.report_presence(node(2), vec![cell(60)]);
+
+        // The departure that emptied the island says so, and says what it
+        // retired: without this the drain is only an absence, and nothing on
+        // the wire could name the island whose cells are now parked.
+        assert_eq!(second.drains.len(), 1);
+        let drain = &second.drains[0];
+        assert_eq!(drain.island, original);
+        assert_eq!(drain.cells, vec![cell(0)]);
+        assert_eq!(drain.peers, vec![node(2)]);
+
         // The original island drained; two new ones formed.
         assert_eq!(reg.island_count(), 2);
+        assert!(reg.island_of(node(2)) != Some(original));
         assert_ne!(reg.island_of(node(1)), reg.island_of(node(2)));
+    }
+
+    #[test]
+    fn a_move_tells_the_island_left_behind_as_well_as_the_one_joined() {
+        // Given: two peers sharing an island, and a third island elsewhere is
+        // where one of them is headed.
+        let mut reg = IslandRegistry::new();
+        reg.report_presence(node(1), vec![cell(0)]);
+        reg.report_presence(node(2), vec![cell(0)]);
+        let vacated = reg.island_of(node(1)).expect("shared island");
+
+        // When: one of them moves out of range of the other.
+        let change = reg.report_presence(node(1), vec![cell(100)]);
+
+        // Then: both rosters come back. The island left behind survives with
+        // one peer, and a survivor that never hears about the bump keeps
+        // reaching for a peer that is no longer in its session.
+        assert!(change.drains.is_empty());
+        assert_eq!(change.manifests.len(), 2);
+        let joined = &change.manifests[0];
+        let left = &change.manifests[1];
+        assert_eq!(reg.island_of(node(1)), Some(joined.island));
+        assert_eq!(left.island, vacated);
+        assert_eq!(left.peers.len(), 1);
+        assert_eq!(left.peers[0].node, node(2));
+        assert!(
+            left.peers.iter().all(|entry| entry.node != node(1)),
+            "the island left behind must not still list the mover"
+        );
+        assert!(
+            left.epoch > 2,
+            "the departure bumps the vacated island's epoch past the join that formed it"
+        );
+    }
+
+    #[test]
+    fn a_move_within_one_island_yields_one_manifest() {
+        // A peer whose new cells still overlap its old island rejoins the one
+        // it just left. The vacated-island manifest would describe the same
+        // island at a staler epoch, so it is not sent.
+        let mut reg = IslandRegistry::new();
+        reg.report_presence(node(1), vec![cell(0)]);
+        reg.report_presence(node(2), vec![cell(0)]);
+        let change = reg.report_presence(node(1), vec![cell(0), cell(1)]);
+        assert_eq!(change.manifests.len(), 1);
+        assert!(change.drains.is_empty());
+        assert_eq!(reg.island_count(), 1);
     }
 
     #[test]

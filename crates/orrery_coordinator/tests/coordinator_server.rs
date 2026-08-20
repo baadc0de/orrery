@@ -208,6 +208,70 @@ async fn a_departing_peer_is_removed_from_the_roster_it_leaves_behind() {
 }
 
 #[tokio::test]
+async fn a_sole_peer_leaving_its_island_is_ordered_to_drain_it() {
+    // Given: one peer, alone in the island its presence formed.
+    let issuer = secret(200);
+    let interest = secret(201);
+    let server = coordinator(&issuer, &interest).await;
+
+    let peer = CoordinatorClient::connect(
+        secret(1),
+        server.addr(),
+        token(&issuer, node(1), 60_000),
+        PATIENCE,
+    )
+    .await
+    .expect("peer admitted");
+    peer.report_presence(vec![cell(0)]).expect("presence");
+    let formed = peer.next_manifest(PATIENCE).await.expect("own island");
+    assert_eq!(formed.peers.len(), 1);
+    assert!(formed.cells.contains(&cell(0)));
+
+    // When: it departs that island — by moving out of range of it, which is
+    // the departure a still-connected peer can be told about. (Closing the
+    // connection is the other shape, covered by the roster test above; a peer
+    // that has hung up cannot read an order addressed to it.)
+    peer.report_presence(vec![cell(500)]).expect("presence");
+
+    // Then: the island it emptied is named in a drain order, with a deadline
+    // in the future on the coordinator's clock. Without it the peer would get
+    // a new assignment and no word at all about the island it just retired.
+    let mut drain = None;
+    let mut assignment = None;
+    let until = tokio::time::Instant::now() + PATIENCE;
+    while drain.is_none() || assignment.is_none() {
+        let remaining = until.saturating_duration_since(tokio::time::Instant::now());
+        match peer.recv(remaining).await {
+            Some(CoordMsg::Drain { island, deadline }) => drain = Some((island, deadline)),
+            Some(CoordMsg::IslandAssignment { manifest }) => assignment = Some(manifest),
+            Some(_) => continue,
+            None => break,
+        }
+    }
+    let (island, deadline) = drain.expect("the peer is told which island it drained");
+    assert_eq!(island, formed.island);
+    assert!(
+        deadline > NOW_MS,
+        "a drain deadline already past is an order with no grace in it"
+    );
+    assert_eq!(
+        deadline,
+        NOW_MS + 10_000,
+        "the default grace is D7's 10 s lease TTL"
+    );
+
+    // And: it is not left islandless — the move formed a new one.
+    let joined = assignment.expect("the peer is assigned the island it moved into");
+    assert_ne!(joined.island, formed.island);
+    assert!(joined.cells.contains(&cell(500)));
+
+    let stats = server.stats().await;
+    assert_eq!(stats.drains_issued, 1);
+    assert_eq!(stats.islands, 1);
+    server.shutdown().await;
+}
+
+#[tokio::test]
 async fn presence_is_refused_without_a_valid_token() {
     let issuer = secret(200);
     let interest = secret(201);
