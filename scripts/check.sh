@@ -51,9 +51,12 @@ note() { echo "$NAME: $*" >&2; }
 #   root   the workspace at the repository root. Its clippy and test commands
 #          are spelled out in the lanes below because they carry the vendored
 #          `--exclude` set; `fmt` treats it like any other workspace.
-#   test   a standalone tool with tests of its own: `cargo test`. Four of them,
-#          carrying 87 tests between them — every one of which `cargo test
-#          --workspace` at the root runs zero of. `p4-streams-bench` is a measurement
+#   test   a standalone tool with tests of its own: `cargo test`. Every test
+#          they carry is a test `cargo test --workspace` at the root runs zero
+#          of, which is the whole reason this loop exists. Deliberately not a
+#          count: the previous wording said "four of them, carrying 87 tests"
+#          and there were five before #129 added a sixth, so the sentence was
+#          wrong in a way nothing could catch. `p4-streams-bench` is a measurement
 #          rather than a gate — its figures are in its README and the
 #          channel-policy decision they justify is in docs/02-networking.md §7 —
 #          so what CI owes it is that it still builds and still self-tests.
@@ -65,9 +68,19 @@ note() { echo "$NAME: $*" >&2; }
 #          by hand when someone is running the measurement.
 #   check  a standalone tool with no tests at all: `cargo check --all-targets`.
 #          `cargo test` on one of these would be a build dressed up as a gate,
-#          which reads as coverage that does not exist. `p3-island`'s behaviour
-#          is asserted by the nightly island gate instead, and the two p0 tools
-#          by the NAT lab they were written for.
+#          which reads as coverage that does not exist. The two p0 tools are
+#          asserted by the NAT lab they were written for.
+#
+#          `p3-island` sat here until #129, on the stated grounds that the
+#          nightly island gate asserts its behaviour instead. The gate does
+#          assert the *harness*; what it cannot assert is the harness's own
+#          unit tests, and by then there were two of them — including the one
+#          pinning the wire name of the counter the parked half of the P3
+#          criterion is read from — that nothing in this repository ran. The
+#          role was right when it was written and quietly wrong for months
+#          after, which is this file's own §"a `--self-test` nothing runs is
+#          not a check" with the roles swapped. A tool grows tests; the table
+#          has to notice.
 #
 # The three vendored crates are members of the root workspace rather than
 # workspaces of their own, so they are not listed — and note the consequence
@@ -81,7 +94,7 @@ readonly WORKSPACES=(
     'p1-swarm        test'
     'p2-dashboard    test'
     'p2-load         test'
-    'p3-island       check'
+    'p3-island       test'
     'p3-siblings     test'
     'p4-streams-bench test'
     'p2-journal-bench check'

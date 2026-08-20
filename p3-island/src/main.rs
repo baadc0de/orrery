@@ -20,8 +20,10 @@
 //!   *disposition*: inherited by a survivor (a `Grant` carrying the registrar
 //!   correlation), or parked at the registrar. The criterion counts both, so
 //!   the clock has to stop on either.
-//! - Anything with no disposition, and which no longer answers a claim, is a
-//!   **lost entity** — the failure the phase exists to rule out.
+//! - Anything with no disposition of its own is probed, and the probe's answer
+//!   is three facts rather than one: the row was free to take, the row is
+//!   **reserved** for the peer that died, or the row is neither. Only the last
+//!   is a **lost entity** — the failure the phase exists to rule out.
 //!
 //! ## How each half of the criterion is observed, and why
 //!
@@ -89,6 +91,43 @@
 //! and the claim probe is demoted to what it can actually prove — that an
 //! entity with no disposition still exists and still answers, i.e. that it is
 //! not lost.
+//!
+//! ## A denied probe is not a lost entity (#129)
+//!
+//! The probe used to answer `Option<lease_id>`, and every `Deny` — whatever
+//! the registrar's reason — collapsed into the `None` this report calls
+//! `lost`. Two outcomes, where the registrar distinguishes four.
+//!
+//! On the weak leg that was invisible, because the victim's rows reassign and
+//! are never probed at all. On the strong leg it is wrong for **every** row,
+//! and the leg could not pass: `LeaseStore::claim` refuses a foreign claimant
+//! on a parked strong row whose `bound_to` names its dead owner and whose
+//! reservation has not lapsed (`lease.rs`, the `row.holder.is_none() &&
+//! STRONG_HELD` branch), which is D7 §4.3 and docs/04-authority.md §7 working
+//! exactly as specified — "a strong-owned entity whose owner crashed re-parks
+//! with `own_seq` intact rather than being regranted". So all fifty probes
+//! were denied, and the gate reported all fifty lost.
+//!
+//! The probe therefore reports the registrar's *reason*, and the four answers
+//! are counted as the four different facts they are:
+//!
+//! - a **grant** — the row exists, answers, and no reservation stood over it;
+//! - `Deny{Parked}` — **parked and reserved**. `park()` writes `bound_to` from
+//!   the row's holder, and the only holder these rows ever had is the peer
+//!   that was killed, so a reservation refusing this probe is the victim's
+//!   reservation. A reserved row is accounted for; that reservation is the
+//!   whole point of the disposition, and counting it as a loss asserts the
+//!   opposite of the ADR;
+//! - **any other `Deny`** — the registrar answered, but with something that is
+//!   neither a grant nor a reservation. The probe has established nothing
+//!   about the row's disposition, so this counts as lost rather than as an
+//!   unexplained pass;
+//! - **no answer at all** — unreachable, and unreserved. This is the literal
+//!   lost entity.
+//!
+//! What is emphatically *not* the fix is making a parked strong row grantable.
+//! That would delete the §7 reservation the registrar exists to defend and
+//! would turn this gate green by breaking the thing it measures.
 
 mod peer;
 mod wire;
@@ -101,9 +140,9 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use clap::Parser;
 use orrery_protocol::{
-    AccountId, CellId, ClaimBasis, ClaimId, ClaimKind, GatewayMsg, GatewayReply, GridId,
-    IssuerKeyId, LeaseMsg, NodeId, PersistId, SeqPair, SessionStanding, SessionTokenClaimsV1,
-    SessionTokenTtlMs, SessionTokenV1, Tick, UnixMillis,
+    AccountId, CellId, ClaimBasis, ClaimId, ClaimKind, DenyReason, GatewayMsg, GatewayReply,
+    GridId, IssuerKeyId, LeaseMsg, NodeId, PersistId, SeqPair, SessionStanding,
+    SessionTokenClaimsV1, SessionTokenTtlMs, SessionTokenV1, Tick, UnixMillis,
 };
 
 use crate::peer::{PeerConfig, PeerEvent};
@@ -650,6 +689,29 @@ async fn orchestrate(cli: Cli) -> Result<Outcome> {
     // It runs only after the clock has stopped, because a claim issued while
     // the victim's lease might still be live would take the entity and settle
     // it by hand.
+    //
+    // What it *does* distinguish, since #129, is the registrar's reason for
+    // refusing. A `Deny{Parked}` is the answer D7 §4.3 specifies for a
+    // strong-owned row whose owner crashed, and it is the answer every one of
+    // the victim's rows gives on the strong leg; reading it as a loss made
+    // that leg unpassable. See [`ProbeOutcome`].
+    //
+    // The probe is a stranger to those rows on purpose. The reservation only
+    // refuses claimants other than the one it names, so a probe wearing the
+    // victim's own identity would be *granted* every row and would report the
+    // reservation as an ordinary free entity — the returning owner's reclaim
+    // (`lease.rs`'s `a_crashed_strong_owner_is_not_regranted_to_whoever_claims_next`),
+    // performed rather than observed. Its `peer_secret(u8::MAX)` identity is
+    // therefore load-bearing and not just a spare key.
+    //
+    // It also has to run inside the reservation's own grace window
+    // (`STRONG_PARK_GRACE_MS`, three lease TTLs from the park), because past
+    // it §7's ordinary "the first `Claim` by anyone unparks it" resumes and
+    // the same row answers with a grant. That is not a failure — a granted row
+    // is accounted for too — but it would stop the strong leg from
+    // demonstrating the reservation. Measured on this box: the rows park about
+    // 10.7 s after the kill and the first probe is sent about 16 s after it,
+    // against a 30 s grace.
     let probe_secret = peer_secret(u8::MAX);
     let probe_node = probe_secret.public();
     let probe_token = mint_token(&issuer, probe_node)?;
@@ -692,7 +754,14 @@ async fn orchestrate(cli: Cli) -> Result<Outcome> {
         "probe interest grant was refused"
     );
 
+    // Four buckets, one per answer the registrar can give. `lost` is the union
+    // of the two that account for nothing — refused for some reason that is
+    // not a reservation, or never answered — and it is the only one that fails
+    // the gate.
     let mut claimable = Vec::new();
+    let mut reserved = Vec::new();
+    let mut refused: Vec<serde_json::Value> = Vec::new();
+    let mut unreachable: Vec<u64> = Vec::new();
     let mut lost = Vec::new();
     let mut claim_id = 1u64;
     for entity in &victim_entities {
@@ -700,8 +769,19 @@ async fn orchestrate(cli: Cli) -> Result<Outcome> {
             continue;
         }
         match probe_claim(&probe, ClaimId(claim_id), PersistId::new(*entity), cell).await? {
-            Some(_) => claimable.push(*entity),
-            None => lost.push(*entity),
+            ProbeOutcome::Granted(_) => claimable.push(*entity),
+            ProbeOutcome::Reserved => reserved.push(*entity),
+            ProbeOutcome::Refused(reason) => {
+                // Carried with its reason rather than as a bare id: a run that
+                // fails here has to say what the registrar actually said, or
+                // the next reader repeats this issue's investigation.
+                refused.push(serde_json::json!({ "entity": entity, "reason": reason }));
+                lost.push(*entity);
+            }
+            ProbeOutcome::Unreachable => {
+                unreachable.push(*entity);
+                lost.push(*entity);
+            }
         }
         claim_id += 1;
     }
@@ -723,10 +803,19 @@ async fn orchestrate(cli: Cli) -> Result<Outcome> {
     // let that read as a pass.
     let attribution_sound = survivor_losses.is_empty();
     let dispositions_attested = reassigned_attested + parked_attested;
+    // The new category is corroborated rather than taken on the probe's word.
+    // "Parked and reserved" is a claim about a *park*, and the registrar's own
+    // `parked_without_successor` delta is what witnesses a park in this
+    // harness — every other number in this report defers to it for the same
+    // reason. Without this clause the reserved bucket would be a category the
+    // gate accepts on the strength of a refusal alone, which is how a bucket
+    // added to stop miscounting becomes somewhere to put anything awkward.
+    let reservations_attested = reserved.len() as u64 <= parked_attested;
     let passed = settled
         && dispositions_attested >= victim_entities.len() as u64
         && settled_in_ms <= settle_budget.as_millis() as u64
         && lost.is_empty()
+        && reservations_attested
         && duplicate_authority == 0
         && attribution_sound
         && unobserved.is_empty();
@@ -748,9 +837,24 @@ async fn orchestrate(cli: Cli) -> Result<Outcome> {
         "parked": parked_attested,
         "parked_when_clock_stopped": parked_delta,
         "dispositions_attested": dispositions_attested,
-        // What the probe actually proves: entities with no disposition of their
-        // own that still exist and still answer a claim.
+        // What the probe actually proves, split by the four answers the
+        // registrar can give to it. `claimable_after_settle` is a grant: the
+        // row exists, answers, and nothing stood over it.
         "claimable_after_settle": claimable.len(),
+        // `Deny{Parked}`: the row is parked and reserved for the peer that was
+        // killed (D7 §4.3; docs/04-authority.md §7). The specified answer on
+        // the strong leg, and neither a reassignment nor a loss.
+        "parked_and_reserved": reserved.len(),
+        // The registrar's own park count, repeated here as the thing
+        // `parked_and_reserved` is checked against; the pass clause is
+        // `parked_and_reserved <= parked`.
+        "reservations_attested": reservations_attested,
+        // Any other `Deny`, with the reason, and no answer at all. Both are
+        // lost — the row is not accounted for — and both are named separately
+        // so the failure says which kind it was.
+        "refused_after_settle": refused,
+        "unreachable_after_settle": unreachable.len(),
+        // Unreachable *and* unreserved: the union of the two above.
         "lost": lost,
         "settled": settled,
         "settled_in_ms": settled_in_ms,
@@ -796,21 +900,61 @@ unsafe fn libc_kill(pid: i32) {
         .ok();
 }
 
-/// Try to claim an entity, returning its granted lease id when the registrar
-/// answers with one.
+/// What the post-settle probe learned about one of the victim's rows.
 ///
-/// A grant proves the row exists and still answers — not that it was parked:
-/// `lease.rs::claim` grants a weak claim over a weak-held row whose holder is
-/// live and unexpired. The tier stays `Weak` deliberately: a `Strong` claim
-/// against a live holder is turned into a cooperative handoff request whose
-/// unanswered deadline hands the entity over, which is a harness resolving the
-/// redistribution rather than observing it.
+/// Four variants because the registrar answers four different things, and the
+/// two-valued `Option` this replaced could not tell the specified answer from
+/// the failure the phase exists to rule out (#129, and the module header's
+/// "A denied probe is not a lost entity").
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ProbeOutcome {
+    /// The registrar granted the claim, carrying the fencing token it issued.
+    ///
+    /// The row exists, still answers, and nothing stood over it — *not* that
+    /// it was parked: `lease.rs::claim` grants a weak claim over a weak-held
+    /// row whose holder is live and unexpired.
+    Granted(u64),
+    /// `Deny{Parked}`: the row is parked with a reservation that has not
+    /// lapsed and that names somebody other than this probe.
+    ///
+    /// The only somebody it can name here is the peer that was killed — the
+    /// reservation is written by `park()` out of the row's holder, and these
+    /// rows were held by the victim and by nobody else. This is a disposition,
+    /// not a loss.
+    Reserved,
+    /// Any other `Deny`, carrying the registrar's reason verbatim.
+    ///
+    /// Held by someone, not eligible, rate-limited, addressed to the wrong
+    /// owner: the registrar answered, but with nothing that accounts for the
+    /// row. Kept apart from [`ProbeOutcome::Reserved`] rather than folded into
+    /// it, because folding it in is precisely how a new category becomes a
+    /// place for failures to hide.
+    Refused(String),
+    /// The probe deadline passed with no answer naming this claim. Unreachable
+    /// and unreserved: the lost entity, in the criterion's own words.
+    Unreachable,
+}
+
+/// How long the probe waits for the registrar's answer about one row.
+///
+/// Nothing measured depends on it — the clock stopped before the first probe
+/// was sent — so it is sized to be far longer than a loopback round trip and
+/// short enough that fifty unanswered rows do not outlast the gate.
+const PROBE_DEADLINE: Duration = Duration::from_secs(5);
+
+/// Ask the registrar about one entity and report which of the four answers it
+/// gave.
+///
+/// The tier stays `Weak` deliberately: a `Strong` claim against a live holder
+/// is turned into a cooperative handoff request whose unanswered deadline
+/// hands the entity over, which is a harness resolving the redistribution
+/// rather than observing it.
 async fn probe_claim(
     session: &Session,
     claim_id: ClaimId,
     entity: PersistId,
     cell: CellId,
-) -> Result<Option<u64>> {
+) -> Result<ProbeOutcome> {
     session.send_control(&GatewayMsg::Lease {
         message: LeaseMsg::Claim {
             claim_id,
@@ -823,30 +967,74 @@ async fn probe_claim(
             tick: Tick::new(0),
         },
     })?;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let deadline = tokio::time::Instant::now() + PROBE_DEADLINE;
+    Ok(probe_outcome(claim_id, deadline, |within| session.recv(within)).await)
+}
+
+/// The probe's reply loop, over a receiver rather than over a live session.
+///
+/// Split out from [`probe_claim`] for one reason: the mapping from replies to
+/// outcomes is the whole of #129, and a mapping that can only be exercised by
+/// standing up eight peers and a registrar is a mapping nothing checks. Driven
+/// by the tests below with a scripted receiver, all four arms included.
+async fn probe_outcome<F, R>(
+    claim_id: ClaimId,
+    deadline: tokio::time::Instant,
+    mut recv: F,
+) -> ProbeOutcome
+where
+    F: FnMut(Duration) -> R,
+    R: std::future::Future<Output = Option<GatewayReply>>,
+{
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        let Some(reply) = session.recv(remaining).await else {
-            return Ok(None);
-        };
-        match reply {
-            GatewayReply::Lease {
-                message:
-                    LeaseMsg::Grant {
-                        claim_id: answered,
-                        lease_id,
-                        ..
-                    },
-            } if answered == claim_id => return Ok(Some(lease_id.0)),
-            GatewayReply::Lease {
-                message:
-                    LeaseMsg::Deny {
-                        claim_id: Some(answered),
-                        ..
-                    },
-            } if answered == claim_id => return Ok(None),
-            _ => {}
+        // A receiver handed a zero timeout is not obliged to block, so the
+        // deadline is enforced here as well: without this a chatty gateway
+        // whose traffic is all for other claims spins forever rather than
+        // reporting the row unreachable.
+        if remaining.is_zero() {
+            return ProbeOutcome::Unreachable;
         }
+        let Some(reply) = recv(remaining).await else {
+            return ProbeOutcome::Unreachable;
+        };
+        if let Some(outcome) = classify_probe_reply(claim_id, &reply) {
+            return outcome;
+        }
+    }
+}
+
+/// Map one gateway reply to the probe's verdict, or `None` when the reply is
+/// not this claim's answer.
+///
+/// `None` means "keep listening", and it has to stay distinguishable from
+/// every verdict: the probe shares its session with whatever else the gateway
+/// pushes — advisories, another claim's `Deny` — and treating one of those as
+/// this row's answer would report a fact about the wrong entity.
+fn classify_probe_reply(claim_id: ClaimId, reply: &GatewayReply) -> Option<ProbeOutcome> {
+    match reply {
+        GatewayReply::Lease {
+            message:
+                LeaseMsg::Grant {
+                    claim_id: answered,
+                    lease_id,
+                    ..
+                },
+        } if *answered == claim_id => Some(ProbeOutcome::Granted(lease_id.0)),
+        GatewayReply::Lease {
+            message:
+                LeaseMsg::Deny {
+                    claim_id: Some(answered),
+                    reason,
+                    ..
+                },
+        } if *answered == claim_id => Some(match reason {
+            // The specified answer on the strong leg, and the one the gate
+            // used to call a loss. See the module header.
+            DenyReason::Parked => ProbeOutcome::Reserved,
+            other => ProbeOutcome::Refused(format!("{other:?}")),
+        }),
+        _ => None,
     }
 }
 
@@ -1014,6 +1202,7 @@ fn encode_hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use orrery_protocol::LeaseId;
 
     /// The parked half of the criterion rides entirely on one field name in
     /// persistd's export. If that name ever moves, `parked` reads zero for
@@ -1059,5 +1248,144 @@ mod tests {
             SETTLE_GRANULARITY >= REGISTRAR_SWEEP_INTERVAL + published_lag,
             "settle budget {SETTLE_GRANULARITY:?} does not cover sweep + {published_lag:?}"
         );
+    }
+
+    /// One `Deny` for the probe to be answered with.
+    fn deny(claim_id: Option<ClaimId>, reason: DenyReason) -> GatewayReply {
+        GatewayReply::Lease {
+            message: LeaseMsg::Deny {
+                claim_id,
+                entity: PersistId::new(1),
+                reason,
+                retry_after_ms: 0,
+            },
+        }
+    }
+
+    /// One `Grant` for the probe to be answered with.
+    fn grant(claim_id: ClaimId, lease_id: u64) -> GatewayReply {
+        GatewayReply::Lease {
+            message: LeaseMsg::Grant {
+                claim_id,
+                entity: PersistId::new(1),
+                lease_id: LeaseId(lease_id),
+                seq: SeqPair::default(),
+                ttl_ms: 10_000,
+                prev_holder: None,
+            },
+        }
+    }
+
+    /// The mapping #129 is about, arm by arm.
+    ///
+    /// Every one of these was `None` before, and `None` is what the report
+    /// calls `lost`: the grant and the reservation were indistinguishable from
+    /// the loss. Written against the classifier rather than against a live
+    /// island, because a mapping that needs eight peers and a registrar to
+    /// exercise is a mapping nothing exercises.
+    #[test]
+    fn the_probe_tells_the_registrars_four_answers_apart() {
+        let ours = ClaimId(7);
+        assert_eq!(
+            classify_probe_reply(ours, &grant(ours, 42)),
+            Some(ProbeOutcome::Granted(42)),
+            "a grant is not reported as a grant"
+        );
+        assert_eq!(
+            classify_probe_reply(ours, &deny(Some(ours), DenyReason::Parked)),
+            Some(ProbeOutcome::Reserved),
+            "the parked reservation — the specified answer on the strong leg — is not reported as one"
+        );
+        let Some(ProbeOutcome::Refused(why)) =
+            classify_probe_reply(ours, &deny(Some(ours), DenyReason::NotEligible))
+        else {
+            panic!("a denial that is not the reservation must not read as one");
+        };
+        assert!(
+            why.contains("NotEligible"),
+            "the refusal does not carry the registrar's reason: {why}"
+        );
+        // And the fourth: nothing arrives at all. Driven through the reply
+        // loop, because "no answer" is a property of the loop rather than of
+        // any one reply.
+        let timed_out = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap()
+            .block_on(probe_outcome(
+                ours,
+                tokio::time::Instant::now() + Duration::from_millis(50),
+                |_| async { None },
+            ));
+        assert_eq!(
+            timed_out,
+            ProbeOutcome::Unreachable,
+            "a probe nobody answered is not reported unreachable"
+        );
+    }
+
+    /// Somebody else's answer is not this row's answer.
+    ///
+    /// The probe shares one session with everything else the gateway pushes,
+    /// and the four verdicts are only worth anything if the reply that carries
+    /// one is the reply to *this* claim. A classifier that matched on shape
+    /// alone would report another entity's denial as this entity's, which is
+    /// the same class of mistake as #129 one level down.
+    #[test]
+    fn a_reply_for_another_claim_is_not_this_rows_answer() {
+        let ours = ClaimId(7);
+        let theirs = ClaimId(8);
+        assert_eq!(classify_probe_reply(ours, &grant(theirs, 42)), None);
+        assert_eq!(
+            classify_probe_reply(ours, &deny(Some(theirs), DenyReason::Parked)),
+            None
+        );
+        // A `Deny` with no correlation at all answers no claim in particular
+        // (`claim_id: None` is the protocol's non-claim rejection).
+        assert_eq!(
+            classify_probe_reply(ours, &deny(None, DenyReason::Parked)),
+            None
+        );
+    }
+
+    /// The reply loop keeps listening past replies that are not its own, and
+    /// still stops at the deadline.
+    ///
+    /// Both halves in one test on purpose: a loop that gave up on the first
+    /// foreign reply would report a live row unreachable, and a loop that
+    /// never gave up would hang the gate on a chatty gateway rather than
+    /// failing it.
+    #[test]
+    fn the_reply_loop_skips_foreign_replies_without_spinning_forever() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        let ours = ClaimId(7);
+
+        let mut scripted = vec![
+            grant(ClaimId(8), 1),
+            deny(Some(ClaimId(9)), DenyReason::RateLimited),
+            deny(Some(ours), DenyReason::Parked),
+        ]
+        .into_iter();
+        let found = runtime.block_on(probe_outcome(
+            ours,
+            tokio::time::Instant::now() + Duration::from_secs(5),
+            |_| {
+                let next = scripted.next();
+                async move { next }
+            },
+        ));
+        assert_eq!(found, ProbeOutcome::Reserved);
+
+        // A receiver that answers instantly and never for us: the deadline is
+        // the only thing that can end this.
+        let chatty = runtime.block_on(probe_outcome(
+            ours,
+            tokio::time::Instant::now() + Duration::from_millis(50),
+            |_| async { Some(grant(ClaimId(8), 1)) },
+        ));
+        assert_eq!(chatty, ProbeOutcome::Unreachable);
     }
 }
