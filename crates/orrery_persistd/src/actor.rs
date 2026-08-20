@@ -150,6 +150,36 @@ pub enum Reject {
     JournalClosed,
     /// The durable lease row could not be committed.
     LeaseStore,
+    /// No shard hosted on this node covers the cell the request named, so
+    /// there is no actor here that could have answered it
+    /// (docs/08-persistence.md §3.5).
+    ///
+    /// This used to be [`Reject::JournalClosed`], and conflating the two cost
+    /// exactly what the distinction buys: a peer, an operator and a harness
+    /// could not tell "this node is broken" from "you are talking to the
+    /// wrong node", and the two call for opposite responses — one is a reason
+    /// to stop writing, the other a reason to write somewhere else.
+    ///
+    /// `shard` is the cell the request named. This node cannot name a coarser
+    /// owning shard for it: hosting no shard over it is the condition being
+    /// reported. `epoch` is the shard-ownership epoch this runtime activated
+    /// its own shards under (`FenceRow.epoch`), which is what §3.5's "reroute
+    /// on epoch bump" is written against; [`Epoch::new(0)`](Epoch) means this
+    /// level of the routing stack has no epoch of its own to report.
+    ///
+    /// Deliberately carries **no redirect target**: which node should have
+    /// been asked is ADR-0026's question, and that record is still Proposed.
+    /// The wire form ([`orrery_protocol::DenyReason::WrongOwner`]) keeps a
+    /// shaped hole for it; this one does not need it until something can fill
+    /// it, because it never crosses a process boundary.
+    WrongOwner {
+        /// The grid the refused request named.
+        grid: GridId,
+        /// The cell the refused request named.
+        shard: CellId,
+        /// This node's shard-ownership epoch, or `0` when unknown here.
+        epoch: Epoch,
+    },
 }
 
 /// Why a server committed-rekey record was rejected before actor transfer.

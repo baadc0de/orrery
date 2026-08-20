@@ -1049,7 +1049,11 @@ impl CellRuntime {
     pub async fn apply(&self, record: JournalRecord) -> Result<Lsn, actor::Reject> {
         let handle = self
             .actor(record.grid, record.cell)
-            .ok_or(actor::Reject::JournalClosed)?;
+            .ok_or(actor::Reject::WrongOwner {
+                grid: record.grid,
+                shard: record.cell,
+                epoch: self.epoch,
+            })?;
         handle.apply_diff(record).await
     }
 
@@ -1091,7 +1095,11 @@ impl CellRuntime {
     /// Read a snapshot from the actor owning `cell` in `grid` (P-7: the grid
     /// scopes which universe the cell id names).
     pub async fn read(&self, grid: GridId, cell: CellId) -> Result<SnapshotPage, actor::Reject> {
-        let handle = self.actor(grid, cell).ok_or(actor::Reject::JournalClosed)?;
+        let handle = self.actor(grid, cell).ok_or(actor::Reject::WrongOwner {
+            grid,
+            shard: cell,
+            epoch: self.epoch,
+        })?;
         handle.read_snapshot(vec![cell]).await
     }
 
@@ -1103,7 +1111,11 @@ impl CellRuntime {
     ) -> Result<crate::actor::CheckpointSnapshot, actor::Reject> {
         let handle = self
             .actor(self.grid, cell)
-            .ok_or(actor::Reject::JournalClosed)?;
+            .ok_or(actor::Reject::WrongOwner {
+                grid: self.grid,
+                shard: cell,
+                epoch: self.epoch,
+            })?;
         handle.checkpoint_snapshot().await
     }
 

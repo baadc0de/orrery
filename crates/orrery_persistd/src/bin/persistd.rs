@@ -1111,6 +1111,22 @@ async fn main() -> anyhow::Result<()> {
             "cluster_node_id": topology.node_id,
             "role": topology.role.name(),
             "ownership_epoch": activation.epoch.0,
+            // Which shards this node answers for, and at what fence epoch.
+            // Without it, "you are talking to the wrong node" is a claim a
+            // harness can receive (`DenyReason::WrongOwner`) and never check:
+            // nothing outside the process said which shards were owned here.
+            // Raw `CellId` bits, the same form `--shard` accepts, so the flag
+            // list and this line are comparable without a decoder.
+            "shards": activation
+                .rows
+                .iter()
+                .map(|(shard, row)| {
+                    serde_json::json!({
+                        "cell": shard.to_bits(),
+                        "epoch": row.epoch.0,
+                    })
+                })
+                .collect::<Vec<_>>(),
             "recovery_cutoff": recovery_cutoff,
             // The D16 `journal_open_ms` budget's measurand, reported by the
             // node that paid it: a restart's index rebuild is linear in the
@@ -1298,6 +1314,14 @@ struct StartupActivation {
     epoch: Epoch,
     /// The old primary epoch whose chain identity must be adopted.
     promoted_source_epoch: Option<u64>,
+    /// The durable `actor/{shard}` rows this activation committed, in the
+    /// canonical shard order `activate_shards` returns them in.
+    ///
+    /// Kept per shard rather than collapsed to the one epoch above, even
+    /// though activation refuses a mixed set today: the readiness line is read
+    /// by harnesses and operators, and "every shard is at epoch e" is a fact
+    /// worth *showing* rather than one they have to know to assume.
+    rows: Vec<(CellId, FenceRow)>,
 }
 
 /// Perform the only ownership transition allowed by the static topology.
@@ -1403,6 +1427,7 @@ async fn activate_topology(
     Ok(StartupActivation {
         epoch,
         promoted_source_epoch: source_epoch,
+        rows,
     })
 }
 

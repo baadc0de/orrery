@@ -322,6 +322,36 @@ pub const AREA_LOAD_ERR_LIVE: u8 = 1;
 /// [`GatewayReply::AreaLoadError`] kind: the cold durable-tier scan errored
 /// (e.g. an FDB transaction failure).
 pub const AREA_LOAD_ERR_COLD: u8 = 2;
+/// [`GatewayReply::AreaLoadError`] kind: this node hosts no shard covering the
+/// cell and no cold store here answered for it either, so the read was
+/// addressed to the wrong owner (docs/08-persistence.md §3.5).
+///
+/// Distinct from [`AREA_LOAD_ERR_COLD`] because nothing failed: an empty
+/// [`GatewayReply::AreaPage`] would have been a *false* answer, indis-
+/// tinguishable from a cell that genuinely holds nothing, and a node owning no
+/// shard over the cell is not entitled to make that claim.
+pub const AREA_LOAD_ERR_WRONG_OWNER: u8 = 3;
+
+/// [`GatewayReply::BulkNack`] reason: the journal refused or dropped the
+/// append, or the lease store could not be written.
+///
+/// The reason is a `u16` and the three codes below are the gateway's own; a
+/// `Ruleset` is free to define others above them.
+pub const BULK_NACK_JOURNAL: u16 = 1;
+/// [`GatewayReply::BulkNack`] reason: the write was refused before or at the
+/// fence — no session, a rekey record on the diff lane, a throttled misroute,
+/// or a fencing rejection (in which case `lease` carries the live row).
+pub const BULK_NACK_REFUSED: u16 = 2;
+/// [`GatewayReply::BulkNack`] reason: this node hosts no shard covering the
+/// diff's cell, so the write was addressed to the wrong owner
+/// (docs/08-persistence.md §3.5).
+///
+/// **A peer must not read this as a lease loss.** Every other NACK reason is
+/// about the write; this one is about the address, and the registrar row this
+/// peer holds is untouched by it. A NACK carrying this code therefore never
+/// carries a `lease` row either — there is no row here to carry — and a client
+/// that revoked on it would hand away authority the cluster never withdrew.
+pub const BULK_NACK_WRONG_OWNER: u16 = 3;
 
 /// The maximum size of one encoded area-page frame on the wire, in bytes.
 ///
