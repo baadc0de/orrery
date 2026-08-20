@@ -379,6 +379,16 @@ fn write_gateway_authority(
             "divest_rejected": snapshot.divest_rejected,
             "divest_requested": snapshot.divest_requested,
             "handoff_timed_out": snapshot.handoff_timed_out,
+            // D25's `Expire` fan-out, exported for the same reason the three
+            // route counters above are: a bound nobody can read is a
+            // paragraph. `sent` against `parked_without_successor` gives the
+            // realised `|A|` per parked lease — the distribution D25's open
+            // question asks to be measured — and `dropped` distinguishes a
+            // cell past D6's population ceiling from one peer's egress bucket
+            // doing its job.
+            "expire_fanout_sent": snapshot.expire_fanout_sent,
+            "expire_fanout_skipped": snapshot.expire_fanout_skipped,
+            "expire_fanout_dropped": snapshot.expire_fanout_dropped,
         }),
     )
     .map_err(std::io::Error::other)?;
@@ -2060,6 +2070,9 @@ mod tests {
             "divest_rejected",
             "divest_requested",
             "handoff_timed_out",
+            "expire_fanout_sent",
+            "expire_fanout_skipped",
+            "expire_fanout_dropped",
         ] {
             assert!(
                 record.get(field).is_some(),
@@ -2069,8 +2082,8 @@ mod tests {
         let object = record.as_object().expect("record is an object");
         assert_eq!(
             object.len(),
-            11,
-            "ten counters plus the type tag: {object:?}"
+            14,
+            "thirteen counters plus the type tag: {object:?}"
         );
         // p3-island's reader takes `duplicate_authority` and ignores every
         // other key, so widening the record is safe for the one parser there

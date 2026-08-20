@@ -3101,6 +3101,552 @@ fn expired_holder_lease_is_reassigned_and_the_silent_holder_is_told() {
     });
 }
 
+// ── D25: `Expire` fan-out to the cell's interest set ────────────────────────
+//
+// The registrar used to tell only the losing holder that a lease ended, which
+// made a park observable from no peer at all — and on a disconnect, where the
+// holder is by definition gone, observable from nobody whatsoever. D25 fans a
+// verbatim copy of the same `LeaseMsg::Expire` out to
+// `A(G, grid, cell, t) = { p ∈ Sessions(G,t) : allows(p, grid, cell, t) }`,
+// for the two dispositions that have no self-healing path of their own.
+//
+// The fixture below is deliberately four peers rather than the two
+// `handoff_fixture` uses, because three distinct exclusion reasons have to be
+// told apart in one run: a peer that covers the cell, a peer whose grant
+// covers a *different* cell, and a peer whose grant covers this cell but has
+// lapsed by the gateway clock. Only the first is a recipient, and all three
+// answer the same `allows` seam a live `Claim` does.
+
+/// A fan-out fixture: one holder plus three observers with different interest.
+struct FanoutFixture {
+    _dir: tempfile::TempDir,
+    server: GatewayServer,
+    _endpoints: Vec<iroh::Endpoint>,
+    /// Connections for `node(1)..=node(n)`, in that order.
+    peers: Vec<lanes::GatewayLanes>,
+    entity: PersistId,
+    cell: CellId,
+}
+
+impl FanoutFixture {
+    /// The connection for `node(seed)`.
+    fn peer(&self, seed: u8) -> &lanes::GatewayLanes {
+        &self.peers[usize::from(seed) - 1]
+    }
+}
+
+/// Bring up a gateway with one seeded entity and one session per snapshot.
+///
+/// `snapshots` is indexed by peer: entry `i` is `node(i + 1)`'s coordinator
+/// interest, so a test says what each peer covers by constructing its snapshot
+/// rather than by threading flags through here.
+async fn fanout_fixture(
+    config: GatewayConfig,
+    snapshots: Vec<CoordinatorInterestSnapshot>,
+) -> FanoutFixture {
+    let dir = tempfile::tempdir().unwrap();
+    let runtime = Arc::new(Mutex::new({
+        let store: Arc<dyn orrery_persistd::checkpoint::CheckpointStore> =
+            Arc::new(orrery_persistd::checkpoint::MemCheckpointStore::new());
+        CellRuntime::open(&runtime_config(dir.path()), &store)
+            .await
+            .unwrap()
+    }));
+    let cell = CellId::ROOT.children()[0];
+    let entity = PersistId::new(771);
+    seed_entity(&runtime, entity, cell).await;
+
+    let issuer = secret(42);
+    let peer_count = snapshots.len();
+    let server = GatewayServer::spawn(
+        GatewayConfig {
+            interest_authority: support::interest_authority(snapshots),
+            authorizer: support::authorizer(&issuer),
+            identity_clock: support::fixed_clock(support::TOKEN_NOW_MS),
+            identity_health: support::available_identity_health(),
+            ..config
+        },
+        runtime.clone(),
+    )
+    .await
+    .unwrap();
+
+    let mut endpoints = Vec::new();
+    let mut peers = Vec::new();
+    for seed in 1..=u8::try_from(peer_count).expect("peer count fits a seed") {
+        let (endpoint, connection) = raw_connection(secret(seed), server.addr()).await;
+        connection
+            .send_control(&GatewayMsg::Hello {
+                token: session_token(
+                    &issuer,
+                    node(seed),
+                    support::TOKEN_ISSUED_AT_MS,
+                    support::TOKEN_TTL_MS,
+                ),
+                node: node(seed),
+            })
+            .await;
+        assert!(receives_hello_ack(&connection).await);
+        endpoints.push(endpoint);
+        peers.push(connection);
+    }
+
+    FanoutFixture {
+        _dir: dir,
+        server,
+        _endpoints: endpoints,
+        peers,
+        entity,
+        cell,
+    }
+}
+
+/// A coordinator snapshot that lapsed before the gateway ever read it.
+///
+/// `allows` requires `valid_until_ms > now_ms` and the registrar clock is
+/// process uptime, so zero is unconditionally in the past. That is the point
+/// of the case: interest is a lifetime the gateway stamps, and a peer between
+/// refreshes still *renders* the cell while being invisible to `allows` — D25
+/// rule 2 names it as one of the three exclusions from D5's true interest set.
+fn lapsed_interest_snapshot(
+    peer: orrery_protocol::NodeId,
+    cell: CellId,
+) -> CoordinatorInterestSnapshot {
+    CoordinatorInterestSnapshot {
+        valid_until_ms: 0,
+        ..support::interest_snapshot(peer, GridId::ROOT, vec![cell])
+    }
+}
+
+/// Assert nothing more arrives on `connection` within `within`.
+///
+/// Deliberately not `pushed_lease(..).is_none()` inline at every call site: a
+/// negative here is the load-bearing half of the recipient set, and it has to
+/// name what it saw when it fails.
+async fn no_pushed_lease(connection: &lanes::GatewayLanes, within: Duration, who: &str) {
+    if let Some(message) = pushed_lease(connection, within).await {
+        panic!("{who} must receive nothing, got {message:?}");
+    }
+}
+
+/// Claim the fan-out fixture's entity for `node(1)`, strongly.
+///
+/// Strong is what makes the row park rather than reassign: `place` returns
+/// `Parked` for a `STRONG_HELD` row *before* any candidate is computed (D7
+/// §5 — only weak authority is redistributed without consent), which is
+/// exactly the disposition with no successor stream to converge observers, and
+/// therefore the one D25 fans out.
+async fn strong_claim_for_holder(fixture: &FanoutFixture) -> LeaseId {
+    let granted = claim_reply(
+        fixture.peer(1),
+        fixture.entity,
+        GridId::ROOT,
+        fixture.cell,
+        ClaimKind::Strong,
+        ClaimBasis::Explicit,
+    )
+    .await;
+    let LeaseMsg::Grant { lease_id, .. } = granted else {
+        panic!("holder's covered strong claim must be granted, got {granted:?}");
+    };
+    lease_id
+}
+
+/// The `Expire` a non-holder should see for a parked entity.
+fn expected_park_advisory(
+    entity: PersistId,
+    lease_id: LeaseId,
+    reason: orrery_protocol::ExpireReason,
+) -> LeaseMsg {
+    LeaseMsg::Expire {
+        entity,
+        lease_id,
+        last_holder: Some(node(1)),
+        reason,
+        disposition: orrery_protocol::ExpireDisposition::Parked,
+    }
+}
+
+/// Peers 2 and 3 cover the entity's cell; peer 4 covers a different one.
+fn fanout_snapshots(cell: CellId) -> Vec<CoordinatorInterestSnapshot> {
+    let elsewhere = CellId::ROOT.children()[1];
+    vec![
+        support::interest_snapshot(node(1), GridId::ROOT, vec![cell]),
+        support::interest_snapshot(node(2), GridId::ROOT, vec![cell]),
+        support::interest_snapshot(node(3), GridId::ROOT, vec![cell]),
+        support::interest_snapshot(node(4), GridId::ROOT, vec![elsewhere]),
+    ]
+}
+
+#[test]
+fn ttl_expiry_of_a_parked_lease_fans_the_expire_out_to_the_cells_interest_set() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        // Given: a strong holder and three onlookers — two covering the
+        // entity's cell, one covering a different one — and a sweep clock a
+        // test can push past the 10 s TTL.
+        let sweep_clock = Arc::new(AtomicClaimClock(AtomicU64::new(0)));
+        let cell = CellId::ROOT.children()[0];
+        let fixture = fanout_fixture(
+            GatewayConfig {
+                lease_sweep_clock: sweep_clock.clone(),
+                ..GatewayConfig::default()
+            },
+            fanout_snapshots(cell),
+        )
+        .await;
+        let lease_id = strong_claim_for_holder(&fixture).await;
+        let before = fixture.server.authority_metrics().snapshot();
+
+        // When: the holder goes silent past its TTL.
+        sweep_clock.0.store(u64::MAX, Ordering::SeqCst);
+
+        // Then: the holder is told, as it always was...
+        let expected = expected_park_advisory(
+            fixture.entity,
+            lease_id,
+            orrery_protocol::ExpireReason::Timeout,
+        );
+        assert_eq!(
+            pushed_lease(fixture.peer(1), Duration::from_secs(5))
+                .await
+                .expect("the silent holder is told its lease ended"),
+            expected,
+        );
+
+        // ...and so is every peer whose live coordinator interest covers the
+        // cell, with the *same* entity, token and disposition. Identical by
+        // construction rather than by copying: one `LeaseMsg` value is cloned
+        // per recipient, which is what makes the wire format unchanged and the
+        // rollout one-sided (D25 rule 4).
+        for observer in [2u8, 3] {
+            assert_eq!(
+                pushed_lease(fixture.peer(observer), Duration::from_secs(5))
+                    .await
+                    .unwrap_or_else(|| panic!("covering peer {observer} receives the advisory")),
+                expected,
+                "peer {observer}'s copy must be the holder's copy verbatim",
+            );
+        }
+
+        // The peer whose grant covers another cell is not in `A` and hears
+        // nothing. Checked after the two positives have landed, so this is a
+        // real absence rather than a race with delivery.
+        no_pushed_lease(
+            fixture.peer(4),
+            Duration::from_millis(500),
+            "a peer whose interest covers a different cell",
+        )
+        .await;
+
+        // The fan-out is purely additive: the disposition counters read
+        // exactly as they did before D25, and nothing about it can produce two
+        // live writers.
+        let after = fixture.server.authority_metrics().snapshot();
+        assert_eq!(after.expire_fanout_sent - before.expire_fanout_sent, 2);
+        assert_eq!(after.expire_fanout_dropped, before.expire_fanout_dropped);
+        assert_eq!(after.expire_fanout_skipped, before.expire_fanout_skipped);
+        assert_eq!(
+            after.parked_without_successor - before.parked_without_successor,
+            1,
+            "one park, whatever the audience size"
+        );
+        assert_eq!(after.reassigned, before.reassigned);
+        assert_eq!(after.duplicate_authority, 0);
+
+        sweep_clock.0.store(0, Ordering::SeqCst);
+        fixture.server.shutdown().await;
+    });
+}
+
+#[test]
+fn a_disconnected_holders_park_is_observed_by_the_cells_interest_set() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        // Given: the same island, resolved by the *fast* path this time —
+        // `cleanup_peer_session` on an observed disconnect rather than the TTL
+        // sweep.
+        let cell = CellId::ROOT.children()[0];
+        let fixture = fanout_fixture(GatewayConfig::default(), fanout_snapshots(cell)).await;
+        let lease_id = strong_claim_for_holder(&fixture).await;
+        let before = fixture.server.authority_metrics().snapshot();
+
+        // When: the holder's session dies. Its own copy of the `Expire` is
+        // undeliverable by construction — this is the case the harness used to
+        // record as "parking is not observable from any peer".
+        fixture.peer(1).conn().close(0u32.into(), b"gone");
+
+        // Then: the survivors that cover the cell observe the disposition.
+        let expected = expected_park_advisory(
+            fixture.entity,
+            lease_id,
+            orrery_protocol::ExpireReason::Disconnect,
+        );
+        for observer in [2u8, 3] {
+            assert_eq!(
+                pushed_lease(fixture.peer(observer), Duration::from_secs(5))
+                    .await
+                    .unwrap_or_else(|| panic!("covering peer {observer} receives the advisory")),
+                expected,
+            );
+        }
+        no_pushed_lease(
+            fixture.peer(4),
+            Duration::from_millis(500),
+            "a peer whose interest covers a different cell",
+        )
+        .await;
+
+        let after = fixture.server.authority_metrics().snapshot();
+        assert_eq!(after.expire_fanout_sent - before.expire_fanout_sent, 2);
+        assert_eq!(
+            after.parked_without_successor - before.parked_without_successor,
+            1
+        );
+        assert_eq!(after.reassigned, before.reassigned);
+        assert_eq!(after.duplicate_authority, 0);
+
+        fixture.server.shutdown().await;
+    });
+}
+
+#[test]
+fn a_peer_whose_interest_grant_lapsed_receives_no_expire_copy() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        // Given: two onlookers whose grants name the *same* cell, one of them
+        // lapsed by the gateway's own clock. Fan-out eligibility is claim
+        // admission, through the same seam, so the lapsed peer must be as
+        // invisible to the advisory as it is to a successor nomination.
+        let sweep_clock = Arc::new(AtomicClaimClock(AtomicU64::new(0)));
+        let cell = CellId::ROOT.children()[0];
+        let fixture = fanout_fixture(
+            GatewayConfig {
+                lease_sweep_clock: sweep_clock.clone(),
+                ..GatewayConfig::default()
+            },
+            vec![
+                support::interest_snapshot(node(1), GridId::ROOT, vec![cell]),
+                support::interest_snapshot(node(2), GridId::ROOT, vec![cell]),
+                lapsed_interest_snapshot(node(3), cell),
+            ],
+        )
+        .await;
+        let lease_id = strong_claim_for_holder(&fixture).await;
+        let before = fixture.server.authority_metrics().snapshot();
+
+        // When: the lease lapses.
+        sweep_clock.0.store(u64::MAX, Ordering::SeqCst);
+
+        // Then: the live grant is served and the lapsed one is not.
+        assert_eq!(
+            pushed_lease(fixture.peer(2), Duration::from_secs(5))
+                .await
+                .expect("the peer with live interest receives the advisory"),
+            expected_park_advisory(
+                fixture.entity,
+                lease_id,
+                orrery_protocol::ExpireReason::Timeout
+            ),
+        );
+        no_pushed_lease(
+            fixture.peer(3),
+            Duration::from_millis(500),
+            "a peer whose interest grant has lapsed",
+        )
+        .await;
+
+        let after = fixture.server.authority_metrics().snapshot();
+        assert_eq!(after.expire_fanout_sent - before.expire_fanout_sent, 1);
+        assert_eq!(after.duplicate_authority, 0);
+
+        sweep_clock.0.store(0, Ordering::SeqCst);
+        fixture.server.shutdown().await;
+    });
+}
+
+#[test]
+fn a_reassigned_expiry_is_holder_only_and_the_successor_gets_only_its_grant() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        // Given: a *weak* holder — the disposition that redistributes — and
+        // two peers that both cover the cell, so one inherits and the other is
+        // a live, covered, non-holder onlooker. Exactly the peer D25 rule 7
+        // declines to tell, because INV-4 converges it on the successor's
+        // first replicated envelope anyway.
+        let sweep_clock = Arc::new(AtomicClaimClock(AtomicU64::new(0)));
+        let cell = CellId::ROOT.children()[0];
+        let fixture = fanout_fixture(
+            GatewayConfig {
+                lease_sweep_clock: sweep_clock.clone(),
+                ..GatewayConfig::default()
+            },
+            vec![
+                support::interest_snapshot(node(1), GridId::ROOT, vec![cell]),
+                support::interest_snapshot(node(2), GridId::ROOT, vec![cell]),
+                support::interest_snapshot(node(3), GridId::ROOT, vec![cell]),
+            ],
+        )
+        .await;
+        let granted = claim_reply(
+            fixture.peer(1),
+            fixture.entity,
+            GridId::ROOT,
+            fixture.cell,
+            ClaimKind::Weak,
+            ClaimBasis::Contact { tick: Tick::new(1) },
+        )
+        .await;
+        let LeaseMsg::Grant { lease_id, .. } = granted else {
+            panic!("holder's covered weak claim must be granted, got {granted:?}");
+        };
+        let before = fixture.server.authority_metrics().snapshot();
+
+        // When: the lease lapses and the registrar places it with a successor.
+        sweep_clock.0.store(u64::MAX, Ordering::SeqCst);
+
+        // Then: the holder is told where authority went...
+        let LeaseMsg::Expire {
+            disposition: orrery_protocol::ExpireDisposition::Reassigned { to: successor },
+            lease_id: expired_lease_id,
+            ..
+        } = pushed_lease(fixture.peer(1), Duration::from_secs(5))
+            .await
+            .expect("the silent holder is told its lease ended")
+        else {
+            panic!("a weak lease with covered candidates must reassign");
+        };
+        assert_eq!(expired_lease_id, lease_id);
+
+        // ...the successor receives a `Grant`, and specifically **not** an
+        // `Expire` telling it that it lost what it just gained...
+        let inherited = pushed_lease(
+            fixture.peer(if successor == node(2) { 2 } else { 3 }),
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("the successor is told it inherited the lease");
+        let LeaseMsg::Grant {
+            claim_id,
+            lease_id: successor_lease_id,
+            ..
+        } = inherited
+        else {
+            panic!("successor must receive a grant, got {inherited:?}");
+        };
+        assert_eq!(claim_id, orrery_protocol::ClaimId::REGISTRAR);
+        assert!(successor_lease_id > lease_id);
+
+        // ...and the other covered onlooker receives nothing at all. This is
+        // the clause that makes D25's arithmetic work: fanning `Reassigned`
+        // out would restore the `L × |A|` burst in the exact scenario the
+        // system is designed around — a field host disconnecting — to save one
+        // 20 Hz send interval in the case INV-4 already handles.
+        let bystander = if successor == node(2) { 3 } else { 2 };
+        no_pushed_lease(
+            fixture.peer(bystander),
+            Duration::from_millis(500),
+            "a covered non-holder on a reassignment",
+        )
+        .await;
+
+        let after = fixture.server.authority_metrics().snapshot();
+        assert_eq!(
+            after.expire_fanout_sent, before.expire_fanout_sent,
+            "a reassignment fans out nothing"
+        );
+        assert_eq!(after.expire_fanout_dropped, before.expire_fanout_dropped);
+        assert_eq!(after.reassigned - before.reassigned, 1);
+        assert_eq!(
+            after.parked_without_successor, before.parked_without_successor,
+            "reassignment must not be miscounted as a park"
+        );
+        assert_eq!(after.duplicate_authority, 0);
+
+        sweep_clock.0.store(0, Ordering::SeqCst);
+        fixture.server.shutdown().await;
+    });
+}
+
+#[test]
+fn a_consented_release_is_advertised_to_the_cells_interest_set() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        // Given: a holder about to put an entity down deliberately. `to: None`
+        // parks it, and a park is the disposition with no successor stream —
+        // without the advisory every observer extrapolates a proxy of a body
+        // nobody writes.
+        let cell = CellId::ROOT.children()[0];
+        let fixture = fanout_fixture(GatewayConfig::default(), fanout_snapshots(cell)).await;
+        let granted = claim_reply(
+            fixture.peer(1),
+            fixture.entity,
+            GridId::ROOT,
+            fixture.cell,
+            ClaimKind::Weak,
+            ClaimBasis::Contact { tick: Tick::new(1) },
+        )
+        .await;
+        let LeaseMsg::Grant { lease_id, seq, .. } = granted else {
+            panic!("holder's covered weak claim must be granted, got {granted:?}");
+        };
+        let before = fixture.server.authority_metrics().snapshot();
+
+        // When: it releases rather than handing off.
+        fixture
+            .peer(1)
+            .send_control(&GatewayMsg::Lease {
+                message: LeaseMsg::Divest {
+                    entity: fixture.entity,
+                    lease_id,
+                    to: None,
+                    final_seq: seq,
+                    cursor: None,
+                },
+            })
+            .await;
+
+        // Then: its own reply is the `Expire`, and the covering peers get the
+        // same message.
+        let expected = expected_park_advisory(
+            fixture.entity,
+            lease_id,
+            orrery_protocol::ExpireReason::Parked,
+        );
+        assert_eq!(
+            pushed_lease(fixture.peer(1), Duration::from_secs(5))
+                .await
+                .expect("the divesting holder receives its expiry"),
+            expected,
+        );
+        for observer in [2u8, 3] {
+            assert_eq!(
+                pushed_lease(fixture.peer(observer), Duration::from_secs(5))
+                    .await
+                    .unwrap_or_else(|| panic!("covering peer {observer} receives the advisory")),
+                expected,
+            );
+        }
+        no_pushed_lease(
+            fixture.peer(4),
+            Duration::from_millis(500),
+            "a peer whose interest covers a different cell",
+        )
+        .await;
+
+        let after = fixture.server.authority_metrics().snapshot();
+        assert_eq!(after.expire_fanout_sent - before.expire_fanout_sent, 2);
+        assert_eq!(after.divested - before.divested, 1);
+        assert_eq!(
+            after.parked_without_successor, before.parked_without_successor,
+            "a consented release is not a park for want of a successor"
+        );
+        assert_eq!(after.duplicate_authority, 0);
+
+        fixture.server.shutdown().await;
+    });
+}
+
 #[test]
 fn negotiated_divestiture_hands_the_lease_to_the_named_successor() {
     let rt = tokio::runtime::Runtime::new().unwrap();
@@ -3888,6 +4434,25 @@ fn a_holder_that_parks_instead_of_handing_over_still_answers_the_claimant() {
                 reason: orrery_protocol::DenyReason::NotEligible,
                 retry_after_ms: 0,
             }
+        );
+
+        // And: because this claimant is also a peer whose coordinator interest
+        // covers the cell, the same release reaches it a second time as a D25
+        // advisory. It arrives *after* the `Deny` — `divest_lease` answers a
+        // waiting claimant before it fans anything out — and it is drained
+        // here rather than tolerated, because the retry below reads the next
+        // lease frame on this lane and would otherwise read this one.
+        assert_eq!(
+            pushed_lease(&fixture.successor, Duration::from_secs(5))
+                .await
+                .expect("the claimant observes the park it asked for"),
+            LeaseMsg::Expire {
+                entity: fixture.entity,
+                lease_id,
+                last_holder: Some(node(1)),
+                reason: orrery_protocol::ExpireReason::Parked,
+                disposition: orrery_protocol::ExpireDisposition::Parked,
+            },
         );
 
         // And: the entity parked, so the claimant's retry can unpark it.

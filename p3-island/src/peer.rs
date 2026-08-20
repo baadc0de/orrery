@@ -60,6 +60,25 @@ pub enum PeerEvent {
     },
     /// A held lease ended.
     Lost { entity: u64, disposition: String },
+    /// The registrar told this peer about an expiry on an entity it does
+    /// **not** hold — D25's non-holder `Expire` advisory.
+    ///
+    /// This is the instrument the module header used to say did not exist.
+    /// A park has no successor stream to converge observers on, so before D25
+    /// nothing was sent to anybody but the previous holder — who, on the leg
+    /// this matters for, is the peer that was just SIGKILLed. Recording it
+    /// here is a pure observation: the peer changes no state and issues no
+    /// claim, so unlike a probe claim it cannot perform the redistribution it
+    /// is measuring.
+    ///
+    /// `at_ms` is when this peer received it, off the same system clock the
+    /// orchestrator subtracts from.
+    Observed {
+        entity: u64,
+        lease_id: u64,
+        disposition: String,
+        at_ms: u64,
+    },
     /// The peer finished its run cleanly.
     Done { held: usize },
 }
@@ -321,6 +340,21 @@ fn apply_unsolicited(
                 emit(&PeerEvent::Lost {
                     entity: entity.0,
                     disposition: format!("{disposition:?}"),
+                });
+            } else {
+                // Not ours: either an entity this peer never held, or a token
+                // it has already moved past. Both are D25 advisories, and both
+                // are correctly inert — the client rule is that a non-holder
+                // copy changes a *belief* about who holds the entity and
+                // nothing else. It touches no `SeqPair`, no fence and no held
+                // lease here, which is exactly what the pre-D25 client already
+                // did with an unexpected copy and why this rolls out one-sided
+                // (`orrery_authority`'s own handling is a separate issue).
+                emit(&PeerEvent::Observed {
+                    entity: entity.0,
+                    lease_id: lease_id.0,
+                    disposition: format!("{disposition:?}"),
+                    at_ms: unix_ms(),
                 });
             }
         }
