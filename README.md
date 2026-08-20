@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/assets/orrery-cover.png" alt="Orrery — a persistent-universe toolkit for Bevy" width="100%">
+  <img src="docs/assets/wide_stylized_sci_fi_promotional_banner_hero_image.png" alt="Orrery — a persistent-universe toolkit for Bevy" width="100%">
 </p>
 
 # Orrery
