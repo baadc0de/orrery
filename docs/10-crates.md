@@ -471,7 +471,13 @@ Landed. Defines `OrreryClientPlugins<R: Ruleset>` — a Bevy `PluginGroup` in de
 
 ### 11. `orrery_persistd` — persistence cluster harness
 
-**Bevy-free** (D15). A library harness plus a reference binary: gateway (iroh endpoint at a well-known address), single-writer cell actors, the segmented append-only journal (group commit, ~2 ms fsync — indexed wal-db by default under D19, with Fjall as an explicit fallback), FoundationDB checkpoint/restore on the 20 s jittered cadence, the lease registrar (CAS rows), intent validation (`Ruleset::validate_intent` + FDB serializable transactions, < 10 ms p99), the adjudication executor (`ReplayHarness<R>`), and hotspot cell splitting. Internal service-to-service traffic uses tonic/gRPC where boring is better (D12). Games do not run this binary — they link their rules into their own (next section).
+**Bevy-free** (D15). A library harness plus a reference binary — and as of
+[D21](adr/0021-ruleset-distribution.md) the harness half is **frozen**: a
+breaking change to the seams a game composes (`CellRuntime`/`RuntimeConfig`,
+`IntentValidator`/`IntentExecutor`, `AdjudicationExecutor::register`,
+`CheckpointStore`/`ColdCellReader`, `Router`, the gateway exports,
+`LeaseStore`/`FenceStore`, `Journal`) needs an ADR that names D21. Additive
+change does not. gateway (iroh endpoint at a well-known address), single-writer cell actors, the segmented append-only journal (group commit, ~2 ms fsync — indexed wal-db by default under D19, with Fjall as an explicit fallback, and bounded by the checkpoint retention floor under D20), FoundationDB checkpoint/restore on the 20 s jittered cadence, the lease registrar (CAS rows), intent validation (`Ruleset::validate_intent` + FDB serializable transactions, < 10 ms p99), the adjudication executor (`ReplayHarness<R>`), and hotspot cell splitting. Internal service-to-service traffic uses tonic/gRPC where boring is better (D12). Games do not run this binary — they link their rules into their own (next section).
 
 **Features:** the manifest default is `["journal-raw", "chain-grpc"]`.
 `journal-raw` uses wal-db 1.0.0 for segmented CRC-framed storage and rebuilds
