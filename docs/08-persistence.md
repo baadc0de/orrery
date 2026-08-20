@@ -3457,10 +3457,20 @@ different mechanism. The P2 kill-9 gate holds with retention on: four
 alternating arms on a qualified `c4d-standard-32-lssd` passed 4/4, retention
 releasing 13 and 17 times inside its two arms' 30-second load phases, with
 `journal_commit_ms` p99 at 1 ms in every arm and every pre-crash
-acknowledgement recovered (docs/data/p2-retention-gate-2026-08-20.json). The
-residual D20 names is the *follower's* mirror, which is still unbounded: releasing a prefix of its provenance index would rebuild an
-empty chain cursor and force a full re-stream, so a follower reclaims nothing
-until that cursor is persisted.
+acknowledgement recovered (docs/data/p2-retention-gate-2026-08-20.json). The residual D20 named — the *follower's* mirror, unbounded because
+releasing a prefix of its provenance index would rebuild an empty chain cursor
+and force a full re-stream — is closed by
+[D23](adr/0023-follower-journal-retention.md): the primary's own floor travels
+on the chain, the follower releases up to the local position of the first
+mirrored row at or above it, and the dedupe cursor is seeded from the durable
+row rather than rebuilt from batch zero. Retention is a *mandatory* clause of
+the P2 gate from the same decision — both nodes' floors must advance and every
+`journal_open_ms` must be inside D16's 2 000 ms budget — rather than something
+the gate covered when jitter happened to fire it. The budget half is what the
+residual actually cost: in the cadence arm whose follower released nothing, the
+promoted node's `Journal::open` took **2 905 ms** after a thirty-second load,
+against 764 ms and 300 ms in the arms that released
+(docs/data/p2-follower-retention-2026-08-20.json).
 
 - **Griefing rollback:** administrative inverse-op replay — select archive records by `(cell range, author/account, time range)`, generate inverse operations (terrain delta inverses, entity state restores from the preceding checkpoint), and apply them as administrative intents through the critical path (audited, attributable).
 - **Offline progress / parked-cell catch-up:** on reload of a parked cell, the field host runs `Ruleset` catch-up (D7); the archive supplies the input history where catch-up depends on past events.

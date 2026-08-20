@@ -245,6 +245,16 @@ pub trait ChainTransport: Send + Sync {
     /// The follower's durable watermark (highest primary LSN persisted on the
     /// follower), or `None` if unknown.
     async fn follower_watermark(&self) -> Option<Lsn>;
+
+    /// Tell the follower how far the *primary* has released its own journal,
+    /// which is what bounds the follower's mirror (D23).
+    ///
+    /// A no-op by default: a transport with no way to carry the floor leaves
+    /// the mirror pinned, which is the pre-D23 behaviour and is safe. The
+    /// value travels on the next frame the transport sends rather than as an
+    /// RPC of its own — one monotone LSN, taken as a maximum by the follower,
+    /// so a dropped frame costs a cadence of retention and nothing else.
+    fn note_primary_floor(&self, _floor: Lsn) {}
 }
 
 /// The replicator's shutdown signal: an `AtomicBool` flag plus a `Notify`
@@ -768,6 +778,10 @@ async fn push_batch(
             complete: false,
         };
     }
+    // The floor rides the batch: the follower learns what this primary has
+    // released at the same rate it learns what this primary has written, which
+    // is exactly the rate at which its mirror grows.
+    transport.note_primary_floor(journal.released_floor());
     let pushed = tokio::select! {
         r = transport.append_batch(records.to_vec()) => r,
         _ = shutdown.wake.notified() => {

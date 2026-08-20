@@ -96,6 +96,22 @@ struct RecordLocation {
     originated: bool,
 }
 
+/// One row of the follower dedupe index: the batch provenance a mirrored
+/// record arrived with, and the **local** position it was written to.
+///
+/// The key carries the record's *origin* LSN (the primary's), which is the
+/// identity §4.1 dedupes on; retention works in this journal's own space, so
+/// the local position has to be recoverable from the row rather than derived
+/// from the key. It is not a second durable copy: both halves come out of the
+/// one `RawEntry::Record` that carried the record and its provenance, at
+/// commit and at recovery alike.
+#[cfg(feature = "chain-grpc")]
+#[derive(Clone, Debug)]
+struct ChainRow {
+    provenance: Vec<u8>,
+    local: Lsn,
+}
+
 #[derive(Default)]
 struct RawIndex {
     records: BTreeMap<Lsn, RecordLocation>,
@@ -107,8 +123,13 @@ struct RawIndex {
     /// The positions a `Release` marker carried, when one was seen.
     released_next_lsn: Option<Lsn>,
     released_committed: Option<Lsn>,
+    /// Locally originated records still in the index. Retention needs to know
+    /// whether this journal holds any at all — a pure mirror is bounded by its
+    /// primary's floor rather than by local checkpoints (D23) — and counting
+    /// them at insert and at prune keeps that a read rather than a scan.
+    originated: u64,
     #[cfg(feature = "chain-grpc")]
-    chain_records: BTreeMap<Vec<u8>, Vec<u8>>,
+    chain_records: BTreeMap<Vec<u8>, ChainRow>,
     #[cfg(feature = "chain-grpc")]
     chain_state: BTreeMap<Vec<u8>, Vec<u8>>,
     #[cfg(feature = "chain-grpc")]
@@ -135,6 +156,19 @@ pub struct Journal {
     /// has registered, in which case retention answers to the checkpoint floor
     /// alone.
     chain_floor: std::sync::Mutex<Option<ChainClaim>>,
+    /// Per mirrored chain, the retention floor its **primary** has itself
+    /// reached, in that primary's LSN space (D23). A mirror is bounded by this
+    /// and not by local checkpoints: no local actor folds a mirrored record,
+    /// and what a promotion still needs from the mirror is exactly what the
+    /// primary's durable tier does not already hold.
+    #[cfg(feature = "chain-grpc")]
+    mirror_floors: std::sync::Mutex<BTreeMap<Vec<u8>, Lsn>>,
+    /// What retention has done since open, for the operator-facing snapshot.
+    retention: std::sync::Mutex<crate::journal::JournalRetention>,
+    /// What this journal's own `open` cost, in milliseconds — the D16
+    /// `journal_open_ms` budget's measurand, reported by the node that paid it
+    /// rather than inferred from a log timestamp.
+    open_ms: f64,
     #[cfg(test)]
     scan_fault: std::sync::atomic::AtomicBool,
 }
@@ -142,6 +176,7 @@ pub struct Journal {
 impl Journal {
     /// Open or recover a raw wal-db journal and start its group committer.
     pub fn open(config: &JournalConfig) -> Result<Self, JournalError> {
+        let opened_at = std::time::Instant::now();
         let wal_dir = prepare_wal_dir(&config.dir)?;
         let wal = Arc::new(
             Wal::open_segmented_with(
@@ -168,9 +203,7 @@ impl Journal {
         // them and a scan would answer from a prefix whose length is an
         // accident of segment alignment.
         if let Some(floor) = recovered.released_below {
-            recovered.records = recovered.records.split_off(&floor);
-            #[cfg(feature = "chain-grpc")]
-            recovered.adopted_records.retain(|_, local| *local >= floor);
+            prune_released(&mut recovered, floor);
         }
 
         let recovered_committed = recovered
@@ -189,6 +222,7 @@ impl Journal {
         // replacement for it: the marker is written before the appends that
         // may follow it, so the derived position wins whenever there is one.
         .max(recovered.released_next_lsn.unwrap_or(Lsn::new(0, 0)));
+        let released_floor = recovered.released_below.unwrap_or(Lsn::new(0, 0));
         let index = Arc::new(RwLock::new(recovered));
 
         let metrics = Arc::new(JournalCommitMetrics::new());
@@ -238,11 +272,23 @@ impl Journal {
                             originated,
                         },
                     );
+                    if originated {
+                        guard.originated += 1;
+                    }
                 }
                 #[cfg(feature = "chain-grpc")]
                 for pending in pending {
                     if let Some((key, value)) = &pending.staged.provenance {
-                        guard.chain_records.insert(key.clone(), value.clone());
+                        let local = parse_lsn_key(&pending.staged.key).ok_or_else(|| {
+                            JournalError::Store("invalid staged raw journal LSN".into())
+                        })?;
+                        guard.chain_records.insert(
+                            key.clone(),
+                            ChainRow {
+                                provenance: value.clone(),
+                                local,
+                            },
+                        );
                     }
                 }
                 Ok(StoreCommitTimings {
@@ -273,6 +319,13 @@ impl Journal {
             published,
             release: std::sync::Mutex::new(()),
             chain_floor: std::sync::Mutex::new(None),
+            #[cfg(feature = "chain-grpc")]
+            mirror_floors: std::sync::Mutex::new(BTreeMap::new()),
+            retention: std::sync::Mutex::new(crate::journal::JournalRetention {
+                floor: released_floor,
+                ..crate::journal::JournalRetention::default()
+            }),
+            open_ms: opened_at.elapsed().as_secs_f64() * 1e3,
             #[cfg(test)]
             scan_fault: std::sync::atomic::AtomicBool::new(false),
         })
@@ -432,8 +485,35 @@ impl Journal {
     ///
     /// So the durable marker always precedes the deletion it describes, and
     /// the window in between costs a retry rather than a record.
+    ///
+    /// Two clamps are the journal's own rather than the caller's, because both
+    /// are facts only it holds: a registered outbound chain's follower
+    /// watermark (D20), and — for each chain this journal *mirrors* — the
+    /// floor that chain's primary has itself reached (D23). Asking to release
+    /// past either is answered with a bounded release or a named block, never
+    /// with the records.
     pub fn release_before(&self, before: Lsn) -> Result<JournalRelease, JournalError> {
+        let outcome = self.release_locked(before);
+        // The operator-facing tally, updated on every answered call: a blocked
+        // release is a normal outcome and the reason is the whole of what
+        // "this journal is not shrinking" means.
+        if let Ok(release) = &outcome {
+            let mut retention = self.retention.lock().expect("journal retention lock");
+            retention.blocked = release.blocked;
+            if release.blocked.is_none() {
+                retention.releases += 1;
+                retention.records_dropped += release.records_dropped;
+                retention.floor = release.floor;
+            }
+        }
+        outcome
+    }
+
+    fn release_locked(&self, before: Lsn) -> Result<JournalRelease, JournalError> {
         use crate::journal::ReleaseBlocked;
+
+        #[allow(unused_mut)]
+        let mut before = before;
 
         if self.closed.load(std::sync::atomic::Ordering::Acquire) {
             return Err(JournalError::Closed);
@@ -451,6 +531,13 @@ impl Journal {
         // for the WAL. The lock order is therefore one way for both — WAL
         // first, index second — and the release takes the index in short,
         // separate sections around its WAL work.
+        //
+        // The journal tail is read here, before the index lock, for the same
+        // reason: the mirror clamp below needs it and must not hold two locks
+        // to get it.
+        let tail = *self.cursor.lock().expect("journal cursor lock");
+        #[cfg(not(feature = "chain-grpc"))]
+        let _ = tail;
         let (floor_now, cut, metadata) = {
             let index = read_index(&self.index)?;
             let floor_now = index.released_below.unwrap_or(Lsn::new(0, 0));
@@ -462,21 +549,28 @@ impl Journal {
                 ));
             }
 
-            // A follower's mirror is not released. `chain_grpc::rebuild_cursor`
-            // reconstructs the durable cursor by walking the provenance index
-            // from batch zero and stopping at the first gap, so releasing a
-            // prefix of it would rebuild an empty cursor and cost a full
-            // re-stream of the primary's journal — the failure
-            // `refuse_sibling_epoch` documents. Bounding a follower's mirror
-            // needs that cursor persisted first; until it is, the primary is
-            // what retention covers (D20 §residual).
+            // A mirror is released only as far as its primary has released,
+            // and only while the durable dedupe cursor that seeds a rebuild
+            // exists (D23). Both are checked here, under the same read lock
+            // that took the floor, so the clamp cannot be computed against an
+            // index a concurrent release has already pruned.
             #[cfg(feature = "chain-grpc")]
-            if !index.chain_records.is_empty() {
-                return Ok(JournalRelease::blocked(
-                    before,
-                    floor_now,
-                    ReleaseBlocked::FollowerProvenance,
-                ));
+            for (key, cut) in self.mirror_cuts(&index, tail)? {
+                if !index.chain_state.contains_key(&key) {
+                    return Ok(JournalRelease::blocked(
+                        before,
+                        floor_now,
+                        ReleaseBlocked::MirrorCursorAbsent,
+                    ));
+                }
+                if cut <= floor_now {
+                    return Ok(JournalRelease::blocked(
+                        before,
+                        floor_now,
+                        ReleaseBlocked::MirrorLag,
+                    ));
+                }
+                before = before.min(cut);
             }
 
             // The cut is the lowest physical position any *retained* record
@@ -589,15 +683,10 @@ impl Journal {
         // floor: `_release` is the only writer of it.
         let records_dropped = {
             let mut index = write_index(&self.index)?;
-            let retained = index.records.split_off(&before);
-            let dropped = index.records.len() as u64;
-            index.records = retained;
             index.released_below = Some(before);
             index.released_next_lsn = Some(next_lsn);
             index.released_committed = committed;
-            #[cfg(feature = "chain-grpc")]
-            index.adopted_records.retain(|_, local| *local >= before);
-            dropped
+            prune_released(&mut index, before)
         };
 
         // Step 4 (no index lock). Drop the segments the marker already
@@ -657,6 +746,116 @@ impl Journal {
                 claim.watermark = Some(claim.watermark.map_or(watermark, |c| c.max(watermark)));
             }
         }
+    }
+
+    /// Record the retention floor a mirrored chain's **primary** has reached,
+    /// in that primary's LSN space (D23).
+    ///
+    /// Monotone per chain: the floor only ever moves forward on the primary,
+    /// and a stale frame that said otherwise must not un-release a mirror.
+    #[cfg(feature = "chain-grpc")]
+    pub(crate) fn note_primary_floor(&self, chain_key: &[u8], floor: Lsn) {
+        let mut floors = self.mirror_floors.lock().expect("mirror floor lock");
+        let entry = floors.entry(chain_key.to_vec()).or_insert(floor);
+        *entry = (*entry).max(floor);
+    }
+
+    /// The lowest local position each mirrored chain still needs retained.
+    ///
+    /// A mirrored record is needed until the primary that wrote it has itself
+    /// released it — at which point the durable tier holds it and a promotion
+    /// recovering from this mirror reads it from there instead (D23). The cut
+    /// is therefore the local position of the lowest retained row whose
+    /// *origin* is at or above the primary's floor, and the journal tail when
+    /// the primary has released past everything here. A chain whose primary
+    /// has advertised no floor at all pins its whole mirror.
+    #[cfg(feature = "chain-grpc")]
+    fn mirror_cuts(
+        &self,
+        index: &RawIndex,
+        tail: Lsn,
+    ) -> Result<Vec<(Vec<u8>, Lsn)>, JournalError> {
+        let floors = self.mirror_floors.lock().expect("mirror floor lock");
+        let mut cuts = Vec::new();
+        let mut start = Vec::new();
+        // One seek per chain rather than one step per row: the index carries a
+        // row per mirrored record and this runs on the checkpoint cadence.
+        while let Some(key) = index
+            .chain_records
+            .range(start.clone()..)
+            .next()
+            .map(|(key, _)| key.clone())
+        {
+            let head: [u8; 4] = key
+                .get(..4)
+                .and_then(|bytes| bytes.try_into().ok())
+                .ok_or_else(|| JournalError::Store("truncated chain index key".into()))?;
+            let chain_key = key
+                .get(4..4 + u32::from_be_bytes(head) as usize)
+                .ok_or_else(|| JournalError::Store("truncated chain index key".into()))?
+                .to_vec();
+            let prefix = chain_record_prefix(&chain_key);
+            let end = prefix_successor(&prefix).ok_or_else(|| {
+                JournalError::Store("chain identity has no finite key-range successor".into())
+            })?;
+            let from = match floors.get(&chain_key) {
+                Some(floor) => chain_record_key(&chain_key, *floor),
+                None => prefix,
+            };
+            let cut = index
+                .chain_records
+                .range(from..end.clone())
+                .map(|(_, row)| row.local)
+                .min()
+                .unwrap_or(tail);
+            cuts.push((chain_key, cut));
+            start = end;
+        }
+        Ok(cuts)
+    }
+
+    /// The floor a release should ask for, given what this node's own
+    /// checkpoints cover — `None` while a hosted shard has yet to report one,
+    /// and `None` again when there is nothing to bound.
+    ///
+    /// The two halves answer to different authorities and a journal can hold
+    /// both kinds of record, so the floor is the lower of them (D23):
+    ///
+    /// - **Locally originated records** are bounded by the checkpoint floor,
+    ///   which is what the node's own actors have folded into the durable
+    ///   tier. A journal holding none of them is not bounded by it at all —
+    ///   a passive follower's actors fold nothing, and reading their empty
+    ///   watermark as a floor of `0:0` is what kept every mirror unbounded.
+    /// - **Mirrored records** are bounded by [`Journal::mirror_cuts`].
+    pub fn retention_floor(&self, checkpoint_floor: Option<Lsn>) -> Option<Lsn> {
+        let tail = *self.cursor.lock().expect("journal cursor lock");
+        let index = read_index(&self.index).ok()?;
+        let mut floor: Option<Lsn> = None;
+        if index.originated > 0 {
+            // A hosted shard that has never checkpointed abstains, and its
+            // abstention is binding: this journal holds records no durable
+            // state covers yet.
+            floor = Some(checkpoint_floor?);
+        }
+        #[cfg(feature = "chain-grpc")]
+        for (_, cut) in self.mirror_cuts(&index, tail).ok()? {
+            floor = Some(floor.map_or(cut, |floor: Lsn| floor.min(cut)));
+        }
+        #[cfg(not(feature = "chain-grpc"))]
+        let _ = tail;
+        floor
+    }
+
+    /// What retention has done to this journal since it was opened.
+    pub fn retention(&self) -> crate::journal::JournalRetention {
+        *self.retention.lock().expect("journal retention lock")
+    }
+
+    /// What this journal's `open` cost, in milliseconds (D16
+    /// `journal_open_ms`).
+    #[must_use]
+    pub fn open_ms(&self) -> f64 {
+        self.open_ms
     }
 
     /// The lowest LSN this journal still retains (D20). `0:0` until a release.
@@ -760,13 +959,13 @@ impl Journal {
         read_index(&self.index)?
             .chain_records
             .range(prefix.clone()..end)
-            .map(|(key, value)| {
+            .map(|(key, row)| {
                 let origin =
                     parse_lsn_key(&key[prefix.len()..]).ok_or_else(|| JournalError::Corrupt {
                         lsn: Lsn::new(0, 0),
                         msg: "invalid origin LSN in raw chain index".into(),
                     })?;
-                Ok((origin, value.clone()))
+                Ok((origin, row.provenance.clone()))
             })
             .collect()
     }
@@ -846,7 +1045,7 @@ impl Journal {
         Ok(read_index(&self.index)?
             .chain_records
             .get(&chain_record_key(chain_key, origin))
-            .cloned())
+            .map(|row| row.provenance.clone()))
     }
 
     #[cfg(feature = "chain-grpc")]
@@ -910,8 +1109,11 @@ impl Journal {
                 .push((origin, provenance));
         }
 
+        // From the retention floor, not from zero: a mirror that has been
+        // released no longer holds its prefix, and asking for it is
+        // `JournalError::Released` rather than a short answer (D20 §4).
         let mut local_by_origin = HashMap::<Lsn, Option<Lsn>>::new();
-        for stored in self.scan_from(Lsn::new(0, 0)).filter_map(Result::ok) {
+        for stored in self.scan_from(self.released_floor()).filter_map(Result::ok) {
             match local_by_origin.entry(stored.record.lsn) {
                 std::collections::hash_map::Entry::Vacant(entry) => {
                     entry.insert(Some(stored.lsn));
@@ -922,14 +1124,31 @@ impl Journal {
             }
         }
 
-        let mut previous = None;
+        // Adoption walks the same index `rebuild_cursor` does, and is seeded
+        // the same way (D23): a released mirror starts at the first retained
+        // batch, and the persisted cursor supplies the watermark and the batch
+        // number the prefix ended at. Without the seed a released mirror reads
+        // as a history that begins at a gap, which is a promotion that refuses
+        // to start rather than one that starts short.
+        let seed = crate::journal::chain_grpc::seed_cursor(self, &source_key)?;
+        let seeded_through = seed.and_then(|cursor| cursor.batch_seq);
+        let mut previous = seed.and_then(|cursor| cursor.watermark);
+        let mut expected = seeded_through.map_or(0, |through| through + 1);
         let mut adopted_records = Vec::new();
-        for (expected, (sequence, mut batch)) in batches.into_iter().enumerate() {
-            if sequence != expected as u64 {
+        for (sequence, mut batch) in batches {
+            // A batch the seed already covers may survive in part: the floor
+            // is a checkpoint watermark, not a batch boundary. Its records are
+            // not re-adopted — the marker names what is *below* the cutoff it
+            // reports, and the seed's watermark already is that cutoff.
+            if seeded_through.is_some_and(|through| sequence <= through) {
+                continue;
+            }
+            if sequence != expected {
                 return Err(JournalError::Store(
                     "cannot adopt chain history with a batch gap".into(),
                 ));
             }
+            expected += 1;
             batch.sort_by_key(|(_, provenance)| provenance.ordinal);
             let Some((_, first)) = batch.first() else {
                 return Err(JournalError::Store("cannot adopt empty chain batch".into()));
@@ -1101,6 +1320,32 @@ fn append_metadata(wal: &Wal<SegmentedStore>, envelope: &RawEnvelope) -> Result<
         .map_err(|error| JournalError::Store(format!("sync raw metadata: {error}")))
 }
 
+/// Drop everything a retention floor has released from an index, and return
+/// how many record entries went.
+///
+/// One function for both callers, because the two used to be written out
+/// separately and the pair is exactly where a divergence is invisible: a
+/// reopened journal and a released-in-place one must present the same index,
+/// or a property holds until the process restarts. The mirrored dedupe rows
+/// go with the records they point at (D23) — their key carries the *origin*
+/// LSN, so they are pruned by the local position in the row rather than by
+/// the key.
+fn prune_released(index: &mut RawIndex, floor: Lsn) -> u64 {
+    let retained = index.records.split_off(&floor);
+    let dropped = std::mem::replace(&mut index.records, retained);
+    for location in dropped.values() {
+        if location.originated {
+            index.originated = index.originated.saturating_sub(1);
+        }
+    }
+    #[cfg(feature = "chain-grpc")]
+    {
+        index.chain_records.retain(|_, row| row.local >= floor);
+        index.adopted_records.retain(|_, local| *local >= floor);
+    }
+    dropped.len() as u64
+}
+
 fn apply_recovered_entry(
     index: &mut RawIndex,
     physical: wal_db::Lsn,
@@ -1130,9 +1375,18 @@ fn apply_recovered_entry(
                     msg: "duplicate logical LSN in raw journal".into(),
                 });
             }
+            if originated {
+                index.originated += 1;
+            }
             #[cfg(feature = "chain-grpc")]
             if let Some((key, value)) = provenance {
-                index.chain_records.insert(key, value);
+                index.chain_records.insert(
+                    key,
+                    ChainRow {
+                        provenance: value,
+                        local: local_lsn,
+                    },
+                );
             }
             #[cfg(not(feature = "chain-grpc"))]
             let _ = provenance;
@@ -1449,6 +1703,75 @@ mod tests {
             .expect("commit after reopen");
         assert!(third > second, "reopen must continue the logical LSN space");
         reopened.close().await.expect("close reopened journal");
+    }
+
+    /// A journal that holds only *mirrored* records is not bounded by its own
+    /// checkpoints, and this is the asymmetry D23 turns on.
+    ///
+    /// A passive follower's actors fold nothing, so every one of its shards
+    /// reports a checkpoint watermark of `0:0` — which read as a floor is the
+    /// reason a mirror was never released even after the block came off. What
+    /// bounds a mirror is the floor its primary reports; what the local
+    /// checkpoints bound is the records this node originated, of which a
+    /// passive follower has none.
+    #[cfg(feature = "chain-grpc")]
+    #[tokio::test]
+    async fn a_pure_mirror_answers_to_its_primary_and_not_to_local_checkpoints() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let journal = Journal::open(&config(dir.path())).expect("open raw journal");
+        let key = b"chain".to_vec();
+        let mut mirrored = Vec::new();
+        for entity in 0..4 {
+            let mut record = record(entity);
+            record.lsn = Lsn::new(0, entity * 100);
+            mirrored.push(
+                journal
+                    .append_replicated_indexed(record, &key, b"provenance")
+                    .expect("mirror")
+                    .expect("new row")
+                    .committed()
+                    .await
+                    .expect("durable"),
+            );
+        }
+
+        // No cursor row: a mirror written by a binary that never persisted one
+        // cannot be seeded, so it is not released and says why.
+        journal.note_primary_floor(&key, Lsn::new(0, 300));
+        let blocked = journal
+            .release_before(Lsn::new(9_999, 0))
+            .expect("release answers");
+        assert_eq!(
+            blocked.blocked,
+            Some(crate::journal::ReleaseBlocked::MirrorCursorAbsent)
+        );
+
+        journal
+            .set_chain_grpc_state(&key, b"cursor")
+            .expect("persist cursor");
+        // An empty checkpoint floor does not pin a journal with nothing of its
+        // own in it; the primary's floor is what the release answers to.
+        assert_eq!(
+            journal.retention_floor(Some(Lsn::new(0, 0))),
+            Some(mirrored[3]),
+            "the mirror cut is the local position of the first row at the primary's floor"
+        );
+        let release = journal
+            .release_before(Lsn::new(9_999, 0))
+            .expect("release answers");
+        assert_eq!(release.blocked, None);
+        assert_eq!(release.floor, mirrored[3]);
+
+        // One locally originated record, and the checkpoint floor is binding
+        // again — an uncheckpointed shard abstains for the whole journal.
+        journal
+            .append(record(9))
+            .expect("append")
+            .committed()
+            .await
+            .expect("durable");
+        assert_eq!(journal.retention_floor(None), None);
+        journal.close().await.expect("close raw journal");
     }
 
     proptest! {

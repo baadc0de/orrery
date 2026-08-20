@@ -172,6 +172,17 @@ struct Cli {
     #[arg(long)]
     no_journal_retention: bool,
 
+    /// Checkpoint cadence in milliseconds, overriding D16's 20 s (jitter is
+    /// held at a quarter of it, as the default pair is).
+    ///
+    /// A harness lever, not a tuning knob. Whether a 30-second gate run
+    /// releases anything at all is otherwise an accident of where 128 shards'
+    /// jittered 20 s timers happen to fall — which is exactly why D20 could
+    /// only report that retention was harmless where it happened to fire. A
+    /// gate that has to *prove* retention sets a cadence it can outlast.
+    #[arg(long, value_name = "MS")]
+    checkpoint_interval_ms: Option<u64>,
+
     /// Append server-internal latency batches and gateway counter records to
     /// this JSONL file.
     ///
@@ -225,6 +236,8 @@ fn spawn_metrics_reporter(
     let (shutdown, mut stopped) = oneshot::channel();
     let task = tokio::spawn(async move {
         let metrics = journal.commit_metrics();
+        let retention_journal = Arc::clone(&journal);
+        let mut retention_cursor = orrery_persistd::journal::JournalRetention::default();
         let mut cursor = metrics.snapshot();
         let mut stage_cursor = metrics.stage_snapshot();
         let mut bulk_cursor = gateway_metrics.bulk.snapshot();
@@ -265,6 +278,7 @@ fn spawn_metrics_reporter(
             write_gateway_area(&mut *writer, &gateway_metrics, &mut area_cursor)?;
             write_gateway_report(&mut *writer, &gateway_metrics, &mut report_cursor)?;
             write_gateway_authority(&mut *writer, &authority_metrics, &mut authority_cursor)?;
+            write_journal_retention(&mut *writer, &retention_journal, &mut retention_cursor)?;
             writer.flush()
         };
 
@@ -286,6 +300,40 @@ fn spawn_metrics_reporter(
         }
     });
     Ok(MetricsReporter { shutdown, task })
+}
+
+/// Append the journal's retention state whenever it changes (D20, D23).
+///
+/// Absolute totals rather than interval deltas, and the floor rather than a
+/// count of bytes: what a reader needs to know is whether this journal is
+/// bounded *now*, and — when it is not — which precondition is the binding
+/// one. A gauge that reset every second would hide a floor that stopped
+/// moving an interval ago, which is the shape the failure actually has.
+///
+/// Both roles emit it. A follower's mirror is bounded by the floor its primary
+/// reports and a primary's journal by its own checkpoints, so the record means
+/// something different on each side and is the same three numbers on both.
+fn write_journal_retention(
+    mut writer: impl Write,
+    journal: &Journal,
+    cursor: &mut orrery_persistd::journal::JournalRetention,
+) -> std::io::Result<()> {
+    let snapshot = journal.retention();
+    if snapshot == *cursor {
+        return Ok(());
+    }
+    *cursor = snapshot;
+    serde_json::to_writer(
+        &mut writer,
+        &serde_json::json!({
+            "type": "journal_retention",
+            "floor": snapshot.floor.to_string(),
+            "releases": snapshot.releases,
+            "records_dropped": snapshot.records_dropped,
+            "blocked": snapshot.blocked.map(|reason| reason.to_string()),
+        }),
+    )?;
+    writeln!(writer)
 }
 
 /// Append the authority counters whenever any of them moved.
@@ -874,6 +922,7 @@ async fn main() -> anyhow::Result<()> {
     // the D12 OTel bridge reads them.
     let gateway_metrics = Arc::new(GatewayMetrics::default());
     let authority_metrics = Arc::new(AuthorityMetrics::default());
+    let journal_open_ms = runtime.journal().open_ms();
     let metrics_reporter = if let Some(path) = cli.metrics_jsonl.clone() {
         let journal = Arc::clone(runtime.journal());
         Some(spawn_metrics_reporter(
@@ -923,9 +972,16 @@ async fn main() -> anyhow::Result<()> {
     let scheduler = orrery_persistd::spawn_checkpoint_scheduler_direct(
         Arc::clone(&runtime),
         Arc::clone(&checkpoint_store),
-        &orrery_persistd::checkpoint::CheckpointConfig {
-            retention: !cli.no_journal_retention,
-            ..orrery_persistd::checkpoint::CheckpointConfig::default()
+        &{
+            let mut config = orrery_persistd::checkpoint::CheckpointConfig {
+                retention: !cli.no_journal_retention,
+                ..orrery_persistd::checkpoint::CheckpointConfig::default()
+            };
+            if let Some(ms) = cli.checkpoint_interval_ms {
+                config.interval = Duration::from_millis(ms);
+                config.jitter = config.interval / 4;
+            }
+            config
         },
     );
     schedulers.push(scheduler);
@@ -1056,6 +1112,12 @@ async fn main() -> anyhow::Result<()> {
             "role": topology.role.name(),
             "ownership_epoch": activation.epoch.0,
             "recovery_cutoff": recovery_cutoff,
+            // The D16 `journal_open_ms` budget's measurand, reported by the
+            // node that paid it: a restart's index rebuild is linear in the
+            // journal it opens, which is what retention exists to bound, and
+            // an operator reading it out of a log timestamp is reading the
+            // whole startup instead.
+            "journal_open_ms": journal_open_ms,
             "bulk_ack_fence_monitor": fence_freshness_monitor.is_some(),
             "adjudicator": adjudicator_configured,
             "dev_seeded_entities": dev_seeded,
@@ -1171,6 +1233,16 @@ async fn run_follower(cli: &Cli, topology: &Topology) -> anyhow::Result<()> {
             )
         })
         .transpose()?;
+    // A follower has no checkpoint cadence to hang retention off — it opens no
+    // runtime and no scheduler — so its mirror is released on a timer of its
+    // own, bounded by the floor its primary reports (D23).
+    let retention = (!cli.no_journal_retention).then(|| {
+        let interval = cli.checkpoint_interval_ms.map_or_else(
+            || orrery_persistd::checkpoint::CheckpointConfig::default().interval,
+            Duration::from_millis,
+        );
+        orrery_persistd::checkpoint::spawn_mirror_retention(Arc::clone(&journal), interval)
+    });
 
     // stdout is a one-line machine-readable readiness contract. Unlike a
     // primary, the follower has no client endpoint to advertise.
@@ -1180,6 +1252,7 @@ async fn run_follower(cli: &Cli, topology: &Topology) -> anyhow::Result<()> {
             "node_id": topology.node_id,
             "chain_addr": server.addr().to_string(),
             "role": topology.role.name(),
+            "journal_open_ms": journal.open_ms(),
         });
         let stdout = std::io::stdout();
         let mut handle = stdout.lock();
@@ -1200,6 +1273,9 @@ async fn run_follower(cli: &Cli, topology: &Topology) -> anyhow::Result<()> {
         _ = sigterm.recv() => tracing::info!("received SIGTERM, shutting down"),
     }
     server.shutdown().await;
+    if let Some(retention) = retention {
+        retention.shutdown().await;
+    }
     if let Some(reporter) = metrics_reporter {
         reporter.shutdown().await;
     }
@@ -1874,6 +1950,7 @@ mod tests {
             ))],
             coordinator_key: Vec::new(),
             no_journal_retention: false,
+            checkpoint_interval_ms: None,
             dev_seed: None,
             secret_key: None,
             shard: Vec::new(),

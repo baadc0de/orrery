@@ -239,19 +239,22 @@ async fn release_reclaims_whole_segments() {
     journal.close().await.expect("close");
 }
 
-/// A follower's mirror is not released, and the reason is reported rather than
-/// hidden (D20 §residual).
+/// A follower's mirror is bounded by what its **primary** has released, and by
+/// nothing else (D23).
 ///
-/// `chain_grpc::rebuild_cursor` reconstructs the follower's durable cursor by
-/// walking the provenance index from batch zero and stopping at the first gap.
-/// Releasing a prefix of that index would rebuild an empty cursor, and an empty
-/// cursor costs a full re-stream of the primary's journal into a second
-/// physical copy of every record — the failure `refuse_sibling_epoch` exists to
-/// catch. Bounding a follower needs that cursor persisted first.
+/// The follower folds no mirrored record into an actor, so its own checkpoints
+/// say nothing about what the mirror still owes; what a promotion needs from it
+/// is exactly the tail the primary's durable tier does not already hold. The
+/// primary therefore reports its own retention floor on the chain, and the
+/// follower releases up to the local position of the first row at or above it.
+///
+/// A mirror whose primary has reported nothing is pinned whole — the pre-D23
+/// behaviour, now the unconfigured case rather than the only case.
 #[cfg(feature = "chain-grpc")]
 #[tokio::test]
-async fn a_follower_mirror_is_not_released() {
-    use orrery_persistd::{spawn_chain_grpc, ChainTransport, DurableChainId, GrpcChainTransport};
+async fn a_follower_mirror_is_released_only_as_far_as_its_primary_has() {
+    use orrery_persistd::journal::ChainTransport;
+    use orrery_persistd::{spawn_chain_grpc, DurableChainId, GrpcChainTransport};
 
     let chain = DurableChainId {
         primary_node: test_node(1),
@@ -297,22 +300,192 @@ async fn a_follower_mirror_is_not_released() {
         .await
         .expect("mirror batch");
 
+    // Nothing reported yet: the whole mirror is pinned, and the reason is
+    // named rather than left as a journal that quietly never shrinks.
+    let blocked = journal
+        .release_before(Lsn::new(9_999, 0))
+        .expect("release call answers");
+    assert_eq!(blocked.blocked, Some(ReleaseBlocked::MirrorLag));
+    assert_eq!(journal.released_floor(), Lsn::new(0, 0));
+    assert_eq!(journal.scan_from(Lsn::new(0, 0)).count(), 3);
+
+    // The primary has released through its record at origin 82. The follower's
+    // own positions are its own — the mirror keeps the origin LSN inside the
+    // record and takes an independent local key — so the floor is the *local*
+    // position of the first row at or above that origin, which is the second
+    // record's.
+    let local: Vec<Lsn> = journal
+        .scan_from(Lsn::new(0, 0))
+        .map(|stored| stored.expect("mirrored record").lsn)
+        .collect();
+    ChainTransport::note_primary_floor(&transport, Lsn::new(0, 82));
+    transport
+        .append_batch(vec![mirror_record(226)])
+        .await
+        .expect("second mirror batch carries the floor");
+
     let release = journal
         .release_before(Lsn::new(9_999, 0))
         .expect("release call answers");
-    assert_eq!(release.blocked, Some(ReleaseBlocked::FollowerProvenance));
-    assert_eq!(journal.released_floor(), Lsn::new(0, 0));
+    assert_eq!(release.blocked, None);
+    assert_eq!(release.floor, local[1]);
     assert_eq!(
-        journal.scan_from(Lsn::new(0, 0)).count(),
+        journal.scan_from(release.floor).count(),
         3,
-        "a blocked release must leave the mirror intact"
+        "the row at the primary's floor is retained, not released"
     );
 
-    // And the cursor the block protects still rebuilds.
-    assert_eq!(transport.follower_watermark().await, Some(Lsn::new(0, 154)));
+    // The cursor the release moved out from under still rebuilds — over the
+    // retained suffix, seeded by the persisted row — and the chain keeps
+    // running across it.
+    assert_eq!(transport.follower_watermark().await, Some(Lsn::new(0, 226)));
+    transport
+        .append_batch(vec![mirror_record(298)])
+        .await
+        .expect("the chain continues over a released prefix");
     drop(transport);
     server.shutdown().await;
     journal.close().await.expect("close");
+
+    // And it survives the restart the persisted cursor exists for.
+    let reopened = std::sync::Arc::new(Journal::open(&config(dir.path())).expect("reopen"));
+    assert_eq!(reopened.released_floor(), local[1]);
+    let chain = DurableChainId {
+        primary_node: test_node(1),
+        follower_node: test_node(2),
+        shard_set: b"root/0-7".to_vec(),
+        epoch: 4,
+    };
+    let server = spawn_chain_grpc(
+        "127.0.0.1:0".parse().expect("addr"),
+        std::sync::Arc::clone(&reopened),
+        chain.clone(),
+    )
+    .await
+    .expect("chain server");
+    let transport = GrpcChainTransport::connect(server.addr(), chain)
+        .await
+        .expect("reconnect");
+    assert_eq!(
+        transport.follower_watermark().await,
+        Some(Lsn::new(0, 298)),
+        "a restarted follower must not re-stream a released prefix"
+    );
+    drop(transport);
+    server.shutdown().await;
+    reopened.close().await.expect("close");
+}
+
+/// End to end, over the real replicator: the primary's floor travels the chain
+/// and the follower's mirror shrinks behind it (D23).
+///
+/// The unit-level tests hand the follower a floor directly. This one is the
+/// path a deployment actually runs — `spawn_chain` reads `released_floor()` at
+/// each push, the transport carries it on the batch frame, the follower takes
+/// the maximum and its own driver releases up to the first row at or above it —
+/// because every one of those four links can be individually absent without any
+/// of the others noticing.
+#[cfg(feature = "chain-grpc")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_primary_floor_travels_the_chain_and_bounds_the_mirror() {
+    use orrery_persistd::{
+        spawn_chain, spawn_chain_grpc, ChainConfig, DurableChainId, GrpcChainTransport,
+    };
+    use std::sync::Arc;
+
+    let chain = DurableChainId {
+        primary_node: test_node(1),
+        follower_node: test_node(2),
+        shard_set: b"root/0-7".to_vec(),
+        epoch: 4,
+    };
+    let primary_dir = tempfile::tempdir().expect("tempdir");
+    let follower_dir = tempfile::tempdir().expect("tempdir");
+    let follower = Arc::new(Journal::open(&config(follower_dir.path())).expect("open follower"));
+    let server = spawn_chain_grpc(
+        "127.0.0.1:0".parse().expect("addr"),
+        Arc::clone(&follower),
+        chain.clone(),
+    )
+    .await
+    .expect("chain server");
+    let primary = Arc::new(Journal::open(&config(primary_dir.path())).expect("open primary"));
+    let replicator = spawn_chain(
+        Arc::clone(&primary),
+        Arc::new(GrpcChainTransport::new(server.addr(), chain)),
+        &ChainConfig {
+            follower: 2,
+            ..ChainConfig::default()
+        },
+    );
+
+    // Poll rather than sleep: the replicator is a background task and every
+    // deadline below is a failure, not a flake budget.
+    async fn until(label: &str, mut ready: impl FnMut() -> bool) {
+        for _ in 0..600 {
+            if ready() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("timed out waiting for {label}");
+    }
+
+    let lsns = fill(&primary, 60).await;
+    until("the follower to mirror the primary's journal", || {
+        follower.scan_from(Lsn::new(0, 0)).count() == 60
+    })
+    .await;
+
+    // The primary's checkpoints have covered its first thirty records. Its own
+    // release is clamped by the follower watermark (D20) and the follower has
+    // everything, so the floor lands where the checkpoints put it.
+    let release = primary.release_before(lsns[30]).expect("primary release");
+    assert_eq!(release.blocked, None);
+    assert_eq!(release.floor, lsns[30]);
+
+    // Nothing has told the follower yet.
+    assert_eq!(follower.released_floor(), Lsn::new(0, 0));
+
+    // The next push carries the floor, and the follower's own driver — here,
+    // this call — is then able to bound the mirror.
+    fill(&primary, 10).await;
+    until("the primary's floor to reach the follower", || {
+        follower
+            .retention_floor(None)
+            .is_some_and(|floor| floor > Lsn::new(0, 0))
+    })
+    .await;
+    let floor = follower.retention_floor(None).expect("mirror floor");
+    let release = follower.release_before(floor).expect("follower release");
+    assert_eq!(release.blocked, None);
+    assert!(
+        release.records_dropped > 0,
+        "the mirror released nothing behind a floor that advanced"
+    );
+    assert!(
+        follower.released_floor() > Lsn::new(0, 0),
+        "the follower's mirror is still unbounded"
+    );
+    assert!(
+        follower.scan_from(follower.released_floor()).count() < 70,
+        "a released mirror must hold fewer records than the primary ever sent"
+    );
+
+    // And the chain keeps running across both floors.
+    let tail = fill(&primary, 5).await;
+    until("replication to continue over two released prefixes", || {
+        follower
+            .scan_from(follower.released_floor())
+            .filter_map(Result::ok)
+            .any(|stored| stored.record.lsn == tail[4])
+    })
+    .await;
+
+    replicator.shutdown().await;
+    server.shutdown().await;
+    primary.close().await.expect("close primary");
+    follower.close().await.expect("close follower");
 }
 
 /// Chain state is re-anchored above the cut, so a release cannot erase the

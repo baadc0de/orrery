@@ -49,6 +49,7 @@ entry point. Decisions live independently under [docs/adr/](docs/adr/):
 | D20 | [ADR-0020](docs/adr/0020-journal-retention.md) | Journal retention and the recovery budget |
 | D21 | [ADR-0021](docs/adr/0021-ruleset-distribution.md) | `Ruleset` distribution, harness API freeze |
 | D22 | [ADR-0022](docs/adr/0022-grid-id-in-the-storage-key.md) | `GridId` stays a key discriminator |
+| D23 | [ADR-0023](docs/adr/0023-follower-journal-retention.md) | Follower journal retention, P2 retention clause |
 
 After the applicable ADRs, use this expansion reading path:
 

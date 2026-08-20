@@ -1,6 +1,8 @@
 # ADR-0020: Journal retention and the recovery budget
 
-**Status:** Accepted · **Date:** 2026-08-20 · **Decision:** D20
+**Status:** Accepted; residual closed by
+[ADR-0023](0023-follower-journal-retention.md) · **Date:** 2026-08-20 ·
+**Decision:** D20
 
 This decision is normative. See the [ADR index](../DECISIONS.md) for
 precedence, scope, and the complete decision set.
@@ -134,9 +136,9 @@ did not create that tail and turning it off did not remove it. Evidence:
 how often — is an accident of jitter rather than something the harness
 arranges. It fired 14–16 times in these runs and 0 in one earlier run on the
 other host. Making retention a *covered clause* rather than an incidental one
-is follow-up work; until it is done, the properties are held by
-`journal_retention.rs` and the gate only shows retention is harmless where it
-happens to run.
+is follow-up work — **done in [D23](0023-follower-journal-retention.md)**,
+which sets the cadence the harness needs and fails the run unless both nodes'
+floors advanced and every journal open came in under the budget below.
 
 ## Decision
 
@@ -231,7 +233,9 @@ P2 latency criterion anyway.
   full event history must land the tailer first. The tailer, when built,
   contributes one more watermark to the same minimum; it does not need a
   different mechanism.
-- **A follower's own mirror is still unbounded (the residual).**
+- **A follower's own mirror is still unbounded (the residual — closed by
+  [D23](0023-follower-journal-retention.md), which sends this primary's floor
+  down the chain and seeds the cursor from the durable row).**
   `chain_grpc::rebuild_cursor` reconstructs a follower's durable cursor by
   walking its provenance index from batch zero and stopping at the first gap,
   so releasing a prefix of that index would rebuild an empty cursor and cost a

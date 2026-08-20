@@ -64,10 +64,16 @@ hour of run time. [D20](docs/adr/0020-journal-retention.md) makes the
 checkpoint floor bound it, clamped by what the chain follower has mirrored,
 with a scan below the floor failing loudly rather than answering short. The gate holds with it on — four
 alternating arms on a qualified `c4d-standard-32-lssd` passed 4/4, retention
-active in its two, every acknowledged write recovered after the `kill -9`. Two
-residuals are named rather than hidden: released records are not archived
-anywhere until the P6 tailer exists, and a follower's own mirror stays
-unbounded until its dedupe cursor is persisted.
+active in its two, every acknowledged write recovered after the `kill -9`. [D23](docs/adr/0023-follower-journal-retention.md) closes the
+follower half: the primary's floor travels on the chain, the mirror is released
+up to it, the dedupe cursor is seeded from a durable row instead of rebuilt
+from batch zero, and the gate now *fails* unless both nodes' floors advanced
+and every journal open came in under D16's 2 000 ms budget — which is not a
+formality: measured on three cadence arms, an *unreleased* mirror made a
+promoted node's `Journal::open` take 2 905 ms after a thirty-second load, past
+that budget, and bounding it brought the same open to 764 ms. One residual is
+named rather than hidden: released records are not archived anywhere until the
+P6 tailer exists.
 
 The Fjall root cause is its 100 ms-step write backpressure, not the device. The
 full investigation is [docs/08-persistence.md](docs/08-persistence.md)
