@@ -29,6 +29,9 @@ This decision is normative. See the [ADR index](../DECISIONS.md) for precedence,
 | Witness epoch length | 30 s (D27, proposed) | Witness set target N | 7 (D27, proposed) |
 | Witness reseed cooldown (per account) | 60 s (D27, proposed) | Stale-epoch acceptance grace | 30 s (D27, proposed) |
 | `epoch/` row retention | 7 days (D27, proposed) | — | — |
+| Witness epoch length | 30 s (D28, proposed) | Witness set target N | 7 (D28, proposed) |
+| Witness reseed cooldown (per account) | 60 s (D28, proposed) | Stale-epoch acceptance grace | 30 s (D28, proposed) |
+| `epoch/` row retention | 7 days (D28, proposed) | — | — |
 | Provisional finalize deadline | 5 min (D29, proposed) | Provisional outstanding cap (per account) | 8 (D29, proposed) |
 | Provisional finalization sampling | 100%, not tunable (D29, proposed) | — | — |
 
@@ -66,4 +69,4 @@ limits **drop** rather than queue — the advisory is best-effort by
 construction, and `Deny{Parked}` on a subsequent claim is the authoritative
 answer.
 
-[ADR-0025](0025-expire-fan-out.md), [ADR-0027](0027-attestation-envelope.md), [ADR-0028](0028-witness-set-seeding.md) and [ADR-0029](0029-low-population-path.md) ·
+[ADR-0025](0025-expire-fan-out.md), [ADR-0028](0028-witness-set-seeding.md) and [ADR-0029](0029-low-population-path.md) ·
