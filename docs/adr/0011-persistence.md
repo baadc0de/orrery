@@ -1,7 +1,8 @@
 # ADR-0011: Persistence: in-memory cell actors + journal, FoundationDB system of record
 
 **Status:** Accepted; local journal-engine choice superseded by
-[ADR-0019](0019-indexed-waldb-journal.md) · **Date:** 2026-08-11 ·
+[ADR-0019](0019-indexed-waldb-journal.md); shard placement qualified by
+[ADR-0026](0026-sibling-gateways.md) (*proposed*) · **Date:** 2026-08-11 ·
 **Decision:** D11
 
 This decision is normative. See the [ADR index](../DECISIONS.md) for precedence, scope, and the complete decision set.
