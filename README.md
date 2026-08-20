@@ -11,11 +11,6 @@ It targets very large universes with strong spatial locality — 32–128 player
 per area, 60 Hz fast action — and it is a framework, not a game. Games supply a
 `Ruleset`; every tunable is a configurable parameter with a stated default.
 
-> **The cover art is aspirational; this README is not.** Where the two
-> disagree, believe the tables below. The architecture is decided and much of
-> it is built, but several headline properties are *targets that are currently
-> missed*, and they are named as such.
-
 **Normative source:** the [ADR index](docs/DECISIONS.md) and the 18 accepted
 [ADRs](docs/adr/) (D1–D17 and D19; D18 remains a reserved proposal). The
 applicable ADRs govern this README and every numbered document.
