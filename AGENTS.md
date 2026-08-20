@@ -780,12 +780,39 @@ Within one session, use the `Agent` tool and its worktree isolation rather than
 inventing a protocol. Subagents inherit this repository's hooks, so a subagent
 that edits into another agent's lane is caught by the same check.
 
-### Codex delegation — suspended
+### Codex delegation — live again (2026-08-20)
 
-The `cx` tool and Codex-to-Codex delegation are **out of credits and disabled**.
-Do not route work to Codex, and do not add a fallback that tries. Revisit after
-Thursday evening; until then this section is the whole story, and work that
-would have been delegated is done here.
+The weekly quota reset, so routing work to Codex is back on. Two providers with
+independent quotas means a wide fan-out should be **level-loaded** across both
+rather than queued entirely on one — one provider's limit then stops being a hard
+stop on the whole queue.
+
+The binary is `codex` (`/usr/bin/codex`). **There is no `cx` wrapper**; earlier
+notes naming one are stale. Auth is a ChatGPT account (`codex login status`).
+
+| Model | Use |
+|---|---|
+| `gpt-5.6-terra` | General coding. Also the configured default in `~/.codex/config.toml`, so a bare `codex exec` already uses it. |
+| `gpt-5.6-sol` | Demanding frontier work. |
+
+**Pass the full `gpt-5.6-*` id.** The bare names `terra` and `sol` are rejected —
+`The 'terra' model is not supported when using Codex with a ChatGPT account` —
+behind a `Model metadata for 'terra' not found` warning that looks like the cause
+and is not. The account is fine; the id is wrong.
+
+```
+codex exec -m gpt-5.6-sol -s workspace-write -C <dir> "<prompt>"
+```
+
+`-s` is `read-only`, `workspace-write` or `danger-full-access`; add `--json` for
+JSONL events and `-o <file>` to capture the final message.
+
+**One caveat that matters here: a Codex agent does not inherit this repository's
+hooks.** The `SessionStart` lane registration and the `PreToolUse` collision check
+in `.claude/settings.json` do not run for it, so it is invisible to
+[the lane ledger](#working-alongside-other-agents) unless someone registers it, and
+nothing warns it when it edits into another agent's paths. Register its lane on its
+behalf, or give it paths that overlap nobody.
 
 ### Device-local memory
 
