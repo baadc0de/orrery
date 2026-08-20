@@ -621,6 +621,80 @@ pub fn ledger_receipt_key() -> [u8; 12] {
     key
 }
 
+/// Byte offset of the versionstamp placeholder inside [`ledger_receipt_key`].
+///
+/// Immediately after the two discriminator bytes, so a receipt row sorts by
+/// commit version and by nothing else.
+pub const LEDGER_RECEIPT_VERSIONSTAMP_OFFSET: u32 = 2;
+
+/// The [`ledger_receipt_key`] in the exact form
+/// `MutationType::SetVersionstampedKey` wants it: the 12-byte key followed by
+/// the placeholder offset as a little-endian `u32`.
+///
+/// FDB strips those final four bytes, reads them as `pos`, and substitutes the
+/// commit versionstamp over `key[pos..pos + 10]`. Building the parameter here
+/// rather than at the call site keeps the offset and the placeholder in one
+/// place: they are two halves of one fact, and a caller that hardcoded `2`
+/// would keep compiling after the placeholder moved and would corrupt the
+/// discriminator bytes instead of the versionstamp.
+///
+/// **One per transaction.** Every versionstamped write in a transaction gets
+/// the *same* 10 bytes, so two receipts in one intent would be one key written
+/// twice. An intent therefore banks exactly one receipt covering all its ops,
+/// which is also what the `(intent_id, parties, ops)` value of §6 describes.
+#[must_use]
+pub fn ledger_receipt_versionstamped_key() -> [u8; 16] {
+    let mut param = [0u8; 16];
+    param[..12].copy_from_slice(&ledger_receipt_key());
+    param[12..16].copy_from_slice(&LEDGER_RECEIPT_VERSIONSTAMP_OFFSET.to_le_bytes());
+    param
+}
+
+/// The value stored at [`ledger_item_key`]: the `(owner_ref, item_state)` pair
+/// of docs/08-persistence.md §6.
+///
+/// **This row is the anti-dupe invariant** (§7). There is exactly one of them
+/// per unique item, so "who holds item X" has exactly one durable answer, and
+/// a transfer is a read-check-write over it inside one serializable
+/// transaction. Two concurrent transfers of X read the same row and therefore
+/// share a read conflict range: at most one of them can commit, and the loser
+/// re-runs and re-reads the winner's owner.
+///
+/// Postcard-encoded, like [`IntentRow`] — the same reason: one small,
+/// versionless value written and read by this crate alone.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ItemRow {
+    /// The `owner_ref` of §6: the account that holds this item.
+    pub owner: AccountId,
+    /// `Ruleset`-opaque item state (durability, charges, socketed contents).
+    ///
+    /// The cluster never interprets these bytes; a transfer carries them
+    /// across unchanged, which is what makes an ownership move a move rather
+    /// than a re-mint. `Vec<u8>` rather than a typed struct because
+    /// docs/08-persistence.md §2.2 keeps op semantics `Ruleset`-side, and a
+    /// typed state here would be this crate quietly defining a game.
+    pub state: Vec<u8>,
+}
+
+/// The value stored at [`ledger_receipt_key`]: the `(intent_id, parties, ops)`
+/// audit record of docs/08-persistence.md §6.
+///
+/// Strictly ordered by construction — the key is the commit versionstamp, so
+/// receipt order *is* commit order and no clock is involved. This is the row
+/// an operator (or the P5 dupe gauntlet) reads to answer "what actually
+/// happened, in what order", independently of the `intent/` idempotency rows,
+/// which are swept after an hour.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ReceiptRow {
+    /// The intent that committed these effects.
+    pub intent_id: u128,
+    /// The accounts the intent moved value between, in first-seen order.
+    pub parties: Vec<AccountId>,
+    /// The op ids the intent carried, in op order — including the
+    /// `Ruleset`-opaque ones, which the cluster records without interpreting.
+    pub ops: Vec<u16>,
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -1111,6 +1185,22 @@ mod tests {
             receipt[2..],
             [0u8; 10],
             "the versionstamp placeholder is ten zero bytes"
+        );
+
+        // The `SetVersionstampedKey` parameter is the key plus the offset the
+        // binding strips off, and the offset must point at the placeholder or
+        // FDB overwrites the discriminator bytes instead.
+        let param = ledger_receipt_versionstamped_key();
+        assert_eq!(&param[..12], &receipt[..]);
+        assert_eq!(
+            u32::from_le_bytes(param[12..16].try_into().unwrap()),
+            LEDGER_RECEIPT_VERSIONSTAMP_OFFSET
+        );
+        assert_eq!(
+            &param[LEDGER_RECEIPT_VERSIONSTAMP_OFFSET as usize
+                ..LEDGER_RECEIPT_VERSIONSTAMP_OFFSET as usize + 10],
+            &[0u8; 10],
+            "the offset names the ten zero bytes, not the 'lr' discriminator"
         );
 
         // All three share the ledger prefix but live in disjoint sub-spans:

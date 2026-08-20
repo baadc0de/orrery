@@ -13,6 +13,13 @@
 //!   effect applied exactly once, and a committed intent survives an unclean
 //!   cluster drop (the idempotency row and the ledger row are both readable
 //!   after reopening).
+//! - **The item ownership transfer** (`fdb` feature, live cluster): one trade
+//!   moves `ledger/item/{uid}` and both balances and banks a versionstamped
+//!   receipt in one transaction; each durable refusal names itself and leaves
+//!   every row untouched; a replay moves the item once; and two concurrent
+//!   transfers of one item leave exactly one owner. That last one is the
+//!   anti-dupe invariant of D11 §7, and the read that produces it is
+//!   `trx.get(ledger/item/{uid})` inside the intent transaction.
 
 mod lanes;
 mod support;
@@ -692,4 +699,596 @@ async fn fdb_fenced_intent_latency_at_128_shards() {
     for &shard in &shards {
         fences.retire(grid, shard).await.unwrap();
     }
+}
+
+// ---------------------------------------------------------------------------
+// The item ownership transfer (`fdb` feature, live cluster)
+// ---------------------------------------------------------------------------
+//
+// These write to fixed keys, so every test resets the rows it owns before it
+// runs. Reusing a shared development cluster otherwise makes the *second* run
+// of a suite assert something different from the first: an item already
+// transferred, a balance already spent, an `intent/` row already recorded.
+// The account, item and intent-id spaces below are disjoint per test for the
+// same reason two tests must not share a grid.
+
+/// Build the 40-byte `LEDGER_ITEM_TRANSFER_OP` args through the same
+/// definition the executor decodes them with.
+#[cfg(feature = "fdb")]
+fn transfer_args(item: u64, seller: u64, buyer: u64, asset: u64, price: i64) -> Vec<u8> {
+    orrery_persistd::ItemTransferArgs {
+        item: orrery_protocol::ItemUid::new(item),
+        seller: orrery_protocol::AccountId::new(seller),
+        buyer: orrery_protocol::AccountId::new(buyer),
+        asset: orrery_protocol::AssetId::new(asset),
+        price,
+    }
+    .encode()
+    .to_vec()
+}
+
+/// A signed transfer intent.
+#[cfg(feature = "fdb")]
+fn transfer_intent(
+    id: u128,
+    key: &iroh_base::SecretKey,
+    item: u64,
+    seller: u64,
+    buyer: u64,
+    asset: u64,
+    price: i64,
+) -> Intent {
+    signed_intent(
+        id,
+        key,
+        orrery_persistd::LEDGER_ITEM_TRANSFER_OP,
+        &transfer_args(item, seller, buyer, asset, price),
+    )
+}
+
+/// Put the durable rows a trade test needs into a known state: item owners,
+/// exact balances, and no `intent/` row for the ids the test will submit.
+///
+/// Balances are `set` rather than `Add`ed, so a re-run starts from the same
+/// number instead of accumulating. The `intent/` deletes are what let a test
+/// reuse a fixed `intent_id` — without them the second run replays the first
+/// run's recorded outcome and asserts nothing.
+#[cfg(feature = "fdb")]
+async fn reset_ledger(
+    db: &foundationdb::Database,
+    items: &[(u64, u64)],
+    balances: &[(u64, u64, i64)],
+    intents: &[u128],
+) {
+    let items = items.to_vec();
+    let balances = balances.to_vec();
+    let intents = intents.to_vec();
+    db.run(|trx, _| {
+        let items = items.clone();
+        let balances = balances.clone();
+        let intents = intents.clone();
+        async move {
+            for (item, owner) in items {
+                let key =
+                    orrery_persistd::keyspace::ledger_item_key(orrery_protocol::ItemUid::new(item));
+                let row = orrery_persistd::keyspace::ItemRow {
+                    owner: orrery_protocol::AccountId::new(owner),
+                    state: b"fixture".to_vec(),
+                };
+                trx.set(&key, &postcard::to_stdvec(&row).unwrap());
+            }
+            for (account, asset, value) in balances {
+                let key = orrery_persistd::keyspace::ledger_bal_key(
+                    orrery_protocol::AccountId::new(account),
+                    orrery_protocol::AssetId::new(asset),
+                );
+                trx.set(&key, &i128::from(value).to_le_bytes());
+            }
+            for id in &intents {
+                trx.clear(&orrery_persistd::keyspace::intent_key(*id));
+            }
+            // Receipts are keyed by commit versionstamp, so a re-run cannot
+            // overwrite the previous run's row the way every other key here
+            // does — it appends a second one. Clear the ones these intent ids
+            // banked, and only those: the `lr` span is global (no grid in the
+            // key) and other tests' rows live in it.
+            {
+                use futures::TryStreamExt as _;
+                let mut stale = Vec::new();
+                let mut stream = trx.get_ranges_keyvalues(
+                    foundationdb::RangeOption {
+                        begin: foundationdb::KeySelector::first_greater_or_equal(b"lr".as_slice()),
+                        end: foundationdb::KeySelector::first_greater_or_equal(b"ls".as_slice()),
+                        ..foundationdb::RangeOption::default()
+                    },
+                    false,
+                );
+                while let Some(kv) = stream.try_next().await? {
+                    if let Ok(row) =
+                        postcard::from_bytes::<orrery_persistd::keyspace::ReceiptRow>(kv.value())
+                    {
+                        if intents.contains(&row.intent_id) {
+                            stale.push(kv.key().to_vec());
+                        }
+                    }
+                }
+                for key in stale {
+                    trx.clear(&key);
+                }
+            }
+            Ok(())
+        }
+    })
+    .await
+    .unwrap();
+}
+
+/// The account named by `ledger/item/{item}`, or `None` if the row is absent.
+#[cfg(feature = "fdb")]
+async fn read_item_owner(db: &foundationdb::Database, item: u64) -> Option<u64> {
+    let key = orrery_persistd::keyspace::ledger_item_key(orrery_protocol::ItemUid::new(item));
+    let value: Option<foundationdb::future::FdbSlice> = db
+        .run(|trx, _| async move { Ok(trx.get(&key, false).await?) })
+        .await
+        .unwrap();
+    value.map(|v| {
+        let row: orrery_persistd::keyspace::ItemRow = postcard::from_bytes(&v).unwrap();
+        row.owner.0
+    })
+}
+
+/// Every `ledger/receipt/` row this intent banked.
+///
+/// The receipt family is not grid-scoped — its key is nothing but the commit
+/// versionstamp — so the whole span is scanned and filtered by `intent_id`
+/// rather than counted. On a shared cluster the span holds other tests' rows.
+#[cfg(feature = "fdb")]
+async fn receipts_for(
+    db: &foundationdb::Database,
+    intent_id: u128,
+) -> Vec<orrery_persistd::keyspace::ReceiptRow> {
+    use futures::TryStreamExt as _;
+
+    db.run(|trx, _| async move {
+        let mut found = Vec::new();
+        let mut stream = trx.get_ranges_keyvalues(
+            foundationdb::RangeOption {
+                begin: foundationdb::KeySelector::first_greater_or_equal(b"lr".as_slice()),
+                end: foundationdb::KeySelector::first_greater_or_equal(b"ls".as_slice()),
+                ..foundationdb::RangeOption::default()
+            },
+            false,
+        );
+        while let Some(kv) = stream.try_next().await? {
+            if let Ok(row) =
+                postcard::from_bytes::<orrery_persistd::keyspace::ReceiptRow>(kv.value())
+            {
+                if row.intent_id == intent_id {
+                    // The versionstamp is 10 bytes at offset 2, so a receipt
+                    // key is 12 bytes and the placeholder is gone.
+                    assert_eq!(kv.key().len(), 12, "receipt key carries a versionstamp");
+                    assert_ne!(
+                        &kv.key()[2..12],
+                        &[0u8; 10],
+                        "FDB substituted the commit versionstamp for the placeholder"
+                    );
+                    found.push(row);
+                }
+            }
+        }
+        Ok(found)
+    })
+    .await
+    .unwrap()
+}
+
+/// The happy path of docs/08-persistence.md §7: one transaction moves the
+/// ownership row, debits the buyer, credits the seller, and banks a receipt.
+#[cfg(feature = "fdb")]
+#[tokio::test]
+async fn fdb_item_transfer_moves_the_row_and_both_balances() {
+    use orrery_persistd::{FdbIntentExecutor, IntentExecutor};
+
+    let Some(cluster) = fdb_cluster_file() else {
+        eprintln!("skipping: ORRERY_FDB_CLUSTER_FILE not set and no .fdb-dev/fdb.cluster");
+        return;
+    };
+    let exec = FdbIntentExecutor::connect(&cluster, GridId::new(9320)).unwrap();
+    let (item, seller, buyer, asset, price) = (0x9320_0001u64, 520_001u64, 520_002u64, 9u64, 500);
+    let id = 0x9320_0001u128;
+    reset_ledger(
+        exec.database(),
+        &[(item, seller)],
+        &[(buyer, asset, 500), (seller, asset, 0)],
+        &[id],
+    )
+    .await;
+
+    let outcome = exec
+        .execute(&transfer_intent(
+            id,
+            &secret(20),
+            item,
+            seller,
+            buyer,
+            asset,
+            price,
+        ))
+        .await
+        .unwrap();
+    assert!(
+        matches!(outcome, IntentOutcome::Committed { .. }),
+        "the trade must commit, got {outcome:?}"
+    );
+
+    assert_eq!(
+        read_item_owner(exec.database(), item).await,
+        Some(buyer),
+        "the single ownership row now names the buyer"
+    );
+    assert_eq!(read_balance(exec.database(), buyer, asset).await, Some(0));
+    assert_eq!(
+        read_balance(exec.database(), seller, asset).await,
+        Some(500)
+    );
+
+    let receipts = receipts_for(exec.database(), id).await;
+    assert_eq!(receipts.len(), 1, "one trade banks one receipt");
+    assert_eq!(
+        receipts[0].parties,
+        vec![
+            orrery_protocol::AccountId::new(seller),
+            orrery_protocol::AccountId::new(buyer)
+        ]
+    );
+    assert_eq!(
+        receipts[0].ops,
+        vec![orrery_persistd::LEDGER_ITEM_TRANSFER_OP]
+    );
+}
+
+/// Each durable refusal names itself, and none of them writes anything.
+///
+/// The distinctness is the assertion. An opaque `REASON_EXECUTOR_ERROR` for
+/// all four would leave "the anti-dupe invariant held" and "the cluster fell
+/// over" reading identically — which is exactly what the dupe gauntlet has to
+/// tell apart.
+#[cfg(feature = "fdb")]
+#[tokio::test]
+async fn fdb_each_transfer_refusal_names_itself_and_writes_nothing() {
+    use orrery_persistd::{FdbIntentExecutor, IntentExecutor};
+
+    let Some(cluster) = fdb_cluster_file() else {
+        eprintln!("skipping: ORRERY_FDB_CLUSTER_FILE not set and no .fdb-dev/fdb.cluster");
+        return;
+    };
+    let exec = FdbIntentExecutor::connect(&cluster, GridId::new(9321)).unwrap();
+    let (item, absent, seller, buyer, asset) =
+        (0x9321_0001u64, 0x9321_00FFu64, 521_001u64, 521_002u64, 9u64);
+
+    // (intent_id, seller, buyer, item, price, expected reason, why)
+    let cases: [(u128, u64, u64, u64, i64, u16, &str); 4] = [
+        (
+            0x9321_0001,
+            buyer,
+            seller,
+            item,
+            0,
+            orrery_protocol::REASON_NOT_ITEM_OWNER,
+            "the named seller does not own the row",
+        ),
+        (
+            0x9321_0002,
+            seller,
+            buyer,
+            absent,
+            0,
+            orrery_protocol::REASON_NO_SUCH_ITEM,
+            "the item has no ownership row",
+        ),
+        (
+            0x9321_0003,
+            seller,
+            seller,
+            item,
+            0,
+            orrery_protocol::REASON_ITEM_TRANSFER_TO_SELF,
+            "one account cannot be both parties",
+        ),
+        (
+            0x9321_0004,
+            seller,
+            buyer,
+            item,
+            501,
+            orrery_protocol::REASON_INSUFFICIENT_BALANCE,
+            "the buyer holds 500 and the price is 501",
+        ),
+    ];
+
+    for (id, from, to, uid, price, reason, why) in cases {
+        reset_ledger(
+            exec.database(),
+            &[(item, seller)],
+            &[(buyer, asset, 500), (seller, asset, 0)],
+            &[id],
+        )
+        .await;
+        // The absent item must actually be absent, whatever a previous run
+        // left behind.
+        exec.database()
+            .run(|trx, _| async move {
+                trx.clear(&orrery_persistd::keyspace::ledger_item_key(
+                    orrery_protocol::ItemUid::new(absent),
+                ));
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        let outcome = exec
+            .execute(&transfer_intent(
+                id,
+                &secret(21),
+                uid,
+                from,
+                to,
+                asset,
+                price,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome,
+            IntentOutcome::Rejected { reason },
+            "{why}: expected its own reason code"
+        );
+        assert_eq!(
+            read_item_owner(exec.database(), item).await,
+            Some(seller),
+            "{why}: the ownership row is untouched"
+        );
+        assert_eq!(
+            read_balance(exec.database(), buyer, asset).await,
+            Some(500),
+            "{why}: the debit side is untouched"
+        );
+        assert_eq!(
+            read_balance(exec.database(), seller, asset).await,
+            Some(0),
+            "{why}: the credit side is untouched"
+        );
+        assert!(
+            receipts_for(exec.database(), id).await.is_empty(),
+            "{why}: no receipt is banked"
+        );
+    }
+}
+
+/// Replay: the same `intent_id` submitted twice transfers the item once.
+#[cfg(feature = "fdb")]
+#[tokio::test]
+async fn fdb_replayed_transfer_moves_the_item_once() {
+    use orrery_persistd::{FdbIntentExecutor, IntentExecutor};
+
+    let Some(cluster) = fdb_cluster_file() else {
+        eprintln!("skipping: ORRERY_FDB_CLUSTER_FILE not set and no .fdb-dev/fdb.cluster");
+        return;
+    };
+    let exec = FdbIntentExecutor::connect(&cluster, GridId::new(9322)).unwrap();
+    let (item, seller, buyer, asset) = (0x9322_0001u64, 522_001u64, 522_002u64, 9u64);
+    let id = 0x9322_0001u128;
+    reset_ledger(
+        exec.database(),
+        &[(item, seller)],
+        &[(buyer, asset, 500), (seller, asset, 0)],
+        &[id],
+    )
+    .await;
+
+    let intent = transfer_intent(id, &secret(22), item, seller, buyer, asset, 500);
+    let first = exec.execute(&intent).await.unwrap();
+    assert!(matches!(first, IntentOutcome::Committed { .. }));
+    let second = exec.execute(&intent).await.unwrap();
+    assert_eq!(second, first, "the replay returns the recorded outcome");
+
+    assert_eq!(read_item_owner(exec.database(), item).await, Some(buyer));
+    assert_eq!(
+        read_balance(exec.database(), seller, asset).await,
+        Some(500),
+        "the seller was paid once, not twice"
+    );
+    assert_eq!(read_balance(exec.database(), buyer, asset).await, Some(0));
+    assert_eq!(
+        receipts_for(exec.database(), id).await.len(),
+        1,
+        "one receipt: the replay committed no second trade"
+    );
+}
+
+/// **The anti-dupe invariant, in one test.** Two transfers of the same item
+/// run concurrently against a live cluster; exactly one commits, the other is
+/// refused with `REASON_NOT_ITEM_OWNER`, and the item ends with exactly one
+/// owner who is not the seller.
+///
+/// The mechanism is the `trx.get` on `ledger/item/{uid}` that both
+/// transactions perform before writing. That read registers the row's
+/// serializable read conflict range, so the resolver aborts whichever
+/// transaction tries to commit second with `not_committed`; `db.run` re-runs
+/// its closure, the item row is read again, and the owner check now fails
+/// against the winner. Double-spend would require two commits over that one
+/// read — which FDB does not allow (docs/08-persistence.md §7).
+///
+/// In-process, deliberately: the two-*process* form is the P5 gauntlet's arm
+/// (b) and belongs to its own harness. What is proved here is that the
+/// conflict range exists and that losing it produces an honest refusal rather
+/// than a second transfer.
+#[cfg(feature = "fdb")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fdb_two_transfers_of_one_item_leave_one_owner() {
+    use orrery_persistd::{FdbIntentExecutor, IntentExecutor};
+
+    let Some(cluster) = fdb_cluster_file() else {
+        eprintln!("skipping: ORRERY_FDB_CLUSTER_FILE not set and no .fdb-dev/fdb.cluster");
+        return;
+    };
+    let exec = Arc::new(FdbIntentExecutor::connect(&cluster, GridId::new(9323)).unwrap());
+    let (item, seller, asset, price) = (0x9323_0001u64, 523_001u64, 9u64, 500i64);
+    let buyers = [523_002u64, 523_003u64];
+    let ids = [0x9323_0001u128, 0x9323_0002u128];
+    reset_ledger(
+        exec.database(),
+        &[(item, seller)],
+        &[
+            (buyers[0], asset, 500),
+            (buyers[1], asset, 500),
+            (seller, asset, 0),
+        ],
+        &ids,
+    )
+    .await;
+
+    // A barrier, so the two transactions genuinely overlap. Without it the
+    // first can finish before the second takes its read version, and the test
+    // would assert the same outcome without ever exercising the conflict.
+    let gate = Arc::new(tokio::sync::Barrier::new(ids.len()));
+    let mut tasks = tokio::task::JoinSet::new();
+    for (id, buyer) in ids.into_iter().zip(buyers) {
+        let exec = Arc::clone(&exec);
+        let gate = Arc::clone(&gate);
+        tasks.spawn(async move {
+            gate.wait().await;
+            exec.execute(&transfer_intent(
+                id,
+                &secret(23),
+                item,
+                seller,
+                buyer,
+                asset,
+                price,
+            ))
+            .await
+        });
+    }
+
+    let mut committed = 0;
+    let mut refused = 0;
+    while let Some(result) = tasks.join_next().await {
+        match result
+            .expect("transfer task did not panic")
+            .expect("a losing transfer is a Rejected outcome, never an executor error")
+        {
+            IntentOutcome::Committed { .. } => committed += 1,
+            IntentOutcome::Rejected { reason } => {
+                assert_eq!(
+                    reason,
+                    orrery_protocol::REASON_NOT_ITEM_OWNER,
+                    "the loser re-reads the winner's owner and fails its check honestly"
+                );
+                refused += 1;
+            }
+        }
+    }
+    assert_eq!(
+        (committed, refused),
+        (1, 1),
+        "exactly one of two transfers of one item commits"
+    );
+
+    let owner = read_item_owner(exec.database(), item)
+        .await
+        .expect("the item still has exactly one ownership row");
+    assert!(
+        buyers.contains(&owner),
+        "the item ended with one of the two buyers, got {owner}"
+    );
+    assert_ne!(owner, seller, "the seller divested exactly once");
+    assert_eq!(
+        read_balance(exec.database(), seller, asset).await,
+        Some(price),
+        "the seller was paid for one sale, not two"
+    );
+    let winner = usize::from(owner == buyers[1]);
+    assert_eq!(
+        read_balance(exec.database(), buyers[winner], asset).await,
+        Some(0),
+        "the winning buyer paid"
+    );
+    assert_eq!(
+        read_balance(exec.database(), buyers[1 - winner], asset).await,
+        Some(500),
+        "the refused buyer's balance is untouched"
+    );
+}
+
+/// The conflict, named: FDB reports `ledger/item/{uid}` as the range that
+/// caused the second commit to fail.
+///
+/// `fdb_two_transfers_of_one_item_leave_one_owner` asserts the *outcome* — one
+/// owner, one honest refusal — and that outcome is also what a purely
+/// serialized pair of transfers would produce, so on its own it does not
+/// distinguish "the resolver aborted the loser" from "the loser simply ran
+/// second". This one removes the ambiguity by asking FDB directly. Two
+/// transactions read the exact key [`plan_ops`] reads
+/// (`keyspace::ledger_item_key`), both write it, the first commits, and the
+/// second is refused with `not_committed` (1020) — with
+/// `ReportConflictingKeys` set, so the reported range can be checked to be the
+/// item row and not something incidental.
+///
+/// [`plan_ops`]: orrery_persistd
+#[cfg(feature = "fdb")]
+#[tokio::test]
+async fn fdb_the_item_row_read_is_what_registers_the_conflict() {
+    use foundationdb::options::TransactionOption;
+    use orrery_persistd::FdbIntentExecutor;
+
+    let Some(cluster) = fdb_cluster_file() else {
+        eprintln!("skipping: ORRERY_FDB_CLUSTER_FILE not set and no .fdb-dev/fdb.cluster");
+        return;
+    };
+    let exec = FdbIntentExecutor::connect(&cluster, GridId::new(9324)).unwrap();
+    let item = 0x9324_0001u64;
+    reset_ledger(exec.database(), &[(item, 524_001)], &[], &[]).await;
+
+    let key = orrery_persistd::keyspace::ledger_item_key(orrery_protocol::ItemUid::new(item));
+    let row = |owner: u64| {
+        postcard::to_stdvec(&orrery_persistd::keyspace::ItemRow {
+            owner: orrery_protocol::AccountId::new(owner),
+            state: Vec::new(),
+        })
+        .unwrap()
+    };
+
+    let first = exec.database().create_trx().unwrap();
+    let second = exec.database().create_trx().unwrap();
+    second
+        .set_option(TransactionOption::ReportConflictingKeys)
+        .unwrap();
+
+    // Both take a read version and register the row's read conflict range,
+    // exactly as the executor's transfer does before it writes.
+    first.get(&key, false).await.unwrap();
+    second.get(&key, false).await.unwrap();
+
+    first.set(&key, &row(524_002));
+    second.set(&key, &row(524_003));
+
+    first.commit().await.expect("the first transfer commits");
+    let Err(refused) = second.commit().await else {
+        panic!("the second commit must be refused: both read the same item row");
+    };
+    assert_eq!(
+        refused.code(),
+        1020,
+        "not_committed is what makes double-spend impossible; got {refused}"
+    );
+
+    let ranges = refused.conflicting_keys().await.unwrap();
+    assert!(
+        ranges
+            .iter()
+            .any(|r| r.begin() <= key.as_slice() && key.as_slice() < r.end()),
+        "the conflicting range must cover ledger/item/{item:#x}, got {:?}",
+        ranges.iter().map(ToString::to_string).collect::<Vec<_>>()
+    );
 }

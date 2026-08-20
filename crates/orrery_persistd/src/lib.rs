@@ -70,12 +70,13 @@ pub use gateway::{
     SharedAdjudicator, SharedBulkAckAdmission, SharedSuccessorPolicy, SuccessorCandidate,
     SuccessorPolicy, SuccessorRequest, GATEWAY_ALPN, MAX_INTEREST_PEERS,
 };
+pub use intent::{
+    item_transfer_verdict, IntentError, IntentExecutor, IntentPrecheck, IntentValidator,
+    IntentVerdict, ItemTransferArgs, MemIntentExecutor, OpsVerdict, PermissiveValidator,
+    LEDGER_CREDIT_OP, LEDGER_ITEM_TRANSFER_ARGS_BYTES, LEDGER_ITEM_TRANSFER_OP,
+};
 #[cfg(feature = "fdb")]
 pub use intent::{FdbIntentExecutor, IntentFence};
-pub use intent::{
-    IntentError, IntentExecutor, IntentPrecheck, IntentValidator, IntentVerdict, MemIntentExecutor,
-    PermissiveValidator,
-};
 #[cfg(feature = "chain-grpc")]
 pub use journal::{
     spawn_adopted_chain, spawn_chain_grpc, AdoptedChainHistory, ChainGrpcServer, DurableChainId,
