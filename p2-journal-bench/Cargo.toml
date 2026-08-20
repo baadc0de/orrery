@@ -1,0 +1,36 @@
+# Store-level comparison rig for the P2 journal's durability barrier
+# (docs/08-persistence.md §4.8).
+#
+# Its own `[workspace]`, and `rocksdb` behind a NON-DEFAULT feature, for one
+# reason each. The workspace keeps `rocksdb` out of `orrery_persistd`'s
+# dependency graph entirely — this is a measurement tool, not a dependency of
+# the system, and adopting a store is a D14/ADR decision this crate does not
+# pre-empt. The feature keeps it out of CI: `librocksdb-sys` compiles RocksDB
+# from C++ source, which is minutes per cold build, and the `gates` lane only
+# ever runs `cargo check --all-targets` with default features here.
+[workspace]
+
+[package]
+name = "p2-journal-bench"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[features]
+default = ["fjall-store"]
+fjall-store = ["dep:fjall"]
+rocksdb-store = ["dep:rocksdb"]
+waldb-store = ["dep:wal-db"]
+
+[dependencies]
+# Pinned to the same version orrery_persistd uses (D14), so the fjall arm
+# measures the store the journal actually runs.
+fjall = { version = "3.1", features = ["bytes_1"], optional = true }
+rocksdb = { version = "0.24", default-features = false, features = ["lz4"], optional = true }
+# Evaluated, NOT adopted. See the README: 235 downloads and a 1.0 declared the
+# same day as 0.5.0. It is here to be measured, which is the only way to have
+# an opinion about it.
+wal-db = { version = "1.0", optional = true }
+
+[profile.release]
+debug = true

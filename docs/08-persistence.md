@@ -2936,6 +2936,13 @@ sleep.
    above is the demonstration. What P2 needs from fjall is backpressure that
    blocks proportionally, or a way to apply it to the *submitter* rather than
    inside `Batch::commit`. Worth an issue with this section's numbers attached.
+
+   > **Better evidenced now ([§4.8](#48-is-it-fjalls-or-an-lsms-a-store-level-comparison)).**
+   > Two other stores under the identical write pattern, on the same box, do
+   > not do this — RocksDB and a pure WAL both stall **zero** times on tmpfs
+   > where fjall stalls 59, and both hold `journal_commit_ms` p99 inside D16's
+   > 2 ms budget where fjall reads 72 ms. So it is fjall's, not an LSM's, and
+   > the issue can say so with numbers.
 2. **Until then, D16's 2 ms `journal_commit_ms` p99 is not reachable through
    this store**, and that is a different sentence from §4.3's. It is not a
    hardware purchase and not a group-commit tuning; 96 % of commits already
@@ -2968,6 +2975,168 @@ orrery_persistd --test journal_arrival_rate` without `--features fdb`
 un-unifies the release profile and rebuilds `persistd` *without* FDB, after
 which the gate dies at startup with `persistd was compiled without the fdb
 feature`.
+
+### 4.8 Is it fjall's, or an LSM's? A store-level comparison
+
+[§4.7](#47-the-stall-is-fjalls-write-backpressure-and-it-is-a-sleep) named the
+mechanism — fjall 3.1.9's `Batch::commit` calls `local_backpressure()`, which
+sleeps in 100 ms steps while four or more sealed memtables are queued — and
+left exactly one question open. That question is about a *second* store: is
+this pathology **fjall's**, or **an LSM's**? Nothing measured so far could tell
+the two apart, because everything measured so far ran on fjall.
+
+```sh
+python3 scripts/p2-journal-store-report.py             # every number below
+python3 scripts/p2-journal-store-report.py --self-test # and its claims
+```
+
+**The instrument** is [`p2-journal-bench`](../p2-journal-bench/README.md), and
+it is deliberately not a second `Journal`. What the journal asks of a store is
+narrow — batch N keyed records, commit the batch with one WAL fsync, let the
+caller time that call — so that is the whole `Store` trait, implemented
+identically for every arm. All arms see the same arrival process (the gate's
+bulk shape: 250 bursts/s of 71 records, ~17.7 k records/s), the same 200 µs
+window and caps, the same **monotonic big-endian keys** — what the journal's
+LSN ordering produces, and the ordering an LSM's compaction is most sensitive
+to — and the same 152 B values. **No arm is tuned.**
+
+#### The answer: it is fjall's
+
+300 s per run on a `c4d-standard-32-lssd`, 5.33 M records, n=2 per cell:
+
+| store | medium | p50 | p99 | p99.9 | max | stalls ≥ 20 ms |
+|---|---|---|---|---|---|---|
+| fjall | NVMe | 0.502 | **74.618** | 325.462 | 456.365 | 66 |
+| fjall | tmpfs | 0.370 | **71.860** | 332.327 | 418.302 | 59 |
+| rocksdb | NVMe | 0.439 | **0.595** | 91.852 | 156.075 | 17 |
+| rocksdb | tmpfs | 0.320 | **0.331** | 0.399 | 0.556 | **0** |
+| wal-db | NVMe | 0.463 | **0.517** | 0.641 | 62.781 | 2 |
+| wal-db | tmpfs | 0.312 | **0.326** | 0.358 | 0.555 | **0** |
+
+Read the tmpfs rows first, because tmpfs is where storage cannot be blamed:
+
+* **fjall stalls 59 times with no block device involved**, and 66 times with
+  one. Its stall count is *device-independent*, which is §4.7's finding
+  reproduced in a codebase that shares nothing with the journal but fjall
+  itself.
+* **RocksDB and wal-db stall zero times on tmpfs.** Their stalls are
+  *device-coupled*: 17 and 2 respectively on NVMe, none in RAM.
+
+And on the gated statistic: **RocksDB and wal-db hold `journal_commit_ms` p99
+inside D16's 2 ms budget in all four of their cells. fjall reads 72–75 ms.**
+That is a factor of roughly 130 on the number P2 is actually graded on, and it
+is not a device story, a tuning story, or a workload story — every arm ran the
+same pattern on the same box through the same binary.
+
+The two-store leg adds duration as a variable and rules out the trap §4.7 fell
+into once already, where a short run reports zero stalls from a store that
+stalls. At 90 s (1.60 M records) fjall's tmpfs p99 is 0.535 ms — *inside*
+budget — because 21 stalls in ~22 000 flushes do not reach the 1 % mark. At
+300 s the same configuration reads 64.7 ms. **A 90 s measurement of fjall would
+have been a passing grade.**
+
+#### The controls, without which none of that means anything
+
+A comparison of "durable" stores is worthless if one of them was quietly not
+syncing, or wrote far less:
+
+| arm | mean barrier | on disk |
+|---|---|---|
+| fjall, fsync per batch | 250.8 µs | 158.6 MB |
+| fjall, buffered *(control)* | 58.4 µs | 158.6 MB |
+| rocksdb, fsync per batch | 194.2 µs | 152.4 MB |
+| rocksdb, buffered *(control)* | 36.3 µs | 152.4 MB |
+| wal-db, fsync per batch | 162.3 µs | **89.5 MB** |
+| wal-db, buffered *(control)* | 23.1 µs | **89.5 MB** |
+
+Every arm's barrier collapses without the fsync, so every arm really is
+syncing. The two LSMs wrote within 4 % of each other. **wal-db wrote 56 % of
+what fjall did**, and that number is the caveat, not a result — see below.
+
+#### What this does not license
+
+* **wal-db does strictly less work, and its numbers are a lower bound.** A WAL
+  keeps no keyed index; the 89.5 MB against fjall's 158.6 MB is exactly that
+  difference. `orrery_persistd`'s `Journal` maintains **8 keyspaces** and has
+  **26 point/range read sites** — chain records, chain state, adoption markers,
+  the originated-records index, segments, metadata. A pure WAL supplies none of
+  it. Adopting one means building [`journal-raw`](#4-journal-design)'s index
+  layer, and that work is not in these numbers.
+* **Neither alternative is stall-free**, and a version of this section that
+  said so would be wrong: RocksDB stalls 17 times on NVMe and wal-db twice,
+  with a 124 ms worst barrier. What separates them from fjall is that their
+  stalls are *rare enough not to reach p99*, and *absent* when the device is.
+* **No store is tuned.** A default RocksDB is not a tuned RocksDB, and fjall's
+  memtable size — the one knob §4.7 swept — is at its default here too.
+* **This is not an adoption recommendation.** Swapping the journal's backing
+  store is a D14/ADR decision. What this section supplies is the evidence such
+  a decision would need, and one of the three candidates should not survive
+  contact with it (below).
+* **n = 2 per cell in the three-way leg**, 2–3 in the two-store leg. The effects
+  are enormous relative to that — 59 stalls against 0 — but no ordering between
+  RocksDB and wal-db is claimed.
+
+#### On the two candidate crates, since suitability was asked
+
+**`wal-db` 1.0.0 is the right *shape* and the wrong *maturity*.** The shape
+argument is strong: the P2 journal *is* an append-only log keyed by LSN with a
+group-commit fsync, and wal-db's `append` (page cache) / `sync` (barrier,
+coalescing concurrent callers) is that contract exactly. It uses `fdatasync` on
+Linux and `fcntl(F_FULLFSYNC)` on macOS — the latter matters, since plain
+`fsync` there does not reach stable storage. It carries CRC32C per record where
+the journal already computes `payload_crc`, truncates torn tails on open, and
+offers a segmented log with `truncate_before` — which is a description of
+`journal-raw` as §4 already scoped it. The maturity argument is equally strong
+in the other direction: **235 downloads, and 0.5.0 through 1.0.0 published
+inside about eight hours on 2026-06-05**, with the only dependents being the
+same author's other crates. "On-disk format frozen for 1.x" is a claim made on
+day one, not a track record. Its test posture (loom, fuzz-hardened recovery,
+property tests for torn writes) is better than most crates its size, and that
+is not the same as having survived other people's crashes.
+
+**`lsm-db` 1.0.0 is the less appropriate of the two, twice over.** It is an LSM
+— the same class whose memtable and compaction machinery produced the stall
+this section exists to escape — so adopting it trades fjall's flow control for
+another's, unmeasured. And it is built *on* wal-db: if this author's code is to
+be depended on at all, the primitive is the part the journal needs and the LSM
+is the part it does not. Its maturity is weaker still: 169 downloads, nine
+versions between 2026-06-06 and 06-10.
+
+#### What follows
+
+1. **The upstream conversation is now better evidenced.** fjall's 100 ms sleep
+   is not "how LSMs behave" — two other stores under the identical pattern do
+   not do it, and one of them is the reference LSM implementation. That belongs
+   in the issue §4.7 asks for.
+2. **`journal-raw` is worth more than it was.** §4 has always listed it as
+   planned; this section says the shape it describes measures flat (p99.9
+   0.358 ms on tmpfs, 0.641 ms on NVMe) where the current store measures 332 ms.
+   The remaining work is the index layer, not the log.
+3. **Do not adopt wal-db as a live dependency on these numbers.** It is a
+   credible *design reference* and a candidate to vendor and audit (this
+   repository already vendors three crates). Depending on 235 downloads for the
+   durability substrate of the system of record would be the largest single
+   risk in the codebase.
+4. **RocksDB is the conservative option and is not free.** It clears the p99
+   budget here and still stalls 17 times on NVMe, it is a large C++ dependency
+   with a minutes-long cold build, and none of that is priced in this section.
+
+#### Reproducing
+
+```sh
+cd p2-journal-bench
+cargo build --release --features "rocksdb-store waldb-store"   # compiles RocksDB from C++; minutes
+./target/release/p2-journal-bench --store fjall   --dir /mnt/nvme/f --seconds 300
+./target/release/p2-journal-bench --store rocksdb --dir /mnt/nvme/r --seconds 300
+./target/release/p2-journal-bench --store wal-db  --dir /mnt/nvme/w --seconds 300
+# and the same three on a tmpfs, which is the arm that removes storage entirely
+# --no-sync is the control: every arm's barrier must collapse without the fsync
+```
+
+**300 s is not a detail.** At the default rate the run offers ~2.7 MB/s and
+fjall's default memtable is 64 MiB, so 90 s rotates two or three times and 30 s
+may not rotate at all. The 90 s column above shows what that costs: a passing
+p99 from a store that fails at 300 s.
 
 ## 5. FoundationDB as the system of record
 
