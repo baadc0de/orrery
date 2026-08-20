@@ -357,7 +357,16 @@ gate_p3_siblings_evidence() {
     survivor_leases_held_before: .gateway_kill.survivor_leases_held_before,
     survivor_leases_held_after: .gateway_kill.survivor_leases_held_after,
     survivor_leases_expired_after: .gateway_kill.survivor_leases_expired_after,
-    lost: (.lost | length)
+    lost: (.lost | length),
+    handover_shards: .handover.shards_moved,
+    handover_holders_divested: .handover.holders_divested,
+    handover_expires_undelivered: .handover.expires_undelivered,
+    handover_heartbeats_wrong_owner: .handover.heartbeats_rejected_wrong_owner,
+    handover_duplicate_in_window: .handover.duplicate_authority_in_window,
+    handover_worst_window_ms: .handover.worst_window_ms,
+    handover_budget_ms: .handover.budget_ms,
+    handover_within_split_target: .handover.within_split_handover_target,
+    handover_clean: .handover.passed
   }' "$dir/report.json" 2>/dev/null || echo '{}')
   if [[ -e $dir/PASSED ]]; then status=PASSED; else status=FAILED; fi
   ev "$status" "$dir" "$numbers"

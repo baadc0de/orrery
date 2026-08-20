@@ -22,7 +22,18 @@
 #      duplicate, and its disposition counters do not move;
 #   5. `duplicate_authority` is the **sum** over both gateways' exports, which
 #      is the point — `AuthorityMetrics` is per-`GatewayServer` and nothing in
-#      the tree aggregates it.
+#      the tree aggregates it;
+#   6. one shard is handed from live gateway A to live gateway B mid-run
+#      (issue #119, D26 rule 3) and the move holds D26's two invariants:
+#      no window of overlapping `Active` ownership (`duplicate_authority`
+#      summed across the *handover window*, not merely over the run), no
+#      holder left without an `Expire`, nothing lost, and the player-facing
+#      window inside its stated budget.
+#
+# Clause 6 runs *before* both kills. The kills are about processes ending;
+# a handover is the case D26 says had no answer anywhere in the accepted set —
+# an owner that is still alive — and the recovery path every other clause
+# exercises is built on the assumption that the previous owner is gone.
 #
 # Like the P2 and P3 gates this is a *proof harness*: it writes no success
 # artifact unless every clause holds. Unlike the P3 island gate it needs
@@ -155,10 +166,39 @@ if [[ ${1:-} == --self-test ]]; then
     || die 'self-test: the gateway kill -9 is never armed; two coexisting processes would pass'
   runs P3_SIBLINGS_BIN 1 '--duration-secs' || die 'self-test: run duration absent'
 
+  # ── The live shard handover (issue #119, D26 rule 3) ──
+  # Six stages, each asserted against the invocation that carries it. A
+  # handover has two sides in two processes and a nomination in this script,
+  # and losing any one of them fails *quietly*: the harness would skip the
+  # clause and report a pass over five criteria instead of six.
+  runs PERSISTD_BIN 1 '--handover-request "$out/handover.json"' \
+    || die 'self-test: gateway A watches for no handover request, so no shard can be handed away'
+  runs PERSISTD_BIN 2 '"${standby_flags_b[@]}"' \
+    || die 'self-test: gateway B has no standby shard, so there is nothing for A to hand it'
+  has 'standby_flags_b+=(--standby-shard "${shards[$index]}")' \
+    || die 'self-test: no shard is nominated for the handover'
+  has 'handover_flags+=(--handover-shard "${shards[$index]}")' \
+    || die 'self-test: the nominated shards are never handed to the harness'
+  # Distinct cluster node ids. Both processes defaulted this to 0 before the
+  # handover clause, which left the durable rows unable to tell the two
+  # siblings apart — and a shard cannot be handed to its current owner.
+  runs PERSISTD_BIN 1 '--node-id 1' || die 'self-test: gateway A has no cluster node id of its own'
+  runs PERSISTD_BIN 2 '--node-id 2' || die 'self-test: gateway B has no cluster node id of its own'
+  has 'die '"'"'both gateways came up under one cluster node id' \
+    || die 'self-test: the two cluster node ids are never checked to differ'
+  runs P3_SIBLINGS_BIN 1 '"${handover_flags[@]}"' \
+    || die 'self-test: the harness is never told which shard moves, so clause 6 is skipped'
+  runs P3_SIBLINGS_BIN 1 '--handover-successor-node "$GATEWAY_B_CLUSTER_NODE"' \
+    || die 'self-test: the handover names no successor'
+  runs P3_SIBLINGS_BIN 1 '--handover-request "$out/handover.json"' \
+    || die 'self-test: the harness cannot invoke the handover it is asked to measure'
+  runs P3_SIBLINGS_BIN 1 '--handover-budget-ms "$HANDOVER_BUDGET_MS"' \
+    || die 'self-test: the handover window is measured against no budget'
+
   # A proof harness is only a proof if its verdict is load-bearing.
   has 'sibling_status -ne 0' || die 'self-test: harness verdict not enforced'
   has 'touch "$out/PASSED"' || die 'self-test: success artifact absent'
-  echo 'self-test: two gateways, disjoint shards, seeded world, both kills and the summed invariant present'
+  echo 'self-test: two gateways, disjoint shards, seeded world, both kills, the live handover and the summed invariant present'
   exit 0
 fi
 
@@ -173,7 +213,13 @@ for tool in "$PERSISTD_BIN" "$P3_SIBLINGS_BIN" "$COORDINATOR_BIN" "$ORRERY_SEED_
 done
 
 PEERS=${P3_SIBLINGS_PEERS:-8}
-DURATION_SECS=${P3_SIBLINGS_DURATION_SECS:-75}
+# Two settle budgets (12.05 s each), the attestation wait, the claim storm, and
+# now the handover leg: each moved shard waits for both registrars' 1 Hz
+# exports to account for it before its clause is judged, so five moves add
+# ~30 s. The harness refuses to start if this is too small rather than
+# discovering it 70 s in, and the figure it computes is the authority — this is
+# a default that has to clear it.
+DURATION_SECS=${P3_SIBLINGS_DURATION_SECS:-110}
 SCENARIO=${P3_SIBLINGS_SCENARIO:-"$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/crates/orrery_seed/scenarios/p2demo.toml"}
 # The `ci` rung of the P2 demo scenario: 100 rows, hash-placed, one per shard.
 # Small on purpose and not arbitrarily so — an interest grant may cover at most
@@ -181,6 +227,13 @@ SCENARIO=${P3_SIBLINGS_SCENARIO:-"$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pw
 # overlapping interest zones half the world, so the seeded row count is bounded
 # by 2 x 64 at any peer count.
 SEED_PROFILE=${P3_SIBLINGS_SEED_PROFILE:-ci}
+# docs/08-persistence.md §3.5 names "< 1 s" for the split handover window, and
+# D26 rule 3 step 4 puts a drain bounded by `handoff_deadline_ms` (300 ms) in
+# front of it. The harness reports the measurement against both figures and
+# fails on this one; it never adjusts either.
+HANDOVER_BUDGET_MS=${P3_SIBLINGS_HANDOVER_BUDGET_MS:-1300}
+# How many of gateway A's shards move, one full sequence each.
+HANDOVER_SHARDS=${P3_SIBLINGS_HANDOVER_SHARDS:-5}
 [[ -r $SCENARIO ]] || die "seed scenario is not readable: $SCENARIO"
 
 # This gate seeds a world and activates two shard sets against the fence. The
@@ -287,6 +340,8 @@ note "seeding the durable world from $(basename "$SCENARIO") (profile $SEED_PROF
 # rather than addressed to nobody.
 shard_flags_a=()
 shard_flags_b=()
+standby_flags_b=()
+handover_flags=()
 split_shard_set() {
   mapfile -t shards <"$out/shard-set.txt"
   local total=${#shards[@]}
@@ -304,7 +359,32 @@ split_shard_set() {
       shard_flags_b+=(--shard "$shard")
     fi
   done
+  # The last `$HANDOVER_SHARDS` of gateway A's shards are nominated to move,
+  # and gateway B is started with each as a `--standby-shard`: a shard it may
+  # adopt, but does not activate and does not serve. That asymmetry is D26 rule
+  # 3's, not this script's — the outgoing owner performs both CASes, and the
+  # successor's part is to notice its row and open.
+  #
+  # **Nominated here on purpose.** Which shard moves and when is placement/ops
+  # policy, which D26 and issue #119 both put out of scope for the mechanism;
+  # what the gate proves is that the move, once asked for, is safe. The tail of
+  # A's list is as good a choice as any and is deterministic, which a rerun of
+  # a failed gate wants.
+  #
+  # **More than one, because one is nearly vacuous.** This gate's world is the
+  # P2 demo scenario, hash-placed one row per level-18 shard, so a single shard
+  # is a single entity held by a single peer — and "every holder on the moving
+  # shard received an `Expire`" over one holder proves almost nothing. Each
+  # named shard is handed over in its own full sequence and the clause is the
+  # conjunction.
+  local nominated=$HANDOVER_SHARDS
+  (( nominated < half )) || die "cannot nominate $nominated of gateway A's $half shard(s) for handover"
+  for (( index = half - nominated; index < half; index++ )); do
+    standby_flags_b+=(--standby-shard "${shards[$index]}")
+    handover_flags+=(--handover-shard "${shards[$index]}")
+  done
   note "shard set split: $half shard(s) to gateway A, $((total - half)) to gateway B"
+  note "$nominated shard(s) nominated for the live handover A -> B: ${shards[*]:half-nominated:nominated}"
 }
 split_shard_set
 
@@ -347,10 +427,12 @@ note "coordinator $COORDINATOR_NODE at $COORDINATOR_ADDR signing interest with $
 # a volatile one would make these two processes unrelated.
 note "starting gateway A over ${#shard_flags_a[@]} shard flags"
 "$PERSISTD_BIN" \
+  --node-id 1 \
   --dir "$out/data-a" \
   --bind 127.0.0.1:0 \
   --fdb-cluster-file "$ORRERY_FDB_CLUSTER_FILE" \
   "${shard_flags_a[@]}" \
+  --handover-request "$out/handover.json" \
   --issuer-key "1@$ISSUER_PUBLIC" \
   --coordinator-key "1@$COORDINATOR_PUBLIC" \
   --metrics-jsonl "$out/metrics-a.jsonl" \
@@ -365,10 +447,12 @@ note "gateway A $GATEWAY_A_NODE at $GATEWAY_A_ADDR (pid $PERSISTD_A_PID), $(wc -
 # ── Gateway B ────────────────────────────────────────────────────────────
 note "starting gateway B over ${#shard_flags_b[@]} shard flags"
 "$PERSISTD_BIN" \
+  --node-id 2 \
   --dir "$out/data-b" \
   --bind 127.0.0.1:0 \
   --fdb-cluster-file "$ORRERY_FDB_CLUSTER_FILE" \
   "${shard_flags_b[@]}" \
+  "${standby_flags_b[@]}" \
   --issuer-key "1@$ISSUER_PUBLIC" \
   --coordinator-key "1@$COORDINATOR_PUBLIC" \
   --metrics-jsonl "$out/metrics-b.jsonl" \
@@ -380,6 +464,17 @@ GATEWAY_B_ADDR=$(json_field "$out/persistd-b.json" bind_addr)
 activated_shards "$out/persistd-b.json" "$out/shards-b.txt"
 note "gateway B $GATEWAY_B_NODE at $GATEWAY_B_ADDR (pid $PERSISTD_B_PID), $(wc -l <"$out/shards-b.txt") shard(s) activated"
 [[ $GATEWAY_A_NODE != "$GATEWAY_B_NODE" ]] || die 'both gateways came up under one node identity'
+# The *cluster* node id, which is a different identity from the iroh key above
+# and is the one an `actor/{grid}/{shard}` row names. Both processes defaulted
+# it to 0 before the handover clause existed, which made the two siblings
+# indistinguishable in the durable rows that decide who owns what (D26 rule 1)
+# — harmless while their shard sets never met, and the first thing a handover
+# needs, since a shard cannot be handed to its current owner.
+GATEWAY_A_CLUSTER_NODE=$(json_field "$out/persistd-a.json" cluster_node_id)
+GATEWAY_B_CLUSTER_NODE=$(json_field "$out/persistd-b.json" cluster_node_id)
+[[ $GATEWAY_A_CLUSTER_NODE != "$GATEWAY_B_CLUSTER_NODE" ]] \
+  || die 'both gateways came up under one cluster node id; a durable row could not tell them apart'
+note "cluster node ids: A=$GATEWAY_A_CLUSTER_NODE B=$GATEWAY_B_CLUSTER_NODE"
 
 # ── The proof ────────────────────────────────────────────────────────────
 set +e
@@ -393,6 +488,10 @@ set +e
   --metrics-b "$out/metrics-b.jsonl" \
   --shards-b "$out/shards-b.txt" \
   --gateway-b-pid "$PERSISTD_B_PID" \
+  "${handover_flags[@]}" \
+  --handover-request "$out/handover.json" \
+  --handover-successor-node "$GATEWAY_B_CLUSTER_NODE" \
+  --handover-budget-ms "$HANDOVER_BUDGET_MS" \
   --coordinator-addr "$COORDINATOR_ADDR" \
   --coordinator-node "$COORDINATOR_NODE" \
   --issuer-secret "$ISSUER_SECRET" \

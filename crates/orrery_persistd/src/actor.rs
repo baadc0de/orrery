@@ -182,6 +182,16 @@ pub enum Reject {
     },
 }
 
+/// What an unconditional shard divest found (D26 rule 3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DivestOutcome {
+    /// Every held row was parked and is addressed for its holder's `Expire`.
+    Divested(Vec<ParkedLease>),
+    /// A committed rekey is mid-flight in this actor, so its registrar is not
+    /// in a state a drain may park wholesale. The caller retries.
+    RekeyInFlight,
+}
+
 /// Why a server committed-rekey record was rejected before actor transfer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RekeyError {
@@ -487,6 +497,11 @@ pub(crate) enum CellMsg {
         now_ms: u64,
         reply: oneshot::Sender<Result<Vec<ParkedLease>, Reject>>,
     },
+    /// Park **every** holder in this actor, silent or not (D26 rule 3).
+    DivestShard {
+        now_ms: u64,
+        reply: oneshot::Sender<Result<DivestOutcome, Reject>>,
+    },
     /// Read one registrar row and the entity's durable uplink cursor without
     /// mutating either.
     InspectLease {
@@ -719,6 +734,19 @@ async fn actor_loop(env: &mut ActorEnv, mut rx: mpsc::Receiver<CellMsg>) {
                     let _ = reply.send(sweep_leases(env, now_ms).await);
                 } else {
                     let _ = reply.send(Ok(Vec::new()));
+                }
+            }
+            CellMsg::DivestShard { now_ms, reply } => {
+                if env.state.pending_rekeys.is_empty() {
+                    let _ =
+                        reply.send(divest_shard(env, now_ms).await.map(DivestOutcome::Divested));
+                } else {
+                    // A sweep answers `Ok(vec![])` here, which is right for a
+                    // periodic best-effort pass and wrong for a drain: an
+                    // empty answer would read as "nothing was held" and let
+                    // the handover proceed over rows it never divested. The
+                    // caller retries within its own deadline instead.
+                    let _ = reply.send(Ok(DivestOutcome::RekeyInFlight));
                 }
             }
             CellMsg::PrepareRekey {
@@ -1138,6 +1166,58 @@ async fn sweep_leases(env: &mut ActorEnv, now_ms: u64) -> Result<Vec<ParkedLease
             previous_lease_id: row.previous_lease_id,
             lease: row.lease,
             reason: orrery_protocol::ExpireReason::Timeout,
+        });
+    }
+    env.state.leases = next;
+    Ok(parked)
+}
+
+/// Park every held row in this actor and return them addressed for an
+/// `Expire` (D26 rule 3 step 3/4, docs/08-persistence.md §3.4.1).
+///
+/// [`sweep_leases`] with the TTL predicate dropped, and structured the same
+/// way for the same reason: the registrar is copied so a durable write that
+/// fails partway leaves the hot registrar exactly as it was, and the copy is
+/// skipped entirely when there is nothing held.
+///
+/// This is the *unconditional* half of D7 §4.2's divestiture. There is no
+/// cooperative round trip and no per-row deadline, because there is no
+/// successor to hand a cursor to: a handover parks, and the peer re-claims on
+/// the new owner. That is what makes the drain bounded by one deadline for
+/// the whole shard rather than one per row.
+async fn divest_shard(env: &mut ActorEnv, now_ms: u64) -> Result<Vec<ParkedLease>, Reject> {
+    if !env.state.leases.has_holders() {
+        return Ok(Vec::new());
+    }
+    let mut next = env.state.leases.clone();
+    let divested = next.divest_all(now_ms);
+    let mut parked = Vec::with_capacity(divested.len());
+    for row in divested {
+        let cell = *env
+            .state
+            .lease_cells
+            .get(&row.lease.entity)
+            .unwrap_or(&env.state.shard);
+        if !matches!(
+            env.lease_store
+                .put(env.state.grid, cell, &row.lease)
+                .await
+                .map_err(|_| Reject::LeaseStore)?,
+            LeasePut::Stored
+        ) {
+            return Err(Reject::LeaseStore);
+        }
+        parked.push(ParkedLease {
+            grid: env.state.grid,
+            cell,
+            previous_holder: row.previous_holder,
+            previous_lease_id: row.previous_lease_id,
+            lease: row.lease,
+            // Not `Timeout` and not `Disconnect`: this holder was alive and
+            // renewing. Telling it `Timeout` would be a false statement about
+            // its own liveness, and it is also the counter an operator reads
+            // to tell a handover park from a crash park (issue #119).
+            reason: orrery_protocol::ExpireReason::Parked,
         });
     }
     env.state.leases = next;
@@ -1666,6 +1746,19 @@ impl CellActorHandle {
         let (reply, rx) = oneshot::channel();
         self.tx
             .send(CellMsg::SweepLeases { now_ms, reply })
+            .await
+            .map_err(|_| Reject::JournalClosed)?;
+        rx.await.map_err(|_| Reject::JournalClosed)?
+    }
+    /// Park every held lease in this actor, whatever its TTL says.
+    ///
+    /// The drain half of a live shard handover (D26 rule 3): the caller then
+    /// delivers each returned row's `Expire` on its holder's own session,
+    /// which is still live on this gateway, before the ownership CAS.
+    pub async fn divest_shard(&self, now_ms: u64) -> Result<DivestOutcome, Reject> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(CellMsg::DivestShard { now_ms, reply })
             .await
             .map_err(|_| Reject::JournalClosed)?;
         rx.await.map_err(|_| Reject::JournalClosed)?

@@ -281,10 +281,7 @@ async fn a_renewal_whose_entity_migrates_under_it_is_re_resolved() {
     })
     .await
     .unwrap();
-    let actor = rt
-        .actor(GridId::ROOT, source)
-        .expect("source actor")
-        .clone();
+    let actor = rt.actor(GridId::ROOT, source).expect("source actor");
     let ClaimResult::Granted(grant) = actor
         .claim_lease(entity, source, holder, ClaimKind::Strong, 20)
         .await

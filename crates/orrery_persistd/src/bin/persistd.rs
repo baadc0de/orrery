@@ -57,8 +57,8 @@ use orrery_persistd::journal::{
 };
 use orrery_persistd::{
     ActivationOutcome, AuthorityMetrics, CellRuntime, CheckpointScheduler,
-    CoordinatorHandoutAuthority, DurableChainId, FenceFreshnessConfig, FenceRow, FenceStore,
-    GatewayConfig, GatewayMetrics, GatewayServer, GatewayServerLatency,
+    CoordinatorHandoutAuthority, DurableChainId, FenceFreshnessConfig, FenceFreshnessMonitor,
+    FenceRow, FenceStore, GatewayConfig, GatewayMetrics, GatewayServer, GatewayServerLatency,
     GatewayServerLatencySnapshot, GrpcChainTransport, IntentExecutor, JournalConfig,
     MemCheckpointStore, RuntimeConfig, ShardActivation,
 };
@@ -159,6 +159,44 @@ struct Cli {
     /// decimal) or coordinate form `x,y,z@level`.
     #[arg(long, value_name = "RAW|X,Y,Z@LEVEL")]
     shard: Vec<ShardSpec>,
+
+    /// A shard this node may **adopt** from a live sibling, but does not
+    /// activate at startup (D26 rule 3 step 7).
+    ///
+    /// The successor half of a live shard handover. The outgoing owner drains
+    /// the shard and CASes `actor/{grid}/{shard}` to name this node; this node
+    /// polls the rows named here and, on seeing one that names it `Active`,
+    /// loads the `PreHandover` checkpoint and opens the actor. It never CASes
+    /// the row itself, which is what keeps a handover a single-writer
+    /// transition with no gateway-to-gateway transport in it.
+    ///
+    /// Deliberately a *separate* flag from `--shard` rather than a mode of it:
+    /// `--shard` is what this process activates and refuses to start without,
+    /// and a standby shard is neither. Standby shards are validated against
+    /// `--shard` for overlap exactly as `--shard` values are against each
+    /// other, because "`--shard` sets across siblings must not overlap" (D26)
+    /// is worth catching within one process too.
+    #[arg(long, value_name = "RAW|X,Y,Z@LEVEL")]
+    standby_shard: Vec<ShardSpec>,
+
+    /// Path to a JSON file this node watches for a shard-handover request.
+    ///
+    /// **This is the invocation surface, not a policy.** Who decides to move a
+    /// shard, and when, is placement/ops policy and explicitly outside D26 and
+    /// issue #119; what this provides is a way for an operator (or a harness)
+    /// to say "hand shard S to node N" to a running gateway that has no admin
+    /// wire surface of its own. The file is read, renamed aside, and the
+    /// outcome written to `<path>.result`:
+    ///
+    /// ```json
+    /// {"grid": 0, "shard": 4611686018427387905,
+    ///  "successor_node": 2, "successor_gateway": "<hex node id>"}
+    /// ```
+    ///
+    /// `successor_gateway` is optional and is what lets the refusals this node
+    /// then issues be *redirects* — see `DenyReason::WrongOwner`.
+    #[arg(long, value_name = "PATH")]
+    handover_request: Option<PathBuf>,
 
     /// Retain every journal segment: never release the ones the checkpoints
     /// have made redundant (D20).
@@ -338,14 +376,17 @@ fn write_journal_retention(
 
 /// Append the authority counters whenever any of them moved.
 ///
-/// All ten of them, and the count has grown twice for the same reason. First
+/// All of them, and the count has grown three times for the same reason. First
 /// `divest_requested` and `handoff_timed_out`: the second is the zombie-host
 /// symptom docs/09-services-and-ops.md §10 builds a runbook around — a holder
 /// that answers no divest request — and a runbook whose symptom has no counter
 /// is a paragraph, not a procedure. Then `misrouted_diffs`, `unindexed_diffs`
 /// and `misroute_throttled`, which docs/08-persistence.md §2.1.2 names as the
 /// alarm on the fenced route's expensive branch while they lived only in
-/// process memory — the same failure one layer out.
+/// process memory — the same failure one layer out. Then D26's handover
+/// counters, which are an *invariant* rather than an alarm: I2 is stated as a
+/// subtraction between two of them, so exporting one without the other would
+/// export half a statement.
 ///
 /// These are absolute totals, not interval deltas: `duplicate_authority` is an
 /// invariant that must read zero for the life of the process, and a gauge that
@@ -389,6 +430,26 @@ fn write_gateway_authority(
             "expire_fanout_sent": snapshot.expire_fanout_sent,
             "expire_fanout_skipped": snapshot.expire_fanout_skipped,
             "expire_fanout_dropped": snapshot.expire_fanout_dropped,
+            // D26 invariant I2, as two zero-valued counters an operator (and
+            // the sibling harness) can subtract without joining anything:
+            // `leases_live_at_drain_start - expires_delivered_before_cas == 0`
+            // and `heartbeats_rejected_wrong_owner == 0` across a handover
+            // window. The second is the one that fails on the exact defect
+            // D26's Context describes — a holder still renewing at a process
+            // that no longer hosts its shard — which is why it is exported
+            // from every node whether or not that node ever hands a shard
+            // anywhere.
+            "handover_leases_live_at_drain_start": snapshot.handover_leases_live_at_drain_start,
+            "handover_expires_delivered_before_cas": snapshot.handover_expires_delivered_before_cas,
+            "heartbeats_rejected_wrong_owner": snapshot.heartbeats_rejected_wrong_owner,
+            // A handover park is the design; a crash park with no successor is
+            // a capability loss. They are the same durable transition, so
+            // without this counter `parked_without_successor` would alarm on
+            // every planned shard move.
+            "handover_parks": snapshot.handover_parks,
+            "claims_denied_draining": snapshot.claims_denied_draining,
+            "handovers_completed": snapshot.handovers_completed,
+            "handovers_aborted": snapshot.handovers_aborted,
         }),
     )
     .map_err(std::io::Error::other)?;
@@ -703,6 +764,12 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let topology = resolve_topology(&cli)?;
+    // Standby shards are validated against the served set for overlap, which
+    // is the same property `validate_shards` holds within `--shard` and the
+    // one D26 makes an operator-checkable deployment property across
+    // siblings. A standby shard that overlapped a served one would make
+    // `adopt_shard` ambiguous at exactly the moment it mattered.
+    let standby_shards = resolve_standby_shards(&cli, &topology)?;
     let startup_started = Instant::now();
 
     if matches!(topology.role, TopologyRole::Follower { .. }) {
@@ -1006,6 +1073,10 @@ async fn main() -> anyhow::Result<()> {
     // Retained only for the dev-seed affordance below, which needs the actor
     // handles directly rather than the routing surface.
     let seed_runtime = cli.dev_seed.is_some().then(|| Arc::clone(&runtime));
+    // Retained for the handover orchestrator, which needs the runtime's fence
+    // CASes and its actor table, not the routing surface. Released before the
+    // `Arc::try_unwrap` at shutdown by stopping that task first.
+    let handover_runtime = Arc::clone(&runtime);
     drop(runtime);
 
     // ── Gateway ─────────────────────────────────────────────────────────
@@ -1028,6 +1099,15 @@ async fn main() -> anyhow::Result<()> {
     #[cfg(feature = "fdb")]
     let activation_epoch = activation.epoch;
 
+    // The intent ledger's fence names the whole activated shard set, so a
+    // handover has to restate it. Captured out of the constructor closure
+    // because `SharedExecutor` is a `dyn` handle with no way back to the
+    // concrete type.
+    #[cfg(feature = "fdb")]
+    let intent_executor: Arc<std::sync::Mutex<Option<Arc<FdbIntentExecutor>>>> =
+        Arc::new(std::sync::Mutex::new(None));
+    #[cfg(feature = "fdb")]
+    let captured_intent_executor = Arc::clone(&intent_executor);
     let mut gateway_config = gateway_config(&cli, secret_key, |cluster_file, grid| {
         #[cfg(feature = "fdb")]
         {
@@ -1050,7 +1130,11 @@ async fn main() -> anyhow::Result<()> {
                     epoch: activation_epoch,
                 },
             );
-            Ok(Some(Arc::new(exec) as SharedExecutor))
+            let exec = Arc::new(exec);
+            *captured_intent_executor
+                .lock()
+                .expect("intent executor capture lock poisoned") = Some(Arc::clone(&exec));
+            Ok(Some(exec as SharedExecutor))
         }
         #[cfg(not(feature = "fdb"))]
         {
@@ -1079,6 +1163,34 @@ async fn main() -> anyhow::Result<()> {
         "persistd startup: starting gateway"
     );
     let gateway = GatewayServer::spawn(gateway_config, router).await?;
+
+    // ── Live shard handover (D26 rule 3) ────────────────────────────────
+    // Started after the gateway, because the drain delivers each `Expire` on
+    // a holder's own session and there are no sessions before the gateway
+    // exists. A node with neither a request path nor a standby shard starts
+    // no task at all.
+    let handover_control = if cli.handover_request.is_some() || !standby_shards.is_empty() {
+        let context = HandoverContext {
+            runtime: Arc::clone(&handover_runtime),
+            checkpoints: Arc::clone(&checkpoint_store),
+            drain: gateway.drain_handle(),
+            authority_metrics: Arc::clone(&authority_metrics),
+            freshness: fence_freshness_monitor.clone(),
+            #[cfg(feature = "fdb")]
+            intents: intent_executor
+                .lock()
+                .expect("intent executor capture lock poisoned")
+                .clone(),
+            node_id: topology.node_id,
+        };
+        Some(spawn_handover_control(
+            context,
+            cli.handover_request.clone(),
+            standby_shards.clone(),
+        ))
+    } else {
+        None
+    };
 
     // Development seeding, after activation and before the readiness line, so
     // a harness that sees the line can immediately claim what it names.
@@ -1137,6 +1249,15 @@ async fn main() -> anyhow::Result<()> {
                     })
                 })
                 .collect::<Vec<_>>(),
+            // Shards this node may adopt from a live sibling but does not own
+            // (D26 rule 3 step 7). Reported for the same reason `shards` is:
+            // "which shards is this process prepared to take" is otherwise
+            // invisible from outside it, and a harness that has to drive a
+            // handover needs both halves.
+            "standby_shards": standby_shards
+                .iter()
+                .map(|shard| shard.to_bits())
+                .collect::<Vec<_>>(),
             "recovery_cutoff": recovery_cutoff,
             // The D16 `journal_open_ms` budget's measurand, reported by the
             // node that paid it: a restart's index rebuild is linear in the
@@ -1180,6 +1301,13 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // Graceful shutdown in reverse order: gateway - schedulers - cluster.
+    // The handover orchestrator goes first and is *awaited*, because it holds
+    // an `Arc<CellRuntime>` and the journal close below needs the last one.
+    if let Some((shutdown, task)) = handover_control {
+        let _ = shutdown.send(());
+        let _ = task.await;
+    }
+    drop(handover_runtime);
     tracing::info!("stopping gateway");
     gateway.shutdown().await;
 
@@ -1210,6 +1338,441 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!("persistd shutdown complete");
     Ok(())
+}
+
+// ── Live shard handover (D26 rule 3, docs/08-persistence.md §3.4.1) ───────
+
+/// One operator-invoked shard handover, as the request file spells it.
+///
+/// Deserialized rather than parsed out of flags because a handover is issued
+/// against a *running* process. It is deliberately the smallest thing that can
+/// name a move: which shard, and to whom.
+#[derive(Debug, serde::Deserialize)]
+struct HandoverRequest {
+    /// The grid the shard's `CellId` lives in (P-7: cell ids are
+    /// grid-relative). Defaults to the root grid, which is what
+    /// `--single-grid` deployments use.
+    #[serde(default)]
+    grid: u32,
+    /// The shard cell, as raw `CellId` bits — the same form `--shard` accepts.
+    shard: u64,
+    /// The cluster node id the `actor/{grid}/{shard}` row moves to.
+    successor_node: u64,
+    /// The successor's iroh gateway identity, if the caller knows it.
+    ///
+    /// Optional, and what it buys is the difference between a refusal and a
+    /// redirect: with it, every `WrongOwner` this node then issues for the
+    /// shard names where to go instead (D26 rule 3 step 8).
+    #[serde(default)]
+    successor_gateway: Option<String>,
+}
+
+/// What one handover did, written beside the request as `<path>.result`.
+#[derive(Debug, serde::Serialize)]
+struct HandoverOutcome {
+    /// Whether the ownership CAS committed.
+    handed_over: bool,
+    /// Unix milliseconds at which step 1 was attempted, and at which the last
+    /// step finished.
+    ///
+    /// Reported so a harness can measure the **player-facing** window without
+    /// charging this file-watching invocation surface's poll interval to the
+    /// protocol: the window that matters starts when admission closes, not
+    /// when an operator's request file appeared on disk.
+    started_at_unix_ms: u64,
+    finished_at_unix_ms: u64,
+    /// Why not, when it did not.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+    shard: u64,
+    grid: u32,
+    successor_node: u64,
+    /// The epoch the row carried before the handover, and after it.
+    epoch_before: u64,
+    epoch_after: u64,
+    /// D26 I2's left-hand term: rows live under the shard when the drain
+    /// began.
+    leases_live_at_drain_start: u64,
+    /// D26 I2's right-hand term: `Expire` frames their holders' own sessions
+    /// accepted, before the CAS.
+    expires_delivered_before_cas: u64,
+    /// Holders with no live session here to deliver to. Broken out so the I2
+    /// subtraction never silently absorbs them.
+    expires_undeliverable: u64,
+    /// Whether the drain finished inside `handoff_deadline_ms`.
+    drain_complete: bool,
+    /// The drain's own bound, for reading the measurement against.
+    handoff_deadline_ms: u32,
+    /// Stage timings, in milliseconds, as the process that ran them measured.
+    mark_ms: u64,
+    drain_ms: u64,
+    checkpoint_ms: u64,
+    cas_ms: u64,
+    /// Mark through CAS: the window in which this node stopped admitting
+    /// claims under the shard and the successor did not yet own it.
+    total_ms: u64,
+}
+
+/// Everything a handover needs that outlives a borrow of the gateway.
+#[derive(Clone)]
+struct HandoverContext {
+    runtime: Arc<CellRuntime>,
+    checkpoints: Arc<dyn orrery_persistd::checkpoint::CheckpointStore>,
+    drain: orrery_persistd::ShardDrainHandle,
+    authority_metrics: Arc<AuthorityMetrics>,
+    freshness: Option<Arc<FenceFreshnessMonitor>>,
+    #[cfg(feature = "fdb")]
+    intents: Option<Arc<FdbIntentExecutor>>,
+    #[cfg_attr(not(feature = "fdb"), allow(dead_code))]
+    node_id: u64,
+}
+
+impl HandoverContext {
+    /// Re-state the shard set this node's intent ledger is fenced by.
+    ///
+    /// A no-op without an intent executor. With one it is not optional: the
+    /// fence verifies *every* shard the node activated, so a shard that has
+    /// correctly moved to a sibling would fail it and refuse every subsequent
+    /// intent on this node (`IntentFence`).
+    fn refence_intents(&self) {
+        #[cfg(feature = "fdb")]
+        if let Some(intents) = &self.intents {
+            let mut shards = self.runtime.shard_cells();
+            shards.sort_unstable_by_key(|shard| shard.to_bits());
+            intents.refence(shards, self.node_id, self.runtime.epoch());
+        }
+    }
+
+    /// Run D26 rule 3's sequence for one shard, start to finish.
+    ///
+    /// The step numbering below is the ADR's own. Two orderings differ from
+    /// the letter of it, both deliberately and both stated in the PR:
+    ///
+    /// * **The quiesce precedes the `PreHandover` checkpoint.** The ADR reads
+    ///   "Checkpoint(PreHandover); stop accepting diffs", which leaves a
+    ///   window in which a diff is accepted *after* the checkpoint that is
+    ///   about to become the successor's only base — and a sibling has no copy
+    ///   of this node's journal to replay it from, so that diff is simply
+    ///   lost. Quiescing first closes it. The cost is that refusals start one
+    ///   checkpoint earlier, which is inside the same window either way.
+    /// * **No row is reassigned during the drain.** See
+    ///   `Redistributor::drain_shard`.
+    async fn run(&self, request: &HandoverRequest) -> HandoverOutcome {
+        let grid = GridId::new(request.grid);
+        let shard = match CellId::from_bits(request.shard) {
+            Some(shard) => shard,
+            None => {
+                return HandoverOutcome {
+                    handed_over: false,
+                    started_at_unix_ms: unix_now_ms(),
+                    finished_at_unix_ms: unix_now_ms(),
+                    error: Some(format!("invalid shard cell bits {}", request.shard)),
+                    shard: request.shard,
+                    grid: request.grid,
+                    successor_node: request.successor_node,
+                    epoch_before: 0,
+                    epoch_after: 0,
+                    leases_live_at_drain_start: 0,
+                    expires_delivered_before_cas: 0,
+                    expires_undeliverable: 0,
+                    drain_complete: false,
+                    handoff_deadline_ms: self.drain.handoff_deadline_ms(),
+                    mark_ms: 0,
+                    drain_ms: 0,
+                    checkpoint_ms: 0,
+                    cas_ms: 0,
+                    total_ms: 0,
+                };
+            }
+        };
+        let successor_gateway = request
+            .successor_gateway
+            .as_deref()
+            .and_then(|hex| hex.parse::<orrery_protocol::NodeId>().ok());
+        let mut outcome = HandoverOutcome {
+            handed_over: false,
+            started_at_unix_ms: unix_now_ms(),
+            finished_at_unix_ms: 0,
+            error: None,
+            shard: request.shard,
+            grid: request.grid,
+            successor_node: request.successor_node,
+            epoch_before: 0,
+            epoch_after: 0,
+            leases_live_at_drain_start: 0,
+            expires_delivered_before_cas: 0,
+            expires_undeliverable: 0,
+            drain_complete: false,
+            handoff_deadline_ms: self.drain.handoff_deadline_ms(),
+            mark_ms: 0,
+            drain_ms: 0,
+            checkpoint_ms: 0,
+            cas_ms: 0,
+            total_ms: 0,
+        };
+        if grid != self.runtime.grid() {
+            outcome.error = Some(format!(
+                "this node serves grid {}, not {}",
+                self.runtime.grid().0,
+                request.grid
+            ));
+            return outcome;
+        }
+        let started = Instant::now();
+
+        // ── Step 1: mark. Status only; still the owner, still the writer. ──
+        let marked = match self
+            .runtime
+            .begin_handover(shard, request.successor_node, successor_gateway)
+            .await
+        {
+            Ok(row) => row,
+            Err(error) => {
+                outcome.error = Some(format!("mark: {error}"));
+                return outcome;
+            }
+        };
+        outcome.epoch_before = marked.epoch.0;
+        // The mark is this node's own write to a row it is watching for
+        // bulk-ack freshness. Told about it, the monitor stays fresh; not told,
+        // it reads its own deliberate status change as a split-brain signal and
+        // makes every acknowledgement on every shard provisional for the length
+        // of the drain.
+        if let Some(freshness) = &self.freshness {
+            freshness.rewatch(shard, marked);
+        }
+        outcome.mark_ms = started.elapsed().as_millis() as u64;
+        tracing::info!(
+            shard = %shard,
+            successor = request.successor_node,
+            epoch = marked.epoch.0,
+            "handover: shard marked draining"
+        );
+
+        // ── Steps 2–4: admission closed by the mark; drain, bounded. ───────
+        let drain_started = Instant::now();
+        let drain = self.drain.drain_shard(grid, shard).await;
+        outcome.drain_ms = drain_started.elapsed().as_millis() as u64;
+        outcome.leases_live_at_drain_start = drain.live_at_start;
+        outcome.expires_delivered_before_cas = drain.expires_delivered;
+        outcome.expires_undeliverable = drain.expires_undeliverable;
+        outcome.drain_complete = drain.complete;
+        if !drain.complete {
+            // The rows this drain did not reach still have live holders here.
+            // Moving the row out from under them is the hazard D26 exists to
+            // prevent, so the handover does not happen.
+            self.authority_metrics.record_handover_aborted();
+            match self.runtime.abort_handover(shard).await {
+                Ok(restored) => {
+                    if let Some(freshness) = &self.freshness {
+                        freshness.rewatch(shard, restored);
+                    }
+                    outcome.error = Some("drain did not complete inside the deadline; handover aborted and the shard is unchanged".into());
+                }
+                Err(error) => outcome.error = Some(format!(
+                    "drain did not complete inside the deadline, and the abort CAS also failed: {error}"
+                )),
+            }
+            outcome.total_ms = started.elapsed().as_millis() as u64;
+            outcome.finished_at_unix_ms = unix_now_ms();
+            return outcome;
+        }
+
+        // ── Step 5: quiesce, then flush. See the note above on the order. ──
+        self.runtime.quiesce_handover(shard);
+        let checkpoint_started = Instant::now();
+        if let Err(error) = self
+            .runtime
+            .checkpoint_shard_because(
+                shard,
+                self.checkpoints.as_ref(),
+                orrery_persistd::CheckpointCause::PreHandover,
+            )
+            .await
+        {
+            self.authority_metrics.record_handover_aborted();
+            let abort = self.runtime.abort_handover(shard).await;
+            outcome.checkpoint_ms = checkpoint_started.elapsed().as_millis() as u64;
+            outcome.total_ms = started.elapsed().as_millis() as u64;
+            if let Ok(restored) = abort {
+                if let Some(freshness) = &self.freshness {
+                    freshness.rewatch(shard, restored);
+                }
+            }
+            outcome.error = Some(match abort {
+                Ok(_) => format!("pre-handover checkpoint failed ({error}); handover aborted"),
+                Err(abort) => format!(
+                    "pre-handover checkpoint failed ({error}), and the abort CAS also failed: {abort}"
+                ),
+            });
+            return outcome;
+        }
+        outcome.checkpoint_ms = checkpoint_started.elapsed().as_millis() as u64;
+
+        // ── Step 6: hand over. ────────────────────────────────────────────
+        let cas_started = Instant::now();
+        match self.runtime.complete_handover(shard).await {
+            Ok(row) => {
+                outcome.epoch_after = row.epoch.0;
+                outcome.handed_over = true;
+            }
+            Err(error) => {
+                self.authority_metrics.record_handover_aborted();
+                let abort = self.runtime.abort_handover(shard).await;
+                outcome.cas_ms = cas_started.elapsed().as_millis() as u64;
+                outcome.total_ms = started.elapsed().as_millis() as u64;
+                if let Ok(restored) = abort {
+                    if let Some(freshness) = &self.freshness {
+                        freshness.rewatch(shard, restored);
+                    }
+                }
+                outcome.error = Some(match abort {
+                    Ok(_) => format!("handover CAS failed ({error}); aborted"),
+                    Err(abort) => {
+                        format!("handover CAS failed ({error}), and the abort also failed: {abort}")
+                    }
+                });
+                return outcome;
+            }
+        }
+        outcome.cas_ms = cas_started.elapsed().as_millis() as u64;
+        outcome.total_ms = started.elapsed().as_millis() as u64;
+        outcome.finished_at_unix_ms = unix_now_ms();
+
+        // The row is gone from this node: stop watching it for bulk-ack
+        // freshness, and take it out of the intent ledger's fence. Both would
+        // otherwise fail closed on a shard this node handed away on purpose.
+        if let Some(freshness) = &self.freshness {
+            freshness.forget(shard);
+        }
+        self.refence_intents();
+        self.authority_metrics.record_handover_completed();
+        tracing::info!(
+            shard = %shard,
+            successor = request.successor_node,
+            epoch = outcome.epoch_after,
+            leases_divested = outcome.leases_live_at_drain_start,
+            expires_delivered = outcome.expires_delivered_before_cas,
+            total_ms = outcome.total_ms,
+            "handover: shard handed to sibling"
+        );
+        outcome
+    }
+
+    /// Adopt any standby shard whose durable row now names this node.
+    ///
+    /// The successor's whole part in a handover: poll, notice, load, open. It
+    /// performs no CAS — the outgoing owner's did — which is why two live
+    /// gateways need no transport between them for this.
+    async fn poll_standby(&self, standby: &[CellId]) {
+        for &shard in standby {
+            if self.runtime.actor(self.runtime.grid(), shard).is_some() {
+                continue;
+            }
+            match self
+                .runtime
+                .adopt_shard(shard, self.checkpoints.as_ref())
+                .await
+            {
+                Ok(row) => {
+                    if let Some(freshness) = &self.freshness {
+                        if let Err(error) = freshness.adopt(shard, row) {
+                            tracing::warn!(%shard, %error, "handover: adopted shard is not watched for fence freshness");
+                        }
+                    }
+                    self.refence_intents();
+                    tracing::info!(
+                        shard = %shard,
+                        epoch = row.epoch.0,
+                        "handover: adopted shard from sibling"
+                    );
+                }
+                // The overwhelmingly common answer: the row still names the
+                // sibling, because no handover has happened. Logged at trace
+                // so a poll loop does not become a log flood.
+                Err(error) => {
+                    tracing::trace!(%shard, %error, "handover: standby shard not adoptable yet")
+                }
+            }
+        }
+    }
+}
+
+/// Unix milliseconds, for stamping a handover's own window.
+///
+/// Wall clock deliberately, and it is the one place in this feature that uses
+/// one: every *decision* here is made against the registrar's monotonic clock
+/// or against FoundationDB's own ordering, and this is not a decision — it is
+/// a timestamp a harness on another machine subtracts from its own reading to
+/// report a window. A monotonic instant would be meaningless across processes.
+fn unix_now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_millis() as u64)
+}
+
+/// How often a standby node re-reads its standby shards' rows, and how often a
+/// node with `--handover-request` looks for a request.
+///
+/// Short relative to the < 1 s handover budget docs/08 §3.5 names, because the
+/// successor's poll is *inside* the player-facing window: a peer redirected to
+/// the successor cannot claim until the successor has opened the shard.
+const HANDOVER_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+/// Watch `path` for handover requests and run them, and adopt standby shards
+/// whose rows have moved to this node.
+///
+/// One task for both because they are one clock: a node may be the outgoing
+/// owner of one shard and the successor of another at the same time, and the
+/// two halves share nothing but the interval.
+fn spawn_handover_control(
+    context: HandoverContext,
+    request_path: Option<PathBuf>,
+    standby: Vec<CellId>,
+) -> (oneshot::Sender<()>, JoinHandle<()>) {
+    let (shutdown, mut stop) = oneshot::channel();
+    let task = tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = &mut stop => break,
+                () = tokio::time::sleep(HANDOVER_POLL_INTERVAL) => {}
+            }
+            if !standby.is_empty() {
+                context.poll_standby(&standby).await;
+            }
+            let Some(path) = request_path.as_ref() else {
+                continue;
+            };
+            let Ok(bytes) = std::fs::read(path) else {
+                continue;
+            };
+            // Renamed aside *before* the handover runs, so a request cannot be
+            // executed twice if the process is slow or restarts mid-move.
+            let taken = path.with_extension("taken");
+            if let Err(error) = std::fs::rename(path, &taken) {
+                tracing::warn!(%error, "handover: could not claim the request file");
+                continue;
+            }
+            let request: HandoverRequest = match serde_json::from_slice(&bytes) {
+                Ok(request) => request,
+                Err(error) => {
+                    tracing::warn!(%error, "handover: malformed request");
+                    continue;
+                }
+            };
+            let outcome = context.run(&request).await;
+            let result_path = path.with_extension("result");
+            match serde_json::to_vec(&outcome) {
+                Ok(json) => {
+                    if let Err(error) = std::fs::write(&result_path, json) {
+                        tracing::warn!(%error, "handover: could not write the result file");
+                    }
+                }
+                Err(error) => tracing::warn!(%error, "handover: could not encode the result"),
+            }
+        }
+    });
+    (shutdown, task)
 }
 
 /// Run the passive half of a static chain topology. It opens no actor runtime,
@@ -1809,6 +2372,36 @@ fn resolve_shards(shards: &[ShardSpec]) -> anyhow::Result<Vec<CellId>> {
     Ok(shards)
 }
 
+/// The shards this node may adopt later, validated against the ones it serves.
+///
+/// D26's "`--shard` sets across siblings must not overlap" is an operator
+/// property the CAS only enforces after the fact, at the cost of a failed
+/// activation. Within one process it is checkable up front, and a standby
+/// shard is exactly a shard this process intends to serve — so it is held to
+/// the same rule as `--shard`, against `--shard` and against itself.
+fn resolve_standby_shards(cli: &Cli, topology: &Topology) -> anyhow::Result<Vec<CellId>> {
+    if cli.standby_shard.is_empty() {
+        return Ok(Vec::new());
+    }
+    if matches!(topology.role, TopologyRole::Follower { .. }) {
+        anyhow::bail!("--standby-shard is not valid for a chain follower: a follower is never a gateway and adopts no shard");
+    }
+    if cli.fdb_cluster_file.is_none() {
+        anyhow::bail!(
+            "--standby-shard requires --fdb-cluster-file: a handover between two processes is a \
+             transition on one durable `actor/{{grid}}/{{shard}}` row, and an in-memory fence store \
+             is not shared with anything"
+        );
+    }
+    let standby = resolve_shards(&cli.standby_shard)?;
+    let mut combined = topology.shards.clone();
+    combined.extend(standby.iter().copied());
+    validate_shards(&combined).map_err(|error| {
+        anyhow::anyhow!("--standby-shard overlaps the served shard set: {error}")
+    })?;
+    Ok(standby)
+}
+
 fn validate_followers(followers: &[ChainFollower], node_id: u64) -> anyhow::Result<()> {
     let mut seen = std::collections::HashSet::new();
     for follower in followers {
@@ -1989,6 +2582,8 @@ mod tests {
             dev_seed: None,
             secret_key: None,
             shard: Vec::new(),
+            standby_shard: Vec::new(),
+            handover_request: None,
             metrics_jsonl: None,
         }
     }
@@ -2073,6 +2668,17 @@ mod tests {
             "expire_fanout_sent",
             "expire_fanout_skipped",
             "expire_fanout_dropped",
+            // D26's live-handover tier. The first two are invariant I2's two
+            // terms and are listed adjacently on purpose: I2 is their
+            // difference, so a record carrying one without the other exports
+            // half a statement.
+            "handover_leases_live_at_drain_start",
+            "handover_expires_delivered_before_cas",
+            "heartbeats_rejected_wrong_owner",
+            "handover_parks",
+            "claims_denied_draining",
+            "handovers_completed",
+            "handovers_aborted",
         ] {
             assert!(
                 record.get(field).is_some(),
@@ -2082,8 +2688,8 @@ mod tests {
         let object = record.as_object().expect("record is an object");
         assert_eq!(
             object.len(),
-            14,
-            "thirteen counters plus the type tag: {object:?}"
+            21,
+            "twenty counters plus the type tag: {object:?}"
         );
         // p3-island's reader takes `duplicate_authority` and ignores every
         // other key, so widening the record is safe for the one parser there

@@ -87,16 +87,37 @@ async fn require_active_fence(
                 format!("fence decode: {e}"),
             )))
         })?;
-    if current
-        != Some(FenceRow {
-            owner,
-            epoch,
-            status: FenceStatus::Active,
-        })
-    {
+    // D26 rule 1's ownership function, verbatim:
+    //
+    //     owner(g, s) = actor[g][s].owner  when status ∈ {Active, Draining}
+    //
+    // `Draining` is excluded from `serves` — nothing routes to a draining
+    // shard once it quiesces — but it is *not* excluded from ownership, and
+    // this fence is an ownership question, not a routing one. It asks "is this
+    // node still the single writer for this shard", and during a drain the
+    // answer is yes: the row still names it, at the same epoch, and the CAS
+    // that moves it has not happened.
+    //
+    // Getting this wrong is not a subtle degradation. The `PreHandover`
+    // checkpoint (D26 rule 3 step 5) is written *while* the row says
+    // `Draining`, and it is the only base the successor gets — a sibling holds
+    // no copy of this node's journal. An `Active`-only fence therefore refuses
+    // the one checkpoint a handover cannot proceed without, which is how this
+    // was found: `tests/shard_handover_fdb.rs` failed at step 5 against a real
+    // cluster while the in-memory suite, which has no such fence, passed.
+    let owned_here = current.is_some_and(|row| {
+        row.owner == owner
+            && row.epoch == epoch
+            && matches!(
+                row.status,
+                FenceStatus::Active | FenceStatus::Draining { .. }
+            )
+    });
+    if !owned_here {
         return Err(foundationdb::FdbBindingError::new_custom_error(Box::new(
             CheckpointError::Store(format!(
-                "fence mismatch for {grid}/{shard}: expected active owner {owner} epoch {epoch}, got {current:?}"
+                "fence mismatch for {grid}/{shard}: expected owner {owner} epoch {epoch} \
+                 with status Active or Draining, got {current:?}"
             )),
         )));
     }

@@ -131,11 +131,99 @@ impl Default for RuntimeConfig {
     }
 }
 
+/// Which stage of a live shard handover a shard is in (D26 rule 3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransferPhase {
+    /// Step 1–4: the row is `Draining{successor}`, this node is still the
+    /// owner and still serving diffs and heartbeats, and new claims under the
+    /// subtree are refused.
+    Draining,
+    /// Step 5: the `PreHandover` checkpoint is written and the shard no longer
+    /// accepts diffs. The durable row still names this node.
+    Quiesced,
+    /// Step 6 committed: the row names the successor at `e+1`, and this node
+    /// has dropped the shard's actor.
+    HandedOver,
+}
+
+impl TransferPhase {
+    /// Whether this node still routes writes for the shard.
+    #[must_use]
+    pub const fn serves(self) -> bool {
+        matches!(self, Self::Draining)
+    }
+}
+
+/// One shard's in-flight or completed handover, as the runtime that started it
+/// sees it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ShardTransfer {
+    /// How far the handover has got.
+    pub phase: TransferPhase,
+    /// The cluster node id the `actor/{grid}/{shard}` row moves to.
+    pub successor: u64,
+    /// The successor's *gateway* identity, when the caller supplied one.
+    ///
+    /// A separate fact from `successor`, and the reason both are carried: the
+    /// fence row is keyed by the cluster node id (a `u64`, D11 §6), while a
+    /// peer needs an iroh transport identity to dial. Nothing in this process
+    /// can derive one from the other — that mapping is the coordinator's
+    /// `(grid, shard) → gateway` publication, which D26 rule 2 names as later
+    /// work — so a redirect can name the successor only if whoever invoked the
+    /// handover said who it is. `None` yields a `WrongOwner` that still tells
+    /// the peer to re-resolve, exactly as this build behaved before.
+    pub successor_gateway: Option<orrery_protocol::NodeId>,
+    /// The `actor/{grid}/{shard}` row's epoch as this node last committed it:
+    /// `e` while draining or quiesced, `e+1` once the handover CAS landed.
+    ///
+    /// Carried so a redirect can state the epoch of the row it is redirecting
+    /// away from. `Router::wrong_owner_epoch` reports the *runtime's* epoch,
+    /// which is the right answer for "I host no shard over this cell" and the
+    /// wrong one for "this shard specifically moved, to here, at this epoch" —
+    /// a claimant comparing epochs to decide whose routing table is fresher
+    /// (§3.5's "reroute on epoch bump") needs the shard's, not the node's.
+    pub epoch: Epoch,
+}
+
+/// The shards this runtime is handing to a sibling, by shard cell.
+#[derive(Debug, Default)]
+struct HandoverTable {
+    transfers: HashMap<CellId, ShardTransfer>,
+}
+
 /// A running cell-actor runtime.
 pub struct CellRuntime {
     journal: Arc<Journal>,
-    actors: HashMap<CellId, CellActorHandle>,
-    epoch: Epoch,
+    /// The live actor per hosted shard.
+    ///
+    /// Behind a lock because a **live shard handover** (D26 rule 3,
+    /// docs/08-persistence.md §3.4.1) adds and removes shards on a runtime
+    /// that is already serving: the outgoing owner drops the shard's actor
+    /// after its handover CAS, and the successor spawns one after adopting
+    /// the row. Both happen while `persistd` holds the runtime as an
+    /// `Arc<dyn Router>` — the shape every write goes through — so neither
+    /// can take `&mut self`.
+    ///
+    /// A `std::sync::RwLock`, not a `tokio` one, deliberately: every critical
+    /// section here is a hash lookup or a small clone with no `.await` inside
+    /// it, and making the routing chokepoint an async acquisition would put a
+    /// scheduler hop in front of every diff.
+    actors: std::sync::RwLock<HashMap<CellId, CellActorHandle>>,
+    /// The highest shard-ownership epoch this runtime has activated under.
+    ///
+    /// Atomic for the same reason `actors` is locked: adopting a handed-over
+    /// shard raises it while the runtime is serving.
+    epoch: std::sync::atomic::AtomicU64,
+    /// Shards this runtime is draining or has handed to a sibling
+    /// ([`HandoverTable`]).
+    handover: std::sync::RwLock<HandoverTable>,
+    /// How many entries [`CellRuntime::handover`] holds.
+    ///
+    /// `owning_shard` is the routing chokepoint every diff, claim and
+    /// heartbeat passes through, and the overwhelmingly common case is a node
+    /// that has never handed a shard anywhere. This makes that case one
+    /// relaxed atomic load instead of a lock acquisition.
+    handover_entries: std::sync::atomic::AtomicUsize,
     grid: GridId,
     fence: std::sync::Arc<dyn FenceStore>,
     node_id: u64,
@@ -572,8 +660,10 @@ impl CellRuntime {
 
         Ok(Self {
             journal,
-            actors,
-            epoch: config.epoch,
+            actors: std::sync::RwLock::new(actors),
+            epoch: std::sync::atomic::AtomicU64::new(config.epoch.0),
+            handover: std::sync::RwLock::new(HandoverTable::default()),
+            handover_entries: std::sync::atomic::AtomicUsize::new(0),
             grid: config.grid,
             fence: Arc::clone(&config.fence),
             node_id: config.node_id,
@@ -596,12 +686,12 @@ impl CellRuntime {
 
     /// The epoch this runtime owns its shards under.
     pub fn epoch(&self) -> Epoch {
-        self.epoch
+        Epoch::new(self.epoch.load(std::sync::atomic::Ordering::Relaxed))
     }
 
     /// The shard cells this runtime hosts.
-    pub fn shards(&self) -> impl Iterator<Item = &CellId> {
-        self.actors.keys()
+    pub fn shards(&self) -> impl Iterator<Item = CellId> {
+        self.shard_cells().into_iter()
     }
 
     /// The fence store backing `actor/{shard}` rows.
@@ -631,8 +721,8 @@ impl CellRuntime {
     /// rows are recovered by the next owner's startup, not here.
     pub async fn sweep_expired_leases(&self, now_ms: u64) -> Vec<crate::lease::ParkedLease> {
         futures::future::join_all(
-            self.actors
-                .values()
+            self.actor_handles()
+                .into_iter()
                 .map(|actor| async move { actor.sweep_leases(now_ms).await.ok() }),
         )
         .await
@@ -704,8 +794,9 @@ impl CellRuntime {
         &self,
         config: FenceFreshnessConfig,
     ) -> Result<Arc<FenceFreshnessMonitor>, FenceFreshnessError> {
-        let mut rows = Vec::with_capacity(self.actors.len());
-        for &shard in self.actors.keys() {
+        let shards = self.shard_cells();
+        let mut rows = Vec::with_capacity(shards.len());
+        for shard in shards {
             let Some(row) = self
                 .fence
                 .read(self.grid, shard)
@@ -731,9 +822,13 @@ impl CellRuntime {
     /// The `grid` guard is the P-7 corollary: storage cell ids are
     /// grid-relative, so the same raw cell under a different grid is a
     /// different entity universe — this runtime must never serve it.
-    pub fn actor(&self, grid: GridId, cell: CellId) -> Option<&CellActorHandle> {
+    pub fn actor(&self, grid: GridId, cell: CellId) -> Option<CellActorHandle> {
         let shard = self.owning_shard(grid, cell)?;
-        self.actors.get(&shard)
+        self.actors
+            .read()
+            .expect("actor table lock poisoned")
+            .get(&shard)
+            .cloned()
     }
 
     /// The **shard** whose actor owns `cell` — the same deepest-prefix rule
@@ -751,7 +846,24 @@ impl CellRuntime {
         if grid != self.grid {
             return None;
         }
+        // D26 rule 1: `serves(n, g, s)` requires the durable row to be
+        // `Active` *and* name this node. A shard past the quiesce-flush is
+        // neither — its diffs are NACKed and its next writer is the successor
+        // — so routing must refuse it here, at the one point every request
+        // resolves an owner, rather than at each of the call sites.
+        if self
+            .handover_entries
+            .load(std::sync::atomic::Ordering::Relaxed)
+            != 0
+            && self
+                .shard_transfer(grid, cell)
+                .is_some_and(|transfer| !transfer.phase.serves())
+        {
+            return None;
+        }
         self.actors
+            .read()
+            .expect("actor table lock poisoned")
             .keys()
             .filter(|shard| shard.is_prefix_of(cell))
             .max_by_key(|shard| shard.level())
@@ -761,14 +873,380 @@ impl CellRuntime {
     /// The shard cells this runtime hosts an actor for.
     #[must_use]
     pub fn shard_cells(&self) -> Vec<CellId> {
-        self.actors.keys().copied().collect()
+        self.actors
+            .read()
+            .expect("actor table lock poisoned")
+            .keys()
+            .copied()
+            .collect()
     }
 
     /// Clone every live actor handle, so a caller can await their mailboxes
     /// without holding a lock on the runtime itself.
     #[must_use]
     pub fn actor_handles(&self) -> Vec<CellActorHandle> {
-        self.actors.values().cloned().collect()
+        self.actors
+            .read()
+            .expect("actor table lock poisoned")
+            .values()
+            .cloned()
+            .collect()
+    }
+
+    /// This runtime's actor for exactly `shard`, **bypassing the handover
+    /// filter** `owning_shard` applies.
+    ///
+    /// The distinction matters at exactly one point and it is load-bearing: a
+    /// quiesced shard (D26 rule 3 step 5) must refuse *client* routing while
+    /// still being checkpointable by its own node, because the checkpoint the
+    /// quiesce exists to make consistent is written after it. Everything that
+    /// serves a request goes through `owning_shard`; this does not.
+    fn hosted_actor(&self, shard: CellId) -> Option<CellActorHandle> {
+        self.actors
+            .read()
+            .expect("actor table lock poisoned")
+            .get(&shard)
+            .cloned()
+    }
+
+    /// Take a shard's actor out of the routing table, if it has one.
+    fn take_actor(&self, shard: CellId) -> Option<CellActorHandle> {
+        self.actors
+            .write()
+            .expect("actor table lock poisoned")
+            .remove(&shard)
+    }
+
+    /// Put a shard's actor into the routing table.
+    fn install_actor(&self, shard: CellId, handle: CellActorHandle) {
+        self.actors
+            .write()
+            .expect("actor table lock poisoned")
+            .insert(shard, handle);
+    }
+
+    /// Advance the runtime's reported ownership epoch, never lowering it.
+    fn raise_epoch(&self, epoch: Epoch) {
+        self.epoch
+            .fetch_max(epoch.0, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The handover this runtime is running over `cell`, if any — the same
+    /// deepest-prefix rule [`CellRuntime::owning_shard`] applies.
+    #[must_use]
+    pub fn shard_transfer(&self, grid: GridId, cell: CellId) -> Option<ShardTransfer> {
+        if grid != self.grid {
+            return None;
+        }
+        self.handover
+            .read()
+            .expect("handover table lock poisoned")
+            .transfers
+            .iter()
+            .filter(|(shard, _)| shard.is_prefix_of(cell))
+            .max_by_key(|(shard, _)| shard.level())
+            .map(|(_, transfer)| *transfer)
+    }
+
+    /// Every shard this runtime is draining or has handed away, for telemetry
+    /// and for a readiness line.
+    #[must_use]
+    pub fn shard_transfers(&self) -> Vec<(CellId, ShardTransfer)> {
+        self.handover
+            .read()
+            .expect("handover table lock poisoned")
+            .transfers
+            .iter()
+            .map(|(shard, transfer)| (*shard, *transfer))
+            .collect()
+    }
+
+    fn record_transfer(&self, shard: CellId, transfer: ShardTransfer) {
+        let mut table = self.handover.write().expect("handover table lock poisoned");
+        table.transfers.insert(shard, transfer);
+        self.handover_entries
+            .store(table.transfers.len(), std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn forget_transfer(&self, shard: CellId) {
+        let mut table = self.handover.write().expect("handover table lock poisoned");
+        table.transfers.remove(&shard);
+        self.handover_entries
+            .store(table.transfers.len(), std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// **Step 1 of a live handover (D26 rule 3):** CAS `actor/{g}/{S}` from
+    /// `(self, e, Active)` to `(self, e, Draining{successor})`.
+    ///
+    /// Status only. This runtime stays the owner, keeps its epoch, and stays
+    /// the single writer — the write path is untouched for the whole drain,
+    /// which is what makes the drain invisible to gameplay. What changes is
+    /// that new `Claim`s under `S` are refused (step 2) and that the shard is
+    /// now on a path with exactly two exits: [`Self::complete_handover`] or
+    /// [`Self::abort_handover`].
+    ///
+    /// A losing CAS returns [`FenceError::Conflict`] and changes nothing,
+    /// locally or durably: a handover that cannot even mark the row must not
+    /// begin, because every later step's precondition is this row.
+    pub async fn begin_handover(
+        &self,
+        shard: CellId,
+        successor: u64,
+        successor_gateway: Option<orrery_protocol::NodeId>,
+    ) -> Result<FenceRow, crate::fence::FenceError> {
+        if successor == self.node_id {
+            return Err(crate::fence::FenceError::InvalidActivation(
+                "a shard cannot be handed to its current owner".into(),
+            ));
+        }
+        if self.actor(self.grid, shard).is_none() {
+            return Err(crate::fence::FenceError::InvalidActivation(format!(
+                "no actor for shard {shard}"
+            )));
+        }
+        let current = self.fence.read(self.grid, shard).await?;
+        let Some(expected) = current.filter(|row| {
+            row.owner == self.node_id
+                && row.status == FenceStatus::Active
+                && row.epoch == self.epoch()
+        }) else {
+            return Err(crate::fence::FenceError::Conflict { current });
+        };
+        let draining = FenceRow {
+            status: FenceStatus::Draining { successor },
+            ..expected
+        };
+        match self
+            .fence
+            .fence(self.grid, shard, Some(&expected), &draining)
+            .await?
+        {
+            FenceOutcome::Fenced => {}
+            FenceOutcome::Conflict { current } => {
+                return Err(crate::fence::FenceError::Conflict { current })
+            }
+        }
+        self.record_transfer(
+            shard,
+            ShardTransfer {
+                phase: TransferPhase::Draining,
+                successor,
+                successor_gateway,
+                epoch: draining.epoch,
+            },
+        );
+        Ok(draining)
+    }
+
+    /// **Step 5's second half:** stop accepting diffs for `S`.
+    ///
+    /// Routing refuses the shard from here on — `owning_shard` returns `None`
+    /// and the gateway answers `WrongOwner`, naming the successor — while the
+    /// durable row still names this node. That ordering is deliberate: the
+    /// quiesce has to be observable *before* the CAS, so no diff is accepted
+    /// after the checkpoint that is about to become the successor's base.
+    ///
+    /// Idempotent, and a no-op on a shard that is not draining.
+    pub fn quiesce_handover(&self, shard: CellId) {
+        let mut table = self.handover.write().expect("handover table lock poisoned");
+        if let Some(transfer) = table.transfers.get_mut(&shard) {
+            if transfer.phase == TransferPhase::Draining {
+                transfer.phase = TransferPhase::Quiesced;
+            }
+        }
+    }
+
+    /// **Step 6:** CAS `(self, e, Draining{B})` → `(B, e+1, Active)`, then
+    /// drop this node's actor for the shard.
+    ///
+    /// From the instant this returns, `owning_shard` answering `None` for
+    /// cells under `S` is *correct* rather than the trap D26's Context
+    /// describes, because the drain left nobody heartbeating here for `S`.
+    /// The row is never retired — only its owner and epoch move.
+    pub async fn complete_handover(
+        &self,
+        shard: CellId,
+    ) -> Result<FenceRow, crate::fence::FenceError> {
+        let Some(transfer) = self.shard_transfer(self.grid, shard) else {
+            return Err(crate::fence::FenceError::InvalidActivation(format!(
+                "shard {shard} is not being handed over"
+            )));
+        };
+        let current = self.fence.read(self.grid, shard).await?;
+        let Some(expected) = current.filter(|row| {
+            row.owner == self.node_id
+                && row.status
+                    == FenceStatus::Draining {
+                        successor: transfer.successor,
+                    }
+        }) else {
+            return Err(crate::fence::FenceError::Conflict { current });
+        };
+        let handed = FenceRow {
+            owner: transfer.successor,
+            epoch: Epoch::new(expected.epoch.0 + 1),
+            status: FenceStatus::Active,
+        };
+        match self
+            .fence
+            .fence(self.grid, shard, Some(&expected), &handed)
+            .await?
+        {
+            FenceOutcome::Fenced => {}
+            FenceOutcome::Conflict { current } => {
+                return Err(crate::fence::FenceError::Conflict { current })
+            }
+        }
+        self.record_transfer(
+            shard,
+            ShardTransfer {
+                phase: TransferPhase::HandedOver,
+                epoch: handed.epoch,
+                ..transfer
+            },
+        );
+        if let Some(actor) = self.take_actor(shard) {
+            actor.shutdown().await;
+        }
+        Ok(handed)
+    }
+
+    /// Undo a drain that cannot complete: CAS `Draining{B}` back to `Active`
+    /// and reopen admission.
+    ///
+    /// The rows already divested stay parked. That is not a half-measure: a
+    /// parked row's holder *received its `Expire`*, so I2 holds either way,
+    /// and the peer re-claims through the ordinary unpark path against the
+    /// owner that never stopped being the owner. What an abort buys is that
+    /// the rows the drain did not reach are not stranded behind a node that
+    /// no longer serves them.
+    pub async fn abort_handover(
+        &self,
+        shard: CellId,
+    ) -> Result<FenceRow, crate::fence::FenceError> {
+        let Some(transfer) = self.shard_transfer(self.grid, shard) else {
+            return Err(crate::fence::FenceError::InvalidActivation(format!(
+                "shard {shard} is not being handed over"
+            )));
+        };
+        if transfer.phase == TransferPhase::HandedOver {
+            return Err(crate::fence::FenceError::InvalidActivation(
+                "a committed handover cannot be aborted".into(),
+            ));
+        }
+        let current = self.fence.read(self.grid, shard).await?;
+        let Some(expected) = current.filter(|row| {
+            row.owner == self.node_id
+                && row.status
+                    == FenceStatus::Draining {
+                        successor: transfer.successor,
+                    }
+        }) else {
+            return Err(crate::fence::FenceError::Conflict { current });
+        };
+        let restored = FenceRow {
+            status: FenceStatus::Active,
+            ..expected
+        };
+        match self
+            .fence
+            .fence(self.grid, shard, Some(&expected), &restored)
+            .await?
+        {
+            FenceOutcome::Fenced => {}
+            FenceOutcome::Conflict { current } => {
+                return Err(crate::fence::FenceError::Conflict { current })
+            }
+        }
+        self.forget_transfer(shard);
+        Ok(restored)
+    }
+
+    /// **Step 7:** adopt a shard whose durable row already names this node
+    /// `Active`, seeding its actor from the durable checkpoint.
+    ///
+    /// The successor side of a live handover, and it takes no CAS of its own:
+    /// the outgoing owner's step-6 CAS is what transferred ownership, and this
+    /// runtime's job is to notice, load, and open. That asymmetry is the
+    /// reason a sibling gateway needs no gateway-to-gateway transport for a
+    /// handover — the durable row is the whole channel.
+    ///
+    /// The checkpoint is the *only* base: a sibling holds no copy of the
+    /// outgoing owner's journal, so there is no tail to replay and the
+    /// `PreHandover` checkpoint of step 5 is what makes this lossless. A shard
+    /// adopted without one comes up at whatever the last scheduled checkpoint
+    /// held.
+    ///
+    /// Every restored lease row is parked, because the drain parked it — which
+    /// is exactly the precondition `with_fresh_recovery_ttl` needs, and the
+    /// reason this path may reuse the ordinary recovery one.
+    pub async fn adopt_shard(
+        &self,
+        shard: CellId,
+        checkpoints: &dyn CheckpointStore,
+    ) -> Result<FenceRow, crate::fence::FenceError> {
+        if self.actor(self.grid, shard).is_some() {
+            return Err(crate::fence::FenceError::InvalidActivation(format!(
+                "shard {shard} already has an actor here"
+            )));
+        }
+        let existing = self.shard_cells();
+        if let Some(overlap) = existing
+            .iter()
+            .find(|hosted| hosted.is_prefix_of(shard) || shard.is_prefix_of(**hosted))
+        {
+            return Err(crate::fence::FenceError::InvalidActivation(format!(
+                "shard {shard} overlaps hosted shard {overlap}"
+            )));
+        }
+        let current = self.fence.read(self.grid, shard).await?;
+        let Some(row) =
+            current.filter(|row| row.owner == self.node_id && row.status == FenceStatus::Active)
+        else {
+            return Err(crate::fence::FenceError::Conflict { current });
+        };
+        let ckpt = checkpoints
+            .load(shard, self.grid)
+            .await
+            .map_err(|e| crate::fence::FenceError::Store(e.to_string()))?;
+        let (state, by_cell, tombstones, superseded, watermark) = ckpt.map_or_else(
+            || {
+                (
+                    HashMap::new(),
+                    HashMap::new(),
+                    HashMap::new(),
+                    HashSet::new(),
+                    Lsn::new(0, 0),
+                )
+            },
+            |c| {
+                (
+                    c.entities,
+                    c.by_cell,
+                    c.tombstones,
+                    c.superseded,
+                    c.watermark,
+                )
+            },
+        );
+        self.install_actor(
+            shard,
+            actor::spawn_preloaded(
+                shard,
+                self.grid,
+                row.epoch,
+                Arc::clone(&self.journal),
+                Arc::clone(&self.lease_store),
+                state,
+                by_cell,
+                tombstones,
+                superseded,
+                watermark,
+                &self.joins,
+            ),
+        );
+        self.raise_epoch(row.epoch);
+        Ok(row)
     }
 
     /// Fence shard `S` for this node: CAS `actor/{S}` from `expected` to
@@ -832,7 +1310,7 @@ impl CellRuntime {
                             )
                         },
                     );
-                if let Some(old) = self.actors.remove(&shard) {
+                if let Some(old) = self.take_actor(shard) {
                     if let Ok(snap) = old.checkpoint_snapshot().await {
                         if snap.ckpt_watermark >= watermark {
                             state = snap.entities;
@@ -844,7 +1322,7 @@ impl CellRuntime {
                     }
                     old.shutdown().await;
                 }
-                self.actors.insert(
+                self.install_actor(
                     shard,
                     actor::spawn_preloaded(
                         shard,
@@ -919,7 +1397,7 @@ impl CellRuntime {
                         )
                     },
                 );
-            if let Some(old) = self.actors.remove(shard) {
+            if let Some(old) = self.take_actor(*shard) {
                 if let Ok(snapshot) = old.checkpoint_snapshot().await {
                     if snapshot.ckpt_watermark >= watermark {
                         state = snapshot.entities;
@@ -931,7 +1409,7 @@ impl CellRuntime {
                 }
                 old.shutdown().await;
             }
-            self.actors.insert(
+            self.install_actor(
                 *shard,
                 actor::spawn_preloaded(
                     *shard,
@@ -948,11 +1426,12 @@ impl CellRuntime {
                 ),
             );
         }
-        self.epoch = rows
-            .iter()
-            .map(|(_, row)| row.epoch)
-            .max()
-            .unwrap_or(self.epoch);
+        self.raise_epoch(
+            rows.iter()
+                .map(|(_, row)| row.epoch)
+                .max()
+                .unwrap_or_else(|| self.epoch()),
+        );
         Ok(outcome)
     }
 
@@ -972,8 +1451,7 @@ impl CellRuntime {
         parent_row: &FenceRow,
     ) -> Result<Vec<(CellId, FenceRow)>, crate::fence::FenceError> {
         let handle = self
-            .actors
-            .get(&parent)
+            .actor(self.grid, parent)
             .ok_or_else(|| crate::fence::FenceError::Store("no actor for shard".into()))?;
         let snap = handle
             .split_snapshot()
@@ -1018,7 +1496,7 @@ impl CellRuntime {
             // left behind here would become a ghost no later checkpoint can
             // reach (§3.5, P-9).
             let child_superseded = snap.superseded.get(child).cloned().unwrap_or_default();
-            self.actors.insert(
+            self.install_actor(
                 *child,
                 actor::spawn_preloaded(
                     *child,
@@ -1038,7 +1516,7 @@ impl CellRuntime {
 
         // Retire the parent row and drop the parent actor.
         let _ = self.fence.retire(self.grid, parent).await;
-        if let Some(old) = self.actors.remove(&parent) {
+        if let Some(old) = self.take_actor(parent) {
             old.shutdown().await;
         }
 
@@ -1052,7 +1530,7 @@ impl CellRuntime {
             .ok_or(actor::Reject::WrongOwner {
                 grid: record.grid,
                 shard: record.cell,
-                epoch: self.epoch,
+                epoch: self.epoch(),
             })?;
         handle.apply_diff(record).await
     }
@@ -1067,11 +1545,9 @@ impl CellRuntime {
         }
         let source = self
             .actor(rekey.source_grid, rekey.source_cell)
-            .cloned()
             .ok_or(actor::RekeyError::ActorUnavailable)?;
         let destination = self
             .actor(rekey.destination_grid, rekey.destination_cell)
-            .cloned()
             .ok_or(actor::RekeyError::ActorUnavailable)?;
         Ok(CommittedRekeyPlan {
             local: source.same_actor(&destination),
@@ -1098,7 +1574,7 @@ impl CellRuntime {
         let handle = self.actor(grid, cell).ok_or(actor::Reject::WrongOwner {
             grid,
             shard: cell,
-            epoch: self.epoch,
+            epoch: self.epoch(),
         })?;
         handle.read_snapshot(vec![cell]).await
     }
@@ -1114,7 +1590,7 @@ impl CellRuntime {
             .ok_or(actor::Reject::WrongOwner {
                 grid: self.grid,
                 shard: cell,
-                epoch: self.epoch,
+                epoch: self.epoch(),
             })?;
         handle.checkpoint_snapshot().await
     }
@@ -1129,7 +1605,7 @@ impl CellRuntime {
         &self,
         store: &dyn CheckpointStore,
     ) -> Result<(), crate::checkpoint::CheckpointError> {
-        for shard in self.actors.keys().copied().collect::<Vec<_>>() {
+        for shard in self.shard_cells() {
             self.checkpoint_shard(shard, store).await?;
         }
         Ok(())
@@ -1147,7 +1623,35 @@ impl CellRuntime {
         shard: CellId,
         store: &dyn CheckpointStore,
     ) -> Result<Lsn, crate::checkpoint::CheckpointError> {
-        self.checkpoint_target(shard)?.checkpoint(store).await
+        self.checkpoint_shard_because(shard, store, crate::checkpoint::CheckpointCause::Scheduled)
+            .await
+    }
+
+    /// [`CellRuntime::checkpoint_shard`], saying why.
+    ///
+    /// The bytes written are identical — see [`crate::checkpoint::CheckpointCause`]
+    /// for why the cause is not a field of the durable row — but a
+    /// quiesce-flush and a cadence checkpoint are different events and an
+    /// operator reading a log has to be able to tell them apart. In
+    /// particular, `PreHandover` is the checkpoint a *sibling gateway* is
+    /// about to load as its only base (D26 rule 3 step 5), so "did it
+    /// happen, and did it happen before the CAS" is a question the log must
+    /// be able to answer.
+    pub async fn checkpoint_shard_because(
+        &self,
+        shard: CellId,
+        store: &dyn CheckpointStore,
+        cause: crate::checkpoint::CheckpointCause,
+    ) -> Result<Lsn, crate::checkpoint::CheckpointError> {
+        let watermark = self.checkpoint_target(shard)?.checkpoint(store).await?;
+        tracing::debug!(
+            shard = %shard,
+            grid = self.grid.0,
+            cause = cause.name(),
+            watermark = %watermark,
+            "runtime: checkpoint written"
+        );
+        Ok(watermark)
     }
 
     /// Resolve a shard checkpoint to a cloneable actor target.
@@ -1159,7 +1663,7 @@ impl CellRuntime {
         &self,
         shard: CellId,
     ) -> Result<CheckpointTarget, crate::checkpoint::CheckpointError> {
-        let handle = self.actor(self.grid, shard).cloned().ok_or_else(|| {
+        let handle = self.hosted_actor(shard).ok_or_else(|| {
             crate::checkpoint::CheckpointError::Store(format!("no actor for shard {shard}"))
         })?;
         Ok(CheckpointTarget {
@@ -1204,7 +1708,7 @@ impl CellRuntime {
         // into the actor. Its coverage bounds the replay below; a shard with
         // no checkpoint — or one whose watermark covers nothing — has the
         // whole journal as its tail.
-        let mut gate = ReplayGate::new(self.actors.keys().copied().collect());
+        let mut gate = ReplayGate::new(self.shard_cells());
         let mut covered = CheckpointCoverage::NONE;
         if let Some(ckpt) = store.load(shard, self.grid).await? {
             covered = CheckpointCoverage::from_watermark(ckpt.watermark);
@@ -1318,7 +1822,12 @@ impl CellRuntime {
     /// awaited and dropped, releasing the journal file lock before returning —
     /// required before reopening the same journal dir.
     pub async fn close(self) -> Result<(), crate::journal::JournalError> {
-        for (_, handle) in self.actors.into_iter() {
+        for (_, handle) in self
+            .actors
+            .into_inner()
+            .expect("actor table lock poisoned")
+            .into_iter()
+        {
             handle.shutdown().await;
         }
         self.joins.join_all().await;

@@ -197,6 +197,51 @@ struct Cli {
     #[arg(long, default_value_t = 8)]
     peers: u8,
 
+    /// The shard gateway A hands to gateway B mid-run, as raw `CellId` bits
+    /// (issue #119, D26 rule 3).
+    ///
+    /// Chosen by the gate script rather than here, and that is the scope line
+    /// D26 draws: *who* decides to move a shard and *when* is placement/ops
+    /// policy and explicitly not this slice. What the harness does is perform
+    /// the move it is told to and measure it.
+    ///
+    /// Accepts the same two spellings `--shards-a`/`--shards-b` do — `0x…` or
+    /// decimal — because it comes from the same seeder-derived list, and a
+    /// flag that took only one of them fails at the far end of a two-minute
+    /// gate run rather than at the parse.
+    ///
+    /// **Repeatable, and the repetition is what gives the clause teeth.** The
+    /// P2 demo world this gate seeds is hash-placed one row per level-18
+    /// shard, so a single shard carries a single entity held by a single peer
+    /// — and "every holder on the moving shard received an `Expire`" over one
+    /// holder is very nearly a vacuous statement. Each named shard is handed
+    /// over in its own full sequence, one after another, and the clause is the
+    /// conjunction over all of them.
+    #[arg(long, value_name = "RAW")]
+    handover_shard: Vec<String>,
+    /// The file gateway A watches for a handover request
+    /// (`persistd --handover-request`).
+    #[arg(long, value_name = "PATH")]
+    handover_request: Option<PathBuf>,
+    /// Gateway B's *cluster* node id (`cluster_node_id` on its readiness
+    /// line), which is what an `actor/{grid}/{shard}` row names.
+    ///
+    /// A different identity from `--gateway-b-node`, which is the iroh
+    /// transport key a peer dials. Both are needed and neither is derivable
+    /// from the other: the fence row is keyed by the `u64`, and the redirect a
+    /// peer receives has to name the `NodeId`.
+    #[arg(long, value_name = "NODE_ID")]
+    handover_successor_node: Option<u64>,
+    /// The player-facing window a handover must fit in, in milliseconds.
+    ///
+    /// Default 1300: docs/08-persistence.md §3.5 names "< 1 s" for the split
+    /// handover window, and D26 rule 3 step 4 adds a drain bounded by
+    /// `handoff_deadline_ms` (300 ms) in front of it. Both halves are reported
+    /// separately so the comparison against the 1 s figure is legible on its
+    /// own.
+    #[arg(long, default_value_t = 1300)]
+    handover_budget_ms: u64,
+
     /// The tier the victim claims its rows at.
     #[arg(long, value_enum, default_value_t = ClaimTier::Weak)]
     victim_claim_kind: ClaimTier,
@@ -350,6 +395,17 @@ fn read_manifest(path: &Path) -> Result<Vec<(u64, u64)>> {
     Ok(rows)
 }
 
+/// One shard cell's raw `CellId` bits, in either spelling the seeder emits.
+fn parse_shard_bits(text: &str) -> Result<u64> {
+    let text = text.trim();
+    if let Some(hex) = text.strip_prefix("0x").or_else(|| text.strip_prefix("0X")) {
+        u64::from_str_radix(hex, 16).with_context(|| format!("shard hex `{text}`"))
+    } else {
+        text.parse::<u64>()
+            .with_context(|| format!("shard `{text}`"))
+    }
+}
+
 /// The shard cells one gateway reported activating.
 ///
 /// Read rather than re-derived, and that is load-bearing twice over. A harness
@@ -368,13 +424,7 @@ fn read_shards(path: &Path) -> Result<BTreeSet<u64>> {
         if line.is_empty() {
             continue;
         }
-        let bits = if let Some(hex) = line.strip_prefix("0x").or_else(|| line.strip_prefix("0X")) {
-            u64::from_str_radix(hex, 16).with_context(|| format!("shard hex `{line}`"))?
-        } else {
-            line.parse::<u64>()
-                .with_context(|| format!("shard `{line}`"))?
-        };
-        shards.insert(bits);
+        shards.insert(parse_shard_bits(line)?);
     }
     anyhow::ensure!(!shards.is_empty(), "{} listed no shards", path.display());
     Ok(shards)
@@ -420,11 +470,17 @@ async fn orchestrate(cli: Cli) -> Result<Outcome> {
     // Two settle windows, an attestation wait, and the claim storm all have to
     // fit inside the peers' lifetime: a peer that exits mid-window stops
     // writing the log the accounting reads, and its own leases park.
-    let needed = settle_budget * 2 + ATTESTATION_WAIT + Duration::from_secs(15);
+    // Each handover waits for both registrars' 1 Hz exports to account for it,
+    // then probes the successor; four export intervals plus a couple of
+    // seconds of probing is the worst case per move.
+    let handover_leg = (METRICS_EXPORT_INTERVAL * 4 + Duration::from_secs(2))
+        * u32::try_from(cli.handover_shard.len()).unwrap_or(u32::MAX);
+    let needed = settle_budget * 2 + ATTESTATION_WAIT + Duration::from_secs(15) + handover_leg;
     anyhow::ensure!(
         Duration::from_secs(cli.duration_secs) > needed,
-        "--duration-secs must exceed {}s: two settle budgets, the attestation wait and the claim storm",
-        needed.as_secs()
+        "--duration-secs must exceed {}s: two settle budgets, the attestation wait, the claim storm and {} handover(s)",
+        needed.as_secs(),
+        cli.handover_shard.len()
     );
 
     // ── Routing ─────────────────────────────────────────────────────────
@@ -654,6 +710,90 @@ async fn orchestrate(cli: Cli) -> Result<Outcome> {
         "misroute probe: a B-side row addressed to gateway A"
     );
 
+    // ── The live shard handover ─────────────────────────────────────────
+    // Before either kill, and deliberately so: the two kills are about
+    // processes ending, and this is the case D26 says nothing in the accepted
+    // set covered — an owner that is still alive. Running it first also keeps
+    // its dispositions out of the kill clauses' baselines, which are taken
+    // immediately before each kill.
+    let mut moves: Vec<HandoverClause> = Vec::new();
+    for (index, spelling) in cli.handover_shard.iter().enumerate() {
+        let shard_bits = parse_shard_bits(spelling)?;
+        let probe_seed = 0xF0u8
+            .checked_add(u8::try_from(index).unwrap_or(u8::MAX))
+            .filter(|seed| *seed < 0xFA)
+            .context(
+                "at most ten shards can be handed over in one run: the probe identities \
+                      0xF0..=0xF9 are reserved for them, and 0xFB..=0xFE for the other probes",
+            )?;
+        moves.push(
+            run_handover(
+                &cli,
+                &issuer,
+                probe_seed,
+                shard_bits,
+                &rows,
+                &logs,
+                metrics_a,
+                metrics_b,
+                &mut claim_id,
+            )
+            .await
+            .with_context(|| format!("live shard handover of {spelling}"))?,
+        );
+    }
+    let moved_entities: BTreeSet<u64> = moves
+        .iter()
+        .flat_map(|clause| clause.moved_entities.iter().copied())
+        .collect();
+    let handover = (!moves.is_empty()).then(|| {
+        let passed = moves.iter().all(|clause| clause.passed);
+        let field = |name: &str| -> u64 {
+            moves
+                .iter()
+                .filter_map(|clause| clause.report.get(name).and_then(serde_json::Value::as_u64))
+                .sum()
+        };
+        let worst_window_ms = moves
+            .iter()
+            .map(|clause| {
+                clause
+                    .report
+                    .get("window_ms")
+                    .and_then(serde_json::Value::as_u64)
+            })
+            .max()
+            .flatten();
+        serde_json::json!({
+            "shards_moved": moves.len(),
+            // The conjunction, and the three sums it is made of. A clause over
+            // one holder is very nearly vacuous, so how many holders were
+            // actually divested is part of the verdict's meaning, not colour.
+            "entities_moved": moved_entities.len(),
+            "holders_divested": field("holders_before"),
+            "leases_live_at_drain_start": field("leases_live_at_drain_start"),
+            "expires_delivered_before_cas": field("expires_delivered_before_cas"),
+            "expires_undelivered": field("expires_undelivered"),
+            "heartbeats_rejected_wrong_owner": moves
+                .iter()
+                .filter_map(|clause| clause
+                    .report
+                    .get("heartbeats_rejected_wrong_owner")
+                    .and_then(serde_json::Value::as_u64))
+                .max()
+                .unwrap_or(0),
+            "duplicate_authority_in_window": field("duplicate_authority_in_window"),
+            "worst_window_ms": worst_window_ms,
+            "budget_ms": cli.handover_budget_ms,
+            "split_handover_target_ms": 1_000,
+            "within_budget": worst_window_ms.is_some_and(|ms| ms <= cli.handover_budget_ms),
+            "within_split_handover_target": worst_window_ms.is_some_and(|ms| ms <= 1_000),
+            "moves": moves.iter().map(|clause| clause.report.clone()).collect::<Vec<_>>(),
+            "passed": passed,
+        })
+    });
+    let handover_all_passed = moves.iter().all(|clause| clause.passed);
+
     // ── Kill 1: a peer ──────────────────────────────────────────────────
     let victim_rows: BTreeMap<u64, Side> = read_events(&logs[VICTIM_INDEX].0)
         .into_iter()
@@ -663,6 +803,12 @@ async fn orchestrate(cli: Cli) -> Result<Outcome> {
             }
             _ => None,
         })
+        // A row the handover moved was disposed of by *that*, not by the
+        // `kill -9` below: its holder already received an `Expire`, its row is
+        // parked, and it lives on the other gateway now. Counting it here
+        // would charge one clause's outcome to another's clock — and address
+        // its loss probe to the node that no longer owns it.
+        .filter(|(entity, _)| !moved_entities.contains(entity))
         .collect();
     anyhow::ensure!(
         !victim_rows.is_empty(),
@@ -713,7 +859,16 @@ async fn orchestrate(cli: Cli) -> Result<Outcome> {
                             .or_insert_with(|| at_ms.saturating_sub(killed_at_unix_ms));
                         inherited_by.insert(entity, index);
                     }
-                    PeerEvent::Lost { entity, .. } if !victim_rows.contains_key(&entity) => {
+                    // A survivor that lost a lease it was not supposed to lose
+                    // is the clause. A survivor that lost one on the shard the
+                    // handover moved is the *handover working*: it was told,
+                    // its `Expire` is asserted by the clause above, and its row
+                    // is claimable on the successor. Charging it here would
+                    // make a correct handover fail the peer-kill criterion.
+                    PeerEvent::Lost { entity, .. }
+                        if !victim_rows.contains_key(&entity)
+                            && !moved_entities.contains(&entity) =>
+                    {
                         survivor_losses.push(entity);
                     }
                     _ => {}
@@ -903,6 +1058,7 @@ async fn orchestrate(cli: Cli) -> Result<Outcome> {
         && a_moved.duplicate == 0
         && held_after >= held_before;
     let passed = settled
+        && handover_all_passed
         && misrouted == 0
         && wrong_owner_probe
         && disposed.reassigned + disposed.parked >= victim_rows.len() as u64
@@ -953,6 +1109,11 @@ async fn orchestrate(cli: Cli) -> Result<Outcome> {
         "misrouted_claims": misrouted,
         "wrong_owner_probe": wrong_owner_probe,
         "claim_refusals": refused,
+        // Issue #119, D26 rule 3: one shard moved between two live gateways.
+        // `null` when the run was not given one to move, which is how a
+        // sibling run without the handover leg still reports honestly rather
+        // than reporting a vacuous pass.
+        "handover": handover,
         "gateway_kill": {
             "issued": gateway_kill_issued,
             "killed": format!("{doomed:?}"),
@@ -970,6 +1131,479 @@ async fn orchestrate(cli: Cli) -> Result<Outcome> {
         "passed": passed,
     });
     Ok(Outcome { passed, report })
+}
+
+/// What gateway A wrote to `<request>.result` (`persistd`'s `HandoverOutcome`).
+///
+/// Only the fields this harness reads. Deserializing a subset is deliberate:
+/// the file is the outgoing owner's own account of the move, and a harness
+/// that insisted on the whole shape would break on a field added for an
+/// operator rather than for it.
+#[derive(Debug, serde::Deserialize)]
+struct HandoverResult {
+    handed_over: bool,
+    #[serde(default)]
+    error: Option<String>,
+    #[serde(default)]
+    started_at_unix_ms: u64,
+    #[serde(default)]
+    finished_at_unix_ms: u64,
+    #[serde(default)]
+    epoch_before: u64,
+    #[serde(default)]
+    epoch_after: u64,
+    #[serde(default)]
+    leases_live_at_drain_start: u64,
+    #[serde(default)]
+    expires_delivered_before_cas: u64,
+    #[serde(default)]
+    expires_undeliverable: u64,
+    #[serde(default)]
+    drain_complete: bool,
+    #[serde(default)]
+    handoff_deadline_ms: u32,
+    #[serde(default)]
+    drain_ms: u64,
+    #[serde(default)]
+    checkpoint_ms: u64,
+    #[serde(default)]
+    total_ms: u64,
+}
+
+/// Everything the handover clause measured, and whether it held.
+struct HandoverClause {
+    passed: bool,
+    /// Entities on the moved shard, excluded from the peer-kill accounting
+    /// below: their disposition was this move, not that `kill -9`.
+    moved_entities: BTreeSet<u64>,
+    report: serde_json::Value,
+}
+
+/// Move one shard from gateway A to gateway B while both are live, and measure
+/// what it cost the players on it (issue #119, D26 rule 3).
+///
+/// ## What this clause is for
+///
+/// The two kills below are about processes *ending*. This one is the case D26
+/// says has no answer anywhere in the accepted set: an owner that is still
+/// alive. The hazard it is written against is specific — a new owner restores
+/// every durable lease row with a full fresh TTL on its own monotonic clock,
+/// which is correct exactly when the previous owner's sessions are gone, and
+/// wrong for a live move. So the assertions are not "did it work" but the two
+/// invariants D26 states in checkable terms:
+///
+/// * **I1** — no window in which two nodes hold `Active` rows for overlapping
+///   subtrees. Decided from the durable rows and proved in
+///   `crates/orrery_persistd/tests/shard_handover.rs`; what this clause adds
+///   is the *cluster* reading of it, `duplicate_authority` summed over both
+///   registrars **across the handover window specifically**, which is the only
+///   externally observable form of two live writers.
+/// * **I2** — `leases_live_at_drain_start - expires_delivered_before_cas == 0`
+///   and `heartbeats_rejected_wrong_owner == 0` across the window, plus the
+///   thing those counters cannot say on their own: every peer that *held* a
+///   row on the moving shard saw its own `Expire`. An entity that silently
+///   stops being writable is a lost row even if it still exists, so the
+///   holder's own log is the witness, not the registrar's counter.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+async fn run_handover(
+    cli: &Cli,
+    issuer: &iroh::SecretKey,
+    probe_seed: u8,
+    shard_bits: u64,
+    rows: &[Row],
+    logs: &[(PathBuf, usize)],
+    metrics_a: &Path,
+    metrics_b: &Path,
+    claim_id: &mut u64,
+) -> Result<HandoverClause> {
+    let request_path = cli
+        .handover_request
+        .as_deref()
+        .context("--handover-request")?;
+    let successor_node = cli
+        .handover_successor_node
+        .context("--handover-successor-node")?;
+    let shard = CellId::from_bits(shard_bits).context("handover shard bits")?;
+
+    // The rows that live under the moving subtree, from the same manifest the
+    // rest of the run is routed by and through the same `shard_of` collapse.
+    let moving: Vec<Row> = rows
+        .iter()
+        .copied()
+        .filter(|row| {
+            CellId::from_bits(row.cell).is_some_and(|cell| shard_of(cell).to_bits() == shard_bits)
+        })
+        .collect();
+    anyhow::ensure!(
+        !moving.is_empty(),
+        "shard {shard_bits:#x} carries no seeded row; a handover of an empty shard proves nothing"
+    );
+    anyhow::ensure!(
+        moving.iter().all(|row| row.side == Side::A),
+        "the moving shard is not gateway A's; the request is addressed to A"
+    );
+    let moved_entities: BTreeSet<u64> = moving.iter().map(|row| row.entity).collect();
+
+    // Who held what, immediately before the move. This is the set I2 is a
+    // statement about, and it is read from the *holders'* logs rather than
+    // from a registrar, because "the holder was told" is a fact only the
+    // holder has.
+    let mut holder_of: BTreeMap<u64, usize> = BTreeMap::new();
+    for (index, (log, _)) in logs.iter().enumerate() {
+        for event in read_events(log) {
+            match event {
+                PeerEvent::Claimed { entity, .. } | PeerEvent::Inherited { entity, .. }
+                    if moved_entities.contains(&entity) =>
+                {
+                    holder_of.insert(entity, index);
+                }
+                PeerEvent::Lost { entity, .. } if moved_entities.contains(&entity) => {
+                    holder_of.remove(&entity);
+                }
+                _ => {}
+            }
+        }
+    }
+    anyhow::ensure!(
+        !holder_of.is_empty(),
+        "no peer holds a lease on the moving shard; the divest clause would be vacuous"
+    );
+
+    let before = AuthorityCounters::sum(
+        read_authority_counters(metrics_a),
+        read_authority_counters(metrics_b),
+    );
+    // These are absolute totals over the process's life, so a run that moves
+    // several shards has to subtract *this* move's baseline. Comparing against
+    // zero would let the second move be attested by the first move's park.
+    let parks_before =
+        read_handover_counters(metrics_a).parks + read_handover_counters(metrics_b).parks;
+    let window_opened_unix_ms = unix_ms();
+
+    // ── Invoke ──────────────────────────────────────────────────────────
+    let _ = std::fs::remove_file(request_path.with_extension("result"));
+    std::fs::write(
+        request_path,
+        serde_json::to_vec(&serde_json::json!({
+            "grid": 0,
+            "shard": shard_bits,
+            "successor_node": successor_node,
+            // With this the refusals gateway A issues for the shard from here
+            // on are *redirects* naming B (D26 rule 3 step 8). Without it they
+            // are bare `WrongOwner`s, which is what this build did before.
+            "successor_gateway": cli.gateway_b_node,
+        }))?,
+    )
+    .with_context(|| format!("write handover request {}", request_path.display()))?;
+    tracing::warn!(
+        shard = format!("{shard_bits:#x}"),
+        successor_node,
+        rows = moving.len(),
+        holders = holder_of.len(),
+        "handover requested: gateway A -> gateway B"
+    );
+
+    let result_path = request_path.with_extension("result");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let result: HandoverResult = loop {
+        if let Ok(bytes) = std::fs::read(&result_path) {
+            if let Ok(parsed) = serde_json::from_slice::<HandoverResult>(&bytes) {
+                break parsed;
+            }
+        }
+        anyhow::ensure!(
+            tokio::time::Instant::now() < deadline,
+            "gateway A never answered the handover request; see its log"
+        );
+        tokio::time::sleep(SETTLE_POLL_INTERVAL).await;
+    };
+    tracing::info!(?result, "handover: gateway A's own account");
+
+    // ── The player-facing window ────────────────────────────────────────
+    // Measured to the instant a peer can *write* again, not to the CAS: a
+    // shard whose row has moved and whose successor has not opened its mailbox
+    // yet is a shard nobody serves, and that gap is the player's, not the
+    // operator's. The claim is issued against gateway B for a row that was on
+    // A a moment ago, so it also proves the move end to end — B could not
+    // answer for this entity at all before the handover.
+    let probe_cells: Vec<CellId> = moving
+        .iter()
+        .filter_map(|row| CellId::from_bits(row.cell))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .take(orrery_protocol::MAX_INTEREST_GRANT_CELLS)
+        .collect();
+    // A fresh probe identity per move, and not for tidiness: a probe is a peer
+    // like any other to the registrar and to the coordinator, so reusing one
+    // node id across moves supersedes its own interest grant — the second
+    // grant for the same peer invalidates the first — and leaves the new
+    // session refused (`InterestGrantVerificationError::Superseded`) or the
+    // claim denied for want of interest. Measured before this was fixed: every
+    // move after the first spent its whole 20 s claim deadline being denied,
+    // and the fourth failed outright at the grant.
+    let (_coordinator, session) = probe_session(
+        issuer,
+        probe_seed,
+        &probe_cells,
+        &cli.coordinator_node,
+        &cli.coordinator_addr,
+        &cli.gateway_b_node,
+        &cli.gateway_b_addr,
+    )
+    .await
+    .context("handover probe session on the successor")?;
+    let probe_target = moving
+        .iter()
+        .find_map(|row| CellId::from_bits(row.cell).map(|cell| (row.entity, cell)))
+        .context("no probe target on the moving shard")?;
+    let claim_deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    let mut writable_at_unix_ms = None;
+    // Reported when the successor never granted: "the window did not close" is
+    // a useless failure message without the refusal that kept it open.
+    let mut last_reply;
+    loop {
+        let reply = probe_claim(
+            &session,
+            ClaimId(*claim_id),
+            PersistId::new(probe_target.0),
+            probe_target.1,
+        )
+        .await;
+        *claim_id += 1;
+        last_reply = format!("{reply:?}");
+        if matches!(reply, ProbeReply::Granted) {
+            writable_at_unix_ms = Some(unix_ms());
+            // Hand it straight back. A probe lease nobody heartbeats lapses one
+            // TTL later and the registrar parks it — a disposition this harness
+            // caused, landing in the very counters the clauses below read. The
+            // gate learned this the hard way once already; see `probe_for_loss`.
+            let _ = session.send_control(&GatewayMsg::Lease {
+                message: LeaseMsg::Divest {
+                    entity: PersistId::new(probe_target.0),
+                    lease_id: orrery_protocol::LeaseId(0),
+                    to: None,
+                    final_seq: SeqPair::default(),
+                    cursor: None,
+                },
+            });
+            break;
+        }
+        if tokio::time::Instant::now() >= claim_deadline {
+            break;
+        }
+        tokio::time::sleep(SETTLE_POLL_INTERVAL).await;
+    }
+
+    // The window the budget is about: admission closing on A through the
+    // successor answering. `started_at_unix_ms` is A's own stamp for step 1,
+    // so the file-watching invocation surface's poll interval is not charged
+    // to the protocol.
+    let opened_at = if result.started_at_unix_ms > 0 {
+        result.started_at_unix_ms
+    } else {
+        window_opened_unix_ms
+    };
+    let window_ms = writable_at_unix_ms.map(|at| at.saturating_sub(opened_at));
+
+    // ── I2, from the holders' own logs ──────────────────────────────────
+    // A counter can say an `Expire` was written; only the holder can say one
+    // arrived. Every peer that held a row on the moving shard must show a
+    // `Lost` for it, after the window opened.
+    let mut holders_without_expire: Vec<u64> = Vec::new();
+    for (entity, index) in &holder_of {
+        let told = read_events(&logs[*index].0).into_iter().any(|event| {
+            matches!(
+                event,
+                PeerEvent::Lost { entity: lost, at_ms, .. }
+                    if lost == *entity && at_ms + 1_000 >= window_opened_unix_ms
+            )
+        });
+        if !told {
+            holders_without_expire.push(*entity);
+        }
+    }
+
+    // ── Nothing lost ────────────────────────────────────────────────────
+    // Every row on the moved shard must still exist and still answer, on the
+    // node that owns it now. Same probe as the peer-kill clause's, same
+    // meaning: a grant proves existence, and silence is the lost entity the
+    // phase exists to rule out. Each is handed straight back for the reason
+    // above.
+    let mut claimable = Vec::new();
+    let mut lost = Vec::new();
+    for row in &moving {
+        let Some(cell) = CellId::from_bits(row.cell) else {
+            continue;
+        };
+        if !probe_cells.contains(&cell) {
+            continue;
+        }
+        let reply = probe_claim(
+            &session,
+            ClaimId(*claim_id),
+            PersistId::new(row.entity),
+            cell,
+        )
+        .await;
+        *claim_id += 1;
+        match reply {
+            ProbeReply::Granted => {
+                claimable.push(row.entity);
+                let _ = session.send_control(&GatewayMsg::Lease {
+                    message: LeaseMsg::Divest {
+                        entity: PersistId::new(row.entity),
+                        lease_id: orrery_protocol::LeaseId(0),
+                        to: None,
+                        final_seq: SeqPair::default(),
+                        cursor: None,
+                    },
+                });
+            }
+            _ => lost.push(row.entity),
+        }
+    }
+
+    // ── The registrars' own account, waited for rather than snatched ────
+    // `--metrics-jsonl` is written on a one-second cadence, so reading it the
+    // instant the probes finish is reading a file that may not yet mention the
+    // handover at all — and every counter this clause reads from it is
+    // asserted to be **zero**. A zero read too early is a pass nobody earned.
+    // So the read waits until the registrars have accounted for the rows the
+    // drain reported parking, and says whether it got there.
+    let attest_deadline = tokio::time::Instant::now() + METRICS_EXPORT_INTERVAL * 4;
+    let (handover_a, handover_b, counters_attested) = loop {
+        let a = read_handover_counters(metrics_a);
+        let b = read_handover_counters(metrics_b);
+        if (a.parks + b.parks).saturating_sub(parks_before) >= result.leases_live_at_drain_start {
+            break (a, b, true);
+        }
+        if tokio::time::Instant::now() >= attest_deadline {
+            break (a, b, false);
+        }
+        tokio::time::sleep(SETTLE_POLL_INTERVAL).await;
+    };
+
+    // ── I1, cluster-wide, across the window specifically ────────────────
+    let after = AuthorityCounters::sum(
+        read_authority_counters(metrics_a),
+        read_authority_counters(metrics_b),
+    );
+    let duplicate_in_window = after.duplicate.saturating_sub(before.duplicate);
+    let heartbeats_rejected_wrong_owner =
+        handover_a.heartbeats_wrong_owner + handover_b.heartbeats_wrong_owner;
+    let i2_undelivered = result
+        .leases_live_at_drain_start
+        .saturating_sub(result.expires_delivered_before_cas);
+
+    let passed = result.handed_over
+        && result.drain_complete
+        && result.error.is_none()
+        && i2_undelivered == 0
+        && result.expires_undeliverable == 0
+        && counters_attested
+        && heartbeats_rejected_wrong_owner == 0
+        && duplicate_in_window == 0
+        && holders_without_expire.is_empty()
+        && lost.is_empty()
+        && window_ms.is_some_and(|ms| ms <= cli.handover_budget_ms);
+
+    let report = serde_json::json!({
+        "shard": format!("{shard_bits:#x}"),
+        "shard_level": shard.level(),
+        "successor_node": successor_node,
+        "successor_gateway": cli.gateway_b_node,
+        "entities_on_shard": moving.len(),
+        "holders_before": holder_of.len(),
+        "handed_over": result.handed_over,
+        "error": result.error,
+        "epoch_before": result.epoch_before,
+        "epoch_after": result.epoch_after,
+        // D26 I2, both terms and their difference. The difference is the
+        // invariant; the terms are beside it so the subtraction can be
+        // checked rather than trusted.
+        "leases_live_at_drain_start": result.leases_live_at_drain_start,
+        "expires_delivered_before_cas": result.expires_delivered_before_cas,
+        "expires_undelivered": i2_undelivered,
+        "expires_undeliverable": result.expires_undeliverable,
+        "heartbeats_rejected_wrong_owner": heartbeats_rejected_wrong_owner,
+        "handover_parks": (handover_a.parks + handover_b.parks).saturating_sub(parks_before),
+        // Whether the two counters above were read from an export that had
+        // caught up with the move. Without it a `0` here is equally consistent
+        // with the invariant holding and with the file not having been written
+        // yet.
+        "counters_attested": counters_attested,
+        "claims_denied_draining": handover_a.claims_denied_draining
+            + handover_b.claims_denied_draining,
+        // The holder's own witness, which no registrar counter can supply.
+        "holders_without_expire": holders_without_expire,
+        // I1's cluster reading, over the window rather than over the run.
+        "duplicate_authority_in_window": duplicate_in_window,
+        "entities_claimable_after": claimable.len(),
+        "lost": lost,
+        // The measurement, against a budget stated in two halves.
+        "drain_complete": result.drain_complete,
+        "handoff_deadline_ms": result.handoff_deadline_ms,
+        "drain_ms": result.drain_ms,
+        "checkpoint_ms": result.checkpoint_ms,
+        "owner_side_total_ms": result.total_ms,
+        "owner_side_window_ms": result.finished_at_unix_ms.saturating_sub(opened_at),
+        "window_ms": window_ms,
+        "budget_ms": cli.handover_budget_ms,
+        "split_handover_target_ms": 1_000,
+        "within_budget": window_ms.is_some_and(|ms| ms <= cli.handover_budget_ms),
+        "within_split_handover_target": window_ms.is_some_and(|ms| ms <= 1_000),
+        "successor_last_reply": last_reply,
+        "passed": passed,
+    });
+    Ok(HandoverClause {
+        passed,
+        moved_entities,
+        report,
+    })
+}
+
+/// The D26 handover counters one gateway last exported.
+#[derive(Debug, Clone, Copy, Default)]
+struct HandoverCounters {
+    heartbeats_wrong_owner: u64,
+    parks: u64,
+    claims_denied_draining: u64,
+}
+
+/// Read the highest total one persistd has reported for each handover counter.
+///
+/// Separate from [`read_authority_counters`] rather than folded into it
+/// because the two are read at different times and mean different things: the
+/// three there are the P3 criterion's dispositions, summed over the whole run,
+/// and these are I2's terms, read across one window. Merging them would invite
+/// a baseline taken for one to be subtracted from the other.
+fn read_handover_counters(path: &Path) -> HandoverCounters {
+    let Ok(contents) = std::fs::read_to_string(path) else {
+        return HandoverCounters::default();
+    };
+    let mut counters = HandoverCounters::default();
+    for line in contents.lines() {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if value.get("type").and_then(|t| t.as_str()) != Some("gateway_authority") {
+            continue;
+        }
+        let field = |name: &str| {
+            value
+                .get(name)
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0)
+        };
+        counters.heartbeats_wrong_owner = counters
+            .heartbeats_wrong_owner
+            .max(field("heartbeats_rejected_wrong_owner"));
+        counters.parks = counters.parks.max(field("handover_parks"));
+        counters.claims_denied_draining = counters
+            .claims_denied_draining
+            .max(field("claims_denied_draining"));
+    }
+    counters
 }
 
 /// How many leases the survivors currently hold on one gateway, from their
@@ -1279,6 +1913,70 @@ fn encode_hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The handover clause's two I2 counters come out of the registrars' own
+    /// export, and they are read **separately** from the P3 disposition
+    /// counters because the two have different baselines: one is subtracted
+    /// over the whole run and the other over one handover window. A reader
+    /// that folded them together would let a baseline taken for one be
+    /// subtracted from the other.
+    #[test]
+    fn handover_counters_come_from_the_registrars_own_export() {
+        let dir = std::env::temp_dir().join(format!("p3-sibling-handover-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("metrics.jsonl");
+        std::fs::write(
+            &path,
+            concat!(
+                r#"{"type":"gateway_authority","handover_parks":2,"#,
+                r#""heartbeats_rejected_wrong_owner":0,"claims_denied_draining":4}"#,
+                "\n",
+                // A record of another kind carrying a same-named field must
+                // not be read as an authority statement.
+                r#"{"type":"journal_commit","handover_parks":99}"#,
+                "\n",
+                r#"{"type":"gateway_authority","handover_parks":3,"#,
+                r#""heartbeats_rejected_wrong_owner":1,"claims_denied_draining":7}"#,
+                "\n",
+                // A gateway that was `kill -9`ed simply stops appending, and a
+                // torn trailing line is what that looks like on disk.
+                r#"{"type":"gateway_auth"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        let counters = read_handover_counters(&path);
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(
+            counters.parks, 3,
+            "absolute totals, so the highest line is the latest statement"
+        );
+        assert_eq!(
+            counters.heartbeats_wrong_owner, 1,
+            "the counter that fails on exactly D26's Context — a holder still \
+             renewing at a process that no longer hosts its shard"
+        );
+        assert_eq!(counters.claims_denied_draining, 7);
+        assert_ne!(counters.parks, 99);
+    }
+
+    /// Shard bits arrive from the seeder in hex and from a hand-written flag
+    /// in decimal, and the handover flag takes the same list the routing files
+    /// do. A parser that took only one spelling failed at the far end of a
+    /// two-minute gate run rather than at the parse — measured, once.
+    #[test]
+    fn shard_bits_parse_both_spellings() {
+        assert_eq!(
+            parse_shard_bits("0x724924924924B200").unwrap(),
+            0x7249_2492_4924_B200
+        );
+        assert_eq!(parse_shard_bits("0X10").unwrap(), 16);
+        assert_eq!(
+            parse_shard_bits(" 4611686018427387905 ").unwrap(),
+            4_611_686_018_427_387_905
+        );
+        assert!(parse_shard_bits("724924924924B200").is_err());
+    }
 
     /// The fleet-wide invariant is a **sum**, and the whole reason this
     /// harness exists is that nothing else computes one: `AuthorityMetrics`

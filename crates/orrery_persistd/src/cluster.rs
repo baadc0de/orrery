@@ -643,7 +643,7 @@ async fn gated_mutex_actor(
     };
     let (actor, runtime_epoch) = {
         let runtime = runtime.lock().await;
-        (runtime.actor(grid, route_cell).cloned(), runtime.epoch())
+        (runtime.actor(grid, route_cell), runtime.epoch())
     };
     let actor = actor.ok_or(Reject::WrongOwner {
         grid,
@@ -841,6 +841,47 @@ pub trait Router: Send + Sync {
     ) -> Result<Option<Lease>, Reject> {
         Err(Reject::JournalClosed)
     }
+    /// The live shard handover this router is running over `cell`, if any
+    /// (D26 rule 3, docs/08-persistence.md §3.4.1).
+    ///
+    /// Two things read it, and they read it for opposite halves of the same
+    /// fact. While the shard is `Draining` the router still serves it, so
+    /// nothing else would notice; the gateway consults this to *close claim
+    /// admission* under the subtree, which is step 2. Once the shard is past
+    /// its quiesce the router refuses it outright and the ordinary
+    /// `WrongOwner` machinery fires; the gateway consults this to fill in the
+    /// redirect's `owner`, which is step 8.
+    ///
+    /// The default is `None` — a router that runs no handovers is exactly as
+    /// it was.
+    async fn shard_transfer(
+        &self,
+        grid: GridId,
+        cell: CellId,
+    ) -> Option<crate::runtime::ShardTransfer> {
+        let _ = (grid, cell);
+        None
+    }
+
+    /// Park **every** held lease under `shard`, returning them addressed for
+    /// their holders' `Expire` frames (D26 rule 3 steps 3–4).
+    ///
+    /// The drain of a live handover. Unlike [`Router::sweep_expired_leases`]
+    /// this is not a periodic best-effort pass and an empty answer is a claim,
+    /// not a shrug: the caller is about to move the shard's durable ownership
+    /// row, and every row it failed to divest is a holder that will lose the
+    /// ability to heartbeat with no `Expire` — the exact defect the handover
+    /// exists to prevent. So a router that cannot do it says so.
+    async fn divest_shard(
+        &self,
+        grid: GridId,
+        shard: CellId,
+        now_ms: u64,
+    ) -> Result<crate::actor::DivestOutcome, Reject> {
+        let _ = (grid, shard, now_ms);
+        Err(Reject::JournalClosed)
+    }
+
     /// Park a disconnecting holder's indexed lease.
     async fn park_lease(
         &self,
@@ -1221,8 +1262,7 @@ impl CellRuntime {
                     // what this batch used to do for every entry
                     // unconditionally.
                     let mut restale: Vec<usize> = Vec::new();
-                    let Some(actor) = shard.and_then(|shard| self.actor(grid, shard)).cloned()
-                    else {
+                    let Some(actor) = shard.and_then(|shard| self.actor(grid, shard)) else {
                         return Ok::<_, Reject>((Vec::new(), restale));
                     };
                     let guards = lock_entity_gates(
@@ -1503,6 +1543,32 @@ impl Router for CellRuntime {
     async fn has_actor(&self, grid: GridId, cell: CellId) -> bool {
         self.actor(grid, cell).is_some()
     }
+    async fn shard_transfer(
+        &self,
+        grid: GridId,
+        cell: CellId,
+    ) -> Option<crate::runtime::ShardTransfer> {
+        CellRuntime::shard_transfer(self, grid, cell)
+    }
+    async fn divest_shard(
+        &self,
+        grid: GridId,
+        shard: CellId,
+        now_ms: u64,
+    ) -> Result<crate::actor::DivestOutcome, Reject> {
+        // Addressed by the shard itself, and resolved through the same
+        // deepest-prefix rule every other route uses: a caller that named a
+        // cell this node hosts no actor for gets `WrongOwner`, not a silent
+        // empty drain.
+        self.actor(grid, shard)
+            .ok_or(Reject::WrongOwner {
+                grid,
+                shard,
+                epoch: self.epoch(),
+            })?
+            .divest_shard(now_ms)
+            .await
+    }
     async fn wrong_owner_epoch(
         &self,
         grid: GridId,
@@ -1528,7 +1594,7 @@ impl Router for CellRuntime {
         }
         let actors: Vec<_> = self
             .shards()
-            .filter_map(|shard| self.actor(grid, *shard).cloned())
+            .filter_map(|shard| self.actor(grid, shard))
             .collect();
         for actor in actors {
             if let Some(cell) = actor.committed_entity_cell(entity).await? {
@@ -1621,8 +1687,7 @@ impl Router for CellRuntime {
         let answered =
             futures::future::join_all(group_by_actor(&shards, &presented).into_iter().map(
                 |(shard, members)| async move {
-                    let Some(actor) = shard.and_then(|shard| self.actor(grid, shard)).cloned()
-                    else {
+                    let Some(actor) = shard.and_then(|shard| self.actor(grid, shard)) else {
                         // No actor here for the presented cell. The old route
                         // would have asked whoever the locate named.
                         return (Vec::new(), members);
@@ -1784,6 +1849,21 @@ impl Router for Arc<CellRuntime> {
     async fn has_actor(&self, grid: GridId, cell: CellId) -> bool {
         <CellRuntime as Router>::has_actor(self.as_ref(), grid, cell).await
     }
+    async fn shard_transfer(
+        &self,
+        grid: GridId,
+        cell: CellId,
+    ) -> Option<crate::runtime::ShardTransfer> {
+        <CellRuntime as Router>::shard_transfer(self.as_ref(), grid, cell).await
+    }
+    async fn divest_shard(
+        &self,
+        grid: GridId,
+        shard: CellId,
+        now_ms: u64,
+    ) -> Result<crate::actor::DivestOutcome, Reject> {
+        <CellRuntime as Router>::divest_shard(self.as_ref(), grid, shard, now_ms).await
+    }
     async fn wrong_owner_epoch(
         &self,
         grid: GridId,
@@ -1890,7 +1970,7 @@ impl Router for tokio::sync::Mutex<CellRuntime> {
             let Some(cell) = rt.lease_location(entity).await? else {
                 return Ok((None, None, None));
             };
-            (cell, rt.actor(grid, cell).cloned())
+            (cell, rt.actor(grid, cell))
         };
         match handle {
             Some(handle) => handle.inspect_lease(entity).await,
@@ -1900,7 +1980,7 @@ impl Router for tokio::sync::Mutex<CellRuntime> {
     async fn apply(&self, record: JournalRecord) -> Result<Arc<AppendHandle>, Reject> {
         let (handle, epoch) = {
             let rt = self.lock().await;
-            (rt.actor(record.grid, record.cell).cloned(), rt.epoch())
+            (rt.actor(record.grid, record.cell), rt.epoch())
         };
         handle
             .ok_or(Reject::WrongOwner {
@@ -1950,7 +2030,7 @@ impl Router for tokio::sync::Mutex<CellRuntime> {
     async fn read(&self, grid: GridId, cell: CellId) -> Result<SnapshotPage, Reject> {
         let (handle, epoch) = {
             let rt = self.lock().await;
-            (rt.actor(grid, cell).cloned(), rt.epoch())
+            (rt.actor(grid, cell), rt.epoch())
         };
         handle
             .ok_or(Reject::WrongOwner {
@@ -1965,6 +2045,28 @@ impl Router for tokio::sync::Mutex<CellRuntime> {
     async fn has_actor(&self, grid: GridId, cell: CellId) -> bool {
         let rt = self.lock().await;
         rt.actor(grid, cell).is_some()
+    }
+    async fn shard_transfer(
+        &self,
+        grid: GridId,
+        cell: CellId,
+    ) -> Option<crate::runtime::ShardTransfer> {
+        self.lock().await.shard_transfer(grid, cell)
+    }
+    async fn divest_shard(
+        &self,
+        grid: GridId,
+        shard: CellId,
+        now_ms: u64,
+    ) -> Result<crate::actor::DivestOutcome, Reject> {
+        let (handle, epoch) = {
+            let rt = self.lock().await;
+            (rt.actor(grid, shard), rt.epoch())
+        };
+        handle
+            .ok_or(Reject::WrongOwner { grid, shard, epoch })?
+            .divest_shard(now_ms)
+            .await
     }
     async fn wrong_owner_epoch(
         &self,
@@ -1988,7 +2090,7 @@ impl Router for tokio::sync::Mutex<CellRuntime> {
                 runtime.lease_store_handle(),
                 runtime
                     .shards()
-                    .filter_map(|shard| runtime.actor(grid, *shard).cloned())
+                    .filter_map(|shard| runtime.actor(grid, shard))
                     .collect(),
             )
         };
@@ -2100,7 +2202,7 @@ impl Router for tokio::sync::Mutex<CellRuntime> {
                     let Some(shard) = shard else {
                         return Ok::<_, Reject>((Vec::new(), restale));
                     };
-                    let Some(actor) = self.lock().await.actor(grid, shard).cloned() else {
+                    let Some(actor) = self.lock().await.actor(grid, shard) else {
                         return Ok((Vec::new(), restale));
                     };
                     let guards = lock_entity_gates(
@@ -2190,6 +2292,21 @@ impl Router for tokio::sync::Mutex<CellRuntime> {
 /// router used when FoundationDB is available.
 #[async_trait::async_trait]
 impl Router for Arc<tokio::sync::Mutex<CellRuntime>> {
+    async fn shard_transfer(
+        &self,
+        grid: GridId,
+        cell: CellId,
+    ) -> Option<crate::runtime::ShardTransfer> {
+        self.as_ref().shard_transfer(grid, cell).await
+    }
+    async fn divest_shard(
+        &self,
+        grid: GridId,
+        shard: CellId,
+        now_ms: u64,
+    ) -> Result<crate::actor::DivestOutcome, Reject> {
+        self.as_ref().divest_shard(grid, shard, now_ms).await
+    }
     async fn sweep_expired_leases(&self, now_ms: u64) -> Vec<crate::lease::ParkedLease> {
         self.as_ref().sweep_expired_leases(now_ms).await
     }
@@ -2362,6 +2479,24 @@ impl<R: Router + Send + Sync> Router for ColdFallbackRouter<R> {
 
     async fn has_actor(&self, grid: GridId, cell: CellId) -> bool {
         self.live.has_actor(grid, cell).await
+    }
+    async fn shard_transfer(
+        &self,
+        grid: GridId,
+        cell: CellId,
+    ) -> Option<crate::runtime::ShardTransfer> {
+        // A handover is a fact about the live half. The cold store has no
+        // ownership of its own — it is a range scan over a keyspace — so it
+        // has nothing to add and nothing to override.
+        self.live.shard_transfer(grid, cell).await
+    }
+    async fn divest_shard(
+        &self,
+        grid: GridId,
+        shard: CellId,
+        now_ms: u64,
+    ) -> Result<crate::actor::DivestOutcome, Reject> {
+        self.live.divest_shard(grid, shard, now_ms).await
     }
     async fn wrong_owner_epoch(
         &self,
@@ -2620,7 +2755,7 @@ impl Router for Cluster {
             .ok_or_else(|| Self::unplaced(record.grid, record.cell))?;
         let (handle, epoch) = {
             let rt = rt.lock().await;
-            (rt.actor(record.grid, record.cell).cloned(), rt.epoch())
+            (rt.actor(record.grid, record.cell), rt.epoch())
         };
         handle
             .ok_or(Reject::WrongOwner {
@@ -2661,7 +2796,7 @@ impl Router for Cluster {
             .ok_or_else(|| Self::unplaced(grid, cell))?;
         let (handle, epoch) = {
             let rt = rt.lock().await;
-            (rt.actor(grid, cell).cloned(), rt.epoch())
+            (rt.actor(grid, cell), rt.epoch())
         };
         handle
             .ok_or(Reject::WrongOwner {
@@ -2944,7 +3079,7 @@ impl Router for Cluster {
             .ok_or_else(|| Self::unplaced(record.grid, route_cell))?;
         let (handle, epoch) = {
             let rt = rt.lock().await;
-            (rt.actor(record.grid, route_cell).cloned(), rt.epoch())
+            (rt.actor(record.grid, route_cell), rt.epoch())
         };
         handle
             .ok_or(Reject::WrongOwner {

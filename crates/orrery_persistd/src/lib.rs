@@ -42,32 +42,33 @@ pub mod reliable;
 pub mod runtime;
 
 pub use actor::{
-    CellActorHandle, EntityRecord, FencedApply, Reject, RekeyError, SnapshotPage, Tombstone,
+    CellActorHandle, DivestOutcome, EntityRecord, FencedApply, Reject, RekeyError, SnapshotPage,
+    Tombstone,
 };
 pub use adjudication::{AdjudicationExecutor, RETAINED_BUILDS};
 pub use checkpoint::{
-    spawn_checkpoint_scheduler, spawn_checkpoint_scheduler_direct, CheckpointConfig,
-    CheckpointData, CheckpointError, CheckpointScheduler, CheckpointStore, ColdCellReader,
-    MemCheckpointStore, QuiesceSignal,
+    spawn_checkpoint_scheduler, spawn_checkpoint_scheduler_direct, CheckpointCause,
+    CheckpointConfig, CheckpointData, CheckpointError, CheckpointScheduler, CheckpointStore,
+    ColdCellReader, MemCheckpointStore, QuiesceSignal,
 };
 pub use cluster::{Cluster, ColdFallbackRouter, Router};
 #[cfg(feature = "fdb")]
 pub use fdb::{FdbContext, FdbContextError};
 pub use fence::{
-    ActivationOutcome, FenceError, FenceFreshnessConfig, FenceFreshnessError,
-    FenceFreshnessMonitor, FenceOutcome, FenceRow, FenceStatus, FenceStore, MemFenceStore,
-    ShardActivation,
+    overlapping_active_ownership, ActivationOutcome, FenceError, FenceFreshnessConfig,
+    FenceFreshnessError, FenceFreshnessMonitor, FenceOutcome, FenceRow, FenceStatus, FenceStore,
+    MemFenceStore, OwnedShard, ShardActivation,
 };
 pub use gateway::{
     AuthorityMetrics, AuthoritySnapshot, BulkAckAdmission, BulkAckDisposition,
-    CoordinatorHandoutAuthority, DuplicateAuthoritySample, FreshBulkAckAdmission,
+    CoordinatorHandoutAuthority, DrainReport, DuplicateAuthoritySample, FreshBulkAckAdmission,
     GatewayAreaMetrics, GatewayAreaSnapshot, GatewayBulkLatencySnapshot, GatewayBulkMetrics,
     GatewayBulkSample, GatewayBulkSnapshot, GatewayConfig, GatewayError, GatewayIntentMetrics,
     GatewayIntentSnapshot, GatewayMetrics, GatewayReportMetrics, GatewayReportSnapshot,
     GatewayServer, GatewayServerLatency, GatewayServerLatencySnapshot,
-    NearestInterestSuccessorPolicy, ParkOnLossPolicy, RegistrarSweepClock, SharedAdjudicator,
-    SharedBulkAckAdmission, SharedSuccessorPolicy, SuccessorCandidate, SuccessorPolicy,
-    SuccessorRequest, GATEWAY_ALPN, MAX_INTEREST_PEERS,
+    NearestInterestSuccessorPolicy, ParkOnLossPolicy, RegistrarSweepClock, ShardDrainHandle,
+    SharedAdjudicator, SharedBulkAckAdmission, SharedSuccessorPolicy, SuccessorCandidate,
+    SuccessorPolicy, SuccessorRequest, GATEWAY_ALPN, MAX_INTEREST_PEERS,
 };
 #[cfg(feature = "fdb")]
 pub use intent::{FdbIntentExecutor, IntentFence};
@@ -97,4 +98,4 @@ pub use lease::{
 };
 pub use placement::{RendezvousHasher, RendezvousNode, RendezvousWeight};
 pub use reliable::{Lane, ReliableSender};
-pub use runtime::{payload_crc, CellRuntime, RuntimeConfig};
+pub use runtime::{payload_crc, CellRuntime, RuntimeConfig, ShardTransfer, TransferPhase};

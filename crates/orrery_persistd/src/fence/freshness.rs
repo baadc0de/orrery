@@ -87,7 +87,16 @@ struct FreshnessState {
 /// so callers inject an `Arc<Self>` into [`crate::gateway::GatewayConfig`].
 pub struct FenceFreshnessMonitor {
     grid: GridId,
-    rows: Vec<(CellId, FenceRow)>,
+    /// The exact rows being watched.
+    ///
+    /// Mutable because a live shard handover (D26 rule 3) moves a row *out*
+    /// of this node's ownership on purpose. Left immutable, the outgoing
+    /// owner would watch a row it had itself handed away, see a permanent
+    /// mismatch on the next poll, and make **every** bulk acknowledgement on
+    /// every one of its remaining shards provisional forever — a correct
+    /// handover taking the node's whole write path down with it. See
+    /// [`Self::forget`] and [`Self::adopt`].
+    rows: RwLock<Vec<(CellId, FenceRow)>>,
     max_staleness: Duration,
     state: RwLock<FreshnessState>,
     shutdown: watch::Sender<bool>,
@@ -125,7 +134,7 @@ impl FenceFreshnessMonitor {
         let (shutdown, mut stopped) = watch::channel(false);
         let monitor = Arc::new(Self {
             grid,
-            rows,
+            rows: RwLock::new(rows),
             max_staleness: config.max_staleness,
             state: RwLock::new(FreshnessState {
                 last_confirmation: Some(Instant::now()),
@@ -144,6 +153,59 @@ impl FenceFreshnessMonitor {
             }
         });
         Ok(monitor)
+    }
+
+    /// Update the row expected for a shard this monitor already watches.
+    ///
+    /// Called when this node itself changes the row — which happens exactly
+    /// once outside activation, at a live handover's step 1, where the status
+    /// goes `Active → Draining{B}` under the same owner and epoch (D26 rule
+    /// 3). Without this the monitor would see its own deliberate write as a
+    /// mismatch and make **every** bulk acknowledgement on **every** shard of
+    /// this node provisional for the length of the drain — a drain D26 calls
+    /// invisible to gameplay, visibly degrading the write path.
+    ///
+    /// A no-op on a shard that is not watched: this never starts watching one,
+    /// because what may be watched is an activation result.
+    pub fn rewatch(&self, shard: CellId, row: FenceRow) {
+        let mut rows = self.rows.write().expect("fence freshness lock poisoned");
+        if let Some(watched) = rows.iter_mut().find(|(watched, _)| *watched == shard) {
+            watched.1 = row;
+        }
+    }
+
+    /// Stop watching `shard`: this node no longer owns it (D26 rule 3 step 6).
+    ///
+    /// Called by the outgoing owner *after* its handover CAS commits. A
+    /// mismatch already recorded is deliberately not cleared — a mismatch
+    /// means some row moved under this node without its consent, and forgetting
+    /// one shard is not evidence about the others. What this prevents is the
+    /// *next* poll finding a row that is missing by design.
+    pub fn forget(&self, shard: CellId) {
+        self.rows
+            .write()
+            .expect("fence freshness lock poisoned")
+            .retain(|(watched, _)| *watched != shard);
+    }
+
+    /// Start watching `shard` at `row`: this node has just adopted it
+    /// (D26 rule 3 step 7).
+    ///
+    /// Refused, and reported as such, if `shard` overlaps a row already
+    /// watched — the same non-overlap precondition [`Self::start`] enforces,
+    /// for the same reason: `assess` picks a row by prefix, so an overlapping
+    /// pair makes cell-to-shard admission ambiguous.
+    pub fn adopt(&self, shard: CellId, row: FenceRow) -> Result<(), FenceFreshnessError> {
+        let mut rows = self.rows.write().expect("fence freshness lock poisoned");
+        if rows
+            .iter()
+            .any(|(watched, _)| watched.is_prefix_of(shard) || shard.is_prefix_of(*watched))
+        {
+            return Err(FenceFreshnessError::OverlappingShards);
+        }
+        rows.push((shard, row));
+        rows.sort_by_key(|(shard, _)| *shard);
+        Ok(())
     }
 
     /// Stop polling and make all future bulk acknowledgements provisional.
@@ -172,14 +234,30 @@ impl FenceFreshnessMonitor {
     /// nothing, because a mismatched monitor is a terminal state the node does
     /// not poll its way out of.
     async fn poll_once(&self, store: &dyn FenceStore) {
-        let shards: Vec<CellId> = self.rows.iter().map(|&(shard, _)| shard).collect();
+        // Snapshot the watch set rather than holding the lock across the
+        // store round trip: `forget` and `adopt` are called from a handover
+        // that must not block on FoundationDB, and a poll that raced one
+        // simply confirms the set as it was a moment ago.
+        let watched = self
+            .rows
+            .read()
+            .expect("fence freshness lock poisoned")
+            .clone();
+        if watched.is_empty() {
+            // A node that owns nothing has nothing to confirm. Refreshing the
+            // confirmation here would be a claim about rows that do not
+            // exist, so the window simply runs down and acks go provisional —
+            // which is correct, because there is no shard left to ack for.
+            return;
+        }
+        let shards: Vec<CellId> = watched.iter().map(|&(shard, _)| shard).collect();
         let Ok(actual) = store.read_many(self.grid, &shards).await else {
             return;
         };
-        if actual.len() != self.rows.len() {
+        if actual.len() != watched.len() {
             return;
         }
-        for (&(_, expected), got) in self.rows.iter().zip(actual) {
+        for (&(_, expected), got) in watched.iter().zip(actual) {
             if got != Some(expected) {
                 self.state
                     .write()
@@ -194,7 +272,11 @@ impl FenceFreshnessMonitor {
     }
 
     fn owns_cell(&self, cell: CellId) -> bool {
-        self.rows.iter().any(|(shard, _)| shard.is_prefix_of(cell))
+        self.rows
+            .read()
+            .expect("fence freshness lock poisoned")
+            .iter()
+            .any(|(shard, _)| shard.is_prefix_of(cell))
     }
 }
 

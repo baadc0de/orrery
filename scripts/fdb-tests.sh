@@ -49,8 +49,14 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # it is a "did the fdb tier run at all" tripwire, not a census that has to be
 # edited every time a test is added. `cargo test -p orrery_persistd -p
 # orrery_seed --features orrery_persistd/fdb,orrery_seed/fdb -- --list`
-# reported 341 on 2026-08-16.
-FLOOR="${ORRERY_FDB_TEST_FLOOR:-320}"
+# reported 341 on 2026-08-16. A full run measured 513 executed tests on
+# 2026-08-20, after the live shard handover (issue #119, D26 rule 3) added 11:
+# `shard_handover_fdb` (1, and the only one that needs the cluster),
+# `shard_handover` (5), `shard_handover_gateway` (2) and three fence unit
+# tests. The floor rises by those 11 — 320 -> 331 — because a floor that never
+# moves stops being a tripwire and becomes a number: every test added widens
+# the gap the tier can go dark inside without tripping it.
+FLOOR="${ORRERY_FDB_TEST_FLOOR:-331}"
 
 # Every test file whose contents only mean anything against a real cluster. If
 # one of these reports no executed tests, the tier is dark again whatever the
@@ -63,6 +69,11 @@ REQUIRED_TARGETS=(
   area_load
   persistd_binary
   fdb_gates
+  # A live shard handover is two processes taking turns owning one durable
+  # row, so it is exactly the tier a memory store cannot speak for — and the
+  # `PreHandover` checkpoint's fence read is where that bit: the in-memory
+  # suite passed while a real cluster refused the checkpoint outright.
+  shard_handover_fdb
 )
 
 die() { echo "::error::$*" >&2; exit 1; }
@@ -177,7 +188,7 @@ self_test() {
     fi
   }
 
-  # 7 targets × 32 + 120 unit tests = 344, over the 320 floor.
+  # 8 targets × 32 + 120 unit tests = 376, over the 331 floor.
   fixture="$tmp/good.log";    emit_log "$fixture" none 32;            expect "a real run passes" pass "$fixture"
   # The same log with `CARGO_TERM_COLOR=always` escapes through it.
   sed -e 's/^     Running/     \x1b[1;32mRunning\x1b[0m/' \
@@ -186,7 +197,7 @@ self_test() {
 
   fixture="$tmp/skipped.log"; emit_log "$fixture" skip 32;            expect "a skipped run is red" fail "$fixture"
   fixture="$tmp/thin.log";    emit_log "$fixture" none 1;             expect "a run under the floor is red" fail "$fixture"
-  # 40 apiece so the six remaining targets still clear the floor: this case has
+  # 40 apiece so the seven remaining targets still clear the floor: this case has
   # to fail because fence_split is missing, not because the total is thin.
   fixture="$tmp/absent.log";  emit_log "$fixture" none 40 fence_split; expect "a missing fdb target is red" fail "$fixture"
   # A target that ran and asserted nothing. `check_log` has always refused this
