@@ -1,10 +1,9 @@
 # Spike brief: a purpose-built `journal-raw`, on `wal-db`
 
-**Status: non-normative working document.** This is not an ADR and does not
-decide anything. It is the brief for an investigation whose *output* may
-justify an ADR — swapping the journal's backing store is a D14 dependency
-decision and a D11 persistence decision, and neither is taken here. Accepted
-ADRs in [`docs/adr/`](../adr/) remain normative over every word below.
+**Status: completed, non-normative spike.** This document does not itself make
+a decision. Its Phase 4 output subsequently supported
+[D19](../adr/0019-indexed-waldb-journal.md), which selects the indexed raw
+journal as the default and is normative over this brief.
 
 **Date:** 2026-08-20. **Reads from:**
 [08-persistence.md](../08-persistence.md) §4.3–§4.8.
@@ -66,8 +65,8 @@ events per run, and a fix is anything that removes *those*.
 
 **The seam already exists. Use it; do not build beside it.**
 
-`crates/orrery_persistd/Cargo.toml` declares, with the comment *"Only one may be
-set"*:
+At the start of the spike, `crates/orrery_persistd/Cargo.toml` declared, with
+the comment *"Only one may be set"*:
 
 ```toml
 journal-fjall = ["dep:fjall"]   # default
@@ -80,13 +79,14 @@ and `crates/orrery_persistd/src/journal/mod.rs` has one line that is the switch:
 pub use fjall::Journal;
 ```
 
-If the spike lands a `Journal` under `journal-raw` with the same surface, then
+The spike landed a `Journal` under `journal-raw` with the same surface, so
 [`crates/orrery_persistd/tests/journal_arrival_rate.rs`](../../crates/orrery_persistd/tests/journal_arrival_rate.rs)
 and [`scripts/p2-kill9-gate.sh`](../../scripts/p2-kill9-gate.sh) both work
 **unmodified**, and the comparison is apples-to-apples by construction rather
 than by argument. A new API instead produces another
 [`p2-journal-bench`](../../p2-journal-bench/README.md) — useful, but not a
-verdict on the journal.
+verdict on the journal. D19 subsequently flipped the manifest default to
+`journal-raw`; the snippet above remains the pre-spike seam the experiment used.
 
 `wal-db` stays *behind* that seam. If the crate proves unsound (see §7), the
 index layer must survive and only the substrate be replaceable.
@@ -353,5 +353,5 @@ Every number above is derived by
 `docs/data/p2-journal-raw-2026-08-20.jsonl` and
 `docs/data/p2-journal-raw-device-2026-08-20.json`. Its `--self-test` is wired
 into `scripts/check.sh` and mutation-checks every guarded class of evidence.
-This section records a measurement only: it makes no dependency or
-default-backend decision.
+This section records a measurement only. D19 subsequently uses this evidence
+to make the dependency and default-backend decision.

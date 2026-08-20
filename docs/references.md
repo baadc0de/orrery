@@ -2,7 +2,8 @@
 
 This is the consolidated bibliography for the Orrery architecture doc set: every external source the design load-bears on, deduplicated and organized by topic, with one line each on why it matters. Entries cite the independent decisions (Dn) they support; sibling docs reference these same links inline.
 
-Normative source: the [ADR index](DECISIONS.md) and [accepted ADRs](adr/) D1–D17; this file adds no decisions.
+Normative source: the [ADR index](DECISIONS.md) and [accepted ADRs](adr/)
+D1–D17 and D19 (D18 remains a reserved proposal); this file adds no decisions.
 
 ## QUIC & NAT traversal
 

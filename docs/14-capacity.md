@@ -26,6 +26,11 @@ server process and RAM are all still idle at that point.
 > reached through *intents* now, at about 1 300 intents/s, not through bulk
 > diffs.
 
+> **D19 changes the default journal after these sweeps.** Every capacity point
+> in this document used Fjall. The full P2 gate is green on the indexed raw
+> journal, but the capacity knee has not yet been re-measured with it; treat the
+> absolute throughput figures as the pre-D19 baseline until that rerun lands.
+
 ## 1. The box, and what was on it
 
 | | |

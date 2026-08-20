@@ -88,17 +88,15 @@ The alternatives, and why not: *a subcommand of `persistd`* couples a batch tool
 
 **Dependencies.** `orrery_protocol` (types), `orrery_persistd` (keyspace helpers and `FenceStore`, see below), `toml` + `serde`, `blake3`, `rand_chacha`, `foundationdb` behind the `fdb` feature. It must **not** depend on `orrery_spatial`, which is a Bevy crate — so `INTEREST_LEVEL`/`SHARD_LEVEL` (currently `orrery_spatial/src/cell.rs:14,17`) and the metres↔cells conversion move to `orrery_protocol` as a spec delta (§16).
 
-**Dependency posture — a knowing deviation (P2 decision, 2026-08-13).** The
-paragraph above rejects the persistd-subcommand shape partly because it "drags
-the gateway/iroh surface into a job that never opens a socket". Depending on
-`orrery_persistd` as a library currently has the same effect: `journal/mod.rs`
-declares `pub mod fjall` unconditionally and `gateway.rs` uses iroh
-unconditionally, so `default-features = false` does not compile and the only
-buildable form links an LSM store and iroh into a batch tool. P2 accepts that
-— it costs build time, not correctness, and the alternative (feature-gating
-`journal::fjall` and `gateway`) touches `lib.rs` and `journal/mod.rs` while
-several other P2 workstreams own those files. Revisit at P3, when the crate is
-quiet enough to gate cleanly.
+**Dependency posture — a knowing deviation (P2 decision, 2026-08-13; updated
+by D19).** The paragraph above rejects the persistd-subcommand shape partly
+because it "drags the gateway/iroh surface into a job that never opens a
+socket". Depending on `orrery_persistd` as a library has the same effect. The
+journal modules are now feature-gated, but one backend is mandatory and
+`gateway.rs` still uses iroh unconditionally, so the default build links
+wal-db and iroh into the batch tool (Fjall before D19). P2 accepts that — it
+costs build time, not correctness. Revisit at P3, when the crate is quiet
+enough to split keyspace helpers from the service runtime cleanly.
 
 **Keyspace helpers.** `world_key`, `ckpt_key`, `world_range_start`/`_end` are private free functions in `orrery_persistd/src/checkpoint/fdb.rs`. They become a public `orrery_persistd::keyspace` module — one definition of the keyspace, used by the checkpointer, the cold reader and the seeder alike. This is what stops P-2/P-3 from recurring as a seeder-vs-checkpointer disagreement.
 

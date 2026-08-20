@@ -1,4 +1,4 @@
-//! The fjall-backed segmented append-only journal (`journal-fjall`, default).
+//! The fallback Fjall-backed segmented append-only journal (`journal-fjall`).
 //!
 //! Records are stored in a single fjall `Database` with **manual journal
 //! persistence** — each selected group is one Fjall batch whose durability is
@@ -12,8 +12,8 @@
 //!
 //! The "segment" is a logical unit inside the LSN (a segment seq advances when
 //! cumulative bytes cross [`JournalConfig::segment_size`]); it is **not** a raw
-//! 128 MiB file in this slice — the `journal-raw` feature is the planned
-//! hand-rolled segment-file backend (D11 offers either).
+//! 128 MiB file. D19 retains this implementation as an explicit fallback while
+//! selecting the indexed wal-db-backed `journal-raw` implementation by default.
 
 #[cfg(feature = "chain-grpc")]
 use std::collections::HashMap;
@@ -525,7 +525,6 @@ impl Journal {
         }
     }
 
-    #[cfg(feature = "chain-grpc")]
     pub(crate) fn scan_source_from<'a>(
         &'a self,
         source: &crate::journal::chain::ChainSource,
@@ -533,6 +532,7 @@ impl Journal {
     ) -> Result<JournalScan<'a>, JournalError> {
         match source {
             crate::journal::chain::ChainSource::Originated => Ok(self.scan_originated_from(from)),
+            #[cfg(feature = "chain-grpc")]
             crate::journal::chain::ChainSource::Adopted(history) => {
                 self.scan_adopted_from(history, from)
             }

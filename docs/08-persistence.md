@@ -2978,6 +2978,13 @@ feature`.
 
 ### 4.8 Is it fjall's, or an LSM's? A store-level comparison
 
+> **Decision status (2026-08-20):** this store-level comparison did not by
+> itself license adoption. The subsequent indexed implementation passed the
+> full kill-9 gate 5/5 against Fjall's 0/5, and
+> [D19](adr/0019-indexed-waldb-journal.md) then selected it as the default.
+> The caveats below remain the pre-decision evidence boundary and maturity-risk
+> record.
+
 [§4.7](#47-the-stall-is-fjalls-write-backpressure-and-it-is-a-sleep) named the
 mechanism — fjall 3.1.9's `Batch::commit` calls `local_backpressure()`, which
 sleeps in 100 ms steps while four or more sealed memtables are queued — and
@@ -3068,10 +3075,10 @@ what fjall did**, and that number is the caveat, not a result — see below.
   stalls are *rare enough not to reach p99*, and *absent* when the device is.
 * **No store is tuned.** A default RocksDB is not a tuned RocksDB, and fjall's
   memtable size — the one knob §4.7 swept — is at its default here too.
-* **This is not an adoption recommendation.** Swapping the journal's backing
-  store is a D14/ADR decision. What this section supplies is the evidence such
-  a decision would need, and one of the three candidates should not survive
-  contact with it (below).
+* **This store-level result was not an adoption recommendation.** Swapping the
+  journal's backing store required a D11/D14 decision. This section supplied
+  substrate evidence; D19 was taken only after the indexed implementation ran
+  through the full gate.
 * **n = 2 per cell in the three-way leg**, 2–3 in the two-store leg. The effects
   are enormous relative to that — 59 stalls against 0 — but no ordering between
   RocksDB and wal-db is claimed.
@@ -3115,14 +3122,13 @@ versions between 2026-06-06 and 06-10.
    investigation — the seam to land it behind, the 19-method contract, the
    invariants that are not in the signatures, the gotchas §4.4–§4.8 paid for,
    and phased acceptance criteria — is
-   [docs/spikes/journal-raw-waldb.md](spikes/journal-raw-waldb.md). It is
-   non-normative and decides nothing; a store swap is a D11/D14 decision that
-   would need its own ADR.
-3. **Do not adopt wal-db as a live dependency on these numbers.** It is a
-   credible *design reference* and a candidate to vendor and audit (this
-   repository already vendors three crates). Depending on 235 downloads for the
-   durability substrate of the system of record would be the largest single
-   risk in the codebase.
+   [docs/spikes/journal-raw-waldb.md](spikes/journal-raw-waldb.md). It remains
+   non-normative; its completed Phase 4 evidence is the input D19 later used.
+3. **These store-only numbers did not justify a live wal-db dependency.** It
+   was a credible *design reference* and a candidate to vendor and audit (this
+   repository already vendors three crates). D19 accepts the maturity risk only
+   after the indexed full-gate result, pins 1.0.0 exactly, and retains Fjall as
+   an explicit fallback.
 4. **RocksDB is the conservative option and is not free.** It clears the p99
    budget here and still stalls 17 times on NVMe, it is a large C++ dependency
    with a minutes-long cold build, and none of that is priced in this section.

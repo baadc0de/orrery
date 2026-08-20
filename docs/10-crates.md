@@ -112,7 +112,7 @@ Layering rules (the first two are normative from D15; the rest are containment r
 | `orrery_witness` | plugin | yes | blake3 |
 | `orrery_persist_client` | plugin | yes | bevy_replicon 0.42 |
 | `orrery` (facade) | lib | yes | all six client plugins |
-| `orrery_persistd` | lib+bin | **none** | foundationdb-rs 0.11, fjall 3.x, iroh, tokio, tonic |
+| `orrery_persistd` | lib+bin | **none** | foundationdb-rs 0.11, wal-db 1.0.0 (default), fjall 3.x (fallback), iroh, tokio, tonic |
 | `orrery_seed` | lib+bin | **none** | toml, serde, blake3, rand_chacha 0.9, postcard, foundationdb-rs 0.11 (opt, `fdb` feature) |
 | `orrery_games` | lib | **none** | libm, rand_chacha 0.9, blake3 |
 | `orrery_coordinator` | bin | **none** | iroh, tokio, tonic |
@@ -471,9 +471,18 @@ Landed. Defines `OrreryClientPlugins<R: Ruleset>` — a Bevy `PluginGroup` in de
 
 ### 11. `orrery_persistd` — persistence cluster harness
 
-**Bevy-free** (D15). A library harness plus a reference binary: gateway (iroh endpoint at a well-known address), single-writer cell actors, the segmented append-only journal (group commit, ~2 ms fsync — via [fjall 3.x](https://github.com/fjall-rs/fjall) or raw segment files), FoundationDB checkpoint/restore on the 20 s jittered cadence, the lease registrar (CAS rows), intent validation (`Ruleset::validate_intent` + FDB serializable transactions, < 10 ms p99), the adjudication executor (`ReplayHarness<R>`), and hotspot cell splitting. Internal service-to-service traffic uses tonic/gRPC where boring is better (D12). Games do not run this binary — they link their rules into their own (next section).
+**Bevy-free** (D15). A library harness plus a reference binary: gateway (iroh endpoint at a well-known address), single-writer cell actors, the segmented append-only journal (group commit, ~2 ms fsync — indexed wal-db by default under D19, with Fjall as an explicit fallback), FoundationDB checkpoint/restore on the 20 s jittered cadence, the lease registrar (CAS rows), intent validation (`Ruleset::validate_intent` + FDB serializable transactions, < 10 ms p99), the adjudication executor (`ReplayHarness<R>`), and hotspot cell splitting. Internal service-to-service traffic uses tonic/gRPC where boring is better (D12). Games do not run this binary — they link their rules into their own (next section).
 
-**Features:** the manifest default is `["journal-fjall", "chain-grpc"]`. `journal-fjall` backs the journal with fjall 3.x; `journal-raw` (declared, unimplemented) is the raw-segment alternative and only one may be set. `chain-grpc` adds the cross-process chain transport (hyper/prost/tonic); `chain-replication` is a non-default placeholder for future transport options — the in-process chain transport is always compiled in, so chain replication is not gated on it. `fdb` links the FoundationDB C client and enables `FdbCheckpointStore` and the cluster-gated test tier. An `otel` feature and a `hilbert` storage-key feature are designed and declared by no manifest.
+**Features:** the manifest default is `["journal-raw", "chain-grpc"]`.
+`journal-raw` uses wal-db 1.0.0 for segmented CRC-framed storage and rebuilds
+Orrery's ordered indexes at open; `journal-fjall` retains the previous Fjall
+implementation as a fallback, and only one may be set. `chain-grpc` adds the
+cross-process chain transport (hyper/prost/tonic); `chain-replication` is a
+non-default placeholder for future transport options — the in-process chain
+transport is always compiled in, so chain replication is not gated on it.
+`fdb` links the FoundationDB C client and enables `FdbCheckpointStore` and the
+cluster-gated test tier. An `otel` feature and a `hilbert` storage-key feature
+are designed and declared by no manifest.
 
 ```rust
 pub struct PersistdHarness<R: Ruleset> { /* … */ }

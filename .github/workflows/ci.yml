@@ -193,10 +193,10 @@ jobs:
         if: runner.environment == 'github-hosted'
         uses: ./.github/actions/foundationdb
 
-      # Both passes, and the `--exclude`/`--no-deps` reasoning that makes them
+      # All three passes, and the `--exclude`/`--no-deps` reasoning that makes them
       # mean something, live in scripts/check.sh so this job is reproducible
       # locally with one command.
-      - name: clippy (default features, then the fdb feature)
+      - name: clippy (default raw, fdb, then Fjall fallback)
         run: scripts/check.sh clippy
 
   gates:
