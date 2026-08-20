@@ -1,7 +1,8 @@
 # ADR-0016: Parameter reference (defaults)
 
 **Status:** Accepted; extended by [ADR-0020](0020-journal-retention.md),
-enforced by [ADR-0023](0023-follower-journal-retention.md) ·
+enforced by [ADR-0023](0023-follower-journal-retention.md), proposed extension in
+[ADR-0025](0025-expire-fan-out.md) ·
 **Date:** 2026-08-11 · **Decision:** D16
 
 This decision is normative. See the [ADR index](../DECISIONS.md) for precedence, scope, and the complete decision set.
@@ -23,6 +24,7 @@ This decision is normative. See the [ADR index](../DECISIONS.md) for precedence,
 | Hot-cell egress (promoted) | ≤ 35 Mbps | Witness-log fan-out | witness set only (≤ 7 links) |
 | Journal retention | on (D20) | Journal open (index rebuild) | < 2 000 ms (D20) |
 | Drain grace | 10 s (D24) | — | — |
+| `Expire` fan-out dispositions | `Parked`/`Free` only (D25) | `Expire` fan-out bucket (per recipient) | 32/s, burst 64 (D25) |
 
 The last row is added by [D20](0020-journal-retention.md). *Journal retention*
 is whether a node releases journal segments its checkpoints have made
@@ -44,3 +46,15 @@ registrar's expiry sweep can observe anything, and a longer one names an
 instant after that sweep has already parked every row — so `10 s` is the only
 value that adds no third timer to the two this system already has.
 
+The `Expire` fan-out rows are added by [D25](0025-expire-fan-out.md), and are
+*proposed* rather than accepted until that record is. *Fan-out dispositions* is
+which expiry outcomes are copied to non-holders: `Reassigned` is excluded
+because [INV-4](../04-authority.md) converges observers on the successor's
+first envelope without any message, while a parked entity has no successor
+stream and the advisory is the only mechanism. *Fan-out bucket* is the
+per-recipient egress limit on those copies, shaped after D7 §10's claim bucket
+so the ingress and egress limits on the same path read alike; D25 also caps one
+expiry at **128** non-holder recipients, D6's per-cell player ceiling. Both
+limits **drop** rather than queue — the advisory is best-effort by
+construction, and `Deny{Parked}` on a subsequent claim is the authoritative
+answer.
