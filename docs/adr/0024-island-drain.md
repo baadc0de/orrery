@@ -25,7 +25,7 @@ Three facts about the landed tree, each read before it was written down here.
 `CoordinatorHandoutAuthority` holds only the coordinator's *public* keys and
 verifies handouts a peer carries: "the gateway needs no connection to the
 coordinator — the peer is the courier, exactly as it is for its identity
-token" (`crates/orrery_persistd/src/gateway.rs:619-622`). Every coordinator
+token" (`crates/orrery_persistd/src/gateway.rs:715-722`). Every coordinator
 fact the persistence tier acts on today arrives couriered by the peer it is
 about.
 
@@ -66,9 +66,9 @@ Clause by clause, against the tree:
 
 | §5 clause | What exists | Where |
 |---|---|---|
-| leases *released* | `LeaseMsg::Divest { to: None }` → `park_lease`, synchronously | `orrery_protocol/src/authority.rs:243-254`; `orrery_persistd/src/gateway.rs:4784-4790` |
-| leases *expire* | 1 s sweep → `sweep_expired_leases` → park → redistribute | `orrery_persistd/src/gateway.rs:3597-3606`; `src/lease.rs:554` |
-| (unwritten third path) | clean session teardown parks every held lease | `orrery_persistd/src/gateway.rs:4909-4947` |
+| leases *released* | `LeaseMsg::Divest { to: None }` → `park_lease`, synchronously | `orrery_protocol/src/authority.rs:243-254`; `orrery_persistd/src/gateway.rs:5712` (`divest_lease`) |
+| leases *expire* | 1 s sweep → `sweep_expired_leases` → park → redistribute | `orrery_persistd/src/gateway.rs:4476` (the sweep call) and `:3598`; `src/lease.rs:554` |
+| (unwritten third path) | clean session teardown parks every held lease | `orrery_persistd/src/gateway.rs:5944` (`cleanup_peer_session`) |
 | cell actors *checkpoint* | jittered per-shard timer, plus an immediate `QuiesceSignal::quiesce(cell)` | `orrery_persistd/src/checkpoint/scheduler.rs:170-205`, `:225-300` |
 | cell actors *quiesce* | **nothing.** `CellActor` has `shutdown` (mailbox drain, drops the `Arc<Journal>`) and no quiesce | `orrery_persistd/src/actor.rs:1705-1711` |
 | cells *parked* | the `PARKED` lease flag, per entity | `orrery_persistd/src/lease.rs:303-321`, `:461-475` |
@@ -83,7 +83,7 @@ no wire message by which any coordinator could reach it.
 ### The two ways to close the gap
 
 **Add a coordinator→gateway control edge.** It is absent from D12's five-service
-inventory, and it inverts the courier model at `gateway.rs:619-622` — the
+inventory, and it inverts the courier model at `gateway.rs:715-722` — the
 gateway would have to hold a *connection* to a coordinator, not merely its
 public keys. Worse, it makes drain stall on coordinator availability, and
 `docs/09-services-and-ops.md:15` states the coordinator's blast radius as "No
@@ -114,7 +114,7 @@ the edge this record declines. It is not one: step 2 has the host send
 `Claim{basis: Promotion{warrant}}`, so the registrar receives the warrant **on
 the host's own claim** and verifies its signature against the coordinator's
 public keys — exactly the courier already used for interest handouts
-(`gateway.rs:619-622`: "the gateway needs no connection to the coordinator —
+(`gateway.rs:715-722`: "the gateway needs no connection to the coordinator —
 the peer is the courier, exactly as it is for its identity token"). §8 step 1
 is reworded here to say so. Field-host promotion therefore adds no edge either,
 and a future record that wants one must argue for it on its own terms rather
@@ -293,7 +293,7 @@ not punished — it is simply no longer the reason anything is waiting.
   `docs/09-services-and-ops.md:15`; and it is *redundant* — the registrar's 1 s
   expiry sweep already parks every row within `TTL + S` with no message at all,
   so the edge would buy a latency improvement the peer's own `Divest` buys more
-  cheaply. It also inverts the trust direction at `gateway.rs:619-622`, where
+  cheaply. It also inverts the trust direction at `gateway.rs:715-722`, where
   the gateway holds coordinator *keys* and not a coordinator *session*.
 - **Teaching `orrery_persistd` about islands.** The prerequisite for the
   option above, and worse than it: an `IslandId` in the persistence tier is a
