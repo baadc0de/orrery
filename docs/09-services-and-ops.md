@@ -6,7 +6,7 @@ Normative source: [ADR-0012](adr/0012-backend-services.md) (expanding on [D3](ad
 
 ## 1. Service inventory
 
-Crate names come from [D15](adr/0015-crate-set.md). `orrery_persistd` ships as a library harness — the game team links its `Ruleset` and builds the deployed binary, so *the game repo owns the persistd artifact* and every `Ruleset` change is a persistd redeploy (D11, D17.6). Rolling deploys keep old builds alive for the adjudication retention horizon: persistd retains the last **3** ruleset builds as version-keyed sidecar adjudication workers (D12); the adjudication executor routes evidence bundles by `RulesetId`, and bundles older than retention are ruled `Unadjudicable` — no strike, rate-limited per account (D10).
+Crate names come from [D15](adr/0015-crate-set.md). `orrery_persistd` ships as a library harness — the game team links its `Ruleset` and builds the deployed binary, so *the game repo owns the persistd artifact* and every `Ruleset` change is a persistd redeploy (D11, D17.6). [D21](adr/0021-ruleset-distribution.md) settles that this is the answer for 1.0 rather than a placeholder, and freezes the harness API accordingly: WASM-sandboxed rules are rejected on determinism and adjudication cost, and D21 names what would reopen the question. Rolling deploys keep old builds alive for the adjudication retention horizon: persistd retains the last **3** ruleset builds as version-keyed sidecar adjudication workers (D12); the adjudication executor routes evidence bundles by `RulesetId`, and bundles older than retention are ruled `Unadjudicable` — no strike, rate-limited per account (D10).
 
 | Service | Crate | Role | State held | Scaling axis | Failure blast radius | HA strategy |
 |---|---|---|---|---|---|---|
