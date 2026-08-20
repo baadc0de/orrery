@@ -816,11 +816,31 @@ emit_jsonl() {
 # ─────────────────────────────────────────────────────────────────────────────
 # --self-test
 #
-# Structural half in the house style — the haystack is the body below the
-# `readonly ROOT=` line and comment lines are stripped, because every pattern
-# also appears in the clause that looks for it and an unrestricted grep over
-# `$0` matches its own source and passes unconditionally (the anti-pattern
-# fixed repo-wide in #35, AGENTS.md).
+# Structural half in the house style — the haystack is this file's own text
+# with comment lines stripped, because every pattern also appears in the clause
+# that looks for it and an unrestricted grep over `$0` matches its own source
+# and passes unconditionally (the anti-pattern fixed repo-wide in #35,
+# AGENTS.md).
+#
+# Stripping comments is not enough on its own, and #135 is the proof: `body`
+# used to run from the `Reporting` banner to EOF, and `self_test` lives below
+# that banner — so every `has` clause found its own `has '…'` line and could
+# only pass. Measured on the way in: a guarded stage was rewritten
+# (`(( unknown > 0 ))` → `(( unknown >= 1 ))`) while its check line was left
+# alone, and the self-test still reported green. `has_head`, bounded *at* the
+# banner and therefore excluding the checks, was sound throughout.
+#
+# So both haystacks are now bounded on both ends, and neither contains this
+# function:
+#
+#   head   `readonly NAME=` … the `Reporting` banner   — discovery
+#   body   the `Reporting` banner … *this* banner      — evaluate/collect/render/emit
+#
+# The searched text and the checking text are disjoint by construction, which
+# is the property that makes a clause capable of failing. A clause that needs
+# to reach something below this banner — the argument dispatch, the final
+# `exit "$EXIT"` — needs a third region, not a wider `body`; widening `body`
+# back to EOF puts the checks inside the haystack again and re-creates #135.
 #
 # Functional half runs this script against a synthetic repository: a
 # `scripts/` directory and a `nightly.yml` this file has never seen. That is
@@ -831,7 +851,8 @@ emit_jsonl() {
 
 self_test() {
   local body
-  body="$(sed -n '/^# ─* *Reporting/,$p' "$0" | grep -v '^[[:space:]]*#')"
+  # Bounded at the banner above this function, not at EOF: see the note there.
+  body="$(sed -n '/^# ─* *Reporting/,/^# ─* *--self-test/p' "$0" | grep -v '^[[:space:]]*#')"
   local head
   head="$(sed -n '/^readonly NAME=/,/^# ─* *Reporting/p' "$0" | grep -v '^[[:space:]]*#')"
   has() { grep -Fq -- "$1" <<<"$body"; }
