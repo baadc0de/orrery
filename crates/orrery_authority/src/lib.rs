@@ -141,6 +141,38 @@ pub enum AuthorityEvent {
         /// Fencing token that is no longer valid.
         lease_id: LeaseId,
     },
+    /// The registrar reported where an entity's authority went, to a peer
+    /// that never held a fence for it (D25, `docs/adr/0025-expire-fan-out.md`,
+    /// rule 5).
+    ///
+    /// Deliberately not [`AuthorityEvent::Lost`], which keeps its single
+    /// meaning: *a fence I held has ended*. Nothing ended here — this peer
+    /// was an observer of the entity before the message and is an observer of
+    /// it after, and the only thing that changed is which peer it believes is
+    /// writing the entity. Game code reads it to demote a body from "simulated
+    /// by peer X" to "parked, render-only" without a claim round trip, or to
+    /// repoint an interpolated proxy at the successor.
+    ///
+    /// It is an **advisory**, not a correctness mechanism: D25 §8-9 let the
+    /// gateway drop it under load, and `Deny{Parked}` on an actual claim
+    /// remains the authoritative answer. Nothing downstream may become correct
+    /// only if this event arrives.
+    DispositionObserved {
+        /// ECS entity whose holder belief changed.
+        entity: Entity,
+        /// The holder this peer now believes in: the named successor for
+        /// [`ExpireDisposition::Reassigned`], and none for
+        /// [`ExpireDisposition::Parked`] and [`ExpireDisposition::Free`].
+        holder: Option<NodeId>,
+        /// What the registrar said became of the entity, carried verbatim so
+        /// game code can tell a parked body from a claimable one — a
+        /// distinction `holder: None` alone erases.
+        disposition: ExpireDisposition,
+        /// The registrar's per-row token the advisory was ordered by. Purely
+        /// informational to a recipient that never installed it; it is not a
+        /// fence, and holding this event does not authorize any write.
+        lease_id: LeaseId,
+    },
 }
 
 /// Queued lease control messages for the gateway adapter.
@@ -219,6 +251,15 @@ pub struct AuthorityState {
     pub now_ms: u64,
     leases: BTreeMap<PersistId, LocalLease>,
     pending_claims: BTreeMap<PersistId, ClaimId>,
+    // The highest `lease_id` whose *observed* disposition has been applied,
+    // per entity (D25 rule 6). One `u64` per entity this peer watches but does
+    // not hold, and the only defence an observer has against a re-delivered
+    // advisory: a fan-out copy carries no `seq`, so the sequence pair cannot
+    // order it, and this peer holds no fence to order it by either. Without
+    // this map a reconnect that replays an old advisory repoints
+    // `Authority.holder` at a peer the registrar has already replaced —
+    // silently, since an observer raises no `Lost`.
+    observed_expiries: BTreeMap<PersistId, LeaseId>,
     next_claim_id: ClaimId,
     last_heartbeat: Instant,
 }
@@ -230,6 +271,7 @@ impl Default for AuthorityState {
             now_ms: 0,
             leases: BTreeMap::new(),
             pending_claims: BTreeMap::new(),
+            observed_expiries: BTreeMap::new(),
             next_claim_id: ClaimId(1),
             last_heartbeat: Instant::now(),
         }
@@ -267,6 +309,30 @@ impl AuthorityState {
     /// makes a captured [`LeaseOutbox`] comparable across runs.
     pub fn held_leases(&self) -> impl Iterator<Item = (PersistId, Entity)> + '_ {
         self.leases.iter().map(|(id, lease)| (*id, lease.entity))
+    }
+
+    /// The highest fan-out `lease_id` whose disposition this peer has applied
+    /// as an observer of `entity`, if any (D25 rule 6).
+    ///
+    /// Independent of [`AuthorityState::local_lease_id`], and never a fence:
+    /// an entry here says only "an advisory this old has already been acted
+    /// on", which is what makes a re-delivered copy a no-op.
+    #[must_use]
+    pub fn observed_disposition_high_water(&self, entity: PersistId) -> Option<LeaseId> {
+        self.observed_expiries.get(&entity).copied()
+    }
+
+    /// Forget the observed-disposition high-water mark for `entity`.
+    ///
+    /// Call this when the entity leaves this peer's interest set, which is
+    /// what bounds the map: D25 sizes it by the interest set (24 high-rate
+    /// bodies plus proxies, D16) on the understanding that it is evicted with
+    /// the cell subscription that produced it. Re-entering interest starts the
+    /// entity from no mark, which is correct — the peer has no belief to
+    /// protect at that point, and the first advisory it hears is the freshest
+    /// thing it knows.
+    pub fn forget_observed_disposition(&mut self, entity: PersistId) {
+        self.observed_expiries.remove(&entity);
     }
 
     /// Allocate and record a claim correlation identifier for `entity`.
@@ -552,11 +618,85 @@ pub fn process_lease_replies(
                 disposition,
                 ..
             } => {
-                if state
-                    .leases
-                    .get(&entity)
-                    .is_none_or(|lease| lease.lease_id != lease_id)
-                {
+                // One message with two readings of one field, and the reading
+                // is decided here, locally, by whether this peer has the
+                // entity in `state.leases` (D25 rule 4). To the holder,
+                // `lease_id` is the fencing token being revoked. To everybody
+                // else it is an ordering token on an advisory about somebody
+                // else's fence. The branches share the message and nothing
+                // else: the observer half installs no fence, drops none,
+                // touches no `SeqPair` and moves no phase.
+                let installed = state.leases.get(&entity).map(|lease| lease.lease_id);
+                if let Some(installed) = installed {
+                    if installed != lease_id {
+                        // A fence is installed and this is not about it. The
+                        // dangerous case is the one the fan-out created: a
+                        // copy addressed to the *previous* holder arriving
+                        // after the registrar granted this entity to this
+                        // peer. Falling through to the observer branch would
+                        // clear a fence the registrar had just issued, on the
+                        // strength of a message that is not addressed to this
+                        // peer at all — the INV-2 failure
+                        // `orrery_persist_client`'s stale-NACK test exists to
+                        // prevent, arriving through the new door.
+                        continue;
+                    }
+                } else {
+                    // Observer half (D25 rule 5): change exactly one thing,
+                    // this peer's belief about who holds the entity.
+                    //
+                    // The ordering gate first, because it is the whole of the
+                    // observer's defence. A non-holder has no fence to compare
+                    // against and must not touch the pair, so `lease_id` —
+                    // monotone per row, since the registrar increments it on
+                    // every acquire — is the only order available. Apply only
+                    // what is strictly newer than the newest already applied.
+                    if state
+                        .observed_expiries
+                        .get(&entity)
+                        .is_some_and(|applied| lease_id <= *applied)
+                    {
+                        continue;
+                    }
+                    // Two conditions in one pattern, and both are drops rather
+                    // than spawns. An unknown `PersistId` is a body this peer
+                    // does not replicate: it is ignored, silently, because a
+                    // fan-out set is a superset of who cares and a `warn!` per
+                    // copy would be a log line per uninteresting expiry. An
+                    // entity with no `Authority` yet is subtler — it has no
+                    // pair on file, so honouring the advisory would mean
+                    // *minting* one, and a row at `(0, 0)` is superseded by
+                    // every row there has ever been, including ones the
+                    // registrar has already moved past. That is the exact
+                    // repointing hazard D25 rule 6 forbids, so the peer waits
+                    // for replication to give it a pair to defend.
+                    let Some((entity_ref, _, Some(authority))) =
+                        entities.iter().find(|(_, id, _)| id.0 == entity)
+                    else {
+                        continue;
+                    };
+                    let holder = match &disposition {
+                        ExpireDisposition::Reassigned { to } => Some(*to),
+                        // No successor stream will ever arrive for these two,
+                        // which is why they are the dispositions D25 rule 7
+                        // fans out at all: nothing else would ever repoint an
+                        // observer off the departed holder.
+                        ExpireDisposition::Parked | ExpireDisposition::Free => None,
+                    };
+                    // The pair is carried over verbatim. `Expire` has no `seq`
+                    // field and a recipient may not synthesise, reset or zero
+                    // one (D25 rule 6, INV-2).
+                    let seq = authority.seq;
+                    state.observed_expiries.insert(entity, lease_id);
+                    commands
+                        .entity(entity_ref)
+                        .insert(Authority { holder, seq });
+                    events.write(AuthorityEvent::DispositionObserved {
+                        entity: entity_ref,
+                        holder,
+                        disposition,
+                        lease_id,
+                    });
                     continue;
                 }
                 if let Some(lease) = state.leases.remove(&entity) {
@@ -1754,6 +1894,368 @@ mod tests {
                 lease_id: LeaseId(4),
                 expires_at_ms: 10_500,
             })
+        );
+    }
+
+    /// An `Expire` for an entity this peer merely watches, addressed by the
+    /// token whichever peer actually held it believed it had installed.
+    fn observed_expire(
+        entity: PersistId,
+        lease_id: LeaseId,
+        last_holder: NodeId,
+        disposition: ExpireDisposition,
+    ) -> LeaseMsg {
+        LeaseMsg::Expire {
+            entity,
+            lease_id,
+            last_holder: Some(last_holder),
+            reason: ExpireReason::Disconnect,
+            disposition,
+        }
+    }
+
+    /// A replicated body this peer renders and does not hold: it knows the
+    /// persistent identity and a sequence pair, and holds no fence.
+    fn observed_entity(
+        app: &mut App,
+        persisted: PersistId,
+        holder: NodeId,
+        seq: SeqPair,
+    ) -> Entity {
+        app.world_mut()
+            .spawn((
+                PersistIdentity(persisted),
+                AuthorityPhase::Remote,
+                Authority {
+                    holder: Some(holder),
+                    seq,
+                },
+            ))
+            .id()
+    }
+
+    fn drain_events(app: &mut App) -> Vec<AuthorityEvent> {
+        app.world_mut()
+            .resource_mut::<Messages<AuthorityEvent>>()
+            .drain()
+            .collect()
+    }
+
+    #[test]
+    fn an_observed_reassignment_repoints_the_holder_and_touches_nothing_else() {
+        // Given: a body this peer replicates from node 1 and never claimed.
+        let mut app = App::new();
+        app.add_plugins(OrreryAuthorityPlugin);
+        let persisted = PersistId::new(70);
+        let pair = SeqPair {
+            own_seq: 3,
+            auth_seq: 7,
+        };
+        let watched = observed_entity(&mut app, persisted, node_id(1), pair);
+
+        // When: a fan-out copy says authority went to node 2. Its `lease_id`
+        // is node 1's token, which this peer never installed — to it the field
+        // is an ordering token and nothing more (D25 rule 4). `Reassigned` is
+        // holder-only in the registrar D25 rule 7 describes, but a client is
+        // permissive about what it accepts.
+        app.world_mut()
+            .resource_mut::<LeaseInbox>()
+            .0
+            .push(observed_expire(
+                persisted,
+                LeaseId(9),
+                node_id(1),
+                ExpireDisposition::Reassigned { to: node_id(2) },
+            ));
+        app.update();
+
+        // Then: exactly one thing changed.
+        let authority = app.world().get::<Authority>(watched).expect("still known");
+        assert_eq!(
+            authority.holder,
+            Some(node_id(2)),
+            "the observer repoints at the successor the disposition names"
+        );
+        assert_eq!(
+            authority.seq, pair,
+            "an `Expire` carries no `seq`, so the pair this peer learned from \
+             replication is the pair it keeps (INV-2, D25 rule 6)"
+        );
+        assert!(
+            app.world().get::<LocallyAuthoritative>(watched).is_none(),
+            "an advisory never authorizes a local write"
+        );
+        assert_eq!(
+            app.world().get::<AuthorityPhase>(watched),
+            Some(&AuthorityPhase::Remote),
+            "the observer was remote before the message and is remote after it"
+        );
+        assert!(
+            app.world()
+                .resource::<AuthorityState>()
+                .local_lease_id(persisted)
+                .is_none(),
+            "no fence was installed by a message addressed to somebody else"
+        );
+        assert_eq!(
+            drain_events(&mut app),
+            vec![AuthorityEvent::DispositionObserved {
+                entity: watched,
+                holder: Some(node_id(2)),
+                disposition: ExpireDisposition::Reassigned { to: node_id(2) },
+                lease_id: LeaseId(9),
+            }],
+            "reported as an observation, never as `Lost`: nothing this peer \
+             held ended"
+        );
+    }
+
+    #[test]
+    fn an_observed_park_clears_the_holder_once_however_many_copies_arrive() {
+        // Given: a body this peer renders, written by node 1.
+        let mut app = App::new();
+        app.add_plugins(OrreryAuthorityPlugin);
+        let persisted = PersistId::new(71);
+        let pair = SeqPair {
+            own_seq: 1,
+            auth_seq: 4,
+        };
+        let watched = observed_entity(&mut app, persisted, node_id(1), pair);
+
+        // When: node 1 goes away and the lease parks for want of a successor.
+        // This is the disposition with no self-healing path — no successor
+        // stream will ever raise the pair — so the advisory is the only thing
+        // that will ever tell this peer to stop expecting writes.
+        let parked = observed_expire(persisted, LeaseId(9), node_id(1), ExpireDisposition::Parked);
+        app.world_mut()
+            .resource_mut::<LeaseInbox>()
+            .0
+            .push(parked.clone());
+        app.update();
+
+        let authority = app.world().get::<Authority>(watched).expect("still known");
+        assert_eq!(authority.holder, None, "a parked entity has no holder");
+        assert_eq!(authority.seq, pair, "and the pair is untouched");
+        assert_eq!(
+            drain_events(&mut app),
+            vec![AuthorityEvent::DispositionObserved {
+                entity: watched,
+                holder: None,
+                disposition: ExpireDisposition::Parked,
+                lease_id: LeaseId(9),
+            }],
+            "the parked-render demotion is reported exactly once"
+        );
+
+        // When: the same copy is delivered again — a reconnect replays what
+        // the peer missed, and the lane is free to duplicate.
+        app.world_mut().resource_mut::<LeaseInbox>().0.push(parked);
+        app.update();
+
+        // Then: nothing at all happens. `lease_id` does not exceed the mark
+        // the first copy left, so there is no second demotion for game code
+        // to act on.
+        assert!(
+            drain_events(&mut app).is_empty(),
+            "a duplicate advisory changes nothing on second delivery"
+        );
+        let authority = app.world().get::<Authority>(watched).expect("still known");
+        assert_eq!(authority.holder, None);
+        assert_eq!(authority.seq, pair);
+    }
+
+    #[test]
+    fn an_observed_copy_cannot_clear_the_fence_this_peer_now_holds() {
+        // Given: this peer watched node 1's body, then claimed it and was
+        // granted it. The registrar's per-row token advanced, as it does on
+        // every acquire.
+        let mut app = App::new();
+        app.add_plugins(OrreryAuthorityPlugin);
+        let persisted = PersistId::new(72);
+        let watched = observed_entity(
+            &mut app,
+            persisted,
+            node_id(1),
+            SeqPair {
+                own_seq: 0,
+                auth_seq: 4,
+            },
+        );
+        let claim_id = begin_test_claim(&mut app, watched, persisted);
+        app.world_mut()
+            .resource_mut::<LeaseInbox>()
+            .0
+            .push(LeaseMsg::Grant {
+                claim_id,
+                entity: persisted,
+                lease_id: LeaseId(10),
+                seq: SeqPair {
+                    own_seq: 0,
+                    auth_seq: 5,
+                },
+                ttl_ms: 10_000,
+                prev_holder: Some(node_id(1)),
+            });
+        app.update();
+        drain_events(&mut app);
+
+        // When: the fan-out copy addressed to node 1 arrives late — the
+        // registrar sent it before it granted, and the lanes reordered.
+        app.world_mut()
+            .resource_mut::<LeaseInbox>()
+            .0
+            .push(observed_expire(
+                persisted,
+                LeaseId(9),
+                node_id(1),
+                ExpireDisposition::Parked,
+            ));
+        app.update();
+
+        // Then: it is not an observer copy at all, because this peer is now
+        // the holder. Treating it as one would revoke a fence the registrar
+        // has just issued, on the strength of a message addressed to the peer
+        // that lost the entity — the INV-2 failure the stale-NACK regression
+        // in `orrery_persist_client::replies` exists to prevent, restated for
+        // the fan-out lane.
+        assert_eq!(
+            app.world()
+                .resource::<AuthorityState>()
+                .local_lease_id(persisted),
+            Some(LeaseId(10)),
+            "the fence this peer holds survives an advisory about the last one"
+        );
+        assert!(app.world().get::<LocallyAuthoritative>(watched).is_some());
+        assert!(matches!(
+            app.world().get::<AuthorityPhase>(watched),
+            Some(AuthorityPhase::LocalGranted {
+                lease_id: LeaseId(10),
+                ..
+            })
+        ));
+        let local_node = app.world().resource::<AuthorityState>().node;
+        assert_eq!(
+            app.world().get::<Authority>(watched).expect("held").holder,
+            Some(local_node),
+            "this peer is still the holder it was granted as"
+        );
+        assert!(
+            drain_events(&mut app).is_empty(),
+            "no loss and no observation: the message was about somebody else"
+        );
+    }
+
+    #[test]
+    fn an_observed_copy_below_the_high_water_mark_is_ignored() {
+        // Given: this peer has already applied the advisory that parked the
+        // entity at token 9.
+        let mut app = App::new();
+        app.add_plugins(OrreryAuthorityPlugin);
+        let persisted = PersistId::new(73);
+        let pair = SeqPair {
+            own_seq: 2,
+            auth_seq: 6,
+        };
+        let watched = observed_entity(&mut app, persisted, node_id(1), pair);
+        app.world_mut()
+            .resource_mut::<LeaseInbox>()
+            .0
+            .push(observed_expire(
+                persisted,
+                LeaseId(9),
+                node_id(1),
+                ExpireDisposition::Parked,
+            ));
+        app.update();
+        drain_events(&mut app);
+        assert_eq!(
+            app.world()
+                .resource::<AuthorityState>()
+                .observed_disposition_high_water(persisted),
+            Some(LeaseId(9)),
+            "applying an advisory raises the mark that orders the next one"
+        );
+
+        // When: an older advisory is re-delivered after a reconnect, naming a
+        // holder the registrar has already moved past.
+        app.world_mut()
+            .resource_mut::<LeaseInbox>()
+            .0
+            .push(observed_expire(
+                persisted,
+                LeaseId(5),
+                node_id(1),
+                ExpireDisposition::Reassigned { to: node_id(3) },
+            ));
+        app.update();
+
+        // Then: it is dropped. This peer holds no fence and the message
+        // carries no `seq`, so `lease_id` — monotone per row — is the only
+        // order there is; without this gate the reconnect repoints the body at
+        // node 3 with no `Lost` event to show for it (D25 rule 6).
+        let authority = app.world().get::<Authority>(watched).expect("still known");
+        assert_eq!(
+            authority.holder, None,
+            "the newer parking still stands after the older copy"
+        );
+        assert_eq!(authority.seq, pair);
+        assert!(
+            drain_events(&mut app).is_empty(),
+            "a superseded advisory is not an event"
+        );
+    }
+
+    #[test]
+    fn an_observed_expire_for_an_unknown_entity_is_dropped_silently() {
+        // Given: a peer that replicates one body and knows nothing of another.
+        // The fan-out set is "everyone whose interest covers the cell", a
+        // superset of everyone who cares, so copies for bodies outside this
+        // peer's replicated set are ordinary traffic rather than an anomaly:
+        // neither spawned nor logged at `warn`.
+        let mut app = App::new();
+        app.add_plugins(OrreryAuthorityPlugin);
+        let known = PersistId::new(74);
+        let unknown = PersistId::new(75);
+        observed_entity(
+            &mut app,
+            known,
+            node_id(1),
+            SeqPair {
+                own_seq: 0,
+                auth_seq: 1,
+            },
+        );
+
+        app.world_mut()
+            .resource_mut::<LeaseInbox>()
+            .0
+            .push(observed_expire(
+                unknown,
+                LeaseId(9),
+                node_id(1),
+                ExpireDisposition::Parked,
+            ));
+        app.update();
+
+        let mut identities = app.world_mut().query::<&PersistIdentity>();
+        let live: Vec<_> = identities.iter(app.world()).map(|id| id.0).collect();
+        assert_eq!(
+            live,
+            vec![known],
+            "an advisory never spawns: `AreaPage` carries no holder, so a peer \
+             that does not already replicate the body has nothing to attach it to"
+        );
+        assert!(
+            drain_events(&mut app).is_empty(),
+            "and nothing is reported about a body game code has never seen"
+        );
+        assert!(
+            app.world()
+                .resource::<AuthorityState>()
+                .observed_disposition_high_water(unknown)
+                .is_none(),
+            "a dropped advisory leaves no mark, so the map stays bounded by \
+             the interest set rather than by everything the gateway ever sent"
         );
     }
 }
