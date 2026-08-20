@@ -3111,7 +3111,13 @@ versions between 2026-06-06 and 06-10.
 2. **`journal-raw` is worth more than it was.** §4 has always listed it as
    planned; this section says the shape it describes measures flat (p99.9
    0.358 ms on tmpfs, 0.641 ms on NVMe) where the current store measures 332 ms.
-   The remaining work is the index layer, not the log.
+   The remaining work is the index layer, not the log. A brief for that
+   investigation — the seam to land it behind, the 19-method contract, the
+   invariants that are not in the signatures, the gotchas §4.4–§4.8 paid for,
+   and phased acceptance criteria — is
+   [docs/spikes/journal-raw-waldb.md](spikes/journal-raw-waldb.md). It is
+   non-normative and decides nothing; a store swap is a D11/D14 decision that
+   would need its own ADR.
 3. **Do not adopt wal-db as a live dependency on these numbers.** It is a
    credible *design reference* and a candidate to vendor and audit (this
    repository already vendors three crates). Depending on 235 downloads for the
