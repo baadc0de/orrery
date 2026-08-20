@@ -571,12 +571,122 @@ fn report_and_maybe_gate(cli: &Cli, thresholds: &ThresholdsUs, loaded: &Loaded) 
         if report.gate == GateVerdict::Pass {
             ExitCode::SUCCESS
         } else {
-            eprintln!("GATE FAILED: one or more D16 series missed its p99 target");
+            for line in gate_failure_report(&report) {
+                eprintln!("{line}");
+            }
             ExitCode::FAILURE
         }
     } else {
         ExitCode::SUCCESS
     }
+}
+
+/// The stderr text the `--gate` failure path prints, one entry per line.
+///
+/// # Why this exists
+///
+/// `--gate --json` sends the report to stdout, and the P2 kill-9 harness
+/// redirects that into `latency-report.json`. So on a nightly failure the only
+/// thing that reaches the job log is what this function returns. It used to
+/// return one sentence — "one or more D16 series missed its p99 target" — which
+/// names no series, no measurement and no target, and the nightly was red for
+/// four consecutive nights with no reader able to say which budget was missed
+/// or by how much. Reading the artifact is a 160 MB download; the log should
+/// answer it.
+///
+/// Every number here comes off the [`Report`] that was already built. This is
+/// rendering: it reads verdicts and thresholds and writes nothing back, so no
+/// series' outcome and no exit code can move in here.
+///
+/// The gated series are walked in [`SERIES_KEYS`] order (the four D16 keys
+/// first, innermost span first) rather than in the report's alphabetical map
+/// order, so the root cause is printed above the failures it explains.
+fn gate_failure_report(r: &Report) -> Vec<String> {
+    let gated: Vec<(&&str, &SeriesSummary)> = SERIES_KEYS
+        .iter()
+        .filter_map(|key| r.series.get_key_value(key))
+        .filter(|(_, s)| s.threshold_us.is_some())
+        .collect();
+    let missed: Vec<&(&&str, &SeriesSummary)> = gated
+        .iter()
+        .filter(|(_, s)| !matches!(s.gate, SeriesGate::Pass | SeriesGate::NotGated))
+        .collect();
+    let passed: Vec<&str> = gated
+        .iter()
+        .filter(|(_, s)| s.gate == SeriesGate::Pass)
+        .map(|(key, _)| **key)
+        .collect();
+
+    let mut lines = vec![format!(
+        "GATE FAILED: {} of {} gated D16 series missed {}",
+        missed.len(),
+        gated.len(),
+        if missed.len() == 1 {
+            "its p99 target"
+        } else {
+            "their p99 targets"
+        }
+    )];
+    for (key, s) in &missed {
+        let unit = s.unit.label();
+        // A gated series always carries a threshold; the filter above is what
+        // makes that true, and the `—` is the honest reading if it ever stops
+        // being true rather than a panic in the failure path.
+        let target = s
+            .threshold_us
+            .map_or_else(|| "—".to_string(), |t| format!("{t} {unit}"));
+        let measured = match (s.gate, s.p99_us) {
+            (SeriesGate::MissingData, _) | (_, None) => {
+                format!("p99 — (0 samples)   D16 target {target}   margin — (never measured)")
+            }
+            (_, Some(p99)) => {
+                let t = s.threshold_us.unwrap_or(0);
+                let over = p99.saturating_sub(t);
+                let factor = if t == 0 {
+                    String::new()
+                } else {
+                    format!(", {:.1}x the target", p99 as f64 / t as f64)
+                };
+                format!("p99 {p99} {unit}   D16 target {target}   margin +{over} {unit}{factor}")
+            }
+        };
+        let role = match &s.failure_role {
+            Some(FailureRole::Root) => "   ROOT CAUSE".to_string(),
+            Some(FailureRole::Consequence { of }) => {
+                format!("   consequence of {}", of.join(", "))
+            }
+            None => String::new(),
+        };
+        lines.push(format!("  {key:<22} {measured}{role}"));
+    }
+    // The exception is not the picture. A reader who sees only the misses
+    // cannot tell a single regressed series from a run where everything is
+    // slow, so the ones that met their budget are named too.
+    if passed.is_empty() {
+        lines.push(format!(
+            "  0 of {} gated series met its target.",
+            gated.len()
+        ));
+    } else {
+        lines.push(format!(
+            "  {} of {} gated series met its target: {}.",
+            passed.len(),
+            gated.len(),
+            passed.join(", ")
+        ));
+    }
+    if !r.root_causes.is_empty() {
+        lines.push(format!(
+            "  start at: {} — every other failure above is downstream of {}.",
+            r.root_causes.join(", "),
+            if r.root_causes.len() == 1 {
+                "it"
+            } else {
+                "these"
+            }
+        ));
+    }
+    lines
 }
 
 /// Summarize every series and adjudicate the verdict. Split out of
@@ -1309,5 +1419,112 @@ mod tests {
             ExitCode::SUCCESS
         );
         let _ = std::fs::remove_file(path);
+    }
+
+    /// The failure path has to name the series, the measurement and the
+    /// target. Under `--gate --json` the report itself goes to a file (the P2
+    /// harness redirects stdout into `latency-report.json`), so these lines
+    /// are the whole of what a nightly log gets to say — and for four
+    /// consecutive nights they said "one or more D16 series missed its p99
+    /// target" and nothing else.
+    #[test]
+    fn a_failing_gate_names_every_series_that_missed_with_its_numbers() {
+        let r = report_on(slow_committer());
+        let text = gate_failure_report(&r).join("\n");
+
+        // The root cause, its measurement, its D16 target and the margin.
+        assert!(
+            text.contains(SERIES_JOURNAL_COMMIT),
+            "the failing series is not named:\n{text}"
+        );
+        let s = &r.series[SERIES_JOURNAL_COMMIT];
+        let p99 = s.p99_us.expect("the slow committer has samples");
+        let target = s.threshold_us.expect("journal_commit_ms is gated");
+        assert!(
+            text.contains(&p99.to_string()),
+            "the measured p99 ({p99}) is not printed:\n{text}"
+        );
+        assert!(
+            text.contains(&target.to_string()),
+            "the D16 target ({target}) is not printed:\n{text}"
+        );
+        assert!(
+            text.contains(&format!("+{}", p99 - target)),
+            "the margin (+{}) is not printed:\n{text}",
+            p99 - target
+        );
+
+        // Both consequences are named too - a reader must see the whole
+        // failing set, not just the root.
+        for key in [SERIES_BULK_ACK, SERIES_INTENT_COMMIT] {
+            assert!(text.contains(key), "{key} failed but is not named:\n{text}");
+        }
+        // And the series that met its budget, so "3 of 4" is legible as
+        // three failures rather than as a total collapse.
+        assert!(
+            text.contains(SERIES_AREA_FIRST_PAGE),
+            "the passing series is not accounted for:\n{text}"
+        );
+        assert!(
+            text.contains("3 of 4"),
+            "the count of missed series is wrong or absent:\n{text}"
+        );
+        // The root cause is still called out by name, and the exit code is
+        // untouched by any of this.
+        assert!(
+            text.contains("ROOT CAUSE"),
+            "the root cause is not marked:\n{text}"
+        );
+        assert_ne!(run_gate_on(slow_committer()), ExitCode::SUCCESS);
+    }
+
+    /// A series the run never sampled fails the gate (`missing_series_fails_the_gate`),
+    /// and the failure text has to say which one and that it was never
+    /// measured — a `p99` of `0` would read as a series that was fast.
+    #[test]
+    fn an_unmeasured_series_is_named_as_unmeasured_not_as_fast() {
+        let lines = conforming()
+            .into_iter()
+            .filter(|v| v.get("series").and_then(|s| s.as_str()) != Some(SERIES_INTENT_COMMIT))
+            .collect::<Vec<_>>();
+        let r = report_on(lines);
+        let text = gate_failure_report(&r).join("\n");
+        assert!(
+            text.contains(SERIES_INTENT_COMMIT),
+            "the unmeasured series is not named:\n{text}"
+        );
+        assert!(
+            text.contains("0 samples"),
+            "an unmeasured series must not be reported as a measurement:\n{text}"
+        );
+        assert!(
+            text.contains("1 of 4"),
+            "one series missed; the header says otherwise:\n{text}"
+        );
+    }
+
+    /// The failure text is rendering over a report that is already decided.
+    /// It reads thresholds and verdicts and writes nothing, so a passing run
+    /// has nothing for it to say and every verdict is what it was.
+    #[test]
+    fn the_failure_text_changes_no_verdict_and_a_passing_run_produces_none() {
+        let before = report_on(slow_committer());
+        let after = report_on(slow_committer());
+        let _ = gate_failure_report(&after);
+        for key in SERIES_KEYS {
+            assert_eq!(
+                before.series[key].gate, after.series[key].gate,
+                "{key}'s verdict moved"
+            );
+            assert_eq!(
+                before.series[key].threshold_us, after.series[key].threshold_us,
+                "{key}'s threshold moved"
+            );
+        }
+        assert_eq!(before.gate, after.gate);
+        // A passing run never reaches the failure path at all.
+        let passing = report_on(conforming());
+        assert_eq!(passing.gate, GateVerdict::Pass);
+        assert_eq!(run_gate_on(conforming()), ExitCode::SUCCESS);
     }
 }
