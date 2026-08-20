@@ -519,11 +519,39 @@ jobs:
       # No FoundationDB here on purpose. Authority lives in the registrar, and
       # the criterion is about what happens when a holder dies, so the volatile
       # lease store is the honest configuration (see the script's header).
-      - name: Run the island gate
+      #
+      # Two runs, because the criterion has two halves and one run only ever
+      # exercises one of them. `P3_VICTIM_CLAIM_KIND` decides which: the weak
+      # leg's rows are *redistributed* to survivors, the strong leg's *park*
+      # and stay reserved for the peer that died (D7 §5, §4.3). Only the weak
+      # leg ran here until #129, and the strong leg had been unpassable for
+      # months without anything noticing — every correctly parked row was
+      # reported lost. The 30 s island is nothing beside the build above; an
+      # unrun leg costs far more (AGENTS.md §A `--self-test` nothing runs is
+      # not a check).
+      - name: Run the island gate (weak claims — the redistribution half)
         env:
           PERSISTD_BIN: ${{ github.workspace }}/target/release/persistd
           COORDINATOR_BIN: ${{ github.workspace }}/target/release/orrery-coordinator
           P3_ISLAND_BIN: ${{ github.workspace }}/p3-island/target/release/p3-island
+          P3_VICTIM_CLAIM_KIND: weak
+        run: scripts/p3-island-gate.sh
+
+      # Runs even when the weak leg failed, so one red leg does not hide the
+      # other's verdict: they fail for different reasons and both answers are
+      # wanted. `!cancelled()` rather than `always()` — a cancelled job should
+      # stop, and a build failure earlier in the job surfaces here as the
+      # script's own "not an executable" refusal rather than as a mystery.
+      # The default output directory is `p3-island-<utc stamp>`, so the two
+      # runs land in two directories and both are uploaded below; which leg a
+      # directory holds is recorded inside its own `report.json`.
+      - name: Run the island gate (strong claims — the parking half)
+        if: ${{ !cancelled() }}
+        env:
+          PERSISTD_BIN: ${{ github.workspace }}/target/release/persistd
+          COORDINATOR_BIN: ${{ github.workspace }}/target/release/orrery-coordinator
+          P3_ISLAND_BIN: ${{ github.workspace }}/p3-island/target/release/p3-island
+          P3_VICTIM_CLAIM_KIND: strong
         run: scripts/p3-island-gate.sh
 
       - name: Upload the gate's evidence

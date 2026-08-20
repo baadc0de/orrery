@@ -255,37 +255,81 @@ gate_p3_island_prereq() {
   have_cargo || { echo 'cargo is not on PATH'; return 1; }
   return 0
 }
+# **Both legs, because a leg nothing runs is not a gate** (#129, AGENTS.md §A
+# `--self-test` nothing runs is not a check). `P3_VICTIM_CLAIM_KIND` selects
+# which half of the criterion a run exercises — `weak` redistributes, `strong`
+# parks — and only the weak one was ever run anywhere. The strong leg was
+# broken for months: every parked row was reported lost, the leg could not
+# pass, and nothing said so because nothing ran it. The build dominates the
+# cost; a second 30 s island is the cheapest insurance in this file.
 gate_p3_island_run() {
   {
     cargo build --release --manifest-path "$ROOT/Cargo.toml" \
       -p orrery_persistd -p orrery_coordinator
     (cd "$ROOT/p3-island" && cargo build --release)
-    PERSISTD_BIN="$ROOT/target/release/persistd" \
-    COORDINATOR_BIN="$ROOT/target/release/orrery-coordinator" \
-    P3_ISLAND_BIN="$ROOT/p3-island/target/release/p3-island" \
-    P3_GATE_OUT="$OUT/p3-island-$(date -u +%Y%m%dT%H%M%SZ)" \
-      "$ROOT/scripts/p3-island-gate.sh"
+    local leg
+    for leg in weak strong; do
+      PERSISTD_BIN="$ROOT/target/release/persistd" \
+      COORDINATOR_BIN="$ROOT/target/release/orrery-coordinator" \
+      P3_ISLAND_BIN="$ROOT/p3-island/target/release/p3-island" \
+      P3_VICTIM_CLAIM_KIND="$leg" \
+      P3_GATE_OUT="$OUT/p3-island-$leg-$(date -u +%Y%m%dT%H%M%SZ)" \
+        "$ROOT/scripts/p3-island-gate.sh" || return 1
+    done
   } >"$OUT/logs/p3-island.log" 2>&1
 }
 # The gate writes to `$(pwd)/p3-island-<stamp>` by default and to $OUT when
-# this script drives it; both are searched, newest first, because an evidence
-# reader that only knew about its own runs would report NOT RUN on a directory
-# a human produced ten minutes earlier.
+# this script drives it; both are searched, because an evidence reader that
+# only knew about its own runs would report NOT RUN on a directory a human
+# produced ten minutes earlier.
+#
+# **One row per leg, not one row for the newest run.** With two legs, "newest
+# directory wins" would report whichever ran last and silently drop the other
+# — and dropping the strong leg is exactly the failure this gate just came
+# out of. Which leg a directory holds is read from `victim_claim_kind` inside
+# the report rather than off the directory name: the harness records the tier
+# it actually claimed at, and a name is a label somebody typed.
 gate_p3_island_evidence() {
-  local dir
-  dir=$(ls -1d "$OUT"/p3-island-* "$ROOT"/p3-island-* 2>/dev/null | sort | tail -1) || true
-  [[ -n ${dir:-} && -r $dir/report.json ]] || { ev_none; return 0; }
-  local numbers status
-  numbers=$(jq -c '{
-    peers, entities_total, victim_entities, victim_claim_kind,
-    reassigned, parked, successors,
-    settled_in_ms, settle_budget_ms, lease_ttl_ms,
-    reassigned_in_ms, parked_observed_in_ms,
-    duplicate_authority, survivor_leases_lost,
-    claimable_after_settle, lost: (.lost | length)
-  }' "$dir/report.json" 2>/dev/null || echo '{}')
-  if [[ -e $dir/PASSED ]]; then status=PASSED; else status=FAILED; fi
-  ev "$status" "$dir" "$numbers"
+  local dir leg
+  declare -A leg_dir=()
+  while read -r dir; do
+    [[ -n $dir && -r $dir/report.json ]] || continue
+    leg=$(jq -r '(.victim_claim_kind // empty) | ascii_downcase' "$dir/report.json" 2>/dev/null) || continue
+    [[ -n $leg ]] || continue
+    # Ascending, so the last directory seen for a leg is its newest run.
+    leg_dir[$leg]=$dir
+  done < <(ls -1d "$OUT"/p3-island-* "$ROOT"/p3-island-* 2>/dev/null | sort)
+  (( ${#leg_dir[@]} )) || { ev_none; return 0; }
+
+  local numbers='{}' evidence='' status=PASSED one
+  for leg in "${!leg_dir[@]}"; do
+    dir=${leg_dir[$leg]}
+    # Every figure is lifted from the gate's own report and prefixed with the
+    # leg it belongs to; nothing here recomputes a number the harness already
+    # published, including the new disposition split — `parked_and_reserved`
+    # is the count of the victim's rows the registrar refused to regrant
+    # because they are reserved for it (D7 §4.3), and it is neither a
+    # reassignment nor a loss.
+    one=$(jq -c --arg leg "$leg" '{
+      peers, entities_total, victim_entities,
+      reassigned, parked, successors,
+      parked_and_reserved, claimable_after_settle,
+      unreachable_after_settle,
+      refused: (.refused_after_settle | length),
+      lost: (.lost | length),
+      settled_in_ms, settle_budget_ms, lease_ttl_ms,
+      reassigned_in_ms, parked_observed_in_ms,
+      duplicate_authority, survivor_leases_lost
+    } | with_entries(select(.value != null)) | with_entries(.key |= ($leg + "_" + .))' \
+      "$dir/report.json" 2>/dev/null || echo '{}')
+    numbers=$(jq -cs 'add' <<<"$numbers
+$one")
+    evidence="${evidence:+$evidence }$dir"
+    # A leg with no success artifact drags the row down: the gate writes it
+    # last and writes it nowhere else, so its absence is the leg saying no.
+    [[ -e $dir/PASSED ]] || status=FAILED
+  done
+  ev "$status" "$evidence" "$numbers"
 }
 
 # ── P3 sibling gateways ──────────────────────────────────────────────────────
@@ -830,6 +874,14 @@ self_test() {
   rm -f "$fdb_probe"
   has_head "grep -c '^\`'" \
     || die "self-test: the P2 fresh-cluster pre-check is gone; the gate would be pointed at an already-activated cluster and its failure read as a defect"
+  # The P3 island criterion has two halves and one environment variable that
+  # picks between them, and for months only the `weak` half was ever run —
+  # which is how #129 (the strong leg reporting every correctly-parked entity
+  # as lost) survived undetected. Asserted against the runner in the head
+  # region, where the string occurs exactly once and only as the loop that
+  # drives the legs; deleting the strong leg from it fails here.
+  has_head 'for leg in weak strong' \
+    || die 'self-test: the island gate no longer runs both claim tiers; a leg nothing runs is not a gate'
 
   # ── Functional half ────────────────────────────────────────────────────────
   local dir
@@ -1013,6 +1065,54 @@ EOF
   st_run --inspect; without_marker=$(cat "$dir/report")
   grep -qE '^  FAILED +nightly:p1-swarm' <<<"$without_marker" \
     || die 'self-test: reports without the success artifact read as a pass; the artifact is what the gate writes last'
+
+  # 10. The P3 island gate has two legs, and the report must carry both of them
+  #     — with the disposition each leg actually produced. Fabricated here in
+  #     the synthetic tree for the same reason as clause 9: it is the only way
+  #     to check that these numbers are *read* rather than re-derived.
+  #
+  #     The strong leg is the one this clause exists for. Its rows park and
+  #     stay reserved for the peer that died (D7 §4.3), the gate reported all
+  #     fifty of them lost until #129, and a reader that showed only the newest
+  #     run would have shown whichever leg happened to finish last.
+  mkdir -p "$dir/out/p3-island-weak-20260101T000000Z" \
+           "$dir/out/p3-island-strong-20260101T000100Z"
+  jq -n '{peers: 8, entities_total: 400, victim_entities: 50,
+          victim_claim_kind: "Weak", reassigned: 50, parked: 0, successors: 7,
+          parked_and_reserved: 0, claimable_after_settle: 0,
+          unreachable_after_settle: 0, refused_after_settle: [], lost: [],
+          settled_in_ms: 9938, settle_budget_ms: 12050, lease_ttl_ms: 10000,
+          duplicate_authority: 0, survivor_leases_lost: 0}' \
+    >"$dir/out/p3-island-weak-20260101T000000Z/report.json"
+  jq -n '{peers: 8, entities_total: 400, victim_entities: 50,
+          victim_claim_kind: "Strong", reassigned: 0, parked: 50, successors: 0,
+          parked_and_reserved: 50, claimable_after_settle: 0,
+          unreachable_after_settle: 0, refused_after_settle: [], lost: [],
+          settled_in_ms: 10700, settle_budget_ms: 12050, lease_ttl_ms: 10000,
+          duplicate_authority: 0, survivor_leases_lost: 0}' \
+    >"$dir/out/p3-island-strong-20260101T000100Z/report.json"
+  touch "$dir/out/p3-island-weak-20260101T000000Z/PASSED" \
+        "$dir/out/p3-island-strong-20260101T000100Z/PASSED"
+  cat >>"$dir/.github/workflows/nightly.yml" <<'EOF'
+  p3-island:
+    runs-on: ubuntu-latest
+    steps:
+      - run: scripts/p3-island-gate.sh
+EOF
+  local both_legs
+  st_run --inspect; both_legs=$(cat "$dir/report")
+  grep -q 'weak_reassigned=50' <<<"$both_legs" \
+    || die 'self-test: the weak leg vanished from the island row; the newest run is not the only leg'
+  grep -q 'strong_parked_and_reserved=50' <<<"$both_legs" \
+    || die "self-test: the strong leg's parked-and-reserved count is not read out of its report; it is the number #129 was about"
+  grep -qE '^  PASSED +nightly:p3-island' <<<"$both_legs" \
+    || die 'self-test: two passing island legs were not reported as a pass'
+  # And one failing leg is a failing gate, however green the other one is.
+  rm -f "$dir/out/p3-island-strong-20260101T000100Z/PASSED"
+  local one_leg_down
+  st_run --inspect; one_leg_down=$(cat "$dir/report")
+  grep -qE '^  FAILED +nightly:p3-island' <<<"$one_leg_down" \
+    || die 'self-test: a failed island leg was hidden by a passing one; a per-leg row that cannot go red is not a report'
 
   rm -rf "$dir"
   trap - EXIT

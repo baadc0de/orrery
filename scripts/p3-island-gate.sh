@@ -103,6 +103,16 @@ DURATION_SECS=${P3_DURATION_SECS:-30}
 # `strong` is the case D7 §5 refuses to redistribute without consent, so every
 # one of the victim's entities parks instead. Both are correct registrar
 # behaviour and the criterion accepts both.
+#
+# **One run is half a gate.** This variable's default is the only reason the
+# weak leg is the one anybody sees, and until #129 it was also the only reason
+# the strong leg's defect survived: its parked rows were reported lost, the leg
+# could not pass, and nothing ran it to say so. Both legs now run in
+# `nightly.yml`'s `p3-island` job and in `scripts/gate-status.sh --full`, as
+# two invocations of this script with the variable set either way. This script
+# still runs exactly one leg per invocation — the choice belongs to whoever
+# drives it — but "the default was never changed" is not a reason for a leg to
+# go unrun.
 VICTIM_CLAIM_KIND=${P3_VICTIM_CLAIM_KIND:-weak}
 # The island's cell. Level 21 origin, matching the harness default.
 CELL=${P3_CELL:-0x8000000000000000}
