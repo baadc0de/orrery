@@ -66,6 +66,17 @@ enum RawEntry {
     },
 }
 
+/// The keyed metadata a release re-anchors above its cut, snapshotted under
+/// the index lock and written without it.
+#[cfg(feature = "chain-grpc")]
+struct ReleaseMetadata {
+    chain_state: Vec<(Vec<u8>, Vec<u8>)>,
+    adoptions: Vec<(Vec<u8>, Vec<u8>)>,
+}
+
+#[cfg(not(feature = "chain-grpc"))]
+struct ReleaseMetadata {}
+
 /// A running chain's claim on the records this journal may release (D20).
 #[derive(Clone, Copy, Debug)]
 struct ChainClaim {
@@ -117,6 +128,9 @@ pub struct Journal {
     closed: std::sync::atomic::AtomicBool,
     metrics: Arc<JournalCommitMetrics>,
     published: broadcast::Sender<JournalRecord>,
+    /// Serializes releases (D20), so each one can take the index lock in short
+    /// sections instead of holding it across its WAL work.
+    release: std::sync::Mutex<()>,
     /// The outbound chain's claim on this journal (D20). `None` when no chain
     /// has registered, in which case retention answers to the checkpoint floor
     /// alone.
@@ -257,6 +271,7 @@ impl Journal {
             closed: std::sync::atomic::AtomicBool::new(false),
             metrics,
             published,
+            release: std::sync::Mutex::new(()),
             chain_floor: std::sync::Mutex::new(None),
             #[cfg(test)]
             scan_fault: std::sync::atomic::AtomicBool::new(false),
@@ -424,31 +439,81 @@ impl Journal {
             return Err(JournalError::Closed);
         }
 
-        let mut index = write_index(&self.index)?;
-        let floor_now = index.released_below.unwrap_or(Lsn::new(0, 0));
-        if before <= floor_now {
-            return Ok(JournalRelease::blocked(
-                before,
-                floor_now,
-                ReleaseBlocked::AlreadyReleased,
-            ));
-        }
+        // Serialize releases against each other. Only the checkpoint scheduler
+        // calls this today, but the lock is what lets every step below take the
+        // index lock briefly instead of holding it across the whole operation.
+        let _release = self.release.lock().expect("journal release lock");
 
-        // A follower's mirror is not released. `chain_grpc::rebuild_cursor`
-        // reconstructs the durable cursor by walking the provenance index from
-        // batch zero and stopping at the first gap, so releasing a prefix of it
-        // would rebuild an empty cursor and cost a full re-stream of the
-        // primary's journal — the failure `refuse_sibling_epoch` documents.
-        // Bounding a follower's mirror needs that cursor persisted first; until
-        // it is, the primary is what retention covers (D20 §residual).
-        #[cfg(feature = "chain-grpc")]
-        if !index.chain_records.is_empty() {
-            return Ok(JournalRelease::blocked(
-                before,
-                floor_now,
-                ReleaseBlocked::FollowerProvenance,
-            ));
-        }
+        // **No WAL call happens while the index lock is held.** The group
+        // committer appends, syncs, and *then* takes the index write lock, so a
+        // release that held the index lock across `append`/`sync` would deadlock
+        // against it: the committer waits for the index while the release waits
+        // for the WAL. The lock order is therefore one way for both — WAL
+        // first, index second — and the release takes the index in short,
+        // separate sections around its WAL work.
+        let (floor_now, cut, metadata) = {
+            let index = read_index(&self.index)?;
+            let floor_now = index.released_below.unwrap_or(Lsn::new(0, 0));
+            if before <= floor_now {
+                return Ok(JournalRelease::blocked(
+                    before,
+                    floor_now,
+                    ReleaseBlocked::AlreadyReleased,
+                ));
+            }
+
+            // A follower's mirror is not released. `chain_grpc::rebuild_cursor`
+            // reconstructs the durable cursor by walking the provenance index
+            // from batch zero and stopping at the first gap, so releasing a
+            // prefix of it would rebuild an empty cursor and cost a full
+            // re-stream of the primary's journal — the failure
+            // `refuse_sibling_epoch` documents. Bounding a follower's mirror
+            // needs that cursor persisted first; until it is, the primary is
+            // what retention covers (D20 §residual).
+            #[cfg(feature = "chain-grpc")]
+            if !index.chain_records.is_empty() {
+                return Ok(JournalRelease::blocked(
+                    before,
+                    floor_now,
+                    ReleaseBlocked::FollowerProvenance,
+                ));
+            }
+
+            // The cut is the lowest physical position any *retained* record
+            // occupies. Taken as a minimum over the retained range rather than
+            // as the first entry's position, so the invariant it rests on —
+            // that logical and physical order agree — is enforced here rather
+            // than assumed. With nothing retained, the cut is the current tail:
+            // every byte written so far is releasable, and the marker below
+            // carries the positions that would otherwise be derived from the
+            // dropped records. Records appended after this point take LSNs
+            // above `before` and land above the cut, so a concurrent committer
+            // cannot invalidate it.
+            let cut = index
+                .records
+                .range(before..)
+                .map(|(_, location)| location.physical.get())
+                .min()
+                .unwrap_or_else(|| self.wal.len());
+
+            #[cfg(feature = "chain-grpc")]
+            let metadata = ReleaseMetadata {
+                chain_state: index
+                    .chain_state
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect(),
+                adoptions: index
+                    .adoptions
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect(),
+            };
+            #[cfg(not(feature = "chain-grpc"))]
+            let metadata = ReleaseMetadata {};
+
+            (floor_now, cut, metadata)
+        };
 
         // A lagging follower resumes by rescanning *this* journal from its own
         // watermark (`chain::spawn_chain_from`), so the floor is bounded by
@@ -479,40 +544,18 @@ impl Journal {
 
         let bytes_before = dir_bytes(&self.wal_dir);
 
-        // Step 1. The cut is the lowest physical position any *retained* record
-        // occupies. Taken as a minimum over the retained range rather than as
-        // the first entry's position, so the invariant it rests on — that
-        // logical and physical order agree — is enforced here rather than
-        // assumed. With nothing retained, the cut is the current tail: every
-        // byte written so far is releasable and the marker below carries the
-        // positions that would otherwise be derived from the dropped records.
-        let cut = index
-            .records
-            .range(before..)
-            .map(|(_, location)| location.physical.get())
-            .min()
-            .unwrap_or_else(|| self.wal.len());
-
-        // Step 2. Re-anchor keyed metadata above the cut.
+        // Step 1 (no index lock). Re-anchor keyed metadata above the cut: chain
+        // state and adoption markers are maps rebuilt by replaying the log, so
+        // a copy has to exist above the cut before the originals are dropped.
         #[cfg(feature = "chain-grpc")]
         {
-            let chain_state: Vec<(Vec<u8>, Vec<u8>)> = index
-                .chain_state
-                .iter()
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect();
-            for (key, value) in chain_state {
+            for (key, value) in metadata.chain_state {
                 append_metadata_unsynced(
                     &self.wal,
                     &RawEnvelope::V1(RawEntry::ChainState { key, value }),
                 )?;
             }
-            let adoptions: Vec<(Vec<u8>, Vec<u8>)> = index
-                .adoptions
-                .iter()
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect();
-            for (key, value) in adoptions {
+            for (key, value) in metadata.adoptions {
                 let value = prune_adoption_marker(&value, before)?;
                 append_metadata_unsynced(
                     &self.wal,
@@ -520,8 +563,13 @@ impl Journal {
                 )?;
             }
         }
+        #[cfg(not(feature = "chain-grpc"))]
+        let ReleaseMetadata {} = metadata;
 
-        // Step 3. The marker, then the barrier.
+        // Step 2 (no index lock). The marker, then the barrier. Until this
+        // returns nothing has changed: a crash here reopens at the old floor
+        // with a duplicate copy of some metadata, which replay folds
+        // idempotently.
         let next_lsn = *self.cursor.lock().expect("journal cursor lock");
         let committed = self.committer.committed();
         append_metadata_unsynced(
@@ -536,7 +584,24 @@ impl Journal {
             .sync()
             .map_err(|error| JournalError::Store(format!("sync release marker: {error}")))?;
 
-        // Step 4. Drop the segments, then the index entries.
+        // Step 3 (index lock, briefly). Prune what the durable marker now says
+        // is gone. Nothing between here and the marker can have lowered the
+        // floor: `_release` is the only writer of it.
+        let records_dropped = {
+            let mut index = write_index(&self.index)?;
+            let retained = index.records.split_off(&before);
+            let dropped = index.records.len() as u64;
+            index.records = retained;
+            index.released_below = Some(before);
+            index.released_next_lsn = Some(next_lsn);
+            index.released_committed = committed;
+            #[cfg(feature = "chain-grpc")]
+            index.adopted_records.retain(|_, local| *local >= before);
+            dropped
+        };
+
+        // Step 4 (no index lock). Drop the segments the marker already
+        // accounted for.
         let head = self
             .wal
             .truncate_before(wal_db::Lsn::new(cut))
@@ -545,16 +610,6 @@ impl Journal {
             head.get() <= cut,
             "wal-db moved the head above the requested cut"
         );
-
-        let retained = index.records.split_off(&before);
-        let records_dropped = index.records.len() as u64;
-        index.records = retained;
-        index.released_below = Some(before);
-        index.released_next_lsn = Some(next_lsn);
-        index.released_committed = committed;
-        #[cfg(feature = "chain-grpc")]
-        index.adopted_records.retain(|_, local| *local >= before);
-        drop(index);
 
         Ok(JournalRelease {
             requested: before,
@@ -569,12 +624,20 @@ impl Journal {
     /// Register an outbound chain: nothing is released until its follower
     /// watermark is known (D20).
     ///
+    /// `bounds_retention` says whether that watermark will be a position in
+    /// *this* journal's LSN space. It is false for a promotion-adopted chain,
+    /// which echoes the source's LSNs, and such a chain blocks release for as
+    /// long as it is registered rather than lifting the block with a number
+    /// that means something else.
+    ///
     /// A registration lasts for the life of the journal. A chain that has
     /// *stopped* — faulted, or its follower gone — keeps its claim, because a
     /// follower that is behind and unreachable is exactly the one that would
     /// lose the records a release reclaims. Retention resumes when a chain
     /// probes successfully again, and until it does the reason the journal is
     /// not shrinking is reported as [`ReleaseBlocked::ChainLag`].
+    ///
+    /// [`ReleaseBlocked::ChainLag`]: crate::journal::ReleaseBlocked::ChainLag
     pub fn register_chain(&self, bounds_retention: bool) {
         *self.chain_floor.lock().expect("chain floor lock") = Some(ChainClaim {
             bounds: bounds_retention,

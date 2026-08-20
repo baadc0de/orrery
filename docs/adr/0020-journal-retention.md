@@ -91,26 +91,35 @@ this change adds precisely so the comparison is a flag rather than a rebuild.
 arms on an ephemeral `c4d-standard-32-lssd` in `us-central1-b` — the shape
 D19's Phase 4 pairs ran on — with the journal on local NVMe (ext4 `noatime`)
 and FoundationDB 7.3.77 beside it. The host cleared D19's own `fio`
-qualification first: 470 IOPS sustained per job at **`fdatasync` p99 0.146 ms,
-max 0.22 ms**, against a requirement of max < 1 ms.
+qualification first, on an idle box: 470 IOPS sustained per job at
+**`fdatasync` p99 0.06 ms, max 0.17 ms**, against a requirement of max < 1 ms.
 
-| arm | gate | `journal_commit_ms` p99 / max | recovery | releases |
-|---|---|---:|---|---:|
-| retention **on** | **pass** | 1 / 3.5 ms | pass | 14 |
-| retention off | pass | 1 / 15 ms | pass | 0 |
-| retention off | pass | 1 / 20 ms | pass | 0 |
-| retention **on** | **pass** | 1 / 15 ms | pass | 16 |
+| arm | gate | `journal_commit_ms` p99 | max | recovery | releases |
+|---|---|---:|---:|---|---:|
+| retention **on** | **pass** | 1 ms | 4 ms | pass | 13 |
+| retention off | pass | 1 ms | 15 ms | pass | 0 |
+| retention off | pass | 1 ms | 20 ms | pass | 0 |
+| retention **on** | **pass** | 1 ms | 50 ms | pass | 17 |
 
-Retention was demonstrably *active* in both of its arms rather than idle: 14
-and 16 releases inside a 30-second load phase, the first of them dropping
-233 465 records out of the index. Every arm's recovery verifier passed against
+Retention was demonstrably *active* in both of its arms rather than idle: 13
+and 17 releases inside a 30-second load phase, the first of them dropping
+233 208 records out of the index. Every arm's recovery verifier passed against
 every pre-crash acknowledgement — 10 000 bulk rows and ~15 900 intents checked
 against ~541 000 eligible durable acks — so an acknowledged write survived a
-`kill -9` on a journal that had been released out from under it sixteen times.
-The retention arms' `journal_commit_ms` maxima are *lower* than the controls',
-which is variance rather than an improvement; the honest reading is that
-retention is not visible in the gate's latency at all. Evidence:
+`kill -9` on a journal that had been released out from under it seventeen
+times.
+
+The maxima column is left in and deliberately not summarized: each is a single
+sample out of ~535 000, they scatter in both directions (4 ms and 50 ms with
+retention, 15 ms and 20 ms without), and they support no ordering between the
+arms. What the gate judges is the p99, and that is 1 ms in every arm. Evidence:
 [`docs/data/p2-retention-gate-2026-08-20.json`](../data/p2-retention-gate-2026-08-20.json).
+
+One methodological note worth carrying: an earlier `fio` on the same host,
+taken *while a build was competing for the device*, reported the same p99 with
+a **143 ms** maximum. The qualification measures contention as readily as it
+measures the device, so it belongs on an idle box — before the load, not beside
+it.
 
 **The same comparison on an unqualified host says the same thing, negatively.**
 Four arms on the self-hosted runner failed the 2 ms `journal_commit_ms` budget
@@ -160,7 +169,21 @@ combination is a checkpoint older than its own journal, and serving it would be
 silent data loss. A shard with no coverage claim at all is skipped rather than
 refused, because rule 2 means it can only have appeared after the release.
 
-**5. The release is durable before it is destructive.** The order is: take the
+**5. No WAL call happens under the index lock.** The group committer appends,
+syncs, and *then* takes the index write lock to record where the records
+landed; so the lock order is WAL first, index second, for the release path too.
+A release that held the index lock across its own `append`/`sync` inverts that
+— the committer waits for the index while the release waits for the WAL — and
+the two wedge. That is not hypothetical: the first implementation did exactly
+this, survived every single-threaded test, and hung the workspace suite. The
+release therefore snapshots what it needs under a short read lock, does its WAL
+work with no lock held, and takes the write lock again only to prune. A
+separate mutex serializes releases against each other, which is what makes the
+short sections safe. `releases_interleave_with_concurrent_appends` holds it,
+with its deadline enforced on the test's own thread rather than by a future on
+the wedged runtime.
+
+**6. The release is durable before it is destructive.** The order is: take the
 physical cut; re-anchor the keyed metadata the surviving suffix needs (chain
 state, adoption markers, the latter pruned of records the release drops); write
 a release marker carrying the floor, the next LSN and the committed watermark;
@@ -171,7 +194,7 @@ that would otherwise be *derived* from records that are no longer there —
 without them a journal released to empty reopens at 0:0 and re-mints LSNs it
 has already acknowledged to clients.
 
-**6. Two D16 parameters.** `journal_retention` (default on) and
+**7. Two D16 parameters.** `journal_retention` (default on) and
 `journal_open_ms` — a **budget of 2 000 ms** for `Journal::open` on a node
 within its retention floor, which is the measured cost of ~500 000 records and
 a deliberately loose ceiling over the ~20 s of records a 20 s checkpoint
@@ -179,13 +202,13 @@ cadence can leave behind. It is a budget to be measured against, not a
 mechanism: nothing enforces it yet, and the first thing that should is the P2
 gate's recovery phase.
 
-**7. Retention is switchable.** `persistd --no-journal-retention` turns it off,
+**8. Retention is switchable.** `persistd --no-journal-retention` turns it off,
 which is what a bisect needs — one binary, one host, one build — and what an
 operator needs when a journal has to be kept for forensics. It is not a tuning
 knob: with it off, both journal disk and the index rebuilt from it at every
 open grow with the node's uptime.
 
-**8. The Fjall fallback does not implement retention.** It answers the release
+**9. The Fjall fallback does not implement retention.** It answers the release
 call with `ReleaseBlocked::Unsupported` rather than refusing it, so the driver
 runs identically under either backend and a Fjall journal that never shrinks
 reports a reason. D19 keeps that backend as a rollback path, not as a second

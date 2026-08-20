@@ -425,3 +425,87 @@ async fn an_adopted_chain_never_lifts_its_own_block() {
     assert_eq!(journal.released_floor(), Lsn::new(0, 0));
     journal.close().await.expect("close");
 }
+
+/// A release must not deadlock against the group committer, and this is the
+/// test that says so because the first implementation did.
+///
+/// The committer's order is WAL first, index second: it appends, syncs, and
+/// *then* takes the index write lock to record where the records landed. A
+/// release that held the index lock across its own `append`/`sync` inverted
+/// that — the committer waited for the index while the release waited for the
+/// WAL — and the two wedged. It survived every single-threaded test in this
+/// file and hung the workspace suite instead.
+///
+/// Two details make this fail rather than hang. The deadline is enforced by
+/// `recv_timeout` on the *main* test thread, not by a future on the runtime,
+/// because a wedged runtime is exactly the state under test and a timeout that
+/// needs a worker to poll it is a timeout that never fires. And the workers are
+/// OS threads for the same reason.
+#[test]
+fn releases_interleave_with_concurrent_appends() {
+    use std::sync::mpsc;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .build()
+        .expect("runtime");
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let journal = Arc::new(Journal::open(&config(dir.path())).expect("open"));
+
+    // Prime the journal so the first release has something to drop.
+    let lsns = runtime.block_on(fill(&journal, 200));
+    let floor = Arc::new(std::sync::Mutex::new(lsns[100]));
+
+    let (done_tx, done_rx) = mpsc::channel();
+    for w in 0..3u64 {
+        let journal = Arc::clone(&journal);
+        let handle = runtime.handle().clone();
+        let done = done_tx.clone();
+        std::thread::spawn(move || {
+            for i in 0..400u64 {
+                let append = journal.append(mk_record(w * 1000 + i)).expect("append");
+                if i % 50 == 0 {
+                    handle.block_on(append.committed()).expect("durable");
+                }
+            }
+            let _ = done.send(());
+        });
+    }
+    {
+        let journal = Arc::clone(&journal);
+        let floor = Arc::clone(&floor);
+        let done = done_tx.clone();
+        std::thread::spawn(move || {
+            for _ in 0..40 {
+                let at = *floor.lock().expect("floor");
+                let release = journal.release_before(at).expect("release");
+                // Advance the floor toward the committed watermark, the way the
+                // checkpoint scheduler does.
+                *floor.lock().expect("floor") = journal.committed().max(release.floor);
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            let _ = done.send(());
+        });
+    }
+    drop(done_tx);
+
+    for worker in 0..4 {
+        done_rx
+            .recv_timeout(Duration::from_secs(30))
+            .unwrap_or_else(|_| {
+                panic!("appends and releases deadlocked: {worker} of 4 workers finished")
+            });
+    }
+
+    // And the journal is still coherent: everything at or above the floor is
+    // readable, and nothing below it is served.
+    let retained = journal.released_floor();
+    for record in journal.scan_from(retained) {
+        record.expect("scan a retained record");
+    }
+    runtime.block_on(journal.close()).expect("close");
+}

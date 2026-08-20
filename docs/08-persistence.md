@@ -3455,7 +3455,7 @@ the full event history has to land the tailer first, and when it does it
 contributes one more watermark to the same minimum rather than needing a
 different mechanism. The P2 kill-9 gate holds with retention on: four
 alternating arms on a qualified `c4d-standard-32-lssd` passed 4/4, retention
-releasing 14 and 16 times inside its two arms' 30-second load phases, with
+releasing 13 and 17 times inside its two arms' 30-second load phases, with
 `journal_commit_ms` p99 at 1 ms in every arm and every pre-crash
 acknowledgement recovered (docs/data/p2-retention-gate-2026-08-20.json). The
 residual D20 names is the *follower's* mirror, which is still unbounded: releasing a prefix of its provenance index would rebuild an
