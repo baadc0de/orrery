@@ -82,6 +82,7 @@ readonly WORKSPACES=(
     'p2-dashboard    test'
     'p2-load         test'
     'p3-island       check'
+    'p3-siblings     test'
     'p4-streams-bench test'
     'p2-journal-bench check'
 )
@@ -213,6 +214,7 @@ lane_gates() {
     # stages that make them proofs.
     run scripts/p2-kill9-gate.sh --self-test
     run scripts/p3-island-gate.sh --self-test
+    run scripts/p3-siblings-gate.sh --self-test
     run scripts/p1-swarm-gate.sh --self-test
     run scripts/fdb-tests.sh --self-test
 

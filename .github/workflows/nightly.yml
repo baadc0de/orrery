@@ -535,6 +535,69 @@ jobs:
           retention-days: 14
           if-no-files-found: warn
 
+  p3-siblings:
+    name: P3 sibling gateways (two persistd, disjoint shards, FoundationDB)
+    # Hosted, and for the same reason `p2-kill9` is: this gate seeds a durable
+    # world and activates two shard sets against the fence, so it consumes its
+    # cluster. Provisioning a throwaway one means `sudo dpkg -i` on the server
+    # package, which the self-hosted box's unprivileged `ci` user cannot do —
+    # and the cluster that box *does* run is the shared development database
+    # this gate must never be pointed at.
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install the pinned toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: nightly-p3s-${{ hashFiles('Cargo.toml', 'crates/*/Cargo.toml', 'vendor/*/Cargo.toml', 'rust-toolchain.toml') }}
+          restore-keys: nightly-p3s-
+
+      # Two live gateways must share one durable fence and one lease tier, so
+      # unlike the P3 island gate this one cannot run without a server.
+      - name: Install FoundationDB with a local cluster
+        uses: ./.github/actions/foundationdb
+        with:
+          server: "true"
+
+      # Release binaries: both criteria are about what a registrar does inside
+      # a 10 s lease TTL, and debug builds change the timing enough to make a
+      # pass or a failure mean something different.
+      - name: Build the fdb-enabled binaries
+        run: |
+          set -euo pipefail
+          cargo build --release -p orrery_persistd --features fdb
+          cargo build --release -p orrery_seed --features orrery_seed/fdb
+          cargo build --release -p orrery_coordinator
+
+      - name: Build the sibling harness
+        working-directory: p3-siblings
+        run: cargo build --release
+
+      - name: Run the sibling-gateway gate
+        env:
+          ORRERY_FDB_CLUSTER_FILE: /etc/foundationdb/fdb.cluster
+          PERSISTD_BIN: ${{ github.workspace }}/target/release/persistd
+          COORDINATOR_BIN: ${{ github.workspace }}/target/release/orrery-coordinator
+          ORRERY_SEED_BIN: ${{ github.workspace }}/target/release/orrery-seed
+          P3_SIBLINGS_BIN: ${{ github.workspace }}/p3-siblings/target/release/p3-siblings
+        run: scripts/p3-siblings-gate.sh
+
+      - name: Upload the gate's evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: p3-siblings-evidence
+          path: p3-siblings-*/
+          retention-days: 14
+          if-no-files-found: warn
+
   p2-kill9:
     name: P2 kill-9 gate (FoundationDB)
     runs-on: ubuntu-latest
