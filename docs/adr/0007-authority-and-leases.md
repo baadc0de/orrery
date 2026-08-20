@@ -1,6 +1,8 @@
 # ADR-0007: Authority: two-tier claims, cluster-arbitered leases
 
-**Status:** Accepted · **Date:** 2026-08-11 · **Decision:** D7
+**Status:** Accepted; successor locality qualified by
+[ADR-0026](0026-sibling-gateways.md) ·
+**Date:** 2026-08-11 · **Decision:** D7
 
 This decision is normative. See the [ADR index](../DECISIONS.md) for precedence, scope, and the complete decision set.
 

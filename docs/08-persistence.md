@@ -1996,9 +1996,22 @@ pub struct CellActorState {
 
 `EntityRecord` stores components as individually `postcard`-encoded byte slices (`orrery_protocol` types): diffs apply by slot replacement without decoding, checkpoints serialize by concatenation, and the actor never needs the game's component types — only the `Ruleset` does.
 
-### 3.2 Placement: rendezvous hashing over shard cells
+### 3.2 Placement: the `actor/` row is the owner ([D26](adr/0026-sibling-gateways.md))
 
-Shard cells map to nodes by **rendezvous (HRW) hashing**: `owner(shard) = argmax_n weight_n · h(shard_id, node_id)`. Properties we need and get: no central assignment table for the common case, minimal disruption when nodes join/leave (only shards whose argmax changed move), and capacity weighting. The authoritative placement record (for fencing and splits, §3.4/§3.5) lives in FDB at `actor/{shard_cell_id}`; gateways cache the HRW result and repair on epoch-mismatch NACKs.
+**One normative rule.** The owner of a shard is the node named by its durable
+`actor/{grid}/{shard}` row, and a process serves a shard only if its `--shard`
+set names it *and* it has won that row by CAS:
+
+```
+owner(g, s) = actor[g][s].owner   when actor[g][s].status ∈ {Active, Draining}
+            = ⊥                   otherwise (no row, or Splitting)
+
+serves(n, g, s)  ⟺  s ∈ shards(n)  ∧  owner(g, s) = n  ∧  status = Active
+```
+
+The row is the placement record *and* the fencing token (§3.4/§3.5): every activation CASes it and every checkpoint transaction re-reads it, so there is no second source to cache, diverge from, or repair. Gateways route on it and repair on epoch-mismatch NACKs.
+
+**Rendezvous (HRW) hashing is a planner, not the rule.** `propose(g, s) = argmax_n weight_n · h(g, s, n)` is a pure function an operator or a future autoscaler uses to *suggest* an assignment — minimal disruption when nodes join or leave (only shards whose argmax changed move), and capacity weighting — and it is consulted on no serving, routing, fencing or recovery path. Its virtue, "no central assignment table", buys nothing here because the table is read for fencing regardless, and `argmax` over a node set is single-valued only if every node agrees on that set, which nothing in this system publishes. Note that the hash mixes the `GridId`: without it, two grids' identically-numbered shards receive identical proposals and their placement is perfectly correlated (D26 rule 1; `RendezvousHasher` does not yet do this, and reaches no production path).
 
 **Which shards a process owns is a deployment input, not an inference.** `persistd --shard` names them; with the flag absent, `resolve_shards` falls back to `CellId::ROOT`, which is one shard covering the universe and therefore *one* actor mailbox for every write in it. That fallback is a single-process harness affordance and is measurably not the architecture: on the P2 kill-9 gate's 10 000-entity world (10 000 interest cells over 128 level-18 shards) it put 96 % of an acknowledged diff's 7.81 ms into `router_apply` — the mailbox — while `journal_commit_ms` sat at 0.46 ms against a 2 ms budget, and the registrar withdrew 8 921 of 10 000 leases. Deploying the shard set the world actually occupies (`orrery-seed shards`, docs/12 §9.3) took the same run to `router_apply` 1.03 ms and 174 withdrawals. Startup cost scales as one FDB fence read plus one checkpoint load per shard, both sequential: measured 386 ms of activation and 63 ms of runtime recovery for 128 shards on a fresh cluster, 503 ms to the readiness line.
 
@@ -2030,6 +2043,23 @@ resolves nothing, every lease claim is denied `NotEligible`, the fenced write
 path refuses every diff, and the chain mirror is empty for want of anything to
 mirror (docs/13-chain-replication.md §"What an empty mirror means").
 
+**Steps 1–4 assume the previous owner is *gone*** — cold start, node replacement, follower promotion — and the lease restore depends on it: a durable expiry minted under another process's monotonic registrar clock means nothing, so a held row is restored with a full fresh 10 s TTL. That is correct exactly when the previous owner's sessions died with it. Moving a shard away from a *live* owner therefore does not use this path directly; it must first make that precondition true, which is what §3.4.1 does.
+
+#### 3.4.1 Live handover: drain, then hand over ([D26](adr/0026-sibling-gateways.md))
+
+Moving shard `S` from live owner A to sibling B is a **drain followed by the ordinary fence**, so that B restores no held row and no holder loses the ability to heartbeat without an `Expire`:
+
+1. **Mark.** A CASes `actor/{g}/{S}` from `(A, e, Active)` to `(A, e, Draining{B})`. Status only: A stays owner, epoch and single writer. A losing CAS aborts with nothing changed.
+2. **Close admission.** New `Claim`s for cells under `S` are denied; diffs and heartbeats keep flowing, so the drain is invisible to gameplay.
+3. **Divest.** Every live row under `S` gets an `Expire` on **its own holder's connection to A** — reassigned to an eligible peer still on A where the row is weak, parked otherwise with `own_seq` intact and [04 §4.3](04-authority.md)'s grace re-armed. No cross-gateway grant and no session directory is needed, because every holder is by construction connected to A.
+4. **Bound it.** A holder silent past `handoff_deadline_ms` (300 ms) is revoked unconditionally. The drain completes within one deadline, not one per row.
+5. **Quiesce-flush.** `Checkpoint(PreHandover)` — §3.5's `PreSplit` under a second name — then stop accepting diffs for `S`. NACKed diffs are dropped, not retried, exactly as §3.5 specifies.
+6. **Hand over.** A CASes `(A, e, Draining{B})` → `(B, e+1, Active)`. A's epoch is now stale, so any late checkpoint of A's conflicts; `owning_shard` returning `None` on A is correct rather than a trap, because step 3 left nobody heartbeating to A for `S`.
+7. **Open.** B runs §3.4 steps 2–4. Every restored row is parked; there is no held row to re-arm.
+8. **Redirect.** A peer's next write under `S` is answered `WrongOwner{grid, shard, owner}`; it re-resolves, dials B and re-claims. The row is never retired — only its owner and epoch moved.
+
+**The invariant, in checkable terms.** *(I1)* At every instant, for each grid, the shard cells of all `Active` rows naming distinct nodes are pairwise non-overlapping — the same prefix-containment test `fence::validate_activation_set` applies within one process, taken cluster-wide. *(I2)* For every lease row live at step 1, an `Expire` was written to its holder's session before the step 6 CAS: `leases_live_at_drain_start − expires_delivered_before_cas == 0` and `heartbeats_rejected_wrong_owner == 0` across the handover window.
+
 ### 3.5 Hotspot split / relocate
 
 Range-sharding on a space-filling curve concentrates a crowd's writes on one shard — the [FDB #11510 hotspot pattern](https://github.com/apple/foundationdb/issues/11510) — so the actor tier splits *ahead* of the storage tier feeling it. Telemetry per actor: player count in shard (from coordinator presence), mailbox depth, append rate.
@@ -2051,7 +2081,7 @@ sequenceDiagram
     P->>F: retire actor/{S}
 ```
 
-The same machinery with one child at the same level is a **relocate** (move a hot shard to an underloaded node, overriding HRW via the `actor/` row). Diffs NACKed during the handover window (target: < 1 s) are **dropped** by the client scheduler, not retried (`UplinkScheduler::on_nack`): the uplink holds one pending diff per entity, so the next change-detection diff restates the entity against the new owner, and records are keyed `(entity, tick)` so nothing survives that the following tick does not re-send. Retrying the NACKed diff itself is deferred — a rejected write is usually rejected for a reason a resend does not change. Either way it is invisible to gameplay, because bulk acks are not in the frame loop. Merges run the protocol in reverse when children fall below the low-water mark for a sustained period.
+The same machinery with one child at the same level is a **relocate** (move a hot shard to an underloaded node by writing the `actor/` row, which is the ownership rule outright per §3.2 — there is no HRW result to override). A relocate away from a *live* owner runs §3.4.1's drain first. Diffs NACKed during the handover window (target: < 1 s) are **dropped** by the client scheduler, not retried (`UplinkScheduler::on_nack`): the uplink holds one pending diff per entity, so the next change-detection diff restates the entity against the new owner, and records are keyed `(entity, tick)` so nothing survives that the following tick does not re-send. Retrying the NACKed diff itself is deferred — a rejected write is usually rejected for a reason a resend does not change. Either way it is invisible to gameplay, because bulk acks are not in the frame loop. Merges run the protocol in reverse when children fall below the low-water mark for a sustained period.
 
 ## 4. Journal design
 
