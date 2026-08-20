@@ -189,6 +189,28 @@ impl Drop for Journal {
     }
 }
 
+/// Keyspace options for this journal's keyspaces.
+///
+/// Everything is fjall's default except the memtable size, and that is an
+/// override rather than a new default: unset reproduces fjall 3.1.9's 64 MiB
+/// exactly. It exists because docs/08-persistence.md §4.7 needs to *move* the
+/// rotation cadence to test a causal claim about it — fjall's `Batch::commit`
+/// calls `local_backpressure`, which sleeps in 100 ms steps while four or more
+/// sealed memtables are queued, so how often the memtable rotates decides how
+/// often a commit meets that sleep. A knob nothing sets is the cheapest way to
+/// vary the independent variable without a patched dependency.
+fn keyspace_options() -> fjall::KeyspaceCreateOptions {
+    let options = fjall::KeyspaceCreateOptions::default();
+    match std::env::var("ORRERY_JOURNAL_MEMTABLE_BYTES")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|bytes| *bytes > 0)
+    {
+        Some(bytes) => options.max_memtable_size(bytes),
+        None => options,
+    }
+}
+
 impl Journal {
     /// Open (or reopen) a journal in `cfg.dir`, starting a group-commit
     /// committer task.
@@ -198,16 +220,16 @@ impl Journal {
             .open()
             .map_err(|e| JournalError::Store(format!("open db: {e}")))?;
         let records = db
-            .keyspace(RECORDS_KS, fjall::KeyspaceCreateOptions::default)
+            .keyspace(RECORDS_KS, keyspace_options)
             .map_err(|e| JournalError::Store(format!("open records ks: {e}")))?;
         let originated_records = db
-            .keyspace(ORIGINATED_RECORDS_KS, fjall::KeyspaceCreateOptions::default)
+            .keyspace(ORIGINATED_RECORDS_KS, keyspace_options)
             .map_err(|e| JournalError::Store(format!("open originated records ks: {e}")))?;
         let metadata = db
-            .keyspace(JOURNAL_META_KS, fjall::KeyspaceCreateOptions::default)
+            .keyspace(JOURNAL_META_KS, keyspace_options)
             .map_err(|e| JournalError::Store(format!("open journal metadata ks: {e}")))?;
         let _segments = db
-            .keyspace(SEGMENTS_KS, fjall::KeyspaceCreateOptions::default)
+            .keyspace(SEGMENTS_KS, keyspace_options)
             .map_err(|e| JournalError::Store(format!("open segments ks: {e}")))?;
 
         // Recover the next LSN from the last stored record so a reopened
@@ -218,7 +240,7 @@ impl Journal {
 
         #[cfg(feature = "chain-grpc")]
         let chain_records = db
-            .keyspace(CHAIN_RECORDS_KS, fjall::KeyspaceCreateOptions::default)
+            .keyspace(CHAIN_RECORDS_KS, keyspace_options)
             .map_err(|e| JournalError::Store(format!("open chain record index: {e}")))?;
 
         let metrics = Arc::new(JournalCommitMetrics::new());
@@ -540,7 +562,7 @@ impl Journal {
     #[cfg(feature = "chain-grpc")]
     fn chain_records(&self) -> Result<Keyspace, JournalError> {
         self.db
-            .keyspace(CHAIN_RECORDS_KS, fjall::KeyspaceCreateOptions::default)
+            .keyspace(CHAIN_RECORDS_KS, keyspace_options)
             .map_err(|e| JournalError::Store(format!("open chain record index: {e}")))
     }
 
@@ -664,7 +686,7 @@ impl Journal {
     ) -> Result<Option<Vec<u8>>, JournalError> {
         let state = self
             .db
-            .keyspace(CHAIN_STATE_KS, fjall::KeyspaceCreateOptions::default)
+            .keyspace(CHAIN_STATE_KS, keyspace_options)
             .map_err(|e| JournalError::Store(format!("open chain state: {e}")))?;
         let Some(end) = prefix_successor(family) else {
             return Ok(None);
@@ -702,7 +724,7 @@ impl Journal {
     ) -> Result<Option<Vec<u8>>, JournalError> {
         let state = self
             .db
-            .keyspace(CHAIN_STATE_KS, fjall::KeyspaceCreateOptions::default)
+            .keyspace(CHAIN_STATE_KS, keyspace_options)
             .map_err(|e| JournalError::Store(format!("open chain state: {e}")))?;
         state
             .get(chain_key)
@@ -719,7 +741,7 @@ impl Journal {
     ) -> Result<(), JournalError> {
         let state = self
             .db
-            .keyspace(CHAIN_STATE_KS, fjall::KeyspaceCreateOptions::default)
+            .keyspace(CHAIN_STATE_KS, keyspace_options)
             .map_err(|e| JournalError::Store(format!("open chain state: {e}")))?;
         state
             .insert(chain_key, value)
@@ -746,7 +768,7 @@ impl Journal {
         let marker_key = adoption_key(&source_key);
         let markers = self
             .db
-            .keyspace(ADOPTIONS_KS, fjall::KeyspaceCreateOptions::default)
+            .keyspace(ADOPTIONS_KS, keyspace_options)
             .map_err(|e| JournalError::Store(format!("open adoption markers: {e}")))?;
         if let Some(value) = markers
             .get(&marker_key)
@@ -851,7 +873,7 @@ impl Journal {
         };
         let adopted = self
             .db
-            .keyspace(ADOPTED_RECORDS_KS, fjall::KeyspaceCreateOptions::default)
+            .keyspace(ADOPTED_RECORDS_KS, keyspace_options)
             .map_err(|e| JournalError::Store(format!("open adopted record index: {e}")))?;
         let mut write = self.db.batch();
         for record in &marker.records {
@@ -886,7 +908,7 @@ impl Journal {
         let source_key = chain_key_for_adoption(history.source())?;
         let adopted = self
             .db
-            .keyspace(ADOPTED_RECORDS_KS, fjall::KeyspaceCreateOptions::default)
+            .keyspace(ADOPTED_RECORDS_KS, keyspace_options)
             .map_err(|e| JournalError::Store(format!("open adopted record index: {e}")))?;
         let prefix = chain_record_prefix(&source_key);
         let end = prefix_successor(&prefix).ok_or_else(|| {
@@ -980,7 +1002,7 @@ fn migrate_originated_index(
     #[cfg(feature = "chain-grpc")]
     let unresolved_provenance = {
         let chain_records = db
-            .keyspace(CHAIN_RECORDS_KS, fjall::KeyspaceCreateOptions::default)
+            .keyspace(CHAIN_RECORDS_KS, keyspace_options)
             .map_err(|e| JournalError::Store(format!("open chain record index: {e}")))?;
         let mut provenance_counts = HashMap::<Lsn, usize>::new();
         for entry in chain_records.iter() {
@@ -1354,9 +1376,9 @@ mod tests {
             .open()
             .expect("open legacy db");
         let records = db
-            .keyspace(RECORDS_KS, fjall::KeyspaceCreateOptions::default)
+            .keyspace(RECORDS_KS, keyspace_options)
             .expect("legacy records");
-        db.keyspace(ORIGINATED_RECORDS_KS, fjall::KeyspaceCreateOptions::default)
+        db.keyspace(ORIGINATED_RECORDS_KS, keyspace_options)
             .expect("empty legacy originated index");
 
         let mut local = mk_record(1);
@@ -1386,7 +1408,7 @@ mod tests {
             )
             .unwrap();
         let chain_records = db
-            .keyspace(CHAIN_RECORDS_KS, fjall::KeyspaceCreateOptions::default)
+            .keyspace(CHAIN_RECORDS_KS, keyspace_options)
             .expect("legacy chain provenance");
         chain_records
             .insert(

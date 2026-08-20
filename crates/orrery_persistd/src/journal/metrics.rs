@@ -75,7 +75,38 @@ pub struct JournalStageSnapshot {
     pub resolve_us_sum: u64,
     /// Cumulative maximum waiter-resolution/publication work, in microseconds.
     pub resolve_us_max: u64,
+    /// Encoded bytes carried by the flush that set [`Self::sync_data_us_max`].
+    ///
+    /// The whole point of the pair (docs/08-persistence.md §4.6): the stall
+    /// that sets `journal_commit_ms` p99 survived removing every co-tenant from
+    /// the device, on two filesystems, so what is left is either fjall's own
+    /// work or the *shape* of the I/O it asks for. Those two predict different
+    /// numbers here. A 90 ms barrier carrying an ordinary batch is fjall or the
+    /// kernel taking that long over ~4 KB; one carrying megabytes is a memtable
+    /// flush or compaction handing a single `fdatasync` far more to persist
+    /// than the steady state does.
+    pub sync_data_us_max_bytes: u64,
+    /// Records carried by the flush that set [`Self::sync_data_us_max`].
+    pub sync_data_us_max_records: u64,
+    /// Flushes whose `SyncData` reached [`SLOW_SYNC_THRESHOLD_US`].
+    ///
+    /// The maximum above describes one flush per interval. These three describe
+    /// every slow one, so a single unlucky barrier cannot be mistaken for a
+    /// population.
+    pub slow_syncs: u64,
+    /// Encoded bytes summed over the flushes counted by [`Self::slow_syncs`].
+    pub slow_sync_bytes_sum: u64,
+    /// Records summed over the flushes counted by [`Self::slow_syncs`].
+    pub slow_sync_records_sum: u64,
 }
+
+/// What counts as a slow durability barrier, in microseconds.
+///
+/// Ten times the D16 `journal_commit_ms` budget. High enough that a healthy
+/// flush on any measured hardware never trips it — the quietest box measured
+/// 0.09 ms at p99 and the reference box 3.7 ms — and low enough to catch the
+/// 50–240 ms excursions docs/08-persistence.md §4.6 is chasing.
+pub const SLOW_SYNC_THRESHOLD_US: u64 = 20_000;
 
 impl JournalCommitSnapshot {
     /// The total number of successfully durable appends in this snapshot.
@@ -114,6 +145,11 @@ struct JournalStageCounters {
     sync_data_us_max: AtomicU64,
     resolve_us_sum: AtomicU64,
     resolve_us_max: AtomicU64,
+    sync_data_us_max_bytes: AtomicU64,
+    sync_data_us_max_records: AtomicU64,
+    slow_syncs: AtomicU64,
+    slow_sync_bytes_sum: AtomicU64,
+    slow_sync_records_sum: AtomicU64,
 }
 
 impl Default for JournalCommitMetrics {
@@ -182,6 +218,11 @@ impl JournalCommitMetrics {
             sync_data_us_max: load(&self.stages.sync_data_us_max),
             resolve_us_sum: load(&self.stages.resolve_us_sum),
             resolve_us_max: load(&self.stages.resolve_us_max),
+            sync_data_us_max_bytes: load(&self.stages.sync_data_us_max_bytes),
+            sync_data_us_max_records: load(&self.stages.sync_data_us_max_records),
+            slow_syncs: load(&self.stages.slow_syncs),
+            slow_sync_bytes_sum: load(&self.stages.slow_sync_bytes_sum),
+            slow_sync_records_sum: load(&self.stages.slow_sync_records_sum),
         }
     }
 
@@ -212,6 +253,19 @@ impl JournalCommitMetrics {
                 .resolve_us_sum
                 .saturating_sub(previous.resolve_us_sum),
             resolve_us_max: current.resolve_us_max,
+            // The bytes travel with the maximum, so they are cumulative in the
+            // same sense it is: both describe the worst flush seen so far, not
+            // the worst flush in this interval. Reporting the bytes as a
+            // difference would be meaningless.
+            sync_data_us_max_bytes: current.sync_data_us_max_bytes,
+            sync_data_us_max_records: current.sync_data_us_max_records,
+            slow_syncs: current.slow_syncs.saturating_sub(previous.slow_syncs),
+            slow_sync_bytes_sum: current
+                .slow_sync_bytes_sum
+                .saturating_sub(previous.slow_sync_bytes_sum),
+            slow_sync_records_sum: current
+                .slow_sync_records_sum
+                .saturating_sub(previous.slow_sync_records_sum),
         };
         *previous = current;
         delta
@@ -243,9 +297,36 @@ impl JournalCommitMetrics {
             .fjall_batch_commit_us_max
             .fetch_max(sample.fjall_batch_commit_us_max, Ordering::Relaxed);
         add(&self.stages.sync_data_us_sum, sample.sync_data_us_sum);
-        self.stages
-            .sync_data_us_max
-            .fetch_max(sample.sync_data_us_max, Ordering::Relaxed);
+        // `fetch_max` cannot carry the flush's shape with it, and the shape is
+        // the measurement (§4.6). A compare-exchange loop keeps the triple
+        // consistent: only the caller that installs a new maximum writes the
+        // bytes and records beside it. The committer is the single writer of
+        // all three, so the loop is exact rather than merely eventually right.
+        let mut observed = self.stages.sync_data_us_max.load(Ordering::Relaxed);
+        while sample.sync_data_us_max > observed {
+            match self.stages.sync_data_us_max.compare_exchange_weak(
+                observed,
+                sample.sync_data_us_max,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => {
+                    self.stages
+                        .sync_data_us_max_bytes
+                        .store(sample.bytes, Ordering::Relaxed);
+                    self.stages
+                        .sync_data_us_max_records
+                        .store(sample.records, Ordering::Relaxed);
+                    break;
+                }
+                Err(current) => observed = current,
+            }
+        }
+        if sample.sync_data_us_max >= SLOW_SYNC_THRESHOLD_US {
+            add(&self.stages.slow_syncs, 1);
+            add(&self.stages.slow_sync_bytes_sum, sample.bytes);
+            add(&self.stages.slow_sync_records_sum, sample.records);
+        }
         add(&self.stages.resolve_us_sum, sample.resolve_us_sum);
         self.stages
             .resolve_us_max
@@ -338,6 +419,80 @@ mod tests {
                 value_us: 1_500,
                 count: 1
             }]
+        );
+    }
+
+    /// docs/08-persistence.md §4.6: the worst barrier's *shape* has to travel
+    /// with its cost, or the number cannot discriminate between fjall's own
+    /// work and the volume it hands one `fdatasync`. Three flushes, and only
+    /// the slowest one's bytes may survive.
+    #[test]
+    fn the_worst_barriers_bytes_travel_with_its_cost() {
+        let metrics = JournalCommitMetrics::new();
+        let mut cursor = metrics.stage_snapshot();
+        let flush = |us: u64, bytes: u64, records: u64| JournalStageSnapshot {
+            records,
+            bytes,
+            sync_data_us_sum: us,
+            sync_data_us_max: us,
+            ..JournalStageSnapshot::default()
+        };
+        // An ordinary flush, then a far slower and much larger one, then a
+        // third that is large but fast — the last must not displace the second.
+        metrics.record_group(flush(300, 4_000, 30));
+        metrics.record_group(flush(90_000, 6_000_000, 40));
+        metrics.record_group(flush(400, 9_000_000, 50));
+
+        let delta = metrics.stage_delta(&mut cursor);
+        assert_eq!(delta.sync_data_us_max, 90_000);
+        assert_eq!(
+            delta.sync_data_us_max_bytes, 6_000_000,
+            "the bytes must be the slowest flush's, not the largest flush's"
+        );
+        assert_eq!(delta.sync_data_us_max_records, 40);
+        // Only the 90 ms flush crossed the threshold, so the slow-population
+        // counters must describe it alone.
+        assert_eq!(delta.slow_syncs, 1);
+        assert_eq!(delta.slow_sync_bytes_sum, 6_000_000);
+        assert_eq!(delta.slow_sync_records_sum, 40);
+    }
+
+    /// The slow counters are an interval difference; the maximum and its bytes
+    /// are cumulative, exactly as `sync_data_us_max` already was. A reader that
+    /// mistook either for the other would misreport every interval after the
+    /// first.
+    #[test]
+    fn slow_counters_are_interval_totals_and_the_maximum_is_cumulative() {
+        let metrics = JournalCommitMetrics::new();
+        let mut cursor = metrics.stage_snapshot();
+        let slow = JournalStageSnapshot {
+            records: 7,
+            bytes: 1_234,
+            sync_data_us_sum: SLOW_SYNC_THRESHOLD_US,
+            sync_data_us_max: SLOW_SYNC_THRESHOLD_US,
+            ..JournalStageSnapshot::default()
+        };
+        metrics.record_group(slow);
+        let first = metrics.stage_delta(&mut cursor);
+        assert_eq!(first.slow_syncs, 1);
+        assert_eq!(first.sync_data_us_max_bytes, 1_234);
+
+        // A quiet interval: no new slow flush, but the cumulative maximum and
+        // its shape still stand.
+        metrics.record_group(JournalStageSnapshot {
+            records: 3,
+            bytes: 99,
+            sync_data_us_sum: 100,
+            sync_data_us_max: 100,
+            ..JournalStageSnapshot::default()
+        });
+        let second = metrics.stage_delta(&mut cursor);
+        assert_eq!(second.slow_syncs, 0, "slow counters are per interval");
+        assert_eq!(second.slow_sync_bytes_sum, 0);
+        assert_eq!(second.sync_data_us_max, SLOW_SYNC_THRESHOLD_US);
+        assert_eq!(
+            second.sync_data_us_max_bytes, 1_234,
+            "the maximum and its bytes are cumulative together"
         );
     }
 

@@ -277,6 +277,28 @@ lane_gates() {
     # aggregate would catch.
     run scripts/p2-nvme-report.py --self-test
 
+    # docs/08 §4.6's, and it guards the opposite risk from §4.4's. That section
+    # attributed the journal's stalls to writeback and this one removes every
+    # co-tenant in turn — the harness's evidence, then FoundationDB — and finds
+    # the stall still there on two filesystems. Its claims are therefore all
+    # *negatives*, and a negative is what a well-meaning data edit quietly
+    # turns into a positive: make one arm come out clean and the section reads
+    # as a fix rather than an elimination. So the self-test pins each arm still
+    # stalling, the per-run `df` proof that each layout was actually in effect,
+    # and the one comparison that carries the filesystem half — that xfs is far
+    # more writeback-resistant at the device and stalls the gate anyway.
+    run scripts/p2-nvme-isolation-report.py --self-test
+
+    # docs/08 §4.7's, which ends the sequence §4.3 started by naming a cause
+    # rather than eliminating one. Three of its clauses are load-bearing in
+    # ways a later edit could quietly reverse: the worst barrier carrying an
+    # *ordinary* batch (which is what refutes the volume story), the tmpfs arm
+    # stalling at all (which is what removes storage), and the 256 MiB point
+    # reading clean at 60 s while stalling at 180 s (which is what stops the
+    # section claiming a fix it does not have). Losing any one of them leaves
+    # the conclusion standing on nothing, so all three are pinned.
+    run scripts/p2-barrier-shape-report.py --self-test
+
     # And this script's own, which nothing ran either: ci.yml calls the four
     # lanes and never `--self-test`, so the lane table's agreement with the tree
     # — and, now, the coverage clause below — were checked only when a human

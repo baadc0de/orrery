@@ -119,20 +119,36 @@ fn open_loop_arrival_rate() {
         std::thread::spawn(move || {
             let mut cursor = journal.commit_metrics().stage_snapshot();
             let mut second = 0u64;
-            println!("sec flushes  records sync_us/flush  qwait_us/flush  rec/flush");
+            println!(
+                "sec flushes  records sync_us/flush  qwait_us/flush  rec/flush  \
+                 slow worst_ms worst_kb worst_rec slow_kb/barrier"
+            );
             while trace.load(Ordering::Relaxed) {
                 std::thread::sleep(Duration::from_secs(1));
                 let d = journal.commit_metrics().stage_delta(&mut cursor);
                 // Denominator: `record_group` is called once per flush, so a
                 // stage sum divides by `flushes`, never by `records`.
                 let f = d.flushes.max(1) as f64;
+                // docs/08 §4.6's discriminator: a slow barrier carrying an
+                // ordinary batch is fjall's own work; one carrying megabytes is
+                // the volume a flush or compaction handed this single fsync.
+                let slow_kb = if d.slow_syncs == 0 {
+                    0.0
+                } else {
+                    d.slow_sync_bytes_sum as f64 / d.slow_syncs as f64 / 1024.0
+                };
                 println!(
-                    "{second:3} {:7} {:8} {:13.0} {:15.0} {:10.1}",
+                    "{second:3} {:7} {:8} {:13.0} {:15.0} {:10.1} {:5} {:8.1} {:8.1} {:9} {:15.1}",
                     d.flushes,
                     d.records,
                     d.sync_data_us_sum as f64 / f,
                     d.queue_wait_us_sum as f64 / f,
                     d.records as f64 / f,
+                    d.slow_syncs,
+                    d.sync_data_us_max as f64 / 1000.0,
+                    d.sync_data_us_max_bytes as f64 / 1024.0,
+                    d.sync_data_us_max_records,
+                    slow_kb,
                 );
                 second += 1;
             }
@@ -221,6 +237,28 @@ fn open_loop_arrival_rate() {
         stages.resolve_us_sum,
         stages.resolve_us_max,
         stages.fjall_batch_commit_us_sum,
+    );
+    // docs/08 §4.6 follow-up 1. Every co-tenant was removed from the journal's
+    // device there and the stall stayed; this rig removes the rest of the
+    // process too — no gateway, no FoundationDB, no follower, no network. If a
+    // stall survives *here*, the journal stack is the whole of it, and these
+    // two numbers say which half: the volume one barrier was asked to persist,
+    // against the ~4 KB an ordinary one carries.
+    println!(
+        "slow barriers (>= {} ms): {} of {} flushes; worst {:.1} ms carrying {:.1} KB / {} records; \
+         mean slow barrier {:.1} KB against {:.1} KB for an average flush",
+        orrery_persistd::journal::SLOW_SYNC_THRESHOLD_US / 1000,
+        stages.slow_syncs,
+        stages.flushes,
+        stages.sync_data_us_max as f64 / 1000.0,
+        stages.sync_data_us_max_bytes as f64 / 1024.0,
+        stages.sync_data_us_max_records,
+        if stages.slow_syncs == 0 {
+            0.0
+        } else {
+            stages.slow_sync_bytes_sum as f64 / stages.slow_syncs as f64 / 1024.0
+        },
+        stages.bytes as f64 / stages.flushes.max(1) as f64 / 1024.0,
     );
     println!(
         "per-flush means (us): queue_wait={:.1} sync_data={:.1} resolve={:.1}  => flush service {:.3} ms",
