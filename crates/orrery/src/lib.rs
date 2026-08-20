@@ -16,9 +16,14 @@
 //! There is now a second such system, [`queue_filed_reports`], and it is here
 //! for the same reason: `orrery_witness` files a signed `DiscrepancyReport`
 //! and has no gateway session, `orrery_persist_client` has the session and
-//! must not learn about witnessing, and only this crate depends on both. The
-//! exception is meant to stay this narrow — both systems move a value between
-//! two resources and decide nothing.
+//! must not learn about witnessing, and only this crate depends on both.
+//!
+//! And a third, [`divest_on_drain`]: a coordinator drain order lands on
+//! `orrery_net`'s session and the leases it releases are `orrery_authority`'s,
+//! which is the same crossing as the first system and in the same direction.
+//! The exception is meant to stay this narrow — every one of the three moves a
+//! value between two resources and decides nothing beyond *whether* the move
+//! applies.
 //!
 //! ```no_run
 //! use bevy::prelude::*;
@@ -39,12 +44,17 @@
 use bevy_app::{App, Plugin, PluginGroup, PluginGroupBuilder};
 use bevy_ecs::prelude::*;
 
-use orrery_authority::{track_island_binding, IslandBinding, OrreryAuthorityPlugin};
+use orrery_authority::{
+    track_island_binding, Authority, IslandBinding, LeaseClient, LeaseDivest, OrreryAuthorityPlugin,
+};
 use orrery_core::Ruleset;
 use orrery_net::plugin::NetConfig;
-use orrery_net::{CoordinatorConfig, IslandMembership, OrreryNetPlugin};
+use orrery_net::{
+    apply_island_drain, CoordinatorConfig, CoordinatorLink, IslandMembership, OrreryNetPlugin,
+};
 use orrery_persist_client::{OrreryPersistClientPlugin, PersistClientConfig, ReportQueue};
 use orrery_predict::{ConfigDefect, OrreryPredictPlugin, PredictConfig};
+use orrery_protocol::SeqPair;
 use orrery_spatial::{OrrerySpatialPlugin, SpatialConfig};
 use orrery_witness::{ReportFiled, WitnessPlugin};
 
@@ -193,6 +203,100 @@ pub fn bind_island_membership(
     }
 }
 
+/// Releases this peer's leases when the coordinator orders its island drained
+/// (D24).
+///
+/// The facade's **third** cross-crate system, and the same rule puts it here as
+/// the other two: the order arrives on `orrery_net`'s coordinator session, the
+/// leases live in `orrery_authority`, authority is the lower layer of the two,
+/// and `orrery_authority` may not depend on `orrery_net`. Only this crate
+/// depends on both.
+///
+/// It is ordered **before**
+/// [`apply_island_drain`], which is the system
+/// that consumes [`CoordinatorLink::drain`](orrery_net::CoordinatorLink::drain)
+/// and calls `IslandMembership::leave()`. Divesting has to see the membership
+/// the order names; once `leave()` has run there is no island left to compare
+/// against.
+///
+/// # Why the island filter is just the membership check
+///
+/// D24 §(a) states the drain predicate per entity, over the cell set `C(I)` of
+/// the drained island: release every lease whose committed cell is in it. There
+/// is no cell set to intersect against here, and there does not need to be. A
+/// peer is in exactly one island at a time
+/// ([`IslandMembership::island`](orrery_net::IslandMembership::island) is one
+/// `Option`), the island's cells are the union of its peers' reported presence,
+/// and a lease is granted only over a cell this peer's interest covers. So
+/// `membership.island == Some(island)` *is* the containment test, and every
+/// lease this peer holds satisfies it. Filtering again on a cell set the peer
+/// would have to reconstruct from a manifest it may no longer hold would be a
+/// second, weaker copy of the same fact.
+///
+/// The substitution is also forced rather than merely convenient:
+/// `CoordMsg::Drain` is `{ island, deadline }` and carries no cell set, so when
+/// the two disagree there is nothing else to test against. That is the move
+/// case — a peer that emptied island `A` by joining `B` is told to drain `A`
+/// while holding `B`, takes the early return here, and lets `A`'s rows park on
+/// the registrar's 11 s expiry sweep rather than one RTT. An accepted latency
+/// cost on an already-correct backstop, not an oversight; see
+/// [`apply_island_drain`], which documents the
+/// case in full.
+///
+/// # `to: None`, `cursor: None`
+///
+/// The sanctioned cooperative release (D7 §5, docs/04 §5): there is no
+/// successor, because the island is being retired rather than handed over —
+/// naming one would be an evacuation, which D24 §(b) explicitly declines to
+/// invent. The registrar's uplink-completeness gate accepts an absent cursor on
+/// exactly that condition, and refuses one otherwise
+/// (`orrery_persistd::gateway`'s `(None, _) => to.is_none()`), so the two
+/// `None`s are one decision rather than two.
+///
+/// `final_seq` is the entity's last known [`Authority::seq`], for the reason
+/// the expiry path carries the pair forward: INV-2 forbids the sequences going
+/// backwards, and a default `(0, 0)` is a pair the registrar's row supersedes.
+///
+/// # This system is an optimisation, and must stay one
+///
+/// If the order never arrives — the usual case being a peer that crashed, which
+/// has no session to receive it on — nothing here runs and the drain still
+/// completes: the registrar's 1 s expiry sweep parks every row within
+/// `TTL + S = 11 s` with no message at all (D24 §(a), path 3). What this buys
+/// is the difference between 11 s and one round trip on a graceful departure.
+/// Nothing downstream may be written so that it is only correct when the notice
+/// was delivered.
+pub fn divest_on_drain(
+    link: Res<CoordinatorLink>,
+    membership: Res<IslandMembership>,
+    mut client: LeaseClient,
+    authority: Query<&Authority>,
+) {
+    let Some((island, _deadline)) = link.drain else {
+        return;
+    };
+    // The deadline is read and discarded deliberately. D24 §(d) sets the grace
+    // at exactly one lease TTL and says a peer past it "is not punished — it is
+    // simply no longer the reason anything is waiting", so there is nothing to
+    // enforce: the response is to divest now, in this frame, which is the only
+    // schedule this system has.
+    if membership.island != Some(island) {
+        return;
+    }
+    for (persist, entity) in client.held_leases() {
+        let final_seq = authority
+            .get(entity)
+            .map_or_else(|_| SeqPair::default(), |known| known.seq);
+        client.divest(LeaseDivest {
+            entity,
+            persist,
+            to: None,
+            final_seq,
+            cursor: None,
+        });
+    }
+}
+
 /// Carries a filed discrepancy report from the witness to the gateway egress.
 ///
 /// The facade's **second** cross-crate system, and it exists for exactly the
@@ -242,24 +346,37 @@ impl Plugin for OrreryEscalationPlugin {
     }
 }
 
-/// Installs [`bind_island_membership`], ordered before its consumer.
+/// Installs the two net↔authority island systems, each ordered against its
+/// consumer: [`bind_island_membership`] and [`divest_on_drain`].
 ///
-/// A `PluginGroup` can only add plugins, so the facade's one system needs one
-/// plugin to carry it. It is a member of [`OrreryClientPlugins`] rather than
+/// A `PluginGroup` can only add plugins, so the facade's systems need a plugin
+/// to carry them. It is a member of [`OrreryClientPlugins`] rather than
 /// something a game adds separately, because a client that has both the net and
-/// the authority plugin and not this wire is the broken configuration the wire
-/// exists to prevent.
+/// the authority plugin and not these wires is the broken configuration they
+/// exist to prevent — no island binding means no ephemeral namespace, and no
+/// drain wire means a drained peer whose leases sit until the registrar's
+/// expiry sweep collects them.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct OrreryIslandBindingPlugin;
 
 impl Plugin for OrreryIslandBindingPlugin {
     fn build(&self, app: &mut App) {
-        // Before, not after: the binding a manifest produced this frame reaches
-        // the ephemeral registry in the same frame, rather than leaving one
-        // frame in which a spawn mints into the previous island's namespace.
         app.add_systems(
             bevy_app::Update,
-            bind_island_membership.before(track_island_binding),
+            (
+                // Before the tear-down, because divesting needs to see the
+                // membership the order names — `apply_island_drain` clears it.
+                divest_on_drain.before(apply_island_drain),
+                // After the tear-down and before the registry: a drain that
+                // cleared the island reaches `IslandBinding` in the frame it
+                // happened, so `EphemeralRegistry::spawn` stops minting into a
+                // namespace this peer has left rather than minting for one more
+                // frame. The same edge carries the ordinary case — the binding a
+                // manifest produced this frame reaches the registry in it.
+                bind_island_membership
+                    .after(apply_island_drain)
+                    .before(track_island_binding),
+            ),
         );
     }
 }
@@ -277,8 +394,8 @@ impl Plugin for OrreryIslandBindingPlugin {
 ///    separate transport plugin.
 /// 2. [`OrrerySpatialPlugin`] — cell commitment, AOI, interest set.
 /// 3. [`OrreryAuthorityPlugin`] — claims, leases, the ephemeral namespace.
-/// 4. [`OrreryIslandBindingPlugin`] — this crate's own wire, between the two
-///    above.
+/// 4. [`OrreryIslandBindingPlugin`] — this crate's own wires, between the two
+///    above: the membership binding, and the drain divestiture.
 /// 5. [`OrreryPredictPlugin`] — lightyear's client stack, per D8/D16.
 /// 6. [`WitnessPlugin<R>`] — the log stream and the discrepancy path.
 /// 7. [`OrreryPersistClientPlugin`] — the gateway session, uplink, area loader.

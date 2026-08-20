@@ -253,6 +253,22 @@ impl AuthorityState {
         self.leases.get(&entity).map(|lease| lease.lease_id)
     }
 
+    /// Every persistent entity this peer currently holds a fence for, paired
+    /// with the ECS entity carrying it.
+    ///
+    /// Exposed for the callers that have to act on *all* of them at once —
+    /// today that is the island drain (D24), which releases the lot rather than
+    /// selecting among them. Ordinary gameplay names one entity and wants
+    /// [`Self::local_lease_id`]; iterating here to find a single lease is a
+    /// linear scan of a map that answers the question directly.
+    ///
+    /// Ordered by [`PersistId`], because the backing map is: two peers
+    /// draining the same set emit their divestitures in the same order, which
+    /// makes a captured [`LeaseOutbox`] comparable across runs.
+    pub fn held_leases(&self) -> impl Iterator<Item = (PersistId, Entity)> + '_ {
+        self.leases.iter().map(|(id, lease)| (*id, lease.entity))
+    }
+
     /// Allocate and record a claim correlation identifier for `entity`.
     pub fn begin_claim(&mut self, entity: PersistId) -> Option<ClaimId> {
         let claim_id = self.next_claim_id;
@@ -334,6 +350,18 @@ impl<'w, 's> LeaseClient<'w, 's> {
             tick: request.tick,
         });
         Some(claim_id)
+    }
+
+    /// Every lease this peer currently holds, as
+    /// [`AuthorityState::held_leases`] reports them.
+    ///
+    /// Collected rather than borrowed: the one caller — the island drain — is
+    /// going to call [`Self::divest`] for each, and `divest` takes `&mut self`.
+    /// A held set is at most the entities one peer has authority over, so the
+    /// allocation is paid once per drain rather than per frame.
+    #[must_use]
+    pub fn held_leases(&self) -> Vec<(PersistId, Entity)> {
+        self.state.held_leases().collect()
     }
 
     /// Consent to give up a lease: hand it to `to`, or release it when `to`
