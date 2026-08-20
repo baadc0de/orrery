@@ -50,6 +50,7 @@ entry point. Decisions live independently under [docs/adr/](docs/adr/):
 | D21 | [ADR-0021](docs/adr/0021-ruleset-distribution.md) | `Ruleset` distribution, harness API freeze |
 | D22 | [ADR-0022](docs/adr/0022-grid-id-in-the-storage-key.md) | `GridId` stays a key discriminator |
 | D23 | [ADR-0023](docs/adr/0023-follower-journal-retention.md) | Follower journal retention, P2 retention clause |
+| D24 | [ADR-0024](docs/adr/0024-island-drain.md) | Island drain driver (Proposed) |
 | D26 | [ADR-0026](docs/adr/0026-sibling-gateways.md) | Sibling gateways: ownership, reachability, live handover |
 
 After the applicable ADRs, use this expansion reading path:

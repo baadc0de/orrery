@@ -22,6 +22,7 @@ This decision is normative. See the [ADR index](../DECISIONS.md) for precedence,
 | Epoch reseed min interval | 10 s | Ruleset builds retained (adjudication) | 3 |
 | Hot-cell egress (promoted) | ≤ 35 Mbps | Witness-log fan-out | witness set only (≤ 7 links) |
 | Journal retention | on (D20) | Journal open (index rebuild) | < 2 000 ms (D20) |
+| Drain grace | 10 s (D24, proposed) | — | — |
 
 The last row is added by [D20](0020-journal-retention.md). *Journal retention*
 is whether a node releases journal segments its checkpoints have made
@@ -35,4 +36,12 @@ retention released on both nodes during the run and every node's reported
 `journal_open_ms` is inside this budget. Retention is unchanged as a default
 (on) and unchanged as a switch (`persistd --no-journal-retention`); what
 changed is that a run in which it did nothing no longer passes.
+
+The *drain grace* row is proposed by [D24](0024-island-drain.md) and is not in
+force until that record is accepted. It is the horizon the coordinator stamps
+into `CoordMsg::Drain`'s `deadline`, and it is set equal to the lease TTL in
+the same table rather than tuned: a shorter grace names an instant before the
+registrar's expiry sweep can observe anything, and a longer one names an
+instant after that sweep has already parked every row — so `10 s` is the only
+value that adds no third timer to the two this system already has.
 
