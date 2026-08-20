@@ -1003,13 +1003,6 @@ fn gateway_gates_client_claims_against_committed_location_and_authoritative_inte
                 ClaimKind::Weak,
                 ClaimBasis::Orphan,
             ),
-            (
-                covered,
-                GridId::new(9),
-                cells[0],
-                ClaimKind::Weak,
-                ClaimBasis::Explicit,
-            ),
         ];
         for (entity, grid, cell, kind, basis) in denied {
             let reply = claim_reply(&connection, entity, grid, cell, kind, basis).await;
@@ -1023,6 +1016,39 @@ fn gateway_gates_client_claims_against_committed_location_and_authoritative_inte
                 } if denied_entity == entity
             ));
         }
+
+        // A claim in a grid this node serves no shard of is refused for a
+        // different reason, and the difference matters. P-7 makes the same raw
+        // cell id under another grid a different entity universe, so this is
+        // not an ineligible claimant — it is a claimant at the wrong node
+        // (docs/08-persistence.md §3.5), and telling it to back off would have
+        // it wait out a node that can never answer.
+        let misaddressed = claim_reply(
+            &connection,
+            covered,
+            GridId::new(9),
+            cells[0],
+            ClaimKind::Weak,
+            ClaimBasis::Explicit,
+        )
+        .await;
+        assert!(
+            matches!(
+                misaddressed,
+                LeaseMsg::Deny {
+                    claim_id: Some(orrery_protocol::ClaimId(1)),
+                    entity: denied_entity,
+                    reason: orrery_protocol::DenyReason::WrongOwner {
+                        grid,
+                        shard,
+                        owner: None,
+                        ..
+                    },
+                    retry_after_ms: 0,
+                } if denied_entity == covered && grid == GridId::new(9) && shard == cells[0]
+            ),
+            "an unserved grid must be answered as a wrong owner, got {misaddressed:?}"
+        );
 
         let (_stale_client, stale_connection) = raw_connection(secret(2), server.addr()).await;
         stale_connection
@@ -3970,4 +3996,315 @@ fn versioned_hello_is_accepted_across_the_rolling_window_and_refused_outside_it(
 
         server.shutdown().await;
     });
+}
+
+/// A runtime config hosting exactly `shards`, at `epoch`.
+///
+/// The default [`runtime_config`] hosts `CellId::ROOT`, which is a prefix of
+/// every cell — nothing is ever outside it, so nothing in this file could have
+/// exercised a wrong-owner route before. Naming a narrower set is what makes
+/// "a cell this node does not own" expressible at all.
+fn sharded_runtime_config(
+    dir: &std::path::Path,
+    shards: Vec<CellId>,
+    epoch: Epoch,
+) -> RuntimeConfig {
+    RuntimeConfig {
+        shards,
+        epoch,
+        ..runtime_config(dir)
+    }
+}
+
+/// A Diff, a Claim and an area Read for a cell outside this node's `--shard`
+/// set are each refused **by name**, and the refusal carries the cell and this
+/// node's fence epoch.
+///
+/// The defect: all three used to come back as `Reject::JournalClosed`, which
+/// the wire reported as a generic `BulkNack`/`Deny`. A peer could not tell
+/// "this node is broken" from "you are talking to the wrong node", and those
+/// call for opposite responses — one is a reason to stop writing, the other a
+/// reason to write somewhere else (docs/08-persistence.md §3.5).
+///
+/// Every leg asserts the in-shard control in the same run, because a refusal
+/// that fired for *every* cell would satisfy the wrong-cell assertions and be
+/// a total outage.
+#[test]
+fn a_cell_outside_this_nodes_shards_is_refused_as_a_wrong_owner_not_as_a_broken_journal() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let roots = CellId::ROOT.children();
+        let (mine, theirs) = (roots[0], roots[1]);
+        let in_shard = mine.children()[0];
+        let out_of_shard = theirs.children()[0];
+        // Not zero, so a reported epoch cannot pass by coincidence with the
+        // `Epoch::new(0)` a forgotten field would carry.
+        let epoch = Epoch::new(9);
+
+        let dir = tempfile::tempdir().unwrap();
+        let store: Arc<dyn orrery_persistd::checkpoint::CheckpointStore> =
+            Arc::new(orrery_persistd::checkpoint::MemCheckpointStore::new());
+        let runtime = Arc::new(Mutex::new(
+            CellRuntime::open(
+                &sharded_runtime_config(dir.path(), vec![mine], epoch),
+                &store,
+            )
+            .await
+            .unwrap(),
+        ));
+        let entity = PersistId::new(4_117);
+        seed_entity(&runtime, entity, in_shard).await;
+
+        let router: Arc<dyn Router> = runtime.clone();
+        let issuer = secret(42);
+        // Interest covers both cells: the refusal under test must come from
+        // shard ownership, not from a peer that was never allowed to ask.
+        let server = GatewayServer::spawn(
+            support::authority_config(node(1), GridId::ROOT, vec![in_shard, out_of_shard]),
+            router,
+        )
+        .await
+        .unwrap();
+        let (_client, conn) = raw_connection(secret(1), server.addr()).await;
+        conn.send_control(&GatewayMsg::Hello {
+            token: session_token(&issuer, node(1), 900, 200),
+            node: node(1),
+        })
+        .await;
+        assert!(receives_hello_ack(&conn).await);
+
+        // -- Diff --------------------------------------------------------
+        let wrong_cell_diff = DiffUplink {
+            cell: out_of_shard,
+            grid: GridId::ROOT,
+            entity,
+            tick: Tick::new(3),
+            kind: RecordKind::ComponentDiff,
+            payload: Bytes::from_static(b"misaddressed"),
+            seq: 1,
+            lease_id: None,
+            authority_seq: None,
+        };
+        match diff_reply(&conn, wrong_cell_diff).await {
+            GatewayReply::BulkNack { reason, lease, .. } => {
+                assert_eq!(
+                    reason,
+                    orrery_protocol::BULK_NACK_WRONG_OWNER,
+                    "a diff for an unowned cell must not read as a journal failure"
+                );
+                assert!(
+                    lease.is_none(),
+                    "a routing refusal carries no registrar row: there is none here to carry"
+                );
+            }
+            other => panic!("expected a wrong-owner BulkNack, got {other:?}"),
+        }
+
+        // -- Claim -------------------------------------------------------
+        let denied = claim_reply(
+            &conn,
+            entity,
+            GridId::ROOT,
+            out_of_shard,
+            ClaimKind::Weak,
+            ClaimBasis::Explicit,
+        )
+        .await;
+        match denied {
+            LeaseMsg::Deny {
+                reason, entity: e, ..
+            } => {
+                assert_eq!(e, entity);
+                assert_eq!(
+                    reason,
+                    orrery_protocol::DenyReason::WrongOwner {
+                        grid: GridId::ROOT,
+                        shard: out_of_shard,
+                        epoch,
+                        owner: None,
+                    },
+                    "the refusal must name the cell and this node's fence epoch, \
+                     not report the claimant as ineligible"
+                );
+            }
+            other => panic!("expected a wrong-owner Deny, got {other:?}"),
+        }
+
+        // The control: the same claim shape at a cell this node *does* own is
+        // arbitrated normally, so the refusal above is about the address.
+        let granted = claim_reply(
+            &conn,
+            entity,
+            GridId::ROOT,
+            in_shard,
+            ClaimKind::Weak,
+            ClaimBasis::Explicit,
+        )
+        .await;
+        assert!(
+            matches!(granted, LeaseMsg::Grant { .. }),
+            "an in-shard claim must still be granted, got {granted:?}"
+        );
+
+        // -- Area read ---------------------------------------------------
+        conn.send_control(&GatewayMsg::Subscribe {
+            grid: GridId::ROOT,
+            cells: vec![out_of_shard],
+        })
+        .await;
+        let area = loop {
+            let packet = conn.next_payload(Duration::from_secs(5)).await.unwrap();
+            match decode_stream_frame(&packet) {
+                Some(
+                    reply @ (GatewayReply::AreaPage { .. } | GatewayReply::AreaLoadError { .. }),
+                ) => break reply,
+                _ => continue,
+            }
+        };
+        match area {
+            GatewayReply::AreaLoadError { cell, kind } => {
+                assert_eq!(cell, out_of_shard);
+                assert_eq!(
+                    kind,
+                    orrery_protocol::AREA_LOAD_ERR_WRONG_OWNER,
+                    "an unowned cell must not be answered as an empty page: a node \
+                     hosting no shard over it cannot claim it is empty"
+                );
+            }
+            other => panic!("expected a wrong-owner AreaLoadError, got {other:?}"),
+        }
+
+        // The control: an owned cell still pages, so the error above is not
+        // the area path failing outright.
+        conn.send_control(&GatewayMsg::Subscribe {
+            grid: GridId::ROOT,
+            cells: vec![in_shard],
+        })
+        .await;
+        let owned_area = loop {
+            let packet = conn.next_payload(Duration::from_secs(5)).await.unwrap();
+            match decode_stream_frame(&packet) {
+                Some(
+                    reply @ (GatewayReply::AreaPage { .. } | GatewayReply::AreaLoadError { .. }),
+                ) => break reply,
+                _ => continue,
+            }
+        };
+        assert!(
+            matches!(owned_area, GatewayReply::AreaPage { cell, .. } if cell == in_shard),
+            "an in-shard read must still page, got {owned_area:?}"
+        );
+
+        server.shutdown().await;
+    });
+}
+
+/// A Heartbeat routed to a cell outside this node's shard set is refused as a
+/// wrong owner, at the router surface the gateway renews through.
+///
+/// Asserted here rather than over the wire because the wire cannot reach it:
+/// `resolve_renewals` only renews pairs this session was *granted*, and a
+/// grant for an unowned cell is exactly what the claim leg above proves is
+/// impossible. The reachable production shape is a shard that moves off this
+/// node while a session still holds leases in it, and that arrives at the
+/// router through these same two methods.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_heartbeat_for_a_cell_outside_this_nodes_shards_is_refused_as_a_wrong_owner() {
+    let roots = CellId::ROOT.children();
+    let (mine, theirs) = (roots[0], roots[1]);
+    let in_shard = mine.children()[0];
+    let out_of_shard = theirs.children()[0];
+    let epoch = Epoch::new(9);
+
+    let dir = tempfile::tempdir().unwrap();
+    let store: Arc<dyn orrery_persistd::checkpoint::CheckpointStore> =
+        Arc::new(orrery_persistd::checkpoint::MemCheckpointStore::new());
+    let runtime = CellRuntime::open(
+        &sharded_runtime_config(dir.path(), vec![mine], epoch),
+        &store,
+    )
+    .await
+    .unwrap();
+
+    let entity = PersistId::new(4_118);
+    let refused = Router::heartbeat_lease(
+        &runtime,
+        GridId::ROOT,
+        out_of_shard,
+        entity,
+        node(1),
+        LeaseId(1),
+        0,
+    )
+    .await;
+    assert_eq!(
+        refused,
+        Err(orrery_persistd::Reject::WrongOwner {
+            grid: GridId::ROOT,
+            shard: out_of_shard,
+            epoch,
+        }),
+        "a renewal for an unowned cell must name the cell and the epoch"
+    );
+
+    // The batched path the gateway actually calls degrades an unroutable entry
+    // to a per-entry `None` rather than failing a batch that may straddle
+    // owned and unowned cells, and that is deliberate — so the *reason* is
+    // recovered from `Router::wrong_owner_epoch`, which is what
+    // `renew_session_leases` consults for exactly the pairs that did not
+    // renew. Both halves are asserted here so the pair cannot drift apart.
+    let batched = Router::heartbeat_leases(
+        &runtime,
+        GridId::ROOT,
+        node(1),
+        &[
+            orrery_persistd::cluster::LeaseRenewal {
+                cell: in_shard,
+                entity,
+                lease_id: LeaseId(1),
+            },
+            orrery_persistd::cluster::LeaseRenewal {
+                cell: out_of_shard,
+                entity: PersistId::new(4_119),
+                lease_id: LeaseId(1),
+            },
+        ],
+        0,
+    )
+    .await;
+    assert_eq!(
+        batched,
+        Ok(vec![None, None]),
+        "the batch answers per entry; it must not fail the owned entry too"
+    );
+    assert_eq!(
+        Router::wrong_owner_epoch(&runtime, GridId::ROOT, out_of_shard).await,
+        Some(epoch),
+        "the refused entry's cell must be reportable as this node's wrong owner"
+    );
+    assert_eq!(
+        Router::wrong_owner_epoch(&runtime, GridId::ROOT, in_shard).await,
+        None,
+        "a cell this node does own must never be reported as misaddressed"
+    );
+
+    // The control: the same renewal at an owned cell routes and answers (with
+    // no row, because nothing granted one) rather than being refused.
+    let owned = Router::heartbeat_lease(
+        &runtime,
+        GridId::ROOT,
+        in_shard,
+        entity,
+        node(1),
+        LeaseId(1),
+        0,
+    )
+    .await;
+    assert_eq!(
+        owned,
+        Ok(None),
+        "an in-shard renewal must still route to its actor"
+    );
+
+    runtime.close().await.unwrap();
 }

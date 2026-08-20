@@ -903,3 +903,56 @@ async fn an_unleased_diff_is_nacked_and_never_reaches_the_follower_mirror() {
     );
     journal.close().await.expect("close inspected journal");
 }
+
+#[test]
+fn readiness_reports_the_owned_shard_set_with_per_shard_epochs() {
+    // A node can now tell a peer "you are talking to the wrong owner"
+    // (`DenyReason::WrongOwner`, docs/08-persistence.md §3.5). Nothing outside
+    // the process could check that claim: which shards were owned here was
+    // knowable only from the `--shard` flags the harness itself passed, which
+    // is not evidence — it is the input restated. This publishes the answer
+    // the node actually activated.
+    //
+    // Two shards, not one, so an implementation that reported a single shard
+    // or collapsed the list would fail rather than pass by arity.
+    let mut octants = CellId::ROOT.children();
+    octants.sort_unstable();
+    let (first, second) = (octants[0].to_bits(), octants[1].to_bits());
+    let (_dir, mut child, ready) = spawn_persistd(&[
+        "--bind".to_string(),
+        "127.0.0.1:0".to_string(),
+        "--shard".to_string(),
+        format!("{first:#x}"),
+        "--shard".to_string(),
+        format!("{second:#x}"),
+    ]);
+
+    let shards = ready["shards"]
+        .as_array()
+        .expect("readiness line carries the owned shard set");
+    let cells: Vec<u64> = shards
+        .iter()
+        .map(|entry| entry["cell"].as_u64().expect("shard cell is raw bits"))
+        .collect();
+    assert_eq!(
+        cells,
+        vec![first, second],
+        "the published set must be exactly the --shard flags, in canonical order"
+    );
+
+    // Per shard, not one figure for the node: activation refuses a mixed set
+    // today, and showing that rather than asking a reader to know it is the
+    // point of the field.
+    let epoch = ready["ownership_epoch"]
+        .as_u64()
+        .expect("readiness line carries the ownership epoch");
+    for entry in shards {
+        assert_eq!(
+            entry["epoch"].as_u64().expect("shard epoch present"),
+            epoch,
+            "every shard's own row must agree with the node's activation epoch"
+        );
+    }
+
+    stop(&mut child);
+}

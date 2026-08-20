@@ -190,10 +190,22 @@ async fn cluster_valid_claim_waits_for_contended_runtime_then_completes() {
     .await
     .expect("retry does not return JournalClosed");
     assert!(matches!(retried, ClaimResult::Granted(_)));
-    assert!(matches!(
-        cluster.read(GridId::new(1), CellId::ROOT).await,
-        Err(orrery_persistd::Reject::JournalClosed)
-    ));
+    // A cell in a grid this cluster does not serve is refused as a *routing*
+    // answer, not as a broken journal: P-7 makes the same raw cell id under
+    // another grid a different entity universe, so no runtime here owns it
+    // (docs/08-persistence.md §3.5). It used to be indistinguishable from a
+    // closed journal, which is the conflation this variant exists to end.
+    assert!(
+        matches!(
+            cluster.read(GridId::new(1), CellId::ROOT).await,
+            Err(orrery_persistd::Reject::WrongOwner {
+                grid,
+                shard: CellId::ROOT,
+                ..
+            }) if grid == GridId::new(1)
+        ),
+        "an unserved grid must be answered as a wrong owner"
+    );
 }
 
 #[tokio::test]

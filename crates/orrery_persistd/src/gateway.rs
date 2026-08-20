@@ -2217,6 +2217,17 @@ enum SessionLeaseOwner {
     Parking(SessionGeneration),
 }
 
+/// One renewal this node could not answer because it hosts no shard over the
+/// cell the lease sits in — carried out of the batch so the heartbeat reply
+/// can name the reason instead of only the refusal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MisaddressedRenewal {
+    entity: PersistId,
+    grid: GridId,
+    cell: CellId,
+    epoch: Epoch,
+}
+
 /// Renew a session's due leases, one router call per grid.
 ///
 /// A heartbeat arrives every 2.5 s naming every lease the peer holds. Those
@@ -2239,12 +2250,21 @@ enum SessionLeaseOwner {
 /// stops a holder writing an entity it no longer owns. The current row is
 /// still returned even when it refuses the renewal: the holder needs to see
 /// who has it now, not merely that it lost it.
+///
+/// The third list is narrower than `invalid` and additive to it: the renewals
+/// that failed *because this node hosts no shard over their cell*, so the
+/// caller can say why (docs/08-persistence.md §3.5) without changing what the
+/// ack itself refuses.
 async fn renew_session_leases(
     router: &Arc<dyn Router>,
     holder: NodeId,
     renewable: &[SessionLease],
     now_ms: u64,
-) -> (Vec<orrery_protocol::Lease>, Vec<(PersistId, LeaseId)>) {
+) -> (
+    Vec<orrery_protocol::Lease>,
+    Vec<(PersistId, LeaseId)>,
+    Vec<MisaddressedRenewal>,
+) {
     let mut groups: Vec<(GridId, Vec<&SessionLease>)> = Vec::new();
     for lease in renewable {
         match groups
@@ -2257,6 +2277,11 @@ async fn renew_session_leases(
     }
     let mut rows = Vec::with_capacity(renewable.len());
     let mut invalid = Vec::new();
+    // Every pair that did not renew, with the cell it was presented at, so the
+    // classification below can ask about the cell rather than guess from the
+    // entity. Refusals only — the happy path adds nothing to this list and
+    // pays nothing for it.
+    let mut refused_at: Vec<(PersistId, GridId, CellId)> = Vec::new();
     for (grid, members) in groups {
         let batch: Vec<_> = members
             .iter()
@@ -2274,6 +2299,7 @@ async fn renew_session_leases(
                     .map(|entry| (entry.entity, entry.lease_id))
                     .collect::<Vec<_>>(),
             );
+            refused_at.extend(batch.iter().map(|entry| (entry.entity, grid, entry.cell)));
             continue;
         };
         let mut answered = 0;
@@ -2287,18 +2313,50 @@ async fn renew_session_leases(
                     rows.push(row);
                     if !current {
                         invalid.push((lease.entity, lease.lease_id));
+                        refused_at.push((lease.entity, grid, lease.cell));
                     }
                 }
-                None => invalid.push((lease.entity, lease.lease_id)),
+                None => {
+                    invalid.push((lease.entity, lease.lease_id));
+                    refused_at.push((lease.entity, grid, lease.cell));
+                }
             }
         }
         // A router that answers short has said nothing about the tail, and a
         // silent tail is exactly the ack blur batching must not introduce.
         for lease in members.iter().skip(answered) {
             invalid.push((lease.entity, lease.lease_id));
+            refused_at.push((lease.entity, grid, lease.cell));
         }
     }
-    (rows, invalid)
+    // Classified *after* the refusals are decided, and only over them.
+    //
+    // The refusals themselves are untouched: every pair that did not renew is
+    // still named individually in `invalid`, because batching must not blur
+    // the ack (docs/04-authority.md §3) and a holder has to learn exactly
+    // which entity it may no longer write. What this adds is the *reason*, for
+    // the one class where the refusal is not about the lease at all — the
+    // shard the lease sits in is not hosted here, so re-addressing is the
+    // response and standing down is not.
+    //
+    // Asked of the router rather than inferred from the router's answer,
+    // because the batched renewal path deliberately degrades an unroutable
+    // entry to a per-entry `None` (`CellRuntime::heartbeat_leases`) rather
+    // than failing a whole batch that may straddle owned and unowned cells.
+    // A `None` therefore carries no reason of its own, and one lookup per
+    // *refused* renewal is what recovers it.
+    let mut misaddressed = Vec::new();
+    for (entity, grid, cell) in refused_at {
+        if let Some(epoch) = router.wrong_owner_epoch(grid, cell).await {
+            misaddressed.push(MisaddressedRenewal {
+                entity,
+                grid,
+                cell,
+                epoch,
+            });
+        }
+    }
+    (rows, invalid, misaddressed)
 }
 
 /// Resolve a batched renewal against the session's lease index.
@@ -4422,6 +4480,36 @@ async fn serve_lease_message(cx: &LeaseContext, work: LeaseWork) {
                 return;
             }
             drop(peer);
+            // Asked before anything arbitrates, because arbitration cannot
+            // reach the right answer here. A claim for a cell no shard of
+            // this node covers fails `plausible` below — `committed_entity_
+            // cell` finds nothing for an entity this node hosts no actor for
+            // — and comes back `NotEligible`, which is a statement about the
+            // *claimant*. It is the wrong statement: the claimant may be
+            // perfectly eligible, at a node that is not this one
+            // (docs/08-persistence.md §3.5). The claim-rate token has already
+            // been spent above, so this cannot be driven any faster than an
+            // ordinary claim.
+            if let Some(epoch) = router.wrong_owner_epoch(grid, cell).await {
+                send(Bytes::from(encode_stream_frame(&GatewayReply::Lease {
+                    message: LeaseMsg::Deny {
+                        claim_id: Some(claim_id),
+                        entity,
+                        reason: orrery_protocol::DenyReason::WrongOwner {
+                            grid,
+                            shard: cell,
+                            epoch,
+                            // ADR-0026's question, deliberately unanswered
+                            // here. See `DenyReason::WrongOwner`.
+                            owner: None,
+                        },
+                        // No timer helps: re-addressing is the only thing
+                        // that changes this answer.
+                        retry_after_ms: 0,
+                    },
+                })));
+                return;
+            }
             if !active_session.try_reserve_lease_slot().await {
                 send(Bytes::from(encode_stream_frame(&GatewayReply::Lease {
                     message: LeaseMsg::Deny {
@@ -4560,13 +4648,31 @@ async fn serve_lease_message(cx: &LeaseContext, work: LeaseWork) {
                         retry_after_ms,
                     }
                 }
-                Err(_) => {
+                Err(error) => {
                     let _ = active_session.complete_lease_claim(None).await;
-                    LeaseMsg::Deny {
-                        claim_id: Some(claim_id),
-                        entity,
-                        reason: orrery_protocol::DenyReason::NotEligible,
-                        retry_after_ms: 100,
+                    // A route that found no actor is answered by name, not as
+                    // a generic ineligibility: the claimant is eligible, it is
+                    // simply asking the wrong node. Every other routing
+                    // failure keeps the old answer, including its 100 ms
+                    // backoff — those *are* worth retrying here.
+                    match error {
+                        Reject::WrongOwner { grid, shard, epoch } => LeaseMsg::Deny {
+                            claim_id: Some(claim_id),
+                            entity,
+                            reason: orrery_protocol::DenyReason::WrongOwner {
+                                grid,
+                                shard,
+                                epoch,
+                                owner: None,
+                            },
+                            retry_after_ms: 0,
+                        },
+                        Reject::JournalClosed | Reject::LeaseStore => LeaseMsg::Deny {
+                            claim_id: Some(claim_id),
+                            entity,
+                            reason: orrery_protocol::DenyReason::NotEligible,
+                            retry_after_ms: 100,
+                        },
                     }
                 }
             };
@@ -4610,7 +4716,7 @@ async fn serve_lease_message(cx: &LeaseContext, work: LeaseWork) {
             drop(peer);
             trace.resolve_us = lease_stage_us(resolve_started);
             let route_started = Instant::now();
-            let (rows, refused) =
+            let (rows, refused, misaddressed) =
                 renew_session_leases(router, remote, &renewable, registrar_now_ms()).await;
             trace.route_us = lease_stage_us(route_started);
             let mut rows = rows;
@@ -4629,6 +4735,34 @@ async fn serve_lease_message(cx: &LeaseContext, work: LeaseWork) {
                     invalid,
                 },
             })));
+            // After the ack, never instead of it. `HeartbeatAck` is the
+            // renewal contract and it is unchanged; these say *why* a pair in
+            // its `invalid` list could not be answered here, one message per
+            // entity because that is the granularity the ack itself keeps.
+            //
+            // `claim_id: None` because no claim was made: this is an
+            // unsolicited statement about routing, and a `Deny` is the only
+            // message on the lease surface that carries a `DenyReason` at all.
+            // A client with no matching pending claim ignores it, which is the
+            // correct floor — a peer that has not been taught to read it is no
+            // worse off than before this existed.
+            if !vanished {
+                for entry in misaddressed {
+                    send(Bytes::from(encode_stream_frame(&GatewayReply::Lease {
+                        message: LeaseMsg::Deny {
+                            claim_id: None,
+                            entity: entry.entity,
+                            reason: orrery_protocol::DenyReason::WrongOwner {
+                                grid: entry.grid,
+                                shard: entry.cell,
+                                epoch: entry.epoch,
+                                owner: None,
+                            },
+                            retry_after_ms: 0,
+                        },
+                    })));
+                }
+            }
             trace.encode_us = lease_stage_us(encode_started);
             trace.heartbeat_us = lease_stage_us(started);
             lease_stage_metrics().record(&trace);
@@ -5504,6 +5638,20 @@ async fn route_session_diff(
     }
 }
 
+/// The wire reason code a [`Reject`] travels back to the client as.
+///
+/// The distinction that earns the function: `NotOwned` is not a failure of
+/// this write, it is a statement about this *node*. A client that folds it
+/// into [`orrery_protocol::BULK_NACK_JOURNAL`] cannot tell a broken gateway
+/// from the wrong one, which is the whole defect this reason code closes
+/// (docs/08-persistence.md §3.5).
+fn bulk_nack_reason(reject: &Reject) -> u16 {
+    match reject {
+        Reject::WrongOwner { .. } => orrery_protocol::BULK_NACK_WRONG_OWNER,
+        Reject::JournalClosed | Reject::LeaseStore => orrery_protocol::BULK_NACK_JOURNAL,
+    }
+}
+
 struct DiffRoute {
     diff: DiffUplink,
     author: NodeId,
@@ -5726,11 +5874,11 @@ async fn route_diff(
                 elapsed_us(received_at),
             );
         }
-        Err(_) => {
+        Err(error) => {
             let reply = GatewayReply::BulkNack {
                 entity,
                 tick,
-                reason: 1,
+                reason: bulk_nack_reason(&error),
                 lease: None,
             };
             send(Bytes::from(encode_datagram(&reply)));
@@ -5781,6 +5929,23 @@ async fn route_subscribe(
         } else {
             router.read_cold(grid, cell).await
         };
+        // A cold miss on a cell this node owns no shard over is not an empty
+        // cell, and an empty `AreaPage` would assert that it is. The order
+        // matters: a cold store that *did* find rows still answers, because a
+        // global durable tier can legitimately serve a cell whose live actor
+        // lives elsewhere — only the "found nothing" case has to fall back to
+        // saying who could not answer.
+        let read = match read {
+            Ok(None) => match router.wrong_owner_epoch(grid, cell).await {
+                Some(epoch) => Err(Reject::WrongOwner {
+                    grid,
+                    shard: cell,
+                    epoch,
+                }),
+                None => Ok(None),
+            },
+            other => other,
+        };
         match read {
             Ok(page) => {
                 let page = page.unwrap_or_default();
@@ -5801,10 +5966,10 @@ async fn route_subscribe(
                 }
             }
             Err(e) => {
-                let kind = if live {
-                    orrery_protocol::AREA_LOAD_ERR_LIVE
-                } else {
-                    orrery_protocol::AREA_LOAD_ERR_COLD
+                let kind = match (&e, live) {
+                    (Reject::WrongOwner { .. }, _) => orrery_protocol::AREA_LOAD_ERR_WRONG_OWNER,
+                    (_, true) => orrery_protocol::AREA_LOAD_ERR_LIVE,
+                    (_, false) => orrery_protocol::AREA_LOAD_ERR_COLD,
                 };
                 warn!(?e, ?cell, %grid, %remote, kind, "gateway: area-load cell read failed");
                 metrics.record_cell_read_error();
@@ -7518,7 +7683,7 @@ mod tests {
                 short: false,
                 holder,
             });
-            let (rows, invalid) = renew_session_leases(&router, holder, &leases, 0).await;
+            let (rows, invalid, _) = renew_session_leases(&router, holder, &leases, 0).await;
             assert_eq!(rows.len(), HELD as usize, "every held row is acked");
             assert!(invalid.is_empty(), "nothing was refused: {invalid:?}");
             measured.push(turns.load(Ordering::SeqCst));
@@ -7589,7 +7754,7 @@ mod tests {
                 short: false,
                 holder,
             });
-            let (rows, invalid) = renew_session_leases(&router, holder, &leases, 0).await;
+            let (rows, invalid, _) = renew_session_leases(&router, holder, &leases, 0).await;
             assert_eq!(rows.len(), HELD, "every held row is acked");
             assert!(invalid.is_empty(), "nothing was refused: {invalid:?}");
             measured.push(turns.load(Ordering::SeqCst));
@@ -7634,7 +7799,7 @@ mod tests {
             holder,
         });
 
-        let (rows, invalid) = renew_session_leases(&router, holder, &leases, 0).await;
+        let (rows, invalid, _) = renew_session_leases(&router, holder, &leases, 0).await;
 
         assert_eq!(turns.load(Ordering::SeqCst), 2);
         assert_eq!(*sizes.lock().expect("sizes"), vec![4, 4]);
@@ -7662,12 +7827,111 @@ mod tests {
             holder,
         });
 
-        let (rows, invalid) = renew_session_leases(&router, holder, &leases, 0).await;
+        let (rows, invalid, _) = renew_session_leases(&router, holder, &leases, 0).await;
 
         assert_eq!(turns.load(Ordering::SeqCst), 1);
         assert_eq!(invalid, vec![(refused, LeaseId(1))]);
         assert_eq!(rows.len(), HELD as usize - 1);
         assert!(rows.iter().all(|row| row.entity != refused));
+    }
+
+    /// A router that renews nothing and disowns one cell, so the two halves of
+    /// a refusal — *that* it failed and *why* — can be told apart.
+    struct DisowningRenewalRouter {
+        disowned: CellId,
+        epoch: Epoch,
+    }
+
+    #[async_trait::async_trait]
+    impl Router for DisowningRenewalRouter {
+        async fn apply(
+            &self,
+            _record: JournalRecord,
+        ) -> Result<Arc<crate::journal::AppendHandle>, Reject> {
+            Err(Reject::JournalClosed)
+        }
+        async fn read(&self, _grid: GridId, _cell: CellId) -> Result<SnapshotPage, Reject> {
+            Err(Reject::JournalClosed)
+        }
+        async fn has_actor(&self, _grid: GridId, _cell: CellId) -> bool {
+            false
+        }
+        async fn wrong_owner_epoch(
+            &self,
+            _grid: GridId,
+            cell: CellId,
+        ) -> Option<orrery_protocol::Epoch> {
+            (cell == self.disowned).then_some(self.epoch)
+        }
+        async fn heartbeat_lease(
+            &self,
+            _grid: GridId,
+            _cell: CellId,
+            _entity: PersistId,
+            _holder: NodeId,
+            _lease_id: LeaseId,
+            _now_ms: u64,
+        ) -> Result<Option<orrery_protocol::Lease>, Reject> {
+            Ok(None)
+        }
+    }
+
+    /// A renewal refused because its shard is not hosted here is reported with
+    /// its reason, and one refused for any other cause is not.
+    ///
+    /// The ack itself is unchanged in both cases — both pairs are named
+    /// individually in `invalid`, because batching must not blur it. What the
+    /// classification adds is the second list, and the whole value of that
+    /// list is that it is *narrower* than the refusals: a peer told "wrong
+    /// owner" about a lease this node does own would re-address a write that
+    /// belonged here.
+    #[tokio::test]
+    async fn only_the_renewal_whose_shard_is_elsewhere_is_reported_as_misaddressed() {
+        let holder = iroh::SecretKey::from_bytes(&[15; 32]).public();
+        let shards = CellId::ROOT.children();
+        let (mine, theirs) = (shards[0], shards[1]);
+        let leases = vec![
+            SessionLease {
+                entity: PersistId::new(1),
+                lease_id: LeaseId(1),
+                grid: GridId::ROOT,
+                cell: mine,
+                owner: SessionLeaseOwner::Active(SessionGeneration(1)),
+            },
+            SessionLease {
+                entity: PersistId::new(2),
+                lease_id: LeaseId(1),
+                grid: GridId::ROOT,
+                cell: theirs,
+                owner: SessionLeaseOwner::Active(SessionGeneration(1)),
+            },
+        ];
+        let router: Arc<dyn Router> = Arc::new(DisowningRenewalRouter {
+            disowned: theirs,
+            epoch: Epoch::new(4),
+        });
+
+        let (rows, invalid, misaddressed) = renew_session_leases(&router, holder, &leases, 0).await;
+
+        assert!(rows.is_empty());
+        assert_eq!(
+            invalid,
+            vec![
+                (PersistId::new(1), LeaseId(1)),
+                (PersistId::new(2), LeaseId(1))
+            ],
+            "both pairs are still refused individually; the ack does not change"
+        );
+        assert_eq!(
+            misaddressed,
+            vec![MisaddressedRenewal {
+                entity: PersistId::new(2),
+                grid: GridId::ROOT,
+                cell: theirs,
+                epoch: Epoch::new(4),
+            }],
+            "only the lease whose shard is elsewhere carries a routing reason"
+        );
     }
 
     /// A router that answers short has said nothing about the tail, and a
@@ -7687,7 +7951,7 @@ mod tests {
             holder,
         });
 
-        let (rows, invalid) = renew_session_leases(&router, holder, &leases, 0).await;
+        let (rows, invalid, _) = renew_session_leases(&router, holder, &leases, 0).await;
 
         assert_eq!(rows.len(), 1);
         assert_eq!(

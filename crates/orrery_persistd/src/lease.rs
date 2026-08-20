@@ -73,6 +73,11 @@ pub fn retry_after_ms(reason: &DenyReason) -> u32 {
     match reason {
         DenyReason::Held { .. } | DenyReason::Parked => CLAIM_HERD_DAMPER_MS as u32,
         DenyReason::StrongHeld | DenyReason::NotEligible | DenyReason::RateLimited => 0,
+        // Not a race and not a decision either: the claim went to a node that
+        // hosts no shard over the cell. Waiting changes nothing about that,
+        // and advising a wait would invite exactly the wrong response — the
+        // claimant has to re-address, not re-time.
+        DenyReason::WrongOwner { .. } => 0,
     }
 }
 

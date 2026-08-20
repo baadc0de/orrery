@@ -4,7 +4,7 @@ use core::cmp::Ordering;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{CellId, GridId, Lsn, NodeId, PersistId, Tick};
+use crate::{CellId, Epoch, GridId, Lsn, NodeId, PersistId, Tick};
 
 /// The authoritative sequence pair for an entity.
 ///
@@ -162,6 +162,44 @@ pub enum DenyReason {
     RateLimited,
     /// Entity is intentionally parked.
     Parked,
+    /// This node hosts no shard covering the cell the claim named, so it is
+    /// not the owner for that entity (docs/08-persistence.md §3.5).
+    ///
+    /// Distinct from every other variant because it says nothing about the
+    /// *claim*: the claim may be perfectly well-formed and the claimant
+    /// perfectly eligible. What is wrong is the address. A peer that reads it
+    /// as [`DenyReason::NotEligible`] backs off against a node that will never
+    /// answer for this cell however long it waits.
+    ///
+    /// `shard` echoes the cell the request named. It is the finest shard
+    /// identity this node can state: hosting no shard over that cell is
+    /// precisely the condition being reported, so a coarser owning shard is
+    /// not something it can look up. `epoch` is the shard-ownership epoch
+    /// (`FenceRow.epoch`) this node last activated its *own* shards under,
+    /// which is what §3.5's "reroute on epoch bump" is written against — a
+    /// claimant that has seen a higher epoch knows its routing table is the
+    /// fresher of the two.
+    ///
+    /// **`owner` is always `None` today, and the field exists so that stays
+    /// cheap to change.** Which node the claimant should have asked is
+    /// ADR-0026's question, and that record is still *Proposed* — nothing here
+    /// resolves, follows or depends on a redirect. But postcard encodes a
+    /// struct variant's fields positionally, so a field appended after the
+    /// fact is a wire break, whereas an `Option` that is already on the wire
+    /// costs one zero byte now and nothing at all later. The hole is shaped,
+    /// not filled.
+    WrongOwner {
+        /// The grid the refused request named (P-7: cell ids are
+        /// grid-relative, so a cell without its grid names nothing).
+        grid: GridId,
+        /// The cell the refused request named.
+        shard: CellId,
+        /// The shard-ownership epoch this node last activated under.
+        epoch: Epoch,
+        /// The node that should have been asked, once anything can say
+        /// (ADR-0026). Always `None` from this build.
+        owner: Option<NodeId>,
+    },
 }
 
 /// Why a lease was withdrawn.
@@ -336,6 +374,98 @@ mod tests {
         };
         let bytes = postcard::to_stdvec(&message).unwrap();
         assert_eq!(postcard::from_bytes::<LeaseMsg>(&bytes).unwrap(), message);
+    }
+
+    /// The wrong-owner refusal decodes under the current `PROTOCOL_VERSION`,
+    /// and appending it left every older variant on the byte it already had.
+    ///
+    /// Postcard keys enum variants **positionally**, so this is the whole
+    /// compatibility argument for a `{V, V−1}` window: a V−1 peer's `Deny`
+    /// names one of `Held`/`StrongHeld`/`NotEligible`/`RateLimited`/`Parked`,
+    /// and those five still encode as discriminants 0..=4 with the payloads
+    /// they always had. A reordering — not an appending — is what would break
+    /// them, silently and in both directions.
+    #[test]
+    fn the_wrong_owner_refusal_decodes_without_moving_the_variants_before_it() {
+        assert_eq!(
+            crate::PROTOCOL_VERSION,
+            1,
+            "this test pins the wire under a specific version; re-check it when the window moves"
+        );
+
+        let wrong_owner = DenyReason::WrongOwner {
+            grid: GridId::ROOT,
+            shard: CellId::ROOT,
+            epoch: Epoch(7),
+            owner: None,
+        };
+        let bytes = postcard::to_stdvec(&wrong_owner).unwrap();
+        assert_eq!(
+            bytes[0], 5,
+            "WrongOwner must be appended after Parked, never inserted"
+        );
+        assert_eq!(
+            postcard::from_bytes::<DenyReason>(&bytes).unwrap(),
+            wrong_owner
+        );
+
+        // Carried on the message a claimant actually reads it from.
+        let message = LeaseMsg::Deny {
+            claim_id: Some(ClaimId(3)),
+            entity: PersistId::new(11),
+            reason: wrong_owner,
+            retry_after_ms: 0,
+        };
+        let bytes = postcard::to_stdvec(&message).unwrap();
+        assert_eq!(postcard::from_bytes::<LeaseMsg>(&bytes).unwrap(), message);
+
+        // The V−1 half: every frame a peer built before this variant existed
+        // still decodes to exactly what it encoded.
+        let previously_encodable = [
+            DenyReason::Held {
+                holder: {
+                    let mut seed = [0u8; 32];
+                    seed[0] = 7;
+                    iroh_base::SecretKey::from_bytes(&seed).public()
+                },
+                seq: SeqPair {
+                    own_seq: 2,
+                    auth_seq: 3,
+                },
+            },
+            DenyReason::StrongHeld,
+            DenyReason::NotEligible,
+            DenyReason::RateLimited,
+            DenyReason::Parked,
+        ];
+        for (discriminant, reason) in previously_encodable.into_iter().enumerate() {
+            let bytes = postcard::to_stdvec(&reason).unwrap();
+            assert_eq!(
+                usize::from(bytes[0]),
+                discriminant,
+                "a V−1 peer's {reason:?} moved on the wire"
+            );
+            assert_eq!(postcard::from_bytes::<DenyReason>(&bytes).unwrap(), reason);
+        }
+    }
+
+    /// The bulk-NACK reason codes are distinct and stable.
+    ///
+    /// They ride a `u16` field that already existed, so there is no
+    /// discriminant to protect — what has to hold is that the not-owned code
+    /// is not one of the two a V−1 gateway already emits, because a peer
+    /// classifying on it would otherwise revoke a lease on an ordinary
+    /// journal failure.
+    #[test]
+    fn the_bulk_nack_reason_codes_do_not_collide() {
+        use crate::{BULK_NACK_JOURNAL, BULK_NACK_REFUSED, BULK_NACK_WRONG_OWNER};
+        assert_eq!((BULK_NACK_JOURNAL, BULK_NACK_REFUSED), (1, 2));
+        assert_eq!(BULK_NACK_WRONG_OWNER, 3);
+        assert_ne!(BULK_NACK_WRONG_OWNER, BULK_NACK_JOURNAL);
+        assert_ne!(BULK_NACK_WRONG_OWNER, BULK_NACK_REFUSED);
+        assert_eq!(crate::AREA_LOAD_ERR_WRONG_OWNER, 3);
+        assert_ne!(crate::AREA_LOAD_ERR_WRONG_OWNER, crate::AREA_LOAD_ERR_LIVE);
+        assert_ne!(crate::AREA_LOAD_ERR_WRONG_OWNER, crate::AREA_LOAD_ERR_COLD);
     }
 
     #[test]

@@ -641,12 +641,15 @@ async fn gated_mutex_actor(
     } else {
         presented_cell
     };
-    let actor = runtime
-        .lock()
-        .await
-        .actor(grid, route_cell)
-        .cloned()
-        .ok_or(Reject::JournalClosed)?;
+    let (actor, runtime_epoch) = {
+        let runtime = runtime.lock().await;
+        (runtime.actor(grid, route_cell).cloned(), runtime.epoch())
+    };
+    let actor = actor.ok_or(Reject::WrongOwner {
+        grid,
+        shard: route_cell,
+        epoch: runtime_epoch,
+    })?;
     Ok((guard, actor))
 }
 
@@ -711,6 +714,28 @@ pub trait Router: Send + Sync {
 
     /// Whether a live actor holds `cell` in `grid` (vs a cold FDB scan).
     async fn has_actor(&self, grid: GridId, cell: CellId) -> bool;
+
+    /// This router's shard-ownership epoch when it is **certain** it hosts no
+    /// shard covering `cell`; `None` when it does host one, or cannot tell.
+    ///
+    /// [`Router::has_actor`] cannot answer this question, and the difference
+    /// is the whole reason for a second method: `false` there means "no live
+    /// actor", which covers both "not mine" and "mine, but cold". Only the
+    /// first is a routing mistake, and only the first may be reported as one
+    /// — telling a peer it asked the wrong node about a cell this node does
+    /// own would send it looking for an owner that does not exist.
+    ///
+    /// The default is `None`, so a router that has not thought about the
+    /// question stays exactly as opaque as it was rather than volunteering an
+    /// answer it cannot support.
+    async fn wrong_owner_epoch(
+        &self,
+        grid: GridId,
+        cell: CellId,
+    ) -> Option<orrery_protocol::Epoch> {
+        let _ = (grid, cell);
+        None
+    }
 
     /// Resolve an entity's committed cell without trusting a client cell hint.
     async fn committed_entity_cell(
@@ -1017,6 +1042,21 @@ async fn finish_location_audit(
 
 /// Route-side helpers for the fenced bulk path.
 impl CellRuntime {
+    /// The rejection for a cell no shard of this runtime covers.
+    ///
+    /// Every route in this module resolves a cell to an actor, and every one
+    /// of them can come up empty for the same reason: this process was not
+    /// started with a `--shard` covering that cell. Naming the reason in one
+    /// place keeps the epoch that travels with it honest — it is always
+    /// *this* runtime's activation epoch, never a neighbour's guess.
+    fn wrong_owner(&self, cell: CellId) -> Reject {
+        Reject::WrongOwner {
+            grid: self.grid(),
+            shard: cell,
+            epoch: self.epoch(),
+        }
+    }
+
     /// Sampled proof that invariant J held for an accepted fenced diff.
     ///
     /// The accept-set equivalence argument has exactly one silent failure
@@ -1278,7 +1318,7 @@ impl CellRuntime {
             .await?
             .unwrap_or(record.cell);
         self.actor(record.grid, route_cell)
-            .ok_or(Reject::JournalClosed)?
+            .ok_or_else(|| self.wrong_owner(route_cell))?
             .start_fenced_diff(record, holder, lease_id, authority_seq, now_ms)
             .await
     }
@@ -1302,7 +1342,7 @@ impl Router for CellRuntime {
     }
     async fn apply(&self, record: JournalRecord) -> Result<Arc<AppendHandle>, Reject> {
         self.actor(record.grid, record.cell)
-            .ok_or(Reject::JournalClosed)?
+            .ok_or_else(|| self.wrong_owner(record.cell))?
             .start_diff(record)
             .await
     }
@@ -1418,7 +1458,9 @@ impl Router for CellRuntime {
         let route_cell = self.lease_location(entity).await?.unwrap_or(presented);
         drop(permit);
         let locate_us = stage_elapsed_us(locate_started);
-        let resolved = self.actor(grid, route_cell).ok_or(Reject::JournalClosed)?;
+        let resolved = self
+            .actor(grid, route_cell)
+            .ok_or_else(|| self.wrong_owner(route_cell))?;
         // Compared by shard, not by handle identity: `CellRuntime::split`
         // swaps handles, and re-sending to the actor that already answered
         // would be a second turn for the same answer.
@@ -1453,13 +1495,25 @@ impl Router for CellRuntime {
 
     async fn read(&self, grid: GridId, cell: CellId) -> Result<SnapshotPage, Reject> {
         self.actor(grid, cell)
-            .ok_or(Reject::JournalClosed)?
+            .ok_or_else(|| self.wrong_owner(cell))?
             .read_snapshot(vec![cell])
             .await
     }
 
     async fn has_actor(&self, grid: GridId, cell: CellId) -> bool {
         self.actor(grid, cell).is_some()
+    }
+    async fn wrong_owner_epoch(
+        &self,
+        grid: GridId,
+        cell: CellId,
+    ) -> Option<orrery_protocol::Epoch> {
+        // `owning_shard` is the same deepest-prefix rule the routes use, and
+        // it carries P-7's grid guard, so a cell from another grid is
+        // correctly reported as not ours rather than matched on raw bits.
+        self.owning_shard(grid, cell)
+            .is_none()
+            .then(|| self.epoch())
     }
     async fn committed_entity_cell(
         &self,
@@ -1496,7 +1550,7 @@ impl Router for CellRuntime {
         let _guard = gate.lock_owned().await;
         let route_cell = self.lease_location(entity).await?.unwrap_or(cell);
         self.actor(grid, route_cell)
-            .ok_or(Reject::JournalClosed)?
+            .ok_or_else(|| self.wrong_owner(route_cell))?
             .claim_lease(entity, cell, holder, kind, now_ms)
             .await
     }
@@ -1513,7 +1567,7 @@ impl Router for CellRuntime {
         let _guard = gate.lock_owned().await;
         let route_cell = self.lease_location(entity).await?.unwrap_or(cell);
         self.actor(grid, route_cell)
-            .ok_or(Reject::JournalClosed)?
+            .ok_or_else(|| self.wrong_owner(route_cell))?
             .heartbeat_lease(entity, holder, lease_id, now_ms)
             .await
     }
@@ -1663,7 +1717,7 @@ impl Router for CellRuntime {
         let _guard = gate.lock_owned().await;
         let route_cell = self.lease_location(entity).await?.unwrap_or(cell);
         self.actor(grid, route_cell)
-            .ok_or(Reject::JournalClosed)?
+            .ok_or_else(|| self.wrong_owner(route_cell))?
             .validate_lease(entity, holder, lease_id, now_ms)
             .await
     }
@@ -1679,7 +1733,7 @@ impl Router for CellRuntime {
         let _guard = gate.lock_owned().await;
         let route_cell = self.lease_location(entity).await?.unwrap_or(cell);
         self.actor(grid, route_cell)
-            .ok_or(Reject::JournalClosed)?
+            .ok_or_else(|| self.wrong_owner(route_cell))?
             .park_lease(entity, holder, lease_id)
             .await
     }
@@ -1729,6 +1783,13 @@ impl Router for Arc<CellRuntime> {
 
     async fn has_actor(&self, grid: GridId, cell: CellId) -> bool {
         <CellRuntime as Router>::has_actor(self.as_ref(), grid, cell).await
+    }
+    async fn wrong_owner_epoch(
+        &self,
+        grid: GridId,
+        cell: CellId,
+    ) -> Option<orrery_protocol::Epoch> {
+        <CellRuntime as Router>::wrong_owner_epoch(self.as_ref(), grid, cell).await
     }
     async fn committed_entity_cell(
         &self,
@@ -1837,12 +1898,16 @@ impl Router for tokio::sync::Mutex<CellRuntime> {
         }
     }
     async fn apply(&self, record: JournalRecord) -> Result<Arc<AppendHandle>, Reject> {
-        let handle = {
+        let (handle, epoch) = {
             let rt = self.lock().await;
-            rt.actor(record.grid, record.cell).cloned()
+            (rt.actor(record.grid, record.cell).cloned(), rt.epoch())
         };
         handle
-            .ok_or(Reject::JournalClosed)?
+            .ok_or(Reject::WrongOwner {
+                grid: record.grid,
+                shard: record.cell,
+                epoch,
+            })?
             .start_diff(record)
             .await
     }
@@ -1883,12 +1948,16 @@ impl Router for tokio::sync::Mutex<CellRuntime> {
     }
 
     async fn read(&self, grid: GridId, cell: CellId) -> Result<SnapshotPage, Reject> {
-        let handle = {
+        let (handle, epoch) = {
             let rt = self.lock().await;
-            rt.actor(grid, cell).cloned()
+            (rt.actor(grid, cell).cloned(), rt.epoch())
         };
         handle
-            .ok_or(Reject::JournalClosed)?
+            .ok_or(Reject::WrongOwner {
+                grid,
+                shard: cell,
+                epoch,
+            })?
             .read_snapshot(vec![cell])
             .await
     }
@@ -1896,6 +1965,14 @@ impl Router for tokio::sync::Mutex<CellRuntime> {
     async fn has_actor(&self, grid: GridId, cell: CellId) -> bool {
         let rt = self.lock().await;
         rt.actor(grid, cell).is_some()
+    }
+    async fn wrong_owner_epoch(
+        &self,
+        grid: GridId,
+        cell: CellId,
+    ) -> Option<orrery_protocol::Epoch> {
+        let rt = self.lock().await;
+        rt.owning_shard(grid, cell).is_none().then(|| rt.epoch())
     }
     async fn committed_entity_cell(
         &self,
@@ -2149,6 +2226,13 @@ impl Router for Arc<tokio::sync::Mutex<CellRuntime>> {
     async fn has_actor(&self, grid: GridId, cell: CellId) -> bool {
         self.as_ref().has_actor(grid, cell).await
     }
+    async fn wrong_owner_epoch(
+        &self,
+        grid: GridId,
+        cell: CellId,
+    ) -> Option<orrery_protocol::Epoch> {
+        self.as_ref().wrong_owner_epoch(grid, cell).await
+    }
     async fn committed_entity_cell(
         &self,
         grid: GridId,
@@ -2278,6 +2362,19 @@ impl<R: Router + Send + Sync> Router for ColdFallbackRouter<R> {
 
     async fn has_actor(&self, grid: GridId, cell: CellId) -> bool {
         self.live.has_actor(grid, cell).await
+    }
+    async fn wrong_owner_epoch(
+        &self,
+        grid: GridId,
+        cell: CellId,
+    ) -> Option<orrery_protocol::Epoch> {
+        // Delegated, not suppressed. The cold store is global, so this router
+        // can *read* a cell it owns no shard over — but it still cannot
+        // arbitrate a lease or admit a write for one, and a cold read that
+        // finds nothing is not evidence the cell is empty. Ownership is the
+        // live half's answer either way; `route_subscribe` is what decides
+        // whether a cold answer overrides it.
+        self.live.wrong_owner_epoch(grid, cell).await
     }
 
     async fn committed_entity_cell(
@@ -2439,6 +2536,21 @@ impl Cluster {
         Some(rt)
     }
 
+    /// The rejection for a cell rendezvous placement assigns to no runtime in
+    /// this cluster.
+    ///
+    /// The epoch is zero and that is the honest answer, not a placeholder: a
+    /// cell with no runtime here has no local activation to report an epoch
+    /// from. Where a runtime *is* found and only the actor is missing, the
+    /// runtime's own epoch travels instead.
+    fn unplaced(grid: GridId, cell: CellId) -> Reject {
+        Reject::WrongOwner {
+            grid,
+            shard: cell,
+            epoch: orrery_protocol::Epoch::new(0),
+        }
+    }
+
     /// The node set (for diagnostics).
     #[must_use]
     pub fn nodes(&self) -> &[RendezvousNode] {
@@ -2505,13 +2617,17 @@ impl Router for Cluster {
     async fn apply(&self, record: JournalRecord) -> Result<Arc<AppendHandle>, Reject> {
         let rt = self
             .runtime_for(record.grid, record.cell)
-            .ok_or(Reject::JournalClosed)?;
-        let handle = {
+            .ok_or_else(|| Self::unplaced(record.grid, record.cell))?;
+        let (handle, epoch) = {
             let rt = rt.lock().await;
-            rt.actor(record.grid, record.cell).cloned()
+            (rt.actor(record.grid, record.cell).cloned(), rt.epoch())
         };
         handle
-            .ok_or(Reject::JournalClosed)?
+            .ok_or(Reject::WrongOwner {
+                grid: record.grid,
+                shard: record.cell,
+                epoch,
+            })?
             .start_diff(record)
             .await
     }
@@ -2540,13 +2656,19 @@ impl Router for Cluster {
     }
 
     async fn read(&self, grid: GridId, cell: CellId) -> Result<SnapshotPage, Reject> {
-        let rt = self.runtime_for(grid, cell).ok_or(Reject::JournalClosed)?;
-        let handle = {
+        let rt = self
+            .runtime_for(grid, cell)
+            .ok_or_else(|| Self::unplaced(grid, cell))?;
+        let (handle, epoch) = {
             let rt = rt.lock().await;
-            rt.actor(grid, cell).cloned()
+            (rt.actor(grid, cell).cloned(), rt.epoch())
         };
         handle
-            .ok_or(Reject::JournalClosed)?
+            .ok_or(Reject::WrongOwner {
+                grid,
+                shard: cell,
+                epoch,
+            })?
             .read_snapshot(vec![cell])
             .await
     }
@@ -2557,6 +2679,21 @@ impl Router for Cluster {
         };
         let rt = rt.lock().await;
         rt.actor(grid, cell).is_some()
+    }
+    async fn wrong_owner_epoch(
+        &self,
+        grid: GridId,
+        cell: CellId,
+    ) -> Option<orrery_protocol::Epoch> {
+        // Two ways to not own a cell in a cluster, and both are reportable:
+        // rendezvous placement names no runtime here at all (epoch 0 — there
+        // is no local activation to quote), or it names one whose shard set
+        // does not reach the cell.
+        let Some(rt) = self.runtime_for(grid, cell) else {
+            return Some(orrery_protocol::Epoch::new(0));
+        };
+        let rt = rt.lock().await;
+        rt.owning_shard(grid, cell).is_none().then(|| rt.epoch())
     }
     async fn committed_entity_cell(
         &self,
@@ -2587,7 +2724,7 @@ impl Router for Cluster {
             .await?
             .unwrap_or(cell);
         self.runtime_for(grid, route_cell)
-            .ok_or(Reject::JournalClosed)?
+            .ok_or_else(|| Self::unplaced(grid, route_cell))?
             .claim_lease(grid, cell, entity, holder, kind, now_ms)
             .await
     }
@@ -2607,7 +2744,7 @@ impl Router for Cluster {
             .await?
             .unwrap_or(cell);
         self.runtime_for(grid, route_cell)
-            .ok_or(Reject::JournalClosed)?
+            .ok_or_else(|| Self::unplaced(grid, route_cell))?
             .heartbeat_lease(grid, route_cell, entity, holder, lease_id, now_ms)
             .await
     }
@@ -2755,7 +2892,7 @@ impl Router for Cluster {
             .await?
             .unwrap_or(cell);
         self.runtime_for(grid, route_cell)
-            .ok_or(Reject::JournalClosed)?
+            .ok_or_else(|| Self::unplaced(grid, route_cell))?
             .validate_lease(grid, route_cell, entity, holder, lease_id, now_ms)
             .await
     }
@@ -2774,7 +2911,7 @@ impl Router for Cluster {
             .await?
             .unwrap_or(cell);
         self.runtime_for(grid, route_cell)
-            .ok_or(Reject::JournalClosed)?
+            .ok_or_else(|| Self::unplaced(grid, route_cell))?
             .park_lease(grid, route_cell, entity, holder, lease_id)
             .await
     }
@@ -2804,13 +2941,17 @@ impl Router for Cluster {
             .unwrap_or(record.cell);
         let rt = self
             .runtime_for(record.grid, route_cell)
-            .ok_or(Reject::JournalClosed)?;
-        let handle = {
+            .ok_or_else(|| Self::unplaced(record.grid, route_cell))?;
+        let (handle, epoch) = {
             let rt = rt.lock().await;
-            rt.actor(record.grid, route_cell).cloned()
+            (rt.actor(record.grid, route_cell).cloned(), rt.epoch())
         };
         handle
-            .ok_or(Reject::JournalClosed)?
+            .ok_or(Reject::WrongOwner {
+                grid: record.grid,
+                shard: route_cell,
+                epoch,
+            })?
             .start_fenced_diff(record, holder, lease_id, authority_seq, now_ms)
             .await
     }

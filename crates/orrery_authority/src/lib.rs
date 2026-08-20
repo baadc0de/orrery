@@ -460,7 +460,32 @@ pub fn process_lease_replies(
                 reason,
                 ..
             } => {
-                if claim_id.is_none() || state.pending_claims.get(&entity) != claim_id.as_ref() {
+                // A wrong-owner refusal is the one `DenyReason` that is not
+                // about the claimant at all: the node it reached hosts no
+                // shard over the cell (docs/08-persistence.md §3.5). The
+                // gateway also sends it **unsolicited** — with no `claim_id`
+                // — when a batched heartbeat could not be routed, and a peer
+                // that dropped that silently would see only the refusal
+                // accompanying it and read it as an unexplained lease loss.
+                //
+                // So it is surfaced even uncorrelated, and surfacing is all
+                // it does: no phase moves, no fence is touched, nothing is
+                // revoked. Re-addressing is the response, and this crate does
+                // not know where to (ADR-0026); game code reading the reason
+                // decides.
+                let correlated =
+                    claim_id.is_some() && state.pending_claims.get(&entity) == claim_id.as_ref();
+                if !correlated {
+                    if matches!(reason, DenyReason::WrongOwner { .. }) {
+                        if let Some((entity_ref, _, _)) =
+                            entities.iter().find(|(_, id, _)| id.0 == entity)
+                        {
+                            events.write(AuthorityEvent::Denied {
+                                entity: entity_ref,
+                                reason,
+                            });
+                        }
+                    }
                     continue;
                 }
                 if let Some((entity_ref, _, _)) = entities.iter().find(|(_, id, _)| id.0 == entity)

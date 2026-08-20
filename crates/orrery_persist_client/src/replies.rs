@@ -82,10 +82,32 @@ pub(crate) fn process_replies(mut context: ReplyProcessingContext) {
             GatewayReply::BulkNack {
                 entity,
                 tick,
+                reason,
                 lease,
-                ..
             } => {
+                // The diff is dropped either way — the uplink holds one
+                // pending diff per entity and the next change-detection pass
+                // restates it (docs/08-persistence.md §3.5) — so `on_nack`
+                // runs before the classification, not inside a branch of it.
                 context.scheduler.on_nack(entity, tick);
+                if reason == orrery_protocol::BULK_NACK_WRONG_OWNER {
+                    // "You asked the wrong node", not "you lost the lease".
+                    // The registrar row this peer holds is untouched by a
+                    // routing mistake, and revoking on it would hand
+                    // authority away on the strength of a *delivery* failure:
+                    // no message withdrew anything, and `sweep_lease_expiry`
+                    // still drops the fence a heartbeat before its TTL if the
+                    // lease really is gone. A gateway sending this reason
+                    // carries no row (`BULK_NACK_WRONG_OWNER`), but the guard
+                    // is on the reason rather than on `lease.is_none()`
+                    // because a `None` row already means something else here.
+                    tracing::warn!(
+                        ?entity,
+                        ?tick,
+                        "gateway: this node owns no shard for the diff's cell"
+                    );
+                    continue;
+                }
                 if let Some(current) = lease {
                     reconcile_lease_nack(
                         &mut context.commands,
@@ -895,6 +917,93 @@ mod tests {
                 lease,
             })),
         );
+    }
+
+    /// The contrast to the revocation test above
+    /// (`lease_bearing_nack_revokes_stale_writer_and_allows_reclaim`): the
+    /// same superseding row, the same lane, one different reason code — and
+    /// the fence survives.
+    ///
+    /// A lease-bearing NACK revokes because the row it carries is the
+    /// registrar's own answer about who holds the entity. A
+    /// `BULK_NACK_WRONG_OWNER` is not an answer about the entity at all: it
+    /// says the node the write reached hosts no shard over the cell
+    /// (docs/08-persistence.md §3.5). Revoking on it would hand authority away
+    /// on the strength of a *delivery* failure, with no registrar message
+    /// having withdrawn anything — and the peer would stop writing a body it
+    /// is still the only legitimate writer of, until the 10 s TTL ran out.
+    ///
+    /// The row is attached here deliberately, even though a gateway sending
+    /// this reason carries none: the guard has to be on the reason, not on
+    /// `lease.is_none()`, because a missing row already means something else
+    /// on this path.
+    #[test]
+    fn a_wrong_owner_nack_drops_the_diff_without_revoking_the_lease() {
+        let (mut app, session_entity) = reply_app();
+        app.add_plugins(OrreryAuthorityPlugin);
+        let persisted = PersistId::new(22);
+        let local = granted_entity(&mut app, persisted, LeaseId(9), node(1));
+        app.world_mut()
+            .resource_mut::<UplinkScheduler>()
+            .register(persisted, 4.0);
+        app.world_mut()
+            .resource_mut::<UplinkScheduler>()
+            .queue(test_diff(persisted, Tick::new(5)));
+
+        // A row that *would* supersede: a different holder at a strictly
+        // greater fencing token. Under `reason: 1` this is precisely the input
+        // that revokes.
+        let superseding = lease_row(
+            persisted,
+            Some(node(8)),
+            LeaseId(11),
+            SeqPair {
+                own_seq: 1,
+                auth_seq: 0,
+            },
+        );
+        push_reply(
+            &mut app,
+            session_entity,
+            Bytes::from(GatewaySession::encode_datagram(&GatewayReply::BulkNack {
+                entity: persisted,
+                tick: Tick::new(5),
+                reason: orrery_protocol::BULK_NACK_WRONG_OWNER,
+                lease: Some(superseding),
+            })),
+        );
+        app.update();
+
+        assert!(
+            app.world().get::<LocallyAuthoritative>(local).is_some(),
+            "a routing refusal must not revoke a fence the registrar never withdrew"
+        );
+        assert!(matches!(
+            app.world().get::<AuthorityPhase>(local),
+            Some(AuthorityPhase::LocalGranted {
+                lease_id: LeaseId(9),
+                ..
+            })
+        ));
+        assert_eq!(
+            app.world()
+                .resource::<AuthorityState>()
+                .local_lease_id(persisted),
+            Some(LeaseId(9))
+        );
+        assert!(
+            app.world_mut()
+                .resource_mut::<Messages<AuthorityEvent>>()
+                .drain()
+                .next()
+                .is_none(),
+            "no authority event: nothing about this peer's authority changed"
+        );
+        // The diff itself is still dropped — §3.5 has the client scheduler
+        // discard a NACKed diff and restate the entity on the next change
+        // detection pass, whatever the reason was.
+        let scheduler = app.world().resource::<UplinkScheduler>();
+        assert!(!scheduler.has_pending(persisted));
     }
 
     #[test]
