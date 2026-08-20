@@ -329,6 +329,17 @@ lane_gates() {
     # guarded fact so a vacuous clause cannot bless a flattering edit.
     run scripts/p2-journal-raw-report.py --self-test
 
+    # D20's journal-open curve, which is the evidence that retention had to
+    # exist. Its self-test holds the shape the ADR's argument reads from --
+    # equally spaced steps of one journal grown in place, a fit that stays
+    # linear to within 5%, a sweep that actually reaches the D16 budget it
+    # motivates -- and the two disclosures the number is worthless without:
+    # that the page cache was warm, so the slope is a floor, and which device
+    # the journal was on. The uptime extrapolation reads its arrival rate from
+    # the D19 gate evidence beside it, so a change to one cannot silently
+    # leave the other's conclusion standing.
+    run scripts/p2-journal-open-report.py --self-test
+
     # And this script's own, which nothing ran either: ci.yml calls the four
     # lanes and never `--self-test`, so the lane table's agreement with the tree
     # — and, now, the coverage clause below — were checked only when a human
