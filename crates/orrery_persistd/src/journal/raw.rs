@@ -18,7 +18,8 @@ use crate::journal::group_commit::{
     spawn_committer, CommitterHandle, StagedAppend, StoreCommitTimings,
 };
 use crate::journal::{
-    AppendHandle, JournalCommitMetrics, JournalConfig, JournalError, JournalScan, StoredRecord,
+    AppendHandle, JournalCommitMetrics, JournalConfig, JournalError, JournalRelease, JournalScan,
+    StoredRecord,
 };
 
 const PUBLISH_CAPACITY: usize = 4096;
@@ -49,6 +50,33 @@ enum RawEntry {
         key: Vec<u8>,
         value: Vec<u8>,
     },
+    /// A retention marker (D20): everything below `floor` has been released.
+    ///
+    /// It carries the two positions that would otherwise be *derived* from
+    /// records that are no longer there. Without them a journal released to
+    /// empty would reopen at LSN 0:0 and mint logical LSNs a previous
+    /// incarnation had already acknowledged.
+    Release {
+        /// The retention floor. No record below it survives in the index.
+        floor: Lsn,
+        /// The LSN the next append must take.
+        next_lsn: Lsn,
+        /// The committed watermark at release time.
+        committed: Option<Lsn>,
+    },
+}
+
+/// A running chain's claim on the records this journal may release (D20).
+#[derive(Clone, Copy, Debug)]
+struct ChainClaim {
+    /// Whether the follower's watermark is in *this* journal's LSN space, and
+    /// so can bound a release at all. False for a promotion-adopted chain,
+    /// which echoes the source's LSNs; such a chain blocks release for as long
+    /// as it is registered rather than lifting the block with a number that
+    /// means something else.
+    bounds: bool,
+    /// The highest watermark the follower has confirmed durable.
+    watermark: Option<Lsn>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -60,6 +88,14 @@ struct RecordLocation {
 #[derive(Default)]
 struct RawIndex {
     records: BTreeMap<Lsn, RecordLocation>,
+    /// The retention floor recovered from (or advanced by) a `Release` marker.
+    /// Records below it are not indexed even when their segment survived, so
+    /// a reopened journal behaves identically whether or not `truncate_before`
+    /// happened to drop the segment they were in.
+    released_below: Option<Lsn>,
+    /// The positions a `Release` marker carried, when one was seen.
+    released_next_lsn: Option<Lsn>,
+    released_committed: Option<Lsn>,
     #[cfg(feature = "chain-grpc")]
     chain_records: BTreeMap<Vec<u8>, Vec<u8>>,
     #[cfg(feature = "chain-grpc")]
@@ -73,6 +109,7 @@ struct RawIndex {
 /// The default per-node indexed wal-db journal.
 pub struct Journal {
     wal: Arc<Wal<SegmentedStore>>,
+    wal_dir: std::path::PathBuf,
     index: Arc<RwLock<RawIndex>>,
     cursor: std::sync::Mutex<Lsn>,
     segment_size: u64,
@@ -80,6 +117,10 @@ pub struct Journal {
     closed: std::sync::atomic::AtomicBool,
     metrics: Arc<JournalCommitMetrics>,
     published: broadcast::Sender<JournalRecord>,
+    /// The outbound chain's claim on this journal (D20). `None` when no chain
+    /// has registered, in which case retention answers to the checkpoint floor
+    /// alone.
+    chain_floor: std::sync::Mutex<Option<ChainClaim>>,
     #[cfg(test)]
     scan_fault: std::sync::atomic::AtomicBool,
 }
@@ -107,14 +148,33 @@ impl Journal {
             let envelope = decode_envelope(record.data(), None)?;
             apply_recovered_entry(&mut recovered, record.lsn(), envelope)?;
         }
-        let recovered_committed = recovered.records.last_key_value().map(|(lsn, _)| *lsn);
+        // Records below the recovered retention floor are dropped rather than
+        // indexed. `truncate_before` reclaims whole segments, so the segment
+        // holding the floor keeps every record below it that shares it; index
+        // them and a scan would answer from a prefix whose length is an
+        // accident of segment alignment.
+        if let Some(floor) = recovered.released_below {
+            recovered.records = recovered.records.split_off(&floor);
+            #[cfg(feature = "chain-grpc")]
+            recovered.adopted_records.retain(|_, local| *local >= floor);
+        }
+
+        let recovered_committed = recovered
+            .records
+            .last_key_value()
+            .map(|(lsn, _)| *lsn)
+            .max(recovered.released_committed);
         let next_lsn = match recovered.records.last_key_value() {
             Some((lsn, location)) => {
                 let record = read_record_at(&wal, *lsn, location.physical)?;
                 successor(*lsn, encoded_len(&record.record), SEGMENT_SIZE)
             }
             None => Lsn::new(0, 0),
-        };
+        }
+        // A release marker's `next_lsn` is a floor on the cursor, not a
+        // replacement for it: the marker is written before the appends that
+        // may follow it, so the derived position wins whenever there is one.
+        .max(recovered.released_next_lsn.unwrap_or(Lsn::new(0, 0)));
         let index = Arc::new(RwLock::new(recovered));
 
         let metrics = Arc::new(JournalCommitMetrics::new());
@@ -189,6 +249,7 @@ impl Journal {
 
         Ok(Self {
             wal,
+            wal_dir,
             index,
             cursor: std::sync::Mutex::new(next_lsn),
             segment_size: SEGMENT_SIZE,
@@ -196,6 +257,7 @@ impl Journal {
             closed: std::sync::atomic::AtomicBool::new(false),
             metrics,
             published,
+            chain_floor: std::sync::Mutex::new(None),
             #[cfg(test)]
             scan_fault: std::sync::atomic::AtomicBool::new(false),
         })
@@ -329,15 +391,248 @@ impl Journal {
         self.published.subscribe()
     }
 
+    /// Release every record below `before`, reclaiming the segments that hold
+    /// only released records (D20).
+    ///
+    /// **The caller asserts the precondition**: every record below `before` is
+    /// already folded into durable state that survives this journal — in
+    /// `persistd` that is the minimum checkpoint watermark across the shards
+    /// this node hosts. The journal cannot check that for itself; what it does
+    /// instead is make a violation loud rather than silent, by failing any
+    /// later scan that reaches below the floor
+    /// ([`JournalError::Released`]) instead of answering with the surviving
+    /// suffix.
+    ///
+    /// Ordering, which is the whole of the crash-safety argument:
+    ///
+    /// 1. Take the physical cut *before* anything is appended, so nothing
+    ///    written by this call can fall below it.
+    /// 2. Re-anchor the metadata the surviving suffix needs — chain state and
+    ///    adoption markers are keyed maps rebuilt by replaying the log, so a
+    ///    copy has to exist above the cut before the originals are dropped.
+    /// 3. Write the release marker and `sync`. Until this barrier completes
+    ///    nothing has changed: a crash here reopens at the old floor with a
+    ///    duplicate copy of some metadata, which replay folds idempotently.
+    /// 4. Only then drop the segments, and only then prune the in-memory index.
+    ///
+    /// So the durable marker always precedes the deletion it describes, and
+    /// the window in between costs a retry rather than a record.
+    pub fn release_before(&self, before: Lsn) -> Result<JournalRelease, JournalError> {
+        use crate::journal::ReleaseBlocked;
+
+        if self.closed.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(JournalError::Closed);
+        }
+
+        let mut index = write_index(&self.index)?;
+        let floor_now = index.released_below.unwrap_or(Lsn::new(0, 0));
+        if before <= floor_now {
+            return Ok(JournalRelease::blocked(
+                before,
+                floor_now,
+                ReleaseBlocked::AlreadyReleased,
+            ));
+        }
+
+        // A follower's mirror is not released. `chain_grpc::rebuild_cursor`
+        // reconstructs the durable cursor by walking the provenance index from
+        // batch zero and stopping at the first gap, so releasing a prefix of it
+        // would rebuild an empty cursor and cost a full re-stream of the
+        // primary's journal — the failure `refuse_sibling_epoch` documents.
+        // Bounding a follower's mirror needs that cursor persisted first; until
+        // it is, the primary is what retention covers (D20 §residual).
+        #[cfg(feature = "chain-grpc")]
+        if !index.chain_records.is_empty() {
+            return Ok(JournalRelease::blocked(
+                before,
+                floor_now,
+                ReleaseBlocked::FollowerProvenance,
+            ));
+        }
+
+        // A lagging follower resumes by rescanning *this* journal from its own
+        // watermark (`chain::spawn_chain_from`), so the floor is bounded by
+        // what the follower has confirmed as well as by what the checkpoints
+        // cover. Clamped rather than refused: releasing up to the follower's
+        // watermark is exactly as safe as releasing up to a checkpoint's.
+        let before = match *self.chain_floor.lock().expect("chain floor lock") {
+            None => before,
+            Some(ChainClaim {
+                watermark: Some(watermark),
+                bounds: true,
+            }) => before.min(watermark),
+            Some(_) => {
+                return Ok(JournalRelease::blocked(
+                    before,
+                    floor_now,
+                    ReleaseBlocked::ChainLag,
+                ))
+            }
+        };
+        if before <= floor_now {
+            return Ok(JournalRelease::blocked(
+                before,
+                floor_now,
+                ReleaseBlocked::ChainLag,
+            ));
+        }
+
+        let bytes_before = dir_bytes(&self.wal_dir);
+
+        // Step 1. The cut is the lowest physical position any *retained* record
+        // occupies. Taken as a minimum over the retained range rather than as
+        // the first entry's position, so the invariant it rests on — that
+        // logical and physical order agree — is enforced here rather than
+        // assumed. With nothing retained, the cut is the current tail: every
+        // byte written so far is releasable and the marker below carries the
+        // positions that would otherwise be derived from the dropped records.
+        let cut = index
+            .records
+            .range(before..)
+            .map(|(_, location)| location.physical.get())
+            .min()
+            .unwrap_or_else(|| self.wal.len());
+
+        // Step 2. Re-anchor keyed metadata above the cut.
+        #[cfg(feature = "chain-grpc")]
+        {
+            let chain_state: Vec<(Vec<u8>, Vec<u8>)> = index
+                .chain_state
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+            for (key, value) in chain_state {
+                append_metadata_unsynced(
+                    &self.wal,
+                    &RawEnvelope::V1(RawEntry::ChainState { key, value }),
+                )?;
+            }
+            let adoptions: Vec<(Vec<u8>, Vec<u8>)> = index
+                .adoptions
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+            for (key, value) in adoptions {
+                let value = prune_adoption_marker(&value, before)?;
+                append_metadata_unsynced(
+                    &self.wal,
+                    &RawEnvelope::V1(RawEntry::Adoption { key, value }),
+                )?;
+            }
+        }
+
+        // Step 3. The marker, then the barrier.
+        let next_lsn = *self.cursor.lock().expect("journal cursor lock");
+        let committed = self.committer.committed();
+        append_metadata_unsynced(
+            &self.wal,
+            &RawEnvelope::V1(RawEntry::Release {
+                floor: before,
+                next_lsn,
+                committed,
+            }),
+        )?;
+        self.wal
+            .sync()
+            .map_err(|error| JournalError::Store(format!("sync release marker: {error}")))?;
+
+        // Step 4. Drop the segments, then the index entries.
+        let head = self
+            .wal
+            .truncate_before(wal_db::Lsn::new(cut))
+            .map_err(|error| JournalError::Store(format!("release journal segments: {error}")))?;
+        debug_assert!(
+            head.get() <= cut,
+            "wal-db moved the head above the requested cut"
+        );
+
+        let retained = index.records.split_off(&before);
+        let records_dropped = index.records.len() as u64;
+        index.records = retained;
+        index.released_below = Some(before);
+        index.released_next_lsn = Some(next_lsn);
+        index.released_committed = committed;
+        #[cfg(feature = "chain-grpc")]
+        index.adopted_records.retain(|_, local| *local >= before);
+        drop(index);
+
+        Ok(JournalRelease {
+            requested: before,
+            floor: before,
+            records_dropped,
+            bytes_before,
+            bytes_after: dir_bytes(&self.wal_dir),
+            blocked: None,
+        })
+    }
+
+    /// Register an outbound chain: nothing is released until its follower
+    /// watermark is known (D20).
+    ///
+    /// A registration lasts for the life of the journal. A chain that has
+    /// *stopped* — faulted, or its follower gone — keeps its claim, because a
+    /// follower that is behind and unreachable is exactly the one that would
+    /// lose the records a release reclaims. Retention resumes when a chain
+    /// probes successfully again, and until it does the reason the journal is
+    /// not shrinking is reported as [`ReleaseBlocked::ChainLag`].
+    pub fn register_chain(&self, bounds_retention: bool) {
+        *self.chain_floor.lock().expect("chain floor lock") = Some(ChainClaim {
+            bounds: bounds_retention,
+            watermark: None,
+        });
+    }
+
+    /// Record a follower watermark an outbound chain has confirmed.
+    ///
+    /// Ignored unless the chain registered as bounding retention, so the
+    /// caller does not have to know whether its own watermark is comparable
+    /// with this journal's — it says so once, at registration.
+    pub fn note_chain_watermark(&self, watermark: Lsn) {
+        let mut floor = self.chain_floor.lock().expect("chain floor lock");
+        if let Some(claim) = floor.as_mut() {
+            if claim.bounds {
+                claim.watermark = Some(claim.watermark.map_or(watermark, |c| c.max(watermark)));
+            }
+        }
+    }
+
+    /// The lowest LSN this journal still retains (D20). `0:0` until a release.
+    pub fn released_floor(&self) -> Lsn {
+        read_index(&self.index)
+            .ok()
+            .and_then(|index| index.released_below)
+            .unwrap_or(Lsn::new(0, 0))
+    }
+
     /// Scan records with `lsn >= from` in logical LSN order.
+    ///
+    /// Fails [`JournalError::Released`] rather than answering short when
+    /// `from` is below the retention floor.
     pub fn scan_from<'a>(&'a self, from: Lsn) -> JournalScan<'a> {
+        if let Err(error) = self.guard_floor(from) {
+            return one_error_scan(error);
+        }
         match record_locations_from(&self.index, from, false) {
             Ok(locations) => self.scan_locations(locations),
             Err(error) => one_error_scan(error),
         }
     }
 
+    fn guard_floor(&self, from: Lsn) -> Result<(), JournalError> {
+        let floor = read_index(&self.index)?.released_below;
+        match floor {
+            Some(floor) if from < floor => Err(JournalError::Released {
+                requested: from,
+                floor,
+            }),
+            _ => Ok(()),
+        }
+    }
+
     pub(crate) fn scan_originated_from<'a>(&'a self, from: Lsn) -> JournalScan<'a> {
+        if let Err(error) = self.guard_floor(from) {
+            return one_error_scan(error);
+        }
         #[cfg(test)]
         if self.scan_fault.load(std::sync::atomic::Ordering::Acquire) {
             return one_error_scan(JournalError::Store(
@@ -692,6 +987,46 @@ fn prepare_wal_dir(root: &std::path::Path) -> Result<std::path::PathBuf, Journal
     Ok(wal_dir)
 }
 
+/// Total bytes of every file under `dir`, for release accounting.
+fn dir_bytes(dir: &std::path::Path) -> u64 {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .filter_map(|entry| entry.metadata().ok())
+        .filter(|meta| meta.is_file())
+        .map(|meta| meta.len())
+        .sum()
+}
+
+/// Append one metadata envelope **without** a durability barrier.
+///
+/// The release path writes several and pays for one barrier at the end;
+/// [`append_metadata`] is the single-entry form that syncs for itself.
+fn append_metadata_unsynced(
+    wal: &Wal<SegmentedStore>,
+    envelope: &RawEnvelope,
+) -> Result<(), JournalError> {
+    let bytes = postcard::to_stdvec(envelope)
+        .map_err(|error| JournalError::Store(format!("encode raw metadata: {error}")))?;
+    wal.append(&bytes)
+        .map(|_| ())
+        .map_err(|error| JournalError::Store(format!("append raw metadata: {error}")))
+}
+
+/// Drop the record entries an adoption marker names below `floor`, so a
+/// re-anchored marker never points at a released record.
+#[cfg(feature = "chain-grpc")]
+fn prune_adoption_marker(value: &[u8], floor: Lsn) -> Result<Vec<u8>, JournalError> {
+    use crate::journal::chain_grpc::AdoptionMarker;
+    let mut marker: AdoptionMarker = postcard::from_bytes(value)
+        .map_err(|error| JournalError::Store(format!("decode adoption marker: {error}")))?;
+    marker.records.retain(|record| record.local >= floor);
+    postcard::to_stdvec(&marker)
+        .map_err(|error| JournalError::Store(format!("encode adoption marker: {error}")))
+}
+
 #[cfg(feature = "chain-grpc")]
 fn append_metadata(wal: &Wal<SegmentedStore>, envelope: &RawEnvelope) -> Result<(), JournalError> {
     let bytes = postcard::to_stdvec(envelope)
@@ -744,6 +1079,22 @@ fn apply_recovered_entry(
             index.chain_state.insert(key, value);
             #[cfg(not(feature = "chain-grpc"))]
             let _ = (key, value);
+        }
+        RawEnvelope::V1(RawEntry::Release {
+            floor,
+            next_lsn,
+            committed,
+        }) => {
+            // Markers are replayed in append order, so a later one wins; take
+            // the maximum anyway so an out-of-order recovery cannot lower a
+            // floor that is already in force.
+            index.released_below = Some(index.released_below.map_or(floor, |c| c.max(floor)));
+            index.released_next_lsn = Some(
+                index
+                    .released_next_lsn
+                    .map_or(next_lsn, |c| c.max(next_lsn)),
+            );
+            index.released_committed = index.released_committed.max(committed);
         }
         RawEnvelope::V1(RawEntry::Adoption { key, value }) => {
             #[cfg(feature = "chain-grpc")]

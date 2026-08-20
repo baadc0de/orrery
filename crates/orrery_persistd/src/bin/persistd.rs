@@ -160,6 +160,18 @@ struct Cli {
     #[arg(long, value_name = "RAW|X,Y,Z@LEVEL")]
     shard: Vec<ShardSpec>,
 
+    /// Retain every journal segment: never release the ones the checkpoints
+    /// have made redundant (D20).
+    ///
+    /// The D16 `journal_retention` parameter, as a switch. Retention is on by
+    /// default and this turns it off, which is what a bisect wants — a run
+    /// with and without it on one binary, one host and one build — and what an
+    /// operator wants when a journal has to be preserved for forensics. It is
+    /// not a tuning knob: with retention off, journal disk and the index
+    /// rebuilt from it at every open grow with the node's uptime.
+    #[arg(long)]
+    no_journal_retention: bool,
+
     /// Append server-internal latency batches and gateway counter records to
     /// this JSONL file.
     ///
@@ -906,11 +918,15 @@ async fn main() -> anyhow::Result<()> {
     };
 
     // Spawn one checkpoint scheduler for the single runtime, using the
-    // default 20 s jittered cadence (D16).
+    // default 20 s jittered cadence (D16). The same scheduler drives journal
+    // retention (D20): its checkpoints are what establish the release floor.
     let scheduler = orrery_persistd::spawn_checkpoint_scheduler_direct(
         Arc::clone(&runtime),
         Arc::clone(&checkpoint_store),
-        &orrery_persistd::checkpoint::CheckpointConfig::default(),
+        &orrery_persistd::checkpoint::CheckpointConfig {
+            retention: !cli.no_journal_retention,
+            ..orrery_persistd::checkpoint::CheckpointConfig::default()
+        },
     );
     schedulers.push(scheduler);
 
@@ -1857,6 +1873,7 @@ mod tests {
                 iroh::SecretKey::from_bytes(&[9; 32]).public(),
             ))],
             coordinator_key: Vec::new(),
+            no_journal_retention: false,
             dev_seed: None,
             secret_key: None,
             shard: Vec::new(),

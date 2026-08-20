@@ -30,7 +30,8 @@ use crate::journal::group_commit::{
     spawn_committer, CommitterHandle, StagedAppend, StoreCommitTimings,
 };
 use crate::journal::{
-    AppendHandle, JournalCommitMetrics, JournalConfig, JournalError, JournalScan, StoredRecord,
+    AppendHandle, JournalCommitMetrics, JournalConfig, JournalError, JournalRelease, JournalScan,
+    StoredRecord,
 };
 
 /// The number of committed records buffered for chain-replication subscribers
@@ -477,6 +478,42 @@ impl Journal {
     /// rescan the journal from its watermark (see [`Journal::scan_from`]).
     pub fn subscribe(&self) -> broadcast::Receiver<JournalRecord> {
         self.published.subscribe()
+    }
+
+    /// Register an outbound chain (D20). A no-op: this backend releases
+    /// nothing, so nothing needs holding back.
+    #[allow(clippy::unused_self)]
+    pub fn register_chain(&self, _bounds_retention: bool) {}
+
+    /// Record a chain follower watermark (D20). A no-op; see
+    /// [`Journal::register_chain`].
+    #[allow(clippy::unused_self)]
+    pub fn note_chain_watermark(&self, _watermark: Lsn) {}
+
+    /// The lowest LSN this journal still retains.
+    ///
+    /// Always `0:0`: the Fjall fallback retains everything. See
+    /// [`Journal::release_before`].
+    pub fn released_floor(&self) -> Lsn {
+        Lsn::new(0, 0)
+    }
+
+    /// Retention is not implemented on the Fjall fallback (D19, D20).
+    ///
+    /// D19 keeps this backend as an explicit rollback path rather than as a
+    /// second shipping configuration, and reclaiming here would mean a second
+    /// durable retention mechanism — a range delete plus its own crash
+    /// ordering — carried by a path that is not the default and does not meet
+    /// the P2 latency criterion anyway. The call is answered, not refused, so
+    /// the driver runs identically under either backend and the reason a Fjall
+    /// journal never shrinks is a reported outcome rather than an absence.
+    #[allow(clippy::unused_self)]
+    pub fn release_before(&self, before: Lsn) -> Result<JournalRelease, JournalError> {
+        Ok(JournalRelease::blocked(
+            before,
+            Lsn::new(0, 0),
+            crate::journal::ReleaseBlocked::Unsupported,
+        ))
     }
 
     /// Scan records with `lsn >= from` in LSN order.

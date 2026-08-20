@@ -18,7 +18,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use orrery_protocol::CellId;
+use orrery_protocol::{CellId, Lsn};
 
 use crate::checkpoint::{CheckpointError, CheckpointStore};
 use crate::runtime::CellRuntime;
@@ -31,6 +31,11 @@ pub struct CheckpointConfig {
     /// The maximum jitter added to (or subtracted from) the interval per shard,
     /// so shards do not checkpoint in lockstep. Default ±5 s.
     pub jitter: Duration,
+    /// Whether to release journal segments the checkpoints have made
+    /// redundant (D20). Default **on**: with it off a node's journal, and the
+    /// index rebuilt from it at every open, grow without bound for as long as
+    /// the node runs.
+    pub retention: bool,
 }
 
 impl Default for CheckpointConfig {
@@ -38,7 +43,70 @@ impl Default for CheckpointConfig {
         Self {
             interval: Duration::from_secs(20),
             jitter: Duration::from_secs(5),
+            retention: true,
         }
+    }
+}
+
+/// Tracks each hosted shard's last durable checkpoint watermark and turns them
+/// into the journal retention floor (D20).
+///
+/// **The floor is the minimum, and a shard that has never checkpointed has no
+/// floor at all.** Both halves matter. The minimum, because a journal record
+/// is releasable only once *every* shard that could still need it has folded
+/// it — the shard that checkpointed most recently says nothing about the one
+/// that has not checkpointed since. And the abstention, because a hosted shard
+/// with no watermark yet is a shard whose whole history is still delta: taking
+/// the minimum over the shards that *have* reported would release records it
+/// has not folded.
+#[derive(Debug, Default)]
+struct ReleaseFloor {
+    watermarks: std::collections::HashMap<CellId, Lsn>,
+}
+
+impl ReleaseFloor {
+    fn record(&mut self, shard: CellId, watermark: Lsn) {
+        // Monotone per shard: a checkpoint never covers less than the last one,
+        // and a stale reply that said otherwise must not lower the floor.
+        let entry = self.watermarks.entry(shard).or_insert(watermark);
+        *entry = (*entry).max(watermark);
+    }
+
+    /// The floor for `shards`, or `None` while any of them has yet to report.
+    fn floor(&mut self, shards: &[CellId]) -> Option<Lsn> {
+        self.watermarks.retain(|shard, _| shards.contains(shard));
+        if shards.is_empty() {
+            return None;
+        }
+        shards
+            .iter()
+            .map(|shard| self.watermarks.get(shard).copied())
+            .min()
+            .flatten()
+    }
+}
+
+/// Ask the journal to release everything below the floor these checkpoints
+/// established, and log what it did.
+fn release_journal(journal: &crate::journal::Journal, floor: Lsn) {
+    match journal.release_before(floor) {
+        Ok(release) => match release.blocked {
+            // At `info`, deliberately: a release is at most one event per
+            // checkpoint round, and it is the only line that says the journal
+            // is being bounded at all. An operator reading a node's log should
+            // be able to see retention working — or, from the `trace` arm
+            // below plus a journal that keeps growing, see it not working and
+            // why.
+            None => tracing::info!(
+                floor = %release.floor,
+                records_dropped = release.records_dropped,
+                bytes_before = release.bytes_before,
+                bytes_after = release.bytes_after,
+                "released journal below the checkpoint floor"
+            ),
+            Some(reason) => tracing::trace!(floor = %floor, %reason, "journal release did nothing"),
+        },
+        Err(error) => tracing::warn!(floor = %floor, %error, "journal release failed"),
     }
 }
 
@@ -107,11 +175,13 @@ pub fn spawn_checkpoint_scheduler(
 
     let interval = config.interval;
     let jitter = config.jitter;
+    let retention = config.retention;
     let shutdown_task = Arc::clone(&shutdown);
 
     let join = tokio::spawn(async move {
         // Timer vector: each entry is a shard and its next checkpoint deadline.
         let mut timers: Vec<(CellId, tokio::time::Instant)> = Vec::new();
+        let mut floor = ReleaseFloor::default();
 
         loop {
             // Re-read the shard set each iteration to pick up splits.
@@ -148,8 +218,11 @@ pub fn spawn_checkpoint_scheduler(
                 _ = &mut sleep => {}
                 _ = shutdown_task.notified() => break,
                 Some(cell) = quiesce_rx.recv() => {
-                    if let Err(e) = checkpoint_cell(&runtime, &store, cell).await {
-                        tracing::warn!(shard = %cell, error = %e, "quiesce checkpoint failed");
+                    match checkpoint_cell(&runtime, &store, cell).await {
+                        Ok(watermark) => floor.record(cell, watermark),
+                        Err(e) => {
+                            tracing::warn!(shard = %cell, error = %e, "quiesce checkpoint failed");
+                        }
                     }
                     continue;
                 }
@@ -159,10 +232,27 @@ pub fn spawn_checkpoint_scheduler(
             let now = tokio::time::Instant::now();
             for (shard, due) in timers.iter_mut() {
                 if *due <= now {
-                    if let Err(e) = checkpoint_cell(&runtime, &store, *shard).await {
-                        tracing::warn!(shard = %shard, error = %e, "scheduled checkpoint failed");
+                    match checkpoint_cell(&runtime, &store, *shard).await {
+                        Ok(watermark) => floor.record(*shard, watermark),
+                        Err(e) => {
+                            tracing::warn!(shard = %shard, error = %e, "scheduled checkpoint failed");
+                        }
                     }
                     *due = now + jittered(interval, jitter, *shard);
+                }
+            }
+
+            // Retention runs after the round rather than after each shard: the
+            // floor can only move when the shard that was holding it lowest
+            // checkpoints, so per-shard attempts would be one useful call and
+            // `shards - 1` blocked ones.
+            if retention {
+                if let Some(release) = floor.floor(&shards) {
+                    let journal = {
+                        let rt = runtime.lock().await;
+                        Arc::clone(rt.journal())
+                    };
+                    release_journal(&journal, release);
                 }
             }
         }
@@ -186,10 +276,12 @@ pub fn spawn_checkpoint_scheduler_direct(
 
     let interval = config.interval;
     let jitter = config.jitter;
+    let retention = config.retention;
     let shutdown_task = Arc::clone(&shutdown);
 
     let join = tokio::spawn(async move {
         let mut timers: Vec<(CellId, tokio::time::Instant)> = Vec::new();
+        let mut floor = ReleaseFloor::default();
 
         loop {
             let shards: Vec<CellId> = runtime.shards().copied().collect();
@@ -217,8 +309,11 @@ pub fn spawn_checkpoint_scheduler_direct(
                 _ = shutdown_task.notified() => break,
                 Some(cell) = quiesce_rx.recv() => {
                     if let Ok(target) = runtime.checkpoint_target(cell) {
-                        if let Err(e) = target.checkpoint(store.as_ref()).await {
-                            tracing::warn!(shard = %cell, error = %e, "quiesce checkpoint failed");
+                        match target.checkpoint(store.as_ref()).await {
+                            Ok(watermark) => floor.record(cell, watermark),
+                            Err(e) => {
+                                tracing::warn!(shard = %cell, error = %e, "quiesce checkpoint failed");
+                            }
                         }
                     }
                     continue;
@@ -229,11 +324,20 @@ pub fn spawn_checkpoint_scheduler_direct(
             for (shard, due) in timers.iter_mut() {
                 if *due <= now {
                     if let Ok(target) = runtime.checkpoint_target(*shard) {
-                        if let Err(e) = target.checkpoint(store.as_ref()).await {
-                            tracing::warn!(shard = %shard, error = %e, "scheduled checkpoint failed");
+                        match target.checkpoint(store.as_ref()).await {
+                            Ok(watermark) => floor.record(*shard, watermark),
+                            Err(e) => {
+                                tracing::warn!(shard = %shard, error = %e, "scheduled checkpoint failed");
+                            }
                         }
                     }
                     *due = now + jittered(interval, jitter, *shard);
+                }
+            }
+
+            if retention {
+                if let Some(release) = floor.floor(&shards) {
+                    release_journal(runtime.journal(), release);
                 }
             }
         }
@@ -251,7 +355,7 @@ async fn checkpoint_cell(
     runtime: &Arc<tokio::sync::Mutex<CellRuntime>>,
     store: &Arc<dyn CheckpointStore>,
     shard: CellId,
-) -> Result<(), CheckpointError> {
+) -> Result<Lsn, CheckpointError> {
     // The runtime mutex protects the actor topology, not checkpoint I/O.
     // Resolve a cloneable target under it, then release it before the actor
     // snapshot, durable-store transaction, and tombstone-pruning awaits. A
@@ -473,6 +577,7 @@ mod tests {
             &CheckpointConfig {
                 interval: Duration::from_millis(50),
                 jitter: Duration::from_millis(10),
+                retention: true,
             },
         );
 
@@ -536,6 +641,7 @@ mod tests {
             &CheckpointConfig {
                 interval: Duration::from_secs(60),
                 jitter: Duration::ZERO,
+                retention: true,
             },
         );
 
@@ -633,6 +739,7 @@ mod tests {
         let config = CheckpointConfig {
             interval,
             jitter: Duration::from_millis(10),
+            retention: true,
         };
 
         let scheduler = spawn_checkpoint_scheduler(Arc::clone(&runtime), store.clone(), &config);
@@ -658,6 +765,107 @@ mod tests {
             assert!(
                 std::time::Instant::now() < deadline,
                 "not all 8 children received a checkpoint within 2x interval"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        scheduler.shutdown().await;
+        let rt = Arc::try_unwrap(runtime)
+            .unwrap_or_else(|_| panic!("scheduler released the runtime"))
+            .into_inner();
+        rt.close().await.unwrap();
+    }
+
+    #[test]
+    fn a_release_floor_abstains_until_every_shard_has_reported() {
+        let a = CellId::ROOT;
+        let b = CellId::from_coords(glam::IVec3::new(-1, -1, -1), 1).expect("valid cell");
+        let mut floor = ReleaseFloor::default();
+
+        assert_eq!(floor.floor(&[]), None, "no shards, no floor");
+        floor.record(a, Lsn::new(0, 900));
+        assert_eq!(
+            floor.floor(&[a, b]),
+            None,
+            "a shard that has never checkpointed has no floor to contribute"
+        );
+
+        floor.record(b, Lsn::new(0, 400));
+        assert_eq!(
+            floor.floor(&[a, b]),
+            Some(Lsn::new(0, 400)),
+            "the floor is the minimum, not the latest"
+        );
+
+        // A stale reply must not lower a floor already established.
+        floor.record(b, Lsn::new(0, 100));
+        assert_eq!(floor.floor(&[a, b]), Some(Lsn::new(0, 400)));
+
+        // A retired shard stops holding the floor down, and stops being tracked.
+        assert_eq!(floor.floor(&[a]), Some(Lsn::new(0, 900)));
+        assert!(!floor.watermarks.contains_key(&b));
+    }
+
+    /// The scheduler's checkpoints are what bound the journal (D20): a running
+    /// node's retention floor advances without anyone asking it to.
+    ///
+    /// Raw-backend only, because the floor advancing is the thing asserted and
+    /// the Fjall fallback deliberately does not implement retention (D19, D20
+    /// §7). The driver runs identically under both; only one of them reclaims.
+    #[cfg(feature = "journal-raw")]
+    #[tokio::test]
+    async fn the_scheduler_releases_the_journal_behind_its_checkpoints() {
+        use orrery_protocol::{JournalRecord, PersistId, RecordKind, Tick};
+
+        use crate::payload_crc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(MemCheckpointStore::new());
+        let runtime = Arc::new(tokio::sync::Mutex::new(
+            CellRuntime::open(&test_runtime_config(dir.path()), &ckpt_store(&store))
+                .await
+                .unwrap(),
+        ));
+
+        {
+            let rt = runtime.lock().await;
+            for entity in 0..8u64 {
+                let rec = JournalRecord {
+                    lsn: Lsn::new(0, 0),
+                    cell: CellId::ROOT,
+                    grid: GridId::ROOT,
+                    entity: PersistId::new(entity),
+                    tick: Tick::new(1),
+                    epoch: orrery_protocol::Epoch::new(0),
+                    author: NodeId::from_bytes(&[0u8; 32]).expect("valid node id"),
+                    kind: RecordKind::Spawn,
+                    payload: bytes::Bytes::from_static(b"test"),
+                    crc: payload_crc(b"test"),
+                };
+                rt.apply(rec).await.unwrap();
+            }
+            assert_eq!(rt.journal().released_floor(), Lsn::new(0, 0));
+        }
+
+        let scheduler = spawn_checkpoint_scheduler(
+            Arc::clone(&runtime),
+            store.clone(),
+            &CheckpointConfig {
+                interval: Duration::from_millis(50),
+                jitter: Duration::from_millis(5),
+                retention: true,
+            },
+        );
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let floor = runtime.lock().await.journal().released_floor();
+            if floor > Lsn::new(0, 0) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the scheduler never released the journal behind its checkpoints"
             );
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
@@ -697,6 +905,7 @@ mod tests {
         let config = CheckpointConfig {
             interval,
             jitter: Duration::from_millis(5),
+            retention: true,
         };
 
         let scheduler = spawn_checkpoint_scheduler(Arc::clone(&runtime), store.clone(), &config);
