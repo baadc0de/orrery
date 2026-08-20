@@ -24,7 +24,8 @@ pub mod plugin;
 pub use aeronet_iroh::IrohRuntime;
 pub use budget::{Bandwidth, UploadBudget, UploadMeter};
 pub use coordinator::{
-    ActiveInterest, CoordinatorConfig, CoordinatorLink, CoordinatorPlugin, LinkStatus,
+    apply_island_drain, ActiveInterest, CoordinatorConfig, CoordinatorLink, CoordinatorPlugin,
+    LinkStatus,
 };
 pub use island::{IslandMembership, IslandSource, NetEvent};
 pub use orrery_protocol::coord::{IslandId, TopologyRegime};
