@@ -57,6 +57,12 @@ note() { echo "$NAME: $*" >&2; }
 #          rather than a gate — its figures are in its README and the
 #          channel-policy decision they justify is in docs/02-networking.md §7 —
 #          so what CI owes it is that it still builds and still self-tests.
+#          `p2-journal-bench` is `check` for a second reason worth stating: its
+#          RocksDB arm is behind a non-default feature because `librocksdb-sys`
+#          compiles RocksDB from C++ source, minutes per cold build. The lane
+#          checks the default (fjall) build only, so adding this comparison
+#          costs CI seconds rather than minutes, and the RocksDB arm is built
+#          by hand when someone is running the measurement.
 #   check  a standalone tool with no tests at all: `cargo check --all-targets`.
 #          `cargo test` on one of these would be a build dressed up as a gate,
 #          which reads as coverage that does not exist. `p3-island`'s behaviour
@@ -77,6 +83,7 @@ readonly WORKSPACES=(
     'p2-load         test'
     'p3-island       check'
     'p4-streams-bench test'
+    'p2-journal-bench check'
 )
 
 # The workspace directories, in table order.
@@ -298,6 +305,16 @@ lane_gates() {
     # section claiming a fix it does not have). Losing any one of them leaves
     # the conclusion standing on nothing, so all three are pinned.
     run scripts/p2-barrier-shape-report.py --self-test
+
+    # docs/08 §4.8's. That section compares three stores, and the risk it runs
+    # is the opposite of §4.7's: a comparison is the easiest thing to flatter.
+    # So the self-test pins the two controls that make it a comparison at all --
+    # every arm's barrier collapsing without its fsync, and the arms having
+    # written comparable bytes -- alongside the asymmetry itself and the two
+    # honest halves the section would be wrong without: that RocksDB and wal-db
+    # do still stall on a real device, and that wal-db's smaller on-disk
+    # footprint is recorded, because that gap IS its no-index caveat.
+    run scripts/p2-journal-store-report.py --self-test
 
     # And this script's own, which nothing ran either: ci.yml calls the four
     # lanes and never `--self-test`, so the lane table's agreement with the tree
