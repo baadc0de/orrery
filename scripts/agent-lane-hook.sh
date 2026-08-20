@@ -41,10 +41,37 @@ case $EVENT in
     ;;
 
   pre-edit)
-    path=$(field '.tool_input.file_path')
-    [[ -n $path ]] || exit 0
-    overlap=$("$LANE" check "$path" 2>/dev/null) && exit 0
-    [[ -n $overlap ]] || exit 0
+    # Two callers, two tool vocabularies. Claude Code names the file directly
+    # (`Edit`/`Write` -> tool_input.file_path). Codex edits through
+    # `apply_patch`, whose payload is the patch itself and whose paths live in
+    # its `*** Add|Update|Delete File:` and `*** Move to:` headers — so a hook
+    # that only reads file_path sees nothing and silently waves every Codex
+    # edit through, which is worse than not running at all.
+    mapfile -t paths < <(
+      printf '%s' "$payload" | jq -r '
+        [ .tool_input.file_path?, .tool_input.path?, .tool_input.file? ]
+        + ( [ .tool_input.command? ] | flatten
+            | map(select(type == "string")) )
+        + [ .tool_input.input?, .tool_input.patch? ]
+        | map(select(. != null and . != ""))
+        | .[]
+      ' 2>/dev/null |
+      awk '
+        /^\*\*\* (Add|Update|Delete) File: / { sub(/^\*\*\* [A-Za-z]+ File: /, ""); print; next }
+        /^\*\*\* Move to: /                  { sub(/^\*\*\* Move to: /, "");        print; next }
+        !/[[:space:]]/ && !/^\*\*\*/          { print }
+      ' | sort -u
+    )
+    (( ${#paths[@]} )) || exit 0
+    overlap=""
+    for path in "${paths[@]}"; do
+      [[ -n $path ]] || continue
+      hit=$("$LANE" check "$path" 2>/dev/null) && continue
+      [[ -n $hit ]] || continue
+      overlap+="$hit"$'\n'
+    done
+    [[ -n ${overlap//[[:space:]]/} ]] || exit 0
+    path=$(printf '%s' "${paths[*]}")
     # "ask", never "deny". Two worktrees editing one file is legal — they are
     # separate checkouts and neither can clobber the other. What it predicts is
     # a merge conflict, and whether that is worth avoiding is a judgement about
