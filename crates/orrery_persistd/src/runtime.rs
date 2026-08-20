@@ -232,11 +232,17 @@ pub(crate) struct CheckpointTarget {
 }
 
 impl CheckpointTarget {
-    /// Capture and durably store this actor's current state.
+    /// Capture and durably store this actor's current state, returning the
+    /// journal watermark the stored checkpoint covers.
+    ///
+    /// The watermark is returned rather than merely written because it is the
+    /// input to journal retention (D20): the floor a node may release to is the
+    /// minimum of these across the shards it hosts, and reading them back out
+    /// of the durable tier would cost a store round trip per shard per cadence.
     pub(crate) async fn checkpoint(
         self,
         store: &dyn CheckpointStore,
-    ) -> Result<(), crate::checkpoint::CheckpointError> {
+    ) -> Result<Lsn, crate::checkpoint::CheckpointError> {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
@@ -274,7 +280,7 @@ impl CheckpointTarget {
             .map_err(|_| {
                 crate::checkpoint::CheckpointError::Store("actor gone after checkpoint".into())
             })?;
-        Ok(())
+        Ok(data.watermark)
     }
 }
 
@@ -392,9 +398,37 @@ impl CellRuntime {
             .iter()
             .filter_map(|(&shard, covered)| covered.through().map(|through| (shard, through)))
             .collect();
-        let stored_records = journal
-            .scan_from(Lsn::new(0, 0))
-            .collect::<Result<Vec<_>, _>>()?;
+        // Recovery reads from the retention floor, not from zero, and checks
+        // the floor against what the checkpoints cover before it does (D20).
+        // The release rule is that the floor never passes the minimum
+        // checkpoint watermark, so a floor that *has* passed one means a
+        // checkpoint older than the journal — recoverable state that no longer
+        // has its delta. That is a refusal to open, not a short replay: the
+        // alternative is an actor that silently serves a state the durable
+        // tier last saw some unknown number of records ago.
+        //
+        // A shard whose coverage is `None` is skipped rather than refused. It
+        // claims nothing, and the release driver never advances the floor while
+        // a hosted shard is uncheckpointed (`checkpoint::scheduler`), so the
+        // only way to hold both facts at once is a shard that appeared *after*
+        // the release — which has nothing below the floor to lose. Refusing it
+        // would brick the restart of a node that simply gained a cell.
+        let floor = journal.released_floor();
+        if let Some((&shard, watermark)) = ckpt_coverage
+            .iter()
+            .filter_map(|(shard, covered)| covered.through().map(|through| (shard, through)))
+            .filter(|(_, watermark)| *watermark < floor)
+            .min_by_key(|(_, watermark)| *watermark)
+        {
+            return Err(crate::journal::JournalError::Released {
+                requested: watermark,
+                floor,
+            })
+            .map_err(|error| crate::journal::JournalError::Store(format!(
+                "shard {shard}'s checkpoint watermark is below the journal's retention floor: {error}"
+            )));
+        }
+        let stored_records = journal.scan_from(floor).collect::<Result<Vec<_>, _>>()?;
         for stored in stored_records {
             // The journal key's own position, which is not always the record's
             // `lsn`: a mirrored row keeps its origin LSN in the encoded record
@@ -1094,11 +1128,13 @@ impl CellRuntime {
     /// Used by the checkpoint scheduler's per-shard jittered cadence and by
     /// quiesce-flush. Copy-on-update: the snapshot is cloned inside the actor's
     /// mailbox, so it does not block concurrent appends.
+    ///
+    /// Returns the journal watermark the checkpoint covers (D20 retention).
     pub async fn checkpoint_shard(
         &self,
         shard: CellId,
         store: &dyn CheckpointStore,
-    ) -> Result<(), crate::checkpoint::CheckpointError> {
+    ) -> Result<Lsn, crate::checkpoint::CheckpointError> {
         self.checkpoint_target(shard)?.checkpoint(store).await
     }
 

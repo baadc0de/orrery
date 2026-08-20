@@ -566,6 +566,11 @@ fn spawn_chain_from(
     let st = Arc::clone(&state);
     let sd = Arc::clone(&shutdown);
 
+    // Retention answers to this chain from the moment it is spawned, not from
+    // its first successful probe: between the two, the follower's watermark is
+    // unknown and every record is potentially one it still has to be sent.
+    journal.register_chain(bound_watermark);
+
     let join = tokio::spawn(async move {
         let mut cursor: Option<Lsn> = None;
         let mut needs_probe = true;
@@ -723,6 +728,11 @@ fn update_progress(
     durable: Lsn,
 ) {
     *state.watermark.lock().expect("chain watermark lock") = Some(durable);
+    // Retention may not release records this follower would have to rescan
+    // (D20). The journal drops the update if this chain registered as
+    // non-bounding, so an adopted chain's source-space watermark never becomes
+    // a floor in this journal's space.
+    journal.note_chain_watermark(durable);
     state.note_progress();
     if let Some(bytes) = lag_in_bytes(journal.committed(), durable, journal.segment_size()) {
         state

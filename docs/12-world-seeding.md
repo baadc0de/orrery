@@ -899,7 +899,7 @@ Golden-manifest tests are valid within a pinned toolchain (§8) and the manifest
 | S3 | New crate `orrery_seed` in the workspace and the crate table | [10-crates.md](10-crates.md) |
 | S4 | `toml` + `blake3` added to the D14 pinned-dependency list (neither is currently a workspace dependency) | [ADR-0014](adr/0014-pinned-versions.md) |
 | S5 | `seedmap/{content_key}` and `seedprog/{emit}/{cell}` added to the keyspace table; `content/version` value extended to `(build, manifest digest, scenario seed, config digest, toolchain, seeded_at)` | [08-persistence.md](08-persistence.md) §6 |
-| S6 | The `world/` key gains a `GridId` discriminator, or per-grid Directory subspaces are specified (P-7) | [08-persistence.md](08-persistence.md) §6 |
+| S6 | The `world/` key gains a `GridId` discriminator (**settled: [D22](adr/0022-grid-id-in-the-storage-key.md)**; the Directory-subspace alternative is rejected) | [08-persistence.md](08-persistence.md) §6 |
 | S7 | §17 gains a pointer to this document as its expansion | [08-persistence.md](08-persistence.md) §17 |
 
 ---
@@ -908,7 +908,7 @@ Golden-manifest tests are valid within a pinned toolchain (§8) and the manifest
 
 | Question | Proposed path | Decide by |
 |---|---|---|
-| **`GridId` in the storage key** (P-7): key discriminator vs. per-grid Directory subspace. A subspace is cleaner and costs a directory lookup per grid; a key field is uniform and costs 4 bytes on every row forever. | Prototype the subspace form against the `kepler` showcase; measure the lookup cost against the < 50 ms first-page-in budget | P2 exit |
+| **`GridId` in the storage key** (P-7): key discriminator vs. per-grid Directory subspace. | **Resolved at P2 exit by [D22](adr/0022-grid-id-in-the-storage-key.md):** the key discriminator stays, and the prototype this row asked for is not owed. The deciding term turned out not to be the lookup — the gate spends at most 7% of the 50 ms first-page-in budget — but the migration cost of durable data that already exists in the key form, plus the availability dependency a directory mapping puts in the path of every cold read | ~~P2 exit~~ **closed** |
 | **Patch granularity below the entity** (§9.4). Whole-bag merge blocks a content update whenever a player touched anything on the entity. Per-component merge needs the `Ruleset` to decode. | Ship whole-entity in v1; measure how often the conflict case actually fires in the reference game before adding a decode path that weakens the seam | P5 entry |
 | **WFC tile-set authoring format** (§6.4). The generator is specified; the content format it consumes is not. | Author the reference game's tile set first and let the format fall out of it, rather than designing a format with no consumer | P4 |
 | **FDB 7.4 `bulkload` SST ingest** (§6.7). Range-parameterized bulk ingest is the fastest possible path and `octree_ifs` output feeds it directly. | Revisit at the 7.3 → 7.4 upgrade decision; the write path is behind a trait so the swap is local | 7.4 upgrade |

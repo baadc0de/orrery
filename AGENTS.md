@@ -46,6 +46,9 @@ entry point. Decisions live independently under [docs/adr/](docs/adr/):
 | D16 | [ADR-0016](docs/adr/0016-parameter-reference.md) | Parameter defaults |
 | D17 | [ADR-0017](docs/adr/0017-risks-and-open-questions.md) | Risks and open questions |
 | D19 | [ADR-0019](docs/adr/0019-indexed-waldb-journal.md) | Indexed wal-db journal default |
+| D20 | [ADR-0020](docs/adr/0020-journal-retention.md) | Journal retention and the recovery budget |
+| D21 | [ADR-0021](docs/adr/0021-ruleset-distribution.md) | `Ruleset` distribution, harness API freeze |
+| D22 | [ADR-0022](docs/adr/0022-grid-id-in-the-storage-key.md) | `GridId` stays a key discriminator |
 
 After the applicable ADRs, use this expansion reading path:
 

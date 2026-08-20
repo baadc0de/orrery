@@ -240,6 +240,27 @@ On primary restart:
 
 This is why the protocol needs a watermark rather than a simple last-seen batch id: the recovery point is an LSN, not a transport message counter.
 
+**And it is why the follower's watermark bounds journal retention
+([D20](adr/0020-journal-retention.md)).** Step 4 above rescans the *primary's*
+journal from `follower_watermark + 1`, so a primary that has released records
+below that point cannot resend them: the follower would be unrecoverable
+rather than merely behind. The primary therefore clamps its release floor to
+what the follower has confirmed durable, and blocks release entirely while a
+registered chain has yet to report a watermark, or while its watermark is in
+another LSN space (a promotion-adopted chain echoes the *source's* LSNs). A
+chain that has stopped keeps its claim: an unreachable follower that is behind
+is exactly the one a release would strand, so retention stalls — visibly, as
+`ReleaseBlocked::ChainLag` — rather than proceeding.
+
+The **follower's own mirror is not released at all**, and §4.1 is the reason.
+Its dedupe cursor is reconstructed by walking the provenance index from batch
+zero and stopping at the first gap, so releasing a prefix of that index
+rebuilds an empty cursor and produces exactly the full re-stream this section
+spends its length avoiding. Bounding a follower needs the rebuilt cursor
+persisted as a keyed row and the reconstruction seeded from it instead of from
+zero. Until that exists, a follower's journal grows with its uptime — the
+residual D20 names.
+
 A restart of the same owner is only "the previous stream" while the epoch is unchanged, and in the landed implementation it usually is not: shard activation bumps the ownership epoch on every activation, a clean restart included. §3.1 makes that a different `DurableChainId`, and §4.1 keys the follower's durable dedupe by it — so a follower reopened at the bumped epoch would rebuild an empty cursor and take a full re-stream into a second physical copy of every mirrored record, at a healthy zero-byte lag, leaving promotion permanently ambiguous.
 
 Dropping the epoch from the dedupe key is **not** the fix: §3.1's identity rule is exactly what stops a superseded primary resuming onto a live follower session. Instead the follower detects the fork. When its journal already holds mirrored rows under a sibling identity differing only in epoch, it refuses to open the new one and names the missing restart handshake. That handshake is not designed yet, and a passive follower cannot invent it: it runs without a fence store (§2's follower accepts no writes and performs no activation), so it has no way to verify an epoch claim. Refusing loudly is the correct behaviour until the handshake exists; resolving a fork today is an operator action.

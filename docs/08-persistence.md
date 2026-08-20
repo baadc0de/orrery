@@ -3440,6 +3440,28 @@ Costs, against the D16 parameter table (transition parameters are design default
 
 The journal **is** the event source (R7). The archive tailer consumes sealed segments, re-sorts records into `(cell_id, tick)` order, and writes Parquet objects to object storage, recording each under `jarchive/{node_id}/{segment_seq}`. Local segments are deleted only after (a) the checkpoint watermark has passed them and (b) the archive object is verified — the journal disk holds minutes-to-hours, the archive holds the configured retention (default: 30 days full-fidelity, aggregated statistics thereafter). Consumers:
 
+**Retention is now built, and the archive half of that rule is not
+([D20](adr/0020-journal-retention.md)).** Until D20 nothing ever deleted a
+segment: `truncate_before` had no caller and the journal grew with a node's
+uptime, as did the index rebuilt from it at every open — measured at 3.94 µs
+and ~95 bytes per record, linearly, which at the P2 gate's own arrival rate is
+a 94 GB journal and a 4.3-minute restart after one hour of run time. The floor
+a node releases to is now the minimum of what its shards have checkpointed and
+what its chain follower has mirrored, so condition (a) above holds and
+condition (b) does not yet: **the archive tailer is a P6 deliverable and
+released records are not archived anywhere.** That is the journal disk holding
+minutes-to-hours, as this section always specified — but anything that needs
+the full event history has to land the tailer first, and when it does it
+contributes one more watermark to the same minimum rather than needing a
+different mechanism. The P2 kill-9 gate holds with retention on: four
+alternating arms on a qualified `c4d-standard-32-lssd` passed 4/4, retention
+releasing 13 and 17 times inside its two arms' 30-second load phases, with
+`journal_commit_ms` p99 at 1 ms in every arm and every pre-crash
+acknowledgement recovered (docs/data/p2-retention-gate-2026-08-20.json). The
+residual D20 names is the *follower's* mirror, which is still unbounded: releasing a prefix of its provenance index would rebuild an
+empty chain cursor and force a full re-stream, so a follower reclaims nothing
+until that cursor is persisted.
+
 - **Griefing rollback:** administrative inverse-op replay — select archive records by `(cell range, author/account, time range)`, generate inverse operations (terrain delta inverses, entity state restores from the preceding checkpoint), and apply them as administrative intents through the critical path (audited, attributable).
 - **Offline progress / parked-cell catch-up:** on reload of a parked cell, the field host runs `Ruleset` catch-up (D7); the archive supplies the input history where catch-up depends on past events.
 - **Desync forensics and adjudication context** (07-witnessing.md), and analytics export (Parquet is directly queryable by the telemetry stack, D12).

@@ -1,0 +1,27 @@
+{
+  "measurement": "journal open cost vs retained journal (D20)",
+  "date": "2026-08-20",
+  "harness": "crates/orrery_persistd/tests/journal_open_scaling.rs",
+  "invocation": "ORRERY_JOURNAL_DIR=<repo>/target/open-scaling-work ORRERY_OPEN_SCALING_OUT=<out> ORRERY_OPEN_SCALING_STEPS=12 ORRERY_OPEN_SCALING_RECORDS_PER_STEP=50000 cargo test -p orrery_persistd --release --test journal_open_scaling -- --ignored --nocapture",
+  "backend": "raw",
+  "features": ["journal-raw", "chain-grpc"],
+  "profile": "release",
+  "host": {
+    "cpu": "AMD Ryzen 9 9950X3D 16-Core Processor",
+    "kernel": "7.1.6-1-cachyos",
+    "ram_bytes": 49596518400,
+    "toolchain": "rustc 1.96.0 (ac68faa20 2026-05-25)"
+  },
+  "journal_device": {
+    "model": "CT2000T700SSD3",
+    "rotational": false,
+    "filesystem": "ext4",
+    "mount_options": "rw,noatime",
+    "source": "/dev/nvme0n1p2"
+  },
+  "page_cache": "warm",
+  "page_cache_note": "The journal was written by the same process moments before each reopen and the host has 46 GiB of RAM against a peak 887 MB journal, so every open read from page cache. The measured slope is therefore a floor: a restart after a host failure reads from the device. This is a developer workstation, not the qualified c4d-standard-32-lssd the D19 gate pairs ran on, and the number this file supports is a slope rather than an absolute.",
+  "steps": 12,
+  "records_per_step": 50000,
+  "payload_bytes": 1400
+}

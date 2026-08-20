@@ -1,0 +1,221 @@
+{
+  "measurement": "D20 retention: the P2 kill-9 gate on a qualified host, retention on vs off, alternating",
+  "date": "2026-08-20",
+  "code": "post lock-ordering fix: the release path takes no WAL lock while holding the journal index lock. An earlier set of arms on an identical host, with the pre-fix binary, passed 4/4 with the same shape; those runs are superseded by these and are not carried here, because an ADR's table should describe the code that shipped.",
+  "host": {
+    "shape": "c4d-standard-32-lssd, us-central1-b (the shape D19's Phase 4 pairs ran on)",
+    "provisioning": "ephemeral instance, created and deleted for this measurement",
+    "journal_and_fdb": "local NVMe /dev/nvme0n1, ext4 noatime at /mnt/nvme; journal under P2_GATE_DATA_DIR=/mnt/nvme/gate-data, separate from the gate's evidence directory",
+    "foundationdb": "7.3.77, single ssd, data on the same local NVMe"
+  },
+  "fio_qualification": {
+    "command": "fio --name=jobA --directory=/mnt/nvme/fio-job-a --rw=write --bs=8k --fdatasync=1 --numjobs=2 --rate_iops=470 --runtime=120 --time_based --size=256m --output-format=json",
+    "criterion": "D19: each job sustains 470 IOPS with maximum fdatasync latency below 1 ms",
+    "result": "PASS",
+    "jobs": [
+      {
+        "iops": 470.0,
+        "sync_p99_ms": 0.0612,
+        "sync_p99_9_ms": 0.1505,
+        "sync_max_ms": 0.1701
+      },
+      {
+        "iops": 470.0,
+        "sync_p99_ms": 0.0494,
+        "sync_p99_9_ms": 0.1444,
+        "sync_max_ms": 0.1649
+      }
+    ],
+    "note": "Taken on an idle host. The same job run while a cargo build was competing for the device reported the same p99 (0.18 ms) with a 143 ms maximum, which is the qualification measuring the contention rather than the device. Qualify before loading the box, not beside it."
+  },
+  "arm_switch": "persistd --no-journal-retention. One binary, one host, one build, arms alternating on/off/off/on.",
+  "arms": [
+    {
+      "arm": "on",
+      "idx": 1,
+      "gate_exit_code": 0,
+      "journal_commit_ms": {
+        "gate": "pass",
+        "p50_us": 1000,
+        "p99_us": 1000,
+        "max_us": 4000,
+        "n": 535032
+      },
+      "intent_commit_ms": {
+        "gate": "pass",
+        "p50_us": 3000,
+        "p99_us": 7000,
+        "max_us": 10000,
+        "n": 15900
+      },
+      "bulk_ack_ms": {
+        "gate": "pass",
+        "p50_us": 1000,
+        "p99_us": 4500,
+        "max_us": 7000,
+        "n": 540904
+      },
+      "area_first_page_ms": {
+        "gate": "pass",
+        "p50_us": 1500,
+        "p99_us": 3000,
+        "max_us": 2669,
+        "n": 125
+      },
+      "root_causes": null,
+      "recovery": {
+        "pass": true,
+        "recovery_cutoff": "0:69235584",
+        "ack_records": 556804,
+        "eligible_bulk_acks": 540904,
+        "bulk_checked": 10000,
+        "intents_checked": 15900
+      },
+      "artifact_result": "pass",
+      "releases": 13,
+      "on_disk_bytes": 76350957
+    },
+    {
+      "arm": "off",
+      "idx": 2,
+      "gate_exit_code": 0,
+      "journal_commit_ms": {
+        "gate": "pass",
+        "p50_us": 1000,
+        "p99_us": 1000,
+        "max_us": 15000,
+        "n": 534920
+      },
+      "intent_commit_ms": {
+        "gate": "pass",
+        "p50_us": 3000,
+        "p99_us": 8000,
+        "max_us": 20000,
+        "n": 15870
+      },
+      "bulk_ack_ms": {
+        "gate": "pass",
+        "p50_us": 1000,
+        "p99_us": 4500,
+        "max_us": 20000,
+        "n": 540992
+      },
+      "area_first_page_ms": {
+        "gate": "pass",
+        "p50_us": 1500,
+        "p99_us": 3000,
+        "max_us": 2732,
+        "n": 125
+      },
+      "root_causes": null,
+      "recovery": {
+        "pass": true,
+        "recovery_cutoff": "0:69246848",
+        "ack_records": 556862,
+        "eligible_bulk_acks": 540992,
+        "bulk_checked": 10000,
+        "intents_checked": 15870
+      },
+      "artifact_result": "pass",
+      "releases": 0,
+      "on_disk_bytes": 76363482
+    },
+    {
+      "arm": "off",
+      "idx": 3,
+      "gate_exit_code": 0,
+      "journal_commit_ms": {
+        "gate": "pass",
+        "p50_us": 1000,
+        "p99_us": 1000,
+        "max_us": 20000,
+        "n": 534872
+      },
+      "intent_commit_ms": {
+        "gate": "pass",
+        "p50_us": 2500,
+        "p99_us": 7000,
+        "max_us": 20000,
+        "n": 15927
+      },
+      "bulk_ack_ms": {
+        "gate": "pass",
+        "p50_us": 1000,
+        "p99_us": 4500,
+        "max_us": 20000,
+        "n": 541016
+      },
+      "area_first_page_ms": {
+        "gate": "pass",
+        "p50_us": 2500,
+        "p99_us": 3500,
+        "max_us": 3451,
+        "n": 125
+      },
+      "root_causes": null,
+      "recovery": {
+        "pass": true,
+        "recovery_cutoff": "0:69249920",
+        "ack_records": 556943,
+        "eligible_bulk_acks": 541016,
+        "bulk_checked": 10000,
+        "intents_checked": 15927
+      },
+      "artifact_result": "pass",
+      "releases": 0,
+      "on_disk_bytes": 76366780
+    },
+    {
+      "arm": "on",
+      "idx": 4,
+      "gate_exit_code": 0,
+      "journal_commit_ms": {
+        "gate": "pass",
+        "p50_us": 1000,
+        "p99_us": 1000,
+        "max_us": 50000,
+        "n": 534600
+      },
+      "intent_commit_ms": {
+        "gate": "pass",
+        "p50_us": 2500,
+        "p99_us": 7000,
+        "max_us": 50000,
+        "n": 15878
+      },
+      "bulk_ack_ms": {
+        "gate": "pass",
+        "p50_us": 1000,
+        "p99_us": 4500,
+        "max_us": 50000,
+        "n": 540952
+      },
+      "area_first_page_ms": {
+        "gate": "pass",
+        "p50_us": 1750,
+        "p99_us": 3000,
+        "max_us": 2736,
+        "n": 125
+      },
+      "root_causes": null,
+      "recovery": {
+        "pass": true,
+        "recovery_cutoff": "0:69241728",
+        "ack_records": 556830,
+        "eligible_bulk_acks": 540952,
+        "bulk_checked": 10000,
+        "intents_checked": 15878
+      },
+      "artifact_result": "pass",
+      "releases": 17,
+      "on_disk_bytes": 76358358
+    }
+  ],
+  "first_release_of_the_last_on_arm": {
+    "floor": "0:29850624",
+    "records_dropped": 233208,
+    "bytes_before": 56728838,
+    "bytes_after": 56731139
+  },
+  "conclusion": "The gate passes 4/4. Both retention arms passed with retention demonstrably active (13 and 17 releases inside a 30-second load phase, the first dropping 233 208 records from the index) and both recovered every pre-crash acknowledgement. journal_commit_ms p99 is 1 ms in every arm, which is what the gate judges. The per-arm maxima are single samples and scatter in both directions -- 4 ms and 50 ms with retention, 15 ms and 20 ms without -- so they support no ordering between the arms, and nothing in this data set separates them."
+}

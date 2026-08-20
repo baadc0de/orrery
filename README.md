@@ -11,8 +11,8 @@ It targets very large universes with strong spatial locality — 32–128 player
 per area, 60 Hz fast action — and it is a framework, not a game. Games supply a
 `Ruleset`; every tunable is a configurable parameter with a stated default.
 
-**Normative source:** the [ADR index](docs/DECISIONS.md) and the 18 accepted
-[ADRs](docs/adr/) (D1–D17 and D19; D18 remains a reserved proposal). The
+**Normative source:** the [ADR index](docs/DECISIONS.md) and the 21 accepted
+[ADRs](docs/adr/) (D1–D17 and D19–D22; D18 remains a reserved proposal). The
 applicable ADRs govern this README and every numbered document.
 
 ---
@@ -55,6 +55,19 @@ The indexed implementation is now the default selected by
 [D19](docs/adr/0019-indexed-waldb-journal.md), pinned to wal-db 1.0.0. Fjall
 remains available behind the explicit, mutually exclusive `journal-fjall`
 fallback feature; it is no longer the shipping path.
+
+**And the journal is now bounded** — it was not. Nothing ever released a
+segment, so a node's journal, and the index rebuilt from it at every open, grew
+with its uptime: 3.94 µs and ~95 bytes per record, linearly, which at the
+gate's own arrival rate is a 94 GB journal and a 4.3-minute restart after one
+hour of run time. [D20](docs/adr/0020-journal-retention.md) makes the
+checkpoint floor bound it, clamped by what the chain follower has mirrored,
+with a scan below the floor failing loudly rather than answering short. The gate holds with it on — four
+alternating arms on a qualified `c4d-standard-32-lssd` passed 4/4, retention
+active in its two, every acknowledged write recovered after the `kill -9`. Two
+residuals are named rather than hidden: released records are not archived
+anywhere until the P6 tailer exists, and a follower's own mirror stays
+unbounded until its dedupe cursor is persisted.
 
 The Fjall root cause is its 100 ms-step write backpressure, not the device. The
 full investigation is [docs/08-persistence.md](docs/08-persistence.md)

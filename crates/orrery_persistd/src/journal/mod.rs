@@ -60,6 +60,82 @@ impl Default for JournalConfig {
     }
 }
 
+/// Why a [`Journal::release_before`] call reclaimed nothing.
+///
+/// A blocked release is a normal outcome, not an error: the caller asks on a
+/// cadence and the journal answers with what it was able to do. The variant
+/// says which precondition was the binding one, so an operator watching a
+/// journal that never shrinks can tell *why* rather than guess.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReleaseBlocked {
+    /// The floor is at or below the one already in force — nothing new.
+    AlreadyReleased,
+    /// The journal mirrors another node's chain and holds the follower
+    /// provenance index, whose consumer (`rebuild_cursor`) walks it from batch
+    /// zero. Releasing a prefix of it would rebuild an empty cursor and cost a
+    /// full re-stream, so a follower's mirror is not released (D20 §residual).
+    FollowerProvenance,
+    /// A chain follower still needs records at or below the proposed floor.
+    ///
+    /// A follower that falls behind resumes by rescanning the *primary's*
+    /// journal from its own watermark, so releasing past that watermark turns
+    /// a lagging follower into an unrecoverable one. A chain whose follower
+    /// watermark is not yet known blocks release entirely, as does an
+    /// adopted chain, whose watermark is in the source's LSN space rather
+    /// than this journal's.
+    ChainLag,
+    /// This backend does not implement retention. The Fjall fallback (D19) is
+    /// a rollback path, not the shipping default, and does not reclaim.
+    Unsupported,
+}
+
+impl core::fmt::Display for ReleaseBlocked {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::AlreadyReleased => write!(f, "already released to this floor"),
+            Self::FollowerProvenance => write!(f, "journal holds follower chain provenance"),
+            Self::ChainLag => write!(f, "a chain follower has not mirrored past the floor"),
+            Self::Unsupported => write!(f, "backend does not implement retention"),
+        }
+    }
+}
+
+/// What one [`Journal::release_before`] call did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JournalRelease {
+    /// The floor the caller asked for.
+    pub requested: Lsn,
+    /// The retention floor in force after the call. Records below it are gone
+    /// from the index and a scan that asks for them fails
+    /// [`JournalError::Released`] rather than returning a short answer.
+    pub floor: Lsn,
+    /// Index entries dropped by this call.
+    pub records_dropped: u64,
+    /// On-disk bytes before and after. `truncate_before` drops whole segments,
+    /// so these are equal whenever the floor advanced within one segment —
+    /// which is the common case and not a failure.
+    pub bytes_before: u64,
+    /// See [`JournalRelease::bytes_before`].
+    pub bytes_after: u64,
+    /// Set when the call reclaimed nothing, naming the binding precondition.
+    pub blocked: Option<ReleaseBlocked>,
+}
+
+impl JournalRelease {
+    /// A release that did nothing, for `reason`.
+    #[must_use]
+    pub fn blocked(requested: Lsn, floor: Lsn, reason: ReleaseBlocked) -> Self {
+        Self {
+            requested,
+            floor,
+            records_dropped: 0,
+            bytes_before: 0,
+            bytes_after: 0,
+            blocked: Some(reason),
+        }
+    }
+}
+
 /// A handle representing one pending journal append.
 ///
 /// Created by [`Journal::append`] and resolved by the group committer once the
@@ -202,6 +278,17 @@ pub enum JournalError {
     PayloadTooLarge(usize),
     /// The underlying store failed.
     Store(String),
+    /// The scan asked for records the journal has released (D20 §retention).
+    ///
+    /// Never a short scan: a caller that needs records below the retention
+    /// floor is a caller whose checkpoint is older than the journal, and
+    /// answering it with the surviving suffix would be silent data loss.
+    Released {
+        /// The LSN the caller asked to scan from.
+        requested: Lsn,
+        /// The lowest LSN the journal still retains.
+        floor: Lsn,
+    },
     /// A stored record failed to decode.
     Corrupt {
         /// The offending record's LSN.
@@ -217,6 +304,11 @@ impl core::fmt::Display for JournalError {
             Self::Closed => write!(f, "journal is closed"),
             Self::PayloadTooLarge(n) => write!(f, "record payload too large: {n} bytes"),
             Self::Store(s) => write!(f, "store error: {s}"),
+            Self::Released { requested, floor } => write!(
+                f,
+                "journal scan from {requested} is below the retention floor {floor}: \
+                 the records it needs have been released"
+            ),
             Self::Corrupt { lsn, msg } => write!(f, "corrupt record at {lsn}: {msg}"),
         }
     }

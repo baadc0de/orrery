@@ -421,6 +421,7 @@ async fn scheduler_checkpoints_on_cadence_and_quiesce() {
         &CheckpointConfig {
             interval: Duration::from_millis(50),
             jitter: Duration::from_millis(10),
+            retention: true,
         },
     );
 

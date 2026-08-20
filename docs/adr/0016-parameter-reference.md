@@ -1,6 +1,7 @@
 # ADR-0016: Parameter reference (defaults)
 
-**Status:** Accepted · **Date:** 2026-08-11 · **Decision:** D16
+**Status:** Accepted; extended by [ADR-0020](0020-journal-retention.md) ·
+**Date:** 2026-08-11 · **Decision:** D16
 
 This decision is normative. See the [ADR index](../DECISIONS.md) for precedence, scope, and the complete decision set.
 
@@ -19,4 +20,13 @@ This decision is normative. See the [ADR index](../DECISIONS.md) for precedence,
 | ε_pos / ε_vel / window | 1 cm / 1 cm·s⁻¹ / 250 ms | Adjudication window max | 3 s (180 ticks) |
 | Epoch reseed min interval | 10 s | Ruleset builds retained (adjudication) | 3 |
 | Hot-cell egress (promoted) | ≤ 35 Mbps | Witness-log fan-out | witness set only (≤ 7 links) |
+| Journal retention | on (D20) | Journal open (index rebuild) | < 2 000 ms (D20) |
+
+The last row is added by [D20](0020-journal-retention.md). *Journal retention*
+is whether a node releases journal segments its checkpoints have made
+redundant; with it off, journal disk and the index rebuilt from it at every
+open grow with total uptime rather than with the checkpoint cadence. *Journal
+open* is the budget for that rebuild on a node within its retention floor —
+measured at 3.94 µs and ~95 bytes of index per record, so 2 000 ms is roughly
+508 000 records. It is a budget to measure against, not yet an enforced gate.
 

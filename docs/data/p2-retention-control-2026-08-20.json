@@ -1,0 +1,46 @@
+{
+  "measurement": "D20 retention control: the P2 kill-9 gate with and without journal retention, on one host, one binary",
+  "date": "2026-08-20",
+  "purpose": "Not a gate qualification. The question is narrower and answerable on an unqualified host: does releasing journal segments during a live gate run move the journal-commit tail, and does an acknowledged write survive a kill -9 after it? The gate's own pass/fail belongs to the qualified host the nightly runs on.",
+  "host": {
+    "name": "orrery-hel1-1",
+    "role": "the self-hosted nightly runner for the P1/P3/P4 legs; the P2 kill-9 job runs on a hosted runner, not here",
+    "cores": 16,
+    "ram_gb": 62,
+    "filesystem": "/dev/md2 (software RAID), ext4"
+  },
+  "fio_qualification": {
+    "command": "fio --name=jobA --directory=<repo>/.fio/jobA --rw=write --bs=8k --fdatasync=1 --numjobs=2 --rate_iops=470 --runtime=60 --time_based --size=256m --output-format=json",
+    "criterion": "D19: each job sustains 470 IOPS with maximum fdatasync latency below 1 ms",
+    "result": "FAIL",
+    "jobs": [
+      { "iops": 337.3, "sync_p99_ms": 7.045, "sync_max_ms": 104.12 },
+      { "iops": 337.3, "sync_p99_ms": 7.045, "sync_max_ms": 95.393 }
+    ],
+    "note": "The host could not even hold the offered 470 IOPS, and its fdatasync p99 of 7.045 ms is two orders of magnitude above the qualified NVMe's 0.185 ms. No arm run here can pass the 2 ms journal_commit_ms budget, and none did."
+  },
+  "arms": [
+    { "arm": "retention off", "idx": 1, "journal_commit_ms": { "p50_us": 1000, "p99_us": 8000, "max_us": 30000, "n": 531816 } },
+    { "arm": "retention on",  "idx": 3, "journal_commit_ms": { "p50_us": 1250, "p99_us": 9000, "max_us": 20000, "n": 531216 } },
+    { "arm": "retention off", "idx": 8, "journal_commit_ms": { "p50_us": 1000, "p99_us": 9000, "max_us": 30000, "n": 531224 } },
+    { "arm": "retention on",  "idx": 9, "journal_commit_ms": { "p50_us": 1000, "p99_us": 9000, "max_us": 30000, "n": 531528 } }
+  ],
+  "arm_switch": "persistd --no-journal-retention. One binary, one host, one build; the arms differ by that flag alone.",
+  "retention_fired": {
+    "run": "idx 9",
+    "releases": 16,
+    "first_release": { "floor": "0:27148288", "records_dropped": 212096, "bytes_before": 53715963, "bytes_after": 53723925 },
+    "note": "bytes_after exceeds bytes_before by the release marker: this journal never reached one 128 MiB segment, so nothing could be reclaimed on disk while 212 096 index entries were. That is the designed behaviour (D20), and it is why the reclamation assertion lives in an ignored test that writes past a segment boundary."
+  },
+  "recovery_verification": {
+    "run": "idx 9",
+    "pass": true,
+    "recovery_cutoff": "0:69248896",
+    "ack_records": 556913,
+    "eligible_bulk_acks": 541008,
+    "bulk_checked": 10000,
+    "intents_checked": 15905,
+    "rejected_intents_audited": 0
+  },
+  "conclusion": "Retention does not move the journal-commit tail: 9 ms p99 with it on, 8-9 ms with it off, on a host whose bare fdatasync p99 is 7 ms. Every acknowledged write survived a kill -9 in the run where retention released 16 times. What is still owed is a run on a qualified host, which is the nightly p2-kill9 job's."
+}
