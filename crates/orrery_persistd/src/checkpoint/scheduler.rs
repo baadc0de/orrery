@@ -88,6 +88,16 @@ impl ReleaseFloor {
 
 /// Ask the journal to release everything below the floor these checkpoints
 /// established, and log what it did.
+///
+/// The floor the scheduler *proposes* is the journal's own
+/// [`Journal::retention_floor`] rather than the checkpoint floor directly,
+/// because the two halves of a node's journal answer to different authorities
+/// (D23): locally originated records to these checkpoints, mirrored records to
+/// the floor their primary has itself reached. A passive follower holds only
+/// the second kind, and reading its actors' empty watermark as a floor of
+/// `0:0` is what kept every mirror unbounded.
+///
+/// [`Journal::retention_floor`]: crate::journal::Journal::retention_floor
 fn release_journal(journal: &crate::journal::Journal, floor: Lsn) {
     match journal.release_before(floor) {
         Ok(release) => match release.blocked {
@@ -108,6 +118,53 @@ fn release_journal(journal: &crate::journal::Journal, floor: Lsn) {
         },
         Err(error) => tracing::warn!(floor = %floor, %error, "journal release failed"),
     }
+}
+
+/// Retention on a node with no actors to checkpoint: a passive chain follower
+/// (D23).
+///
+/// `run_follower` opens no runtime, no scheduler and no gateway — mirrored
+/// records are its only writes — so the checkpoint cadence that drives
+/// retention everywhere else does not exist there, and its mirror grew with
+/// its uptime for exactly that reason. This is the same release call on the
+/// same cadence, driven by a timer instead of by checkpoints, because on this
+/// node there is nothing to checkpoint: the floor comes from the primary
+/// ([`Journal::retention_floor`] with no local floor at all).
+///
+/// [`Journal::retention_floor`]: crate::journal::Journal::retention_floor
+pub struct MirrorRetention {
+    shutdown: Arc<tokio::sync::Notify>,
+    join: tokio::task::JoinHandle<()>,
+}
+
+impl MirrorRetention {
+    /// Stop the driver and await its task.
+    pub async fn shutdown(self) {
+        self.shutdown.notify_waiters();
+        let _ = self.join.await;
+    }
+}
+
+/// Spawn the passive-follower retention driver described by [`MirrorRetention`].
+#[must_use]
+pub fn spawn_mirror_retention(
+    journal: Arc<crate::journal::Journal>,
+    interval: Duration,
+) -> MirrorRetention {
+    let shutdown = Arc::new(tokio::sync::Notify::new());
+    let shutdown_task = Arc::clone(&shutdown);
+    let join = tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                () = tokio::time::sleep(interval) => {}
+                () = shutdown_task.notified() => break,
+            }
+            if let Some(floor) = journal.retention_floor(None) {
+                release_journal(&journal, floor);
+            }
+        }
+    });
+    MirrorRetention { shutdown, join }
 }
 
 /// A request to quiesce-flush a cell (coordinator signal, §8).
@@ -247,11 +304,11 @@ pub fn spawn_checkpoint_scheduler(
             // checkpoints, so per-shard attempts would be one useful call and
             // `shards - 1` blocked ones.
             if retention {
-                if let Some(release) = floor.floor(&shards) {
-                    let journal = {
-                        let rt = runtime.lock().await;
-                        Arc::clone(rt.journal())
-                    };
+                let journal = {
+                    let rt = runtime.lock().await;
+                    Arc::clone(rt.journal())
+                };
+                if let Some(release) = journal.retention_floor(floor.floor(&shards)) {
                     release_journal(&journal, release);
                 }
             }
@@ -336,8 +393,9 @@ pub fn spawn_checkpoint_scheduler_direct(
             }
 
             if retention {
-                if let Some(release) = floor.floor(&shards) {
-                    release_journal(runtime.journal(), release);
+                let journal = runtime.journal();
+                if let Some(release) = journal.retention_floor(floor.floor(&shards)) {
+                    release_journal(journal, release);
                 }
             }
         }

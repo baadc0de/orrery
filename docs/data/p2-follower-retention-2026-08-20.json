@@ -1,0 +1,287 @@
+{
+  "kind": "p2_retention_cadence_arms",
+  "decision": "D23",
+  "measured_at": "2026-08-20",
+  "host": {
+    "note": "self-hosted dev box; fails D19 device qualification (bare fdatasync p99 7.045 ms), so every arm misses the 2 ms journal_commit_ms budget for the reason D20 recorded here",
+    "cluster": "throwaway single-node FoundationDB 7.3.63, ssd engine, 127.0.0.1:4599"
+  },
+  "arms": [
+    {
+      "checkpoint_interval_ms": 20000,
+      "retention": {
+        "primary": {
+          "blocked": null,
+          "floor": "0:27258496",
+          "records_dropped": 212957,
+          "releases": 30,
+          "type": "journal_retention"
+        },
+        "follower": {
+          "blocked": "already released to this floor",
+          "floor": "0:0",
+          "records_dropped": 0,
+          "releases": 0,
+          "type": "journal_retention"
+        }
+      },
+      "journal_open_ms": {
+        "follower": 0.188591,
+        "primary": 0.281655,
+        "promoted": 2905.0295109999997
+      },
+      "latency": {
+        "gate": "fail",
+        "series": {
+          "area_first_page_ms": {
+            "n": 125,
+            "p50_us": 2500,
+            "p99_us": 4000,
+            "max_us": 3888,
+            "threshold_us": 50000,
+            "gate": "pass",
+            "unit": "us"
+          },
+          "bulk_ack_ms": {
+            "n": 540992,
+            "p50_us": 8000,
+            "p99_us": 30000,
+            "max_us": 75000,
+            "threshold_us": 5000,
+            "gate": "fail",
+            "unit": "us",
+            "contains": [
+              "journal_commit_ms"
+            ],
+            "failure_role": {
+              "kind": "consequence",
+              "of": [
+                "journal_commit_ms"
+              ]
+            }
+          },
+          "intent_commit_ms": {
+            "n": 15891,
+            "p50_us": 10000,
+            "p99_us": 30000,
+            "max_us": 75000,
+            "threshold_us": 10000,
+            "gate": "fail",
+            "unit": "us",
+            "contains": [
+              "journal_commit_ms"
+            ],
+            "failure_role": {
+              "kind": "consequence",
+              "of": [
+                "journal_commit_ms"
+              ]
+            }
+          },
+          "journal_commit_ms": {
+            "n": 532704,
+            "p50_us": 8000,
+            "p99_us": 30000,
+            "max_us": 75000,
+            "threshold_us": 2000,
+            "gate": "fail",
+            "unit": "us",
+            "failure_role": {
+              "kind": "root"
+            }
+          }
+        }
+      }
+    },
+    {
+      "checkpoint_interval_ms": 5000,
+      "retention": {
+        "primary": {
+          "blocked": null,
+          "floor": "0:55467776",
+          "records_dropped": 433342,
+          "releases": 237,
+          "type": "journal_retention"
+        },
+        "follower": {
+          "blocked": null,
+          "floor": "0:47787648",
+          "records_dropped": 373341,
+          "releases": 5,
+          "type": "journal_retention"
+        }
+      },
+      "journal_open_ms": {
+        "follower": 0.154728,
+        "primary": 0.202708,
+        "promoted": 763.862436
+      },
+      "latency": {
+        "gate": "fail",
+        "series": {
+          "area_first_page_ms": {
+            "n": 125,
+            "p50_us": 3000,
+            "p99_us": 4500,
+            "max_us": 4123,
+            "threshold_us": 50000,
+            "gate": "pass",
+            "unit": "us"
+          },
+          "bulk_ack_ms": {
+            "n": 540992,
+            "p50_us": 8000,
+            "p99_us": 30000,
+            "max_us": 40000,
+            "threshold_us": 5000,
+            "gate": "fail",
+            "unit": "us",
+            "contains": [
+              "journal_commit_ms"
+            ],
+            "failure_role": {
+              "kind": "consequence",
+              "of": [
+                "journal_commit_ms"
+              ]
+            }
+          },
+          "intent_commit_ms": {
+            "n": 15887,
+            "p50_us": 10000,
+            "p99_us": 30000,
+            "max_us": 40000,
+            "threshold_us": 10000,
+            "gate": "fail",
+            "unit": "us",
+            "contains": [
+              "journal_commit_ms"
+            ],
+            "failure_role": {
+              "kind": "consequence",
+              "of": [
+                "journal_commit_ms"
+              ]
+            }
+          },
+          "journal_commit_ms": {
+            "n": 532168,
+            "p50_us": 8000,
+            "p99_us": 30000,
+            "max_us": 40000,
+            "threshold_us": 2000,
+            "gate": "fail",
+            "unit": "us",
+            "failure_role": {
+              "kind": "root"
+            }
+          }
+        }
+      },
+      "recovery": {
+        "pass": true,
+        "recovery_cutoff": "0:69246848",
+        "ack_records": 556879,
+        "eligible_bulk_acks": 540992,
+        "bulk_checked": 10000,
+        "intents_checked": 15887,
+        "rejected_intents_audited": 0
+      }
+    },
+    {
+      "checkpoint_interval_ms": 2000,
+      "retention": {
+        "primary": {
+          "blocked": null,
+          "floor": "0:62370432",
+          "records_dropped": 487269,
+          "releases": 140,
+          "type": "journal_retention"
+        },
+        "follower": {
+          "blocked": null,
+          "floor": "0:60046720",
+          "records_dropped": 469115,
+          "releases": 10,
+          "type": "journal_retention"
+        }
+      },
+      "journal_open_ms": {
+        "follower": 1.277722,
+        "primary": 0.30971699999999996,
+        "promoted": 299.756446
+      },
+      "latency": {
+        "gate": "fail",
+        "series": {
+          "area_first_page_ms": {
+            "n": 125,
+            "p50_us": 1000,
+            "p99_us": 3500,
+            "max_us": 3106,
+            "threshold_us": 50000,
+            "gate": "pass",
+            "unit": "us"
+          },
+          "bulk_ack_ms": {
+            "n": 540256,
+            "p50_us": 15000,
+            "p99_us": 75000,
+            "max_us": 200000,
+            "threshold_us": 5000,
+            "gate": "fail",
+            "unit": "us",
+            "contains": [
+              "journal_commit_ms"
+            ],
+            "failure_role": {
+              "kind": "consequence",
+              "of": [
+                "journal_commit_ms"
+              ]
+            }
+          },
+          "intent_commit_ms": {
+            "n": 15838,
+            "p50_us": 15000,
+            "p99_us": 50000,
+            "max_us": 200000,
+            "threshold_us": 10000,
+            "gate": "fail",
+            "unit": "us",
+            "contains": [
+              "journal_commit_ms"
+            ],
+            "failure_role": {
+              "kind": "consequence",
+              "of": [
+                "journal_commit_ms"
+              ]
+            }
+          },
+          "journal_commit_ms": {
+            "n": 531232,
+            "p50_us": 15000,
+            "p99_us": 75000,
+            "max_us": 200000,
+            "threshold_us": 2000,
+            "gate": "fail",
+            "unit": "us",
+            "failure_role": {
+              "kind": "root"
+            }
+          }
+        }
+      },
+      "recovery": {
+        "pass": true,
+        "recovery_cutoff": "0:68351872",
+        "ack_records": 556094,
+        "eligible_bulk_acks": 534000,
+        "bulk_checked": 10000,
+        "intents_checked": 15838,
+        "rejected_intents_audited": 0
+      }
+    }
+  ]
+}

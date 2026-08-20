@@ -156,6 +156,9 @@ pub struct Journal {
     metrics: Arc<JournalCommitMetrics>,
     /// Committed records, published for chain replication (§4).
     published: broadcast::Sender<JournalRecord>,
+    /// What this journal's `open` cost, in milliseconds (D16
+    /// `journal_open_ms`).
+    open_ms: f64,
     /// Test-only fault injection for [`Journal::scan_originated_from`].
     ///
     /// The replicator's unrecoverable read path is a *per-item* error inside
@@ -216,6 +219,7 @@ impl Journal {
     /// Open (or reopen) a journal in `cfg.dir`, starting a group-commit
     /// committer task.
     pub fn open(config: &JournalConfig) -> Result<Self, JournalError> {
+        let opened_at = std::time::Instant::now();
         let db = Database::builder(&config.dir)
             .manual_journal_persist(true)
             .open()
@@ -298,6 +302,7 @@ impl Journal {
             closed: std::sync::atomic::AtomicBool::new(false),
             metrics,
             published,
+            open_ms: opened_at.elapsed().as_secs_f64() * 1e3,
             #[cfg(test)]
             scan_fault: std::sync::atomic::AtomicBool::new(false),
         })
@@ -489,6 +494,33 @@ impl Journal {
     /// [`Journal::register_chain`].
     #[allow(clippy::unused_self)]
     pub fn note_chain_watermark(&self, _watermark: Lsn) {}
+
+    /// Record a mirrored chain's primary retention floor (D23). A no-op: this
+    /// backend releases nothing, so nothing is bounded by it.
+    #[cfg(feature = "chain-grpc")]
+    #[allow(clippy::unused_self)]
+    pub(crate) fn note_primary_floor(&self, _chain_key: &[u8], _floor: Lsn) {}
+
+    /// The floor a release should ask for (D23). Always `None`: this backend
+    /// implements no retention, so the driver has nothing to ask for.
+    #[allow(clippy::unused_self)]
+    pub fn retention_floor(&self, _checkpoint_floor: Option<Lsn>) -> Option<Lsn> {
+        None
+    }
+
+    /// What retention has done since open. Always the default: see
+    /// [`Journal::release_before`].
+    #[allow(clippy::unused_self)]
+    pub fn retention(&self) -> crate::journal::JournalRetention {
+        crate::journal::JournalRetention::default()
+    }
+
+    /// What this journal's `open` cost, in milliseconds (D16
+    /// `journal_open_ms`).
+    #[must_use]
+    pub fn open_ms(&self) -> f64 {
+        self.open_ms
+    }
 
     /// The lowest LSN this journal still retains.
     ///

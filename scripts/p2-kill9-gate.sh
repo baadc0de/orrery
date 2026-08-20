@@ -129,6 +129,28 @@ if [[ ${1:-} == --self-test ]]; then
   has 'durable_acks=$(grep -c' || die 'self-test: durable-acknowledgement count absent'
   has 'load produced no durable bulk acknowledgement' \
     || die 'self-test: durable-acknowledgement assertion absent'
+  # Retention, in three clauses, because the stage has three separable ways to
+  # go missing and each one leaves the others green. The *cadence* has to be
+  # set, or a 30-second load against D16's 20 s +/- 5 s cadence makes a release
+  # an accident of jitter — which is how D20 could only report that retention
+  # was harmless where it happened to fire. The stage has to *run*. And the run
+  # has to *fail* when a journal released nothing, which is the assertion, not
+  # the stage. Matched with their operands attached: bare `checkpoint_interval`
+  # and bare `prove_retention_advanced` are both satisfied by the variable
+  # assignment and the function definition that survive deleting every use.
+  has '--checkpoint-interval-ms "$checkpoint_interval_ms"' \
+    || die 'self-test: the checkpoint cadence that makes retention observable is not passed to persistd'
+  [[ $(grep -cF -- '--checkpoint-interval-ms "$checkpoint_interval_ms"' <<<"$body") -ge 2 ]] \
+    || die 'self-test: only one node is run at the retention cadence; the gate proves retention on both'
+  runs 'prove_retention_advanced' || die 'self-test: retention proof absent'
+  has 'retention released nothing' || die 'self-test: retention proof asserts nothing about releases'
+  has 'the retention floor never advanced past 0:0' \
+    || die 'self-test: retention proof does not require the floor to advance'
+  # And the budget the floor exists to keep. `journal_open_ms` alone appears in
+  # the readiness field name, which survives deleting the comparison.
+  runs 'prove_journal_open_budget' || die 'self-test: journal-open budget check absent'
+  has 'over the D16 journal_open_ms budget of 2000 ms' \
+    || die 'self-test: journal-open budget has no threshold'
   echo 'self-test: two-process proof stages present'
   exit 0
 fi
@@ -229,6 +251,42 @@ duration=${P2_GATE_DURATION_SECS:-30}
 # `ci` is the same topology 100x smaller). They are no longer rig arguments:
 # the rig must claim leases at the cells the seeder actually committed.
 sessions=${P2_GATE_SESSIONS:-125}
+# The checkpoint cadence every persistd below runs at, in milliseconds.
+#
+# D16's cadence is 20 s ± 5 s, and against a 30-second load phase that made
+# retention an accident of jitter: D20 could only report that the gate passed
+# with retention on, not that retention had happened. A cadence the load phase
+# outlasts is what turns "retention is harmless here" into a clause that fails
+# when retention breaks (D23). It is a harness lever, not a claim about the
+# deployed cadence — the *mechanism* under test is the release, and the release
+# is driven by checkpoint rounds either way.
+#
+# **5 s, and the number is measured rather than picked.** Three arms on this
+# repository's self-hosted box, same binaries, same seeded world, one after the
+# other (2026-08-20):
+#
+# | cadence | primary | follower | `journal_commit_ms` p50 / p99 |
+# |---|---|---|---|
+# | 20 s (D16) | 30 releases | **0 — clause fails** | 8 ms / 30 ms |
+# | 5 s | 237 releases | 5 releases | 8 ms / 30 ms |
+# | 2 s | 140 releases | 10 releases | 15 ms / 75 ms |
+#
+# At D16's own cadence a 30-second load does not contain one follower release:
+# the primary's first floor needs all 128 shards to have checkpointed once
+# (~20 s), and the follower's own timer has already fired by the time that
+# floor reaches it. Two cadences of lag do not fit in the window, so the clause
+# fails — correctly, and on a configuration that says nothing about retention.
+# At 2 s the clause passes and the *measurement* degrades: 128 shards
+# checkpointing ten times as often is ten times the checkpoint write traffic on
+# a device that already cannot hold its offered IOPS, and the p99 this gate
+# judges doubles-and-a-half. 5 s is the cadence that buys the clause without
+# moving the number: identical p50 and p99 to D16's own cadence on this box.
+#
+# (Every arm fails the 2 ms `journal_commit_ms` budget here regardless — this
+# box's bare `fdatasync` p99 is 7.045 ms and it fails D19's qualification, as
+# D20 recorded for both of its own arms on the same machine.)
+checkpoint_interval_ms=${P2_GATE_CHECKPOINT_INTERVAL_MS:-5000}
+[[ $checkpoint_interval_ms =~ ^[0-9]+$ ]] || die 'P2_GATE_CHECKPOINT_INTERVAL_MS must be numeric'
 
 primary_pid=''
 follower_pid=''
@@ -314,6 +372,7 @@ note "identity issuer $issuer_key_id@$issuer_public"
 
 start_follower() {
   "$PERSISTD_BIN" --node-id 2 --chain-epoch 1 --chain-primary 1 "${shard_flags[@]}" \
+    --checkpoint-interval-ms "$checkpoint_interval_ms" \
     --chain-listen "127.0.0.1:$chain_port" --dir "$data/follower-data" \
     --metrics-jsonl "$out/follower-metrics.jsonl" \
     >"$out/follower.json" 2>"$out/follower.stderr" & follower_pid=$!
@@ -324,6 +383,7 @@ start_primary() {
   ORRERY_GATEWAY_BOUNDARY_JSONL="$out/primary-boundary.jsonl" \
   "$PERSISTD_BIN" --node-id 1 --chain-epoch 1 --chain-follower "2@$follower_chain" \
     "${shard_flags[@]}" \
+    --checkpoint-interval-ms "$checkpoint_interval_ms" \
     --bind "127.0.0.1:$gateway_port" --dir "$data/primary-data" \
     --secret-key "$secret_primary" --fdb-cluster-file "$ORRERY_FDB_CLUSTER_FILE" \
     --issuer-key "$issuer_key_id@$issuer_public" \
@@ -380,6 +440,101 @@ start_promoted_follower() {
   promoted_gateway=$(json_field "$out/promoted.json" node_id)
   promoted_addr=$(json_field "$out/promoted.json" bind_addr)
   recovery_cutoff=$(json_field "$out/promoted.json" recovery_cutoff)
+}
+
+# Retention has to have *happened*, on both nodes, and the floor is the proof.
+#
+# D20 shipped retention on by default and this gate covered it incidentally: on
+# a 30-second load against a 20 s +/- 5 s cadence, whether a release fired at
+# all was jitter. One earlier run fired none and passed. So the gate now sets
+# the cadence (`--checkpoint-interval-ms`) and reads back what each node's own
+# reporter said about its floor, which is a clause that fails when retention
+# breaks rather than one that passes when retention is absent.
+#
+# The two sides are bounded by different things and that is the point (D23):
+# the primary's journal answers to its own checkpoints, and the follower's
+# mirror answers to the floor the primary reports over the chain. A run where
+# only the primary released is a run whose follower mirror is still unbounded,
+# which is exactly the residual this clause exists to keep closed.
+prove_retention_advanced() {
+  note 'proving both journals were released behind their floors'
+  python3 - "$out/primary-metrics.jsonl" "$out/follower-metrics.jsonl" "$out/retention.json" <<'PY'
+import json, sys
+
+
+def last_retention(path):
+    found = None
+    with open(path, encoding='utf-8') as handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if record.get('type') == 'journal_retention':
+                found = record
+    return found
+
+
+proof = {}
+for role, path in (('primary', sys.argv[1]), ('follower', sys.argv[2])):
+    record = last_retention(path)
+    if record is None:
+        raise SystemExit(
+            f'{role}: no journal_retention record at all, so retention never '
+            f'reported and this run says nothing about whether the journal is bounded'
+        )
+    if record.get('releases', 0) < 1:
+        raise SystemExit(
+            f"{role}: retention released nothing (blocked: {record.get('blocked')})"
+        )
+    if record.get('floor') == '0:0':
+        raise SystemExit(f'{role}: the retention floor never advanced past 0:0')
+    proof[role] = record
+
+with open(sys.argv[3], 'w', encoding='utf-8') as handle:
+    json.dump(proof, handle, indent=2)
+print(
+    'retention: primary floor {} after {} release(s), {} records dropped; '
+    'follower floor {} after {} release(s), {} records dropped'.format(
+        proof['primary']['floor'],
+        proof['primary']['releases'],
+        proof['primary']['records_dropped'],
+        proof['follower']['floor'],
+        proof['follower']['releases'],
+        proof['follower']['records_dropped'],
+    ),
+    file=sys.stderr,
+)
+PY
+}
+
+# The D16 `journal_open_ms` budget, enforced where it is actually paid.
+#
+# D20 set a 2 000 ms budget for `Journal::open` on a node within its retention
+# floor and left it as a number nothing checked. It is the budget retention
+# exists to keep: the index rebuild is linear in the journal opened (~3.94 us
+# per record), so an unbounded journal crosses it and then keeps going. Every
+# node in this run reports what its own open cost on its readiness line, which
+# is the measurement rather than one startup timestamp minus another.
+prove_journal_open_budget() {
+  local role file ms
+  for role in follower primary promoted; do
+    file="$out/$role.json"
+    [[ -s $file ]] || die "no readiness line for $role; cannot check the journal-open budget"
+    ms=$(json_field "$file" journal_open_ms)
+    python3 - "$role" "$ms" <<'PY'
+import sys
+role, ms = sys.argv[1], float(sys.argv[2])
+if ms >= 2000:
+    raise SystemExit(
+        f'{role}: journal open took {ms:.1f} ms, over the D16 journal_open_ms budget of 2000 ms'
+    )
+print(f'{role}: journal open {ms:.1f} ms', file=sys.stderr)
+PY
+  done
 }
 
 # Seed the durable world, then take its manifest as the rig's inventory.
@@ -478,6 +633,14 @@ note 'SIGKILL primary and promote follower'
 kill -KILL "$primary_pid"; wait "$primary_pid" 2>/dev/null || true; primary_pid=''
 start_promoted_follower
 
+# Both journals are final by now: the primary's reporter flushed every second
+# up to the SIGKILL, and the follower's flushed on the SIGTERM the promotion
+# sends it. Read the retention evidence before the recovery verifier runs, so a
+# run that released nothing fails as a retention failure rather than as
+# whatever the verifier happens to notice second.
+prove_retention_advanced
+prove_journal_open_budget
+
 # The verifier reads materialized bulk state through the promoted gateway and
 # intent idempotency rows directly from FDB.  Its cutoff binds comparison to
 # the chain prefix actually adopted during promotion, so a post-cutoff ack is
@@ -518,10 +681,11 @@ cat "$out/load-before.jsonl" "$out/primary-metrics.jsonl" "$out/promoted-metrics
     "$out/primary-boundary.jsonl" "$out/promoted-boundary.jsonl" >"$out/telemetry.jsonl"
 "$P2_DASHBOARD_BIN" --gate --json "$out/telemetry.jsonl" >"$out/latency-report.json"
 
-python3 - "$out/artifact.json" "$out/recovery-verification.json" "$out/latency-report.json" "$recovery_cutoff" <<'PY'
+python3 - "$out/artifact.json" "$out/recovery-verification.json" "$out/latency-report.json" "$recovery_cutoff" "$out/retention.json" <<'PY'
 import datetime,json,pathlib,sys
 artifact = pathlib.Path(sys.argv[1]); verification = pathlib.Path(sys.argv[2]); latency = pathlib.Path(sys.argv[3]); cutoff = sys.argv[4]
 v=json.loads(verification.read_text()); l=json.loads(latency.read_text())
+retention=json.loads(pathlib.Path(sys.argv[5]).read_text())
 if not v.get('pass', False): raise SystemExit('recovery verifier returned a non-pass report')
 if l.get('gate') != 'pass': raise SystemExit('latency dashboard returned a non-pass report')
 # The merged artifact is written by persistd and p2-load and read by the
@@ -554,7 +718,7 @@ artifact.write_text(json.dumps({
   'created_at':datetime.datetime.now(datetime.timezone.utc).isoformat(),
   'result':'pass', 'recovery_cutoff':cutoff,
   'proofs': {'recovery': v, 'latency': l, 'zombie_primary_fenced': True,
-             'bumped_chain_epoch_refused': True},
+             'bumped_chain_epoch_refused': True, 'retention': retention},
 }, indent=2) + '\n')
 PY
 note "PASS artifact: $out/artifact.json"

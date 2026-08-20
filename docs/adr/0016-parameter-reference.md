@@ -1,6 +1,7 @@
 # ADR-0016: Parameter reference (defaults)
 
-**Status:** Accepted; extended by [ADR-0020](0020-journal-retention.md) ·
+**Status:** Accepted; extended by [ADR-0020](0020-journal-retention.md),
+enforced by [ADR-0023](0023-follower-journal-retention.md) ·
 **Date:** 2026-08-11 · **Decision:** D16
 
 This decision is normative. See the [ADR index](../DECISIONS.md) for precedence, scope, and the complete decision set.
@@ -28,5 +29,10 @@ redundant; with it off, journal disk and the index rebuilt from it at every
 open grow with total uptime rather than with the checkpoint cadence. *Journal
 open* is the budget for that rebuild on a node within its retention floor —
 measured at 3.94 µs and ~95 bytes of index per record, so 2 000 ms is roughly
-508 000 records. It is a budget to measure against, not yet an enforced gate.
+508 000 records. Both parameters are **enforced** as of
+[D23](0023-follower-journal-retention.md): the P2 kill-9 gate fails unless
+retention released on both nodes during the run and every node's reported
+`journal_open_ms` is inside this budget. Retention is unchanged as a default
+(on) and unchanged as a switch (`persistd --no-journal-retention`); what
+changed is that a run in which it did nothing no longer passes.
 

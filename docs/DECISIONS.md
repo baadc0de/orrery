@@ -37,6 +37,7 @@ their linked dependencies.
 | D20 | [ADR-0020](adr/0020-journal-retention.md) | Journal retention and the recovery budget |
 | D21 | [ADR-0021](adr/0021-ruleset-distribution.md) | `Ruleset` distribution and the harness API freeze |
 | D22 | [ADR-0022](adr/0022-grid-id-in-the-storage-key.md) | `GridId` stays a key discriminator (P-7) |
+| D23 | [ADR-0023](adr/0023-follower-journal-retention.md) | Follower journal retention and the P2 retention clause |
 
 ## Status and supersession
 
@@ -62,11 +63,11 @@ ADR file. D19 deliberately follows that reserved gap.
 | [05-prediction-rollback.md](05-prediction-rollback.md) | D8 | Timelines, prediction sets, reconciliation, interpolation, hits |
 | [06-verifiable-core.md](06-verifiable-core.md) | D9 | Ruleset, determinism scoping, logs, replay harness |
 | [07-witnessing.md](07-witnessing.md) | D10 | Threat model, discrepancy protocol, adjudication, strikes |
-| [08-persistence.md](08-persistence.md) | D11, D19, D20, D22 | Cell actors, journal, FDB schema, intents, terrain, event archive |
+| [08-persistence.md](08-persistence.md) | D11, D19, D20, D22, D23 | Cell actors, journal, FDB schema, intents, terrain, event archive |
 | [09-services-and-ops.md](09-services-and-ops.md) | D12, D21 | Service inventory, deployment, scaling, failure modes, telemetry |
 | [10-crates.md](10-crates.md) | D15, D19, D21 | Workspace, per-crate API sketches, dependency graph |
-| [11-roadmap.md](11-roadmap.md) | D17, D19, D20–D22 | Build phases, milestones, risks |
+| [11-roadmap.md](11-roadmap.md) | D17, D19, D20–D23 | Build phases, milestones, risks |
 | [12-world-seeding.md](12-world-seeding.md) | D11, D22 | World seeding, deterministic generation, content diff and patch |
-| [13-chain-replication.md](13-chain-replication.md) | D11, D12, D20 | Cross-process journal mirroring and recovery |
+| [13-chain-replication.md](13-chain-replication.md) | D11, D12, D20, D23 | Cross-process journal mirroring and recovery |
 | [14-capacity.md](14-capacity.md) | D11, D12, D16, D19 | Measured single-box capacity envelope: the knee, what binds first, entities and players |
 | [references.md](references.md) | D1–D17, D19 | Annotated bibliography |

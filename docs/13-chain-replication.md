@@ -227,7 +227,7 @@ On follower restart:
 
 1. Open the local journal.
 2. Rebuild the highest contiguous watermark per durable chain from durable records.
-3. Rebuild the dedupe cursor from the same durable source.
+3. Rebuild the dedupe cursor from the same durable source — seeded, where retention has released a prefix, by the durable cursor row written after every batch, and then advanced over the retained suffix ([D23](adr/0023-follower-journal-retention.md)).
 4. Resume accepting `AppendBatch` messages only after the durable chain identity is revalidated.
 
 On primary restart:
@@ -252,14 +252,31 @@ chain that has stopped keeps its claim: an unreachable follower that is behind
 is exactly the one a release would strand, so retention stalls — visibly, as
 `ReleaseBlocked::ChainLag` — rather than proceeding.
 
-The **follower's own mirror is not released at all**, and §4.1 is the reason.
-Its dedupe cursor is reconstructed by walking the provenance index from batch
-zero and stopping at the first gap, so releasing a prefix of that index
-rebuilds an empty cursor and produces exactly the full re-stream this section
-spends its length avoiding. Bounding a follower needs the rebuilt cursor
-persisted as a keyed row and the reconstruction seeded from it instead of from
-zero. Until that exists, a follower's journal grows with its uptime — the
-residual D20 names.
+**The follower's own mirror is bounded by what the primary has released**
+([D23](adr/0023-follower-journal-retention.md)), and §4.1 is why it takes a
+number from the other end of the chain to do it. A follower folds no mirrored
+record into an actor — a passive one opens no runtime at all — so its own
+checkpoints say nothing about what its mirror still owes. What a promotion
+needs from the mirror is the tail the durable tier does not already hold, and
+what is in the durable tier was put there by the *primary's* checkpoints. So
+every `AppendBatch` and every reconnect carries `primary_floor`, the primary's
+own release floor in primary LSN space, and the follower releases up to the
+local position of the first mirrored row at or above it:
+
+```
+cut = min { local(r) : r ∈ mirror, origin(r) ≥ primary_floor }
+```
+
+Chain order is journal order, so those rows are a suffix and the cut is its
+first element. The dedupe cursor survives the release because it is *seeded*
+from the durable row §4.1 already writes after every batch, and the walk then
+validates only the retained suffix above it — a starting point, never an
+answer, because records are durable before the row that names them is written.
+D20 rule 3 is what makes the cut safe: the primary's floor is clamped to the
+follower watermark it has confirmed, so a release can truncate a batch in half
+but never one the persisted cursor has not already passed. A mirror whose
+primary has advertised no floor is pinned, visibly, as
+`ReleaseBlocked::MirrorLag`.
 
 A restart of the same owner is only "the previous stream" while the epoch is unchanged, and in the landed implementation it usually is not: shard activation bumps the ownership epoch on every activation, a clean restart included. §3.1 makes that a different `DurableChainId`, and §4.1 keys the follower's durable dedupe by it — so a follower reopened at the bumped epoch would rebuild an empty cursor and take a full re-stream into a second physical copy of every mirrored record, at a healthy zero-byte lag, leaving promotion permanently ambiguous.
 

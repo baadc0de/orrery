@@ -70,11 +70,26 @@ impl Default for JournalConfig {
 pub enum ReleaseBlocked {
     /// The floor is at or below the one already in force — nothing new.
     AlreadyReleased,
-    /// The journal mirrors another node's chain and holds the follower
-    /// provenance index, whose consumer (`rebuild_cursor`) walks it from batch
-    /// zero. Releasing a prefix of it would rebuild an empty cursor and cost a
-    /// full re-stream, so a follower's mirror is not released (D20 §residual).
-    FollowerProvenance,
+    /// The journal mirrors another node's chain but holds no durable dedupe
+    /// cursor for it, so a seeded rebuild has nothing to start from.
+    ///
+    /// `chain_grpc::rebuild_cursor` walks the provenance index, and after a
+    /// release that index no longer starts at batch zero; the persisted
+    /// cursor is what supplies the released prefix (D23). Every
+    /// `FollowerReplica::load` writes one, so this is the shape of a mirror
+    /// written by a pre-D23 binary — released records with nothing to seed
+    /// from would rebuild an empty cursor and cost a full re-stream.
+    MirrorCursorAbsent,
+    /// A mirrored chain's primary has not itself released past the proposed
+    /// floor.
+    ///
+    /// A follower's mirror is bounded by what the *primary* has released, not
+    /// by the follower's own checkpoints: the follower folds no mirrored
+    /// record into an actor, and what a promotion needs from the mirror is
+    /// exactly what the primary's durable tier does not already hold (D23).
+    /// A mirror whose primary has advertised no floor yet blocks release of
+    /// that mirror entirely.
+    MirrorLag,
     /// A chain follower still needs records at or below the proposed floor.
     ///
     /// A follower that falls behind resumes by rescanning the *primary's*
@@ -93,7 +108,13 @@ impl core::fmt::Display for ReleaseBlocked {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::AlreadyReleased => write!(f, "already released to this floor"),
-            Self::FollowerProvenance => write!(f, "journal holds follower chain provenance"),
+            Self::MirrorCursorAbsent => {
+                write!(
+                    f,
+                    "mirrored chain has no durable dedupe cursor to seed from"
+                )
+            }
+            Self::MirrorLag => write!(f, "a mirrored chain's primary has not released this far"),
             Self::ChainLag => write!(f, "a chain follower has not mirrored past the floor"),
             Self::Unsupported => write!(f, "backend does not implement retention"),
         }
@@ -132,6 +153,35 @@ impl JournalRelease {
             bytes_before: 0,
             bytes_after: 0,
             blocked: Some(reason),
+        }
+    }
+}
+
+/// What retention has done to this journal since it was opened (D20, D23).
+///
+/// Exported so an operator — and the P2 gate — can see retention *working*
+/// rather than infer it from a directory listing: a journal that is not
+/// shrinking is either releasing nothing or being blocked, and the two are
+/// only distinguishable if both the floor and the reason are reported.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct JournalRetention {
+    /// The retention floor in force. `0:0` until the first release.
+    pub floor: Lsn,
+    /// Releases that reclaimed something since open.
+    pub releases: u64,
+    /// Index entries dropped by those releases.
+    pub records_dropped: u64,
+    /// Why the most recent release call reclaimed nothing, if it did not.
+    pub blocked: Option<ReleaseBlocked>,
+}
+
+impl Default for JournalRetention {
+    fn default() -> Self {
+        Self {
+            floor: Lsn::new(0, 0),
+            releases: 0,
+            records_dropped: 0,
+            blocked: None,
         }
     }
 }

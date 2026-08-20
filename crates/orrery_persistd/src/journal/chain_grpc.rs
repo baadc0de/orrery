@@ -132,12 +132,21 @@ struct AppendBatchRequest {
     first_lsn: Option<WireLsn>,
     last_lsn: Option<WireLsn>,
     records: Vec<Vec<u8>>,
+    /// The retention floor the *primary* has reached in its own journal, which
+    /// is what bounds the follower's mirror (D23). Carried on every frame it
+    /// can be carried on rather than as a message of its own: it is one
+    /// monotone LSN, the follower only ever takes the maximum, and a lost
+    /// frame therefore costs one cadence of retention rather than correctness.
+    primary_floor: Option<WireLsn>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct ReconnectRequest {
     chain: Option<WireChainId>,
     session_nonce: Vec<u8>,
+    /// See [`AppendBatchRequest::primary_floor`]. Carried on the handshake too
+    /// so a chain that reconnects and then sits idle still bounds its mirror.
+    primary_floor: Option<WireLsn>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -237,11 +246,13 @@ pub(crate) struct AdoptionMarker {
     pub(crate) records: Vec<AdoptedRecord>,
 }
 
+/// The follower's durable dedupe cursor for one chain, persisted as keyed
+/// journal metadata after every batch it advances (docs/13 §4.1, D23).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-struct Cursor {
-    batch_seq: Option<u64>,
-    watermark: Option<Lsn>,
-    next_lsn: Option<Lsn>,
+pub(crate) struct Cursor {
+    pub(crate) batch_seq: Option<u64>,
+    pub(crate) watermark: Option<Lsn>,
+    pub(crate) next_lsn: Option<Lsn>,
 }
 
 pub(crate) fn chain_key_for_adoption(chain: &DurableChainId) -> Result<Vec<u8>, JournalError> {
@@ -328,6 +339,33 @@ fn decode_progress(reply: ProgressReply) -> (Option<u64>, Option<Lsn>) {
     )
 }
 
+/// The durable cursor a rebuild starts from, or `None` to start from batch
+/// zero (D23).
+///
+/// **`None` unless retention has actually removed something.** The provenance
+/// index is written atomically with the records themselves, which makes it the
+/// stronger of the two sources, and while the journal is at floor `0:0` it
+/// still holds every batch — so the persisted cursor is not consulted at all
+/// and this path behaves exactly as it did before retention reached followers.
+/// Above a floor the index no longer begins at batch zero, and the persisted
+/// cursor is what accounts for the prefix that is gone. `release_before`
+/// refuses to release a mirror that has no persisted cursor
+/// ([`ReleaseBlocked::MirrorCursorAbsent`]), so "released but unseedable" is a
+/// state this journal cannot reach.
+///
+/// [`ReleaseBlocked::MirrorCursorAbsent`]: crate::journal::ReleaseBlocked::MirrorCursorAbsent
+pub(crate) fn seed_cursor(journal: &Journal, key: &[u8]) -> Result<Option<Cursor>, JournalError> {
+    if journal.released_floor() == Lsn::new(0, 0) {
+        return Ok(None);
+    }
+    let Some(bytes) = journal.chain_grpc_state(key)? else {
+        return Ok(None);
+    };
+    postcard::from_bytes(&bytes)
+        .map(Some)
+        .map_err(|e| JournalError::Store(format!("decode persisted chain cursor: {e}")))
+}
+
 fn rebuild_cursor(journal: &Journal, key: &[u8]) -> Result<Cursor, JournalError> {
     let mut batches: BTreeMap<u64, Vec<(Lsn, RecordProvenance)>> = BTreeMap::new();
     for (origin, bytes) in journal.chain_grpc_records(key)? {
@@ -339,8 +377,33 @@ fn rebuild_cursor(journal: &Journal, key: &[u8]) -> Result<Cursor, JournalError>
             .push((origin, provenance));
     }
 
-    let mut cursor = Cursor::default();
+    let seed = seed_cursor(journal, key)?;
+    let seeded_through = seed.and_then(|cursor| cursor.batch_seq);
+    let mut cursor = seed.unwrap_or_default();
     for (seq, mut records) in batches {
+        // Only the *retained suffix* is validated. A batch at or below the
+        // seed is a batch the persisted cursor already accounts for, and
+        // retention may have cut it in half — the floor is a checkpoint
+        // watermark, not a batch boundary — so an incomplete one here is
+        // expected rather than a gap. What is still checked is the one thing
+        // that would mean the cursor and the index disagree: a batch the seed
+        // *ends at* that survived whole must end where the seed says it does.
+        if seeded_through.is_some_and(|through| seq <= through) {
+            records.sort_by_key(|(_, provenance)| provenance.ordinal);
+            if let Some((_, first)) = records.first() {
+                if seeded_through == Some(seq)
+                    && usize::try_from(first.batch_len).ok() == Some(records.len())
+                    && (cursor.watermark != Some(first.last_lsn)
+                        || cursor.next_lsn != Some(first.next_lsn))
+                {
+                    return Err(JournalError::Store(
+                        "persisted chain cursor disagrees with the retained provenance index"
+                            .into(),
+                    ));
+                }
+            }
+            continue;
+        }
         let expected_seq = cursor.batch_seq.map_or(0, |value| value + 1);
         if seq != expected_seq {
             break;
@@ -482,6 +545,18 @@ impl FollowerReplica {
         Ok(())
     }
 
+    /// Record what the primary has released, which is what bounds this
+    /// mirror's own retention (D23).
+    ///
+    /// Advisory in both directions: an absent floor leaves the mirror pinned
+    /// where it was, and a floor that arrives on a frame the follower then
+    /// rejects is still true — the primary released those records either way.
+    fn note_primary_floor(&self, floor: Option<WireLsn>) {
+        if let Some(floor) = floor {
+            self.journal.note_primary_floor(&self.key, lsn(floor));
+        }
+    }
+
     fn nonce(bytes: &[u8]) -> Result<[u8; 16], Status> {
         bytes
             .try_into()
@@ -491,9 +566,14 @@ impl FollowerReplica {
     async fn reconnect(&self, request: ReconnectRequest) -> Result<ProgressReply, Status> {
         self.validate_chain(request.chain)?;
         let nonce = Self::nonce(&request.session_nonce)?;
+        self.note_primary_floor(request.primary_floor);
         let mut state = self.state.lock().await;
-        // Always reconstruct from chain-scoped provenance. The cached cursor is
-        // never used as the recovery probe result.
+        // Always reconstruct from chain-scoped provenance, never from the
+        // in-memory cursor this replica happens to be holding. Where retention
+        // has removed a prefix, the reconstruction is *seeded* by the durable
+        // cursor row and validated against the retained suffix (D23) — which
+        // is still a reconstruction from what is on disk, and still not the
+        // cached value.
         state.cursor = rebuild_cursor(&self.journal, &self.key)
             .map_err(|e| Status::internal(format!("rebuild chain cursor: {e}")))?;
         state.session_nonce = Some(nonce);
@@ -516,6 +596,7 @@ impl FollowerReplica {
     async fn append(&self, request: AppendBatchRequest) -> Result<ProgressReply, Status> {
         self.validate_chain(request.chain)?;
         let nonce = Self::nonce(&request.session_nonce)?;
+        self.note_primary_floor(request.primary_floor);
         let first_lsn = request
             .first_lsn
             .map(lsn)
@@ -981,6 +1062,9 @@ pub struct GrpcChainTransport {
     addr: std::net::SocketAddr,
     chain: DurableChainId,
     inner: Mutex<ClientState>,
+    /// The primary's own retention floor, as last reported by the replicator
+    /// (D23). Kept outside `inner` so noting it never waits on a live stream.
+    primary_floor: std::sync::Mutex<Option<Lsn>>,
 }
 
 #[derive(Debug)]
@@ -1036,7 +1120,18 @@ impl GrpcChainTransport {
                 next_batch: 0,
                 watermark: None,
             }),
+            primary_floor: std::sync::Mutex::new(None),
         }
+    }
+
+    fn wire_primary_floor(&self) -> Option<WireLsn> {
+        self.primary_floor
+            .lock()
+            .expect("primary floor lock")
+            .map(|floor| WireLsn {
+                segment: floor.segment,
+                offset: floor.offset,
+            })
     }
 
     /// Connect and perform a fresh remote recovery probe.
@@ -1066,6 +1161,7 @@ impl GrpcChainTransport {
                 frame: Some(RequestFrame::Open(ReconnectRequest {
                     chain: Some(wire_chain(&self.chain)),
                     session_nonce: nonce.to_vec(),
+                    primary_floor: self.wire_primary_floor(),
                 })),
             })
             .map_err(|e| JournalError::Store(format!("queue gRPC open handshake: {e}")))?;
@@ -1214,6 +1310,7 @@ impl GrpcChainTransport {
                 offset: last.offset,
             }),
             records: encoded.clone(),
+            primary_floor: self.wire_primary_floor(),
         };
         let request = make_request(&state);
         let first = self.send_batch_locked(&mut state, request).await;
@@ -1258,6 +1355,11 @@ impl GrpcChainTransport {
 impl ChainTransport for GrpcChainTransport {
     async fn append(&self, record: JournalRecord) -> Result<Lsn, JournalError> {
         self.append_batch(vec![record]).await
+    }
+
+    fn note_primary_floor(&self, floor: Lsn) {
+        let mut current = self.primary_floor.lock().expect("primary floor lock");
+        *current = Some(current.map_or(floor, |previous| previous.max(floor)));
     }
 
     async fn append_batch(&self, records: Vec<JournalRecord>) -> Result<Lsn, JournalError> {
@@ -1412,6 +1514,7 @@ mod tests {
         ReconnectRequest {
             chain: Some(wire_chain(chain)),
             session_nonce: nonce.to_vec(),
+            primary_floor: None,
         }
     }
 
@@ -1442,7 +1545,216 @@ mod tests {
                 .iter()
                 .map(|record| postcard::to_stdvec(record).unwrap())
                 .collect(),
+            primary_floor: None,
         }
+    }
+
+    // Retention is a `journal-raw` property: the Fjall fallback answers
+    // `release_before` with `Unsupported` by design (D19, D20 §9), so these
+    // five cases are about the default backend and are compiled for it.
+    #[cfg(feature = "journal-raw")]
+    /// Mirror three one-record batches and return their records, so a test can
+    /// name the origin LSN it wants the primary's floor to sit at.
+    async fn mirror_three(
+        replica: &FollowerReplica,
+        journal: &Journal,
+        id: &DurableChainId,
+        nonce: [u8; 16],
+    ) -> Vec<JournalRecord> {
+        replica
+            .reconnect(reconnect_request(id, nonce))
+            .await
+            .unwrap();
+        let mut records = Vec::new();
+        let mut previous: Option<Lsn> = None;
+        let mut origin = 10;
+        for seq in 0..3 {
+            let record = record(origin, seq + 1);
+            origin = journal.chain_grpc_successor(&record).offset;
+            replica
+                .append(batch_request(
+                    id,
+                    nonce,
+                    seq,
+                    previous,
+                    std::slice::from_ref(&record),
+                ))
+                .await
+                .unwrap();
+            previous = Some(record.lsn);
+            records.push(record);
+        }
+        records
+    }
+
+    // Retention is a `journal-raw` property: the Fjall fallback answers
+    // `release_before` with `Unsupported` by design (D19, D20 §9), so these
+    // five cases are about the default backend and are compiled for it.
+    #[cfg(feature = "journal-raw")]
+    /// A released mirror rebuilds its cursor from the persisted row plus the
+    /// retained suffix, and neither half alone would do it (D23).
+    ///
+    /// The provenance index no longer starts at batch zero, so an unseeded walk
+    /// stops at the first gap and reports an empty cursor — which is the full
+    /// re-stream `refuse_sibling_epoch` exists to catch, arrived at from the
+    /// other direction.
+    #[tokio::test]
+    async fn a_released_mirror_seeds_its_cursor_from_the_persisted_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = Arc::new(Journal::open(&config(dir.path())).unwrap());
+        let id = chain(1, 9, 1, 4);
+        let key = chain_key(&id).unwrap();
+        let replica = FollowerReplica::load(id.clone(), Arc::clone(&journal)).unwrap();
+        let records = mirror_three(&replica, &journal, &id, [21; 16]).await;
+
+        journal.note_primary_floor(&key, records[2].lsn);
+        let release = journal.release_before(Lsn::new(9_999, 0)).unwrap();
+        assert_eq!(release.blocked, None);
+        assert_eq!(
+            journal.chain_grpc_records(&key).unwrap().len(),
+            1,
+            "the released rows go with the records they point at"
+        );
+
+        journal.close().await.unwrap();
+        drop(replica);
+        drop(journal);
+
+        let journal = Arc::new(Journal::open(&config(dir.path())).unwrap());
+        let replica = FollowerReplica::load(id, Arc::clone(&journal)).unwrap();
+        let cursor = replica.state.lock().await.cursor;
+        assert_eq!(cursor.batch_seq, Some(2));
+        assert_eq!(cursor.watermark, Some(records[2].lsn));
+        journal.close().await.unwrap();
+    }
+
+    // Retention is a `journal-raw` property: the Fjall fallback answers
+    // `release_before` with `Unsupported` by design (D19, D20 §9), so these
+    // five cases are about the default backend and are compiled for it.
+    #[cfg(feature = "journal-raw")]
+    /// The crash boundary the persisted cursor does *not* close: records are
+    /// durable before the row that names them is written, so a cursor can be
+    /// one batch behind the index it seeds.
+    ///
+    /// Seeding must therefore be a starting point and not an answer — the walk
+    /// continues over every retained batch above the seed. The opposite bug is
+    /// the expensive one: a rebuild that trusted the row and stopped would
+    /// report a watermark below what is durable, and the primary would resend
+    /// records the follower already holds.
+    #[tokio::test]
+    async fn a_cursor_behind_its_index_still_advances_over_the_retained_suffix() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = Arc::new(Journal::open(&config(dir.path())).unwrap());
+        let id = chain(1, 9, 1, 4);
+        let key = chain_key(&id).unwrap();
+        let replica = FollowerReplica::load(id.clone(), Arc::clone(&journal)).unwrap();
+        let records = mirror_three(&replica, &journal, &id, [22; 16]).await;
+
+        // The row a crash between the first batch's durability and its cursor
+        // write would have left behind.
+        let stale = Cursor {
+            batch_seq: Some(0),
+            watermark: Some(records[0].lsn),
+            next_lsn: Some(journal.chain_grpc_successor(&records[0])),
+        };
+        journal
+            .set_chain_grpc_state(&key, &postcard::to_stdvec(&stale).unwrap())
+            .unwrap();
+        journal.note_primary_floor(&key, records[1].lsn);
+        assert_eq!(
+            journal.release_before(Lsn::new(9_999, 0)).unwrap().blocked,
+            None
+        );
+
+        assert_eq!(
+            rebuild_cursor(&journal, &key).unwrap().batch_seq,
+            Some(2),
+            "the retained suffix above the seed is still the durable truth"
+        );
+        journal.close().await.unwrap();
+    }
+
+    // Retention is a `journal-raw` property: the Fjall fallback answers
+    // `release_before` with `Unsupported` by design (D19, D20 §9), so these
+    // five cases are about the default backend and are compiled for it.
+    #[cfg(feature = "journal-raw")]
+    /// A persisted cursor that disagrees with a batch the release *kept* is a
+    /// corruption, not a starting point, and it fails the open loudly.
+    #[tokio::test]
+    async fn a_cursor_that_disagrees_with_the_retained_index_refuses_to_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = Arc::new(Journal::open(&config(dir.path())).unwrap());
+        let id = chain(1, 9, 1, 4);
+        let key = chain_key(&id).unwrap();
+        let replica = FollowerReplica::load(id.clone(), Arc::clone(&journal)).unwrap();
+        let records = mirror_three(&replica, &journal, &id, [23; 16]).await;
+
+        let wrong = Cursor {
+            batch_seq: Some(1),
+            watermark: Some(Lsn::new(7, 7)),
+            next_lsn: Some(Lsn::new(7, 8)),
+        };
+        journal
+            .set_chain_grpc_state(&key, &postcard::to_stdvec(&wrong).unwrap())
+            .unwrap();
+        journal.note_primary_floor(&key, records[1].lsn);
+        assert_eq!(
+            journal.release_before(Lsn::new(9_999, 0)).unwrap().blocked,
+            None
+        );
+
+        let error = rebuild_cursor(&journal, &key).unwrap_err().to_string();
+        assert!(error.contains("disagrees"), "unexpected error: {error}");
+        journal.close().await.unwrap();
+    }
+
+    // Retention is a `journal-raw` property: the Fjall fallback answers
+    // `release_before` with `Unsupported` by design (D19, D20 §9), so these
+    // five cases are about the default backend and are compiled for it.
+    #[cfg(feature = "journal-raw")]
+    /// Retention does not cost a follower its two refusals: a replayed batch
+    /// below the floor is refused rather than mirrored a second time, and a
+    /// bumped chain epoch is still detected on the released directory.
+    #[tokio::test]
+    async fn a_released_mirror_keeps_its_refusals() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = Arc::new(Journal::open(&config(dir.path())).unwrap());
+        let id = chain(1, 9, 1, 4);
+        let key = chain_key(&id).unwrap();
+        let replica = FollowerReplica::load(id.clone(), Arc::clone(&journal)).unwrap();
+        let nonce = [24; 16];
+        let records = mirror_three(&replica, &journal, &id, nonce).await;
+
+        journal.note_primary_floor(&key, records[2].lsn);
+        assert_eq!(
+            journal.release_before(Lsn::new(9_999, 0)).unwrap().blocked,
+            None
+        );
+        let retained = journal.scan_from(journal.released_floor()).count();
+
+        // A replay of a released batch cannot be answered as a duplicate — the
+        // rows that proved it durable are gone — so it is refused, and the one
+        // thing it must never do is append a second physical copy.
+        let replay = replica
+            .append(batch_request(&id, nonce, 0, None, &[records[0].clone()]))
+            .await;
+        assert!(replay.is_err(), "a released batch must not be re-mirrored");
+        assert_eq!(
+            journal.scan_from(journal.released_floor()).count(),
+            retained
+        );
+
+        journal.close().await.unwrap();
+        drop(replica);
+        drop(journal);
+
+        let journal = Arc::new(Journal::open(&config(dir.path())).unwrap());
+        let sibling = FollowerReplica::load(chain(1, 9, 1, 5), Arc::clone(&journal));
+        assert!(
+            sibling.is_err(),
+            "a released mirror still knows it was opened at another epoch"
+        );
+        journal.close().await.unwrap();
     }
 
     #[tokio::test]
@@ -1651,6 +1963,42 @@ mod tests {
             .await
             .unwrap();
         assert!(journal.adopt_chain_history(id).is_err());
+        journal.close().await.unwrap();
+    }
+
+    // Retention is a `journal-raw` property: the Fjall fallback answers
+    // `release_before` with `Unsupported` by design (D19, D20 §9), so these
+    // five cases are about the default backend and are compiled for it.
+    #[cfg(feature = "journal-raw")]
+    /// Promotion adopts a *released* mirror by starting where the persisted
+    /// cursor says the released prefix ended (D23).
+    ///
+    /// Adoption walks the same provenance index a rebuild does and used to
+    /// insist it begin at batch zero, so the first follower release would have
+    /// turned every later promotion into "cannot adopt chain history with a
+    /// batch gap" — a node that refuses to start rather than one that starts
+    /// short.
+    #[tokio::test]
+    async fn adoption_over_a_released_mirror_starts_at_the_persisted_cursor() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = Arc::new(Journal::open(&config(dir.path())).unwrap());
+        let id = chain(1, 9, 1, 4);
+        let key = chain_key(&id).unwrap();
+        let replica = FollowerReplica::load(id.clone(), Arc::clone(&journal)).unwrap();
+        let records = mirror_three(&replica, &journal, &id, [25; 16]).await;
+
+        journal.note_primary_floor(&key, records[2].lsn);
+        assert_eq!(
+            journal.release_before(Lsn::new(9_999, 0)).unwrap().blocked,
+            None
+        );
+
+        let history = journal.adopt_chain_history(id).expect("adopt");
+        assert_eq!(
+            history.watermark(),
+            Some(records[2].lsn),
+            "the adopted cutoff is the whole mirrored history, released prefix included"
+        );
         journal.close().await.unwrap();
     }
 
