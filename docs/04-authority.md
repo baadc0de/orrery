@@ -2,7 +2,7 @@
 
 Every replicated entity in Orrery has exactly one writer at any instant. This document specifies how that writer is chosen, proven, transferred, and recovered: the two-tier claim model (weak authority by interaction, strong ownership by explicit act) with its sequence-number invariants; the lease registrar inside the persistence cluster that arbitrates claims for persistent entities via compare-and-swap; the full message-level lease protocol (`Claim`, `Grant`, `Deny`, `Divest`, `Heartbeat`, `Expire`) with flows for cooperative handoff, contested claims, crash orphaning, and cluster-unreachable degraded operation; contact-island propagation for physics; ephemeral, parked, and active (NPC-hosted) entities; and the interactions with field-host promotion and cross-cell movement. The protocol lives in `orrery_protocol`, the client logic in `orrery_authority`, and the registrar in `orrery_persistd`.
 
-Normative source: [ADR-0007](adr/0007-authority-and-leases.md) (boundaries with [D5](adr/0005-spatial-model.md), [D6](adr/0006-population-adaptive-topology.md), [D8](adr/0008-prediction-rollback-interpolation.md), [D11](adr/0011-persistence.md), and [D12](adr/0012-backend-services.md)).
+Normative source: [ADR-0007](adr/0007-authority-and-leases.md), with the `Expire` fan-out set, non-holder addressing and amplification bound in [ADR-0025](adr/0025-expire-fan-out.md) (*proposed*) (boundaries with [D5](adr/0005-spatial-model.md), [D6](adr/0006-population-adaptive-topology.md), [D8](adr/0008-prediction-rollback-interpolation.md), [D11](adr/0011-persistence.md), and [D12](adr/0012-backend-services.md)).
 
 > **Implementation status (2026-08-16).** The strict persistence-authority path is
 > implemented: a signed, transport-NodeId-bound session is required before lease
@@ -121,7 +121,7 @@ Six messages, defined in `orrery_protocol`, postcard-encoded on the reliable con
 | `Deny` | registrar → peer | `claim_id`, `entity`, `reason: Held{holder, seq} \| StrongHeld \| NotEligible \| RateLimited \| Parked`, `retry_after_ms` |
 | `Divest` | both | registrar → holder: request `{entity, lease_id, to: Option<NodeId>, deadline_ms}`; holder → registrar: consent/offer `{entity, lease_id, to: Option<NodeId>, final_seq, cursor: JournalCursor}`. `to: None` = release/park. |
 | `Heartbeat` | both | peer → registrar: `{renew: Vec<(entity, lease_id)>, tick}` (one batch per peer per 2.5 s covering all held leases); registrar → peer `HeartbeatAck{leases: Vec<Lease>, invalid: Vec<(entity, lease_id)>}` |
-| `Expire` | registrar → holder + cell subscribers | `{entity, lease_id, last_holder, reason: Timeout\|Disconnect\|Revoked\|Parked, disposition: Reassigned{to}\|Parked\|Free}` |
+| `Expire` | registrar → holder, plus the [D25](adr/0025-expire-fan-out.md) fan-out set on a parking disposition | `{entity, lease_id, last_holder, reason: Timeout\|Disconnect\|Revoked\|Parked, disposition: Reassigned{to}\|Parked\|Free}` |
 
 A `Heartbeat` is one message per peer per 2.5 s naming every lease it holds,
 and it costs **one actor turn per owning actor** — not one per entity, and not
@@ -186,6 +186,36 @@ a row left at `(0, 0)` is superseded by *every* row — including one the
 registrar had already moved past when the datagram left. That is how a
 duplicated NACK repoints `Authority.holder` at a stale peer, with no `Lost`
 event to show for it.
+
+**Who else hears it, and what they do with it** ([D25](adr/0025-expire-fan-out.md),
+*proposed*). "Cell subscribers" is not a group the registrar can evaluate —
+room membership is a pure function of replicated positions that each *sender*
+evaluates per outgoing link ([03-replication.md](03-replication.md) §3), and
+the registrar sends none. D25 therefore defines the fan-out set as the peers
+with a live session **on this gateway** whose coordinator interest covers the
+entity's committed cell — `InterestAuthority::allows`, the same predicate a
+`Claim` and a successor nomination pass, which makes the set identical to the
+successor candidate list the registrar has already computed. It is a strict
+subset of D5's interest set and excludes peers on sibling gateways, peers
+whose grant lapsed while still rendering, and peers with no gateway session at
+all.
+
+Only `Parked` and `Free` fan out. A `Reassigned` needs no copy: INV-4 converges
+every observer on the successor's first envelope, so the copy would buy one
+send interval and cost `|leases| × |subscribers|` messages in exactly the
+field-host disconnect (§4.3) the system is designed around. A parked entity has
+no successor stream, so the advisory is the only mechanism there.
+
+A **non-holder** copy reuses `LeaseMsg::Expire` verbatim — no new variant, and
+today's clients already drop what they do not hold — and changes exactly one
+thing: the recipient's belief about who holds the entity. It must not touch the
+`SeqPair`, must not install or clear a fence, and raises no `Lost`. Its
+`lease_id` is an *ordering* token there, not a fencing one: a non-holder
+applies an advisory only when it exceeds the highest already applied for that
+entity. Fan-out is capped at 128 recipients per expiry and 32/s (burst 64) per
+recipient, and over-limit advisories are **dropped rather than queued** —
+the fallback is the pre-fan-out behaviour, and `Deny{Parked}` on a subsequent
+claim remains the authoritative answer.
 
 `Divest.cursor` names the holder's last acked journal position so the registrar can require the state to be uplink-complete before regranting — the successor starts from exactly the state the predecessor last committed.
 
@@ -297,7 +327,7 @@ sequenceDiagram
     end
     Reg->>Reg: mark orphan; pick candidate:<br/>1. peer with recent contact (weak-auth telemetry)<br/>2. nearest cell-subscribed peer<br/>3. none → park
     Reg->>B: Grant{unsolicited, seq=(own, auth+1)}
-    Reg-->>B: Expire{A, Timeout, Reassigned{B}} (also to cell subscribers)
+    Reg-->>B: Expire{A, Timeout, Reassigned{B}} (holder only — D25 rule 7)
     B->>B: adopt from last committed state (may decline: Divest{to: None})
     Note over Reg: no candidate → row flagged PARKED,<br/>state served from hot tier
 ```
@@ -602,5 +632,8 @@ Design-elaborated defaults introduced by this document (configurable, subject to
 | Claim rate limit | 20/s sustained, burst 64 |
 | Deny re-claim cooldown | 250 ms → 2 s exponential |
 | Contact-propagation batch cap | 64 entities/tick |
+| `Expire` fan-out dispositions (D25) | `Parked`/`Free` only |
+| `Expire` fan-out cap (D25) | 128 recipients per expiry |
+| `Expire` fan-out bucket, per recipient (D25) | 32/s sustained, burst 64 |
 | Active-entity load cap (per peer, §7.1) | 16 core-class / 256 bulk-class |
 | Holder-side uncertainty margin | 1 heartbeat (2.5 s) before nominal expiry |

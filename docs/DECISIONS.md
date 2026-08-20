@@ -39,6 +39,7 @@ their linked dependencies.
 | D22 | [ADR-0022](adr/0022-grid-id-in-the-storage-key.md) | `GridId` stays a key discriminator (P-7) |
 | D23 | [ADR-0023](adr/0023-follower-journal-retention.md) | Follower journal retention and the P2 retention clause |
 | D24 | [ADR-0024](adr/0024-island-drain.md) | Island drain is peer-driven; no evacuation |
+| D25 | [ADR-0025](adr/0025-expire-fan-out.md) | `Expire` fan-out recipient set and amplification bound |
 | D26 | [ADR-0026](adr/0026-sibling-gateways.md) | Sibling gateways: ownership, reachability, live handover |
 
 ## Status and supersession
@@ -61,7 +62,7 @@ ADR file. D19 deliberately follows that reserved gap.
 | [01-spatial-model.md](01-spatial-model.md) | D5 | Grid, CellId, big_space, AOI, hysteresis, hotspots, nested grids |
 | [02-networking.md](02-networking.md) | D3, D6, D24 | iroh, relays, islands, topology regimes, channels, budgets |
 | [03-replication.md](03-replication.md) | D4, D8 | Replicon/lightyear stack, interest sets, delta compression, priority |
-| [04-authority.md](04-authority.md) | D7 | Claims, leases, handoff, orphans, promotion interplay |
+| [04-authority.md](04-authority.md) | D7, D25 | Claims, leases, handoff, orphans, promotion interplay |
 | [05-prediction-rollback.md](05-prediction-rollback.md) | D8 | Timelines, prediction sets, reconciliation, interpolation, hits |
 | [06-verifiable-core.md](06-verifiable-core.md) | D9 | Ruleset, determinism scoping, logs, replay harness |
 | [07-witnessing.md](07-witnessing.md) | D10 | Threat model, discrepancy protocol, adjudication, strikes |

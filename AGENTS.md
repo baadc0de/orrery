@@ -51,6 +51,7 @@ entry point. Decisions live independently under [docs/adr/](docs/adr/):
 | D22 | [ADR-0022](docs/adr/0022-grid-id-in-the-storage-key.md) | `GridId` stays a key discriminator |
 | D23 | [ADR-0023](docs/adr/0023-follower-journal-retention.md) | Follower journal retention, P2 retention clause |
 | D24 | [ADR-0024](docs/adr/0024-island-drain.md) | Island drain is peer-driven; no evacuation |
+| D25 | [ADR-0025](docs/adr/0025-expire-fan-out.md) | `Expire` fan-out set and bound |
 | D26 | [ADR-0026](docs/adr/0026-sibling-gateways.md) | Sibling gateways: ownership, reachability, live handover |
 
 After the applicable ADRs, use this expansion reading path:
