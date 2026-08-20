@@ -396,6 +396,16 @@ const MAX_PEER_REGISTRY_ENTRIES: usize = 4_096;
 
 const MAX_PEER_LIVE_LEASES: usize = 256;
 
+/// The most non-holder `Expire` advisories one expiry may produce (D25 rule 8).
+///
+/// D6's per-cell player ceiling, reused verbatim: a cell with more admitted
+/// sessions than this is already past that ceiling, so the excess is dropped
+/// rather than sent. Dropping happens in ascending `NodeId` order — not in
+/// whatever order a `HashMap` walk produced — so the same expiry replayed
+/// against the same session set drops the same peers. Without that clause an
+/// over-cap run is not reproducible from its own inputs.
+pub const EXPIRE_FANOUT_MAX_RECIPIENTS: usize = 128;
+
 /// The adjudication executor a gateway routes discrepancy reports to
 /// (docs/07-witnessing.md §3 stage 4).
 ///
@@ -601,6 +611,93 @@ pub trait InterestAuthority: Send + Sync {
                 && snapshot.covered_cells.contains(&cell)
         })
     }
+
+    /// Which of `sessions` cover `cell` in `grid` right now, capped at `limit`.
+    ///
+    /// This is D25's recipient set `A(G, grid, cell, t)` with the sessions
+    /// term supplied by the caller, and the split is the seam D25 rule 3
+    /// names: an authority knows *interest*, a gateway knows *who is
+    /// addressable*, and a later cluster-wide session directory widens the
+    /// second term without touching the first. There is no reverse
+    /// `peers_covering(cell)` index anywhere in the system and D25 declined to
+    /// build one — a coordinator grant's expiry is enforced on this read path
+    /// and nowhere else, so a second structure would leak advisories to peers
+    /// whose interest had lapsed.
+    ///
+    /// The default filters through [`InterestAuthority::allows`], the same
+    /// predicate a live `Claim` and a successor nomination pass. That is not
+    /// an incidental implementation choice an override may re-derive: fan-out
+    /// eligibility *is* claim admission, so an override that disagreed would
+    /// address a peer the gateway would refuse to grant to. An override exists
+    /// to answer the same question with fewer locks, never with a different
+    /// answer.
+    ///
+    /// Cost is `O(sessions.len())`, itself bounded by
+    /// `MAX_PEER_REGISTRY_ENTRIES`, and callers are expected to pay it once
+    /// per `(grid, cell)` rather than once per entity (D25 rule 8).
+    #[must_use]
+    fn covering_peers(
+        &self,
+        sessions: &[NodeId],
+        grid: GridId,
+        cell: CellId,
+        now_ms: u64,
+        limit: usize,
+    ) -> CoveringPeers {
+        let covering = sessions
+            .iter()
+            .copied()
+            .filter(|peer| self.allows(*peer, grid, cell, now_ms))
+            .collect::<Vec<_>>();
+        CoveringPeers::bounded(covering, limit)
+    }
+}
+
+/// The addressable audience for one cell's non-holder `Expire` advisories
+/// (D25 rule 1).
+///
+/// Carrying the cut-off count rather than truncating silently is what makes
+/// the bound observable. An `over_limit` that tracks a cell's population is a
+/// cell past D6's ceiling — a capacity signal, not a fault — and one that
+/// tracks nothing in particular is a cap that is inert, which is the reading
+/// D25's open question asks for.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CoveringPeers {
+    /// Peers covering the cell, in ascending `NodeId` order, truncated to the
+    /// caller's limit.
+    pub peers: Vec<NodeId>,
+    /// How many covering peers the limit cut off.
+    pub over_limit: usize,
+}
+
+impl CoveringPeers {
+    /// Sort `covering` by `NodeId` and keep at most `limit` of them.
+    ///
+    /// Sorting before truncating is the whole point: an unordered truncation
+    /// of a registry walk drops a different subset on every pass, so a run
+    /// that exceeded the cap could not be reproduced from the same inputs.
+    #[must_use]
+    pub fn bounded(mut covering: Vec<NodeId>, limit: usize) -> Self {
+        covering.sort_unstable_by_key(|peer| *peer.as_bytes());
+        let over_limit = covering.len().saturating_sub(limit);
+        covering.truncate(limit);
+        Self {
+            peers: covering,
+            over_limit,
+        }
+    }
+
+    /// How many peers are actually addressed.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.peers.len()
+    }
+
+    /// Whether nobody addressable covers the cell.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.peers.is_empty()
+    }
 }
 
 /// Shared coordinator-interest authority injected into a gateway.
@@ -655,6 +752,44 @@ impl InterestAuthority for CoordinatorHandoutAuthority {
         if let Ok(mut held) = self.snapshots.write() {
             held.retain(|_, snapshot| snapshot.valid_until_ms > now_ms);
         }
+    }
+
+    /// Answer the whole cell in one read lock instead of one per peer.
+    ///
+    /// The predicate is character-for-character the default's — this is the
+    /// same map, read the same way — and the only thing the override buys is
+    /// that `snapshot_for` is not called once per session, each call taking
+    /// the lock and *cloning* a `covered_cells` vector that is discarded a
+    /// line later. At `MAX_PEER_REGISTRY_ENTRIES` sessions that is 4 096 lock
+    /// acquisitions and 4 096 allocations per `(grid, cell)`; here it is one
+    /// and none.
+    fn covering_peers(
+        &self,
+        sessions: &[NodeId],
+        grid: GridId,
+        cell: CellId,
+        now_ms: u64,
+        limit: usize,
+    ) -> CoveringPeers {
+        let Ok(held) = self.snapshots.read() else {
+            // A poisoned map is not evidence that anybody covers the cell,
+            // and an advisory is best-effort by construction (D25 rule 9), so
+            // the safe answer is to address nobody.
+            return CoveringPeers::default();
+        };
+        let covering = sessions
+            .iter()
+            .copied()
+            .filter(|peer| {
+                held.get(peer).is_some_and(|snapshot| {
+                    snapshot.peer == *peer
+                        && snapshot.grid == grid
+                        && snapshot.valid_until_ms > now_ms
+                        && snapshot.covered_cells.contains(&cell)
+                })
+            })
+            .collect::<Vec<_>>();
+        CoveringPeers::bounded(covering, limit)
     }
 
     fn apply_grant(
@@ -920,6 +1055,41 @@ pub struct AuthoritySnapshot {
     pub divest_requested: u64,
     /// Requests a holder did not answer before the deadline.
     pub handoff_timed_out: u64,
+    /// Non-holder `Expire` advisories actually pushed to a peer's live
+    /// connection (D25 rule 1).
+    ///
+    /// Purely additive to the disposition counters above: every increment
+    /// here accompanies an `Expire` the losing holder was already sent (or
+    /// would have been, had it still been reachable), and none of it changes
+    /// `reassigned` or `parked_without_successor`.
+    ///
+    /// Healthy shape: roughly `parked_without_successor × |A|` for the cells
+    /// that actually park, and **zero** across a field host's disconnect,
+    /// whose leases reassign and which D25 rule 7 keeps holder-only.
+    pub expire_fanout_sent: u64,
+    /// Recipients that covered the cell but had no live connection left to
+    /// push to by the time the advisory was addressed.
+    ///
+    /// Enumeration and delivery are not one atomic step — a session can end
+    /// between them — so this is an ordinary race rather than a fault. A
+    /// value that tracks `expire_fanout_sent` means the gateway is enumerating
+    /// sessions it can no longer reach, which is a peer-registry eviction
+    /// question and not a fan-out one.
+    pub expire_fanout_skipped: u64,
+    /// Advisories dropped by a bound: over the per-expiry recipient cap, or
+    /// refused by a recipient's own egress bucket (D25 rules 8 and 9).
+    ///
+    /// Dropping is safe *because* the advisory is an optimisation: a
+    /// recipient that loses one falls back to exactly the pre-D25 behaviour —
+    /// the entity stops being written, its proxy decays, and any peer that
+    /// cares issues a `Claim` and gets the authoritative `Deny{Parked}`.
+    /// Queueing instead would put a hint in front of `Grant` and `Deny` on the
+    /// same lane, degrading the one thing on this path that is *not*
+    /// best-effort.
+    ///
+    /// A count that tracks a cell's population is a cell past D6's ceiling; a
+    /// count that tracks one peer is that peer's bucket doing its job.
+    pub expire_fanout_dropped: u64,
 }
 
 /// Always-on authority telemetry.
@@ -942,6 +1112,9 @@ pub struct AuthorityMetrics {
     divest_rejected: AtomicU64,
     divest_requested: AtomicU64,
     handoff_timed_out: AtomicU64,
+    expire_fanout_sent: AtomicU64,
+    expire_fanout_skipped: AtomicU64,
+    expire_fanout_dropped: AtomicU64,
     last_duplicate: std::sync::Mutex<Option<DuplicateAuthoritySample>>,
 }
 
@@ -960,6 +1133,9 @@ impl AuthorityMetrics {
             divest_rejected: self.divest_rejected.load(Ordering::Relaxed),
             divest_requested: self.divest_requested.load(Ordering::Relaxed),
             handoff_timed_out: self.handoff_timed_out.load(Ordering::Relaxed),
+            expire_fanout_sent: self.expire_fanout_sent.load(Ordering::Relaxed),
+            expire_fanout_skipped: self.expire_fanout_skipped.load(Ordering::Relaxed),
+            expire_fanout_dropped: self.expire_fanout_dropped.load(Ordering::Relaxed),
         }
     }
 
@@ -1009,6 +1185,26 @@ impl AuthorityMetrics {
 
     fn record_handoff_timed_out(&self) {
         self.handoff_timed_out.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// One non-holder `Expire` copy handed to a live connection.
+    fn record_expire_fanout_sent(&self) {
+        self.expire_fanout_sent.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// One recipient that covered the cell but had no live session left.
+    fn record_expire_fanout_skipped(&self) {
+        self.expire_fanout_skipped.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// `count` advisories a bound refused. Called with the whole over-cap
+    /// remainder at once, and with `1` for a recipient whose bucket is empty.
+    fn record_expire_fanout_dropped(&self, count: u64) {
+        if count == 0 {
+            return;
+        }
+        self.expire_fanout_dropped
+            .fetch_add(count, Ordering::Relaxed);
     }
 
     fn record_duplicate_authority(&self, sample: DuplicateAuthoritySample) {
@@ -2366,6 +2562,7 @@ struct PeerState {
     idle_since_ms: Option<u64>,
     claim_bucket: ClaimBucket,
     misroute_bucket: MisrouteBucket,
+    expire_fanout_bucket: ExpireFanoutBucket,
 }
 
 struct PeerRegistry {
@@ -2416,6 +2613,16 @@ impl PeerSession {
             }
             _ => false,
         }
+    }
+
+    /// Spend one token from this peer's `Expire`-advisory egress budget.
+    ///
+    /// Taken against the `NodeId`'s own state rather than this generation's,
+    /// for the reason [`ExpireFanoutBucket`] records: reconnecting must not
+    /// refill the allowance. A `false` here is a *drop*, not a deferral.
+    async fn take_expire_fanout_token(&self, now_ms: u64) -> bool {
+        let mut peer = self.state.lock().await;
+        peer.expire_fanout_bucket.take(now_ms)
     }
 
     async fn try_reserve_lease_slot(&self) -> bool {
@@ -2526,6 +2733,7 @@ impl PeerRegistry {
                     idle_since_ms: Some(now_ms),
                     claim_bucket: ClaimBucket::new(claim_now_ms),
                     misroute_bucket: MisrouteBucket::new(claim_now_ms),
+                    expire_fanout_bucket: ExpireFanoutBucket::new(claim_now_ms),
                 }));
                 entries.insert(node, Arc::clone(&state));
                 state
@@ -2707,7 +2915,57 @@ struct Redistributor {
     policy: SharedSuccessorPolicy,
     metrics: Arc<AuthorityMetrics>,
     handoff_deadline_ms: u32,
+    /// The clock the per-recipient advisory buckets are metered on.
+    ///
+    /// The *same* clock the per-peer claim bucket uses, because the two limits
+    /// are two ends of one path and a test that freezes one must freeze both;
+    /// `registrar_now_ms` is process uptime and injectable by nothing.
+    claim_clock: SharedClaimClock,
     pending: tokio::sync::Mutex<HashMap<(PersistId, NodeId), PendingHandoff>>,
+}
+
+/// Addressable audiences memoised for the length of one redistribution pass.
+///
+/// D25 rule 8's third limit: the covering set is enumerated **once per
+/// `(grid, cell)`**, never once per entity. The difference is the one that
+/// bites before bandwidth does. Enumerating walks the whole peer registry,
+/// locking every entry's mutex, so a lost peer holding `MAX_PEER_LIVE_LEASES`
+/// rows would cost `256 × 4 096 ≈ 1.05 M` lock-and-check operations in a
+/// single `cleanup_peer_session` pass. Per `(grid, cell)` the same pass is
+/// bounded by the cells one grant may cover, `MAX_INTEREST_GRANT_CELLS = 64`,
+/// for `64 × 4 096 ≈ 262 K` — and on the reassignment path it is zero extra,
+/// because `place` already produced the set as its candidate list.
+///
+/// Deliberately **not** a field on [`Redistributor`]: this is a pass-scoped
+/// memo, and a long-lived one would answer with sessions that have since gone
+/// and grants that have since lapsed. It is created by the loop that parks and
+/// dropped when that loop ends.
+///
+/// The cached value is the *unfiltered* covering set. One sweep pass carries
+/// leases from several holders, so the peer to exclude varies within a pass
+/// while `A(G, grid, cell, t)` does not; folding the exclusion into the key
+/// would defeat the memo exactly when a cell is busiest.
+#[derive(Debug, Default)]
+struct ExpireAudiences {
+    by_cell: HashMap<(GridId, CellId), Vec<NodeId>>,
+}
+
+/// What [`Redistributor::place`] decided, and what it already enumerated.
+///
+/// The candidate set is carried out of `place` rather than recomputed by the
+/// caller because it *is* D25's `A(G, grid, cell, t)` minus the previous
+/// holder — the same walk, through the same `allows` seam — so fan-out on the
+/// redistribution path costs no enumeration the registrar was not already
+/// paying (D25 rule 1).
+struct Placement {
+    disposition: orrery_protocol::ExpireDisposition,
+    /// The vetted candidates, when `place` got far enough to compute them.
+    ///
+    /// `None` means the row was never offered at all — `STRONG_HELD` or
+    /// `PLAYER_BOUND` returns before any enumeration happens — and that is
+    /// precisely the case where an audience must still be found, because a
+    /// strong-owned entity parks with a live audience watching it.
+    candidates: Option<Vec<NodeId>>,
 }
 
 impl Redistributor {
@@ -2741,6 +2999,129 @@ impl Redistributor {
             });
         }
         candidates
+    }
+
+    /// Everyone this gateway may hand a non-holder `Expire` for `cell`.
+    ///
+    /// D25's `A(G, grid, cell, t) \ {exclude}`, enumerated the only way a
+    /// registrar can: `Sessions(G, t)` comes from the peer registry — peers
+    /// with a live authenticated session and a current generation on **this**
+    /// gateway — and the interest predicate is applied to it through the
+    /// `InterestAuthority` seam.
+    ///
+    /// This is a strict subset of D5's interest set, and D25 rule 2 names what
+    /// it leaves out: peers on sibling gateways (no cluster-wide session
+    /// directory yet — the same sentence `candidates` records above), peers
+    /// whose grant lapsed between refreshes while still rendering the cell,
+    /// and pure mesh peers that never talk to this registrar at all. Widening
+    /// happens at the `Sessions` term and nowhere else.
+    ///
+    /// Called once per `(grid, cell)`, never once per entity: on the
+    /// redistribution path `place` has already produced this set as its
+    /// candidate list, and this method is the fallback for the one disposition
+    /// that never computes one.
+    async fn fanout_audience(
+        &self,
+        audiences: &mut ExpireAudiences,
+        grid: GridId,
+        cell: CellId,
+        exclude: NodeId,
+        now_ms: u64,
+    ) -> CoveringPeers {
+        let covering = match audiences.by_cell.get(&(grid, cell)) {
+            Some(cached) => cached.clone(),
+            None => {
+                let sessions = self
+                    .peers
+                    .live_peer_leases()
+                    .await
+                    .into_iter()
+                    .map(|(node, _)| node)
+                    .collect::<Vec<_>>();
+                // No cap here: the memo holds `A` itself, and the cap belongs
+                // to one expiry's recipient list rather than to the cell's
+                // membership. Capping first would make the drop count depend
+                // on which entity happened to be enumerated first.
+                let covering = self
+                    .interest
+                    .covering_peers(&sessions, grid, cell, now_ms, usize::MAX)
+                    .peers;
+                audiences.by_cell.insert((grid, cell), covering.clone());
+                covering
+            }
+        };
+        CoveringPeers::bounded(
+            covering
+                .into_iter()
+                .filter(|node| *node != exclude)
+                .collect(),
+            EXPIRE_FANOUT_MAX_RECIPIENTS,
+        )
+    }
+
+    /// Push one advisory copy of `message` to every peer in `audience`.
+    ///
+    /// The message is reused **verbatim** — same `entity`, same `lease_id`,
+    /// same `disposition` as the losing holder's copy — which is what makes
+    /// this deployable ahead of any client change (D25 rule 4): a client that
+    /// has not learned to read a non-holder copy already drops one, because it
+    /// has no installed lease for that entity to match the token against.
+    ///
+    /// Every refusal on this path is a **drop**. Queueing an advisory would
+    /// put a hint in front of `Grant`, `Deny` and `HeartbeatAck` on the same
+    /// lane, so a fan-out storm would degrade arbitration — the one thing here
+    /// that is not best-effort (D25 rule 9).
+    async fn fan_out_expire(&self, audience: CoveringPeers, message: &LeaseMsg) {
+        // The over-cap remainder is counted before anything is sent: those
+        // recipients were dropped by the cap, not by their own buckets, and
+        // conflating the two would hide a cell past D6's ceiling behind a peer
+        // that is merely busy.
+        self.metrics
+            .record_expire_fanout_dropped(audience.over_limit as u64);
+        let now_ms = self.claim_clock.now_ms();
+        for node in audience.peers {
+            let Some(session) = self.peers.current_session(node).await else {
+                // Enumeration and delivery are not one atomic step; a session
+                // can end in between. An ordinary race, not a fault.
+                self.metrics.record_expire_fanout_skipped();
+                continue;
+            };
+            if !session.take_expire_fanout_token(now_ms).await {
+                self.metrics.record_expire_fanout_dropped(1);
+                continue;
+            }
+            if session
+                .notify(&GatewayReply::Lease {
+                    message: message.clone(),
+                })
+                .await
+            {
+                self.metrics.record_expire_fanout_sent();
+            } else {
+                self.metrics.record_expire_fanout_skipped();
+            }
+        }
+    }
+
+    /// Whether a disposition has any self-healing path of its own.
+    ///
+    /// `Reassigned` does and is therefore holder-only (D25 rule 7): INV-4
+    /// converges every observer on the successor's first replicated envelope,
+    /// because the successor's grant bumped the pair (INV-2), so an advisory
+    /// buys at most one send interval — 50 ms at D16's 20 Hz — in the case
+    /// that already heals itself. `Parked` and `Free` have no successor
+    /// stream, nothing ever raises the pair, and the advisory is the *only*
+    /// mechanism by which an observer stops extrapolating a proxy of an entity
+    /// no node writes.
+    ///
+    /// This asymmetry is also what makes the bound tractable rather than
+    /// merely smaller: a field host's disconnect reassigns its whole working
+    /// set, so the worst case in the system fans out approximately nothing.
+    const fn fans_out(disposition: &orrery_protocol::ExpireDisposition) -> bool {
+        matches!(
+            disposition,
+            orrery_protocol::ExpireDisposition::Parked | orrery_protocol::ExpireDisposition::Free
+        )
     }
 
     /// Grant a parked entity to `successor` and tell it, or return `None`
@@ -2955,6 +3336,15 @@ impl Redistributor {
             self.metrics.record_reassigned();
             // Tell the silent holder its lease ended, addressed by the token
             // it still believes it holds.
+            //
+            // Holder-only, and deliberately so: a timed-out handoff always
+            // ends `Reassigned`, which D25 rule 7 excludes from fan-out
+            // because INV-4 converges every observer on the claimant's first
+            // replicated envelope — its grant bumped the pair — so an
+            // advisory here would buy one send interval and nothing else.
+            // The `else` arm below sends no `Expire` at all, to anybody,
+            // which is pre-existing behaviour this change does not disturb:
+            // there is no expiry message to fan out.
             if let Some(session) = self.peers.current_session(pending.holder).await {
                 session
                     .notify(&GatewayReply::Lease {
@@ -2997,32 +3387,68 @@ impl Redistributor {
     }
 
     /// Choose where a lost lease goes, put it there, and tell the loser.
-    async fn redistribute(&self, router: &Arc<dyn Router>, parked: crate::lease::ParkedLease) {
+    async fn redistribute(
+        &self,
+        router: &Arc<dyn Router>,
+        parked: crate::lease::ParkedLease,
+        audiences: &mut ExpireAudiences,
+    ) {
         let entity = parked.lease.entity;
-        let disposition = self.place(router, &parked).await;
+        let Placement {
+            disposition,
+            candidates,
+        } = self.place(router, &parked).await;
         match &disposition {
             orrery_protocol::ExpireDisposition::Reassigned { .. } => {
                 self.metrics.record_reassigned()
             }
             _ => self.metrics.record_parked_without_successor(),
         }
-        // Tell the losing holder, addressed by the token it still believes it
-        // has installed — parking already bumped the row's own `lease_id`
-        // past it. On a disconnect there is nobody left to tell; on a TTL
-        // sweep this is what stops a silent zombie from writing again.
+        let fans_out = Self::fans_out(&disposition);
+        let message = LeaseMsg::Expire {
+            entity,
+            lease_id: parked.previous_lease_id,
+            last_holder: Some(parked.previous_holder),
+            reason: parked.reason,
+            disposition,
+        };
+        // Tell the losing holder first, addressed by the token it still
+        // believes it has installed — parking already bumped the row's own
+        // `lease_id` past it. On a disconnect there is nobody left to tell;
+        // on a TTL sweep this is what stops a silent zombie from writing
+        // again. Either way the copies below go out regardless, which is the
+        // whole point: the disconnect case is exactly the one where the
+        // holder's own copy is undeliverable and every survivor's is not.
         if let Some(session) = self.peers.current_session(parked.previous_holder).await {
             session
                 .notify(&GatewayReply::Lease {
-                    message: LeaseMsg::Expire {
-                        entity,
-                        lease_id: parked.previous_lease_id,
-                        last_holder: Some(parked.previous_holder),
-                        reason: parked.reason,
-                        disposition,
-                    },
+                    message: message.clone(),
                 })
                 .await;
         }
+        if !fans_out {
+            return;
+        }
+        // Reuse the set `place` already walked wherever it produced one — it
+        // *is* `A` minus the previous holder, computed through the same seam
+        // (D25 rule 1). The `None` arm is the strong-owned and player-bound
+        // case, which returns before any enumeration and is the very case
+        // where the advisory does the most work: a strong-owned entity parks
+        // with a live audience and no successor stream will ever repoint it.
+        let audience = match candidates {
+            Some(nodes) => CoveringPeers::bounded(nodes, EXPIRE_FANOUT_MAX_RECIPIENTS),
+            None => {
+                self.fanout_audience(
+                    audiences,
+                    parked.grid,
+                    parked.cell,
+                    parked.previous_holder,
+                    registrar_now_ms(),
+                )
+                .await
+            }
+        };
+        self.fan_out_expire(audience, &message).await;
     }
 
     /// Decide and enact the disposition of one parked row.
@@ -3030,7 +3456,7 @@ impl Redistributor {
         &self,
         router: &Arc<dyn Router>,
         parked: &crate::lease::ParkedLease,
-    ) -> orrery_protocol::ExpireDisposition {
+    ) -> Placement {
         // D7 §5: a strong-owned entity whose owner crashed re-parks with its
         // `own_seq` intact rather than being regranted. Only weak authority
         // is redistributed without consent.
@@ -3047,7 +3473,14 @@ impl Redistributor {
                 .flags
                 .contains(orrery_protocol::LeaseFlags::PLAYER_BOUND)
         {
-            return orrery_protocol::ExpireDisposition::Parked;
+            // No candidate set is computed here, and `Placement::candidates`
+            // says so rather than reporting an empty one: "nobody covers this
+            // cell" and "nobody was asked" are different facts, and the
+            // fan-out path has to tell them apart.
+            return Placement {
+                disposition: orrery_protocol::ExpireDisposition::Parked,
+                candidates: None,
+            };
         }
         let candidates = self
             .candidates(
@@ -3057,8 +3490,23 @@ impl Redistributor {
                 registrar_now_ms(),
             )
             .await;
+        let addressable = || {
+            Some(
+                candidates
+                    .iter()
+                    .map(|candidate| candidate.node)
+                    .collect::<Vec<_>>(),
+            )
+        };
         if candidates.is_empty() {
-            return orrery_protocol::ExpireDisposition::Parked;
+            // D25's load-bearing case: `candidates` *is* `A` minus the
+            // previous holder, so an empty one says `|A \ {P}| = 0` and the
+            // fan-out term for this entity is zero by construction. A lease
+            // parks for want of a successor only when there is nobody to tell.
+            return Placement {
+                disposition: orrery_protocol::ExpireDisposition::Parked,
+                candidates: addressable(),
+            };
         }
         let chosen = self.policy.select(&SuccessorRequest {
             grid: parked.grid,
@@ -3074,7 +3522,10 @@ impl Redistributor {
             *node != parked.previous_holder
                 && candidates.iter().any(|candidate| candidate.node == *node)
         }) else {
-            return orrery_protocol::ExpireDisposition::Parked;
+            return Placement {
+                disposition: orrery_protocol::ExpireDisposition::Parked,
+                candidates: addressable(),
+            };
         };
         if self
             .hand_to(
@@ -3090,9 +3541,21 @@ impl Redistributor {
             .await
             .is_some()
         {
-            orrery_protocol::ExpireDisposition::Reassigned { to: successor }
+            Placement {
+                // Holder-only by D25 rule 7; the candidate set is carried
+                // anyway so the caller never has to know which arm produced
+                // the disposition it is looking at.
+                disposition: orrery_protocol::ExpireDisposition::Reassigned { to: successor },
+                candidates: addressable(),
+            }
         } else {
-            orrery_protocol::ExpireDisposition::Parked
+            // The handoff failed after the row was parked. The audience is
+            // real and there is now no successor stream, so this parks *and*
+            // fans out — the case D25's arithmetic calls `declined(P)`.
+            Placement {
+                disposition: orrery_protocol::ExpireDisposition::Parked,
+                candidates: addressable(),
+            }
         }
     }
 }
@@ -3153,6 +3616,7 @@ impl GatewayServer {
             policy: config.successor_policy,
             metrics: Arc::clone(&authority_metrics),
             handoff_deadline_ms: config.handoff_deadline_ms,
+            claim_clock: Arc::clone(&admission.claim_clock),
             pending: tokio::sync::Mutex::new(HashMap::new()),
         });
         let lease_sweep_clock = config.lease_sweep_clock;
@@ -3601,8 +4065,15 @@ async fn accept_loop(
                 // Expiry and redistribution are one step: a swept row that is
                 // parked and then left is exactly the orphan the phase exists
                 // to eliminate.
+                // One memo per sweep, dropped with it: a sweep is a pass in
+                // D25 rule 8's sense, and several of its rows routinely share
+                // a cell — a busy cell is exactly where several leases lapse
+                // together — so enumerating that cell's audience once is the
+                // difference between `O(leases × sessions)` and
+                // `O(cells × sessions)`.
+                let mut audiences = ExpireAudiences::default();
                 for parked in router.sweep_expired_leases(lease_sweep_clock.now_ms()).await {
-                    redistributor.redistribute(&router, parked).await;
+                    redistributor.redistribute(&router, parked, &mut audiences).await;
                 }
                 admission.peers.evict_idle(admission.clock.now_ms().0).await;
                 interest_authority.prune_expired(registrar_now_ms());
@@ -4800,6 +5271,10 @@ async fn divest_lease(
     // reply, whichever way the holder decided.
     let requested = redistributor.take_pending(entity, session.node).await;
 
+    // The audience `place` would have produced, kept when this path already
+    // walked the registry for its own reasons so the fan-out below never pays
+    // for a second enumeration of the same `(grid, cell)` (D25 rule 8).
+    let mut audience: Option<Vec<NodeId>> = None;
     let disposition = match to {
         None => orrery_protocol::ExpireDisposition::Parked,
         Some(successor) if successor == session.node => orrery_protocol::ExpireDisposition::Parked,
@@ -4807,11 +5282,13 @@ async fn divest_lease(
             // The named successor passes exactly the admission a claim of its
             // own would: a live session on this gateway plus live coordinator
             // interest covering the cell. Consent does not widen it.
-            let eligible = redistributor
+            let candidates = redistributor
                 .candidates(indexed.grid, indexed.cell, session.node, registrar_now_ms())
-                .await
+                .await;
+            let eligible = candidates
                 .iter()
                 .any(|candidate| candidate.node == successor);
+            audience = Some(candidates.iter().map(|candidate| candidate.node).collect());
             // When this consent answers a registrar request naming the same
             // successor, the grant carries that claimant's own correlation, so
             // its pending `Claim` resolves rather than looking unanswered.
@@ -4871,7 +5348,8 @@ async fn divest_lease(
             .await;
     }
 
-    LeaseMsg::Expire {
+    let fans_out = Redistributor::fans_out(&disposition);
+    let message = LeaseMsg::Expire {
         entity,
         lease_id,
         last_holder: Some(session.node),
@@ -4884,7 +5362,41 @@ async fn divest_lease(
             orrery_protocol::ExpireReason::Revoked
         },
         disposition,
+    };
+
+    // A deliberate release is the purest case D25 exists for: the entity is
+    // parked, no successor stream will ever raise its pair, and every observer
+    // would otherwise extrapolate a proxy of a body nobody writes. A consented
+    // *handoff* is `Reassigned` and stays holder-only (rule 7).
+    //
+    // The caller sends `message` back down this holder's own connection, so
+    // the holder's copy is not sent here and the holder is excluded from the
+    // audience either way — `candidates` excludes it, and so does
+    // `fanout_audience`.
+    if fans_out {
+        let audience = match audience {
+            Some(nodes) => CoveringPeers::bounded(nodes, EXPIRE_FANOUT_MAX_RECIPIENTS),
+            None => {
+                // One divest is one expiry, so the memo has nothing to reuse
+                // and exists only to satisfy the signature. Constructing it
+                // here rather than holding one on the redistributor is the
+                // point: an audience outliving its pass would answer with
+                // sessions that have gone and grants that have lapsed.
+                redistributor
+                    .fanout_audience(
+                        &mut ExpireAudiences::default(),
+                        indexed.grid,
+                        indexed.cell,
+                        session.node,
+                        registrar_now_ms(),
+                    )
+                    .await
+            }
+        };
+        redistributor.fan_out_expire(audience, &message).await;
     }
+
+    message
 }
 
 /// Map a verification failure onto its stable wire code.
@@ -4962,8 +5474,20 @@ async fn cleanup_peer_session(
 
     // Redistribute only after every park has landed and every session lock is
     // released: a successor's grant path locks peer state of its own.
+    //
+    // This is also the fan-out path's hardest case and the reason D25 exists.
+    // The holder is by definition gone here, so its own `Expire` goes nowhere;
+    // before D25 that meant a park on this path was observable from no peer at
+    // all. `redistribute` now addresses the survivors that cover the cell, so
+    // the burst for one lost peer is `Σ min(|A|, R)` over the leases that
+    // actually park — which for a field host, whose leases reassign, is
+    // approximately nothing, and for a strong-owned working set is held down
+    // by each recipient's own egress bucket rather than by this loop.
+    let mut audiences = ExpireAudiences::default();
     for parked in orphaned {
-        redistributor.redistribute(router, parked).await;
+        redistributor
+            .redistribute(router, parked, &mut audiences)
+            .await;
     }
 
     let mut peer = session.state.lock().await;
@@ -5067,6 +5591,64 @@ impl ClaimBucket {
         let wait_ms = missing_token_millis.saturating_add(Self::CLAIMS_PER_SECOND - 1)
             / Self::CLAIMS_PER_SECOND;
         u32::try_from(wait_ms).unwrap_or(u32::MAX)
+    }
+}
+
+/// One peer's allowance for *receiving* non-holder `Expire` advisories
+/// (D25 rule 8, second limit).
+///
+/// Deliberately the same shape as [`ClaimBucket`] — 32/s sustained, burst 64 —
+/// so the ingress limit on `Claim` and the egress limit on the advisory it
+/// answers read alike, and neither has to be looked up to reason about the
+/// other. It is the limit that actually binds: the per-expiry cap is a
+/// property of one cell's population, while this one is what stops a single
+/// `cleanup_peer_session` pass over a strong-owned working set from delivering
+/// `MAX_PEER_LIVE_LEASES` advisories to one peer in a burst. With it, one pass
+/// costs any single peer at most 64 frames — about 4 KB — and the sustained
+/// rate is 16.4 kbit/s, 1.6 % of D6's per-peer upload budget.
+///
+/// Kept on [`PeerState`] rather than on the session, and so shared across
+/// replacement generations exactly as `claim_bucket` is: the budget belongs to
+/// the `NodeId`, and a peer that reconnected should not find its allowance
+/// refilled by the reconnect.
+///
+/// An empty bucket **drops**, never queues (D25 rule 9).
+#[derive(Debug, Clone, Copy)]
+struct ExpireFanoutBucket {
+    token_millis: u64,
+    updated_ms: u64,
+}
+
+impl ExpireFanoutBucket {
+    const ADVISORIES_PER_SECOND: u64 = 32;
+    const BURST_ADVISORIES: u64 = 64;
+    const TOKEN_MILLIS_PER_ADVISORY: u64 = 1_000;
+    const BURST_TOKEN_MILLIS: u64 = Self::BURST_ADVISORIES * Self::TOKEN_MILLIS_PER_ADVISORY;
+
+    const fn new(now_ms: u64) -> Self {
+        Self {
+            token_millis: Self::BURST_TOKEN_MILLIS,
+            updated_ms: now_ms,
+        }
+    }
+
+    fn take(&mut self, now_ms: u64) -> bool {
+        if now_ms > self.updated_ms {
+            let replenished = now_ms
+                .saturating_sub(self.updated_ms)
+                .saturating_mul(Self::ADVISORIES_PER_SECOND);
+            self.token_millis = self
+                .token_millis
+                .saturating_add(replenished)
+                .min(Self::BURST_TOKEN_MILLIS);
+            self.updated_ms = now_ms;
+        }
+        if self.token_millis < Self::TOKEN_MILLIS_PER_ADVISORY {
+            false
+        } else {
+            self.token_millis -= Self::TOKEN_MILLIS_PER_ADVISORY;
+            true
+        }
     }
 }
 
@@ -6267,6 +6849,310 @@ mod tests {
         );
     }
 
+    /// D25 rule 8's per-expiry cap drops the excess, and drops it in a
+    /// reproducible order.
+    ///
+    /// The ordering clause is the half worth testing. Truncating an unordered
+    /// registry walk keeps a *different* 128 peers on every pass, so a run
+    /// that exceeded the cap could not be reproduced from its own inputs, and
+    /// the drop count would be the only thing about it that was stable.
+    #[test]
+    fn the_per_expiry_cap_drops_the_excess_in_node_id_order() {
+        let peers = (1u8..=200).map(successor_node).collect::<Vec<_>>();
+        let bounded = CoveringPeers::bounded(peers.clone(), EXPIRE_FANOUT_MAX_RECIPIENTS);
+
+        assert_eq!(bounded.len(), EXPIRE_FANOUT_MAX_RECIPIENTS);
+        assert_eq!(bounded.over_limit, 200 - EXPIRE_FANOUT_MAX_RECIPIENTS);
+
+        let mut expected = peers;
+        expected.sort_unstable_by_key(|peer| *peer.as_bytes());
+        expected.truncate(EXPIRE_FANOUT_MAX_RECIPIENTS);
+        assert_eq!(bounded.peers, expected);
+
+        // Presented in a different order, the same set keeps the same 128.
+        let mut shuffled = expected.clone();
+        shuffled.reverse();
+        assert_eq!(
+            CoveringPeers::bounded(shuffled, EXPIRE_FANOUT_MAX_RECIPIENTS).peers,
+            expected
+        );
+
+        // Under the cap nothing is dropped and the count says so.
+        let under = CoveringPeers::bounded(
+            (1u8..=8).map(successor_node).collect(),
+            EXPIRE_FANOUT_MAX_RECIPIENTS,
+        );
+        assert_eq!(under.len(), 8);
+        assert_eq!(under.over_limit, 0);
+        assert!(!under.is_empty());
+        assert!(CoveringPeers::bounded(Vec::new(), EXPIRE_FANOUT_MAX_RECIPIENTS).is_empty());
+    }
+
+    /// Exceeding the cap moves `expire_fanout_dropped`, and by the whole
+    /// remainder rather than by one.
+    ///
+    /// The remainder is counted before any delivery is attempted, which is why
+    /// this can be asserted against a registry holding no sessions at all: a
+    /// peer dropped by the cap was never addressed, so its own reachability is
+    /// not part of the question. The recipients that *were* addressed and
+    /// found unreachable land on `expire_fanout_skipped` instead, and keeping
+    /// the two apart is the point — one says a cell is past D6's population
+    /// ceiling, the other says the registry is enumerating sessions it can no
+    /// longer reach.
+    #[test]
+    fn over_cap_advisories_are_dropped_and_counted_before_delivery() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let registry = Arc::new(PeerRegistry::new(
+                MAX_PEER_REGISTRY_ENTRIES,
+                10_000,
+                MAX_PEER_LIVE_LEASES,
+            ));
+            let redistributor = parking_redistributor(registry);
+            let audience = CoveringPeers::bounded(
+                (1u8..=200).map(successor_node).collect(),
+                EXPIRE_FANOUT_MAX_RECIPIENTS,
+            );
+            let message = LeaseMsg::Expire {
+                entity: PersistId::new(1),
+                lease_id: LeaseId(3),
+                last_holder: Some(successor_node(250)),
+                reason: orrery_protocol::ExpireReason::Disconnect,
+                disposition: orrery_protocol::ExpireDisposition::Parked,
+            };
+
+            redistributor.fan_out_expire(audience, &message).await;
+
+            let snapshot = redistributor.metrics.snapshot();
+            assert_eq!(
+                snapshot.expire_fanout_dropped,
+                (200 - EXPIRE_FANOUT_MAX_RECIPIENTS) as u64,
+                "the whole over-cap remainder is one drop each"
+            );
+            assert_eq!(
+                snapshot.expire_fanout_skipped, EXPIRE_FANOUT_MAX_RECIPIENTS as u64,
+                "the capped recipients were addressed and had no session"
+            );
+            assert_eq!(snapshot.expire_fanout_sent, 0);
+            // Purely additive: nothing on this path touches a disposition.
+            assert_eq!(snapshot.parked_without_successor, 0);
+            assert_eq!(snapshot.reassigned, 0);
+            assert_eq!(snapshot.duplicate_authority, 0);
+        });
+    }
+
+    /// An [`InterestAuthority`] that admits everything and counts how often it
+    /// was asked.
+    ///
+    /// Counting is the whole point: D25 rule 8's per-pass limit is a statement
+    /// about *how many times* the registry is walked, and an assertion about
+    /// the answers cannot distinguish one enumeration from a hundred.
+    #[derive(Default)]
+    struct CountingInterestAuthority {
+        enumerations: AtomicU64,
+    }
+
+    impl InterestAuthority for CountingInterestAuthority {
+        fn snapshot_for(&self, _peer: NodeId) -> Option<CoordinatorInterestSnapshot> {
+            None
+        }
+
+        fn allows(&self, _peer: NodeId, _grid: GridId, _cell: CellId, _now_ms: u64) -> bool {
+            true
+        }
+
+        fn covering_peers(
+            &self,
+            sessions: &[NodeId],
+            _grid: GridId,
+            _cell: CellId,
+            _now_ms: u64,
+            limit: usize,
+        ) -> CoveringPeers {
+            self.enumerations.fetch_add(1, Ordering::Relaxed);
+            CoveringPeers::bounded(sessions.to_vec(), limit)
+        }
+    }
+
+    /// One pass enumerates each `(grid, cell)` once, however many entities in
+    /// it expire — and the memo still excludes the right holder each time.
+    ///
+    /// The second clause is why the cache stores `A` unfiltered rather than
+    /// `A \ {holder}`: a single TTL sweep carries rows from several holders,
+    /// so the peer to exclude varies within the pass while the cell's
+    /// membership does not. Keying on the holder as well would defeat the memo
+    /// exactly where a cell is busiest.
+    #[test]
+    fn one_pass_enumerates_each_cell_once_whatever_the_holder() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let registry = Arc::new(PeerRegistry::new(
+                MAX_PEER_REGISTRY_ENTRIES,
+                10_000,
+                MAX_PEER_LIVE_LEASES,
+            ));
+            let interest = Arc::new(CountingInterestAuthority::default());
+            let redistributor = Redistributor {
+                interest: Arc::clone(&interest) as SharedInterestAuthority,
+                ..parking_redistributor(Arc::clone(&registry))
+            };
+            let cell = CellId::ROOT.children()[0];
+            let elsewhere = CellId::ROOT.children()[1];
+            let mut audiences = ExpireAudiences::default();
+
+            // No sessions are registered, so every audience is empty — this
+            // test is about the number of walks, not their contents.
+            for _ in 0..16 {
+                redistributor
+                    .fanout_audience(&mut audiences, GridId::ROOT, cell, successor_node(1), 0)
+                    .await;
+            }
+            assert_eq!(
+                interest.enumerations.load(Ordering::Relaxed),
+                1,
+                "sixteen expiries in one cell cost one enumeration"
+            );
+
+            // A different holder in the same cell reuses the memo...
+            redistributor
+                .fanout_audience(&mut audiences, GridId::ROOT, cell, successor_node(2), 0)
+                .await;
+            assert_eq!(interest.enumerations.load(Ordering::Relaxed), 1);
+
+            // ...and a different cell does not.
+            redistributor
+                .fanout_audience(
+                    &mut audiences,
+                    GridId::ROOT,
+                    elsewhere,
+                    successor_node(1),
+                    0,
+                )
+                .await;
+            assert_eq!(interest.enumerations.load(Ordering::Relaxed), 2);
+
+            // A fresh pass starts cold, which is the property that keeps a
+            // memo from outliving the sessions and grants it was built from.
+            redistributor
+                .fanout_audience(
+                    &mut ExpireAudiences::default(),
+                    GridId::ROOT,
+                    cell,
+                    successor_node(1),
+                    0,
+                )
+                .await;
+            assert_eq!(interest.enumerations.load(Ordering::Relaxed), 3);
+        });
+    }
+
+    /// The per-recipient bucket is D16's claim-bucket shape at D25's rate:
+    /// burst 64, then 32/s.
+    ///
+    /// This is the limit that actually binds. The per-expiry cap is a property
+    /// of one cell's population and is inert below D6's ceiling; this one is
+    /// what holds a single `cleanup_peer_session` pass over a strong-owned
+    /// working set — up to `MAX_PEER_LIVE_LEASES` parks — down to 64 frames
+    /// at any one peer.
+    #[test]
+    fn expire_fanout_bucket_bursts_to_sixty_four_then_refills_at_thirty_two_per_second() {
+        let mut bucket = ExpireFanoutBucket::new(0);
+        for advisory in 0..64 {
+            assert!(bucket.take(0), "burst advisory {advisory} is admitted");
+        }
+        // The 65th in one pass is dropped, not queued: an advisory ahead of a
+        // `Grant` on the same lane would degrade arbitration.
+        assert!(!bucket.take(0));
+
+        // One second later, exactly 32 more.
+        for advisory in 0..32 {
+            assert!(bucket.take(1_000), "refilled advisory {advisory}");
+        }
+        assert!(!bucket.take(1_000));
+
+        // A long idle refills to the burst and no further.
+        for advisory in 0..64 {
+            assert!(bucket.take(1_000_000), "post-idle advisory {advisory}");
+        }
+        assert!(!bucket.take(1_000_000));
+    }
+
+    /// `covering_peers` is `allows` applied to the caller's session set, and
+    /// the production authority's override answers identically.
+    ///
+    /// The override exists to take one read lock instead of `|Sessions|` of
+    /// them; if it ever answered a different question, fan-out would address
+    /// peers the same gateway would refuse to grant to.
+    #[test]
+    fn covering_peers_agrees_with_allows_on_every_impl() {
+        let cell = CellId::ROOT.children()[0];
+        let elsewhere = CellId::ROOT.children()[1];
+        let sessions = (1u8..=4).map(successor_node).collect::<Vec<_>>();
+        let snapshots = vec![
+            interest_snapshot(successor_node(1), 1, GridId::ROOT, vec![cell], 10_000),
+            interest_snapshot(successor_node(2), 1, GridId::ROOT, vec![elsewhere], 10_000),
+            // Covers the cell, but its gateway-stamped deadline has passed.
+            interest_snapshot(successor_node(3), 1, GridId::ROOT, vec![cell], 500),
+            interest_snapshot(successor_node(4), 1, GridId::ROOT, vec![cell], 10_000),
+        ];
+
+        let authority = SnapshotInterestAuthority::from_snapshots(snapshots.clone());
+        let covering = authority.covering_peers(
+            &sessions,
+            GridId::ROOT,
+            cell,
+            1_000,
+            EXPIRE_FANOUT_MAX_RECIPIENTS,
+        );
+        let mut expected = vec![successor_node(1), successor_node(4)];
+        expected.sort_unstable_by_key(|peer| *peer.as_bytes());
+        assert_eq!(covering.peers, expected);
+        assert_eq!(covering.over_limit, 0);
+
+        // The same answer, arrived at through the per-peer seam.
+        for peer in &sessions {
+            assert_eq!(
+                authority.allows(*peer, GridId::ROOT, cell, 1_000),
+                covering.peers.contains(peer),
+                "{peer} disagrees between allows and covering_peers"
+            );
+        }
+
+        // And the production authority, whose override reads the map directly.
+        let handout = CoordinatorHandoutAuthority::new([]);
+        {
+            let mut held = handout.snapshots.write().expect("fresh lock");
+            for snapshot in snapshots {
+                held.insert(snapshot.peer, snapshot);
+            }
+        }
+        assert_eq!(
+            handout
+                .covering_peers(
+                    &sessions,
+                    GridId::ROOT,
+                    cell,
+                    1_000,
+                    EXPIRE_FANOUT_MAX_RECIPIENTS
+                )
+                .peers,
+            expected
+        );
+
+        // The default authority trusts nothing, so it addresses nobody — and
+        // the defaulted method is what keeps it, and every test double,
+        // compiling without a fan-out implementation of its own.
+        assert!(DenyAllInterestAuthority
+            .covering_peers(
+                &sessions,
+                GridId::ROOT,
+                cell,
+                1_000,
+                EXPIRE_FANOUT_MAX_RECIPIENTS
+            )
+            .is_empty());
+    }
+
     /// A redistributor for unit tests: no coordinator interest, so no peer is
     /// ever a candidate and every lost lease parks — the behaviour these tests
     /// were written against.
@@ -6277,6 +7163,7 @@ mod tests {
             policy: Arc::new(ParkOnLossPolicy),
             metrics: Arc::new(AuthorityMetrics::default()),
             handoff_deadline_ms: 300,
+            claim_clock: Arc::new(SystemClaimClock::default()),
             pending: tokio::sync::Mutex::new(HashMap::new()),
         }
     }

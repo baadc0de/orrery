@@ -29,11 +29,38 @@
 //! grant with the wall-clock instant it arrived, so the settle time is the
 //! registrar's latency and not the orchestrator's poll interval.
 //!
-//! **Parking is not observable from any peer.** The registrar tells only the
+//! **Parking became observable from a peer on the strong leg, and only
+//! there.** It used to be observable from nowhere: the registrar told only the
 //! *previous* holder that a lease parked (`Expire`), and that peer is the one
-//! that was killed. Nothing is sent to anybody else, and the heartbeat read
-//! path returns rows only for leases the asking session already holds, so a
-//! survivor cannot poll for it either.
+//! that was killed; nothing went to anybody else, and the heartbeat read path
+//! returns rows only for leases the asking session already holds, so a
+//! survivor could not poll for it either.
+//!
+//! D25 fans a verbatim copy of that same `Expire` out to
+//! `A(G, grid, cell, t) = { p ∈ Sessions(G,t) : allows(p, grid, cell, t) }` —
+//! every peer with a live session on this gateway whose coordinator interest
+//! covers the entity's committed cell. Survivors therefore record
+//! `PeerEvent::Observed`, and the orchestrator checks it. Two scoping clauses
+//! are load-bearing, and neither is an implementation detail:
+//!
+//! - **Strong leg only.** With `--victim-claim-kind strong` the victim's rows
+//!   are `STRONG_HELD`, so `Redistributor::place` parks each one *before* it
+//!   computes any candidate (D7 §5: only weak authority is redistributed
+//!   without consent), and the seven survivors are a live, covered audience.
+//!   On the weak leg the same rows *reassign*, which D25 rule 7 deliberately
+//!   keeps holder-only: INV-4 already converges every observer on the
+//!   successor's first replicated envelope, so an advisory would buy one 20 Hz
+//!   send interval and nothing else. Asserting observation on the weak leg
+//!   would assert something unreachable by construction.
+//! - **Best-effort by design.** D25 permits the gateway to *drop* an advisory
+//!   rather than queue it behind a `Grant` on the same lane. So the clause is
+//!   conditioned on the registrar's own `expire_fanout_dropped` reading zero
+//!   for the window: a run that dropped is a run where non-delivery is
+//!   correct, and the gate says nothing about it rather than failing it.
+//!
+//! What this does **not** change is which instrument times the settle. An
+//! advisory is not a disposition; the registrar's counters remain the witness
+//! that a row parked, for the reasons below.
 //!
 //! That leaves two instruments, and only one of them is honest:
 //!
@@ -471,6 +498,11 @@ async fn orchestrate(cli: Cli) -> Result<Outcome> {
     // window would be counted here as one of the victim's rows settling.
     // Checked rather than assumed.
     let mut survivor_losses: Vec<u64> = Vec::new();
+    // D25's advisory, as observed by the survivors. Keyed by entity, valued by
+    // the set of peers that saw a disposition for it — the second half is what
+    // makes "*every* surviving peer observed it" checkable rather than "at
+    // least somebody did".
+    let mut observed_by: BTreeMap<u64, BTreeSet<usize>> = BTreeMap::new();
     let settled = loop {
         survivor_losses.clear();
         for (index, log) in logs.iter().enumerate() {
@@ -486,6 +518,9 @@ async fn orchestrate(cli: Cli) -> Result<Outcome> {
                             .entry(entity)
                             .or_insert_with(|| at_ms.saturating_sub(killed_at_unix_ms));
                         inherited_by.insert(entity, index);
+                    }
+                    PeerEvent::Observed { entity, .. } if victim_entities.contains(&entity) => {
+                        observed_by.entry(entity).or_default().insert(index);
                     }
                     PeerEvent::Lost { entity, .. } => survivor_losses.push(entity),
                     _ => {}
@@ -545,6 +580,63 @@ async fn orchestrate(cli: Cli) -> Result<Outcome> {
         tokio::time::sleep(SETTLE_POLL_INTERVAL).await;
     };
     let parked_attested = final_counters.parked.saturating_sub(baseline.parked);
+    let fanout_sent = final_counters
+        .fanout_sent
+        .saturating_sub(baseline.fanout_sent);
+    let fanout_dropped = final_counters
+        .fanout_dropped
+        .saturating_sub(baseline.fanout_dropped);
+
+    // ── The park, observed ──────────────────────────────────────────────
+    // Re-read the survivors' logs once the registrar's own account has caught
+    // up. The settle loop stops on the *first* evidence a cohort was disposed
+    // of, which is by construction at or before the last advisory lands, so a
+    // reading taken there would undercount for reasons that have nothing to do
+    // with the registrar.
+    for (index, log) in logs.iter().enumerate() {
+        if index == VICTIM_INDEX {
+            continue;
+        }
+        for event in read_events(log)? {
+            if let PeerEvent::Observed { entity, .. } = event {
+                if victim_entities.contains(&entity) {
+                    observed_by.entry(entity).or_default().insert(index);
+                }
+            }
+        }
+    }
+    let survivors = usize::from(cli.peers).saturating_sub(1);
+    // **This clause is a leg, not a blanket** (D25's third accepted caveat).
+    //
+    // It is reachable on the strong leg and only there. With
+    // `--victim-claim-kind strong` the victim's rows are `STRONG_HELD`, so
+    // `Redistributor::place` parks each one *before* any candidate is computed
+    // — D7 §5: only weak authority is redistributed without consent — and the
+    // seven survivors are a live audience with coordinator interest covering
+    // the cell. On the weak leg those same rows reassign, and D25 rule 7 keeps
+    // a reassignment holder-only because INV-4 already converges every
+    // observer on the successor's first replicated envelope. Asserting
+    // observation there would assert something unreachable by construction,
+    // so the clause is scoped rather than universal.
+    let expects_advisory = matches!(ClaimKind::from(cli.victim_claim_kind), ClaimKind::Strong);
+    // And it is conditioned on the bound, because the advisory is best-effort
+    // by design: D25 permits the gateway to drop one rather than queue it
+    // behind a `Grant`. If the registrar reports having dropped any in this
+    // window, the run is in the regime where non-delivery is correct and this
+    // clause has nothing to say about it.
+    let unobserved: Vec<u64> = if expects_advisory && fanout_dropped == 0 {
+        victim_entities
+            .iter()
+            .copied()
+            .filter(|entity| {
+                observed_by
+                    .get(entity)
+                    .is_none_or(|seen| seen.len() < survivors)
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
 
     // Anything with no disposition of its own is checked entity by entity, and
     // the check is deliberately narrow about what it proves. A claim is not an
@@ -636,7 +728,8 @@ async fn orchestrate(cli: Cli) -> Result<Outcome> {
         && settled_in_ms <= settle_budget.as_millis() as u64
         && lost.is_empty()
         && duplicate_authority == 0
-        && attribution_sound;
+        && attribution_sound
+        && unobserved.is_empty();
     let report = serde_json::json!({
         "peers": cli.peers,
         "entities_total": total_entities,
@@ -673,6 +766,19 @@ async fn orchestrate(cli: Cli) -> Result<Outcome> {
         // A survivor losing a lease inside the window would put dispositions
         // that are not the victim's into the counters the clock reads.
         "survivor_leases_lost": survivor_losses.len(),
+        // D25's `Expire` fan-out. `observed_entities` is how many of the
+        // victim's rows at least one survivor saw a disposition for, and
+        // `fully_observed_entities` how many were seen by *every* survivor —
+        // the number the strong-leg clause is written against.
+        "fanout_expected": expects_advisory,
+        "fanout_sent_attested": fanout_sent,
+        "fanout_dropped_attested": fanout_dropped,
+        "observed_entities": observed_by.len(),
+        "fully_observed_entities": observed_by
+            .values()
+            .filter(|seen| seen.len() >= survivors)
+            .count(),
+        "unobserved_entities": unobserved.len(),
         "passed": passed,
     });
     Ok(Outcome { passed, report })
@@ -789,6 +895,18 @@ struct AuthorityCounters {
     /// Lost leases parked because no successor was eligible — or because the
     /// tier forbids redistributing them at all (D7 §5).
     parked: u64,
+    /// Non-holder `Expire` advisories the registrar pushed (D25 rule 1).
+    fanout_sent: u64,
+    /// Advisories a bound refused — over the per-expiry recipient cap, or
+    /// past a recipient's own egress bucket (D25 rules 8 and 9).
+    ///
+    /// Read for one reason only: the advisory is *best-effort by design*, and
+    /// the bound explicitly permits the gateway to drop one. A gate that
+    /// asserted delivery unconditionally would be asserting something the
+    /// architecture allows to be false. This counter is what makes the
+    /// observability clause below conditional on the regime the run was
+    /// actually in rather than on hope.
+    fanout_dropped: u64,
 }
 
 /// Read the highest total persistd has reported for each authority counter.
@@ -818,6 +936,8 @@ fn read_authority_counters(path: &std::path::Path) -> Result<AuthorityCounters> 
         counters.duplicate = counters.duplicate.max(field("duplicate_authority"));
         counters.reassigned = counters.reassigned.max(field("reassigned"));
         counters.parked = counters.parked.max(field("parked_without_successor"));
+        counters.fanout_sent = counters.fanout_sent.max(field("expire_fanout_sent"));
+        counters.fanout_dropped = counters.fanout_dropped.max(field("expire_fanout_dropped"));
     }
     Ok(counters)
 }
