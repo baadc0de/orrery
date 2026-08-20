@@ -2,7 +2,7 @@
 
 Every replicated entity in Orrery has exactly one writer at any instant. This document specifies how that writer is chosen, proven, transferred, and recovered: the two-tier claim model (weak authority by interaction, strong ownership by explicit act) with its sequence-number invariants; the lease registrar inside the persistence cluster that arbitrates claims for persistent entities via compare-and-swap; the full message-level lease protocol (`Claim`, `Grant`, `Deny`, `Divest`, `Heartbeat`, `Expire`) with flows for cooperative handoff, contested claims, crash orphaning, and cluster-unreachable degraded operation; contact-island propagation for physics; ephemeral, parked, and active (NPC-hosted) entities; and the interactions with field-host promotion and cross-cell movement. The protocol lives in `orrery_protocol`, the client logic in `orrery_authority`, and the registrar in `orrery_persistd`.
 
-Normative source: [ADR-0007](adr/0007-authority-and-leases.md), with the `Expire` fan-out set, non-holder addressing and amplification bound in [ADR-0025](adr/0025-expire-fan-out.md) (*proposed*) (boundaries with [D5](adr/0005-spatial-model.md), [D6](adr/0006-population-adaptive-topology.md), [D8](adr/0008-prediction-rollback-interpolation.md), [D11](adr/0011-persistence.md), and [D12](adr/0012-backend-services.md)).
+Normative source: [ADR-0007](adr/0007-authority-and-leases.md), with the `Expire` fan-out set, non-holder addressing and amplification bound in [ADR-0025](adr/0025-expire-fan-out.md) (boundaries with [D5](adr/0005-spatial-model.md), [D6](adr/0006-population-adaptive-topology.md), [D8](adr/0008-prediction-rollback-interpolation.md), [D11](adr/0011-persistence.md), and [D12](adr/0012-backend-services.md)).
 
 > **Implementation status (2026-08-16).** The strict persistence-authority path is
 > implemented: a signed, transport-NodeId-bound session is required before lease
@@ -187,8 +187,8 @@ registrar had already moved past when the datagram left. That is how a
 duplicated NACK repoints `Authority.holder` at a stale peer, with no `Lost`
 event to show for it.
 
-**Who else hears it, and what they do with it** ([D25](adr/0025-expire-fan-out.md),
-*proposed*). "Cell subscribers" is not a group the registrar can evaluate —
+**Who else hears it, and what they do with it**
+([D25](adr/0025-expire-fan-out.md)). "Cell subscribers" is not a group the registrar can evaluate —
 room membership is a pure function of replicated positions that each *sender*
 evaluates per outgoing link ([03-replication.md](03-replication.md) §3), and
 the registrar sends none. D25 therefore defines the fan-out set as the peers
