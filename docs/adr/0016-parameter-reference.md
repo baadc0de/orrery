@@ -2,7 +2,7 @@
 
 **Status:** Accepted; extended by [ADR-0020](0020-journal-retention.md),
 enforced by [ADR-0023](0023-follower-journal-retention.md), proposed extensions in
-[ADR-0025](0025-expire-fan-out.md) and [ADR-0027](0027-low-population-path.md) ·
+[ADR-0025](0025-expire-fan-out.md) and [ADR-0029](0029-low-population-path.md) ·
 **Date:** 2026-08-11 · **Decision:** D16
 
 This decision is normative. See the [ADR index](../DECISIONS.md) for precedence, scope, and the complete decision set.
@@ -25,8 +25,8 @@ This decision is normative. See the [ADR index](../DECISIONS.md) for precedence,
 | Journal retention | on (D20) | Journal open (index rebuild) | < 2 000 ms (D20) |
 | Drain grace | 10 s (D24) | — | — |
 | `Expire` fan-out dispositions | `Parked`/`Free` only (D25) | `Expire` fan-out bucket (per recipient) | 32/s, burst 64 (D25) |
-| Provisional finalize deadline | 5 min (D27, proposed) | Provisional outstanding cap (per account) | 8 (D27, proposed) |
-| Provisional finalization sampling | 100%, not tunable (D27, proposed) | — | — |
+| Provisional finalize deadline | 5 min (D29, proposed) | Provisional outstanding cap (per account) | 8 (D29, proposed) |
+| Provisional finalization sampling | 100%, not tunable (D29, proposed) | — | — |
 
 The last row is added by [D20](0020-journal-retention.md). *Journal retention*
 is whether a node releases journal segments its checkpoints have made
@@ -63,7 +63,7 @@ construction, and `Deny{Parked}` on a subsequent claim is the authoritative
 answer.
 
 The three *provisional* parameters above are **proposed** by
-[D27](0027-low-population-path.md) and are not in force until that record is
+[D29](0029-low-population-path.md) and are not in force until that record is
 accepted. They govern the P5 low-population intent path only. *Finalize
 deadline* is the horizon after which an unfinalized provisional commit is
 annulled; it is chosen rather than measured, constrained from below by an
@@ -76,6 +76,6 @@ unfinalized provisional commits and therefore on value at risk; at the cap,
 further low-population intents from that account are refused rather than
 queued, which is what makes deadline expiry a fault indicator instead of a
 routine outcome. *Finalization sampling* is listed **so that it is not added as
-a dial later**: D27 fixes it at 1 because a low-population cell has no
+a dial later**: D29 fixes it at 1 because a low-population cell has no
 independent check to cover an unsampled residue, and any value below 1 is a
 farmable probability of an unexamined durable commit.

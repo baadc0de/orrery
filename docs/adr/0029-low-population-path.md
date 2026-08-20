@@ -1,6 +1,6 @@
-# ADR-0027: The P5 low-population path: quarantined provisional commit, mandatory spot replay, forward-written annulment
+# ADR-0029: The P5 low-population path: quarantined provisional commit, mandatory spot replay, forward-written annulment
 
-**Status:** Proposed · **Date:** 2026-08-20 · **Decision:** D27
+**Status:** Proposed · **Date:** 2026-08-20 · **Decision:** D29
 
 This decision is normative once accepted. See the [ADR index](../DECISIONS.md)
 for precedence, scope, and the complete decision set.
