@@ -53,6 +53,7 @@ entry point. Decisions live independently under [docs/adr/](docs/adr/):
 | D24 | [ADR-0024](docs/adr/0024-island-drain.md) | Island drain is peer-driven; no evacuation |
 | D25 | [ADR-0025](docs/adr/0025-expire-fan-out.md) | `Expire` fan-out set and bound |
 | D26 | [ADR-0026](docs/adr/0026-sibling-gateways.md) | Sibling gateways: ownership, reachability, live handover |
+| D29 | [ADR-0029](docs/adr/0029-low-population-path.md) | P5 low-population path: provisional commit, spot replay, annulment (Proposed) |
 
 After the applicable ADRs, use this expansion reading path:
 
