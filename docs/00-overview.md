@@ -2,7 +2,9 @@
 
 Orrery is a set of Rust crates for [Bevy](https://bevy.org) 0.19 that provides peer-to-peer multiplayer (QUIC with NAT hole punching via [iroh](https://github.com/n0-computer/iroh)), client-side prediction with rollback/reapply, witness-based trust, and a horizontally scalable, low-latency clustered persistence tier for very large persistent universes with strong spatial locality. This document is the entry point to the architecture doc set: what the system is, the five ideas that carry its weight, a full-system diagram, two end-to-end walkthroughs, and a glossary. Everything here is a summary; the numbered sibling docs carry the detail, and the accepted ADRs are the law.
 
-Normative source: the [ADR index](DECISIONS.md) and all [accepted ADRs](adr/) D1–D17 (this overview touches every decision; where wording differs, the applicable ADR wins).
+Normative source: the [ADR index](DECISIONS.md) and all [accepted ADRs](adr/)
+D1–D17 and D19 (D18 remains a reserved proposal; this overview touches every
+accepted decision, and where wording differs the applicable ADR wins).
 
 ## 1. What Orrery is — and is not
 

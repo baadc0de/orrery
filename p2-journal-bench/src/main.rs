@@ -272,7 +272,8 @@ mod waldb_store {
                 framed.clear();
                 framed.extend_from_slice(k);
                 framed.extend_from_slice(v);
-                self.wal
+                let _lsn = self
+                    .wal
                     .append(&framed)
                     .map_err(|e| format!("wal append: {e}"))?;
             }

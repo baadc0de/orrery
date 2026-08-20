@@ -16,9 +16,9 @@ per area, 60 Hz fast action — and it is a framework, not a game. Games supply 
 > it is built, but several headline properties are *targets that are currently
 > missed*, and they are named as such.
 
-**Normative source:** the [ADR index](docs/DECISIONS.md) and the 17
-[accepted ADRs](docs/adr/). The applicable ADRs govern this README and every
-numbered document.
+**Normative source:** the [ADR index](docs/DECISIONS.md) and the 18 accepted
+[ADRs](docs/adr/) (D1–D17 and D19; D18 remains a reserved proposal). The
+applicable ADRs govern this README and every numbered document.
 
 ---
 
@@ -30,7 +30,7 @@ Design is complete and accepted; implementation is active across P0–P4.
 |---|---|---|
 | **P0** | QUIC transport, NAT hole punching | Transport adapter vendored; NAT lab and dashboard tools present |
 | **P1** | Spatial model, replication, prediction | Gate holds — 32-peer swarm runs clean, impaired and witnessed |
-| **P2** | Persistence: cell actors, journal, FoundationDB | Durability holds. Indexed `journal-raw` is **gate-green (5/5)**; the Fjall backend currently landed on `main` remains red — see below |
+| **P2** | Persistence: cell actors, journal, FoundationDB | **Gate holds** — indexed `journal-raw` is the default and passed 5/5 full kill-9 runs |
 | **P3** | Per-entity authority and handoff | Gate holds — 8 peers, 400 entities, `kill -9`, every entity reassigned or parked inside the lease TTL |
 | **P4** | Verifiable core, witnessing | Built; witnessing runs in **shadow mode**. Enforcement is off until the false-positive rate is measured (D17 R-6) |
 | **P5–P6** | Intents, attestation, enforcement | Not started |
@@ -39,7 +39,7 @@ Two crates named in the design are **not yet present**: `orrery_identity` and
 `orrery_field_host`. The `orrery` name and crate prefix are provisional and
 mechanically replaceable.
 
-### P2 has a gate-green journal candidate; the landed backend is still red
+### The P2 gate holds with the indexed raw journal
 
 `scripts/p2-kill9-gate.sh` proves **durability** on every run — recovery
 verified against every pre-crash acknowledgement, zero leases lost, zero
@@ -56,10 +56,10 @@ All ten runs passed recovery verification.
 | Fjall | 0/5 | **40 ms** median [15, 75] | **3.856%** median | **1.580%** median |
 | indexed `journal-raw` | **5/5** | **1 ms** in every run | **0.009%** median | **0.000%** |
 
-This proves a passing journal implementation exists; it does **not** make the
-current `main` backend green. `main` still builds the Fjall journal, and neither
-the indexed implementation nor a dependency/default-backend decision has
-landed. Until that happens, running the gate from `main` exercises the red arm.
+The indexed implementation is now the default selected by
+[D19](docs/adr/0019-indexed-waldb-journal.md), pinned to wal-db 1.0.0. Fjall
+remains available behind the explicit, mutually exclusive `journal-fjall`
+fallback feature; it is no longer the shipping path.
 
 The Fjall root cause is its 100 ms-step write backpressure, not the device. The
 full investigation is [docs/08-persistence.md](docs/08-persistence.md)
@@ -110,12 +110,12 @@ These are the accepted design targets. They describe what the architecture is
 predict → witness → persist_client in dependency order, with `OrreryConfig`
 aggregating the per-plugin configs.
 
-**Persistence (P2).** Single-writer cell actors, adaptive group-commit journals
-on a dedicated OS thread, fencing and hotspot splits, checkpoint/restore and
-cold area reads, the iroh gateway, FDB-backed checkpoints and serializable
-intent execution, a TOML world seeder, and a static two-process chain topology
-where a write-serving primary asynchronously mirrors its journal to a passive
-gRPC follower.
+**Persistence (P2).** Single-writer cell actors, an indexed wal-db segmented
+journal with adaptive group commit on a dedicated OS thread, fencing and
+hotspot splits, checkpoint/restore and cold area reads, the iroh gateway,
+FDB-backed checkpoints and serializable intent execution, a TOML world seeder,
+and a static two-process chain topology where a write-serving primary
+asynchronously mirrors its journal to a passive gRPC follower.
 
 **Authority (P3).** Signed, transport-bound gateway admission; actor-owned
 durable lease rows; strict fenced bulk uplinks; lease-loss revocation. Authority
@@ -201,7 +201,7 @@ Start with the ADRs. They are normative; everything else expands on them.
 
 | # | Document | Covers |
 |---|---|---|
-| 1 | [DECISIONS.md](docs/DECISIONS.md) + [adr/](docs/adr/) | ADR index and the 17 accepted decisions. **Normative** |
+| 1 | [DECISIONS.md](docs/DECISIONS.md) + [adr/](docs/adr/) | ADR index and the 18 accepted decisions. **Normative** |
 | 2 | [00-overview.md](docs/00-overview.md) | Goals, constraints, system diagram, subsystem tour, glossary |
 | 3 | [01-spatial-model.md](docs/01-spatial-model.md) | Grid, `CellId`, `big_space`, AOI, hysteresis, hotspots |
 | 4 | [02-networking.md](docs/02-networking.md) | iroh, relays, islands, topology regimes, channels, budgets |

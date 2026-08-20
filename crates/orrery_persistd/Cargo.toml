@@ -6,24 +6,22 @@ description = "Orrery persistence cluster harness: cell actors, segmented journa
 license = "MIT OR Apache-2.0"
 
 # Bevy-free (D15). Library harness for the persistence cluster (docs/10-crates.md
-# §11). Slice 2 covers the single-writer cell-actor runtime and the fjall-backed
-# segmented append-only journal with adaptive group commit — testable in
-# isolation, no FoundationDB. Gateway, FDB checkpoint/restore, chain replication,
-# and the Ruleset-linked intent/adjudication paths land in later slices.
+# §11). The default journal is the indexed wal-db-backed segmented log selected
+# by D19; Fjall remains available as an explicit fallback feature.
 [features]
-default = ["journal-fjall", "chain-grpc"]
-# Journal backing store. `journal-fjall` (default) uses fjall 3.x as a keyed
-# append-only log; `journal-raw` (planned) will use raw 128 MiB segment files
-# with a sparse footer index (docs/08-persistence.md §4). Only one may be set.
+default = ["journal-raw", "chain-grpc"]
+# Journal backing store. `journal-raw` (default, D19) uses wal-db's segmented
+# durable log plus Orrery's rebuilt in-memory indexes. `journal-fjall` retains
+# the previous Fjall implementation as an explicit fallback. Only one may be set.
 journal-fjall = ["dep:fjall"]
-journal-raw = []
+journal-raw = ["dep:wal-db"]
 # Chain replication of the journal to one async follower (D11, RPO ≤ ~100 ms).
 # Implemented in `journal::chain`; this feature is a placeholder for future
 # transport options (tonic/gRPC per D12). The in-process transport is always
 # available.
 chain-replication = []
-# Cross-process chain transport. Durable storage remains in the fjall journal;
-# these dependencies only provide HTTP/2 framing and protobuf encoding.
+# Cross-process chain transport. These dependencies only provide HTTP/2 framing
+# and protobuf encoding; durable storage remains in the selected journal.
 chain-grpc = ["dep:hyper", "dep:hyper-util", "dep:prost", "dep:tonic"]
 # FoundationDB checkpoint/restore store (slice 3). Enables `FdbCheckpointStore`
 # and links the C client (`libfdb_c`). Tests that need a live cluster are
@@ -52,11 +50,17 @@ glam = { workspace = true }
 hyper = { workspace = true, optional = true }
 hyper-util = { workspace = true, optional = true }
 fjall = { version = "3.1", features = ["bytes_1"], optional = true }
+wal-db = { version = "=1.0.0", optional = true }
 # FoundationDB 7.3.x system-of-record (D11, D14). Optional: only built when the
 # `fdb` feature is on (requires the C client at link time).
 foundationdb = { version = "0.11", default-features = false, features = ["fdb-7_3"], optional = true }
 prost = { version = "0.14.3", default-features = false, features = ["std"], optional = true }
 tonic = { version = "0.14.6", default-features = false, features = ["codegen"], optional = true }
+
+[[bin]]
+name = "persistd"
+path = "src/bin/persistd.rs"
+required-features = ["chain-grpc"]
 
 [[bench]]
 name = "journal_latency"

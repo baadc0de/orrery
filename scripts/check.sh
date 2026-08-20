@@ -185,6 +185,13 @@ lane_clippy() {
     run cargo clippy -p orrery_persistd -p orrery_seed --all-targets --no-deps \
         --features orrery_persistd/fdb,orrery_seed/fdb \
         -- -D warnings
+
+    # D19 keeps Fjall as a mutually exclusive fallback. The workspace command
+    # exercises the default raw backend; this invocation prevents the fallback
+    # from becoming compile-only archaeology behind an unvisited feature.
+    run cargo clippy -p orrery_persistd --all-targets --no-deps \
+        --no-default-features --features journal-fjall,chain-grpc \
+        -- -D warnings
 }
 
 # ci.yml `gates`, verbatim: the static gates, every harness self-test in
@@ -348,6 +355,13 @@ lane_test() {
         --exclude bevy_replicon \
         --exclude aeronet_iroh \
         --exclude aeronet_tokio_runtime
+
+    # The workspace test above is D19's default indexed raw journal. Exercise
+    # the retained Fjall implementation's unit tests as well; clippy compiles
+    # all fallback targets above. Its full integration suite retains Fjall's
+    # known shutdown-hang exposure and is not a second shipping-path gate.
+    run cargo test -p orrery_persistd --lib \
+        --no-default-features --features journal-fjall,chain-grpc
 }
 
 # Not a CI lane: CI clears `RUSTC_WRAPPER` for GitHub-hosted runners, which are
@@ -489,6 +503,15 @@ self_test() {
     else
         note 'self-test: no .github/workflows/ci.yml here; skipped the delegation clause'
     fi
+
+    # D19 retains Fjall as a real fallback, not dead source. Both the clippy
+    # and test lanes must name its mutually exclusive feature set explicitly;
+    # the default workspace commands cover journal-raw.
+    grep -Fq 'journal-fjall,chain-grpc' <(sed -n '/^lane_clippy() {/,/^}/p' "$0") \
+        || die 'self-test: the clippy lane no longer checks D19 journal-fjall fallback'
+    grep -Fq 'journal-fjall,chain-grpc' <(sed -n '/^lane_test() {/,/^}/p' "$0") \
+        || die 'self-test: the test lane no longer exercises D19 journal-fjall fallback'
+    note 'self-test: both D19 journal backends are covered by clippy and tests'
 
     # ── Coverage: every --self-test in scripts/ is invoked by a lane ──────────
     #

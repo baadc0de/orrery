@@ -45,6 +45,7 @@ entry point. Decisions live independently under [docs/adr/](docs/adr/):
 | D15 | [ADR-0015](docs/adr/0015-crate-set.md) | Crate set |
 | D16 | [ADR-0016](docs/adr/0016-parameter-reference.md) | Parameter defaults |
 | D17 | [ADR-0017](docs/adr/0017-risks-and-open-questions.md) | Risks and open questions |
+| D19 | [ADR-0019](docs/adr/0019-indexed-waldb-journal.md) | Indexed wal-db journal default |
 
 After the applicable ADRs, use this expansion reading path:
 
@@ -198,17 +199,23 @@ queue, not merely share.
 Five things about the workflow itself are worth knowing before you change
 anything it touches.
 
-**`clippy` is enforced at `-D warnings`, over two feature sets.** The default
-build and the `fdb` build compile different code, and the `fdb` half went
+**`clippy` is enforced at `-D warnings`, over three feature sets.** The default
+indexed-raw build, the `fdb` build, and D19's explicit Fjall fallback compile
+different code, and the `fdb` half once went
 unlinted long enough for `orrery_seed/tests/fdb_gates.rs` to stop compiling
-altogether. Both are gated now. `clippy` needs only metadata, so the `fdb` pass
+altogether. All three are gated now. `clippy` needs only metadata, so the `fdb` pass
 runs with no `libfdb_c` on the runner. Vendored crates under `vendor/` are
 excluded — their findings are upstream's to fix — and the run passes
 `--no-deps`, without which `--exclude` does not actually spare them: they are
 still path dependencies, and clippy lints those too. The workspace test job
-excludes the same three: `bevy_replicon`'s own tests and doctests do not compile
-under this workspace's feature unification, because `bevy/serialize` is off and
-they need `Transform: Serialize`.
+excludes the same three, then runs `orrery_persistd`'s library tests once more
+with `--no-default-features --features journal-fjall,chain-grpc`: the default
+suite covers raw, clippy compiles every fallback target, and the Fjall unit
+tests are not allowed to rot. The full fallback integration suite is not run a
+second time because it retains Fjall's known shutdown-hang exposure.
+`bevy_replicon`'s own tests and doctests do not compile under this workspace's
+feature unification, because `bevy/serialize` is off and they need
+`Transform: Serialize`.
 
 One thing to know while you are in there: **`[workspace.lints]` still reaches
 only the vendored crates.** `vendor/aeronet_iroh`, `vendor/aeronet_tokio_runtime`

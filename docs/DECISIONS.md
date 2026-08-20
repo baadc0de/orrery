@@ -33,6 +33,7 @@ their linked dependencies.
 | D15 | [ADR-0015](adr/0015-crate-set.md) | Crate set and dependency spine |
 | D16 | [ADR-0016](adr/0016-parameter-reference.md) | Default parameter reference |
 | D17 | [ADR-0017](adr/0017-risks-and-open-questions.md) | Known risks and open questions |
+| D19 | [ADR-0019](adr/0019-indexed-waldb-journal.md) | Indexed wal-db journal default |
 
 ## Status and supersession
 
@@ -44,13 +45,13 @@ implicit conflict precedence.
 
 D18 is reserved only as a proposal in
 [ADR-0017](adr/0017-risks-and-open-questions.md); it is not accepted and has no
-ADR file.
+ADR file. D19 deliberately follows that reserved gap.
 
 ## Document map
 
 | Document | Primary ADRs | Covers |
 |---|---|---|
-| [00-overview.md](00-overview.md) | D1–D17 | Goals, constraints, system diagram, subsystem tour, glossary |
+| [00-overview.md](00-overview.md) | D1–D17, D19 | Goals, constraints, system diagram, subsystem tour, glossary |
 | [01-spatial-model.md](01-spatial-model.md) | D5 | Grid, CellId, big_space, AOI, hysteresis, hotspots, nested grids |
 | [02-networking.md](02-networking.md) | D3, D6 | iroh, relays, islands, topology regimes, channels, budgets |
 | [03-replication.md](03-replication.md) | D4, D8 | Replicon/lightyear stack, interest sets, delta compression, priority |
@@ -58,11 +59,11 @@ ADR file.
 | [05-prediction-rollback.md](05-prediction-rollback.md) | D8 | Timelines, prediction sets, reconciliation, interpolation, hits |
 | [06-verifiable-core.md](06-verifiable-core.md) | D9 | Ruleset, determinism scoping, logs, replay harness |
 | [07-witnessing.md](07-witnessing.md) | D10 | Threat model, discrepancy protocol, adjudication, strikes |
-| [08-persistence.md](08-persistence.md) | D11 | Cell actors, journal, FDB schema, intents, terrain, event archive |
+| [08-persistence.md](08-persistence.md) | D11, D19 | Cell actors, journal, FDB schema, intents, terrain, event archive |
 | [09-services-and-ops.md](09-services-and-ops.md) | D12 | Service inventory, deployment, scaling, failure modes, telemetry |
-| [10-crates.md](10-crates.md) | D15 | Workspace, per-crate API sketches, dependency graph |
-| [11-roadmap.md](11-roadmap.md) | D17 | Build phases, milestones, risks |
+| [10-crates.md](10-crates.md) | D15, D19 | Workspace, per-crate API sketches, dependency graph |
+| [11-roadmap.md](11-roadmap.md) | D17, D19 | Build phases, milestones, risks |
 | [12-world-seeding.md](12-world-seeding.md) | D11 | World seeding, deterministic generation, content diff and patch |
 | [13-chain-replication.md](13-chain-replication.md) | D11, D12 | Cross-process journal mirroring and recovery |
-| [14-capacity.md](14-capacity.md) | D11, D12, D16 | Measured single-box capacity envelope: the knee, what binds first, entities and players |
-| [references.md](references.md) | D1–D17 | Annotated bibliography |
+| [14-capacity.md](14-capacity.md) | D11, D12, D16, D19 | Measured single-box capacity envelope: the knee, what binds first, entities and players |
+| [references.md](references.md) | D1–D17, D19 | Annotated bibliography |

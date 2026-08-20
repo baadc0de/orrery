@@ -81,7 +81,11 @@ The harness runs the shipping plugins; only the socket is stood in for, by an in
 
 **Goal.** The "really really fast" tier (D11): cell actors, journal, FoundationDB checkpoints, area load — proven against synthetic load before real gameplay needs it. Starts during P1 (depends only on `orrery_protocol`).
 
-**Crates.** `orrery_persistd` (gateway, cell actors, segmented journal on fjall 3.x or raw segments, FDB checkpoint/restore), `orrery_persist_client` (gateway session, diff uplink scheduler at 1–4 Hz per entity, area load/subscribe), `orrery_protocol` (intent, journal-record, checkpoint types).
+**Crates.** `orrery_persistd` (gateway, cell actors, indexed wal-db segmented
+journal by default under D19, Fjall fallback, FDB checkpoint/restore),
+`orrery_persist_client` (gateway session, diff uplink scheduler at 1–4 Hz per
+entity, area load/subscribe), `orrery_protocol` (intent, journal-record,
+checkpoint types).
 
 **Deliverables.**
 - Single-writer cell actor runtime with rendezvous-hash placement over shard cells (8×8×8 interest cells per shard).
@@ -95,8 +99,8 @@ The harness runs the shipping plugins; only the socket is stood in for, by an in
 
 **Demo criterion.** With 10k entities across 100+ cells under synthetic load: `kill -9` the entire cluster, restart it, and the world resumes — zero acked intents lost (RPO 0), bulk loss bounded by the journal/replication window, clients (netsplit posture, D12) having queued intents and continued simulating. Measured against D16 targets in-region: journal commit < 2 ms server-internal, client-observed bulk ack p99 < 5 ms, intent commit p99 < 10 ms, area first page-in < 50 ms.
 
-**Where the demo criterion stands — candidate green, landed default red
-(2026-08-20).** The indexed `journal-raw` implementation cleared the complete
+**Where the demo criterion stands — passed (2026-08-20).** The indexed
+`journal-raw` implementation cleared the complete
 full-duration kill-9 gate in **5 of 5** runs on the same qualified
 `c4d-standard-32-lssd` local-NVMe shape used for the paired Fjall control;
 Fjall cleared **0 of 5**. `journal_commit_ms` p99 was 1 ms in every indexed
@@ -105,13 +109,12 @@ inside their D16 budgets. All ten runs passed recovery verification, with
 540,640–541,256 durable acknowledgements per run, zero leases lost, zero diff
 nacks and zero duplicate durable acknowledgements.
 
-That establishes a gate-green implementation of the P2 criterion. It is not an
-unqualified pass for the current tree: `main` still builds the Fjall journal,
-and neither the indexed implementation nor the D11/D14 dependency and
-default-backend decision has landed. The precise state is therefore **indexed
-candidate green; landed default red**. The paired evidence and its
-mutation-checked report are in
-[spikes/journal-raw-waldb.md](spikes/journal-raw-waldb.md) §9.
+That establishes the P2 criterion and D19 makes the indexed implementation the
+default, with Fjall retained only as an explicit fallback feature. The paired
+evidence and its mutation-checked report are in
+[spikes/journal-raw-waldb.md](spikes/journal-raw-waldb.md) §9; the accepted
+default-backend decision and its maturity tradeoff are in
+[ADR-0019](adr/0019-indexed-waldb-journal.md).
 
 **Historical Fjall baseline, re-measured on the phased rig (2026-08-19).**
 `p2-load` phases each session's lease renewal across the period by default
@@ -245,7 +248,7 @@ settled independently inside a single change.
 | **C-3** | **`world/` values over 100 KB are a hard error, not a split row.** | → [08-persistence.md](08-persistence.md) §6. The reader identifies a row by exact key length; a suffixed row would be invisible to `load` and `read_cold`. |
 | **C-4** | **The manifest's `value_digest` covers the component bag only**, excluding the storage value's live/tombstone tag byte. | → [12-world-seeding.md](12-world-seeding.md) §9.3. One decision with three consumers; if they disagree, gate A4 fails for a reason nobody can localize. |
 | **C-5** | **`--profile <name>` selects an in-file `[profile.<name>]` overlay; the five ladder rungs are separate scenario files.** `apply --profile demo` therefore names a scenario file too, and `scenarios/p2demo.toml` ships with a baseline `[profile.demo]` and a 1000×-smaller `[profile.ci]`. | [12-world-seeding.md](12-world-seeding.md) §13.2 calls `apply --profile demo` "the entire P2 demo runbook line" while §5.2 defines `[profile.<name>]` as a file-local overlay. Binding profiles to files rather than to a global rung table keeps the ladder extensible without a registry, at the cost of one extra argument on the runbook line. |
-| **C-6** | **`orrery_seed` depends on `orrery_persistd` with default features**, linking fjall and iroh into a batch tool. | → [12-world-seeding.md](12-world-seeding.md) §4. A knowing deviation from that section's own rationale; costs build time, not correctness. Revisit at P3. |
+| **C-6** | **`orrery_seed` depends on `orrery_persistd` with default features**, originally linking Fjall and iroh into a batch tool; D19 changes the journal dependency to wal-db. | → [12-world-seeding.md](12-world-seeding.md) §4. A knowing deviation from that section's own rationale; costs build time, not correctness. Revisit at P3. |
 | **C-8** | **`actor/{shard}` fence rows are NOT grid-scoped, and that is now a known gap.** The key is `b'a' ‖ shard(8)` — 9 bytes, no `GridId` — while `world/`, `ckpt/` and `chunk/` all carry one. | Found 2026-08-13 by the seeder's `wipe` guard refusing on 8 fence rows another crate's tests had left in the shared dev cluster. Two consequences. **Correctness:** D11 §6 calls `cell_id` grid-relative, which is exactly why P-7 grid-scoped the other families; leaving `actor/` unscoped means a nested grid's shard fences against the root grid's row for the identical cell id — two different shards sharing one fencing token. **Operationally:** the seeder's §11.4 offline-mode precondition ("refuse when any `actor/{shard}` row in range is live") cannot be scoped to the grid being wiped, so unrelated residue blocks it. **Blocking, not deferred** (revised same day): running `cargo test` over `orrery_persistd` and `orrery_seed` *together* — which CI and the P2 demo runbook both must — leaves 8 fence rows from the persistd split tests that then block every seeder gate's pre-wipe. The suites pass separately and fail combined. **Fixed** (`e6a9a17`): the key is now `b'a' ‖ grid(4) ‖ shard(8)` (13 B), threaded through the `FenceStore` trait, the FDB store, the runtime, the scheduler and the seeder's wipe guard — which also had to stop deriving its grid set from every *declared* grid and use the grids its emits actually realize into, since guarding (and clearing) a grid the scenario never wrote is wrong twice over. The whole workspace now passes in one command: 301 tests across all four packages with both fdb features, twice consecutively, 0 skipped. |
 | **C-7** | **Gate A8 is restated** as a skew-reproduction and watermark-size regression guard. | → [12-world-seeding.md](12-world-seeding.md) §14. The gate as written self-destructed when P-8 was fixed. |
 

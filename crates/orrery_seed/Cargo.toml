@@ -19,9 +19,9 @@ fdb = ["dep:foundationdb", "orrery_persistd/fdb"]
 
 [dependencies]
 orrery_protocol = { path = "../orrery_protocol" }
-# Default features per P2 decision C-6 (docs/11-roadmap.md §P2): fjall and iroh
-# link into the batch tool — a knowing deviation recorded in docs/12 §4. Only
-# the `keyspace` module shapes are consumed today.
+# Default features per P2 decision C-6 and D19: wal-db and iroh link into the
+# batch tool — a knowing deviation recorded in docs/12 §4. Only the `keyspace`
+# module shapes are consumed today.
 orrery_persistd = { path = "../orrery_persistd" }
 toml = "1.1"
 serde = { workspace = true }

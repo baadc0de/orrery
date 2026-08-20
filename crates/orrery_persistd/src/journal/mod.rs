@@ -9,9 +9,17 @@
 pub mod chain;
 #[cfg(feature = "chain-grpc")]
 pub mod chain_grpc;
+#[cfg(feature = "journal-fjall")]
 pub mod fjall;
 mod group_commit;
 mod metrics;
+#[cfg(feature = "journal-raw")]
+pub mod raw;
+
+#[cfg(all(feature = "journal-fjall", feature = "journal-raw"))]
+compile_error!("journal-fjall and journal-raw are mutually exclusive");
+#[cfg(not(any(feature = "journal-fjall", feature = "journal-raw")))]
+compile_error!("one journal backend feature must be enabled");
 
 use orrery_protocol::JournalRecord;
 use orrery_protocol::Lsn;
@@ -24,12 +32,15 @@ pub use chain::{
 };
 #[cfg(feature = "chain-grpc")]
 pub use chain_grpc::{spawn_chain_grpc, ChainGrpcServer, DurableChainId, GrpcChainTransport};
+#[cfg(feature = "journal-fjall")]
 pub use fjall::Journal;
 pub use group_commit::{AdaptiveCommitMode, GroupCommitConfig};
 pub use metrics::{
     JournalCommitMetrics, JournalCommitSample, JournalCommitSnapshot, JournalStageSnapshot,
     SLOW_SYNC_THRESHOLD_US,
 };
+#[cfg(feature = "journal-raw")]
+pub use raw::Journal;
 
 /// Configuration for a node's [`Journal`].
 #[derive(Debug, Clone)]

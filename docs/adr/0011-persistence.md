@@ -1,6 +1,8 @@
 # ADR-0011: Persistence: in-memory cell actors + journal, FoundationDB system of record
 
-**Status:** Accepted · **Date:** 2026-08-11 · **Decision:** D11
+**Status:** Accepted; local journal-engine choice superseded by
+[ADR-0019](0019-indexed-waldb-journal.md) · **Date:** 2026-08-11 ·
+**Decision:** D11
 
 This decision is normative. See the [ADR index](../DECISIONS.md) for precedence, scope, and the complete decision set.
 
@@ -21,4 +23,3 @@ This decision is normative. See the [ADR index](../DECISIONS.md) for precedence,
 - **Area load:** client enters an area → gateway serves the 27-cell neighborhood via FDB range scans + live actor deltas, streamed nearest-first; **< 50 ms to first page-in** target.
 
 **Rejected:** ScyllaDB as primary (best raw write throughput, superb Rust driver — but LWTs are the wrong trade-safety tool; runner-up if sustained writes exceed a modest FDB cluster); building a general replicated store on openraft (pre-1.0, chaos-testing incomplete; FDB's own lesson: the simulator is the hard part — our custom layer stays *thin and single-purpose*); Redis/Valkey/Dragonfly as record store (async replication loses acked writes); Aerospike (CE caps kill "very large"); TiKV (client officially non-production); sled (stalled). Local engine for journal/staging: **fjall 3.x** (active, pure Rust) or raw segmented logs; not RocksDB unless profiling demands it.
-
