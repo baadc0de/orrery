@@ -1,0 +1,61 @@
+{
+  "measured_utc": {
+    "fio": "2026-08-20T08:26:51Z",
+    "gate_start": "2026-08-20T08:40:13Z",
+    "gate_end": "2026-08-20T08:49:16Z"
+  },
+  "tree": "e5906c5c176bc169ae7813c96069cb1ff96a437f",
+  "source_archive_sha256": "39a9d20c6c517d98bad69effc46e9d1f0ff20c293925963cf6adf9b7bca15ff8",
+  "host": {
+    "provider": "gcp",
+    "instance": "orrery-nvme-lab",
+    "machine_type": "c4d-standard-32-lssd",
+    "zone": "us-central1-b",
+    "vcpu": 32,
+    "os": "Debian 13",
+    "rustc": "1.96.0 (ac68faa20 2026-05-25)",
+    "foundationdb": "7.3.77",
+    "nvme": "/dev/nvme0n1, 402653184000 bytes, ext4 rw,noatime, write through",
+    "evidence": "/dev/shm tmpfs",
+    "fdb_placement": "/mnt/nvme on the same local NVMe; keyspace cleared before every arm"
+  },
+  "binaries_sha256": {
+    "persistd_fjall": "4a74deaccd35fa06812d9c727bfa2b309f3f1ce4077f4a30911505b8fe8e2d41",
+    "persistd_raw": "a2a28bf8351fa68a97c289fe3f77b04f2b3ee0e9f6139496205af7eba44170d0",
+    "p2_load": "f7bf1fd5af82362448cf289be3ae108076cc85ef986caf883c2c2181e4cdd8ab",
+    "p2_dashboard": "64dc317533adbf46acc5b69d49403585265eb280ad0069faf1e1233b375611ec",
+    "orrery_seed": "9156189a2f6c6518f3907335b0b79a6be7bdbba612bfc344221cf20fa8268d7c"
+  },
+  "fio": {
+    "version": "fio-3.39",
+    "command": "fio --name=jobA --directory=/mnt/nvme/fio-job-a --rw=write --bs=8k --fdatasync=1 --numjobs=2 --rate_iops=470 --runtime=120 --time_based --size=256m --output-format=json",
+    "qualification": "pass: each job sustained 470 IOPS and the maximum fdatasync latency was below 1 ms",
+    "jobs": [
+      {
+        "iops": 470.004417,
+        "sync_p99_ms": 0.166912,
+        "sync_p99_9_ms": 0.248832,
+        "sync_max_ms": 0.417715
+      },
+      {
+        "iops": 470.0005,
+        "sync_p99_ms": 0.185344,
+        "sync_p99_9_ms": 0.27648,
+        "sync_max_ms": 0.509102
+      }
+    ]
+  },
+  "gate": {
+    "script": "scripts/p2-kill9-gate.sh",
+    "duration_seconds": 30,
+    "pairs": 5,
+    "order": [
+      ["fjall", "raw"],
+      ["raw", "fjall"],
+      ["fjall", "raw"],
+      ["raw", "fjall"],
+      ["fjall", "raw"]
+    ],
+    "backend_difference": "the persistd binary's journal feature only; load generator, dashboard, seeder, scenario, FDB cluster, host and filesystem were identical"
+  }
+}

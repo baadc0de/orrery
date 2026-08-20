@@ -321,3 +321,37 @@ fixed upstream and the journal left alone.
 | Report + self-test pattern | `scripts/p2-barrier-shape-report.py` | The shape Phase 4's report must follow |
 | Journal placement knob | `P2_GATE_DATA_DIR` | Separating evidence from journal; **not** a fix |
 | Memtable knob (fjall arm only) | `ORRERY_JOURNAL_MEMTABLE_BYTES` | Moving fjall's rotation cadence; unset = 64 MiB default |
+
+---
+
+## 9. Phase 4 measurement — 2026-08-20
+
+Phase 4 ran on the same ephemeral GCP shape used for §4.4–§4.8:
+`c4d-standard-32-lssd` in `us-central1-b`, with the journal on a write-through
+local NVMe mounted ext4 `noatime`, gate evidence on tmpfs, and FoundationDB
+7.3.77 on the NVMe. The exact two-job `fio` qualification sustained **940.0
+barriers/s** in aggregate, with **0.185 ms p99** and **0.509 ms maximum**, so
+the host cleared this brief's `< 1 ms` maximum requirement.
+
+Five full-duration pairs then ran through `scripts/p2-kill9-gate.sh`, with arm
+order alternating per pair. These are the headline medians; brackets are the
+five-run range for p99 and the worst observed maximum for the sync column:
+
+| backend | gate passes | `journal_commit_ms` p99 | commits > 2 ms | commits > 15 ms | sync maximum | median on-disk bytes |
+|---|---:|---:|---:|---:|---:|---:|
+| fjall | 0 / 5 | **40 ms** [15, 75] | **3.856 %** | **1.580 %** | 97.488 ms [191.969] | 896,138,100 |
+| indexed `journal-raw` | **5 / 5** | **1 ms** [1, 1] | **0.009 %** | **0.000 %** | 2.290 ms [2.343] | 781,193,686 |
+
+All ten runs passed recovery verification. Each produced 540,640–541,256
+durable acknowledgements, with zero leases lost, zero diff nacks and zero
+duplicate durable acknowledgements. The p99 values are bounded-histogram
+bucket upper bounds; the tail percentages come from the same versioned
+histograms rather than from interpolation.
+
+Every number above is derived by
+`scripts/p2-journal-raw-report.py` from
+`docs/data/p2-journal-raw-2026-08-20.jsonl` and
+`docs/data/p2-journal-raw-device-2026-08-20.json`. Its `--self-test` is wired
+into `scripts/check.sh` and mutation-checks every guarded class of evidence.
+This section records a measurement only: it makes no dependency or
+default-backend decision.

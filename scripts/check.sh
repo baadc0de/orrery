@@ -316,6 +316,12 @@ lane_gates() {
     # footprint is recorded, because that gap IS its no-index caveat.
     run scripts/p2-journal-store-report.py --self-test
 
+    # The journal-raw spike's indexed, gate-level comparison. Its self-test
+    # pins the qualified device, five alternating pairs, every crash/recovery
+    # proof, tail mass and on-disk work; it also mutation-checks each class of
+    # guarded fact so a vacuous clause cannot bless a flattering edit.
+    run scripts/p2-journal-raw-report.py --self-test
+
     # And this script's own, which nothing ran either: ci.yml calls the four
     # lanes and never `--self-test`, so the lane table's agreement with the tree
     # — and, now, the coverage clause below — were checked only when a human
