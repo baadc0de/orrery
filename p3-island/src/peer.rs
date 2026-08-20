@@ -10,8 +10,8 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use orrery_protocol::{
-    CellId, ClaimBasis, ClaimId, ClaimKind, GatewayMsg, GatewayReply, GridId, LeaseId, LeaseMsg,
-    PersistId, RecordKind, SeqPair, Tick,
+    CellId, ClaimBasis, ClaimId, ClaimKind, CoordMsg, GatewayMsg, GatewayReply, GridId, LeaseId,
+    LeaseMsg, PersistId, RecordKind, SeqPair, Tick,
 };
 
 use crate::wire::Session;
@@ -79,6 +79,13 @@ pub enum PeerEvent {
         disposition: String,
         at_ms: u64,
     },
+    /// The coordinator's advisory order after this peer left the island.
+    ///
+    /// The harness records it with [`orrery_coordinator::CoordinatorClient::recv`]
+    /// rather than inferring delivery from its own departure request. D24 makes
+    /// the order advisory, so this is evidence about the path, never a reason
+    /// for the drain verdict to pass or fail.
+    DrainOrder { island: u64, deadline: u64 },
     /// The peer finished its run cleanly.
     Done { held: usize },
 }
@@ -96,6 +103,13 @@ pub struct PeerConfig {
     /// which is how the harness exercises parking.
     pub kind: ClaimKind,
     pub duration: Duration,
+    /// A file the orchestrator creates once the kill-9 criterion has settled.
+    pub drain_signal: std::path::PathBuf,
+    /// A different presence cell, so reporting it leaves the tested island
+    /// while preserving the coordinator session long enough to receive `Drain`.
+    pub drain_destination: CellId,
+    /// The observation window for coordinator orders before graceful leave.
+    pub drain_order_observation: Duration,
     pub log: std::path::PathBuf,
 }
 
@@ -226,9 +240,11 @@ pub async fn run(config: PeerConfig) -> Result<()> {
     let started = tokio::time::Instant::now();
     let mut uplink = tokio::time::interval(UPLINK_INTERVAL);
     let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
+    let mut drain_poll = tokio::time::interval(Duration::from_millis(50));
     // The first tick of a tokio interval fires immediately; the heartbeat
     // should not race the claims that just landed.
     heartbeat.tick().await;
+    drain_poll.tick().await;
 
     loop {
         if started.elapsed() >= config.duration {
@@ -267,6 +283,35 @@ pub async fn run(config: PeerConfig) -> Result<()> {
                     })?;
                 }
             }
+            _ = drain_poll.tick(), if config.drain_signal.exists() => {
+                // Reporting another cell is the graceful "leave island" shape:
+                // the coordinator can retire the old island and still has this
+                // session to notify. It deliberately does not make the gateway
+                // release anything. D24's backstop is the session teardown
+                // below (and, if that is lost, the registrar's expiry sweep),
+                // not delivery of this advisory datagram.
+                coordinator
+                    .report_presence(vec![config.drain_destination])
+                    .map_err(|error| anyhow::anyhow!("drain departure presence: {error}"))?;
+
+                let deadline = tokio::time::Instant::now() + config.drain_order_observation;
+                loop {
+                    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                    if remaining.is_zero() {
+                        break;
+                    }
+                    let Some(message) = coordinator.recv(remaining).await else {
+                        break;
+                    };
+                    if let CoordMsg::Drain { island, deadline } = message {
+                        emit(&PeerEvent::DrainOrder {
+                            island: island.0,
+                            deadline,
+                        });
+                    }
+                }
+                break;
+            }
             reply = session.recv(Duration::from_millis(100)) => {
                 if let Some(reply) = reply {
                     apply_unsolicited(reply, &mut held, &mut emit);
@@ -279,7 +324,7 @@ pub async fn run(config: PeerConfig) -> Result<()> {
     // Keep the coordinator session alive to here: a peer that vanished from
     // the island roster while still holding leases would be a different
     // scenario than the one under test.
-    drop(coordinator);
+    coordinator.leave().await;
     Ok(())
 }
 

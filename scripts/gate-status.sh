@@ -319,7 +319,10 @@ gate_p3_island_evidence() {
       lost: (.lost | length),
       settled_in_ms, settle_budget_ms, lease_ttl_ms,
       reassigned_in_ms, parked_observed_in_ms,
-      duplicate_authority, survivor_leases_lost
+      duplicate_authority, survivor_leases_lost,
+      drain_orders_by_peer, drain_orders_observed,
+      drain_entities_parked, drain_expected_parked, drain_settled,
+      drain_settled_in_ms, drain_settle_budget_ms, drain_passed
     } | with_entries(select(.value != null)) | with_entries(.key |= ($leg + "_" + .))' \
       "$dir/report.json" 2>/dev/null || echo '{}')
     numbers=$(jq -cs 'add' <<<"$numbers
@@ -1103,14 +1106,22 @@ EOF
           parked_and_reserved: 0, claimable_after_settle: 0,
           unreachable_after_settle: 0, refused_after_settle: [], lost: [],
           settled_in_ms: 9938, settle_budget_ms: 12050, lease_ttl_ms: 10000,
-          duplicate_authority: 0, survivor_leases_lost: 0}' \
+          duplicate_authority: 0, survivor_leases_lost: 0,
+          drain_orders_by_peer: {"1": [], "2": [], "3": [], "4": [], "5": [], "6": [], "7": [{island: 1, deadline: 10000}]},
+          drain_orders_observed: 1, drain_entities_parked: 400, drain_settled: true,
+          drain_expected_parked: 400, drain_settled_in_ms: 1050,
+          drain_settle_budget_ms: 12050, drain_passed: true}' \
     >"$dir/out/p3-island-weak-20260101T000000Z/report.json"
   jq -n '{peers: 8, entities_total: 400, victim_entities: 50,
           victim_claim_kind: "Strong", reassigned: 0, parked: 50, successors: 0,
           parked_and_reserved: 50, claimable_after_settle: 0,
           unreachable_after_settle: 0, refused_after_settle: [], lost: [],
           settled_in_ms: 10700, settle_budget_ms: 12050, lease_ttl_ms: 10000,
-          duplicate_authority: 0, survivor_leases_lost: 0}' \
+          duplicate_authority: 0, survivor_leases_lost: 0,
+          drain_orders_by_peer: {"1": [], "2": [], "3": [], "4": [], "5": [], "6": [], "7": [{island: 2, deadline: 10000}]},
+          drain_orders_observed: 1, drain_entities_parked: 350, drain_settled: true,
+          drain_expected_parked: 350, drain_settled_in_ms: 1050,
+          drain_settle_budget_ms: 12050, drain_passed: true}' \
     >"$dir/out/p3-island-strong-20260101T000100Z/report.json"
   touch "$dir/out/p3-island-weak-20260101T000000Z/PASSED" \
         "$dir/out/p3-island-strong-20260101T000100Z/PASSED"
@@ -1126,6 +1137,10 @@ EOF
     || die 'self-test: the weak leg vanished from the island row; the newest run is not the only leg'
   grep -q 'strong_parked_and_reserved=50' <<<"$both_legs" \
     || die "self-test: the strong leg's parked-and-reserved count is not read out of its report; it is the number #129 was about"
+  grep -q 'strong_drain_entities_parked=350' <<<"$both_legs" \
+    || die 'self-test: the drain parking count was not read from the island report'
+  grep -q 'strong_drain_orders_by_peer=' <<<"$both_legs" \
+    || die 'self-test: per-peer drain-order observations were not read from the island report'
   grep -qE '^  PASSED +nightly:p3-island' <<<"$both_legs" \
     || die 'self-test: two passing island legs were not reported as a pass'
   # And one failing leg is a failing gate, however green the other one is.

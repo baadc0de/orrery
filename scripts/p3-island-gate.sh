@@ -78,6 +78,12 @@ if [[ ${1:-} == --self-test ]]; then
   runs P3_ISLAND_BIN '--duration-secs' || die 'self-test: run duration absent'
   runs P3_ISLAND_BIN '--metrics-jsonl' || die 'self-test: duplicate-authority and disposition read absent'
   runs P3_ISLAND_BIN '--victim-claim-kind' || die 'self-test: victim claim tier not selectable'
+  # The post-kill drain is a separate proof leg. These checks are against the
+  # harness invocation alone: finding either spelling elsewhere in this body
+  # would not prove the process that produces report.json ever ran the leg.
+  runs P3_ISLAND_BIN '--drain \' || die 'self-test: island drain leg absent'
+  runs P3_ISLAND_BIN '--drain-order-observation-ms "$DRAIN_ORDER_OBSERVATION_MS"' \
+    || die 'self-test: drain-order observation window absent'
 
   # A proof harness is only a proof if its verdict is load-bearing: the gate
   # must die on a non-zero harness exit, and the success artifact must be
@@ -98,6 +104,11 @@ done
 PEERS=${P3_PEERS:-8}
 ENTITIES_PER_PEER=${P3_ENTITIES_PER_PEER:-50}
 DURATION_SECS=${P3_DURATION_SECS:-30}
+# The coordinator order is advisory (D24), so this only bounds how long the
+# departing peer records it before it closes. It does not bound correctness:
+# the registrar counter is still the drain witness and TTL + sweep remains the
+# backstop when there was no live session to receive an order at all.
+DRAIN_ORDER_OBSERVATION_MS=${P3_DRAIN_ORDER_OBSERVATION_MS:-2000}
 # The tier the victim claims at, and with it which half of the criterion the
 # run exercises. `weak` is the contested-physics case, which redistributes;
 # `strong` is the case D7 §5 refuses to redistribute without consent, so every
@@ -222,6 +233,8 @@ set +e
   --victim-claim-kind "$VICTIM_CLAIM_KIND" \
   --cell "$CELL" \
   --duration-secs "$DURATION_SECS" \
+  --drain \
+  --drain-order-observation-ms "$DRAIN_ORDER_OBSERVATION_MS" \
   --metrics-jsonl "$out/metrics.jsonl" \
   --out "$out/peers" \
   > "$out/report.json" 2> "$out/island.log"
