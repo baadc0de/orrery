@@ -219,6 +219,13 @@ fn a_drain_naming_another_island_releases_nothing() {
     // anomalous one. Acting on it would release leases this peer is still the
     // legitimate writer for — and leave the entities unowned until the TTL runs
     // out, which is the outage the fencing token exists to prevent.
+    //
+    // This is also the move case, which needs no separate test because it is
+    // the same shape: a peer that emptied island A by joining B is on A's last
+    // roster, so it is sent `Drain{A}` while holding B. `Drain` carries no cell
+    // set, so the peer cannot tell which leases were A's and correctly releases
+    // none of them — A's rows park on the registrar's 11 s sweep instead of one
+    // RTT. See `apply_island_drain`'s docs for why that cost is accepted.
     let (mut app, entities) = client_holding(&[PersistId::new(64)]);
     app.world_mut().resource_mut::<CoordinatorLink>().drain = Some((IslandId::new(7), 10_000));
 

@@ -606,6 +606,36 @@ pub fn pump_coordinator(
 /// keeps [`IslandMembership`] across a drop by design (see the module docs), so
 /// an order left standing would fire again against the membership a reconnect
 /// restored.
+///
+/// # The move case, and why it costs 11 s instead of one RTT
+///
+/// One drop is not a duplicate and is worth naming, because the code otherwise
+/// reads as though the case does not exist. A peer that moves out of the last
+/// cell of island `A` and into `B` is exactly the peer whose departure emptied
+/// `A`, so it is on the roster `order_drains` addresses
+/// (`orrery_coordinator::server`, which sends to the island's roster at its
+/// last populated epoch). It therefore receives `Drain { island: A }` *after*
+/// it has joined `B` — and this system drops it, because `membership.island`
+/// is `Some(B)`.
+///
+/// The drop is forced rather than chosen. [`CoordMsg::Drain`] is
+/// `{ island, deadline }` and carries **no cell set**
+/// (`orrery_protocol::coord`), so a peer that has already moved cannot tell
+/// which of its leases belonged to `A`: the only island term it has is the one
+/// it is in now. Divesting everything would release `B`'s leases too, and
+/// divesting nothing is the safe direction. So `A`'s rows fall to the
+/// registrar's expiry sweep and park within `TTL + S = 11 s` instead of one
+/// RTT. That is a latency cost on an already-correct backstop (D24 §(a),
+/// path 3), which is the trade this whole system is on the cheap side of — not
+/// an oversight. Closing it means putting the island's cell set on the wire,
+/// which is a protocol change.
+///
+/// Note that the coordinator's send order does not avoid this and is not meant
+/// to: `apply` sends drains before manifests so the peer never holds both
+/// islands at once, but [`pump_coordinator`] drains its whole inbound queue in
+/// one call, so a same-frame arrival applies `B`'s manifest and records `A`'s
+/// order before this system ever runs. On the move path the drop is the
+/// expected outcome, not a reordering accident.
 pub fn apply_island_drain(
     mut link: ResMut<CoordinatorLink>,
     mut membership: ResMut<IslandMembership>,

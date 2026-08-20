@@ -213,7 +213,7 @@ pub fn bind_island_membership(
 /// depends on both.
 ///
 /// It is ordered **before**
-/// [`apply_island_drain`](orrery_net::apply_island_drain), which is the system
+/// [`apply_island_drain`], which is the system
 /// that consumes [`CoordinatorLink::drain`](orrery_net::CoordinatorLink::drain)
 /// and calls `IslandMembership::leave()`. Divesting has to see the membership
 /// the order names; once `leave()` has run there is no island left to compare
@@ -232,6 +232,16 @@ pub fn bind_island_membership(
 /// lease this peer holds satisfies it. Filtering again on a cell set the peer
 /// would have to reconstruct from a manifest it may no longer hold would be a
 /// second, weaker copy of the same fact.
+///
+/// The substitution is also forced rather than merely convenient:
+/// `CoordMsg::Drain` is `{ island, deadline }` and carries no cell set, so when
+/// the two disagree there is nothing else to test against. That is the move
+/// case — a peer that emptied island `A` by joining `B` is told to drain `A`
+/// while holding `B`, takes the early return here, and lets `A`'s rows park on
+/// the registrar's 11 s expiry sweep rather than one RTT. An accepted latency
+/// cost on an already-correct backstop, not an oversight; see
+/// [`apply_island_drain`], which documents the
+/// case in full.
 ///
 /// # `to: None`, `cursor: None`
 ///
