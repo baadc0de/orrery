@@ -344,8 +344,7 @@ async fn seed_entity(runtime: &Arc<Mutex<CellRuntime>>, entity: PersistId, cell:
         .lock()
         .await
         .actor(GridId::ROOT, cell)
-        .expect("actor for seeded entity")
-        .clone();
+        .expect("actor for seeded entity");
     let payload = Bytes::from_static(b"seeded");
     actor
         .start_diff(JournalRecord {
@@ -666,8 +665,7 @@ fn gateway_closes_the_client_to_actor_path() {
                 .lock()
                 .await
                 .actor(GridId::ROOT, CellId::ROOT)
-                .expect("root actor")
-                .clone();
+                .expect("root actor");
             actor
                 .validate_lease(PersistId::new(999), node(1), orrery_protocol::LeaseId(0), 0)
                 .await
@@ -861,7 +859,6 @@ fn gateway_closes_the_client_to_actor_path() {
                     .await
                     .actor(GridId::ROOT, CellId::ROOT)
                     .expect("root actor")
-                    .clone()
             };
             let current = actor
                 .validate_lease(PersistId::new(1), node(1), grant.0, 0)
@@ -1081,8 +1078,7 @@ fn gateway_gates_client_claims_against_committed_location_and_authoritative_inte
             .lock()
             .await
             .actor(GridId::ROOT, CellId::ROOT)
-            .unwrap()
-            .clone();
+            .unwrap();
         for entity in [PersistId::new(399), moved, uncovered, orphan, stale] {
             assert!(actor
                 .validate_lease(entity, node(1), orrery_protocol::LeaseId(0), 0)
@@ -1138,7 +1134,7 @@ fn gateway_rejects_unverified_raw_iroh_hellos_before_authority_activation() {
         let (_client, connection) = raw_connection(secret(1), server.addr()).await;
         let actor = {
             let runtime = runtime.lock().await;
-            runtime.actor(GridId::ROOT, CellId::ROOT).unwrap().clone()
+            runtime.actor(GridId::ROOT, CellId::ROOT).unwrap()
         };
         let invalid_tokens = [
             Vec::new(),
@@ -1234,8 +1230,7 @@ fn gateway_graces_only_the_established_matching_token_during_identity_outage() {
             .lock()
             .await
             .actor(GridId::ROOT, CellId::ROOT)
-            .unwrap()
-            .clone();
+            .unwrap();
         let issuer = secret(42);
         let clock = Arc::new(AtomicGatewayClock(AtomicU64::new(1_000)));
         let health = Arc::new(SwitchIdentityHealth(AtomicBool::new(true)));
@@ -1864,8 +1859,7 @@ fn gateway_replacement_session_exclusively_owns_inherited_leases() {
             .lock()
             .await
             .actor(GridId::ROOT, CellId::ROOT)
-            .unwrap()
-            .clone();
+            .unwrap();
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         let parked = loop {
             let row = actor
@@ -2054,8 +2048,7 @@ fn gateway_lease_capacity_denies_before_actor_mutation_after_reconnect() {
             .lock()
             .await
             .actor(GridId::ROOT, CellId::ROOT)
-            .unwrap()
-            .clone();
+            .unwrap();
         assert!(actor
             .validate_lease(first_entity, node(1), lease_id, 0)
             .await
@@ -2131,8 +2124,7 @@ fn gateway_rejects_client_rekey_without_mutation() {
             .lock()
             .await
             .actor(GridId::ROOT, CellId::ROOT)
-            .unwrap()
-            .clone();
+            .unwrap();
         let snapshot_before = actor.read_snapshot(vec![CellId::ROOT]).await.unwrap();
         let journal_count_before = runtime
             .lock()
@@ -2366,8 +2358,7 @@ fn rekeyed_entity_rejects_stale_presented_cell_with_current_lease() {
             .lock()
             .await
             .actor(GridId::ROOT, destination)
-            .unwrap()
-            .clone();
+            .unwrap();
         assert!(!actor
             .read_snapshot(vec![source])
             .await
@@ -2830,8 +2821,7 @@ fn reviewed_authority_narrative() {
             .lock()
             .await
             .actor(GridId::ROOT, destination)
-            .unwrap()
-            .clone();
+            .unwrap();
         assert_eq!(
             destination_actor
                 .read_snapshot(vec![destination])

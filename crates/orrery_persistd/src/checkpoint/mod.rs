@@ -30,6 +30,45 @@ pub use scheduler::{
     CheckpointConfig, CheckpointScheduler, MirrorRetention, QuiesceSignal,
 };
 
+/// Why a checkpoint was taken (docs/08-persistence.md §3.5, §3.4.1).
+///
+/// A checkpoint's *bytes* do not depend on its cause — the same copy-on-update
+/// snapshot is written either way — so this is deliberately **not** a field of
+/// [`CheckpointData`]: adding one would change a durable row's encoding to
+/// carry a fact only the writer's own telemetry cares about. It travels with
+/// the call instead, where it names which of the three obligations the write
+/// is discharging and lands in the log line and the authority counters.
+///
+/// The distinction is load-bearing for a *quiesce-flush*: `PreSplit` and
+/// `PreHandover` are the checkpoints after which the shard stops accepting
+/// diffs, so "the last checkpoint before the epoch moved" is the one a reader
+/// of the durable tier has to be able to find.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CheckpointCause {
+    /// The scheduler's jittered cadence (D16), or an explicit operator flush.
+    Scheduled,
+    /// §3.5's quiesce-flush before a hotspot split: the parent's last
+    /// checkpoint, and the base its children load.
+    PreSplit,
+    /// §3.4.1 step 5's quiesce-flush before a live shard handover: the
+    /// outgoing owner's last checkpoint, and the *only* base the successor
+    /// has — a sibling gateway has no copy of this node's journal, so a
+    /// handover with no `PreHandover` checkpoint hands over a stale shard.
+    PreHandover,
+}
+
+impl CheckpointCause {
+    /// A short stable label for logs and metrics records.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Scheduled => "scheduled",
+            Self::PreSplit => "pre_split",
+            Self::PreHandover => "pre_handover",
+        }
+    }
+}
+
 /// The durable payload of one shard cell's checkpoint (§8, `ckpt/{shard}` row).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CheckpointData {

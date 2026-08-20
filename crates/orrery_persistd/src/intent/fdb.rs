@@ -91,7 +91,16 @@ impl PersistIdAllocator {
 pub struct FdbIntentExecutor {
     db: Arc<Database>,
     grid: GridId,
-    fence: Option<IntentFence>,
+    /// The shard set every intent transaction re-reads before committing.
+    ///
+    /// Behind a lock because a live shard handover (D26 rule 3) changes it on
+    /// a running node. Left fixed at what `--shard` activated, a node that
+    /// correctly handed one shard to a sibling would find *every* subsequent
+    /// intent refused — the fence verifies the whole set, and one row now
+    /// naming the successor fails it — so a planned shard move would take the
+    /// node's entire intent ledger down with it. See
+    /// [`FdbIntentExecutor::refence`].
+    fence: std::sync::RwLock<Option<IntentFence>>,
     allocator: Arc<tokio::sync::Mutex<PersistIdAllocator>>,
 }
 
@@ -120,6 +129,24 @@ pub struct IntentFence {
 }
 
 impl FdbIntentExecutor {
+    /// Replace the shard set this executor admits intents under.
+    ///
+    /// Called after a live shard handover commits (either side of it): the
+    /// outgoing owner drops the shard it handed away, the successor adds the
+    /// one it adopted, at the epoch its row now carries. An executor with no
+    /// fence stays unfenced — this never *installs* one, because whether a
+    /// deployment fences its ledger at all is a startup decision.
+    pub fn refence(&self, shards: Vec<CellId>, owner: u64, epoch: Epoch) {
+        let mut fence = self.fence.write().expect("intent fence lock poisoned");
+        if fence.is_some() {
+            *fence = Some(IntentFence {
+                shards,
+                owner,
+                epoch,
+            });
+        }
+    }
+
     /// Build an executor using a process-scoped FDB context.
     #[must_use]
     pub fn from_context(context: &FdbContext, grid: GridId) -> Self {
@@ -132,7 +159,7 @@ impl FdbIntentExecutor {
         Self {
             db,
             grid,
-            fence: None,
+            fence: std::sync::RwLock::new(None),
             allocator: Arc::new(tokio::sync::Mutex::new(PersistIdAllocator::default())),
         }
     }
@@ -149,7 +176,7 @@ impl FdbIntentExecutor {
         Self {
             db,
             grid,
-            fence: Some(fence),
+            fence: std::sync::RwLock::new(Some(fence)),
             allocator: Arc::new(tokio::sync::Mutex::new(PersistIdAllocator::default())),
         }
     }
@@ -226,10 +253,26 @@ async fn require_intent_fence(
     grid: GridId,
     fence: &IntentFence,
 ) -> Result<(), FdbBindingError> {
-    let expected = FenceRow {
-        owner: fence.owner,
-        epoch: fence.epoch,
-        status: FenceStatus::Active,
+    // D26 rule 1's ownership function: `owner(g, s)` is the row's owner when
+    // its status is `Active` **or** `Draining`. This fence asks whether this
+    // node is still the single writer for its shard set, which a live handover
+    // does not change until its second CAS — so a shard being drained
+    // (D26 rule 3 steps 1–5) is still this node's, and the intents it is
+    // fenced by must keep committing. Refusing them would take the node's
+    // whole intent ledger down for the length of every planned shard move,
+    // because the fence covers the *whole* set and one non-`Active` row fails
+    // it. The same reading is applied on the checkpoint path
+    // (`checkpoint/fdb.rs`), where getting it wrong refused the `PreHandover`
+    // checkpoint outright.
+    let owned_here = |current: Option<FenceRow>| {
+        current.is_some_and(|row| {
+            row.owner == fence.owner
+                && row.epoch == fence.epoch
+                && matches!(
+                    row.status,
+                    FenceStatus::Active | FenceStatus::Draining { .. }
+                )
+        })
     };
     // Issue every row's read **concurrently**, then check them in shard
     // order.
@@ -320,7 +363,7 @@ async fn require_intent_fence(
         .map(|&shard| (shard, seen.get(&shard.to_bits()).copied()))
         .collect();
     for (shard, current) in results {
-        if current != Some(expected) {
+        if !owned_here(current) {
             return Err(FdbBindingError::new_custom_error(Box::new(
                 IntentError::Store(format!(
                     "intent fence mismatch for {grid}/{shard}: expected owner {} epoch {}, got {current:?}",
@@ -337,7 +380,11 @@ impl IntentExecutor for FdbIntentExecutor {
     async fn execute(&self, intent: &Intent) -> Result<IntentOutcome, IntentError> {
         let intent = intent.clone();
         let grid = self.grid;
-        let fence = self.fence.clone();
+        let fence = self
+            .fence
+            .read()
+            .expect("intent fence lock poisoned")
+            .clone();
         // The block is durably reserved before the transaction. Reusing this
         // exact vector across FDB retries makes retries safe, while a failed
         // overall attempt merely leaves a permanent, harmless gap.

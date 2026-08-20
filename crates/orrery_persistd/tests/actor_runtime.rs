@@ -130,7 +130,7 @@ async fn source_actor_snapshot_and_journal_characterization_before_rekey() {
         b"characterized-components",
     );
     let committed_lsn = rt.apply(spawn).await.unwrap();
-    let source = rt.actor(GridId::ROOT, cells[0]).unwrap().clone();
+    let source = rt.actor(GridId::ROOT, cells[0]).unwrap();
     let ClaimResult::Granted(grant) = source
         .claim_lease(entity, cells[0], holder, ClaimKind::Weak, 10)
         .await
@@ -272,7 +272,7 @@ async fn committed_rekey_moves_entity_then_recovers_destination() {
     ))
     .await
     .unwrap();
-    let source = rt.actor(GridId::ROOT, cells[0]).unwrap().clone();
+    let source = rt.actor(GridId::ROOT, cells[0]).unwrap();
     let ClaimResult::Granted(grant) = source
         .claim_lease(entity, cells[0], holder, ClaimKind::Strong, 20)
         .await
@@ -306,7 +306,7 @@ async fn committed_rekey_moves_entity_then_recovers_destination() {
         moved.entities[&entity].components.as_ref(),
         b"rekeyed-component-bytes"
     );
-    let destination = rt.actor(GridId::ROOT, cells[1]).unwrap().clone();
+    let destination = rt.actor(GridId::ROOT, cells[1]).unwrap();
     let moved_lease = destination
         .validate_lease(entity, holder, grant.lease_id, 21)
         .await
@@ -332,7 +332,7 @@ async fn committed_rekey_moves_entity_then_recovers_destination() {
         recovered_page.entities[&entity].components.as_ref(),
         b"rekeyed-component-bytes"
     );
-    let recovered_destination = recovered.actor(GridId::ROOT, cells[1]).unwrap().clone();
+    let recovered_destination = recovered.actor(GridId::ROOT, cells[1]).unwrap();
     let recovered_lease = recovered_destination
         .validate_lease(entity, holder, grant.lease_id, 0)
         .await
@@ -391,7 +391,7 @@ async fn a_rekey_for_unhosted_shards_does_not_brick_open() {
     ))
     .await
     .unwrap();
-    let source = rt.actor(GridId::ROOT, cells[0]).unwrap().clone();
+    let source = rt.actor(GridId::ROOT, cells[0]).unwrap();
     let ClaimResult::Granted(grant) = source
         .claim_lease(moved, cells[0], holder, ClaimKind::Strong, 30)
         .await
@@ -463,7 +463,7 @@ async fn stalled_lease_recovery_is_cancellable_and_reopen_remains_destination_on
     ))
     .await
     .unwrap();
-    let source = rt.actor(GridId::ROOT, cells[0]).unwrap().clone();
+    let source = rt.actor(GridId::ROOT, cells[0]).unwrap();
     let ClaimResult::Granted(grant) = source
         .claim_lease(entity, cells[0], holder, ClaimKind::Strong, 70)
         .await
@@ -674,7 +674,7 @@ async fn committed_rekey_mem_recovery_has_one_destination_row() {
     let recovered = CellRuntime::open_with_lease_store(&config, &checkpoints, store.clone())
         .await
         .unwrap();
-    let destination = recovered.actor(GridId::ROOT, cells[1]).unwrap().clone();
+    let destination = recovered.actor(GridId::ROOT, cells[1]).unwrap();
     let restored = destination
         .validate_lease(entity, holder, grant.lease_id, 0)
         .await
@@ -1093,7 +1093,7 @@ async fn committed_rekey_migration_failure_preserves_exact_source_only() {
     ))
     .await
     .unwrap();
-    let source = rt.actor(GridId::ROOT, cells[0]).unwrap().clone();
+    let source = rt.actor(GridId::ROOT, cells[0]).unwrap();
     let ClaimResult::Granted(grant) = source
         .claim_lease(entity, cells[0], holder, ClaimKind::Weak, 30)
         .await
@@ -1189,7 +1189,7 @@ async fn committed_rekey_migration_failure_fences_source_until_restart_recovery(
     ))
     .await
     .unwrap();
-    let source = rt.actor(GridId::ROOT, cells[0]).unwrap().clone();
+    let source = rt.actor(GridId::ROOT, cells[0]).unwrap();
     let ClaimResult::Granted(grant) = source
         .claim_lease(entity, cells[0], holder, ClaimKind::Strong, 50)
         .await
@@ -1291,7 +1291,7 @@ async fn committed_rekey_migration_failure_fences_source_until_restart_recovery(
             .as_ref(),
         b"committed-source-image"
     );
-    let destination = recovered.actor(GridId::ROOT, cells[1]).unwrap().clone();
+    let destination = recovered.actor(GridId::ROOT, cells[1]).unwrap();
     let recovered_lease = destination
         .validate_lease(entity, holder, grant.lease_id, 0)
         .await
@@ -1357,7 +1357,7 @@ async fn committed_rekey_rejects_stale_source_image_and_fence_before_append() {
     rt.apply(mk_record(cells[0], entity.0, RecordKind::Spawn, b"current"))
         .await
         .unwrap();
-    let source = rt.actor(GridId::ROOT, cells[0]).unwrap().clone();
+    let source = rt.actor(GridId::ROOT, cells[0]).unwrap();
     let ClaimResult::Granted(grant) = source
         .claim_lease(entity, cells[0], holder, ClaimKind::Weak, 40)
         .await
@@ -1880,10 +1880,7 @@ async fn failed_lease_store_transition_leaves_registrar_hot_state_unchanged() {
     )
     .await
     .unwrap();
-    let actor = rt
-        .actor(GridId::ROOT, CellId::ROOT)
-        .expect("root actor")
-        .clone();
+    let actor = rt.actor(GridId::ROOT, CellId::ROOT).expect("root actor");
     let entity = PersistId::new(991);
     let holder = test_node(9);
 
@@ -1922,10 +1919,7 @@ async fn heartbeat_renews_hot_expiry_without_persisting_a_new_lease_row() {
     )
     .await
     .unwrap();
-    let actor = rt
-        .actor(GridId::ROOT, CellId::ROOT)
-        .expect("root actor")
-        .clone();
+    let actor = rt.actor(GridId::ROOT, CellId::ROOT).expect("root actor");
     let entity = PersistId::new(990);
     let holder = test_node(8);
     let ClaimResult::Granted(grant) = actor
@@ -1961,10 +1955,7 @@ async fn heartbeat_does_not_wait_for_a_blocked_durable_store_or_block_the_mailbo
     )
     .await
     .unwrap();
-    let actor = rt
-        .actor(GridId::ROOT, CellId::ROOT)
-        .expect("root actor")
-        .clone();
+    let actor = rt.actor(GridId::ROOT, CellId::ROOT).expect("root actor");
     let entity = PersistId::new(988);
     let holder = test_node(6);
     let ClaimResult::Granted(grant) = actor
@@ -2013,10 +2004,7 @@ async fn heartbeat_with_stale_token_returns_current_row_without_persisting() {
     )
     .await
     .unwrap();
-    let actor = rt
-        .actor(GridId::ROOT, CellId::ROOT)
-        .expect("root actor")
-        .clone();
+    let actor = rt.actor(GridId::ROOT, CellId::ROOT).expect("root actor");
     let entity = PersistId::new(989);
     let holder = test_node(7);
     let ClaimResult::Granted(grant) = actor
@@ -2055,10 +2043,7 @@ async fn heartbeat_with_wrong_holder_returns_current_row_without_persisting() {
     )
     .await
     .unwrap();
-    let actor = rt
-        .actor(GridId::ROOT, CellId::ROOT)
-        .expect("root actor")
-        .clone();
+    let actor = rt.actor(GridId::ROOT, CellId::ROOT).expect("root actor");
     let entity = PersistId::new(987);
     let holder = test_node(5);
     let ClaimResult::Granted(grant) = actor
@@ -2096,10 +2081,7 @@ async fn heartbeat_after_expiry_returns_current_row_without_persisting() {
     )
     .await
     .unwrap();
-    let actor = rt
-        .actor(GridId::ROOT, CellId::ROOT)
-        .expect("root actor")
-        .clone();
+    let actor = rt.actor(GridId::ROOT, CellId::ROOT).expect("root actor");
     let entity = PersistId::new(986);
     let holder = test_node(3);
     let ClaimResult::Granted(grant) = actor
@@ -2134,10 +2116,7 @@ async fn heartbeat_survives_store_failure_while_durable_park_and_expiry_stay_ato
     )
     .await
     .unwrap();
-    let actor = rt
-        .actor(GridId::ROOT, CellId::ROOT)
-        .expect("root actor")
-        .clone();
+    let actor = rt.actor(GridId::ROOT, CellId::ROOT).expect("root actor");
     let entity = PersistId::new(985);
     let holder = test_node(2);
     let ClaimResult::Granted(grant) = actor
@@ -2185,10 +2164,7 @@ async fn disconnect_parks_the_durable_row_and_exposes_it_for_stale_token_nacks()
     )
     .await
     .unwrap();
-    let actor = rt
-        .actor(GridId::ROOT, CellId::ROOT)
-        .expect("root actor")
-        .clone();
+    let actor = rt.actor(GridId::ROOT, CellId::ROOT).expect("root actor");
     let entity = PersistId::new(992);
     let holder = test_node(10);
     let ClaimResult::Granted(grant) = actor
@@ -2234,10 +2210,7 @@ async fn actor_recovery_preserves_fencing_identity_and_refreshes_lease_ttl() {
     let rt = CellRuntime::open_with_lease_store(&config, &checkpoints, store.clone())
         .await
         .unwrap();
-    let actor = rt
-        .actor(GridId::ROOT, CellId::ROOT)
-        .expect("root actor")
-        .clone();
+    let actor = rt.actor(GridId::ROOT, CellId::ROOT).expect("root actor");
     let ClaimResult::Granted(before_restart) = actor
         .claim_lease(entity, CellId::ROOT, holder, ClaimKind::Weak, 0)
         .await
@@ -2255,8 +2228,7 @@ async fn actor_recovery_preserves_fencing_identity_and_refreshes_lease_ttl() {
         .unwrap();
     let restored_actor = restored_rt
         .actor(GridId::ROOT, CellId::ROOT)
-        .expect("restored root actor")
-        .clone();
+        .expect("restored root actor");
     let after_restart = restored_actor
         .validate_lease(entity, holder, before_restart.lease_id, 0)
         .await
@@ -2289,10 +2261,7 @@ async fn expiry_sweep_parks_the_durable_row_and_rotates_its_token() {
     )
     .await
     .unwrap();
-    let actor = rt
-        .actor(GridId::ROOT, CellId::ROOT)
-        .expect("root actor")
-        .clone();
+    let actor = rt.actor(GridId::ROOT, CellId::ROOT).expect("root actor");
     let entity = PersistId::new(994);
     let holder = test_node(12);
     let ClaimResult::Granted(grant) = actor
@@ -2331,10 +2300,7 @@ async fn committed_entity_location_tracks_actor_hot_state_without_creating_a_lea
     let rt = CellRuntime::open(&runtime_config(dir.path(), false), &mem_store())
         .await
         .unwrap();
-    let actor = rt
-        .actor(GridId::ROOT, CellId::ROOT)
-        .expect("root actor")
-        .clone();
+    let actor = rt.actor(GridId::ROOT, CellId::ROOT).expect("root actor");
     let entity = PersistId::new(9940);
     let cells = CellId::ROOT.children();
     actor
@@ -2399,10 +2365,7 @@ async fn committed_entity_cell_rejects_a_cross_cell_claim() {
     let rt = CellRuntime::open(&runtime_config(dir.path(), false), &mem_store())
         .await
         .unwrap();
-    let actor = rt
-        .actor(GridId::ROOT, CellId::ROOT)
-        .expect("root actor")
-        .clone();
+    let actor = rt.actor(GridId::ROOT, CellId::ROOT).expect("root actor");
     let entity = PersistId::new(995);
     let cells = CellId::ROOT.children();
     let ClaimResult::Granted(first) = actor
@@ -2437,10 +2400,7 @@ async fn concurrent_weak_claims_are_serialized_with_monotonic_fencing() {
     let rt = CellRuntime::open(&runtime_config(dir.path(), false), &mem_store())
         .await
         .unwrap();
-    let actor = rt
-        .actor(GridId::ROOT, CellId::ROOT)
-        .expect("root actor")
-        .clone();
+    let actor = rt.actor(GridId::ROOT, CellId::ROOT).expect("root actor");
     let entity = PersistId::new(996);
     let first = actor.claim_lease(entity, CellId::ROOT, test_node(15), ClaimKind::Weak, 0);
     let second = actor.claim_lease(entity, CellId::ROOT, test_node(16), ClaimKind::Weak, 0);
@@ -2673,10 +2633,7 @@ async fn strong_actor_lease_cannot_be_stolen_by_a_weak_claim() {
     let rt = CellRuntime::open(&runtime_config(dir.path(), false), &mem_store())
         .await
         .unwrap();
-    let actor = rt
-        .actor(GridId::ROOT, CellId::ROOT)
-        .expect("root actor")
-        .clone();
+    let actor = rt.actor(GridId::ROOT, CellId::ROOT).expect("root actor");
     let entity = PersistId::new(997);
     let holder = test_node(17);
     let ClaimResult::Granted(strong) = actor
@@ -2710,10 +2667,7 @@ async fn fenced_append_rechecks_the_lease_inside_the_actor_mailbox() {
     let rt = CellRuntime::open(&runtime_config(dir.path(), false), &mem_store())
         .await
         .unwrap();
-    let actor = rt
-        .actor(GridId::ROOT, CellId::ROOT)
-        .expect("root actor")
-        .clone();
+    let actor = rt.actor(GridId::ROOT, CellId::ROOT).expect("root actor");
     let entity = PersistId::new(998);
     let original_holder = test_node(19);
     let ClaimResult::Granted(original) = actor
@@ -2774,10 +2728,7 @@ async fn actor_returns_pending_handle_after_fold_without_resolver_task() {
     let rt = CellRuntime::open(&runtime_config(dir.path(), true), &mem_store())
         .await
         .unwrap();
-    let actor = rt
-        .actor(GridId::ROOT, CellId::ROOT)
-        .expect("root actor")
-        .clone();
+    let actor = rt.actor(GridId::ROOT, CellId::ROOT).expect("root actor");
 
     let handle = tokio::time::timeout(
         Duration::from_millis(20),

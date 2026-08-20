@@ -1049,7 +1049,7 @@ async fn rekey_entity(
 ) {
     use orrery_persistd::{ClaimResult, Router};
 
-    let actor = rt.actor(grid, source).expect("source actor").clone();
+    let actor = rt.actor(grid, source).expect("source actor");
     let ClaimResult::Granted(grant) = actor
         .claim_lease(
             entity,

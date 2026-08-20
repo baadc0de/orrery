@@ -38,6 +38,43 @@ pub enum FenceStatus {
     /// The shard is mid-split: the parent is quiesced and the children are
     /// being brought up at epoch `e+1`.
     Splitting,
+    /// The shard is mid-**handover**: its owner is draining every lease under
+    /// the subtree before handing the row to `successor` (D26 rule 3,
+    /// docs/08-persistence.md §3.4.1).
+    ///
+    /// The owner named by the row is still the owner and still the single
+    /// writer — only claim admission closes. `Draining` is deliberately not
+    /// `Active`, so `serves(n, g, s)` is false for it and D26's I1 (no two
+    /// nodes hold `Active` rows for overlapping subtrees) is decided by
+    /// looking at one durable row per shard.
+    ///
+    /// Appended after `Splitting` rather than inserted: postcard encodes an
+    /// enum's variants by index, so a new variant at the end is additive on
+    /// the wire and a variant in the middle renumbers every row already
+    /// written.
+    Draining {
+        /// The node that will own the shard once the drain completes and the
+        /// second CAS commits.
+        successor: u64,
+    },
+}
+
+impl FenceStatus {
+    /// Whether a row in this status makes its owner the *serving* owner —
+    /// D26 rule 1's `status = Active` conjunct.
+    #[must_use]
+    pub const fn serves(self) -> bool {
+        matches!(self, Self::Active)
+    }
+
+    /// The successor this status names, if it is a drain.
+    #[must_use]
+    pub const fn draining_to(self) -> Option<u64> {
+        match self {
+            Self::Draining { successor } => Some(successor),
+            _ => None,
+        }
+    }
 }
 
 /// The `actor/{grid}/{shard}` row: placement + fencing (D11 §6).
@@ -326,6 +363,54 @@ impl FenceStore for MemFenceStore {
     }
 }
 
+/// One shard's durable ownership row, addressed: the shape D26's invariant I1
+/// is stated over.
+///
+/// A tuple rather than a struct because it is what a caller already has —
+/// a fence read yields `(grid, shard) -> row`, and the harness reading it
+/// cluster-wide is assembling exactly this from two nodes' rows. Named so the
+/// pair [`overlapping_active_ownership`] returns is legible.
+pub type OwnedShard = (GridId, CellId, FenceRow);
+
+/// D26 invariant **I1**, taken cluster-wide: no two `Active` rows in one grid
+/// may cover overlapping shard subtrees.
+///
+/// [`validate_activation_set`] enforces exactly this *within one process*, over
+/// the set a single activation commits. It cannot see a sibling, so it cannot
+/// see the window a live handover would open if `Draining` were `Active`:
+/// during a drain the row is `Draining`, `serves` is false for it, and
+/// `(B, e+1, Active)` is reachable only from `(A, e, Draining{B})` by CAS. That
+/// makes I1 decidable from one durable row per shard, with no global pause —
+/// which is what this function does. Feed it every row in the grid (or every
+/// row two siblings between them name `Active`) and it returns the first
+/// offending pair.
+///
+/// Rows that are not `Active` are ignored: a `Splitting` parent legitimately
+/// contains its `Active` children, and a `Draining` row legitimately precedes
+/// the successor's `Active` one by the length of one CAS.
+///
+/// Equality counts as overlap ([`CellId::is_prefix_of`] is reflexive), so two
+/// nodes claiming the *same* shard is reported, which is the case that matters
+/// most.
+#[must_use]
+pub fn overlapping_active_ownership(rows: &[OwnedShard]) -> Option<(OwnedShard, OwnedShard)> {
+    let active: Vec<&OwnedShard> = rows
+        .iter()
+        .filter(|(_, _, row)| row.status.serves())
+        .collect();
+    for (index, first) in active.iter().enumerate() {
+        for second in &active[index + 1..] {
+            if first.0 != second.0 {
+                continue;
+            }
+            if first.1.is_prefix_of(second.1) || second.1.is_prefix_of(first.1) {
+                return Some((**first, **second));
+            }
+        }
+    }
+    None
+}
+
 /// Validate the canonical ordering required to make a shard-set activation
 /// unambiguous.  A parent and child overlap even if their raw Morton values
 /// sort differently, so check prefix relation as well as strict ordering.
@@ -492,6 +577,121 @@ mod tests {
             .unwrap();
         store.retire(GridId::ROOT, CellId::ROOT).await.unwrap();
         assert_eq!(store.read(GridId::ROOT, CellId::ROOT).await.unwrap(), None);
+    }
+
+    /// D26 I1 is decided from the rows alone: `Draining` is not `Active`, so
+    /// the two-node overlap the handover would otherwise open never appears.
+    #[test]
+    fn draining_is_never_serving_so_a_handover_opens_no_overlap_window() {
+        let shard = CellId::ROOT.children()[0];
+        let draining = FenceRow {
+            owner: 1,
+            epoch: Epoch::new(4),
+            status: FenceStatus::Draining { successor: 2 },
+        };
+        let handed = FenceRow {
+            owner: 2,
+            epoch: Epoch::new(5),
+            status: FenceStatus::Active,
+        };
+        assert!(!draining.status.serves());
+        assert_eq!(draining.status.draining_to(), Some(2));
+        assert_eq!(FenceStatus::Active.draining_to(), None);
+
+        // The pathological pair the drain exists to prevent: were the outgoing
+        // row still `Active`, both nodes would serve the same shard.
+        assert!(
+            overlapping_active_ownership(&[
+                (GridId::ROOT, shard, draining),
+                (GridId::ROOT, shard, handed),
+            ])
+            .is_none(),
+            "a draining row and its successor's active row are not two serving owners"
+        );
+        assert!(
+            overlapping_active_ownership(&[
+                (
+                    GridId::ROOT,
+                    shard,
+                    FenceRow {
+                        status: FenceStatus::Active,
+                        ..draining
+                    }
+                ),
+                (GridId::ROOT, shard, handed),
+            ])
+            .is_some(),
+            "two Active rows over one shard is exactly what I1 forbids"
+        );
+    }
+
+    /// I1 is about *containment*, not equality, and it is per grid.
+    #[test]
+    fn overlapping_ownership_is_prefix_containment_within_one_grid() {
+        let parent = CellId::ROOT;
+        let child = CellId::ROOT.children()[0];
+        let sibling = CellId::ROOT.children()[1];
+        let active = |owner| FenceRow {
+            owner,
+            epoch: Epoch::new(1),
+            status: FenceStatus::Active,
+        };
+
+        assert!(
+            overlapping_active_ownership(&[
+                (GridId::ROOT, child, active(1)),
+                (GridId::ROOT, sibling, active(2)),
+            ])
+            .is_none(),
+            "disjoint subtrees on two nodes is the sibling deployment itself"
+        );
+        assert!(
+            overlapping_active_ownership(&[
+                (GridId::ROOT, parent, active(1)),
+                (GridId::ROOT, child, active(2)),
+            ])
+            .is_some(),
+            "a node serving a parent while another serves its child is two writers \
+             for every cell in the child"
+        );
+        // A `Splitting` parent legitimately contains its `Active` children.
+        assert!(overlapping_active_ownership(&[
+            (
+                GridId::ROOT,
+                parent,
+                FenceRow {
+                    status: FenceStatus::Splitting,
+                    ..active(1)
+                }
+            ),
+            (GridId::ROOT, child, active(1)),
+        ])
+        .is_none());
+        // P-7: the same raw cell under two grids is two entity universes.
+        assert!(
+            overlapping_active_ownership(&[
+                (GridId::ROOT, child, active(1)),
+                (GridId::new(7), child, active(2)),
+            ])
+            .is_none(),
+            "cell ids are grid-relative, so a cross-grid pair is not an overlap"
+        );
+    }
+
+    /// The `Draining` variant is appended, so an already-written row still
+    /// decodes as what it was.
+    #[test]
+    fn the_fence_status_encoding_is_additive() {
+        let encoded_active = postcard::to_allocvec(&FenceStatus::Active).expect("encode");
+        let encoded_splitting = postcard::to_allocvec(&FenceStatus::Splitting).expect("encode");
+        assert_eq!(encoded_active, vec![0]);
+        assert_eq!(encoded_splitting, vec![1]);
+        assert_eq!(
+            postcard::to_allocvec(&FenceStatus::Draining { successor: 2 }).expect("encode"),
+            vec![2, 2],
+            "Draining takes the next index and carries its successor; the two \
+             statuses that predate it keep the bytes already in the durable tier"
+        );
     }
 
     #[tokio::test]

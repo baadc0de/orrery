@@ -91,8 +91,7 @@ async fn seed_entity(runtime: &Arc<Mutex<CellRuntime>>, entity: PersistId, cell:
         .lock()
         .await
         .actor(GridId::ROOT, cell)
-        .expect("actor for seeded entity")
-        .clone();
+        .expect("actor for seeded entity");
     let payload = Bytes::from_static(b"seeded");
     actor
         .start_diff(JournalRecord {

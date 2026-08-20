@@ -549,6 +549,49 @@ impl LeaseRegistrar {
             .any(|row| row.holder.is_some() && row.expires_at <= now_ms)
     }
 
+    /// Whether [`Self::divest_all`] would park anything.
+    ///
+    /// `has_expired`'s predicate with the clock term dropped, for the same
+    /// reason it exists: the caller copies the registrar so a half-applied
+    /// pass can be abandoned, and a copy of a shard's whole registrar is the
+    /// expensive part.
+    #[must_use]
+    pub fn has_holders(&self) -> bool {
+        self.leases.values().any(|row| row.holder.is_some())
+    }
+
+    /// Park **every** held row, whatever its TTL says (D26 rule 3 step 4).
+    ///
+    /// [`Self::sweep_expired`] with the clock term dropped, and the difference
+    /// is the whole point of a live handover: the rows being divested are
+    /// *live*, their holders are heartbeating, and the drain exists precisely
+    /// so they stop being live before the `actor/{grid}/{shard}` row moves to
+    /// a node those holders have no session to. Each entry carries the holder
+    /// and the token the row had before the park, because the `Expire` the
+    /// caller then delivers has to be addressed by the token the holder still
+    /// believes it has installed.
+    ///
+    /// `own_seq` and `auth_seq` are untouched — `park` moves `holder`,
+    /// `lease_id`, `flags` and `expires_at` and nothing else — so the
+    /// successor adopts the row at the sequence the outgoing owner left it at
+    /// (D26 rule 3 step 3, docs/04-authority.md §9).
+    pub fn divest_all(&mut self, now_ms: u64) -> Vec<ExpiredLease> {
+        let unparked_at = &mut self.unparked_at;
+        self.leases
+            .values_mut()
+            .filter_map(|row| {
+                let previous_holder = row.holder?;
+                let previous_lease_id = row.lease_id;
+                park(row, unparked_at, now_ms);
+                Some(ExpiredLease {
+                    previous_holder,
+                    previous_lease_id,
+                    lease: row.clone(),
+                })
+            })
+            .collect()
+    }
+
     /// Park silent holders whose registrar-clock TTL elapsed.
     ///
     /// Each entry carries the holder and fencing token the row had **before**

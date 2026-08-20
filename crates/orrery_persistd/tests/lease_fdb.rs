@@ -206,7 +206,7 @@ async fn fdb_lease_actor_restore_and_expiry_are_durable() {
     let rt = CellRuntime::open_with_lease_store(&config, &checkpoints, store.clone())
         .await
         .unwrap();
-    let actor = rt.actor(grid, CellId::ROOT).unwrap().clone();
+    let actor = rt.actor(grid, CellId::ROOT).unwrap();
     let ClaimResult::Granted(before_restart) = actor
         .claim_lease(entity, CellId::ROOT, holder, ClaimKind::Weak, 0)
         .await
@@ -230,7 +230,7 @@ async fn fdb_lease_actor_restore_and_expiry_are_durable() {
     let restored_rt = CellRuntime::open_with_lease_store(&config, &checkpoints, store.clone())
         .await
         .unwrap();
-    let restored_actor = restored_rt.actor(grid, CellId::ROOT).unwrap().clone();
+    let restored_actor = restored_rt.actor(grid, CellId::ROOT).unwrap();
     let restored = restored_actor
         .validate_lease(entity, holder, before_restart.lease_id, 0)
         .await

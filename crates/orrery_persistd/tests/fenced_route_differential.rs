@@ -289,7 +289,7 @@ fn matrix() -> Vec<Scenario> {
 }
 
 /// What a fenced apply answered, in a form two runs can be compared by.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum Outcome {
     Accepted,
     Rejected(Option<Lease>),
@@ -602,10 +602,35 @@ async fn run_matrix(
 }
 
 /// Equal outcomes, ignoring the `entity`-independent grid the two runtimes
-/// were built under (nothing in `Lease` carries a grid, so this is a plain
-/// equality — the helper exists to name why it is allowed to be).
+/// were built under.
+///
+/// This was a plain `new == old` on the stated grounds that "nothing in
+/// `Lease` carries a grid". That stopped being true when `Reject::WrongOwner`
+/// gained one (#125): the `fdb` leg deliberately runs the two runtimes under
+/// **two different grids** — "two grids, not two stores", so the oracle's
+/// runtime cannot see the subject's rows — so every scenario whose outcome is
+/// a `WrongOwner` now diverges on a field that is different by construction.
+/// Measured 2026-08-20 against a live cluster: eight of the matrix's scenarios
+/// diverge, all of them on the grid alone, with identical shard and epoch.
+///
+/// So the grid is normalised out here rather than the two runtimes being put
+/// on one grid, which would defeat the isolation the fdb leg exists for. The
+/// shard and the epoch — the two fields that say anything about *routing* —
+/// are still compared exactly.
 fn same_outcome(new: &Outcome, old: &Outcome) -> bool {
-    new == old
+    fn without_grid(outcome: &Outcome) -> Outcome {
+        match outcome {
+            Outcome::Failed(Reject::WrongOwner { shard, epoch, .. }) => {
+                Outcome::Failed(Reject::WrongOwner {
+                    grid: GridId::ROOT,
+                    shard: *shard,
+                    epoch: *epoch,
+                })
+            }
+            other => other.clone(),
+        }
+    }
+    without_grid(new) == without_grid(old)
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -244,7 +244,7 @@ pub fn spawn_checkpoint_scheduler(
             // Re-read the shard set each iteration to pick up splits.
             let shards: Vec<CellId> = {
                 let rt = runtime.lock().await;
-                rt.shards().copied().collect()
+                rt.shards().collect()
             };
 
             // Reconcile: add timers for shards not yet tracked, remove timers
@@ -341,7 +341,7 @@ pub fn spawn_checkpoint_scheduler_direct(
         let mut floor = ReleaseFloor::default();
 
         loop {
-            let shards: Vec<CellId> = runtime.shards().copied().collect();
+            let shards: Vec<CellId> = runtime.shards().collect();
 
             let now = tokio::time::Instant::now();
             timers.retain(|(shard, _)| shards.contains(shard));

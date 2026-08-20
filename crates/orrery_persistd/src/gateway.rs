@@ -1090,6 +1090,44 @@ pub struct AuthoritySnapshot {
     /// A count that tracks a cell's population is a cell past D6's ceiling; a
     /// count that tracks one peer is that peer's bucket doing its job.
     pub expire_fanout_dropped: u64,
+    /// Lease rows that were **live** when a live shard handover's drain began
+    /// (D26 rule 3 step 1) — the left-hand term of invariant I2.
+    pub handover_leases_live_at_drain_start: u64,
+    /// `Expire` frames delivered to those rows' holders on their own sessions
+    /// **before** the ownership CAS — the right-hand term of I2.
+    ///
+    /// I2 is `handover_leases_live_at_drain_start -
+    /// handover_expires_delivered_before_cas == 0`. It is not merely "an
+    /// `Expire` was constructed": this counts frames the holder's live
+    /// connection accepted, because a holder that never received one is a
+    /// holder that will discover it has lost authority by having its writes
+    /// silently stop working, which is what the handover exists to prevent.
+    pub handover_expires_delivered_before_cas: u64,
+    /// Rows parked by a handover drain rather than by a crash or a TTL sweep.
+    ///
+    /// The counter that tells a **handover park from a crash park** — they are
+    /// the same durable transition and completely different events. A crash
+    /// park with no successor is a capability loss; a handover park is the
+    /// design, and the row unparks on the successor at the peer's next claim.
+    /// Deliberately **not** folded into `parked_without_successor`, which
+    /// would otherwise alarm on every planned shard move.
+    pub handover_parks: u64,
+    /// Lease renewals that arrived at this process for a shard it no longer
+    /// hosts — the second half of I2, and zero-valued across a handover
+    /// window.
+    ///
+    /// This is the counter that fails on exactly the defect D26's Context
+    /// describes: a holder still heartbeating to the previous owner because
+    /// nobody told it the shard moved. A planned handover leaves it at zero
+    /// because the drain divested every holder first.
+    pub heartbeats_rejected_wrong_owner: u64,
+    /// Claims refused because their cell's shard is mid-drain (step 2).
+    pub claims_denied_draining: u64,
+    /// Live shard handovers whose step-6 CAS committed on this node.
+    pub handovers_completed: u64,
+    /// Drains this node started and then rolled back, leaving the shard where
+    /// it was.
+    pub handovers_aborted: u64,
 }
 
 /// Always-on authority telemetry.
@@ -1115,6 +1153,13 @@ pub struct AuthorityMetrics {
     expire_fanout_sent: AtomicU64,
     expire_fanout_skipped: AtomicU64,
     expire_fanout_dropped: AtomicU64,
+    handover_leases_live_at_drain_start: AtomicU64,
+    handover_expires_delivered_before_cas: AtomicU64,
+    handover_parks: AtomicU64,
+    heartbeats_rejected_wrong_owner: AtomicU64,
+    claims_denied_draining: AtomicU64,
+    handovers_completed: AtomicU64,
+    handovers_aborted: AtomicU64,
     last_duplicate: std::sync::Mutex<Option<DuplicateAuthoritySample>>,
 }
 
@@ -1136,6 +1181,19 @@ impl AuthorityMetrics {
             expire_fanout_sent: self.expire_fanout_sent.load(Ordering::Relaxed),
             expire_fanout_skipped: self.expire_fanout_skipped.load(Ordering::Relaxed),
             expire_fanout_dropped: self.expire_fanout_dropped.load(Ordering::Relaxed),
+            handover_leases_live_at_drain_start: self
+                .handover_leases_live_at_drain_start
+                .load(Ordering::Relaxed),
+            handover_expires_delivered_before_cas: self
+                .handover_expires_delivered_before_cas
+                .load(Ordering::Relaxed),
+            handover_parks: self.handover_parks.load(Ordering::Relaxed),
+            heartbeats_rejected_wrong_owner: self
+                .heartbeats_rejected_wrong_owner
+                .load(Ordering::Relaxed),
+            claims_denied_draining: self.claims_denied_draining.load(Ordering::Relaxed),
+            handovers_completed: self.handovers_completed.load(Ordering::Relaxed),
+            handovers_aborted: self.handovers_aborted.load(Ordering::Relaxed),
         }
     }
 
@@ -1147,6 +1205,47 @@ impl AuthorityMetrics {
 
     fn record_reassigned(&self) {
         self.reassigned.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// `count` rows were live under a moving shard when its drain began.
+    fn record_handover_drain_start(&self, count: u64) {
+        self.handover_leases_live_at_drain_start
+            .fetch_add(count, Ordering::Relaxed);
+    }
+
+    /// One `Expire` a divested holder's own live session accepted.
+    fn record_handover_expire_delivered(&self) {
+        self.handover_expires_delivered_before_cas
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// One row parked by a handover drain rather than by a crash.
+    fn record_handover_park(&self) {
+        self.handover_parks.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// One renewal that reached a process no longer hosting the shard.
+    ///
+    /// Public because the counter's whole value is that it fires from the
+    /// *renewal* path, which is where D26's Context says the defect surfaces.
+    pub fn record_heartbeat_wrong_owner(&self) {
+        self.heartbeats_rejected_wrong_owner
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// One claim refused because its shard is draining (D26 rule 3 step 2).
+    fn record_claim_denied_draining(&self) {
+        self.claims_denied_draining.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// One completed live shard handover.
+    pub fn record_handover_completed(&self) {
+        self.handovers_completed.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// One drain rolled back without moving the shard.
+    pub fn record_handover_aborted(&self) {
+        self.handovers_aborted.fetch_add(1, Ordering::Relaxed);
     }
 
     /// One bulk diff whose route this session's lease index does not confirm:
@@ -2422,6 +2521,8 @@ struct MisaddressedRenewal {
     grid: GridId,
     cell: CellId,
     epoch: Epoch,
+    /// The sibling this node handed the shard to, when it did (D26 rule 3).
+    owner: Option<NodeId>,
 }
 
 /// Renew a session's due leases, one router call per grid.
@@ -2549,6 +2650,15 @@ async fn renew_session_leases(
                 grid,
                 cell,
                 epoch,
+                // D26 rule 3 step 8. This is the renewal the ADR's Context
+                // describes going nowhere — the holder heartbeating to a
+                // process that no longer hosts the shard — and it is the one
+                // frame in the system that can turn that into a redirect
+                // instead of an opaque refusal.
+                owner: router
+                    .shard_transfer(grid, cell)
+                    .await
+                    .and_then(|transfer| transfer.successor_gateway),
             });
         }
     }
@@ -3006,6 +3116,31 @@ struct Redistributor {
 #[derive(Debug, Default)]
 struct ExpireAudiences {
     by_cell: HashMap<(GridId, CellId), Vec<NodeId>>,
+}
+
+/// What one shard's handover drain did (D26 rule 3 steps 3–4).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DrainReport {
+    /// Whether every held row under the shard was parked inside the deadline.
+    ///
+    /// `false` is a **refusal to hand over**, not a warning: the caller must
+    /// abort rather than move a row whose holders it did not divest.
+    pub complete: bool,
+    /// Rows that were live when the drain parked them — I2's left-hand term.
+    pub live_at_start: u64,
+    /// Of those, the holders whose own live session accepted the `Expire` —
+    /// I2's right-hand term.
+    pub expires_delivered: u64,
+    /// Holders that had no live session on this gateway to deliver to.
+    ///
+    /// Not an I2 violation by itself: a holder with no session is a holder
+    /// whose rows the disconnect path was about to park anyway. It is broken
+    /// out because I2's subtraction must not silently absorb it.
+    pub expires_undeliverable: u64,
+    /// How many times the drain waited on a rekey mid-flight in the actor.
+    pub rekey_waits: u64,
+    /// Durable-store failures that ended the drain early.
+    pub store_errors: u64,
 }
 
 /// What [`Redistributor::place`] decided, and what it already enumerated.
@@ -3509,6 +3644,130 @@ impl Redistributor {
         self.fan_out_expire(audience, &message).await;
     }
 
+    /// Divest every live lease under `shard` through its holder's own session
+    /// on this gateway (D26 rule 3 steps 3–4, docs/08-persistence.md §3.4.1).
+    ///
+    /// The whole handover rests on this one property: after it returns
+    /// `complete`, no peer holds a live lease under `shard` here, so the
+    /// successor's `with_fresh_recovery_ttl` restores nothing held and the
+    /// function that is *wrong* for a live move is never asked to handle one.
+    /// D26 states it the same way round — the handover's job is to make that
+    /// function's precondition true rather than to change the function.
+    ///
+    /// **Every row parks; none is reassigned**, and that is a deliberate
+    /// narrowing of D26 rule 3 step 3, which *permits* ("may") reassigning a
+    /// weak row to an eligible peer still on A. Taking that permission would
+    /// reintroduce the exact hazard this record exists to remove, one row at a
+    /// time: the successor peer's session is on A, the shard is about to
+    /// become B's, and that peer would then be a live holder under a shard it
+    /// cannot heartbeat for — B would restore its row with a fresh 10 s TTL
+    /// and park it with nobody to redistribute to. A reassignment inside a
+    /// drain is only safe if the reassignee is on the *successor's* gateway,
+    /// and D26 rule 4 rules cross-gateway candidacy out. So the drain parks,
+    /// the peer is told, and it re-claims on B — which is step 8 anyway.
+    ///
+    /// Bounded by **one** `deadline` for the whole shard, not one per row
+    /// (step 4). There is no cooperative round trip to wait on: an
+    /// unconditional divest has no successor to hand a cursor to, so the only
+    /// thing the clock is bounding is this node's own durable writes. A drain
+    /// that runs out of clock returns `complete: false`, and its caller must
+    /// abort the handover rather than move the row over rows it never
+    /// divested.
+    async fn drain_shard(
+        &self,
+        router: &Arc<dyn Router>,
+        grid: GridId,
+        shard: CellId,
+        deadline: std::time::Duration,
+    ) -> DrainReport {
+        let started = std::time::Instant::now();
+        let mut report = DrainReport::default();
+        let mut audiences = ExpireAudiences::default();
+        loop {
+            if started.elapsed() >= deadline {
+                return report;
+            }
+            let outcome = router.divest_shard(grid, shard, registrar_now_ms()).await;
+            match outcome {
+                Ok(crate::actor::DivestOutcome::Divested(parked)) => {
+                    report.live_at_start += parked.len() as u64;
+                    self.metrics
+                        .record_handover_drain_start(parked.len() as u64);
+                    for row in parked {
+                        if self.expire_for_handover(router, row, &mut audiences).await {
+                            self.metrics.record_handover_expire_delivered();
+                            report.expires_delivered += 1;
+                        } else {
+                            report.expires_undeliverable += 1;
+                        }
+                    }
+                    report.complete = true;
+                    return report;
+                }
+                Ok(crate::actor::DivestOutcome::RekeyInFlight) => {
+                    // A committed rekey is mid-flight in the actor. It is a
+                    // bounded operation, so the drain waits for it inside its
+                    // own deadline rather than parking a registrar that is
+                    // half-way through moving a row between cells.
+                    report.rekey_waits += 1;
+                    tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+                }
+                Err(error) => {
+                    warn!(?error, ?shard, "gateway: handover drain failed");
+                    report.store_errors += 1;
+                    return report;
+                }
+            }
+        }
+    }
+
+    /// Tell one divested holder its lease ended, then fan the advisory out.
+    ///
+    /// [`Redistributor::redistribute`] with `place` removed — see
+    /// [`Redistributor::drain_shard`] for why a drain never selects a
+    /// successor. The return value is whether the *holder's own* frame
+    /// reached a live session, because that, and not the construction of the
+    /// message, is what D26's I2 counts.
+    async fn expire_for_handover(
+        &self,
+        _router: &Arc<dyn Router>,
+        parked: crate::lease::ParkedLease,
+        audiences: &mut ExpireAudiences,
+    ) -> bool {
+        self.metrics.record_handover_park();
+        let message = LeaseMsg::Expire {
+            entity: parked.lease.entity,
+            lease_id: parked.previous_lease_id,
+            last_holder: Some(parked.previous_holder),
+            reason: parked.reason,
+            disposition: orrery_protocol::ExpireDisposition::Parked,
+        };
+        let delivered = match self.peers.current_session(parked.previous_holder).await {
+            Some(session) => {
+                session
+                    .notify(&GatewayReply::Lease {
+                        message: message.clone(),
+                    })
+                    .await
+            }
+            None => false,
+        };
+        // The non-holder advisory still goes out (D25): the entity has just
+        // stopped being written and every peer rendering it wants to know,
+        // handover or crash.
+        let audience = self
+            .fanout_audience(
+                audiences,
+                parked.grid,
+                parked.cell,
+                parked.previous_holder,
+                registrar_now_ms(),
+            )
+            .await;
+        self.fan_out_expire(audience, &message).await;
+        delivered
+    }
+
     /// Decide and enact the disposition of one parked row.
     async fn place(
         &self,
@@ -3622,6 +3881,16 @@ impl Redistributor {
 /// them onto a [`Router`] (a single runtime or a test cluster harness).
 pub struct GatewayServer {
     endpoint: Arc<Endpoint>,
+    /// The routing surface, retained so an operator-invoked shard handover can
+    /// reach the actors *and* the peer sessions in one place. It is the same
+    /// `Arc` the accept loop holds.
+    router: Arc<dyn Router>,
+    /// The registrar's successor/expiry machinery, retained for the same
+    /// reason: a handover drain has to deliver each `Expire` on the holder's
+    /// own connection, and the peer registry lives behind here.
+    redistributor: Arc<Redistributor>,
+    /// The drain's deadline, from [`GatewayConfig::handoff_deadline_ms`].
+    handoff_deadline_ms: u32,
     interest_authority: SharedInterestAuthority,
     authority_metrics: Arc<AuthorityMetrics>,
     metrics: Arc<GatewayMetrics>,
@@ -3677,6 +3946,7 @@ impl GatewayServer {
             claim_clock: Arc::clone(&admission.claim_clock),
             pending: tokio::sync::Mutex::new(HashMap::new()),
         });
+        let handoff_deadline_ms = config.handoff_deadline_ms;
         let lease_sweep_clock = config.lease_sweep_clock;
         let route_admission_wait_us = config.route_admission_wait_us;
         // One limiter per gateway, not per connection: the limit is per
@@ -3685,6 +3955,8 @@ impl GatewayServer {
         let (shutdown, rx) = oneshot::channel();
         let send_failures = Arc::new(AtomicU64::new(0));
         spawn_boundary_reporter(Arc::clone(&metrics));
+        let retained_router = Arc::clone(&router);
+        let retained_redistributor = Arc::clone(&redistributor);
         let join = tokio::spawn(accept_loop(
             endpoint.clone(),
             router,
@@ -3706,6 +3978,9 @@ impl GatewayServer {
         ));
         Ok(Self {
             endpoint,
+            router: retained_router,
+            redistributor: retained_redistributor,
+            handoff_deadline_ms,
             interest_authority,
             authority_metrics,
             metrics,
@@ -3762,11 +4037,79 @@ impl GatewayServer {
         self.send_failures.load(Ordering::Relaxed)
     }
 
+    /// Divest every live lease under `shard` through its holders' own
+    /// sessions here — steps 3 and 4 of a live shard handover (D26 rule 3,
+    /// docs/08-persistence.md §3.4.1).
+    ///
+    /// This is the *only* part of a handover the gateway owns, and it owns it
+    /// because it is the only part that needs a peer session: the fence CASes,
+    /// the quiesce and the `PreHandover` checkpoint are the runtime's and the
+    /// checkpoint store's, and the operator-facing sequencing is `persistd`'s.
+    /// See [`crate::runtime::CellRuntime::begin_handover`] for the step before
+    /// this one and [`crate::runtime::CellRuntime::complete_handover`] for the
+    /// step after.
+    ///
+    /// A report whose `complete` is `false` means the drain did not finish
+    /// inside `handoff_deadline_ms` and **the handover must be aborted**: the
+    /// rows it did not reach have live holders on this gateway, and moving the
+    /// row out from under them is exactly the hazard D26 exists to prevent.
+    pub async fn drain_shard_for_handover(&self, grid: GridId, shard: CellId) -> DrainReport {
+        self.drain_handle().drain_shard(grid, shard).await
+    }
+
+    /// A cloneable handle to the drain above, for an orchestrator that must
+    /// outlive a borrow of this server.
+    ///
+    /// `shutdown` consumes the `GatewayServer`, so a background task holding
+    /// `&self` could not exist — and a handover orchestrator is exactly such
+    /// a task. The handle carries the three things the drain needs and
+    /// nothing else.
+    #[must_use]
+    pub fn drain_handle(&self) -> ShardDrainHandle {
+        ShardDrainHandle {
+            router: Arc::clone(&self.router),
+            redistributor: Arc::clone(&self.redistributor),
+            handoff_deadline_ms: self.handoff_deadline_ms,
+        }
+    }
+
     /// Stop the accept loop and close the endpoint, awaiting the accept task.
     pub async fn shutdown(self) {
         let _ = self.shutdown.send(());
         self.endpoint.close().await;
         let _ = self.join.await;
+    }
+}
+
+/// The drain half of a live shard handover, detached from the server that
+/// owns it (D26 rule 3 steps 3–4).
+#[derive(Clone)]
+pub struct ShardDrainHandle {
+    router: Arc<dyn Router>,
+    redistributor: Arc<Redistributor>,
+    handoff_deadline_ms: u32,
+}
+
+impl ShardDrainHandle {
+    /// Divest every live lease under `shard`, bounded by one
+    /// `handoff_deadline_ms` for the whole shard.
+    ///
+    /// See [`GatewayServer::drain_shard_for_handover`], whose body this is.
+    pub async fn drain_shard(&self, grid: GridId, shard: CellId) -> DrainReport {
+        self.redistributor
+            .drain_shard(
+                &self.router,
+                grid,
+                shard,
+                Duration::from_millis(u64::from(self.handoff_deadline_ms)),
+            )
+            .await
+    }
+
+    /// The deadline the drain is bounded by, in milliseconds.
+    #[must_use]
+    pub const fn handoff_deadline_ms(&self) -> u32 {
+        self.handoff_deadline_ms
     }
 }
 
@@ -4961,6 +5304,7 @@ async fn serve_lease_message(cx: &LeaseContext, work: LeaseWork) {
             // (docs/08-persistence.md §3.5). The claim-rate token has already
             // been spent above, so this cannot be driven any faster than an
             // ordinary claim.
+            let transfer = router.shard_transfer(grid, cell).await;
             if let Some(epoch) = router.wrong_owner_epoch(grid, cell).await {
                 send(Bytes::from(encode_stream_frame(&GatewayReply::Lease {
                     message: LeaseMsg::Deny {
@@ -4970,12 +5314,47 @@ async fn serve_lease_message(cx: &LeaseContext, work: LeaseWork) {
                             grid,
                             shard: cell,
                             epoch,
-                            // ADR-0026's question, deliberately unanswered
-                            // here. See `DenyReason::WrongOwner`.
-                            owner: None,
+                            // D26 rule 3 step 8, and the one thing that makes
+                            // this a *redirect* rather than a refusal: if this
+                            // node handed the shard to a named sibling, say so.
+                            // `None` everywhere else, exactly as before —
+                            // nothing else in this process can answer "who owns
+                            // this cell", because that is the coordinator's
+                            // `(grid, shard) → gateway` publication and D26
+                            // rule 2 leaves it to later work.
+                            owner: transfer.and_then(|transfer| transfer.successor_gateway),
                         },
                         // No timer helps: re-addressing is the only thing
                         // that changes this answer.
+                        retry_after_ms: 0,
+                    },
+                })));
+                return;
+            }
+            // **Close admission** (D26 rule 3 step 2). The shard is still
+            // served — diffs and heartbeats keep flowing, which is what makes
+            // a drain invisible to gameplay — but a claim granted now would
+            // create a live holder under a subtree that is about to move, and
+            // the drain has already enumerated what it has to divest.
+            //
+            // Answered as a redirect rather than as `NotEligible`, because
+            // that is what it is: the claimant is fine, and by the time it
+            // re-addresses, the successor will own the row.
+            if transfer
+                .is_some_and(|transfer| transfer.phase == crate::runtime::TransferPhase::Draining)
+            {
+                redistributor.metrics.record_claim_denied_draining();
+                send(Bytes::from(encode_stream_frame(&GatewayReply::Lease {
+                    message: LeaseMsg::Deny {
+                        claim_id: Some(claim_id),
+                        entity,
+                        reason: orrery_protocol::DenyReason::WrongOwner {
+                            grid,
+                            shard: cell,
+                            epoch: transfer
+                                .map_or(orrery_protocol::Epoch::new(0), |transfer| transfer.epoch),
+                            owner: transfer.and_then(|transfer| transfer.successor_gateway),
+                        },
                         retry_after_ms: 0,
                     },
                 })));
@@ -5218,6 +5597,16 @@ async fn serve_lease_message(cx: &LeaseContext, work: LeaseWork) {
             // correct floor — a peer that has not been taught to read it is no
             // worse off than before this existed.
             if !vanished {
+                // D26 I2's second counter, and the useful one in a fault
+                // injection: it counts renewals that arrived at a process no
+                // longer hosting the shard. A planned handover leaves it at
+                // zero, because the drain divested every holder before the
+                // ownership CAS; the naive "stop serving and let the fresh
+                // TTL ride it out" alternative makes it rise once per holder
+                // per heartbeat interval for ten seconds.
+                for _ in 0..misaddressed.len() {
+                    redistributor.metrics.record_heartbeat_wrong_owner();
+                }
                 for entry in misaddressed {
                     send(Bytes::from(encode_stream_frame(&GatewayReply::Lease {
                         message: LeaseMsg::Deny {
@@ -5227,7 +5616,7 @@ async fn serve_lease_message(cx: &LeaseContext, work: LeaseWork) {
                                 grid: entry.grid,
                                 shard: entry.cell,
                                 epoch: entry.epoch,
-                                owner: None,
+                                owner: entry.owner,
                             },
                             retry_after_ms: 0,
                         },
@@ -8816,6 +9205,7 @@ mod tests {
                 grid: GridId::ROOT,
                 cell: theirs,
                 epoch: Epoch::new(4),
+                owner: None,
             }],
             "only the lease whose shard is elsewhere carries a routing reason"
         );
