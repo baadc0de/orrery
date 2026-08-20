@@ -46,8 +46,9 @@ registrar's expiry sweep can observe anything, and a longer one names an
 instant after that sweep has already parked every row — so `10 s` is the only
 value that adds no third timer to the two this system already has.
 
-The `Expire` fan-out rows are added by [D25](0025-expire-fan-out.md), and are
-*proposed* rather than accepted until that record is. *Fan-out dispositions* is
+The `Expire` fan-out rows are set by [D25](0025-expire-fan-out.md). Both values
+are derived from D6's population ceiling and D7 §10's bucket shape rather than
+measured, and D25 records that limit. *Fan-out dispositions* is
 which expiry outcomes are copied to non-holders: `Reassigned` is excluded
 because [INV-4](../04-authority.md) converges observers on the successor's
 first envelope without any message, while a parked entity has no successor

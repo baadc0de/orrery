@@ -39,7 +39,7 @@ their linked dependencies.
 | D22 | [ADR-0022](adr/0022-grid-id-in-the-storage-key.md) | `GridId` stays a key discriminator (P-7) |
 | D23 | [ADR-0023](adr/0023-follower-journal-retention.md) | Follower journal retention and the P2 retention clause |
 | D24 | [ADR-0024](adr/0024-island-drain.md) | Island drain is peer-driven; no evacuation |
-| D25 | [ADR-0025](adr/0025-expire-fan-out.md) | `Expire` fan-out recipient set and amplification bound (**Proposed**) |
+| D25 | [ADR-0025](adr/0025-expire-fan-out.md) | `Expire` fan-out recipient set and amplification bound |
 | D26 | [ADR-0026](adr/0026-sibling-gateways.md) | Sibling gateways: ownership, reachability, live handover |
 
 ## Status and supersession

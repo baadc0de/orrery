@@ -1,6 +1,6 @@
 # ADR-0025: `Expire` fan-out — recipient set, non-holder addressing, amplification bound
 
-**Status:** Proposed · **Date:** 2026-08-20 · **Decision:** D25
+**Status:** Accepted · **Date:** 2026-08-20 · **Decision:** D25
 
 This decision is normative once accepted. See the [ADR index](../DECISIONS.md)
 for precedence, scope, and the complete decision set.
@@ -346,6 +346,34 @@ pass. Per `(grid, cell)` it is bounded by the cells one peer's grant may cover,
 - **Bound fan-out with D7 §10's claim bucket.** It is a peer-side ingress
   limit on `Claim`; it never sees a registrar egress message and cannot
   constrain one. Naming it as the bound would be a citation, not a limit.
+
+## Accepted with these caveats
+
+Accepted 2026-08-20 with three limits stated rather than resolved, so that a
+later reader knows which parts rest on measurement that has not been taken.
+
+- **The two constants are derived, not measured**, and the record says so
+  below. They are safe in the direction that matters — both are ceilings, and
+  the structural collapse in §"The bound" is what makes the expected cost
+  near-zero regardless of where the ceilings sit — but neither number should
+  be quoted as an observed figure until the `|A|` distribution is measured
+  under the P2 workload.
+- **One open question is now closed by [D26](0026-sibling-gateways.md)**, which
+  was accepted the same day. This record confines all future widening to the
+  `Sessions(G, t)` term, and D26 rule 2 builds the cluster-wide session
+  directory as a control-plane index that changes exactly that term and not the
+  `InterestAuthority::allows` predicate, the message, the client rule, or the
+  bound's shape. The seam holds as designed; no amendment is owed here when the
+  directory lands.
+- **The `p3-island` observability consequence is a leg, not a blanket.**
+  Retiring `p3-island/src/main.rs:32-36`'s "parking is not observable from any
+  peer" is reachable on the **strong-claim leg**
+  (`P3_VICTIM_CLAIM_KIND=strong`), where `STRONG_HELD` parks before candidates
+  are computed (`gateway.rs:3041-3050`) and the survivors are a live audience.
+  On the weak leg the victim's entities reassign, which this record keeps
+  holder-only because INV-4 already converges observers. Any issue asserting
+  that limitation is retired must name the strong leg, or it asserts something
+  unreachable by construction.
 
 ## Open questions
 
