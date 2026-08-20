@@ -288,6 +288,81 @@ gate_p3_island_evidence() {
   ev "$status" "$dir" "$numbers"
 }
 
+# ── P3 sibling gateways ──────────────────────────────────────────────────────
+#
+# Two live gateways over disjoint shards, so unlike the island gate this one
+# cannot run without FoundationDB: the whole question is what two processes
+# sharing one fence and one lease tier do to each other's rows, and a volatile
+# lease store would make them unrelated. It also *seeds* a world and activates
+# two shard sets against the fence, so it consumes its cluster exactly as
+# `p2-kill9` does — pointing it at the box's shared development database would
+# either fail on the seeder's offline-load refusal or write into a database
+# three runners and a developer are using. Refused here with a reason, so the
+# answer is SKIPPED rather than FAILED.
+gate_p3_siblings_tier() { echo full; }
+gate_p3_siblings_prereq() {
+  # `--inspect` runs nothing, so every clause below would only hide the
+  # evidence already on disk behind a SKIPPED row that claimed the cluster was
+  # the problem. The prerequisite is about *running* this gate.
+  [[ ${MODE:-} == inspect ]] && return 0
+  local cf=${ORRERY_FDB_CLUSTER_FILE:-}
+  [[ -n $cf ]] || { echo 'ORRERY_FDB_CLUSTER_FILE is not set; two gateways must share one durable fence and lease tier'; return 1; }
+  [[ -r $cf ]] || { echo "ORRERY_FDB_CLUSTER_FILE=$cf is not readable"; return 1; }
+  command -v fdbcli >/dev/null || { echo 'fdbcli is not on PATH; cannot establish that the cluster is fresh'; return 1; }
+  timeout 20 fdbcli -C "$cf" --exec 'status minimal' 2>/dev/null | grep -q 'is available' \
+    || { echo "the cluster at $cf is not available"; return 1; }
+  local rows
+  rows=$(timeout 30 fdbcli -C "$cf" --exec 'getrangekeys a b 1' 2>/dev/null | grep -c '^`') || true
+  [[ ${rows:-0} -eq 0 ]] \
+    || { echo "the cluster at $cf already carries an actor/ activation row; this gate seeds a world and activates two shard sets, and needs a fresh throwaway cluster"; return 1; }
+  have_cargo || { echo 'cargo is not on PATH'; return 1; }
+  return 0
+}
+gate_p3_siblings_run() {
+  {
+    cargo build --release --manifest-path "$ROOT/Cargo.toml" -p orrery_persistd --features fdb
+    cargo build --release --manifest-path "$ROOT/Cargo.toml" -p orrery_seed --features orrery_seed/fdb
+    cargo build --release --manifest-path "$ROOT/Cargo.toml" -p orrery_coordinator
+    (cd "$ROOT/p3-siblings" && cargo build --release)
+    PERSISTD_BIN="$ROOT/target/release/persistd" \
+    COORDINATOR_BIN="$ROOT/target/release/orrery-coordinator" \
+    ORRERY_SEED_BIN="$ROOT/target/release/orrery-seed" \
+    P3_SIBLINGS_BIN="$ROOT/p3-siblings/target/release/p3-siblings" \
+    P3_SIBLINGS_GATE_OUT="$OUT/p3-siblings-$(date -u +%Y%m%dT%H%M%SZ)" \
+      "$ROOT/scripts/p3-siblings-gate.sh"
+  } >"$OUT/logs/p3-siblings.log" 2>&1
+}
+# Every number is read out of the gate's own `report.json` and none is
+# re-derived here: a figure this script computed itself would be a second
+# implementation of the gate, and the two would disagree exactly when it
+# mattered. `duplicate_authority` in that file is already the sum over both
+# registrars' exports; the two halves ride beside it so the sum can be checked
+# rather than trusted.
+gate_p3_siblings_evidence() {
+  local dir
+  dir=$(ls -1d "$OUT"/p3-siblings-* "$ROOT"/p3-siblings-2* 2>/dev/null | sort | tail -1) || true
+  [[ -n ${dir:-} && -r $dir/report.json ]] || { ev_none; return 0; }
+  local numbers status
+  numbers=$(jq -c '{
+    peers, entities_total, entities_gateway_a, entities_gateway_b,
+    shards_gateway_a, shards_gateway_b,
+    victim_entities, victim_entities_gateway_a, victim_entities_gateway_b,
+    reassigned, parked, successors,
+    settled_in_ms, settle_budget_ms, lease_ttl_ms,
+    duplicate_authority, duplicate_authority_gateway_a, duplicate_authority_gateway_b,
+    misrouted_claims, wrong_owner_probe,
+    survivor_leases_lost,
+    gateway_killed: .gateway_kill.killed,
+    gateway_kill_clean: .gateway_kill.clean,
+    survivor_leases_held_before: .gateway_kill.survivor_leases_held_before,
+    survivor_leases_held_after: .gateway_kill.survivor_leases_held_after,
+    survivor_leases_expired_after: .gateway_kill.survivor_leases_expired_after,
+    lost: (.lost | length)
+  }' "$dir/report.json" 2>/dev/null || echo '{}')
+  if [[ -e $dir/PASSED ]]; then status=PASSED; else status=FAILED; fi
+  ev "$status" "$dir" "$numbers"
+}
+
 # ── P2 kill-9 ────────────────────────────────────────────────────────────────
 
 gate_p2_kill9_tier() { echo full; }

@@ -155,6 +155,7 @@ CIs in one week came from that blind spot. The inventory, which is also
 | `p0-nat-test` | `cargo check --all-targets` — no tests |
 | `p0-dashboard` | `cargo check --all-targets` — no tests |
 | `p3-island` | `cargo check --all-targets` — no tests; asserted by the nightly island gate |
+| `p3-siblings` | `cargo test` in `gates` — 4 tests; the two-gateway harness, asserted by the nightly sibling gate |
 
 The four tool suites are 87 tests between them, which is the number that would
 go unrun if the `gates` lane stopped visiting them.

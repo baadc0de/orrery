@@ -34,6 +34,9 @@ p2-kill9-*/
 p2-abba-*/
 p2-gateway-*/
 p3-island-*/
+# The sibling-gateway gate's evidence. `p3-siblings-2*` rather than
+# `p3-siblings-*` so the tool directory itself is not swept up with it.
+p3-siblings-2*/
 
 # Agent worktrees. These are full checkouts with their own .git, so a stray
 # `git add -A` stages three embedded repositories instead of ignoring them.
