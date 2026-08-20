@@ -2,13 +2,15 @@
 //!
 //! Cell actors checkpoint **copy-on-update** on a **20 s, jittered per shard**
 //! cadence (spreads FDB write load; prevents cluster-wide checkpoint
-//! synchronization), and **immediately on cell quiesce** — when a cell's last
-//! player leaves (coordinator signal), the actor checkpoints and may be parked.
+//! synchronization), and **immediately on cell quiesce** — a flush pulled
+//! forward ahead of the cell's next jittered tick, after which the cell's
+//! rows may be parked by the ordinary per-entity lease paths.
 //!
 //! This module owns that cadence. A [`CheckpointScheduler`] runs one timer per
 //! shard cell, each jittered independently, and fires a checkpoint to the
-//! runtime's [`CheckpointStore`]. A [`QuiesceSignal`] lets the coordinator
-//! request an immediate quiesce-flush for a cell.
+//! runtime's [`CheckpointStore`]. A [`QuiesceSignal`] lets *this process*
+//! request an immediate quiesce-flush for a cell; see its docs for why that
+//! is not a request anything outside the process can make.
 //!
 //! The scheduler re-reads its runtime's shard set every loop iteration and
 //! reconciles the timer vector against it, so shards that appear after the
@@ -167,11 +169,40 @@ pub fn spawn_mirror_retention(
     MirrorRetention { shutdown, join }
 }
 
-/// A request to quiesce-flush a cell (coordinator signal, §8).
+/// An in-process request to checkpoint one cell immediately (§8).
 ///
-/// When a cell's last player leaves, the coordinator asks the scheduler to
-/// checkpoint that cell immediately, so hot memory is bounded by *populated*
-/// cells, not universe size.
+/// This is a handle on a channel into the scheduler's own task and nothing
+/// more. It has no wire representation, and no component outside this process
+/// can raise it. The wording here previously said the *coordinator* asks for
+/// the flush when a cell's last player leaves; D24 (a) rules that out — the
+/// gateway holds only the coordinator's **public** keys and no connection to
+/// it, the peer being the courier for every coordinator fact the persistence
+/// tier acts on ([`crate::gateway::CoordinatorHandoutAuthority`]), so there is
+/// no coordinator→gateway control edge that could carry such a request, and
+/// D24 declined to add one. D24 (c) settles what "checkpoint and quiesce"
+/// therefore means today: every affected lease row is parked by one of the
+/// ordinary per-entity paths, and the cell's state reaches durability on the
+/// ordinary 20 s jittered cadence (D16). This signal only pulls that flush
+/// forward.
+///
+/// **A flush does not bound hot memory.** A checkpoint writes the cell's state
+/// to durable storage and the actor goes on holding it; there is no cell-state
+/// eviction path anywhere in this crate (the only `evict` in
+/// `orrery_persistd` is the gateway's idle-*peer* registry, which is
+/// unrelated despite the shared word). Bounding the hot tier by *populated*
+/// cells rather than universe size is the **intent of a path that is not
+/// built** — issue #124 Part 2, which must settle the trigger, the durability
+/// precondition, the interaction with §3.4 fencing, and the write
+/// amplification D23 measured, in an ADR before any of it exists.
+///
+/// **Why this stays `pub` with no production caller.** Its only caller in the
+/// tree is a test (`tests/checkpoint_restore.rs`). It is kept public
+/// deliberately, as the seam issue #124 Part 2 builds on: an eviction path
+/// needs exactly this "flush this cell now" entry point in order to establish
+/// its own safety precondition — a cell may only be dropped from memory once
+/// its state is durable — and removing the type now only to re-add it then
+/// would churn the crate's public API for no gain. If #124 is ever closed
+/// without an eviction path, this is dead surface and should go with it.
 #[derive(Debug, Clone)]
 pub struct QuiesceSignal {
     tx: tokio::sync::mpsc::Sender<CellId>,
@@ -197,8 +228,12 @@ pub struct CheckpointScheduler {
 }
 
 impl CheckpointScheduler {
-    /// The quiesce-flush signal, for the coordinator to request immediate
-    /// checkpoints of drained cells.
+    /// The quiesce-flush signal: an in-process handle for requesting an
+    /// immediate checkpoint of a cell, ahead of its jittered cadence.
+    ///
+    /// Not the coordinator's to call — it has no path here (D24 (a)) — and
+    /// not a memory bound. See [`QuiesceSignal`] for both, and for why the
+    /// type stays public with no production caller.
     #[must_use]
     pub fn quiesce_signal(&self) -> QuiesceSignal {
         self.quiesce.clone()
