@@ -307,10 +307,14 @@ Redistribution is NGO-style: the successor inherits last-known committed state, 
 **Successor selection as implemented.** Candidacy is deliberately no wider than
 a live claim's own admission, and is evaluated by calling the *same* predicate
 rather than reimplementing it: a peer qualifies only when it has a live
-authenticated session on this gateway and `InterestAuthority::allows` accepts
-it for the entity's committed cell — exactly what a `Claim` passes.
-Redistribution can therefore never place authority somewhere an ordinary claim
-could not. True metric proximity needs peer positions the coordinator does not
+authenticated session on the gateway that owns the entity's shard and
+`InterestAuthority::allows` accepts it for the entity's committed cell —
+exactly what a `Claim` passes. Redistribution can therefore never place
+authority somewhere an ordinary claim could not. The gateway qualifier is
+normative under [D26](adr/0026-sibling-gateways.md) rule 4, not an artefact of
+the single-gateway implementation: a successor on a sibling gateway is never
+selected, because a grant needs liveness the granting registrar can observe and
+a renewal follows the session. True metric proximity needs peer positions the coordinator does not
 yet hand the gateway, so "nearest interacting peer" is read off the data that
 is authoritative here, in order:
 

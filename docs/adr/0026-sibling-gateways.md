@@ -1,6 +1,6 @@
 # ADR-0026: Sibling gateways: ownership, reachability, and live shard handover
 
-**Status:** Proposed · **Date:** 2026-08-20 · **Decision:** D26
+**Status:** Accepted · **Date:** 2026-08-20 · **Decision:** D26
 
 This decision is normative once accepted. See the [ADR index](../DECISIONS.md)
 for precedence, scope, and the complete decision set.
@@ -138,6 +138,16 @@ Three reasons, in the order they carry weight.
 - **The saving is imaginary.** HRW's virtue is "no central assignment table",
   and the central table exists regardless: every activation reads
   `actor/{grid}/{shard}` for fencing, so removing HRW removes no read.
+
+**This rule is provisional on there being no membership service, and that is
+the fact most likely to overturn it.** Making HRW normative and deriving
+`--shard` from it is the better design the moment the cluster can agree on its
+own node set and weights, and it is the alternative this record would have
+taken if one existed. Nothing here is hard to unwind: `propose` is already the
+right function, `--shard` would become its output rather than an operator's
+input, and no durable data depends on the switch because the `actor/` row
+remains the fence either way. A reader who arrives holding a membership
+protocol should re-open this rule before building anything on top of it.
 
 **The hash takes the `GridId`.** If a planner is kept, `propose` mixes the
 grid: `hash2(cell.to_bits(), node.id)` (`placement.rs:69`) does not, so two
@@ -293,6 +303,18 @@ peer set, and `InterestAuthority::allows` — the predicate candidacy already
 shares with live claims — is doing the narrowing anyway. The residual is the
 peer interested in `S` that has not *yet* dialled `S`'s owner; it parks, and
 unparks on its first claim.
+
+**But that mitigation is not in force yet, and until it is, this rule is a
+capability loss.** The convergence argument above assumes multi-homing — a peer
+holding a session to every gateway owning a shard it cares about. This record
+does not build that: the `GatewayConfig` resolver and the coordinator's
+`(grid, shard) → gateway` publication are named as consequences and left to
+later P3 work. Until they land, a two-gateway deployment parks every entity
+whose only eligible successor is connected to the sibling, where a one-gateway
+deployment would have reassigned it. That is strictly worse, for exactly the
+configuration this record exists to enable. It is therefore a sequencing
+constraint and not merely a backlog item: **multi-homing lands before a second
+gateway carries live players, not after.**
 
 ### 5. The handover invariant, in checkable terms
 
