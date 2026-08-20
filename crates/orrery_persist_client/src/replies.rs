@@ -1328,6 +1328,104 @@ mod tests {
     }
 
     #[test]
+    fn a_stale_nack_after_an_observed_parking_cannot_repoint_the_holder() {
+        // The contrast to the test above, for the D25 fan-out lane, and it
+        // lives here because `reconcile_lease_nack` — the code whose ordering
+        // this protects — lives here and not in `orrery_authority`.
+        //
+        // A peer that never held the lease is *permanently* in the state that
+        // test describes: it holds no fence, so the `superseding` fallback
+        // resolves every late row against the sequence pair alone. An observer
+        // branch that stamped a fresh `(0, 0)` while repointing the holder
+        // would therefore not merely lose one entity's ordering, it would open
+        // the same hole on every entity a peer watches — including entities no
+        // registrar message ever addressed to it before D25.
+        let (mut app, session_entity) = reply_app();
+        app.add_plugins(OrreryAuthorityPlugin);
+        let persisted = PersistId::new(26);
+        let pair = SeqPair {
+            own_seq: 0,
+            auth_seq: 5,
+        };
+        let watched = app
+            .world_mut()
+            .spawn((
+                PersistIdentity(persisted),
+                Authority {
+                    holder: Some(node(8)),
+                    seq: pair,
+                },
+                AuthorityPhase::Remote,
+            ))
+            .id();
+        app.world_mut().resource_mut::<AuthorityState>().node = node(1);
+
+        // Given: node 8 dropped out, nobody could take its lease, and the
+        // gateway fanned the parking out to the peers watching the cell. This
+        // peer is one of them and holds no fence for the entity.
+        app.world_mut()
+            .resource_mut::<LeaseInbox>()
+            .0
+            .push(orrery_protocol::LeaseMsg::Expire {
+                entity: persisted,
+                lease_id: LeaseId(7),
+                last_holder: Some(node(8)),
+                reason: orrery_protocol::ExpireReason::Disconnect,
+                disposition: orrery_protocol::ExpireDisposition::Parked,
+            });
+        app.update();
+        assert_eq!(
+            app.world().get::<Authority>(watched).map(|a| a.holder),
+            Some(None),
+            "the observer demotes the body to parked, render-only"
+        );
+        app.world_mut()
+            .resource_mut::<Messages<AuthorityEvent>>()
+            .clear();
+
+        // When: a NACK the gateway sent before any of that is delivered late,
+        // carrying the row that was current when it left.
+        push_nack(
+            &mut app,
+            session_entity,
+            persisted,
+            Tick::new(3),
+            Some(lease_row(
+                persisted,
+                Some(node(3)),
+                LeaseId(2),
+                SeqPair {
+                    own_seq: 0,
+                    auth_seq: 3,
+                },
+            )),
+        );
+        app.update();
+
+        // Then: the pair the advisory left alone is what refuses it. Had the
+        // observer reset the row, `(0, 3)` would have superseded `(0, 0)` and
+        // a parked body would be rendering against node 3, which holds
+        // nothing, with no `Lost` event to show for it.
+        let authority = app
+            .world()
+            .get::<Authority>(watched)
+            .expect("the entity keeps its authority component");
+        assert_eq!(
+            authority.holder, None,
+            "a row the registrar has moved past must not un-park the entity"
+        );
+        assert_eq!(authority.seq, pair, "and the pair never goes backwards");
+        assert!(
+            app.world_mut()
+                .resource_mut::<Messages<AuthorityEvent>>()
+                .drain()
+                .next()
+                .is_none(),
+            "no fence was held, so there is nothing to report either way"
+        );
+    }
+
+    #[test]
     fn hello_ack_naming_an_unsupported_protocol_ends_the_session() {
         let (mut app, session_entity) = hello_app();
         push_reply(
