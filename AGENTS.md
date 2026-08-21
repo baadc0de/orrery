@@ -668,15 +668,29 @@ this machine there is no second one to stand up on a whim.
 `ORRERY_FDB_DEV_DIR`, the cluster description, the memory sizes and the
 `FDBSERVER` path all come from the environment, and an instance is identified by
 its data directory rather than by its port, so `stop` can never reach an
-instance it did not start. **But `start` cannot run here: there is no
-`fdbserver` binary on this box.** `foundationdb-clients` is installed — that is
-`fdbcli`, `fdbbackup` and `libfdb_c`, which is what the builds and
-`foundationdb-sys`'s bindgen actually need — and the *server* package is not.
-The `fdbserver` you can see in `ps` is root-owned and lives in a container.
+instance it did not start.
 
-The dev cluster is that container: **`orrery-fdb`, image
-`foundationdb/foundationdb:7.3.63`, host networking, serving `127.0.0.1:4500`,
-with the main checkout's `.fdb-dev/data` bind-mounted at `/var/fdb/data`.** So
+**`start` does work here.** An earlier revision of this section said it could
+not — that there was no `fdbserver` binary, only `foundationdb-clients`, and
+that the process in `ps` was root-owned and lived in a container. All three
+claims are wrong, and they were repeated into agent briefings for a day before
+anyone checked. Verify for yourself rather than trusting either version:
+
+```
+which fdbserver                     # /usr/bin/fdbserver — the server package IS installed
+ss -lntp | grep 4500                # served by fdbserver, not a container
+ps -o user= -p <that pid>           # owned by the dev user, not root
+docker ps | grep -i fdb             # no fdb container exists
+```
+
+So an agent needing a cluster it can clobber should start its **own
+`fdbserver`** on a non-default port with its own data directory — which is
+exactly what `fdb-dev.sh` is parameterised for — rather than standing up a
+container. The shared instance on `127.0.0.1:4500` is still shared: take the
+`fdb-dev` lease before writing to it, and never `stop`, `reset` or `pkill` it.
+
+The shared dev cluster serves `127.0.0.1:4500` from the main checkout's
+`.fdb-dev/data`. So
 the route to it is its cluster file, not the script — and that file lives in the
 *main checkout*, which is why a worktree cannot find it by looking around:
 
