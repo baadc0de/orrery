@@ -47,101 +47,45 @@ env:
   CARGO_INCREMENTAL: 0
 
 jobs:
-  # Is any larger hosted shape reachable from this repository at all? Larger
-  # runners are an organisation feature; this repository is owned by a user
-  # account, so the honest answer may be "no", and that is a finding #170 needs
-  # rather than something to work around. Cheap: each leg prints its own shape
-  # and exits.
-  probe-shapes:
-    name: probe ${{ matrix.label }}
-    strategy:
-      fail-fast: false
-      matrix:
-        label:
-          - ubuntu-latest
-          - ubuntu-24.04-arm
-          - ubuntu-latest-4-core
-          - ubuntu-latest-8-core
-          - ubuntu-latest-16-core
-    runs-on: ${{ matrix.label }}
-    timeout-minutes: 10
-    steps:
-      - name: What is this machine
-        run: |
-          set -euo pipefail
-          {
-            echo "### ${{ matrix.label }}"
-            echo
-            echo '```'
-            echo "arch:    $(uname -m)"
-            echo "nproc:   $(nproc)"
-            echo "memory:  $(free -h | awk '/^Mem:/{print $2}')"
-            echo
-            df -h / /mnt 2>&1 || true
-            echo
-            lsblk -o NAME,SIZE,MOUNTPOINT 2>&1 || true
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
-          df -h
-
-  # The first hosted run of the `gates` lane died in 10 s, before any build, on
-  # `scripts/p3-island-gate.sh --self-test` reporting "entity seeding absent" —
-  # a check that passes on the self-hosted box and on a developer machine. The
-  # clause reads one `launch()` invocation out of the script body with
-  # `awk -v bin="\"\$$1\" \\"`, whose value ends in a lone backslash. Ubuntu's
-  # default `awk` is mawk; a developer machine and the box have gawk. This job
-  # tests that hypothesis directly rather than assuming it, because "the gates
-  # lane cannot run on a hosted runner" is a blocking finding for #178 and it
-  # has to be stated with the cause attached.
-  diagnose-awk:
-    name: which awk reads the island gate's self-test
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@v7
-      - name: Reproduce the launch() extraction under each awk
-        run: |
-          set -uo pipefail
-          readlink -f "$(command -v awk)" || true
-          awk -W version 2>&1 | head -2 || awk --version 2>&1 | head -2 || true
-          sudo apt-get update -qq && sudo apt-get install -y -qq gawk mawk
-
-          body="$(sed -n '/^: /,$p' scripts/p3-island-gate.sh | grep -v '^[[:space:]]*#')"
-          for a in mawk gawk; do
-            got=$("$a" -v bin="\"\$PERSISTD_BIN\" \\" \
-              '$0 == bin { inside = 1 }
-               inside { print; if ($0 !~ /\\$/) exit }' <<<"$body" | head -3)
-            echo "--- $a extracted ${#got} bytes:"
-            printf '%s\n' "$got"
-          done
-          echo "--- the line it is looking for, as it appears in the script:"
-          grep -n 'PERSISTD_BIN" \\' scripts/p3-island-gate.sh | head -3
-
-      - name: Does the whole self-test pass under gawk
-        run: |
-          set -uo pipefail
-          sudo update-alternatives --set awk /usr/bin/gawk
-          scripts/p3-island-gate.sh --self-test
-          echo "gawk rc=$?"
-
   measure:
-    name: ${{ matrix.lane }} on ${{ matrix.runner }}${{ matrix.gawk == 'yes' && ' (gawk)' || '' }}
+    name: ${{ matrix.lane }} on ${{ matrix.runner }}${{ matrix.awk != '' && format(' ({0})', matrix.awk) || '' }}
     strategy:
       # One lane running out of disk is the most informative result this
       # workflow can produce. Never cancel the others because of it.
       fail-fast: false
       matrix:
         include:
-          - { lane: clippy, runner: ubuntu-latest, gawk: 'no' }
-          - { lane: gates,  runner: ubuntu-latest, gawk: 'no' }
-          - { lane: test,   runner: ubuntu-latest, gawk: 'no' }
-          # The `gates` lane as-is stops in 10 s on an awk difference, which
-          # yields no build figure at all. This leg installs gawk — the awk the
-          # self-hosted box and every developer machine already has — so the
-          # lane runs to the end and #178 gets the disk and wall-clock number it
-          # needs. Nothing is skipped, disabled or weakened: more of the lane
-          # executes, not less. Both legs are reported.
-          - { lane: gates,  runner: ubuntu-latest, gawk: 'yes' }
+          # `clippy` and `test` on ubuntu-latest are already measured by the
+          # first two runs of this workflow and are not repeated here.
+          #
+          # The `gates` lane as-is dies in 10 s, before any build, on
+          # `scripts/p3-island-gate.sh --self-test`. Measured, not guessed:
+          # `diagnose-awk` in run 32468201653 showed the runner image's awk is
+          # **gawk 5.2.1**, which drops the trailing lone backslash in
+          # `awk -v bin="\"\$$1\" \\"` and so extracts 0 bytes; mawk extracts
+          # the 62-byte invocation correctly, and this repository's developer
+          # machine has gawk 5.4.1, which also works. So the lane is unrunnable
+          # on the hosted image for a reason that has nothing to do with disk,
+          # and forcing gawk (run 32468201653's `(gawk)` leg) does not help —
+          # gawk 5.2.1 *is* the problem.
+          #
+          # This leg points `awk` at mawk so the lane runs to the end and #178
+          # gets a disk and wall-clock figure. Nothing is skipped, disabled or
+          # weakened: more of the lane executes, not less, and the same clause
+          # is evaluated — by an awk that reads it correctly. Both the as-is
+          # failure and this figure are reported.
+          - { lane: gates, runner: ubuntu-latest, awk: mawk }
+          # Larger hosted shapes are an organisation feature and this
+          # repository is owned by a user account, so `ubuntu-latest-{4,8,16}
+          # -core` never picked up a runner. `ubuntu-24.04-arm` is the only
+          # other hosted shape reachable here; it is not larger in CPU or RAM
+          # but it is a different image with more free disk (109 GiB against
+          # 87 GiB). Only `test` is measurable on it: the FoundationDB action
+          # downloads `foundationdb-clients_${version}-1_amd64.deb`
+          # (.github/actions/foundationdb/action.yml), so the two lanes that
+          # need the client cannot run on arm64 as things stand — itself a
+          # finding for #179.
+          - { lane: test, runner: ubuntu-24.04-arm, awk: '' }
     runs-on: ${{ matrix.runner }}
     # ci.yml gives these lanes 30 minutes on a warm self-hosted box. Cold, with
     # no cache at all, they may take far longer; a bound this generous is there
@@ -183,14 +127,17 @@ jobs:
         if: matrix.lane == 'clippy' || matrix.lane == 'gates'
         uses: ./.github/actions/foundationdb
 
-      - name: Make gawk the default awk
-        if: matrix.gawk == 'yes'
+      - name: Point awk at ${{ matrix.awk }}
+        if: matrix.awk != ''
         run: |
           set -euo pipefail
           sudo apt-get update -qq
-          sudo apt-get install -y -qq gawk
-          sudo update-alternatives --set awk /usr/bin/gawk
+          sudo apt-get install -y -qq "${{ matrix.awk }}"
+          sudo update-alternatives --set awk "/usr/bin/${{ matrix.awk }}"
           readlink -f "$(command -v awk)"
+          # Prove the clause that stopped the lane now reads correctly, before
+          # spending an hour measuring a lane that would die at the same line.
+          scripts/p3-island-gate.sh --self-test
 
       # Deliberately no actions/cache: #171 measures the uncached worst case so
       # the later cache comparison (#175) has an honest floor.
@@ -317,7 +264,7 @@ jobs:
       - uses: actions/upload-artifact@v7
         if: always()
         with:
-          name: samples-${{ matrix.lane }}-${{ matrix.runner }}-gawk-${{ matrix.gawk }}
+          name: samples-${{ matrix.lane }}-${{ matrix.runner }}-awk${{ matrix.awk }}
           path: ${{ runner.temp }}/measure/
           retention-days: 30
 
