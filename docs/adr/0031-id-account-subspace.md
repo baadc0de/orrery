@@ -1,6 +1,10 @@
 # ADR-0031: The `id/` account subspace, its reverse index, and what a miss means
 
-**Status:** Proposed · **Date:** 2026-08-21 · **Decision:** D31
+**Status:** Accepted · **Date:** 2026-08-21 · **Decision:** D31
+
+> Accepted by the repo owner on 2026-08-21, together with the four open
+> questions below, which were resolved by owner-delegated decision recorded on
+> PR #225. Question 5 remains open and is the standing record's to answer.
 
 This decision is normative once accepted. See the [ADR index](../DECISIONS.md)
 for precedence, scope, and the complete decision set.
@@ -169,6 +173,9 @@ without any lookup. The reverse index is a gateway concern.
 
 ```
 da ‖ account:u64 BE                              10 B  → AccountRow
+                                                   (incl. binding_event_count:u32
+                                                    and first_event_ms:u64 — see
+                                                    Resolved question 2)
 db ‖ node:[u8;32]                                34 B  → (AccountId, bound_at_ms)
 dh ‖ node:[u8;32] ‖ versionstamp:[u8;10]         44 B  → (AccountId, BindKind, at_ms)
 
@@ -610,36 +617,92 @@ Open question 1.
   audit's question runs node→account, and an account-keyed history answers it
   only by scanning.
 
+## Resolved questions
+
+Questions 1–4 were resolved by owner-delegated decision on 2026-08-21 and are
+recorded here as part of the accepted record. The full reasoning, including what
+was rejected and the condition that would reverse each, is on PR #225.
+
+1. **Recording the binding view with `AttestRow` — no.** A `Vec<u32>` of
+   `binding_epoch` parallel to `AttestRow.eligible` is **not** added, and D27
+   clause (f)'s artifact is not amended for this. Two reasons, the second
+   decisive: resolved question 3 subsumes it — an announcement that carries
+   accounts makes the eligibility view coordinator-signed and epoch-frozen,
+   which collapses the `T_stale` residual at the source rather than recording it
+   after the fact. And on its own it would buy little: `AttestRow` is GC'd with
+   the intent's own row at `INTENT_ROW_RETENTION_MS`, **one hour**
+   (`intent/fdb.rs:86`, applied at `:927`), so a durable `binding_epoch` vector
+   would outlive nothing. **Reverses if** question 3 is rejected or deferred
+   indefinitely.
+
+2. **`T_history` = 90 days, hard delete at expiry, with a write-time fold.**
+   `da` additionally carries `binding_event_count: u32` and
+   `first_event_ms: u64`, maintained in the same transaction that appends a `dh`
+   row. Expiry is then a pure range delete with no read-modify-write, and the
+   lifetime-churn signal — the thing a dispute actually asks for — survives
+   expiry at ≈ 12 B/account, ≈ 120 MB at 10⁷ accounts.
+
+   The horizon is set by the **strike and appeal window**, not by the audit
+   cross-check. Clause (h)'s cross-check cannot justify it: `AttestRow` is gone
+   in an hour (see question 1), so no attestation-side artifact survives even a
+   day. D16's 14-day half-life does justify it — at 90 d a strike retains
+   ≈ 1.2 % of its original weight (2^(−90/14) ≈ 0.0118), so the history outlives
+   every dispute that could cite it. Cost ≈ 3.1 GB realistic.
+
+   *Rejected:* retaining forever, which makes the adversarial term unbounded in
+   time as well as rate; the intent audit window, which makes (h) useless
+   precisely when it would be interesting; and per-node summary rows, which
+   never expire and grow at the adversarial rate rather than the account rate.
+   **Reverses on** a compliance requirement with a longer statutory horizon, or
+   evidence of adjudication queries reaching the 90-day boundary.
+
+3. **Accounts go in the D28 announcement — yes, as its own amending ADR, gated
+   on "before enforcement turns on".** `candidate_accounts` parallel to
+   `candidates` in `WitnessEpochClaimsV1`, at ≤ 256 B/announcement.
+
+   This overrides the recommendation in Alternatives, which said to wait for the
+   next time D28's wire opens for another reason. That framing assumed a
+   rolling-upgrade window worth preserving. There is none:
+   `PROTOCOL_VERSION` is already **2** (`protocol.rs:35`) and the window D29
+   closed is closed, so the price of a bump is at its historic minimum and does
+   not fall further by waiting. It zeroes this record's miss set, which is what
+   makes enforcement viable while the `id/` subspace is still filling, and it
+   adds no trust — the coordinator already chooses the set.
+
+   **Reverses if** demotion telemetry shows a miss rate below 10⁻⁴ (the miss set
+   is then not worth a wire change), or if external clients appear before the
+   bump lands, restoring a compatibility cost that does not exist today.
+   Confidence is high on direction and **medium on timing** — the gate is the
+   part to revisit.
+
+4. **`strike/` takes its own family byte `y`, with sub-discriminator `ya` — it
+   does not share `d`.** Sharing would put a second writer inside `d`, and
+   clause (d)'s single-writer property is load-bearing for clause (b)'s
+   atomicity: `db` must be written with `da` in one transaction, and (f)'s
+   fail-closed posture makes index staleness a security property. Breaking that
+   to save a byte, in the record that establishes it, is not a trade worth
+   making.
+
+   The byte budget still closes: `z` goes to `jarchive/`, and `coord/leader`
+   presupposes coordinator-side FoundationDB state that clause (d) says does not
+   exist by design. **Reverses if** the standing record makes identity itself
+   the strike writer — in which case `d` is correct after all. That is free to
+   change before any `strike/` row exists, so the standing record should decide
+   its writer before it decides its byte.
+
 ## Open questions
 
-1. **Recording the binding view with `AttestRow`.** (c) and (h) leave
-   reconstruction exact only up to `T_stale`. A `Vec<u32>` of `binding_epoch`
-   values parallel to `AttestRow.eligible` would close it, at 4 B × ≤ 7 = 28 B
-   per committed intent. It is a change to D27 clause (f)'s artifact and so is
-   D27's record to amend, not this one's.
-2. **`T_history`** — the retention horizon for `dh`. **This needs the repo
-   owner.** 90 d is recommended: it covers roughly seven strike half-lives
-   (D16: 14 d, so a strike is under 1 % of its original weight at ≈ 98 d), which
-   makes the binding history outlive every dispute that could cite it, at
-   ≈ 3.1 GB realistic / ≈ 490 GB adversarial-at-the-cap. Retaining forever
-   removes a GC pass and an argument about what "auditable" means, and makes
-   the adversarial term unbounded in time as well as in rate. Retaining for the
-   intent audit window only (D27 (f) ties `AttestRow` GC to the intent's own
-   `gc_deadline_ms`, default 1 h per `docs/08:3226`) is the cheapest and makes
-   (h)'s cross-check useless the moment it would be interesting.
-3. **Whether to put accounts in the announcement** (Alternatives). It reduces
-   this record's miss set to zero and costs a `PROTOCOL_VERSION` bump and a D28
-   amendment. Recommended as a follow-on the next time D28's wire opens for
-   another reason, not as a bump of its own.
-4. **Whether `strike/{account_id}/{versionstamp}` shares byte `d`.** It is
-   account-keyed, written by the adjudication executor and read by identity —
-   a different writer, a different retention (D16's 14-day half-life), and
-   D22's precedent says a key discriminator deserves its own record. The
-   byte-budget arithmetic in Context says it will be tempting. The sibling
-   standing record decides it; this one only notes that `d`'s discriminator
-   space has room and that room is not by itself a reason.
 5. **Account age past probation** — D28 clause (e) grades it *skipped* because
    it is not a token field, and `da` would now carry a `created_ms` that could
    answer it durably. Whether the gateway should read it, or whether identity
    should put an `account_age_bucket` in the token as D28 suggests, is the
    standing record's call; the token change is explicitly out of scope here.
+
+## Consequential edits this record now requires
+
+Accepting resolved question 3 puts a load-bearing sentence in clause (f) on a
+countdown: it cites "the direction D27 clause (e) already chose for
+`UnknownEpoch` and `EpochStale`", and #208's amending record reverses that
+direction. The demotion in (f) survives on its own legs — it rides
+`LowPopulationEpoch` with an announcement in hand — but the citation must be
+re-pointed when #208 lands, not left to rot.
