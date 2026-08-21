@@ -419,13 +419,36 @@ pub const REASON_ITEM_TRANSFER_TO_SELF: u16 = 10;
 /// reason rather than [`REASON_EXECUTOR_ERROR`].
 pub const REASON_MALFORMED_OP: u16 = 11;
 
+/// An [`Attestation`] names the intent's own `issuer` as its witness — the
+/// issuer signed its own permission slip.
+///
+/// D10 item 4 seeds the witness set "excluding **all parties to the intent**",
+/// and the issuer is the first of those parties; `docs/07-witnessing.md` §4.1
+/// states the same rule and §4.2 makes the gateway the enforcer ("the gateway
+/// rejects party attestations regardless"). This is the admission-time half of
+/// that rule — the selection-time half is the coordinator's (D28/#143), and a
+/// gateway must not assume a set it did not choose is well-formed.
+///
+/// # Why this is not folded into [`REASON_VALIDATION_FAILED`]
+///
+/// It is the one admission refusal that is never a client bug. Every other
+/// cause the baseline validator can raise describes a malformed or
+/// misaddressed request — a short `args` field, an account the connection did
+/// not authenticate as — and a client author reading `REASON_VALIDATION_FAILED`
+/// will find it. A self-witnessed intent is a *forgery attempt*, and an
+/// operator watching the rejection rate needs to be able to count it
+/// separately from the noise floor of bad clients. Collapsing the two costs
+/// exactly what [`crate::DenyReason::WrongOwner`] cost on the authority path:
+/// an opaque refusal that every subsequent investigation has to re-derive.
+pub const REASON_SELF_WITNESS: u16 = 12;
+
 /// [`GatewayReply::ReportVerdict`] reason: the report was adjudicated, and the
 /// reply's `verdict` carries the answer.
 ///
 /// # Why this is its own numbering rather than more `REASON_*`
 ///
 /// The `REASON_*` codes above are `IntentOutcome::Rejected` reasons: they
-/// answer "why was this durable write refused", and the space below `12` is
+/// answer "why was this durable write refused", and the space below `13` is
 /// partly a `Ruleset`'s to extend. A refused *report* is a different question
 /// on a different message, so it gets its own space rather than borrowing
 /// numbers whose meaning a game may redefine. The two never appear in the same

@@ -294,10 +294,13 @@ pub enum OpsVerdict {
     Rejected(u16),
 }
 
-/// Why an intent failed admission. Never sent on the wire — the wire reason is
-/// [`orrery_protocol::REASON_VALIDATION_FAILED`], because a `Ruleset`-defined
-/// reason space is the `Ruleset`'s to define — but logged, so an operator
-/// reading a rejection rate can tell a malformed client from an attack.
+/// Why an intent failed admission. Mostly not sent on the wire — the wire
+/// reason is [`orrery_protocol::REASON_VALIDATION_FAILED`], because a
+/// `Ruleset`-defined reason space is the `Ruleset`'s to define — but always
+/// logged, so an operator reading a rejection rate can tell a malformed client
+/// from an attack. [`RejectionCause::wire_reason`] holds the mapping, and
+/// [`RejectionCause::SelfWitness`] is the one cause that carries a code of its
+/// own, because it is the one that is never a malformed client.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RejectionCause {
     /// The intent carries no ops: nothing to commit, and an idempotency row
@@ -344,6 +347,16 @@ pub enum RejectionCause {
     /// An attestation's signature does not verify over the intent's canonical
     /// preimage: a forged co-signature.
     BadAttestation,
+    /// An attestation names the intent's own issuer as its witness.
+    ///
+    /// D10 item 4 seeds the witness set "excluding **all parties to the
+    /// intent**", and the issuer is the first of those parties;
+    /// `docs/07-witnessing.md` §4.1 states the rule and §4.2 puts the gateway
+    /// on the hook for it ("the gateway rejects party attestations
+    /// regardless"). Unlike every other cause here this one is not a client
+    /// bug, which is why it is the one admission cause with its own wire code
+    /// ([`orrery_protocol::REASON_SELF_WITNESS`]).
+    SelfWitness,
 }
 
 impl RejectionCause {
@@ -362,6 +375,26 @@ impl RejectionCause {
             Self::TooManyAttestations => "too_many_attestations",
             Self::DuplicateAttestation => "duplicate_attestation",
             Self::BadAttestation => "bad_attestation",
+            Self::SelfWitness => "self_witness",
+        }
+    }
+
+    /// The `IntentOutcome::Rejected { reason }` code this cause is answered
+    /// with on the wire.
+    ///
+    /// Almost every cause collapses to
+    /// [`orrery_protocol::REASON_VALIDATION_FAILED`], and deliberately so: the
+    /// reason space below it is a `Ruleset`'s to define, and a cluster that
+    /// enumerated its own envelope checks there would be spending numbers a
+    /// game may want. [`Self::SelfWitness`] is the exception, for the reason
+    /// [`orrery_protocol::REASON_SELF_WITNESS`] states at length — it is the
+    /// only one of these that describes an attack rather than a bad client,
+    /// and an operator must be able to count it without reading gateway logs.
+    #[must_use]
+    pub const fn wire_reason(self) -> u16 {
+        match self {
+            Self::SelfWitness => orrery_protocol::REASON_SELF_WITNESS,
+            _ => orrery_protocol::REASON_VALIDATION_FAILED,
         }
     }
 }
@@ -401,6 +434,13 @@ impl RejectionCause {
 ///    [`MAX_ATTESTATIONS`], no repeated witness, and every signature verifies
 ///    against [`Intent::signing_preimage`]. A forged co-signature is refused
 ///    here rather than being carried into the ledger's audit trail.
+/// 5. **Party exclusion, as far as NodeIds reach.** No attestation may name
+///    the issuer as its witness (D10 item 4; `docs/07-witnessing.md` §4.1's
+///    per-intent party exclusion, enforced by the gateway per §4.2). This is
+///    the cheapest check in the function and runs above all of them, so a
+///    self-witnessed intent never reaches signature verification and never
+///    produces a read plan. Its limit is stated under "does NOT validate"
+///    below: it matches NodeIds, and D10's rule is written over accounts.
 ///
 /// On admit, the precheck names the `ledger/bal/{account}/{asset}` rows the
 /// credited ops touch and the `ledger/item/{item_uid}` + debit-side balance
@@ -435,6 +475,21 @@ impl RejectionCause {
 /// - **Witness attestation thresholds.** K-of-N and the seeded cell-epoch
 ///   witness set are P5 (docs/11-roadmap.md §P2). `cell_epoch` is carried,
 ///   not checked: nothing here knows which witness set it names.
+/// - **Account-level party exclusion.** D10 item 4 excludes parties "matched
+///   on **accounts and every NodeId bound to them**", and check 5 above
+///   matches only the NodeId. Two NodeIds bound to one account therefore still
+///   let a party attest for itself, and **this filter does not claim
+///   otherwise**. The binding is not reachable from here: [`IntentContext`]
+///   carries exactly one account — the submitting connection's, from its own
+///   session token — and the only NodeId→account table in this crate is the
+///   gateway's peer registry, which is `async`, covers only peers currently
+///   holding a session on *this* gateway, and would therefore answer "not a
+///   party" for any witness attesting from elsewhere. A check that fails open
+///   on a miss is worse than an absent one, because it reads as coverage. No
+///   FDB key family binds an account to a NodeId either, so an authoritative
+///   answer is a durable read, which the admission path does not take. The
+///   account-level half is D28's, made at selection time where the identity
+///   bindings actually live.
 /// - **Rate and quota.** Intent submission is bounded per connection by the
 ///   gateway's in-flight lane, not by a per-account budget the way reports
 ///   are.
@@ -475,6 +530,55 @@ impl BaselineIntentValidator {
         }
         if intent.attestations.len() > MAX_ATTESTATIONS {
             return Err(RejectionCause::TooManyAttestations);
+        }
+
+        // ── Party exclusion: the issuer may not witness its own intent ──────
+        //
+        // D10 item 4 seeds the witness set "excluding **all parties to the
+        // intent**"; docs/07 §4.2 makes the gateway enforce it independently
+        // of who selected the set, because a gateway must never assume a set
+        // it did not choose is well-formed.
+        //
+        // **What this prevents.** Attestations are not yet counted toward a
+        // threshold, so today a self-attestation buys nothing. The K-of-N
+        // enforcement of #147 makes them load-bearing, and on that day an
+        // issuer that can appear in its own attestation list is signing its
+        // own permission slip — it supplies K of the K signatures a durable
+        // trade needs, and the co-signature requirement that exists to make a
+        // counterparty's consent unforgeable proves nothing at all.
+        //
+        // **Why it is worse than it looks in this tree.** The loop below
+        // verifies a witness signature over `Intent::signing_preimage()` — the
+        // *identical bytes the issuer already signed* (persist.rs's preimage
+        // is deliberately attestation-excluding, so co-signatures can be
+        // appended without invalidating the author). An issuer therefore does
+        // not even need a fresh signature: copying `intent.signature` verbatim
+        // into an `Attestation { witness: intent.issuer, .. }` yields an
+        // attestation that verifies. D27 closes *that* variant by giving a
+        // witness its own domain-separated preimage, but a domain tag cannot
+        // stop an issuer from correctly signing the witness preimage too. The
+        // party check is required either way, which is why it is written here
+        // rather than deferred to the envelope work.
+        //
+        // **Why it sits this early.** It is two NodeId comparisons — cheaper
+        // than the arg-size walk below it, let alone the ed25519 verification
+        // at the bottom — and it needs no durable row, so nothing downstream
+        // of it should ever pay for a self-witnessed intent. Placing it above
+        // the ops loop also means `check` cannot return a read plan for one:
+        // an `IntentPrecheck`'s `read_keys` are exactly the durable rows the
+        // executor will read, and a refusal here is a refusal before any of
+        // them is named.
+        //
+        // Both identities are compared because they answer different
+        // questions and only the gateway makes them agree: `intent.issuer` is
+        // who signed the envelope, `cx.issuer` is the connection the envelope
+        // arrived on. The gateway binds them before this runs, but a validator
+        // that silently depends on a caller having done so is a validator that
+        // stops holding the moment someone calls it directly.
+        for attestation in &intent.attestations {
+            if attestation.witness == intent.issuer || attestation.witness == cx.issuer {
+                return Err(RejectionCause::SelfWitness);
+            }
         }
 
         let mut total_args = 0usize;
@@ -583,7 +687,7 @@ impl IntentValidator for BaselineIntentValidator {
                     "intent admission refused"
                 );
                 IntentVerdict::Reject {
-                    reason: orrery_protocol::REASON_VALIDATION_FAILED,
+                    reason: cause.wire_reason(),
                 }
             }
         }
@@ -1372,6 +1476,183 @@ mod tests {
             BaselineIntentValidator::check(&flooded, &cx(Some(7))),
             Err(RejectionCause::TooManyAttestations),
             "the count is bounded before any signature is verified"
+        );
+    }
+
+    /// The issuer is a party to its own intent, so it may not witness it
+    /// (D10 item 4; docs/07 §4.1).
+    ///
+    /// The degenerate arm is the one that matters, and it is the one that
+    /// works in this tree: because a witness is verified over
+    /// `Intent::signing_preimage()` — the same bytes the issuer signed — the
+    /// issuer's own `intent.signature`, copied verbatim, *is* a byte-valid
+    /// attestation naming the issuer. No fresh signing required.
+    #[test]
+    fn baseline_refuses_the_issuer_as_its_own_witness() {
+        let key = issuer_key();
+        let base = intent_with(vec![IntentOp {
+            op: OPAQUE_OP_BASE,
+            args: bytes::Bytes::new(),
+        }]);
+
+        // (a) The zero-effort forgery: the issuer signature, reused as an
+        // attestation. Byte-for-byte identical to `base.signature`.
+        let mut replayed = base.clone();
+        replayed.attestations.push(Attestation {
+            witness: key.public(),
+            signature: base.signature,
+        });
+        assert_eq!(
+            replayed.attestations[0].signature, base.signature,
+            "this arm is only meaningful while the copy is exact"
+        );
+        assert!(
+            key.public()
+                .verify(
+                    &base.signing_preimage(),
+                    &replayed.attestations[0].signature
+                )
+                .is_ok(),
+            "the copied signature really does verify as an attestation — that is \
+             the defect, and a test that skipped this would pass on a tree that \
+             had merely stopped verifying it"
+        );
+        assert_eq!(
+            BaselineIntentValidator::check(&replayed, &cx(Some(7))),
+            Err(RejectionCause::SelfWitness),
+            "an issuer must not witness its own intent, however it got the bytes"
+        );
+
+        // (b) A freshly and correctly made self-attestation — the variant
+        // D27's separate witness preimage would *not* stop, which is why the
+        // party check has to exist independently of it.
+        let mut fresh = base.clone();
+        fresh.attestations.push(Attestation {
+            witness: key.public(),
+            signature: key.sign(&base.signing_preimage()),
+        });
+        assert_eq!(
+            BaselineIntentValidator::check(&fresh, &cx(Some(7))),
+            Err(RejectionCause::SelfWitness)
+        );
+
+        // (c) Hidden among honest ones: position must not matter.
+        let honest = iroh_base::SecretKey::from_bytes(&[9u8; 32]);
+        let mut mixed = base.clone();
+        mixed.attestations.push(Attestation {
+            witness: honest.public(),
+            signature: honest.sign(&base.signing_preimage()),
+        });
+        mixed.attestations.push(Attestation {
+            witness: key.public(),
+            signature: base.signature,
+        });
+        assert_eq!(
+            BaselineIntentValidator::check(&mixed, &cx(Some(7))),
+            Err(RejectionCause::SelfWitness),
+            "one genuine co-signature does not launder the self-attestation \
+             sitting next to it"
+        );
+
+        // And the refusal is legible on the wire, not folded into the
+        // generic validation code: #145's precedent, and the whole cost of
+        // `DenyReason::WrongOwner` on the authority path.
+        assert_eq!(
+            BaselineIntentValidator.validate(&replayed, &cx(Some(7))),
+            IntentVerdict::Reject {
+                reason: orrery_protocol::REASON_SELF_WITNESS
+            }
+        );
+        assert_eq!(
+            RejectionCause::SelfWitness.wire_reason(),
+            orrery_protocol::REASON_SELF_WITNESS
+        );
+        // Every other cause keeps the opaque code it had: this change adds a
+        // number, it does not start enumerating the whole enum on the wire.
+        assert_eq!(
+            RejectionCause::BadAttestation.wire_reason(),
+            orrery_protocol::REASON_VALIDATION_FAILED
+        );
+    }
+
+    /// Independent witnesses are untouched by the party check — the control
+    /// arm, without which "refuses self-witnessing" is satisfied by refusing
+    /// every attestation.
+    #[test]
+    fn baseline_admits_genuinely_independent_witnesses() {
+        let base = intent_with(vec![IntentOp {
+            op: OPAQUE_OP_BASE,
+            args: bytes::Bytes::new(),
+        }]);
+        let mut attested = base.clone();
+        for seed in [9u8, 10, 11] {
+            let witness = iroh_base::SecretKey::from_bytes(&[seed; 32]);
+            assert_ne!(
+                witness.public(),
+                base.issuer,
+                "a control arm whose witness is the issuer proves nothing"
+            );
+            attested.attestations.push(Attestation {
+                witness: witness.public(),
+                signature: witness.sign(&base.signing_preimage()),
+            });
+        }
+        assert_eq!(
+            BaselineIntentValidator::check(&attested, &cx(Some(7))),
+            Ok(IntentPrecheck::default()),
+            "three independent co-signatures are exactly what D10 asks for"
+        );
+    }
+
+    /// The party check must sit in the cheap-check band, above everything
+    /// that plans or performs a durable read.
+    ///
+    /// `IntentPrecheck::read_keys` is this crate's definition of "the durable
+    /// rows the executor will read" (§7 step 1), so the ordering is
+    /// falsifiable here: take an intent whose admission *does* name read keys,
+    /// self-witness it, and require that the refusal wins. If a later refactor
+    /// moved the party check below the ops loop it would still refuse — but if
+    /// it moved below the loop *and* the loop learned to read, this is the
+    /// test that catches it, because a `SelfWitness` verdict can never carry a
+    /// read plan. The end-to-end half of the claim — that the executor is
+    /// never reached at all — is
+    /// `tests/intent_self_witness.rs`.
+    #[test]
+    fn self_witness_is_refused_before_any_durable_read_is_planned() {
+        // Control: this exact intent, unattested, names two durable rows.
+        let transfer = transfer_intent(41, 0xBEEF, 7, 8, 500);
+        let planned = BaselineIntentValidator::check(&transfer, &cx(Some(8)))
+            .expect("the control arm must be admissible, or it proves nothing");
+        assert_eq!(
+            planned.read_keys.len(),
+            2,
+            "the control names ledger/item and the buyer's balance"
+        );
+
+        // The same intent, self-witnessed: no read plan is produced at all.
+        let mut self_witnessed = transfer.clone();
+        self_witnessed.attestations.push(Attestation {
+            witness: transfer.issuer,
+            signature: transfer.signature,
+        });
+        assert_eq!(
+            BaselineIntentValidator::check(&self_witnessed, &cx(Some(8))),
+            Err(RejectionCause::SelfWitness),
+            "the party check must beat the read planner, not follow it"
+        );
+
+        // It also beats signature verification, which is the other thing on
+        // this path that costs anything: a self-attestation carrying outright
+        // garbage is still `SelfWitness`, never `BadAttestation`. That
+        // ordering is what keeps the refusal constant-cost under a flood.
+        let mut garbage = transfer;
+        garbage.attestations.push(Attestation {
+            witness: garbage.issuer,
+            signature: issuer_key().sign(b"not a preimage of anything"),
+        });
+        assert_eq!(
+            BaselineIntentValidator::check(&garbage, &cx(Some(8))),
+            Err(RejectionCause::SelfWitness)
         );
     }
 
