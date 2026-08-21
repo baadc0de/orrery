@@ -87,77 +87,24 @@ env:
   CARGO_INCREMENTAL: 0
 
 jobs:
-  # The runner picker. **It has no consumer left.**
+  # No job in this workflow can reach a self-hosted runner, and none exists to
+  # reach. #178 pointed `clippy`, `gates` and `test` at `ubuntu-latest`
+  # directly; #180 deleted the runner picker they had stopped reading and
+  # deregistered the three runners from `orrery-hel1-1`.
   #
-  # #178 finished on 2026-08-21: `clippy`, `gates` and `test` all name
-  # `ubuntu-latest` directly, so nothing in this workflow reads
-  # `needs.runner.outputs` any more and no job in this file can reach the box.
-  # The job is left standing deliberately rather than deleted — retiring it is
-  # #180's work, together with deregistering the three runners from GitHub and
-  # decommissioning `orrery-hel1-1` itself, and doing half of that here would
-  # leave the other half looking done. Until #180 lands this job runs, prints a
-  # line and is read by nobody.
+  # Why the pinning existed, kept because the reasoning outlives the hardware:
+  # the box had a persistent `target/` and a shared build cache worth 5-9
+  # minutes a run. But this repository is **public**, and a self-hosted runner
+  # is not ephemeral — a fork pull request carries its own `build.rs` and its
+  # own test code, and running `cargo test` on it is arbitrary code execution
+  # on hardware that survives the job. So fork pull requests went to hosted
+  # runners and only same-repository events reached the box.
   #
-  # The history below is kept because #180 has to be able to see what it is
-  # switching off and why the pinning existed.
-  #
-  # `orrery-hel1-1` is a self-hosted box with a persistent `target/` and a
-  # shared build cache, which is worth 5-9 minutes a run — but this repository is
-  # **public**, and a self-hosted runner is not ephemeral. A pull request from
-  # a fork carries its own `build.rs` and its own test code, and running
-  # `cargo test` on it is arbitrary code execution on hardware that survives
-  # the job.
-  #
-  # So fork pull requests go to GitHub-hosted runners and only same-repository
-  # events reach the box.
-  #
-  # **This guard is not the security boundary, and it is important not to
-  # mistake it for one.** A `pull_request` workflow runs from the merge of the
-  # head and base branches, so a fork can edit *this file* along with the code.
-  # What actually gates a fork is the repository's Actions setting, which is
-  # now "require approval for all outside collaborators": no fork workflow runs
-  # at all until someone approves it. The guard below is defence in depth for
-  # the case where a fork PR is approved so it can be reviewed — approving it
-  # should not silently mean "run this on my hardware".
-  #
-  # The third layer is the box itself: the runner is an unprivileged `ci` user
-  # with no sudo and no docker group, so the blast radius of a mistake at the
-  # first two layers stays inside one home directory.
-  #
-  # `gates` was the last consumer. What held it back was never headroom but
-  # correctness: `scripts/check.sh gates` exited 2 after 4.5 s on
-  # `scripts/p3-island-gate.sh --self-test` under the `ubuntu-latest` image's
-  # gawk 5.2.1, which dropped the trailing backslash in an `awk -v` assignment
-  # and extracted 0 bytes, so every `runs` clause misfired. #195 fixed that by
-  # building the sentinel inside awk's own `BEGIN` block, and `gates` moved.
-  runner:
-    name: pick runner
-    # Already proven on the PR's merge commit; see the note by `concurrency`.
-    if: github.event_name != 'push'
-    runs-on: ubuntu-latest
-    # Every job here declares one. A workflow with no bound falls back to
-    # GitHub's six hours, which is not a timeout so much as a way to notice
-    # tomorrow that something hung today.
-    timeout-minutes: 5
-    outputs:
-      gates: ${{ steps.pick.outputs.gates }}
-    steps:
-      - id: pick
-        env:
-          SAME_REPO: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
-        run: |
-          if [[ "$SAME_REPO" == "true" ]]; then
-            # The runner is pinned to this one job, and the pinning is the
-            # point: the runners on the box share a machine but not a
-            # `target/`, so an unpinned job lands on whichever runner is free
-            # and rebuilds against a directory last used by a different job.
-            # Pinned, each target/ only ever serves one job and stays warm.
-            echo 'gates=["self-hosted","orrery-gates"]' >> "$GITHUB_OUTPUT"
-            echo "self-hosted: same-repository ${{ github.event_name }}"
-          else
-            echo 'gates=["ubuntu-latest"]' >> "$GITHUB_OUTPUT"
-            echo "::notice::fork pull request — running on GitHub-hosted runners"
-          fi
+  # That guard was never the security boundary, and it mattered not to mistake
+  # it for one: a `pull_request` workflow runs from the merge of the PR into
+  # the base, so the workflow file itself is the base's. The boundary was the
+  # ephemerality of the runner, which is why the answer was to stop using a
+  # persistent one rather than to guard it more carefully.
 
   fmt:
     name: rustfmt
