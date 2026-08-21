@@ -30,15 +30,15 @@ on:
 # `clippy`, `static gates` and `workspace tests` after the merge re-tests a tree
 # that has already passed. That was originally argued on cost — 802 s of
 # self-hosted time on one main run (clippy 76 s, gates 355 s, tests 371 s)
-# against 228 s of hosted — and #178 moved `clippy` and `test` to hosted
-# runners, so that half of the argument no longer applies to them.
+# against 228 s of hosted — and #178 has now moved all three onto hosted
+# runners, so that half of the argument no longer applies to any of them.
 #
 # They stay `pull_request`-only anyway, deliberately: the cost was never the
 # only reason. Re-running a lane on a tree it has already passed buys no
-# information whichever runner pays for it, and #171 measured the hosted lanes
-# cold at 239 s and 674 s, which is not free either. `rustfmt` stays everywhere
-# as a cheap tripwire, and the determinism matrix stays because the corpus needs
-# a verdict per main commit.
+# information whichever runner pays for it, and #171 measured the three hosted
+# lanes cold at 239 s, 656 s and 674 s, which is not free either. `rustfmt`
+# stays everywhere as a cheap tripwire, and the determinism matrix stays
+# because the corpus needs a verdict per main commit.
 #
 # The residual gap is a direct push to main, which now gets rustfmt and
 # determinism but not the heavy trio. Closing it is branch protection's job, not
@@ -63,15 +63,20 @@ env:
   # identity plane and the `orrery-kache` S3 bucket: a hosted runner is still
   # ephemeral, but the cache it hits no longer lives on the runner. `clippy`
   # assumes `orrery-ci-cache` by OIDC and installs kache pointed at that bucket
-  # (#175), which sets `RUSTC_WRAPPER=kache` through `$GITHUB_ENV`; `gates`
-  # still puts it back by hand on the box.
+  # (#175), which sets `RUSTC_WRAPPER=kache` through `$GITHUB_ENV`.
   #
   # `test` deliberately does not, and the long block on that job says why with
   # the numbers — #175 wired it, measured it and took it back out. Not every
   # lane is worth a remote, and this default is what a lane falls back to when
   # it is not.
   #
-  # So this default now covers: `fmt`, `test`, the four determinism legs
+  # `gates` joined that list on 2026-08-21, when #178 moved it off the box.
+  # It got no remote either, for a different reason: there is no measurement
+  # of one for this lane at all, and #175's `test` numbers are the standing
+  # warning against wiring one on the assumption it helps. An open question
+  # with a measurement attached, not a gap — see the block on that job.
+  #
+  # So this default covers: `fmt`, `gates`, `test`, the four determinism legs
   # (Windows and macOS included), the verdict job, and the fork-pull-request
   # path of any lane — a fork gets no `id-token`, so it gets no credential, no
   # cache, and a cold build, which is the intended outcome and not a degraded
@@ -82,7 +87,19 @@ env:
   CARGO_INCREMENTAL: 0
 
 jobs:
-  # Which runner the `gates` job gets, decided per event.
+  # The runner picker. **It has no consumer left.**
+  #
+  # #178 finished on 2026-08-21: `clippy`, `gates` and `test` all name
+  # `ubuntu-latest` directly, so nothing in this workflow reads
+  # `needs.runner.outputs` any more and no job in this file can reach the box.
+  # The job is left standing deliberately rather than deleted — retiring it is
+  # #180's work, together with deregistering the three runners from GitHub and
+  # decommissioning `orrery-hel1-1` itself, and doing half of that here would
+  # leave the other half looking done. Until #180 lands this job runs, prints a
+  # line and is read by nobody.
+  #
+  # The history below is kept because #180 has to be able to see what it is
+  # switching off and why the pinning existed.
   #
   # `orrery-hel1-1` is a self-hosted box with a persistent `target/` and a
   # shared build cache, which is worth 5-9 minutes a run — but this repository is
@@ -107,13 +124,12 @@ jobs:
   # with no sudo and no docker group, so the blast radius of a mistake at the
   # first two layers stays inside one home directory.
   #
-  # Only `gates` still consults this. #178 moved `clippy` and `test` to
-  # `ubuntu-latest` unconditionally, so for them the picker is vestigial and
-  # their outputs are gone. `gates` cannot follow yet: `scripts/check.sh gates`
-  # exits 2 after 4.5 s on `scripts/p3-island-gate.sh --self-test` on the
-  # `ubuntu-latest` image, where gawk 5.2.1 drops the trailing backslash in an
-  # `awk -v` assignment and extracts 0 bytes (measured in #171, being fixed in
-  # #189). The job as a whole dies with the runners in #180.
+  # `gates` was the last consumer. What held it back was never headroom but
+  # correctness: `scripts/check.sh gates` exited 2 after 4.5 s on
+  # `scripts/p3-island-gate.sh --self-test` under the `ubuntu-latest` image's
+  # gawk 5.2.1, which dropped the trailing backslash in an `awk -v` assignment
+  # and extracted 0 bytes, so every `runs` clause misfired. #195 fixed that by
+  # building the sentinel inside awk's own `BEGIN` block, and `gates` moved.
   runner:
     name: pick runner
     # Already proven on the PR's merge commit; see the note by `concurrency`.
@@ -442,45 +458,60 @@ jobs:
     name: static gates
     # Already proven on the PR's merge commit; see the note by `concurrency`.
     if: github.event_name != 'push'
-    # The one lane #178 did NOT move, and not for want of headroom: #171
-    # measured it at 656 s and 17.57 GiB with 68.64 GiB free, which fits
-    # comfortably. It is blocked on correctness instead —
-    # `scripts/p3-island-gate.sh --self-test` exits 2 after 4.5 s under the
-    # `ubuntu-latest` image's gawk 5.2.1, which drops a trailing backslash in
-    # an `awk -v` assignment and extracts 0 bytes, so every `runs` clause
-    # misfires. That is #189. When it lands, this job follows `clippy` and
-    # `test` onto `ubuntu-latest` and the `runner` job above goes with it.
+    # Hosted since #178, and the last lane to get there. It was never short of
+    # headroom: #171 measured it cold and cacheless on `ubuntu-latest` at
+    # **656 s**, peaking at 17.57 GiB of disk growth with **68.64 GiB still
+    # free** — 3.9x headroom — so no disk-cleanup step and no larger runner.
+    # (Larger runners are unreachable anyway: they are an organisation feature
+    # and this repository is user-owned; #171 probed `ubuntu-latest-4-core`,
+    # `-8-core` and `-16-core` and none ever picked up a runner.
+    # `ubuntu-24.04-arm` is out for a different reason —
+    # `.github/actions/foundationdb/action.yml` fetches an amd64 `.deb`, and
+    # this lane needs that package.)
     #
-    # Note the standing consequence until then: a fork pull request already
-    # sent this lane to `ubuntu-latest` (the picker's else-branch) and so
-    # already hits the gawk bug. #178 neither introduced nor fixed that.
-    needs: runner
-    runs-on: ${{ fromJSON(needs.runner.outputs.gates) }}
-    # A self-hosted job queues forever if the box is down; fail instead.
+    # What actually held it on the box was correctness, not capacity:
+    # `scripts/check.sh gates` exited 2 after 4.5 s on
+    # `scripts/p3-island-gate.sh --self-test` under the `ubuntu-latest` image's
+    # gawk 5.2.1, which dropped a trailing backslash in an `awk -v` assignment
+    # and extracted 0 bytes, so every `runs` clause misfired. #195 fixed that
+    # (the sentinel is built inside awk's `BEGIN` block, so nothing passes
+    # through `-v`) and this job moved. The same bug was already reaching fork
+    # pull requests, which the picker's else-branch has always sent here.
+    #
+    # NO S3 KACHE REMOTE, AND THAT IS ON PURPOSE. #175 gave one to `clippy`
+    # ($1.15 per hour of wall-clock saved) and measured `test` at $16.70 with a
+    # hit rate that swung 63.7 % -> 89.4 % on an unchanged tree, then took it
+    # back out — see the long block on `test` below. `gates` has no measurement
+    # of its own either way, so it starts where #171 measured it: cold. Wiring
+    # a remote here on the assumption that it helps is exactly the move #175
+    # exists to warn against. A follow-up may measure it — this lane's shape
+    # (many small standalone-workspace builds, and it does link) is not
+    # `clippy`'s and not `test`'s, so neither result predicts it.
+    runs-on: ubuntu-latest
+    # 656 s measured cold; 30 minutes is ~2.7x that, so a lane that hangs says
+    # so rather than burning the six-hour default.
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
       - name: Install the pinned toolchain
         run: rustup show active-toolchain || rustup toolchain install
-      - name: Route rustc through the shared build cache
-        # The workflow env clears RUSTC_WRAPPER because a GitHub-hosted runner
-        # is ephemeral and has nothing to hit. The self-hosted box is the
-        # opposite case: /var/cache/kache/shared is a content-addressed cache
-        # this runner's `ci` uid and the dev checkout both publish to and
-        # restore from, so a CI build starts warm off whatever was compiled by
-        # hand there, and vice versa.
-        if: runner.environment == 'self-hosted'
-        run: echo "RUSTC_WRAPPER=kache" >> "$GITHUB_ENV"
+
+      # Registry and git checkouts only — deliberately not `target/`, the same
+      # judgement as `clippy` and `test` and for the same two reasons. This
+      # lane's `target/` grows 17.57 GiB (#171); the repository's entire
+      # Actions cache allowance is 10 GB, so the save would spend minutes
+      # compressing and then be rejected. The sources are a few hundred MB and
+      # are the part a cold runner otherwise re-downloads.
+      #
+      # `target` WAS in this list, because until now this step only ran on the
+      # rarely-taken fork-PR branch. As the only path it has to be sized, and
+      # it does not size.
       - uses: actions/cache@v6
-        # The self-hosted box keeps its target/ between runs; a cache
-        # round-trip would cost more than it saves there.
-        if: runner.environment == 'github-hosted'
         with:
           path: |
             ~/.cargo/registry/index
             ~/.cargo/registry/cache
             ~/.cargo/git/db
-            target
           key: gates-${{ runner.os }}-${{ hashFiles('Cargo.toml', 'crates/*/Cargo.toml', 'vendor/*/Cargo.toml', 'rust-toolchain.toml') }}
           restore-keys: gates-${{ runner.os }}-
 
@@ -490,9 +521,10 @@ jobs:
       # tests are unit tests. `p3-siblings` joined that list with the P5
       # double-spend race, which reads `ledger/item/{uid}` back out of the
       # durable tier rather than trusting the gateways' acks.
+      #
+      # Unconditional now: there is only one environment left in this job. The
+      # guard existed because the box already had `foundationdb-clients`.
       - name: Install the FoundationDB client
-        # foundationdb-clients is already installed on the box.
-        if: runner.environment == 'github-hosted'
         uses: ./.github/actions/foundationdb
 
       # docs/06-verifiable-core.md §8's static gates, the four harness
