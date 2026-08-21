@@ -28,11 +28,17 @@ on:
 # That verdict is the ONLY thing main's own push run owes. `pull_request` builds
 # and tests `refs/pull/N/merge` — the PR already merged into main — so re-running
 # `clippy`, `static gates` and `workspace tests` after the merge re-tests a tree
-# that has already passed, on the three jobs that are pinned to the self-hosted
-# box. Measured on one main run: 802 s of self-hosted time (clippy 76 s, gates
-# 355 s, tests 371 s) against 228 s of hosted. Those three are therefore
-# `pull_request`-only; `rustfmt` stays everywhere as a cheap tripwire, and the
-# determinism matrix stays because the corpus needs a verdict per main commit.
+# that has already passed. That was originally argued on cost — 802 s of
+# self-hosted time on one main run (clippy 76 s, gates 355 s, tests 371 s)
+# against 228 s of hosted — and #178 moved `clippy` and `test` to hosted
+# runners, so that half of the argument no longer applies to them.
+#
+# They stay `pull_request`-only anyway, deliberately: the cost was never the
+# only reason. Re-running a lane on a tree it has already passed buys no
+# information whichever runner pays for it, and #171 measured the hosted lanes
+# cold at 239 s and 674 s, which is not free either. `rustfmt` stays everywhere
+# as a cheap tripwire, and the determinism matrix stays because the corpus needs
+# a verdict per main commit.
 #
 # The residual gap is a direct push to main, which now gets rustfmt and
 # determinism but not the heavy trio. Closing it is branch protection's job, not
@@ -50,14 +56,14 @@ env:
   # .cargo/config.toml routes rustc through kache so agent worktrees share one
   # object cache (AGENTS.md § Build cache). GitHub-hosted runners are ephemeral
   # and have no kache installed, so the wrapper is cleared here — the documented
-  # opt-out. The self-hosted steps below put it back.
+  # opt-out. `gates`, the last job still on the box, puts it back.
   RUSTC_WRAPPER: ""
   # Already off in .cargo/config.toml; restated because a cache miss on a fresh
   # runner is the case where incremental artifacts cost the most and buy least.
   CARGO_INCREMENTAL: 0
 
 jobs:
-  # Which runner the heavy Linux jobs get, decided per event.
+  # Which runner the `gates` job gets, decided per event.
   #
   # `orrery-hel1-1` is a self-hosted box with a persistent `target/` and a
   # shared build cache, which is worth 5-9 minutes a run — but this repository is
@@ -81,6 +87,14 @@ jobs:
   # The third layer is the box itself: the runner is an unprivileged `ci` user
   # with no sudo and no docker group, so the blast radius of a mistake at the
   # first two layers stays inside one home directory.
+  #
+  # Only `gates` still consults this. #178 moved `clippy` and `test` to
+  # `ubuntu-latest` unconditionally, so for them the picker is vestigial and
+  # their outputs are gone. `gates` cannot follow yet: `scripts/check.sh gates`
+  # exits 2 after 4.5 s on `scripts/p3-island-gate.sh --self-test` on the
+  # `ubuntu-latest` image, where gawk 5.2.1 drops the trailing backslash in an
+  # `awk -v` assignment and extracts 0 bytes (measured in #171, being fixed in
+  # #189). The job as a whole dies with the runners in #180.
   runner:
     name: pick runner
     # Already proven on the PR's merge commit; see the note by `concurrency`.
@@ -91,28 +105,22 @@ jobs:
     # tomorrow that something hung today.
     timeout-minutes: 5
     outputs:
-      clippy: ${{ steps.pick.outputs.clippy }}
       gates: ${{ steps.pick.outputs.gates }}
-      tests: ${{ steps.pick.outputs.tests }}
     steps:
       - id: pick
         env:
           SAME_REPO: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
         run: |
           if [[ "$SAME_REPO" == "true" ]]; then
-            # One runner per job, and the pinning is the point: three runners
-            # share the box but not a `target/`, so an unpinned job lands on
-            # whichever runner is free and rebuilds against a directory last
-            # used by a different job. Pinned, each target/ only ever serves
-            # one job and stays warm for it.
-            echo 'clippy=["self-hosted","orrery-clippy"]' >> "$GITHUB_OUTPUT"
-            echo 'gates=["self-hosted","orrery-gates"]'   >> "$GITHUB_OUTPUT"
-            echo 'tests=["self-hosted","orrery-tests"]'   >> "$GITHUB_OUTPUT"
+            # The runner is pinned to this one job, and the pinning is the
+            # point: the runners on the box share a machine but not a
+            # `target/`, so an unpinned job lands on whichever runner is free
+            # and rebuilds against a directory last used by a different job.
+            # Pinned, each target/ only ever serves one job and stays warm.
+            echo 'gates=["self-hosted","orrery-gates"]' >> "$GITHUB_OUTPUT"
             echo "self-hosted: same-repository ${{ github.event_name }}"
           else
-            for j in clippy gates tests; do
-              echo "$j=[\"ubuntu-latest\"]" >> "$GITHUB_OUTPUT"
-            done
+            echo 'gates=["ubuntu-latest"]' >> "$GITHUB_OUTPUT"
             echo "::notice::fork pull request — running on GitHub-hosted runners"
           fi
 
@@ -133,23 +141,19 @@ jobs:
     name: clippy
     # Already proven on the PR's merge commit; see the note by `concurrency`.
     if: github.event_name != 'push'
-    needs: runner
-    runs-on: ${{ fromJSON(needs.runner.outputs.clippy) }}
-    # A self-hosted job queues forever if the box is down; fail instead.
+    # Hosted since #178. #171 measured this lane cold on `ubuntu-latest` at
+    # 239 s and 244 s over two independent samples, peaking at 3.43 GiB of disk
+    # growth with 82.78 GiB still free — 24× headroom — and 1.17 GiB peak RSS.
+    # No warm `target/`, no kache, no disk-cleanup step, and no larger runner
+    # (larger runners are an organisation feature this user-owned repository
+    # cannot reach at all; #171 probed `-4-core`, `-8-core` and `-16-core` and
+    # none ever picked up a runner).
+    runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
       - name: Install the pinned toolchain
         run: rustup show active-toolchain || rustup toolchain install
-      - name: Route rustc through the shared build cache
-        # The workflow env clears RUSTC_WRAPPER because a GitHub-hosted runner
-        # is ephemeral and has nothing to hit. The self-hosted box is the
-        # opposite case: /var/cache/kache/shared is a content-addressed cache
-        # this runner's `ci` uid and the dev checkout both publish to and
-        # restore from, so a CI build starts warm off whatever was compiled by
-        # hand there, and vice versa.
-        if: runner.environment == 'self-hosted'
-        run: echo "RUSTC_WRAPPER=kache" >> "$GITHUB_ENV"
       # Four first-party crates take `bevy = { workspace = true }` with default
       # features, which pulls bevy_winit and its display/audio stack, so three
       # build scripts probe pkg-config: alsa-sys, libudev-sys and wayland-sys.
@@ -158,25 +162,33 @@ jobs:
       # Only this job and `test` need them — the determinism matrix and both
       # nightly gates build Bevy-free crates, which is why those legs stay cheap.
       - name: Install Bevy's Linux build dependencies
-        # Pre-installed on the self-hosted box, and the `ci` user has no sudo
-        # by design — see the `runner` job.
-        if: runner.environment == 'github-hosted'
         run: |
           sudo apt-get update
           sudo apt-get install --no-install-recommends -y \
             g++ pkg-config libx11-dev libasound2-dev libudev-dev \
             libwayland-dev libxkbcommon-dev
 
+      # Registry and git checkouts only — deliberately not `target/`.
+      #
+      # `target/` was in this list while the hosted path was the rarely-taken
+      # fork-PR branch. Now that it is the only path it has to be sized. #171
+      # measured `test`'s cold `target/` at 45.65 GiB with 39.29 GiB free at
+      # peak, so tarring it would not fit on the disk that produced it, and the
+      # repository's whole Actions cache allowance is 10 GB — the save would
+      # spend minutes compressing and then be rejected. `clippy`'s own 1.79 GiB
+      # would fit, but the two lanes are kept symmetrical rather than one of
+      # them silently doing something different.
+      #
+      # The registry is a few hundred MB, restores in seconds, and is the part
+      # a cold runner otherwise re-downloads. A warm `target/` is what the
+      # kache S3 remote (#174/#175) is for; this is not a substitute for it,
+      # and #171's timings above are cache-free, so they are the honest budget.
       - uses: actions/cache@v6
-        # The self-hosted box keeps its target/ between runs; a cache
-        # round-trip would cost more than it saves there.
-        if: runner.environment == 'github-hosted'
         with:
           path: |
             ~/.cargo/registry/index
             ~/.cargo/registry/cache
             ~/.cargo/git/db
-            target
           key: clippy-${{ runner.os }}-${{ hashFiles('Cargo.toml', 'crates/*/Cargo.toml', 'vendor/*/Cargo.toml', 'rust-toolchain.toml') }}
           restore-keys: clippy-${{ runner.os }}-
 
@@ -189,8 +201,6 @@ jobs:
       # input. No server here — running the fdb tests against a real cluster is
       # nightly.yml's job.
       - name: Install the FoundationDB client
-        # foundationdb-clients is already installed on the box.
-        if: runner.environment == 'github-hosted'
         uses: ./.github/actions/foundationdb
 
       # All three passes, and the `--exclude`/`--no-deps` reasoning that makes them
@@ -203,6 +213,18 @@ jobs:
     name: static gates
     # Already proven on the PR's merge commit; see the note by `concurrency`.
     if: github.event_name != 'push'
+    # The one lane #178 did NOT move, and not for want of headroom: #171
+    # measured it at 656 s and 17.57 GiB with 68.64 GiB free, which fits
+    # comfortably. It is blocked on correctness instead —
+    # `scripts/p3-island-gate.sh --self-test` exits 2 after 4.5 s under the
+    # `ubuntu-latest` image's gawk 5.2.1, which drops a trailing backslash in
+    # an `awk -v` assignment and extracts 0 bytes, so every `runs` clause
+    # misfires. That is #189. When it lands, this job follows `clippy` and
+    # `test` onto `ubuntu-latest` and the `runner` job above goes with it.
+    #
+    # Note the standing consequence until then: a fork pull request already
+    # sent this lane to `ubuntu-latest` (the picker's else-branch) and so
+    # already hits the gawk bug. #178 neither introduced nor fixed that.
     needs: runner
     runs-on: ${{ fromJSON(needs.runner.outputs.gates) }}
     # A self-hosted job queues forever if the box is down; fail instead.
@@ -253,43 +275,42 @@ jobs:
     name: workspace tests
     # Already proven on the PR's merge commit; see the note by `concurrency`.
     if: github.event_name != 'push'
-    needs: runner
-    runs-on: ${{ fromJSON(needs.runner.outputs.tests) }}
-    # A self-hosted job queues forever if the box is down; fail instead.
+    # Hosted since #178, and this is the lane whose fit was in question. #171
+    # measured it cold on `ubuntu-latest` twice: 674 s and 681 s wall-clock,
+    # 46.92 GiB peak disk growth, **39.29 GiB still free at the peak** — 0.84×
+    # its own footprint again — and 6.59 GiB peak RSS against 15 GiB. It fits,
+    # but it is the tightest lane and there is no escalation path: #171 probed
+    # `ubuntu-latest-4-core`, `-8-core` and `-16-core` and none of them ever
+    # picked up a runner, because larger runners are an organisation feature
+    # and this repository is user-owned. `ubuntu-24.04-arm` has more disk but
+    # is not reachable either: `.github/actions/foundationdb/action.yml:36`
+    # fetches an amd64 `.deb`. So if this lane's `target/` grows by 84 %, the
+    # answer is to shrink or split the lane, not to ask for a bigger machine.
+    runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
       - name: Install the pinned toolchain
         run: rustup show active-toolchain || rustup toolchain install
-      - name: Route rustc through the shared build cache
-        # The workflow env clears RUSTC_WRAPPER because a GitHub-hosted runner
-        # is ephemeral and has nothing to hit. The self-hosted box is the
-        # opposite case: /var/cache/kache/shared is a content-addressed cache
-        # this runner's `ci` uid and the dev checkout both publish to and
-        # restore from, so a CI build starts warm off whatever was compiled by
-        # hand there, and vice versa.
-        if: runner.environment == 'self-hosted'
-        run: echo "RUSTC_WRAPPER=kache" >> "$GITHUB_ENV"
       - name: Install Bevy's Linux build dependencies
-        # Pre-installed on the self-hosted box, and the `ci` user has no sudo
-        # by design — see the `runner` job.
-        if: runner.environment == 'github-hosted'
         run: |
           sudo apt-get update
           sudo apt-get install --no-install-recommends -y \
             g++ pkg-config libx11-dev libasound2-dev libudev-dev \
             libwayland-dev libxkbcommon-dev
 
+      # Registry and git checkouts only, and here the reason is load-bearing
+      # rather than tidiness: see the note on the same step in `clippy`. This
+      # lane's `target/` is 45.65 GiB on a disk with 39.29 GiB free at peak, so
+      # caching it would fill the disk trying to compress it — the exact
+      # failure mode (#168, `ld terminated with signal 7`) this migration
+      # exists to leave behind.
       - uses: actions/cache@v6
-        # The self-hosted box keeps its target/ between runs; a cache
-        # round-trip would cost more than it saves there.
-        if: runner.environment == 'github-hosted'
         with:
           path: |
             ~/.cargo/registry/index
             ~/.cargo/registry/cache
             ~/.cargo/git/db
-            target
           key: test-${{ runner.os }}-${{ hashFiles('Cargo.toml', 'crates/*/Cargo.toml', 'vendor/*/Cargo.toml', 'rust-toolchain.toml') }}
           restore-keys: test-${{ runner.os }}-
 
