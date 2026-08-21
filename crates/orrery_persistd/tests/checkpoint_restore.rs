@@ -93,6 +93,14 @@ fn store_dyn<S: CheckpointStore + 'static>(store: &Arc<S>) -> Arc<dyn Checkpoint
     store.clone()
 }
 
+/// Bound an integration-test phase whose production API deliberately has no
+/// deadline, and name the phase if it stops making progress.
+async fn completes_within<T>(phase: &str, future: impl std::future::Future<Output = T>) -> T {
+    tokio::time::timeout(Duration::from_secs(5), future)
+        .await
+        .unwrap_or_else(|_| panic!("{phase} did not complete within 5 seconds"))
+}
+
 fn runtime_config(dir: &std::path::Path) -> RuntimeConfig {
     runtime_config_in(dir, GridId::ROOT)
 }
@@ -204,10 +212,15 @@ async fn open_scans_the_journal_once_for_many_shards() {
             let rec = mk_record(cell, i, RecordKind::Spawn, &i.to_le_bytes());
             handles.push(journal.append(rec).unwrap());
         }
-        for h in handles {
-            h.committed().await.unwrap();
-        }
-        journal.close().await.unwrap();
+        completes_within("the 512-record journal batch becoming durable", async {
+            for h in handles {
+                h.committed().await.unwrap();
+            }
+        })
+        .await;
+        completes_within("the seed journal committer shutting down", journal.close())
+            .await
+            .unwrap();
         drop(journal);
     }
 
@@ -215,24 +228,44 @@ async fn open_scans_the_journal_once_for_many_shards() {
         let mut cfg = runtime_config(dir.path());
         cfg.shards = shards;
         let t0 = std::time::Instant::now();
-        let rt = CellRuntime::open(&cfg, &store()).await.unwrap();
+        let rt = completes_within("CellRuntime::open replaying the journal", async {
+            CellRuntime::open(&cfg, &store()).await
+        })
+        .await
+        .unwrap();
         let opened = t0.elapsed();
         (rt, opened)
     };
 
     let (rt1, t1) = one_shard(vec![CellId::ROOT]).await;
-    let page = rt1.read(GridId::ROOT, CellId::ROOT).await.unwrap();
+    let page = completes_within(
+        "the one-shard actor serving its recovered snapshot",
+        rt1.read(GridId::ROOT, CellId::ROOT),
+    )
+    .await
+    .unwrap();
     assert_eq!(page.entities.len(), 512, "1-shard open replays all");
-    rt1.close().await.unwrap();
+    completes_within("the one-shard runtime shutting down", rt1.close())
+        .await
+        .unwrap();
 
     let (rt8, t8) = one_shard(CellId::ROOT.children().to_vec()).await;
-    let mut total = 0usize;
-    for child in CellId::ROOT.children() {
-        let page = rt8.read(GridId::ROOT, child).await.unwrap();
-        total += page.entities.len();
-    }
+    let total = completes_within(
+        "the eight shard actors serving recovered snapshots",
+        async {
+            let mut total = 0usize;
+            for child in CellId::ROOT.children() {
+                let page = rt8.read(GridId::ROOT, child).await.unwrap();
+                total += page.entities.len();
+            }
+            total
+        },
+    )
+    .await;
     assert_eq!(total, 512, "8-shard open replays all, partitioned");
-    rt8.close().await.unwrap();
+    completes_within("the eight-shard runtime shutting down", rt8.close())
+        .await
+        .unwrap();
 
     assert!(
         t8 <= t1 * 2 + Duration::from_millis(500),

@@ -1921,7 +1921,7 @@ fn gateway_peer_registry_rejects_capacity_then_evicts_expired_idle_peer() {
         let (first_client, first) = raw_connection(secret(1), server.addr()).await;
         first
             .send_control(&GatewayMsg::Hello {
-                token: session_token(&issuer, node(1), 900, 200),
+                token: session_token(&issuer, node(1), 900, 10_000),
                 node: node(1),
             })
             .await;
@@ -1931,7 +1931,7 @@ fn gateway_peer_registry_rejects_capacity_then_evicts_expired_idle_peer() {
         // When: another NodeId authenticates while the sole slot is occupied.
         second
             .send_control(&GatewayMsg::Hello {
-                token: session_token(&issuer, node(2), 900, 200),
+                token: session_token(&issuer, node(2), 900, 10_000),
                 node: node(2),
             })
             .await;
@@ -1942,14 +1942,20 @@ fn gateway_peer_registry_rejects_capacity_then_evicts_expired_idle_peer() {
         // When: the established peer disconnects and its idle retention elapses.
         drop(first);
         first_client.close().await;
-        clock.0.store(1_011, Ordering::SeqCst);
 
         // Then: a later authentication evicts the stale entry and takes the slot.
+        // Advance logical time before each already-existing admission probe. If
+        // disconnect cleanup has not run yet, that probe is still rejected; when
+        // cleanup does run, its `idle_since` uses the current logical instant and
+        // the next probe is necessarily 11 ms later. A one-shot store raced the
+        // cleanup on a loaded runner and could leave both instants at 1,011 ms,
+        // after which five seconds of wall time changed nothing about this clock.
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         loop {
+            clock.0.fetch_add(11, Ordering::SeqCst);
             second
                 .send_control(&GatewayMsg::Hello {
-                    token: session_token(&issuer, node(2), 900, 200),
+                    token: session_token(&issuer, node(2), 900, 10_000),
                     node: node(2),
                 })
                 .await;
