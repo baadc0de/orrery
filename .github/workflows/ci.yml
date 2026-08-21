@@ -54,9 +54,28 @@ env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
   # .cargo/config.toml routes rustc through kache so agent worktrees share one
-  # object cache (AGENTS.md § Build cache). GitHub-hosted runners are ephemeral
-  # and have no kache installed, so the wrapper is cleared here — the documented
-  # opt-out. `gates`, the last job still on the box, puts it back.
+  # object cache (AGENTS.md § Build cache). A runner that has no kache on PATH
+  # would fail every rustc invocation, so the wrapper is cleared here — the
+  # documented opt-out — and *put back by whichever job installs kache*.
+  #
+  # This used to read "GitHub-hosted runners are ephemeral and have nothing to
+  # hit". That stopped being true on 2026-08-21, when #173/#174 applied the AWS
+  # identity plane and the `orrery-kache` S3 bucket: a hosted runner is still
+  # ephemeral, but the cache it hits no longer lives on the runner. `clippy`
+  # assumes `orrery-ci-cache` by OIDC and installs kache pointed at that bucket
+  # (#175), which sets `RUSTC_WRAPPER=kache` through `$GITHUB_ENV`; `gates`
+  # still puts it back by hand on the box.
+  #
+  # `test` deliberately does not, and the long block on that job says why with
+  # the numbers — #175 wired it, measured it and took it back out. Not every
+  # lane is worth a remote, and this default is what a lane falls back to when
+  # it is not.
+  #
+  # So this default now covers: `fmt`, `test`, the four determinism legs
+  # (Windows and macOS included), the verdict job, and the fork-pull-request
+  # path of any lane — a fork gets no `id-token`, so it gets no credential, no
+  # cache, and a cold build, which is the intended outcome and not a degraded
+  # one.
   RUSTC_WRAPPER: ""
   # Already off in .cargo/config.toml; restated because a cache miss on a fresh
   # runner is the case where incremental artifacts cost the most and buy least.
@@ -141,17 +160,123 @@ jobs:
     name: clippy
     # Already proven on the PR's merge commit; see the note by `concurrency`.
     if: github.event_name != 'push'
-    # Hosted since #178. #171 measured this lane cold on `ubuntu-latest` at
-    # 239 s and 244 s over two independent samples, peaking at 3.43 GiB of disk
-    # growth with 82.78 GiB still free — 24× headroom — and 1.17 GiB peak RSS.
-    # No warm `target/`, no kache, no disk-cleanup step, and no larger runner
-    # (larger runners are an organisation feature this user-owned repository
-    # cannot reach at all; #171 probed `-4-core`, `-8-core` and `-16-core` and
-    # none ever picked up a runner).
+    # Hosted since #178. #171 measured this lane cold and cacheless on
+    # `ubuntu-latest` at 239 s and 244 s over two independent samples, peaking
+    # at 3.43 GiB of disk growth with 82.78 GiB still free — 24x headroom — and
+    # 1.17 GiB peak RSS. No disk-cleanup step and no larger runner (larger
+    # runners are an organisation feature this user-owned repository cannot
+    # reach at all; #171 probed `-4-core`, `-8-core` and `-16-core` and none
+    # ever picked up a runner).
+    #
+    # #175 then gave it the S3 kache remote below, and this is the lane where
+    # that pays. Steady state over three runs on an unchanged tree
+    # (https://github.com/baadc0de/orrery/actions/runs/32487828063):
+    #
+    #   wall-clock  148 s / 131 s / 121 s   mean 133 s vs 241.5 s = -45 %
+    #   hit rate    99.9 % / 99.9 % / 100.0 %   (1, 1 and 0 misses of 919)
+    #   pulled      0.460 / 0.461 / 0.461 GiB, and nothing uploaded
+    #   free disk   81.11 GiB at peak, all three runs
+    #
+    # 0.461 GiB of egress at $0.09/GB buys 108 s a run: $1.15 per hour of
+    # wall-clock saved. `test` measured $16.70 and does not keep its remote.
+    # The three samples agree to within 0.3 % on bytes and one cache key on
+    # hit rate, which is the other half of why this lane keeps it — `test`'s
+    # spread was 2.7x its own saving.
+    #
+    # 100 % is the ceiling and it is reached because nothing in this lane
+    # links: read the rate against AGENTS.md:641-647 before treating a future
+    # dip as breakage.
     runs-on: ubuntu-latest
+    # The workflow default is `contents: read` and stays that way. `id-token`
+    # is what lets this job ask GitHub for the OIDC JWT that
+    # `orrery-ci-cache`'s trust policy accepts; without it the job cannot even
+    # request a token and the AWS step fails with "Credentials could not be
+    # loaded". It is granted per-job, exactly as infra/README.md § Troubleshooting
+    # says to. `pull-requests` is deliberately NOT granted — kache-action's
+    # sticky PR comment is turned off below and the same report is written to
+    # the job summary regardless.
+    permissions:
+      contents: read
+      id-token: write
     timeout-minutes: 30
+    env:
+      # A fork pull request is never granted `id-token: write` by GitHub, so
+      # there is no token to present and no credential to assume. Rather than
+      # let the AWS step fail and read as breakage, both cache steps are
+      # skipped on that path and the lane runs cold with the workflow-level
+      # `RUSTC_WRAPPER: ""` — the same cold build #171 measured. Nothing about
+      # what the lane checks changes.
+      ORRERY_CACHE_AVAILABLE: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
     steps:
       - uses: actions/checkout@v7
+
+      # #173's federated role. No access key exists anywhere in this design:
+      # the role is assumed from the workflow's own OIDC token, the session
+      # lasts an hour, and its entire grant is read/write on
+      # s3://orrery-kache/artifacts/*.
+      - name: Assume the cache role
+        if: env.ORRERY_CACHE_AVAILABLE == 'true'
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: arn:aws:iam::590561279276:role/orrery-ci-cache
+          aws-region: eu-central-1
+          role-session-name: orrery-ci-clippy-${{ github.run_id }}
+
+      # Installs kache and sets RUSTC_WRAPPER=kache through $GITHUB_ENV, which
+      # is what overrides the workflow-level empty default for the steps after
+      # it. Deliberately early: the action starts kache's daemon, which
+      # warm-prefetches the expensive artifacts named by the previous run's
+      # manifest, and that prefetch then overlaps the apt and FoundationDB
+      # installs below instead of running on its own clock.
+      #
+      # No credential input. kache honours KACHE_S3_ACCESS_KEY/SECRET_KEY only
+      # when *both* are set and otherwise falls through to reqsign's AWS chain,
+      # which reaches AssumeRoleWithWebIdentity — so the role assumed above is
+      # picked up with no kache-specific credential configuration at all
+      # (docs/spikes/kache-remote-backend.md § 2).
+      #
+      # `manifest-key` is per-lane on purpose: every build sharing the bucket
+      # writes the manifest, so `clippy` and `test` without distinct keys would
+      # clobber each other's and prefetch would fall to near zero.
+      - name: Install kache and point it at the S3 remote
+        if: env.ORRERY_CACHE_AVAILABLE == 'true'
+        uses: kunobi-ninja/kache-action@a257c055543c2840700a9bbca8f9c3094a421b1b # main@2026-06-19
+        with:
+          version: 0.14.2
+          s3-bucket: orrery-kache
+          s3-region: eu-central-1
+          s3-prefix: artifacts
+          manifest-key: clippy-x86_64-unknown-linux-gnu
+          pr-comment: false
+          # THE MOST REUSABLE THING #175 FOUND, AND IT IS NOT ABOUT THIS
+          # LANE. `kache doctor` reports the runner's cache filesystem as
+          # "Cache FS  ext2/3/4 (local)" — ext4 WITHOUT reflink support. So a
+          # stored or restored artifact is a second PHYSICAL copy of the file
+          # in `target/`, not a copy-on-write clone, and the local store is
+          # roughly a duplicate of the cacheable part of `target/` rather than
+          # free. That invalidates a premise #171 and #192 both rest on: the
+          # store has to fit inside #171's free-at-peak headroom, and on
+          # kache's 50 GiB default it does not.
+          #
+          # Measured, not reasoned about. The first run of #175
+          # (https://github.com/baadc0de/orrery/actions/runs/32486274447) left
+          # the default in place and the `test` lane died 13 min in with
+          #   error: failed to build archive at .../libiroh-*.rlib:
+          #          No space left on device (os error 28)
+          # and `df` reading `145G 145G 29M 100% /` — on the lane #171 had
+          # measured with 39.29 GiB to spare. Anyone wiring a Rust object
+          # cache onto a hosted runner will hit this; budget the store against
+          # free-at-peak, and sample the peak rather than reading `df` at the
+          # end, because a run that filled the disk prints a healthy number
+          # afterwards.
+          #
+          # This lane is nowhere near the cap — 1.7 GiB store, 81 GiB free —
+          # so the number here is cheap insurance and a place to record the
+          # finding, not a live constraint. Note also that the cap is soft:
+          # eviction lags, and `test` was observed at 28.2 GiB against a
+          # 20 GiB cap (141 %) before it was taken off the remote.
+          max-size: 20GiB
+
       - name: Install the pinned toolchain
         run: rustup show active-toolchain || rustup toolchain install
       # Four first-party crates take `bevy = { workspace = true }` with default
@@ -180,9 +305,12 @@ jobs:
       # them silently doing something different.
       #
       # The registry is a few hundred MB, restores in seconds, and is the part
-      # a cold runner otherwise re-downloads. A warm `target/` is what the
-      # kache S3 remote (#174/#175) is for; this is not a substitute for it,
-      # and #171's timings above are cache-free, so they are the honest budget.
+      # a cold runner otherwise re-downloads. It stays alongside the kache
+      # remote rather than being replaced by it, because the two cache
+      # different things and neither is a substitute for the other: kache
+      # caches rustc *outputs*, `actions/cache` caches crate *sources*. A
+      # 100 % kache hit rate still needs the sources on disk for cargo to
+      # resolve the graph at all.
       - uses: actions/cache@v6
         with:
           path: |
@@ -203,11 +331,112 @@ jobs:
       - name: Install the FoundationDB client
         uses: ./.github/actions/foundationdb
 
+      # Evidence, not assertion — and it fails the job rather than warning,
+      # because a silently-unwired cache is the failure mode this whole issue
+      # exists to avoid: the lane would still be green, just paying full price
+      # while a table claimed otherwise.
+      #
+      # Two independent things are checked. RUSTC_WRAPPER must actually be
+      # `kache` in this step's environment, which is the empirical answer to
+      # whether a $GITHUB_ENV write beats a workflow-level `env:` of the same
+      # name (it does; this step is what proves it rather than assuming it).
+      # And `kache doctor` must name the bucket — its "Remote" check prints
+      # `s3://<bucket>/<prefix>` from the resolved config, so grepping for the
+      # exact URI distinguishes "a remote is configured" from "some remote is
+      # configured". doctor's exit status is deliberately not the assertion:
+      # it reports the daemon unit as missing on any runner, which is expected
+      # and not a problem (AGENTS.md § Build cache).
+      - name: Confirm rustc is wrapped and the S3 remote is configured
+        if: env.ORRERY_CACHE_AVAILABLE == 'true'
+        run: |
+          set -euo pipefail
+          echo "RUSTC_WRAPPER=${RUSTC_WRAPPER:-<unset>}"
+          [[ "${RUSTC_WRAPPER:-}" == *kache* ]] || {
+            echo "::error::RUSTC_WRAPPER is not kache — the lane would build uncached"
+            exit 1
+          }
+          kache doctor 2>&1 | tee doctor.txt || true
+          grep -qF 's3://orrery-kache/artifacts' doctor.txt || {
+            echo "::error::kache doctor does not report the s3://orrery-kache/artifacts remote"
+            exit 1
+          }
+
+      # #171 made the case that a `df` before and after misses the peak, and
+      # the peak is the whole question. That is even truer with a cache: the
+      # local store and `target/` grow together and the store evicts under its
+      # cap, so the end-of-run reading understates what the disk actually had
+      # to hold. Two-second sampling for the life of the lane, same interval
+      # #171 used, so the two numbers are comparable.
+      - name: Start the free-disk sampler
+        if: env.ORRERY_CACHE_AVAILABLE == 'true'
+        run: |
+          set -euo pipefail
+          nohup bash -c 'while :; do df -B1 --output=avail / | tail -1; sleep 2; done' \
+            > "$RUNNER_TEMP/avail.txt" 2>/dev/null &
+          echo "sampling free bytes on / every 2 s into $RUNNER_TEMP/avail.txt"
+
       # All three passes, and the `--exclude`/`--no-deps` reasoning that makes them
       # mean something, live in scripts/check.sh so this job is reproducible
       # locally with one command.
       - name: clippy (default raw, fdb, then Fjall fallback)
         run: scripts/check.sh clippy
+
+      # #170 asks for a hit rate and a wall-clock. infra/README.md § What it
+      # costs asks for one more, and it is the one that decides the economics:
+      # hosted runners are outside AWS, so every cache HIT is billable egress
+      # at $0.09/GB past the free tier — the bill scales with the mechanism
+      # working. `network.bytes_down` is that number, on the wire and after
+      # compression. Read from kache's own report rather than inferred, per
+      # #175's acceptance criteria, and uploaded raw so it is recomputable.
+      #
+      # `if: always()` because a failed lane's cache figures are still data.
+      # Note this runs BEFORE kache-action's post step does `kache sync --push`,
+      # so `bytes_up` here undercounts the run's uploads; `bytes_down` — the
+      # billed direction — is complete.
+      - name: Cache report
+        if: always() && env.ORRERY_CACHE_AVAILABLE == 'true'
+        run: |
+          set -euo pipefail
+          # Disk alongside the cache figures: a warm lane restores artifacts
+          # into `target/` *and* keeps them in the local store, so the cache
+          # changes the disk answer #171 measured and the new number should be
+          # on the record next to it. `min_free_bytes` is the minimum over the
+          # sampled series — the figure directly comparable to #171's "free at
+          # peak" column.
+          df -h /
+          if [[ -s "$RUNNER_TEMP/avail.txt" ]]; then
+            echo "min_free_bytes     $(sort -n "$RUNNER_TEMP/avail.txt" | head -1)"
+            echo "df_samples         $(wc -l < "$RUNNER_TEMP/avail.txt")"
+          fi
+          kache stats --since 24h || true
+          kache report --format json --since 24h --output kache-clippy.json
+          {
+            echo '### kache — clippy'
+            echo '```'
+            # `network` is an Option in kache's report schema and is null when
+            # no transfer happened at all, so every read of it is defaulted.
+            jq -r '
+              (.network // {}) as $n |
+              "hit_rate_pct       \(.summary.hit_rate_pct)",
+              "local_hits         \(.summary.local_hits)",
+              "remote_hits        \(.summary.remote_hits)",
+              "prefetch_hits      \(.summary.prefetch_hits)",
+              "misses             \(.summary.misses)",
+              "total_crates       \(.summary.total_crates)",
+              "configured_backend \($n.configured_backend // "none")",
+              "bytes_down         \($n.bytes_down // 0)",
+              "bytes_up           \($n.bytes_up // 0)",
+              "downloads_ok       \($n.downloads_ok // 0)",
+              "downloads_failed   \($n.downloads_failed // 0)"
+            ' kache-clippy.json
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v7
+        if: always() && env.ORRERY_CACHE_AVAILABLE == 'true'
+        with:
+          name: kache-report-clippy
+          path: kache-clippy.json
+          retention-days: 30
 
   gates:
     name: static gates
@@ -280,7 +509,7 @@ jobs:
     if: github.event_name != 'push'
     # Hosted since #178, and this is the lane whose fit was in question. #171
     # measured it cold on `ubuntu-latest` twice: 674 s and 681 s wall-clock,
-    # 46.92 GiB peak disk growth, **39.29 GiB still free at the peak** — 0.84×
+    # 46.92 GiB peak disk growth, **39.29 GiB still free at the peak** — 0.84x
     # its own footprint again — and 6.59 GiB peak RSS against 15 GiB. It fits,
     # but it is the tightest lane and there is no escalation path: #171 probed
     # `ubuntu-latest-4-core`, `-8-core` and `-16-core` and none of them ever
@@ -289,6 +518,60 @@ jobs:
     # is not reachable either: `.github/actions/foundationdb/action.yml:36`
     # fetches an amd64 `.deb`. So if this lane's `target/` grows by 84 %, the
     # answer is to shrink or split the lane, not to ask for a bigger machine.
+    #
+    # ---------------------------------------------------------------------
+    # THIS LANE DELIBERATELY HAS NO S3 KACHE REMOTE, AND THAT IS A MEASURED
+    # DECISION RATHER THAN AN OMISSION. #175 wired one in, ran it, and took it
+    # back out. Do not re-add it without reading this block.
+    #
+    # Steady state over three runs on an unchanged tree
+    # (https://github.com/baadc0de/orrery/actions/runs/32487828063):
+    #
+    #   wall-clock  562 s / 690 s / 637 s   mean 630 s vs #171's 677.5 s = -7 %
+    #   hit rate    75.2 % / 63.7 % / 89.4 %
+    #   pulled      2.64 / 1.81 / 2.47 GiB  mean 2.30 GiB per run
+    #
+    # Three things kill it, in order of how much they matter.
+    #
+    # 1. THE VARIANCE EXCEEDS THE SAVING. The 128 s spread across three runs
+    #    of the *same tree* is 2.7x the 48 s the cache saves. #171's two
+    #    uncached samples of this lane agreed to within 1 % (674 s / 681 s),
+    #    so that variance is the cache's, not the runner's. A cache that adds
+    #    more variance than it removes latency is not worth paying for.
+    #
+    # 2. THE EGRESS IS THE BILL, AND IT SCALES WITH THE CACHE *WORKING*.
+    #    A GitHub-hosted runner is on Azure; the bucket is in eu-central-1.
+    #    Every byte pulled is billed at $0.09/GB past the 100 GB free tier, so
+    #    2.30 GiB per run at this repository's measured ~29 PR runs/day is
+    #    ~$200/month — for 48 s a run. That is $16.70 per hour of wall-clock
+    #    saved. `clippy`, which keeps its remote, is $1.15.
+    #
+    # 3. THE HIT RATE IS NOT STABLE. 63.7 % -> 89.4 % on identical inputs. The
+    #    low run uploaded only 0.136 GiB against 356 misses, i.e. those misses
+    #    re-produced content the bucket already held — they were remote
+    #    *lookup failures degraded to misses*, not cache-key misses. kache's
+    #    own report names the cause: remote open/setup latency (~4 min
+    #    aggregate) exceeding read/transfer time, at ~312 ms per remote hit
+    #    across two clouds.
+    #
+    # And cold is not a defeat here: #171 measured a cold hosted `test` at
+    # 674 s against 890 s for the box's slowest *warm* run of the same lane.
+    #
+    # THE TRIGGER TO PUT IT BACK, so nobody has to re-derive this: when the
+    # runners for this lane live in eu-central-1 with the bucket (#176's
+    # ephemeral machines, #180's retirement of the box). At that point both
+    # objections above dissolve at once rather than being traded off — the
+    # traffic is intra-region so the egress line goes to $0, and the ~312 ms
+    # cross-cloud round trip that produces the lookup failures goes with it.
+    # Re-measure then; do not assume the -7 % becomes a win, prove it.
+    #
+    # One constraint that survives the move and must be carried with it: the
+    # runner's root filesystem is ext4 WITHOUT reflink support, so kache's
+    # local store is a second physical copy of the cacheable part of
+    # `target/`, not a copy-on-write clone. See the cap on `clippy`'s
+    # kache-action step — on this lane it is the difference between fitting
+    # and `No space left on device`.
+    # ---------------------------------------------------------------------
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
