@@ -784,10 +784,16 @@ that edits into another agent's lane is caught by the same check.
 
 ### Codex delegation — live again (2026-08-20)
 
-The weekly quota reset, so routing work to Codex is back on. Two providers with
-independent quotas means a wide fan-out should be **level-loaded** across both
-rather than queued entirely on one — one provider's limit then stops being a hard
-stop on the whole queue.
+The weekly quota reset, so routing work to Codex is back on. With opencode
+(below) there are now **three** providers with independent quotas, so a wide
+fan-out should be **level-loaded** across all of them rather than queued entirely
+on one — no single provider's limit is then a hard stop on the whole queue.
+
+Rough division by what each is actually good at here, rather than round-robin:
+**Claude** for judgement against an unbuilt design, and for anything that must
+commit, push or open a PR; **Codex** for well-specified crate work it can build
+and verify, remembering it cannot write to `.git`; **opencode** for read-heavy
+investigation and precise citation.
 
 The binary is `codex` (`/usr/bin/codex`). **There is no `cx` wrapper**; earlier
 notes naming one are stale. Auth is a ChatGPT account (`codex login status`).
@@ -815,6 +821,71 @@ in `.claude/settings.json` do not run for it, so it is invisible to
 [the lane ledger](#working-alongside-other-agents) unless someone registers it, and
 nothing warns it when it edits into another agent's paths. Register its lane on its
 behalf, or give it paths that overlap nobody.
+
+### opencode delegation (2026-08-21)
+
+A third provider, alongside Claude and Codex, and free at time of writing. The
+binary is `opencode` (`~/.opencode/bin/opencode`, v1.18.20). It needs **no
+credentials** — `~/.local/share/opencode/auth.json` is empty and the
+`opencode/*-free` models run anyway. `opencode models` lists what is available;
+`opencode/x-preview-f-free` is the capable one.
+
+**It is very good at reading code and citing it.** Across four tasks it produced
+six `file:line` citations that were checked against the source and every one was
+exact, including a correction nobody asked for: `AGENTS.md`'s claim that
+`max_size` is silently ignored is true *as a TOML key*, but `KACHE_MAX_SIZE`
+does work as an environment variable. Route investigation, grooming and
+review-style work to it.
+
+#### The three traps, all of which look like a broken model
+
+Every one of these was hit here before the tool worked, and each cost real time:
+
+```
+opencode.jsonc      an explicit permission block, per project
+--format json       structured events on stdout
+nohup + patience    it does NOT stream; output appears at exit
+```
+
+1. **The default renderer needs a TTY.** Redirect it and you get zero bytes.
+   Always pass `--format json`, then filter with
+   `jq -r 'select(.type=="text")|.part.text'`.
+2. **Tool permissions default to asking, and a non-interactive run auto-rejects.**
+   The symptom is a silent stall, not an error. `--auto` works but is a blanket
+   grant (`auto-approve permissions that are not explicitly denied
+   (dangerous!)`); prefer a project `opencode.jsonc` with an explicit block,
+   which is scoped and reviewable:
+
+   ```jsonc
+   { "$schema": "https://opencode.ai/config.json",
+     "permission": { "bash": "allow", "edit": "allow", "read": "allow",
+                     "glob": "allow", "grep": "allow", "list": "allow",
+                     "lsp": "allow", "task": "allow", "todowrite": "allow",
+                     "external_directory": "allow" } }
+   ```
+
+   Every key takes `ask`, `allow` or `deny`; the full list is in the schema.
+   Note `external_directory` — without it, reading anything outside the project
+   (a vendored crate under `~/.cargo/registry`, say) stalls silently.
+3. **It buffers output and writes at exit.** A run killed before it finishes
+   produces *nothing*, which is indistinguishable from a hang. Multi-step turns
+   are slow — a tool call returns quickly but the follow-up model step was
+   measured at ~55 s — so a real task runs for many minutes. Launch it detached
+   (`nohup … &`) with a generous timeout and read the file afterwards. **Do not
+   conclude it has hung because the log is empty.**
+
+That third trap produced three separate wrong diagnoses here, including a
+"bootstrap hangs on this repository" conclusion that was false — bootstrap
+completes in well under a second, as `--print-logs --log-level DEBUG` shows. The
+control that appeared to confirm it (a one-file repo that answered fine) did not
+control for elapsed time, which was the variable that actually differed.
+
+#### Reviewing its work
+
+It cannot be trusted more than any other agent, and the same rule applies: **read
+the line it cites before repeating the claim.** It has earned that trust on
+citations so far; it has not yet been proven on code changes, because every
+attempt to test that here was killed by the harness rather than by the model.
 
 ### Device-local memory
 
