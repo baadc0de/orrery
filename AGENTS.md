@@ -472,14 +472,14 @@ worktree here reached **77 GiB**, a second checkout **182 GiB**, and 17 GiB of
 that was incremental-compilation scratch alone. Left alone this fills the disk,
 and a build that dies with `No space left on device` costs more than it saves.
 
-The arrangement is: **every worktree keeps its own `target/`, and they all share
-one object cache.**
+The arrangement is: **every worktree keeps its own `target/`; kache keeps a
+local object cache per build identity.** There is no shared remote on this box.
 
 Sharing a `CARGO_TARGET_DIR` instead would look tempting and be wrong — cargo
 takes an exclusive lock on a target directory, so two agents building at once
 would serialize, one waiting on the other for the whole build. The object cache
-has no such contention: identical `rustc` invocations, which is nearly the
-entire dependency graph, are compiled once per machine and reused everywhere.
+has no such contention: identical `rustc` invocations can be reused by the
+worktrees of the identity that owns its local store.
 
 ### What is configured, and where
 
@@ -487,8 +487,9 @@ entire dependency graph, are compiled once per machine and reused everywhere.
 |---|---|---|
 | `build.rustc-wrapper = "kache"` | `.cargo/config.toml` | yes — worktrees each get a copy of tracked files, so this is the only way a setting reaches all of them |
 | `build.incremental = false` | `.cargo/config.toml` | yes |
-| local store size cap, shared remote | `~/.config/kache/config.toml` | no — machine-local, one per build identity |
-| the cache daemon | `kache@<user>.service` (systemd) | no — machine-local |
+| kache local store | `~/.cache/kache` | no — the live default store; one per build identity |
+| kache remote | unconfigured | n/a — no filesystem or object-store remote exists on this box |
+| kache daemon unit | not installed | n/a — there is no `kache@<user>.service` systemd unit |
 
 The standalone tools (`p2-load`, `p3-island`, `p0-*`) each declare their own
 `[workspace]`, so each has its own `target/`. They still inherit the repo's
@@ -515,35 +516,48 @@ RUSTC_WRAPPER= cargo build
 
 ### How it is set up on this box
 
-Two build identities compile here: the dev user (you, and every agent worktree)
-and `ci`, which the three GitHub Actions runners run as. They share one cache
-through a content-addressed directory:
+This box has local **kache 0.14.2** only. `.cargo/config.toml` routes `rustc`
+through it; its store is the default `~/.cache/kache` for the invoking user.
+There is no `~/.config/kache/config.toml`, no project `.kache.toml`, no remote,
+no `/var/cache/kache/shared`, no `kache` group, and no `kache@<user>.service`
+or `kache-prune-shared.timer` systemd unit. `kache doctor` reports all checks
+passed and explicitly says that no remote cache or planner is configured; its
+daemon-service result is informational for this local-only arrangement.
 
-| Piece | Where |
-|---|---|
-| shared cache | `/var/cache/kache/shared`, group `kache`, `2775` + a default ACL granting the group `rwx` |
-| local store | `~/.cache/kache` per identity, capped at 25 GiB |
-| daemon | `kache@<user>.service`, a systemd **system** unit, one instance per identity |
-| shared-cache pruning | `kache-prune-shared.timer`, daily |
+Verify those claims rather than assuming the old design landed:
+
+```
+kache --version
+kache doctor
+ls /var/cache/kache
+getent group kache
+systemctl list-unit-files 'kache*'
+```
+
+The `ci` account and the dev user are distinct build identities, so their local
+stores are distinct too. Worktrees run by the same user share that user's local
+store. A future remote is not described here; it is not provisioned on this box.
+
+### Records from the retired shared-cache experiment
+
+The following findings are records, not statements about the live arrangement.
+Keep them when changing this section.
 
 `cache.local_max_size` is the size cap — **not** `max_size`, which kache ignores
-silently, leaving you on the 50 GiB default while your config claims otherwise.
-`cache.auto_gc` is on by default and enforces the cap opportunistically, so the
-local stores look after themselves.
+silently, leaving a configured store on the 50 GiB default while the config
+claims otherwise. `cache.auto_gc` is on by default and enforces the local cap
+opportunistically.
 
-The shared remote does not: `kache gc` evicts the local stores only, and neither
-`CacheFileConfig` nor `RemoteFileConfig` has a remote size or retention key, so a
-filesystem remote grows without bound. Reported upstream as
-[kache#774](https://github.com/kunobi-ninja/kache/issues/774); until it lands,
-`kache-prune-shared.timer` holds it under a size cap (80 GiB, hourly) by evicting
-least-recently-read objects. Deleting them is always safe — they are
-content-addressed and immutable, so a pruned object is a cache miss and nothing
-worse.
+`kache gc` evicts local stores only. Neither `CacheFileConfig` nor
+`RemoteFileConfig` had a remote size or retention key, so the former filesystem
+remote could grow without bound. This was reported upstream as
+[kache#774](https://github.com/kunobi-ninja/kache/issues/774). Its former
+`kache-prune-shared.timer` is **not installed on this box**.
 
-**Size, not age**, and the first version got this wrong. An age policy cannot
+**Size, not age**, was the lesson from that experiment. An age policy cannot
 fire on a cache that is being read continuously: the remote reached 319 GiB in a
 single day with **zero** objects untouched for even 24 hours, because every
-build re-reads the whole hot set. The disk hit 94% before anyone noticed.
+build re-read the whole hot set. The disk hit 94% before anyone noticed.
 
 **A blob leak was suspected here and does not reproduce.** On 2026-08-18 we
 recorded `kache stats` reporting `Store: 0 B (0 entries)` while
@@ -570,22 +584,18 @@ separates them:
 SELECT COUNT(*) FROM blobs WHERE hash NOT IN (SELECT hash FROM entry_blobs);
 ```
 
-The reclaim itself is still just stopping `kache@<user>`, deleting `~/.cache/kache` and
-starting it again — the local store is a cache and refills from the shared remote.
+There is no unit to stop on this box. Deleting `~/.cache/kache` drops the local
+cache outright; with no remote it does **not** refill from anywhere. It is safe
+for source correctness, but it deliberately turns later cacheable compiles into
+misses. Inspect `./scripts/dev-cache.sh disk` and use `kache`'s own maintenance
+commands before discarding a useful local store.
 
-The default ACL is the part worth understanding: it makes every new object
-group-writable **regardless of the writing process's umask**. Without it a
-runner with `umask 022` would publish objects the dev user could not overwrite,
-and the sharing would rot silently in one direction.
-
-A systemd *system* unit rather than kache's own `kache daemon install`, which
-writes a **user** unit: a user unit needs lingering and a D-Bus session, and
-`ci` is a service account with neither.
-
-Two `kache doctor` checks are expected to fail here and are not problems: it
-reports the daemon service as "not installed" because it only recognises its own
-user unit, and it counts daemon processes machine-wide rather than per uid, so
-it sees the other identity's daemon and reports one too many.
+The default ACL and systemd system-unit design below belonged to the uninstalled
+filesystem remote. The ACL made every new object group-writable **regardless of
+the writing process's umask**; without it a runner with `umask 022` could have
+published objects the dev user could not overwrite. A systemd *system* unit,
+rather than `kache daemon install`'s user unit, was proposed because a user unit
+needs lingering and a D-Bus session that the `ci` service account does not have.
 
 **Why not sccache**, since the repo used it until 2026-08-17.
 
@@ -600,14 +610,13 @@ exact: each one begins 15–50 ms after a *different* job on a *different* runne
 logged that kill. (PR #52's `SCCACHE_IGNORE_SERVER_IO_ERROR=1` did not help; one
 of the 15 failed fatally with it set.)
 
-kache is immune for two independent reasons. Its daemon is a systemd system
-unit in `system.slice`, not a descendant of any job, so a runner's orphan reaper
-never sees it. And because kache compiles **in the invoking process**, a dead
-daemon costs remote lookups, not builds: with `kache@baadc0de` stopped
-outright, a full rebuild of `p3-island` from an empty `target/` took 3.45 s
-against 3.28 s with it running.
+kache's relevant property is that it compiles **in the invoking process**. The
+systemd-unit and shared-remote arrangement discussed in the earlier comparison
+was never installed here; there is no `kache@baadc0de` unit to stop. The former
+measurement was 3.45 s for a full `p3-island` rebuild from an empty `target/`
+with the proposed daemon stopped, against 3.28 s with it running.
 
-Two further sccache problems made the shared cache worth leaving anyway. It runs
+Two further sccache problems made leaving it worthwhile anyway. It runs
 the compiler inside its server, so the server's uid owns the output objects and
 it panics outright if it cannot stat the calling user's toolchain — which it
 cannot, because `/home/<user>` is `0750`. And it writes cache entries `0600`, so
@@ -626,8 +635,8 @@ will race and cause spurious build failures."*
 ./scripts/dev-cache.sh prune    # delete every target/ — safe, and meant to be used
 ```
 
-`prune` is the lever to pull when disk gets tight, and pulling it is cheap:
-sources are in git and the rebuild refills from the cache. Measured 2026-08-17
+`prune` is the lever to pull when disk gets tight: sources are in git, though a
+local-only store cannot restore entries deleted with the store itself. Measured 2026-08-17
 on the `p3-island` tool, deleting its whole `target/` and rebuilding: **25 s
 with a cold cache, 3.3 s warm** (330 cache hits). The residual is linking and
 cargo's own bookkeeping, which no object cache can remove. For comparison, the
@@ -638,15 +647,15 @@ build identities and a warm cache was warm for one user only.
 Two things follow for agents sharing this machine:
 
 - **Prune freely, and prune your own worktree before a long build.** You are not
-  destroying anyone's work; you are dropping a derived artifact that another
-  agent's build already paid to compute.
+  destroying anyone's work; you are dropping a derived artifact. The local
+  store may accelerate rebuilding it, but this box has no remote fallback.
 - **Do not read a less-than-100% hit rate as breakage.** Linking, `build.rs`
   executions and a few binary crate-type units are not cacheable by design, and
   the crate you are actively editing is *supposed* to miss. `kache why-miss
   <crate>` explains any individual miss, which beats guessing.
 - **A miss on the crate you are editing is not a miss on its dependencies.**
-  The dependency graph is the part the shared cache pays for, and it is the
-  overwhelming majority of a cold build.
+  The dependency graph is the part kache can pay for, and it is the overwhelming
+  majority of a cold build.
 
 ## Working alongside other agents
 
