@@ -96,6 +96,7 @@ readonly WORKSPACES=(
     'p2-load         test'
     'p3-island       test'
     'p3-siblings     test'
+    'p5-dupe-gauntlet check'
     'p4-streams-bench test'
     'p2-journal-bench check'
 )
@@ -221,13 +222,14 @@ lane_gates() {
     # docs/06-verifiable-core.md §8's static gates.
     run scripts/core-gates.sh
 
-    # The P2 and P3 harnesses need a FoundationDB cluster and eight peer
-    # processes respectively, so the real runs are nightly. Their `--self-test`
-    # modes are the per-commit half: they assert the scripts still contain the
-    # stages that make them proofs.
+    # The phase harnesses need FoundationDB and/or multiple real processes, so
+    # the real runs are nightly. Their `--self-test` modes are the per-commit
+    # half: they assert the scripts still contain the stages that make them
+    # proofs.
     run scripts/p2-kill9-gate.sh --self-test
     run scripts/p3-island-gate.sh --self-test
     run scripts/p3-siblings-gate.sh --self-test
+    run scripts/p5-dupe-gauntlet-gate.sh --self-test
     run scripts/p1-swarm-gate.sh --self-test
     run scripts/fdb-tests.sh --self-test
 

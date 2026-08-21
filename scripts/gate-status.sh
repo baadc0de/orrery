@@ -437,6 +437,59 @@ gate_p3_siblings_evidence() {
   ev "$status" "$dir" "$numbers"
 }
 
+# ── P5 dupe gauntlet ────────────────────────────────────────────────────────
+
+gate_p5_dupe_gauntlet_tier() { echo full; }
+gate_p5_dupe_gauntlet_prereq() {
+  [[ ${MODE:-} == inspect ]] && return 0
+  local cf=${ORRERY_FDB_CLUSTER_FILE:-}
+  [[ -n $cf ]] \
+    || { echo 'ORRERY_FDB_CLUSTER_FILE is not set; replay evidence requires a live FoundationDB cluster'; return 1; }
+  [[ -r $cf ]] || { echo "ORRERY_FDB_CLUSTER_FILE=$cf is not readable"; return 1; }
+  [[ ${P5_DUPE_CLUSTER_IS_THROWAWAY:-0} == 1 ]] \
+    || { echo "set P5_DUPE_CLUSTER_IS_THROWAWAY=1 to assert $cf may receive the gauntlet's fixed ledger rows"; return 1; }
+  command -v fdbcli >/dev/null || { echo 'fdbcli is not on PATH'; return 1; }
+  timeout 20 fdbcli -C "$cf" --exec 'status minimal' 2>/dev/null | grep -q 'is available' \
+    || { echo "the cluster at $cf is not available"; return 1; }
+  have_cargo || { echo 'cargo is not on PATH'; return 1; }
+  return 0
+}
+gate_p5_dupe_gauntlet_run() {
+  {
+    (cd "$ROOT/p5-dupe-gauntlet" && cargo build --release)
+    P5_DUPE_BIN="$ROOT/p5-dupe-gauntlet/target/release/p5-dupe-gauntlet" \
+    P5_DUPE_GATE_OUT="$OUT/p5-dupe-gauntlet-$(date -u +%Y%m%dT%H%M%SZ)" \
+      "$ROOT/scripts/p5-dupe-gauntlet-gate.sh"
+  } >"$OUT/logs/p5-dupe-gauntlet.log" 2>&1
+}
+gate_p5_dupe_gauntlet_evidence() {
+  local dir
+  dir=$(ls -1d "$OUT"/p5-dupe-gauntlet-* "$ROOT"/p5-dupe-gauntlet-2* 2>/dev/null | sort | tail -1) || true
+  [[ -n ${dir:-} && -r $dir/report.json ]] || { ev_none; return 0; }
+  local numbers status
+  numbers=$(jq -c '{
+    result,
+    replay_passed: .arms.replay.passed,
+    replay_submissions: .arms.replay.submissions,
+    replay_intent_rows: .arms.replay.intent_rows,
+    replay_receipts: .arms.replay.ledger_receipts,
+    honest_control_passed: .arms.attestation.honest_control.passed,
+    legacy_preimage_passed: .arms.attestation.legacy_preimage.passed,
+    legacy_preimage_cause: .arms.attestation.legacy_preimage.audit_cause,
+    issuer_as_witness_passed: .arms.attestation.issuer_as_witness.passed,
+    issuer_as_witness_cause: .arms.attestation.issuer_as_witness.audit_cause,
+    outside_set_passed: .arms.attestation.outside_announced_set.passed,
+    outside_set_cause: .arms.attestation.outside_announced_set.audit_cause,
+    non_required_subset_passed: .arms.attestation.non_required_subset.passed,
+    non_required_subset_cause: .arms.attestation.non_required_subset.audit_cause,
+    quarantine_passed: .arms.quarantine.passed,
+    quarantine_cause: .arms.quarantine.audit_cause,
+    quarantine_full_validation: .arms.quarantine.full_validation_path_proved_by_ordering
+  }' "$dir/report.json" 2>/dev/null || echo '{}')
+  if [[ -e $dir/PASSED ]]; then status=PASSED; else status=FAILED; fi
+  ev "$status" "$dir" "$numbers"
+}
+
 # ── P2 kill-9 ────────────────────────────────────────────────────────────────
 
 gate_p2_kill9_tier() { echo full; }

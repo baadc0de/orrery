@@ -160,6 +160,7 @@ CIs in one week came from that blind spot. The inventory, which is also
 | `p0-dashboard` | `cargo check --all-targets` — no tests |
 | `p3-island` | `cargo check --all-targets` — no tests; asserted by the nightly island gate |
 | `p3-siblings` | `cargo test` in `gates` — 10 tests; the two-gateway harness, asserted by the nightly sibling gate. The only tool that links `libfdb_c` besides `p2-load`: its double-spend race leg reads the ledger back out of FoundationDB |
+| `p5-dupe-gauntlet` | `cargo check --all-targets` — no tests; the single-gateway replay, attestation-abuse and quarantine proof, asserted by the nightly P5 gate against FoundationDB |
 
 The four tool suites are 87 tests between them, which is the number that would
 go unrun if the `gates` lane stopped visiting them.
