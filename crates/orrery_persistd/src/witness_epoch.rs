@@ -603,6 +603,26 @@ pub(crate) mod test_support {
             .expect("the fixture announcement is accepted");
         epochs
     }
+
+    /// Accept one more epoch, for a **different cell**, into an existing
+    /// cache.
+    ///
+    /// D30's tests need two cells in one cache, because that is the shape the
+    /// standing predicate exists for: the cache resolves by handle and holds
+    /// whatever every peer couriered, so a second cell's announced set is one
+    /// `u64` away from any submitter that can reach this gateway.
+    pub(crate) fn add_cell_epoch(
+        epochs: &WitnessEpochAuthority,
+        cell: CellId,
+        handle: u64,
+        selected: &[NodeId],
+        now_ms: u64,
+    ) {
+        let encoded = announcement(GridId::ROOT, cell, 1, handle, selected, &[9u8; 32], None);
+        epochs
+            .apply_announcement(&encoded, secret(1).public(), &CoverAllInterest, now_ms)
+            .expect("the fixture announcement is accepted");
+    }
 }
 
 #[cfg(test)]

@@ -56,6 +56,7 @@ entry point. Decisions live independently under [docs/adr/](docs/adr/):
 | D27 | [ADR-0027](docs/adr/0027-attestation-envelope.md) | Attestation envelope and required-K draw |
 | D28 | [ADR-0028](docs/adr/0028-witness-set-seeding.md) | Witness-set seeding, announcement, `epoch/` record |
 | D29 | [ADR-0029](docs/adr/0029-low-population-path.md) | P5 low-population path: provisional commit, spot replay, annulment |
+| D30 | [ADR-0030](docs/adr/0030-cell-epoch-standing.md) | Cell-epoch standing: which announced set may judge an intent (Proposed) |
 
 After the applicable ADRs, use this expansion reading path:
 

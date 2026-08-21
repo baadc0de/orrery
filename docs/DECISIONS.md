@@ -44,6 +44,7 @@ their linked dependencies.
 | D27 | [ADR-0027](adr/0027-attestation-envelope.md) | Attestation envelope and required-K draw |
 | D28 | [ADR-0028](adr/0028-witness-set-seeding.md) | Witness-set seeding, announcement envelope, `epoch/` record |
 | D29 | [ADR-0029](adr/0029-low-population-path.md) | P5 low-population path: quarantined provisional commit, spot replay, annulment |
+| D30 | [ADR-0030](adr/0030-cell-epoch-standing.md) | An intent is judged only under a cell-epoch its issuer stands in (**Proposed**) |
 
 ## Status and supersession
 
