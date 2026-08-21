@@ -5,6 +5,17 @@
 This decision is normative once accepted. See the [ADR index](../DECISIONS.md)
 for precedence, scope, and the complete decision set.
 
+**Amended 2026-08-21, while still Proposed ([#248]).** The merged first draft
+of this record allocated the one-byte key family `b'y'` to `ramp/`, justified
+by `'y'` appearing nowhere in `keyspace.rs` — a check of the code, not of the
+accepted set. Accepted [ADR-0031]'s resolved question 4 had already allocated
+`y` to `strike/`, and an accepted record does not yield to a proposed one, so
+this record moved: `ramp/` spends **no family byte** and lives as the
+`b"vr"`-discriminated sub-span of the registered `v` family. Clause (c)
+carries the new allocation, the byte-budget arithmetic that forced it, and
+the allocation rule whose absence produced the collision. Nothing else in the
+record changed.
+
 **Supersedes:** nothing. It **implements the policy half** of
 [D17.3](0017-risks-and-open-questions.md) for epic #106 — #147 shipped the
 K-of-N switch and refused to ship the ramp ("this code takes no position on
@@ -215,13 +226,72 @@ maintenance loop (`gateway.rs:4777`), and the epoch cache rides it
 (`:4829-4831`, the D28 arrangement); posture polling joins that loop, and a
 posture change lands on every process within one sweep period.
 
-The family is new and prefix-disjoint: `ramp/{control}` with family byte
-**`b'y'`** — chosen because `'y'` appears nowhere in
-`crates/orrery_persistd/src/keyspace.rs` today, while the bytes in use leave
-only `b, h, j, q, t, x, y, z`; `'d'` is [ADR-0031]'s claim for `id/`,
-[#205] will claim one for `strike/`, and `'y'` collides with neither. The
-disjointness test (`keyspace.rs:1849`) is the mechanism that keeps the next
-family's choice as honest. The value:
+The rows are durable in FoundationDB, and that much is forced, not chosen:
+auto-suspend (clause f) is a *persistd-written* posture change that every
+process in the fleet must see within one poll interval and that must survive
+every restart — a config file or CLI default cannot be written by a tripping
+gateway, the coordinator holds no durable state by design ([ADR-0031]
+Context), and FoundationDB is the only shared durable store in the system.
+What is **not** forced is a family byte, and `ramp/` does not get one:
+
+> **`ramp/{control}` is the sub-span `b"vr" ‖ control-name` inside the
+> registered `v` family — no new family byte is spent. The full ramp scan is
+> `[b"vr", b"vs")`. The existing `content/version` row is the bare one-byte
+> key `[b'v']` (`keyspace.rs:458`), which sorts before every two-byte
+> `v ‖ …` key (`[0x76] < [0x76, …]`, the same ordering argument [ADR-0031]
+> clause (a) makes for its range bounds), so the landed key is untouched and
+> no migration exists. The implementing change registers nothing new in
+> `all_key_families_are_range_disjoint` (`keyspace.rs:2777`) — byte `v` is
+> already in its table — and must instead add a sub-span assertion in the
+> style of the `d`/`l` sub-discriminator tests: `[b'v']` < every `b"vr"` key
+> < `[b'w']`.**
+
+This paragraph replaces the first draft's allocation of family byte `b'y'`,
+and the arithmetic is why the fix is a sub-span rather than another byte.
+`registered_families()` (`keyspace.rs:2662`) holds eighteen one-byte
+families — `a c d e f g i k l m n o p r s u v w` — and six more bytes are in
+use as exclusive range ends (`b h j q t x`). Of the two lowercase bytes left,
+accepted [ADR-0031] resolved question 4 allocates `y` to `strike/` and closes
+its budget with `z` to `jarchive/`. The clean-byte budget is therefore
+**zero**, and five absent-by-default singleton rows would be the worst
+possible way to spend a byte even if one remained. [ADR-0031]'s Consequences
+already name the fork for the next family — "adopt sub-discrimination as
+this one does or open the question of a two-byte family space" — and this
+record takes the first tine.
+
+`v` is the right host, not merely an available one. Its one landed key kind,
+`content/version`, is a deployment-plane singleton: written by the world
+seeder at seed time (`docs/12-world-seeding.md` §9.3), read by `persistd`,
+never written on any hot path. `ramp/` rows have the same shape — at most
+five rows, written rarely by the operator plane and by auto-suspend, polled
+by every process. [ADR-0031] clause (d)'s single-writer objection — the
+reason `strike/` did not share `d` — is about transactional coupling: `db`
+must be written with `da` atomically, and index staleness there is a
+security property. No such coupling exists here: no transaction spans the
+`v` sub-spans, no scan crosses them, and a posture row's staleness is
+bounded by the poll interval regardless of who wrote the content row. The
+discriminator is ASCII at a fixed offset, per the rule [ADR-0031] draws from
+the `lease_key` finding — never an id's high byte.
+
+**The allocation rule, so the next family is not answered ad hoc a third
+time.** This collision happened because a proposed record checked the tree
+and not the record set — and it is the second such check (D28 chose `e`/`f`
+against "the fourteen in `keyspace.rs`"; it happened to be right). The rule:
+
+> **The free list for a key-prefix allocation is the lowercase bytes minus
+> `registered_families()` minus every byte an accepted record allocates or
+> earmarks — the code alone is never sufficient, because a
+> documented-but-unimplemented family is still allocated. That list is now
+> empty. A new key kind therefore takes an ASCII sub-discriminator inside
+> the existing family whose writer, retention and scan profile it matches,
+> as this record does. A kind that genuinely cannot — because sharing would
+> put a foreign writer inside a transactionally-coupled family ([ADR-0031]
+> clause (d)) or because no family can host its scan shape — is grounds for
+> a dedicated ADR that amends [ADR-0031]'s budget arithmetic and defines a
+> multi-byte family scheme. It is never grounds for taking `y`, `z`, or a
+> range-end byte in passing.**
+
+The value:
 
 ```rust
 struct RampPosture {
@@ -580,10 +650,18 @@ either an attack or a ruleset bug, and both page somebody.
 
 ## Consequences
 
-- **Five CLI arguments and one new keyspace family land in `persistd`.** The
-  family is `ramp/` (`b'y'`), one row per control, absent-by-default. The
-  keyspace disjointness test gains the new prefix; the test at
-  `keyspace.rs:1849` is what keeps that addition from ever colliding.
+- **Five CLI arguments and no new keyspace family land in `persistd`.** The
+  rows are `ramp/{control}` at `b"vr" ‖ control-name`, one row per control,
+  absent-by-default, inside the already-registered `v` family. The
+  disjointness test (`keyspace.rs:2777`) needs no new row; the implementing
+  change adds the `v` sub-span assertion clause (c) requires, in the style
+  of the `d`/`l` sub-discriminator tests.
+- **The one-byte family budget is spent, and this record says so on the
+  way past.** Accepted [ADR-0031] holds `y` for `strike/` and `z` for
+  `jarchive/`; nothing clean remains. Clause (c)'s allocation rule is
+  normative once this record is accepted: sub-discriminate inside a matching
+  family, or write the ADR that opens the multi-byte space — and always
+  check the accepted record set, not just `keyspace.rs`.
 - **The binary stops being unable to enforce.** Wiring the flags replaces
   `persistd.rs:2109`'s hardcoded constructor and adds the `recording_epochs`
   call the executor never receives. After this record's implementation
@@ -623,6 +701,30 @@ either an attack or a ruleset bug, and both page somebody.
   authentication question. Rejected: a redeploy is minutes and drops
   sessions; auto-suspend would have to restart fleets to demote a control,
   which turns "contain the blast radius" into "cause a bigger one".
+- **A family byte of `ramp/`'s own — `y`, as the merged first draft said.**
+  Rejected on [#248]: accepted [ADR-0031] resolved question 4 allocates `y`
+  to `strike/`, and the draft's justification ("`'y'` appears nowhere in
+  `keyspace.rs`") consulted the code while `strike/` is
+  documented-but-unimplemented — exactly the guard-blindness [#226]
+  describes from the other direction.
+- **Take `z` instead.** The same mistake one byte later: [ADR-0031]'s
+  accepted arithmetic closes only because `z` goes to `jarchive/`. Spending
+  it here re-opens an accepted record's budget to shelve five rows.
+- **Open the two-byte family space now.** The structural fix, and costed
+  rather than dismissed: it touches every key builder in `keyspace.rs`, the
+  disjointness guard's one-byte model, and — for any family it re-homes —
+  the on-disk key format, the least reversible change class in the system
+  ([#226]). Buying that to store at most five absent-by-default posture rows
+  is backwards. The mechanism stays available to a future family that
+  genuinely needs a range of its own, through the dedicated ADR clause (c)'s
+  allocation rule names.
+- **Keep posture out of FoundationDB entirely** — a config file, an
+  environment variable, an ops-plane push. Rejected for the same reason
+  CLI-only flags are: auto-suspend is a durable, fleet-visible write made by
+  a `persistd` process itself, within seconds, surviving restarts. There is
+  no other shared durable store — the coordinator holds none by design
+  ([ADR-0031] Context) — so anything outside FDB reinvents replication for
+  five rows.
 - **Hot-path posture reads.** Always-current mode, no staleness. Rejected:
   puts an FDB round trip inside the admission path that #147's acceptance
   and D16's 10 ms p99 both forbid; the 1 s poll buys the same semantics for
@@ -702,4 +804,6 @@ either an attack or a ruleset bug, and both page somebody.
 [#221]: https://github.com/baadc0de/orrery/issues/221
 [#222]: https://github.com/baadc0de/orrery/issues/222
 [#224]: https://github.com/baadc0de/orrery/issues/224
+[#226]: https://github.com/baadc0de/orrery/issues/226
+[#248]: https://github.com/baadc0de/orrery/issues/248
 [ADR-0031]: 0031-id-account-subspace.md
