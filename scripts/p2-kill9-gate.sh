@@ -2,14 +2,93 @@
 # P2's permanent two-process crash/recovery regression harness.
 #
 # This is intentionally a *proof harness*, not a convenience restart script:
-# no success artifact is written until the promoted follower has been checked
-# against every pre-crash acknowledgement, the old owner has failed fenced
-# admission, and the four D16 latency series have passed the dashboard gate.
+# no artifact is written until the promoted follower has been checked against
+# every pre-crash acknowledgement and the old owner has failed fenced
+# admission. The D16 latency verdict is included only when D19's device
+# preflight qualifies the journal filesystem; an unqualified run still writes
+# its completed correctness proofs with an explicit non-verdict.
 set -euo pipefail
 
 readonly NAME=p2-kill9-gate
 die() { echo "$NAME: $*" >&2; exit 2; }
 note() { echo "$NAME: $*" >&2; }
+
+# Reduce fio job A into the stable D19 qualification artifact. Kept as one
+# function because `--self-test` feeds it both a qualified and an unqualified
+# population: the check exercises the same comparison the live preflight uses,
+# not a second implementation of it.
+reduce_device_qualification() {
+  python3 - "$1" "${2:-}" <<'PY'
+import json, pathlib, sys
+
+raw = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding='utf-8'))
+required = {
+    'jobs': 2,
+    'runtime_seconds': 120,
+    'block_size_bytes': 8192,
+    'offered_rate_iops_per_job': 470.0,
+    # fio's runtime accounting can land fractionally below the offered rate.
+    # D19's committed reducer accepts >=469 while still refusing the 337.3
+    # IOPS population measured on this box.
+    'minimum_rate_iops_per_job': 469.0,
+    'sync_max_ms_below': 1.0,
+    'reference_barriers_per_s': 940.0,
+    'reference_sync_p99_ms': 0.185,
+    'reference_sync_max_ms': 0.509,
+}
+jobs = []
+for raw_job in raw.get('jobs', []):
+    sync = raw_job.get('sync', {}).get('lat_ns', {})
+    percentiles = sync.get('percentile', {})
+    jobs.append({
+        'iops': float(raw_job.get('write', {}).get('iops', 0.0)),
+        'sync_p99_ms': float(percentiles.get('99.000000', 0.0)) / 1_000_000.0,
+        'sync_max_ms': float(sync.get('max', 0.0)) / 1_000_000.0,
+    })
+
+qualified = len(jobs) == required['jobs'] and all(
+    job['iops'] >= required['minimum_rate_iops_per_job']
+    and job['sync_max_ms'] < required['sync_max_ms_below']
+    for job in jobs
+)
+measured = None
+if jobs:
+    measured = {
+        'aggregate_barriers_per_s': sum(job['iops'] for job in jobs),
+        'worst_sync_p99_ms': max(job['sync_p99_ms'] for job in jobs),
+        'worst_sync_max_ms': max(job['sync_max_ms'] for job in jobs),
+        'jobs': jobs,
+    }
+reasons = []
+if len(jobs) != required['jobs']:
+    reasons.append(f"fio returned {len(jobs)} jobs; required {required['jobs']}")
+for index, job in enumerate(jobs, 1):
+    if job['iops'] < required['minimum_rate_iops_per_job']:
+        reasons.append(
+            f"job {index} sustained {job['iops']:.1f} IOPS; "
+            f"required >= {required['minimum_rate_iops_per_job']:.1f} "
+            f"at an offered {required['offered_rate_iops_per_job']:.1f}"
+        )
+    if job['sync_max_ms'] >= required['sync_max_ms_below']:
+        reasons.append(
+            f"job {index} fdatasync max {job['sync_max_ms']:.3f} ms; "
+            f"required < {required['sync_max_ms_below']:.3f} ms"
+        )
+
+json.dump({
+    'kind': 'd19_device_qualification',
+    'method': 'fio_job_a',
+    'command': 'fio --name=jobA --directory=<journal-filesystem> --rw=write --bs=8k --fdatasync=1 --numjobs=2 --rate_iops=470 --runtime=120 --time_based --size=256m --output-format=json --unlink=1',
+    'data_path': sys.argv[2] or raw.get('orrery_data_path', ''),
+    'fio_version': raw.get('fio version'),
+    'required': required,
+    'measured': measured,
+    'qualified': qualified,
+    'reason': None if qualified else '; '.join(reasons),
+}, sys.stdout, indent=2)
+print()
+PY
+}
 
 if [[ ${1:-} == --self-test ]]; then
   # Offline guard: useful in CI images without FDB or release binaries.  Keep
@@ -58,6 +137,11 @@ if [[ ${1:-} == --self-test ]]; then
     || die 'self-test: zombie fence evidence assertion absent'
   runs 'prove_epoch_fork_refused' || die 'self-test: primary-restart epoch-fork proof absent'
   has '--gate --json' || die 'self-test: latency gate absent'
+  runs 'run_device_qualification' || die 'self-test: D19 device preflight absent'
+  has '--device-qualification "$qualification_artifact"' \
+    || die 'self-test: dashboard is not given the device qualification'
+  has "l.get('gate') != 'unqualified'" \
+    || die 'self-test: unqualified latency report is not accepted as a non-verdict'
   # `persistd` has refused to start without an identity issuer key since
   # `f33568b feat(p3): complete strict persistence authority path`, and this
   # script did not pass one. Nothing noticed, because the only thing that runs
@@ -151,6 +235,32 @@ if [[ ${1:-} == --self-test ]]; then
   runs 'prove_journal_open_budget' || die 'self-test: journal-open budget check absent'
   has 'over the D16 journal_open_ms budget of 2000 ms' \
     || die 'self-test: journal-open budget has no threshold'
+
+  # Functional half of the device preflight. Both populations pass through the
+  # live reducer above. The unqualified population is this box's recorded D23
+  # shape; the qualified population is D19's reference shape. Keeping both in
+  # one check prevents a comparison that always refuses (or always qualifies)
+  # from passing per commit.
+  qualified_raw='{"fio version":"fio-3.42","orrery_data_path":"/qualified","jobs":[{"write":{"iops":470.0},"sync":{"lat_ns":{"max":509000,"percentile":{"99.000000":185000}}}},{"write":{"iops":470.0},"sync":{"lat_ns":{"max":480000,"percentile":{"99.000000":170000}}}}]}'
+  unqualified_raw='{"fio version":"fio-3.42","orrery_data_path":"/unqualified","jobs":[{"write":{"iops":337.3},"sync":{"lat_ns":{"max":104120000,"percentile":{"99.000000":7045000}}}},{"write":{"iops":337.3},"sync":{"lat_ns":{"max":95393000,"percentile":{"99.000000":7045000}}}}]}'
+  qualified_report=$(reduce_device_qualification <(printf '%s\n' "$qualified_raw"))
+  unqualified_report=$(reduce_device_qualification <(printf '%s\n' "$unqualified_raw"))
+  python3 - "$qualified_report" "$unqualified_report" <<'PY'
+import json, sys
+qualified, unqualified = map(json.loads, sys.argv[1:])
+if qualified.get('qualified') is not True:
+    raise SystemExit('self-test: D19 reference population was not qualified')
+if unqualified.get('qualified') is not False:
+    raise SystemExit('self-test: D23 box population was not refused')
+measured = unqualified.get('measured') or {}
+required = unqualified.get('required') or {}
+if measured.get('worst_sync_p99_ms') != 7.045:
+    raise SystemExit('self-test: unqualified p99 was not preserved')
+if measured.get('worst_sync_max_ms') != 104.12:
+    raise SystemExit('self-test: unqualified maximum was not preserved')
+if required.get('sync_max_ms_below') != 1.0:
+    raise SystemExit('self-test: D19 maximum requirement moved')
+PY
   echo 'self-test: two-process proof stages present'
   exit 0
 fi
@@ -212,6 +322,82 @@ out=${P2_GATE_OUT:-"$(pwd)/p2-kill9-$(date -u +%Y%m%dT%H%M%SZ)"}
 data=${P2_GATE_DATA_DIR:-"$out"}
 [[ $data == "$out" ]] || mkdir -p "$data"
 mkdir -p "$out" "$data/primary-data" "$data/follower-data"
+qualification_artifact="$out/device-qualification.json"
+
+# D19's exact job-A shape: two 8 KiB write+fdatasync writers, each offered 470
+# operations/s for 120 seconds. It runs on the filesystem that will carry the
+# journals and before any gate process starts, because D20 measured that a
+# competing build can change the maximum by two orders of magnitude. `--unlink`
+# removes only fio's files in this newly-created work directory after the job;
+# the JSON result remains in the evidence directory.
+run_device_qualification() {
+  local injected=${P2_GATE_DEVICE_QUALIFICATION_JSON:-}
+  if [[ -n $injected ]]; then
+    [[ -r $injected ]] || die "injected device qualification is not readable: $injected"
+    cp "$injected" "$qualification_artifact"
+  else
+    local fio_bin=${P2_GATE_FIO_BIN:-fio}
+    local work="$data/device-qualification-work"
+    local raw="$out/device-qualification-fio.json"
+    mkdir -p "$work"
+    if command -v "$fio_bin" >/dev/null 2>&1 && \
+      "$fio_bin" --name=jobA --directory="$work" --rw=write --bs=8k \
+        --fdatasync=1 --numjobs=2 --rate_iops=470 --runtime=120 \
+        --time_based --size=256m --output-format=json --unlink=1 \
+        >"$raw" 2>"$out/device-qualification-fio.stderr"; then
+      reduce_device_qualification "$raw" "$data" >"$qualification_artifact"
+    else
+      python3 - "$qualification_artifact" "$data" "$fio_bin" <<'PY'
+import json, pathlib, sys
+out, data_path, fio_bin = sys.argv[1:]
+pathlib.Path(out).write_text(json.dumps({
+    'kind': 'd19_device_qualification',
+    'method': 'fio_job_a_unavailable',
+    'command': 'fio --name=jobA --directory=<journal-filesystem> --rw=write --bs=8k --fdatasync=1 --numjobs=2 --rate_iops=470 --runtime=120 --time_based --size=256m --output-format=json --unlink=1',
+    'data_path': data_path,
+    'fio_version': None,
+    'required': {
+        'jobs': 2,
+        'runtime_seconds': 120,
+        'block_size_bytes': 8192,
+        'offered_rate_iops_per_job': 470.0,
+        'minimum_rate_iops_per_job': 469.0,
+        'sync_max_ms_below': 1.0,
+        'reference_barriers_per_s': 940.0,
+        'reference_sync_p99_ms': 0.185,
+        'reference_sync_max_ms': 0.509,
+    },
+    'measured': None,
+    'qualified': False,
+    'reason': f'{fio_bin} was unavailable or job A failed; no latency verdict is permitted',
+}, indent=2) + '\n', encoding='utf-8')
+PY
+    fi
+  fi
+
+  python3 - "$qualification_artifact" <<'PY'
+import json, pathlib, sys
+q = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding='utf-8'))
+if q.get('kind') != 'd19_device_qualification':
+    raise SystemExit('device qualification has an unexpected kind')
+measured, required = q.get('measured'), q.get('required') or {}
+if measured:
+    print(
+        'device qualification: {} — {:.1f} barriers/s vs {:.1f} reference, '
+        'p99 {:.3f} ms vs {:.3f} reference, max {:.3f} ms vs required < {:.3f} ms'.format(
+            'QUALIFIED' if q.get('qualified') else 'UNQUALIFIED',
+            measured['aggregate_barriers_per_s'], required['reference_barriers_per_s'],
+            measured['worst_sync_p99_ms'], required['reference_sync_p99_ms'],
+            measured['worst_sync_max_ms'], required['sync_max_ms_below'],
+        ),
+        file=sys.stderr,
+    )
+else:
+    print(f"device qualification: UNQUALIFIED — {q.get('reason')}", file=sys.stderr)
+PY
+}
+run_device_qualification
+
 # `SIGKILL` can land before a reporter's first tick.  Pre-create the files so
 # the merge step remains deterministic; the dashboard still rejects the run
 # if this leaves `journal_commit_ms` without samples.
@@ -679,15 +865,23 @@ grep -Eqi 'fence|owner|activation|epoch' "$out/zombie.stderr" || die 'zombie fai
 # Keep all raw telemetry, then gate the merged evidence in one invocation.
 cat "$out/load-before.jsonl" "$out/primary-metrics.jsonl" "$out/promoted-metrics.jsonl" \
     "$out/primary-boundary.jsonl" "$out/promoted-boundary.jsonl" >"$out/telemetry.jsonl"
-"$P2_DASHBOARD_BIN" --gate --json "$out/telemetry.jsonl" >"$out/latency-report.json"
+"$P2_DASHBOARD_BIN" --gate --json \
+  --device-qualification "$qualification_artifact" \
+  "$out/telemetry.jsonl" >"$out/latency-report.json"
 
-python3 - "$out/artifact.json" "$out/recovery-verification.json" "$out/latency-report.json" "$recovery_cutoff" "$out/retention.json" <<'PY'
+python3 - "$out/artifact.json" "$out/recovery-verification.json" "$out/latency-report.json" "$recovery_cutoff" "$out/retention.json" "$qualification_artifact" <<'PY'
 import datetime,json,pathlib,sys
 artifact = pathlib.Path(sys.argv[1]); verification = pathlib.Path(sys.argv[2]); latency = pathlib.Path(sys.argv[3]); cutoff = sys.argv[4]
 v=json.loads(verification.read_text()); l=json.loads(latency.read_text())
 retention=json.loads(pathlib.Path(sys.argv[5]).read_text())
+qualification=json.loads(pathlib.Path(sys.argv[6]).read_text())
 if not v.get('pass', False): raise SystemExit('recovery verifier returned a non-pass report')
-if l.get('gate') != 'pass': raise SystemExit('latency dashboard returned a non-pass report')
+if qualification.get('qualified'):
+    if l.get('gate') != 'pass': raise SystemExit('latency dashboard returned a non-pass report on a qualified device')
+    result = 'pass'
+else:
+    if l.get('gate') != 'unqualified': raise SystemExit('latency dashboard did not withhold its verdict on an unqualified device')
+    result = 'unqualified'
 # The merged artifact is written by persistd and p2-load and read by the
 # dashboard, all three off one series-name definition (orrery_protocol::
 # metrics). An unrecognized name here means a producer drifted from it, which
@@ -716,9 +910,11 @@ server_side_spans_never_gate(l.get('series') or {})
 artifact.write_text(json.dumps({
   'kind':'p2_two_process_kill9_gate',
   'created_at':datetime.datetime.now(datetime.timezone.utc).isoformat(),
-  'result':'pass', 'recovery_cutoff':cutoff,
+  'result':result, 'recovery_cutoff':cutoff,
   'proofs': {'recovery': v, 'latency': l, 'zombie_primary_fenced': True,
-             'bumped_chain_epoch_refused': True, 'retention': retention},
+             'bumped_chain_epoch_refused': True, 'retention': retention,
+             'device_qualification': qualification},
 }, indent=2) + '\n')
 PY
-note "PASS artifact: $out/artifact.json"
+artifact_result=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["result"])' "$out/artifact.json")
+note "${artifact_result^^} artifact: $out/artifact.json"
