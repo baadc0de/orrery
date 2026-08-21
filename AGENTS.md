@@ -473,7 +473,9 @@ that was incremental-compilation scratch alone. Left alone this fills the disk,
 and a build that dies with `No space left on device` costs more than it saves.
 
 The arrangement is: **every worktree keeps its own `target/`; kache keeps a
-local object cache per build identity.** There is no shared remote on this box.
+local object cache per build identity.** On `fortyninety` that is the whole
+arrangement; on `orrery-hel1-1` those local stores additionally publish to and
+restore from the shared remote described below.
 
 Sharing a `CARGO_TARGET_DIR` instead would look tempting and be wrong — cargo
 takes an exclusive lock on a target directory, so two agents building at once
@@ -488,8 +490,8 @@ worktrees of the identity that owns its local store.
 | `build.rustc-wrapper = "kache"` | `.cargo/config.toml` | yes — worktrees each get a copy of tracked files, so this is the only way a setting reaches all of them |
 | `build.incremental = false` | `.cargo/config.toml` | yes |
 | kache local store | `~/.cache/kache` | no — the live default store; one per build identity |
-| kache remote | unconfigured | n/a — no filesystem or object-store remote exists on this box |
-| kache daemon unit | not installed | n/a — there is no `kache@<user>.service` systemd unit |
+| kache remote | `fortyninety`: unconfigured · `orrery-hel1-1`: `/var/cache/kache/shared` | n/a — machine-local, not committed |
+| kache daemon unit | `fortyninety`: none · `orrery-hel1-1`: `kache@<user>.service`, one per build identity | n/a — machine-local |
 
 The standalone tools (`p2-load`, `p3-island`, `p0-*`) each declare their own
 `[workspace]`, so each has its own `target/`. They still inherit the repo's
@@ -514,31 +516,62 @@ an empty wrapper, which takes precedence over the config file:
 RUSTC_WRAPPER= cargo build
 ```
 
-### How it is set up on this box
+### How it is set up: two boxes, two arrangements
 
-This box has local **kache 0.14.2** only. `.cargo/config.toml` routes `rustc`
-through it; its store is the default `~/.cache/kache` for the invoking user.
-There is no `~/.config/kache/config.toml`, no project `.kache.toml`, no remote,
-no `/var/cache/kache/shared`, no `kache` group, and no `kache@<user>.service`
-or `kache-prune-shared.timer` systemd unit. `kache doctor` reports all checks
-passed and explicitly says that no remote cache or planner is configured; its
-daemon-service result is informational for this local-only arrangement.
+**This section describes two different machines.** Conflating them is what made
+the previous version of it wrong, so check which one you are on before acting on
+anything here: `hostname`.
 
-Verify those claims rather than assuming the old design landed:
+**`fortyninety` — the dev workstation.** Local **kache 0.14.2** only.
+`.cargo/config.toml` routes `rustc` through it; the store is the default
+`~/.cache/kache` for the invoking user. There is no `~/.config/kache/config.toml`,
+no project `.kache.toml`, no remote, no `/var/cache/kache`, no `kache` group and
+no `kache*` systemd unit. `kache doctor` reports all checks passed and says
+explicitly that no remote cache or planner is configured; its daemon-service
+result is informational for this local-only arrangement.
+
+**`orrery-hel1-1` — the self-hosted runner.** The full shared arrangement is
+live here, verified 2026-08-21:
+
+| | |
+|---|---|
+| shared store | `/var/cache/kache/shared`, **80 GB** |
+| mode / owner | `2775` `root:kache`, setgid, with a **default ACL** granting `group:kache:rwx` |
+| group | `kache` (1002), members `baadc0de` and `ci` |
+| daemons | `kache@baadc0de.service` and `kache@ci.service`, both running — **one per build identity is the design**, so a "2 daemon processes, expected 1" complaint is not a fault |
+| pruning | `kache-prune-shared.timer`, enabled, firing **hourly** |
+| user config | `~/.config/kache/config.toml` exists |
+
+The setgid bit plus the default ACL are what make sharing work: every blob either
+identity writes lands group-owned and group-writable, so the other can read and
+replace it. That is the whole mechanism, and it is why a `chmod` that drops
+setgid, or a `cp` that does not preserve ACLs, silently breaks sharing rather
+than failing loudly.
+
+Both build identities publish to and restore from that one store, over the same
+dependency graph — so a CI build starts warm off whatever was compiled by hand in
+the dev checkout on that box, and vice versa.
+
+Verify rather than assume, on whichever box you are on:
 
 ```
+hostname
 kache --version
 kache doctor
-ls /var/cache/kache
+ls -ld /var/cache/kache/shared
 getent group kache
 systemctl list-unit-files 'kache*'
 ```
 
-The `ci` account and the dev user are distinct build identities, so their local
-stores are distinct too. Worktrees run by the same user share that user's local
-store. A future remote is not described here; it is not provisioned on this box.
+`scripts/dev-cache.sh doctor` treats the filesystem remote as **opt-in**, via
+`KACHE_SHARED_REMOTE`. Unconfigured is reported as unconfigured and is not a
+failure; configured-but-missing and configured-but-unwritable both still fail.
+An unconfigured optional remote is not a failure, and a skip is never a pass.
 
-### Records from the retired shared-cache experiment
+The `ci` account and the dev user are distinct build identities. On a box with no
+shared remote their local stores are distinct too, and worktrees run by the same
+user share that user's store.
+### Records from the shared-cache experiment
 
 The following findings are records, not statements about the live arrangement.
 Keep them when changing this section.
@@ -549,10 +582,11 @@ claims otherwise. `cache.auto_gc` is on by default and enforces the local cap
 opportunistically.
 
 `kache gc` evicts local stores only. Neither `CacheFileConfig` nor
-`RemoteFileConfig` had a remote size or retention key, so the former filesystem
-remote could grow without bound. This was reported upstream as
-[kache#774](https://github.com/kunobi-ninja/kache/issues/774). Its former
-`kache-prune-shared.timer` is **not installed on this box**.
+`RemoteFileConfig` has a remote size or retention key, so the filesystem remote
+can grow without bound. This was reported upstream as
+[kache#774](https://github.com/kunobi-ninja/kache/issues/774), and
+`kache-prune-shared.timer` on `orrery-hel1-1` exists to compensate for it. There
+is no such timer on `fortyninety`, which has no remote to prune.
 
 **Size, not age**, was the lesson from that experiment. An age policy cannot
 fire on a cache that is being read continuously: the remote reached 319 GiB in a
@@ -584,18 +618,24 @@ separates them:
 SELECT COUNT(*) FROM blobs WHERE hash NOT IN (SELECT hash FROM entry_blobs);
 ```
 
-There is no unit to stop on this box. Deleting `~/.cache/kache` drops the local
-cache outright; with no remote it does **not** refill from anywhere. It is safe
-for source correctness, but it deliberately turns later cacheable compiles into
-misses. Inspect `./scripts/dev-cache.sh disk` and use `kache`'s own maintenance
-commands before discarding a useful local store.
+**On `fortyninety` there is no unit to stop**, and deleting `~/.cache/kache`
+drops the local cache outright — with no remote it does **not** refill from
+anywhere. It is safe for source correctness, but it deliberately turns later
+cacheable compiles into misses.
 
-The default ACL and systemd system-unit design below belonged to the uninstalled
+**On `orrery-hel1-1` the old procedure still applies**: stop `kache@<user>`,
+delete `~/.cache/kache`, start it again — there the local store genuinely does
+refill from the shared remote.
+
+Either way, inspect `./scripts/dev-cache.sh disk` and use `kache`'s own
+maintenance commands before discarding a useful local store.
+
+The default ACL and systemd system-unit design below belong to the
 filesystem remote. The ACL made every new object group-writable **regardless of
 the writing process's umask**; without it a runner with `umask 022` could have
 published objects the dev user could not overwrite. A systemd *system* unit,
-rather than `kache daemon install`'s user unit, was proposed because a user unit
-needs lingering and a D-Bus session that the `ci` service account does not have.
+rather than `kache daemon install`'s user unit, is used because a user unit needs
+lingering and a D-Bus session that the `ci` service account does not have.
 
 **Why not sccache**, since the repo used it until 2026-08-17.
 
