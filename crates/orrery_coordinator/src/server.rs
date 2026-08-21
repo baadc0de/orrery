@@ -35,7 +35,8 @@ use tracing::{debug, warn};
 
 use orrery_protocol::channels::{decode_stream_frame, encode_stream_frame, untag, Channel};
 use orrery_protocol::{
-    CellId, CoordMsg, GridId, IssuerKey, NodeId, SessionTokenVerifier, TokenClock, UnixMillis,
+    CellId, CoordMsg, FixedTokenClock, GridId, IssuerKey, NodeId, SessionTokenClaimsV1,
+    SessionTokenV1, SessionTokenVerificationError, SessionTokenVerifier, TokenClock, UnixMillis,
     COORD_ALPN, COORD_PROTOCOL_VERSION, MAX_PRESENCE_CELLS,
 };
 
@@ -48,6 +49,24 @@ const ACCEPTED: u8 = 0;
 
 /// Maximum peers a coordinator tracks at once.
 const MAX_TRACKED_PEERS: usize = 4_096;
+
+/// How long an ended session stays "established", and how far past its expiry
+/// a token may be graced (docs/09 §8).
+///
+/// One number for both halves, and one rationale: a session token's cap is an
+/// hour (`MAX_SESSION_TOKEN_TTL_MS`) and clients refresh at half-TTL, so an
+/// hour of grace is at most one missed refresh cycle turned into a second
+/// token lifetime. Past that the outage has stopped being something to ride
+/// out — identity is stateless replicas behind a well-known address
+/// (docs/09 §1), so an hour down is an incident, not a blip, and a
+/// coordinator quietly running on hour-old standing for a shift is worse than
+/// making the peers log in again when identity returns.
+///
+/// The gateway pins no bound at all today (`gateway.rs`'s `Expired` arm
+/// checks only its peer-registry retention), so this is deliberately the
+/// stricter of the two. Bringing the gateway to the same bound is a follow-up
+/// on its own, not something to smuggle in from here.
+const TOKEN_GRACE_MS: u64 = orrery_protocol::MAX_SESSION_TOKEN_TTL_MS;
 
 /// Presence reports allowed per peer per second, and the burst above it.
 ///
@@ -108,6 +127,34 @@ impl TokenClock for SystemUnixClock {
     }
 }
 
+/// Reports whether the identity service is reachable (docs/09 §8).
+///
+/// The same shape as `orrery_persistd`'s `IdentityHealth`, and deliberately a
+/// second copy of it rather than a trait lifted into `orrery_protocol`: the
+/// two services answer the question from different places — a gateway from
+/// its own identity client, a coordinator from whatever its deployment gives
+/// it — and neither of them has an implementation to share yet. Factor it out
+/// when there is a probe worth sharing, not before.
+pub trait IdentityHealth: Send + Sync {
+    /// Return `true` only while the identity service is known to be available.
+    fn is_available(&self) -> bool;
+}
+
+/// Shared identity-service health source.
+pub type SharedIdentityHealth = Arc<dyn IdentityHealth>;
+
+/// Healthy-by-default production health until an outage monitor reports
+/// otherwise. Grace is off under this one, which is the safe default: a
+/// deployment that has not wired a probe has not earned the relaxation.
+#[derive(Debug, Default)]
+pub struct AvailableIdentityHealth;
+
+impl IdentityHealth for AvailableIdentityHealth {
+    fn is_available(&self) -> bool {
+        true
+    }
+}
+
 /// Startup configuration for a [`CoordinatorServer`].
 pub struct ServerConfig {
     /// The application protocol to advertise. Defaults to [`COORD_ALPN`].
@@ -138,6 +185,8 @@ pub struct ServerConfig {
     pub token_clock: Arc<dyn TokenClock + Send + Sync>,
     /// Monotonic clock used for presence rate limiting.
     pub presence_clock: Arc<dyn PresenceClock>,
+    /// Identity-service health, consulted only to decide token grace.
+    pub identity_health: SharedIdentityHealth,
 }
 
 impl ServerConfig {
@@ -156,6 +205,7 @@ impl ServerConfig {
             grid: GridId::ROOT,
             token_clock: Arc::new(SystemUnixClock),
             presence_clock: Arc::new(SystemPresenceClock::default()),
+            identity_health: Arc::new(AvailableIdentityHealth),
         }
     }
 }
@@ -220,6 +270,146 @@ struct PeerSession {
     budget: PresenceBudget,
 }
 
+/// How a `Hello`'s session token verified.
+///
+/// The distinction the coordinator did not use to draw: `Expired` is a token
+/// this coordinator would have accepted a moment ago and whose signature,
+/// issuer, node binding and TTL cap all still check out — everything except
+/// the wall clock. Every other rejection stays a rejection.
+#[derive(Debug, Clone)]
+enum Admission {
+    /// Valid at the coordinator's clock.
+    Valid(SessionTokenClaimsV1),
+    /// Authentic and node-bound, but its lifetime elapsed.
+    Expired(SessionTokenClaimsV1),
+}
+
+/// Verifies `Hello` tokens, telling "late" apart from "invalid".
+///
+/// Mirrors `orrery_persistd`'s `SessionTokenV1Authorizer`: on `Expired`, the
+/// same bytes are verified a second time against a clock pinned to the
+/// token's own `issued_at_ms`, so an expired token that also has a forged
+/// signature, a wrong node binding, an unknown issuer or an over-cap TTL
+/// still fails — grace admits a *late* token, never a weaker check.
+struct SessionAuthorizer {
+    clock: Arc<dyn TokenClock + Send + Sync>,
+    issuer_keys: Vec<IssuerKey>,
+}
+
+impl SessionAuthorizer {
+    fn authorize(
+        &self,
+        token: &[u8],
+        node: &NodeId,
+    ) -> Result<Admission, SessionTokenVerificationError> {
+        let verifier =
+            SessionTokenVerifier::new(ClockBox(Arc::clone(&self.clock)), self.issuer_keys.clone());
+        match verifier.verify(token, node) {
+            Ok(claims) => Ok(Admission::Valid(claims)),
+            Err(SessionTokenVerificationError::Expired) => {
+                let issued_at = SessionTokenV1::decode(token)?.claims.issued_at_ms;
+                SessionTokenVerifier::new(FixedTokenClock::new(issued_at), self.issuer_keys.clone())
+                    .verify(token, node)
+                    .map(Admission::Expired)
+            }
+            Err(error) => Err(error),
+        }
+    }
+}
+
+/// The identity one peer established a session with, kept past the session.
+struct EstablishedPeer {
+    claims: SessionTokenClaimsV1,
+    token: Vec<u8>,
+    /// When the peer's last session ended; `None` while one is live.
+    idle_since_ms: Option<u64>,
+}
+
+/// What "a peer this coordinator already knows" means, in state.
+///
+/// docs/09 §8 grants grace to *established* sessions, and nothing here could
+/// answer that before: `shared.peers`, the registry's presence and the
+/// seeder's session facts are all torn down the moment a connection ends, so
+/// a peer whose QUIC connection blipped was indistinguishable from a stranger
+/// — which is exactly the peer the grace rule is written for. This is the one
+/// piece of state that outlives a session, and it is bounded on both axes:
+/// [`MAX_TRACKED_PEERS`] entries, each held [`TOKEN_GRACE_MS`] past the
+/// session that created it.
+#[derive(Default)]
+struct EstablishedPeers {
+    entries: HashMap<NodeId, EstablishedPeer>,
+}
+
+impl EstablishedPeers {
+    /// Record a peer admitted on a valid token, and mark its session live.
+    fn admit(&mut self, node: NodeId, claims: SessionTokenClaimsV1, token: &[u8], now_ms: u64) {
+        self.evict_idle(now_ms);
+        if !self.entries.contains_key(&node) && self.entries.len() >= MAX_TRACKED_PEERS {
+            // Nothing is refused here — the session is admitted either way.
+            // What is lost is grace for *this* peer later, which is the
+            // conservative direction to fail in.
+            debug!(%node, "coordinator: established-peer table full, no grace recorded");
+            return;
+        }
+        self.entries.insert(
+            node,
+            EstablishedPeer {
+                claims,
+                token: token.to_vec(),
+                idle_since_ms: None,
+            },
+        );
+    }
+
+    /// Note that a peer's session ended, starting its retention clock.
+    fn retire(&mut self, node: NodeId, now_ms: u64) {
+        if let Some(entry) = self.entries.get_mut(&node) {
+            entry.idle_since_ms = Some(now_ms);
+        }
+        self.evict_idle(now_ms);
+    }
+
+    /// Is this the same peer, presenting the same token it established with?
+    ///
+    /// The token bytes and the claims must both match, which is the gateway's
+    /// test too. It matters: without it, grace would accept *any* expired
+    /// token for a known NodeId, including one with a different account or a
+    /// better `standing` than the session actually held.
+    fn recognises(
+        &mut self,
+        node: NodeId,
+        claims: &SessionTokenClaimsV1,
+        token: &[u8],
+        now_ms: u64,
+    ) -> bool {
+        self.evict_idle(now_ms);
+        self.entries
+            .get(&node)
+            .is_some_and(|entry| &entry.claims == claims && entry.token == token)
+    }
+
+    fn evict_idle(&mut self, now_ms: u64) {
+        self.entries.retain(|_, entry| {
+            entry
+                .idle_since_ms
+                .is_none_or(|idle_since| now_ms.saturating_sub(idle_since) <= TOKEN_GRACE_MS)
+        });
+    }
+}
+
+/// Is a token that has expired still inside the grace window?
+///
+/// Measured from the token's own signed expiry, not from when the session
+/// ended, so a peer cannot extend grace by reconnecting repeatedly.
+fn within_grace(claims: &SessionTokenClaimsV1, now_ms: u64) -> bool {
+    let expires_ms = claims
+        .issued_at_ms
+        .0
+        .saturating_add(claims.ttl_ms.0)
+        .saturating_add(TOKEN_GRACE_MS);
+    now_ms <= expires_ms
+}
+
 /// The coordinator's shared state, owned by the accept loop and its sessions.
 struct Shared {
     registry: tokio::sync::Mutex<IslandRegistry>,
@@ -241,6 +431,12 @@ struct Shared {
     /// on the recipient's clock too. This is the same clock that verifies
     /// session-token expiry, for the same reason.
     unix_clock: Arc<dyn TokenClock + Send + Sync>,
+    /// Identities that have completed a `Hello` here, held past their
+    /// sessions so docs/09 §8's "established" qualifier is answerable.
+    established: tokio::sync::Mutex<EstablishedPeers>,
+    /// Whether identity is reachable. Read on exactly one path: an otherwise
+    /// valid token that has expired.
+    identity_health: SharedIdentityHealth,
     presence_reports: AtomicU64,
     grants_issued: AtomicU64,
     manifests_pushed: AtomicU64,
@@ -453,6 +649,8 @@ impl CoordinatorServer {
             grid: config.grid,
             presence_clock: config.presence_clock,
             unix_clock: token_clock,
+            established: tokio::sync::Mutex::new(EstablishedPeers::default()),
+            identity_health: config.identity_health,
             presence_reports: AtomicU64::new(0),
             grants_issued: AtomicU64::new(0),
             manifests_pushed: AtomicU64::new(0),
@@ -460,16 +658,16 @@ impl CoordinatorServer {
             witness_epochs_seeded: AtomicU64::new(0),
             witness_epochs_delivered: AtomicU64::new(0),
         });
-        let verifier = Arc::new(SessionTokenVerifier::new(
-            ClockBox(config.token_clock),
-            config.issuer_keys,
-        ));
+        let authorizer = Arc::new(SessionAuthorizer {
+            clock: config.token_clock,
+            issuer_keys: config.issuer_keys,
+        });
 
         let (shutdown, rx) = oneshot::channel();
         let join = tokio::spawn(accept_loop(
             Arc::clone(&endpoint),
             Arc::clone(&shared),
-            verifier,
+            authorizer,
             rx,
         ));
         Ok(Self {
@@ -526,7 +724,7 @@ impl TokenClock for ClockBox {
 async fn accept_loop(
     endpoint: Arc<Endpoint>,
     shared: Arc<Shared>,
-    verifier: Arc<SessionTokenVerifier<ClockBox>>,
+    authorizer: Arc<SessionAuthorizer>,
     mut shutdown: oneshot::Receiver<()>,
 ) {
     loop {
@@ -535,9 +733,9 @@ async fn accept_loop(
             incoming = endpoint.accept() => {
                 let Some(incoming) = incoming else { break };
                 let shared = Arc::clone(&shared);
-                let verifier = Arc::clone(&verifier);
+                let authorizer = Arc::clone(&authorizer);
                 let coordinator = endpoint.id();
-                tokio::spawn(handle_connection(incoming, shared, verifier, coordinator));
+                tokio::spawn(handle_connection(incoming, shared, authorizer, coordinator));
             }
         }
     }
@@ -546,7 +744,7 @@ async fn accept_loop(
 async fn handle_connection(
     incoming: iroh::endpoint::Incoming,
     shared: Arc<Shared>,
-    verifier: Arc<SessionTokenVerifier<ClockBox>>,
+    authorizer: Arc<SessionAuthorizer>,
     coordinator: NodeId,
 ) {
     let conn = match incoming.accept() {
@@ -615,8 +813,62 @@ async fn handle_connection(
                     warn!(%remote, "coordinator: hello node did not match transport identity");
                     break;
                 }
-                let claims = match verifier.verify(&token, &remote) {
-                    Ok(claims) => claims,
+                // docs/09 §8's grace rule: an expired-but-otherwise-valid
+                // token is accepted for an *established* session while
+                // identity is unreachable. Without it a transient identity
+                // outage is a topology event — a peer whose connection blips
+                // cannot re-establish presence, drops out of its island
+                // manifest, and enough of them trip D28 clause (g)'s churn
+                // and pool-collapse reseeds. An outage locks out new logins;
+                // it must not end in-flight play.
+                let unix_now_ms = shared.unix_clock.now_ms().0;
+                let (claims, graced) = match authorizer.authorize(&token, &remote) {
+                    Ok(Admission::Valid(claims)) => (claims, false),
+                    Ok(Admission::Expired(claims)) => {
+                        if shared.identity_health.is_available() {
+                            debug!(
+                                %remote,
+                                "coordinator: rejected an expired token while identity is up"
+                            );
+                            break;
+                        }
+                        if !within_grace(&claims, unix_now_ms) {
+                            debug!(
+                                %remote,
+                                issued_at_ms = claims.issued_at_ms.0,
+                                ttl_ms = claims.ttl_ms.0,
+                                grace_ms = TOKEN_GRACE_MS,
+                                "coordinator: expired token is past the grace window"
+                            );
+                            break;
+                        }
+                        if !shared.established.lock().await.recognises(
+                            remote,
+                            &claims,
+                            &token,
+                            unix_now_ms,
+                        ) {
+                            debug!(
+                                %remote,
+                                "coordinator: no established session to grace — a login, not a reconnect"
+                            );
+                            break;
+                        }
+                        // Loud on purpose. An operator reading a coordinator
+                        // log mid-incident has to be able to tell a graced
+                        // admission from an ordinary one, and how stale the
+                        // token it rode in on was.
+                        warn!(
+                            %remote,
+                            account = claims.account.0,
+                            expired_for_ms = unix_now_ms.saturating_sub(
+                                claims.issued_at_ms.0.saturating_add(claims.ttl_ms.0)
+                            ),
+                            grace_ms = TOKEN_GRACE_MS,
+                            "coordinator: token grace — established session admitted while identity is unreachable"
+                        );
+                        (claims, true)
+                    }
                     Err(error) => {
                         debug!(%remote, ?error, "coordinator: rejected session token");
                         break;
@@ -629,12 +881,34 @@ async fn handle_connection(
                 // witness-eligibility filters rest on nothing more than
                 // retaining them: they are already inside a signature this
                 // process verifies, from an issuer it already trusts.
-                shared.seeder.lock().await.note_session(
-                    remote,
-                    claims.account,
-                    claims.standing,
-                    now_ms,
-                );
+                // A graced session's `standing` is only as fresh as an expired
+                // token, so it plays but does not witness — D28 clause (e)
+                // reads that field, and a quarantine applied during the
+                // outage is invisible here. `note_grace_session` carries the
+                // reasoning.
+                if graced {
+                    shared.seeder.lock().await.note_grace_session(
+                        remote,
+                        claims.account,
+                        claims.standing,
+                        now_ms,
+                    );
+                } else {
+                    shared.seeder.lock().await.note_session(
+                        remote,
+                        claims.account,
+                        claims.standing,
+                        now_ms,
+                    );
+                    // Only a token identity itself vouched for right now
+                    // establishes a session to grace later.
+                    shared.established.lock().await.admit(
+                        remote,
+                        claims.clone(),
+                        &token,
+                        unix_now_ms,
+                    );
+                }
                 {
                     let mut peers = shared.peers.lock().await;
                     if !peers.contains_key(&remote) && peers.len() >= MAX_TRACKED_PEERS {
@@ -732,6 +1006,15 @@ async fn handle_connection(
             .lock()
             .await
             .forget_session(remote, shared.presence_clock.now_ms());
+        // What does *not* go with it is the identity this session
+        // established. That record is the only reason a reconnect during an
+        // identity outage can be told from a fresh login, so it starts a
+        // retention clock here instead of being dropped.
+        shared
+            .established
+            .lock()
+            .await
+            .retire(remote, shared.unix_clock.now_ms().0);
     }
 }
 

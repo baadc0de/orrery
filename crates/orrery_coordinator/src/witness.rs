@@ -184,6 +184,10 @@ struct SessionFacts {
     account: AccountId,
     standing: SessionStanding,
     joined_ms: u64,
+    /// Set when the session was admitted on docs/09 §8's token grace, so its
+    /// `standing` is only as fresh as an expired token. Such a peer plays;
+    /// it does not witness. See [`WitnessSeeder::note_grace_session`].
+    graced: bool,
 }
 
 /// One cell's current epoch, as the coordinator remembers it.
@@ -294,6 +298,37 @@ impl WitnessSeeder {
             account,
             standing,
             joined_ms: now_ms,
+            graced: false,
+        });
+    }
+
+    /// Record a session admitted on token grace (docs/09 §8) as ineligible.
+    ///
+    /// The account is kept — the cooldown in [`Self::forget_session`] is
+    /// keyed by it, and dropping it would let a grace reconnect launder one
+    /// away — but the session never enters a candidate pool.
+    ///
+    /// D28 clause (e) reads witness eligibility off the token's *signed*
+    /// `standing`, and an expired token's standing is exactly as stale as the
+    /// identity outage is long: a quarantine applied during the outage is
+    /// invisible, and so is one lifted. Both directions are invisible, so the
+    /// choice is which mistake to make, and the safe one is refusing to
+    /// witness rather than seating a quarantined account on a set that judges
+    /// intents. The cost is a smaller pool during an outage, which D29's
+    /// low-population path already covers and clause (g)'s floor already
+    /// refuses to paper over with a short set.
+    pub fn note_grace_session(
+        &mut self,
+        node: NodeId,
+        account: AccountId,
+        standing: SessionStanding,
+        now_ms: u64,
+    ) {
+        self.sessions.entry(node).or_insert(SessionFacts {
+            account,
+            standing,
+            joined_ms: now_ms,
+            graced: true,
         });
     }
 
@@ -331,7 +366,9 @@ impl WitnessSeeder {
     ///   own session;
     /// - **one slot per account** — dedup on the signed `account`, taking the
     ///   lowest `NodeId` so the choice is deterministic;
-    /// - **not on cooldown** — the anti-grind exclusion above.
+    /// - **not on cooldown** — the anti-grind exclusion above;
+    /// - **not admitted on token grace** — an expired token's `standing` is
+    ///   as stale as the outage is long ([`Self::note_grace_session`]).
     ///
     /// And, said out loud because a silent no-op reads like enforcement:
     /// **account age past probation is not enforced** (it is not a token
@@ -352,7 +389,7 @@ impl WitnessSeeder {
             let Some(facts) = self.sessions.get(&node) else {
                 continue;
             };
-            if facts.standing != SessionStanding::Good {
+            if facts.standing != SessionStanding::Good || facts.graced {
                 continue;
             }
             if now_ms.saturating_sub(facts.joined_ms) < self.config.min_presence_ms {
@@ -743,6 +780,50 @@ mod tests {
             SeedOutcome::BelowFloor { eligible: 4 }
         );
         assert_eq!(seeder.current_epoch(cell(0)), None);
+    }
+
+    #[test]
+    fn a_session_admitted_on_token_grace_plays_but_does_not_witness() {
+        // docs/09 §8 keeps an established peer connected through an identity
+        // outage. What it cannot do is refresh the `standing` D28 clause (e)
+        // filters on, so the coordinator declines to seat that peer on a set
+        // rather than trusting an hour-old quarantine flag.
+        let mut registry = IslandRegistry::new();
+        let mut seeder = WitnessSeeder::new(GridId::ROOT);
+        for index in 1..=6u8 {
+            registry.report_presence(node(index), vec![cell(0)]);
+            seeder.note_session(
+                node(index),
+                AccountId::new(u64::from(index)),
+                SessionStanding::Good,
+                T0,
+            );
+        }
+        assert_eq!(
+            seeder.eligible_pool(&registry, cell(0), T0 + 10_000).len(),
+            6
+        );
+
+        // The same peers, one of them back on grace instead. Its token said
+        // `Good` when identity last spoke, and that is exactly the claim this
+        // filter refuses to keep believing.
+        let mut graced = WitnessSeeder::new(GridId::ROOT);
+        for index in 1..=5u8 {
+            graced.note_session(
+                node(index),
+                AccountId::new(u64::from(index)),
+                SessionStanding::Good,
+                T0,
+            );
+        }
+        graced.note_grace_session(node(6), AccountId::new(6), SessionStanding::Good, T0);
+
+        let pool = graced.eligible_pool(&registry, cell(0), T0 + 10_000);
+        assert_eq!(pool.len(), 5, "the graced session costs its own slot only");
+        assert!(
+            !pool.contains(&node(6)),
+            "a session running on an expired token's standing must not witness"
+        );
     }
 
     #[test]
