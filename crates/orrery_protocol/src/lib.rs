@@ -34,11 +34,17 @@ pub use cell::{
     DEFAULT_CELL_EDGE_M, INTEREST_LEVEL, SHARD_LEVEL,
 };
 pub use coord::{
-    verify_interest_grant, CoordMsg, CoordinatorInterestSnapshot, InterestGrantClaimsV1,
+    audit_witness_epoch_draw, draw_witness_set, verify_interest_grant, verify_witness_epoch,
+    verify_witness_epoch_reveal, witness_epoch_binding, witness_epoch_commitment,
+    witness_epoch_seed, CoordMsg, CoordinatorInterestSnapshot, InterestGrantClaimsV1,
     InterestGrantV1, InterestGrantVerificationError, IslandId, IslandManifest, PeerEntry,
-    TopologyRegime, COORD_ALPN, COORD_PROTOCOL_VERSION, INTEREST_GRANT_V1_DOMAIN,
-    INTEREST_GRANT_V1_VERSION, MAX_INTEREST_GRANT_BYTES, MAX_INTEREST_GRANT_CELLS,
-    MAX_INTEREST_GRANT_TTL_MS, MAX_PRESENCE_CELLS,
+    TopologyRegime, WitnessEpochClaimsV1, WitnessEpochSnapshot, WitnessEpochV1,
+    WitnessEpochVerificationError, COORD_ALPN, COORD_PROTOCOL_VERSION, INTEREST_GRANT_V1_DOMAIN,
+    INTEREST_GRANT_V1_VERSION, MAX_EPOCH_CANDIDATES, MAX_INTEREST_GRANT_BYTES,
+    MAX_INTEREST_GRANT_CELLS, MAX_INTEREST_GRANT_TTL_MS, MAX_PRESENCE_CELLS,
+    MAX_WITNESS_EPOCH_BYTES, MAX_WITNESS_EPOCH_MS, WITNESS_EPOCH_COMMIT_V1_DOMAIN,
+    WITNESS_EPOCH_KEY_V1_DOMAIN, WITNESS_EPOCH_SEED_V1_DOMAIN, WITNESS_EPOCH_V1_DOMAIN,
+    WITNESS_EPOCH_V1_VERSION, WITNESS_SET_FLOOR_N, WITNESS_SET_TARGET_N,
 };
 pub use gateway::{
     AreaPage, DiffUplink, GatewayMsg, GatewayReply, AREA_LOAD_ERR_COLD, AREA_LOAD_ERR_LIVE,

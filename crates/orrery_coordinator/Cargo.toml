@@ -34,6 +34,12 @@ iroh-base = { workspace = true }
 postcard = { workspace = true }
 serde = { workspace = true }
 tracing = { workspace = true }
+# Witness-epoch seed keys (D28 clause (c)): `k_e` is HKDF-SHA256 over a
+# provisioned master secret, so a warm standby can reveal an epoch the leader
+# issued. Only the derivation is here — the commitment, the seed and the draw
+# live in `orrery_protocol`, because a verifier has to reproduce them.
+hkdf = "0.12"
+sha2 = "0.10"
 
 [dev-dependencies]
 glam = { workspace = true }

@@ -41,6 +41,7 @@ use orrery_protocol::{
 
 use crate::interest::InterestIssuer;
 use crate::registry::{IslandDrain, IslandRegistry, MembershipChange};
+use crate::witness::{SeedOutcome, WitnessEpochIssuer, WitnessSeedConfig, WitnessSeeder};
 
 /// The admission response byte, mirroring the gateway's `ACCEPTED`.
 const ACCEPTED: u8 = 0;
@@ -121,6 +122,15 @@ pub struct ServerConfig {
     pub issuer_keys: Vec<IssuerKey>,
     /// The signing key for the interest grants this coordinator hands out.
     pub interest_issuer: InterestIssuer,
+    /// The witness-epoch issuer, when this coordinator seeds witness sets.
+    ///
+    /// `None` is P4's posture and the default: no announcements are made, and
+    /// `orrery_witness` keeps its self-chosen fallback, which is only
+    /// tolerable while nothing is filed against a report. Configuring an
+    /// issuer is what turns D10 item 4 on for this deployment.
+    pub witness_issuer: Option<WitnessEpochIssuer>,
+    /// The epoch cadence and eligibility windows for witness seeding.
+    pub witness_seed: WitnessSeedConfig,
     /// The grid presence and grants are relative to (P-7: cell ids are
     /// grid-relative, so a coordinator serves one grid's cell space).
     pub grid: GridId,
@@ -141,6 +151,8 @@ impl ServerConfig {
             bind: "127.0.0.1:0".parse().expect("static valid loopback addr"),
             issuer_keys: issuer_keys.into_iter().collect(),
             interest_issuer: issuer,
+            witness_issuer: None,
+            witness_seed: WitnessSeedConfig::default(),
             grid: GridId::ROOT,
             token_clock: Arc::new(SystemUnixClock),
             presence_clock: Arc::new(SystemPresenceClock::default()),
@@ -213,6 +225,12 @@ struct Shared {
     registry: tokio::sync::Mutex<IslandRegistry>,
     peers: tokio::sync::Mutex<HashMap<NodeId, PeerSession>>,
     issuer: InterestIssuer,
+    /// The witness-epoch signing key, when this coordinator seeds sets.
+    witness_issuer: Option<WitnessEpochIssuer>,
+    /// Per-cell epoch state. Kept even when no issuer is configured so that
+    /// enabling seeding on a running deployment does not need a restart's
+    /// worth of session history to rebuild before anything is eligible.
+    seeder: tokio::sync::Mutex<WitnessSeeder>,
     grid: GridId,
     presence_clock: Arc<dyn PresenceClock>,
     /// Wall clock, used only to stamp drain deadlines.
@@ -227,6 +245,8 @@ struct Shared {
     grants_issued: AtomicU64,
     manifests_pushed: AtomicU64,
     drains_issued: AtomicU64,
+    witness_epochs_seeded: AtomicU64,
+    witness_epochs_delivered: AtomicU64,
 }
 
 impl Shared {
@@ -256,6 +276,62 @@ impl Shared {
         };
         if self.notify(node, &CoordMsg::InterestGrant { grant }).await {
             self.grants_issued.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Seed the cells a presence report touched, and hand every announcement
+    /// to the peers that cover its cell (D28 clause (a)).
+    ///
+    /// The peers are the delivery mechanism, and that is the design rather
+    /// than a shortcut: a gateway needs only the coordinator's public key to
+    /// check an announcement, so adding gateways adds no coordinator fan-out
+    /// and an epoch is recorded exactly when some peer's traffic makes it
+    /// load-bearing. It is also why the announcement goes to *everyone*
+    /// covering the cell and not only to the drawn witnesses — a peer that is
+    /// not witnessing still submits intents that will be judged against these
+    /// bytes, and any of them can carry them.
+    async fn seed_witness_epochs(&self, cells: &[CellId]) {
+        let Some(issuer) = self.witness_issuer.as_ref() else {
+            return;
+        };
+        let now_ms = self.presence_clock.now_ms();
+        let mut announcements = Vec::new();
+        {
+            let registry = self.registry.lock().await;
+            let mut seeder = self.seeder.lock().await;
+            for cell in cells {
+                match seeder.maybe_seed(issuer, &registry, *cell, now_ms) {
+                    SeedOutcome::Seeded(epoch) => announcements.push(epoch),
+                    // A cell inside its reseed floor, an unchanged pool, or a
+                    // pool below the floor are all "no announcement", and the
+                    // last one is deliberately not a short set: D29's
+                    // low-population path is what covers a cell that cannot
+                    // field a witness set, not a set of four pretending.
+                    SeedOutcome::Cooling
+                    | SeedOutcome::Unchanged
+                    | SeedOutcome::BelowFloor { .. } => {}
+                }
+            }
+        }
+        for epoch in announcements {
+            self.witness_epochs_seeded.fetch_add(1, Ordering::Relaxed);
+            debug!(
+                cell = %epoch.claims.cell,
+                epoch = epoch.claims.epoch,
+                handle = epoch.claims.handle,
+                pool = epoch.claims.candidates.len(),
+                selected = epoch.claims.selected.len(),
+                "coordinator: seeded a witness epoch"
+            );
+            let message = CoordMsg::WitnessEpoch {
+                announcement: epoch.announcement,
+            };
+            for node in epoch.recipients {
+                if self.notify(node, &message).await {
+                    self.witness_epochs_delivered
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+            }
         }
     }
 
@@ -332,6 +408,10 @@ pub struct CoordinatorStats {
     pub manifests_pushed: u64,
     /// Drain orders delivered.
     pub drains_issued: u64,
+    /// Witness epochs drawn and signed.
+    pub witness_epochs_seeded: u64,
+    /// Witness-epoch announcements handed to a peer to courier.
+    pub witness_epochs_delivered: u64,
     /// Peers with a live session.
     pub connected_peers: usize,
     /// Islands currently formed.
@@ -365,6 +445,11 @@ impl CoordinatorServer {
             registry: tokio::sync::Mutex::new(IslandRegistry::new()),
             peers: tokio::sync::Mutex::new(HashMap::new()),
             issuer: config.interest_issuer,
+            witness_issuer: config.witness_issuer,
+            seeder: tokio::sync::Mutex::new(WitnessSeeder::with_config(
+                config.grid,
+                config.witness_seed,
+            )),
             grid: config.grid,
             presence_clock: config.presence_clock,
             unix_clock: token_clock,
@@ -372,6 +457,8 @@ impl CoordinatorServer {
             grants_issued: AtomicU64::new(0),
             manifests_pushed: AtomicU64::new(0),
             drains_issued: AtomicU64::new(0),
+            witness_epochs_seeded: AtomicU64::new(0),
+            witness_epochs_delivered: AtomicU64::new(0),
         });
         let verifier = Arc::new(SessionTokenVerifier::new(
             ClockBox(config.token_clock),
@@ -412,6 +499,8 @@ impl CoordinatorServer {
             grants_issued: self.shared.grants_issued.load(Ordering::Relaxed),
             manifests_pushed: self.shared.manifests_pushed.load(Ordering::Relaxed),
             drains_issued: self.shared.drains_issued.load(Ordering::Relaxed),
+            witness_epochs_seeded: self.shared.witness_epochs_seeded.load(Ordering::Relaxed),
+            witness_epochs_delivered: self.shared.witness_epochs_delivered.load(Ordering::Relaxed),
             connected_peers: self.shared.peers.lock().await.len(),
             islands: self.shared.registry.lock().await.island_count(),
         }
@@ -526,14 +615,26 @@ async fn handle_connection(
                     warn!(%remote, "coordinator: hello node did not match transport identity");
                     break;
                 }
-                match verifier.verify(&token, &remote) {
-                    Ok(_claims) => {}
+                let claims = match verifier.verify(&token, &remote) {
+                    Ok(claims) => claims,
                     Err(error) => {
                         debug!(%remote, ?error, "coordinator: rejected session token");
                         break;
                     }
-                }
+                };
                 let now_ms = shared.presence_clock.now_ms();
+                // Keep the account and the standing this session authenticated
+                // as. These used to be dropped on the floor the instant the
+                // signature checked out, and four of D28 clause (e)'s six
+                // witness-eligibility filters rest on nothing more than
+                // retaining them: they are already inside a signature this
+                // process verifies, from an issuer it already trusts.
+                shared.seeder.lock().await.note_session(
+                    remote,
+                    claims.account,
+                    claims.standing,
+                    now_ms,
+                );
                 {
                     let mut peers = shared.peers.lock().await;
                     if !peers.contains_key(&remote) && peers.len() >= MAX_TRACKED_PEERS {
@@ -579,6 +680,7 @@ async fn handle_connection(
                 }
                 shared.presence_reports.fetch_add(1, Ordering::Relaxed);
 
+                let covered = cells.clone();
                 let (change, grace_ms) = {
                     let mut registry = shared.registry.lock().await;
                     let grace_ms = registry.config.drain_grace_ms;
@@ -588,13 +690,20 @@ async fn handle_connection(
                 // claiming should already hold the grant those claims need.
                 shared.issue_interest(remote).await;
                 shared.apply(change, grace_ms).await;
+                // Then the witness sets for the cells this report touched. It
+                // goes last because a peer needs its island roster before an
+                // announcement naming peers in it means anything, and because
+                // most reports seed nothing at all — the reseed floor makes
+                // this a hash lookup per cell in the common case.
+                shared.seed_witness_epochs(&covered).await;
             }
             // Everything else is coordinator→peer. A peer sending one is
             // confused rather than hostile; ignore it.
             CoordMsg::Welcome { .. }
             | CoordMsg::IslandAssignment { .. }
             | CoordMsg::InterestGrant { .. }
-            | CoordMsg::Drain { .. } => {}
+            | CoordMsg::Drain { .. }
+            | CoordMsg::WitnessEpoch { .. } => {}
         }
     }
 
@@ -613,6 +722,16 @@ async fn handle_connection(
         shared.order_drains(&change.drains, grace_ms).await;
         shared.peers.lock().await.remove(&remote);
         shared.broadcast(change.manifests).await;
+        // A departure puts the account on the reseed cooldown (D28 clause
+        // (g)): a colluder's only lever on the draw is to leave and come back
+        // to force a redraw, and forfeiting six draws to buy one is what
+        // makes that a losing move. The session facts go with it, so a
+        // reconnect is a fresh presence clock as well.
+        shared
+            .seeder
+            .lock()
+            .await
+            .forget_session(remote, shared.presence_clock.now_ms());
     }
 }
 

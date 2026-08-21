@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use clap::Parser;
 use orrery_coordinator::server::{ServerConfig, SystemPresenceClock, SystemUnixClock};
-use orrery_coordinator::{CoordinatorServer, InterestIssuer};
+use orrery_coordinator::{CoordinatorServer, InterestIssuer, WitnessEpochIssuer};
 use orrery_protocol::{GridId, IssuerKey, IssuerKeyId, NodeId};
 
 #[derive(Debug, Parser)]
@@ -57,6 +57,31 @@ struct Cli {
     /// grid-relative).
     #[arg(long, default_value_t = 0)]
     grid: u32,
+
+    /// Hex-encoded 32-byte master secret for witness-epoch seed keys (D28).
+    ///
+    /// Supplying it is what turns witness-set seeding on: without it the
+    /// coordinator announces nothing and `orrery_witness` keeps its
+    /// self-chosen fallback, which is only safe while nothing is filed
+    /// against a report. Announcements are signed with `--interest-secret`
+    /// under `--interest-key-id`, so a gateway that already trusts this
+    /// coordinator's grants needs no second key.
+    ///
+    /// **Provision it, do not generate it per boot.** Every epoch key is
+    /// derived from this secret, so a coordinator that loses it can no longer
+    /// reveal — and therefore no longer usefully reseed — any cell it had
+    /// already announced.
+    #[arg(long, value_name = "HEX")]
+    witness_master_secret: Option<String>,
+
+    /// The leader-lease generation stamped into the high bits of every epoch
+    /// handle this process mints (D28 clause (b)).
+    ///
+    /// It must increase across failovers: two coordinators sharing an
+    /// incarnation can mint colliding handles, and a handle is what an intent
+    /// names when it says which witness set it was collected under.
+    #[arg(long, default_value_t = 1)]
+    witness_incarnation: u64,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -84,9 +109,23 @@ fn main() -> anyhow::Result<()> {
         .map(|hex| Ok::<_, anyhow::Error>(iroh::SecretKey::from_bytes(&decode_key(hex)?)))
         .transpose()?;
 
+    let witness_issuer = cli
+        .witness_master_secret
+        .as_deref()
+        .map(|hex| {
+            Ok::<_, anyhow::Error>(WitnessEpochIssuer::new(
+                interest_secret.clone(),
+                IssuerKeyId::new(cli.interest_key_id),
+                decode_key(hex)?,
+                cli.witness_incarnation,
+            ))
+        })
+        .transpose()?;
+
     let config = ServerConfig {
         bind: cli.bind.parse::<SocketAddr>()?,
         secret_key,
+        witness_issuer,
         grid: GridId::new(cli.grid),
         token_clock: Arc::new(SystemUnixClock),
         presence_clock: Arc::new(SystemPresenceClock::default()),
@@ -111,6 +150,12 @@ fn main() -> anyhow::Result<()> {
                 "interest_public_key": interest_secret.public().to_string(),
                 "interest_key_id": cli.interest_key_id,
                 "grid": cli.grid,
+                // Whether this coordinator seeds witness sets is a deployment
+                // fact a harness must be able to read without guessing: with
+                // it off, attestations have no announced set to be checked
+                // against and the peer-side fallback is what is running.
+                "witness_seeding": cli.witness_master_secret.is_some(),
+                "witness_incarnation": cli.witness_incarnation,
             });
             let stdout = std::io::stdout();
             let mut handle = stdout.lock();
