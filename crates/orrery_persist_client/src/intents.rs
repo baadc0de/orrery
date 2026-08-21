@@ -48,7 +48,13 @@ use std::time::Duration;
 
 use bevy_ecs::prelude::*;
 use bevy_platform::time::Instant;
-use orrery_protocol::{Intent, IntentOutcome};
+use bytes::Bytes;
+use orrery_net::{PeerPacket, SendPacket, StreamMode};
+use orrery_protocol::{
+    channels::{decode_witness, encode_witness, Channel},
+    AttestationRefusalReason, AttestationVerdict, Intent, IntentContextRef, IntentOutcome,
+    IntentProposal, IntentResponse, NodeId, WitnessMsg,
+};
 
 use crate::gateway::GatewaySession;
 use crate::latency::LatencyHistogram;
@@ -71,6 +77,23 @@ pub enum IntentStatus {
     Committed(orrery_protocol::Tick),
     /// Rejected by the gateway (validation or a durable invariant).
     Rejected(orrery_protocol::IntentOutcome),
+}
+
+/// What the submitter knows about one announced witness's answer.
+///
+/// [`Self::Refused`] and [`Self::TimedOut`] are intentionally separate: the
+/// former is an explicit peer judgement received on the wire, while the latter
+/// means no answer arrived inside [`COSIGN_BUDGET`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CoSignDisposition {
+    /// The collection window is still open and this witness has not answered.
+    Pending,
+    /// An attestation arrived inside the collection window.
+    Attested,
+    /// The witness explicitly declined with this machine-readable reason.
+    Refused(AttestationRefusalReason),
+    /// No answer arrived before the collection window closed.
+    TimedOut,
 }
 
 /// The locally-predicted effect of an intent (D8).
@@ -97,7 +120,23 @@ struct QueuedIntent {
     /// When this intent was last sent (for in-flight timeout checking).
     /// `None` if it has never been sent.
     sent_at: Option<Instant>,
+    /// Present only for intents assembled through the peer co-sign flow.
+    cosign: Option<CoSignCollection>,
 }
+
+/// One D27 collection window, kept beside its draft intent.
+#[derive(Debug, Clone)]
+struct CoSignCollection {
+    parties: Vec<NodeId>,
+    context_refs: Vec<IntentContextRef>,
+    targets: Vec<NodeId>,
+    answers: Vec<Option<AttestationVerdict>>,
+    started_at: Instant,
+    proposals_sent: bool,
+}
+
+/// The D16/D27 peer co-sign collection budget.
+pub const COSIGN_BUDGET: Duration = Duration::from_millis(150);
 
 /// Default in-flight timeout before an unacked intent is requeued (10 s).
 ///
@@ -181,6 +220,7 @@ impl IntentQueue {
                 predicted: None,
                 submitted_at: Instant::now(),
                 sent_at: None,
+                cosign: None,
             });
         }
         Self {
@@ -209,8 +249,225 @@ impl IntentQueue {
             predicted: None,
             submitted_at: Instant::now(),
             sent_at: None,
+            cosign: None,
         });
         Some(ticket)
+    }
+
+    /// Start gathering co-signatures from an injected announced witness set.
+    ///
+    /// The proposal targets are exactly `announced` minus `parties`. The
+    /// issuer is added to the party set defensively, because D27 also forbids
+    /// an issuer from appearing as its own witness. No required subset is an
+    /// input to this API — the submitter broadcasts to every remaining member
+    /// and leaves the secret draw entirely to the gateway.
+    ///
+    /// The draft is not written to the durable queue store. Only
+    /// [`Self::advance_cosign_at`] closes collection, appends every returned
+    /// attestation, transitions it to [`IntentStatus::Queued`], and persists
+    /// it. A restart may therefore lose an unfinished 150 ms draft, but cannot
+    /// replay a half-assembled intent as though it were ready for admission.
+    pub fn begin_cosign(
+        &mut self,
+        intent: Intent,
+        announced: Vec<NodeId>,
+        parties: Vec<NodeId>,
+        context_refs: Vec<IntentContextRef>,
+    ) -> Option<IntentTicket> {
+        self.begin_cosign_at(intent, announced, parties, context_refs, Instant::now())
+    }
+
+    /// [`Self::begin_cosign`] with an injected monotonic instant.
+    ///
+    /// Supplying the instant makes the 150 ms boundary testable without a
+    /// sleep and keeps the production path on the same monotonic clock as the
+    /// existing in-flight timeout.
+    pub fn begin_cosign_at(
+        &mut self,
+        intent: Intent,
+        announced: Vec<NodeId>,
+        mut parties: Vec<NodeId>,
+        context_refs: Vec<IntentContextRef>,
+        now: Instant,
+    ) -> Option<IntentTicket> {
+        if self.queue.len() >= self.capacity {
+            return None;
+        }
+        if !parties.contains(&intent.issuer) {
+            parties.push(intent.issuer);
+        }
+        let targets: Vec<NodeId> = announced
+            .into_iter()
+            .filter(|candidate| !parties.contains(candidate))
+            .collect();
+        let answers = vec![None; targets.len()];
+        let ticket = IntentTicket(intent.intent_id);
+        self.queue.push_back(QueuedIntent {
+            intent,
+            status: IntentStatus::Draft,
+            predicted: None,
+            submitted_at: now,
+            sent_at: None,
+            cosign: Some(CoSignCollection {
+                parties,
+                context_refs,
+                targets,
+                answers,
+                started_at: now,
+                proposals_sent: false,
+            }),
+        });
+        Some(ticket)
+    }
+
+    /// Return every not-yet-broadcast proposal and mark it emitted.
+    ///
+    /// Each target receives the same issuer-signed intent, party set, and
+    /// context hints. The returned target list is the announcement order with
+    /// parties removed; no K-subset selection or reachability substitution is
+    /// performed here.
+    pub fn drain_cosign_proposals(&mut self) -> Vec<(NodeId, IntentProposal)> {
+        let mut outbound = Vec::new();
+        for entry in &mut self.queue {
+            if entry.status != IntentStatus::Draft {
+                continue;
+            }
+            let Some(collection) = entry.cosign.as_mut() else {
+                continue;
+            };
+            if collection.proposals_sent {
+                continue;
+            }
+            collection.proposals_sent = true;
+            let proposal = IntentProposal {
+                intent: entry.intent.clone(),
+                parties: collection.parties.clone(),
+                context_refs: collection.context_refs.clone(),
+            };
+            outbound.extend(
+                collection
+                    .targets
+                    .iter()
+                    .copied()
+                    .map(|target| (target, proposal.clone())),
+            );
+        }
+        outbound
+    }
+
+    /// Record one expected witness's first answer if it arrived in budget.
+    ///
+    /// Returns `true` only when the answer became part of the collection. Late
+    /// answers, duplicate answers, responses for another intent, and answers
+    /// from nodes outside the announced-minus-parties target vector return
+    /// `false`. Attestations are intentionally not verified or ranked here:
+    /// D27 requires the submitter to forward everything it received and the
+    /// gateway owns membership, signature, and required-subset checks.
+    pub fn record_cosign_response_at(
+        &mut self,
+        from: NodeId,
+        response: IntentResponse,
+        now: Instant,
+    ) -> bool {
+        let Some(entry) = self
+            .queue
+            .iter_mut()
+            .find(|entry| entry.intent.intent_id == response.intent_id)
+        else {
+            return false;
+        };
+        if entry.status != IntentStatus::Draft {
+            return false;
+        }
+        let Some(collection) = entry.cosign.as_mut() else {
+            return false;
+        };
+        if now.saturating_duration_since(collection.started_at) >= COSIGN_BUDGET {
+            return false;
+        }
+        let Some(index) = collection.targets.iter().position(|target| *target == from) else {
+            return false;
+        };
+        if collection.answers[index].is_some() {
+            return false;
+        }
+        collection.answers[index] = Some(response.verdict);
+        true
+    }
+
+    /// Close every collection that answered in full or reached 150 ms.
+    ///
+    /// Every received [`AttestationVerdict::Attested`] value is appended in
+    /// announced-set order, without local signature filtering and without a
+    /// required-subset filter. Refusals and silent timeouts append nothing but
+    /// remain queryable through [`Self::cosign_disposition_at`].
+    /// Returns the number of drafts transitioned to `Queued`.
+    pub fn advance_cosign_at(&mut self, now: Instant) -> usize {
+        let mut advanced = 0;
+        let store = &mut self.store;
+        for entry in &mut self.queue {
+            if entry.status != IntentStatus::Draft {
+                continue;
+            }
+            let Some(collection) = entry.cosign.as_ref() else {
+                continue;
+            };
+            let expired = now.saturating_duration_since(collection.started_at) >= COSIGN_BUDGET;
+            let complete = collection.answers.iter().all(Option::is_some);
+            if !expired && !complete {
+                continue;
+            }
+            entry
+                .intent
+                .attestations
+                .extend(collection.answers.iter().filter_map(|answer| match answer {
+                    Some(AttestationVerdict::Attested(attestation)) => Some(attestation.clone()),
+                    Some(AttestationVerdict::Refused(_)) | None => None,
+                }));
+            entry.status = IntentStatus::Queued;
+            let _ = store.push(&entry.intent);
+            advanced += 1;
+        }
+        advanced
+    }
+
+    /// The announcement-order targets for one co-signing draft.
+    #[must_use]
+    pub fn cosign_targets(&self, ticket: IntentTicket) -> Option<&[NodeId]> {
+        self.queue
+            .iter()
+            .find(|entry| entry.intent.intent_id == ticket.0)?
+            .cosign
+            .as_ref()
+            .map(|collection| collection.targets.as_slice())
+    }
+
+    /// What is known about one target at the supplied monotonic instant.
+    #[must_use]
+    pub fn cosign_disposition_at(
+        &self,
+        ticket: IntentTicket,
+        witness: NodeId,
+        now: Instant,
+    ) -> Option<CoSignDisposition> {
+        let collection = self
+            .queue
+            .iter()
+            .find(|entry| entry.intent.intent_id == ticket.0)?
+            .cosign
+            .as_ref()?;
+        let index = collection
+            .targets
+            .iter()
+            .position(|target| *target == witness)?;
+        match &collection.answers[index] {
+            Some(AttestationVerdict::Attested(_)) => Some(CoSignDisposition::Attested),
+            Some(AttestationVerdict::Refused(reason)) => Some(CoSignDisposition::Refused(*reason)),
+            None if now.saturating_duration_since(collection.started_at) >= COSIGN_BUDGET => {
+                Some(CoSignDisposition::TimedOut)
+            }
+            None => Some(CoSignDisposition::Pending),
+        }
     }
 
     /// Attach a locally-predicted effect to a queued intent.
@@ -417,6 +674,57 @@ impl IntentQueue {
     }
 }
 
+/// Broadcast every newly-created proposal on the reliable peer-control lane.
+///
+/// There is deliberately no connectivity prefilter and no replacement target:
+/// [`IntentQueue::drain_cosign_proposals`] already names the full announced
+/// set minus parties. A disconnected target simply produces no answer and is
+/// reported as [`CoSignDisposition::TimedOut`] when the budget closes.
+pub fn flush_cosign_proposals(
+    mut queue: ResMut<IntentQueue>,
+    mut outbound: MessageWriter<SendPacket>,
+) {
+    for (target, proposal) in queue.drain_cosign_proposals() {
+        outbound.write(SendPacket {
+            to: target,
+            channel: Channel::Control,
+            payload: Bytes::from(encode_witness(&WitnessMsg::IntentProposal(Box::new(
+                proposal,
+            )))),
+            mode: StreamMode::Shared,
+        });
+    }
+}
+
+/// Feed peer attestation responses into their matching collection windows.
+///
+/// Other witness traffic shares the same reader but is ignored before it can
+/// affect queue state. `PeerPacket::from` is the responder identity used to
+/// match the announced target; an `Attestation`'s own claimed witness remains
+/// unfiltered and travels to the gateway exactly as returned.
+pub fn ingest_cosign_responses(
+    mut packets: MessageReader<PeerPacket>,
+    mut queue: ResMut<IntentQueue>,
+) {
+    let now = Instant::now();
+    for packet in packets.read() {
+        if packet.channel != Channel::Control {
+            continue;
+        }
+        let Some(WitnessMsg::IntentResponse(response)) =
+            decode_witness::<WitnessMsg>(&packet.payload)
+        else {
+            continue;
+        };
+        let _ = queue.record_cosign_response_at(packet.from, response, now);
+    }
+}
+
+/// Close complete or expired peer co-sign windows using the monotonic clock.
+pub fn advance_cosign(mut queue: ResMut<IntentQueue>) {
+    let _ = queue.advance_cosign_at(Instant::now());
+}
+
 /// The Bevy system that drains the intent queue to the gateway.
 ///
 /// When connected, queued intents are written to the session's reliable lane.
@@ -477,12 +785,179 @@ mod tests {
         }
     }
 
+    fn signed_intent(id: u128) -> Intent {
+        let issuer = iroh_base::SecretKey::from_bytes(&[1; 32]);
+        let mut intent = intent(id);
+        intent.issuer = issuer.public();
+        intent.attestations.clear();
+        intent.sign(&issuer);
+        intent
+    }
+
     #[test]
     fn submit_and_status() {
         let mut queue = IntentQueue::new(10);
         let ticket = queue.submit(intent(1)).unwrap();
         assert_eq!(queue.status(ticket), IntentStatus::Queued);
         assert_eq!(queue.len(), 1);
+    }
+
+    #[test]
+    fn explicit_refusal_is_distinct_from_a_silent_timeout() {
+        let started = Instant::now();
+        let refusing = node(2);
+        let silent = node(3);
+        let mut queue = IntentQueue::new(10);
+        let ticket = queue
+            .begin_cosign_at(
+                signed_intent(1),
+                vec![refusing, silent],
+                Vec::new(),
+                Vec::new(),
+                started,
+            )
+            .unwrap();
+
+        assert!(queue.record_cosign_response_at(
+            refusing,
+            IntentResponse {
+                intent_id: 1,
+                verdict: AttestationVerdict::Refused(AttestationRefusalReason::PlausibilityFailed(
+                    41
+                ),),
+            },
+            started + Duration::from_millis(20),
+        ));
+        let after_budget = started + COSIGN_BUDGET;
+        assert_eq!(
+            queue.cosign_disposition_at(ticket, refusing, after_budget),
+            Some(CoSignDisposition::Refused(
+                AttestationRefusalReason::PlausibilityFailed(41)
+            ))
+        );
+        assert_eq!(
+            queue.cosign_disposition_at(ticket, silent, after_budget),
+            Some(CoSignDisposition::TimedOut)
+        );
+    }
+
+    #[test]
+    fn broadcasts_to_announced_minus_parties_and_forwards_every_attestation() {
+        let started = Instant::now();
+        let witness_a = node(2);
+        let party = node(3);
+        let witness_b = node(4);
+        let claimed_by_a = node(8);
+        let claimed_by_b = node(9);
+        let mut queue = IntentQueue::new(10);
+        let ticket = queue
+            .begin_cosign_at(
+                signed_intent(7),
+                vec![witness_a, party, witness_b],
+                vec![party],
+                vec![IntentContextRef {
+                    entity: orrery_protocol::PersistId::new(99),
+                    tick: Tick::new(600),
+                }],
+                started,
+            )
+            .unwrap();
+
+        assert_eq!(queue.status(ticket), IntentStatus::Draft);
+        assert_eq!(queue.store.load().len(), 0, "drafts are not durable");
+        assert_eq!(
+            queue.cosign_targets(ticket),
+            Some([witness_a, witness_b].as_slice())
+        );
+        let proposals = queue.drain_cosign_proposals();
+        assert_eq!(
+            proposals
+                .iter()
+                .map(|(target, _)| *target)
+                .collect::<Vec<_>>(),
+            vec![witness_a, witness_b],
+            "the full announcement order survives with only parties removed"
+        );
+        assert!(proposals
+            .iter()
+            .all(|(_, proposal)| proposal.parties.contains(&party)));
+        assert!(queue.drain_cosign_proposals().is_empty());
+
+        let returned_a = Attestation {
+            witness: claimed_by_a,
+            signature: sig(),
+        };
+        let returned_b = Attestation {
+            witness: claimed_by_b,
+            signature: sig(),
+        };
+        assert!(queue.record_cosign_response_at(
+            witness_a,
+            IntentResponse {
+                intent_id: 7,
+                verdict: AttestationVerdict::Attested(returned_a.clone()),
+            },
+            started + Duration::from_millis(20),
+        ));
+        assert!(queue.record_cosign_response_at(
+            witness_b,
+            IntentResponse {
+                intent_id: 7,
+                verdict: AttestationVerdict::Attested(returned_b.clone()),
+            },
+            started + Duration::from_millis(30),
+        ));
+
+        assert_eq!(
+            queue.advance_cosign_at(started + Duration::from_millis(30)),
+            1
+        );
+        assert_eq!(queue.status(ticket), IntentStatus::Queued);
+        assert_eq!(
+            queue.store.load().len(),
+            1,
+            "only the closed draft is durable"
+        );
+        let submitted = queue.drain();
+        assert_eq!(submitted.len(), 1);
+        assert_eq!(
+            submitted[0].attestations,
+            vec![returned_a, returned_b],
+            "the submitter must not signature-filter or required-subset-filter replies"
+        );
+    }
+
+    #[test]
+    fn an_attestation_at_the_budget_boundary_is_not_counted() {
+        let started = Instant::now();
+        let witness = node(2);
+        let mut queue = IntentQueue::new(10);
+        let ticket = queue
+            .begin_cosign_at(
+                signed_intent(8),
+                vec![witness],
+                Vec::new(),
+                Vec::new(),
+                started,
+            )
+            .unwrap();
+        assert!(!queue.record_cosign_response_at(
+            witness,
+            IntentResponse {
+                intent_id: 8,
+                verdict: AttestationVerdict::Attested(Attestation {
+                    witness,
+                    signature: sig(),
+                }),
+            },
+            started + COSIGN_BUDGET,
+        ));
+        assert_eq!(
+            queue.cosign_disposition_at(ticket, witness, started + COSIGN_BUDGET),
+            Some(CoSignDisposition::TimedOut)
+        );
+        assert_eq!(queue.advance_cosign_at(started + COSIGN_BUDGET), 1);
+        assert!(queue.drain()[0].attestations.is_empty());
     }
 
     #[test]

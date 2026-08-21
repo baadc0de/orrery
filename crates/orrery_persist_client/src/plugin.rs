@@ -17,7 +17,9 @@ use crate::gateway::{
     connect_gateway, disconnect_gateway, flush_interest_grant, flush_lease_control, hello_gateway,
     sync_authority_identity, GatewaySession,
 };
-use crate::intents::{drain_intents, IntentQueue};
+use crate::intents::{
+    advance_cosign, drain_intents, flush_cosign_proposals, ingest_cosign_responses, IntentQueue,
+};
 use crate::replies::process_replies;
 use crate::reports::{drain_reports, ReportQueue};
 use crate::uplink::{flush_uplink, UplinkScheduler};
@@ -49,11 +51,19 @@ impl Plugin for OrreryPersistClientPlugin {
             .init_resource::<ReportQueue>()
             .init_resource::<UplinkSeq>()
             .add_message::<bevy_replicon::server::uplink::ComponentDiff>()
+            // The net plugin normally owns these message resources. Declaring
+            // them here too keeps this plugin independently runnable in tests
+            // and is idempotent when both plugins are installed.
+            .add_message::<orrery_net::PeerPacket>()
+            .add_message::<orrery_net::SendPacket>()
             .configure_sets(Update, PersistClientSet::Flush)
             .add_systems(
                 Update,
                 (
                     flush_uplink,
+                    ingest_cosign_responses,
+                    advance_cosign,
+                    flush_cosign_proposals,
                     drain_intents,
                     // Reports leave on the same lane and in the same set as
                     // intents, and for the same reason: both are reliable

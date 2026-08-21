@@ -270,8 +270,23 @@ pub struct IntentOp {
 pub struct Attestation {
     /// The co-signing witness's NodeId.
     pub witness: NodeId,
-    /// The witness's ed25519 signature over the intent.
+    /// The witness's ed25519 signature over D27's attestation preimage.
     pub signature: Signature,
+}
+
+impl Attestation {
+    /// Verify this witness signature against D27's role-separated preimage.
+    ///
+    /// This deliberately does not use [`Intent::signing_preimage`]. The
+    /// attestation preimage commits to the issuer signature and to
+    /// [`Self::witness`], so neither an issuer signature nor an attestation
+    /// made by another witness can be substituted here.
+    #[must_use]
+    pub fn verify(&self, intent: &Intent) -> bool {
+        self.witness
+            .verify(&intent.attestation_preimage(self.witness), &self.signature)
+            .is_ok()
+    }
 }
 
 /// A signed, witness-attested critical-write envelope (D11 §2.2).
@@ -301,6 +316,12 @@ pub struct Intent {
 /// one.
 pub const INTENT_PREIMAGE_TAG: &[u8] = b"orrery/intent/v1";
 
+/// The domain separator at offset 0 of D27's attestation preimage.
+pub const ATTESTATION_PREIMAGE_TAG: &[u8; 21] = b"orrery/attestation/v1";
+
+/// The fixed byte length of D27's attestation preimage.
+pub const ATTESTATION_PREIMAGE_LEN: usize = 157;
+
 impl Intent {
     /// The canonical byte string the issuer signs: domain-separated and
     /// **attestation-excluding** — it covers exactly `(intent_id, issuer,
@@ -327,6 +348,41 @@ impl Intent {
             buf.extend_from_slice(&op.args);
         }
         buf
+    }
+
+    /// D27's canonical, fixed-length byte string a witness signs.
+    ///
+    /// The layout is exact and has no length prefixes: the 21-byte
+    /// [`ATTESTATION_PREIMAGE_TAG`], the 32-byte blake3 digest of
+    /// [`Self::signing_preimage`], `cell_epoch` as eight little-endian bytes,
+    /// the issuer's 64-byte Ed25519 signature, and the witness's 32-byte
+    /// [`NodeId`], in that order. The redundant epoch is intentional: its
+    /// constant offset keeps the epoch binding visible even if a future intent
+    /// preimage changes shape.
+    #[must_use]
+    pub fn attestation_preimage(&self, witness: NodeId) -> [u8; ATTESTATION_PREIMAGE_LEN] {
+        let intent_hash = blake3::hash(&self.signing_preimage());
+        let mut preimage = [0_u8; ATTESTATION_PREIMAGE_LEN];
+        preimage[..21].copy_from_slice(ATTESTATION_PREIMAGE_TAG);
+        preimage[21..53].copy_from_slice(intent_hash.as_bytes());
+        preimage[53..61].copy_from_slice(&self.cell_epoch.0.to_le_bytes());
+        preimage[61..125].copy_from_slice(&self.signature.to_bytes());
+        preimage[125..157].copy_from_slice(witness.as_bytes());
+        preimage
+    }
+
+    /// Co-sign this already issuer-signed intent as `key`'s witness.
+    ///
+    /// Call this only after [`Self::sign`]. The issuer signature is itself
+    /// inside [`Self::attestation_preimage`], so replacing or re-making it
+    /// invalidates the returned attestation even when `intent_id` is reused.
+    #[must_use]
+    pub fn attest(&self, key: &iroh_base::SecretKey) -> Attestation {
+        let witness = key.public();
+        Attestation {
+            witness,
+            signature: key.sign(&self.attestation_preimage(witness)),
+        }
     }
 
     /// Sign [`Intent::signing_preimage`] with `key`, replacing any previous
@@ -684,6 +740,76 @@ mod tests {
             !intent.verify_issuer(),
             "a mutated ops byte must fail verification"
         );
+    }
+
+    #[test]
+    fn attestation_preimage_matches_d27_and_separates_signature_roles() {
+        let issuer = key(1);
+        let witness = key(2);
+        let mut intent = intent_for_test(42, issuer.public());
+        intent.sign(&issuer);
+
+        let attestation = intent.attest(&witness);
+        let preimage = intent.attestation_preimage(witness.public());
+        assert_eq!(preimage.len(), ATTESTATION_PREIMAGE_LEN);
+
+        let intent_hash = blake3::hash(&intent.signing_preimage());
+        let mut expected = [0_u8; ATTESTATION_PREIMAGE_LEN];
+        expected[..21].copy_from_slice(ATTESTATION_PREIMAGE_TAG);
+        expected[21..53].copy_from_slice(intent_hash.as_bytes());
+        expected[53..61].copy_from_slice(&intent.cell_epoch.0.to_le_bytes());
+        expected[61..125].copy_from_slice(&intent.signature.to_bytes());
+        expected[125..157].copy_from_slice(witness.public().as_bytes());
+        assert_eq!(
+            preimage, expected,
+            "D27's offset table is transcribed exactly"
+        );
+
+        assert!(attestation.verify(&intent));
+        assert!(
+            witness
+                .public()
+                .verify(&intent.signing_preimage(), &attestation.signature)
+                .is_err(),
+            "a witness signature must not verify over the issuer preimage"
+        );
+    }
+
+    #[test]
+    fn attestation_is_bound_to_the_issuer_signature_even_when_id_is_reused() {
+        let issuer = key(1);
+        let witness = key(2);
+        let mut original = intent_for_test(77, issuer.public());
+        original.sign(&issuer);
+        let attestation = original.attest(&witness);
+        assert!(attestation.verify(&original));
+
+        let mut resigned = original.clone();
+        resigned.signature = key(3).sign(&resigned.signing_preimage());
+        assert_eq!(resigned.intent_id, original.intent_id);
+        assert_ne!(resigned.signature, original.signature);
+        assert!(
+            !attestation.verify(&resigned),
+            "offset 61 commits the attestation to the issuer signature"
+        );
+    }
+
+    fn key(seed: u8) -> iroh_base::SecretKey {
+        iroh_base::SecretKey::from_bytes(&[seed; 32])
+    }
+
+    fn intent_for_test(intent_id: u128, issuer: NodeId) -> Intent {
+        Intent {
+            intent_id,
+            issuer,
+            cell_epoch: CellEpoch::new(9),
+            ops: vec![IntentOp {
+                op: 4,
+                args: bytes::Bytes::from_static(b"transfer"),
+            }],
+            attestations: Vec::new(),
+            signature: key(9).sign(b"placeholder"),
+        }
     }
 
     #[test]

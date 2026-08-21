@@ -20,7 +20,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::{NodeId, PersistId, Signature, Tick};
+use crate::{Attestation, Intent, NodeId, PersistId, Signature, Tick};
 
 /// A blake3 chain hash over a log's records.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -319,6 +319,73 @@ pub struct FrameHead {
     pub head: ChainHash,
 }
 
+/// One signed-log position a witness may consult while judging an intent.
+///
+/// These are routing hints into the witness's already-replicated view, not
+/// additional claims and not additional signed fields. D27 fixes the
+/// attestation preimage to the enclosing [`Intent`], so a game that needs a
+/// context position to be binding must also encode it in the intent op.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IntentContextRef {
+    /// The persistent entity whose witnessed history carries the context.
+    pub entity: PersistId,
+    /// The universe tick to inspect in that history.
+    pub tick: Tick,
+}
+
+/// A signed intent offered to one member of its announced witness set.
+///
+/// `parties` lets an honest witness perform D10's mandatory self-exclusion.
+/// The gateway still derives and checks the authoritative party set: this
+/// peer-carried list is protective for an honest witness, not trusted input to
+/// durable admission.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IntentProposal {
+    /// The issuer-signed intent, before witness attestations are appended.
+    pub intent: Intent,
+    /// Every party NodeId known to the submitter, including the issuer.
+    pub parties: Vec<NodeId>,
+    /// Positions in the already-streamed log that may help judge plausibility.
+    pub context_refs: Vec<IntentContextRef>,
+}
+
+/// Why a witness explicitly declined an [`IntentProposal`].
+///
+/// A refusal is a received answer. It is deliberately a different wire value
+/// from silence, because the submitter must distinguish a negative judgement
+/// from an unreachable witness when the 150 ms budget closes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AttestationRefusalReason {
+    /// This witness is the issuer or appears in the proposal's party set.
+    Party,
+    /// The issuer signature does not verify over [`Intent::signing_preimage`].
+    BadIssuerSignature,
+    /// The peer has no witness signing identity configured.
+    MissingSigningIdentity,
+    /// A game-defined plausibility precondition failed in the replicated view.
+    PlausibilityFailed(u16),
+    /// This witness already judged a conflicting intent in the same epoch.
+    ConflictingIntent,
+}
+
+/// One witness's explicit answer to an [`IntentProposal`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AttestationVerdict {
+    /// The witness signed D27's attestation preimage.
+    Attested(Attestation),
+    /// The witness declined and supplied a machine-readable reason.
+    Refused(AttestationRefusalReason),
+}
+
+/// A witness answer routed back to the intent submitter.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IntentResponse {
+    /// The proposal's intent id, used to route concurrent collections.
+    pub intent_id: u128,
+    /// The positive attestation or explicit refusal.
+    pub verdict: AttestationVerdict,
+}
+
 /// Verifiable-core traffic between peers (docs/06 §6, docs/07 §3).
 ///
 /// # Which lane each rides
@@ -360,6 +427,10 @@ pub enum WitnessMsg {
     },
     /// A self-verifying accusation, bound to its reporter.
     Report(Box<DiscrepancyReport>),
+    /// Ask one announced, non-party witness to judge a signed intent.
+    IntentProposal(Box<IntentProposal>),
+    /// Return an attestation or an explicit refusal to the submitter.
+    IntentResponse(IntentResponse),
 }
 
 /// How a claimed trajectory failed against a replayed one.
