@@ -62,8 +62,9 @@ pub use identity::{
 };
 pub use persist::{
     AccountId, AssetId, Attestation, CellEpoch, Checkpoint, EntityRekey, Epoch, Intent, IntentOp,
-    IntentOutcome, ItemUid, JournalRecord, Lsn, PersistId, RecordKind, Tick, ENTITY_REKEY_VERSION,
-    INTENT_PREIMAGE_TAG, REASON_BAD_SIGNATURE, REASON_CONTENTION_EXHAUSTED, REASON_EXECUTOR_ERROR,
+    IntentOutcome, ItemUid, JournalRecord, Lsn, PersistId, RecordKind, Tick,
+    ATTESTATION_PREIMAGE_LEN, ATTESTATION_PREIMAGE_TAG, ENTITY_REKEY_VERSION, INTENT_PREIMAGE_TAG,
+    REASON_BAD_SIGNATURE, REASON_CONTENTION_EXHAUSTED, REASON_EXECUTOR_ERROR,
     REASON_INSUFFICIENT_BALANCE, REASON_ISSUER_MISMATCH, REASON_ITEM_TRANSFER_TO_SELF,
     REASON_MALFORMED_OP, REASON_NOT_ITEM_OWNER, REASON_NO_EXECUTOR, REASON_NO_SUCH_ITEM,
     REASON_SELF_WITNESS, REASON_VALIDATION_FAILED, REPORT_ADJUDICATED,
@@ -72,8 +73,9 @@ pub use persist::{
 };
 pub use protocol::PROTOCOL_VERSION;
 pub use verifiable::{
-    ChainHash, DeviationKind, DiscrepancyReport, EntitySlice, EvidenceBundle, ForgeryProof,
-    FrameHead, InputRecord, LogFrame, LogRangeRequest, LogRangeResponse, RecordSource, RollingHead,
-    RulesetId, StateClaim, UnadjudicableReason, UniverseSeed, Verdict, WitnessMsg,
+    AttestationRefusalReason, AttestationVerdict, ChainHash, DeviationKind, DiscrepancyReport,
+    EntitySlice, EvidenceBundle, ForgeryProof, FrameHead, InputRecord, IntentContextRef,
+    IntentProposal, IntentResponse, LogFrame, LogRangeRequest, LogRangeResponse, RecordSource,
+    RollingHead, RulesetId, StateClaim, UnadjudicableReason, UniverseSeed, Verdict, WitnessMsg,
     MAX_ADJUDICATION_TICKS,
 };

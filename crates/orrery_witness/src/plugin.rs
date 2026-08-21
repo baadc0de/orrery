@@ -40,9 +40,11 @@ use orrery_net::channels::{decode_witness, encode_witness, Channel};
 use orrery_net::peer_link::{control_payload_budget, payload_budget};
 use orrery_net::{IslandMembership, PeerPacket, SendPacket, StreamMode};
 use orrery_protocol::{
-    FrameHead, LogFrame, LogRangeRequest, NodeId, PersistId, StateClaim, Tick, WitnessMsg,
+    AttestationVerdict, FrameHead, LogFrame, LogRangeRequest, NodeId, PersistId, StateClaim, Tick,
+    WitnessMsg,
 };
 
+use crate::cosign::decide_proposal;
 use crate::witness::{Witness, WitnessSignal};
 
 /// The MTU to size a range response against when none is known.
@@ -338,10 +340,10 @@ impl Default for WitnessClock {
     }
 }
 
-/// The key this peer signs discrepancy reports with (docs/07 §3 stage 3).
+/// The key this peer signs discrepancy reports and intent attestations with.
 ///
-/// **Optional, and absent by default.** [`Witness::raise`] needs a signing
-/// key, and no other resource carries one this crate can reach:
+/// **Optional, and absent by default.** [`Witness::raise`] and D27 co-signing
+/// need a signing key, and no other resource carries one this crate can reach:
 /// `orrery_net`'s `NetConfig::secret_key` is consumed straight into the iroh
 /// endpoint builder, and the endpoint's key is not handed back out. So filing
 /// is opt-in — a host that wants its witness to escalate inserts this, and one
@@ -403,6 +405,12 @@ pub struct WitnessLinkCounters {
     pub undecodable: u64,
     /// Inbound messages refused by the engine.
     pub refused: u64,
+    /// Intent proposals received on the reliable peer-control lane.
+    pub cosign_proposals_received: u64,
+    /// D27 attestations signed and returned to submitters.
+    pub cosign_attestations_signed: u64,
+    /// Explicit, machine-readable co-sign refusals returned to submitters.
+    pub cosign_refusals_sent: u64,
     /// Reports assembled, signed and handed to the transport.
     pub escalations_filed: u64,
     /// Windows raised while shadow mode was on, and therefore not filed.
@@ -632,6 +640,33 @@ pub fn ingest_peer_traffic<R>(
             continue;
         };
 
+        // Co-signing is a request/response exchange and therefore belongs on
+        // the reliable control lane. It is routed before the detection engine
+        // for the same reason repairs are: a peer need not be watching any
+        // entity to answer for its own signing identity. The generic adapter
+        // can evaluate the universal checks (party exclusion and issuer
+        // authentication); a game-specific adapter may call `decide_proposal`
+        // itself with a failed plausibility code before this default path.
+        if let WitnessMsg::IntentProposal(proposal) = message {
+            if packet.channel != Channel::Control {
+                counters.refused += 1;
+                continue;
+            }
+            counters.cosign_proposals_received += 1;
+            let response = decide_proposal(&proposal, identity, Ok(()));
+            match &response.verdict {
+                AttestationVerdict::Attested(_) => counters.cosign_attestations_signed += 1,
+                AttestationVerdict::Refused(_) => counters.cosign_refusals_sent += 1,
+            }
+            out.write(SendPacket {
+                to: packet.from,
+                channel: Channel::Control,
+                payload: Bytes::from(encode_witness(&WitnessMsg::IntentResponse(response))),
+                mode: StreamMode::Shared,
+            });
+            continue;
+        }
+
         // Answering a repair needs a *log*, not a witness. Most peers watch
         // nobody and still have to justify their own chain on request, so this
         // is routed before the witness is even looked for — gating it behind
@@ -750,6 +785,11 @@ pub fn ingest_peer_traffic<R>(
             // arriving here is either a misroute or a peer hoping to be
             // believed — neither is this adapter's business.
             WitnessMsg::Report(_) => counters.refused += 1,
+            // Consumed above even when no detection engine is installed.
+            WitnessMsg::IntentProposal(_) => unreachable!("routed before this match"),
+            // The submitter-side collector in `orrery_persist_client` owns
+            // responses; this adapter has nothing to decide about one.
+            WitnessMsg::IntentResponse(_) => {}
         }
     }
 }

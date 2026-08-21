@@ -57,19 +57,24 @@
 //! does. The P4 exit criterion is measured over bot *and* human play, so that
 //! has to be one implementation.
 //!
-//! # Not yet here
+//! # Co-signing is independent of shadow mode
 //!
-//! Attestation co-signing (docs/07 §4) is P5, not P4 — this phase is passive
-//! by design: logs, replay, telemetry, no enforcement.
+//! [`cosign`] implements the P5 peer decision over D27's role-separated
+//! envelope. [`WitnessConfig::shadow_mode`] still governs discrepancy reports
+//! only: a co-sign proposal is answered identically in either shadow-mode
+//! position, because an explicit refusal and a silent report are different
+//! protocols with different consequences.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod cosign;
 #[cfg(feature = "bevy")]
 pub mod plugin;
 pub mod report;
 pub mod witness;
 
+pub use cosign::decide_proposal;
 #[cfg(feature = "bevy")]
 pub use plugin::{
     AuthoredLog, PendingRepairs, PublishClaim, PublishFrame, RepairBudget, ReportFiled,

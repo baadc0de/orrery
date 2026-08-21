@@ -55,7 +55,9 @@ pub use area::{order_nearest_first, sync_aoi_to_loader, AreaLoader, LoadedPage};
 pub use config::PersistClientConfig;
 pub use feed::{feed_uplink, LocallyAuthoritative, PersistId, UplinkSeq};
 pub use gateway::{GatewayConfig, GatewaySession, GatewayState, SessionEvent};
-pub use intents::{IntentQueue, IntentStatus, IntentTicket, PredictedEffects};
+pub use intents::{
+    CoSignDisposition, IntentQueue, IntentStatus, IntentTicket, PredictedEffects, COSIGN_BUDGET,
+};
 pub use latency::LatencyHistogram;
 pub use plugin::{OrreryPersistClientPlugin, PersistClientSet};
 pub use reports::{drain_reports, ReportOutcome, ReportQueue, DEFAULT_REPORT_QUEUE_CAPACITY};
