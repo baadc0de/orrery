@@ -5,16 +5,20 @@
 //! authenticates and reports presence actually receive a usable interest grant
 //! and an island manifest, and does the coordinator refuse the things it must?
 
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use orrery_coordinator::server::{FixedUnixClock, ServerConfig, SystemPresenceClock};
+use orrery_coordinator::server::{
+    FixedUnixClock, IdentityHealth, ServerConfig, SystemPresenceClock,
+};
 use orrery_coordinator::{
     CoordinatorClient, CoordinatorServer, InterestIssuer, WitnessEpochIssuer, WitnessSeedConfig,
 };
 use orrery_protocol::{
     verify_interest_grant, AccountId, CellId, CoordMsg, GridId, IssuerKey, IssuerKeyId, NodeId,
-    SessionStanding, SessionTokenClaimsV1, SessionTokenTtlMs, SessionTokenV1, UnixMillis,
+    SessionStanding, SessionTokenClaimsV1, SessionTokenTtlMs, SessionTokenV1, TokenClock,
+    UnixMillis, MAX_SESSION_TOKEN_TTL_MS,
 };
 
 const NOW_MS: u64 = 1_000_000;
@@ -83,6 +87,398 @@ async fn coordinator(issuer: &iroh::SecretKey, interest: &iroh::SecretKey) -> Co
     })
     .await
     .expect("spawn coordinator")
+}
+
+/// A wall clock the test moves, so one token can be signed while it is valid
+/// and presented again after it has expired — which is the whole shape of the
+/// grace rule and is unreachable with a fixed clock.
+#[derive(Debug, Clone)]
+struct StepClock(Arc<AtomicU64>);
+
+impl TokenClock for StepClock {
+    fn now_ms(&self) -> UnixMillis {
+        UnixMillis::new(self.0.load(Ordering::Relaxed))
+    }
+}
+
+/// An identity service a test can take down.
+#[derive(Debug, Clone)]
+struct SwitchedIdentityHealth(Arc<AtomicBool>);
+
+impl IdentityHealth for SwitchedIdentityHealth {
+    fn is_available(&self) -> bool {
+        self.0.load(Ordering::Relaxed)
+    }
+}
+
+/// A coordinator whose clock and identity health the test drives.
+async fn coordinator_in_an_outage(
+    issuer: &iroh::SecretKey,
+    interest: &iroh::SecretKey,
+) -> (CoordinatorServer, Arc<AtomicU64>, Arc<AtomicBool>) {
+    let clock = Arc::new(AtomicU64::new(NOW_MS));
+    let identity_up = Arc::new(AtomicBool::new(true));
+    let server = CoordinatorServer::spawn(ServerConfig {
+        token_clock: Arc::new(StepClock(Arc::clone(&clock))),
+        presence_clock: Arc::new(SystemPresenceClock::default()),
+        identity_health: Arc::new(SwitchedIdentityHealth(Arc::clone(&identity_up))),
+        ..ServerConfig::new(
+            [IssuerKey::new(IssuerKeyId::new(1), issuer.public())],
+            InterestIssuer::new(interest.clone(), IssuerKeyId::new(1)),
+        )
+    })
+    .await
+    .expect("spawn coordinator");
+    (server, clock, identity_up)
+}
+
+#[tokio::test]
+async fn an_identity_outage_does_not_end_an_established_session() {
+    // docs/09 §8: "coordinator and gateway accept expired-but-otherwise-valid
+    // tokens for *established* sessions while identity is unreachable". The
+    // coordinator half of that sentence is what this pins. Without it a relay
+    // flap during an identity outage costs the peer its presence, its island
+    // membership and its interest grant.
+    let issuer = secret(200);
+    let interest = secret(201);
+    let (server, clock, identity_up) = coordinator_in_an_outage(&issuer, &interest).await;
+
+    // Given: a peer that authenticated while identity was up.
+    let session = token(&issuer, node(1), 60_000);
+    let first = CoordinatorClient::connect(secret(1), server.addr(), session.clone(), PATIENCE)
+        .await
+        .expect("peer admitted");
+    first.report_presence(vec![cell(0)]).expect("presence");
+    first.next_grant(PATIENCE).await.expect("first grant");
+    first.leave().await;
+
+    // When: identity goes down and the token ages out under it. The peer
+    // cannot refresh — refresh is the first thing an identity outage takes.
+    identity_up.store(false, Ordering::Relaxed);
+    clock.store(NOW_MS + 120_000, Ordering::Relaxed);
+
+    // Then: the same token, now 61 s expired, still re-establishes the
+    // session it established the first time.
+    let again = CoordinatorClient::connect(secret(1), server.addr(), session, PATIENCE)
+        .await
+        .expect("an established peer rides out the outage");
+    again.report_presence(vec![cell(0)]).expect("presence");
+    let grant = again.next_grant(PATIENCE).await.expect("grant");
+    let trusted = [IssuerKey::new(IssuerKeyId::new(1), interest.public())];
+    assert_eq!(
+        verify_interest_grant(&grant, &node(1), &trusted)
+            .expect("valid")
+            .covered_cells,
+        vec![cell(0)]
+    );
+    assert_eq!(server.stats().await.connected_peers, 1);
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn an_expired_token_is_refused_while_identity_is_reachable() {
+    // The asymmetry is the rule. Grace is a concession to an unreachable
+    // identity service, not a second lifetime for every token: with identity
+    // up, the peer can refresh, so an expired token is simply expired.
+    let issuer = secret(200);
+    let interest = secret(201);
+    let (server, clock, _identity_up) = coordinator_in_an_outage(&issuer, &interest).await;
+
+    let session = token(&issuer, node(1), 60_000);
+    let first = CoordinatorClient::connect(secret(1), server.addr(), session.clone(), PATIENCE)
+        .await
+        .expect("peer admitted");
+    first.leave().await;
+
+    clock.store(NOW_MS + 120_000, Ordering::Relaxed);
+    assert!(
+        CoordinatorClient::connect(
+            secret(1),
+            server.addr(),
+            session,
+            Duration::from_millis(750)
+        )
+        .await
+        .is_err(),
+        "an expired token was accepted with identity reachable"
+    );
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn an_identity_outage_still_locks_out_a_peer_that_never_logged_in() {
+    // "An identity outage locks out new logins, never in-flight play" — the
+    // first half. A stranger's expired token has no established session
+    // behind it, and an outage must not turn one into a way in.
+    let issuer = secret(200);
+    let interest = secret(201);
+    let (server, clock, identity_up) = coordinator_in_an_outage(&issuer, &interest).await;
+
+    identity_up.store(false, Ordering::Relaxed);
+    clock.store(NOW_MS + 120_000, Ordering::Relaxed);
+    assert!(
+        CoordinatorClient::connect(
+            secret(1),
+            server.addr(),
+            token(&issuer, node(1), 60_000),
+            Duration::from_millis(750)
+        )
+        .await
+        .is_err(),
+        "an outage admitted a peer this coordinator had never seen"
+    );
+    assert_eq!(server.stats().await.connected_peers, 0);
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn grace_admits_a_late_token_and_never_a_weaker_check() {
+    // Everything except the clock still has to hold. Otherwise "identity is
+    // down" would be a window in which signatures, node bindings and issuers
+    // stopped meaning anything — which is the failure mode that would make
+    // the grace rule worse than the churn it prevents.
+    let issuer = secret(200);
+    let interest = secret(201);
+    let (server, clock, identity_up) = coordinator_in_an_outage(&issuer, &interest).await;
+
+    let session = token(&issuer, node(1), 60_000);
+    let established = CoordinatorClient::connect(secret(1), server.addr(), session, PATIENCE)
+        .await
+        .expect("peer admitted");
+    established.leave().await;
+
+    identity_up.store(false, Ordering::Relaxed);
+    clock.store(NOW_MS + 120_000, Ordering::Relaxed);
+
+    // An expired token from an issuer this coordinator does not trust.
+    let forged = secret(199);
+    assert!(CoordinatorClient::connect(
+        secret(1),
+        server.addr(),
+        token(&forged, node(1), 60_000),
+        Duration::from_millis(750)
+    )
+    .await
+    .is_err());
+
+    // An expired token bound to a different node than the one presenting it.
+    assert!(CoordinatorClient::connect(
+        secret(1),
+        server.addr(),
+        token(&issuer, node(2), 60_000),
+        Duration::from_millis(750)
+    )
+    .await
+    .is_err());
+
+    // A genuine expired token for this peer — but not the one it established
+    // with. Same account, later issue time: grace re-admits a session, it
+    // does not accept fresh claims nobody's live signature vouches for.
+    assert!(CoordinatorClient::connect(
+        secret(1),
+        server.addr(),
+        token(&issuer, node(1), 30_000),
+        Duration::from_millis(750)
+    )
+    .await
+    .is_err());
+
+    assert_eq!(server.stats().await.connected_peers, 0);
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn grace_does_not_outlast_its_window() {
+    // The bound the gateway does not pin. An outage long enough to age a
+    // token an hour past its expiry has stopped being something to ride out,
+    // and a coordinator running on standing that old is worse than a login.
+    let issuer = secret(200);
+    let interest = secret(201);
+    let (server, clock, identity_up) = coordinator_in_an_outage(&issuer, &interest).await;
+
+    // The peer holds its session open across the whole outage — a live
+    // connection is never re-verified — and only then blips. So its session
+    // ended a moment ago and it is established by every other measure; the
+    // one thing wrong with the token it presents is its age, which is
+    // precisely what this window is.
+    let session = token(&issuer, node(1), 60_000);
+    let first = CoordinatorClient::connect(secret(1), server.addr(), session.clone(), PATIENCE)
+        .await
+        .expect("peer admitted");
+    identity_up.store(false, Ordering::Relaxed);
+    // The token expired at NOW_MS + 59_000; one millisecond past the window.
+    clock.store(
+        NOW_MS + 59_000 + MAX_SESSION_TOKEN_TTL_MS + 1,
+        Ordering::Relaxed,
+    );
+    first.leave().await;
+    assert!(
+        CoordinatorClient::connect(
+            secret(1),
+            server.addr(),
+            session,
+            Duration::from_millis(750)
+        )
+        .await
+        .is_err(),
+        "grace outlasted its window"
+    );
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_graced_peer_keeps_its_place_in_the_island_manifest() {
+    // The consequence that makes this a topology problem rather than a login
+    // problem: a coordinator session ends by forgetting the peer entirely, so
+    // a peer that cannot re-establish drops out of every manifest its island
+    // pushes and out of the pool D28's reseed triggers count.
+    let issuer = secret(200);
+    let interest = secret(201);
+    let (server, clock, identity_up) = coordinator_in_an_outage(&issuer, &interest).await;
+
+    let staying = CoordinatorClient::connect(
+        secret(1),
+        server.addr(),
+        token(&issuer, node(1), 60_000),
+        PATIENCE,
+    )
+    .await
+    .expect("first peer admitted");
+    staying.report_presence(vec![cell(0)]).expect("presence");
+    staying.next_manifest(PATIENCE).await.expect("own island");
+
+    let session = token(&issuer, node(2), 60_000);
+    let blipping = CoordinatorClient::connect(secret(2), server.addr(), session.clone(), PATIENCE)
+        .await
+        .expect("second peer admitted");
+    blipping.report_presence(vec![cell(0)]).expect("presence");
+    let merged = staying.next_manifest(PATIENCE).await.expect("merged");
+    assert_eq!(merged.peers.len(), 2);
+
+    // Its connection drops mid-outage — a relay flap, a NAT rebind.
+    blipping.leave().await;
+    staying.next_manifest(PATIENCE).await.expect("departure");
+    identity_up.store(false, Ordering::Relaxed);
+    clock.store(NOW_MS + 120_000, Ordering::Relaxed);
+
+    // It comes back on the only token it has, and the island is whole again.
+    let back = CoordinatorClient::connect(secret(2), server.addr(), session, PATIENCE)
+        .await
+        .expect("the peer is re-admitted on grace");
+    back.report_presence(vec![cell(0)]).expect("presence");
+    let rejoined = staying
+        .next_manifest(PATIENCE)
+        .await
+        .expect("the survivor learns the peer is back");
+    assert_eq!(rejoined.peers.len(), 2);
+    assert!(rejoined.peers.iter().any(|entry| entry.node == node(2)));
+    assert_eq!(server.stats().await.connected_peers, 2);
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_graced_peer_is_left_out_of_the_witness_pool_it_would_have_joined() {
+    // The standing decision, end to end. D28 clause (e) filters on the
+    // token's signed `standing`, and a graced session's is only as fresh as
+    // the outage is long — a quarantine applied while identity was down is
+    // invisible. So the peer plays and does not witness, and the coordinator
+    // says so in the pool it announces rather than in a comment.
+    let issuer = secret(200);
+    let interest = secret(201);
+    let clock = Arc::new(AtomicU64::new(NOW_MS));
+    let identity_up = Arc::new(AtomicBool::new(true));
+    let server = CoordinatorServer::spawn(ServerConfig {
+        token_clock: Arc::new(StepClock(Arc::clone(&clock))),
+        presence_clock: Arc::new(SystemPresenceClock::default()),
+        identity_health: Arc::new(SwitchedIdentityHealth(Arc::clone(&identity_up))),
+        witness_issuer: Some(WitnessEpochIssuer::new(
+            interest.clone(),
+            IssuerKeyId::new(1),
+            [0x2Au8; 32],
+            1,
+        )),
+        // Every window driven to its floor, for one reason each: a test
+        // cannot wait out a 10 s probation or a 30 s epoch, and the 60 s
+        // departure cooldown would exclude the returning peer on its own —
+        // exactly the confound that would make this test pass while proving
+        // nothing about grace. The epoch is 1 ms rather than 0 because a
+        // verifier refuses a zero-length epoch, and a QUIC reconnect is not
+        // finished inside one millisecond.
+        witness_seed: WitnessSeedConfig {
+            min_presence_ms: 0,
+            reseed_min_ms: 0,
+            epoch_ms: 1,
+            reseed_cooldown_ms: 0,
+            ..WitnessSeedConfig::default()
+        },
+        ..ServerConfig::new(
+            [IssuerKey::new(IssuerKeyId::new(1), issuer.public())],
+            InterestIssuer::new(interest.clone(), IssuerKeyId::new(1)),
+        )
+    })
+    .await
+    .expect("spawn coordinator");
+
+    // Five peers that stay, on five accounts — the floor exactly, so the
+    // graced sixth is the difference between a pool of five and one of six.
+    let mut staying = Vec::new();
+    for index in 1..=5u8 {
+        let client = CoordinatorClient::connect(
+            secret(index),
+            server.addr(),
+            account_token(&issuer, node(index), u64::from(index)),
+            PATIENCE,
+        )
+        .await
+        .expect("peer admitted");
+        client.report_presence(vec![cell(0)]).expect("presence");
+        staying.push(client);
+    }
+
+    let session = account_token(&issuer, node(6), 6);
+    let blipping = CoordinatorClient::connect(secret(6), server.addr(), session.clone(), PATIENCE)
+        .await
+        .expect("sixth peer admitted");
+    blipping.report_presence(vec![cell(0)]).expect("presence");
+    blipping
+        .next_witness_epoch(PATIENCE)
+        .await
+        .expect("a verified session is witness-eligible");
+    blipping.leave().await;
+
+    // It comes back mid-outage on the token it already had.
+    identity_up.store(false, Ordering::Relaxed);
+    clock.store(NOW_MS + 120_000, Ordering::Relaxed);
+    let back = CoordinatorClient::connect(secret(6), server.addr(), session, PATIENCE)
+        .await
+        .expect("the peer is re-admitted on grace");
+    back.report_presence(vec![cell(0)]).expect("presence");
+
+    // Its own connection is new, so the first announcement it is handed is
+    // the one its return seeded — no backlog to read past.
+    let bytes = back
+        .next_witness_epoch(PATIENCE)
+        .await
+        .expect("the reseed its return triggered");
+    let trusted = [IssuerKey::new(IssuerKeyId::new(1), interest.public())];
+    let claims =
+        orrery_protocol::verify_witness_epoch(&bytes, &trusted).expect("a signed announcement");
+    assert!(
+        !claims.candidates.contains(&node(6)),
+        "a session running on an expired token's standing must not witness"
+    );
+    assert_eq!(
+        claims.candidates.len(),
+        5,
+        "the five verified peers, and only those"
+    );
+
+    server.shutdown().await;
 }
 
 #[tokio::test]
