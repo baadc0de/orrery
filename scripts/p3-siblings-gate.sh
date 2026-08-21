@@ -80,12 +80,21 @@ if [[ ${1:-} == --self-test ]]; then
   # number and returns the Nth invocation of that binary, from the line that
   # runs it through the last of its continuation lines.
   launch() { # VAR occurrence
-    awk -v bin="\"\$$1\" \\" -v want="$2" '
+    # Build the backslash-terminated sentinel inside awk. Passing that sentinel
+    # through -v is not portable: gawk 5.2 drops its lone trailing backslash.
+    awk -v var="$1" -v want="$2" '
+      BEGIN { bin = "\"$" var "\" " "\\" }
       $0 == bin { n++; inside = (n == want); if (inside) { print; next } }
       inside { print; if ($0 !~ /\\$/) inside = 0 }
     ' <<<"$body"
   }
-  runs() { grep -Fq -- "$3" <<<"$(launch "$1" "$2")"; }
+  runs() {
+    local invocation
+    invocation=$(launch "$1" "$2")
+    [[ -n $invocation ]] \
+      || die "self-test: invocation extraction returned no text for $1 occurrence $2"
+    grep -Fq -- "$3" <<<"$invocation"
+  }
   # Exactly two, and the count is asserted rather than assumed: a third
   # gateway would silently go unchecked by every clause below.
   gateways=$(grep -cFx -- '"$PERSISTD_BIN" \' <<<"$body" || true)
