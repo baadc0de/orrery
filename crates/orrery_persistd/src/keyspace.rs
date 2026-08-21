@@ -9,7 +9,7 @@
 //! Normative source: docs/08-persistence.md §6, docs/12-world-seeding.md §9.2,
 //! §9.3, §11.1, and docs/adr/0011-persistence.md.
 
-use orrery_protocol::{AccountId, AssetId, CellId, GridId, ItemUid, PersistId};
+use orrery_protocol::{AccountId, AssetId, CellId, GridId, ItemUid, NodeId, PersistId};
 
 use crate::actor::Tombstone;
 use crate::checkpoint::CheckpointError;
@@ -971,6 +971,418 @@ pub fn player_loc_key(account: AccountId) -> [u8; 10] {
 }
 
 // ---------------------------------------------------------------------------
+// Identity family: `id/{…}` — `da` accounts, `db` bindings, `dh` history
+// ---------------------------------------------------------------------------
+//
+// D31's account subspace. One family byte, `b'd'`, spanning `[b"d", b"e")`,
+// with three sub-spans discriminated by an ASCII byte at a fixed offset:
+//
+//   da ‖ account:u64 BE                       10 B  ->  AccountRow
+//   db ‖ node:[u8;32]                         34 B  ->  BindingRow
+//   dh ‖ node:[u8;32] ‖ versionstamp:[u8;10]  44 B  ->  BindingHistoryRow
+//
+// `orrery_identity` (D12) is the sole writer of every row here. The gateway is
+// the only durable reader, and it reads FoundationDB directly rather than
+// calling identity on the intent path, because an identity outage must never
+// be a play outage (docs/09-services-and-ops.md §8's grace rule). The
+// coordinator reads nothing: every candidate it seeds a witness set from
+// already holds a token-verified session with it, so its account is in hand
+// without a lookup (D31 (d)).
+//
+// **Why one byte carries three families.** Seventeen of the twenty-six
+// lowercase bytes were already taken as family prefixes before this record, and
+// six more are spoken for as exclusive range ends, leaving `d`, `y` and `z`
+// against four documented-but-unbuilt families. Taking one byte each runs out.
+// So `id/` spends one and discriminates inside it, which is the pattern the
+// ledger already established with `lb`/`li`/`lr`; sub-span ordering
+// `a < b < h` makes the three scans disjoint by construction, exactly as
+// `lb < li < lr` does. All three are written by one service, in one
+// transaction, under one retention rule, so there is nothing a second byte
+// would separate that is not already together.
+//
+// The discriminator is an ASCII byte at a **fixed offset**, never the high byte
+// of an id. That is the discipline [`lease_key`] does not observe — it puts a
+// `GridId`'s most significant byte where the ledger puts `b`/`i`/`r`, so a
+// `grid.0 >= 0x6200_0000` would land a lease row inside `ledger/bal/`. Latent
+// today, because grid ids are small and no full-family scan of either exists,
+// and tracked as its own on-disk-format question rather than fixed here.
+//
+// **Why the reverse index is inside the family and not beside it.** The only
+// direction any consumer reads is node -> account: a gateway deriving `E(I)`
+// asks `owner(n)` for the <= 7 announced NodeIds, and never asks which nodes an
+// account holds. Answering that from `da` alone is an O(accounts) range read —
+// at 10^7 accounts, a full-subspace scan on a path D16 budgets at 10 ms. `db`
+// makes it a point read. A *second family* would cost the same point read,
+// spend one of the three remaining clean bytes, and — the load-bearing half —
+// separate two rows that must be written in one transaction. A reverse index
+// maintained in a second transaction has a window in which `db` names an
+// account `da` no longer binds, and under D31 (f) that is a *wrong* answer
+// rather than a miss: a miss excludes, a wrong answer admits (D31 (b)).
+//
+// **Why the history is keyed by node rather than by account.** Same reason.
+// The audit's question is `owner_t(n)` for the <= 7 announced NodeIds, so a
+// node-keyed log answers it with <= 7 bounded, contiguous range reads. The
+// per-account question — which devices has this account ever held — is a
+// support and abuse-investigation query that no hot path makes, and it is
+// served offline by scanning the same rows rather than by a second log that
+// would be a second thing to keep consistent (D31 (b)).
+//
+// **Why no `GridId`, when D22 says a grid id stays a key discriminator.** D22
+// scopes *cell-id spaces*: a `CellId` is grid-relative, so two grids'
+// identically numbered cells must not share a row. An `AccountId` is not a cell
+// id and has no grid — an account is one cluster-global identity that plays
+// wherever it likes, and a per-grid account record would be several accounts
+// wearing one id. Every other account-keyed family in this module is grid-free
+// for the same reason: `player/{account_id}`, `ledger/bal/{account}/{asset}`
+// and `provisional/{account}`. D22 is satisfied by there being no cell id here
+// to be ambiguous.
+//
+// **What this subspace does not do.** It does not replace [`AttestRow`] as the
+// audit's source for `E(I)` (D31 (h)): the recorded eligible vector answers
+// "given that list, did you draw correctly", and `dh` answers the separate
+// question "was that list consistent with the bindings that existed at the
+// time" — a cross-check, and one whose disagreements mean nothing inside the
+// reader's cache staleness bound.
+//
+// **Nothing writes these rows yet.** There is no `orrery_identity` crate; D31
+// decides bytes, directions and semantics and defers the writer. Until one
+// exists the subspace is empty, every binding lookup misses, and D31 (f)'s
+// fail-closed rule excludes every announced NodeId a gateway is not directly
+// connected to — a real behaviour change on an empty subspace, and the reason
+// the enforcement switch defaulting off matters more after this than before it.
+
+/// Maximum NodeIds bound to one account (D31 (g), proposed as a D16 row).
+///
+/// This is what bounds [`AccountRow`]: eight inline NodeIds put the row at
+/// ~282 B, ~2.8 GB across 10^7 accounts. Enforced at identity, on the write
+/// path; stated here because it is the reason the row is safe to read whole.
+pub const MAX_BOUND_NODES_PER_ACCOUNT: usize = 8;
+
+/// How long a `dh` row is retained before hard deletion: 90 days (D31 (g) and
+/// its resolved question 2, proposed as a D16 row).
+///
+/// The horizon is set by the strike and appeal window, not by the audit
+/// cross-check — [`AttestRow`] is swept an hour after its intent commits, so no
+/// attestation-side artifact survives even a day. D16's 14-day strike half-life
+/// is what justifies 90: a strike retains 2^(-90/14) ~= 1.2 % of its weight by
+/// then, so the history outlives every dispute that could cite it.
+///
+/// Expiry is a **pure range delete** with no read-modify-write, and that is
+/// what [`AccountRow::binding_event_count`] and [`AccountRow::first_event_ms`]
+/// buy: the lifetime-churn signal a dispute actually asks for is folded into
+/// the account row at write time and survives the deletion of the rows it was
+/// folded from, at ~12 B per account.
+pub const BINDING_HISTORY_RETENTION_MS: u64 = 90 * 24 * 60 * 60 * 1000;
+
+/// Key for an account record: `id/da/{account_id}`.
+///
+/// `'d'`, then the sub-space discriminator `'a'`, then the 8-byte [`AccountId`]
+/// big-endian so accounts sort by id and the sub-space is one contiguous range.
+///
+/// **Not to be confused with [`player_key`]**, which is also account-keyed.
+/// That row is the *game* profile written by the intent path; this one is the
+/// *identity* record written by identity alone. Different families, different
+/// writers, different retention; the only thing they share is the id in the
+/// key.
+#[must_use]
+pub fn account_key(account: AccountId) -> [u8; 10] {
+    let mut key = [0u8; 10];
+    key[0] = b'd';
+    key[1] = b'a';
+    key[2..10].copy_from_slice(&account.0.to_be_bytes());
+    key
+}
+
+/// Key for the reverse binding index: `id/db/{node_id}` -> [`BindingRow`].
+///
+/// The 32 raw bytes of the NodeId, which is an ed25519 public key
+/// (`orrery_protocol::identity`), so the key *is* the identity and no hashing
+/// or truncation stands between a lookup and its row. Written in the same
+/// FoundationDB transaction as the [`account_key`] row it derives from
+/// (D31 (b)), so the two are never observed disagreeing.
+#[must_use]
+pub fn binding_key(node: &NodeId) -> [u8; 34] {
+    let mut key = [0u8; 34];
+    key[0] = b'd';
+    key[1] = b'b';
+    key[2..34].copy_from_slice(node.as_bytes());
+    key
+}
+
+/// Key for one append-only binding event:
+/// `id/dh/{node_id}/{versionstamp}` -> [`BindingHistoryRow`].
+///
+/// The returned key carries 10 zero bytes at the versionstamp position (byte
+/// offset [`BINDING_HISTORY_VERSIONSTAMP_OFFSET`]); write it with
+/// `MutationType::SetVersionstampedKey` and the parameter
+/// [`binding_history_versionstamped_key`] builds, so FDB substitutes the commit
+/// versionstamp. Ordering within a node's span is therefore commit order and no
+/// clock is involved — the property [`ledger_receipt_key`] relies on, and for
+/// the same reason: `at_ms` in the value is the writer's clock, and it is
+/// evidence rather than an index.
+///
+/// **One per transaction.** Every versionstamped write in a transaction gets
+/// the same 10 bytes, so two events for one node in one transaction would be
+/// one key written twice. A bind and an unbind are separate credentialed
+/// actions and therefore separate transactions, so this bounds batching and
+/// not the model.
+#[must_use]
+pub fn binding_history_key(node: &NodeId) -> [u8; 44] {
+    let mut key = [0u8; 44];
+    key[0] = b'd';
+    key[1] = b'h';
+    key[2..34].copy_from_slice(node.as_bytes());
+    // bytes 34..44: the zero placeholder the versionstamp is written into.
+    key
+}
+
+/// Byte offset of the versionstamp placeholder inside [`binding_history_key`].
+///
+/// Immediately after the two discriminator bytes and the 32-byte node id, so a
+/// node's events sort by commit version and by nothing else.
+pub const BINDING_HISTORY_VERSIONSTAMP_OFFSET: u32 = 34;
+
+/// The [`binding_history_key`] in the exact form
+/// `MutationType::SetVersionstampedKey` wants it: the 44-byte key followed by
+/// the placeholder offset as a little-endian `u32`.
+///
+/// Built here rather than at the call site for the reason
+/// [`ledger_receipt_versionstamped_key`] gives: the offset and the placeholder
+/// are two halves of one fact, and a caller that hardcoded `34` would keep
+/// compiling after the placeholder moved and would corrupt the node id instead
+/// of the versionstamp.
+#[must_use]
+pub fn binding_history_versionstamped_key(node: &NodeId) -> [u8; 48] {
+    let mut param = [0u8; 48];
+    param[..44].copy_from_slice(&binding_history_key(node));
+    param[44..48].copy_from_slice(&BINDING_HISTORY_VERSIONSTAMP_OFFSET.to_le_bytes());
+    param
+}
+
+/// Decode an `id/dh/…` key back into its `(node, versionstamp)` components.
+///
+/// The inverse of [`binding_history_key`] once FDB has substituted the
+/// versionstamp. Returns `None` for any key that is not exactly 44 bytes
+/// beginning `d`, `h`, and `None` when the 32 node bytes are not a valid
+/// ed25519 public key — a NodeId is a curve point, so not every 32-byte string
+/// is one.
+///
+/// This is what serves the per-account query D31 (b) sends offline: scan the
+/// `dh` sub-space, take the account from the value and the device from the key.
+#[must_use]
+pub fn decode_binding_history_key(key: &[u8]) -> Option<(NodeId, [u8; 10])> {
+    if key.len() != 44 || key[0] != b'd' || key[1] != b'h' {
+        return None;
+    }
+    let node = NodeId::from_bytes(key[2..34].try_into().ok()?).ok()?;
+    let versionstamp: [u8; 10] = key[34..44].try_into().ok()?;
+    Some((node, versionstamp))
+}
+
+/// The first byte of the whole `id/` family span.
+#[must_use]
+pub fn id_range_start() -> Vec<u8> {
+    vec![b'd']
+}
+
+/// The exclusive end of the whole `id/` family span (one byte past `d`).
+///
+/// `b'e'` is also the `epoch/` prefix, which is the correct exclusive bound
+/// here for the reason [`epoch_range_end`] and [`provisional_range_end`] both
+/// give: the families are adjacent and disjoint, so one past the end of `'d'`
+/// is the first key of the next family. An exclusive bound of `[b'e']` cannot
+/// include any key `e ‖ …`, because `[0x65] < [0x65, …]`.
+#[must_use]
+pub fn id_range_end() -> Vec<u8> {
+    vec![b'e']
+}
+
+/// The first key of the `id/da/…` account sub-space.
+#[must_use]
+pub fn account_range_start() -> Vec<u8> {
+    vec![b'd', b'a']
+}
+
+/// The exclusive end of the `id/da/…` account sub-space.
+///
+/// `b"db"` is the binding sub-space's first key, adjacent and disjoint — the
+/// same construction the family bounds use one level up.
+#[must_use]
+pub fn account_range_end() -> Vec<u8> {
+    vec![b'd', b'b']
+}
+
+/// The first key of the `id/db/…` binding sub-space.
+#[must_use]
+pub fn binding_range_start() -> Vec<u8> {
+    vec![b'd', b'b']
+}
+
+/// The exclusive end of the `id/db/…` binding sub-space.
+///
+/// `b"dc"` names nothing: `c` is the gap the discriminators `a < b < h`
+/// deliberately leave, so this bound is one past every binding key and short of
+/// every history key.
+#[must_use]
+pub fn binding_range_end() -> Vec<u8> {
+    vec![b'd', b'c']
+}
+
+/// The first key of the `id/dh/…` binding-history sub-space.
+#[must_use]
+pub fn binding_history_range_start() -> Vec<u8> {
+    vec![b'd', b'h']
+}
+
+/// The exclusive end of the `id/dh/…` binding-history sub-space.
+///
+/// `b"di"` is one past every history key and still inside the `d` family, so a
+/// sweep of the history never reaches another family's rows even though the
+/// family's own end bound would also be correct arithmetic.
+#[must_use]
+pub fn binding_history_range_end() -> Vec<u8> {
+    vec![b'd', b'i']
+}
+
+/// The first key of one node's `id/dh/{node_id}/…` span.
+///
+/// The 34-byte prefix with no versionstamp, which sorts at or before every
+/// event for that node. This and [`binding_history_node_range_end`] are the
+/// bounded, contiguous read D31 (b) keys the history by node to get.
+#[must_use]
+pub fn binding_history_node_range_start(node: &NodeId) -> Vec<u8> {
+    let mut key = Vec::with_capacity(34);
+    key.extend_from_slice(b"dh");
+    key.extend_from_slice(node.as_bytes());
+    key
+}
+
+/// The 32 node bytes incremented as one big-endian integer, or `None` when
+/// they are all `0xFF` and there is no successor.
+///
+/// Split out from [`binding_history_node_range_end`] so the top of the node
+/// space is testable at all. `0xFF…FF` *is* a well-formed [`NodeId`] encoding —
+/// it decompresses, checked — but reaching it means finding a secret key whose
+/// public key is that exact point, so no test can construct the case through
+/// the public API and no fallback branch would ever be exercised. Here it is
+/// one call.
+fn next_node_bytes(node: &[u8; 32]) -> Option<[u8; 32]> {
+    let mut next = *node;
+    for byte in next.iter_mut().rev() {
+        let (incremented, carry) = byte.overflowing_add(1);
+        *byte = incremented;
+        if !carry {
+            return Some(next);
+        }
+    }
+    None
+}
+
+/// The exclusive end of one node's `id/dh/{node_id}/…` span.
+///
+/// The first key of the *next* node's span — the 32 node bytes incremented as a
+/// big-endian integer — which sorts after every 44-byte key sharing this node's
+/// prefix and before every key of any later node. At the top of the node space
+/// the bound is the end of the whole sub-space, exactly as [`world_range_end`]
+/// falls back to the next family at the top of its own.
+#[must_use]
+pub fn binding_history_node_range_end(node: &NodeId) -> Vec<u8> {
+    let Some(next) = next_node_bytes(node.as_bytes()) else {
+        return binding_history_range_end();
+    };
+    let mut key = Vec::with_capacity(34);
+    key.extend_from_slice(b"dh");
+    key.extend_from_slice(&next);
+    key
+}
+
+/// The value stored at [`account_key`]: D31's account record.
+///
+/// Postcard-encoded, like [`IntentRow`] and [`ItemRow`], and for the same
+/// reason: one small, versionless value written and read inside this cluster.
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub struct AccountRow {
+    /// The NodeIds currently bound to this account, at most
+    /// [`MAX_BOUND_NODES_PER_ACCOUNT`] of them.
+    ///
+    /// Inline rather than a sub-family: the cap bounds the row, and the forward
+    /// direction is read whole or not at all. The *reverse* direction is the
+    /// one that needs an index, and it has one — [`binding_key`].
+    pub bound_nodes: Vec<NodeId>,
+    /// Bumped on every binding change, and the half of a reader's cache
+    /// validity that is not a clock (D31 (e)).
+    ///
+    /// A gateway's binding cache entry is valid while it is younger than
+    /// `T_stale` **and** this counter has not moved since the fill; identity
+    /// pushes the new value on a change. Losing the push channel degrades the
+    /// cache to TTL-only, which is safe precisely because a miss excludes.
+    pub binding_epoch: u32,
+    /// Unix milliseconds at which the account was created.
+    ///
+    /// Carried because it is the only durable answer to D28 clause (e)'s
+    /// *skipped* account-age row — the session token has no such field. Whether
+    /// a gateway should read it, or whether identity should instead put an age
+    /// bucket in the token, is D31's open question 5 and is not settled here;
+    /// the row carries the fact either way.
+    pub created_ms: u64,
+    /// Lifetime count of binding events appended for this account, maintained
+    /// in the same transaction that appends the `dh` row (D31, resolved
+    /// question 2).
+    ///
+    /// A write-time fold, not a live count of surviving rows: it is never
+    /// decremented when history expires, which is exactly what makes expiry a
+    /// pure range delete. It is also the churn signal a dispute asks for, and
+    /// it outlives the rows it was folded from.
+    pub binding_event_count: u32,
+    /// Unix milliseconds of this account's **first** binding event, kept for
+    /// the same reason and with the same discipline as
+    /// [`Self::binding_event_count`]: together they still say "this account has
+    /// rebound N times since T" after every row that would have proved it has
+    /// been deleted.
+    pub first_event_ms: u64,
+}
+
+/// The value stored at [`binding_key`]: the current owner of one NodeId.
+///
+/// Deleted, not tombstoned, when the binding is released — unbinding is
+/// immediate (docs/09-services-and-ops.md §8) — and the released NodeId's
+/// lookup becomes a miss. Under D31 (f) a miss excludes, so an attacker gains
+/// nothing by shedding a NodeId just before submitting.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct BindingRow {
+    /// The account this NodeId is currently bound to.
+    pub account: AccountId,
+    /// Unix milliseconds at which the binding was established.
+    pub bound_at_ms: u64,
+}
+
+/// Which way a binding event moved (D31 (c)).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum BindKind {
+    /// The NodeId became bound to the account.
+    Bind,
+    /// The NodeId was released from the account.
+    Unbind,
+}
+
+/// The value stored at [`binding_history_key`]: one append-only binding event.
+///
+/// `da` and `db` are current-state rows and are mutated; this is the log they
+/// are a fold of, and it is never updated in place (D31 (c)). It is what makes
+/// `E(I)` reconstructible at all — up to the reader's cache staleness bound,
+/// which D31 (c) is explicit is *not* exactness.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct BindingHistoryRow {
+    /// The account the event bound the node to, or released it from.
+    pub account: AccountId,
+    /// Which way the event moved.
+    pub kind: BindKind,
+    /// Unix milliseconds on identity's clock, as evidence. The row's *order*
+    /// comes from the key's versionstamp; this field is never an index.
+    pub at_ms: u64,
+}
+
+// ---------------------------------------------------------------------------
 // PersistId allocator family: `pid/next`
 // ---------------------------------------------------------------------------
 //
@@ -1832,85 +2244,724 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // Identity family (D31): `da` accounts, `db` bindings, `dh` history
+    // -----------------------------------------------------------------------
+
+    /// A deterministic, valid [`NodeId`] from a one-byte discriminant.
+    ///
+    /// Derived from a secret key rather than written down, because a NodeId is
+    /// a compressed ed25519 point and most 32-byte strings are not one — the
+    /// same helper `orrery_protocol::identity`'s tests use. Its byte *order* is
+    /// therefore not the order of `n`, which is why the span test below sorts.
+    fn node(n: u8) -> NodeId {
+        let mut seed = [0u8; 32];
+        seed[0] = n;
+        iroh_base::SecretKey::from_bytes(&seed).public()
+    }
+
+    #[test]
+    fn id_keys_have_the_widths_and_discriminators_d31_specifies() {
+        let account = account_key(AccountId::new(0x0102_0304_0506_0708));
+        assert_eq!(account.len(), 10, "da ‖ account:u64 BE");
+        assert_eq!(&account[..2], b"da");
+        assert_eq!(
+            u64::from_be_bytes(account[2..10].try_into().unwrap()),
+            0x0102_0304_0506_0708,
+            "account id is big-endian, so accounts sort by id"
+        );
+
+        let subject = node(0x11);
+        let binding = binding_key(&subject);
+        assert_eq!(binding.len(), 34, "db ‖ node:[u8;32]");
+        assert_eq!(&binding[..2], b"db");
+        assert_eq!(
+            &binding[2..],
+            subject.as_bytes(),
+            "the key is the node id itself — no hashing, no truncation"
+        );
+
+        let history = binding_history_key(&subject);
+        assert_eq!(
+            history.len(),
+            44,
+            "dh ‖ node:[u8;32] ‖ versionstamp:[u8;10]"
+        );
+        assert_eq!(&history[..2], b"dh");
+        assert_eq!(&history[2..34], subject.as_bytes());
+        assert_eq!(
+            &history[34..],
+            &[0u8; 10],
+            "the versionstamp is a zero placeholder until FDB substitutes it"
+        );
+    }
+
+    #[test]
+    fn id_sub_spans_are_ordered_disjoint_and_inside_the_family() {
+        let start = id_range_start();
+        let end = id_range_end();
+        assert_eq!(start, vec![b'd']);
+        assert_eq!(end, vec![b'e'], "one past `d`; also the `epoch/` start");
+        assert!(
+            start.as_slice() < end.as_slice(),
+            "an exclusive bound of [0x65] cannot include any key `e ‖ …`"
+        );
+
+        // `a < b < h` makes the three scans disjoint by construction, exactly
+        // as `lb < li < lr` does for the ledger.
+        let spans = [
+            (account_range_start(), account_range_end(), "da"),
+            (binding_range_start(), binding_range_end(), "db"),
+            (
+                binding_history_range_start(),
+                binding_history_range_end(),
+                "dh",
+            ),
+        ];
+        for (lo, hi, name) in &spans {
+            assert!(lo.as_slice() < hi.as_slice(), "{name} span is non-empty");
+            assert!(
+                start.as_slice() <= lo.as_slice() && hi.as_slice() <= end.as_slice(),
+                "{name} sits inside the `id/` family span"
+            );
+        }
+        for (i, (_, hi, a)) in spans.iter().enumerate() {
+            for (lo, _, b) in spans.iter().skip(i + 1) {
+                assert!(
+                    hi.as_slice() <= lo.as_slice(),
+                    "{a} must end at or before {b} begins"
+                );
+            }
+        }
+
+        // And the concrete keys land where the spans say they do — with the
+        // extreme account id, because `da` is the sub-space a maximal key could
+        // push out of its own bound.
+        let account = account_key(AccountId::new(u64::MAX)).to_vec();
+        let binding = binding_key(&node(0xEE)).to_vec();
+        let history = binding_history_key(&node(0x00)).to_vec();
+        assert!(account_range_start() <= account && account < account_range_end());
+        assert!(binding_range_start() <= binding && binding < binding_range_end());
+        assert!(binding_history_range_start() <= history && history < binding_history_range_end());
+        assert!(account < binding && binding < history, "da < db < dh");
+    }
+
+    #[test]
+    fn binding_history_node_span_brackets_exactly_that_node() {
+        // Sorted by key bytes, not by discriminant: a NodeId's byte order is
+        // whatever the curve gives it.
+        let mut nodes = [node(1), node(2), node(3)];
+        nodes.sort_by_key(|n| *n.as_bytes());
+        let [lower, subject, upper] = nodes;
+
+        let lo = binding_history_node_range_start(&subject);
+        let hi = binding_history_node_range_end(&subject);
+
+        assert_eq!(lo.len(), 34);
+        assert_eq!(hi.len(), 34, "the end is the next node's 34-byte prefix");
+        assert!(lo.as_slice() < hi.as_slice());
+
+        // Every 44-byte key for this node, at either extreme of the
+        // versionstamp space, is inside the span.
+        let mut oldest = binding_history_key(&subject).to_vec();
+        let mut newest = binding_history_key(&subject).to_vec();
+        newest[34..].copy_from_slice(&[0xFF; 10]);
+        for key in [&mut oldest, &mut newest] {
+            assert!(
+                lo.as_slice() <= key.as_slice() && key.as_slice() < hi.as_slice(),
+                "a versionstamped row for this node is inside its own span"
+            );
+        }
+
+        // Neighbouring nodes are outside it, on both sides.
+        let below = binding_history_key(&lower).to_vec();
+        let above = binding_history_key(&upper).to_vec();
+        assert!(below.as_slice() < lo.as_slice());
+        assert!(above.as_slice() >= hi.as_slice());
+
+        // And the whole span stays inside the `dh` sub-space.
+        assert!(binding_history_range_start() <= lo);
+        assert!(hi <= binding_history_range_end());
+    }
+
+    #[test]
+    fn next_node_bytes_carries_and_saturates() {
+        assert_eq!(next_node_bytes(&[0x11; 32]).unwrap()[31], 0x12);
+        assert_eq!(&next_node_bytes(&[0x11; 32]).unwrap()[..31], &[0x11; 31]);
+
+        let mut trailing_ff = [0x00; 32];
+        trailing_ff[30] = 0x07;
+        trailing_ff[31] = 0xFF;
+        let carried = next_node_bytes(&trailing_ff).unwrap();
+        assert_eq!(carried[30], 0x08, "the carry propagates left");
+        assert_eq!(carried[31], 0x00);
+
+        assert!(
+            next_node_bytes(&[0xFF; 32]).is_none(),
+            "no successor at the top of the node space; the caller falls back \
+             to the sub-space end"
+        );
+    }
+
+    #[test]
+    fn binding_history_versionstamp_parameter_names_its_own_placeholder() {
+        let subject = node(0x11);
+        let param = binding_history_versionstamped_key(&subject);
+        assert_eq!(param.len(), 48, "44-byte key ‖ 4-byte LE offset");
+        assert_eq!(&param[..44], binding_history_key(&subject).as_slice());
+
+        let offset = u32::from_le_bytes(param[44..48].try_into().unwrap());
+        assert_eq!(offset, BINDING_HISTORY_VERSIONSTAMP_OFFSET);
+        assert_eq!(offset, 34, "immediately after `dh` and the 32 node bytes");
+        assert_eq!(
+            &param[offset as usize..44],
+            &[0u8; 10],
+            "the offset must name the zero placeholder, not the node id"
+        );
+    }
+
+    #[test]
+    fn binding_history_key_round_trips_through_its_decoder() {
+        let subject = node(0x11);
+        let mut key = binding_history_key(&subject).to_vec();
+        let stamp = [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x00, 0x09];
+        key[34..].copy_from_slice(&stamp);
+
+        let (decoded, versionstamp) =
+            decode_binding_history_key(&key).expect("a well-formed dh key decodes");
+        assert_eq!(decoded, subject);
+        assert_eq!(versionstamp, stamp);
+
+        // Everything that is not a `dh` key is refused rather than
+        // misinterpreted: wrong family, wrong sub-space, wrong width, and a
+        // node id that is not a curve point.
+        assert!(decode_binding_history_key(&[]).is_none());
+        assert!(decode_binding_history_key(&key[..43]).is_none());
+        assert!(decode_binding_history_key(&binding_key(&subject)).is_none());
+        assert!(decode_binding_history_key(&account_key(AccountId::new(1))).is_none());
+        let mut wrong_family = key.clone();
+        wrong_family[0] = b'e';
+        assert!(decode_binding_history_key(&wrong_family).is_none());
+        let mut not_a_point = key.clone();
+        // `[0x02; 32]` does not decompress to a curve point. Checked rather
+        // than assumed: roughly half of all 32-byte strings do not, and a
+        // decoder that swallowed one would hand a caller a node that cannot
+        // exist.
+        not_a_point[2..34].copy_from_slice(&[0x02; 32]);
+        assert!(NodeId::from_bytes(&[0x02; 32]).is_err());
+        assert!(
+            decode_binding_history_key(&not_a_point).is_none(),
+            "a NodeId is a curve point, so not every 32-byte string is one"
+        );
+    }
+
+    #[test]
+    fn id_rows_round_trip_through_postcard() {
+        let row = AccountRow {
+            bound_nodes: (0..MAX_BOUND_NODES_PER_ACCOUNT)
+                .map(|n| node(u8::try_from(n).unwrap() + 0x11))
+                .collect(),
+            binding_epoch: 7,
+            created_ms: 1_700_000_000_000,
+            binding_event_count: 3,
+            first_event_ms: 1_600_000_000_000,
+        };
+        let bytes = postcard::to_allocvec(&row).expect("encode");
+        assert_eq!(postcard::from_bytes::<AccountRow>(&bytes).unwrap(), row);
+        // D31 (c) prices the row at ~282 B with eight NodeIds inline; the
+        // budget that matters is that it stays a bounded, readable-whole row.
+        assert!(
+            bytes.len() < 512,
+            "an account row is {} B; D31 (c) budgets ~282 B and \
+             MAX_BOUND_NODES_PER_ACCOUNT is what bounds it",
+            bytes.len()
+        );
+
+        let binding = BindingRow {
+            account: AccountId::new(42),
+            bound_at_ms: 1_700_000_000_000,
+        };
+        let bytes = postcard::to_allocvec(&binding).expect("encode");
+        assert_eq!(postcard::from_bytes::<BindingRow>(&bytes).unwrap(), binding);
+
+        for kind in [BindKind::Bind, BindKind::Unbind] {
+            let event = BindingHistoryRow {
+                account: AccountId::new(42),
+                kind,
+                at_ms: 1_700_000_000_000,
+            };
+            let bytes = postcard::to_allocvec(&event).expect("encode");
+            assert_eq!(
+                postcard::from_bytes::<BindingHistoryRow>(&bytes).unwrap(),
+                event
+            );
+        }
+    }
+
+    #[test]
+    fn account_keys_are_adjacent_and_ordered_for_adjacent_account_ids() {
+        // The property the big-endian encoding exists for: `da` is one
+        // contiguous, id-ordered range, so a scan of the account sub-space
+        // walks accounts in id order and an id-bounded sub-scan is a range.
+        let keys: Vec<[u8; 10]> = (0u64..4).map(|n| account_key(AccountId::new(n))).collect();
+        for pair in keys.windows(2) {
+            assert!(pair[0] < pair[1], "account keys sort by account id");
+            let mut expected = pair[0];
+            expected[9] += 1;
+            assert_eq!(
+                pair[1], expected,
+                "adjacent account ids are adjacent keys — nothing can sort \
+                 between them"
+            );
+        }
+
+        // The carry crosses byte boundaries the way big-endian promises.
+        assert!(account_key(AccountId::new(0xFF)) < account_key(AccountId::new(0x100)));
+        assert!(account_key(AccountId::new(u64::MAX - 1)) < account_key(AccountId::new(u64::MAX)));
+    }
+
+    #[test]
+    fn id_range_helpers_span_the_family_and_nothing_beyond_it() {
+        let start = id_range_start();
+        let end = id_range_end();
+
+        // Every key the family can produce is inside the span, at both
+        // extremes of every sub-space.
+        let mut inside = vec![
+            account_key(AccountId::new(0)).to_vec(),
+            account_key(AccountId::new(u64::MAX)).to_vec(),
+            binding_key(&node(1)).to_vec(),
+            binding_history_key(&node(1)).to_vec(),
+        ];
+        let mut newest = binding_history_key(&node(1)).to_vec();
+        newest[34..].copy_from_slice(&[0xFF; 10]);
+        inside.push(newest);
+        for key in &inside {
+            assert!(
+                start.as_slice() <= key.as_slice() && key.as_slice() < end.as_slice(),
+                "an `id/` key must be inside [{start:?}, {end:?})"
+            );
+        }
+
+        // And no neighbouring family's key is. `c` is `ckpt/` and `e` is
+        // `epoch/`: the span must touch neither.
+        let shard = CellId::from_bits(SHARD).unwrap();
+        let outside = [
+            ckpt_key(GRID, shard).to_vec(),
+            epoch_key(GRID, shard, 0).to_vec(),
+            epoch_handle_key(0).to_vec(),
+        ];
+        for key in &outside {
+            assert!(
+                key.as_slice() < start.as_slice() || end.as_slice() <= key.as_slice(),
+                "a neighbouring family's key must be outside the `id/` span"
+            );
+        }
+    }
+
+    #[test]
+    fn an_account_with_no_bound_nodes_encodes_and_decodes() {
+        // An account exists before its first device binds — identity mints the
+        // `da` row at account creation, and D31 (f) then excludes every NodeId
+        // it cannot resolve, which is all of them until a bind happens.
+        let fresh = AccountRow {
+            created_ms: 1_700_000_000_000,
+            ..AccountRow::default()
+        };
+        assert!(fresh.bound_nodes.is_empty());
+        let bytes = postcard::to_allocvec(&fresh).expect("encode");
+        assert_eq!(postcard::from_bytes::<AccountRow>(&bytes).unwrap(), fresh);
+        assert_eq!(fresh.binding_event_count, 0);
+        assert_eq!(fresh.first_event_ms, 0, "no first event yet");
+    }
+
+    #[test]
+    fn bound_node_order_is_preserved_but_is_not_load_bearing() {
+        // Two bindings, because one proves nothing about order.
+        let (first, second) = (node(1), node(2));
+        let row = AccountRow {
+            bound_nodes: vec![first, second],
+            ..AccountRow::default()
+        };
+        let reversed = AccountRow {
+            bound_nodes: vec![second, first],
+            ..row.clone()
+        };
+
+        // The encoding is faithful: a round-trip returns the vector it was
+        // given, in the order it was given.
+        for original in [&row, &reversed] {
+            let bytes = postcard::to_allocvec(original).expect("encode");
+            assert_eq!(
+                &postcard::from_bytes::<AccountRow>(&bytes).unwrap(),
+                original
+            );
+        }
+
+        // But order carries no meaning, and this is the half worth pinning.
+        // D31 makes `bound_nodes` a *set* — the questions asked of it are
+        // "is this node bound" and "how many are bound", and the reverse
+        // direction, which is the only one any consumer reads, goes through
+        // `db` and never through this vector at all.
+        //
+        // Contrast [`AttestRow::eligible`], where order *is* load-bearing and
+        // says so: the audit recomputes the draw over that exact vector, so a
+        // normalized copy would no longer be the object the gateway drew over.
+        // Nothing recomputes anything over `bound_nodes`.
+        let as_set = |r: &AccountRow| {
+            r.bound_nodes
+                .iter()
+                .map(|n| *n.as_bytes())
+                .collect::<std::collections::BTreeSet<_>>()
+        };
+        assert_ne!(row.bound_nodes, reversed.bound_nodes);
+        assert_eq!(
+            as_set(&row),
+            as_set(&reversed),
+            "the two rows bind the same devices; only the order differs"
+        );
+        for node in &reversed.bound_nodes {
+            assert!(
+                row.bound_nodes.contains(node),
+                "membership, not position, is what a reader of this field asks"
+            );
+        }
+    }
+
+    #[test]
+    fn binding_history_retention_is_ninety_days() {
+        // D31 resolved question 2. The value is load-bearing twice over: it is
+        // what makes the history outlive every dispute a strike could raise
+        // (D16's 14-day half-life leaves ~1.2 % of a strike's weight at 90 d),
+        // and it is what bounds the adversarial storage term in D31 (c).
+        assert_eq!(BINDING_HISTORY_RETENTION_MS, 7_776_000_000);
+        assert_eq!(BINDING_HISTORY_RETENTION_MS / (24 * 60 * 60 * 1000), 90);
+    }
+
+    // -----------------------------------------------------------------------
     // Pairwise disjointness: every key family's range is non-overlapping
     // -----------------------------------------------------------------------
 
-    /// Each family is described by its first-byte prefix and an (inclusive)
-    /// maximum key. Families are disjoint iff for every pair (a, b):
+    /// One registered key family: its one-byte prefix, the name it goes by,
+    /// and a sample key built by the family's **own** constructor.
+    struct Family {
+        prefix: u8,
+        name: &'static str,
+        sample: Vec<u8>,
+    }
+
+    /// Every key family this module defines, in prefix order.
+    ///
+    /// **One table, not two.** Until D31 this registry was two arrays — the
+    /// prefixes in one, the sample keys in another — correlated by nothing but
+    /// position, and a family added to one and not the other still passed. A
+    /// family is one row here and cannot be half-registered.
+    ///
+    /// The sample comes from the family's own constructor rather than being
+    /// spelled out, so a constructor that changes its prefix moves this table
+    /// with it instead of being contradicted by it.
+    fn registered_families() -> Vec<Family> {
+        let shard = CellId::from_bits(SHARD).unwrap();
+        vec![
+            Family {
+                prefix: b'a',
+                name: "fence/actor",
+                sample: fence_key(GRID, shard).to_vec(),
+            },
+            Family {
+                prefix: b'c',
+                name: "ckpt",
+                sample: ckpt_key(GRID, shard).to_vec(),
+            },
+            Family {
+                prefix: b'd',
+                name: "id (da/db/dh)",
+                sample: account_key(AccountId::new(1)).to_vec(),
+            },
+            Family {
+                prefix: b'e',
+                name: "epoch",
+                sample: epoch_key(GRID, shard, 3).to_vec(),
+            },
+            Family {
+                prefix: b'f',
+                name: "epoch-handle",
+                sample: epoch_handle_key(1 << 48).to_vec(),
+            },
+            Family {
+                prefix: b'g',
+                name: "attest",
+                sample: attest_key(42).to_vec(),
+            },
+            Family {
+                prefix: b'i',
+                name: "intent",
+                sample: intent_key(42).to_vec(),
+            },
+            Family {
+                prefix: b'k',
+                name: "chunk",
+                sample: chunk_key(GRID, shard, 0).to_vec(),
+            },
+            Family {
+                prefix: b'l',
+                name: "ledger (bal/item/receipt)",
+                sample: ledger_bal_key(AccountId::new(1), AssetId::new(1)).to_vec(),
+            },
+            Family {
+                prefix: b'm',
+                name: "lease-cell",
+                sample: lease_cell_key(GRID, shard, PersistId::new(1)).to_vec(),
+            },
+            Family {
+                prefix: b'n',
+                name: "pid/next",
+                sample: pid_next_key(GridId::ROOT).to_vec(),
+            },
+            Family {
+                prefix: b'o',
+                name: "lease-location",
+                sample: lease_location_key(GRID, PersistId::new(1)).to_vec(),
+            },
+            Family {
+                prefix: b'p',
+                name: "seedprog",
+                sample: seedprog_key([0xDE; 8], GRID, shard).to_vec(),
+            },
+            Family {
+                prefix: b'r',
+                name: "provisional",
+                sample: provisional_key(AccountId::new(1)).to_vec(),
+            },
+            Family {
+                prefix: b's',
+                name: "seedmap",
+                sample: seedmap_key([0xAB; 16]).to_vec(),
+            },
+            Family {
+                prefix: b'u',
+                name: "player",
+                sample: player_key(AccountId::new(1)).to_vec(),
+            },
+            Family {
+                prefix: b'v',
+                name: "content/version",
+                sample: content_version_key().to_vec(),
+            },
+            Family {
+                prefix: b'w',
+                name: "world",
+                sample: world_key(GRID, shard, PersistId::new(1)).to_vec(),
+            },
+            // `lease/{grid}/{entity}` is deliberately absent: it takes the
+            // ledger's `b'l'` and discriminates on the `GridId`'s most
+            // significant byte rather than an ASCII byte, so it is not a family
+            // in this table's sense. `lease_key_overlaps_the_ledger_family`
+            // below records that overlap rather than letting this omission read
+            // as an oversight.
+        ]
+    }
+
+    /// Families are disjoint iff for every pair (a, b):
     ///   max_key(a) < min_key(b)  or  max_key(b) < min_key(a)
     /// For fixed-byte-prefix families (all of ours), min_key = [prefix] and
-    /// max_key sorts before [prefix+1], so we just check that the prefix bytes
+    /// max_key sorts before [prefix+1], so it is enough that the prefix bytes
     /// are all different.
     ///
     /// This test provides an explicit concrete assertion for each pair so a
     /// future addition that reuses a prefix is caught with the offending pair
-    /// named.
+    /// named. Completeness of the table — that *every* family in the module is
+    /// in it — is the separate obligation of
+    /// [`every_family_prefix_written_in_this_module_is_registered`], because a
+    /// disjointness proof over a subset proves nothing about the rest.
     #[test]
     fn all_key_families_are_range_disjoint() {
-        // The fourteen families and their one-byte prefix.
-        struct Family {
-            prefix: u8,
+        let families = registered_families();
+
+        // Each sample must actually begin with the prefix its row claims, or
+        // everything below is a property of the table rather than of the
+        // keyspace.
+        for family in &families {
+            assert_eq!(
+                family.sample.first().copied(),
+                Some(family.prefix),
+                "{} sample key must begin with its declared prefix 0x{:02x}",
+                family.name,
+                family.prefix
+            );
         }
 
-        let shard = CellId::from_bits(SHARD).unwrap();
-        let families = [
-            Family { prefix: b'a' }, // fence/actor
-            Family { prefix: b'c' }, // ckpt
-            Family { prefix: b'e' }, // epoch
-            Family { prefix: b'f' }, // epoch-handle
-            Family { prefix: b'g' }, // attest
-            Family { prefix: b'i' }, // intent
-            Family { prefix: b'k' }, // chunk
-            Family { prefix: b'l' }, // ledger (bal/item/receipt)
-            Family { prefix: b'n' }, // pid/next
-            Family { prefix: b'p' }, // seedprog
-            Family { prefix: b's' }, // seedmap
-            Family { prefix: b'u' }, // player
-            Family { prefix: b'v' }, // content/version
-            Family { prefix: b'w' }, // world
-        ];
-
-        // All prefix bytes must be distinct.
-        let mut prefixes: Vec<u8> = families.iter().map(|f| f.prefix).collect();
-        prefixes.sort();
-        prefixes.dedup();
-        assert_eq!(
-            prefixes.len(),
-            families.len(),
-            "all fourteen family prefixes must be distinct"
-        );
+        // All prefix bytes must be distinct, and the collision is named rather
+        // than reported as a count: "18 != 19" sends a reader counting rows.
+        let mut seen: std::collections::BTreeMap<u8, &'static str> =
+            std::collections::BTreeMap::new();
+        for family in &families {
+            if let Some(other) = seen.insert(family.prefix, family.name) {
+                panic!(
+                    "family prefix 0x{:02x} ('{}') is claimed by both {} and {}",
+                    family.prefix,
+                    char::from(family.prefix),
+                    other,
+                    family.name
+                );
+            }
+        }
 
         // For each pair (a, b), verify that a key from family A sorts before
         // a key from family B when prefix_a < prefix_b. Since each family has
         // a fixed one-byte prefix, the full-family range is [prefix, prefix+1),
         // so distinct prefixes guarantee disjoint ranges.
-        let keys: [Vec<u8>; 14] = [
-            fence_key(GRID, shard).to_vec(),                             // 'a'
-            ckpt_key(GRID, shard).to_vec(),                              // 'c'
-            epoch_key(GRID, shard, 3).to_vec(),                          // 'e'
-            epoch_handle_key(1 << 48).to_vec(),                          // 'f'
-            attest_key(42).to_vec(),                                     // 'g'
-            intent_key(42).to_vec(),                                     // 'i'
-            chunk_key(GRID, shard, 0).to_vec(),                          // 'k'
-            ledger_bal_key(AccountId::new(1), AssetId::new(1)).to_vec(), // 'l'
-            pid_next_key(GridId::ROOT).to_vec(),                         // 'n'
-            seedprog_key([0xDE; 8], GRID, shard).to_vec(),               // 'p'
-            seedmap_key([0xAB; 16]).to_vec(),                            // 's'
-            player_key(AccountId::new(1)).to_vec(),                      // 'u'
-            content_version_key().to_vec(),                              // 'v'
-            world_key(GRID, shard, PersistId::new(1)).to_vec(),          // 'w'
-        ];
-        for (i, ka) in keys.iter().enumerate() {
-            for (j, kb) in keys.iter().enumerate() {
-                if i >= j {
-                    continue;
-                }
+        for (i, a) in families.iter().enumerate() {
+            for b in families.iter().skip(i + 1) {
                 assert!(
-                    ka.as_slice() < kb.as_slice(),
-                    "key family at index {i} should sort before family at index {j}"
+                    a.sample.as_slice() < b.sample.as_slice(),
+                    "{} (0x{:02x}) must sort before {} (0x{:02x}); \
+                     one of them is in the wrong place or they collide",
+                    a.name,
+                    a.prefix,
+                    b.name,
+                    b.prefix
                 );
             }
         }
+    }
+
+    /// The text of this module, read back so the completeness clause below has
+    /// a second source. A clause that read both sides out of
+    /// [`registered_families`] would pass on exactly the family nobody
+    /// registered.
+    const KEYSPACE_SOURCE: &str = include_str!("keyspace.rs");
+
+    /// Every one-byte family prefix a key constructor in this module writes.
+    ///
+    /// Three recognized forms, and each is unambiguous by construction:
+    ///
+    /// ```text
+    ///     key[0] = b'x'      the fixed-size array constructors
+    ///     key.push(b'x')     the `Vec` range-bound builders
+    ///     \n    [b'x']       a single-byte key returned as a bare array
+    /// ```
+    ///
+    /// `key[1] = b'x'` is deliberately **not** one of them: the second byte is
+    /// a sub-discriminator *inside* a family (`lb`/`li`/`lr`, `da`/`db`/`dh`),
+    /// not a family. Neither is `vec![b'x']`, which is how range *bounds* are
+    /// written — an exclusive end is one past a family, not a family, which is
+    /// why `b`, `h`, `j`, `q`, `t` and `x` are spoken for without being
+    /// families.
+    ///
+    /// The test half of the file is excluded, because a test may build a
+    /// deliberately colliding key and that must not register a family.
+    fn family_prefixes_written_in_this_module() -> std::collections::BTreeSet<u8> {
+        let source = KEYSPACE_SOURCE
+            .split_once("\n#[cfg(test)]\n")
+            .map_or(KEYSPACE_SOURCE, |(head, _)| head);
+        let bytes = source.as_bytes();
+
+        let mut found = std::collections::BTreeSet::new();
+        for (at, _) in source.match_indices("b'") {
+            // `b'x'` is four bytes; anything else is not a byte literal.
+            if bytes.len() < at + 4 || bytes[at + 3] != b'\'' {
+                continue;
+            }
+            let before = &source[..at];
+            let writes_a_family_prefix = before.ends_with("key[0] = ")
+                || before.ends_with("key.push(")
+                || before.ends_with("\n    [");
+            if writes_a_family_prefix {
+                found.insert(bytes[at + 2]);
+            }
+        }
+        found
+    }
+
+    /// The completeness half of the disjointness proof: the registry must name
+    /// **every** family the module actually writes.
+    ///
+    /// D31 clause (a) makes this a condition rather than a nicety. Before it,
+    /// the table held fourteen families while seventeen prefix bytes were live
+    /// — `m` (`lease-cell/`), `o` (`lease-location/`) and `r` (D29's
+    /// `provisional/`) had landed without ever being registered — so the guard
+    /// proved fourteen of seventeen bytes distinct and would not have noticed a
+    /// new family colliding with any of the three. Registering `d` in a guard
+    /// that is itself incomplete is half a check.
+    ///
+    /// The two sides are the *text of the module* and the *typed registry*,
+    /// which is what makes this a check and not a restatement: adding a family
+    /// and forgetting the table now fails here, by name.
+    ///
+    /// **What it does not catch**, said out loud so it is not over-trusted: the
+    /// scan yields a set of *bytes*, so a second family that reuses an
+    /// already-registered byte without an ASCII sub-discriminator is invisible
+    /// to it. That is exactly [`lease_key`]'s shape, and
+    /// [`lease_key_overlaps_the_ledger_family`] carries that one by name rather
+    /// than leaving this clause to imply coverage it does not have.
+    #[test]
+    fn every_family_prefix_written_in_this_module_is_registered() {
+        let written = family_prefixes_written_in_this_module();
+        let registered: std::collections::BTreeSet<u8> =
+            registered_families().iter().map(|f| f.prefix).collect();
+
+        // Sanity: the scanner must find something, or the two-source property
+        // is vacuous and every future family passes unnoticed.
+        assert!(
+            written.len() >= 18,
+            "the source scan found only {} family prefixes; \
+             the recognized constructor forms have drifted from the code",
+            written.len()
+        );
+
+        let unregistered: Vec<char> = written
+            .difference(&registered)
+            .map(|b| char::from(*b))
+            .collect();
+        assert!(
+            unregistered.is_empty(),
+            "key families written by this module but absent from \
+             `registered_families`: {unregistered:?} — a disjointness proof \
+             that skips a family is not a disjointness proof (D31 (a))"
+        );
+
+        let unwritten: Vec<char> = registered
+            .difference(&written)
+            .map(|b| char::from(*b))
+            .collect();
+        assert!(
+            unwritten.is_empty(),
+            "families registered but written by no constructor in this \
+             module: {unwritten:?} — the table has outlived its code"
+        );
+    }
+
+    /// `lease/{grid}/{entity}` shares the ledger's `b'l'` without the ledger's
+    /// discriminator discipline, and this test records that rather than
+    /// asserting it away.
+    ///
+    /// Byte 1 of a lease key is the `GridId`'s most significant byte, where the
+    /// ledger puts an ASCII `b`/`i`/`r`. The two are disjoint today only
+    /// because grid ids are small: `grid.0 >= 0x6200_0000` puts a lease row
+    /// inside `ledger/bal/`, `0x6900_0000` inside `ledger/item/`, `0x7200_0000`
+    /// inside `ledger/receipt/`. Latent rather than live — no full-family scan
+    /// of either exists in the tree — and an on-disk format change to fix, so
+    /// it is tracked separately. This test fails the day someone "fixes" it
+    /// without deciding it, which is the point.
+    #[test]
+    fn lease_key_overlaps_the_ledger_family() {
+        let entity = PersistId::new(1);
+        let bal = ledger_bal_key(AccountId::new(0), AssetId::new(0));
+
+        let small = lease_key(GridId::ROOT, entity);
+        assert_eq!(small[0], b'l');
+        assert!(
+            small.as_slice() < bal.as_slice(),
+            "a small grid id keeps the lease row below `ledger/bal/`"
+        );
+
+        let colliding = lease_key(GridId::new(0x6200_0000), entity);
+        assert_eq!(colliding[0], b'l');
+        assert_eq!(
+            colliding[1], b'b',
+            "byte 1 is the grid id's MSB, and 0x62 is the ledger's `bal` \
+             discriminator — the overlap is arithmetic, not hypothetical"
+        );
     }
 
     #[test]
@@ -2009,43 +3060,39 @@ mod tests {
         assert_eq!(fence_range_end(), vec![b'b']);
     }
 
+    /// The registry is written in prefix order, and that order is load-bearing
+    /// twice: it is what makes the pairwise loop in
+    /// [`all_key_families_are_range_disjoint`] a *sorted* comparison rather
+    /// than an unordered one, and it is what makes a new row's correct place
+    /// obvious to whoever adds it.
+    ///
+    /// This used to be an eleven-entry table of its own, written down beside
+    /// the fourteen-entry one it was meant to corroborate — two hand-kept
+    /// copies of a fact, neither complete. It reads the registry now.
     #[test]
     fn prefix_order_is_ascii_and_stable() {
-        // The prefix bytes must be chosen so that no prefix is a prefix of
-        // another family's range end. Since we use single bytes and ensure
-        // ranges are [prefix, prefix+1), this is automatic if prefixes are
-        // distinct. This test records the sort order for documentation.
-        let order = [
-            (b'a', "fence/actor"),
-            (b'c', "ckpt"),
-            (b'i', "intent"),
-            (b'k', "chunk"),
-            (b'l', "ledger"),
-            (b'n', "pid/next"),
-            (b'p', "seedprog"),
-            (b's', "seedmap"),
-            (b'u', "player"),
-            (b'v', "content/version"),
-            (b'w', "world"),
-        ];
-        for (i, (p1, n1)) in order.iter().enumerate() {
-            for (j, (p2, n2)) in order.iter().enumerate() {
-                if i < j {
-                    assert!(
-                        p1 < p2,
-                        "prefix {n1} (0x{p1:02x}) should sort before {n2} (0x{p2:02x})"
-                    );
-                }
+        let families = registered_families();
+        let mut prev: Option<&Family> = None;
+        for family in &families {
+            if let Some(before) = prev {
+                assert!(
+                    before.prefix < family.prefix,
+                    "the registry is kept in prefix order; {} (0x{:02x}) is \
+                     listed after {} (0x{:02x})",
+                    family.name,
+                    family.prefix,
+                    before.name,
+                    before.prefix
+                );
             }
-        }
-        // Verify there is no gap where a different prefix could collide.
-        let mut prev = 0u8;
-        for (p, name) in &order {
             assert!(
-                *p > prev,
-                "prefix bytes are in strictly increasing order; {name} = 0x{p:02x} after 0x{prev:02x}"
+                family.prefix.is_ascii_lowercase(),
+                "{} takes 0x{:02x}, which is outside the lowercase family \
+                 space the byte budget is counted in",
+                family.name,
+                family.prefix
             );
-            prev = *p;
+            prev = Some(family);
         }
     }
 }
