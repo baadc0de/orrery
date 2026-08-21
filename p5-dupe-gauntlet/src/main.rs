@@ -200,7 +200,16 @@ async fn run_gateway(cluster_file: &Path, data_dir: &Path) -> Result<()> {
     let config = GatewayConfig {
         secret_key: Some(secret(250)),
         executor: Some(Arc::new(executor)),
-        validator: Arc::new(BaselineIntentValidator::enforcing(Arc::clone(&epochs))),
+        // D30 (#197) made the validator resolve a cell-epoch only where the
+        // issuer has standing, so `enforcing` now takes the interest authority
+        // too. The gauntlet hands it the same `CoverAllInterest` the gateway
+        // gets: cell coverage is orthogonal to what these arms prove, and
+        // holding it open is what stops a standing refusal masquerading as an
+        // attestation result.
+        validator: Arc::new(BaselineIntentValidator::enforcing(
+            Arc::clone(&epochs),
+            Arc::new(CoverAllInterest),
+        )),
         witness_epochs: Some(epochs),
         authorizer: Arc::new(SessionTokenV1Authorizer::new([IssuerKey::new(
             IssuerKeyId::new(1),
