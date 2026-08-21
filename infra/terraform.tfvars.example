@@ -1,0 +1,20 @@
+# Copy to terraform.tfvars only if you need to override something. Every
+# variable already has a default that is correct for account 590561279276 and
+# for github.com/baadc0de/orrery, so an ordinary apply needs no tfvars file at
+# all — which is deliberate: a plan a reviewer can reproduce with no local
+# state is a plan they can check.
+
+# region                = "eu-central-1"
+# expected_account_id   = "590561279276"
+
+# Only if `orrery-kache` has been taken globally by someone else since
+# 2026-08-21, when `aws s3api head-bucket --bucket orrery-kache` returned 404.
+# cache_bucket_name     = "orrery-kache"
+
+# Re-read after any repository rename or transfer:
+#   gh api repos/baadc0de/orrery/actions/oidc/customization/sub
+# github_subject_prefix = "repo:baadc0de@15308543/orrery@1331921648"
+
+# The retention window. Change this when #175 has measured the fill rate; see
+# s3.tf for the arithmetic that turns a fill rate into a steady-state size.
+# cache_expiration_days = 14

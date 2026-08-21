@@ -1,0 +1,23 @@
+# Terraform state records real resource ids and, for some resource types,
+# secrets. This configuration creates no secret-bearing resource — there are no
+# access keys anywhere in the design, which is #173's whole point — but state is
+# still not repository content: it is a live record of one account.
+*.tfstate
+*.tfstate.*
+*.tfstate.backup
+crash.log
+crash.*.log
+
+# Provider plugins and the lock's local cache.
+.terraform/
+
+# Saved plans can embed variable values.
+*.tfplan
+
+# Real variable values. terraform.tfvars.example is committed; the real one is
+# not, so an operator can point this at a different account without a diff.
+*.auto.tfvars
+terraform.tfvars
+
+# Everything else here is source, including .terraform.lock.hcl, which is
+# committed on purpose so a reviewer's plan resolves the same provider build.
