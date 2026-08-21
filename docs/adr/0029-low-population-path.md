@@ -2,6 +2,13 @@
 
 **Status:** Accepted · **Date:** 2026-08-20 · **Decision:** D29
 
+**Erratum (2026-08-21):** This accepted record originally said that a cluster
+deploying version 2 "still serves version-1 clients" and that "Version-1
+clients keep working." Those were stale pre-acceptance draft statements and
+are corrected below. This erratum does not change the decision: the
+rolling-upgrade acceptance window is closed and the cluster supports protocol
+version 2 only.
+
 This decision is normative once accepted. See the [ADR index](../DECISIONS.md)
 for precedence, scope, and the complete decision set.
 
@@ -370,13 +377,6 @@ dual-version support was complexity that had not been earned. The `protocol.rs`
 change is wider than the intent path and belongs to whoever implements this
 record: the window is closed once, for all traffic, not per message family.
 
-The acceptance window was `PROTOCOL_VERSION` and `PROTOCOL_VERSION − 1`
-(`protocol.rs:3-5`), so a cluster deploying 2 still serves version-1 clients —
-and a version-1 client must therefore be **refused** the provisional path
-rather than sent an arm it cannot read: for a client that negotiated version 1,
-clause 2's second line degrades to refusal. That is the correct degradation,
-and it is the same answer clause 2 already gives for every non-eligible intent.
-
 The exhaustive match at `intents.rs:320-334` means the compiler names every
 place that must decide, which is the reason to spend an enum arm rather than a
 boolean.
@@ -641,9 +641,8 @@ shadow-mode telemetry rather than defended.
   stays exactly where it is.
 - **A wire change and a `PROTOCOL_VERSION` bump land in P5.** The third
   `IntentOutcome` arm is the first protocol break since `PROTOCOL_VERSION` was
-  introduced, and it exercises the rolling-upgrade window at `protocol.rs:3-5`
-  for real. Version-1 clients keep working and simply cannot use the
-  provisional path.
+  introduced. Under clause 5, the rolling-upgrade acceptance window is closed:
+  the cluster supports version 2 only.
 - **Capability lost: two-party trades do not work in empty regions, at all.**
   Clause 3 refuses transfers on this path and party exclusion leaves a
   two-person cell with no witnesses, so a trade between the only two players in
