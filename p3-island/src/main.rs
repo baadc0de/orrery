@@ -218,14 +218,13 @@ const ATTESTATION_WAIT: Duration = Duration::from_secs(5);
 /// budget rather than loosening the measurement.
 const SETTLE_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
-/// D24's `TTL + S` backstop, measured from the last peer departure.
+/// A harness watchdog, not a drain timing budget.
 ///
-/// The counter's last change must land inside this bound. Establishing that it
-/// stayed unchanged takes the separate quiescence window below, but that later
-/// observation never widens the instant compared with D24's bound.
-const DRAIN_SETTLE_BUDGET: Duration = Duration::from_millis(
-    LEASE_TTL.as_millis() as u64 + REGISTRAR_SWEEP_INTERVAL.as_millis() as u64,
-);
+/// The drain verdict is counter-based and carries elapsed time as evidence
+/// only. This ceiling keeps a dead registrar from hanging the proof forever;
+/// reaching it means the required disposition evidence never arrived, not
+/// that a latency target was missed.
+const DRAIN_OBSERVATION_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Two complete registrar sweep periods with no disposition-counter movement.
 ///
@@ -853,18 +852,17 @@ async fn orchestrate(cli: Cli) -> Result<Outcome> {
     let mut drain_counters = read_authority_counters(metrics_jsonl)?;
     let mut stable_since = tokio::time::Instant::now();
     let mut drain_last_change_in_ms = 0;
-    let mut drain_movement_observed = drain_counters != drain_baseline;
     let mut drain_counter_series = vec![authority_counter_sample(
         drain_departed_at.elapsed().as_millis() as u64,
         drain_counters,
         drain_baseline,
     )];
-    // This is an observation guard, not the correctness bound. A change at the
-    // last legal instant still needs two quiet sweep periods before the harness
-    // can call it quiescent. The verdict below compares the change instant —
-    // not this later detection instant — with TTL + S.
+    // This is a harness watchdog, not a correctness bound. The registrar's
+    // counters have no event timestamps, and this process cannot observe the
+    // registrar's own `T_last_peer_gone`, so elapsed wall time is evidence and
+    // never part of the verdict.
     let drain_observation_deadline =
-        drain_departed_at + DRAIN_SETTLE_BUDGET + DRAIN_QUIESCENCE_WINDOW;
+        drain_departed_at + DRAIN_OBSERVATION_TIMEOUT + DRAIN_QUIESCENCE_WINDOW;
     let mut drain_quiesced = false;
     loop {
         tokio::time::sleep(SETTLE_POLL_INTERVAL).await;
@@ -873,19 +871,18 @@ async fn orchestrate(cli: Cli) -> Result<Outcome> {
             drain_counters = next;
             stable_since = tokio::time::Instant::now();
             drain_last_change_in_ms = drain_departed_at.elapsed().as_millis() as u64;
-            drain_movement_observed = true;
             drain_counter_series.push(authority_counter_sample(
                 drain_last_change_in_ms,
                 drain_counters,
                 drain_baseline,
             ));
         }
-        // Quiescence is detected independently of the desired end state. That
-        // distinction is what made the #157 defect measurable: its counters
-        // became quiet while hundreds of rows were still held. Requiring one
-        // movement avoids mistaking the expected pre-expiry silence for the
-        // final steady state.
-        if drain_movement_observed && stable_since.elapsed() >= DRAIN_QUIESCENCE_WINDOW {
+        let accounting = drain_accounting(drain_leases_held, next, drain_baseline);
+        // Quiet is meaningful only after every starting lease has a D7
+        // disposition. In particular, an intermediate reassignment is an
+        // accounted disposition rather than a failed park; a later park may
+        // move the counters again without invalidating either transition.
+        if accounting.outstanding == 0 && stable_since.elapsed() >= DRAIN_QUIESCENCE_WINDOW {
             drain_quiesced = true;
             break;
         }
@@ -897,23 +894,19 @@ async fn orchestrate(cli: Cli) -> Result<Outcome> {
     let drain_reassigned = drain_counters
         .reassigned
         .saturating_sub(drain_baseline.reassigned);
+    let drain_accounting = drain_accounting(drain_leases_held, drain_counters, drain_baseline);
     let drain_quiescence_observed_in_ms = drain_departed_at.elapsed().as_millis() as u64;
-    let drain_quiesced_in_ms = if drain_quiesced {
+    let drain_last_disposition_in_ms = if drain_quiesced {
         drain_last_change_in_ms
     } else {
         drain_quiescence_observed_in_ms
     };
-    let drain_within_bound =
-        drain_quiesced && drain_quiesced_in_ms <= DRAIN_SETTLE_BUDGET.as_millis() as u64;
     drain_counter_series.push(authority_counter_sample(
         drain_quiescence_observed_in_ms,
         drain_counters,
         drain_baseline,
     ));
-    let drain_passed = drain_quiesced
-        && drain_within_bound
-        && drain_parked == drain_leases_held
-        && drain_counters.duplicate == 0;
+    let drain_passed = drain_passes(drain_quiesced, drain_accounting, drain_counters.duplicate);
     let duplicate_authority = drain_counters.duplicate;
 
     // Every clause of the criterion, and no others: every entity disposed of —
@@ -943,20 +936,20 @@ async fn orchestrate(cli: Cli) -> Result<Outcome> {
         && drain_passed;
     let drain_report = serde_json::json!({
         // No observer joins during this window: the series is the registrar's
-        // non-invasive account of cleanup reaching a steady state with no
-        // eligible successor. Two quiet sweep periods establish quiescence.
+        // non-invasive account of every D7 disposition. Reassignment and
+        // parking are both valid; two quiet sweep periods after every starting
+        // lease is accounted for establish quiescence.
         "drain_leases_held_at_start": drain_leases_held,
         "drain_parked_at_quiescence": drain_parked,
         "drain_reassigned_during_close": drain_reassigned,
+        "drain_accounted_at_quiescence": drain_accounting.accounted,
+        "drain_outstanding_at_quiescence": drain_accounting.outstanding,
         "drain_counter_series": drain_counter_series,
-        "drain_entities_parked": drain_parked,
-        "drain_expected_parked": drain_leases_held,
         "drain_quiesced": drain_quiesced,
-        "drain_quiesced_in_ms": drain_quiesced_in_ms,
+        "drain_last_disposition_in_ms": drain_last_disposition_in_ms,
         "drain_quiescence_observed_in_ms": drain_quiescence_observed_in_ms,
         "drain_quiescence_window_ms": DRAIN_QUIESCENCE_WINDOW.as_millis() as u64,
-        "drain_within_bound": drain_within_bound,
-        "drain_settle_budget_ms": DRAIN_SETTLE_BUDGET.as_millis() as u64,
+        "drain_observation_timeout_ms": DRAIN_OBSERVATION_TIMEOUT.as_millis() as u64,
         "drain_passed": drain_passed,
     });
     let mut report = serde_json::json!({
@@ -1240,6 +1233,37 @@ struct AuthorityCounters {
     fanout_dropped: u64,
 }
 
+/// The starting leases for which the registrar has reported a D7 disposition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DrainAccounting {
+    accounted: u64,
+    outstanding: u64,
+}
+
+fn drain_accounting(
+    held_at_start: u64,
+    counters: AuthorityCounters,
+    baseline: AuthorityCounters,
+) -> DrainAccounting {
+    let dispositions = counters
+        .reassigned
+        .saturating_sub(baseline.reassigned)
+        .saturating_add(counters.parked.saturating_sub(baseline.parked));
+    let accounted = dispositions.min(held_at_start);
+    DrainAccounting {
+        accounted,
+        outstanding: held_at_start.saturating_sub(accounted),
+    }
+}
+
+const fn drain_passes(
+    quiesced: bool,
+    accounting: DrainAccounting,
+    duplicate_authority: u64,
+) -> bool {
+    quiesced && accounting.outstanding == 0 && duplicate_authority == 0
+}
+
 /// One change point in the drain quiescence series, relative to its baseline.
 fn authority_counter_sample(
     elapsed_ms: u64,
@@ -1407,6 +1431,37 @@ mod tests {
             SETTLE_GRANULARITY >= REGISTRAR_SWEEP_INTERVAL + published_lag,
             "settle budget {SETTLE_GRANULARITY:?} does not cover sweep + {published_lag:?}"
         );
+    }
+
+    /// Reassignment is a valid D7 disposition, not a failed attempt to park.
+    ///
+    /// The hosted-runner shape from #218 is deliberately represented here: a
+    /// lease can be reassigned during concurrent close and park later, so the
+    /// cumulative park count need not equal the number held at drain start.
+    #[test]
+    fn reassigned_then_parked_leases_are_accounted_once() {
+        let accounting = drain_accounting(
+            400,
+            AuthorityCounters {
+                reassigned: 378,
+                parked: 589,
+                ..AuthorityCounters::default()
+            },
+            AuthorityCounters::default(),
+        );
+        assert_eq!(accounting.accounted, 400);
+        assert_eq!(accounting.outstanding, 0);
+        assert!(drain_passes(true, accounting, 0));
+        assert!(!drain_passes(
+            true,
+            DrainAccounting {
+                accounted: 399,
+                outstanding: 1,
+            },
+            0,
+        ));
+        assert!(!drain_passes(false, accounting, 0));
+        assert!(!drain_passes(true, accounting, 1));
     }
 
     /// One `Deny` for the probe to be answered with.

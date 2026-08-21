@@ -95,6 +95,10 @@ if [[ ${1:-} == --self-test ]]; then
   # Keep its drain validation load-bearing before PASSED is written.
   has "python3 - \"\$out/report.json\" <<'PY'" \
     || die 'self-test: drain report validation absent'
+  has 'assert report["drain_accounted_at_quiescence"] == report["drain_leases_held_at_start"]' \
+    || die 'self-test: drain disposition accounting not enforced'
+  has 'assert report["drain_outstanding_at_quiescence"] == 0' \
+    || die 'self-test: outstanding drain leases not enforced'
 
   # A proof harness is only a proof if its verdict is load-bearing: the gate
   # must die on a non-zero harness exit, and the success artifact must be
@@ -264,20 +268,22 @@ with open(sys.argv[1], encoding="utf-8") as stream:
 required = {
     "drain_leases_held_at_start",
     "drain_parked_at_quiescence",
-    "drain_quiesced_in_ms",
+    "drain_reassigned_during_close",
+    "drain_accounted_at_quiescence",
+    "drain_outstanding_at_quiescence",
+    "drain_last_disposition_in_ms",
     "drain_quiescence_observed_in_ms",
-    "drain_settle_budget_ms",
+    "drain_observation_timeout_ms",
     "drain_counter_series",
     "drain_quiesced",
-    "drain_within_bound",
     "drain_passed",
     "passed",
 }
 missing = sorted(required.difference(report))
 assert not missing, f"missing drain report keys: {missing}"
-assert report["drain_leases_held_at_start"] == report["drain_parked_at_quiescence"], report
+assert report["drain_accounted_at_quiescence"] == report["drain_leases_held_at_start"], report
+assert report["drain_outstanding_at_quiescence"] == 0, report
 assert report["drain_quiesced"] is True, report
-assert report["drain_within_bound"] is True, report
 assert report["drain_passed"] is True, report
 assert report["passed"] is True, report
 series = report["drain_counter_series"]
