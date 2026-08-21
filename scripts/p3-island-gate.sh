@@ -43,10 +43,19 @@ if [[ ${1:-} == --self-test ]]; then
   # One invocation: from the line that runs the named binary through the last
   # of its continuation lines.
   launch() {
-    awk -v bin="\"\$$1\" \\" '$0 == bin { inside = 1 }
-                                 inside { print; if ($0 !~ /\\$/) exit }' <<<"$body"
+    # Build the backslash-terminated sentinel inside awk. Passing that sentinel
+    # through -v is not portable: gawk 5.2 drops its lone trailing backslash.
+    awk -v var="$1" 'BEGIN { bin = "\"$" var "\" " "\\" }
+                         $0 == bin { inside = 1 }
+                         inside { print; if ($0 !~ /\\$/) exit }' <<<"$body"
   }
-  runs() { grep -Fq -- "$2" <<<"$(launch "$1")"; }
+  runs() {
+    local invocation
+    invocation=$(launch "$1")
+    [[ -n $invocation ]] \
+      || die "self-test: invocation extraction returned no text for $1"
+    grep -Fq -- "$2" <<<"$invocation"
+  }
 
   # persistd: the registrar under test, and the two flags it refuses to start
   # without in this configuration. Neither key was checked here once, and the
