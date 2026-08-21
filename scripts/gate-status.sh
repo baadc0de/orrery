@@ -20,14 +20,17 @@
 # script about it breaks the report loudly rather than dropping the gate from
 # it silently.
 #
-# **A skip is never a pass.** Five statuses, and they are not collapsible:
+# **A partial evaluation is never a pass.** Six statuses, and they are not
+# collapsible:
 #
-#   PASSED    executed here, or an evidence artifact that says it held
-#   FAILED    executed here and did not hold, or evidence that says so
-#   NOT RUN   runnable, but this mode did not run it and no evidence exists
-#   SKIPPED   a prerequisite is missing — no cluster, no hosted runner, no
-#             binary. The gate was not evaluated and nothing is claimed.
-#   UNKNOWN   discovered, but this reporter does not know how to run or read it
+#   PASSED       executed here, or an evidence artifact that says it held
+#   FAILED       executed here and did not hold, or evidence that says so
+#   UNQUALIFIED  correctness was evaluated, but the device could not support a
+#                latency verdict; the whole gate therefore did not pass
+#   NOT RUN      runnable, but this mode did not run it and no evidence exists
+#   SKIPPED      a prerequisite is missing — no cluster, no hosted runner, no
+#                binary. The gate was not evaluated and nothing is claimed.
+#   UNKNOWN      discovered, but this reporter cannot run or read it
 #
 # The exit status distinguishes them too: 0 = nothing failed, 1 = a gate
 # failed, 2 = the report is incomplete (an UNKNOWN gate). A run that skipped
@@ -461,10 +464,17 @@ gate_p2_kill9_evidence() {
   local dir
   dir=$(ls -1d "$OUT"/p2-kill9-* "$ROOT"/p2-kill9-* 2>/dev/null | sort | tail -1) || true
   [[ -n ${dir:-} ]] || { ev_none; return 0; }
-  # The artifact is written last and only on a pass, so a directory without one
-  # is a failed run rather than an absent one.
+  # The artifact is written last, after every correctness proof. Its result is
+  # the whole-gate verdict: an unqualified latency clause is neither a pass nor
+  # a failure. A directory without the final artifact is still a failed run.
   if [[ ! -r $dir/artifact.json ]]; then ev FAILED "$dir" '{}'; return 0; fi
-  local numbers
+  local numbers result status
+  result=$(jq -r '.result // empty' "$dir/artifact.json" 2>/dev/null || true)
+  case "$result" in
+    pass)        status=PASSED ;;
+    unqualified) status=UNQUALIFIED ;;
+    *)           status=FAILED ;;
+  esac
   numbers=$(jq -c '{
     result, recovery_cutoff,
     durable_acks: (.proofs.recovery.durable_acks // .proofs.recovery.acked // null),
@@ -476,7 +486,7 @@ gate_p2_kill9_evidence() {
     area_first_page_p99_ms:(.proofs.latency.series.area_first_page_ms.p99 // null),
     zombie_primary_fenced: .proofs.zombie_primary_fenced
   } | with_entries(select(.value != null))' "$dir/artifact.json" 2>/dev/null || echo '{}')
-  ev PASSED "$dir" "$numbers"
+  ev "$status" "$dir" "$numbers"
 }
 
 # ── P4 accumulation and its ledger ───────────────────────────────────────────
@@ -691,9 +701,16 @@ evaluate() { # id kind fn_prefix source arg
     e=$("${prefix}_evidence" "$arg")
     evidence=$(jq -r '.evidence' <<<"$e")
     numbers=$(jq -c '.numbers' <<<"$e")
+    local evidence_status
+    evidence_status=$(jq -r '.status' <<<"$e")
     if [[ -z $status ]]; then
-      status=$(jq -r '.status' <<<"$e")
+      status=$evidence_status
       if [[ $status == 'NOT RUN' ]]; then reason="mode '$MODE' does not run this gate and no evidence is on disk"; fi
+    elif [[ $status == PASSED && $evidence_status == UNQUALIFIED ]]; then
+      # The harness completed successfully so that its correctness evidence
+      # could be retained, but the evidence is authoritative about whether the
+      # whole criterion was qualified to pass.
+      status=UNQUALIFIED
     fi
   else
     status=SKIPPED
@@ -743,7 +760,7 @@ collect() {
 }
 
 render() {
-  local total=0 passed=0 failed=0 notrun=0 skipped=0 unknown=0 row st
+  local total=0 passed=0 failed=0 unqualified=0 notrun=0 skipped=0 unknown=0 row st
 
   echo
   echo "gate status — MODE: $MODE"
@@ -760,18 +777,19 @@ render() {
   echo "  commit $COMMIT · $(date -u +%Y-%m-%dT%H:%M:%SZ) · jsonl: $JSONL"
   echo
 
-  printf '  %-9s  %-34s  %s\n' STATUS GATE SOURCE
-  printf '  %-9s  %-34s  %s\n' '---------' '----------------------------------' '------'
+  printf '  %-11s  %-34s  %s\n' STATUS GATE SOURCE
+  printf '  %-11s  %-34s  %s\n' '-----------' '----------------------------------' '------'
   for row in "${ROWS[@]}"; do
     st=$(jq -r '.status' <<<"$row")
-    printf '  %-9s  %-34s  %s\n' "$st" "$(jq -r '.gate' <<<"$row")" "$(jq -r '.source' <<<"$row")"
+    printf '  %-11s  %-34s  %s\n' "$st" "$(jq -r '.gate' <<<"$row")" "$(jq -r '.source' <<<"$row")"
     total=$((total + 1))
     case "$st" in
-      PASSED)    passed=$((passed + 1)) ;;
-      FAILED)    failed=$((failed + 1)) ;;
-      'NOT RUN') notrun=$((notrun + 1)) ;;
-      SKIPPED)   skipped=$((skipped + 1)) ;;
-      UNKNOWN)   unknown=$((unknown + 1)) ;;
+      PASSED)      passed=$((passed + 1)) ;;
+      FAILED)      failed=$((failed + 1)) ;;
+      UNQUALIFIED) unqualified=$((unqualified + 1)) ;;
+      'NOT RUN')   notrun=$((notrun + 1)) ;;
+      SKIPPED)     skipped=$((skipped + 1)) ;;
+      UNKNOWN)     unknown=$((unknown + 1)) ;;
     esac
   done
 
@@ -791,8 +809,8 @@ render() {
   done
 
   echo
-  echo "  $total gates · $passed passed · $failed failed · $notrun not run · $skipped skipped · $unknown unknown"
-  echo "  produced by MODE=$MODE — skipped and not-run gates were not evaluated and are not passes."
+  echo "  $total gates · $passed passed · $failed failed · $unqualified unqualified · $notrun not run · $skipped skipped · $unknown unknown"
+  echo "  produced by MODE=$MODE — skipped and not-run gates were not evaluated; unqualified gates were only partially evaluated; none are passes."
   echo
 
   # Precedence, and it is a judgement: a gate that actually failed outranks an
@@ -1015,7 +1033,7 @@ EOF
   #    bitten this repository before.
   grep -qE '^  SKIPPED +nightly:p2-kill9' <<<"$report" \
     || die 'self-test: a gate whose prerequisite is missing was not reported SKIPPED'
-  grep -qE '^  (PASSED|FAILED) +nightly:p2-kill9' <<<"$report" \
+  grep -qE '^  (PASSED|FAILED|UNQUALIFIED) +nightly:p2-kill9' <<<"$report" \
     && die 'self-test: a skipped gate was also reported as a verdict; a skip must never read as a pass'
 
   # 5. The skip is counted apart from the passes in the summary line.
@@ -1053,7 +1071,7 @@ EOF
   jsonl="$dir/out/gate-status.jsonl"
   [[ -r $jsonl ]] || die 'self-test: no JSONL was emitted'
   json_rows=$(wc -l <"$jsonl")
-  human_rows=$(grep -cE '^  (PASSED|FAILED|NOT RUN|SKIPPED|UNKNOWN) ' <<<"$inspect_report")
+  human_rows=$(grep -cE '^  (PASSED|FAILED|UNQUALIFIED|NOT RUN|SKIPPED|UNKNOWN) ' <<<"$inspect_report")
   [[ $json_rows -eq $human_rows ]] \
     || die "self-test: the JSONL has $json_rows records and the table $human_rows rows; they must be the same report"
   jq -e 'select(.mode != "inspect")' "$jsonl" >/dev/null \
@@ -1090,7 +1108,61 @@ EOF
   grep -qE '^  FAILED +nightly:p1-swarm' <<<"$without_marker" \
     || die 'self-test: reports without the success artifact read as a pass; the artifact is what the gate writes last'
 
-  # 10. The P3 island gate has two legs, and the report must carry both of them
+  # 10. A completed P2 run whose device was unqualified has real correctness
+  #     evidence, but it did not evaluate the whole criterion. Exercise the
+  #     live-run path, not only evidence inspection: a zero harness exit used
+  #     to stamp PASSED before the artifact's latency non-verdict was read.
+  mkdir -p "$dir/out/p2-kill9-unqualified"
+  jq -n '{
+      kind: "p2_two_process_kill9_gate", result: "unqualified",
+      recovery_cutoff: "0:42",
+      proofs: {
+        recovery: {pass: true, durable_acks: 100},
+        latency: {gate: "unqualified", series: {
+          journal_commit_ms: {p99_us: 7000, threshold_us: 2000, gate: "unqualified"}
+        }},
+        zombie_primary_fenced: true,
+        bumped_chain_epoch_refused: true,
+        device_qualification: {qualified: false}
+      }
+    }' >"$dir/out/p2-kill9-unqualified/artifact.json"
+
+  # Dynamic scope gives the real evaluator synthetic prerequisites and a
+  # successful harness without weakening the production prerequisite or run.
+  local OUT="$dir/out" MODE=full JSONL="$dir/out/p2-projection.jsonl" COMMIT=selftest EXIT=0
+  local -a ROWS=()
+  gate_p2_kill9_prereq() { return 0; }
+  gate_p2_kill9_run() { return 0; }
+  evaluate 'nightly:p2-kill9' nightly gate_p2_kill9 \
+    'nightly.yml:p2-kill9@hosted (p2-kill9-gate.sh)'
+  local p2_projection
+  p2_projection=$(render)
+  emit_jsonl
+  grep -qE '^  PASSED +nightly:p2-kill9' <<<"$p2_projection" \
+    && die 'self-test: an unqualified P2 report was rendered PASSED'
+  grep -qE '^  UNQUALIFIED +nightly:p2-kill9' <<<"$p2_projection" \
+    || die 'self-test: an unqualified P2 report did not get its own top-line state'
+  grep -q '1 unqualified' <<<"$p2_projection" \
+    || die 'self-test: the summary counted an unqualified P2 report as another state'
+  jq -e 'select(.gate == "nightly:p2-kill9" and .status == "UNQUALIFIED")' "$JSONL" >/dev/null \
+    || die 'self-test: the machine-readable P2 projection lost the unqualified state'
+
+  # A later qualified artifact follows the unchanged path: successful process,
+  # complete verdict, PASSED at the top line.
+  mkdir -p "$dir/out/p2-kill9-zz-qualified"
+  jq '.result = "pass"
+      | .proofs.latency.gate = "pass"
+      | .proofs.device_qualification.qualified = true' \
+    "$dir/out/p2-kill9-unqualified/artifact.json" \
+    >"$dir/out/p2-kill9-zz-qualified/artifact.json"
+  ROWS=()
+  evaluate 'nightly:p2-kill9' nightly gate_p2_kill9 \
+    'nightly.yml:p2-kill9@hosted (p2-kill9-gate.sh)'
+  p2_projection=$(render)
+  grep -qE '^  PASSED +nightly:p2-kill9' <<<"$p2_projection" \
+    || die 'self-test: a qualified passing P2 report no longer renders PASSED'
+
+  # 11. The P3 island gate has two legs, and the report must carry both of them
   #     — with the disposition each leg actually produced. Fabricated here in
   #     the synthetic tree for the same reason as clause 9: it is the only way
   #     to check that these numbers are *read* rather than re-derived.

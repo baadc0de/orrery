@@ -34,7 +34,10 @@
 //! crate's re-export.
 //!
 //! `--json` carries the stable machine contract (a `Report` struct); `--gate`
-//! makes the process exit non-zero when any series misses its threshold.
+//! makes the process exit non-zero when any series misses its threshold. The
+//! P2 kill-9 harness also supplies D19's device qualification. On an
+//! unqualified device the measurements remain visible, but no latency
+//! comparison is rendered as a pass or a failure.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
@@ -271,6 +274,9 @@ enum SeriesGate {
     /// No samples were recorded for this series. A series the run never
     /// sampled cannot pass the D16 demo criterion by omission.
     MissingData,
+    /// Samples exist, but D19's device qualification failed. The measurement
+    /// is reported beside its D16 threshold without turning it into a verdict.
+    Unqualified,
     /// D16 sets no target for this series: it is reported for attribution
     /// and never contributes to the verdict, present or absent.
     NotGated,
@@ -284,6 +290,85 @@ enum GateVerdict {
     Pass,
     /// At least one series missed (or was missing).
     Fail,
+    /// Every required series was measured, but the device failed D19's
+    /// qualification, so the latency verdict was withheld.
+    Unqualified,
+}
+
+/// D19's fio job-A requirement, copied into the run artifact by the harness.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DeviceQualificationRequirement {
+    /// Number of concurrent writers in fio job A.
+    jobs: usize,
+    /// Duration of the time-based job.
+    runtime_seconds: u64,
+    /// Size of each write followed by fdatasync.
+    block_size_bytes: u64,
+    /// Offered rate per writer.
+    offered_rate_iops_per_job: f64,
+    /// Minimum observed rate accepted per writer. This permits fio's timer
+    /// accounting tolerance while still detecting a device that cannot hold
+    /// the offered 470 barriers/s.
+    minimum_rate_iops_per_job: f64,
+    /// D19's binding qualification threshold.
+    sync_max_ms_below: f64,
+    /// Aggregate rate recorded by D19's reference run.
+    reference_barriers_per_s: f64,
+    /// D19's reference p99, for comparison rather than qualification.
+    reference_sync_p99_ms: f64,
+    /// D19's reference maximum.
+    reference_sync_max_ms: f64,
+}
+
+/// One fio writer's observed job-A result.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DeviceQualificationJob {
+    /// Sustained write-and-fdatasync operations per second.
+    iops: f64,
+    /// 99th percentile fdatasync latency.
+    sync_p99_ms: f64,
+    /// Maximum fdatasync latency.
+    sync_max_ms: f64,
+}
+
+/// Aggregate fio result for the filesystem carrying the journals.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DeviceQualificationMeasurement {
+    /// Sum of the two writers' observed rates.
+    aggregate_barriers_per_s: f64,
+    /// Worse of the two writers' p99s.
+    worst_sync_p99_ms: f64,
+    /// Worse of the two writers' maxima.
+    worst_sync_max_ms: f64,
+    /// Per-writer observations used to adjudicate qualification.
+    jobs: Vec<DeviceQualificationJob>,
+}
+
+/// Device preflight emitted by `scripts/p2-kill9-gate.sh`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DeviceQualification {
+    /// Stable artifact discriminator.
+    kind: String,
+    /// Measurement method (`fio_job_a` or an explicit unavailable result).
+    method: String,
+    /// Reproducible command shape. The journal path is represented by a
+    /// placeholder and recorded separately in `data_path`.
+    command: String,
+    /// Filesystem path on which job A ran.
+    data_path: String,
+    /// fio version, when fio could run.
+    #[serde(default)]
+    fio_version: Option<String>,
+    /// The exact qualification requirement and D19 reference figures.
+    required: DeviceQualificationRequirement,
+    /// Measurement, absent only when the preflight could not execute.
+    #[serde(default)]
+    measured: Option<DeviceQualificationMeasurement>,
+    /// Whether the measured jobs met the requirement.
+    qualified: bool,
+    /// Why qualification was refused.
+    #[serde(default)]
+    reason: Option<String>,
 }
 
 /// The run context block the rig emits in its `run_header` record. All fields
@@ -334,6 +419,10 @@ struct Report {
     unknown_series_names: Vec<String>,
     /// Whether the run's p99s all met their thresholds.
     gate: GateVerdict,
+    /// D19 device preflight. Absent for standalone dashboard use; the kill-9
+    /// gate always supplies it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    device_qualification: Option<DeviceQualification>,
     /// The run context echoed from the `run_header` record, when present.
     #[serde(skip_serializing_if = "Option::is_none")]
     run: Option<RunContext>,
@@ -385,6 +474,11 @@ struct Cli {
     /// criterion gates on this flag; a series with no samples fails the gate.
     #[arg(long)]
     gate: bool,
+    /// D19 device-qualification JSON emitted before the P2 load starts. If it
+    /// says the device is unqualified, latency comparisons are withheld while
+    /// missing telemetry still fails.
+    #[arg(long)]
+    device_qualification: Option<PathBuf>,
     /// Threshold override for `journal_commit_ms` (µs). Default: the D16 2 ms
     /// target.
     #[arg(long, default_value_t = ThresholdsUs::D16.journal_commit_ms)]
@@ -422,7 +516,32 @@ fn run() -> Result<ExitCode> {
         area_first_page_ms: cli.area_first_page_ms,
     };
     let loaded = load(&cli.files)?;
-    Ok(report_and_maybe_gate(&cli, &thresholds, &loaded))
+    let qualification = cli
+        .device_qualification
+        .as_deref()
+        .map(load_device_qualification)
+        .transpose()?;
+    Ok(report_and_maybe_gate(
+        &cli,
+        &thresholds,
+        &loaded,
+        qualification,
+    ))
+}
+
+/// Read and minimally validate the harness-owned qualification artifact.
+fn load_device_qualification(path: &std::path::Path) -> Result<DeviceQualification> {
+    let file = File::open(path)
+        .with_context(|| format!("failed to open device qualification {}", path.display()))?;
+    let qualification: DeviceQualification = serde_json::from_reader(file)
+        .with_context(|| format!("failed to parse device qualification {}", path.display()))?;
+    anyhow::ensure!(
+        qualification.kind == "d19_device_qualification",
+        "device qualification {} has unexpected kind {:?}",
+        path.display(),
+        qualification.kind
+    );
+    Ok(qualification)
 }
 
 /// The fully-parsed input: per-series histograms plus the run context.
@@ -552,8 +671,13 @@ fn threshold_for(t: &ThresholdsUs, key: &str) -> Option<u64> {
 /// Build the report from the loaded input, print it, and return the process
 /// exit code under `--gate`. This is the whole gate; `run()` is just this
 /// plus file IO, so the tests exercise the exact binary path.
-fn report_and_maybe_gate(cli: &Cli, thresholds: &ThresholdsUs, loaded: &Loaded) -> ExitCode {
-    let report = build_report(thresholds, loaded);
+fn report_and_maybe_gate(
+    cli: &Cli,
+    thresholds: &ThresholdsUs,
+    loaded: &Loaded,
+    qualification: Option<DeviceQualification>,
+) -> ExitCode {
+    let report = build_report(thresholds, loaded, qualification);
 
     if cli.json {
         match serde_json::to_string_pretty(&report) {
@@ -568,17 +692,55 @@ fn report_and_maybe_gate(cli: &Cli, thresholds: &ThresholdsUs, loaded: &Loaded) 
     }
 
     if cli.gate {
-        if report.gate == GateVerdict::Pass {
-            ExitCode::SUCCESS
-        } else {
-            for line in gate_failure_report(&report) {
-                eprintln!("{line}");
+        match report.gate {
+            GateVerdict::Pass => ExitCode::SUCCESS,
+            GateVerdict::Unqualified => {
+                for line in gate_unqualified_report(&report) {
+                    eprintln!("{line}");
+                }
+                ExitCode::SUCCESS
             }
-            ExitCode::FAILURE
+            GateVerdict::Fail => {
+                for line in gate_failure_report(&report) {
+                    eprintln!("{line}");
+                }
+                ExitCode::FAILURE
+            }
         }
     } else {
         ExitCode::SUCCESS
     }
+}
+
+/// The explicit non-verdict printed when D19's preflight refuses the device.
+fn gate_unqualified_report(r: &Report) -> Vec<String> {
+    let Some(q) = &r.device_qualification else {
+        return vec!["LATENCY UNQUALIFIED: device qualification is absent".to_string()];
+    };
+    let required = &q.required;
+    let mut lines = vec![
+        "LATENCY UNQUALIFIED: D19 device qualification failed; D16 latency verdict withheld"
+            .to_string(),
+    ];
+    if let Some(measured) = &q.measured {
+        lines.push(format!(
+            "  fio job A: {:.1} barriers/s measured vs {:.1} reference; p99 {:.3} ms vs {:.3} ms reference; max {:.3} ms vs required < {:.3} ms (reference {:.3} ms)",
+            measured.aggregate_barriers_per_s,
+            required.reference_barriers_per_s,
+            measured.worst_sync_p99_ms,
+            required.reference_sync_p99_ms,
+            measured.worst_sync_max_ms,
+            required.sync_max_ms_below,
+            required.reference_sync_max_ms,
+        ));
+    } else {
+        lines.push(format!(
+            "  no fio measurement: {}",
+            q.reason.as_deref().unwrap_or("preflight unavailable")
+        ));
+    }
+    lines.push(format!("  journal path: {}", q.data_path));
+    lines
 }
 
 /// The stderr text the `--gate` failure path prints, one entry per line.
@@ -609,7 +771,7 @@ fn gate_failure_report(r: &Report) -> Vec<String> {
         .collect();
     let missed: Vec<&(&&str, &SeriesSummary)> = gated
         .iter()
-        .filter(|(_, s)| !matches!(s.gate, SeriesGate::Pass | SeriesGate::NotGated))
+        .filter(|(_, s)| matches!(s.gate, SeriesGate::Fail | SeriesGate::MissingData))
         .collect();
     let passed: Vec<&str> = gated
         .iter()
@@ -692,9 +854,16 @@ fn gate_failure_report(r: &Report) -> Vec<String> {
 /// Summarize every series and adjudicate the verdict. Split out of
 /// [`report_and_maybe_gate`] so the containment tests can assert on the whole
 /// report rather than on an exit code that compresses it to one bit.
-fn build_report(thresholds: &ThresholdsUs, loaded: &Loaded) -> Report {
+fn build_report(
+    thresholds: &ThresholdsUs,
+    loaded: &Loaded,
+    qualification: Option<DeviceQualification>,
+) -> Report {
     let mut series = BTreeMap::new();
     let mut any_fail = false;
+    let device_qualified = qualification
+        .as_ref()
+        .is_none_or(|qualification| qualification.qualified);
     for (i, key) in SERIES_KEYS.iter().enumerate() {
         let hist = &loaded.histograms[i];
         let (p50_us, p99_us, max_us) = if hist.total() == 0 {
@@ -713,11 +882,12 @@ fn build_report(thresholds: &ThresholdsUs, loaded: &Loaded) -> Report {
             // D16 series does.
             (None, _) => SeriesGate::NotGated,
             (Some(_), None) => SeriesGate::MissingData,
+            (Some(_), Some(_)) if !device_qualified => SeriesGate::Unqualified,
             (Some(t), Some(p99)) if p99 <= t => SeriesGate::Pass,
             (Some(_), Some(_)) => SeriesGate::Fail,
         };
         debug_assert_eq!(i < NUM_GATED, threshold_us.is_some());
-        if gate != SeriesGate::Pass && gate != SeriesGate::NotGated {
+        if matches!(gate, SeriesGate::Fail | SeriesGate::MissingData) {
             any_fail = true;
         }
         series.insert(
@@ -744,7 +914,7 @@ fn build_report(thresholds: &ThresholdsUs, loaded: &Loaded) -> Report {
     // or exit code can move here — see `containment_changes_no_verdict`.
     let failing: BTreeSet<&str> = series
         .iter()
-        .filter(|(_, s)| !matches!(s.gate, SeriesGate::Pass | SeriesGate::NotGated))
+        .filter(|(_, s)| matches!(s.gate, SeriesGate::Fail | SeriesGate::MissingData))
         .map(|(key, _)| *key)
         .collect();
     let mut root_causes = Vec::new();
@@ -775,9 +945,12 @@ fn build_report(thresholds: &ThresholdsUs, loaded: &Loaded) -> Report {
         unknown_series_names: loaded.unknown_series_names.iter().cloned().collect(),
         gate: if any_fail {
             GateVerdict::Fail
-        } else {
+        } else if device_qualified {
             GateVerdict::Pass
+        } else {
+            GateVerdict::Unqualified
         },
+        device_qualification: qualification,
         run: loaded.run_ctx.clone(),
         series,
         root_causes,
@@ -824,6 +997,7 @@ fn print_human(r: &Report) {
             SeriesGate::Pass => "PASS",
             SeriesGate::Fail => "FAIL",
             SeriesGate::MissingData => "MISSING",
+            SeriesGate::Unqualified => "UNQUALIFIED",
             SeriesGate::NotGated => "—",
         };
         let threshold = s.threshold_us.map_or_else(|| "—".into(), |v| v.to_string());
@@ -848,10 +1022,10 @@ fn print_human(r: &Report) {
     println!();
     println!(
         "GATE: {}",
-        if r.gate == GateVerdict::Pass {
-            "PASS"
-        } else {
-            "FAIL"
+        match r.gate {
+            GateVerdict::Pass => "PASS",
+            GateVerdict::Fail => "FAIL",
+            GateVerdict::Unqualified => "UNQUALIFIED (D19 device preflight failed)",
         }
     );
 }
@@ -980,6 +1154,7 @@ mod tests {
             files,
             json: false,
             gate: true,
+            device_qualification: None,
             journal_commit_ms: ThresholdsUs::D16.journal_commit_ms,
             bulk_ack_ms: ThresholdsUs::D16.bulk_ack_ms,
             intent_commit_ms: ThresholdsUs::D16.intent_commit_ms,
@@ -996,19 +1171,68 @@ mod tests {
         let cli = gate_cli(vec![path.clone()]);
         let thresholds = ThresholdsUs::D16;
         let loaded = load(&cli.files).expect("test jsonl loads");
-        let exit = report_and_maybe_gate(&cli, &thresholds, &loaded);
+        let exit = report_and_maybe_gate(&cli, &thresholds, &loaded, None);
         let _ = std::fs::remove_file(&path);
         exit
     }
 
     /// Build the full report for `lines` the way the binary would.
     fn report_on(lines: Vec<serde_json::Value>) -> Report {
+        report_on_with_qualification(lines, None)
+    }
+
+    fn report_on_with_qualification(
+        lines: Vec<serde_json::Value>,
+        qualification: Option<DeviceQualification>,
+    ) -> Report {
         let path = tmp("report");
         write_jsonl(&path, &lines);
         let loaded = load(std::slice::from_ref(&path)).expect("test jsonl loads");
-        let report = build_report(&ThresholdsUs::D16, &loaded);
+        let report = build_report(&ThresholdsUs::D16, &loaded, qualification);
         let _ = std::fs::remove_file(&path);
         report
+    }
+
+    fn qualification(qualified: bool) -> DeviceQualification {
+        DeviceQualification {
+            kind: "d19_device_qualification".to_string(),
+            method: "fio_job_a".to_string(),
+            command: "fio --name=jobA --directory=<journal-filesystem> --rw=write --bs=8k --fdatasync=1 --numjobs=2 --rate_iops=470 --runtime=120 --time_based --size=256m --output-format=json --unlink=1".to_string(),
+            data_path: "/journal-device".to_string(),
+            fio_version: Some("fio-3.42".to_string()),
+            required: DeviceQualificationRequirement {
+                jobs: 2,
+                runtime_seconds: 120,
+                block_size_bytes: 8192,
+                offered_rate_iops_per_job: 470.0,
+                minimum_rate_iops_per_job: 469.0,
+                sync_max_ms_below: 1.0,
+                reference_barriers_per_s: 940.0,
+                reference_sync_p99_ms: 0.185,
+                reference_sync_max_ms: 0.509,
+            },
+            measured: Some(DeviceQualificationMeasurement {
+                aggregate_barriers_per_s: if qualified { 940.0 } else { 674.6 },
+                worst_sync_p99_ms: if qualified { 0.185 } else { 7.045 },
+                worst_sync_max_ms: if qualified { 0.509 } else { 104.120 },
+                jobs: vec![
+                    DeviceQualificationJob {
+                        iops: if qualified { 470.0 } else { 337.3 },
+                        sync_p99_ms: if qualified { 0.185 } else { 7.045 },
+                        sync_max_ms: if qualified { 0.509 } else { 104.120 },
+                    },
+                    DeviceQualificationJob {
+                        iops: if qualified { 470.0 } else { 337.3 },
+                        sync_p99_ms: if qualified { 0.170 } else { 7.045 },
+                        sync_max_ms: if qualified { 0.480 } else { 95.393 },
+                    },
+                ],
+            }),
+            qualified,
+            reason: (!qualified).then(|| {
+                "each job must sustain the offered rate and remain below the maximum".to_string()
+            }),
+        }
     }
 
     /// A run in which the journal committer is the thing that is broken: the
@@ -1144,6 +1368,84 @@ mod tests {
     }
 
     #[test]
+    fn unqualified_device_withholds_every_latency_verdict_but_keeps_measurements() {
+        let r = report_on_with_qualification(slow_committer(), Some(qualification(false)));
+        assert_eq!(r.gate, GateVerdict::Unqualified);
+        assert!(
+            r.root_causes.is_empty(),
+            "an unjudged run has no latency root cause"
+        );
+        for key in GATED_SERIES {
+            let summary = &r.series[key];
+            assert_eq!(summary.gate, SeriesGate::Unqualified, "{key} was judged");
+            assert!(summary.p99_us.is_some(), "{key}'s measurement disappeared");
+            assert!(
+                summary.threshold_us.is_some(),
+                "{key}'s D16 target disappeared"
+            );
+        }
+        let qualification = r
+            .device_qualification
+            .as_ref()
+            .expect("the refusal must travel with the report");
+        let measured = qualification.measured.as_ref().expect("fio did run");
+        assert_eq!(measured.worst_sync_p99_ms, 7.045);
+        assert_eq!(measured.worst_sync_max_ms, 104.120);
+        assert_eq!(qualification.required.sync_max_ms_below, 1.0);
+        let text = gate_unqualified_report(&r).join("\n");
+        for needle in [
+            "UNQUALIFIED",
+            "7.045",
+            "104.120",
+            "< 1.000",
+            "0.185",
+            "0.509",
+        ] {
+            assert!(text.contains(needle), "{needle:?} absent from:\n{text}");
+        }
+    }
+
+    #[test]
+    fn injected_qualified_device_preserves_the_existing_failure_path() {
+        let r = report_on_with_qualification(slow_committer(), Some(qualification(true)));
+        assert_eq!(r.gate, GateVerdict::Fail);
+        assert_eq!(r.series[SERIES_JOURNAL_COMMIT].gate, SeriesGate::Fail);
+        let text = gate_failure_report(&r).join("\n");
+        assert!(text.contains(SERIES_JOURNAL_COMMIT));
+        assert!(text.contains("ROOT CAUSE"));
+    }
+
+    #[test]
+    fn missing_latency_data_still_fails_on_an_unqualified_device() {
+        let lines = conforming()
+            .into_iter()
+            .filter(|v| v.get("series").and_then(|s| s.as_str()) != Some(SERIES_INTENT_COMMIT))
+            .collect::<Vec<_>>();
+        let r = report_on_with_qualification(lines, Some(qualification(false)));
+        assert_eq!(r.gate, GateVerdict::Fail);
+        assert_eq!(r.series[SERIES_INTENT_COMMIT].gate, SeriesGate::MissingData);
+        for key in [
+            SERIES_JOURNAL_COMMIT,
+            SERIES_BULK_ACK,
+            SERIES_AREA_FIRST_PAGE,
+        ] {
+            assert_eq!(r.series[key].gate, SeriesGate::Unqualified);
+        }
+        let text = gate_failure_report(&r).join("\n");
+        assert!(text.contains(SERIES_INTENT_COMMIT));
+        for key in [
+            SERIES_JOURNAL_COMMIT,
+            SERIES_BULK_ACK,
+            SERIES_AREA_FIRST_PAGE,
+        ] {
+            assert!(
+                !text.contains(key),
+                "unqualified {key} was rendered as a latency failure:\n{text}"
+            );
+        }
+    }
+
+    #[test]
     fn gate_fails_when_one_series_regresses() {
         // Mutate the bulk-ack series so its p99 lands above the 5 ms target.
         // 150 extra samples at 20 ms against a 100-sample base means p99 is
@@ -1246,7 +1548,7 @@ mod tests {
         assert_eq!(loaded.histograms[idx].total(), 50);
         // 300 ms would fail every D16 threshold; the run still passes.
         assert_eq!(
-            report_and_maybe_gate(&cli, &ThresholdsUs::D16, &loaded),
+            report_and_maybe_gate(&cli, &ThresholdsUs::D16, &loaded, None),
             ExitCode::SUCCESS
         );
         let _ = std::fs::remove_file(path);
@@ -1305,7 +1607,7 @@ mod tests {
         assert_eq!(observed, baseline, "a server span moved a gated p99");
 
         assert_eq!(
-            report_and_maybe_gate(&cli, &ThresholdsUs::D16, &loaded),
+            report_and_maybe_gate(&cli, &ThresholdsUs::D16, &loaded, None),
             ExitCode::SUCCESS
         );
         let _ = std::fs::remove_file(path);
@@ -1371,7 +1673,7 @@ mod tests {
         );
 
         assert_eq!(
-            report_and_maybe_gate(&cli, &ThresholdsUs::D16, &loaded),
+            report_and_maybe_gate(&cli, &ThresholdsUs::D16, &loaded, None),
             ExitCode::SUCCESS,
             "300 ms of ungated client attribution failed a conforming run"
         );
@@ -1415,7 +1717,7 @@ mod tests {
         // Counting them is diagnostic, not gating.
         let cli = gate_cli(vec![path.clone()]);
         assert_eq!(
-            report_and_maybe_gate(&cli, &ThresholdsUs::D16, &loaded),
+            report_and_maybe_gate(&cli, &ThresholdsUs::D16, &loaded, None),
             ExitCode::SUCCESS
         );
         let _ = std::fs::remove_file(path);
