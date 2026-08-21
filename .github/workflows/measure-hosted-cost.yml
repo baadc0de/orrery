@@ -1,0 +1,268 @@
+# THROWAWAY. Issue #171 — measure what `clippy`, `gates` and `test` cost on a
+# GitHub-hosted runner, cold, before #178/#179 move them there.
+#
+# This file is deleted in the same pull request that adds it. The deliverable is
+# the table of numbers, not the workflow. Nothing else in the repository may
+# depend on it, and `scripts/gate-status.sh` does not discover it (it reads the
+# `jobs:` keys of nightly.yml and ci.yml only, scripts/gate-status.sh:102).
+#
+# Why the numbers are needed. #170 sizes one risk by assumption: "GitHub-hosted
+# `ubuntu-latest` provides roughly 14 GB of free disk; this workspace's
+# `target/` reaches 60 GB." Six hosted jobs already pass, but three of them are
+# trivial and none of the disk-hungry lanes has ever run there on a
+# same-repository event — ci.yml pins them to `[self-hosted, orrery-*]`.
+#
+# The measurement is deliberately the worst case: no `actions/cache`,
+# `RUSTC_WRAPPER` empty (as ci.yml:54 already sets it for hosted runners), no
+# `CARGO_TARGET_DIR` relocation. A run that moved `target/` to the second disk
+# would not be measuring the lane ci.yml runs (AGENTS.md:202-208).
+#
+# Sampling. A `df` before and after misses the peak, and the peak is the whole
+# question: #168 was `collect2: fatal error: ld terminated with signal 7 [Bus
+# error]` — a disk that filled during linking and then freed. So a background
+# sampler writes `df -B1` for `/` and `/mnt` plus used memory every 2 s for the
+# whole life of the lane, and a second sampler `du -sb`s the workspace every
+# 30 s. Peaks are reduced from those series, and both series are uploaded as an
+# artifact so the reduction is checkable rather than asserted.
+
+name: measure hosted cost (#171, throwaway)
+
+on:
+  workflow_dispatch:
+  # A `workflow_dispatch`-only workflow cannot be dispatched until it exists on
+  # the default branch, and this one is never going to be on the default
+  # branch. So it also triggers on pushes to its own branch, and only that
+  # branch. It is deleted before the pull request is merged.
+  push:
+    branches: [ci/measure-hosted-runner-cost]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  # ci.yml:54 — hosted runners have no kache to hit.
+  RUSTC_WRAPPER: ""
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  # Is any larger hosted shape reachable from this repository at all? Larger
+  # runners are an organisation feature; this repository is owned by a user
+  # account, so the honest answer may be "no", and that is a finding #170 needs
+  # rather than something to work around. Cheap: each leg prints its own shape
+  # and exits.
+  probe-shapes:
+    name: probe ${{ matrix.label }}
+    strategy:
+      fail-fast: false
+      matrix:
+        label:
+          - ubuntu-latest
+          - ubuntu-24.04-arm
+          - ubuntu-latest-4-core
+          - ubuntu-latest-8-core
+          - ubuntu-latest-16-core
+    runs-on: ${{ matrix.label }}
+    timeout-minutes: 10
+    steps:
+      - name: What is this machine
+        run: |
+          set -euo pipefail
+          {
+            echo "### ${{ matrix.label }}"
+            echo
+            echo '```'
+            echo "arch:    $(uname -m)"
+            echo "nproc:   $(nproc)"
+            echo "memory:  $(free -h | awk '/^Mem:/{print $2}')"
+            echo
+            df -h / /mnt 2>&1 || true
+            echo
+            lsblk -o NAME,SIZE,MOUNTPOINT 2>&1 || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          df -h
+
+  measure:
+    name: ${{ matrix.lane }} on ${{ matrix.runner }}
+    strategy:
+      # One lane running out of disk is the most informative result this
+      # workflow can produce. Never cancel the others because of it.
+      fail-fast: false
+      matrix:
+        lane: [clippy, gates, test]
+        runner: [ubuntu-latest]
+    runs-on: ${{ matrix.runner }}
+    # ci.yml gives these lanes 30 minutes on a warm self-hosted box. Cold, with
+    # no cache at all, they may take far longer; a bound this generous is there
+    # so "it did not finish" means the lane, not the clock.
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Baseline — the machine, before anything is installed
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/measure"
+          df -B1 --output=used,avail / | tail -1 \
+            > "$RUNNER_TEMP/measure/baseline-root"
+          {
+            echo "arch=$(uname -m) nproc=$(nproc)"
+            free -h
+            df -h / /mnt 2>&1 || true
+            lsblk -o NAME,SIZE,MOUNTPOINT 2>&1 || true
+          } | tee "$RUNNER_TEMP/measure/machine.txt"
+
+      - name: Install the pinned toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+
+      # Exactly what ci.yml installs for this lane, and nothing more: `clippy`
+      # and `test` need Bevy's Linux build dependencies (ci.yml's "Install
+      # Bevy's Linux build dependencies" steps), `clippy` and `gates` need the
+      # FoundationDB client. Installing a superset would inflate the disk
+      # figure for the lane that does not need it.
+      - name: Install Bevy's Linux build dependencies
+        if: matrix.lane == 'clippy' || matrix.lane == 'test'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            g++ pkg-config libx11-dev libasound2-dev libudev-dev \
+            libwayland-dev libxkbcommon-dev
+
+      - name: Install the FoundationDB client
+        if: matrix.lane == 'clippy' || matrix.lane == 'gates'
+        uses: ./.github/actions/foundationdb
+
+      # Deliberately no actions/cache: #171 measures the uncached worst case so
+      # the later cache comparison (#175) has an honest floor.
+
+      - name: Run the lane with disk and memory sampled underneath it
+        id: lane
+        run: |
+          set -uo pipefail
+          out="$RUNNER_TEMP/measure"
+          df_csv="$out/df.csv"
+          du_csv="$out/du.csv"
+
+          # Every 2 s: bytes used and bytes available on the filesystem the
+          # workspace lives on, the same for the second disk at /mnt, and used
+          # memory. Cheap enough to run at this interval for hours.
+          printf 'epoch,root_used,root_avail,mnt_used,mnt_avail,mem_used\n' > "$df_csv"
+          (
+            while true; do
+              r=$(df -B1 --output=used,avail / | tail -1)
+              m="0 0"
+              [[ -d /mnt ]] && m=$(df -B1 --output=used,avail /mnt | tail -1) || true
+              mem=$(free -b | awk '/^Mem:/{print $3}')
+              echo "$(date +%s),$(echo $r | tr ' ' ','),$(echo $m | tr ' ' ','),$mem" >> "$df_csv"
+              sleep 2
+            done
+          ) & df_pid=$!
+
+          # Every 30 s: the size of the checkout, which is target/ plus a few
+          # MB. `du` over a large target/ walks hundreds of thousands of
+          # inodes, so it gets a slower interval than df — the df series is the
+          # one the peak is read from, and this one attributes it.
+          printf 'epoch,workspace_bytes\n' > "$du_csv"
+          (
+            while true; do
+              echo "$(date +%s),$(du -sb "$GITHUB_WORKSPACE" 2>/dev/null | cut -f1)" >> "$du_csv"
+              sleep 30
+            done
+          ) & du_pid=$!
+
+          start=$(date +%s)
+          # /usr/bin/time -v reports the maximum resident set size seen by any
+          # process in the tree it waited on, which is the cheap peak-RSS the
+          # issue asks for if it is cheap to get. Not piped anywhere: the full
+          # lane log is what makes a failure diagnosable, and a `tail` would
+          # throw away the part that names the failing command.
+          if [[ -x /usr/bin/time ]]; then
+            /usr/bin/time -v -o "$out/time.txt" ./scripts/check.sh "${{ matrix.lane }}"
+          else
+            echo "note: GNU time absent, peak RSS not measured" | tee "$out/time.txt"
+            ./scripts/check.sh "${{ matrix.lane }}"
+          fi
+          rc=$?
+          end=$(date +%s)
+
+          kill "$df_pid" "$du_pid" 2>/dev/null || true
+          wait "$df_pid" "$du_pid" 2>/dev/null || true
+
+          echo "lane_rc=$rc"      >> "$GITHUB_OUTPUT"
+          echo "wall_s=$((end - start))" >> "$GITHUB_OUTPUT"
+          # The step itself does not fail on a failing lane: the report below
+          # is the deliverable and it has to run either way. The job's verdict
+          # is asserted in the final step instead.
+          exit 0
+
+      - name: Reduce the samples to peaks
+        if: always()
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/measure"
+          read -r base_used base_avail < "$out/baseline-root"
+
+          # Peak = the maximum bytes used on / across the whole series, and the
+          # minimum bytes still free across the same series. Both are read from
+          # the sampled series, not from a final df.
+          read -r peak_used min_avail n < <(
+            awk -F, 'NR>1 {
+              if ($2 > pu) pu = $2
+              if (ma == 0 || $3 < ma) ma = $3
+              c++
+            } END { print pu, ma, c }' "$out/df.csv"
+          )
+          peak_mem=$(awk -F, 'NR>1 && $6 > m { m = $6 } END { print m+0 }' "$out/df.csv")
+          peak_ws=$(awk -F, 'NR>1 && $2 > m { m = $2 } END { print m+0 }' "$out/du.csv")
+          final_ws=$(awk -F, 'END { print $2+0 }' "$out/du.csv")
+          max_rss_kb=$(awk '/Maximum resident set size/ { print $NF }' "$out/time.txt" 2>/dev/null || echo 0)
+
+          gb() { awk -v b="$1" 'BEGIN { printf "%.2f", b/1073741824 }'; }
+
+          rc='${{ steps.lane.outputs.lane_rc }}'
+          wall='${{ steps.lane.outputs.wall_s }}'
+          [[ -n "$rc" ]] || rc="(step did not report — job was killed)"
+          [[ -n "$wall" ]] || wall=0
+
+          {
+            echo "## ${{ matrix.lane }} on ${{ matrix.runner }} — cold, no cache"
+            echo
+            echo "| figure | value |"
+            echo "|---|---|"
+            echo "| completed | $([[ "$rc" == 0 ]] && echo 'yes' || echo "no (exit $rc)") |"
+            echo "| wall-clock (lane only) | ${wall}s ($(awk -v s="$wall" 'BEGIN{printf "%dm %02ds", s/60, s%60}')) |"
+            echo "| peak bytes used on / | $(gb "$peak_used") GiB |"
+            echo "| free bytes on / at peak | $(gb "$min_avail") GiB |"
+            echo "| used on / before the lane | $(gb "$base_used") GiB (free $(gb "$base_avail") GiB) |"
+            echo "| peak growth attributable to the run | $(gb "$((peak_used - base_used))") GiB |"
+            echo "| peak workspace size (du, 30s) | $(gb "$peak_ws") GiB |"
+            echo "| workspace size at the end | $(gb "$final_ws") GiB |"
+            echo "| peak used memory | $(gb "$peak_mem") GiB |"
+            echo "| max RSS of the heaviest process | $(awk -v k="$max_rss_kb" 'BEGIN{printf "%.2f", k/1048576}') GiB |"
+            echo "| df samples taken | $n at 2s |"
+            echo
+            echo '<details><summary>machine</summary>'
+            echo
+            echo '```'
+            cat "$out/machine.txt"
+            echo '```'
+            echo '</details>'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: samples-${{ matrix.lane }}-${{ matrix.runner }}
+          path: ${{ runner.temp }}/measure/
+          retention-days: 30
+
+      - name: The lane's own verdict
+        if: always()
+        run: |
+          rc='${{ steps.lane.outputs.lane_rc }}'
+          if [[ "$rc" != 0 ]]; then
+            echo "::error::${{ matrix.lane }} did not complete on ${{ matrix.runner }} (exit ${rc:-unknown})"
+            exit 1
+          fi
