@@ -45,6 +45,7 @@ their linked dependencies.
 | D28 | [ADR-0028](adr/0028-witness-set-seeding.md) | Witness-set seeding, announcement envelope, `epoch/` record |
 | D29 | [ADR-0029](adr/0029-low-population-path.md) | P5 low-population path: quarantined provisional commit, spot replay, annulment |
 | D30 | [ADR-0030](adr/0030-cell-epoch-standing.md) | An intent is judged only under a cell-epoch its issuer stands in (**Proposed**) |
+| D31 | [ADR-0031](adr/0031-id-account-subspace.md) | The `id/` account subspace, its reverse index, and what a miss means |
 
 ## Status and supersession
 
