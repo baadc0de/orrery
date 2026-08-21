@@ -282,9 +282,10 @@ pub async fn run(spec: PeerSpec) -> Result<()> {
     ] {
         let session =
             Session::connect(secret.clone(), crate::endpoint_addr(node_id, addr)?).await?;
-        session.send_control(&GatewayMsg::Hello {
+        session.send_control(&GatewayMsg::VersionedHello {
             token: token.clone(),
             node,
+            version: orrery_protocol::PROTOCOL_VERSION,
         })?;
         let hello = session.recv(Duration::from_secs(10)).await;
         anyhow::ensure!(

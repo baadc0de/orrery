@@ -26,10 +26,14 @@
 /// all would only move the failure to the first low-population commit in the
 /// cell it happens to be standing in.
 ///
-/// The window is enforced by
-/// [`GatewayMsg::protocol_accepted`](crate::GatewayMsg::protocol_accepted), and
-/// only against clients that bootstrap with
-/// [`GatewayMsg::VersionedHello`](crate::GatewayMsg::VersionedHello): the
-/// unversioned [`GatewayMsg::Hello`](crate::GatewayMsg::Hello) is still
-/// accepted unchecked, so enforcement is opt-in until that variant is removed.
+/// The version is enforced by
+/// [`GatewayMsg::protocol_accepted`](crate::GatewayMsg::protocol_accepted)
+/// against every client, because
+/// [`GatewayMsg::VersionedHello`](crate::GatewayMsg::VersionedHello) is now the
+/// only bootstrap a gateway admits. The unversioned
+/// [`GatewayMsg::Hello`](crate::GatewayMsg::Hello) is retired as a wire
+/// bootstrap and is refused with
+/// [`GatewayReply::HelloRefused`](crate::GatewayReply::HelloRefused): a
+/// bootstrap that names no version cannot be shown to be inside a window of
+/// one, and admitting it unchecked was the hole that made enforcement opt-in.
 pub const PROTOCOL_VERSION: u16 = 2;

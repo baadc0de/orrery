@@ -260,16 +260,17 @@ Do not apply postcard's varints to the §2 or §3 signing preimages. Conversely,
 do not encode announcement claims as fixed-width integers: their signature is
 over postcard bytes.
 
-## 7. Protocol version 1
+## 7. Protocol version 2
 
-`PROTOCOL_VERSION` is currently `1`. A versioned gateway accepts an offered
-version exactly when it is its current version `V` or `V - 1` (saturating at
-zero). At `V = 1`, accepted offers are therefore `1` and `0`; any other value
-must be refused. The deployment rule is cluster first, then clients.
+`PROTOCOL_VERSION` is `2`. A gateway accepts an offered version exactly when it
+equals its own — D29 clause 5 closed the `{V, V−1}` rolling window for all
+traffic, so there is no predecessor to accept and no cluster-first deployment
+order to observe. Any other value must be refused.
 
-This check applies only to `GatewayMsg::VersionedHello`. The older unversioned
-`GatewayMsg::Hello` remains accepted without a version check, so version
-enforcement is currently opt-in rather than universal. Version 1 does **not**
+The check binds every session, because `GatewayMsg::VersionedHello` is the only
+bootstrap a gateway admits. The older unversioned `GatewayMsg::Hello` is retired
+and refused with `GatewayReply::HelloRefused` rather than dropped, so version
+enforcement is universal rather than opt-in. The version does **not**
 mean that D27 changed the postcard `Attestation` shape: D27 intentionally adds
 no fields and specifies only different signed bytes. As the conformance warning
 states, those signed bytes have not landed in the inspected implementation.

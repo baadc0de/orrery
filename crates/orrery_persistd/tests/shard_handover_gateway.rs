@@ -218,7 +218,7 @@ impl Fixture {
         for seed in 1..=peer_count {
             let (endpoint, connection) = raw_connection(secret(seed), server.addr()).await;
             connection
-                .send_control(&GatewayMsg::Hello {
+                .send_control(&GatewayMsg::VersionedHello {
                     token: support::session_token(
                         &issuer,
                         node(seed),
@@ -226,6 +226,7 @@ impl Fixture {
                         support::TOKEN_TTL_MS,
                     ),
                     node: node(seed),
+                    version: orrery_protocol::PROTOCOL_VERSION,
                 })
                 .await;
             let ack = connection.next_payload(Duration::from_secs(5)).await;

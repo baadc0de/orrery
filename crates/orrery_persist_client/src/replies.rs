@@ -165,11 +165,12 @@ pub(crate) fn process_replies(mut context: ReplyProcessingContext) {
                     end_session(&mut context.session);
                     continue;
                 }
-                // Acceptance is mutual. A gateway outside this client's
-                // `{V, V−1}` window speaks a wire surface this build cannot
-                // read, and storing its version would leave the session
-                // nominally up while every later message was decoded against
-                // the wrong shape.
+                // Acceptance is mutual, and exact — D29 clause 5 closed the
+                // `{V, V−1}` window. A gateway naming any version but this
+                // build's speaks a wire surface this build cannot read, and
+                // storing its version would leave the session nominally up
+                // while every later message was decoded against the wrong
+                // shape.
                 if !orrery_protocol::GatewayMsg::protocol_accepted(
                     orrery_protocol::PROTOCOL_VERSION,
                     protocol,

@@ -188,7 +188,7 @@ fn an_island_departing_at_once_parks_every_lease_it_held() {
         for seed in 1..=PEERS {
             let (endpoint, connection) = raw_connection(support::secret(seed), server.addr()).await;
             connection
-                .send_control(&GatewayMsg::Hello {
+                .send_control(&GatewayMsg::VersionedHello {
                     token: support::session_token(
                         &issuer,
                         support::node(seed),
@@ -196,6 +196,7 @@ fn an_island_departing_at_once_parks_every_lease_it_held() {
                         support::TOKEN_TTL_MS,
                     ),
                     node: support::node(seed),
+                    version: orrery_protocol::PROTOCOL_VERSION,
                 })
                 .await;
             loop {

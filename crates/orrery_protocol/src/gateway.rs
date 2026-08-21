@@ -31,7 +31,24 @@ use crate::{
 /// A client → gateway message (docs/10-crates.md §9).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum GatewayMsg {
-    /// Session bootstrap: authenticate and negotiate the protocol version.
+    /// Session bootstrap that names no protocol version — **retired as a wire
+    /// bootstrap**, and refused by every gateway with
+    /// [`GatewayReply::HelloRefused`].
+    ///
+    /// It survives for two reasons, neither of them compatibility.
+    ///
+    /// **It must stay decodable to be refusable.** postcard keys variants
+    /// positionally, so deleting this arm renumbers every one after it: a
+    /// retired client's bootstrap would then decode as some unrelated variant
+    /// or fail to decode at all, and the gateway would drop it in silence.
+    /// That is exactly the outcome [`GatewayReply::HelloRefused`] exists to
+    /// prevent, so the wire form is kept in order to be turned away by name.
+    ///
+    /// **It is the gateway's internal normalized form.** A
+    /// [`GatewayMsg::VersionedHello`] whose version checks out is rewritten
+    /// into this variant, so the admission path — token, transport-identity
+    /// binding, session install — is written once rather than twice. Do not
+    /// read a `Hello` inside the gateway as one that arrived on the wire.
     Hello {
         /// The session token from `orrery_identity` login.
         token: Vec<u8>,
@@ -81,10 +98,10 @@ pub enum GatewayMsg {
     /// growing `Hello` would silently mis-decode every peer still sending the
     /// two-field form. Appending leaves that encoding untouched.
     ///
-    /// **Both bootstraps stay live.** A gateway accepts the unversioned
-    /// [`GatewayMsg::Hello`] without checking anything, so version enforcement
-    /// is opt-in: it binds the clients that send this variant, and becomes
-    /// universal only when `Hello` is removed.
+    /// **This is the only live bootstrap.** The unversioned
+    /// [`GatewayMsg::Hello`] is retired and refused, so version enforcement is
+    /// universal rather than opt-in: every session a gateway admits has stated
+    /// a version and had it checked for exact equality.
     VersionedHello {
         /// The session token from `orrery_identity` login.
         token: Vec<u8>,
@@ -254,10 +271,12 @@ pub enum GatewayReply {
     },
     /// The gateway refused the session.
     ///
-    /// A refused [`GatewayMsg::VersionedHello`] would otherwise be silent, and
-    /// silence here is indistinguishable from a slow gateway: the client would
-    /// re-dial and re-offer the same unacceptable version until it gave up,
-    /// with nothing to report but a timeout.
+    /// A refused bootstrap would otherwise be silent, and silence here is
+    /// indistinguishable from a slow gateway: the client would re-dial and
+    /// re-offer the same unacceptable bootstrap until it gave up, with nothing
+    /// to report but a timeout. Both refusals carry this reply — a
+    /// [`GatewayMsg::VersionedHello`] outside the accepted version, and the
+    /// retired unversioned [`GatewayMsg::Hello`].
     HelloRefused {
         /// The gateway's NodeId.
         gateway: NodeId,
@@ -310,9 +329,14 @@ pub enum GatewayReply {
 }
 
 impl GatewayReply {
-    /// [`GatewayReply::HelloRefused`] reason: the offered protocol version is
-    /// outside the `{V, V−1}` window this gateway accepts
-    /// ([`GatewayMsg::protocol_accepted`]).
+    /// [`GatewayReply::HelloRefused`] reason: the bootstrap did not name this
+    /// gateway's exact protocol version ([`GatewayMsg::protocol_accepted`]).
+    ///
+    /// One code covers both shapes of that failure — a
+    /// [`GatewayMsg::VersionedHello`] naming the wrong version, and the retired
+    /// [`GatewayMsg::Hello`] naming none — because the client's remedy is the
+    /// same in both: bootstrap with `VersionedHello` at the `protocol` this
+    /// reply carries, or stop dialling this cluster.
     pub const HELLO_REFUSED_PROTOCOL: u8 = 1;
 }
 
@@ -913,8 +937,11 @@ mod tests {
         let back: GatewayMsg = postcard::from_bytes(&bytes).unwrap();
         assert_eq!(back, versioned);
 
-        // The point of appending rather than growing `Hello`: a peer still
-        // sending the two-field form encodes exactly what it always did.
+        // The two-field form still encodes and decodes exactly what it always
+        // did. That is an *encoding* claim, not an admission one: a gateway
+        // refuses this bootstrap (`GatewayReply::HelloRefused`), and it stays
+        // decodable precisely so the refusal can name it instead of the
+        // gateway dropping an undecodable frame in silence.
         let unversioned = GatewayMsg::Hello {
             token: b"session-token".to_vec(),
             node: node(1),

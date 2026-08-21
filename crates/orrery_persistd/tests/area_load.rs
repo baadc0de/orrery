@@ -126,9 +126,10 @@ async fn dial(server: &GatewayServer) -> Client {
     let msg = admission.read_to_end(16).await.unwrap();
     assert_eq!(msg, vec![0u8]);
     let conn = lanes::GatewayLanes::attach(conn);
-    conn.send_control(&GatewayMsg::Hello {
+    conn.send_control(&GatewayMsg::VersionedHello {
         token: support::valid_session_token(node),
         node,
+        version: orrery_protocol::PROTOCOL_VERSION,
     })
     .await;
     assert!(matches!(

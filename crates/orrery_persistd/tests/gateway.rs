@@ -612,9 +612,10 @@ fn gateway_closes_the_client_to_actor_path() {
 
         // A claimed NodeId that does not equal the iroh-authenticated remote
         // identity must not activate lease traffic.
-        conn.send_control(&GatewayMsg::Hello {
+        conn.send_control(&GatewayMsg::VersionedHello {
             token: b"bad-node".to_vec(),
             node: node(2),
+            version: orrery_protocol::PROTOCOL_VERSION,
         })
         .await;
         conn.send_control(&GatewayMsg::Lease {
@@ -632,9 +633,10 @@ fn gateway_closes_the_client_to_actor_path() {
         .await;
 
         // A matching Hello binds the session and activates control traffic.
-        conn.send_control(&GatewayMsg::Hello {
+        conn.send_control(&GatewayMsg::VersionedHello {
             token: session_token(&issuer, node(1), 900, 200),
             node: node(1),
+            version: orrery_protocol::PROTOCOL_VERSION,
         })
         .await;
 
@@ -934,9 +936,10 @@ fn gateway_gates_client_claims_against_committed_location_and_authoritative_inte
         .unwrap();
         let (_client, connection) = raw_connection(secret(1), server.addr()).await;
         connection
-            .send_control(&GatewayMsg::Hello {
+            .send_control(&GatewayMsg::VersionedHello {
                 token: session_token(&issuer, node(1), 900, 200),
                 node: node(1),
+                version: orrery_protocol::PROTOCOL_VERSION,
             })
             .await;
         assert!(receives_hello_ack(&connection).await);
@@ -1050,9 +1053,10 @@ fn gateway_gates_client_claims_against_committed_location_and_authoritative_inte
 
         let (_stale_client, stale_connection) = raw_connection(secret(2), server.addr()).await;
         stale_connection
-            .send_control(&GatewayMsg::Hello {
+            .send_control(&GatewayMsg::VersionedHello {
                 token: session_token(&issuer, node(2), 900, 200),
                 node: node(2),
+                version: orrery_protocol::PROTOCOL_VERSION,
             })
             .await;
         assert!(receives_hello_ack(&stale_connection).await);
@@ -1148,9 +1152,10 @@ fn gateway_rejects_unverified_raw_iroh_hellos_before_authority_activation() {
 
         for (index, token) in invalid_tokens.into_iter().enumerate() {
             connection
-                .send_control(&GatewayMsg::Hello {
+                .send_control(&GatewayMsg::VersionedHello {
                     token,
                     node: node(1),
+                    version: orrery_protocol::PROTOCOL_VERSION,
                 })
                 .await;
             assert!(!receives_hello_ack(&connection).await);
@@ -1181,9 +1186,10 @@ fn gateway_rejects_unverified_raw_iroh_hellos_before_authority_activation() {
         }
 
         connection
-            .send_control(&GatewayMsg::Hello {
+            .send_control(&GatewayMsg::VersionedHello {
                 token: session_token(&issuer, node(1), 900, 200),
                 node: node(2),
+                version: orrery_protocol::PROTOCOL_VERSION,
             })
             .await;
         assert!(!receives_hello_ack(&connection).await);
@@ -1197,9 +1203,10 @@ fn gateway_rejects_unverified_raw_iroh_hellos_before_authority_activation() {
             .unwrap();
         let (_client, deny_connection) = raw_connection(secret(1), deny_server.addr()).await;
         deny_connection
-            .send_control(&GatewayMsg::Hello {
+            .send_control(&GatewayMsg::VersionedHello {
                 token: session_token(&issuer, node(1), 900, 200),
                 node: node(1),
+                version: orrery_protocol::PROTOCOL_VERSION,
             })
             .await;
         assert!(!receives_hello_ack(&deny_connection).await);
@@ -1250,9 +1257,10 @@ fn gateway_graces_only_the_established_matching_token_during_identity_outage() {
 
         let (_first_client, first) = raw_connection(secret(1), server.addr()).await;
         first
-            .send_control(&GatewayMsg::Hello {
+            .send_control(&GatewayMsg::VersionedHello {
                 token: token.clone(),
                 node: node(1),
+                version: orrery_protocol::PROTOCOL_VERSION,
             })
             .await;
         assert!(receives_hello_ack(&first).await);
@@ -1261,18 +1269,20 @@ fn gateway_graces_only_the_established_matching_token_during_identity_outage() {
         health.0.store(false, Ordering::SeqCst);
         let (_grace_client, grace) = raw_connection(secret(1), server.addr()).await;
         grace
-            .send_control(&GatewayMsg::Hello {
+            .send_control(&GatewayMsg::VersionedHello {
                 token: token.clone(),
                 node: node(1),
+                version: orrery_protocol::PROTOCOL_VERSION,
             })
             .await;
         assert!(receives_hello_ack(&grace).await);
 
         let (_new_client, newly_expired) = raw_connection(secret(2), server.addr()).await;
         newly_expired
-            .send_control(&GatewayMsg::Hello {
+            .send_control(&GatewayMsg::VersionedHello {
                 token: session_token(&issuer, node(2), 900, 200),
                 node: node(2),
+                version: orrery_protocol::PROTOCOL_VERSION,
             })
             .await;
         assert!(!receives_hello_ack(&newly_expired).await);
@@ -1281,9 +1291,10 @@ fn gateway_graces_only_the_established_matching_token_during_identity_outage() {
 
         let (_changed_client, changed_token) = raw_connection(secret(1), server.addr()).await;
         changed_token
-            .send_control(&GatewayMsg::Hello {
+            .send_control(&GatewayMsg::VersionedHello {
                 token: session_token(&issuer, node(1), 901, 200),
                 node: node(1),
+                version: orrery_protocol::PROTOCOL_VERSION,
             })
             .await;
         assert!(!receives_hello_ack(&changed_token).await);
@@ -1293,9 +1304,10 @@ fn gateway_graces_only_the_established_matching_token_during_identity_outage() {
         health.0.store(true, Ordering::SeqCst);
         let (_healthy_client, healthy) = raw_connection(secret(1), server.addr()).await;
         healthy
-            .send_control(&GatewayMsg::Hello {
+            .send_control(&GatewayMsg::VersionedHello {
                 token,
                 node: node(1),
+                version: orrery_protocol::PROTOCOL_VERSION,
             })
             .await;
         assert!(!receives_hello_ack(&healthy).await);
@@ -1332,9 +1344,10 @@ fn stale_inflight_claim_grant_is_parked_without_indexing_replacement() {
         .await
         .unwrap();
         let (old_client, old) = raw_connection(secret(1), server.addr()).await;
-        old.send_control(&GatewayMsg::Hello {
+        old.send_control(&GatewayMsg::VersionedHello {
             token: support::valid_session_token(node(1)),
             node: node(1),
+            version: orrery_protocol::PROTOCOL_VERSION,
         })
         .await;
         assert!(receives_hello_ack(&old).await);
@@ -1358,9 +1371,10 @@ fn stale_inflight_claim_grant_is_parked_without_indexing_replacement() {
         // When: a replacement for the same peer authenticates while that route is blocked.
         let (replacement_client, replacement) = raw_connection(secret(1), server.addr()).await;
         replacement
-            .send_control(&GatewayMsg::Hello {
+            .send_control(&GatewayMsg::VersionedHello {
                 token: support::valid_session_token(node(1)),
                 node: node(1),
+                version: orrery_protocol::PROTOCOL_VERSION,
             })
             .await;
 
@@ -1469,9 +1483,10 @@ fn pending_heartbeat_releases_peer_state_and_stale_session_gets_no_current_rows(
         .await
         .unwrap();
         let (old_client, old) = raw_connection(secret(1), server.addr()).await;
-        old.send_control(&GatewayMsg::Hello {
+        old.send_control(&GatewayMsg::VersionedHello {
             token: support::valid_session_token(node(1)),
             node: node(1),
+            version: orrery_protocol::PROTOCOL_VERSION,
         })
         .await;
         assert!(receives_hello_ack(&old).await);
@@ -1499,9 +1514,10 @@ fn pending_heartbeat_releases_peer_state_and_stale_session_gets_no_current_rows(
         // When: a replacement for the same peer authenticates while renewal is blocked.
         let (replacement_client, replacement) = raw_connection(secret(1), server.addr()).await;
         replacement
-            .send_control(&GatewayMsg::Hello {
+            .send_control(&GatewayMsg::VersionedHello {
                 token: support::valid_session_token(node(1)),
                 node: node(1),
+                version: orrery_protocol::PROTOCOL_VERSION,
             })
             .await;
 
@@ -1562,9 +1578,10 @@ fn gateway_rate_limits_claims_by_retained_node_id() {
 
         let (first_client, first) = raw_connection(secret(1), server.addr()).await;
         first
-            .send_control(&GatewayMsg::Hello {
+            .send_control(&GatewayMsg::VersionedHello {
                 token: support::valid_session_token(node(1)),
                 node: node(1),
+                version: orrery_protocol::PROTOCOL_VERSION,
             })
             .await;
         assert!(receives_hello_ack(&first).await);
@@ -1585,9 +1602,10 @@ fn gateway_rate_limits_claims_by_retained_node_id() {
 
         let (replacement_client, replacement) = raw_connection(secret(1), server.addr()).await;
         replacement
-            .send_control(&GatewayMsg::Hello {
+            .send_control(&GatewayMsg::VersionedHello {
                 token: support::valid_session_token(node(1)),
                 node: node(1),
+                version: orrery_protocol::PROTOCOL_VERSION,
             })
             .await;
         assert!(receives_hello_ack(&replacement).await);
@@ -1656,9 +1674,10 @@ fn gateway_rate_limits_claims_by_retained_node_id() {
 
         let (other_client, other) = raw_connection(secret(2), server.addr()).await;
         other
-            .send_control(&GatewayMsg::Hello {
+            .send_control(&GatewayMsg::VersionedHello {
                 token: support::valid_session_token(node(2)),
                 node: node(2),
+                version: orrery_protocol::PROTOCOL_VERSION,
             })
             .await;
         assert!(receives_hello_ack(&other).await);
@@ -1707,9 +1726,10 @@ fn gateway_replacement_session_exclusively_owns_inherited_leases() {
         .await
         .unwrap();
         let (old_client, old) = raw_connection(secret(1), server.addr()).await;
-        old.send_control(&GatewayMsg::Hello {
+        old.send_control(&GatewayMsg::VersionedHello {
             token: support::valid_session_token(node(1)),
             node: node(1),
+            version: orrery_protocol::PROTOCOL_VERSION,
         })
         .await;
         assert!(receives_hello_ack(&old).await);
@@ -1728,9 +1748,10 @@ fn gateway_replacement_session_exclusively_owns_inherited_leases() {
 
         // When: a second connection with the same verified NodeId replaces it.
         let (new_client, new) = raw_connection(secret(1), server.addr()).await;
-        new.send_control(&GatewayMsg::Hello {
+        new.send_control(&GatewayMsg::VersionedHello {
             token: support::valid_session_token(node(1)),
             node: node(1),
+            version: orrery_protocol::PROTOCOL_VERSION,
         })
         .await;
         assert!(receives_hello_ack(&new).await);
@@ -1921,9 +1942,10 @@ fn gateway_peer_registry_rejects_capacity_then_evicts_expired_idle_peer() {
         .unwrap();
         let (first_client, first) = raw_connection(secret(1), server.addr()).await;
         first
-            .send_control(&GatewayMsg::Hello {
+            .send_control(&GatewayMsg::VersionedHello {
                 token: session_token(&issuer, node(1), 900, 10_000),
                 node: node(1),
+                version: orrery_protocol::PROTOCOL_VERSION,
             })
             .await;
         assert!(receives_hello_ack(&first).await);
@@ -1931,9 +1953,10 @@ fn gateway_peer_registry_rejects_capacity_then_evicts_expired_idle_peer() {
 
         // When: another NodeId authenticates while the sole slot is occupied.
         second
-            .send_control(&GatewayMsg::Hello {
+            .send_control(&GatewayMsg::VersionedHello {
                 token: session_token(&issuer, node(2), 900, 10_000),
                 node: node(2),
+                version: orrery_protocol::PROTOCOL_VERSION,
             })
             .await;
 
@@ -1955,9 +1978,10 @@ fn gateway_peer_registry_rejects_capacity_then_evicts_expired_idle_peer() {
         loop {
             clock.0.fetch_add(11, Ordering::SeqCst);
             second
-                .send_control(&GatewayMsg::Hello {
+                .send_control(&GatewayMsg::VersionedHello {
                     token: session_token(&issuer, node(2), 900, 10_000),
                     node: node(2),
+                    version: orrery_protocol::PROTOCOL_VERSION,
                 })
                 .await;
             if receives_hello_ack(&second).await {
@@ -1997,9 +2021,10 @@ fn gateway_lease_capacity_denies_before_actor_mutation_after_reconnect() {
         .await
         .unwrap();
         let (old_client, old) = raw_connection(secret(1), server.addr()).await;
-        old.send_control(&GatewayMsg::Hello {
+        old.send_control(&GatewayMsg::VersionedHello {
             token: support::valid_session_token(node(1)),
             node: node(1),
+            version: orrery_protocol::PROTOCOL_VERSION,
         })
         .await;
         assert!(receives_hello_ack(&old).await);
@@ -2019,9 +2044,10 @@ fn gateway_lease_capacity_denies_before_actor_mutation_after_reconnect() {
         // When: a replacement generation reconnects and claims another eligible entity.
         let (_replacement_client, replacement) = raw_connection(secret(1), server.addr()).await;
         replacement
-            .send_control(&GatewayMsg::Hello {
+            .send_control(&GatewayMsg::VersionedHello {
                 token: support::valid_session_token(node(1)),
                 node: node(1),
+                version: orrery_protocol::PROTOCOL_VERSION,
             })
             .await;
         assert!(receives_hello_ack(&replacement).await);
@@ -2109,9 +2135,10 @@ fn gateway_rejects_client_rekey_without_mutation() {
         .unwrap();
         let (_client, connection) = raw_connection(secret(1), server.addr()).await;
         connection
-            .send_control(&GatewayMsg::Hello {
+            .send_control(&GatewayMsg::VersionedHello {
                 token: support::valid_session_token(node(1)),
                 node: node(1),
+                version: orrery_protocol::PROTOCOL_VERSION,
             })
             .await;
         assert!(receives_hello_ack(&connection).await);
@@ -2273,9 +2300,10 @@ fn rekeyed_entity_rejects_stale_presented_cell_with_current_lease() {
         .unwrap();
         let (_client, connection) = raw_connection(secret(1), server.addr()).await;
         connection
-            .send_control(&GatewayMsg::Hello {
+            .send_control(&GatewayMsg::VersionedHello {
                 token: support::valid_session_token(node(1)),
                 node: node(1),
+                version: orrery_protocol::PROTOCOL_VERSION,
             })
             .await;
         assert!(receives_hello_ack(&connection).await);
@@ -2502,9 +2530,10 @@ fn reviewed_authority_narrative() {
         let (stale_client, stale_connection) = raw_connection(secret(3), server.addr()).await;
         let stale_journal = journal_len(&runtime).await;
         stale_connection
-            .send_control(&GatewayMsg::Hello {
+            .send_control(&GatewayMsg::VersionedHello {
                 token: session_token(&secret(42), node(3), 1, 1),
                 node: node(3),
+                version: orrery_protocol::PROTOCOL_VERSION,
             })
             .await;
         assert!(!receives_hello_ack(&stale_connection).await);
@@ -2535,9 +2564,10 @@ fn reviewed_authority_narrative() {
         // When: a valid signed token is paired with missing coordinator interest.
         let (missing_client, missing_connection) = raw_connection(secret(2), server.addr()).await;
         missing_connection
-            .send_control(&GatewayMsg::Hello {
+            .send_control(&GatewayMsg::VersionedHello {
                 token: support::valid_session_token(node(2)),
                 node: node(2),
+                version: orrery_protocol::PROTOCOL_VERSION,
             })
             .await;
         assert!(receives_hello_ack(&missing_connection).await);
@@ -2562,9 +2592,10 @@ fn reviewed_authority_narrative() {
 
         // When: the reviewed holder presents a valid token but the wrong interest cell.
         let (old_client, old) = raw_connection(secret(1), server.addr()).await;
-        old.send_control(&GatewayMsg::Hello {
+        old.send_control(&GatewayMsg::VersionedHello {
             token: support::valid_session_token(node(1)),
             node: node(1),
+            version: orrery_protocol::PROTOCOL_VERSION,
         })
         .await;
         assert!(receives_hello_ack(&old).await);
@@ -2631,9 +2662,10 @@ fn reviewed_authority_narrative() {
         // When: a replacement connection inherits the lease generation.
         let (replacement_client, replacement) = raw_connection(secret(1), server.addr()).await;
         replacement
-            .send_control(&GatewayMsg::Hello {
+            .send_control(&GatewayMsg::VersionedHello {
                 token: support::valid_session_token(node(1)),
                 node: node(1),
+                version: orrery_protocol::PROTOCOL_VERSION,
             })
             .await;
         assert!(receives_hello_ack(&replacement).await);
@@ -2918,7 +2950,7 @@ async fn handoff_fixture(config: GatewayConfig) -> HandoffFixture {
     for seed in [1u8, 2] {
         let (endpoint, connection) = raw_connection(secret(seed), server.addr()).await;
         connection
-            .send_control(&GatewayMsg::Hello {
+            .send_control(&GatewayMsg::VersionedHello {
                 token: session_token(
                     &issuer,
                     node(seed),
@@ -2926,6 +2958,7 @@ async fn handoff_fixture(config: GatewayConfig) -> HandoffFixture {
                     support::TOKEN_TTL_MS,
                 ),
                 node: node(seed),
+                version: orrery_protocol::PROTOCOL_VERSION,
             })
             .await;
         assert!(receives_hello_ack(&connection).await);
@@ -3173,7 +3206,7 @@ async fn fanout_fixture(
     for seed in 1..=u8::try_from(peer_count).expect("peer count fits a seed") {
         let (endpoint, connection) = raw_connection(secret(seed), server.addr()).await;
         connection
-            .send_control(&GatewayMsg::Hello {
+            .send_control(&GatewayMsg::VersionedHello {
                 token: session_token(
                     &issuer,
                     node(seed),
@@ -3181,6 +3214,7 @@ async fn fanout_fixture(
                     support::TOKEN_TTL_MS,
                 ),
                 node: node(seed),
+                version: orrery_protocol::PROTOCOL_VERSION,
             })
             .await;
         assert!(receives_hello_ack(&connection).await);
@@ -3978,7 +4012,7 @@ fn a_peer_carrying_its_coordinator_grant_unlocks_claims_and_redistribution() {
         for seed in [1u8, 2] {
             let (endpoint, connection) = raw_connection(secret(seed), server.addr()).await;
             connection
-                .send_control(&GatewayMsg::Hello {
+                .send_control(&GatewayMsg::VersionedHello {
                     token: session_token(
                         &issuer,
                         node(seed),
@@ -3986,6 +4020,7 @@ fn a_peer_carrying_its_coordinator_grant_unlocks_claims_and_redistribution() {
                         support::TOKEN_TTL_MS,
                     ),
                     node: node(seed),
+                    version: orrery_protocol::PROTOCOL_VERSION,
                 })
                 .await;
             assert!(receives_hello_ack(&connection).await);
@@ -4106,7 +4141,7 @@ fn an_interest_grant_is_refused_with_a_reason_the_peer_can_act_on() {
         .unwrap();
         let (_client, connection) = raw_connection(secret(1), server.addr()).await;
         connection
-            .send_control(&GatewayMsg::Hello {
+            .send_control(&GatewayMsg::VersionedHello {
                 token: session_token(
                     &issuer,
                     node(1),
@@ -4114,6 +4149,7 @@ fn an_interest_grant_is_refused_with_a_reason_the_peer_can_act_on() {
                     support::TOKEN_TTL_MS,
                 ),
                 node: node(1),
+                version: orrery_protocol::PROTOCOL_VERSION,
             })
             .await;
         assert!(receives_hello_ack(&connection).await);
@@ -4554,15 +4590,126 @@ fn versioned_hello_is_accepted_only_at_the_gateways_own_version() {
             );
         }
 
-        // The unversioned bootstrap is still accepted unchecked, which is what
-        // makes enforcement opt-in until `GatewayMsg::Hello` is retired.
+        // And the unversioned bootstrap — which names no version at all, so
+        // it cannot be shown to be inside a window of one — is refused by the
+        // same reply rather than admitted unchecked. Enforcement is universal,
+        // not opt-in. `an_unversioned_hello_is_refused_with_a_legible_reply`
+        // carries the rest of that proof.
         connection
             .send_control(&GatewayMsg::Hello {
                 token: session_token(&issuer, node(1), 900, 200),
                 node: node(1),
             })
             .await;
-        assert!(receives_hello_ack(&connection).await);
+        assert_eq!(
+            hello_refusal(&connection).await,
+            Some((4, GatewayReply::HELLO_REFUSED_PROTOCOL)),
+            "the unversioned bootstrap is retired and must be refused"
+        );
+
+        server.shutdown().await;
+    });
+}
+
+/// The retired unversioned `GatewayMsg::Hello` is **refused with a reply**, and
+/// no session is established behind it.
+///
+/// Two halves, and dropping either one would leave a hole the other cannot
+/// cover.
+///
+/// *Legible*, because a silent drop is the failure mode `GatewayReply::
+/// HelloRefused` was introduced to prevent: it is indistinguishable from a slow
+/// gateway, and a client that cannot tell those apart re-dials and re-offers
+/// the same retired bootstrap until it times out with nothing to report. The
+/// reply names the gateway's own version, so the client reports the skew.
+///
+/// *Refused*, because a reply on its own proves nothing about admission — a
+/// gateway that answered `HelloRefused` and then went on to install the session
+/// would pass a reply-only assertion. So the connection follows with a message
+/// only an admitted session is served: an authority claim, whose arm takes
+/// `session.clone()` and returns early when there is none. Nothing comes back.
+/// (`Subscribe` would not do — the area path is session-free by design and
+/// answers a refused connection too.)
+#[test]
+fn an_unversioned_hello_is_refused_with_a_legible_reply() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = Arc::new(Mutex::new({
+            let store: Arc<dyn orrery_persistd::checkpoint::CheckpointStore> =
+                Arc::new(orrery_persistd::checkpoint::MemCheckpointStore::new());
+            CellRuntime::open(&runtime_config(dir.path()), &store)
+                .await
+                .unwrap()
+        }));
+        let router: Arc<dyn Router> = runtime.clone();
+        let issuer = support::issuer();
+        // A distinctive per-instance version, so the reply's `protocol` field
+        // cannot match by coincidence with `PROTOCOL_VERSION` or with zero.
+        let server = GatewayServer::spawn(
+            GatewayConfig {
+                protocol_version: 7,
+                ..support::authority_config(node(1), GridId::ROOT, vec![CellId::ROOT])
+            },
+            router,
+        )
+        .await
+        .unwrap();
+        let (_client, conn) = raw_connection(secret(1), server.addr()).await;
+
+        // The control: an otherwise identical token and node id are admitted
+        // the moment the bootstrap names the version. Without this leg a
+        // gateway that refused *every* bootstrap would pass the assertion
+        // below, and that is a total outage rather than a retirement.
+        conn.send_control(&GatewayMsg::VersionedHello {
+            token: session_token(&issuer, node(1), 900, 200),
+            node: node(1),
+            version: 7,
+        })
+        .await;
+        assert!(
+            receives_hello_ack(&conn).await,
+            "the versioned bootstrap with the same credentials is admitted"
+        );
+
+        // A fresh connection, so the refusal is judged on its own and not
+        // against a session the control above already installed.
+        let (_client2, retired) = raw_connection(secret(2), server.addr()).await;
+        retired
+            .send_control(&GatewayMsg::Hello {
+                token: session_token(&issuer, node(2), 900, 200),
+                node: node(2),
+            })
+            .await;
+        assert_eq!(
+            hello_refusal(&retired).await,
+            Some((7, GatewayReply::HELLO_REFUSED_PROTOCOL)),
+            "a retired bootstrap must come back as HelloRefused naming the \
+             gateway's own version, never as silence"
+        );
+
+        // ... and it bought no session: a claim is served only to one.
+        retired
+            .send_control(&GatewayMsg::Lease {
+                message: LeaseMsg::Claim {
+                    claim_id: orrery_protocol::ClaimId(1),
+                    entity: PersistId::new(9_001),
+                    grid: GridId::ROOT,
+                    cell: CellId::ROOT,
+                    kind: ClaimKind::Weak,
+                    basis: ClaimBasis::Explicit,
+                    observed: Default::default(),
+                    tick: Tick::new(1),
+                },
+            })
+            .await;
+        assert!(
+            retired
+                .next_payload(Duration::from_millis(300))
+                .await
+                .is_none(),
+            "the refused connection must hold no session"
+        );
 
         server.shutdown().await;
     });
@@ -4636,9 +4783,10 @@ fn a_cell_outside_this_nodes_shards_is_refused_as_a_wrong_owner_not_as_a_broken_
         .await
         .unwrap();
         let (_client, conn) = raw_connection(secret(1), server.addr()).await;
-        conn.send_control(&GatewayMsg::Hello {
+        conn.send_control(&GatewayMsg::VersionedHello {
             token: session_token(&issuer, node(1), 900, 200),
             node: node(1),
+            version: orrery_protocol::PROTOCOL_VERSION,
         })
         .await;
         assert!(receives_hello_ack(&conn).await);

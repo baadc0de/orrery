@@ -296,9 +296,10 @@ async fn connect_session(
     address: iroh::EndpointAddr,
 ) -> Result<Session> {
     let session = Session::connect(key.clone(), address).await?;
-    session.send(&GatewayMsg::Hello {
+    session.send(&GatewayMsg::VersionedHello {
         token: session_token(key.public(), standing)?,
         node: key.public(),
+        version: orrery_protocol::PROTOCOL_VERSION,
     })?;
     anyhow::ensure!(
         matches!(

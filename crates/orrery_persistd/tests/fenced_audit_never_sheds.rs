@@ -242,9 +242,10 @@ async fn an_audit_slower_than_the_route_budget_neither_sheds_the_diff_nor_vanish
         vec![0u8]
     );
     let conn = lanes::GatewayLanes::attach(conn);
-    conn.send_control(&GatewayMsg::Hello {
+    conn.send_control(&GatewayMsg::VersionedHello {
         token: support::valid_session_token(peer.public()),
         node: peer.public(),
+        version: orrery_protocol::PROTOCOL_VERSION,
     })
     .await;
     assert!(matches!(

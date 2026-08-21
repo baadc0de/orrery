@@ -344,9 +344,10 @@ pub async fn run(spec: TraderSpec) -> Result<()> {
         crate::endpoint_addr(&spec.gateway_node, &spec.gateway_addr)?,
     )
     .await?;
-    session.send_control(&GatewayMsg::Hello {
+    session.send_control(&GatewayMsg::VersionedHello {
         token: token.clone(),
         node,
+        version: orrery_protocol::PROTOCOL_VERSION,
     })?;
     let hello = session.recv(Duration::from_secs(10)).await;
     anyhow::ensure!(

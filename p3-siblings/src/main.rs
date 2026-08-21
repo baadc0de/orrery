@@ -1764,7 +1764,11 @@ async fn probe_session(
         .map_err(|error| anyhow::anyhow!("probe interest grant: {error}"))?;
 
     let session = Session::connect(secret, endpoint_addr(gateway_node, gateway_addr)?).await?;
-    session.send_control(&GatewayMsg::Hello { token, node })?;
+    session.send_control(&GatewayMsg::VersionedHello {
+        token,
+        node,
+        version: orrery_protocol::PROTOCOL_VERSION,
+    })?;
     anyhow::ensure!(
         matches!(
             session.recv(Duration::from_secs(10)).await,

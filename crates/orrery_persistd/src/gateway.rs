@@ -20,11 +20,11 @@
 //!   the intent to the configured [`IntentExecutor`] and ack **only after**
 //!   its future resolves — a `Committed` ack implies a durable commit (RPO 0).
 //!   With no executor configured the reply is `Rejected`, never a fake commit.
-//! - [`GatewayMsg::Hello`] / [`GatewayMsg::VersionedHello`] → acknowledge with
-//!   the gateway node id + protocol (the versioned form is checked against the
-//!   `{V, V−1}` window and refused with [`GatewayReply::HelloRefused`]; the
-//!   unversioned one is accepted unchecked)
-//!   version.
+//! - [`GatewayMsg::VersionedHello`] → acknowledge with the gateway node id +
+//!   protocol version, once the offered version matches this gateway's exactly
+//!   (D29 clause 5 closed the `{V, V−1}` window). Any other version, and the
+//!   retired unversioned [`GatewayMsg::Hello`], are refused with
+//!   [`GatewayReply::HelloRefused`] — never dropped.
 //!
 //! The transport is the **raw** iroh endpoint — this crate is **Bevy-free**
 //! (D15) and does not run the aeronet session stack. It speaks exactly the wire
@@ -5065,13 +5065,22 @@ async fn handle_connection(
         if !matches!(msg, GatewayMsg::Diff { .. }) {
             metrics.boundary.record_ingress(ingress_queue_us);
         }
-        // A versioned bootstrap is an ordinary one once its version is inside
-        // the rolling-upgrade window, so the two share the admission path
-        // below rather than duplicating it. Enforcement is confined to the
-        // versioned form on purpose: the unversioned `Hello` stays accepted
-        // unchecked, so this gateway does not cut off a peer that has not
-        // adopted the new variant, and version checking is opt-in until
-        // `Hello` is retired.
+        // `VersionedHello` is the only bootstrap this gateway admits, and it
+        // becomes an ordinary `Hello` the moment its version checks out — so
+        // the admission arm below is written once and both forms reach it.
+        // `Hello` survives as that *internal normalized* form and is no longer
+        // a wire bootstrap: D29 clause 5 closed the version window for all
+        // traffic, and a bootstrap that names no version cannot be inside a
+        // window of one. Refused rather than dropped, for the reason
+        // `GatewayReply::HelloRefused` records: silence is indistinguishable
+        // from a slow gateway, and the peer would re-offer the same
+        // unacceptable bootstrap until it timed out with nothing to report.
+        //
+        // The variant stays on the wire precisely so this refusal can happen.
+        // Deleting it would renumber every later `GatewayMsg` arm under
+        // postcard's positional keying, and a retired client's bootstrap would
+        // then decode as some unrelated variant or not at all — a silent drop,
+        // which is the one outcome this arm exists to prevent.
         let msg = match msg {
             GatewayMsg::VersionedHello {
                 token,
@@ -5093,6 +5102,20 @@ async fn handle_connection(
                     continue;
                 }
                 GatewayMsg::Hello { token, node }
+            }
+            GatewayMsg::Hello { .. } => {
+                warn!(
+                    %remote,
+                    protocol,
+                    "gateway: refused an unversioned Hello; the bootstrap is retired"
+                );
+                let reply = GatewayReply::HelloRefused {
+                    gateway,
+                    protocol,
+                    reason: GatewayReply::HELLO_REFUSED_PROTOCOL,
+                };
+                send(Bytes::from(encode_stream_frame(&reply)));
+                continue;
             }
             other => other,
         };
