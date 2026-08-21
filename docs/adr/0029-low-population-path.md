@@ -1,6 +1,6 @@
 # ADR-0029: The P5 low-population path: quarantined provisional commit, mandatory spot replay, forward-written annulment
 
-**Status:** Proposed · **Date:** 2026-08-20 · **Decision:** D29
+**Status:** Accepted · **Date:** 2026-08-20 · **Decision:** D29
 
 This decision is normative once accepted. See the [ADR index](../DECISIONS.md)
 for precedence, scope, and the complete decision set.
@@ -359,7 +359,18 @@ versioning: this bumps `PROTOCOL_VERSION` from 1 to 2**
 (`crates/orrery_protocol/src/protocol.rs:13`). postcard keys enum variants by
 declaration order, so appending an arm is safe to encode-old/decode-new and
 unsafe in the other direction: a version-1 client receiving `Provisional` fails
-to decode. The acceptance window is `PROTOCOL_VERSION` and `PROTOCOL_VERSION − 1`
+to decode. **Accepted with the window closed.** The operator's decision on acceptance is
+that the cluster supports version 2 **only** — the `PROTOCOL_VERSION − 1`
+acceptance window is dropped rather than kept. That is a broader change than
+this record needs and it simplifies this clause rather than complicating it:
+there is no version-1 client to degrade to refusal, so clause 2's second line
+has no second branch, and `IntentStatus`'s non-terminal state has no
+compatibility caveat. The system is pre-release and has no external clients, so
+dual-version support was complexity that had not been earned. The `protocol.rs`
+change is wider than the intent path and belongs to whoever implements this
+record: the window is closed once, for all traffic, not per message family.
+
+The acceptance window was `PROTOCOL_VERSION` and `PROTOCOL_VERSION − 1`
 (`protocol.rs:3-5`), so a cluster deploying 2 still serves version-1 clients —
 and a version-1 client must therefore be **refused** the provisional path
 rather than sent an arm it cannot read: for a client that negotiated version 1,

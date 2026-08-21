@@ -1,6 +1,6 @@
 # ADR-0027: The attestation envelope — witness preimage, role separation, and where the required-K draw is made
 
-**Status:** Proposed · **Date:** 2026-08-20 · **Decision:** D27
+**Status:** Accepted · **Date:** 2026-08-20 · **Decision:** D27
 
 This decision is normative once accepted. See the [ADR index](../DECISIONS.md)
 for precedence, scope, and the complete decision set.
@@ -401,6 +401,24 @@ the auditor would conclude the gateway cheated when it did not. So:
 > **The gateway records the eligible vector it derived over, in announced
 > order, with the committed intent. An audit reads the recorded `E(I)`; it does
 > not reconstruct historical account↔NodeId bindings.**
+
+**Accepted, with the limit stated.** The storage cost is real — a NodeId vector
+per committed intent, kept for as long as the intent is auditable — and it was
+weighed against what it buys and accepted deliberately.
+
+What it buys is the only audit that can exist today. What it does *not* buy is
+worth being exact about, because a later reader will otherwise over-trust it:
+the audit proves **"given the eligibility list you recorded, did you draw the
+required subset correctly"**, not **"was that eligibility list honest"**. A
+gateway that lied about `E(I)` would pass. That is acceptable here only because
+the gateway is already the sole writer of durable truth (D11) — its compromise
+ends the game by other means, so this adds no attack surface. It does bound the
+claim, and the bound belongs in the record rather than in a reviewer's memory.
+
+The upgrade path, if an audit that does not trust the gateway is ever wanted, is
+an append-only account↔NodeId binding history in `orrery_identity` so that
+`E(I)` becomes reconstructible from first principles. That is a materially
+larger system and is not proposed here.
 
 ### (g) Parameters
 

@@ -25,9 +25,12 @@ This decision is normative. See the [ADR index](../DECISIONS.md) for precedence,
 | Journal retention | on (D20) | Journal open (index rebuild) | < 2 000 ms (D20) |
 | Drain grace | 10 s (D24) | — | — |
 | `Expire` fan-out dispositions | `Parked`/`Free` only (D25) | `Expire` fan-out bucket (per recipient) | 32/s, burst 64 (D25) |
-| Witness epoch length | 30 s (D27, proposed) | Witness co-sign budget | 150 ms (D27, proposed) |
-| Provisional finalize deadline | 5 min (D29, proposed) | Provisional outstanding cap (per account) | 8 (D29, proposed) |
-| Provisional finalization sampling | 100%, not tunable (D29, proposed) | — | — |
+| Witness epoch length | 30 s (D27) | Witness co-sign budget | 150 ms (D27) |
+| Witness set target N | 7 (D28) | — | — |
+| Witness reseed cooldown (per account) | 60 s (D28) | Stale-epoch acceptance grace | 30 s (D28) |
+| `epoch/` row retention | 7 days (D28) | — | — |
+| Provisional finalize deadline | 5 min (D29) | Provisional outstanding cap (per account) | 8 (D29) |
+| Provisional finalization sampling | 100%, not tunable (D29) | — | — |
 
 The last row is added by [D20](0020-journal-retention.md). *Journal retention*
 is whether a node releases journal segments its checkpoints have made
@@ -63,4 +66,4 @@ limits **drop** rather than queue — the advisory is best-effort by
 construction, and `Deny{Parked}` on a subsequent claim is the authoritative
 answer.
 
-[ADR-0025](0025-expire-fan-out.md), [ADR-0027](0027-attestation-envelope.md) and [ADR-0029](0029-low-population-path.md) ·
+[ADR-0025](0025-expire-fan-out.md), [ADR-0028](0028-witness-set-seeding.md) and [ADR-0029](0029-low-population-path.md) ·
