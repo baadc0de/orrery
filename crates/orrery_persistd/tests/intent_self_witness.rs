@@ -41,8 +41,8 @@ use orrery_persistd::{
 };
 use orrery_protocol::channels::decode_stream_frame;
 use orrery_protocol::{
-    Attestation, CellEpoch, CellId, Epoch, GatewayMsg, GatewayReply, GridId, Intent, IntentOp,
-    IntentOutcome, PersistId, Tick, REASON_SELF_WITNESS,
+    CellEpoch, CellId, Epoch, GatewayMsg, GatewayReply, GridId, Intent, IntentOp, IntentOutcome,
+    PersistId, Tick, REASON_SELF_WITNESS,
 };
 use tokio::sync::Mutex;
 
@@ -152,7 +152,7 @@ async fn a_self_witnessed_intent_is_refused_before_the_executor_is_reached() {
         // The library default is `PermissiveValidator`, which admits
         // everything; the check under test lives in the baseline validator a
         // deployed node runs, so the test must configure it or assert nothing.
-        validator: Arc::new(BaselineIntentValidator),
+        validator: Arc::new(BaselineIntentValidator::permissive()),
         ..support::authority_config(key.public(), GridId::ROOT, vec![CellId::ROOT])
     };
     let server = GatewayServer::spawn(config, router).await.unwrap();
@@ -181,15 +181,21 @@ async fn a_self_witnessed_intent_is_refused_before_the_executor_is_reached() {
 
     // ── Arm 1: the issuer witnesses itself ────────────────────────────────
     //
-    // The attestation is the issuer's own signature, copied. It verifies —
-    // the witness preimage is `Intent::signing_preimage()`, the same bytes the
-    // issuer signed — so nothing but the party check stands between this and
-    // the executor.
+    // The attestation is a *correct* co-signature made by the issuer over D27
+    // clause (a)'s witness preimage. It is deliberately not the copied issuer
+    // signature this arm used before the preimage switch: that variant now
+    // fails as `BadAttestation` and would prove only that the domain tag
+    // works. A domain tag cannot stop an issuer from correctly signing the
+    // witness preimage too, which is exactly why the party check is a separate
+    // rule — and this arm is what holds it to that.
     let mut self_witnessed = signed_intent(1, &key);
-    self_witnessed.attestations.push(Attestation {
-        witness: self_witnessed.issuer,
-        signature: self_witnessed.signature,
-    });
+    let self_attestation = self_witnessed.attest(&key);
+    assert!(
+        self_attestation.verify(&self_witnessed),
+        "arm 1 must present a co-signature that verifies, or it proves nothing \
+         beyond the signature check"
+    );
+    self_witnessed.attestations.push(self_attestation);
     assert_eq!(
         submit(&conn, self_witnessed).await,
         IntentOutcome::Rejected {
@@ -213,11 +219,8 @@ async fn a_self_witnessed_intent_is_refused_before_the_executor_is_reached() {
     let witness = secret(9);
     assert_ne!(witness.public(), key.public());
     let mut attested = signed_intent(2, &key);
-    let preimage = attested.signing_preimage();
-    attested.attestations.push(Attestation {
-        witness: witness.public(),
-        signature: witness.sign(&preimage),
-    });
+    let attestation = attested.attest(&witness);
+    attested.attestations.push(attestation);
     assert!(
         matches!(
             submit(&conn, attested).await,

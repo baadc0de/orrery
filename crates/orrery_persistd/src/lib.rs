@@ -40,6 +40,7 @@ pub mod lease;
 pub mod placement;
 pub mod reliable;
 pub mod runtime;
+pub mod witness_epoch;
 
 pub use actor::{
     CellActorHandle, DivestOutcome, EntityRecord, FencedApply, Reject, RekeyError, SnapshotPage,
@@ -100,3 +101,4 @@ pub use lease::{
 pub use placement::{RendezvousHasher, RendezvousNode, RendezvousWeight};
 pub use reliable::{Lane, ReliableSender};
 pub use runtime::{payload_crc, CellRuntime, RuntimeConfig, ShardTransfer, TransferPhase};
+pub use witness_epoch::{AcceptedEpoch, WitnessEpochAuthority};

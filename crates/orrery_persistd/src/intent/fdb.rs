@@ -123,6 +123,13 @@ pub struct FdbIntentExecutor {
     /// [`FdbIntentExecutor::refence`].
     fence: std::sync::RwLock<Option<IntentFence>>,
     allocator: Arc<tokio::sync::Mutex<PersistIdAllocator>>,
+    /// The epoch cache this executor records against, when the gateway
+    /// enforces K-of-N.
+    ///
+    /// `None` is the enforcement-off build and writes no `epoch/` or `attest/`
+    /// row at all — an executor that recorded an eligible vector nobody
+    /// enforced would be banking evidence about a check that did not happen.
+    witness_epochs: Option<Arc<crate::witness_epoch::WitnessEpochAuthority>>,
 }
 
 /// The active shard ownership an intent executor is allowed to write under.
@@ -182,6 +189,7 @@ impl FdbIntentExecutor {
             grid,
             fence: std::sync::RwLock::new(None),
             allocator: Arc::new(tokio::sync::Mutex::new(PersistIdAllocator::default())),
+            witness_epochs: None,
         }
     }
 
@@ -199,6 +207,7 @@ impl FdbIntentExecutor {
             grid,
             fence: std::sync::RwLock::new(Some(fence)),
             allocator: Arc::new(tokio::sync::Mutex::new(PersistIdAllocator::default())),
+            witness_epochs: None,
         }
     }
 
@@ -211,6 +220,23 @@ impl FdbIntentExecutor {
         let context =
             FdbContext::connect(cluster_file).map_err(|e| IntentError::Store(e.to_string()))?;
         Ok(Self::from_context(&context, grid))
+    }
+
+    /// Record this executor's committed intents against `epochs`.
+    ///
+    /// Wire the **same** cache the gateway's validator enforces against. The
+    /// two are not independent: admission draws the required subset from a
+    /// cache entry, and this executor writes the draw commitment that entry
+    /// carries. A second, differently-seeded cache here would publish a
+    /// commitment to a key no admission decision was ever made under, which is
+    /// the one way this scheme can be broken from the inside.
+    #[must_use]
+    pub fn recording_epochs(
+        mut self,
+        epochs: Arc<crate::witness_epoch::WitnessEpochAuthority>,
+    ) -> Self {
+        self.witness_epochs = Some(epochs);
+        self
     }
 
     /// The underlying database handle, for tests that need to read rows back.
@@ -399,6 +425,7 @@ async fn require_intent_fence(
 #[async_trait::async_trait]
 impl IntentExecutor for FdbIntentExecutor {
     async fn execute(&self, intent: &Intent) -> Result<IntentOutcome, IntentError> {
+        let intent_handle = intent.cell_epoch.0;
         let intent = intent.clone();
         let grid = self.grid;
         let fence = self
@@ -410,6 +437,16 @@ impl IntentExecutor for FdbIntentExecutor {
         // exact vector across FDB retries makes retries safe, while a failed
         // overall attempt merely leaves a permanent, harmless gap.
         let minted = self.allocate_ids(intent.ops.len() as u64).await?;
+        let epochs = self.witness_epochs.clone();
+        // Set by the closure only on an attempt that wrote or verified the
+        // `epoch/` row. It is **not** the same question as "did this intent
+        // commit": the idempotency replay path below returns a recorded
+        // `Committed` outcome without running step 2c at all, and marking the
+        // cache on that would tell every later intent in the cell-epoch that a
+        // row exists which nothing ever wrote — leaving the draw commitment
+        // undurable while intents commit under the epoch, which is exactly the
+        // ordering rule D27 clause (d) exists to enforce.
+        let epoch_row_seen = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         // `db.run` is the retry loop (§7: "retry loop is db.run's"). We bound
         // the `not_committed` retries with an interior-mutable attempt counter:
         // past the limit the closure returns `ContentionExhausted` as a custom
@@ -430,6 +467,8 @@ impl IntentExecutor for FdbIntentExecutor {
                 let intent = intent.clone();
                 let minted = minted.clone();
                 let fence = fence.clone();
+                let epochs = epochs.clone();
+                let epoch_row_seen = std::sync::Arc::clone(&epoch_row_seen);
                 let hooks = std::sync::Arc::clone(&hooks);
                 let attempt = attempts.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
                 async move {
@@ -512,6 +551,41 @@ impl IntentExecutor for FdbIntentExecutor {
                         PlanOutcome::Planned(plan) => plan,
                     };
 
+                    // Step 2c (D27 clauses (d) and (f), D28 clause (f)): the
+                    // witness-epoch record and this intent's eligible vector,
+                    // in the transaction the intent already runs.
+                    //
+                    // Both obligations land here rather than on a path of
+                    // their own, and the placement is the point: the draw
+                    // commitment must be durable before the cell-epoch admits
+                    // anything, and the `epoch/` row must cost the intent p99
+                    // no extra round trip. Writing it inside the *first*
+                    // intent's own transaction satisfies both at once —
+                    // atomicity means no intent's effects become durable
+                    // before the commitment does, so the gateway cannot have
+                    // chosen the draw key after seeing which attestations
+                    // arrived. Every later intent in the epoch skips even the
+                    // index read (`is_committed`), so the steady-state cost is
+                    // exactly zero operations.
+                    //
+                    // **Above `apply_plan`, and that is not cosmetic.** This
+                    // step can refuse (a draw key that was never this
+                    // cell-epoch's, see `record_witness_epoch`), and `db.run`
+                    // commits whatever a closure staged whether or not the
+                    // closure decided it wanted it — the exact trap
+                    // `PlannedWrite`'s doc names. Deciding before writing is
+                    // what keeps a refused intent from banking its effects.
+                    match record_witness_epoch(&trx, epochs.as_deref(), &intent).await? {
+                        EpochRecord::Refused(reason) => {
+                            hooks.mark_closure_end();
+                            return Ok(IntentOutcome::Rejected { reason });
+                        }
+                        EpochRecord::Recorded => {
+                            epoch_row_seen.store(true, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        EpochRecord::NotApplicable => {}
+                    }
+
                     // Step 3: apply the ops' ledger effects (see `apply_plan`).
                     apply_plan(&trx, &plan, &intent)?;
 
@@ -541,10 +615,167 @@ impl IntentExecutor for FdbIntentExecutor {
         hooks.fold_into_trace();
 
         match result {
-            Ok(outcome) => Ok(outcome),
+            Ok(outcome) => {
+                // Only now is the `epoch/` row durable, so only now may the
+                // cache stop re-reading the index. Doing this inside the
+                // closure would mark a row durable that a later conflict retry
+                // discarded, and every subsequent intent in the epoch would
+                // then skip a write that never landed.
+                //
+                // Both conditions are load-bearing. `Committed` alone is not
+                // enough — the replay path returns it without touching the row
+                // — and the flag alone is not enough, because an attempt can
+                // record and then lose its commit to a conflict.
+                if matches!(outcome, IntentOutcome::Committed { .. })
+                    && epoch_row_seen.load(std::sync::atomic::Ordering::Relaxed)
+                {
+                    if let Some(epochs) = self.witness_epochs.as_ref() {
+                        if let Some(epoch) = epochs.resolve(intent_handle) {
+                            epoch.mark_committed();
+                        }
+                    }
+                }
+                Ok(outcome)
+            }
             Err(e) => Err(unwrap_binding_error(e)),
         }
     }
+}
+
+/// What one intent's pass over the witness-epoch record decided.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EpochRecord {
+    /// No epoch cache, or an intent naming a cell-epoch this gateway cannot
+    /// resolve. Nothing was written and nothing is claimed.
+    NotApplicable,
+    /// The `epoch/` row was written or verified in this transaction, and this
+    /// intent's eligible vector was recorded.
+    Recorded,
+    /// The intent must be refused with this wire reason.
+    Refused(u16),
+}
+
+/// Make this cell-epoch's draw commitment durable, re-derive the required
+/// subset under the **durable** draw key, and record the eligible vector the
+/// intent was judged against.
+///
+/// # The one refusal, and why it is checked here rather than only at admission
+///
+/// The `epoch/` row already exists and carries a different draw key from the
+/// one this gateway holds. That is the D26 sibling handover: another gateway
+/// owned the shard when the epoch was accepted and minted the key every
+/// outstanding co-signature was solicited under. The durable key wins.
+///
+/// Refusing on the *key* alone is not sufficient, and the gap is narrow enough
+/// to be worth spelling out. When the mismatch is discovered the cache adopts
+/// the durable key — but intents already admitted under the stale key are
+/// still in flight, and by the time they arrive the cache and the row agree,
+/// so a key comparison passes them. Their attestations satisfy the subset
+/// drawn under the *old* key. So this re-derives `required(I)` from
+/// `row.draw_key` and checks it against the attestations actually carried,
+/// which is a check on the authoritative key no matter when the intent was
+/// admitted. It costs K keyed hashes and only runs while the row is being
+/// read at all — never on the steady-state path.
+///
+/// # Errors
+///
+/// Only FoundationDB and encoding failures; every semantic outcome is an
+/// [`EpochRecord`].
+async fn record_witness_epoch(
+    trx: &foundationdb::Transaction,
+    epochs: Option<&crate::witness_epoch::WitnessEpochAuthority>,
+    intent: &Intent,
+) -> Result<EpochRecord, FdbBindingError> {
+    // No cache is the enforcement-off build, and an unresolvable handle is an
+    // intent this executor was handed without admission having enforced
+    // anything (the permissive validator, or an epoch that aged out between
+    // admission and commit). Neither is an error and neither writes a row:
+    // there is no eligible vector to record, because no draw was made.
+    let (Some(epochs), Some(epoch)) = (epochs, epochs.and_then(|e| e.resolve(intent.cell_epoch.0)))
+    else {
+        return Ok(EpochRecord::NotApplicable);
+    };
+
+    // D27 clause (f) item 5, derived once and used for both the durable
+    // re-derivation below and the recorded vector. It is derived here rather
+    // than carried from admission because it is a pure function of the
+    // announced set and the issuer, and both sides read the same cache entry —
+    // so a second derivation cannot disagree with the first, and threading a
+    // vector through the executor seam would have widened
+    // `IntentExecutor::execute` for no added fact.
+    let eligible = orrery_protocol::eligible_witnesses(&epoch.snapshot.selected, intent.issuer);
+
+    let handle_key = keyspace::epoch_handle_key(intent.cell_epoch.0);
+    let row_key = keyspace::epoch_key(
+        epoch.snapshot.grid,
+        epoch.snapshot.cell,
+        epoch.snapshot.epoch,
+    );
+    if !epoch.is_committed() {
+        let fresh = |draw_key, draw_commit| keyspace::EpochRow {
+            announcement: epoch.announcement.clone(),
+            first_seen_ms: epoch.snapshot.first_seen_ms,
+            draw_commit,
+            draw_key,
+            revealed_key: None,
+            gc_deadline_ms: now_ms() + INTENT_ROW_RETENTION_MS,
+        };
+        // A handle index pointing at nothing is a torn write this executor
+        // cannot have produced — both keys are set in one transaction — so it
+        // is repaired by writing the pair, not trusted and not skipped.
+        // Skipping would commit the intent with no recorded `E(I)` and under
+        // an unverified key, which is the audit going quietly vacuous.
+        let existing = match trx.get(&handle_key, false).await? {
+            None => None,
+            Some(existing_key) => trx.get(&existing_key, false).await?,
+        };
+        match existing {
+            None => {
+                let encoded = postcard::to_stdvec(&fresh(*epoch.draw_key(), epoch.draw_commit))
+                    .map_err(store_err("witness epoch row encode"))?;
+                trx.set(&row_key, &encoded);
+                // The index carries the row's key rather than a copy of the
+                // row, for the reason `lease_location_key` carries a cell:
+                // one fact, one writer, and a second copy is a second thing
+                // that can disagree.
+                trx.set(&handle_key, &row_key);
+            }
+            Some(value) => {
+                let row: keyspace::EpochRow =
+                    postcard::from_bytes(&value).map_err(store_err("witness epoch row decode"))?;
+                if &row.draw_key != epoch.draw_key() {
+                    epochs.adopt_draw_key(intent.cell_epoch.0, row.draw_key, row.draw_commit);
+                }
+                // The authoritative check: the subset the *durable* key names
+                // must be among the attestations this intent actually carries.
+                // Under a matching key this re-proves what admission already
+                // decided, for K hashes; under an adopted one it is the only
+                // thing standing between a stale-key intent and a commit.
+                for required in
+                    orrery_protocol::required_witnesses(&row.draw_key, intent.intent_id, &eligible)
+                {
+                    if !intent
+                        .attestations
+                        .iter()
+                        .any(|attestation| attestation.witness == required)
+                    {
+                        return Ok(EpochRecord::Refused(
+                            orrery_protocol::REASON_ATTESTATION_QUORUM,
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    let row = keyspace::AttestRow {
+        epoch_handle: intent.cell_epoch.0,
+        eligible,
+        gc_deadline_ms: now_ms() + INTENT_ROW_RETENTION_MS,
+    };
+    let encoded = postcard::to_stdvec(&row).map_err(store_err("attest row encode"))?;
+    trx.set(&keyspace::attest_key(intent.intent_id), &encoded);
+    Ok(EpochRecord::Recorded)
 }
 
 /// Retry-loop instrumentation for one intent's `db.run`.

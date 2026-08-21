@@ -64,7 +64,23 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # nine `orrery_persistd` unit tests covering the op's args layout, its
 # admission arms and the `MemIntentExecutor` half of the same contract. The
 # floor rises by those 14: 331 -> 345.
-FLOOR="${ORRERY_FDB_TEST_FLOOR:-345}"
+#
+# A full run measured 566 executed tests on 2026-08-21, after K-of-N
+# attestation enforcement (issue #147, D27/D28) added 29: six in the new
+# `intent_witness_epoch` file — the only ones that need the cluster, because
+# they are about the durable `epoch/` record, the draw commitment, the
+# recorded eligible vector and the two ways a stale draw key can survive a
+# gateway restart or a sibling handover — two in `gateway_witness_epoch` for
+# the courier hop, ten witness-epoch cache unit tests, nine
+# admission-predicate unit tests and two keyspace tests for the three new
+# families. The floor rises by those 29: 345 -> 374.
+#
+# The measured total is 39 above the last recorded one rather than 29. The
+# remaining 10 landed between the two measurements and were never recorded, so
+# they are deliberately not claimed here: the floor tracks what a change can
+# account for, and inflating it with tests nobody attributed would make the
+# next person's arithmetic wrong instead of this one's.
+FLOOR="${ORRERY_FDB_TEST_FLOOR:-374}"
 
 # Every test file whose contents only mean anything against a real cluster. If
 # one of these reports no executed tests, the tier is dark again whatever the
@@ -82,6 +98,12 @@ REQUIRED_TARGETS=(
   # `PreHandover` checkpoint's fence read is where that bit: the in-memory
   # suite passed while a real cluster refused the checkpoint outright.
   shard_handover_fdb
+  # The durable half of D27's K-of-N enforcement. A memory store cannot speak
+  # for it at all: what these assert is that the draw commitment and the
+  # eligible vector land in the *same serializable transaction* as the intent's
+  # effects, which is the property that makes a retrospective audit of the draw
+  # non-vacuous, and there is no such transaction without a cluster.
+  intent_witness_epoch
 )
 
 die() { echo "::error::$*" >&2; exit 1; }
@@ -196,7 +218,7 @@ self_test() {
     fi
   }
 
-  # 8 targets × 32 + 120 unit tests = 376, over the 345 floor.
+  # 9 targets × 32 + 120 unit tests = 408, over the 374 floor.
   fixture="$tmp/good.log";    emit_log "$fixture" none 32;            expect "a real run passes" pass "$fixture"
   # The same log with `CARGO_TERM_COLOR=always` escapes through it.
   sed -e 's/^     Running/     \x1b[1;32mRunning\x1b[0m/' \
@@ -205,14 +227,14 @@ self_test() {
 
   fixture="$tmp/skipped.log"; emit_log "$fixture" skip 32;            expect "a skipped run is red" fail "$fixture"
   fixture="$tmp/thin.log";    emit_log "$fixture" none 1;             expect "a run under the floor is red" fail "$fixture"
-  # 40 apiece so the seven remaining targets still clear the floor: this case has
+  # 45 apiece so the eight remaining targets still clear the floor: this case has
   # to fail because fence_split is missing, not because the total is thin.
-  fixture="$tmp/absent.log";  emit_log "$fixture" none 40 fence_split; expect "a missing fdb target is red" fail "$fixture"
+  fixture="$tmp/absent.log";  emit_log "$fixture" none 45 fence_split; expect "a missing fdb target is red" fail "$fixture"
   # A target that ran and asserted nothing. `check_log` has always refused this
   # — "a target that is present with a zero count is as dark as one that never
   # ran" — and until now no fixture exercised the clause: measured 2026-08-17,
   # relaxing `(( count > 0 ))` to `(( count >= 0 ))` left all five cases green.
-  # 60 apiece keeps the total at 480, well over the floor, so this can only be
+  # 60 apiece keeps the total at 600, well over the floor, so this can only be
   # red for the reason it names.
   fixture="$tmp/silent.log";  emit_log "$fixture" none 60 '' fence_split; expect "a target that ran zero tests is red" fail "$fixture"
 

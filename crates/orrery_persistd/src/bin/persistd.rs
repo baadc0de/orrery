@@ -2093,7 +2093,7 @@ where
         // and the account binding of a ledger credit. Its doc comment states
         // exactly what it does not check — every durable invariant, which a
         // linked `Ruleset` and the FDB transaction still owe.
-        validator: Arc::new(BaselineIntentValidator),
+        validator: Arc::new(BaselineIntentValidator::permissive()),
         ..GatewayConfig::default()
     })
 }

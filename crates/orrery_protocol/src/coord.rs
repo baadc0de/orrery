@@ -711,6 +711,50 @@ pub fn witness_epoch_commitment(
     *hasher.finalize().as_bytes()
 }
 
+/// The domain tag under which a gateway's per-cell-epoch `draw_key` is
+/// committed to (D27 clause (d)).
+///
+/// Distinct from [`WITNESS_EPOCH_COMMIT_V1_DOMAIN`] because the two keys are
+/// *different secrets held by different processes* and only ever look alike:
+/// `k_epoch` is the coordinator's and seeds the set-selection shuffle;
+/// `draw_key` is the gateway's and seeds the per-intent required-K draw.
+/// Neither ever crosses to the other's holder, and a shared tag would make a
+/// commitment to one openable as a commitment to the other.
+pub const ATTESTATION_DRAW_COMMIT_V1_DOMAIN: &[u8] = b"orrery/attestation-draw-commit/v1";
+
+/// The commitment a gateway publishes for a cell-epoch's `draw_key`
+/// (D27 clause (d)).
+///
+/// `blake3(DOMAIN ‖ grid ‖ cell ‖ epoch ‖ d)`, the shape
+/// [`witness_epoch_commitment`] uses, for the same reason: the binding is
+/// inside the hash, so a key revealed for one cell-epoch cannot be replayed as
+/// the opening of another's commitment.
+///
+/// **D27 writes the binding as `c ‖ e` and this adds the grid.** That is D28
+/// clause (f)'s correction applied here too — cell ids are grid-relative
+/// ([D22][d22]), so a binding without a grid would let two nested grids'
+/// identically numbered cells share one commitment.
+///
+/// The ordering rule this exists to serve is the one that makes a retrospective
+/// audit non-vacuous: the commitment must be durable before any intent in the
+/// cell-epoch is admitted, so the gateway cannot choose `d` after seeing which
+/// attestations arrived.
+///
+/// [d22]: https://github.com/baadc0de/orrery/blob/main/docs/adr/0022-grid-id-in-the-storage-key.md
+#[must_use]
+pub fn attestation_draw_commitment(
+    grid: GridId,
+    cell: CellId,
+    epoch: u32,
+    draw_key: &[u8; 32],
+) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(ATTESTATION_DRAW_COMMIT_V1_DOMAIN);
+    hasher.update(&witness_epoch_binding(grid, cell, epoch));
+    hasher.update(draw_key);
+    *hasher.finalize().as_bytes()
+}
+
 /// The ChaCha20 seed the draw runs under.
 ///
 /// `HMAC-SHA256(k_e, DOMAIN ‖ grid ‖ cell ‖ epoch)` — the seed key is the MAC

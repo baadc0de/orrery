@@ -228,6 +228,23 @@ pub(crate) fn process_replies(mut context: ReplyProcessingContext) {
                     );
                 }
             }
+            GatewayReply::WitnessEpochAck { epoch, reason } => {
+                // This client does not courier witness-set announcements yet —
+                // the co-sign flow owns the peer side — so the only thing to
+                // do with an ack is say what it was. It is logged rather than
+                // dropped for the reason the interest ack above is: a refused
+                // announcement is otherwise invisible until attested intents
+                // start failing their quorum, which is the hardest possible
+                // way to discover a key rotation or a lapsed grant.
+                if epoch.is_none() {
+                    tracing::warn!(
+                        reason,
+                        "gateway: witness-set announcement refused; attested                          intents in that cell-epoch will not reach quorum"
+                    );
+                } else {
+                    tracing::debug!(?epoch, "gateway: witness-set announcement accepted");
+                }
+            }
         }
     }
 }
