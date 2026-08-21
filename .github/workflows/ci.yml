@@ -216,7 +216,7 @@ jobs:
       # clobber each other's and prefetch would fall to near zero.
       - name: Install kache and point it at the S3 remote
         if: env.ORRERY_CACHE_AVAILABLE == 'true'
-        uses: kunobi-ninja/kache-action@49398d37113c616fdb61be434cb497e3c2c8f3e6 # v1
+        uses: kunobi-ninja/kache-action@a257c055543c2840700a9bbca8f9c3094a421b1b # main@2026-06-19
         with:
           version: 0.14.2
           s3-bucket: orrery-kache
@@ -224,6 +224,11 @@ jobs:
           s3-prefix: artifacts
           manifest-key: clippy-x86_64-unknown-linux-gnu
           pr-comment: false
+          # Symmetric with `test`'s cap and for the same reason, though this
+          # lane is nowhere near it: the same first run measured this store at
+          # 1.7 GiB with 82 GiB free. Stated rather than left to the 50 GiB
+          # default so the two lanes do not silently differ.
+          max-size: 20GiB
 
       - name: Install the pinned toolchain
         run: rustup show active-toolchain || rustup toolchain install
@@ -306,6 +311,20 @@ jobs:
             exit 1
           }
 
+      # #171 made the case that a `df` before and after misses the peak, and
+      # the peak is the whole question. That is even truer with a cache: the
+      # local store and `target/` grow together and the store evicts under its
+      # cap, so the end-of-run reading understates what the disk actually had
+      # to hold. Two-second sampling for the life of the lane, same interval
+      # #171 used, so the two numbers are comparable.
+      - name: Start the free-disk sampler
+        if: env.ORRERY_CACHE_AVAILABLE == 'true'
+        run: |
+          set -euo pipefail
+          nohup bash -c 'while :; do df -B1 --output=avail / | tail -1; sleep 2; done' \
+            > "$RUNNER_TEMP/avail.txt" 2>/dev/null &
+          echo "sampling free bytes on / every 2 s into $RUNNER_TEMP/avail.txt"
+
       # All three passes, and the `--exclude`/`--no-deps` reasoning that makes them
       # mean something, live in scripts/check.sh so this job is reproducible
       # locally with one command.
@@ -331,8 +350,14 @@ jobs:
           # Disk alongside the cache figures: a warm lane restores artifacts
           # into `target/` *and* keeps them in the local store, so the cache
           # changes the disk answer #171 measured and the new number should be
-          # on the record next to it.
+          # on the record next to it. `min_free_bytes` is the minimum over the
+          # sampled series — the figure directly comparable to #171's "free at
+          # peak" column.
           df -h /
+          if [[ -s "$RUNNER_TEMP/avail.txt" ]]; then
+            echo "min_free_bytes     $(sort -n "$RUNNER_TEMP/avail.txt" | head -1)"
+            echo "df_samples         $(wc -l < "$RUNNER_TEMP/avail.txt")"
+          fi
           kache stats --since 24h || true
           kache report --format json --since 24h --output kache-clippy.json
           {
@@ -466,7 +491,7 @@ jobs:
       # expensive last time" index that is per-lane.
       - name: Install kache and point it at the S3 remote
         if: env.ORRERY_CACHE_AVAILABLE == 'true'
-        uses: kunobi-ninja/kache-action@49398d37113c616fdb61be434cb497e3c2c8f3e6 # v1
+        uses: kunobi-ninja/kache-action@a257c055543c2840700a9bbca8f9c3094a421b1b # main@2026-06-19
         with:
           version: 0.14.2
           s3-bucket: orrery-kache
@@ -474,15 +499,29 @@ jobs:
           s3-prefix: artifacts
           manifest-key: test-x86_64-unknown-linux-gnu
           pr-comment: false
-          # The local store is capped rather than left on kache's 50 GiB
-          # default, and the cap is load-bearing on this lane. #171 measured
-          # `test`'s cold `target/` at 45.65 GiB with 39.29 GiB free at peak;
-          # an uncapped store on the same filesystem could in principle add
-          # another 50 GiB and reproduce the disk-exhaustion failure (#168)
-          # this migration exists to leave behind. 25 GiB is the figure
-          # AGENTS.md § Build cache already uses for a per-identity local
-          # store, and it leaves 46 + 25 = 71 GiB against 87 GiB free.
-          max-size: 25GiB
+          # THE CAP IS LOAD-BEARING ON THIS LANE, AND THAT IS MEASURED, NOT
+          # ASSUMED. The first run of this PR
+          # (https://github.com/baadc0de/orrery/actions/runs/32486274447)
+          # left the store on kache's 50 GiB default and died 13 min in with
+          #   error: failed to build archive at .../libiroh-*.rlib:
+          #          No space left on device (os error 28)
+          # and `df` reading `145G 145G 29M 100% /`.
+          #
+          # The mechanism, stated plainly because it invalidates a premise
+          # #171 and #192 both rest on: the runner's root filesystem is ext4
+          # *without* reflink support (`kache doctor` reports "Cache FS
+          # ext2/3/4 (local)"), so a cached artifact is a second physical copy
+          # rather than a copy-on-write clone. The local store is therefore
+          # roughly a duplicate of the cacheable part of `target/`, and
+          # #171's 39.29 GiB of headroom is the budget it has to fit inside.
+          # Uncapped, it does not.
+          #
+          # 20 GiB, not the 25 GiB AGENTS.md uses for a per-identity store on
+          # the box: 58 GiB base + 47 GiB `target/` + 20 GiB store is 125 GiB
+          # of 145 GiB. Evicting under the cap costs nothing — every evicted
+          # object has already been uploaded, and a pruned object is a cache
+          # miss and nothing worse (AGENTS.md § Build cache).
+          max-size: 20GiB
 
       - name: Install the pinned toolchain
         run: rustup show active-toolchain || rustup toolchain install
@@ -536,6 +575,20 @@ jobs:
             exit 1
           }
 
+      # #171 made the case that a `df` before and after misses the peak, and
+      # the peak is the whole question. That is even truer with a cache: the
+      # local store and `target/` grow together and the store evicts under its
+      # cap, so the end-of-run reading understates what the disk actually had
+      # to hold. Two-second sampling for the life of the lane, same interval
+      # #171 used, so the two numbers are comparable.
+      - name: Start the free-disk sampler
+        if: env.ORRERY_CACHE_AVAILABLE == 'true'
+        run: |
+          set -euo pipefail
+          nohup bash -c 'while :; do df -B1 --output=avail / | tail -1; sleep 2; done' \
+            > "$RUNNER_TEMP/avail.txt" 2>/dev/null &
+          echo "sampling free bytes on / every 2 s into $RUNNER_TEMP/avail.txt"
+
       - run: scripts/check.sh test
 
       # The heavier of the two lanes, so the one whose `bytes_down` decides the
@@ -547,8 +600,14 @@ jobs:
           # Disk alongside the cache figures: a warm lane restores artifacts
           # into `target/` *and* keeps them in the local store, so the cache
           # changes the disk answer #171 measured and the new number should be
-          # on the record next to it.
+          # on the record next to it. `min_free_bytes` is the minimum over the
+          # sampled series — the figure directly comparable to #171's "free at
+          # peak" column.
           df -h /
+          if [[ -s "$RUNNER_TEMP/avail.txt" ]]; then
+            echo "min_free_bytes     $(sort -n "$RUNNER_TEMP/avail.txt" | head -1)"
+            echo "df_samples         $(wc -l < "$RUNNER_TEMP/avail.txt")"
+          fi
           kache stats --since 24h || true
           kache report --format json --since 24h --output kache-test.json
           {
