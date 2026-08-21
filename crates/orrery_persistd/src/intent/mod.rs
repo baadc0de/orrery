@@ -412,6 +412,28 @@ pub enum RejectionCause {
     /// the cell's population; the other is "it collected enough, and they were
     /// the wrong ones", which is either bad luck or attestation shopping.
     ThresholdNotMet,
+    /// The intent names a cell-epoch whose cell the issuer holds no
+    /// coordinator-confirmed interest in.
+    ///
+    /// [D30](../../../../docs/adr/0030-cell-epoch-standing.md) clause (a).
+    /// The epoch resolved, the announcement is genuine, and this gateway is
+    /// still refusing to judge the intent under it — because *which announced
+    /// set judges an intent* must not be a submitter's choice. D27 §4.4's
+    /// collusion arithmetic is stated per cell, and a submitter free to name
+    /// any cell-epoch in this gateway's cache turns "do I hold `K` of this
+    /// cell's draw" into "do I hold `K` of any reachable cell's draw".
+    ///
+    /// The standing is the peer's own live interest grant — the same
+    /// coordinator signature [`crate::gateway::InterestAuthority::allows`]
+    /// answers a `Claim` and D25's fan-out with, and the same predicate D28
+    /// clause (d) step 6 already gates *presenting* an announcement on.
+    ///
+    /// Deliberately **not** the provisional case: `UnknownEpoch`,
+    /// `EpochStale` and `LowPopulationEpoch` all describe a gateway that
+    /// cannot judge, and D29 answers those with a quarantined commit. This
+    /// one describes a submitter that asked to be judged somewhere it does
+    /// not stand, which is a refusal at every population.
+    NoStandingInCell,
     /// A witness the draw named did not attest.
     ///
     /// The conjunct that makes K-of-N mean something: `required(I) ⊆ the
@@ -445,6 +467,7 @@ impl RejectionCause {
             Self::UnknownEpoch => "unknown_epoch",
             Self::EpochStale => "epoch_stale",
             Self::LowPopulationEpoch => "low_population_epoch",
+            Self::NoStandingInCell => "no_standing_in_cell",
             Self::WitnessOutsideAnnouncedSet => "witness_outside_announced_set",
             Self::ThresholdNotMet => "threshold_not_met",
             Self::RequiredWitnessMissing => "required_witness_missing",
@@ -481,6 +504,7 @@ impl RejectionCause {
             Self::UnknownEpoch
             | Self::EpochStale
             | Self::LowPopulationEpoch
+            | Self::NoStandingInCell
             | Self::WitnessOutsideAnnouncedSet
             | Self::ThresholdNotMet
             | Self::RequiredWitnessMissing => orrery_protocol::REASON_ATTESTATION_QUORUM,
@@ -529,11 +553,13 @@ impl RejectionCause {
 ///    audit trail.
 /// 6. **The K-of-N quorum, when this validator enforces it**
 ///    ([`AttestationEnforcement`]). The intent's `cell_epoch` handle resolves
-///    to a coordinator-announced witness set; every attestation must come from
-///    that set minus the parties; and the `K` members D27's per-intent draw
-///    names must all have signed. Off by default, because every production
-///    issuer in this tree submits zero attestations and a hard requirement
-///    flipped on unconditionally would refuse all of them at once.
+///    to a coordinator-announced witness set; **the issuer must hold live
+///    coordinator-confirmed interest in that announcement's cell** (D30
+///    clause (a)); every attestation must come from that set minus the
+///    parties; and the `K` members D27's per-intent draw names must all have
+///    signed. Off by default, because every production issuer in this tree
+///    submits zero attestations and a hard requirement flipped on
+///    unconditionally would refuse all of them at once.
 /// 5. **Party exclusion, as far as NodeIds reach.** No attestation may name
 ///    the issuer as its witness (D10 item 4; `docs/07-witnessing.md` §4.1's
 ///    per-intent party exclusion, enforced by the gateway per §4.2). This is
@@ -604,6 +630,15 @@ impl RejectionCause {
 ///   answer is a durable read, which the admission path does not take. The
 ///   account-level half is D28's, made at selection time where the identity
 ///   bindings actually live.
+/// - **Which *one* cell an intent belongs to.** D30 clause (a) narrows the
+///   cell-epochs a submitter may be judged under to the cells its own
+///   coordinator grant covers — D5's 27-cell neighbourhood, capped at
+///   `MAX_INTEREST_GRANT_CELLS` — and not to a single cell, because nothing
+///   in an intent identifies one. The ops are `Ruleset`-opaque and the two
+///   this cluster does interpret address flat keys with no spatial term at
+///   all (`keyspace::ledger_bal_key`, `keyspace::ledger_item_key`), so there
+///   is no cell to derive. What survives is a bounded neighbourhood factor,
+///   quantified in D30's Consequences.
 /// - **Rate and quota.** Intent submission is bounded per connection by the
 ///   gateway's in-flight lane, not by a per-account budget the way reports
 ///   are.
@@ -612,10 +647,26 @@ impl RejectionCause {
 /// - **The issuer signature and the issuer/connection binding**, which the
 ///   gateway checks *before* this runs; the validator would be the wrong
 ///   place to repeat them.
-#[derive(Debug, Default, Clone)]
+#[derive(Default, Clone)]
 pub struct BaselineIntentValidator {
     enforcement: AttestationEnforcement,
     epochs: Option<Arc<crate::witness_epoch::WitnessEpochAuthority>>,
+    interest: Option<Arc<dyn crate::gateway::InterestAuthority>>,
+}
+
+/// Written out rather than derived because [`crate::gateway::InterestAuthority`]
+/// is not `Debug`: it is an interface over the gateway's live, lock-guarded
+/// snapshot table, and formatting one would put every peer's coordinator
+/// interest set into whatever log line printed the validator. Whether an
+/// authority is configured is the fact a reader needs here.
+impl core::fmt::Debug for BaselineIntentValidator {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("BaselineIntentValidator")
+            .field("enforcement", &self.enforcement)
+            .field("epochs", &self.epochs)
+            .field("interest", &self.interest.is_some())
+            .finish()
+    }
 }
 
 /// Whether this gateway requires D27's K-of-N quorum, or only checks that a
@@ -661,12 +712,26 @@ impl BaselineIntentValidator {
     }
 
     /// A validator that enforces D27's K-of-N predicate against the epochs
-    /// `epochs` holds.
+    /// `epochs` holds, for issuers `interest` says stand in the cell.
+    ///
+    /// Both authorities are required, and the second one is
+    /// [D30](../../../../docs/adr/0030-cell-epoch-standing.md) clause (a).
+    /// A cell-epoch resolves by handle out of a cache that holds every cell
+    /// any peer has couriered an announcement for, so without a standing
+    /// predicate the *submitter* decides which announced set judges its
+    /// intent. `interest` is the gateway's own
+    /// [`crate::gateway::InterestAuthority`] — the same coordinator-signed
+    /// object D28 clause (d) step 6 already gates announcement *presentation*
+    /// on, reused rather than a second notion of who belongs where.
     #[must_use]
-    pub fn enforcing(epochs: Arc<crate::witness_epoch::WitnessEpochAuthority>) -> Self {
+    pub fn enforcing(
+        epochs: Arc<crate::witness_epoch::WitnessEpochAuthority>,
+        interest: Arc<dyn crate::gateway::InterestAuthority>,
+    ) -> Self {
         Self {
             enforcement: AttestationEnforcement::Required,
             epochs: Some(epochs),
+            interest: Some(interest),
         }
     }
 
@@ -687,32 +752,33 @@ impl BaselineIntentValidator {
 /// derive a different `required(I)` and convict an honest gateway; the
 /// recorded vector is what the audit reads instead.
 ///
-/// # What this cannot bind, and it is D27's own open question 2
+/// # Which cell judges the intent: D30, closing D27's open question 2
 ///
-/// **The intent's cell.** `CellEpoch` is a bare `u64` handle
-/// (`persist.rs`: "wire-identical to `Epoch`"), and an [`Intent`] names no
-/// cell, no grid and no entity this code can map to one. So the epoch is
-/// resolved by handle out of a cache that holds every cell a peer has
-/// couriered an announcement for, and a submitter therefore chooses *which
-/// announced set* judges its intent among those.
+/// `CellEpoch` is a bare `u64` handle (`persist.rs`: "wire-identical to
+/// `Epoch`") and an [`Intent`] names no cell, no grid and no entity this code
+/// can map to one. What the handle *does* name, exactly and under the
+/// coordinator's signature, is one `(grid, cell, epoch)` — D28 clause (b)
+/// makes the handle globally unique and the cell arrive signed. The gap D27
+/// left open was never that the gateway cannot tell which cell an intent
+/// names; it is that **nothing constrained which cell a submitter may name**,
+/// because the cache resolves by handle and holds every cell any peer has
+/// couriered an announcement for.
 ///
-/// That matters: D27's collusion arithmetic (`C(c,K)/C(N,K)`) is computed over
-/// **the cell's** announced set, and a submitter free to name another cell's
-/// epoch can shop for whichever announced set holds the most of its colluders
-/// — it still needs their co-signatures, so this is not a free forgery, but it
-/// converts "3 of my colluders landed in this cell's draw" into "3 landed in
-/// any cell's draw I can reach".
+/// That is a quantified weakening, not untidiness. D27 §4.4's collusion
+/// arithmetic `C(c,K)/C(N,K)` is stated over **one cell's** announced set, and
+/// a submitter free to name another cell's epoch converts "do I hold `K` of
+/// this cell's draw" into "do I hold `K` of any reachable cell's draw" — one
+/// attempt per cell in the cache, at whichever cell holds the most of its
+/// colluders.
 ///
-/// It is **not fixable here**, and D27 says so in as many words (open question
-/// 2): "a gateway serving more than one cell cannot resolve *which*
-/// announcement an intent names from the intent alone — it must infer `c` from
-/// the intent's subject entities, which is `Ruleset`-dependent … whether
-/// `CellEpoch` widens, or the announcement carries the binding, is
-/// unresolved." Closing it needs a wire change or a linked `Ruleset`, and both
-/// are somebody else's record to make. Until then the residual is bounded by
-/// what is *in* the cache: only announcements presented by a peer that held
-/// interest in the announced cell (D28 clause (d) step 6), and only for
-/// `epoch_ms + accept_grace_ms`.
+/// [D30](../../../../docs/adr/0030-cell-epoch-standing.md) clause (a) closes
+/// it with a standing predicate rather than a wire field: the issuer must hold
+/// live coordinator-confirmed interest in the epoch's cell. The choice set
+/// shrinks from "every cell in this gateway's cache" — a property of what
+/// other peers couriered, not of the submitter at all — to the cells of the
+/// issuer's own interest grant, each of which is a cell it is actually in.
+/// The bound is per cell again, and the residual (a submitter may still pick
+/// the best cell of its own ≤27-cell neighbourhood) is stated in the record.
 ///
 /// # Errors
 ///
@@ -720,6 +786,7 @@ impl BaselineIntentValidator {
 fn check_attestation_quorum(
     intent: &Intent,
     epochs: &crate::witness_epoch::WitnessEpochAuthority,
+    interest: &dyn crate::gateway::InterestAuthority,
     now_ms: u64,
 ) -> Result<Vec<NodeId>, RejectionCause> {
     // The epoch the intent *names*, resolved by handle. Never "the current
@@ -729,6 +796,28 @@ fn check_attestation_quorum(
     let Some(epoch) = epochs.resolve(intent.cell_epoch.0) else {
         return Err(RejectionCause::UnknownEpoch);
     };
+
+    // D30 clause (a). The handle named a cell; this asks whether the issuer
+    // has any business being judged there. The cell comes out of the
+    // coordinator's signed announcement (D28 clause (b): "the cell arrives
+    // signed, never asserted") and the standing out of the issuer's own
+    // coordinator-signed interest grant, so neither term of the comparison is
+    // anything the submitter said about itself.
+    //
+    // **Above the staleness check on purpose.** Standing is a fact about the
+    // submitter and does not depend on the epoch's window, and answering
+    // `EpochStale` to a peer with no standing would confirm the existence and
+    // the age of a cell-epoch it has no business enumerating — the same
+    // reason every quorum cause collapses to one wire code.
+    if !interest.allows(
+        intent.issuer,
+        epoch.snapshot.grid,
+        epoch.snapshot.cell,
+        now_ms,
+    ) {
+        return Err(RejectionCause::NoStandingInCell);
+    }
+
     if !epoch.snapshot.usable_at(now_ms) {
         return Err(RejectionCause::EpochStale);
     }
@@ -1023,12 +1112,20 @@ impl BaselineIntentValidator {
         let Some(epochs) = self.epochs.as_ref() else {
             return Err(RejectionCause::UnknownEpoch);
         };
+        // The same fail-closed reading for D30's second authority: a validator
+        // enforcing with no interest authority can establish standing for
+        // nobody, which is exactly `NoStandingInCell`. `enforcing` takes both,
+        // so this arm is unreachable through the constructor and is written
+        // out rather than unwrapped.
+        let Some(interest) = self.interest.as_ref() else {
+            return Err(RejectionCause::NoStandingInCell);
+        };
         // The quorum runs *after* every shape check and after the envelope's
         // signature work, preserving the "signature work last" property this
         // filter already documents: an oversized or malformed submission never
         // pays for a witness-set resolution, and a self-witnessed one never
         // reaches the draw.
-        check_attestation_quorum(intent, epochs.as_ref(), now_ms)?;
+        check_attestation_quorum(intent, epochs.as_ref(), interest.as_ref(), now_ms)?;
         Ok(precheck)
     }
 }
@@ -1690,8 +1787,15 @@ mod tests {
     ) {
         let announced: Vec<NodeId> = witnesses.iter().map(iroh_base::SecretKey::public).collect();
         let epochs = epoch_fixture::cache_with(EPOCH_HANDLE, &announced, 1_000);
+        // D30's standing predicate is not what these tests are about, and a
+        // fixture that denied it would make every one of them fail for the
+        // wrong reason. The predicate has its own tests below, against a
+        // grant that covers one cell of two.
         (
-            BaselineIntentValidator::enforcing(Arc::clone(&epochs)),
+            BaselineIntentValidator::enforcing(
+                Arc::clone(&epochs),
+                Arc::new(epoch_fixture::CoverAllInterest),
+            ),
             epochs,
         )
     }
@@ -1986,7 +2090,10 @@ mod tests {
             witnesses.iter().map(iroh_base::SecretKey::public).collect();
         announced.push(issuer_key().public());
         let epochs = epoch_fixture::cache_with(EPOCH_HANDLE, &announced, 1_000);
-        let validator = BaselineIntentValidator::enforcing(Arc::clone(&epochs));
+        let validator = BaselineIntentValidator::enforcing(
+            Arc::clone(&epochs),
+            Arc::new(epoch_fixture::CoverAllInterest),
+        );
 
         let mut intent = attestable_intent(9);
         for key in &witnesses {
@@ -2022,10 +2129,26 @@ mod tests {
         let blind = BaselineIntentValidator {
             enforcement: AttestationEnforcement::Required,
             epochs: None,
+            interest: None,
         };
         assert_eq!(
             blind.check_at(&intent, &cx(Some(7)), 2_000),
             Err(RejectionCause::UnknownEpoch)
+        );
+
+        // The same direction for D30's second authority: an enforcing
+        // validator that can establish standing for nobody refuses, rather
+        // than treating a missing predicate as a satisfied one.
+        let witnesses = witness_keys(7);
+        let announced: Vec<NodeId> = witnesses.iter().map(iroh_base::SecretKey::public).collect();
+        let standingless = BaselineIntentValidator {
+            enforcement: AttestationEnforcement::Required,
+            epochs: Some(epoch_fixture::cache_with(EPOCH_HANDLE, &announced, 1_000)),
+            interest: None,
+        };
+        assert_eq!(
+            standingless.check_at(&intent, &cx(Some(7)), 2_000),
+            Err(RejectionCause::NoStandingInCell)
         );
     }
 
@@ -2046,6 +2169,243 @@ mod tests {
             Err(RejectionCause::SelfWitness),
             "party exclusion is checked above the draw and carries its own \
              wire code, because it is never a bad client"
+        );
+    }
+
+    // -- D30: which announced set is allowed to judge the intent ------------
+    //
+    // The cache resolves by handle and holds every cell any peer couriered an
+    // announcement for, so the shape these tests need is two cells in one
+    // cache and an issuer standing in exactly one of them.
+
+    /// The handle of the cell the issuer stands in — the fixture cell
+    /// [`epoch_fixture::cache_with`] announces under, `CellId::ROOT`.
+    const HOME_HANDLE: u64 = EPOCH_HANDLE;
+    /// The handle of a second cell, announced to the same gateway by some
+    /// other peer. One `u64` away from any submitter that can reach it.
+    const AWAY_HANDLE: u64 = 0x0001_0000_0000_0002;
+
+    /// The second cell. A child of the root rather than the root itself, so
+    /// the two announcements are genuinely for different cells and the
+    /// standing grant can cover one without covering the other.
+    fn away_cell() -> orrery_protocol::CellId {
+        orrery_protocol::CellId::ROOT.children()[0]
+    }
+
+    /// A gateway holding announcements for two cells, and an issuer whose
+    /// coordinator grant covers only the first.
+    ///
+    /// Returns the validator, the cache, the seven witnesses announced at
+    /// home, and the seven announced away. The two announced sets are
+    /// **disjoint**, which is what makes "the draw ran over the wrong cell"
+    /// observable rather than a coincidence of overlapping membership.
+    fn two_cell_gateway() -> (
+        BaselineIntentValidator,
+        Arc<crate::witness_epoch::WitnessEpochAuthority>,
+        Vec<iroh_base::SecretKey>,
+        Vec<iroh_base::SecretKey>,
+    ) {
+        let home = witness_keys(7);
+        let away: Vec<iroh_base::SecretKey> = (10..17).map(epoch_fixture::witness_secret).collect();
+        let home_ids: Vec<NodeId> = home.iter().map(iroh_base::SecretKey::public).collect();
+        let away_ids: Vec<NodeId> = away.iter().map(iroh_base::SecretKey::public).collect();
+        assert!(
+            away_ids.iter().all(|node| !home_ids.contains(node)),
+            "the two announced sets must be disjoint, or these tests prove nothing"
+        );
+
+        let epochs = epoch_fixture::cache_with(HOME_HANDLE, &home_ids, 1_000);
+        epoch_fixture::add_cell_epoch(&epochs, away_cell(), AWAY_HANDLE, &away_ids, 1_000);
+
+        let interest = Arc::new(crate::gateway::SnapshotInterestAuthority::from_snapshots([
+            orrery_protocol::CoordinatorInterestSnapshot {
+                peer: issuer_key().public(),
+                epoch: orrery_protocol::Epoch::new(1),
+                grid: orrery_protocol::GridId::ROOT,
+                covered_cells: vec![orrery_protocol::CellId::ROOT],
+                valid_until_ms: 50_000,
+            },
+        ]));
+        let validator =
+            BaselineIntentValidator::enforcing(Arc::clone(&epochs), interest.clone() as Arc<_>);
+        (validator, epochs, home, away)
+    }
+
+    /// A signed intent naming `handle`, with one opaque op.
+    fn intent_naming(handle: u64, id: u128) -> Intent {
+        let mut intent = attestable_intent(id);
+        intent.cell_epoch = CellEpoch::new(handle);
+        intent.attestations.clear();
+        intent.sign(&issuer_key());
+        intent
+    }
+
+    /// Attach the co-signatures the draw under `handle` requires.
+    fn attest_required_under(
+        intent: &mut Intent,
+        handle: u64,
+        witnesses: &[iroh_base::SecretKey],
+        epochs: &crate::witness_epoch::WitnessEpochAuthority,
+    ) -> Vec<NodeId> {
+        let epoch = epochs.resolve(handle).expect("fixture epoch is cached");
+        let eligible = orrery_protocol::eligible_witnesses(&epoch.snapshot.selected, intent.issuer);
+        let required = epoch.required_witnesses(intent.intent_id, &eligible);
+        for node in &required {
+            let key = witnesses
+                .iter()
+                .find(|key| key.public() == *node)
+                .expect("the draw only names announced witnesses");
+            let attestation = intent.attest(key);
+            intent.attestations.push(attestation);
+        }
+        required
+    }
+
+    /// D30 clause (a). An intent naming a cell-epoch the issuer has no
+    /// standing in is refused, under a cause of its own — even when it
+    /// carries exactly the co-signatures that cell's draw requires.
+    ///
+    /// The control arm is the same submitter, the same op, the same clock,
+    /// naming the cell it *does* stand in: that one commits. Without it this
+    /// test would pass against an implementation that simply refused
+    /// everything.
+    #[test]
+    fn an_intent_naming_a_cell_epoch_the_issuer_does_not_stand_in_is_refused() {
+        let (validator, epochs, home, away) = two_cell_gateway();
+
+        let mut shopped = intent_naming(AWAY_HANDLE, 21);
+        let required_away = attest_required_under(&mut shopped, AWAY_HANDLE, &away, &epochs);
+        assert_eq!(required_away.len(), orrery_protocol::WITNESS_QUORUM_K);
+        for attestation in &shopped.attestations {
+            assert!(
+                attestation.verify(&shopped),
+                "every co-signature is genuine, so only the standing check can refuse this"
+            );
+        }
+        assert_eq!(
+            validator.check_at(&shopped, &cx(Some(7)), 2_000),
+            Err(RejectionCause::NoStandingInCell),
+            "the submitter does not stand in the away cell, so that cell's \
+             announced set does not judge its intent"
+        );
+
+        let mut at_home = intent_naming(HOME_HANDLE, 22);
+        attest_required_under(&mut at_home, HOME_HANDLE, &home, &epochs);
+        assert!(
+            validator.check_at(&at_home, &cx(Some(7)), 2_000).is_ok(),
+            "the same issuer, in the cell it stands in, commits"
+        );
+    }
+
+    /// The required subset is drawn from the cell the intent is judged under,
+    /// never from one the submitter picked for its membership.
+    ///
+    /// The colluders here are the away cell's required trio — the best
+    /// possible hand under the set the submitter would like to be judged by.
+    /// Both of the moves that hand enables are closed: presenting it under the
+    /// away handle fails the standing check, and presenting it under the home
+    /// handle fails set membership, because the home draw runs over the home
+    /// announcement and names nobody from the away set.
+    #[test]
+    fn the_required_subset_is_drawn_from_the_cell_that_judges_the_intent() {
+        let (validator, epochs, home, away) = two_cell_gateway();
+
+        let mut probe = intent_naming(AWAY_HANDLE, 23);
+        let colluders = attest_required_under(&mut probe, AWAY_HANDLE, &away, &epochs);
+
+        // The same co-signatures, re-made over an intent naming the home
+        // cell-epoch: real signatures from real announced witnesses — of
+        // another cell.
+        let mut shopped = intent_naming(HOME_HANDLE, 23);
+        for node in &colluders {
+            let key = away
+                .iter()
+                .find(|key| key.public() == *node)
+                .expect("a colluder is an away witness");
+            let attestation = shopped.attest(key);
+            assert!(attestation.verify(&shopped), "the signature is genuine");
+            shopped.attestations.push(attestation);
+        }
+        assert_eq!(
+            validator.check_at(&shopped, &cx(Some(7)), 2_000),
+            Err(RejectionCause::WitnessOutsideAnnouncedSet),
+            "the home cell's draw runs over the home cell's announcement"
+        );
+
+        // And the home draw names only home witnesses, which is the same fact
+        // from the other side.
+        let mut honest = intent_naming(HOME_HANDLE, 23);
+        let required_home = attest_required_under(&mut honest, HOME_HANDLE, &home, &epochs);
+        assert!(
+            required_home.iter().all(|node| !colluders.contains(node)),
+            "disjoint announced sets cannot share a required subset"
+        );
+        assert!(validator.check_at(&honest, &cx(Some(7)), 2_000).is_ok());
+    }
+
+    /// Standing is checked above staleness, and the order is deliberate: a
+    /// submitter with no standing must not learn the age of a cell-epoch it
+    /// has no business enumerating.
+    #[test]
+    fn no_standing_outranks_a_stale_epoch() {
+        let (validator, epochs, _home, away) = two_cell_gateway();
+        let mut shopped = intent_naming(AWAY_HANDLE, 24);
+        attest_required_under(&mut shopped, AWAY_HANDLE, &away, &epochs);
+
+        // Past `epoch_ms + accept_grace_ms` from acceptance at t=1000, so the
+        // away epoch is genuinely stale as well as unstood-in.
+        let long_after = 1_000 + 60_000 + 1;
+        assert!(
+            !epochs
+                .resolve(AWAY_HANDLE)
+                .expect("cached")
+                .snapshot
+                .usable_at(long_after),
+            "the epoch must really be stale, or this proves nothing"
+        );
+        assert_eq!(
+            validator.check_at(&shopped, &cx(Some(7)), long_after),
+            Err(RejectionCause::NoStandingInCell)
+        );
+    }
+
+    /// A lapsed grant is no standing. Interest expiry is enforced on the read
+    /// path and nowhere else (D25 rule 3), so the same intent that committed
+    /// inside the grant's window is refused outside it.
+    #[test]
+    fn a_lapsed_interest_grant_stops_binding_the_intent() {
+        let (validator, epochs, home, _away) = two_cell_gateway();
+        let mut intent = intent_naming(HOME_HANDLE, 25);
+        attest_required_under(&mut intent, HOME_HANDLE, &home, &epochs);
+
+        assert!(validator.check_at(&intent, &cx(Some(7)), 2_000).is_ok());
+        // The fixture grant is valid until 50_000; the home epoch is usable
+        // until 61_000, so this instant separates the two.
+        assert!(
+            epochs
+                .resolve(HOME_HANDLE)
+                .expect("cached")
+                .snapshot
+                .usable_at(55_000),
+            "the epoch is still live here, so only the grant can refuse"
+        );
+        assert_eq!(
+            validator.check_at(&intent, &cx(Some(7)), 55_000),
+            Err(RejectionCause::NoStandingInCell)
+        );
+    }
+
+    /// The refusal is logged under its own label and answered on the wire
+    /// with the one quorum code, which is what stops it leaking the draw.
+    #[test]
+    fn no_standing_is_labelled_in_logs_and_collapsed_on_the_wire() {
+        assert_eq!(
+            RejectionCause::NoStandingInCell.as_str(),
+            "no_standing_in_cell"
+        );
+        assert_eq!(
+            RejectionCause::NoStandingInCell.wire_reason(),
+            orrery_protocol::REASON_ATTESTATION_QUORUM
         );
     }
 
