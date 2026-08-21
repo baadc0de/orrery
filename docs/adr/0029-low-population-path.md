@@ -777,6 +777,12 @@ shadow-mode telemetry rather than defended.
   without a strike, so it is not obviously covered by that requirement.
   Enforcement rollout policy is #105's and explicitly out of this record's
   scope; the flag is named, its default is not set here.
+
+  > *Erratum (2026-08-21, [ADR-0032](0032-enforcement-ramp.md)):* rollout
+  > policy was not #105's — #105 defers it ("tracked separately") — and it is
+  > owned by epic #106, recorded as ADR-0032, which also closes this open
+  > question: expiry annuls from day one, unflagged. The decision text above
+  > is unchanged; only the pointer was wrong.
 - **`v_max` — the largest single-intent value a `Ruleset` may classify as
   provisional-eligible — has no bound in this record.** Clause 9's
   `VaR ≤ C · v_max` is only a bound if `v_max` is one, and classification is the
