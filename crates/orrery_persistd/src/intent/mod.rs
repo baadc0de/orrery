@@ -25,7 +25,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use orrery_protocol::{
-    AccountId, AssetId, Intent, IntentOutcome, NodeId, REASON_CONTENTION_EXHAUSTED,
+    AccountId, AssetId, Intent, IntentOutcome, NodeId, SessionStanding, REASON_CONTENTION_EXHAUSTED,
 };
 
 #[cfg(feature = "fdb")]
@@ -84,6 +84,9 @@ pub struct IntentContext {
     /// completed a `Hello`. `None` means the connection has no established
     /// session, so nothing on it can be billed or attributed to an account.
     pub account: Option<AccountId>,
+    /// The standing the gateway read from the connection's verified session
+    /// token. A quarantined standing requires full admission validation.
+    pub standing: SessionStanding,
 }
 
 impl IntentContext {
@@ -94,6 +97,7 @@ impl IntentContext {
         Self {
             issuer,
             account: None,
+            standing: SessionStanding::Quarantined,
         }
     }
 }
@@ -513,15 +517,46 @@ fn push_read_key(read_keys: &mut Vec<Vec<u8>>, key: Vec<u8>) {
     }
 }
 
+/// Verify the bounded co-signature set carried by an intent.
+fn check_attestations(intent: &Intent) -> Result<(), RejectionCause> {
+    if intent.attestations.is_empty() {
+        return Ok(());
+    }
+
+    let preimage = intent.signing_preimage();
+    let mut seen: Vec<NodeId> = Vec::with_capacity(intent.attestations.len());
+    for attestation in &intent.attestations {
+        if seen.contains(&attestation.witness) {
+            return Err(RejectionCause::DuplicateAttestation);
+        }
+        seen.push(attestation.witness);
+        if attestation
+            .witness
+            .verify(&preimage, &attestation.signature)
+            .is_err()
+        {
+            return Err(RejectionCause::BadAttestation);
+        }
+    }
+    Ok(())
+}
+
 impl BaselineIntentValidator {
     /// The verdict, with the cause preserved for logging.
     ///
     /// # Errors
     ///
-    /// Returns the first [`RejectionCause`] the intent trips, checked cheapest
-    /// first so an oversized or malformed submission never pays for signature
-    /// verification.
+    /// Returns the first [`RejectionCause`] the intent trips. Good sessions are
+    /// checked cheapest first so an oversized or malformed submission never
+    /// pays for signature verification. A quarantined session verifies its
+    /// bounded attestation set before returning any other rejection.
     pub fn check(intent: &Intent, cx: &IntentContext) -> Result<IntentPrecheck, RejectionCause> {
+        if cx.standing == SessionStanding::Quarantined {
+            if intent.attestations.len() > MAX_ATTESTATIONS {
+                return Err(RejectionCause::TooManyAttestations);
+            }
+            check_attestations(intent)?;
+        }
         if intent.ops.is_empty() {
             return Err(RejectionCause::NoOps);
         }
@@ -647,24 +682,13 @@ impl BaselineIntentValidator {
             }
         }
 
-        // Signature work last: it is the only non-trivial cost here, and an
-        // intent that fails any check above must never pay it.
-        if !intent.attestations.is_empty() {
-            let preimage = intent.signing_preimage();
-            let mut seen: Vec<NodeId> = Vec::with_capacity(intent.attestations.len());
-            for attestation in &intent.attestations {
-                if seen.contains(&attestation.witness) {
-                    return Err(RejectionCause::DuplicateAttestation);
-                }
-                seen.push(attestation.witness);
-                if attestation
-                    .witness
-                    .verify(&preimage, &attestation.signature)
-                    .is_err()
-                {
-                    return Err(RejectionCause::BadAttestation);
-                }
-            }
+        // Signature work stays last for a good session: it is the only
+        // non-trivial cost here, and an intent that fails any check above must
+        // never pay it. Quarantined sessions paid this bounded cost before
+        // shape validation so a forged co-signature cannot hide behind a
+        // cheaper rejection.
+        if cx.standing == SessionStanding::Good {
+            check_attestations(intent)?;
         }
 
         Ok(IntentPrecheck { read_keys })
@@ -1249,10 +1273,23 @@ mod tests {
     }
 
     fn cx(account: Option<u64>) -> IntentContext {
+        cx_with_standing(account, SessionStanding::Good)
+    }
+
+    fn cx_with_standing(account: Option<u64>, standing: SessionStanding) -> IntentContext {
         IntentContext {
             issuer: issuer_key().public(),
             account: account.map(AccountId::new),
+            standing,
         }
+    }
+
+    #[test]
+    fn unauthenticated_intent_context_is_quarantined() {
+        assert_eq!(
+            IntentContext::unauthenticated(issuer_key().public()).standing,
+            SessionStanding::Quarantined
+        );
     }
 
     /// An intent carrying exactly `ops`, signed by the same issuer.
@@ -1653,6 +1690,39 @@ mod tests {
         assert_eq!(
             BaselineIntentValidator::check(&garbage, &cx(Some(8))),
             Err(RejectionCause::SelfWitness)
+        );
+    }
+
+    /// A quarantined account cannot use a cheap shape rejection to avoid
+    /// attestation-authenticity validation.
+    #[test]
+    fn quarantined_session_checks_attestations_before_shape_rejections() {
+        let witness = iroh_base::SecretKey::from_bytes(&[9u8; 32]);
+        let mut intent = intent_with(
+            (0..=MAX_OPS_PER_INTENT)
+                .map(|op| IntentOp {
+                    op: op as u16 + OPAQUE_OP_BASE,
+                    args: bytes::Bytes::new(),
+                })
+                .collect(),
+        );
+        intent.attestations.push(Attestation {
+            witness: witness.public(),
+            signature: witness.sign(b"forged attestation"),
+        });
+
+        assert_eq!(
+            BaselineIntentValidator::check(&intent, &cx(Some(7))),
+            Err(RejectionCause::TooManyOps),
+            "a good session retains the cheapest-first path"
+        );
+        assert_eq!(
+            BaselineIntentValidator::check(
+                &intent,
+                &cx_with_standing(Some(7), SessionStanding::Quarantined)
+            ),
+            Err(RejectionCause::BadAttestation),
+            "a quarantined session observes the forged co-signature first"
         );
     }
 

@@ -56,11 +56,12 @@ use orrery_protocol::channels::{
 use orrery_protocol::{
     verify_interest_grant, AccountId, AreaPage, CellId, CoordinatorInterestSnapshot, DiffUplink,
     DiscrepancyReport, Epoch, GatewayMsg, GatewayReply, GridId, Intent, IntentOutcome, IssuerKey,
-    JournalRecord, LeaseId, LeaseMsg, Lsn, NodeId, PersistId, SessionTokenClaimsV1, SessionTokenV1,
-    SessionTokenVerificationError, SessionTokenVerifier, Tick, UnixMillis, Verdict,
-    MAX_AREA_PAGE_FRAME_BYTES, MAX_SESSION_TOKEN_TTL_MS, PROTOCOL_VERSION, REASON_BAD_SIGNATURE,
-    REASON_ISSUER_MISMATCH, REASON_NO_EXECUTOR, REPORT_ADJUDICATED, REPORT_REFUSED_NO_ADJUDICATOR,
-    REPORT_REFUSED_NO_SESSION, REPORT_REFUSED_RATE_LIMITED, REPORT_REFUSED_REPORTER_MISMATCH,
+    JournalRecord, LeaseId, LeaseMsg, Lsn, NodeId, PersistId, SessionStanding,
+    SessionTokenClaimsV1, SessionTokenV1, SessionTokenVerificationError, SessionTokenVerifier,
+    Tick, UnixMillis, Verdict, MAX_AREA_PAGE_FRAME_BYTES, MAX_SESSION_TOKEN_TTL_MS,
+    PROTOCOL_VERSION, REASON_BAD_SIGNATURE, REASON_ISSUER_MISMATCH, REASON_NO_EXECUTOR,
+    REPORT_ADJUDICATED, REPORT_REFUSED_NO_ADJUDICATOR, REPORT_REFUSED_NO_SESSION,
+    REPORT_REFUSED_RATE_LIMITED, REPORT_REFUSED_REPORTER_MISMATCH,
 };
 
 use crate::actor::{FencedApply, Reject};
@@ -2821,6 +2822,12 @@ struct PeerSession {
     /// whatever lease operation currently holds it. A session's account cannot
     /// change — a token naming a different one activates a new generation.
     account: AccountId,
+    /// The standing the verified session token assigned this connection.
+    ///
+    /// Copied out for the same receive-loop reason as [`Self::account`].
+    /// It cannot change during a session because a replacement token activates
+    /// a new generation.
+    standing: SessionStanding,
     state: Arc<tokio::sync::Mutex<PeerState>>,
     /// The same cell as [`PeerState::last_seen_ms`], reachable without the
     /// peer lock so the receive loop can stamp it per message.
@@ -2828,6 +2835,15 @@ struct PeerSession {
 }
 
 impl PeerSession {
+    /// The trusted admission context for an intent from this session.
+    fn intent_context(&self) -> IntentContext {
+        IntentContext {
+            issuer: self.node,
+            account: Some(self.account),
+            standing: self.standing,
+        }
+    }
+
     async fn lock_current(&self) -> Option<tokio::sync::OwnedMutexGuard<PeerState>> {
         let state = Arc::clone(&self.state).lock_owned().await;
         (state.current == Some(self.generation)).then_some(state)
@@ -3044,6 +3060,7 @@ impl PeerRegistry {
             }
         }
         let account = peer.established.claims.account;
+        let standing = peer.established.claims.standing;
         // A completed handshake is the first thing this session is heard
         // saying; without this a peer admitted into a long-lived registry
         // entry would inherit whatever staleness the previous session left.
@@ -3054,6 +3071,7 @@ impl PeerRegistry {
             node,
             generation,
             account,
+            standing,
             state,
             last_seen_ms,
         })
@@ -3066,11 +3084,12 @@ impl PeerRegistry {
     /// negotiated handoff.
     async fn current_session(&self, node: NodeId) -> Option<PeerSession> {
         let state = Arc::clone(self.entries.lock().await.get(&node)?);
-        let (generation, account, last_seen_ms) = {
+        let (generation, account, standing, last_seen_ms) = {
             let peer = state.lock().await;
             (
                 peer.current?,
                 peer.established.claims.account,
+                peer.established.claims.standing,
                 Arc::clone(&peer.last_seen_ms),
             )
         };
@@ -3078,6 +3097,7 @@ impl PeerRegistry {
             node,
             generation,
             account,
+            standing,
             state,
             last_seen_ms,
         })
@@ -3155,6 +3175,7 @@ impl PeerRegistry {
                     node,
                     generation,
                     account: peer.established.claims.account,
+                    standing: peer.established.claims.standing,
                     state: Arc::clone(&state),
                     last_seen_ms: Arc::clone(&peer.last_seen_ms),
                 }
@@ -5171,12 +5192,13 @@ async fn handle_connection(
                 // counting only the cheap exits.
                 let received_at = Instant::now();
                 // The session is what an account-scoped admission check has to
-                // authorize against; an intent submitted before `Hello` is
-                // answered simply carries no account (`IntentContext`).
-                let cx = IntentContext {
-                    issuer: remote,
-                    account: session.as_ref().map(|session| session.account),
-                };
+                // authorize against. An intent submitted before `Hello` is
+                // answered is quarantined: it has neither a verified account
+                // nor a standing that could warrant a shortcut.
+                let cx = session.as_ref().map_or_else(
+                    || IntentContext::unauthenticated(remote),
+                    PeerSession::intent_context,
+                );
                 // The wait upstream of `received_at`, carried into the intent's
                 // own stage record. It is already summed into
                 // `gateway_ingress_queue_ms`, but that series is ~100:1 diffs
@@ -7289,6 +7311,72 @@ mod tests {
 
     fn successor_node(seed: u8) -> NodeId {
         iroh::SecretKey::from_bytes(&[seed; 32]).public()
+    }
+
+    #[derive(Default)]
+    struct ContextRecorder {
+        seen: Mutex<Option<IntentContext>>,
+    }
+
+    impl crate::intent::IntentValidator for ContextRecorder {
+        fn validate(&self, _intent: &Intent, cx: &IntentContext) -> IntentVerdict {
+            *self.seen.lock().expect("context recorder lock") = Some(*cx);
+            IntentVerdict::Admit(crate::intent::IntentPrecheck::default())
+        }
+    }
+
+    /// A quarantined standing is trusted only when it came from the verified
+    /// token, then travels with the session into the validator's context.
+    #[tokio::test]
+    async fn quarantined_token_standing_reaches_the_intent_validator() {
+        let registry = PeerRegistry::new(1, 10_000, MAX_PEER_LIVE_LEASES);
+        let signer = iroh::SecretKey::from_bytes(&[31; 32]);
+        let node = signer.public();
+        let account = AccountId::new(41);
+        let session = registry
+            .activate(
+                node,
+                GatewayAuthorization::Valid(SessionTokenClaimsV1::new(
+                    account,
+                    node,
+                    UnixMillis::new(0),
+                    orrery_protocol::SessionTokenTtlMs::new(1_000),
+                    SessionStanding::Quarantined,
+                    orrery_protocol::IssuerKeyId::new(1),
+                )),
+                b"quarantined",
+                None,
+                0,
+                0,
+            )
+            .await
+            .expect("valid peer is admitted");
+        let mut intent = Intent {
+            intent_id: 1,
+            issuer: node,
+            cell_epoch: orrery_protocol::CellEpoch::new(0),
+            ops: vec![orrery_protocol::IntentOp {
+                op: 1,
+                args: Bytes::new(),
+            }],
+            attestations: Vec::new(),
+            signature: signer.sign(b"placeholder"),
+        };
+        intent.sign(&signer);
+        let validator = ContextRecorder::default();
+
+        assert_eq!(
+            admit_intent(&intent, &validator, &session.intent_context()),
+            Ok(())
+        );
+        assert_eq!(
+            *validator.seen.lock().expect("context recorder lock"),
+            Some(IntentContext {
+                issuer: node,
+                account: Some(account),
+                standing: SessionStanding::Quarantined,
+            })
+        );
     }
 
     #[test]
