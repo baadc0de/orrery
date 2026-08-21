@@ -124,9 +124,10 @@ async fn connect(config: GatewayConfig, key: &iroh_base::SecretKey) -> Session {
     let mut admission = conn.accept_uni().await.unwrap();
     assert_eq!(admission.read_to_end(16).await.unwrap(), vec![0u8]);
     let conn = lanes::GatewayLanes::attach(conn);
-    conn.send_control(&GatewayMsg::Hello {
+    conn.send_control(&GatewayMsg::VersionedHello {
         token: support::valid_session_token(key.public()),
         node: key.public(),
+        version: orrery_protocol::PROTOCOL_VERSION,
     })
     .await;
     assert!(matches!(

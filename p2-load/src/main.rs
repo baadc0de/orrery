@@ -1245,9 +1245,10 @@ async fn dial(
     // Hello, then require the ack to name the gateway we dialed.
     send_msg(
         &link,
-        &GatewayMsg::Hello {
+        &GatewayMsg::VersionedHello {
             token,
             node: endpoint.id(),
+            version: orrery_protocol::PROTOCOL_VERSION,
         },
     )
     .await;

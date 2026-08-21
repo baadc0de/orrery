@@ -434,9 +434,10 @@ async fn production_authority_admits_well_formed_intents_and_refuses_malformed_o
     assert_eq!(admission.read_to_end(16).await.unwrap(), vec![0]);
     let connection = lanes::GatewayLanes::attach(connection);
     connection
-        .send_control(&GatewayMsg::Hello {
+        .send_control(&GatewayMsg::VersionedHello {
             token: process_session_token(client_key.public()),
             node: client_key.public(),
+            version: orrery_protocol::PROTOCOL_VERSION,
         })
         .await;
     assert!(matches!(
@@ -857,9 +858,10 @@ async fn primary_ack_is_mirrored_to_the_passive_follower_journal() {
     let conn = lanes::GatewayLanes::attach(conn);
 
     let author = client_key.public();
-    conn.send_control(&GatewayMsg::Hello {
+    conn.send_control(&GatewayMsg::VersionedHello {
         token: process_session_token(author),
         node: author,
+        version: orrery_protocol::PROTOCOL_VERSION,
     })
     .await;
     conn.send_control(&GatewayMsg::Lease {
@@ -1039,9 +1041,10 @@ async fn an_unleased_diff_is_nacked_and_never_reaches_the_follower_mirror() {
     let conn = lanes::GatewayLanes::attach(conn);
 
     let author = client_key.public();
-    conn.send_control(&GatewayMsg::Hello {
+    conn.send_control(&GatewayMsg::VersionedHello {
         token: process_session_token(author),
         node: author,
+        version: orrery_protocol::PROTOCOL_VERSION,
     })
     .await;
 

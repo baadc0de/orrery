@@ -763,9 +763,10 @@ async fn orchestrate(cli: Cli) -> Result<Outcome> {
         .map_err(|error| anyhow::anyhow!("probe interest grant: {error}"))?;
 
     let probe = Session::connect(probe_secret, gateway.clone()).await?;
-    probe.send_control(&GatewayMsg::Hello {
+    probe.send_control(&GatewayMsg::VersionedHello {
         token: probe_token,
         node: probe_node,
+        version: orrery_protocol::PROTOCOL_VERSION,
     })?;
     anyhow::ensure!(
         matches!(

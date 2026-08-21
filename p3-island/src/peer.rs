@@ -132,9 +132,10 @@ pub async fn run(config: PeerConfig) -> Result<()> {
     let session = Session::connect(config.secret.clone(), config.gateway).await?;
     let node = config.secret.public();
 
-    session.send_control(&GatewayMsg::Hello {
+    session.send_control(&GatewayMsg::VersionedHello {
         token: config.token,
         node,
+        version: orrery_protocol::PROTOCOL_VERSION,
     })?;
     let hello = session.recv(Duration::from_secs(10)).await;
     anyhow::ensure!(

@@ -268,9 +268,11 @@ pub fn connect_gateway(
 /// on [`GatewaySession::gateway`]'s sibling fields by [`connect_gateway`].
 ///
 /// This is the one site that bootstraps a session, so naming the protocol
-/// version here is what puts every Orrery client inside the gateway's `{V,
-/// V−1}` acceptance window. The unversioned `GatewayMsg::Hello` remains a
-/// valid bootstrap on the wire for peers that do not send this one.
+/// version here is what gets every Orrery client admitted at all. Acceptance is
+/// **exact equality** with the gateway's own version — D29 clause 5 closed the
+/// `{V, V−1}` window for all traffic — and the unversioned `GatewayMsg::Hello`
+/// is retired: a gateway refuses it with `GatewayReply::HelloRefused`. There is
+/// no second bootstrap to fall back to.
 pub fn hello_gateway(mut session: ResMut<GatewaySession>, mut streams: Query<&mut IrohStreamIo>) {
     if session.state != GatewayState::Connecting || session.hello_sent {
         return;

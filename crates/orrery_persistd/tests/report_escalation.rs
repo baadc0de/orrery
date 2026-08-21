@@ -314,9 +314,10 @@ async fn connect(config: GatewayConfig, key: &iroh_base::SecretKey) -> Session {
     let session = dial(config, key).await;
     session
         .conn
-        .send_control(&GatewayMsg::Hello {
+        .send_control(&GatewayMsg::VersionedHello {
             token: support::valid_session_token(key.public()),
             node: key.public(),
+            version: orrery_protocol::PROTOCOL_VERSION,
         })
         .await;
     assert!(matches!(

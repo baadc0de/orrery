@@ -195,9 +195,10 @@ async fn connect(config: GatewayConfig, key: &iroh_base::SecretKey) -> Session {
         vec![0u8]
     );
     let conn = lanes::GatewayLanes::attach(conn);
-    conn.send_control(&GatewayMsg::Hello {
+    conn.send_control(&GatewayMsg::VersionedHello {
         token: support::valid_session_token(key.public()),
         node: key.public(),
+        version: orrery_protocol::PROTOCOL_VERSION,
     })
     .await;
     assert!(matches!(
@@ -559,9 +560,10 @@ async fn a_persistd_run_emits_the_two_server_spans_and_never_a_gated_name() {
     let mut admission = conn.accept_uni().await.expect("gateway admission");
     assert_eq!(admission.read_to_end(16).await.expect("admission"), vec![0]);
     let conn = lanes::GatewayLanes::attach(conn);
-    conn.send_control(&GatewayMsg::Hello {
+    conn.send_control(&GatewayMsg::VersionedHello {
         token: process_session_token(client_key.public()),
         node: client_key.public(),
+        version: orrery_protocol::PROTOCOL_VERSION,
     })
     .await;
     assert!(matches!(
