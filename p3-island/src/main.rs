@@ -218,6 +218,23 @@ const ATTESTATION_WAIT: Duration = Duration::from_secs(5);
 /// budget rather than loosening the measurement.
 const SETTLE_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
+/// D24's `TTL + S` backstop, measured from the last peer departure.
+///
+/// The counter's last change must land inside this bound. Establishing that it
+/// stayed unchanged takes the separate quiescence window below, but that later
+/// observation never widens the instant compared with D24's bound.
+const DRAIN_SETTLE_BUDGET: Duration = Duration::from_millis(
+    LEASE_TTL.as_millis() as u64 + REGISTRAR_SWEEP_INTERVAL.as_millis() as u64,
+);
+
+/// Two complete registrar sweep periods with no disposition-counter movement.
+///
+/// One quiet sweep can straddle a change. Two consecutive periods establish
+/// that both the sweep which could observe it and the following sweep were
+/// quiet, without introducing a peer that could become a successor.
+const DRAIN_QUIESCENCE_WINDOW: Duration =
+    Duration::from_millis(REGISTRAR_SWEEP_INTERVAL.as_millis() as u64 * 2);
+
 /// The claim tier a peer asks for, as a CLI value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 enum ClaimTier {
@@ -296,6 +313,14 @@ struct Cli {
     /// persistd's `--metrics-jsonl` file, read for `duplicate_authority`.
     #[arg(long, value_name = "PATH")]
     metrics_jsonl: Option<PathBuf>,
+
+    /// Run the D24 island-drain proof after the kill-9 criterion settles.
+    ///
+    /// The proof has every survivor end its coordinator presence and gateway
+    /// session. The verdict is the registrar's own parking counter, not
+    /// whether a coordinator advisory was delivered.
+    #[arg(long)]
+    drain: bool,
 
     /// Print the public half of the identity issuer secret as JSON and exit.
     ///
@@ -396,6 +421,10 @@ async fn orchestrate(cli: Cli) -> Result<Outcome> {
         .metrics_jsonl
         .as_deref()
         .context("--metrics-jsonl is required: the parked half of the criterion is observable only in persistd's authority counters")?;
+    anyhow::ensure!(
+        cli.drain,
+        "--drain is required: the P3 gate proves both the kill-9 and island-drain legs"
+    );
     // Survivors must still be running while the proof is collected: a peer
     // that exits mid-window stops writing the log the accounting reads, and
     // its own leases park, which would look like the victim's redistribution
@@ -719,7 +748,7 @@ async fn orchestrate(cli: Cli) -> Result<Outcome> {
     // interest rather than assuming any.
     let probe_coordinator = orrery_coordinator::CoordinatorClient::connect(
         probe_secret.clone(),
-        coordinator_addr,
+        coordinator_addr.clone(),
         probe_token.clone(),
         Duration::from_secs(10),
     )
@@ -733,7 +762,7 @@ async fn orchestrate(cli: Cli) -> Result<Outcome> {
         .await
         .map_err(|error| anyhow::anyhow!("probe interest grant: {error}"))?;
 
-    let probe = Session::connect(probe_secret, gateway).await?;
+    let probe = Session::connect(probe_secret, gateway.clone()).await?;
     probe.send_control(&GatewayMsg::Hello {
         token: probe_token,
         node: probe_node,
@@ -786,14 +815,106 @@ async fn orchestrate(cli: Cli) -> Result<Outcome> {
         claim_id += 1;
     }
 
-    let duplicate_authority = final_counters.duplicate;
     let reassigned_attested = final_counters
         .reassigned
         .saturating_sub(baseline.reassigned);
 
-    for mut child in children {
-        let _ = child.kill().await;
+    // ── Drain ─────────────────────────────────────────────────────────
+    // The probe joined the original island only to acquire its interest grant.
+    // It holds no lease, and no replacement observer is introduced during the
+    // drain: an instrument that joins now could become a redistribution
+    // successor and would be participating rather than observing.
+    probe_coordinator.leave().await;
+    drop(probe);
+
+    let drain_leases_held = total_entities.saturating_sub(parked_attested);
+    let drain_baseline = read_authority_counters(metrics_jsonl)?;
+
+    // Reuse the harness's process teardown: stop every survivor without
+    // relocating it or opening a replacement session. This is deliberately
+    // the uncooperative shape D24 must survive. A process can disappear before
+    // QUIC flushes CONNECTION_CLOSE, so the registrar's own silence deadline
+    // has to turn the nominally-open session into path 2 (session teardown).
+    // The advisory Drain notice cannot be a clause: a stopped peer has no live
+    // recipient, while the expiry/silence backstop still has to park its rows.
+    for (index, child) in children.iter_mut().enumerate() {
+        if index != VICTIM_INDEX {
+            child
+                .start_kill()
+                .with_context(|| format!("tear down survivor peer {index}"))?;
+        }
     }
+    for (index, child) in children.iter_mut().enumerate() {
+        tokio::time::timeout(Duration::from_secs(5), child.wait())
+            .await
+            .with_context(|| format!("peer {index} did not finish teardown"))??;
+    }
+    let drain_departed_at = tokio::time::Instant::now();
+    let mut drain_counters = read_authority_counters(metrics_jsonl)?;
+    let mut stable_since = tokio::time::Instant::now();
+    let mut drain_last_change_in_ms = 0;
+    let mut drain_movement_observed = drain_counters != drain_baseline;
+    let mut drain_counter_series = vec![authority_counter_sample(
+        drain_departed_at.elapsed().as_millis() as u64,
+        drain_counters,
+        drain_baseline,
+    )];
+    // This is an observation guard, not the correctness bound. A change at the
+    // last legal instant still needs two quiet sweep periods before the harness
+    // can call it quiescent. The verdict below compares the change instant —
+    // not this later detection instant — with TTL + S.
+    let drain_observation_deadline =
+        drain_departed_at + DRAIN_SETTLE_BUDGET + DRAIN_QUIESCENCE_WINDOW;
+    let mut drain_quiesced = false;
+    loop {
+        tokio::time::sleep(SETTLE_POLL_INTERVAL).await;
+        let next = read_authority_counters(metrics_jsonl)?;
+        if next != drain_counters {
+            drain_counters = next;
+            stable_since = tokio::time::Instant::now();
+            drain_last_change_in_ms = drain_departed_at.elapsed().as_millis() as u64;
+            drain_movement_observed = true;
+            drain_counter_series.push(authority_counter_sample(
+                drain_last_change_in_ms,
+                drain_counters,
+                drain_baseline,
+            ));
+        }
+        // Quiescence is detected independently of the desired end state. That
+        // distinction is what made the #157 defect measurable: its counters
+        // became quiet while hundreds of rows were still held. Requiring one
+        // movement avoids mistaking the expected pre-expiry silence for the
+        // final steady state.
+        if drain_movement_observed && stable_since.elapsed() >= DRAIN_QUIESCENCE_WINDOW {
+            drain_quiesced = true;
+            break;
+        }
+        if tokio::time::Instant::now() >= drain_observation_deadline {
+            break;
+        }
+    }
+    let drain_parked = drain_counters.parked.saturating_sub(drain_baseline.parked);
+    let drain_reassigned = drain_counters
+        .reassigned
+        .saturating_sub(drain_baseline.reassigned);
+    let drain_quiescence_observed_in_ms = drain_departed_at.elapsed().as_millis() as u64;
+    let drain_quiesced_in_ms = if drain_quiesced {
+        drain_last_change_in_ms
+    } else {
+        drain_quiescence_observed_in_ms
+    };
+    let drain_within_bound =
+        drain_quiesced && drain_quiesced_in_ms <= DRAIN_SETTLE_BUDGET.as_millis() as u64;
+    drain_counter_series.push(authority_counter_sample(
+        drain_quiescence_observed_in_ms,
+        drain_counters,
+        drain_baseline,
+    ));
+    let drain_passed = drain_quiesced
+        && drain_within_bound
+        && drain_parked == drain_leases_held
+        && drain_counters.duplicate == 0;
+    let duplicate_authority = drain_counters.duplicate;
 
     // Every clause of the criterion, and no others: every entity disposed of —
     // reassigned *or* parked — inside the budget, nothing lost, and no tick on
@@ -818,8 +939,27 @@ async fn orchestrate(cli: Cli) -> Result<Outcome> {
         && reservations_attested
         && duplicate_authority == 0
         && attribution_sound
-        && unobserved.is_empty();
-    let report = serde_json::json!({
+        && unobserved.is_empty()
+        && drain_passed;
+    let drain_report = serde_json::json!({
+        // No observer joins during this window: the series is the registrar's
+        // non-invasive account of cleanup reaching a steady state with no
+        // eligible successor. Two quiet sweep periods establish quiescence.
+        "drain_leases_held_at_start": drain_leases_held,
+        "drain_parked_at_quiescence": drain_parked,
+        "drain_reassigned_during_close": drain_reassigned,
+        "drain_counter_series": drain_counter_series,
+        "drain_entities_parked": drain_parked,
+        "drain_expected_parked": drain_leases_held,
+        "drain_quiesced": drain_quiesced,
+        "drain_quiesced_in_ms": drain_quiesced_in_ms,
+        "drain_quiescence_observed_in_ms": drain_quiescence_observed_in_ms,
+        "drain_quiescence_window_ms": DRAIN_QUIESCENCE_WINDOW.as_millis() as u64,
+        "drain_within_bound": drain_within_bound,
+        "drain_settle_budget_ms": DRAIN_SETTLE_BUDGET.as_millis() as u64,
+        "drain_passed": drain_passed,
+    });
+    let mut report = serde_json::json!({
         "peers": cli.peers,
         "entities_total": total_entities,
         "victim_node": victim_node.to_string(),
@@ -885,6 +1025,9 @@ async fn orchestrate(cli: Cli) -> Result<Outcome> {
         "unobserved_entities": unobserved.len(),
         "passed": passed,
     });
+    if let (Some(report), Some(drain)) = (report.as_object_mut(), drain_report.as_object()) {
+        report.extend(drain.clone());
+    }
     Ok(Outcome { passed, report })
 }
 
@@ -1074,7 +1217,7 @@ fn read_events(path: &PathBuf) -> Result<Vec<PeerEvent>> {
 /// These are the harness's only non-invasive window into what the registrar
 /// decided: `parked` is the sole witness that an entity parked rather than
 /// being reassigned, and `duplicate_authority` is the single-writer invariant.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct AuthorityCounters {
     /// Ticks on which two peers both believed they held authority.
     duplicate: u64,
@@ -1095,6 +1238,22 @@ struct AuthorityCounters {
     /// observability clause below conditional on the regime the run was
     /// actually in rather than on hope.
     fanout_dropped: u64,
+}
+
+/// One change point in the drain quiescence series, relative to its baseline.
+fn authority_counter_sample(
+    elapsed_ms: u64,
+    counters: AuthorityCounters,
+    baseline: AuthorityCounters,
+) -> serde_json::Value {
+    serde_json::json!({
+        "elapsed_ms": elapsed_ms,
+        "reassigned": counters.reassigned.saturating_sub(baseline.reassigned),
+        "parked_without_successor": counters.parked.saturating_sub(baseline.parked),
+        "expire_fanout_sent": counters.fanout_sent.saturating_sub(baseline.fanout_sent),
+        "expire_fanout_dropped": counters.fanout_dropped.saturating_sub(baseline.fanout_dropped),
+        "duplicate_authority": counters.duplicate.saturating_sub(baseline.duplicate),
+    })
 }
 
 /// Read the highest total persistd has reported for each authority counter.

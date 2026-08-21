@@ -78,6 +78,14 @@ if [[ ${1:-} == --self-test ]]; then
   runs P3_ISLAND_BIN '--duration-secs' || die 'self-test: run duration absent'
   runs P3_ISLAND_BIN '--metrics-jsonl' || die 'self-test: duplicate-authority and disposition read absent'
   runs P3_ISLAND_BIN '--victim-claim-kind' || die 'self-test: victim claim tier not selectable'
+  # The post-kill drain is a separate proof leg. This check is against the
+  # harness invocation alone: finding the spelling elsewhere in this body
+  # would not prove the process that produces report.json ever ran the leg.
+  runs P3_ISLAND_BIN '--drain \' || die 'self-test: island drain leg absent'
+  # A zero process exit is necessary but the report is the durable evidence.
+  # Keep its drain validation load-bearing before PASSED is written.
+  has "python3 - \"\$out/report.json\" <<'PY'" \
+    || die 'self-test: drain report validation absent'
 
   # A proof harness is only a proof if its verdict is load-bearing: the gate
   # must die on a non-zero harness exit, and the success artifact must be
@@ -222,6 +230,7 @@ set +e
   --victim-claim-kind "$VICTIM_CLAIM_KIND" \
   --cell "$CELL" \
   --duration-secs "$DURATION_SECS" \
+  --drain \
   --metrics-jsonl "$out/metrics.jsonl" \
   --out "$out/peers" \
   > "$out/report.json" 2> "$out/island.log"
@@ -231,6 +240,51 @@ set -e
 cat "$out/report.json"
 if [[ $island_status -ne 0 ]]; then
   die "island criterion FAILED; report in $out/report.json, logs in $out"
+fi
+
+# The binary's verdict is authoritative; this second read protects the
+# artifact contract. A successful gate must leave all requested drain evidence
+# populated, internally reconciled, and visibly folded into the overall pass.
+if ! python3 - "$out/report.json" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as stream:
+    report = json.load(stream)
+
+required = {
+    "drain_leases_held_at_start",
+    "drain_parked_at_quiescence",
+    "drain_quiesced_in_ms",
+    "drain_quiescence_observed_in_ms",
+    "drain_settle_budget_ms",
+    "drain_counter_series",
+    "drain_quiesced",
+    "drain_within_bound",
+    "drain_passed",
+    "passed",
+}
+missing = sorted(required.difference(report))
+assert not missing, f"missing drain report keys: {missing}"
+assert report["drain_leases_held_at_start"] == report["drain_parked_at_quiescence"], report
+assert report["drain_quiesced"] is True, report
+assert report["drain_within_bound"] is True, report
+assert report["drain_passed"] is True, report
+assert report["passed"] is True, report
+series = report["drain_counter_series"]
+assert isinstance(series, list) and len(series) >= 2, series
+for sample in series:
+    assert {
+        "elapsed_ms",
+        "reassigned",
+        "parked_without_successor",
+        "expire_fanout_sent",
+        "expire_fanout_dropped",
+        "duplicate_authority",
+    }.issubset(sample), sample
+PY
+then
+  die "drain report validation FAILED; report in $out/report.json"
 fi
 
 touch "$out/PASSED"
