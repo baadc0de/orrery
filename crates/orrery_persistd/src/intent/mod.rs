@@ -361,6 +361,68 @@ pub enum RejectionCause {
     /// bug, which is why it is the one admission cause with its own wire code
     /// ([`orrery_protocol::REASON_SELF_WITNESS`]).
     SelfWitness,
+    /// The intent names a cell-epoch this gateway holds no announcement for.
+    ///
+    /// D27 clause (e) cases 2 and 3: an announcement for a different epoch
+    /// than the intent names, or a cell that has never had one. `E(I)` is
+    /// undefined, `required(I)` is undefined, and there is no honest set to
+    /// judge the attestations against.
+    ///
+    /// **The record's answer here is a provisional commit, not a refusal**
+    /// (D27 clause (e): "in all three cases the failure mode is *provisional
+    /// commit*, never *refusal* and never *silent full admission*"). D29's
+    /// provisional path is #150's and is not built, so this enforcement
+    /// refuses instead — which is the strictly safer of the two directions and
+    /// is why the enforcement switch exists. When #150 lands, this cause is
+    /// where the provisional branch attaches.
+    UnknownEpoch,
+    /// The intent names a cell-epoch whose usability window has closed.
+    ///
+    /// Kept distinct from [`Self::UnknownEpoch`] and from every signature
+    /// failure on purpose, and D28 clause (g) says why: past the grace, "the
+    /// answer is a distinct `EpochStale` rejection and not a signature
+    /// failure, because the two are operationally different". The first says
+    /// re-collect under the current epoch; the second says somebody forged
+    /// something. Conflating them puts honest netsplit survivors in the same
+    /// bucket as attackers.
+    EpochStale,
+    /// The announced set has too few non-party members to draw from.
+    ///
+    /// D27 clause (d): below `N_floor` (= `WITNESS_SET_FLOOR_N`, 5) **no draw
+    /// is made**, because a required subset drawn from four is not the
+    /// hypergeometric draw the collusion arithmetic is computed over. Like
+    /// [`Self::UnknownEpoch`] this is D29's provisional case, refused here
+    /// only because that path is not built.
+    LowPopulationEpoch,
+    /// An attestation names a witness the announcement did not select.
+    ///
+    /// The self-chosen-witness case D10 item 4 exists to stop. The signature
+    /// may be cryptographically perfect and it still counts for nothing: a
+    /// submitter that could nominate its own co-signers would be certifying
+    /// its own trade. Judged against the **announced** set of the epoch the
+    /// intent names, never against who is in the cell now (D28 clause (g)) —
+    /// a witness that left one second after signing is still a valid signer.
+    WitnessOutsideAnnouncedSet,
+    /// Fewer than `WITNESS_QUORUM_K` valid attestations are present at all.
+    ///
+    /// Implied by [`Self::RequiredWitnessMissing`] — a set of fewer than K
+    /// cannot contain the required K — and kept separate anyway, because the
+    /// two describe different operator situations. This one is "the submitter
+    /// did not collect enough co-signatures", which is the co-sign budget or
+    /// the cell's population; the other is "it collected enough, and they were
+    /// the wrong ones", which is either bad luck or attestation shopping.
+    ThresholdNotMet,
+    /// A witness the draw named did not attest.
+    ///
+    /// The conjunct that makes K-of-N mean something: `required(I) ⊆ the
+    /// witnesses that attested`. "Any first K of N" is precisely the
+    /// attestation shopping D10 abolishes, so a missing *required* co-signer
+    /// admits no substitute, however many other valid attestations arrived.
+    ///
+    /// **The cause does not say which witness is missing**, and neither does
+    /// the wire code: `required(I)` is drawn with a secret held until epoch
+    /// end, and naming the gap would leak the draw one intent at a time.
+    RequiredWitnessMissing,
 }
 
 impl RejectionCause {
@@ -380,6 +442,12 @@ impl RejectionCause {
             Self::DuplicateAttestation => "duplicate_attestation",
             Self::BadAttestation => "bad_attestation",
             Self::SelfWitness => "self_witness",
+            Self::UnknownEpoch => "unknown_epoch",
+            Self::EpochStale => "epoch_stale",
+            Self::LowPopulationEpoch => "low_population_epoch",
+            Self::WitnessOutsideAnnouncedSet => "witness_outside_announced_set",
+            Self::ThresholdNotMet => "threshold_not_met",
+            Self::RequiredWitnessMissing => "required_witness_missing",
         }
     }
 
@@ -398,6 +466,24 @@ impl RejectionCause {
     pub const fn wire_reason(self) -> u16 {
         match self {
             Self::SelfWitness => orrery_protocol::REASON_SELF_WITNESS,
+            // Every K-of-N refusal collapses to one code, and the collapse is
+            // the design rather than laziness. A client needs exactly one bit
+            // here — "your attestations were wrong" as against
+            // `REASON_VALIDATION_FAILED`'s "your ops were wrong" — because
+            // that is the bit that decides whether resubmitting the same
+            // intent with more co-signatures can work. Splitting further would
+            // tell a submitter *which* required witness it is missing, and
+            // `required(I)` is drawn with a secret this gateway holds until
+            // epoch end: a per-cause reply would leak the draw one intent at a
+            // time and hand `intent_id` grinding back to the attacker. The
+            // distinctions an operator needs are all present, in the logs,
+            // where an attacker cannot read them.
+            Self::UnknownEpoch
+            | Self::EpochStale
+            | Self::LowPopulationEpoch
+            | Self::WitnessOutsideAnnouncedSet
+            | Self::ThresholdNotMet
+            | Self::RequiredWitnessMissing => orrery_protocol::REASON_ATTESTATION_QUORUM,
             _ => orrery_protocol::REASON_VALIDATION_FAILED,
         }
     }
@@ -433,11 +519,21 @@ impl RejectionCause {
 ///    check that keeps the executor's blind `MutationType::Add` from being a
 ///    "credit anyone" primitive reachable by any peer that can complete a
 ///    transport handshake.
-/// 4. **Attestation authenticity.** Attestations are not *required* (P5 owes
-///    the K-of-N threshold), but a present one must be real: at most
-///    [`MAX_ATTESTATIONS`], no repeated witness, and every signature verifies
-///    against [`Intent::signing_preimage`]. A forged co-signature is refused
-///    here rather than being carried into the ledger's audit trail.
+/// 4. **Attestation authenticity.** A present attestation must be real: at
+///    most [`MAX_ATTESTATIONS`], no repeated witness, and every signature
+///    verifies against D27's domain-separated *witness* preimage
+///    ([`Intent::attestation_preimage`]) — never
+///    [`Intent::signing_preimage`], which is what the issuer signs and what
+///    this filter checked before the two roles were separated. A forged
+///    co-signature is refused here rather than being carried into the ledger's
+///    audit trail.
+/// 6. **The K-of-N quorum, when this validator enforces it**
+///    ([`AttestationEnforcement`]). The intent's `cell_epoch` handle resolves
+///    to a coordinator-announced witness set; every attestation must come from
+///    that set minus the parties; and the `K` members D27's per-intent draw
+///    names must all have signed. Off by default, because every production
+///    issuer in this tree submits zero attestations and a hard requirement
+///    flipped on unconditionally would refuse all of them at once.
 /// 5. **Party exclusion, as far as NodeIds reach.** No attestation may name
 ///    the issuer as its witness (D10 item 4; `docs/07-witnessing.md` §4.1's
 ///    per-intent party exclusion, enforced by the gateway per §4.2). This is
@@ -476,9 +572,23 @@ impl RejectionCause {
 ///   owner as seller and any price, including zero.
 /// - **Any op other than the two above.** They are `Ruleset`-opaque by
 ///   design; their `args` are checked for size and for nothing else.
-/// - **Witness attestation thresholds.** K-of-N and the seeded cell-epoch
-///   witness set are P5 (docs/11-roadmap.md §P2). `cell_epoch` is carried,
-///   not checked: nothing here knows which witness set it names.
+/// - **The K-of-N quorum, when [`AttestationEnforcement::Off`]** — which is
+///   the default. In that mode `cell_epoch` is still carried and not checked,
+///   and a present attestation proves only that some key signed the right
+///   bytes. Turning the switch on is what makes it mean anything, and what
+///   the switch does *not* decide is when a deployment flips it: the ramp is
+///   policy and is tracked separately from this mechanism.
+/// - **The low-population and provisional paths.** An intent whose cell-epoch
+///   this gateway cannot resolve, or whose eligible set is below
+///   `WITNESS_SET_FLOOR_N`, is **refused** here. D27 clause (e) says the
+///   answer should be a *provisional commit* instead — "in all three cases
+///   the failure mode is provisional commit, never refusal and never silent
+///   full admission" — and D29 owns that path, which is not built. Refusing
+///   is the strictly safer of the two directions and is the reason the
+///   enforcement switch defaults off; the causes those cases raise
+///   ([`RejectionCause::UnknownEpoch`], [`RejectionCause::EpochStale`],
+///   [`RejectionCause::LowPopulationEpoch`]) are where the provisional branch
+///   attaches when it lands.
 /// - **Account-level party exclusion.** D10 item 4 excludes parties "matched
 ///   on **accounts and every NodeId bound to them**", and check 5 above
 ///   matches only the NodeId. Two NodeIds bound to one account therefore still
@@ -502,8 +612,171 @@ impl RejectionCause {
 /// - **The issuer signature and the issuer/connection binding**, which the
 ///   gateway checks *before* this runs; the validator would be the wrong
 ///   place to repeat them.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct BaselineIntentValidator;
+#[derive(Debug, Default, Clone)]
+pub struct BaselineIntentValidator {
+    enforcement: AttestationEnforcement,
+    epochs: Option<Arc<crate::witness_epoch::WitnessEpochAuthority>>,
+}
+
+/// Whether this gateway requires D27's K-of-N quorum, or only checks that a
+/// present attestation is real.
+///
+/// # Why this is a switch and not a constant
+///
+/// [`BaselineIntentValidator`] is what a deployed `persistd` runs with no
+/// linked `Ruleset`, and it is also what every harness in this repository
+/// runs. Every production issuer in the tree submits **zero** attestations
+/// today, so a hard requirement flipped on unconditionally would refuse every
+/// intent in the workspace at once — including the control arm an
+/// attestation-overhead measurement needs, which is the zero-attestation path
+/// by definition.
+///
+/// So the switch ships and the ramp does not: this code takes no position on
+/// when a deployment flips it, on shadow-to-live ramping, or on verdict-rate
+/// auto-suspend. That policy is tracked separately from the mechanism.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum AttestationEnforcement {
+    /// Attestations are verified but not required, and no witness set is
+    /// consulted: the pre-D27 behaviour, and the default.
+    ///
+    /// Note what stays enforced even here — the D27 preimage, the
+    /// [`MAX_ATTESTATIONS`] cap, the no-repeat rule and the self-witness
+    /// refusal. "Off" means *the quorum* is off, not that an attestation may
+    /// be a forgery.
+    #[default]
+    Off,
+    /// D27's full admission predicate: every attestation from the announced
+    /// eligible set, and the drawn required subset present in full.
+    Required,
+}
+
+impl BaselineIntentValidator {
+    /// A validator that verifies attestations but requires no quorum.
+    ///
+    /// The library and harness default, and the mode every pre-existing intent
+    /// test runs under.
+    #[must_use]
+    pub fn permissive() -> Self {
+        Self::default()
+    }
+
+    /// A validator that enforces D27's K-of-N predicate against the epochs
+    /// `epochs` holds.
+    #[must_use]
+    pub fn enforcing(epochs: Arc<crate::witness_epoch::WitnessEpochAuthority>) -> Self {
+        Self {
+            enforcement: AttestationEnforcement::Required,
+            epochs: Some(epochs),
+        }
+    }
+
+    /// This validator's enforcement mode.
+    #[must_use]
+    pub fn enforcement(&self) -> AttestationEnforcement {
+        self.enforcement
+    }
+}
+
+/// D27 clause (d)'s admission predicate, evaluated against one accepted epoch.
+///
+/// Returns the eligible vector `E(I)` the draw ran over. D27 clause (f)
+/// requires the gateway to **record the eligible vector it derived over** with
+/// the committed intent, because `E(I)` depends on party exclusion and party
+/// exclusion matches on account-to-NodeId bindings that change over time. An
+/// audit that recomputed `E(I)` a week later from current bindings could
+/// derive a different `required(I)` and convict an honest gateway; the
+/// recorded vector is what the audit reads instead.
+///
+/// # What this cannot bind, and it is D27's own open question 2
+///
+/// **The intent's cell.** `CellEpoch` is a bare `u64` handle
+/// (`persist.rs`: "wire-identical to `Epoch`"), and an [`Intent`] names no
+/// cell, no grid and no entity this code can map to one. So the epoch is
+/// resolved by handle out of a cache that holds every cell a peer has
+/// couriered an announcement for, and a submitter therefore chooses *which
+/// announced set* judges its intent among those.
+///
+/// That matters: D27's collusion arithmetic (`C(c,K)/C(N,K)`) is computed over
+/// **the cell's** announced set, and a submitter free to name another cell's
+/// epoch can shop for whichever announced set holds the most of its colluders
+/// — it still needs their co-signatures, so this is not a free forgery, but it
+/// converts "3 of my colluders landed in this cell's draw" into "3 landed in
+/// any cell's draw I can reach".
+///
+/// It is **not fixable here**, and D27 says so in as many words (open question
+/// 2): "a gateway serving more than one cell cannot resolve *which*
+/// announcement an intent names from the intent alone — it must infer `c` from
+/// the intent's subject entities, which is `Ruleset`-dependent … whether
+/// `CellEpoch` widens, or the announcement carries the binding, is
+/// unresolved." Closing it needs a wire change or a linked `Ruleset`, and both
+/// are somebody else's record to make. Until then the residual is bounded by
+/// what is *in* the cache: only announcements presented by a peer that held
+/// interest in the announced cell (D28 clause (d) step 6), and only for
+/// `epoch_ms + accept_grace_ms`.
+///
+/// # Errors
+///
+/// The first [`RejectionCause`] the intent's attestation set trips.
+fn check_attestation_quorum(
+    intent: &Intent,
+    epochs: &crate::witness_epoch::WitnessEpochAuthority,
+    now_ms: u64,
+) -> Result<Vec<NodeId>, RejectionCause> {
+    // The epoch the intent *names*, resolved by handle. Never "the current
+    // epoch": D28 clause (g) judges an intent against the announced set of the
+    // epoch it names, which is what lets a co-signature collected a moment
+    // before a turnover commit a moment after it.
+    let Some(epoch) = epochs.resolve(intent.cell_epoch.0) else {
+        return Err(RejectionCause::UnknownEpoch);
+    };
+    if !epoch.snapshot.usable_at(now_ms) {
+        return Err(RejectionCause::EpochStale);
+    }
+
+    // `E(I)` — the announced set in announced order, minus the parties this
+    // gateway can see. Announced order is preserved because the recorded
+    // vector has to be the object an auditor draws over, not a normalization
+    // of it.
+    let eligible = orrery_protocol::eligible_witnesses(&epoch.snapshot.selected, intent.issuer);
+    if eligible.len() < orrery_protocol::WITNESS_SET_FLOOR_N {
+        return Err(RejectionCause::LowPopulationEpoch);
+    }
+
+    // Set membership, before the draw. An attestation from outside `E(I)`
+    // counts for nothing however well it verifies, and refusing the whole
+    // intent rather than silently dropping the stray signature is deliberate:
+    // a submitter that attached one is either broken or shopping, and both
+    // want an answer rather than a mysteriously short quorum.
+    for attestation in &intent.attestations {
+        if !eligible.contains(&attestation.witness) {
+            return Err(RejectionCause::WitnessOutsideAnnouncedSet);
+        }
+    }
+
+    // The count first, because it is the cheaper fact and the more common
+    // operator situation — "the co-sign budget expired" rather than "the draw
+    // did not land where the submitter hoped".
+    if intent.attestations.len() < orrery_protocol::WITNESS_QUORUM_K {
+        return Err(RejectionCause::ThresholdNotMet);
+    }
+
+    // The draw. This is the conjunct that makes the scheme more than a
+    // counting exercise: the submitter broadcast to the full announced set
+    // minus parties and submitted whatever came back inside the co-sign
+    // budget, and it never learns which K of those this gateway will require —
+    // because the draw key is this cluster's and stays secret until epoch end.
+    for required in epoch.required_witnesses(intent.intent_id, &eligible) {
+        if !intent
+            .attestations
+            .iter()
+            .any(|attestation| attestation.witness == required)
+        {
+            return Err(RejectionCause::RequiredWitnessMissing);
+        }
+    }
+
+    Ok(eligible)
+}
 
 /// Append `key` to an [`IntentPrecheck`]'s read set unless it is already
 /// there.
@@ -517,24 +790,48 @@ fn push_read_key(read_keys: &mut Vec<Vec<u8>>, key: Vec<u8>) {
     }
 }
 
-/// Verify the bounded co-signature set carried by an intent.
+/// Verify the bounded co-signature set carried by an intent, against
+/// [D27](../../../../docs/adr/0027-attestation-envelope.md) clause (a)'s
+/// witness preimage.
+///
+/// # What changed here, and why it is the whole point of the record
+///
+/// This used to verify each attestation against `Intent::signing_preimage()` —
+/// **the identical bytes the issuer signs**. That is a role confusion, not a
+/// subtlety: an issuer's own signature was a byte-valid `Attestation` naming
+/// anybody, and a signature solicited for one role verified in the other.
+/// `Attestation::verify` checks the domain-separated 157-byte attestation
+/// preimage instead, which binds the co-signature to one intent hash, one
+/// issuer signature, one cell-epoch and one witness identity.
+///
+/// # A signature over the legacy preimage is not an attestation
+///
+/// It does not verify here, and D27 clause (c) is explicit about what that
+/// means: such a signature is **counted toward no required slot**, and on its
+/// own it is not grounds to reject the intent either — an intent whose
+/// attestations all fail this way is an intent with zero valid attestations,
+/// which is D29's low-population case and not a forgery. That is what
+/// preserves the `{V, V−1}` rolling-upgrade window across the switch without
+/// a flag day, and without ever counting an undomained signature.
+///
+/// This function is the strict half of that: a *present* attestation that does
+/// not verify is refused as [`RejectionCause::BadAttestation`], because a peer
+/// that went to the trouble of attaching one is claiming it is real. The
+/// permissive half — "an unverifiable attestation contributes nothing but
+/// convicts nobody" — is what the quorum check below is written against: it
+/// counts only witnesses that reached this point.
 fn check_attestations(intent: &Intent) -> Result<(), RejectionCause> {
     if intent.attestations.is_empty() {
         return Ok(());
     }
 
-    let preimage = intent.signing_preimage();
     let mut seen: Vec<NodeId> = Vec::with_capacity(intent.attestations.len());
     for attestation in &intent.attestations {
         if seen.contains(&attestation.witness) {
             return Err(RejectionCause::DuplicateAttestation);
         }
         seen.push(attestation.witness);
-        if attestation
-            .witness
-            .verify(&preimage, &attestation.signature)
-            .is_err()
-        {
+        if !attestation.verify(intent) {
             return Err(RejectionCause::BadAttestation);
         }
     }
@@ -695,9 +992,50 @@ impl BaselineIntentValidator {
     }
 }
 
+impl BaselineIntentValidator {
+    /// The full admission decision at `now_ms`: the envelope checks of
+    /// [`Self::check`], then — when this validator enforces — D27's K-of-N
+    /// predicate against the epoch the intent names.
+    ///
+    /// The clock is a parameter rather than read here so a test can place an
+    /// intent inside or outside an epoch's usability window without sleeping
+    /// through it; [`IntentValidator::validate`] passes the registrar clock,
+    /// which is the same monotonic source the epoch cache stamps acceptance
+    /// with.
+    ///
+    /// # Errors
+    ///
+    /// The first [`RejectionCause`] the intent trips.
+    pub fn check_at(
+        &self,
+        intent: &Intent,
+        cx: &IntentContext,
+        now_ms: u64,
+    ) -> Result<IntentPrecheck, RejectionCause> {
+        let precheck = Self::check(intent, cx)?;
+        if self.enforcement == AttestationEnforcement::Off {
+            return Ok(precheck);
+        }
+        // Enforcing with no cache configured is a misconfiguration, and it
+        // fails closed: a gateway that cannot resolve any epoch holds no
+        // announcement for any intent's cell-epoch, which is exactly
+        // `UnknownEpoch` and not a special case.
+        let Some(epochs) = self.epochs.as_ref() else {
+            return Err(RejectionCause::UnknownEpoch);
+        };
+        // The quorum runs *after* every shape check and after the envelope's
+        // signature work, preserving the "signature work last" property this
+        // filter already documents: an oversized or malformed submission never
+        // pays for a witness-set resolution, and a self-witnessed one never
+        // reaches the draw.
+        check_attestation_quorum(intent, epochs.as_ref(), now_ms)?;
+        Ok(precheck)
+    }
+}
+
 impl IntentValidator for BaselineIntentValidator {
     fn validate(&self, intent: &Intent, cx: &IntentContext) -> IntentVerdict {
-        match Self::check(intent, cx) {
+        match self.check_at(intent, cx, crate::lease::registrar_now_ms()) {
             Ok(precheck) => IntentVerdict::Admit(precheck),
             Err(cause) => {
                 // Debug, not warn: a rejection is an ordinary answer to a bad
@@ -1307,6 +1645,410 @@ mod tests {
         intent
     }
 
+    // -- D27 K-of-N enforcement -------------------------------------------
+    //
+    // Every test below runs `check_at` with an explicit clock so the epoch's
+    // usability window is a parameter rather than a race.
+
+    use crate::witness_epoch::test_support as epoch_fixture;
+
+    /// The handle every fixture epoch is announced under.
+    const EPOCH_HANDLE: u64 = 0x0001_0000_0000_0001;
+
+    /// An intent naming [`EPOCH_HANDLE`], signed, with one opaque op.
+    fn attestable_intent(id: u128) -> Intent {
+        let key = issuer_key();
+        let mut intent = Intent {
+            intent_id: id,
+            issuer: key.public(),
+            cell_epoch: CellEpoch::new(EPOCH_HANDLE),
+            ops: vec![IntentOp {
+                op: OPAQUE_OP_BASE,
+                args: bytes::Bytes::new(),
+            }],
+            attestations: Vec::new(),
+            signature: key.sign(b"placeholder"),
+        };
+        intent.sign(&key);
+        intent
+    }
+
+    /// The witness secret keys the fixture announcement selects, in announced
+    /// order — the same identities `epoch_fixture::witnesses` produces, but
+    /// with the private halves the tests need in order to co-sign.
+    fn witness_keys(count: u8) -> Vec<iroh_base::SecretKey> {
+        (0..count).map(epoch_fixture::witness_secret).collect()
+    }
+
+    /// A validator enforcing over one epoch announcing `witnesses`, accepted
+    /// at t=1000.
+    fn enforcing_over(
+        witnesses: &[iroh_base::SecretKey],
+    ) -> (
+        BaselineIntentValidator,
+        Arc<crate::witness_epoch::WitnessEpochAuthority>,
+    ) {
+        let announced: Vec<NodeId> = witnesses.iter().map(iroh_base::SecretKey::public).collect();
+        let epochs = epoch_fixture::cache_with(EPOCH_HANDLE, &announced, 1_000);
+        (
+            BaselineIntentValidator::enforcing(Arc::clone(&epochs)),
+            epochs,
+        )
+    }
+
+    /// Attach co-signatures from every witness the draw requires.
+    fn attest_required(
+        intent: &mut Intent,
+        witnesses: &[iroh_base::SecretKey],
+        epochs: &crate::witness_epoch::WitnessEpochAuthority,
+    ) -> Vec<NodeId> {
+        let epoch = epochs
+            .resolve(EPOCH_HANDLE)
+            .expect("fixture epoch is cached");
+        let eligible = orrery_protocol::eligible_witnesses(&epoch.snapshot.selected, intent.issuer);
+        let required = epoch.required_witnesses(intent.intent_id, &eligible);
+        for node in &required {
+            let key = witnesses
+                .iter()
+                .find(|key| key.public() == *node)
+                .expect("the draw only names announced witnesses");
+            let attestation = intent.attest(key);
+            intent.attestations.push(attestation);
+        }
+        required
+    }
+
+    /// The whole predicate, in one test: K required co-signatures admit, and
+    /// dropping any single one of them refuses.
+    ///
+    /// The "any single one" half is what makes this more than a count. A test
+    /// that dropped only the last attestation would pass against an
+    /// implementation that checked `len() >= K`, which is exactly the
+    /// attestation shopping D10 abolishes.
+    #[test]
+    fn k_required_co_signatures_admit_and_losing_any_one_of_them_refuses() {
+        let witnesses = witness_keys(7);
+        let (validator, epochs) = enforcing_over(&witnesses);
+
+        let mut intent = attestable_intent(1);
+        let required = attest_required(&mut intent, &witnesses, &epochs);
+        assert_eq!(required.len(), orrery_protocol::WITNESS_QUORUM_K);
+        assert!(
+            validator.check_at(&intent, &cx(Some(7)), 2_000).is_ok(),
+            "K valid attestations from the required subset commit"
+        );
+
+        for dropped in 0..required.len() {
+            let mut short = attestable_intent(1);
+            short.attestations = intent
+                .attestations
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| *index != dropped)
+                .map(|(_, attestation)| attestation.clone())
+                .collect();
+            assert_eq!(
+                validator.check_at(&short, &cx(Some(7)), 2_000),
+                Err(RejectionCause::ThresholdNotMet),
+                "one short by required witness {dropped} must be refused"
+            );
+        }
+    }
+
+    /// K valid attestations that are not the drawn subset admit nothing.
+    ///
+    /// This is the arm that separates "K of N" from "any first K of N". The
+    /// substitutes are real, announced, non-party witnesses whose signatures
+    /// verify — and the intent is still refused, because a missing *required*
+    /// co-signer admits no substitute.
+    #[test]
+    fn k_valid_attestations_that_are_not_the_required_subset_are_refused() {
+        let witnesses = witness_keys(7);
+        let (validator, epochs) = enforcing_over(&witnesses);
+        let epoch = epochs.resolve(EPOCH_HANDLE).expect("cached");
+
+        let mut intent = attestable_intent(2);
+        let eligible = orrery_protocol::eligible_witnesses(&epoch.snapshot.selected, intent.issuer);
+        let required = epoch.required_witnesses(intent.intent_id, &eligible);
+
+        let substitutes: Vec<&iroh_base::SecretKey> = witnesses
+            .iter()
+            .filter(|key| !required.contains(&key.public()))
+            .take(orrery_protocol::WITNESS_QUORUM_K)
+            .collect();
+        assert_eq!(
+            substitutes.len(),
+            orrery_protocol::WITNESS_QUORUM_K,
+            "an announced set of 7 leaves 4 non-required members to shop among"
+        );
+        for key in substitutes {
+            let attestation = intent.attest(key);
+            intent.attestations.push(attestation);
+        }
+
+        assert_eq!(
+            intent.attestations.len(),
+            orrery_protocol::WITNESS_QUORUM_K,
+            "the count is met, so only the draw can refuse this"
+        );
+        for attestation in &intent.attestations {
+            assert!(
+                attestation.verify(&intent),
+                "every substitute signature is genuine"
+            );
+        }
+        assert_eq!(
+            validator.check_at(&intent, &cx(Some(7)), 2_000),
+            Err(RejectionCause::RequiredWitnessMissing)
+        );
+    }
+
+    /// A witness outside the announced set counts for nothing, however good
+    /// its signature — the self-chosen-witness case D10 item 4 exists to stop.
+    #[test]
+    fn an_attestation_from_outside_the_announced_set_does_not_count() {
+        let witnesses = witness_keys(7);
+        let (validator, epochs) = enforcing_over(&witnesses);
+
+        let mut intent = attestable_intent(3);
+        attest_required(&mut intent, &witnesses, &epochs);
+        assert!(validator.check_at(&intent, &cx(Some(7)), 2_000).is_ok());
+
+        // Same intent, one extra co-signature from a real key that the
+        // coordinator never announced.
+        let outsider = epoch_fixture::secret(77);
+        assert!(
+            !epochs
+                .resolve(EPOCH_HANDLE)
+                .expect("cached")
+                .snapshot
+                .admits(&outsider.public()),
+            "the outsider must genuinely be outside, or this proves nothing"
+        );
+        let attestation = intent.attest(&outsider);
+        assert!(attestation.verify(&intent), "and its signature is real");
+        intent.attestations.push(attestation);
+
+        assert_eq!(
+            validator.check_at(&intent, &cx(Some(7)), 2_000),
+            Err(RejectionCause::WitnessOutsideAnnouncedSet),
+            "a submitter that nominates its own co-signers is certifying its \
+             own trade"
+        );
+    }
+
+    /// A co-signature over the legacy issuer preimage is not an attestation,
+    /// even under enforcement — D27 clause (c)'s stated degradation.
+    #[test]
+    fn legacy_preimage_signatures_never_reach_the_quorum() {
+        let witnesses = witness_keys(7);
+        let (validator, epochs) = enforcing_over(&witnesses);
+        let epoch = epochs.resolve(EPOCH_HANDLE).expect("cached");
+
+        let mut intent = attestable_intent(4);
+        let eligible = orrery_protocol::eligible_witnesses(&epoch.snapshot.selected, intent.issuer);
+        let required = epoch.required_witnesses(intent.intent_id, &eligible);
+        let preimage = intent.signing_preimage();
+        for node in &required {
+            let key = witnesses
+                .iter()
+                .find(|key| key.public() == *node)
+                .expect("announced");
+            intent.attestations.push(Attestation {
+                witness: *node,
+                signature: key.sign(&preimage),
+            });
+        }
+
+        // Exactly the required subset, exactly K of them, every signature made
+        // by the right witness — and all of it over the wrong bytes.
+        assert_eq!(intent.attestations.len(), orrery_protocol::WITNESS_QUORUM_K);
+        assert_eq!(
+            validator.check_at(&intent, &cx(Some(7)), 2_000),
+            Err(RejectionCause::BadAttestation),
+            "the switch to D27's preimage is what this asserts: a peer running \
+             the pre-D27 semantics contributes zero valid attestations"
+        );
+    }
+
+    /// An intent naming an epoch this gateway cannot resolve is refused, and
+    /// a stale one is refused with a *different* cause.
+    #[test]
+    fn an_unresolvable_epoch_and_a_stale_one_are_named_separately() {
+        let witnesses = witness_keys(7);
+        let (validator, epochs) = enforcing_over(&witnesses);
+
+        let mut unknown = attestable_intent(5);
+        unknown.cell_epoch = CellEpoch::new(0x0002_0000_0000_0009);
+        unknown.sign(&issuer_key());
+        assert_eq!(
+            validator.check_at(&unknown, &cx(Some(7)), 2_000),
+            Err(RejectionCause::UnknownEpoch),
+            "no announcement means no eligible vector and no required subset"
+        );
+
+        let mut attested = attestable_intent(6);
+        attest_required(&mut attested, &witnesses, &epochs);
+        assert!(validator.check_at(&attested, &cx(Some(7)), 60_999).is_ok());
+        assert_eq!(
+            validator.check_at(&attested, &cx(Some(7)), 61_000),
+            Err(RejectionCause::EpochStale),
+            "past the grace an operator must be able to tell a reconnect from \
+             an attack, so this is not a signature failure"
+        );
+
+        // The two share one wire code — a client needs "your attestations were
+        // wrong", not a taxonomy — and are distinct in the logs, which is
+        // where the operator reads them and an attacker does not.
+        assert_eq!(
+            RejectionCause::UnknownEpoch.wire_reason(),
+            orrery_protocol::REASON_ATTESTATION_QUORUM
+        );
+        assert_eq!(
+            RejectionCause::EpochStale.wire_reason(),
+            orrery_protocol::REASON_ATTESTATION_QUORUM
+        );
+        assert_ne!(
+            RejectionCause::UnknownEpoch.as_str(),
+            RejectionCause::EpochStale.as_str()
+        );
+    }
+
+    /// An intent is judged against the announced set of the epoch it *names*,
+    /// not against the newest one on file.
+    #[test]
+    fn epoch_turnover_judges_an_intent_against_the_epoch_it_names() {
+        let first_set = witness_keys(7);
+        let (validator, epochs) = enforcing_over(&first_set);
+
+        // A second epoch for the same cell, over a disjoint set of witnesses,
+        // chained onto the first's commitment.
+        let second_set: Vec<iroh_base::SecretKey> =
+            (20..27).map(epoch_fixture::witness_secret).collect();
+        let second_handle = 0x0001_0000_0000_0002;
+        let announced: Vec<NodeId> = second_set
+            .iter()
+            .map(iroh_base::SecretKey::public)
+            .collect();
+        let encoded = epoch_fixture::announcement(
+            orrery_protocol::GridId::ROOT,
+            orrery_protocol::CellId::ROOT,
+            2,
+            second_handle,
+            &announced,
+            &[8u8; 32],
+            Some([7u8; 32]),
+        );
+        epochs
+            .apply_announcement(
+                &encoded,
+                epoch_fixture::secret(1).public(),
+                &epoch_fixture::CoverAllInterest,
+                1_500,
+            )
+            .expect("the chained announcement is accepted");
+
+        // An intent attested under epoch 1, submitted after epoch 2 arrived.
+        // Nothing about epoch 2's arrival invalidates it: this is what lets a
+        // co-signature collected a moment before a boundary commit a moment
+        // after it, at Donnybrook-rate churn.
+        let mut in_flight = attestable_intent(7);
+        attest_required(&mut in_flight, &first_set, &epochs);
+        assert!(
+            validator.check_at(&in_flight, &cx(Some(7)), 2_000).is_ok(),
+            "an in-flight attestation survives the boundary"
+        );
+
+        // And the same co-signatures, re-pointed at epoch 2, are worthless:
+        // its announced set shares no member with epoch 1's.
+        let mut misdirected = attestable_intent(8);
+        misdirected.cell_epoch = CellEpoch::new(second_handle);
+        misdirected.sign(&issuer_key());
+        for key in first_set.iter().take(orrery_protocol::WITNESS_QUORUM_K) {
+            let attestation = misdirected.attest(key);
+            misdirected.attestations.push(attestation);
+        }
+        assert_eq!(
+            validator.check_at(&misdirected, &cx(Some(7)), 2_000),
+            Err(RejectionCause::WitnessOutsideAnnouncedSet)
+        );
+    }
+
+    /// An announced set too small to draw from is refused rather than drawn
+    /// over — and it is a *different* refusal from a forgery.
+    #[test]
+    fn an_epoch_below_the_population_floor_makes_no_draw() {
+        // Five announced, one of whom is the issuer: four eligible, one below
+        // `WITNESS_SET_FLOOR_N`. A draw from four is not the hypergeometric
+        // draw the collusion arithmetic is computed over.
+        let witnesses = witness_keys(4);
+        let mut announced: Vec<NodeId> =
+            witnesses.iter().map(iroh_base::SecretKey::public).collect();
+        announced.push(issuer_key().public());
+        let epochs = epoch_fixture::cache_with(EPOCH_HANDLE, &announced, 1_000);
+        let validator = BaselineIntentValidator::enforcing(Arc::clone(&epochs));
+
+        let mut intent = attestable_intent(9);
+        for key in &witnesses {
+            let attestation = intent.attest(key);
+            intent.attestations.push(attestation);
+        }
+        assert_eq!(
+            validator.check_at(&intent, &cx(Some(7)), 2_000),
+            Err(RejectionCause::LowPopulationEpoch),
+            "D29's provisional path owns this case; refusing is the safe \
+             direction until it is built"
+        );
+    }
+
+    /// The switch's off position leaves the pre-existing path untouched: an
+    /// intent with zero attestations, naming an epoch nothing announced, still
+    /// commits.
+    #[test]
+    fn enforcement_off_admits_the_zero_attestation_path_every_issuer_sends() {
+        let validator = BaselineIntentValidator::permissive();
+        assert_eq!(validator.enforcement(), AttestationEnforcement::Off);
+
+        let intent = attestable_intent(10);
+        assert!(intent.attestations.is_empty());
+        assert!(
+            validator.check_at(&intent, &cx(Some(7)), 2_000).is_ok(),
+            "every production issuer in this tree sends exactly this, and the \
+             measurement task's control arm is this path by definition"
+        );
+
+        // And an enforcing validator with no cache fails closed rather than
+        // open, which is the direction a misconfiguration must take.
+        let blind = BaselineIntentValidator {
+            enforcement: AttestationEnforcement::Required,
+            epochs: None,
+        };
+        assert_eq!(
+            blind.check_at(&intent, &cx(Some(7)), 2_000),
+            Err(RejectionCause::UnknownEpoch)
+        );
+    }
+
+    /// The self-witness refusal outranks the quorum, and the quorum never
+    /// rescues a party attestation.
+    #[test]
+    fn a_party_attestation_is_refused_even_when_the_draw_would_have_named_it() {
+        let witnesses = witness_keys(7);
+        let (validator, epochs) = enforcing_over(&witnesses);
+
+        let mut intent = attestable_intent(11);
+        attest_required(&mut intent, &witnesses, &epochs);
+        let self_attestation = intent.attest(&issuer_key());
+        intent.attestations.push(self_attestation);
+
+        assert_eq!(
+            validator.check_at(&intent, &cx(Some(7)), 2_000),
+            Err(RejectionCause::SelfWitness),
+            "party exclusion is checked above the draw and carries its own \
+             wire code, because it is never a bad client"
+        );
+    }
+
     /// The asset every trade test below prices in.
     const GOLD: u64 = 3;
 
@@ -1366,14 +2108,14 @@ mod tests {
             args: bytes::Bytes::from_static(b"trade"),
         }]);
         assert_eq!(
-            BaselineIntentValidator.validate(&intent, &cx(Some(7))),
+            BaselineIntentValidator::permissive().validate(&intent, &cx(Some(7))),
             IntentVerdict::Admit(IntentPrecheck { read_keys: vec![] }),
             "an opaque op is admitted: only the envelope is this filter's business"
         );
         // And it does not secretly depend on a session: an opaque op names no
         // account, so there is nothing to bind it to.
         assert!(matches!(
-            BaselineIntentValidator.validate(&intent, &cx(None)),
+            BaselineIntentValidator::permissive().validate(&intent, &cx(None)),
             IntentVerdict::Admit(_)
         ));
     }
@@ -1474,13 +2216,48 @@ mod tests {
         }]);
 
         let mut genuine = base.clone();
-        genuine.attestations.push(Attestation {
+        genuine.attestations.push(base.attest(&witness));
+        assert!(
+            BaselineIntentValidator::check(&genuine, &cx(Some(7))).is_ok(),
+            "a real co-signature is admitted"
+        );
+
+        // D27 clause (c)'s stated degradation, and the proof that the preimage
+        // switch actually happened: a signature over the *issuer's* preimage —
+        // the identical bytes this validator used to check against, and the
+        // bytes a peer running the pre-D27 semantics still emits — is not an
+        // attestation. It is refused here rather than counted, because a peer
+        // that attached one is asserting it is real.
+        let mut legacy = base.clone();
+        legacy.attestations.push(Attestation {
             witness: witness.public(),
             signature: witness.sign(&base.signing_preimage()),
         });
         assert!(
-            BaselineIntentValidator::check(&genuine, &cx(Some(7))).is_ok(),
-            "a real co-signature is admitted"
+            witness
+                .public()
+                .verify(&base.signing_preimage(), &legacy.attestations[0].signature)
+                .is_ok(),
+            "the legacy signature is cryptographically perfect over the old bytes"
+        );
+        assert_eq!(
+            BaselineIntentValidator::check(&legacy, &cx(Some(7))),
+            Err(RejectionCause::BadAttestation),
+            "a signature valid over the issuer preimage is not an attestation"
+        );
+
+        // The role confusion the switch closes, from the other direction: the
+        // issuer's own signature used to be a byte-valid attestation naming
+        // anybody. It is now not even a signature over the right message.
+        let mut lifted = base.clone();
+        lifted.attestations.push(Attestation {
+            witness: witness.public(),
+            signature: base.signature,
+        });
+        assert_eq!(
+            BaselineIntentValidator::check(&lifted, &cx(Some(7))),
+            Err(RejectionCause::BadAttestation),
+            "an issuer signature replayed as a co-signature no longer verifies"
         );
 
         let mut forged = base.clone();
@@ -1595,7 +2372,7 @@ mod tests {
         // generic validation code: #145's precedent, and the whole cost of
         // `DenyReason::WrongOwner` on the authority path.
         assert_eq!(
-            BaselineIntentValidator.validate(&replayed, &cx(Some(7))),
+            BaselineIntentValidator::permissive().validate(&replayed, &cx(Some(7))),
             IntentVerdict::Reject {
                 reason: orrery_protocol::REASON_SELF_WITNESS
             }
@@ -1629,10 +2406,7 @@ mod tests {
                 base.issuer,
                 "a control arm whose witness is the issuer proves nothing"
             );
-            attested.attestations.push(Attestation {
-                witness: witness.public(),
-                signature: witness.sign(&base.signing_preimage()),
-            });
+            attested.attestations.push(base.attest(&witness));
         }
         assert_eq!(
             BaselineIntentValidator::check(&attested, &cx(Some(7))),

@@ -2390,6 +2390,18 @@ pub struct GatewayConfig {
     /// plausibility checks. The default denies every peer until coordinator
     /// transport injects a snapshot authority.
     pub interest_authority: SharedInterestAuthority,
+    /// The verified cache of coordinator witness-set announcements
+    /// (D28 clause (f)), and the holder of each live cell-epoch's `draw_key`
+    /// (D27 clause (d)).
+    ///
+    /// **The default is `None`, and that is the enforcement switch's off
+    /// position at the transport layer.** A gateway with no cache accepts no
+    /// [`GatewayMsg::WitnessEpoch`] and resolves no intent's `cell_epoch`, so
+    /// an intent validator configured to require K-of-N would refuse
+    /// everything — which is why the validator carries its own mode and the
+    /// two are configured together. Supplying a cache alone changes nothing
+    /// about admission: it makes announcements cacheable and nothing else.
+    pub witness_epochs: Option<Arc<crate::witness_epoch::WitnessEpochAuthority>>,
     /// Session-token verifier. Defaults to explicit denial.
     pub authorizer: SharedGatewayAuthorizer,
     /// Unix clock used by the session-token verifier.
@@ -2459,6 +2471,7 @@ impl Default for GatewayConfig {
             validator: Arc::new(PermissiveValidator),
             bulk_ack_admission: Arc::new(FreshBulkAckAdmission),
             interest_authority: Arc::new(DenyAllInterestAuthority),
+            witness_epochs: None,
             authorizer: Arc::new(DenyAllGatewayAuthorizer),
             identity_clock: Arc::new(SystemGatewayClock),
             identity_health: Arc::new(AvailableIdentityHealth),
@@ -4081,6 +4094,7 @@ pub struct GatewayServer {
     /// The drain's deadline, from [`GatewayConfig::handoff_deadline_ms`].
     handoff_deadline_ms: u32,
     interest_authority: SharedInterestAuthority,
+    witness_epochs: Option<Arc<crate::witness_epoch::WitnessEpochAuthority>>,
     authority_metrics: Arc<AuthorityMetrics>,
     metrics: Arc<GatewayMetrics>,
     send_failures: Arc<AtomicU64>,
@@ -4113,6 +4127,7 @@ impl GatewayServer {
         let validator = config.validator;
         let bulk_ack_admission = config.bulk_ack_admission;
         let interest_authority = config.interest_authority;
+        let witness_epochs = config.witness_epochs;
         let admission = GatewayAdmission {
             authorizer: config.authorizer,
             clock: config.identity_clock,
@@ -4156,6 +4171,7 @@ impl GatewayServer {
             validator,
             bulk_ack_admission,
             Arc::clone(&interest_authority),
+            witness_epochs.clone(),
             admission,
             report_limiter,
             Arc::clone(&metrics),
@@ -4171,6 +4187,7 @@ impl GatewayServer {
             redistributor: retained_redistributor,
             handoff_deadline_ms,
             interest_authority,
+            witness_epochs,
             authority_metrics,
             metrics,
             send_failures,
@@ -4199,6 +4216,17 @@ impl GatewayServer {
     #[must_use]
     pub fn interest_authority(&self) -> &dyn InterestAuthority {
         self.interest_authority.as_ref()
+    }
+
+    /// The witness-epoch cache supplied at gateway startup, if any.
+    ///
+    /// Unlike [`Self::interest_authority`] this one *is* updated by client
+    /// messages — a peer couriers announcements into it — which is exactly
+    /// why it is exposed: a test (and an operator's debug endpoint) needs to
+    /// see what a gateway actually accepted, not what it was configured with.
+    #[must_use]
+    pub fn witness_epochs(&self) -> Option<&Arc<crate::witness_epoch::WitnessEpochAuthority>> {
+        self.witness_epochs.as_ref()
     }
 
     /// The always-on authority telemetry, including the single-writer
@@ -4639,6 +4667,7 @@ async fn accept_loop(
     validator: SharedValidator,
     bulk_ack_admission: SharedBulkAckAdmission,
     interest_authority: SharedInterestAuthority,
+    witness_epochs: Option<Arc<crate::witness_epoch::WitnessEpochAuthority>>,
     admission: GatewayAdmission,
     report_limiter: Arc<ReportLimiter>,
     metrics: Arc<GatewayMetrics>,
@@ -4700,6 +4729,15 @@ async fn accept_loop(
                 }
                 admission.peers.evict_idle(admission.clock.now_ms().0).await;
                 interest_authority.prune_expired(registrar_now_ms());
+                // The epoch cache rides the same sweep the grant cache does,
+                // and is bounded the same way: an accepted announcement lives
+                // for `epoch_ms + accept_grace_ms` from acceptance (D28 clause
+                // (g)) and is then forgotten. Without this a long-lived
+                // gateway would accumulate one entry per cell-epoch it has
+                // ever been couriered — one per 30 s per cell — forever.
+                if let Some(epochs) = witness_epochs.as_ref() {
+                    epochs.prune_expired(registrar_now_ms());
+                }
             }
             incoming = endpoint.accept() => {
                 let Some(incoming) = incoming else { break };
@@ -4709,6 +4747,7 @@ async fn accept_loop(
                 let validator = Arc::clone(&validator);
                 let bulk_ack_admission = Arc::clone(&bulk_ack_admission);
                 let interest_authority = Arc::clone(&interest_authority);
+                let witness_epochs = witness_epochs.clone();
                 let admission = admission.clone();
                 let report_limiter = Arc::clone(&report_limiter);
                 let metrics = Arc::clone(&metrics);
@@ -4724,6 +4763,7 @@ async fn accept_loop(
                     validator,
                     bulk_ack_admission,
                     interest_authority,
+                    witness_epochs,
                     admission,
                     report_limiter,
                     metrics,
@@ -4756,6 +4796,7 @@ async fn handle_connection(
     validator: SharedValidator,
     bulk_ack_admission: SharedBulkAckAdmission,
     interest_authority: SharedInterestAuthority,
+    witness_epochs: Option<Arc<crate::witness_epoch::WitnessEpochAuthority>>,
     admission: GatewayAdmission,
     report_limiter: Arc<ReportLimiter>,
     metrics: Arc<GatewayMetrics>,
@@ -5054,6 +5095,52 @@ async fn handle_connection(
                     Err(error) => GatewayReply::InterestAck {
                         epoch: None,
                         reason: interest_ack_reason(error),
+                    },
+                };
+                send(Bytes::from(encode_stream_frame(&reply)));
+            }
+            GatewayMsg::WitnessEpoch { announcement } => {
+                // The announcement is self-authenticating — it is signed by
+                // the coordinator and names its own cell — but like a grant it
+                // is only accepted inside an established session, and for one
+                // more reason than a grant has: step 6 of D28 clause (d) tests
+                // the *presenter's* interest in the announced cell, and a
+                // connection with no session is a connection the interest
+                // authority has nothing to say about.
+                if session.as_ref().is_none() {
+                    continue;
+                }
+                let Some(epochs) = witness_epochs.as_ref() else {
+                    // A gateway with no cache configured is one that enforces
+                    // no witness set. Saying so is the point: silence would
+                    // leave a peer couriering announcements into a void and
+                    // discovering it only when its attested intents started
+                    // being refused for a quorum it thought it had met.
+                    send(Bytes::from(encode_stream_frame(
+                        &GatewayReply::WitnessEpochAck {
+                            epoch: None,
+                            reason: orrery_protocol::WITNESS_EPOCH_ACK_UNSUPPORTED,
+                        },
+                    )));
+                    continue;
+                };
+                let outcome = epochs.apply_announcement(
+                    &announcement,
+                    remote,
+                    interest_authority.as_ref(),
+                    registrar_now_ms(),
+                );
+                if let Err(error) = &outcome {
+                    debug!(%remote, %error, "gateway: witness epoch refused");
+                }
+                let reply = match outcome {
+                    Ok(epoch) => GatewayReply::WitnessEpochAck {
+                        epoch: Some(epoch),
+                        reason: orrery_protocol::WITNESS_EPOCH_ACK_OK,
+                    },
+                    Err(error) => GatewayReply::WitnessEpochAck {
+                        epoch: None,
+                        reason: witness_epoch_ack_reason(&error),
                     },
                 };
                 send(Bytes::from(encode_stream_frame(&reply)));
@@ -6180,6 +6267,34 @@ fn interest_ack_reason(error: orrery_protocol::InterestGrantVerificationError) -
     }
 }
 
+/// Map a witness-epoch verification failure onto its stable wire code.
+///
+/// The same courtesy [`interest_ack_reason`] extends to a refused grant, and
+/// necessary for the same reason: without it a refused announcement is
+/// indistinguishable from an accepted one until intents start failing their
+/// quorum for no visible cause. The collapses are deliberate —
+/// `UnknownIssuer`/`BadSignature` are one fact to a peer ("this gateway does
+/// not trust who signed that"), and `BadPool`/`OverTtl` are one fact too
+/// ("the announcement is out of bounds") — while `BadReveal` stays its own
+/// code because a good signature over a reveal that does not open is a
+/// coordinator problem, not a key-rotation one.
+fn witness_epoch_ack_reason(error: &orrery_protocol::WitnessEpochVerificationError) -> u8 {
+    use orrery_protocol::WitnessEpochVerificationError as EpochError;
+    match error {
+        EpochError::Malformed => orrery_protocol::WITNESS_EPOCH_ACK_MALFORMED,
+        EpochError::UnknownIssuer(_) | EpochError::BadSignature => {
+            orrery_protocol::WITNESS_EPOCH_ACK_UNTRUSTED
+        }
+        EpochError::BadPool | EpochError::OverTtl | EpochError::BadDraw => {
+            orrery_protocol::WITNESS_EPOCH_ACK_BOUNDS
+        }
+        EpochError::NotCovered => orrery_protocol::WITNESS_EPOCH_ACK_NOT_COVERED,
+        EpochError::Superseded => orrery_protocol::WITNESS_EPOCH_ACK_SUPERSEDED,
+        EpochError::BadReveal => orrery_protocol::WITNESS_EPOCH_ACK_BAD_REVEAL,
+        EpochError::Unsupported => orrery_protocol::WITNESS_EPOCH_ACK_UNSUPPORTED,
+    }
+}
+
 async fn cleanup_peer_session(
     session: &PeerSession,
     router: &Arc<dyn Router>,
@@ -6446,6 +6561,17 @@ fn reserve_intent_lane(lane: Arc<Semaphore>) -> Result<OwnedSemaphorePermit, Int
 ///    connection context (`cx`) as well as the intent, because an
 ///    account-scoped check has nothing to authorize against otherwise — the
 ///    intent itself is entirely peer-authored.
+///
+///    **D27's K-of-N quorum is inside this step, not beside it**, and that
+///    placement is the contract's: attestation is "a filter in front of
+///    cluster validation, never a substitute for it" (docs/07 §4.2), so it
+///    belongs above the executor and below the cheap shape checks — which is
+///    exactly where the validator already sits. A gateway configured to
+///    enforce resolves the intent's `cell_epoch` against its couriered
+///    announcement cache ([`GatewayMsg::WitnessEpoch`]) with no FoundationDB
+///    round trip, and refuses with
+///    [`orrery_protocol::REASON_ATTESTATION_QUORUM`] when the drawn required
+///    subset has not signed.
 /// 4. **Execution** — the configured [`IntentExecutor`]'s future must resolve
 ///    before the ack is sent, so a `Committed` outcome implies a durable
 ///    commit (RPO 0). With no executor configured the reply is

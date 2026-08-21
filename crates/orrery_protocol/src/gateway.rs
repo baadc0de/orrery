@@ -116,6 +116,31 @@ pub enum GatewayMsg {
         /// rides.
         report: Box<DiscrepancyReport>,
     },
+    /// Present the coordinator's signed witness-set announcement for a
+    /// cell-epoch (D28 clause (a): "the coordinator seeds; the peer couriers;
+    /// the gateway verifies").
+    ///
+    /// This is [`GatewayMsg::InterestGrant`]'s twin and exists for the same
+    /// reason it does: a gateway has **no** connection to the coordinator
+    /// (`orrery_coordinator`'s `interest.rs`: "there is no coordinator→gateway
+    /// connection anywhere in this design"), so the only way a coordinator
+    /// fact reaches a gateway is inside bytes a peer cannot forge. The peer is
+    /// a courier, not an authority: the gateway verifies the coordinator
+    /// signature, the pool bounds, and that the presenter actually holds
+    /// interest in the cell being announced, and believes nothing else the
+    /// presenter says about it.
+    ///
+    /// Without this the K-of-N enforcement of D27 has nothing to enforce
+    /// against — a gateway that holds no announcement derives no required
+    /// subset and admits no attestation toward K (D27 clause (e)).
+    ///
+    /// Appended rather than folded into an existing variant, for the reason
+    /// [`GatewayMsg::VersionedHello`] gives: postcard keys variants
+    /// positionally, so growing one mis-decodes every deployed peer.
+    WitnessEpoch {
+        /// A postcard-encoded [`crate::WitnessEpochV1`].
+        announcement: Vec<u8>,
+    },
 }
 
 impl GatewayMsg {
@@ -259,6 +284,20 @@ pub enum GatewayReply {
         /// present, otherwise why the cluster would not judge it.
         reason: u16,
     },
+    /// Outcome of presenting a coordinator witness-set announcement.
+    ///
+    /// A peer needs this for the reason [`GatewayReply::InterestAck`] gives:
+    /// without it, an announcement this gateway refused is indistinguishable
+    /// from one it accepted until intents start being refused for a quorum the
+    /// submitter thought it had met.
+    WitnessEpochAck {
+        /// The per-cell epoch counter now on file for the announced cell, when
+        /// accepted. `None` on refusal.
+        epoch: Option<u32>,
+        /// Why the announcement was refused, as a stable numeric code. `0` on
+        /// acceptance. See `WITNESS_EPOCH_ACK_*`.
+        reason: u8,
+    },
 }
 
 impl GatewayReply {
@@ -315,6 +354,46 @@ pub const INTEREST_ACK_BOUNDS: u8 = 4;
 pub const INTEREST_ACK_SUPERSEDED: u8 = 5;
 /// [`GatewayReply::InterestAck`] reason: this gateway accepts no grants.
 pub const INTEREST_ACK_UNSUPPORTED: u8 = 6;
+
+// The witness-epoch acknowledgement codes. A separate space from
+// `INTEREST_ACK_*` rather than a shared one, even though the first six lines
+// up almost exactly: the two acks answer different messages, and a shared
+// space would make every future divergence a renumbering. They are the arms
+// of `WitnessEpochVerificationError` (D28 clause (d) steps 1–8), collapsed
+// only where two errors are the same fact to a peer.
+
+/// [`GatewayReply::WitnessEpochAck`] reason: the announcement was accepted.
+pub const WITNESS_EPOCH_ACK_OK: u8 = 0;
+/// [`GatewayReply::WitnessEpochAck`] reason: oversized, undecodable, or a
+/// version this gateway does not speak (step 1).
+pub const WITNESS_EPOCH_ACK_MALFORMED: u8 = 1;
+/// [`GatewayReply::WitnessEpochAck`] reason: no configured coordinator key
+/// carries the announcement's `issuer_key_id`, or the signature does not
+/// verify under the one that does (steps 2–3).
+pub const WITNESS_EPOCH_ACK_UNTRUSTED: u8 = 2;
+/// [`GatewayReply::WitnessEpochAck`] reason: the candidate pool or the drawn
+/// set is malformed, or a duration is outside its bound (steps 4–5).
+pub const WITNESS_EPOCH_ACK_BOUNDS: u8 = 3;
+/// [`GatewayReply::WitnessEpochAck`] reason: the presenting peer holds no
+/// interest in the announced cell (step 6).
+///
+/// Not an accusation — a peer whose grant lapsed lands here — but it is the
+/// check that stops any authenticated peer from stuffing a gateway's epoch
+/// cache with announcements for cells it has nothing to do with.
+pub const WITNESS_EPOCH_ACK_NOT_COVERED: u8 = 4;
+/// [`GatewayReply::WitnessEpochAck`] reason: a newer epoch for this cell is
+/// already on file, or this handle is on file with different claims (step 7).
+pub const WITNESS_EPOCH_ACK_SUPERSEDED: u8 = 5;
+/// [`GatewayReply::WitnessEpochAck`] reason: the carried `prev_seed_key` does
+/// not open the commitment this gateway holds for the previous epoch (step 8).
+///
+/// Distinct from [`WITNESS_EPOCH_ACK_UNTRUSTED`] on purpose: the signature was
+/// good, so this is a coordinator that signed a reveal it could not honour,
+/// which is a far louder fact than a key rotation.
+pub const WITNESS_EPOCH_ACK_BAD_REVEAL: u8 = 6;
+/// [`GatewayReply::WitnessEpochAck`] reason: this gateway accepts no witness
+/// epochs — it has no coordinator keys configured, or no epoch cache.
+pub const WITNESS_EPOCH_ACK_UNSUPPORTED: u8 = 7;
 
 /// [`GatewayReply::AreaLoadError`] kind: the live read failed (the owning
 /// actor is gone — e.g. it crashed between the liveness check and the read).
@@ -640,7 +719,7 @@ mod tests {
             renew: vec![(PersistId::new(1), LeaseId(1))],
             tick: Tick::new(0),
         };
-        let msgs: [(GatewayMsg, u8); 8] = [
+        let msgs: [(GatewayMsg, u8); 9] = [
             (
                 GatewayMsg::Hello {
                     token: Vec::new(),
@@ -700,6 +779,12 @@ mod tests {
                 6,
             ),
             (GatewayMsg::Report { report: report() }, 7),
+            (
+                GatewayMsg::WitnessEpoch {
+                    announcement: Vec::new(),
+                },
+                8,
+            ),
         ];
         for (msg, discriminant) in msgs {
             assert_eq!(
@@ -709,7 +794,7 @@ mod tests {
             );
         }
 
-        let replies: [(GatewayReply, u8); 10] = [
+        let replies: [(GatewayReply, u8); 11] = [
             (
                 GatewayReply::HelloAck {
                     gateway: node(1),
@@ -789,6 +874,13 @@ mod tests {
                     reason: crate::REPORT_ADJUDICATED,
                 },
                 9,
+            ),
+            (
+                GatewayReply::WitnessEpochAck {
+                    epoch: None,
+                    reason: WITNESS_EPOCH_ACK_OK,
+                },
+                10,
             ),
         ];
         for (reply, discriminant) in replies {

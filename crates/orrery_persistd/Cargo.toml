@@ -46,6 +46,12 @@ anyhow = { workspace = true }
 tracing-subscriber = { workspace = true }
 futures = { workspace = true }
 serde_json = "1"
+# The OS CSPRNG behind D27 clause (d)'s per-cell-epoch `draw_key`. A draw key
+# is the one secret this crate generates, and it must come from the operating
+# system rather than from a seeded PRNG: everything else in this workspace
+# draws deterministically on purpose, and reaching for one of those here would
+# make the required-K subset reproducible by whoever knows the seed.
+getrandom = "0.3"
 glam = { workspace = true }
 hyper = { workspace = true, optional = true }
 hyper-util = { workspace = true, optional = true }

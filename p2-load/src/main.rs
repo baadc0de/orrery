@@ -2555,6 +2555,17 @@ impl Rig<'_> {
                     "unexpected report verdict on a rig session"
                 );
             }
+            // And the same again for witness-set announcements: the rig
+            // couriers none, so an ack addressed to it means the gateway has
+            // this connection confused with a peer that does.
+            GatewayReply::WitnessEpochAck { epoch, reason } => {
+                tracing::warn!(
+                    session,
+                    ?epoch,
+                    reason,
+                    "unexpected witness-epoch ack on a rig session"
+                );
+            }
         }
     }
 

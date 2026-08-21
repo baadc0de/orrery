@@ -7653,6 +7653,7 @@ dependencies = [
  "fjall",
  "foundationdb",
  "futures",
+ "getrandom 0.3.4",
  "glam 0.32.1",
  "hyper",
  "hyper-util",

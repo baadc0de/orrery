@@ -510,6 +510,202 @@ pub struct IntentRow {
 }
 
 // ---------------------------------------------------------------------------
+// Witness-epoch families: `epoch/{grid}/{cell}/{epoch}` and
+// `epoch-handle/{handle}`
+// ---------------------------------------------------------------------------
+//
+// The durable half of D28 clause (f) and D27 clause (d). Two families over one
+// fact, and the reason is the reason `lease_cell_key` and `lease_location_key`
+// both exist: two read patterns, neither of which should scan for the other.
+// An auditor and the adjudication executor scan by cell — a cell's epochs sort
+// in order and a grid's subtree is one contiguous range — while the intent
+// path resolves by the globally unique handle an `Intent::cell_epoch` names.
+//
+// docs/08-persistence.md writes this family as `epoch/{cell_id}` with no grid.
+// That is a D22 violation the sweep missed: cell ids are grid-relative, so two
+// grids' identically numbered cells would share a row, and a witness set
+// silently shared between nested grids is a witness set chosen by neither
+// cell's population. D28 clause (f) fixes it, and this is that fix.
+
+/// Key for the witness-epoch record: `epoch/{grid}/{cell}/{epoch}`.
+///
+/// `'e'` then the 4-byte `GridId`, the 8-byte `CellId` and the 4-byte epoch
+/// counter, all big-endian so a cell's epochs sort in announcement order.
+#[must_use]
+pub fn epoch_key(grid: GridId, cell: CellId, epoch: u32) -> [u8; 17] {
+    let mut key = [0u8; 17];
+    key[0] = b'e';
+    key[1..5].copy_from_slice(&grid.0.to_be_bytes());
+    key[5..13].copy_from_slice(&cell.to_bits().to_be_bytes());
+    key[13..].copy_from_slice(&epoch.to_be_bytes());
+    key
+}
+
+/// The first byte of the `epoch/` family span.
+#[must_use]
+pub fn epoch_range_start() -> Vec<u8> {
+    vec![b'e']
+}
+
+/// The exclusive end of the `epoch/` family span (one byte past `e`).
+///
+/// `b'f'` is also the `epoch-handle/` prefix, which is the correct exclusive
+/// bound here for exactly the reason it looks alarming: the two families are
+/// adjacent and disjoint, so "one past the end of `e`" is the first key of the
+/// next family and no `epoch/` row can sort at or beyond it.
+#[must_use]
+pub fn epoch_range_end() -> Vec<u8> {
+    vec![b'f']
+}
+
+/// Key for the handle index: `epoch-handle/{handle}` -> the [`epoch_key`] of
+/// the row it names.
+///
+/// The handle is D28 clause (b)'s `(incarnation << 48) | counter`, big-endian.
+/// This is the only lookup on the intent path, and it exists because an
+/// `Intent` carries a handle and nothing else — no grid, no cell, no counter —
+/// so resolving one by scanning the cell family would mean scanning the whole
+/// family.
+#[must_use]
+pub fn epoch_handle_key(handle: u64) -> [u8; 9] {
+    let mut key = [0u8; 9];
+    key[0] = b'f';
+    key[1..].copy_from_slice(&handle.to_be_bytes());
+    key
+}
+
+/// The value stored at [`epoch_key`]: the announcement verbatim, plus the draw
+/// state this gateway minted for the cell-epoch.
+///
+/// **The envelope is stored undecomposed, and that is the whole security value
+/// of the row** (D28 clause (f)): a reader recomputes the coordinator
+/// signature from these bytes and needs to trust neither the gateway that
+/// wrote them nor FoundationDB. A decomposed row would be the gateway's
+/// *assertion* about an announcement, which is the trust inversion the
+/// courier model exists to refuse.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct EpochRow {
+    /// The coordinator-signed `WitnessEpochV1` envelope, verbatim.
+    pub announcement: Vec<u8>,
+    /// When the accepting gateway first saw it, on its own clock.
+    pub first_seen_ms: u64,
+    /// `blake3(DOMAIN ‖ grid ‖ cell ‖ epoch ‖ draw_key)`.
+    ///
+    /// The commitment D27 clause (d) requires to be durable before any intent
+    /// in the cell-epoch is admitted. Without it a gateway could choose the
+    /// draw key after seeing which attestations arrived, and every
+    /// retrospective audit of the draw would be theatre.
+    pub draw_commit: [u8; 32],
+    /// The cell-epoch's draw key itself.
+    ///
+    /// Stored rather than held only in memory, and D27 clause (d) is explicit
+    /// about why: it is what makes the scheme survive a D26 sibling handover.
+    /// A sibling that adopts the shard mid-epoch **reads** this key instead of
+    /// minting a new one, so a handover does not silently re-roll every
+    /// outstanding required subset and invalidate every co-signature already
+    /// collected.
+    ///
+    /// "Secret" here means *not exported*, not *not stored*: no peer holds a
+    /// FoundationDB handle, so the cluster's trust boundary is the disclosure
+    /// boundary. This row is also the surface a cluster-side auditor reads the
+    /// key from after epoch end, which is D27's reveal. A *peer*-side audit of
+    /// the draw is deferred — no peer-visible message carries the commitment,
+    /// and D27 leaves naming one as an open question.
+    pub draw_key: [u8; 32],
+    /// The coordinator's seed key for this epoch, once the next announcement's
+    /// `prev_seed_key` has opened its commitment (D28 clause (c)).
+    ///
+    /// `None` until then. This is `k_epoch`, not [`Self::draw_key`]: it checks
+    /// the coordinator's *selection* shuffle, not this gateway's per-intent
+    /// draw, and the two are different secrets held by different processes.
+    pub revealed_key: Option<[u8; 32]>,
+    /// Unix-millisecond deadline after which the checkpoint pass may clear the
+    /// row. Carried rather than re-derived, the shape [`IntentRow`] uses, so
+    /// the sweep is a pure deadline comparison.
+    pub gc_deadline_ms: u64,
+}
+
+// ---------------------------------------------------------------------------
+// Attested-intent family: `attest/{intent_id}`
+// ---------------------------------------------------------------------------
+//
+// D27 clause (f) item 5, the one an implementer is most likely to skip and
+// which makes the whole retrospective audit vacuous if omitted: **the eligible
+// vector the gateway actually derived over**, recorded alongside the committed
+// intent.
+//
+// `E(I)` is the announced set minus the parties, and party exclusion matches
+// on accounts and every NodeId bound to them — bindings that live in
+// `orrery_identity` and change over time. An auditor recomputing `E(I)` a week
+// later from *current* bindings can silently derive a different eligible list,
+// therefore a different `required(I)`, and conclude the gateway cheated when
+// it did not. So the gateway records what it drew over, and the audit reads
+// the record rather than reconstructing history.
+//
+// What that buys, exactly, is worth being precise about because a later reader
+// will otherwise over-trust it: the audit proves "given the eligibility list
+// you recorded, did you draw the required subset correctly", not "was that
+// eligibility list honest". A gateway that lied about `E(I)` would pass. That
+// is acceptable only because the gateway is already the sole writer of durable
+// truth (D11) — its compromise ends the game by other means — and D27 accepts
+// the bound explicitly rather than leaving it in a reviewer's memory.
+
+/// Key for the recorded eligible vector: `attest/{intent_id}`, big-endian.
+///
+/// The prefix is `b'g'` for want of a mnemonic: `'a'` is the actor/fence
+/// family, `'i'` is the intent idempotency row, and `'e'`/`'f'` are this
+/// record's own epoch families. `'g'` is unclaimed and adjacent, which is all
+/// a one-byte discriminator has to be.
+#[must_use]
+pub fn attest_key(intent_id: u128) -> [u8; 17] {
+    let mut key = [0u8; 17];
+    key[0] = b'g';
+    key[1..].copy_from_slice(&intent_id.to_be_bytes());
+    key
+}
+
+/// The first byte of the `attest/` family span.
+#[must_use]
+pub fn attest_range_start() -> Vec<u8> {
+    vec![b'g']
+}
+
+/// The exclusive end of the `attest/` family span (one byte past `g`).
+#[must_use]
+pub fn attest_range_end() -> Vec<u8> {
+    vec![b'h']
+}
+
+/// The value stored at [`attest_key`]: what this intent's required subset was
+/// drawn over.
+///
+/// Written in the same transaction as the intent's effects and its
+/// idempotency row, so a committed intent and the record of how it was judged
+/// are one atomic fact. An audit reads both.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct AttestRow {
+    /// The cell-epoch handle the intent named, so an auditor can find the
+    /// announcement and the draw key without re-deriving either.
+    pub epoch_handle: u64,
+    /// `E(I)`: the eligible vector, **in announced order**.
+    ///
+    /// Order is load-bearing. The draw is a keyed hash per member and the
+    /// smallest K win, so order does not change the *result* — but the audit
+    /// recomputes over this vector, and a normalized (sorted, deduplicated)
+    /// copy would no longer be the object the gateway drew over.
+    pub eligible: Vec<orrery_protocol::NodeId>,
+    /// Unix-millisecond deadline after which the checkpoint pass may clear the
+    /// row.
+    ///
+    /// **The audit window is therefore this deadline, and it is the same one
+    /// [`IntentRow`] carries.** D27 asks for the record to be kept "for as
+    /// long as the intent is auditable", and this makes those two the same
+    /// span by construction rather than by coincidence — a longer retention
+    /// here would preserve a proof about an intent whose own row is gone.
+    pub gc_deadline_ms: u64,
+}
+
+// ---------------------------------------------------------------------------
 // Player family: `player/{account_id}` (+ `/loc` placement pointer)
 // ---------------------------------------------------------------------------
 //
@@ -1331,7 +1527,7 @@ mod tests {
     /// named.
     #[test]
     fn all_key_families_are_range_disjoint() {
-        // The seven families and their one-byte prefix.
+        // The fourteen families and their one-byte prefix.
         struct Family {
             prefix: u8,
         }
@@ -1340,6 +1536,9 @@ mod tests {
         let families = [
             Family { prefix: b'a' }, // fence/actor
             Family { prefix: b'c' }, // ckpt
+            Family { prefix: b'e' }, // epoch
+            Family { prefix: b'f' }, // epoch-handle
+            Family { prefix: b'g' }, // attest
             Family { prefix: b'i' }, // intent
             Family { prefix: b'k' }, // chunk
             Family { prefix: b'l' }, // ledger (bal/item/receipt)
@@ -1358,16 +1557,19 @@ mod tests {
         assert_eq!(
             prefixes.len(),
             families.len(),
-            "all eleven family prefixes must be distinct"
+            "all fourteen family prefixes must be distinct"
         );
 
         // For each pair (a, b), verify that a key from family A sorts before
         // a key from family B when prefix_a < prefix_b. Since each family has
         // a fixed one-byte prefix, the full-family range is [prefix, prefix+1),
         // so distinct prefixes guarantee disjoint ranges.
-        let keys: [Vec<u8>; 11] = [
+        let keys: [Vec<u8>; 14] = [
             fence_key(GRID, shard).to_vec(),                             // 'a'
             ckpt_key(GRID, shard).to_vec(),                              // 'c'
+            epoch_key(GRID, shard, 3).to_vec(),                          // 'e'
+            epoch_handle_key(1 << 48).to_vec(),                          // 'f'
+            attest_key(42).to_vec(),                                     // 'g'
             intent_key(42).to_vec(),                                     // 'i'
             chunk_key(GRID, shard, 0).to_vec(),                          // 'k'
             ledger_bal_key(AccountId::new(1), AssetId::new(1)).to_vec(), // 'l'
@@ -1389,6 +1591,69 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn epoch_keys_are_grid_scoped_and_sort_by_epoch_within_a_cell() {
+        let shard = CellId::from_bits(SHARD).unwrap();
+        let grid_a = GridId::new(7);
+        let grid_b = GridId::new(9);
+
+        // D22 in one assertion: two grids' identically numbered cells must not
+        // share a witness-epoch row, or a set drawn from one grid's population
+        // would govern the other's.
+        assert_ne!(epoch_key(grid_a, shard, 1), epoch_key(grid_b, shard, 1));
+
+        let first = epoch_key(grid_a, shard, 1);
+        let second = epoch_key(grid_a, shard, 2);
+        assert_eq!(first[0], b'e');
+        assert_eq!(first.len(), 17);
+        assert!(
+            first.as_slice() < second.as_slice(),
+            "a cell's epochs must sort in announcement order, so an auditor's \
+             scan is chronological without a secondary sort"
+        );
+        assert!(first.as_slice() >= epoch_range_start().as_slice());
+        assert!(first.as_slice() < epoch_range_end().as_slice());
+        assert!(second.as_slice() < epoch_range_end().as_slice());
+
+        // The handle index is a separate family, and the exclusive end of the
+        // epoch span is its first byte — adjacent and disjoint.
+        let handle = epoch_handle_key(orrery_protocol::WitnessEpochClaimsV1::compose_handle(1, 4));
+        assert_eq!(handle[0], b'f');
+        assert_eq!(handle.len(), 9);
+        assert!(handle.as_slice() >= epoch_range_end().as_slice());
+        assert!(
+            epoch_key(GridId::new(u32::MAX), shard, u32::MAX).as_slice()
+                < epoch_range_end().as_slice(),
+            "no epoch row, however extreme, may sort into the handle family"
+        );
+
+        // Handles are big-endian so an incarnation bump sorts after every
+        // handle the previous incarnation could mint.
+        assert!(
+            epoch_handle_key(orrery_protocol::WitnessEpochClaimsV1::compose_handle(
+                1,
+                0x0000_ffff_ffff_ffff
+            ))
+            .as_slice()
+                < epoch_handle_key(orrery_protocol::WitnessEpochClaimsV1::compose_handle(2, 0))
+                    .as_slice()
+        );
+    }
+
+    #[test]
+    fn attest_key_is_17_bytes_with_g_prefix_and_shares_the_intent_id_order() {
+        let key = attest_key(42);
+        assert_eq!(key[0], b'g');
+        assert_eq!(key.len(), 17);
+        assert_eq!(&key[1..], &42u128.to_be_bytes());
+        // Same encoding as `intent_key`, one prefix apart: the two rows are
+        // written in one transaction and read together by an audit, so a
+        // reader that has one id has both keys with no re-derivation.
+        assert_eq!(&attest_key(42)[1..], &intent_key(42)[1..]);
+        assert!(attest_key(0).as_slice() >= attest_range_start().as_slice());
+        assert!(attest_key(u128::MAX).as_slice() < attest_range_end().as_slice());
     }
 
     #[test]
