@@ -70,40 +70,15 @@ fn run_persistd(args: &[&str]) -> (String, String) {
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
 
+    // Snapshot the command line before spawning. A failure report that cannot
+    // say what was run leaves the reader guessing at the one thing the harness
+    // knows for certain.
+    let command = format!("{cmd:?}");
     let mut child = cmd.spawn().expect("failed to spawn persistd");
-    let stdout = child.stdout.take().expect("stdout captured");
-    let mut reader = std::io::BufReader::new(stdout);
-
-    // Read the first line of stdout — the JSON address line.
-    let mut line = String::new();
-    use std::io::BufRead;
-    let timeout = Duration::from_secs(10);
-    let start = std::time::Instant::now();
-
-    loop {
-        if start.elapsed() > timeout {
-            // Kill the process and fail.
-            let _ = child.kill();
-            let _ = child.wait();
-            panic!("timed out waiting for JSON address line from persistd");
-        }
-        line.clear();
-        let bytes_read = reader.read_line(&mut line).expect("read stdout line");
-        if bytes_read == 0 {
-            // EOF — process may have exited.
-            std::thread::sleep(Duration::from_millis(50));
-            continue;
-        }
-        if line.starts_with('{') {
-            break;
-        }
-        // Skip non-JSON output (tracing should go to stderr, but just in case).
-    }
-
-    // Parse the JSON line.
-    let trimmed = line.trim();
-    let parsed: serde_json::Value =
-        serde_json::from_str(trimmed).expect("stdout line is valid JSON");
+    let parsed = match await_readiness(&mut child, &command) {
+        Ok(parsed) => parsed,
+        Err(why) => panic!("{why}"),
+    };
 
     let node_id = parsed["node_id"]
         .as_str()
@@ -132,26 +107,208 @@ fn spawn_persistd(args: &[String]) -> (tempfile::TempDir, Child, serde_json::Val
 }
 
 fn spawn_persistd_in(dir: &std::path::Path, args: &[String]) -> (Child, serde_json::Value) {
-    let mut child = Command::new(persistd_binary())
-        .arg("--dir")
+    match try_spawn_persistd_in(dir, args) {
+        Ok(spawned) => spawned,
+        // `panic!` rather than `.expect()` on the `Result`: the message is
+        // already a multi-line report, and `expect` would bury it inside an
+        // `Err(..)` debug rendering with the newlines escaped.
+        Err(why) => panic!("{why}"),
+    }
+}
+
+/// The fallible half of [`spawn_persistd_in`], split out so the harness's own
+/// diagnostics can be asserted on without catching a panic. Every test uses the
+/// panicking wrapper; only the regression test for issue #139 calls this.
+fn try_spawn_persistd_in(
+    dir: &std::path::Path,
+    args: &[String],
+) -> Result<(Child, serde_json::Value), String> {
+    let mut cmd = Command::new(persistd_binary());
+    cmd.arg("--dir")
         .arg(dir)
         .arg("--allow-volatile-leases")
         .arg("--issuer-key")
         .arg(issuer_key_arg())
         .args(args)
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .expect("spawn persistd topology role");
+        .stderr(std::process::Stdio::piped());
+    let command = format!("{cmd:?}");
+    let mut child = cmd.spawn().expect("spawn persistd topology role");
+    let ready = await_readiness(&mut child, &command)?;
+    Ok((child, ready))
+}
+
+/// How long a freshly spawned `persistd` gets to print its readiness line.
+///
+/// The same ten seconds `run_persistd` already allowed itself for the address
+/// line, now applied to every spawn in this file rather than one of them.
+/// Startup on an idle box is milliseconds; the bound exists to turn a hang into
+/// a report, not to pace a slow machine, so a value generous enough to survive
+/// a loaded shared runner is the right one to reuse.
+const READINESS_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Why a spawned child never produced a readiness document.
+///
+/// Each variant is a distinct thing the harness observed, and each earns its
+/// own sentence: "it died", "it went quiet" and "it said something else" send
+/// an investigation to three different places.
+enum ReadinessProblem {
+    /// The child closed stdout without printing anything — it is dead.
+    Died,
+    /// The child was still silent when [`READINESS_TIMEOUT`] expired.
+    Silent,
+    /// Reading the child's stdout failed outright.
+    Unreadable(String),
+    /// A line arrived, but it was not a readiness document.
+    NotJson {
+        /// The line as read, quoted verbatim.
+        line: String,
+        /// What `serde_json` made of it.
+        error: String,
+    },
+}
+
+/// Wait, with a bound, for a spawned child's readiness document.
+///
+/// Issue #139. The body this replaces was `read_line(..).expect(..)` followed
+/// by `from_str(..).expect("valid readiness JSON")`. A child that died during
+/// startup — a failed bind, a resource limit, an OOM on this shared box — made
+/// `read_line` return zero bytes, and the test then failed with
+/// `Error("EOF while parsing a value", line: 1, column: 0)`. That describes the
+/// shape of an empty read. It says nothing about the child, whose exit status
+/// was never checked and whose stderr was captured and then dropped on the
+/// floor, at exactly the moment the cause was knowable. Two investigations
+/// ended in "probably contention" for want of those two facts.
+///
+/// So: never parse a short read. Reap the child, join its stderr, and report
+/// the status, the output and the command line together. There is deliberately
+/// no retry here — retrying a failure you cannot yet read converts a visible
+/// flake into an invisible one, which is the worse of the two.
+fn await_readiness(child: &mut Child, command: &str) -> Result<serde_json::Value, String> {
+    use std::io::{BufRead, Read};
+    use std::sync::mpsc::{self, RecvTimeoutError};
+
     let stdout = child.stdout.take().expect("stdout captured");
-    let mut reader = std::io::BufReader::new(stdout);
-    let mut line = String::new();
-    use std::io::BufRead;
-    reader
-        .read_line(&mut line)
-        .expect("read readiness document");
-    let ready = serde_json::from_str(line.trim()).expect("valid readiness JSON");
-    (child, ready)
+    let mut stderr = child.stderr.take().expect("stderr captured");
+
+    // Drain stderr on a thread of its own, for the child's whole life. Two
+    // reasons, and this file is exposed to both: a pipe nobody reads fills at
+    // 64 KiB and blocks the child mid-startup, and the one diagnostic worth
+    // having when a child dies is precisely what it wrote there. The thread
+    // ends when the child's stderr closes, which is when the child exits, so a
+    // healthy spawn leaks nothing.
+    let stderr_drain = std::thread::spawn(move || {
+        let mut raw = Vec::new();
+        let _ = stderr.read_to_end(&mut raw);
+        // Lossy on purpose: one mangled byte must not cost the whole message.
+        String::from_utf8_lossy(&raw).into_owned()
+    });
+
+    // Read stdout on another thread, so that the wait below can be bounded at
+    // all. `read_line` on a pipe blocks indefinitely, so a child that hangs
+    // before printing would otherwise hang the test along with it.
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut reader = std::io::BufReader::new(stdout);
+        loop {
+            let mut line = String::new();
+            let sent = match reader.read_line(&mut line) {
+                Ok(0) => tx.send(Err(ReadinessProblem::Died)),
+                Ok(_) if line.trim_start().starts_with('{') => tx.send(Ok(line)),
+                // Tracing is configured onto stderr, but a stray line that
+                // reaches stdout anyway must not be mistaken for the readiness
+                // document — skip it and keep reading.
+                Ok(_) => continue,
+                Err(err) => tx.send(Err(ReadinessProblem::Unreadable(err.to_string()))),
+            };
+            let _ = sent;
+            return;
+        }
+    });
+
+    let start = std::time::Instant::now();
+    let outcome = rx.recv_timeout(READINESS_TIMEOUT);
+    let waited = start.elapsed();
+    let problem = match outcome {
+        Ok(Ok(line)) => match serde_json::from_str(line.trim()) {
+            Ok(ready) => return Ok(ready),
+            Err(error) => ReadinessProblem::NotJson {
+                line,
+                error: error.to_string(),
+            },
+        },
+        Ok(Err(problem)) => problem,
+        Err(RecvTimeoutError::Timeout) => ReadinessProblem::Silent,
+        // The reader thread drops its sender only after sending, so a
+        // disconnect means it died before it could say anything at all.
+        Err(RecvTimeoutError::Disconnected) => {
+            ReadinessProblem::Unreadable("the stdout reader thread died".to_string())
+        }
+    };
+    Err(readiness_failure(
+        child,
+        command,
+        stderr_drain,
+        waited,
+        problem,
+    ))
+}
+
+/// Reap a child that failed to become ready and render the whole story as one
+/// message: what was observed, how the child ended, how long it was given, what
+/// was run, and everything it wrote to stderr.
+fn readiness_failure(
+    child: &mut Child,
+    command: &str,
+    stderr_drain: std::thread::JoinHandle<String>,
+    waited: Duration,
+    problem: ReadinessProblem,
+) -> String {
+    // Kill first, then reap, then join. Signalling a child that has already
+    // exited is a no-op that leaves its recorded status alone, and signalling
+    // one that has hung is the only way to close its stderr so the drain can
+    // reach EOF — joining before the kill would deadlock on exactly the case
+    // this function exists for.
+    let _ = child.kill();
+    let status = match child.wait() {
+        Ok(status) => status.to_string(),
+        Err(err) => format!("unavailable ({err})"),
+    };
+    let stderr = stderr_drain
+        .join()
+        .unwrap_or_else(|_| "<the stderr drain thread panicked>".to_string());
+
+    let head = match problem {
+        ReadinessProblem::Died => {
+            format!("persistd exited with status `{status}` before printing its readiness line")
+        }
+        ReadinessProblem::Silent => format!(
+            "persistd printed no readiness line before the bound expired; \
+             it was killed and reaped as `{status}`"
+        ),
+        ReadinessProblem::Unreadable(err) => {
+            format!("reading persistd's stdout failed ({err}); it was reaped as `{status}`")
+        }
+        ReadinessProblem::NotJson { line, error } => format!(
+            "persistd printed {line:?}, which is not a readiness document ({error}); \
+             it was reaped as `{status}`"
+        ),
+    };
+
+    let stderr = stderr.trim_end();
+    let stderr = if stderr.is_empty() {
+        "    <the child wrote nothing to stderr>".to_string()
+    } else {
+        stderr
+            .lines()
+            .map(|line| format!("    {line}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
+    format!(
+        "{head}\n  waited: {waited:?} of {READINESS_TIMEOUT:?}\n  command: {command}\n  stderr:\n{stderr}"
+    )
 }
 
 async fn seed_process_entity(
@@ -502,6 +659,59 @@ fn overlapping_local_shards_are_rejected() {
     assert!(
         stderr.contains("overlapping --shard values"),
         "stderr should explain the overlap: {stderr}"
+    );
+}
+
+#[test]
+fn a_child_that_dies_at_startup_reports_its_exit_status_and_stderr() {
+    // Issue #139, and the reason this test exists at all: a child that died
+    // during startup used to surface as
+    // `valid readiness JSON: Error("EOF while parsing a value", line: 1,
+    // column: 0)`, which describes the shape of an empty read and nothing about
+    // the child. Twice that cost an investigation that ended in "probably
+    // contention" because the exit status and stderr had been discarded.
+    //
+    // Force a real startup failure — overlapping `--shard` values, the same
+    // rejection `overlapping_local_shards_are_rejected` relies on — and assert
+    // that the harness reports what the child said on its way out. Asserting on
+    // the message rather than on a panic is why `try_spawn_persistd_in` exists.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let why = match try_spawn_persistd_in(
+        dir.path(),
+        &[
+            "--bind".to_string(),
+            "127.0.0.1:0".to_string(),
+            "--shard".to_string(),
+            "0x8000_0000_0000_0000".to_string(),
+            "--shard".to_string(),
+            "0,0,0@1".to_string(),
+        ],
+    ) {
+        Ok((mut child, _ready)) => {
+            stop(&mut child);
+            panic!(
+                "persistd accepted overlapping --shard values; this test needs another way to \
+                 make startup fail"
+            );
+        }
+        Err(why) => why,
+    };
+
+    assert!(
+        why.contains("persistd exited with status"),
+        "a dead child must be reported as dead, with its status: {why}"
+    );
+    assert!(
+        why.contains("overlapping --shard values"),
+        "the child's stderr must be surfaced, not discarded: {why}"
+    );
+    assert!(
+        why.contains(persistd_binary()),
+        "the report must say what was run: {why}"
+    );
+    assert!(
+        !why.contains("EOF while parsing"),
+        "a short read must never be handed to the JSON parser: {why}"
     );
 }
 
