@@ -135,6 +135,24 @@ impl CoordinatorClient {
         }
     }
 
+    /// Wait for the next witness-epoch announcement, discarding the rest.
+    ///
+    /// Returns the opaque signed bytes this peer couriers to its gateway —
+    /// the same handout shape as [`Self::next_grant`], because it is the same
+    /// model: the coordinator signs, the peer carries, the gateway verifies
+    /// (D28 clause (a)).
+    pub async fn next_witness_epoch(&self, within: Duration) -> Result<Vec<u8>, ClientError> {
+        let deadline = tokio::time::Instant::now() + within;
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            match self.recv(remaining).await {
+                Some(CoordMsg::WitnessEpoch { announcement }) => return Ok(announcement),
+                Some(_) => continue,
+                None => return Err(ClientError::Timeout("a witness epoch")),
+            }
+        }
+    }
+
     /// Read the next coordinator message, or `None` on timeout or teardown.
     pub async fn recv(&self, within: Duration) -> Option<CoordMsg> {
         let deadline = tokio::time::Instant::now() + within;

@@ -24,6 +24,18 @@ serde = { workspace = true }
 postcard = { workspace = true, optional = true }
 bytes = { workspace = true, features = ["serde"] }
 bitcode = { version = "0.6", optional = true }
+# Witness-set seeding (D28 clause (c)). The draw is a keyed shuffle that both
+# the coordinator and every later auditor must reproduce byte for byte, so the
+# primitives live beside the envelope rather than in either party's crate:
+# blake3 for the seed-key commitment, HMAC-SHA256 for the seed, and ChaCha20 as
+# the shuffle's stream. All three are already in this workspace's dependency
+# graph (`orrery_core`, `orrery_witness`) — this crate is where the *shared*
+# definition belongs, because a verifier that cannot recompute the draw cannot
+# check the reveal.
+blake3 = "1.8"
+rand_chacha = "0.9"
+hmac = "0.12"
+sha2 = "0.10"
 
 [dev-dependencies]
 proptest = { workspace = true }

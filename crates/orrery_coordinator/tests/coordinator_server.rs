@@ -9,7 +9,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use orrery_coordinator::server::{FixedUnixClock, ServerConfig, SystemPresenceClock};
-use orrery_coordinator::{CoordinatorClient, CoordinatorServer, InterestIssuer};
+use orrery_coordinator::{
+    CoordinatorClient, CoordinatorServer, InterestIssuer, WitnessEpochIssuer, WitnessSeedConfig,
+};
 use orrery_protocol::{
     verify_interest_grant, AccountId, CellId, CoordMsg, GridId, IssuerKey, IssuerKeyId, NodeId,
     SessionStanding, SessionTokenClaimsV1, SessionTokenTtlMs, SessionTokenV1, UnixMillis,
@@ -31,6 +33,26 @@ fn node(seed: u8) -> NodeId {
 
 fn cell(x: i32) -> CellId {
     CellId::from_coords(glam::IVec3::new(x, 0, 0), CellId::MAX_LEVEL).unwrap()
+}
+
+/// A token binding `bound` to its own account, so a fixture of several peers
+/// is several *accounts* — witness eligibility dedups on the account, so
+/// peers sharing one would collapse to a single pool slot.
+fn account_token(issuer: &iroh::SecretKey, bound: NodeId, account: u64) -> Vec<u8> {
+    SessionTokenV1::sign(
+        SessionTokenClaimsV1::new(
+            AccountId::new(account),
+            bound,
+            UnixMillis::new(NOW_MS - 1_000),
+            SessionTokenTtlMs::new(60_000),
+            SessionStanding::Good,
+            IssuerKeyId::new(1),
+        ),
+        issuer,
+    )
+    .expect("sign token")
+    .encode()
+    .expect("encode token")
 }
 
 fn token(issuer: &iroh::SecretKey, bound: NodeId, ttl_ms: u64) -> Vec<u8> {
@@ -458,5 +480,135 @@ async fn coordinator_directed_messages_from_a_peer_are_ignored() {
     client.report_presence(vec![cell(0)]).expect("presence");
     assert!(client.next_grant(PATIENCE).await.is_ok());
 
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_populated_cell_gets_a_witness_set_every_peer_can_courier() {
+    // D28 clause (a) end to end: the coordinator alone chooses, and the peers
+    // covering the cell are the only delivery mechanism. There is no
+    // coordinator→gateway connection anywhere in this test because there is
+    // none in the design — a gateway needs the public key and the bytes.
+    let issuer = secret(200);
+    let interest = secret(201);
+    let witness_master = [0x2Au8; 32];
+    let server = CoordinatorServer::spawn(ServerConfig {
+        token_clock: Arc::new(FixedUnixClock(NOW_MS)),
+        presence_clock: Arc::new(SystemPresenceClock::default()),
+        witness_issuer: Some(WitnessEpochIssuer::new(
+            interest.clone(),
+            IssuerKeyId::new(1),
+            witness_master,
+            1,
+        )),
+        // The eligibility windows are real clocks; a test cannot wait out a
+        // 10 s probation, and the filters themselves are unit-tested against
+        // an injected clock in `witness.rs`.
+        witness_seed: WitnessSeedConfig {
+            min_presence_ms: 0,
+            reseed_min_ms: 0,
+            ..WitnessSeedConfig::default()
+        },
+        ..ServerConfig::new(
+            [IssuerKey::new(IssuerKeyId::new(1), issuer.public())],
+            InterestIssuer::new(interest.clone(), IssuerKeyId::new(1)),
+        )
+    })
+    .await
+    .expect("spawn coordinator");
+
+    // Five peers on five accounts, all covering one cell — the floor exactly.
+    let mut clients = Vec::new();
+    for index in 1..=5u8 {
+        let client = CoordinatorClient::connect(
+            secret(index),
+            server.addr(),
+            account_token(&issuer, node(index), u64::from(index)),
+            PATIENCE,
+        )
+        .await
+        .expect("peer admitted");
+        client.report_presence(vec![cell(0)]).expect("presence");
+        clients.push(client);
+    }
+
+    // Every one of them receives the same signed announcement, and every one
+    // of them can hand it to a gateway that holds only the public half.
+    let trusted = [IssuerKey::new(IssuerKeyId::new(1), interest.public())];
+    let mut announcements = Vec::new();
+    for client in &clients {
+        let bytes = client
+            .next_witness_epoch(PATIENCE)
+            .await
+            .expect("a covering peer is handed the cell's witness set");
+        let claims = orrery_protocol::verify_witness_epoch(&bytes, &trusted)
+            .expect("a gateway accepts the coordinator's signature");
+        announcements.push(claims);
+    }
+    let first = &announcements[0];
+    assert_eq!(first.cell, cell(0));
+    assert_eq!(
+        first.candidates.len(),
+        5,
+        "five eligible peers, five accounts"
+    );
+    assert_eq!(
+        first.selected.len(),
+        5,
+        "a pool under the target is taken whole"
+    );
+    assert!(
+        first.prev_seed_key.is_none(),
+        "the cell's first epoch opens nothing"
+    );
+    for claims in &announcements {
+        assert_eq!(claims, first, "one epoch, one set, one set of bytes");
+    }
+    // The set is drawn from the pool and from nothing else: nobody who was
+    // not in the cell can appear in it.
+    for selected in &first.selected {
+        assert!(first.candidates.contains(selected));
+        assert!((1..=5u8).any(|index| node(index) == *selected));
+    }
+
+    let stats = server.stats().await;
+    assert_eq!(stats.witness_epochs_seeded, 1);
+    assert_eq!(stats.witness_epochs_delivered, 5);
+
+    for client in clients {
+        client.leave().await;
+    }
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_coordinator_with_no_witness_issuer_announces_nothing() {
+    // The default posture, and it must stay a real default rather than a set
+    // of empty announcements: P4 files nothing, so `orrery_witness`'s
+    // self-chosen fallback is still what runs, and a coordinator that shipped
+    // an epoch without being configured to seed one would be asserting an
+    // authority it was never given a key for.
+    let issuer = secret(200);
+    let interest = secret(201);
+    let server = coordinator(&issuer, &interest).await;
+    let client = CoordinatorClient::connect(
+        secret(1),
+        server.addr(),
+        token(&issuer, node(1), 60_000),
+        PATIENCE,
+    )
+    .await
+    .expect("peer admitted");
+    client.report_presence(vec![cell(0)]).expect("presence");
+    assert!(client.next_grant(PATIENCE).await.is_ok());
+
+    assert!(
+        client
+            .next_witness_epoch(Duration::from_millis(300))
+            .await
+            .is_err(),
+        "an unconfigured coordinator announced a witness epoch"
+    );
+    assert_eq!(server.stats().await.witness_epochs_seeded, 0);
     server.shutdown().await;
 }

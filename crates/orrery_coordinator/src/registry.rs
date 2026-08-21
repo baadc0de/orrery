@@ -163,6 +163,31 @@ impl IslandRegistry {
         self.islands.len()
     }
 
+    /// Every peer whose reported presence covers `cell`, in byte order.
+    ///
+    /// This is the candidate pool a witness epoch is drawn from (D28), and it
+    /// is deliberately taken from **presence** rather than from island
+    /// membership: docs/07 §4.1 says the pool is the entity's interest set,
+    /// and two islands whose peers both cover a cell are one cell's
+    /// population, not two. Unioning here is the "one pool per cell-epoch"
+    /// reading D28 leaves open, and it is the only reading under which the
+    /// witnesses of a cell are chosen by the people actually in it.
+    ///
+    /// Sorted bytewise so the caller gets a canonical set rather than
+    /// whatever order a `HashMap` iterated in — the draw is a function of the
+    /// set, and this is where that starts.
+    #[must_use]
+    pub fn peers_covering(&self, cell: CellId) -> Vec<NodeId> {
+        let mut covering: Vec<NodeId> = self
+            .peers
+            .iter()
+            .filter(|(_, presence)| presence.cells.contains(&cell))
+            .map(|(node, _)| *node)
+            .collect();
+        covering.sort_by_key(|node| *node.as_bytes());
+        covering
+    }
+
     /// The island a peer currently belongs to, if any.
     #[must_use]
     pub fn island_of(&self, node: NodeId) -> Option<IslandId> {
