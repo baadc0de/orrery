@@ -60,6 +60,8 @@
 #![recursion_limit = "512"]
 
 mod peer;
+mod race;
+mod trader;
 mod wire;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -258,9 +260,39 @@ struct Cli {
     #[arg(long)]
     print_keys: bool,
 
+    /// The FoundationDB cluster file the two gateways share.
+    ///
+    /// Required by the double-spend race leg and by nothing else: that leg's
+    /// verdict is the state of `ledger/item/{uid}` after both attempts
+    /// settled, and a verdict read from the two acks instead would be a
+    /// statement about what the gateways *said*, which is the thing under
+    /// test. Without it the leg does not run and the report says so.
+    #[arg(long, value_name = "PATH")]
+    fdb_cluster_file: Option<String>,
+
+    /// How many times the same item is offered twice at once (issue #152).
+    ///
+    /// Repeated because a single round is a coin flip: the failure mode this
+    /// leg is written against is a race that quietly degenerated into a
+    /// sequence, and that is only visible across a distribution of overlaps.
+    #[arg(long, default_value_t = 24)]
+    race_rounds: u32,
+
+    /// Milliseconds between race rounds.
+    ///
+    /// Long enough that a round's two acks are back before the next one fires
+    /// — the loser's answer costs a conflict, a retry and a re-read — and
+    /// short enough that the whole leg fits inside the peers' lifetime.
+    #[arg(long, default_value_t = 250)]
+    race_period_ms: u64,
+
     /// Internal: run as one peer rather than the orchestrator.
     #[arg(long, hide = true)]
     peer_spec: Option<PathBuf>,
+
+    /// Internal: run as one racer rather than the orchestrator.
+    #[arg(long, hide = true)]
+    trader_spec: Option<PathBuf>,
 }
 
 fn main() -> Result<()> {
@@ -285,6 +317,11 @@ fn main() -> Result<()> {
         let spec: PeerSpec = serde_json::from_slice(&std::fs::read(&path)?)
             .with_context(|| format!("read peer spec {}", path.display()))?;
         return runtime.block_on(peer::run(spec));
+    }
+    if let Some(path) = cli.trader_spec.clone() {
+        let spec: trader::TraderSpec = serde_json::from_slice(&std::fs::read(&path)?)
+            .with_context(|| format!("read trader spec {}", path.display()))?;
+        return runtime.block_on(trader::run(spec));
     }
     let outcome = runtime.block_on(orchestrate(cli))?;
     println!("{}", serde_json::to_string_pretty(&outcome.report)?);
@@ -451,6 +488,15 @@ async fn orchestrate(cli: Cli) -> Result<Outcome> {
         .metrics_b
         .as_deref()
         .context("--metrics-b is required: the summed invariant needs gateway B's counters too")?;
+    // Required, like the manifest and both metrics files, and for the same
+    // kind of reason: the double-spend race's verdict is the state of
+    // `ledger/item/{uid}` after both attempts settled, and a harness that read
+    // it from the two acks instead would be asserting what the gateways said
+    // rather than what the ledger did.
+    let cluster_file = cli
+        .fdb_cluster_file
+        .as_deref()
+        .context("--fdb-cluster-file is required: the double-spend race is decided in the durable tier, and is read back from it")?;
     let shards_a = read_shards(
         cli.shards_a
             .as_deref()
@@ -475,12 +521,23 @@ async fn orchestrate(cli: Cli) -> Result<Outcome> {
     // seconds of probing is the worst case per move.
     let handover_leg = (METRICS_EXPORT_INTERVAL * 4 + Duration::from_secs(2))
         * u32::try_from(cli.handover_shard.len()).unwrap_or(u32::MAX);
-    let needed = settle_budget * 2 + ATTESTATION_WAIT + Duration::from_secs(15) + handover_leg;
+    // The race leg: the rounds themselves, the two racers' connect-and-fund
+    // before the barrier, and the wait for the cluster's status gather to
+    // catch up with the conflicts it counted.
+    let race_leg = if cli.fdb_cluster_file.is_some() {
+        Duration::from_millis(u64::from(cli.race_rounds) * cli.race_period_ms)
+            + Duration::from_secs(25)
+    } else {
+        Duration::ZERO
+    };
+    let needed =
+        settle_budget * 2 + ATTESTATION_WAIT + Duration::from_secs(15) + handover_leg + race_leg;
     anyhow::ensure!(
         Duration::from_secs(cli.duration_secs) > needed,
-        "--duration-secs must exceed {}s: two settle budgets, the attestation wait, the claim storm and {} handover(s)",
+        "--duration-secs must exceed {}s: two settle budgets, the attestation wait, the claim storm, {} handover(s) and a {}-round double-spend race",
         needed.as_secs(),
-        cli.handover_shard.len()
+        cli.handover_shard.len(),
+        cli.race_rounds
     );
 
     // ── Routing ─────────────────────────────────────────────────────────
@@ -709,6 +766,30 @@ async fn orchestrate(cli: Cli) -> Result<Outcome> {
         wrong_owner_probe,
         "misroute probe: a B-side row addressed to gateway A"
     );
+
+    // ── The double-spend race ───────────────────────────────────────────
+    // Arm (b) of the P5 dupe gauntlet (issue #152): the same item offered
+    // twice, at the same instant, through the two sibling gateways. It runs
+    // here — after the island has formed and before the handover and both
+    // kills — for three reasons. Both gateways must be alive, because a race
+    // needs two racers. Neither executor may be re-fenced mid-flight, and a
+    // handover calls `FdbIntentExecutor::refence` on both sides. And the leg
+    // takes no lease and kills nothing, so it cannot move a counter any later
+    // clause reads.
+    let race = race::run_race(
+        &issuer,
+        cluster_file,
+        &cli.out,
+        cli.race_rounds,
+        cli.race_period_ms,
+        (&cli.gateway_a_addr, &cli.gateway_a_node),
+        (&cli.gateway_b_addr, &cli.gateway_b_node),
+        &std::env::current_exe()?,
+    )
+    .await
+    .context("the double-spend race across two sibling gateways")?;
+    let race_passed = race.passed;
+    let race_report = race.report;
 
     // ── The live shard handover ─────────────────────────────────────────
     // Before either kill, and deliberately so: the two kills are about
@@ -1058,6 +1139,7 @@ async fn orchestrate(cli: Cli) -> Result<Outcome> {
         && a_moved.duplicate == 0
         && held_after >= held_before;
     let passed = settled
+        && race_passed
         && handover_all_passed
         && misrouted == 0
         && wrong_owner_probe
@@ -1109,6 +1191,12 @@ async fn orchestrate(cli: Cli) -> Result<Outcome> {
         "misrouted_claims": misrouted,
         "wrong_owner_probe": wrong_owner_probe,
         "claim_refusals": refused,
+        // Issue #152, P5 arm (b): the same item offered twice at once through
+        // the two siblings. Every figure in it is read back out of
+        // FoundationDB after both attempts settled — the ownership row, both
+        // idempotency rows, the receipt range and the three balances — because
+        // "one attempt returned an error" is not the criterion and never was.
+        "race": race_report,
         // Issue #119, D26 rule 3: one shard moved between two live gateways.
         // `null` when the run was not given one to move, which is how a
         // sibling run without the handover leg still reports honestly rather
@@ -1857,12 +1945,25 @@ fn unix_ms() -> u64 {
 }
 
 fn mint_token(issuer: &iroh::SecretKey, node: NodeId) -> Result<Vec<u8>> {
+    mint_token_for(issuer, node, 1)
+}
+
+/// Mint a session token naming a specific account.
+///
+/// The peers all share account 1 — nothing on the authority path distinguishes
+/// them by account, and giving each its own would change a topology this gate
+/// has already measured. The two racers cannot: `BaselineIntentValidator`
+/// admits a `LEDGER_ITEM_TRANSFER_OP` only when the buyer is the submitting
+/// connection's own account, so two racers on one account would be two
+/// submissions of the *same* trade, and "exactly one owner afterwards" would
+/// hold whichever one won — including if both had.
+fn mint_token_for(issuer: &iroh::SecretKey, node: NodeId, account: u64) -> Result<Vec<u8>> {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)?
         .as_millis() as u64;
     Ok(SessionTokenV1::sign(
         SessionTokenClaimsV1::new(
-            AccountId::new(1),
+            AccountId::new(account),
             node,
             UnixMillis::new(now),
             SessionTokenTtlMs::new(3_600_000),

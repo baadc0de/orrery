@@ -255,9 +255,12 @@ jobs:
           key: gates-${{ runner.os }}-${{ hashFiles('Cargo.toml', 'crates/*/Cargo.toml', 'vendor/*/Cargo.toml', 'rust-toolchain.toml') }}
           restore-keys: gates-${{ runner.os }}-
 
-      # `p2-load` takes `orrery_persistd` with `features = ["fdb"]`
-      # (p2-load/Cargo.toml), so it needs libfdb_c and the headers to build at
-      # all — the client package only, no cluster: its tests are unit tests.
+      # `p2-load` and `p3-siblings` both take `orrery_persistd` with
+      # `features = ["fdb"]` (their Cargo.tomls), so they need libfdb_c and the
+      # headers to build at all — the client package only, no cluster: their
+      # tests are unit tests. `p3-siblings` joined that list with the P5
+      # double-spend race, which reads `ledger/item/{uid}` back out of the
+      # durable tier rather than trusting the gateways' acks.
       - name: Install the FoundationDB client
         # foundationdb-clients is already installed on the box.
         if: runner.environment == 'github-hosted'

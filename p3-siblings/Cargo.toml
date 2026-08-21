@@ -24,11 +24,21 @@ orrery_protocol = { path = "../crates/orrery_protocol" }
 # fixture that signs its own authorization proves nothing about the path
 # production uses.
 orrery_coordinator = { path = "../crates/orrery_coordinator" }
+# The durable ledger the double-spend race is decided in (issue #152, D11 §7).
+# Taken as a dependency rather than re-spelled here: `ledger/item/{uid}`'s key
+# layout, its postcard-encoded `ItemRow`, the receipt row and the 40-byte
+# transfer `args` are all *durable* encodings, and a harness carrying a second
+# copy of them would keep compiling after the cluster's own layout moved and
+# would then assert confidently about the wrong bytes. The `p2-load` rig takes
+# the same dependency for the same reason (`p2-load/Cargo.toml`).
+orrery_persistd = { path = "../crates/orrery_persistd", features = ["fdb"] }
+foundationdb = { version = "0.11", default-features = false, features = ["fdb-7_3"] }
 # Versions mirror the root workspace's D14 pins exactly (a standalone
 # `[workspace]` cannot inherit `workspace.dependencies`).
 iroh = "1.0.3"
 iroh-base = { version = "1.0.3", default-features = false, features = ["key"] }
 bytes = "1"
+futures = "0.3"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "process", "signal"] }
 clap = { version = "4", features = ["derive"] }
 anyhow = "1"
