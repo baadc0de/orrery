@@ -886,7 +886,338 @@ platforms the criterion names.
 
 **Demo criterion.** A scripted 128-player crowd event (R6 upper bound) in one region: the hot cell is promoted within the hysteresis window, per-peer bandwidth stays within the ≤ 1 Mbps uplink budget and field-host egress within the ≤ 35 Mbps hot-cell budget (D6; the modeled n=128 load is ~25.6+ Mbps, inside budget) throughout, and demotion follows dispersal cleanly. Then the rollback demo: a griefer bulldozes a player town; an operator restores it to a timestamp via archive inverse-op replay, with the ledger untouched. Multi-region: EU-based peers joining a US island get relay/gateway routing that keeps added latency within the measured relay penalty from P0.
 
+*A **proposed, not accepted** amendment to this criterion — two additional legs covering the chaos suite and admission control, which this criterion as written never exercises — is in [Beyond P6](#beyond-p6--proposed-extension-not-accepted) below. It strengthens the criterion; it moves nothing out of the phase.*
+
 **Upstream milestone.** Open-source the load/chaos harness and `iroh-relay` fleet deployment tooling.
+
+---
+
+## Beyond P6 — proposed extension (not accepted)
+
+> **Status: PROPOSED, in its entirety.** Nothing in this section is accepted;
+> phase acceptance is the repo owner's call, and no decision named here is made
+> here. This section does two things, and the second must not be discovered by
+> reading a diff: it **appends** two proposed phases and a live-operations
+> track after P6, and it **proposes an amendment to P6 itself** — two
+> additional demo-criterion legs, argued in §B1 below. It moves no deliverable
+> out of P6, and §B1 records why the candidate moves were considered and
+> rejected.
+
+Nothing below is invented. Every item is one of the project's own unresolved
+threads followed to its conclusion: an open-questions row, a risk-register row
+whose mitigation cannot complete inside P0–P6, a deferral an accepted ADR
+records explicitly, an orphaned deliverable ([#223], [#224]), or a designed
+mechanism (multi-node persistd, [08-persistence.md](08-persistence.md) §3.2 and
+§13; D26 live handover) that no phase gate has ever run at its modeled scale.
+The speculation gradient is stated per phase and is not uniform: P7 is
+near-certain, P8 is speculative in its parameters but not its content, and the
+horizon past P8 is deliberately not phased.
+
+### B0. Why the numbering continues, and where it stops
+
+A P-phase in this document is a specific thing: a body of work with a
+falsifiable demo criterion that becomes a permanent regression harness and
+gates what follows. Two more bodies of post-P6 work still have that shape —
+*operating the built system at its modeled population* (P7) and *changing a
+live universe without stopping it* (P8) — so they keep the numbering. What
+does **not** have that shape is the residue: relay economics tuning (R-5),
+enforcement ramp beyond quarantine (R-6's "provably zero over months"),
+field-host cost dials (R-8), and the upstreaming that discharges R-2. Those
+are standing obligations with *triggers*, not criteria — running them as
+phases would mean inventing exit conditions for work that structurally never
+exits. They are collected in §B3 as a **live-operations track** that starts at
+P7 entry and runs alongside, feeding the risk register rather than the phase
+sequence. And past P8 the honest answer is a named horizon, not more phases
+(§B4): every tunable there is an input only a real population produces.
+
+### B1. Proposed P6 amendments (criterion only; no deliverable moves)
+
+**What P6's criterion covers and what it ships diverge.** The deliverables
+list carries field-host promotion/demotion, the terrain pipeline, the event
+archive + griefing rollback, the chaos suite, and admission control. The
+criterion exercises the first (crowd event), the second and third together
+(the rollback demo restores bulldozed terrain and reads the archive), and
+multi-region routing. **It never runs a chaos scenario and never admits a
+herd** — the two deliverables named only in prose. A phase whose criterion
+does not test its own deliverables has absorbed work it cannot prove it
+finished, so the criterion gains two legs:
+
+- **Chaos leg** (same deployed topology as the crowd event, all four scripted
+  scenarios, each with a stated failure condition):
+  (a) *netsplit* — cluster unreachable for 5 minutes: simulation continues,
+  clients queue intents (D12 netsplit posture); on heal, every queued intent
+  commits or is refused by validation — zero silent loss, RPO 0 — and
+  `intent_commit_ms` p99 is back under 10 ms within 60 s of heal;
+  (b) *relay-region loss* — one of the ≥ 3 regions killed: every relayed peer
+  re-homes within 30 s and its added latency stays within P0's measured relay
+  penalty;
+  (c) *FDB node loss* — one node of the 3–5 killed: `leases_lost = 0`
+  throughout, commit availability restored and intent p99 back under 10 ms
+  within 60 s;
+  (d) *coordinator restart* — standby takeover ([09-services-and-ops.md](09-services-and-ops.md) §6):
+  zero manifest-driven disconnects among peers that never lost connectivity,
+  no island membership flap.
+- **Admission leg** (the herd P6 owns, [08-persistence.md](08-persistence.md)
+  §2.2.2): a scripted patch-day reopen delivers the full test population —
+  ≥ 2 000 sessions, the per-node comfortable envelope from
+  [14-capacity.md](14-capacity.md) §6.2, scaled by node count — to the queue
+  inside 60 s. The queue admits at its configured rate and lowers it under
+  pressure at least once during the run (the lever must be shown to move, not
+  merely exist). Within 5 minutes of the last admission, lease renewals are
+  measurably de-synchronized: over the 2.5 s heartbeat period, no 100 ms phase
+  bucket carries more than 2× the mean renewal rate. All D16 persistence
+  budgets hold throughout. **Failure:** any `leases_lost > 0`, sustained
+  intent p99 ≥ 10 ms, or a phase bucket above 2× mean persisting past the
+  5-minute mark. (A herd of 2 000 admitted in one second and never spread is
+  2 000 renewals in one 100 ms bucket every 2.5 s — 80× the mean — so the 2×
+  bound is a real test, not a formality.)
+
+The four new dials (5 min partition, 30 s re-home, 60 s recovery, 2× phase
+bound, queue rate) are **proposed defaults pending a D16 amendment** — a
+decision-to-be-made (§B5), not a made one.
+
+**Moves considered and rejected.** (1) *Admission control out to P7*:
+rejected — §2.2.2 assigns the synchronized case to P6 by name and forbids
+compensating inside the persistence path, launch-shaped herds arrive the day
+the doors open rather than after, and P7's population deployment *depends* on
+the queue existing (10k synthetic CCU cannot be pointed at a cluster with no
+front door). Epic [#108] already scopes it to P6. (2) *Archive + rollback out*:
+rejected — D20 made the tailer load-bearing ("a released record's history
+exists only where the tailer has put it"), P8's auditor full sweep and any
+post-P6 forensic claim need it, and epic [#107] owns it at P6. (3) *Terrain
+pipeline out*: rejected — the rollback demo exercises it; the one unproven
+number, the ≤ 100 KB compacted-shard bound, is checkable inside the existing
+rollback leg and should be asserted there. P6 stays large because it is
+genuinely large; the amendment makes it provable, not smaller.
+
+### P7 — Reference deployment at population *(proposed; near-certain)*
+
+This is the least speculative phase this document could add, because every
+number in it already exists: it is [09-services-and-ops.md](09-services-and-ops.md)
+§11's 10k-CCU worked example stood up and held, rather than modeled. P6
+finishes production ops *posture*; nothing in P0–P6 ever runs the multi-node
+persistence tier at its modeled load — [14-capacity.md](14-capacity.md) §9's
+answer to outgrowing one box is "add nodes, which is what the architecture is
+for," and that sentence has never been tested. P7 is where R-5's relay-tail
+model, R-7's hotspot exposure, R-8's cost model, and D26's sibling-gateway
+mechanics all meet a population instead of a paragraph.
+
+**Goal.** The §11 reference topology deployed and soaked: ~15 modest VMs — 3
+relay regions × 2 instances, coordinator active + standby, 4 persistd nodes,
+3–5 FDB nodes, 2 identity replicas, ~3 field-host VMs + warm pool — carrying a
+sustained 10k-CCU synthetic population at the shared capacity-table rates,
+with a real-NAT cohort (R-11's standing cohort, CGNAT included) embedded in
+it.
+
+**Crates.** No new crates (the D15 set is deliberately complete here). The
+load harness lineage (`p2-load`, `p1-swarm`) grows a population driver that
+speaks the full client stack; ops assets — deployment automation, dashboards,
+runbooks, the relay fleet — are the deliverable surface, per the P6 upstream
+milestone's open-sourced tooling.
+
+**Deliverables.**
+- The deployed topology above, reproducible from committed automation, with
+  the D12 telemetry pipeline live end to end.
+- Population load at the capacity table's rates: 40k hot entities, 100k diff
+  records/s cluster-wide ≈ 26 MB/s journal ingest — 25k appends/s per persistd
+  node at 4 nodes, which is 62.5% of the measured 40k-records/s single-box
+  knee ([14-capacity.md](14-capacity.md) §8) and the first time the §3.2
+  multi-node path carries it; 500 intents/s average with 5k/s scripted event
+  peaks (≈ 15k ed25519 verifies/s at K=3, ~1 core); ~500 islands at mean size
+  20.
+- R-5 measured at population: relayed-peer fraction and relayed-*bytes*
+  fraction against the 5–10% / ≤ 500 Mbps-per-region model, per NAT type,
+  from the embedded real-NAT cohort — the number the risk register has been
+  waiting on since P0.
+- R-8 measured: promoted-cell-hours and cost per promoted cell-hour recorded
+  continuously; the promotion threshold and demotion aggressiveness exercised
+  as live dials at least once each.
+- Witnessing armed in its P5 enforcement configuration throughout, banking
+  honest hours at three orders of magnitude past P4's gate: 10 000 CCU × 72 h
+  = **720 000 synthetic player-hours** with the false-positive count carried
+  beside coverage, exactly as the P4 ledger does.
+- D26 sibling-gateway live handover exercised under load as part of a rolling
+  gateway restart (also P8's rehearsal).
+
+**Demo criterion.** A 72-hour soak at 10 000 synthetic CCU on the reference
+topology, with the real-NAT cohort connected throughout and one scripted 5k/s
+intent peak and one 128-player crowd event per 24 h: every D16 budget holds
+for the whole soak (intent commit p99 < 10 ms, bulk ack p99 < 5 ms, journal
+commit < 2 ms, area first page-in < 50 ms); `leases_lost = 0`; FDB stays
+under 75% load (R-7's line); relayed-bytes fraction ≤ 10% with per-region
+relay egress ≤ 500 Mbps; per-peer uplink ≤ 1 Mbps and field-host egress
+≤ 35 Mbps during the crowd events; **zero false-positive discrepancy reports
+across all ~720 000 armed honest hours**; and the measured footprint stays
+within 2× the §11 worked example (≤ 30 VM-equivalents, ≤ 3 Gbps provisioned
+relay) — the cost clause is denominated in infrastructure units because
+pricing is a product decision, and converting it to currency is the owner's
+input at phase entry. **Failure:** any budget missed for a sustained window,
+any lease lost, any false positive, relay fraction over 10% without the R-5
+mitigation (rate-tiering or region add) being executed and re-measured
+*inside the phase*, or footprint over 2×. The soak becomes the permanent
+scale-regression harness, re-run per release at a compressed duration.
+
+**Upstream milestone.** Publish the population harness and the measured
+capacity envelope (the §11 table with measured columns beside the modeled
+ones); file iroh relay-fleet findings where the relayed-tail economics
+diverge from the published direct-path rates.
+
+### P8 — Live-universe change: patch, migrate, audit *(proposed; speculative in parameters, not in content)*
+
+Every deliverable here is an obligation the project has already written down
+and given no proving ground. [#223] (at-rest schema versioning) and [#224]
+(the economy-wide invariant auditor) are P5 deliverables owned by no epic;
+their *construction* stays P5 as the roadmap says, but their proof at
+operating conditions cannot happen before a live, populated, multi-version
+universe exists — and the auditor's **full-history sweep structurally cannot
+predate P6's archive tailer** at all, because D20 bounded the journal and
+released records exist only where the tailer put them (only the hot-ledger
+incremental can be live at P5 exit; see the finding in §B5). D21's three
+reopen conditions — a title needing rules it does not compile, a rules hotfix
+a rolling deploy cannot deliver, a `RETAINED_BUILDS` horizon too short because
+redeploys are too expensive — are all *live-patch* observations: nothing
+before this phase can tell the owner whether any of them fires. What is
+speculative is the parameters (sweep windows, detection targets, the planted
+leak's shape), and they are marked as proposed dials; the content is not.
+
+**Goal.** Change a running universe — rules, schema, and economy controls —
+with zero downtime, zero skew-caused strikes, and the auditor live before the
+enforcement ramp completes, on the P7 deployment (or a stated scale-down of
+it, with the scale factor recorded on the evidence).
+
+**Crates.** `orrery_persistd` (rolling deploy across the `RETAINED_BUILDS = 3`
+adjudication horizon; lazy migrations + background sweep against D21's frozen
+composition seams — a breaking seam change costs an ADR, so #223 must be
+designed against the freeze or argue to reopen it); `orrery_seed` (content
+diff/patch against the recorded content-version row, docs/12); the auditor as
+a journal-archive consumer — whether it is a workspace crate (a D15 amendment)
+or a standalone tool like `p2-dashboard` is a decision-to-be-made (§B5);
+`orrery_persist_client` (client-side ruleset-version handling during the
+window).
+
+**Deliverables.**
+- The rolling-deploy runbook, executed: two consecutive ruleset builds live
+  simultaneously inside the retention horizon, evidence bundles routed by
+  `RulesetId`, session continuity through D26 live handover on each gateway
+  restart.
+- #223 exercised end to end on live data: per-component versions in the bag,
+  lazy migration on checkpoint-load/area-read, the background sweep, and the
+  ≥ 2-adjacent-versions clause proven by reading a planted v_{n−1} row *after*
+  the sweep window (the clause most likely to be quietly dropped, per the
+  issue).
+- #224 live at its calibrated cadence — hourly incremental over hot `ledger/`
+  rows, daily full conservation sweep over the archive — with cadence
+  calibrated from measured archive scan cost, and demonstrably live **before**
+  the enforcement ramp reaches its last control — the constraint the
+  open-questions row states, which [D32](adr/0032-enforcement-ramp.md)
+  (Proposed) clause (g) now wires in as a hard gate; P8 is where that gate is
+  exercised on a live universe rather than asserted.
+- A D21 reopen-watch record: for each of the three reopen conditions, the
+  measured fact (hotfix latency achieved by the rolling deploy; redeploy cost;
+  retention-horizon pressure) and whether it fires.
+
+**Demo criterion.** On a populated universe (P7 topology or stated
+scale-down), one full change cycle: deploy ruleset v_{n+1} with a schema bump
+by rolling restart — no session drops for peers not on the restarting node,
+no player-visible stall beyond the 100 ms interpolation buffer, zero acked
+intents lost, **zero strikes attributable to version skew** (bundles older
+than retention resolve unadjudicable, never a strike — and inside the horizon
+the unadjudicable count from skew must be 0); the background migration sweep
+completes with FDB under 75% load and every D16 budget held, and a planted
+stale-version row still migrates lazily afterwards. Then the auditor arm: a
+conservation leak of known magnitude is planted (a disabled per-intent check
+in a test arm, leaking a fixed quantum per hour); the hourly incremental
+detects it within 2 sweep periods and the daily full sweep confirms magnitude
+within 26 h, with **zero false alarms across a 7-day clean control run**.
+**Failure:** any skew strike, any lost ack, a leak undetected past 2× its
+sweep period, a false alarm on the clean run, or a migration sweep that
+misses a budget. Detection targets are proposed defaults for the calibration
+the open-questions row asks for, not settled numbers.
+
+**Upstream milestone.** Publish the migration/versioning pattern (frozen-seam
+lazy migrations under link-time ruleset composition) as design notes with the
+D21 reopen-watch data — the honest public answer to "do you need WASM rules
+distribution," backed by measurement.
+
+### B3. The live-operations track (not a phase, deliberately)
+
+Starts at P7 entry, runs alongside, reports into the risk register. Triggers,
+not criteria — each of these is work that never exits:
+
+- **R-5, relay economics:** continuous relayed-fraction and per-region cost
+  telemetry against the 10% / 500 Mbps lines; the mitigation ladder
+  (rate-tiering, region add, steer-to-field-host) executed on trigger, first
+  proven inside P7's criterion.
+- **R-6, enforcement past quarantine:** the "provably zero FP over months"
+  bar is calendar time at population, not a demo; P7's 720k hours start the
+  clock, and the ramp record ([D32](adr/0032-enforcement-ramp.md), Proposed)
+  owns promotion evidence.
+- **R-8, field-host spend:** promoted-cell-hour cost against the owner's
+  budget once currency-denominated; the D17.5 convergence (fully-hot world =
+  client-server economics) is accepted by design, so this dial is watched,
+  never "fixed."
+- **R-2, bus factor:** the P3/P4 upstream milestones either land in-tree or
+  the vendored surface (aeronet fork, replicon fork, lightyear seam) becomes a
+  permanent maintenance cost; the tripwire stays the register's 60-day
+  inactivity trigger, and the plan-B seam (`orrery_predict` internals
+  replicon-direct) stays a documented fallback — building it speculatively is
+  not proposed.
+- **R-1/R-10, pin migrations:** re-pin at release boundaries per D14, priced
+  per release, forever.
+
+### B4. The horizon: open playtest and a real population
+
+Beyond P8 the next body of work is an open playtest — real players, real
+abuse, real account economics — and it is deliberately **not** phased here.
+Every tunable it would gate on is an input only a live population produces:
+the honest-player false-positive base rate across real hardware and real
+last-mile networks, actual relay-tail cost per relayed player, actual abuse
+patterns against the intent surface, and what an account should cost (D10
+says it costs something; D31 records that pricing it is a product decision).
+Writing demo criteria for those today would be inventing numbers this
+document has spent six phases refusing to invent. What can be said now is the
+entry condition: P7's soak green, P8's cycle green, the auditor live, and the
+enforcement ramp still at or below quarantine per R-6's plan B until the
+field data exists.
+
+### B5. Decisions this extension implies (to be made, not made here)
+
+No ADR numbers are claimed. In rough order of when they bite:
+
+1. **P4 exit:** what "across all three platforms" means in the 500-hour
+   criterion — pipeline-per-platform or cross-platform log exchange. The P4
+   section already records that its own wording does not settle this; P7's
+   armed-hours clause inherits whichever reading the owner fixes.
+2. **P6 entry:** accept or amend the two criterion legs in §B1, and the D16
+   amendment for their dials (5 min / 30 s / 60 s / 2× / queue rate).
+3. **P6 exit:** where the field-host *witness* mode lands. The P5 crate list
+   carries `orrery_field_host` "(witness-fallback mode only)" while D29's
+   consequences place field-host substance — and the fix for the
+   empty-region two-party-trade refusal — in P6; the hole is player-visible
+   and currently owned by a parenthesis (finding, below).
+4. **P7 entry:** the currency conversion of the cost clause, and whether
+   72 h / 10k CCU is the accepted operating point or the owner scales it.
+5. **P8 entry:** auditor packaging (D15 crate vs standalone tool), its
+   detection targets, and whether #223's migration design fits inside D21's
+   frozen seams or argues to reopen them.
+6. **Standing items:** the D27-deferred peer-visible draw-commitment message
+   and the VRF reconsideration (docs/07 names it future work) — both change
+   the trust story an open-playtest population is asked to accept, so they
+   should be decided before B4's horizon, in either direction.
+
+**Findings recorded, not fixed** (surfaced while writing this section):
+the roadmap's open-questions row requires the economy auditor "live before
+enforcement is fully on" with a P5-exit decision date, but D20's bounded
+journal means the *full-history* sweep cannot exist before P6's archive
+tailer — only the hot-ledger incremental can meet the P5 date, and the row
+does not say so; P6's criterion as written exercises neither the chaos suite
+nor admission control (addressed in §B1); and the P5/D29 placement of the
+field-host witness mode is contradictory as described in item 3.
+
+[#107]: https://github.com/baadc0de/orrery/issues/107
+[#108]: https://github.com/baadc0de/orrery/issues/108
+[#223]: https://github.com/baadc0de/orrery/issues/223
+[#224]: https://github.com/baadc0de/orrery/issues/224
 
 ---
 
