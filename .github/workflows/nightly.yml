@@ -34,32 +34,98 @@
 
 # ── Where these run ──────────────────────────────────────────────────────────
 #
-# Nightly fires on a schedule and on workflow_dispatch, never on a pull request,
-# so the fork-PR problem that constrains ci.yml does not exist here and the
-# self-hosted box is unconditionally safe to use.
+# Nightly fires on a schedule and on workflow_dispatch, never on a pull
+# request, so the fork-PR problem that constrains ci.yml does not exist here.
+# That is why a self-hosted runner was safe to name in this file at all, and it
+# stays true for the one job below that still names one.
 #
-# The two jobs that need a FoundationDB cluster stay on GitHub-hosted runners,
-# and the reason is now the accurate one. It is not `scripts/fdb-dev.sh`, which
-# takes its port and data directory from the environment
-# (`ORRERY_FDB_DEV_PORT`, `ORRERY_FDB_DEV_DIR`) and no longer stops anything by
-# port; and `scripts/p2-kill9-gate.sh` never called that harness in the first
-# place — it reads `ORRERY_FDB_CLUSTER_FILE` and nothing else. It is that
-# provisioning a throwaway cluster means `sudo dpkg -i` on the server package,
-# and the self-hosted runner is an unprivileged `ci` user with no sudo. The box
-# does run an `fdbserver`, and that is precisely the cluster these jobs must
-# not touch: it is a shared development database, and both of them write to
-# whatever cluster they are pointed at (docs/11-roadmap.md, C-8).
+# #179 triaged every job in this file by what it actually *needs*, rather than
+# moving them as a block, because the three answers want three different
+# machines and only one of them is `ubuntu-latest`.
 #
-# `p3-island` was pinned here for the same stated reason and never had one:
-# `scripts/p3-island-gate.sh` contains no FoundationDB reference at all, runs
-# persistd with `--allow-volatile-leases`, and binds every listener on
-# `127.0.0.1:0`. Nothing in it collides with anything, so it runs on the box.
+# ── A. Needs a device that passes D19's qualification ────────────────────────
 #
-# It failed its first run there, and the move is not why. The harness had gone
-# deaf to the gateway's control replies when `8fd8c22` put them on a reliable
-# stream, and the same failure — `only 0/50 claims answered`, eight peers each
-# reporting an unanswered hello — reproduces on a developer's shell with no CI
-# in sight. Fixed in `p3-island/src/wire.rs`; the job stays where it is.
+# `p2-kill9`, and nothing else. It is the only gate here carrying a
+# `journal_commit_ms` verdict against D16's 2 ms budget, and the only one with
+# a `fio` preflight (`scripts/p2-kill9-gate.sh`, `reduce_device_qualification`)
+# to decide whether that verdict may be issued at all. D19 took its reference
+# numbers on a `c4d-standard-32-lssd` local NVMe; D23 records that this
+# repository's box fails the same qualification outright at a bare `fdatasync`
+# p99 of 7.045 ms, and says plainly that the latency verdict there is the
+# device's rather than the code's.
+#
+# It already runs on `ubuntu-latest` — it was there before #179 and #179 did
+# not put it there — and a hosted runner will not qualify either, so #190's
+# preflight withholds the verdict and reports UNQUALIFIED. That is the designed
+# behaviour and not a regression, but it does mean D19's own numbers are not
+# falsifiable anywhere in this workflow today. **Fixing that is #176's
+# ephemeral-instance work, not this file's**, and nothing here should be read
+# as a claim that a hosted runner is an adequate home for this gate.
+#
+# ── B. Needs a live FoundationDB server, but no qualified device ─────────────
+#
+# `p3-siblings`, `p5-dupe-gauntlet` and `fdb-tests`. All three were already
+# hosted and stay hosted, and the reason is unchanged: provisioning a throwaway
+# cluster means `sudo dpkg -i` on the server package, which the box's
+# unprivileged `ci` user could not do, and the `fdbserver` the box *does* run
+# is a shared development database these gates must never be pointed at,
+# because each writes into whatever cluster it is given at fixed keys
+# (docs/11-roadmap.md, C-8). `.github/actions/foundationdb` installs the client
+# by default and a self-configuring single-node server on `server: "true"`, and
+# their green runs are the evidence that this works on `ubuntu-latest`. Their
+# budgets are handover and settle windows, not device latency, so category A's
+# problem is not theirs.
+#
+# Kept from the version of this note #185 corrected, because it is the accurate
+# form of a claim that was wrong for years: the reason is *not*
+# `scripts/fdb-dev.sh`, which takes its port and data directory from the
+# environment (`ORRERY_FDB_DEV_PORT`, `ORRERY_FDB_DEV_DIR`) and no longer stops
+# anything by port, and `scripts/p2-kill9-gate.sh` never called that harness in
+# the first place — it reads `ORRERY_FDB_CLUSTER_FILE` and nothing else.
+#
+# ── C. Needs neither ─────────────────────────────────────────────────────────
+#
+# `p1-swarm`, `p4-accumulate`, `p4-platform-ledger`, `determinism-soak` — and
+# these are what #179 moved to `ubuntu-latest`:
+#
+#   * `p1-swarm` and both `p4-*` jobs run the `p1-swarm` harness, a headless
+#     in-process simulation on a simulated clock. No socket, no cluster, no
+#     fixed port, and no wall-clock assertion — its peers are coupled by an
+#     in-process router, so a slower machine costs time and changes no verdict.
+#   * `determinism-soak` builds one deliberately dependency-light Bevy-free
+#     crate and runs it ten times, comparing digests to each other.
+#
+# What the box was buying them was a warm `target/` and a `kache` remote, i.e.
+# wall-clock, and each job's `timeout-minutes` below now carries the measured
+# hosted figure it was re-sized against rather than the box's.
+#
+# ── The exception, and why the box is still here ─────────────────────────────
+#
+# `p3-island` is in category C by every prerequisite and **still failed on
+# `ubuntu-latest`**, so it kept the box. The long note on that job has the
+# measurement; the short version is that its P3 criterion holds fine on a
+# hosted runner and the drain leg #168 added does not, for a reason no timeout
+# addresses. It is the only thing standing between #180 and deregistering
+# `orrery-hel1`.
+#
+# The historical note that belongs with `p3-island` and is not a runner
+# question: it failed its first run *on the box*, and the move there was not
+# why. The harness had gone deaf to the gateway's control replies when
+# `8fd8c22` put them on a reliable stream, and the same failure — `only 0/50
+# claims answered`, eight peers each reporting an unanswered hello —
+# reproduces on a developer's shell with no CI in sight. Fixed in
+# `p3-island/src/wire.rs`.
+#
+# ── The budget every hosted job here lives inside ────────────────────────────
+#
+# From #171: `ubuntu-latest` is a single 145 GB root filesystem with 87 GiB
+# free at job start, 4 vCPU and 15 GiB of RAM. **Larger runners are
+# unavailable to this repository** — `ubuntu-latest-4-core`, `-8-core` and
+# `-16-core` were each probed and never picked up a runner; they are an
+# organisation feature and this repository is user-owned. `ubuntu-24.04-arm`
+# has more disk but is out for category B, whose composite action fetches an
+# amd64 `.deb`. So there is no escalation path: a job that stops fitting is a
+# finding for #170, not a runner-size change.
 
 name: Nightly gates
 
@@ -81,25 +147,42 @@ env:
 jobs:
   p1-swarm:
     name: P1 swarm gate (32 peers, one simulated hour, clean + impaired + witnessed)
-    # Simulated hour, no cluster, no ports: 16 cores and a warm target/ turn this from tens of minutes into a few.
-    runs-on: [self-hosted, orrery-hel1]
-    env:
-      # Overrides the workflow-level clear: the box has a persistent build
-      # cache at /var/cache/kache/shared, shared with the dev checkout on the
-      # same machine.
-      RUSTC_WRAPPER: kache
-    # Three simulated hours take about fifteen minutes of wall clock — the hour
-    # is simulated, so it costs what it costs to compute. The witnessed leg is
-    # the expensive one at roughly ten of those minutes, because every peer
-    # re-executes its witness set's logs as well as its own. The build still
-    # accounts for a good share of the rest.
-    timeout-minutes: 45
+    # Simulated hour, no cluster, no ports, no shared state: the harness couples
+    # its 32 peers through an in-process router, so nothing in it contends with
+    # anything and it was never the box's to keep.
+    #
+    # Hosted since #179. Cold and cacheless on `ubuntu-latest`, peaking at
+    # **2.18 GiB** of disk growth with **84.04 GiB still free** — 38x headroom,
+    # so no disk-cleanup step and no larger runner (there is no larger runner;
+    # see the header).
+    runs-on: ubuntu-latest
+    # Three simulated hours plus a five-minute island, and the hour is
+    # simulated, so it costs what it costs to compute. The witnessed leg is the
+    # expensive one — every peer re-executes its witness set's logs as well as
+    # its own — and the cold build accounts for a good share of the rest.
+    #
+    # Re-sized from 45 to 75, and the reason is variance rather than the mean.
+    # Two cold samples on `ubuntu-latest` at the same tree came in at **1246 s**
+    # and **1970 s** (runs 32507043296 and 32503887628) against 1044 s on the
+    # box on 2026-08-21 — so the same work is 1.2x the box on a good runner and
+    # 1.9x on a bad one, a 58 % spread with nothing changed. At 45 minutes the
+    # slower sample would have had 1.37x headroom, which is thin enough that an
+    # ordinary bad draw reads as a gate failure; at 75 it has 2.3x.
+    #
+    # This is a raise for a runner that is measurably slower and measurably
+    # inconsistent, not a raise to absorb a hang. The distinction matters and it
+    # is checkable: this harness reads no clock and opens no socket, so its cost
+    # is a function of the tree. If it ever exceeds this bound, that is a real
+    # regression in the simulation's cost and not something to re-size again.
+    timeout-minutes: 75
     steps:
       - uses: actions/checkout@v7
       - name: Install the pinned toolchain
         run: rustup show active-toolchain || rustup toolchain install
+      # Unconditional since #179: there is one environment left in this job.
+      # The box had these pre-installed and its `ci` user had no sudo, which is
+      # what the guard was for.
       - name: Install Bevy's Linux build dependencies
-        if: runner.environment == 'github-hosted'
         run: |
           sudo apt-get update
           sudo apt-get install --no-install-recommends -y \
@@ -151,20 +234,45 @@ jobs:
     # The leg is a single-threaded simulation: measured at 99% of one core and
     # 108 MB RSS on the box, 9.26 s of CPU for 60 simulated seconds, so ~555 s
     # for the criterion's hour on a Zen 4 core (615 s is the figure measured with
-    # two other nightly jobs competing). A hosted runner is slower per core and
-    # pays a cold build of ~400 crates that the box does not, which is what the
-    # cache below is for. Bounded per platform rather than at one number, and all
-    # of them far under the 6-hour job ceiling. The repository is public, so
-    # hosted minutes — macOS included — are not billed.
+    # two other nightly jobs competing). Every leg is on a hosted runner as of
+    # #179, so every leg is slower per core than that and pays a cold build of
+    # ~400 crates on a cache miss, which is what the cache below is for.
+    # Bounded per platform rather than at one number, and all of them far under
+    # the 6-hour job ceiling. The repository is public, so hosted minutes —
+    # macOS included — are not billed.
+    #
+    # Nothing in the leg's verdict depends on the machine, which is what makes
+    # the move safe rather than merely affordable: the simulation runs on a
+    # simulated clock, and `started_at_unix_secs` — set only by
+    # `--stamp-wall-clock` — is deliberately held outside `RunIdentity` as "the
+    # one field that makes two runs of the same seed differ". The comparability
+    # probe below is the standing proof of that: it requires three platforms'
+    # reports to be byte-identical once `identity.target` is stripped.
     strategy:
       fail-fast: false
       matrix:
         include:
           - platform: linux
-            runs-on: [self-hosted, orrery-hel1]
+            # Hosted since #179. The shard name is untouched by that move and
+            # must stay untouched: the ledger chain is carried between nights
+            # by artifact name, and `run_key` is a hash of the report's
+            # `identity` (commit, seed, target triple) with nothing
+            # machine-specific in it — so a Linux hour banked on a hosted
+            # runner joins the same `x86_64-unknown-linux-gnu` group as every
+            # hour banked on the box, and de-duplicates against it.
+            runs-on: ubuntu-latest
             # The historical artifact name, kept: it *is* the Linux shard, and
             # renaming it would orphan every hour banked before this change.
             shard: p4-hour-ledger
+            # Kept at 45 rather than re-sized, and the measurement is why it is
+            # still the right number. Cold and cacheless on `ubuntu-latest`
+            # (run 32503887628): **1256 s** for the whole job — 365 s for the
+            # build plus the comparability probe, 878 s for the criterion's
+            # hour — against 663 s on the box on 2026-08-21 with a warm
+            # `target/` and kache. 1.9x slower, 2.15x headroom, and a bound
+            # this tight is worth keeping: this leg is a single-threaded
+            # simulation with a known cost, so an overrun is a hang and should
+            # fail rather than be absorbed.
             timeout: 45
           - platform: windows
             runs-on: windows-latest
@@ -182,12 +290,10 @@ jobs:
         # every step here is a POSIX shell script. `bash` on a Windows runner is
         # the Git Bash that ships with the image.
         shell: bash
-    env:
-      # Overrides the workflow-level clear on the box only, which has a
-      # persistent build cache at /var/cache/kache/shared. The hosted runners
-      # have none; pointing `RUSTC_WRAPPER` at a binary that is not installed
-      # fails every compile.
-      RUSTC_WRAPPER: ${{ matrix.platform == 'linux' && 'kache' || '' }}
+    # No per-job `env:` any more. It existed to put `RUSTC_WRAPPER: kache` back
+    # on the Linux leg only, because that leg ran on the box and the other two
+    # did not. All three legs are hosted now, none has kache installed, and the
+    # workflow-level clear is the whole of the answer.
     permissions:
       contents: read
       # The ledger is carried between nights as an artifact of this workflow,
@@ -208,11 +314,20 @@ jobs:
       - name: Install the pinned toolchain
         run: rustup show active-toolchain || rustup toolchain install
 
-      # The box keeps its target/ between runs and has kache; a cache
-      # round-trip there would cost more than it saves. The hosted legs would
-      # otherwise pay a cold build of the whole dependency graph every night.
+      # Every leg pays a cold build of the whole dependency graph without this.
+      # The guard was `runner.environment == 'github-hosted'`, excluding the
+      # Linux leg because it ran on a box with a persistent `target/` and
+      # kache; #179 moved that leg here, so the guard is vacuous and gone and
+      # the leg simply joins the scheme the other two already use, under its
+      # own per-platform key.
+      #
+      # `p1-swarm/target` stays in the path list, unlike the `ci.yml` lanes
+      # #178 moved, and the difference is size: that argument was about a
+      # 45.65 GiB workspace `target/` against a 10 GB repository-wide Actions
+      # cache allowance. This is one standalone workspace, and the two hosted
+      # legs have depended on it every night since the matrix landed —
+      # dropping it here would slow them down to make a symmetry point.
       - uses: actions/cache@v6
-        if: runner.environment == 'github-hosted'
         with:
           path: |
             ~/.cargo/registry/index
@@ -264,11 +379,16 @@ jobs:
       # things:
       #
       #   * A dedicated branch or an in-repo file needs `contents: write` on a
-      #     public repository whose nightly runs on a self-hosted machine shared
-      #     with a development checkout. That is a token that can rewrite the
-      #     repository, held by a job on a box three CI runners and a developer
-      #     already share. The ledger is not worth that, and an in-repo file
-      #     additionally means a commit every night and a five-way append race.
+      #     public repository. That is a token that can rewrite the repository,
+      #     handed to a nightly job so that a ledger of player-hours can grow;
+      #     the ledger is not worth it. An in-repo file additionally means a
+      #     commit every night and a five-way append race. (When this was
+      #     written the argument had a second half — the job ran on a box three
+      #     CI runners and a developer's own checkout shared, so the token was
+      #     also reachable from a machine nothing about the repository
+      #     controlled. #179 moved every leg onto ephemeral hosted runners and
+      #     that half is gone. The first half stands on its own and is why the
+      #     storage choice does not change with the runners.)
       #   * A release asset needs the same write scope, plus a release to hang
       #     it on.
       #   * An artifact needs `actions: read` and a download step, and nothing
@@ -372,7 +492,22 @@ jobs:
     # would swallow it.
     needs: p4-accumulate
     if: always()
-    runs-on: [self-hosted, orrery-hel1]
+    # Hosted since #179. This job compiles nothing and runs no harness: it
+    # downloads the three legs' artifacts and reduces them with `jq`, `diff`
+    # and `scripts/p4-ledger.sh`. It was on the box only because the box was
+    # the default here, and it is the cheapest of the five to move.
+    #
+    # It needs the checkout only for `scripts/p4-ledger.sh` itself: `total`
+    # groups on the `pipeline` digest each line already carries and never
+    # re-derives one, so the shallow checkout that cannot resolve a banked
+    # line's older commit is not a problem here. `append`, which does derive
+    # a digest, runs in the accumulation legs against their own `HEAD`.
+    runs-on: ubuntu-latest
+    # Untouched at 20 minutes: 15 s on the box on 2026-08-21 (run 32442955806),
+    # and **11 s** for a hosted replica of the download and both reduction steps
+    # against three probe artifacts (run 32507043296). 109x headroom. The bound
+    # exists so a wedged artifact download fails the job instead of hanging
+    # until the ceiling, and nothing about that changes with the runner.
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7
@@ -479,7 +614,52 @@ jobs:
     name: P3 island gate (kill -9, 8 peers)
     # No cluster and no fixed port: every listener in scripts/p3-island-gate.sh
     # binds 127.0.0.1:0 and persistd runs with --allow-volatile-leases, so this
-    # gate collides with nothing the box is already doing.
+    # gate needs nothing a runner does not already have.
+    #
+    # ── The one job #179 tried to move and could not ────────────────────────
+    #
+    # By prerequisite it belongs with `p1-swarm` and the `p4-*` jobs: no
+    # FoundationDB (the argument that pinned it here originally was `p2-kill9`'s
+    # and `p3-siblings`', never this gate's), no D19 device qualification, no
+    # journal — the volatile lease store writes none — and only three processes,
+    # one coordinator, one persistd and the harness. **It fails on
+    # `ubuntu-latest` anyway, and the failure is the drain leg #168 added.**
+    #
+    # Measured 2026-08-21 at `3b4aacec`, both legs, same tree both sides
+    # (run 32503887628 hosted, and by hand on the box):
+    #
+    #   leg     where    settled_in_ms  drain_quiesced_in_ms  drain_reassigned  verdict
+    #   weak    box       9931 / 12050   10996 / 11000          0 / 400 parked  PASSED
+    #   weak    hosted   10897 / 12050   10951 / 11000        378 / 589 parked  FAILED
+    #   strong  box      10078 / 12050   10994 / 11000          0 / 350 parked  PASSED
+    #   strong  hosted   10336 / 12050    1951 / 11000          0 /  50 parked  FAILED
+    #
+    # Read the columns separately, because they say different things. The P3
+    # *criterion* holds on a hosted runner: 50 victim entities reassigned across
+    # 7 successors on the weak leg and 50 parked on the strong one, 0 duplicate
+    # authority, nothing lost, and settle times inside the 12 050 ms budget on
+    # both. Nothing about the phase gate needs this box.
+    #
+    # The drain leg is what does not survive. It orders the gateway to divest
+    # and requires every lease held at the start to be *parked* at quiescence.
+    # On a 4-vCPU runner the peers leave the island at different enough rates
+    # that 378 of the weak leg's 400 leases find a live successor and are
+    # reassigned on the way out instead, and the strong leg observes 50 of an
+    # expected 350. That is a timing-shaped disagreement about what a drain is
+    # supposed to produce, not a slower version of the same answer, and there is
+    # no timeout that fixes it.
+    #
+    # Worth recording beside it: `drain_quiesced_in_ms` is 10 996 ms against an
+    # 11 000 ms budget *on the box*. Four milliseconds. This leg is marginal on
+    # the hardware it was written on, which is its own finding and #170's to
+    # take — a gate with 0.04 % of headroom is measuring the machine.
+    #
+    # So this job keeps the box, and it is the reason #180 cannot deregister
+    # `orrery-hel1` yet. What would let it move: the drain leg becoming
+    # insensitive to peer-departure ordering (a code question, not a CI one), or
+    # an ephemeral instance per run under #176 — which the triage in the header
+    # notes this job does *not* otherwise need, since it wants cores and not a
+    # qualified device.
     runs-on: [self-hosted, orrery-hel1]
     env:
       # Overrides the workflow-level clear: the box has a persistent build
@@ -488,6 +668,7 @@ jobs:
       RUSTC_WRAPPER: kache
     # The harness runs a 30 s island plus setup and teardown; the build
     # dominates. Bounded so a hung peer fails rather than burning the job limit.
+    # 174 s on the box on 2026-08-21 (run 32442955806).
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7
@@ -568,9 +749,12 @@ jobs:
     # Hosted, and for the same reason `p2-kill9` is: this gate seeds a durable
     # world and activates two shard sets against the fence, so it consumes its
     # cluster. Provisioning a throwaway one means `sudo dpkg -i` on the server
-    # package, which the self-hosted box's unprivileged `ci` user cannot do —
-    # and the cluster that box *does* run is the shared development database
-    # this gate must never be pointed at.
+    # package, which the box's unprivileged `ci` user could not do — and the
+    # cluster that box *did* run is a shared development database this gate
+    # must never be pointed at. #179 moved the rest of this file here too, so
+    # "hosted" is now the default rather than this job's exception; the
+    # cluster argument is still the reason it could never have been anywhere
+    # else.
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
@@ -629,8 +813,10 @@ jobs:
   p5-dupe-gauntlet:
     name: P5 dupe gauntlet (replay, attestation abuse, quarantine)
     # The gate writes fixed ledger ids and reads the receipt range back, so it
-    # needs the hosted runner's throwaway cluster and must never use the
-    # self-hosted box's shared development database.
+    # needs a throwaway cluster of its own — the one the composite action
+    # provisions on this runner and discards with it — and must never be
+    # pointed at a shared development database such as the `fdbserver` on
+    # `orrery-hel1-1`.
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
@@ -739,13 +925,21 @@ jobs:
 
   determinism-soak:
     name: determinism soak (extended corpus)
-    # Ten corpus repeats in one process. Bevy-free and cheap, but it still paid a cold build every night.
-    runs-on: [self-hosted, orrery-hel1]
-    env:
-      # Overrides the workflow-level clear: the box has a persistent build
-      # cache at /var/cache/kache/shared, shared with the dev checkout on the
-      # same machine.
-      RUSTC_WRAPPER: kache
+    # Ten corpus repeats in one process, against one Bevy-free crate whose
+    # dependency list is deliberately tiny (`orrery_conformance` takes no
+    # tokio, no OS services and no clock, so that it builds identically on
+    # every target in the determinism matrix). That is why it is the cheapest
+    # job in this file and the one the box bought the least for.
+    #
+    # Hosted since #179, and the cheapest move in the file: the whole job took
+    # **44 s** cold and cacheless on `ubuntu-latest` (30 s of it the build and
+    # the ten repeats together), against 18 s on the box with a warm `target/`
+    # and kache. 26 seconds is the entire price of not owning a machine.
+    runs-on: ubuntu-latest
+    # Untouched at 30 minutes: 41x the measured wall-clock. The bound is here
+    # so a per-process nondeterminism that manifests as a hang fails the job
+    # rather than burning the ceiling, and it does not need re-sizing for a
+    # 44 s job.
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
