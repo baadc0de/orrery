@@ -361,10 +361,20 @@ pub const WITNESS_QUORUM_K: usize = 3;
 /// D10 item 4 excludes parties "matched on **accounts and every NodeId bound
 /// to them**". The only party this function can see is the issuer's NodeId,
 /// and it does not pretend otherwise: the account↔NodeId binding lives in
-/// `orrery_identity` and is not reachable from an [`Intent`], which is why
-/// D28 clause (e) records account-level party exclusion as *approximated* and
-/// places its enforceable half at selection time, inside the coordinator that
-/// does hold the bindings.
+/// `orrery_identity` and is not reachable from an [`Intent`].
+///
+/// This is therefore the **first** of two filters, not the whole of `E(I)`.
+/// The gateway composes an account-level pass on top of this one, resolving
+/// each surviving candidate through D31 clause (e)'s `owner(n)` and dropping
+/// every NodeId bound to a party account — and, per D31 clause (f), every
+/// NodeId whose binding does not resolve at all. The signature stays as it is
+/// because the composition belongs where the resolver is; a `NodeId`-only
+/// function with a published test vector should not grow an authority
+/// parameter to express that.
+///
+/// The coordinator's selection-time half remains *approximated* (D28
+/// clause (e)): a NodeId bound to the same account but connected to a
+/// different coordinator is not deduped out of the candidate pool.
 ///
 /// # Why announced order is preserved
 ///

@@ -131,6 +131,14 @@ pub struct FdbIntentExecutor {
     /// row at all — an executor that recorded an eligible vector nobody
     /// enforced would be banking evidence about a check that did not happen.
     witness_epochs: Option<Arc<crate::witness_epoch::WitnessEpochAuthority>>,
+    /// The `owner(n)` resolver `E(I)` is derived through when the recorded
+    /// vector is written (D31 clause (e)).
+    ///
+    /// Set and cleared together with [`Self::witness_epochs`], because a
+    /// recorded vector derived through a *different* resolver from the one
+    /// admission used is a recorded vector the audit cannot read as evidence
+    /// of the decision that was actually made.
+    witness_bindings: Option<crate::gateway::SharedBindingAuthority>,
 }
 
 /// The active shard ownership an intent executor is allowed to write under.
@@ -191,6 +199,7 @@ impl FdbIntentExecutor {
             fence: std::sync::RwLock::new(None),
             allocator: Arc::new(tokio::sync::Mutex::new(PersistIdAllocator::default())),
             witness_epochs: None,
+            witness_bindings: None,
         }
     }
 
@@ -209,6 +218,7 @@ impl FdbIntentExecutor {
             fence: std::sync::RwLock::new(Some(fence)),
             allocator: Arc::new(tokio::sync::Mutex::new(PersistIdAllocator::default())),
             witness_epochs: None,
+            witness_bindings: None,
         }
     }
 
@@ -223,20 +233,41 @@ impl FdbIntentExecutor {
         Ok(Self::from_context(&context, grid))
     }
 
-    /// Record this executor's committed intents against `epochs`.
+    /// Record this executor's committed intents against `epochs`, deriving
+    /// the recorded eligible vector through `bindings`.
     ///
-    /// Wire the **same** cache the gateway's validator enforces against. The
-    /// two are not independent: admission draws the required subset from a
-    /// cache entry, and this executor writes the draw commitment that entry
-    /// carries. A second, differently-seeded cache here would publish a
-    /// commitment to a key no admission decision was ever made under, which is
-    /// the one way this scheme can be broken from the inside.
+    /// Wire the **same** cache and the **same** resolver the gateway's
+    /// validator enforces against. The two are not independent: admission
+    /// draws the required subset from a cache entry, and this executor writes
+    /// the draw commitment that entry carries. A second, differently-seeded
+    /// cache here would publish a commitment to a key no admission decision
+    /// was ever made under, which is the one way this scheme can be broken
+    /// from the inside.
+    ///
+    /// # Why the resolver is now the second half of the same argument
+    ///
+    /// `E(I)` used to be a pure function of the announced set and the issuer,
+    /// which is why this executor re-derived it instead of threading a vector
+    /// through [`super::IntentExecutor::execute`]. With D10 item 4's account
+    /// half enforced it is **not** pure any more: it depends on `owner(n)`,
+    /// which is a live view. Re-deriving it through a different resolver would
+    /// let the recorded vector and the admitted one disagree by construction,
+    /// so the two sides share one authority instead.
+    ///
+    /// They can still disagree by *time* — a binding that moved between
+    /// admission and commit — and that residual is D31 clause (h)'s and is
+    /// bounded by `T_stale`: "a mismatch inside `T_stale` is not evidence of
+    /// anything, and a mismatch outside `T_stale` is". Collapsing it to zero
+    /// means recording the binding view alongside the vector, which is that
+    /// record's Open question 1 and not this executor's to answer.
     #[must_use]
     pub fn recording_epochs(
         mut self,
         epochs: Arc<crate::witness_epoch::WitnessEpochAuthority>,
+        bindings: crate::gateway::SharedBindingAuthority,
     ) -> Self {
         self.witness_epochs = Some(epochs);
+        self.witness_bindings = Some(bindings);
         self
     }
 
@@ -467,6 +498,7 @@ impl FdbIntentExecutor {
         // overall attempt merely leaves a permanent, harmless gap.
         let minted = self.allocate_ids(intent.ops.len() as u64).await?;
         let epochs = self.witness_epochs.clone();
+        let bindings = self.witness_bindings.clone();
         // Set by the closure only on an attempt that wrote or verified the
         // `epoch/` row. It is **not** the same question as "did this intent
         // commit": the idempotency replay path below returns a recorded
@@ -501,6 +533,7 @@ impl FdbIntentExecutor {
                 let minted = minted.clone();
                 let fence = fence.clone();
                 let epochs = epochs.clone();
+                let bindings = bindings.clone();
                 let epoch_row_seen = std::sync::Arc::clone(&epoch_row_seen);
                 let named = named.clone();
                 let hooks = std::sync::Arc::clone(&hooks);
@@ -680,7 +713,14 @@ impl FdbIntentExecutor {
                     // closure decided it wanted it — the exact trap
                     // `PlannedWrite`'s doc names. Deciding before writing is
                     // what keeps a refused intent from banking its effects.
-                    match record_witness_epoch(&trx, epochs.as_deref(), &intent).await? {
+                    match record_witness_epoch(
+                        &trx,
+                        epochs.as_deref(),
+                        bindings.as_deref(),
+                        &intent,
+                    )
+                    .await?
+                    {
                         EpochRecord::Refused(reason) => {
                             hooks.mark_closure_end();
                             return Ok(IntentOutcome::Rejected { reason });
@@ -837,6 +877,7 @@ enum EpochRecord {
 async fn record_witness_epoch(
     trx: &foundationdb::Transaction,
     epochs: Option<&crate::witness_epoch::WitnessEpochAuthority>,
+    bindings: Option<&dyn crate::gateway::BindingAuthority>,
     intent: &Intent,
 ) -> Result<EpochRecord, FdbBindingError> {
     // No cache is the enforcement-off build, and an unresolvable handle is an
@@ -851,12 +892,30 @@ async fn record_witness_epoch(
 
     // D27 clause (f) item 5, derived once and used for both the durable
     // re-derivation below and the recorded vector. It is derived here rather
-    // than carried from admission because it is a pure function of the
-    // announced set and the issuer, and both sides read the same cache entry —
-    // so a second derivation cannot disagree with the first, and threading a
-    // vector through the executor seam would have widened
-    // `IntentExecutor::execute` for no added fact.
-    let eligible = orrery_protocol::eligible_witnesses(&epoch.snapshot.selected, intent.issuer);
+    // than carried from admission because both sides read the same cache entry
+    // *and* the same `owner(n)` resolver — see `recording_epochs`, which is
+    // where the pairing is argued and where the residual (a binding that moved
+    // between admission and commit, bounded by D31 clause (h)'s `T_stale`) is
+    // named. Threading a vector through the executor seam would have widened
+    // `IntentExecutor::execute`, which is implemented outside this crate.
+    //
+    // A resolver is *required* once epochs are: `recording_epochs` takes both,
+    // so `None` here is only reachable through a hand-built executor. It is
+    // read as D31 clause (f) reads every miss — nothing resolves, so nothing
+    // is eligible — rather than as "skip the account half", because a recorded
+    // vector wider than the admitted one is the audit going quietly wrong in
+    // the direction that convicts nobody.
+    static UNBOUND: crate::gateway::UnboundBindingAuthority =
+        crate::gateway::UnboundBindingAuthority;
+    let bindings = bindings.unwrap_or(&UNBOUND);
+    // The issuer's account through the resolver rather than a session context,
+    // which the executor seam does not carry. For both ops this cluster
+    // interprets the ops themselves already name it, so the two derivations
+    // agree wherever "party" means anything — `super::party_accounts` writes
+    // that argument out.
+    let parties = super::party_accounts(intent, bindings.owner(&intent.issuer));
+    let eligible =
+        super::eligible_after_party_exclusion(&epoch.snapshot.selected, intent, &parties, bindings);
 
     let handle_key = keyspace::epoch_handle_key(intent.cell_epoch.0);
     let row_key = keyspace::epoch_key(

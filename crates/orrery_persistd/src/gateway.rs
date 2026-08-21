@@ -879,6 +879,97 @@ impl InterestAuthority for SnapshotInterestAuthority {
     }
 }
 
+/// Answers `owner(n)`: which account a `NodeId` is currently bound to.
+///
+/// [D31](../../../../docs/adr/0031-id-account-subspace.md) clause (e)'s
+/// resolver, expressed as the seam the admission path calls. The clause
+/// specifies three tiers — (1) a verified session token on a live connection,
+/// (2) a bounded in-process binding cache, (3) a `db ‖ node` point read — and
+/// the two properties that matter here are properties of *this signature*
+/// rather than of any tier: it is **synchronous** and it **never blocks**. A
+/// tier-3 miss enqueues an asynchronous fill and answers `None` in the same
+/// instant, because D16 budgets an intent commit at p99 < 10 ms and #147's
+/// acceptance pinned "no FDB read on the admission path".
+///
+/// # What `None` means, and why it is not "not a party"
+///
+/// `None` is *unresolved*, never *resolved to nobody*, and D31 clause (f)
+/// gives it exactly one reading: **a miss excludes**. The caller treats an
+/// unresolvable `NodeId` as if it were a party to the intent and drops it from
+/// `E(I)`. That is not caution for its own sake — the attacker chooses whether
+/// a lookup misses (bind a second NodeId to your own account, then simply do
+/// not connect it here), so a predicate whose unknown branch the attacker
+/// selects must not have "admit" on that branch.
+///
+/// # Which tiers exist in this tree
+///
+/// None of them yet. `orrery_identity` is the sole writer of the `d` rows
+/// (D31 clause (d)) and is not built, so [`UnboundBindingAuthority`] — which
+/// resolves nothing — is the honest default, in the same way
+/// [`DenyAllInterestAuthority`] was the honest default before coordinator
+/// grants arrived. This trait is where the tiers attach when they land.
+pub trait BindingAuthority: Send + Sync {
+    /// The account `node` is bound to right now, or `None` if this gateway
+    /// cannot establish one without blocking.
+    ///
+    /// **Current bindings only** (D31 clause (g)): a NodeId that has been
+    /// unbound resolves to `None` and is therefore excluded, which is what
+    /// makes shedding a NodeId just before submitting buy an attacker nothing.
+    #[must_use]
+    fn owner(&self, node: &NodeId) -> Option<AccountId>;
+}
+
+/// Shared account-binding authority injected into a validator.
+pub type SharedBindingAuthority = Arc<dyn BindingAuthority>;
+
+/// The default binding authority until `orrery_identity` exists: nothing
+/// resolves.
+///
+/// Read together with D31 clause (f) this is the strictest possible
+/// configuration rather than an inert one — every announced candidate misses,
+/// so every candidate is excluded, `|E(I)|` is zero, and an enforcing gateway
+/// answers [`crate::intent::RejectionCause::LowPopulationEpoch`], which is
+/// D29's provisional path and not a refusal. That is the intended shape of the
+/// interim: a gateway that cannot resolve bindings does not get to judge
+/// intents, and it does not get to lose them either.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct UnboundBindingAuthority;
+
+impl BindingAuthority for UnboundBindingAuthority {
+    fn owner(&self, _node: &NodeId) -> Option<AccountId> {
+        None
+    }
+}
+
+/// A fixed `NodeId → AccountId` table, for deterministic tests and for
+/// harnesses that already know their own bindings.
+///
+/// The counterpart of [`SnapshotInterestAuthority`], and the same caveat
+/// applies: it is a table somebody typed, not a durable read, so it proves the
+/// *predicate* and never the storage.
+#[derive(Debug, Default, Clone)]
+pub struct SnapshotBindingAuthority {
+    bindings: HashMap<NodeId, AccountId>,
+}
+
+impl SnapshotBindingAuthority {
+    /// Build an authority from `(node, account)` pairs. A repeated `node`
+    /// keeps the last account given, because a NodeId binds to at most one
+    /// account at a time (D31 clause (b)).
+    #[must_use]
+    pub fn from_bindings(bindings: impl IntoIterator<Item = (NodeId, AccountId)>) -> Self {
+        Self {
+            bindings: bindings.into_iter().collect(),
+        }
+    }
+}
+
+impl BindingAuthority for SnapshotBindingAuthority {
+    fn owner(&self, node: &NodeId) -> Option<AccountId> {
+        self.bindings.get(node).copied()
+    }
+}
+
 /// One candidate for inheriting a lease whose holder was lost (D7 §5).
 ///
 /// Candidacy is deliberately narrow: a peer qualifies only when the
