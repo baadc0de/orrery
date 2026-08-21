@@ -67,6 +67,7 @@ use crate::fence::{FenceRow, FenceStatus};
 use crate::keyspace;
 use crate::FdbContext;
 
+use super::provisional::{self, ProvisionalStore};
 use super::stages;
 use super::{
     IntentError, IntentExecutor, IntentPlan, ItemTransferArgs, OpsVerdict, PlannedWrite,
@@ -425,6 +426,34 @@ async fn require_intent_fence(
 #[async_trait::async_trait]
 impl IntentExecutor for FdbIntentExecutor {
     async fn execute(&self, intent: &Intent) -> Result<IntentOutcome, IntentError> {
+        self.run(intent, None).await
+    }
+
+    async fn execute_provisional(
+        &self,
+        intent: &Intent,
+        account: AccountId,
+    ) -> Result<IntentOutcome, IntentError> {
+        self.run(intent, Some(account)).await
+    }
+}
+
+impl FdbIntentExecutor {
+    /// §7's transaction, with D29's low-population path folded into it.
+    ///
+    /// `provisional` is `Some(account)` for a commit admitted to D29's
+    /// low-population path. The reads, the checks and the ledger writes are
+    /// identical either way — a provisional commit is a real commit, and the
+    /// reply after `db.run` resolves is an RPO-0 statement exactly as
+    /// `Committed` is. Three things differ, and all three are recorded rather
+    /// than applied differently: the finality on the `intent/` row, the
+    /// deadline beside it, and a hold in `provisional/{account}` naming every
+    /// balance this intent wrote.
+    async fn run(
+        &self,
+        intent: &Intent,
+        provisional: Option<AccountId>,
+    ) -> Result<IntentOutcome, IntentError> {
         let intent_handle = intent.cell_epoch.0;
         let intent = intent.clone();
         let grid = self.grid;
@@ -447,6 +476,10 @@ impl IntentExecutor for FdbIntentExecutor {
         // undurable while intents commit under the epoch, which is exactly the
         // ordering rule D27 clause (d) exists to enforce.
         let epoch_row_seen = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // Derived once, outside the retry loop: it is a pure function of the
+        // intent's ops and re-deriving it per attempt would be work the
+        // conflict did not ask for.
+        let named = provisional::named_balances(&intent);
         // `db.run` is the retry loop (§7: "retry loop is db.run's"). We bound
         // the `not_committed` retries with an interior-mutable attempt counter:
         // past the limit the closure returns `ContentionExhausted` as a custom
@@ -469,6 +502,7 @@ impl IntentExecutor for FdbIntentExecutor {
                 let fence = fence.clone();
                 let epochs = epochs.clone();
                 let epoch_row_seen = std::sync::Arc::clone(&epoch_row_seen);
+                let named = named.clone();
                 let hooks = std::sync::Arc::clone(&hooks);
                 let attempt = attempts.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
                 async move {
@@ -503,6 +537,20 @@ impl IntentExecutor for FdbIntentExecutor {
                         let row: keyspace::IntentRow =
                             postcard::from_bytes(&prev).map_err(store_err("intent row decode"))?;
                         hooks.mark_closure_end();
+                        // D29 clause 8. An annulled intent is the one replay
+                        // that does not return its recorded outcome, because
+                        // its recorded outcome is no longer true: the effects
+                        // were reversed by a forward-written inverse. The row
+                        // is still here — clause 9(c)'s GC interlock keeps it
+                        // here, restamped from the annulment — so the replay
+                        // applies nothing and is told what happened rather
+                        // than being handed a `Committed` for value that is
+                        // gone.
+                        if row.finality == keyspace::IntentFinality::Annulled {
+                            return Ok(IntentOutcome::Rejected {
+                                reason: orrery_protocol::REASON_INTENT_ANNULLED,
+                            });
+                        }
                         return Ok(row.outcome);
                     }
 
@@ -518,6 +566,63 @@ impl IntentExecutor for FdbIntentExecutor {
                     if let Some(fence) = &fence {
                         require_intent_fence(&trx, grid, fence).await?;
                     }
+
+                    // D29 clause 4, and the reason it is *here* rather than
+                    // at admission: the quarantine is a fact about a durable
+                    // row, and D11 keeps the serializable transaction the sole
+                    // authority over those. An admission-time cache would be a
+                    // second answer to a question this read answers exactly.
+                    //
+                    // **The cost, stated.** One point read per distinct
+                    // account the intent names a balance for — at most two for
+                    // the reference trade, and *zero* for an intent of nothing
+                    // but `Ruleset`-opaque ops, which is what every existing
+                    // load harness in this repository submits. The read
+                    // registers a conflict range on `provisional/{account}`,
+                    // so an intent spending an account's balance and a
+                    // provisional commit into that same account are ordered by
+                    // the resolver rather than racing. That is the correct
+                    // ordering and it is not free: two intents naming one
+                    // account's balances now conflict where previously only
+                    // their item rows did.
+                    let mut holds = std::collections::HashMap::new();
+                    for (account, asset) in &named {
+                        let row = match holds.entry(*account) {
+                            std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+                            std::collections::hash_map::Entry::Vacant(e) => {
+                                e.insert(read_provisional_row(&trx, *account).await?)
+                            }
+                        };
+                        if row.holds_balance(*account, *asset).is_some() {
+                            hooks.mark_closure_end();
+                            return Ok(IntentOutcome::Rejected {
+                                reason: orrery_protocol::REASON_PROVISIONAL_INPUT,
+                            });
+                        }
+                    }
+
+                    // D29 clause 9(b): the per-account outstanding cap, read
+                    // in the same transaction that will extend it. An intent
+                    // of purely opaque ops names no balance, so the row may
+                    // not have been read above; reading it here is what makes
+                    // the cap cover every provisional intent rather than only
+                    // the ones that move currency.
+                    let submitter_row = match provisional {
+                        None => None,
+                        Some(account) => {
+                            let row = match holds.remove(&account) {
+                                Some(row) => row,
+                                None => read_provisional_row(&trx, account).await?,
+                            };
+                            if row.holds.len() >= orrery_protocol::PROVISIONAL_OUTSTANDING_CAP {
+                                hooks.mark_closure_end();
+                                return Ok(IntentOutcome::Rejected {
+                                    reason: orrery_protocol::REASON_PROVISIONAL_CAP,
+                                });
+                            }
+                            Some((account, row))
+                        }
+                    };
 
                     // Step 1: reads register conflict ranges. The tick is
                     // derived from the transaction's read version — a
@@ -589,11 +694,57 @@ impl IntentExecutor for FdbIntentExecutor {
                     // Step 3: apply the ops' ledger effects (see `apply_plan`).
                     apply_plan(&trx, &plan, &intent)?;
 
-                    // Step 4 (§7 step 3): the outcome row, same transaction.
-                    let outcome = IntentOutcome::Committed { tick, minted };
+                    // Step 4 (§7 step 3): the outcome row, same transaction —
+                    // and, on the low-population path, the hold row beside it.
+                    // Both in this transaction, because a provisional commit
+                    // whose hold did not land would be quarantined value that
+                    // nothing quarantines.
+                    let (outcome, finality, finalize_by_ms) = match submitter_row {
+                        None => (
+                            IntentOutcome::Committed { tick, minted },
+                            keyspace::IntentFinality::Final,
+                            0,
+                        ),
+                        Some((account, mut row)) => {
+                            let committed_ms = now_ms();
+                            let finalize_by = provisional::finalize_by(committed_ms);
+                            row.holds.push(keyspace::ProvisionalHold {
+                                intent_id: intent.intent_id,
+                                account,
+                                writes: provisional::provisional_writes(plan.writes()),
+                                committed_ms,
+                                finalize_by_ms: finalize_by,
+                                // Present by construction: admission refuses a
+                                // provisional intent that carries no
+                                // commitment, because one that did could never
+                                // be finalized and would only expire.
+                                commitment: intent.evidence.ok_or_else(|| {
+                                    FdbBindingError::new_custom_error(Box::new(IntentError::Store(
+                                        "provisional intent reached the executor with no evidence commitment"
+                                            .to_owned(),
+                                    )))
+                                })?,
+                                subject: intent.issuer,
+                            });
+                            let encoded = postcard::to_stdvec(&row)
+                                .map_err(store_err("provisional row encode"))?;
+                            trx.set(&keyspace::provisional_key(account), &encoded);
+                            (
+                                IntentOutcome::Provisional {
+                                    tick,
+                                    minted,
+                                    finalize_by,
+                                },
+                                keyspace::IntentFinality::Provisional,
+                                finalize_by,
+                            )
+                        }
+                    };
                     let row = keyspace::IntentRow {
                         outcome: outcome.clone(),
                         gc_deadline_ms: now_ms() + INTENT_ROW_RETENTION_MS,
+                        finality,
+                        finalize_by_ms,
                     };
                     let encoded =
                         postcard::to_stdvec(&row).map_err(store_err("intent row encode"))?;
@@ -626,8 +777,10 @@ impl IntentExecutor for FdbIntentExecutor {
                 // enough — the replay path returns it without touching the row
                 // — and the flag alone is not enough, because an attempt can
                 // record and then lose its commit to a conflict.
-                if matches!(outcome, IntentOutcome::Committed { .. })
-                    && epoch_row_seen.load(std::sync::atomic::Ordering::Relaxed)
+                if matches!(
+                    outcome,
+                    IntentOutcome::Committed { .. } | IntentOutcome::Provisional { .. }
+                ) && epoch_row_seen.load(std::sync::atomic::Ordering::Relaxed)
                 {
                     if let Some(epochs) = self.witness_epochs.as_ref() {
                         if let Some(epoch) = epochs.resolve(intent_handle) {
@@ -1060,6 +1213,211 @@ fn apply_plan(
     Ok(())
 }
 
+/// Read and decode `provisional/{account}` inside `trx`; an absent row is an
+/// account with nothing outstanding.
+///
+/// **Not a snapshot read.** The conflict range this registers is the point:
+/// clause 4's quarantine has to hold against a provisional commit landing
+/// concurrently, and a snapshot read would let an intent observe an empty hold
+/// set a microsecond before the commit that fills it.
+async fn read_provisional_row(
+    trx: &foundationdb::Transaction,
+    account: AccountId,
+) -> Result<keyspace::ProvisionalRow, FdbBindingError> {
+    let key = keyspace::provisional_key(account);
+    let Some(value) = trx.get(&key, false).await? else {
+        return Ok(keyspace::ProvisionalRow::default());
+    };
+    postcard::from_bytes(&value).map_err(store_err("provisional row decode"))
+}
+
+/// D29 clauses 7 and 8 against FoundationDB.
+///
+/// Each method is one serializable transaction. [`Self::annul`] being one
+/// transaction is the load-bearing part and the thing only this tier can
+/// prove: the inverse writes, the finality flip, the restamped GC deadline,
+/// the compensating receipt and the hold release either all become durable or
+/// none of them do. An annulment that lost half of itself to a crash would
+/// leave a row saying `Annulled` over ledger effects that were never reversed,
+/// which is worse than either outcome it sits between.
+#[async_trait::async_trait]
+impl ProvisionalStore for FdbIntentExecutor {
+    async fn outstanding(&self) -> Result<Vec<keyspace::ProvisionalHold>, IntentError> {
+        let result: Result<Vec<keyspace::ProvisionalHold>, FdbBindingError> = self
+            .db
+            .run(|trx, _maybe_committed| async move {
+                // One range read over a family that is **empty in the steady
+                // state**: a row exists only while an account has unfinalized
+                // provisional work, and `release_hold`'s FDB counterpart
+                // clears the row rather than leaving a zero-length one. So the
+                // sweep costs one operation proportional to outstanding work,
+                // not to history — which is what makes running it at a
+                // sampling rate of 1 affordable.
+                let mut holds = Vec::new();
+                let start = keyspace::provisional_range_start();
+                let end = keyspace::provisional_range_end();
+                let mut stream = trx.get_ranges_keyvalues(
+                    foundationdb::RangeOption {
+                        begin: foundationdb::KeySelector::first_greater_or_equal(start.as_slice()),
+                        end: foundationdb::KeySelector::first_greater_or_equal(end.as_slice()),
+                        ..foundationdb::RangeOption::default()
+                    },
+                    false,
+                );
+                while let Some(kv) = stream.try_next().await? {
+                    let row: keyspace::ProvisionalRow = postcard::from_bytes(kv.value())
+                        .map_err(store_err("provisional row decode"))?;
+                    holds.extend(row.holds);
+                }
+                Ok(holds)
+            })
+            .await;
+        let mut holds = result.map_err(unwrap_binding_error)?;
+        // Oldest first (D29 clause 7), with `intent_id` breaking ties so two
+        // intents committed in the same millisecond sweep in a defined order.
+        holds.sort_by_key(|hold| (hold.committed_ms, hold.intent_id));
+        Ok(holds)
+    }
+
+    async fn finalize(&self, hold: &keyspace::ProvisionalHold) -> Result<(), IntentError> {
+        let hold = hold.clone();
+        let result: Result<(), FdbBindingError> = self
+            .db
+            .run(|trx, _maybe_committed| {
+                let hold = hold.clone();
+                async move {
+                    let ikey = keyspace::intent_key(hold.intent_id);
+                    let Some(value) = trx.get(&ikey, false).await? else {
+                        // The row is gone. Under clause 9(c) that cannot
+                        // happen to a provisional row — it is not sweepable
+                        // while unresolved — so this is a torn state rather
+                        // than a race, and the honest response is to release
+                        // the hold and stop rather than to write a finality
+                        // onto a row that is not there.
+                        release_hold(&trx, &hold).await?;
+                        return Ok(());
+                    };
+                    let mut row: keyspace::IntentRow =
+                        postcard::from_bytes(&value).map_err(store_err("intent row decode"))?;
+                    // Only a provisional row is promotable. A row that has
+                    // already been annulled by a concurrent sweep stays
+                    // annulled: reversal is not undone by a later agreeing
+                    // replay, because the value is already back and the player
+                    // has already been told.
+                    if row.finality == keyspace::IntentFinality::Provisional {
+                        row.finality = keyspace::IntentFinality::Final;
+                        row.finalize_by_ms = 0;
+                        let encoded =
+                            postcard::to_stdvec(&row).map_err(store_err("intent row encode"))?;
+                        trx.set(&ikey, &encoded);
+                    }
+                    release_hold(&trx, &hold).await?;
+                    Ok(())
+                }
+            })
+            .await;
+        result.map_err(unwrap_binding_error)
+    }
+
+    async fn annul(&self, hold: &keyspace::ProvisionalHold) -> Result<(), IntentError> {
+        let hold = hold.clone();
+        let result: Result<(), FdbBindingError> = self
+            .db
+            .run(|trx, _maybe_committed| {
+                let hold = hold.clone();
+                async move {
+                    let ikey = keyspace::intent_key(hold.intent_id);
+                    let previous = trx.get(&ikey, false).await?;
+                    let Some(value) = previous else {
+                        release_hold(&trx, &hold).await?;
+                        return Ok(());
+                    };
+                    let mut row: keyspace::IntentRow =
+                        postcard::from_bytes(&value).map_err(store_err("intent row decode"))?;
+                    // Idempotent by the row, not by the caller. Two sweeps
+                    // racing on one hold must not apply the inverse twice, and
+                    // the read above registers the conflict range that makes
+                    // at most one of them commit.
+                    if row.finality != keyspace::IntentFinality::Provisional {
+                        release_hold(&trx, &hold).await?;
+                        return Ok(());
+                    }
+
+                    // The forward-written inverse. `MutationType::Add` with a
+                    // negated delta, in the same 16-byte sign-extended
+                    // little-endian form `apply_plan` writes, so the reversal
+                    // is arithmetically the commit's mirror and not a
+                    // recomputation of what the balance "should" be.
+                    for write in &hold.writes {
+                        let key = keyspace::ledger_bal_key(write.account, write.asset);
+                        let param = i128::from(write.delta).wrapping_neg().to_le_bytes();
+                        trx.atomic_op(&key, &param, MutationType::Add);
+                    }
+
+                    // The compensating receipt. Appended, never substituted:
+                    // `ledger/receipt/{versionstamp}` is a strictly-ordered
+                    // history, and a reader of it sees the commit and then the
+                    // reversal — which is what an auditor needs and what a
+                    // player owed an explanation needs.
+                    let receipt = keyspace::ReceiptRow {
+                        intent_id: hold.intent_id,
+                        parties: hold.writes.iter().map(|write| write.account).collect(),
+                        ops: Vec::new(),
+                    };
+                    let rkey = keyspace::ledger_receipt_versionstamped_key();
+                    let encoded =
+                        postcard::to_stdvec(&receipt).map_err(store_err("receipt row encode"))?;
+                    trx.atomic_op(&rkey, &encoded, MutationType::SetVersionstampedKey);
+
+                    row.finality = keyspace::IntentFinality::Annulled;
+                    row.finalize_by_ms = 0;
+                    // Restamped from the annulment, so an annulled row retains
+                    // for an hour from *this* moment rather than from the
+                    // commit (D29 clause 9(c)). That is what keeps it able to
+                    // answer a replay out of a client's offline queue, whose
+                    // TTL docs/08 §6 already requires to be shorter than the
+                    // retention.
+                    row.gc_deadline_ms = now_ms() + INTENT_ROW_RETENTION_MS;
+                    let encoded =
+                        postcard::to_stdvec(&row).map_err(store_err("intent row encode"))?;
+                    trx.set(&ikey, &encoded);
+
+                    release_hold(&trx, &hold).await?;
+                    Ok(())
+                }
+            })
+            .await;
+        result.map_err(unwrap_binding_error)
+    }
+}
+
+/// Drop `hold` from its account's `provisional/{account}` row, clearing the
+/// row entirely once nothing is outstanding.
+///
+/// Clearing rather than storing an empty vector keeps
+/// [`ProvisionalStore::outstanding`]'s range scan proportional to outstanding
+/// work instead of to the set of accounts that have ever committed
+/// provisionally.
+async fn release_hold(
+    trx: &foundationdb::Transaction,
+    hold: &keyspace::ProvisionalHold,
+) -> Result<(), FdbBindingError> {
+    let key = keyspace::provisional_key(hold.account);
+    let Some(value) = trx.get(&key, false).await? else {
+        return Ok(());
+    };
+    let mut row: keyspace::ProvisionalRow =
+        postcard::from_bytes(&value).map_err(store_err("provisional row decode"))?;
+    row.holds.retain(|held| held.intent_id != hold.intent_id);
+    if row.holds.is_empty() {
+        trx.clear(&key);
+    } else {
+        let encoded = postcard::to_stdvec(&row).map_err(store_err("provisional row encode"))?;
+        trx.set(&key, &encoded);
+    }
+    Ok(())
+}
+
 /// Read and decode `ledger/item/{item}` inside `trx`.
 ///
 /// **The read that makes the anti-dupe invariant work.** It registers the
@@ -1100,4 +1458,351 @@ async fn read_balance(
     let n = value.len().min(16);
     buf[..n].copy_from_slice(&value[..n]);
     Ok(i128::from_le_bytes(buf))
+}
+
+#[cfg(test)]
+mod tests {
+    //! The `fdb` tier for D29's low-population path.
+    //!
+    //! These are the assertions the in-memory tier cannot make. That tier
+    //! serialises on a mutex, so it proves the *logic* of the quarantine, the
+    //! sweep and the inverse, and proves nothing about the property those three
+    //! actually depend on: that each of them is **one serializable
+    //! transaction**, and that the reads inside it register conflict ranges a
+    //! concurrent commit collides with.
+    //!
+    //! Each test opens with the same guard every `fdb`-tier test in this
+    //! repository opens with — `eprintln!("skipping: …")` and return — which is
+    //! right for a developer's `cargo test` and a trap for CI;
+    //! `scripts/fdb-tests.sh` is what turns it back into a real gate, failing
+    //! on any `skipping:` line and asserting a floor on tests executed.
+    //!
+    //! **One account per test.** libtest runs these concurrently and every one
+    //! of them writes a `provisional/{account}` row and one balance row.
+    //! Neither key carries a grid discriminator (they are flat ledger keys), so
+    //! the isolation has to come from the id — and a shared account made these
+    //! four a race whose failures read as bugs in the mechanism rather than in
+    //! the fixture.
+
+    use super::*;
+    use crate::intent::{IntentExecutor, LEDGER_CREDIT_OP};
+    use orrery_protocol::{
+        CellEpoch, ChainHash, EvidenceCommitment, IntentOp, PersistId, RulesetId, Tick,
+    };
+
+    /// This file's own grid, so its `pid/next` counter never contends with
+    /// another suite's on the shared dev cluster.
+    const GRID: u32 = 9602;
+    const GOLD: u64 = 0x9602_0000_0000_00f0;
+
+    fn fdb_cluster_file() -> Option<String> {
+        if let Ok(path) = std::env::var("ORRERY_FDB_CLUSTER_FILE") {
+            return Some(path);
+        }
+        let mut dir = std::env::current_dir().ok()?;
+        loop {
+            let candidate = dir.join(".fdb-dev/fdb.cluster");
+            if candidate.exists() {
+                return Some(candidate.display().to_string());
+            }
+            if !dir.pop() {
+                return None;
+            }
+        }
+    }
+
+    fn commitment() -> EvidenceCommitment {
+        EvidenceCommitment {
+            ruleset: RulesetId {
+                version: 1,
+                digest: [7; 32],
+            },
+            entity: PersistId::new(11),
+            window_start: Tick::new(100),
+            window_end: Tick::new(160),
+            t0_claim_hash: [9; 32],
+            log_head: ChainHash([5; 32]),
+        }
+    }
+
+    fn intent_with(id: u128, ops: Vec<IntentOp>) -> Intent {
+        let mut seed = [0u8; 32];
+        seed[0] = 42;
+        let key = iroh_base::SecretKey::from_bytes(&seed);
+        let mut intent = Intent {
+            intent_id: id,
+            issuer: key.public(),
+            cell_epoch: CellEpoch::new(0),
+            ops,
+            attestations: Vec::new(),
+            evidence: Some(commitment()),
+            signature: key.sign(b"placeholder"),
+        };
+        intent.sign(&key);
+        intent
+    }
+
+    /// One self-credit of `delta` gold into `account`.
+    fn credit(account: u64, id: u128, delta: i64) -> Intent {
+        let mut args = Vec::with_capacity(24);
+        args.extend_from_slice(&account.to_le_bytes());
+        args.extend_from_slice(&GOLD.to_le_bytes());
+        args.extend_from_slice(&delta.to_le_bytes());
+        intent_with(
+            id,
+            vec![IntentOp {
+                op: LEDGER_CREDIT_OP,
+                args: bytes::Bytes::from(args),
+            }],
+        )
+    }
+
+    /// A `Ruleset`-opaque op: provisional-eligible, and it names no ledger row,
+    /// so the quarantine — which is stricter per balance row than the cap is
+    /// per account — is not what refuses it.
+    fn opaque(id: u128) -> Intent {
+        intent_with(
+            id,
+            vec![IntentOp {
+                op: 100,
+                args: bytes::Bytes::from_static(b"opaque"),
+            }],
+        )
+    }
+
+    /// Clear every row one test writes, so a rerun against the same cluster
+    /// starts from the same state. The balance is *cleared* rather than
+    /// negated: `MutationType::Add` has no identity a test can compute without
+    /// reading, and reading it back to subtract it would make the fixture
+    /// depend on the thing under test.
+    async fn reset(db: &Database, account: u64, ids: &[u128]) {
+        let ids = ids.to_vec();
+        db.run(|trx, _| {
+            let ids = ids.clone();
+            async move {
+                for id in &ids {
+                    trx.clear(&keyspace::intent_key(*id));
+                }
+                trx.clear(&keyspace::provisional_key(AccountId::new(account)));
+                trx.clear(&keyspace::ledger_bal_key(
+                    AccountId::new(account),
+                    AssetId::new(GOLD),
+                ));
+                Ok(())
+            }
+        })
+        .await
+        .expect("reset");
+    }
+
+    async fn balance(db: &Database, account: u64) -> i128 {
+        db.run(|trx, _| async move {
+            read_balance(&trx, AccountId::new(account), AssetId::new(GOLD)).await
+        })
+        .await
+        .expect("balance")
+    }
+
+    async fn intent_row(db: &Database, id: u128) -> Option<keyspace::IntentRow> {
+        db.run(|trx, _| async move {
+            let Some(value) = trx.get(&keyspace::intent_key(id), false).await? else {
+                return Ok(None);
+            };
+            let row: keyspace::IntentRow =
+                postcard::from_bytes(&value).map_err(store_err("intent row decode"))?;
+            Ok(Some(row))
+        })
+        .await
+        .expect("intent row")
+    }
+
+    /// This account's outstanding holds, filtered out of the family-wide scan
+    /// so concurrent tests' rows are invisible to each other.
+    async fn holds_of(exec: &FdbIntentExecutor, account: u64) -> Vec<keyspace::ProvisionalHold> {
+        exec.outstanding()
+            .await
+            .expect("outstanding")
+            .into_iter()
+            .filter(|hold| hold.account == AccountId::new(account))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_provisional_commit_writes_the_row_the_hold_and_the_effect_together() {
+        const ALICE: u64 = 0x9602_0000_0000_0001;
+        let Some(cluster) = fdb_cluster_file() else {
+            eprintln!("skipping: ORRERY_FDB_CLUSTER_FILE not set and no .fdb-dev/fdb.cluster");
+            return;
+        };
+        let exec = FdbIntentExecutor::connect(&cluster, GridId::new(GRID)).expect("connect");
+        let db = Arc::clone(exec.database());
+        reset(&db, ALICE, &[0xd29_0001]).await;
+
+        let outcome = exec
+            .execute_provisional(&credit(ALICE, 0xd29_0001, 100), AccountId::new(ALICE))
+            .await
+            .expect("no executor error");
+        let IntentOutcome::Provisional { finalize_by, .. } = outcome else {
+            panic!("expected Provisional, got {outcome:?}");
+        };
+
+        // All three in one transaction, so all three are here or none is.
+        assert_eq!(balance(&db, ALICE).await, 100);
+        let row = intent_row(&db, 0xd29_0001).await.expect("durable row");
+        assert_eq!(row.finality, keyspace::IntentFinality::Provisional);
+        assert_eq!(row.finalize_by_ms, finalize_by);
+        assert!(
+            !keyspace::sweepable(&row, u64::MAX),
+            "D29 clause 9(c): a provisional row is not sweepable at any clock"
+        );
+        let holds = holds_of(&exec, ALICE).await;
+        assert_eq!(holds.len(), 1);
+        assert_eq!(holds[0].intent_id, 0xd29_0001);
+        assert_eq!(holds[0].commitment, commitment());
+        assert_eq!(holds[0].writes.len(), 1);
+        assert_eq!(holds[0].writes[0].delta, 100);
+
+        exec.annul(&holds[0]).await.expect("annul");
+        reset(&db, ALICE, &[0xd29_0001]).await;
+    }
+
+    #[tokio::test]
+    async fn a_held_balance_row_is_an_input_to_nothing() {
+        // D29 clause 4 against the durable rows, which is where it has to hold:
+        // the refusal is decided by a `get` inside the intent's own
+        // serializable transaction, so it registers the conflict range a
+        // concurrent provisional commit collides with rather than consulting a
+        // cache a commit can outrun.
+        const BOB: u64 = 0x9602_0000_0000_0002;
+        let Some(cluster) = fdb_cluster_file() else {
+            eprintln!("skipping: ORRERY_FDB_CLUSTER_FILE not set and no .fdb-dev/fdb.cluster");
+            return;
+        };
+        let exec = FdbIntentExecutor::connect(&cluster, GridId::new(GRID)).expect("connect");
+        let db = Arc::clone(exec.database());
+        reset(&db, BOB, &[0xd29_0002, 0xd29_0003]).await;
+
+        exec.execute_provisional(&credit(BOB, 0xd29_0002, 100), AccountId::new(BOB))
+            .await
+            .expect("no executor error");
+        assert_eq!(
+            exec.execute(&credit(BOB, 0xd29_0003, 5))
+                .await
+                .expect("no executor error"),
+            IntentOutcome::Rejected {
+                reason: orrery_protocol::REASON_PROVISIONAL_INPUT
+            },
+        );
+        assert_eq!(balance(&db, BOB).await, 100, "the refusal applied nothing");
+        assert!(
+            intent_row(&db, 0xd29_0003).await.is_none(),
+            "and burned no idempotency row, so the same id works after finalization"
+        );
+
+        let holds = holds_of(&exec, BOB).await;
+        exec.finalize(&holds[0]).await.expect("finalize");
+        assert!(matches!(
+            exec.execute(&credit(BOB, 0xd29_0003, 5))
+                .await
+                .expect("no executor error"),
+            IntentOutcome::Committed { .. }
+        ));
+        assert_eq!(balance(&db, BOB).await, 105);
+        assert_eq!(
+            intent_row(&db, 0xd29_0002).await.expect("row").finality,
+            keyspace::IntentFinality::Final
+        );
+        reset(&db, BOB, &[0xd29_0002, 0xd29_0003]).await;
+    }
+
+    #[tokio::test]
+    async fn annulment_is_one_transaction_and_a_replay_of_it_reapplies_nothing() {
+        const CAROL: u64 = 0x9602_0000_0000_0003;
+        let Some(cluster) = fdb_cluster_file() else {
+            eprintln!("skipping: ORRERY_FDB_CLUSTER_FILE not set and no .fdb-dev/fdb.cluster");
+            return;
+        };
+        let exec = FdbIntentExecutor::connect(&cluster, GridId::new(GRID)).expect("connect");
+        let db = Arc::clone(exec.database());
+        reset(&db, CAROL, &[0xd29_0004]).await;
+
+        exec.execute_provisional(&credit(CAROL, 0xd29_0004, 100), AccountId::new(CAROL))
+            .await
+            .expect("no executor error");
+        let hold = holds_of(&exec, CAROL).await.remove(0);
+        exec.annul(&hold).await.expect("annul");
+
+        assert_eq!(
+            balance(&db, CAROL).await,
+            0,
+            "the forward-written inverse: +100 then -100, never a deletion"
+        );
+        let row = intent_row(&db, 0xd29_0004).await.expect("row");
+        assert_eq!(row.finality, keyspace::IntentFinality::Annulled);
+        assert!(
+            row.gc_deadline_ms >= now_ms(),
+            "restamped from the annulment, so it outlives a client offline queue"
+        );
+        assert!(!keyspace::sweepable(&row, row.gc_deadline_ms - 1));
+
+        // A replay is answered, not re-applied. The row survives its reversal
+        // precisely so this question has an answer.
+        assert_eq!(
+            exec.execute_provisional(&credit(CAROL, 0xd29_0004, 100), AccountId::new(CAROL))
+                .await
+                .expect("no executor error"),
+            IntentOutcome::Rejected {
+                reason: orrery_protocol::REASON_INTENT_ANNULLED
+            }
+        );
+        assert_eq!(balance(&db, CAROL).await, 0);
+
+        // Annulling twice is idempotent by the row, which is what makes two
+        // sweeps racing on one hold safe.
+        exec.annul(&hold).await.expect("second annul");
+        assert_eq!(balance(&db, CAROL).await, 0);
+        reset(&db, CAROL, &[0xd29_0004]).await;
+    }
+
+    #[tokio::test]
+    async fn the_per_account_cap_is_enforced_against_the_durable_row() {
+        const DAVE: u64 = 0x9602_0000_0000_0004;
+        let Some(cluster) = fdb_cluster_file() else {
+            eprintln!("skipping: ORRERY_FDB_CLUSTER_FILE not set and no .fdb-dev/fdb.cluster");
+            return;
+        };
+        let exec = FdbIntentExecutor::connect(&cluster, GridId::new(GRID)).expect("connect");
+        let db = Arc::clone(exec.database());
+        let base = 0xd29_1000_u128;
+        let cap = orrery_protocol::PROVISIONAL_OUTSTANDING_CAP as u128;
+        let ids: Vec<u128> = (0..=cap).map(|i| base + i).collect();
+        reset(&db, DAVE, &ids).await;
+
+        for id in ids.iter().take(cap as usize) {
+            assert!(matches!(
+                exec.execute_provisional(&opaque(*id), AccountId::new(DAVE))
+                    .await
+                    .expect("no executor error"),
+                IntentOutcome::Provisional { .. }
+            ));
+        }
+        assert_eq!(
+            exec.execute_provisional(&opaque(base + cap), AccountId::new(DAVE))
+                .await
+                .expect("no executor error"),
+            IntentOutcome::Rejected {
+                reason: orrery_protocol::REASON_PROVISIONAL_CAP
+            },
+            "the cluster refuses new provisional intents rather than annulling old ones"
+        );
+        assert!(
+            intent_row(&db, base + cap).await.is_none(),
+            "a refused intent is not a durable fact"
+        );
+
+        for hold in holds_of(&exec, DAVE).await {
+            exec.annul(&hold).await.expect("annul");
+        }
+        reset(&db, DAVE, &ids).await;
+    }
 }

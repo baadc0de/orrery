@@ -445,6 +445,7 @@ async fn production_authority_admits_well_formed_intents_and_refuses_malformed_o
     ));
     let signed = |intent_id: u128, ops: Vec<IntentOp>| {
         let mut intent = Intent {
+            evidence: None,
             intent_id,
             issuer: client_key.public(),
             cell_epoch: CellEpoch::new(0),

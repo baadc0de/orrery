@@ -226,6 +226,7 @@ mod tests {
 
     fn intent(id: u128) -> Intent {
         Intent {
+            evidence: None,
             intent_id: id,
             issuer: node(1),
             cell_epoch: CellEpoch::new(0),

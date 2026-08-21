@@ -15,9 +15,11 @@
 use serde::{Deserialize, Serialize};
 
 use crate::CellId;
+use crate::EvidenceCommitment;
 use crate::GridId;
 use crate::NodeId;
 use crate::Signature;
+use crate::EVIDENCE_COMMITMENT_PREIMAGE_LEN;
 
 /// A universe-global simulation tick (D8): u64, 60 Hz, anchored to a
 /// coordinator-issued universe epoch. Signed logs, RNG seeds, witness epochs,
@@ -307,6 +309,20 @@ pub struct Intent {
     pub ops: Vec<IntentOp>,
     /// K-of-N witness co-signatures (default K=3 of N≥5, D16).
     pub attestations: Vec<Attestation>,
+    /// D29 clause 6's fixed-size commitment to the history behind this
+    /// intent, or `None` when the submitter offers none.
+    ///
+    /// **Only the low-population path consumes it.** An attested intent is
+    /// judged by its co-signatures and this field is ignored; an intent that
+    /// falls to D29's provisional path is finalized by spot replay, and this
+    /// is what the replay is held to. A submitter that offers none is
+    /// therefore submitting an intent the cluster can commit but never
+    /// finalize, which is why admission refuses the provisional path without
+    /// it rather than committing something guaranteed to expire.
+    ///
+    /// Covered by [`Self::signing_preimage`], so it is the issuer's own
+    /// signed statement (see [`EvidenceCommitment`]).
+    pub evidence: Option<EvidenceCommitment>,
     /// The issuer's ed25519 signature over the intent.
     pub signature: Signature,
 }
@@ -443,7 +459,16 @@ impl Intent {
     #[must_use]
     pub fn signing_preimage(&self) -> Vec<u8> {
         let ops_len: usize = self.ops.iter().map(|op| 2 + 4 + op.args.len()).sum();
-        let mut buf = Vec::with_capacity(INTENT_PREIMAGE_TAG.len() + 16 + 32 + 8 + 4 + ops_len);
+        let mut buf = Vec::with_capacity(
+            INTENT_PREIMAGE_TAG.len()
+                + 16
+                + 32
+                + 8
+                + 4
+                + ops_len
+                + 1
+                + EVIDENCE_COMMITMENT_PREIMAGE_LEN,
+        );
         buf.extend_from_slice(INTENT_PREIMAGE_TAG);
         buf.extend_from_slice(&self.intent_id.to_le_bytes());
         buf.extend_from_slice(self.issuer.as_bytes());
@@ -453,6 +478,23 @@ impl Intent {
             buf.extend_from_slice(&op.op.to_le_bytes());
             buf.extend_from_slice(&(op.args.len() as u32).to_le_bytes());
             buf.extend_from_slice(&op.args);
+        }
+        // D29 clause 6's commitment, appended **after** the ops and tagged
+        // with a presence byte rather than being encoded as a length.
+        //
+        // The tag matters more than it looks. Without it, "no commitment" and
+        // "a commitment of 124 zero bytes" would produce the same preimage,
+        // and a submitter could strip a signed commitment off an intent and
+        // still present a verifying signature — which is precisely the
+        // after-the-fact substitution the commitment exists to prevent, run
+        // in the one direction that turns a finalizable intent into an
+        // unfinalizable one.
+        match &self.evidence {
+            None => buf.push(0),
+            Some(commitment) => {
+                buf.push(1);
+                buf.extend_from_slice(&commitment.preimage());
+            }
         }
         buf
     }
@@ -532,7 +574,85 @@ pub enum IntentOutcome {
         /// A `Ruleset`-defined rejection reason code.
         reason: u16,
     },
+    /// The intent committed **provisionally** on D29's low-population path:
+    /// durable, attributable, and quarantined until the cluster finalizes it
+    /// by spot replay.
+    ///
+    /// # This is not a hedge about durability
+    ///
+    /// The reply is sent after the FoundationDB transaction resolves, exactly
+    /// as [`Self::Committed`] is, so RPO 0 is untouched (D11). What is
+    /// provisional is the *verdict*, not the write: the row is there, the
+    /// value is real, and the cluster has not yet re-executed the history
+    /// behind it.
+    ///
+    /// # What the submitter may do with it
+    ///
+    /// Hold it and display it. **Not** spend it: D29 clause 4 makes a
+    /// provisional row an input to nothing until its originating intent is
+    /// finalized, which is what bounds the annulment set at exactly one
+    /// intent. A client's local prediction *holds* on this arm — it neither
+    /// rolls back (the value is real) nor resolves terminally (the verdict is
+    /// not in).
+    ///
+    /// # It shares nothing but a word with the other two "provisional"s
+    ///
+    /// D29 clause 5's second normative sentence: this is unrelated to
+    /// `LeaseFlags::PROVISIONAL` and to the *bulk*-ack disposition of the same
+    /// name. A provisional bulk ack means "resend this"; a provisional intent
+    /// outcome means the exact opposite — never resend, the durable row is
+    /// already there and a replay returns this same answer.
+    Provisional {
+        /// The tick at which the provisional commit was recorded.
+        tick: Tick,
+        /// `PersistId`s minted inside the transaction, in op order. Minted
+        /// ids are **not** returned by annulment: D29 clause 8 records that
+        /// as one of the four things a forward-written inverse cannot undo.
+        minted: Vec<PersistId>,
+        /// Unix-millisecond deadline by which the cluster must finalize or
+        /// annul this intent
+        /// ([`PROVISIONAL_FINALIZE_DEADLINE_MS`]). Reaching it **annuls**;
+        /// it never auto-finalizes, because auto-finalizing would make
+        /// outlasting the replay queue a winning strategy.
+        finalize_by: u64,
+    },
 }
+
+/// How long a commit may stay provisional before the cluster annuls it
+/// (D29 clause 9, `provisional_finalize_deadline`, default 5 min).
+///
+/// # Chosen, not measured
+///
+/// Five minutes exceeds an evidence fetch — one RTT, plus a retry, plus a
+/// reconnect window for a submitter whose 10 s lease has lapsed (D7) — by
+/// three orders of magnitude, and sits an order of magnitude under the
+/// `intent/` row retention that bounds it. D29 marks it proposed into D16 and
+/// asks for it to be re-derived from the first shadow-mode telemetry rather
+/// than defended.
+///
+/// The interlock it must satisfy is
+/// `PROVISIONAL_FINALIZE_DEADLINE_MS ≪ INTENT_ROW_RETENTION_MS` (5 min against
+/// 1 h, a factor of twelve), so a provisional row is always resolved with ≥ 55
+/// minutes of retention left and can never vanish under a replay.
+pub const PROVISIONAL_FINALIZE_DEADLINE_MS: u64 = 5 * 60 * 1000;
+
+/// The most unfinalized provisional intents one account may hold at once
+/// (D29 clause 9(b), `C = 8`).
+///
+/// # Why a cap exists at all
+///
+/// It is the per-account value-at-risk dial: `VaR(account) ≤ C · v_max`. Past
+/// it, further low-population intents from that account are **refused**, not
+/// queued — and refusal is the routine response the whole clause is arranged
+/// to produce, because expiry is the one outcome that destroys value the
+/// cluster already promised. An expiry in production is an incident; a
+/// refusal is a defined, liability-free answer the admission function already
+/// knows how to give.
+///
+/// `C = 8` has no derivation. It is set low because nothing in a
+/// low-population cell should be producing eight unfinalized intents at once,
+/// and an account that is has already told the operator something.
+pub const PROVISIONAL_OUTSTANDING_CAP: usize = 8;
 
 /// The issuer's ed25519 signature did not verify (gateway edge check, §2.2).
 pub const REASON_BAD_SIGNATURE: u16 = 1;
@@ -628,6 +748,74 @@ pub const REASON_SELF_WITNESS: u16 = 12;
 /// one party that needs the distinction between a netsplit and a forgery —
 /// reads it from the gateway, where the labels already are.
 pub const REASON_ATTESTATION_QUORUM: u16 = 13;
+
+/// The intent named a row an unfinalized **provisional** commit wrote, and
+/// D29 clause 4 makes such a row an input to nothing.
+///
+/// # Why this is its own code and not folded into `REASON_VALIDATION_FAILED`
+///
+/// Every other refusal on this path tells the submitter something it did
+/// wrong. This one tells it something about *timing*: the same intent, resent
+/// after the originating intent finalizes, succeeds unchanged. Collapsing it
+/// into the generic validation code would leave a client with no way to tell
+/// "never do this" from "do this in a moment", and the correct behaviour for
+/// the two is opposite.
+///
+/// The quarantine it enforces is the whole cascade defence. If a provisional
+/// output could be spent, the set of intents that must be reversed when the
+/// original is annulled is the transitive closure of everything derived from
+/// it — across accounts, and including intents that have since *finalized*.
+/// Containment at depth 1 makes that set exactly one intent, and this code is
+/// what containment sounds like from the outside.
+pub const REASON_PROVISIONAL_INPUT: u16 = 14;
+
+/// The intent was eligible for D29's low-population path by population, and
+/// refused by its **classification**: it is not reversible by a
+/// forward-written inverse the cluster can write on its own (D29 clause 3).
+///
+/// Value *creation into escrow* is admitted on this path — loot, crafting
+/// output, progression, anything whose credit and debit are both inside the
+/// submitting account's own rows. Value *transfer* is refused: any op naming a
+/// second account, any sink the cluster cannot re-credit.
+///
+/// **The reference two-party trade is refused in a low-population cell**, and
+/// that is a deliberate, player-visible product hole rather than an oversight.
+/// Party exclusion removes both traders from the eligible set anyway, so a
+/// trade in a two-person cell has no witnesses by construction — and
+/// committing it provisionally would be committing the most cascade-prone
+/// operation there is on the least evidence.
+pub const REASON_PROVISIONAL_INELIGIBLE: u16 = 15;
+
+/// This account already holds
+/// [`PROVISIONAL_OUTSTANDING_CAP`] unfinalized provisional intents
+/// (D29 clause 9(b)).
+///
+/// A refusal, never a queue. The cluster's response to a finalizer that
+/// cannot keep up is to stop *admitting* provisional intents long before it
+/// starts annulling old ones, because refusal is a defined answer that costs
+/// the player nothing they had, and expiry destroys value the cluster already
+/// promised.
+pub const REASON_PROVISIONAL_CAP: u16 = 16;
+
+/// The intent id is a replay of an intent the cluster **annulled**
+/// (D29 clause 8).
+///
+/// The durable row is still there — that is what makes this answerable at all,
+/// and D29 clause 9(c)'s GC interlock is what keeps it there — so the replay
+/// applies nothing and is told what happened to the original. Distinct from
+/// every other rejection because nothing the submitter can do changes it: the
+/// commit happened, was reversed, and the reversal is in the ledger's history
+/// forever.
+pub const REASON_INTENT_ANNULLED: u16 = 17;
+
+/// The intent fell to D29's low-population path and carries no
+/// [`EvidenceCommitment`], so nothing could ever finalize it.
+///
+/// Committing it would mean minting durable value with a guaranteed expiry
+/// five minutes later, which converts the honest answer (refuse now) into the
+/// one outcome D29 clause 9(b) exists to avoid (annul later). Refusal is free
+/// and the submitter can resubmit with a commitment attached.
+pub const REASON_PROVISIONAL_NO_EVIDENCE: u16 = 18;
 
 /// [`GatewayReply::ReportVerdict`] reason: the report was adjudicated, and the
 /// reply's `verdict` carries the answer.
@@ -773,6 +961,7 @@ mod tests {
     #[test]
     fn intent_roundtrips() {
         let intent = Intent {
+            evidence: None,
             intent_id: 0x1122_3344_5566_7788_99aa_bbcc_ddee_ff00,
             issuer: node(1),
             cell_epoch: CellEpoch::new(7),
@@ -810,6 +999,7 @@ mod tests {
         // D10 flow: the peer signs, *then* collects witness co-signatures — so
         // pushing an Attestation must not change the bytes the author signed.
         let mut intent = Intent {
+            evidence: None,
             intent_id: 0x1122_3344_5566_7788_99aa_bbcc_ddee_ff00,
             issuer: node(1),
             cell_epoch: CellEpoch::new(7),
@@ -841,12 +1031,44 @@ mod tests {
         expected.extend_from_slice(&3u16.to_le_bytes()); // op id
         expected.extend_from_slice(&5u32.to_le_bytes()); // args len
         expected.extend_from_slice(b"trade");
+        // D29 clause 6's presence tag, and the reason a bare `Option` encoding
+        // would not do: without a discriminator byte, "no commitment" and "a
+        // commitment of 124 zero bytes" produce the same preimage, and a
+        // submitter could strip a signed commitment off an intent and still
+        // present a verifying signature — turning a finalizable intent into an
+        // unfinalizable one, which is exactly the after-the-fact substitution
+        // the commitment exists to prevent.
+        expected.push(0);
         assert_eq!(before, expected, "canonical layout, derived by hand");
+
+        // And the present case: the same intent carrying a commitment signs
+        // over different bytes, so the two are not interchangeable.
+        let mut with_evidence = intent.clone();
+        with_evidence.evidence = Some(crate::EvidenceCommitment {
+            ruleset: crate::RulesetId {
+                version: 1,
+                digest: [7; 32],
+            },
+            entity: PersistId::new(11),
+            window_start: Tick::new(100),
+            window_end: Tick::new(160),
+            t0_claim_hash: [9; 32],
+            log_head: crate::ChainHash([5; 32]),
+        });
+        let committed = with_evidence.signing_preimage();
+        assert_ne!(before, committed);
+        assert_eq!(
+            committed.len(),
+            before.len() + crate::EVIDENCE_COMMITMENT_PREIMAGE_LEN,
+            "the tag is already in `before`; the present case adds the body"
+        );
+        assert_eq!(committed[before.len() - 1], 1, "the presence tag flips");
     }
 
     #[test]
     fn signature_roundtrips() {
         let mut intent = Intent {
+            evidence: None,
             intent_id: 42,
             issuer: node(1),
             cell_epoch: CellEpoch::new(0),
@@ -1029,6 +1251,7 @@ mod tests {
 
     fn intent_for_test(intent_id: u128, issuer: NodeId) -> Intent {
         Intent {
+            evidence: None,
             intent_id,
             issuer,
             cell_epoch: CellEpoch::new(9),

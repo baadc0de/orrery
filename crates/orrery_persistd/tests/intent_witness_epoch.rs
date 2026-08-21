@@ -163,6 +163,7 @@ fn attested_intent(
     witnesses: &[iroh_base::SecretKey],
 ) -> Intent {
     let mut intent = Intent {
+        evidence: None,
         intent_id: id,
         issuer: key.public(),
         cell_epoch: CellEpoch::new(handle),

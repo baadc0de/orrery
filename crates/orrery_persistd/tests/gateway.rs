@@ -520,6 +520,7 @@ async fn assert_diff_denied_without_mutation(
 /// `b"test"`-signed fixture no longer commits.
 fn signed_intent(id: u128, key: &iroh_base::SecretKey) -> Intent {
     let mut intent = Intent {
+        evidence: None,
         intent_id: id,
         issuer: key.public(),
         cell_epoch: CellEpoch::new(0),
@@ -4479,9 +4480,17 @@ async fn hello_refusal(connection: &lanes::GatewayLanes) -> Option<(u16, u8)> {
 }
 
 #[test]
-fn versioned_hello_is_accepted_across_the_rolling_window_and_refused_outside_it() {
-    // The gateway's own version is per-instance, so this drives all four cases
+fn versioned_hello_is_accepted_only_at_the_gateways_own_version() {
+    // The gateway's own version is per-instance, so this drives every case
     // against one server without touching `PROTOCOL_VERSION`.
+    //
+    // **The `{V, V-1}` window is closed** — D29 clause 5, taken on acceptance:
+    // the third `IntentOutcome` arm is undecodable by a version-1 client under
+    // postcard's positional variant keying, and rather than carry a
+    // "degrade this client to refusal" branch through every site D29 touches,
+    // the operator closed the window once, for all traffic. So the predecessor
+    // version is refused here exactly like any other mismatch, which is the
+    // whole behavioural content of the change.
     let rt = tokio::runtime::Runtime::new().unwrap();
     rt.block_on(async {
         let dir = tempfile::tempdir().unwrap();
@@ -4505,9 +4514,8 @@ fn versioned_hello_is_accepted_across_the_rolling_window_and_refused_outside_it(
         .unwrap();
         let (_client, connection) = raw_connection(secret(1), server.addr()).await;
 
-        // V and V−1 are the rolling-upgrade window: a cluster deploys ahead of
-        // its clients, so the version below the gateway's own is accepted.
-        for version in [4u16, 3] {
+        // Only the gateway's own version is accepted.
+        for version in [4u16] {
             connection
                 .send_control(&GatewayMsg::VersionedHello {
                     token: session_token(&issuer, node(1), 900, 200),
@@ -4524,7 +4532,8 @@ fn versioned_hello_is_accepted_across_the_rolling_window_and_refused_outside_it(
         // Anything else is refused with a typed reply naming the gateway's own
         // version, not dropped: silence here is indistinguishable from a slow
         // gateway, and the client would re-offer the same version forever.
-        for version in [2u16, 5, 0] {
+        // Everything else, the former window's `V-1` included.
+        for version in [3u16, 2, 5, 0] {
             connection
                 .send_control(&GatewayMsg::VersionedHello {
                     token: session_token(&issuer, node(1), 900, 200),

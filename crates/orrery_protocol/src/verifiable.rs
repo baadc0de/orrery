@@ -246,6 +246,118 @@ pub struct EvidenceBundle {
     pub computed_hashes: Vec<[u8; 32]>,
 }
 
+/// The fixed-size commitment a low-population intent carries **instead of** an
+/// [`EvidenceBundle`] (D29 clause 6).
+///
+/// # Why a commitment and not the bundle
+///
+/// `docs/07 §4.5` asks for "full evidence attached (submitter's log segment
+/// covering the intent window, `t₀` claim)". That is an [`EvidenceBundle`],
+/// which carries a `t0_snapshot`, up to [`MAX_ADJUDICATION_TICKS`] frames,
+/// every frame's sibling heads and the disputed claims — unbounded in
+/// principle and routinely past FoundationDB's 100 KB value limit. Attaching
+/// it would mean sharding a blob across rows inside the one transaction whose
+/// p99 budget is 10 ms.
+///
+/// So the intent path carries this instead — 108 bytes, fixed — and the
+/// finalizer fetches the bundle out of band at replay time. The property the
+/// intent path actually needed from "attached evidence" is that the submitter
+/// **cannot substitute a friendlier history after the fact**, and that is a
+/// property of committing early, not of storing much: a bundle the finalizer
+/// later receives either reproduces every field here or is refused.
+///
+/// # The five fields, and what each one pins
+///
+/// | field | pins |
+/// |---|---|
+/// | `ruleset` | which retained build replays the window — never "the current one" |
+/// | `entity` | whose history is being replayed |
+/// | `window_start` / `window_end` | the half-open `[t₀, t_intent)` span |
+/// | `t0_claim_hash` | the signed claim replay starts from |
+/// | `log_head` | the submitter's chain head, so the segment cannot be re-cut |
+///
+/// # It is inside the issuer's signing preimage
+///
+/// [`Intent::signing_preimage`](crate::Intent::signing_preimage) covers this
+/// field, so the commitment is the submitter's own signed statement about the
+/// history it is asking the cluster to accept. D29 clause 6 only requires the
+/// commitment to be *stored*; signing it is strictly stronger and costs
+/// nothing, because the wire break that admits the field is already being
+/// taken. A commitment the submitter could disown would give the finalizer
+/// nothing to hold it to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EvidenceCommitment {
+    /// The rules build the window was executed under, and the build the
+    /// finalizer must route to.
+    pub ruleset: RulesetId,
+    /// The entity whose history the window covers.
+    pub entity: PersistId,
+    /// First tick of the half-open replay window.
+    pub window_start: Tick,
+    /// Exclusive end of the replay window — the intent's own tick.
+    pub window_end: Tick,
+    /// blake3 over the canonical preimage of the `t₀` [`StateClaim`] replay
+    /// starts from.
+    pub t0_claim_hash: [u8; 32],
+    /// The submitter's full input-chain head at `window_end`.
+    pub log_head: ChainHash,
+}
+
+/// The byte width of [`EvidenceCommitment::preimage`].
+///
+/// `4 + 32` ruleset, `8` entity, `8 + 8` window, `32` claim hash, `32` head.
+pub const EVIDENCE_COMMITMENT_PREIMAGE_LEN: usize = 124;
+
+impl EvidenceCommitment {
+    /// The canonical fixed-width byte string this commitment contributes to
+    /// [`Intent::signing_preimage`](crate::Intent::signing_preimage).
+    ///
+    /// Fixed-width and little-endian throughout, with no length prefixes,
+    /// for the same reason the attestation preimage is: an encoding whose
+    /// field offsets are constants is an encoding two implementations cannot
+    /// disagree about.
+    #[must_use]
+    pub fn preimage(&self) -> [u8; EVIDENCE_COMMITMENT_PREIMAGE_LEN] {
+        let mut buf = [0_u8; EVIDENCE_COMMITMENT_PREIMAGE_LEN];
+        buf[0..4].copy_from_slice(&self.ruleset.version.to_le_bytes());
+        buf[4..36].copy_from_slice(&self.ruleset.digest);
+        buf[36..44].copy_from_slice(&self.entity.0.to_le_bytes());
+        buf[44..52].copy_from_slice(&self.window_start.0.to_le_bytes());
+        buf[52..60].copy_from_slice(&self.window_end.0.to_le_bytes());
+        buf[60..92].copy_from_slice(&self.t0_claim_hash);
+        buf[92..124].copy_from_slice(&self.log_head.0);
+        buf
+    }
+
+    /// The commitment an [`EvidenceBundle`] *would* have produced, so a
+    /// finalizer can compare the bundle it fetched against the one the intent
+    /// pinned.
+    ///
+    /// Two of the six fields are supplied rather than read out of the bundle,
+    /// and both for the same reason — this crate cannot compute them.
+    /// `t0_claim_hash` is `orrery_core::claim_hash`, which lives above this
+    /// crate in the dependency order, and `log_head` is the submitter's chain
+    /// head, which the bundle's frames advance *toward* rather than state, so
+    /// it comes from the fold the fetcher just performed. Everything else
+    /// comes out of the bundle itself, which is what makes the comparison a
+    /// check on the *evidence* rather than on the fetcher's bookkeeping.
+    #[must_use]
+    pub fn from_bundle(
+        bundle: &EvidenceBundle,
+        t0_claim_hash: [u8; 32],
+        log_head: ChainHash,
+    ) -> Self {
+        Self {
+            ruleset: bundle.ruleset,
+            entity: bundle.entity,
+            window_start: bundle.window_start,
+            window_end: bundle.window_end,
+            t0_claim_hash,
+            log_head,
+        }
+    }
+}
+
 /// A dispute filed at stage 3 (docs/07-witnessing.md §3).
 ///
 /// The bundle inside is self-verifying, so an adjudicator needs nothing from
@@ -471,6 +583,20 @@ pub enum ForgeryProof {
     ClaimSignatureInvalid,
     /// The supplied `t0` snapshot does not hash to what the claim commits to.
     SnapshotHashMismatch,
+    /// The bundle does not reproduce the [`EvidenceCommitment`] the intent was
+    /// committed under (D29 clause 6).
+    ///
+    /// The odd one out, and deliberately so: every other arm names a signature
+    /// or a hash that failed to check. Nothing failed to check here — the
+    /// signatures on the presented history are perfectly good signatures over a
+    /// *different* history. What is proven is substitution, which is only
+    /// provable because the submitter pinned the history before it knew what
+    /// the cluster would ask for.
+    ///
+    /// It strikes the submitter rather than a reporter, because on the
+    /// provisional-finalization path the evidence's author and the intent's
+    /// submitter are the same account.
+    CommitmentMismatch,
 }
 
 /// The outcome of adjudicating an [`EvidenceBundle`].

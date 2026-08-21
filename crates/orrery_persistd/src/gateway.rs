@@ -1688,6 +1688,44 @@ pub struct GatewayIntentSnapshot {
     pub committed: u64,
     /// Acknowledgements reporting a rejection, for any reason.
     pub rejected: u64,
+    /// Acknowledgements reporting a **provisional** durable commit on D29's
+    /// low-population path.
+    ///
+    /// Named `intent_provisional_*` and counted apart from every bulk-ack
+    /// counter, per D29 clause 5's second normative sentence: the intent-side
+    /// mechanism and `BulkAckDisposition::Provisional` are opposites in the
+    /// one way that matters — a provisional bulk ack means "resend this", a
+    /// provisional intent outcome means "never resend this, the durable row is
+    /// already there" — so a shared counter would average two mechanisms with
+    /// contrary remediations. No dashboard panel and no gate assertion may sum
+    /// across them.
+    pub provisional_committed: u64,
+    /// Provisional intents refused because the account is at its outstanding
+    /// cap. The number that should absorb a finalizer slowdown, so that
+    /// `provisional_expired` stays zero.
+    pub provisional_refused_cap: u64,
+    /// Intents refused for naming a row an unfinalized provisional commit
+    /// wrote (D29 clause 4). A nonzero rate is a client spending quarantined
+    /// value, which is ordinary; a *rising* one is a client that has not
+    /// learned to wait.
+    pub provisional_refused_input: u64,
+    /// Replays of intents the cluster annulled.
+    pub annulled_replays: u64,
+    /// Provisional intents promoted to `Final` by an agreeing spot replay.
+    pub provisional_finalized: u64,
+    /// Provisional intents reversed by a forward-written inverse — a
+    /// disagreeing replay, a missing bundle, a commitment mismatch, or an
+    /// expired deadline.
+    pub provisional_annulled: u64,
+    /// Of those, the ones annulled because their deadline passed.
+    ///
+    /// **The one number here that is an incident rather than a workload.**
+    /// D29 clause 9(b) arranges the cluster to refuse new provisional intents
+    /// long before it expires old ones, so a nonzero value means admission
+    /// control did not hold: the finalizer is behind and the cap did not shed
+    /// the load in front of it. An expiry destroys value the cluster already
+    /// promised a player.
+    pub provisional_expired: u64,
     /// Rejections because no executor is configured: this gateway cannot
     /// commit an intent at all, which reads as a deployment fault rather than
     /// a `Ruleset` verdict.
@@ -1714,6 +1752,13 @@ pub struct GatewayIntentMetrics {
     replies: AtomicU64,
     committed: AtomicU64,
     rejected: AtomicU64,
+    provisional_committed: AtomicU64,
+    provisional_refused_cap: AtomicU64,
+    provisional_refused_input: AtomicU64,
+    annulled_replays: AtomicU64,
+    provisional_finalized: AtomicU64,
+    provisional_annulled: AtomicU64,
+    provisional_expired: AtomicU64,
     rejected_no_executor: AtomicU64,
     lane_saturated: AtomicU64,
     server_us_sum: AtomicU64,
@@ -1730,6 +1775,13 @@ impl GatewayIntentMetrics {
             replies: load(&self.replies),
             committed: load(&self.committed),
             rejected: load(&self.rejected),
+            provisional_committed: load(&self.provisional_committed),
+            provisional_refused_cap: load(&self.provisional_refused_cap),
+            provisional_refused_input: load(&self.provisional_refused_input),
+            annulled_replays: load(&self.annulled_replays),
+            provisional_finalized: load(&self.provisional_finalized),
+            provisional_annulled: load(&self.provisional_annulled),
+            provisional_expired: load(&self.provisional_expired),
             rejected_no_executor: load(&self.rejected_no_executor),
             lane_saturated: load(&self.lane_saturated),
             server_us_sum: load(&self.server_us_sum),
@@ -1747,6 +1799,24 @@ impl GatewayIntentMetrics {
         self.lane_saturated.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Fold one [`crate::intent::FinalizerReport`] into the intent metrics.
+    ///
+    /// The finalizer is not a gateway component — D29 leaves where it runs to
+    /// P5 ops, and it may well run in D12's sidecar fleet rather than in
+    /// `persistd` — but its counters belong on the same surface as the
+    /// provisional commits they resolve, because the only question an operator
+    /// asks about either is "are these two numbers converging". Exposing the
+    /// method here means a deployment that starts running a finalizer has a
+    /// named series waiting for it instead of inventing one.
+    pub fn record_finalizer(&self, report: &crate::intent::FinalizerReport) {
+        self.provisional_finalized
+            .fetch_add(report.finalized, Ordering::Relaxed);
+        self.provisional_annulled
+            .fetch_add(report.annulled, Ordering::Relaxed);
+        self.provisional_expired
+            .fetch_add(report.expired, Ordering::Relaxed);
+    }
+
     fn record_reply(&self, outcome: &IntentOutcome, server_us: u64) {
         self.replies.fetch_add(1, Ordering::Relaxed);
         match outcome {
@@ -1758,6 +1828,30 @@ impl GatewayIntentMetrics {
                 if *reason == REASON_NO_EXECUTOR {
                     self.rejected_no_executor.fetch_add(1, Ordering::Relaxed);
                 }
+                // Three of D29's refusals are counted apart from the
+                // rejection noise floor, because each one names a distinct
+                // operator situation with a distinct response: the cap says
+                // the finalizer is behind, the input refusal says clients are
+                // spending quarantined value, and an annulled replay says a
+                // reversal is still being resubmitted against.
+                if *reason == orrery_protocol::REASON_PROVISIONAL_CAP {
+                    self.provisional_refused_cap.fetch_add(1, Ordering::Relaxed);
+                }
+                if *reason == orrery_protocol::REASON_PROVISIONAL_INPUT {
+                    self.provisional_refused_input
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                if *reason == orrery_protocol::REASON_INTENT_ANNULLED {
+                    self.annulled_replays.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            IntentOutcome::Provisional { .. } => {
+                // Deliberately **not** also counted as `committed`. A
+                // provisional commit is durable and is not a commit the
+                // cluster has stood behind, and an operator reading a commit
+                // rate that silently included them would be reading a number
+                // that is right about durability and wrong about certainty.
+                self.provisional_committed.fetch_add(1, Ordering::Relaxed);
             }
         }
         self.server_us_sum.fetch_add(server_us, Ordering::Relaxed);
@@ -5297,18 +5391,21 @@ async fn handle_connection(
                 };
                 let admit = admit_intent(&intent, validator.as_ref(), &cx);
                 trace.admit_us = elapsed_us(received_at);
-                if let Err(outcome) = admit {
-                    send_intent_reply(
-                        send.as_ref(),
-                        intent.intent_id,
-                        outcome,
-                        &metrics.intent,
-                        received_at,
-                        trace,
-                        false,
-                    );
-                    continue;
-                }
+                let admission = match admit {
+                    Ok(admission) => admission,
+                    Err(outcome) => {
+                        send_intent_reply(
+                            send.as_ref(),
+                            intent.intent_id,
+                            outcome,
+                            &metrics.intent,
+                            received_at,
+                            trace,
+                            false,
+                        );
+                        continue;
+                    }
+                };
                 match reserve_intent_lane(Arc::clone(&inflight_intents)) {
                     Ok(permit) => {
                         let send = Arc::clone(&send);
@@ -5324,6 +5421,7 @@ async fn handle_connection(
                             execute_admitted_intent(
                                 send.as_ref(),
                                 intent,
+                                admission,
                                 &executor,
                                 &metrics.intent,
                                 received_at,
@@ -6581,7 +6679,7 @@ fn admit_intent(
     intent: &Intent,
     validator: &dyn crate::intent::IntentValidator,
     cx: &IntentContext,
-) -> Result<(), IntentOutcome> {
+) -> Result<IntentAdmission, IntentOutcome> {
     // 1. Signature (docs/08-persistence.md §2.2: signature checks at the
     //    edge, before any transaction work).
     if !intent.verify_issuer() {
@@ -6598,15 +6696,56 @@ fn admit_intent(
         });
     }
 
-    // 3. Admission (the Ruleset stub for now).
-    let precheck = match validator.validate(intent, cx) {
-        IntentVerdict::Admit(precheck) => precheck,
+    // 3. Admission (the Ruleset stub for now), with D29's three-outcome
+    //    admission function inside it.
+    let (precheck, provisional) = match validator.validate(intent, cx) {
+        IntentVerdict::Admit(precheck) => (precheck, false),
+        IntentVerdict::AdmitProvisional(precheck) => (precheck, true),
         IntentVerdict::Reject { reason } => return Err(IntentOutcome::Rejected { reason }),
     };
     // The FDB executor derives its read set from the intent's ops; the
     // precheck's named keys are reserved for a Ruleset-linked executor.
     let _ = precheck;
-    Ok(())
+    // The account is carried out of the *connection*, not out of the intent:
+    // it is what the outstanding cap is counted against and what an annulment
+    // notice is delivered to, and a submitter-supplied one would be a submitter
+    // choosing whose value is at risk. `provisional::classify` has already
+    // refused the `None` case, so an admitted provisional intent always has
+    // one; the type keeps that honest rather than the comment.
+    Ok(if provisional {
+        match cx.account {
+            Some(account) => IntentAdmission::Provisional { account },
+            // Unreachable through `BaselineIntentValidator`, and answered
+            // rather than unwrapped because a `Ruleset`-linked validator is
+            // free to return `AdmitProvisional` and this is the fail-closed
+            // reading of one that does so for a sessionless connection.
+            None => {
+                return Err(IntentOutcome::Rejected {
+                    reason: orrery_protocol::REASON_PROVISIONAL_INELIGIBLE,
+                })
+            }
+        }
+    } else {
+        IntentAdmission::Attested
+    })
+}
+
+/// Which of D29 clause 2's two admitting outcomes the gateway reached, carried
+/// from the receive loop to the spawned execution task.
+///
+/// The account rides along because the executor needs it and the intent does
+/// not carry it: an [`Intent`] names ops, and the ops this cluster interprets
+/// name accounts, but *which* account a quarantine is attributed to is the
+/// connection's authenticated identity and nothing else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IntentAdmission {
+    /// Ordinary admission: commit final.
+    Attested,
+    /// D29's low-population path: commit quarantined, attributed here.
+    Provisional {
+        /// The submitting connection's authenticated account.
+        account: orrery_protocol::AccountId,
+    },
 }
 
 /// Execute an intent that already passed the edge checks, then send its
@@ -6616,6 +6755,7 @@ fn admit_intent(
 async fn execute_admitted_intent(
     send: &(dyn Fn(Bytes) + Send + Sync),
     intent: Intent,
+    admission: IntentAdmission,
     executor: &Option<SharedExecutor>,
     metrics: &GatewayIntentMetrics,
     received_at: Instant,
@@ -6642,10 +6782,30 @@ async fn execute_admitted_intent(
             None => IntentOutcome::Rejected {
                 reason: REASON_NO_EXECUTOR,
             },
-            Some(exec) => match stages::timed(|t| &mut t.exec_us, exec.execute(&intent)).await {
-                Ok(outcome) => outcome,
-                Err(err) => error_outcome(&err),
-            },
+            // The two calls are the same await on the same seam and differ
+            // only in which contract the executor is being held to. Neither is
+            // a fallback for the other: the branch was decided at admission,
+            // by a predicate over the announced witness set, and an executor
+            // that cannot serve the provisional path reports a fault rather
+            // than quietly committing final.
+            Some(exec) => {
+                let executed = match admission {
+                    IntentAdmission::Attested => {
+                        stages::timed(|t| &mut t.exec_us, exec.execute(&intent)).await
+                    }
+                    IntentAdmission::Provisional { account } => {
+                        stages::timed(
+                            |t| &mut t.exec_us,
+                            exec.execute_provisional(&intent, account),
+                        )
+                        .await
+                    }
+                };
+                match executed {
+                    Ok(outcome) => outcome,
+                    Err(err) => error_outcome(&err),
+                }
+            }
         }
     })
     .await;
@@ -7478,6 +7638,7 @@ mod tests {
             .await
             .expect("valid peer is admitted");
         let mut intent = Intent {
+            evidence: None,
             intent_id: 1,
             issuer: node,
             cell_epoch: orrery_protocol::CellEpoch::new(0),
@@ -7493,7 +7654,7 @@ mod tests {
 
         assert_eq!(
             admit_intent(&intent, &validator, &session.intent_context()),
-            Ok(())
+            Ok(IntentAdmission::Attested)
         );
         assert_eq!(
             *validator.seen.lock().expect("context recorder lock"),

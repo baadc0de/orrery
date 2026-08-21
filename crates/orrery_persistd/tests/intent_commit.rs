@@ -51,6 +51,7 @@ fn secret(n: u8) -> iroh_base::SecretKey {
 /// Build a signed intent from `key` with `id` and one op.
 fn signed_intent(id: u128, key: &iroh_base::SecretKey, op: u16, args: &[u8]) -> Intent {
     let mut intent = Intent {
+        evidence: None,
         intent_id: id,
         issuer: key.public(),
         cell_epoch: CellEpoch::new(0),
@@ -1179,6 +1180,12 @@ async fn fdb_two_transfers_of_one_item_leave_one_owner() {
             .expect("a losing transfer is a Rejected outcome, never an executor error")
         {
             IntentOutcome::Committed { .. } => committed += 1,
+            // `execute` is the attested path and never produces this arm;
+            // named rather than wildcarded so a change that let it do so
+            // fails here instead of going uncounted.
+            IntentOutcome::Provisional { .. } => {
+                panic!("execute never commits provisionally")
+            }
             IntentOutcome::Rejected { reason } => {
                 assert_eq!(
                     reason,

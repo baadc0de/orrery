@@ -73,6 +73,7 @@ mod tests {
     fn proposal() -> IntentProposal {
         let issuer = key(1);
         let mut intent = Intent {
+            evidence: None,
             intent_id: 91,
             issuer: issuer.public(),
             cell_epoch: CellEpoch::new(5),
