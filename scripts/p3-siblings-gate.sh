@@ -29,8 +29,14 @@
 #      summed across the *handover window*, not merely over the run), no
 #      holder left without an `Expire`, nothing lost, and the player-facing
 #      window inside its stated budget.
+#   7. the P5 dupe gauntlet's arm (b) (issue #152): the same item offered twice
+#      at the same instant through the two gateways, over many rounds, leaves
+#      exactly one owner in the durable tier — read back from FoundationDB, not
+#      inferred from the acks — with exactly one receipt, the loser definitively
+#      refused, the two attempts measurably in flight together, and the
+#      cluster's own conflict counter non-zero over the leg.
 #
-# Clause 6 runs *before* both kills. The kills are about processes ending;
+# Clauses 6 and 7 run *before* both kills. The kills are about processes ending;
 # a handover is the case D26 says had no answer anywhere in the accepted set —
 # an owner that is still alive — and the recovery path every other clause
 # exercises is built on the assumption that the previous owner is gone.
@@ -195,10 +201,24 @@ if [[ ${1:-} == --self-test ]]; then
   runs P3_SIBLINGS_BIN 1 '--handover-budget-ms "$HANDOVER_BUDGET_MS"' \
     || die 'self-test: the handover window is measured against no budget'
 
+  # ── The double-spend race (issue #152, P5 arm (b)) ──
+  # Three flags, and the first is the one that makes the arm an assertion about
+  # the ledger rather than about two acks: without a cluster file the harness
+  # cannot read `ledger/item/{uid}` back at all, and "the loser got an error"
+  # is not the criterion. Asserted against the harness's own invocation for the
+  # same reason every other stage here is — `ORRERY_FDB_CLUSTER_FILE` appears
+  # in both persistd launches and in the `${VAR:?...}` usage line above.
+  runs P3_SIBLINGS_BIN 1 '--fdb-cluster-file "$ORRERY_FDB_CLUSTER_FILE"' \
+    || die 'self-test: the harness cannot read the ledger back, so the double-spend race would be judged from acks'
+  runs P3_SIBLINGS_BIN 1 '--race-rounds "$RACE_ROUNDS"' \
+    || die 'self-test: the double-spend race has no rounds; one round is a coin flip'
+  runs P3_SIBLINGS_BIN 1 '--race-period-ms "$RACE_PERIOD_MS"' \
+    || die 'self-test: the race rounds have no cadence'
+
   # A proof harness is only a proof if its verdict is load-bearing.
   has 'sibling_status -ne 0' || die 'self-test: harness verdict not enforced'
   has 'touch "$out/PASSED"' || die 'self-test: success artifact absent'
-  echo 'self-test: two gateways, disjoint shards, seeded world, both kills, the live handover and the summed invariant present'
+  echo 'self-test: two gateways, disjoint shards, seeded world, both kills, the live handover, the double-spend race and the summed invariant present'
   exit 0
 fi
 
@@ -213,13 +233,23 @@ for tool in "$PERSISTD_BIN" "$P3_SIBLINGS_BIN" "$COORDINATOR_BIN" "$ORRERY_SEED_
 done
 
 PEERS=${P3_SIBLINGS_PEERS:-8}
-# Two settle budgets (12.05 s each), the attestation wait, the claim storm, and
-# now the handover leg: each moved shard waits for both registrars' 1 Hz
-# exports to account for it before its clause is judged, so five moves add
-# ~30 s. The harness refuses to start if this is too small rather than
-# discovering it 70 s in, and the figure it computes is the authority — this is
-# a default that has to clear it.
-DURATION_SECS=${P3_SIBLINGS_DURATION_SECS:-110}
+# The double-spend race: how many times one item is offered twice at once, and
+# how far apart the rounds are. Twenty-four rather than one because a single
+# round is a coin flip and the failure this leg is written against — a race
+# that degenerated into a sequence — shows up as a distribution, not as an
+# outcome. The cadence is well over a round trip: the loser's answer costs a
+# conflict, a `db.run` retry and a re-read, and a round that fired before the
+# previous one settled would contend with *itself*.
+RACE_ROUNDS=${P3_SIBLINGS_RACE_ROUNDS:-24}
+RACE_PERIOD_MS=${P3_SIBLINGS_RACE_PERIOD_MS:-250}
+# Two settle budgets (12.05 s each), the attestation wait, the claim storm, the
+# handover leg and the race leg: each moved shard waits for both registrars'
+# 1 Hz exports to account for it before its clause is judged, so five moves add
+# ~30 s, and the race adds its rounds plus the two racers' connect-and-fund and
+# the cluster's status-gather lag. The harness refuses to start if this is too
+# small rather than discovering it 70 s in, and the figure it computes is the
+# authority — this is a default that has to clear it.
+DURATION_SECS=${P3_SIBLINGS_DURATION_SECS:-150}
 SCENARIO=${P3_SIBLINGS_SCENARIO:-"$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/crates/orrery_seed/scenarios/p2demo.toml"}
 # The `ci` rung of the P2 demo scenario: 100 rows, hash-placed, one per shard.
 # Small on purpose and not arbitrarily so — an interest grant may cover at most
@@ -488,6 +518,9 @@ set +e
   --metrics-b "$out/metrics-b.jsonl" \
   --shards-b "$out/shards-b.txt" \
   --gateway-b-pid "$PERSISTD_B_PID" \
+  --fdb-cluster-file "$ORRERY_FDB_CLUSTER_FILE" \
+  --race-rounds "$RACE_ROUNDS" \
+  --race-period-ms "$RACE_PERIOD_MS" \
   "${handover_flags[@]}" \
   --handover-request "$out/handover.json" \
   --handover-successor-node "$GATEWAY_B_CLUSTER_NODE" \

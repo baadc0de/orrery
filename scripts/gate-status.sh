@@ -413,7 +413,22 @@ gate_p3_siblings_evidence() {
     handover_worst_window_ms: .handover.worst_window_ms,
     handover_budget_ms: .handover.budget_ms,
     handover_within_split_target: .handover.within_split_handover_target,
-    handover_clean: .handover.passed
+    handover_clean: .handover.passed,
+    race_rounds: .race.rounds,
+    race_attempts_a: .race.attempts_gateway_a,
+    race_attempts_b: .race.attempts_gateway_b,
+    race_commits: .race.commits,
+    race_commits_a: .race.commits_gateway_a,
+    race_commits_b: .race.commits_gateway_b,
+    race_rounds_one_owner: .race.rounds_with_one_owner,
+    race_rounds_one_receipt: .race.rounds_with_one_receipt,
+    race_rounds_loser_refused: .race.rounds_loser_definitively_refused,
+    race_rounds_overlapped: .race.rounds_overlapped,
+    race_max_dispatch_skew_us: .race.max_dispatch_skew_us,
+    race_conflicts_observed: .race.conflicts_observed,
+    race_unanswered: .race.unanswered_attempts,
+    race_value_conserved: .race.value_conserved,
+    race_clean: .race.passed
   }' "$dir/report.json" 2>/dev/null || echo '{}')
   if [[ -e $dir/PASSED ]]; then status=PASSED; else status=FAILED; fi
   ev "$status" "$dir" "$numbers"
