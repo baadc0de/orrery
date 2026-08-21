@@ -46,7 +46,9 @@ const LENGTH_PREFIX_LEN: usize = 4;
 
 /// An open gateway session: a raw iroh connection past the admission stream.
 pub struct Session {
-    /// Held for its lifetime: closing it ends every connection made from it.
+    /// Held for its lifetime, not read: dropping the endpoint closes every
+    /// connection made from it, which would tear the session down mid-run.
+    #[allow(dead_code)]
     endpoint: iroh::Endpoint,
     pub connection: iroh::endpoint::Connection,
     /// Replies from both transports, in arrival order. Behind a mutex so
@@ -141,16 +143,6 @@ impl Session {
                 return Some(reply);
             }
         }
-    }
-
-    /// Close this gateway session cleanly and wait for its endpoint to stop.
-    ///
-    /// The P3 drain leg relies on this path: a bare drop aborts the endpoint,
-    /// leaving the registrar to wait for lease expiry rather than running its
-    /// immediate session-cleanup path.
-    pub async fn close(self) {
-        self.connection.close(0u32.into(), b"leaving");
-        self.endpoint.close().await;
     }
 }
 

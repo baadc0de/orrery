@@ -96,8 +96,6 @@ pub struct PeerConfig {
     /// which is how the harness exercises parking.
     pub kind: ClaimKind,
     pub duration: Duration,
-    /// A file the orchestrator creates once the kill-9 criterion has settled.
-    pub drain_signal: std::path::PathBuf,
     pub log: std::path::PathBuf,
 }
 
@@ -228,11 +226,9 @@ pub async fn run(config: PeerConfig) -> Result<()> {
     let started = tokio::time::Instant::now();
     let mut uplink = tokio::time::interval(UPLINK_INTERVAL);
     let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
-    let mut drain_poll = tokio::time::interval(Duration::from_millis(50));
     // The first tick of a tokio interval fires immediately; the heartbeat
     // should not race the claims that just landed.
     heartbeat.tick().await;
-    drain_poll.tick().await;
 
     loop {
         if started.elapsed() >= config.duration {
@@ -271,14 +267,6 @@ pub async fn run(config: PeerConfig) -> Result<()> {
                     })?;
                 }
             }
-            _ = drain_poll.tick(), if config.drain_signal.exists() => {
-                // A drain is a departure, not an evacuation: the peer closes
-                // both of its existing sessions below. That lets the gateway
-                // synchronously park the held leases on session cleanup. D24
-                // keeps expiry as the redundant backstop, so no coordinator
-                // advisory receipt participates in this leg's verdict.
-                break;
-            }
             reply = session.recv(Duration::from_millis(100)) => {
                 if let Some(reply) = reply {
                     apply_unsolicited(reply, &mut held, &mut emit);
@@ -288,13 +276,10 @@ pub async fn run(config: PeerConfig) -> Result<()> {
     }
 
     emit(&PeerEvent::Done { held: held.len() });
-    // This is the graceful departure path. Close the gateway side first so
-    // every peer responding to the shared marker stops being a redistribution
-    // candidate before any one cleanup pass can hand it another lease. The
-    // coordinator close then retires the peer's island presence; D24 makes a
-    // last advisory on that session optional rather than part of the verdict.
-    session.close().await;
-    coordinator.leave().await;
+    // Keep the coordinator session alive to here: a peer that vanished from
+    // the island roster while still holding leases would be a different
+    // scenario than the one under test.
+    drop(coordinator);
     Ok(())
 }
 

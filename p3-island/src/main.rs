@@ -220,8 +220,9 @@ const SETTLE_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 /// D24's `TTL + S` backstop, measured from the last peer departure.
 ///
-/// The bound is not widened for the metrics exporter or quiescence detector:
-/// if they cannot witness the end state inside D24's bound, the gate fails.
+/// The counter's last change must land inside this bound. Establishing that it
+/// stayed unchanged takes the separate quiescence window below, but that later
+/// observation never widens the instant compared with D24's bound.
 const DRAIN_SETTLE_BUDGET: Duration = Duration::from_millis(
     LEASE_TTL.as_millis() as u64 + REGISTRAR_SWEEP_INTERVAL.as_millis() as u64,
 );
@@ -378,7 +379,6 @@ struct PeerSpec {
     entities: Vec<u64>,
     kind: ClaimKind,
     duration_secs: u64,
-    drain_signal: PathBuf,
     log: PathBuf,
 }
 
@@ -394,7 +394,6 @@ async fn run_peer(spec_path: PathBuf) -> Result<()> {
         entities: spec.entities,
         kind: spec.kind,
         duration: Duration::from_secs(spec.duration_secs),
-        drain_signal: spec.drain_signal,
         log: spec.log,
     })
     .await
@@ -437,7 +436,6 @@ async fn orchestrate(cli: Cli) -> Result<Outcome> {
         settle_budget.as_secs()
     );
     let total_entities = u64::from(cli.entities_per_peer) * u64::from(cli.peers);
-    let drain_signal = cli.out.join("drain");
 
     // ── Peers ───────────────────────────────────────────────────────────
     // Entity ids are the dev-seeded range 1..=N. The orchestrator partitions
@@ -472,7 +470,6 @@ async fn orchestrate(cli: Cli) -> Result<Outcome> {
                 ClaimKind::Weak
             },
             duration_secs: cli.duration_secs,
-            drain_signal: drain_signal.clone(),
             log: log.clone(),
         };
         std::fs::write(&spec_path, serde_json::to_vec(&spec)?)?;
@@ -824,41 +821,50 @@ async fn orchestrate(cli: Cli) -> Result<Outcome> {
 
     // ── Drain ─────────────────────────────────────────────────────────
     // The probe joined the original island only to acquire its interest grant.
-    // It holds no lease, but leaving it present would make the coordinator see
-    // an island that never empties. Its graceful close is therefore part of
-    // arranging the drain, not evidence that the drain completed.
+    // It holds no lease, and no replacement observer is introduced during the
+    // drain: an instrument that joins now could become a redistribution
+    // successor and would be participating rather than observing.
     probe_coordinator.leave().await;
-    probe.close().await;
+    drop(probe);
 
     let drain_leases_held = total_entities.saturating_sub(parked_attested);
     let drain_baseline = read_authority_counters(metrics_jsonl)?;
-    std::fs::write(&drain_signal, b"drain")
-        .with_context(|| format!("signal island drain at {}", drain_signal.display()))?;
 
-    // The marker makes each survivor take its ordinary clean departure path:
-    // it closes coordinator presence and its gateway session without moving
-    // cells. D24 makes any coordinator advisory redundant, so this leg uses
-    // only the registrar's non-invasive disposition stream as its witness.
+    // Reuse the harness's process teardown: stop every survivor without
+    // relocating it or opening a replacement session. This is deliberately
+    // the uncooperative shape D24 must survive. A process can disappear before
+    // QUIC flushes CONNECTION_CLOSE, so the registrar's own silence deadline
+    // has to turn the nominally-open session into path 2 (session teardown).
+    // The advisory Drain notice cannot be a clause: a stopped peer has no live
+    // recipient, while the expiry/silence backstop still has to park its rows.
     for (index, child) in children.iter_mut().enumerate() {
-        let status = tokio::time::timeout(DRAIN_SETTLE_BUDGET, child.wait())
-            .await
-            .with_context(|| format!("peer {index} did not leave during the drain window"))??;
         if index != VICTIM_INDEX {
-            anyhow::ensure!(
-                status.success(),
-                "peer {index} failed during the drain phase"
-            );
+            child
+                .start_kill()
+                .with_context(|| format!("tear down survivor peer {index}"))?;
         }
+    }
+    for (index, child) in children.iter_mut().enumerate() {
+        tokio::time::timeout(Duration::from_secs(5), child.wait())
+            .await
+            .with_context(|| format!("peer {index} did not finish teardown"))??;
     }
     let drain_departed_at = tokio::time::Instant::now();
     let mut drain_counters = read_authority_counters(metrics_jsonl)?;
     let mut stable_since = tokio::time::Instant::now();
+    let mut drain_last_change_in_ms = 0;
+    let mut drain_movement_observed = drain_counters != drain_baseline;
     let mut drain_counter_series = vec![authority_counter_sample(
         drain_departed_at.elapsed().as_millis() as u64,
         drain_counters,
         drain_baseline,
     )];
-    let drain_deadline = drain_departed_at + DRAIN_SETTLE_BUDGET;
+    // This is an observation guard, not the correctness bound. A change at the
+    // last legal instant still needs two quiet sweep periods before the harness
+    // can call it quiescent. The verdict below compares the change instant —
+    // not this later detection instant — with TTL + S.
+    let drain_observation_deadline =
+        drain_departed_at + DRAIN_SETTLE_BUDGET + DRAIN_QUIESCENCE_WINDOW;
     let mut drain_quiesced = false;
     loop {
         tokio::time::sleep(SETTLE_POLL_INTERVAL).await;
@@ -866,18 +872,24 @@ async fn orchestrate(cli: Cli) -> Result<Outcome> {
         if next != drain_counters {
             drain_counters = next;
             stable_since = tokio::time::Instant::now();
+            drain_last_change_in_ms = drain_departed_at.elapsed().as_millis() as u64;
+            drain_movement_observed = true;
             drain_counter_series.push(authority_counter_sample(
-                drain_departed_at.elapsed().as_millis() as u64,
+                drain_last_change_in_ms,
                 drain_counters,
                 drain_baseline,
             ));
         }
-        let parked = drain_counters.parked.saturating_sub(drain_baseline.parked);
-        if parked == drain_leases_held && stable_since.elapsed() >= DRAIN_QUIESCENCE_WINDOW {
+        // Quiescence is detected independently of the desired end state. That
+        // distinction is what made the #157 defect measurable: its counters
+        // became quiet while hundreds of rows were still held. Requiring one
+        // movement avoids mistaking the expected pre-expiry silence for the
+        // final steady state.
+        if drain_movement_observed && stable_since.elapsed() >= DRAIN_QUIESCENCE_WINDOW {
             drain_quiesced = true;
             break;
         }
-        if tokio::time::Instant::now() >= drain_deadline {
+        if tokio::time::Instant::now() >= drain_observation_deadline {
             break;
         }
     }
@@ -885,10 +897,16 @@ async fn orchestrate(cli: Cli) -> Result<Outcome> {
     let drain_reassigned = drain_counters
         .reassigned
         .saturating_sub(drain_baseline.reassigned);
-    let drain_quiesced_in_ms = drain_departed_at.elapsed().as_millis() as u64;
-    let drain_within_bound = drain_quiesced_in_ms <= DRAIN_SETTLE_BUDGET.as_millis() as u64;
+    let drain_quiescence_observed_in_ms = drain_departed_at.elapsed().as_millis() as u64;
+    let drain_quiesced_in_ms = if drain_quiesced {
+        drain_last_change_in_ms
+    } else {
+        drain_quiescence_observed_in_ms
+    };
+    let drain_within_bound =
+        drain_quiesced && drain_quiesced_in_ms <= DRAIN_SETTLE_BUDGET.as_millis() as u64;
     drain_counter_series.push(authority_counter_sample(
-        drain_quiesced_in_ms,
+        drain_quiescence_observed_in_ms,
         drain_counters,
         drain_baseline,
     ));
@@ -935,6 +953,7 @@ async fn orchestrate(cli: Cli) -> Result<Outcome> {
         "drain_expected_parked": drain_leases_held,
         "drain_quiesced": drain_quiesced,
         "drain_quiesced_in_ms": drain_quiesced_in_ms,
+        "drain_quiescence_observed_in_ms": drain_quiescence_observed_in_ms,
         "drain_quiescence_window_ms": DRAIN_QUIESCENCE_WINDOW.as_millis() as u64,
         "drain_within_bound": drain_within_bound,
         "drain_settle_budget_ms": DRAIN_SETTLE_BUDGET.as_millis() as u64,
