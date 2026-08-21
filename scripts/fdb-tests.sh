@@ -80,7 +80,32 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # they are deliberately not claimed here: the floor tracks what a change can
 # account for, and inflating it with tests nobody attributed would make the
 # next person's arithmetic wrong instead of this one's.
-FLOOR="${ORRERY_FDB_TEST_FLOOR:-374}"
+#
+# A full run measured 605 executed tests on 2026-08-21, after D29's
+# low-population path (issue #150). It adds 38, and unusually for this list
+# only four of them need the cluster. Those four are new `intent::fdb` unit
+# tests in `orrery_persistd`'s lib target rather than a new `tests/` file, and
+# they are here because each one asserts something only a real serializable
+# transaction can show: that a provisional commit writes the intent row, the
+# hold and the ledger effect together; that a held balance row is refused as an
+# input by a `get` inside the intent's own transaction; that annulment's
+# inverse, finality flip, restamped deadline and compensating receipt are one
+# transaction, and that a replay of an annulled intent re-applies nothing; and
+# that the per-account cap is enforced against the durable row.
+#
+# The remaining 34 need no cluster — 25 in `intent::provisional` covering the
+# classifier, the quarantine, the sweep, the verdict table, the deadline rule
+# and the GC interlock against the in-memory tier, four new keyspace tests for
+# the `provisional/` family and `sweepable`, four admission-predicate tests
+# including the bypass check, and one client test for the non-terminal
+# `IntentStatus` — but they run in the same invocation and count the same, so
+# the floor rises by all 38: 374 -> 412.
+#
+# The measured total is 39 above the last recorded one rather than 38, for the
+# same reason the previous entry's arithmetic was one short of its measurement:
+# one test landed between the two runs and was never attributed. It is
+# deliberately not claimed here.
+FLOOR="${ORRERY_FDB_TEST_FLOOR:-412}"
 
 # Every test file whose contents only mean anything against a real cluster. If
 # one of these reports no executed tests, the tier is dark again whatever the
@@ -218,8 +243,11 @@ self_test() {
     fi
   }
 
-  # 9 targets × 32 + 120 unit tests = 408, over the 374 floor.
-  fixture="$tmp/good.log";    emit_log "$fixture" none 32;            expect "a real run passes" pass "$fixture"
+  # 9 targets × 36 + 120 unit tests = 444, over the 412 floor. The per-target
+  # count moves with the floor: this fixture has to stay comfortably above it
+  # or the healthy case starts failing for the reason the thin case is
+  # supposed to.
+  fixture="$tmp/good.log";    emit_log "$fixture" none 36;            expect "a real run passes" pass "$fixture"
   # The same log with `CARGO_TERM_COLOR=always` escapes through it.
   sed -e 's/^     Running/     \x1b[1;32mRunning\x1b[0m/' \
       -e 's/result: ok\./result: \x1b[32mok\x1b[0m./' "$tmp/good.log" > "$tmp/colour.log"

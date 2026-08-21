@@ -144,17 +144,26 @@ pub enum GatewayMsg {
 }
 
 impl GatewayMsg {
-    /// Whether a service speaking `current` accepts a peer offering `offered`:
-    /// the rolling-upgrade window of `{V, V−1}`
-    /// ([`crate::PROTOCOL_VERSION`]), so a cluster always deploys ahead of its
-    /// clients.
+    /// Whether a service speaking `current` accepts a peer offering
+    /// `offered`: **exact equality**, because
+    /// [D29](https://github.com/baadc0de/orrery/blob/main/docs/adr/0029-low-population-path.md)
+    /// clause 5 closed the `{V, V−1}` rolling-upgrade window.
+    ///
+    /// The window existed so a cluster could deploy ahead of its clients. D29
+    /// appends a third [`crate::IntentOutcome`] arm, and postcard's positional
+    /// variant keying makes that undecodable by a version-1 client — so a
+    /// cluster that kept serving version 1 would be a cluster that has to
+    /// decide, per intent, whether the peer on the other end can be told the
+    /// truth about its own commit. The operator's decision on accepting D29
+    /// was to close the window instead, once, for all traffic. See
+    /// [`crate::PROTOCOL_VERSION`].
     ///
     /// `current` is a parameter rather than the constant because a gateway
     /// carries its own version per instance, which is what lets a test drive
-    /// both ends of the window without touching the constant.
+    /// the boundary without touching the constant.
     #[must_use]
     pub const fn protocol_accepted(current: u16, offered: u16) -> bool {
-        offered == current || offered == current.saturating_sub(1)
+        offered == current
     }
 }
 
@@ -760,6 +769,7 @@ mod tests {
             (
                 GatewayMsg::SubmitIntent {
                     intent: Intent {
+                        evidence: None,
                         intent_id: 1,
                         issuer: node(1),
                         cell_epoch: crate::CellEpoch::new(0),
@@ -929,13 +939,15 @@ mod tests {
     }
 
     #[test]
-    fn the_accepted_version_window_is_v_and_v_minus_one() {
+    fn the_accepted_version_window_is_closed_to_exactly_this_version() {
+        // D29 clause 5: the `{V, V-1}` window is dropped rather than kept.
+        // The predecessor is refused like any other mismatch, which is the
+        // whole content of the change — there is no longer a version a peer
+        // can offer other than the one the service speaks.
         assert!(GatewayMsg::protocol_accepted(3, 3));
-        assert!(GatewayMsg::protocol_accepted(3, 2));
+        assert!(!GatewayMsg::protocol_accepted(3, 2));
         assert!(!GatewayMsg::protocol_accepted(3, 1));
         assert!(!GatewayMsg::protocol_accepted(3, 4));
-        // A service at the floor accepts only itself, rather than wrapping
-        // into the top of the u16 range.
         assert!(GatewayMsg::protocol_accepted(0, 0));
         assert!(!GatewayMsg::protocol_accepted(0, u16::MAX));
     }

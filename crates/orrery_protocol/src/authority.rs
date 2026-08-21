@@ -379,18 +379,23 @@ mod tests {
     /// The wrong-owner refusal decodes under the current `PROTOCOL_VERSION`,
     /// and appending it left every older variant on the byte it already had.
     ///
-    /// Postcard keys enum variants **positionally**, so this is the whole
-    /// compatibility argument for a `{V, V−1}` window: a V−1 peer's `Deny`
-    /// names one of `Held`/`StrongHeld`/`NotEligible`/`RateLimited`/`Parked`,
-    /// and those five still encode as discriminants 0..=4 with the payloads
-    /// they always had. A reordering — not an appending — is what would break
-    /// them, silently and in both directions.
+    /// Postcard keys enum variants **positionally**, and this test is what
+    /// keeps that honest: appending a variant leaves every older one on the
+    /// byte it already had, and a *reordering* would break them silently and
+    /// in both directions.
+    ///
+    /// The `{V, V−1}` acceptance window this argument used to serve is closed
+    /// (D29 clause 5), so no peer decodes these bytes under an older version
+    /// any more. The assertion stays for the other reader it always had: a
+    /// stored value. Rows written by an earlier build are still decoded by
+    /// this one, and a reordering would misread them with no version
+    /// negotiation anywhere to catch it.
     #[test]
     fn the_wrong_owner_refusal_decodes_without_moving_the_variants_before_it() {
         assert_eq!(
             crate::PROTOCOL_VERSION,
-            1,
-            "this test pins the wire under a specific version; re-check it when the window moves"
+            2,
+            "this test pins the wire under a specific version; re-check it when the version moves"
         );
 
         let wrong_owner = DenyReason::WrongOwner {

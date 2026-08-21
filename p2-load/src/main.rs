@@ -726,6 +726,17 @@ async fn read_intent_rows(
                     IntentOutcomeEvidence::Committed { tick, minted }
                 }
                 IntentOutcome::Rejected { reason } => IntentOutcomeEvidence::Rejected { reason },
+                // D29's low-population path. This rig submits `Ruleset`-opaque
+                // ops against a gateway that does not enforce a quorum, so it
+                // never reaches that path; recording the outcome as a
+                // rejection would be wrong if it ever did, so the arm refuses
+                // instead of guessing.
+                IntentOutcome::Provisional { .. } => {
+                    anyhow::bail!(
+                        "intent {id_text} committed provisionally; this rig has no evidence \
+                         shape for D29's low-population path"
+                    )
+                }
             },
         );
     }
@@ -2428,6 +2439,18 @@ impl Rig<'_> {
                     IntentOutcome::Rejected { reason } => {
                         IntentOutcomeEvidence::Rejected { reason: *reason }
                     }
+                    // See the note in `read_intent_rows`: unreachable for this
+                    // rig's traffic, and deliberately not silently folded into
+                    // either of the other two.
+                    IntentOutcome::Provisional { .. } => {
+                        tracing::error!(
+                            intent_id,
+                            "intent committed provisionally; p2-load has no evidence shape for it"
+                        );
+                        IntentOutcomeEvidence::Rejected {
+                            reason: orrery_protocol::REASON_EXECUTOR_ERROR,
+                        }
+                    }
                 };
                 if let Some(log) = &mut self.ack_log {
                     log.record(&AckRecord::Intent {
@@ -2648,6 +2671,7 @@ fn session_token(cli: &Cli, node: NodeId) -> Result<Vec<u8>> {
 fn signed_intent(id: u128, issuer: NodeId, signing_key: &SecretKey, kind: String) -> Intent {
     debug_assert_eq!(issuer, signing_key.public());
     let mut intent = Intent {
+        evidence: None,
         intent_id: id,
         issuer,
         cell_epoch: CellEpoch::new(0),

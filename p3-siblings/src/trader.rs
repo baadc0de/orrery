@@ -217,6 +217,7 @@ fn signed_intent(
     args: Vec<u8>,
 ) -> Result<Intent> {
     let mut intent = Intent {
+        evidence: None,
         intent_id,
         issuer: secret.public(),
         // Zero because nothing reads it yet: `cell_epoch` binds the seeded
@@ -313,6 +314,13 @@ fn outcome_fields(outcome: &IntentOutcome) -> (bool, Option<u16>) {
     match outcome {
         IntentOutcome::Committed { .. } => (true, None),
         IntentOutcome::Rejected { reason } => (false, Some(*reason)),
+        // D29's low-population path never admits a transfer (clause 3 refuses
+        // every op naming a second account), and this harness sends nothing
+        // else — so this is unreachable rather than merely unlikely. Logged as
+        // "not committed" with no reason code, which is the honest shape for
+        // an outcome the sibling gate's double-spend arithmetic has no place
+        // for: a provisional commit is not a commit it may count.
+        IntentOutcome::Provisional { .. } => (false, None),
     }
 }
 

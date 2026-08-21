@@ -23,6 +23,7 @@ fn sig() -> orrery_protocol::Signature {
 
 fn intent(id: u128) -> orrery_protocol::Intent {
     orrery_protocol::Intent {
+        evidence: None,
         intent_id: id,
         issuer: node(1),
         cell_epoch: orrery_protocol::CellEpoch::new(0),

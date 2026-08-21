@@ -495,18 +495,252 @@ pub fn intent_range_end() -> Vec<u8> {
     vec![b'j']
 }
 
-/// The value stored at [`intent_key`]: the recorded outcome plus the GC
-/// deadline (docs/08-persistence.md §6 — `(outcome, gc_deadline_ms)`, default
-/// 1 h retention, swept by the same checkpoint pass that GCs despawn
-/// tombstones). The deadline is carried on the row, not re-derived, so the
-/// sweep is a pure deadline comparison.
+/// Where one intent stands between commit and certainty
+/// ([D29](../../../../docs/adr/0029-low-population-path.md) clause 5).
+///
+/// # Why a field on the existing row and not a second key family
+///
+/// A `provisional/{intent_id}` family was considered by the record and
+/// rejected: it would put the answer to "did this intent happen" in two rows
+/// that a crash between them can disagree about, in the one code path whose
+/// entire purpose is that there is only ever one answer. The idempotency read
+/// at the top of every intent transaction keeps returning exactly one row, and
+/// that row now carries both halves of the answer — what the intent did, and
+/// whether the cluster has stood behind it yet.
+///
+/// # The three states are not a progression a reader may assume
+///
+/// [`Self::Final`] is reached two ways — an attested commit is born final, and
+/// a provisional one is promoted by spot replay — and the durable row does not
+/// distinguish them, deliberately: a finalized intent is a finalized intent,
+/// and a reader that treated "was once provisional" as a taint would be
+/// re-inventing the cascade D29 clause 4 exists to remove.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub enum IntentFinality {
+    /// Committed with the cluster standing behind it: either attested at
+    /// admission, or provisional and since finalized by spot replay.
+    #[default]
+    Final,
+    /// Committed on D29's low-population path and **quarantined**: durable,
+    /// visible and attributable, and an input to nothing until the cluster
+    /// finalizes it.
+    Provisional,
+    /// Committed provisionally and reversed by a forward-written inverse
+    /// (D29 clause 8). The row survives its reversal — that is what lets a
+    /// replay be answered — and its GC deadline is restamped from the
+    /// annulment rather than from the commit.
+    Annulled,
+}
+
+impl IntentFinality {
+    /// A short stable label for logs and metrics.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Final => "final",
+            Self::Provisional => "provisional",
+            Self::Annulled => "annulled",
+        }
+    }
+}
+
+/// The value stored at [`intent_key`]: the recorded outcome, the GC deadline
+/// (docs/08-persistence.md §6 — default 1 h retention, swept by the same
+/// checkpoint pass that GCs despawn tombstones), and D29 clause 5's finality
+/// state. The deadline is carried on the row, not re-derived, so the sweep is
+/// a pure deadline comparison.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct IntentRow {
     /// The outcome the intent committed (or was rejected) with.
     pub outcome: orrery_protocol::IntentOutcome,
     /// Unix-millisecond deadline after which the checkpoint pass may clear
-    /// the row.
+    /// the row — **and only if [`Self::finality`] permits**, see
+    /// [`sweepable`].
     pub gc_deadline_ms: u64,
+    /// D29 clause 5's durable finality state.
+    pub finality: IntentFinality,
+    /// Unix-millisecond deadline by which a [`IntentFinality::Provisional`]
+    /// row must be finalized or annulled, `0` on any other finality.
+    ///
+    /// Carried on the row rather than derived from a commit timestamp for the
+    /// same reason `gc_deadline_ms` is: the finalizer's sweep is then a
+    /// comparison and not a reconstruction, and raising the deadline for new
+    /// commits cannot retroactively extend old ones.
+    pub finalize_by_ms: u64,
+}
+
+/// D29 clause 9(c)'s GC interlock, in one predicate.
+///
+/// ```text
+/// sweepable(row)  <=>  row.finality in {Final, Annulled}
+///                      && now_ms >= row.gc_deadline_ms
+/// ```
+///
+/// # What the finality conjunct buys
+///
+/// docs/08-persistence.md §6 promises a checkpoint pass that clears these rows
+/// after their retention, and names the hazard it creates: "A client's offline
+/// intent queue TTL must be shorter than this, or a replay after a long
+/// netsplit can double-apply". A *provisional* row makes that hazard sharper —
+/// if it could be swept, a replayed provisional intent would find no
+/// idempotency row and commit a second time, which is a dupe vector wearing a
+/// garbage-collection costume. The interlock removes it by construction: a row
+/// is not sweepable while it is unresolved, whatever its deadline says.
+///
+/// It is written to be the assertion that never fires. `D_finalize` is 5
+/// minutes and the retention is 1 hour, a factor of twelve, so a provisional
+/// row is always resolved with ~55 minutes of retention left. The interlock is
+/// what catches it if that ratio is ever changed carelessly.
+///
+/// The sweep this predicate is the contract for is still unwritten — D29
+/// deliberately specified it before it exists, so whoever writes it inherits
+/// the condition rather than discovering the race in production. This function
+/// is that inheritance, and it is exported so the sweep cannot be written
+/// against a second, differently-worded version of the rule.
+#[must_use]
+pub const fn sweepable(row: &IntentRow, now_ms: u64) -> bool {
+    matches!(
+        row.finality,
+        IntentFinality::Final | IntentFinality::Annulled
+    ) && now_ms >= row.gc_deadline_ms
+}
+
+// ---------------------------------------------------------------------------
+// Provisional-hold family: `provisional/{account}`
+// ---------------------------------------------------------------------------
+//
+// D29 clauses 4 and 9(b)'s durable index, and the one row three questions are
+// answered from:
+//
+//   1. **Is this ledger row quarantined?** (Clause 4 — a provisional commit is
+//      an input to nothing.) An intent that reads a balance row reads this row
+//      too and refuses if the balance is held.
+//   2. **Is this account over its outstanding cap?** (Clause 9(b).) The entry
+//      count is the answer.
+//   3. **What must the finalizer look at next?** (Clause 7's sweep, oldest
+//      first.) The family is small — one row per account with outstanding
+//      provisional work, and empty in the steady state — so the sweep is a
+//      short range scan rather than a walk of the whole `intent/` family.
+//
+// One row rather than three families, and the reason is the reason `IntentRow`
+// carries `finality`: an account's outstanding provisional set is one fact, and
+// a second copy of it is a second thing that can disagree.
+//
+// **Why keyed by account and not by ledger key.** Clause 3 admits on the
+// provisional path only ops "whose credit and debit are both inside the
+// submitting account's rows", so every key a provisional intent can write
+// belongs to one account — the submitter's. A held key is therefore always
+// reachable from the account that owns it, and the account is what both the cap
+// and the sweep are already scoped by. A key-addressed hold family would buy
+// nothing and cost a read per named key.
+
+/// Key for an account's outstanding provisional set: `provisional/{account}`.
+///
+/// `'r'` then the 8-byte [`AccountId`] big-endian, so accounts sort by id and
+/// the family is one contiguous range for the finalizer's sweep. The prefix is
+/// `'r'` for want of a mnemonic — `'p'` is the seed-progress family and `'i'`
+/// is the intent family this one indexes into — and `'r'` was unclaimed.
+#[must_use]
+pub fn provisional_key(account: AccountId) -> [u8; 9] {
+    let mut key = [0u8; 9];
+    key[0] = b'r';
+    key[1..9].copy_from_slice(&account.0.to_be_bytes());
+    key
+}
+
+/// The first byte of the `provisional/` family span.
+#[must_use]
+pub fn provisional_range_start() -> Vec<u8> {
+    vec![b'r']
+}
+
+/// The exclusive end of the `provisional/` family span.
+///
+/// `b's'` is the `seedmap/` prefix, which is the correct exclusive bound here
+/// for the reason [`epoch_range_end`] gives: the families are adjacent and
+/// disjoint, so one past the end of `'r'` is the first key of the next family.
+#[must_use]
+pub fn provisional_range_end() -> Vec<u8> {
+    vec![b's']
+}
+
+/// One durable write a provisional intent applied, kept so annulment can write
+/// its exact inverse.
+///
+/// # Why the *applied* writes and not the intent's ops
+///
+/// D29 clause 8 requires annulment to apply "the exact inverse of the original
+/// ops", and an op is not its own inverse: `LEDGER_CREDIT_OP` carries a delta,
+/// but a `Ruleset`-opaque op carries bytes this cluster never interpreted and
+/// therefore never applied. Recording what was *written* rather than what was
+/// *asked for* makes the inverse a mechanical negation with nothing to
+/// re-interpret — and it means an annulment cannot drift from the commit if
+/// the op semantics change under it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ProvisionalWrite {
+    /// The account whose balance row moved.
+    pub account: AccountId,
+    /// The asset the balance is denominated in.
+    pub asset: AssetId,
+    /// The delta applied. Annulment applies `-delta`.
+    pub delta: i64,
+}
+
+/// One unfinalized provisional intent, as its submitting account's
+/// `provisional/{account}` row records it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ProvisionalHold {
+    /// The intent whose `intent/{intent_id}` row is `Provisional`.
+    pub intent_id: u128,
+    /// The account this hold is filed under — the row's own key, carried in
+    /// the value so a hold read out of a range scan knows where to be written
+    /// back. Not derivable from [`Self::writes`]: an intent of nothing but
+    /// `Ruleset`-opaque ops writes no balance and still holds a slot against
+    /// the cap.
+    pub account: AccountId,
+    /// The balance rows this intent wrote, and which are therefore an input
+    /// to nothing until it is finalized (D29 clause 4).
+    pub writes: Vec<ProvisionalWrite>,
+    /// Unix milliseconds at which the provisional commit landed. The sweep
+    /// orders by this — oldest first (D29 clause 7).
+    pub committed_ms: u64,
+    /// Unix-millisecond finalization deadline, mirrored from the intent row
+    /// so the sweep needs one read rather than two.
+    pub finalize_by_ms: u64,
+    /// D29 clause 6's commitment, mirrored here for the same reason: the
+    /// finalizer fetches a bundle against it and never needs the intent row.
+    pub commitment: orrery_protocol::EvidenceCommitment,
+    /// The issuer the verdict is attributed to, and whose key the fetched
+    /// bundle's signatures must verify under.
+    pub subject: orrery_protocol::NodeId,
+}
+
+/// The value stored at [`provisional_key`].
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub struct ProvisionalRow {
+    /// The account's unfinalized provisional intents, oldest first.
+    ///
+    /// Bounded at [`orrery_protocol::PROVISIONAL_OUTSTANDING_CAP`] by
+    /// admission, which is what keeps this row small enough to read on the
+    /// intent path.
+    pub holds: Vec<ProvisionalHold>,
+}
+
+impl ProvisionalRow {
+    /// Whether `(account, asset)` is written by an unfinalized provisional
+    /// intent — D29 clause 4's predicate, and the reason this row is read on
+    /// the intent path at all.
+    #[must_use]
+    pub fn holds_balance(&self, account: AccountId, asset: AssetId) -> Option<u128> {
+        self.holds
+            .iter()
+            .find(|hold| {
+                hold.writes
+                    .iter()
+                    .any(|write| write.account == account && write.asset == asset)
+            })
+            .map(|hold| hold.intent_id)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1207,6 +1441,92 @@ mod tests {
             small.as_slice() < large.as_slice(),
             "smaller intent_id sorts before larger"
         );
+    }
+
+    #[test]
+    fn provisional_key_is_9_bytes_with_r_prefix_and_big_endian_account() {
+        let key = provisional_key(AccountId::new(0x0102_0304_0506_0708));
+        assert_eq!(key.len(), 9);
+        assert_eq!(key[0], b'r');
+        assert_eq!(&key[1..], &0x0102_0304_0506_0708_u64.to_be_bytes());
+        // Accounts sort by id, which is what makes the finalizer's sweep one
+        // range read over a family that is empty in the steady state.
+        assert!(provisional_key(AccountId::new(1)) < provisional_key(AccountId::new(2)));
+    }
+
+    #[test]
+    fn provisional_range_spans_r_prefix_and_touches_no_neighbour() {
+        let start = provisional_range_start();
+        let end = provisional_range_end();
+        assert_eq!(start, vec![b'r']);
+        assert_eq!(end, vec![b's']);
+        let key = provisional_key(AccountId::new(u64::MAX)).to_vec();
+        assert!(key >= start && key < end);
+        // `'s'` is the seedmap family and `'q'` is one past seed-progress:
+        // adjacent and disjoint, which is the only property the bound needs.
+        assert!(seedmap_key([0u8; 16]).to_vec() >= end);
+    }
+
+    #[test]
+    fn the_gc_interlock_is_a_conjunction_and_not_a_deadline_alone() {
+        // D29 clause 9(c). The deadline half is what docs/08 §6 already
+        // promised; the finality half is what stops a *provisional* row from
+        // vanishing under a replay and taking the idempotency answer with it.
+        let row = |finality| IntentRow {
+            outcome: orrery_protocol::IntentOutcome::Committed {
+                tick: orrery_protocol::Tick::new(1),
+                minted: Vec::new(),
+            },
+            gc_deadline_ms: 1_000,
+            finality,
+            finalize_by_ms: 0,
+        };
+        assert!(sweepable(&row(IntentFinality::Final), 1_000));
+        assert!(sweepable(&row(IntentFinality::Annulled), 1_000));
+        assert!(!sweepable(&row(IntentFinality::Final), 999));
+        assert!(
+            !sweepable(&row(IntentFinality::Provisional), u64::MAX),
+            "unresolved is not sweepable at any clock"
+        );
+    }
+
+    #[test]
+    fn a_provisional_row_answers_which_balances_it_holds() {
+        let hold = ProvisionalHold {
+            intent_id: 7,
+            account: AccountId::new(1),
+            writes: vec![ProvisionalWrite {
+                account: AccountId::new(1),
+                asset: AssetId::new(3),
+                delta: 100,
+            }],
+            committed_ms: 0,
+            finalize_by_ms: 1,
+            commitment: orrery_protocol::EvidenceCommitment {
+                ruleset: orrery_protocol::RulesetId {
+                    version: 1,
+                    digest: [0; 32],
+                },
+                entity: PersistId::new(1),
+                window_start: orrery_protocol::Tick::new(0),
+                window_end: orrery_protocol::Tick::new(1),
+                t0_claim_hash: [0; 32],
+                log_head: orrery_protocol::ChainHash::EMPTY,
+            },
+            subject: iroh_base::SecretKey::from_bytes(&[3; 32]).public(),
+        };
+        let row = ProvisionalRow { holds: vec![hold] };
+        assert_eq!(
+            row.holds_balance(AccountId::new(1), AssetId::new(3)),
+            Some(7)
+        );
+        assert_eq!(row.holds_balance(AccountId::new(1), AssetId::new(4)), None);
+        assert_eq!(row.holds_balance(AccountId::new(2), AssetId::new(3)), None);
+        // Round-trips, because the row is read on the intent path and a
+        // decode failure there would refuse an intent for a storage reason.
+        let bytes = postcard::to_stdvec(&row).expect("encode");
+        let back: ProvisionalRow = postcard::from_bytes(&bytes).expect("decode");
+        assert_eq!(back, row);
     }
 
     #[test]

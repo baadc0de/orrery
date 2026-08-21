@@ -343,6 +343,7 @@ fn transfer_intent(
         price: PRICE,
     };
     let mut intent = Intent {
+        evidence: None,
         intent_id,
         issuer: issuer.public(),
         cell_epoch: CellEpoch::new(HANDLE),
@@ -733,6 +734,7 @@ async fn run_gauntlet(
 fn forged_empty_intent(issuer: &iroh::SecretKey, intent_id: u128) -> Intent {
     let witness = secret(149);
     let mut intent = Intent {
+        evidence: None,
         intent_id,
         issuer: issuer.public(),
         cell_epoch: CellEpoch::new(HANDLE),

@@ -534,6 +534,19 @@ fn write_gateway_intent(
             "rejected": snapshot.rejected,
             "rejected_no_executor": snapshot.rejected_no_executor,
             "lane_saturated": snapshot.lane_saturated,
+            // D29's low-population path. Every name carries the
+            // `intent_provisional_` sense the record requires, and none of
+            // them may be summed with the bulk-ack `provisional` counter in
+            // the `gateway_bulk` record: the two mechanisms have contrary
+            // remediations, and an averaged panel would say nothing about
+            // either.
+            "intent_provisional_committed": snapshot.provisional_committed,
+            "intent_provisional_refused_cap": snapshot.provisional_refused_cap,
+            "intent_provisional_refused_input": snapshot.provisional_refused_input,
+            "intent_provisional_finalized": snapshot.provisional_finalized,
+            "intent_provisional_annulled": snapshot.provisional_annulled,
+            "intent_provisional_expired": snapshot.provisional_expired,
+            "intent_annulled_replays": snapshot.annulled_replays,
             "server_us_sum": snapshot.server_us_sum,
             "server_us_max": snapshot.server_us_max,
         }),

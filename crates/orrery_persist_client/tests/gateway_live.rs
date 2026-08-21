@@ -549,6 +549,7 @@ fn area_pages_and_intents_cross_the_reliable_lane() {
 /// gateway binds `intent.issuer` to the connection's authenticated identity.
 fn signed_intent(key: &iroh_base::SecretKey, id: u128) -> orrery_protocol::Intent {
     let mut intent = orrery_protocol::Intent {
+        evidence: None,
         intent_id: id,
         issuer: key.public(),
         cell_epoch: CellEpoch::new(0),

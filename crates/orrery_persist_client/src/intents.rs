@@ -75,8 +75,54 @@ pub enum IntentStatus {
     InFlight,
     /// Committed at the given tick.
     Committed(orrery_protocol::Tick),
+    /// Committed **provisionally** on D29's low-population path: the durable
+    /// write landed and the cluster has not yet stood behind it.
+    ///
+    /// # This is the one non-terminal status a gateway can answer with
+    ///
+    /// [`Self::Draft`], [`Self::Queued`] and [`Self::InFlight`] are states
+    /// before an answer. This one is an answer that is not the end of the
+    /// story, and every property below follows from that:
+    ///
+    /// - **The local prediction holds.** It does not roll back — the value is
+    ///   real and durable — and it does not resolve terminally either, because
+    ///   the verdict is not in. A game that treats this like `Committed` is
+    ///   wrong in one direction and a game that treats it like `Rejected` is
+    ///   wrong in the other.
+    /// - **[`IntentQueue::retire`] refuses it.** The entry stays in the queue
+    ///   until the cluster finalizes or annuls it, because dropping it would
+    ///   throw away the only place the client is tracking an outcome it has
+    ///   not been given yet.
+    /// - **It is not spendable.** D29 clause 4 makes the row an input to
+    ///   nothing until finalization, and the gateway enforces that, so a
+    ///   client that spends it anyway gets
+    ///   [`orrery_protocol::REASON_PROVISIONAL_INPUT`] rather than a dupe.
+    /// - **It may be displayed, and must not be displayed as final.** The
+    ///   player has the item. Whether the game renders "pending" is the game's
+    ///   call; whether the value moves is not.
+    Provisional {
+        /// The tick at which the provisional commit was recorded.
+        tick: orrery_protocol::Tick,
+        /// Unix-millisecond deadline by which the cluster finalizes or annuls
+        /// it. Reaching it annuls; it never auto-finalizes.
+        finalize_by: u64,
+    },
     /// Rejected by the gateway (validation or a durable invariant).
     Rejected(orrery_protocol::IntentOutcome),
+}
+
+impl IntentStatus {
+    /// Whether the gateway's answer is final.
+    ///
+    /// The distinction the third [`IntentOutcome`] arm was spent to make: a
+    /// provisional commit is an answer, and it is not a terminal one. Every
+    /// caller that used to ask "did this resolve" by matching `Committed |
+    /// Rejected` is a caller that has to decide about this state, which is
+    /// exactly what an enum arm buys over a boolean.
+    #[must_use]
+    pub const fn is_terminal(&self) -> bool {
+        matches!(self, Self::Committed(_) | Self::Rejected(_))
+    }
 }
 
 /// What the submitter knows about one announced witness's answer.
@@ -587,6 +633,21 @@ impl IntentQueue {
                 }
                 IntentStatus::Committed(*tick)
             }
+            IntentOutcome::Provisional {
+                tick, finalize_by, ..
+            } => {
+                // The latency histograms deliberately do **not** move here.
+                // They measure submit-to-commit against D16's p99 < 10 ms
+                // budget, and a provisional commit is a durable write on that
+                // same path — but folding it in would mean the series silently
+                // mixed two populations, one of which the cluster has not
+                // finished judging. The provisional rate is counted on the
+                // gateway, under its own name.
+                IntentStatus::Provisional {
+                    tick: *tick,
+                    finalize_by: *finalize_by,
+                }
+            }
             IntentOutcome::Rejected { .. } => IntentStatus::Rejected(outcome.clone()),
         };
         Some(IntentTicket(intent_id))
@@ -596,12 +657,29 @@ impl IntentQueue {
     ///
     /// The game calls this once it has observed the terminal status, freeing
     /// the slot and (if disk-backed) removing the intent from the store.
-    /// Returns the ticket if the intent was present.
+    /// Returns the ticket if the intent was present **and terminal**.
+    ///
+    /// # A provisional intent is not retirable, and the refusal is here
+    ///
+    /// D29 clause 4: a client's prediction holds across a provisional commit —
+    /// it neither rolls back nor resolves — so retiring one would drop the
+    /// only record the client has of an outcome it has not been given yet.
+    /// The refusal lives in this function rather than in every caller because
+    /// the natural call site is "the game observed a status and is done with
+    /// it", and a game reading `Provisional` as done is the mistake worth
+    /// making impossible.
+    ///
+    /// Returns `None` for a provisional entry, which is the same answer it
+    /// already gives for an intent that is not present — both mean "nothing
+    /// was retired", and neither is an error.
     pub fn retire(&mut self, intent_id: u128) -> Option<IntentTicket> {
         let idx = self
             .queue
             .iter()
             .position(|e| e.intent.intent_id == intent_id)?;
+        if !self.queue[idx].status.is_terminal() {
+            return None;
+        }
         self.queue.remove(idx);
         let _ = self.store.remove(intent_id);
         Some(IntentTicket(intent_id))
@@ -770,6 +848,7 @@ mod tests {
 
     fn intent(id: u128) -> Intent {
         Intent {
+            evidence: None,
             intent_id: id,
             issuer: node(1),
             cell_epoch: CellEpoch::new(0),
@@ -1019,6 +1098,59 @@ mod tests {
         );
         // Retire frees the slot.
         queue.retire(1);
+        assert_eq!(queue.len(), 0);
+    }
+
+    #[test]
+    fn a_provisional_ack_is_a_non_terminal_status_that_cannot_be_retired() {
+        // D29 clause 4's client half, in one test. The three properties it
+        // asserts are the three a game gets wrong if the outcome is a boolean
+        // on `Committed` instead of an arm of its own:
+        //
+        //  - the status is distinguishable from `Committed`, so a game does
+        //    not present quarantined value as final;
+        //  - it is not terminal, so the local prediction holds — it neither
+        //    rolls back (the value is real) nor resolves (the verdict is not
+        //    in);
+        //  - `retire` refuses it, so the client cannot forget the one intent
+        //    whose outcome it has not been given yet.
+        let mut queue = IntentQueue::new(10);
+        let ticket = queue.submit(intent(1)).unwrap();
+        queue.on_ack(
+            1,
+            IntentOutcome::Provisional {
+                tick: Tick::new(5),
+                minted: vec![],
+                finalize_by: 1_700_000_000_000,
+            },
+        );
+        assert_eq!(
+            queue.status(ticket),
+            IntentStatus::Provisional {
+                tick: Tick::new(5),
+                finalize_by: 1_700_000_000_000,
+            }
+        );
+        assert!(!queue.status(ticket).is_terminal());
+        assert_eq!(
+            queue.retire(1),
+            None,
+            "a provisional intent is not retirable"
+        );
+        assert_eq!(queue.len(), 1, "and stays in the queue");
+
+        // The cluster finalizes it later; the terminal ack is what frees the
+        // slot. A `Committed` arriving after a `Provisional` is the ordinary
+        // shape of a finalized low-population intent from the client's side.
+        queue.on_ack(
+            1,
+            IntentOutcome::Committed {
+                tick: Tick::new(5),
+                minted: vec![],
+            },
+        );
+        assert!(queue.status(ticket).is_terminal());
+        assert_eq!(queue.retire(1), Some(ticket));
         assert_eq!(queue.len(), 0);
     }
 

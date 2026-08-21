@@ -106,6 +106,81 @@ impl AdjudicationExecutor {
         };
         (registered.worker)(report.subject, &report.bundle)
     }
+
+    /// D29 clause 7's second entry point: finalize one provisional intent by
+    /// spot replay.
+    ///
+    /// # Why this cannot be `adjudicate` with a synthesised report
+    ///
+    /// [`Self::adjudicate`] opens by verifying the *reporter's* signature, and
+    /// that check has no meaning here: a provisional finalization has no
+    /// reporter and no accusation. There is nobody claiming anything — the
+    /// cluster is checking its own outstanding work. Wrapping the bundle in a
+    /// [`DiscrepancyReport`] would mean the cluster signing an accusation
+    /// against a player in order to satisfy a check it wrote for a different
+    /// situation, which is a worse fiction than a second entry point.
+    ///
+    /// What *is* shared is the executor itself, and deliberately:
+    /// [`RETAINED_BUILDS`] is the scarce resource, and two registries would
+    /// give two answers to "which build adjudicates this window" — the exact
+    /// failure the version-keyed routing exists to prevent.
+    ///
+    /// # The commitment check comes first
+    ///
+    /// Before any replay, the fetched bundle must reproduce the
+    /// [`EvidenceCommitment`] the intent was committed under. That is the only
+    /// property clause 6 traded the attached evidence for: the submitter
+    /// pinned the history before it knew what the cluster would ask, so a
+    /// bundle that does not match is a substituted one. It is answered with
+    /// `EvidenceForged` — and note that this verdict strikes the *submitter*
+    /// here, where on the report path it protects an accused peer by striking
+    /// the reporter. On this path the evidence's author and the intent's
+    /// submitter are one account, which is the asymmetry D29 flags for review.
+    ///
+    /// # What spot replay proves, exactly
+    ///
+    /// That the submitter's claimed history across `[t₀, t_intent)` is
+    /// self-consistent, correctly signed, chain-continuous, and reproduces its
+    /// own state claims under the pinned build. It does **not** re-check the
+    /// ledger invariant — that check already ran, inside the serializable
+    /// transaction, and D11 keeps that transaction the sole authority over
+    /// durable truth. The gap this closes is the one attestation would have
+    /// closed: whether the intent was grafted onto a history nobody saw.
+    ///
+    /// Stating it narrowly matters, because a reader who believes finalization
+    /// re-audits the economy will not build the conservation auditor that P5
+    /// exit still owes.
+    #[must_use]
+    pub fn finalize_provisional(
+        &self,
+        subject: NodeId,
+        commitment: &orrery_protocol::EvidenceCommitment,
+        bundle: &orrery_protocol::EvidenceBundle,
+        log_head: orrery_protocol::ChainHash,
+    ) -> Verdict {
+        if !crate::intent::provisional::commitment_matches(commitment, bundle, log_head) {
+            return crate::intent::provisional::mismatch_verdict();
+        }
+        // Routed by the **commitment's** ruleset, not the bundle's. They are
+        // equal — `commitment_matches` just proved it — and taking it from the
+        // commitment is what makes that equality load-bearing rather than
+        // incidental: the build that judges the window is the build the
+        // submitter pinned at commit time, and no later-fetched artifact can
+        // move it.
+        let Some(registered) = self
+            .builds
+            .iter()
+            .find(|registered| registered.id == commitment.ruleset)
+        else {
+            // Never a strike. `RETAINED_BUILDS` bounds both workloads, so an
+            // intent pinning a build older than the last three is annulled
+            // with nobody at fault — a new way for an honest player to lose an
+            // item during a rules upgrade, and the same trade the report path
+            // already accepted.
+            return crate::intent::provisional::unknown_ruleset_verdict();
+        };
+        (registered.worker)(subject, bundle)
+    }
 }
 
 #[cfg(test)]

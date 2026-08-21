@@ -393,6 +393,7 @@ async fn a_gateway_with_no_metrics_sink_still_accumulates_every_counter() {
     // Intent: no executor is configured, so the honest answer is a rejection —
     // which is still one definitive reply, and still one measured span.
     let mut intent = Intent {
+        evidence: None,
         intent_id: 71,
         issuer: peer.public(),
         cell_epoch: CellEpoch::new(0),
@@ -582,6 +583,7 @@ async fn a_persistd_run_emits_the_two_server_spans_and_never_a_gated_name() {
     );
 
     let mut intent = Intent {
+        evidence: None,
         intent_id: 91,
         issuer: client_key.public(),
         cell_epoch: CellEpoch::new(0),

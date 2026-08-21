@@ -77,6 +77,7 @@ fn secret(n: u8) -> iroh_base::SecretKey {
 /// has nothing to object to but the attestations.
 fn signed_intent(id: u128, key: &iroh_base::SecretKey) -> Intent {
     let mut intent = Intent {
+        evidence: None,
         intent_id: id,
         issuer: key.public(),
         cell_epoch: CellEpoch::new(0),

@@ -33,6 +33,12 @@ mod fdb;
 #[cfg(feature = "fdb")]
 pub use fdb::{FdbIntentExecutor, IntentFence};
 
+pub mod provisional;
+pub use provisional::{
+    EvidenceSource, FetchedEvidence, Finalization, FinalizerReport, ProvisionalFinalizer,
+    ProvisionalStore, ReplayJudge,
+};
+
 pub mod stages;
 pub use stages::{intent_stage_metrics, IntentStageMetrics, IntentStageSnapshot, IntentTrace};
 
@@ -55,8 +61,29 @@ pub struct IntentPrecheck {
 /// `Ruleset`-defined reason code carried in `IntentOutcome::Rejected`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IntentVerdict {
-    /// Admit the intent to execution.
+    /// Admit the intent to execution, with the cluster standing behind it: it
+    /// carries the required co-signatures, or this gateway does not enforce a
+    /// quorum at all.
     Admit(IntentPrecheck),
+    /// Admit the intent to **D29's low-population path**: commit it, and
+    /// quarantine it until spot replay finalizes or annuls it.
+    ///
+    /// # This is not a weaker `Admit`
+    ///
+    /// It is a different destination. The executor writes a different finality
+    /// onto the durable row, the client is told a different outcome, and the
+    /// value the intent creates is an input to nothing until the cluster has
+    /// re-executed the history behind it. Every property of this path is worse
+    /// for the submitter than the attested path — not spendable at commit,
+    /// replayed with probability 1, and usable only after `D_finalize` — which
+    /// is what makes manufacturing low population self-defeating (D29
+    /// clause 3).
+    ///
+    /// Reached **only** when the announced witness set cannot supply `N`
+    /// eligible members, or this gateway cannot resolve the cell-epoch the
+    /// intent names at all (D27 clause (e)). An intent that could have been
+    /// attested and simply was not is [`Self::Reject`], never this.
+    AdmitProvisional(IntentPrecheck),
     /// Reject the intent; `reason` maps onto
     /// `IntentOutcome::Rejected { reason }` (persist.rs's never-before-
     /// constructed variant — validation failures are a *rejection*, not an
@@ -434,6 +461,24 @@ pub enum RejectionCause {
     /// one describes a submitter that asked to be judged somewhere it does
     /// not stand, which is a refusal at every population.
     NoStandingInCell,
+    /// The intent fell to D29's low-population path and is not the kind of
+    /// intent a forward-written inverse can undo (D29 clause 3's
+    /// `reversible(i)`).
+    ///
+    /// Value *creation* into the submitter's own rows is admitted; value
+    /// *transfer* is refused, because annulling a transfer takes value from a
+    /// second account that did nothing wrong and could not have known. See
+    /// [`provisional::classify`] for the full statement and for the negative
+    /// delta case.
+    ProvisionalIneligible,
+    /// The intent fell to D29's low-population path carrying no
+    /// [`orrery_protocol::EvidenceCommitment`], so nothing could ever finalize
+    /// it.
+    ///
+    /// Committing it would mint durable value with a guaranteed expiry five
+    /// minutes later, turning a free refusal into the one outcome D29
+    /// clause 9(b) is arranged to avoid.
+    ProvisionalNoEvidence,
     /// A witness the draw named did not attest.
     ///
     /// The conjunct that makes K-of-N mean something: `required(I) ⊆ the
@@ -471,6 +516,8 @@ impl RejectionCause {
             Self::WitnessOutsideAnnouncedSet => "witness_outside_announced_set",
             Self::ThresholdNotMet => "threshold_not_met",
             Self::RequiredWitnessMissing => "required_witness_missing",
+            Self::ProvisionalIneligible => "provisional_ineligible",
+            Self::ProvisionalNoEvidence => "provisional_no_evidence",
         }
     }
 
@@ -508,6 +555,16 @@ impl RejectionCause {
             | Self::WitnessOutsideAnnouncedSet
             | Self::ThresholdNotMet
             | Self::RequiredWitnessMissing => orrery_protocol::REASON_ATTESTATION_QUORUM,
+            // The two provisional causes do **not** collapse into the quorum
+            // code, and the reason is the reason the quorum code exists at
+            // all: a client needs to know whether resubmitting can work.
+            // `REASON_ATTESTATION_QUORUM` says "collect more co-signatures",
+            // which is precisely the advice that cannot help here — there was
+            // nobody to collect them from, which is how the intent reached
+            // this path. These two say something else: change the intent
+            // (drop the transfer) or attach a commitment.
+            Self::ProvisionalIneligible => orrery_protocol::REASON_PROVISIONAL_INELIGIBLE,
+            Self::ProvisionalNoEvidence => orrery_protocol::REASON_PROVISIONAL_NO_EVIDENCE,
             _ => orrery_protocol::REASON_VALIDATION_FAILED,
         }
     }
@@ -1092,6 +1149,60 @@ impl BaselineIntentValidator {
     /// which is the same monotonic source the epoch cache stamps acceptance
     /// with.
     ///
+    /// # D29 clause 2's admission function lives here
+    ///
+    /// ```text
+    /// attested(i)                                ->  commit, finality = Final
+    /// !attested(i) && low_pop(i) && reversible(i) ->  commit, finality = Provisional
+    /// otherwise                                   ->  refuse
+    /// ```
+    ///
+    /// with `low_pop(i)` evaluated against the **announced** `epoch/{cell_id}`
+    /// record with the intent's parties removed — never live presence, which a
+    /// submitter can manufacture by dropping its friends' sessions. The
+    /// announced set is coordinator-seeded, rate-limited against reseed
+    /// grinding and durable, so `|elig(i)|` is a fact about a committed record
+    /// rather than about the instant of submission.
+    ///
+    /// The third line is the one that matters most, and it is why
+    /// [`RejectionCause::ThresholdNotMet`] and
+    /// [`RejectionCause::RequiredWitnessMissing`] stay refusals: an intent that
+    /// *could* have been attested and simply was not is refused. Provisional
+    /// commit is not a general-purpose relief valve for a missing signature; it
+    /// is the answer to one specific fact about the world, namely that there
+    /// was nobody there to sign.
+    ///
+    /// # Which causes reach the provisional path, and one divergence worth
+    /// naming
+    ///
+    /// Exactly one: [`RejectionCause::LowPopulationEpoch`], which is
+    /// `|elig(i)| < N` and nothing else.
+    ///
+    /// **D27 clause (e) asks for more than that** — it says an intent whose
+    /// cell-epoch this gateway cannot resolve
+    /// ([`RejectionCause::UnknownEpoch`]) or whose epoch has aged out
+    /// ([`RejectionCause::EpochStale`]) should also reach a provisional commit,
+    /// "never refusal and never silent full admission". D29 clause 2, which is
+    /// the later record and the one that actually defines this function, states
+    /// the predicate as `low_pop(i) ⟺ |elig(i)| < N` and makes admission a
+    /// total function with three outcomes whose second line needs `low_pop` to
+    /// be *defined* — and for an unresolvable handle `E(c,e)` does not exist,
+    /// so it is not.
+    ///
+    /// This implements D29's predicate. The divergence is deliberate, it is
+    /// the strictly safer of the two directions (an unresolvable epoch is
+    /// refused rather than committed), and it is recorded here rather than
+    /// silently resolved because closing it properly is a decision, not an
+    /// implementation choice: either D27 clause (e)'s two extra cases get a
+    /// population predicate that is defined without an announcement, or D29
+    /// narrows them the way clause 1 narrowed the field-host fallback.
+    ///
+    /// [`RejectionCause::NoStandingInCell`] is emphatically **not** on this
+    /// path, and D30 says why in as many words: the other causes describe a
+    /// gateway that cannot judge, and this one describes a submitter that asked
+    /// to be judged somewhere it does not stand — a refusal at every
+    /// population.
+    ///
     /// # Errors
     ///
     /// The first [`RejectionCause`] the intent trips.
@@ -1100,10 +1211,15 @@ impl BaselineIntentValidator {
         intent: &Intent,
         cx: &IntentContext,
         now_ms: u64,
-    ) -> Result<IntentPrecheck, RejectionCause> {
+    ) -> Result<Admission, RejectionCause> {
         let precheck = Self::check(intent, cx)?;
         if self.enforcement == AttestationEnforcement::Off {
-            return Ok(precheck);
+            // No quorum is enforced, so no intent is *un*attested in the sense
+            // clause 2 means, and the provisional path is unreachable. That is
+            // the correct reading rather than a shortcut: D29's second line
+            // needs `low_pop(i)`, and `low_pop` is a statement about an
+            // announced set this validator is not consulting.
+            return Ok(Admission::Attested(precheck));
         }
         // Enforcing with no cache configured is a misconfiguration, and it
         // fails closed: a gateway that cannot resolve any epoch holds no
@@ -1125,15 +1241,69 @@ impl BaselineIntentValidator {
         // filter already documents: an oversized or malformed submission never
         // pays for a witness-set resolution, and a self-witnessed one never
         // reaches the draw.
-        check_attestation_quorum(intent, epochs.as_ref(), interest.as_ref(), now_ms)?;
-        Ok(precheck)
+        match check_attestation_quorum(intent, epochs.as_ref(), interest.as_ref(), now_ms) {
+            Ok(_eligible) => Ok(Admission::Attested(precheck)),
+            // The second line of clause 2's admission function, in full: the
+            // population predicate held, so `reversible(i)` decides. A failure
+            // here is a *refusal*, not a fallback to the fallback — an intent
+            // that is both unwitnessable and unreversible has no safe home.
+            Err(RejectionCause::LowPopulationEpoch) => {
+                provisional::classify(intent, cx.account)?;
+                Ok(Admission::Provisional(precheck))
+            }
+            Err(cause) => Err(cause),
+        }
+    }
+}
+
+/// Which of D29 clause 2's two admitting outcomes an intent reached.
+///
+/// A two-arm enum rather than a boolean on [`IntentPrecheck`], for the reason
+/// D29 gives for spending an [`IntentOutcome`] arm instead of a flag: the
+/// compiler then names every site that has to decide. The two destinations
+/// differ in the durable finality written, the outcome the client is told, and
+/// whether the value is an input to anything — which is more than a
+/// `provisional: bool` on an otherwise identical path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Admission {
+    /// Commit with the cluster standing behind it.
+    Attested(IntentPrecheck),
+    /// Commit on D29's low-population path, quarantined until spot replay.
+    Provisional(IntentPrecheck),
+}
+
+impl Admission {
+    /// The read plan, whichever path admitted the intent.
+    #[must_use]
+    pub fn precheck(&self) -> &IntentPrecheck {
+        match self {
+            Self::Attested(precheck) | Self::Provisional(precheck) => precheck,
+        }
+    }
+
+    /// Whether this admission is D29's low-population path.
+    #[must_use]
+    pub const fn is_provisional(&self) -> bool {
+        matches!(self, Self::Provisional(_))
     }
 }
 
 impl IntentValidator for BaselineIntentValidator {
     fn validate(&self, intent: &Intent, cx: &IntentContext) -> IntentVerdict {
         match self.check_at(intent, cx, crate::lease::registrar_now_ms()) {
-            Ok(precheck) => IntentVerdict::Admit(precheck),
+            Ok(Admission::Attested(precheck)) => IntentVerdict::Admit(precheck),
+            Ok(Admission::Provisional(precheck)) => {
+                // Info, not debug: a provisional commit is a durable write the
+                // cluster has not yet stood behind, and an operator reading a
+                // nonzero rate of these is reading a fact about how empty the
+                // world is. It is not an error and it is not routine either.
+                tracing::info!(
+                    intent_id = intent.intent_id,
+                    issuer = %cx.issuer,
+                    "intent admitted to the low-population provisional path"
+                );
+                IntentVerdict::AdmitProvisional(precheck)
+            }
             Err(cause) => {
                 // Debug, not warn: a rejection is an ordinary answer to a bad
                 // request, and the gateway's `rejected` counter is the signal
@@ -1386,6 +1556,48 @@ pub trait IntentExecutor: Send + Sync {
     /// Execute `intent`, returning its outcome. The gateway acks only after
     /// this future resolves.
     async fn execute(&self, intent: &Intent) -> Result<IntentOutcome, IntentError>;
+
+    /// Execute `intent` on D29's low-population path, attributing the
+    /// quarantine to `account`.
+    ///
+    /// The durable effects are applied exactly as [`Self::execute`] applies
+    /// them — this is a real commit, and the reply is sent after the
+    /// transaction resolves, so RPO 0 is untouched. What differs is what the
+    /// row records and what the ledger then refuses: the
+    /// `intent/{intent_id}` row carries
+    /// [`crate::keyspace::IntentFinality::Provisional`] and a finalization
+    /// deadline, the account's `provisional/{account}` row gains a hold
+    /// naming every balance the intent wrote, and any later intent that names
+    /// one of those balances is refused with
+    /// [`orrery_protocol::REASON_PROVISIONAL_INPUT`] until this one is
+    /// finalized.
+    ///
+    /// # Why a second method rather than a parameter on `execute`
+    ///
+    /// `execute` is implemented outside this crate — the harnesses carry
+    /// tripwire executors that assert it is never reached — and widening its
+    /// signature would make every one of them a compile error to gain a
+    /// parameter all but one of them would ignore. A defaulted second method
+    /// leaves the existing seam exactly as it was.
+    ///
+    /// # Errors
+    ///
+    /// The default implementation is
+    /// [`IntentError::Store`], and that is the honest answer rather than a
+    /// silent refusal: a gateway configured to enforce D27's quorum, handed an
+    /// executor with no provisional path, is misconfigured. Reporting it as an
+    /// executor fault puts it in the operator's error budget instead of in a
+    /// player's rejection rate.
+    async fn execute_provisional(
+        &self,
+        intent: &Intent,
+        account: AccountId,
+    ) -> Result<IntentOutcome, IntentError> {
+        let _ = (intent, account);
+        Err(IntentError::Store(
+            "executor has no D29 provisional path".to_owned(),
+        ))
+    }
 }
 
 /// Everything one [`MemIntentExecutor`] owns, behind **one** lock.
@@ -1398,8 +1610,13 @@ pub trait IntentExecutor: Send + Sync {
 /// executor is where the awaiting happens.
 #[derive(Debug, Default)]
 struct MemLedger {
-    /// Recorded outcomes by `intent_id` — the `intent/{intent_id}` store.
-    outcomes: HashMap<u128, IntentOutcome>,
+    /// Recorded rows by `intent_id` — the `intent/{intent_id}` store,
+    /// carrying the outcome *and* D29 clause 5's finality, exactly as the
+    /// durable row does.
+    outcomes: HashMap<u128, crate::keyspace::IntentRow>,
+    /// The `provisional/{account}` store: each account's unfinalized
+    /// provisional intents.
+    provisional: HashMap<AccountId, crate::keyspace::ProvisionalRow>,
     /// The `ledger/item/{item_uid}` rows.
     items: HashMap<orrery_protocol::ItemUid, crate::keyspace::ItemRow>,
     /// The `ledger/bal/{account}/{asset}` rows. An absent key is zero.
@@ -1507,15 +1724,72 @@ impl Default for MemIntentExecutor {
     }
 }
 
-#[async_trait::async_trait]
-impl IntentExecutor for MemIntentExecutor {
-    async fn execute(&self, intent: &Intent) -> Result<IntentOutcome, IntentError> {
+impl MemIntentExecutor {
+    /// The whole of §7 for this tier, with D29's provisional path folded in.
+    ///
+    /// `provisional` is `Some(account)` when the gateway admitted the intent
+    /// to the low-population path. Both paths run the same reads, the same
+    /// checks and the same writes — the ledger effects of a provisional commit
+    /// are real, which is the entire content of "durable, visible and
+    /// attributable" — and they differ only in what is recorded about them.
+    fn commit(
+        &self,
+        intent: &Intent,
+        provisional: Option<AccountId>,
+        now_ms: u64,
+    ) -> Result<IntentOutcome, IntentError> {
         let mut ledger = self.ledger.lock().expect("mutex");
 
         // Step 0 (§7): the idempotency row. A replay returns the recorded
-        // outcome unchanged.
+        // outcome unchanged — *including* a provisional one, which is the
+        // property the dupe gauntlet's replay arm asserts: a replayed
+        // provisional intent returns `Provisional` and not a second commit.
         if let Some(prev) = ledger.outcomes.get(&intent.intent_id) {
-            return Ok(prev.clone());
+            // An annulled intent is the one replay that does not return its
+            // recorded outcome, because its recorded outcome is no longer
+            // true: the effects were reversed. The row is still here — D29
+            // clause 9(c)'s GC interlock is what keeps it here — so the replay
+            // applies nothing and is told what happened.
+            if prev.finality == crate::keyspace::IntentFinality::Annulled {
+                return Ok(IntentOutcome::Rejected {
+                    reason: orrery_protocol::REASON_INTENT_ANNULLED,
+                });
+            }
+            return Ok(prev.outcome.clone());
+        }
+
+        // D29 clause 4, before anything is read or staged: a provisionally
+        // committed row is an input to nothing. Checked for *every* intent,
+        // not only provisional ones — the rule is about the row's state, not
+        // about who is naming it, and the intent this refuses is usually an
+        // ordinary attested one trying to spend quarantined value.
+        for (account, asset) in provisional::named_balances(intent) {
+            if ledger
+                .provisional
+                .get(&account)
+                .and_then(|row| row.holds_balance(account, asset))
+                .is_some()
+            {
+                return Ok(IntentOutcome::Rejected {
+                    reason: orrery_protocol::REASON_PROVISIONAL_INPUT,
+                });
+            }
+        }
+
+        // D29 clause 9(b): the per-account outstanding cap. A refusal, never a
+        // queue — the cluster stops admitting long before it starts annulling,
+        // because refusal costs the player nothing it had and expiry destroys
+        // value the cluster already promised.
+        if let Some(account) = provisional {
+            let outstanding = ledger
+                .provisional
+                .get(&account)
+                .map_or(0, |row| row.holds.len());
+            if outstanding >= orrery_protocol::PROVISIONAL_OUTSTANDING_CAP {
+                return Ok(IntentOutcome::Rejected {
+                    reason: orrery_protocol::REASON_PROVISIONAL_CAP,
+                });
+            }
         }
 
         // Steps 1-2 (§7): read, then check, then stage — no row is touched
@@ -1601,10 +1875,202 @@ impl IntentExecutor for MemIntentExecutor {
         ledger.next_tick += 1;
         let tick = orrery_protocol::Tick::new(ledger.next_tick);
 
-        let outcome = IntentOutcome::Committed { tick, minted };
-        ledger.outcomes.insert(intent.intent_id, outcome.clone());
+        let (outcome, finality, finalize_by_ms) = match provisional {
+            None => (
+                IntentOutcome::Committed { tick, minted },
+                crate::keyspace::IntentFinality::Final,
+                0,
+            ),
+            Some(account) => {
+                let finalize_by = provisional::finalize_by(now_ms);
+                let writes = provisional::provisional_writes(plan.writes());
+                // The commitment is present: `provisional::classify` refuses
+                // an intent without one before the gateway ever reaches this
+                // executor, and an executor reached without that check is a
+                // caller bug rather than a case to degrade for.
+                let commitment = intent
+                    .evidence
+                    .expect("classify admits no provisional intent without a commitment");
+                ledger.provisional.entry(account).or_default().holds.push(
+                    crate::keyspace::ProvisionalHold {
+                        intent_id: intent.intent_id,
+                        account,
+                        writes,
+                        committed_ms: now_ms,
+                        finalize_by_ms: finalize_by,
+                        commitment,
+                        subject: intent.issuer,
+                    },
+                );
+                (
+                    IntentOutcome::Provisional {
+                        tick,
+                        minted,
+                        finalize_by,
+                    },
+                    crate::keyspace::IntentFinality::Provisional,
+                    finalize_by,
+                )
+            }
+        };
+        ledger.outcomes.insert(
+            intent.intent_id,
+            crate::keyspace::IntentRow {
+                outcome: outcome.clone(),
+                gc_deadline_ms: now_ms + MEM_INTENT_ROW_RETENTION_MS,
+                finality,
+                finalize_by_ms,
+            },
+        );
         Ok(outcome)
     }
+
+    /// The durable row this tier recorded for `intent_id`, for tests that
+    /// assert on finality rather than on the reply.
+    #[must_use]
+    pub fn intent_row(&self, intent_id: u128) -> Option<crate::keyspace::IntentRow> {
+        self.ledger
+            .lock()
+            .expect("mutex")
+            .outcomes
+            .get(&intent_id)
+            .cloned()
+    }
+
+    /// This account's unfinalized provisional intents, oldest first.
+    #[must_use]
+    pub fn provisional_holds(&self, account: AccountId) -> Vec<crate::keyspace::ProvisionalHold> {
+        self.ledger
+            .lock()
+            .expect("mutex")
+            .provisional
+            .get(&account)
+            .map(|row| row.holds.clone())
+            .unwrap_or_default()
+    }
+}
+
+/// This tier's stand-in for `INTENT_ROW_RETENTION_MS` (1 h).
+///
+/// Defined here rather than imported because the FDB constant lives behind the
+/// `fdb` feature and this tier has to compile without it. The two must agree —
+/// the GC interlock is asserted against this one in the non-`fdb` test tier —
+/// which is why the number is written once as an hour in milliseconds in both
+/// places and never derived from the other.
+const MEM_INTENT_ROW_RETENTION_MS: u64 = 60 * 60 * 1000;
+
+#[async_trait::async_trait]
+impl IntentExecutor for MemIntentExecutor {
+    async fn execute(&self, intent: &Intent) -> Result<IntentOutcome, IntentError> {
+        self.commit(intent, None, mem_now_ms())
+    }
+
+    async fn execute_provisional(
+        &self,
+        intent: &Intent,
+        account: AccountId,
+    ) -> Result<IntentOutcome, IntentError> {
+        self.commit(intent, Some(account), mem_now_ms())
+    }
+}
+
+/// Current unix time in milliseconds, for this tier's deadlines.
+fn mem_now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// D29 clauses 7 and 8 against the in-memory ledger.
+///
+/// The point of implementing this here as well as against FoundationDB is that
+/// [`ProvisionalFinalizer`]'s sweep — the deadline rule, the verdict table, the
+/// order of operations — then has exactly one implementation, exercised by the
+/// tier that needs no cluster. What only the `fdb` tier can prove is that the
+/// annulment's writes and its finality flip land in **one** serializable
+/// transaction; this tier's mutex gives that for free and therefore proves
+/// nothing about it.
+#[async_trait::async_trait]
+impl ProvisionalStore for MemIntentExecutor {
+    async fn outstanding(&self) -> Result<Vec<crate::keyspace::ProvisionalHold>, IntentError> {
+        let ledger = self.ledger.lock().expect("mutex");
+        let mut holds: Vec<crate::keyspace::ProvisionalHold> = ledger
+            .provisional
+            .values()
+            .flat_map(|row| row.holds.iter().cloned())
+            .collect();
+        // Oldest first (D29 clause 7). The tiebreak on `intent_id` is not
+        // cosmetic: two intents committed in the same millisecond must sweep
+        // in a defined order, or a test asserting on the sweep's report is
+        // asserting on a `HashMap` iteration.
+        holds.sort_by_key(|hold| (hold.committed_ms, hold.intent_id));
+        Ok(holds)
+    }
+
+    async fn finalize(&self, hold: &crate::keyspace::ProvisionalHold) -> Result<(), IntentError> {
+        let mut ledger = self.ledger.lock().expect("mutex");
+        if let Some(row) = ledger.outcomes.get_mut(&hold.intent_id) {
+            // The outcome stays `Provisional` on the wire-typed field and the
+            // *finality* moves to `Final`, which is the split D29 clause 5
+            // draws: the outcome records what the intent did, the finality
+            // records whether the cluster has stood behind it. Rewriting the
+            // outcome to `Committed` would make a replay of a finalized intent
+            // indistinguishable from one that was never provisional, and the
+            // client that is holding a `Provisional` status needs the tick and
+            // the minted ids it was already told about to keep matching.
+            row.finality = crate::keyspace::IntentFinality::Final;
+            row.finalize_by_ms = 0;
+        }
+        release_hold(&mut ledger, hold.intent_id);
+        Ok(())
+    }
+
+    async fn annul(&self, hold: &crate::keyspace::ProvisionalHold) -> Result<(), IntentError> {
+        let mut ledger = self.ledger.lock().expect("mutex");
+        // The forward-written inverse. Nothing is deleted: the original
+        // commit's effects were applied, these are their negation, and both
+        // are in the history.
+        for write in &hold.writes {
+            *ledger
+                .balances
+                .entry((write.account, write.asset))
+                .or_insert(0) -= i128::from(write.delta);
+        }
+        // The compensating receipt. An annulment *adds* a receipt; it never
+        // removes one. A reader of the trade history sees the commit and the
+        // reversal, in that order, which is what an auditor needs and what a
+        // player owed an explanation needs.
+        ledger.receipts.push(crate::keyspace::ReceiptRow {
+            intent_id: hold.intent_id,
+            parties: hold.writes.iter().map(|write| write.account).collect(),
+            ops: Vec::new(),
+        });
+        if let Some(row) = ledger.outcomes.get_mut(&hold.intent_id) {
+            row.finality = crate::keyspace::IntentFinality::Annulled;
+            row.finalize_by_ms = 0;
+            // Restamped from the *annulment*, not from the commit, so an
+            // annulled row outlives a client offline queue whose TTL must
+            // already be shorter than the retention (D29 clause 9(c)).
+            row.gc_deadline_ms = mem_now_ms() + MEM_INTENT_ROW_RETENTION_MS;
+        }
+        release_hold(&mut ledger, hold.intent_id);
+        Ok(())
+    }
+}
+
+/// Drop `intent_id` from whichever account's hold list carries it, and drop
+/// the account's row once it is empty.
+///
+/// Emptying the row rather than leaving a zero-length one matters for the
+/// sweep: the family is scanned, and a row per account that ever committed
+/// provisionally would make the scan proportional to history instead of to
+/// outstanding work.
+fn release_hold(ledger: &mut MemLedger, intent_id: u128) {
+    ledger.provisional.retain(|_, row| {
+        row.holds.retain(|hold| hold.intent_id != intent_id);
+        !row.holds.is_empty()
+    });
 }
 
 /// Map an [`IntentError`] onto the outcome the gateway acks (the bounded-
@@ -1619,6 +2085,102 @@ pub fn error_outcome(err: &IntentError) -> IntentOutcome {
             reason: orrery_protocol::REASON_EXECUTOR_ERROR,
         },
     }
+}
+
+/// Intent fixtures shared by this module's tests and
+/// [`provisional`](self::provisional)'s.
+///
+/// A separate module rather than helpers inside one `#[cfg(test)] mod tests`,
+/// because two test modules in this crate build the same three shapes — a
+/// self-credit, a transfer, and an intent carrying a commitment — and a second
+/// copy of the 40-byte transfer layout is the kind of duplication that drifts
+/// silently and then makes one of the two suites assert about a different
+/// object than it names.
+#[cfg(test)]
+pub(crate) mod tests_support {
+    use orrery_protocol::{
+        AccountId, AssetId, CellEpoch, ChainHash, EvidenceCommitment, Intent, IntentOp, PersistId,
+        RulesetId, Tick,
+    };
+
+    use super::{ItemTransferArgs, LEDGER_ITEM_TRANSFER_OP};
+
+    /// The key every fixture intent is issued by, so a test can co-sign
+    /// against it and so `intent_id` alone distinguishes two intents.
+    pub(crate) fn issuer_key() -> iroh_base::SecretKey {
+        let mut seed = [0u8; 32];
+        seed[0] = 1;
+        iroh_base::SecretKey::from_bytes(&seed)
+    }
+
+    /// A [`super::LEDGER_CREDIT_OP`]'s 24-byte `account ‖ asset ‖ delta`
+    /// triple.
+    pub(crate) fn credit_args(account: u64, asset: u64, delta: i64) -> bytes::Bytes {
+        let mut args = Vec::with_capacity(24);
+        args.extend_from_slice(&account.to_le_bytes());
+        args.extend_from_slice(&asset.to_le_bytes());
+        args.extend_from_slice(&delta.to_le_bytes());
+        bytes::Bytes::from(args)
+    }
+
+    /// A [`LEDGER_ITEM_TRANSFER_OP`]'s 40-byte layout, built through the
+    /// canonical encoder rather than by hand.
+    pub(crate) fn transfer_args(
+        item: u64,
+        seller: u64,
+        buyer: u64,
+        asset: u64,
+        price: i64,
+    ) -> bytes::Bytes {
+        bytes::Bytes::copy_from_slice(
+            &ItemTransferArgs {
+                item: orrery_protocol::ItemUid::new(item),
+                seller: AccountId::new(seller),
+                buyer: AccountId::new(buyer),
+                asset: AssetId::new(asset),
+                price,
+            }
+            .encode(),
+        )
+    }
+
+    /// A commitment whose fields are distinct constants, so a mismatch shows
+    /// up as a specific field rather than as a wall of zeroes.
+    pub(crate) fn commitment() -> EvidenceCommitment {
+        EvidenceCommitment {
+            ruleset: RulesetId {
+                version: 1,
+                digest: [7; 32],
+            },
+            entity: PersistId::new(11),
+            window_start: Tick::new(100),
+            window_end: Tick::new(160),
+            t0_claim_hash: [9; 32],
+            log_head: ChainHash([5; 32]),
+        }
+    }
+
+    /// A signed intent carrying `ops`, with or without D29's commitment.
+    pub(crate) fn provisional_intent(id: u128, ops: Vec<IntentOp>, with_evidence: bool) -> Intent {
+        let key = issuer_key();
+        let mut intent = Intent {
+            intent_id: id,
+            issuer: key.public(),
+            cell_epoch: CellEpoch::new(0),
+            ops,
+            attestations: Vec::new(),
+            evidence: with_evidence.then(commitment),
+            signature: key.sign(b"placeholder"),
+        };
+        intent.sign(&key);
+        intent
+    }
+
+    /// The unused-import silencer for a fixture the parent module's tests do
+    /// not reach for. Referencing it here keeps the `use` honest without a
+    /// crate-wide allow.
+    #[allow(dead_code)]
+    pub(crate) const TRANSFER_OP: u16 = LEDGER_ITEM_TRANSFER_OP;
 }
 
 /// A shared validator for [`crate::gateway::GatewayConfig`].
@@ -1642,6 +2204,7 @@ mod tests {
             seed
         });
         let mut intent = Intent {
+            evidence: None,
             intent_id: id,
             issuer: key.public(),
             cell_epoch: CellEpoch::new(0),
@@ -1731,6 +2294,7 @@ mod tests {
     fn intent_with(ops: Vec<IntentOp>) -> Intent {
         let key = issuer_key();
         let mut intent = Intent {
+            evidence: None,
             intent_id: 9,
             issuer: key.public(),
             cell_epoch: CellEpoch::new(0),
@@ -1756,6 +2320,7 @@ mod tests {
     fn attestable_intent(id: u128) -> Intent {
         let key = issuer_key();
         let mut intent = Intent {
+            evidence: None,
             intent_id: id,
             issuer: key.public(),
             cell_epoch: CellEpoch::new(EPOCH_HANDLE),
@@ -2102,10 +2667,144 @@ mod tests {
         }
         assert_eq!(
             validator.check_at(&intent, &cx(Some(7)), 2_000),
-            Err(RejectionCause::LowPopulationEpoch),
-            "D29's provisional path owns this case; refusing is the safe \
-             direction until it is built"
+            Err(RejectionCause::ProvisionalNoEvidence),
+            "the population predicate holds, so the refusal is now about the \
+             intent's own classification and no longer about the draw"
         );
+    }
+
+    /// D29 clause 2's second line, end to end at the admission seam: an
+    /// under-populated epoch plus a reversible intent plus a commitment is a
+    /// **provisional** admission, not a refusal and not an ordinary one.
+    #[test]
+    fn an_under_populated_epoch_admits_a_reversible_intent_provisionally() {
+        let epochs = under_populated_epoch();
+        let validator = BaselineIntentValidator::enforcing(
+            Arc::clone(&epochs),
+            Arc::new(epoch_fixture::CoverAllInterest),
+        );
+        let intent = low_population_intent(30, true);
+        assert!(
+            matches!(
+                validator.check_at(&intent, &cx(Some(7)), 2_000),
+                Ok(Admission::Provisional(_))
+            ),
+            "|elig(i)| < N and reversible(i) is clause 2's second line"
+        );
+        // `validate` is deliberately not asserted here: it reads the
+        // registrar clock, and this fixture's epoch was accepted at a
+        // synthetic 1 000 ms, so the call would fail on `EpochStale` for a
+        // reason that has nothing to do with the population predicate. The
+        // `Admission -> IntentVerdict` mapping is three lines with no
+        // branching, and the gateway asserts it end to end.
+    }
+
+    /// The bypass check, and the single most important assertion in #150: an
+    /// intent whose announced set *could* have attested it and simply did not
+    /// is refused. If this ever admits provisionally, provisional commit stops
+    /// being the answer to "there was nobody there to sign" and becomes a
+    /// universal bypass of the mechanism P5 exists to add.
+    #[test]
+    fn an_adequately_populated_epoch_with_missing_attestations_is_refused() {
+        // Six announced, one of whom is the issuer: five eligible, exactly at
+        // `WITNESS_SET_FLOOR_N`. There *were* witnesses; the submitter did not
+        // bring their signatures.
+        let witnesses = witness_keys(5);
+        let mut announced: Vec<NodeId> =
+            witnesses.iter().map(iroh_base::SecretKey::public).collect();
+        announced.push(issuer_key().public());
+        let epochs = epoch_fixture::cache_with(EPOCH_HANDLE, &announced, 1_000);
+        let validator = BaselineIntentValidator::enforcing(
+            Arc::clone(&epochs),
+            Arc::new(epoch_fixture::CoverAllInterest),
+        );
+
+        // Carrying a commitment, so the refusal cannot be blamed on clause 6:
+        // this intent is provisional-*eligible* in every respect except the
+        // one that matters, which is that it did not need the path.
+        let intent = low_population_intent(31, true);
+        assert_eq!(
+            validator.check_at(&intent, &cx(Some(7)), 2_000),
+            Err(RejectionCause::ThresholdNotMet),
+            "clause 2's third line: otherwise, refuse"
+        );
+
+        // And the same intent with K attestations that are simply the wrong
+        // ones is refused too — the other half of "could have been attested".
+        let mut shopped = low_population_intent(32, true);
+        for key in witnesses.iter().take(orrery_protocol::WITNESS_QUORUM_K) {
+            let attestation = shopped.attest(key);
+            shopped.attestations.push(attestation);
+        }
+        let verdict = validator.check_at(&shopped, &cx(Some(7)), 2_000);
+        assert!(
+            matches!(
+                verdict,
+                Ok(Admission::Attested(_)) | Err(RejectionCause::RequiredWitnessMissing)
+            ),
+            "either the draw landed on these three or it did not; neither \
+             answer is a provisional commit, and this got {verdict:?}"
+        );
+    }
+
+    /// Clause 3 at the admission seam: the population predicate holds and the
+    /// intent is still refused, because a transfer is not something the
+    /// cluster can undo by writing an inverse into the submitter's own rows.
+    #[test]
+    fn an_under_populated_epoch_still_refuses_a_transfer() {
+        let epochs = under_populated_epoch();
+        let validator = BaselineIntentValidator::enforcing(
+            Arc::clone(&epochs),
+            Arc::new(epoch_fixture::CoverAllInterest),
+        );
+        let key = issuer_key();
+        let mut intent = Intent {
+            intent_id: 33,
+            issuer: key.public(),
+            cell_epoch: CellEpoch::new(EPOCH_HANDLE),
+            ops: vec![transfer_op(1, 8, 7, 10)],
+            attestations: Vec::new(),
+            evidence: Some(tests_support::commitment()),
+            signature: key.sign(b"placeholder"),
+        };
+        intent.sign(&key);
+        assert_eq!(
+            validator.check_at(&intent, &cx(Some(7)), 2_000),
+            Err(RejectionCause::ProvisionalIneligible)
+        );
+        assert_eq!(
+            RejectionCause::ProvisionalIneligible.wire_reason(),
+            orrery_protocol::REASON_PROVISIONAL_INELIGIBLE,
+            "the cause is named on the wire, not collapsed into the quorum code"
+        );
+    }
+
+    /// An announced set of four eligible witnesses — one below
+    /// `WITNESS_SET_FLOOR_N`, which is `low_pop(i)`.
+    fn under_populated_epoch() -> Arc<crate::witness_epoch::WitnessEpochAuthority> {
+        let mut announced: Vec<NodeId> = witness_keys(4)
+            .iter()
+            .map(iroh_base::SecretKey::public)
+            .collect();
+        announced.push(issuer_key().public());
+        epoch_fixture::cache_with(EPOCH_HANDLE, &announced, 1_000)
+    }
+
+    /// A provisional-eligible intent naming this module's fixture epoch: one
+    /// self-credit into the submitting account.
+    fn low_population_intent(id: u128, with_evidence: bool) -> Intent {
+        let key = issuer_key();
+        let mut intent = Intent {
+            intent_id: id,
+            issuer: key.public(),
+            cell_epoch: CellEpoch::new(EPOCH_HANDLE),
+            ops: vec![ledger_op(7, GOLD, 100)],
+            attestations: Vec::new(),
+            evidence: with_evidence.then(tests_support::commitment),
+            signature: key.sign(b"placeholder"),
+        };
+        intent.sign(&key);
+        intent
     }
 
     /// The switch's off position leaves the pre-existing path untouched: an
@@ -2436,6 +3135,7 @@ mod tests {
     fn transfer_intent(id: u128, item: u64, seller: u64, buyer: u64, price: i64) -> Intent {
         let key = issuer_key();
         let mut intent = Intent {
+            evidence: None,
             intent_id: id,
             issuer: key.public(),
             cell_epoch: CellEpoch::new(0),
@@ -3052,6 +3752,7 @@ mod tests {
         let exec = seeded();
         let key = issuer_key();
         let mut intent = Intent {
+            evidence: None,
             intent_id: 20,
             issuer: key.public(),
             cell_epoch: CellEpoch::new(0),
@@ -3122,6 +3823,14 @@ mod tests {
                 .expect("no executor error")
             {
                 IntentOutcome::Committed { .. } => committed += 1,
+                // Unreachable: `execute` is the attested path, and only
+                // `execute_provisional` produces this arm. Named rather than
+                // wildcarded so a future change that lets `execute` commit
+                // provisionally fails here instead of being counted as a
+                // refusal.
+                IntentOutcome::Provisional { .. } => {
+                    panic!("execute never commits provisionally")
+                }
                 IntentOutcome::Rejected { reason } => {
                     assert_eq!(
                         reason,
