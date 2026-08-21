@@ -41,9 +41,9 @@ their linked dependencies.
 | D24 | [ADR-0024](adr/0024-island-drain.md) | Island drain is peer-driven; no evacuation |
 | D25 | [ADR-0025](adr/0025-expire-fan-out.md) | `Expire` fan-out recipient set and amplification bound |
 | D26 | [ADR-0026](adr/0026-sibling-gateways.md) | Sibling gateways: ownership, reachability, live handover |
-| D27 | [ADR-0027](adr/0027-attestation-envelope.md) | Attestation envelope and required-K draw (Proposed) |
-| D28 | [ADR-0028](adr/0028-witness-set-seeding.md) | Witness-set seeding, announcement envelope, `epoch/` record (Proposed) |
-| D29 | [ADR-0029](adr/0029-low-population-path.md) | P5 low-population path: quarantined provisional commit, spot replay, annulment (Proposed) |
+| D27 | [ADR-0027](adr/0027-attestation-envelope.md) | Attestation envelope and required-K draw |
+| D28 | [ADR-0028](adr/0028-witness-set-seeding.md) | Witness-set seeding, announcement envelope, `epoch/` record |
+| D29 | [ADR-0029](adr/0029-low-population-path.md) | P5 low-population path: quarantined provisional commit, spot replay, annulment |
 
 ## Status and supersession
 

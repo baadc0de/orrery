@@ -1,6 +1,6 @@
 # ADR-0028: Witness-set seeding, the announcement envelope, and the `epoch/` record
 
-**Status:** Proposed · **Date:** 2026-08-20 · **Decision:** D28
+**Status:** Accepted · **Date:** 2026-08-20 · **Decision:** D28
 
 This decision is normative once accepted. See the [ADR index](../DECISIONS.md)
 for precedence, scope, and the complete decision set.
