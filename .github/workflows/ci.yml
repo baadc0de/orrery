@@ -54,9 +54,23 @@ env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
   # .cargo/config.toml routes rustc through kache so agent worktrees share one
-  # object cache (AGENTS.md § Build cache). GitHub-hosted runners are ephemeral
-  # and have no kache installed, so the wrapper is cleared here — the documented
-  # opt-out. `gates`, the last job still on the box, puts it back.
+  # object cache (AGENTS.md § Build cache). A runner that has no kache on PATH
+  # would fail every rustc invocation, so the wrapper is cleared here — the
+  # documented opt-out — and *put back by whichever job installs kache*.
+  #
+  # This used to read "GitHub-hosted runners are ephemeral and have nothing to
+  # hit". That stopped being true on 2026-08-21, when #173/#174 applied the AWS
+  # identity plane and the `orrery-kache` S3 bucket: a hosted runner is still
+  # ephemeral, but the cache it hits no longer lives on the runner. `clippy` and
+  # `test` now assume `orrery-ci-cache` by OIDC and install kache pointed at
+  # that bucket (#175), which sets `RUSTC_WRAPPER=kache` through `$GITHUB_ENV`;
+  # `gates` still puts it back by hand on the box.
+  #
+  # So this default now covers exactly the jobs that install no kache: `fmt`,
+  # the four determinism legs (Windows and macOS included), the verdict job,
+  # and the fork-pull-request path of any lane — a fork gets no `id-token`, so
+  # it gets no credential, no cache, and a cold build, which is the intended
+  # outcome and not a degraded one.
   RUSTC_WRAPPER: ""
   # Already off in .cargo/config.toml; restated because a cache miss on a fresh
   # runner is the case where incremental artifacts cost the most and buy least.
@@ -149,9 +163,68 @@ jobs:
     # cannot reach at all; #171 probed `-4-core`, `-8-core` and `-16-core` and
     # none ever picked up a runner).
     runs-on: ubuntu-latest
+    # The workflow default is `contents: read` and stays that way. `id-token`
+    # is what lets this job ask GitHub for the OIDC JWT that
+    # `orrery-ci-cache`'s trust policy accepts; without it the job cannot even
+    # request a token and the AWS step fails with "Credentials could not be
+    # loaded". It is granted per-job, exactly as infra/README.md § Troubleshooting
+    # says to. `pull-requests` is deliberately NOT granted — kache-action's
+    # sticky PR comment is turned off below and the same report is written to
+    # the job summary regardless.
+    permissions:
+      contents: read
+      id-token: write
     timeout-minutes: 30
+    env:
+      # A fork pull request is never granted `id-token: write` by GitHub, so
+      # there is no token to present and no credential to assume. Rather than
+      # let the AWS step fail and read as breakage, both cache steps are
+      # skipped on that path and the lane runs cold with the workflow-level
+      # `RUSTC_WRAPPER: ""` — the same cold build #171 measured. Nothing about
+      # what the lane checks changes.
+      ORRERY_CACHE_AVAILABLE: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
     steps:
       - uses: actions/checkout@v7
+
+      # #173's federated role. No access key exists anywhere in this design:
+      # the role is assumed from the workflow's own OIDC token, the session
+      # lasts an hour, and its entire grant is read/write on
+      # s3://orrery-kache/artifacts/*.
+      - name: Assume the cache role
+        if: env.ORRERY_CACHE_AVAILABLE == 'true'
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: arn:aws:iam::590561279276:role/orrery-ci-cache
+          aws-region: eu-central-1
+          role-session-name: orrery-ci-clippy-${{ github.run_id }}
+
+      # Installs kache and sets RUSTC_WRAPPER=kache through $GITHUB_ENV, which
+      # is what overrides the workflow-level empty default for the steps after
+      # it. Deliberately early: the action starts kache's daemon, which
+      # warm-prefetches the expensive artifacts named by the previous run's
+      # manifest, and that prefetch then overlaps the apt and FoundationDB
+      # installs below instead of running on its own clock.
+      #
+      # No credential input. kache honours KACHE_S3_ACCESS_KEY/SECRET_KEY only
+      # when *both* are set and otherwise falls through to reqsign's AWS chain,
+      # which reaches AssumeRoleWithWebIdentity — so the role assumed above is
+      # picked up with no kache-specific credential configuration at all
+      # (docs/spikes/kache-remote-backend.md § 2).
+      #
+      # `manifest-key` is per-lane on purpose: every build sharing the bucket
+      # writes the manifest, so `clippy` and `test` without distinct keys would
+      # clobber each other's and prefetch would fall to near zero.
+      - name: Install kache and point it at the S3 remote
+        if: env.ORRERY_CACHE_AVAILABLE == 'true'
+        uses: kunobi-ninja/kache-action@49398d37113c616fdb61be434cb497e3c2c8f3e6 # v1
+        with:
+          version: 0.14.2
+          s3-bucket: orrery-kache
+          s3-region: eu-central-1
+          s3-prefix: artifacts
+          manifest-key: clippy-x86_64-unknown-linux-gnu
+          pr-comment: false
+
       - name: Install the pinned toolchain
         run: rustup show active-toolchain || rustup toolchain install
       # Four first-party crates take `bevy = { workspace = true }` with default
@@ -203,11 +276,92 @@ jobs:
       - name: Install the FoundationDB client
         uses: ./.github/actions/foundationdb
 
+      # Evidence, not assertion — and it fails the job rather than warning,
+      # because a silently-unwired cache is the failure mode this whole issue
+      # exists to avoid: the lane would still be green, just paying full price
+      # while a table claimed otherwise.
+      #
+      # Two independent things are checked. RUSTC_WRAPPER must actually be
+      # `kache` in this step's environment, which is the empirical answer to
+      # whether a $GITHUB_ENV write beats a workflow-level `env:` of the same
+      # name (it does; this step is what proves it rather than assuming it).
+      # And `kache doctor` must name the bucket — its "Remote" check prints
+      # `s3://<bucket>/<prefix>` from the resolved config, so grepping for the
+      # exact URI distinguishes "a remote is configured" from "some remote is
+      # configured". doctor's exit status is deliberately not the assertion:
+      # it reports the daemon unit as missing on any runner, which is expected
+      # and not a problem (AGENTS.md § Build cache).
+      - name: Confirm rustc is wrapped and the S3 remote is configured
+        if: env.ORRERY_CACHE_AVAILABLE == 'true'
+        run: |
+          set -euo pipefail
+          echo "RUSTC_WRAPPER=${RUSTC_WRAPPER:-<unset>}"
+          [[ "${RUSTC_WRAPPER:-}" == *kache* ]] || {
+            echo "::error::RUSTC_WRAPPER is not kache — the lane would build uncached"
+            exit 1
+          }
+          kache doctor 2>&1 | tee doctor.txt || true
+          grep -qF 's3://orrery-kache/artifacts' doctor.txt || {
+            echo "::error::kache doctor does not report the s3://orrery-kache/artifacts remote"
+            exit 1
+          }
+
       # All three passes, and the `--exclude`/`--no-deps` reasoning that makes them
       # mean something, live in scripts/check.sh so this job is reproducible
       # locally with one command.
       - name: clippy (default raw, fdb, then Fjall fallback)
         run: scripts/check.sh clippy
+
+      # #170 asks for a hit rate and a wall-clock. infra/README.md § What it
+      # costs asks for one more, and it is the one that decides the economics:
+      # hosted runners are outside AWS, so every cache HIT is billable egress
+      # at $0.09/GB past the free tier — the bill scales with the mechanism
+      # working. `network.bytes_down` is that number, on the wire and after
+      # compression. Read from kache's own report rather than inferred, per
+      # #175's acceptance criteria, and uploaded raw so it is recomputable.
+      #
+      # `if: always()` because a failed lane's cache figures are still data.
+      # Note this runs BEFORE kache-action's post step does `kache sync --push`,
+      # so `bytes_up` here undercounts the run's uploads; `bytes_down` — the
+      # billed direction — is complete.
+      - name: Cache report
+        if: always() && env.ORRERY_CACHE_AVAILABLE == 'true'
+        run: |
+          set -euo pipefail
+          # Disk alongside the cache figures: a warm lane restores artifacts
+          # into `target/` *and* keeps them in the local store, so the cache
+          # changes the disk answer #171 measured and the new number should be
+          # on the record next to it.
+          df -h /
+          kache stats --since 24h || true
+          kache report --format json --since 24h --output kache-clippy.json
+          {
+            echo '### kache — clippy'
+            echo '```'
+            # `network` is an Option in kache's report schema and is null when
+            # no transfer happened at all, so every read of it is defaulted.
+            jq -r '
+              (.network // {}) as $n |
+              "hit_rate_pct       \(.summary.hit_rate_pct)",
+              "local_hits         \(.summary.local_hits)",
+              "remote_hits        \(.summary.remote_hits)",
+              "prefetch_hits      \(.summary.prefetch_hits)",
+              "misses             \(.summary.misses)",
+              "total_crates       \(.summary.total_crates)",
+              "configured_backend \($n.configured_backend // "none")",
+              "bytes_down         \($n.bytes_down // 0)",
+              "bytes_up           \($n.bytes_up // 0)",
+              "downloads_ok       \($n.downloads_ok // 0)",
+              "downloads_failed   \($n.downloads_failed // 0)"
+            ' kache-clippy.json
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v7
+        if: always() && env.ORRERY_CACHE_AVAILABLE == 'true'
+        with:
+          name: kache-report-clippy
+          path: kache-clippy.json
+          retention-days: 30
 
   gates:
     name: static gates
@@ -287,9 +441,49 @@ jobs:
     # fetches an amd64 `.deb`. So if this lane's `target/` grows by 84 %, the
     # answer is to shrink or split the lane, not to ask for a bigger machine.
     runs-on: ubuntu-latest
+    # See the note on the same block in `clippy`.
+    permissions:
+      contents: read
+      id-token: write
     timeout-minutes: 30
+    env:
+      ORRERY_CACHE_AVAILABLE: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
     steps:
       - uses: actions/checkout@v7
+
+      - name: Assume the cache role
+        if: env.ORRERY_CACHE_AVAILABLE == 'true'
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: arn:aws:iam::590561279276:role/orrery-ci-cache
+          aws-region: eu-central-1
+          role-session-name: orrery-ci-test-${{ github.run_id }}
+
+      # Distinct `manifest-key` from `clippy`'s: they share one bucket, and a
+      # shared manifest key would have each lane overwrite the other's record
+      # of what to prefetch. The object store underneath is shared and should
+      # be — the dependency graph is the same graph — it is only the "what was
+      # expensive last time" index that is per-lane.
+      - name: Install kache and point it at the S3 remote
+        if: env.ORRERY_CACHE_AVAILABLE == 'true'
+        uses: kunobi-ninja/kache-action@49398d37113c616fdb61be434cb497e3c2c8f3e6 # v1
+        with:
+          version: 0.14.2
+          s3-bucket: orrery-kache
+          s3-region: eu-central-1
+          s3-prefix: artifacts
+          manifest-key: test-x86_64-unknown-linux-gnu
+          pr-comment: false
+          # The local store is capped rather than left on kache's 50 GiB
+          # default, and the cap is load-bearing on this lane. #171 measured
+          # `test`'s cold `target/` at 45.65 GiB with 39.29 GiB free at peak;
+          # an uncapped store on the same filesystem could in principle add
+          # another 50 GiB and reproduce the disk-exhaustion failure (#168)
+          # this migration exists to leave behind. 25 GiB is the figure
+          # AGENTS.md § Build cache already uses for a per-identity local
+          # store, and it leaves 46 + 25 = 71 GiB against 87 GiB free.
+          max-size: 25GiB
+
       - name: Install the pinned toolchain
         run: rustup show active-toolchain || rustup toolchain install
       - name: Install Bevy's Linux build dependencies
@@ -323,7 +517,65 @@ jobs:
       # workspace's feature unification (`bevy/serialize` is off, so
       # `Transform: Serialize` is unsatisfied). That is upstream's build to fix,
       # and it is not what this repo is testing.
+      #
+      # Same two-part check as `clippy`'s, and for the same reason: a lane that
+      # builds uncached while a table says otherwise is worse than a lane that
+      # fails.
+      - name: Confirm rustc is wrapped and the S3 remote is configured
+        if: env.ORRERY_CACHE_AVAILABLE == 'true'
+        run: |
+          set -euo pipefail
+          echo "RUSTC_WRAPPER=${RUSTC_WRAPPER:-<unset>}"
+          [[ "${RUSTC_WRAPPER:-}" == *kache* ]] || {
+            echo "::error::RUSTC_WRAPPER is not kache — the lane would build uncached"
+            exit 1
+          }
+          kache doctor 2>&1 | tee doctor.txt || true
+          grep -qF 's3://orrery-kache/artifacts' doctor.txt || {
+            echo "::error::kache doctor does not report the s3://orrery-kache/artifacts remote"
+            exit 1
+          }
+
       - run: scripts/check.sh test
+
+      # The heavier of the two lanes, so the one whose `bytes_down` decides the
+      # egress bill. See the note on `clippy`'s copy of this step.
+      - name: Cache report
+        if: always() && env.ORRERY_CACHE_AVAILABLE == 'true'
+        run: |
+          set -euo pipefail
+          # Disk alongside the cache figures: a warm lane restores artifacts
+          # into `target/` *and* keeps them in the local store, so the cache
+          # changes the disk answer #171 measured and the new number should be
+          # on the record next to it.
+          df -h /
+          kache stats --since 24h || true
+          kache report --format json --since 24h --output kache-test.json
+          {
+            echo '### kache — workspace tests'
+            echo '```'
+            jq -r '
+              (.network // {}) as $n |
+              "hit_rate_pct       \(.summary.hit_rate_pct)",
+              "local_hits         \(.summary.local_hits)",
+              "remote_hits        \(.summary.remote_hits)",
+              "prefetch_hits      \(.summary.prefetch_hits)",
+              "misses             \(.summary.misses)",
+              "total_crates       \(.summary.total_crates)",
+              "configured_backend \($n.configured_backend // "none")",
+              "bytes_down         \($n.bytes_down // 0)",
+              "bytes_up           \($n.bytes_up // 0)",
+              "downloads_ok       \($n.downloads_ok // 0)",
+              "downloads_failed   \($n.downloads_failed // 0)"
+            ' kache-test.json
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v7
+        if: always() && env.ORRERY_CACHE_AVAILABLE == 'true'
+        with:
+          name: kache-report-test
+          path: kache-test.json
+          retention-days: 30
 
   determinism:
     name: determinism (${{ matrix.label }})
