@@ -6,11 +6,31 @@ OIDC provider and one federated IAM role) and
 as its remote, with the lifecycle rule that replaces
 `kache-prune-shared.timer`).
 
-**Nothing here has been applied.** No cloud resource was created or modified in
-writing it. `terraform plan` reports **10 to add, 0 to change, 0 to destroy**
-against account `590561279276`, and that plan is the only thing that has been
-run. Applying it is a human decision, and this file exists so that decision can
-be made on evidence.
+**Applied 2026-08-21.** All ten resources exist in account `590561279276`,
+verified with `aws` directly rather than from Terraform's own output, since
+state can drift from reality:
+
+| | |
+|---|---|
+| bucket | `arn:aws:s3:::orrery-kache` (`eu-central-1`) |
+| role | `arn:aws:iam::590561279276:role/orrery-ci-cache` |
+| OIDC provider | `token.actions.githubusercontent.com` — the account's first |
+| lifecycle | `expire-cache-objects`, 14 d on `artifacts/`, plus multipart abort |
+
+It was applied as an IAM principal, not as the account root user, and the plan
+was read before the apply — `10 to add, 0 to change, 0 to destroy`, matching
+what this file predicted.
+
+**The state file is the record.** `infra/terraform.tfstate` is `.gitignore`d and
+there is no remote backend, because a remote backend would be chicken-and-egg:
+the only bucket this account has is the one this configuration creates. Keep it
+somewhere that survives the machine it was applied from.
+
+**What it is being used for, as of today:** the `clippy` CI lane pulls from this
+bucket ([#194](https://github.com/baadc0de/orrery/issues/175)); the `test` lane
+deliberately does not, because it was measured at \$16.70 per hour of wall-clock
+saved against `clippy`'s \$1.15. See § What it costs below, and note the live
+figure that matters is **egress, not storage**.
 
 ---
 
