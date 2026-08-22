@@ -19,6 +19,9 @@ path = "src/bin/orrery-coordinator.rs"
 
 [dependencies]
 orrery_protocol = { path = "../orrery_protocol" }
+# The standing-invalidation feed (D33 clause (e)) is an async trait, the same
+# shape persistd's gateway-side seam uses.
+async-trait = "0.1"
 # The coordinator is a Bevy-free service that speaks iroh directly
 # (docs/10-crates.md §6), so it owns an endpoint and a tokio runtime.
 iroh = { workspace = true }
@@ -45,3 +48,9 @@ sha2 = "0.10"
 glam = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
 bytes = { workspace = true }
+# The mint-refusal proof (`tests/standing_mint_refusal.rs`) drives
+# `orrery_identity::IdentityService` over `ComputedStanding` from outside the
+# identity crate — which another lane holds while #219 runs. persistd comes
+# with it for the strike-row types the scorer reads.
+orrery_identity = { path = "../orrery_identity" }
+orrery_persistd = { path = "../orrery_persistd" }

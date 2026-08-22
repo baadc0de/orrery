@@ -30,5 +30,8 @@ pub mod witness;
 pub use client::{ClientError, CoordinatorClient};
 pub use interest::InterestIssuer;
 pub use registry::{CoordinatorConfig, IslandDrain, IslandRegistry, MembershipChange};
-pub use server::{CoordinatorServer, CoordinatorStats, ServerConfig, ServerError};
+pub use server::{
+    CoordinatorServer, CoordinatorStats, FeedFailure, ServerConfig, ServerError,
+    SharedStandingInvalidationFeed, StandingInvalidationFeed, StrikesMode, StrikesPosture,
+};
 pub use witness::{SeedOutcome, SeededEpoch, WitnessEpochIssuer, WitnessSeedConfig, WitnessSeeder};

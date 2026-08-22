@@ -184,7 +184,14 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # target; with nine targets that is 552, which must stay clear of this floor.
 # It was 40/target and silently fell one test short at 481 -- a self-test whose
 # healthy case fails is not a stricter check, it is a broken one.
-FLOOR="${ORRERY_FDB_TEST_FLOOR:-481}"
+#
+# Standing enforcement at the gateway (issue #219, D33 clause (e)) adds four in
+# `tests/gateway_standing.rs` — the distinguishable `HELLO_REFUSED_STANDING`
+# refusal, mid-session termination through the real sweep, the grace-override
+# pin, and shadow admitting while counting. None needs the cluster, but they
+# run in the same invocation over `--features orrery_persistd/fdb` and count
+# the same. The floor rises by all four: 481 -> 485.
+FLOOR="${ORRERY_FDB_TEST_FLOOR:-485}"
 
 # Every test file whose contents only mean anything against a real cluster. If
 # one of these reports no executed tests, the tier is dark again whatever the

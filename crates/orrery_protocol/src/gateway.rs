@@ -338,6 +338,18 @@ impl GatewayReply {
     /// same in both: bootstrap with `VersionedHello` at the `protocol` this
     /// reply carries, or stop dialling this cluster.
     pub const HELLO_REFUSED_PROTOCOL: u8 = 1;
+
+    /// [`GatewayReply::HelloRefused`] reason: identity has invalidated the
+    /// presenting account's outstanding session tokens (D33 clause (e)).
+    ///
+    /// The value a cooldown or ban takes on the wire. It exists so a refused
+    /// account can tell "your account may not hold a session right now" apart
+    /// from "your token is malformed" — the distinction #219 asks for and a
+    /// generic bad-token refusal collapses. A new `u8` on an existing frame,
+    /// not a new variant: an older client decodes the reply it already knows
+    /// and reads an unfamiliar reason number, which is exactly how the
+    /// `REASON_*` codes below stay additive.
+    pub const HELLO_REFUSED_STANDING: u8 = 2;
 }
 
 /// A single bulk diff uplink (D11 §2.1).

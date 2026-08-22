@@ -60,12 +60,39 @@ impl IssuerKeyId {
 }
 
 /// The standing carried in a session token.
+///
+/// Deliberately two-valued: cooldown and ban are admission decisions identity
+/// makes at mint time, not claims a connected peer must interpret (D33 clause
+/// (e)), so they never widen this enum or the token that carries it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SessionStanding {
     /// The account is not quarantined.
     Good,
     /// The account may connect but requires additional write validation.
     Quarantined,
+}
+
+/// One account whose outstanding session tokens identity has invalidated
+/// (D33 clause (e)).
+///
+/// Published when an account's standing crosses into cooldown or ban. A token
+/// is dead when its signed `issued_at_ms` is **older than**
+/// `effective_from_ms`: identity refused that account at `effective_from_ms`,
+/// so anything it signed earlier was admitted under a standing identity no
+/// longer holds. A token issued *after* the watermark was minted by an
+/// identity that answered for the account again — a lifted cooldown or an
+/// upheld appeal — and passes normally. No new token field carries this; the
+/// bound rides the timestamp every V1 claim already signs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AccountInvalidation {
+    /// The account whose outstanding tokens are invalidated.
+    pub account: AccountId,
+    /// Identity's read instant when the refusal began, in Unix milliseconds.
+    ///
+    /// Tokens with `issued_at_ms < effective_from_ms` are refused while this
+    /// entry stands; tokens minted at or after it were issued past the
+    /// refusal and are accepted on their own merits.
+    pub effective_from_ms: UnixMillis,
 }
 
 /// The signed V1 session-token claims, serialized with postcard.

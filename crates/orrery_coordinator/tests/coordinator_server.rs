@@ -13,12 +13,13 @@ use orrery_coordinator::server::{
     FixedUnixClock, IdentityHealth, ServerConfig, SystemPresenceClock,
 };
 use orrery_coordinator::{
-    CoordinatorClient, CoordinatorServer, InterestIssuer, WitnessEpochIssuer, WitnessSeedConfig,
+    CoordinatorClient, CoordinatorServer, FeedFailure, InterestIssuer, StandingInvalidationFeed,
+    StrikesMode, StrikesPosture, WitnessEpochIssuer, WitnessSeedConfig,
 };
 use orrery_protocol::{
-    verify_interest_grant, AccountId, CellId, CoordMsg, GridId, IssuerKey, IssuerKeyId, NodeId,
-    SessionStanding, SessionTokenClaimsV1, SessionTokenTtlMs, SessionTokenV1, TokenClock,
-    UnixMillis, MAX_SESSION_TOKEN_TTL_MS,
+    verify_interest_grant, AccountId, AccountInvalidation, CellId, CoordMsg, GridId, IssuerKey,
+    IssuerKeyId, NodeId, SessionStanding, SessionTokenClaimsV1, SessionTokenTtlMs, SessionTokenV1,
+    TokenClock, UnixMillis, MAX_SESSION_TOKEN_TTL_MS,
 };
 
 const NOW_MS: u64 = 1_000_000;
@@ -1006,5 +1007,206 @@ async fn a_coordinator_with_no_witness_issuer_announces_nothing() {
         "an unconfigured coordinator announced a witness epoch"
     );
     assert_eq!(server.stats().await.witness_epochs_seeded, 0);
+    server.shutdown().await;
+}
+
+// ── Standing enforcement (D33 clause (e), issue #219) ────────────────────
+
+/// An in-memory stand-in for identity's publication, whose entries a test can
+/// change while sessions are open — which is exactly the moment this
+/// machinery exists for.
+///
+/// The coordinator consults this only on its 1 s sweep, never on admission
+/// (D32 clause (c): no hot-path reads), so tests synchronize on
+/// [`MutableStandingFeed::wait_for_poll`] rather than on raw sleeps.
+struct MutableStandingFeed {
+    entries: std::sync::Mutex<Vec<AccountInvalidation>>,
+    polls: AtomicU64,
+}
+
+impl MutableStandingFeed {
+    fn serving(entries: Vec<AccountInvalidation>) -> Arc<Self> {
+        Arc::new(Self {
+            entries: std::sync::Mutex::new(entries),
+            polls: AtomicU64::new(0),
+        })
+    }
+
+    async fn publish(&self, entry: AccountInvalidation) {
+        self.entries.lock().expect("feed lock").push(entry);
+    }
+
+    /// Block until the coordinator's sweep has polled at least `minimum`
+    /// times, which is when anything published so far is in its consumer
+    /// state and every open session has been re-checked against it.
+    async fn wait_for_poll(&self, minimum: u64) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while self.polls.load(Ordering::SeqCst) < minimum {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the maintenance sweep never polled the standing feed"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl StandingInvalidationFeed for MutableStandingFeed {
+    async fn invalidations(&self) -> Result<Vec<AccountInvalidation>, FeedFailure> {
+        self.polls.fetch_add(1, Ordering::SeqCst);
+        Ok(self.entries.lock().expect("feed lock").clone())
+    }
+}
+
+fn invalidated(account: AccountId, effective_from_ms: u64) -> AccountInvalidation {
+    AccountInvalidation {
+        account,
+        effective_from_ms: UnixMillis::new(effective_from_ms),
+    }
+}
+
+/// A coordinator whose standing feed, posture, clock and identity health the
+/// test drives.
+async fn coordinator_with_standing(
+    issuer: &iroh::SecretKey,
+    interest: &iroh::SecretKey,
+    feed: Arc<MutableStandingFeed>,
+    posture: StrikesMode,
+) -> (CoordinatorServer, Arc<AtomicU64>, Arc<AtomicBool>) {
+    let clock = Arc::new(AtomicU64::new(NOW_MS));
+    let identity_up = Arc::new(AtomicBool::new(true));
+    let server = CoordinatorServer::spawn(ServerConfig {
+        token_clock: Arc::new(StepClock(Arc::clone(&clock))),
+        presence_clock: Arc::new(SystemPresenceClock::default()),
+        identity_health: Arc::new(SwitchedIdentityHealth(Arc::clone(&identity_up))),
+        standing_feed: Some(feed),
+        strikes_posture: StrikesPosture::new(posture),
+        ..ServerConfig::new(
+            [IssuerKey::new(IssuerKeyId::new(1), issuer.public())],
+            InterestIssuer::new(interest.clone(), IssuerKeyId::new(1)),
+        )
+    })
+    .await
+    .expect("spawn coordinator");
+    (server, clock, identity_up)
+}
+
+/// The termination half of clause (e): a session opened before the crossing
+/// loses presence, island membership and its witness facts within one poll
+/// interval, and its still-cryptographically-valid token cannot walk back in.
+#[tokio::test]
+async fn an_open_session_is_terminated_and_the_dead_token_cannot_re_establish() {
+    let issuer = secret(210);
+    let interest = secret(211);
+    let feed = MutableStandingFeed::serving(vec![]);
+    let (server, _clock, _identity_up) =
+        coordinator_with_standing(&issuer, &interest, Arc::clone(&feed), StrikesMode::Live).await;
+
+    // The token was minted at `NOW_MS - 1_000`; an invalidation effective at
+    // `NOW_MS` kills it and nothing minted after it.
+    let session = token(&issuer, node(1), 60_000);
+    let peer = CoordinatorClient::connect(secret(1), server.addr(), session.clone(), PATIENCE)
+        .await
+        .expect("peer admitted");
+    peer.report_presence(vec![cell(0)]).expect("presence");
+    peer.next_grant(PATIENCE).await.expect("grant");
+
+    feed.publish(invalidated(AccountId::new(7), NOW_MS)).await;
+    let polled = feed.polls.load(Ordering::SeqCst);
+    feed.wait_for_poll(polled + 1).await;
+
+    // The connection task ran the ordinary disconnect path: presence
+    // forgotten, roster rebroadcast, witness facts dropped.
+    let stats = server.stats().await;
+    assert_eq!(stats.connected_peers, 0, "the invalidated session is gone");
+    assert_eq!(stats.standing_sessions_terminated, 1);
+
+    assert!(
+        CoordinatorClient::connect(
+            secret(1),
+            server.addr(),
+            session,
+            Duration::from_millis(750)
+        )
+        .await
+        .is_err(),
+        "a pre-watermark token cannot re-establish presence"
+    );
+    server.shutdown().await;
+}
+
+/// Grace exists so an identity *outage* does not end in-flight play. An
+/// invalidation published before the outage is a standing decision that
+/// outlives it; one published during it cannot exist, because identity is
+/// what publishes. Either way the graced re-admission of #227 must not
+/// resurrect the account here.
+#[tokio::test]
+async fn grace_does_not_admit_an_account_identity_has_invalidated() {
+    let issuer = secret(210);
+    let interest = secret(211);
+    let feed = MutableStandingFeed::serving(vec![]);
+    let (server, clock, identity_up) =
+        coordinator_with_standing(&issuer, &interest, Arc::clone(&feed), StrikesMode::Live).await;
+
+    // Established while identity answered for the account.
+    let session = token(&issuer, node(1), 60_000);
+    let first = CoordinatorClient::connect(secret(1), server.addr(), session.clone(), PATIENCE)
+        .await
+        .expect("peer admitted");
+    first.report_presence(vec![cell(0)]).expect("presence");
+    first.leave().await;
+
+    feed.publish(invalidated(AccountId::new(7), NOW_MS)).await;
+    let polled = feed.polls.load(Ordering::SeqCst);
+    feed.wait_for_poll(polled + 1).await;
+
+    // Then the token expired under an outage. Without the entry this exact
+    // sequence is the graced re-admission `an_identity_outage_does_not_end_
+    // an_established_session` pins.
+    identity_up.store(false, Ordering::Relaxed);
+    clock.store(NOW_MS + 120_000, Ordering::Relaxed);
+    assert!(
+        CoordinatorClient::connect(
+            secret(1),
+            server.addr(),
+            session,
+            Duration::from_millis(750)
+        )
+        .await
+        .is_err(),
+        "the invalidation overrides grace"
+    );
+    assert_eq!(server.stats().await.standing_hellos_refused, 1);
+    server.shutdown().await;
+}
+
+/// D17.3's requirement on this process too: with C5 still observing, the
+/// invalidated account is admitted, plays normally, and the counter moves —
+/// a control that cannot be observed before it acts cannot be promoted.
+#[tokio::test]
+async fn in_shadow_the_invalidated_account_is_still_admitted_and_counted() {
+    let issuer = secret(210);
+    let interest = secret(211);
+    let feed = MutableStandingFeed::serving(vec![invalidated(AccountId::new(7), NOW_MS + 10)]);
+    let (server, _clock, _identity_up) =
+        coordinator_with_standing(&issuer, &interest, Arc::clone(&feed), StrikesMode::Shadow).await;
+    feed.wait_for_poll(1).await;
+
+    let peer = CoordinatorClient::connect(
+        secret(1),
+        server.addr(),
+        token(&issuer, node(1), 60_000),
+        PATIENCE,
+    )
+    .await
+    .expect("shadow suppresses the refusal");
+    peer.report_presence(vec![cell(0)]).expect("presence");
+    assert!(peer.next_grant(PATIENCE).await.is_ok());
+
+    let stats = server.stats().await;
+    assert_eq!(stats.shadow_hellos_would_refuse, 1);
+    assert_eq!(stats.standing_hellos_refused, 0);
+    assert_eq!(stats.connected_peers, 1);
     server.shutdown().await;
 }
