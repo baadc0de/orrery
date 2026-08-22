@@ -36,8 +36,8 @@
 #
 # Nightly fires on a schedule and on workflow_dispatch, never on a pull
 # request, so the fork-PR problem that constrains ci.yml does not exist here.
-# That is why a self-hosted runner was safe to name in this file at all, and it
-# stays true for the one job below that still names one.
+# That is why a self-hosted runner was safe to name in this file at all. As of
+# #180 no job here names one: every job runs on a GitHub-hosted runner.
 #
 # #179 triaged every job in this file by what it actually *needs*, rather than
 # moving them as a block, because the three answers want three different
@@ -103,10 +103,11 @@
 #
 # `p3-island` is in category C by every prerequisite and **still failed on
 # `ubuntu-latest`**, so it kept the box. The long note on that job has the
-# measurement; the short version is that its P3 criterion holds fine on a
-# hosted runner and the drain leg #168 added does not, for a reason no timeout
-# addresses. It is the only thing standing between #180 and deregistering
-# `orrery-hel1`.
+# measurement; the short version was that its P3 criterion held fine on a
+# hosted runner and the drain leg #168 added did not, for a reason no timeout
+# addressed. #236 fixed that at the source — the leg now asserts an invariant
+# rather than a wall-clock bound — and #180 moved the job, which is what let
+# `orrery-hel1` be deregistered.
 #
 # The historical note that belongs with `p3-island` and is not a runner
 # question: it failed its first run *on the box*, and the move there was not
@@ -616,56 +617,30 @@ jobs:
     # binds 127.0.0.1:0 and persistd runs with --allow-volatile-leases, so this
     # gate needs nothing a runner does not already have.
     #
-    # ── The one job #179 tried to move and could not ────────────────────────
+    # ── Moved to a hosted runner by #180, once #236 made it portable ────────
     #
-    # By prerequisite it belongs with `p1-swarm` and the `p4-*` jobs: no
-    # FoundationDB (the argument that pinned it here originally was `p2-kill9`'s
-    # and `p3-siblings`', never this gate's), no D19 device qualification, no
-    # journal — the volatile lease store writes none — and only three processes,
-    # one coordinator, one persistd and the harness. **It fails on
-    # `ubuntu-latest` anyway, and the failure is the drain leg #168 added.**
+    # This job was the last thing pinned to `orrery-hel1`, and the reason was
+    # the drain leg #168 added: it required every lease held at drain start to
+    # be *parked* at one observation instant. On a 4-vCPU hosted runner peers
+    # leave the island at different enough rates that 378 of 400 leases found a
+    # live successor and were reassigned on the way out instead — correct D7
+    # behaviour that the leg counted as failure. It also passed on the box by
+    # 4 ms (10 996 against an 11 000 ms budget), which was the tell: a gate with
+    # 0.04 % of headroom is measuring the machine.
     #
-    # Measured 2026-08-21 at `3b4aacec`, both legs, same tree both sides
-    # (run 32503887628 hosted, and by hand on the box):
+    # #236 replaced that timing verdict with an invariant — every lease
+    # accounted for through reassignment *or* parking, nothing outstanding,
+    # counters quiescent, `duplicate_authority` 0 — so a reassigned-then-parked
+    # lease is now accounted for rather than failed. The leg no longer depends
+    # on peer-departure ordering, and nothing here needs the box: no
+    # FoundationDB, no D19 device qualification, no journal, and three
+    # processes.
     #
-    #   leg     where    settled_in_ms  drain_quiesced_in_ms  drain_reassigned  verdict
-    #   weak    box       9931 / 12050   10996 / 11000          0 / 400 parked  PASSED
-    #   weak    hosted   10897 / 12050   10951 / 11000        378 / 589 parked  FAILED
-    #   strong  box      10078 / 12050   10994 / 11000          0 / 350 parked  PASSED
-    #   strong  hosted   10336 / 12050    1951 / 11000          0 /  50 parked  FAILED
-    #
-    # Read the columns separately, because they say different things. The P3
-    # *criterion* holds on a hosted runner: 50 victim entities reassigned across
-    # 7 successors on the weak leg and 50 parked on the strong one, 0 duplicate
-    # authority, nothing lost, and settle times inside the 12 050 ms budget on
-    # both. Nothing about the phase gate needs this box.
-    #
-    # The drain leg is what does not survive. It orders the gateway to divest
-    # and requires every lease held at the start to be *parked* at quiescence.
-    # On a 4-vCPU runner the peers leave the island at different enough rates
-    # that 378 of the weak leg's 400 leases find a live successor and are
-    # reassigned on the way out instead, and the strong leg observes 50 of an
-    # expected 350. That is a timing-shaped disagreement about what a drain is
-    # supposed to produce, not a slower version of the same answer, and there is
-    # no timeout that fixes it.
-    #
-    # Worth recording beside it: `drain_quiesced_in_ms` is 10 996 ms against an
-    # 11 000 ms budget *on the box*. Four milliseconds. This leg is marginal on
-    # the hardware it was written on, which is its own finding and #170's to
-    # take — a gate with 0.04 % of headroom is measuring the machine.
-    #
-    # So this job keeps the box, and it is the reason #180 cannot deregister
-    # `orrery-hel1` yet. What would let it move: the drain leg becoming
-    # insensitive to peer-departure ordering (a code question, not a CI one), or
-    # an ephemeral instance per run under #176 — which the triage in the header
-    # notes this job does *not* otherwise need, since it wants cores and not a
-    # qualified device.
-    runs-on: [self-hosted, orrery-hel1]
-    env:
-      # Overrides the workflow-level clear: the box has a persistent build
-      # cache at /var/cache/kache/shared, shared with the dev checkout on the
-      # same machine.
-      RUSTC_WRAPPER: kache
+    # The cost of moving is 174 s on the box against 407 s hosted, once a night:
+    # about 1.2 hours a year, and $0, because hosted minutes are free on a
+    # public repository. The `actions/cache` step below stops being dead code
+    # and starts being the thing that keeps that number down.
+    runs-on: ubuntu-latest
     # The harness runs a 30 s island plus setup and teardown; the build
     # dominates. Bounded so a hung peer fails rather than burning the job limit.
     # 174 s on the box on 2026-08-21 (run 32442955806).
@@ -675,9 +650,6 @@ jobs:
       - name: Install the pinned toolchain
         run: rustup show active-toolchain || rustup toolchain install
       - uses: actions/cache@v6
-        # The box keeps its target/ between runs; a cache round-trip would cost
-        # more than it saves there.
-        if: runner.environment == 'github-hosted'
         with:
           path: |
             ~/.cargo/registry/index
