@@ -86,6 +86,22 @@ pub enum IdentityError {
         /// The cap that was reached.
         cap: usize,
     },
+    /// The account has filed too many binding events inside one rolling
+    /// window, so this one is refused (D31 clause (g), enforced per D36).
+    ///
+    /// Both directions count — a bind and an unbind are both events — and the
+    /// refusal stages nothing: the transaction aborts wholesale, so a refused
+    /// unbind leaves the binding in place. When both windows would trip, the
+    /// 24 h one is named, being checked first.
+    BindingRateLimited {
+        /// The account whose window is full.
+        account: AccountId,
+        /// The width of the window that tripped, in milliseconds —
+        /// `BINDING_RATE_WINDOW_24H_MS` or `BINDING_RATE_WINDOW_30D_MS`.
+        window_ms: u64,
+        /// That window's cap — 8 or 64 events.
+        cap: usize,
+    },
     /// The requested session lifetime is longer than the one-hour policy cap.
     ///
     /// [`orrery_protocol::MAX_SESSION_TOKEN_TTL_MS`], enforced here
@@ -130,6 +146,15 @@ impl fmt::Display for IdentityError {
             Self::TooManyBoundNodes { account, cap } => {
                 write!(f, "account {} already holds {cap} bound nodes", account.0)
             }
+            Self::BindingRateLimited {
+                account,
+                window_ms,
+                cap,
+            } => write!(
+                f,
+                "account {} exceeded its cap of {cap} binding events per rolling {} ms",
+                account.0, window_ms
+            ),
             Self::TtlAboveCap {
                 requested_ms,
                 cap_ms,
@@ -187,10 +212,13 @@ pub trait AccountStore: Send + Sync {
     /// gives it exactly one reading, which is that a miss excludes.
     async fn binding(&self, node: &NodeId) -> Result<Option<BindingRow>, IdentityError>;
 
-    /// Bind `node` to `account`, writing `da`, `db` and `dh` together.
+    /// Bind `node` to `account`, writing `da`, `db`, `dh` and the D36 window
+    /// row together.
     ///
     /// `docs/09-services-and-ops.md` §8 requires credentials to bind. Proving
-    /// them is the caller's; this is the durable half.
+    /// them is the caller's; this is the durable half. The event is checked
+    /// against the account's binding-rate window (D31 clause (g) via D36)
+    /// inside the same transaction; a refusal stages nothing.
     async fn bind(
         &self,
         account: AccountId,

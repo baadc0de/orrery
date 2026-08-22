@@ -1,10 +1,10 @@
 //! The durable account store: D31's `d` family, written by this service alone.
 //!
-//! # One transaction, three rows
+//! # One transaction, four rows
 //!
-//! Every mutation here is a single `db.run` closure that stages `da`, `db` and
-//! `dh` together. D31 clause (b) is explicit that this is the load-bearing
-//! half, not the byte layout:
+//! Every mutation here is a single `db.run` closure that stages `da`, `db`,
+//! `dh` — and D36's `dw` window — together. D31 clause (b) is explicit that
+//! this is the load-bearing half, not the byte layout:
 //!
 //! > A reverse index maintained in a second transaction has a window in which
 //! > `db` names an account that `da` no longer binds — and under clause (f) a
@@ -21,9 +21,11 @@
 //! FoundationDB gives all-or-nothing for free once the writes are staged
 //! together, and that is exactly what
 //! [`tests::binding_writes_are_all_or_nothing`] proves: a closure that stages
-//! everything and then fails leaves *no* row changed. Split the same work
-//! across two transactions and the first one's rows survive the second one's
-//! failure, which is the observable form of the window clause (b) forbids.
+//! everything and then fails leaves *no* row changed — `da`, `db`, `dh`, and
+//! since D36 the window too, whose refusal and append live in this same
+//! transaction. Split the same work across two transactions and the first
+//! one's rows survive the second one's failure, which is the observable form
+//! of the window clause (b) forbids.
 //!
 //! # What is *not* here
 //!
@@ -37,6 +39,7 @@
 //! it because a lock-guarded map probe genuinely is tier 2.
 
 use crate::store::{AccountStore, BindOutcome, IdentityError};
+use crate::window::{admit_binding_event, rate_limited};
 use async_trait::async_trait;
 use foundationdb::options::MutationType;
 use foundationdb::{Database, FdbBindingError};
@@ -249,6 +252,24 @@ async fn read_binding(
     Ok(Some(row))
 }
 
+/// Read and decode the account's `dw ‖ account` window inside `trx`.
+///
+/// **Not a snapshot read**, exactly like [`read_account`]: D36 (b) reads the
+/// window with the same discipline as `da`, whose conflict range is what
+/// serializes two concurrent binds on one account. The check must run before
+/// anything is staged, and a versionstamped ordering is impossible pre-commit
+/// — `at_ms` is the available time base (D36 §Alternatives).
+async fn read_window(
+    trx: &foundationdb::RetryableTransaction,
+    account: AccountId,
+) -> Result<Vec<u64>, FdbBindingError> {
+    let key = keyspace::binding_window_key(account);
+    let Some(raw) = trx.get(&key, false).await? else {
+        return Ok(Vec::new());
+    };
+    postcard::from_bytes(&raw).map_err(decode_err("binding window decode"))
+}
+
 /// Stage the `dh` append.
 ///
 /// `SetVersionstampedKey` with the parameter `keyspace` builds, so FDB
@@ -265,6 +286,23 @@ fn stage_history(
     let param = keyspace::binding_history_versionstamped_key(node);
     let encoded = postcard::to_stdvec(row).map_err(decode_err("binding history row encode"))?;
     trx.atomic_op(&param, &encoded, MutationType::SetVersionstampedKey);
+    Ok(())
+}
+
+/// Stage the `dw` write-back: the pruned vector with this event's stamp
+/// appended.
+///
+/// Rides the same transaction as `da`, `db` and `dh` — D36 clause (b)'s
+/// atomicity requirement, the same property D31 clause (b) makes
+/// load-bearing — so an abort leaves the window exactly as it was read, and a
+/// refusal (which returns before this is reached) stages nothing at all.
+fn stage_window(
+    trx: &foundationdb::RetryableTransaction,
+    account: AccountId,
+    window: &[u64],
+) -> Result<(), FdbBindingError> {
+    let encoded = postcard::to_stdvec(window).map_err(decode_err("binding window encode"))?;
+    trx.set(&keyspace::binding_window_key(account), &encoded);
     Ok(())
 }
 
@@ -343,6 +381,14 @@ impl AccountStore for FdbAccountStore {
                         cap: MAX_BOUND_NODES_PER_ACCOUNT,
                     }));
                 }
+                // D36 (b): the rate check runs after the concurrency cap and
+                // before anything is staged, so a refusal consumes nothing.
+                // The 24 h window is evaluated first, so a double trip names
+                // the shorter one.
+                let window = match admit_binding_event(&read_window(&trx, account).await?, at_ms) {
+                    Ok(next) => next,
+                    Err(refusal) => return Err(custom(rate_limited(account, refusal))),
+                };
 
                 row.bound_nodes.push(node);
                 fold_event(&mut row, at_ms);
@@ -365,6 +411,7 @@ impl AccountStore for FdbAccountStore {
                         at_ms,
                     },
                 )?;
+                stage_window(&trx, account, &window)?;
 
                 if aborting {
                     return Err(custom(IdentityError::Store("injected abort".into())));
@@ -392,6 +439,13 @@ impl AccountStore for FdbAccountStore {
                     Some(existing) if existing.account == account => {}
                     _ => return Err(custom(IdentityError::NotBound { node, account })),
                 }
+                // An unbind is an event too (D36 (b), property 2): refusing it
+                // here aborts the whole transaction, so the binding stays in
+                // place and removal waits for a window slide.
+                let window = match admit_binding_event(&read_window(&trx, account).await?, at_ms) {
+                    Ok(next) => next,
+                    Err(refusal) => return Err(custom(rate_limited(account, refusal))),
+                };
 
                 row.bound_nodes.retain(|bound| bound != &node);
                 fold_event(&mut row, at_ms);
@@ -413,6 +467,7 @@ impl AccountStore for FdbAccountStore {
                         at_ms,
                     },
                 )?;
+                stage_window(&trx, account, &window)?;
 
                 if aborting {
                     return Err(custom(IdentityError::Store("injected abort".into())));
@@ -481,6 +536,7 @@ mod tests {
     //! mechanism.
 
     use super::*;
+    use crate::window::{BINDING_RATE_CAP_24H, BINDING_RATE_WINDOW_24H_MS};
     use orrery_protocol::NodeId;
 
     fn cluster_file() -> Option<String> {
@@ -501,7 +557,9 @@ mod tests {
     }
 
     /// Leave the subspace as it was found, so a shared cluster does not
-    /// accumulate this suite's rows.
+    /// accumulate this suite's rows. The window row is this suite's too since
+    /// D36 — a stale `dw` vector would rate-limit the next run's binds with
+    /// events that no longer exist anywhere else.
     async fn wipe(store: &FdbAccountStore, account: AccountId, nodes: &[NodeId]) {
         let db = Arc::clone(&store.db);
         let nodes = nodes.to_vec();
@@ -510,6 +568,7 @@ mod tests {
                 let nodes = nodes.clone();
                 async move {
                     trx.clear(&keyspace::account_key(account));
+                    trx.clear(&keyspace::binding_window_key(account));
                     for node in &nodes {
                         trx.clear(&keyspace::binding_key(node));
                         trx.clear_range(
@@ -614,31 +673,59 @@ mod tests {
         wipe(&store, account, &[node]).await;
     });
 
-    // D31 clause (b), made observable: a mutation that stages `da`, `db` and
-    // `dh` and then fails leaves **no** row changed. Split the same work across
-    // two transactions and the first one's rows survive — the window in which
-    // `db` names an account `da` does not bind, which is the state clause (f)
-    // turns from a miss into a wrong answer.
+    /// The account's stored `dw` vector, read straight off its raw key —
+    /// not through any accessor, so the assertion is about the bytes.
+    async fn window_of(store: &FdbAccountStore, account: AccountId) -> Vec<u64> {
+        let db = Arc::clone(&store.db);
+        let key = keyspace::binding_window_key(account);
+        let raw = db
+            .run(|trx, _| async move {
+                trx.get(&key, false)
+                    .await
+                    .map_err(foundationdb::FdbBindingError::from)
+            })
+            .await
+            .expect("read window row");
+        raw.map(|value| postcard::from_bytes(&value[..]).expect("decode window row"))
+            .unwrap_or_default()
+    }
+
+    // D31 clause (b), made observable — extended per D36 clause (d): a
+    // mutation that stages `da`, `db`, `dh` **and the window** and then fails
+    // leaves *no* row changed. Split the same work across two transactions
+    // and the first one's rows survive — the window in which `db` names an
+    // account `da` does not bind, which is the state clause (f) turns from a
+    // miss into a wrong answer. One successful bind runs first, so "unchanged"
+    // below means something: the window row exists with one stamp, and the
+    // aborted transaction must leave it exactly that.
     fdb_test!(binding_writes_are_all_or_nothing, |store| async move {
         let account = account(3);
-        let node = node(3);
-        wipe(&store, account, &[node]).await;
+        let bound = node(3);
+        let refused = node(0x63);
+        let after = node(0x64);
+        wipe(&store, account, &[bound, refused, after]).await;
 
         store.create_account(account, 1_000).await.expect("create");
+        store.bind(account, &bound, 2_000).await.expect("bind");
+        assert_eq!(window_of(&store, account).await, vec![2_000]);
 
         let mut aborting = store.clone();
         aborting.abort_before_commit = true;
         let error = aborting
-            .bind(account, &node, 2_000)
+            .bind(account, &refused, 3_000)
             .await
             .expect_err("the injected abort refuses the bind");
         assert!(matches!(error, IdentityError::Store(_)));
 
-        // Neither half landed, and that is the assertion: a `db` row
-        // without its `da` row, or the reverse, is the inconsistency the
-        // single transaction exists to make unobservable.
+        // Nothing from the aborted transaction landed, and everything from
+        // the committed one did: the half-applied mix is exactly the
+        // inconsistency the single transaction exists to make unobservable.
         assert!(
-            store.binding(&node).await.expect("read binding").is_none(),
+            store
+                .binding(&refused)
+                .await
+                .expect("read binding")
+                .is_none(),
             "the aborted transaction must leave no `db` row"
         );
         let row = store
@@ -646,29 +733,36 @@ mod tests {
             .await
             .expect("read account")
             .expect("row");
-        assert!(
-            row.bound_nodes.is_empty(),
+        assert_eq!(
+            row.bound_nodes,
+            vec![bound],
             "the aborted transaction must leave `da` unchanged"
         );
         assert_eq!(
-            row.binding_event_count, 0,
+            row.binding_event_count, 1,
             "and must leave the write-time fold unchanged with it"
         );
         assert!(
             store
-                .binding_history(&node)
+                .binding_history(&refused)
                 .await
                 .expect("history")
                 .is_empty(),
             "and must append no `dh` row"
         );
+        assert_eq!(
+            window_of(&store, account).await,
+            vec![2_000],
+            "and must leave the `dw` window unchanged across the injected abort"
+        );
 
         // The store that did not abort still works, so the assertion above
         // is about atomicity and not about a store that writes nothing.
-        store.bind(account, &node, 4_000).await.expect("bind");
-        assert!(store.binding(&node).await.expect("binding").is_some());
+        store.bind(account, &after, 4_000).await.expect("bind");
+        assert!(store.binding(&after).await.expect("binding").is_some());
+        assert_eq!(window_of(&store, account).await, vec![2_000, 4_000]);
 
-        wipe(&store, account, &[node]).await;
+        wipe(&store, account, &[bound, refused, after]).await;
     });
 
     fdb_test!(a_node_binds_to_at_most_one_account, |store| async move {
@@ -738,4 +832,73 @@ mod tests {
 
         wipe(&store, account, &nodes).await;
     });
+
+    // D36 clause (d)'s durable obligation: the ninth event inside one
+    // trailing-24 h span is refused by the store itself, naming the window —
+    // and nothing was consumed. Four bind/unbind pairs fill the short window
+    // while keeping concurrency clear of its own cap, which is checked before
+    // the rate cap by design; pure binds could never reach this refusal.
+    fdb_test!(
+        the_ninth_event_inside_24h_is_refused_at_the_durable_store,
+        |store| async move {
+            const DAY: u64 = BINDING_RATE_WINDOW_24H_MS;
+            let t0 = DAY * 1_000;
+            let account = account(7);
+            let pairs: Vec<NodeId> = (0..4u8).map(|k| node(0x50 + k)).collect();
+            let ninth = node(0x60);
+            let mut all = pairs.clone();
+            all.push(ninth);
+            wipe(&store, account, &all).await;
+
+            store.create_account(account, 1_000).await.expect("create");
+
+            for (k, device) in pairs.iter().enumerate() {
+                let base = t0 + 2 * k as u64;
+                assert_eq!(
+                    store.bind(account, device, base).await.expect("bind"),
+                    BindOutcome::Bound
+                );
+                store
+                    .unbind(account, device, base + 1)
+                    .await
+                    .expect("unbind");
+            }
+            assert_eq!(
+                window_of(&store, account).await.len(),
+                BINDING_RATE_CAP_24H,
+                "eight admitted events sit in the durable window"
+            );
+
+            let error = store
+                .bind(account, &ninth, t0 + 8)
+                .await
+                .expect_err("the ninth event inside 24 h refuses at the durable store");
+            assert_eq!(
+                error,
+                IdentityError::BindingRateLimited {
+                    account,
+                    window_ms: DAY,
+                    cap: BINDING_RATE_CAP_24H,
+                }
+            );
+
+            // Refused, not deferred: no slot consumed, no `db` row, no `dh`
+            // append, fold unmoved, window exactly as it was.
+            assert!(store.binding(&ninth).await.expect("read").is_none());
+            assert!(store
+                .binding_history(&ninth)
+                .await
+                .expect("history")
+                .is_empty());
+            let row = store.account(account).await.expect("read").expect("row");
+            assert!(row.bound_nodes.is_empty());
+            assert_eq!(
+                row.binding_event_count,
+                u32::try_from(BINDING_RATE_CAP_24H).unwrap()
+            );
+            assert_eq!(window_of(&store, account).await.len(), BINDING_RATE_CAP_24H);
+
+            wipe(&store, account, &all).await;
+        }
+    );
 }
