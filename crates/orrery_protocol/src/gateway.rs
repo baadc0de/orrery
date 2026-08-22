@@ -980,6 +980,14 @@ mod tests {
     }
 
     #[test]
+    fn protocol_version_is_pinned_for_the_candidate_accounts_wire_change() {
+        // A round-trip cannot catch a forgotten bump because both ends use
+        // the same claims layout. D34 changes that positional layout, so pin
+        // the externally visible version as a literal.
+        assert_eq!(crate::PROTOCOL_VERSION, 3);
+    }
+
+    #[test]
     fn hello_roundtrips() {
         let msg = GatewayMsg::Hello {
             token: b"session-token".to_vec(),

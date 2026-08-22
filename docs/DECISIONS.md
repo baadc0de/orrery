@@ -48,6 +48,7 @@ their linked dependencies.
 | D31 | [ADR-0031](adr/0031-id-account-subspace.md) | The `id/` account subspace, its reverse index, and what a miss means |
 | D32 | [ADR-0032](adr/0032-enforcement-ramp.md) | Enforcement ramp: shadow semantics per control, flag inventory, promotion evidence, auto-suspend (**Proposed**) |
 | D33 | [ADR-0033](adr/0033-strike-ledger-standing.md) | Strike ledger, decay, and quarantine → cooldown → ban standing (**Proposed**) |
+| D34 | [ADR-0034](adr/0034-candidate-accounts-announcement.md) | Candidate accounts travel in the witness-epoch announcement; amends D28 (**Proposed**) |
 
 ## Status and supersession
 
