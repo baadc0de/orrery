@@ -46,6 +46,12 @@ pub use shadow::{
     SHADOW_TARGET,
 };
 
+pub mod ramp;
+pub use ramp::{
+    AbsentControl, CohortEvidence, HonestCohort, Provenance, RampArtifact, RampMeter, RampSnapshot,
+    UnattributedTally, RAMP_ARTIFACT_SCHEMA,
+};
+
 pub mod stages;
 pub use stages::{intent_stage_metrics, IntentStageMetrics, IntentStageSnapshot, IntentTrace};
 
@@ -1765,6 +1771,18 @@ impl BaselineIntentValidator {
         cx: &IntentContext,
         now_ms: u64,
     ) -> Result<Admission, RejectionCause> {
+        // D32 clause (e)'s coverage **denominator**, counted here and nowhere
+        // else. Before `check`, not after, and unconditionally on the posture:
+        // an intent refused by clause (b)'s always-on correctness set never
+        // reaches the shadow arm, and a validator posted in `Off` never
+        // evaluates one at all. Both are qualifying activity that went
+        // unobserved, and a denominator that could not see them would report
+        // full coverage of a control nobody ran — which is the exact evidence
+        // D32 calls "blindness with a clean conscience". The numerator is
+        // counted at the far end of this function, in `observe`.
+        if let Some(observer) = self.observer.as_deref() {
+            observer.record_qualifying(cx.account);
+        }
         let precheck = Self::check(intent, cx)?;
 
         // The resolver, or the honest absence of one. A validator built
@@ -3736,6 +3754,288 @@ mod tests {
             !observed.verdict.would_act(),
             "a provisional commit is a commit; clause (e) counts refusals"
         );
+    }
+
+    // -- D32 clause (e): the measurement -----------------------------------
+    //
+    // The tests above prove the shadow arm *observes*. These prove the
+    // observations become clause (e)'s two numbers, and they run through the
+    // real validator rather than against the meter directly for the reason
+    // `watching` gives: a fixture that fed the meter by hand would keep passing
+    // after the validator stopped feeding it.
+
+    /// The same validator, watching, with its observations metered.
+    fn metering(
+        validator: &BaselineIntentValidator,
+    ) -> (BaselineIntentValidator, Arc<ramp::RampMeter>) {
+        let meter = Arc::new(ramp::RampMeter::new(ATTESTATION_QUORUM_CONTROL));
+        let metered = BaselineIntentValidator {
+            enforcement: AttestationPosture::new(AttestationEnforcement::Shadow),
+            observer: Some(Arc::clone(&meter) as SharedShadowObserver),
+            ..validator.clone()
+        };
+        (metered, meter)
+    }
+
+    /// The would-have-acted counter moves on what `Required` would refuse and
+    /// stands still on what it would admit.
+    ///
+    /// Both arms in one test on purpose: a counter that increments on the
+    /// refused intent proves nothing on its own, because a counter that
+    /// increments on *everything* does that too, and the resulting `fp_count`
+    /// would be the intent count.
+    #[test]
+    fn the_would_have_acted_counter_moves_only_on_a_would_be_refusal() {
+        let witnesses = witness_keys(7);
+        let (enforcing, epochs) = enforcing_over(&witnesses);
+        let (metered, meter) = metering(&enforcing);
+        let subject = AccountId::new(5_000);
+        let cohort = {
+            let mut cohort = ramp::HonestCohort::new();
+            cohort.arm(subject);
+            cohort
+        };
+
+        let mut admitted = attestable_intent(90);
+        attest_required(&mut admitted, &witnesses, &epochs);
+        enforcing
+            .check_at(&admitted, &cx(Some(subject.0)), 2_000)
+            .expect("the control arm: live mode admits this intent");
+
+        let mut refused = attestable_intent(91);
+        attest_required(&mut refused, &witnesses, &epochs);
+        refused.attestations.pop();
+        let cause = enforcing
+            .check_at(&refused, &cx(Some(subject.0)), 2_000)
+            .expect_err("the control arm: live mode refuses this one");
+
+        assert!(metered
+            .check_at(&admitted, &cx(Some(subject.0)), 2_000)
+            .is_ok());
+        let clean = meter.snapshot(&cohort);
+        assert_eq!(clean.cohort.fp_count, 0);
+        assert_eq!(clean.cohort.observed, 1);
+        assert_eq!(clean.cohort.coverage, Some(1.0));
+
+        assert!(metered
+            .check_at(&refused, &cx(Some(subject.0)), 2_000)
+            .is_ok());
+        let flagged = meter.snapshot(&cohort);
+        assert_eq!(flagged.cohort.fp_count, 1);
+        assert_eq!(flagged.cohort.observed, 2);
+        assert_eq!(
+            flagged.cohort.by_cause.get(cause.as_str()),
+            Some(&1),
+            "dimensioned by the rejection log's own label, so the two join \
+             without a translation table"
+        );
+        assert_eq!(
+            flagged.cohort.accounts_would_act, 1,
+            "one account, whatever the event count"
+        );
+    }
+
+    /// The coverage denominator counts activity the shadow arm never saw.
+    ///
+    /// This is the clause the whole measurement rests on, and it is the one a
+    /// meter fed from the observation stream alone cannot have: the four
+    /// always-on correctness checks refuse *above* the enforcement switch, so
+    /// the predicate never runs, nothing is observed, and a denominator
+    /// derived from `record` would report `coverage = 1.000` over a population
+    /// the control judged half of. Both numbers here come from counting points
+    /// at opposite ends of `check_at`, which is what makes the ratio a
+    /// measurement rather than a restatement.
+    #[test]
+    fn the_coverage_denominator_counts_activity_the_shadow_arm_never_saw() {
+        let witnesses = witness_keys(7);
+        let (enforcing, epochs) = enforcing_over(&witnesses);
+        let (metered, meter) = metering(&enforcing);
+        let subject = AccountId::new(5_001);
+        let cohort = {
+            let mut cohort = ramp::HonestCohort::new();
+            cohort.sample(subject);
+            cohort
+        };
+
+        // Three intents the quorum sees and admits.
+        for id in 92..95_u128 {
+            let mut attested = attestable_intent(id);
+            attest_required(&mut attested, &witnesses, &epochs);
+            assert!(metered
+                .check_at(&attested, &cx(Some(subject.0)), 2_000)
+                .is_ok());
+        }
+
+        // One the always-on duplicate rule refuses before the quorum runs.
+        let mut repeated = attestable_intent(95);
+        let once = repeated.attest(&witnesses[1]);
+        repeated.attestations.push(once.clone());
+        repeated.attestations.push(once);
+        assert_eq!(
+            metered.check_at(&repeated, &cx(Some(subject.0)), 2_000),
+            Err(RejectionCause::DuplicateAttestation),
+            "correctness, not enforcement: it never ramps and never reaches \
+             the shadow arm"
+        );
+
+        let snapshot = meter.snapshot(&cohort);
+        assert_eq!(snapshot.cohort.observed, 3, "the shadow arm saw three");
+        assert_eq!(
+            snapshot.cohort.qualifying, 4,
+            "and the gateway made four admission decisions for this account"
+        );
+        assert_eq!(snapshot.cohort.coverage, Some(0.75));
+        assert_eq!(snapshot.cohort.fp_count, 0);
+    }
+
+    /// `Off` evaluates nothing, so its coverage is zero rather than clean.
+    ///
+    /// D32 clause (b): "a control in `Off` has no observation period and
+    /// cannot be promoted from it." A fleet with half its gateways posted off
+    /// has half the coverage, and this is the only counter that can say so —
+    /// the observation stream from those gateways is empty, which is
+    /// indistinguishable from quiet traffic.
+    #[test]
+    fn a_validator_posted_off_reports_no_coverage_rather_than_a_clean_sheet() {
+        let witnesses = witness_keys(7);
+        let (enforcing, epochs) = enforcing_over(&witnesses);
+        let meter = Arc::new(ramp::RampMeter::new(ATTESTATION_QUORUM_CONTROL));
+        let dark = BaselineIntentValidator {
+            enforcement: AttestationPosture::new(AttestationEnforcement::Off),
+            observer: Some(Arc::clone(&meter) as SharedShadowObserver),
+            ..enforcing.clone()
+        };
+        let subject = AccountId::new(5_002);
+        let cohort = {
+            let mut cohort = ramp::HonestCohort::new();
+            cohort.arm(subject);
+            cohort
+        };
+
+        let mut attested = attestable_intent(96);
+        attest_required(&mut attested, &witnesses, &epochs);
+        assert!(dark
+            .check_at(&attested, &cx(Some(subject.0)), 2_000)
+            .is_ok());
+
+        let snapshot = meter.snapshot(&cohort);
+        assert_eq!(snapshot.cohort.qualifying, 1);
+        assert_eq!(snapshot.cohort.observed, 0);
+        assert_eq!(snapshot.cohort.fp_count, 0);
+        assert_eq!(
+            snapshot.cohort.coverage,
+            Some(0.0),
+            "zero false positives at zero coverage is the shape of evidence \
+             D32 refuses, and it has to be visible as such"
+        );
+    }
+
+    /// Regenerate `docs/data/ramp-shadow-*.json` from a real shadow run.
+    ///
+    /// Ignored because it writes into the tree, in the same arrangement
+    /// `orrery_conformance`'s golden and `orrery_games`' chains use. The
+    /// traffic is a harness and the artifact says so in its own `provenance`
+    /// block: the report script refuses to call a non-production run's
+    /// production leg met, however good its numbers are.
+    ///
+    /// ```sh
+    /// cargo test -p orrery_persistd --lib -- --ignored --nocapture emit_ramp_artifact
+    /// ```
+    #[test]
+    #[ignore = "writes docs/data/ramp-shadow-*.json; run explicitly to regenerate"]
+    fn emit_ramp_artifact() {
+        const ARMED: u64 = 40;
+        const NATURAL: u64 = 80;
+        const OUTSIDE: u64 = 20;
+        const INTENTS_PER_ACCOUNT: u64 = 30;
+        /// One simulated intent every 10 ms, so the window is a span rather
+        /// than an instant and `W` is a number the report can reject. Ten,
+        /// not more: the whole run has to fit inside the fixture epoch's own
+        /// 60 s usability window, or every intent is refused `EpochStale` and
+        /// the artifact measures the fixture instead of the control.
+        const TICK_MS: u64 = 10;
+
+        let witnesses = witness_keys(7);
+        let (enforcing, epochs) = enforcing_over(&witnesses);
+        let (metered, meter) = metering(&enforcing);
+
+        let mut cohort = ramp::HonestCohort::new();
+        for index in 0..ARMED {
+            cohort.arm(AccountId::new(5_000 + index));
+        }
+        for index in 0..NATURAL {
+            cohort.sample(AccountId::new(6_000 + index));
+        }
+        let honest: Vec<u64> = (0..ARMED)
+            .map(|index| 5_000 + index)
+            .chain((0..NATURAL).map(|index| 6_000 + index))
+            .collect();
+        let outside: Vec<u64> = (0..OUTSIDE).map(|index| 9_000 + index).collect();
+
+        let mut id: u128 = 1_000_000;
+        let mut now_ms: u64 = 2_000;
+        let mut submit = |account: u64, drop_one: bool, duplicate: bool| {
+            id += 1;
+            now_ms += TICK_MS;
+            let mut intent = attestable_intent(id);
+            if duplicate {
+                // A buggy client attaching one co-signature twice: refused by
+                // the always-on rule, above the switch, so the quorum never
+                // runs. Qualifying activity that goes unobserved, which is the
+                // only thing that can move coverage off 1.0.
+                let once = intent.attest(&witnesses[1]);
+                intent.attestations.push(once.clone());
+                intent.attestations.push(once);
+            } else {
+                attest_required(&mut intent, &witnesses, &epochs);
+                if drop_one {
+                    intent.attestations.pop();
+                }
+            }
+            let _ = metered.check_at(&intent, &cx(Some(account)), now_ms);
+        };
+
+        // The honest cohort acts honestly: every intent carries the drawn
+        // subset. One client in the cohort has the duplicate-attestation bug,
+        // once — that is the coverage story, and it is deliberately small
+        // enough to stay above clause (e)'s three-nines floor so the report's
+        // failing term is the one a harness genuinely cannot supply.
+        for (index, account) in honest.iter().enumerate() {
+            for round in 0..INTENTS_PER_ACCOUNT {
+                submit(*account, false, index == 0 && round == 0);
+            }
+        }
+        // Outside the cohort, a population that under-attests: real
+        // would-have-acted events, spread across accounts, none of them a
+        // false positive because none of these accounts is in H.
+        for (index, account) in outside.iter().enumerate() {
+            for round in 0..INTENTS_PER_ACCOUNT {
+                submit(*account, (index as u64 + round).is_multiple_of(3), false);
+            }
+        }
+
+        let artifact = ramp::RampArtifact::new(
+            ramp::Provenance {
+                traffic: "harness".to_owned(),
+                source: "orrery_persistd::intent::tests::emit_ramp_artifact, \
+                         BaselineIntentValidator in shadow over a fixture epoch of 7 witnesses"
+                    .to_owned(),
+                note: "Simulated traffic, not a fleet. Clause (e)'s W term is meaningless here \
+                       by construction: the clock advances 10 ms per intent inside one fixture \
+                       epoch's 60 s usability window, so W is under a minute rather than \
+                       the 30 days a production leg needs. Everything else — fp_count, \
+                       coverage and its denominator, |H|, account spread — is measured from \
+                       the same shadow arm a deployment would run."
+                    .to_owned(),
+            },
+            vec![meter.snapshot(&cohort)],
+        );
+
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../docs/data/ramp-shadow-2026-08-22.json");
+        std::fs::write(&path, artifact.to_json().expect("serializable"))
+            .expect("docs/data is writable");
+        println!("wrote {}", path.display());
     }
 
     // -- D32 clause (c) and (f): the runtime lever -------------------------

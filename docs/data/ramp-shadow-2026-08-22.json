@@ -1,0 +1,67 @@
+{
+  "schema": "orrery.ramp.report/1",
+  "provenance": {
+    "traffic": "harness",
+    "source": "orrery_persistd::intent::tests::emit_ramp_artifact, BaselineIntentValidator in shadow over a fixture epoch of 7 witnesses",
+    "note": "Simulated traffic, not a fleet. Clause (e)'s W term is meaningless here by construction: the clock advances 10 ms per intent inside one fixture epoch's 60 s usability window, so W is under a minute rather than the 30 days a production leg needs. Everything else — fp_count, coverage and its denominator, |H|, account spread — is measured from the same shadow arm a deployment would run."
+  },
+  "controls": [
+    {
+      "control": "attestation_quorum",
+      "observed_from_ms": 2020,
+      "observed_to_ms": 44000,
+      "window_days": 0.0004858796296296296,
+      "qualifying": 4200,
+      "observed": 4199,
+      "unevaluated": 0,
+      "would_act": 200,
+      "accounts_qualifying": 140,
+      "accounts_observed": 140,
+      "accounts_would_act": 20,
+      "accounts_truncated": 0,
+      "unattributed": {
+        "qualifying": 0,
+        "observed": 0,
+        "would_act": 0
+      },
+      "by_verdict": {
+        "threshold_not_met": 200,
+        "would_admit": 3999
+      },
+      "by_cause": {
+        "threshold_not_met": 200
+      },
+      "cohort": {
+        "armed": 40,
+        "natural": 80,
+        "size": 120,
+        "active": 120,
+        "qualifying": 3600,
+        "observed": 3599,
+        "unevaluated": 0,
+        "coverage": 0.9997222222222222,
+        "fp_count": 0,
+        "accounts_would_act": 0,
+        "by_cause": {}
+      }
+    }
+  ],
+  "absent": [
+    {
+      "control": "quarantine_validation",
+      "reason": "D32 clause (d): with C1 off no intent commits on an attestation shortcut, so \"denied the shortcut\" is vacuous and C2-shadow degrades to counting quarantined-session intents — a count this tree does not emit on any target."
+    },
+    {
+      "control": "write_annulment",
+      "reason": "D32 clause (c): C3 does not exist yet (#220). Its flag is specified so the implementing issue lands against a named contract; until then the row gates nothing and there is nothing to observe."
+    },
+    {
+      "control": "authority_correction",
+      "reason": "D32 clause (c): C4 does not exist yet (#215)."
+    },
+    {
+      "control": "strikes",
+      "reason": "D32 clause (c): C5 does not exist yet (#219)."
+    }
+  ]
+}

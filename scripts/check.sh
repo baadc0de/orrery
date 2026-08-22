@@ -357,6 +357,21 @@ lane_gates() {
     # leave the other's conclusion standing.
     run scripts/p2-journal-open-report.py --self-test
 
+    # D32 clause (e)'s promotion evidence, over the artifact the shadow arm's
+    # meter writes (`docs/data/ramp-shadow-*.json`, 40 KB, in the tree). Its
+    # self-test is two halves. The first mutation-checks seventeen guarded
+    # facts about the artifact — schema, the five-control inventory, and every
+    # arithmetic relation the artifact's own counters owe each other, because a
+    # reader that cannot tell a coherent artifact from an incoherent one is not
+    # reading it. The second is functional and is the reason this is a
+    # per-commit line rather than a nightly one: it renders `0 of 10 000` and
+    # `0 of 0` and asserts they do not come out looking alike. A ramp report
+    # that cannot distinguish those is not a weaker report, it is the specific
+    # failure D32 names — "a false-positive rate of 0 over a cohort nobody
+    # watched is not evidence, it is blindness with a clean conscience" — and
+    # it would read as a control ready to promote.
+    run scripts/ramp-report.py --self-test
+
     # And this script's own, which nothing ran either: ci.yml calls the four
     # lanes and never `--self-test`, so the lane table's agreement with the tree
     # — and, now, the coverage clause below — were checked only when a human

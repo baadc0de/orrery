@@ -196,6 +196,26 @@ pub struct ShadowObservation {
 pub trait ShadowObserver: Send + Sync {
     /// Record one observation. Called once per intent evaluated in shadow.
     fn record(&self, observation: ShadowObservation);
+
+    /// Count one intent *entering* the control's admission check, whatever
+    /// becomes of it.
+    ///
+    /// The second counting point, and the reason it is a separate method:
+    /// [`Self::record`] fires only for intents that reached the shadow arm,
+    /// which is `observed` qualifying activity. D32 clause (e)'s
+    /// `coverage(H, C, W)` divides that by **total** qualifying activity, and
+    /// the two differ by every intent refused upstream of the enforcement
+    /// switch by clause (b)'s always-on checks, every intent seen by a
+    /// validator posted in `Off` — which "evaluates nothing and therefore
+    /// calibrates nothing" — and every evaluation that degraded to
+    /// [`ShadowVerdict::Unevaluated`]. A denominator derived from `record`
+    /// alone is `1.000` by construction, which is the shape of evidence D32
+    /// calls "blindness with a clean conscience".
+    ///
+    /// The default does nothing: an observer that only wants the individual
+    /// observations owes no denominator, and [`super::ramp::RampMeter`] is the
+    /// implementation that overrides it.
+    fn record_qualifying(&self, _subject: Option<AccountId>) {}
 }
 
 /// A shared [`ShadowObserver`], the shape a validator holds.
