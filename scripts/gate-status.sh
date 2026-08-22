@@ -492,6 +492,68 @@ gate_p5_dupe_gauntlet_evidence() {
   ev "$status" "$dir" "$numbers"
 }
 
+# ── The enforcement ramp: shadow observes and does not act (#222) ───────────
+#
+# Same cluster posture as the dupe gauntlet — fixed ledger ids, a receipt-range
+# read-back — so the prerequisite is that one's, with its own assertion
+# variable. It runs two gateway processes with opposite postures against one
+# cluster, which is why it is a row of its own rather than a fourth arm there.
+
+gate_ramp_shadow_tier() { echo full; }
+gate_ramp_shadow_prereq() {
+  [[ ${MODE:-} == inspect ]] && return 0
+  local cf=${ORRERY_FDB_CLUSTER_FILE:-}
+  [[ -n $cf ]] \
+    || { echo 'ORRERY_FDB_CLUSTER_FILE is not set; the ramp gate needs a live FoundationDB cluster'; return 1; }
+  [[ -r $cf ]] || { echo "ORRERY_FDB_CLUSTER_FILE=$cf is not readable"; return 1; }
+  [[ ${RAMP_SHADOW_CLUSTER_IS_THROWAWAY:-0} == 1 ]] \
+    || { echo "set RAMP_SHADOW_CLUSTER_IS_THROWAWAY=1 to assert $cf may receive the ramp gate's fixed ledger rows"; return 1; }
+  command -v fdbcli >/dev/null || { echo 'fdbcli is not on PATH'; return 1; }
+  timeout 20 fdbcli -C "$cf" --exec 'status minimal' 2>/dev/null | grep -q 'is available' \
+    || { echo "the cluster at $cf is not available"; return 1; }
+  have_cargo || { echo 'cargo is not on PATH'; return 1; }
+  return 0
+}
+gate_ramp_shadow_run() {
+  {
+    (cd "$ROOT/p5-dupe-gauntlet" && cargo build --release)
+    P5_DUPE_BIN="$ROOT/p5-dupe-gauntlet/target/release/p5-dupe-gauntlet" \
+    RAMP_SHADOW_GATE_OUT="$OUT/ramp-shadow-$(date -u +%Y%m%dT%H%M%SZ)" \
+      "$ROOT/scripts/ramp-shadow-gate.sh"
+  } >"$OUT/logs/ramp-shadow.log" 2>&1
+}
+gate_ramp_shadow_evidence() {
+  local dir
+  dir=$(ls -1d "$OUT"/ramp-shadow-* "$ROOT"/ramp-shadow-2* 2>/dev/null | sort | tail -1) || true
+  [[ -n ${dir:-} && -r $dir/report.json ]] || { ev_none; return 0; }
+  local numbers status
+  # Every figure read out of the harness's own report. The pair in the middle
+  # is the one that carries the gate's argument: refusals zero *and*
+  # would-have-refused non-zero. Either number alone is satisfied by a control
+  # that is simply off, so a reader given only one of them learns nothing.
+  numbers=$(jq -c '{
+    result,
+    enforcing_acts: .arms.enforcing_acts.passed,
+    enforcing_cause: .arms.enforcing_acts.audit_cause,
+    enforcing_intent_rows: .arms.enforcing_acts.intent_rows,
+    shadow_observes: .arms.shadow_observes.passed,
+    shadow_verdict: .arms.shadow_observes.offender_observation.verdict,
+    shadow_verdict_matches: .arms.shadow_observes.verdict_matches_enforcing_cause,
+    shadow_does_not_act: .arms.shadow_does_not_act.passed,
+    shadow_outcome_committed: (.arms.shadow_does_not_act.outcome | startswith("Committed")),
+    shadow_attest_enforced: .arms.shadow_does_not_act.attest_row_enforced,
+    shadow_refusals: .arms.shadow_does_not_act.refusals_in_shadow_run,
+    shadow_would_act: .arms.shadow_does_not_act.would_act_observations,
+    shadow_observations: .arms.shadow_does_not_act.observations,
+    reversible: .arms.reversibility.passed,
+    demote_apply_ms: .arms.reversibility.demotion.apply_ms,
+    promote_apply_ms: .arms.reversibility.promotion.apply_ms,
+    apply_bound_ms: .arms.reversibility.apply_bound_ms
+  }' "$dir/report.json" 2>/dev/null || echo '{}')
+  if [[ -e $dir/PASSED ]]; then status=PASSED; else status=FAILED; fi
+  ev "$status" "$dir" "$numbers"
+}
+
 # ── P2 kill-9 ────────────────────────────────────────────────────────────────
 
 gate_p2_kill9_tier() { echo full; }

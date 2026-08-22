@@ -23,7 +23,10 @@ use futures::TryStreamExt;
 use orrery_persistd::gateway::{
     InterestAuthority, SessionTokenV1Authorizer, SharedBindingAuthority, SnapshotBindingAuthority,
 };
-use orrery_persistd::intent::{BaselineIntentValidator, ItemTransferArgs, LEDGER_ITEM_TRANSFER_OP};
+use orrery_persistd::intent::{
+    AttestationEnforcement, AttestationPosture, BaselineIntentValidator, ItemTransferArgs,
+    LEDGER_ITEM_TRANSFER_OP, SHADOW_TARGET,
+};
 use orrery_persistd::journal::{AdaptiveCommitMode, GroupCommitConfig};
 use orrery_persistd::witness_epoch::WitnessEpochAuthority;
 use orrery_persistd::{
@@ -61,6 +64,31 @@ const WRONG_SUBSET_INTENT: u128 = 151_000_006;
 const GOOD_ORDERING_CONTROL_INTENT: u128 = 151_000_007;
 const QUARANTINED_INTENT: u128 = 151_000_008;
 
+// ── The ramp arm's own ids (issue #222) ────────────────────────────────────
+//
+// Disjoint from every id above, and from the dupe gauntlet's ledger items, so
+// the two gates can share a cluster without either one's seed check refusing
+// the other's rows.
+const RAMP_ASSET: AssetId = AssetId(151_103);
+/// The honest trade that makes each gateway's epoch cache adopt the durable
+/// draw key before any subset is drawn against it.
+const RAMP_ENFORCING_WARMUP_INTENT: u128 = 151_000_101;
+const RAMP_SHADOW_WARMUP_INTENT: u128 = 151_000_102;
+/// The synthetic offender, submitted once to each gateway. Two ids because the
+/// intent id is the idempotency key and both gateways write the same
+/// FoundationDB keyspace — one id would make the second submission a replay of
+/// the first rather than a second judgement of the same traffic.
+const RAMP_ENFORCING_OFFENDER_INTENT: u128 = 151_000_103;
+const RAMP_SHADOW_OFFENDER_INTENT: u128 = 151_000_104;
+/// The offender submitted to the *enforcing* process after it is demoted, and
+/// the one submitted after it is promoted back.
+const RAMP_DEMOTED_OFFENDER_INTENT: u128 = 151_000_105;
+const RAMP_REPROMOTED_OFFENDER_INTENT: u128 = 151_000_106;
+
+/// D32 clause (c)'s bound on an operator's decision reaching a running fleet:
+/// one poll interval plus apply, 2 s wall clock.
+const RAMP_APPLY_BOUND_MS: u64 = 2_000;
+
 #[derive(Debug, Parser)]
 #[command(name = "p5-dupe-gauntlet")]
 struct Cli {
@@ -70,12 +98,30 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Run the enforcing persistence gateway until interrupted.
+    /// Run the persistence gateway until interrupted.
     Gateway {
         #[arg(long)]
         cluster_file: PathBuf,
         #[arg(long)]
         data_dir: PathBuf,
+        /// D32 clause (c)'s startup default for control C1, which seeds the
+        /// posture cell and pins this process's identity.
+        ///
+        /// `required` is the default so every existing caller — the dupe
+        /// gauntlet's gate among them — keeps the process it already launches.
+        #[arg(long, default_value = "required")]
+        enforcement: String,
+        /// D32 clause (c)'s runtime lever, stood in for by a file.
+        ///
+        /// The record's lever is the durable `ramp/{control}` row polled on
+        /// the maintenance sweep, and that row does not exist in this tree
+        /// yet. What the ramp gate has to prove is the property the row is a
+        /// transport for — that a control demoted while the process runs stops
+        /// acting, within clause (c)'s bound — so the transport is a file this
+        /// process polls on the same schedule. Every byte downstream of
+        /// [`AttestationPosture::set`] is the production path.
+        #[arg(long)]
+        posture_file: Option<PathBuf>,
     },
     /// Exercise all requested arms and write their durable evidence.
     Run {
@@ -96,6 +142,33 @@ enum Command {
         #[arg(long)]
         quarantine: bool,
     },
+    /// D32's enforcement ramp, against one shadow and one enforcing gateway
+    /// (issue #222).
+    Ramp {
+        #[arg(long)]
+        enforcing_addr: String,
+        #[arg(long)]
+        enforcing_node: String,
+        #[arg(long)]
+        shadow_addr: String,
+        #[arg(long)]
+        shadow_node: String,
+        #[arg(long)]
+        cluster_file: PathBuf,
+        /// The enforcing gateway's own process log: refusal causes, and the
+        /// shadow observations it starts emitting once it is demoted.
+        #[arg(long)]
+        enforcing_log: PathBuf,
+        /// The shadow gateway's process log, which is where the observation
+        /// half of this gate is read from.
+        #[arg(long)]
+        shadow_log: PathBuf,
+        /// The file the enforcing gateway polls for its posture.
+        #[arg(long)]
+        posture_file: PathBuf,
+        #[arg(long)]
+        report: PathBuf,
+    },
 }
 
 #[tokio::main]
@@ -104,7 +177,18 @@ async fn main() -> Result<()> {
         Command::Gateway {
             cluster_file,
             data_dir,
-        } => run_gateway(&cluster_file, &data_dir).await,
+            enforcement,
+            posture_file,
+        } => {
+            run_gateway(
+                &cluster_file,
+                &data_dir,
+                AttestationEnforcement::from_str(&enforcement)
+                    .map_err(|_| anyhow::anyhow!("unknown --enforcement {enforcement:?}"))?,
+                posture_file.as_deref(),
+            )
+            .await
+        }
         Command::Run {
             gateway_addr,
             gateway_node,
@@ -125,6 +209,28 @@ async fn main() -> Result<()> {
                 &audit_log,
                 &report,
             )
+            .await
+        }
+        Command::Ramp {
+            enforcing_addr,
+            enforcing_node,
+            shadow_addr,
+            shadow_node,
+            cluster_file,
+            enforcing_log,
+            shadow_log,
+            posture_file,
+            report,
+        } => {
+            run_ramp(RampArgs {
+                enforcing: endpoint_addr(&enforcing_node, &enforcing_addr)?,
+                shadow: endpoint_addr(&shadow_node, &shadow_addr)?,
+                cluster_file,
+                enforcing_log,
+                shadow_log,
+                posture_file,
+                report,
+            })
             .await
         }
     }
@@ -168,7 +274,58 @@ fn witness_bindings() -> SharedBindingAuthority {
     ))
 }
 
-fn runtime_config(data_dir: &Path) -> RuntimeConfig {
+/// The gateway's wire identity, keyed on its startup posture.
+///
+/// The ramp gate runs a shadow and an enforcing gateway **at the same time**
+/// against one cluster, so the two cannot share a NodeId. Deriving it from the
+/// startup mode rather than from a flag keeps the enforcing process byte-for-
+/// byte the one the dupe gauntlet's gate already launches, and the identity is
+/// fixed at startup: a demotion changes what a process does, never who it is.
+const fn gateway_seed(enforcement: AttestationEnforcement) -> u8 {
+    match enforcement {
+        AttestationEnforcement::Shadow => 251,
+        _ => 250,
+    }
+}
+
+/// D32 clause (c)'s runtime lever, transported by a file.
+///
+/// The record's lever is `ramp/attestation_quorum`, a durable row every
+/// process polls on its 1 s maintenance sweep. That row is not in the tree, and
+/// inventing it here would put a keyspace allocation inside a gate. What the
+/// gate has to prove is downstream of the transport — that a control demoted
+/// in a *running* process stops acting, within the bound — so the transport is
+/// a polled file and everything after [`AttestationPosture::set`] is the
+/// production path.
+///
+/// Polled at a quarter of clause (c)'s 1 s sweep so the gate's measurement of
+/// apply latency is not dominated by this stand-in's own period.
+fn spawn_posture_poller(path: PathBuf, posture: AttestationPosture) {
+    tokio::spawn(async move {
+        let mut last = posture.get();
+        loop {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            let Ok(mode) = AttestationEnforcement::from_str(text.trim()) else {
+                continue;
+            };
+            if mode != last {
+                posture.set(mode);
+                last = mode;
+                tracing::info!(
+                    target: "p5_dupe_gauntlet",
+                    control = "attestation_quorum",
+                    mode = mode.as_str(),
+                    "ramp posture applied"
+                );
+            }
+        }
+    });
+}
+
+fn runtime_config(data_dir: &Path, enforcement: AttestationEnforcement) -> RuntimeConfig {
     RuntimeConfig {
         shards: vec![CellId::ROOT],
         grid: GRID,
@@ -181,16 +338,28 @@ fn runtime_config(data_dir: &Path) -> RuntimeConfig {
                 batch_max_bytes: 1 << 20,
             },
         },
-        node_id: 151,
+        node_id: u64::from(gateway_seed(enforcement)) - 99,
         epoch: Epoch::new(1),
         fence: Arc::new(MemFenceStore::new()),
     }
 }
 
-async fn run_gateway(cluster_file: &Path, data_dir: &Path) -> Result<()> {
+async fn run_gateway(
+    cluster_file: &Path,
+    data_dir: &Path,
+    enforcement: AttestationEnforcement,
+    posture_file: Option<&Path>,
+) -> Result<()> {
+    // `SHADOW_TARGET` is `orrery::ramp::shadow`, which is **not** a prefix of
+    // `orrery_persistd` — a filter naming only the crate drops every shadow
+    // observation, and the gate reading that log would see an inert control as
+    // a silent one. Named explicitly, and at `debug`, because the
+    // `would_act = false` observations are the coverage denominator D32 clause
+    // (e) calls the difference between a rate and blindness.
+    let filter = format!("orrery_persistd=debug,p5_dupe_gauntlet=info,{SHADOW_TARGET}=debug");
     tracing_subscriber::fmt()
         .json()
-        .with_env_filter("orrery_persistd=debug,p5_dupe_gauntlet=info")
+        .with_env_filter(filter)
         .with_writer(std::io::stderr)
         .try_init()
         .map_err(|error| anyhow::anyhow!("install gateway tracing: {error}"))?;
@@ -201,25 +370,51 @@ async fn run_gateway(cluster_file: &Path, data_dir: &Path) -> Result<()> {
         IssuerKeyId::new(1),
         coordinator().public(),
     )]));
+    // D30/D31's three authorities, built before the executor because the two
+    // halves of control C1 share them — and, since #222, share the posture
+    // cell as well: `tracking_posture` hands the executor the *same* cell the
+    // validator reads, so one write moves the admission refusal and the
+    // commit-time re-proof together. Two cells would let a demoted gateway go
+    // on refusing at commit what it now admits at admission.
+    let validator = match enforcement {
+        AttestationEnforcement::Required => BaselineIntentValidator::enforcing(
+            Arc::clone(&epochs),
+            Arc::new(CoverAllInterest),
+            witness_bindings(),
+        ),
+        AttestationEnforcement::Shadow => BaselineIntentValidator::shadow(
+            Arc::clone(&epochs),
+            Arc::new(CoverAllInterest),
+            witness_bindings(),
+        ),
+        AttestationEnforcement::Off => {
+            anyhow::bail!("`off` evaluates nothing and calibrates nothing (D32 clause (b))")
+        }
+    };
+    let posture = validator.posture();
     let executor = FdbIntentExecutor::connect(
         cluster_file
             .to_str()
             .context("cluster-file path is not UTF-8")?,
         GRID,
     )?
-    .recording_epochs(Arc::clone(&epochs), witness_bindings());
+    .tracking_posture(Arc::clone(&epochs), witness_bindings(), posture.clone());
+
+    if let Some(path) = posture_file {
+        spawn_posture_poller(path.to_path_buf(), posture);
+    }
 
     let store: Arc<dyn orrery_persistd::checkpoint::CheckpointStore> =
         Arc::new(orrery_persistd::checkpoint::MemCheckpointStore::new());
     let runtime = Arc::new(Mutex::new(
-        CellRuntime::open(&runtime_config(data_dir), &store)
+        CellRuntime::open(&runtime_config(data_dir, enforcement), &store)
             .await
             .context("open gauntlet runtime")?,
     ));
     let router: Arc<dyn Router> = runtime;
 
     let config = GatewayConfig {
-        secret_key: Some(secret(250)),
+        secret_key: Some(secret(gateway_seed(enforcement))),
         executor: Some(Arc::new(executor)),
         // D30 (#197) made the validator resolve a cell-epoch only where the
         // issuer has standing, so `enforcing` now takes the interest authority
@@ -233,11 +428,7 @@ async fn run_gateway(cluster_file: &Path, data_dir: &Path) -> Result<()> {
         // the executor below records the vector through the **same** resolver
         // it is handed here. Two resolvers would let the recorded vector and
         // the admitted one disagree by construction.
-        validator: Arc::new(BaselineIntentValidator::enforcing(
-            Arc::clone(&epochs),
-            Arc::new(CoverAllInterest),
-            witness_bindings(),
-        )),
+        validator: Arc::new(validator),
         witness_epochs: Some(epochs),
         authorizer: Arc::new(SessionTokenV1Authorizer::new([IssuerKey::new(
             IssuerKeyId::new(1),
@@ -262,7 +453,8 @@ async fn run_gateway(cluster_file: &Path, data_dir: &Path) -> Result<()> {
         serde_json::to_string(&json!({
             "bind_addr": bind_addr.to_string(),
             "node_id": server.id().to_string(),
-            "enforcement": "required",
+            "enforcement": enforcement.as_str(),
+            "posture_file": posture_file.map(|path| path.display().to_string()),
             "fdb": true
         }))?
     );
@@ -762,6 +954,586 @@ async fn run_gauntlet(
     println!("{}", String::from_utf8_lossy(&encoded));
     anyhow::ensure!(passed, "one or more gauntlet arms failed");
     Ok(())
+}
+
+// ── The ramp arm (issue #222, D32 clause (b) and clause (e)'s sensitivity leg) ─
+//
+// Three claims, and the middle one is the one that rots quietly:
+//
+//   1. **Enforcing acts.** A synthetic offender — K cryptographically valid
+//      co-signatures from announced witnesses, deliberately not the subset the
+//      durable draw key names — is refused by the enforcing process with
+//      `required_witness_missing`, and leaves no durable trace.
+//   2. **Shadow observes.** The same offender, submitted to a gateway launched
+//      in shadow, produces a `would_act = true` observation carrying that
+//      *same* verdict label on the stable `orrery::ramp::shadow` target.
+//   3. **Shadow does not act.** That intent's ack comes back `Committed`, its
+//      `attest/` row carries `enforced: false`, the item moved, and across the
+//      whole shadow run the count of refusals is zero.
+//
+// A gate that proved only (1) and (2) is the one #222 exists to prevent: a
+// shadow arm that had quietly started refusing would pass it.
+//
+// Plus reversibility, which is the claim that cannot be made by launching a
+// second process: the *enforcing* gateway is demoted while it runs, and the
+// offender it refused a moment ago commits — inside D32 clause (c)'s 2 s bound
+// — and then, promoted back, is refused again.
+//
+// ## Why the process log and not the in-process observer
+//
+// #217 left three surfaces. The in-process `CountingShadowObserver` is the
+// cheapest and proves the least: it would live in *this* process, and a gate
+// that instantiates its own validator has proved something about a validator
+// rather than about a gateway anyone could deploy. The two used here are the
+// out-of-process ones. The `tracing` events are what an operator actually has,
+// need no wiring, and are read here through the same JSON log the dupe
+// gauntlet already reads refusal causes from. The durable `attest/` row is the
+// inertness half, and it is durable evidence rather than a log line: a shadow
+// arm that had started acting could not fake a committed transfer.
+
+struct RampArgs {
+    enforcing: iroh::EndpointAddr,
+    shadow: iroh::EndpointAddr,
+    cluster_file: PathBuf,
+    enforcing_log: PathBuf,
+    shadow_log: PathBuf,
+    posture_file: PathBuf,
+    report: PathBuf,
+}
+
+/// One shadow observation, as an out-of-process reader recovers it.
+#[derive(Debug, Clone)]
+struct ObservedShadow {
+    intent_id: u128,
+    would_act: bool,
+    verdict: String,
+}
+
+/// Every `orrery::ramp::shadow` event in a gateway's JSON process log.
+///
+/// Filtered on the **target**, which is why #217 made it a constant: a reader
+/// matching the human-readable message would pass on the day somebody reworded
+/// it, and would report an observing control as a silent one.
+fn read_shadow_observations(path: &Path) -> Result<Vec<ObservedShadow>> {
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("read gateway log {}", path.display()))?;
+    let mut seen = Vec::new();
+    for line in text.lines() {
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if value.get("target").and_then(Value::as_str) != Some(SHADOW_TARGET) {
+            continue;
+        }
+        let Some(fields) = value.get("fields") else {
+            continue;
+        };
+        let intent_id = fields
+            .get("intent_id")
+            .and_then(|id| {
+                id.as_u64()
+                    .map(u128::from)
+                    .or_else(|| id.as_str()?.parse::<u128>().ok())
+            })
+            .context("shadow observation has no intent_id")?;
+        seen.push(ObservedShadow {
+            intent_id,
+            would_act: fields
+                .get("would_act")
+                .and_then(Value::as_bool)
+                .context("shadow observation has no would_act")?,
+            verdict: fields
+                .get("verdict")
+                .and_then(Value::as_str)
+                .context("shadow observation has no verdict")?
+                .to_owned(),
+        });
+    }
+    Ok(seen)
+}
+
+/// An honestly attested trade, which is what makes a gateway's epoch cache
+/// adopt the durable draw key.
+///
+/// Load-bearing rather than warm-up ceremony: the draw is keyed, and a
+/// validator drawing over a locally generated key would refuse — or admit — a
+/// different subset from the one the durable row names. Both gateways must
+/// have converged before either judges the offender, or the two verdicts this
+/// gate compares would be answers to two different questions.
+fn ramp_warmup(
+    issuer: &iroh::SecretKey,
+    intent_id: u128,
+    item: ItemUid,
+    witness_keys: &[iroh::SecretKey],
+) -> Intent {
+    let mut intent = transfer_intent(issuer, intent_id, item, RAMP_ASSET);
+    fully_attest(&mut intent, witness_keys);
+    intent
+}
+
+/// The synthetic offender: exactly K valid, announced co-signatures, chosen to
+/// be a *different* subset from the one the durable draw key names for this
+/// intent id.
+///
+/// The same shape the dupe gauntlet's arm (c.4) uses, and deliberately so:
+/// D32 clause (b) says a shadow verdict carries the exact `RejectionCause`
+/// label `Required` returns, so the gate can only check that by refusing the
+/// intent one way and observing it the other.
+fn ramp_offender(
+    issuer: &iroh::SecretKey,
+    intent_id: u128,
+    item: ItemUid,
+    draw_key: &[u8; 32],
+    eligible: &[NodeId],
+    witness_keys: &[iroh::SecretKey],
+) -> Result<(Intent, Vec<NodeId>, Vec<NodeId>)> {
+    let required = required_witnesses(draw_key, intent_id, eligible);
+    let mut members: Vec<NodeId> = eligible.iter().copied().take(WITNESS_QUORUM_K).collect();
+    if members == required {
+        members[WITNESS_QUORUM_K - 1] = eligible[WITNESS_QUORUM_K];
+    }
+    anyhow::ensure!(
+        members != required && members.len() == WITNESS_QUORUM_K,
+        "the offender's subset is the required one; it would not offend"
+    );
+    let mut intent = transfer_intent(issuer, intent_id, item, RAMP_ASSET);
+    for node in &members {
+        let key = witness_keys
+            .iter()
+            .find(|key| key.public() == *node)
+            .context("offender member is not announced")?;
+        intent.attestations.push(intent.attest(key));
+    }
+    anyhow::ensure!(
+        intent
+            .attestations
+            .iter()
+            .all(|attestation| attestation.verify(&intent)),
+        "the offender's co-signatures must be cryptographically valid, or the \
+         refusal proves signature checking rather than the quorum"
+    );
+    Ok((intent, members, required))
+}
+
+/// Submit `intent` until the outcome the caller is waiting for arrives, and
+/// report how long the wait was.
+///
+/// The measurement D32 clause (c) is bounded on. A refused intent burns no
+/// idempotency row, so resubmitting the same id is a fresh judgement rather
+/// than a replay — which is what makes this a poll rather than a sleep, and
+/// the difference is that a sleep would report the bound instead of measuring
+/// against it.
+async fn poll_until_committed(
+    session: &Session,
+    intent: &Intent,
+    budget: Duration,
+) -> Result<(IntentOutcome, u64)> {
+    let started = std::time::Instant::now();
+    loop {
+        let outcome = submit(session, intent.clone()).await?;
+        let elapsed = started.elapsed();
+        // Exhausting the budget is a *failed arm*, not a harness error: the
+        // report is the evidence, and a gate that died here would name the
+        // timeout instead of naming the control that went on acting. The
+        // caller's assertion — committed, inside the bound — is what fails.
+        if matches!(outcome, IntentOutcome::Committed { .. }) || elapsed >= budget {
+            return Ok((outcome, elapsed.as_millis() as u64));
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// Wait for a gateway to record that it applied a posture, and report how long
+/// it took.
+///
+/// The promotion direction cannot be polled the way the demotion direction is,
+/// and the asymmetry is the mechanism rather than an inconvenience: a refused
+/// intent burns no idempotency row, so resubmitting it under `required` is a
+/// fresh judgement — but a *committed* one is durable, so an offender polled
+/// across the promotion boundary would commit on its first attempt and then be
+/// unusable as a probe. So the latency comes from the process's own record and
+/// the *effect* is proved by the single submission after it, which must be
+/// refused with no durable trace.
+fn wait_for_posture(log: &Path, mode: &str, budget: Duration) -> Result<u64> {
+    let started = std::time::Instant::now();
+    loop {
+        let text = std::fs::read_to_string(log)
+            .with_context(|| format!("read gateway log {}", log.display()))?;
+        let mut applied = text.lines().filter_map(|line| {
+            let value = serde_json::from_str::<Value>(line).ok()?;
+            let fields = value.get("fields")?;
+            (fields.get("message").and_then(Value::as_str) == Some("ramp posture applied")).then(
+                || {
+                    fields
+                        .get("mode")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                },
+            )?
+        });
+        // Same discipline as `poll_until_committed`: a posture that never
+        // applied returns a latency past the bound, which fails the arm and
+        // says so in the report, rather than killing the harness.
+        if applied.next_back().as_deref() == Some(mode) || started.elapsed() >= budget {
+            return Ok(started.elapsed().as_millis() as u64);
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+async fn run_ramp(args: RampArgs) -> Result<()> {
+    let db = FdbIntentExecutor::connect(
+        args.cluster_file
+            .to_str()
+            .context("cluster-file path is not UTF-8")?,
+        GRID,
+    )?
+    .database()
+    .clone();
+    seed_ramp_ledger(&db).await?;
+    std::fs::write(&args.posture_file, "required\n")
+        .with_context(|| format!("seed the posture file {}", args.posture_file.display()))?;
+
+    let issuer = secret(1);
+    let witness_keys = witnesses();
+    let selected: Vec<NodeId> = witness_keys.iter().map(iroh::SecretKey::public).collect();
+
+    let enforcing = connect_session(&issuer, SessionStanding::Good, args.enforcing.clone()).await?;
+    present_epoch(&enforcing, announcement(&selected)?).await?;
+    let shadow = connect_session(&issuer, SessionStanding::Good, args.shadow.clone()).await?;
+    present_epoch(&shadow, announcement(&selected)?).await?;
+
+    // Both caches converge on the durable draw key before anything is drawn
+    // against it, and the shadow warm-up doubles as the `would_act = false`
+    // observation that keeps this gate's "shadow refuses nothing" from being a
+    // claim about a control that observed nothing either.
+    let enforcing_warmup = submit(
+        &enforcing,
+        ramp_warmup(
+            &issuer,
+            RAMP_ENFORCING_WARMUP_INTENT,
+            ItemUid::new(151_301),
+            &witness_keys,
+        ),
+    )
+    .await?;
+    let shadow_warmup = submit(
+        &shadow,
+        ramp_warmup(
+            &issuer,
+            RAMP_SHADOW_WARMUP_INTENT,
+            ItemUid::new(151_302),
+            &witness_keys,
+        ),
+    )
+    .await?;
+
+    let epoch_row: keyspace::EpochRow = decode_required(
+        &db,
+        keyspace::epoch_key(GRID, CELL, EPOCH).to_vec(),
+        "durable epoch row",
+    )
+    .await?;
+    let eligible = selected.clone();
+
+    // (1) Enforcing acts.
+    let (offender, submitted, required) = ramp_offender(
+        &issuer,
+        RAMP_ENFORCING_OFFENDER_INTENT,
+        ItemUid::new(151_303),
+        &epoch_row.draw_key,
+        &eligible,
+        &witness_keys,
+    )?;
+    let enforcing_outcome = submit(&enforcing, offender).await?;
+
+    // (2) and (3): the same traffic, judged by the shadow process.
+    let (shadow_offender, _, _) = ramp_offender(
+        &issuer,
+        RAMP_SHADOW_OFFENDER_INTENT,
+        ItemUid::new(151_304),
+        &epoch_row.draw_key,
+        &eligible,
+        &witness_keys,
+    )?;
+    let shadow_outcome = submit(&shadow, shadow_offender).await?;
+
+    // (4) Reversibility, on the process that was acting a moment ago. The
+    // posture write is the operator's act; everything after it is the fleet's.
+    let (demoted_offender, _, _) = ramp_offender(
+        &issuer,
+        RAMP_DEMOTED_OFFENDER_INTENT,
+        ItemUid::new(151_305),
+        &epoch_row.draw_key,
+        &eligible,
+        &witness_keys,
+    )?;
+    std::fs::write(&args.posture_file, "shadow\n").context("demote the enforcing gateway")?;
+    let (demoted_outcome, demote_ms) = poll_until_committed(
+        &enforcing,
+        &demoted_offender,
+        Duration::from_millis(RAMP_APPLY_BOUND_MS * 5),
+    )
+    .await?;
+
+    // And back, because a lever that only moves one way is a collapse rather
+    // than a ramp: D32 clause (f) makes promotion an operator act precisely
+    // because demotion is automatable, and a gate that never promoted could
+    // not tell a reversible control from a broken one.
+    let (repromoted_offender, _, _) = ramp_offender(
+        &issuer,
+        RAMP_REPROMOTED_OFFENDER_INTENT,
+        ItemUid::new(151_306),
+        &epoch_row.draw_key,
+        &eligible,
+        &witness_keys,
+    )?;
+    std::fs::write(&args.posture_file, "required\n").context("promote the gateway back")?;
+    let promote_ms = wait_for_posture(
+        &args.enforcing_log,
+        "required",
+        Duration::from_millis(RAMP_APPLY_BOUND_MS * 5),
+    )?;
+    let repromoted_outcome = submit(&enforcing, repromoted_offender).await?;
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let shadow_observations = read_shadow_observations(&args.shadow_log)?;
+    let enforcing_observations = read_shadow_observations(&args.enforcing_log)?;
+    let shadow_refusals = read_refusal_audit(&args.shadow_log)?;
+    let enforcing_refusals = read_refusal_audit(&args.enforcing_log)?;
+
+    let observation_of =
+        |seen: &[ObservedShadow], id: u128| seen.iter().find(|row| row.intent_id == id).cloned();
+
+    // ── (1) ─────────────────────────────────────────────────────────────────
+    let enforcing_durable = rejected_without_state(
+        &db,
+        &read_receipts(&db).await?,
+        RAMP_ENFORCING_OFFENDER_INTENT,
+    )
+    .await?;
+    let enforcing_cause = enforcing_refusals
+        .get(&RAMP_ENFORCING_OFFENDER_INTENT)
+        .cloned();
+    let enforcing_acts = rejected_as(
+        &enforcing_outcome,
+        orrery_protocol::REASON_ATTESTATION_QUORUM,
+    ) && enforcing_cause.as_deref() == Some("required_witness_missing")
+        && enforcing_durable == (true, true, 0)
+        && matches!(enforcing_warmup, IntentOutcome::Committed { .. });
+
+    // ── (2) ─────────────────────────────────────────────────────────────────
+    let shadow_offender_seen = observation_of(&shadow_observations, RAMP_SHADOW_OFFENDER_INTENT);
+    let shadow_warmup_seen = observation_of(&shadow_observations, RAMP_SHADOW_WARMUP_INTENT);
+    let shadow_observes = shadow_offender_seen
+        .as_ref()
+        .is_some_and(|row| row.would_act && row.verdict == "required_witness_missing")
+        // The predicate ran in full on honest traffic too, which is what
+        // separates a shadow that is observing from one that only wakes up for
+        // the traffic a gate injects.
+        && shadow_warmup_seen
+            .as_ref()
+            .is_some_and(|row| !row.would_act);
+
+    // ── (3) ─────────────────────────────────────────────────────────────────
+    let receipts = read_receipts(&db).await?;
+    let shadow_receipts = receipts
+        .iter()
+        .filter(|row| row.intent_id == RAMP_SHADOW_OFFENDER_INTENT)
+        .count();
+    let shadow_attest = read_attest_enforced(&db, RAMP_SHADOW_OFFENDER_INTENT).await?;
+    let shadow_would_act = shadow_observations
+        .iter()
+        .filter(|row| row.would_act)
+        .count();
+    let shadow_does_not_act = matches!(shadow_outcome, IntentOutcome::Committed { .. })
+        && matches!(shadow_warmup, IntentOutcome::Committed { .. })
+        && shadow_attest == Some(false)
+        && read_item_owner(&db, ItemUid::new(151_304)).await? == Some(BUYER)
+        && shadow_receipts == 1
+        // The pair a single counter cannot express: nothing refused, and
+        // something that would have been. Either half alone is satisfied by a
+        // control that is simply off.
+        && shadow_refusals.is_empty()
+        && shadow_would_act > 0;
+
+    // ── (4) ─────────────────────────────────────────────────────────────────
+    let demoted_attest = read_attest_enforced(&db, RAMP_DEMOTED_OFFENDER_INTENT).await?;
+    let demoted_seen = observation_of(&enforcing_observations, RAMP_DEMOTED_OFFENDER_INTENT);
+    let repromoted_durable =
+        rejected_without_state(&db, &receipts, RAMP_REPROMOTED_OFFENDER_INTENT).await?;
+    let reversible = matches!(demoted_outcome, IntentOutcome::Committed { .. })
+        && demote_ms <= RAMP_APPLY_BOUND_MS
+        // The commit half of the control moved with the admission half. A
+        // demotion that reached only the validator would have committed this
+        // intent with `enforced: true`, or refused it at commit.
+        && demoted_attest == Some(false)
+        && demoted_seen
+            .as_ref()
+            .is_some_and(|row| row.would_act && row.verdict == "required_witness_missing")
+        && rejected_as(
+            &repromoted_outcome,
+            orrery_protocol::REASON_ATTESTATION_QUORUM,
+        )
+        && promote_ms <= RAMP_APPLY_BOUND_MS
+        && repromoted_durable == (true, true, 0);
+
+    let passed = enforcing_acts && shadow_observes && shadow_does_not_act && reversible;
+    let node_strings = |nodes: &[NodeId]| nodes.iter().map(ToString::to_string).collect::<Vec<_>>();
+    let observed_json = |row: &Option<ObservedShadow>| match row {
+        Some(row) => json!({
+            "intent_id": row.intent_id.to_string(),
+            "would_act": row.would_act,
+            "verdict": row.verdict
+        }),
+        None => Value::Null,
+    };
+    let report = json!({
+        "schema": "orrery.p5-ramp-shadow/1",
+        "result": if passed { "pass" } else { "fail" },
+        "control": "attestation_quorum",
+        "observation_surface": {
+            "tracing_target": SHADOW_TARGET,
+            "durable_row": "attest/{intent_id}.enforced",
+            "in_process_observer": false
+        },
+        "gateways": {
+            "process_boundary": true,
+            "wire": "iroh",
+            "fdb": true,
+            "enforcing_started_as": "required",
+            "shadow_started_as": "shadow"
+        },
+        "epoch": {
+            "grid": GRID.0,
+            "cell": CELL.to_bits(),
+            "epoch": EPOCH,
+            "handle": HANDLE,
+            "announced_witnesses": node_strings(&selected),
+            "draw_key_audited_from_fdb": true
+        },
+        "arms": {
+            "enforcing_acts": {
+                "passed": enforcing_acts,
+                "intent_id": RAMP_ENFORCING_OFFENDER_INTENT.to_string(),
+                "outcome": format!("{enforcing_outcome:?}"),
+                "audit_cause": enforcing_cause,
+                "submitted_witnesses": node_strings(&submitted),
+                "required_witnesses": node_strings(&required),
+                "intent_rows": usize::from(!enforcing_durable.0),
+                "attest_rows": usize::from(!enforcing_durable.1),
+                "ledger_receipts": enforcing_durable.2
+            },
+            "shadow_observes": {
+                "passed": shadow_observes,
+                "intent_id": RAMP_SHADOW_OFFENDER_INTENT.to_string(),
+                "offender_observation": observed_json(&shadow_offender_seen),
+                "honest_observation": observed_json(&shadow_warmup_seen),
+                "verdict_matches_enforcing_cause":
+                    shadow_offender_seen.as_ref().map(|row| row.verdict.clone())
+                        == enforcing_refusals.get(&RAMP_ENFORCING_OFFENDER_INTENT).cloned()
+            },
+            "shadow_does_not_act": {
+                "passed": shadow_does_not_act,
+                "intent_id": RAMP_SHADOW_OFFENDER_INTENT.to_string(),
+                "outcome": format!("{shadow_outcome:?}"),
+                "attest_row_enforced": shadow_attest,
+                "durable_item_owner": read_item_owner(&db, ItemUid::new(151_304))
+                    .await?
+                    .map(|owner| owner.0),
+                "ledger_receipts": shadow_receipts,
+                "refusals_in_shadow_run": shadow_refusals.len(),
+                "would_act_observations": shadow_would_act,
+                "observations": shadow_observations.len()
+            },
+            "reversibility": {
+                "passed": reversible,
+                "apply_bound_ms": RAMP_APPLY_BOUND_MS,
+                "demotion": {
+                    "intent_id": RAMP_DEMOTED_OFFENDER_INTENT.to_string(),
+                    "apply_ms": demote_ms,
+                    "outcome": format!("{demoted_outcome:?}"),
+                    "attest_row_enforced": demoted_attest,
+                    "observation": observed_json(&demoted_seen)
+                },
+                "promotion": {
+                    "intent_id": RAMP_REPROMOTED_OFFENDER_INTENT.to_string(),
+                    "apply_ms": promote_ms,
+                    "outcome": format!("{repromoted_outcome:?}"),
+                    "intent_rows": usize::from(!repromoted_durable.0),
+                    "attest_rows": usize::from(!repromoted_durable.1),
+                    "ledger_receipts": repromoted_durable.2
+                }
+            }
+        },
+        // D32 clause (c)'s inventory has five controls and only C1 and C2
+        // exist; C3, C4 and C5 "do not exist yet" and their flags "gate
+        // nothing". #222's acceptance list asks this gate to prove no lease was
+        // revoked and no authority correction broadcast, and there is no such
+        // control in the tree to prove it of. Named here rather than silently
+        // skipped, so the hole is visible to whoever promotes.
+        "controls_not_yet_built": ["write_annulment", "authority_correction", "strikes"]
+    });
+    let encoded = serde_json::to_vec_pretty(&report)?;
+    std::fs::write(&args.report, &encoded)
+        .with_context(|| format!("write report {}", args.report.display()))?;
+    println!("{}", String::from_utf8_lossy(&encoded));
+    anyhow::ensure!(passed, "one or more ramp arms failed");
+    Ok(())
+}
+
+/// The `enforced` marker on an intent's durable attestation row, and `None`
+/// when there is no row at all.
+///
+/// The two are different facts and the gate needs both: `off` writes no row,
+/// `shadow` writes one saying the cluster did not stand behind the quorum, and
+/// `required` writes one saying it did. Collapsing the absent row into `false`
+/// would let an `off` gateway pass the shadow arm.
+async fn read_attest_enforced(db: &Database, intent_id: u128) -> Result<Option<bool>> {
+    let Some(raw) = read_raw(db, keyspace::attest_key(intent_id).to_vec()).await? else {
+        return Ok(None);
+    };
+    let row: keyspace::AttestRow = postcard::from_bytes(&raw).context("decode attest row")?;
+    Ok(Some(row.enforced))
+}
+
+async fn seed_ramp_ledger(db: &Database) -> Result<()> {
+    let items = [151_301u64, 151_302, 151_303, 151_304, 151_305, 151_306];
+    for item in items {
+        anyhow::ensure!(
+            read_raw(db, keyspace::ledger_item_key(ItemUid::new(item)).to_vec())
+                .await?
+                .is_none(),
+            "ledger item {item} already exists; the gate requires a fresh throwaway cluster"
+        );
+    }
+    let rows = items
+        .into_iter()
+        .map(|item| {
+            Ok::<_, anyhow::Error>((
+                keyspace::ledger_item_key(ItemUid::new(item)).to_vec(),
+                postcard::to_stdvec(&keyspace::ItemRow {
+                    owner: SELLER,
+                    state: b"p5-ramp-shadow".to_vec(),
+                })?,
+            ))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    db.run(|trx, _| {
+        let rows = rows.clone();
+        async move {
+            for (key, value) in rows {
+                trx.set(&key, &value);
+            }
+            trx.set(
+                &keyspace::ledger_bal_key(BUYER, RAMP_ASSET),
+                &STARTING_BALANCE.to_le_bytes(),
+            );
+            Ok(())
+        }
+    })
+    .await
+    .map_err(|error: FdbBindingError| anyhow::anyhow!("seed ramp ledger: {error}"))
 }
 
 fn forged_empty_intent(issuer: &iroh::SecretKey, intent_id: u128) -> Intent {

@@ -139,18 +139,37 @@ pub struct FdbIntentExecutor {
     /// admission used is a recorded vector the audit cannot read as evidence
     /// of the decision that was actually made.
     witness_bindings: Option<crate::gateway::SharedBindingAuthority>,
-    /// The mode the gateway's validator admitted under, which decides two
+    /// The posture the gateway's validator admits under, which decides two
     /// things here and nothing else (D32 clause (d)): the `enforced` marker on
     /// the [`keyspace::AttestRow`] this executor writes, and whether the
     /// commit-time required-subset re-proof is armed.
     ///
-    /// Wired through [`Self::recording_epochs`] and [`Self::shadowing_epochs`]
-    /// rather than read from the validator, because the two seams do not know
-    /// each other: [`super::IntentExecutor`] is implemented outside this crate
-    /// and takes no validator. Keeping it a startup pairing is the same
-    /// argument `recording_epochs` already makes about the cache and the
-    /// resolver.
-    witness_enforcement: super::AttestationEnforcement,
+    /// Wired through [`Self::recording_epochs`], [`Self::shadowing_epochs`]
+    /// and [`Self::tracking_posture`] rather than read from the validator,
+    /// because the two seams do not know each other:
+    /// [`super::IntentExecutor`] is implemented outside this crate and takes
+    /// no validator.
+    ///
+    /// # Why it is a posture cell and not a mode
+    ///
+    /// D32 clause (c) makes the mode *runtime-settable* and bounds the time
+    /// from an operator's decision to a stopped control at one poll interval
+    /// plus apply. A frozen copy here cannot honour that bound, and the way it
+    /// fails is the worst available one: demoting the validator
+    /// `Required -> Shadow` would move the refusal from admission to commit
+    /// rather than removing it, because the re-proof below would still be
+    /// armed. The control would go on acting under a mode that says it does
+    /// not — clause (b)'s second corollary, and exactly what [#222]'s gate leg
+    /// exists to catch. Sharing the validator's own cell
+    /// ([`super::BaselineIntentValidator::posture`]) is what makes the two
+    /// halves of one control move together.
+    ///
+    /// [`Self::recording_epochs`] and [`Self::shadowing_epochs`] keep their
+    /// meaning: each installs a private cell pinned to that mode, which is the
+    /// right answer for a deployment with no runtime lever wired up.
+    ///
+    /// [#222]: https://github.com/baadc0de/orrery/issues/222
+    witness_enforcement: super::AttestationPosture,
 }
 
 /// The active shard ownership an intent executor is allowed to write under.
@@ -212,7 +231,7 @@ impl FdbIntentExecutor {
             allocator: Arc::new(tokio::sync::Mutex::new(PersistIdAllocator::default())),
             witness_epochs: None,
             witness_bindings: None,
-            witness_enforcement: super::AttestationEnforcement::Off,
+            witness_enforcement: super::AttestationPosture::new(super::AttestationEnforcement::Off),
         }
     }
 
@@ -232,7 +251,7 @@ impl FdbIntentExecutor {
             allocator: Arc::new(tokio::sync::Mutex::new(PersistIdAllocator::default())),
             witness_epochs: None,
             witness_bindings: None,
-            witness_enforcement: super::AttestationEnforcement::Off,
+            witness_enforcement: super::AttestationPosture::new(super::AttestationEnforcement::Off),
         }
     }
 
@@ -282,7 +301,8 @@ impl FdbIntentExecutor {
     ) -> Self {
         self.witness_epochs = Some(epochs);
         self.witness_bindings = Some(bindings);
-        self.witness_enforcement = super::AttestationEnforcement::Required;
+        self.witness_enforcement =
+            super::AttestationPosture::new(super::AttestationEnforcement::Required);
         self
     }
 
@@ -316,8 +336,49 @@ impl FdbIntentExecutor {
     ) -> Self {
         self.witness_epochs = Some(epochs);
         self.witness_bindings = Some(bindings);
-        self.witness_enforcement = super::AttestationEnforcement::Shadow;
+        self.witness_enforcement =
+            super::AttestationPosture::new(super::AttestationEnforcement::Shadow);
         self
+    }
+
+    /// [`Self::recording_epochs`] against a posture cell the caller also
+    /// holds, rather than one pinned at startup.
+    ///
+    /// The constructor a gateway that wires D32 clause (c)'s runtime lever
+    /// uses: hand this the *same* [`super::AttestationPosture`] the
+    /// [`super::BaselineIntentValidator`] reads
+    /// ([`super::BaselineIntentValidator::posture`]) and one write moves both
+    /// halves of control C1 together — the admission refusal and the
+    /// commit-time re-proof, the `enforced` marker with them.
+    ///
+    /// Two cells would be two controls wearing one name, and the failure is
+    /// silent in the dangerous direction: a demotion that reached only the
+    /// validator would leave this executor refusing at commit what admission
+    /// admitted, so a control an operator believes is observing would still be
+    /// acting.
+    #[must_use]
+    pub fn tracking_posture(
+        mut self,
+        epochs: Arc<crate::witness_epoch::WitnessEpochAuthority>,
+        bindings: crate::gateway::SharedBindingAuthority,
+        posture: super::AttestationPosture,
+    ) -> Self {
+        self.witness_epochs = Some(epochs);
+        self.witness_bindings = Some(bindings);
+        self.witness_enforcement = posture;
+        self
+    }
+
+    /// The posture cell this executor reads at the top of every commit.
+    ///
+    /// The read side of [`Self::tracking_posture`], and the reason it is a
+    /// cell rather than a mode: a caller that cached this answer would be
+    /// reporting the posture at startup and calling it the posture now, which
+    /// is the mistake [`super::BaselineIntentValidator::posture`] documents on
+    /// the admission half of the same control.
+    #[must_use]
+    pub fn attestation_posture(&self) -> super::AttestationPosture {
+        self.witness_enforcement.clone()
     }
 
     /// The underlying database handle, for tests that need to read rows back.
@@ -548,7 +609,12 @@ impl FdbIntentExecutor {
         let minted = self.allocate_ids(intent.ops.len() as u64).await?;
         let epochs = self.witness_epochs.clone();
         let bindings = self.witness_bindings.clone();
-        let enforcement = self.witness_enforcement;
+        // Read once, here, and used for the whole of this intent's commit.
+        // D32 clause (c): "intents already past validation complete under the
+        // prior mode" — so a posture write landing mid-transaction must not
+        // arm the re-proof for an intent shadow already admitted, nor mark its
+        // row `enforced` because the flag moved after the fact.
+        let enforcement = self.witness_enforcement.get();
         // Set by the closure only on an attempt that wrote or verified the
         // `epoch/` row. It is **not** the same question as "did this intent
         // commit": the idempotency replay path below returns a recorded
@@ -1637,6 +1703,97 @@ mod tests {
                 return None;
             }
         }
+    }
+
+    /// D32 clause (c)'s runtime lever reaches the *commit* half of control C1,
+    /// not only the admission half.
+    ///
+    /// The regression this pins is the one #222's gate leg exists to catch,
+    /// and it is invisible from the admission side: with a frozen mode here, a
+    /// validator demoted `Required -> Shadow` would go on refusing at commit
+    /// what it now admits at admission — the control acting under a mode that
+    /// says it does not. Sharing the validator's own cell is what makes one
+    /// write move both halves, so this asserts the *identity* of the cells
+    /// rather than a mode either of them happened to start in.
+    #[test]
+    fn the_executor_and_the_validator_share_one_posture_cell() {
+        let Some(cluster) = fdb_cluster_file() else {
+            eprintln!("skipping: ORRERY_FDB_CLUSTER_FILE not set and no .fdb-dev/fdb.cluster");
+            return;
+        };
+        let epochs = Arc::new(crate::witness_epoch::WitnessEpochAuthority::new([]));
+        let bindings: crate::gateway::SharedBindingAuthority =
+            Arc::new(crate::gateway::SnapshotBindingAuthority::from_bindings([]));
+        let validator = crate::intent::BaselineIntentValidator::shadow(
+            Arc::clone(&epochs),
+            Arc::new(crate::gateway::DenyAllInterestAuthority),
+            Arc::clone(&bindings),
+        );
+        let executor = FdbIntentExecutor::connect(&cluster, GridId::new(GRID))
+            .expect("connect")
+            .tracking_posture(epochs, bindings, validator.posture());
+
+        assert_eq!(
+            executor.attestation_posture().get(),
+            crate::intent::AttestationEnforcement::Shadow
+        );
+
+        // The operator's promotion, written through the validator's handle —
+        // the seam a `ramp/attestation_quorum` poller holds.
+        validator
+            .posture()
+            .set(crate::intent::AttestationEnforcement::Required);
+        assert_eq!(
+            executor.attestation_posture().get(),
+            crate::intent::AttestationEnforcement::Required,
+            "a promotion that reached only the validator would leave the \
+             commit-time re-proof disarmed under `required`"
+        );
+
+        // And clause (f)'s trip, which is the direction that matters: the
+        // demotion has to disarm the re-proof, or auto-suspend suspends half a
+        // control.
+        assert!(validator.posture().auto_suspend());
+        assert_eq!(
+            executor.attestation_posture().get(),
+            crate::intent::AttestationEnforcement::Shadow
+        );
+    }
+
+    /// The two pinned constructors keep their meaning: each installs a cell of
+    /// its own, so a deployment with no runtime lever is unchanged.
+    #[test]
+    fn the_pinned_constructors_install_private_cells() {
+        let Some(cluster) = fdb_cluster_file() else {
+            eprintln!("skipping: ORRERY_FDB_CLUSTER_FILE not set and no .fdb-dev/fdb.cluster");
+            return;
+        };
+        let epochs = Arc::new(crate::witness_epoch::WitnessEpochAuthority::new([]));
+        let bindings: crate::gateway::SharedBindingAuthority =
+            Arc::new(crate::gateway::SnapshotBindingAuthority::from_bindings([]));
+        let recording = FdbIntentExecutor::connect(&cluster, GridId::new(GRID))
+            .expect("connect")
+            .recording_epochs(Arc::clone(&epochs), Arc::clone(&bindings));
+        let shadowing = FdbIntentExecutor::connect(&cluster, GridId::new(GRID))
+            .expect("connect")
+            .shadowing_epochs(epochs, bindings);
+
+        assert_eq!(
+            recording.attestation_posture().get(),
+            crate::intent::AttestationEnforcement::Required
+        );
+        assert_eq!(
+            shadowing.attestation_posture().get(),
+            crate::intent::AttestationEnforcement::Shadow
+        );
+        shadowing
+            .attestation_posture()
+            .set(crate::intent::AttestationEnforcement::Off);
+        assert_eq!(
+            recording.attestation_posture().get(),
+            crate::intent::AttestationEnforcement::Required,
+            "two pinned executors must not share one cell"
+        );
     }
 
     fn commitment() -> EvidenceCommitment {

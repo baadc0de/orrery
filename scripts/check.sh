@@ -230,6 +230,7 @@ lane_gates() {
     run scripts/p3-island-gate.sh --self-test
     run scripts/p3-siblings-gate.sh --self-test
     run scripts/p5-dupe-gauntlet-gate.sh --self-test
+    run scripts/ramp-shadow-gate.sh --self-test
     run scripts/p1-swarm-gate.sh --self-test
     run scripts/fdb-tests.sh --self-test
 
