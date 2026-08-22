@@ -1,6 +1,6 @@
 # ADR-0037: An unavailable witness epoch refuses with a bounded cure; only measured low population is provisional
 
-**Status:** Proposed · **Date:** 2026-08-22 · **Decision:** D37
+**Status:** Accepted · **Date:** 2026-08-22 · **Decision:** D37
 
 > **This record amends the accepted [D27](0027-attestation-envelope.md) and
 > [D28](0028-witness-set-seeding.md), and consequentially updates accepted
