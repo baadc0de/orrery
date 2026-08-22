@@ -166,7 +166,21 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # the bind atomicity proof, which now also asserts `dw` unchanged across an
 # injected abort), so they move nothing. A full run measured 687 executed tests
 # on 2026-08-22. The floor rises by those ten: 459 -> 469.
-FLOOR="${ORRERY_FDB_TEST_FLOOR:-469}"
+# The ramp measurement (issue #221, D32 clause (e)) adds twelve, and **none**
+# of them needs the cluster: the whole instrument is counters on the admission
+# path, which is the gateway-side fast filter that performs no FDB round trip
+# by design. Nine are `intent::ramp`'s unit tests — the 0-of-10000 against
+# 0-of-0 distinction, coverage falling when qualifying activity goes
+# unobserved, the unevaluated split, account cardinality against event volume,
+# the cause vocabulary, the unattributed bucket, truncation reporting, the
+# cohort union, and the artifact round trip — and three are `intent::tests`'
+# validator-level pair tests (the would-have-acted counter's two arms, the
+# denominator counting what the shadow arm never saw, and an `Off` validator
+# reporting no coverage rather than a clean sheet). They run in the same
+# invocation and count the same. The thirteenth, `emit_ramp_artifact`, is
+# `#[ignore]`d — it regenerates a committed artifact — so it does not.
+# The floor rises by all twelve: 469 -> 481.
+FLOOR="${ORRERY_FDB_TEST_FLOOR:-481}"
 
 # Every test file whose contents only mean anything against a real cluster. If
 # one of these reports no executed tests, the tier is dark again whatever the
