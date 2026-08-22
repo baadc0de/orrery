@@ -188,7 +188,7 @@ pub struct EvidenceBundle {              // D10 discrepancy report payload
     pub observer: NodeId,
 }
 
-pub const PROTOCOL_VERSION: u16 = 1;     // services accept N and N−1 (rolling upgrade)
+pub const PROTOCOL_VERSION: u16 = 3;     // services accept this version only
 ```
 
 ### 2. `orrery_core` — verifiable core

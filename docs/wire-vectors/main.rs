@@ -1,9 +1,9 @@
 use iroh_base::SecretKey;
 use orrery_protocol::{
     audit_witness_epoch_draw, draw_witness_set, verify_witness_epoch, verify_witness_epoch_reveal,
-    witness_epoch_binding, witness_epoch_commitment, witness_epoch_seed, CellEpoch, CellId, GridId,
-    Intent, IntentOp, IssuerKey, IssuerKeyId, NodeId, WitnessEpochClaimsV1, WitnessEpochV1,
-    INTENT_PREIMAGE_TAG, PROTOCOL_VERSION, WITNESS_EPOCH_V1_DOMAIN,
+    witness_epoch_binding, witness_epoch_commitment, witness_epoch_seed, AccountId, CellEpoch,
+    CellId, GridId, Intent, IntentOp, IssuerKey, IssuerKeyId, NodeId, WitnessEpochClaimsV1,
+    WitnessEpochV1, INTENT_PREIMAGE_TAG, PROTOCOL_VERSION, WITNESS_EPOCH_V1_DOMAIN,
 };
 use serde_json::{json, Value};
 
@@ -53,6 +53,9 @@ fn epoch_vector(
     let commitment = witness_epoch_commitment(grid, cell, epoch, &seed_key);
     let draw_seed = witness_epoch_seed(&seed_key, grid, cell, epoch);
     let selected = draw_witness_set(candidates, &draw_seed);
+    let candidate_accounts = (0..candidates.len())
+        .map(|index| AccountId::new(10_000_000 + index as u64))
+        .collect();
     let claims = WitnessEpochClaimsV1::new(
         grid,
         cell,
@@ -65,7 +68,8 @@ fn epoch_vector(
         commitment,
         prev_seed_key,
         issuer_key_id,
-    );
+    )
+    .with_candidate_accounts(candidate_accounts);
     let claims_postcard = postcard::to_stdvec(&claims).expect("claims encode");
     let mut signing_preimage = WITNESS_EPOCH_V1_DOMAIN.to_vec();
     signing_preimage.extend_from_slice(&claims_postcard);
@@ -127,6 +131,7 @@ fn main() {
             },
         ],
         attestations: Vec::new(),
+        evidence: None,
         signature: issuer.sign(b"replaced by Intent::sign"),
     };
     let signing_preimage = intent.signing_preimage();

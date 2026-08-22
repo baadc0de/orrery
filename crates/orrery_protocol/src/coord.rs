@@ -8,7 +8,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::identity::{IssuerKey, IssuerKeyId, Signature};
-use crate::{CellId, Epoch, GridId, NodeId};
+use crate::{AccountId, CellId, Epoch, GridId, NodeId};
 
 /// A coordinator-allocated island identifier (docs/02-networking.md §3).
 ///
@@ -381,6 +381,14 @@ pub const MAX_WITNESS_EPOCH_BYTES: usize = 2048;
 /// promoted to a field host, so a pool larger than that describes a population
 /// the topology does not have.
 pub const MAX_EPOCH_CANDIDATES: usize = 32;
+/// Maximum raw account-id payload added to one witness-epoch announcement.
+///
+/// D34 caps the parallel account vector at 32 `u64` account ids: 256 bytes
+/// before postcard's sequence framing and integer encoding. The encoded delta
+/// for realistic account ids is measured by the protocol tests rather than
+/// inferred from this raw-width bound.
+pub const MAX_CANDIDATE_ACCOUNTS_BYTES: usize =
+    MAX_EPOCH_CANDIDATES * core::mem::size_of::<AccountId>();
 /// The witness set size the coordinator draws for (D16, D28 clause (c)).
 ///
 /// 7 is `orrery_witness`'s `MAX_WITNESS_LINKS`, which is the bandwidth bound
@@ -444,6 +452,12 @@ pub struct WitnessEpochClaimsV1 {
     /// claim any `selected` was drawn from a pool it invented afterwards, and
     /// the reveal would prove nothing.
     pub candidates: Vec<NodeId>,
+    /// The coordinator-resolved account for each candidate at issuance.
+    ///
+    /// Entries are positional: `candidate_accounts[i]` owns `candidates[i]`.
+    /// The vector is signed with the rest of the claims, freezing the binding
+    /// view for this cell-epoch (D34).
+    pub candidate_accounts: Vec<AccountId>,
     /// The drawn witness set, in draw order, a subset of `candidates`.
     pub selected: Vec<NodeId>,
     /// blake3 commitment to the epoch's secret seed key.
@@ -485,11 +499,24 @@ impl WitnessEpochClaimsV1 {
             epoch_ms,
             accept_grace_ms,
             candidates,
+            candidate_accounts: Vec::new(),
             selected,
             seed_commitment,
             prev_seed_key,
             issuer_key_id,
         }
+    }
+
+    /// Attach the account parallel to each candidate (D34).
+    ///
+    /// Verification rejects a non-empty vector whose length differs from the
+    /// candidate vector. This builder preserves the established constructor
+    /// while the coordinator's candidate-account collection lands in its own
+    /// lane.
+    #[must_use]
+    pub fn with_candidate_accounts(mut self, candidate_accounts: Vec<AccountId>) -> Self {
+        self.candidate_accounts = candidate_accounts;
+        self
     }
 
     /// Compose the epoch handle D28 clause (b) specifies.
@@ -650,6 +677,12 @@ fn check_witness_epoch_pool(
     claims: &WitnessEpochClaimsV1,
 ) -> Result<(), WitnessEpochVerificationError> {
     if claims.candidates.is_empty() || claims.candidates.len() > MAX_EPOCH_CANDIDATES {
+        return Err(WitnessEpochVerificationError::BadPool);
+    }
+    if (!claims.candidate_accounts.is_empty()
+        && claims.candidate_accounts.len() != claims.candidates.len())
+        || claims.candidate_accounts.len() > MAX_EPOCH_CANDIDATES
+    {
         return Err(WitnessEpochVerificationError::BadPool);
     }
     // Strictly ascending, which is both the canonical order the draw runs in
@@ -1294,6 +1327,10 @@ mod tests {
         let grid = GridId::ROOT;
         let seed = witness_epoch_seed(seed_key, grid, cell, epoch);
         let selected = draw_witness_set(&candidates, &seed);
+        let candidates = ascending(candidates);
+        let candidate_accounts = (0..candidates.len())
+            .map(|index| AccountId::new(10_000_000 + index as u64))
+            .collect();
         WitnessEpochClaimsV1::new(
             grid,
             cell,
@@ -1301,12 +1338,13 @@ mod tests {
             WitnessEpochClaimsV1::compose_handle(1, u64::from(epoch)),
             30_000,
             30_000,
-            ascending(candidates),
+            candidates,
             selected,
             witness_epoch_commitment(grid, cell, epoch, seed_key),
             None,
             IssuerKeyId::new(3),
         )
+        .with_candidate_accounts(candidate_accounts)
     }
 
     fn signed_epoch(claims: WitnessEpochClaimsV1, key: &iroh_base::SecretKey) -> Vec<u8> {
@@ -1418,6 +1456,11 @@ mod tests {
                 c.candidates = ascending(pool(11));
                 c
             }),
+            ("candidate_accounts", {
+                let mut c = original.clone();
+                c.candidate_accounts[0] = AccountId::new(99_000_001);
+                c
+            }),
         ];
 
         for (field, claims) in tampered {
@@ -1493,6 +1536,16 @@ mod tests {
             ("repeated candidate", {
                 let mut c = base.clone();
                 c.candidates[1] = c.candidates[0];
+                c
+            }),
+            ("account vector shorter than the pool", {
+                let mut c = base.clone();
+                c.candidate_accounts.pop();
+                c
+            }),
+            ("account vector over the interest-mesh ceiling", {
+                let mut c = base.clone();
+                c.candidate_accounts = vec![AccountId::new(1); MAX_EPOCH_CANDIDATES + 1];
                 c
             }),
             ("selection outside the pool", {
@@ -1678,6 +1731,31 @@ mod tests {
             "a full pool encodes to {} bytes",
             encoded.len()
         );
+    }
+
+    #[test]
+    fn realistic_candidate_accounts_add_at_most_256_bytes() {
+        // These are signed, fully populated announcements at the pool sizes
+        // supported by D28: the five-candidate floor through the 32-peer
+        // interest-mesh ceiling. Ten-million-range ids model a populated
+        // account table without relying on postcard's one-byte small-id case.
+        for pool_size in [5u8, 7, 8, 16, 24, MAX_EPOCH_CANDIDATES as u8] {
+            let with_accounts = epoch_claims(&[7u8; 32], u32::MAX, pool(pool_size));
+            let mut without_accounts = with_accounts.clone();
+            without_accounts.candidate_accounts.clear();
+
+            let encoded_with = signed_epoch(with_accounts, &secret(9));
+            let encoded_without = signed_epoch(without_accounts, &secret(9));
+            let added = encoded_with.len() - encoded_without.len();
+            eprintln!(
+                "candidate pool {pool_size:>2}: announcement {} B, candidate_accounts +{added} B",
+                encoded_with.len()
+            );
+            assert!(
+                added <= MAX_CANDIDATE_ACCOUNTS_BYTES,
+                "{pool_size} realistic candidate accounts added {added} bytes"
+            );
+        }
     }
 
     #[test]

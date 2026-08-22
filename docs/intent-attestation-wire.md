@@ -1,8 +1,11 @@
 # Orrery intent, attestation, and witness-epoch wire specification
 
-**Status:** interoperability specification for `PROTOCOL_VERSION = 1`  
-**Normative decisions:** [D27](adr/0027-attestation-envelope.md) and
-[D28](adr/0028-witness-set-seeding.md)  
+**Status:** interoperability specification for `PROTOCOL_VERSION = 3`
+
+**Normative decisions:** [D27](adr/0027-attestation-envelope.md),
+[D28](adr/0028-witness-set-seeding.md), and
+[D34](adr/0034-candidate-accounts-announcement.md)
+
 **Test vectors:**
 [`wire-vectors/intent-attestation-v1.json`](wire-vectors/intent-attestation-v1.json)
 
@@ -260,12 +263,17 @@ Do not apply postcard's varints to the §2 or §3 signing preimages. Conversely,
 do not encode announcement claims as fixed-width integers: their signature is
 over postcard bytes.
 
-## 7. Protocol version 2
+## 7. Protocol version 3
 
-`PROTOCOL_VERSION` is `2`. A gateway accepts an offered version exactly when it
+`PROTOCOL_VERSION` is `3`. A gateway accepts an offered version exactly when it
 equals its own — D29 clause 5 closed the `{V, V−1}` rolling window for all
 traffic, so there is no predecessor to accept and no cluster-first deployment
 order to observe. Any other value must be refused.
+
+Version 3 adds the signed `candidate_accounts` vector to
+`WitnessEpochClaimsV1`, parallel to `candidates` (D34). A version-2 decoder
+does not know that positional field, so this is a protocol break even though
+the surrounding `GatewayMsg::WitnessEpoch` discriminant remains unchanged.
 
 The check binds every session, because `GatewayMsg::VersionedHello` is the only
 bootstrap a gateway admits. The older unversioned `GatewayMsg::Hello` is retired

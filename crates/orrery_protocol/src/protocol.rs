@@ -2,7 +2,7 @@
 
 /// The wire protocol version. Services accept **this version only**.
 ///
-/// # Version 2, and why the rolling-upgrade window is gone
+/// # Version 3, and why the rolling-upgrade window is gone
 ///
 /// [D29](https://github.com/baadc0de/orrery/blob/main/docs/adr/0029-low-population-path.md)
 /// clause 5 appends a third arm to
@@ -36,4 +36,9 @@
 /// [`GatewayReply::HelloRefused`](crate::GatewayReply::HelloRefused): a
 /// bootstrap that names no version cannot be shown to be inside a window of
 /// one, and admitting it unchecked was the hole that made enforcement opt-in.
-pub const PROTOCOL_VERSION: u16 = 2;
+///
+/// Version 3 adds `candidate_accounts` to
+/// [`WitnessEpochClaimsV1`](crate::WitnessEpochClaimsV1). This is a positional
+/// postcard change to a signed wire body, so a version-2 peer must not share a
+/// gateway session with a version-3 peer.
+pub const PROTOCOL_VERSION: u16 = 3;
