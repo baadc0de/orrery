@@ -44,10 +44,10 @@ their linked dependencies.
 | D27 | [ADR-0027](adr/0027-attestation-envelope.md) | Attestation envelope and required-K draw |
 | D28 | [ADR-0028](adr/0028-witness-set-seeding.md) | Witness-set seeding, announcement envelope, `epoch/` record |
 | D29 | [ADR-0029](adr/0029-low-population-path.md) | P5 low-population path: quarantined provisional commit, spot replay, annulment |
-| D30 | [ADR-0030](adr/0030-cell-epoch-standing.md) | An intent is judged only under a cell-epoch its issuer stands in (**Proposed**) |
+| D30 | [ADR-0030](adr/0030-cell-epoch-standing.md) | An intent is judged only under a cell-epoch its issuer stands in |
 | D31 | [ADR-0031](adr/0031-id-account-subspace.md) | The `id/` account subspace, its reverse index, and what a miss means |
 | D32 | [ADR-0032](adr/0032-enforcement-ramp.md) | Enforcement ramp: shadow semantics per control, flag inventory, promotion evidence, auto-suspend |
-| D33 | [ADR-0033](adr/0033-strike-ledger-standing.md) | Strike ledger, decay, and quarantine → cooldown → ban standing (**Proposed**) |
+| D33 | [ADR-0033](adr/0033-strike-ledger-standing.md) | Strike ledger, decay, and quarantine → cooldown → ban standing |
 | D34 | [ADR-0034](adr/0034-candidate-accounts-announcement.md) | Candidate accounts travel in the witness-epoch announcement; amends D28 |
 | D35 | [ADR-0035](adr/0035-lease-key-discriminator.md) | The lease registrar row takes the `le` discriminator inside `l`; the disjointness guard learns sub-spans |
 | D36 | [ADR-0036](adr/0036-binding-rate-window.md) | The binding-rate window: `dw` answers D31 clause (g) inside `d`; amends D31 |

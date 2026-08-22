@@ -1,6 +1,6 @@
 # ADR-0033: Strike ledger, exponential decay, and the quarantine → cooldown → ban standing machine
 
-**Status:** Proposed · **Date:** 2026-08-21 · **Decision:** D33
+**Status:** Accepted · **Date:** 2026-08-21 · **Decision:** D33
 
 This decision is normative once accepted. See the [ADR index](../DECISIONS.md)
 for precedence, scope, and the complete decision set.
@@ -56,9 +56,16 @@ writer, so `y`, not `d`, remains correct.
 
 Only the D10/D29 mapping files a row:
 
+> *Erratum (2026-08-22, at acceptance):* an earlier revision of this table
+> named the guilty outcome `Deviation`. No such variant exists —
+> `orrery_protocol::verifiable::Verdict` is `{ Confirms { at, kind },
+> Exonerates, EvidenceForged, Unadjudicable }`, and `Confirms` is the one whose
+> doc reads "Deviation proven". A naming correction only; no weight, subject or
+> decision changes. Found independently by the #215 and #220 implementations.
+
 | Adjudicated outcome | Subject | Weight |
 |---|---|---:|
-| `Deviation` / confirmed replay violation | disputed account | 3.0 |
+| `Confirms { at, kind }` — deviation proven, or a confirmed replay violation | disputed account | 3.0 |
 | false attestation | attesting account | 3.0 |
 | `EvidenceForged` | reporter (or D29 provisional submitter) | 3.0 |
 | non-cooperation / log gap after the existing proof threshold | responsible account | 1.0 |

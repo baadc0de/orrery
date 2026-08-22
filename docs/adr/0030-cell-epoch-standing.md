@@ -1,6 +1,6 @@
 # ADR-0030: An intent is judged only under a cell-epoch its issuer stands in
 
-**Status:** Proposed · **Date:** 2026-08-21 · **Decision:** D30
+**Status:** Accepted · **Date:** 2026-08-21 · **Decision:** D30
 
 This decision is normative once accepted. See the [ADR index](../DECISIONS.md)
 for precedence, scope, and the complete decision set.
