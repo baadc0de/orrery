@@ -155,10 +155,38 @@ not a second shadow policy.
 
 ### (d) Proposed standing thresholds: one proof quarantines; a recent pattern escalates
 
-> **This proposal sets `Q = 3.0`, `C = 5.0`, `B = 7.0`, a 14-day minimum
-> cooldown, and a 7-day account probation. The owner should accept this
-> package or explicitly choose the conservative `3 / 6 / 10` alternative
-> below before accepting the record.**
+> **`Q`, `C`, `B`, the minimum cooldown and the probation window are
+> deployment configuration, not constants of this record. The defaults are
+> `Q = 3.0`, `C = 5.0`, `B = 7.0`, a 14-day minimum cooldown and a 7-day
+> probation. A deployment may set others; it may not set incoherent ones, so
+> the four invariants below are validated at startup and a violation refuses
+> to start rather than warning.**
+
+Decided by the repo owner on 2026-08-22: thresholds are configurable with this
+package as the default, rather than a value fixed by the record. The reasoning
+is that these are policy dials — this record says so itself, two paragraphs
+down — and a dial whose only value is written into a normative ADR forces an
+ADR amendment to retune a number that P4's calibration campaign (#240) exists
+to inform. The record therefore owns the *shape* and the *invariants*; the
+deployment owns the *values*.
+
+What configuration may not do, checked at startup:
+
+```
+(i)   Q <= w_max                 a single proved major violation must quarantine
+(ii)  Q < C < B                  strictly ordered, or a state is unreachable
+(iii) B <= n_intended * w_max    ban must be reachable by the number of major
+                                 findings the operator intends, given decay
+(iv)  cooldown_min > 0           a cooldown that can be left instantly is not one
+```
+
+`w_max` is 3.0 under clause (a)'s weight table. Invariant (iii) is not
+theoretical: the `3 / 6 / 10` package discussed below fails it for
+`n_intended = 3`, because three 3-point facts sum to 9 and never reach 10 —
+so it silently means "three major findings are insufficient" rather than "a
+higher bar". A configuration that cannot reach its own terminal state is the
+kind of error a startup check should catch, not an operator should discover
+from an absence of bans.
 
 The recommended package is arithmetic, not a claim that the values were
 measured:
@@ -187,10 +215,12 @@ The alternative inherited from `docs/07` is `Q/C/B = 3/6/10`. It is more
 forgiving but has two cliffs: two 3-point facts only equal 6 at exactly the
 same instant, and even three equal 9, never ban. It therefore means “three
 major findings are insufficient absent a fourth or lesser facts,” not merely
-“a higher threshold.” **Recommendation: accept 3/5/7**; it supplies a
-two-recent-proof and three-recent-proof machine while retaining the 14-day
-half-life as the forgiveness mechanism. The thresholds are policy dials and
-need owner approval, not a fabricated empirical provenance.
+“a higher threshold.” **`3/5/7` is the default** for exactly that reason: it
+supplies a two-recent-proof and three-recent-proof machine while retaining the
+14-day half-life as the forgiveness mechanism, and it satisfies invariant (iii)
+where `3/6/10` does not. These are policy dials with no fabricated empirical
+provenance — the values that replace them should come from P4's calibration
+campaign (#240), which is what measuring a real false-positive rate is for.
 
 ### (e) State transitions, reversals, and appeals
 
@@ -275,6 +305,42 @@ On acceptance, D16 gains these rows; it does not gain a second half-life:
 | Ban score `B` | 7.0 | Minimum cooldown | 14 days |
 | Account probation | 7 days | Strike storage alarm | 8 retained rows/account/90 d |
 
+### (h) No guest experience during cooldown; unsessioned mesh membership is a non-goal
+
+> **Cooldown admits nothing. A game may not offer a guest, observer or
+> spectator experience that places a cooled-down account in a live mesh, and
+> this record grants no such permission. Anonymous or non-session-backed
+> participants in a mesh are an explicit non-goal.**
+
+Decided by the repo owner on 2026-08-22, closing this record's second open
+question. An earlier draft permitted a "game-level, non-durable mode" under
+that label; that permission is withdrawn.
+
+The reasoning is that the permission was cheaper to grant than to honour. Under
+clause (e) cooldown is an *admission* decision — identity refuses to mint a
+token — and admission is what island membership is gated on:
+`SessionAuthorizer::authorize` verifies the token before a coordinator session
+exists, and island membership is what drives replication interest. So a peer
+without a token receives no replicated state today, and an observer experience
+is not reachable by relaxing a policy dial. Reaching it would take one of:
+
+- an unauthenticated or guest-token admission path — a second admission
+  surface, which is precisely what clause (f)'s fail-closed posture exists to
+  avoid;
+- a third `SessionStanding`, reversing clause (e)'s two-valued decision and
+  adding a state every connected peer must interpret; or
+- a read-only session honoured by the interest and replication paths, which no
+  code models.
+
+Each is a design change with its own failure modes, not a product toggle. A
+record that permits the outcome without specifying the mechanism invites an
+implementer to invent one of the three under time pressure.
+
+**This is a non-goal, not a rejected idea.** If spectating, observer mode or a
+cooled-down guest tier is wanted later, it gets its own record and answers the
+three points above explicitly. Nothing here forecloses that; it only declines
+to pre-authorise it.
+
 ## Consequences
 
 - `y` remains available for the executor-written strike ledger exactly as D31
@@ -313,12 +379,12 @@ On acceptance, D16 gains these rows; it does not gain a second half-life:
 
 ## Owner decisions requested
 
-1. **Threshold package:** accept recommended `3 / 5 / 7`, or choose the
-   conservative legacy-shaped `3 / 6 / 10`. Recommendation: `3 / 5 / 7` for
-   the explicit 8.19-day and 22.19-day escalation windows above.
-2. **Guest experience during cooldown:** this record only permits it as a
-   game-level, non-durable mode. Whether any game exposes one is product
-   policy; token refusal and durable-write denial do not depend on that choice.
+1. **Threshold package: decided — configurable, defaulting to `3 / 5 / 7`.**
+   Resolved by the repo owner on 2026-08-22. The values are deployment
+   configuration bounded by four startup-validated invariants; see clause (d).
+   The legacy-shaped `3 / 6 / 10` was not adopted, and fails invariant (iii).
+2. **Guest experience during cooldown: decided — no.** Resolved by the repo
+   owner on 2026-08-22. See clause (h).
 
 [#205]: https://github.com/baadc0de/orrery/issues/205
 [D10]: 0010-witnessing.md
