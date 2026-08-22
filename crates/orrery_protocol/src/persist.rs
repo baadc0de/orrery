@@ -225,8 +225,74 @@ pub struct JournalRecord {
     pub crc: u32,
 }
 
+impl JournalRecord {
+    /// Encode this record as a versioned logical frame:
+    /// `postcard(record) ‖ [JOURNAL_RECORD_ENCODING]`.
+    ///
+    /// Every journal backend writes through this rather than calling postcard
+    /// directly, so there is one answer to "what encoding is a record on
+    /// disk?" and it is stamped by the writer rather than inferred by the
+    /// reader (D38 clause (d)(5)).
+    ///
+    /// # Errors
+    ///
+    /// Returns the postcard error if the record does not serialize.
+    pub fn encode_frame(&self) -> Result<Vec<u8>, postcard::Error> {
+        crate::atrest::encode_versioned(self, JOURNAL_RECORD_ENCODING)
+    }
+
+    /// Decode a logical frame, returning the record and the encoding version
+    /// it was written under.
+    ///
+    /// A frame with no trailer is [`ENCODING_V0`](crate::atrest::ENCODING_V0):
+    /// a record written before journals were self-describing, read rather than
+    /// refused (the bootstrap rule, [`crate::atrest`]).
+    ///
+    /// # Errors
+    ///
+    /// [`crate::atrest::VersionedError`] if the body does not decode or more
+    /// than a version byte follows it.
+    pub fn decode_frame(
+        bytes: &[u8],
+    ) -> Result<(Self, crate::atrest::EncodingVersion), crate::atrest::VersionedError> {
+        crate::atrest::decode_versioned(bytes)
+    }
+}
+
+/// The encoding version [`JournalRecord::encode_frame`] stamps on every
+/// logical journal record it writes (D38 clause (d)(5)).
+///
+/// **Bump this whenever the logical record's shape or its payload framing
+/// changes** — a new field, a `RecordKind` whose payload changes layout, a
+/// change to how `payload` is framed. It is not a rules version and not a
+/// physical-envelope version: the WAL's own `RawEnvelope` versions the *file
+/// format*, and D38 is explicit that the physical envelope is the upgrade
+/// vehicle and not the answer to "what schema is this record?".
+///
+/// Version 1 is the shape as of the change that made journal records
+/// self-describing. Everything written before it decodes as
+/// [`ENCODING_V0`](crate::atrest::ENCODING_V0) under the bootstrap rule
+/// ([`crate::atrest`]), which is what lets an existing journal be replayed
+/// rather than refused.
+pub const JOURNAL_RECORD_ENCODING: crate::atrest::EncodingVersion = 1;
+
 /// Current serialization version for [`EntityRekey`].
-pub const ENTITY_REKEY_VERSION: u8 = 1;
+///
+/// **Bumped to 2** by D38 clause (d)(2), which added
+/// [`EntityRekey::source_schema_floor`]. A version-1 payload is refused rather
+/// than bootstrapped, and that is this field's whole point: the bootstrap rule
+/// of [`crate::atrest`] gives *unversioned* bytes a defined meaning, while a
+/// payload that states a version it no longer matches is a mismatch, not an
+/// old era. Journals are retention-bounded (D20), so the two shapes coexist
+/// only for as long as one deployment's rollout takes.
+///
+/// Predates [`JOURNAL_RECORD_ENCODING`] and stays: this one versions the
+/// *payload* of a single server-owned `RecordKind` from inside the payload,
+/// which is the per-kind mechanism D38 clause (d)(5) names as the alternative
+/// to a record-level version. The two compose — the record frame says how the
+/// record is shaped, this says how one kind's bytes are shaped — and neither
+/// is derived from the other.
+pub const ENTITY_REKEY_VERSION: u8 = 2;
 
 /// Server-owned payload for one committed storage-location transition.
 ///
@@ -252,6 +318,17 @@ pub struct EntityRekey {
     pub expected_lease_id: crate::LeaseId,
     /// Opaque source component image used by deterministic recovery.
     pub source_record: bytes::Bytes,
+    /// The schema floor of [`Self::source_record`] (D38 clause (d)(2)).
+    ///
+    /// A rekey is the one path on which a `world/` row's bag crosses from one
+    /// actor to another, and the destination writes the row it lands in. Without
+    /// this field the destination would have to invent a floor for a bag it
+    /// cannot open — and the only value it could invent is
+    /// [`SCHEMA_V0`](crate::atrest::SCHEMA_V0), silently demoting an
+    /// up-to-date row to the oldest era and inviting a later sweep to migrate
+    /// it from a version it was never written at. So the floor travels with the
+    /// image it describes.
+    pub source_schema_floor: crate::atrest::SchemaVersion,
 }
 
 /// A single operation inside an [`Intent`] (D11 §2.2).
@@ -920,6 +997,7 @@ mod tests {
         // Given: a committed cross-grid move with an exact source image and fence.
         let cells = CellId::ROOT.children();
         let rekey = EntityRekey {
+            source_schema_floor: 0,
             version: ENTITY_REKEY_VERSION,
             entity: PersistId::new(77),
             source_grid: GridId::ROOT,

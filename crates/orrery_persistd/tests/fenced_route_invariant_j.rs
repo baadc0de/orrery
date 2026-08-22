@@ -223,6 +223,7 @@ async fn run(grid: GridId, store: Arc<dyn LeaseStore>) {
         Router::commit_rekey(
             &rt,
             rekey_record(&EntityRekey {
+                source_schema_floor: 0,
                 version: ENTITY_REKEY_VERSION,
                 entity,
                 source_grid: grid,

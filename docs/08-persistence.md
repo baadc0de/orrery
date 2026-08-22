@@ -3588,6 +3588,29 @@ Games change their components; a persistent universe keeps rows written by every
 - **Lazy application.** Migrations run on **checkpoint-load and area-read** — a row upgrades when next touched and is written back at current version by the next checkpoint. An optional **background sweep** walks cold ranges at low priority, bounding how far behind any row can fall (and letting old migration code retire on a schedule).
 - **History decodes too.** Journal and archive records carry their **encoding version**, so recovery replay (§3.4), parked-cell catch-up, and griefing rollback (§11) can decode records written under any retained version. Adjudication has the parallel mechanism: the executor keeps the last 3 ruleset builds as version-keyed workers routed by `RulesetId` (§1).
 
+### 16.1 What is landed: the formats are self-describing (D38 W1)
+
+[D38](adr/0038-at-rest-schema-versioning.md) splits the scheme above into three work items and lands the *formats* first, because every commit without them writes more long-lived rows a later reader would have to guess about. W1 writes versions; it applies none. Migration machinery — the registry, lazy application, the sweep — is W2, and the ≥ 2-adjacent-versions proof is W3.
+
+**The bootstrap rule: absent == v0.** A value written without a version field is version 0 — not unknown, not rejected, not inferred from its shape. Rows predating a family's versioning are that family's oldest readable era, and a chain starting at 0 walks them forward like any other row. The rule is stated once, in `orrery_protocol::atrest`, and every family below defers to it.
+
+**Component versions live in the bag; the staleness marker lives in the envelope.** §16's first bullet and its third pull in opposite directions — versions are *per component, inside* an opaque bag, while a sweep walks cold ranges without decoding game types. D38 clause (d)(2) resolves it by putting a summary outside the bag:
+
+```
+world/{grid}/{cell}/{entity}  ->  0x02 ‖ schema_floor:u32 BE ‖ component bag
+                                  0x00 ‖ component bag                (v0, bootstrap)
+                                  0x01 ‖ postcard(Tombstone)
+schema_floor = min over the bag's slots of that slot's schema version
+```
+
+The floor is *derived from* the bag it describes rather than being an independent counter, so the two cannot drift apart undetectably. Per-component versions govern **what** migrates; the floor governs **whether**, at a fixed offset, to code that never opens the bag. persistd stamps it on every write-back, so each checkpoint retires one more unversioned row.
+
+**Version domains do not mix.** A component schema version is per `ComponentTypeId`, allocated by the game, monotone, never reused or gapped within a type — and **orthogonal to `RulesetId.version`**. A rules hotfix bumps no schema; a schema bump ships without a rules change; `RETAINED_BUILDS` bounds adjudication evidence, not schemas. Neither number is ever derived from the other.
+
+**Journal logical records carry their encoding version** as a one-byte trailer after the postcard body: `postcard(JournalRecord) ‖ version`. A trailer rather than a field, because postcard is positional and refuses trailing bytes — a new field would make every existing journal *fail* rather than bootstrap, which is exactly what the rule above forbids. What remains after an exact-length postcard decode is framing, so present-or-absent is decidable rather than guessed. The physical `RawEnvelope` still versions the file format and is not asked to answer for the record.
+
+**What is deliberately not versioned yet, and why.** D38 clause (d)(1) allows `player/` and `ledger/` rows to gain versions "at their next shape change at the latest"; each carries its reason beside its constructor in `keyspace.rs`. `ledger/bal/` is the one that never will while it stays an integer: the value is a bare 16-byte little-endian i128 mutated by FDB's atomic `Add`, and a version byte would be arithmetic. `player/` has no writer yet, so there are no rows at rest to bootstrap. `ItemRow` and `ReceiptRow` are permanent and unswept, and their deadline is a shape change rather than a date — the next field added to either adds the trailer in the same commit.
+
 ## 17. World seeding and content patching
 
 A designed world has to get *into* the keyspace before the first player connects:

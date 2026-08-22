@@ -310,7 +310,10 @@ pub async fn build_desired_rows(
             let world_key = keyspace::world_key(emit.grid, cell, persist_id);
             out.push(DesiredRow {
                 key: world_key.to_vec(),
-                value: keyspace::encode_live_value(&bag),
+                value: keyspace::encode_versioned_live_value(
+                    crate::plan::bag_schema_floor(scenario, emit, &archetype),
+                    &bag,
+                ),
                 manifest: Some(manifest_entry),
             });
             let seedmap_value = if let Some(existing) = seed_row {

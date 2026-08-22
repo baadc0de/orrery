@@ -9,6 +9,7 @@
 //! Normative source: docs/08-persistence.md §6, docs/12-world-seeding.md §9.2,
 //! §9.3, §11.1, and docs/adr/0011-persistence.md.
 
+use orrery_protocol::atrest::{SchemaVersion, SCHEMA_V0};
 use orrery_protocol::{AccountId, AssetId, CellId, GridId, ItemUid, NodeId, PersistId};
 
 use crate::actor::Tombstone;
@@ -110,17 +111,116 @@ pub fn decode_world_key(key: &[u8]) -> Option<(GridId, CellId, PersistId)> {
 /// Values are `LIVE_TAG ‖ component bag` or `TOMBSTONE_TAG ‖ postcard(Tombstone)`.
 /// The tag lives in the key's value, never the key, so live rows, tombstone
 /// rows, and the seeder's rows share one key convention.
+///
+/// **This tag is the v0 live envelope** (D38 clause (d)(1)). It carries no
+/// schema marker, so under the bootstrap rule of [`orrery_protocol::atrest`] a
+/// row wearing it is [`SCHEMA_V0`] — read, not refused, and not guessed at by
+/// peeking into the bag. Writers in this workspace emit
+/// [`LIVE_VERSIONED_TAG`] instead; this one stays because the rows already on
+/// disk wear it and must keep decoding.
 pub const LIVE_TAG: u8 = 0x00;
 /// The tombstone tag (P-6).
 pub const TOMBSTONE_TAG: u8 = 0x01;
+/// The versioned live tag (D38 clause (d)(2)): `LIVE_VERSIONED_TAG ‖
+/// schema_floor:u32 BE ‖ component bag`.
+///
+/// **The marker persistd can read without decoding game types.** docs/08 §16
+/// puts schema versions *inside* the bag, per component, and also asks a
+/// background sweep to walk cold ranges — and the cell actor never decodes
+/// game types (§3.1). Something outside the bag therefore has to answer "is
+/// this row behind?", which is what the floor is: the **minimum** schema
+/// version over the bag's component slots, stamped by persistd on every
+/// write-back. Per-component versions govern *what* migrates; this governs
+/// *whether*, at a fixed offset, to code that never opens the bag.
+///
+/// A floor rather than a generation counter because it is derivable from the
+/// bag it describes (see `ComponentBag::schema_floor` in [`crate::schema`])
+/// rather than being a second, independently-driftable number: a row whose
+/// floor disagrees with its bag is a bug the bag itself convicts, whereas a
+/// counter's disagreement is undetectable.
+///
+/// Big-endian so a value dump sorts and reads the way every other multi-byte
+/// field in this module does.
+pub const LIVE_VERSIONED_TAG: u8 = 0x02;
 
-/// Encode a live entity value: `LIVE_TAG ‖ components`.
+/// The width of the schema-floor field in a [`LIVE_VERSIONED_TAG`] value.
+const SCHEMA_FLOOR_LEN: usize = 4;
+
+/// The fixed prefix a [`LIVE_VERSIONED_TAG`] value carries before its bag:
+/// the tag byte plus the floor. Named because it is the offset the sweep's
+/// read is "fixed" at, and because the accessors below all bound against it.
+const LIVE_VERSIONED_HEADER_LEN: usize = 1 + SCHEMA_FLOOR_LEN;
+
+/// Encode a live entity value in the v0 envelope: `LIVE_TAG ‖ components`.
+///
+/// Retained for the callers that genuinely mean "no schema statement" —
+/// chiefly tests that construct the legacy shape on purpose. New writers use
+/// [`encode_versioned_live_value`], which states the floor rather than leaving
+/// a reader to bootstrap it.
 #[must_use]
 pub fn encode_live_value(components: &[u8]) -> Vec<u8> {
     let mut value = Vec::with_capacity(components.len() + 1);
     value.push(LIVE_TAG);
     value.extend_from_slice(components);
     value
+}
+
+/// Encode a live entity value with its bag-level schema floor:
+/// `LIVE_VERSIONED_TAG ‖ floor:u32 BE ‖ components`.
+#[must_use]
+pub fn encode_versioned_live_value(floor: SchemaVersion, components: &[u8]) -> Vec<u8> {
+    let mut value = Vec::with_capacity(components.len() + LIVE_VERSIONED_HEADER_LEN);
+    value.push(LIVE_VERSIONED_TAG);
+    value.extend_from_slice(&floor.to_be_bytes());
+    value.extend_from_slice(components);
+    value
+}
+
+/// The bag-level schema floor of a `world/` value, **without decoding the
+/// bag**.
+///
+/// This is the read the background sweep of docs/08 §16 makes: it walks cold
+/// `world/` ranges it cannot interpret and has to decide, per row, whether the
+/// row is behind. Returns `None` for anything that is not a live row — a
+/// tombstone carries no components and so no schema — and [`SCHEMA_V0`] for a
+/// [`LIVE_TAG`] row, which is the bootstrap rule and not an inference about
+/// its contents.
+#[must_use]
+pub fn world_value_schema_floor(value: &[u8]) -> Option<SchemaVersion> {
+    match value.first() {
+        Some(&LIVE_TAG) => Some(SCHEMA_V0),
+        Some(&LIVE_VERSIONED_TAG) if value.len() >= LIVE_VERSIONED_HEADER_LEN => {
+            let mut floor = [0u8; SCHEMA_FLOOR_LEN];
+            floor.copy_from_slice(&value[1..LIVE_VERSIONED_HEADER_LEN]);
+            Some(SchemaVersion::from_be_bytes(floor))
+        }
+        // A truncated versioned row, a tombstone, or a tag from a future
+        // writer: not a live row this reader can speak for.
+        _ => None,
+    }
+}
+
+/// The component bag inside a `world/` live value, whichever envelope it
+/// wears. `None` for a tombstone, an unknown tag, or a truncated value.
+#[must_use]
+pub fn world_value_components(value: &[u8]) -> Option<&[u8]> {
+    match value.first() {
+        Some(&LIVE_TAG) => Some(&value[1..]),
+        Some(&LIVE_VERSIONED_TAG) if value.len() >= LIVE_VERSIONED_HEADER_LEN => {
+            Some(&value[LIVE_VERSIONED_HEADER_LEN..])
+        }
+        _ => None,
+    }
+}
+
+/// Whether a `world/` value is behind `current` — the sweep's filter (D38
+/// clause (d)(2)).
+///
+/// False for anything that is not a live row: a tombstone has no schema to be
+/// behind, and a row this reader cannot parse is not one it may declare stale.
+#[must_use]
+pub fn world_value_is_stale(value: &[u8], current: SchemaVersion) -> bool {
+    world_value_schema_floor(value).is_some_and(|floor| floor < current)
 }
 
 /// Encode a despawn marker value: `TOMBSTONE_TAG ‖ postcard(Tombstone)`.
@@ -991,6 +1091,14 @@ pub struct AttestRow {
 
 /// Key for the account profile row: `player/{account_id}` (§6). Critical-class;
 /// written inside intent transactions only.
+///
+/// **Unversioned, and the reason is that nothing writes it yet** (D38 clause
+/// (d)(1)). Grepping the workspace finds this constructor called from no
+/// writer and no reader outside this module's own guards: the profile row is
+/// designed and keyed but not yet produced. There are therefore zero rows at
+/// rest to bootstrap, and the version arrives with the first writer — which is
+/// strictly better than picking a value shape now and versioning a row nobody
+/// has written.
 #[must_use]
 pub fn player_key(account: AccountId) -> [u8; 9] {
     let mut key = [0u8; 9];
@@ -1513,6 +1621,17 @@ pub fn pid_next_key(grid: GridId) -> [u8; 9] {
 // second byte so range scans of one kind never see another. Balances encode
 // **little-endian** so `MutationType::Add` applies directly (§7: the credit
 // side is a blind atomic increment).
+//
+// **On versioning these three (D38 clause (d)(1)).** `ledger/bal/` is the one
+// family in this module that *cannot* take a version field, and the reason is
+// structural rather than a matter of scheduling: the value is a bare 16-byte
+// little-endian i128 mutated in place by `MutationType::Add`, which is what
+// makes a credit a blind atomic increment with no read and no conflict range.
+// A version byte appended to it would be arithmetic — `Add` would carry it
+// into the balance — and a version byte prepended would shift every digit.
+// The row's self-description is its fixed width and its family byte, and it
+// gains a version field only if it ever stops being an integer. The other two
+// carry their reasons on `ItemRow` and `ReceiptRow`.
 
 /// Key for a balance row: `ledger/bal/{account_id}/{asset_id}` → integer
 /// balance (§6). Ids are big-endian so accounts and assets sort by id; the
@@ -1598,6 +1717,19 @@ pub fn ledger_receipt_versionstamped_key() -> [u8; 16] {
 ///
 /// Postcard-encoded, like [`IntentRow`] — the same reason: one small,
 /// versionless value written and read by this crate alone.
+///
+/// **Still unversioned, and this is the recorded reason** (D38 clause (d)(1),
+/// which puts a version on `player/` and `ledger/` rows "at their next shape
+/// change at the latest"). The mechanism is already in the tree —
+/// [`orrery_protocol::atrest::encode_versioned`] appends the byte and
+/// [`orrery_protocol::atrest::decode_versioned`] reads today's rows back as
+/// v0 — so adopting it is a two-line change at each of this row's writers.
+/// What buys the wait is that the row's shape is *not* changing in this work
+/// item, and adopting the trailer now would rewrite six harness call sites
+/// (`p5-dupe-gauntlet`, `p3-siblings` and the intent-commit tests all encode
+/// this row by hand) for no byte that is not already decidable. The deadline
+/// is real and it is a shape change, not a date: **the next field added here
+/// adds the trailer in the same commit.**
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ItemRow {
     /// The `owner_ref` of §6: the account that holds this item.
@@ -1620,6 +1752,14 @@ pub struct ItemRow {
 /// an operator (or the P5 dupe gauntlet) reads to answer "what actually
 /// happened, in what order", independently of the `intent/` idempotency rows,
 /// which are swept after an hour.
+///
+/// **Unversioned for now, on [`ItemRow`]'s recorded reason** (D38 clause
+/// (d)(1)): the trailer codec exists, this row's shape is not changing here,
+/// and the deadline is the next field added to it rather than a date. Note
+/// what makes the wait affordable *and* what makes it a real deadline: a
+/// receipt is permanent by design — it is the row that outlives the swept
+/// `intent/` row — so nothing sweeps this family the way retention rescued the
+/// `attest/`/`enforced` shape change.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ReceiptRow {
     /// The intent that committed these effects.
@@ -1680,6 +1820,7 @@ pub fn strike_account_range_end(account: AccountId) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::schema::{ComponentBag, ComponentSlot};
 
     // Worked-example constants matching docs/01-spatial-model.md §3.3.
     const SHARD: u64 = 0xA924_9249_2492_4E00;
@@ -1825,6 +1966,144 @@ mod tests {
         // A live bag with the same payload sorts differently in the tag byte.
         let live = encode_live_value(b"hp=100");
         assert_ne!(encoded[0], live[0]);
+    }
+
+    // -----------------------------------------------------------------------
+    // The `world/` value envelope is self-describing (D38 clause (d))
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn a_genuinely_unversioned_world_value_reads_as_v0() {
+        // The bootstrap rule, on bytes a writer that predates versioning
+        // produced: `LIVE_TAG ‖ bag`, nothing else, no floor anywhere in it.
+        // The requirement is that this row is *read as v0* — not refused, and
+        // not guessed at by peeking into the bag.
+        let bag = b"hp=100";
+        let legacy = encode_live_value(bag);
+        assert_eq!(legacy.len(), bag.len() + 1, "no floor field is present");
+
+        assert_eq!(
+            world_value_schema_floor(&legacy),
+            Some(SCHEMA_V0),
+            "absent == v0 (D38 (d)(1)): an unversioned live row is version 0"
+        );
+        assert_eq!(
+            world_value_components(&legacy),
+            Some(&bag[..]),
+            "and its bag is recovered whole, so the row stays readable"
+        );
+        assert!(
+            !world_value_is_stale(&legacy, SCHEMA_V0),
+            "a v0 row is not behind a v0 current"
+        );
+    }
+
+    #[test]
+    fn a_stale_world_value_is_detectable_without_decoding_its_components() {
+        // D38 clause (d)(2). The sweep walks cold `world/` ranges it cannot
+        // interpret: the bag here is deliberately **not** decodable as
+        // anything — random bytes standing in for a game type this crate has
+        // never seen — and staleness must still come out right.
+        let opaque_bag: &[u8] = &[0xFF, 0x9E, 0x00, 0x7B, 0xC3, 0xFF, 0xFF];
+        assert!(
+            ComponentBag::decode(opaque_bag).is_err(),
+            "the fixture must be undecodable, or this test proves nothing \
+             about a reader that cannot decode game types"
+        );
+
+        let behind = encode_versioned_live_value(3, opaque_bag);
+        let current = encode_versioned_live_value(9, opaque_bag);
+
+        assert!(
+            world_value_is_stale(&behind, 9),
+            "a row at floor 3 is behind a current schema of 9"
+        );
+        assert!(
+            !world_value_is_stale(&current, 9),
+            "a row already at 9 is not"
+        );
+        // And the decision is a fixed-offset read, not a parse: the floor sits
+        // in the envelope, and the bytes after it were never touched.
+        assert_eq!(world_value_schema_floor(&behind), Some(3));
+        assert_eq!(world_value_components(&behind), Some(opaque_bag));
+    }
+
+    #[test]
+    fn the_envelope_floor_is_the_bag_floor() {
+        // The marker is a *summary* of the bag, not an independent counter
+        // (D38 (d)(2)): a writer stamps what the bag says, so a row whose
+        // envelope disagrees with its slots is convicted by the bag itself.
+        let bag = ComponentBag {
+            slots: vec![
+                ComponentSlot {
+                    component: orrery_core::ComponentTypeId(1),
+                    schema_version: 5,
+                    payload: bytes::Bytes::from_static(b"a"),
+                },
+                ComponentSlot {
+                    component: orrery_core::ComponentTypeId(2),
+                    schema_version: 2,
+                    payload: bytes::Bytes::from_static(b"b"),
+                },
+            ],
+        };
+        let encoded = bag.encode().expect("encodes");
+        let value = encode_versioned_live_value(bag.schema_floor(), &encoded);
+        assert_eq!(world_value_schema_floor(&value), Some(2));
+        assert_eq!(
+            ComponentBag::decode(world_value_components(&value).expect("live"))
+                .expect("decodes")
+                .schema_floor(),
+            2,
+            "the envelope repeats what the slots already say"
+        );
+    }
+
+    #[test]
+    fn the_three_world_value_tags_are_distinct_and_only_live_ones_carry_schema() {
+        let tomb = encode_tombstone_value(&Tombstone {
+            cell: CellId::from_bits(CELL).unwrap(),
+            tick: orrery_protocol::Tick::new(1),
+            gc_deadline_ms: 2,
+        })
+        .expect("encodes");
+        let tags = [
+            encode_live_value(b"x")[0],
+            tomb[0],
+            encode_versioned_live_value(1, b"x")[0],
+        ];
+        assert_eq!(
+            std::collections::BTreeSet::from(tags).len(),
+            3,
+            "LIVE_TAG, TOMBSTONE_TAG and LIVE_VERSIONED_TAG are three values"
+        );
+        assert_eq!(
+            world_value_schema_floor(&tomb),
+            None,
+            "a tombstone has no components and so no schema to be behind"
+        );
+        assert!(!world_value_is_stale(&tomb, u32::MAX));
+        assert_eq!(
+            world_value_schema_floor(&[0x7F, 0x00]),
+            None,
+            "an unknown tag is a row this reader may not speak for"
+        );
+        assert_eq!(
+            world_value_schema_floor(&[LIVE_VERSIONED_TAG, 0, 0]),
+            None,
+            "a versioned value too short to hold its floor is truncated, not v0"
+        );
+    }
+
+    #[test]
+    fn the_versioned_envelope_costs_four_bytes_over_the_v0_one() {
+        // D38 clause (f) prices the marker; the seeder's WORLD_ROW_OVERHEAD
+        // depends on this number being what it says it is.
+        let bag = b"hp=100";
+        assert_eq!(
+            encode_versioned_live_value(0, bag).len() - encode_live_value(bag).len(),
+            4
+        );
     }
 
     #[test]

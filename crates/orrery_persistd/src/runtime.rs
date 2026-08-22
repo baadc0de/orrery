@@ -2048,6 +2048,7 @@ fn recover_rekey(
                 EntityRecord {
                     components: rekey.source_record.clone(),
                     dirty: true,
+                    schema_floor: rekey.source_schema_floor,
                 },
             );
             actor::note_row_moved(

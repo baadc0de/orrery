@@ -301,6 +301,7 @@ async fn has_actor_means_live_actor_not_placement_answer() {
         entities: HashMap::from([(
             PersistId::new(7),
             EntityRecord {
+                schema_floor: 0,
                 components: bytes::Bytes::copy_from_slice(b"seeded"),
                 dirty: false,
             },

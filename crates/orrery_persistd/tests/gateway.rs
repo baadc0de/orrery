@@ -2199,6 +2199,7 @@ fn gateway_rejects_client_rekey_without_mutation() {
             ));
         }
         let rekey_payload = postcard::to_allocvec(&EntityRekey {
+            source_schema_floor: 0,
             version: ENTITY_REKEY_VERSION,
             entity,
             source_grid: GridId::ROOT,
@@ -2320,6 +2321,7 @@ fn rekeyed_entity_rejects_stale_presented_cell_with_current_lease() {
             panic!("seeded entity must receive its source lease");
         };
         let rekey = EntityRekey {
+            source_schema_floor: 0,
             version: ENTITY_REKEY_VERSION,
             entity,
             source_grid: GridId::ROOT,
@@ -2743,6 +2745,7 @@ fn reviewed_authority_narrative() {
 
         // When: trusted persistence commits a cross-cell rekey for the current fence.
         let rekey = EntityRekey {
+            source_schema_floor: 0,
             version: ENTITY_REKEY_VERSION,
             entity,
             source_grid: GridId::ROOT,

@@ -358,6 +358,7 @@ async fn seed(
         let outcome = Router::commit_rekey(
             rt,
             rekey_record(&EntityRekey {
+                source_schema_floor: 0,
                 version: ENTITY_REKEY_VERSION,
                 entity,
                 source_grid: grid,

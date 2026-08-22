@@ -201,12 +201,25 @@ async fn scan_world(
         let entity = PersistId::new(u64::from_be_bytes(ent));
         let value = kv.value();
         match value.first() {
-            Some(&keyspace::LIVE_TAG) => {
+            Some(&keyspace::LIVE_TAG) | Some(&keyspace::LIVE_VERSIONED_TAG) => {
+                // Both live envelopes, read through the one pair of accessors
+                // that know where each puts the bag: the v0 tag carries the
+                // bag directly and floors at SCHEMA_V0 by the bootstrap rule,
+                // the versioned tag states its floor (D38 (d)(1), (d)(2)).
+                let (Some(components), Some(schema_floor)) = (
+                    keyspace::world_value_components(value),
+                    keyspace::world_value_schema_floor(value),
+                ) else {
+                    // A versioned tag on a value too short to hold its floor:
+                    // truncated, not a row this scan can honour.
+                    continue;
+                };
                 rows.entities.insert(
                     entity,
                     EntityRecord {
-                        components: bytes::Bytes::copy_from_slice(&value[1..]),
+                        components: bytes::Bytes::copy_from_slice(components),
                         dirty: false,
+                        schema_floor,
                     },
                 );
                 // Keys arrive in Morton order, so a second live row for the
@@ -309,7 +322,15 @@ impl CheckpointStore for FdbCheckpointStore {
             .map(|(entity, record)| {
                 let cell = data.by_cell.get(entity).copied().unwrap_or(data.shard);
                 let key = keyspace::world_key(data.grid, cell, *entity);
-                (key, keyspace::encode_live_value(&record.components))
+                // Write-back always stamps the envelope (D38 (d)(2)), floor
+                // included when it is SCHEMA_V0: a row that says "v0" is
+                // self-describing, and one that says nothing is a row the next
+                // reader has to bootstrap. Every checkpoint therefore retires
+                // one more unversioned row.
+                (
+                    key,
+                    keyspace::encode_versioned_live_value(record.schema_floor, &record.components),
+                )
             })
             .collect();
 
@@ -567,6 +588,7 @@ mod tests {
                 EntityRecord {
                     components: bytes::Bytes::from_static(b"xxxxxxxxxxxx"),
                     dirty: true,
+                    schema_floor: 0,
                 },
             );
         }

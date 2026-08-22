@@ -97,6 +97,7 @@ fn rekey_record(rekey: &EntityRekey) -> JournalRecord {
 fn valid_rekey() -> EntityRekey {
     let cells = CellId::ROOT.children();
     EntityRekey {
+        source_schema_floor: 0,
         version: ENTITY_REKEY_VERSION,
         entity: PersistId::new(5_501),
         source_grid: GridId::ROOT,
@@ -281,6 +282,7 @@ async fn committed_rekey_moves_entity_then_recovers_destination() {
         panic!("source lease must be granted");
     };
     let rekey = EntityRekey {
+        source_schema_floor: 0,
         version: ENTITY_REKEY_VERSION,
         entity,
         source_grid: GridId::ROOT,
@@ -402,6 +404,7 @@ async fn a_rekey_for_unhosted_shards_does_not_brick_open() {
     Router::commit_rekey(
         &rt,
         rekey_record(&EntityRekey {
+            source_schema_floor: 0,
             version: ENTITY_REKEY_VERSION,
             entity: moved,
             source_grid: GridId::ROOT,
@@ -472,6 +475,7 @@ async fn stalled_lease_recovery_is_cancellable_and_reopen_remains_destination_on
         panic!("source lease must be granted");
     };
     let rekey = EntityRekey {
+        source_schema_floor: 0,
         version: ENTITY_REKEY_VERSION,
         entity,
         source_grid: GridId::ROOT,
@@ -641,6 +645,7 @@ async fn committed_rekey_mem_recovery_has_one_destination_row() {
     Router::commit_rekey(
         &rt,
         rekey_record(&EntityRekey {
+            source_schema_floor: 0,
             version: ENTITY_REKEY_VERSION,
             entity,
             source_grid: GridId::ROOT,
@@ -864,6 +869,7 @@ async fn rekeyed_entity_routes_current_fence_to_destination_and_rejects_stale_ce
     Router::commit_rekey(
         &rt,
         rekey_record(&EntityRekey {
+            source_schema_floor: 0,
             version: ENTITY_REKEY_VERSION,
             entity,
             source_grid: GridId::ROOT,
@@ -969,6 +975,7 @@ async fn same_entity_rekey_racing_old_cell_fence_admits_exactly_one_path() {
         panic!("source lease must be granted");
     };
     let rekey = rekey_record(&EntityRekey {
+        source_schema_floor: 0,
         version: ENTITY_REKEY_VERSION,
         entity,
         source_grid: GridId::ROOT,
@@ -1102,6 +1109,7 @@ async fn committed_rekey_migration_failure_preserves_exact_source_only() {
         panic!("source lease must be granted");
     };
     let rekey = EntityRekey {
+        source_schema_floor: 0,
         version: ENTITY_REKEY_VERSION,
         entity,
         source_grid: GridId::ROOT,
@@ -1198,6 +1206,7 @@ async fn committed_rekey_migration_failure_fences_source_until_restart_recovery(
         panic!("source lease must be granted");
     };
     let rekey = EntityRekey {
+        source_schema_floor: 0,
         version: ENTITY_REKEY_VERSION,
         entity,
         source_grid: GridId::ROOT,
@@ -1366,6 +1375,7 @@ async fn committed_rekey_rejects_stale_source_image_and_fence_before_append() {
         panic!("source lease must be granted");
     };
     let base = EntityRekey {
+        source_schema_floor: 0,
         version: ENTITY_REKEY_VERSION,
         entity,
         source_grid: GridId::ROOT,
@@ -3238,6 +3248,7 @@ async fn open_and_restore_fold_a_nested_journal_identically() {
                 entities: std::collections::HashMap::from([(
                     PersistId::new(entity),
                     orrery_persistd::EntityRecord {
+                        schema_floor: 0,
                         components: bytes::Bytes::from_static(b"synthetic"),
                         dirty: false,
                     },
