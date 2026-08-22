@@ -139,6 +139,18 @@ pub struct FdbIntentExecutor {
     /// admission used is a recorded vector the audit cannot read as evidence
     /// of the decision that was actually made.
     witness_bindings: Option<crate::gateway::SharedBindingAuthority>,
+    /// The mode the gateway's validator admitted under, which decides two
+    /// things here and nothing else (D32 clause (d)): the `enforced` marker on
+    /// the [`keyspace::AttestRow`] this executor writes, and whether the
+    /// commit-time required-subset re-proof is armed.
+    ///
+    /// Wired through [`Self::recording_epochs`] and [`Self::shadowing_epochs`]
+    /// rather than read from the validator, because the two seams do not know
+    /// each other: [`super::IntentExecutor`] is implemented outside this crate
+    /// and takes no validator. Keeping it a startup pairing is the same
+    /// argument `recording_epochs` already makes about the cache and the
+    /// resolver.
+    witness_enforcement: super::AttestationEnforcement,
 }
 
 /// The active shard ownership an intent executor is allowed to write under.
@@ -200,6 +212,7 @@ impl FdbIntentExecutor {
             allocator: Arc::new(tokio::sync::Mutex::new(PersistIdAllocator::default())),
             witness_epochs: None,
             witness_bindings: None,
+            witness_enforcement: super::AttestationEnforcement::Off,
         }
     }
 
@@ -219,6 +232,7 @@ impl FdbIntentExecutor {
             allocator: Arc::new(tokio::sync::Mutex::new(PersistIdAllocator::default())),
             witness_epochs: None,
             witness_bindings: None,
+            witness_enforcement: super::AttestationEnforcement::Off,
         }
     }
 
@@ -268,6 +282,41 @@ impl FdbIntentExecutor {
     ) -> Self {
         self.witness_epochs = Some(epochs);
         self.witness_bindings = Some(bindings);
+        self.witness_enforcement = super::AttestationEnforcement::Required;
+        self
+    }
+
+    /// [`Self::recording_epochs`] for a gateway admitting in
+    /// [`super::AttestationEnforcement::Shadow`].
+    ///
+    /// Two differences, both D32 clause (d)'s, and both necessary rather than
+    /// cosmetic:
+    ///
+    /// - The [`keyspace::AttestRow`] is written with `enforced: false`. The row
+    ///   still has to be written — a shadow-period commit is an attested
+    ///   commit as far as D27 clause (f)'s audit is concerned, and omitting it
+    ///   would leave the whole observation period unauditable — but a row that
+    ///   looked enforced and was not is a false audit trail, which is worse
+    ///   than none.
+    /// - The commit-time required-subset re-proof is **disarmed**. That check
+    ///   exists to stop a stale-key intent committing below quorum, and shadow
+    ///   commits below quorum on purpose; leaving it armed would make shadow
+    ///   refuse at commit what it admitted at admission — acting after failing
+    ///   to act, which violates clause (b) from the far side and is the worst
+    ///   of both modes.
+    ///
+    /// The draw-key adoption is *not* one of the differences: the cache must
+    /// converge on the durable key regardless of mode, or a promotion to
+    /// `required` would begin against a key this gateway never adopted.
+    #[must_use]
+    pub fn shadowing_epochs(
+        mut self,
+        epochs: Arc<crate::witness_epoch::WitnessEpochAuthority>,
+        bindings: crate::gateway::SharedBindingAuthority,
+    ) -> Self {
+        self.witness_epochs = Some(epochs);
+        self.witness_bindings = Some(bindings);
+        self.witness_enforcement = super::AttestationEnforcement::Shadow;
         self
     }
 
@@ -499,6 +548,7 @@ impl FdbIntentExecutor {
         let minted = self.allocate_ids(intent.ops.len() as u64).await?;
         let epochs = self.witness_epochs.clone();
         let bindings = self.witness_bindings.clone();
+        let enforcement = self.witness_enforcement;
         // Set by the closure only on an attempt that wrote or verified the
         // `epoch/` row. It is **not** the same question as "did this intent
         // commit": the idempotency replay path below returns a recorded
@@ -717,6 +767,7 @@ impl FdbIntentExecutor {
                         &trx,
                         epochs.as_deref(),
                         bindings.as_deref(),
+                        enforcement,
                         &intent,
                     )
                     .await?
@@ -878,6 +929,7 @@ async fn record_witness_epoch(
     trx: &foundationdb::Transaction,
     epochs: Option<&crate::witness_epoch::WitnessEpochAuthority>,
     bindings: Option<&dyn crate::gateway::BindingAuthority>,
+    enforcement: super::AttestationEnforcement,
     intent: &Intent,
 ) -> Result<EpochRecord, FdbBindingError> {
     // No cache is the enforcement-off build, and an unresolvable handle is an
@@ -963,27 +1015,44 @@ async fn record_witness_epoch(
                 // Under a matching key this re-proves what admission already
                 // decided, for K hashes; under an adopted one it is the only
                 // thing standing between a stale-key intent and a commit.
-                for required in
-                    orrery_protocol::required_witnesses(&row.draw_key, intent.intent_id, &eligible)
-                {
-                    if !intent
-                        .attestations
-                        .iter()
-                        .any(|attestation| attestation.witness == required)
-                    {
-                        return Ok(EpochRecord::Refused(
-                            orrery_protocol::REASON_ATTESTATION_QUORUM,
-                        ));
+                //
+                // **Disarmed in shadow** (D32 clause (d)). The adoption above
+                // still runs — the cache must converge on the durable key in
+                // every mode — but the re-proof does not, because the thing it
+                // refuses is a below-quorum commit and shadow commits below
+                // quorum deliberately. Left armed it would refuse at commit
+                // what admission admitted, which is the control acting after
+                // the mode said it would not.
+                if enforcement.acts() {
+                    for required in orrery_protocol::required_witnesses(
+                        &row.draw_key,
+                        intent.intent_id,
+                        &eligible,
+                    ) {
+                        if !intent
+                            .attestations
+                            .iter()
+                            .any(|attestation| attestation.witness == required)
+                        {
+                            return Ok(EpochRecord::Refused(
+                                orrery_protocol::REASON_ATTESTATION_QUORUM,
+                            ));
+                        }
                     }
                 }
             }
         }
     }
 
+    // D32 clause (d)'s marker. The row is written in every mode that resolved
+    // an epoch at all; what the mode decides is whether it claims the cluster
+    // stood behind the quorum. `off` never reaches this line — it resolves no
+    // epoch and returns `NotApplicable` above.
     let row = keyspace::AttestRow {
         epoch_handle: intent.cell_epoch.0,
         eligible,
         gc_deadline_ms: now_ms() + INTENT_ROW_RETENTION_MS,
+        enforced: enforcement.acts(),
     };
     let encoded = postcard::to_stdvec(&row).map_err(store_err("attest row encode"))?;
     trx.set(&keyspace::attest_key(intent.intent_id), &encoded);

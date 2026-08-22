@@ -51,7 +51,7 @@ use tracing_subscriber::EnvFilter;
 
 use orrery_persistd::cluster::{ColdFallbackRouter, Router};
 use orrery_persistd::gateway::SessionTokenV1Authorizer;
-use orrery_persistd::intent::BaselineIntentValidator;
+use orrery_persistd::intent::{AttestationEnforcement, BaselineIntentValidator};
 use orrery_persistd::journal::{
     spawn_chain, spawn_chain_grpc, AdaptiveCommitMode, ChainConfig, GroupCommitConfig, Journal,
 };
@@ -149,6 +149,29 @@ struct Cli {
     /// are refused and a lost lease parks instead of moving to a successor.
     #[arg(long, value_name = "KEY_ID@PUBLIC_KEY")]
     coordinator_key: Vec<IssuerKeySpec>,
+
+    /// D27's K-of-N attestation quorum: `off`, `shadow` or `required`.
+    ///
+    /// [D32](../../../docs/adr/0032-enforcement-ramp.md) clause (c)'s control
+    /// C1, and the startup half of its lever. `off` is the default and
+    /// preserves this binary's landed behaviour exactly: the quorum is not
+    /// evaluated, no witness-epoch cache is configured, and no `epoch/` or
+    /// `attest/` row is written. `shadow` evaluates the full predicate,
+    /// records the verdict it would have returned on the
+    /// `orrery::ramp::shadow` tracing target, and refuses nothing on it.
+    /// `required` refuses.
+    ///
+    /// **The default is `off` because D32's inventory sets it there**, and the
+    /// reason is the same one #147 gave its switch: landing a flag must change
+    /// nothing until an operator acts. Promotion to `shadow` is an operator
+    /// decision with clause (e)'s evidence behind it, not a build's.
+    ///
+    /// Anything but `off` needs `--coordinator-key`: the quorum judges an
+    /// intent against a coordinator-signed announcement, and a gateway that
+    /// trusts no coordinator key caches none. Startup refuses the combination
+    /// rather than running a mode that can never evaluate anything.
+    #[arg(long, value_name = "off|shadow|required", default_value = "off")]
+    attestation_enforcement: AttestationEnforcement,
 
     /// Hex-encoded iroh secret key, pinning the gateway's NodeId across runs.
     /// When absent a fresh identity is generated per boot.
@@ -1126,43 +1149,64 @@ async fn main() -> anyhow::Result<()> {
         Arc::new(std::sync::Mutex::new(None));
     #[cfg(feature = "fdb")]
     let captured_intent_executor = Arc::clone(&intent_executor);
-    let mut gateway_config = gateway_config(&cli, secret_key, |cluster_file, grid| {
-        #[cfg(feature = "fdb")]
-        {
-            let _ = cluster_file;
-            let context = fdb_context
-                .as_ref()
-                .expect("FDB context exists when --fdb-cluster-file is set");
-            // The ledger is fenced by the same activation the bulk path is:
-            // every intent transaction re-reads the ownership rows this
-            // startup committed, so a superseded process that still holds a
-            // live FDB handle cannot mint durable effects. The whole shard set
-            // is named because an `IntentOp` carries no cell — see
-            // `IntentFence`.
-            let exec = FdbIntentExecutor::fenced_from_context(
-                context,
-                grid,
-                orrery_persistd::IntentFence {
-                    shards: activation_shards.clone(),
-                    owner: activation_owner,
-                    epoch: activation_epoch,
-                },
-            );
-            let exec = Arc::new(exec);
-            *captured_intent_executor
-                .lock()
-                .expect("intent executor capture lock poisoned") = Some(Arc::clone(&exec));
-            Ok(Some(exec as SharedExecutor))
-        }
-        #[cfg(not(feature = "fdb"))]
-        {
-            let _ = (cluster_file, grid);
-            anyhow::bail!(
-                "persistd was compiled without the `fdb` feature; \
+    let mut gateway_config =
+        gateway_config(&cli, secret_key, |cluster_file, grid, attestation| {
+            #[cfg(feature = "fdb")]
+            {
+                let _ = cluster_file;
+                let context = fdb_context
+                    .as_ref()
+                    .expect("FDB context exists when --fdb-cluster-file is set");
+                // The ledger is fenced by the same activation the bulk path is:
+                // every intent transaction re-reads the ownership rows this
+                // startup committed, so a superseded process that still holds a
+                // live FDB handle cannot mint durable effects. The whole shard set
+                // is named because an `IntentOp` carries no cell — see
+                // `IntentFence`.
+                let exec = FdbIntentExecutor::fenced_from_context(
+                    context,
+                    grid,
+                    orrery_persistd::IntentFence {
+                        shards: activation_shards.clone(),
+                        owner: activation_owner,
+                        epoch: activation_epoch,
+                    },
+                );
+                // D32 clause (d)'s corollary: the executor's re-proof and the
+                // `attest/` marker have to agree with the mode admission ran
+                // under, so the same cache and the same resolver are wired into
+                // both sides here rather than configured twice. Under `off` the
+                // executor holds no authority and writes no row, which is the
+                // state this binary shipped in.
+                let exec = match attestation {
+                    None => exec,
+                    Some(wiring) => match wiring.mode {
+                        AttestationEnforcement::Off => exec,
+                        AttestationEnforcement::Shadow => exec.shadowing_epochs(
+                            Arc::clone(&wiring.epochs),
+                            Arc::clone(&wiring.bindings),
+                        ),
+                        AttestationEnforcement::Required => exec.recording_epochs(
+                            Arc::clone(&wiring.epochs),
+                            Arc::clone(&wiring.bindings),
+                        ),
+                    },
+                };
+                let exec = Arc::new(exec);
+                *captured_intent_executor
+                    .lock()
+                    .expect("intent executor capture lock poisoned") = Some(Arc::clone(&exec));
+                Ok(Some(exec as SharedExecutor))
+            }
+            #[cfg(not(feature = "fdb"))]
+            {
+                let _ = (cluster_file, grid, attestation);
+                anyhow::bail!(
+                    "persistd was compiled without the `fdb` feature; \
                      --fdb-cluster-file requires libfdb_c"
-            );
-        }
-    })?;
+                );
+            }
+        })?;
     if let Some(monitor) = &fence_freshness_monitor {
         gateway_config.bulk_ack_admission = monitor.clone();
     }
@@ -2065,20 +2109,34 @@ async fn dev_seed_entities(
     Ok(seeded)
 }
 
+/// The witness-epoch cache, resolver and mode an FDB executor records
+/// `attest/` rows through — D32 clause (d)'s "a deployment running C1 in
+/// anything but `off` must wire the epoch authority into **both** the
+/// validator and the executor".
+///
+/// Handed to the executor factory rather than applied after it, because
+/// [`FdbIntentExecutor::recording_epochs`] consumes `self` and the binary
+/// wraps the executor in an `Arc` the moment it is built. `None` is `off`,
+/// where the executor writes no row and the two sides have nothing to agree
+/// about.
+struct AttestationWiring {
+    mode: AttestationEnforcement,
+    epochs: Arc<orrery_persistd::witness_epoch::WitnessEpochAuthority>,
+    bindings: orrery_persistd::gateway::SharedBindingAuthority,
+}
+
 fn gateway_config<F>(
     cli: &Cli,
     secret_key: Option<iroh::SecretKey>,
     mut make_executor: F,
 ) -> anyhow::Result<GatewayConfig>
 where
-    F: FnMut(&std::path::Path, GridId) -> anyhow::Result<Option<SharedExecutor>>,
+    F: FnMut(
+        &std::path::Path,
+        GridId,
+        Option<&AttestationWiring>,
+    ) -> anyhow::Result<Option<SharedExecutor>>,
 {
-    let executor = if let Some(cluster_file) = cli.fdb_cluster_file.as_deref() {
-        make_executor(cluster_file, GridId::ROOT)?
-    } else {
-        None
-    };
-
     // With no coordinator key configured the default deny-all authority
     // stands: interest is unproven, so weak claims are refused and lost leases
     // park. That is the conservative posture, not a silent downgrade.
@@ -2091,7 +2149,44 @@ where
             ))
         };
 
+    // D32 clause (c)'s control C1, from CLI default to a validator that can
+    // actually see it. Everything below this comment is the second half of
+    // #217: the arm existed in the library and no deployment could reach it,
+    // because `gateway_config` hardcoded `permissive()` and nothing ever
+    // called `enforcing()` outside a test.
+    let attestation = attestation_wiring(cli)?;
+
+    let executor = if let Some(cluster_file) = cli.fdb_cluster_file.as_deref() {
+        make_executor(cluster_file, GridId::ROOT, attestation.as_ref())?
+    } else {
+        None
+    };
+
+    // The admission filter, in whichever of the three postures the operator
+    // asked for. `off` keeps the landed constructor untouched — including its
+    // absent resolver, which is honest rather than degraded (a validator with
+    // no `id/` rows has no account to compare and says so by having none).
+    let validator: Arc<dyn orrery_persistd::intent::IntentValidator> = match &attestation {
+        None => Arc::new(BaselineIntentValidator::permissive()),
+        Some(wiring) => match wiring.mode {
+            AttestationEnforcement::Off => Arc::new(BaselineIntentValidator::permissive()),
+            AttestationEnforcement::Shadow => Arc::new(BaselineIntentValidator::shadow(
+                Arc::clone(&wiring.epochs),
+                Arc::clone(&interest_authority),
+                Arc::clone(&wiring.bindings),
+            )),
+            AttestationEnforcement::Required => Arc::new(BaselineIntentValidator::enforcing(
+                Arc::clone(&wiring.epochs),
+                Arc::clone(&interest_authority),
+                Arc::clone(&wiring.bindings),
+            )),
+        },
+    };
+
     Ok(GatewayConfig {
+        witness_epochs: attestation
+            .as_ref()
+            .map(|wiring| Arc::clone(&wiring.epochs)),
         bind: cli.bind.parse::<SocketAddr>()?,
         secret_key,
         executor,
@@ -2106,9 +2201,57 @@ where
         // and the account binding of a ledger credit. Its doc comment states
         // exactly what it does not check — every durable invariant, which a
         // linked `Ruleset` and the FDB transaction still owe.
-        validator: Arc::new(BaselineIntentValidator::permissive()),
+        validator,
         ..GatewayConfig::default()
     })
+}
+
+/// Build C1's wiring from the CLI, or refuse a mode that could never evaluate.
+///
+/// `None` is `off`: no cache, no resolver, and the landed permissive validator
+/// — which is why `off` is byte-for-byte the behaviour this binary had before
+/// the flag existed.
+///
+/// # The resolver is deliberately the one that resolves nothing
+///
+/// [`UnboundBindingAuthority`] answers `None` to every `owner(n)`, and under
+/// D31 clause (f) a miss *excludes*: `E(I)` collapses below
+/// `WITNESS_SET_FLOOR_N` and the recorded verdict is
+/// `LowPopulationEpoch`'s provisional branch rather than an admission. That is
+/// not a degraded shadow, it is an accurate one — nothing in this cluster
+/// writes the `id/` rows yet, so a gateway that pretended to resolve bindings
+/// would be measuring a control it is not running. When `orrery_identity` is
+/// deployed, this is the one line that changes.
+///
+/// # Errors
+///
+/// A mode other than `off` with no `--coordinator-key`: the cache would trust
+/// no announcement, every intent would answer `UnknownEpoch`, and `shadow`
+/// would spend a whole observation period recording
+/// [`ShadowVerdict::Unevaluated`]. Refusing at startup is the difference
+/// between a misconfiguration and a month of blank telemetry.
+///
+/// [`UnboundBindingAuthority`]: orrery_persistd::gateway::UnboundBindingAuthority
+/// [`ShadowVerdict::Unevaluated`]: orrery_persistd::intent::ShadowVerdict::Unevaluated
+fn attestation_wiring(cli: &Cli) -> anyhow::Result<Option<AttestationWiring>> {
+    if cli.attestation_enforcement == AttestationEnforcement::Off {
+        return Ok(None);
+    }
+    if cli.coordinator_key.is_empty() {
+        anyhow::bail!(
+            "--attestation-enforcement {} requires at least one --coordinator-key: \
+             the K-of-N quorum judges an intent against a coordinator-signed witness-set \
+             announcement, and a gateway that trusts no coordinator key caches none",
+            cli.attestation_enforcement.as_str()
+        );
+    }
+    Ok(Some(AttestationWiring {
+        mode: cli.attestation_enforcement,
+        epochs: Arc::new(orrery_persistd::witness_epoch::WitnessEpochAuthority::new(
+            cli.coordinator_key.iter().map(|key| key.0.clone()),
+        )),
+        bindings: Arc::new(orrery_persistd::gateway::UnboundBindingAuthority),
+    }))
 }
 
 /// `<count>@<cell>` for [`Cli::dev_seed`].
@@ -2595,6 +2738,7 @@ mod tests {
                 iroh::SecretKey::from_bytes(&[9; 32]).public(),
             ))],
             coordinator_key: Vec::new(),
+            attestation_enforcement: AttestationEnforcement::Off,
             no_journal_retention: false,
             checkpoint_interval_ms: None,
             dev_seed: None,
@@ -2723,7 +2867,7 @@ mod tests {
         let cfg = gateway_config(
             &cli(Some(PathBuf::from("/tmp/fdb.cluster"))),
             None,
-            move |cluster_file, grid| {
+            move |cluster_file, grid, _attestation| {
                 let mut slot = seen_capture.lock().expect("capture lock");
                 *slot = Some((cluster_file.to_path_buf(), grid));
                 Ok(Some(
@@ -2742,7 +2886,7 @@ mod tests {
 
     #[test]
     fn gateway_config_leaves_executor_empty_without_fdb() {
-        let cfg = gateway_config(&cli(None), None, |_cluster_file, _grid| {
+        let cfg = gateway_config(&cli(None), None, |_cluster_file, _grid, _attestation| {
             panic!("executor factory should not be called without --fdb-cluster-file")
         })
         .expect("gateway config");
@@ -2759,8 +2903,10 @@ mod tests {
         };
 
         // Given: production startup has one configured identity issuer.
-        let config = gateway_config(&cli(None), None, |_cluster_file, _grid| Ok(None))
-            .expect("gateway config");
+        let config = gateway_config(&cli(None), None, |_cluster_file, _grid, _attestation| {
+            Ok(None)
+        })
+        .expect("gateway config");
         let client = iroh::SecretKey::from_bytes(&[8; 32]);
         let signed = SessionTokenV1::sign(
             SessionTokenClaimsV1::new(
@@ -2789,6 +2935,205 @@ mod tests {
         // Then: only the configured issuer's signed token establishes authority.
         assert!(matches!(admitted, Ok(GatewayAuthorization::Valid(_))));
         assert_eq!(rejected, Err(SessionTokenVerificationError::Malformed));
+    }
+
+    // ── D32 clause (c): control C1's deployment lever ────────────────────
+    //
+    // The point of these three tests is not that the flag parses — clap can be
+    // trusted with that — but that each position *reaches the objects it is
+    // supposed to reach*: the validator, the gateway's epoch cache, and the
+    // executor's `attest/` marker. Before #217 the enforcing constructor had
+    // no caller in this file at all, so a flag that merely parsed would have
+    // reproduced exactly the defect it was written to fix.
+
+    /// A `Cli` selecting `mode`, with the coordinator key every mode but `off`
+    /// requires.
+    fn cli_enforcing(mode: AttestationEnforcement) -> Cli {
+        Cli {
+            coordinator_key: vec![IssuerKeySpec(IssuerKey::new(
+                IssuerKeyId::new(2),
+                iroh::SecretKey::from_bytes(&[11; 32]).public(),
+            ))],
+            attestation_enforcement: mode,
+            // A cluster file, so the executor factory actually runs: the
+            // executor half of the wiring is only observable on the FDB path.
+            ..cli(Some(PathBuf::from("/tmp/fdb.cluster")))
+        }
+    }
+
+    /// A signed intent naming a cell-epoch no gateway in this test has an
+    /// announcement for.
+    ///
+    /// The discriminating fixture: `off` and `shadow` both admit it and
+    /// `required` refuses it, so one intent separates all three modes without
+    /// standing up a coordinator.
+    fn unannounced_intent() -> (orrery_protocol::Intent, iroh::SecretKey) {
+        let key = iroh::SecretKey::from_bytes(&[12; 32]);
+        let mut intent = orrery_protocol::Intent {
+            evidence: None,
+            intent_id: 4242,
+            issuer: key.public(),
+            cell_epoch: orrery_protocol::CellEpoch::new(0x0007_0000_0000_0007),
+            ops: vec![orrery_protocol::IntentOp {
+                // `Ruleset`-opaque: the mode decides this intent, not the op.
+                op: 100,
+                args: bytes::Bytes::new(),
+            }],
+            attestations: Vec::new(),
+            signature: key.sign(b"placeholder"),
+        };
+        intent.sign(&key);
+        (intent, key)
+    }
+
+    /// Build a config in `mode` and report what the flag actually reached:
+    /// the validator's verdict on an unannounced intent, whether the gateway
+    /// got an epoch cache, and the mode the executor factory was handed.
+    fn wiring_reached_by(
+        mode: AttestationEnforcement,
+    ) -> (
+        orrery_persistd::intent::IntentVerdict,
+        bool,
+        Option<AttestationEnforcement>,
+    ) {
+        let seen = Arc::new(std::sync::Mutex::new(None::<AttestationEnforcement>));
+        let capture = Arc::clone(&seen);
+        let config = gateway_config(
+            &cli_enforcing(mode),
+            None,
+            move |_cluster_file, _grid, attestation| {
+                *capture.lock().expect("capture lock") = attestation.map(|wiring| wiring.mode);
+                Ok(None)
+            },
+        )
+        .expect("gateway config");
+
+        let (intent, key) = unannounced_intent();
+        let verdict = config.validator.validate(
+            &intent,
+            &orrery_persistd::intent::IntentContext {
+                issuer: key.public(),
+                account: Some(orrery_protocol::AccountId::new(7)),
+                standing: orrery_protocol::SessionStanding::Good,
+            },
+        );
+        let executor_mode = *seen.lock().expect("capture lock");
+        (verdict, config.witness_epochs.is_some(), executor_mode)
+    }
+
+    /// The flag's default, pinned so that changing it is a test change and
+    /// therefore visible in review.
+    ///
+    /// D32 clause (c)'s inventory sets C1's CLI default to `off`, for the
+    /// reason #147 gave its switch: landing a flag must change nothing until
+    /// an operator acts.
+    #[test]
+    fn the_attestation_flag_defaults_to_off_and_that_default_changes_nothing() {
+        use clap::Parser;
+
+        let parsed = Cli::try_parse_from(["persistd"]).expect("bare invocation parses");
+        assert_eq!(parsed.attestation_enforcement, AttestationEnforcement::Off);
+
+        // And `off` is the landed behaviour byte for byte: no epoch cache on
+        // the gateway, no wiring handed to the executor, and the permissive
+        // validator admitting the zero-attestation path every issuer in this
+        // tree sends.
+        let config = gateway_config(&cli(None), None, |_cluster_file, _grid, attestation| {
+            assert!(
+                attestation.is_none(),
+                "`off` hands the executor no epoch authority, so it writes no `attest/` row"
+            );
+            Ok(None)
+        })
+        .expect("gateway config");
+        assert!(config.witness_epochs.is_none());
+
+        let (intent, key) = unannounced_intent();
+        assert!(matches!(
+            config.validator.validate(
+                &intent,
+                &orrery_persistd::intent::IntentContext {
+                    issuer: key.public(),
+                    account: Some(orrery_protocol::AccountId::new(7)),
+                    standing: orrery_protocol::SessionStanding::Good,
+                },
+            ),
+            orrery_persistd::intent::IntentVerdict::Admit(_)
+        ));
+    }
+
+    /// Each of the three positions reaches the validator, the epoch cache and
+    /// the executor — not merely the argument parser.
+    #[test]
+    fn the_attestation_flag_selects_all_three_modes_at_the_validator() {
+        use orrery_persistd::intent::IntentVerdict;
+
+        // `off`: nothing is evaluated, nothing is wired, the intent commits.
+        let (verdict, cached, executor) = wiring_reached_by(AttestationEnforcement::Off);
+        assert!(matches!(verdict, IntentVerdict::Admit(_)));
+        assert!(!cached, "`off` configures no witness-epoch cache");
+        assert_eq!(executor, None);
+
+        // `shadow`: the predicate is evaluated against a cache that resolves
+        // nothing, the verdict is recorded, and the intent commits anyway.
+        // That last clause is the one #222 gates on.
+        let (verdict, cached, executor) = wiring_reached_by(AttestationEnforcement::Shadow);
+        assert!(
+            matches!(verdict, IntentVerdict::Admit(_)),
+            "shadow suppresses the refusal `required` returns on this exact intent"
+        );
+        assert!(cached, "shadow needs the cache the predicate resolves in");
+        assert_eq!(
+            executor,
+            Some(AttestationEnforcement::Shadow),
+            "D32 clause (d): the executor's marker and re-proof follow the same mode"
+        );
+
+        // `required`: the same intent is refused. The pair is the whole
+        // assertion — a flag proven to reach the validator is a flag whose two
+        // enforcing positions answer differently on one input.
+        let (verdict, cached, executor) = wiring_reached_by(AttestationEnforcement::Required);
+        assert!(
+            matches!(verdict, IntentVerdict::Reject { .. }),
+            "an unannounced cell-epoch is `UnknownEpoch`, which `required` refuses"
+        );
+        assert!(cached);
+        assert_eq!(executor, Some(AttestationEnforcement::Required));
+    }
+
+    /// A mode that could never evaluate anything is refused at startup rather
+    /// than run.
+    ///
+    /// Without a coordinator key the cache trusts no announcement, so `shadow`
+    /// would spend its whole observation period recording
+    /// `Unevaluated(NoEpochAuthority)`-shaped nothing and `required` would
+    /// refuse every intent on the cluster. Both are misconfigurations, and the
+    /// difference between catching one at startup and finding it a month later
+    /// is the whole value of the check.
+    #[test]
+    fn an_enforcing_mode_without_a_coordinator_key_refuses_to_start() {
+        for mode in [
+            AttestationEnforcement::Shadow,
+            AttestationEnforcement::Required,
+        ] {
+            let cli = Cli {
+                attestation_enforcement: mode,
+                ..cli(None)
+            };
+            assert!(
+                cli.coordinator_key.is_empty(),
+                "the fixture must be keyless"
+            );
+            let Err(error) =
+                gateway_config(&cli, None, |_cluster_file, _grid, _attestation| Ok(None))
+            else {
+                panic!("a keyless {} mode must not start", mode.as_str());
+            };
+            assert!(
+                error.to_string().contains("--coordinator-key"),
+                "the refusal must name the missing argument: {error}"
+            );
+        }
     }
 
     #[test]

@@ -128,7 +128,19 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # in-memory mint/refresh/rotation round-trips against the protocol verifier;
 # they need no cluster but run in the same invocation and count the same. The
 # floor rises by all eighteen: 419 -> 437.
-FLOOR="${ORRERY_FDB_TEST_FLOOR:-437}"
+# The attestation shadow arm and its deployment switch (issue #217, D32
+# clauses (b)–(d)) add eighteen. Two need the cluster, and they are the two
+# durable consequences the record decides: a shadow commit's `attest/` row
+# carries `enforced: false` while an enforced one carries `true` (a false
+# audit trail is worse than none), and the commit-time required-subset
+# re-proof is disarmed under shadow, so the executor does not refuse what
+# admission admitted. Neither is observable without a transaction. The other
+# sixteen are `intent::tests`' shadow pair-tests (10, each written against one
+# acting validator and one watching one), `intent::shadow`'s verdict and
+# bounded-log unit tests (3) and `bin/persistd`'s flag-reaches-the-validator
+# tests (3); they need no cluster but run in the same invocation and count the
+# same. The floor rises by all eighteen: 437 -> 455.
+FLOOR="${ORRERY_FDB_TEST_FLOOR:-455}"
 
 # Every test file whose contents only mean anything against a real cluster. If
 # one of these reports no executed tests, the tier is dark again whatever the
@@ -266,11 +278,11 @@ self_test() {
     fi
   }
 
-  # 9 targets × 36 + 120 unit tests = 444, over the 412 floor. The per-target
+  # 9 targets × 40 + 120 unit tests = 480, over the 455 floor. The per-target
   # count moves with the floor: this fixture has to stay comfortably above it
   # or the healthy case starts failing for the reason the thin case is
   # supposed to.
-  fixture="$tmp/good.log";    emit_log "$fixture" none 36;            expect "a real run passes" pass "$fixture"
+  fixture="$tmp/good.log";    emit_log "$fixture" none 40;            expect "a real run passes" pass "$fixture"
   # The same log with `CARGO_TERM_COLOR=always` escapes through it.
   sed -e 's/^     Running/     \x1b[1;32mRunning\x1b[0m/' \
       -e 's/result: ok\./result: \x1b[32mok\x1b[0m./' "$tmp/good.log" > "$tmp/colour.log"

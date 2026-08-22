@@ -937,6 +937,29 @@ pub struct AttestRow {
     /// span by construction rather than by coincidence — a longer retention
     /// here would preserve a proof about an intent whose own row is gone.
     pub gc_deadline_ms: u64,
+    /// Whether the quorum this row records was **enforced** at admission, or
+    /// merely observed.
+    ///
+    /// [D32](../../adr/0032-enforcement-ramp.md) clause (d). A shadow-period
+    /// commit writes its row like any other, with this field `false`;
+    /// `required` writes `true`; `off` writes no row at all. The alternatives
+    /// both fail, and the record says why: omitting the row leaves
+    /// shadow-period attested commits unauditable against D27 clause (f), and
+    /// writing it *unmarked* fabricates an audit trail claiming the cluster
+    /// stood behind a quorum it deliberately waived. With the marker an
+    /// auditor reads a coherent story — insufficient co-signatures, admitted
+    /// by policy, observed and not trusted.
+    ///
+    /// **This is a durable value-shape change.** `postcard` encodes fields
+    /// positionally and `postcard::from_bytes` refuses trailing bytes, so a
+    /// reader of the older three-field shape does **not** decode-and-drop this
+    /// field — it fails outright, which is where D32's Consequences overstate
+    /// the compatibility. What makes that affordable rather than a migration
+    /// is the retention: an `attest/` row is swept an hour after its intent
+    /// commits (the `INTENT_ROW_RETENTION_MS` the executor stamps
+    /// [`Self::gc_deadline_ms`] with), so the two shapes can only coexist for
+    /// as long as one deployment's rollout takes.
+    pub enforced: bool,
 }
 
 // ---------------------------------------------------------------------------
