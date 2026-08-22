@@ -180,10 +180,9 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # invocation and count the same. The thirteenth, `emit_ramp_artifact`, is
 # `#[ignore]`d — it regenerates a committed artifact — so it does not.
 # The floor rises by all twelve: 469 -> 481.
-# The healthy fixture in `--self-test` emits 120 lib tests plus 48 per required
-# target; with nine targets that is 552, which must stay clear of this floor.
-# It was 40/target and silently fell one test short at 481 -- a self-test whose
-# healthy case fails is not a stricter check, it is a broken one.
+# The healthy `--self-test` fixture derives its per-target count from this
+# floor, with a 15% margin. A floor increase must not make its healthy case
+# fail: that would test the fixture's bookkeeping instead of the assertion.
 #
 # Standing enforcement at the gateway (issue #219, D33 clause (e)) adds four in
 # `tests/gateway_standing.rs` — the distinguishable `HELLO_REFUSED_STANDING`
@@ -306,9 +305,18 @@ check_log() {
 # colourised, and one for each way the tier can go dark: skipped, thin, a target
 # missing, and a target present having asserted nothing.
 self_test() {
-  local tmp fixture rc failures=0
+  local tmp fixture rc failures=0 target_count fixture_total fixture_per_target
   tmp="$(mktemp -d)"
   trap 'rm -rf "$tmp"' RETURN
+
+  # Emit at least 115% of the floor. The ceiling division keeps the total over
+  # that bound after distributing it across the required targets; clamping to
+  # one also keeps the fixture structurally healthy for a very small override.
+  target_count="${#REQUIRED_TARGETS[@]}"
+  fixture_total=$(( (FLOOR * 115 + 99) / 100 ))
+  fixture_per_target=$(( (fixture_total - 120 + target_count - 1) / target_count ))
+  (( fixture_per_target > 0 )) || fixture_per_target=1
+  echo "healthy fixture: 120 + ${target_count} × ${fixture_per_target} = $(( 120 + target_count * fixture_per_target )) tests (floor $FLOOR)"
 
   emit_log() {
     local out="$1" skip="$2" per="$3" omit="${4:-}" zero="${5:-}"
@@ -345,12 +353,9 @@ self_test() {
     fi
   }
 
-  # 9 targets × 60 + 120 unit tests = 660, over the 491 floor. The per-target
-  # count moves with the floor: this fixture has to stay comfortably above it
-  # or the healthy case starts failing for the reason the thin case is
-  # supposed to. 48 was the minimum that cleared 481 and it fell short the very
-  # next time the floor moved; 60 buys 170 tests of headroom instead of one.
-  fixture="$tmp/good.log";    emit_log "$fixture" none 60;            expect "a real run passes" pass "$fixture"
+  # The per-target count moves with the floor, so raising the floor cannot make
+  # this healthy fixture fail for the reason the thin case is supposed to.
+  fixture="$tmp/good.log";    emit_log "$fixture" none "$fixture_per_target"; expect "a real run passes" pass "$fixture"
   # The same log with `CARGO_TERM_COLOR=always` escapes through it.
   sed -e 's/^     Running/     \x1b[1;32mRunning\x1b[0m/' \
       -e 's/result: ok\./result: \x1b[32mok\x1b[0m./' "$tmp/good.log" > "$tmp/colour.log"
@@ -361,14 +366,14 @@ self_test() {
   # 60 apiece so the eight remaining targets still clear the floor — 8 × 60 +
   # 120 = 600 against 491: this case has to fail because fence_split is
   # missing, not because the total is thin.
-  fixture="$tmp/absent.log";  emit_log "$fixture" none 60 fence_split; expect "a missing fdb target is red" fail "$fixture"
+  fixture="$tmp/absent.log";  emit_log "$fixture" none "$fixture_per_target" fence_split; expect "a missing fdb target is red" fail "$fixture"
   # A target that ran and asserted nothing. `check_log` has always refused this
   # — "a target that is present with a zero count is as dark as one that never
   # ran" — and until now no fixture exercised the clause: measured 2026-08-17,
   # relaxing `(( count > 0 ))` to `(( count >= 0 ))` left all five cases green.
   # 60 apiece keeps the total at 600, well over the floor, so this can only be
   # red for the reason it names.
-  fixture="$tmp/silent.log";  emit_log "$fixture" none 60 '' fence_split; expect "a target that ran zero tests is red" fail "$fixture"
+  fixture="$tmp/silent.log";  emit_log "$fixture" none "$fixture_per_target" '' fence_split; expect "a target that ran zero tests is red" fail "$fixture"
 
   (( failures == 0 )) || die "$failures self-test case(s) failed"
   echo "fdb-tests self-test: 6/6"
