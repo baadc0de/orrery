@@ -253,6 +253,10 @@ async fn intent_without_executor_is_rejected() {
 
 // ---------------------------------------------------------------------------
 // FDB-backed durability (live cluster; self-skips when unconfigured)
+//
+// These reuse fixed `intent_id`s, so every test obtains its executor through
+// `connect_fresh`, which resets the rows it owns before it runs — see the
+// item-transfer section below for why that delete is not optional.
 // ---------------------------------------------------------------------------
 
 /// The cluster file for the FDB-gated tests, or `None` if not configured.
@@ -310,21 +314,24 @@ async fn read_balance(db: &foundationdb::Database, account: u64, asset: u64) -> 
 #[cfg(feature = "fdb")]
 #[tokio::test]
 async fn fdb_replayed_intent_returns_recorded_outcome() {
-    use orrery_persistd::{FdbIntentExecutor, IntentExecutor};
+    use orrery_persistd::IntentExecutor;
 
     let Some(cluster) = fdb_cluster_file() else {
         eprintln!("skipping: ORRERY_FDB_CLUSTER_FILE not set and no .fdb-dev/fdb.cluster");
         return;
     };
     // This test's own grid (brief: 9301..9315), so its ledger/pid rows never
-    // touch another test's namespace on the shared dev cluster.
+    // touch another test's namespace on the shared dev cluster. The balance
+    // is SET to 0 rather than merely cleared-and-forgotten because the
+    // absolute figure below is the assertion; the `intent/` delete is what
+    // makes this fixed intent_id genuinely fresh on every run.
     let grid = GridId::new(9301);
-    let exec = FdbIntentExecutor::connect(&cluster, grid).unwrap();
-
     let key = secret(11);
     let account = 500_001u64;
     let asset = 1u64;
-    let intent = signed_intent(0x9301_0001, &key, 0, &credit_args(account, asset, 500));
+    let intent_id = 0x9301_0001u128;
+    let exec = connect_fresh(&cluster, grid, &[], &[(account, asset, 0)], &[intent_id]).await;
+    let intent = signed_intent(intent_id, &key, 0, &credit_args(account, asset, 500));
 
     // First submission commits.
     let first = exec.execute(&intent).await.unwrap();
@@ -371,7 +378,7 @@ async fn fdb_replayed_intent_returns_recorded_outcome() {
 async fn fdb_concurrent_independent_intents_use_unique_block_granted_ids() {
     use std::collections::BTreeSet;
 
-    use orrery_persistd::{FdbIntentExecutor, IntentExecutor};
+    use orrery_persistd::IntentExecutor;
 
     let Some(cluster) = fdb_cluster_file() else {
         eprintln!("skipping: ORRERY_FDB_CLUSTER_FILE not set and no .fdb-dev/fdb.cluster");
@@ -380,8 +387,15 @@ async fn fdb_concurrent_independent_intents_use_unique_block_granted_ids() {
     // One shared executor is the P2 gateway shape: many concurrently arriving
     // independent intents must not all read-conflict on pid/next. This grid is
     // deliberately isolated from the durability tests above and from seeded
-    // content in the shared development cluster.
-    let exec = Arc::new(FdbIntentExecutor::connect(&cluster, GridId::new(9310)).unwrap());
+    // content in the shared development cluster. The 32 fixed intent ids and
+    // their accounts are declared here so every run starts fresh — without
+    // the `intent/` deletes this test would replay the previous run's
+    // recorded outcomes, and the uniqueness assertions would hold vacuously.
+    // Balances are not asserted, but are set to 0 anyway so repeated runs do
+    // not accumulate credits on a shared cluster.
+    let ids: Vec<u128> = (0..32u64).map(|n| 0x9310_0000 + u128::from(n)).collect();
+    let balances: Vec<(u64, u64, i64)> = (0..32u64).map(|n| (510_000 + n, 1, 0)).collect();
+    let exec = Arc::new(connect_fresh(&cluster, GridId::new(9310), &[], &balances, &ids).await);
     let key = secret(13);
     let mut tasks = tokio::task::JoinSet::new();
     for n in 0..32u64 {
@@ -422,13 +436,17 @@ async fn fdb_committed_intent_survives_restart() {
     let key = secret(12);
     let account = 500_002u64;
     let asset = 2u64;
-    let intent = signed_intent(0x9302_0001, &key, 0, &credit_args(account, asset, 750));
+    let intent_id = 0x9302_0001u128;
+    let intent = signed_intent(intent_id, &key, 0, &credit_args(account, asset, 750));
 
     // Commit against one executor, then drop it WITHOUT a clean shutdown —
     // the FDB client has no graceful-close requirement; durability is the
-    // cluster's, so a kill -9 of the gateway loses nothing committed.
+    // cluster's, so a kill -9 of the gateway loses nothing committed. The
+    // fixture starts fresh for the same reason as everywhere else in this
+    // file; the balance is SET to 0 because the absolute figure below is
+    // the assertion.
     let committed = {
-        let exec = FdbIntentExecutor::connect(&cluster, grid).unwrap();
+        let exec = connect_fresh(&cluster, grid, &[], &[(account, asset, 0)], &[intent_id]).await;
         let outcome = exec.execute(&intent).await.unwrap();
         assert!(matches!(outcome, IntentOutcome::Committed { .. }));
         outcome
@@ -437,6 +455,8 @@ async fn fdb_committed_intent_survives_restart() {
 
     // Reopen with a fresh executor (a new Database handle on the same
     // cluster) and read both the effect and the idempotency row back.
+    // Deliberately NOT `connect_fresh`: resetting here would erase exactly
+    // the survival this test exists to assert.
     let exec = FdbIntentExecutor::connect(&cluster, grid).unwrap();
 
     // The ledger effect survived.
@@ -823,6 +843,30 @@ async fn reset_ledger(
     })
     .await
     .unwrap();
+}
+
+/// Connect an executor **and** put the rows the test owns into a known state,
+/// in one step.
+///
+/// This is the standard way for an FDB test in this file to obtain an
+/// executor, precisely so a fixed `intent_id` cannot silently replay the
+/// previous run's recorded outcome: declaring what you own is part of
+/// connecting, not a separate opt-in step. Going around it — raw
+/// [`FdbIntentExecutor::connect`] — is reserved for the sites that must NOT
+/// reset, such as reopening after an unclean drop to prove survival. See
+/// [`reset_ledger`] for what "known state" means.
+#[cfg(feature = "fdb")]
+async fn connect_fresh(
+    cluster: &str,
+    grid: GridId,
+    items: &[(u64, u64)],
+    balances: &[(u64, u64, i64)],
+    intents: &[u128],
+) -> orrery_persistd::FdbIntentExecutor {
+    use orrery_persistd::FdbIntentExecutor;
+    let exec = FdbIntentExecutor::connect(cluster, grid).unwrap();
+    reset_ledger(exec.database(), items, balances, intents).await;
+    exec
 }
 
 /// The account named by `ledger/item/{item}`, or `None` if the row is absent.
