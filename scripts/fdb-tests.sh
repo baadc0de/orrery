@@ -180,6 +180,10 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # invocation and count the same. The thirteenth, `emit_ramp_artifact`, is
 # `#[ignore]`d — it regenerates a committed artifact — so it does not.
 # The floor rises by all twelve: 469 -> 481.
+# The healthy fixture in `--self-test` emits 120 lib tests plus 48 per required
+# target; with nine targets that is 552, which must stay clear of this floor.
+# It was 40/target and silently fell one test short at 481 -- a self-test whose
+# healthy case fails is not a stricter check, it is a broken one.
 FLOOR="${ORRERY_FDB_TEST_FLOOR:-481}"
 
 # Every test file whose contents only mean anything against a real cluster. If
@@ -322,7 +326,7 @@ self_test() {
   # count moves with the floor: this fixture has to stay comfortably above it
   # or the healthy case starts failing for the reason the thin case is
   # supposed to.
-  fixture="$tmp/good.log";    emit_log "$fixture" none 40;            expect "a real run passes" pass "$fixture"
+  fixture="$tmp/good.log";    emit_log "$fixture" none 48;            expect "a real run passes" pass "$fixture"
   # The same log with `CARGO_TERM_COLOR=always` escapes through it.
   sed -e 's/^     Running/     \x1b[1;32mRunning\x1b[0m/' \
       -e 's/result: ok\./result: \x1b[32mok\x1b[0m./' "$tmp/good.log" > "$tmp/colour.log"
