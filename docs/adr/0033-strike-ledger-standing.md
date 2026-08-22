@@ -155,10 +155,38 @@ not a second shadow policy.
 
 ### (d) Proposed standing thresholds: one proof quarantines; a recent pattern escalates
 
-> **This proposal sets `Q = 3.0`, `C = 5.0`, `B = 7.0`, a 14-day minimum
-> cooldown, and a 7-day account probation. The owner should accept this
-> package or explicitly choose the conservative `3 / 6 / 10` alternative
-> below before accepting the record.**
+> **`Q`, `C`, `B`, the minimum cooldown and the probation window are
+> deployment configuration, not constants of this record. The defaults are
+> `Q = 3.0`, `C = 5.0`, `B = 7.0`, a 14-day minimum cooldown and a 7-day
+> probation. A deployment may set others; it may not set incoherent ones, so
+> the four invariants below are validated at startup and a violation refuses
+> to start rather than warning.**
+
+Decided by the repo owner on 2026-08-22: thresholds are configurable with this
+package as the default, rather than a value fixed by the record. The reasoning
+is that these are policy dials — this record says so itself, two paragraphs
+down — and a dial whose only value is written into a normative ADR forces an
+ADR amendment to retune a number that P4's calibration campaign (#240) exists
+to inform. The record therefore owns the *shape* and the *invariants*; the
+deployment owns the *values*.
+
+What configuration may not do, checked at startup:
+
+```
+(i)   Q <= w_max                 a single proved major violation must quarantine
+(ii)  Q < C < B                  strictly ordered, or a state is unreachable
+(iii) B <= n_intended * w_max    ban must be reachable by the number of major
+                                 findings the operator intends, given decay
+(iv)  cooldown_min > 0           a cooldown that can be left instantly is not one
+```
+
+`w_max` is 3.0 under clause (a)'s weight table. Invariant (iii) is not
+theoretical: the `3 / 6 / 10` package discussed below fails it for
+`n_intended = 3`, because three 3-point facts sum to 9 and never reach 10 —
+so it silently means "three major findings are insufficient" rather than "a
+higher bar". A configuration that cannot reach its own terminal state is the
+kind of error a startup check should catch, not an operator should discover
+from an absence of bans.
 
 The recommended package is arithmetic, not a claim that the values were
 measured:
@@ -187,10 +215,12 @@ The alternative inherited from `docs/07` is `Q/C/B = 3/6/10`. It is more
 forgiving but has two cliffs: two 3-point facts only equal 6 at exactly the
 same instant, and even three equal 9, never ban. It therefore means “three
 major findings are insufficient absent a fourth or lesser facts,” not merely
-“a higher threshold.” **Recommendation: accept 3/5/7**; it supplies a
-two-recent-proof and three-recent-proof machine while retaining the 14-day
-half-life as the forgiveness mechanism. The thresholds are policy dials and
-need owner approval, not a fabricated empirical provenance.
+“a higher threshold.” **`3/5/7` is the default** for exactly that reason: it
+supplies a two-recent-proof and three-recent-proof machine while retaining the
+14-day half-life as the forgiveness mechanism, and it satisfies invariant (iii)
+where `3/6/10` does not. These are policy dials with no fabricated empirical
+provenance — the values that replace them should come from P4's calibration
+campaign (#240), which is what measuring a real false-positive rate is for.
 
 ### (e) State transitions, reversals, and appeals
 
