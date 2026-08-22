@@ -496,6 +496,13 @@ Three consequences, each answering one of the questions turnover raises:
   the current epoch (or take [#144]'s provisional path), the second says
   somebody forged something. Conflating them would put honest netsplit
   survivors in the same bucket as attackers.
+
+  > *Proposed erratum (2026-08-22,
+  > [ADR-0037](0037-unavailable-witness-epoch.md)):* the parenthetical
+  > provisional alternative contradicts D29 clause 2, accepted in the same
+  > commit as this record. D37 proposes refusal and re-collection under the
+  > current epoch as the only stale cure. This annotation is not normative
+  > unless D37 is accepted.
 - **The grace *is* the netsplit posture.** `docs/07:233` promises "a grace
   window (one epoch length) of stale-epoch attestations" on reconnect;
   `accept_grace_ms = 30 s = epoch_ms` is that promise, expressed as a duration
