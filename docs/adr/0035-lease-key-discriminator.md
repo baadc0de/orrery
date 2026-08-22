@@ -1,6 +1,6 @@
 # ADR-0035: The lease registrar row takes the `le` discriminator inside `l`, and the disjointness guard learns sub-spans
 
-**Status:** Proposed · **Date:** 2026-08-22 · **Decision:** D35
+**Status:** Accepted · **Date:** 2026-08-22 · **Decision:** D35
 
 This decision is normative once accepted. See the [ADR index](../DECISIONS.md)
 for precedence, scope, and the complete decision set.
