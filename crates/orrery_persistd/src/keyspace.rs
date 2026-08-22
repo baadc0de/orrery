@@ -1588,6 +1588,48 @@ pub struct ReceiptRow {
 // Tests
 // ---------------------------------------------------------------------------
 
+/// The byte offset at which FoundationDB substitutes the commit versionstamp.
+pub const STRIKE_VERSIONSTAMP_OFFSET: u32 = 10;
+
+/// `ya || account:u64-be || versionstamp:[u8;10]`, before substitution.
+#[must_use]
+pub fn strike_key(account: AccountId) -> [u8; 20] {
+    let mut key = [0; 20];
+    key[0] = b'y';
+    key[1] = b'a';
+    key[2..10].copy_from_slice(&account.0.to_be_bytes());
+    key
+}
+
+/// [`strike_key`] in `SetVersionstampedKey` parameter form.
+#[must_use]
+pub fn strike_versionstamped_key(account: AccountId) -> [u8; 24] {
+    let mut key = [0; 24];
+    key[..20].copy_from_slice(&strike_key(account));
+    key[20..].copy_from_slice(&STRIKE_VERSIONSTAMP_OFFSET.to_le_bytes());
+    key
+}
+
+/// First key in one account's contiguous `ya` span.
+#[must_use]
+pub fn strike_account_range_start(account: AccountId) -> Vec<u8> {
+    strike_key(account)[..10].to_vec()
+}
+
+/// Exclusive end of one account's contiguous `ya` span.
+#[must_use]
+pub fn strike_account_range_end(account: AccountId) -> Vec<u8> {
+    let mut end = strike_account_range_start(account);
+    for byte in end.iter_mut().rev() {
+        let (next, carry) = byte.overflowing_add(1);
+        *byte = next;
+        if !carry {
+            return end;
+        }
+    }
+    vec![b'y', b'b']
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2920,7 +2962,7 @@ mod tests {
                     table: vec![SubKind {
                         discriminator: b'a',
                         name: "strike/ya account facts",
-                        sample: crate::adjudication::strike_key(AccountId::new(1)).to_vec(),
+                        sample: strike_key(AccountId::new(1)).to_vec(),
                     }],
                 },
             },
@@ -3273,8 +3315,8 @@ mod tests {
     ///
     /// **The floor is the anti-vacuity clause.** Set-equality between two
     /// empty sets passes, so the test asserts the scan found at least the
-    /// seven discriminated constructors known to exist today (`da db dh lb le
-    /// li lr`). If the recognized pairing idiom drifts from the code — a
+    /// eight discriminated constructors known to exist today (`da db dh lb le
+    /// li lr ya`). If the recognized pairing idiom drifts from the code — a
     /// helper rename, a new construction form — the floor fires first and
     /// names the drift, rather than letting two empty sides pass as equal.
     #[test]
@@ -3300,7 +3342,7 @@ mod tests {
 
         // Sanity, floored: seven discriminated constructors exist today.
         assert!(
-            written.len() >= 7,
+            written.len() >= 8,
             "the source scan found only {} discriminated constructors \
              ({}); the recognized pairing idiom has drifted from the code",
             written.len(),
