@@ -205,13 +205,32 @@ pub fn fence_grid_range_end(grid: GridId) -> Vec<u8> {
     }
 }
 
-/// Durable registrar row `lease/{grid}/{entity}`.
+/// Durable registrar row `lease/{grid}/{entity}` — `le ‖ grid ‖ entity`.
+///
+/// The fourth ASCII-discriminated kind of the registered `l` family (D35
+/// clause (a)): `'l'`, then the discriminator `'e'`, then the 4-byte
+/// [`GridId`] and 8-byte [`PersistId`], both big-endian so rows sort by grid
+/// within one sub-span. The sub-span is `[b"le", b"lf") ⊂ [b'l', b'm')`,
+/// ordered `lb < le < li < lr`; the disjointness guard at the bottom of this
+/// module proves it beside its three siblings.
+///
+/// **The discriminator exists because byte 1 must never be an id's high
+/// byte.** Before D35 this row put `grid.0`'s most significant byte where
+/// the ledger puts `b`/`i`/`r`, so a grid id ≥ `0x6200_0000` sorted a lease
+/// row into `ledger/bal/` (`0x6900_0000` → items, `0x7200_0000` → receipts)
+/// and the harness receipt scans over `[lr, ls)` would decode it as
+/// corruption. The value encoding is unchanged: still a postcard-encoded
+/// `orrery_protocol::Lease`, only the key mutated, with no migration — any
+/// old-shape row is dev-cluster garbage by policy (D35 clause (b), audited
+/// loudly in the fdb tier), and fencing turns a missed read into a re-claim,
+/// never a rivalry.
 #[must_use]
-pub fn lease_key(grid: GridId, entity: PersistId) -> [u8; 13] {
-    let mut key = [0; 13];
+pub fn lease_key(grid: GridId, entity: PersistId) -> [u8; 14] {
+    let mut key = [0; 14];
     key[0] = b'l';
-    key[1..5].copy_from_slice(&grid.0.to_be_bytes());
-    key[5..].copy_from_slice(&entity.0.to_be_bytes());
+    key[1] = b'e';
+    key[2..6].copy_from_slice(&grid.0.to_be_bytes());
+    key[6..].copy_from_slice(&entity.0.to_be_bytes());
     key
 }
 /// Location index `lease-cell/{grid}/{cell}/{entity}` used for actor restore.
@@ -1024,11 +1043,13 @@ pub fn player_loc_key(account: AccountId) -> [u8; 10] {
 // would separate that is not already together.
 //
 // The discriminator is an ASCII byte at a **fixed offset**, never the high byte
-// of an id. That is the discipline [`lease_key`] does not observe — it puts a
-// `GridId`'s most significant byte where the ledger puts `b`/`i`/`r`, so a
-// `grid.0 >= 0x6200_0000` would land a lease row inside `ledger/bal/`. Latent
-// today, because grid ids are small and no full-family scan of either exists,
-// and tracked as its own on-disk-format question rather than fixed here.
+// of an id. [`lease_key`] observes the same discipline now — D35 moved the
+// registrar row into an `le` sub-span beside `lb`/`li`/`lr`, which is what
+// this family's drafting pass asked for. Until then it put a `GridId`'s most
+// significant byte where the ledger puts `b`/`i`/`r`, so a
+// `grid.0 >= 0x6200_0000` would have landed a lease row inside `ledger/bal/`;
+// latent only because grid ids were small, and fixed as its own on-disk-format
+// record rather than here.
 //
 // **Why the reverse index is inside the family and not beside it.** The only
 // direction any consumer reads is node -> account: a gateway deriving `E(I)`
@@ -2667,136 +2688,284 @@ mod tests {
     // Pairwise disjointness: every key family's range is non-overlapping
     // -----------------------------------------------------------------------
 
-    /// One registered key family: its one-byte prefix, the name it goes by,
-    /// and a sample key built by the family's **own** constructor.
-    struct Family {
-        prefix: u8,
+    /// One declared sub-kind of a discriminated family (D35 clause (c)).
+    ///
+    /// `discriminator` is byte 1 of every key of this kind — an ASCII literal
+    /// the kind's constructor writes immediately after the family byte — and
+    /// `sample` is drawn from that same constructor, so a constructor that
+    /// moves its bytes moves the table with it instead of being contradicted.
+    struct SubKind {
+        discriminator: u8,
         name: &'static str,
         sample: Vec<u8>,
     }
 
-    /// Every key family this module defines, in prefix order.
+    /// What one family byte holds: the whole span, or an ordered sub-kind
+    /// table.
+    ///
+    /// The marker is not decoration. A whole-span family asserts there is no
+    /// second kind inside it — which is exactly why `m` (`lease-cell/`) and
+    /// `o` (`lease-location/`) are *not* defects although they put a grid id's
+    /// high byte at byte 1: a collision needs cohabitation without
+    /// discrimination, and those families have nothing inside to collide
+    /// with (D35 Context §3).
+    enum Kinds {
+        /// The family owns `[prefix, prefix+1)` entire.
+        WholeSpan {
+            /// A key drawn from the family's own constructor.
+            sample: Vec<u8>,
+        },
+        /// ASCII-discriminated kinds at byte 1, kept in discriminator order.
+        ///
+        /// Declared sub-spans must be pairwise disjoint; the guard proves it
+        /// from distinct discriminators the way the between-family proof is
+        /// proven from distinct prefixes.
+        SubKinds {
+            /// One row per kind, in ascending [`SubKind::discriminator`]
+            /// order.
+            table: Vec<SubKind>,
+        },
+    }
+
+    /// One registered key family: its one-byte prefix, the name it goes by,
+    /// and either a whole-span marker or its sub-kind table.
     ///
     /// **One table, not two.** Until D31 this registry was two arrays — the
     /// prefixes in one, the sample keys in another — correlated by nothing but
     /// position, and a family added to one and not the other still passed. A
     /// family is one row here and cannot be half-registered.
     ///
-    /// The sample comes from the family's own constructor rather than being
-    /// spelled out, so a constructor that changes its prefix moves this table
-    /// with it instead of being contradicted by it.
+    /// Since D35 clause (c) the row also models what sits *inside* the byte:
+    /// a family is either whole-span or declares every `(byte, discriminator)`
+    /// pair it writes, so a constructor that shares a registered byte cannot
+    /// exist without declaring its sub-span — the class of defect
+    /// [`every_discriminated_constructor_is_registered_with_its_pair`] closes,
+    /// of which pre-D35's `lease_key` was the only host.
+    struct Family {
+        prefix: u8,
+        name: &'static str,
+        kinds: Kinds,
+    }
+
     fn registered_families() -> Vec<Family> {
         let shard = CellId::from_bits(SHARD).unwrap();
         vec![
             Family {
                 prefix: b'a',
                 name: "fence/actor",
-                sample: fence_key(GRID, shard).to_vec(),
+                kinds: Kinds::WholeSpan {
+                    sample: fence_key(GRID, shard).to_vec(),
+                },
             },
             Family {
                 prefix: b'c',
                 name: "ckpt",
-                sample: ckpt_key(GRID, shard).to_vec(),
+                kinds: Kinds::WholeSpan {
+                    sample: ckpt_key(GRID, shard).to_vec(),
+                },
             },
             Family {
                 prefix: b'd',
-                name: "id (da/db/dh)",
-                sample: account_key(AccountId::new(1)).to_vec(),
+                name: "id",
+                kinds: Kinds::SubKinds {
+                    table: vec![
+                        SubKind {
+                            discriminator: b'a',
+                            name: "id/da accounts",
+                            sample: account_key(AccountId::new(1)).to_vec(),
+                        },
+                        SubKind {
+                            discriminator: b'b',
+                            name: "id/db bindings",
+                            sample: binding_key(&node(1)).to_vec(),
+                        },
+                        SubKind {
+                            discriminator: b'h',
+                            name: "id/dh binding-history",
+                            sample: binding_history_key(&node(1)).to_vec(),
+                        },
+                    ],
+                },
             },
             Family {
                 prefix: b'e',
                 name: "epoch",
-                sample: epoch_key(GRID, shard, 3).to_vec(),
+                kinds: Kinds::WholeSpan {
+                    sample: epoch_key(GRID, shard, 3).to_vec(),
+                },
             },
             Family {
                 prefix: b'f',
                 name: "epoch-handle",
-                sample: epoch_handle_key(1 << 48).to_vec(),
+                kinds: Kinds::WholeSpan {
+                    sample: epoch_handle_key(1 << 48).to_vec(),
+                },
             },
             Family {
                 prefix: b'g',
                 name: "attest",
-                sample: attest_key(42).to_vec(),
+                kinds: Kinds::WholeSpan {
+                    sample: attest_key(42).to_vec(),
+                },
             },
             Family {
                 prefix: b'i',
                 name: "intent",
-                sample: intent_key(42).to_vec(),
+                kinds: Kinds::WholeSpan {
+                    sample: intent_key(42).to_vec(),
+                },
             },
             Family {
                 prefix: b'k',
                 name: "chunk",
-                sample: chunk_key(GRID, shard, 0).to_vec(),
+                kinds: Kinds::WholeSpan {
+                    sample: chunk_key(GRID, shard, 0).to_vec(),
+                },
             },
             Family {
                 prefix: b'l',
-                name: "ledger (bal/item/receipt)",
-                sample: ledger_bal_key(AccountId::new(1), AssetId::new(1)).to_vec(),
+                name: "ledger",
+                kinds: Kinds::SubKinds {
+                    table: vec![
+                        SubKind {
+                            discriminator: b'b',
+                            name: "ledger/bal balances",
+                            sample: ledger_bal_key(AccountId::new(1), AssetId::new(1)).to_vec(),
+                        },
+                        SubKind {
+                            discriminator: b'e',
+                            name: "lease registrar rows",
+                            sample: lease_key(GridId::ROOT, PersistId::new(1)).to_vec(),
+                        },
+                        SubKind {
+                            discriminator: b'i',
+                            name: "ledger/item items",
+                            sample: ledger_item_key(ItemUid::new(1)).to_vec(),
+                        },
+                        SubKind {
+                            discriminator: b'r',
+                            name: "ledger/receipt receipts",
+                            sample: ledger_receipt_key().to_vec(),
+                        },
+                    ],
+                },
             },
             Family {
                 prefix: b'm',
                 name: "lease-cell",
-                sample: lease_cell_key(GRID, shard, PersistId::new(1)).to_vec(),
+                kinds: Kinds::WholeSpan {
+                    sample: lease_cell_key(GRID, shard, PersistId::new(1)).to_vec(),
+                },
             },
             Family {
                 prefix: b'n',
                 name: "pid/next",
-                sample: pid_next_key(GridId::ROOT).to_vec(),
+                kinds: Kinds::WholeSpan {
+                    sample: pid_next_key(GridId::ROOT).to_vec(),
+                },
             },
             Family {
                 prefix: b'o',
                 name: "lease-location",
-                sample: lease_location_key(GRID, PersistId::new(1)).to_vec(),
+                kinds: Kinds::WholeSpan {
+                    sample: lease_location_key(GRID, PersistId::new(1)).to_vec(),
+                },
             },
             Family {
                 prefix: b'p',
                 name: "seedprog",
-                sample: seedprog_key([0xDE; 8], GRID, shard).to_vec(),
+                kinds: Kinds::WholeSpan {
+                    sample: seedprog_key([0xDE; 8], GRID, shard).to_vec(),
+                },
             },
             Family {
                 prefix: b'r',
                 name: "provisional",
-                sample: provisional_key(AccountId::new(1)).to_vec(),
+                kinds: Kinds::WholeSpan {
+                    sample: provisional_key(AccountId::new(1)).to_vec(),
+                },
             },
             Family {
                 prefix: b's',
                 name: "seedmap",
-                sample: seedmap_key([0xAB; 16]).to_vec(),
+                kinds: Kinds::WholeSpan {
+                    sample: seedmap_key([0xAB; 16]).to_vec(),
+                },
             },
             Family {
                 prefix: b'u',
                 name: "player",
-                sample: player_key(AccountId::new(1)).to_vec(),
+                kinds: Kinds::WholeSpan {
+                    sample: player_key(AccountId::new(1)).to_vec(),
+                },
             },
             Family {
                 prefix: b'v',
                 name: "content/version",
-                sample: content_version_key().to_vec(),
+                kinds: Kinds::WholeSpan {
+                    sample: content_version_key().to_vec(),
+                },
             },
             Family {
                 prefix: b'w',
                 name: "world",
-                sample: world_key(GRID, shard, PersistId::new(1)).to_vec(),
+                kinds: Kinds::WholeSpan {
+                    sample: world_key(GRID, shard, PersistId::new(1)).to_vec(),
+                },
             },
             Family {
                 prefix: b'y',
-                name: "strike (ya)",
-                sample: crate::adjudication::strike_key(AccountId::new(1)).to_vec(),
+                name: "strike",
+                kinds: Kinds::SubKinds {
+                    table: vec![SubKind {
+                        discriminator: b'a',
+                        name: "strike/ya account facts",
+                        sample: crate::adjudication::strike_key(AccountId::new(1)).to_vec(),
+                    }],
+                },
             },
-            // `lease/{grid}/{entity}` is deliberately absent: it takes the
-            // ledger's `b'l'` and discriminates on the `GridId`'s most
-            // significant byte rather than an ASCII byte, so it is not a family
-            // in this table's sense. `lease_key_overlaps_the_ledger_family`
-            // below records that overlap rather than letting this omission read
-            // as an oversight.
         ]
+    }
+
+    impl Family {
+        /// Every `(declared leading bytes, label, sample key)` triple this
+        /// row owns: one for a whole-span family, one per sub-kind otherwise.
+        ///
+        /// The guards walk these rather than reaching into [`Kinds`], so a
+        /// restructure of the enum cannot quietly drop a sample from proof.
+        /// Each triple's `declared` is the span the row claims in the order
+        /// space — `[prefix]` or `[prefix, discriminator]` — and the disjoint-
+        /// ness tests check the sample actually begins with it.
+        fn proven_spans(&self) -> Vec<(Vec<u8>, String, Vec<u8>)> {
+            match &self.kinds {
+                Kinds::WholeSpan { sample } => {
+                    vec![(vec![self.prefix], self.name.to_owned(), sample.clone())]
+                }
+                Kinds::SubKinds { table } => table
+                    .iter()
+                    .map(|kind| {
+                        (
+                            vec![self.prefix, kind.discriminator],
+                            format!("{}/{}", self.name, kind.name),
+                            kind.sample.clone(),
+                        )
+                    })
+                    .collect(),
+            }
+        }
     }
 
     /// Families are disjoint iff for every pair (a, b):
     ///   max_key(a) < min_key(b)  or  max_key(b) < min_key(a)
     /// For fixed-byte-prefix families (all of ours), min_key = [prefix] and
     /// max_key sorts before [prefix+1], so it is enough that the prefix bytes
-    /// are all different.
+    /// are all different. Since D35 clause (c) a discriminated family's span
+    /// is still `[prefix, prefix+1)` — its sub-spans live inside that byte —
+    /// so the between-family proof walks every sub-kind sample unchanged.
+    ///
+    /// Each sample must actually begin with its declared leading bytes —
+    /// `[prefix]`, or `[prefix, discriminator]` for a sub-kind — or everything
+    /// below is a property of the table rather than of the keyspace.
     ///
     /// This test provides an explicit concrete assertion for each pair so a
     /// future addition that reuses a prefix is caught with the offending pair
@@ -2808,17 +2977,15 @@ mod tests {
     fn all_key_families_are_range_disjoint() {
         let families = registered_families();
 
-        // Each sample must actually begin with the prefix its row claims, or
-        // everything below is a property of the table rather than of the
-        // keyspace.
         for family in &families {
-            assert_eq!(
-                family.sample.first().copied(),
-                Some(family.prefix),
-                "{} sample key must begin with its declared prefix 0x{:02x}",
-                family.name,
-                family.prefix
-            );
+            for (declared, label, sample) in family.proven_spans() {
+                assert_eq!(
+                    &sample[..declared.len()],
+                    declared.as_slice(),
+                    "{label} sample key must begin with its declared prefix \
+                     bytes {declared:02x?}"
+                );
+            }
         }
 
         // All prefix bytes must be distinct, and the collision is named rather
@@ -2837,21 +3004,89 @@ mod tests {
             }
         }
 
-        // For each pair (a, b), verify that a key from family A sorts before
-        // a key from family B when prefix_a < prefix_b. Since each family has
-        // a fixed one-byte prefix, the full-family range is [prefix, prefix+1),
-        // so distinct prefixes guarantee disjoint ranges.
+        // For each pair (a, b), verify that every key family A can produce
+        // sorts before every key family B can produce when prefix_a <
+        // prefix_b. Each sample begins with its family's prefix byte (checked
+        // above), so distinct prefixes guarantee disjoint ranges whatever the
+        // bytes behind them hold.
         for (i, a) in families.iter().enumerate() {
             for b in families.iter().skip(i + 1) {
+                for (_, a_label, a_sample) in a.proven_spans() {
+                    for (_, b_label, b_sample) in b.proven_spans() {
+                        assert!(
+                            a_sample.as_slice() < b_sample.as_slice(),
+                            "{} (0x{:02x}) must sort before {} (0x{:02x}); \
+                             one of them is in the wrong place or they collide",
+                            a_label,
+                            a.prefix,
+                            b_label,
+                            b.prefix
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The within-family half of D35 clause (c): declared sub-spans are
+    /// pairwise disjoint, ordered by discriminator.
+    ///
+    /// Between families this property comes free from distinct prefix bytes;
+    /// inside one byte it is exactly what the old byte-only guard could not
+    /// see. Distinct discriminators imply disjoint spans the same way — min
+    /// key = `[prefix, disc]`, which sorts before `[prefix, disc+1]` — but
+    /// the assertion below spells out the concrete ordering anyway, with the
+    /// offenders named, because a proof over samples nobody checked is where
+    /// this defect class lived.
+    #[test]
+    fn declared_sub_kinds_are_pairwise_disjoint_inside_each_family() {
+        for family in registered_families() {
+            let Kinds::SubKinds { table } = &family.kinds else {
+                continue;
+            };
+
+            // Ascending discriminators: the table is kept in sort order, as
+            // `registered_families` itself is, so a row added out of order is
+            // caught here rather than silently re-sorted by a reader.
+            for pair in table.windows(2) {
+                let [lower, higher] = pair else {
+                    unreachable!("windows(2) yields slices of two")
+                };
                 assert!(
-                    a.sample.as_slice() < b.sample.as_slice(),
-                    "{} (0x{:02x}) must sort before {} (0x{:02x}); \
-                     one of them is in the wrong place or they collide",
-                    a.name,
-                    a.prefix,
-                    b.name,
-                    b.prefix
+                    lower.discriminator < higher.discriminator,
+                    "family 'c{}' keeps its sub-kinds in discriminator order; \
+                     '{}' (0x{:02x}) is listed after '{}' (0x{:02x})",
+                    char::from(family.prefix),
+                    higher.name,
+                    higher.discriminator,
+                    lower.name,
+                    lower.discriminator
                 );
+            }
+
+            // And the concrete keys land in the declared order: lb < le < li
+            // < lr, da < db < dh. A sample that does not begin with its own
+            // declared pair is caught above; one that begins with it but sorts
+            // against declaration would mean the discriminator is not actually
+            // at byte 1 of the constructor's output.
+            let named: Vec<(String, Vec<u8>)> = table
+                .iter()
+                .map(|kind| {
+                    (
+                        format!("{} {}", family.name, kind.name),
+                        kind.sample.clone(),
+                    )
+                })
+                .collect();
+            for (i, (_, a_sample)) in named.iter().enumerate() {
+                for (b_label, b_sample) in named.iter().skip(i + 1) {
+                    assert!(
+                        a_sample.as_slice() < b_sample.as_slice(),
+                        "{b_label} must sort after the sub-kind before it inside \
+                         family '{}': the declared sub-spans overlap",
+                        char::from(family.prefix)
+                    );
+                }
             }
         }
     }
@@ -2876,10 +3111,13 @@ mod tests {
     ///
     /// `key[1] = b'x'` is deliberately **not** one of them: the second byte is
     /// a sub-discriminator *inside* a family (`lb`/`li`/`lr`, `da`/`db`/`dh`),
-    /// not a family. Neither is `vec![b'x']`, which is how range *bounds* are
-    /// written — an exclusive end is one past a family, not a family, which is
-    /// why `b`, `h`, `j`, `q`, `t` and `x` are spoken for without being
-    /// families.
+    /// not a family. Since D35 clause (c) those literals have their own scan —
+    /// [`discriminated_pairs_written_in_this_module`] — which pairs them into
+    /// the registry's sub-kind tables; this scan stays byte-level so the two
+    /// sources of truth stay separate. Neither is `vec![b'x']`, which is how
+    /// range *bounds* are written — an exclusive end is one past a family, not
+    /// a family, which is why `b`, `h`, `j`, `q`, `t` and `x` are spoken for
+    /// without being families.
     ///
     /// The test half of the file is excluded, because a test may build a
     /// deliberately colliding key and that must not register a family.
@@ -2920,6 +3158,47 @@ mod tests {
         found
     }
 
+    /// Every `(family byte, discriminator byte)` pair a discriminated
+    /// constructor in this module writes.
+    ///
+    /// D35 clause (c)'s extension of [`family_prefixes_written_in_this_module`]
+    /// from bytes to byte *pairs*. It recognizes `key[1] = b'…'` literal writes
+    /// in the non-test half and pairs each with the nearest preceding
+    /// `key[0] = b'…'` literal — a heuristic that works because every
+    /// discriminated constructor here assigns byte 0 immediately before byte 1,
+    /// true of all seven sites today. A constructor that computes byte 1
+    /// without a literal (e.g. `copy_from_slice`) remains invisible, exactly as
+    /// this module's byte-0 scan cannot see one that computes its prefix;
+    /// should such a site ever land it must go through a named form the scanner
+    /// recognizes, and the floor assertion in
+    /// [`every_discriminated_constructor_is_registered_with_its_pair`] is what
+    /// turns any drift of that decision into a failure rather than a silent
+    /// pass.
+    fn discriminated_pairs_written_in_this_module() -> std::collections::BTreeSet<(u8, u8)> {
+        let source = KEYSPACE_SOURCE
+            .split_once("\n#[cfg(test)]\n")
+            .map_or(KEYSPACE_SOURCE, |(head, _)| head);
+        let bytes = source.as_bytes();
+
+        let mut pairs = std::collections::BTreeSet::new();
+        let mut last_byte0_write: Option<u8> = None;
+        for (at, _) in source.match_indices("b'") {
+            // `b'x'` is four bytes; anything else is not a byte literal.
+            if bytes.len() < at + 4 || bytes[at + 3] != b'\'' {
+                continue;
+            }
+            let before = &source[..at];
+            if before.ends_with("key[0] = ") {
+                last_byte0_write = Some(bytes[at + 2]);
+            } else if before.ends_with("key[1] = ") {
+                if let Some(family) = last_byte0_write {
+                    pairs.insert((family, bytes[at + 2]));
+                }
+            }
+        }
+        pairs
+    }
+
     /// The completeness half of the disjointness proof: the registry must name
     /// **every** family the module actually writes.
     ///
@@ -2938,9 +3217,11 @@ mod tests {
     /// **What it does not catch**, said out loud so it is not over-trusted: the
     /// scan yields a set of *bytes*, so a second family that reuses an
     /// already-registered byte without an ASCII sub-discriminator is invisible
-    /// to it. That is exactly [`lease_key`]'s shape, and
-    /// [`lease_key_overlaps_the_ledger_family`] carries that one by name rather
-    /// than leaving this clause to imply coverage it does not have.
+    /// to it **by construction** — a reused byte adds nothing to a set of
+    /// bytes. That class stopped being unguarded when D35 clause (c) landed:
+    /// [`every_discriminated_constructor_is_registered_with_its_pair`] models
+    /// `(byte, discriminator)` pairs, and pre-D35 [`lease_key`]'s overlap with
+    /// the ledger was the one live instance of the class.
     #[test]
     fn every_family_prefix_written_in_this_module_is_registered() {
         let written = family_prefixes_written_by_persistd();
@@ -2978,36 +3259,132 @@ mod tests {
         );
     }
 
-    /// `lease/{grid}/{entity}` shares the ledger's `b'l'` without the ledger's
-    /// discriminator discipline, and this test records that rather than
-    /// asserting it away.
+    /// The completeness half of the sub-span proof (D35 clause (c)): every
+    /// `(byte, discriminator)` pair this module writes must be named in the
+    /// registry's sub-kind tables, and every pair named must actually be
+    /// written.
     ///
-    /// Byte 1 of a lease key is the `GridId`'s most significant byte, where the
-    /// ledger puts an ASCII `b`/`i`/`r`. The two are disjoint today only
-    /// because grid ids are small: `grid.0 >= 0x6200_0000` puts a lease row
-    /// inside `ledger/bal/`, `0x6900_0000` inside `ledger/item/`, `0x7200_0000`
-    /// inside `ledger/receipt/`. Latent rather than live — no full-family scan
-    /// of either exists in the tree — and an on-disk format change to fix, so
-    /// it is tracked separately. This test fails the day someone "fixes" it
-    /// without deciding it, which is the point.
+    /// This is the guard that closes the class [`lease_key`] belonged to. A
+    /// second constructor sharing an already-registered family byte adds
+    /// nothing to [`family_prefixes_written_in_this_module`]'s set of bytes,
+    /// so [`every_family_prefix_written_in_this_module_is_registered`] cannot
+    /// see it; a set of *pairs* grows by one instead, and the defect fails
+    /// here with both bytes named.
+    ///
+    /// **The floor is the anti-vacuity clause.** Set-equality between two
+    /// empty sets passes, so the test asserts the scan found at least the
+    /// seven discriminated constructors known to exist today (`da db dh lb le
+    /// li lr`). If the recognized pairing idiom drifts from the code — a
+    /// helper rename, a new construction form — the floor fires first and
+    /// names the drift, rather than letting two empty sides pass as equal.
     #[test]
-    fn lease_key_overlaps_the_ledger_family() {
-        let entity = PersistId::new(1);
-        let bal = ledger_bal_key(AccountId::new(0), AssetId::new(0));
+    fn every_discriminated_constructor_is_registered_with_its_pair() {
+        let written = discriminated_pairs_written_in_this_module();
 
-        let small = lease_key(GridId::ROOT, entity);
-        assert_eq!(small[0], b'l');
+        let mut registered = std::collections::BTreeSet::new();
+        for family in registered_families() {
+            if let Kinds::SubKinds { table } = family.kinds {
+                for kind in table {
+                    registered.insert((family.prefix, kind.discriminator));
+                }
+            }
+        }
+
+        let spell = |pairs: &std::collections::BTreeSet<(u8, u8)>| {
+            pairs
+                .iter()
+                .map(|(b, d)| format!("{}{}", char::from(*b), char::from(*d)))
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+
+        // Sanity, floored: seven discriminated constructors exist today.
         assert!(
-            small.as_slice() < bal.as_slice(),
-            "a small grid id keeps the lease row below `ledger/bal/`"
+            written.len() >= 7,
+            "the source scan found only {} discriminated constructors \
+             ({}); the recognized pairing idiom has drifted from the code",
+            written.len(),
+            spell(&written)
         );
 
+        let unregistered: Vec<String> = written
+            .difference(&registered)
+            .map(|(b, d)| format!("{}{}", char::from(*b), char::from(*d)))
+            .collect();
+        assert!(
+            unregistered.is_empty(),
+            "discriminated constructors written by this module but absent \
+             from `registered_families`: {unregistered:?} — a constructor \
+             that shares a registered family byte must declare its sub-span \
+             in the registry (D35 clause (c))"
+        );
+
+        let unwritten: Vec<String> = registered
+            .difference(&written)
+            .map(|(b, d)| format!("{}{}", char::from(*b), char::from(*d)))
+            .collect();
+        assert!(
+            unwritten.is_empty(),
+            "sub-kinds registered but written by no constructor in this \
+             module: {unwritten:?} — the table has outlived its code"
+        );
+    }
+
+    /// The acceptance test D35 clause (a) specifies, inverted from the
+    /// recording test it replaces.
+    ///
+    /// Until August 2026 `lease/{grid}/{entity}` shared the ledger's `b'l'`
+    /// without its discriminator discipline — byte 1 held the `GridId`'s most
+    /// significant byte, so `grid.0 >= 0x6200_0000` sorted a lease row inside
+    /// `ledger/bal/`, `0x6900_0000` inside `ledger/item/`, `0x7200_0000`
+    /// inside `ledger/receipt/`. `lease_key_overlaps_the_ledger_family`
+    /// recorded that overlap as present-tense so no undiscussed "fix" could
+    /// land; D35 discussed it and fixed it, and this test holds the fix to
+    /// the record's own assertions: byte 1 is `'e'` at the grid ids that used
+    /// to collide, the key escapes all three ledger sub-spans, and the extreme
+    /// grid id still sorts inside the family and its sub-span.
+    #[test]
+    fn lease_key_is_discriminated_inside_the_ledger_family() {
+        let entity = PersistId::new(1);
+
+        // `0x6200_0000` is the smallest grid id whose high byte used to land a
+        // lease row inside `ledger/bal/`; the item and receipt collisions began
+        // at `0x6900_0000` and `0x7200_0000`.
         let colliding = lease_key(GridId::new(0x6200_0000), entity);
         assert_eq!(colliding[0], b'l');
         assert_eq!(
-            colliding[1], b'b',
-            "byte 1 is the grid id's MSB, and 0x62 is the ledger's `bal` \
-             discriminator — the overlap is arithmetic, not hypothetical"
+            colliding[1], b'e',
+            "byte 1 is the ASCII discriminator, never the grid id's high byte"
+        );
+        assert_eq!(colliding.len(), 14, "`le ‖ grid ‖ entity`");
+
+        let bal = ledger_bal_key(AccountId::new(u64::MIN), AssetId::new(u64::MIN));
+        assert!(
+            !(colliding.as_slice() >= bal.as_slice()
+                && colliding.as_slice() < [b'l', b'c'].as_slice()),
+            "the once-colliding grid id must not sort inside [lb, lc)"
+        );
+        let item = ledger_item_key(ItemUid::new(u64::MIN));
+        assert!(
+            !(colliding.as_slice() >= item.as_slice()
+                && colliding.as_slice() < [b'l', b'j'].as_slice()),
+            "…nor inside [li, lj)"
+        );
+        let receipt = ledger_receipt_key();
+        assert!(
+            !(colliding.as_slice() >= receipt.as_slice()
+                && colliding.as_slice() < [b'l', b's'].as_slice()),
+            "…nor inside [lr, ls) — the range both harness receipt scanners walk"
+        );
+
+        // The extreme grid stays inside the family: the sub-span is bounded by
+        // the discriminators, not by anything beneath them.
+        let max = lease_key(GridId::new(u32::MAX), entity);
+        assert_eq!(max[1], b'e');
+        assert!(max.as_slice() >= [b'l', b'e'].as_slice());
+        assert!(
+            max.as_slice() < [b'l', b'f'].as_slice(),
+            "`lease_key(GridId::new(u32::MAX))` still sorts inside [le, lf) ⊂ [l, m)"
         );
     }
 
