@@ -129,20 +129,13 @@ cargo invocations of its own plus the four gate scripts it runs *for real*,
 including the two heavy harnesses that need an FDB cluster and eight peer
 processes. Neither workflow is reproduced here.
 
-**Measured, on the shared 16-thread box at `CARGO_BUILD_JOBS=3` with two other
-agents building concurrently: 13 min 50 s** into a fresh worktree — empty
-`target/` directories in all eight workspaces, warm cache. The second run,
-fully warm and with nothing changed, was **78 s**: `fmt` 3 s, `clippy` 1 s,
-`gates` 10 s, `test` 64 s. So the honest shape of it is that the first run in a
-new worktree costs a quarter of an hour and every run after it costs a minute,
-and `fmt` costs 3 s either way — run that one before every commit regardless.
+**No local timing figure is normative.** The former figures were taken under
+sccache on the retired shared runner box and do not describe either this
+workstation or a GitHub-hosted runner. Time a particular change where it will
+run, record the runner and cache state with the result, and do not turn an old
+cache experiment into a current expectation.
 
-Those figures were measured under the previous build cache (sccache), before the
-2026-08-17 move to kache. The shape holds — a cold worktree is dominated by the
-dependency graph and a warm one by `test` — but treat the absolute numbers as
-stale until someone re-measures them.
-
-### Eight workspaces, and only one of them is "the" workspace
+### Eleven workspaces, and only one of them is "the" workspace
 
 `cargo test --workspace` reaches the root workspace. Each standalone tool
 declares its own `[workspace]` table, so it reaches none of *them* — three red
@@ -151,19 +144,21 @@ CIs in one week came from that blind spot. The inventory, which is also
 
 | Workspace | Role in the lanes |
 |---|---|
-| `.` (root, 15 first-party crates + 3 vendored) | `clippy` and `test` lanes; `fmt` like any other. 1820 tests |
-| `p1-swarm` | `cargo test` in `gates` — 43 tests |
-| `p2-load` | `cargo test` in `gates` — 28 tests |
-| `p2-dashboard` | `cargo test` in `gates` — 9 tests |
-| `p4-streams-bench` | `cargo test` in `gates` — 7 tests |
+| `.` (root, 15 first-party crates + 3 vendored) | `clippy` and `test` lanes; `fmt` like any other |
+| `p1-swarm` | `cargo test` in `gates` |
+| `p2-load` | `cargo test` in `gates` |
+| `p2-dashboard` | `cargo test` in `gates` |
+| `p4-streams-bench` | `cargo test` in `gates` |
 | `p0-nat-test` | `cargo check --all-targets` — no tests |
 | `p0-dashboard` | `cargo check --all-targets` — no tests |
-| `p3-island` | `cargo check --all-targets` — no tests; asserted by the nightly island gate |
-| `p3-siblings` | `cargo test` in `gates` — 10 tests; the two-gateway harness, asserted by the nightly sibling gate. The only tool that links `libfdb_c` besides `p2-load`: its double-spend race leg reads the ledger back out of FoundationDB |
+| `p3-island` | `cargo test` in `gates`; asserted by the nightly island gate |
+| `p3-siblings` | `cargo test` in `gates`; the two-gateway harness, asserted by the nightly sibling gate. The only tool that links `libfdb_c` besides `p2-load`: its double-spend race leg reads the ledger back out of FoundationDB |
 | `p5-dupe-gauntlet` | `cargo check --all-targets` — no tests; the single-gateway replay, attestation-abuse and quarantine proof, asserted by the nightly P5 gate against FoundationDB |
+| `p2-journal-bench` | `cargo check --all-targets` — no tests |
 
-The four tool suites are 87 tests between them, which is the number that would
-go unrun if the `gates` lane stopped visiting them.
+The six tool test suites, and the four tools checked without tests, are the work
+that would go unrun if the `gates` lane stopped visiting them. Do not hand-copy
+test totals here: `./scripts/check.sh --list` is the executable inventory.
 
 `--self-test` compares that table against the filesystem — every directory
 whose `Cargo.toml` declares `[workspace]` must appear in it — so a ninth
@@ -172,7 +167,7 @@ by construction: the table cannot match itself.
 
 **`fmt` is where this actually bit.** `cargo fmt --all` means "every member of
 *this* workspace", so the root-only invocation the workflow used to run reached
-zero of the 27 `.rs` files under the seven tools. Widening it found exactly one
+zero of the 27 `.rs` files under the standalone tools. Widening it found exactly one
 dirty workspace, `p0-nat-test`. Note the flip side at the root: the three
 vendored crates *are* root members, so `cargo fmt --all` holds `vendor/` to
 default rustfmt even though clippy deliberately excludes it.
@@ -203,11 +198,9 @@ the check line together proves nothing, which is how vacuous clauses survive.
 
 **`CARGO_TARGET_DIR` is never exported by the script.** An already-set value
 always wins, and `--isolate` (per-lane directories, local use only) is opt-in.
-Two reasons, both live: each pinned self-hosted runner keeps one warm `target/`
-for its one job, and relocating it makes the first post-merge run cold on all
-three; and an agent harness sets one per task, so an unconditional export would
-collapse isolated lanes onto a single exclusively-locked directory — they would
-queue, not merely share.
+An agent harness sets one per task; an unconditional export would collapse
+isolated lanes onto a single exclusively locked directory, so they would queue,
+not merely share.
 
 Five things about the workflow itself are worth knowing before you change
 anything it touches.
@@ -288,62 +281,29 @@ in the core. A fourth clause, scoped to the two ruleset crates, refuses a live
 neighbour read: cross-entity effects travel as events, because the adjudicator
 installs exactly one entity and a neighbour read is always `None` at replay.
 
-**The rustc wrapper is cleared on GitHub-hosted runners, and deliberately not
-on the self-hosted one.** `.cargo/config.toml` sets
-`build.rustc-wrapper = "kache"` for local worktrees; the workflows set
-`RUSTC_WRAPPER: ""` at the top because a GitHub-hosted runner is ephemeral and
-has nothing to hit. The jobs that can land on `orrery-hel1-1` set it back to
-`kache`, because that box keeps a persistent `target/` and a shared cache at
-`/var/cache/kache/shared` that **both build identities publish to and restore
-from** — same dependency graph, so a CI build starts warm off whatever was
-compiled by hand in the dev checkout, and vice versa.
+**All workflow jobs run on GitHub-hosted runners.** `ci.yml` and `nightly.yml`
+name `ubuntu-latest`, `windows-latest`, `macos-latest`, or a matrix value for
+one of those; neither names a self-hosted label. GitHub reports zero registered
+runners for this repository. The workflow-level `RUSTC_WRAPPER: ""` is the
+safe default for an ephemeral runner; a job may install and configure its own
+cache within that run, but it must not rely on a persistent runner `target/`.
 
-**The heavy Linux jobs run on a self-hosted box.** `clippy`, `static gates` and
-`workspace tests` run on `orrery-hel1-1` for pushes and same-repository pull
-requests, and fall back to `ubuntu-latest` for fork pull requests; `p1-swarm`
-and the determinism soak run there nightly. Measured on the workspace test
-job: 305–549 s hosted, 182 s cold on the box, **48 s warm**.
+The `ci` Unix account on `orrery-hel1-1` is idle: it no longer runs GitHub
+Actions. Do not administer runner services there; the `actions.runner.*` units
+are gone.
 
-**Three runners, and each job is pinned to one of them.** A runner takes one
-job at a time, so a single runner would serialize the three heavy jobs that
-GitHub used to run on three machines. Three runners share the box — but not a
-`target/`, since cargo takes an exclusive lock on one. That is why the jobs are
-*pinned* by label (`orrery-clippy`, `orrery-gates`, `orrery-tests`) rather than
-left to land wherever: an unpinned job runs against a directory last used by a
-different job and rebuilds most of it. Each runner caps `CARGO_BUILD_JOBS` at
-8, mild oversubscription across three concurrent jobs on 16 threads, which
-keeps a lone nightly job fast when it has the box to itself.
-
-**Do not restart the runner services while a run is in flight** — the job dies
-as `The operation was canceled`, which reads like a test failure and is not
-one.
-
-Three things to know before changing any of it. The repository is public, so
-the security posture is layered and the in-workflow runner guard is the
-*weakest* of the three layers — see the comment on the `runner` job in
-`ci.yml`. The runner is an unprivileged `ci` user with **no sudo**, which is
-why every `apt-get` step in those jobs is conditioned on
-`runner.environment == 'github-hosted'` — and why a missing system library on
-the box is an ssh-and-install away rather than a workflow edit. What it needs
-beyond a stock Ubuntu: the Bevy build dependencies, `foundationdb-clients`, and
-**`libclang-dev`** (`foundationdb-sys` runs bindgen, which the hosted images
-happen to satisfy and a bare box does not). And the four jobs that need a
-FoundationDB *server* — `p2-kill9`, `p3-siblings`, `p5-dupe-gauntlet` and
-`fdb-tests`, all in `nightly.yml` — stay on GitHub-hosted runners, because
-provisioning their cluster means `sudo dpkg -i` on the server package, which
-that user cannot do. Each installs one per run through the composite action
+The jobs that need a FoundationDB *server* — `p2-kill9`, `p3-siblings`,
+`p5-dupe-gauntlet` and `fdb-tests`, all in `nightly.yml` — provision one per
+run through the composite action
 [`.github/actions/foundationdb`](.github/actions/foundationdb/action.yml) with
 `server: "true"`, points `ORRERY_FDB_CLUSTER_FILE` at the package-configured
 `/etc/foundationdb/fdb.cluster`, writes into whatever cluster it is given, and
-discards it with the runner. There is no long-running reference cluster for a
-gate to be mis-pointed at — see
-[Working alongside other agents](#working-alongside-other-agents).
+discards it with the runner. There is no long-running CI cluster for a gate to
+be mis-pointed at — see [Working alongside other agents](#working-alongside-other-agents).
 
-`p3-island` used to be pinned there for the same stated reason and never had
-one — `scripts/p3-island-gate.sh` contains no FoundationDB reference at all,
-binds every listener on `127.0.0.1:0` and runs persistd with
-`--allow-volatile-leases` — so it now runs on the box with the other nightly
-jobs.
+`p3-island` contains no FoundationDB reference, binds every listener on
+`127.0.0.1:0`, and runs persistd with `--allow-volatile-leases`; it runs on a
+GitHub-hosted runner with the other nightly jobs.
 
 The heavy harnesses — P2's kill-9 gate, which needs a real FoundationDB
 cluster, and P3's island gate, which needs eight peer processes and a real
@@ -365,9 +325,9 @@ per-commit, alongside every other self-test in `scripts/`.
 
 **The standalone tools are tested per-commit too.** Each declares its own
 `[workspace]`, so `cargo test --workspace` reaches none of them; the `gates`
-lane runs `cargo test` in `p1-swarm`, `p2-load`, `p2-dashboard` and
-`p4-streams-bench`, and `cargo check --all-targets` in the three that have no
-tests at all — see the inventory above, which is the table the lane iterates.
+lane runs `cargo test` in its six test workspaces and `cargo check --all-targets`
+in its four check-only workspaces — see the inventory above, which is the table
+the lane iterates.
 `p2-load` takes `orrery_persistd` with `features = ["fdb"]`, which is why that
 job installs the FoundationDB *client* on the hosted path.
 
@@ -429,30 +389,12 @@ cross-platform determinism matrix, `p4-platform-ledger` and the Windows and
 macOS accumulation legs need hosted runners this machine does not have. Every
 one of those is `SKIPPED` with the reason printed, not quietly absent.
 
-**Measured on the box, `--full`, at `607550c` with a nightly running
-concurrently: 28 minutes**, of which `p1-swarm` is 982 s and the `test` lane
-507 s; `p3-island` 72 s, the `p4` probe 27 s, the determinism soak 10 s,
-`clippy` 40 s, `fmt` 3 s. `--fast` is 18 s. What it reported: P1 held all five
-legs (0 boundary flips, 0 proxy pops, 138 cells on the least-travelled peer,
-773760 bits worst p99 upload, 162 shed on the witnessed hour, 0 false positives
-at 0.9999992 observation coverage, and the conviction and armed-honest controls
-both clean); P3 settled 50 victim entities across 7 successors in 9939 ms
-against a 12050 ms budget with 0 duplicate authority and 0 lost; the soak's ten
-corpus runs produced one digest. Six gates were `SKIPPED` and none of them read
-as a pass.
+The old full-run timing and disposition report was measured on the retired
+shared runner box. It is historical evidence, not a claim about this checkout
+or GitHub-hosted CI; re-run the required mode when the answer must be current.
 
-**It needs one line in `check.sh` that is not there yet.** `check.sh
---self-test` asserts that every script in `scripts/` dispatching on
-`--self-test` is invoked by `lane_gates`, and `gate-status.sh` is one — so the
-per-commit `gates` job fails until
-
-```
-    run scripts/gate-status.sh --self-test
-```
-
-is added to `lane_gates` beside the other seven (`scripts/check.sh:214`). That
-is the coverage clause doing exactly its job; the self-test costs 0.9 s and
-needs no cluster, no binaries and no network.
+`gate-status.sh --self-test` is part of the `gates` lane. The coverage clause
+therefore proves that the report script itself is not an unrun self-test.
 
 **Evidence is read as it is found, and that is a limitation with teeth.**
 `--inspect` and the evidence half of `--fast` tell you what a gate last said,
@@ -476,15 +418,14 @@ that was incremental-compilation scratch alone. Left alone this fills the disk,
 and a build that dies with `No space left on device` costs more than it saves.
 
 The arrangement is: **every worktree keeps its own `target/`; kache keeps a
-local object cache per build identity.** On `fortyninety` that is the whole
-arrangement; on `orrery-hel1-1` those local stores additionally publish to and
-restore from the shared remote described below.
+local object cache for the Unix user running the build.** Do not turn this into
+a shared `CARGO_TARGET_DIR`.
 
 Sharing a `CARGO_TARGET_DIR` instead would look tempting and be wrong — cargo
 takes an exclusive lock on a target directory, so two agents building at once
-would serialize, one waiting on the other for the whole build. The object cache
-has no such contention: identical `rustc` invocations can be reused by the
-worktrees of the identity that owns its local store.
+would serialize, one waiting on the other for the whole build. The local object
+cache has no such contention: identical `rustc` invocations can be reused by
+worktrees run by the same user.
 
 ### What is configured, and where
 
@@ -492,9 +433,7 @@ worktrees of the identity that owns its local store.
 |---|---|---|
 | `build.rustc-wrapper = "kache"` | `.cargo/config.toml` | yes — worktrees each get a copy of tracked files, so this is the only way a setting reaches all of them |
 | `build.incremental = false` | `.cargo/config.toml` | yes |
-| kache local store | `~/.cache/kache` | no — the live default store; one per build identity |
-| kache remote | `fortyninety`: unconfigured · `orrery-hel1-1`: `/var/cache/kache/shared` | n/a — machine-local, not committed |
-| kache daemon unit | `fortyninety`: none · `orrery-hel1-1`: `kache@<user>.service`, one per build identity | n/a — machine-local |
+| kache local store | `~/.cache/kache` | no — the live default store, shared by worktrees of its Unix user |
 
 The standalone tools (`p2-load`, `p3-island`, `p0-*`) each declare their own
 `[workspace]`, so each has its own `target/`. They still inherit the repo's
@@ -519,13 +458,16 @@ an empty wrapper, which takes precedence over the config file:
 RUSTC_WRAPPER= cargo build
 ```
 
-### How it is set up: two boxes, two arrangements
+### What exists on the named machines
 
-**This section describes two different machines.** Conflating them is what made
-the previous version of it wrong, so check which one you are on before acting on
-anything here: `hostname`.
+**Machine names are part of the claim.** `fortyninety` and `orrery-hel1-1` are
+different hosts. Check before acting:
 
-**`fortyninety` — the dev workstation.** Local **kache 0.14.2** only.
+```
+hostname
+```
+
+**`fortyninety` — the development workstation.** Local **kache 0.14.2** only.
 `.cargo/config.toml` routes `rustc` through it; the store is the default
 `~/.cache/kache` for the invoking user. There is no `~/.config/kache/config.toml`,
 no project `.kache.toml`, no remote, no `/var/cache/kache`, no `kache` group and
@@ -533,141 +475,36 @@ no `kache*` systemd unit. `kache doctor` reports all checks passed and says
 explicitly that no remote cache or planner is configured; its daemon-service
 result is informational for this local-only arrangement.
 
-**`orrery-hel1-1` — the self-hosted runner.** The full shared arrangement is
-live here, verified 2026-08-21:
-
-| | |
-|---|---|
-| shared store | `/var/cache/kache/shared`, **80 GB** |
-| mode / owner | `2775` `root:kache`, setgid, with a **default ACL** granting `group:kache:rwx` |
-| group | `kache` (1002), members `baadc0de` and `ci` |
-| daemons | `kache@baadc0de.service` and `kache@ci.service`, both running — **one per build identity is the design**, so a "2 daemon processes, expected 1" complaint is not a fault |
-| pruning | `kache-prune-shared.timer`, enabled, firing **hourly** |
-| user config | `~/.config/kache/config.toml` exists |
-
-The setgid bit plus the default ACL are what make sharing work: every blob either
-identity writes lands group-owned and group-writable, so the other can read and
-replace it. That is the whole mechanism, and it is why a `chmod` that drops
-setgid, or a `cp` that does not preserve ACLs, silently breaks sharing rather
-than failing loudly.
-
-Both build identities publish to and restore from that one store, over the same
-dependency graph — so a CI build starts warm off whatever was compiled by hand in
-the dev checkout on that box, and vice versa.
-
-Verify rather than assume, on whichever box you are on:
+The commands above were verified on `fortyninety` on 2026-08-22:
 
 ```
-hostname
 kache --version
 kache doctor
-ls -ld /var/cache/kache/shared
+ls -ld /var/cache/kache
 getent group kache
-systemctl list-unit-files 'kache*'
+systemctl list-unit-files 'kache*' --no-legend
 ```
 
-`scripts/dev-cache.sh doctor` treats the filesystem remote as **opt-in**, via
-`KACHE_SHARED_REMOTE`. Unconfigured is reported as unconfigured and is not a
-failure; configured-but-missing and configured-but-unwritable both still fail.
-An unconfigured optional remote is not a failure, and a skip is never a pass.
+`orrery-hel1-1` is no longer a self-hosted runner. GitHub reports zero runners
+for this repository, and `actions.runner.*` units are absent there. The `ci`
+account remains, but it runs no GitHub Actions jobs. The old filesystem cache is
+still present on that host (`/var/cache/kache/shared`, group `kache`, and the
+pruning timer); it is not CI infrastructure and agents must not rely on it.
 
-The `ci` account and the dev user are distinct build identities. On a box with no
-shared remote their local stores are distinct too, and worktrees run by the same
-user share that user's store.
-### Records from the shared-cache experiment
+These were verified read-only from `fortyninety` on 2026-08-22:
 
-The following findings are records, not statements about the live arrangement.
-Keep them when changing this section.
-
-`cache.local_max_size` is the size cap — **not** `max_size`, which kache ignores
-silently, leaving a configured store on the 50 GiB default while the config
-claims otherwise. `cache.auto_gc` is on by default and enforces the local cap
-opportunistically.
-
-`kache gc` evicts local stores only. Neither `CacheFileConfig` nor
-`RemoteFileConfig` has a remote size or retention key, so the filesystem remote
-can grow without bound. This was reported upstream as
-[kache#774](https://github.com/kunobi-ninja/kache/issues/774), and
-`kache-prune-shared.timer` on `orrery-hel1-1` exists to compensate for it. There
-is no such timer on `fortyninety`, which has no remote to prune.
-
-**Size, not age**, was the lesson from that experiment. An age policy cannot
-fire on a cache that is being read continuously: the remote reached 319 GiB in a
-single day with **zero** objects untouched for even 24 hours, because every
-build re-read the whole hot set. The disk hit 94% before anyone noticed.
-
-**A blob leak was suspected here and does not reproduce.** On 2026-08-18 we
-recorded `kache stats` reporting `Store: 0 B (0 entries)` while
-`~/.cache/kache/store/blobs` still held 37 GB, and wrote it up as a gc bug. Retested
-against 0.14.2 in isolated stores: age-based eviction of every entry, size-pressure
-eviction, and `purge`, each with and without a remote configured. **All six reclaimed
-correctly** — blob rows, blob files and directory bytes all tracked the entry count
-down, and `doctor --verify` reported 0 orphaned blobs throughout. The live 24 GiB store
-audits clean too: 5747 blob rows, 5747 files, no unreferenced rows, no refcount drift.
-The two upstream bugs that would explain the observation (kache#275 orphaned blob
-files, kache#276 refcount leak on unreadable `meta.json`) are both fixed, and the
-`entry_blobs` join table that #276 asked for exists.
-
-So the 37 GB reading was most likely a measurement error — most plausibly one
-identity's store `du`'d against the other identity's `kache stats`, which is easy to do
-here and which `doctor` hints at when it reports more daemon processes than expected.
-**Do not carry the leak claim forward.** If it recurs, capture the state before
-reclaiming anything, because the distinction that identifies it is invisible afterwards:
-a blob *file* with no `blobs` row is kache#275, whereas a `blobs` row that survives
-with `refcount > 0` and no `entry_blobs` referent is a different bug. This SQL
-separates them:
-
-```sql
-SELECT COUNT(*) FROM blobs WHERE hash NOT IN (SELECT hash FROM entry_blobs);
+```
+gh api repos/baadc0de/orrery/actions/runners --paginate --jq '.total_count'
+ssh -F /dev/null -o BatchMode=yes orrery-hel1-1.distopik.com \
+  'hostname; id ci; systemctl list-unit-files "actions.runner.*" --no-legend; \
+   systemctl list-units "actions.runner.*" --all --no-legend; \
+   ls -ld /var/cache/kache /var/cache/kache/shared; getent group kache; \
+   systemctl list-unit-files "kache*" --no-legend'
 ```
 
-**On `fortyninety` there is no unit to stop**, and deleting `~/.cache/kache`
-drops the local cache outright — with no remote it does **not** refill from
-anywhere. It is safe for source correctness, but it deliberately turns later
-cacheable compiles into misses.
-
-**On `orrery-hel1-1` the old procedure still applies**: stop `kache@<user>`,
-delete `~/.cache/kache`, start it again — there the local store genuinely does
-refill from the shared remote.
-
-Either way, inspect `./scripts/dev-cache.sh disk` and use `kache`'s own
-maintenance commands before discarding a useful local store.
-
-The default ACL and systemd system-unit design below belong to the
-filesystem remote. The ACL made every new object group-writable **regardless of
-the writing process's umask**; without it a runner with `umask 022` could have
-published objects the dev user could not overwrite. A systemd *system* unit,
-rather than `kache daemon install`'s user unit, is used because a user unit needs
-lingering and a D-Bus session that the `ci` service account does not have.
-
-**Why not sccache**, since the repo used it until 2026-08-17.
-
-The intermittent CI failures — `Connection reset by peer (os error 104)`,
-`Failed to read response header` — had a specific cause, and it was not cache
-corruption. All three runners run as `ci` and shared **one** sccache server.
-Whichever job's client spawned it owned that process inside *that runner's*
-process tree, so when that job finished, the runner's cleanup killed it —
-`Terminate orphan process: pid (N) (sccache)` — and every in-flight compile in
-the other two jobs died with it. Across 15 retrieved failures the correlation is
-exact: each one begins 15–50 ms after a *different* job on a *different* runner
-logged that kill. (PR #52's `SCCACHE_IGNORE_SERVER_IO_ERROR=1` did not help; one
-of the 15 failed fatally with it set.)
-
-kache's relevant property is that it compiles **in the invoking process**. The
-systemd-unit and shared-remote arrangement discussed in the earlier comparison
-was never installed here; there is no `kache@baadc0de` unit to stop. The former
-measurement was 3.45 s for a full `p3-island` rebuild from an empty `target/`
-with the proposed daemon stopped, against 3.28 s with it running.
-
-Two further sccache problems made leaving it worthwhile anyway. It runs
-the compiler inside its server, so the server's uid owns the output objects and
-it panics outright if it cannot stat the calling user's toolchain — which it
-cannot, because `/home/<user>` is `0750`. And it writes cache entries `0600`, so
-`/var/cache/sccache` was never actually shared: 20,520 entries readable only by
-the dev user, 4,965 only by `ci`, each server's LRU evicting files it could not
-read. Upstream documents that arrangement as unsupported — *"The local storage
-only supports a single sccache server at a time. Multiple concurrent servers
-will race and cause spurious build failures."*
+This section describes local agent builds and the retired runner host, not the
+workflow cache configuration. Do not infer an unverified infrastructure design
+from it; record the commands, host and result before documenting one.
 
 ### Working with it
 
@@ -679,13 +516,8 @@ will race and cause spurious build failures."*
 ```
 
 `prune` is the lever to pull when disk gets tight: sources are in git, though a
-local-only store cannot restore entries deleted with the store itself. Measured 2026-08-17
-on the `p3-island` tool, deleting its whole `target/` and rebuilding: **25 s
-with a cold cache, 3.3 s warm** (330 cache hits). The residual is linking and
-cargo's own bookkeeping, which no object cache can remove. For comparison, the
-same measurement under sccache was 21 s cold and **14 s** warm — the warm case
-is where the difference shows, because sccache's entries were unreadable across
-build identities and a warm cache was warm for one user only.
+local-only store cannot restore entries deleted with the store itself. It is a
+derived-artifact cleanup, not a source-data cleanup.
 
 Two things follow for agents sharing this machine:
 
