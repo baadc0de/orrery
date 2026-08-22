@@ -40,7 +40,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -54,7 +54,7 @@ use orrery_protocol::channels::{
     decode_datagram, decode_stream_frame, encode_datagram, encode_stream_frame, untag, Channel,
 };
 use orrery_protocol::{
-    verify_interest_grant, AccountId, AccountInvalidation, AreaPage, CellId,
+    verify_interest_grant, AccountId, AccountInvalidation, AccountStandings, AreaPage, CellId,
     CoordinatorInterestSnapshot, DiffUplink, DiscrepancyReport, Epoch, GatewayMsg, GatewayReply,
     GridId, Intent, IntentOutcome, IssuerKey, JournalRecord, LeaseId, LeaseMsg, Lsn, NodeId,
     PersistId, SessionStanding, SessionTokenClaimsV1, SessionTokenV1,
@@ -2945,6 +2945,19 @@ pub struct GatewayConfig {
     /// [`Self::authority_metrics`]; a fresh one is created when the caller
     /// does not.
     pub standing_metrics: Arc<GatewayStandingMetrics>,
+    /// Identity's standing assertions for accounts whose sessions are already
+    /// open (D33 clause (e), the **quarantine** half).
+    ///
+    /// The sibling of [`Self::standing_feed`], not a replacement for it: that
+    /// one carries cooldown/ban invalidations and ends sessions, this one
+    /// carries a standing value and moves a live session in place. Both are
+    /// C5, so both answer to [`Self::strikes_posture`].
+    ///
+    /// **The default is inert.** With no feed configured nothing is ever
+    /// resolved, and with C5 at `Off` — its own default — not even the poll
+    /// happens, so a deployment that configures neither behaves exactly as it
+    /// did before this field existed.
+    pub standing_updates: Arc<AccountStandings>,
     /// Registrar clock the periodic TTL sweep reads. Injectable so a test can
     /// advance expiry without sleeping through a 10 s lease.
     pub lease_sweep_clock: SharedClaimClock,
@@ -2997,6 +3010,7 @@ impl Default for GatewayConfig {
             successor_policy: Arc::new(NearestInterestSuccessorPolicy),
             authority_metrics: Arc::new(AuthorityMetrics::default()),
             standing_metrics: Arc::new(GatewayStandingMetrics::default()),
+            standing_updates: Arc::new(AccountStandings::inert()),
             lease_sweep_clock: Arc::new(RegistrarSweepClock),
             handoff_deadline_ms: 300,
             route_admission_wait_us: route_admission_budget_us(),
@@ -3314,8 +3328,64 @@ type PeerNotifier = Arc<dyn Fn(Bytes) + Send + Sync>;
 /// on the sweep tick that already exists.
 const SESSION_SILENCE_LIMIT_MS: u64 = crate::lease::LEASE_TTL_MS;
 
+/// The standing in force for a peer's session *right now*, which is the
+/// token's until an [`AccountStandingUpdate`](orrery_protocol::AccountStandingUpdate)
+/// says otherwise (D33 clause (e), the quarantine half).
+///
+/// An `Arc<AtomicU8>` for exactly the reason [`PeerState::last_seen_ms`] is an
+/// `Arc<AtomicU64>`: the value is read on the receive loop — every intent
+/// builds an [`IntentContext`] from it — and taking the peer mutex there would
+/// serialize the diff path behind whatever lease operation currently holds the
+/// lock. The previous shape, a plain `SessionStanding` copied out of the token
+/// at handshake, had the same property and one flaw: it could not change. This
+/// keeps the property and drops the flaw, at the cost of one relaxed atomic
+/// byte per intent against a check that already verifies signatures.
+///
+/// `Relaxed` is deliberate and matches [`StrikesPosture`]. There is nothing to
+/// order a standing change against: a sweep may be observed one intent late by
+/// construction, which is what "no later than one sweep interval" means.
+#[derive(Debug, Clone)]
+struct SharedStanding(Arc<AtomicU8>);
+
+impl SharedStanding {
+    fn new(standing: SessionStanding) -> Self {
+        Self(Arc::new(AtomicU8::new(Self::code(standing))))
+    }
+
+    fn get(&self) -> SessionStanding {
+        match self.0.load(Ordering::Relaxed) {
+            0 => SessionStanding::Good,
+            // Unreachable: `code` is the only writer and it emits 0 or 1.
+            // Written as the enforcing arm because a torn read here should
+            // cost a peer a shortcut, never hand it one.
+            _ => SessionStanding::Quarantined,
+        }
+    }
+
+    fn set(&self, standing: SessionStanding) {
+        self.0.store(Self::code(standing), Ordering::Relaxed);
+    }
+
+    const fn code(standing: SessionStanding) -> u8 {
+        match standing {
+            SessionStanding::Good => 0,
+            SessionStanding::Quarantined => 1,
+        }
+    }
+}
+
 struct PeerState {
     established: EstablishedIdentity,
+    /// The standing every session on this peer entry currently enforces.
+    ///
+    /// Restamped from the verified token on each handshake and moved in place
+    /// by [`PeerRegistry::apply_standing_updates`] when identity publishes a
+    /// standing change for the account. It is *not* part of the session
+    /// generation: a standing change is not a new session, and treating it as
+    /// one would re-key every lease the peer holds — which is exactly what
+    /// separates this from the cooldown/ban path, where terminating the
+    /// session and parking its rows is the point.
+    standing: SharedStanding,
     current: Option<SessionGeneration>,
     live: HashSet<SessionGeneration>,
     notify: Option<(SessionGeneration, PeerNotifier)>,
@@ -3356,6 +3426,14 @@ struct PeerRegistry {
     capacity: usize,
     lease_capacity: usize,
     idle_retention_ms: u64,
+    /// Identity's standing assertions, consulted on admission and on the
+    /// registrar sweep. Inert unless a deployment configures a feed.
+    standings: Arc<AccountStandings>,
+    /// C5's posture — the *same* cell [`GatewayAdmission::strikes_posture`]
+    /// holds, cloned, not a second one. One control, one lever: a clause (f)
+    /// auto-suspend has to demote the quarantine half and the cooldown/ban
+    /// half together or it has not demoted C5 at all.
+    strikes_posture: StrikesPosture,
 }
 
 #[derive(Clone)]
@@ -3370,12 +3448,16 @@ struct PeerSession {
     /// whatever lease operation currently holds it. A session's account cannot
     /// change — a token naming a different one activates a new generation.
     account: AccountId,
-    /// The standing the verified session token assigned this connection.
+    /// The standing this connection currently enforces.
     ///
-    /// Copied out for the same receive-loop reason as [`Self::account`].
-    /// It cannot change during a session because a replacement token activates
-    /// a new generation.
-    standing: SessionStanding,
+    /// Shared out of [`PeerState`] rather than through the mutex for the same
+    /// receive-loop reason as [`Self::account`] — but *shared*, not copied,
+    /// which is the difference this handle exists to make. The token's signed
+    /// standing seeds it; identity may move it mid-session (D33 clause (e)),
+    /// and the next intent this session sends reads the moved value without
+    /// the peer redialling and without a new generation. See
+    /// [`SharedStanding`].
+    standing: SharedStanding,
     state: Arc<tokio::sync::Mutex<PeerState>>,
     /// The same cell as [`PeerState::last_seen_ms`], reachable without the
     /// peer lock so the receive loop can stamp it per message.
@@ -3388,7 +3470,7 @@ impl PeerSession {
         IntentContext {
             issuer: self.node,
             account: Some(self.account),
-            standing: self.standing,
+            standing: self.standing.get(),
         }
     }
 
@@ -3523,7 +3605,18 @@ impl PeerRegistry {
             capacity: capacity.min(MAX_PEER_REGISTRY_ENTRIES),
             lease_capacity: lease_capacity.min(MAX_PEER_LIVE_LEASES),
             idle_retention_ms,
+            standings: Arc::new(AccountStandings::inert()),
+            strikes_posture: StrikesPosture::default(),
         }
+    }
+
+    /// Point this registry at identity's standing assertions, under C5's
+    /// posture cell.
+    #[must_use]
+    fn with_standings(mut self, standings: Arc<AccountStandings>, posture: StrikesPosture) -> Self {
+        self.standings = standings;
+        self.strikes_posture = posture;
+        self
     }
 
     async fn activate(
@@ -3550,6 +3643,7 @@ impl PeerRegistry {
                     GatewayAuthorization::Expired(_) => return None,
                 };
                 let state = Arc::new(tokio::sync::Mutex::new(PeerState {
+                    standing: SharedStanding::new(claims.standing),
                     established: EstablishedIdentity {
                         claims,
                         token: token.to_vec(),
@@ -3608,7 +3702,32 @@ impl PeerRegistry {
             }
         }
         let account = peer.established.claims.account;
-        let standing = peer.established.claims.standing;
+        // Restamp standing from the token, then let any newer assertion win.
+        //
+        // The order is the whole point and both arms matter. A *valid* token
+        // is identity answering for this account again, so it supersedes an
+        // assertion it postdates — and `AccountStandings::pending_for` says so
+        // by comparing `issued_at_ms`, the same watermark rule
+        // [`AccountInvalidations`] applies to the termination half. A token
+        // admitted on docs/09 §8's grace is exactly as stale as the outage is
+        // long, so restamping alone would silently undo an applied quarantine
+        // on a reconnect; running the resolve *after* it, rather than instead
+        // of it, is what makes an expired token lose.
+        let mut standing = peer.established.claims.standing;
+        let mode = self.strikes_posture.get();
+        if mode != StrikesEnforcement::Off {
+            if let Some(resolved) = self.standings.pending_for(&peer.established.claims) {
+                if mode == StrikesEnforcement::Live {
+                    self.standings.record_applied();
+                    standing = resolved;
+                } else {
+                    // Evaluated exactly as `Live` would, admitted untouched.
+                    self.standings.record_observed();
+                }
+            }
+        }
+        peer.standing.set(standing);
+        let standing = peer.standing.clone();
         // A completed handshake is the first thing this session is heard
         // saying; without this a peer admitted into a long-lived registry
         // entry would inherit whatever staleness the previous session left.
@@ -3637,7 +3756,7 @@ impl PeerRegistry {
             (
                 peer.current?,
                 peer.established.claims.account,
-                peer.established.claims.standing,
+                peer.standing.clone(),
                 Arc::clone(&peer.last_seen_ms),
             )
         };
@@ -3723,7 +3842,7 @@ impl PeerRegistry {
                     node,
                     generation,
                     account: peer.established.claims.account,
-                    standing: peer.established.claims.standing,
+                    standing: peer.standing.clone(),
                     state: Arc::clone(&state),
                     last_seen_ms: Arc::clone(&peer.last_seen_ms),
                 }
@@ -3780,7 +3899,7 @@ impl PeerRegistry {
                     node,
                     generation,
                     account: claims.account,
-                    standing: claims.standing,
+                    standing: peer.standing.clone(),
                     state: Arc::clone(&state),
                     last_seen_ms: Arc::clone(&peer.last_seen_ms),
                 }
@@ -3788,6 +3907,83 @@ impl PeerRegistry {
             invalidated.push(session);
         }
         invalidated
+    }
+
+    /// Drain identity's standing assertions and move the sessions they name
+    /// (D33 clause (e), the **quarantine** half).
+    ///
+    /// Returns the nodes whose standing actually changed, for the sweep's log.
+    ///
+    /// # This is not [`Self::invalidated_sessions`] and must not become it
+    ///
+    /// They read the same watermark and do opposite things with it, because
+    /// clause (e) says two different things. Cooldown and ban are admission
+    /// decisions: the session ends, `standing_sweep` tears it down through
+    /// `cleanup_peer_session`, and its leases park and redistribute.
+    /// Quarantine keeps the session and narrows what it may do, so nothing
+    /// here touches `current`, the live generation set, the lease map, or
+    /// `last_seen_ms`. A standing change is not a new session; re-keying
+    /// leases through a fresh generation is precisely the damage this avoids,
+    /// and it is why the value lives beside the generation rather than inside
+    /// it.
+    ///
+    /// It is also off every hot path. The whole pass runs on the 1 s registrar
+    /// sweep that already reaps stale sessions and expires leases, touches no
+    /// store, and costs the intent path nothing at all — an intent reads one
+    /// relaxed atomic byte whether this ever runs or not (D16's 10 ms budget).
+    async fn apply_standing_updates(&self, now_ms: u64) -> Vec<(NodeId, SessionStanding)> {
+        // D32 clause (b): "Off observes nothing." Not even the poll.
+        let mode = self.strikes_posture.get();
+        if let StrikesEnforcement::Off = mode {
+            return Vec::new();
+        }
+        self.standings.poll();
+        let entries = {
+            let entries = self.entries.lock().await;
+            entries
+                .iter()
+                .map(|(node, state)| (*node, Arc::clone(state)))
+                .collect::<Vec<_>>()
+        };
+        let mut moved = Vec::new();
+        for (node, state) in entries {
+            let peer = state.lock().await;
+            // An entry with no current generation is a retained identity, not
+            // a session: it has nothing to enforce against, and the next
+            // `activate` resolves against the same map anyway.
+            if peer.current.is_none() {
+                continue;
+            }
+            let claims = &peer.established.claims;
+            let Some(resolved) =
+                self.standings
+                    .pending(claims.account, claims.issued_at_ms, peer.standing.get())
+            else {
+                continue;
+            };
+            // Re-read per session so a mid-sweep demotion cannot act after it
+            // has been asked for — the same rule `standing_sweep` states.
+            match self.strikes_posture.get() {
+                StrikesEnforcement::Off | StrikesEnforcement::Shadow => {
+                    self.standings.record_observed();
+                    tracing::info!(
+                        target: STRIKES_SHADOW_TARGET,
+                        control = STRIKES_CONTROL,
+                        node = %node,
+                        account = claims.account.0,
+                        action = "would_move_standing",
+                        observed_at_ms = now_ms,
+                        "standing assertion would have moved this session; left unchanged in shadow"
+                    );
+                }
+                StrikesEnforcement::Live => {
+                    self.standings.record_applied();
+                    peer.standing.set(resolved);
+                    moved.push((node, resolved));
+                }
+            }
+        }
+        moved
     }
 }
 
@@ -4776,11 +4972,15 @@ impl GatewayServer {
             clock: config.identity_clock,
             health: config.identity_health,
             claim_clock: config.claim_clock,
-            peers: Arc::new(PeerRegistry::new(
-                config.peer_registry_capacity,
-                config.peer_idle_retention_ms,
-                config.peer_lease_capacity,
-            )),
+            peers: Arc::new(
+                PeerRegistry::new(
+                    config.peer_registry_capacity,
+                    config.peer_idle_retention_ms,
+                    config.peer_lease_capacity,
+                )
+                // The same posture cell, cloned — see `PeerRegistry`'s field.
+                .with_standings(config.standing_updates, config.strikes_posture.clone()),
+            ),
             standing_invalidations,
             strikes_posture: config.strikes_posture,
             standing_metrics: Arc::clone(&config.standing_metrics),
@@ -5437,6 +5637,24 @@ async fn accept_loop(
                 // than widened: every peer is reaped by its own
                 // `last_seen + TTL`, and every `last_seen` is at most
                 // `T_last_peer_gone`.
+                // D33 clause (e)'s *quarantine* half, and it rides this
+                // sweep before the reap rather than after it. The two are
+                // unrelated judgements — one is "is anybody still there", the
+                // other "what may they do" — but a session moved to
+                // `Quarantined` in this pass and reaped in the same one should
+                // be quarantined for whatever it does in between, and ordering
+                // it first is free. The *termination* half runs last, at the
+                // end of this arm, because a session it kills needs no further
+                // maintenance.
+                for (node, standing) in
+                    admission.peers.apply_standing_updates(admission.clock.now_ms().0).await
+                {
+                    debug!(
+                        %node,
+                        ?standing,
+                        "gateway: identity moved an open session's standing"
+                    );
+                }
                 for stale in admission.peers.stale_sessions(registrar_now_ms()).await {
                     debug!(
                         node = %stale.node,
@@ -8887,6 +9105,332 @@ mod tests {
             .current_session(fixture.peer)
             .await
             .is_some());
+    }
+
+    // ── Standing propagation (D33 clause (e), issue #216) ────────────────
+    //
+    // The quarantine half: a live session's standing moves in place. The
+    // cooldown/ban half above ends sessions instead; both are C5, and these
+    // tests drive the *same* `StrikesPosture` those do.
+
+    /// A registry wired to a queue-backed standing feed at `mode`, plus the
+    /// publisher half and the consumer whose counters the ramp tests read.
+    fn standing_registry(
+        mode: StrikesEnforcement,
+    ) -> (
+        Arc<orrery_protocol::QueuedStandingUpdates>,
+        Arc<AccountStandings>,
+        StrikesPosture,
+        PeerRegistry,
+    ) {
+        let feed = Arc::new(orrery_protocol::QueuedStandingUpdates::new());
+        let standings = Arc::new(AccountStandings::new(
+            Arc::clone(&feed) as Arc<dyn orrery_protocol::StandingUpdateFeed>
+        ));
+        let posture = StrikesPosture::new(mode);
+        let registry = PeerRegistry::new(4, 10_000, MAX_PEER_LIVE_LEASES)
+            .with_standings(Arc::clone(&standings), posture.clone());
+        (feed, standings, posture, registry)
+    }
+
+    /// Claims for a session admitted with `standing`, on a token signed at
+    /// `issued_at_ms`.
+    fn standing_claims(
+        seed: u8,
+        standing: SessionStanding,
+        issued_at_ms: u64,
+    ) -> SessionTokenClaimsV1 {
+        let node = iroh::SecretKey::from_bytes(&[seed; 32]).public();
+        SessionTokenClaimsV1::new(
+            AccountId::new(u64::from(seed)),
+            node,
+            UnixMillis::new(issued_at_ms),
+            orrery_protocol::SessionTokenTtlMs::new(3_600_000),
+            standing,
+            orrery_protocol::IssuerKeyId::new(1),
+        )
+    }
+
+    fn standing_assertion(
+        seed: u8,
+        standing: SessionStanding,
+        effective_from_ms: u64,
+    ) -> orrery_protocol::AccountStandingUpdate {
+        orrery_protocol::AccountStandingUpdate {
+            account: AccountId::new(u64::from(seed)),
+            standing,
+            effective_from_ms: UnixMillis::new(effective_from_ms),
+        }
+    }
+
+    /// The issue's first acceptance clause: a quarantine filed at `t` reaches a
+    /// session that handshook as `Good`, on its **next intent**, without the
+    /// peer redialling.
+    ///
+    /// The session handle is deliberately the one `activate` returned and is
+    /// never re-fetched: that is what "an open session" means here. Before
+    /// this, `PeerSession::standing` was a copy taken at handshake, so this
+    /// handle could not have observed the change even in principle.
+    #[tokio::test]
+    async fn a_quarantine_applied_mid_session_reaches_an_open_session() {
+        let (feed, standings, _posture, registry) = standing_registry(StrikesEnforcement::Live);
+        let node = iroh::SecretKey::from_bytes(&[51; 32]).public();
+        let session = registry
+            .activate(
+                node,
+                GatewayAuthorization::Valid(standing_claims(51, SessionStanding::Good, 1_000)),
+                b"good",
+                None,
+                0,
+                0,
+            )
+            .await
+            .expect("valid peer is admitted");
+        assert_eq!(session.intent_context().standing, SessionStanding::Good);
+
+        // Identity files the strike and asserts the new standing from now.
+        feed.publish(standing_assertion(51, SessionStanding::Quarantined, 2_000));
+        assert_eq!(
+            registry.apply_standing_updates(2_500).await,
+            vec![(node, SessionStanding::Quarantined)]
+        );
+
+        assert_eq!(
+            session.intent_context().standing,
+            SessionStanding::Quarantined,
+            "the validator's quarantine branch must fire for a session that handshook Good"
+        );
+        assert_eq!(standings.applied(), 1);
+    }
+
+    /// The half that is easy to forget: an account whose quarantine is lifted
+    /// stops paying D10's full cluster-side validation cost on the same tick.
+    #[tokio::test]
+    async fn a_lifted_quarantine_reaches_an_open_session_too() {
+        let (feed, _standings, _posture, registry) = standing_registry(StrikesEnforcement::Live);
+        let node = iroh::SecretKey::from_bytes(&[52; 32]).public();
+        let session = registry
+            .activate(
+                node,
+                GatewayAuthorization::Valid(standing_claims(
+                    52,
+                    SessionStanding::Quarantined,
+                    1_000,
+                )),
+                b"quarantined",
+                None,
+                0,
+                0,
+            )
+            .await
+            .expect("valid peer is admitted");
+        assert_eq!(
+            session.intent_context().standing,
+            SessionStanding::Quarantined
+        );
+
+        feed.publish(standing_assertion(52, SessionStanding::Good, 2_000));
+        assert_eq!(
+            registry.apply_standing_updates(2_500).await,
+            vec![(node, SessionStanding::Good)]
+        );
+
+        assert_eq!(session.intent_context().standing, SessionStanding::Good);
+    }
+
+    /// A standing update is not a new session: no generation is allocated, and
+    /// the leases keyed by the current one are untouched.
+    ///
+    /// This is the property that makes updating in place the right mechanism
+    /// rather than reusing the cooldown/ban termination path — re-keying a
+    /// holder's leases to punish a quarantine would park and redistribute rows
+    /// D33 clause (e) never asked to move.
+    #[tokio::test]
+    async fn a_standing_update_allocates_no_generation_and_disturbs_no_lease() {
+        let (feed, _standings, _posture, registry) = standing_registry(StrikesEnforcement::Live);
+        let node = iroh::SecretKey::from_bytes(&[53; 32]).public();
+        let session = registry
+            .activate(
+                node,
+                GatewayAuthorization::Valid(standing_claims(53, SessionStanding::Good, 1_000)),
+                b"good",
+                None,
+                0,
+                0,
+            )
+            .await
+            .expect("valid peer is admitted");
+        let entity = PersistId::new(53);
+        session.state.lock().await.leases.insert(
+            entity,
+            SessionLease {
+                entity,
+                lease_id: LeaseId(53),
+                grid: GridId::ROOT,
+                cell: CellId::ROOT,
+                owner: SessionLeaseOwner::Active(session.generation),
+            },
+        );
+        let before = {
+            let peer = session.state.lock().await;
+            (peer.current, peer.live.clone(), peer.leases.clone())
+        };
+
+        feed.publish(standing_assertion(53, SessionStanding::Quarantined, 2_000));
+        registry.apply_standing_updates(2_500).await;
+
+        let after = {
+            let peer = session.state.lock().await;
+            (peer.current, peer.live.clone(), peer.leases.clone())
+        };
+        assert_eq!(before.0, after.0, "the current generation must not move");
+        assert_eq!(
+            before.1, after.1,
+            "no generation may be allocated or retired"
+        );
+        assert_eq!(
+            before.2, after.2,
+            "held leases must not be re-keyed or parked"
+        );
+        assert_eq!(
+            session.intent_context().standing,
+            SessionStanding::Quarantined
+        );
+    }
+
+    /// C5's observing position: evaluate fully, count, change nothing — and
+    /// promote without a reconnect.
+    #[tokio::test]
+    async fn in_shadow_the_standing_does_not_move_and_the_counter_does() {
+        let (feed, standings, posture, registry) = standing_registry(StrikesEnforcement::Shadow);
+        let node = iroh::SecretKey::from_bytes(&[54; 32]).public();
+        let session = registry
+            .activate(
+                node,
+                GatewayAuthorization::Valid(standing_claims(54, SessionStanding::Good, 1_000)),
+                b"good",
+                None,
+                0,
+                0,
+            )
+            .await
+            .expect("valid peer is admitted");
+
+        feed.publish(standing_assertion(54, SessionStanding::Quarantined, 2_000));
+        assert!(registry.apply_standing_updates(2_500).await.is_empty());
+
+        assert_eq!(session.intent_context().standing, SessionStanding::Good);
+        assert_eq!(standings.observed(), 1);
+        assert_eq!(standings.applied(), 0);
+
+        // The same open session moves on the next sweep after promotion — and
+        // it is C5's own cell that promotes it, not a second lever.
+        posture.set(StrikesEnforcement::Live);
+        registry.apply_standing_updates(3_000).await;
+        assert_eq!(
+            session.intent_context().standing,
+            SessionStanding::Quarantined
+        );
+    }
+
+    /// `Off` observes nothing (D32 clause (b)): the feed is not even drained,
+    /// so a later promotion still converges because the queue is intact.
+    #[tokio::test]
+    async fn off_does_not_consult_the_feed_at_all() {
+        let (feed, standings, posture, registry) = standing_registry(StrikesEnforcement::Off);
+        let node = iroh::SecretKey::from_bytes(&[57; 32]).public();
+        let session = registry
+            .activate(
+                node,
+                GatewayAuthorization::Valid(standing_claims(57, SessionStanding::Good, 1_000)),
+                b"good",
+                None,
+                0,
+                0,
+            )
+            .await
+            .expect("valid peer is admitted");
+
+        feed.publish(standing_assertion(57, SessionStanding::Quarantined, 2_000));
+        assert!(registry.apply_standing_updates(2_500).await.is_empty());
+        assert_eq!(standings.observed(), 0);
+        assert_eq!(standings.applied(), 0);
+        assert_eq!(session.intent_context().standing, SessionStanding::Good);
+
+        posture.set(StrikesEnforcement::Live);
+        registry.apply_standing_updates(3_000).await;
+        assert_eq!(
+            session.intent_context().standing,
+            SessionStanding::Quarantined
+        );
+    }
+
+    /// A token identity signed *after* the assertion stands on its own merits,
+    /// and one admitted on docs/09 §8's grace does not.
+    ///
+    /// Both arms in one test because they are the same comparison read in two
+    /// directions, and getting the second one wrong is how a reconnect during
+    /// an identity outage would silently launder an applied quarantine away.
+    #[tokio::test]
+    async fn a_token_newer_than_the_assertion_wins_and_a_graced_one_loses() {
+        let (feed, _standings, _posture, registry) = standing_registry(StrikesEnforcement::Live);
+        let node = iroh::SecretKey::from_bytes(&[55; 32]).public();
+        feed.publish(standing_assertion(55, SessionStanding::Quarantined, 2_000));
+
+        // Identity answered for this account again at 3_000, after the strike,
+        // and signed `Good`: the appeal was upheld, or the score decayed.
+        let session = registry
+            .activate(
+                node,
+                GatewayAuthorization::Valid(standing_claims(55, SessionStanding::Good, 3_000)),
+                b"fresh",
+                None,
+                0,
+                0,
+            )
+            .await
+            .expect("valid peer is admitted");
+        assert_eq!(session.intent_context().standing, SessionStanding::Good);
+        registry.apply_standing_updates(3_500).await;
+        assert_eq!(session.intent_context().standing, SessionStanding::Good);
+
+        // A session on a token signed *before* the assertion is moved, and a
+        // grace re-handshake on that same stale token does not undo it.
+        let stale_node = iroh::SecretKey::from_bytes(&[56; 32]).public();
+        feed.publish(standing_assertion(56, SessionStanding::Quarantined, 2_000));
+        let claims = standing_claims(56, SessionStanding::Good, 1_000);
+        let stale = registry
+            .activate(
+                stale_node,
+                GatewayAuthorization::Valid(claims.clone()),
+                b"stale",
+                None,
+                0,
+                0,
+            )
+            .await
+            .expect("valid peer is admitted");
+        registry.apply_standing_updates(3_500).await;
+        assert_eq!(
+            stale.intent_context().standing,
+            SessionStanding::Quarantined
+        );
+        let regraced = registry
+            .activate(
+                stale_node,
+                GatewayAuthorization::Expired(claims),
+                b"stale",
+                Some(stale.generation),
+                0,
+                0,
+            )
+            .await
+            .expect("an established identity is graced");
+        assert_eq!(
+            regraced.intent_context().standing,
+            SessionStanding::Quarantined,
+            "a grace reconnect on a stale token must not launder an applied quarantine"
+        );
     }
 
     #[test]

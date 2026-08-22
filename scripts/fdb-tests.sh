@@ -191,7 +191,23 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # pin, and shadow admitting while counting. None needs the cluster, but they
 # run in the same invocation over `--features orrery_persistd/fdb` and count
 # the same. The floor rises by all four: 481 -> 485.
-FLOOR="${ORRERY_FDB_TEST_FLOOR:-485}"
+#
+# Standing propagation to open sessions (issue #216, D33 clause (e)) adds six
+# more, in `orrery_persistd`'s *library* target rather than a `tests/` one —
+# they drive `PeerRegistry` directly through a queue-backed standing feed, so
+# none of them needs the cluster either. They run in the same invocation and
+# count the same, which is the whole reason this floor tracks executed tests
+# rather than fdb-gated ones. A full run measured 720 executed tests on
+# 2026-08-22. The floor rises by those six: 485 -> 491.
+#
+# Note for whoever raises it next, because it has now bitten twice (#273): the
+# healthy fixture below is the coupled half. It emits 120 library tests plus
+# `per_target` for each of the nine required targets, and a floor that walks up
+# past that product turns the *healthy* case red — reported as "a real run
+# passes should have passed", which names neither the floor nor the fixture.
+# Raise the per-target count in the same commit, and leave real headroom rather
+# than the minimum that passes today.
+FLOOR="${ORRERY_FDB_TEST_FLOOR:-491}"
 
 # Every test file whose contents only mean anything against a real cluster. If
 # one of these reports no executed tests, the tier is dark again whatever the
@@ -329,11 +345,12 @@ self_test() {
     fi
   }
 
-  # 9 targets × 40 + 120 unit tests = 480, over the 455 floor. The per-target
+  # 9 targets × 60 + 120 unit tests = 660, over the 491 floor. The per-target
   # count moves with the floor: this fixture has to stay comfortably above it
   # or the healthy case starts failing for the reason the thin case is
-  # supposed to.
-  fixture="$tmp/good.log";    emit_log "$fixture" none 48;            expect "a real run passes" pass "$fixture"
+  # supposed to. 48 was the minimum that cleared 481 and it fell short the very
+  # next time the floor moved; 60 buys 170 tests of headroom instead of one.
+  fixture="$tmp/good.log";    emit_log "$fixture" none 60;            expect "a real run passes" pass "$fixture"
   # The same log with `CARGO_TERM_COLOR=always` escapes through it.
   sed -e 's/^     Running/     \x1b[1;32mRunning\x1b[0m/' \
       -e 's/result: ok\./result: \x1b[32mok\x1b[0m./' "$tmp/good.log" > "$tmp/colour.log"
@@ -341,9 +358,10 @@ self_test() {
 
   fixture="$tmp/skipped.log"; emit_log "$fixture" skip 32;            expect "a skipped run is red" fail "$fixture"
   fixture="$tmp/thin.log";    emit_log "$fixture" none 1;             expect "a run under the floor is red" fail "$fixture"
-  # 45 apiece so the eight remaining targets still clear the floor: this case has
-  # to fail because fence_split is missing, not because the total is thin.
-  fixture="$tmp/absent.log";  emit_log "$fixture" none 45 fence_split; expect "a missing fdb target is red" fail "$fixture"
+  # 60 apiece so the eight remaining targets still clear the floor — 8 × 60 +
+  # 120 = 600 against 491: this case has to fail because fence_split is
+  # missing, not because the total is thin.
+  fixture="$tmp/absent.log";  emit_log "$fixture" none 60 fence_split; expect "a missing fdb target is red" fail "$fixture"
   # A target that ran and asserted nothing. `check_log` has always refused this
   # — "a target that is present with a zero count is as dark as one that never
   # ran" — and until now no fixture exercised the clause: measured 2026-08-17,

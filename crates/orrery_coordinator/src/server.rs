@@ -35,9 +35,10 @@ use tracing::{debug, info, warn};
 
 use orrery_protocol::channels::{decode_stream_frame, encode_stream_frame, untag, Channel};
 use orrery_protocol::{
-    AccountId, AccountInvalidation, CellId, CoordMsg, FixedTokenClock, GridId, IssuerKey, NodeId,
-    SessionTokenClaimsV1, SessionTokenV1, SessionTokenVerificationError, SessionTokenVerifier,
-    TokenClock, UnixMillis, COORD_ALPN, COORD_PROTOCOL_VERSION, MAX_PRESENCE_CELLS,
+    AccountId, AccountInvalidation, AccountStandings, CellId, CoordMsg, FixedTokenClock, GridId,
+    IssuerKey, NodeId, SessionTokenClaimsV1, SessionTokenV1, SessionTokenVerificationError,
+    SessionTokenVerifier, TokenClock, UnixMillis, COORD_ALPN, COORD_PROTOCOL_VERSION,
+    MAX_PRESENCE_CELLS,
 };
 
 use crate::interest::InterestIssuer;
@@ -436,7 +437,26 @@ pub struct ServerConfig {
     /// Runtime lever for control C5 on this coordinator (`ramp/strikes`'s
     /// consumption half). Defaults to [`StrikesMode::Off`], preserving landed
     /// behaviour exactly.
+    ///
+    /// It governs [`standing_updates`](Self::standing_updates) too. One
+    /// control, one lever: quarantine propagation and cooldown/ban termination
+    /// are both C5, so a clause (f) auto-suspend that demoted only one of them
+    /// would not have demoted C5.
     pub strikes_posture: StrikesPosture,
+    /// Identity's standing assertions for accounts whose sessions are already
+    /// open (D33 clause (e), the **quarantine** half).
+    ///
+    /// The sibling of [`standing_feed`](Self::standing_feed), not a
+    /// replacement: that one carries cooldown/ban invalidations and ends
+    /// sessions, this one carries a standing value and moves a live session in
+    /// place. D28 clause (e) reads a session's standing for witness
+    /// eligibility, so this is the seam that stops a stale standing seating a
+    /// quarantined account on a set that judges intents.
+    ///
+    /// **The default is inert**, and with C5 at `Off` not even the poll
+    /// happens, so a deployment configuring neither behaves exactly as it did
+    /// before this field existed.
+    pub standing_updates: Arc<AccountStandings>,
 }
 
 impl ServerConfig {
@@ -458,6 +478,7 @@ impl ServerConfig {
             identity_health: Arc::new(AvailableIdentityHealth),
             standing_feed: None,
             strikes_posture: StrikesPosture::default(),
+            standing_updates: Arc::new(AccountStandings::inert()),
         }
     }
 }
@@ -692,6 +713,9 @@ struct Shared {
     /// C5's consumption half: identity's invalidation set, its posture, and
     /// the change signal open sessions wait on (D33 clause (e)).
     standing: Arc<StandingState>,
+    /// C5's *other* consumption half: identity's standing assertions, drained
+    /// on the same 1 s tick. Terminating half above, in-place half here.
+    standing_updates: Arc<AccountStandings>,
     presence_reports: AtomicU64,
     grants_issued: AtomicU64,
     manifests_pushed: AtomicU64,
@@ -929,6 +953,7 @@ impl CoordinatorServer {
             established: tokio::sync::Mutex::new(EstablishedPeers::default()),
             identity_health: config.identity_health,
             standing: Arc::clone(&standing),
+            standing_updates: config.standing_updates,
             presence_reports: AtomicU64::new(0),
             grants_issued: AtomicU64::new(0),
             manifests_pushed: AtomicU64::new(0),
@@ -1032,6 +1057,26 @@ async fn accept_loop(
             // than through this walk.
             _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {
                 shared.standing.sweep().await;
+                // The quarantine half rides the same tick, because it is the
+                // same control and the same publisher cadence. Unlike the
+                // termination half above it cannot be delivered through the
+                // per-session watch: what changes is a *fact this process
+                // holds about* the session — the standing D28 clause (e) reads
+                // when it draws a witness set — not something the peer must be
+                // told. So this one does walk the seeder's table, under the
+                // lock the handshake path already takes for a moment.
+                for (node, standing) in shared
+                    .seeder
+                    .lock()
+                    .await
+                    .apply_standing_updates(&shared.standing_updates, shared.standing.posture.get())
+                {
+                    debug!(
+                        %node,
+                        ?standing,
+                        "coordinator: identity moved an open session's standing"
+                    );
+                }
             }
             incoming = endpoint.accept() => {
                 let Some(incoming) = incoming else { break };
@@ -1237,6 +1282,7 @@ async fn handle_connection(
                             remote,
                             claims.account,
                             claims.standing,
+                            claims.issued_at_ms,
                             now_ms,
                         );
                     } else {
@@ -1244,6 +1290,7 @@ async fn handle_connection(
                             remote,
                             claims.account,
                             claims.standing,
+                            claims.issued_at_ms,
                             now_ms,
                         );
                         // Only a token identity itself vouched for right now
