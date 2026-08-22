@@ -136,6 +136,24 @@ run_in() {
 
 run() { run_in . "$@"; }
 
+# Run one named test behind a wall-clock bound. `timeout` exits 124 when the
+# command reaches the bound; translating that otherwise anonymous status here
+# is what makes the CI failure identify the test instead of leaving the job's
+# outer timeout to kill an undifferentiated `cargo test` process.
+run_bounded_test() {
+    local bound="$1" test_name="$2"; shift 2
+    printf '%s: [%s] (root) $ timeout --kill-after=5s %s %s\n' \
+        "$NAME" "$LANE" "$bound" "$*" >&2
+    (( DRY_RUN )) && return 0
+
+    local status=0
+    (cd "$ROOT" && timeout --kill-after=5s "$bound" "$@") || status=$?
+    if (( status == 124 )); then
+        note "test timed out after $bound: $test_name"
+    fi
+    return "$status"
+}
+
 # `CARGO_TARGET_DIR` is deliberately never exported unconditionally, and the two
 # hazards are both real rather than theoretical.
 #
@@ -395,10 +413,21 @@ lane_gates() {
 # do not compile under this workspace's feature unification.
 lane_test() {
     lane_target_dir
+    local torn_tail_test='journal::raw::tests::a_torn_final_frame_recovers_the_last_intact_record'
     run cargo test --workspace \
         --exclude bevy_replicon \
         --exclude aeronet_iroh \
-        --exclude aeronet_tokio_runtime
+        --exclude aeronet_tokio_runtime \
+        -- --skip "$torn_tail_test"
+
+    # This proptest normally completes with the rest of persistd's library
+    # tests in under three seconds, but it was the sole test still running in
+    # both 30-minute workspace-test cancellations (#290). Keep the job timeout
+    # as an outer backstop and give this known unbounded wait a local failure
+    # that names it. Sixty seconds is more than 20x the two successful reruns'
+    # complete persistd-library times (2.32 s and 2.89 s).
+    run_bounded_test 60s "$torn_tail_test" \
+        cargo test -p orrery_persistd --lib "$torn_tail_test" -- --exact --nocapture
 
     # The workspace test above is D19's default indexed raw journal. Exercise
     # the retained Fjall implementation's unit tests as well; clippy compiles
@@ -556,6 +585,19 @@ self_test() {
     grep -Fq 'journal-fjall,chain-grpc' <(sed -n '/^lane_test() {/,/^}/p' "$0") \
         || die 'self-test: the test lane no longer exercises D19 journal-fjall fallback'
     note 'self-test: both D19 journal backends are covered by clippy and tests'
+
+    # Functional, not structural: exercise the guarded stage with a command
+    # that cannot finish inside the bound, then require both timeout's status
+    # and the diagnostic a cancelled job was missing. If `timeout` is removed
+    # from run_bounded_test, the sleep succeeds and this clause fails.
+    local bound_output bound_status=0 mutation_name='self-test-deliberate-timeout'
+    bound_output="$(run_bounded_test 0.01s "$mutation_name" sleep 1 2>&1)" \
+        || bound_status=$?
+    (( bound_status == 124 )) \
+        || die "self-test: bounded-test guard returned $bound_status, expected timeout status 124"
+    grep -Fq "test timed out after 0.01s: $mutation_name" <<<"$bound_output" \
+        || die 'self-test: bounded-test guard did not name the timed-out test'
+    note 'self-test: bounded-test guard fires with timeout status 124 and names the test'
 
     # ── Coverage: every --self-test in scripts/ is invoked by a lane ──────────
     #
