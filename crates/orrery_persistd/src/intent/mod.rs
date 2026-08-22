@@ -92,10 +92,13 @@ pub enum IntentVerdict {
     /// is what makes manufacturing low population self-defeating (D29
     /// clause 3).
     ///
-    /// Reached **only** when the announced witness set cannot supply `N`
-    /// eligible members, or this gateway cannot resolve the cell-epoch the
-    /// intent names at all (D27 clause (e)). An intent that could have been
-    /// attested and simply was not is [`Self::Reject`], never this.
+    /// Reached **only** when the announced witness set resolves but cannot
+    /// supply `N` eligible members — D29's `low_pop(i)`
+    /// ([`RejectionCause::LowPopulationEpoch`]). An unresolvable or expired
+    /// cell-epoch refuses instead ([`RejectionCause::UnknownEpoch`],
+    /// [`RejectionCause::EpochStale`] — D37's correction of D27 clause (e)),
+    /// and so does an intent that could have been attested and simply was
+    /// not ([`Self::Reject`], never this).
     AdmitProvisional(IntentPrecheck),
     /// Reject the intent; `reason` maps onto
     /// `IntentOutcome::Rejected { reason }` (persist.rs's never-before-
@@ -448,13 +451,18 @@ pub enum RejectionCause {
     /// undefined, `required(I)` is undefined, and there is no honest set to
     /// judge the attestations against.
     ///
-    /// **The record's answer here is a provisional commit, not a refusal**
-    /// (D27 clause (e): "in all three cases the failure mode is *provisional
-    /// commit*, never *refusal* and never *silent full admission*"). D29's
-    /// provisional path is #150's and is not built, so this enforcement
-    /// refuses instead — which is the strictly safer of the two directions and
-    /// is why the enforcement switch exists. When #150 lands, this cause is
-    /// where the provisional branch attaches.
+    /// **This cause refuses; it never reaches D29's provisional path.** D27
+    /// clause (e) originally answered "in all three cases the failure mode is
+    /// *provisional commit*, never *refusal*", and
+    /// [D37](../../../../docs/adr/0037-unavailable-witness-epoch.md) corrects
+    /// exactly these two cases by erratum: absence of the announcement is
+    /// submitter-selectable — a peer holding one produces this refusal merely
+    /// by withholding it — so a branch reachable at zero cost by the party
+    /// being checked must not admit, or required scrutiny falls from K
+    /// co-signatures to zero before a durable write. The cure is presentation,
+    /// not quarantine: present the named announcement and retry (D37 clause
+    /// (c)). Only [`Self::LowPopulationEpoch`] attaches to the provisional
+    /// branch.
     UnknownEpoch,
     /// The intent names a cell-epoch whose usability window has closed.
     ///
@@ -470,9 +478,12 @@ pub enum RejectionCause {
     ///
     /// D27 clause (d): below `N_floor` (= `WITNESS_SET_FLOOR_N`, 5) **no draw
     /// is made**, because a required subset drawn from four is not the
-    /// hypergeometric draw the collusion arithmetic is computed over. Like
-    /// [`Self::UnknownEpoch`] this is D29's provisional case, refused here
-    /// only because that path is not built.
+    /// hypergeometric draw the collusion arithmetic is computed over. Unlike
+    /// [`Self::UnknownEpoch`] and [`Self::EpochStale`], which refuse since
+    /// D37 corrected D27 clause (e), this is the sole cause that reaches
+    /// D29's quarantined provisional path: the announcement resolved, so
+    /// `low_pop(i)` is a defined, coordinator-signed fact rather than an
+    /// absence — subject to D29 clause 3's `reversible(i)`.
     LowPopulationEpoch,
     /// An attestation names a witness the announcement did not select.
     ///
@@ -508,11 +519,14 @@ pub enum RejectionCause {
     /// answers a `Claim` and D25's fan-out with, and the same predicate D28
     /// clause (d) step 6 already gates *presenting* an announcement on.
     ///
-    /// Deliberately **not** the provisional case: `UnknownEpoch`,
-    /// `EpochStale` and `LowPopulationEpoch` all describe a gateway that
-    /// cannot judge, and D29 answers those with a quarantined commit. This
-    /// one describes a submitter that asked to be judged somewhere it does
-    /// not stand, which is a refusal at every population.
+    /// Deliberately **not** the provisional case: only
+    /// [`Self::LowPopulationEpoch`] describes a gateway that resolved the
+    /// announcement but has nobody to draw from, and D29 answers that one
+    /// with a quarantined commit. [`Self::UnknownEpoch`] and
+    /// [`Self::EpochStale`] refuse outright — D37 corrected the old reading
+    /// that grouped all three. This one describes a submitter that asked to
+    /// be judged somewhere it does not stand, which is a refusal at every
+    /// population.
     NoStandingInCell,
     /// The intent fell to D29's low-population path and is not the kind of
     /// intent a forward-written inverse can undo (D29 clause 3's
@@ -741,15 +755,18 @@ impl RejectionCause {
 ///   policy and is tracked separately from this mechanism.
 /// - **The low-population and provisional paths.** An intent whose cell-epoch
 ///   this gateway cannot resolve, or whose eligible set is below
-///   `WITNESS_SET_FLOOR_N`, is **refused** here. D27 clause (e) says the
-///   answer should be a *provisional commit* instead — "in all three cases
-///   the failure mode is provisional commit, never refusal and never silent
-///   full admission" — and D29 owns that path, which is not built. Refusing
-///   is the strictly safer of the two directions and is the reason the
-///   enforcement switch defaults off; the causes those cases raise
-///   ([`RejectionCause::UnknownEpoch`], [`RejectionCause::EpochStale`],
-///   [`RejectionCause::LowPopulationEpoch`]) are where the provisional branch
-///   attaches when it lands.
+///   `WITNESS_SET_FLOOR_N`, is not admitted by these envelope checks; the
+///   disposition is D29's total admission function in [`Self::check_at`]. An
+///   unavailable announcement **refuses**
+///   ([`RejectionCause::UnknownEpoch`], [`RejectionCause::EpochStale`]):
+///   D37 corrects D27 clause (e)'s "in all three cases the failure mode is
+///   provisional commit, never refusal", because absence of the announcement
+///   is submitter-selectable and no branch reachable by withholding input may
+///   admit — the cure is presenting it and retrying. Only a *resolved*
+///   announcement with too few eligible witnesses
+///   ([`RejectionCause::LowPopulationEpoch`]) reaches D29's quarantined
+///   provisional commit, subject to `reversible(i)`; that path is built, and
+///   that cause alone attaches to it.
 /// - **Account-level party exclusion, when no resolver is configured.** D10
 ///   item 4 excludes parties "matched on **accounts and every NodeId bound to
 ///   them**", and check 5's account half needs an
@@ -1258,11 +1275,15 @@ fn party_accounts(intent: &Intent, issuer_account: Option<AccountId>) -> Vec<Acc
 ///
 /// `|E(I)|` shrinks, and below [`orrery_protocol::WITNESS_SET_FLOOR_N`] that
 /// is [`RejectionCause::LowPopulationEpoch`] — which is **D29's quarantined
-/// provisional commit, not a refusal**. Fail-closed here means "demote to the
-/// path that already exists for a gateway that cannot judge", the same
-/// direction D27 clause (e) chose for `UnknownEpoch` and `EpochStale`. An
-/// honest intent whose announced set this gateway cannot fully resolve is
-/// committed provisionally and finalized by replay; it is not lost.
+/// provisional commit, not a refusal**. Fail-closed here means "exclude the
+/// miss and let the population predicate speak": the announcement itself
+/// resolved, so `low_pop(i)` is defined, and
+/// [D37](../../../../docs/adr/0037-unavailable-witness-epoch.md) leaves this
+/// demotion untouched while correcting D27 clause (e)'s old direction for
+/// `UnknownEpoch` and `EpochStale` — those refuse, because there no
+/// announcement exists to count an eligible vector from. An honest intent
+/// whose witness bindings this gateway cannot fully resolve is committed
+/// provisionally and finalized by replay; it is not lost.
 ///
 /// # Announced order, unsorted and undeduplicated
 ///
@@ -1731,36 +1752,28 @@ impl BaselineIntentValidator {
     /// is the answer to one specific fact about the world, namely that there
     /// was nobody there to sign.
     ///
-    /// # Which causes reach the provisional path, and one divergence worth
-    /// naming
+    /// # Which causes reach the provisional path
     ///
     /// Exactly one: [`RejectionCause::LowPopulationEpoch`], which is
     /// `|elig(i)| < N` and nothing else.
     ///
-    /// **D27 clause (e) asks for more than that** — it says an intent whose
-    /// cell-epoch this gateway cannot resolve
-    /// ([`RejectionCause::UnknownEpoch`]) or whose epoch has aged out
-    /// ([`RejectionCause::EpochStale`]) should also reach a provisional commit,
-    /// "never refusal and never silent full admission". D29 clause 2, which is
-    /// the later record and the one that actually defines this function, states
-    /// the predicate as `low_pop(i) ⟺ |elig(i)| < N` and makes admission a
-    /// total function with three outcomes whose second line needs `low_pop` to
-    /// be *defined* — and for an unresolvable handle `E(c,e)` does not exist,
-    /// so it is not.
-    ///
-    /// This implements D29's predicate. The divergence is deliberate, it is
-    /// the strictly safer of the two directions (an unresolvable epoch is
-    /// refused rather than committed), and it is recorded here rather than
-    /// silently resolved because closing it properly is a decision, not an
-    /// implementation choice: either D27 clause (e)'s two extra cases get a
-    /// population predicate that is defined without an announcement, or D29
-    /// narrows them the way clause 1 narrowed the field-host fallback.
+    /// [`RejectionCause::UnknownEpoch`] and [`RejectionCause::EpochStale`]
+    /// refuse. What this function once documented as a deliberate divergence
+    /// from D27 clause (e)'s "in all three cases ... provisional commit,
+    /// never refusal" is no longer a divergence:
+    /// [D37](../../../../docs/adr/0037-unavailable-witness-epoch.md) resolved
+    /// the contradiction by erratum and corrected D27 clause (e)'s two
+    /// unavailable-input cases to refusals with a bounded cure. The reasoning
+    /// this function already followed is now the accepted position: D29
+    /// clause 2's second line needs `low_pop(i)` to be *defined*, and for an
+    /// unresolvable or expired handle `E(c,e)` does not exist — so it is not.
+    /// Absence of the announcement is submitter-selectable, which is why no
+    /// branch reachable by withholding it may admit.
     ///
     /// [`RejectionCause::NoStandingInCell`] is emphatically **not** on this
-    /// path, and D30 says why in as many words: the other causes describe a
-    /// gateway that cannot judge, and this one describes a submitter that asked
-    /// to be judged somewhere it does not stand — a refusal at every
-    /// population.
+    /// path either, and D30 says why in as many words: it describes a
+    /// submitter that asked to be judged somewhere it does not stand — a
+    /// refusal at every population.
     ///
     /// # Errors
     ///
