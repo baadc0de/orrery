@@ -151,7 +151,7 @@ CIs in one week came from that blind spot. The inventory, which is also
 
 | Workspace | Role in the lanes |
 |---|---|
-| `.` (root, 14 first-party crates + 3 vendored) | `clippy` and `test` lanes; `fmt` like any other. 1820 tests |
+| `.` (root, 15 first-party crates + 3 vendored) | `clippy` and `test` lanes; `fmt` like any other. 1820 tests |
 | `p1-swarm` | `cargo test` in `gates` — 43 tests |
 | `p2-load` | `cargo test` in `gates` — 28 tests |
 | `p2-dashboard` | `cargo test` in `gates` — 9 tests |
@@ -239,7 +239,7 @@ mechanism. That is backwards, and adopting the table wholesale is still its own
 piece of work.
 
 But do not read it as "no lint levels apply to `crates/*`", because one of them
-does and it bites. All fourteen first-party crates set
+does and it bites. All fifteen first-party crates set
 `#![warn(missing_docs)]` in their own `lib.rs`, and CI runs `clippy --workspace
 --all-targets --no-deps -- -D warnings`, which promotes that warning to an
 error. **An undocumented

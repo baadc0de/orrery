@@ -1,0 +1,45 @@
+[package]
+name = "orrery_identity"
+version = "0.1.0"
+edition = "2021"
+description = "Orrery identity service: account store, NodeId binding, session-token issuance, refresh, and issuer-key rotation (D12, D31)"
+license = "MIT OR Apache-2.0"
+
+# Bevy-free service crate (D15), the first row of D12's service table. It owns
+# the write half of the `id/` subspace D31 specifies and the issuing half of the
+# session token `orrery_protocol::identity` already verifies.
+#
+# A root workspace member, deliberately: the eight-workspace table in AGENTS.md
+# and `scripts/check.sh --self-test` police standalone `[workspace]` tables, and
+# a ninth workspace fails that gate by design.
+[features]
+default = []
+# FoundationDB-backed account store over D31's `d` family. Links the C client
+# (`libfdb_c`); the default build needs none, which is the same posture
+# `orrery_persistd` and `orrery_seed` keep. Tests that need a live cluster are
+# compiled here and self-skip when no cluster is reachable.
+fdb = ["dep:foundationdb", "orrery_persistd/fdb"]
+
+[dependencies]
+orrery_protocol = { path = "../orrery_protocol" }
+# For `keyspace`: #209 landed D31's `da`/`db`/`dh` key builders and row types in
+# persistd, and for `gateway::BindingAuthority`, the seam this crate's store
+# answers. Same direction and the same reason `orrery_seed` depends on it —
+# persistd owns the keyspace module, and a second copy of those bytes is the one
+# thing D31 clause (b) cannot survive.
+orrery_persistd = { path = "../orrery_persistd" }
+# The issuer's Ed25519 signing key. `SessionTokenV1::sign` takes an
+# `iroh_base::SecretKey`; nothing else in iroh is needed here.
+iroh-base = { workspace = true }
+postcard = { workspace = true }
+serde = { workspace = true }
+async-trait = "0.1"
+futures = { workspace = true }
+tracing = { workspace = true }
+# FoundationDB 7.3.x (D11, D14). Optional: only built with `--features fdb`.
+foundationdb = { version = "0.11", default-features = false, features = [
+    "fdb-7_3",
+], optional = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

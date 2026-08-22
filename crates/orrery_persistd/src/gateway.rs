@@ -903,9 +903,12 @@ impl InterestAuthority for SnapshotInterestAuthority {
 ///
 /// # Which tiers exist in this tree
 ///
-/// None of them yet. `orrery_identity` is the sole writer of the `d` rows
-/// (D31 clause (d)) and is not built, so [`UnboundBindingAuthority`] — which
-/// resolves nothing — is the honest default, in the same way
+/// None of them yet, and the reason is now deployment rather than absence.
+/// `orrery_identity` is the sole writer of the `d` rows (D31 clause (d)) and
+/// the crate exists (issue #210) — it implements tier 2's shape on its
+/// in-memory store and owns the durable rows tier 3 would read — but nothing
+/// in this cluster runs that service or wires it here. So
+/// [`UnboundBindingAuthority`] remains the honest default, in the same way
 /// [`DenyAllInterestAuthority`] was the honest default before coordinator
 /// grants arrived. This trait is where the tiers attach when they land.
 pub trait BindingAuthority: Send + Sync {

@@ -7,9 +7,10 @@
 #
 # ── Why this exists ──────────────────────────────────────────────────────────
 #
-# `orrery_persistd` and `orrery_seed` carry a whole tier of tests that only
-# compile under `--features fdb` — checkpoint write and restore, the
-# `actor/{shard}` fence CAS, the lease CAS, intent commit, seed apply. Every one
+# `orrery_persistd`, `orrery_seed` and `orrery_identity` carry a whole tier of
+# tests that only compile under `--features fdb` — checkpoint write and restore,
+# the `actor/{shard}` fence CAS, the lease CAS, intent commit, seed apply, and
+# the `id/` subspace's one-transaction bind. Every one
 # of them opens with a guard that looks for a cluster and, not finding one,
 # `eprintln!("skipping: ...")` and returns `Ok`.
 #
@@ -115,7 +116,19 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # miss semantics, the honest-witness regression guard and announced-order
 # preservation — and need no cluster, but run in the same invocation and count
 # the same. The floor rises by all seven: 412 -> 419.
-FLOOR="${ORRERY_FDB_TEST_FLOOR:-419}"
+#
+# The `orrery_identity` crate (issue #210, D12/D31) adds eighteen and joins the
+# invocation as a third package. Five need the cluster and live in the library
+# target: they are what makes D31 clause (b) — `db` written in the same
+# transaction as `da`, so the two are never observed disagreeing — a proof
+# rather than a comment. The load-bearing one aborts a bind after staging all
+# three rows and asserts that *none* of them landed, which is the observable
+# form of the window a two-transaction writer would open, and there is no such
+# transaction without a cluster. The other thirteen are the `issuance` target's
+# in-memory mint/refresh/rotation round-trips against the protocol verifier;
+# they need no cluster but run in the same invocation and count the same. The
+# floor rises by all eighteen: 419 -> 437.
+FLOOR="${ORRERY_FDB_TEST_FLOOR:-437}"
 
 # Every test file whose contents only mean anything against a real cluster. If
 # one of these reports no executed tests, the tier is dark again whatever the
@@ -323,8 +336,8 @@ set +e
   cd "$ROOT"
   # The workflows force colour on; a log that has to be parsed does not want it.
   CARGO_TERM_COLOR=never \
-  cargo test -p orrery_persistd -p orrery_seed \
-    --features orrery_persistd/fdb,orrery_seed/fdb \
+  cargo test -p orrery_persistd -p orrery_seed -p orrery_identity \
+    --features orrery_persistd/fdb,orrery_seed/fdb,orrery_identity/fdb \
     -- --nocapture
 ) 2>&1 | tee "$LOG"
 status="${PIPESTATUS[0]}"

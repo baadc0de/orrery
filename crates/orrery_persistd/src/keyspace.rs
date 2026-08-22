@@ -1044,12 +1044,15 @@ pub fn player_loc_key(account: AccountId) -> [u8; 10] {
 // time" — a cross-check, and one whose disagreements mean nothing inside the
 // reader's cache staleness bound.
 //
-// **Nothing writes these rows yet.** There is no `orrery_identity` crate; D31
-// decides bytes, directions and semantics and defers the writer. Until one
-// exists the subspace is empty, every binding lookup misses, and D31 (f)'s
-// fail-closed rule excludes every announced NodeId a gateway is not directly
-// connected to — a real behaviour change on an empty subspace, and the reason
-// the enforcement switch defaulting off matters more after this than before it.
+// **The writer is `orrery_identity` (issue #210), and it is now in the tree.**
+// D31 decided bytes, directions and semantics and deferred the writer; the
+// crate implements it, and every mutation there stages `da`, `db` and `dh` in
+// one transaction as clause (b) requires. What has *not* changed is the
+// deployment posture: nothing in this cluster runs that service yet, so the
+// subspace a live gateway reads is still empty, every binding lookup still
+// misses, and D31 (f)'s fail-closed rule still excludes every announced NodeId
+// a gateway is not directly connected to — which remains the reason the
+// enforcement switch defaulting off matters.
 
 /// Maximum NodeIds bound to one account (D31 (g), proposed as a D16 row).
 ///

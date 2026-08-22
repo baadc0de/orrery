@@ -7591,6 +7591,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "orrery_identity"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "foundationdb",
+ "futures",
+ "iroh-base",
+ "orrery_persistd",
+ "orrery_protocol",
+ "postcard",
+ "serde",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "orrery_net"
 version = "0.1.0"
 dependencies = [
