@@ -153,7 +153,7 @@ CIs in one week came from that blind spot. The inventory, which is also
 | `p0-dashboard` | `cargo check --all-targets` — no tests |
 | `p3-island` | `cargo test` in `gates`; asserted by the nightly island gate |
 | `p3-siblings` | `cargo test` in `gates`; the two-gateway harness, asserted by the nightly sibling gate. The only tool that links `libfdb_c` besides `p2-load`: its double-spend race leg reads the ledger back out of FoundationDB |
-| `p5-dupe-gauntlet` | `cargo check --all-targets` — no tests; the single-gateway replay, attestation-abuse and quarantine proof, asserted by the nightly P5 gate against FoundationDB |
+| `p5-dupe-gauntlet` | `cargo check --all-targets` — no tests; the single-gateway replay, attestation-abuse and quarantine proof, asserted by the nightly P5 gate against FoundationDB. Its `ramp` subcommand carries D32's enforcement-ramp arms too, asserted by the nightly `ramp-shadow` gate, which runs a shadow and an enforcing gateway from this one binary at the same time |
 | `p2-journal-bench` | `cargo check --all-targets` — no tests |
 
 The six tool test suites, and the four tools checked without tests, are the work
@@ -293,7 +293,7 @@ Actions. Do not administer runner services there; the `actions.runner.*` units
 are gone.
 
 The jobs that need a FoundationDB *server* — `p2-kill9`, `p3-siblings`,
-`p5-dupe-gauntlet` and `fdb-tests`, all in `nightly.yml` — provision one per
+`p5-dupe-gauntlet`, `ramp-shadow` and `fdb-tests`, all in `nightly.yml` — provision one per
 run through the composite action
 [`.github/actions/foundationdb`](.github/actions/foundationdb/action.yml) with
 `server: "true"`, points `ORRERY_FDB_CLUSTER_FILE` at the package-configured
