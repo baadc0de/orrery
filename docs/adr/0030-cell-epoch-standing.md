@@ -200,7 +200,7 @@ or not.
 > `UnknownEpoch` and `EpochStale` also refuse and no longer belong on the
 > provisional side of this comparison. `LowPopulationEpoch` remains D29's
 > provisional case. `NoStandingInCell` and this clause's ordering are
-> unchanged. This is a consequence of D37's proposed erratum, not an erratum
+> unchanged. This is a consequence of D37's erratum, not an erratum
 > to D30.
 
 The wire collapse is #182's argument unchanged: the reason space below

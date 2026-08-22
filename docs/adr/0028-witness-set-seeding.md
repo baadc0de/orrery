@@ -497,7 +497,7 @@ Three consequences, each answering one of the questions turnover raises:
   somebody forged something. Conflating them would put honest netsplit
   survivors in the same bucket as attackers.
 
-  > *Proposed erratum (2026-08-22,
+  > *Erratum (2026-08-22,
   > [ADR-0037](0037-unavailable-witness-epoch.md)):* the parenthetical
   > provisional alternative contradicts D29 clause 2, accepted in the same
   > commit as this record. D37 proposes refusal and re-collection under the
