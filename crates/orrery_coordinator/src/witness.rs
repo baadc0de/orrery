@@ -33,11 +33,12 @@ use orrery_protocol::coord::{
     WitnessEpochV1, MAX_EPOCH_CANDIDATES, WITNESS_EPOCH_KEY_V1_DOMAIN, WITNESS_SET_FLOOR_N,
 };
 use orrery_protocol::{
-    witness_epoch_binding, AccountId, CellId, GridId, IssuerKey, IssuerKeyId, NodeId,
-    SessionStanding,
+    witness_epoch_binding, AccountId, AccountStandings, CellId, GridId, IssuerKey, IssuerKeyId,
+    NodeId, SessionStanding, UnixMillis,
 };
 
 use crate::registry::IslandRegistry;
+use crate::StrikesMode;
 
 /// The coordinator's witness-epoch signing key, master secret and incarnation.
 ///
@@ -183,6 +184,15 @@ impl Default for WitnessSeedConfig {
 struct SessionFacts {
     account: AccountId,
     standing: SessionStanding,
+    /// The `issued_at_ms` the session's token was signed with.
+    ///
+    /// Retained for exactly one purpose: it is the left-hand side of the
+    /// watermark comparison in
+    /// [`AccountStandings::pending`](orrery_protocol::AccountStandings::pending),
+    /// so a session that re-handshook with a token identity signed *after* an
+    /// assertion is not walked backwards by it. Without it a reconnect during
+    /// a lifted quarantine would be re-quarantined by a stale assertion.
+    issued_at_ms: UnixMillis,
     joined_ms: u64,
     /// Set when the session was admitted on docs/09 §8's token grace, so its
     /// `standing` is only as fresh as an expired token. Such a peer plays;
@@ -292,11 +302,13 @@ impl WitnessSeeder {
         node: NodeId,
         account: AccountId,
         standing: SessionStanding,
+        issued_at_ms: UnixMillis,
         now_ms: u64,
     ) {
         self.sessions.entry(node).or_insert(SessionFacts {
             account,
             standing,
+            issued_at_ms,
             joined_ms: now_ms,
             graced: false,
         });
@@ -322,14 +334,75 @@ impl WitnessSeeder {
         node: NodeId,
         account: AccountId,
         standing: SessionStanding,
+        issued_at_ms: UnixMillis,
         now_ms: u64,
     ) {
         self.sessions.entry(node).or_insert(SessionFacts {
             account,
             standing,
+            issued_at_ms,
             joined_ms: now_ms,
             graced: true,
         });
+    }
+
+    /// Drain identity's standing assertions and move the sessions they name,
+    /// leaving everything else about those sessions alone (D33 clause (e)).
+    ///
+    /// Returns the sessions moved, for the caller's log. Both directions are
+    /// this one call, because the watermark rule in
+    /// [`AccountStandings::pending`](orrery_protocol::AccountStandings::pending)
+    /// is direction-free: a quarantine applied drops the account out of the
+    /// next [`Self::eligible_pool`] without waiting for a `Hello`, and a
+    /// quarantine lifted lets it back in on the same terms as any other peer.
+    ///
+    /// `mode` is control C5's posture — the same cell `StandingState` holds
+    /// for the cooldown/ban half, not a second lever. `Off` consults nothing,
+    /// `Shadow` evaluates fully and counts, `Live` applies.
+    ///
+    /// # Why this is not `note_session` with a different `or_insert`
+    ///
+    /// [`Self::note_session`] inserts and never updates, on purpose: `joined_ms`
+    /// is what "present in the island ≥ 10 s" is measured from, and a peer that
+    /// keeps talking must not keep resetting its own probation. Widening it to
+    /// an upsert would hand a peer a probation reset for free — and a standing
+    /// change is *account*-addressed, arriving from identity rather than from
+    /// the peer, so it is not that call's shape at all. This updates one field
+    /// of an existing row and creates none: an account with no session here is
+    /// simply not this coordinator's problem, and the next `note_session` will
+    /// carry a token identity signed after the change anyway.
+    ///
+    /// `graced` is untouched for the same reason it is set: a session admitted
+    /// on an expired token still does not witness, whatever its standing now
+    /// says.
+    pub fn apply_standing_updates(
+        &mut self,
+        standings: &AccountStandings,
+        mode: StrikesMode,
+    ) -> Vec<(NodeId, SessionStanding)> {
+        // D32 clause (b): "Off observes nothing." Not even the poll — which
+        // costs nothing to honour and means a promotion converges on its first
+        // evaluated tick with the queue intact.
+        if mode == StrikesMode::Off {
+            return Vec::new();
+        }
+        standings.poll();
+        let mut moved = Vec::new();
+        for (node, facts) in &mut self.sessions {
+            let Some(resolved) =
+                standings.pending(facts.account, facts.issued_at_ms, facts.standing)
+            else {
+                continue;
+            };
+            if mode == StrikesMode::Shadow {
+                standings.record_observed();
+                continue;
+            }
+            standings.record_applied();
+            facts.standing = resolved;
+            moved.push((*node, resolved));
+        }
+        moved
     }
 
     /// Drop a peer's session and put its account on cooldown.
@@ -530,6 +603,11 @@ mod tests {
     };
 
     const T0: u64 = 1_000_000;
+    /// The `issued_at_ms` these fixtures' tokens carry. A separate clock from
+    /// [`T0`] on purpose: presence is timed on the coordinator's monotonic
+    /// clock and token issuance on a wall clock, and the standing watermark
+    /// compares against the second one.
+    const TOKEN_ISSUED: UnixMillis = UnixMillis::new(500_000);
 
     fn secret(seed: u8) -> iroh_base::SecretKey {
         let mut bytes = [0u8; 32];
@@ -560,10 +638,230 @@ mod tests {
                 node(index),
                 AccountId::new(u64::from(index)),
                 SessionStanding::Good,
+                TOKEN_ISSUED,
                 T0,
             );
         }
         (registry, seeder)
+    }
+
+    /// A consumer plus its publisher half. The posture is C5's and is passed
+    /// to `apply_standing_updates` per call, not held here — see that method.
+    fn standings() -> (
+        std::sync::Arc<orrery_protocol::QueuedStandingUpdates>,
+        AccountStandings,
+    ) {
+        let feed = std::sync::Arc::new(orrery_protocol::QueuedStandingUpdates::new());
+        let consumer =
+            AccountStandings::new(std::sync::Arc::clone(&feed)
+                as std::sync::Arc<dyn orrery_protocol::StandingUpdateFeed>);
+        (feed, consumer)
+    }
+
+    fn standing_update(
+        account: u64,
+        standing: SessionStanding,
+        effective_from_ms: u64,
+    ) -> orrery_protocol::AccountStandingUpdate {
+        orrery_protocol::AccountStandingUpdate {
+            account: AccountId::new(account),
+            standing,
+            effective_from_ms: UnixMillis::new(effective_from_ms),
+        }
+    }
+
+    /// D28 clause (e) reads witness eligibility off a session's standing, so a
+    /// quarantine filed mid-session has to leave the pool without waiting for
+    /// a `Hello` that a peer holding its connection open may never send.
+    #[test]
+    fn a_quarantine_applied_mid_session_leaves_the_eligible_pool() {
+        let (registry, mut seeder) = populated(12);
+        let now = T0 + 20_000;
+        assert!(seeder
+            .eligible_pool(&registry, cell(0), now)
+            .contains(&node(3)));
+
+        let (feed, consumer) = standings();
+        feed.publish(standing_update(
+            3,
+            SessionStanding::Quarantined,
+            TOKEN_ISSUED.0 + 1,
+        ));
+        assert_eq!(
+            seeder.apply_standing_updates(&consumer, StrikesMode::Live),
+            vec![(node(3), SessionStanding::Quarantined)]
+        );
+
+        let pool = seeder.eligible_pool(&registry, cell(0), now);
+        assert!(!pool.contains(&node(3)));
+        assert_eq!(pool.len(), 11, "only the struck account leaves");
+    }
+
+    /// The lift direction, and the reason it is not optional: an account still
+    /// excluded from every draw after its quarantine expired is being punished
+    /// by a cache.
+    #[test]
+    fn a_lifted_quarantine_returns_an_account_to_the_pool() {
+        let mut registry = IslandRegistry::new();
+        let mut seeder = WitnessSeeder::new(GridId::ROOT);
+        registry.report_presence(node(1), vec![cell(0)]);
+        seeder.note_session(
+            node(1),
+            AccountId::new(1),
+            SessionStanding::Quarantined,
+            TOKEN_ISSUED,
+            T0,
+        );
+        let now = T0 + 20_000;
+        assert!(seeder.eligible_pool(&registry, cell(0), now).is_empty());
+
+        let (feed, consumer) = standings();
+        feed.publish(standing_update(
+            1,
+            SessionStanding::Good,
+            TOKEN_ISSUED.0 + 1,
+        ));
+        seeder.apply_standing_updates(&consumer, StrikesMode::Live);
+
+        assert_eq!(seeder.eligible_pool(&registry, cell(0), now), vec![node(1)]);
+    }
+
+    /// `joined_ms` is what "present in the island ≥ 10 s" is measured from, and
+    /// a standing update must not reset it in either direction.
+    ///
+    /// Read through the only observable that depends on it: a peer that has
+    /// been present for `min_presence_ms` stays eligible across an update, and
+    /// would drop straight back out of the pool if the update had restamped
+    /// its arrival. The lift arm is the one that could plausibly have been
+    /// written as a re-`note_session`, which is exactly the mistake.
+    #[test]
+    fn a_standing_update_does_not_reset_joined_ms() {
+        let mut registry = IslandRegistry::new();
+        let mut seeder = WitnessSeeder::new(GridId::ROOT);
+        registry.report_presence(node(1), vec![cell(0)]);
+        seeder.note_session(
+            node(1),
+            AccountId::new(1),
+            SessionStanding::Quarantined,
+            TOKEN_ISSUED,
+            T0,
+        );
+        // Exactly at the presence threshold: one millisecond of reset would
+        // show.
+        let now = T0 + seeder.config.min_presence_ms;
+
+        let (feed, consumer) = standings();
+        feed.publish(standing_update(
+            1,
+            SessionStanding::Good,
+            TOKEN_ISSUED.0 + 1,
+        ));
+        seeder.apply_standing_updates(&consumer, StrikesMode::Live);
+
+        assert_eq!(
+            seeder.eligible_pool(&registry, cell(0), now),
+            vec![node(1)],
+            "the peer's probation must be measured from its arrival, not from the update"
+        );
+    }
+
+    /// A session whose token identity signed *after* the assertion is not
+    /// walked backwards by it — the reconnect case `issued_at_ms` exists for.
+    #[test]
+    fn a_session_on_a_newer_token_is_not_moved_by_an_older_assertion() {
+        let mut registry = IslandRegistry::new();
+        let mut seeder = WitnessSeeder::new(GridId::ROOT);
+        registry.report_presence(node(1), vec![cell(0)]);
+        seeder.note_session(
+            node(1),
+            AccountId::new(1),
+            SessionStanding::Good,
+            UnixMillis::new(TOKEN_ISSUED.0 + 10_000),
+            T0,
+        );
+
+        let (feed, consumer) = standings();
+        feed.publish(standing_update(
+            1,
+            SessionStanding::Quarantined,
+            TOKEN_ISSUED.0 + 1,
+        ));
+        assert!(seeder
+            .apply_standing_updates(&consumer, StrikesMode::Live)
+            .is_empty());
+        assert_eq!(
+            seeder.eligible_pool(&registry, cell(0), T0 + 20_000),
+            vec![node(1)]
+        );
+    }
+
+    /// The ramp's observing position, at the coordinator: the pool is
+    /// unchanged and the counter is not.
+    #[test]
+    fn in_shadow_the_pool_does_not_move_and_the_counter_does() {
+        let (registry, mut seeder) = populated(12);
+        let (feed, consumer) = standings();
+        feed.publish(standing_update(
+            3,
+            SessionStanding::Quarantined,
+            TOKEN_ISSUED.0 + 1,
+        ));
+
+        // Off first: D32 clause (b) says it observes nothing, not even the
+        // poll, so the queue survives to be drained by the next posture.
+        assert!(seeder
+            .apply_standing_updates(&consumer, StrikesMode::Off)
+            .is_empty());
+        assert_eq!(consumer.observed(), 0);
+
+        assert!(seeder
+            .apply_standing_updates(&consumer, StrikesMode::Shadow)
+            .is_empty());
+        assert!(seeder
+            .eligible_pool(&registry, cell(0), T0 + 20_000)
+            .contains(&node(3)));
+        assert_eq!(consumer.observed(), 1);
+        assert_eq!(consumer.applied(), 0);
+
+        // Promotion needs no reconnect: the same session moves next tick, on
+        // the same C5 cell that governs the termination half.
+        assert_eq!(
+            seeder.apply_standing_updates(&consumer, StrikesMode::Live),
+            vec![(node(3), SessionStanding::Quarantined)]
+        );
+        assert!(!seeder
+            .eligible_pool(&registry, cell(0), T0 + 20_000)
+            .contains(&node(3)));
+    }
+
+    /// A graced session does not witness whatever its standing now says, so a
+    /// lift reaching it must not seat it (`note_grace_session`'s reasoning).
+    #[test]
+    fn lifting_a_graced_sessions_quarantine_still_does_not_seat_it() {
+        let mut registry = IslandRegistry::new();
+        let mut seeder = WitnessSeeder::new(GridId::ROOT);
+        registry.report_presence(node(1), vec![cell(0)]);
+        seeder.note_grace_session(
+            node(1),
+            AccountId::new(1),
+            SessionStanding::Quarantined,
+            TOKEN_ISSUED,
+            T0,
+        );
+
+        let (feed, consumer) = standings();
+        feed.publish(standing_update(
+            1,
+            SessionStanding::Good,
+            TOKEN_ISSUED.0 + 1,
+        ));
+        assert_eq!(
+            seeder.apply_standing_updates(&consumer, StrikesMode::Live),
+            vec![(node(1), SessionStanding::Good)]
+        );
+        assert!(seeder
+            .eligible_pool(&registry, cell(0), T0 + 20_000)
+            .is_empty());
     }
 
     fn seeded(outcome: SeedOutcome) -> SeededEpoch {
@@ -759,6 +1057,7 @@ mod tests {
                 node(index),
                 AccountId::new(u64::from(index)),
                 SessionStanding::Good,
+                TOKEN_ISSUED,
                 T0 + 10_000,
             );
         }
@@ -796,6 +1095,7 @@ mod tests {
                 node(index),
                 AccountId::new(u64::from(index)),
                 SessionStanding::Good,
+                TOKEN_ISSUED,
                 T0,
             );
         }
@@ -813,10 +1113,17 @@ mod tests {
                 node(index),
                 AccountId::new(u64::from(index)),
                 SessionStanding::Good,
+                TOKEN_ISSUED,
                 T0,
             );
         }
-        graced.note_grace_session(node(6), AccountId::new(6), SessionStanding::Good, T0);
+        graced.note_grace_session(
+            node(6),
+            AccountId::new(6),
+            SessionStanding::Good,
+            TOKEN_ISSUED,
+            T0,
+        );
 
         let pool = graced.eligible_pool(&registry, cell(0), T0 + 10_000);
         assert_eq!(pool.len(), 5, "the graced session costs its own slot only");
@@ -842,18 +1149,38 @@ mod tests {
                 node(index),
                 AccountId::new(u64::from(index)),
                 SessionStanding::Good,
+                TOKEN_ISSUED,
                 T0,
             );
         }
-        seeder.note_session(node(5), AccountId::new(5), SessionStanding::Quarantined, T0);
+        seeder.note_session(
+            node(5),
+            AccountId::new(5),
+            SessionStanding::Quarantined,
+            TOKEN_ISSUED,
+            T0,
+        );
         seeder.note_session(
             node(6),
             AccountId::new(6),
             SessionStanding::Good,
+            TOKEN_ISSUED,
             T0 + 5_000,
         );
-        seeder.note_session(node(7), AccountId::new(1), SessionStanding::Good, T0);
-        seeder.note_session(node(8), AccountId::new(2), SessionStanding::Good, T0);
+        seeder.note_session(
+            node(7),
+            AccountId::new(1),
+            SessionStanding::Good,
+            TOKEN_ISSUED,
+            T0,
+        );
+        seeder.note_session(
+            node(8),
+            AccountId::new(2),
+            SessionStanding::Good,
+            TOKEN_ISSUED,
+            T0,
+        );
 
         let pool = seeder.eligible_pool(&registry, cell(0), T0 + 10_000);
         assert_eq!(
@@ -909,6 +1236,7 @@ mod tests {
             node(3),
             AccountId::new(3),
             SessionStanding::Good,
+            TOKEN_ISSUED,
             T0 + 11_000,
         );
 
@@ -995,6 +1323,7 @@ mod tests {
                 node(index),
                 AccountId::new(u64::from(index)),
                 SessionStanding::Good,
+                TOKEN_ISSUED,
                 T0,
             );
         }

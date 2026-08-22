@@ -23,6 +23,7 @@ mod identity;
 pub mod metrics;
 mod persist;
 mod protocol;
+pub mod standing;
 mod verifiable;
 
 pub use authority::{
@@ -79,6 +80,9 @@ pub use persist::{
     WITNESS_QUORUM_K,
 };
 pub use protocol::PROTOCOL_VERSION;
+pub use standing::{
+    AccountStandingUpdate, AccountStandings, QueuedStandingUpdates, StandingUpdateFeed,
+};
 pub use verifiable::{
     AttestationRefusalReason, AttestationVerdict, ChainHash, DeviationKind, DiscrepancyReport,
     EntitySlice, EvidenceBundle, EvidenceCommitment, ForgeryProof, FrameHead, InputRecord,
