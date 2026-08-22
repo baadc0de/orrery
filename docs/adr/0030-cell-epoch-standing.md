@@ -5,6 +5,23 @@
 This decision is normative once accepted. See the [ADR index](../DECISIONS.md)
 for precedence, scope, and the complete decision set.
 
+**Amended 2026-08-22, while still Proposed.** A re-examination before
+acceptance left clauses (a)–(e) unchanged and corrected what the tree had
+moved under them: two line citations (`keyspace.rs`'s ledger builders and
+`witness_epoch.rs`'s `resolve`/cache spans, below), and two statements whose
+truth later records changed. Clause (b)'s "`PROTOCOL_VERSION` stays at 1" was
+true when this record landed in code (#197, the day it was written);
+[D29](0029-low-population-path.md) has since taken the constant to 2 and
+[D34](0034-candidate-accounts-announcement.md) to 3, neither through this
+record, so the clause now states the invariant that actually governs it — no
+bump from here. Clause (c)'s description of `UnknownEpoch` as "D29's
+provisional path" was false when written and is false now: the enforcement
+landed by #182 refuses that cause, deliberately diverging from
+[D27](0027-attestation-envelope.md) clause (e), and the divergence is recorded
+where it is implemented; [D31](0031-id-account-subspace.md)'s closing note
+assigns the reconciliation to amending record #208. Everything else in the
+record verified against the tree as written, including the implementation.
+
 **Supersedes:** nothing. It **closes** [D27](0027-attestation-envelope.md)'s
 open question 2 — "a gateway serving more than one cell cannot resolve *which*
 announcement an intent names from the intent alone" — and it does so **without**
@@ -36,8 +53,8 @@ let Some(epoch) = epochs.resolve(intent.cell_epoch.0) else {
 ```
 
 `resolve` takes a handle and nothing else
-(`crates/orrery_persistd/src/witness_epoch.rs:334-343`), against a cache keyed
-`by_handle: HashMap<u64, Arc<AcceptedEpoch>>` (`:159-163`) that is **one map
+(`crates/orrery_persistd/src/witness_epoch.rs:334-349`), against a cache keyed
+`by_handle: HashMap<u64, Arc<AcceptedEpoch>>` (`:158-161`) that is **one map
 for the whole gateway**. Anything any peer couriered is resolvable by any
 other peer. `Intent::cell_epoch` is a submitter-chosen `u64`
 (`crates/orrery_protocol/src/persist.rs:88-99`, "wire-identical to `Epoch`"),
@@ -79,7 +96,7 @@ pub fn ledger_bal_key(account: AccountId, asset: AssetId) -> [u8; 18]   // b"lb"
 pub fn ledger_item_key(item: ItemUid)                    -> [u8; 10]    // b"li" ‖ item_uid
 ```
 
-(`crates/orrery_persistd/src/keyspace.rs:782-801`.) No grid, no cell, no
+(`crates/orrery_persistd/src/keyspace.rs:1454-1473`.) No grid, no cell, no
 shard — flat keys owned by no shard, which is also why `IntentFence` fences on
 the whole activated shard set rather than per cell. Every other op is
 `Ruleset`-opaque by construction (D11 §2.2). **There is nothing to derive.**
@@ -90,9 +107,9 @@ eliminates the second candidate.
 
 One thing, and it is already on the gateway. An `InterestGrantV1` is a
 coordinator-signed claim binding one peer to one grid and a bounded cell list
-(`crates/orrery_protocol/src/coord.rs:172-188`), localized against the
-gateway's own clock (`:128-139`) and answered by
-`InterestAuthority::allows(peer, grid, cell, now_ms)`
+(claims at `crates/orrery_protocol/src/coord.rs:172-188`, signed envelope at
+`:215-220`), localized against the gateway's own clock (`:128-139`) and
+answered by `InterestAuthority::allows(peer, grid, cell, now_ms)`
 (`crates/orrery_persistd/src/gateway.rs:605-614`). It is the predicate a live
 `Claim` passes, the predicate D25 rule 3's fan-out uses, and — the part that
 matters here — the predicate D28 clause (d) step 6 already gates *presenting*
@@ -132,7 +149,7 @@ rather than a declaration.
 ### (b) The cell stays off the wire; `PROTOCOL_VERSION` is untouched
 
 > **`Intent` gains no field, `CellEpoch` stays a bare `u64` handle, and
-> `PROTOCOL_VERSION` stays at 1 for this record. D28 clause (b) is not
+> `PROTOCOL_VERSION` gains no bump from this record. D28 clause (b) is not
 > amended, weakened or reinterpreted.**
 
 The reason is (a)'s reason read backwards. A `cell` field would be a second
@@ -162,8 +179,12 @@ Two orderings are load-bearing:
   standing would confirm the existence *and the age* of a cell-epoch it has no
   business enumerating.
 - **Below resolution.** A handle that resolves to nothing is `UnknownEpoch`
-  whether or not the submitter stands anywhere, and that case is D29's
-  provisional path.
+  whether or not the submitter stands anywhere, so the standing predicate is
+  never consulted for an unresolvable handle. What that cause meets
+  downstream is owned elsewhere: [D27](0027-attestation-envelope.md) clause
+  (e)'s text routes it to the provisional path, the landed enforcement
+  refuses it — a divergence recorded where it is implemented — and amending
+  record #208 owns the reconciliation.
 
 And `NoStandingInCell` is deliberately **not** a provisional case.
 `UnknownEpoch`, `EpochStale` and `LowPopulationEpoch` all describe a gateway
