@@ -1,6 +1,6 @@
 # ADR-0032: The enforcement ramp: shadow semantics per control, the flag inventory, promotion evidence, and auto-suspend
 
-**Status:** Proposed · **Date:** 2026-08-21 · **Decision:** D32
+**Status:** Accepted · **Date:** 2026-08-21 · **Decision:** D32
 
 This decision is normative once accepted. See the [ADR index](../DECISIONS.md)
 for precedence, scope, and the complete decision set.
@@ -669,11 +669,20 @@ either an attack or a ruleset bug, and both page somebody.
   is the first moment D17.3 is satisfiable in the field rather than in
   tests.
 - **`AttestRow` gains a field, a durable value-shape change.** `enforced:
-  bool` is additive under postcard decoding only for new readers; old
-  readers of the family decode-and-drop unknown fields, but the audit tooling
-  must be updated in the same change or shadow-period audits silently read
-  `enforced` as missing. [#217] flags the review prominence; this record
-  supplies the decision.
+  bool` is **not** additive in the tolerant sense: postcard encodes
+  **positionally**, and `from_bytes` errors on trailing bytes, so a reader
+  built before the field fails outright on a row written after it — it does
+  not decode-and-drop. An earlier revision of this bullet said the opposite;
+  [#217] found it while implementing, and the corrected reasoning is what
+  makes the change affordable.
+
+  What makes it affordable is **retention, not compatibility**: `AttestRow`
+  is swept with the intent row at `INTENT_ROW_RETENTION_MS` — one hour
+  (`crates/orrery_persistd/src/intent/fdb.rs:86`, applied at `:927`) — so the
+  mixed-shape window is bounded by that sweep rather than by reader
+  tolerance. A deployment must therefore not straddle the change for longer
+  than the retention horizon, and audit tooling must be updated in the same
+  change or shadow-period audits misread rows written by the other side.
 - **`strike/` gains a mandatory mode stamp before its first row is written.**
   [#205] shapes the family; this record constrains it: no strike row may
   exist without a mode, and the scorer filters on it. Retrofitting a mode

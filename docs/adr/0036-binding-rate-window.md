@@ -1,6 +1,6 @@
 # ADR-0036: The binding-rate window row `dw`: clause (g) becomes answerable inside `d`, and its adversarial bound is corrected
 
-**Status:** Proposed · **Date:** 2026-08-22 · **Decision:** D36
+**Status:** Accepted · **Date:** 2026-08-22 · **Decision:** D36
 
 > **This record amends the accepted [ADR-0031], in two distinct ways that are
 > recorded differently.** It applies **one erratum**: the storage arithmetic

@@ -1,6 +1,6 @@
 # ADR-0034: Candidate accounts travel in the witness-epoch announcement
 
-**Status:** Proposed · **Date:** 2026-08-21 · **Decision:** D34
+**Status:** Accepted · **Date:** 2026-08-21 · **Decision:** D34
 
 This record **amends the accepted [D28](0028-witness-set-seeding.md)**. It does
 not reopen D28's seeding authority, courier path, draw, or durable epoch-row
