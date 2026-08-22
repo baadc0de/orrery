@@ -327,14 +327,17 @@ why every `apt-get` step in those jobs is conditioned on
 the box is an ssh-and-install away rather than a workflow edit. What it needs
 beyond a stock Ubuntu: the Bevy build dependencies, `foundationdb-clients`, and
 **`libclang-dev`** (`foundationdb-sys` runs bindgen, which the hosted images
-happen to satisfy and a bare box does not). And the jobs that need a
-FoundationDB *server* stay on GitHub-hosted runners — `p2-kill9` and the fdb
-test job — because provisioning a throwaway cluster means `sudo dpkg -i` on the
-server package, which that user cannot do. The box does run an `fdbserver` — in
-a Docker container, see [Working alongside other agents](#working-alongside-other-agents)
-— and that is exactly the cluster those jobs must not be pointed at: it is a
-shared development database, and both of them write into whatever cluster they
-are given.
+happen to satisfy and a bare box does not). And the four jobs that need a
+FoundationDB *server* — `p2-kill9`, `p3-siblings`, `p5-dupe-gauntlet` and
+`fdb-tests`, all in `nightly.yml` — stay on GitHub-hosted runners, because
+provisioning their cluster means `sudo dpkg -i` on the server package, which
+that user cannot do. Each installs one per run through the composite action
+[`.github/actions/foundationdb`](.github/actions/foundationdb/action.yml) with
+`server: "true"`, points `ORRERY_FDB_CLUSTER_FILE` at the package-configured
+`/etc/foundationdb/fdb.cluster`, writes into whatever cluster it is given, and
+discards it with the runner. There is no long-running reference cluster for a
+gate to be mis-pointed at — see
+[Working alongside other agents](#working-alongside-other-agents).
 
 `p3-island` used to be pinned there for the same stated reason and never had
 one — `scripts/p3-island-gate.sh` contains no FoundationDB reference at all,
@@ -721,6 +724,25 @@ this machine there is no second one to stand up on a whim.
 its data directory rather than by its port, so `stop` can never reach an
 instance it did not start.
 
+**What exists where, since the 2026-08-22 decision on #176: gates provision
+FoundationDB per run and discard it with the runner, and there is no long-running
+reference cluster anywhere.** The composite action
+[`.github/actions/foundationdb`](.github/actions/foundationdb/action.yml)
+installs the client always and, under `server: "true"`, a throwaway single-node
+cluster whose server package self-configures `/etc/foundationdb/fdb.cluster`;
+that is how `nightly.yml`'s four FDB jobs named above get theirs. What persists
+between runs is local convenience only: this workstation (`fortyninety`) keeps a
+native `fdbserver` — the `.fdb-dev/` instance described next. The Docker
+container that used to be the reference cluster on `orrery-hel1-1` was retired
+by that decision; when last checked (2026-08-22) it was still listening there,
+awaiting teardown —
+
+```
+ssh orrery-hel1-1.distopik.com docker ps -a | grep -i fdb   # still up? a leftover, not a reference
+```
+
+— and nothing new may point at it.
+
 **`start` does work here.** An earlier revision of this section said it could
 not — that there was no `fdbserver` binary, only `foundationdb-clients`, and
 that the process in `ps` was root-owned and lived in a container. All three
@@ -728,6 +750,7 @@ claims are wrong, and they were repeated into agent briefings for a day before
 anyone checked. Verify for yourself rather than trusting either version:
 
 ```
+hostname                            # fortyninety — these answers describe THIS box
 which fdbserver                     # /usr/bin/fdbserver — the server package IS installed
 ss -lntp | grep 4500                # served by fdbserver, not a container
 ps -o user= -p <that pid>           # owned by the dev user, not root
@@ -740,29 +763,42 @@ exactly what `fdb-dev.sh` is parameterised for — rather than standing up a
 container. The shared instance on `127.0.0.1:4500` is still shared: take the
 `fdb-dev` lease before writing to it, and never `stop`, `reset` or `pkill` it.
 
-The shared dev cluster serves `127.0.0.1:4500` from the main checkout's
-`.fdb-dev/data`. So
-the route to it is its cluster file, not the script — and that file lives in the
-*main checkout*, which is why a worktree cannot find it by looking around:
+The shared dev cluster serves `127.0.0.1:4500`, with its data and cluster file
+under the *main* checkout's `.fdb-dev/`. Tools that look beside their own
+checkout — `scripts/fdb-dev.sh`'s `$ROOT/.fdb-dev` default, for one — do not
+find it from a worktree, so the route to it is its cluster file:
 
 ```
 export ORRERY_FDB_CLUSTER_FILE="$(git rev-parse --path-format=absolute --git-common-dir)/../.fdb-dev/fdb.cluster"
-fdbcli -C "$ORRERY_FDB_CLUSTER_FILE" --exec 'status minimal'   # docker:docker@127.0.0.1:4500
+fdbcli -C "$ORRERY_FDB_CLUSTER_FILE" --exec 'status minimal'   # dev:test@127.0.0.1:4500
 ```
 
-Set it explicitly, and do not rely on the fallback: most fdb-gated tests look
-for a `.fdb-dev/fdb.cluster` by walking up from the crate directory, a walk that
-finds nothing from a worktree. The tests then `eprintln!("skipping: …")` and
-pass — green assertions about nothing, which is exactly the trap
-`scripts/fdb-tests.sh` exists to close. That script refuses to default the
-variable at all.
+Set it explicitly, and do not rely on the fallback: the fdb-gated tests discover
+their cluster by walking up from the crate directory looking for any
+`.fdb-dev/fdb.cluster`. From a worktree under `.claude/worktrees/` that walk
+climbs out of the worktree and lands in the main checkout — an unset variable
+does not fail safe here, it quietly aims the run at the shared instance below.
+From a checkout with no `.fdb-dev` above it, the other failure mode fires: the
+tests `eprintln!("skipping: …")` and pass — green assertions about nothing,
+which is exactly the trap `scripts/fdb-tests.sh` exists to close. That script
+refuses to default the variable at all.
 
-**Never `stop`, `reset` or `pkill` any of it.** One container serves every agent
-on this box and the tests' default fallback, and it is a *shared development
-database*: whatever you write stays. Take the `fdb-dev` lease before you write
-to it. If you need a cluster you can clobber, run a second container on another
-port and point `ORRERY_FDB_CLUSTER_FILE` at its cluster file — an agent running
-its own instance needs no lease, and should not take one.
+**Never `stop`, `reset` or `pkill` any of it.** One native `fdbserver` serves
+every agent on this box and the tests' default fallback, and it is a *shared
+development database*: whatever you write stays. Take the `fdb-dev` lease before
+you write to it. If you need a cluster you can clobber, start your own instance
+on another port **and in its own directory** — the directory does not follow
+the port, and a second instance pointed at the shared data dir is not isolated —
+
+```
+ORRERY_FDB_DEV_PORT=4501 ORRERY_FDB_DEV_DIR=/tmp/opencode/fdb-4501 \
+  scripts/fdb-dev.sh start        # dev4501:test4501@127.0.0.1:4501, verified 2026-08-22
+```
+
+— then point `ORRERY_FDB_CLUSTER_FILE` at `/tmp/opencode/fdb-4501/fdb.cluster`.
+An agent running its own instance needs no lease, and should not take one;
+`scripts/fdb-dev.sh stop` with the same two variables tears it down and cannot
+reach any other instance.
 
 So this arrangement is deliberately two-speed: **lanes are advisory, leases are
 exclusive.**
