@@ -437,9 +437,32 @@ async fn the_primary_floor_travels_the_chain_and_bounds_the_mirror() {
     })
     .await;
 
-    // The primary's checkpoints have covered its first thirty records. Its own
-    // release is clamped by the follower watermark (D20) and the follower has
-    // everything, so the floor lands where the checkpoints put it.
+    // A complete mirror is *not* the fact the release below depends on, and
+    // this is what #286 failed on twice: nothing here checkpoints anything, so
+    // the floor is decided entirely by D20's chain clamp — and that clamp is
+    // the follower watermark the **primary** has recorded, which
+    // `chain::update_progress` writes only after a push RPC has replied. The
+    // follower indexes a batch's rows before it acknowledges it (commit, then
+    // persist the cursor, then reply), so the scan above goes true one fsync
+    // and one round trip early, and an exact floor asserted there reads
+    // whichever earlier batch the primary had acknowledged. The runner saw
+    // `lsns[16]`; delaying the follower's reply reproduces it exactly.
+    //
+    // So wait for the primary's own reading, and for it to be *settled* rather
+    // than merely published: `update_progress` publishes the gauge and writes
+    // the clamp as two separate steps, and a single task runs it, so a later
+    // watermark can only be observed once the earlier one has finished both.
+    // The extra record is what forces that second push — it is appended after
+    // the follower already holds all sixty, so it cannot ride the same batch —
+    // which makes the clamp known to be at `lsns[59]`, well past `lsns[30]`.
+    let fence = fill(&primary, 1).await[0];
+    until("the primary to record the follower's watermark", || {
+        replicator.follower_watermark() == Some(fence)
+    })
+    .await;
+
+    // The follower has everything and the primary knows it, so nothing clamps
+    // this release below what it asks for.
     let release = primary.release_before(lsns[30]).expect("primary release");
     assert_eq!(release.blocked, None);
     assert_eq!(release.floor, lsns[30]);
