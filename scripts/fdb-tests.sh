@@ -105,7 +105,17 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # same reason the previous entry's arithmetic was one short of its measurement:
 # one test landed between the two runs and was never attributed. It is
 # deliberately not claimed here.
-FLOOR="${ORRERY_FDB_TEST_FLOOR:-412}"
+#
+# Account-level party exclusion (issue #211, D31) adds seven. One needs the
+# cluster: `intent_witness_epoch`'s proof that a party account's NodeId is
+# absent from the **recorded** `AttestRow.eligible`, which is the only place
+# the executor's re-derivation of `E(I)` can be observed at all. The other six
+# are `intent::tests` admission-predicate tests — the issuer's second device,
+# the counterparty's device, two devices filling one slot, D31 clause (f)'s
+# miss semantics, the honest-witness regression guard and announced-order
+# preservation — and need no cluster, but run in the same invocation and count
+# the same. The floor rises by all seven: 412 -> 419.
+FLOOR="${ORRERY_FDB_TEST_FLOOR:-419}"
 
 # Every test file whose contents only mean anything against a real cluster. If
 # one of these reports no executed tests, the tier is dark again whatever the

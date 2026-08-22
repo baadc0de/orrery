@@ -20,7 +20,9 @@ use clap::{Parser, Subcommand};
 use foundationdb::options::StreamingMode;
 use foundationdb::{Database, FdbBindingError, KeySelector, RangeOption};
 use futures::TryStreamExt;
-use orrery_persistd::gateway::{InterestAuthority, SessionTokenV1Authorizer};
+use orrery_persistd::gateway::{
+    InterestAuthority, SessionTokenV1Authorizer, SharedBindingAuthority, SnapshotBindingAuthority,
+};
 use orrery_persistd::intent::{BaselineIntentValidator, ItemTransferArgs, LEDGER_ITEM_TRANSFER_OP};
 use orrery_persistd::journal::{AdaptiveCommitMode, GroupCommitConfig};
 use orrery_persistd::witness_epoch::WitnessEpochAuthority;
@@ -147,6 +149,25 @@ fn witnesses() -> Vec<iroh::SecretKey> {
     (100..107).map(secret).collect()
 }
 
+/// D31 clause (e)'s `owner(n)` for this harness: one account per announced
+/// witness, none of them [`BUYER`] or [`SELLER`].
+///
+/// Two properties are load-bearing and neither is decoration. **Distinct**
+/// accounts, so no pair of announced witnesses is refused as one account
+/// attesting twice. **Non-party** accounts, so `E(I)` is the full announced
+/// set and arm (c.4)'s draw runs over the vector this file computes as
+/// `selected.clone()`. And they must resolve *at all*: D31 clause (f) excludes
+/// a candidate whose binding is unknown, so an unbound witness set would leave
+/// `E(I)` empty and demote every arm to the low-population path.
+fn witness_bindings() -> SharedBindingAuthority {
+    Arc::new(SnapshotBindingAuthority::from_bindings(
+        witnesses()
+            .iter()
+            .enumerate()
+            .map(|(index, key)| (key.public(), AccountId(151_100 + index as u64))),
+    ))
+}
+
 fn runtime_config(data_dir: &Path) -> RuntimeConfig {
     RuntimeConfig {
         shards: vec![CellId::ROOT],
@@ -186,7 +207,7 @@ async fn run_gateway(cluster_file: &Path, data_dir: &Path) -> Result<()> {
             .context("cluster-file path is not UTF-8")?,
         GRID,
     )?
-    .recording_epochs(Arc::clone(&epochs));
+    .recording_epochs(Arc::clone(&epochs), witness_bindings());
 
     let store: Arc<dyn orrery_persistd::checkpoint::CheckpointStore> =
         Arc::new(orrery_persistd::checkpoint::MemCheckpointStore::new());
@@ -206,9 +227,16 @@ async fn run_gateway(cluster_file: &Path, data_dir: &Path) -> Result<()> {
         // gets: cell coverage is orthogonal to what these arms prove, and
         // holding it open is what stops a standing refusal masquerading as an
         // attestation result.
+        //
+        // D31 (#211) added the third authority for the same reason and with
+        // the same discipline: `E(I)` is now derived through `owner(n)`, and
+        // the executor below records the vector through the **same** resolver
+        // it is handed here. Two resolvers would let the recorded vector and
+        // the admitted one disagree by construction.
         validator: Arc::new(BaselineIntentValidator::enforcing(
             Arc::clone(&epochs),
             Arc::new(CoverAllInterest),
+            witness_bindings(),
         )),
         witness_epochs: Some(epochs),
         authorizer: Arc::new(SessionTokenV1Authorizer::new([IssuerKey::new(
@@ -448,6 +476,10 @@ async fn run_gauntlet(
         "durable epoch row",
     )
     .await?;
+    // `E(I)` is the announced set: the issuer is not announced, no announced
+    // witness is bound to `BUYER` or `SELLER`, and every one of them resolves
+    // (`witness_bindings`), so neither half of D10 item 4's party exclusion
+    // removes anybody here.
     let eligible = selected.clone();
 
     // Arm (c.1): real witness keys sign the old issuer preimage. Those

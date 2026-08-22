@@ -388,6 +388,46 @@ pub enum RejectionCause {
     /// bug, which is why it is the one admission cause with its own wire code
     /// ([`orrery_protocol::REASON_SELF_WITNESS`]).
     SelfWitness,
+    /// An attestation's witness is bound to an account that is a **party** to
+    /// the intent — the issuer's own account under a second NodeId, or the
+    /// counterparty named by a `LEDGER_ITEM_TRANSFER_OP`.
+    ///
+    /// The account-level half of [`Self::SelfWitness`], and the half D10
+    /// item 4 actually asks for: parties are excluded "matched on **accounts
+    /// and every NodeId bound to them**", not on NodeIds. Kept a separate
+    /// cause because the two are separate operator facts — `SelfWitness` is
+    /// one key signing for itself, this is one *account* signing for itself
+    /// through a device the NodeId comparison cannot see — and collapsed to
+    /// the same wire code, for the reason [`Self::wire_reason`] gives.
+    ///
+    /// Refused at every enforcement mode, exactly as `SelfWitness` is: party
+    /// exclusion is not part of the K-of-N quorum and must not switch off
+    /// with it.
+    PartyAccountWitness,
+    /// Two attestations whose witnesses are different NodeIds bound to the
+    /// **same** account.
+    ///
+    /// [`Self::DuplicateAttestation`]'s account-level half, and distinct from
+    /// it on purpose: "one device, twice" is a broken client and "one account,
+    /// two devices" is the Sybil shape D10 item 5's acquisition cost exists to
+    /// price. An operator that cannot count them apart cannot tell the two
+    /// situations apart either.
+    DuplicateAttestingAccount,
+    /// An attestation came from a NodeId the announcement selected, but whose
+    /// account binding this gateway could not resolve without blocking — so
+    /// D31 clause (f) excluded it from `E(I)`.
+    ///
+    /// Not [`Self::WitnessOutsideAnnouncedSet`], and D31 clause (f) says why
+    /// in as many words: that label would send an operator hunting a forgery,
+    /// when what actually happened is that a resolver missed. The witness may
+    /// be entirely honest — a peer connected to a sibling gateway, or one
+    /// whose cache entry aged past `T_stale`.
+    ///
+    /// It is still a refusal rather than a silent drop, for the reason every
+    /// membership failure is: the intent's draw was computed over a vector
+    /// this attestation is not in, so counting it would be counting a
+    /// signature toward a slot it cannot fill.
+    UnresolvedWitnessBinding,
     /// The intent names a cell-epoch this gateway holds no announcement for.
     ///
     /// D27 clause (e) cases 2 and 3: an announcement for a different epoch
@@ -509,6 +549,9 @@ impl RejectionCause {
             Self::DuplicateAttestation => "duplicate_attestation",
             Self::BadAttestation => "bad_attestation",
             Self::SelfWitness => "self_witness",
+            Self::PartyAccountWitness => "party_account_witness",
+            Self::DuplicateAttestingAccount => "duplicate_attesting_account",
+            Self::UnresolvedWitnessBinding => "unresolved_witness_binding",
             Self::UnknownEpoch => "unknown_epoch",
             Self::EpochStale => "epoch_stale",
             Self::LowPopulationEpoch => "low_population_epoch",
@@ -535,7 +578,22 @@ impl RejectionCause {
     #[must_use]
     pub const fn wire_reason(self) -> u16 {
         match self {
-            Self::SelfWitness => orrery_protocol::REASON_SELF_WITNESS,
+            // Both halves of party exclusion answer one code. They are the
+            // same fact at two resolutions — "a party to this intent attested
+            // it" — the client's remedy is identical (re-collect from
+            // non-parties), and an operator watching for party attestations
+            // wants one counter rather than two that must be added up. The
+            // sub-distinction stays in the log, where an attacker cannot read
+            // it, following D30 clause (c).
+            //
+            // Minting a second code would also be strictly *worse* than the
+            // collapse, and not merely redundant: an account-specific answer
+            // is an oracle on the `id/` bindings. A submitter naming a chosen
+            // account as the seller of a transfer and attaching one
+            // attestation could read "is NodeId W bound to account A" straight
+            // off the wire, one probe per guess. The refusal itself already
+            // leaks a bit; a dedicated code would leak which bit.
+            Self::SelfWitness | Self::PartyAccountWitness => orrery_protocol::REASON_SELF_WITNESS,
             // Every K-of-N refusal collapses to one code, and the collapse is
             // the design rather than laziness. A client needs exactly one bit
             // here — "your attestations were wrong" as against
@@ -554,6 +612,7 @@ impl RejectionCause {
             | Self::NoStandingInCell
             | Self::WitnessOutsideAnnouncedSet
             | Self::ThresholdNotMet
+            | Self::UnresolvedWitnessBinding
             | Self::RequiredWitnessMissing => orrery_protocol::REASON_ATTESTATION_QUORUM,
             // The two provisional causes do **not** collapse into the quorum
             // code, and the reason is the reason the quorum code exists at
@@ -617,13 +676,19 @@ impl RejectionCause {
 ///    signed. Off by default, because every production issuer in this tree
 ///    submits zero attestations and a hard requirement flipped on
 ///    unconditionally would refuse all of them at once.
-/// 5. **Party exclusion, as far as NodeIds reach.** No attestation may name
-///    the issuer as its witness (D10 item 4; `docs/07-witnessing.md` §4.1's
-///    per-intent party exclusion, enforced by the gateway per §4.2). This is
-///    the cheapest check in the function and runs above all of them, so a
-///    self-witnessed intent never reaches signature verification and never
-///    produces a read plan. Its limit is stated under "does NOT validate"
-///    below: it matches NodeIds, and D10's rule is written over accounts.
+/// 5. **Party exclusion, on NodeIds and on accounts.** No attestation may
+///    name the issuer as its witness, and — given an
+///    [`crate::gateway::BindingAuthority`] — none may come from a NodeId
+///    bound to any account the intent's ops name as a party, nor may two
+///    attestations come from two NodeIds bound to one account (D10 item 4,
+///    "matched on **accounts and every NodeId bound to them**";
+///    `docs/07-witnessing.md` §4.1's per-intent party exclusion, enforced by
+///    the gateway per §4.2). The NodeId half is the cheapest check in the
+///    function and runs above all of them, so a self-witnessed intent never
+///    reaches signature verification and never produces a read plan. The
+///    account half runs in [`Self::check_at`], which is where the resolver
+///    is — above the enforcement switch, because party exclusion is not part
+///    of the quorum and does not switch off with it.
 ///
 /// On admit, the precheck names the `ledger/bal/{account}/{asset}` rows the
 /// credited ops touch and the `ledger/item/{item_uid}` + debit-side balance
@@ -672,21 +737,27 @@ impl RejectionCause {
 ///   ([`RejectionCause::UnknownEpoch`], [`RejectionCause::EpochStale`],
 ///   [`RejectionCause::LowPopulationEpoch`]) are where the provisional branch
 ///   attaches when it lands.
-/// - **Account-level party exclusion.** D10 item 4 excludes parties "matched
-///   on **accounts and every NodeId bound to them**", and check 5 above
-///   matches only the NodeId. Two NodeIds bound to one account therefore still
-///   let a party attest for itself, and **this filter does not claim
-///   otherwise**. The binding is not reachable from here: [`IntentContext`]
-///   carries exactly one account — the submitting connection's, from its own
-///   session token — and the only NodeId→account table in this crate is the
-///   gateway's peer registry, which is `async`, covers only peers currently
-///   holding a session on *this* gateway, and would therefore answer "not a
-///   party" for any witness attesting from elsewhere. A check that fails open
-///   on a miss is worse than an absent one, because it reads as coverage. No
-///   FDB key family binds an account to a NodeId either, so an authoritative
-///   answer is a durable read, which the admission path does not take. The
-///   account-level half is D28's, made at selection time where the identity
-///   bindings actually live.
+/// - **Account-level party exclusion, when no resolver is configured.** D10
+///   item 4 excludes parties "matched on **accounts and every NodeId bound to
+///   them**", and check 5's account half needs an
+///   [`crate::gateway::BindingAuthority`] to answer `owner(n)`. Built through
+///   [`Self::permissive`], this validator has none, and it does not pretend
+///   to: it excludes on NodeId alone and says so by having no authority,
+///   rather than by answering "not a party" to every question.
+///
+///   What it never does is fail *open*. Given a resolver, an unresolvable
+///   NodeId is treated as a party and excluded (D31 clause (f)); given none,
+///   an enforcing validator excludes every candidate and every attested
+///   intent demotes to D29's provisional path. The objection this file used to
+///   raise against itself — *a check that fails open on a miss is worse than
+///   an absent one, because it reads as coverage* — is the sentence D31
+///   clause (f) turned into the rule.
+///
+///   What is still approximated is the **coordinator's** selection-time half
+///   (D28 clause (e)): a NodeId bound to the same account but connected to a
+///   different coordinator is not deduped out of the candidate pool. That is
+///   defence at selection, this is defence at admission, and D31 clause (d)
+///   keeps the coordinator out of the `id/` rows deliberately.
 /// - **Which *one* cell an intent belongs to.** D30 clause (a) narrows the
 ///   cell-epochs a submitter may be judged under to the cells its own
 ///   coordinator grant covers — D5's 27-cell neighbourhood, capped at
@@ -709,6 +780,7 @@ pub struct BaselineIntentValidator {
     enforcement: AttestationEnforcement,
     epochs: Option<Arc<crate::witness_epoch::WitnessEpochAuthority>>,
     interest: Option<Arc<dyn crate::gateway::InterestAuthority>>,
+    bindings: Option<crate::gateway::SharedBindingAuthority>,
 }
 
 /// Written out rather than derived because [`crate::gateway::InterestAuthority`]
@@ -722,6 +794,7 @@ impl core::fmt::Debug for BaselineIntentValidator {
             .field("enforcement", &self.enforcement)
             .field("epochs", &self.epochs)
             .field("interest", &self.interest.is_some())
+            .field("bindings", &self.bindings.is_some())
             .finish()
     }
 }
@@ -768,11 +841,40 @@ impl BaselineIntentValidator {
         Self::default()
     }
 
+    /// A validator that requires no quorum but still refuses **party**
+    /// attestations at the account level, resolved through `bindings`.
+    ///
+    /// The pairing is deliberate and is the acceptance line #211 was written
+    /// around: party exclusion is not part of D27's K-of-N predicate and must
+    /// not switch off with it, exactly as
+    /// [`RejectionCause::SelfWitness`] does not. `Off` means *the quorum* is
+    /// off; it never means a party may certify its own trade.
+    ///
+    /// [`Self::permissive`] resolves no bindings at all, which leaves the
+    /// pre-D31 NodeId-only behaviour — honest, because a validator with no
+    /// resolver has no account to compare and says so by having none, rather
+    /// than by answering "not a party" to every question.
+    #[must_use]
+    pub fn permissive_with_bindings(bindings: crate::gateway::SharedBindingAuthority) -> Self {
+        Self {
+            bindings: Some(bindings),
+            ..Self::default()
+        }
+    }
+
     /// A validator that enforces D27's K-of-N predicate against the epochs
     /// `epochs` holds, for issuers `interest` says stand in the cell.
     ///
-    /// Both authorities are required, and the second one is
-    /// [D30](../../../../docs/adr/0030-cell-epoch-standing.md) clause (a).
+    /// All three authorities are required. The second is
+    /// [D30](../../../../docs/adr/0030-cell-epoch-standing.md) clause (a) and
+    /// the third is [D31](../../../../docs/adr/0031-id-account-subspace.md)
+    /// clause (e)'s `owner(n)` resolver, without which `E(I)` can only be
+    /// derived over NodeIds and D10 item 4's account half goes unenforced.
+    /// Passing [`crate::gateway::UnboundBindingAuthority`] is legal and is not
+    /// a way to switch the account half off: under D31 clause (f) a resolver
+    /// that answers nothing excludes everybody, so every attested intent
+    /// demotes to D29's provisional path. That is the intended shape of the
+    /// interim, not a degenerate case.
     /// A cell-epoch resolves by handle out of a cache that holds every cell
     /// any peer has couriered an announcement for, so without a standing
     /// predicate the *submitter* decides which announced set judges its
@@ -784,11 +886,13 @@ impl BaselineIntentValidator {
     pub fn enforcing(
         epochs: Arc<crate::witness_epoch::WitnessEpochAuthority>,
         interest: Arc<dyn crate::gateway::InterestAuthority>,
+        bindings: crate::gateway::SharedBindingAuthority,
     ) -> Self {
         Self {
             enforcement: AttestationEnforcement::Required,
             epochs: Some(epochs),
             interest: Some(interest),
+            bindings: Some(bindings),
         }
     }
 
@@ -797,6 +901,138 @@ impl BaselineIntentValidator {
     pub fn enforcement(&self) -> AttestationEnforcement {
         self.enforcement
     }
+}
+
+/// Append `account` to a party set unless it is already there.
+///
+/// Order is preserved and duplicates are not, for the same reason
+/// [`push_read_key`] does it: an intent naming one account twice (a credit and
+/// the debit side of a trade in the same intent) is ordinary, and the set is
+/// then scanned once per announced candidate.
+fn push_party(parties: &mut Vec<AccountId>, account: AccountId) {
+    if !parties.contains(&account) {
+        parties.push(account);
+    }
+}
+
+/// `P(I)` — the accounts an intent is a transaction *between*.
+///
+/// [D10](../../../../docs/adr/0010-witnessing.md) item 4 seeds the witness set
+/// "excluding **all parties to the intent** (matched on accounts and every
+/// NodeId bound to them)". This function is the first half of that sentence;
+/// [`eligible_after_party_exclusion`] is the second.
+///
+/// # Why this needs no reverse lookup
+///
+/// The party side was never the missing half, and D31's Context says so with
+/// the line numbers: the ops this cluster interprets are keyed by
+/// [`AccountId`] outright — `ledger_bal_key(account, asset)`,
+/// `ItemTransferArgs { seller, buyer, .. }` — and the receipt's
+/// `parties: Vec<AccountId>` is built straight from the planned writes. **The
+/// party set is already a set of accounts.** What needed the `id/` reverse
+/// index is the *candidate* side, where `WitnessEpochClaimsV1` carries
+/// `Vec<NodeId>` and no account anywhere.
+///
+/// # `issuer_account`, and why the two derivation sites agree
+///
+/// `issuer_account` is the submitting connection's own account, from its
+/// verified session token — the thing that makes an issuer's *other* NodeIds
+/// excludable. The executor re-derives `E(I)` when it records `AttestRow`
+/// (D27 clause (f)) and has no [`IntentContext`], so it supplies
+/// [`crate::gateway::BindingAuthority::owner`] of `intent.issuer` there
+/// instead.
+///
+/// The two cannot disagree on any intent where "party" means anything, and
+/// that is a property of the ops rather than a coincidence: a
+/// [`LEDGER_CREDIT_OP`] is refused unless it names the connection's own
+/// account, and a [`LEDGER_ITEM_TRANSFER_OP`] is refused unless the
+/// connection's account is the buyer. So for both interpreted ops the issuer's
+/// account is already in the set the ops name. It can differ only for a
+/// `Ruleset`-opaque op, which moves no value and names no party this filter
+/// can see either way.
+///
+/// A malformed op contributes nothing rather than erroring: shape validation
+/// ran above this at admission, and at commit an op that does not decode names
+/// no account to exclude.
+#[must_use]
+fn party_accounts(intent: &Intent, issuer_account: Option<AccountId>) -> Vec<AccountId> {
+    let mut parties = Vec::with_capacity(1 + intent.ops.len());
+    if let Some(account) = issuer_account {
+        push_party(&mut parties, account);
+    }
+    for op in &intent.ops {
+        match op.op {
+            LEDGER_CREDIT_OP => {
+                if op.args.len() == LEDGER_CREDIT_ARGS_BYTES {
+                    push_party(
+                        &mut parties,
+                        AccountId::new(u64::from_le_bytes(
+                            op.args[0..8].try_into().expect("slice len"),
+                        )),
+                    );
+                }
+            }
+            LEDGER_ITEM_TRANSFER_OP => {
+                if let Ok(transfer) = ItemTransferArgs::decode(&op.args) {
+                    push_party(&mut parties, transfer.seller);
+                    push_party(&mut parties, transfer.buyer);
+                }
+            }
+            // `Ruleset`-opaque (docs/08-persistence.md §2.2). Its `args` are
+            // not a layout this crate may read, so it names no party here.
+            _ => {}
+        }
+    }
+    parties
+}
+
+/// `E(I)` with D10 item 4's account half applied: the announced set in
+/// announced order, minus the issuer's NodeId, minus every NodeId bound to a
+/// party account, **and minus every NodeId whose binding did not resolve**.
+///
+/// # The third term is the whole point
+///
+/// [D31](../../../../docs/adr/0031-id-account-subspace.md) clause (f): *a miss
+/// excludes; it never admits*. The attacker decides whether a lookup misses —
+/// binding a second NodeId to its own account is a credentialed operation on
+/// its own account, and keeping that NodeId out of this gateway's resolver is
+/// achieved by not connecting it here, or by waiting out the cache's staleness
+/// bound. A predicate whose "unknown" branch the attacker selects must not
+/// have "admit" on that branch, which is the objection this file already
+/// raised against itself before the `id/` rows existed: *a check that fails
+/// open on a miss is worse than an absent one, because it reads as coverage.*
+///
+/// # What closing costs, and why it is affordable
+///
+/// `|E(I)|` shrinks, and below [`orrery_protocol::WITNESS_SET_FLOOR_N`] that
+/// is [`RejectionCause::LowPopulationEpoch`] — which is **D29's quarantined
+/// provisional commit, not a refusal**. Fail-closed here means "demote to the
+/// path that already exists for a gateway that cannot judge", the same
+/// direction D27 clause (e) chose for `UnknownEpoch` and `EpochStale`. An
+/// honest intent whose announced set this gateway cannot fully resolve is
+/// committed provisionally and finalized by replay; it is not lost.
+///
+/// # Announced order, unsorted and undeduplicated
+///
+/// `filter` over [`orrery_protocol::eligible_witnesses`]'s output, never a set
+/// operation, because the recorded vector is the object an auditor draws over
+/// (D27 clause (f)) and normalizing it here would silently make the audit's
+/// object a different one from the announcement's.
+#[must_use]
+fn eligible_after_party_exclusion(
+    selected: &[NodeId],
+    intent: &Intent,
+    parties: &[AccountId],
+    bindings: &dyn crate::gateway::BindingAuthority,
+) -> Vec<NodeId> {
+    orrery_protocol::eligible_witnesses(selected, intent.issuer)
+        .into_iter()
+        .filter(|witness| {
+            bindings
+                .owner(witness)
+                .is_some_and(|account| !parties.contains(&account))
+        })
+        .collect()
 }
 
 /// D27 clause (d)'s admission predicate, evaluated against one accepted epoch.
@@ -844,6 +1080,8 @@ fn check_attestation_quorum(
     intent: &Intent,
     epochs: &crate::witness_epoch::WitnessEpochAuthority,
     interest: &dyn crate::gateway::InterestAuthority,
+    bindings: &dyn crate::gateway::BindingAuthority,
+    parties: &[AccountId],
     now_ms: u64,
 ) -> Result<Vec<NodeId>, RejectionCause> {
     // The epoch the intent *names*, resolved by handle. Never "the current
@@ -879,11 +1117,17 @@ fn check_attestation_quorum(
         return Err(RejectionCause::EpochStale);
     }
 
-    // `E(I)` — the announced set in announced order, minus the parties this
-    // gateway can see. Announced order is preserved because the recorded
-    // vector has to be the object an auditor draws over, not a normalization
-    // of it.
-    let eligible = orrery_protocol::eligible_witnesses(&epoch.snapshot.selected, intent.issuer);
+    // `E(I)` — the announced set in announced order, minus the parties.
+    // Announced order is preserved because the recorded vector has to be the
+    // object an auditor draws over, not a normalization of it.
+    //
+    // D10 item 4's account half runs here now, not just the NodeId half: a
+    // candidate bound to a party account drops out, and so does one whose
+    // binding did not resolve (D31 clause (f) — a miss excludes). The cost of
+    // shrinking is `LowPopulationEpoch` below, which is D29's provisional
+    // path, so closing here demotes rather than refuses.
+    let eligible =
+        eligible_after_party_exclusion(&epoch.snapshot.selected, intent, parties, bindings);
     if eligible.len() < orrery_protocol::WITNESS_SET_FLOOR_N {
         return Err(RejectionCause::LowPopulationEpoch);
     }
@@ -893,8 +1137,22 @@ fn check_attestation_quorum(
     // intent rather than silently dropping the stray signature is deliberate:
     // a submitter that attached one is either broken or shopping, and both
     // want an answer rather than a mysteriously short quorum.
+    //
+    // The two ways to be outside `E(I)` are told apart because they describe
+    // opposite situations, and D31 clause (f) asks for exactly this
+    // separation: a witness the announcement never selected is a forgery or a
+    // shopping attempt, while one it *did* select whose account this gateway
+    // could not resolve is a resolver miss — possibly an entirely honest peer
+    // connected to a sibling gateway. Labelling the second
+    // `WitnessOutsideAnnouncedSet` would send an operator hunting a forgery
+    // that is not there. Both answer `REASON_ATTESTATION_QUORUM` on the wire.
     for attestation in &intent.attestations {
         if !eligible.contains(&attestation.witness) {
+            if epoch.snapshot.selected.contains(&attestation.witness)
+                && bindings.owner(&attestation.witness).is_none()
+            {
+                return Err(RejectionCause::UnresolvedWitnessBinding);
+            }
             return Err(RejectionCause::WitnessOutsideAnnouncedSet);
         }
     }
@@ -966,6 +1224,55 @@ fn push_read_key(read_keys: &mut Vec<Vec<u8>>, key: Vec<u8>) {
 /// permissive half — "an unverifiable attestation contributes nothing but
 /// convicts nobody" — is what the quorum check below is written against: it
 /// counts only witnesses that reached this point.
+/// D10 item 4's account half applied to the attestations an intent actually
+/// carries: no party may witness, and no account may witness twice.
+///
+/// # Why this is not inside [`check_attestation_quorum`]
+///
+/// Because it must hold with the quorum switched **off**. Party exclusion is
+/// not part of D27's K-of-N predicate — it is the rule that makes a
+/// co-signature mean a third party looked, and an issuer able to certify its
+/// own trade through a second device defeats that at every enforcement
+/// setting. [`RejectionCause::SelfWitness`] already sits above the switch for
+/// exactly this reason; this is the same rule with the NodeId comparison
+/// replaced by the account one.
+///
+/// # A miss is skipped here, and that is not fail-open
+///
+/// D31 clause (f)'s obligation is discharged in
+/// [`eligible_after_party_exclusion`], where an unresolvable NodeId is dropped
+/// from `E(I)` and an attestation from one is then refused as
+/// [`RejectionCause::UnresolvedWitnessBinding`]. This function runs at every
+/// enforcement mode, including `Off`, where *no* attestation counts toward
+/// anything at all: there is no quorum for it to fill and no slot for it to
+/// occupy. Refusing every unresolved witness here would therefore refuse every
+/// attestation in a tree where nothing yet writes the `id/` rows, and would
+/// buy no security in exchange, because the thing it would be protecting does
+/// not exist in that mode.
+fn check_attesting_accounts(
+    intent: &Intent,
+    parties: &[AccountId],
+    bindings: &dyn crate::gateway::BindingAuthority,
+) -> Result<(), RejectionCause> {
+    let mut seen: Vec<AccountId> = Vec::with_capacity(intent.attestations.len());
+    for attestation in &intent.attestations {
+        let Some(account) = bindings.owner(&attestation.witness) else {
+            continue;
+        };
+        // Before the duplicate check, because a party that attested twice is a
+        // party first: answering `DuplicateAttestingAccount` would name the
+        // lesser of the two facts.
+        if parties.contains(&account) {
+            return Err(RejectionCause::PartyAccountWitness);
+        }
+        if seen.contains(&account) {
+            return Err(RejectionCause::DuplicateAttestingAccount);
+        }
+        seen.push(account);
+    }
+    Ok(())
+}
+
 fn check_attestations(intent: &Intent) -> Result<(), RejectionCause> {
     if intent.attestations.is_empty() {
         return Ok(());
@@ -1213,6 +1520,32 @@ impl BaselineIntentValidator {
         now_ms: u64,
     ) -> Result<Admission, RejectionCause> {
         let precheck = Self::check(intent, cx)?;
+
+        // The resolver, or the honest absence of one. A validator built
+        // without bindings answers `None` to every `owner(n)`, which leaves
+        // the pre-D31 NodeId-only behaviour in `Off` and excludes everybody in
+        // `Required` — the fail-closed direction in both cases.
+        static UNBOUND: crate::gateway::UnboundBindingAuthority =
+            crate::gateway::UnboundBindingAuthority;
+        let bindings: &dyn crate::gateway::BindingAuthority =
+            self.bindings.as_deref().unwrap_or(&UNBOUND);
+
+        // `P(I)`, derived once and used twice: by the account-level party
+        // refusal immediately below, and by `E(I)`'s derivation inside the
+        // quorum. The issuer's own account comes from its verified session
+        // token when there is one, and from the resolver otherwise — never
+        // from the intent, which is peer-authored.
+        let parties = party_accounts(
+            intent,
+            cx.account.or_else(|| bindings.owner(&intent.issuer)),
+        );
+
+        // **Above the enforcement switch on purpose.** D10 item 4's party
+        // exclusion is not part of the K-of-N quorum and does not switch off
+        // with it, the same way the NodeId-level `SelfWitness` refusal in
+        // `check` does not.
+        check_attesting_accounts(intent, &parties, bindings)?;
+
         if self.enforcement == AttestationEnforcement::Off {
             // No quorum is enforced, so no intent is *un*attested in the sense
             // clause 2 means, and the provisional path is unreachable. That is
@@ -1241,7 +1574,14 @@ impl BaselineIntentValidator {
         // filter already documents: an oversized or malformed submission never
         // pays for a witness-set resolution, and a self-witnessed one never
         // reaches the draw.
-        match check_attestation_quorum(intent, epochs.as_ref(), interest.as_ref(), now_ms) {
+        match check_attestation_quorum(
+            intent,
+            epochs.as_ref(),
+            interest.as_ref(),
+            bindings,
+            &parties,
+            now_ms,
+        ) {
             Ok(_eligible) => Ok(Admission::Attested(precheck)),
             // The second line of clause 2's admission function, in full: the
             // population predicate held, so `reversible(i)` decides. A failure
@@ -2270,6 +2610,11 @@ mod tests {
         })
     }
 
+    /// The account every `cx(Some(..))` fixture in this module authenticates
+    /// as. Named because D10 item 4's account half turns it from an opaque
+    /// number into the party set.
+    const ISSUER_ACCOUNT: u64 = 7;
+
     fn cx(account: Option<u64>) -> IntentContext {
         cx_with_standing(account, SessionStanding::Good)
     }
@@ -2342,6 +2687,55 @@ mod tests {
         (0..count).map(epoch_fixture::witness_secret).collect()
     }
 
+    /// The first account id handed to an announced witness.
+    ///
+    /// Well clear of the single-digit ids the `cx` fixtures give the issuer,
+    /// so "N honest strangers" is what a fixture produces by default and a
+    /// party has to be arranged on purpose. A fixture whose witnesses shared
+    /// the issuer's account by accident would make every enforcement test pass
+    /// for the wrong reason once D10 item 4's account half runs.
+    const WITNESS_ACCOUNT_BASE: u64 = 1_000;
+
+    /// One distinct, non-party account per announced NodeId — D31 clause (e)'s
+    /// `owner(n)`, answered from a table instead of from the `id/` rows
+    /// `orrery_identity` will write.
+    fn distinct_bindings(announced: &[NodeId]) -> crate::gateway::SharedBindingAuthority {
+        bindings_from(
+            announced
+                .iter()
+                .enumerate()
+                .map(|(index, node)| (*node, AccountId::new(WITNESS_ACCOUNT_BASE + index as u64))),
+        )
+    }
+
+    /// An `owner(n)` resolver over an explicit table, for the tests that need
+    /// two NodeIds to share an account.
+    fn bindings_from(
+        pairs: impl IntoIterator<Item = (NodeId, AccountId)>,
+    ) -> crate::gateway::SharedBindingAuthority {
+        Arc::new(crate::gateway::SnapshotBindingAuthority::from_bindings(
+            pairs,
+        ))
+    }
+
+    /// An enforcing validator over an already-built cache, binding one
+    /// distinct account to every NodeId that epoch announced.
+    fn enforcing_with(
+        epochs: &Arc<crate::witness_epoch::WitnessEpochAuthority>,
+    ) -> BaselineIntentValidator {
+        let announced = epochs
+            .resolve(EPOCH_HANDLE)
+            .expect("fixture epoch is announced under EPOCH_HANDLE")
+            .snapshot
+            .selected
+            .clone();
+        BaselineIntentValidator::enforcing(
+            Arc::clone(epochs),
+            Arc::new(epoch_fixture::CoverAllInterest),
+            distinct_bindings(&announced),
+        )
+    }
+
     /// A validator enforcing over one epoch announcing `witnesses`, accepted
     /// at t=1000.
     fn enforcing_over(
@@ -2360,6 +2754,7 @@ mod tests {
             BaselineIntentValidator::enforcing(
                 Arc::clone(&epochs),
                 Arc::new(epoch_fixture::CoverAllInterest),
+                distinct_bindings(&announced),
             ),
             epochs,
         )
@@ -2588,7 +2983,7 @@ mod tests {
     #[test]
     fn epoch_turnover_judges_an_intent_against_the_epoch_it_names() {
         let first_set = witness_keys(7);
-        let (validator, epochs) = enforcing_over(&first_set);
+        let (_, epochs) = enforcing_over(&first_set);
 
         // A second epoch for the same cell, over a disjoint set of witnesses,
         // chained onto the first's commitment.
@@ -2617,6 +3012,20 @@ mod tests {
             )
             .expect("the chained announcement is accepted");
 
+        // The validator resolves **both** announced sets. This test is about
+        // which epoch judges an intent, so a candidate that dropped out of
+        // `E(I)` for an unresolved binding (D31 clause (f)) would answer the
+        // wrong question — the misdirected intent below would demote to the
+        // low-population path instead of naming its witnesses as strangers.
+        let mut every_announced: Vec<NodeId> =
+            first_set.iter().map(iroh_base::SecretKey::public).collect();
+        every_announced.extend_from_slice(&announced);
+        let validator = BaselineIntentValidator::enforcing(
+            Arc::clone(&epochs),
+            Arc::new(epoch_fixture::CoverAllInterest),
+            distinct_bindings(&every_announced),
+        );
+
         // An intent attested under epoch 1, submitted after epoch 2 arrived.
         // Nothing about epoch 2's arrival invalidates it: this is what lets a
         // co-signature collected a moment before a boundary commit a moment
@@ -2643,6 +3052,311 @@ mod tests {
         );
     }
 
+    // -- D10 item 4's account half (D31) ----------------------------------
+    //
+    // Everything below turns on one arrangement: a witness whose **NodeId** is
+    // not the issuer's and is genuinely in the announced set, but whose
+    // **account** is a party's. Every test asserts that the NodeId-level
+    // checks admit it first, because a test that only re-proves the
+    // same-NodeId case proves nothing this work added.
+
+    /// The issuer's own account, under a second NodeId, may not witness — and
+    /// it is refused with the quorum switched **off**.
+    #[test]
+    fn a_second_device_of_the_issuers_own_account_may_not_witness() {
+        let witnesses = witness_keys(7);
+        let announced: Vec<NodeId> = witnesses.iter().map(iroh_base::SecretKey::public).collect();
+        // The attacker's second device: a distinct keypair, bound to the same
+        // account the connection authenticated as.
+        let attacker = &witnesses[0];
+        assert_ne!(
+            attacker.public(),
+            issuer_key().public(),
+            "the whole point is a NodeId the existing checks cannot object to"
+        );
+        let bindings = bindings_from(announced.iter().enumerate().map(|(index, node)| {
+            let account = if index == 0 {
+                ISSUER_ACCOUNT
+            } else {
+                WITNESS_ACCOUNT_BASE + index as u64
+            };
+            (*node, AccountId::new(account))
+        }));
+
+        let mut intent = attestable_intent(40);
+        let attestation = intent.attest(attacker);
+        assert!(
+            attestation.verify(&intent),
+            "a real co-signature over D27's witness preimage, not a forgery"
+        );
+        intent.attestations.push(attestation);
+
+        // It passes all three of the NodeId-level checks that existed before
+        // this: not the issuer, not the connection identity, not a repeat.
+        assert!(
+            BaselineIntentValidator::check(&intent, &cx(Some(ISSUER_ACCOUNT))).is_ok(),
+            "the pre-D31 envelope checks admit it, which is the exposure"
+        );
+
+        // And the account-level check refuses it at the default enforcement
+        // mode, because party exclusion is not part of the quorum.
+        let validator = BaselineIntentValidator::permissive_with_bindings(bindings);
+        assert_eq!(validator.enforcement(), AttestationEnforcement::Off);
+        assert_eq!(
+            validator.check_at(&intent, &cx(Some(ISSUER_ACCOUNT)), 2_000),
+            Err(RejectionCause::PartyAccountWitness)
+        );
+        assert_eq!(
+            RejectionCause::PartyAccountWitness.wire_reason(),
+            orrery_protocol::REASON_SELF_WITNESS,
+            "both halves of party exclusion answer one code; the sub-\
+             distinction stays in the log"
+        );
+    }
+
+    /// The **counterparty's** account may not witness either, and the
+    /// counterparty is named by the intent's own ops rather than by the
+    /// connection.
+    #[test]
+    fn a_witness_bound_to_the_counterparty_account_is_refused() {
+        let witnesses = witness_keys(7);
+        let announced: Vec<NodeId> = witnesses.iter().map(iroh_base::SecretKey::public).collect();
+        // The seller of the transfer, which `party_accounts` reads out of the
+        // op layout. Nothing on the connection names it.
+        const SELLER: u64 = 8;
+        let bindings = bindings_from(announced.iter().enumerate().map(|(index, node)| {
+            let account = if index == 3 {
+                SELLER
+            } else {
+                WITNESS_ACCOUNT_BASE + index as u64
+            };
+            (*node, AccountId::new(account))
+        }));
+
+        let key = issuer_key();
+        let mut intent = Intent {
+            evidence: None,
+            intent_id: 41,
+            issuer: key.public(),
+            cell_epoch: CellEpoch::new(EPOCH_HANDLE),
+            ops: vec![transfer_op(1, SELLER, ISSUER_ACCOUNT, 10)],
+            attestations: Vec::new(),
+            signature: key.sign(b"placeholder"),
+        };
+        intent.sign(&key);
+        let attestation = intent.attest(&witnesses[3]);
+        intent.attestations.push(attestation);
+
+        assert!(
+            BaselineIntentValidator::check(&intent, &cx(Some(ISSUER_ACCOUNT))).is_ok(),
+            "neither the issuer's NodeId nor the connection's, and not a repeat"
+        );
+        assert_eq!(
+            BaselineIntentValidator::permissive_with_bindings(bindings).check_at(
+                &intent,
+                &cx(Some(ISSUER_ACCOUNT)),
+                2_000
+            ),
+            Err(RejectionCause::PartyAccountWitness),
+            "D10 item 4 excludes *all* parties, not just the submitter"
+        );
+    }
+
+    /// Two devices of one non-party account are one witness, not two.
+    #[test]
+    fn two_node_ids_of_one_account_cannot_fill_two_slots() {
+        let witnesses = witness_keys(7);
+        let announced: Vec<NodeId> = witnesses.iter().map(iroh_base::SecretKey::public).collect();
+        // An accomplice account with two devices, both announced, neither a
+        // party to the intent.
+        const ACCOMPLICE: u64 = 2_600;
+        let bindings = bindings_from(announced.iter().enumerate().map(|(index, node)| {
+            let account = if index < 2 {
+                ACCOMPLICE
+            } else {
+                WITNESS_ACCOUNT_BASE + index as u64
+            };
+            (*node, AccountId::new(account))
+        }));
+
+        let mut intent = attestable_intent(42);
+        for key in witnesses.iter().take(2) {
+            let attestation = intent.attest(key);
+            intent.attestations.push(attestation);
+        }
+        assert!(
+            BaselineIntentValidator::check(&intent, &cx(Some(ISSUER_ACCOUNT))).is_ok(),
+            "two different NodeIds, so the no-repeat rule has nothing to say"
+        );
+        assert_eq!(
+            BaselineIntentValidator::permissive_with_bindings(bindings).check_at(
+                &intent,
+                &cx(Some(ISSUER_ACCOUNT)),
+                2_000
+            ),
+            Err(RejectionCause::DuplicateAttestingAccount)
+        );
+        // The two causes are distinct so an operator can count "one account,
+        // two devices" apart from "one device, twice".
+        assert_ne!(
+            RejectionCause::DuplicateAttestingAccount.as_str(),
+            RejectionCause::DuplicateAttestation.as_str()
+        );
+    }
+
+    /// D31 clause (f): **a miss excludes, and the closure is a demotion, not a
+    /// refusal.**
+    ///
+    /// Named after the clause so a future reader can find the decision from
+    /// the test. Both halves are asserted, because either one alone is
+    /// misleading: excluding without demoting would lose honest intents, and
+    /// demoting without excluding would be the fail-open behaviour that makes
+    /// the whole check decorative.
+    #[test]
+    fn d31_clause_f_a_missing_binding_excludes_and_demotes() {
+        let witnesses = witness_keys(7);
+        let announced: Vec<NodeId> = witnesses.iter().map(iroh_base::SecretKey::public).collect();
+
+        // Half one. Only four of the seven announced NodeIds resolve, so
+        // `|E(I)|` is four — one below `WITNESS_SET_FLOOR_N` — and a
+        // reversible intent carrying a commitment is committed
+        // *provisionally* rather than refused.
+        let partial =
+            bindings_from(
+                announced.iter().take(4).enumerate().map(|(index, node)| {
+                    (*node, AccountId::new(WITNESS_ACCOUNT_BASE + index as u64))
+                }),
+            );
+        let epochs = epoch_fixture::cache_with(EPOCH_HANDLE, &announced, 1_000);
+        let closing = BaselineIntentValidator::enforcing(
+            Arc::clone(&epochs),
+            Arc::new(epoch_fixture::CoverAllInterest),
+            partial,
+        );
+        assert!(
+            matches!(
+                closing.check_at(
+                    &low_population_intent(43, true),
+                    &cx(Some(ISSUER_ACCOUNT)),
+                    2_000
+                ),
+                Ok(Admission::Provisional(_))
+            ),
+            "seven were announced and three cannot be resolved, so the \
+             gateway cannot judge — which is D29's path, not a refusal"
+        );
+
+        // The control: the same seven NodeIds, all resolved, and the same
+        // intent is no longer under-populated. Without this the assertion
+        // above would also pass on a validator that demoted everything.
+        let resolving = BaselineIntentValidator::enforcing(
+            Arc::clone(&epochs),
+            Arc::new(epoch_fixture::CoverAllInterest),
+            distinct_bindings(&announced),
+        );
+        assert_eq!(
+            resolving.check_at(
+                &low_population_intent(44, true),
+                &cx(Some(ISSUER_ACCOUNT)),
+                2_000
+            ),
+            Err(RejectionCause::ThresholdNotMet),
+            "|E(I)| = 7 with every binding resolved, so the intent is simply \
+             un-attested"
+        );
+
+        // Half two. An attestation *from* an announced NodeId whose binding
+        // did not resolve is refused, and it is named for what it is — a
+        // resolver miss — rather than as a forgery.
+        let six =
+            bindings_from(
+                announced.iter().take(6).enumerate().map(|(index, node)| {
+                    (*node, AccountId::new(WITNESS_ACCOUNT_BASE + index as u64))
+                }),
+            );
+        let mut unresolved = attestable_intent(45);
+        let attestation = unresolved.attest(&witnesses[6]);
+        unresolved.attestations.push(attestation);
+        let validator = BaselineIntentValidator::enforcing(
+            Arc::clone(&epochs),
+            Arc::new(epoch_fixture::CoverAllInterest),
+            six,
+        );
+        assert_eq!(
+            validator.check_at(&unresolved, &cx(Some(ISSUER_ACCOUNT)), 2_000),
+            Err(RejectionCause::UnresolvedWitnessBinding),
+            "announced, so `WitnessOutsideAnnouncedSet` would send an \
+             operator hunting a forgery that is not there"
+        );
+        assert_eq!(
+            RejectionCause::UnresolvedWitnessBinding.wire_reason(),
+            orrery_protocol::REASON_ATTESTATION_QUORUM,
+            "one wire code for the whole quorum space (D30 clause (c))"
+        );
+    }
+
+    /// The regression guard: honest witnesses bound to unrelated accounts are
+    /// untouched by any of the above, at both enforcement modes.
+    #[test]
+    fn honest_witnesses_on_unrelated_accounts_are_unaffected() {
+        let witnesses = witness_keys(7);
+        let announced: Vec<NodeId> = witnesses.iter().map(iroh_base::SecretKey::public).collect();
+        let bindings = distinct_bindings(&announced);
+
+        // `Off`: a real co-signature from a stranger still admits.
+        let mut intent = attestable_intent(46);
+        let attestation = intent.attest(&witnesses[2]);
+        intent.attestations.push(attestation);
+        assert!(
+            BaselineIntentValidator::permissive_with_bindings(Arc::clone(&bindings))
+                .check_at(&intent, &cx(Some(ISSUER_ACCOUNT)), 2_000)
+                .is_ok()
+        );
+
+        // `Required`: the full K-of-N predicate still admits, so the account
+        // filter has not quietly shrunk `E(I)` under an honest set.
+        let (validator, epochs) = enforcing_over(&witnesses);
+        let mut attested = attestable_intent(47);
+        attest_required(&mut attested, &witnesses, &epochs);
+        assert!(matches!(
+            validator.check_at(&attested, &cx(Some(ISSUER_ACCOUNT)), 2_000),
+            Ok(Admission::Attested(_))
+        ));
+    }
+
+    /// `E(I)` keeps announced order when the account filter removes a member
+    /// from the middle of it.
+    ///
+    /// The recorded vector is the object an auditor draws over (D27
+    /// clause (f)), so a filter that sorted or de-duplicated would silently
+    /// make the audit's object a different one from the announcement's.
+    #[test]
+    fn party_exclusion_preserves_announced_order() {
+        let witnesses = witness_keys(7);
+        let announced: Vec<NodeId> = witnesses.iter().map(iroh_base::SecretKey::public).collect();
+        let bindings = bindings_from(announced.iter().enumerate().map(|(index, node)| {
+            let account = if index == 3 {
+                ISSUER_ACCOUNT
+            } else {
+                WITNESS_ACCOUNT_BASE + index as u64
+            };
+            (*node, AccountId::new(account))
+        }));
+
+        let intent = attestable_intent(48);
+        let parties = party_accounts(&intent, Some(AccountId::new(ISSUER_ACCOUNT)));
+        let eligible =
+            eligible_after_party_exclusion(&announced, &intent, &parties, bindings.as_ref());
+
+        let expected: Vec<NodeId> = announced
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| *index != 3)
+            .map(|(_, node)| *node)
+            .collect();
+        assert_eq!(eligible, expected, "index 3 removed, the rest in place");
+    }
+
     /// An announced set too small to draw from is refused rather than drawn
     /// over — and it is a *different* refusal from a forgery.
     #[test]
@@ -2655,10 +3369,7 @@ mod tests {
             witnesses.iter().map(iroh_base::SecretKey::public).collect();
         announced.push(issuer_key().public());
         let epochs = epoch_fixture::cache_with(EPOCH_HANDLE, &announced, 1_000);
-        let validator = BaselineIntentValidator::enforcing(
-            Arc::clone(&epochs),
-            Arc::new(epoch_fixture::CoverAllInterest),
-        );
+        let validator = enforcing_with(&epochs);
 
         let mut intent = attestable_intent(9);
         for key in &witnesses {
@@ -2679,10 +3390,7 @@ mod tests {
     #[test]
     fn an_under_populated_epoch_admits_a_reversible_intent_provisionally() {
         let epochs = under_populated_epoch();
-        let validator = BaselineIntentValidator::enforcing(
-            Arc::clone(&epochs),
-            Arc::new(epoch_fixture::CoverAllInterest),
-        );
+        let validator = enforcing_with(&epochs);
         let intent = low_population_intent(30, true);
         assert!(
             matches!(
@@ -2714,10 +3422,7 @@ mod tests {
             witnesses.iter().map(iroh_base::SecretKey::public).collect();
         announced.push(issuer_key().public());
         let epochs = epoch_fixture::cache_with(EPOCH_HANDLE, &announced, 1_000);
-        let validator = BaselineIntentValidator::enforcing(
-            Arc::clone(&epochs),
-            Arc::new(epoch_fixture::CoverAllInterest),
-        );
+        let validator = enforcing_with(&epochs);
 
         // Carrying a commitment, so the refusal cannot be blamed on clause 6:
         // this intent is provisional-*eligible* in every respect except the
@@ -2753,10 +3458,7 @@ mod tests {
     #[test]
     fn an_under_populated_epoch_still_refuses_a_transfer() {
         let epochs = under_populated_epoch();
-        let validator = BaselineIntentValidator::enforcing(
-            Arc::clone(&epochs),
-            Arc::new(epoch_fixture::CoverAllInterest),
-        );
+        let validator = enforcing_with(&epochs);
         let key = issuer_key();
         let mut intent = Intent {
             intent_id: 33,
@@ -2829,6 +3531,7 @@ mod tests {
             enforcement: AttestationEnforcement::Required,
             epochs: None,
             interest: None,
+            bindings: None,
         };
         assert_eq!(
             blind.check_at(&intent, &cx(Some(7)), 2_000),
@@ -2844,6 +3547,7 @@ mod tests {
             enforcement: AttestationEnforcement::Required,
             epochs: Some(epoch_fixture::cache_with(EPOCH_HANDLE, &announced, 1_000)),
             interest: None,
+            bindings: Some(distinct_bindings(&announced)),
         };
         assert_eq!(
             standingless.check_at(&intent, &cx(Some(7)), 2_000),
@@ -2925,8 +3629,16 @@ mod tests {
                 valid_until_ms: 50_000,
             },
         ]));
-        let validator =
-            BaselineIntentValidator::enforcing(Arc::clone(&epochs), interest.clone() as Arc<_>);
+        // Both announced sets get bindings, and disjoint accounts: D30's
+        // standing predicate is what these tests are about, so no candidate
+        // may drop out of `E(I)` for a D31 reason.
+        let mut announced = home_ids.clone();
+        announced.extend_from_slice(&away_ids);
+        let validator = BaselineIntentValidator::enforcing(
+            Arc::clone(&epochs),
+            interest.clone() as Arc<_>,
+            distinct_bindings(&announced),
+        );
         (validator, epochs, home, away)
     }
 

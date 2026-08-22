@@ -31,11 +31,12 @@
 use std::sync::Arc;
 
 use bytes::Bytes;
+use orrery_persistd::gateway::{SharedBindingAuthority, SnapshotBindingAuthority};
 use orrery_persistd::witness_epoch::WitnessEpochAuthority;
 use orrery_persistd::{keyspace, FdbIntentExecutor, IntentExecutor};
 use orrery_protocol::{
-    CellEpoch, CellId, CoordinatorInterestSnapshot, GridId, Intent, IntentOp, IntentOutcome,
-    IssuerKey, IssuerKeyId, NodeId, WitnessEpochClaimsV1, WitnessEpochV1,
+    AccountId, CellEpoch, CellId, CoordinatorInterestSnapshot, GridId, Intent, IntentOp,
+    IntentOutcome, IssuerKey, IssuerKeyId, NodeId, WitnessEpochClaimsV1, WitnessEpochV1,
 };
 
 /// This file's own grid, so its `epoch/` and `pid/next` rows never touch
@@ -126,6 +127,24 @@ fn accepted_epoch(
         )
         .expect("the fixture announcement is accepted");
     (epochs, witnesses)
+}
+
+/// D31 clause (e)'s `owner(n)`, answered from a table: one distinct account
+/// per announced witness.
+///
+/// Every fixture intent here carries one `Ruleset`-opaque op and names no
+/// ledger account, so `P(I)` is empty and no announced witness is a party.
+/// What the resolver has to supply is the other half of D31 clause (f): a
+/// candidate whose binding does not resolve is **excluded**, so a fixture with
+/// no bindings at all would record an empty `E(I)` and these tests would be
+/// asserting against a vacuum.
+fn fixture_bindings(witnesses: &[iroh_base::SecretKey]) -> SharedBindingAuthority {
+    Arc::new(SnapshotBindingAuthority::from_bindings(
+        witnesses
+            .iter()
+            .enumerate()
+            .map(|(index, key)| (key.public(), AccountId::new(1_000 + index as u64))),
+    ))
 }
 
 /// Clear every row a test is about to write.
@@ -224,7 +243,7 @@ async fn the_first_intent_of_an_epoch_makes_the_draw_commitment_durable() {
     let (epochs, witnesses) = accepted_epoch(1, handle);
     let exec = FdbIntentExecutor::connect(&cluster, GridId::new(GRID))
         .unwrap()
-        .recording_epochs(Arc::clone(&epochs));
+        .recording_epochs(Arc::clone(&epochs), fixture_bindings(&witnesses));
     let db = Arc::clone(exec.database());
     reset(&db, 1, handle, &[0x9601_0001]).await;
 
@@ -320,7 +339,7 @@ async fn later_intents_in_one_epoch_add_no_epoch_write_and_keep_the_same_draw_ke
     let (epochs, witnesses) = accepted_epoch(2, handle);
     let exec = FdbIntentExecutor::connect(&cluster, GridId::new(GRID))
         .unwrap()
-        .recording_epochs(Arc::clone(&epochs));
+        .recording_epochs(Arc::clone(&epochs), fixture_bindings(&witnesses));
     let db = Arc::clone(exec.database());
     reset(&db, 2, handle, &[0x9601_0011, 0x9601_0012]).await;
     let key = secret(12);
@@ -403,7 +422,7 @@ async fn an_intent_admitted_under_a_stale_draw_key_is_refused_after_the_adoption
     let (sibling_epochs, witnesses) = accepted_epoch(5, handle);
     let exec_a = FdbIntentExecutor::connect(&cluster, GridId::new(GRID))
         .unwrap()
-        .recording_epochs(Arc::clone(&sibling_epochs));
+        .recording_epochs(Arc::clone(&sibling_epochs), fixture_bindings(&witnesses));
     reset(
         exec_a.database(),
         5,
@@ -426,7 +445,7 @@ async fn an_intent_admitted_under_a_stale_draw_key_is_refused_after_the_adoption
     let (successor_epochs, _) = accepted_epoch(5, handle);
     let exec_b = FdbIntentExecutor::connect(&cluster, GridId::new(GRID))
         .unwrap()
-        .recording_epochs(Arc::clone(&successor_epochs));
+        .recording_epochs(Arc::clone(&successor_epochs), fixture_bindings(&witnesses));
 
     // Two intents attested under the successor's own (stale) key, both
     // admitted before it learns anything.
@@ -487,7 +506,7 @@ async fn a_replayed_intent_does_not_certify_an_epoch_row_that_was_never_written(
     let (before, witnesses) = accepted_epoch(6, handle);
     let exec = FdbIntentExecutor::connect(&cluster, GridId::new(GRID))
         .unwrap()
-        .recording_epochs(Arc::clone(&before));
+        .recording_epochs(Arc::clone(&before), fixture_bindings(&witnesses));
     reset(exec.database(), 6, handle, &[0x9601_0051, 0x9601_0052]).await;
 
     let intent = attested_intent(0x9601_0051, &key_for_replay(), handle, &before, &witnesses);
@@ -506,7 +525,7 @@ async fn a_replayed_intent_does_not_certify_an_epoch_row_that_was_never_written(
     let (after, _) = accepted_epoch(6, handle);
     let restarted = FdbIntentExecutor::connect(&cluster, GridId::new(GRID))
         .unwrap()
-        .recording_epochs(Arc::clone(&after));
+        .recording_epochs(Arc::clone(&after), fixture_bindings(&witnesses));
     assert_ne!(
         after.resolve(handle).expect("cached").draw_key(),
         before.resolve(handle).expect("cached").draw_key()
@@ -562,7 +581,7 @@ async fn a_durable_draw_key_from_a_sibling_is_adopted_and_this_intent_is_refused
     let (sibling_epochs, witnesses) = accepted_epoch(4, handle);
     let exec_a = FdbIntentExecutor::connect(&cluster, GridId::new(GRID))
         .unwrap()
-        .recording_epochs(Arc::clone(&sibling_epochs));
+        .recording_epochs(Arc::clone(&sibling_epochs), fixture_bindings(&witnesses));
     reset(
         exec_a.database(),
         4,
@@ -585,7 +604,7 @@ async fn a_durable_draw_key_from_a_sibling_is_adopted_and_this_intent_is_refused
 
     let exec_b = FdbIntentExecutor::connect(&cluster, GridId::new(GRID))
         .unwrap()
-        .recording_epochs(Arc::clone(&successor_epochs));
+        .recording_epochs(Arc::clone(&successor_epochs), fixture_bindings(&witnesses));
     let contested = attested_intent(0x9601_0032, &key, handle, &successor_epochs, &witnesses);
     assert_eq!(
         exec_b.execute(&contested).await.unwrap(),
@@ -622,4 +641,104 @@ async fn a_durable_draw_key_from_a_sibling_is_adopted_and_this_intent_is_refused
         exec_b.execute(&resubmitted).await.unwrap(),
         IntentOutcome::Committed { .. }
     ));
+}
+
+/// D10 item 4's account half reaches the **recorded** vector, not only
+/// admission: a party account's NodeId is absent from `AttestRow.eligible`,
+/// and the survivors are still in announced order.
+///
+/// The reason this needs a cluster is the reason D27 clause (f) exists. `E(I)`
+/// is derived twice — once by the validator to decide, once by this executor
+/// to record — and only the durable row can show that the second derivation
+/// applied the same exclusion as the first. A recorded vector wider than the
+/// admitted one would let an auditor redraw `required(I)` over members the
+/// gateway never drew from, which is the audit convicting an honest gateway.
+#[tokio::test]
+async fn a_party_accounts_node_id_is_absent_from_the_recorded_eligible_vector() {
+    let Some(cluster) = fdb_cluster_file() else {
+        eprintln!("skipping: ORRERY_FDB_CLUSTER_FILE not set and no .fdb-dev/fdb.cluster");
+        return;
+    };
+    let handle = 0x9601_0000_0000_0007;
+    let (epochs, witnesses) = accepted_epoch(7, handle);
+    let announced: Vec<NodeId> = witnesses.iter().map(iroh_base::SecretKey::public).collect();
+
+    // The submitter, and one announced witness that is its own second device:
+    // a different NodeId, the same account. Index 2 rather than 0 so the
+    // survivors have to keep their order across a hole in the middle.
+    let key = secret(17);
+    const PARTY: AccountId = AccountId(151_700);
+    const PARTY_INDEX: usize = 2;
+    let mut pairs: Vec<(NodeId, AccountId)> = announced
+        .iter()
+        .enumerate()
+        .map(|(index, node)| (*node, AccountId::new(1_000 + index as u64)))
+        .collect();
+    pairs[PARTY_INDEX].1 = PARTY;
+    pairs.push((key.public(), PARTY));
+    let bindings: SharedBindingAuthority = Arc::new(SnapshotBindingAuthority::from_bindings(pairs));
+
+    let exec = FdbIntentExecutor::connect(&cluster, GridId::new(GRID))
+        .unwrap()
+        .recording_epochs(Arc::clone(&epochs), Arc::clone(&bindings));
+    let db = Arc::clone(exec.database());
+    reset(&db, 7, handle, &[0x9601_0061]).await;
+
+    // What the gateway would have admitted over: the announced set minus the
+    // party's device, in announced order.
+    let expected: Vec<NodeId> = announced
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| *index != PARTY_INDEX)
+        .map(|(_, node)| *node)
+        .collect();
+
+    let mut intent = Intent {
+        evidence: None,
+        intent_id: 0x9601_0061,
+        issuer: key.public(),
+        cell_epoch: CellEpoch::new(handle),
+        ops: vec![IntentOp {
+            op: 100,
+            args: Bytes::new(),
+        }],
+        attestations: Vec::new(),
+        signature: key.sign(b"placeholder"),
+    };
+    intent.sign(&key);
+    let cached = epochs.resolve(handle).expect("cached");
+    for node in cached.required_witnesses(intent.intent_id, &expected) {
+        let witness = witnesses
+            .iter()
+            .find(|w| w.public() == node)
+            .expect("the draw names only announced witnesses");
+        let attestation = intent.attest(witness);
+        intent.attestations.push(attestation);
+    }
+    assert!(matches!(
+        exec.execute(&intent).await.unwrap(),
+        IntentOutcome::Committed { .. }
+    ));
+
+    let attest: keyspace::AttestRow = postcard::from_bytes(
+        &read_key(&db, keyspace::attest_key(intent.intent_id).to_vec())
+            .await
+            .expect("attest row"),
+    )
+    .expect("attest row decodes");
+    assert!(
+        !attest.eligible.contains(&announced[PARTY_INDEX]),
+        "a NodeId bound to a party account is not in the audited vector"
+    );
+    assert_eq!(
+        attest.eligible, expected,
+        "and the survivors keep announced order — the recorded vector is the \
+         object an auditor draws over, not a normalization of it"
+    );
+    assert_ne!(
+        attest.eligible,
+        orrery_protocol::eligible_witnesses(&cached.snapshot.selected, intent.issuer),
+        "the NodeId-only derivation would have recorded the party's device, \
+         so this assertion is what makes the previous two mean something"
+    );
 }
