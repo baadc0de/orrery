@@ -379,9 +379,10 @@ to pre-authorise it.
 
 ## Owner decisions requested
 
-1. **Threshold package:** accept recommended `3 / 5 / 7`, or choose the
-   conservative legacy-shaped `3 / 6 / 10`. Recommendation: `3 / 5 / 7` for
-   the explicit 8.19-day and 22.19-day escalation windows above.
+1. **Threshold package: decided — configurable, defaulting to `3 / 5 / 7`.**
+   Resolved by the repo owner on 2026-08-22. The values are deployment
+   configuration bounded by four startup-validated invariants; see clause (d).
+   The legacy-shaped `3 / 6 / 10` was not adopted, and fails invariant (iii).
 2. **Guest experience during cooldown: decided — no.** Resolved by the repo
    owner on 2026-08-22. See clause (h).
 
