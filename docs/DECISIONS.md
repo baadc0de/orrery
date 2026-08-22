@@ -52,6 +52,7 @@ their linked dependencies.
 | D35 | [ADR-0035](adr/0035-lease-key-discriminator.md) | The lease registrar row takes the `le` discriminator inside `l`; the disjointness guard learns sub-spans |
 | D36 | [ADR-0036](adr/0036-binding-rate-window.md) | The binding-rate window: `dw` answers D31 clause (g) inside `d`; amends D31 |
 | D37 | [ADR-0037](adr/0037-unavailable-witness-epoch.md) | Unavailable witness epochs refuse with a bounded cure; corrects D27/D28 |
+| D38 | [ADR-0038](adr/0038-at-rest-schema-versioning.md) | At-rest schema versioning as three work items: formats before machinery, migrations fit D21's freeze additively (Proposed) |
 
 ## Status and supersession
 
