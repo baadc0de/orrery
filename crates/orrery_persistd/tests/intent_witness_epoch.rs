@@ -108,6 +108,11 @@ fn announcement(epoch: u32, handle: u64, selected: &[NodeId]) -> Vec<u8> {
 /// durable row is keyed by `(grid, cell, epoch)`, so two tests sharing a
 /// counter would share a row and the second would find the first's draw key
 /// already there. Handles are per-test too, because the index is global.
+///
+/// Calling this **twice for one handle** models a second gateway over the same
+/// announcement, and a test that then expects the second one's intents to be
+/// refused wants [`stale_successor`], not this: a fresh key is not a diverging
+/// draw, and the difference is issue #288.
 fn accepted_epoch(
     epoch: u32,
     handle: u64,
@@ -206,6 +211,135 @@ fn attested_intent(
         intent.attestations.push(attestation);
     }
     intent
+}
+
+/// A second gateway's cache over the same announcement, minted so that its
+/// draw **really** diverges from the durable one — for every intent this test
+/// will attest under it.
+///
+/// # Why a loop and not a second `accepted_epoch` call
+///
+/// Every stale-draw-key test in this file asserts a *refusal*, and the thing
+/// that earns the refusal is not that the two draw keys differ. It is that
+/// `required_witnesses(durable, id, E)` names witnesses the intent's
+/// co-signatures — solicited under the successor's own key — do not cover.
+/// `keyed_hash` over two independent keys is two independent orderings of `E`,
+/// so with `K = 3` of `|E| = 7` the two draws name the *same three witnesses*
+/// with probability `1 / C(7,3) = 1/35`, measured at 2.8% and matching to
+/// three digits. When that happens the intent genuinely carries the subset the
+/// durable key requires, the executor's re-proof passes because it *should*,
+/// and the intent commits — a green production path failing a fixture that
+/// asserted an accident. Five such assertions per run put the file's failure
+/// rate at `1 - (34/35)^5 ≈ 13%`, which is issue #288's "1 in 5".
+///
+/// So the divergence is a property the fixture has to *establish*, not one it
+/// may assume. Re-minting until it holds costs ~35/34 accepts on average and
+/// makes every refusal below deterministic.
+///
+/// # Why the intent ids are declared up front
+///
+/// The divergence is per intent id — it is `id` that goes into the hash — so a
+/// cache proven to diverge for one id says nothing about the next. Handing
+/// back a bare `WitnessEpochAuthority` would let the next test attest a new id
+/// under a cache nobody checked it against, and the flake would come back
+/// looking exactly like a fresh bug. [`StaleSuccessor::intent`] is therefore
+/// the only way to attest under this cache, and it refuses an id that was not
+/// in the set the constructor proved.
+struct StaleSuccessor {
+    epochs: Arc<WitnessEpochAuthority>,
+    handle: u64,
+    diverging: Vec<u128>,
+}
+
+impl StaleSuccessor {
+    /// The cache itself, for the assertions about adoption and commitment.
+    fn epochs(&self) -> &Arc<WitnessEpochAuthority> {
+        &self.epochs
+    }
+
+    /// An intent co-signed under this successor's *stale* key, for one of the
+    /// ids the constructor proved the draw diverges on.
+    fn intent(
+        &self,
+        id: u128,
+        key: &iroh_base::SecretKey,
+        witnesses: &[iroh_base::SecretKey],
+    ) -> Intent {
+        assert!(
+            self.diverging.contains(&id),
+            "intent {id:#x} was not among the ids `stale_successor` proved this \
+             cache's draw diverges on — declare it there, or its refusal is a \
+             1-in-35 coin flip"
+        );
+        attested_intent(id, key, self.handle, &self.epochs, witnesses)
+    }
+}
+
+/// Mint successor caches over the announcement for `(epoch, handle)` until one
+/// draws a different required subset from `durable` for **every** id in
+/// `intents`.
+fn stale_successor(
+    epoch: u32,
+    handle: u64,
+    durable: &[u8; 32],
+    issuer: NodeId,
+    witnesses: &[iroh_base::SecretKey],
+    intents: &[u128],
+) -> StaleSuccessor {
+    assert!(
+        !intents.is_empty(),
+        "a successor with nothing to attest proves nothing"
+    );
+    let announced: Vec<NodeId> = witnesses.iter().map(iroh_base::SecretKey::public).collect();
+    let eligible = orrery_protocol::eligible_witnesses(&announced, issuer);
+    assert!(
+        eligible.len() > orrery_protocol::WITNESS_QUORUM_K,
+        "with |E| == K every draw names the whole of E and no key can diverge"
+    );
+    let required_under = |draw_key: &[u8; 32], id: u128| -> Vec<[u8; 32]> {
+        // The executor's re-proof asks whether every member of the durable
+        // draw is *among* the attestations, so what has to differ is the set,
+        // not the order it came back in. Comparing the ordered vector would
+        // accept a same-set/different-order pair as "diverging" and let the
+        // flake through at 1/35 minus 1/210.
+        let mut names: Vec<[u8; 32]> = orrery_protocol::required_witnesses(draw_key, id, &eligible)
+            .into_iter()
+            .map(|node| *node.as_bytes())
+            .collect();
+        names.sort_unstable();
+        names
+    };
+    let durable_required: Vec<Vec<[u8; 32]>> = intents
+        .iter()
+        .map(|id| required_under(durable, *id))
+        .collect();
+
+    // 400 tries is `(34/35)^400 < 1e-5` for a single id — a cap that reports a
+    // broken draw rather than hanging, not a retry budget.
+    for _ in 0..400 {
+        let (candidate, _) = accepted_epoch(epoch, handle);
+        let minted = *candidate.resolve(handle).expect("cached").draw_key();
+        assert_ne!(
+            &minted, durable,
+            "two independent gateways must not mint the same key, or these \
+             tests prove nothing"
+        );
+        if intents
+            .iter()
+            .zip(&durable_required)
+            .all(|(id, under_durable)| &required_under(&minted, *id) != under_durable)
+        {
+            return StaleSuccessor {
+                epochs: candidate,
+                handle,
+                diverging: intents.to_vec(),
+            };
+        }
+    }
+    panic!(
+        "no minted draw key diverged from the durable one for {intents:x?} in \
+         400 tries — the draw is not behaving like a keyed hash"
+    );
 }
 
 fn fdb_cluster_file() -> Option<String> {
@@ -442,15 +576,23 @@ async fn an_intent_admitted_under_a_stale_draw_key_is_refused_after_the_adoption
         .await
         .unwrap();
 
-    let (successor_epochs, _) = accepted_epoch(5, handle);
+    let durable = *sibling_epochs.resolve(handle).expect("cached").draw_key();
+    let successor = stale_successor(
+        5,
+        handle,
+        &durable,
+        key.public(),
+        &witnesses,
+        &[0x9601_0042, 0x9601_0043],
+    );
     let exec_b = FdbIntentExecutor::connect(&cluster, GridId::new(GRID))
         .unwrap()
-        .recording_epochs(Arc::clone(&successor_epochs), fixture_bindings(&witnesses));
+        .recording_epochs(Arc::clone(successor.epochs()), fixture_bindings(&witnesses));
 
     // Two intents attested under the successor's own (stale) key, both
     // admitted before it learns anything.
-    let in_flight = attested_intent(0x9601_0042, &key, handle, &successor_epochs, &witnesses);
-    let discovers = attested_intent(0x9601_0043, &key, handle, &successor_epochs, &witnesses);
+    let in_flight = successor.intent(0x9601_0042, &key, &witnesses);
+    let discovers = successor.intent(0x9601_0043, &key, &witnesses);
 
     assert_eq!(
         exec_b.execute(&discovers).await.unwrap(),
@@ -472,13 +614,26 @@ async fn an_intent_admitted_under_a_stale_draw_key_is_refused_after_the_adoption
 
     // A fresh intent, drawn under the adopted key, commits — otherwise the
     // assertions above are satisfied by a gateway that refuses everything.
+    // This one goes through `attested_intent` rather than `StaleSuccessor`
+    // because by now the cache has adopted the durable key, so its draw is
+    // meant to *agree*: it is the control, not a stale-key case.
+    assert_eq!(
+        successor
+            .epochs()
+            .resolve(handle)
+            .expect("cached")
+            .draw_key(),
+        &durable,
+        "the adoption is what makes the next intent a control rather than a \
+         third stale-key case"
+    );
     assert!(matches!(
         exec_b
             .execute(&attested_intent(
                 0x9601_0044,
                 &key,
                 handle,
-                &successor_epochs,
+                successor.epochs(),
                 &witnesses
             ))
             .await
@@ -521,13 +676,22 @@ async fn a_replayed_intent_does_not_certify_an_epoch_row_that_was_never_written(
     .await
     .expect("the first intent wrote the row");
 
-    // Restart: a new cache over the same announcement, a new draw key.
-    let (after, _) = accepted_epoch(6, handle);
+    // Restart: a new cache over the same announcement, a new draw key — and
+    // one whose draw for the intent below really names a different subset,
+    // which is what the refusal at the end of this test rests on.
+    let after = stale_successor(
+        6,
+        handle,
+        before.resolve(handle).expect("cached").draw_key(),
+        key_for_replay().public(),
+        &witnesses,
+        &[0x9601_0052],
+    );
     let restarted = FdbIntentExecutor::connect(&cluster, GridId::new(GRID))
         .unwrap()
-        .recording_epochs(Arc::clone(&after), fixture_bindings(&witnesses));
+        .recording_epochs(Arc::clone(after.epochs()), fixture_bindings(&witnesses));
     assert_ne!(
-        after.resolve(handle).expect("cached").draw_key(),
+        after.epochs().resolve(handle).expect("cached").draw_key(),
         before.resolve(handle).expect("cached").draw_key()
     );
 
@@ -537,14 +701,18 @@ async fn a_replayed_intent_does_not_certify_an_epoch_row_that_was_never_written(
         IntentOutcome::Committed { .. }
     ));
     assert!(
-        !after.resolve(handle).expect("cached").is_committed(),
+        !after
+            .epochs()
+            .resolve(handle)
+            .expect("cached")
+            .is_committed(),
         "a replay certifies nothing about the epoch row"
     );
 
     // So the very next real intent still reaches the row — and is refused,
     // because its subset was drawn under the freshly minted key rather than
     // the durable one.
-    let fresh = attested_intent(0x9601_0052, &key_for_replay(), handle, &after, &witnesses);
+    let fresh = after.intent(0x9601_0052, &key_for_replay(), &witnesses);
     assert_eq!(
         restarted.execute(&fresh).await.unwrap(),
         IntentOutcome::Rejected {
@@ -594,18 +762,23 @@ async fn a_durable_draw_key_from_a_sibling_is_adopted_and_this_intent_is_refused
     exec_a.execute(&first).await.unwrap();
     let durable = *sibling_epochs.resolve(handle).expect("cached").draw_key();
 
-    let (successor_epochs, _) = accepted_epoch(4, handle);
-    let minted = *successor_epochs.resolve(handle).expect("cached").draw_key();
-    assert_ne!(
-        minted, durable,
-        "two independent gateways must not mint the same key, or this test \
-         proves nothing"
+    // A different key is necessary but not sufficient: what refuses the
+    // contested intent is a different *required subset*, and two independent
+    // keys name the same three witnesses once in 35. `stale_successor` mints
+    // until they do not.
+    let successor = stale_successor(
+        4,
+        handle,
+        &durable,
+        key.public(),
+        &witnesses,
+        &[0x9601_0032],
     );
 
     let exec_b = FdbIntentExecutor::connect(&cluster, GridId::new(GRID))
         .unwrap()
-        .recording_epochs(Arc::clone(&successor_epochs), fixture_bindings(&witnesses));
-    let contested = attested_intent(0x9601_0032, &key, handle, &successor_epochs, &witnesses);
+        .recording_epochs(Arc::clone(successor.epochs()), fixture_bindings(&witnesses));
+    let contested = successor.intent(0x9601_0032, &key, &witnesses);
     assert_eq!(
         exec_b.execute(&contested).await.unwrap(),
         IntentOutcome::Rejected {
@@ -615,7 +788,11 @@ async fn a_durable_draw_key_from_a_sibling_is_adopted_and_this_intent_is_refused
          cell-epoch's, so it is refused rather than committed on a bad draw"
     );
     assert_eq!(
-        successor_epochs.resolve(handle).expect("cached").draw_key(),
+        successor
+            .epochs()
+            .resolve(handle)
+            .expect("cached")
+            .draw_key(),
         &durable,
         "and the durable key is adopted, so the resubmission is judged right"
     );
@@ -636,7 +813,9 @@ async fn a_durable_draw_key_from_a_sibling_is_adopted_and_this_intent_is_refused
         "and records no eligible vector for a judgement it did not make"
     );
 
-    let resubmitted = attested_intent(0x9601_0033, &key, handle, &successor_epochs, &witnesses);
+    // Drawn under the adopted key, so this one is a control: `attested_intent`
+    // deliberately, not `StaleSuccessor::intent`.
+    let resubmitted = attested_intent(0x9601_0033, &key, handle, successor.epochs(), &witnesses);
     assert!(matches!(
         exec_b.execute(&resubmitted).await.unwrap(),
         IntentOutcome::Committed { .. }
@@ -893,15 +1072,25 @@ async fn a_shadow_executor_does_not_refuse_at_commit_what_admission_admitted() {
     ));
 
     // A successor with its own, different key, and two intents attested under
-    // it — both below quorum against the *durable* draw.
-    let (successor_epochs, _) = accepted_epoch(10, handle);
-    let stale_for_armed = attested_intent(0x9601_0082, &key, handle, &successor_epochs, &witnesses);
-    let stale_for_shadow =
-        attested_intent(0x9601_0083, &key, handle, &successor_epochs, &witnesses);
+    // it — both below quorum against the *durable* draw. "Below quorum" is the
+    // property that has to be established rather than assumed: a successor
+    // whose draw happened to name the durable three would put both intents
+    // *at* quorum, and the armed control below would commit.
+    let durable_key = *sibling_epochs.resolve(handle).expect("cached").draw_key();
+    let successor = stale_successor(
+        10,
+        handle,
+        &durable_key,
+        key.public(),
+        &witnesses,
+        &[0x9601_0082, 0x9601_0083],
+    );
+    let stale_for_armed = successor.intent(0x9601_0082, &key, &witnesses);
+    let stale_for_shadow = successor.intent(0x9601_0083, &key, &witnesses);
 
     let armed = FdbIntentExecutor::connect(&cluster, GridId::new(GRID))
         .unwrap()
-        .recording_epochs(Arc::clone(&successor_epochs), fixture_bindings(&witnesses));
+        .recording_epochs(Arc::clone(successor.epochs()), fixture_bindings(&witnesses));
     assert_eq!(
         armed.execute(&stale_for_armed).await.unwrap(),
         IntentOutcome::Rejected {
