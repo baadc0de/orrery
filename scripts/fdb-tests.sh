@@ -140,7 +140,12 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # bounded-log unit tests (3) and `bin/persistd`'s flag-reaches-the-validator
 # tests (3); they need no cluster but run in the same invocation and count the
 # same. The floor rises by all eighteen: 437 -> 455.
-FLOOR="${ORRERY_FDB_TEST_FLOOR:-455}"
+#
+# Strike-ledger filing (issue #215, D33) adds one executor unit test that needs
+# the cluster. It writes distinct subject and reporter bindings, files a
+# confirmed verdict, and proves the `ya` row exists only under the subject's
+# account. The floor rises by one more: 455 -> 456.
+FLOOR="${ORRERY_FDB_TEST_FLOOR:-456}"
 
 # Every test file whose contents only mean anything against a real cluster. If
 # one of these reports no executed tests, the tier is dark again whatever the

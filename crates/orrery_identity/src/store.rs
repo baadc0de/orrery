@@ -108,6 +108,10 @@ pub enum IdentityError {
     /// to make the lookup unavailable would otherwise select the branch that
     /// admits a ban.
     StandingUnavailable(AccountId),
+    /// The live score is at or above the configured cooldown threshold.
+    Cooldown(AccountId),
+    /// The live score is at or above the configured ban threshold.
+    Banned(AccountId),
     /// The durable store failed.
     Store(String),
 }
@@ -137,6 +141,8 @@ impl fmt::Display for IdentityError {
             Self::StandingUnavailable(account) => {
                 write!(f, "standing for account {} is unavailable", account.0)
             }
+            Self::Cooldown(account) => write!(f, "account {} is in cooldown", account.0),
+            Self::Banned(account) => write!(f, "account {} is banned", account.0),
             Self::Store(message) => write!(f, "identity store: {message}"),
         }
     }

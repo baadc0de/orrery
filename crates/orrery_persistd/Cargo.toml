@@ -39,6 +39,7 @@ postcard = { workspace = true }
 serde = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
+blake3 = "1.8"
 iroh = { workspace = true }
 async-trait = "0.1"
 clap = { workspace = true }
@@ -77,7 +78,6 @@ name = "lease_renewal"
 harness = false
 
 [dev-dependencies]
-blake3 = "1.8"
 tempfile = "3"
 proptest = { workspace = true }
 iroh-base = { workspace = true }

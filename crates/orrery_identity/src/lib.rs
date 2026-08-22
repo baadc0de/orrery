@@ -36,13 +36,13 @@
 //!
 //! # What is deliberately not here
 //!
-//! **Standing is read, never computed.** D33 (proposed) puts the `ya` strike
-//! ledger and the `S(t) = Σ wᵢ·2^(−ageᵢ/14d)` read-time decay behind a separate
-//! record and a separate writer (the adjudication executor). This crate takes
-//! standing from a [`StandingSource`] and stamps it into the claims. The
-//! default source, [`UnavailableStanding`], **refuses**, which is D33 clause
-//! (f)'s posture: "a missing or unreadable ledger is never interpreted as
-//! `Good`". A deployment substitutes a real source when one exists.
+//! **Standing is read, never written here.** D33 (proposed) puts the `ya`
+//! strike ledger behind a separate writer (the adjudication executor).
+//! [`standing`] supplies its read-time scorer and configurable boundaries;
+//! this crate still takes the result through [`StandingSource`] and stamps it
+//! into claims. The default source, [`UnavailableStanding`], **refuses**,
+//! which is D33 clause (f)'s posture: "a missing or unreadable ledger is never
+//! interpreted as `Good`".
 //!
 //! **Credentials, payment and account creation UX.** D10 item 5 says an account
 //! costs something; pricing it and proving it was paid for is a product
@@ -67,6 +67,7 @@
 pub mod issuer;
 pub mod mem;
 pub mod service;
+pub mod standing;
 pub mod store;
 
 #[cfg(feature = "fdb")]
@@ -77,5 +78,9 @@ pub use mem::MemAccountStore;
 pub use service::{
     IdentityService, IssuedSession, StandingSource, StaticStanding, SystemClock,
     UnavailableStanding, DEFAULT_SESSION_TOKEN_TTL_MS,
+};
+pub use standing::{
+    score_rows, ComputedStanding, StandingLevel, StandingScores, StandingThresholds,
+    StaticStrikeRows, DEFAULT_STANDING_THRESHOLDS,
 };
 pub use store::{AccountStore, BindOutcome, IdentityError};
