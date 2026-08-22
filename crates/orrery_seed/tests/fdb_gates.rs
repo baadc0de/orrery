@@ -377,9 +377,21 @@ async fn every_written_value_carries_the_live_tag() {
         .await
         .expect("scan world");
     assert_eq!(rows.len(), 1_000, "smoke writes exactly 1000 world rows");
+    // Every seeded row is live *and* self-describing (D38 clause (d)(2)): the
+    // versioned envelope, carrying the archetype's declared schema version as
+    // the bag's floor. Asserting the tag alone would still pass on a writer
+    // that dropped the floor, so the floor is read back too — without decoding
+    // the bag, which is the whole point of putting it in the envelope.
     assert!(rows
         .iter()
-        .all(|(_, value)| value.first() == Some(&keyspace::LIVE_TAG)));
+        .all(|(_, value)| value.first() == Some(&keyspace::LIVE_VERSIONED_TAG)));
+    assert!(
+        rows.iter()
+            .all(|(_, value)| keyspace::world_value_schema_floor(value) == Some(0)),
+        "smoke declares no schema_version, so its archetype floors at 0 — and \
+         the row says 0 out loud rather than saying nothing, which is the \
+         difference between a self-describing row and one a reader bootstraps"
+    );
 }
 
 #[cfg(feature = "fdb")]

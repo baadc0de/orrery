@@ -312,6 +312,7 @@ async fn a_renewal_whose_entity_migrates_under_it_is_re_resolved() {
     entered.notified().await;
 
     let rekey = orrery_protocol::EntityRekey {
+        source_schema_floor: 0,
         version: ENTITY_REKEY_VERSION,
         entity,
         source_grid: GridId::ROOT,

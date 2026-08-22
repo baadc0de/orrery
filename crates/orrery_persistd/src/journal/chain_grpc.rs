@@ -612,7 +612,12 @@ impl FollowerReplica {
             .records
             .iter()
             .map(|bytes| {
-                postcard::from_bytes(bytes)
+                // Same frame the journals write (D38 (d)(5)), so the encoding
+                // version survives the hop to the follower rather than being
+                // re-invented on the far side. A primary that predates the
+                // frame sends a bare body, which bootstraps to encoding v0.
+                JournalRecord::decode_frame(bytes)
+                    .map(|(record, _encoding)| record)
                     .map_err(|e| Status::invalid_argument(format!("decode journal record: {e}")))
             })
             .collect::<Result<_, _>>()?;
@@ -1266,7 +1271,8 @@ impl GrpcChainTransport {
         let encoded: Vec<Vec<u8>> = records
             .iter()
             .map(|record| {
-                postcard::to_stdvec(record)
+                record
+                    .encode_frame()
                     .map_err(|e| JournalError::Store(format!("encode chain record: {e}")))
             })
             .collect::<Result<_, _>>()?;

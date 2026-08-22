@@ -405,7 +405,11 @@ impl Journal {
             if !publish {
                 record.lsn = origin_lsn;
             }
-            let encoded = postcard::to_stdvec(&record)
+            // The logical record is written through its versioned frame (D38
+            // (d)(5)), never bare postcard: the encoding version is stamped by
+            // the writer rather than inferred by whoever reads the WAL back.
+            let encoded = record
+                .encode_frame()
                 .map_err(|error| JournalError::Store(format!("encode record: {error}")))?;
             (local_lsn, key, encoded)
         };
@@ -1493,8 +1497,13 @@ fn decode_envelope(bytes: &[u8], lsn: Option<Lsn>) -> Result<RawEnvelope, Journa
 }
 
 fn decode_record(local_lsn: Lsn, bytes: &[u8]) -> Result<StoredRecord, JournalError> {
-    let record: JournalRecord =
-        postcard::from_bytes(bytes).map_err(|error| JournalError::Corrupt {
+    // A frame written before journals were self-describing carries no version
+    // trailer, and the bootstrap rule reads it as encoding v0 rather than
+    // refusing it (D38 (d)(1), `orrery_protocol::atrest`). Nothing here acts on
+    // the version — consuming it is W2's job (#281); this reader only proves it
+    // survived the round trip.
+    let (record, _encoding) =
+        JournalRecord::decode_frame(bytes).map_err(|error| JournalError::Corrupt {
             lsn: local_lsn,
             msg: format!("decode journal record: {error}"),
         })?;
@@ -1645,6 +1654,46 @@ mod tests {
         let encoded = postcard::to_stdvec(&envelope).expect("encode V1 fixture");
 
         assert_eq!(encoded, [0, 0, 2, 3, 2, 4, 5, 1, 1, 1, 6, 2, 7, 8]);
+    }
+
+    #[test]
+    fn a_journal_record_written_before_versioning_replays_as_encoding_v0() {
+        // D38 clause (d)(1) on the journal half: the bytes an older writer
+        // produced are a bare postcard body with no trailer. `decode_record`
+        // is the one door every replay path enters through, so this is the
+        // reader that must bootstrap them rather than refuse them — and a
+        // refusal here is an unreadable journal, not a degraded one.
+        let record = record(7);
+        let unversioned = postcard::to_stdvec(&record).expect("legacy encode");
+        let framed = record.encode_frame().expect("frame encode");
+        assert_eq!(
+            framed.len(),
+            unversioned.len() + 1,
+            "the frame is the legacy body plus one version byte"
+        );
+        assert_eq!(
+            *framed.last().expect("nonempty"),
+            orrery_protocol::JOURNAL_RECORD_ENCODING
+        );
+
+        let stored = decode_record(Lsn::new(1, 2), &unversioned).expect("bootstraps to v0");
+        assert_eq!(stored.record, record, "the record survives unchanged");
+        assert_eq!(
+            orrery_protocol::JournalRecord::decode_frame(&unversioned)
+                .expect("bootstraps")
+                .1,
+            orrery_protocol::atrest::ENCODING_V0,
+            "absent == v0: an unversioned record is v0, not a decode failure"
+        );
+
+        // And a frame this writer produced round-trips through the same door
+        // carrying its stamped version.
+        assert_eq!(
+            decode_record(Lsn::new(1, 2), &framed)
+                .expect("decodes")
+                .record,
+            record
+        );
     }
 
     #[test]

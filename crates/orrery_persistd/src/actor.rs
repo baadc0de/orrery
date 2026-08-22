@@ -114,7 +114,8 @@ pub(crate) fn cancel_tombstone(
     }
 }
 
-/// An opaque entity record: component bytes plus a dirty flag (§3.1).
+/// An opaque entity record: component bytes, a dirty flag, and the bag's
+/// schema floor (§3.1, D38 clause (d)(2)).
 ///
 /// Components are stored as postcard bytes so the actor never needs the game's
 /// component types — only the `Ruleset` does (which lands in a later slice).
@@ -124,6 +125,21 @@ pub struct EntityRecord {
     pub components: bytes::Bytes,
     /// Whether this entity was touched since the last checkpoint.
     pub dirty: bool,
+    /// The bag's schema floor — the minimum schema version over its component
+    /// slots ([`crate::schema::ComponentBag::schema_floor`]).
+    ///
+    /// **It rides the record rather than being recomputed at write-back.** The
+    /// checkpointer stamps this number into the `world/` value envelope so a
+    /// sweep can read it without opening the bag — and the checkpointer cannot
+    /// open the bag either, because the bag is `Ruleset`-opaque here by
+    /// construction. So the producer states the floor and the record carries it
+    /// through the read-modify-write cycle unchanged: a row read at floor 7 is
+    /// written back at floor 7 rather than quietly demoted to v0.
+    ///
+    /// [`Default`] is [`SCHEMA_V0`](orrery_protocol::atrest::SCHEMA_V0), which
+    /// is the bootstrap rule rather than a guess: a producer that says nothing
+    /// has written an unversioned bag.
+    pub schema_floor: orrery_protocol::atrest::SchemaVersion,
 }
 
 /// The result of admitting a diff (currently: accepted with an LSN, or NACKed).
@@ -1282,6 +1298,15 @@ fn fold(env: &mut ActorEnv, record: &JournalRecord, now_ms: u64) {
             let entry = env.state.entities.entry(record.entity).or_default();
             entry.components = record.payload.clone();
             entry.dirty = true;
+            // The bag is replaced wholesale, so the floor it carried is
+            // replaced too. A diff arrives from a peer that makes no schema
+            // statement, and the bootstrap rule's answer for bytes with no
+            // statement is v0 (D38 (d)(1)) — *not* the floor of the bag these
+            // bytes just overwrote, which would claim a version for a payload
+            // nobody versioned. When a producer starts framing its bags
+            // ([`crate::schema::ComponentBag`]), the declared floor arrives on
+            // the uplink and this becomes a read of it.
+            entry.schema_floor = orrery_protocol::atrest::SCHEMA_V0;
             // An ordinary diff at a new cell moves the durable row's key as
             // surely as a rekey does: the vacated key must be cleared, or the
             // checkpoint leaves a second live row behind.
@@ -1357,6 +1382,10 @@ fn fold(env: &mut ActorEnv, record: &JournalRecord, now_ms: u64) {
                         EntityRecord {
                             components: rekey.source_record,
                             dirty: true,
+                            // The floor travels with the image (D38 (d)(2)):
+                            // a row that arrives here up to date is written
+                            // back up to date.
+                            schema_floor: rekey.source_schema_floor,
                         },
                     );
                     note_row_moved(

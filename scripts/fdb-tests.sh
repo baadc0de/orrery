@@ -199,6 +199,27 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # rather than fdb-gated ones. A full run measured 720 executed tests on
 # 2026-08-22. The floor rises by those six: 485 -> 491.
 #
+# Self-describing at-rest formats (issue #280, D38 clause (d)) add twelve.
+# Eleven are `orrery_persistd` library tests and need no cluster — five on the
+# component-bag framing and its floor, five on the `world/` value envelope
+# (the unversioned row that must read as v0, the stale row a sweep separates
+# without decoding an undecodable bag, the envelope floor agreeing with the
+# bag's slots, the three tags, and the marker's four-byte cost), and one in
+# `journal::raw` proving a pre-versioning record frame replays as encoding v0
+# through the same `decode_record` every replay path enters. The twelfth is in
+# `tests/checkpoint_restore.rs` and genuinely needs the cluster: it plants a
+# `LIVE_TAG` row and a floor-7 row on real keys, reads both back through
+# `load`, checkpoints them, and re-reads the raw values to prove write-back
+# stamps the envelope and never demotes a stated floor. A measured run: the
+# library target went 334 -> 345, checkpoint_restore +1. The floor rises by
+# those twelve: 491 -> 503.
+#
+# A full run measured 734 executed tests on 2026-08-22, two above the 732 this
+# arithmetic accounts for. Those two landed between the last recorded
+# measurement and this one and were never attributed, so — as with the two
+# earlier entries in this list that ran short of their measurement — they are
+# deliberately not claimed here.
+#
 # Note for whoever raises it next, because it has now bitten twice (#273): the
 # healthy fixture below is the coupled half. It emits 120 library tests plus
 # `per_target` for each of the nine required targets, and a floor that walks up
@@ -206,7 +227,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # passes should have passed", which names neither the floor nor the fixture.
 # Raise the per-target count in the same commit, and leave real headroom rather
 # than the minimum that passes today.
-FLOOR="${ORRERY_FDB_TEST_FLOOR:-491}"
+FLOOR="${ORRERY_FDB_TEST_FLOOR:-503}"
 
 # Every test file whose contents only mean anything against a real cluster. If
 # one of these reports no executed tests, the tier is dark again whatever the

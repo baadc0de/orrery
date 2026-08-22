@@ -420,7 +420,11 @@ impl Journal {
             if !publish {
                 record.lsn = origin_lsn;
             }
-            let encoded = postcard::to_stdvec(&record)
+            // Through the versioned frame, exactly as the raw journal writes
+            // it (D38 (d)(5)) — the two backends must not disagree about what
+            // a logical record looks like on disk.
+            let encoded = record
+                .encode_frame()
                 .map_err(|e| JournalError::Store(format!("encode record: {e}")))?;
             (lsn, key, encoded)
         };
@@ -1236,10 +1240,13 @@ fn decode_pair(key: &[u8], value: &[u8]) -> Result<StoredRecord, JournalError> {
         lsn: Lsn::new(0, 0),
         msg: "unparseable key in scan".into(),
     })?;
-    let record: JournalRecord = postcard::from_bytes(value).map_err(|e| JournalError::Corrupt {
-        lsn,
-        msg: format!("decode: {e}"),
-    })?;
+    // Unversioned bytes bootstrap to encoding v0 rather than being refused
+    // (D38 (d)(1)); acting on the version is W2's, not this reader's.
+    let (record, _encoding) =
+        JournalRecord::decode_frame(value).map_err(|e| JournalError::Corrupt {
+            lsn,
+            msg: format!("decode: {e}"),
+        })?;
     Ok(StoredRecord { lsn, record })
 }
 

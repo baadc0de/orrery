@@ -26,12 +26,19 @@ use crate::manifest::{value_digest, ManifestWriter, ToolchainStamp};
 use crate::scenario::{ResolvedEmit, ResolvedLayer, ResolvedScenario};
 use crate::seedtree::SeedRoot;
 use crate::split::{split_cell, FieldOracle};
-use orrery_persistd::keyspace::encode_live_value;
+use orrery_persistd::keyspace::encode_versioned_live_value;
+use orrery_protocol::atrest::SchemaVersion;
 
-/// The landed per-row overhead: 21-byte `world/` key + 1-byte value tag
-/// (`orrery_persistd::keyspace::world_key`, `LIVE_TAG`). See the module
-/// docs: this supersedes docs/12 §13.1's 17-byte untagged model.
-pub const WORLD_ROW_OVERHEAD: usize = 21 + 1;
+/// The landed per-row overhead: 21-byte `world/` key + 1-byte value tag +
+/// 4-byte schema floor (`orrery_persistd::keyspace::world_key`,
+/// `LIVE_VERSIONED_TAG`). See the module docs: this supersedes docs/12
+/// §13.1's 17-byte untagged model.
+///
+/// The floor is what D38 clause (d)(2) buys, and it is priced here rather than
+/// hidden: 4 B a row is 40 MB across 10^7 rows, noise against the bags
+/// themselves, and it is the field that lets a sweep decide staleness without
+/// opening one.
+pub const WORLD_ROW_OVERHEAD: usize = 21 + 1 + 4;
 
 /// Which dry-run tier a scenario is in (docs/12 §7.3). v1 implements the
 /// analytic tier only; iterative generators (which would degrade the oracle
@@ -100,7 +107,7 @@ pub struct EmitPlan {
 pub struct PlannedRow {
     /// The manifest entry for the row.
     pub entry: crate::manifest::ManifestEntry,
-    /// The landed `world/` value: `LIVE_TAG || bag`.
+    /// The landed `world/` value: `LIVE_VERSIONED_TAG || schema floor || bag`.
     pub value: Vec<u8>,
 }
 
@@ -508,7 +515,10 @@ pub fn emit_rows(
             };
             rows.push(PlannedRow {
                 entry,
-                value: encode_live_value(&bag),
+                value: encode_versioned_live_value(
+                    bag_schema_floor(scenario, emit, archetype),
+                    &bag,
+                ),
             });
         }
         rows.sort_by_key(|e| e.entry.content_key);
@@ -553,6 +563,34 @@ pub fn encode_bag(
     OpaqueEncoder
         .encode(&ctx)
         .expect("opaque encode of a validated archetype")
+}
+
+/// The schema floor the writer stamps into an archetype's `world/` envelope
+/// (D38 clause (d)(2)).
+///
+/// The seeder is the one first-party producer of `world/` bags today, and it
+/// already knows the number: `[archetype.…] schema_version` is the scenario's
+/// declaration of what shape the bag it asks for is in (docs/12 §5.5), and
+/// [`crate::encode::OpaqueEncoder`] writes that same number *inside* the bag.
+/// The envelope floor is therefore a restatement of the bag's own content at a
+/// fixed offset, which is exactly what clause (d)(2) asks the marker to be —
+/// derivable from what it describes, not an independent counter that can drift
+/// away from it.
+///
+/// One archetype's bag is one slot's worth of schema today, so the minimum
+/// over its slots is that one version. A multi-slot encoder floors over its
+/// slots instead ([`orrery_persistd::ComponentBag::schema_floor`]).
+#[must_use]
+pub fn bag_schema_floor(
+    scenario: &ResolvedScenario,
+    emit: &ResolvedEmit,
+    archetype: &str,
+) -> SchemaVersion {
+    let fields = scenario
+        .archetypes
+        .get(archetype)
+        .unwrap_or_else(|| panic!("emit {:?} archetype {archetype:?} validated", emit.name));
+    SchemaVersion::from(fields.schema_version)
 }
 
 fn hex32(b: &[u8; 32]) -> String {

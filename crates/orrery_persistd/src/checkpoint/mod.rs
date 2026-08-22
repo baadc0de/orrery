@@ -224,6 +224,7 @@ mod tests {
                 EntityRecord {
                     components: bytes::Bytes::copy_from_slice(&i.to_le_bytes()),
                     dirty: true,
+                    schema_floor: 0,
                 },
             );
         }

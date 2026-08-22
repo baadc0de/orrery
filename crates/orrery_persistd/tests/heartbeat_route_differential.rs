@@ -273,6 +273,7 @@ async fn rekey(
     expected_lease_id: LeaseId,
 ) {
     let rekey = orrery_protocol::EntityRekey {
+        source_schema_floor: 0,
         version: ENTITY_REKEY_VERSION,
         entity,
         source_grid: GridId::ROOT,

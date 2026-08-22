@@ -49,19 +49,21 @@ fn demo_profile_plan_matches_ladder() {
     );
 
     // The byte estimate is derived from the LANDED row shape (21-byte key +
-    // 1-byte tag + bag), NOT §13.1's stale 17-byte model. For the opaque
-    // demo: 10 000 × (22 + bag). With crate 256B at 0.7 and barrel 224B at
-    // 0.3, E[bag] = 0.7·256 + 0.3·224 = 246.4 B → per-row ≈ 268.4 B →
-    // ≈ 2.68 MB. Assert the estimate uses the landed overhead: it must
-    // exceed 10 000 × (21 + 1 + 224) = 2 460 000 and stay under the
-    // all-256B ceiling 10 000 × 278 = 2 780 000.
+    // 1-byte tag + 4-byte schema floor + bag), NOT §13.1's stale 17-byte
+    // model. The floor is D38 clause (d)(2)'s marker, and it is in this
+    // arithmetic because it is in every row the seeder writes. For the opaque
+    // demo: 10 000 × (26 + bag). With crate 256B at 0.7 and barrel 224B at
+    // 0.3, E[bag] = 0.7·256 + 0.3·224 = 246.4 B → per-row ≈ 272.4 B →
+    // ≈ 2.72 MB. Assert the estimate uses the landed overhead: it must
+    // exceed 10 000 × (21 + 1 + 4 + 224) = 2 500 000 and stay under the
+    // all-256B ceiling 10 000 × 282 = 2 820 000.
     assert!(
-        report.total_logical_bytes > 10_000 * (21 + 1 + 224) as u64,
-        "byte estimate uses the landed 21B key + 1B tag + bag shape: {}",
+        report.total_logical_bytes > 10_000 * (21 + 1 + 4 + 224) as u64,
+        "byte estimate uses the landed 21B key + 1B tag + 4B floor + bag shape: {}",
         report.total_logical_bytes
     );
     assert!(
-        report.total_logical_bytes <= 10_000 * (21 + 1 + 256) as u64,
+        report.total_logical_bytes <= 10_000 * (21 + 1 + 4 + 256) as u64,
         "byte estimate stays under the all-crate ceiling: {}",
         report.total_logical_bytes
     );

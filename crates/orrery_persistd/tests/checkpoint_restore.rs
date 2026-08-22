@@ -148,6 +148,7 @@ async fn actor_serves_rows_present_only_in_the_checkpoint() {
         entities.insert(
             PersistId::new(i),
             orrery_persistd::EntityRecord {
+                schema_floor: 0,
                 components: bytes::Bytes::copy_from_slice(&i.to_le_bytes()),
                 dirty: false,
             },
@@ -693,6 +694,7 @@ async fn fdb_subtree_keying_and_watermark_only_checkpoint() {
     );
 
     let rec = |bytes: u64| EntityRecord {
+        schema_floor: 0,
         components: bytes::Bytes::copy_from_slice(&bytes.to_le_bytes()),
         dirty: false,
     };
@@ -813,6 +815,7 @@ async fn fdb_tombstones_write_gc_and_isolate_grids() {
         orrery_persistd::checkpoint::FdbCheckpointStore::connect(&cluster).unwrap(),
     );
     let rec = |bytes: u64| EntityRecord {
+        schema_floor: 0,
         components: bytes::Bytes::copy_from_slice(&bytes.to_le_bytes()),
         dirty: false,
     };
@@ -1097,6 +1100,7 @@ async fn rekey_entity(
         panic!("source lease must be granted");
     };
     let rekey = orrery_protocol::EntityRekey {
+        source_schema_floor: 0,
         version: orrery_protocol::ENTITY_REKEY_VERSION,
         entity,
         source_grid: grid,
@@ -1169,7 +1173,11 @@ async fn fdb_cross_shard_rekey_leaves_one_world_row() {
     rt.checkpoint(store.as_ref()).await.unwrap();
     assert_eq!(
         world_rows(&cluster, grid).await,
-        vec![(source, entity, orrery_persistd::keyspace::LIVE_TAG)],
+        vec![(
+            source,
+            entity,
+            orrery_persistd::keyspace::LIVE_VERSIONED_TAG
+        )],
         "the spawn is durable at the source cell"
     );
 
@@ -1186,7 +1194,11 @@ async fn fdb_cross_shard_rekey_leaves_one_world_row() {
 
     assert_eq!(
         world_rows(&cluster, grid).await,
-        vec![(destination, entity, orrery_persistd::keyspace::LIVE_TAG)],
+        vec![(
+            destination,
+            entity,
+            orrery_persistd::keyspace::LIVE_VERSIONED_TAG
+        )],
         "one row, at the destination: the source key was cleared, not orphaned"
     );
 
@@ -1277,7 +1289,11 @@ async fn fdb_rekey_then_restart_recovers_one_shard_only() {
     );
     assert_eq!(
         world_rows(&cluster, grid).await,
-        vec![(destination, entity, orrery_persistd::keyspace::LIVE_TAG)]
+        vec![(
+            destination,
+            entity,
+            orrery_persistd::keyspace::LIVE_VERSIONED_TAG
+        )]
     );
     recovered.close().await.unwrap();
     for shard in &shards {
@@ -1333,7 +1349,11 @@ async fn fdb_intra_shard_movement_leaves_one_world_row() {
     rt.checkpoint(store.as_ref()).await.unwrap();
     assert_eq!(
         world_rows(&cluster, grid).await,
-        vec![(cells[3], entity, orrery_persistd::keyspace::LIVE_TAG)],
+        vec![(
+            cells[3],
+            entity,
+            orrery_persistd::keyspace::LIVE_VERSIONED_TAG
+        )],
         "a diff at a new cell moves the row rather than duplicating it"
     );
 
@@ -1342,7 +1362,11 @@ async fn fdb_intra_shard_movement_leaves_one_world_row() {
     rt.checkpoint(store.as_ref()).await.unwrap();
     assert_eq!(
         world_rows(&cluster, grid).await,
-        vec![(cells[6], entity, orrery_persistd::keyspace::LIVE_TAG)],
+        vec![(
+            cells[6],
+            entity,
+            orrery_persistd::keyspace::LIVE_VERSIONED_TAG
+        )],
         "a local rekey moves the row too"
     );
 
@@ -1441,7 +1465,11 @@ async fn fdb_split_carries_the_pending_row_clear_to_the_child() {
 
     assert_eq!(
         world_rows(&cluster, grid).await,
-        vec![(cells[4], entity, orrery_persistd::keyspace::LIVE_TAG)],
+        vec![(
+            cells[4],
+            entity,
+            orrery_persistd::keyspace::LIVE_VERSIONED_TAG
+        )],
         "the child inherited the parent's pending clear"
     );
 
@@ -1635,6 +1663,7 @@ async fn rekey_at_zero_snapshot(
                 entities: std::iter::once((
                     entity,
                     orrery_persistd::EntityRecord {
+                        schema_floor: 0,
                         components: bytes::Bytes::from_static(b"before"),
                         dirty: false,
                     },
@@ -1674,7 +1703,8 @@ async fn rekey_at_zero_snapshot(
         .unwrap();
 
     let rekey = orrery_protocol::EntityRekey {
-        version: 1,
+        source_schema_floor: 0,
+        version: orrery_protocol::ENTITY_REKEY_VERSION,
         entity,
         source_grid: GridId::ROOT,
         source_cell: source,
@@ -1769,4 +1799,133 @@ async fn checkpoint_at_zero_still_vacates_the_source_shard_on_a_rekey_at_zero() 
         !snap.entities.contains_key(&entity),
         "and must not keep serving its pre-rekey row"
     );
+}
+
+#[cfg(feature = "fdb")]
+#[tokio::test]
+async fn fdb_an_unversioned_world_row_reads_as_v0_and_is_stamped_on_write_back() {
+    // D38 clause (d)(1)/(d)(2), end to end against a real cluster.
+    //
+    // Two halves, and both are load-bearing. **Read:** a row written the way
+    // every `world/` row in this cluster was written until now — `LIVE_TAG ‖
+    // bag`, no floor anywhere in it — has to come back as schema v0, not as a
+    // decode failure and not as a guess about what is in the bag. **Write:**
+    // the next checkpoint has to stamp the envelope, so the population of rows
+    // a later reader must bootstrap shrinks with every checkpoint instead of
+    // growing with every commit.
+    let Some(cluster) = support::fdb_cluster_file() else {
+        eprintln!("skipping: ORRERY_FDB_CLUSTER_FILE not set and no .fdb-dev/fdb.cluster");
+        return;
+    };
+    use orrery_persistd::keyspace;
+
+    const GRID: GridId = GridId::new(9009);
+    let cell = CellId::from_coords(glam::IVec3::new(2, 2, 2), 18).unwrap();
+    let legacy = PersistId::new(1);
+    let seeded = PersistId::new(2);
+
+    activate_fdb_checkpoint_fence(&cluster, GRID).await;
+    let ctx = orrery_persistd::FdbContext::connect(&cluster).unwrap();
+    let store = Arc::new(orrery_persistd::checkpoint::FdbCheckpointStore::from_context(&ctx));
+    store.delete(CellId::ROOT, GRID).await.unwrap();
+
+    // One row in each envelope: the pre-D38 shape, and a seeder-written row
+    // that already declares a floor of 7.
+    let db = ctx.database();
+    db.run(|trx, _| async move {
+        trx.set(
+            &keyspace::world_key(GRID, cell, legacy),
+            &keyspace::encode_live_value(b"legacy-bag"),
+        );
+        trx.set(
+            &keyspace::world_key(GRID, cell, seeded),
+            &keyspace::encode_versioned_live_value(7, b"seeded-bag"),
+        );
+        Ok(())
+    })
+    .await
+    .unwrap();
+
+    let loaded = store.load(CellId::ROOT, GRID).await.unwrap().expect("rows");
+    let legacy_row = loaded.entities.get(&legacy).expect("legacy row recovered");
+    assert_eq!(
+        legacy_row.schema_floor, 0,
+        "absent == v0: the unversioned row is read as v0, not refused"
+    );
+    assert_eq!(
+        legacy_row.components.as_ref(),
+        b"legacy-bag",
+        "and its bag survives the read whole"
+    );
+    assert_eq!(
+        loaded
+            .entities
+            .get(&seeded)
+            .expect("seeded row")
+            .schema_floor,
+        7,
+        "a stated floor is read back as stated"
+    );
+
+    // Write the loaded rows back, exactly as an ordinary checkpoint would.
+    store
+        .checkpoint(&orrery_persistd::CheckpointData {
+            shard: CellId::ROOT,
+            grid: GRID,
+            node_id: 0,
+            epoch: Epoch::new(0),
+            watermark: Lsn::new(1, 64),
+            entities: loaded.entities.clone(),
+            by_cell: loaded.by_cell.clone(),
+            tombstones: std::collections::HashMap::new(),
+            superseded: std::collections::HashSet::new(),
+            taken_at_ms: 1_700_000_000_000,
+        })
+        .await
+        .unwrap();
+
+    // Read the raw values back the way a sweep would: bytes off the key, no
+    // decode of anything inside the bag.
+    let raw = db
+        .run(|trx, _| async move {
+            let mut out = Vec::new();
+            for entity in [legacy, seeded] {
+                out.push(
+                    trx.get(&keyspace::world_key(GRID, cell, entity), false)
+                        .await?
+                        .map(|value| value.to_vec()),
+                );
+            }
+            Ok(out)
+        })
+        .await
+        .unwrap();
+
+    let legacy_value = raw[0].as_ref().expect("legacy row rewritten");
+    assert_eq!(
+        legacy_value[0],
+        keyspace::LIVE_VERSIONED_TAG,
+        "write-back stamps the envelope, so the row now says v0 rather than \
+         leaving the next reader to bootstrap it"
+    );
+    assert_eq!(keyspace::world_value_schema_floor(legacy_value), Some(0));
+    assert_eq!(
+        keyspace::world_value_components(legacy_value),
+        Some(&b"legacy-bag"[..]),
+        "and the bag is carried across untouched — persistd never opened it"
+    );
+
+    let seeded_value = raw[1].as_ref().expect("seeded row rewritten");
+    assert_eq!(
+        keyspace::world_value_schema_floor(seeded_value),
+        Some(7),
+        "a row at floor 7 is written back at floor 7, never demoted to v0"
+    );
+    assert!(
+        keyspace::world_value_is_stale(legacy_value, 7)
+            && !keyspace::world_value_is_stale(seeded_value, 7),
+        "and the sweep's filter separates the two without decoding either bag"
+    );
+
+    store.delete(CellId::ROOT, GRID).await.unwrap();
 }

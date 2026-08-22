@@ -301,6 +301,7 @@ async fn first_page_precedes_last_cell_read() {
     entities.insert(
         PersistId::new(1),
         EntityRecord {
+            schema_floor: 0,
             components: Bytes::from_static(b"centre"),
             dirty: false,
         },
@@ -378,6 +379,7 @@ async fn every_requested_cell_gets_a_page() {
         entities.insert(
             PersistId::new(i as u64 + 1),
             EntityRecord {
+                schema_floor: 0,
                 components: Bytes::from_static(b"live"),
                 dirty: false,
             },
@@ -475,6 +477,7 @@ async fn collect_chunked_frames() -> (Vec<Bytes>, GatewayServer) {
         entities.insert(
             PersistId::new(i),
             EntityRecord {
+                schema_floor: 0,
                 components: Bytes::from(vec![0xAB; CHUNKED_CELL_BAG_BYTES]),
                 dirty: false,
             },

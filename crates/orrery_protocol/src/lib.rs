@@ -13,6 +13,7 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod atrest;
 pub mod authority;
 pub mod cell;
 pub mod channels;
@@ -26,6 +27,10 @@ mod protocol;
 pub mod standing;
 mod verifiable;
 
+pub use atrest::{
+    decode_versioned, encode_versioned, EncodingVersion, SchemaVersion, VersionedError,
+    ENCODING_V0, SCHEMA_V0,
+};
 pub use authority::{
     ClaimBasis, ClaimId, ClaimKind, DenyReason, ExpireDisposition, ExpireReason, Lease, LeaseFlags,
     LeaseId, LeaseMsg, SeqPair,
@@ -68,7 +73,7 @@ pub use persist::{
     eligible_witnesses, required_witnesses, AccountId, AssetId, Attestation, CellEpoch, Checkpoint,
     EntityRekey, Epoch, Intent, IntentOp, IntentOutcome, ItemUid, JournalRecord, Lsn, PersistId,
     RecordKind, Tick, ATTESTATION_DRAW_V1_DOMAIN, ATTESTATION_PREIMAGE_LEN,
-    ATTESTATION_PREIMAGE_TAG, ENTITY_REKEY_VERSION, INTENT_PREIMAGE_TAG,
+    ATTESTATION_PREIMAGE_TAG, ENTITY_REKEY_VERSION, INTENT_PREIMAGE_TAG, JOURNAL_RECORD_ENCODING,
     PROVISIONAL_FINALIZE_DEADLINE_MS, PROVISIONAL_OUTSTANDING_CAP, REASON_ATTESTATION_QUORUM,
     REASON_BAD_SIGNATURE, REASON_CONTENTION_EXHAUSTED, REASON_EXECUTOR_ERROR,
     REASON_INSUFFICIENT_BALANCE, REASON_INTENT_ANNULLED, REASON_ISSUER_MISMATCH,
