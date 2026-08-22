@@ -51,14 +51,15 @@ pub const DEFAULT_SESSION_TOKEN_TTL_MS: u64 = MAX_SESSION_TOKEN_TTL_MS;
 /// D33 (proposed) puts standing behind the `ya` strike ledger, whose sole
 /// writer is the adjudication executor and whose scorer is this service:
 /// `S(t) = Σ wᵢ · 2^(−ageᵢ / 14 d)`, evaluated at read time, with
-/// quarantine/cooldown/ban at 3/5/7. **None of that is implemented here** —
-/// D33 is Proposed, the `y` family is not in the keyspace, and #210 puts the
-/// ledger explicitly out of scope. This trait is the seam it arrives at.
+/// quarantine/cooldown/ban at configured boundaries. The read-only
+/// implementation is [`crate::ComputedStanding`]; this trait remains the seam
+/// so issuance does not acquire a FoundationDB dependency in its hot logic.
 ///
 /// `Err(IdentityError::StandingUnavailable)` is the honest answer to "the
 /// ledger could not be read", and the service refuses to mint on it. Returning
 /// `Ok(Good)` instead would be the one thing D33's Alternatives rejects by
 /// name.
+#[async_trait::async_trait]
 pub trait StandingSource: Send + Sync {
     /// The standing to stamp into a token for `account`.
     ///
@@ -66,7 +67,7 @@ pub trait StandingSource: Send + Sync {
     ///
     /// [`IdentityError::StandingUnavailable`] when no answer can be
     /// established. It is never softened into `Good`.
-    fn standing(&self, account: AccountId) -> Result<SessionStanding, IdentityError>;
+    async fn standing(&self, account: AccountId) -> Result<SessionStanding, IdentityError>;
 }
 
 /// The default standing source: there is no ledger, so nothing resolves.
@@ -79,8 +80,9 @@ pub trait StandingSource: Send + Sync {
 #[derive(Debug, Default, Clone, Copy)]
 pub struct UnavailableStanding;
 
+#[async_trait::async_trait]
 impl StandingSource for UnavailableStanding {
-    fn standing(&self, account: AccountId) -> Result<SessionStanding, IdentityError> {
+    async fn standing(&self, account: AccountId) -> Result<SessionStanding, IdentityError> {
         Err(IdentityError::StandingUnavailable(account))
     }
 }
@@ -122,8 +124,9 @@ impl StaticStanding {
     }
 }
 
+#[async_trait::async_trait]
 impl StandingSource for StaticStanding {
-    fn standing(&self, account: AccountId) -> Result<SessionStanding, IdentityError> {
+    async fn standing(&self, account: AccountId) -> Result<SessionStanding, IdentityError> {
         self.standings
             .get(&account)
             .copied()
@@ -294,7 +297,7 @@ where
         }
 
         // 4. Standing is read, not computed, and an unreadable ledger refuses.
-        let standing = self.standing.standing(account)?;
+        let standing = self.standing.standing(account).await?;
 
         self.mint(account, node, ttl_ms, standing)
     }

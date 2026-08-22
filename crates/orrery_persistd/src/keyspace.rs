@@ -2778,6 +2778,11 @@ mod tests {
                 name: "world",
                 sample: world_key(GRID, shard, PersistId::new(1)).to_vec(),
             },
+            Family {
+                prefix: b'y',
+                name: "strike (ya)",
+                sample: crate::adjudication::strike_key(AccountId::new(1)).to_vec(),
+            },
             // `lease/{grid}/{entity}` is deliberately absent: it takes the
             // ledger's `b'l'` and discriminates on the `GridId`'s most
             // significant byte rather than an ASCII byte, so it is not a family
@@ -2851,13 +2856,14 @@ mod tests {
         }
     }
 
-    /// The text of this module, read back so the completeness clause below has
-    /// a second source. A clause that read both sides out of
+    /// The text of the key-writing modules, read back so the completeness
+    /// clause below has a second source. A clause that read both sides out of
     /// [`registered_families`] would pass on exactly the family nobody
     /// registered.
     const KEYSPACE_SOURCE: &str = include_str!("keyspace.rs");
+    const ADJUDICATION_SOURCE: &str = include_str!("adjudication.rs");
 
-    /// Every one-byte family prefix a key constructor in this module writes.
+    /// Every one-byte family prefix a persistd key constructor writes.
     ///
     /// Three recognized forms, and each is unambiguous by construction:
     ///
@@ -2865,6 +2871,7 @@ mod tests {
     ///     key[0] = b'x'      the fixed-size array constructors
     ///     key.push(b'x')     the `Vec` range-bound builders
     ///     \n    [b'x']       a single-byte key returned as a bare array
+    ///     key[..2].copy_from_slice(b"xy")  a two-byte family/discriminator
     /// ```
     ///
     /// `key[1] = b'x'` is deliberately **not** one of them: the second byte is
@@ -2876,10 +2883,7 @@ mod tests {
     ///
     /// The test half of the file is excluded, because a test may build a
     /// deliberately colliding key and that must not register a family.
-    fn family_prefixes_written_in_this_module() -> std::collections::BTreeSet<u8> {
-        let source = KEYSPACE_SOURCE
-            .split_once("\n#[cfg(test)]\n")
-            .map_or(KEYSPACE_SOURCE, |(head, _)| head);
+    fn scan_family_prefixes(source: &str) -> std::collections::BTreeSet<u8> {
         let bytes = source.as_bytes();
 
         let mut found = std::collections::BTreeSet::new();
@@ -2895,6 +2899,23 @@ mod tests {
             if writes_a_family_prefix {
                 found.insert(bytes[at + 2]);
             }
+        }
+        for (at, _) in source.match_indices("key[..2].copy_from_slice(b\"") {
+            let family_at = at + "key[..2].copy_from_slice(b\"".len();
+            if let Some(prefix) = bytes.get(family_at) {
+                found.insert(*prefix);
+            }
+        }
+        found
+    }
+
+    fn family_prefixes_written_by_persistd() -> std::collections::BTreeSet<u8> {
+        let mut found = std::collections::BTreeSet::new();
+        for source in [KEYSPACE_SOURCE, ADJUDICATION_SOURCE] {
+            let production = source
+                .split_once("\n#[cfg(test)]\n")
+                .map_or(source, |(head, _)| head);
+            found.extend(scan_family_prefixes(production));
         }
         found
     }
@@ -2922,7 +2943,7 @@ mod tests {
     /// than leaving this clause to imply coverage it does not have.
     #[test]
     fn every_family_prefix_written_in_this_module_is_registered() {
-        let written = family_prefixes_written_in_this_module();
+        let written = family_prefixes_written_by_persistd();
         let registered: std::collections::BTreeSet<u8> =
             registered_families().iter().map(|f| f.prefix).collect();
 
@@ -2941,7 +2962,7 @@ mod tests {
             .collect();
         assert!(
             unregistered.is_empty(),
-            "key families written by this module but absent from \
+            "key families written by persistd but absent from \
              `registered_families`: {unregistered:?} — a disjointness proof \
              that skips a family is not a disjointness proof (D31 (a))"
         );
@@ -2952,8 +2973,8 @@ mod tests {
             .collect();
         assert!(
             unwritten.is_empty(),
-            "families registered but written by no constructor in this \
-             module: {unwritten:?} — the table has outlived its code"
+            "families registered but written by no persistd constructor: \
+             {unwritten:?} — the table has outlived its code"
         );
     }
 

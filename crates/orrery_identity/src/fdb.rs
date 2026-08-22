@@ -41,12 +41,76 @@ use async_trait::async_trait;
 use foundationdb::options::MutationType;
 use foundationdb::{Database, FdbBindingError};
 use futures::TryStreamExt;
+use orrery_persistd::adjudication::{
+    strike_account_range_end, strike_account_range_start, StrikeRow,
+};
 use orrery_persistd::keyspace::{
     self, AccountRow, BindKind, BindingHistoryRow, BindingRow, MAX_BOUND_NODES_PER_ACCOUNT,
 };
 use orrery_protocol::AccountId;
 use orrery_protocol::NodeId;
 use std::sync::Arc;
+
+/// Read-only identity view of the executor-owned `ya` strike family.
+#[derive(Clone)]
+pub struct FdbStrikeRowSource {
+    db: Arc<Database>,
+}
+
+impl std::fmt::Debug for FdbStrikeRowSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FdbStrikeRowSource").finish_non_exhaustive()
+    }
+}
+
+impl FdbStrikeRowSource {
+    /// Open a bounded read-only source against `cluster_file`.
+    pub fn connect(cluster_file: &str) -> Result<Self, IdentityError> {
+        let context = orrery_persistd::fdb::FdbContext::connect(cluster_file)
+            .map_err(|error| IdentityError::Store(error.to_string()))?;
+        Ok(Self::from_database(context.database()))
+    }
+
+    /// Reuse a process-scoped, bounded database handle.
+    #[must_use]
+    pub fn from_database(db: Arc<Database>) -> Self {
+        Self { db }
+    }
+}
+
+#[async_trait]
+impl crate::standing::StrikeRowSource for FdbStrikeRowSource {
+    async fn rows(&self, account: AccountId) -> Result<Vec<StrikeRow>, IdentityError> {
+        let start = strike_account_range_start(account);
+        let end = strike_account_range_end(account);
+        self.db
+            .run(|trx, _| {
+                let start = start.clone();
+                let end = end.clone();
+                async move {
+                    let mut stream = trx.get_ranges_keyvalues(
+                        foundationdb::RangeOption {
+                            begin: foundationdb::KeySelector::first_greater_or_equal(
+                                start.as_slice(),
+                            ),
+                            end: foundationdb::KeySelector::first_greater_or_equal(end.as_slice()),
+                            ..foundationdb::RangeOption::default()
+                        },
+                        true,
+                    );
+                    let mut rows = Vec::new();
+                    while let Some(kv) = stream.try_next().await? {
+                        let row = postcard::from_bytes(kv.value())
+                            .map_err(decode_err("strike row decode"))?;
+                        rows.push(row);
+                    }
+                    Ok(rows)
+                }
+            })
+            .await
+            .map_err(unwrap_binding_error)
+    }
+}
 
 /// A FoundationDB-backed [`AccountStore`] over the `d` family.
 #[derive(Clone)]
