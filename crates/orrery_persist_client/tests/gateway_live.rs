@@ -234,6 +234,12 @@ fn client_connects_hellos_and_uplinks_to_real_gateway() {
         });
     }
     let cfg = app.world().resource::<PersistClientConfig>().clone();
+    // Deterministic on any machine, unlike a lone synthetic flush reading: no
+    // update runs between the queue above and these two calls, so the plugin's
+    // real-clock flush cannot interleave, and the zero baseline pins
+    // `last_elapsed` — the second flush then accrues exactly rate × 250 ms =
+    // 1.0 priority. Reordering or splitting these lines around an
+    // `app.update()` would reintroduce the machine race #277 removed.
     let diffs = {
         let mut sched = app.world_mut().resource_mut::<UplinkScheduler>();
         sched.flush(&cfg, Duration::from_millis(0));
@@ -288,6 +294,13 @@ fn client_connects_hellos_and_uplinks_to_real_gateway() {
     });
 
     // When: its next live uplink presents a stale lease id and receives the actor's current row.
+    // The client cannot know the token is stale, so the plugin's own flush
+    // system sends it exactly as it would in a real client, and the scheduler
+    // goes quiet only once the gateway's reply for this tick has landed and
+    // been applied. What that reply must have been is asserted below from the
+    // journal — not from a flush window, because whether a fixed-duration
+    // flush has produced the diff yet is a property of the machine, not of
+    // fencing (#277).
     app.world_mut()
         .resource_mut::<UplinkScheduler>()
         .queue(DiffUplink {
@@ -301,28 +314,6 @@ fn client_connects_hellos_and_uplinks_to_real_gateway() {
             lease_id: Some(orrery_protocol::LeaseId(0)),
             authority_seq: Some(authority_seq),
         });
-    let stale_diffs = {
-        let mut sched = app.world_mut().resource_mut::<UplinkScheduler>();
-        sched.flush(&cfg, Duration::from_millis(500))
-    };
-    assert_eq!(
-        stale_diffs.len(),
-        1,
-        "stale fenced diff reached the live wire"
-    );
-    {
-        let session_entity = app.world().resource::<GatewaySession>().session.unwrap();
-        let mut io = app
-            .world_mut()
-            .get_mut::<aeronet_io::Session>(session_entity)
-            .unwrap();
-        for diff in stale_diffs {
-            io.send
-                .push(bytes::Bytes::from(GatewaySession::encode_datagram(
-                    &GatewayMsg::Diff { diff },
-                )));
-        }
-    }
     wait_until(&mut app, |world| {
         !world
             .resource::<UplinkScheduler>()
