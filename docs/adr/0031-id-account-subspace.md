@@ -462,6 +462,13 @@ which is the direction D27 clause (e) already chose for `UnknownEpoch` and
 `EpochStale`.** That is what makes closing affordable, and it is why this
 record depends on D29 rather than merely citing it.
 
+> *Proposed consequential update (2026-08-22,
+> [ADR-0037](0037-unavailable-witness-epoch.md)):* D37 proposes correcting
+> D27's `UnknownEpoch` and `EpochStale` direction to refusal, so that analogy
+> would no longer hold. This clause's result is unchanged: a binding miss
+> shrinks a resolved eligible vector and reaches `LowPopulationEpoch`, the D29
+> provisional case. This is not an erratum to D31.
+
 **One cause, logged by name, collapsed on the wire**, following D30 clause (c).
 An attestation from an announced NodeId whose binding did not resolve is not
 `WitnessOutsideAnnouncedSet` — that label would send an operator hunting a
@@ -709,9 +716,10 @@ was rejected and the condition that would reverse each, is on PR #225.
 
 ## Consequential edits this record now requires
 
-Accepting resolved question 3 puts a load-bearing sentence in clause (f) on a
+Accepting resolved question 3 put a load-bearing sentence in clause (f) on a
 countdown: it cites "the direction D27 clause (e) already chose for
-`UnknownEpoch` and `EpochStale`", and #208's amending record reverses that
-direction. The demotion in (f) survives on its own legs — it rides
-`LowPopulationEpoch` with an announcement in hand — but the citation must be
-re-pointed when #208 lands, not left to rot.
+`UnknownEpoch` and `EpochStale`". Proposed
+[D37](0037-unavailable-witness-epoch.md), resolving #208, corrects that
+direction by erratum. The demotion in (f) survives on its own legs — it rides
+`LowPopulationEpoch` with an announcement in hand — and the proposed
+consequential annotation now says so at the citation site.

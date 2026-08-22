@@ -375,6 +375,13 @@ and never *silent full admission*. That keeps D12's netsplit posture intact:
 "P2P sim continues without the cluster (intents queue, durable commits pause);
 no cluster = degraded, not dead."
 
+> *Proposed erratum (2026-08-22,
+> [ADR-0037](0037-unavailable-witness-epoch.md)):* cases 2 and 3 and “never
+> refusal” contradict D29 clause 2, which became Accepted in the same commit as
+> this record. D37 proposes that `UnknownEpoch` and `EpochStale` refuse with
+> bounded cures; case 1 and “never silent full admission” remain unchanged.
+> This annotation is not normative unless D37 is accepted.
+
 ### (f) Retroactive verifiability: what must be published, exhaustively
 
 > **After epoch end, a third party can recompute every required subset of a

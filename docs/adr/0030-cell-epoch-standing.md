@@ -19,8 +19,9 @@ provisional path" was false when written and is false now: the enforcement
 landed by #182 refuses that cause, deliberately diverging from
 [D27](0027-attestation-envelope.md) clause (e), and the divergence is recorded
 where it is implemented; [D31](0031-id-account-subspace.md)'s closing note
-assigns the reconciliation to amending record #208. Everything else in the
-record verified against the tree as written, including the implementation.
+assigns the reconciliation to proposed
+[D37](0037-unavailable-witness-epoch.md), resolving #208. Everything else in
+the record verified against the tree as written, including the implementation.
 
 **Supersedes:** nothing. It **closes** [D27](0027-attestation-envelope.md)'s
 open question 2 — "a gateway serving more than one cell cannot resolve *which*
@@ -183,8 +184,9 @@ Two orderings are load-bearing:
   never consulted for an unresolvable handle. What that cause meets
   downstream is owned elsewhere: [D27](0027-attestation-envelope.md) clause
   (e)'s text routes it to the provisional path, the landed enforcement
-  refuses it — a divergence recorded where it is implemented — and amending
-  record #208 owns the reconciliation.
+  refuses it — a divergence recorded where it is implemented — and proposed
+  [D37](0037-unavailable-witness-epoch.md), resolving #208, owns the
+  reconciliation.
 
 And `NoStandingInCell` is deliberately **not** a provisional case.
 `UnknownEpoch`, `EpochStale` and `LowPopulationEpoch` all describe a gateway
@@ -192,6 +194,14 @@ that *cannot judge* — D27 clause (e)'s answer to those is a quarantined commit
 This one describes a submitter asking to be judged somewhere it does not stand,
 which is a refusal at every population, in every netsplit, and with D29 landed
 or not.
+
+> *Proposed consequential update (2026-08-22,
+> [ADR-0037](0037-unavailable-witness-epoch.md)):* if D37 is accepted,
+> `UnknownEpoch` and `EpochStale` also refuse and no longer belong on the
+> provisional side of this comparison. `LowPopulationEpoch` remains D29's
+> provisional case. `NoStandingInCell` and this clause's ordering are
+> unchanged. This is a consequence of D37's proposed erratum, not an erratum
+> to D30.
 
 The wire collapse is #182's argument unchanged: the reason space below
 `REASON_ATTESTATION_QUORUM` is one bit — "your attestations were wrong" as
