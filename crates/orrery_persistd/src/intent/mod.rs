@@ -39,6 +39,13 @@ pub use provisional::{
     ProvisionalStore, ReplayJudge,
 };
 
+pub mod shadow;
+pub use shadow::{
+    CountingShadowObserver, ShadowObservation, ShadowObservationLog, ShadowObserver,
+    ShadowUnevaluated, ShadowVerdict, SharedShadowObserver, ATTESTATION_QUORUM_CONTROL,
+    SHADOW_TARGET,
+};
+
 pub mod stages;
 pub use stages::{intent_stage_metrics, IntentStageMetrics, IntentStageSnapshot, IntentTrace};
 
@@ -777,10 +784,19 @@ impl RejectionCause {
 ///   place to repeat them.
 #[derive(Default, Clone)]
 pub struct BaselineIntentValidator {
-    enforcement: AttestationEnforcement,
+    enforcement: AttestationPosture,
     epochs: Option<Arc<crate::witness_epoch::WitnessEpochAuthority>>,
     interest: Option<Arc<dyn crate::gateway::InterestAuthority>>,
     bindings: Option<crate::gateway::SharedBindingAuthority>,
+    /// Where [`AttestationEnforcement::Shadow`]'s observations go.
+    ///
+    /// `None` in every other mode, and `None` is not "discard": the `tracing`
+    /// event in [`shadow::emit`] is unconditional, so a validator built
+    /// through [`Self::shadow`] still discharges D32 clause (b)'s second
+    /// obligation with nothing wired. This field is the *in-process* half,
+    /// for the collector and the gate leg that want the observations back
+    /// rather than in a log.
+    observer: Option<SharedShadowObserver>,
 }
 
 /// Written out rather than derived because [`crate::gateway::InterestAuthority`]
@@ -791,10 +807,11 @@ pub struct BaselineIntentValidator {
 impl core::fmt::Debug for BaselineIntentValidator {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("BaselineIntentValidator")
-            .field("enforcement", &self.enforcement)
+            .field("enforcement", &self.enforcement.get())
             .field("epochs", &self.epochs)
             .field("interest", &self.interest.is_some())
             .field("bindings", &self.bindings.is_some())
+            .field("observer", &self.observer.is_some())
             .finish()
     }
 }
@@ -812,9 +829,14 @@ impl core::fmt::Debug for BaselineIntentValidator {
 /// attestation-overhead measurement needs, which is the zero-attestation path
 /// by definition.
 ///
-/// So the switch ships and the ramp does not: this code takes no position on
-/// when a deployment flips it, on shadow-to-live ramping, or on verdict-rate
-/// auto-suspend. That policy is tracked separately from the mechanism.
+/// The ramp arrived as [D32](../../../../docs/adr/0032-enforcement-ramp.md),
+/// which names this control **C1** and gives it the three positions below plus
+/// a deployment lever that reaches them ([`AttestationPosture`], and
+/// `persistd`'s `--attestation-enforcement`). What this code still takes no
+/// position on is *policy*: when a deployment promotes, what evidence
+/// justifies it, and what verdict rate demotes it are clause (e)'s and clause
+/// (f)'s, computed from the observations this mode records rather than decided
+/// here.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum AttestationEnforcement {
     /// Attestations are verified but not required, and no witness set is
@@ -824,11 +846,165 @@ pub enum AttestationEnforcement {
     /// [`MAX_ATTESTATIONS`] cap, the no-repeat rule and the self-witness
     /// refusal. "Off" means *the quorum* is off, not that an attestation may
     /// be a forgery.
+    ///
+    /// **`Off` is not shadow**, and D32 clause (b) makes the distinction a
+    /// rule: this arm evaluates nothing, so it observes nothing, so it
+    /// calibrates nothing — a control in `Off` has no observation period and
+    /// cannot be promoted out of one.
     #[default]
     Off,
+    /// D32 clause (b)'s shadow: the full predicate is evaluated, the action
+    /// `Required` would have taken is recorded, and none of it is taken.
+    ///
+    /// Every sub-predicate `Required` evaluates is evaluated here, D30's
+    /// standing conjunct included, because a shadow measurement that skipped
+    /// one understates the refusal count it exists to produce. The suppressed
+    /// action is the refusal: an intent this arm would have refused is
+    /// admitted exactly as `Off` admits it, and the would-be
+    /// [`RejectionCause`] is handed to a [`ShadowObserver`] and emitted on
+    /// [`SHADOW_TARGET`] instead.
+    ///
+    /// The always-on set is unchanged and unchangeable: this arm switches off
+    /// the quorum and nothing else. On an internal error the arm degrades to
+    /// [`ShadowVerdict::Unevaluated`] — never to an action.
+    Shadow,
     /// D27's full admission predicate: every attestation from the announced
     /// eligible set, and the drawn required subset present in full.
     Required,
+}
+
+impl AttestationEnforcement {
+    /// The CLI spelling D32 clause (c)'s inventory gives this mode.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Shadow => "shadow",
+            Self::Required => "required",
+        }
+    }
+
+    /// Whether this mode refuses an intent the quorum predicate rejects.
+    ///
+    /// The one question the admission path actually asks, written once so that
+    /// adding a fourth arm forces an answer here rather than at each `match`.
+    #[must_use]
+    pub const fn acts(self) -> bool {
+        matches!(self, Self::Required)
+    }
+
+    /// Whether this mode evaluates the quorum predicate at all.
+    #[must_use]
+    pub const fn evaluates(self) -> bool {
+        matches!(self, Self::Shadow | Self::Required)
+    }
+}
+
+impl core::str::FromStr for AttestationEnforcement {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "off" => Ok(Self::Off),
+            "shadow" => Ok(Self::Shadow),
+            "required" => Ok(Self::Required),
+            other => Err(format!(
+                "unknown attestation enforcement mode `{other}` \
+                 (expected one of: off, shadow, required)"
+            )),
+        }
+    }
+}
+
+/// The runtime half of C1's lever: a posture cell every clone of one validator
+/// shares.
+///
+/// # Why the mode is not a plain field any more
+///
+/// D32 clause (c) gives each control **two layers**, and the reason is an
+/// incident timescale rather than tidiness. A CLI argument is a startup
+/// default: changing it means rolling a gateway restart, which drops sessions
+/// and takes minutes. Clause (f)'s auto-suspend has to demote a misbehaving
+/// control *while the fleet runs*, within one poll interval, so the mode has
+/// to be writable by something other than a process launch. This cell is that
+/// something — the seam the durable `ramp/attestation_quorum` poller writes
+/// into, and the seam a test writes into directly.
+///
+/// The load is `Relaxed` and on the admission path: one atomic byte read per
+/// intent, against a check that already verifies ed25519 signatures. Ordering
+/// buys nothing here because there is nothing to order it against — a posture
+/// change is allowed to be observed one intent late by construction (clause
+/// (c) bounds the fleet-wide latency at a poll interval, not at an
+/// instruction).
+///
+/// # The asymmetry is enforced by the API, not by convention
+///
+/// Clause (f): *automation may make the fleet safer without asking, never less
+/// safe.* [`Self::auto_suspend`] is therefore the only write automation gets,
+/// and it moves `Required → Shadow` and nothing else — never to `Off`, which
+/// would blind the cluster during exactly the incident that tripped it and
+/// would make the trigger a censorship lever. Promotion is [`Self::set`], an
+/// operator act.
+#[derive(Debug, Clone)]
+pub struct AttestationPosture(Arc<std::sync::atomic::AtomicU8>);
+
+impl Default for AttestationPosture {
+    fn default() -> Self {
+        Self::new(AttestationEnforcement::Off)
+    }
+}
+
+impl AttestationPosture {
+    /// A posture cell starting at `mode`.
+    #[must_use]
+    pub fn new(mode: AttestationEnforcement) -> Self {
+        Self(Arc::new(std::sync::atomic::AtomicU8::new(Self::code(mode))))
+    }
+
+    /// The mode in force right now.
+    #[must_use]
+    pub fn get(&self) -> AttestationEnforcement {
+        match self.0.load(std::sync::atomic::Ordering::Relaxed) {
+            0 => AttestationEnforcement::Off,
+            1 => AttestationEnforcement::Shadow,
+            // Unreachable: `code` is the only writer and it emits 0, 1 or 2.
+            // Written as the enforcing arm rather than as a panic because a
+            // torn read here would be a refusal, which is the safe direction.
+            _ => AttestationEnforcement::Required,
+        }
+    }
+
+    /// Set the mode. The operator lever, and the only one that may promote.
+    pub fn set(&self, mode: AttestationEnforcement) {
+        self.0
+            .store(Self::code(mode), std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// D32 clause (f)'s trip: demote an acting control to shadow, and refuse
+    /// to do anything else.
+    ///
+    /// Returns whether the posture moved. `false` is the ordinary answer for a
+    /// control that is already `Shadow` or `Off` — there is no action left to
+    /// suspend, and a trip that "succeeded" by moving `Off → Shadow` would be
+    /// automation *starting* an evaluation nobody asked for.
+    pub fn auto_suspend(&self) -> bool {
+        self.0
+            .compare_exchange(
+                Self::code(AttestationEnforcement::Required),
+                Self::code(AttestationEnforcement::Shadow),
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+            )
+            .is_ok()
+    }
+
+    const fn code(mode: AttestationEnforcement) -> u8 {
+        match mode {
+            AttestationEnforcement::Off => 0,
+            AttestationEnforcement::Shadow => 1,
+            AttestationEnforcement::Required => 2,
+        }
+    }
 }
 
 impl BaselineIntentValidator {
@@ -889,17 +1065,87 @@ impl BaselineIntentValidator {
         bindings: crate::gateway::SharedBindingAuthority,
     ) -> Self {
         Self {
-            enforcement: AttestationEnforcement::Required,
+            enforcement: AttestationPosture::new(AttestationEnforcement::Required),
             epochs: Some(epochs),
             interest: Some(interest),
             bindings: Some(bindings),
+            observer: None,
         }
     }
 
-    /// This validator's enforcement mode.
+    /// A validator that evaluates D27's K-of-N predicate exactly as
+    /// [`Self::enforcing`] does and **refuses nothing on it**, recording the
+    /// verdict it would have returned instead.
+    ///
+    /// D32 clause (b)'s shadow mode, and the same three authorities are
+    /// required for the same reason: a shadow whose predicate is weaker than
+    /// live mode's measures a different control from the one it is calibrating
+    /// for. Passing a resolver that answers nothing is legal here too and
+    /// means what it means everywhere else — everybody is excluded, `|E(I)|`
+    /// collapses, and the recorded verdict is
+    /// [`ShadowVerdict::WouldCommitProvisionally`] rather than an admission.
+    /// That is an honest measurement of a gateway with no `id/` rows, which is
+    /// the deployment this tree currently has.
+    ///
+    /// Observations reach [`SHADOW_TARGET`] as `tracing` events with no
+    /// further wiring. Use [`Self::shadow_observing`] when they must also come
+    /// back in-process.
+    #[must_use]
+    pub fn shadow(
+        epochs: Arc<crate::witness_epoch::WitnessEpochAuthority>,
+        interest: Arc<dyn crate::gateway::InterestAuthority>,
+        bindings: crate::gateway::SharedBindingAuthority,
+    ) -> Self {
+        Self {
+            enforcement: AttestationPosture::new(AttestationEnforcement::Shadow),
+            epochs: Some(epochs),
+            interest: Some(interest),
+            bindings: Some(bindings),
+            observer: None,
+        }
+    }
+
+    /// [`Self::shadow`], with the observations also handed to `observer`.
+    ///
+    /// The in-process surface D32 clause (e)'s report and [#222]'s gate leg
+    /// read: a [`ShadowObservationLog`] gives the observations back
+    /// individually, and a [`CountingShadowObserver`] gives the numerator and
+    /// denominator of a rate without retaining anything.
+    ///
+    /// [#222]: https://github.com/baadc0de/orrery/issues/222
+    #[must_use]
+    pub fn shadow_observing(
+        epochs: Arc<crate::witness_epoch::WitnessEpochAuthority>,
+        interest: Arc<dyn crate::gateway::InterestAuthority>,
+        bindings: crate::gateway::SharedBindingAuthority,
+        observer: SharedShadowObserver,
+    ) -> Self {
+        Self {
+            observer: Some(observer),
+            ..Self::shadow(epochs, interest, bindings)
+        }
+    }
+
+    /// This validator's enforcement mode, as of this instant.
+    ///
+    /// A read of [`Self::posture`] rather than of a constant: the mode is
+    /// runtime-settable (D32 clause (c)), so a caller that cached this answer
+    /// would be reporting the posture at startup and calling it the posture
+    /// now.
     #[must_use]
     pub fn enforcement(&self) -> AttestationEnforcement {
-        self.enforcement
+        self.enforcement.get()
+    }
+
+    /// The posture cell this validator reads on every admission.
+    ///
+    /// The handle a `ramp/attestation_quorum` poller — or clause (f)'s
+    /// auto-suspend monitor — writes into to change the mode of a running
+    /// process. Cloning it is cloning the `Arc`, so every holder sees every
+    /// write.
+    #[must_use]
+    pub fn posture(&self) -> AttestationPosture {
+        self.enforcement.clone()
     }
 }
 
@@ -1546,7 +1792,8 @@ impl BaselineIntentValidator {
         // `check` does not.
         check_attesting_accounts(intent, &parties, bindings)?;
 
-        if self.enforcement == AttestationEnforcement::Off {
+        let enforcement = self.enforcement.get();
+        if !enforcement.evaluates() {
             // No quorum is enforced, so no intent is *un*attested in the sense
             // clause 2 means, and the provisional path is unreachable. That is
             // the correct reading rather than a shortcut: D29's second line
@@ -1558,15 +1805,41 @@ impl BaselineIntentValidator {
         // fails closed: a gateway that cannot resolve any epoch holds no
         // announcement for any intent's cell-epoch, which is exactly
         // `UnknownEpoch` and not a special case.
+        //
+        // Shadow has no closed direction to fail in, because it never acts, so
+        // D32 clause (b)'s degraded arm applies instead: record the
+        // misconfiguration as *unevaluated* and admit. Borrowing `UnknownEpoch`
+        // here would be worse than useless — it would enter clause (e)'s
+        // `fp_count` as a would-be refusal of every honest account on the
+        // cluster, and a gateway that cannot evaluate anything would read as a
+        // control that refuses everything.
         let Some(epochs) = self.epochs.as_ref() else {
+            if !enforcement.acts() {
+                return Ok(self.observe(
+                    intent,
+                    cx,
+                    now_ms,
+                    precheck,
+                    ShadowVerdict::Unevaluated(ShadowUnevaluated::NoEpochAuthority),
+                ));
+            }
             return Err(RejectionCause::UnknownEpoch);
         };
         // The same fail-closed reading for D30's second authority: a validator
         // enforcing with no interest authority can establish standing for
-        // nobody, which is exactly `NoStandingInCell`. `enforcing` takes both,
-        // so this arm is unreachable through the constructor and is written
-        // out rather than unwrapped.
+        // nobody, which is exactly `NoStandingInCell`. `enforcing` and
+        // `shadow` both take all three, so this arm is unreachable through the
+        // constructors and is written out rather than unwrapped.
         let Some(interest) = self.interest.as_ref() else {
+            if !enforcement.acts() {
+                return Ok(self.observe(
+                    intent,
+                    cx,
+                    now_ms,
+                    precheck,
+                    ShadowVerdict::Unevaluated(ShadowUnevaluated::NoInterestAuthority),
+                ));
+            }
             return Err(RejectionCause::NoStandingInCell);
         };
         // The quorum runs *after* every shape check and after the envelope's
@@ -1574,14 +1847,40 @@ impl BaselineIntentValidator {
         // filter already documents: an oversized or malformed submission never
         // pays for a witness-set resolution, and a self-witnessed one never
         // reaches the draw.
-        match check_attestation_quorum(
+        let quorum = check_attestation_quorum(
             intent,
             epochs.as_ref(),
             interest.as_ref(),
             bindings,
             &parties,
             now_ms,
-        ) {
+        );
+
+        // D32 clause (b) obligation (1) is discharged above this line and
+        // obligations (2) and (3) below it: the predicate has already run in
+        // full, with every sub-predicate live mode evaluates, and the *only*
+        // thing the mode decides is what happens to its answer.
+        if !enforcement.acts() {
+            let verdict = match quorum {
+                Ok(_eligible) => ShadowVerdict::WouldAdmit,
+                // The provisional branch is evaluated rather than assumed: D29
+                // clause 3's `reversible(i)` is one of the sub-predicates live
+                // mode would run, and a shadow that recorded every
+                // low-population intent as "would have committed
+                // provisionally" would hide the ones live mode would have
+                // refused outright.
+                Err(RejectionCause::LowPopulationEpoch) => {
+                    match provisional::classify(intent, cx.account) {
+                        Ok(()) => ShadowVerdict::WouldCommitProvisionally,
+                        Err(cause) => ShadowVerdict::WouldRefuse(cause),
+                    }
+                }
+                Err(cause) => ShadowVerdict::WouldRefuse(cause),
+            };
+            return Ok(self.observe(intent, cx, now_ms, precheck, verdict));
+        }
+
+        match quorum {
             Ok(_eligible) => Ok(Admission::Attested(precheck)),
             // The second line of clause 2's admission function, in full: the
             // population predicate held, so `reversible(i)` decides. A failure
@@ -1593,6 +1892,41 @@ impl BaselineIntentValidator {
             }
             Err(cause) => Err(cause),
         }
+    }
+
+    /// Record one shadow verdict and admit the intent regardless of it.
+    ///
+    /// The whole of D32 clause (b)'s third obligation is the return value:
+    /// [`Admission::Attested`], the same answer [`AttestationEnforcement::Off`]
+    /// gives, whatever `verdict` says. Not `Provisional` even when the verdict
+    /// is [`ShadowVerdict::WouldCommitProvisionally`] — the quarantine, the
+    /// outstanding-cap accounting and the annulment deadline D29's path
+    /// applies are *actions*, and a shadow period that started quarantining
+    /// intents would be live under a different name.
+    ///
+    /// One function rather than an inline tuple at each of the three call
+    /// sites, so "record, then admit" is a single statement no future arm can
+    /// half-implement.
+    fn observe(
+        &self,
+        intent: &Intent,
+        cx: &IntentContext,
+        now_ms: u64,
+        precheck: IntentPrecheck,
+        verdict: ShadowVerdict,
+    ) -> Admission {
+        shadow::emit(
+            self.observer.as_deref(),
+            ShadowObservation {
+                intent_id: intent.intent_id,
+                issuer: intent.issuer,
+                subject: cx.account,
+                cell_epoch: intent.cell_epoch,
+                verdict,
+                observed_at_ms: now_ms,
+            },
+        );
+        Admission::Attested(precheck)
     }
 }
 
@@ -3052,6 +3386,459 @@ mod tests {
         );
     }
 
+    // -- D32 clause (b): the shadow arm -----------------------------------
+    //
+    // Every test below is written against a **pair**: one validator that acts
+    // and one that watches, differing in nothing but the posture byte and the
+    // observer. That is not a convenience — it is what makes "shadow evaluates
+    // the same predicate live mode does" structural rather than asserted. A
+    // shadow fixture built from its own authorities could drift from the
+    // enforcing one and every test here would keep passing.
+
+    /// The same validator, watching instead of acting, with its observations
+    /// captured.
+    fn watching(
+        validator: &BaselineIntentValidator,
+    ) -> (BaselineIntentValidator, Arc<ShadowObservationLog>) {
+        let log = Arc::new(ShadowObservationLog::default());
+        let shadowed = BaselineIntentValidator {
+            enforcement: AttestationPosture::new(AttestationEnforcement::Shadow),
+            observer: Some(Arc::clone(&log) as SharedShadowObserver),
+            ..validator.clone()
+        };
+        assert_eq!(shadowed.enforcement(), AttestationEnforcement::Shadow);
+        (shadowed, log)
+    }
+
+    /// The one observation a test's single intent produced.
+    fn only(log: &ShadowObservationLog) -> ShadowObservation {
+        let observations = log.observations();
+        assert_eq!(
+            observations.len(),
+            1,
+            "shadow records exactly one observation per evaluated intent"
+        );
+        observations[0]
+    }
+
+    /// Obligations (2) and (3) on one intent, in both directions.
+    ///
+    /// The intent is one the quorum genuinely refuses — two of the three
+    /// co-signatures the draw named — so:
+    ///
+    /// - `Required` refuses it. That is the control: without it, "shadow
+    ///   admitted the intent" says nothing, because an intent nothing would
+    ///   have refused is admitted by every mode.
+    /// - `Shadow` **commits** it. That is obligation (3), the half a test
+    ///   which only checked the log would miss entirely.
+    /// - `Shadow` records the **exact** cause `Required` returned, compared
+    ///   against the refusal itself rather than against a literal, so the two
+    ///   cannot drift apart.
+    #[test]
+    fn shadow_admits_what_required_refuses_and_records_that_refusal() {
+        let witnesses = witness_keys(7);
+        let (enforcing, epochs) = enforcing_over(&witnesses);
+        let (shadow, log) = watching(&enforcing);
+
+        let mut short = attestable_intent(60);
+        let required = attest_required(&mut short, &witnesses, &epochs);
+        assert_eq!(required.len(), orrery_protocol::WITNESS_QUORUM_K);
+        short.attestations.pop();
+
+        let refused = enforcing
+            .check_at(&short, &cx(Some(7)), 2_000)
+            .expect_err("K-1 of the drawn subset is a refusal in live mode");
+        assert_eq!(refused, RejectionCause::ThresholdNotMet);
+
+        assert_eq!(
+            shadow.check_at(&short, &cx(Some(7)), 2_000),
+            Ok(Admission::Attested(IntentPrecheck::default())),
+            "obligation (3): the refusal is the action, and shadow does not take it"
+        );
+
+        let observed = only(&log);
+        assert_eq!(
+            observed.verdict,
+            ShadowVerdict::WouldRefuse(refused),
+            "obligation (2): the recorded cause is the one live mode returned"
+        );
+        assert!(observed.verdict.would_act());
+        assert_eq!(log.would_act(), 1);
+        assert_eq!(observed.intent_id, short.intent_id);
+        assert_eq!(observed.subject, Some(AccountId::new(7)));
+        assert_eq!(observed.cell_epoch, short.cell_epoch);
+        assert_eq!(observed.observed_at_ms, 2_000);
+        assert_eq!(
+            observed.verdict.as_str(),
+            RejectionCause::ThresholdNotMet.as_str(),
+            "the label is the rejection log's own, so a shadow report joins \
+             against it with no translation table"
+        );
+    }
+
+    /// The draw conjunct is observed too, not just the count.
+    ///
+    /// K co-signatures that are the *wrong* K is the attestation-shopping case
+    /// D10 abolishes, and it is the one an implementation checking `len() >= K`
+    /// would let through. Shadow has to see it, or its refusal count
+    /// understates exactly the population the control exists for.
+    #[test]
+    fn shadow_records_a_missing_required_witness_rather_than_a_short_count() {
+        let witnesses = witness_keys(7);
+        let (enforcing, epochs) = enforcing_over(&witnesses);
+        let (shadow, log) = watching(&enforcing);
+
+        let mut shopped = attestable_intent(61);
+        let required = attest_required(&mut shopped, &witnesses, &epochs);
+        // Swap one drawn witness for an eligible one the draw did not name:
+        // the count still reaches K, and the subset does not.
+        shopped.attestations.pop();
+        let substitute = witnesses
+            .iter()
+            .find(|key| !required.contains(&key.public()))
+            .expect("N > K, so an undrawn announced witness exists");
+        let attestation = shopped.attest(substitute);
+        assert!(attestation.verify(&shopped), "a genuine co-signature");
+        shopped.attestations.push(attestation);
+        assert_eq!(
+            shopped.attestations.len(),
+            orrery_protocol::WITNESS_QUORUM_K,
+            "the count is satisfied, which is the point"
+        );
+
+        let refused = enforcing
+            .check_at(&shopped, &cx(Some(7)), 2_000)
+            .expect_err("the drawn subset is not present");
+        assert_eq!(refused, RejectionCause::RequiredWitnessMissing);
+        assert!(shadow.check_at(&shopped, &cx(Some(7)), 2_000).is_ok());
+        assert_eq!(only(&log).verdict, ShadowVerdict::WouldRefuse(refused));
+    }
+
+    /// An intent live mode would have admitted records no would-be refusal.
+    ///
+    /// Without this the signal is useless in the other direction: a shadow
+    /// that flagged everything would read as a control about to refuse the
+    /// whole cluster, and clause (e)'s `fp_count` would be the intent count.
+    #[test]
+    fn shadow_records_no_refusal_for_an_intent_required_would_admit() {
+        let witnesses = witness_keys(7);
+        let (enforcing, epochs) = enforcing_over(&witnesses);
+        let (shadow, log) = watching(&enforcing);
+
+        let mut attested = attestable_intent(62);
+        attest_required(&mut attested, &witnesses, &epochs);
+        assert!(
+            enforcing.check_at(&attested, &cx(Some(7)), 2_000).is_ok(),
+            "the control arm: live mode admits this intent"
+        );
+
+        assert!(shadow.check_at(&attested, &cx(Some(7)), 2_000).is_ok());
+        let observed = only(&log);
+        assert_eq!(observed.verdict, ShadowVerdict::WouldAdmit);
+        assert!(!observed.verdict.would_act());
+        assert_eq!(observed.verdict.cause(), None);
+        assert_eq!(log.would_act(), 0);
+        assert_eq!(
+            log.evaluated(),
+            1,
+            "an admitted intent is still observed — it is clause (e)'s \
+             coverage denominator, and a numerator with no denominator is not \
+             evidence"
+        );
+    }
+
+    /// D30's standing conjunct is evaluated in shadow, not skipped.
+    ///
+    /// It is the sub-predicate most easily lost, because it sits inside the
+    /// quorum check rather than beside it, and losing it makes the shadow
+    /// refusal count silently low — which reads as a control that is safe to
+    /// promote.
+    #[test]
+    fn shadow_evaluates_d30s_standing_conjunct() {
+        let (enforcing, epochs, _home, away) = two_cell_gateway();
+        let (shadow, log) = watching(&enforcing);
+
+        let mut shopped = intent_naming(AWAY_HANDLE, 63);
+        attest_required_under(&mut shopped, AWAY_HANDLE, &away, &epochs);
+        assert_eq!(
+            enforcing.check_at(&shopped, &cx(Some(7)), 2_000),
+            Err(RejectionCause::NoStandingInCell),
+            "the control: the issuer stands in the home cell only"
+        );
+
+        assert!(shadow.check_at(&shopped, &cx(Some(7)), 2_000).is_ok());
+        assert_eq!(
+            only(&log).verdict,
+            ShadowVerdict::WouldRefuse(RejectionCause::NoStandingInCell)
+        );
+    }
+
+    /// The always-on set does not switch off with the quorum, and shadow is
+    /// not an exception to that.
+    ///
+    /// D32 clause (b)'s second box lists what never ramps: the D27 preimage,
+    /// the `MAX_ATTESTATIONS` cap, the duplicate rule, the self-witness
+    /// refusal. Each of these is a *refusal* in shadow mode, which is the one
+    /// place "shadow refuses nothing" would be exactly the wrong reading — a
+    /// flag that could disable a signature check is a denial-of-service lever
+    /// pointed at the cluster.
+    ///
+    /// The log is asserted empty as well, because these refusals happen above
+    /// the quorum: an observation for one would mean the predicate had run,
+    /// and the intent had reached a stage it must never reach.
+    #[test]
+    fn shadow_still_refuses_every_check_that_is_not_the_quorum() {
+        let witnesses = witness_keys(7);
+        let (enforcing, _epochs) = enforcing_over(&witnesses);
+        let (shadow, log) = watching(&enforcing);
+
+        // A forged co-signature: the D27 preimage, which no mode waives.
+        let mut forged = attestable_intent(64);
+        let mut attestation = forged.attest(&witnesses[0]);
+        attestation.signature = witnesses[0].sign(b"not the attestation preimage");
+        forged.attestations.push(attestation);
+
+        // The same witness twice.
+        let mut repeated = attestable_intent(65);
+        let once = repeated.attest(&witnesses[1]);
+        repeated.attestations.push(once.clone());
+        repeated.attestations.push(once);
+
+        // Over the cap.
+        let mut flooded = attestable_intent(66);
+        for index in 0..=MAX_ATTESTATIONS {
+            let key = epoch_fixture::witness_secret(100 + index as u8);
+            let attestation = flooded.attest(&key);
+            flooded.attestations.push(attestation);
+        }
+
+        // The issuer witnessing itself.
+        let mut selfish = attestable_intent(67);
+        let attestation = selfish.attest(&issuer_key());
+        selfish.attestations.push(attestation);
+
+        for (intent, expected) in [
+            (&forged, RejectionCause::BadAttestation),
+            (&repeated, RejectionCause::DuplicateAttestation),
+            (&flooded, RejectionCause::TooManyAttestations),
+            (&selfish, RejectionCause::SelfWitness),
+        ] {
+            assert_eq!(
+                shadow.check_at(intent, &cx(Some(7)), 2_000),
+                Err(expected),
+                "`{}` is correctness, not enforcement: it never ramps",
+                expected.as_str()
+            );
+            assert_eq!(
+                enforcing.check_at(intent, &cx(Some(7)), 2_000),
+                Err(expected),
+                "and the two modes agree on it exactly"
+            );
+        }
+        assert_eq!(
+            log.evaluated(),
+            0,
+            "every one of these is refused above the quorum, so the predicate \
+             never ran and there is nothing to observe"
+        );
+    }
+
+    /// D32 clause (b)'s degraded arm: an internal error records
+    /// *unevaluated*, and never acts.
+    ///
+    /// The direction matters more than the mechanism. Live mode fails closed
+    /// on a missing authority — `UnknownEpoch`, `NoStandingInCell` — because a
+    /// refusal is the safe answer when it cannot judge. Shadow has no safe
+    /// refusal to make, so borrowing those causes would put a would-be refusal
+    /// of every honest account on the cluster into clause (e)'s `fp_count`,
+    /// and a misconfigured gateway would read as a control that refuses
+    /// everything.
+    #[test]
+    fn shadow_records_unevaluated_when_it_cannot_evaluate() {
+        let intent = attestable_intent(68);
+        let witnesses = witness_keys(7);
+        let announced: Vec<NodeId> = witnesses.iter().map(iroh_base::SecretKey::public).collect();
+
+        let cacheless_log = Arc::new(ShadowObservationLog::default());
+        let cacheless = BaselineIntentValidator {
+            enforcement: AttestationPosture::new(AttestationEnforcement::Shadow),
+            epochs: None,
+            interest: None,
+            bindings: None,
+            observer: Some(Arc::clone(&cacheless_log) as SharedShadowObserver),
+        };
+        assert!(
+            cacheless.check_at(&intent, &cx(Some(7)), 2_000).is_ok(),
+            "a misconfiguration is not grounds to act"
+        );
+        assert_eq!(
+            only(&cacheless_log).verdict,
+            ShadowVerdict::Unevaluated(ShadowUnevaluated::NoEpochAuthority)
+        );
+        assert_eq!(cacheless_log.would_act(), 0);
+
+        let standingless_log = Arc::new(ShadowObservationLog::default());
+        let standingless = BaselineIntentValidator {
+            enforcement: AttestationPosture::new(AttestationEnforcement::Shadow),
+            epochs: Some(epoch_fixture::cache_with(EPOCH_HANDLE, &announced, 1_000)),
+            interest: None,
+            bindings: Some(distinct_bindings(&announced)),
+            observer: Some(Arc::clone(&standingless_log) as SharedShadowObserver),
+        };
+        assert!(standingless.check_at(&intent, &cx(Some(7)), 2_000).is_ok());
+        assert_eq!(
+            only(&standingless_log).verdict,
+            ShadowVerdict::Unevaluated(ShadowUnevaluated::NoInterestAuthority)
+        );
+        assert_eq!(standingless_log.would_act(), 0);
+    }
+
+    /// A shadow commit is `Attested`, never `Provisional`, even when live mode
+    /// would have quarantined the intent.
+    ///
+    /// The quarantine, the outstanding-account cap and the annulment deadline
+    /// D29's path applies are *actions* — a shadow period that started
+    /// applying them would be live under a different name. The verdict still
+    /// records which of live mode's three outcomes it would have been, because
+    /// collapsing "would have been quarantined" into "would have been
+    /// admitted" mis-states the population D29's path serves.
+    #[test]
+    fn shadow_commits_attested_where_required_would_have_committed_provisionally() {
+        let witnesses = witness_keys(7);
+        let (enforcing, _epochs) = enforcing_over(&witnesses);
+        // A resolver that answers nothing: D31 clause (f) excludes every
+        // candidate, `|E(I)|` falls to zero, and live mode reaches D29's
+        // low-population branch. This is the deployment this tree actually has
+        // — nothing writes the `id/` rows yet.
+        let blind = BaselineIntentValidator {
+            bindings: Some(Arc::new(crate::gateway::UnboundBindingAuthority)),
+            ..enforcing.clone()
+        };
+        let (shadow, log) = watching(&blind);
+
+        let mut intent = attestable_intent(69);
+        intent.evidence = Some(tests_support::commitment());
+        intent.sign(&issuer_key());
+
+        assert_eq!(
+            blind.check_at(&intent, &cx(Some(7)), 2_000),
+            Ok(Admission::Provisional(IntentPrecheck::default())),
+            "the control: live mode quarantines this intent"
+        );
+        assert_eq!(
+            shadow.check_at(&intent, &cx(Some(7)), 2_000),
+            Ok(Admission::Attested(IntentPrecheck::default())),
+            "shadow applies no quarantine — that is an action"
+        );
+        let observed = only(&log);
+        assert_eq!(observed.verdict, ShadowVerdict::WouldCommitProvisionally);
+        assert!(
+            !observed.verdict.would_act(),
+            "a provisional commit is a commit; clause (e) counts refusals"
+        );
+    }
+
+    // -- D32 clause (c) and (f): the runtime lever -------------------------
+
+    /// The posture is settable while the validator runs, and setting it
+    /// changes what the *next* intent gets — which is the whole point of
+    /// there being two layers rather than one.
+    ///
+    /// A CLI-only flag is not reversible on an incident timescale: rolling a
+    /// gateway restart drops sessions and takes minutes. This is the seam a
+    /// `ramp/attestation_quorum` poller writes into.
+    #[test]
+    fn the_posture_changes_a_running_validators_mode_without_a_restart() {
+        let witnesses = witness_keys(7);
+        let (validator, epochs) = enforcing_over(&witnesses);
+
+        let mut short = attestable_intent(70);
+        attest_required(&mut short, &witnesses, &epochs);
+        short.attestations.pop();
+        assert_eq!(
+            validator.check_at(&short, &cx(Some(7)), 2_000),
+            Err(RejectionCause::ThresholdNotMet)
+        );
+
+        // A clone shares the cell, exactly as the gateway's `Arc<dyn
+        // IntentValidator>` and a poller's handle would.
+        let posture = validator.posture();
+        assert!(
+            posture.auto_suspend(),
+            "clause (f): an acting control demotes to shadow"
+        );
+        assert_eq!(validator.enforcement(), AttestationEnforcement::Shadow);
+        assert!(
+            validator.check_at(&short, &cx(Some(7)), 2_000).is_ok(),
+            "the same validator, the same intent, and it no longer acts"
+        );
+
+        posture.set(AttestationEnforcement::Required);
+        assert_eq!(
+            validator.check_at(&short, &cx(Some(7)), 2_000),
+            Err(RejectionCause::ThresholdNotMet),
+            "promotion is an operator act, and it works"
+        );
+    }
+
+    /// Automation may make the fleet safer and never less safe.
+    ///
+    /// D32 clause (f)'s asymmetry, enforced by the API rather than by
+    /// convention: the trip demotes `Required → Shadow` and does nothing else.
+    /// Falling to `Off` would blind the cluster during exactly the incident
+    /// that tripped it and would make the trigger a censorship lever — spike
+    /// the verdict rate, turn enforcement off.
+    #[test]
+    fn auto_suspend_only_demotes_and_only_as_far_as_shadow() {
+        let acting = AttestationPosture::new(AttestationEnforcement::Required);
+        assert!(acting.auto_suspend());
+        assert_eq!(acting.get(), AttestationEnforcement::Shadow);
+        assert!(
+            !acting.auto_suspend(),
+            "a suspended control has no action left to suspend"
+        );
+        assert_eq!(
+            acting.get(),
+            AttestationEnforcement::Shadow,
+            "and it never falls further: shadow keeps observing"
+        );
+
+        let silent = AttestationPosture::new(AttestationEnforcement::Off);
+        assert!(!silent.auto_suspend());
+        assert_eq!(
+            silent.get(),
+            AttestationEnforcement::Off,
+            "automation does not start an evaluation nobody asked for either"
+        );
+    }
+
+    /// The CLI spellings D32 clause (c)'s inventory names, round-tripped.
+    #[test]
+    fn the_three_modes_parse_and_print_as_the_inventory_spells_them() {
+        for mode in [
+            AttestationEnforcement::Off,
+            AttestationEnforcement::Shadow,
+            AttestationEnforcement::Required,
+        ] {
+            assert_eq!(mode.as_str().parse::<AttestationEnforcement>(), Ok(mode));
+        }
+        assert_eq!(
+            AttestationEnforcement::Off.as_str(),
+            "off",
+            "the inventory's spelling, and the flag's default"
+        );
+        assert!("live".parse::<AttestationEnforcement>().is_err());
+
+        // Only `required` acts; only `shadow` and `required` evaluate. These
+        // two predicates are what every mode decision in this crate is written
+        // against, so a fourth arm has to answer them explicitly.
+        assert!(AttestationEnforcement::Required.acts());
+        assert!(!AttestationEnforcement::Shadow.acts());
+        assert!(!AttestationEnforcement::Off.acts());
+        assert!(AttestationEnforcement::Shadow.evaluates());
+        assert!(!AttestationEnforcement::Off.evaluates());
+    }
+
     // -- D10 item 4's account half (D31) ----------------------------------
     //
     // Everything below turns on one arrangement: a witness whose **NodeId** is
@@ -3528,10 +4315,11 @@ mod tests {
         // And an enforcing validator with no cache fails closed rather than
         // open, which is the direction a misconfiguration must take.
         let blind = BaselineIntentValidator {
-            enforcement: AttestationEnforcement::Required,
+            enforcement: AttestationPosture::new(AttestationEnforcement::Required),
             epochs: None,
             interest: None,
             bindings: None,
+            observer: None,
         };
         assert_eq!(
             blind.check_at(&intent, &cx(Some(7)), 2_000),
@@ -3544,10 +4332,11 @@ mod tests {
         let witnesses = witness_keys(7);
         let announced: Vec<NodeId> = witnesses.iter().map(iroh_base::SecretKey::public).collect();
         let standingless = BaselineIntentValidator {
-            enforcement: AttestationEnforcement::Required,
+            enforcement: AttestationPosture::new(AttestationEnforcement::Required),
             epochs: Some(epoch_fixture::cache_with(EPOCH_HANDLE, &announced, 1_000)),
             interest: None,
             bindings: Some(distinct_bindings(&announced)),
+            observer: None,
         };
         assert_eq!(
             standingless.check_at(&intent, &cx(Some(7)), 2_000),

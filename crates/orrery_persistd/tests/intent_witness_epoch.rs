@@ -742,3 +742,215 @@ async fn a_party_accounts_node_id_is_absent_from_the_recorded_eligible_vector() 
          so this assertion is what makes the previous two mean something"
     );
 }
+
+// ── D32 clause (d): the shadow arm, at the executor ──────────────────────
+//
+// The admission half is unit-tested against the validator. What only a
+// cluster can show is the pair of durable consequences the record decides:
+// what a shadow commit's `attest/` row says about itself, and that the
+// commit-time re-proof — the second place a below-quorum intent can die — is
+// disarmed under shadow. An arm that admitted at admission and refused at
+// commit would be acting after saying it would not, which is the failure
+// this file's fixtures are already shaped to catch.
+
+/// A signed intent naming `handle`, carrying **no** co-signatures.
+///
+/// The below-quorum case: `required` refuses it at admission and, if it ever
+/// reached the executor, at commit. Shadow commits it, which is the whole
+/// question these two tests ask of the durable rows.
+fn unattested_intent(id: u128, key: &iroh_base::SecretKey, handle: u64) -> Intent {
+    let mut intent = Intent {
+        evidence: None,
+        intent_id: id,
+        issuer: key.public(),
+        cell_epoch: CellEpoch::new(handle),
+        ops: vec![IntentOp {
+            op: 100,
+            args: Bytes::new(),
+        }],
+        attestations: Vec::new(),
+        signature: key.sign(b"placeholder"),
+    };
+    intent.sign(key);
+    intent
+}
+
+#[tokio::test]
+async fn a_shadow_commit_records_an_attest_row_an_auditor_can_tell_apart() {
+    let Some(cluster) = fdb_cluster_file() else {
+        eprintln!("skipping: ORRERY_FDB_CLUSTER_FILE not set and no .fdb-dev/fdb.cluster");
+        return;
+    };
+    // D32 clause (d)'s decision, both halves in one test because each is only
+    // meaningful against the other. Omitting the row would leave a whole
+    // shadow period unauditable against D27 clause (f); writing it unmarked
+    // would fabricate an audit trail claiming the cluster stood behind a
+    // quorum it deliberately waived. The marker is what makes the story
+    // coherent: insufficient co-signatures, admitted by policy, observed and
+    // not trusted.
+    let handle = 0x9601_0000_0000_0009;
+    let (epochs, witnesses) = accepted_epoch(9, handle);
+    let exec = FdbIntentExecutor::connect(&cluster, GridId::new(GRID))
+        .unwrap()
+        .shadowing_epochs(Arc::clone(&epochs), fixture_bindings(&witnesses));
+    let db = Arc::clone(exec.database());
+    reset(&db, 9, handle, &[0x9601_0071, 0x9601_0072]).await;
+
+    let key = secret(17);
+    let bare = unattested_intent(0x9601_0071, &key, handle);
+    assert!(
+        bare.attestations.is_empty(),
+        "the fixture must really be below quorum"
+    );
+    assert!(
+        matches!(
+            exec.execute(&bare).await.unwrap(),
+            IntentOutcome::Committed { .. }
+        ),
+        "shadow commits an intent `required` would refuse"
+    );
+
+    let shadow_row: keyspace::AttestRow = postcard::from_bytes(
+        &read_key(&db, keyspace::attest_key(bare.intent_id).to_vec())
+            .await
+            .expect("a shadow commit still records its eligible vector"),
+    )
+    .expect("attest row decodes");
+    assert!(
+        !shadow_row.enforced,
+        "the marker is what stops the row reading as an enforced commit"
+    );
+    assert_eq!(shadow_row.epoch_handle, handle);
+    assert_eq!(
+        shadow_row.eligible,
+        orrery_protocol::eligible_witnesses(
+            &epochs.resolve(handle).expect("cached").snapshot.selected,
+            bare.issuer
+        ),
+        "and it records the same `E(I)` an enforced commit would, so the \
+         audit reads one shape of row in both postures"
+    );
+
+    // The control, on the same cell-epoch and the same durable draw key: an
+    // enforcing executor's row is marked `true`. Without this the assertion
+    // above is satisfied by a field that is always `false`.
+    let enforcing = FdbIntentExecutor::connect(&cluster, GridId::new(GRID))
+        .unwrap()
+        .recording_epochs(Arc::clone(&epochs), fixture_bindings(&witnesses));
+    let attested = attested_intent(0x9601_0072, &key, handle, &epochs, &witnesses);
+    assert!(matches!(
+        enforcing.execute(&attested).await.unwrap(),
+        IntentOutcome::Committed { .. }
+    ));
+    let enforced_row: keyspace::AttestRow = postcard::from_bytes(
+        &read_key(&db, keyspace::attest_key(attested.intent_id).to_vec())
+            .await
+            .expect("attest row"),
+    )
+    .expect("attest row decodes");
+    assert!(enforced_row.enforced);
+}
+
+#[tokio::test]
+async fn a_shadow_executor_does_not_refuse_at_commit_what_admission_admitted() {
+    let Some(cluster) = fdb_cluster_file() else {
+        eprintln!("skipping: ORRERY_FDB_CLUSTER_FILE not set and no .fdb-dev/fdb.cluster");
+        return;
+    };
+    // The stale-draw-key scenario, run twice: once with the re-proof armed
+    // and once in shadow. The armed run is the control — it is the landed
+    // behaviour, and it is what proves the fixture really does trip the
+    // re-proof rather than passing it. The shadow run is the assertion: the
+    // same intent, against the same durable row and the same adopted key,
+    // commits.
+    //
+    // This is the "must not act" half at the executor. A shadow arm that
+    // admitted at admission and refused here would be the worst of both
+    // modes, and it is the failure mode D32 clause (d) names from the far
+    // side of clause (b).
+    let handle = 0x9601_0000_0000_000A;
+    let (sibling_epochs, witnesses) = accepted_epoch(10, handle);
+    let owner = FdbIntentExecutor::connect(&cluster, GridId::new(GRID))
+        .unwrap()
+        .recording_epochs(Arc::clone(&sibling_epochs), fixture_bindings(&witnesses));
+    let db = Arc::clone(owner.database());
+    reset(&db, 10, handle, &[0x9601_0081, 0x9601_0082, 0x9601_0083]).await;
+
+    // The sibling mints the durable key.
+    let key = secret(18);
+    assert!(matches!(
+        owner
+            .execute(&attested_intent(
+                0x9601_0081,
+                &key,
+                handle,
+                &sibling_epochs,
+                &witnesses
+            ))
+            .await
+            .unwrap(),
+        IntentOutcome::Committed { .. }
+    ));
+
+    // A successor with its own, different key, and two intents attested under
+    // it — both below quorum against the *durable* draw.
+    let (successor_epochs, _) = accepted_epoch(10, handle);
+    let stale_for_armed = attested_intent(0x9601_0082, &key, handle, &successor_epochs, &witnesses);
+    let stale_for_shadow =
+        attested_intent(0x9601_0083, &key, handle, &successor_epochs, &witnesses);
+
+    let armed = FdbIntentExecutor::connect(&cluster, GridId::new(GRID))
+        .unwrap()
+        .recording_epochs(Arc::clone(&successor_epochs), fixture_bindings(&witnesses));
+    assert_eq!(
+        armed.execute(&stale_for_armed).await.unwrap(),
+        IntentOutcome::Rejected {
+            reason: orrery_protocol::REASON_ATTESTATION_QUORUM
+        },
+        "the control: armed, the re-proof refuses this exact intent"
+    );
+
+    // A fresh cache again, so the shadow executor starts from the same stale
+    // key the armed one did rather than from the adoption it just made.
+    let (shadow_epochs, _) = accepted_epoch(10, handle);
+    let shadow = FdbIntentExecutor::connect(&cluster, GridId::new(GRID))
+        .unwrap()
+        .shadowing_epochs(Arc::clone(&shadow_epochs), fixture_bindings(&witnesses));
+    assert!(
+        matches!(
+            shadow.execute(&stale_for_shadow).await.unwrap(),
+            IntentOutcome::Committed { .. }
+        ),
+        "shadow commits it: the re-proof refuses below-quorum commits, and \
+         shadow commits below quorum on purpose"
+    );
+
+    // The adoption still happened, in both modes. The cache must converge on
+    // the durable key regardless of posture, or a later promotion to
+    // `required` would begin against a key this gateway never adopted.
+    let durable: keyspace::EpochRow = postcard::from_bytes(
+        &read_key(
+            &db,
+            keyspace::epoch_key(GridId::new(GRID), cell(), 10).to_vec(),
+        )
+        .await
+        .expect("epoch row"),
+    )
+    .expect("epoch row decodes");
+    assert_eq!(
+        *shadow_epochs.resolve(handle).expect("cached").draw_key(),
+        durable.draw_key,
+        "shadow adopts the durable draw key; only the refusal is suppressed"
+    );
+
+    let row: keyspace::AttestRow = postcard::from_bytes(
+        &read_key(
+            &db,
+            keyspace::attest_key(stale_for_shadow.intent_id).to_vec(),
+        )
+        .await
+        .expect("attest row"),
+    )
+    .expect("attest row decodes");
+    assert!(!row.enforced);
+}
