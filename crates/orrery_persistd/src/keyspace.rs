@@ -1013,15 +1013,18 @@ pub fn player_loc_key(account: AccountId) -> [u8; 10] {
 }
 
 // ---------------------------------------------------------------------------
-// Identity family: `id/{…}` — `da` accounts, `db` bindings, `dh` history
+// Identity family: `id/{…}` — `da` accounts, `db` bindings, `dh` history,
+// `dw` binding-rate window
 // ---------------------------------------------------------------------------
 //
 // D31's account subspace. One family byte, `b'd'`, spanning `[b"d", b"e")`,
-// with three sub-spans discriminated by an ASCII byte at a fixed offset:
+// with four sub-spans discriminated by an ASCII byte at a fixed offset:
 //
 //   da ‖ account:u64 BE                       10 B  ->  AccountRow
 //   db ‖ node:[u8;32]                         34 B  ->  BindingRow
 //   dh ‖ node:[u8;32] ‖ versionstamp:[u8;10]  44 B  ->  BindingHistoryRow
+//   dw ‖ account:u64 BE                       10 B  ->  postcard Vec<u64>,
+//                                                   ascending event stamps (D36)
 //
 // `orrery_identity` (D12) is the sole writer of every row here. The gateway is
 // the only durable reader, and it reads FoundationDB directly rather than
@@ -1031,14 +1034,15 @@ pub fn player_loc_key(account: AccountId) -> [u8; 10] {
 // already holds a token-verified session with it, so its account is in hand
 // without a lookup (D31 (d)).
 //
-// **Why one byte carries three families.** Seventeen of the twenty-six
+// **Why one byte carries four families.** Seventeen of the twenty-six
 // lowercase bytes were already taken as family prefixes before this record, and
 // six more are spoken for as exclusive range ends, leaving `d`, `y` and `z`
 // against four documented-but-unbuilt families. Taking one byte each runs out.
 // So `id/` spends one and discriminates inside it, which is the pattern the
 // ledger already established with `lb`/`li`/`lr`; sub-span ordering
-// `a < b < h` makes the three scans disjoint by construction, exactly as
-// `lb < li < lr` does. All three are written by one service, in one
+// `a < b < h < w` makes the scans disjoint by construction, exactly as
+// `lb < le < li < lr` does. All four are written by one service — the window
+// rides the same transaction as the rows it guards (D36 (b)) — in one
 // transaction, under one retention rule, so there is nothing a second byte
 // would separate that is not already together.
 //
@@ -1226,6 +1230,31 @@ pub fn decode_binding_history_key(key: &[u8]) -> Option<(NodeId, [u8; 10])> {
     Some((node, versionstamp))
 }
 
+/// Key for one account's binding-rate window: `id/dw/{account_id}`.
+///
+/// The value is a postcard `Vec<u64>` of ascending event timestamps in ms —
+/// every binding event the account filed within its trailing 30 days, both
+/// directions counted — which is what makes D31 clause (g)'s rate cap
+/// answerable with one point read instead of a scan of every node's `dh`
+/// span filtered on values (D36 §Decision (a), `docs/adr/0036-binding-rate-window.md`).
+/// Identity is this row's only
+/// writer, and it writes it **inside** the transaction that stages `da`, `db`
+/// and `dh`: the window check that refuses the 9th event in 24 h or the 65th
+/// in 30 days reads and writes this row non-snapshot there, so a refusal
+/// stages nothing and an abort leaves the window exactly as it was.
+///
+/// `'w'` keeps the hand-written bound away from `dh`'s end for the same
+/// reason D35 refused an `'s'` beside `lr`: boundaries that mean two things
+/// are how sub-span defects breed.
+#[must_use]
+pub fn binding_window_key(account: AccountId) -> [u8; 10] {
+    let mut key = [0u8; 10];
+    key[0] = b'd';
+    key[1] = b'w';
+    key[2..10].copy_from_slice(&account.0.to_be_bytes());
+    key
+}
+
 /// The first byte of the whole `id/` family span.
 #[must_use]
 pub fn id_range_start() -> Vec<u8> {
@@ -1289,6 +1318,24 @@ pub fn binding_history_range_start() -> Vec<u8> {
 #[must_use]
 pub fn binding_history_range_end() -> Vec<u8> {
     vec![b'd', b'i']
+}
+
+/// The first key of the `id/dw/…` binding-rate-window sub-space (D36).
+#[must_use]
+pub fn binding_window_range_start() -> Vec<u8> {
+    vec![b'd', b'w']
+}
+
+/// The exclusive end of the `id/dw/…` binding-rate-window sub-space.
+///
+/// `b"dx"` is one past `'w'` — house style for a sub-span end — and still
+/// inside the `d` family. The whole window span `[dw, dx)` sorts above every
+/// `dh` key (`dh`'s own span ends at `[b"di"]`) and below the family end
+/// `[b"e")`, so neither the `dh` retention sweep nor any full-family scan can
+/// reach it by accident.
+#[must_use]
+pub fn binding_window_range_end() -> Vec<u8> {
+    vec![b'd', b'x']
 }
 
 /// The first key of one node's `id/dh/{node_id}/…` span.
@@ -2382,6 +2429,15 @@ mod tests {
             &[0u8; 10],
             "the versionstamp is a zero placeholder until FDB substitutes it"
         );
+
+        let window = binding_window_key(AccountId::new(0x0102_0304_0506_0708));
+        assert_eq!(window.len(), 10, "dw ‖ account:u64 BE (D36 (a))");
+        assert_eq!(&window[..2], b"dw");
+        assert_eq!(
+            u64::from_be_bytes(window[2..10].try_into().unwrap()),
+            0x0102_0304_0506_0708,
+            "the window is account-keyed — the rate cap's question is per-account"
+        );
     }
 
     #[test]
@@ -2395,8 +2451,8 @@ mod tests {
             "an exclusive bound of [0x65] cannot include any key `e ‖ …`"
         );
 
-        // `a < b < h` makes the three scans disjoint by construction, exactly
-        // as `lb < li < lr` does for the ledger.
+        // `a < b < h < w` makes the scans disjoint by construction, exactly
+        // as `lb < le < li < lr` does for the ledger.
         let spans = [
             (account_range_start(), account_range_end(), "da"),
             (binding_range_start(), binding_range_end(), "db"),
@@ -2404,6 +2460,11 @@ mod tests {
                 binding_history_range_start(),
                 binding_history_range_end(),
                 "dh",
+            ),
+            (
+                binding_window_range_start(),
+                binding_window_range_end(),
+                "dw",
             ),
         ];
         for (lo, hi, name) in &spans {
@@ -2428,10 +2489,16 @@ mod tests {
         let account = account_key(AccountId::new(u64::MAX)).to_vec();
         let binding = binding_key(&node(0xEE)).to_vec();
         let history = binding_history_key(&node(0x00)).to_vec();
+        let window = binding_window_key(AccountId::new(u64::MAX)).to_vec();
         assert!(account_range_start() <= account && account < account_range_end());
         assert!(binding_range_start() <= binding && binding < binding_range_end());
         assert!(binding_history_range_start() <= history && history < binding_history_range_end());
-        assert!(account < binding && binding < history, "da < db < dh");
+        assert!(binding_window_range_start() <= window && window < binding_window_range_end());
+        assert!(
+            account < binding && binding < history && history < window,
+            "da < db < dh < dw — the window sorts above every history key, \
+             so the `dh` retention sweep over [dh, di) cannot reach it (D36 (c))"
+        );
     }
 
     #[test]
@@ -2825,6 +2892,11 @@ mod tests {
                             discriminator: b'h',
                             name: "id/dh binding-history",
                             sample: binding_history_key(&node(1)).to_vec(),
+                        },
+                        SubKind {
+                            discriminator: b'w',
+                            name: "id/dw binding-rate window",
+                            sample: binding_window_key(AccountId::new(1)).to_vec(),
                         },
                     ],
                 },
@@ -3315,10 +3387,12 @@ mod tests {
     ///
     /// **The floor is the anti-vacuity clause.** Set-equality between two
     /// empty sets passes, so the test asserts the scan found at least the
-    /// eight discriminated constructors known to exist today (`da db dh lb le
-    /// li lr ya`). If the recognized pairing idiom drifts from the code — a
-    /// helper rename, a new construction form — the floor fires first and
-    /// names the drift, rather than letting two empty sides pass as equal.
+    /// nine discriminated constructors known to exist today (`da db dh dw lb
+    /// le li lr ya`) — eight as #265 landed it, plus `dw`, which D36 (a)
+    /// adds and registers in the same change so neither side of this test can
+    /// pass without the other. If the recognized pairing idiom drifts from the
+    /// code — a helper rename, a new construction form — the floor fires first
+    /// and names the drift, rather than letting two empty sides pass as equal.
     #[test]
     fn every_discriminated_constructor_is_registered_with_its_pair() {
         let written = discriminated_pairs_written_in_this_module();
@@ -3340,9 +3414,9 @@ mod tests {
                 .join(" ")
         };
 
-        // Sanity, floored: seven discriminated constructors exist today.
+        // Sanity, floored: nine discriminated constructors exist today.
         assert!(
-            written.len() >= 8,
+            written.len() >= 9,
             "the source scan found only {} discriminated constructors \
              ({}); the recognized pairing idiom has drifted from the code",
             written.len(),

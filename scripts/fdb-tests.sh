@@ -155,7 +155,18 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # completeness guard and the inverted acceptance test, replacing
 # `lease_key_overlaps_the_ledger_family` (so the unit delta is +2, not +3 —
 # one recording test retired). The floor rises by all three: 456 -> 459.
-FLOOR="${ORRERY_FDB_TEST_FLOOR:-459}"
+#
+# The binding-rate window (issue #255, D36) adds ten, all in `orrery_identity`'
+# library target. One needs the cluster: the durable ninth-event refusal,
+# which asserts against the real `dw` row read back off its raw key. The other
+# nine need no cluster but run in the same invocation and count the same —
+# five window-semantics unit tests against the shared prune/check/append logic
+# and four enforcement tests through `MemAccountStore`. Two existing tests were
+# extended rather than added (the keyspace `id/` width and sub-span guards, and
+# the bind atomicity proof, which now also asserts `dw` unchanged across an
+# injected abort), so they move nothing. A full run measured 687 executed tests
+# on 2026-08-22. The floor rises by those ten: 459 -> 469.
+FLOOR="${ORRERY_FDB_TEST_FLOOR:-469}"
 
 # Every test file whose contents only mean anything against a real cluster. If
 # one of these reports no executed tests, the tier is dark again whatever the

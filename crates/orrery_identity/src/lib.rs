@@ -16,17 +16,19 @@
 //! - [`store`] — the [`AccountStore`] seam: account records, the reverse
 //!   binding index, and the append-only binding history, i.e. D31's `da`, `db`
 //!   and `dh` rows.
+//! - [`window`] — the binding-rate window (`dw`, D36): the shared
+//!   prune/check/append both stores enforce D31 clause (g)'s caps through.
 //! - [`mem`] — [`MemAccountStore`], an in-process store for tests and
 //!   harnesses. It also implements
 //!   [`orrery_persistd::gateway::BindingAuthority`] directly, so a harness that
 //!   holds one can answer `owner(n)` without a durable read.
 //! - [`fdb`] (feature `fdb`) — [`fdb::FdbAccountStore`], the durable store over
 //!   #209's key builders. Every mutation is **one** FoundationDB transaction
-//!   that writes `da`, `db` and `dh` together, which is D31 clause (b)'s
-//!   requirement and not an optimization: a reverse index maintained in a
-//!   second transaction has a window in which `db` names an account `da` no
-//!   longer binds, and under clause (f) a *wrong* answer admits where a miss
-//!   would have excluded.
+//!   that writes `da`, `db`, `dh` and D36's window row together, which is
+//!   D31 clause (b)'s requirement and not an optimization: a reverse index
+//!   maintained in a second transaction has a window in which `db` names an
+//!   account `da` no longer binds, and under clause (f) a *wrong* answer
+//!   admits where a miss would have excluded.
 //! - [`issuer`] — [`IssuerKeyring`], the signing-key set. More than one key is
 //!   held at a time and one is active, which is what makes
 //!   `docs/09-services-and-ops.md` §8's "rotate = publish new well-known
@@ -69,6 +71,7 @@ pub mod mem;
 pub mod service;
 pub mod standing;
 pub mod store;
+pub mod window;
 
 #[cfg(feature = "fdb")]
 pub mod fdb;
@@ -84,3 +87,7 @@ pub use standing::{
     StaticStrikeRows, DEFAULT_STANDING_THRESHOLDS,
 };
 pub use store::{AccountStore, BindOutcome, IdentityError};
+pub use window::{
+    admit_binding_event, RateRefusal, BINDING_RATE_CAP_24H, BINDING_RATE_CAP_30D,
+    BINDING_RATE_WINDOW_24H_MS, BINDING_RATE_WINDOW_30D_MS,
+};
