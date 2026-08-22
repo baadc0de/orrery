@@ -1,6 +1,6 @@
 # ADR-0038: At-rest schema versioning is owned as three work items — the self-describing formats precede the machinery, and D21's freeze absorbs lazy migrations additively
 
-**Status:** Proposed · **Date:** 2026-08-22 · **Decision:** D38
+**Status:** Accepted · **Date:** 2026-08-22 · **Decision:** D38
 
 This decision is normative once accepted. See the [ADR index](../DECISIONS.md)
 for precedence, scope, and the complete decision set.
