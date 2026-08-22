@@ -830,6 +830,59 @@ jobs:
           retention-days: 14
           if-no-files-found: warn
 
+  ramp-shadow:
+    name: Enforcement ramp (shadow observes and does not act)
+    # Same posture as the dupe gauntlet and for the same reason: fixed ledger
+    # ids and a receipt-range read-back, so a throwaway cluster of its own —
+    # the one the composite action provisions on this runner and discards with
+    # it — and never a shared development database.
+    #
+    # A job of its own rather than an arm of the gauntlet: this one runs two
+    # gateway processes with *opposite* postures against one cluster and moves
+    # the posture of one of them mid-run, which is a different supervision
+    # shape from that job's single enforcing gateway. The harness binary is
+    # shared; only the process supervision differs.
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install the pinned toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            p5-dupe-gauntlet/target
+          key: nightly-p5-dupe-${{ hashFiles('p5-dupe-gauntlet/Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: nightly-p5-dupe-
+
+      - name: Install FoundationDB with a local cluster
+        uses: ./.github/actions/foundationdb
+        with:
+          server: "true"
+
+      - name: Build the harness
+        working-directory: p5-dupe-gauntlet
+        run: cargo build --release
+
+      - name: Run the ramp arms
+        env:
+          ORRERY_FDB_CLUSTER_FILE: /etc/foundationdb/fdb.cluster
+          RAMP_SHADOW_CLUSTER_IS_THROWAWAY: "1"
+          P5_DUPE_BIN: ${{ github.workspace }}/p5-dupe-gauntlet/target/release/p5-dupe-gauntlet
+        run: scripts/ramp-shadow-gate.sh
+
+      - name: Upload the gate's evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: ramp-shadow-evidence
+          path: ramp-shadow-*/
+          retention-days: 14
+          if-no-files-found: warn
+
   p2-kill9:
     name: P2 kill-9 gate (FoundationDB)
     runs-on: ubuntu-latest
