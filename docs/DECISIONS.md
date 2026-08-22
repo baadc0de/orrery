@@ -49,6 +49,7 @@ their linked dependencies.
 | D32 | [ADR-0032](adr/0032-enforcement-ramp.md) | Enforcement ramp: shadow semantics per control, flag inventory, promotion evidence, auto-suspend (**Proposed**) |
 | D33 | [ADR-0033](adr/0033-strike-ledger-standing.md) | Strike ledger, decay, and quarantine → cooldown → ban standing (**Proposed**) |
 | D34 | [ADR-0034](adr/0034-candidate-accounts-announcement.md) | Candidate accounts travel in the witness-epoch announcement; amends D28 (**Proposed**) |
+| D35 | [ADR-0035](adr/0035-lease-key-discriminator.md) | The lease registrar row takes the `le` discriminator inside `l`; the disjointness guard learns sub-spans (**Proposed**) |
 
 ## Status and supersession
 
