@@ -7546,12 +7546,15 @@ name = "orrery_coordinator"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "bytes",
  "clap",
  "glam 0.32.1",
  "hkdf",
  "iroh",
  "iroh-base",
+ "orrery_identity",
+ "orrery_persistd",
  "orrery_protocol",
  "postcard",
  "serde",

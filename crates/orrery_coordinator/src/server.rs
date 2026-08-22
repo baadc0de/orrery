@@ -31,13 +31,13 @@ use std::sync::Arc;
 use bytes::Bytes;
 use iroh::{Endpoint, EndpointAddr, RelayMode};
 use tokio::sync::oneshot;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use orrery_protocol::channels::{decode_stream_frame, encode_stream_frame, untag, Channel};
 use orrery_protocol::{
-    CellId, CoordMsg, FixedTokenClock, GridId, IssuerKey, NodeId, SessionTokenClaimsV1,
-    SessionTokenV1, SessionTokenVerificationError, SessionTokenVerifier, TokenClock, UnixMillis,
-    COORD_ALPN, COORD_PROTOCOL_VERSION, MAX_PRESENCE_CELLS,
+    AccountId, AccountInvalidation, CellId, CoordMsg, FixedTokenClock, GridId, IssuerKey, NodeId,
+    SessionTokenClaimsV1, SessionTokenV1, SessionTokenVerificationError, SessionTokenVerifier,
+    TokenClock, UnixMillis, COORD_ALPN, COORD_PROTOCOL_VERSION, MAX_PRESENCE_CELLS,
 };
 
 use crate::interest::InterestIssuer;
@@ -155,6 +155,243 @@ impl IdentityHealth for AvailableIdentityHealth {
     }
 }
 
+/// The name D32 clause (c) gives control C5: the `control` field of every
+/// shadow observation this process emits for standing enforcement.
+const STRIKES_CONTROL: &str = "strikes";
+
+/// The tracing target standing-shadow observations are emitted on.
+///
+/// Deliberately the same string persistd's shadow arms use, so one filter
+/// catches every control's would-be actions — and deliberately a copied
+/// literal rather than a shared constant, for the same reason
+/// [`IdentityHealth`] is a copied trait: there is no crate both services
+/// already share that owns enforcement vocabulary. When one exists, move both.
+const STRIKES_SHADOW_TARGET: &str = "orrery::ramp::shadow";
+
+/// Where this coordinator learns that identity has invalidated accounts'
+/// outstanding session tokens (D33 clause (e)).
+///
+/// A deliberate second copy of the same-named seam in
+/// `orrery_persistd::gateway`, for the same reason [`IdentityHealth`] is: the
+/// two services read identity's publication from different places, and
+/// neither has an implementation to share yet.
+#[async_trait::async_trait]
+pub trait StandingInvalidationFeed: Send + Sync {
+    /// The invalidations currently in force, in full each call. Absence is
+    /// never read as a retraction (see `orrery_persistd`'s seam for the full
+    /// argument): recovery runs through minting, not through un-publishing.
+    ///
+    /// # Errors
+    ///
+    /// A failure keeps the previous entries; a flaky feed degrades to stale
+    /// enforcement, never to none.
+    async fn invalidations(&self) -> Result<Vec<AccountInvalidation>, FeedFailure>;
+}
+
+/// Shared standing-invalidation feed.
+pub type SharedStandingInvalidationFeed = Arc<dyn StandingInvalidationFeed>;
+
+/// Why reading the invalidation feed failed.
+///
+/// A copy of `orrery_persistd::gateway::FeedFailure`, kept local so the two
+/// crates can drift in their error reporting without a shared dependency.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FeedFailure(pub String);
+
+impl core::fmt::Display for FeedFailure {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "standing-invalidation feed: {}", self.0)
+    }
+}
+
+impl core::error::Error for FeedFailure {}
+
+/// D32 clause (c)'s three postures for control C5, as this coordinator
+/// consumes them.
+///
+/// A deliberate second copy of `orrery_persistd::gateway`'s
+/// `StrikesEnforcement`, like [`IdentityHealth`] and [`FeedFailure`] above:
+/// one lever per process, and no shared crate to own the vocabulary yet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum StrikesMode {
+    /// The control does not exist here: the feed is not consulted, nothing is
+    /// evaluated or counted. D32 clause (b): "Off observes nothing".
+    #[default]
+    Off,
+    /// The full predicate runs against real admissions — every invalidation
+    /// is evaluated exactly as `Live` would — and the would-be action is
+    /// recorded on [`STRIKES_SHADOW_TARGET`] while admission proceeds.
+    Shadow,
+    /// Refuse invalidated accounts at `Hello` and terminate their open
+    /// sessions: presence gone, island membership gone, witness pool gone.
+    Live,
+}
+
+/// The runtime half of C5's lever on this process: a posture cell shared by
+/// everything that consults standing state here.
+///
+/// The same design as persistd's gateway-side cell, and for the same reason:
+/// a startup argument cannot demote a running control, so the cell is the
+/// seam an operator-plane writer sets and a test writes into directly.
+#[derive(Debug, Clone)]
+pub struct StrikesPosture(Arc<std::sync::atomic::AtomicU8>);
+
+impl Default for StrikesPosture {
+    fn default() -> Self {
+        Self::new(StrikesMode::Off)
+    }
+}
+
+impl StrikesPosture {
+    /// A posture cell starting at `mode`.
+    #[must_use]
+    pub fn new(mode: StrikesMode) -> Self {
+        Self(Arc::new(std::sync::atomic::AtomicU8::new(Self::code(mode))))
+    }
+
+    /// The mode in force right now.
+    #[must_use]
+    pub fn get(&self) -> StrikesMode {
+        match self.0.load(std::sync::atomic::Ordering::Relaxed) {
+            0 => StrikesMode::Off,
+            1 => StrikesMode::Shadow,
+            // Unreachable: `code` is the only writer and it emits 0, 1 or 2.
+            // Written as the acting arm rather than as a panic because a torn
+            // read here would under-enforce, which is the wrong direction.
+            _ => StrikesMode::Live,
+        }
+    }
+
+    /// Set the mode. The operator lever, and the only one that may promote.
+    pub fn set(&self, mode: StrikesMode) {
+        self.0
+            .store(Self::code(mode), std::sync::atomic::Ordering::Relaxed);
+    }
+
+    const fn code(mode: StrikesMode) -> u8 {
+        match mode {
+            StrikesMode::Off => 0,
+            StrikesMode::Shadow => 1,
+            StrikesMode::Live => 2,
+        }
+    }
+}
+
+/// What a `Hello` should do about standing, given the posture in force.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StandingVerdict {
+    /// Nothing applies, or shadow suppresses it.
+    Admit,
+    /// Live mode refuses; the connection closes before any admission effect.
+    Refuse,
+    /// Shadow mode records what live would have done, then admits anyway.
+    WouldRefuse,
+}
+
+/// This coordinator's copy of identity's invalidation set, plus the change
+/// signal open sessions wait on.
+///
+/// The watermark rule is the gateway consumer's (`AccountInvalidations`
+/// there): an entry kills exactly the tokens minted *before* it, entries are
+/// never removed because they went missing from a poll — recovery runs
+/// through minting — and the map grows only by distinct struck accounts. The
+/// watch channel is what makes termination reach an idle peer within one poll
+/// interval: every open session subscribes before its `Hello` and re-checks
+/// itself on each change, so the accept loop never has to walk the peers
+/// table to find whose account moved.
+struct StandingState {
+    feed: Option<SharedStandingInvalidationFeed>,
+    posture: StrikesPosture,
+    entries: tokio::sync::RwLock<HashMap<AccountId, u64>>,
+    changed: tokio::sync::watch::Sender<u64>,
+}
+
+impl StandingState {
+    fn new(feed: Option<SharedStandingInvalidationFeed>, posture: StrikesPosture) -> Self {
+        Self {
+            feed,
+            posture,
+            entries: tokio::sync::RwLock::new(HashMap::new()),
+            changed: tokio::sync::watch::Sender::new(0),
+        }
+    }
+
+    /// Subscribe a session to invalidation changes. Call before `Hello`, so
+    /// no entry can land unobserved between the admission check and the
+    /// subscription.
+    fn watch(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.changed.subscribe()
+    }
+
+    async fn invalidates(&self, account: AccountId, issued_at_ms: u64) -> bool {
+        self.entries
+            .read()
+            .await
+            .get(&account)
+            .is_some_and(|watermark| *watermark > issued_at_ms)
+    }
+
+    /// What `Hello` should do with these claims under the current posture.
+    async fn hello_verdict(&self, account: AccountId, issued_at_ms: u64) -> StandingVerdict {
+        // Off observes nothing: not the predicate, not even its evaluation.
+        let mode = self.posture.get();
+        if mode == StrikesMode::Off {
+            return StandingVerdict::Admit;
+        }
+        if !self.invalidates(account, issued_at_ms).await {
+            return StandingVerdict::Admit;
+        }
+        match mode {
+            StrikesMode::Shadow => StandingVerdict::WouldRefuse,
+            StrikesMode::Live => StandingVerdict::Refuse,
+            StrikesMode::Off => unreachable!("handled above"),
+        }
+    }
+
+    /// One posture poll: refresh from the feed when the control exists.
+    ///
+    /// D32 clause (b): `Off` observes nothing, not even the poll. A failed
+    /// fetch keeps the previous entries. Any applied change bumps the watch
+    /// epoch every open session is waiting on.
+    async fn sweep(&self) {
+        let Some(feed) = self.feed.as_ref() else {
+            return;
+        };
+        if self.posture.get() == StrikesMode::Off {
+            return;
+        }
+        let fetched = match feed.invalidations().await {
+            Ok(fetched) => fetched,
+            Err(error) => {
+                warn!(%error, "coordinator: standing-invalidation feed failed; keeping previous entries");
+                return;
+            }
+        };
+        let mut entries = self.entries.write().await;
+        let mut applied = 0usize;
+        for invalidation in fetched {
+            let effective_from_ms = invalidation.effective_from_ms.0;
+            match entries.get_mut(&invalidation.account) {
+                Some(held) => {
+                    if *held < effective_from_ms {
+                        *held = effective_from_ms;
+                        applied += 1;
+                    }
+                }
+                None => {
+                    entries.insert(invalidation.account, effective_from_ms);
+                    applied += 1;
+                }
+            }
+        }
+        drop(entries);
+        if applied > 0 {
+            let next = self.changed.borrow().wrapping_add(1);
+            let _ = self.changed.send(next);
+        }
+    }
+}
+
 /// Startup configuration for a [`CoordinatorServer`].
 pub struct ServerConfig {
     /// The application protocol to advertise. Defaults to [`COORD_ALPN`].
@@ -187,6 +424,19 @@ pub struct ServerConfig {
     pub presence_clock: Arc<dyn PresenceClock>,
     /// Identity-service health, consulted only to decide token grace.
     pub identity_health: SharedIdentityHealth,
+    /// Where identity's account-generation invalidations are read from (D33
+    /// clause (e)): cooldown and ban admission decisions enforced against
+    /// open sessions here. `None` is C5 absent at this coordinator — with it,
+    /// [`strikes_posture`](Self::strikes_posture) has nothing to act on.
+    ///
+    /// The publisher is identity's scorer, whose service half does not exist
+    /// yet; until it does only harnesses and tests wire one, which keeps every
+    /// default behaviour-preserving.
+    pub standing_feed: Option<SharedStandingInvalidationFeed>,
+    /// Runtime lever for control C5 on this coordinator (`ramp/strikes`'s
+    /// consumption half). Defaults to [`StrikesMode::Off`], preserving landed
+    /// behaviour exactly.
+    pub strikes_posture: StrikesPosture,
 }
 
 impl ServerConfig {
@@ -206,6 +456,8 @@ impl ServerConfig {
             token_clock: Arc::new(SystemUnixClock),
             presence_clock: Arc::new(SystemPresenceClock::default()),
             identity_health: Arc::new(AvailableIdentityHealth),
+            standing_feed: None,
+            strikes_posture: StrikesPosture::default(),
         }
     }
 }
@@ -437,12 +689,23 @@ struct Shared {
     /// Whether identity is reachable. Read on exactly one path: an otherwise
     /// valid token that has expired.
     identity_health: SharedIdentityHealth,
+    /// C5's consumption half: identity's invalidation set, its posture, and
+    /// the change signal open sessions wait on (D33 clause (e)).
+    standing: Arc<StandingState>,
     presence_reports: AtomicU64,
     grants_issued: AtomicU64,
     manifests_pushed: AtomicU64,
     drains_issued: AtomicU64,
     witness_epochs_seeded: AtomicU64,
     witness_epochs_delivered: AtomicU64,
+    /// Hellos refused because identity had invalidated the account.
+    standing_hellos_refused: AtomicU64,
+    /// Open sessions terminated for an invalidated account.
+    standing_sessions_terminated: AtomicU64,
+    /// Shadow Hellos live would have refused.
+    shadow_hellos_would_refuse: AtomicU64,
+    /// Shadow open sessions live would have terminated.
+    shadow_sessions_would_terminate: AtomicU64,
 }
 
 impl Shared {
@@ -608,6 +871,16 @@ pub struct CoordinatorStats {
     pub witness_epochs_seeded: u64,
     /// Witness-epoch announcements handed to a peer to courier.
     pub witness_epochs_delivered: u64,
+    /// Hellos refused because identity had invalidated the account
+    /// (`Live` only).
+    pub standing_hellos_refused: u64,
+    /// Open sessions terminated for an invalidated account (`Live` only).
+    pub standing_sessions_terminated: u64,
+    /// Shadow Hellos that would have been refused — the numerator of D32
+    /// clause (e)'s false-positive count for this control's coordinator half.
+    pub shadow_hellos_would_refuse: u64,
+    /// Shadow open sessions that would have been terminated.
+    pub shadow_sessions_would_terminate: u64,
     /// Peers with a live session.
     pub connected_peers: usize,
     /// Islands currently formed.
@@ -637,6 +910,10 @@ impl CoordinatorServer {
         let endpoint = Arc::new(builder.bind().await.map_err(ServerError::Bind)?);
 
         let token_clock = Arc::clone(&config.token_clock);
+        let standing = Arc::new(StandingState::new(
+            config.standing_feed,
+            config.strikes_posture,
+        ));
         let shared = Arc::new(Shared {
             registry: tokio::sync::Mutex::new(IslandRegistry::new()),
             peers: tokio::sync::Mutex::new(HashMap::new()),
@@ -651,12 +928,17 @@ impl CoordinatorServer {
             unix_clock: token_clock,
             established: tokio::sync::Mutex::new(EstablishedPeers::default()),
             identity_health: config.identity_health,
+            standing: Arc::clone(&standing),
             presence_reports: AtomicU64::new(0),
             grants_issued: AtomicU64::new(0),
             manifests_pushed: AtomicU64::new(0),
             drains_issued: AtomicU64::new(0),
             witness_epochs_seeded: AtomicU64::new(0),
             witness_epochs_delivered: AtomicU64::new(0),
+            standing_hellos_refused: AtomicU64::new(0),
+            standing_sessions_terminated: AtomicU64::new(0),
+            shadow_hellos_would_refuse: AtomicU64::new(0),
+            shadow_sessions_would_terminate: AtomicU64::new(0),
         });
         let authorizer = Arc::new(SessionAuthorizer {
             clock: config.token_clock,
@@ -699,6 +981,19 @@ impl CoordinatorServer {
             drains_issued: self.shared.drains_issued.load(Ordering::Relaxed),
             witness_epochs_seeded: self.shared.witness_epochs_seeded.load(Ordering::Relaxed),
             witness_epochs_delivered: self.shared.witness_epochs_delivered.load(Ordering::Relaxed),
+            standing_hellos_refused: self.shared.standing_hellos_refused.load(Ordering::Relaxed),
+            standing_sessions_terminated: self
+                .shared
+                .standing_sessions_terminated
+                .load(Ordering::Relaxed),
+            shadow_hellos_would_refuse: self
+                .shared
+                .shadow_hellos_would_refuse
+                .load(Ordering::Relaxed),
+            shadow_sessions_would_terminate: self
+                .shared
+                .shadow_sessions_would_terminate
+                .load(Ordering::Relaxed),
             connected_peers: self.shared.peers.lock().await.len(),
             islands: self.shared.registry.lock().await.island_count(),
         }
@@ -730,6 +1025,14 @@ async fn accept_loop(
     loop {
         tokio::select! {
             _ = &mut shutdown => break,
+            // D33 clause (e)'s poll rides a 1 s tick of its own, matching the
+            // gateway's maintenance cadence: one posture poll plus apply is
+            // D32 clause (c)'s ≤2 s fleet bound, and every open session learns
+            // of an applied change through its own watch subscription rather
+            // than through this walk.
+            _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {
+                shared.standing.sweep().await;
+            }
             incoming = endpoint.accept() => {
                 let Some(incoming) = incoming else { break };
                 let shared = Arc::clone(&shared);
@@ -788,196 +1091,263 @@ async fn handle_connection(
     };
 
     let mut admitted = false;
+    // The account this session authenticated as, and the instant its token
+    // was minted — the pair the watermark rule reads. Set on admission, so
+    // the invalidation watch below knows what to re-check.
+    let mut session_identity: Option<(orrery_protocol::AccountId, u64)> = None;
+    // Subscribed before the first `Hello`, so no entry can land unobserved
+    // between the admission check and the watch going live (D33 clause (e)).
+    let mut standing_changes = shared.standing.watch();
     loop {
-        let packet = match conn.read_datagram().await {
-            Ok(packet) => packet,
-            Err(error) => {
-                debug!(?error, %remote, "coordinator: connection closed");
-                break;
-            }
-        };
-        let Some((Channel::Control, _)) = untag(&packet) else {
-            continue;
-        };
-        let Some(message) = decode_stream_frame::<CoordMsg>(&packet) else {
-            debug!(%remote, "coordinator: undecodable message");
-            continue;
-        };
+        tokio::select! {
+            packet = conn.read_datagram() => {
+                let packet = match packet {
+                    Ok(packet) => packet,
+                    Err(error) => {
+                        debug!(?error, %remote, "coordinator: connection closed");
+                        break;
+                    }
+                };
+                let Some((Channel::Control, _)) = untag(&packet) else {
+                    continue;
+                };
+                let Some(message) = decode_stream_frame::<CoordMsg>(&packet) else {
+                    debug!(%remote, "coordinator: undecodable message");
+                    continue;
+                };
 
-        match message {
-            CoordMsg::Hello { token, node } => {
-                // The iroh transport identity is the identity. A claimed wire
-                // NodeId must never substitute it, or a peer could report
-                // presence — and so mint interest — as somebody else.
-                if node != remote {
-                    warn!(%remote, "coordinator: hello node did not match transport identity");
-                    break;
-                }
-                // docs/09 §8's grace rule: an expired-but-otherwise-valid
-                // token is accepted for an *established* session while
-                // identity is unreachable. Without it a transient identity
-                // outage is a topology event — a peer whose connection blips
-                // cannot re-establish presence, drops out of its island
-                // manifest, and enough of them trip D28 clause (g)'s churn
-                // and pool-collapse reseeds. An outage locks out new logins;
-                // it must not end in-flight play.
-                let unix_now_ms = shared.unix_clock.now_ms().0;
-                let (claims, graced) = match authorizer.authorize(&token, &remote) {
-                    Ok(Admission::Valid(claims)) => (claims, false),
-                    Ok(Admission::Expired(claims)) => {
-                        if shared.identity_health.is_available() {
-                            debug!(
+                match message {
+                CoordMsg::Hello { token, node } => {
+                    // The iroh transport identity is the identity. A claimed wire
+                    // NodeId must never substitute it, or a peer could report
+                    // presence — and so mint interest — as somebody else.
+                    if node != remote {
+                        warn!(%remote, "coordinator: hello node did not match transport identity");
+                        break;
+                    }
+                    // docs/09 §8's grace rule: an expired-but-otherwise-valid
+                    // token is accepted for an *established* session while
+                    // identity is unreachable. Without it a transient identity
+                    // outage is a topology event — a peer whose connection blips
+                    // cannot re-establish presence, drops out of its island
+                    // manifest, and enough of them trip D28 clause (g)'s churn
+                    // and pool-collapse reseeds. An outage locks out new logins;
+                    // it must not end in-flight play.
+                    let unix_now_ms = shared.unix_clock.now_ms().0;
+                    let (claims, graced) = match authorizer.authorize(&token, &remote) {
+                        Ok(Admission::Valid(claims)) => (claims, false),
+                        Ok(Admission::Expired(claims)) => {
+                            if shared.identity_health.is_available() {
+                                debug!(
+                                    %remote,
+                                    "coordinator: rejected an expired token while identity is up"
+                                );
+                                break;
+                            }
+                            if !within_grace(&claims, unix_now_ms) {
+                                debug!(
+                                    %remote,
+                                    issued_at_ms = claims.issued_at_ms.0,
+                                    ttl_ms = claims.ttl_ms.0,
+                                    grace_ms = TOKEN_GRACE_MS,
+                                    "coordinator: expired token is past the grace window"
+                                );
+                                break;
+                            }
+                            if !shared.established.lock().await.recognises(
+                                remote,
+                                &claims,
+                                &token,
+                                unix_now_ms,
+                            ) {
+                                debug!(
+                                    %remote,
+                                    "coordinator: no established session to grace — a login, not a reconnect"
+                                );
+                                break;
+                            }
+                            // Loud on purpose. An operator reading a coordinator
+                            // log mid-incident has to be able to tell a graced
+                            // admission from an ordinary one, and how stale the
+                            // token it rode in on was.
+                            warn!(
                                 %remote,
-                                "coordinator: rejected an expired token while identity is up"
-                            );
-                            break;
-                        }
-                        if !within_grace(&claims, unix_now_ms) {
-                            debug!(
-                                %remote,
-                                issued_at_ms = claims.issued_at_ms.0,
-                                ttl_ms = claims.ttl_ms.0,
+                                account = claims.account.0,
+                                expired_for_ms = unix_now_ms.saturating_sub(
+                                    claims.issued_at_ms.0.saturating_add(claims.ttl_ms.0)
+                                ),
                                 grace_ms = TOKEN_GRACE_MS,
-                                "coordinator: expired token is past the grace window"
+                                "coordinator: token grace — established session admitted while identity is unreachable"
                             );
+                            (claims, true)
+                        }
+                        Err(error) => {
+                            debug!(%remote, ?error, "coordinator: rejected session token");
                             break;
                         }
-                        if !shared.established.lock().await.recognises(
+                    };
+                    // D33 clause (e): identity refused this account at mint
+                    // time, so a token minted before the refusal must not
+                    // establish or re-establish presence here — not even on
+                    // grace, which exists for an identity *outage* and cannot
+                    // resurrect a standing decision that predates it.
+                    match shared
+                        .standing
+                        .hello_verdict(claims.account, claims.issued_at_ms.0)
+                        .await
+                    {
+                        StandingVerdict::Admit => {}
+                        StandingVerdict::WouldRefuse => {
+                            shared.shadow_hellos_would_refuse.fetch_add(1, Ordering::Relaxed);
+                            info!(
+                                target: STRIKES_SHADOW_TARGET,
+                                control = STRIKES_CONTROL,
+                                issuer = %remote,
+                                account = claims.account.0,
+                                action = "would_refuse_hello",
+                                observed_at_ms = unix_now_ms,
+                                "standing invalidation would have refused this Hello; admitted in shadow"
+                            );
+                        }
+                        StandingVerdict::Refuse => {
+                            warn!(
+                                issuer = %remote,
+                                account = claims.account.0,
+                                issued_at_ms = claims.issued_at_ms.0,
+                                "coordinator: refusing Hello for an account whose tokens identity invalidated"
+                            );
+                            shared.standing_hellos_refused.fetch_add(1, Ordering::Relaxed);
+                            break;
+                        }
+                    }
+                    let now_ms = shared.presence_clock.now_ms();
+                    // Keep the account and the standing this session authenticated
+                    // as. These used to be dropped on the floor the instant the
+                    // signature checked out, and four of D28 clause (e)'s six
+                    // witness-eligibility filters rest on nothing more than
+                    // retaining them: they are already inside a signature this
+                    // process verifies, from an issuer it already trusts.
+                    // A graced session's `standing` is only as fresh as an expired
+                    // token, so it plays but does not witness — D28 clause (e)
+                    // reads that field, and a quarantine applied during the
+                    // outage is invisible here. `note_grace_session` carries the
+                    // reasoning.
+                    if graced {
+                        shared.seeder.lock().await.note_grace_session(
                             remote,
-                            &claims,
+                            claims.account,
+                            claims.standing,
+                            now_ms,
+                        );
+                    } else {
+                        shared.seeder.lock().await.note_session(
+                            remote,
+                            claims.account,
+                            claims.standing,
+                            now_ms,
+                        );
+                        // Only a token identity itself vouched for right now
+                        // establishes a session to grace later.
+                        shared.established.lock().await.admit(
+                            remote,
+                            claims.clone(),
                             &token,
                             unix_now_ms,
-                        ) {
-                            debug!(
-                                %remote,
-                                "coordinator: no established session to grace — a login, not a reconnect"
-                            );
+                        );
+                    }
+                    {
+                        let mut peers = shared.peers.lock().await;
+                        if !peers.contains_key(&remote) && peers.len() >= MAX_TRACKED_PEERS {
+                            warn!(%remote, "coordinator: peer capacity reached");
                             break;
                         }
-                        // Loud on purpose. An operator reading a coordinator
-                        // log mid-incident has to be able to tell a graced
-                        // admission from an ordinary one, and how stale the
-                        // token it rode in on was.
-                        warn!(
-                            %remote,
-                            account = claims.account.0,
-                            expired_for_ms = unix_now_ms.saturating_sub(
-                                claims.issued_at_ms.0.saturating_add(claims.ttl_ms.0)
-                            ),
-                            grace_ms = TOKEN_GRACE_MS,
-                            "coordinator: token grace — established session admitted while identity is unreachable"
+                        peers.insert(
+                            remote,
+                            PeerSession {
+                                notify: Arc::clone(&send),
+                                budget: PresenceBudget::new(now_ms),
+                            },
                         );
-                        (claims, true)
                     }
-                    Err(error) => {
-                        debug!(%remote, ?error, "coordinator: rejected session token");
-                        break;
-                    }
-                };
-                let now_ms = shared.presence_clock.now_ms();
-                // Keep the account and the standing this session authenticated
-                // as. These used to be dropped on the floor the instant the
-                // signature checked out, and four of D28 clause (e)'s six
-                // witness-eligibility filters rest on nothing more than
-                // retaining them: they are already inside a signature this
-                // process verifies, from an issuer it already trusts.
-                // A graced session's `standing` is only as fresh as an expired
-                // token, so it plays but does not witness — D28 clause (e)
-                // reads that field, and a quarantine applied during the
-                // outage is invisible here. `note_grace_session` carries the
-                // reasoning.
-                if graced {
-                    shared.seeder.lock().await.note_grace_session(
-                        remote,
-                        claims.account,
-                        claims.standing,
-                        now_ms,
-                    );
-                } else {
-                    shared.seeder.lock().await.note_session(
-                        remote,
-                        claims.account,
-                        claims.standing,
-                        now_ms,
-                    );
-                    // Only a token identity itself vouched for right now
-                    // establishes a session to grace later.
-                    shared.established.lock().await.admit(
-                        remote,
-                        claims.clone(),
-                        &token,
-                        unix_now_ms,
-                    );
+                    admitted = true;
+                    session_identity = Some((claims.account, claims.issued_at_ms.0));
+                    send(Bytes::from(encode_stream_frame(&CoordMsg::Welcome {
+                        coordinator,
+                        protocol: COORD_PROTOCOL_VERSION,
+                    })));
+                    // A reconnecting peer may already have presence on file; hand
+                    // it a fresh grant so it is not left unable to claim until it
+                    // next moves.
+                    shared.issue_interest(remote).await;
                 }
-                {
-                    let mut peers = shared.peers.lock().await;
-                    if !peers.contains_key(&remote) && peers.len() >= MAX_TRACKED_PEERS {
-                        warn!(%remote, "coordinator: peer capacity reached");
-                        break;
-                    }
-                    peers.insert(
-                        remote,
-                        PeerSession {
-                            notify: Arc::clone(&send),
-                            budget: PresenceBudget::new(now_ms),
-                        },
-                    );
-                }
-                admitted = true;
-                send(Bytes::from(encode_stream_frame(&CoordMsg::Welcome {
-                    coordinator,
-                    protocol: COORD_PROTOCOL_VERSION,
-                })));
-                // A reconnecting peer may already have presence on file; hand
-                // it a fresh grant so it is not left unable to claim until it
-                // next moves.
-                shared.issue_interest(remote).await;
-            }
-            CoordMsg::Presence { cells } => {
-                if !admitted {
-                    continue;
-                }
-                if cells.is_empty() || cells.len() > MAX_PRESENCE_CELLS {
-                    debug!(%remote, count = cells.len(), "coordinator: unusable presence");
-                    continue;
-                }
-                let now_ms = shared.presence_clock.now_ms();
-                {
-                    let mut peers = shared.peers.lock().await;
-                    let Some(session) = peers.get_mut(&remote) else {
-                        break;
-                    };
-                    if !session.budget.take(now_ms) {
-                        debug!(%remote, "coordinator: presence rate limited");
+                CoordMsg::Presence { cells } => {
+                    if !admitted {
                         continue;
                     }
-                }
-                shared.presence_reports.fetch_add(1, Ordering::Relaxed);
+                    if cells.is_empty() || cells.len() > MAX_PRESENCE_CELLS {
+                        debug!(%remote, count = cells.len(), "coordinator: unusable presence");
+                        continue;
+                    }
+                    let now_ms = shared.presence_clock.now_ms();
+                    {
+                        let mut peers = shared.peers.lock().await;
+                        let Some(session) = peers.get_mut(&remote) else {
+                            break;
+                        };
+                        if !session.budget.take(now_ms) {
+                            debug!(%remote, "coordinator: presence rate limited");
+                            continue;
+                        }
+                    }
+                    shared.presence_reports.fetch_add(1, Ordering::Relaxed);
 
-                let covered = cells.clone();
-                let (change, grace_ms) = {
-                    let mut registry = shared.registry.lock().await;
-                    let grace_ms = registry.config.drain_grace_ms;
-                    (registry.report_presence(remote, cells), grace_ms)
-                };
-                // Interest first: a peer that receives its manifest and starts
-                // claiming should already hold the grant those claims need.
-                shared.issue_interest(remote).await;
-                shared.apply(change, grace_ms).await;
-                // Then the witness sets for the cells this report touched. It
-                // goes last because a peer needs its island roster before an
-                // announcement naming peers in it means anything, and because
-                // most reports seed nothing at all — the reseed floor makes
-                // this a hash lookup per cell in the common case.
-                shared.seed_witness_epochs(&covered).await;
+                    let covered = cells.clone();
+                    let (change, grace_ms) = {
+                        let mut registry = shared.registry.lock().await;
+                        let grace_ms = registry.config.drain_grace_ms;
+                        (registry.report_presence(remote, cells), grace_ms)
+                    };
+                    // Interest first: a peer that receives its manifest and starts
+                    // claiming should already hold the grant those claims need.
+                    shared.issue_interest(remote).await;
+                    shared.apply(change, grace_ms).await;
+                    // Then the witness sets for the cells this report touched. It
+                    // goes last because a peer needs its island roster before an
+                    // announcement naming peers in it means anything, and because
+                    // most reports seed nothing at all — the reseed floor makes
+                    // this a hash lookup per cell in the common case.
+                    shared.seed_witness_epochs(&covered).await;
+                }
+                // Everything else is coordinator→peer. A peer sending one is
+                // confused rather than hostile; ignore it.
+                CoordMsg::Welcome { .. }
+                | CoordMsg::IslandAssignment { .. }
+                | CoordMsg::InterestGrant { .. }
+                | CoordMsg::Drain { .. }
+                | CoordMsg::WitnessEpoch { .. } => {}
             }
-            // Everything else is coordinator→peer. A peer sending one is
-            // confused rather than hostile; ignore it.
-            CoordMsg::Welcome { .. }
-            | CoordMsg::IslandAssignment { .. }
-            | CoordMsg::InterestGrant { .. }
-            | CoordMsg::Drain { .. }
-            | CoordMsg::WitnessEpoch { .. } => {}
+            }
+            changed = standing_changes.changed() => {
+                // A gone sender means the coordinator is shutting down; the
+                // endpoint close ends this session either way.
+                if changed.is_err() {
+                    break;
+                }
+                if let Some((account, issued_at_ms)) = session_identity {
+                    if shared.standing.invalidates(account, issued_at_ms).await {
+                        warn!(
+                            issuer = %remote,
+                            account = account.0,
+                            "coordinator: terminating a session whose tokens identity invalidated"
+                        );
+                        shared.standing_sessions_terminated.fetch_add(1, Ordering::Relaxed);
+                        // Breaking runs the ordinary disconnect path below:
+                        // presence forgotten, island roster rebroadcast, the
+                        // account out of every witness pool it sat in.
+                        break;
+                    }
+                }
+            }
         }
     }
 

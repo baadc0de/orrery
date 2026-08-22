@@ -58,10 +58,10 @@ pub use gateway::{
 };
 pub use grid::GridId;
 pub use identity::{
-    FixedTokenClock, IssuerKey, IssuerKeyId, NodeId, SessionStanding, SessionTokenClaimsV1,
-    SessionTokenTtlMs, SessionTokenV1, SessionTokenVerificationError, SessionTokenVerifier,
-    Signature, TokenClock, UnixMillis, MAX_SESSION_TOKEN_BYTES, MAX_SESSION_TOKEN_TTL_MS,
-    SESSION_TOKEN_V1_DOMAIN, SESSION_TOKEN_V1_VERSION,
+    AccountInvalidation, FixedTokenClock, IssuerKey, IssuerKeyId, NodeId, SessionStanding,
+    SessionTokenClaimsV1, SessionTokenTtlMs, SessionTokenV1, SessionTokenVerificationError,
+    SessionTokenVerifier, Signature, TokenClock, UnixMillis, MAX_SESSION_TOKEN_BYTES,
+    MAX_SESSION_TOKEN_TTL_MS, SESSION_TOKEN_V1_DOMAIN, SESSION_TOKEN_V1_VERSION,
 };
 pub use persist::{
     eligible_witnesses, required_witnesses, AccountId, AssetId, Attestation, CellEpoch, Checkpoint,

@@ -54,14 +54,14 @@ use orrery_protocol::channels::{
     decode_datagram, decode_stream_frame, encode_datagram, encode_stream_frame, untag, Channel,
 };
 use orrery_protocol::{
-    verify_interest_grant, AccountId, AreaPage, CellId, CoordinatorInterestSnapshot, DiffUplink,
-    DiscrepancyReport, Epoch, GatewayMsg, GatewayReply, GridId, Intent, IntentOutcome, IssuerKey,
-    JournalRecord, LeaseId, LeaseMsg, Lsn, NodeId, PersistId, SessionStanding,
-    SessionTokenClaimsV1, SessionTokenV1, SessionTokenVerificationError, SessionTokenVerifier,
-    Tick, UnixMillis, Verdict, MAX_AREA_PAGE_FRAME_BYTES, MAX_SESSION_TOKEN_TTL_MS,
-    PROTOCOL_VERSION, REASON_BAD_SIGNATURE, REASON_ISSUER_MISMATCH, REASON_NO_EXECUTOR,
-    REPORT_ADJUDICATED, REPORT_REFUSED_NO_ADJUDICATOR, REPORT_REFUSED_NO_SESSION,
-    REPORT_REFUSED_RATE_LIMITED, REPORT_REFUSED_REPORTER_MISMATCH,
+    verify_interest_grant, AccountId, AccountInvalidation, AreaPage, CellId,
+    CoordinatorInterestSnapshot, DiffUplink, DiscrepancyReport, Epoch, GatewayMsg, GatewayReply,
+    GridId, Intent, IntentOutcome, IssuerKey, JournalRecord, LeaseId, LeaseMsg, Lsn, NodeId,
+    PersistId, SessionStanding, SessionTokenClaimsV1, SessionTokenV1,
+    SessionTokenVerificationError, SessionTokenVerifier, Tick, UnixMillis, Verdict,
+    MAX_AREA_PAGE_FRAME_BYTES, MAX_SESSION_TOKEN_TTL_MS, PROTOCOL_VERSION, REASON_BAD_SIGNATURE,
+    REASON_ISSUER_MISMATCH, REASON_NO_EXECUTOR, REPORT_ADJUDICATED, REPORT_REFUSED_NO_ADJUDICATOR,
+    REPORT_REFUSED_NO_SESSION, REPORT_REFUSED_RATE_LIMITED, REPORT_REFUSED_REPORTER_MISMATCH,
 };
 
 use crate::actor::{FencedApply, Reject};
@@ -164,6 +164,234 @@ impl GatewayAuthorizer for SessionTokenV1Authorizer {
             }
             Err(error) => Err(error),
         }
+    }
+}
+
+/// The name D32 clause (c) gives control C5: the `control` field of every
+/// shadow observation this module emits for standing enforcement, and the
+/// suffix of the `ramp/{control}` posture row an operator writes to demote it.
+pub const STRIKES_CONTROL: &str = "strikes";
+
+/// The `tracing` target every shadow observation for standing enforcement is
+/// emitted on — the same stable target C1's shadow arm uses, so one filter
+/// catches every control's would-be actions.
+const STRIKES_SHADOW_TARGET: &str = crate::intent::shadow::SHADOW_TARGET;
+
+/// D32 clause (c)'s three postures for control C5, as this gateway consumes
+/// them.
+///
+/// The rows are filed by adjudication with their own mode stamp (`StrikeMode`),
+/// and that stamp is what keeps a shadow-period ledger from ever crossing a
+/// threshold: score sums live rows only, so while C5 files shadow rows no
+/// account reaches cooldown or ban and no invalidation is published at all.
+/// This lever governs what a gateway does with an invalidation that *does*
+/// arrive — which is live-mode behaviour by construction, but is still gated
+/// here so clause (f)'s auto-suspend can demote a misbehaving rollout within
+/// one poll interval without waiting for tokens to expire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum StrikesEnforcement {
+    /// The control does not exist: the feed is not consulted, nothing is
+    /// evaluated, nothing is counted. D32 clause (b): "Off observes nothing".
+    #[default]
+    Off,
+    /// The full predicate runs against real admissions — every invalidation is
+    /// evaluated exactly as `Live` would — and the would-be action is recorded
+    /// on [`STRIKES_SHADOW_TARGET`] and in [`GatewayStandingMetrics`] while
+    /// admission proceeds untouched.
+    Shadow,
+    /// Refuse invalidated accounts at admission and terminate their open
+    /// sessions.
+    Live,
+}
+
+/// The runtime half of C5's lever on this process: a posture cell shared by
+/// every consumer of one gateway's standing state.
+///
+/// The same design as C1's [`crate::intent::AttestationPosture`], and for the
+/// same reason: a CLI argument is a startup default, while auto-suspend has to
+/// demote a control while the fleet runs. This cell is the seam that writer
+/// sets; a test writes into it directly.
+#[derive(Debug, Clone)]
+pub struct StrikesPosture(Arc<std::sync::atomic::AtomicU8>);
+
+impl Default for StrikesPosture {
+    fn default() -> Self {
+        Self::new(StrikesEnforcement::Off)
+    }
+}
+
+impl StrikesPosture {
+    /// A posture cell starting at `mode`.
+    #[must_use]
+    pub fn new(mode: StrikesEnforcement) -> Self {
+        Self(Arc::new(std::sync::atomic::AtomicU8::new(Self::code(mode))))
+    }
+
+    /// The mode in force right now.
+    #[must_use]
+    pub fn get(&self) -> StrikesEnforcement {
+        match self.0.load(std::sync::atomic::Ordering::Relaxed) {
+            0 => StrikesEnforcement::Off,
+            1 => StrikesEnforcement::Shadow,
+            // Unreachable: `code` is the only writer and it emits 0, 1 or 2.
+            // Written as the acting arm rather than as a panic because a torn
+            // read here would under-enforce, which is the wrong direction.
+            _ => StrikesEnforcement::Live,
+        }
+    }
+
+    /// Set the mode. The operator lever, and the only one that may promote.
+    pub fn set(&self, mode: StrikesEnforcement) {
+        self.0
+            .store(Self::code(mode), std::sync::atomic::Ordering::Relaxed);
+    }
+
+    const fn code(mode: StrikesEnforcement) -> u8 {
+        match mode {
+            StrikesEnforcement::Off => 0,
+            StrikesEnforcement::Shadow => 1,
+            StrikesEnforcement::Live => 2,
+        }
+    }
+}
+
+/// Why reading the invalidation feed failed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FeedFailure(pub String);
+
+impl core::fmt::Display for FeedFailure {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "standing-invalidation feed: {}", self.0)
+    }
+}
+
+impl core::error::Error for FeedFailure {}
+
+/// Where a gateway learns that identity has invalidated accounts' outstanding
+/// tokens (D33 clause (e)).
+///
+/// Identity publishes an account generation invalidation when an account's
+/// standing crosses into cooldown or ban; gateways terminate matching sessions
+/// within one posture poll plus apply. This trait is that publication read
+/// from this side. It is deliberately a seam rather than a FoundationDB row:
+/// the publisher is identity's scorer, whose service half does not exist yet,
+/// and allocating the row it would write belongs to the record that decides
+/// its key. A deployment wires whichever transport carries the publication;
+/// tests inject a static table.
+#[async_trait::async_trait]
+pub trait StandingInvalidationFeed: Send + Sync {
+    /// The invalidations currently in force, in full each call.
+    ///
+    /// Returning every live entry rather than a delta keeps the contract
+    /// stateless — a gateway that restarts converges on its first poll, and a
+    /// lost poll costs nothing but the next one.
+    ///
+    /// Absence from a response is **not** trusted as a retraction: a consumer
+    /// keeps every entry it has applied, because the party able to make this
+    /// feed return an empty list would otherwise hold the power to mass-unban
+    /// (D31 clause (f)'s attacker-controlled-unknown problem, one level up).
+    /// Recovery runs through minting instead: once identity answers for the
+    /// account again, tokens postdating the watermark admit on their own
+    /// merits, and the retained entry only keeps the *old* tokens out until
+    /// they expire on their own signed TTLs.
+    ///
+    /// # Errors
+    ///
+    /// A failure is reported and survived: the consumer keeps its previous
+    /// entries, because a flaky feed must degrade to stale enforcement rather
+    /// than to none.
+    async fn invalidations(&self) -> Result<Vec<AccountInvalidation>, FeedFailure>;
+}
+
+/// Shared standing-invalidation feed.
+pub type SharedStandingInvalidationFeed = Arc<dyn StandingInvalidationFeed>;
+
+/// Consumer-side bound on how many distinct accounts' invalidations are kept.
+///
+/// Far above any honest population of simultaneously cooled-down or banned
+/// accounts, and safe to enforce by dropping the *oldest* watermark when
+/// exceeded: a token predates only what it was issued before, and every token
+/// a peer can still present was issued within
+/// [`MAX_SESSION_TOKEN_TTL_MS`] (+ the coordinator's grace, which this
+/// gateway does not extend), so a watermark older than that window can no
+/// longer kill anything that exists.
+const MAX_STANDING_INVALIDATION_ENTRIES: usize = 65_536;
+
+/// The gateway's copy of identity's invalidation set, and the watermark rule.
+///
+/// An entry kills exactly the tokens minted *before* it: a token with
+/// `issued_at_ms < effective_from_ms` was signed under a standing identity no
+/// longer holds, while a token issued at or after the watermark was minted by
+/// an identity answering for the account again — a lifted cooldown or an
+/// upheld appeal — and passes on its own merits.
+///
+/// This is why termination alone would be useless (the terminated peer's
+/// token stays valid for up to an hour and would simply reconnect), and it
+/// decides two more rules. Entries are never removed because they went
+/// missing from a poll — an empty-but-successful response must not be a mass
+/// pardon, and recovery runs through minting anyway — so the only bound here
+/// is [`MAX_STANDING_INVALIDATION_ENTRIES`], enforced against the oldest
+/// watermark: no token a peer can still present predates it (see that
+/// constant). No expiry timer lives in this type.
+#[derive(Debug, Default)]
+pub struct AccountInvalidations {
+    entries: tokio::sync::RwLock<HashMap<AccountId, u64>>,
+}
+
+impl AccountInvalidations {
+    /// Merge one poll's entries, keeping the highest watermark per account.
+    ///
+    /// Watermarks only move forward: identity's read instants are monotone per
+    /// account, and a stale feed delivering an older entry behind a newer one
+    /// must not resurrect the tokens the newer one killed.
+    ///
+    /// Returns how many accounts changed — the number the caller reports and,
+    /// at most, the number of open sessions worth walking.
+    async fn refresh(&self, fetched: Vec<AccountInvalidation>) -> usize {
+        let mut entries = self.entries.write().await;
+        let mut changed = 0usize;
+        for invalidation in fetched {
+            let effective_from_ms = invalidation.effective_from_ms.0;
+            match entries.get_mut(&invalidation.account) {
+                Some(held) => {
+                    if *held < effective_from_ms {
+                        *held = effective_from_ms;
+                        changed += 1;
+                    }
+                }
+                None => {
+                    if entries.len() >= MAX_STANDING_INVALIDATION_ENTRIES {
+                        // Drop the oldest watermark rather than refuse the
+                        // newest: see [`MAX_STANDING_INVALIDATION_ENTRIES`].
+                        if let Some(oldest) = entries
+                            .iter()
+                            .min_by_key(|(_, effective)| **effective)
+                            .map(|(account, _)| *account)
+                        {
+                            entries.remove(&oldest);
+                        }
+                    }
+                    entries.insert(invalidation.account, effective_from_ms);
+                    changed += 1;
+                }
+            }
+        }
+        changed
+    }
+
+    /// Does this account have a live invalidation that outdates a token minted
+    /// at `issued_at_ms`?
+    async fn invalidates(&self, account: AccountId, issued_at_ms: u64) -> bool {
+        self.entries
+            .read()
+            .await
+            .get(&account)
+            .is_some_and(|watermark| *watermark > issued_at_ms)
+    }
+
+    /// A point-in-time copy, for the sweep's walk over the peer registry.
+    async fn snapshot(&self) -> HashMap<AccountId, u64> {
+        self.entries.read().await.clone()
     }
 }
 
@@ -2391,6 +2619,74 @@ impl GatewayIngressSnapshot {
     }
 }
 
+/// Standing-enforcement telemetry (D33 clause (e)): what C5 did at this
+/// gateway, split live from shadow.
+///
+/// The shadow pair is D32 clause (b)'s obligation (2) in counter form — a
+/// would-be action with a denominator — and it is the number clause (e)'s
+/// promotion predicate reads before C5 is allowed to act fleet-wide. The live
+/// pair is the control acting; both are cumulative since process start, like
+/// every sibling here.
+#[derive(Debug, Default)]
+pub struct GatewayStandingMetrics {
+    hello_refused_standing: AtomicU64,
+    sessions_terminated: AtomicU64,
+    shadow_hello_would_refuse: AtomicU64,
+    shadow_sessions_would_terminate: AtomicU64,
+}
+
+impl GatewayStandingMetrics {
+    /// One admission refused because identity had invalidated the account.
+    pub fn record_hello_refused(&self) {
+        self.hello_refused_standing.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// One open session torn down for its invalidated account.
+    pub fn record_session_terminated(&self) {
+        self.sessions_terminated.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// One shadow-mode admission that `Live` would have refused.
+    pub fn record_shadow_hello_would_refuse(&self) {
+        self.shadow_hello_would_refuse
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// One shadow-mode session that `Live` would have terminated.
+    pub fn record_shadow_session_would_terminate(&self) {
+        self.shadow_sessions_would_terminate
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Capture the cumulative totals.
+    #[must_use]
+    pub fn snapshot(&self) -> GatewayStandingSnapshot {
+        GatewayStandingSnapshot {
+            hello_refused_standing: self.hello_refused_standing.load(Ordering::Relaxed),
+            sessions_terminated: self.sessions_terminated.load(Ordering::Relaxed),
+            shadow_hello_would_refuse: self.shadow_hello_would_refuse.load(Ordering::Relaxed),
+            shadow_sessions_would_terminate: self
+                .shadow_sessions_would_terminate
+                .load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// A point-in-time read of [`GatewayStandingMetrics`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct GatewayStandingSnapshot {
+    /// Admissions refused because identity had invalidated the presenting
+    /// account's token (`Live` only).
+    pub hello_refused_standing: u64,
+    /// Open sessions torn down for an invalidated account (`Live` only).
+    pub sessions_terminated: u64,
+    /// Shadow admissions that would have been refused (the numerator of
+    /// clause (e)'s false-positive count for this control).
+    pub shadow_hello_would_refuse: u64,
+    /// Shadow open sessions that would have been terminated.
+    pub shadow_sessions_would_terminate: u64,
+}
+
 /// What the receive loop did with every lease operation it took off the
 /// inbound queue: queued it on this connection's lease lane, or refused it
 /// because the lane was already full.
@@ -2596,6 +2892,28 @@ pub struct GatewayConfig {
     pub identity_clock: SharedGatewayClock,
     /// Identity-service health used only for established-token expiry grace.
     pub identity_health: SharedIdentityHealth,
+    /// Where identity's account-generation invalidations are read from (D33
+    /// clause (e)): the cooldown and ban admission decisions this gateway must
+    /// enforce against open sessions and reconnecting peers.
+    ///
+    /// **The default is `None`, and that is C5's consumption half switched
+    /// off at the transport layer**, the same posture [`witness_epochs`]
+    /// holds for the quorum: a gateway with no feed has nothing to evaluate,
+    /// so no posture can make it refuse or terminate anything. Supplying a
+    /// feed makes the entries cacheable; [`strikes_posture`](Self::strikes_posture)
+    /// decides what happens to them. The publisher is identity's scorer, whose
+    /// service half does not exist yet — until it does, only harnesses and
+    /// tests wire one, which keeps every default behaviour-preserving.
+    pub standing_feed: Option<SharedStandingInvalidationFeed>,
+    /// Runtime lever for control C5 on this gateway (`ramp/strikes`'s
+    /// consumption half). Defaults to [`StrikesEnforcement::Off`], preserving
+    /// landed behaviour exactly; see [`StrikesEnforcement`] for what each
+    /// posture does with a configured [`Self::standing_feed`].
+    ///
+    /// A live posture over no feed enforces nothing, because there is nothing
+    /// to enforce: keep the two configured together, as D32 clause (d) pairs
+    /// C1's mode and its epoch authority.
+    pub strikes_posture: StrikesPosture,
     /// Always-on server-side telemetry: bulk stages, the intent and area
     /// server spans, and the report outcome split. Share the handle to read
     /// it; a fresh one is created when the caller does not, and collection is
@@ -2621,6 +2939,12 @@ pub struct GatewayConfig {
     /// Always-on single-writer invariant telemetry. Share the handle to scrape
     /// it; a fresh one is created when the caller does not.
     pub authority_metrics: Arc<AuthorityMetrics>,
+    /// Always-on standing-enforcement telemetry (D33 clause (e)): C5's live
+    /// actions and shadow would-be actions at admission and in the sweep.
+    /// Share the handle to scrape it, exactly like
+    /// [`Self::authority_metrics`]; a fresh one is created when the caller
+    /// does not.
+    pub standing_metrics: Arc<GatewayStandingMetrics>,
     /// Registrar clock the periodic TTL sweep reads. Injectable so a test can
     /// advance expiry without sleeping through a 10 s lease.
     pub lease_sweep_clock: SharedClaimClock,
@@ -2663,6 +2987,8 @@ impl Default for GatewayConfig {
             authorizer: Arc::new(DenyAllGatewayAuthorizer),
             identity_clock: Arc::new(SystemGatewayClock),
             identity_health: Arc::new(AvailableIdentityHealth),
+            standing_feed: None,
+            strikes_posture: StrikesPosture::default(),
             metrics: Arc::new(GatewayMetrics::default()),
             peer_registry_capacity: MAX_PEER_REGISTRY_ENTRIES,
             peer_lease_capacity: MAX_PEER_LIVE_LEASES,
@@ -2670,6 +2996,7 @@ impl Default for GatewayConfig {
             claim_clock: Arc::new(SystemClaimClock::default()),
             successor_policy: Arc::new(NearestInterestSuccessorPolicy),
             authority_metrics: Arc::new(AuthorityMetrics::default()),
+            standing_metrics: Arc::new(GatewayStandingMetrics::default()),
             lease_sweep_clock: Arc::new(RegistrarSweepClock),
             handoff_deadline_ms: 300,
             route_admission_wait_us: route_admission_budget_us(),
@@ -2704,6 +3031,26 @@ struct GatewayAdmission {
     health: SharedIdentityHealth,
     claim_clock: SharedClaimClock,
     peers: Arc<PeerRegistry>,
+    /// Identity's invalidation set, when a feed is configured. `None` is C5's
+    /// consumption half absent, and every standing check below with it.
+    standing_invalidations: Option<Arc<AccountInvalidations>>,
+    strikes_posture: StrikesPosture,
+    standing_metrics: Arc<GatewayStandingMetrics>,
+}
+
+/// Why [`GatewayAdmission::authorize`] refused a `Hello`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AdmissionRefusal {
+    /// The token did not verify — malformed, forged, wrong node binding,
+    /// unknown issuer, over-cap TTL — or had expired while identity is
+    /// reachable. The ordinary refusal, and the one that has always been
+    /// silent on the wire.
+    Untrusted,
+    /// Identity has invalidated this account's outstanding tokens (D33 clause
+    /// (e)): a cooldown or a ban. The refusal a client must be able to tell
+    /// apart from [`Self::Untrusted`], which is what
+    /// `GatewayReply::HELLO_REFUSED_STANDING` is for.
+    StandingInvalidated,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -3397,6 +3744,51 @@ impl PeerRegistry {
             retained || !peer.live.is_empty() || !peer.leases.is_empty() || peer.current.is_some()
         });
     }
+
+    /// Open sessions whose account identity has invalidated since their token
+    /// was minted (D33 clause (e)).
+    ///
+    /// The watermark rule is the token's, not the session's: an entry kills
+    /// what was issued *before* it, so a session whose replacement token
+    /// activated a new generation after the watermark stands is left alone —
+    /// that token exists only because identity answered for the account again.
+    /// `entries` is the caller's point-in-time copy of [`AccountInvalidations`],
+    /// taken before the walk so no peer lock is ever held across the map's.
+    async fn invalidated_sessions(&self, entries: &HashMap<AccountId, u64>) -> Vec<PeerSession> {
+        let states = {
+            let entries_lock = self.entries.lock().await;
+            entries_lock
+                .iter()
+                .map(|(node, state)| (*node, Arc::clone(state)))
+                .collect::<Vec<_>>()
+        };
+        let mut invalidated = Vec::new();
+        for (node, state) in states {
+            let session = {
+                let peer = state.lock().await;
+                let Some(generation) = peer.current else {
+                    continue;
+                };
+                let claims = &peer.established.claims;
+                let Some(watermark) = entries.get(&claims.account) else {
+                    continue;
+                };
+                if claims.issued_at_ms.0 >= *watermark {
+                    continue;
+                }
+                PeerSession {
+                    node,
+                    generation,
+                    account: claims.account,
+                    standing: claims.standing,
+                    state: Arc::clone(&state),
+                    last_seen_ms: Arc::clone(&peer.last_seen_ms),
+                }
+            };
+            invalidated.push(session);
+        }
+        invalidated
+    }
 }
 
 impl GatewayAdmission {
@@ -3405,15 +3797,67 @@ impl GatewayAdmission {
         token: &[u8],
         remote: &NodeId,
         retiring: Option<SessionGeneration>,
-    ) -> Option<PeerSession> {
+    ) -> Result<PeerSession, AdmissionRefusal> {
         let now_ms = self.clock.now_ms();
         let authorization = match self.authorizer.authorize(token, remote, now_ms) {
             Ok(valid @ GatewayAuthorization::Valid(_)) => valid,
             Ok(expired @ GatewayAuthorization::Expired(_)) if !self.health.is_available() => {
                 expired
             }
-            Ok(GatewayAuthorization::Expired(_)) | Err(_) => return None,
+            Ok(GatewayAuthorization::Expired(_)) | Err(_) => {
+                return Err(AdmissionRefusal::Untrusted)
+            }
         };
+        // D33 clause (e)'s admission half: identity refuses to mint a token
+        // for a cooled-down or banned account, and this check is what makes
+        // that refusal hold for tokens minted *before* the standing changed.
+        // A graced token is subject to it like any other — grace exists so an
+        // identity *outage* does not end in-flight play, and an invalidation
+        // published before the outage is a standing decision that outlives it;
+        // one published *during* an outage cannot exist, because identity is
+        // what publishes it.
+        if let Some(invalidations) = self.standing_invalidations.as_ref() {
+            let claims = match &authorization {
+                GatewayAuthorization::Valid(claims) | GatewayAuthorization::Expired(claims) => {
+                    claims
+                }
+            };
+            match self.strikes_posture.get() {
+                StrikesEnforcement::Off => {}
+                StrikesEnforcement::Shadow => {
+                    if invalidations
+                        .invalidates(claims.account, claims.issued_at_ms.0)
+                        .await
+                    {
+                        self.standing_metrics.record_shadow_hello_would_refuse();
+                        tracing::info!(
+                            target: STRIKES_SHADOW_TARGET,
+                            control = STRIKES_CONTROL,
+                            issuer = %remote,
+                            account = claims.account.0,
+                            action = "would_refuse_hello",
+                            issued_at_ms = claims.issued_at_ms.0,
+                            observed_at_ms = now_ms.0,
+                            "standing invalidation would have refused this Hello; admitted in shadow"
+                        );
+                    }
+                }
+                StrikesEnforcement::Live => {
+                    if invalidations
+                        .invalidates(claims.account, claims.issued_at_ms.0)
+                        .await
+                    {
+                        warn!(
+                            issuer = %remote,
+                            account = claims.account.0,
+                            issued_at_ms = claims.issued_at_ms.0,
+                            "gateway: refusing Hello for an account whose tokens identity invalidated"
+                        );
+                        return Err(AdmissionRefusal::StandingInvalidated);
+                    }
+                }
+            }
+        }
         self.peers
             .activate(
                 *remote,
@@ -3424,6 +3868,7 @@ impl GatewayAdmission {
                 self.claim_clock.now_ms(),
             )
             .await
+            .ok_or(AdmissionRefusal::Untrusted)
     }
 }
 
@@ -4284,6 +4729,7 @@ pub struct GatewayServer {
     interest_authority: SharedInterestAuthority,
     witness_epochs: Option<Arc<crate::witness_epoch::WitnessEpochAuthority>>,
     authority_metrics: Arc<AuthorityMetrics>,
+    standing_metrics: Arc<GatewayStandingMetrics>,
     metrics: Arc<GatewayMetrics>,
     send_failures: Arc<AtomicU64>,
     shutdown: oneshot::Sender<()>,
@@ -4316,6 +4762,15 @@ impl GatewayServer {
         let bulk_ack_admission = config.bulk_ack_admission;
         let interest_authority = config.interest_authority;
         let witness_epochs = config.witness_epochs;
+        // C5's consumption half. A feed plus its posture move together (see
+        // [`GatewayConfig::strikes_posture`]); with no feed the consumer state
+        // is still allocated so a posture flip needs nothing else, but it can
+        // never hold an entry and every standing check is vacuous.
+        let standing_invalidations = config
+            .standing_feed
+            .as_ref()
+            .map(|_feed| Arc::new(AccountInvalidations::default()));
+        let standing_feed = config.standing_feed;
         let admission = GatewayAdmission {
             authorizer: config.authorizer,
             clock: config.identity_clock,
@@ -4326,6 +4781,9 @@ impl GatewayServer {
                 config.peer_idle_retention_ms,
                 config.peer_lease_capacity,
             )),
+            standing_invalidations,
+            strikes_posture: config.strikes_posture,
+            standing_metrics: Arc::clone(&config.standing_metrics),
         };
         let metrics = Arc::clone(&config.metrics);
         let authority_metrics = Arc::clone(&config.authority_metrics);
@@ -4361,6 +4819,7 @@ impl GatewayServer {
             Arc::clone(&interest_authority),
             witness_epochs.clone(),
             admission,
+            standing_feed,
             report_limiter,
             Arc::clone(&metrics),
             redistributor,
@@ -4377,6 +4836,7 @@ impl GatewayServer {
             interest_authority,
             witness_epochs,
             authority_metrics,
+            standing_metrics: config.standing_metrics,
             metrics,
             send_failures,
             shutdown,
@@ -4422,6 +4882,13 @@ impl GatewayServer {
     #[must_use]
     pub fn authority_metrics(&self) -> &Arc<AuthorityMetrics> {
         &self.authority_metrics
+    }
+
+    /// The always-on standing-enforcement telemetry (D33 clause (e)): what
+    /// control C5 did at this gateway, live and shadow.
+    #[must_use]
+    pub fn standing_metrics(&self) -> &Arc<GatewayStandingMetrics> {
+        &self.standing_metrics
     }
 
     /// The always-on server-side telemetry: bulk stages, the intent and area
@@ -4842,6 +5309,78 @@ fn spawn_boundary_reporter(metrics: Arc<GatewayMetrics>) {
     });
 }
 
+/// One posture poll of C5's consumption half (D33 clause (e)): refresh this
+/// gateway's copy of identity's invalidation set, then enforce it against the
+/// open sessions it kills.
+///
+/// Rides [`accept_loop`]'s 1 s maintenance arm, so a published cooldown or ban
+/// reaches every matching session this gateway holds within one poll plus
+/// apply — D32 clause (c)'s existing fleet bound, ≤2 s. `Off` consults nothing,
+/// per D32 clause (b); a failed poll keeps the previous entries, which errs
+/// toward stale enforcement rather than toward none.
+#[allow(clippy::too_many_arguments)] // Sweep dependencies are explicit at this boundary.
+async fn standing_sweep(
+    feed: &dyn StandingInvalidationFeed,
+    invalidations: &AccountInvalidations,
+    mode: StrikesEnforcement,
+    peers: &PeerRegistry,
+    metrics: &GatewayStandingMetrics,
+    router: &Arc<dyn Router>,
+    redistributor: &Redistributor,
+    now_ms: u64,
+) {
+    // D32 clause (b): "Off observes nothing." Not even the poll happens —
+    // a control that does not exist neither acts nor calibrates, and a flip
+    // to `Shadow` or `Live` converges on its first evaluated sweep because
+    // the feed answers with the full set every time.
+    if let StrikesEnforcement::Off = mode {
+        return;
+    }
+    let fetched = match feed.invalidations().await {
+        Ok(fetched) => fetched,
+        Err(error) => {
+            warn!(%error, "gateway: standing-invalidation feed failed; keeping previous entries");
+            return;
+        }
+    };
+    let changed = invalidations.refresh(fetched).await;
+    if changed > 0 {
+        debug!(
+            changed,
+            "gateway: applied new account standing invalidations"
+        );
+    }
+    let entries = invalidations.snapshot().await;
+    for session in peers.invalidated_sessions(&entries).await {
+        match mode {
+            // Re-read per session so a mid-sweep demotion cannot act after it
+            // has been asked for; a demotion taking effect one session late is
+            // the same one-poll-late observation [`StrikesPosture`] documents.
+            StrikesEnforcement::Off | StrikesEnforcement::Shadow => {
+                metrics.record_shadow_session_would_terminate();
+                tracing::info!(
+                    target: STRIKES_SHADOW_TARGET,
+                    control = STRIKES_CONTROL,
+                    node = %session.node,
+                    account = session.account.0,
+                    action = "would_terminate_session",
+                    observed_at_ms = now_ms,
+                    "standing invalidation would have terminated this session; left connected in shadow"
+                );
+            }
+            StrikesEnforcement::Live => {
+                debug!(
+                    node = %session.node,
+                    account = session.account.0,
+                    "gateway: terminating a session whose tokens identity invalidated"
+                );
+                metrics.record_session_terminated();
+                cleanup_peer_session(&session, router, redistributor, now_ms).await;
+            }
+        }
+    }
+}
+
 /// Accept client connections forever, spawning one handler task per connection,
 /// until `shutdown` resolves or the endpoint closes.
 #[allow(clippy::too_many_arguments)]
@@ -4857,6 +5396,7 @@ async fn accept_loop(
     interest_authority: SharedInterestAuthority,
     witness_epochs: Option<Arc<crate::witness_epoch::WitnessEpochAuthority>>,
     admission: GatewayAdmission,
+    standing_feed: Option<SharedStandingInvalidationFeed>,
     report_limiter: Arc<ReportLimiter>,
     metrics: Arc<GatewayMetrics>,
     redistributor: Arc<Redistributor>,
@@ -4925,6 +5465,25 @@ async fn accept_loop(
                 // ever been couriered — one per 30 s per cell — forever.
                 if let Some(epochs) = witness_epochs.as_ref() {
                     epochs.prune_expired(registrar_now_ms());
+                }
+                // D33 clause (e)'s termination half rides this sweep last: a
+                // published cooldown or ban reaches every session it kills
+                // within one poll plus apply, and the apply is the same
+                // teardown path the reaper above uses.
+                if let (Some(feed), Some(invalidations)) =
+                    (standing_feed.as_deref(), admission.standing_invalidations.as_ref())
+                {
+                    standing_sweep(
+                        feed,
+                        invalidations,
+                        admission.strikes_posture.get(),
+                        &admission.peers,
+                        &admission.standing_metrics,
+                        &router,
+                        &redistributor,
+                        admission.clock.now_ms().0,
+                    )
+                    .await;
                 }
             }
             incoming = endpoint.accept() => {
@@ -5219,30 +5778,56 @@ async fn handle_connection(
                 // claimed wire NodeId must never be allowed to substitute it.
                 let retiring = session.as_ref().map(|session| session.generation);
                 let authorized = if node == remote {
-                    admission.authorize(&token, &remote, retiring).await
+                    Some(admission.authorize(&token, &remote, retiring).await)
                 } else {
                     None
                 };
-                if let Some(authorized) = authorized {
-                    // Install the push path before acknowledging: from here on
-                    // the registrar can reach this peer unprompted, which is
-                    // what makes reassignment and expiry visible to it.
-                    authorized.install_notifier(Arc::clone(&send)).await;
-                    session = Some(authorized);
-                    let reply = GatewayReply::HelloAck { gateway, protocol };
-                    send(Bytes::from(encode_stream_frame(&reply)));
-                } else {
-                    if let Some(retiring) = session.take() {
-                        cleanup_peer_session(
-                            &retiring,
-                            &router,
-                            &redistributor,
-                            admission.clock.now_ms().0,
-                        )
-                        .await;
+                match authorized {
+                    Some(Ok(authorized)) => {
+                        // Install the push path before acknowledging: from here on
+                        // the registrar can reach this peer unprompted, which is
+                        // what makes reassignment and expiry visible to it.
+                        authorized.install_notifier(Arc::clone(&send)).await;
+                        session = Some(authorized);
+                        let reply = GatewayReply::HelloAck { gateway, protocol };
+                        send(Bytes::from(encode_stream_frame(&reply)));
                     }
-                    if node != remote {
-                        warn!(%remote, "gateway: Hello node did not match transport identity");
+                    // D33 clause (e)'s distinguishable refusal. A cooldown or a
+                    // ban must not read as a malformed token: the client's
+                    // remedy is an appeal or the passage of time, not a
+                    // re-login, and silence would have it re-dialling on the
+                    // same dead token forever.
+                    Some(Err(AdmissionRefusal::StandingInvalidated)) => {
+                        if let Some(retiring) = session.take() {
+                            cleanup_peer_session(
+                                &retiring,
+                                &router,
+                                &redistributor,
+                                admission.clock.now_ms().0,
+                            )
+                            .await;
+                        }
+                        admission.standing_metrics.record_hello_refused();
+                        let reply = GatewayReply::HelloRefused {
+                            gateway,
+                            protocol,
+                            reason: GatewayReply::HELLO_REFUSED_STANDING,
+                        };
+                        send(Bytes::from(encode_stream_frame(&reply)));
+                    }
+                    Some(Err(AdmissionRefusal::Untrusted)) | None => {
+                        if let Some(retiring) = session.take() {
+                            cleanup_peer_session(
+                                &retiring,
+                                &router,
+                                &redistributor,
+                                admission.clock.now_ms().0,
+                            )
+                            .await;
+                        }
+                        if node != remote {
+                            warn!(%remote, "gateway: Hello node did not match transport identity");
+                        }
                     }
                 }
             }
@@ -7781,6 +8366,527 @@ mod tests {
                 standing: SessionStanding::Quarantined,
             })
         );
+    }
+
+    // ── Standing enforcement (D33 clause (e), issue #219) ────────────────
+
+    /// A fixed Unix clock a test can move, so each phase states its instant.
+    struct FixedAdmissionClock(AtomicU64);
+
+    impl GatewayClock for FixedAdmissionClock {
+        fn now_ms(&self) -> UnixMillis {
+            UnixMillis::new(self.0.load(Ordering::SeqCst))
+        }
+    }
+
+    impl FixedAdmissionClock {
+        fn set_now(&self, ms: u64) {
+            self.0.store(ms, Ordering::SeqCst);
+        }
+    }
+
+    /// Identity reachable: an expired token is refused outright.
+    struct HealthUp;
+
+    impl IdentityHealth for HealthUp {
+        fn is_available(&self) -> bool {
+            true
+        }
+    }
+
+    /// An identity outage: the arm under which token grace arms.
+    struct HealthDown;
+
+    impl IdentityHealth for HealthDown {
+        fn is_available(&self) -> bool {
+            false
+        }
+    }
+
+    /// A static invalidation table that counts its polls, can fail on cue,
+    /// and accepts entries mid-test — which is how a test publishes "the
+    /// standing crossed while the session was open".
+    struct StaticStandingFeed {
+        entries: Mutex<Vec<AccountInvalidation>>,
+        polls: AtomicU64,
+        fail: std::sync::atomic::AtomicBool,
+    }
+
+    impl StaticStandingFeed {
+        fn new(entries: Vec<AccountInvalidation>) -> Arc<Self> {
+            Arc::new(Self {
+                entries: Mutex::new(entries),
+                polls: AtomicU64::new(0),
+                fail: std::sync::atomic::AtomicBool::new(false),
+            })
+        }
+
+        fn publish(&self, entry: AccountInvalidation) {
+            self.entries.lock().expect("static feed lock").push(entry);
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl StandingInvalidationFeed for StaticStandingFeed {
+        async fn invalidations(&self) -> Result<Vec<AccountInvalidation>, FeedFailure> {
+            self.polls.fetch_add(1, Ordering::SeqCst);
+            if self.fail.load(Ordering::SeqCst) {
+                return Err(FeedFailure("injected feed failure".to_string()));
+            }
+            Ok(self.entries.lock().expect("static feed lock").clone())
+        }
+    }
+
+    fn invalidated(account: AccountId, effective_from_ms: u64) -> AccountInvalidation {
+        AccountInvalidation {
+            account,
+            effective_from_ms: UnixMillis::new(effective_from_ms),
+        }
+    }
+
+    /// One standing-enforcement rig: real issuer keys, a movable fixed clock,
+    /// the static feed, its consumer state, and the metrics handle. The peer
+    /// is its own transport identity, as on a real connection.
+    struct StandingFixture {
+        issuer: iroh::SecretKey,
+        peer: NodeId,
+        registry: Arc<PeerRegistry>,
+        feed: Arc<StaticStandingFeed>,
+        consumer: Arc<AccountInvalidations>,
+        metrics: Arc<GatewayStandingMetrics>,
+        clock: Arc<FixedAdmissionClock>,
+        admission: GatewayAdmission,
+    }
+
+    impl StandingFixture {
+        async fn authorize(&self, token: &[u8]) -> Result<PeerSession, AdmissionRefusal> {
+            self.admission.authorize(token, &self.peer, None).await
+        }
+
+        fn set_now(&self, ms: u64) {
+            self.clock.set_now(ms);
+        }
+
+        /// One maintenance sweep against this rig's own feed and consumer.
+        async fn sweep(&self, mode: StrikesEnforcement) {
+            let redistributor = Redistributor {
+                peers: Arc::clone(&self.registry),
+                interest: Arc::new(DenyAllInterestAuthority),
+                policy: Arc::new(NearestInterestSuccessorPolicy),
+                metrics: Arc::new(AuthorityMetrics::default()),
+                handoff_deadline_ms: 300,
+                claim_clock: Arc::new(SystemClaimClock::default()),
+                pending: tokio::sync::Mutex::new(HashMap::new()),
+            };
+            let router: Arc<dyn Router> = Arc::new(SuccessfulRouter);
+            standing_sweep(
+                self.feed.as_ref(),
+                &self.consumer,
+                mode,
+                &self.registry,
+                &self.metrics,
+                &router,
+                &redistributor,
+                2_000,
+            )
+            .await;
+        }
+    }
+
+    async fn standing_fixture(
+        posture: StrikesEnforcement,
+        health: SharedIdentityHealth,
+        feed: Arc<StaticStandingFeed>,
+    ) -> StandingFixture {
+        let issuer = iroh::SecretKey::from_bytes(&[31; 32]);
+        let peer = issuer.public();
+        let clock = Arc::new(FixedAdmissionClock(AtomicU64::new(1_000)));
+        let registry = Arc::new(PeerRegistry::new(8, 10_000, MAX_PEER_LIVE_LEASES));
+        let consumer = Arc::new(AccountInvalidations::default());
+        let metrics = Arc::new(GatewayStandingMetrics::default());
+        let admission = GatewayAdmission {
+            authorizer: Arc::new(SessionTokenV1Authorizer::new([IssuerKey::new(
+                orrery_protocol::IssuerKeyId::new(11),
+                issuer.public(),
+            )])),
+            clock: Arc::clone(&clock) as SharedGatewayClock,
+            health,
+            claim_clock: Arc::new(SystemClaimClock::default()),
+            peers: Arc::clone(&registry),
+            strikes_posture: StrikesPosture::new(posture),
+            standing_invalidations: Some(Arc::clone(&consumer)),
+            standing_metrics: Arc::clone(&metrics),
+        };
+        StandingFixture {
+            issuer,
+            peer,
+            registry,
+            metrics,
+            clock,
+            admission,
+            feed,
+            consumer,
+        }
+    }
+
+    /// Mint a well-formed V1 token bound to `node` for `account`.
+    fn standing_token(
+        issuer: &iroh::SecretKey,
+        node: NodeId,
+        account: AccountId,
+        issued_at_ms: u64,
+    ) -> Vec<u8> {
+        SessionTokenV1::sign(
+            SessionTokenClaimsV1::new(
+                account,
+                node,
+                UnixMillis::new(issued_at_ms),
+                orrery_protocol::SessionTokenTtlMs::new(60_000),
+                SessionStanding::Good,
+                orrery_protocol::IssuerKeyId::new(11),
+            ),
+            issuer,
+        )
+        .expect("sign session token")
+        .encode()
+        .expect("encode session token")
+    }
+
+    /// The watermark rule in isolation: an entry kills what was minted
+    /// strictly before it, minted-at-the-watermark means identity answered
+    /// for the account again, other accounts are untouched, and watermarks
+    /// only move forward.
+    #[tokio::test]
+    async fn an_invalidation_kills_only_tokens_minted_before_its_watermark() {
+        let consumer = AccountInvalidations::default();
+        let account = AccountId::new(41);
+
+        assert_eq!(
+            consumer.refresh(vec![invalidated(account, 1_000)]).await,
+            1,
+            "a first entry always changes the set"
+        );
+        assert!(consumer.invalidates(account, 999).await);
+        // Not `>=`: a token issued *at* the watermark postdates the refusal.
+        assert!(!consumer.invalidates(account, 1_000).await);
+        assert!(!consumer.invalidates(AccountId::new(42), 0).await);
+
+        // A stale poll behind a fresh entry moves nothing; a fresher entry
+        // supersedes it. This is what makes the full-set feed contract safe
+        // against out-of-order delivery.
+        assert_eq!(consumer.refresh(vec![invalidated(account, 500)]).await, 0);
+        assert_eq!(consumer.refresh(vec![invalidated(account, 2_000)]).await, 1);
+        assert!(consumer.invalidates(account, 1_999).await);
+    }
+
+    /// Live refuses the invalidated account's pre-watermark token, and the
+    /// refusal is a different fact from a token that does not verify — the
+    /// distinction #219 asks for and the wire code carries.
+    #[tokio::test]
+    async fn a_live_posture_refuses_a_pre_invalidation_token_and_the_refusal_is_distinct() {
+        let account = AccountId::new(41);
+        let feed = StaticStandingFeed::new(vec![]);
+        let fixture = standing_fixture(
+            StrikesEnforcement::Live,
+            Arc::new(HealthUp),
+            Arc::clone(&feed),
+        )
+        .await;
+        fixture
+            .consumer
+            .refresh(vec![invalidated(account, 500)])
+            .await;
+        let issuer = iroh::SecretKey::from_bytes(&[31; 32]);
+
+        let stale = standing_token(&issuer, fixture.peer, account, 100);
+        match fixture.authorize(&stale).await {
+            Err(AdmissionRefusal::StandingInvalidated) => {}
+            Err(other) => panic!("expected a standing refusal, got {other:?}"),
+            Ok(_) => panic!("expected a standing refusal, got an admission"),
+        }
+
+        let garbage = b"not a token".to_vec();
+        match fixture.authorize(&garbage).await {
+            Err(AdmissionRefusal::Untrusted) => {}
+            Err(other) => panic!("expected an untrusted-token refusal, got {other:?}"),
+            Ok(_) => panic!("expected an untrusted-token refusal, got an admission"),
+        }
+    }
+
+    /// A token identity minted *after* the watermark exists only because
+    /// identity answered for the account again — a lifted cooldown or an
+    /// upheld appeal — so it passes on its own merits.
+    #[tokio::test]
+    async fn a_token_minted_after_the_watermark_is_admitted_again() {
+        let account = AccountId::new(41);
+        let feed = StaticStandingFeed::new(vec![]);
+        let fixture = standing_fixture(
+            StrikesEnforcement::Live,
+            Arc::new(HealthUp),
+            Arc::clone(&feed),
+        )
+        .await;
+        fixture
+            .consumer
+            .refresh(vec![invalidated(account, 500)])
+            .await;
+        let issuer = iroh::SecretKey::from_bytes(&[31; 32]);
+
+        let fresh = standing_token(&issuer, fixture.peer, account, 600);
+        assert!(
+            fixture.authorize(&fresh).await.is_ok(),
+            "the watermark bounds only what predates it"
+        );
+    }
+
+    /// Shadow evaluates the same predicate and records what live would have
+    /// done, then admits — D32 clause (b)'s three obligations on C5's
+    /// consumption half.
+    #[tokio::test]
+    async fn a_shadow_posture_counts_a_would_be_hello_refusal_and_admits() {
+        let account = AccountId::new(41);
+        let feed = StaticStandingFeed::new(vec![]);
+        let fixture = standing_fixture(
+            StrikesEnforcement::Shadow,
+            Arc::new(HealthUp),
+            Arc::clone(&feed),
+        )
+        .await;
+        fixture
+            .consumer
+            .refresh(vec![invalidated(account, 500)])
+            .await;
+        let issuer = iroh::SecretKey::from_bytes(&[31; 32]);
+
+        let stale = standing_token(&issuer, fixture.peer, account, 100);
+        assert!(fixture.authorize(&stale).await.is_ok());
+        let snapshot = fixture.metrics.snapshot();
+        assert_eq!(snapshot.shadow_hello_would_refuse, 1);
+        assert_eq!(snapshot.hello_refused_standing, 0);
+    }
+
+    /// Off observes nothing: no evaluation, no counter, no feed consultation.
+    #[tokio::test]
+    async fn an_off_posture_admits_and_never_consults_the_consumer() {
+        let account = AccountId::new(41);
+        let feed = StaticStandingFeed::new(vec![]);
+        let fixture = standing_fixture(
+            StrikesEnforcement::Off,
+            Arc::new(HealthUp),
+            Arc::clone(&feed),
+        )
+        .await;
+        fixture
+            .consumer
+            .refresh(vec![invalidated(account, 500)])
+            .await;
+        let issuer = iroh::SecretKey::from_bytes(&[31; 32]);
+
+        let stale = standing_token(&issuer, fixture.peer, account, 100);
+        assert!(fixture.authorize(&stale).await.is_ok());
+        let snapshot = fixture.metrics.snapshot();
+        assert_eq!(snapshot.shadow_hello_would_refuse, 0);
+        assert_eq!(snapshot.hello_refused_standing, 0);
+    }
+
+    /// Grace exists so an identity *outage* does not end in-flight play. An
+    /// invalidation published before the outage is a standing decision that
+    /// outlives it; one published during it cannot exist, because identity is
+    /// what publishes. Either way grace must not resurrect the account.
+    #[tokio::test]
+    async fn grace_does_not_resurrect_an_account_identity_invalidated_before_the_outage() {
+        let account = AccountId::new(41);
+        let feed = StaticStandingFeed::new(vec![]);
+        let fixture = standing_fixture(
+            StrikesEnforcement::Live,
+            Arc::new(HealthDown),
+            Arc::clone(&feed),
+        )
+        .await;
+        let issuer = iroh::SecretKey::from_bytes(&[31; 32]);
+
+        // Established while identity answered for the account...
+        let token = standing_token(&issuer, fixture.peer, account, 100);
+        fixture.set_now(200);
+        assert!(fixture.authorize(&token).await.is_ok());
+
+        // ...then the crossing lands, and then the token expires with
+        // identity still down. Without the invalidation this exact sequence
+        // is the graced re-admission docs/09 §8 grants.
+        fixture
+            .consumer
+            .refresh(vec![invalidated(account, 500)])
+            .await;
+        fixture.set_now(61_000);
+        match fixture.authorize(&token).await {
+            Err(AdmissionRefusal::StandingInvalidated) => {}
+            Err(other) => panic!("expected the invalidation to override grace, got {other:?}"),
+            Ok(_) => panic!("expected the invalidation to override grace, got an admission"),
+        }
+    }
+
+    /// Establish a live session on a pre-watermark token, as every session
+    /// that later gets invalidated once looked.
+    async fn established_session(fixture: &StandingFixture, account: AccountId) -> Vec<u8> {
+        let token = standing_token(&fixture.issuer, fixture.peer, account, 100);
+        fixture.set_now(200);
+        assert!(
+            fixture.authorize(&token).await.is_ok(),
+            "the token is valid and nothing is invalidated yet"
+        );
+        assert!(fixture
+            .registry
+            .current_session(fixture.peer)
+            .await
+            .is_some());
+        token
+    }
+
+    /// The termination half of clause (e): an open session whose token
+    /// predates the watermark is torn down through the same path the stale
+    /// reaper uses — `current` cleared, leases parked.
+    #[tokio::test]
+    async fn the_sweep_terminates_an_open_session_whose_token_predates_the_invalidation() {
+        let account = AccountId::new(41);
+        let feed = StaticStandingFeed::new(vec![]);
+        let fixture = standing_fixture(
+            StrikesEnforcement::Live,
+            Arc::new(HealthUp),
+            Arc::clone(&feed),
+        )
+        .await;
+        established_session(&fixture, account).await;
+
+        feed.publish(invalidated(account, 500));
+        fixture.sweep(StrikesEnforcement::Live).await;
+
+        assert!(
+            fixture
+                .registry
+                .current_session(fixture.peer)
+                .await
+                .is_none(),
+            "the invalidated open session is gone"
+        );
+        assert_eq!(fixture.metrics.snapshot().sessions_terminated, 1);
+    }
+
+    /// Shadow walks the same set and records what live would have done,
+    /// leaving every session connected — clause (b)'s suppression obligation.
+    #[tokio::test]
+    async fn the_sweep_counts_but_spares_a_session_in_shadow() {
+        let account = AccountId::new(41);
+        let feed = StaticStandingFeed::new(vec![]);
+        let fixture = standing_fixture(
+            StrikesEnforcement::Shadow,
+            Arc::new(HealthUp),
+            Arc::clone(&feed),
+        )
+        .await;
+        established_session(&fixture, account).await;
+
+        feed.publish(invalidated(account, 500));
+        fixture.sweep(StrikesEnforcement::Shadow).await;
+
+        assert!(
+            fixture
+                .registry
+                .current_session(fixture.peer)
+                .await
+                .is_some(),
+            "shadow terminates nothing"
+        );
+        let snapshot = fixture.metrics.snapshot();
+        assert_eq!(snapshot.shadow_sessions_would_terminate, 1);
+        assert_eq!(snapshot.sessions_terminated, 0);
+    }
+
+    /// A session whose replacement token postdates the watermark stands only
+    /// because identity answered for the account again, so the sweep leaves
+    /// it alone even though its account carries an entry.
+    #[tokio::test]
+    async fn the_sweep_spares_a_session_running_on_a_post_watermark_token() {
+        let account = AccountId::new(41);
+        let feed = StaticStandingFeed::new(vec![invalidated(account, 500)]);
+        let fixture = standing_fixture(StrikesEnforcement::Live, Arc::new(HealthUp), feed).await;
+        let fresh = standing_token(&fixture.issuer, fixture.peer, account, 600);
+        assert!(fixture.authorize(&fresh).await.is_ok());
+        assert!(fixture
+            .registry
+            .current_session(fixture.peer)
+            .await
+            .is_some());
+
+        fixture.sweep(StrikesEnforcement::Live).await;
+
+        assert!(fixture
+            .registry
+            .current_session(fixture.peer)
+            .await
+            .is_some());
+        assert_eq!(fixture.metrics.snapshot().sessions_terminated, 0);
+    }
+
+    /// A failed poll must not silently drop what was already applied: the
+    /// next good sweep still enforces it. (The failed sweep itself acts on
+    /// nothing, because it could not have learned anything new.)
+    #[tokio::test]
+    async fn a_failed_feed_poll_keeps_the_previous_entries_enforceable() {
+        let account = AccountId::new(41);
+        let feed = StaticStandingFeed::new(vec![]);
+        let fixture = standing_fixture(
+            StrikesEnforcement::Live,
+            Arc::new(HealthUp),
+            Arc::clone(&feed),
+        )
+        .await;
+        established_session(&fixture, account).await;
+        feed.publish(invalidated(account, 500));
+
+        feed.fail.store(true, Ordering::SeqCst);
+        fixture.sweep(StrikesEnforcement::Live).await;
+        assert!(
+            fixture
+                .registry
+                .current_session(fixture.peer)
+                .await
+                .is_some(),
+            "a poll that failed evaluated nothing this pass"
+        );
+
+        feed.fail.store(false, Ordering::SeqCst);
+        fixture.sweep(StrikesEnforcement::Live).await;
+        assert!(fixture
+            .registry
+            .current_session(fixture.peer)
+            .await
+            .is_none());
+        assert_eq!(fixture.metrics.snapshot().sessions_terminated, 1);
+    }
+
+    /// Off consults nothing: not the predicate, not even the feed — D32
+    /// clause (b)'s "Off observes nothing", held for the consumption half.
+    #[tokio::test]
+    async fn an_off_sweep_never_even_polls_the_feed() {
+        let account = AccountId::new(41);
+        let feed = StaticStandingFeed::new(vec![]);
+        let fixture = standing_fixture(
+            StrikesEnforcement::Off,
+            Arc::new(HealthUp),
+            Arc::clone(&feed),
+        )
+        .await;
+        established_session(&fixture, account).await;
+
+        feed.publish(invalidated(account, 500));
+        fixture.sweep(StrikesEnforcement::Off).await;
+
+        assert_eq!(feed.polls.load(Ordering::SeqCst), 0);
+        assert!(fixture
+            .registry
+            .current_session(fixture.peer)
+            .await
+            .is_some());
     }
 
     #[test]
