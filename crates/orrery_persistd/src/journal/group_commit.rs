@@ -640,10 +640,14 @@ mod tests {
                 batch_max_records: 8,
                 batch_max_bytes: 1 << 20,
             },
-            Arc::new(|pending| {
-                assert_eq!(pending.len(), 3);
-                Err(JournalError::Store("injected batch failure".into()))
-            }),
+            // No assertion on how many records one call sees: the three
+            // submits race the 1 ms window, so the committer may legitimately
+            // flush them as 1+2 or 1+1+1 on a loaded runner. What the test is
+            // named for holds either way -- every handle below resolves with
+            // the injected error, which is also what proves all three records
+            // reached the store, since a handle resolves only from the batch
+            // that carried it.
+            Arc::new(|_pending| Err(JournalError::Store("injected batch failure".into()))),
             published,
             None,
             Arc::clone(&metrics),
