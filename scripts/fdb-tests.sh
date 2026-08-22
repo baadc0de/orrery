@@ -145,7 +145,17 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # the cluster. It writes distinct subject and reporter bindings, files a
 # confirmed verdict, and proves the `ya` row exists only under the subject's
 # account. The floor rises by one more: 455 -> 456.
-FLOOR="${ORRERY_FDB_TEST_FLOOR:-456}"
+# tests (3); they need no cluster but run in the same invocation and count
+#
+# D35's key-format change (issue #226) nets three. One needs the cluster: the
+# `l`-family audit in `tests/lease_fdb.rs`, which scans `[b'l', b'm')` and
+# fails on any key whose byte 1 is not a registered sub-discriminator — the
+# loud half of the no-migration posture, expected count zero. The other two
+# are keyspace unit tests that run in the same invocation: the pair-model
+# completeness guard and the inverted acceptance test, replacing
+# `lease_key_overlaps_the_ledger_family` (so the unit delta is +2, not +3 —
+# one recording test retired). The floor rises by all three: 456 -> 459.
+FLOOR="${ORRERY_FDB_TEST_FLOOR:-459}"
 
 # Every test file whose contents only mean anything against a real cluster. If
 # one of these reports no executed tests, the tier is dark again whatever the

@@ -102,46 +102,15 @@ pub struct StrikeRow {
     pub expires_at_ms: u64,
 }
 
-/// The byte offset at which FoundationDB substitutes the commit versionstamp.
-pub const STRIKE_VERSIONSTAMP_OFFSET: u32 = 10;
-
-/// `ya || account:u64-be || versionstamp:[u8;10]`, before substitution.
-#[must_use]
-pub fn strike_key(account: AccountId) -> [u8; 20] {
-    let mut key = [0; 20];
-    key[..2].copy_from_slice(b"ya");
-    key[2..10].copy_from_slice(&account.0.to_be_bytes());
-    key
-}
-
-/// [`strike_key`] in `SetVersionstampedKey` parameter form.
-#[must_use]
-pub fn strike_versionstamped_key(account: AccountId) -> [u8; 24] {
-    let mut key = [0; 24];
-    key[..20].copy_from_slice(&strike_key(account));
-    key[20..].copy_from_slice(&STRIKE_VERSIONSTAMP_OFFSET.to_le_bytes());
-    key
-}
-
-/// First key in one account's contiguous `ya` span.
-#[must_use]
-pub fn strike_account_range_start(account: AccountId) -> Vec<u8> {
-    strike_key(account)[..10].to_vec()
-}
-
-/// Exclusive end of one account's contiguous `ya` span.
-#[must_use]
-pub fn strike_account_range_end(account: AccountId) -> Vec<u8> {
-    let mut end = strike_account_range_start(account);
-    for byte in end.iter_mut().rev() {
-        let (next, carry) = byte.overflowing_add(1);
-        *byte = next;
-        if !carry {
-            return end;
-        }
-    }
-    vec![b'y', b'b']
-}
+// The `strike/` key builders live in `keyspace`, with every other key
+// builder in this crate. `keyspace`'s registry guard scans that module's own
+// source for constructors, so a builder outside it registers a sub-kind the
+// guard cannot see written — which is exactly what it reported when these
+// lived here.
+pub use crate::keyspace::{
+    strike_account_range_end, strike_account_range_start, strike_key, strike_versionstamped_key,
+    STRIKE_VERSIONSTAMP_OFFSET,
+};
 
 /// Result of attempting to append one verdict-derived fact.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
