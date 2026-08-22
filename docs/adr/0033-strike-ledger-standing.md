@@ -305,6 +305,42 @@ On acceptance, D16 gains these rows; it does not gain a second half-life:
 | Ban score `B` | 7.0 | Minimum cooldown | 14 days |
 | Account probation | 7 days | Strike storage alarm | 8 retained rows/account/90 d |
 
+### (h) No guest experience during cooldown; unsessioned mesh membership is a non-goal
+
+> **Cooldown admits nothing. A game may not offer a guest, observer or
+> spectator experience that places a cooled-down account in a live mesh, and
+> this record grants no such permission. Anonymous or non-session-backed
+> participants in a mesh are an explicit non-goal.**
+
+Decided by the repo owner on 2026-08-22, closing this record's second open
+question. An earlier draft permitted a "game-level, non-durable mode" under
+that label; that permission is withdrawn.
+
+The reasoning is that the permission was cheaper to grant than to honour. Under
+clause (e) cooldown is an *admission* decision — identity refuses to mint a
+token — and admission is what island membership is gated on:
+`SessionAuthorizer::authorize` verifies the token before a coordinator session
+exists, and island membership is what drives replication interest. So a peer
+without a token receives no replicated state today, and an observer experience
+is not reachable by relaxing a policy dial. Reaching it would take one of:
+
+- an unauthenticated or guest-token admission path — a second admission
+  surface, which is precisely what clause (f)'s fail-closed posture exists to
+  avoid;
+- a third `SessionStanding`, reversing clause (e)'s two-valued decision and
+  adding a state every connected peer must interpret; or
+- a read-only session honoured by the interest and replication paths, which no
+  code models.
+
+Each is a design change with its own failure modes, not a product toggle. A
+record that permits the outcome without specifying the mechanism invites an
+implementer to invent one of the three under time pressure.
+
+**This is a non-goal, not a rejected idea.** If spectating, observer mode or a
+cooled-down guest tier is wanted later, it gets its own record and answers the
+three points above explicitly. Nothing here forecloses that; it only declines
+to pre-authorise it.
+
 ## Consequences
 
 - `y` remains available for the executor-written strike ledger exactly as D31
@@ -346,9 +382,8 @@ On acceptance, D16 gains these rows; it does not gain a second half-life:
 1. **Threshold package:** accept recommended `3 / 5 / 7`, or choose the
    conservative legacy-shaped `3 / 6 / 10`. Recommendation: `3 / 5 / 7` for
    the explicit 8.19-day and 22.19-day escalation windows above.
-2. **Guest experience during cooldown:** this record only permits it as a
-   game-level, non-durable mode. Whether any game exposes one is product
-   policy; token refusal and durable-write denial do not depend on that choice.
+2. **Guest experience during cooldown: decided — no.** Resolved by the repo
+   owner on 2026-08-22. See clause (h).
 
 [#205]: https://github.com/baadc0de/orrery/issues/205
 [D10]: 0010-witnessing.md
