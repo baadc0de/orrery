@@ -278,6 +278,15 @@ adversarial, capped at clause (g)'s 8/day:
            10^7 × 8 × 90 = 7.2×10^9 rows × 68 B ≈ 490 GB
 ```
 
+> *Erratum (2026-08-22, [ADR-0036](0036-binding-rate-window.md)):* the
+> adversarial line above prices only the 24 h cap. Clause (g) sets two caps
+> and both hold together: 64 per rolling 30 d bounds any 90-day retention
+> horizon at three disjoint 30-day windows — ≤ 192 events per account,
+> achievable by spreading uniformly at 64/30 d, which also satisfies the
+> 24 h cap. The bound is 10⁷ × 192 × 68 B ≈ **131 GB**, not ≈ 490 GB; the
+> published figure was a valid upper bound and overstated by 3.75×. Nothing
+> else in this record changes.
+
 The realistic figure is nothing next to `world/`. The adversarial figure is
 why clause (g) carries a rate cap at all: **append-only without a write cap is
 an unbounded storage amplifier with a free trigger**, which is the same shape
