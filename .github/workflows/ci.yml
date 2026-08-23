@@ -662,6 +662,127 @@ jobs:
             echo '```'
           } | tee -a "$GITHUB_STEP_SUMMARY"
 
+  # ── The Regolith client's Windows and macOS legs (#344) ─────────────────────
+  #
+  # Why a job of its own, and why not the determinism matrix above, which
+  # looks like the cheaper way to buy three-platform coverage and was tried in
+  # exactly that spirit by #327. The matrix asserts one thing only: that the
+  # headless spine — orrery_core, orrery_protocol, orrery_conformance,
+  # orrery_games — produces *identical bytes* on four platforms. That claim is
+  # why those legs install no Linux graphics dependencies, and it is why both
+  # Linux legs failed when the client joined them:
+  #
+  #   The system library `wayland-client` required by crate `wayland-sys` was
+  #   not found.
+  #
+  # A render/input skin makes no determinism claim at all. #320's constraint 3
+  # puts input source and rendering as the *only* deltas between the client
+  # and the bot path — precisely the two things a byte-identical-replay matrix
+  # cannot assert and must not pay for. So the skin lives here instead: same
+  # per-commit cadence as the other lanes, on the two platforms the gates lane
+  # cannot reach (Linux already builds and tests the workspace there, via
+  # scripts/check.sh's WORKSPACES table).
+  #
+  # No apt packages here, deliberately: libx11/libasound2/libudev/
+  # libwayland/libxkbcommon are Linux-only build inputs for bevy's
+  # winit/alsa/udev backends. Windows and macOS link their own platform
+  # frameworks natively; copying the Linux step onto these legs would be dead
+  # weight that suggests the display stack needed help here.
+  #
+  # No FoundationDB either: the client's graph (bevy, four first-party crates,
+  # serde) reaches no fdb-gated code.
+  #
+  # ── Cache posture ────────────────────────────────────────────────────────────
+  #
+  # Registry and git checkouts only — NOT `target/`, unlike the determinism
+  # legs. The repository's entire Actions cache allowance is 10 GB and is
+  # shared; the determinism legs' cached targets are what keep the four-leg
+  # matrix cheap, and a Bevy-sized target/ per platform (several GiB each)
+  # would evict them for a lane whose cacheable part buys less. So every run
+  # pays the dependency-graph build; the registry cache saves the download and
+  # extraction only.
+  #
+  # No free-disk sampler either, matching the determinism legs: BSD df lacks
+  # -B/--output on macOS and Git Bash has no df at all, so the pair would emit
+  # empty series on both legs while implying a measurement exists.
+  client-platforms:
+    name: regolith client (${{ matrix.label }})
+    # Already proven on the PR's merge commit; see the note by `concurrency`.
+    if: github.event_name != 'push'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: windows-latest, label: x86_64-windows }
+          - { os: macos-latest,   label: aarch64-macos }
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        # Explicit, because the Windows leg would otherwise get PowerShell and
+        # every step below is a POSIX shell script. `bash` on a Windows runner
+        # is the Git Bash that ships with the image — the same arrangement as
+        # nightly.yml's P4 accumulation matrix. `*.sh` arrives with LF endings
+        # everywhere (.gitattributes), so the script needs no autocrlf dance.
+        shell: bash
+    # Outer backstop only. A cold Bevy graph build fits inside the
+    # determinism legs' 45-minute bound on the same images; this doubles it so
+    # a slow hosted queue is not a failure, while a hang still says so instead
+    # of burning the six-hour default.
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+
+      # Merge-order guard, and it must be a step rather than a job-level
+      # `hashFiles()` condition: `jobs.<id>.if` is evaluated before checkout,
+      # when the workspace is empty and hashFiles always returns "". With the
+      # client absent (this PR open before #342 merges) the job reports a
+      # notice and runs nothing; the moment clients/regolith exists on the
+      # checked-out tree the legs go live with no further edit. Dormancy is
+      # therefore impossible once merged: presence of the path IS the switch,
+      # and the wrapper itself refuses loudly if invoked without it.
+      - name: Require the Regolith client workspace
+        id: client
+        run: |
+          if [[ ! -f clients/regolith/Cargo.toml ]]; then
+            echo "::notice::clients/regolith is absent on this base — the client lands with PR #342 (#344); these legs stay dormant until it merges"
+            echo "present=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install the pinned toolchain
+        if: steps.client.outputs.present == 'true'
+        run: rustup show active-toolchain || rustup toolchain install
+
+      - uses: actions/cache@v6
+        if: steps.client.outputs.present == 'true'
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: client-${{ matrix.label }}-${{ hashFiles('clients/regolith/Cargo.toml', 'clients/regolith/Cargo.lock', 'crates/*/Cargo.toml', 'rust-toolchain.toml') }}
+          restore-keys: client-${{ matrix.label }}-
+
+      # The wrapper, not bare cargo test, because green-with-zero-executed and
+      # wrong-workspace-green are exactly the shapes a compile-heavy Bevy job
+      # can fail invisibly in. It asserts an executed-test floor and that this
+      # package's own unittest binary ran; see scripts/client-tests.sh.
+      - name: Build and test the Regolith client (floor-asserted)
+        if: steps.client.outputs.present == 'true'
+        run: scripts/client-tests.sh
+
+      # Evidence without a log download: executed counts land in the summary,
+      # raw log rides the artifact for the `--check` mode and for diffing a
+      # suspicious run against a good one.
+      - name: Upload the client's test log
+        if: always() && steps.client.outputs.present == 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: client-platforms-log-${{ matrix.label }}
+          path: target/client-platforms.log
+          retention-days: 30
+
   determinism:
     name: determinism (${{ matrix.label }})
     strategy:
