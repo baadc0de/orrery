@@ -1636,6 +1636,32 @@ mod tests {
         }
     }
 
+    /// Close a journal, or **fail** rather than wait forever.
+    ///
+    /// `Journal::close` arms the committer's shutdown and then awaits its
+    /// exit, and every defect that path has had — #293's lost wakeup on the
+    /// commit-queue condvar, and the `Notify` variant before it — presented as
+    /// an unbounded wait, not as a wrong answer. An unbounded wait in a test
+    /// is the worst of both: it proves nothing, it takes a job's whole timeout
+    /// to notice, and it cannot be told apart from a merely slow machine. Two
+    /// CI jobs were cancelled after thirty silent minutes before one line said
+    /// which test it was.
+    ///
+    /// The bound is deliberately far above the work: this closes a journal
+    /// holding three records, which is microseconds of `fdatasync`. Anything
+    /// approaching thirty seconds is a wedge, so the bound cannot fire on
+    /// slowness and a regression in the shutdown handshake fails here, named,
+    /// in seconds.
+    async fn close_or_fail(journal: &Journal, which: &str) {
+        match tokio::time::timeout(Duration::from_secs(30), journal.close()).await {
+            Ok(result) => result.unwrap_or_else(|error| panic!("close {which} journal: {error}")),
+            Err(_) => panic!(
+                "closing the {which} journal did not return within 30s: the group committer's \
+                 shutdown handshake is wedged (#293), not slow"
+            ),
+        }
+    }
+
     fn config(dir: &std::path::Path) -> JournalConfig {
         JournalConfig {
             dir: dir.to_path_buf(),
@@ -1730,7 +1756,7 @@ mod tests {
             .await
             .expect("commit second");
         assert!(first < second);
-        journal.close().await.expect("close raw journal");
+        close_or_fail(&journal, "raw").await;
         drop(journal);
 
         let reopened = Journal::open(&config(dir.path())).expect("reopen raw journal");
@@ -1751,7 +1777,7 @@ mod tests {
             .await
             .expect("commit after reopen");
         assert!(third > second, "reopen must continue the logical LSN space");
-        reopened.close().await.expect("close reopened journal");
+        close_or_fail(&reopened, "reopened").await;
     }
 
     /// A journal that holds only *mirrored* records is not bounded by its own
@@ -1820,7 +1846,7 @@ mod tests {
             .await
             .expect("durable");
         assert_eq!(journal.retention_floor(None), None);
-        journal.close().await.expect("close raw journal");
+        close_or_fail(&journal, "mirror").await;
     }
 
     proptest! {
@@ -1839,7 +1865,7 @@ mod tests {
                 let second_lsn = second.committed().await.expect("commit second");
                 let third = journal.append(record(3)).expect("append third");
                 third.committed().await.expect("commit third");
-                journal.close().await.expect("close raw journal");
+                close_or_fail(&journal, "written").await;
                 drop(journal);
 
                 let segment = dir
@@ -1862,7 +1888,7 @@ mod tests {
                     .expect("scan recovered prefix");
                 assert_eq!(records.len(), 2);
                 assert_eq!(records[1].lsn, second_lsn);
-                recovered.close().await.expect("close recovered journal");
+                close_or_fail(&recovered, "recovered").await;
             });
         }
     }
