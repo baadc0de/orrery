@@ -627,6 +627,8 @@ gate_p2_kill9_evidence() {
     fio_barriers_per_s: (.proofs.device_qualification.measured.aggregate_barriers_per_s // null),
     fio_p99_ms: (.proofs.device_qualification.measured.worst_sync_p99_ms // null),
     fio_max_ms: (.proofs.device_qualification.measured.worst_sync_max_ms // null),
+    qualification_candidates: (.proofs.device_qualification.candidate_count // .provisioning.candidate_count // null),
+    qualification_qualified: (.proofs.device_qualification.qualified_count // .provisioning.qualified_count // null),
     instance_id: (.provisioning.instance_id // null),
     instance_type: (.provisioning.instance_type // null),
     instance_market: (.provisioning.market // null),
@@ -1403,7 +1405,9 @@ EOF
         }},
         zombie_primary_fenced: true,
         bumped_chain_epoch_refused: true,
-        device_qualification: {qualified: false}
+        device_qualification: {
+          qualified: false, candidate_count: 47, qualified_count: 0, selected: null
+        }
       }
     }' >"$dir/out/p2-kill9-unqualified/artifact.json"
 
@@ -1426,6 +1430,10 @@ EOF
     || die 'self-test: the summary counted an unqualified P2 report as another state'
   jq -e 'select(.gate == "nightly:p2-kill9" and .status == "UNQUALIFIED")' "$JSONL" >/dev/null \
     || die 'self-test: the machine-readable P2 projection lost the unqualified state'
+  grep -q 'qualification_candidates=47' <<<"$p2_projection" \
+    || die 'self-test: the unqualified P2 report lost its candidate count'
+  grep -q 'qualification_qualified=0' <<<"$p2_projection" \
+    || die 'self-test: the unqualified P2 report lost its zero-qualified count'
 
   # Spot loss is environmental, not a retryable test failure and not a gate
   # pass. The controller exits cleanly after bounded retries so it can retain

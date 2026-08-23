@@ -11,6 +11,7 @@ SSM instance profile, or evidence-bucket grant is required.
 from __future__ import annotations
 
 import argparse
+import ast
 import base64
 import concurrent.futures
 import csv
@@ -491,20 +492,75 @@ def write_nonverdict(
     rows: list[dict[str, Any]],
     provisioning: dict[str, Any] | None = None,
 ) -> None:
+    qualified_count = sum(bool(row.get("qualified")) for row in rows)
+    proofs: dict[str, Any] = {"device_qualification": None}
+    if result == "unqualified":
+        proofs = {
+            "device_qualification": {
+                "qualified": False,
+                "candidate_count": len(rows),
+                "qualified_count": qualified_count,
+                "selected": None,
+            },
+            "latency": {
+                "gate": "unqualified",
+                "reason": "the D16 latency verdict was not evaluated because no selected device passed fio job A",
+            },
+        }
     artifact = {
         "kind": "p2_two_process_kill9_gate",
         "created_at": dt.datetime.now(dt.UTC).isoformat(),
         "result": result,
         "reason": reason,
-        "proofs": {"device_qualification": None},
+        "proofs": proofs,
         "provisioning": {
             "provider": "aws",
             "market": "spot",
             "candidate_count": len(rows),
+            "qualified_count": qualified_count,
             **(provisioning or {}),
         },
     }
     (OUT / "artifact.json").write_text(json.dumps(artifact, indent=2) + "\n", encoding="utf-8")
+
+
+def select_gate_candidate(rows: list[dict[str, Any]]) -> dict[str, Any] | None:
+    # FoundationDB's pinned package is amd64 today. This is a software support
+    # constraint applied after measurement, not a pre-selected device family.
+    eligible = [row for row in rows if row.get("qualified") and row.get("architecture") == "x86_64"]
+    eligible.sort(
+        key=lambda row: (
+            (row.get("measured") or {}).get("worst_sync_max_ms", float("inf")),
+            (row.get("measured") or {}).get("worst_sync_p99_ms", float("inf")),
+            row["instance_type"],
+        )
+    )
+    if eligible:
+        return eligible[0]
+
+    interrupted = bool(rows) and all(row.get("status") == "interrupted" for row in rows)
+    qualified_count = sum(bool(row.get("qualified")) for row in rows)
+    if interrupted:
+        reason = (
+            f"all {len(rows)} candidate qualifications were interrupted after bounded retries; "
+            "the D16 latency verdict was not evaluated"
+        )
+        write_nonverdict("interrupted", reason, rows)
+        return None
+    if qualified_count == 0:
+        reason = (
+            f"device qualification failed: zero of {len(rows)} candidates qualified; "
+            "no device was selected. The D16 latency verdict was not evaluated because "
+            "no device passed fio job A"
+        )
+    else:
+        reason = (
+            f"device qualification failed: {qualified_count} of {len(rows)} candidates qualified, "
+            "but zero qualified x86_64 devices support the pinned FoundationDB package; no device "
+            "was selected. The D16 latency verdict was not evaluated"
+        )
+    write_nonverdict("unqualified", reason, rows)
+    raise ControllerError(reason)
 
 
 def run_gate(winner: dict[str, Any], ami: str) -> str:
@@ -559,22 +615,9 @@ def controller() -> int:
             )
     rows.sort(key=lambda row: row["instance_type"])
     write_candidate_evidence(rows)
-    # FoundationDB's pinned package is amd64 today. This is a software support
-    # constraint applied after measurement, not a pre-selected device family.
-    eligible = [row for row in rows if row.get("qualified") and row.get("architecture") == "x86_64"]
-    eligible.sort(
-        key=lambda row: (
-            (row.get("measured") or {}).get("worst_sync_max_ms", float("inf")),
-            (row.get("measured") or {}).get("worst_sync_p99_ms", float("inf")),
-            row["instance_type"],
-        )
-    )
-    if not eligible:
-        interrupted = rows and all(row.get("status") == "interrupted" for row in rows)
-        result = "interrupted" if interrupted else "unqualified"
-        write_nonverdict(result, "no measured x86_64 candidate qualified for the pinned FoundationDB package", rows)
+    winner = select_gate_candidate(rows)
+    if winner is None:
         return 0
-    winner = eligible[0]
     (OUT / "selected-candidate.json").write_text(json.dumps(winner, indent=2) + "\n", encoding="utf-8")
     print(f"selected {winner['instance_type']} from measured results; launching a fresh gate instance")
     run_gate(winner, amis["x86_64"])
@@ -630,6 +673,53 @@ def self_test() -> int:
         for needle in needles:
             if needle not in block:
                 raise ControllerError(f"self-test: compute policy's {stage} lost {needle}")
+
+    # Exercise the live selection/verdict function in both directions. The
+    # controller call-site check is AST-based so its own source cannot satisfy
+    # it: removing only the call makes this fail even though this functional
+    # fixture still invokes the helper directly.
+    source = Path(__file__).read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    controller_node = next(
+        node for node in tree.body if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == "controller"
+    )
+    live_calls = [
+        node for node in ast.walk(controller_node)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "select_gate_candidate"
+    ]
+    if len(live_calls) != 1:
+        raise ControllerError("self-test: live controller verdict is not conditioned on device qualification")
+
+    global OUT
+    original_out = OUT
+    with tempfile.TemporaryDirectory(prefix="p2-ephemeral-verdict-") as tmp:
+        OUT = Path(tmp)
+        unqualified = [
+            {"instance_type": f"synthetic-{index}.2xlarge", "architecture": "x86_64", "status": "error", "qualified": False}
+            for index in range(3)
+        ]
+        try:
+            select_gate_candidate(unqualified)
+        except ControllerError as exc:
+            failure = str(exc)
+        else:
+            raise ControllerError("self-test: selected None synthetic run unexpectedly passed")
+        if "zero of 3 candidates qualified" not in failure or "D16 latency verdict was not evaluated" not in failure:
+            raise ControllerError(f"self-test: unqualified failure did not name its basis: {failure}")
+        print(f"p2-ephemeral: synthetic unqualified case failed as required: {failure}")
+        artifact = json.loads((OUT / "artifact.json").read_text(encoding="utf-8"))
+        if artifact.get("result") != "unqualified" or artifact.get("proofs", {}).get("latency", {}).get("gate") != "unqualified":
+            raise ControllerError("self-test: unqualified synthetic run lost its distinct artifact verdict")
+
+        qualified = [{
+            "instance_type": "synthetic-pass.2xlarge", "architecture": "x86_64", "status": "measured", "qualified": True,
+            "measured": {"worst_sync_max_ms": 0.509, "worst_sync_p99_ms": 0.185},
+        }]
+        winner = select_gate_candidate(qualified)
+        if winner is not qualified[0]:
+            raise ControllerError("self-test: qualified synthetic run did not preserve the passing selection path")
+        print("p2-ephemeral: synthetic qualified case passed")
+    OUT = original_out
     print("p2-ephemeral: self-test passed")
     return 0
 
