@@ -440,6 +440,20 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
+      # #171's answer to "would we know before hitting a ceiling?": sample free
+      # disk every 2 s for the life of the lane and report the minimum, rather
+      # than snapshotting at start (which misses the peak) or end (which
+      # understates it). Record-only — it asserts nothing, so it cannot fire
+      # for the wrong reason. Same pattern `clippy` has run since #194; the
+      # only exhaustion this repository has recorded on a hosted runner
+      # (kache's uncapped store, #175's first run) arrived through tooling,
+      # which is exactly the kind of growth nobody pre-computes.
+      - name: Start the free-disk sampler
+        run: |
+          set -euo pipefail
+          nohup bash -c 'while :; do df -B1 --output=avail / | tail -1; sleep 2; done' \
+            > "$RUNNER_TEMP/avail.txt" 2>/dev/null &
+          echo "sampling free bytes on / every 2 s into $RUNNER_TEMP/avail.txt"
       - name: Install the pinned toolchain
         run: rustup show active-toolchain || rustup toolchain install
 
@@ -481,6 +495,26 @@ jobs:
       # holds against the filesystem so a new workspace cannot appear unchecked.
       - name: static gates, harness self-tests, standalone tools
         run: scripts/check.sh gates
+
+      # The sampled minimum over the whole lane, next to the end-of-run `df`.
+      # A run that filled the disk prints a healthy number at the end; the
+      # minimum is the figure comparable to #171's "free at peak" column.
+      - name: Disk report
+        if: always()
+        run: |
+          set -euo pipefail
+          {
+            echo '### Free disk at peak'
+            echo '```'
+            df -h /
+            if [[ -s "${RUNNER_TEMP:-}/avail.txt" ]]; then
+              echo "min_free_bytes     $(sort -n "${RUNNER_TEMP:-}/avail.txt" | head -1)"
+              echo "df_samples         $(wc -l < "${RUNNER_TEMP:-}/avail.txt")"
+            else
+              echo 'no samples collected'
+            fi
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
 
   test:
     name: workspace tests
@@ -555,6 +589,17 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
+      # The free-disk sampler, same as `gates` above. This is the lane that
+      # needs it: #171 measured 39.29 GiB free at peak on 2026-08-20 — under
+      # one footprint of headroom — and the tree has grown since (the fdb
+      # floor alone moved 459 -> 508 in the two days after that sample).
+      # Without a sampled number, gradual erosion is invisible until ENOSPC.
+      - name: Start the free-disk sampler
+        run: |
+          set -euo pipefail
+          nohup bash -c 'while :; do df -B1 --output=avail / | tail -1; sleep 2; done' \
+            > "$RUNNER_TEMP/avail.txt" 2>/dev/null &
+          echo "sampling free bytes on / every 2 s into $RUNNER_TEMP/avail.txt"
       - name: Install the pinned toolchain
         run: rustup show active-toolchain || rustup toolchain install
       - name: Install Bevy's Linux build dependencies
@@ -589,6 +634,25 @@ jobs:
       # `Transform: Serialize` is unsatisfied). That is upstream's build to fix,
       # and it is not what this repo is testing.
       - run: scripts/check.sh test
+
+      # Same report as `gates`; this lane is the one whose peak the next
+      # dependency addition is most likely to move.
+      - name: Disk report
+        if: always()
+        run: |
+          set -euo pipefail
+          {
+            echo '### Free disk at peak'
+            echo '```'
+            df -h /
+            if [[ -s "${RUNNER_TEMP:-}/avail.txt" ]]; then
+              echo "min_free_bytes     $(sort -n "${RUNNER_TEMP:-}/avail.txt" | head -1)"
+              echo "df_samples         $(wc -l < "${RUNNER_TEMP:-}/avail.txt")"
+            else
+              echo 'no samples collected'
+            fi
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
 
   determinism:
     name: determinism (${{ matrix.label }})

@@ -119,8 +119,11 @@
 #
 # ── The budget every hosted job here lives inside ────────────────────────────
 #
-# From #171: `ubuntu-latest` is a single 145 GB root filesystem with 87 GiB
-# free at job start, 4 vCPU and 15 GiB of RAM. **Larger runners are
+# From #171: `ubuntu-latest` is a single 145 GiB root filesystem with roughly
+# 84-88 GB free at job start depending on the image build — #171's "87 GiB"
+# was that byte count read in decimal gigabytes (81.1 GiB); clippy's sampled
+# minimum on 2026-08-23 was min_free_bytes 87086202880 = 81.1 GiB mid-run.
+# 4 vCPU and 15 GiB of RAM. **Larger runners are
 # unavailable to this repository** — `ubuntu-latest-4-core`, `-8-core` and
 # `-16-core` were each probed and never picked up a runner; they are an
 # organisation feature and this repository is user-owned. `ubuntu-24.04-arm`
@@ -731,6 +734,18 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v7
+      # #171's free-disk sampler, record-only: sample free bytes on / every
+      # 2 s for the life of the job and report the minimum at the end. A
+      # snapshot at start misses the peak and one at the end understates it;
+      # the sampled minimum is the figure comparable to #171's "free at peak"
+      # column. Same loop `clippy` has run since #194. It asserts nothing, so
+      # unlike a threshold guard it cannot fire for the wrong reason.
+      - name: Start the free-disk sampler
+        run: |
+          set -euo pipefail
+          nohup bash -c 'while :; do df -B1 --output=avail / | tail -1; sleep 2; done' \
+            > "$RUNNER_TEMP/avail.txt" 2>/dev/null &
+          echo "sampling free bytes on / every 2 s into $RUNNER_TEMP/avail.txt"
       - name: Install the pinned toolchain
         run: rustup show active-toolchain || rustup toolchain install
       - uses: actions/cache@v6
@@ -782,6 +797,23 @@ jobs:
           retention-days: 14
           if-no-files-found: warn
 
+      - name: Disk report
+        if: always()
+        run: |
+          set -euo pipefail
+          {
+            echo '### Free disk at peak'
+            echo '```'
+            df -h /
+            if [[ -s "${RUNNER_TEMP:-}/avail.txt" ]]; then
+              echo "min_free_bytes     $(sort -n "${RUNNER_TEMP:-}/avail.txt" | head -1)"
+              echo "df_samples         $(wc -l < "${RUNNER_TEMP:-}/avail.txt")"
+            else
+              echo 'no samples collected'
+            fi
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
   p5-dupe-gauntlet:
     name: P5 dupe gauntlet (replay, attestation abuse, quarantine)
     # The gate writes fixed ledger ids and reads the receipt range back, so it
@@ -793,6 +825,17 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7
+      # #171's free-disk sampler, record-only: sample free bytes on / every
+      # 2 s and report the minimum at the end — the figure comparable to
+      # #171's "free at peak" column, which a start or end snapshot misses.
+      # Same loop `clippy` has run since #194; it asserts nothing, so it
+      # cannot fire for the wrong reason.
+      - name: Start the free-disk sampler
+        run: |
+          set -euo pipefail
+          nohup bash -c 'while :; do df -B1 --output=avail / | tail -1; sleep 2; done' \
+            > "$RUNNER_TEMP/avail.txt" 2>/dev/null &
+          echo "sampling free bytes on / every 2 s into $RUNNER_TEMP/avail.txt"
       - name: Install the pinned toolchain
         run: rustup show active-toolchain || rustup toolchain install
       - uses: actions/cache@v6
@@ -830,6 +873,23 @@ jobs:
           retention-days: 14
           if-no-files-found: warn
 
+      - name: Disk report
+        if: always()
+        run: |
+          set -euo pipefail
+          {
+            echo '### Free disk at peak'
+            echo '```'
+            df -h /
+            if [[ -s "${RUNNER_TEMP:-}/avail.txt" ]]; then
+              echo "min_free_bytes     $(sort -n "${RUNNER_TEMP:-}/avail.txt" | head -1)"
+              echo "df_samples         $(wc -l < "${RUNNER_TEMP:-}/avail.txt")"
+            else
+              echo 'no samples collected'
+            fi
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
   ramp-shadow:
     name: Enforcement ramp (shadow observes and does not act)
     # Same posture as the dupe gauntlet and for the same reason: fixed ledger
@@ -846,6 +906,14 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7
+      # Same free-disk sampler as the gauntlet above; #171's record-only
+      # answer to "would we know before hitting the ceiling?".
+      - name: Start the free-disk sampler
+        run: |
+          set -euo pipefail
+          nohup bash -c 'while :; do df -B1 --output=avail / | tail -1; sleep 2; done' \
+            > "$RUNNER_TEMP/avail.txt" 2>/dev/null &
+          echo "sampling free bytes on / every 2 s into $RUNNER_TEMP/avail.txt"
       - name: Install the pinned toolchain
         run: rustup show active-toolchain || rustup toolchain install
       - uses: actions/cache@v6
@@ -883,12 +951,37 @@ jobs:
           retention-days: 14
           if-no-files-found: warn
 
+      - name: Disk report
+        if: always()
+        run: |
+          set -euo pipefail
+          {
+            echo '### Free disk at peak'
+            echo '```'
+            df -h /
+            if [[ -s "${RUNNER_TEMP:-}/avail.txt" ]]; then
+              echo "min_free_bytes     $(sort -n "${RUNNER_TEMP:-}/avail.txt" | head -1)"
+              echo "df_samples         $(wc -l < "${RUNNER_TEMP:-}/avail.txt")"
+            else
+              echo 'no samples collected'
+            fi
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
   p2-kill9:
     name: P2 kill-9 gate (FoundationDB)
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v7
+      # #171's free-disk sampler, record-only — same loop as the other FDB
+      # jobs in this file; see the note on `p3-siblings`.
+      - name: Start the free-disk sampler
+        run: |
+          set -euo pipefail
+          nohup bash -c 'while :; do df -B1 --output=avail / | tail -1; sleep 2; done' \
+            > "$RUNNER_TEMP/avail.txt" 2>/dev/null &
+          echo "sampling free bytes on / every 2 s into $RUNNER_TEMP/avail.txt"
       - name: Install the pinned toolchain
         run: rustup show active-toolchain || rustup toolchain install
       - uses: actions/cache@v6
@@ -947,6 +1040,23 @@ jobs:
           path: p2-kill9-*/
           retention-days: 14
           if-no-files-found: warn
+
+      - name: Disk report
+        if: always()
+        run: |
+          set -euo pipefail
+          {
+            echo '### Free disk at peak'
+            echo '```'
+            df -h /
+            if [[ -s "${RUNNER_TEMP:-}/avail.txt" ]]; then
+              echo "min_free_bytes     $(sort -n "${RUNNER_TEMP:-}/avail.txt" | head -1)"
+              echo "df_samples         $(wc -l < "${RUNNER_TEMP:-}/avail.txt")"
+            else
+              echo 'no samples collected'
+            fi
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
 
   determinism-soak:
     name: determinism soak (extended corpus)
@@ -1018,6 +1128,14 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v7
+      # #171's free-disk sampler, record-only — same loop as the other FDB
+      # jobs in this file; see the note on `p3-siblings`.
+      - name: Start the free-disk sampler
+        run: |
+          set -euo pipefail
+          nohup bash -c 'while :; do df -B1 --output=avail / | tail -1; sleep 2; done' \
+            > "$RUNNER_TEMP/avail.txt" 2>/dev/null &
+          echo "sampling free bytes on / every 2 s into $RUNNER_TEMP/avail.txt"
       - name: Install the pinned toolchain
         run: rustup show active-toolchain || rustup toolchain install
       - uses: actions/cache@v6
@@ -1060,3 +1178,20 @@ jobs:
           path: target/fdb-tests.log
           retention-days: 14
           if-no-files-found: warn
+
+      - name: Disk report
+        if: always()
+        run: |
+          set -euo pipefail
+          {
+            echo '### Free disk at peak'
+            echo '```'
+            df -h /
+            if [[ -s "${RUNNER_TEMP:-}/avail.txt" ]]; then
+              echo "min_free_bytes     $(sort -n "${RUNNER_TEMP:-}/avail.txt" | head -1)"
+              echo "df_samples         $(wc -l < "${RUNNER_TEMP:-}/avail.txt")"
+            else
+              echo 'no samples collected'
+            fi
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
