@@ -1,0 +1,62 @@
+# Provenance manifest for every asset file in `assets/`.
+#
+# The licensing bar and the field semantics are stated in
+# docs/15-asset-provenance.md; this file is the machine-checked record.
+#
+# The invariant `scripts/asset-provenance.sh` enforces is bidirectional:
+#
+#   * every regular file under `assets/` other than this manifest has an
+#     entry below, with a sha256 matching its bytes;
+#   * every entry below names a file that exists.
+#
+# There are no other files in `assets/`: no README, no licence bundles. A
+# question a reader could ask about an asset's origin must be answerable from
+# the entry itself or from the licence link/text it carries.
+#
+# Field reference (all required unless noted):
+#
+#   path          relative to THIS FILE's directory (`assets/`). Never `..`.
+#   sha256        lowercase hex digest of the exact bytes in the tree. A
+#                 mismatch means the file changed without new provenance.
+#   source_url    where the original was retrieved from. For self-authored
+#                 work, say so here honestly rather than inventing a URL.
+#   licence       SPDX-style identifier from the allowlist in the guard script
+#                 (each entry there records why it permits public-repo
+#                 redistribution). An unknown identifier fails the check;
+#                 extending the allowlist is a deliberate edit with a reason.
+#   licence_url   stable link to the licence text, OR licence_text inline.
+#                 At least one of the two. Not a marketplace category name.
+#   author        creator as recorded upstream.
+#   retrieved     ISO date of retrieval.
+#   conversion    tool and version that produced the `.glb`, or "none" for
+#                 files authored directly in glTF 2.0.
+#   notes         optional.
+#
+# ── Fixtures ─────────────────────────────────────────────────────────────────
+#
+# Both entries below are FIXTURES: self-authored empty scenes generated inside
+# this repository to exercise the check before the first real third-party
+# asset arrives (#332). They are never loaded by any client — no client exists
+# yet (#327) — and they exist only so the guard has something true to assert.
+# Delete them when real assets land, keeping at least one manifested file so
+# the guard cannot rot into checking nothing.
+
+[[asset]]
+path = "fixtures/fixture-empty-scene.glb"
+sha256 = "eda47e6f1c7979c42270d417d8c2504dda431eefe221b91862be6c63685660aa"
+source_url = "n/a - self-authored fixture, generated in-repo (see #332)"
+licence = "CC0-1.0"
+licence_text = "Creative Commons Zero v1.0 Universal. The author dedicated this fixture to the public domain; text at https://creativecommons.org/publicdomain/zero/1.0/"
+author = "orrery project, generated in-repo"
+retrieved = "2026-08-23"
+conversion = "none - authored directly as glTF 2.0 JSON, wrapped in a GLB container by scripts/asset-provenance.sh's generator step"
+
+[[asset]]
+path = "fixtures/fixture-empty-scene.gltf"
+sha256 = "3c08518dd329f14decbdc9e1ff15f05176a4353d1284c3e11e6fa6c015a4bc09"
+source_url = "n/a - self-authored fixture, generated in-repo (see #332)"
+licence = "CC0-1.0"
+licence_text = "Creative Commons Zero v1.0 Universal. The author dedicated this fixture to the public domain; text at https://creativecommons.org/publicdomain/zero/1.0/"
+author = "orrery project, generated in-repo"
+retrieved = "2026-08-23"
+conversion = "none - authored directly as glTF 2.0 JSON"
