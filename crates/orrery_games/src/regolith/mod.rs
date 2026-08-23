@@ -70,9 +70,10 @@ pub const LOCK_ACQUISITION_TICKS: u16 = 30;
 const REFERENCE_SIGNATURE_RADIUS_MM: u128 = 3_000;
 const CHANCE_SCALE: u128 = 1_000_000;
 
-/// Regolith v6's rules identity: target-side tracking, flight time and locks.
+/// Regolith v7's rules identity: target-side tracking, flight time and
+/// switchable locks.
 pub const REGOLITH_RULESET: RulesetId = RulesetId {
-    version: 6,
+    version: 7,
     digest: [0x63; 32],
 };
 
@@ -283,7 +284,13 @@ impl Regolith {
                                 }
                             }
                         }
-                        Some(_) => continue,
+                        // A Fire naming a different target switches the lock,
+                        // paying acquisition again from scratch: the switch is
+                        // free to make but never cheaper than a fresh lock.
+                        Some(_) => {
+                            lock_target = Some(*target);
+                            lock_progress = 1;
+                        }
                     }
                     if lock_progress < LOCK_ACQUISITION_TICKS {
                         continue;
