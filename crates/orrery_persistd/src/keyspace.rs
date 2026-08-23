@@ -578,6 +578,30 @@ pub fn content_version_key() -> [u8; 1] {
     [b'v']
 }
 
+/// Key for D32's durable `ramp/{control}` posture row.
+///
+/// Ramp rows share the registered `v` family and occupy the `b"vr"`
+/// sub-span; `control` is one of D32 clause (c)'s stable control names.
+#[must_use]
+pub fn ramp_key(control: &str) -> Vec<u8> {
+    let mut key = Vec::with_capacity(2 + control.len());
+    key.extend_from_slice(b"vr");
+    key.extend_from_slice(control.as_bytes());
+    key
+}
+
+/// Inclusive start of the durable posture-row sub-span.
+#[must_use]
+pub fn ramp_range_start() -> Vec<u8> {
+    b"vr".to_vec()
+}
+
+/// Exclusive end of the durable posture-row sub-span.
+#[must_use]
+pub fn ramp_range_end() -> Vec<u8> {
+    b"vs".to_vec()
+}
+
 // ---------------------------------------------------------------------------
 // Intent idempotency family: `intent/{intent_id}`
 // ---------------------------------------------------------------------------
@@ -2246,6 +2270,16 @@ mod tests {
         let key = content_version_key();
         assert_eq!(key.len(), 1);
         assert_eq!(key[0], b'v', "content version key is the single byte 'v'");
+    }
+
+    #[test]
+    fn ramp_rows_are_the_registered_v_family_subspan() {
+        let key = ramp_key("authority_correction");
+        assert_eq!(key, b"vrauthority_correction");
+        assert!(content_version_key().as_slice() < ramp_range_start().as_slice());
+        assert!(ramp_range_start() <= key);
+        assert!(key < ramp_range_end());
+        assert!(ramp_range_end().as_slice() < [b'w'].as_slice());
     }
 
     // -----------------------------------------------------------------------

@@ -4,7 +4,94 @@ use core::cmp::Ordering;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{CellId, Epoch, GridId, Lsn, NodeId, PersistId, Tick};
+use crate::{CellId, Epoch, GridId, Lsn, NodeId, PersistId, RulesetId, Signature, Tick};
+
+/// Domain separator for a gateway-signed in-session authority correction.
+pub const AUTHORITY_CORRECTION_V1_DOMAIN: &[u8] = b"orrery/authority-correction/v1\0";
+
+/// The signed facts in an [`AuthorityCorrectionV1`].
+///
+/// The state is the canonical `Ruleset::CoreState` encoding after
+/// `authoritative_tick` executed. It is deliberately opaque at the protocol
+/// layer: only the game build named by `ruleset` knows how to install it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthorityCorrectionClaimsV1 {
+    /// The gateway identity that adjudicated and signed this correction.
+    pub issuer: NodeId,
+    /// The authority whose signed claim the replay disproved.
+    pub subject: NodeId,
+    /// The corrected persistent entity.
+    pub entity: PersistId,
+    /// The first tick at which adjudication found a deviation.
+    pub reconcile_from: Tick,
+    /// The tick represented by `authoritative_state`.
+    pub authoritative_tick: Tick,
+    /// Canonical bytes for the adjudicated state at `authoritative_tick`.
+    pub authoritative_state: Vec<u8>,
+    /// The exact rules build that produced `authoritative_state`.
+    pub ruleset: RulesetId,
+    /// BLAKE3 of the postcard-encoded discrepancy report that caused this.
+    pub adjudication: [u8; 32],
+}
+
+/// A cluster-authored correction peers may feed into normal reconciliation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthorityCorrectionV1 {
+    /// Version-one correction claims.
+    pub claims: AuthorityCorrectionClaimsV1,
+    /// Ed25519 signature by `claims.issuer` over the domain-separated claims.
+    pub signature: Signature,
+}
+
+impl AuthorityCorrectionV1 {
+    /// Sign one correction with the gateway's already-pinned transport key.
+    #[must_use]
+    pub fn sign(claims: AuthorityCorrectionClaimsV1, key: &iroh_base::SecretKey) -> Self {
+        let signature = key.sign(&authority_correction_preimage(&claims));
+        Self { claims, signature }
+    }
+
+    /// Verify the signature and the expected gateway trust root.
+    ///
+    /// # Errors
+    ///
+    /// [`AuthorityCorrectionVerificationError::WrongIssuer`] when the signed
+    /// issuer is not the gateway the session dialled, or
+    /// [`AuthorityCorrectionVerificationError::BadSignature`] when its
+    /// Ed25519 signature does not verify.
+    pub fn verify(
+        &self,
+        expected_issuer: NodeId,
+    ) -> Result<(), AuthorityCorrectionVerificationError> {
+        if self.claims.issuer != expected_issuer {
+            return Err(AuthorityCorrectionVerificationError::WrongIssuer);
+        }
+        self.claims
+            .issuer
+            .verify(
+                &authority_correction_preimage(&self.claims),
+                &self.signature,
+            )
+            .map_err(|_| AuthorityCorrectionVerificationError::BadSignature)
+    }
+}
+
+/// Why a peer refused a signed authority correction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthorityCorrectionVerificationError {
+    /// The correction names a signer other than the pinned gateway.
+    WrongIssuer,
+    /// The correction's signature does not verify under its named issuer.
+    BadSignature,
+}
+
+fn authority_correction_preimage(claims: &AuthorityCorrectionClaimsV1) -> Vec<u8> {
+    let encoded = postcard::to_stdvec(claims).expect("authority-correction claims serialize");
+    let mut preimage = Vec::with_capacity(AUTHORITY_CORRECTION_V1_DOMAIN.len() + encoded.len());
+    preimage.extend_from_slice(AUTHORITY_CORRECTION_V1_DOMAIN);
+    preimage.extend_from_slice(&encoded);
+    preimage
+}
 
 /// The authoritative sequence pair for an entity.
 ///
@@ -394,7 +481,7 @@ mod tests {
     fn the_wrong_owner_refusal_decodes_without_moving_the_variants_before_it() {
         assert_eq!(
             crate::PROTOCOL_VERSION,
-            4,
+            5,
             "this test pins the wire under a specific version; re-check it when the version moves"
         );
 
@@ -452,6 +539,42 @@ mod tests {
             );
             assert_eq!(postcard::from_bytes::<DenyReason>(&bytes).unwrap(), reason);
         }
+    }
+
+    fn correction_claims(issuer: NodeId) -> AuthorityCorrectionClaimsV1 {
+        AuthorityCorrectionClaimsV1 {
+            issuer,
+            subject: iroh_base::SecretKey::from_bytes(&[2; 32]).public(),
+            entity: PersistId::new(9),
+            reconcile_from: Tick::new(10),
+            authoritative_tick: Tick::new(12),
+            authoritative_state: vec![1, 2, 3],
+            ruleset: RulesetId {
+                version: 7,
+                digest: [4; 32],
+            },
+            adjudication: [5; 32],
+        }
+    }
+
+    #[test]
+    fn authority_correction_accepts_only_the_pinned_gateway_signature() {
+        let signer = iroh_base::SecretKey::from_bytes(&[7; 32]);
+        let correction = AuthorityCorrectionV1::sign(correction_claims(signer.public()), &signer);
+        assert_eq!(correction.verify(signer.public()), Ok(()));
+
+        let stranger = iroh_base::SecretKey::from_bytes(&[8; 32]);
+        assert_eq!(
+            correction.verify(stranger.public()),
+            Err(AuthorityCorrectionVerificationError::WrongIssuer)
+        );
+
+        let mut tampered = correction;
+        tampered.claims.authoritative_state.push(4);
+        assert_eq!(
+            tampered.verify(signer.public()),
+            Err(AuthorityCorrectionVerificationError::BadSignature)
+        );
     }
 
     /// The bulk-NACK reason codes are distinct and stable.

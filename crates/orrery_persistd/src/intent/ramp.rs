@@ -51,12 +51,12 @@
 //!
 //! # What this measures and what it cannot
 //!
-//! Only **C1**, the attestation quorum, and D32 clause (c) is why: C3, C4 and
-//! C5 "do not exist yet", and C2's shadow "honestly degrades to counting
-//! quarantined-session intents" while C1 is off — it has no observation
-//! surface of its own in this tree. [`RampArtifact::absent`] records those four
-//! by name with the reason, so a reader of the artifact cannot mistake an
-//! unbuilt control for a clean one.
+//! This artifact measures only **C1**, the attestation quorum. C2 has no
+//! observation surface here, while the landed C3/C4/C5 measurements live at
+//! their annulment, gateway and strike-ledger seams rather than in the intent
+//! observer this artifact reads. [`RampArtifact::absent`] records those four by
+//! name with the reason, so a reader cannot mistake an uncollected control for
+//! a clean one.
 //!
 //! Two dimensions D32 and [#221] ask for are **not** here, and are named rather
 //! than approximated:
@@ -103,6 +103,96 @@ use super::shadow::{ShadowObservation, ShadowObserver, ShadowVerdict, ATTESTATIO
 /// and a reader that guesses at a shape it was not written for reports numbers
 /// that are wrong rather than absent.
 pub const RAMP_ARTIFACT_SCHEMA: &str = "orrery.ramp.report/1";
+
+/// D32's three cached enforcement postures.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RampMode {
+    /// Do not evaluate the control.
+    Off,
+    /// Evaluate and measure every would-be action, but suppress all actions.
+    Shadow,
+    /// Evaluate and perform the control's actions.
+    Live,
+}
+
+/// Who last selected a durable enforcement posture.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PostureSource {
+    /// The startup default; normally represented by an absent row.
+    Default,
+    /// An authenticated operator-plane write.
+    Operator,
+    /// D32's verdict-rate circuit breaker.
+    AutoSuspend,
+}
+
+/// The value stored at D32's `ramp/{control}` row.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RampPosture {
+    /// Current mode.
+    pub mode: RampMode,
+    /// Writer class that selected the mode.
+    pub source: PostureSource,
+    /// Unix timestamp at which it was selected.
+    pub set_at_ms: u64,
+    /// Human-readable reason, limited to 256 bytes by writers.
+    pub reason: String,
+    /// Auto-suspend incident handle; cleared by an operator write.
+    pub incident_id: Option<[u8; 16]>,
+}
+
+/// Failure reading a durable ramp posture.
+#[derive(Debug)]
+pub struct RampPostureError(pub String);
+
+impl std::fmt::Display for RampPostureError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for RampPostureError {}
+
+/// FoundationDB adapter for D32's rarely-written, one-second-polled rows.
+#[cfg(feature = "fdb")]
+pub struct FdbRampPostureStore {
+    db: std::sync::Arc<foundationdb::Database>,
+}
+
+#[cfg(feature = "fdb")]
+impl FdbRampPostureStore {
+    /// Construct from the process-scoped FDB context.
+    #[must_use]
+    pub fn from_context(context: &crate::FdbContext) -> Self {
+        Self {
+            db: context.database(),
+        }
+    }
+
+    /// Read one control's posture. An absent row means the CLI default.
+    pub async fn read(&self, control: &str) -> Result<Option<RampPosture>, RampPostureError> {
+        let db = std::sync::Arc::clone(&self.db);
+        let key = crate::keyspace::ramp_key(control);
+        db.run(move |transaction, _| {
+            let key = key.clone();
+            async move {
+                let Some(bytes) = transaction.get(&key, false).await? else {
+                    return Ok(None);
+                };
+                let posture = postcard::from_bytes(bytes.as_ref()).map_err(|error| {
+                    foundationdb::FdbBindingError::new_custom_error(Box::new(RampPostureError(
+                        format!("decode ramp posture: {error}"),
+                    )))
+                })?;
+                Ok(Some(posture))
+            }
+        })
+        .await
+        .map_err(|error: foundationdb::FdbBindingError| {
+            RampPostureError(format!("read ramp posture transaction: {error}"))
+        })
+    }
+}
 
 /// How many distinct accounts a [`RampMeter`] keeps individual tallies for
 /// before folding the rest into one truncation bucket.
@@ -618,7 +708,7 @@ impl RampArtifact {
     }
 }
 
-/// The four controls D32 clause (c) inventories that emit nothing here, each
+/// The controls D32 clause (c) that this C1-specific artifact cannot measure,
 /// with the record's own reason.
 #[must_use]
 pub fn absent_controls() -> Vec<AbsentControl> {
@@ -631,15 +721,18 @@ pub fn absent_controls() -> Vec<AbsentControl> {
         ),
         (
             "write_annulment",
-            "D32 clause (c): C3 does not exist yet (#220). Its flag is specified so the \
-             implementing issue lands against a named contract; until then the row gates \
-             nothing and there is nothing to observe.",
+            "D32 clause (e): C3's refusal and compensating-write measurements live at the \
+             durable intent/annulment seam, outside this C1-specific intent artifact.",
         ),
         (
             "authority_correction",
-            "D32 clause (c): C4 does not exist yet (#215).",
+            "D32 clause (e): C4 emits process-local gateway metrics, while this C1-specific \
+             intent artifact has no gateway-metrics collector.",
         ),
-        ("strikes", "D32 clause (c): C5 does not exist yet (#219)."),
+        (
+            "strikes",
+            "D32 clause (e): C5's strike ledger is measured outside this C1-specific intent artifact.",
+        ),
     ]
     .into_iter()
     .map(|(control, reason)| AbsentControl {

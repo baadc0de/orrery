@@ -52,8 +52,10 @@ use orrery_net::plugin::NetConfig;
 use orrery_net::{
     apply_island_drain, CoordinatorConfig, CoordinatorLink, IslandMembership, OrreryNetPlugin,
 };
-use orrery_persist_client::{OrreryPersistClientPlugin, PersistClientConfig, ReportQueue};
-use orrery_predict::{ConfigDefect, OrreryPredictPlugin, PredictConfig};
+use orrery_persist_client::{
+    AuthorityCorrectionQueue, OrreryPersistClientPlugin, PersistClientConfig, ReportQueue,
+};
+use orrery_predict::{AuthorityCorrectionInbox, ConfigDefect, OrreryPredictPlugin, PredictConfig};
 use orrery_protocol::SeqPair;
 use orrery_spatial::{OrrerySpatialPlugin, SpatialConfig};
 use orrery_witness::{ReportFiled, WitnessPlugin};
@@ -325,6 +327,21 @@ pub fn queue_filed_reports(
     }
 }
 
+/// Move signature-verified gateway corrections into prediction reconciliation.
+///
+/// This is the same narrow facade crossing as [`queue_filed_reports`], in the
+/// opposite direction: the persistence client owns gateway trust and
+/// `orrery_predict` owns rollback-versus-snap. Neither lower crate depends on
+/// the other, so the facade moves the value and makes no decision about it.
+pub fn queue_authority_corrections(
+    mut verified: ResMut<AuthorityCorrectionQueue>,
+    mut reconciliation: ResMut<AuthorityCorrectionInbox>,
+) {
+    while let Some(correction) = verified.pop() {
+        reconciliation.push(correction);
+    }
+}
+
 /// Installs [`queue_filed_reports`].
 ///
 /// A `PluginGroup` can only add plugins, so this carries the wire the same way
@@ -341,7 +358,10 @@ impl Plugin for OrreryEscalationPlugin {
         // than waiting a frame per hop.
         app.add_systems(
             bevy_app::Update,
-            queue_filed_reports.before(orrery_persist_client::drain_reports),
+            (
+                queue_filed_reports.before(orrery_persist_client::drain_reports),
+                queue_authority_corrections.before(orrery_predict::reconcile_authority_corrections),
+            ),
         );
     }
 }

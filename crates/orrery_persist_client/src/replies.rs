@@ -20,6 +20,7 @@ use std::collections::HashMap;
 use orrery_protocol::{GatewayReply, Lease, LeaseId, PersistId};
 
 use crate::area::AreaLoader;
+use crate::corrections::AuthorityCorrectionQueue;
 use crate::gateway::{GatewayConfig, GatewaySession, GatewayState};
 use crate::intents::IntentQueue;
 use crate::reports::{ReportOutcome, ReportQueue};
@@ -246,6 +247,15 @@ pub(crate) fn process_replies(mut context: ReplyProcessingContext) {
                     tracing::debug!(?epoch, "gateway: witness-set announcement accepted");
                 }
             }
+            GatewayReply::AuthorityCorrection { correction } => {
+                let expected = context.config.as_ref().map(|config| config.gateway);
+                let accepted = expected
+                    .zip(context.corrections.as_mut())
+                    .is_some_and(|(gateway, corrections)| corrections.accept(correction, gateway));
+                if !accepted {
+                    tracing::warn!("gateway: refused an untrusted authority correction");
+                }
+            }
         }
     }
 }
@@ -285,6 +295,7 @@ pub(crate) struct ReplyProcessingContext<'w, 's> {
     loader: ResMut<'w, AreaLoader>,
     queue: ResMut<'w, IntentQueue>,
     reports: ResMut<'w, ReportQueue>,
+    corrections: Option<ResMut<'w, AuthorityCorrectionQueue>>,
     lease_inbox: Option<ResMut<'w, LeaseInbox>>,
     interest: Option<ResMut<'w, InterestGrant>>,
     authority_state: Option<ResMut<'w, AuthorityState>>,
@@ -403,7 +414,8 @@ mod tests {
             .init_resource::<UplinkScheduler>()
             .init_resource::<AreaLoader>()
             .init_resource::<IntentQueue>()
-            .init_resource::<ReportQueue>();
+            .init_resource::<ReportQueue>()
+            .init_resource::<AuthorityCorrectionQueue>();
         let session_entity = app
             .world_mut()
             .spawn(aeronet_io::Session::new(

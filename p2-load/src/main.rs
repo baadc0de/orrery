@@ -2590,6 +2590,14 @@ impl Rig<'_> {
                     "unexpected witness-epoch ack on a rig session"
                 );
             }
+            GatewayReply::AuthorityCorrection { correction } => {
+                tracing::warn!(
+                    session,
+                    subject = ?correction.claims.subject,
+                    entity = ?correction.claims.entity,
+                    "unexpected authority correction on a load-rig session"
+                );
+            }
         }
     }
 

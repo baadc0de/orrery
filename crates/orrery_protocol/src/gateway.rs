@@ -24,8 +24,8 @@
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    CellId, DiscrepancyReport, Epoch, GridId, Intent, IntentOutcome, Lease, LeaseId, LeaseMsg, Lsn,
-    NodeId, PersistId, SeqPair, Tick, Verdict,
+    AuthorityCorrectionV1, CellId, DiscrepancyReport, Epoch, GridId, Intent, IntentOutcome, Lease,
+    LeaseId, LeaseMsg, Lsn, NodeId, PersistId, SeqPair, Tick, Verdict,
 };
 
 /// A client → gateway message (docs/10-crates.md §9).
@@ -325,6 +325,15 @@ pub enum GatewayReply {
         /// Why the announcement was refused, as a stable numeric code. `0` on
         /// acceptance. See `WITNESS_EPOCH_ACK_*`.
         reason: u8,
+    },
+    /// A guilty-verdict correction authored by the cluster (D10 item 3a).
+    ///
+    /// Appended because postcard keys enum variants positionally. This is a
+    /// wire-format change and therefore travels with a protocol-version bump;
+    /// an older peer must never decode these bytes as another reply.
+    AuthorityCorrection {
+        /// Signed adjudicated state for the peer's normal reconciliation path.
+        correction: AuthorityCorrectionV1,
     },
 }
 
@@ -840,7 +849,7 @@ mod tests {
             );
         }
 
-        let replies: [(GatewayReply, u8); 11] = [
+        let replies: [(GatewayReply, u8); 12] = [
             (
                 GatewayReply::HelloAck {
                     gateway: node(1),
@@ -928,6 +937,27 @@ mod tests {
                 },
                 10,
             ),
+            (
+                GatewayReply::AuthorityCorrection {
+                    correction: crate::AuthorityCorrectionV1::sign(
+                        crate::AuthorityCorrectionClaimsV1 {
+                            issuer: node(1),
+                            subject: node(2),
+                            entity: PersistId::new(1),
+                            reconcile_from: Tick::new(2),
+                            authoritative_tick: Tick::new(3),
+                            authoritative_state: vec![4],
+                            ruleset: crate::RulesetId {
+                                version: 1,
+                                digest: [5; 32],
+                            },
+                            adjudication: [6; 32],
+                        },
+                        &iroh_base::SecretKey::from_bytes(&[1; 32]),
+                    ),
+                },
+                11,
+            ),
         ];
         for (reply, discriminant) in replies {
             assert_eq!(
@@ -998,7 +1028,7 @@ mod tests {
         // positional layout, and D33's probation field changes
         // `SessionTokenClaimsV1`'s, so pin the externally visible version as a
         // literal.
-        assert_eq!(crate::PROTOCOL_VERSION, 4);
+        assert_eq!(crate::PROTOCOL_VERSION, 5);
     }
 
     #[test]

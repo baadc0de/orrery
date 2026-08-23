@@ -22,8 +22,7 @@ use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
-use orrery_core::verify_bundle;
-use orrery_core::Ruleset;
+use orrery_core::{verify_bundle, ReplayHarness, Ruleset};
 use orrery_protocol::{
     AccountId, DiscrepancyReport, NodeId, PersistId, RulesetId, Tick, UnadjudicableReason,
     UniverseSeed, Verdict,
@@ -276,7 +275,27 @@ struct StrikeFiler {
 /// A cluster serves many games' worth of history across a rules upgrade, and
 /// making the executor generic would force one binary per build. The closure
 /// captures the concrete build and hands back a verdict.
-type Worker = Box<dyn Fn(NodeId, &orrery_protocol::EvidenceBundle) -> Verdict + Send + Sync>;
+type Worker =
+    Box<dyn Fn(NodeId, &orrery_protocol::EvidenceBundle) -> AdjudicationOutcome + Send + Sync>;
+
+/// Canonical state produced by the cluster's replay of a guilty window.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdjudicatedState {
+    /// The last executed tick represented by `canonical`.
+    pub tick: Tick,
+    /// The `Ruleset::CoreState` canonical encoding at `tick`.
+    pub canonical: Vec<u8>,
+}
+
+/// A verdict together with state usable by D10's correction response.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdjudicationOutcome {
+    /// The ordinary stage-4 verdict.
+    pub verdict: Verdict,
+    /// Replayed state, present only for a confirmed deviation whose replay
+    /// completed all the way through the evidence window.
+    pub corrected: Option<AdjudicatedState>,
+}
 
 struct Registered {
     id: RulesetId,
@@ -332,7 +351,7 @@ impl AdjudicationExecutor {
         let id = factory().id();
         let seed = self.seed;
         let worker: Worker =
-            Box::new(move |authority, bundle| verify_bundle(factory(), seed, authority, bundle));
+            Box::new(move |authority, bundle| adjudicate_bundle(factory, seed, authority, bundle));
         self.builds.retain(|registered| registered.id != id);
         self.builds.push_back(Registered { id, worker });
         while self.builds.len() > RETAINED_BUILDS {
@@ -354,11 +373,23 @@ impl AdjudicationExecutor {
     /// have to stay distinguishable.
     #[must_use]
     pub fn adjudicate(&self, report: &DiscrepancyReport) -> Verdict {
-        let verdict = if orrery_witness::verify_report(report).is_err() {
+        self.adjudicate_outcome(report).verdict
+    }
+
+    /// Adjudicate and retain the replayed state a guilty response needs.
+    ///
+    /// Strike filing is identical to [`Self::adjudicate`] and happens exactly
+    /// once; callers choose this form only when they also consume C4.
+    #[must_use]
+    pub fn adjudicate_outcome(&self, report: &DiscrepancyReport) -> AdjudicationOutcome {
+        let outcome = if orrery_witness::verify_report(report).is_err() {
             // Unsigned or tampered-in-transit. Not `EvidenceForged`: that
             // verdict strikes the named reporter, and an unverifiable
             // signature is exactly the case where the name means nothing.
-            Verdict::Unadjudicable(UnadjudicableReason::Malformed)
+            AdjudicationOutcome {
+                verdict: Verdict::Unadjudicable(UnadjudicableReason::Malformed),
+                corrected: None,
+            }
         } else if let Some(registered) = self
             .builds
             .iter()
@@ -366,10 +397,13 @@ impl AdjudicationExecutor {
         {
             (registered.worker)(report.subject, &report.bundle)
         } else {
-            Verdict::Unadjudicable(UnadjudicableReason::UnknownRuleset)
+            AdjudicationOutcome {
+                verdict: Verdict::Unadjudicable(UnadjudicableReason::UnknownRuleset),
+                corrected: None,
+            }
         };
-        self.file_report_verdict(report, verdict);
-        verdict
+        self.file_report_verdict(report, outcome.verdict);
+        outcome
     }
 
     fn file_report_verdict(&self, report: &DiscrepancyReport, verdict: Verdict) {
@@ -510,8 +544,42 @@ impl AdjudicationExecutor {
             // already accepted.
             return crate::intent::provisional::unknown_ruleset_verdict();
         };
-        (registered.worker)(subject, bundle)
+        (registered.worker)(subject, bundle).verdict
     }
+}
+
+fn adjudicate_bundle<R: Ruleset>(
+    factory: fn() -> R,
+    seed: UniverseSeed,
+    authority: NodeId,
+    bundle: &orrery_protocol::EvidenceBundle,
+) -> AdjudicationOutcome {
+    let verdict = verify_bundle(factory(), seed, authority, bundle);
+    let corrected = if matches!(verdict, Verdict::Confirms { .. }) {
+        let mut replay = ReplayHarness::new(factory(), seed);
+        replay
+            .load_claimed_snapshot(&bundle.t0_claim, &bundle.t0_snapshot)
+            .and_then(|()| {
+                replay.replay(
+                    &bundle.frames,
+                    authority,
+                    (bundle.window_start, bundle.window_end),
+                    &bundle.sibling_heads,
+                )
+            })
+            .ok()
+            .and_then(|_| {
+                bundle.window_end.0.checked_sub(1).and_then(|tick| {
+                    replay.canonical_state().map(|canonical| AdjudicatedState {
+                        tick: Tick::new(tick),
+                        canonical,
+                    })
+                })
+            })
+    } else {
+        None
+    };
+    AdjudicationOutcome { verdict, corrected }
 }
 
 fn system_time_ms() -> u64 {
@@ -816,6 +884,35 @@ mod tests {
                 "build {build:?} should be adjudicable"
             );
         }
+    }
+
+    #[test]
+    fn confirmed_replay_returns_the_canonical_adjudicated_state() {
+        let mut evidence = bundle(V1.id());
+        let mut disputed = StateClaim {
+            entity: evidence.entity,
+            chain_epoch: 0,
+            tick: Tick::new(1),
+            input_head: ChainHash::EMPTY,
+            // `Empty` encodes as no bytes, so this is deliberately false.
+            state_hash: [9; 32],
+            prev_claim: orrery_core::log::claim_hash(&evidence.t0_claim),
+            ruleset: evidence.ruleset,
+            sig: key(1).sign(b"placeholder"),
+        };
+        orrery_core::log::sign_claim(&key(1), &mut disputed);
+        evidence.disputed_claims.push(disputed);
+
+        let outcome = adjudicate_bundle(|| V1, UniverseSeed([1; 32]), key(1).public(), &evidence);
+
+        assert!(matches!(outcome.verdict, Verdict::Confirms { .. }));
+        assert_eq!(
+            outcome.corrected,
+            Some(AdjudicatedState {
+                tick: Tick::new(0),
+                canonical: Vec::new(),
+            })
+        );
     }
 
     #[test]

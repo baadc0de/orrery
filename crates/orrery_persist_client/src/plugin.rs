@@ -12,6 +12,7 @@ use bevy_ecs::prelude::*;
 
 use crate::area::{drive_area_loader, sync_aoi_to_loader, AreaLoader};
 use crate::config::PersistClientConfig;
+use crate::corrections::AuthorityCorrectionQueue;
 use crate::feed::{feed_uplink, UplinkSeq};
 use crate::gateway::{
     connect_gateway, disconnect_gateway, flush_interest_grant, flush_lease_control, hello_gateway,
@@ -49,6 +50,7 @@ impl Plugin for OrreryPersistClientPlugin {
             .init_resource::<AreaLoader>()
             .insert_resource(queue)
             .init_resource::<ReportQueue>()
+            .init_resource::<AuthorityCorrectionQueue>()
             .init_resource::<UplinkSeq>()
             .add_message::<bevy_replicon::server::uplink::ComponentDiff>()
             // The net plugin normally owns these message resources. Declaring

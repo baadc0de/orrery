@@ -54,18 +54,19 @@ use orrery_protocol::channels::{
     decode_datagram, decode_stream_frame, encode_datagram, encode_stream_frame, untag, Channel,
 };
 use orrery_protocol::{
-    verify_interest_grant, AccountId, AccountInvalidation, AccountStandings, AreaPage, CellId,
-    CoordinatorInterestSnapshot, DiffUplink, DiscrepancyReport, Epoch, GatewayMsg, GatewayReply,
-    GridId, Intent, IntentOutcome, IssuerKey, JournalRecord, LeaseId, LeaseMsg, Lsn, NodeId,
-    PersistId, SessionStanding, SessionTokenClaimsV1, SessionTokenV1,
-    SessionTokenVerificationError, SessionTokenVerifier, Tick, UnixMillis, Verdict,
-    MAX_AREA_PAGE_FRAME_BYTES, MAX_SESSION_TOKEN_TTL_MS, PROTOCOL_VERSION, REASON_BAD_SIGNATURE,
-    REASON_ISSUER_MISMATCH, REASON_NO_EXECUTOR, REPORT_ADJUDICATED, REPORT_REFUSED_NO_ADJUDICATOR,
-    REPORT_REFUSED_NO_SESSION, REPORT_REFUSED_RATE_LIMITED, REPORT_REFUSED_REPORTER_MISMATCH,
+    verify_interest_grant, AccountId, AccountInvalidation, AccountStandings, AreaPage,
+    AuthorityCorrectionClaimsV1, AuthorityCorrectionV1, CellId, CoordinatorInterestSnapshot,
+    DiffUplink, DiscrepancyReport, Epoch, GatewayMsg, GatewayReply, GridId, Intent, IntentOutcome,
+    IssuerKey, JournalRecord, LeaseId, LeaseMsg, Lsn, NodeId, PersistId, SessionStanding,
+    SessionTokenClaimsV1, SessionTokenV1, SessionTokenVerificationError, SessionTokenVerifier,
+    Tick, UnixMillis, Verdict, MAX_AREA_PAGE_FRAME_BYTES, MAX_SESSION_TOKEN_TTL_MS,
+    PROTOCOL_VERSION, REASON_BAD_SIGNATURE, REASON_ISSUER_MISMATCH, REASON_NO_EXECUTOR,
+    REPORT_ADJUDICATED, REPORT_REFUSED_NO_ADJUDICATOR, REPORT_REFUSED_NO_SESSION,
+    REPORT_REFUSED_RATE_LIMITED, REPORT_REFUSED_REPORTER_MISMATCH,
 };
 
 use crate::actor::{FencedApply, Reject};
-use crate::adjudication::AdjudicationExecutor;
+use crate::adjudication::{AdjudicationExecutor, AdjudicationOutcome};
 use crate::cluster::{LeaseRenewal, Router};
 use crate::intent::stages::{self, intent_stage_metrics, IntentStageSnapshot, IntentTrace};
 use crate::intent::{
@@ -171,6 +172,108 @@ impl GatewayAuthorizer for SessionTokenV1Authorizer {
 /// shadow observation this module emits for standing enforcement, and the
 /// suffix of the `ramp/{control}` posture row an operator writes to demote it.
 pub const STRIKES_CONTROL: &str = "strikes";
+
+/// D32 clause (c)'s name for control C4 and its durable-row suffix.
+pub const AUTHORITY_CORRECTION_CONTROL: &str = "authority_correction";
+
+/// The `tracing` target for C4 shadow observations.
+const AUTHORITY_CORRECTION_SHADOW_TARGET: &str = crate::intent::shadow::SHADOW_TARGET;
+
+/// D32's three postures for authority correction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AuthorityCorrectionEnforcement {
+    /// Evaluate nothing and take no action.
+    #[default]
+    Off,
+    /// Build, sign, hash and address the payload; revoke and send nothing.
+    Shadow,
+    /// Revoke through the registrar and broadcast the signed correction.
+    Live,
+}
+
+impl AuthorityCorrectionEnforcement {
+    /// Stable CLI and durable-row spelling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Shadow => "shadow",
+            Self::Live => "live",
+        }
+    }
+
+    /// Whether this posture evaluates the guilty-verdict response.
+    #[must_use]
+    pub const fn evaluates(self) -> bool {
+        !matches!(self, Self::Off)
+    }
+
+    /// Whether this posture may revoke or broadcast.
+    #[must_use]
+    pub const fn acts(self) -> bool {
+        matches!(self, Self::Live)
+    }
+}
+
+impl core::str::FromStr for AuthorityCorrectionEnforcement {
+    type Err = &'static str;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "off" => Ok(Self::Off),
+            "shadow" => Ok(Self::Shadow),
+            "live" => Ok(Self::Live),
+            _ => Err("expected off, shadow, or live"),
+        }
+    }
+}
+
+impl core::fmt::Display for AuthorityCorrectionEnforcement {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+/// The process-local cell a CLI default and durable C4 poller share.
+#[derive(Debug, Clone)]
+pub struct AuthorityCorrectionPosture(Arc<AtomicU8>);
+
+impl Default for AuthorityCorrectionPosture {
+    fn default() -> Self {
+        Self::new(AuthorityCorrectionEnforcement::Off)
+    }
+}
+
+impl AuthorityCorrectionPosture {
+    /// A posture starting at `mode`.
+    #[must_use]
+    pub fn new(mode: AuthorityCorrectionEnforcement) -> Self {
+        Self(Arc::new(AtomicU8::new(Self::code(mode))))
+    }
+
+    /// The mode currently in force.
+    #[must_use]
+    pub fn get(&self) -> AuthorityCorrectionEnforcement {
+        match self.0.load(Ordering::Relaxed) {
+            0 => AuthorityCorrectionEnforcement::Off,
+            1 => AuthorityCorrectionEnforcement::Shadow,
+            _ => AuthorityCorrectionEnforcement::Live,
+        }
+    }
+
+    /// Apply a CLI, operator-row, or auto-suspend posture.
+    pub fn set(&self, mode: AuthorityCorrectionEnforcement) {
+        self.0.store(Self::code(mode), Ordering::Relaxed);
+    }
+
+    const fn code(mode: AuthorityCorrectionEnforcement) -> u8 {
+        match mode {
+            AuthorityCorrectionEnforcement::Off => 0,
+            AuthorityCorrectionEnforcement::Shadow => 1,
+            AuthorityCorrectionEnforcement::Live => 2,
+        }
+    }
+}
 
 /// The `tracing` target every shadow observation for standing enforcement is
 /// emitted on — the same stable target C1's shadow arm uses, so one filter
@@ -2635,6 +2738,54 @@ pub struct GatewayStandingMetrics {
     shadow_sessions_would_terminate: AtomicU64,
 }
 
+/// C4's cumulative evaluation and action counters.
+#[derive(Debug, Default)]
+pub struct AuthorityCorrectionMetrics {
+    evaluated: AtomicU64,
+    unevaluated: AtomicU64,
+    shadow_suppressed: AtomicU64,
+    leases_revoked: AtomicU64,
+    broadcasts: AtomicU64,
+    recipients: AtomicU64,
+    dropped: AtomicU64,
+}
+
+impl AuthorityCorrectionMetrics {
+    /// Read every C4 counter.
+    #[must_use]
+    pub fn snapshot(&self) -> AuthorityCorrectionSnapshot {
+        let load = |counter: &AtomicU64| counter.load(Ordering::Relaxed);
+        AuthorityCorrectionSnapshot {
+            evaluated: load(&self.evaluated),
+            unevaluated: load(&self.unevaluated),
+            shadow_suppressed: load(&self.shadow_suppressed),
+            leases_revoked: load(&self.leases_revoked),
+            broadcasts: load(&self.broadcasts),
+            recipients: load(&self.recipients),
+            dropped: load(&self.dropped),
+        }
+    }
+}
+
+/// A point-in-time C4 counter snapshot.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AuthorityCorrectionSnapshot {
+    /// Guilty verdicts whose payload and audience were computed.
+    pub evaluated: u64,
+    /// Guilty verdicts for which corrected state or registrar coordinates were absent.
+    pub unevaluated: u64,
+    /// Complete shadow evaluations whose actions were suppressed.
+    pub shadow_suppressed: u64,
+    /// Registrar leases successfully revoked in live mode.
+    pub leases_revoked: u64,
+    /// Corrections emitted in live mode.
+    pub broadcasts: u64,
+    /// Recipient deliveries that succeeded.
+    pub recipients: u64,
+    /// Recipient copies refused by the D25 cap, bucket, or a session race.
+    pub dropped: u64,
+}
+
 impl GatewayStandingMetrics {
     /// One admission refused because identity had invalidated the account.
     pub fn record_hello_refused(&self) {
@@ -2914,6 +3065,10 @@ pub struct GatewayConfig {
     /// to enforce: keep the two configured together, as D32 clause (d) pairs
     /// C1's mode and its epoch authority.
     pub strikes_posture: StrikesPosture,
+    /// Runtime lever for D32 control C4. Defaults off.
+    pub authority_correction_posture: AuthorityCorrectionPosture,
+    /// Always-on C4 evaluation/action telemetry.
+    pub authority_correction_metrics: Arc<AuthorityCorrectionMetrics>,
     /// Always-on server-side telemetry: bulk stages, the intent and area
     /// server spans, and the report outcome split. Share the handle to read
     /// it; a fresh one is created when the caller does not, and collection is
@@ -3002,6 +3157,8 @@ impl Default for GatewayConfig {
             identity_health: Arc::new(AvailableIdentityHealth),
             standing_feed: None,
             strikes_posture: StrikesPosture::default(),
+            authority_correction_posture: AuthorityCorrectionPosture::default(),
+            authority_correction_metrics: Arc::new(AuthorityCorrectionMetrics::default()),
             metrics: Arc::new(GatewayMetrics::default()),
             peer_registry_capacity: MAX_PEER_REGISTRY_ENTRIES,
             peer_lease_capacity: MAX_PEER_LIVE_LEASES,
@@ -3814,6 +3971,19 @@ impl PeerRegistry {
         live
     }
 
+    /// Active registrar leases currently indexed to `node`'s live session.
+    async fn active_leases(&self, node: NodeId) -> Vec<SessionLease> {
+        let Some(session) = self.current_session(node).await else {
+            return Vec::new();
+        };
+        let peer = session.state.lock().await;
+        peer.leases
+            .values()
+            .filter(|lease| lease.owner == SessionLeaseOwner::Active(session.generation))
+            .copied()
+            .collect()
+    }
+
     /// Sessions with a current generation that nobody has been heard on for a
     /// full [`SESSION_SILENCE_LIMIT_MS`].
     ///
@@ -4321,6 +4491,99 @@ impl Redistributor {
                 self.metrics.record_expire_fanout_skipped();
             }
         }
+    }
+
+    /// Broadcast one signed correction under D25's recipient cap and the
+    /// same per-recipient bucket as unsolicited `Expire` advisories.
+    async fn fan_out_correction(
+        &self,
+        audience: CoveringPeers,
+        correction: &AuthorityCorrectionV1,
+        metrics: &AuthorityCorrectionMetrics,
+    ) {
+        metrics
+            .dropped
+            .fetch_add(audience.over_limit as u64, Ordering::Relaxed);
+        let now_ms = self.claim_clock.now_ms();
+        for node in audience.peers {
+            let Some(session) = self.peers.current_session(node).await else {
+                metrics.dropped.fetch_add(1, Ordering::Relaxed);
+                continue;
+            };
+            if !session.take_expire_fanout_token(now_ms).await {
+                metrics.dropped.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
+            if session
+                .notify(&GatewayReply::AuthorityCorrection {
+                    correction: correction.clone(),
+                })
+                .await
+            {
+                metrics.recipients.fetch_add(1, Ordering::Relaxed);
+            } else {
+                metrics.dropped.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// Revoke every lease currently held by `subject`, through the registrar's
+    /// existing park-and-redistribute path.
+    async fn revoke_subject_leases(&self, router: &Arc<dyn Router>, subject: NodeId) -> u64 {
+        let Some(session) = self.peers.current_session(subject).await else {
+            return 0;
+        };
+        let leases = {
+            let mut peer = session.state.lock().await;
+            let generation = session.generation;
+            let leases = peer
+                .leases
+                .values_mut()
+                .filter(|lease| lease.owner == SessionLeaseOwner::Active(generation))
+                .map(|lease| {
+                    lease.owner = SessionLeaseOwner::Parking(generation);
+                    *lease
+                })
+                .collect::<Vec<_>>();
+            leases
+        };
+
+        let mut revoked = Vec::new();
+        for lease in leases {
+            let parked = router
+                .park_lease(
+                    lease.grid,
+                    lease.cell,
+                    lease.entity,
+                    subject,
+                    lease.lease_id,
+                )
+                .await;
+            let Ok(parked_row) = parked else { continue };
+            {
+                let mut peer = session.state.lock().await;
+                if peer.leases.get(&lease.entity) == Some(&lease) {
+                    peer.leases.remove(&lease.entity);
+                }
+            }
+            if let Some(row) = parked_row.filter(|row| parked_by_us(row, lease.lease_id)) {
+                revoked.push(crate::lease::ParkedLease {
+                    grid: lease.grid,
+                    cell: lease.cell,
+                    previous_holder: subject,
+                    previous_lease_id: lease.lease_id,
+                    lease: row,
+                    reason: orrery_protocol::ExpireReason::Revoked,
+                });
+            }
+        }
+
+        let count = u64::try_from(revoked.len()).unwrap_or(u64::MAX);
+        let mut audiences = ExpireAudiences::default();
+        for parked in revoked {
+            self.redistribute(router, parked, &mut audiences).await;
+        }
+        count
     }
 
     /// Whether a disposition has any self-healing path of its own.
@@ -4926,6 +5189,7 @@ pub struct GatewayServer {
     witness_epochs: Option<Arc<crate::witness_epoch::WitnessEpochAuthority>>,
     authority_metrics: Arc<AuthorityMetrics>,
     standing_metrics: Arc<GatewayStandingMetrics>,
+    authority_correction_metrics: Arc<AuthorityCorrectionMetrics>,
     metrics: Arc<GatewayMetrics>,
     send_failures: Arc<AtomicU64>,
     shutdown: oneshot::Sender<()>,
@@ -4951,6 +5215,9 @@ impl GatewayServer {
         let endpoint = Arc::new(builder.bind().await.map_err(GatewayError::Bind)?);
 
         let gateway = endpoint.id();
+        let authority_correction_signer = endpoint.secret_key().clone();
+        let authority_correction_posture = config.authority_correction_posture.clone();
+        let authority_correction_metrics = Arc::clone(&config.authority_correction_metrics);
         let protocol = config.protocol_version;
         let executor = config.executor;
         let adjudicator = config.adjudicator;
@@ -5020,6 +5287,9 @@ impl GatewayServer {
             witness_epochs.clone(),
             admission,
             standing_feed,
+            authority_correction_signer,
+            authority_correction_posture,
+            Arc::clone(&authority_correction_metrics),
             report_limiter,
             Arc::clone(&metrics),
             redistributor,
@@ -5037,6 +5307,7 @@ impl GatewayServer {
             witness_epochs,
             authority_metrics,
             standing_metrics: config.standing_metrics,
+            authority_correction_metrics,
             metrics,
             send_failures,
             shutdown,
@@ -5089,6 +5360,12 @@ impl GatewayServer {
     #[must_use]
     pub fn standing_metrics(&self) -> &Arc<GatewayStandingMetrics> {
         &self.standing_metrics
+    }
+
+    /// C4 evaluation and action counters.
+    #[must_use]
+    pub fn authority_correction_metrics(&self) -> &Arc<AuthorityCorrectionMetrics> {
+        &self.authority_correction_metrics
     }
 
     /// The always-on server-side telemetry: bulk stages, the intent and area
@@ -5597,6 +5874,9 @@ async fn accept_loop(
     witness_epochs: Option<Arc<crate::witness_epoch::WitnessEpochAuthority>>,
     admission: GatewayAdmission,
     standing_feed: Option<SharedStandingInvalidationFeed>,
+    authority_correction_signer: iroh::SecretKey,
+    authority_correction_posture: AuthorityCorrectionPosture,
+    authority_correction_metrics: Arc<AuthorityCorrectionMetrics>,
     report_limiter: Arc<ReportLimiter>,
     metrics: Arc<GatewayMetrics>,
     redistributor: Arc<Redistributor>,
@@ -5715,6 +5995,9 @@ async fn accept_loop(
                 let witness_epochs = witness_epochs.clone();
                 let admission = admission.clone();
                 let report_limiter = Arc::clone(&report_limiter);
+                let authority_correction_signer = authority_correction_signer.clone();
+                let authority_correction_posture = authority_correction_posture.clone();
+                let authority_correction_metrics = Arc::clone(&authority_correction_metrics);
                 let metrics = Arc::clone(&metrics);
                 let redistributor = Arc::clone(&redistributor);
                 let send_failures = Arc::clone(&send_failures);
@@ -5730,6 +6013,9 @@ async fn accept_loop(
                     interest_authority,
                     witness_epochs,
                     admission,
+                    authority_correction_signer,
+                    authority_correction_posture,
+                    authority_correction_metrics,
                     report_limiter,
                     metrics,
                     redistributor,
@@ -5763,6 +6049,9 @@ async fn handle_connection(
     interest_authority: SharedInterestAuthority,
     witness_epochs: Option<Arc<crate::witness_epoch::WitnessEpochAuthority>>,
     admission: GatewayAdmission,
+    authority_correction_signer: iroh::SecretKey,
+    authority_correction_posture: AuthorityCorrectionPosture,
+    authority_correction_metrics: Arc<AuthorityCorrectionMetrics>,
     report_limiter: Arc<ReportLimiter>,
     metrics: Arc<GatewayMetrics>,
     redistributor: Arc<Redistributor>,
@@ -6420,10 +6709,37 @@ async fn handle_connection(
                 // owes other connections their bulk acks.
                 let send = Arc::clone(&send);
                 let metrics = Arc::clone(&metrics);
+                let router = Arc::clone(&router);
+                let redistributor = Arc::clone(&redistributor);
+                let correction_metrics = Arc::clone(&authority_correction_metrics);
+                let correction_posture = authority_correction_posture.clone();
+                let correction_signer = authority_correction_signer.clone();
                 let permit = Arc::clone(&inflight_control).acquire_owned().await;
-                tokio::task::spawn_blocking(move || {
-                    let _permit = permit;
-                    adjudicate_report(send.as_ref(), &adjudicator, &report, &metrics.report);
+                tokio::spawn(async move {
+                    let outcome = tokio::task::spawn_blocking(move || {
+                        let _permit = permit;
+                        let outcome = adjudicate_report(
+                            send.as_ref(),
+                            &adjudicator,
+                            &report,
+                            &metrics.report,
+                        );
+                        (report, outcome)
+                    })
+                    .await;
+                    let Ok((report, outcome)) = outcome else {
+                        return;
+                    };
+                    apply_authority_correction(
+                        &report,
+                        &outcome,
+                        &correction_signer,
+                        &correction_posture,
+                        &correction_metrics,
+                        &router,
+                        &redistributor,
+                    )
+                    .await;
                 });
             }
         }
@@ -7753,9 +8069,121 @@ fn adjudicate_report(
     adjudicator: &AdjudicationExecutor,
     report: &DiscrepancyReport,
     metrics: &GatewayReportMetrics,
+) -> AdjudicationOutcome {
+    let outcome = adjudicator.adjudicate_outcome(report);
+    send_report_verdict(
+        send,
+        report,
+        Some(outcome.verdict),
+        REPORT_ADJUDICATED,
+        metrics,
+    );
+    outcome
+}
+
+/// Consume a guilty verdict as D10 response (a), under D32 control C4.
+async fn apply_authority_correction(
+    report: &DiscrepancyReport,
+    outcome: &AdjudicationOutcome,
+    signer: &iroh::SecretKey,
+    posture: &AuthorityCorrectionPosture,
+    metrics: &AuthorityCorrectionMetrics,
+    router: &Arc<dyn Router>,
+    redistributor: &Redistributor,
 ) {
-    let verdict = adjudicator.adjudicate(report);
-    send_report_verdict(send, report, Some(verdict), REPORT_ADJUDICATED, metrics);
+    let mode = posture.get();
+    if !mode.evaluates() {
+        return;
+    }
+    let Verdict::Confirms { at, .. } = outcome.verdict else {
+        return;
+    };
+    let Some(corrected) = outcome.corrected.as_ref() else {
+        metrics.unevaluated.fetch_add(1, Ordering::Relaxed);
+        tracing::warn!(
+            target: AUTHORITY_CORRECTION_SHADOW_TARGET,
+            control = AUTHORITY_CORRECTION_CONTROL,
+            subject = %report.subject,
+            entity = ?report.bundle.entity,
+            action = "unevaluated",
+            reason = "replayed_state_unavailable",
+            "authority correction could not build adjudicated state"
+        );
+        return;
+    };
+
+    // Registrar coordinates come from the registrar's own session index. The
+    // report is evidence about an entity, not authority to invent its cell.
+    let leases = redistributor.peers.active_leases(report.subject).await;
+    let Some(disputed_lease) = leases
+        .iter()
+        .find(|lease| lease.entity == report.bundle.entity)
+        .copied()
+    else {
+        metrics.unevaluated.fetch_add(1, Ordering::Relaxed);
+        tracing::warn!(
+            target: AUTHORITY_CORRECTION_SHADOW_TARGET,
+            control = AUTHORITY_CORRECTION_CONTROL,
+            subject = %report.subject,
+            entity = ?report.bundle.entity,
+            action = "unevaluated",
+            reason = "no_active_registrar_lease",
+            "authority correction found no live registrar authority to revoke"
+        );
+        return;
+    };
+    let audience = redistributor
+        .fanout_audience(
+            &mut ExpireAudiences::default(),
+            disputed_lease.grid,
+            disputed_lease.cell,
+            report.subject,
+            registrar_now_ms(),
+        )
+        .await;
+    let claims = AuthorityCorrectionClaimsV1 {
+        issuer: signer.public(),
+        subject: report.subject,
+        entity: report.bundle.entity,
+        reconcile_from: at,
+        authoritative_tick: corrected.tick,
+        authoritative_state: corrected.canonical.clone(),
+        ruleset: report.bundle.ruleset,
+        adjudication: *blake3::hash(&postcard::to_stdvec(report).unwrap_or_default()).as_bytes(),
+    };
+    let correction = AuthorityCorrectionV1::sign(claims, signer);
+    let payload = postcard::to_stdvec(&correction).unwrap_or_default();
+    let payload_digest = blake3::hash(&payload);
+    metrics.evaluated.fetch_add(1, Ordering::Relaxed);
+
+    // Re-read after every await and after the full computation. An operator
+    // demoting live to shadow during evaluation must suppress both actions.
+    if !posture.get().acts() {
+        metrics.shadow_suppressed.fetch_add(1, Ordering::Relaxed);
+        tracing::info!(
+            target: AUTHORITY_CORRECTION_SHADOW_TARGET,
+            control = AUTHORITY_CORRECTION_CONTROL,
+            subject = %report.subject,
+            entity = ?report.bundle.entity,
+            leases = leases.len(),
+            recipients = audience.peers.len(),
+            over_limit = audience.over_limit,
+            payload_bytes = payload.len(),
+            payload_digest = %payload_digest.to_hex(),
+            action = "would_revoke_and_broadcast",
+            "authority correction computed and suppressed in shadow"
+        );
+        return;
+    }
+
+    let revoked = redistributor
+        .revoke_subject_leases(router, report.subject)
+        .await;
+    metrics.leases_revoked.fetch_add(revoked, Ordering::Relaxed);
+    metrics.broadcasts.fetch_add(1, Ordering::Relaxed);
+    redistributor
+        .fan_out_correction(audience, &correction, metrics)
+        .await;
 }
 
 /// Refuse a report with a stable code and no verdict.
@@ -12789,5 +13217,335 @@ mod tests {
             replies.lock().expect("replies").is_empty(),
             "a refused heartbeat is counted, never answered with a lie"
         );
+    }
+
+    struct CorrectionRouter {
+        parks: AtomicU64,
+    }
+
+    #[async_trait::async_trait]
+    impl Router for CorrectionRouter {
+        async fn apply(
+            &self,
+            _record: JournalRecord,
+        ) -> Result<Arc<crate::journal::AppendHandle>, Reject> {
+            Ok(crate::journal::AppendHandle::completed(Lsn::new(1, 1)))
+        }
+
+        async fn read(&self, _grid: GridId, _cell: CellId) -> Result<SnapshotPage, Reject> {
+            Err(Reject::JournalClosed)
+        }
+
+        async fn has_actor(&self, _grid: GridId, _cell: CellId) -> bool {
+            true
+        }
+
+        async fn park_lease(
+            &self,
+            _grid: GridId,
+            _cell: CellId,
+            entity: PersistId,
+            _holder: NodeId,
+            lease_id: LeaseId,
+        ) -> Result<Option<orrery_protocol::Lease>, Reject> {
+            self.parks.fetch_add(1, Ordering::SeqCst);
+            Ok(Some(orrery_protocol::Lease {
+                entity,
+                holder: None,
+                seq: SeqPair::default(),
+                lease_id: LeaseId(lease_id.0.saturating_add(1)),
+                expires_at: 0,
+                flags: LeaseFlags::PARKED,
+                bound_to: None,
+            }))
+        }
+    }
+
+    fn correction_report(subject: NodeId, entity: PersistId) -> DiscrepancyReport {
+        let reporter_key = iroh::SecretKey::from_bytes(&[72; 32]);
+        let ruleset = orrery_protocol::RulesetId {
+            version: 9,
+            digest: [9; 32],
+        };
+        let t0_claim = orrery_protocol::StateClaim {
+            entity,
+            chain_epoch: 1,
+            tick: Tick::new(10),
+            input_head: orrery_protocol::ChainHash::EMPTY,
+            state_hash: [0; 32],
+            prev_claim: [0; 32],
+            ruleset,
+            sig: reporter_key.sign(b"test claim"),
+        };
+        DiscrepancyReport {
+            subject,
+            bundle: orrery_protocol::EvidenceBundle {
+                ruleset,
+                entity,
+                window_start: Tick::new(10),
+                window_end: Tick::new(12),
+                t0_claim,
+                t0_snapshot: Bytes::new(),
+                frames: Vec::new(),
+                sibling_heads: Vec::new(),
+                disputed_claims: Vec::new(),
+                claimed_hashes: Vec::new(),
+                computed_hashes: Vec::new(),
+            },
+            reporter: reporter_key.public(),
+            reporter_sig: reporter_key.sign(b"test report"),
+        }
+    }
+
+    async fn correction_fixture(
+        mode: AuthorityCorrectionEnforcement,
+    ) -> (
+        Arc<PeerRegistry>,
+        PeerSession,
+        Arc<CorrectionRouter>,
+        Redistributor,
+        AuthorityCorrectionPosture,
+        Arc<Mutex<Vec<GatewayReply>>>,
+    ) {
+        let registry = Arc::new(PeerRegistry::new(4, 10_000, MAX_PEER_LIVE_LEASES));
+        let subject = successor_node(70);
+        let observer = successor_node(71);
+        let authorize = |node, account| {
+            GatewayAuthorization::Valid(SessionTokenClaimsV1::new(
+                AccountId::new(account),
+                node,
+                UnixMillis::new(0),
+                orrery_protocol::SessionTokenTtlMs::new(10_000),
+                SessionStanding::Good,
+                orrery_protocol::IssuerKeyId::new(1),
+                false,
+            ))
+        };
+        let subject_session = registry
+            .activate(subject, authorize(subject, 70), b"subject", None, 0, 0)
+            .await
+            .expect("subject session");
+        let observer_session = registry
+            .activate(observer, authorize(observer, 71), b"observer", None, 0, 0)
+            .await
+            .expect("observer session");
+        let replies = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&replies);
+        observer_session
+            .install_notifier(Arc::new(move |frame| {
+                if let Some(reply) = orrery_protocol::channels::decode_stream_frame(&frame) {
+                    captured.lock().expect("reply capture").push(reply);
+                }
+            }))
+            .await;
+        let interest = SnapshotInterestAuthority::from_snapshots(vec![interest_snapshot(
+            observer,
+            1,
+            GridId::ROOT,
+            vec![CellId::ROOT],
+            u64::MAX,
+        )]);
+        let redistributor = Redistributor {
+            interest: Arc::new(interest),
+            ..parking_redistributor(Arc::clone(&registry))
+        };
+        let router = Arc::new(CorrectionRouter {
+            parks: AtomicU64::new(0),
+        });
+        (
+            registry,
+            subject_session,
+            router,
+            redistributor,
+            AuthorityCorrectionPosture::new(mode),
+            replies,
+        )
+    }
+
+    fn confirmed_outcome(state: &[u8]) -> AdjudicationOutcome {
+        AdjudicationOutcome {
+            verdict: Verdict::Confirms {
+                at: Tick::new(11),
+                kind: orrery_protocol::DeviationKind::DiscreteMismatch,
+            },
+            corrected: Some(crate::adjudication::AdjudicatedState {
+                tick: Tick::new(11),
+                canonical: state.to_vec(),
+            }),
+        }
+    }
+
+    #[tokio::test]
+    async fn guilty_live_revokes_at_registrar_and_broadcasts_signed_correction() {
+        let (registry, subject_session, router, redistributor, posture, replies) =
+            correction_fixture(AuthorityCorrectionEnforcement::Live).await;
+        let entity = PersistId::new(700);
+        subject_session.state.lock().await.leases.insert(
+            entity,
+            SessionLease {
+                entity,
+                lease_id: LeaseId(7),
+                grid: GridId::ROOT,
+                cell: CellId::ROOT,
+                owner: SessionLeaseOwner::Active(subject_session.generation),
+            },
+        );
+        let report = correction_report(subject_session.node, entity);
+        let signer = iroh::SecretKey::from_bytes(&[73; 32]);
+        let metrics = AuthorityCorrectionMetrics::default();
+        let routed: Arc<dyn Router> = router.clone();
+
+        apply_authority_correction(
+            &report,
+            &confirmed_outcome(b"adjudicated state"),
+            &signer,
+            &posture,
+            &metrics,
+            &routed,
+            &redistributor,
+        )
+        .await;
+
+        assert_eq!(router.parks.load(Ordering::SeqCst), 1);
+        assert!(registry
+            .active_leases(subject_session.node)
+            .await
+            .is_empty());
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.leases_revoked, 1);
+        assert_eq!(snapshot.broadcasts, 1);
+        assert_eq!(snapshot.recipients, 1);
+        let replies = replies.lock().expect("reply capture");
+        let correction = replies.iter().find_map(|reply| match reply {
+            GatewayReply::AuthorityCorrection { correction } => Some(correction),
+            _ => None,
+        });
+        let correction = correction.expect("observer receives correction");
+        correction
+            .verify(signer.public())
+            .expect("correction uses pinned gateway identity");
+        assert_eq!(correction.claims.authoritative_state, b"adjudicated state");
+    }
+
+    #[tokio::test]
+    async fn guilty_shadow_computes_but_revokes_and_broadcasts_nothing() {
+        let (registry, subject_session, router, redistributor, posture, replies) =
+            correction_fixture(AuthorityCorrectionEnforcement::Shadow).await;
+        let entity = PersistId::new(701);
+        subject_session.state.lock().await.leases.insert(
+            entity,
+            SessionLease {
+                entity,
+                lease_id: LeaseId(8),
+                grid: GridId::ROOT,
+                cell: CellId::ROOT,
+                owner: SessionLeaseOwner::Active(subject_session.generation),
+            },
+        );
+        let report = correction_report(subject_session.node, entity);
+        let signer = iroh::SecretKey::from_bytes(&[74; 32]);
+        let metrics = AuthorityCorrectionMetrics::default();
+        let routed: Arc<dyn Router> = router.clone();
+
+        apply_authority_correction(
+            &report,
+            &confirmed_outcome(b"shadow state"),
+            &signer,
+            &posture,
+            &metrics,
+            &routed,
+            &redistributor,
+        )
+        .await;
+
+        assert_eq!(router.parks.load(Ordering::SeqCst), 0);
+        assert_eq!(registry.active_leases(subject_session.node).await.len(), 1);
+        assert!(replies.lock().expect("reply capture").is_empty());
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.evaluated, 1);
+        assert_eq!(snapshot.shadow_suppressed, 1);
+        assert_eq!(snapshot.leases_revoked, 0);
+        assert_eq!(snapshot.broadcasts, 0);
+        assert_eq!(snapshot.recipients, 0);
+    }
+
+    #[tokio::test]
+    async fn only_a_confirmed_verdict_can_trigger_authority_correction() {
+        for verdict in [
+            Verdict::Exonerates,
+            Verdict::EvidenceForged(orrery_protocol::ForgeryProof::ClaimSignatureInvalid),
+            Verdict::Unadjudicable(orrery_protocol::UnadjudicableReason::IncompleteChain),
+        ] {
+            let (_registry, subject_session, router, redistributor, posture, replies) =
+                correction_fixture(AuthorityCorrectionEnforcement::Live).await;
+            let entity = PersistId::new(702);
+            subject_session.state.lock().await.leases.insert(
+                entity,
+                SessionLease {
+                    entity,
+                    lease_id: LeaseId(9),
+                    grid: GridId::ROOT,
+                    cell: CellId::ROOT,
+                    owner: SessionLeaseOwner::Active(subject_session.generation),
+                },
+            );
+            let report = correction_report(subject_session.node, entity);
+            let metrics = AuthorityCorrectionMetrics::default();
+            let routed: Arc<dyn Router> = router.clone();
+            apply_authority_correction(
+                &report,
+                &AdjudicationOutcome {
+                    verdict,
+                    corrected: None,
+                },
+                &iroh::SecretKey::from_bytes(&[76; 32]),
+                &posture,
+                &metrics,
+                &routed,
+                &redistributor,
+            )
+            .await;
+
+            assert_eq!(router.parks.load(Ordering::SeqCst), 0, "{verdict:?}");
+            assert!(replies.lock().expect("reply capture").is_empty());
+            assert_eq!(metrics.snapshot(), AuthorityCorrectionSnapshot::default());
+        }
+    }
+
+    #[tokio::test]
+    async fn correction_broadcast_uses_the_d25_per_recipient_bucket() {
+        let (_registry, _subject, _router, redistributor, _posture, _replies) =
+            correction_fixture(AuthorityCorrectionEnforcement::Live).await;
+        let observer = successor_node(71);
+        let signer = iroh::SecretKey::from_bytes(&[75; 32]);
+        let correction = AuthorityCorrectionV1::sign(
+            AuthorityCorrectionClaimsV1 {
+                issuer: signer.public(),
+                subject: successor_node(70),
+                entity: PersistId::new(1),
+                reconcile_from: Tick::new(1),
+                authoritative_tick: Tick::new(2),
+                authoritative_state: Vec::new(),
+                ruleset: orrery_protocol::RulesetId {
+                    version: 1,
+                    digest: [1; 32],
+                },
+                adjudication: [2; 32],
+            },
+            &signer,
+        );
+        let metrics = AuthorityCorrectionMetrics::default();
+        for _ in 0..65 {
+            redistributor
+                .fan_out_correction(
+                    CoveringPeers::bounded(vec![observer], EXPIRE_FANOUT_MAX_RECIPIENTS),
+                    &correction,
+                    &metrics,
+                )
+                .await;
+        }
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.recipients, 64);
+        assert_eq!(snapshot.dropped, 1);
     }
 }

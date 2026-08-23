@@ -32,8 +32,9 @@ pub use atrest::{
     ENCODING_V0, SCHEMA_V0,
 };
 pub use authority::{
+    AuthorityCorrectionClaimsV1, AuthorityCorrectionV1, AuthorityCorrectionVerificationError,
     ClaimBasis, ClaimId, ClaimKind, DenyReason, ExpireDisposition, ExpireReason, Lease, LeaseFlags,
-    LeaseId, LeaseMsg, SeqPair,
+    LeaseId, LeaseMsg, SeqPair, AUTHORITY_CORRECTION_V1_DOMAIN,
 };
 pub use cell::{
     cell_id_from_metres, metres_from_cell_id, shard_of, CellId, CellRangeError,

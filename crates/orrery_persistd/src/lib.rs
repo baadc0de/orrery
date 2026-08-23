@@ -62,15 +62,17 @@ pub use fence::{
     MemFenceStore, OwnedShard, ShardActivation,
 };
 pub use gateway::{
-    AuthorityMetrics, AuthoritySnapshot, BulkAckAdmission, BulkAckDisposition,
-    CoordinatorHandoutAuthority, DrainReport, DuplicateAuthoritySample, FreshBulkAckAdmission,
-    GatewayAreaMetrics, GatewayAreaSnapshot, GatewayBulkLatencySnapshot, GatewayBulkMetrics,
-    GatewayBulkSample, GatewayBulkSnapshot, GatewayConfig, GatewayError, GatewayIntentMetrics,
-    GatewayIntentSnapshot, GatewayMetrics, GatewayReportMetrics, GatewayReportSnapshot,
-    GatewayServer, GatewayServerLatency, GatewayServerLatencySnapshot,
+    AuthorityCorrectionEnforcement, AuthorityCorrectionMetrics, AuthorityCorrectionPosture,
+    AuthorityCorrectionSnapshot, AuthorityMetrics, AuthoritySnapshot, BulkAckAdmission,
+    BulkAckDisposition, CoordinatorHandoutAuthority, DrainReport, DuplicateAuthoritySample,
+    FreshBulkAckAdmission, GatewayAreaMetrics, GatewayAreaSnapshot, GatewayBulkLatencySnapshot,
+    GatewayBulkMetrics, GatewayBulkSample, GatewayBulkSnapshot, GatewayConfig, GatewayError,
+    GatewayIntentMetrics, GatewayIntentSnapshot, GatewayMetrics, GatewayReportMetrics,
+    GatewayReportSnapshot, GatewayServer, GatewayServerLatency, GatewayServerLatencySnapshot,
     NearestInterestSuccessorPolicy, ParkOnLossPolicy, RegistrarSweepClock, ShardDrainHandle,
     SharedAdjudicator, SharedBulkAckAdmission, SharedSuccessorPolicy, SuccessorCandidate,
-    SuccessorPolicy, SuccessorRequest, GATEWAY_ALPN, MAX_INTEREST_PEERS,
+    SuccessorPolicy, SuccessorRequest, AUTHORITY_CORRECTION_CONTROL, GATEWAY_ALPN,
+    MAX_INTEREST_PEERS,
 };
 pub use intent::{
     item_transfer_verdict, IntentError, IntentExecutor, IntentPrecheck, IntentValidator,

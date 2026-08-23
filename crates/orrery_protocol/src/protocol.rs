@@ -53,9 +53,16 @@
 /// names. Bumping here is what keeps that failure at the handshake, where it is
 /// one refusal with a version in it, instead of at the first token decode.
 ///
+/// Version 5 appends
+/// [`GatewayReply::AuthorityCorrection`](crate::GatewayReply::AuthorityCorrection).
+/// postcard keys enum variants by position and rejects trailing bytes, so a
+/// version-4 peer cannot safely share a session on which that reply may appear.
+/// Exact-equality admission makes the incompatibility a handshake refusal
+/// instead of a decode failure at the first guilty verdict.
+///
 /// The version-1 claims body remains *decodable* — see
 /// [`SESSION_TOKEN_V1_VERSION`](crate::SESSION_TOKEN_V1_VERSION) — but that
 /// window is for a fleet mid-rollout, where identity and the gateways are
 /// separate services with no handshake between them. It is not a second
 /// client-facing window: this one is exact equality and D29 clause 5 closed it.
-pub const PROTOCOL_VERSION: u16 = 4;
+pub const PROTOCOL_VERSION: u16 = 5;
