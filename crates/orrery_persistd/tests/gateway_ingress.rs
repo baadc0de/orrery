@@ -42,6 +42,16 @@ use orrery_protocol::{
 /// the test observes that the receive loop is still alive.
 const PROBE: PersistId = PersistId::new(9_999_999);
 
+/// The short downstream admission budget used by the valve tests below.
+const ROUTE_BUDGET_US: u64 = 10_000;
+
+/// A liveness ceiling expressed in the route budget under test. The ingress
+/// snapshot below proves that a healthy gateway shed nothing; this only keeps
+/// a permanently stalled reply stream from holding a test worker forever.
+const ACK_LIVENESS_ROUTE_BUDGETS: u64 = 3_000;
+const ACK_LIVENESS_TIMEOUT: Duration =
+    Duration::from_micros(ROUTE_BUDGET_US * ACK_LIVENESS_ROUTE_BUDGETS);
+
 /// A gateway with the downstream route valve **off**.
 ///
 /// The saturation test below holds a connection at its route cap by parking
@@ -257,7 +267,7 @@ async fn a_router_that_will_not_answer_is_shed_downstream_and_counted_separately
     let router = Arc::new(ParkingRouter {
         entered: AtomicUsize::new(0),
     });
-    let server = GatewayServer::spawn(valved_gateway_config(10_000), router.clone())
+    let server = GatewayServer::spawn(valved_gateway_config(ROUTE_BUDGET_US), router.clone())
         .await
         .expect("spawn gateway");
     let metrics = Arc::clone(server.metrics());
@@ -324,7 +334,7 @@ async fn a_gateway_that_is_keeping_up_sheds_nothing_downstream() {
     // never refuse anything — a valve that trips on a healthy gateway is a
     // throughput bug wearing a metric.
     let router = Arc::new(AnsweringRouter);
-    let server = GatewayServer::spawn(valved_gateway_config(10_000), router)
+    let server = GatewayServer::spawn(valved_gateway_config(ROUTE_BUDGET_US), router)
         .await
         .expect("spawn gateway");
     let metrics = Arc::clone(server.metrics());
@@ -335,16 +345,37 @@ async fn a_gateway_that_is_keeping_up_sheds_nothing_downstream() {
             .conn
             .send_state(&diff(PersistId::new(entity), RecordKind::ComponentDiff));
     }
-    // Every reply, then a full budget of quiet on top, so a late shed still
-    // lands inside the observation window.
+    // Let the route budget expire before inspecting the valve. This is the
+    // ordering evidence: a slow healthy route would be refused before any
+    // acknowledgement could arrive, so fail on that metric rather than later
+    // calling silence a throughput failure.
+    tokio::time::sleep(Duration::from_micros(ROUTE_BUDGET_US * 4)).await;
+    let shed = metrics.ingress.snapshot();
+    assert_eq!(
+        (shed.shed_slow_route, shed.shed_stale, shed.shed_saturated),
+        (0, 0, 0),
+        "nothing is refused on a gateway that is keeping up: {shed:?}"
+    );
+
+    // The metric establishes the no-shed invariant. The reply wait is only a
+    // liveness ceiling, measured in the budget this test exercises.
     let mut acked = 0;
     while acked < 64 {
-        match client.conn.next_reply(Duration::from_secs(10)).await {
+        match client.conn.next_reply(ACK_LIVENESS_TIMEOUT).await {
             Some(GatewayReply::BulkAck { .. }) => acked += 1,
-            other => panic!("an answering router must acknowledge: {other:?}"),
+            Some(other) => panic!("unexpected reply while awaiting acknowledgements: {other:?}"),
+            None => panic!(
+                "timed out after {ACK_LIVENESS_ROUTE_BUDGETS} route budgets waiting for \
+                 acknowledgement {}/64; this is a liveness failure, not evidence that \
+                 the gateway shed a healthy route",
+                acked + 1,
+            ),
         }
     }
-    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // A second observation catches a late shed rather than one that happened
+    // before the acknowledgements reached this client.
+    tokio::time::sleep(Duration::from_micros(ROUTE_BUDGET_US * 4)).await;
 
     let shed = metrics.ingress.snapshot();
     assert_eq!(
