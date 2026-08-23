@@ -74,6 +74,7 @@
 pub mod executor;
 pub mod invariants;
 pub mod log;
+pub mod migration;
 pub mod quantize;
 pub mod replay;
 pub mod rng;
@@ -83,6 +84,7 @@ pub mod tolerance;
 
 pub use executor::{Executor, TickOutcome, TICK_HZ, TICK_NANOS};
 pub use invariants::{evaluate, Invariant, InvariantKind, InvariantSample, InvariantViolation};
+pub use migration::ComponentMigrator;
 pub use quantize::{QPos, QVel, Quantized};
 pub use replay::{verify_bundle, ReplayError, ReplayHarness, ReplayTrace};
 pub use rng::{tick_rng, tick_seed, TickRng};

@@ -38,6 +38,7 @@ pub mod intent;
 pub mod journal;
 pub mod keyspace;
 pub mod lease;
+pub mod migration;
 pub mod placement;
 pub mod reliable;
 pub mod runtime;
@@ -101,6 +102,10 @@ pub use lease::FdbLeaseStore;
 pub use lease::{
     ClaimResult, LeaseMigrate, LeasePut, LeaseRegistrar, LeaseStore, LeaseStoreError,
     MemLeaseStore, LEASE_TTL_MS,
+};
+pub use migration::{
+    spawn_migration_sweep, MigratingStore, MigrationConfig, MigrationError, MigrationRegistry,
+    MigrationSweepConfig, MigrationSweepTarget, MigrationSweeper,
 };
 pub use placement::{RendezvousHasher, RendezvousNode, RendezvousWeight};
 pub use reliable::{Lane, ReliableSender};

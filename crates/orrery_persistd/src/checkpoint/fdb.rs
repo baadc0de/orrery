@@ -52,7 +52,7 @@
 //! no cluster is reachable.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use foundationdb::{Database, KeySelector, RangeOption};
 use futures::TryStreamExt;
@@ -65,6 +65,7 @@ use crate::FdbContext;
 use crate::actor::{EntityRecord, SnapshotPage, SupersededRow, Tombstone};
 use crate::checkpoint::{CheckpointData, CheckpointError, CheckpointStore, ColdCellReader};
 use crate::fence::{FenceRow, FenceStatus};
+use crate::migration::{migrate_world_value, MigrationRegistry, MigrationSweepTarget};
 
 /// Require the active ownership row in the transaction that writes a
 /// checkpoint. Reading the row establishes the conflict range which fences a
@@ -268,6 +269,7 @@ async fn scan_world(
 /// An FDB-backed checkpoint store.
 pub struct FdbCheckpointStore {
     db: Arc<Database>,
+    migration_sweep_cursors: Mutex<HashMap<(GridId, CellId), Vec<u8>>>,
 }
 
 impl FdbCheckpointStore {
@@ -276,13 +278,17 @@ impl FdbCheckpointStore {
     pub fn from_context(context: &FdbContext) -> Self {
         Self {
             db: context.database(),
+            migration_sweep_cursors: Mutex::new(HashMap::new()),
         }
     }
 
     /// Build a checkpoint store from an already-open database handle.
     #[must_use]
     pub fn from_database(db: Arc<Database>) -> Self {
-        Self { db }
+        Self {
+            db,
+            migration_sweep_cursors: Mutex::new(HashMap::new()),
+        }
     }
 
     /// Connect to the cluster at `cluster_file`.
@@ -570,6 +576,83 @@ impl ColdCellReader for FdbCheckpointStore {
         .map_err(|e: foundationdb::FdbBindingError| {
             CheckpointError::Store(format!("cold read txn: {e}"))
         })
+    }
+}
+
+#[async_trait::async_trait]
+impl MigrationSweepTarget for FdbCheckpointStore {
+    async fn sweep_migrations(
+        &self,
+        registry: &MigrationRegistry,
+        grid: GridId,
+        cell: CellId,
+        limit: usize,
+    ) -> Result<usize, CheckpointError> {
+        if limit == 0 {
+            return Ok(0);
+        }
+        let db = Arc::clone(&self.db);
+        let registry = registry.clone();
+        let cursor_key = (grid, cell);
+        let cursor = self
+            .migration_sweep_cursors
+            .lock()
+            .expect("migration sweep cursor lock")
+            .get(&cursor_key)
+            .cloned();
+        let (rewritten, last_key) = db
+            .run(|trx, _| {
+                let registry = registry.clone();
+                let cursor = cursor.clone();
+                async move {
+                    let start = keyspace::world_range_start(grid, cell);
+                    let end = keyspace::world_range_end(grid, cell);
+                    let range = RangeOption {
+                        begin: cursor.as_ref().map_or_else(
+                            || KeySelector::first_greater_or_equal(start.as_slice()),
+                            |last| KeySelector::first_greater_than(last.as_slice()),
+                        ),
+                        end: KeySelector::first_greater_or_equal(end.as_slice()),
+                        limit: Some(limit),
+                        ..RangeOption::default()
+                    };
+                    let mut stream = trx.get_ranges_keyvalues(range, false);
+                    let mut rewritten = Vec::new();
+                    let mut last_key = None;
+                    while let Some(kv) = stream.try_next().await? {
+                        last_key = Some(kv.key().to_vec());
+                        let migrated =
+                            migrate_world_value(&registry, kv.value()).map_err(|error| {
+                                foundationdb::FdbBindingError::new_custom_error(Box::new(
+                                    CheckpointError::Store(format!("migration sweep: {error}")),
+                                ))
+                            })?;
+                        if let Some(value) = migrated {
+                            rewritten.push((kv.key().to_vec(), value));
+                        }
+                    }
+                    for (key, value) in &rewritten {
+                        trx.set(key, value);
+                    }
+                    Ok((rewritten.len(), last_key))
+                }
+            })
+            .await
+            .map_err(|error: foundationdb::FdbBindingError| {
+                CheckpointError::Store(format!("migration sweep txn: {error}"))
+            })?;
+        let mut cursors = self
+            .migration_sweep_cursors
+            .lock()
+            .expect("migration sweep cursor lock");
+        if let Some(last_key) = last_key {
+            cursors.insert(cursor_key, last_key);
+        } else {
+            // The previous pass reached the range end. Reset so a later full
+            // pass sees rows written behind its old cursor.
+            cursors.remove(&cursor_key);
+        }
+        Ok(rewritten)
     }
 }
 
