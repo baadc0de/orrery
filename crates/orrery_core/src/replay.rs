@@ -129,6 +129,19 @@ impl<R: Ruleset> ReplayHarness<R> {
         Ok(())
     }
 
+    /// Canonical bytes for the currently installed replay state.
+    ///
+    /// This is the same encoding [`state_hash`](crate::state_hash) commits to.
+    /// Adjudication uses it after a confirmed replay so an authority correction
+    /// carries state the peer can install, rather than only a hash that proves
+    /// the old authority was wrong.
+    #[must_use]
+    pub fn canonical_state(&self) -> Option<Vec<u8>> {
+        self.entity
+            .and_then(|entity| self.executor.state(entity))
+            .map(CoreCodec::to_canonical)
+    }
+
     /// Re-execute `window` from `frames`.
     ///
     /// Verifies signatures, chain continuity and input-order legality as it

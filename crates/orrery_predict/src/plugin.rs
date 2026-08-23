@@ -6,6 +6,7 @@ use lightyear::prelude::LocalTimeline;
 
 use crate::budget::RollbackBudget;
 use crate::config::PredictConfig;
+use crate::correction::{reconcile_authority_corrections, AuthorityCorrectionInbox};
 use crate::monitor::ReconciliationMonitor;
 use crate::tick::TickBridge;
 use crate::wiring;
@@ -38,6 +39,7 @@ impl Plugin for OrreryPredictPlugin {
         app.insert_resource(self.config.clone())
             .init_resource::<ReconciliationMonitor>()
             .init_resource::<RollbackBudget>()
+            .init_resource::<AuthorityCorrectionInbox>()
             // Anchored at the universe origin, and still there: re-anchoring
             // from the coordinator's `UniverseEpoch` and the converged clock
             // offset is the sync phase's job (docs/05 §6) and nothing in the
@@ -53,6 +55,7 @@ impl Plugin for OrreryPredictPlugin {
         // bridge is later in the frame than that (`feed_residuals` runs in
         // `PostUpdate`).
         app.add_systems(FixedLast, advance_tick_bridge);
+        app.add_systems(PostUpdate, reconcile_authority_corrections);
 
         wiring::install(app, &self.config);
     }

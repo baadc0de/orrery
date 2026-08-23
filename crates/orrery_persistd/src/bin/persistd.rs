@@ -51,14 +51,19 @@ use tracing_subscriber::EnvFilter;
 
 use orrery_persistd::cluster::{ColdFallbackRouter, Router};
 use orrery_persistd::gateway::SessionTokenV1Authorizer;
+#[cfg(feature = "fdb")]
+use orrery_persistd::intent::FdbRampPostureStore;
 use orrery_persistd::intent::{AttestationEnforcement, BaselineIntentValidator};
+#[cfg(any(feature = "fdb", test))]
+use orrery_persistd::intent::{RampMode, RampPosture};
 use orrery_persistd::journal::{
     spawn_chain, spawn_chain_grpc, AdaptiveCommitMode, ChainConfig, GroupCommitConfig, Journal,
 };
 use orrery_persistd::{
-    ActivationOutcome, AuthorityMetrics, CellRuntime, CheckpointScheduler,
-    CoordinatorHandoutAuthority, DurableChainId, FenceFreshnessConfig, FenceFreshnessMonitor,
-    FenceRow, FenceStore, GatewayConfig, GatewayMetrics, GatewayServer, GatewayServerLatency,
+    ActivationOutcome, AuthorityCorrectionEnforcement, AuthorityCorrectionPosture,
+    AuthorityMetrics, CellRuntime, CheckpointScheduler, CoordinatorHandoutAuthority,
+    DurableChainId, FenceFreshnessConfig, FenceFreshnessMonitor, FenceRow, FenceStore,
+    GatewayConfig, GatewayMetrics, GatewayServer, GatewayServerLatency,
     GatewayServerLatencySnapshot, GrpcChainTransport, IntentExecutor, JournalConfig,
     MemCheckpointStore, RuntimeConfig, ShardActivation,
 };
@@ -172,6 +177,15 @@ struct Cli {
     /// rather than running a mode that can never evaluate anything.
     #[arg(long, value_name = "off|shadow|required", default_value = "off")]
     attestation_enforcement: AttestationEnforcement,
+
+    /// D32 control C4: guilty-verdict authority correction posture.
+    ///
+    /// `shadow` constructs, signs, hashes and addresses exactly the payload
+    /// live mode would emit, while suppressing both registrar revocation and
+    /// broadcast. A durable `ramp/authority_correction` row overrides this
+    /// startup default within the one-second poll interval.
+    #[arg(long, value_name = "off|shadow|live", default_value = "off")]
+    authority_correction: AuthorityCorrectionEnforcement,
 
     /// Hex-encoded iroh secret key, pinning the gateway's NodeId across runs.
     /// When absent a fresh identity is generated per boot.
@@ -1207,6 +1221,14 @@ async fn main() -> anyhow::Result<()> {
                 );
             }
         })?;
+    #[cfg(feature = "fdb")]
+    let authority_correction_poller = fdb_context.as_ref().map(|context| {
+        spawn_authority_correction_poller(
+            FdbRampPostureStore::from_context(context),
+            gateway_config.authority_correction_posture.clone(),
+            cli.authority_correction,
+        )
+    });
     if let Some(monitor) = &fence_freshness_monitor {
         gateway_config.bulk_ack_admission = monitor.clone();
     }
@@ -1372,6 +1394,12 @@ async fn main() -> anyhow::Result<()> {
     drop(handover_runtime);
     tracing::info!("stopping gateway");
     gateway.shutdown().await;
+
+    #[cfg(feature = "fdb")]
+    if let Some(poller) = authority_correction_poller {
+        poller.abort();
+        let _ = poller.await;
+    }
 
     if let Some(monitor) = fence_freshness_monitor {
         monitor.shutdown();
@@ -2202,7 +2230,50 @@ where
         // exactly what it does not check — every durable invariant, which a
         // linked `Ruleset` and the FDB transaction still owe.
         validator,
+        authority_correction_posture: AuthorityCorrectionPosture::new(cli.authority_correction),
         ..GatewayConfig::default()
+    })
+}
+
+#[cfg(feature = "fdb")]
+fn spawn_authority_correction_poller(
+    store: FdbRampPostureStore,
+    posture: AuthorityCorrectionPosture,
+    startup_default: AuthorityCorrectionEnforcement,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(1));
+        loop {
+            interval.tick().await;
+            match store
+                .read(orrery_persistd::AUTHORITY_CORRECTION_CONTROL)
+                .await
+            {
+                Ok(row) => {
+                    let mode = authority_correction_mode(row.as_ref(), startup_default);
+                    posture.set(mode);
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        control = orrery_persistd::AUTHORITY_CORRECTION_CONTROL,
+                        %error,
+                        "could not refresh enforcement posture; retaining last known mode"
+                    );
+                }
+            }
+        }
+    })
+}
+
+#[cfg(any(feature = "fdb", test))]
+fn authority_correction_mode(
+    durable: Option<&RampPosture>,
+    startup_default: AuthorityCorrectionEnforcement,
+) -> AuthorityCorrectionEnforcement {
+    durable.map_or(startup_default, |row| match row.mode {
+        RampMode::Off => AuthorityCorrectionEnforcement::Off,
+        RampMode::Shadow => AuthorityCorrectionEnforcement::Shadow,
+        RampMode::Live => AuthorityCorrectionEnforcement::Live,
     })
 }
 
@@ -2739,6 +2810,7 @@ mod tests {
             ))],
             coordinator_key: Vec::new(),
             attestation_enforcement: AttestationEnforcement::Off,
+            authority_correction: AuthorityCorrectionEnforcement::Off,
             no_journal_retention: false,
             checkpoint_interval_ms: None,
             dev_seed: None,
@@ -3061,6 +3133,54 @@ mod tests {
             ),
             orrery_persistd::intent::IntentVerdict::Admit(_)
         ));
+    }
+
+    #[test]
+    fn authority_correction_flag_defaults_off_and_reaches_the_gateway_posture() {
+        let defaulted = Cli::try_parse_from(["persistd"]).expect("bare invocation parses");
+        assert_eq!(
+            defaulted.authority_correction,
+            AuthorityCorrectionEnforcement::Off
+        );
+
+        for (spelling, expected) in [
+            ("off", AuthorityCorrectionEnforcement::Off),
+            ("shadow", AuthorityCorrectionEnforcement::Shadow),
+            ("live", AuthorityCorrectionEnforcement::Live),
+        ] {
+            let parsed = Cli::try_parse_from([
+                "persistd",
+                "--authority-correction",
+                spelling,
+                "--issuer-key",
+                "1@0000000000000000000000000000000000000000000000000000000000000000",
+            ])
+            .expect("C4 posture parses");
+            let config =
+                gateway_config(&parsed, None, |_cluster_file, _grid, _attestation| Ok(None))
+                    .expect("C4 posture reaches gateway config");
+            assert_eq!(config.authority_correction_posture.get(), expected);
+        }
+    }
+
+    #[test]
+    fn durable_authority_correction_posture_overrides_cli_and_absence_restores_it() {
+        let startup = AuthorityCorrectionEnforcement::Shadow;
+        assert_eq!(authority_correction_mode(None, startup), startup);
+        for (mode, expected) in [
+            (RampMode::Off, AuthorityCorrectionEnforcement::Off),
+            (RampMode::Shadow, AuthorityCorrectionEnforcement::Shadow),
+            (RampMode::Live, AuthorityCorrectionEnforcement::Live),
+        ] {
+            let row = RampPosture {
+                mode,
+                source: orrery_persistd::intent::PostureSource::Operator,
+                set_at_ms: 1,
+                reason: "test override".to_owned(),
+                incident_id: None,
+            };
+            assert_eq!(authority_correction_mode(Some(&row), startup), expected);
+        }
     }
 
     /// Each of the three positions reaches the validator, the epoch cache and

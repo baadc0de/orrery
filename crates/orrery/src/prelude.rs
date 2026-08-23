@@ -6,7 +6,8 @@
 //! pulled in every subsystem's vocabulary would collide with the game's own.
 
 pub use crate::{
-    bind_island_membership, OrreryClientPlugins, OrreryConfig, OrreryIslandBindingPlugin,
+    bind_island_membership, queue_authority_corrections, OrreryClientPlugins, OrreryConfig,
+    OrreryIslandBindingPlugin,
 };
 
 pub use orrery_authority::{IslandBinding, OrreryAuthorityPlugin};
@@ -14,7 +15,10 @@ pub use orrery_core::Ruleset;
 pub use orrery_net::plugin::NetConfig;
 pub use orrery_net::{CoordinatorConfig, IslandMembership, OrreryNetPlugin};
 pub use orrery_persist_client::{OrreryPersistClientPlugin, PersistClientConfig};
-pub use orrery_predict::{OrreryPredictPlugin, PredictConfig};
+pub use orrery_predict::{
+    AuthorityCorrectionReconciler, OrreryPredictPlugin, PredictConfig,
+    SharedAuthorityCorrectionReconciler,
+};
 pub use orrery_protocol::{CellId, IslandId, Tick};
 // `AoiVisibilityPlugin` is not a member of the group — see its docs — so a game
 // that replicates adds it itself, which makes it prelude material.

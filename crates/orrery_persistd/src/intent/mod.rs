@@ -47,9 +47,12 @@ pub use shadow::{
 };
 
 pub mod ramp;
+#[cfg(feature = "fdb")]
+pub use ramp::FdbRampPostureStore;
 pub use ramp::{
-    AbsentControl, CohortEvidence, HonestCohort, Provenance, RampArtifact, RampMeter, RampSnapshot,
-    UnattributedTally, RAMP_ARTIFACT_SCHEMA,
+    AbsentControl, CohortEvidence, HonestCohort, PostureSource, Provenance, RampArtifact,
+    RampMeter, RampMode, RampPosture, RampPostureError, RampSnapshot, UnattributedTally,
+    RAMP_ARTIFACT_SCHEMA,
 };
 
 pub mod stages;

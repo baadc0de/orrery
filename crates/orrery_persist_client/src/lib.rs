@@ -41,6 +41,7 @@
 
 pub mod area;
 pub mod config;
+pub mod corrections;
 pub mod feed;
 pub mod gateway;
 pub mod intents;
@@ -53,6 +54,7 @@ pub mod uplink;
 
 pub use area::{order_nearest_first, sync_aoi_to_loader, AreaLoader, LoadedPage};
 pub use config::PersistClientConfig;
+pub use corrections::{AuthorityCorrectionQueue, AUTHORITY_CORRECTION_QUEUE_CAPACITY};
 pub use feed::{feed_uplink, LocallyAuthoritative, PersistId, UplinkSeq};
 pub use gateway::{GatewayConfig, GatewaySession, GatewayState, SessionEvent};
 pub use intents::{

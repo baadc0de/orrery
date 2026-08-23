@@ -33,6 +33,7 @@
 
 pub mod budget;
 pub mod config;
+pub mod correction;
 pub mod monitor;
 pub mod plugin;
 pub mod tick;
@@ -40,6 +41,10 @@ pub mod wiring;
 
 pub use budget::{PredictPriority, ResimPlan, RollbackBudget};
 pub use config::{ConfigDefect, PredictConfig, HIGH_RATE_SET};
+pub use correction::{
+    authority_correction_plan, reconcile_authority_corrections, AuthorityCorrectionInbox,
+    AuthorityCorrectionPlan, AuthorityCorrectionReconciler, SharedAuthorityCorrectionReconciler,
+};
 pub use monitor::{
     DegradedReason, ErrorTrack, MonitorBands, MonitorSignal, ReconciliationMonitor, TrackKey,
     WitnessConfidence,
