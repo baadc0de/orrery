@@ -48,6 +48,12 @@ pub struct Craft {
     pub score_rock_points: u64,
     /// Craft kill credits delivered to this craft, ever. Monotone and state-hashed.
     pub kills: u32,
+    /// Target being acquired or held; only own inputs and logged breaks change it.
+    pub lock_target: Option<orrery_protocol::PersistId>,
+    /// Monotone acquisition progress while `lock_target` remains unchanged.
+    pub lock_progress: u16,
+    /// Locks acquired, ever. Monotone and state-hashed.
+    pub locks_acquired: u32,
 }
 
 /// A rock's published tier. Its limits are derived from this hashed value,
@@ -219,7 +225,7 @@ pub enum RegolithState {
     BloomDirector(BloomDirector),
 }
 
-const CRAFT_ENCODED_LEN: usize = 106;
+const CRAFT_ENCODED_LEN: usize = 121;
 
 impl Quantized for Craft {
     fn quantize(&mut self) {
@@ -287,9 +293,18 @@ impl CoreCodec for Craft {
         out.extend_from_slice(&self.respawn_in.to_le_bytes());
         out.extend_from_slice(&self.score_rock_points.to_le_bytes());
         out.extend_from_slice(&self.kills.to_le_bytes());
+        match self.lock_target {
+            Some(target) => {
+                out.push(1);
+                out.extend_from_slice(&target.0.to_le_bytes());
+            }
+            None => out.extend_from_slice(&[0; 9]),
+        }
+        out.extend_from_slice(&self.lock_progress.to_le_bytes());
+        out.extend_from_slice(&self.locks_acquired.to_le_bytes());
     }
     fn decode(bytes: &[u8]) -> Result<Self, CodecError> {
-        if bytes.len() != CRAFT_ENCODED_LEN {
+        if bytes.len() != CRAFT_ENCODED_LEN || bytes[106] > 1 {
             return Err(CodecError("regolith craft: wrong length"));
         }
         let i64_at = |o| i64::from_le_bytes(bytes[o..o + 8].try_into().unwrap());
@@ -320,6 +335,13 @@ impl CoreCodec for Craft {
             respawn_in: u16::from_le_bytes(bytes[92..94].try_into().unwrap()),
             score_rock_points: u64::from_le_bytes(bytes[94..102].try_into().unwrap()),
             kills: u32::from_le_bytes(bytes[102..106].try_into().unwrap()),
+            lock_target: (bytes[106] == 1).then(|| {
+                orrery_protocol::PersistId::new(u64::from_le_bytes(
+                    bytes[107..115].try_into().unwrap(),
+                ))
+            }),
+            lock_progress: u16::from_le_bytes(bytes[115..117].try_into().unwrap()),
+            locks_acquired: u32::from_le_bytes(bytes[117..121].try_into().unwrap()),
         })
     }
 }
@@ -533,6 +555,9 @@ impl Craft {
             respawn_in: 0,
             score_rock_points: 0,
             kills: 0,
+            lock_target: None,
+            lock_progress: 0,
+            locks_acquired: 0,
         }
     }
     /// Whether this craft is active.

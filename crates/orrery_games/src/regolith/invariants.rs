@@ -3,7 +3,8 @@ use super::{
     state::{RegolithState, TAU_URAD},
     weapon::WeaponKind,
     BLOOM_CADENCE_TICKS, BLOOM_CENTRAL_RADIUS_MM, BLOOM_MAX_LIVE_ROCKS, DRAG_PER_SEC_PER_MILLE,
-    ISLAND_CRAFT_BUDGET, ISLAND_PICKUP_BUDGET, ISLAND_ROCK_BUDGET, RESPAWN_TICKS,
+    ISLAND_CRAFT_BUDGET, ISLAND_PICKUP_BUDGET, ISLAND_ROCK_BUDGET, LOCK_ACQUISITION_TICKS,
+    RESPAWN_TICKS,
 };
 use orrery_core::invariants::checks;
 use orrery_core::{Invariant, InvariantKind, InvariantSample, InvariantViolation, QVel, TICK_HZ};
@@ -186,6 +187,8 @@ fn value_range(sample: &InvariantSample<'_, RegolithState>) -> Result<(), Invari
                 || craft.yaw_urad >= TAU_URAD
                 || craft.pitch_urad != 0
                 || craft.respawn_in > RESPAWN_TICKS
+                || craft.lock_progress > LOCK_ACQUISITION_TICKS
+                || (craft.lock_target.is_none() != (craft.lock_progress == 0))
                 || (craft.hull > 0 && craft.respawn_in != 0)
                 || (craft.hull == 0 && craft.respawn_in == 0)
             {

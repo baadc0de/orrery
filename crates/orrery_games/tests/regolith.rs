@@ -7,14 +7,14 @@ use orrery_games::game::Game;
 use orrery_games::regolith::{
     archetype::Archetype,
     invariants::INVARIANTS,
-    order::{ChildSpec, Order, Outcome},
+    order::{ChildSpec, LockBreakReason, Order, Outcome},
     pilot::{scenario_at, PilotScenario, PILOT_SCENARIOS, SCENARIO_TICKS},
     state::{BloomDirector, BloomMembership, Craft, Pickup, RegolithState, Rock, RockTier},
     weapon::WeaponKind,
     Regolith, BLOOM_CADENCE_TICKS, BLOOM_CENTRAL_RADIUS_MM, BLOOM_LIFETIME_TICKS, BLOOM_ROCK_COUNT,
     ISLAND_CRAFT_BUDGET, ISLAND_DIRECTOR_BUDGET, ISLAND_PICKUP_BUDGET, ISLAND_ROCK_BUDGET,
-    ISLAND_WINDOW_BUDGET, KILL_SCORE_POINTS, PICKUP_SCORE_POINTS, PICKUP_TTL_TICKS,
-    REGOLITH_RULESET, RESPAWN_TICKS,
+    ISLAND_WINDOW_BUDGET, KILL_SCORE_POINTS, LOCK_ACQUISITION_TICKS, PICKUP_SCORE_POINTS,
+    PICKUP_TTL_TICKS, REGOLITH_RULESET, RESPAWN_TICKS,
 };
 use orrery_protocol::{PersistId, Tick, UniverseSeed};
 use rand_chacha::rand_core::SeedableRng;
@@ -36,11 +36,21 @@ fn sample<'a>(
 }
 
 #[test]
-fn v5_weapon_table_ruleset_identity_and_island_budget_are_pinned() {
-    assert_eq!(REGOLITH_RULESET.version, 5);
+fn v6_weapon_table_ruleset_identity_and_island_budget_are_pinned() {
+    assert_eq!(REGOLITH_RULESET.version, 6);
     assert_eq!(WeaponKind::Stock.weapon().damage_base, 10);
     assert_eq!(WeaponKind::Volley.weapon().rolls, 3);
-    assert_eq!(WeaponKind::Heavy.weapon().reach_mm, 900_000);
+    assert_eq!(WeaponKind::Stock.weapon().optimal_mm, 300_000);
+    assert_eq!(WeaponKind::Volley.weapon().tracking_urad_per_sec, 300_000);
+    assert_eq!(WeaponKind::Heavy.weapon().falloff_mm, 200_000);
+    assert_eq!(WeaponKind::Heavy.weapon().projectile_speed_mms, 180_000);
+    assert_eq!(
+        [WeaponKind::Stock, WeaponKind::Volley, WeaponKind::Heavy].map(|kind| {
+            let weapon = kind.weapon();
+            weapon.optimal_mm + weapon.falloff_mm
+        }),
+        [400_000, 300_000, 900_000]
+    );
     assert_eq!(ISLAND_CRAFT_BUDGET, 8);
     assert_eq!(ISLAND_ROCK_BUDGET, 24);
     assert_eq!(ISLAND_PICKUP_BUDGET, 4);
@@ -190,7 +200,10 @@ fn kill_credit_is_log_delivered_and_replays_from_the_killers_input() {
     let game = Regolith::honest();
     let killer = PersistId::new(1);
     let victim = PersistId::new(2);
-    let killer_start = craft_at(0);
+    let mut killer_start = craft_at(0);
+    killer_start.lock_target = Some(victim);
+    killer_start.lock_progress = LOCK_ACQUISITION_TICKS;
+    killer_start.locks_acquired = 1;
     let mut victim_state = craft_at(0);
     victim_state.hull = 1;
     victim_state.shield = 0;
@@ -289,6 +302,8 @@ fn wreck_respawns_after_120_own_ticks_with_stock_and_score_intact() {
                     z: 0,
                 },
                 from_weapon: WeaponKind::Stock,
+                from_vel: QVel::default(),
+                flight_ticks: Some(1),
             }],
         )
         .expect("craft exists");
@@ -359,6 +374,8 @@ fn rock_credit_is_log_delivered_with_resolver_owned_points() {
                 from: killer,
                 from_pos: QPos::default(),
                 from_weapon: WeaponKind::Stock,
+                from_vel: QVel::default(),
+                flight_ticks: Some(1),
             }],
         )
         .expect("rock exists");
@@ -497,6 +514,9 @@ fn relabelled_weapon_without_matching_hashed_state_fails_stage_one() {
 fn volley_is_three_left_slot_first_rolls_and_uses_its_own_cooldown() {
     let mut shooter = craft_at(0);
     shooter.weapon = WeaponKind::Volley;
+    shooter.lock_target = Some(PersistId::new(2));
+    shooter.lock_progress = LOCK_ACQUISITION_TICKS;
+    shooter.locks_acquired = 1;
     let mut executor = Executor::new(Regolith::honest(), UniverseSeed([9; 32]));
     executor.insert(PersistId::new(1), RegolithState::Craft(shooter));
     executor.insert(PersistId::new(2), RegolithState::Craft(craft_at(1)));
@@ -547,6 +567,8 @@ fn large_split_is_slot_ordered_materialized_and_traced() {
                 from: PersistId::new(1),
                 from_pos: QPos::default(),
                 from_weapon: WeaponKind::Stock,
+                from_vel: QVel::default(),
+                flight_ticks: Some(1),
             }],
         )
         .expect("parent exists");
@@ -603,6 +625,8 @@ fn split_replay_uses_derived_ids_not_creation_order() {
                     from: PersistId::new(1),
                     from_pos: QPos::default(),
                     from_weapon: WeaponKind::Stock,
+                    from_vel: QVel::default(),
+                    flight_ticks: Some(1),
                 }],
             )
             .expect("parent exists")
@@ -644,6 +668,285 @@ fn honest_pilot_keeps_pitch_locked_to_zero() {
         orders.first(),
         Some(Order::Thrust { pitch_urad: 0, .. })
     ));
+}
+
+fn resolved_hits(
+    archetype: Archetype,
+    target_x: i64,
+    target_vel: QVel,
+    weapon: WeaponKind,
+    samples: u64,
+) -> u64 {
+    let target = PersistId::new(2);
+    let mut executor = Executor::new(Regolith::honest(), UniverseSeed([0x35; 32]));
+    (0..samples)
+        .filter(|sample| {
+            let mut craft = Craft::spawned(
+                archetype,
+                QPos {
+                    x: target_x,
+                    y: 0,
+                    z: 0,
+                },
+                0,
+            );
+            craft.vel = target_vel;
+            let full_shield = craft.shield;
+            executor.insert(target, RegolithState::Craft(craft));
+            executor
+                .step_entity(
+                    target,
+                    Tick::new(10_000 + sample),
+                    &[Order::Damage {
+                        amount: 1,
+                        from: PersistId::new(1),
+                        from_pos: QPos::default(),
+                        from_vel: QVel::default(),
+                        from_weapon: weapon,
+                        flight_ticks: Some(1),
+                    }],
+                )
+                .expect("target exists");
+            matches!(
+                executor.state(target),
+                Some(RegolithState::Craft(Craft { shield, .. })) if *shield < full_shield
+            )
+        })
+        .count() as u64
+}
+
+#[test]
+fn fast_orbit_is_measurably_harder_to_hit_over_10000_shots() {
+    const SAMPLES: u64 = 10_000;
+    let slow_hits = resolved_hits(
+        Archetype::Interceptor,
+        200_000,
+        QVel {
+            x: 0,
+            y: 0,
+            z: 12_000,
+        },
+        WeaponKind::Stock,
+        SAMPLES,
+    );
+    let fast_hits = resolved_hits(
+        Archetype::Interceptor,
+        200_000,
+        QVel {
+            x: 0,
+            y: 0,
+            z: 120_000,
+        },
+        WeaponKind::Stock,
+        SAMPLES,
+    );
+    println!(
+        "tracking hit rates over {SAMPLES} shots: slow={slow_hits}/{SAMPLES} ({:.2}%), fast={fast_hits}/{SAMPLES} ({:.2}%)",
+        slow_hits as f64 * 100.0 / SAMPLES as f64,
+        fast_hits as f64 * 100.0 / SAMPLES as f64,
+    );
+    assert!(slow_hits > fast_hits.saturating_mul(5));
+}
+
+#[test]
+fn signature_radius_and_accuracy_falloff_are_live_inputs() {
+    const SAMPLES: u64 = 10_000;
+    let fast_interceptor = resolved_hits(
+        Archetype::Interceptor,
+        200_000,
+        QVel {
+            x: 0,
+            y: 0,
+            z: 120_000,
+        },
+        WeaponKind::Stock,
+        SAMPLES,
+    );
+    let fast_cruiser = resolved_hits(
+        Archetype::Cruiser,
+        200_000,
+        QVel {
+            x: 0,
+            y: 0,
+            z: 120_000,
+        },
+        WeaponKind::Stock,
+        SAMPLES,
+    );
+    let optimal = resolved_hits(
+        Archetype::Interceptor,
+        300_000,
+        QVel::default(),
+        WeaponKind::Stock,
+        SAMPLES,
+    );
+    let edge_of_falloff = resolved_hits(
+        Archetype::Interceptor,
+        400_000,
+        QVel::default(),
+        WeaponKind::Stock,
+        SAMPLES,
+    );
+    assert!(fast_cruiser > fast_interceptor);
+    assert_eq!(optimal, SAMPLES);
+    assert!(edge_of_falloff < optimal && edge_of_falloff > 4_500);
+}
+
+fn fly_one_stock_shot(seed_byte: u8, evade: bool) -> (u64, bool) {
+    let target = PersistId::new(2);
+    let game = Regolith::honest();
+    let mut craft = craft_at(300_000);
+    craft.yaw_urad = orrery_games::regolith::state::TAU_URAD / 4;
+    let full_shield = craft.shield;
+    let mut executor = Executor::new(game, UniverseSeed([seed_byte; 32]));
+    executor.insert(target, RegolithState::Craft(craft));
+    let mut projectile = Some(Order::Damage {
+        amount: 1,
+        from: PersistId::new(1),
+        from_pos: QPos::default(),
+        from_vel: QVel::default(),
+        from_weapon: WeaponKind::Stock,
+        flight_ticks: None,
+    });
+    for tick in 1..=100 {
+        let mut inputs = projectile.take().into_iter().collect::<Vec<_>>();
+        if evade && tick > 1 {
+            inputs.push(Order::Thrust {
+                accel_mmss: 60_000,
+                yaw_urad: 0,
+                pitch_urad: 0,
+            });
+        }
+        let output = executor
+            .step_entity(target, Tick::new(tick), &inputs)
+            .expect("target exists");
+        projectile = output
+            .events
+            .iter()
+            .find_map(|event| game.deliver(event))
+            .map(|(_, order)| order)
+            .filter(|order| matches!(order, Order::Damage { .. }));
+        if projectile.is_none() {
+            let hit = matches!(
+                executor.state(target),
+                Some(RegolithState::Craft(Craft { shield, .. })) if *shield < full_shield
+            );
+            return (tick, hit);
+        }
+    }
+    panic!("projectile did not resolve within its bounded flight time")
+}
+
+#[test]
+fn course_change_after_fire_avoids_a_fixed_seed_projectile() {
+    let stationary = fly_one_stock_shot(0x6A, false);
+    let evasive = fly_one_stock_shot(0x6A, true);
+    println!("fixed seed 0x6a time-of-flight: stationary={stationary:?}, evasive={evasive:?}");
+    assert_eq!(stationary, (60, true));
+    assert_eq!(evasive, (60, false));
+}
+
+#[test]
+fn lock_acquisition_replays_from_the_locker_alone() {
+    let locker = PersistId::new(1);
+    let target = PersistId::new(2);
+    let run = || {
+        let mut executor = Executor::new(Regolith::honest(), UniverseSeed([0xAC; 32]));
+        executor.insert(locker, RegolithState::Craft(craft_at(0)));
+        let mut hashes = Vec::new();
+        for tick in 1..=u64::from(LOCK_ACQUISITION_TICKS) {
+            let output = executor
+                .step_entity(locker, Tick::new(tick), &[Order::Fire { target }])
+                .expect("locker exists");
+            assert!(output.neighbor_reads.is_empty());
+            if tick < u64::from(LOCK_ACQUISITION_TICKS) {
+                assert!(output.events.is_empty(), "lock fired early at tick {tick}");
+            } else {
+                assert!(!output.events.is_empty(), "acquired lock did not fire");
+            }
+            hashes.push(output.state_hash);
+        }
+        (
+            executor.state(locker).expect("locker remains").clone(),
+            hashes,
+        )
+    };
+    let (live, live_hashes) = run();
+    let (replay, replay_hashes) = run();
+    assert_eq!(live_hashes, replay_hashes);
+    assert_eq!(live, replay);
+    assert!(matches!(
+        live,
+        RegolithState::Craft(Craft {
+            lock_target: Some(locked),
+            lock_progress: LOCK_ACQUISITION_TICKS,
+            locks_acquired: 1,
+            ..
+        }) if locked == target
+    ));
+}
+
+fn locked_craft(target: PersistId) -> Craft {
+    let mut craft = craft_at(0);
+    craft.lock_target = Some(target);
+    craft.lock_progress = LOCK_ACQUISITION_TICKS;
+    craft.locks_acquired = 1;
+    craft
+}
+
+#[test]
+fn range_exceeded_and_target_destroyed_break_logged_locks() {
+    let game = Regolith::honest();
+    let locker = PersistId::new(1);
+    let target = PersistId::new(2);
+    for (reason, target_state) in [
+        (LockBreakReason::RangeExceeded, craft_at(500_000)),
+        (LockBreakReason::TargetDestroyed, {
+            let mut destroyed = craft_at(0);
+            destroyed.hull = 0;
+            destroyed.shield = 0;
+            destroyed.respawn_in = RESPAWN_TICKS;
+            destroyed
+        }),
+    ] {
+        let mut executor = Executor::new(game, UniverseSeed([0xB4; 32]));
+        executor.insert(locker, RegolithState::Craft(locked_craft(target)));
+        executor.insert(target, RegolithState::Craft(target_state));
+        let fired = executor
+            .step_entity(locker, Tick::new(1), &[Order::Fire { target }])
+            .expect("locker fires");
+        let projectile = game
+            .deliver(
+                fired
+                    .events
+                    .first()
+                    .expect("locked fire emits a projectile"),
+            )
+            .expect("projectile is delivered")
+            .1;
+        let resolved = executor
+            .step_entity(target, Tick::new(2), &[projectile])
+            .expect("target resolves");
+        let break_event = resolved
+            .events
+            .iter()
+            .find(|event| matches!(event, Outcome::LockBroken { reason: found, .. } if *found == reason))
+            .expect("target emits the scoped lock break");
+        let (recipient, break_order) = game.deliver(break_event).expect("break is delivered");
+        assert_eq!(recipient, locker);
+        executor
+            .step_entity(locker, Tick::new(3), &[break_order])
+            .expect("locker consumes break");
+        assert!(matches!(
+            executor.state(locker),
+            Some(RegolithState::Craft(Craft {
+                lock_target: None,
+                lock_progress: 0,
+                locks_acquired: 1,
+                ..
+            }))
+        ));
+    }
 }
 
 fn run_contest() -> (
@@ -845,6 +1148,8 @@ fn small_drop_is_derived_materialized_and_traced() {
                     from: PersistId::new(1),
                     from_pos: QPos::default(),
                     from_weapon: WeaponKind::Stock,
+                    from_vel: QVel::default(),
+                    flight_ticks: Some(1),
                 }],
             )
             .expect("rock exists");
@@ -918,6 +1223,18 @@ fn pickup_state_and_grammar_are_canonical() {
             bloom_index: 3,
             delta: -1,
         },
+        Order::Damage {
+            amount: 7,
+            from: ship,
+            from_pos: pos,
+            from_vel: QVel { x: 1, y: 2, z: 3 },
+            from_weapon: WeaponKind::Stock,
+            flight_ticks: Some(12),
+        },
+        Order::LockBroken {
+            target: pickup,
+            reason: LockBreakReason::RangeExceeded,
+        },
     ];
     for order in orders {
         assert_eq!(Order::decode(&order.to_canonical()).unwrap(), order);
@@ -948,6 +1265,20 @@ fn pickup_state_and_grammar_are_canonical() {
             director: PersistId::new(700),
             bloom_index: 3,
             delta: 1,
+        },
+        Outcome::DamageDealt {
+            attacker: ship,
+            target: pickup,
+            amount: 7,
+            attacker_pos: pos,
+            attacker_vel: QVel { x: 1, y: 2, z: 3 },
+            attacker_weapon: WeaponKind::Stock,
+            flight_ticks: Some(12),
+        },
+        Outcome::LockBroken {
+            locker: ship,
+            target: pickup,
+            reason: LockBreakReason::TargetDestroyed,
         },
     ];
     for outcome in outcomes {
