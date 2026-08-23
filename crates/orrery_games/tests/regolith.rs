@@ -36,8 +36,8 @@ fn sample<'a>(
 }
 
 #[test]
-fn v6_weapon_table_ruleset_identity_and_island_budget_are_pinned() {
-    assert_eq!(REGOLITH_RULESET.version, 6);
+fn v7_weapon_table_ruleset_identity_and_island_budget_are_pinned() {
+    assert_eq!(REGOLITH_RULESET.version, 7);
     assert_eq!(WeaponKind::Stock.weapon().damage_base, 10);
     assert_eq!(WeaponKind::Volley.weapon().rolls, 3);
     assert_eq!(WeaponKind::Stock.weapon().optimal_mm, 300_000);
@@ -892,6 +892,103 @@ fn locked_craft(target: PersistId) -> Craft {
     craft.lock_progress = LOCK_ACQUISITION_TICKS;
     craft.locks_acquired = 1;
     craft
+}
+
+#[test]
+fn fire_on_a_different_target_switches_the_lock_and_restarts_acquisition() {
+    let locker = PersistId::new(1);
+    let first_target = PersistId::new(2);
+    let second_target = PersistId::new(3);
+    let mut executor = Executor::new(Regolith::honest(), UniverseSeed([0x57; 32]));
+    let mut start = craft_at(0);
+    // Mid-acquisition on the old target: progress banked but not yet locked.
+    start.lock_target = Some(first_target);
+    start.lock_progress = LOCK_ACQUISITION_TICKS - 10;
+    executor.insert(locker, RegolithState::Craft(start));
+
+    // The switch tick: B replaces A and acquisition restarts from one. The
+    // banked progress must not survive, and nothing may fire on this tick.
+    let switched = executor
+        .step_entity(
+            locker,
+            Tick::new(1),
+            &[Order::Fire {
+                target: second_target,
+            }],
+        )
+        .expect("locker exists");
+    assert!(
+        switched.events.is_empty(),
+        "a switched lock must not fire on its switch tick"
+    );
+    assert!(matches!(
+        executor.state(locker),
+        Some(RegolithState::Craft(Craft {
+            lock_target: Some(locked),
+            lock_progress: 1,
+            locks_acquired: 0,
+            ..
+        })) if *locked == second_target
+    ));
+
+    // The switched lock then pays the full acquisition again: no shot until
+    // LOCK_ACQUISITION_TICKS ticks have named the new target.
+    for tick in 2..u64::from(LOCK_ACQUISITION_TICKS) {
+        let output = executor
+            .step_entity(
+                locker,
+                Tick::new(tick),
+                &[Order::Fire {
+                    target: second_target,
+                }],
+            )
+            .expect("locker exists");
+        assert!(
+            output.events.is_empty(),
+            "switched lock fired early at tick {tick}"
+        );
+    }
+    let acquired = executor
+        .step_entity(
+            locker,
+            Tick::new(u64::from(LOCK_ACQUISITION_TICKS)),
+            &[Order::Fire {
+                target: second_target,
+            }],
+        )
+        .expect("locker exists");
+    assert!(!acquired.events.is_empty(), "re-acquired lock did not fire");
+    assert!(matches!(
+        executor.state(locker),
+        Some(RegolithState::Craft(Craft {
+            lock_target: Some(locked),
+            lock_progress: LOCK_ACQUISITION_TICKS,
+            locks_acquired: 1,
+            ..
+        })) if *locked == second_target
+    ));
+}
+
+#[test]
+fn fire_on_the_locked_target_keeps_banked_acquisition() {
+    let locker = PersistId::new(1);
+    let target = PersistId::new(2);
+    let mut executor = Executor::new(Regolith::honest(), UniverseSeed([0x58; 32]));
+    let mut start = craft_at(0);
+    start.lock_target = Some(target);
+    start.lock_progress = LOCK_ACQUISITION_TICKS / 2;
+    executor.insert(locker, RegolithState::Craft(start));
+    executor
+        .step_entity(locker, Tick::new(1), &[Order::Fire { target }])
+        .expect("locker exists");
+    assert!(matches!(
+        executor.state(locker),
+        Some(RegolithState::Craft(Craft {
+            lock_target: Some(locked),
+            lock_progress,
+            ..
+        })) if *locked == target && *lock_progress == LOCK_ACQUISITION_TICKS / 2 + 1
+    ));
 }
 
 #[test]
