@@ -8,6 +8,9 @@ pub mod intent;
 pub mod session;
 pub mod telemetry;
 
+/// Commit revision embedded in this client binary at build time.
+pub const BUILD_REV: &str = env!("ORRERY_BUILD_REV");
+
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -278,12 +281,12 @@ fn refresh_f3_pane(
             Display::None
         };
         **text = format!(
-            "adjudications {} | latency p50/p99 {}/{} ms\nprediction set {} | loss observed/configured {:.2}/{:.2}%\njitter observed p50/p99 {}/{} ms | configured {} ms\nisland {:?} | cell {:?}\nsession {}\nbanked {:.1} min | idle {:.1} min",
+            "adjudications {} | latency p50/p99 {}/{} ms\nprediction set {} | loss observed/configured {:.2}/{:.2}%\njitter observed p50/p99 {}/{} ms | configured {} ms\nisland {:?} | cell {:?}\nbuild {}\nsession {}\nbanked {:.1} min | idle {:.1} min",
             metrics.adjudications_completed, metrics.adjudication_latency_p50_ms,
             metrics.adjudication_latency_p99_ms, metrics.prediction_set_size,
             metrics.observed_loss_pct, metrics.configured_loss_pct,
             metrics.observed_jitter_p50_ms, metrics.observed_jitter_p99_ms,
-            metrics.configured_jitter_ms, metrics.island_id, metrics.cell_id,
+            metrics.configured_jitter_ms, metrics.island_id, metrics.cell_id, BUILD_REV,
             metrics.session_record_path.display(), metrics.banked_minutes, metrics.idle_minutes,
         );
     }
@@ -306,6 +309,20 @@ mod tests {
     use super::*;
     use orrery_core::state_hash;
     use orrery_games::scenario::{Entry, Play, Scenario, TickRecord};
+
+    #[test]
+    fn build_revision_tracks_the_checkout_commit() {
+        let output = std::process::Command::new("git")
+            .args(["rev-parse", "--verify", "HEAD"])
+            .output()
+            .expect("git is available in this source checkout");
+        assert!(output.status.success(), "git must resolve HEAD");
+        let expected = String::from_utf8(output.stdout)
+            .expect("git emits UTF-8 commit ids")
+            .trim()
+            .to_owned();
+        assert_eq!(BUILD_REV, expected, "the binary stamp must be this commit");
+    }
 
     #[test]
     fn recorded_human_order_log_replays_through_game_harness() {
