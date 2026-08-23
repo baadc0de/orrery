@@ -517,25 +517,37 @@ before this — and `RunIdentity` carries no wall clock, so consecutive nightlie
 on one commit produced byte-identical identities. Thirty-two hours re-run three
 hundred times are thirty-two hours. The accumulation leg varies the seed with
 the date and sweeps 3% → 4% → 5% on a three-day cycle, so each night is a
-distinct sample of the band the criterion names; the ledger deduplicates on
-`RunIdentity` verbatim, so a re-dispatched nightly adds nothing and a re-run at
-a new seed adds a line.
+distinct sample of the band the criterion names. The ledger deduplicates on the
+*measurement* — pipeline digest, seed, impairment and target — so a re-dispatched
+nightly adds a provenance line but no hours, and a re-run at a new seed adds
+both. It deduplicated on `RunIdentity` **verbatim** until #306, and that was the
+defect: `RunIdentity` carries the commit, so two dispatches on one day banked one
+simulated hour twice. Ninety-six of the live pipeline's 288 banked hours were
+duplicates of exactly that kind.
 
-*Running total, and what it is a total of.* **0 banked hours as of this
-change** — the first line lands on the next nightly. A total is only meaningful
+*Running total, and what it is a total of.* **192 distinct hours of 500 (38%)
+on the live pipeline `c6d6caaaa86d649d` as of 2026-08-23** — 64 on each of
+linux, windows and macos, from 288 banked across 9 provenance runs. Read
+`p4-ledger.sh total`, which prints distinct and banked side by side with the
+arithmetic; do not hand-copy this figure, and note that the retired pipeline
+`ca3017478a9ec533` holds 480 distinct of 640 banked, so **no pipeline has yet
+reached 500**. A total is only meaningful
 within a *pipeline version*, so every line carries one: the git tree hashes of
 `orrery_witness`, `orrery_core`, `orrery_games` and `p1-swarm` at the run's own
 commit, hashed together, and `p4-ledger.sh total` groups by it rather than
 summing across it. That is what makes the pre-#44 boundary auditable rather than
 a footnote: hours banked while the swarm played `orrery_conformance`'s corpus
 kernel ran stage 1 against an empty invariant slice and are not hours of the
-same measurement. At `431aa10` that digest is `52afc77a6583c7a6`; the 500 are
-counted against it and reset when any of those four trees changes.
+same measurement. The digest is whatever the run's own commit yields; as of
+2026-08-23 the live one is `c6d6caaaa86d649d`. The 500 are counted against it
+and reset when **any file** under those four trees changes — `p1-swarm/Cargo.lock`
+included, since these are tree hashes rather than source hashes. Whether a
+lockfile-only change *should* reset the count is open; #306 poses it.
 
 *What the ledger can and cannot claim.* Until this change it could claim honest
 player-hours on **`x86_64-unknown-linux-gnu` only**. Every runner that could
-execute the accumulation leg was Linux — the nightly's self-hosted box and
-`ubuntu-latest` — and the criterion says *across all three platforms*, so a
+execute the accumulation leg was Linux — the nightly's since-retired
+self-hosted box and `ubuntu-latest` — and the criterion says *across all three platforms*, so a
 Linux-only ledger could not satisfy it however many hours it held. The `target`
 field is recorded per line and `total` groups on it precisely so that the
 shortfall was visible rather than implied.
