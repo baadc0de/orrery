@@ -5,6 +5,7 @@
 
 pub mod assets;
 pub mod intent;
+pub mod session;
 pub mod telemetry;
 
 use std::collections::BTreeMap;
