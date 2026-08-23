@@ -660,9 +660,8 @@ jobs:
           - { os: windows-latest,   label: x86_64-windows }
           - { os: macos-latest,     label: aarch64-macos }
     runs-on: ${{ matrix.os }}
-    # A cold Windows or macOS leg builds the deterministic spine and #327's
-    # Bevy skin from scratch; the replay corpora and smoke run themselves are
-    # seconds.
+    # A cold Windows or macOS leg builds the headless spine from scratch; the
+    # corpus itself is seconds.
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7
@@ -675,17 +674,14 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             target
-            clients/regolith/target
-          key: det-${{ matrix.label }}-${{ hashFiles('Cargo.toml', 'crates/*/Cargo.toml', 'clients/*/Cargo.toml', 'vendor/*/Cargo.toml', 'rust-toolchain.toml') }}
+          key: det-${{ matrix.label }}-${{ hashFiles('Cargo.toml', 'crates/*/Cargo.toml', 'vendor/*/Cargo.toml', 'rust-toolchain.toml') }}
           restore-keys: det-${{ matrix.label }}-
 
-      # The determinism half remains the headless spine:
-      # orrery_conformance and orrery_games depend on orrery_core and
-      # orrery_protocol and nothing else. These are the crates that *must* be
-      # byte-portable — producing identical bytes everywhere is the core's
-      # entire claim. The Regolith skin checks below are a separate portability
-      # assertion in the same platform matrix; their output is not folded into
-      # the determinism verdict.
+      # The headless spine only: orrery_conformance and orrery_games depend on
+      # orrery_core and orrery_protocol and nothing else, so the whole matrix
+      # stays cheap on every platform. These are also the crates that *must* be
+      # portable — producing identical bytes everywhere is the core's entire
+      # claim.
       #
       # orrery_games is here for the same reason orrery_conformance is, one
       # level up: its committed golden chains (crates/orrery_games/src/golden.rs)
@@ -694,28 +690,14 @@ jobs:
       # what makes "the reference game is deterministic across platforms" a
       # per-commit fact rather than an inference from the corpus kernel.
       #
-      # orrery_witness is deliberately not added to this matrix. Its behavior
-      # is covered by the workspace tests; #327 adds only the concrete client
-      # whose three-OS portability this issue must prove.
+      # orrery_witness is deliberately not here. It enables Bevy by default now
+      # (`bevy` is in its default features, pulling bevy_app/bevy_ecs/orrery_net
+      # plus a full bevy dev-dependency), which would drag winit and its
+      # display stack onto all four runners — and require wayland dev packages
+      # on the Linux ones — for a crate whose portability is not what this
+      # matrix asserts. It is covered by the `workspace tests` job instead.
       - name: Test the headless spine
         run: cargo test -p orrery_core -p orrery_protocol -p orrery_conformance -p orrery_games
-
-      # #327's first non-headless target. Its tests run the human recording
-      # through the same headless adjudicator as bot logs, and the smoke run
-      # exercises DefaultPlugins plus window/render/input startup. The Linux
-      # runners need a virtual display; Windows and macOS hosted runners have
-      # their native window service.
-      - name: Test the Regolith skin
-        run: cargo test --manifest-path clients/regolith/Cargo.toml
-      - name: Install the Regolith virtual display (Linux)
-        if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y xvfb
-      - name: Launch the Regolith skin (Linux)
-        if: runner.os == 'Linux'
-        run: xvfb-run -a cargo run --manifest-path clients/regolith/Cargo.toml -- --smoke-test
-      - name: Launch the Regolith skin (Windows/macOS)
-        if: runner.os != 'Linux'
-        run: cargo run --manifest-path clients/regolith/Cargo.toml -- --smoke-test
 
       # Emits this platform's report. The `check` inside the test above already
       # compared against the committed golden; this artifact is what makes a
