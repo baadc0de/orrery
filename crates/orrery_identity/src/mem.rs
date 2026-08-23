@@ -79,6 +79,17 @@ impl MemAccountStore {
             .collect()
     }
 
+    /// Every account id with a `da` row, in no particular order.
+    ///
+    /// A test that wants to prove some path created *no* account cannot do it
+    /// by probing the one id it happens to know: a bug that writes a different
+    /// id passes such a probe while polluting the store on every call. This
+    /// exposes the whole key set so the absence can be asserted directly.
+    #[must_use]
+    pub fn accounts(&self) -> Vec<AccountId> {
+        Self::lock(&self.state).accounts.keys().copied().collect()
+    }
+
     /// Take the lock, treating poisoning as "read what is there".
     ///
     /// Nothing in this type panics while holding the lock — every refusal is

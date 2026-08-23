@@ -99,4 +99,17 @@ async fn wrong_code_is_refused_before_it_creates_or_binds_an_account() {
             .is_none(),
         "the invalid-code guard runs before account creation"
     );
+    // Checking only `minted.account` would pass for a verify-after-mutate bug
+    // that writes some *other* id: the store gets polluted on every wrong code
+    // and the assertion above looks the other way. The function's contract is
+    // that a bad code touches the store at all, so assert on the whole binding
+    // set rather than on the one row we happen to know the id of.
+    assert!(
+        identity.store().bindings().is_empty(),
+        "a refused code must leave no binding behind, whatever account it names"
+    );
+    assert!(
+        identity.store().accounts().is_empty(),
+        "a refused code must create no account row, whatever id it names"
+    );
 }
