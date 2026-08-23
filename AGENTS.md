@@ -129,11 +129,15 @@ cargo invocations of its own plus the four gate scripts it runs *for real*,
 including the two heavy harnesses that need an FDB cluster and eight peer
 processes. Neither workflow is reproduced here.
 
-**No local timing figure is normative.** The former figures were taken under
-sccache on the retired shared runner box and do not describe either this
-workstation or a GitHub-hosted runner. Time a particular change where it will
-run, record the runner and cache state with the result, and do not turn an old
-cache experiment into a current expectation.
+**The hosted measurements are the current capacity evidence, not local
+timing promises.** On `ubuntu-latest`, #171 measured cold, cacheless wall
+times of 239/244 s for `clippy`, 656 s for `gates`, and 674/681 s for `test`;
+the corresponding peak free disk was 82.78, 68.64, and 39.29 GiB. The current
+`clippy` remote-cache samples (2026-08-21, unchanged tree) were 148/131/121 s
+with 99.9/99.9/100.0% hits and 0.460/0.461/0.461 GiB pulled. Those figures
+describe those hosted runs and their cache posture, not this workstation or a
+future change: time a particular change where it will run and record the
+runner and cache state with the result.
 
 ### Twelve workspaces, and only one of them is "the" workspace
 
@@ -431,14 +435,9 @@ the workflow's version does not reach it. Giving that job a script in
 
 ## Build cache and target directories
 
-Agents work in parallel git worktrees, and a Rust `target/` is enormous: one
-worktree here reached **77 GiB**, a second checkout **182 GiB**, and 17 GiB of
-that was incremental-compilation scratch alone. Left alone this fills the disk,
-and a build that dies with `No space left on device` costs more than it saves.
-
-The arrangement is: **every worktree keeps its own `target/`; kache keeps a
-local object cache for the Unix user running the build.** Do not turn this into
-a shared `CARGO_TARGET_DIR`.
+Agents work in parallel git worktrees, and a Rust `target/` is enormous. Every
+worktree keeps its own `target/`; kache stores compiled objects separately.
+Do not turn this into a shared `CARGO_TARGET_DIR`.
 
 Sharing a `CARGO_TARGET_DIR` instead would look tempting and be wrong — cargo
 takes an exclusive lock on a target directory, so two agents building at once
@@ -452,7 +451,8 @@ worktrees run by the same user.
 |---|---|---|
 | `build.rustc-wrapper = "kache"` | `.cargo/config.toml` | yes — worktrees each get a copy of tracked files, so this is the only way a setting reaches all of them |
 | `build.incremental = false` | `.cargo/config.toml` | yes |
-| kache local store | `~/.cache/kache` | no — the live default store, shared by worktrees of its Unix user |
+| developer kache store | `~/.cache/kache` | no — local to that Unix user; it has no shared remote on this workstation |
+| CI remote | `clippy`'s `kunobi-ninja/kache-action` inputs and its job environment | yes — `s3-bucket: orrery-kache`, `s3-region: eu-central-1`, `s3-prefix: artifacts`, and a 20 GiB local cap |
 
 The standalone tools (`p2-load`, `p3-island`, `p0-*`) each declare their own
 `[workspace]`, so each has its own `target/`. They still inherit the repo's
@@ -460,12 +460,10 @@ The standalone tools (`p2-load`, `p3-island`, `p0-*`) each declare their own
 not add a per-tool `.cargo/config.toml`, which would shadow it and silently
 drop that tool back to uncached builds.
 
-**Incremental compilation is off deliberately, and the two reasons compound.**
-An incremental unit is not cacheable by a plain rustc wrapper, so
-leaving it on would defeat the cache for exactly the crates being worked on,
-while still writing the artifacts to disk. If you are a human tight-looping
-edits on one crate, that trade is not in your favour: use `CARGO_INCREMENTAL=1`
-for that session, which overrides the file.
+**Incremental compilation is off deliberately.** An incremental unit is not
+cacheable by a plain rustc wrapper, so leaving it on writes artifacts while
+defeating the cache for the crate being edited. For a local tight edit loop,
+`CARGO_INCREMENTAL=1` overrides the file for that command.
 
 ### This makes kache a build prerequisite
 
@@ -477,53 +475,59 @@ an empty wrapper, which takes precedence over the config file:
 RUSTC_WRAPPER= cargo build
 ```
 
-### What exists on the named machines
+### What exists on the developer box and CI
 
-**Machine names are part of the claim.** `fortyninety` and `orrery-hel1-1` are
-different hosts. Check before acting:
-
-```
-hostname
-```
-
-**`fortyninety` — the development workstation.** Local **kache 0.14.2** only.
-`.cargo/config.toml` routes `rustc` through it; the store is the default
-`~/.cache/kache` for the invoking user. There is no `~/.config/kache/config.toml`,
-no project `.kache.toml`, no remote, no `/var/cache/kache`, no `kache` group and
-no `kache*` systemd unit. `kache doctor` reports all checks passed and says
-explicitly that no remote cache or planner is configured; its daemon-service
-result is informational for this local-only arrangement.
-
-The commands above were verified on `fortyninety` on 2026-08-22:
+**`fortyninety` is deliberately local-only.** `.cargo/config.toml` routes
+rustc through kache and its store is the invoking user's `~/.cache/kache`, but
+the shared S3 bucket is not configured there. As verified on 2026-08-23,
+`kache doctor` ends with:
 
 ```
-kache --version
-kache doctor
-ls -ld /var/cache/kache
-getent group kache
-systemctl list-unit-files 'kache*' --no-legend
+All checks passed.
+Daemon checks are informational: no remote cache or planner configured (the daemon is optional for local-only use).
 ```
 
-`orrery-hel1-1` is no longer a self-hosted runner. GitHub reports zero runners
-for this repository, and `actions.runner.*` units are absent there. The `ci`
-account remains, but it runs no GitHub Actions jobs. The old filesystem cache is
-still present on that host (`/var/cache/kache/shared`, group `kache`, and the
-pruning timer); it is not CI infrastructure and agents must not rely on it.
+That is expected, not an instruction to add AWS credentials or a remote to a
+developer machine. `./scripts/dev-cache.sh doctor`, `stats`, and `disk` report
+the local arrangement; they cannot validate CI's ephemeral S3 credentials.
 
-These were verified read-only from `fortyninety` on 2026-08-22:
+**The configured machine is the CI `clippy` runner.** For a same-repository
+run, that job assumes `orrery-ci-cache` with GitHub OIDC, then
+`kunobi-ninja/kache-action` installs kache 0.14.2 and exports the S3 settings.
+The 2026-08-21 CI run printed this resolved remote:
 
 ```
-gh api repos/baadc0de/orrery/actions/runners --paginate --jq '.total_count'
-ssh -F /dev/null -o BatchMode=yes orrery-hel1-1.distopik.com \
-  'hostname; id ci; systemctl list-unit-files "actions.runner.*" --no-legend; \
-   systemctl list-units "actions.runner.*" --all --no-legend; \
-   ls -ld /var/cache/kache /var/cache/kache/shared; getent group kache; \
-   systemctl list-unit-files "kache*" --no-legend'
+✓ Remote          s3://orrery-kache/artifacts
+✗ Daemon service  not installed
+                  → kache daemon install
+
+1 issue(s) found.
 ```
 
-This section describes local agent builds and the retired runner host, not the
-workflow cache configuration. Do not infer an unverified infrastructure design
-from it; record the commands, host and result before documenting one.
+The daemon-service line is informational on an ephemeral runner; the workflow
+asserts the exact `s3://orrery-kache/artifacts` line, rather than treating
+`kache doctor`'s exit status as the remote check. Fork pull requests do not
+receive an OIDC token and run cold. `fmt`, `gates`, `test`, the determinism
+matrix, and nightly jobs also use the workflow-level empty `RUSTC_WRAPPER` or
+their own `actions/cache` setup unless a job explicitly installs kache. In
+particular, `gates` and `test` have no S3 kache remote by a measured decision,
+not an omission.
+
+There are no self-hosted runners: `gh api repos/baadc0de/orrery/actions/runners
+--paginate --jq '.total_count'` returned `0` on 2026-08-23. Do not administer
+the retired `orrery-hel1-1` runner services or rely on its cache paths.
+
+**Remote retention lives in S3, not on a host.**
+`infra/s3.tf` provisions the private `orrery-kache` bucket with all public
+access blocked and AES256 SSE-S3, then its
+`aws_s3_bucket_lifecycle_configuration.kache` expires the `artifacts/` prefix
+at `var.cache_expiration_days`. The current value is 14 days since object
+creation, so the bound is `unique bytes uploaded per day × 14`; reads cannot
+extend it. A second, bucket-wide rule aborts incomplete multipart uploads one
+day after initiation (`var.multipart_abort_days`). There is no bespoke pruning
+timer anywhere in this arrangement. Adjusting the retention window means
+changing and applying the Terraform variable after measuring upload rate; it
+does not mean adding a cron job.
 
 ### Working with it
 
@@ -534,9 +538,10 @@ from it; record the commands, host and result before documenting one.
 ./scripts/dev-cache.sh prune    # delete every target/ — safe, and meant to be used
 ```
 
-`prune` is the lever to pull when disk gets tight: sources are in git, though a
-local-only store cannot restore entries deleted with the store itself. It is a
-derived-artifact cleanup, not a source-data cleanup.
+`prune` is the lever to pull when disk gets tight: sources are in git and it
+removes only this checkout's derived `target/` directories. The developer's
+local store may accelerate the rebuild; the CI S3 remote is configured only by
+the CI job, so it is not a local fallback.
 
 Two things follow for agents sharing this machine:
 
@@ -555,8 +560,10 @@ Two things follow for agents sharing this machine:
 
 Several agents work this repository at once, each in its own git worktree. The
 worktrees isolate the filesystem and nothing else: there is one `.git`, one
-build cache, one disk, one FoundationDB dev cluster, one set of harness ports,
-one GitHub remote. Everything below exists because of that asymmetry.
+developer-local build cache, one disk, one FoundationDB dev cluster, one set of
+harness ports, and one GitHub remote. CI's S3 cache is separate infrastructure,
+configured only by the CI job; it is not shared state on this workstation.
+Everything below exists because of the remaining local asymmetry.
 
 **Be clear about what a collision actually is.** Two agents editing the same
 file in two worktrees do *not* clobber each other — separate checkouts, separate
