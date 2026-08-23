@@ -306,6 +306,16 @@ lane_gates() {
     # self-test runs nothing and takes about a second.
     run scripts/gate-status.sh --self-test
 
+    # #332's provenance guard over `assets/`: every asset file manifested with
+    # an allowlisted, redistribution-permitting licence; every entry naming an
+    # existing file whose bytes still match its recorded sha256; no loadable
+    # model outside the managed root; the weight ceilings enforced. Its
+    # self-test breaks one thing per synthetic forest — both directions
+    # included — against the same check the live invocation runs, then proves
+    # the committed tree passes. Needs nothing but python3 (3.11+, stdlib
+    # tomllib) and coreutils; about a second.
+    run scripts/asset-provenance.sh --self-test
+
     # The one Python self-test that can run per-commit. docs/08 §2.2.2's
     # numbers come from `scripts/p2-baseline-report.py` reading
     # `docs/data/p2-phase-baseline-2026-08-19.jsonl`, which is in the tree — so
