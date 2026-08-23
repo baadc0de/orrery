@@ -941,6 +941,101 @@ collect() {
   done
 }
 
+# ── Disk telemetry presence (#305) ───────────────────────────────────────────
+#
+# Nothing here asserts a sampled VALUE. #171 settled that deliberately — the
+# sampler is record-only, with no threshold and no failure condition on any
+# number, because the one lane that sampled had the most headroom while the
+# tightest had none, and the only recorded ENOSPC came from the kache store,
+# which no threshold pre-computes. That stays settled.
+#
+# What went silently wrong instead is PRESENCE. #313 rewrote `p2-kill9` for
+# ephemeral provisioning and the free-disk sampler it carried disappeared in
+# the rewrite; every check stayed green while a lane stopped measuring its
+# disk. Same species as a `--self-test` nothing runs: the absence of a
+# measurement is invisible to every existing gate. So these functions assert
+# only that each job below still emits the `Start the free-disk sampler` /
+# `Disk report` pair — checked per commit, because `--self-test` rides the
+# gates lane.
+#
+# The list is a recorded decision, not a discovery: adding a job to it says
+# "this job's disk is worth measuring"; removing one has to say why.
+#
+#   * `p3-siblings`, `p5-dupe-gauntlet`, `ramp-shadow`, `fdb-tests` — #171's
+#     original four.
+#   * `p1-swarm`, `p4-accumulate`, `p4-platform-ledger`, `p3-island`,
+#     `determinism-soak` — added by #305; previously unmeasured.
+#
+#   * NOT `p2-kill9`: since #313 its gate runs on an ephemeral EC2 instance,
+#     not the runner. The old runner-side sampler measured a filesystem the
+#     gate no longer writes to — dropping it was right, and re-adding it here
+#     would mislabel the controller's disk as if it were comparable with the
+#     nine lanes where runner and workload share a machine. Measuring the
+#     instance's NVMe from inside its bootstrap is a different shape entirely
+#     and is deliberately not attempted in this file.
+#   * NOT `compute-identity-smoke`: STS probes and one small report; kilobytes
+#     on a 10-minute job. A sampler there would read the runner image's
+#     baseline rather than any workload.
+
+readonly -a DISK_TELEMETRY_JOBS=(
+  p1-swarm p4-accumulate p4-platform-ledger p3-island determinism-soak
+  p3-siblings p5-dupe-gauntlet ramp-shadow fdb-tests
+)
+
+# One pass over a workflow file: `<job> <has-sampler> <has-report>` for every
+# job key under `jobs:`, 1 or 0 per step. Step names are matched anchored to
+# whole `- name:` lines so a comment that mentions a name cannot satisfy the
+# count; the job keys are exactly two-space indented, which nothing else in a
+# workflow is.
+disk_telemetry_inventory() {
+  awk '
+    /^jobs:/ { injobs = 1; next }
+    injobs && /^[^ #]/ { injobs = 0 }
+    injobs && /^  [A-Za-z0-9_-]+:$/ {
+      job = substr($0, 3, length($0) - 3); order[++n] = job; next
+    }
+    injobs && job != "" {
+      if ($0 ~ /^[ \t]*- name: Start the free-disk sampler[ \t]*$/) s[job] = 1
+      if ($0 ~ /^[ \t]*- name: Disk report[ \t]*$/) r[job] = 1
+    }
+    END {
+      for (i = 1; i <= n; i++)
+        print order[i], (order[i] in s) ? 1 : 0, (order[i] in r) ? 1 : 0
+    }
+  ' "$1"
+}
+
+# check_disk_telemetry <workflow.yml> <required-job...>
+#
+# Prints one line of violations on stdout and returns 1 unless every required
+# job exists in the file carrying both steps AND no unlisted job carries
+# either. The reverse direction is what keeps the exclusions above honest:
+# reintroducing the sampler into `p2-kill9` without confronting this comment
+# now fails here.
+check_disk_telemetry() {
+  local yml=$1; shift
+  local inv bad="" line want job s r
+  inv=$(disk_telemetry_inventory "$yml")
+  for want in "$@"; do
+    line=$(grep "^$want " <<<"$inv" || true)
+    if [[ -z $line ]]; then
+      bad+="${bad:+; }$want is listed as instrumented but does not exist in $yml"
+      continue
+    fi
+    read -r _ s r <<<"$line"
+    [[ $s == 1 ]] || bad+="${bad:+; }$want no longer emits 'Start the free-disk sampler'"
+    [[ $r == 1 ]] || bad+="${bad:+; }$want no longer emits 'Disk report'"
+  done
+  while read -r job s r; do
+    [[ -n $job ]] || continue
+    if [[ " $* " != *" $job "* ]] && { [[ $s == 1 ]] || [[ $r == 1 ]]; }; then
+      bad+="${bad:+; }$job carries the disk-sampler pair but is not on the instrumented list"
+    fi
+  done <<<"$inv"
+  if [[ -n $bad ]]; then printf '%s\n' "$bad"; return 1; fi
+  return 0
+}
+
 render() {
   local total=0 passed=0 failed=0 unqualified=0 interrupted=0 notrun=0 skipped=0 unknown=0 row st
 
@@ -1426,6 +1521,68 @@ EOF
   st_run --inspect; one_leg_down=$(cat "$dir/report")
   grep -qE '^  FAILED +nightly:p3-island' <<<"$one_leg_down" \
     || die 'self-test: a failed island leg was hidden by a passing one; a per-leg row that cannot go red is not a report'
+
+  # 12. Disk-telemetry presence (#305). The sampler pair is record-only and
+  #     asserts no value — this clause is only about whether the measurement
+  #     exists at all, because #313's p2-kill9 rewrite dropped it from a job
+  #     and nothing noticed. Proven against fixtures first — a check whose
+  #     teeth have never been demonstrated is decoration — then applied to the
+  #     real nightly.yml. Deleting either function fails this clause loudly by
+  #     construction (command-not-found under `set -e`); deleting the job list
+  #     trips `set -u` at the live call below. No haystack here is this file's
+  #     own text: the fixture YAML is data written to disk, and the checker
+  #     greps that, so the #35 self-match anti-pattern cannot arise.
+  local dt="$dir/dt.yml"
+  cat >"$dt" <<'EOF'
+name: fixture
+jobs:
+  alpha:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Start the free-disk sampler
+        run: echo sampling
+      - name: Disk report
+        if: always()
+        run: echo reporting
+  beta:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo bare, like a controller-only job
+  gamma:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Start the free-disk sampler
+        run: echo sampling
+      - name: Disk report
+        if: always()
+        run: echo reporting
+EOF
+  local dt_out
+  # A listed job missing steps is named with the step it lost.
+  dt_out=$(check_disk_telemetry "$dt" alpha beta) \
+    && die 'self-test: a listed job without the sampler pair passed the disk-telemetry check'
+  grep -q "beta no longer emits 'Start the free-disk sampler'" <<<"$dt_out" \
+    || die "self-test: the missing-sampler violation does not name the job ('got': $dt_out)"
+  grep -q "beta no longer emits 'Disk report'" <<<"$dt_out" \
+    || die "self-test: the missing-report violation does not name the job ('got': $dt_out)"
+  # The reverse direction is what keeps the exclusions honest: an unlisted
+  # carrier is refused, so reintroducing p2-kill9's runner-side sampler
+  # without confronting its recorded reason fails here rather than shipping.
+  dt_out=$(check_disk_telemetry "$dt" alpha) \
+    && die 'self-test: an unlisted job carrying the pair was accepted'
+  grep -q 'gamma carries the disk-sampler pair but is not on the instrumented list' <<<"$dt_out" \
+    || die "self-test: the unlisted-carrier refusal does not name the job ('got': $dt_out)"
+  # A listed job renamed out of existence is caught, not silently forgotten.
+  dt_out=$(check_disk_telemetry "$dt" alpha delta) \
+    && die 'self-test: a listed job absent from the workflow was accepted'
+  grep -q 'delta is listed as instrumented but does not exist' <<<"$dt_out" \
+    || die "self-test: the vanished-job violation does not name the job ('got': $dt_out)"
+  # And a clean inventory passes — the check is not a constant failure.
+  check_disk_telemetry "$dt" alpha gamma \
+    || die 'self-test: a fully-instrumented workflow failed the disk-telemetry check'
+  # Live tree: every job on the recorded list still measures its disk.
+  dt_out=$(check_disk_telemetry "$ROOT/.github/workflows/nightly.yml" "${DISK_TELEMETRY_JOBS[@]}") \
+    || die "self-test: nightly.yml violates its own disk-telemetry invariant: $dt_out"
 
   rm -rf "$dir"
   trap - EXIT
