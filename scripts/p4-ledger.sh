@@ -14,10 +14,20 @@
 # `RunIdentity` — seed, the full impairment profile, target triple, commit — is
 # provenance for one run. It is the append key, so restoring a shard or
 # re-dispatching the exact same run adds no second line. The criterion counts
-# measurements, however: pipeline digest + seed + impairment + target. A
-# re-measurement at a different commit of the same pipeline keeps its useful
-# provenance line but must not add a second hour of evidence. The identity
-# carries no wall clock on purpose (`--stamp-wall-clock` puts that outside it).
+# measurements, however: bots are deterministic, so their key is pipeline
+# digest + bot + seed + impairment + target. A re-measurement at a different
+# commit of the same pipeline keeps its useful provenance line but must not add
+# a second hour of evidence. Human input is not deterministic, so a human key
+# adds its session identity rather than collapsing two people who used one seed.
+# The identity carries no wall clock on purpose (`--stamp-wall-clock` puts that
+# outside it).
+#
+# A human report must carry `identity.human_session_id`, a coordinator-issued
+# UUIDv7 allocated once under the coordinator's unique session-id constraint.
+# It is not derived from the seed. The coordinator cannot issue it twice; the
+# ledger also rejects a malformed value, so a weak timestamp or display name
+# cannot quietly become the distinguishing field. #328 must retain this field
+# verbatim in its session record when it sends the report here.
 #
 # Hours are only comparable within a pipeline version, so every line also
 # carries a `pipeline` digest: the git tree hashes of `orrery_witness`,
@@ -93,6 +103,10 @@ self_test() {
     || die 'self-test: total no longer dedups provenance across shards; a restored shard would double its hours'
   has 'unique_by(measurement)' \
     || die 'self-test: total no longer counts distinct measurements; a re-measurement would double its hours'
+  has 'human_session_id' \
+    || die 'self-test: the human session identity is gone; same-seed human hours would collapse'
+  has 'actor' \
+    || die 'self-test: the bot|human dimension is gone; P4 cannot check its required mix'
   has 'def platform' \
     || die 'self-test: the target-to-platform fold is gone; the criterion is counted per platform'
   has 'MISSING' \
@@ -113,19 +127,22 @@ self_test() {
   export P4_PIPELINE_ID=selftestpipeline
 
   # A passing witnessed hour, with the jq expression in $2 applied on top.
+  # $3/$4 are actor and the optional human session identity. Human identities
+  # below are valid UUIDv7s with different counter-bearing low bits.
   st_report() {
-    jq -n --argjson seed "$1" '{
+    jq -n --argjson seed "$1" --arg actor "${3:-bot}" --arg session "${4:-}" '{
       identity: {
         seed: $seed,
         impairment: { loss: 0.03, jitter_ticks: 6, jitter_rate: 0.1, retransmit_ticks: 3 },
         target: "x86_64-unknown-linux-gnu",
-        commit: "0000000000000000000000000000000000000000"
+        commit: "0000000000000000000000000000000000000000",
+        actor: $actor
       },
       started_at_unix_secs: 1750000000,
       peers: 32, seconds: 3600, player_hours: 32.0,
       witnessing: true, total_false_positives: 0, observation_coverage: 1.0,
       deferral_ledger_balances: true, total_gaps: 164022, total_shed: 162
-    }' > "$dir/r.json"
+    } | if $session == "" then . else .identity.human_session_id = $session end' > "$dir/r.json"
     if [[ -n $2 ]]; then
       jq "$2" "$dir/r.json" > "$dir/r.next.json"
       mv "$dir/r.next.json" "$dir/r.json"
@@ -138,6 +155,7 @@ self_test() {
   # exactly how the nightly's macOS leg failed while Linux stayed green.
   st_lines() { if [[ -r $P4_LEDGER_FILE ]]; then awk 'END { print NR }' "$P4_LEDGER_FILE"; else echo 0; fi; }
   st_bank() { "$0" append "$(st_report "$1" "$2")" >/dev/null 2>&1; }
+  st_bank_as() { "$0" append "$(st_report "$1" "$2" "$3" "$4")" >/dev/null 2>&1; }
 
   st_bank 1 '' || die 'self-test: a passing witnessed hour was refused'
   [[ $(st_lines) == 1 ]] || die 'self-test: a passing hour did not append exactly one line'
@@ -165,6 +183,36 @@ self_test() {
   total="$("$0" total | grep -F 'pipeline selftestpipeline  target x86_64-unknown-linux-gnu' | head -1)"
   grep -q 'banked_runs 3.*measurements 2.*distinct_hours 64' <<<"$total" \
     || die "self-test: two distinct seeds did not count as 64 distinct hours ('$total')"
+
+  # Human input is the counterexample to bot seed deduplication. These have
+  # identical seeded conditions but coordinator-issued, distinct session IDs,
+  # so they are two measurements. The filter in the mutation proof below names
+  # this exact check and the call site it has to break.
+  st_bank_as 6 '' human '018f8f4e-5c90-7abc-8123-000000000001' \
+    || die 'self-test: first human session was refused'
+  st_bank_as 6 '.identity.commit = "2222222222222222222222222222222222222222"' human '018f8f4e-5c90-7abc-8123-000000000002' \
+    || die 'self-test: second same-seed human session was refused'
+  total="$("$0" total | grep -F 'pipeline selftestpipeline  target x86_64-unknown-linux-gnu' | head -1)"
+  grep -q 'banked_runs 5.*measurements 4.*distinct_hours 128' <<<"$total" \
+    || die "self-test: two same-seed human sessions did not count as two hours ('$total')"
+
+  # The old behaviour remains deliberate for bots: independent provenance
+  # reports for one seed are one deterministic measurement, even if a caller
+  # supplies irrelevant session-looking metadata.
+  st_bank_as 7 '' bot '018f8f4e-5c90-7abc-8123-000000000003' \
+    || die 'self-test: first bot run was refused'
+  st_bank_as 7 '.identity.commit = "3333333333333333333333333333333333333333"' bot '018f8f4e-5c90-7abc-8123-000000000004' \
+    || die 'self-test: second same-seed bot run was refused'
+  total="$("$0" total | grep -F 'pipeline selftestpipeline  target x86_64-unknown-linux-gnu' | head -1)"
+  grep -q 'banked_runs 7.*measurements 5.*distinct_hours 160' <<<"$total" \
+    || die "self-test: two same-seed bot runs did not count as one hour ('$total')"
+  view="$("$0" total 2>&1)"
+  grep -q 'bot: 96 distinct hours = 32.0 + 32.0 + 32.0 (3 distinct measurement(s))' <<<"$view" \
+    || die "self-test: the pipeline bot-hour breakdown is wrong ('$view')"
+  grep -q 'human: 64 distinct hours = 32.0 + 32.0 (2 distinct measurement(s))' <<<"$view" \
+    || die "self-test: the pipeline human-hour breakdown is wrong ('$view')"
+  grep -q 'human mix: 64 / 160 distinct hours = 40% (requires ≥25%)' <<<"$view" \
+    || die "self-test: the pipeline human mix arithmetic is wrong ('$view')"
 
   # Each of these is a run that must add no hours at all. The count is checked
   # as well as the exit status: a refusal that has already written the line is
@@ -371,21 +419,34 @@ cmd_append() {
   awk -v h="$hours" 'BEGIN { exit !(h > 0) }' \
     || die "refusing to bank: the run accumulated $hours player-hours"
 
-  local commit key measurement_key pipeline seed target
+  local commit key measurement_key pipeline seed target actor human_session_id
   commit=$(jq -r '.identity.commit // "unknown"' "$report")
   seed=$(jq -r '.identity.seed' "$report")
   target=$(jq -r '.identity.target' "$report")
+  # Existing swarm reports predate the dimension and are all deterministic bot
+  # runs. Keep them readable and bankable as bots; human reports must opt in.
+  actor=$(jq -r '.identity.actor // "bot"' "$report")
+  [[ $actor == bot || $actor == human ]] \
+    || die "refusing to bank: identity.actor must be bot or human, got '$actor'"
+  human_session_id=$(jq -r '.identity.human_session_id // empty' "$report")
+  if [[ $actor == human ]]; then
+    [[ $human_session_id =~ ^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$ ]] \
+      || die 'refusing to bank: a human hour needs a coordinator-issued UUIDv7 identity.human_session_id'
+  fi
   # `run_key` is provenance for an individual run. It intentionally includes
   # commit, so an independently re-run report is retained for reproducibility.
   key=$(jq -cS '.identity' "$report" | sha256_hex | cut -c1-16)
   pipeline=$(pipeline_id "$commit")
   # P4's denominator is measurements rather than runs. The digest is the
-  # comparable-pipeline boundary; within it, these are the seeded inputs that
-  # choose a simulated hour. Canonicalize before hashing so JSON field order
-  # cannot alter the count.
-  measurement_key=$(jq -cS --arg pipeline "$pipeline" \
-    '{pipeline: $pipeline, seed: .identity.seed, impairment: .identity.impairment,
-      target: .identity.target}' "$report" | sha256_hex | cut -c1-16)
+  # comparable-pipeline boundary; within it bot inputs choose a deterministic
+  # simulated hour. A human session is deliberately an additional input: two
+  # humans on the same seed are two pieces of false-positive evidence.
+  # Canonicalize before hashing so JSON field order cannot alter the count.
+  measurement_key=$(jq -cS --arg pipeline "$pipeline" --arg actor "$actor" \
+    '{pipeline: $pipeline, actor: $actor, seed: .identity.seed,
+      impairment: .identity.impairment, target: .identity.target}
+     + (if $actor == "human" then {human_session_id: .identity.human_session_id} else {} end)' \
+    "$report" | sha256_hex | cut -c1-16)
 
   mkdir -p "$(dirname "$LEDGER")"
   # One writer at a time. The nightly is a single job today, and a ledger whose
@@ -403,10 +464,12 @@ cmd_append() {
     --arg pipeline "$pipeline" \
     --arg banked_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
     '{
-      schema: 1,
+      schema: 2,
       run_key: $key,
       measurement_key: $measurement_key,
       pipeline: $pipeline,
+      actor: (.identity.actor // "bot"),
+      human_session_id: (if (.identity.actor // "bot") == "human" then .identity.human_session_id else null end),
       banked_at: $banked_at,
       seed: .identity.seed,
       impairment: .identity.impairment,
@@ -422,7 +485,7 @@ cmd_append() {
       shed: .total_shed
     }' "$report" >> "$LEDGER"
 
-  note "banked $hours player-hours: run_key $key, measurement_key $measurement_key, seed $seed, loss $loss, target $target, pipeline $pipeline"
+  note "banked $hours $actor player-hours: run_key $key, measurement_key $measurement_key, seed $seed, loss $loss, target $target, pipeline $pipeline"
 }
 
 # The criterion's figure, and the thing `total` is progress against.
@@ -446,7 +509,9 @@ readonly HOURS_GOAL=500
 readonly JQ_PRELUDE='
   def banked: unique_by(.run_key);
   def measurement:
-    (.measurement_key // ([.pipeline, .seed, .impairment, .target] | tojson));
+    (.measurement_key // ([.pipeline, (.actor // "bot"), .seed, .impairment,
+                          .target, (.human_session_id // null)] | tojson));
+  def actor: (.actor // "bot");
   def distinct: banked | unique_by(measurement);
   # serde emits 32.0 where the swarm accumulated exactly 32 hours, and jq keeps
   # the literal. A ledger read by a human should not print two spellings of the
@@ -478,10 +543,12 @@ cmd_total() {
         banked_hours: (map(.player_hours) | add | hrs),
         measurements: (unique_by(measurement) | length),
         distinct_hours: (unique_by(measurement) | map(.player_hours) | add | hrs),
-        commits: (map(.commit[0:12]) | unique | length)
+        commits: (map(.commit[0:12]) | unique | length),
+        bot_measurements: (unique_by(measurement) | map(select(actor == "bot")) | length),
+        human_measurements: (unique_by(measurement) | map(select(actor == "human")) | length)
       })
     | sort_by(.pipeline, .target)[]
-    | "pipeline \(.pipeline)  target \(.target)  banked_runs \(.banked_runs)  commits \(.commits)  measurements \(.measurements)  distinct_hours \(.distinct_hours)  banked_hours \(.banked_hours)"
+    | "pipeline \(.pipeline)  target \(.target)  banked_runs \(.banked_runs)  commits \(.commits)  measurements \(.measurements) (bot \(.bot_measurements), human \(.human_measurements))  distinct_hours \(.distinct_hours)  banked_hours \(.banked_hours)"
   ' "$LEDGER"
 
   jq -rs "$JQ_PRELUDE"'
@@ -518,6 +585,12 @@ cmd_total() {
         measurements: length,
         h: (map(.player_hours) | add | hrs),
         terms: (map(.player_hours | tostring) | join(" + ")),
+        actors: (group_by(actor)
+                 | map(. as $actor_measurements | {
+                         k: (.[0] | actor),
+                         h: (map(.player_hours) | add | hrs),
+                         terms: (map(.player_hours | tostring) | join(" + ")),
+                         measurements: length })),
         banked: ($banked | map(select(.pipeline == $measurements[0].pipeline))),
         by: (group_by(.target | platform)
              | map(. as $platform_measurements | {
@@ -533,6 +606,14 @@ cmd_total() {
     | sort_by(-.h)[]
     | . as $g
     | "  pipeline \($g.p): \($g.h) distinct hours = \($g.terms) (\($g.measurements) distinct measurement(s)); \($g.banked | length) provenance run(s) / \($g.banked | map(.player_hours) | add | hrs) banked hours; \($g.h) of \($goal) hours (\(($g.h * 100 / $goal) | floor)%)",
+      ( ["bot", "human"]
+        | map(. as $want | { k: $want, hit: ($g.actors | map(select(.k == $want)) | first) })
+        | map(if .hit
+              then "    \(.k): \(.hit.h) distinct hours = \(.hit.terms) (\(.hit.measurements) distinct measurement(s))"
+              else "    \(.k): 0 distinct hours = 0 (0 distinct measurement(s))"
+              end)[] ),
+      ( ($g.actors | map(select(.k == "human")) | first | .h // 0) as $human
+        | "    human mix: \($human) / \($g.h) distinct hours = \(($human * 100 / $g.h) | floor)% (requires ≥25%)" ),
       ( ["linux", "windows", "macos"]
         | map(. as $want | { k: $want, hit: ($g.by | map(select(.k == $want)) | first) })
         | map(if .hit
