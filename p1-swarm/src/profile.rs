@@ -150,7 +150,7 @@ mod tests {
 
     #[test]
     fn cruise_cuts_thrust_at_speed() {
-        // Skirmish does have drag, and a per-archetype speed clamp above it —
+        // Regolith does have drag, and a per-archetype speed clamp above it —
         // but both sit far above the 32 m/s these bots roam at, so neither is
         // what holds a bot at cruise. This cutoff is. Without it the clamp
         // would be, and every bot would sit pinned at its archetype ceiling:
