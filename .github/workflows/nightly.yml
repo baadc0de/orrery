@@ -179,6 +179,16 @@ jobs:
     timeout-minutes: 75
     steps:
       - uses: actions/checkout@v7
+      # #171's record-only free-disk sampler, added here by #305: sample free
+      # bytes on / every 2 s for the life of the job and report the minimum in
+      # the closing Disk report. Same loop as the FDB jobs below; asserts
+      # nothing, so it cannot fire for the wrong reason.
+      - name: Start the free-disk sampler
+        run: |
+          set -euo pipefail
+          nohup bash -c 'while :; do df -B1 --output=avail / | tail -1; sleep 2; done' \
+            > "$RUNNER_TEMP/avail.txt" 2>/dev/null &
+          echo "sampling free bytes on / every 2 s into $RUNNER_TEMP/avail.txt"
       - name: Install the pinned toolchain
         run: rustup show active-toolchain || rustup toolchain install
       # Unconditional since #179: there is one environment left in this job.
@@ -202,6 +212,23 @@ jobs:
           path: target/p1-swarm/
           retention-days: 14
           if-no-files-found: warn
+
+      - name: Disk report
+        if: always()
+        run: |
+          set -euo pipefail
+          {
+            echo '### Free disk at peak'
+            echo '```'
+            df -h /
+            if [[ -s "${RUNNER_TEMP:-}/avail.txt" ]]; then
+              echo "min_free_bytes     $(sort -n "${RUNNER_TEMP:-}/avail.txt" | head -1)"
+              echo "df_samples         $(wc -l < "${RUNNER_TEMP:-}/avail.txt")"
+            else
+              echo 'no samples collected'
+            fi
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
 
   p4-accumulate:
     name: P4 hour accumulation (${{ matrix.platform }}, one witnessed hour, swept across the loss band)
@@ -313,6 +340,16 @@ jobs:
         run: git config --global core.autocrlf input
 
       - uses: actions/checkout@v7
+      # #171's record-only free-disk sampler, added here by #305. Same loop as
+      # the FDB jobs and byte-identical to them; asserts nothing. On the macOS
+      # leg BSD df lacks -B/--output, so the series stays empty and the Disk
+      # report says 'no samples collected' rather than inventing a figure.
+      - name: Start the free-disk sampler
+        run: |
+          set -euo pipefail
+          nohup bash -c 'while :; do df -B1 --output=avail / | tail -1; sleep 2; done' \
+            > "$RUNNER_TEMP/avail.txt" 2>/dev/null &
+          echo "sampling free bytes on / every 2 s into $RUNNER_TEMP/avail.txt"
       - name: Install the pinned toolchain
         run: rustup show active-toolchain || rustup toolchain install
 
@@ -486,6 +523,23 @@ jobs:
           retention-days: 14
           if-no-files-found: warn
 
+      - name: Disk report
+        if: always()
+        run: |
+          set -euo pipefail
+          {
+            echo '### Free disk at peak'
+            echo '```'
+            df -h /
+            if [[ -s "${RUNNER_TEMP:-}/avail.txt" ]]; then
+              echo "min_free_bytes     $(sort -n "${RUNNER_TEMP:-}/avail.txt" | head -1)"
+              echo "df_samples         $(wc -l < "${RUNNER_TEMP:-}/avail.txt")"
+            else
+              echo 'no samples collected'
+            fi
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
   p4-platform-ledger:
     name: P4 cross-platform comparison and combined ledger
     # `always()`: the interesting case is precisely the one where a platform leg
@@ -513,6 +567,15 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7
+      # #171's record-only free-disk sampler, added here by #305. Same loop as
+      # the FDB jobs below; asserts nothing. This job compiles nothing, so its
+      # series should stay near-flat — which is the point of having it.
+      - name: Start the free-disk sampler
+        run: |
+          set -euo pipefail
+          nohup bash -c 'while :; do df -B1 --output=avail / | tail -1; sleep 2; done' \
+            > "$RUNNER_TEMP/avail.txt" 2>/dev/null &
+          echo "sampling free bytes on / every 2 s into $RUNNER_TEMP/avail.txt"
 
       - name: Collect every probe report
         uses: actions/download-artifact@v7
@@ -612,6 +675,23 @@ jobs:
           retention-days: 90
           if-no-files-found: warn
 
+      - name: Disk report
+        if: always()
+        run: |
+          set -euo pipefail
+          {
+            echo '### Free disk at peak'
+            echo '```'
+            df -h /
+            if [[ -s "${RUNNER_TEMP:-}/avail.txt" ]]; then
+              echo "min_free_bytes     $(sort -n "${RUNNER_TEMP:-}/avail.txt" | head -1)"
+              echo "df_samples         $(wc -l < "${RUNNER_TEMP:-}/avail.txt")"
+            else
+              echo 'no samples collected'
+            fi
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
   p3-island:
     name: P3 island gate (kill -9, 8 peers)
     # No cluster and no fixed port: every listener in scripts/p3-island-gate.sh
@@ -648,6 +728,15 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7
+      # #171's record-only free-disk sampler, added here by #305. Same loop as
+      # the FDB jobs below; asserts nothing. Worth having on the job that
+      # builds two release trees and runs eight peers.
+      - name: Start the free-disk sampler
+        run: |
+          set -euo pipefail
+          nohup bash -c 'while :; do df -B1 --output=avail / | tail -1; sleep 2; done' \
+            > "$RUNNER_TEMP/avail.txt" 2>/dev/null &
+          echo "sampling free bytes on / every 2 s into $RUNNER_TEMP/avail.txt"
       - name: Install the pinned toolchain
         run: rustup show active-toolchain || rustup toolchain install
       - uses: actions/cache@v6
@@ -716,6 +805,23 @@ jobs:
           path: p3-island-*/
           retention-days: 14
           if-no-files-found: warn
+
+      - name: Disk report
+        if: always()
+        run: |
+          set -euo pipefail
+          {
+            echo '### Free disk at peak'
+            echo '```'
+            df -h /
+            if [[ -s "${RUNNER_TEMP:-}/avail.txt" ]]; then
+              echo "min_free_bytes     $(sort -n "${RUNNER_TEMP:-}/avail.txt" | head -1)"
+              echo "df_samples         $(wc -l < "${RUNNER_TEMP:-}/avail.txt")"
+            else
+              echo 'no samples collected'
+            fi
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
 
   p3-siblings:
     name: P3 sibling gateways (two persistd, disjoint shards, FoundationDB)
@@ -1098,6 +1204,15 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
+      # #171's record-only free-disk sampler, added here by #305. Same loop as
+      # the FDB jobs below; asserts nothing. The soak is the cheapest job in
+      # the file, so its series doubles as a near-baseline image reading.
+      - name: Start the free-disk sampler
+        run: |
+          set -euo pipefail
+          nohup bash -c 'while :; do df -B1 --output=avail / | tail -1; sleep 2; done' \
+            > "$RUNNER_TEMP/avail.txt" 2>/dev/null &
+          echo "sampling free bytes on / every 2 s into $RUNNER_TEMP/avail.txt"
       - name: Install the pinned toolchain
         run: rustup show active-toolchain || rustup toolchain install
 
@@ -1135,6 +1250,23 @@ jobs:
           path: /tmp/soak-*.json
           retention-days: 14
           if-no-files-found: warn
+
+      - name: Disk report
+        if: always()
+        run: |
+          set -euo pipefail
+          {
+            echo '### Free disk at peak'
+            echo '```'
+            df -h /
+            if [[ -s "${RUNNER_TEMP:-}/avail.txt" ]]; then
+              echo "min_free_bytes     $(sort -n "${RUNNER_TEMP:-}/avail.txt" | head -1)"
+              echo "df_samples         $(wc -l < "${RUNNER_TEMP:-}/avail.txt")"
+            else
+              echo 'no samples collected'
+            fi
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
 
   fdb-tests:
     name: fdb-gated tests (persistd + seed, against a real cluster)
