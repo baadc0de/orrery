@@ -12,7 +12,7 @@ mod wire;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use bytes::Bytes;
@@ -169,6 +169,35 @@ enum Command {
         #[arg(long)]
         report: PathBuf,
     },
+    /// Measure paired honest trade commits with and without gateway-side
+    /// attestation verification (issue #153). This is not a gauntlet arm and
+    /// does not change the nightly gate's assertions or report.
+    Measure {
+        #[arg(long)]
+        control_addr: String,
+        #[arg(long)]
+        control_node: String,
+        #[arg(long)]
+        attested_addr: String,
+        #[arg(long)]
+        attested_node: String,
+        #[arg(long)]
+        cluster_file: PathBuf,
+        #[arg(long)]
+        control_stages: PathBuf,
+        #[arg(long)]
+        attested_stages: PathBuf,
+        #[arg(long)]
+        report: PathBuf,
+        /// Samples in each population. Ten thousand leaves 100 observations
+        /// in the upper one percent instead of presenting a tiny tail as p99.
+        #[arg(long, default_value_t = 10_000)]
+        samples: usize,
+        /// Simultaneous submissions per population. Each worker owns one
+        /// session to each gateway and submits its pair concurrently.
+        #[arg(long, default_value_t = 16)]
+        concurrency: usize,
+    },
 }
 
 #[tokio::main]
@@ -230,6 +259,30 @@ async fn main() -> Result<()> {
                 shadow_log,
                 posture_file,
                 report,
+            })
+            .await
+        }
+        Command::Measure {
+            control_addr,
+            control_node,
+            attested_addr,
+            attested_node,
+            cluster_file,
+            control_stages,
+            attested_stages,
+            report,
+            samples,
+            concurrency,
+        } => {
+            run_measurement(MeasurementArgs {
+                control: endpoint_addr(&control_node, &control_addr)?,
+                attested: endpoint_addr(&attested_node, &attested_addr)?,
+                cluster_file,
+                control_stages,
+                attested_stages,
+                report,
+                samples,
+                concurrency,
             })
             .await
         }
@@ -955,6 +1008,533 @@ async fn run_gauntlet(
     println!("{}", String::from_utf8_lossy(&encoded));
     anyhow::ensure!(passed, "one or more gauntlet arms failed");
     Ok(())
+}
+
+// ── Honest trade verification-overhead measurement (issue #153) ────────
+//
+// This deliberately lives beside, not inside, `run_gauntlet`. The nightly
+// gate's commands, arms, report schema and fixed ids remain unchanged. The
+// only shared pieces are the production gateway constructor and the honest
+// epoch/trade helpers whose exact shape the measurement must reuse.
+
+const MEASURE_ASSET_BASE: u64 = 153_000_000;
+const MEASURE_ITEM_BASE: u64 = 153_000_000;
+const MEASURE_CONTROL_INTENT_BASE: u128 = 153_000_000_000;
+const MEASURE_ATTESTED_INTENT_BASE: u128 = 153_100_000_000;
+const MEASURE_CONTROL_WARMUP_INTENT: u128 = 153_900_000_001;
+const MEASURE_ATTESTED_WARMUP_INTENT: u128 = 153_900_000_002;
+const MEASURE_CONTROL_CONVERGENCE_INTENT: u128 = 153_900_000_003;
+const MEASURE_ATTESTED_CONVERGENCE_INTENT: u128 = 153_900_000_004;
+const MEASURE_MIN_SAMPLES: usize = 10_000;
+
+struct MeasurementArgs {
+    control: iroh::EndpointAddr,
+    attested: iroh::EndpointAddr,
+    cluster_file: PathBuf,
+    control_stages: PathBuf,
+    attested_stages: PathBuf,
+    report: PathBuf,
+    samples: usize,
+    concurrency: usize,
+}
+
+#[derive(Debug)]
+struct WorkerSamples {
+    control: Vec<(usize, u64)>,
+    attested: Vec<(usize, u64)>,
+    attestations_verified: usize,
+}
+
+async fn run_measurement(args: MeasurementArgs) -> Result<()> {
+    anyhow::ensure!(
+        args.samples >= MEASURE_MIN_SAMPLES,
+        "--samples must be at least {MEASURE_MIN_SAMPLES}; a smaller population gives p99 too few tail observations"
+    );
+    anyhow::ensure!(
+        (1..=64).contains(&args.concurrency),
+        "--concurrency must be in 1..=64"
+    );
+    let db = FdbIntentExecutor::connect(
+        args.cluster_file
+            .to_str()
+            .context("cluster-file path is not UTF-8")?,
+        GRID,
+    )?
+    .database()
+    .clone();
+    seed_measurement_ledger(&db, args.samples).await?;
+
+    let witness_keys = Arc::new(witnesses());
+    let selected: Vec<NodeId> = witness_keys.iter().map(iroh::SecretKey::public).collect();
+    let mut control_sessions = Vec::with_capacity(args.concurrency);
+    let mut attested_sessions = Vec::with_capacity(args.concurrency);
+    for worker in 0..args.concurrency {
+        let key = secret(u8::try_from(worker + 1).context("worker key seed")?);
+        control_sessions
+            .push(connect_session(&key, SessionStanding::Good, args.control.clone()).await?);
+        attested_sessions
+            .push(connect_session(&key, SessionStanding::Good, args.attested.clone()).await?);
+    }
+    // The enforcing gateway owns epoch initialization. Its first full-N
+    // warmup makes *its own* draw key durable before the control gateway can
+    // race a different key into the row. This ordering is the precondition
+    // exact-K samples need; a simultaneous first commit would deliberately
+    // refuse the loser once while it adopts the durable key.
+    present_epoch(&attested_sessions[0], announcement(&selected)?).await?;
+
+    // Both gateways commit the same fully-attested shape used by the live
+    // gauntlet. The enforcing gateway goes first to establish the durable key;
+    // the shadow control then adopts it without racing initialization.
+    let warmup_key = secret(1);
+    let mut attested_warmup = transfer_intent(
+        &warmup_key,
+        MEASURE_ATTESTED_WARMUP_INTENT,
+        ItemUid::new(MEASURE_ITEM_BASE),
+        AssetId(MEASURE_ASSET_BASE),
+    );
+    fully_attest(&mut attested_warmup, &witness_keys);
+    anyhow::ensure!(
+        matches!(
+            submit(&attested_sessions[0], attested_warmup).await?,
+            IntentOutcome::Committed { .. }
+        ),
+        "enforcing gateway epoch-initialization warmup did not commit"
+    );
+    present_epoch(&control_sessions[0], announcement(&selected)?).await?;
+    let mut control_warmup = transfer_intent(
+        &warmup_key,
+        MEASURE_CONTROL_WARMUP_INTENT,
+        ItemUid::new(MEASURE_ITEM_BASE + 1),
+        AssetId(MEASURE_ASSET_BASE + 1),
+    );
+    fully_attest(&mut control_warmup, &witness_keys);
+    anyhow::ensure!(
+        matches!(
+            submit(&control_sessions[0], control_warmup).await?,
+            IntentOutcome::Committed { .. }
+        ),
+        "control gateway epoch-adoption warmup did not commit"
+    );
+    // A second full-N commit on each process proves both caches are on the
+    // already-durable key before exactly-K samples are constructed. This is
+    // event-ordered, not a fixed-time assertion.
+    let mut control_convergence = transfer_intent(
+        &warmup_key,
+        MEASURE_CONTROL_CONVERGENCE_INTENT,
+        ItemUid::new(MEASURE_ITEM_BASE + 2),
+        AssetId(MEASURE_ASSET_BASE + 2),
+    );
+    fully_attest(&mut control_convergence, &witness_keys);
+    let mut attested_convergence = transfer_intent(
+        &warmup_key,
+        MEASURE_ATTESTED_CONVERGENCE_INTENT,
+        ItemUid::new(MEASURE_ITEM_BASE + 3),
+        AssetId(MEASURE_ASSET_BASE + 3),
+    );
+    fully_attest(&mut attested_convergence, &witness_keys);
+    anyhow::ensure!(
+        matches!(
+            submit(&control_sessions[0], control_convergence).await?,
+            IntentOutcome::Committed { .. }
+        ) && matches!(
+            submit(&attested_sessions[0], attested_convergence).await?,
+            IntentOutcome::Committed { .. }
+        ),
+        "post-race epoch convergence commits did not both succeed"
+    );
+    let epoch_row: keyspace::EpochRow = decode_required(
+        &db,
+        keyspace::epoch_key(GRID, CELL, EPOCH).to_vec(),
+        "durable measurement epoch row",
+    )
+    .await?;
+
+    // Let the 250 ms gateway reporter consume the warmups, then remove their
+    // already-drained records. O_APPEND makes subsequent interval deltas land
+    // at the new EOF; the reporter's in-memory cursor remains advanced.
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    std::fs::write(&args.control_stages, [])
+        .with_context(|| format!("clear control stages {}", args.control_stages.display()))?;
+    std::fs::write(&args.attested_stages, [])
+        .with_context(|| format!("clear attested stages {}", args.attested_stages.display()))?;
+
+    let mut tasks = tokio::task::JoinSet::new();
+    for (worker, (control, attested)) in control_sessions
+        .into_iter()
+        .zip(attested_sessions)
+        .enumerate()
+    {
+        let witness_keys = Arc::clone(&witness_keys);
+        let selected = selected.clone();
+        let draw_key = epoch_row.draw_key;
+        let samples = args.samples;
+        let concurrency = args.concurrency;
+        tasks.spawn(async move {
+            let issuer = secret(u8::try_from(worker + 1).context("worker key seed")?);
+            let mut result = WorkerSamples {
+                control: Vec::new(),
+                attested: Vec::new(),
+                attestations_verified: 0,
+            };
+            for index in (worker..samples).step_by(concurrency) {
+                let offset = u64::try_from(index).context("sample item offset")?;
+                let control_id = MEASURE_CONTROL_INTENT_BASE
+                    + u128::try_from(index).context("control intent offset")?;
+                let attested_id = MEASURE_ATTESTED_INTENT_BASE
+                    + u128::try_from(index).context("attested intent offset")?;
+                let control_intent = transfer_intent(
+                    &issuer,
+                    control_id,
+                    ItemUid::new(MEASURE_ITEM_BASE + 4 + offset),
+                    AssetId(MEASURE_ASSET_BASE + 4 + offset),
+                );
+                let mut attested_intent = transfer_intent(
+                    &issuer,
+                    attested_id,
+                    ItemUid::new(MEASURE_ITEM_BASE + 4 + samples as u64 + offset),
+                    AssetId(MEASURE_ASSET_BASE + 4 + samples as u64 + offset),
+                );
+                let required = required_witnesses(&draw_key, attested_id, &selected);
+                anyhow::ensure!(
+                    required.len() == WITNESS_QUORUM_K,
+                    "required subset has {} members, expected {WITNESS_QUORUM_K}",
+                    required.len()
+                );
+                for node in required {
+                    let key = witness_keys
+                        .iter()
+                        .find(|key| key.public() == node)
+                        .context("required witness is not in the announced key set")?;
+                    attested_intent
+                        .attestations
+                        .push(attested_intent.attest(key));
+                }
+                anyhow::ensure!(
+                    attested_intent.attestations.len() == WITNESS_QUORUM_K
+                        && attested_intent
+                            .attestations
+                            .iter()
+                            .all(|attestation| attestation.verify(&attested_intent)),
+                    "sample {index} does not carry exactly K valid attestations"
+                );
+                result.attestations_verified += attested_intent.attestations.len();
+
+                // One paired observation: both populations see the same
+                // moment and the same offered concurrency, without asserting
+                // that either finishes inside a fixed wall-clock window.
+                let (control_sample, attested_sample) = tokio::join!(
+                    submit_timed(&control, control_intent),
+                    submit_timed(&attested, attested_intent)
+                );
+                let (control_outcome, control_us) = control_sample?;
+                let (attested_outcome, attested_us) = attested_sample?;
+                anyhow::ensure!(
+                    matches!(control_outcome, IntentOutcome::Committed { .. }),
+                    "unattested control sample {index} did not commit: {control_outcome:?}"
+                );
+                anyhow::ensure!(
+                    matches!(attested_outcome, IntentOutcome::Committed { .. }),
+                    "attested sample {index} did not commit: {attested_outcome:?}"
+                );
+                result.control.push((index, control_us));
+                result.attested.push((index, attested_us));
+            }
+            Ok::<_, anyhow::Error>(result)
+        });
+    }
+
+    let mut control = Vec::with_capacity(args.samples);
+    let mut attested = Vec::with_capacity(args.samples);
+    let mut attestations_verified = 0usize;
+    while let Some(joined) = tasks.join_next().await {
+        let worker = joined.context("measurement worker panicked")??;
+        control.extend(worker.control);
+        attested.extend(worker.attested);
+        attestations_verified += worker.attestations_verified;
+    }
+    control.sort_by_key(|sample| sample.0);
+    attested.sort_by_key(|sample| sample.0);
+    anyhow::ensure!(
+        control.len() == args.samples && attested.len() == args.samples,
+        "measurement populations are incomplete: control={} attested={} expected={}",
+        control.len(),
+        attested.len(),
+        args.samples
+    );
+    anyhow::ensure!(
+        attestations_verified == args.samples * WITNESS_QUORUM_K,
+        "verified-attestation count is {attestations_verified}, expected {}",
+        args.samples * WITNESS_QUORUM_K
+    );
+
+    // Drain the final interval before reading the gateway-owned stage totals.
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    let control_stage = stage_report(&args.control_stages, args.samples)?;
+    let attested_stage = stage_report(&args.attested_stages, args.samples)?;
+    let receipts = read_receipts(&db).await?;
+    let control_receipts = receipts
+        .iter()
+        .filter(|row| {
+            (MEASURE_CONTROL_INTENT_BASE..MEASURE_CONTROL_INTENT_BASE + args.samples as u128)
+                .contains(&row.intent_id)
+        })
+        .count();
+    let attested_receipts = receipts
+        .iter()
+        .filter(|row| {
+            (MEASURE_ATTESTED_INTENT_BASE..MEASURE_ATTESTED_INTENT_BASE + args.samples as u128)
+                .contains(&row.intent_id)
+        })
+        .count();
+    anyhow::ensure!(
+        control_receipts == args.samples && attested_receipts == args.samples,
+        "durable receipt populations differ: control={control_receipts} attested={attested_receipts} expected={}",
+        args.samples
+    );
+
+    let control_values: Vec<u64> = control.iter().map(|sample| sample.1).collect();
+    let attested_values: Vec<u64> = attested.iter().map(|sample| sample.1).collect();
+    let control_summary = latency_summary(&control_values);
+    let attested_summary = latency_summary(&attested_values);
+    let control_p99 = control_summary["p99_us"].as_u64().context("control p99")?;
+    let attested_p99 = attested_summary["p99_us"]
+        .as_u64()
+        .context("attested p99")?;
+    let budget_met = attested_p99 < 10_000;
+    let report = json!({
+        "schema": "orrery.p5-honest-trade-verification-overhead/1",
+        "measurement_valid": true,
+        "method": {
+            "attestations": "pre-built",
+            "claim": "verification overhead",
+            "not_end_to_end": [
+                "witness discovery",
+                "request/response latency",
+                "witness execution",
+                "witness signing",
+                "retries",
+                "quorum collection"
+            ],
+            "paired": true,
+            "fresh_item_per_sample": true,
+            "control_posture": "shadow",
+            "attested_posture": "required",
+            "attestations_per_attested_intent": WITNESS_QUORUM_K,
+            "cryptographically_verified_attestations": attestations_verified,
+            "distinct_non_party_witness_accounts": witness_keys.len(),
+            "concurrency_per_population": args.concurrency,
+            "combined_inflight_pairs": args.concurrency,
+        },
+        "populations": {
+            "control": {
+                "series": "honest_trade_unattested_control_commit_ms",
+                "samples": args.samples,
+                "committed": control.len(),
+                "durable_receipts": control_receipts,
+                "latency": control_summary,
+                "gateway_stages": control_stage,
+            },
+            "attested": {
+                "series": "honest_trade_attested_verification_commit_ms",
+                "samples": args.samples,
+                "committed": attested.len(),
+                "durable_receipts": attested_receipts,
+                "latency": attested_summary,
+                "gateway_stages": attested_stage,
+            }
+        },
+        "delta": {
+            "p99_us": i128::from(attested_p99) - i128::from(control_p99),
+            "admit_mean_us": signed_stage_mean_delta(
+                &args.control_stages,
+                &args.attested_stages,
+                "admit_us_sum"
+            )?,
+        },
+        "budget": {
+            "intent_commit_p99_us": 10_000,
+            "comparison": "strictly_less_than",
+            "attested_p99_us": attested_p99,
+            "result": if budget_met { "pass" } else { "miss" },
+        },
+        "recorded_at_unix_ms": unix_ms(),
+    });
+    let encoded = serde_json::to_vec_pretty(&report)?;
+    std::fs::write(&args.report, &encoded)
+        .with_context(|| format!("write measurement report {}", args.report.display()))?;
+    println!("{}", String::from_utf8_lossy(&encoded));
+    Ok(())
+}
+
+async fn submit_timed(session: &Session, intent: Intent) -> Result<(IntentOutcome, u64)> {
+    let started = Instant::now();
+    let outcome = submit(session, intent).await?;
+    Ok((outcome, elapsed_us(started)))
+}
+
+fn elapsed_us(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX)
+}
+
+fn latency_summary(samples: &[u64]) -> Value {
+    let mut ordered = samples.to_vec();
+    ordered.sort_unstable();
+    let percentile = |numerator: usize, denominator: usize| {
+        let rank = (ordered.len() * numerator).div_ceil(denominator);
+        ordered[rank.saturating_sub(1)]
+    };
+    json!({
+        "unit": "microseconds",
+        "min_us": ordered[0],
+        "mean_us": ordered.iter().sum::<u64>() / ordered.len() as u64,
+        "p50_us": percentile(50, 100),
+        "p90_us": percentile(90, 100),
+        "p99_us": percentile(99, 100),
+        "max_us": ordered[ordered.len() - 1],
+    })
+}
+
+fn read_stage_totals(path: &Path, scope: &str) -> Result<std::collections::BTreeMap<String, u64>> {
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("read stage metrics {}", path.display()))?;
+    let mut totals = std::collections::BTreeMap::<String, u64>::new();
+    for line in text.lines() {
+        let Ok(record) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if record.get("type").and_then(Value::as_str) != Some("gateway_intent_stage")
+            || record.get("scope").and_then(Value::as_str) != Some(scope)
+        {
+            continue;
+        }
+        let Some(fields) = record.as_object() else {
+            continue;
+        };
+        for (key, value) in fields {
+            let Some(value) = value.as_u64() else {
+                continue;
+            };
+            if key.ends_with("_max") || key == "fence_read_max_us" {
+                totals
+                    .entry(key.clone())
+                    .and_modify(|current| *current = (*current).max(value))
+                    .or_insert(value);
+            } else {
+                *totals.entry(key.clone()).or_default() += value;
+            }
+        }
+    }
+    Ok(totals)
+}
+
+fn stage_report(path: &Path, expected: usize) -> Result<Value> {
+    let all = read_stage_totals(path, "all")?;
+    let intents = all.get("intents").copied().unwrap_or(0);
+    let executed = all.get("executed").copied().unwrap_or(0);
+    anyhow::ensure!(
+        intents == expected as u64 && executed == expected as u64,
+        "stage population in {} is intents={intents} executed={executed}, expected={expected}",
+        path.display()
+    );
+    let mean = |key: &str, denominator: u64| all.get(key).copied().unwrap_or(0) / denominator;
+    Ok(json!({
+        "intents": intents,
+        "executed": executed,
+        "attempts": all.get("attempts").copied().unwrap_or(0),
+        "mean_us": {
+            "ingress": mean("ingress_us_sum", intents),
+            "admit": mean("admit_us_sum", intents),
+            "spawn_wait": mean("spawn_wait_us_sum", intents),
+            "exec": mean("exec_us_sum", intents),
+            "server": mean("server_us_sum", intents),
+            "reply": mean("reply_us_sum", intents),
+            "server_gap": mean("server_gap_us_sum", intents),
+            "alloc_wait": mean("alloc_wait_us_sum", executed),
+            "alloc_refill": mean("alloc_refill_us_sum", executed),
+            "grv": mean("grv_us_sum", executed),
+            "idem_read": mean("idem_read_us_sum", executed),
+            "fence": mean("fence_us_sum", executed),
+            "commit": mean("commit_us_sum", executed),
+            "backoff": mean("backoff_us_sum", executed),
+            "fdb_gap": mean("fdb_gap_us_sum", executed),
+        },
+        "max_us": {
+            "admit": all.get("admit_us_max").copied().unwrap_or(0),
+            "exec": all.get("exec_us_max").copied().unwrap_or(0),
+            "server": all.get("server_us_max").copied().unwrap_or(0),
+            "commit": all.get("commit_us_max").copied().unwrap_or(0),
+        }
+    }))
+}
+
+fn signed_stage_mean_delta(control: &Path, attested: &Path, key: &str) -> Result<i128> {
+    let control = read_stage_totals(control, "all")?;
+    let attested = read_stage_totals(attested, "all")?;
+    let control_n = control
+        .get("intents")
+        .copied()
+        .context("control stage intents")?;
+    let attested_n = attested
+        .get("intents")
+        .copied()
+        .context("attested stage intents")?;
+    Ok(
+        i128::from(attested.get(key).copied().unwrap_or(0) / attested_n)
+            - i128::from(control.get(key).copied().unwrap_or(0) / control_n),
+    )
+}
+
+async fn seed_measurement_ledger(db: &Database, samples: usize) -> Result<()> {
+    anyhow::ensure!(
+        read_receipts(db).await?.is_empty(),
+        "measurement requires a fresh throwaway cluster: ledger receipts already exist"
+    );
+    for key in [
+        keyspace::ledger_bal_key(BUYER, AssetId(MEASURE_ASSET_BASE)).to_vec(),
+        keyspace::ledger_bal_key(BUYER, AssetId(MEASURE_ASSET_BASE + 1)).to_vec(),
+    ] {
+        anyhow::ensure!(
+            read_raw(db, key).await?.is_none(),
+            "measurement balance rows already exist; cluster is not fresh"
+        );
+    }
+    let count = samples
+        .checked_mul(2)
+        .and_then(|count| count.checked_add(4))
+        .context("measurement item count overflow")?;
+    let rows = (0..count)
+        .map(|offset| {
+            Ok::<_, anyhow::Error>((
+                keyspace::ledger_item_key(ItemUid::new(
+                    MEASURE_ITEM_BASE + u64::try_from(offset).context("item offset")?,
+                ))
+                .to_vec(),
+                postcard::to_stdvec(&keyspace::ItemRow {
+                    owner: SELLER,
+                    state: b"p5-honest-trade-measurement".to_vec(),
+                })?,
+            ))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let balance = i128::from(PRICE);
+    db.run(|trx, _| {
+        let rows = rows.clone();
+        async move {
+            for (key, value) in rows {
+                trx.set(&key, &value);
+            }
+            for offset in 0..count {
+                let asset = AssetId(MEASURE_ASSET_BASE + offset as u64);
+                trx.set(
+                    &keyspace::ledger_bal_key(BUYER, asset),
+                    &balance.to_le_bytes(),
+                );
+            }
+            Ok(())
+        }
+    })
+    .await
+    .map_err(|error: FdbBindingError| anyhow::anyhow!("seed measurement ledger: {error}"))
 }
 
 // ── The ramp arm (issue #222, D32 clause (b) and clause (e)'s sensitivity leg) ─
@@ -1826,5 +2406,34 @@ mod tests {
 
         let members = offender_members(&eligible, &required).expect("subset");
         assert_eq!(members, eligible[..WITNESS_QUORUM_K].to_vec());
+    }
+
+    #[test]
+    fn latency_summary_uses_nearest_rank_over_a_real_p99_population() {
+        let samples: Vec<u64> = (1..=10_000).collect();
+        let summary = latency_summary(&samples);
+
+        assert_eq!(summary["p50_us"], 5_000);
+        assert_eq!(summary["p90_us"], 9_000);
+        assert_eq!(summary["p99_us"], 9_900);
+        assert_eq!(summary["max_us"], 10_000);
+    }
+
+    #[test]
+    fn stage_report_refuses_a_population_with_missing_samples() {
+        let path = std::env::temp_dir().join(format!(
+            "orrery-p5-stage-report-{}-{}.jsonl",
+            std::process::id(),
+            unix_ms()
+        ));
+        std::fs::write(
+            &path,
+            r#"{"type":"gateway_intent_stage","scope":"all","intents":9999,"executed":9999,"admit_us_sum":9999}"#,
+        )
+        .expect("write stage fixture");
+
+        let error = stage_report(&path, 10_000).expect_err("missing sample must fail");
+        assert!(error.to_string().contains("expected=10000"));
+        std::fs::remove_file(path).expect("remove stage fixture");
     }
 }

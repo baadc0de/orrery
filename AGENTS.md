@@ -153,10 +153,10 @@ CIs in one week came from that blind spot. The inventory, which is also
 | `p0-dashboard` | `cargo check --all-targets` — no tests |
 | `p3-island` | `cargo test` in `gates`; asserted by the nightly island gate |
 | `p3-siblings` | `cargo test` in `gates`; the two-gateway harness, asserted by the nightly sibling gate. The only tool that links `libfdb_c` besides `p2-load`: its double-spend race leg reads the ledger back out of FoundationDB |
-| `p5-dupe-gauntlet` | `cargo check --all-targets` — no tests; the single-gateway replay, attestation-abuse and quarantine proof, asserted by the nightly P5 gate against FoundationDB. Its `ramp` subcommand carries D32's enforcement-ramp arms too, asserted by the nightly `ramp-shadow` gate, which runs a shadow and an enforcing gateway from this one binary at the same time |
+| `p5-dupe-gauntlet` | `cargo test`; the single-gateway replay, attestation-abuse and quarantine proof, asserted by the nightly P5 gate against FoundationDB. Its `ramp` subcommand carries D32's enforcement-ramp arms too, asserted by the nightly `ramp-shadow` gate, which runs a shadow and an enforcing gateway from this one binary at the same time. Its additive measurement tests pin #153's p99 population and stage-count guards |
 | `p2-journal-bench` | `cargo check --all-targets` — no tests |
 
-The six tool test suites, and the four tools checked without tests, are the work
+The seven tool test suites, and the three tools checked without tests, are the work
 that would go unrun if the `gates` lane stopped visiting them. Do not hand-copy
 test totals here: `./scripts/check.sh --list` is the executable inventory.
 
@@ -325,8 +325,8 @@ per-commit, alongside every other self-test in `scripts/`.
 
 **The standalone tools are tested per-commit too.** Each declares its own
 `[workspace]`, so `cargo test --workspace` reaches none of them; the `gates`
-lane runs `cargo test` in its six test workspaces and `cargo check --all-targets`
-in its four check-only workspaces — see the inventory above, which is the table
+lane runs `cargo test` in its seven test workspaces and `cargo check --all-targets`
+in its three check-only workspaces — see the inventory above, which is the table
 the lane iterates.
 `p2-load` takes `orrery_persistd` with `features = ["fdb"]`, which is why that
 job installs the FoundationDB *client* on the hosted path.
