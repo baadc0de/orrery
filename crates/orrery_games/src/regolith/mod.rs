@@ -1,4 +1,4 @@
-//! **Regolith** — planar combat, replayable rock splits and contested pickups.
+//! **Regolith** — planar combat, deterministic density, death loops and scoring.
 //!
 //! A split is described entirely by an ordered event. Its parent records the
 //! monotone split counter in its own state, so materialization is adjudicable.
@@ -19,7 +19,10 @@ use orrery_core::{
 };
 use orrery_protocol::{PersistId, RulesetId, Tick};
 use rand_core::RngCore;
-use state::{Craft, Pickup, RegolithState, Rock, RockTier, PITCH_LIMIT_URAD, TAU_URAD};
+use state::{
+    BloomDirector, BloomMembership, Craft, Pickup, RegolithState, Rock, RockTier, PITCH_LIMIT_URAD,
+    TAU_URAD,
+};
 
 const DT: f64 = 1.0 / TICK_HZ as f64;
 /// Drag shared by craft rules and stage-1 acceleration bounds.
@@ -27,6 +30,33 @@ pub const DRAG_PER_SEC_PER_MILLE: i64 = 50;
 const DRAG_PER_SEC: f64 = DRAG_PER_SEC_PER_MILLE as f64 / 1_000.0;
 const SPAWN_RADIUS_MM: f64 = 150_000.0;
 const GOLDEN_ANGLE_URAD: i64 = 2_399_963;
+/// Bloom cadence: 60 seconds at 60 Hz.
+pub const BLOOM_CADENCE_TICKS: u64 = 3_600;
+/// Maximum bloom-site lifetime: 90 seconds at 60 Hz.
+pub const BLOOM_LIFETIME_TICKS: u64 = 5_400;
+/// Rocks seeded by one bloom: 2 Large, 3 Medium and 5 Small.
+pub const BLOOM_ROCK_COUNT: u16 = 10;
+/// Largest live descendant population reachable from one bloom batch.
+pub const BLOOM_MAX_LIVE_ROCKS: u16 = 19;
+/// Half-width of the square central region used for bloom site draws.
+pub const BLOOM_CENTRAL_RADIUS_MM: i64 = 250_000;
+/// Wreck countdown: two seconds at 60 Hz.
+pub const RESPAWN_TICKS: u16 = 120;
+/// Maximum craft windows in one island.
+pub const ISLAND_CRAFT_BUDGET: u16 = 8;
+/// Steady-state rock-window target in one island.
+pub const ISLAND_ROCK_BUDGET: u16 = 24;
+/// Outstanding pickup-window target in one island.
+pub const ISLAND_PICKUP_BUDGET: u16 = 4;
+/// BloomDirector windows in one island.
+pub const ISLAND_DIRECTOR_BUDGET: u16 = 1;
+/// Published total island-window budget.
+pub const ISLAND_WINDOW_BUDGET: u16 =
+    ISLAND_CRAFT_BUDGET + ISLAND_ROCK_BUDGET + ISLAND_PICKUP_BUDGET + ISLAND_DIRECTOR_BUDGET;
+/// Score value of one delivered craft kill.
+pub const KILL_SCORE_POINTS: u64 = 25;
+/// Score value of one delivered pickup win.
+pub const PICKUP_SCORE_POINTS: u64 = 5;
 /// Rocks reflect from this square island edge with integer velocity negation.
 pub const ISLAND_BOUNDARY_MM: i64 = 1_000_000;
 const JITTER_MIN_URAD: u32 = 785_398;
@@ -36,16 +66,16 @@ pub const PICKUP_TTL_TICKS: u16 = 1_800;
 /// Maximum eligible grab distance, in millimetres.
 pub const GRAB_RADIUS_MM: i64 = 25_000;
 
-/// Regolith v3's rules identity. Pickups change rules and golden chains.
+/// Regolith v4's rules identity. Blooms, respawn and scoring change the rules.
 pub const REGOLITH_RULESET: RulesetId = RulesetId {
-    version: 3,
+    version: 4,
     digest: [0x52; 32],
 };
 
 /// Component classifications.
 pub mod components {
     use orrery_core::ComponentTypeId;
-    /// Verifiable Regolith state, whether craft or rock.
+    /// Verifiable Regolith state for every entity-window variant.
     pub const STATE: ComponentTypeId = ComponentTypeId(1);
 }
 
@@ -122,6 +152,10 @@ impl Ruleset for Regolith {
                 let (pickup, events) = Self::step_pickup(me, pickup, inputs);
                 (RegolithState::Pickup(pickup), events)
             }
+            RegolithState::BloomDirector(director) => {
+                let (director, events) = Self::step_director(me, director, inputs, rng);
+                (RegolithState::BloomDirector(director), events)
+            }
         };
         *view.own_mut() = state;
         StepOutput { events }
@@ -134,14 +168,17 @@ impl Ruleset for Regolith {
                 ..
             } => {
                 for child in children {
+                    let mut rock = Rock::spawned(
+                        child.tier,
+                        generation.saturating_add(1),
+                        child.pos,
+                        child.vel,
+                    );
+                    rock.bloom = child.bloom;
+                    rock.born_in_bloom = child.bloom.is_some();
                     out.push(EntityMaterialization::new(
                         child.id,
-                        RegolithState::Rock(Rock::spawned(
-                            child.tier,
-                            generation.saturating_add(1),
-                            child.pos,
-                            child.vel,
-                        )),
+                        RegolithState::Rock(rock),
                     ));
                 }
             }
@@ -154,6 +191,25 @@ impl Ruleset for Regolith {
                 *id,
                 RegolithState::Pickup(Pickup::spawned(*pos, *kind, *expires_at)),
             )),
+            Outcome::BloomSeeded {
+                director,
+                bloom_index,
+                rocks,
+                ..
+            } => {
+                for rock in rocks.iter() {
+                    out.push(EntityMaterialization::new(
+                        rock.id,
+                        RegolithState::Rock(Rock::spawned_in_bloom(
+                            rock.tier,
+                            rock.pos,
+                            rock.vel,
+                            *director,
+                            *bloom_index,
+                        )),
+                    ));
+                }
+            }
             _ => {}
         }
     }
@@ -179,7 +235,10 @@ impl Regolith {
             (own.shots, own.damage_dealt, own.cooldown.saturating_sub(1));
         let (mut grabs_attempted, mut pickups_won, mut grabs_lost) =
             (own.grabs_attempted, own.pickups_won, own.grabs_lost);
-        let mut disabled = !own.alive();
+        let (mut respawn_in, mut score_rock_points, mut kills) =
+            (own.respawn_in, own.score_rock_points, own.kills);
+        let was_alive = own.alive();
+        let mut disabled = !was_alive;
         for order in inputs.iter() {
             match order {
                 Order::Thrust { .. } | Order::Fire { .. } | Order::Grab { .. } if disabled => {}
@@ -248,6 +307,7 @@ impl Regolith {
                         hull = (hull - through).max(0);
                         if hull == 0 {
                             disabled = true;
+                            respawn_in = RESPAWN_TICKS;
                             events.push(Outcome::Destroyed { by: *from });
                         }
                     }
@@ -269,7 +329,11 @@ impl Regolith {
                 Order::PickupDenied => {
                     grabs_lost = grabs_lost.saturating_add(1);
                 }
-                Order::GrabAttempt { .. } => {}
+                Order::KillCredit => kills = kills.saturating_add(1),
+                Order::RockCredit { points } => {
+                    score_rock_points = score_rock_points.saturating_add(u64::from(*points));
+                }
+                Order::GrabAttempt { .. } | Order::BloomPopulationChanged { .. } => {}
             }
         }
         let speed = libm::sqrt(vx * vx + vy * vy + vz * vz);
@@ -287,6 +351,24 @@ impl Regolith {
         px += vx * DT;
         py += vy * DT;
         pz += vz * DT;
+        if !was_alive && hull == 0 && respawn_in > 0 {
+            respawn_in -= 1;
+            if respawn_in == 0 {
+                let (spawn_pos, spawn_yaw) = spawn_pose(me.0.saturating_sub(1));
+                px = spawn_pos.x as f64 / 1_000.0;
+                py = spawn_pos.y as f64 / 1_000.0;
+                pz = spawn_pos.z as f64 / 1_000.0;
+                vx = 0.0;
+                vy = 0.0;
+                vz = 0.0;
+                yaw = spawn_yaw;
+                pitch = 0;
+                hull = limits.max_hull;
+                shield = limits.max_shield;
+                cooldown = 0;
+                equipped = weapon::WeaponKind::Stock;
+            }
+        }
         let next = Craft {
             weapon: equipped,
             pos: QPos::from_metres(px, py, pz),
@@ -301,6 +383,9 @@ impl Regolith {
             grabs_attempted,
             pickups_won,
             grabs_lost,
+            respawn_in,
+            score_rock_points,
+            kills,
             ..own
         };
         (next, events)
@@ -314,21 +399,25 @@ impl Regolith {
     ) -> (Rock, Vec<Outcome>) {
         let mut events = Vec::new();
         let origin = rock.pos;
+        let mut killer = None;
         if rock.hull > 0 {
             for order in inputs.iter() {
                 if let Order::Damage {
                     amount,
+                    from,
                     from_pos,
                     from_weapon,
-                    ..
                 } = order
                 {
                     let reach = from_weapon
                         .weapon()
                         .reach_mm
                         .saturating_add(rock.tier.limits().radius_mm);
-                    if origin.distance_squared(*from_pos) <= reach_sq(reach) {
+                    if rock.hull > 0 && origin.distance_squared(*from_pos) <= reach_sq(reach) {
                         rock.hull = (rock.hull - (*amount).max(0)).max(0);
+                        if rock.hull == 0 {
+                            killer = Some(*from);
+                        }
                     }
                 }
             }
@@ -341,6 +430,13 @@ impl Regolith {
                         children,
                     });
                     rock.splits_done = rock.splits_done.saturating_add(1);
+                    if let Some(bloom) = rock.bloom {
+                        events.push(Outcome::BloomPopulationChanged {
+                            director: bloom.director,
+                            bloom_index: bloom.bloom_index,
+                            delta: 1,
+                        });
+                    }
                 } else {
                     let threshold = if rock.born_in_bloom { 50 } else { 25 };
                     if uniform_percent(rng) < threshold {
@@ -357,6 +453,19 @@ impl Regolith {
                         });
                         rock.pickups_dropped = rock.pickups_dropped.saturating_add(1);
                     }
+                    if let Some(bloom) = rock.bloom {
+                        events.push(Outcome::BloomPopulationChanged {
+                            director: bloom.director,
+                            bloom_index: bloom.bloom_index,
+                            delta: -1,
+                        });
+                    }
+                }
+                if let Some(by) = killer {
+                    events.push(Outcome::RockDestroyed {
+                        by,
+                        points: rock.tier.limits().points,
+                    });
                 }
             }
         }
@@ -409,6 +518,70 @@ impl Regolith {
             }
         }
         (pickup, events)
+    }
+
+    fn step_director(
+        me: PersistId,
+        mut director: BloomDirector,
+        inputs: &OrderedInputs<'_, Order>,
+        rng: &mut TickRng,
+    ) -> (BloomDirector, Vec<Outcome>) {
+        for input in inputs {
+            let Order::BloomPopulationChanged { bloom_index, delta } = input else {
+                continue;
+            };
+            let current_index = director.blooms_seeded.checked_sub(1);
+            if current_index != Some(*bloom_index) || director.site_pos.is_none() {
+                continue;
+            }
+            director.site_rocks_alive = if *delta < 0 {
+                director
+                    .site_rocks_alive
+                    .saturating_sub(delta.unsigned_abs().into())
+            } else {
+                director
+                    .site_rocks_alive
+                    .saturating_add(u16::try_from(*delta).unwrap_or(0))
+                    .min(BLOOM_MAX_LIVE_ROCKS)
+            };
+            if director.site_rocks_alive == 0 {
+                director.site_pos = None;
+                director.site_active_until = None;
+            }
+        }
+
+        director.clock_tick = director.clock_tick.saturating_add(1);
+        if director
+            .site_active_until
+            .is_some_and(|until| director.clock_tick >= until)
+        {
+            director.site_pos = None;
+            director.site_active_until = None;
+            director.site_rocks_alive = 0;
+        }
+
+        let mut events = Vec::new();
+        if director.clock_tick >= director.next_bloom_tick {
+            let bloom_index = director.blooms_seeded;
+            let site_pos = draw_bloom_site(rng);
+            let active_until = director.clock_tick.saturating_add(BLOOM_LIFETIME_TICKS);
+            let rocks = Box::new(core::array::from_fn(|slot| {
+                bloom_spec(me, bloom_index, slot, site_pos)
+            }));
+            events.push(Outcome::BloomSeeded {
+                director: me,
+                bloom_index,
+                site_pos,
+                active_until,
+                rocks,
+            });
+            director.blooms_seeded = director.blooms_seeded.saturating_add(1);
+            director.next_bloom_tick = director.next_bloom_tick.saturating_add(BLOOM_CADENCE_TICKS);
+            director.site_pos = Some(site_pos);
+            director.site_active_until = Some(active_until);
+            director.site_rocks_alive = BLOOM_ROCK_COUNT;
+        }
+        (director, events)
     }
 }
 
@@ -489,6 +662,47 @@ fn child_spec(
         tier,
         pos,
         vel,
+        bloom: rock.bloom,
+    }
+}
+fn bloom_spec(director: PersistId, bloom_index: u32, slot: usize, site_pos: QPos) -> ChildSpec {
+    let tier = match slot {
+        0..=1 => RockTier::Large,
+        2..=4 => RockTier::Medium,
+        _ => RockTier::Small,
+    };
+    let slot = u8::try_from(slot).expect("ten bloom slots fit in u8");
+    ChildSpec {
+        id: bloom_rock_id(director, bloom_index, slot),
+        tier,
+        pos: site_pos,
+        vel: QVel::default(),
+        bloom: Some(BloomMembership {
+            director,
+            bloom_index,
+        }),
+    }
+}
+fn bloom_rock_id(director: PersistId, bloom_index: u32, slot: u8) -> PersistId {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"regolith-bloom");
+    hasher.update(&director.0.to_le_bytes());
+    hasher.update(&bloom_index.to_le_bytes());
+    hasher.update(&[slot]);
+    PersistId::new(u64::from_le_bytes(
+        hasher.finalize().as_bytes()[..8]
+            .try_into()
+            .expect("digest prefix"),
+    ))
+}
+fn draw_bloom_site(rng: &mut TickRng) -> QPos {
+    let span = u64::try_from(BLOOM_CENTRAL_RADIUS_MM.saturating_mul(2).saturating_add(1))
+        .expect("positive central-region span");
+    let coordinate = |draw: u64| i64::try_from(draw % span).unwrap_or(0) - BLOOM_CENTRAL_RADIUS_MM;
+    QPos {
+        x: coordinate(rng.next_u64()),
+        y: 0,
+        z: coordinate(rng.next_u64()),
     }
 }
 fn child_id(parent: PersistId, generation: u32, slot: u8) -> PersistId {
@@ -520,7 +734,7 @@ const fn reach_sq(range_mm: i64) -> i128 {
 impl Game for Regolith {
     const META: GameMeta = GameMeta {
         name: "regolith",
-        summary: "planar craft, replayable rock splits and contested pickups",
+        summary: "planar combat, deterministic bloom density and logged scoring",
         ruleset: REGOLITH_RULESET,
     };
     const GOLDEN_CHAINS: &'static [(&'static str, [u8; 32])] = &crate::golden::REGOLITH;
@@ -532,14 +746,7 @@ impl Game for Regolith {
     }
     fn spawn(&self, _entity: PersistId, slot: u64) -> RegolithState {
         let archetype = Archetype::for_slot(slot);
-        let angle_urad = (slot as i64).saturating_mul(GOLDEN_ANGLE_URAD) % i64::from(TAU_URAD);
-        let angle = angle_urad as f64 / 1_000_000.0;
-        let pos = QPos::from_metres(
-            SPAWN_RADIUS_MM * libm::cos(angle) / 1_000.0,
-            0.0,
-            SPAWN_RADIUS_MM * libm::sin(angle) / 1_000.0,
-        );
-        let yaw = i32::try_from(angle_urad).unwrap_or(0) + TAU_URAD / 4;
+        let (pos, yaw) = spawn_pose(slot);
         RegolithState::Craft(Craft::spawned(archetype, pos, yaw))
     }
     fn honest_inputs(
@@ -583,10 +790,25 @@ impl Game for Regolith {
             )),
             Outcome::Granted { ship, kind } => Some((*ship, Order::PickupGranted { kind: *kind })),
             Outcome::Denied { ship } => Some((*ship, Order::PickupDenied)),
-            Outcome::Destroyed { .. }
-            | Outcome::Split { .. }
+            Outcome::Destroyed { by } => Some((*by, Order::KillCredit)),
+            Outcome::RockDestroyed { by, points } => {
+                Some((*by, Order::RockCredit { points: *points }))
+            }
+            Outcome::BloomPopulationChanged {
+                director,
+                bloom_index,
+                delta,
+            } => Some((
+                *director,
+                Order::BloomPopulationChanged {
+                    bloom_index: *bloom_index,
+                    delta: *delta,
+                },
+            )),
+            Outcome::Split { .. }
             | Outcome::SpawnPickup { .. }
-            | Outcome::Expired { .. } => None,
+            | Outcome::Expired { .. }
+            | Outcome::BloomSeeded { .. } => None,
         }
     }
     fn trajectory(state: &RegolithState) -> (QPos, QVel) {
@@ -594,6 +816,19 @@ impl Game for Regolith {
             RegolithState::Craft(craft) => (craft.pos, craft.vel),
             RegolithState::Rock(rock) => (rock.pos, rock.vel),
             RegolithState::Pickup(pickup) => (pickup.pos, QVel::default()),
+            RegolithState::BloomDirector(_) => (QPos::default(), QVel::default()),
         }
     }
+}
+
+fn spawn_pose(slot: u64) -> (QPos, i32) {
+    let angle_urad = (slot as i64).saturating_mul(GOLDEN_ANGLE_URAD) % i64::from(TAU_URAD);
+    let angle = angle_urad as f64 / 1_000_000.0;
+    let pos = QPos::from_metres(
+        SPAWN_RADIUS_MM * libm::cos(angle) / 1_000.0,
+        0.0,
+        SPAWN_RADIUS_MM * libm::sin(angle) / 1_000.0,
+    );
+    let yaw = i32::try_from(angle_urad).unwrap_or(0) + TAU_URAD / 4;
+    (pos, yaw.rem_euclid(TAU_URAD))
 }

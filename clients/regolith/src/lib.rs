@@ -235,6 +235,13 @@ fn sync_rendered_state(
             RegolithState::Craft(craft) => (craft.pos, Some(craft.yaw_urad)),
             RegolithState::Rock(rock) => (rock.pos, None),
             RegolithState::Pickup(pickup) => (pickup.pos, None),
+            // A bloom director is a scheduler, not a body: it occupies no
+            // point in the lattice. Its `site_pos` announces where a bloom
+            // seeds, which is not the same thing as where the director is —
+            // drawing it there would put a visible object in the world that
+            // the ruleset never spawned. Skip it and let the rocks it seeds
+            // be the only thing the skin shows.
+            RegolithState::BloomDirector(_) => continue,
         };
         let (x, _, z) = pos.to_metres();
         transform.translation = Vec3::new(x as f32, 0.0, z as f32);

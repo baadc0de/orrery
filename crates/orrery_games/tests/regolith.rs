@@ -5,10 +5,13 @@ use orrery_games::game::Game;
 use orrery_games::regolith::{
     archetype::Archetype,
     invariants::INVARIANTS,
-    order::{Order, Outcome},
-    state::{Craft, Pickup, RegolithState, Rock, RockTier},
+    order::{ChildSpec, Order, Outcome},
+    state::{BloomDirector, BloomMembership, Craft, Pickup, RegolithState, Rock, RockTier},
     weapon::WeaponKind,
-    Regolith, PICKUP_TTL_TICKS, REGOLITH_RULESET,
+    Regolith, BLOOM_CADENCE_TICKS, BLOOM_CENTRAL_RADIUS_MM, BLOOM_LIFETIME_TICKS, BLOOM_ROCK_COUNT,
+    ISLAND_CRAFT_BUDGET, ISLAND_DIRECTOR_BUDGET, ISLAND_PICKUP_BUDGET, ISLAND_ROCK_BUDGET,
+    ISLAND_WINDOW_BUDGET, KILL_SCORE_POINTS, PICKUP_SCORE_POINTS, PICKUP_TTL_TICKS,
+    REGOLITH_RULESET, RESPAWN_TICKS,
 };
 use orrery_protocol::{PersistId, Tick, UniverseSeed};
 use rand_chacha::rand_core::SeedableRng;
@@ -30,11 +33,383 @@ fn sample<'a>(
 }
 
 #[test]
-fn v3_weapon_table_and_ruleset_identity_are_pinned() {
-    assert_eq!(REGOLITH_RULESET.version, 3);
+fn v4_weapon_table_ruleset_identity_and_island_budget_are_pinned() {
+    assert_eq!(REGOLITH_RULESET.version, 4);
     assert_eq!(WeaponKind::Stock.weapon().damage_base, 10);
     assert_eq!(WeaponKind::Volley.weapon().rolls, 3);
     assert_eq!(WeaponKind::Heavy.weapon().reach_mm, 900_000);
+    assert_eq!(ISLAND_CRAFT_BUDGET, 8);
+    assert_eq!(ISLAND_ROCK_BUDGET, 24);
+    assert_eq!(ISLAND_PICKUP_BUDGET, 4);
+    assert_eq!(ISLAND_DIRECTOR_BUDGET, 1);
+    assert_eq!(ISLAND_WINDOW_BUDGET, 37);
+    assert_eq!((KILL_SCORE_POINTS, PICKUP_SCORE_POINTS), (25, 5));
+}
+
+#[test]
+fn bloom_director_replays_in_isolation_without_neighbor_reads() {
+    let director_id = PersistId::new(700);
+    let neighbor_id = PersistId::new(99);
+    let ready = BloomDirector {
+        clock_tick: BLOOM_CADENCE_TICKS - 1,
+        ..BloomDirector::spawned()
+    };
+    let run = |with_neighbor: bool| {
+        let mut executor = Executor::new(Regolith::honest(), UniverseSeed([0xB1; 32]));
+        executor.insert(director_id, RegolithState::BloomDirector(ready.clone()));
+        if with_neighbor {
+            executor.insert(neighbor_id, RegolithState::Craft(craft_at(123)));
+        }
+        let outcome = executor
+            .step_entity(director_id, Tick::new(9_000), &[])
+            .expect("director exists");
+        let state = executor
+            .state(director_id)
+            .expect("director remains")
+            .clone();
+        (outcome, state, executor)
+    };
+
+    let (populated, populated_state, populated_executor) = run(true);
+    let (isolated, isolated_state, _) = run(false);
+    assert_eq!(populated, isolated);
+    assert_eq!(populated_state, isolated_state);
+    assert!(populated.neighbor_reads.is_empty());
+    assert_eq!(populated.materialized.len(), usize::from(BLOOM_ROCK_COUNT));
+
+    let Outcome::BloomSeeded {
+        director,
+        bloom_index,
+        site_pos,
+        active_until,
+        rocks,
+    } = &populated.events[0]
+    else {
+        panic!("the cadence tick must seed one bloom")
+    };
+    assert_eq!((*director, *bloom_index), (director_id, 0));
+    assert_eq!(*active_until, BLOOM_CADENCE_TICKS + BLOOM_LIFETIME_TICKS);
+    assert_eq!(site_pos.y, 0);
+    assert!(site_pos.x.abs() <= BLOOM_CENTRAL_RADIUS_MM);
+    assert!(site_pos.z.abs() <= BLOOM_CENTRAL_RADIUS_MM);
+    assert_eq!(
+        rocks.iter().map(|rock| rock.tier).collect::<Vec<_>>(),
+        vec![
+            RockTier::Large,
+            RockTier::Large,
+            RockTier::Medium,
+            RockTier::Medium,
+            RockTier::Medium,
+            RockTier::Small,
+            RockTier::Small,
+            RockTier::Small,
+            RockTier::Small,
+            RockTier::Small,
+        ]
+    );
+    for rock in rocks.iter() {
+        assert!(matches!(
+            populated_executor.state(rock.id),
+            Some(RegolithState::Rock(Rock {
+                born_in_bloom: true,
+                bloom: Some(_),
+                ..
+            }))
+        ));
+    }
+}
+
+#[test]
+fn kill_credit_is_log_delivered_and_replays_from_the_killers_input() {
+    let game = Regolith::honest();
+    let killer = PersistId::new(1);
+    let victim = PersistId::new(2);
+    let killer_start = craft_at(0);
+    let mut victim_state = craft_at(0);
+    victim_state.hull = 1;
+    victim_state.shield = 0;
+    let mut live = Executor::new(game, UniverseSeed([0xC1; 32]));
+    live.insert(killer, RegolithState::Craft(killer_start.clone()));
+    live.insert(victim, RegolithState::Craft(victim_state));
+
+    let fired = live
+        .step_entity(killer, Tick::new(1), &[Order::Fire { target: victim }])
+        .expect("killer exists");
+    let damage = game
+        .deliver(&fired.events[0])
+        .expect("damage is delivered")
+        .1;
+    live.step_entity(killer, Tick::new(2), &[])
+        .expect("killer advances each tick");
+    let destroyed = live
+        .step_entity(victim, Tick::new(2), &[damage])
+        .expect("victim exists");
+    let destroyed = destroyed
+        .events
+        .iter()
+        .find(|event| matches!(event, Outcome::Destroyed { .. }))
+        .expect("lethal logged damage emits Destroyed");
+    let (credit_target, credit_input) = game
+        .deliver(destroyed)
+        .expect("Destroyed credit must enter the killer's log through deliver");
+    assert_eq!(credit_target, killer);
+    assert_eq!(credit_input, Order::KillCredit);
+    let credited = live
+        .step_entity(killer, Tick::new(3), core::slice::from_ref(&credit_input))
+        .expect("killer exists");
+
+    let mut replay = Executor::new(game, UniverseSeed([0xC1; 32]));
+    replay.insert(killer, RegolithState::Craft(killer_start.clone()));
+    replay
+        .step_entity(killer, Tick::new(1), &[Order::Fire { target: victim }])
+        .expect("isolated killer exists");
+    replay
+        .step_entity(killer, Tick::new(2), &[])
+        .expect("isolated killer advances each tick");
+    let replayed = replay
+        .step_entity(killer, Tick::new(3), &[credit_input])
+        .expect("isolated killer consumes its logged credit");
+    assert_eq!(credited.state_hash, replayed.state_hash);
+
+    let mut replay_without_delivery = Executor::new(game, UniverseSeed([0xC1; 32]));
+    replay_without_delivery.insert(killer, RegolithState::Craft(killer_start));
+    replay_without_delivery
+        .step_entity(killer, Tick::new(1), &[Order::Fire { target: victim }])
+        .expect("isolated killer exists");
+    replay_without_delivery
+        .step_entity(killer, Tick::new(2), &[])
+        .expect("isolated killer advances each tick");
+    let missing_credit = replay_without_delivery
+        .step_entity(killer, Tick::new(3), &[])
+        .expect("replay without the delivery still runs");
+    assert_ne!(credited.state_hash, missing_credit.state_hash);
+    assert!(matches!(
+        replay_without_delivery.state(killer),
+        Some(RegolithState::Craft(Craft { kills: 0, .. }))
+    ));
+    assert!(matches!(
+        live.state(killer),
+        Some(RegolithState::Craft(Craft { kills: 1, .. }))
+    ));
+    let RegolithState::Craft(craft) = replay.state(killer).expect("replayed killer") else {
+        panic!("killer is a craft")
+    };
+    assert_eq!(craft.kills, 1);
+    assert_eq!(craft.score(), KILL_SCORE_POINTS);
+}
+
+#[test]
+fn wreck_respawns_after_120_own_ticks_with_stock_and_score_intact() {
+    let craft_id = PersistId::new(2);
+    let mut craft = craft_at(80_000);
+    craft.weapon = WeaponKind::Heavy;
+    craft.hull = 1;
+    craft.shield = 0;
+    craft.kills = 2;
+    craft.pickups_won = 3;
+    let expected_score = 2 * KILL_SCORE_POINTS + 3 * PICKUP_SCORE_POINTS;
+    let mut executor = Executor::new(Regolith::honest(), UniverseSeed([0xD1; 32]));
+    executor.insert(craft_id, RegolithState::Craft(craft));
+    executor
+        .step_entity(
+            craft_id,
+            Tick::new(1),
+            &[Order::Damage {
+                amount: 1,
+                from: PersistId::new(8),
+                from_pos: QPos {
+                    x: 80_000,
+                    y: 0,
+                    z: 0,
+                },
+                from_weapon: WeaponKind::Stock,
+            }],
+        )
+        .expect("craft exists");
+    assert!(matches!(
+        executor.state(craft_id),
+        Some(RegolithState::Craft(Craft {
+            hull: 0,
+            respawn_in: RESPAWN_TICKS,
+            ..
+        }))
+    ));
+    for tick in 2..=120 {
+        executor
+            .step_entity(craft_id, Tick::new(tick), &[])
+            .expect("wreck owns its countdown");
+    }
+    assert!(matches!(
+        executor.state(craft_id),
+        Some(RegolithState::Craft(Craft {
+            hull: 0,
+            respawn_in: 1,
+            ..
+        }))
+    ));
+    executor
+        .step_entity(craft_id, Tick::new(121), &[])
+        .expect("120th wreck tick respawns");
+    let expected = Regolith::honest().spawn(craft_id, 1);
+    let Some(RegolithState::Craft(respawned)) = executor.state(craft_id) else {
+        panic!("respawned state is a craft")
+    };
+    let RegolithState::Craft(expected) = expected else {
+        unreachable!()
+    };
+    assert_eq!(respawned.pos, expected.pos);
+    assert_eq!(respawned.vel, QVel::default());
+    assert_eq!(respawned.weapon, WeaponKind::Stock);
+    let limits = respawned.archetype.limits();
+    assert_eq!(
+        (respawned.hull, respawned.shield),
+        (limits.max_hull, limits.max_shield)
+    );
+    assert_eq!(respawned.score(), expected_score);
+}
+
+#[test]
+fn rock_credit_is_log_delivered_with_resolver_owned_points() {
+    let game = Regolith::honest();
+    let killer = PersistId::new(1);
+    let rock_id = PersistId::new(20);
+    let mut executor = Executor::new(game, UniverseSeed([0xA4; 32]));
+    executor.insert(killer, RegolithState::Craft(craft_at(0)));
+    executor.insert(
+        rock_id,
+        RegolithState::Rock(Rock::spawned(
+            RockTier::Small,
+            2,
+            QPos::default(),
+            QVel::default(),
+        )),
+    );
+    let destroyed = executor
+        .step_entity(
+            rock_id,
+            Tick::new(1),
+            &[Order::Damage {
+                amount: 5,
+                from: killer,
+                from_pos: QPos::default(),
+                from_weapon: WeaponKind::Stock,
+            }],
+        )
+        .expect("rock exists");
+    let credit = destroyed
+        .events
+        .iter()
+        .find_map(|event| game.deliver(event))
+        .expect("RockDestroyed is delivered");
+    assert_eq!(credit, (killer, Order::RockCredit { points: 1 }));
+    executor
+        .step_entity(killer, Tick::new(2), &[credit.1])
+        .expect("killer consumes rock credit");
+    let Some(RegolithState::Craft(killer)) = executor.state(killer) else {
+        panic!("killer remains a craft")
+    };
+    assert_eq!(killer.score_rock_points, 1);
+    assert_eq!(killer.score(), 1);
+}
+
+#[test]
+fn score_rate_and_director_population_ceilings_are_stage_one_checked() {
+    let previous = RegolithState::Craft(craft_at(0));
+    let mut impossible_score = previous.clone();
+    let RegolithState::Craft(craft) = &mut impossible_score else {
+        unreachable!()
+    };
+    craft.kills = u32::from(ISLAND_CRAFT_BUDGET) * 3 + 1;
+    let violation = evaluate(INVARIANTS, &sample(Some(&previous), &impossible_score))
+        .expect_err("more than eight kill deliveries per tick is impossible");
+    assert_eq!(violation.kind, InvariantKind::RateLimit);
+    assert_eq!(violation.validator, "regolith/score-rate");
+
+    let impossible_population = RegolithState::BloomDirector(BloomDirector {
+        clock_tick: BLOOM_CADENCE_TICKS,
+        next_bloom_tick: BLOOM_CADENCE_TICKS * 2,
+        blooms_seeded: 1,
+        site_pos: Some(QPos::default()),
+        site_active_until: Some(BLOOM_CADENCE_TICKS + BLOOM_LIFETIME_TICKS),
+        site_rocks_alive: 20,
+    });
+    let violation = evaluate(INVARIANTS, &sample(None, &impossible_population))
+        .expect_err("one bloom cannot have twenty live descendants");
+    assert_eq!(violation.kind, InvariantKind::ValueRange);
+    assert_eq!(violation.validator, "regolith/value-range");
+}
+
+#[test]
+fn site_closes_from_logged_population_delivery_without_neighbor_reads() {
+    let game = Regolith::honest();
+    let director_id = PersistId::new(700);
+    let population_event = Outcome::BloomPopulationChanged {
+        director: director_id,
+        bloom_index: 0,
+        delta: -1,
+    };
+    let (target, input) = game
+        .deliver(&population_event)
+        .expect("rock population events route through the log");
+    assert_eq!(target, director_id);
+    let mut executor = Executor::new(game, UniverseSeed([0xE1; 32]));
+    executor.insert(
+        director_id,
+        RegolithState::BloomDirector(BloomDirector {
+            clock_tick: BLOOM_CADENCE_TICKS,
+            next_bloom_tick: BLOOM_CADENCE_TICKS * 2,
+            blooms_seeded: 1,
+            site_pos: Some(QPos::default()),
+            site_active_until: Some(BLOOM_CADENCE_TICKS + BLOOM_LIFETIME_TICKS),
+            site_rocks_alive: BLOOM_ROCK_COUNT,
+        }),
+    );
+    let inputs = vec![input; usize::from(BLOOM_ROCK_COUNT)];
+    let outcome = executor
+        .step_entity(director_id, Tick::new(1), &inputs)
+        .expect("director consumes logged population changes");
+    assert!(outcome.neighbor_reads.is_empty());
+    assert!(matches!(
+        executor.state(director_id),
+        Some(RegolithState::BloomDirector(BloomDirector {
+            site_pos: None,
+            site_active_until: None,
+            site_rocks_alive: 0,
+            ..
+        }))
+    ));
+}
+
+#[test]
+fn bloom_site_expires_after_5400_director_ticks() {
+    let director_id = PersistId::new(700);
+    let active_until = BLOOM_CADENCE_TICKS + BLOOM_LIFETIME_TICKS;
+    let mut executor = Executor::new(Regolith::honest(), UniverseSeed([0xE2; 32]));
+    executor.insert(
+        director_id,
+        RegolithState::BloomDirector(BloomDirector {
+            clock_tick: active_until - 1,
+            next_bloom_tick: BLOOM_CADENCE_TICKS * 3,
+            blooms_seeded: 2,
+            site_pos: Some(QPos::default()),
+            site_active_until: Some(active_until),
+            site_rocks_alive: BLOOM_ROCK_COUNT,
+        }),
+    );
+    let outcome = executor
+        .step_entity(director_id, Tick::new(active_until), &[])
+        .expect("director owns site expiry");
+    assert!(outcome.events.is_empty());
+    assert!(outcome.neighbor_reads.is_empty());
+    assert!(matches!(
+        executor.state(director_id),
+        Some(RegolithState::BloomDirector(BloomDirector {
+            site_pos: None,
+            site_active_until: None,
+            site_rocks_alive: 0,
+            ..
+        }))
+    ));
 }
 
 #[test]
@@ -456,6 +831,7 @@ fn pickup_state_and_grammar_are_canonical() {
         RegolithState::Craft(craft_at(0)),
         RegolithState::Rock(Rock::spawned(RockTier::Small, 2, pos, QVel::default())),
         RegolithState::Pickup(Pickup::spawned(pos, WeaponKind::Volley, PICKUP_TTL_TICKS)),
+        RegolithState::BloomDirector(BloomDirector::spawned()),
     ];
     for state in states {
         assert_eq!(RegolithState::decode(&state.to_canonical()).unwrap(), state);
@@ -470,6 +846,12 @@ fn pickup_state_and_grammar_are_canonical() {
             kind: WeaponKind::Heavy,
         },
         Order::PickupDenied,
+        Order::KillCredit,
+        Order::RockCredit { points: 4 },
+        Order::BloomPopulationChanged {
+            bloom_index: 3,
+            delta: -1,
+        },
     ];
     for order in orders {
         assert_eq!(Order::decode(&order.to_canonical()).unwrap(), order);
@@ -492,8 +874,38 @@ fn pickup_state_and_grammar_are_canonical() {
         },
         Outcome::Denied { ship },
         Outcome::Expired { id: pickup },
+        Outcome::RockDestroyed {
+            by: ship,
+            points: 2,
+        },
+        Outcome::BloomPopulationChanged {
+            director: PersistId::new(700),
+            bloom_index: 3,
+            delta: 1,
+        },
     ];
     for outcome in outcomes {
         assert_eq!(Outcome::decode(&outcome.to_canonical()).unwrap(), outcome);
     }
+    let bloom = BloomMembership {
+        director: PersistId::new(700),
+        bloom_index: 3,
+    };
+    let bloom_outcome = Outcome::BloomSeeded {
+        director: bloom.director,
+        bloom_index: bloom.bloom_index,
+        site_pos: pos,
+        active_until: 9_000,
+        rocks: Box::new(core::array::from_fn(|slot| ChildSpec {
+            id: PersistId::new(100 + slot as u64),
+            tier: RockTier::Small,
+            pos,
+            vel: QVel::default(),
+            bloom: Some(bloom),
+        })),
+    };
+    assert_eq!(
+        Outcome::decode(&bloom_outcome.to_canonical()).unwrap(),
+        bloom_outcome
+    );
 }

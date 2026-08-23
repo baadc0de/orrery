@@ -42,6 +42,12 @@ pub struct Craft {
     pub pickups_won: u32,
     /// Pickup denials consumed, ever. Monotone and state-hashed.
     pub grabs_lost: u32,
+    /// Ticks remaining before a wreck respawns. Zero while alive.
+    pub respawn_in: u16,
+    /// Rock points delivered to this craft, ever. Monotone and state-hashed.
+    pub score_rock_points: u64,
+    /// Craft kill credits delivered to this craft, ever. Monotone and state-hashed.
+    pub kills: u32,
 }
 
 /// A rock's published tier. Its limits are derived from this hashed value,
@@ -63,7 +69,7 @@ pub struct RockLimits {
     pub radius_mm: i64,
     /// Hull at creation and its ceiling.
     pub max_hull: i32,
-    /// Score value reserved for the later kill-credit rule.
+    /// Score value routed to a killer through logged delivery.
     pub points: u8,
     /// Velocity ceiling, in millimetres per second.
     pub max_speed_mms: i64,
@@ -151,6 +157,17 @@ pub struct Rock {
     pub born_in_bloom: bool,
     /// Pickup materializations emitted, ever. Monotone and state-hashed.
     pub pickups_dropped: u32,
+    /// Bloom lineage, propagated through splits so site liveness is log-routed.
+    pub bloom: Option<BloomMembership>,
+}
+
+/// The director and bloom generation that own a seeded rock lineage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BloomMembership {
+    /// Director receiving population-change events.
+    pub director: orrery_protocol::PersistId,
+    /// Director-local bloom index.
+    pub bloom_index: u32,
 }
 
 /// A materialized weapon pickup with its own adjudicable window.
@@ -172,7 +189,24 @@ pub struct Pickup {
     pub expired: bool,
 }
 
-/// The complete core-state sum: craft, rock and pickup windows share one ruleset.
+/// One island's deterministic bloom schedule and in-band site announcement.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BloomDirector {
+    /// Island-local core tick advanced by this entity's own step.
+    pub clock_tick: u64,
+    /// Island-local tick at which the next bloom is seeded.
+    pub next_bloom_tick: u64,
+    /// Bloom batches emitted, ever. This is the monotone own-state seed trace.
+    pub blooms_seeded: u32,
+    /// Latest active site position, replicated in-band.
+    pub site_pos: Option<QPos>,
+    /// Absolute expiry tick for the latest active site.
+    pub site_active_until: Option<u64>,
+    /// Live rock lineages in the latest site, including split descendants.
+    pub site_rocks_alive: u16,
+}
+
+/// The complete core-state sum: every Regolith window shares one ruleset.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RegolithState {
     /// A player craft.
@@ -181,9 +215,11 @@ pub enum RegolithState {
     Rock(Rock),
     /// A contested weapon pickup.
     Pickup(Pickup),
+    /// One island's bloom scheduler and replicated site announcement.
+    BloomDirector(BloomDirector),
 }
 
-const CRAFT_ENCODED_LEN: usize = 92;
+const CRAFT_ENCODED_LEN: usize = 106;
 
 impl Quantized for Craft {
     fn quantize(&mut self) {
@@ -210,12 +246,22 @@ impl Quantized for Pickup {
     }
 }
 
+impl Quantized for BloomDirector {
+    fn quantize(&mut self) {
+        if let Some(pos) = self.site_pos {
+            let (x, y, z) = pos.to_metres();
+            self.site_pos = Some(QPos::from_metres(x, y, z));
+        }
+    }
+}
+
 impl Quantized for RegolithState {
     fn quantize(&mut self) {
         match self {
             Self::Craft(craft) => craft.quantize(),
             Self::Rock(rock) => rock.quantize(),
             Self::Pickup(pickup) => pickup.quantize(),
+            Self::BloomDirector(director) => director.quantize(),
         }
     }
 }
@@ -238,6 +284,9 @@ impl CoreCodec for Craft {
         out.extend_from_slice(&self.grabs_attempted.to_le_bytes());
         out.extend_from_slice(&self.pickups_won.to_le_bytes());
         out.extend_from_slice(&self.grabs_lost.to_le_bytes());
+        out.extend_from_slice(&self.respawn_in.to_le_bytes());
+        out.extend_from_slice(&self.score_rock_points.to_le_bytes());
+        out.extend_from_slice(&self.kills.to_le_bytes());
     }
     fn decode(bytes: &[u8]) -> Result<Self, CodecError> {
         if bytes.len() != CRAFT_ENCODED_LEN {
@@ -268,6 +317,9 @@ impl CoreCodec for Craft {
             grabs_attempted: u32::from_le_bytes(bytes[80..84].try_into().unwrap()),
             pickups_won: u32::from_le_bytes(bytes[84..88].try_into().unwrap()),
             grabs_lost: u32::from_le_bytes(bytes[88..92].try_into().unwrap()),
+            respawn_in: u16::from_le_bytes(bytes[92..94].try_into().unwrap()),
+            score_rock_points: u64::from_le_bytes(bytes[94..102].try_into().unwrap()),
+            kills: u32::from_le_bytes(bytes[102..106].try_into().unwrap()),
         })
     }
 }
@@ -285,9 +337,17 @@ impl CoreCodec for Rock {
         out.extend_from_slice(&self.splits_done.to_le_bytes());
         out.push(u8::from(self.born_in_bloom));
         out.extend_from_slice(&self.pickups_dropped.to_le_bytes());
+        match self.bloom {
+            Some(bloom) => {
+                out.push(1);
+                out.extend_from_slice(&bloom.director.0.to_le_bytes());
+                out.extend_from_slice(&bloom.bloom_index.to_le_bytes());
+            }
+            None => out.extend_from_slice(&[0; 13]),
+        }
     }
     fn decode(bytes: &[u8]) -> Result<Self, CodecError> {
-        if bytes.len() != 66 || bytes[61] > 1 {
+        if bytes.len() != 79 || bytes[61] > 1 || bytes[66] > 1 {
             return Err(CodecError("regolith rock: wrong length"));
         }
         let i64_at = |o| i64::from_le_bytes(bytes[o..o + 8].try_into().unwrap());
@@ -308,6 +368,12 @@ impl CoreCodec for Rock {
             splits_done: u32::from_le_bytes(bytes[57..61].try_into().unwrap()),
             born_in_bloom: bytes[61] == 1,
             pickups_dropped: u32::from_le_bytes(bytes[62..66].try_into().unwrap()),
+            bloom: (bytes[66] == 1).then(|| BloomMembership {
+                director: orrery_protocol::PersistId::new(u64::from_le_bytes(
+                    bytes[67..75].try_into().unwrap(),
+                )),
+                bloom_index: u32::from_le_bytes(bytes[75..79].try_into().unwrap()),
+            }),
         })
     }
 }
@@ -362,6 +428,53 @@ impl CoreCodec for Pickup {
     }
 }
 
+impl CoreCodec for BloomDirector {
+    fn encode(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&self.clock_tick.to_le_bytes());
+        out.extend_from_slice(&self.next_bloom_tick.to_le_bytes());
+        out.extend_from_slice(&self.blooms_seeded.to_le_bytes());
+        match self.site_pos {
+            Some(pos) => {
+                out.push(1);
+                for value in [pos.x, pos.y, pos.z] {
+                    out.extend_from_slice(&value.to_le_bytes());
+                }
+            }
+            None => out.extend_from_slice(&[0; 25]),
+        }
+        match self.site_active_until {
+            Some(tick) => {
+                out.push(1);
+                out.extend_from_slice(&tick.to_le_bytes());
+            }
+            None => out.extend_from_slice(&[0; 9]),
+        }
+        out.extend_from_slice(&self.site_rocks_alive.to_le_bytes());
+    }
+
+    fn decode(bytes: &[u8]) -> Result<Self, CodecError> {
+        if bytes.len() != 56 || bytes[20] > 1 || bytes[45] > 1 {
+            return Err(CodecError(
+                "regolith bloom director: bad length or option tag",
+            ));
+        }
+        let i64_at = |o| i64::from_le_bytes(bytes[o..o + 8].try_into().unwrap());
+        Ok(Self {
+            clock_tick: u64::from_le_bytes(bytes[0..8].try_into().unwrap()),
+            next_bloom_tick: u64::from_le_bytes(bytes[8..16].try_into().unwrap()),
+            blooms_seeded: u32::from_le_bytes(bytes[16..20].try_into().unwrap()),
+            site_pos: (bytes[20] == 1).then(|| QPos {
+                x: i64_at(21),
+                y: i64_at(29),
+                z: i64_at(37),
+            }),
+            site_active_until: (bytes[45] == 1)
+                .then(|| u64::from_le_bytes(bytes[46..54].try_into().unwrap())),
+            site_rocks_alive: u16::from_le_bytes(bytes[54..56].try_into().unwrap()),
+        })
+    }
+}
+
 impl CoreCodec for RegolithState {
     fn encode(&self, out: &mut Vec<u8>) {
         match self {
@@ -377,6 +490,10 @@ impl CoreCodec for RegolithState {
                 out.push(2);
                 pickup.encode(out);
             }
+            Self::BloomDirector(director) => {
+                out.push(3);
+                director.encode(out);
+            }
         }
     }
     fn decode(bytes: &[u8]) -> Result<Self, CodecError> {
@@ -387,6 +504,7 @@ impl CoreCodec for RegolithState {
             0 => Ok(Self::Craft(Craft::decode(rest)?)),
             1 => Ok(Self::Rock(Rock::decode(rest)?)),
             2 => Ok(Self::Pickup(Pickup::decode(rest)?)),
+            3 => Ok(Self::BloomDirector(BloomDirector::decode(rest)?)),
             _ => Err(CodecError("regolith state: unknown tag")),
         }
     }
@@ -412,12 +530,23 @@ impl Craft {
             grabs_attempted: 0,
             pickups_won: 0,
             grabs_lost: 0,
+            respawn_in: 0,
+            score_rock_points: 0,
+            kills: 0,
         }
     }
     /// Whether this craft is active.
     #[must_use]
     pub const fn alive(&self) -> bool {
         self.hull > 0
+    }
+
+    /// Session score derived from the three monotone hashed counters.
+    #[must_use]
+    pub const fn score(&self) -> u64 {
+        self.score_rock_points
+            .saturating_add((self.kills as u64).saturating_mul(super::KILL_SCORE_POINTS))
+            .saturating_add((self.pickups_won as u64).saturating_mul(super::PICKUP_SCORE_POINTS))
     }
 }
 
@@ -434,7 +563,26 @@ impl Rock {
             splits_done: 0,
             born_in_bloom: false,
             pickups_dropped: 0,
+            bloom: None,
         }
+    }
+
+    /// A fully described rock seeded by a bloom director.
+    #[must_use]
+    pub const fn spawned_in_bloom(
+        tier: RockTier,
+        pos: QPos,
+        vel: QVel,
+        director: orrery_protocol::PersistId,
+        bloom_index: u32,
+    ) -> Self {
+        let mut rock = Self::spawned(tier, 0, pos, vel);
+        rock.born_in_bloom = true;
+        rock.bloom = Some(BloomMembership {
+            director,
+            bloom_index,
+        });
+        rock
     }
 }
 
@@ -450,6 +598,21 @@ impl Pickup {
             claimed_by: None,
             claimed_at: None,
             expired: false,
+        }
+    }
+}
+
+impl BloomDirector {
+    /// A fresh island director whose first bloom starts after one cadence.
+    #[must_use]
+    pub const fn spawned() -> Self {
+        Self {
+            clock_tick: 0,
+            next_bloom_tick: super::BLOOM_CADENCE_TICKS,
+            blooms_seeded: 0,
+            site_pos: None,
+            site_active_until: None,
+            site_rocks_alive: 0,
         }
     }
 }
