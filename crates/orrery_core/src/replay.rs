@@ -241,6 +241,13 @@ impl<R: Ruleset> ReplayHarness<R> {
             let Some(outcome) = self.executor.step_entity(entity, Tick::new(tick), &inputs) else {
                 return Err(ReplayError::SnapshotMalformed);
             };
+            // The adjudicator replays exactly one entity. Its emitted child
+            // descriptions are reproduced by `step_entity`, but retaining
+            // those children here would make them neighbours on the next tick
+            // and quietly turn a closed window into a growing world.
+            for materialized in &outcome.materialized {
+                self.executor.take_state(*materialized);
+            }
             trace.hashes.push((Tick::new(tick), outcome.state_hash));
         }
         Ok(trace)

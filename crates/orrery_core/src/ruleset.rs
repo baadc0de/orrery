@@ -207,6 +207,28 @@ impl<E> Default for StepOutput<E> {
     }
 }
 
+/// A fully described entity a core event asks the executor to install.
+///
+/// The ruleset supplies the identifier; the executor deliberately has no
+/// allocator. That makes identity a pure function of the emitting entity's
+/// replayable inputs (for example `(parent, generation, slot)`) instead of a
+/// function of which other entities happened to be created first.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EntityMaterialization<S> {
+    /// The game-derived persistent identifier.
+    pub entity: PersistId,
+    /// The complete initial core state, quantized by the executor on install.
+    pub state: S,
+}
+
+impl<S> EntityMaterialization<S> {
+    /// Describe one entity for deterministic materialization.
+    #[must_use]
+    pub const fn new(entity: PersistId, state: S) -> Self {
+        Self { entity, state }
+    }
+}
+
 /// The game's deterministic kernel.
 pub trait Ruleset: Send + Sync + 'static {
     /// Per-entity verifiable state — the only state `step` may touch.
@@ -238,6 +260,35 @@ pub trait Ruleset: Send + Sync + 'static {
         inputs: &OrderedInputs<'_, Self::CoreInput>,
         rng: &mut TickRng,
     ) -> StepOutput<Self::CoreEvent>;
+
+    /// Project one emitted event into fully described entities to install.
+    ///
+    /// The executor calls this immediately after [`Ruleset::step`], once per
+    /// event in emission order, and installs appended entities in append
+    /// order. The first description of an identifier wins; later descriptions
+    /// are dropped. Existing rulesets need no materialization channel and use
+    /// the empty default.
+    ///
+    /// This projection must be pure and must take every identifier and state
+    /// field from the event. In particular, identifiers are derived by the
+    /// emitting step from its own replayable inputs; they are never allocated
+    /// from executor population or creation order. An isolated replay of the
+    /// emitter therefore reproduces the same descriptions even though it does
+    /// not hold the rest of the world. Whether a colliding description wins is
+    /// an executor concern and does not feed back into the emitter's step.
+    ///
+    /// Materialization descriptions are not part of [`state_hash`]. A game
+    /// whose materialization matters to adjudication must also record an
+    /// own-state trace in the emitter (a monotone split/seed/drop counter, for
+    /// example); an event-only effect is invisible to state-hash goldens and
+    /// adjudication.
+    fn materialize(
+        &self,
+        event: &Self::CoreEvent,
+        out: &mut Vec<EntityMaterialization<Self::CoreState>>,
+    ) {
+        let _ = (event, out);
+    }
 
     /// Core, Bulk or Cosmetic for a replicated component (§2).
     ///
