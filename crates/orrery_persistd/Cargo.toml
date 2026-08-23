@@ -69,6 +69,11 @@ name = "persistd"
 path = "src/bin/persistd.rs"
 required-features = ["chain-grpc"]
 
+[[bin]]
+name = "world-census"
+path = "src/bin/world-census.rs"
+required-features = ["fdb"]
+
 [[bench]]
 name = "journal_latency"
 harness = false
