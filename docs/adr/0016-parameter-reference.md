@@ -31,6 +31,28 @@ This decision is normative. See the [ADR index](../DECISIONS.md) for precedence,
 | `epoch/` row retention | 7 days (D28) | — | — |
 | Provisional finalize deadline | 5 min (D29) | Provisional outstanding cap (per account) | 8 (D29) |
 | Provisional finalization sampling | 100%, not tunable (D29) | — | — |
+| Session token TTL | 1 h, hard max (D41) | Session refresh point | half-TTL (D41) |
+
+*Session token TTL* and *Session refresh point* are added by
+[D41](0041-offline-identity-issuer-custody-and-lifecycle.md). Both are landed
+code rather than new tunables: `MAX_SESSION_TOKEN_TTL_MS` is a hard
+`3_600_000`, and `IssuedSession` sets refresh to `issued_at + ttl/2`. At a
+steady concurrent population `C`, half-TTL refresh costs `2C/T` QPS — at
+T = 3600 s that is 5.56/s for C = 10 000, and 0.004/s for an 8-person playtest
+session.
+
+*Intent commit p99* has one **accepted exception**, recorded rather than
+restated. The P5 reference trade measured **10.044 ms** — a 0.44% overshoot —
+and the owner accepted it on 2026-08-23 rather than moving the budget, so the
+`< 10 ms` target above stands as written. Two things about that measurement
+belong with it: only ~0.1 ms of the +1.959 ms delta is signature verification,
+the rest being FDB commit tail; and the harness uses **pre-built attestations**,
+so the figure excludes witness discovery, signature round trips and quorum
+collection. It is therefore a lower bound on the end-to-end attested path, and
+the P5 criterion's phrase "with attestation overhead included"
+(`../11-roadmap.md`) is satisfied here only in the narrower sense of
+*verification* overhead. Closing that gap needs a discovery-plus-quorum
+measurement under load, not further verification benchmarking.
 
 The last row is added by [D20](0020-journal-retention.md). *Journal retention*
 is whether a node releases journal segments its checkpoints have made
