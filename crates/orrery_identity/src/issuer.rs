@@ -60,6 +60,14 @@ impl IssuerSigningKey {
     pub fn issuer_key(&self) -> IssuerKey {
         IssuerKey::new(self.key_id, self.public_key())
     }
+
+    /// Return the portable secret bytes for the lifecycle module.
+    ///
+    /// This stays crate-private: callers should only persist it through the
+    /// encrypted escrow and restrictive runtime-credential paths.
+    pub(crate) fn secret_bytes(&self) -> [u8; 32] {
+        self.secret.to_bytes()
+    }
 }
 
 impl fmt::Debug for IssuerSigningKey {
