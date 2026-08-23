@@ -1,0 +1,124 @@
+{
+  "budget": {
+    "attested_p99_us": 10044,
+    "comparison": "strictly_less_than",
+    "intent_commit_p99_us": 10000,
+    "result": "miss"
+  },
+  "delta": {
+    "admit_mean_us": 100,
+    "p99_us": 1959
+  },
+  "measurement_valid": true,
+  "method": {
+    "attestations": "pre-built",
+    "attestations_per_attested_intent": 3,
+    "attested_posture": "required",
+    "claim": "verification overhead",
+    "combined_inflight_pairs": 16,
+    "concurrency_per_population": 16,
+    "control_posture": "shadow",
+    "cryptographically_verified_attestations": 30000,
+    "distinct_non_party_witness_accounts": 7,
+    "fresh_item_per_sample": true,
+    "not_end_to_end": [
+      "witness discovery",
+      "request/response latency",
+      "witness execution",
+      "witness signing",
+      "retries",
+      "quorum collection"
+    ],
+    "paired": true
+  },
+  "populations": {
+    "attested": {
+      "committed": 10000,
+      "durable_receipts": 10000,
+      "gateway_stages": {
+        "attempts": 10000,
+        "executed": 10000,
+        "intents": 10000,
+        "max_us": {
+          "admit": 394,
+          "commit": 30064,
+          "exec": 37317,
+          "server": 37431
+        },
+        "mean_us": {
+          "admit": 148,
+          "alloc_refill": 3,
+          "alloc_wait": 41,
+          "backoff": 0,
+          "commit": 6118,
+          "exec": 6625,
+          "fdb_gap": 282,
+          "fence": 0,
+          "grv": 113,
+          "idem_read": 65,
+          "ingress": 0,
+          "reply": 0,
+          "server": 6777,
+          "server_gap": 1,
+          "spawn_wait": 1
+        }
+      },
+      "latency": {
+        "max_us": 37511,
+        "mean_us": 6941,
+        "min_us": 4678,
+        "p50_us": 6843,
+        "p90_us": 7012,
+        "p99_us": 10044,
+        "unit": "microseconds"
+      },
+      "samples": 10000,
+      "series": "honest_trade_attested_verification_commit_ms"
+    },
+    "control": {
+      "committed": 10000,
+      "durable_receipts": 10000,
+      "gateway_stages": {
+        "attempts": 10000,
+        "executed": 10000,
+        "intents": 10000,
+        "max_us": {
+          "admit": 284,
+          "commit": 30135,
+          "exec": 37394,
+          "server": 37433
+        },
+        "mean_us": {
+          "admit": 48,
+          "alloc_refill": 1,
+          "alloc_wait": 10,
+          "backoff": 0,
+          "commit": 6244,
+          "exec": 6739,
+          "fdb_gap": 286,
+          "fence": 0,
+          "grv": 125,
+          "idem_read": 71,
+          "ingress": 0,
+          "reply": 0,
+          "server": 6791,
+          "server_gap": 1,
+          "spawn_wait": 1
+        }
+      },
+      "latency": {
+        "max_us": 37495,
+        "mean_us": 6906,
+        "min_us": 4484,
+        "p50_us": 6842,
+        "p90_us": 7013,
+        "p99_us": 8085,
+        "unit": "microseconds"
+      },
+      "samples": 10000,
+      "series": "honest_trade_unattested_control_commit_ms"
+    }
+  },
+  "recorded_at_unix_ms": 1787461627308,
+  "schema": "orrery.p5-honest-trade-verification-overhead/1"
+}
