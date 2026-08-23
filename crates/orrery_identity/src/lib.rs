@@ -70,6 +70,7 @@
 
 #![warn(missing_docs)]
 
+pub mod invite;
 pub mod issuer;
 pub mod mem;
 pub mod service;
@@ -80,6 +81,10 @@ pub mod window;
 #[cfg(feature = "fdb")]
 pub mod fdb;
 
+pub use invite::{
+    mint_invite, redeem_invite, InviteCodeGenerator, InviteError, InviteLedger,
+    InviteRedemptionError, MintedInvite, OsInviteCodeGenerator,
+};
 pub use issuer::{IssuerKeyring, IssuerSigningKey, RotationError};
 pub use mem::MemAccountStore;
 pub use service::{
