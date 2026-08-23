@@ -52,7 +52,7 @@ unrelated workloads. Nothing pre-existing is read, referenced or modified.
 | `aws_iam_role` | `orrery-ci-cache` | applied | Assumed from Actions. The trust policy is the reviewable artefact. |
 | `aws_iam_policy` + attachment | `orrery-ci-cache-access` | applied | Four object actions on one prefix. No delete, no bucket admin. |
 | `aws_iam_role` | `orrery-ci-compute` | **pending apply** | #176's ephemeral machines. Main-only trust; tag-chained lifecycle. |
-| `aws_iam_policy` + attachment | `orrery-ci-compute-access` | **pending apply** | EC2 discovery, tagged launch, tagged termination. One region. |
+| `aws_iam_policy` + attachment | `orrery-ci-compute-access` | **pending apply** | EC2 discovery, tagged launch/console/termination. One region. |
 | `aws_s3_bucket` | `orrery-kache` | applied | The kache remote, `eu-central-1`. |
 | `aws_s3_bucket_public_access_block` | — | applied | All four switches on. |
 | `aws_s3_bucket_ownership_controls` | — | applied | `BucketOwnerEnforced`; ACLs off. |
@@ -211,7 +211,7 @@ off a real token from any run's log line `assumed principal:`.
 
 ### The permission policy
 
-Four statements plus one explicit deny; every action is listed because the
+Seven allow statements plus one explicit deny; every action is listed because the
 lifecycle needs it, and the absences are argued in iam-compute-policy.tf's
 header:
 
@@ -219,7 +219,10 @@ header:
 |---|---|---|
 | `NoMetalSizes` | — (**Deny**) | `ec2:RunInstances` refused for `*.metal`, cutting the most expensive shapes off every family glob below. |
 | `DiscoveryReadOnly` | eight `ec2:Describe*` actions | Instance types (the #170 capability query), images, AZs, VPC/subnet/SG lookups, our instances' status. Resource `*` — Describe actions accept no narrower scope — but pinned to `eu-central-1` via `aws:RequestedRegion`. |
-| `LaunchTaggedInstance` | `ec2:RunInstances` | Only instance types matching `compute_instance_type_patterns` (#170's measured local-NVMe candidate set); only requests carrying `aws:RequestTag/orrery-ci-ephemeral=true`; only `eu-central-1`; subordinate resources scoped to this account's ARNs. |
+| `UseCanonicalUbuntuImage` | `ec2:RunInstances` | Public image/snapshot resources only, pinned by `ec2:Owner` to Canonical (`099720109477`). This closes the licensed-AMI exposure #173 recorded. |
+| `UseVpcLaunchInputs` | `ec2:RunInstances` | Existing subnet/security-group inputs in this account and region; separated because launch inputs do not carry creation request tags. |
+| `LaunchTaggedInstance` | `ec2:RunInstances` | Only instance types matching `compute_instance_type_patterns` (#170's local-NVMe candidate set); only created resources carrying `aws:RequestTag/orrery-ci-ephemeral=true`; only `eu-central-1`. |
+| `ReadTaggedConsoleEvidence` | `ec2:GetConsoleOutput` | Only an instance carrying the ownership tag. This is the result channel: the instance has no AWS credential, key pair, SSM profile or bucket grant. |
 | `TagOnlyAtLaunch` | `ec2:CreateTags` | Only while `ec2:CreateAction = RunInstances`. Tags can never be written onto an existing object afterwards. |
 | `TerminateTaggedOnly` | `ec2:TerminateInstances` | Only objects carrying `aws:ResourceTag/orrery-ci-ephemeral=true`. |
 
@@ -229,6 +232,12 @@ and `ssm:*` (session access — SSM vs SSH — is #170's open question and drags
 an instance profile with it; granting half now would be scoping by guesswork),
 every delete action (root volumes ride delete-on-termination and RunInstances'
 NICs are reaped with the instance), S3/IAM/KMS/STS (nothing outside EC2).
+
+#176 resolved the access question without either option: EC2 user data starts
+the public-repository workload and one compact result returns through the
+tag-guarded serial console. `infra/p2-ephemeral.py` records every launched id,
+terminates in each worker's `finally`, traps cancellation, and the workflow has
+an independent `if: always()` teardown step over the same id file.
 
 **The tag chain is the security argument.** Launch requires the tag;
 retagging outside a launch is impossible; termination requires the tag.
@@ -391,6 +400,7 @@ directory, on an already-initialized checkout:
 $ terraform -chdir=infra fmt -check -recursive     # passes
 $ terraform -chdir=infra validate                  # passes
 $ scripts/aws-compute-smoke.sh --self-test         # structural clauses hold (no AWS needed)
+$ python3 infra/p2-ephemeral.py self-test           # #176 stages hold (no AWS needed)
 $ terraform -chdir=infra plan                      # 3 to add, 0 to change, 0 to destroy
 $ terraform -chdir=infra apply
 ```
@@ -400,8 +410,9 @@ The plan's three adds are exactly: `aws_iam_role.github_compute`,
 the rendered subject list in
 `data.aws_iam_policy_document.github_compute_trust` — it must end in
 `:ref:refs/heads/main`, character for character — and the action lists in
-`data.aws_iam_policy_document.compute_access`. Nothing else in the plan may
-change; if a tenth resource appears, stop and read why.
+`data.aws_iam_policy_document.compute_access`, including Canonical's owner pin,
+the ownership tag on launch/console/termination, and the explicit metal deny.
+Nothing else in the plan may change; if a fourth add appears, stop and read why.
 
 Then prove the credential path from Actions:
 

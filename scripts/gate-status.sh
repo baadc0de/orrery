@@ -20,13 +20,15 @@
 # script about it breaks the report loudly rather than dropping the gate from
 # it silently.
 #
-# **A partial evaluation is never a pass.** Six statuses, and they are not
+# **A partial evaluation is never a pass.** Seven statuses, and they are not
 # collapsible:
 #
 #   PASSED       executed here, or an evidence artifact that says it held
 #   FAILED       executed here and did not hold, or evidence that says so
 #   UNQUALIFIED  correctness was evaluated, but the device could not support a
 #                latency verdict; the whole gate therefore did not pass
+#   INTERRUPTED  a spot interruption ended the environment; retry was bounded
+#                and no gate verdict was emitted
 #   NOT RUN      runnable, but this mode did not run it and no evidence exists
 #   SKIPPED      a prerequisite is missing — no cluster, no hosted runner, no
 #                binary. The gate was not evaluated and nothing is claimed.
@@ -609,6 +611,7 @@ gate_p2_kill9_evidence() {
   case "$result" in
     pass)        status=PASSED ;;
     unqualified) status=UNQUALIFIED ;;
+    interrupted) status=INTERRUPTED ;;
     *)           status=FAILED ;;
   esac
   numbers=$(jq -c '{
@@ -620,7 +623,16 @@ gate_p2_kill9_evidence() {
     bulk_ack_p99_ms:       (.proofs.latency.series.bulk_ack_ms.p99 // null),
     intent_commit_p99_ms:  (.proofs.latency.series.intent_commit_ms.p99 // null),
     area_first_page_p99_ms:(.proofs.latency.series.area_first_page_ms.p99 // null),
-    zombie_primary_fenced: .proofs.zombie_primary_fenced
+    zombie_primary_fenced: .proofs.zombie_primary_fenced,
+    fio_barriers_per_s: (.proofs.device_qualification.measured.aggregate_barriers_per_s // null),
+    fio_p99_ms: (.proofs.device_qualification.measured.worst_sync_p99_ms // null),
+    fio_max_ms: (.proofs.device_qualification.measured.worst_sync_max_ms // null),
+    instance_id: (.provisioning.instance_id // null),
+    instance_type: (.provisioning.instance_type // null),
+    instance_market: (.provisioning.market // null),
+    journal_filesystem: (.provisioning.journal.filesystem // null),
+    evidence_filesystem: (.provisioning.evidence.filesystem // null),
+    foundationdb_backing: (.provisioning.foundationdb.backing // null)
   } | with_entries(select(.value != null))' "$dir/artifact.json" 2>/dev/null || echo '{}')
   ev "$status" "$dir" "$numbers"
 }
@@ -876,11 +888,11 @@ evaluate() { # id kind fn_prefix source arg
     if [[ -z $status ]]; then
       status=$evidence_status
       if [[ $status == 'NOT RUN' ]]; then reason="mode '$MODE' does not run this gate and no evidence is on disk"; fi
-    elif [[ $status == PASSED && $evidence_status == UNQUALIFIED ]]; then
+    elif [[ $status == PASSED && $evidence_status =~ ^(UNQUALIFIED|INTERRUPTED)$ ]]; then
       # The harness completed successfully so that its correctness evidence
       # could be retained, but the evidence is authoritative about whether the
       # whole criterion was qualified to pass.
-      status=UNQUALIFIED
+      status=$evidence_status
     fi
   else
     status=SKIPPED
@@ -930,7 +942,7 @@ collect() {
 }
 
 render() {
-  local total=0 passed=0 failed=0 unqualified=0 notrun=0 skipped=0 unknown=0 row st
+  local total=0 passed=0 failed=0 unqualified=0 interrupted=0 notrun=0 skipped=0 unknown=0 row st
 
   echo
   echo "gate status — MODE: $MODE"
@@ -957,6 +969,7 @@ render() {
       PASSED)      passed=$((passed + 1)) ;;
       FAILED)      failed=$((failed + 1)) ;;
       UNQUALIFIED) unqualified=$((unqualified + 1)) ;;
+      INTERRUPTED) interrupted=$((interrupted + 1)) ;;
       'NOT RUN')   notrun=$((notrun + 1)) ;;
       SKIPPED)     skipped=$((skipped + 1)) ;;
       UNKNOWN)     unknown=$((unknown + 1)) ;;
@@ -979,8 +992,8 @@ render() {
   done
 
   echo
-  echo "  $total gates · $passed passed · $failed failed · $unqualified unqualified · $notrun not run · $skipped skipped · $unknown unknown"
-  echo "  produced by MODE=$MODE — skipped and not-run gates were not evaluated; unqualified gates were only partially evaluated; none are passes."
+  echo "  $total gates · $passed passed · $failed failed · $unqualified unqualified · $interrupted interrupted · $notrun not run · $skipped skipped · $unknown unknown"
+  echo "  produced by MODE=$MODE — skipped, not-run and interrupted gates were not evaluated; unqualified gates were only partially evaluated; none are passes."
   echo
 
   # Precedence, and it is a judgement: a gate that actually failed outranks an
@@ -1059,6 +1072,8 @@ self_test() {
     || die 'self-test: a gate this reporter cannot read no longer reports UNKNOWN; it would vanish from the report'
   has 'status=SKIPPED' \
     || die 'self-test: the prerequisite branch no longer yields SKIPPED; a skip would read as something else'
+  has 'status=$evidence_status' \
+    || die 'self-test: an interrupted environment no longer overrides a successful controller exit'
   has 'MODE: $MODE' \
     || die 'self-test: the mode is no longer named in the human report; a fast run could be read as a full one'
   has '--arg mode "$MODE"' \
@@ -1203,7 +1218,7 @@ EOF
   #    bitten this repository before.
   grep -qE '^  SKIPPED +nightly:p2-kill9' <<<"$report" \
     || die 'self-test: a gate whose prerequisite is missing was not reported SKIPPED'
-  grep -qE '^  (PASSED|FAILED|UNQUALIFIED) +nightly:p2-kill9' <<<"$report" \
+  grep -qE '^  (PASSED|FAILED|UNQUALIFIED|INTERRUPTED) +nightly:p2-kill9' <<<"$report" \
     && die 'self-test: a skipped gate was also reported as a verdict; a skip must never read as a pass'
 
   # 5. The skip is counted apart from the passes in the summary line.
@@ -1241,7 +1256,7 @@ EOF
   jsonl="$dir/out/gate-status.jsonl"
   [[ -r $jsonl ]] || die 'self-test: no JSONL was emitted'
   json_rows=$(wc -l <"$jsonl")
-  human_rows=$(grep -cE '^  (PASSED|FAILED|UNQUALIFIED|NOT RUN|SKIPPED|UNKNOWN) ' <<<"$inspect_report")
+  human_rows=$(grep -cE '^  (PASSED|FAILED|UNQUALIFIED|INTERRUPTED|NOT RUN|SKIPPED|UNKNOWN) ' <<<"$inspect_report")
   [[ $json_rows -eq $human_rows ]] \
     || die "self-test: the JSONL has $json_rows records and the table $human_rows rows; they must be the same report"
   jq -e 'select(.mode != "inspect")' "$jsonl" >/dev/null \
@@ -1316,6 +1331,24 @@ EOF
     || die 'self-test: the summary counted an unqualified P2 report as another state'
   jq -e 'select(.gate == "nightly:p2-kill9" and .status == "UNQUALIFIED")' "$JSONL" >/dev/null \
     || die 'self-test: the machine-readable P2 projection lost the unqualified state'
+
+  # Spot loss is environmental, not a retryable test failure and not a gate
+  # pass. The controller exits cleanly after bounded retries so it can retain
+  # evidence; the artifact's third verdict must remain authoritative.
+  mkdir -p "$dir/out/p2-kill9-yy-interrupted"
+  jq -n '{
+      kind: "p2_two_process_kill9_gate", result: "interrupted",
+      reason: "spot interruption notice", proofs: {device_qualification: null},
+      provisioning: {provider: "aws", market: "spot", instance_id: "i-selftest"}
+    }' >"$dir/out/p2-kill9-yy-interrupted/artifact.json"
+  ROWS=()
+  evaluate 'nightly:p2-kill9' nightly gate_p2_kill9 \
+    'nightly.yml:p2-kill9@hosted (p2-kill9-gate.sh)'
+  p2_projection=$(render)
+  grep -qE '^  INTERRUPTED +nightly:p2-kill9' <<<"$p2_projection" \
+    || die 'self-test: a spot interruption was collapsed into pass or failure'
+  grep -q '1 interrupted' <<<"$p2_projection" \
+    || die 'self-test: the summary did not count an interruption separately'
 
   # A later qualified artifact follows the unchanged path: successful process,
   # complete verdict, PASSED at the top line.

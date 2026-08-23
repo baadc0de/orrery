@@ -58,22 +58,23 @@
 #
 # ## The permission policy, derived from the lifecycle, not from a template
 #
-# An ephemeral machine has three moments: discover, launch tagged, terminate
-# what you tagged. Each statement below is one of those moments, plus one
-# explicit deny. The absences carry as much weight:
+# An ephemeral machine has four moments: discover, launch tagged, read the
+# tagged instance's serial-console evidence, terminate what you tagged. Each
+# statement below is one of those moments, plus one explicit deny. The
+# absences carry as much weight:
 #
 # **No StartInstances / StopInstances.** An ephemeral instance is launched,
 # used and terminated. Pause/resume would let an idle machine accumulate cost
 # indefinitely while every tool still calls it "running since Tuesday"; with
-# no stop grant, everything this role creates dies within its own session or
-# not at all.
+# no stop grant, every machine is either running work or terminating. #176 also
+# sets instance-initiated-shutdown-behavior=terminate, so cloud-init's EXIT
+# trap is independent of the controller's tagged teardown.
 #
-# **No CreateKeyPair, no ssm:*.** How a job reaches the instance (SSM Session
-# Manager vs SSH key pair) is #170's explicitly open question ("neither exists
-# yet"), and it decides a second identity too — an instance profile for SSM.
-# Granting half of it now would be scoping by guesswork, which
-# iam-cache-policy.tf already ruled out once. The control-plane lifecycle here
-# is complete without it; session access lands with #176's first launch.
+# **No CreateKeyPair, no ssm:*.** #176 resolves the access question without a
+# login channel: user data starts a public-repository workload pinned to
+# GITHUB_SHA, and one compact result comes back through GetConsoleOutput. The
+# instance receives no AWS identity at all, so there is no profile to leak and
+# no second credential path to audit.
 #
 # **No DeleteVolume, no DeleteNetworkInterface.** The root volume rides
 # delete-on-termination and a NIC created by RunInstances is reaped with the
@@ -106,21 +107,19 @@
 # everything CI can delete, CI created. The blast radius of a leaked compute
 # credential is the instances of one nightly run.
 #
-# ## What is honestly NOT pinned down yet, stated for the reviewer
+# ## What is and is not pinned down, stated for the reviewer
 #
-# **The AMI is unscoped.** RunInstances' image resource cannot be narrowed
-# without pinning an AMI id, and #176 chooses its base image when it builds
-# the harness — before that, any id would be a guess. The residual exposure:
-# a malicious workflow could launch an AMI carrying licence costs (Windows,
-# RHEL BYOL) on an allowed instance type. The type allow-list and the metal
-# deny bound the per-hour figure but not that line item. Pinning the image ARN
-# is #176's first tightening pass, one condition away.
+# **The AMI publisher is pinned, the image id is discovered.** #176 resolves
+# the newest Ubuntu 24.04 image for each architecture from Canonical account
+# 099720109477. `UseCanonicalUbuntuImage` enforces that owner in IAM, closing
+# #173's recorded Windows/RHEL licence-cost exposure without hard-coding an AMI
+# id that would rot when Canonical publishes its next security refresh.
 #
 # **Subnet/security-group resources are account-scoped, not topology-scoped.**
 # Pinning them means reading pre-existing VPC data into this module, which
 # infra/README.md rules out ("nothing pre-existing is read"), and pre-empts
-# #176's networking shape (a dedicated SG is likely). The default VPC is the
-# only network this account has today, so the marginal grant is near-empty.
+# a topology decision into identity. The default VPC is the only network this
+# account has today, so the marginal grant is near-empty.
 #
 # **Instance types are capability-derived, not preference-derived.** The list
 # is #170's measured candidate set — every family in eu-central-1 reporting
@@ -248,6 +247,53 @@ data "aws_iam_policy_document" "compute_access" {
   # Subnet/security-group/image stay account-scoped rather than id-pinned —
   # the reasons are in the header, under "honestly NOT pinned down".
   # ---------------------------------------------------------------------------
+  # RunInstances evaluates every named resource separately. Public AMIs and
+  # their snapshots do not carry our ownership request tag, so they have their
+  # own grant, pinned to Canonical's publisher account. This also closes #173's
+  # recorded licensed-AMI exposure.
+  statement {
+    sid     = "UseCanonicalUbuntuImage"
+    effect  = "Allow"
+    actions = ["ec2:RunInstances"]
+
+    resources = [
+      "arn:aws:ec2:*::image/*",
+      "arn:aws:ec2:*::snapshot/*",
+    ]
+
+    condition {
+      test     = "StringEquals"
+      variable = "ec2:Owner"
+      values   = ["099720109477"]
+    }
+
+    condition {
+      test     = "StringEquals"
+      variable = "aws:RequestedRegion"
+      values   = [var.region]
+    }
+  }
+
+  # Existing default-VPC objects are inputs to the launch, not things it
+  # creates. They cannot carry aws:RequestTag, so keep this grant separate from
+  # the created-resource statement below.
+  statement {
+    sid     = "UseVpcLaunchInputs"
+    effect  = "Allow"
+    actions = ["ec2:RunInstances"]
+
+    resources = [
+      "arn:aws:ec2:*:${var.expected_account_id}:security-group/*",
+      "arn:aws:ec2:*:${var.expected_account_id}:subnet/*",
+    ]
+
+    condition {
+      test     = "StringEquals"
+      variable = "aws:RequestedRegion"
+      values   = [var.region]
+    }
+  }
+
   statement {
     sid     = "LaunchTaggedInstance"
     effect  = "Allow"
@@ -257,10 +303,7 @@ data "aws_iam_policy_document" "compute_access" {
       "arn:aws:ec2:*:${var.expected_account_id}:instance/*",
       "arn:aws:ec2:*:${var.expected_account_id}:volume/*",
       "arn:aws:ec2:*:${var.expected_account_id}:network-interface/*",
-      "arn:aws:ec2:*:${var.expected_account_id}:security-group/*",
-      "arn:aws:ec2:*:${var.expected_account_id}:subnet/*",
-      "arn:aws:ec2:*:${var.expected_account_id}:image/*",
-      "arn:aws:ec2:*:${var.expected_account_id}:snapshot/*",
+      "arn:aws:ec2:*:${var.expected_account_id}:spot-instances-request/*",
     ]
 
     # The candidate set: local-NVMe families measured in eu-central-1, sizes
@@ -272,13 +315,36 @@ data "aws_iam_policy_document" "compute_access" {
       values   = var.compute_instance_type_patterns
     }
 
-    # Tag at creation or do not create. Every TagSpecification the launcher
-    # sends should carry this tag (instance, volume, NIC), so the request
-    # satisfies this condition whichever resource type AWS evaluates it
-    # against.
+    # Tag at creation or do not create. Every created resource type in the
+    # controller's TagSpecifications carries this tag.
     condition {
       test     = "StringEquals"
       variable = "aws:RequestTag/${local.ephemeral_tag_key}"
+      values   = [local.ephemeral_tag_value]
+    }
+
+    condition {
+      test     = "StringEquals"
+      variable = "aws:RequestedRegion"
+      values   = [var.region]
+    }
+  }
+
+  # ---------------------------------------------------------------------------
+  # Evidence return. The instance has no SSH key, SSM profile, AWS credential
+  # or bucket grant. Its cloud-init process emits one compact, base64-encoded
+  # result to the serial console; the controller may read that console only on
+  # an instance carrying the same ownership tag termination requires.
+  # ---------------------------------------------------------------------------
+  statement {
+    sid       = "ReadTaggedConsoleEvidence"
+    effect    = "Allow"
+    actions   = ["ec2:GetConsoleOutput"]
+    resources = ["arn:aws:ec2:*:${var.expected_account_id}:instance/*"]
+
+    condition {
+      test     = "StringEquals"
+      variable = "aws:ResourceTag/${local.ephemeral_tag_key}"
       values   = [local.ephemeral_tag_value]
     }
 
@@ -359,7 +425,7 @@ resource "aws_iam_role" "github_compute" {
 
 resource "aws_iam_policy" "compute_access" {
   name        = "orrery-ci-compute-access"
-  description = "EC2 discovery, tagged launch, tagged termination, in one region. No start/stop, no deletes, no keys, no SSM."
+  description = "EC2 discovery, tagged launch, tagged console evidence and tagged termination, in one region. No start/stop, no deletes, no keys, no SSM."
   policy      = data.aws_iam_policy_document.compute_access.json
 }
 
