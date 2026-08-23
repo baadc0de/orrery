@@ -173,36 +173,33 @@ pub fn spawn_mirror_retention(
 ///
 /// This is a handle on a channel into the scheduler's own task and nothing
 /// more. It has no wire representation, and no component outside this process
-/// can raise it. The wording here previously said the *coordinator* asks for
-/// the flush when a cell's last player leaves; D24 (a) rules that out — the
-/// gateway holds only the coordinator's **public** keys and no connection to
-/// it, the peer being the courier for every coordinator fact the persistence
-/// tier acts on ([`crate::gateway::CoordinatorHandoutAuthority`]), so there is
-/// no coordinator→gateway control edge that could carry such a request, and
-/// D24 declined to add one. D24 (c) settles what "checkpoint and quiesce"
-/// therefore means today: every affected lease row is parked by one of the
-/// ordinary per-entity paths, and the cell's state reaches durability on the
-/// ordinary 20 s jittered cadence (D16). This signal only pulls that flush
-/// forward.
+/// can raise it. No coordinator can call it: D24 (a) rules out a
+/// coordinator→gateway control edge. The gateway holds only coordinator
+/// **public** keys, and peers courier the signed facts the persistence tier
+/// acts on ([`crate::gateway::CoordinatorHandoutAuthority`]). D24 (c) settles
+/// what "checkpoint and quiesce" means today: ordinary per-entity paths park
+/// affected lease rows, and the cell reaches durability on the ordinary 20 s
+/// jittered cadence (D16). This signal only pulls that flush forward.
 ///
 /// **A flush does not bound hot memory.** A checkpoint writes the cell's state
 /// to durable storage and the actor goes on holding it; there is no cell-state
-/// eviction path anywhere in this crate (the only `evict` in
-/// `orrery_persistd` is the gateway's idle-*peer* registry, which is
-/// unrelated despite the shared word). Bounding the hot tier by *populated*
-/// cells rather than universe size is the **intent of a path that is not
-/// built** — issue #124 Part 2, which must settle the trigger, the durability
-/// precondition, the interaction with §3.4 fencing, and the write
-/// amplification D23 measured, in an ADR before any of it exists.
+/// eviction path anywhere in this crate. The only implemented eviction is the
+/// gateway's idle-*peer* registry, which is unrelated despite the shared word.
+/// Bounding the hot tier by *populated* cells rather than universe size is the
+/// **intent of a path that is not built** — issue #124 Part 2, which must
+/// settle the trigger, the durability precondition, the interaction with §3.4
+/// fencing, and the write amplification D23 measured, in an ADR before any of
+/// it exists.
 ///
-/// **Why this stays `pub` with no production caller.** Its only caller in the
-/// tree is a test (`tests/checkpoint_restore.rs`). It is kept public
-/// deliberately, as the seam issue #124 Part 2 builds on: an eviction path
-/// needs exactly this "flush this cell now" entry point in order to establish
-/// its own safety precondition — a cell may only be dropped from memory once
-/// its state is durable — and removing the type now only to re-add it then
-/// would churn the crate's public API for no gain. If #124 is ever closed
-/// without an eviction path, this is dead surface and should go with it.
+/// **Why this stays `pub` with no production caller.** Every caller in the
+/// tree is test code (including `tests/checkpoint_restore.rs`). It is kept
+/// public deliberately, as the request half of the seam issue #124 Part 2
+/// builds on: an eviction path needs this "flush this cell now" entry point,
+/// followed by a completion result proving which watermark committed, before
+/// it may drop the cell from memory. Removing the type now only to re-add it
+/// then would churn D21's frozen public surface for no gain. If #124 is ever
+/// closed without an eviction path, this is dead surface and should go with
+/// it.
 #[derive(Debug, Clone)]
 pub struct QuiesceSignal {
     tx: tokio::sync::mpsc::Sender<CellId>,
@@ -231,9 +228,9 @@ impl CheckpointScheduler {
     /// The quiesce-flush signal: an in-process handle for requesting an
     /// immediate checkpoint of a cell, ahead of its jittered cadence.
     ///
-    /// Not the coordinator's to call — it has no path here (D24 (a)) — and
-    /// not a memory bound. See [`QuiesceSignal`] for both, and for why the
-    /// type stays public with no production caller.
+    /// No coordinator can call it (D24 (a)), and it is not a memory bound.
+    /// See [`QuiesceSignal`] for both, and for why the type stays public with
+    /// no production caller.
     #[must_use]
     pub fn quiesce_signal(&self) -> QuiesceSignal {
         self.quiesce.clone()
@@ -1033,5 +1030,42 @@ mod tests {
             .unwrap_or_else(|_| panic!("scheduler released the runtime"))
             .into_inner();
         rt.close().await.unwrap();
+    }
+
+    /// The prose in this module twice claimed something the tree does not do:
+    /// that the *coordinator* raises the quiesce signal, and that a flush
+    /// therefore bounds hot memory by populated cells. Both were repaired for
+    /// #124, and both are the kind of claim that regresses silently — nothing
+    /// compiles differently when a doc comment starts lying again.
+    ///
+    /// So the check is the module reading itself. A flush persists the cell
+    /// and the actor goes on holding it; until an eviction path exists (#124
+    /// Part 2, proposed as D39), any sentence here asserting a memory bound is
+    /// false. If that path lands, delete this test in the same change that
+    /// makes the claim true — do not weaken it to keep it green.
+    #[test]
+    fn module_prose_claims_no_memory_bound_and_no_coordinator_signal() {
+        const SCHEDULER_SOURCE: &str = include_str!("scheduler.rs");
+
+        // Everything below the test module is this test's own text, which of
+        // course contains the very phrases it forbids.
+        let prose = SCHEDULER_SOURCE
+            .split_once("mod tests {")
+            .expect("scheduler.rs has a test module")
+            .0;
+
+        for forbidden in [
+            "hot memory is bounded by",
+            "bounded by *populated*",
+            "the coordinator asks",
+            "coordinator signal",
+        ] {
+            assert!(
+                !prose.contains(forbidden),
+                "scheduler.rs prose contains {forbidden:?}: a checkpoint does not \
+                 evict, so it bounds nothing, and D24 (a) leaves no \
+                 coordinator->gateway edge that could raise this signal"
+            );
+        }
     }
 }

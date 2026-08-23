@@ -62,6 +62,11 @@ must name the record it supersedes; the superseded record then changes status
 and links to its replacement. Decision numbers provide stable references, not
 implicit conflict precedence.
 
+D39 is **proposed, not accepted**: [ADR-0039](adr/0039-cell-state-eviction.md)
+holds it. It is deliberately absent from the index above, which is the accepted
+set; it is non-normative until the owner accepts it, and the false hot-memory
+bound it exists to repair is corrected in the tree independently of it.
+
 D18 is reserved only as a proposal in
 [ADR-0017](adr/0017-risks-and-open-questions.md); it is not accepted and has no
 ADR file. D19 deliberately follows that reserved gap.
