@@ -73,6 +73,12 @@ deliberately absent from the index above, which is the accepted set; it is
 non-normative until the owner decides the visibility/spatial-query layering and
 the accepted-record tensions the proposal names.
 
+D41 is **proposed, not accepted**:
+[ADR-0041](adr/0041-offline-identity-issuer-custody-and-lifecycle.md) holds it.
+It is deliberately absent from the index above, which is the accepted set; it
+is non-normative until the owner decides invite custody, account allocation,
+single-use lifecycle, issuer-key custody and campaign session refresh policy.
+
 D18 is reserved only as a proposal in
 [ADR-0017](adr/0017-risks-and-open-questions.md); it is not accepted and has no
 ADR file. D19 deliberately follows that reserved gap.
