@@ -16,7 +16,7 @@
 # variable, because two things need it: agents working the repository in
 # parallel worktrees, and the nightly gates, which were pinned to
 # GitHub-hosted runners purely because a hardcoded 127.0.0.1:4500 would have
-# collided with the development cluster on the self-hosted box.
+# collided with the development cluster on the shared development host.
 #
 #   ORRERY_FDB_DEV_PORT           listen/public port           (default 4500)
 #   ORRERY_FDB_DEV_DIR            instance directory           (default $ROOT/.fdb-dev)

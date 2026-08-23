@@ -190,16 +190,8 @@ build_test_binary() {
     printf '%s\n' "$path"
 }
 
-# `CARGO_TARGET_DIR` is deliberately never exported unconditionally, and the two
-# hazards are both real rather than theoretical.
-#
-# On the self-hosted box each of the three runners is pinned to one job and
-# keeps one warm `target/` for it (AGENTS.md § CI). Relocating the directory
-# from inside the script would make the first run after this merge cold on all
-# three, and every run after it cold again whenever the script and the workflow
-# disagreed.
-#
-# Locally, an agent harness sets `CARGO_TARGET_DIR` per task to keep concurrent
+# `CARGO_TARGET_DIR` is deliberately never exported unconditionally. Locally,
+# an agent harness sets `CARGO_TARGET_DIR` per task to keep concurrent
 # worktrees off each other's builds. Overwriting that collapses isolated lanes
 # onto one directory, and cargo takes an *exclusive* lock on a target
 # directory — so the lanes would not merely share a cache, they would queue.
@@ -484,9 +476,7 @@ lane_test() {
         --no-default-features --features journal-fjall,chain-grpc
 }
 
-# Not a CI lane: CI clears `RUSTC_WRAPPER` for GitHub-hosted runners, which are
-# ephemeral and have nothing to hit; the self-hosted jobs put it back. Locally
-# kache is a build prerequisite (AGENTS.md
+# Not a CI lane: CI clears `RUSTC_WRAPPER`. Locally kache is a build prerequisite (AGENTS.md
 # § Build cache), and `scripts/dev-cache.sh` already knows how to prove it is
 # taking effect — including running a build and watching the request count
 # move. Delegated rather than reimplemented.

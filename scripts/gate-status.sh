@@ -150,14 +150,17 @@ discover_static_gates() {
     | sed 's|scripts/||' | sort -u || true
 }
 
-# `[self-hosted, …]` or a GitHub-hosted image. The distinction is a skip
-# reason: a `macos-latest` leg cannot be evaluated on this box at all.
+# A matrix, a GitHub-hosted image, or a legacy persistent-runner label. The
+# distinction is a skip reason: a `macos-latest` leg cannot be evaluated on
+# this box at all. The legacy classification is deliberately retained even
+# though no workflow currently produces it: an accidental reintroduction is
+# useful source-column evidence, and this function never branches on it.
 job_runner_kind() {
   local block runs_on
   block=$(workflow_job_block "$1" "$2")
   # `runs-on` is not one value in this repository. Two jobs take it from a
-  # matrix, three from the `runner` job's output, and the rest name a label
-  # directly — so a matrix leg is reported as such rather than as whichever of
+  # matrix, and the rest name a label directly — so a matrix leg is reported as
+  # such rather than as whichever of
   # its three `include:` entries happens to be listed first. All of it is
   # labelling for the source column; nothing branches on it.
   runs_on=$(sed -n 's|^[[:space:]]*runs-on:[[:space:]]*||p' <<<"$block" | tail -1)
@@ -781,12 +784,6 @@ gate_ci_determinism_verdict_prereq() {
 }
 gate_ci_determinism_verdict_run() { return 0; }
 gate_ci_determinism_verdict_evidence() { ev_none; }
-
-# `runner` picks a label for the other jobs and gates nothing.
-gate_ci_runner_tier() { echo full; }
-gate_ci_runner_prereq() { echo 'infrastructure: selects a runner label for the other jobs, gates nothing'; return 1; }
-gate_ci_runner_run() { return 0; }
-gate_ci_runner_evidence() { ev_none; }
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Reporting

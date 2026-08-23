@@ -28,11 +28,6 @@ on:
 # That verdict is the ONLY thing main's own push run owes. `pull_request` builds
 # and tests `refs/pull/N/merge` — the PR already merged into main — so re-running
 # `clippy`, `static gates` and `workspace tests` after the merge re-tests a tree
-# that has already passed. That was originally argued on cost — 802 s of
-# self-hosted time on one main run (clippy 76 s, gates 355 s, tests 371 s)
-# against 228 s of hosted — and #178 has now moved all three onto hosted
-# runners, so that half of the argument no longer applies to any of them.
-#
 # They stay `pull_request`-only anyway, deliberately: the cost was never the
 # only reason. Re-running a lane on a tree it has already passed buys no
 # information whichever runner pays for it, and #171 measured the three hosted
@@ -87,24 +82,17 @@ env:
   CARGO_INCREMENTAL: 0
 
 jobs:
-  # No job in this workflow can reach a self-hosted runner, and none exists to
-  # reach. #178 pointed `clippy`, `gates` and `test` at `ubuntu-latest`
-  # directly; #180 deleted the runner picker they had stopped reading and
-  # deregistered the three runners from `orrery-hel1-1`.
-  #
-  # Why the pinning existed, kept because the reasoning outlives the hardware:
-  # the box had a persistent `target/` and a shared build cache worth 5-9
-  # minutes a run. But this repository is **public**, and a self-hosted runner
-  # is not ephemeral — a fork pull request carries its own `build.rs` and its
-  # own test code, and running `cargo test` on it is arbitrary code execution
-  # on hardware that survives the job. So fork pull requests went to hosted
-  # runners and only same-repository events reached the box.
-  #
-  # That guard was never the security boundary, and it mattered not to mistake
-  # it for one: a `pull_request` workflow runs from the merge of the PR into
-  # the base, so the workflow file itself is the base's. The boundary was the
-  # ephemerality of the runner, which is why the answer was to stop using a
-  # persistent one rather than to guard it more carefully.
+  # Fork pull requests are protected by two repository controls. First, a
+  # `pull_request` workflow runs the base revision's workflow file, not YAML
+  # supplied by the fork. Second, GitHub requires approval for workflows from
+  # all external contributors. That setting is Settings -> Actions -> "Approval
+  # for running fork pull request workflows"; it is UI-only, exposed by no REST
+  # endpoint on a public repository, so it cannot be asserted from a script and
+  # must be confirmed by eye if layer two is ever in doubt.
+  # The jobs then execute any accepted build.rs or test code on a disposable
+  # GitHub-hosted VM. That containment is intentionally not counted as an
+  # approval layer: it limits persistence after a job, rather than deciding
+  # whether the fork may run.
 
   fmt:
     name: rustfmt
