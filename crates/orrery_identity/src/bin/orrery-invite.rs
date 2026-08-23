@@ -17,9 +17,9 @@ struct Arguments {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let arguments = Arguments::parse();
-    let mut ledger = InviteLedger::load(&arguments.ledger)?;
-    let minted = mint_invite(&mut ledger, arguments.label, &mut OsInviteCodeGenerator)?;
-    ledger.save(&arguments.ledger)?;
+    let minted = InviteLedger::update_locked(&arguments.ledger, |ledger| {
+        mint_invite(ledger, arguments.label, &mut OsInviteCodeGenerator)
+    })?;
     println!("account={}", minted.account.0);
     println!("invite_code={}", minted.code);
     Ok(())
