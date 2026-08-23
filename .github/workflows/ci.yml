@@ -235,8 +235,12 @@ jobs:
       # build scripts probe pkg-config: alsa-sys, libudev-sys and wayland-sys.
       # A developer machine usually has these already; a runner does not.
       #
-      # Only this job and `test` need them — the determinism matrix and both
-      # nightly gates build Bevy-free crates, which is why those legs stay cheap.
+      # `clippy`, `test` and `gates` need them. `gates` joined that list when
+      # #327 added `clients/regolith` to `scripts/check.sh`'s WORKSPACES table:
+      # the gates lane builds every standalone tool, and that one is a Bevy
+      # client. The determinism matrix and both nightly gates still build
+      # Bevy-free crates, which is why those legs stay cheap — and why the skin
+      # is deliberately not in the determinism matrix.
       - name: Install Bevy's Linux build dependencies
         run: |
           sudo apt-get update
@@ -481,6 +485,18 @@ jobs:
       # eight workspaces gets `cargo test` and which gets `cargo check`, and why,
       # is in scripts/check.sh's lane table — the same table its `--self-test`
       # holds against the filesystem so a new workspace cannot appear unchecked.
+      # `scripts/check.sh`'s gates lane builds every standalone tool, and
+      # `clients/regolith` is a Bevy client — so this job needs the same Linux
+      # display-stack packages `clippy` and `test` install. Without them
+      # `wayland-sys`'s build script fails and the lane dies before any gate
+      # runs, which is how #342 first went red.
+      - name: Install Bevy's Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            g++ pkg-config libx11-dev libasound2-dev libudev-dev \
+            libwayland-dev libxkbcommon-dev
+
       - name: static gates, harness self-tests, standalone tools
         run: scripts/check.sh gates
 
