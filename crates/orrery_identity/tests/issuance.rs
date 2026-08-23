@@ -580,20 +580,24 @@ async fn the_probation_window_is_a_deployment_dial_and_not_a_constant() {
     );
 
     let (service, node) = service_at(T0, T0 + 3 * day_ms).await;
-    let service = service.with_standing_thresholds(StandingThresholds {
-        probation_ms: day_ms,
-        ..DEFAULT_STANDING_THRESHOLDS
-    });
+    let service = service
+        .with_standing_thresholds(StandingThresholds {
+            probation_ms: day_ms,
+            ..DEFAULT_STANDING_THRESHOLDS
+        })
+        .expect("only probation changed; the four invariants still hold");
     assert!(
         !minted_probation(&service, &node, T0 + 3 * day_ms + 1).await,
         "three days is past a one-day window"
     );
 
     let (service, node) = service_at(T0, T0).await;
-    let service = service.with_standing_thresholds(StandingThresholds {
-        probation_ms: 0,
-        ..DEFAULT_STANDING_THRESHOLDS
-    });
+    let service = service
+        .with_standing_thresholds(StandingThresholds {
+            probation_ms: 0,
+            ..DEFAULT_STANDING_THRESHOLDS
+        })
+        .expect("D33 deliberately places no invariant on probation");
     assert!(
         !minted_probation(&service, &node, T0 + 1).await,
         "a zero window means no probation, not everyone forever"

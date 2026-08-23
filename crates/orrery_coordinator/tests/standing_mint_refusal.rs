@@ -88,7 +88,8 @@ async fn service_with(
             StaticStrikeRows::new([(ACCOUNT, rows)]),
             move || scorer_now.load(Ordering::SeqCst),
             DEFAULT_STANDING_THRESHOLDS,
-        ),
+        )
+        .expect("default standing thresholds are coherent"),
         FixedTokenClock::new(UnixMillis::new(T0)),
         IssuerKeyring::new(IssuerSigningKey::new(
             IssuerKeyId::new(1),

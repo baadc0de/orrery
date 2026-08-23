@@ -47,7 +47,7 @@
 //! worse outcome.
 
 use crate::issuer::IssuerKeyring;
-use crate::standing::{StandingThresholds, DEFAULT_STANDING_THRESHOLDS};
+use crate::standing::{StandingThresholdError, StandingThresholds, DEFAULT_STANDING_THRESHOLDS};
 use crate::store::{AccountStore, IdentityError};
 use orrery_protocol::AccountId;
 use orrery_protocol::{
@@ -231,13 +231,21 @@ where
     /// Replace the policy package this service stamps probation against.
     ///
     /// The whole [`StandingThresholds`] rather than the one field it reads, so
-    /// a deployment configures `Q`, `C`, `B` and the probation window as the
-    /// single set D33 clause (d) describes and hands the same value to
-    /// [`crate::ComputedStanding`].
-    #[must_use]
-    pub fn with_standing_thresholds(mut self, thresholds: StandingThresholds) -> Self {
+    /// a deployment configures `Q`, `C`, `B`, intended major-finding count,
+    /// minimum cooldown, and probation window as the single set D33 clause (d)
+    /// describes and hands the same value to [`crate::ComputedStanding`].
+    ///
+    /// # Errors
+    ///
+    /// Refuses an incoherent package under D33 clause (d)'s four startup
+    /// invariants.
+    pub fn with_standing_thresholds(
+        mut self,
+        thresholds: StandingThresholds,
+    ) -> Result<Self, StandingThresholdError> {
+        thresholds.validate()?;
         self.thresholds = thresholds;
-        self
+        Ok(self)
     }
 
     /// The account store, for binding operations and durable reads.

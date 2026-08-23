@@ -87,8 +87,8 @@ pub use service::{
     UnavailableStanding, DEFAULT_SESSION_TOKEN_TTL_MS,
 };
 pub use standing::{
-    score_rows, ComputedStanding, StandingLevel, StandingScores, StandingThresholds,
-    StaticStrikeRows, DEFAULT_STANDING_THRESHOLDS,
+    score_rows, ComputedStanding, StandingLevel, StandingScores, StandingThresholdError,
+    StandingThresholds, StaticStrikeRows, DEFAULT_STANDING_THRESHOLDS,
 };
 pub use store::{AccountStore, BindOutcome, IdentityError};
 pub use window::{
