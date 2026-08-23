@@ -232,6 +232,13 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # earlier entries in this list that ran short of their measurement — they are
 # deliberately not claimed here.
 #
+# Standing-threshold startup validation (issue #295, D33 clause (d)) adds five
+# `orrery_identity` library tests: the accepted default, one isolated test for
+# each of invariants (i), (ii), and (iv), and the record's 3/6/10-at-three
+# example through the fallible scorer constructor for invariant (iii). They do
+# not need a cluster but execute in this invocation, so the floor rises by all
+# five: 508 -> 513.
+#
 # Note for whoever raises it next, because it has now bitten twice (#273): the
 # healthy fixture below is the coupled half. It emits 120 library tests plus
 # `per_target` for each of the nine required targets, and a floor that walks up
@@ -239,7 +246,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # passes should have passed", which names neither the floor nor the fixture.
 # Raise the per-target count in the same commit, and leave real headroom rather
 # than the minimum that passes today.
-FLOOR="${ORRERY_FDB_TEST_FLOOR:-508}"
+FLOOR="${ORRERY_FDB_TEST_FLOOR:-513}"
 
 # Every test file whose contents only mean anything against a real cluster. If
 # one of these reports no executed tests, the tier is dark again whatever the

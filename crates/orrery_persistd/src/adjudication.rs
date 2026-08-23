@@ -37,12 +37,19 @@ pub const RETAINED_BUILDS: usize = 3;
 pub const STRIKE_HALF_LIFE_MS: u64 = 14 * 24 * 60 * 60 * 1000;
 /// D33's hard 90-day strike-row retention, in milliseconds.
 pub const STRIKE_RETENTION_MS: u64 = 90 * 24 * 60 * 60 * 1000;
+/// D33 clause (a)'s non-zero strike-weight table, in milli-points.
+///
+/// Keep the named weights below as aliases into this table. Consumers which
+/// need a property of the whole table (such as its maximum) must derive it
+/// from this value so changing or extending the table cannot leave a second
+/// restatement behind.
+pub const STRIKE_WEIGHT_TABLE_MILLI: [i32; 3] = [3_000, 1_000, 500];
 /// A confirmed replay deviation or fabricated evidence is one major finding.
-pub const MAJOR_STRIKE_WEIGHT_MILLI: i32 = 3_000;
+pub const MAJOR_STRIKE_WEIGHT_MILLI: i32 = STRIKE_WEIGHT_TABLE_MILLI[0];
 /// A proved non-cooperation finding.
-pub const NON_COOPERATION_WEIGHT_MILLI: i32 = 1_000;
+pub const NON_COOPERATION_WEIGHT_MILLI: i32 = STRIKE_WEIGHT_TABLE_MILLI[1];
 /// A reviewed timing-pattern finding.
-pub const TIMING_PATTERN_WEIGHT_MILLI: i32 = 500;
+pub const TIMING_PATTERN_WEIGHT_MILLI: i32 = STRIKE_WEIGHT_TABLE_MILLI[2];
 
 /// Whether a filed strike is calibration-only or affects standing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

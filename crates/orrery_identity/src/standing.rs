@@ -8,12 +8,16 @@
 use crate::service::StandingSource;
 use crate::store::IdentityError;
 use async_trait::async_trait;
-use orrery_persistd::adjudication::{StrikeMode, StrikeRow, STRIKE_HALF_LIFE_MS};
+use orrery_persistd::adjudication::{
+    StrikeMode, StrikeRow, STRIKE_HALF_LIFE_MS, STRIKE_WEIGHT_TABLE_MILLI,
+};
 use orrery_protocol::{AccountId, SessionStanding};
 use std::collections::HashMap;
+use std::fmt;
 
 /// The configured account-policy package: the quarantine/cooldown/ban
-/// boundaries in milli-points, and the probation window in milliseconds.
+/// boundaries in milli-points, intended major-finding count, minimum cooldown,
+/// and probation window.
 ///
 /// One value rather than two, because D33 clause (d) names them as one dial
 /// set — "`Q`, `C`, `B`, the minimum cooldown and the probation window are
@@ -28,6 +32,11 @@ pub struct StandingThresholds {
     pub cooldown_milli: i64,
     /// `Cooldown` becomes `Banned` at this score.
     pub ban_milli: i64,
+    /// Number of major findings by which the operator intends ban to be
+    /// reachable, before decay.
+    pub intended_major_findings: u32,
+    /// Minimum time an account remains in cooldown, in milliseconds.
+    pub cooldown_min_ms: u64,
     /// How long after `AccountRow::created_ms` an account remains on
     /// probation, in milliseconds.
     ///
@@ -37,14 +46,92 @@ pub struct StandingThresholds {
     pub probation_ms: u64,
 }
 
-/// D33 clause (d)'s recommended package: 3/5/7 with a 7-day probation. Owner
-/// selection can replace this value.
+/// D33 clause (d)'s recommended package: 3/5/7, ban intended to be reachable
+/// by three major findings, a 14-day minimum cooldown, and 7-day probation.
+/// Owner selection can replace this value.
 pub const DEFAULT_STANDING_THRESHOLDS: StandingThresholds = StandingThresholds {
     quarantine_milli: 3_000,
     cooldown_milli: 5_000,
     ban_milli: 7_000,
+    intended_major_findings: 3,
+    cooldown_min_ms: 14 * 24 * 60 * 60 * 1_000,
     probation_ms: 7 * 24 * 60 * 60 * 1_000,
 };
+
+/// An incoherent D33 standing-policy package.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StandingThresholdError {
+    /// Invariant (i): one maximum-weight finding cannot reach quarantine.
+    QuarantineAboveMaximumWeight {
+        /// Configured quarantine boundary.
+        quarantine_milli: i64,
+        /// Maximum entry in D33 clause (a)'s weight table.
+        maximum_weight_milli: i64,
+    },
+    /// Invariant (ii): the three standing boundaries are not strictly ordered.
+    BoundariesNotStrictlyOrdered {
+        /// Configured quarantine boundary.
+        quarantine_milli: i64,
+        /// Configured cooldown boundary.
+        cooldown_milli: i64,
+        /// Configured ban boundary.
+        ban_milli: i64,
+    },
+    /// Invariant (iii): the intended number of maximum-weight findings cannot
+    /// reach ban even before decay.
+    BanUnreachableByIntendedFindings {
+        /// Configured ban boundary.
+        ban_milli: i64,
+        /// Configured intended number of major findings.
+        intended_major_findings: u32,
+        /// Maximum entry in D33 clause (a)'s weight table.
+        maximum_weight_milli: i64,
+        /// Largest score those findings can produce before decay.
+        reachable_milli: i64,
+    },
+    /// Invariant (iv): cooldown has no positive minimum duration.
+    CooldownMinimumNotPositive {
+        /// Configured minimum cooldown duration.
+        cooldown_min_ms: u64,
+    },
+}
+
+impl fmt::Display for StandingThresholdError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match *self {
+            Self::QuarantineAboveMaximumWeight {
+                quarantine_milli,
+                maximum_weight_milli,
+            } => write!(
+                formatter,
+                "D33 standing threshold invariant (i) failed: Q={quarantine_milli} milli-points must be <= w_max={maximum_weight_milli} milli-points so one proved major violation quarantines"
+            ),
+            Self::BoundariesNotStrictlyOrdered {
+                quarantine_milli,
+                cooldown_milli,
+                ban_milli,
+            } => write!(
+                formatter,
+                "D33 standing threshold invariant (ii) failed: Q={quarantine_milli}, C={cooldown_milli}, B={ban_milli} milli-points must satisfy Q < C < B so every standing state is reachable"
+            ),
+            Self::BanUnreachableByIntendedFindings {
+                ban_milli,
+                intended_major_findings,
+                maximum_weight_milli,
+                reachable_milli,
+            } => write!(
+                formatter,
+                "D33 standing threshold invariant (iii) failed: B={ban_milli} milli-points must be <= n_intended={intended_major_findings} * w_max={maximum_weight_milli} milli-points = {reachable_milli} milli-points so ban is reachable by the intended findings"
+            ),
+            Self::CooldownMinimumNotPositive { cooldown_min_ms } => write!(
+                formatter,
+                "D33 standing threshold invariant (iv) failed: cooldown_min={cooldown_min_ms} ms must be > 0 so cooldown cannot be left instantly"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for StandingThresholdError {}
 
 impl Default for StandingThresholds {
     fn default() -> Self {
@@ -53,6 +140,44 @@ impl Default for StandingThresholds {
 }
 
 impl StandingThresholds {
+    /// Validate D33 clause (d)'s four startup invariants.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first failed invariant, naming every value involved. A
+    /// configuration loader must propagate this error and refuse startup.
+    pub fn validate(self) -> Result<(), StandingThresholdError> {
+        let maximum_weight_milli = maximum_strike_weight_milli();
+        if self.quarantine_milli > maximum_weight_milli {
+            return Err(StandingThresholdError::QuarantineAboveMaximumWeight {
+                quarantine_milli: self.quarantine_milli,
+                maximum_weight_milli,
+            });
+        }
+        if !(self.quarantine_milli < self.cooldown_milli && self.cooldown_milli < self.ban_milli) {
+            return Err(StandingThresholdError::BoundariesNotStrictlyOrdered {
+                quarantine_milli: self.quarantine_milli,
+                cooldown_milli: self.cooldown_milli,
+                ban_milli: self.ban_milli,
+            });
+        }
+        let reachable_milli = i64::from(self.intended_major_findings) * maximum_weight_milli;
+        if self.ban_milli > reachable_milli {
+            return Err(StandingThresholdError::BanUnreachableByIntendedFindings {
+                ban_milli: self.ban_milli,
+                intended_major_findings: self.intended_major_findings,
+                maximum_weight_milli,
+                reachable_milli,
+            });
+        }
+        if self.cooldown_min_ms == 0 {
+            return Err(StandingThresholdError::CooldownMinimumNotPositive {
+                cooldown_min_ms: self.cooldown_min_ms,
+            });
+        }
+        Ok(())
+    }
+
     /// Whether an account created at `created_ms` is still inside probation at
     /// `now_ms` (D33 clause (d), `docs/07-witnessing.md` §5).
     ///
@@ -167,13 +292,31 @@ pub struct ComputedStanding<R, C> {
 
 impl<R, C> ComputedStanding<R, C> {
     /// Assemble a scorer with an explicit policy package.
-    pub const fn new(rows: R, clock: C, thresholds: StandingThresholds) -> Self {
-        Self {
+    ///
+    /// # Errors
+    ///
+    /// Refuses an incoherent package under D33 clause (d)'s four startup
+    /// invariants.
+    pub fn new(
+        rows: R,
+        clock: C,
+        thresholds: StandingThresholds,
+    ) -> Result<Self, StandingThresholdError> {
+        thresholds.validate()?;
+        Ok(Self {
             rows,
             clock,
             thresholds,
-        }
+        })
     }
+}
+
+fn maximum_strike_weight_milli() -> i64 {
+    STRIKE_WEIGHT_TABLE_MILLI
+        .iter()
+        .copied()
+        .max()
+        .map_or(0, i64::from)
 }
 
 #[async_trait]
@@ -222,6 +365,97 @@ mod tests {
             mode,
             expires_at_ms: issued_at_ms + STRIKE_RETENTION_MS,
         }
+    }
+
+    #[test]
+    fn default_thresholds_satisfy_all_four_startup_invariants() {
+        DEFAULT_STANDING_THRESHOLDS
+            .validate()
+            .expect("D33's accepted default package must start");
+    }
+
+    #[test]
+    fn invariant_i_names_quarantine_and_weight_table_maximum() {
+        let thresholds = StandingThresholds {
+            quarantine_milli: 3_001,
+            ..DEFAULT_STANDING_THRESHOLDS
+        };
+        let error = thresholds.validate().expect_err("Q above w_max must fail");
+        assert_eq!(
+            error,
+            StandingThresholdError::QuarantineAboveMaximumWeight {
+                quarantine_milli: 3_001,
+                maximum_weight_milli: 3_000,
+            }
+        );
+        assert_eq!(
+            error.to_string(),
+            "D33 standing threshold invariant (i) failed: Q=3001 milli-points must be <= w_max=3000 milli-points so one proved major violation quarantines"
+        );
+    }
+
+    #[test]
+    fn invariant_ii_names_all_three_unordered_boundaries() {
+        let thresholds = StandingThresholds {
+            cooldown_milli: 3_000,
+            ..DEFAULT_STANDING_THRESHOLDS
+        };
+        let error = thresholds
+            .validate()
+            .expect_err("equal Q and C must fail strict ordering");
+        assert_eq!(
+            error,
+            StandingThresholdError::BoundariesNotStrictlyOrdered {
+                quarantine_milli: 3_000,
+                cooldown_milli: 3_000,
+                ban_milli: 7_000,
+            }
+        );
+        assert!(error.to_string().contains("Q=3000, C=3000, B=7000"));
+    }
+
+    #[test]
+    fn legacy_three_six_ten_is_rejected_by_invariant_iii_at_three_findings() {
+        let legacy = StandingThresholds {
+            quarantine_milli: 3_000,
+            cooldown_milli: 6_000,
+            ban_milli: 10_000,
+            intended_major_findings: 3,
+            ..DEFAULT_STANDING_THRESHOLDS
+        };
+        let error = ComputedStanding::new(StaticStrikeRows::default(), || 0, legacy)
+            .err()
+            .expect("startup must refuse a ban unreachable by intended findings");
+        assert_eq!(
+            error,
+            StandingThresholdError::BanUnreachableByIntendedFindings {
+                ban_milli: 10_000,
+                intended_major_findings: 3,
+                maximum_weight_milli: 3_000,
+                reachable_milli: 9_000,
+            }
+        );
+        assert!(error.to_string().contains(
+            "invariant (iii) failed: B=10000 milli-points must be <= n_intended=3 * w_max=3000 milli-points = 9000 milli-points"
+        ));
+    }
+
+    #[test]
+    fn invariant_iv_names_the_zero_cooldown() {
+        let thresholds = StandingThresholds {
+            cooldown_min_ms: 0,
+            ..DEFAULT_STANDING_THRESHOLDS
+        };
+        let error = thresholds
+            .validate()
+            .expect_err("an instantaneous cooldown must fail");
+        assert_eq!(
+            error,
+            StandingThresholdError::CooldownMinimumNotPositive { cooldown_min_ms: 0 }
+        );
+        assert!(error
+            .to_string()
+            .contains("invariant (iv) failed: cooldown_min=0 ms must be > 0"));
     }
 
     #[test]
