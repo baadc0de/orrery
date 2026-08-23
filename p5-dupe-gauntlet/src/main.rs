@@ -1080,6 +1080,51 @@ fn ramp_warmup(
 /// D32 clause (b) says a shadow verdict carries the exact `RejectionCause`
 /// label `Required` returns, so the gate can only check that by refusing the
 /// intent one way and observing it the other.
+/// Choose the offender's witness subset: `WITNESS_QUORUM_K` announced
+/// witnesses that do **not** cover `required`.
+///
+/// Split out from [`ramp_offender`] so the one thing that can silently
+/// un-offend the offender is directly testable.
+///
+/// The comparison is by **set**. What makes the intent an offender is that a
+/// required witness is absent from the submitted members; the quorum check is
+/// membership and does not care about order. `required_witnesses` returns its
+/// draw in draw order while the leading-K slice is in eligible order, so an
+/// ordered `==` is false for every permutation of a colliding set: the guard
+/// would not fire, the check below would pass, and the harness would submit a
+/// fully-witnessed intent as its offender. That intent commits, the
+/// `enforcing_acts` arm fails, and the report blames a gate that is behaving
+/// correctly.
+///
+/// Rate, so this is not dismissed as theoretical: the draw takes
+/// `WITNESS_QUORUM_K` = 3 of the 7 announced witnesses, so it collides with the
+/// leading 3 once in `C(7,3)` = 35 runs, and 5 of the 6 orderings of a
+/// colliding set are permutations rather than the identity — 5/210, about one
+/// run in 42. That is what failed run 32614843047.
+fn offender_members(eligible: &[NodeId], required: &[NodeId]) -> Result<Vec<NodeId>> {
+    fn same_set(a: &[NodeId], b: &[NodeId]) -> bool {
+        let (mut a, mut b) = (a.to_vec(), b.to_vec());
+        a.sort_unstable();
+        b.sort_unstable();
+        a == b
+    }
+
+    anyhow::ensure!(
+        eligible.len() > WITNESS_QUORUM_K,
+        "need more than WITNESS_QUORUM_K announced witnesses to build a \
+         non-covering subset"
+    );
+    let mut members: Vec<NodeId> = eligible.iter().copied().take(WITNESS_QUORUM_K).collect();
+    if same_set(&members, required) {
+        members[WITNESS_QUORUM_K - 1] = eligible[WITNESS_QUORUM_K];
+    }
+    anyhow::ensure!(
+        !same_set(&members, required) && members.len() == WITNESS_QUORUM_K,
+        "the offender's subset is the required one; it would not offend"
+    );
+    Ok(members)
+}
+
 fn ramp_offender(
     issuer: &iroh::SecretKey,
     intent_id: u128,
@@ -1089,14 +1134,7 @@ fn ramp_offender(
     witness_keys: &[iroh::SecretKey],
 ) -> Result<(Intent, Vec<NodeId>, Vec<NodeId>)> {
     let required = required_witnesses(draw_key, intent_id, eligible);
-    let mut members: Vec<NodeId> = eligible.iter().copied().take(WITNESS_QUORUM_K).collect();
-    if members == required {
-        members[WITNESS_QUORUM_K - 1] = eligible[WITNESS_QUORUM_K];
-    }
-    anyhow::ensure!(
-        members != required && members.len() == WITNESS_QUORUM_K,
-        "the offender's subset is the required one; it would not offend"
-    );
+    let members = offender_members(eligible, &required)?;
     let mut intent = transfer_intent(issuer, intent_id, item, RAMP_ASSET);
     for node in &members {
         let key = witness_keys
@@ -1735,4 +1773,58 @@ fn read_refusal_audit(path: &Path) -> Result<std::collections::BTreeMap<u128, St
 
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn node(seed: u8) -> NodeId {
+        secret(seed).public()
+    }
+
+    /// The regression from run 32614843047: `required` was a *permutation* of
+    /// the leading `WITNESS_QUORUM_K` eligible witnesses, not a different set.
+    ///
+    /// An ordered `members == required` is false here, so the old guard did not
+    /// fire and the old `ensure!` did not trip. The harness then submitted an
+    /// intent carrying every required witness as its "offender", the gateway
+    /// correctly committed it, and `enforcing_acts` failed — blaming a gate
+    /// that was right.
+    #[test]
+    fn a_permuted_required_set_still_forces_a_non_covering_subset() {
+        let eligible: Vec<NodeId> = (100..107).map(node).collect();
+        let required = vec![eligible[0], eligible[2], eligible[1]];
+
+        // The precondition that made the old comparison useless.
+        assert_ne!(
+            eligible[..WITNESS_QUORUM_K].to_vec(),
+            required,
+            "this case is only interesting when an ordered comparison says \
+             they differ"
+        );
+
+        let members = offender_members(&eligible, &required).expect("subset");
+
+        let mut got = members.clone();
+        let mut want = required.clone();
+        got.sort_unstable();
+        want.sort_unstable();
+        assert_ne!(
+            got, want,
+            "the offender must omit a required witness, or it does not offend"
+        );
+        assert_eq!(members.len(), WITNESS_QUORUM_K);
+    }
+
+    /// The ordinary case: the draw genuinely differs, and the leading slice is
+    /// already a valid offender, so nothing is substituted.
+    #[test]
+    fn a_disjoint_required_set_leaves_the_leading_subset_alone() {
+        let eligible: Vec<NodeId> = (100..107).map(node).collect();
+        let required = vec![eligible[3], eligible[4], eligible[5]];
+
+        let members = offender_members(&eligible, &required).expect("subset");
+        assert_eq!(members, eligible[..WITNESS_QUORUM_K].to_vec());
+    }
 }
