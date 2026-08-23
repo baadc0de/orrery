@@ -1,14 +1,14 @@
 # `infra/` — the AWS identity plane and the kache cache bucket
 
 Terraform for [#173](https://github.com/baadc0de/orrery/issues/173) (a GitHub
-OIDC provider and one federated IAM role) and
+OIDC provider and **two** federated IAM roles), and
 [#174](https://github.com/baadc0de/orrery/issues/174) (the S3 bucket kache uses
 as its remote, with the lifecycle rule that replaces
 `kache-prune-shared.timer`).
 
-**Applied 2026-08-21.** All ten resources exist in account `590561279276`,
-verified with `aws` directly rather than from Terraform's own output, since
-state can drift from reality:
+**Applied 2026-08-21.** All ten resources of the identity plane + cache bucket
+exist in account `590561279276`, verified with `aws` directly rather than from
+Terraform's own output, since state can drift from reality:
 
 | | |
 |---|---|
@@ -16,6 +16,11 @@ state can drift from reality:
 | role | `arn:aws:iam::590561279276:role/orrery-ci-cache` |
 | OIDC provider | `token.actions.githubusercontent.com` — the account's first |
 | lifecycle | `expire-cache-objects`, 14 d on `artifacts/`, plus multipart abort |
+
+The **compute role** (`orrery-ci-compute`, also #173) is in the tree since
+2026-08-23 but **not yet applied** — see § The compute role below for its
+three resources and what applying them costs (nothing per month; instances
+bill only while a gate keeps one alive).
 
 It was applied as an IAM principal, not as the account root user, and the plan
 was read before the apply — `10 to add, 0 to change, 0 to destroy`, matching
@@ -36,33 +41,32 @@ figure that matters is **egress, not storage**.
 
 ## What it creates — the whole list
 
-Ten resources, all named `orrery-*` or `orrery-kache`, so they are separable by
-name from the 25 roles, 1 IAM user, 9 customer policies and 1 instance profile
-this account already carries for unrelated workloads. Nothing pre-existing is
-read, referenced or modified.
+Ten applied resources and three pending ones, all named `orrery-*` or
+`orrery-kache`, so they are separable by name from the 25 roles, 1 IAM user,
+9 customer policies and 1 instance profile this account already carries for
+unrelated workloads. Nothing pre-existing is read, referenced or modified.
 
-| Resource | Name | Why |
-|---|---|---|
-| `aws_iam_openid_connect_provider` | `token.actions.githubusercontent.com` | The account's first. Lets GitHub-signed tokens be presented to STS. |
-| `aws_iam_role` | `orrery-ci-cache` | Assumed from Actions. The trust policy is the reviewable artefact. |
-| `aws_iam_policy` + attachment | `orrery-ci-cache-access` | Four object actions on one prefix. No delete, no bucket admin. |
-| `aws_s3_bucket` | `orrery-kache` | The kache remote, `eu-central-1`. |
-| `aws_s3_bucket_public_access_block` | — | All four switches on. |
-| `aws_s3_bucket_ownership_controls` | — | `BucketOwnerEnforced`; ACLs off. |
-| `aws_s3_bucket_server_side_encryption_configuration` | — | SSE-S3 (AES256). |
-| `aws_s3_bucket_lifecycle_configuration` | — | Expiry + multipart abort. |
-| `aws_s3_bucket_policy` | — | Deny non-TLS. |
+| Resource | Name | Status | Why |
+|---|---|---|---|
+| `aws_iam_openid_connect_provider` | `token.actions.githubusercontent.com` | applied | The account's first. Lets GitHub-signed tokens be presented to STS. |
+| `aws_iam_role` | `orrery-ci-cache` | applied | Assumed from Actions. The trust policy is the reviewable artefact. |
+| `aws_iam_policy` + attachment | `orrery-ci-cache-access` | applied | Four object actions on one prefix. No delete, no bucket admin. |
+| `aws_iam_role` | `orrery-ci-compute` | **pending apply** | #176's ephemeral machines. Main-only trust; tag-chained lifecycle. |
+| `aws_iam_policy` + attachment | `orrery-ci-compute-access` | **pending apply** | EC2 discovery, tagged launch, tagged termination. One region. |
+| `aws_s3_bucket` | `orrery-kache` | applied | The kache remote, `eu-central-1`. |
+| `aws_s3_bucket_public_access_block` | — | applied | All four switches on. |
+| `aws_s3_bucket_ownership_controls` | — | applied | `BucketOwnerEnforced`; ACLs off. |
+| `aws_s3_bucket_server_side_encryption_configuration` | — | applied | SSE-S3 (AES256). |
+| `aws_s3_bucket_lifecycle_configuration` | — | applied | Expiry + multipart abort. |
+| `aws_s3_bucket_policy` | — | applied | Deny non-TLS. |
 
-Not created: **no access keys, no IAM users, no KMS keys, no EC2, no VPC
-changes, no account-level settings.** #173's whole point is that there is no
-long-lived credential anywhere in this design, and there is not one in this
-directory.
-
-Also not created: **#176's compute role.** Its least-privilege shape depends on
-which instance family passes D19's fio qualification and on whether access is by
-SSM or a key pair — none of which is decided. Writing an `ec2:RunInstances`
-grant now would mean scoping it by guesswork. The OIDC provider it needs is
-here, and its ARN is an output.
+Not created: **no access keys, no IAM users, no KMS keys, no VPC changes, no
+account-level settings.** #173's whole point is that there is no long-lived
+credential anywhere in this design, and there is not one in this directory.
+(EC2 *resources* are likewise not created here: instances exist only while a
+gate launches one, per the standing no-long-running-infrastructure decision,
+and launching is done by workflows assuming the compute role — never by this
+module.)
 
 ---
 
@@ -143,6 +147,118 @@ or a malicious commit merged to a branch, yields the ability to fill and read a
 build cache. The objects are content-addressed compiler outputs of a public
 repository. Poisoning one requires a hash collision; reading them reveals
 compiled artefacts of code that is already public. That is the entire grant.
+
+---
+
+## The compute role — `orrery-ci-compute` (#173, for #176)
+
+The second of the two roles #173 names: what #176's ephemeral qualified
+machines assume they may do. It exists to launch one EC2 instance in
+`eu-central-1`, let a gate run on it, and terminate that instance — nothing
+more. Instances are per-run infrastructure by standing decision; nothing here
+keeps one alive between runs.
+
+### The trust policy
+
+Rendered exactly as AWS receives it (`terraform -chdir=infra output -raw` has
+no equivalent for trust documents; this is `data.aws_iam_policy_document.github_compute_trust.json`):
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Sid": "GitHubActionsWebIdentityCompute",
+    "Effect": "Allow",
+    "Action": "sts:AssumeRoleWithWebIdentity",
+    "Principal": {
+      "Federated": "arn:aws:iam::590561279276:oidc-provider/token.actions.githubusercontent.com"
+    },
+    "Condition": {
+      "StringEquals": {
+        "token.actions.githubusercontent.com:aud": "sts.amazonaws.com",
+        "token.actions.githubusercontent.com:sub":
+          "repo:baadc0de@15308543/orrery@1331921648:ref:refs/heads/main"
+      }
+    }
+  }]
+}
+```
+
+**Read why this is tighter than the cache role's.** The cache serves branches,
+tags and same-repo PRs; machines cost money and can be left running if a job
+dies, so the compute credential is granted to exactly one subject:
+
+- **Permitted:** `…:ref:refs/heads/main`. Pushes to main, `workflow_dispatch`
+  on main, and the nightly `schedule` (which GitHub always runs on the default
+  branch) all carry precisely this string. The population that can mint it is
+  the population whose code has passed review and merged.
+- **Fork pull requests:** excluded three independent ways. Their subjects name
+  another repository; GitHub never mints an OIDC token for a fork PR at all;
+  and `.github/actions/aws-compute-role` refuses any `pull_request` event up
+  front with a message naming the reason instead of an opaque STS denial.
+- **Same-repo pull requests:** excluded on purpose. A PR is where unreviewed
+  code lands before review, and unreviewed code must not launch billable
+  machines. Testing the ephemeral flow before merge means merging first, or
+  widening `compute_allowed_subject_suffixes` in variables.tf as a conscious,
+  reviewable act.
+- **Tags and `environment:*`:** absent with the same reasoning oidc.tf records
+  for the cache role — Environments *replace* the ref in the subject, so the
+  day a job gains one it fails here until added deliberately.
+
+A reviewer can check the subject against reality without AWS:
+`terraform -chdir=infra output -raw compute_allowed_oidc_subjects`, or read it
+off a real token from any run's log line `assumed principal:`.
+
+### The permission policy
+
+Four statements plus one explicit deny; every action is listed because the
+lifecycle needs it, and the absences are argued in iam-compute-policy.tf's
+header:
+
+| Statement | Grants | Bounds |
+|---|---|---|
+| `NoMetalSizes` | — (**Deny**) | `ec2:RunInstances` refused for `*.metal`, cutting the most expensive shapes off every family glob below. |
+| `DiscoveryReadOnly` | eight `ec2:Describe*` actions | Instance types (the #170 capability query), images, AZs, VPC/subnet/SG lookups, our instances' status. Resource `*` — Describe actions accept no narrower scope — but pinned to `eu-central-1` via `aws:RequestedRegion`. |
+| `LaunchTaggedInstance` | `ec2:RunInstances` | Only instance types matching `compute_instance_type_patterns` (#170's measured local-NVMe candidate set); only requests carrying `aws:RequestTag/orrery-ci-ephemeral=true`; only `eu-central-1`; subordinate resources scoped to this account's ARNs. |
+| `TagOnlyAtLaunch` | `ec2:CreateTags` | Only while `ec2:CreateAction = RunInstances`. Tags can never be written onto an existing object afterwards. |
+| `TerminateTaggedOnly` | `ec2:TerminateInstances` | Only objects carrying `aws:ResourceTag/orrery-ci-ephemeral=true`. |
+
+**Not granted**, each deliberate: `StartInstances`/`StopInstances` (an idle
+machine could accrue cost forever while looking ephemeral), `CreateKeyPair`
+and `ssm:*` (session access — SSM vs SSH — is #170's open question and drags
+an instance profile with it; granting half now would be scoping by guesswork),
+every delete action (root volumes ride delete-on-termination and RunInstances'
+NICs are reaped with the instance), S3/IAM/KMS/STS (nothing outside EC2).
+
+**The tag chain is the security argument.** Launch requires the tag;
+retagging outside a launch is impossible; termination requires the tag.
+Together: *everything CI can create, CI can delete; everything CI can delete,
+CI created.* A leaked compute credential's blast radius is the instances of
+one nightly run, and nothing pre-existing in the account is reachable even
+for reads beyond Describe*.
+
+### The instance-type allow-list will rot, in one direction
+
+The list in variables.tf is #170's measured candidate set — every family in
+`eu-central-1` reporting `NvmeSupport=required` — because D19 qualifies devices
+by measurement and #176 measures the whole set rather than reasoning families
+out first. AWS will add families; until someone re-runs #170's discovery query
+and adds them consciously, new families fail closed. That is the correct
+default for a credential that creates billable machines. Metal sizes never
+match anyway: the explicit deny removes them from every glob at once,
+including shapes like `u-*.metal` and `mac*.metal` no family pattern covers.
+
+### Proving it works, nightly
+
+nightly.yml's `compute-identity-smoke` job assumes the role through
+[`.github/actions/aws-compute-role`](../.github/actions/aws-compute-role/action.yml)
+and runs [`scripts/aws-compute-smoke.sh`](../scripts/aws-compute-smoke.sh):
+three positive probes (identity, discovery, image resolution) and five
+refusals the job *requires*, each side-effect-free by construction — the
+launch probe uses `--dry-run`, so not even a broken policy can start anything
+during the proof. The script's `--self-test` runs per-commit in `check.sh`'s
+gates lane and asserts the Terraform still contains every clause those probes
+enforce at runtime.
 
 ---
 
@@ -266,11 +382,45 @@ Read the plan. The three things worth reading closely are the `sub` list in
 `data.aws_iam_policy_document.github_cache_trust`, the action list in
 `data.aws_iam_policy_document.cache_access`, and the two lifecycle rules.
 
-Then hand the outputs to #175 rather than transcribing them — a mistyped role
+### Applying the compute role (pending as of 2026-08-23)
+
+The cache half above is applied; `iam-compute-policy.tf` is not. From this
+directory, on an already-initialized checkout:
+
+```console
+$ terraform -chdir=infra fmt -check -recursive     # passes
+$ terraform -chdir=infra validate                  # passes
+$ scripts/aws-compute-smoke.sh --self-test         # structural clauses hold (no AWS needed)
+$ terraform -chdir=infra plan                      # 3 to add, 0 to change, 0 to destroy
+$ terraform -chdir=infra apply
+```
+
+The plan's three adds are exactly: `aws_iam_role.github_compute`,
+`aws_iam_policy.compute_access`, and its attachment. Read two things closely:
+the rendered subject list in
+`data.aws_iam_policy_document.github_compute_trust` — it must end in
+`:ref:refs/heads/main`, character for character — and the action lists in
+`data.aws_iam_policy_document.compute_access`. Nothing else in the plan may
+change; if a tenth resource appears, stop and read why.
+
+Then prove the credential path from Actions:
+
+```console
+$ gh workflow run nightly.yml        # dispatch runs on main; the trust policy permits exactly that
+$ gh run watch                       # or watch https://github.com/baadc0de/orrery/actions
+```
+
+and read the `compute-identity-smoke` job: it prints the assumed principal,
+exercises the discovery query #176 will start from, and requires five IAM
+refusals (S3, IAM, off-list launch under `--dry-run`, untagged termination,
+retag-outside-launch). A green run there is #173's acceptance evidence.
+
+Then hand the outputs onward rather than transcribing them — a mistyped role
 ARN fails as an opaque `AccessDenied` several minutes into a job:
 
 ```console
 $ terraform -chdir=infra output -raw cache_role_arn
+$ terraform -chdir=infra output -raw compute_role_arn
 $ terraform -chdir=infra output -json kache_env
 ```
 
@@ -304,6 +454,9 @@ the lifecycle rule would eventually expire it.
 | `AccessDenied` on a List, while Get and Put work | The `s3:prefix` condition in `iam-cache-policy.tf` is too tight for the caller's list request. kache's build path does not list, so this degrades `sync`/`doctor` rather than the cache; widen the condition values or drop the condition. |
 | `BucketAlreadyExists` | Bucket names are global. Set `cache_bucket_name`. (`orrery-kache` was free on 2026-08-21.) |
 | A transition rule to IA/Glacier tiers almost nothing | The account reports `TransitionDefaultMinimumObjectSize: all_storage_classes_128K` — transitions skip objects under 128 KB, which is most of a build cache. Override it or do not add transitions. There are none today. |
+| `compute-identity-smoke` fails with `Not authorized to perform sts:AssumeRoleWithWebIdentity` | Almost always the ref: this role accepts **only** `ref:refs/heads/main`, so a dispatch on a branch is refused by design. Compare the token's `sub` against `terraform output -raw compute_allowed_oidc_subjects` character by character. A repository rename changes the prefix — see the row above. |
+| …the smoke's negative probes fail with anything but `UnauthorizedOperation`/`AccessDenied` | The policy has widened: e.g. `InvalidInstanceId.NotFound` on N4 means the tag guard is gone and AWS looked the instance up instead of refusing. Treat as a security regression, not flakiness; `scripts/aws-compute-smoke.sh --self-test` names which Terraform clause to diff first. |
+| The composite action refuses with "pull_request events cannot assume…" | Working as designed — same-repo PRs cannot launch machines (fork PRs never even get an OIDC token). Merge, or widen `compute_allowed_subject_suffixes` deliberately. |
 
 ## Watching the size
 
@@ -341,11 +494,13 @@ $ terraform -chdir=infra destroy
 Two warnings.
 
 **The OIDC provider is account-global.** Destroying it breaks every federated
-role in the account at once. Today only `orrery-ci-cache` uses it; once #176
-adds a compute role, or if any unrelated workload adopts it, `terraform destroy`
-here becomes a wider action than it looks. Check with
+role in the account at once. Both `orrery-ci-cache` and `orrery-ci-compute`
+trust it, and any unrelated workload that adopts it would too, so
+`terraform destroy` here becomes a wider action than it looks. Check with
 `aws iam list-open-id-connect-providers` and audit who trusts it before
-destroying.
+destroying. (Destroying the compute role itself is safe the way deleting a
+key is: nightly's `compute-identity-smoke` goes red on the next run, loudly,
+at the point of use.)
 
 **Deleting the cache is safe; deleting the identity plane is not, silently.**
 Cache objects are content-addressed, so an emptied bucket costs one cold build.
@@ -361,8 +516,9 @@ of use.
 | `versions.tf` | Terraform and provider pinning; why Terraform. |
 | `providers.tf` | Region, default tags, and the wrong-account guard. |
 | `variables.tf` | Every input, each with its justification. |
-| `oidc.tf` | **#173.** The provider, and the trust policy with its full argument. |
-| `iam-cache-policy.tf` | **#173.** The permissions policy, derived from kache's request set. |
+| `oidc.tf` | **#173.** The provider, and the cache trust policy with its full argument. |
+| `iam-cache-policy.tf` | **#173.** The cache permissions policy, derived from kache's request set. |
+| `iam-compute-policy.tf` | **#173.** The compute role: main-only trust, the tag-chained EC2 lifecycle, and the argued absences. |
 | `s3.tf` | **#174.** The bucket, its defaults, and the lifecycle rule. |
 | `outputs.tf` | What #175 consumes. |
 | `terraform.tfvars.example` | Overrides, none of which an ordinary apply needs. |

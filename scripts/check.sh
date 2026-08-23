@@ -291,6 +291,14 @@ lane_gates() {
     run scripts/p4-accumulate.sh --self-test
     run scripts/p4-ledger.sh --self-test
 
+    # #173's compute-role smoke. Its real run needs AWS credentials and
+    # happens nightly (nightly.yml `compute-identity-smoke`); this structural
+    # half runs per-commit against the checkout alone and asserts the
+    # Terraform still says what the nightly probes enforce at runtime — trust
+    # conditions pinned, pull_request absent, the tag chain intact, no grant
+    # outside EC2 — and that the workflow plumbing still reaches the script.
+    run scripts/aws-compute-smoke.sh --self-test
+
     # The gate reporter's own. It is the script that says which gates ran and
     # what they measured, so a report that has quietly stopped discovering a
     # gate is exactly as bad as a gate that has quietly stopped failing. Its

@@ -1055,6 +1055,73 @@ jobs:
             echo '```'
           } | tee -a "$GITHUB_STEP_SUMMARY"
 
+  compute-identity-smoke:
+    name: cloud identity smoke (assume orrery-ci-compute via OIDC)
+    # ── What this job is ───────────────────────────────────────────────────
+    #
+    # #173's demonstration: a workflow job authenticates to AWS with NO
+    # long-lived key anywhere in secrets, prints the assumed principal it
+    # resolved to, and then proves the credential is least-privilege in fact —
+    # three positive probes (identity, instance-type discovery, image
+    # resolution) and five refusals it REQUIRES (no S3, no IAM, an
+    # out-of-allow-list launch denied under --dry-run, untagged-instance
+    # termination denied, retag-outside-launch denied).
+    #
+    # It is not a phase gate; it is the credential path #176's ephemeral
+    # qualified machines will ride. Like `p4-accumulate` it produces evidence
+    # rather than guarding a demo criterion, but unlike that one its nightly
+    # cadence is cheap insurance rather than accumulation: every call is free
+    # or sub-penny, nothing launches even if the policy were broken (the
+    # launch probe is --dry-run), and a trust policy that has silently drifted
+    # from the Terraform should be tonight's red row, not #176's first run.
+    #
+    # ── Who can reach this credential ──────────────────────────────────────
+    #
+    # The role's trust policy (infra/iam-compute-policy.tf) permits exactly
+    # repo:<prefix>:ref:refs/heads/main — pushes to main, dispatch on main,
+    # and this schedule, which GitHub always runs on the default branch. No
+    # pull_request subject of any kind: this repository is public, fork PRs
+    # never receive an OIDC token at all, and same-repo PRs are where
+    # unreviewed code lands before review — so unreviewed code cannot launch
+    # billable machines. The per-job `id-token: write` below is granted here
+    # and nowhere else; the workflow default stays `contents: read`.
+    #
+    # scripts/gate-status.sh knows this job through a
+    # gate_compute_identity_smoke_* trio delegating to
+    # scripts/aws-compute-smoke.sh — the same script, so the report and the
+    # workflow cannot drift apart.
+    #
+    # Cost: $0 in practice — STS and Describe* are free-tier calls, the
+    # negatives are refusals by construction, no instance exists during any
+    # step, and the runner minutes are public-repository-free.
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v7
+
+      # Present on hosted Ubuntu images. Asserted rather than assumed so an
+      # image change surfaces as this message instead of a mystery failure
+      # three steps later.
+      - name: Assert the AWS CLI the probes need
+        run: aws --version
+
+      - uses: ./.github/actions/aws-compute-role
+
+      - name: Prove what the credential may and may not do
+        run: scripts/aws-compute-smoke.sh
+
+      - name: Upload the smoke's report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: compute-identity-smoke-evidence
+          path: target/compute-identity-smoke/
+          retention-days: 14
+          if-no-files-found: warn
+
   determinism-soak:
     name: determinism soak (extended corpus)
     # Ten corpus repeats in one process, against one Bevy-free crate whose

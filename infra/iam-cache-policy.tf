@@ -133,22 +133,16 @@ resource "aws_iam_role_policy_attachment" "cache_access" {
 }
 
 # -----------------------------------------------------------------------------
-# NOT PROVISIONED HERE: #176's compute role.
+# NOT HERE, ON PURPOSE: #176's compute role.
 #
-# #173's scope names two roles, a cache role and a compute role for the
-# ephemeral qualified machines. Only the cache role is here, deliberately.
+# This file was written with only the cache role, and its closing note said
+# why: an `ec2:RunInstances` grant needs answers this directory did not have
+# (which instance family passes D19's qualification, SSM or key pair, launch
+# template shape), and scoping one by guesswork is exactly what #173 rejects.
 #
-# The compute role's least-privilege shape depends on decisions #176 has not
-# made and this PR must not pre-empt: which instance family passes D19's fio
-# qualification (the candidate set spans arm64 and x86 and is chosen by
-# measurement, per #170), whether access is by SSM Session Manager or a key
-# pair (neither exists in the account), and what the launch template and
-# instance profile look like. An `ec2:RunInstances` grant written before those
-# answers exist would be scoped by guesswork, and #173 says plainly that
-# `ec2:*` is not an acceptable answer.
-#
-# What #176 inherits from this PR is the expensive part: the OIDC provider
-# exists, its ARN is an output, and this file is the worked example of the
-# scoping standard its policy has to meet. Adding the compute role is then one
-# file, not a re-derivation.
+# The compute role has since landed as its own file, iam-compute-policy.tf,
+# with those questions answered where they could be and the remainder stated
+# as open on the record rather than papered over. It reuses this file's
+# conventions — data.aws_iam_policy_document, argued absences, a rendered
+# subject list in the plan output — so read that file as this one's sequel.
 # -----------------------------------------------------------------------------

@@ -1,0 +1,96 @@
+# Assume `orrery-ci-compute` from GitHub's OIDC token (#173).
+#
+# Factored out for the same reason .github/actions/foundationdb is: the smoke
+# job and #176's ephemeral-machine jobs need the same credential shape, and a
+# drift between them — a different session naming scheme here, a widened trust
+# condition there — would be invisible until one of them failed oddly.
+#
+# The security properties live in the role's trust policy
+# (infra/iam-compute-policy.tf), not here; what this action adds on top of a
+# bare configure-aws-credentials step is:
+#
+#   * a legible refusal on pull_request events. The trust policy never
+#     permits a pull_request subject, so such an assumption always fails —
+#     but it fails as `Not authorized to perform sts:AssumeRoleWithWebIdentity`
+#     several minutes into a job. Refusing up front names the reason instead.
+#     Fork pull requests are covered twice over regardless (GitHub never mints
+#     their OIDC token), which this guard restates rather than replaces.
+#   * proof of who the job became. The acceptance criterion for #173 is that a
+#     job "prints the assumed principal it resolved to"; doing it inside the
+#     action means every consumer gets the same evidence, and asserting the ARN
+#     really is orrery-ci-compute catches the failure mode where ambient AWS
+#     environment variables from some earlier step silently answer first.
+#
+# No access key exists anywhere in this design and none may be added to it:
+# there is no `aws-access-key-id` input, and adding one would be exactly the
+# thing #173 exists to retire.
+
+name: Assume the Orrery CI compute role
+description: >-
+  Refuse paths the compute trust policy can never accept, assume
+  orrery-ci-compute from the workflow's OIDC token, and print the assumed
+  principal.
+
+inputs:
+  role-to-assume:
+    description: IAM role to assume. The default is terraform output -raw compute_role_arn.
+    required: false
+    default: arn:aws:iam::590561279276:role/orrery-ci-compute
+  aws-region:
+    description: Region for the session and every probe made with it.
+    required: false
+    default: eu-central-1
+  role-session-name:
+    description: CloudTrail-visible session name.
+    required: false
+    default: ${{ github.job }}-${{ github.run_id }}-${{ github.run_attempt }}
+
+runs:
+  using: composite
+  steps:
+    - name: Refuse paths the trust policy can never accept
+      shell: bash
+      run: |
+        set -euo pipefail
+        event='${{ github.event_name }}'
+        if [[ $event == pull_request ]]; then
+          echo "::error::pull_request events cannot assume orrery-ci-compute — the trust policy permits ref:refs/heads/main only, because unreviewed code must not launch billable machines. Merge first, or widen compute_allowed_subject_suffixes in infra/variables.tf as a conscious act."
+          exit 1
+        fi
+
+    - name: Configure AWS credentials from the OIDC token
+      uses: aws-actions/configure-aws-credentials@v6
+      with:
+        role-to-assume: ${{ inputs.role-to-assume }}
+        aws-region: ${{ inputs.aws-region }}
+        role-session-name: ${{ inputs.role-session-name }}
+        # Matches the role's max_session_duration (3600): a credential cannot
+        # outlive the hour its policy pins, and p2-kill9's job timeout fits
+        # inside it.
+        role-duration-seconds: 3600
+
+    - name: Print who this job became
+      shell: bash
+      env:
+        EXPECTED_ROLE_NAME: orrery-ci-compute
+      run: |
+        set -euo pipefail
+        ident="$(aws sts get-caller-identity --output json)"
+        jq . <<<"$ident"
+        arn="$(jq -r .Arn <<<"$ident")"
+        account="$(jq -r .Account <<<"$ident")"
+        case "$arn" in
+          *"assumed-role/${EXPECTED_ROLE_NAME}/"*) ;;
+          *)
+            echo "::error::assumed principal is not assumed-role/${EXPECTED_ROLE_NAME}: got $arn"
+            exit 1
+            ;;
+        esac
+        echo "assumed principal: $arn (account $account)"
+        {
+          echo '### Assumed cloud identity'
+          echo '```'
+          echo "principal: $arn"
+          echo "account:   $account"
+          echo '```'
+        } >> "$GITHUB_STEP_SUMMARY"

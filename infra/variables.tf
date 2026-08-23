@@ -90,6 +90,83 @@ variable "allowed_subject_suffixes" {
   }
 }
 
+variable "compute_allowed_subject_suffixes" {
+  description = <<-EOT
+    The `sub` suffixes that may assume orrery-ci-compute, after the repository
+    prefix. Deliberately narrower than allowed_subject_suffixes, because this
+    role creates billable machines rather than reading a cache:
+
+      ref:refs/heads/main   pushes to main, workflow_dispatch on main, and the
+                            nightly schedule (GitHub runs schedules on the
+                            default branch) — all three carry exactly this
+
+    pull_request is deliberately absent for BOTH kinds of fork question: a
+    fork PR never gets an OIDC token at all, and a same-repository PR is where
+    unreviewed code lands, so neither may launch instances. Tags and
+    environment:* are absent with the same reasoning oidc.tf records for the
+    cache role. Widening any of these is a conscious edit to this list.
+  EOT
+  type        = list(string)
+  default = [
+    "ref:refs/heads/main",
+  ]
+
+  validation {
+    condition     = length(var.compute_allowed_subject_suffixes) > 0
+    error_message = "At least one subject suffix must be permitted, or the compute role is unassumable."
+  }
+}
+
+variable "compute_instance_type_patterns" {
+  description = <<-EOT
+    The EC2 instance types orrery-ci-compute may launch, as family globs.
+    Capability-derived, not preference-derived: every entry below came from
+    #170's measured discovery in eu-central-1 on 2026-08-21 — all families
+    reporting instance-storage-supported with NvmeSupport=required — because
+    D19 qualifies devices by measurement and #176 measures the whole set
+    (~$9 on-demand / ~$3 spot per one-hour pass) instead of reasoning families
+    out first.
+
+    Metal sizes are excluded separately by an explicit Deny in
+    iam-compute-policy.tf, which also covers shapes no family glob would have
+    matched anyway (u-*.metal, mac*.metal).
+
+    This list rots in one direction only: AWS will ADD families. When #170's
+    discovery query is re-run and a new local-NVMe family appears, add it here
+    consciously — until then a new family fails closed, which is the right
+    default for a credential that creates billable machines.
+
+        aws ec2 describe-instance-types \
+          --filters "Name=instance-storage-supported,Values=true" \
+          --query 'InstanceTypes[?InstanceStorageInfo.NvmeSupport==`required`].[InstanceType, InstanceStorageInfo.TotalSizeInGB]' \
+          --output table
+  EOT
+  type        = list(string)
+  default = [
+    # compute, local NVMe
+    "c6gd.*", "c7gd.*", "c8gd.*", "c9gd.*",
+    "c6id.*", "c8id.*",
+    # general purpose, local NVMe
+    "m6gd.*", "m7gd.*", "m8gd.*",
+    "m6id.*", "m6idn.*", "m8id.*",
+    # memory, local NVMe
+    "r6gd.*", "r7gd.*", "r8gd.*",
+    "r6id.*", "r6idn.*", "r8id.*", "r8idn.*", "r8idb.*",
+    # storage-optimised
+    "i3.*", "i3en.*", "i4i.*", "i7i.*", "i7ie.*",
+    # Graviton storage-optimised
+    "im4gn.*", "is4gen.*",
+  ]
+
+  validation {
+    condition = alltrue([
+      for pattern in var.compute_instance_type_patterns :
+      can(regex("^[a-z][a-z0-9-]+\\.\\*$", pattern))
+    ])
+    error_message = "Each entry is an EC2 family glob like \"c7gd.*\" — family name plus \".*\". A bare family name matches no InstanceType value, because condition values are compared against full size names like c7gd.xlarge."
+  }
+}
+
 variable "cache_bucket_name" {
   description = <<-EOT
     S3 bucket for the kache remote. S3 bucket names are global across all AWS

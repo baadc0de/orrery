@@ -42,6 +42,26 @@ output "cache_prefix" {
   value       = var.cache_prefix
 }
 
+output "compute_role_arn" {
+  description = "Pass to aws-actions/configure-aws-credentials as `role-to-assume`. The default of .github/actions/aws-compute-role; #176's ephemeral-machine jobs assume this."
+  value       = aws_iam_role.github_compute.arn
+}
+
+output "compute_role_name" {
+  description = "IAM role name, for console lookups and CloudTrail filters."
+  value       = aws_iam_role.github_compute.name
+}
+
+output "compute_allowed_oidc_subjects" {
+  description = <<-EOT
+    The exact `sub` values the COMPUTE trust policy accepts, rendered. Compare
+    against a failing job's token subject character by character — for this
+    role the most likely mismatch is a branch other than main, which is
+    excluded on purpose.
+  EOT
+  value       = local.allowed_compute_subjects
+}
+
 output "allowed_oidc_subjects" {
   description = <<-EOT
     The exact `sub` values the trust policy accepts, rendered. Paste these into
