@@ -135,6 +135,28 @@ if [[ ${1:-} == --self-test ]]; then
     || die 'self-test: the report is not held to the shadow-does-not-act arm'
   grep -Fq 'jq -e '\''.arms.reversibility.passed == true'\'' "$out/report.json"' <<<"$body" \
     || die 'self-test: the report is not held to the reversibility arm'
+  # `gate-status.sh` reads three field paths out of this report to render the
+  # ramp row. A jq path that no longer exists returns **null**, not an error, so
+  # renaming a report field breaks the operator's view silently and every
+  # self-test still passes. #301 moved the shadow diagnostics under a
+  # `diagnostics` object for exactly the legibility reason this gate exists to
+  # serve; that move would have left `shadow_verdict: null` on every run.
+  #
+  # So assert the two ends agree: every `.arms.shadow_observes...` path
+  # gate-status reads must name a key the harness actually emits.
+  repo_root=$(cd "$(dirname "$0")/.." && pwd -P)
+  ramp_reader=$(sed -n 's/.*\(\.arms\.shadow_observes[A-Za-z_.]*\).*/\1/p' \
+    "$repo_root/scripts/gate-status.sh" | sort -u)
+  [[ -n $ramp_reader ]] \
+    || die 'self-test: gate-status.sh reads no shadow_observes path; the ramp row cannot be rendered'
+  while read -r path; do
+    [[ -n $path ]] || continue
+    leaf=${path##*.}
+    grep -Fq "\"$leaf\"" "$repo_root/p5-dupe-gauntlet/src/main.rs" \
+      || die "self-test: gate-status.sh reads $path but the harness emits no '$leaf' key; \
+a renamed report field returns null rather than failing, so the ramp row would go blank"
+  done <<<"$ramp_reader"
+
   grep -Fq 'touch "$out/PASSED"' <<<"$body" \
     || die 'self-test: no final success artifact exists'
   echo 'self-test: two opposed gateways, runtime posture lever, ramp arm, both readiness postures, all four report arms and a final verdict present'

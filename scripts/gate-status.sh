@@ -540,8 +540,9 @@ gate_ramp_shadow_evidence() {
     enforcing_cause: .arms.enforcing_acts.audit_cause,
     enforcing_intent_rows: .arms.enforcing_acts.intent_rows,
     shadow_observes: .arms.shadow_observes.passed,
-    shadow_verdict: .arms.shadow_observes.offender_observation.verdict,
-    shadow_verdict_matches: .arms.shadow_observes.verdict_matches_enforcing_cause,
+    shadow_verdict: .arms.shadow_observes.diagnostics.offender_observation.verdict,
+    shadow_verdict_matches:
+      .arms.shadow_observes.diagnostics.cross_gateway_verdict_matches_enforcing_audit_cause,
     shadow_does_not_act: .arms.shadow_does_not_act.passed,
     shadow_outcome_committed: (.arms.shadow_does_not_act.outcome | startswith("Committed")),
     shadow_attest_enforced: .arms.shadow_does_not_act.attest_row_enforced,
