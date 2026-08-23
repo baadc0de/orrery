@@ -4,7 +4,7 @@ use super::weapon::WeaponKind;
 use orrery_core::{CodecError, CoreCodec, QPos, QVel};
 use orrery_protocol::PersistId;
 
-use super::state::RockTier;
+use super::state::{BloomMembership, RockTier};
 
 fn encode_pos(pos: QPos, out: &mut Vec<u8>) {
     for value in [pos.x, pos.y, pos.z] {
@@ -45,6 +45,8 @@ pub struct ChildSpec {
     pub pos: QPos,
     /// Child lattice velocity.
     pub vel: QVel,
+    /// Bloom lineage inherited from the parent, if any.
+    pub bloom: Option<BloomMembership>,
 }
 
 /// An ordered core input.
@@ -94,6 +96,20 @@ pub enum Order {
     },
     /// A pickup's denial delivered back to an unsuccessful craft.
     PickupDenied,
+    /// A destroyed craft's logged credit delivered to its killer.
+    KillCredit,
+    /// A destroyed rock's logged point value delivered to its killer.
+    RockCredit {
+        /// Resolver-owned points from the dead rock's hashed tier.
+        points: u8,
+    },
+    /// A bloom rock lineage changed size, delivered to its director.
+    BloomPopulationChanged {
+        /// Director-local bloom generation.
+        bloom_index: u32,
+        /// Net live-lineage change: `+1` for a split, `-1` for a terminal death.
+        delta: i8,
+    },
 }
 
 impl CoreCodec for Order {
@@ -138,6 +154,13 @@ impl CoreCodec for Order {
                 out.extend_from_slice(&[5, kind.tag()]);
             }
             Self::PickupDenied => out.push(6),
+            Self::KillCredit => out.push(7),
+            Self::RockCredit { points } => out.extend_from_slice(&[8, *points]),
+            Self::BloomPopulationChanged { bloom_index, delta } => {
+                out.push(9);
+                out.extend_from_slice(&bloom_index.to_le_bytes());
+                out.push(delta.to_le_bytes()[0]);
+            }
         }
     }
     fn decode(bytes: &[u8]) -> Result<Self, CodecError> {
@@ -170,6 +193,12 @@ impl CoreCodec for Order {
                 kind: WeaponKind::from_tag(rest[0])?,
             }),
             (6, 0) => Ok(Self::PickupDenied),
+            (7, 0) => Ok(Self::KillCredit),
+            (8, 1) => Ok(Self::RockCredit { points: rest[0] }),
+            (9, 5) => Ok(Self::BloomPopulationChanged {
+                bloom_index: u32::from_le_bytes(rest[0..4].try_into().unwrap()),
+                delta: i8::from_le_bytes([rest[4]]),
+            }),
             _ => Err(CodecError("regolith order: bad tag or length")),
         }
     }
@@ -242,6 +271,75 @@ pub enum Outcome {
         /// Expired pickup.
         id: PersistId,
     },
+    /// One director seeded ten fully described rocks in slot order.
+    BloomSeeded {
+        /// Emitting director.
+        director: PersistId,
+        /// Director-local bloom generation.
+        bloom_index: u32,
+        /// In-band site announcement position.
+        site_pos: QPos,
+        /// Absolute site expiry tick.
+        active_until: u64,
+        /// Two Large, three Medium, then five Small rocks.
+        rocks: Box<[ChildSpec; 10]>,
+    },
+    /// A rock death earned resolver-owned points.
+    RockDestroyed {
+        /// Last attacker whose logged damage reduced hull to zero.
+        by: PersistId,
+        /// Points derived from the dead rock's own hashed tier.
+        points: u8,
+    },
+    /// A bloom lineage split or ended, routed to the owning director.
+    BloomPopulationChanged {
+        /// Owning director.
+        director: PersistId,
+        /// Director-local bloom generation.
+        bloom_index: u32,
+        /// Net live-lineage change.
+        delta: i8,
+    },
+}
+
+fn encode_bloom(bloom: Option<BloomMembership>, out: &mut Vec<u8>) {
+    match bloom {
+        Some(bloom) => {
+            out.push(1);
+            out.extend_from_slice(&bloom.director.0.to_le_bytes());
+            out.extend_from_slice(&bloom.bloom_index.to_le_bytes());
+        }
+        None => out.extend_from_slice(&[0; 13]),
+    }
+}
+
+fn decode_bloom(bytes: &[u8]) -> Result<Option<BloomMembership>, CodecError> {
+    match bytes[0] {
+        0 => Ok(None),
+        1 => Ok(Some(BloomMembership {
+            director: PersistId::new(u64::from_le_bytes(bytes[1..9].try_into().unwrap())),
+            bloom_index: u32::from_le_bytes(bytes[9..13].try_into().unwrap()),
+        })),
+        _ => Err(CodecError("regolith outcome: bad bloom tag")),
+    }
+}
+
+fn encode_child(child: &ChildSpec, out: &mut Vec<u8>) {
+    out.extend_from_slice(&child.id.0.to_le_bytes());
+    out.push(child.tier.tag());
+    encode_pos(child.pos, out);
+    encode_vel(child.vel, out);
+    encode_bloom(child.bloom, out);
+}
+
+fn decode_child(bytes: &[u8]) -> Result<ChildSpec, CodecError> {
+    Ok(ChildSpec {
+        id: PersistId::new(u64::from_le_bytes(bytes[0..8].try_into().unwrap())),
+        tier: RockTier::from_tag(bytes[8])?,
+        pos: decode_pos(&bytes[9..33]),
+        vel: decode_vel(&bytes[33..57]),
+        bloom: decode_bloom(&bytes[57..70])?,
+    })
 }
 
 impl CoreCodec for Outcome {
@@ -274,10 +372,7 @@ impl CoreCodec for Outcome {
                 out.extend_from_slice(&parent.0.to_le_bytes());
                 out.extend_from_slice(&generation.to_le_bytes());
                 for child in children {
-                    out.extend_from_slice(&child.id.0.to_le_bytes());
-                    out.push(child.tier.tag());
-                    encode_pos(child.pos, out);
-                    encode_vel(child.vel, out);
+                    encode_child(child, out);
                 }
             }
             Self::SpawnPickup {
@@ -315,6 +410,37 @@ impl CoreCodec for Outcome {
                 out.push(7);
                 out.extend_from_slice(&id.0.to_le_bytes());
             }
+            Self::BloomSeeded {
+                director,
+                bloom_index,
+                site_pos,
+                active_until,
+                rocks,
+            } => {
+                out.push(8);
+                out.extend_from_slice(&director.0.to_le_bytes());
+                out.extend_from_slice(&bloom_index.to_le_bytes());
+                encode_pos(*site_pos, out);
+                out.extend_from_slice(&active_until.to_le_bytes());
+                for rock in rocks.iter() {
+                    encode_child(rock, out);
+                }
+            }
+            Self::RockDestroyed { by, points } => {
+                out.push(9);
+                out.extend_from_slice(&by.0.to_le_bytes());
+                out.push(*points);
+            }
+            Self::BloomPopulationChanged {
+                director,
+                bloom_index,
+                delta,
+            } => {
+                out.push(10);
+                out.extend_from_slice(&director.0.to_le_bytes());
+                out.extend_from_slice(&bloom_index.to_le_bytes());
+                out.push(delta.to_le_bytes()[0]);
+            }
         }
     }
     fn decode(bytes: &[u8]) -> Result<Self, CodecError> {
@@ -332,23 +458,11 @@ impl CoreCodec for Outcome {
             (1, 8) => Ok(Self::Destroyed {
                 by: PersistId::new(u64::from_le_bytes(rest.try_into().unwrap())),
             }),
-            (2, 126) => {
-                let child = |offset: usize| -> Result<ChildSpec, CodecError> {
-                    Ok(ChildSpec {
-                        id: PersistId::new(u64::from_le_bytes(
-                            rest[offset..offset + 8].try_into().unwrap(),
-                        )),
-                        tier: RockTier::from_tag(rest[offset + 8])?,
-                        pos: decode_pos(&rest[offset + 9..offset + 33]),
-                        vel: decode_vel(&rest[offset + 33..offset + 57]),
-                    })
-                };
-                Ok(Self::Split {
-                    parent: PersistId::new(u64::from_le_bytes(rest[0..8].try_into().unwrap())),
-                    generation: u32::from_le_bytes(rest[8..12].try_into().unwrap()),
-                    children: [child(12)?, child(69)?],
-                })
-            }
+            (2, 152) => Ok(Self::Split {
+                parent: PersistId::new(u64::from_le_bytes(rest[0..8].try_into().unwrap())),
+                generation: u32::from_le_bytes(rest[8..12].try_into().unwrap()),
+                children: [decode_child(&rest[12..82])?, decode_child(&rest[82..152])?],
+            }),
             (3, 35) => Ok(Self::SpawnPickup {
                 id: PersistId::new(u64::from_le_bytes(rest[0..8].try_into().unwrap())),
                 pos: decode_pos(&rest[8..32]),
@@ -369,6 +483,33 @@ impl CoreCodec for Outcome {
             }),
             (7, 8) => Ok(Self::Expired {
                 id: PersistId::new(u64::from_le_bytes(rest.try_into().unwrap())),
+            }),
+            (8, 744) => {
+                let rocks: [Result<ChildSpec, CodecError>; 10] = core::array::from_fn(|slot| {
+                    let offset = 44 + slot * 70;
+                    decode_child(&rest[offset..offset + 70])
+                });
+                let rocks = rocks
+                    .into_iter()
+                    .collect::<Result<Vec<_>, _>>()?
+                    .try_into()
+                    .map_err(|_| CodecError("regolith outcome: bloom rock count"))?;
+                Ok(Self::BloomSeeded {
+                    director: PersistId::new(u64::from_le_bytes(rest[0..8].try_into().unwrap())),
+                    bloom_index: u32::from_le_bytes(rest[8..12].try_into().unwrap()),
+                    site_pos: decode_pos(&rest[12..36]),
+                    active_until: u64::from_le_bytes(rest[36..44].try_into().unwrap()),
+                    rocks: Box::new(rocks),
+                })
+            }
+            (9, 9) => Ok(Self::RockDestroyed {
+                by: PersistId::new(u64::from_le_bytes(rest[0..8].try_into().unwrap())),
+                points: rest[8],
+            }),
+            (10, 13) => Ok(Self::BloomPopulationChanged {
+                director: PersistId::new(u64::from_le_bytes(rest[0..8].try_into().unwrap())),
+                bloom_index: u32::from_le_bytes(rest[8..12].try_into().unwrap()),
+                delta: i8::from_le_bytes([rest[12]]),
             }),
             _ => Err(CodecError("regolith outcome: bad tag or length")),
         }
