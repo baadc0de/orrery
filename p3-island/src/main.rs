@@ -1334,6 +1334,7 @@ fn mint_token(issuer: &iroh::SecretKey, node: NodeId) -> Result<Vec<u8>> {
             SessionTokenTtlMs::new(3_600_000),
             SessionStanding::Good,
             IssuerKeyId::new(1),
+            false,
         ),
         issuer,
     )?

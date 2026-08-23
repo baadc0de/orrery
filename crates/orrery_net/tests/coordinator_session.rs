@@ -49,6 +49,7 @@ fn token(issuer: &iroh::SecretKey, bound: NodeId) -> Vec<u8> {
             SessionTokenTtlMs::new(60_000),
             SessionStanding::Good,
             IssuerKeyId::new(1),
+            false,
         ),
         issuer,
     )

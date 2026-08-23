@@ -50,10 +50,14 @@
 //! costs something; pricing it and proving it was paid for is a product
 //! decision. [`AccountStore::create_account`] creates one by fiat.
 //!
-//! **`SessionTokenClaimsV1` is unchanged.** Probation, account-age buckets and
-//! any widened standing are sibling work; this crate issues the V1 claims that
-//! already exist, including their two-armed
-//! [`orrery_protocol::SessionStanding`].
+//! **Standing stays two-armed, and probation is the one claim this crate
+//! added.** [`orrery_protocol::SessionStanding`] is still `Good`/`Quarantined`
+//! (D33 clause (e): cooldown and ban are admission decisions, not token
+//! states). What did move is account age: `SessionTokenClaimsV1` gained
+//! `on_probation` at claims version 2, stamped here from
+//! `AccountRow::created_ms` against [`StandingThresholds::probation_ms`],
+//! because the filter that consumes it lives in the coordinator and D31 clause
+//! (d) gives the coordinator no durable read to answer it with.
 //!
 //! # The TTL cap is enforced at both ends
 //!

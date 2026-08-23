@@ -1266,9 +1266,10 @@ async fn handle_connection(
                         }
                     }
                     let now_ms = shared.presence_clock.now_ms();
-                    // Keep the account and the standing this session authenticated
-                    // as. These used to be dropped on the floor the instant the
-                    // signature checked out, and four of D28 clause (e)'s six
+                    // Keep the identity this session authenticated as — the
+                    // account, the standing, and the probation flag. These used
+                    // to be dropped on the floor the instant the signature
+                    // checked out, and five of D28 clause (e)'s six
                     // witness-eligibility filters rest on nothing more than
                     // retaining them: they are already inside a signature this
                     // process verifies, from an issuer it already trusts.
@@ -1278,21 +1279,17 @@ async fn handle_connection(
                     // outage is invisible here. `note_grace_session` carries the
                     // reasoning.
                     if graced {
-                        shared.seeder.lock().await.note_grace_session(
-                            remote,
-                            claims.account,
-                            claims.standing,
-                            claims.issued_at_ms,
-                            now_ms,
-                        );
+                        shared
+                            .seeder
+                            .lock()
+                            .await
+                            .note_grace_session(remote, &claims, now_ms);
                     } else {
-                        shared.seeder.lock().await.note_session(
-                            remote,
-                            claims.account,
-                            claims.standing,
-                            claims.issued_at_ms,
-                            now_ms,
-                        );
+                        shared
+                            .seeder
+                            .lock()
+                            .await
+                            .note_session(remote, &claims, now_ms);
                         // Only a token identity itself vouched for right now
                         // establishes a session to grace later.
                         shared.established.lock().await.admit(

@@ -992,11 +992,13 @@ mod tests {
     }
 
     #[test]
-    fn protocol_version_is_pinned_for_the_candidate_accounts_wire_change() {
+    fn protocol_version_is_pinned_for_positional_signed_body_changes() {
         // A round-trip cannot catch a forgotten bump because both ends use
-        // the same claims layout. D34 changes that positional layout, so pin
-        // the externally visible version as a literal.
-        assert_eq!(crate::PROTOCOL_VERSION, 3);
+        // the same claims layout. D34 changed `WitnessEpochClaimsV1`'s
+        // positional layout, and D33's probation field changes
+        // `SessionTokenClaimsV1`'s, so pin the externally visible version as a
+        // literal.
+        assert_eq!(crate::PROTOCOL_VERSION, 4);
     }
 
     #[test]

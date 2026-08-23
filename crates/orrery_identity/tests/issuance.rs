@@ -12,13 +12,14 @@ use orrery_identity::mem::MemAccountStore;
 use orrery_identity::store::AccountStore;
 use orrery_identity::store::{BindOutcome, IdentityError};
 use orrery_identity::{
-    IdentityService, IssuerKeyring, IssuerSigningKey, StaticStanding, UnavailableStanding,
+    IdentityService, IssuerKeyring, IssuerSigningKey, StandingThresholds, StaticStanding,
+    UnavailableStanding, DEFAULT_STANDING_THRESHOLDS,
 };
 use orrery_persistd::gateway::BindingAuthority;
 use orrery_protocol::AccountId;
 use orrery_protocol::{
     FixedTokenClock, IssuerKeyId, NodeId, SessionStanding, SessionTokenVerificationError,
-    SessionTokenVerifier, UnixMillis, MAX_SESSION_TOKEN_TTL_MS,
+    SessionTokenVerifier, UnixMillis, MAX_SESSION_TOKEN_BYTES, MAX_SESSION_TOKEN_TTL_MS,
 };
 
 const ACCOUNT: AccountId = AccountId(7);
@@ -485,4 +486,152 @@ async fn the_store_feeds_the_gateways_snapshot_authority() {
         "an unbound node is unresolved, and D31 clause (f) reads that as \
          `exclude`, never as `not a party`"
     );
+}
+
+// ── Probation (D28 clause (e), D33 clause (d)) ───────────────────────────────
+
+/// A service whose account was created at `created_ms` and whose clock reads
+/// `now_ms`, holding one bound node.
+///
+/// Two instants rather than one because probation is the difference between
+/// them, and a fixture that could only move them together could not tell a
+/// seven-day-old account from a seven-day-old clock.
+async fn service_at(
+    created_ms: u64,
+    now_ms: u64,
+) -> (
+    IdentityService<MemAccountStore, StaticStanding, FixedTokenClock>,
+    NodeId,
+) {
+    let store = MemAccountStore::new();
+    store
+        .create_account(ACCOUNT, created_ms)
+        .await
+        .expect("create");
+    let node = node(1);
+    store.bind(ACCOUNT, &node, created_ms).await.expect("bind");
+    let service = IdentityService::new(
+        store,
+        StaticStanding::new([(ACCOUNT, SessionStanding::Good)], None),
+        FixedTokenClock::new(UnixMillis::new(now_ms)),
+        IssuerKeyring::new(signing_key(1, 0xA1)),
+    );
+    (service, node)
+}
+
+/// What the *verifier* reads out of a minted token, not what the issuer put in.
+async fn minted_probation(
+    service: &IdentityService<MemAccountStore, StaticStanding, FixedTokenClock>,
+    node: &NodeId,
+    now_ms: u64,
+) -> bool {
+    let session = service.issue(ACCOUNT, node, None).await.expect("issue");
+    SessionTokenVerifier::new(
+        FixedTokenClock::new(UnixMillis::new(now_ms)),
+        service.published_issuer_keys(),
+    )
+    .verify(&session.encoded, node)
+    .expect("the verifier accepts what the issuer minted")
+    .on_probation
+}
+
+#[tokio::test]
+async fn probation_is_stamped_from_the_account_row_and_lifts_at_the_window() {
+    // Both directions from one dial. A test that only proved the refusal would
+    // pass just as well against a field wired to a constant `true`.
+    let window = DEFAULT_STANDING_THRESHOLDS.probation_ms;
+
+    let (fresh, node) = service_at(T0, T0).await;
+    assert!(
+        minted_probation(&fresh, &node, T0 + 1).await,
+        "an account created this instant is on probation"
+    );
+
+    let (nearly, node) = service_at(T0, T0 + window - 1).await;
+    assert!(
+        minted_probation(&nearly, &node, T0 + window).await,
+        "one millisecond short of the window is still inside it"
+    );
+
+    let (past, node) = service_at(T0, T0 + window).await;
+    assert!(
+        !minted_probation(&past, &node, T0 + window + 1).await,
+        "the boundary instant is the first one past probation"
+    );
+
+    let month_ms = 30 * 24 * 60 * 60 * 1_000;
+    let (old, node) = service_at(T0, T0 + month_ms).await;
+    assert!(
+        !minted_probation(&old, &node, T0 + month_ms + 1).await,
+        "a month-old account is not on probation"
+    );
+}
+
+#[tokio::test]
+async fn the_probation_window_is_a_deployment_dial_and_not_a_constant() {
+    // D33 clause (d): "the probation window [is] deployment configuration, not
+    // constants of this record". The same account at the same instant, two
+    // configurations, two answers.
+    let day_ms = 24 * 60 * 60 * 1_000;
+    let (service, node) = service_at(T0, T0 + 3 * day_ms).await;
+    assert!(
+        minted_probation(&service, &node, T0 + 3 * day_ms + 1).await,
+        "three days into the 7-day default is inside probation"
+    );
+
+    let (service, node) = service_at(T0, T0 + 3 * day_ms).await;
+    let service = service.with_standing_thresholds(StandingThresholds {
+        probation_ms: day_ms,
+        ..DEFAULT_STANDING_THRESHOLDS
+    });
+    assert!(
+        !minted_probation(&service, &node, T0 + 3 * day_ms + 1).await,
+        "three days is past a one-day window"
+    );
+
+    let (service, node) = service_at(T0, T0).await;
+    let service = service.with_standing_thresholds(StandingThresholds {
+        probation_ms: 0,
+        ..DEFAULT_STANDING_THRESHOLDS
+    });
+    assert!(
+        !minted_probation(&service, &node, T0 + 1).await,
+        "a zero window means no probation, not everyone forever"
+    );
+}
+
+#[tokio::test]
+async fn a_backwards_clock_does_not_buy_a_way_out_of_probation() {
+    // A `created_ms` ahead of the mint instant is a host with a wrong RTC, or
+    // an operator moving a clock. Subtracted the other way round it would be an
+    // enormous elapsed time, and probation would be the easiest filter in the
+    // system to skip.
+    let (service, node) = service_at(T0 + 60 * 60 * 1_000, T0).await;
+    assert!(
+        minted_probation(&service, &node, T0 + 1).await,
+        "an account created in the future is on probation, not past it"
+    );
+}
+
+#[tokio::test]
+async fn the_widened_token_still_fits_the_wire_bound() {
+    // `MAX_SESSION_TOKEN_BYTES` is checked before postcard sees the frame, so a
+    // real token growing past it would be refused as malformed rather than
+    // reported as too large. Both values of the new field, since the widest
+    // token is the one that has to fit.
+    for (created_ms, on_probation) in [(T0, true), (0, false)] {
+        let (service, node) = service_at(created_ms, T0).await;
+        let session = service.issue(ACCOUNT, &node, None).await.expect("issue");
+        assert_eq!(session.claims().on_probation, on_probation);
+        // Stated rather than merely bounded: a minted token is 111 B, so the
+        // headroom the next field has to fit into is 401 B. The assertion is a
+        // floor under that, not a measurement of it.
+        assert!(
+            MAX_SESSION_TOKEN_BYTES - session.encoded.len() > 380,
+            "a minted token is {} B against a {} B decode bound, leaving {} B",
+            session.encoded.len(),
+            MAX_SESSION_TOKEN_BYTES,
+            MAX_SESSION_TOKEN_BYTES - session.encoded.len()
+        );
+    }
 }

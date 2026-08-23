@@ -2660,6 +2660,7 @@ fn session_token(cli: &Cli, node: NodeId) -> Result<Vec<u8>> {
         orrery_protocol::SessionTokenTtlMs::new(orrery_protocol::MAX_SESSION_TOKEN_TTL_MS),
         orrery_protocol::SessionStanding::Good,
         orrery_protocol::IssuerKeyId::new(cli.issuer_key_id),
+        false,
     );
     orrery_protocol::SessionTokenV1::sign(claims, &issuer)
         .map_err(|e| anyhow::anyhow!("sign session token: {e:?}"))?

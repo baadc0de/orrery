@@ -1521,11 +1521,14 @@ pub struct AccountRow {
     pub binding_epoch: u32,
     /// Unix milliseconds at which the account was created.
     ///
-    /// Carried because it is the only durable answer to D28 clause (e)'s
-    /// *skipped* account-age row — the session token has no such field. Whether
-    /// a gateway should read it, or whether identity should instead put an age
-    /// bucket in the token, is D31's open question 5 and is not settled here;
-    /// the row carries the fact either way.
+    /// The durable answer to D28 clause (e)'s account-age row, and D31's
+    /// resolved question 5 settled what is done with it: identity reads this
+    /// row to authenticate a login anyway, compares it against the configured
+    /// probation window, and signs the *verdict* into the session token's
+    /// `on_probation` claim. Nobody downstream reads this field — the
+    /// coordinator that enforces the filter has no FoundationDB at all (D31
+    /// clause (d)) — so this is the origin of the fact and the token is its
+    /// only carrier.
     pub created_ms: u64,
     /// Lifetime count of binding events appended for this account, maintained
     /// in the same transaction that appends the `dh` row (D31, resolved

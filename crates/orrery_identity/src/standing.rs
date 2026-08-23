@@ -12,7 +12,14 @@ use orrery_persistd::adjudication::{StrikeMode, StrikeRow, STRIKE_HALF_LIFE_MS};
 use orrery_protocol::{AccountId, SessionStanding};
 use std::collections::HashMap;
 
-/// Configured quarantine/cooldown/ban boundaries, in milli-points.
+/// The configured account-policy package: the quarantine/cooldown/ban
+/// boundaries in milli-points, and the probation window in milliseconds.
+///
+/// One value rather than two, because D33 clause (d) names them as one dial
+/// set — "`Q`, `C`, `B`, the minimum cooldown and the probation window are
+/// deployment configuration, not constants of this record" — and a second
+/// standalone probation constant would be a second place to configure a number
+/// the record says has one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StandingThresholds {
     /// `Good` becomes `Quarantined` at this score.
@@ -21,13 +28,22 @@ pub struct StandingThresholds {
     pub cooldown_milli: i64,
     /// `Cooldown` becomes `Banned` at this score.
     pub ban_milli: i64,
+    /// How long after `AccountRow::created_ms` an account remains on
+    /// probation, in milliseconds.
+    ///
+    /// Probation is not a score band, so it is not classified with the other
+    /// three: it is a fact about the account row, evaluated at mint time by
+    /// [`StandingThresholds::on_probation`] and stamped into the token.
+    pub probation_ms: u64,
 }
 
-/// D33's recommended 3/5/7 package. Owner selection can replace this value.
+/// D33 clause (d)'s recommended package: 3/5/7 with a 7-day probation. Owner
+/// selection can replace this value.
 pub const DEFAULT_STANDING_THRESHOLDS: StandingThresholds = StandingThresholds {
     quarantine_milli: 3_000,
     cooldown_milli: 5_000,
     ban_milli: 7_000,
+    probation_ms: 7 * 24 * 60 * 60 * 1_000,
 };
 
 impl Default for StandingThresholds {
@@ -37,6 +53,21 @@ impl Default for StandingThresholds {
 }
 
 impl StandingThresholds {
+    /// Whether an account created at `created_ms` is still inside probation at
+    /// `now_ms` (D33 clause (d), `docs/07-witnessing.md` §5).
+    ///
+    /// The comparison is `elapsed < probation_ms`, so the boundary instant is
+    /// the first one past probation and a window of zero means "no probation"
+    /// rather than "everyone, forever". A `created_ms` in the future — a clock
+    /// that stepped backwards, or a row written by a host whose RTC is wrong —
+    /// is *not* read as "very old": the subtraction saturates to zero elapsed
+    /// time and the account stays on probation. Subtracting the other way round
+    /// would make a skewed clock the cheapest way to skip probation entirely.
+    #[must_use]
+    pub const fn on_probation(self, created_ms: u64, now_ms: u64) -> bool {
+        now_ms.saturating_sub(created_ms) < self.probation_ms
+    }
+
     /// Classify a conservatively rounded live score.
     #[must_use]
     pub const fn classify(self, score_milli: i64) -> StandingLevel {
@@ -191,6 +222,43 @@ mod tests {
             mode,
             expires_at_ms: issued_at_ms + STRIKE_RETENTION_MS,
         }
+    }
+
+    #[test]
+    fn probation_is_a_configured_window_measured_from_the_account_row() {
+        let week = DEFAULT_STANDING_THRESHOLDS;
+        // Open at both ends of the window, and in the direction that excludes
+        // at every ambiguity.
+        assert!(
+            week.on_probation(0, 0),
+            "a brand-new account is on probation"
+        );
+        assert!(week.on_probation(0, 7 * DAY_MS - 1));
+        assert!(
+            !week.on_probation(0, 7 * DAY_MS),
+            "the boundary instant is the first one past probation"
+        );
+        assert!(!week.on_probation(0, 30 * DAY_MS));
+        assert!(
+            week.on_probation(DAY_MS, 0),
+            "a row from the future is not an ancient account"
+        );
+
+        // The window is a dial, so the same account answers differently under
+        // a different configuration — which is the whole of D33 clause (d).
+        let day = StandingThresholds {
+            probation_ms: DAY_MS,
+            ..DEFAULT_STANDING_THRESHOLDS
+        };
+        assert!(!day.on_probation(0, 3 * DAY_MS));
+        assert!(
+            !StandingThresholds {
+                probation_ms: 0,
+                ..DEFAULT_STANDING_THRESHOLDS
+            }
+            .on_probation(0, 0),
+            "a zero window is no probation, not an unbounded one"
+        );
     }
 
     #[test]

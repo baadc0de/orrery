@@ -19,6 +19,21 @@
 //!   4. what standing does the ledger hold for it?              -> StandingUnavailable
 //! ```
 //!
+//! # Probation is stamped, not asked about
+//!
+//! D33 clause (d) makes a 7-day account probation deployment configuration, and
+//! `docs/07` §5 makes it half of the Sybil cost: a fresh account may play, but
+//! it may not witness. The enforcement point is the coordinator's candidate
+//! pool, and D31 clause (d) says the coordinator reads nothing from
+//! FoundationDB — so the answer has to travel, and the only authenticated thing
+//! that travels from here to there is the token.
+//!
+//! It costs no read. Question 2 already fetches `da ‖ account` and, until now,
+//! threw the row away after an `is_some()`; `created_ms` is on that row (D31),
+//! so probation is a comparison against a value already in hand. The price is
+//! paid on the other side, in freshness: see
+//! [`orrery_protocol::SessionTokenClaimsV1::on_probation`].
+//!
 //! Question 3 is the one worth arguing for. A token binds `(account, node)` and
 //! the verifier checks the node against the connected peer, so a token minted
 //! for a node the account does not hold would be a durable statement that the
@@ -32,6 +47,7 @@
 //! worse outcome.
 
 use crate::issuer::IssuerKeyring;
+use crate::standing::{StandingThresholds, DEFAULT_STANDING_THRESHOLDS};
 use crate::store::{AccountStore, IdentityError};
 use orrery_protocol::AccountId;
 use orrery_protocol::{
@@ -192,6 +208,7 @@ pub struct IdentityService<S, T, C> {
     standing: T,
     clock: C,
     keyring: RwLock<IssuerKeyring>,
+    thresholds: StandingThresholds,
 }
 
 impl<S, T, C> IdentityService<S, T, C>
@@ -200,14 +217,27 @@ where
     T: StandingSource,
     C: TokenClock,
 {
-    /// Assemble a service.
+    /// Assemble a service at D33 clause (d)'s default policy package.
     pub fn new(store: S, standing: T, clock: C, keyring: IssuerKeyring) -> Self {
         Self {
             store,
             standing,
             clock,
             keyring: RwLock::new(keyring),
+            thresholds: DEFAULT_STANDING_THRESHOLDS,
         }
+    }
+
+    /// Replace the policy package this service stamps probation against.
+    ///
+    /// The whole [`StandingThresholds`] rather than the one field it reads, so
+    /// a deployment configures `Q`, `C`, `B` and the probation window as the
+    /// single set D33 clause (d) describes and hands the same value to
+    /// [`crate::ComputedStanding`].
+    #[must_use]
+    pub fn with_standing_thresholds(mut self, thresholds: StandingThresholds) -> Self {
+        self.thresholds = thresholds;
+        self
     }
 
     /// The account store, for binding operations and durable reads.
@@ -272,10 +302,12 @@ where
         let ttl_ms = self.checked_ttl(requested_ttl_ms)?;
 
         // 2. The account must exist. D33 clause (f)'s first absence: no `da`
-        //    row is an authentication failure, never an implicit account.
-        if self.store.account(account).await?.is_none() {
+        //    row is an authentication failure, never an implicit account. The
+        //    row is kept rather than discarded after the check: `created_ms` is
+        //    on it, and it is what probation is measured from.
+        let Some(row) = self.store.account(account).await? else {
             return Err(IdentityError::UnknownAccount(account));
-        }
+        };
 
         // 3. And the node must be bound to it *right now*. Current bindings
         //    only (D31 clause (g)); a node released a moment ago is a miss and
@@ -299,7 +331,7 @@ where
         // 4. Standing is read, not computed, and an unreadable ledger refuses.
         let standing = self.standing.standing(account).await?;
 
-        self.mint(account, node, ttl_ms, standing)
+        self.mint(account, node, ttl_ms, standing, row.created_ms)
     }
 
     /// Reissue for an established `(account, node)` — the half-TTL refresh of
@@ -346,8 +378,14 @@ where
         node: &NodeId,
         ttl_ms: u64,
         standing: SessionStanding,
+        created_ms: u64,
     ) -> Result<IssuedSession, IdentityError> {
         let issued_at_ms = self.clock.now_ms();
+        // Evaluated at the mint instant, from the row read at question 2, and
+        // then frozen into a signature. That is the whole freshness story: the
+        // account crosses its boundary in wall-clock time, but the token only
+        // learns about it at the next mint or refresh.
+        let on_probation = self.thresholds.on_probation(created_ms, issued_at_ms.0);
         let keyring = self.read_keyring();
         let claims = SessionTokenClaimsV1::new(
             account,
@@ -356,6 +394,7 @@ where
             SessionTokenTtlMs::new(ttl_ms),
             standing,
             keyring.active_key_id(),
+            on_probation,
         );
         let token = keyring
             .sign(claims)

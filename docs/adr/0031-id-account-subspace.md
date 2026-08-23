@@ -714,6 +714,17 @@ was rejected and the condition that would reverse each, is on PR #225.
    should put an `account_age_bucket` in the token as D28 suggests, is the
    standing record's call; the token change is explicitly out of scope here.
 
+   > *Resolved 2026-08-23 (issue #214): the token carries it.* The durable read
+   > was never available at the enforcement point — witness eligibility is
+   > decided in the coordinator's candidate pool, and clause (d) of this record
+   > gives the coordinator no FoundationDB. Identity reads `created_ms` on the
+   > `da` row it already fetches to authenticate the login, compares it against
+   > D33 clause (d)'s configured window, and signs the *verdict* into
+   > `SessionTokenClaimsV1.on_probation` — a boolean, not the age bucket D28
+   > suggested, so the window stays configured in exactly one service. The cost
+   > is freshness: the answer is as old as the token, bounded by the one-hour
+   > TTL cap, and it errs by excluding.
+
 ## Consequential edits this record now requires
 
 Accepting resolved question 3 put a load-bearing sentence in clause (f) on a

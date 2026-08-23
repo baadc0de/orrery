@@ -2916,6 +2916,7 @@ mod tests {
                 SessionTokenTtlMs::new(1_000),
                 SessionStanding::Good,
                 IssuerKeyId::new(1),
+                false,
             ),
             &iroh::SecretKey::from_bytes(&[9; 32]),
         )

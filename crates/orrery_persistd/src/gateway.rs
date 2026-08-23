@@ -8549,6 +8549,7 @@ mod tests {
                     orrery_protocol::SessionTokenTtlMs::new(1_000),
                     SessionStanding::Quarantined,
                     orrery_protocol::IssuerKeyId::new(1),
+                    false,
                 )),
                 b"quarantined",
                 None,
@@ -8762,6 +8763,7 @@ mod tests {
                 orrery_protocol::SessionTokenTtlMs::new(60_000),
                 SessionStanding::Good,
                 orrery_protocol::IssuerKeyId::new(11),
+                false,
             ),
             issuer,
         )
@@ -9148,6 +9150,7 @@ mod tests {
             orrery_protocol::SessionTokenTtlMs::new(3_600_000),
             standing,
             orrery_protocol::IssuerKeyId::new(1),
+            false,
         )
     }
 
@@ -10584,6 +10587,7 @@ mod tests {
             orrery_protocol::SessionTokenTtlMs::new(1_000),
             orrery_protocol::SessionStanding::Good,
             orrery_protocol::IssuerKeyId::new(1),
+            false,
         ));
         let first = registry
             .activate(node, authorization.clone(), b"first", None, 0, 0)
@@ -10636,6 +10640,7 @@ mod tests {
                     orrery_protocol::SessionTokenTtlMs::new(1_000),
                     orrery_protocol::SessionStanding::Good,
                     orrery_protocol::IssuerKeyId::new(1),
+                    false,
                 )),
                 b"reconnect",
                 None,
@@ -10669,6 +10674,7 @@ mod tests {
                     orrery_protocol::SessionTokenTtlMs::new(1_000),
                     orrery_protocol::SessionStanding::Good,
                     orrery_protocol::IssuerKeyId::new(1),
+                    false,
                 )),
                 b"other",
                 None,
@@ -10696,6 +10702,7 @@ mod tests {
             orrery_protocol::SessionTokenTtlMs::new(1_000),
             orrery_protocol::SessionStanding::Good,
             orrery_protocol::IssuerKeyId::new(1),
+            false,
         ));
         let first = registry
             .activate(node, authorization.clone(), b"first", None, 0, 0)
@@ -10832,6 +10839,7 @@ mod tests {
             orrery_protocol::SessionTokenTtlMs::new(1_000),
             orrery_protocol::SessionStanding::Good,
             orrery_protocol::IssuerKeyId::new(1),
+            false,
         ))
     }
 
@@ -11047,6 +11055,7 @@ mod tests {
             orrery_protocol::SessionTokenTtlMs::new(1_000),
             orrery_protocol::SessionStanding::Good,
             orrery_protocol::IssuerKeyId::new(1),
+            false,
         ));
         let first = registry
             .activate(node, authorization.clone(), b"first", None, 0, 0)
@@ -11963,6 +11972,7 @@ mod tests {
             orrery_protocol::SessionTokenTtlMs::new(1_000),
             orrery_protocol::SessionStanding::Good,
             orrery_protocol::IssuerKeyId::new(1),
+            false,
         ));
         let session = registry
             .activate(node, authorization, b"conn", None, 0, 0)
@@ -12161,6 +12171,7 @@ mod tests {
             orrery_protocol::SessionTokenTtlMs::new(1_000),
             orrery_protocol::SessionStanding::Good,
             orrery_protocol::IssuerKeyId::new(1),
+            false,
         ));
         let session = registry
             .activate(node, authorization, b"conn", None, 0, 0)
@@ -12322,6 +12333,7 @@ mod tests {
             orrery_protocol::SessionTokenTtlMs::new(1_000),
             orrery_protocol::SessionStanding::Good,
             orrery_protocol::IssuerKeyId::new(1),
+            false,
         ));
         let session = registry
             .activate(node, authorization, b"conn", None, 0, 0)
@@ -12623,6 +12635,7 @@ mod tests {
             orrery_protocol::SessionTokenTtlMs::new(1_000),
             orrery_protocol::SessionStanding::Good,
             orrery_protocol::IssuerKeyId::new(1),
+            false,
         ))
     }
 

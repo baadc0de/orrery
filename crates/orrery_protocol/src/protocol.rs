@@ -41,4 +41,21 @@
 /// [`WitnessEpochClaimsV1`](crate::WitnessEpochClaimsV1). This is a positional
 /// postcard change to a signed wire body, so a version-2 peer must not share a
 /// gateway session with a version-3 peer.
-pub const PROTOCOL_VERSION: u16 = 3;
+///
+/// Version 4 adds `on_probation` to
+/// [`SessionTokenClaimsV1`](crate::SessionTokenClaimsV1), for the same reason
+/// and by the same rule. The token rides
+/// [`GatewayMsg::VersionedHello`](crate::GatewayMsg::VersionedHello), so a
+/// version-3 client presents a version-3 client's token: seven fields where a
+/// version-4 service reads eight. postcard appends, and a decoder built for the
+/// longer body fails outright on the shorter one rather than ignoring what is
+/// missing — there is nothing to ignore, because the body carries no field
+/// names. Bumping here is what keeps that failure at the handshake, where it is
+/// one refusal with a version in it, instead of at the first token decode.
+///
+/// The version-1 claims body remains *decodable* — see
+/// [`SESSION_TOKEN_V1_VERSION`](crate::SESSION_TOKEN_V1_VERSION) — but that
+/// window is for a fleet mid-rollout, where identity and the gateways are
+/// separate services with no handshake between them. It is not a second
+/// client-facing window: this one is exact equality and D29 clause 5 closed it.
+pub const PROTOCOL_VERSION: u16 = 4;

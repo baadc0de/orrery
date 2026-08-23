@@ -108,6 +108,7 @@ pub fn session_token(
             SessionTokenTtlMs::new(ttl_ms),
             SessionStanding::Good,
             IssuerKeyId::new(ISSUER_KEY_ID),
+            false,
         ),
         issuer,
     )
