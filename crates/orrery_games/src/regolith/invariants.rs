@@ -36,10 +36,12 @@ fn speed_cap(sample: &InvariantSample<'_, RegolithState>) -> Result<(), Invarian
     let limit = match sample.current {
         RegolithState::Craft(craft) => craft.archetype.limits().max_speed_mms,
         RegolithState::Rock(rock) => rock.tier.limits().max_speed_mms,
+        RegolithState::Pickup(_) => 0,
     } + VEL_MARGIN_MMS;
     let vel = match sample.current {
         RegolithState::Craft(craft) => craft.vel,
         RegolithState::Rock(rock) => rock.vel,
+        RegolithState::Pickup(_) => QVel::default(),
     };
     if vel.difference_squared(QVel::default()) > i128::from(limit) * i128::from(limit) {
         Err(InvariantViolation::new(
@@ -84,6 +86,9 @@ fn teleport(sample: &InvariantSample<'_, RegolithState>) -> Result<(), Invariant
             current.pos,
             current.tier.limits().max_speed_mms,
         ),
+        (RegolithState::Pickup(previous), RegolithState::Pickup(current)) => {
+            (previous.pos, current.pos, 0)
+        }
         _ => {
             return Err(InvariantViolation::new(
                 InvariantKind::ValueRange,
@@ -145,26 +150,55 @@ fn value_range(sample: &InvariantSample<'_, RegolithState>) -> Result<(), Invari
                 return Err(InvariantViolation::new(InvariantKind::ValueRange, NAME));
             }
         }
+        RegolithState::Pickup(pickup) => {
+            if pickup.ttl_remaining > pickup.expires_at
+                || pickup.claimed_by.is_some() != pickup.claimed_at.is_some()
+                || (pickup.expired && pickup.claimed_by.is_some())
+                || (pickup.expired && pickup.ttl_remaining != 0)
+            {
+                return Err(InvariantViolation::new(InvariantKind::ValueRange, NAME));
+            }
+        }
     }
     if let Some(previous) = sample.previous {
         match (previous, sample.current) {
             (RegolithState::Craft(previous), RegolithState::Craft(current))
                 if current.archetype != previous.archetype
-                    || current.weapon != previous.weapon
+                    || (current.weapon != previous.weapon
+                        && current.pickups_won <= previous.pickups_won)
                     || current.shots < previous.shots
-                    || current.damage_dealt < previous.damage_dealt =>
+                    || current.damage_dealt < previous.damage_dealt
+                    || current.grabs_attempted < previous.grabs_attempted
+                    || current.pickups_won < previous.pickups_won
+                    || current.grabs_lost < previous.grabs_lost =>
             {
                 return Err(InvariantViolation::new(InvariantKind::ValueRange, NAME))
             }
             (RegolithState::Rock(previous), RegolithState::Rock(current))
                 if current.tier != previous.tier
                     || current.generation != previous.generation
-                    || current.splits_done < previous.splits_done =>
+                    || current.splits_done < previous.splits_done
+                    || current.born_in_bloom != previous.born_in_bloom
+                    || current.pickups_dropped < previous.pickups_dropped =>
             {
                 return Err(InvariantViolation::new(InvariantKind::ValueRange, NAME))
             }
-            (RegolithState::Craft(_), RegolithState::Rock(_))
-            | (RegolithState::Rock(_), RegolithState::Craft(_)) => {
+            (RegolithState::Pickup(previous), RegolithState::Pickup(current))
+                if current.pos != previous.pos
+                    || current.kind != previous.kind
+                    || current.expires_at != previous.expires_at
+                    || current.ttl_remaining > previous.ttl_remaining
+                    || previous.claimed_by.is_some()
+                        && current.claimed_by != previous.claimed_by
+                    || previous.claimed_at.is_some()
+                        && current.claimed_at != previous.claimed_at
+                    || previous.expired && !current.expired =>
+            {
+                return Err(InvariantViolation::new(InvariantKind::ValueRange, NAME))
+            }
+            (previous, current)
+                if core::mem::discriminant(previous) != core::mem::discriminant(current) =>
+            {
                 return Err(InvariantViolation::new(InvariantKind::ValueRange, NAME))
             }
             _ => {}

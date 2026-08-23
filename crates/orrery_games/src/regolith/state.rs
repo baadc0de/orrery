@@ -35,6 +35,13 @@ pub struct Craft {
     /// Damage rolled, ever, not landed. This monotone own-state trace makes
     /// `DamageInflation` adjudicable at the attacker.
     pub damage_dealt: u64,
+    /// Pickup grabs emitted, ever. The attempt is knowable from this craft's
+    /// own input even though the pickup decides its outcome.
+    pub grabs_attempted: u32,
+    /// Pickup grants consumed, ever. Monotone and state-hashed.
+    pub pickups_won: u32,
+    /// Pickup denials consumed, ever. Monotone and state-hashed.
+    pub grabs_lost: u32,
 }
 
 /// A rock's published tier. Its limits are derived from this hashed value,
@@ -139,18 +146,44 @@ pub struct Rock {
     pub hull: i32,
     /// Parent splits emitted, ever. Monotone and state-hashed.
     pub splits_done: u32,
+    /// Whether this rock was seeded by a bloom. Hashed here for the later
+    /// director rule; pickup drops use it as their own-state probability bit.
+    pub born_in_bloom: bool,
+    /// Pickup materializations emitted, ever. Monotone and state-hashed.
+    pub pickups_dropped: u32,
 }
 
-/// The complete core-state sum: craft and rock windows share one ruleset.
+/// A materialized weapon pickup with its own adjudicable window.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Pickup {
+    /// Lattice position used to resolve grabs.
+    pub pos: QPos,
+    /// Weapon granted to the first eligible craft.
+    pub kind: WeaponKind,
+    /// Lifetime boundary, in ticks after materialization.
+    pub expires_at: u16,
+    /// Ticks before expiry. Its countdown makes expiry state-hash visible.
+    pub ttl_remaining: u16,
+    /// First eligible claimant, if any.
+    pub claimed_by: Option<orrery_protocol::PersistId>,
+    /// Pickup-local age at the claim, if any.
+    pub claimed_at: Option<u16>,
+    /// Whether the TTL elapsed before a claim.
+    pub expired: bool,
+}
+
+/// The complete core-state sum: craft, rock and pickup windows share one ruleset.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RegolithState {
     /// A player craft.
     Craft(Craft),
     /// An autonomous rock.
     Rock(Rock),
+    /// A contested weapon pickup.
+    Pickup(Pickup),
 }
 
-const ENCODED_LEN: usize = 80;
+const CRAFT_ENCODED_LEN: usize = 92;
 
 impl Quantized for Craft {
     fn quantize(&mut self) {
@@ -170,11 +203,19 @@ impl Quantized for Rock {
     }
 }
 
+impl Quantized for Pickup {
+    fn quantize(&mut self) {
+        let (x, y, z) = self.pos.to_metres();
+        self.pos = QPos::from_metres(x, y, z);
+    }
+}
+
 impl Quantized for RegolithState {
     fn quantize(&mut self) {
         match self {
             Self::Craft(craft) => craft.quantize(),
             Self::Rock(rock) => rock.quantize(),
+            Self::Pickup(pickup) => pickup.quantize(),
         }
     }
 }
@@ -194,9 +235,12 @@ impl CoreCodec for Craft {
         out.extend_from_slice(&self.cooldown.to_le_bytes());
         out.extend_from_slice(&self.shots.to_le_bytes());
         out.extend_from_slice(&self.damage_dealt.to_le_bytes());
+        out.extend_from_slice(&self.grabs_attempted.to_le_bytes());
+        out.extend_from_slice(&self.pickups_won.to_le_bytes());
+        out.extend_from_slice(&self.grabs_lost.to_le_bytes());
     }
     fn decode(bytes: &[u8]) -> Result<Self, CodecError> {
-        if bytes.len() != ENCODED_LEN {
+        if bytes.len() != CRAFT_ENCODED_LEN {
             return Err(CodecError("regolith craft: wrong length"));
         }
         let i64_at = |o| i64::from_le_bytes(bytes[o..o + 8].try_into().unwrap());
@@ -221,6 +265,9 @@ impl CoreCodec for Craft {
             cooldown: u16::from_le_bytes(bytes[66..68].try_into().unwrap()),
             shots: u32::from_le_bytes(bytes[68..72].try_into().unwrap()),
             damage_dealt: u64::from_le_bytes(bytes[72..80].try_into().unwrap()),
+            grabs_attempted: u32::from_le_bytes(bytes[80..84].try_into().unwrap()),
+            pickups_won: u32::from_le_bytes(bytes[84..88].try_into().unwrap()),
+            grabs_lost: u32::from_le_bytes(bytes[88..92].try_into().unwrap()),
         })
     }
 }
@@ -236,9 +283,11 @@ impl CoreCodec for Rock {
         }
         out.extend_from_slice(&self.hull.to_le_bytes());
         out.extend_from_slice(&self.splits_done.to_le_bytes());
+        out.push(u8::from(self.born_in_bloom));
+        out.extend_from_slice(&self.pickups_dropped.to_le_bytes());
     }
     fn decode(bytes: &[u8]) -> Result<Self, CodecError> {
-        if bytes.len() != 61 {
+        if bytes.len() != 66 || bytes[61] > 1 {
             return Err(CodecError("regolith rock: wrong length"));
         }
         let i64_at = |o| i64::from_le_bytes(bytes[o..o + 8].try_into().unwrap());
@@ -257,6 +306,58 @@ impl CoreCodec for Rock {
             },
             hull: i32::from_le_bytes(bytes[53..57].try_into().unwrap()),
             splits_done: u32::from_le_bytes(bytes[57..61].try_into().unwrap()),
+            born_in_bloom: bytes[61] == 1,
+            pickups_dropped: u32::from_le_bytes(bytes[62..66].try_into().unwrap()),
+        })
+    }
+}
+
+impl CoreCodec for Pickup {
+    fn encode(&self, out: &mut Vec<u8>) {
+        out.push(self.kind.tag());
+        for value in [self.pos.x, self.pos.y, self.pos.z] {
+            out.extend_from_slice(&value.to_le_bytes());
+        }
+        out.extend_from_slice(&self.expires_at.to_le_bytes());
+        out.extend_from_slice(&self.ttl_remaining.to_le_bytes());
+        match self.claimed_by {
+            Some(entity) => {
+                out.push(1);
+                out.extend_from_slice(&entity.0.to_le_bytes());
+            }
+            None => out.extend_from_slice(&[0; 9]),
+        }
+        match self.claimed_at {
+            Some(at) => {
+                out.push(1);
+                out.extend_from_slice(&at.to_le_bytes());
+            }
+            None => out.extend_from_slice(&[0; 3]),
+        }
+        out.push(u8::from(self.expired));
+    }
+    fn decode(bytes: &[u8]) -> Result<Self, CodecError> {
+        if bytes.len() != 42 || bytes[29] > 1 || bytes[38] > 1 || bytes[41] > 1 {
+            return Err(CodecError("regolith pickup: bad length or option tag"));
+        }
+        let i64_at = |o| i64::from_le_bytes(bytes[o..o + 8].try_into().unwrap());
+        Ok(Self {
+            kind: WeaponKind::from_tag(bytes[0])?,
+            pos: QPos {
+                x: i64_at(1),
+                y: i64_at(9),
+                z: i64_at(17),
+            },
+            expires_at: u16::from_le_bytes(bytes[25..27].try_into().unwrap()),
+            ttl_remaining: u16::from_le_bytes(bytes[27..29].try_into().unwrap()),
+            claimed_by: (bytes[29] == 1).then(|| {
+                orrery_protocol::PersistId::new(u64::from_le_bytes(
+                    bytes[30..38].try_into().unwrap(),
+                ))
+            }),
+            claimed_at: (bytes[38] == 1)
+                .then(|| u16::from_le_bytes(bytes[39..41].try_into().unwrap())),
+            expired: bytes[41] == 1,
         })
     }
 }
@@ -272,6 +373,10 @@ impl CoreCodec for RegolithState {
                 out.push(1);
                 rock.encode(out);
             }
+            Self::Pickup(pickup) => {
+                out.push(2);
+                pickup.encode(out);
+            }
         }
     }
     fn decode(bytes: &[u8]) -> Result<Self, CodecError> {
@@ -281,6 +386,7 @@ impl CoreCodec for RegolithState {
         match tag {
             0 => Ok(Self::Craft(Craft::decode(rest)?)),
             1 => Ok(Self::Rock(Rock::decode(rest)?)),
+            2 => Ok(Self::Pickup(Pickup::decode(rest)?)),
             _ => Err(CodecError("regolith state: unknown tag")),
         }
     }
@@ -303,6 +409,9 @@ impl Craft {
             cooldown: 0,
             shots: 0,
             damage_dealt: 0,
+            grabs_attempted: 0,
+            pickups_won: 0,
+            grabs_lost: 0,
         }
     }
     /// Whether this craft is active.
@@ -323,6 +432,24 @@ impl Rock {
             vel,
             hull: tier.limits().max_hull,
             splits_done: 0,
+            born_in_bloom: false,
+            pickups_dropped: 0,
+        }
+    }
+}
+
+impl Pickup {
+    /// A fully described initial pickup state.
+    #[must_use]
+    pub const fn spawned(pos: QPos, kind: WeaponKind, expires_at: u16) -> Self {
+        Self {
+            pos,
+            kind,
+            expires_at,
+            ttl_remaining: expires_at,
+            claimed_by: None,
+            claimed_at: None,
+            expired: false,
         }
     }
 }

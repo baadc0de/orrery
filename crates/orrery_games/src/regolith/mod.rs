@@ -1,4 +1,4 @@
-//! **Regolith** — planar combat plus materialized, replayable rock splits.
+//! **Regolith** — planar combat, replayable rock splits and contested pickups.
 //!
 //! A split is described entirely by an ordered event. Its parent records the
 //! monotone split counter in its own state, so materialization is adjudicable.
@@ -19,7 +19,7 @@ use orrery_core::{
 };
 use orrery_protocol::{PersistId, RulesetId, Tick};
 use rand_core::RngCore;
-use state::{Craft, RegolithState, Rock, RockTier, PITCH_LIMIT_URAD, TAU_URAD};
+use state::{Craft, Pickup, RegolithState, Rock, RockTier, PITCH_LIMIT_URAD, TAU_URAD};
 
 const DT: f64 = 1.0 / TICK_HZ as f64;
 /// Drag shared by craft rules and stage-1 acceleration bounds.
@@ -31,10 +31,14 @@ const GOLDEN_ANGLE_URAD: i64 = 2_399_963;
 pub const ISLAND_BOUNDARY_MM: i64 = 1_000_000;
 const JITTER_MIN_URAD: u32 = 785_398;
 const JITTER_MAX_URAD: u32 = 1_308_997;
+/// Pickup lifetime: 30 seconds at 60 Hz.
+pub const PICKUP_TTL_TICKS: u16 = 1_800;
+/// Maximum eligible grab distance, in millimetres.
+pub const GRAB_RADIUS_MM: i64 = 25_000;
 
-/// Regolith v2's rules identity. Rocks change rules and golden chains.
+/// Regolith v3's rules identity. Pickups change rules and golden chains.
 pub const REGOLITH_RULESET: RulesetId = RulesetId {
-    version: 2,
+    version: 3,
     digest: [0x52; 32],
 };
 
@@ -114,28 +118,43 @@ impl Ruleset for Regolith {
                 let (rock, events) = self.step_rock(me, rock, inputs, rng);
                 (RegolithState::Rock(rock), events)
             }
+            RegolithState::Pickup(pickup) => {
+                let (pickup, events) = Self::step_pickup(me, pickup, inputs);
+                (RegolithState::Pickup(pickup), events)
+            }
         };
         *view.own_mut() = state;
         StepOutput { events }
     }
     fn materialize(&self, event: &Outcome, out: &mut Vec<EntityMaterialization<RegolithState>>) {
-        if let Outcome::Split {
-            generation,
-            children,
-            ..
-        } = event
-        {
-            for child in children {
-                out.push(EntityMaterialization::new(
-                    child.id,
-                    RegolithState::Rock(Rock::spawned(
-                        child.tier,
-                        generation.saturating_add(1),
-                        child.pos,
-                        child.vel,
-                    )),
-                ));
+        match event {
+            Outcome::Split {
+                generation,
+                children,
+                ..
+            } => {
+                for child in children {
+                    out.push(EntityMaterialization::new(
+                        child.id,
+                        RegolithState::Rock(Rock::spawned(
+                            child.tier,
+                            generation.saturating_add(1),
+                            child.pos,
+                            child.vel,
+                        )),
+                    ));
+                }
             }
+            Outcome::SpawnPickup {
+                id,
+                pos,
+                kind,
+                expires_at,
+            } => out.push(EntityMaterialization::new(
+                *id,
+                RegolithState::Pickup(Pickup::spawned(*pos, *kind, *expires_at)),
+            )),
+            _ => {}
         }
     }
 }
@@ -150,7 +169,7 @@ impl Regolith {
     ) -> (Craft, Vec<Outcome>) {
         let mut events = Vec::new();
         let limits = own.archetype.limits();
-        let weapon = own.weapon.weapon();
+        let mut equipped = own.weapon;
         let origin = own.pos;
         let (mut px, mut py, mut pz) = own.pos.to_metres();
         let (mut vx, mut vy, mut vz) = own.vel.to_metres_per_sec();
@@ -158,10 +177,12 @@ impl Regolith {
             (own.yaw_urad, own.pitch_urad, own.hull, own.shield);
         let (mut shots, mut damage_dealt, mut cooldown) =
             (own.shots, own.damage_dealt, own.cooldown.saturating_sub(1));
+        let (mut grabs_attempted, mut pickups_won, mut grabs_lost) =
+            (own.grabs_attempted, own.pickups_won, own.grabs_lost);
         let mut disabled = !own.alive();
         for order in inputs.iter() {
             match order {
-                Order::Thrust { .. } | Order::Fire { .. } if disabled => {}
+                Order::Thrust { .. } | Order::Fire { .. } | Order::Grab { .. } if disabled => {}
                 Order::Thrust {
                     accel_mmss,
                     yaw_urad,
@@ -183,6 +204,7 @@ impl Regolith {
                         .clamp(-PITCH_LIMIT_URAD, PITCH_LIMIT_URAD);
                 }
                 Order::Fire { target } => {
+                    let weapon = equipped.weapon();
                     if cooldown > 0 && self.honours_cooldown() {
                         continue;
                     }
@@ -199,7 +221,7 @@ impl Regolith {
                             target: *target,
                             amount,
                             attacker_pos: origin,
-                            attacker_weapon: own.weapon,
+                            attacker_weapon: equipped,
                         });
                     }
                     shots = shots.saturating_add(1);
@@ -230,6 +252,24 @@ impl Regolith {
                         }
                     }
                 }
+                Order::Grab { pickup } => {
+                    grabs_attempted = grabs_attempted.saturating_add(1);
+                    events.push(Outcome::GrabAttempted {
+                        pickup: *pickup,
+                        ship: me,
+                        ship_pos: origin,
+                    });
+                }
+                Order::PickupGranted { kind } => {
+                    // This write is the durable inventory trace: the pickup
+                    // decided the outcome, then delivery brought it home.
+                    equipped = *kind;
+                    pickups_won = pickups_won.saturating_add(1);
+                }
+                Order::PickupDenied => {
+                    grabs_lost = grabs_lost.saturating_add(1);
+                }
+                Order::GrabAttempt { .. } => {}
             }
         }
         let speed = libm::sqrt(vx * vx + vy * vy + vz * vz);
@@ -247,21 +287,23 @@ impl Regolith {
         px += vx * DT;
         py += vy * DT;
         pz += vz * DT;
-        (
-            Craft {
-                pos: QPos::from_metres(px, py, pz),
-                vel: QVel::from_metres_per_sec(vx, vy, vz),
-                yaw_urad: yaw,
-                pitch_urad: pitch,
-                hull,
-                shield,
-                cooldown,
-                shots,
-                damage_dealt,
-                ..own
-            },
-            events,
-        )
+        let next = Craft {
+            weapon: equipped,
+            pos: QPos::from_metres(px, py, pz),
+            vel: QVel::from_metres_per_sec(vx, vy, vz),
+            yaw_urad: yaw,
+            pitch_urad: pitch,
+            hull,
+            shield,
+            cooldown,
+            shots,
+            damage_dealt,
+            grabs_attempted,
+            pickups_won,
+            grabs_lost,
+            ..own
+        };
+        (next, events)
     }
     fn step_rock(
         &self,
@@ -299,6 +341,22 @@ impl Regolith {
                         children,
                     });
                     rock.splits_done = rock.splits_done.saturating_add(1);
+                } else {
+                    let threshold = if rock.born_in_bloom { 50 } else { 25 };
+                    if uniform_percent(rng) < threshold {
+                        let kind = if rng.next_u32() & 1 == 0 {
+                            weapon::WeaponKind::Volley
+                        } else {
+                            weapon::WeaponKind::Heavy
+                        };
+                        events.push(Outcome::SpawnPickup {
+                            id: pickup_id(me),
+                            pos: rock.pos,
+                            kind,
+                            expires_at: PICKUP_TTL_TICKS,
+                        });
+                        rock.pickups_dropped = rock.pickups_dropped.saturating_add(1);
+                    }
                 }
             }
         }
@@ -318,6 +376,44 @@ impl Regolith {
         }
         (rock, events)
     }
+
+    fn step_pickup(
+        me: PersistId,
+        mut pickup: Pickup,
+        inputs: &OrderedInputs<'_, Order>,
+    ) -> (Pickup, Vec<Outcome>) {
+        let mut events = Vec::new();
+        if pickup.claimed_by.is_none() && !pickup.expired {
+            pickup.ttl_remaining = pickup.ttl_remaining.saturating_sub(1);
+            if pickup.ttl_remaining == 0 {
+                pickup.expired = true;
+                events.push(Outcome::Expired { id: me });
+            }
+        }
+        for order in inputs.iter() {
+            let Order::GrabAttempt { ship, ship_pos } = order else {
+                continue;
+            };
+            let eligible = pickup.claimed_by.is_none()
+                && !pickup.expired
+                && pickup.pos.distance_squared(*ship_pos) <= reach_sq(GRAB_RADIUS_MM);
+            if eligible {
+                pickup.claimed_by = Some(*ship);
+                pickup.claimed_at = Some(pickup.expires_at.saturating_sub(pickup.ttl_remaining));
+                events.push(Outcome::Granted {
+                    ship: *ship,
+                    kind: pickup.kind,
+                });
+            } else {
+                events.push(Outcome::Denied { ship: *ship });
+            }
+        }
+        (pickup, events)
+    }
+}
+
+fn uniform_percent(rng: &mut TickRng) -> u32 {
+    rng.next_u32() % 100
 }
 
 fn split_children(
@@ -407,6 +503,16 @@ fn child_id(parent: PersistId, generation: u32, slot: u8) -> PersistId {
             .expect("digest prefix"),
     ))
 }
+fn pickup_id(rock: PersistId) -> PersistId {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"regolith-pickup");
+    hasher.update(&rock.0.to_le_bytes());
+    PersistId::new(u64::from_le_bytes(
+        hasher.finalize().as_bytes()[..8]
+            .try_into()
+            .expect("digest prefix"),
+    ))
+}
 const fn reach_sq(range_mm: i64) -> i128 {
     (range_mm as i128) * (range_mm as i128)
 }
@@ -414,7 +520,7 @@ const fn reach_sq(range_mm: i64) -> i128 {
 impl Game for Regolith {
     const META: GameMeta = GameMeta {
         name: "regolith",
-        summary: "planar craft and replayable three-tier rock splits",
+        summary: "planar craft, replayable rock splits and contested pickups",
         ruleset: REGOLITH_RULESET,
     };
     const GOLDEN_CHAINS: &'static [(&'static str, [u8; 32])] = &crate::golden::REGOLITH;
@@ -464,13 +570,30 @@ impl Game for Regolith {
                     from_weapon: *attacker_weapon,
                 },
             )),
-            Outcome::Destroyed { .. } | Outcome::Split { .. } => None,
+            Outcome::GrabAttempted {
+                pickup,
+                ship,
+                ship_pos,
+            } => Some((
+                *pickup,
+                Order::GrabAttempt {
+                    ship: *ship,
+                    ship_pos: *ship_pos,
+                },
+            )),
+            Outcome::Granted { ship, kind } => Some((*ship, Order::PickupGranted { kind: *kind })),
+            Outcome::Denied { ship } => Some((*ship, Order::PickupDenied)),
+            Outcome::Destroyed { .. }
+            | Outcome::Split { .. }
+            | Outcome::SpawnPickup { .. }
+            | Outcome::Expired { .. } => None,
         }
     }
     fn trajectory(state: &RegolithState) -> (QPos, QVel) {
         match state {
             RegolithState::Craft(craft) => (craft.pos, craft.vel),
             RegolithState::Rock(rock) => (rock.pos, rock.vel),
+            RegolithState::Pickup(pickup) => (pickup.pos, QVel::default()),
         }
     }
 }

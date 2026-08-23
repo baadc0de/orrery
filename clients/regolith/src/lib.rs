@@ -224,11 +224,17 @@ fn sync_rendered_state(
         };
         // `RegolithState` became a sum when #323 added rocks: craft and rock
         // windows share one ruleset. Both carry a lattice position; only a
-        // craft has a facing, so a rock keeps whatever rotation it was spawned
-        // with rather than being forced to zero every frame.
+        // craft has a facing, so a rock or a pickup keeps whatever rotation it
+        // was spawned with rather than being forced to zero every frame.
+        //
+        // A claimed or expired pickup is still rendered at its position; the
+        // skin shows what the ruleset says exists and makes no judgement about
+        // it. Hiding it here would be gameplay logic in the skin, which
+        // constraint 3 forbids.
         let (pos, yaw_urad) = match state {
             RegolithState::Craft(craft) => (craft.pos, Some(craft.yaw_urad)),
             RegolithState::Rock(rock) => (rock.pos, None),
+            RegolithState::Pickup(pickup) => (pickup.pos, None),
         };
         let (x, _, z) = pos.to_metres();
         transform.translation = Vec3::new(x as f32, 0.0, z as f32);

@@ -1,4 +1,4 @@
-//! Regolith's one grammar extension: damage identifies a weapon, never a raw reach.
+//! Regolith's ordered combat, materialization and pickup grammar.
 
 use super::weapon::WeaponKind;
 use orrery_core::{CodecError, CoreCodec, QPos, QVel};
@@ -75,6 +75,25 @@ pub enum Order {
         /// Weapon from the shooter's hashed state.
         from_weapon: WeaponKind,
     },
+    /// Ask this craft to attempt a pickup grab.
+    Grab {
+        /// Pickup entity to contest.
+        pickup: PersistId,
+    },
+    /// A craft's emitted attempt, delivered to the pickup next tick.
+    GrabAttempt {
+        /// Attempting craft.
+        ship: PersistId,
+        /// Craft position from its own hashed state.
+        ship_pos: QPos,
+    },
+    /// A pickup's grant delivered back to its winner.
+    PickupGranted {
+        /// Weapon kind from the pickup's hashed state.
+        kind: WeaponKind,
+    },
+    /// A pickup's denial delivered back to an unsuccessful craft.
+    PickupDenied,
 }
 
 impl CoreCodec for Order {
@@ -106,6 +125,19 @@ impl CoreCodec for Order {
                 encode_pos(*from_pos, out);
                 out.push(from_weapon.tag());
             }
+            Self::Grab { pickup } => {
+                out.push(3);
+                out.extend_from_slice(&pickup.0.to_le_bytes());
+            }
+            Self::GrabAttempt { ship, ship_pos } => {
+                out.push(4);
+                out.extend_from_slice(&ship.0.to_le_bytes());
+                encode_pos(*ship_pos, out);
+            }
+            Self::PickupGranted { kind } => {
+                out.extend_from_slice(&[5, kind.tag()]);
+            }
+            Self::PickupDenied => out.push(6),
         }
     }
     fn decode(bytes: &[u8]) -> Result<Self, CodecError> {
@@ -127,6 +159,17 @@ impl CoreCodec for Order {
                 from_pos: decode_pos(&rest[12..36]),
                 from_weapon: WeaponKind::from_tag(rest[36])?,
             }),
+            (3, 8) => Ok(Self::Grab {
+                pickup: PersistId::new(u64::from_le_bytes(rest.try_into().unwrap())),
+            }),
+            (4, 32) => Ok(Self::GrabAttempt {
+                ship: PersistId::new(u64::from_le_bytes(rest[0..8].try_into().unwrap())),
+                ship_pos: decode_pos(&rest[8..32]),
+            }),
+            (5, 1) => Ok(Self::PickupGranted {
+                kind: WeaponKind::from_tag(rest[0])?,
+            }),
+            (6, 0) => Ok(Self::PickupDenied),
             _ => Err(CodecError("regolith order: bad tag or length")),
         }
     }
@@ -161,6 +204,43 @@ pub enum Outcome {
         generation: u32,
         /// Slot-zero then slot-one children.
         children: [ChildSpec; 2],
+    },
+    /// A dying Small produced one fully described pickup.
+    SpawnPickup {
+        /// Derived pickup identifier.
+        id: PersistId,
+        /// Pickup lattice position.
+        pos: QPos,
+        /// Weapon kind to grant.
+        kind: WeaponKind,
+        /// Lifetime boundary in ticks after materialization.
+        expires_at: u16,
+    },
+    /// A craft emitted a grab attempt for delivery to the pickup.
+    GrabAttempted {
+        /// Pickup being contested.
+        pickup: PersistId,
+        /// Attempting craft.
+        ship: PersistId,
+        /// Craft position from its own hashed state.
+        ship_pos: QPos,
+    },
+    /// The first eligible craft won.
+    Granted {
+        /// Winning craft.
+        ship: PersistId,
+        /// Weapon kind from the pickup's own state.
+        kind: WeaponKind,
+    },
+    /// A craft was ineligible or arrived after the winner.
+    Denied {
+        /// Denied craft.
+        ship: PersistId,
+    },
+    /// An unclaimed pickup reached its TTL.
+    Expired {
+        /// Expired pickup.
+        id: PersistId,
     },
 }
 
@@ -200,6 +280,41 @@ impl CoreCodec for Outcome {
                     encode_vel(child.vel, out);
                 }
             }
+            Self::SpawnPickup {
+                id,
+                pos,
+                kind,
+                expires_at,
+            } => {
+                out.push(3);
+                out.extend_from_slice(&id.0.to_le_bytes());
+                encode_pos(*pos, out);
+                out.push(kind.tag());
+                out.extend_from_slice(&expires_at.to_le_bytes());
+            }
+            Self::GrabAttempted {
+                pickup,
+                ship,
+                ship_pos,
+            } => {
+                out.push(4);
+                out.extend_from_slice(&pickup.0.to_le_bytes());
+                out.extend_from_slice(&ship.0.to_le_bytes());
+                encode_pos(*ship_pos, out);
+            }
+            Self::Granted { ship, kind } => {
+                out.push(5);
+                out.extend_from_slice(&ship.0.to_le_bytes());
+                out.push(kind.tag());
+            }
+            Self::Denied { ship } => {
+                out.push(6);
+                out.extend_from_slice(&ship.0.to_le_bytes());
+            }
+            Self::Expired { id } => {
+                out.push(7);
+                out.extend_from_slice(&id.0.to_le_bytes());
+            }
         }
     }
     fn decode(bytes: &[u8]) -> Result<Self, CodecError> {
@@ -234,6 +349,27 @@ impl CoreCodec for Outcome {
                     children: [child(12)?, child(69)?],
                 })
             }
+            (3, 35) => Ok(Self::SpawnPickup {
+                id: PersistId::new(u64::from_le_bytes(rest[0..8].try_into().unwrap())),
+                pos: decode_pos(&rest[8..32]),
+                kind: WeaponKind::from_tag(rest[32])?,
+                expires_at: u16::from_le_bytes(rest[33..35].try_into().unwrap()),
+            }),
+            (4, 40) => Ok(Self::GrabAttempted {
+                pickup: PersistId::new(u64::from_le_bytes(rest[0..8].try_into().unwrap())),
+                ship: PersistId::new(u64::from_le_bytes(rest[8..16].try_into().unwrap())),
+                ship_pos: decode_pos(&rest[16..40]),
+            }),
+            (5, 9) => Ok(Self::Granted {
+                ship: PersistId::new(u64::from_le_bytes(rest[0..8].try_into().unwrap())),
+                kind: WeaponKind::from_tag(rest[8])?,
+            }),
+            (6, 8) => Ok(Self::Denied {
+                ship: PersistId::new(u64::from_le_bytes(rest.try_into().unwrap())),
+            }),
+            (7, 8) => Ok(Self::Expired {
+                id: PersistId::new(u64::from_le_bytes(rest.try_into().unwrap())),
+            }),
             _ => Err(CodecError("regolith outcome: bad tag or length")),
         }
     }
