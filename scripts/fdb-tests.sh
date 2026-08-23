@@ -46,6 +46,8 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
+die() { echo "::error::$*" >&2; exit 1; }
+
 # The floor is deliberately below the current count rather than equal to it —
 # it is a "did the fdb tier run at all" tripwire, not a census that has to be
 # edited every time a test is added. `cargo test -p orrery_persistd -p
@@ -239,14 +241,35 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # not need a cluster but execute in this invocation, so the floor rises by all
 # five: 508 -> 513.
 #
-# Note for whoever raises it next, because it has now bitten twice (#273): the
-# healthy fixture below is the coupled half. It emits 120 library tests plus
-# `per_target` for each of the nine required targets, and a floor that walks up
-# past that product turns the *healthy* case red — reported as "a real run
-# passes should have passed", which names neither the floor nor the fixture.
-# Raise the per-target count in the same commit, and leave real headroom rather
-# than the minimum that passes today.
-FLOOR="${ORRERY_FDB_TEST_FLOOR:-513}"
+# The original floor was 320.  Each later, attributed increase lives in a
+# separate `scripts/fdb-test-floor/*.floor` fragment, whose integer is added
+# here.  A change that adds tests adds a uniquely named fragment (normally
+# `issue-<number>.floor`) with its delta and rationale, rather than editing a
+# shared total.  Git therefore unions concurrent additions; addition is
+# commutative, so there is no arithmetic merge resolution to get wrong.
+#
+# Do not derive this from the test tree.  The floor is deliberately an
+# independently recorded lower bound on what the cargo invocation executed;
+# counting the same test declarations that cargo is meant to select would make
+# a feature/filter mistake agree with its own expected count.  The executed
+# total and the required-target non-zero checks below remain the anti-vacuity
+# proof.
+FLOOR=320
+FLOOR_DIR="$ROOT/scripts/fdb-test-floor"
+shopt -s nullglob
+floor_fragments=("$FLOOR_DIR"/*.floor)
+shopt -u nullglob
+(( ${#floor_fragments[@]} > 0 )) || die "no fdb-test floor fragments in $FLOOR_DIR"
+for floor_fragment in "${floor_fragments[@]}"; do
+  mapfile -t floor_values < <(awk '!/^[[:space:]]*(#|$)/ { print }' "$floor_fragment")
+  (( ${#floor_values[@]} == 1 )) \
+    || die "floor fragment $floor_fragment must contain one positive integer"
+  floor_delta="${floor_values[0]}"
+  [[ "$floor_delta" =~ ^[1-9][0-9]*$ ]] \
+    || die "floor fragment $floor_fragment must contain one positive integer"
+  FLOOR=$(( FLOOR + floor_delta ))
+done
+FLOOR="${ORRERY_FDB_TEST_FLOOR:-$FLOOR}"
 
 # Every test file whose contents only mean anything against a real cluster. If
 # one of these reports no executed tests, the tier is dark again whatever the
@@ -271,8 +294,6 @@ REQUIRED_TARGETS=(
   # non-vacuous, and there is no such transaction without a cluster.
   intent_witness_epoch
 )
-
-die() { echo "::error::$*" >&2; exit 1; }
 
 # ── Assertions over a captured log ───────────────────────────────────────────
 check_log() {
