@@ -2,7 +2,7 @@
 # One definition of the per-commit checks, runnable locally and by CI.
 #
 #   ./scripts/check.sh              every lane, in CI's order
-#   ./scripts/check.sh fmt          rustfmt over all eight workspaces
+#   ./scripts/check.sh fmt          rustfmt over all twelve workspaces
 #   ./scripts/check.sh clippy       both feature sets, -D warnings
 #   ./scripts/check.sh gates        static gates, harness self-tests, tool tests
 #   ./scripts/check.sh test         the root workspace's test suite
@@ -99,6 +99,7 @@ readonly WORKSPACES=(
     'p5-dupe-gauntlet test'
     'p4-streams-bench test'
     'p2-journal-bench check'
+    'clients/regolith test'
 )
 
 # The workspace directories, in table order.
