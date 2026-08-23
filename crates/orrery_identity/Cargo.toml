@@ -36,6 +36,9 @@ serde = { workspace = true }
 async-trait = "0.1"
 futures = { workspace = true }
 tracing = { workspace = true }
+clap = { workspace = true }
+sha2 = "0.10"
+rand = "0.9"
 # FoundationDB 7.3.x (D11, D14). Optional: only built with `--features fdb`.
 foundationdb = { version = "0.11", default-features = false, features = [
     "fdb-7_3",

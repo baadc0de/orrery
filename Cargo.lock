@@ -7598,13 +7598,16 @@ name = "orrery_identity"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "clap",
  "foundationdb",
  "futures",
  "iroh-base",
  "orrery_persistd",
  "orrery_protocol",
  "postcard",
+ "rand 0.9.5",
  "serde",
+ "sha2 0.10.9",
  "tokio",
  "tracing",
 ]
