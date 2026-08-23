@@ -188,6 +188,32 @@ self_test() {
   grep -q 'run scripts/aws-compute-smoke.sh --self-test' "$ROOT/scripts/check.sh" \
     || die 'self-test: check.sh gates lane stopped running this self-test; a structural regression would go unnoticed'
 
+  # Every probe below runs against real AWS, so an argument this CLI cannot
+  # parse never reaches the policy at all: `aws` exits 2 with "Unknown options"
+  # and the probe fails while proving *nothing*. That is exactly how #176's
+  # first live run failed — `--min-count`/`--max-count` are AWS CLI **v1**
+  # spellings and v2 wants `--count`. The structural clauses above all passed
+  # while that was true, because they assert the probes exist rather than that
+  # they are runnable.
+  #
+  # Search the executable body only: these spellings appear in this clause too,
+  # and a whole-file search would match its own source and pass vacuously.
+  probe_body="$(sed -n '/^echo "== positive probes =="/,$p' "$0" | grep -v '^[[:space:]]*#')"
+  for v1_only in --min-count --max-count; do
+    grep -Fq -- "$v1_only" <<<"$probe_body" \
+      && die "self-test: probe uses the AWS CLI v1 option '$v1_only'; v2 rejects it at parse time, so the probe would fail without ever reaching the policy"
+  done
+
+  # The same failure one layer down: EC2 validates resource-id *syntax* before
+  # it evaluates authorisation, so a dummy id in a known-malformed form answers
+  # InvalidAMIID.Malformed / InvalidInstanceID.Malformed and masks the verdict
+  # the probe asserts on. These two forms are confirmed malformed; the ids in
+  # use are confirmed well-formed.
+  for malformed in ami-00000000000000000 i-00000000000000000 ami-0123456789abcdef0; do
+    grep -Fq -- "$malformed" <<<"$probe_body" \
+      && die "self-test: probe uses '$malformed', which EC2 rejects as malformed before authorisation; the probe would report a syntax error instead of the policy verdict"
+  done
+
   echo "$NAME: self-test passed"
 }
 
@@ -272,23 +298,59 @@ expect_denied "s3 ls $KACHE_BUCKET" "AccessDenied" \
 expect_denied "iam list-roles" "AccessDenied" \
   aws iam list-roles --region "$REGION" --max-items 1
 
-# N3 — the type allow-list. t3.micro is deliberately outside it; --dry-run
-# means even a broken policy cannot launch anything during this probe.
-expect_denied "run-instances t3.micro (dry-run)" "UnauthorizedOperation" \
+# N3 — the type allow-list, and *only* the type allow-list.
+#
+# Three details, each learned by watching this probe fail for the wrong reason:
+#
+#   * `--count`, not `--min-count`/`--max-count`. Those were AWS CLI **v1**
+#     spellings; v2 rejects them at argument-parse time with "Unknown options",
+#     which never reaches AWS at all — so the probe failed while proving
+#     nothing about the policy.
+#   * A **real** image id. EC2 validates the AMI id's syntax before it
+#     evaluates authorisation, so any dummy id answers
+#     `InvalidAMIID.Malformed` and masks the verdict this probe asserts on.
+#     `ami-00000000000000000` and `ami-0123456789abcdef0` are both rejected as
+#     malformed.
+#   * Canonical's image and the launch tag, both **correct**. The policy grants
+#     RunInstances only for owner 099720109477 and only with
+#     `aws:RequestTag/orrery-ci-ephemeral=true`. If either were wrong here the
+#     refusal could come from that condition instead, and the probe would pass
+#     while the type allow-list was wide open.
+#
+# So every condition is satisfied except the instance type. `UnauthorizedOperation`
+# can then only mean the allow-list refused it, which is what N3 exists to prove.
+# `--dry-run` keeps this side-effect-free by construction: EC2 evaluates
+# authorisation without executing, so even a broken policy launches nothing.
+probe_ami=$(aws ec2 describe-images --region "$REGION" --owners 099720109477 \
+  --filters 'Name=name,Values=ubuntu/images/hvm-ssd*/ubuntu-*-24.04-amd64-server-*' \
+            'Name=state,Values=available' \
+  --query 'sort_by(Images,&CreationDate)[-1].ImageId' --output text)
+[[ $probe_ami == ami-* ]] \
+  || die "could not resolve a Canonical base image for the type-allow-list probe; got '$probe_ami'"
+
+expect_denied "run-instances t3.micro, Canonical image, correct tag (dry-run)" "UnauthorizedOperation" \
   aws ec2 run-instances --region "$REGION" --dry-run \
-    --image-id ami-00000000000000000 --instance-type t3.micro \
-    --min-count 1 --max-count 1
+    --image-id "$probe_ami" --instance-type t3.micro --count 1 \
+    --tag-specifications 'ResourceType=instance,Tags=[{Key=orrery-ci-ephemeral,Value=true}]'
 
 # N4 — the termination tag guard, against an untagged-looking dummy id.
+#
+# The id is `i-00000000000000001` rather than the more obvious all-zeros form,
+# because EC2 validates instance-id syntax before authorisation and rejects
+# `i-00000000000000000` as `InvalidInstanceID.Malformed` — which would mask the
+# verdict this probe reads. `i-00000000000000001` parses and answers
+# `InvalidInstanceID.NotFound` to a principal that *is* authorised, so under
+# this role the only way to see `UnauthorizedOperation` is the tag condition
+# doing its job. NotFound here would mean the condition is missing.
 # Denied before existence is checked, so this cannot affect anything.
 expect_denied "terminate untagged instance" "UnauthorizedOperation" \
   aws ec2 terminate-instances --region "$REGION" \
-    --instance-ids i-00000000000000000
+    --instance-ids i-00000000000000001
 
 # N5 — retag-and-kill, step one: tagging outside a launch call.
 expect_denied "create-tags outside launch" "UnauthorizedOperation" \
   aws ec2 create-tags --region "$REGION" \
-    --resources i-00000000000000000 \
+    --resources i-00000000000000001 \
     --tags "Key=orrery-ci-ephemeral,Value=true" "Key=smoke-probe,Value=outside-launch"
 
 jq -n \
