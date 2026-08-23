@@ -13,13 +13,13 @@
 //!   (VC-7);
 //! - neighbour reads are collected for the log (docs/06 §3).
 
-use std::collections::BTreeMap;
+use std::collections::{btree_map::Entry, BTreeMap};
 
 use orrery_protocol::{PersistId, Tick, UniverseSeed};
 
 use crate::quantize::Quantized;
 use crate::rng::tick_rng;
-use crate::ruleset::{state_hash, OrderedInputs, Ruleset, StateView};
+use crate::ruleset::{state_hash, EntityMaterialization, OrderedInputs, Ruleset, StateView};
 
 /// The fixed simulation rate (VC-1, D8).
 pub const TICK_HZ: u32 = 60;
@@ -32,6 +32,9 @@ pub const TICK_NANOS: u64 = 1_000_000_000 / TICK_HZ as u64;
 pub struct TickOutcome<E> {
     /// Events emitted, in emission order.
     pub events: Vec<E>,
+    /// Entity identifiers installed from those events, in materialization
+    /// order. Colliding later descriptions are absent: first writer wins.
+    pub materialized: Vec<PersistId>,
     /// Neighbours the step actually read, in first-read order. These become
     /// `NeighborFrame` records.
     pub neighbor_reads: Vec<PersistId>,
@@ -82,6 +85,15 @@ impl<R: Ruleset> Executor<R> {
         self.states.get(&entity)
     }
 
+    /// Remove and return an entity's state.
+    ///
+    /// Replay consumers use this to move a materialized child into its own
+    /// one-entity executor. A live world normally keeps materializations in
+    /// this executor and has no reason to call it.
+    pub fn take_state(&mut self, entity: PersistId) -> Option<R::CoreState> {
+        self.states.remove(&entity)
+    }
+
     /// Every entity, in `PersistId` order.
     pub fn entities(&self) -> impl Iterator<Item = &PersistId> {
         self.states.keys()
@@ -115,11 +127,33 @@ impl<R: Ruleset> Executor<R> {
         let hash = state_hash(&own);
         self.states.insert(entity, own);
 
+        let mut descriptions = Vec::new();
+        for event in &output.events {
+            self.ruleset.materialize(event, &mut descriptions);
+        }
+        let materialized = self.install_materializations(descriptions);
+
         Some(TickOutcome {
             events: output.events,
+            materialized,
             neighbor_reads,
             state_hash: hash,
         })
+    }
+
+    fn install_materializations(
+        &mut self,
+        descriptions: Vec<EntityMaterialization<R::CoreState>>,
+    ) -> Vec<PersistId> {
+        let mut materialized = Vec::with_capacity(descriptions.len());
+        for EntityMaterialization { entity, mut state } in descriptions {
+            if let Entry::Vacant(slot) = self.states.entry(entity) {
+                state.quantize();
+                slot.insert(state);
+                materialized.push(entity);
+            }
+        }
+        materialized
     }
 }
 
@@ -127,7 +161,7 @@ impl<R: Ruleset> Executor<R> {
 mod tests {
     use super::*;
     use crate::quantize::{QPos, QVel};
-    use crate::ruleset::{CodecError, CoreCodec, StepOutput};
+    use crate::ruleset::{CodecError, CoreCodec, EntityMaterialization, StepOutput};
     use orrery_protocol::RulesetId;
     use rand_chacha::rand_core::RngCore;
 
@@ -245,6 +279,210 @@ mod tests {
             vel: QVel::default(),
             rolls: 0,
         }
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct ChildSpec {
+        entity: PersistId,
+        state: Body,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct SpawnBatch {
+        children: Vec<ChildSpec>,
+    }
+
+    impl CoreCodec for SpawnBatch {
+        fn encode(&self, out: &mut Vec<u8>) {
+            out.extend_from_slice(&(self.children.len() as u32).to_le_bytes());
+            for child in &self.children {
+                out.extend_from_slice(&child.entity.0.to_le_bytes());
+                child.state.encode(out);
+            }
+        }
+
+        fn decode(bytes: &[u8]) -> Result<Self, CodecError> {
+            let count = bytes
+                .get(..4)
+                .and_then(|raw| raw.try_into().ok())
+                .map(u32::from_le_bytes)
+                .ok_or(CodecError("spawn batch count is missing"))?
+                as usize;
+            let expected = 4usize
+                .checked_add(
+                    count
+                        .checked_mul(60)
+                        .ok_or(CodecError("spawn batch too large"))?,
+                )
+                .ok_or(CodecError("spawn batch too large"))?;
+            if bytes.len() != expected {
+                return Err(CodecError("spawn batch has the wrong length"));
+            }
+            let mut children = Vec::with_capacity(count);
+            for index in 0..count {
+                let offset = 4 + index * 60;
+                let entity = PersistId::new(u64::from_le_bytes(
+                    bytes[offset..offset + 8]
+                        .try_into()
+                        .expect("length checked above"),
+                ));
+                let state = Body::decode(&bytes[offset + 8..offset + 60])?;
+                children.push(ChildSpec { entity, state });
+            }
+            Ok(Self { children })
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    struct Materializer {
+        children: usize,
+    }
+
+    impl Ruleset for Materializer {
+        type CoreState = Body;
+        type CoreInput = Nudge;
+        type CoreEvent = SpawnBatch;
+
+        fn id(&self) -> RulesetId {
+            RulesetId {
+                version: 1,
+                digest: [8; 32],
+            }
+        }
+
+        fn step(
+            &self,
+            view: &mut StateView<'_, Body>,
+            _inputs: &OrderedInputs<'_, Nudge>,
+            _rng: &mut crate::rng::TickRng,
+        ) -> StepOutput<SpawnBatch> {
+            if view.own().pos.x != 0 {
+                return StepOutput::default();
+            }
+            let parent = view.entity();
+            view.own_mut().pos.x = 1;
+            let children = (0..self.children)
+                .map(|slot| ChildSpec {
+                    entity: derived_child_id(parent, 1, slot as u64),
+                    state: Body {
+                        pos: QPos {
+                            x: 100 + slot as i64,
+                            y: 0,
+                            z: 0,
+                        },
+                        ..body()
+                    },
+                })
+                .collect();
+            StepOutput {
+                events: vec![SpawnBatch { children }],
+            }
+        }
+
+        fn materialize(&self, event: &SpawnBatch, out: &mut Vec<EntityMaterialization<Body>>) {
+            out.extend(
+                event
+                    .children
+                    .iter()
+                    .map(|child| EntityMaterialization::new(child.entity, child.state.clone())),
+            );
+        }
+    }
+
+    fn derived_child_id(parent: PersistId, generation: u64, slot: u64) -> PersistId {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"executor-materialization-test");
+        hasher.update(&parent.0.to_le_bytes());
+        hasher.update(&generation.to_le_bytes());
+        hasher.update(&slot.to_le_bytes());
+        PersistId::new(u64::from_le_bytes(
+            hasher.finalize().as_bytes()[..8]
+                .try_into()
+                .expect("a digest has eight bytes"),
+        ))
+    }
+
+    #[test]
+    fn materialization_replay_is_isolated_from_world_creation_order() {
+        let parent = PersistId::new(41);
+        let expected = [
+            derived_child_id(parent, 1, 0),
+            derived_child_id(parent, 1, 1),
+        ];
+
+        let run = |with_unrelated_entity: bool| {
+            let mut executor = Executor::new(Materializer { children: 2 }, UniverseSeed([5; 32]));
+            if with_unrelated_entity {
+                executor.insert(
+                    PersistId::new(9_001),
+                    Body {
+                        pos: QPos { x: 9, y: 0, z: 0 },
+                        ..body()
+                    },
+                );
+            }
+            executor.insert(parent, body());
+            let outcome = executor
+                .step_entity(parent, Tick::new(700), &[])
+                .expect("the parent is installed");
+            let children: Vec<(PersistId, Body)> = expected
+                .iter()
+                .map(|entity| {
+                    (
+                        *entity,
+                        executor
+                            .state(*entity)
+                            .expect("the derived child was materialized")
+                            .clone(),
+                    )
+                })
+                .collect();
+            (outcome.events, outcome.materialized, children)
+        };
+
+        let shared_world = run(true);
+        let isolated_replay = run(false);
+        assert_eq!(shared_world, isolated_replay);
+        assert_eq!(shared_world.1, expected);
+        assert_eq!(shared_world.0[0].children.len(), 2);
+    }
+
+    #[test]
+    fn materialization_supports_pickup_split_and_director_batch_shapes() {
+        for count in [1, 2, 10] {
+            let parent = PersistId::new(50 + count as u64);
+            let mut executor =
+                Executor::new(Materializer { children: count }, UniverseSeed([6; 32]));
+            executor.insert(parent, body());
+            let outcome = executor
+                .step_entity(parent, Tick::new(800), &[])
+                .expect("the source is installed");
+            assert_eq!(outcome.materialized.len(), count);
+            assert_eq!(executor.entities().count(), count + 1);
+        }
+    }
+
+    #[test]
+    fn materialization_is_first_writer_wins_in_description_order() {
+        let occupied = PersistId::new(70);
+        let new = PersistId::new(71);
+        let mut executor = executor();
+        executor.insert(
+            occupied,
+            Body {
+                pos: QPos { x: 7, y: 0, z: 0 },
+                ..body()
+            },
+        );
+        let accepted = executor.install_materializations(vec![
+            EntityMaterialization::new(occupied, Body { rolls: 1, ..body() }),
+            EntityMaterialization::new(new, Body { rolls: 2, ..body() }),
+            EntityMaterialization::new(new, Body { rolls: 3, ..body() }),
+        ]);
+
+        assert_eq!(accepted, vec![new]);
+        assert_eq!(executor.state(occupied).expect("kept").pos.x, 7);
+        assert_eq!(executor.state(new).expect("created").rolls, 2);
     }
 
     #[test]

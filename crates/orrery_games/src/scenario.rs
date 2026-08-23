@@ -30,7 +30,7 @@
 //! correlates with a player's packet loss rather than with their conduct
 //! (D17 risk 3).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use orrery_core::{
     evaluate, state_hash, CoreCodec, Executor, InvariantSample, InvariantViolation, Tolerance,
@@ -172,14 +172,10 @@ impl<G: Game> Play<G> {
 pub fn play<G: Game>(game: G, scenario: &Scenario) -> Play<G> {
     let seed = UniverseSeed([scenario.seed_byte; 32]);
     let entities: Vec<PersistId> = (1..=scenario.entities).map(PersistId::new).collect();
-    let peers: BTreeMap<PersistId, Vec<PersistId>> = entities
+    let player_slots: BTreeMap<PersistId, u64> = entities
         .iter()
-        .map(|entity| {
-            (
-                *entity,
-                entities.iter().copied().filter(|e| e != entity).collect(),
-            )
-        })
+        .enumerate()
+        .map(|(slot, entity)| (*entity, slot as u64))
         .collect();
 
     // Spawn before the ruleset moves into the executor.
@@ -203,23 +199,35 @@ pub fn play<G: Game>(game: G, scenario: &Scenario) -> Play<G> {
 
     for offset in 0..scenario.ticks {
         let tick = Tick::new(T0 + offset);
+        // Snapshot the population at the tick boundary. Entities materialized
+        // while this tick runs begin stepping on the next tick, never halfway
+        // through their birth tick.
+        let tick_entities: Vec<PersistId> = executor.entities().copied().collect();
         let mut delivered: BTreeMap<PersistId, Vec<G::CoreInput>> = BTreeMap::new();
-        let mut entries = Vec::with_capacity(entities.len());
+        let mut entries = Vec::with_capacity(tick_entities.len());
 
-        for (slot, entity) in entities.iter().enumerate() {
+        for entity in &tick_entities {
             // Events delivered from the previous tick come first, then what
-            // the player asked for. The order is arbitrary but it is fixed,
-            // which is all VC-2 requires of the authority that sets it.
+            // an initial scenario player asked for. Materialized entities are
+            // autonomous and receive only delivered inputs. The order is
+            // arbitrary but fixed, which is all VC-2 requires.
             let mut inputs = pending.remove(entity).unwrap_or_default();
-            let mut rng = pilot_rng(seed, *entity, tick);
-            executor.ruleset().honest_inputs(
-                *entity,
-                slot as u64,
-                tick,
-                &peers[entity],
-                &mut rng,
-                &mut inputs,
-            );
+            if let Some(slot) = player_slots.get(entity) {
+                let peers: Vec<PersistId> = tick_entities
+                    .iter()
+                    .copied()
+                    .filter(|peer| peer != entity)
+                    .collect();
+                let mut rng = pilot_rng(seed, *entity, tick);
+                executor.ruleset().honest_inputs(
+                    *entity,
+                    *slot,
+                    tick,
+                    &peers,
+                    &mut rng,
+                    &mut inputs,
+                );
+            }
 
             let outcome = executor
                 .step_entity(*entity, tick, &inputs)
@@ -248,7 +256,7 @@ pub fn play<G: Game>(game: G, scenario: &Scenario) -> Play<G> {
         if offset.is_multiple_of(SAMPLE_PERIOD) {
             sample_stage_one(
                 &executor,
-                &entities,
+                &tick_entities,
                 tick,
                 scenario,
                 &mut last_sample,
@@ -386,6 +394,7 @@ pub fn adjudicate_isolated<G: Game>(
 ) -> Option<Divergence> {
     let seed = UniverseSeed([scenario.seed_byte; 32]);
     let mut executors: BTreeMap<PersistId, Executor<G>> = BTreeMap::new();
+    let mut known_entities = BTreeSet::new();
     for slot in 0..scenario.entities {
         let entity = PersistId::new(slot + 1);
         let game = make();
@@ -393,22 +402,50 @@ pub fn adjudicate_isolated<G: Game>(
         let mut executor = Executor::new(game, seed);
         executor.insert(entity, state);
         executors.insert(entity, executor);
+        known_entities.insert(entity);
     }
 
     let tolerance = Tolerance::default();
     for record in &play.log {
         for entry in &record.entries {
-            let executor = executors
-                .get_mut(&entry.entity)
-                .expect("the log names an entity the scenario spawned");
-            let outcome = executor
-                .step_entity(entry.entity, record.tick, &entry.inputs)
-                .expect("each executor holds the entity it was built for");
+            let (outcome, materialized) = {
+                let executor = executors
+                    .get_mut(&entry.entity)
+                    .expect("the log names an initial or materialized entity");
+                let outcome = executor
+                    .step_entity(entry.entity, record.tick, &entry.inputs)
+                    .expect("each executor holds the entity it was built for");
+                let materialized = outcome
+                    .materialized
+                    .iter()
+                    .map(|entity| {
+                        (
+                            *entity,
+                            executor
+                                .take_state(*entity)
+                                .expect("the executor just materialized this entity"),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                (outcome, materialized)
+            };
             if outcome.state_hash == entry.hash {
+                // First-writer-wins is global even though each source replays
+                // alone. The emitted description remains source-local; only
+                // the first log-ordered source creates the child's executor.
+                for (entity, state) in materialized {
+                    if !known_entities.insert(entity) {
+                        continue;
+                    }
+                    let mut executor = Executor::new(make(), seed);
+                    executor.insert(entity, state);
+                    executors.insert(entity, executor);
+                }
                 continue;
             }
-            let computed = executor
-                .state(entry.entity)
+            let computed = executors
+                .get(&entry.entity)
+                .and_then(|executor| executor.state(entry.entity))
                 .expect("the entity was just stepped");
             return Some(divergence::<G>(record.tick, entry, computed, &tolerance));
         }

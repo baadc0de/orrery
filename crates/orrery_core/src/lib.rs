@@ -87,8 +87,8 @@ pub use quantize::{QPos, QVel, Quantized};
 pub use replay::{verify_bundle, ReplayError, ReplayHarness, ReplayTrace};
 pub use rng::{tick_rng, tick_seed, TickRng};
 pub use ruleset::{
-    state_hash, CodecError, ComponentTypeId, CoreClass, CoreCodec, OrderedInputs, Ruleset,
-    StateView, StepOutput,
+    state_hash, CodecError, ComponentTypeId, CoreClass, CoreCodec, EntityMaterialization,
+    OrderedInputs, Ruleset, StateView, StepOutput,
 };
 pub use store::{AuthorityLog, BundleError, ClaimRecord, Retention};
 pub use tolerance::{Tolerance, ToleranceOutcome, TrajectorySample};
