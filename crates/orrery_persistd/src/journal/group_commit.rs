@@ -266,6 +266,19 @@ impl CommitterHandle {
     /// waiter set, after which `notified().await` blocked forever. That is a
     /// hang in `Journal::close`, and through it in `CellRuntime::close`, so it
     /// stalled whichever test happened to lose the race rather than failing it.
+    ///
+    /// **Creation, not polling, is what this relies on**, and the distinction
+    /// is the reason this is correct rather than a second lost wakeup — it was
+    /// the leading suspect when #293 reopened. A `Notified` is *not* on the
+    /// waiter list until its first `poll` (or `Notified::enable`), so the flag
+    /// read below runs with nothing registered. `notify_waiters` is
+    /// nonetheless documented to reach it: the future snapshots the `Notify`'s
+    /// `notify_waiters_calls` counter when it is **created**, and any later
+    /// call bumps that counter, so the first poll sees the mismatch and
+    /// returns ready. The opposite rule governs the `notify_one` wait in
+    /// [`crate::journal::AppendHandle::committed`], which is saved by a stored
+    /// permit instead. Mixing the two rules up is how one of these grows a
+    /// window while looking like the other.
     pub(crate) async fn wait_exit(&self) {
         let notified = self.state.exited.notified();
         if self.state.exited_flag.load(Ordering::Acquire) {

@@ -552,6 +552,10 @@ jobs:
     # and `No space left on device`.
     # ---------------------------------------------------------------------
     runs-on: ubuntu-latest
+    # This remains the outer lane backstop. scripts/check.sh gives #290's
+    # intermittently hanging torn-tail proptest its own 60-second bound, so a
+    # recurrence fails with the test name instead of surfacing as a cancelled
+    # 30-minute job.
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7

@@ -265,11 +265,20 @@ impl AppendHandle {
     /// Wait until this append is durably flushed.
     ///
     /// The lost-wakeup window of the previous `Mutex + Notify` pair is closed
-    /// by construction: the `Notified` future is created (and thus registered
-    /// with the `Notify`) **before** the result is re-checked, so a `resolve`
-    /// landing between the check and the suspend either finds the future
-    /// already registered or leaves the `notify_one` permit for it. Either
-    /// way the waiter wakes and observes the stored result.
+    /// by `notify_one`, not by the order the future is created in. Creating a
+    /// `Notified` does **not** register it: tokio only adds it to the waiter
+    /// list on the first `poll` (or an explicit `Notified::enable`), so the
+    /// re-check below runs with nothing registered. What makes that safe is
+    /// that `resolve` calls `notify_one`, which stores a permit when it finds
+    /// no waiter; the first poll of this future consumes that permit and
+    /// returns ready. So a `resolve` landing between the re-check and the
+    /// suspend leaves a permit, and one landing before it is visible in the
+    /// re-check. Either way the waiter observes the stored result.
+    ///
+    /// The distinction matters because the sibling wait,
+    /// `CommitterHandle::wait_exit`, is guarded by the *other* rule:
+    /// `notify_waiters` stores no permit, and is instead documented to reach
+    /// any `Notified` created before it ran, polled or not.
     pub async fn committed(&self) -> Result<Lsn, JournalError> {
         // 1. Fast path: already resolved.
         if self
@@ -285,11 +294,12 @@ impl AppendHandle {
                 .clone()
                 .unwrap_or(Err(JournalError::Closed));
         }
-        // 2. Register interest, THEN re-check. Any resolve after the
-        //    registration notifies this future (or stores the permit it will
-        //    consume); any resolve before it is visible in the re-check.
-        //    `pin!` gives the `Notified` an address so it stays registered
-        //    across the re-check and the await.
+        // 2. Create the future, THEN re-check. Any resolve after this point
+        //    stores the `notify_one` permit the first poll will consume; any
+        //    resolve before it is visible in the re-check. `pin!` gives the
+        //    `Notified` a stable address so the same future — and so the same
+        //    place in the queue once polled — survives the re-check and the
+        //    await.
         let notified = std::pin::pin!(self.state.done.notified());
         if self
             .state
