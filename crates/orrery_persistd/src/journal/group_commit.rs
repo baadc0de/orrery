@@ -224,8 +224,35 @@ impl CommitterHandle {
     }
 
     /// Arm shutdown: the committer drains pending appends, flushes, then stops.
+    ///
+    /// The flag is flipped **while holding `queue.inner`**, and that is the
+    /// whole correctness of this function. `shutdown_armed()` is half of the
+    /// committer's condvar predicate, so it is shared state guarding a
+    /// `Condvar` — and a condvar only guarantees delivery to a waiter if the
+    /// predicate is mutated under the same mutex the waiter evaluates it
+    /// under. Being an `AtomicBool` does not exempt it: atomicity buys a
+    /// tear-free read, not a wakeup.
+    ///
+    /// Flipping it outside the lock left the textbook lost-wakeup window. The
+    /// committer holds `queue.inner`, reads `is_empty() == true` and
+    /// `shutdown_armed() == false`, and is then descheduled *before* it
+    /// registers on the condvar inside `wait`. `shutdown` runs entirely in
+    /// that gap — store, then `notify_all` against an empty waiter set — and
+    /// the committer parks forever with nothing left to wake it: no further
+    /// append arrives on a journal that is closing, and `shutdown` is
+    /// idempotent, so nobody notifies again. `Journal::close` then awaits
+    /// [`Self::wait_exit`] for a committer that will never reach its exit,
+    /// and the caller hangs unboundedly rather than slowly (#293).
+    ///
+    /// Taking the mutex closes the gap by construction: the store cannot land
+    /// in that window, because the committer is holding the mutex throughout
+    /// it, and once the committer *has* released the mutex it is registered on
+    /// the condvar and `notify_all` reaches it.
     pub(crate) fn shutdown(&self) {
-        self.state.shutdown_flag.store(true, Ordering::Release);
+        {
+            let _queue = self.state.queue.inner.lock().expect("commit queue lock");
+            self.state.shutdown_flag.store(true, Ordering::Release);
+        }
         self.state.queue.condvar.notify_all();
     }
 
@@ -626,6 +653,67 @@ mod tests {
             originated: true,
             #[cfg(feature = "chain-grpc")]
             provenance: None,
+        }
+    }
+
+    #[test]
+    fn shutdown_arms_the_wait_predicate_under_the_commit_queue_lock() {
+        // #293. `shutdown_armed()` is half the committer's condvar predicate.
+        // Arming it outside `queue.inner` can land in the window between the
+        // committer's predicate check and its registration inside `wait`:
+        // `notify_all` reaches an empty waiter set, nothing notifies again on
+        // a closing journal, and `Journal::close` awaits an exit that never
+        // comes. Holding the queue lock here *is* that window, made
+        // observable: while it is held, `shutdown` must not be able to flip
+        // the flag, because it must be blocked on the same mutex.
+        let (published, _subscriber) = broadcast::channel(8);
+        let metrics = Arc::new(crate::journal::JournalCommitMetrics::new());
+        let committer = spawn_committer(
+            GroupCommitConfig::default(),
+            Arc::new(|_pending| {
+                Ok(StoreCommitTimings {
+                    fjall_batch_commit: Duration::ZERO,
+                    sync_data: Duration::ZERO,
+                })
+            }),
+            published,
+            None,
+            metrics,
+        );
+        let state = Arc::clone(&committer.state);
+
+        let queue = state.queue.inner.lock().expect("commit queue lock");
+        let arming = std::thread::spawn({
+            let committer = committer.clone();
+            move || committer.shutdown()
+        });
+        // Long enough that an unsynchronised store would certainly have
+        // landed; the assertion is deliberately read before the lock is
+        // released so a panic cannot be blamed on the drop order.
+        std::thread::sleep(Duration::from_millis(200));
+        let armed_while_locked = state.shutdown_armed();
+        drop(queue);
+        arming.join().expect("arming thread");
+
+        assert!(
+            !armed_while_locked,
+            "shutdown armed the committer's wait predicate while another \
+             thread held queue.inner: the notify can then land before the \
+             committer registers on the condvar, and the committer parks \
+             forever (#293)"
+        );
+
+        // And the arming still works once the lock is free: the committer has
+        // to actually reach its exit, or the fix would be a deadlock of its
+        // own rather than a wakeup.
+        drop(committer);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !state.exited_flag.load(Ordering::Acquire) {
+            assert!(
+                Instant::now() < deadline,
+                "committer never exited after shutdown was armed under the lock"
+            );
+            std::thread::sleep(Duration::from_millis(5));
         }
     }
 
