@@ -6,6 +6,32 @@ use orrery_protocol::PersistId;
 
 use super::state::{BloomMembership, RockTier};
 
+/// A target-side fact that clears a lock without a live neighbour read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LockBreakReason {
+    /// The projectile was outside optimal plus falloff range.
+    RangeExceeded,
+    /// The target was destroyed before or by the projectile.
+    TargetDestroyed,
+}
+
+impl LockBreakReason {
+    const fn tag(self) -> u8 {
+        match self {
+            Self::RangeExceeded => 0,
+            Self::TargetDestroyed => 1,
+        }
+    }
+
+    const fn from_tag(tag: u8) -> Result<Self, CodecError> {
+        match tag {
+            0 => Ok(Self::RangeExceeded),
+            1 => Ok(Self::TargetDestroyed),
+            _ => Err(CodecError("regolith: unknown lock-break reason")),
+        }
+    }
+}
+
 fn encode_pos(pos: QPos, out: &mut Vec<u8>) {
     for value in [pos.x, pos.y, pos.z] {
         out.extend_from_slice(&value.to_le_bytes());
@@ -74,8 +100,12 @@ pub enum Order {
         from: PersistId,
         /// Shooter origin.
         from_pos: QPos,
+        /// Shooter velocity at firing.
+        from_vel: QVel,
         /// Weapon from the shooter's hashed state.
         from_weapon: WeaponKind,
+        /// Remaining target-owned flight ticks; `None` marks first arrival.
+        flight_ticks: Option<u16>,
     },
     /// Ask this craft to attempt a pickup grab.
     Grab {
@@ -110,6 +140,13 @@ pub enum Order {
         /// Net live-lineage change: `+1` for a split, `-1` for a terminal death.
         delta: i8,
     },
+    /// A target-side range or destruction fact delivered to the locker.
+    LockBroken {
+        /// Target whose lock ended.
+        target: PersistId,
+        /// Resolver-owned reason.
+        reason: LockBreakReason,
+    },
 }
 
 impl CoreCodec for Order {
@@ -133,13 +170,23 @@ impl CoreCodec for Order {
                 amount,
                 from,
                 from_pos,
+                from_vel,
                 from_weapon,
+                flight_ticks,
             } => {
                 out.push(2);
                 out.extend_from_slice(&amount.to_le_bytes());
                 out.extend_from_slice(&from.0.to_le_bytes());
                 encode_pos(*from_pos, out);
+                encode_vel(*from_vel, out);
                 out.push(from_weapon.tag());
+                match flight_ticks {
+                    Some(ticks) => {
+                        out.push(1);
+                        out.extend_from_slice(&ticks.to_le_bytes());
+                    }
+                    None => out.extend_from_slice(&[0; 3]),
+                }
             }
             Self::Grab { pickup } => {
                 out.push(3);
@@ -161,6 +208,11 @@ impl CoreCodec for Order {
                 out.extend_from_slice(&bloom_index.to_le_bytes());
                 out.push(delta.to_le_bytes()[0]);
             }
+            Self::LockBroken { target, reason } => {
+                out.push(10);
+                out.extend_from_slice(&target.0.to_le_bytes());
+                out.push(reason.tag());
+            }
         }
     }
     fn decode(bytes: &[u8]) -> Result<Self, CodecError> {
@@ -176,11 +228,14 @@ impl CoreCodec for Order {
             (1, 8) => Ok(Self::Fire {
                 target: PersistId::new(u64::from_le_bytes(rest.try_into().unwrap())),
             }),
-            (2, 37) => Ok(Self::Damage {
+            (2, 64) if rest[61] <= 1 => Ok(Self::Damage {
                 amount: i32::from_le_bytes(rest[0..4].try_into().unwrap()),
                 from: PersistId::new(u64::from_le_bytes(rest[4..12].try_into().unwrap())),
                 from_pos: decode_pos(&rest[12..36]),
-                from_weapon: WeaponKind::from_tag(rest[36])?,
+                from_vel: decode_vel(&rest[36..60]),
+                from_weapon: WeaponKind::from_tag(rest[60])?,
+                flight_ticks: (rest[61] == 1)
+                    .then(|| u16::from_le_bytes(rest[62..64].try_into().unwrap())),
             }),
             (3, 8) => Ok(Self::Grab {
                 pickup: PersistId::new(u64::from_le_bytes(rest.try_into().unwrap())),
@@ -198,6 +253,10 @@ impl CoreCodec for Order {
             (9, 5) => Ok(Self::BloomPopulationChanged {
                 bloom_index: u32::from_le_bytes(rest[0..4].try_into().unwrap()),
                 delta: i8::from_le_bytes([rest[4]]),
+            }),
+            (10, 9) => Ok(Self::LockBroken {
+                target: PersistId::new(u64::from_le_bytes(rest[0..8].try_into().unwrap())),
+                reason: LockBreakReason::from_tag(rest[8])?,
             }),
             _ => Err(CodecError("regolith order: bad tag or length")),
         }
@@ -217,8 +276,12 @@ pub enum Outcome {
         amount: i32,
         /// Firing position.
         attacker_pos: QPos,
+        /// Firing velocity.
+        attacker_vel: QVel,
         /// Equipped firing weapon.
         attacker_weapon: WeaponKind,
+        /// Remaining target-owned flight ticks; `None` marks first arrival.
+        flight_ticks: Option<u16>,
     },
     /// A hull reached zero.
     Destroyed {
@@ -300,6 +363,15 @@ pub enum Outcome {
         /// Net live-lineage change.
         delta: i8,
     },
+    /// A target-side fact that clears a lock at its owner.
+    LockBroken {
+        /// Locker receiving the fact.
+        locker: PersistId,
+        /// Target whose lock ended.
+        target: PersistId,
+        /// Resolver-owned reason.
+        reason: LockBreakReason,
+    },
 }
 
 fn encode_bloom(bloom: Option<BloomMembership>, out: &mut Vec<u8>) {
@@ -350,14 +422,24 @@ impl CoreCodec for Outcome {
                 target,
                 amount,
                 attacker_pos,
+                attacker_vel,
                 attacker_weapon,
+                flight_ticks,
             } => {
                 out.push(0);
                 out.extend_from_slice(&attacker.0.to_le_bytes());
                 out.extend_from_slice(&target.0.to_le_bytes());
                 out.extend_from_slice(&amount.to_le_bytes());
                 encode_pos(*attacker_pos, out);
+                encode_vel(*attacker_vel, out);
                 out.push(attacker_weapon.tag());
+                match flight_ticks {
+                    Some(ticks) => {
+                        out.push(1);
+                        out.extend_from_slice(&ticks.to_le_bytes());
+                    }
+                    None => out.extend_from_slice(&[0; 3]),
+                }
             }
             Self::Destroyed { by } => {
                 out.push(1);
@@ -441,6 +523,16 @@ impl CoreCodec for Outcome {
                 out.extend_from_slice(&bloom_index.to_le_bytes());
                 out.push(delta.to_le_bytes()[0]);
             }
+            Self::LockBroken {
+                locker,
+                target,
+                reason,
+            } => {
+                out.push(11);
+                out.extend_from_slice(&locker.0.to_le_bytes());
+                out.extend_from_slice(&target.0.to_le_bytes());
+                out.push(reason.tag());
+            }
         }
     }
     fn decode(bytes: &[u8]) -> Result<Self, CodecError> {
@@ -448,12 +540,15 @@ impl CoreCodec for Outcome {
             .split_first()
             .ok_or(CodecError("regolith outcome: empty"))?;
         match (tag, rest.len()) {
-            (0, 45) => Ok(Self::DamageDealt {
+            (0, 72) if rest[69] <= 1 => Ok(Self::DamageDealt {
                 attacker: PersistId::new(u64::from_le_bytes(rest[0..8].try_into().unwrap())),
                 target: PersistId::new(u64::from_le_bytes(rest[8..16].try_into().unwrap())),
                 amount: i32::from_le_bytes(rest[16..20].try_into().unwrap()),
                 attacker_pos: decode_pos(&rest[20..44]),
-                attacker_weapon: WeaponKind::from_tag(rest[44])?,
+                attacker_vel: decode_vel(&rest[44..68]),
+                attacker_weapon: WeaponKind::from_tag(rest[68])?,
+                flight_ticks: (rest[69] == 1)
+                    .then(|| u16::from_le_bytes(rest[70..72].try_into().unwrap())),
             }),
             (1, 8) => Ok(Self::Destroyed {
                 by: PersistId::new(u64::from_le_bytes(rest.try_into().unwrap())),
@@ -510,6 +605,11 @@ impl CoreCodec for Outcome {
                 director: PersistId::new(u64::from_le_bytes(rest[0..8].try_into().unwrap())),
                 bloom_index: u32::from_le_bytes(rest[8..12].try_into().unwrap()),
                 delta: i8::from_le_bytes([rest[12]]),
+            }),
+            (11, 17) => Ok(Self::LockBroken {
+                locker: PersistId::new(u64::from_le_bytes(rest[0..8].try_into().unwrap())),
+                target: PersistId::new(u64::from_le_bytes(rest[8..16].try_into().unwrap())),
+                reason: LockBreakReason::from_tag(rest[16])?,
             }),
             _ => Err(CodecError("regolith outcome: bad tag or length")),
         }

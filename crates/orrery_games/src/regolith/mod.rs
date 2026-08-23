@@ -12,7 +12,7 @@ pub mod weapon;
 
 use crate::game::{Game, GameMeta, Tamper};
 use archetype::Archetype;
-use order::{ChildSpec, Order, Outcome};
+use order::{ChildSpec, LockBreakReason, Order, Outcome};
 use orrery_core::{
     ComponentTypeId, CoreClass, EntityMaterialization, Invariant, OrderedInputs, QPos, QVel,
     Ruleset, StateView, StepOutput, TickRng, TICK_HZ,
@@ -65,11 +65,15 @@ const JITTER_MAX_URAD: u32 = 1_308_997;
 pub const PICKUP_TTL_TICKS: u16 = 1_800;
 /// Maximum eligible grab distance, in millimetres.
 pub const GRAB_RADIUS_MM: i64 = 25_000;
+/// Held-fire ticks required to acquire a target lock.
+pub const LOCK_ACQUISITION_TICKS: u16 = 30;
+const REFERENCE_SIGNATURE_RADIUS_MM: u128 = 3_000;
+const CHANCE_SCALE: u128 = 1_000_000;
 
-/// Regolith v5's rules identity. The bankable pilot now covers every scenario.
+/// Regolith v6's rules identity: target-side tracking, flight time and locks.
 pub const REGOLITH_RULESET: RulesetId = RulesetId {
-    version: 5,
-    digest: [0x52; 32],
+    version: 6,
+    digest: [0x63; 32],
 };
 
 /// Component classifications.
@@ -227,6 +231,7 @@ impl Regolith {
         let limits = own.archetype.limits();
         let mut equipped = own.weapon;
         let origin = own.pos;
+        let firing_vel = own.vel;
         let (mut px, mut py, mut pz) = own.pos.to_metres();
         let (mut vx, mut vy, mut vz) = own.vel.to_metres_per_sec();
         let (mut yaw, mut pitch, mut hull, mut shield) =
@@ -237,6 +242,8 @@ impl Regolith {
             (own.grabs_attempted, own.pickups_won, own.grabs_lost);
         let (mut respawn_in, mut score_rock_points, mut kills) =
             (own.respawn_in, own.score_rock_points, own.kills);
+        let (mut lock_target, mut lock_progress, mut locks_acquired) =
+            (own.lock_target, own.lock_progress, own.locks_acquired);
         let was_alive = own.alive();
         let mut disabled = !was_alive;
         for order in inputs.iter() {
@@ -263,6 +270,24 @@ impl Regolith {
                         .clamp(-PITCH_LIMIT_URAD, PITCH_LIMIT_URAD);
                 }
                 Order::Fire { target } => {
+                    match lock_target {
+                        None => {
+                            lock_target = Some(*target);
+                            lock_progress = 1;
+                        }
+                        Some(current) if current == *target => {
+                            if lock_progress < LOCK_ACQUISITION_TICKS {
+                                lock_progress = lock_progress.saturating_add(1);
+                                if lock_progress == LOCK_ACQUISITION_TICKS {
+                                    locks_acquired = locks_acquired.saturating_add(1);
+                                }
+                            }
+                        }
+                        Some(_) => continue,
+                    }
+                    if lock_progress < LOCK_ACQUISITION_TICKS {
+                        continue;
+                    }
                     let weapon = equipped.weapon();
                     if cooldown > 0 && self.honours_cooldown() {
                         continue;
@@ -280,7 +305,9 @@ impl Regolith {
                             target: *target,
                             amount,
                             attacker_pos: origin,
+                            attacker_vel: firing_vel,
                             attacker_weapon: equipped,
+                            flight_ticks: None,
                         });
                     }
                     shots = shots.saturating_add(1);
@@ -290,14 +317,43 @@ impl Regolith {
                     amount,
                     from,
                     from_pos,
+                    from_vel,
                     from_weapon,
+                    flight_ticks,
                 } => {
-                    let reach = from_weapon
-                        .weapon()
-                        .reach_mm
-                        .saturating_add(limits.radius_mm);
-                    if origin.distance_squared(*from_pos) > reach_sq(reach) {
-                        continue;
+                    match projectile_resolution(
+                        origin,
+                        own.vel,
+                        limits.radius_mm,
+                        was_alive && !disabled,
+                        *from_pos,
+                        *from_vel,
+                        *from_weapon,
+                        *flight_ticks,
+                        rng,
+                    ) {
+                        ProjectileResolution::InFlight(ticks) => {
+                            events.push(Outcome::DamageDealt {
+                                attacker: *from,
+                                target: me,
+                                amount: *amount,
+                                attacker_pos: *from_pos,
+                                attacker_vel: *from_vel,
+                                attacker_weapon: *from_weapon,
+                                flight_ticks: Some(ticks),
+                            });
+                            continue;
+                        }
+                        ProjectileResolution::Miss => continue,
+                        ProjectileResolution::Break(reason) => {
+                            events.push(Outcome::LockBroken {
+                                locker: *from,
+                                target: me,
+                                reason,
+                            });
+                            continue;
+                        }
+                        ProjectileResolution::Hit => {}
                     }
                     let incoming = (*amount).max(0);
                     let absorbed = incoming.min(shield.max(0));
@@ -309,6 +365,11 @@ impl Regolith {
                             disabled = true;
                             respawn_in = RESPAWN_TICKS;
                             events.push(Outcome::Destroyed { by: *from });
+                            events.push(Outcome::LockBroken {
+                                locker: *from,
+                                target: me,
+                                reason: LockBreakReason::TargetDestroyed,
+                            });
                         }
                     }
                 }
@@ -332,6 +393,12 @@ impl Regolith {
                 Order::KillCredit => kills = kills.saturating_add(1),
                 Order::RockCredit { points } => {
                     score_rock_points = score_rock_points.saturating_add(u64::from(*points));
+                }
+                Order::LockBroken { target, reason: _ } => {
+                    if lock_target == Some(*target) {
+                        lock_target = None;
+                        lock_progress = 0;
+                    }
                 }
                 Order::GrabAttempt { .. } | Order::BloomPopulationChanged { .. } => {}
             }
@@ -367,6 +434,8 @@ impl Regolith {
                 shield = limits.max_shield;
                 cooldown = 0;
                 equipped = weapon::WeaponKind::Stock;
+                lock_target = None;
+                lock_progress = 0;
             }
         }
         let next = Craft {
@@ -386,6 +455,9 @@ impl Regolith {
             respawn_in,
             score_rock_points,
             kills,
+            lock_target,
+            lock_progress,
+            locks_acquired,
             ..own
         };
         (next, events)
@@ -406,18 +478,47 @@ impl Regolith {
                     amount,
                     from,
                     from_pos,
+                    from_vel,
                     from_weapon,
+                    flight_ticks,
                 } = order
                 {
-                    let reach = from_weapon
-                        .weapon()
-                        .reach_mm
-                        .saturating_add(rock.tier.limits().radius_mm);
-                    if rock.hull > 0 && origin.distance_squared(*from_pos) <= reach_sq(reach) {
-                        rock.hull = (rock.hull - (*amount).max(0)).max(0);
-                        if rock.hull == 0 {
-                            killer = Some(*from);
+                    match projectile_resolution(
+                        origin,
+                        rock.vel,
+                        rock.tier.limits().radius_mm,
+                        rock.hull > 0,
+                        *from_pos,
+                        *from_vel,
+                        *from_weapon,
+                        *flight_ticks,
+                        rng,
+                    ) {
+                        ProjectileResolution::InFlight(ticks) => {
+                            events.push(Outcome::DamageDealt {
+                                attacker: *from,
+                                target: me,
+                                amount: *amount,
+                                attacker_pos: *from_pos,
+                                attacker_vel: *from_vel,
+                                attacker_weapon: *from_weapon,
+                                flight_ticks: Some(ticks),
+                            });
                         }
+                        ProjectileResolution::Hit => {
+                            rock.hull = (rock.hull - (*amount).max(0)).max(0);
+                            if rock.hull == 0 {
+                                killer = Some(*from);
+                            }
+                        }
+                        ProjectileResolution::Break(reason) => {
+                            events.push(Outcome::LockBroken {
+                                locker: *from,
+                                target: me,
+                                reason,
+                            });
+                        }
+                        ProjectileResolution::Miss => {}
                     }
                 }
             }
@@ -465,6 +566,21 @@ impl Regolith {
                     events.push(Outcome::RockDestroyed {
                         by,
                         points: rock.tier.limits().points,
+                    });
+                    events.push(Outcome::LockBroken {
+                        locker: by,
+                        target: me,
+                        reason: LockBreakReason::TargetDestroyed,
+                    });
+                }
+            }
+        } else {
+            for order in inputs.iter() {
+                if let Order::Damage { from, .. } = order {
+                    events.push(Outcome::LockBroken {
+                        locker: *from,
+                        target: me,
+                        reason: LockBreakReason::TargetDestroyed,
                     });
                 }
             }
@@ -582,6 +698,169 @@ impl Regolith {
             director.site_rocks_alive = BLOOM_ROCK_COUNT;
         }
         (director, events)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProjectileResolution {
+    InFlight(u16),
+    Hit,
+    Miss,
+    Break(LockBreakReason),
+}
+
+#[allow(clippy::too_many_arguments)]
+fn projectile_resolution(
+    target_pos: QPos,
+    target_vel: QVel,
+    target_radius_mm: i64,
+    target_alive: bool,
+    attacker_pos: QPos,
+    attacker_vel: QVel,
+    weapon_kind: weapon::WeaponKind,
+    flight_ticks: Option<u16>,
+    rng: &mut TickRng,
+) -> ProjectileResolution {
+    if !target_alive {
+        return ProjectileResolution::Break(LockBreakReason::TargetDestroyed);
+    }
+    let weapon = weapon_kind.weapon();
+    let range_sq = nonnegative_distance_squared(target_pos, attacker_pos);
+    let reach = weapon
+        .optimal_mm
+        .saturating_add(weapon.falloff_mm)
+        .saturating_add(target_radius_mm);
+    if range_sq > square_i64(reach) {
+        return ProjectileResolution::Break(LockBreakReason::RangeExceeded);
+    }
+
+    match flight_ticks {
+        None => {
+            let ticks = flight_ticks_for(range_sq, weapon.projectile_speed_mms);
+            if ticks > 1 {
+                return ProjectileResolution::InFlight(ticks - 1);
+            }
+        }
+        Some(ticks) if ticks > 1 => return ProjectileResolution::InFlight(ticks - 1),
+        Some(_) => {}
+    }
+
+    let chance = hit_chance_ppm(
+        target_pos,
+        target_vel,
+        target_radius_mm,
+        attacker_pos,
+        attacker_vel,
+        weapon,
+    );
+    if uniform_below(rng, CHANCE_SCALE as u32) < chance {
+        ProjectileResolution::Hit
+    } else {
+        ProjectileResolution::Miss
+    }
+}
+
+fn hit_chance_ppm(
+    target_pos: QPos,
+    target_vel: QVel,
+    target_radius_mm: i64,
+    attacker_pos: QPos,
+    attacker_vel: QVel,
+    weapon: weapon::Weapon,
+) -> u32 {
+    let rx = i128::from(target_pos.x).saturating_sub(i128::from(attacker_pos.x));
+    let ry = i128::from(target_pos.y).saturating_sub(i128::from(attacker_pos.y));
+    let rz = i128::from(target_pos.z).saturating_sub(i128::from(attacker_pos.z));
+    let vx = i128::from(target_vel.x).saturating_sub(i128::from(attacker_vel.x));
+    let vy = i128::from(target_vel.y).saturating_sub(i128::from(attacker_vel.y));
+    let vz = i128::from(target_vel.z).saturating_sub(i128::from(attacker_vel.z));
+    let range_sq = sum_squares([rx, ry, rz]);
+    let range_mm = integer_sqrt(range_sq);
+
+    let cross = [
+        ry.saturating_mul(vz).saturating_sub(rz.saturating_mul(vy)),
+        rz.saturating_mul(vx).saturating_sub(rx.saturating_mul(vz)),
+        rx.saturating_mul(vy).saturating_sub(ry.saturating_mul(vx)),
+    ];
+    let cross_magnitude = integer_sqrt(sum_squares(cross));
+    let angular_urad_per_sec = cross_magnitude
+        .saturating_mul(1_000_000)
+        .checked_div(range_sq)
+        .unwrap_or(0);
+    let tracking_denominator =
+        u128::from(weapon.tracking_urad_per_sec).saturating_mul(target_radius_mm.max(1) as u128);
+    let tracking_ratio = angular_urad_per_sec
+        .saturating_mul(REFERENCE_SIGNATURE_RADIUS_MM)
+        .saturating_mul(CHANCE_SCALE)
+        / tracking_denominator.max(1);
+
+    let optimal = weapon.optimal_mm.max(0) as u128;
+    let range_ratio = range_mm
+        .saturating_sub(optimal)
+        .saturating_mul(CHANCE_SCALE)
+        / (weapon.falloff_mm.max(1) as u128);
+    let penalty = tracking_ratio
+        .saturating_mul(tracking_ratio)
+        .saturating_add(range_ratio.saturating_mul(range_ratio));
+    let denominator = CHANCE_SCALE
+        .saturating_mul(CHANCE_SCALE)
+        .saturating_add(penalty);
+    let chance = CHANCE_SCALE
+        .saturating_mul(CHANCE_SCALE)
+        .saturating_mul(CHANCE_SCALE)
+        / denominator.max(1);
+    u32::try_from(chance.min(CHANCE_SCALE)).unwrap_or(CHANCE_SCALE as u32)
+}
+
+fn flight_ticks_for(range_sq: u128, projectile_speed_mms: i64) -> u16 {
+    let distance = integer_sqrt(range_sq);
+    let numerator = distance.saturating_mul(u128::from(TICK_HZ));
+    let speed = projectile_speed_mms.max(1) as u128;
+    let ticks = numerator.saturating_add(speed - 1) / speed;
+    u16::try_from(ticks.max(1)).unwrap_or(u16::MAX)
+}
+
+fn nonnegative_distance_squared(a: QPos, b: QPos) -> u128 {
+    sum_squares([
+        i128::from(a.x).saturating_sub(i128::from(b.x)),
+        i128::from(a.y).saturating_sub(i128::from(b.y)),
+        i128::from(a.z).saturating_sub(i128::from(b.z)),
+    ])
+}
+
+fn square_i64(value: i64) -> u128 {
+    let value = value.max(0) as u128;
+    value.saturating_mul(value)
+}
+
+fn sum_squares(values: [i128; 3]) -> u128 {
+    values.into_iter().fold(0, |sum, value| {
+        let magnitude = value.unsigned_abs();
+        sum.saturating_add(magnitude.saturating_mul(magnitude))
+    })
+}
+
+fn integer_sqrt(value: u128) -> u128 {
+    if value < 2 {
+        return value;
+    }
+    let mut estimate = 1u128 << (value.ilog2() / 2 + 1);
+    loop {
+        let next = (estimate + value / estimate) / 2;
+        if next >= estimate {
+            return estimate;
+        }
+        estimate = next;
+    }
+}
+
+fn uniform_below(rng: &mut TickRng, bound: u32) -> u32 {
+    let limit = u32::MAX - u32::MAX % bound;
+    loop {
+        let draw = rng.next_u32();
+        if draw < limit {
+            return draw % bound;
+        }
     }
 }
 
@@ -767,14 +1046,18 @@ impl Game for Regolith {
                 target,
                 amount,
                 attacker_pos,
+                attacker_vel,
                 attacker_weapon,
+                flight_ticks,
             } => Some((
                 *target,
                 Order::Damage {
                     amount: *amount,
                     from: *attacker,
                     from_pos: *attacker_pos,
+                    from_vel: *attacker_vel,
                     from_weapon: *attacker_weapon,
+                    flight_ticks: *flight_ticks,
                 },
             )),
             Outcome::GrabAttempted {
@@ -803,6 +1086,17 @@ impl Game for Regolith {
                 Order::BloomPopulationChanged {
                     bloom_index: *bloom_index,
                     delta: *delta,
+                },
+            )),
+            Outcome::LockBroken {
+                locker,
+                target,
+                reason,
+            } => Some((
+                *locker,
+                Order::LockBroken {
+                    target: *target,
+                    reason: *reason,
                 },
             )),
             Outcome::Split { .. }

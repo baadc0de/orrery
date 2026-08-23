@@ -24,8 +24,14 @@ pub struct Weapon {
     pub rolls: u8,
     /// Decrement-first cadence.
     pub cooldown_ticks: u16,
-    /// Target-side reach.
-    pub reach_mm: i64,
+    /// Range at which the weapon has no range penalty.
+    pub optimal_mm: i64,
+    /// Additional range over which accuracy decays.
+    pub falloff_mm: i64,
+    /// Projectile speed, in millimetres per second.
+    pub projectile_speed_mms: i64,
+    /// Turret tracking speed, in micro-radians per second at reference signature.
+    pub tracking_urad_per_sec: u32,
 }
 
 impl WeaponKind {
@@ -38,21 +44,30 @@ impl WeaponKind {
                 damage_spread: 4,
                 rolls: 1,
                 cooldown_ticks: 20,
-                reach_mm: 400_000,
+                optimal_mm: 300_000,
+                falloff_mm: 100_000,
+                projectile_speed_mms: 300_000,
+                tracking_urad_per_sec: 180_000,
             },
             Self::Volley => Weapon {
                 damage_base: 5,
                 damage_spread: 2,
                 rolls: 3,
                 cooldown_ticks: 30,
-                reach_mm: 300_000,
+                optimal_mm: 200_000,
+                falloff_mm: 100_000,
+                projectile_speed_mms: 450_000,
+                tracking_urad_per_sec: 300_000,
             },
             Self::Heavy => Weapon {
                 damage_base: 45,
                 damage_spread: 12,
                 rolls: 1,
                 cooldown_ticks: 90,
-                reach_mm: 900_000,
+                optimal_mm: 700_000,
+                falloff_mm: 200_000,
+                projectile_speed_mms: 180_000,
+                tracking_urad_per_sec: 60_000,
             },
         }
     }
