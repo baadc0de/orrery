@@ -38,6 +38,7 @@
 use orrery_core::{QPos, QVel, Ruleset, TickRng};
 use orrery_protocol::{PersistId, RulesetId, Tick};
 
+use crate::regolith::Regolith;
 use crate::skirmish::Skirmish;
 
 /// What a harness can learn about a game without instantiating it.
@@ -163,7 +164,7 @@ pub trait Game: Ruleset + Sized {
 /// Kept in step with [`for_each_game`] by `catalogue_and_visitor_agree` in the
 /// battery — a game added to one and not the other is a test failure, not a
 /// silently unmeasured game.
-pub const CATALOGUE: &[GameMeta] = &[Skirmish::META];
+pub const CATALOGUE: &[GameMeta] = &[Skirmish::META, Regolith::META];
 
 /// A visitor over the catalogue, static-dispatched.
 ///
@@ -179,4 +180,5 @@ pub trait GameVisitor {
 /// Run `visitor` over every game in the catalogue.
 pub fn for_each_game<V: GameVisitor>(visitor: &mut V) {
     visitor.visit::<Skirmish>();
+    visitor.visit::<Regolith>();
 }

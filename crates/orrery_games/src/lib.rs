@@ -66,10 +66,12 @@
 
 pub mod game;
 pub mod golden;
+pub mod regolith;
 pub mod scenario;
 pub mod skirmish;
 
 pub use game::{for_each_game, Game, GameMeta, GameVisitor, Tamper, CATALOGUE};
+pub use regolith::Regolith;
 pub use scenario::{
     adjudicate, adjudicate_isolated, play, Divergence, Flag, Play, Scenario, SCENARIOS,
 };
