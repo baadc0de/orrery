@@ -53,6 +53,7 @@ their linked dependencies.
 | D36 | [ADR-0036](adr/0036-binding-rate-window.md) | The binding-rate window: `dw` answers D31 clause (g) inside `d`; amends D31 |
 | D37 | [ADR-0037](adr/0037-unavailable-witness-epoch.md) | Unavailable witness epochs refuse with a bounded cure; corrects D27/D28 |
 | D38 | [ADR-0038](adr/0038-at-rest-schema-versioning.md) | At-rest schema versioning as three work items: formats before machinery, migrations fit D21's freeze additively |
+| D41 | [ADR-0041](adr/0041-offline-identity-issuer-custody-and-lifecycle.md) | Offline invites are single-use capabilities, account allocation is singular, issuer keys are portable escrowed secrets |
 
 ## Status and supersession
 
@@ -72,12 +73,6 @@ D40 is **proposed, not accepted**:
 deliberately absent from the index above, which is the accepted set; it is
 non-normative until the owner decides the visibility/spatial-query layering and
 the accepted-record tensions the proposal names.
-
-D41 is **proposed, not accepted**:
-[ADR-0041](adr/0041-offline-identity-issuer-custody-and-lifecycle.md) holds it.
-It is deliberately absent from the index above, which is the accepted set; it
-is non-normative until the owner decides invite custody, account allocation,
-single-use lifecycle, issuer-key custody and campaign session refresh policy.
 
 D18 is reserved only as a proposal in
 [ADR-0017](adr/0017-risks-and-open-questions.md); it is not accepted and has no

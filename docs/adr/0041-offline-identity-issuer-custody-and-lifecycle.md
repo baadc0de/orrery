@@ -1,10 +1,12 @@
 # ADR-0041: Offline invites are single-use capabilities, account allocation is singular, and issuer keys are portable secrets
 
-**Status:** Proposed · **Date:** 2026-08-23 · **Decision:** D41
+**Status:** Accepted · **Date:** 2026-08-23 · **Decision:** D41
 
-This record is non-normative until accepted. See the [ADR index](../DECISIONS.md)
-for precedence, scope, and the complete accepted decision set. Acceptance is
-reserved to the owner.
+This record is normative. See the [ADR index](../DECISIONS.md) for precedence,
+scope, and the complete accepted decision set.
+
+Accepted by the owner on 2026-08-23, with clause (f)'s five tensions resolved
+as recorded in that clause.
 
 **Supersedes:** nothing. It proposes the custody and lifecycle policy that
 [D31] explicitly excludes and that [D12]'s identity service now needs before an
@@ -438,10 +440,11 @@ owner-selectable future
 campaign policy only after measuring that path and recording the changed
 freshness/load arithmetic.
 
-### (f) Accepted records and expansion rules the owner must resolve
+### (f) Accepted records and expansion rules — resolved on acceptance
 
-This proposal does not silently edit architectural history. Acceptance requires
-the owner to resolve these tensions explicitly:
+This record does not silently edit architectural history. The owner resolved
+each tension explicitly on 2026-08-23; the resolutions are recorded inline
+below, after each tension they answer.
 
 - **D31 clauses (a) and (d), as amended by D36.** D31 gives `d` only its named
   identity sub-spans and makes identity their sole writer. Atomic allocation
@@ -471,7 +474,36 @@ the owner to resolve these tensions explicitly:
   session TTL and half-TTL refresh rows to D16 or deliberately leaves them as a
   protocol constant plus operations rule.
 
-## Consequences if accepted
+**Resolutions, 2026-08-23:**
+
+1. **D31 (a)/(d) via D36 — follows from resolution 3.** Durable allocation and
+   consumption move to identity-owned storage when the service does; until then
+   the local ledger enforces single-use per ledger and nothing claims
+   cross-operator atomicity. `crates/orrery_identity` says so at the point it
+   matters rather than implying a stronger property.
+2. **D31's out-of-scope boundary — confirmed, narrow.** This record decides the
+   operator-issued invite credential and the account-allocation path only.
+   Payment, pricing and general login remain open and undecided, exactly as
+   [D31] leaves them.
+3. **D12 and [docs/09 §1–§2] — portable shared state is the destination; the
+   first deployment takes a dated single-host exception.** The accepted posture
+   of replicated stateless replicas over one home FDB stands and is not
+   amended. The first invite-redemption endpoint may run as a single host with
+   a host-local ledger, on two conditions: the issuer key is generated
+   off-host and escrowed per clause (d) so it is portable before it is used,
+   and the successor-host restore rehearsal in clause (d) is performed *before*
+   the endpoint accepts its first redemption. The exception expires when the
+   host it runs on is decommissioned; it is not a licence to keep a stateful
+   singleton past that date.
+4. **[docs/09 §8] — confirmed, narrow.** Its dual-accept-for-one-release
+   rotation governs *planned service-NodeId* rotation. It does not authorize
+   continued trust in a stolen issuer key; clause (d)'s immediate-distrust mode
+   governs compromise.
+5. **D16 — the rows are added.** Session token TTL (1 h, hard max) and the
+   half-TTL refresh point now appear in [D16]'s parameter table with the
+   arithmetic that prices them.
+
+## Consequences
 
 - A leaked unredeemed invite buys at most one first binding; after a committed
   redemption it buys zero. A stolen issuer key remains fleet-wide and is never
