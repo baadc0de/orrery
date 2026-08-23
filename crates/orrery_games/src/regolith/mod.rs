@@ -1,9 +1,7 @@
-//! **Regolith** — planar combat over a weapon table.
+//! **Regolith** — planar combat plus materialized, replayable rock splits.
 //!
-//! This is intentionally a sibling, not an edit, of `skirmish`. Kinematics are
-//! inherited exactly; the honest input source locks pitch to zero. The only
-//! grammar change is that a shot names `WeaponKind`, whose legitimacy is
-//! established by the shooter's own hashed `Craft.weapon` state.
+//! A split is described entirely by an ordered event. Its parent records the
+//! monotone split counter in its own state, so materialization is adjudicable.
 
 pub mod archetype;
 pub mod invariants;
@@ -14,34 +12,37 @@ pub mod weapon;
 
 use crate::game::{Game, GameMeta, Tamper};
 use archetype::Archetype;
-use order::{Order, Outcome};
+use order::{ChildSpec, Order, Outcome};
 use orrery_core::{
-    ComponentTypeId, CoreClass, Invariant, OrderedInputs, QPos, QVel, Ruleset, StateView,
-    StepOutput, TickRng, TICK_HZ,
+    ComponentTypeId, CoreClass, EntityMaterialization, Invariant, OrderedInputs, QPos, QVel,
+    Ruleset, StateView, StepOutput, TickRng, TICK_HZ,
 };
 use orrery_protocol::{PersistId, RulesetId, Tick};
 use rand_core::RngCore;
-use state::{Craft, PITCH_LIMIT_URAD, TAU_URAD};
+use state::{Craft, RegolithState, Rock, RockTier, PITCH_LIMIT_URAD, TAU_URAD};
 
 const DT: f64 = 1.0 / TICK_HZ as f64;
-/// Drag shared by rules and stage-1 acceleration bounds.
+/// Drag shared by craft rules and stage-1 acceleration bounds.
 pub const DRAG_PER_SEC_PER_MILLE: i64 = 50;
 const DRAG_PER_SEC: f64 = DRAG_PER_SEC_PER_MILLE as f64 / 1_000.0;
 const SPAWN_RADIUS_MM: f64 = 150_000.0;
 const GOLDEN_ANGLE_URAD: i64 = 2_399_963;
+/// Rocks reflect from this square island edge with integer velocity negation.
+pub const ISLAND_BOUNDARY_MM: i64 = 1_000_000;
+const JITTER_MIN_URAD: u32 = 785_398;
+const JITTER_MAX_URAD: u32 = 1_308_997;
 
-/// Regolith v1's fixed rules identity.
+/// Regolith v2's rules identity. Rocks change rules and golden chains.
 pub const REGOLITH_RULESET: RulesetId = RulesetId {
-    version: 1,
+    version: 2,
     digest: [0x52; 32],
 };
 
 /// Component classifications.
 pub mod components {
     use orrery_core::ComponentTypeId;
-
-    /// Verifiable craft state.
-    pub const CRAFT: ComponentTypeId = ComponentTypeId(1);
+    /// Verifiable Regolith state, whether craft or rock.
+    pub const STATE: ComponentTypeId = ComponentTypeId(1);
 }
 
 /// Regolith rules, optionally carrying one deliberate P4 tamper.
@@ -49,6 +50,7 @@ pub mod components {
 pub struct Regolith {
     tamper: Option<Tamper>,
 }
+
 impl Regolith {
     /// Honest rules.
     #[must_use]
@@ -78,44 +80,84 @@ impl Regolith {
         !matches!(self.tamper, Some(Tamper::NoCooldown))
     }
 }
+
 impl Ruleset for Regolith {
-    type CoreState = Craft;
+    type CoreState = RegolithState;
     type CoreInput = Order;
     type CoreEvent = Outcome;
     fn id(&self) -> RulesetId {
         REGOLITH_RULESET
     }
     fn classify_component(&self, component: ComponentTypeId) -> CoreClass {
-        if component == components::CRAFT {
+        if component == components::STATE {
             CoreClass::Core
         } else {
             CoreClass::Cosmetic
         }
     }
-    fn invariants(&self) -> &[Invariant<Craft>] {
+    fn invariants(&self) -> &[Invariant<RegolithState>] {
         invariants::INVARIANTS
     }
     fn step(
         &self,
-        view: &mut StateView<'_, Craft>,
+        view: &mut StateView<'_, RegolithState>,
         inputs: &OrderedInputs<'_, Order>,
         rng: &mut TickRng,
     ) -> StepOutput<Outcome> {
-        let mut events = Vec::new();
         let me = view.entity();
-        let own = view.own();
+        let (state, events) = match view.own().clone() {
+            RegolithState::Craft(craft) => {
+                let (craft, events) = self.step_craft(me, craft, inputs, rng);
+                (RegolithState::Craft(craft), events)
+            }
+            RegolithState::Rock(rock) => {
+                let (rock, events) = self.step_rock(me, rock, inputs, rng);
+                (RegolithState::Rock(rock), events)
+            }
+        };
+        *view.own_mut() = state;
+        StepOutput { events }
+    }
+    fn materialize(&self, event: &Outcome, out: &mut Vec<EntityMaterialization<RegolithState>>) {
+        if let Outcome::Split {
+            generation,
+            children,
+            ..
+        } = event
+        {
+            for child in children {
+                out.push(EntityMaterialization::new(
+                    child.id,
+                    RegolithState::Rock(Rock::spawned(
+                        child.tier,
+                        generation.saturating_add(1),
+                        child.pos,
+                        child.vel,
+                    )),
+                ));
+            }
+        }
+    }
+}
+
+impl Regolith {
+    fn step_craft(
+        &self,
+        me: PersistId,
+        own: Craft,
+        inputs: &OrderedInputs<'_, Order>,
+        rng: &mut TickRng,
+    ) -> (Craft, Vec<Outcome>) {
+        let mut events = Vec::new();
         let limits = own.archetype.limits();
         let weapon = own.weapon.weapon();
         let origin = own.pos;
         let (mut px, mut py, mut pz) = own.pos.to_metres();
         let (mut vx, mut vy, mut vz) = own.vel.to_metres_per_sec();
-        let mut yaw = own.yaw_urad;
-        let mut pitch = own.pitch_urad;
-        let mut hull = own.hull;
-        let mut shield = own.shield;
-        let mut shots = own.shots;
-        let mut damage_dealt = own.damage_dealt;
-        let mut cooldown = own.cooldown.saturating_sub(1);
+        let (mut yaw, mut pitch, mut hull, mut shield) =
+            (own.yaw_urad, own.pitch_urad, own.hull, own.shield);
+        let (mut shots, mut damage_dealt, mut cooldown) =
+            (own.shots, own.damage_dealt, own.cooldown.saturating_sub(1));
         let mut disabled = !own.alive();
         for order in inputs.iter() {
             match order {
@@ -169,8 +211,11 @@ impl Ruleset for Regolith {
                     from_pos,
                     from_weapon,
                 } => {
-                    if origin.distance_squared(*from_pos) > reach_sq(from_weapon.weapon().reach_mm)
-                    {
+                    let reach = from_weapon
+                        .weapon()
+                        .reach_mm
+                        .saturating_add(limits.radius_mm);
+                    if origin.distance_squared(*from_pos) > reach_sq(reach) {
                         continue;
                     }
                     let incoming = (*amount).max(0);
@@ -202,26 +247,174 @@ impl Ruleset for Regolith {
         px += vx * DT;
         py += vy * DT;
         pz += vz * DT;
-        let craft = view.own_mut();
-        craft.pos = QPos::from_metres(px, py, pz);
-        craft.vel = QVel::from_metres_per_sec(vx, vy, vz);
-        craft.yaw_urad = yaw;
-        craft.pitch_urad = pitch;
-        craft.hull = hull;
-        craft.shield = shield;
-        craft.cooldown = cooldown;
-        craft.shots = shots;
-        craft.damage_dealt = damage_dealt;
-        StepOutput { events }
+        (
+            Craft {
+                pos: QPos::from_metres(px, py, pz),
+                vel: QVel::from_metres_per_sec(vx, vy, vz),
+                yaw_urad: yaw,
+                pitch_urad: pitch,
+                hull,
+                shield,
+                cooldown,
+                shots,
+                damage_dealt,
+                ..own
+            },
+            events,
+        )
     }
+    fn step_rock(
+        &self,
+        me: PersistId,
+        mut rock: Rock,
+        inputs: &OrderedInputs<'_, Order>,
+        rng: &mut TickRng,
+    ) -> (Rock, Vec<Outcome>) {
+        let mut events = Vec::new();
+        let origin = rock.pos;
+        if rock.hull > 0 {
+            for order in inputs.iter() {
+                if let Order::Damage {
+                    amount,
+                    from_pos,
+                    from_weapon,
+                    ..
+                } = order
+                {
+                    let reach = from_weapon
+                        .weapon()
+                        .reach_mm
+                        .saturating_add(rock.tier.limits().radius_mm);
+                    if origin.distance_squared(*from_pos) <= reach_sq(reach) {
+                        rock.hull = (rock.hull - (*amount).max(0)).max(0);
+                    }
+                }
+            }
+            if rock.hull == 0 {
+                if let Some(child_tier) = rock.tier.child() {
+                    let children = split_children(me, &rock, child_tier, rng);
+                    events.push(Outcome::Split {
+                        parent: me,
+                        generation: rock.generation,
+                        children,
+                    });
+                    rock.splits_done = rock.splits_done.saturating_add(1);
+                }
+            }
+        }
+        if rock.hull > 0 {
+            rock.pos.x = rock.pos.x.saturating_add(rock.vel.x / i64::from(TICK_HZ));
+            rock.pos.y = rock.pos.y.saturating_add(rock.vel.y / i64::from(TICK_HZ));
+            rock.pos.z = rock.pos.z.saturating_add(rock.vel.z / i64::from(TICK_HZ));
+            if rock.pos.x.abs() > ISLAND_BOUNDARY_MM {
+                rock.vel.x = rock.vel.x.saturating_neg();
+            }
+            if rock.pos.y.abs() > ISLAND_BOUNDARY_MM {
+                rock.vel.y = rock.vel.y.saturating_neg();
+            }
+            if rock.pos.z.abs() > ISLAND_BOUNDARY_MM {
+                rock.vel.z = rock.vel.z.saturating_neg();
+            }
+        }
+        (rock, events)
+    }
+}
+
+fn split_children(
+    parent: PersistId,
+    rock: &Rock,
+    tier: RockTier,
+    rng: &mut TickRng,
+) -> [ChildSpec; 2] {
+    let jitter0 = uniform_jitter(rng);
+    let jitter1 = uniform_jitter(rng);
+    [
+        child_spec(parent, rock, tier, 0, i64::from(jitter0)),
+        child_spec(parent, rock, tier, 1, -i64::from(jitter1)),
+    ]
+}
+fn uniform_jitter(rng: &mut TickRng) -> u32 {
+    let width = JITTER_MAX_URAD - JITTER_MIN_URAD + 1;
+    let limit = u32::MAX - u32::MAX % width;
+    loop {
+        let draw = rng.next_u32();
+        if draw < limit {
+            return JITTER_MIN_URAD + draw % width;
+        }
+    }
+}
+fn child_spec(
+    parent: PersistId,
+    rock: &Rock,
+    tier: RockTier,
+    slot: u8,
+    signed_angle_urad: i64,
+) -> ChildSpec {
+    let angle = signed_angle_urad as f64 / 1_000_000.0;
+    let (vx, vy, vz) = rock.vel.to_metres_per_sec();
+    let scale = 1.4_f64;
+    let (mut x, mut z) = (
+        (vx * libm::cos(angle) - vz * libm::sin(angle)) * scale,
+        (vx * libm::sin(angle) + vz * libm::cos(angle)) * scale,
+    );
+    let mut y = vy * scale;
+    let speed = libm::sqrt(x * x + y * y + z * z);
+    let ceiling = tier.limits().max_speed_mms as f64 / 1_000.0;
+    if speed > ceiling && speed > 0.0 {
+        let cap = ceiling / speed;
+        x *= cap;
+        y *= cap;
+        z *= cap;
+    }
+    let vel = QVel::from_metres_per_sec(x, y, z);
+    let speed =
+        libm::sqrt((vel.x as f64).powi(2) + (vel.y as f64).powi(2) + (vel.z as f64).powi(2));
+    let radius = rock.tier.limits().radius_mm as f64;
+    let pos = if speed > 0.0 {
+        QPos {
+            x: rock
+                .pos
+                .x
+                .saturating_add((vel.x as f64 * radius / speed) as i64),
+            y: rock
+                .pos
+                .y
+                .saturating_add((vel.y as f64 * radius / speed) as i64),
+            z: rock
+                .pos
+                .z
+                .saturating_add((vel.z as f64 * radius / speed) as i64),
+        }
+    } else {
+        rock.pos
+    };
+    ChildSpec {
+        id: child_id(parent, rock.generation, slot),
+        tier,
+        pos,
+        vel,
+    }
+}
+fn child_id(parent: PersistId, generation: u32, slot: u8) -> PersistId {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"regolith-rock");
+    hasher.update(&parent.0.to_le_bytes());
+    hasher.update(&generation.to_le_bytes());
+    hasher.update(&[slot]);
+    PersistId::new(u64::from_le_bytes(
+        hasher.finalize().as_bytes()[..8]
+            .try_into()
+            .expect("digest prefix"),
+    ))
 }
 const fn reach_sq(range_mm: i64) -> i128 {
     (range_mm as i128) * (range_mm as i128)
 }
+
 impl Game for Regolith {
     const META: GameMeta = GameMeta {
         name: "regolith",
-        summary: "planar craft: inherited kinematics and weapon-table combat",
+        summary: "planar craft and replayable three-tier rock splits",
         ruleset: REGOLITH_RULESET,
     };
     const GOLDEN_CHAINS: &'static [(&'static str, [u8; 32])] = &crate::golden::REGOLITH;
@@ -231,7 +424,7 @@ impl Game for Regolith {
     fn tampered(tamper: Tamper) -> Option<Self> {
         Some(Self::cheating(tamper))
     }
-    fn spawn(&self, _entity: PersistId, slot: u64) -> Craft {
+    fn spawn(&self, _entity: PersistId, slot: u64) -> RegolithState {
         let archetype = Archetype::for_slot(slot);
         let angle_urad = (slot as i64).saturating_mul(GOLDEN_ANGLE_URAD) % i64::from(TAU_URAD);
         let angle = angle_urad as f64 / 1_000_000.0;
@@ -241,7 +434,7 @@ impl Game for Regolith {
             SPAWN_RADIUS_MM * libm::sin(angle) / 1_000.0,
         );
         let yaw = i32::try_from(angle_urad).unwrap_or(0) + TAU_URAD / 4;
-        Craft::spawned(archetype, pos, yaw)
+        RegolithState::Craft(Craft::spawned(archetype, pos, yaw))
     }
     fn honest_inputs(
         &self,
@@ -271,10 +464,13 @@ impl Game for Regolith {
                     from_weapon: *attacker_weapon,
                 },
             )),
-            Outcome::Destroyed { .. } => None,
+            Outcome::Destroyed { .. } | Outcome::Split { .. } => None,
         }
     }
-    fn trajectory(state: &Craft) -> (QPos, QVel) {
-        (state.pos, state.vel)
+    fn trajectory(state: &RegolithState) -> (QPos, QVel) {
+        match state {
+            RegolithState::Craft(craft) => (craft.pos, craft.vel),
+            RegolithState::Rock(rock) => (rock.pos, rock.vel),
+        }
     }
 }

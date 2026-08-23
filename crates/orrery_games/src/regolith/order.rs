@@ -1,8 +1,10 @@
 //! Regolith's one grammar extension: damage identifies a weapon, never a raw reach.
 
 use super::weapon::WeaponKind;
-use orrery_core::{CodecError, CoreCodec, QPos};
+use orrery_core::{CodecError, CoreCodec, QPos, QVel};
 use orrery_protocol::PersistId;
+
+use super::state::RockTier;
 
 fn encode_pos(pos: QPos, out: &mut Vec<u8>) {
     for value in [pos.x, pos.y, pos.z] {
@@ -16,6 +18,33 @@ fn decode_pos(bytes: &[u8]) -> QPos {
         y: at(8),
         z: at(16),
     }
+}
+fn encode_vel(vel: QVel, out: &mut Vec<u8>) {
+    for value in [vel.x, vel.y, vel.z] {
+        out.extend_from_slice(&value.to_le_bytes());
+    }
+}
+fn decode_vel(bytes: &[u8]) -> QVel {
+    let at = |o| i64::from_le_bytes(bytes[o..o + 8].try_into().unwrap());
+    QVel {
+        x: at(0),
+        y: at(8),
+        z: at(16),
+    }
+}
+
+/// One complete child description. The event is self-sufficient: executor
+/// materialization never allocates an id or consults the parent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChildSpec {
+    /// Derived child identifier.
+    pub id: PersistId,
+    /// Child tier.
+    pub tier: RockTier,
+    /// Child lattice position.
+    pub pos: QPos,
+    /// Child lattice velocity.
+    pub vel: QVel,
 }
 
 /// An ordered core input.
@@ -124,6 +153,15 @@ pub enum Outcome {
         /// Last attacker.
         by: PersistId,
     },
+    /// A dying parent produced its two ordered children.
+    Split {
+        /// The emitting parent.
+        parent: PersistId,
+        /// The parent generation, included in the id derivation.
+        generation: u32,
+        /// Slot-zero then slot-one children.
+        children: [ChildSpec; 2],
+    },
 }
 
 impl CoreCodec for Outcome {
@@ -147,6 +185,21 @@ impl CoreCodec for Outcome {
                 out.push(1);
                 out.extend_from_slice(&by.0.to_le_bytes());
             }
+            Self::Split {
+                parent,
+                generation,
+                children,
+            } => {
+                out.push(2);
+                out.extend_from_slice(&parent.0.to_le_bytes());
+                out.extend_from_slice(&generation.to_le_bytes());
+                for child in children {
+                    out.extend_from_slice(&child.id.0.to_le_bytes());
+                    out.push(child.tier.tag());
+                    encode_pos(child.pos, out);
+                    encode_vel(child.vel, out);
+                }
+            }
         }
     }
     fn decode(bytes: &[u8]) -> Result<Self, CodecError> {
@@ -164,6 +217,23 @@ impl CoreCodec for Outcome {
             (1, 8) => Ok(Self::Destroyed {
                 by: PersistId::new(u64::from_le_bytes(rest.try_into().unwrap())),
             }),
+            (2, 126) => {
+                let child = |offset: usize| -> Result<ChildSpec, CodecError> {
+                    Ok(ChildSpec {
+                        id: PersistId::new(u64::from_le_bytes(
+                            rest[offset..offset + 8].try_into().unwrap(),
+                        )),
+                        tier: RockTier::from_tag(rest[offset + 8])?,
+                        pos: decode_pos(&rest[offset + 9..offset + 33]),
+                        vel: decode_vel(&rest[offset + 33..offset + 57]),
+                    })
+                };
+                Ok(Self::Split {
+                    parent: PersistId::new(u64::from_le_bytes(rest[0..8].try_into().unwrap())),
+                    generation: u32::from_le_bytes(rest[8..12].try_into().unwrap()),
+                    children: [child(12)?, child(69)?],
+                })
+            }
             _ => Err(CodecError("regolith outcome: bad tag or length")),
         }
     }
