@@ -1,0 +1,60 @@
+name: Package Regolith client
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "playtest-*"
+
+permissions:
+  contents: read
+
+# This workflow is deliberately release-shaped. Do not add a PR trigger: it
+# will eventually hold the private-assets credential, and PR code must never
+# run with that authority.
+jobs:
+  package-client:
+    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/playtest-')
+    name: package Regolith (${{ matrix.label }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, label: x86_64-linux, binary: orrery_regolith_client }
+          - { os: windows-latest, label: x86_64-windows, binary: orrery_regolith_client.exe }
+          - { os: macos-latest, label: macos, binary: orrery_regolith_client }
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+        working-directory: clients/regolith
+    env:
+      ORRERY_BUILD_REV: ${{ github.sha }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install the pinned toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+
+      - name: Build the standalone Regolith workspace
+        run: cargo build --release
+
+      - name: Stage binary and its SHA-256
+        working-directory: .
+        run: |
+          mkdir -p "dist/${{ matrix.label }}"
+          artifact="dist/${{ matrix.label }}/orrery-regolith-${{ matrix.label }}"
+          cp "clients/regolith/target/release/${{ matrix.binary }}" "$artifact"
+          if command -v sha256sum >/dev/null; then
+            sha256sum "$artifact" > "$artifact.sha256"
+          else
+            shasum -a 256 "$artifact" > "$artifact.sha256"
+          fi
+
+      - name: Upload binary and SHA-256
+        uses: actions/upload-artifact@v7
+        with:
+          name: regolith-${{ matrix.label }}-${{ github.sha }}
+          path: dist/${{ matrix.label }}
+          if-no-files-found: error
+          retention-days: 30

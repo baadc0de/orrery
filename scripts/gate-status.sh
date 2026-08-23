@@ -12,8 +12,8 @@
 # ── The two rules this report is built on ────────────────────────────────────
 #
 # **Nothing here is a typed list of gates.** The gates are discovered from the
-# filesystem (`scripts/*.sh`) and from the workflows (`jobs:` in nightly.yml and
-# ci.yml). A hardcoded inventory is the thing that rots: it stays green while
+# filesystem (`scripts/*.sh`) and from every workflow under `.github/workflows`.
+# A hardcoded inventory is the thing that rots: it stays green while
 # the tree moves under it. What *is* written down is how to run and how to read
 # each gate this reporter knows about, and a discovered gate with no such entry
 # is reported `UNKNOWN` and exits 2. So adding a gate and not teaching this
@@ -113,6 +113,10 @@ workflow_jobs() {
       key = $1; sub(/:$/, "", key); print key
     }
   ' "$wf"
+}
+
+workflow_files() {
+  find "$ROOT/.github/workflows" -maxdepth 1 -type f -name '*.yml' -printf '%f\n' | sort
 }
 
 # The body of one job, for the two questions asked of it below: which scripts
@@ -861,6 +865,31 @@ gate_ci_client_platforms_prereq() {
 gate_ci_client_platforms_run() { return 0; }
 gate_ci_client_platforms_evidence() { ev_none; }
 
+# ── release packaging for the Regolith client (#373) ─────────────────────────
+#
+# GitHub-hosted runners perform the actual package builds. The local gate is a
+# manifest guard: it proves the release workflow retains its isolated trigger
+# surface, standalone release build, commit stamp, checksum, and upload, but
+# cannot claim a runner produced a binary.
+gate_package_client_tier() { echo fast; }
+gate_package_client_prereq() { [[ -r "$ROOT/.github/workflows/package-client.yml" ]]; }
+gate_package_client_run() {
+  local wf="${1:-$ROOT/.github/workflows/package-client.yml}" source
+  source=$(sed '/^[[:space:]]*#/d' "$wf")
+  grep -Fq 'workflow_dispatch:' <<<"$source" \
+    && grep -Fq 'playtest-*' <<<"$source" \
+    && ! grep -Eq '^[[:space:]]*pull_request:' <<<"$source" \
+    && grep -Fq 'ubuntu-latest' <<<"$source" \
+    && grep -Fq 'windows-latest' <<<"$source" \
+    && grep -Fq 'macos-latest' <<<"$source" \
+    && grep -Fq 'working-directory: clients/regolith' <<<"$source" \
+    && grep -Fq 'cargo build --release' <<<"$source" \
+    && grep -Fq 'ORRERY_BUILD_REV: ${{ github.sha }}' <<<"$source" \
+    && grep -Fq 'sha256sum' <<<"$source" \
+    && grep -Fq 'actions/upload-artifact@v7' <<<"$source"
+}
+gate_package_client_evidence() { ev_none; }
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Reporting
 # ─────────────────────────────────────────────────────────────────────────────
@@ -941,26 +970,25 @@ collect() {
     fi
   done
 
-  # Nightly jobs. A job is named by its own key and evaluated through the trio
-  # for that key; the scripts it runs are recorded as the source so a reader
-  # can go from a row to a file.
-  for job in $(workflow_jobs nightly.yml); do
-    key=$(gate_key "$job")
-    local scripts kindnote
-    # `|| true`: a job that runs no script at all — the determinism soak's
-    # body is inline in the workflow — makes the `grep -o` in the pipeline exit
-    # 1, and under `set -e` a bare assignment from it kills the report three
-    # jobs before the end. Measured: that is exactly how the first real run of
-    # this script died, with no output at all.
-    scripts=$(job_real_scripts nightly.yml "$job" | paste -sd, - || true)
-    kindnote="nightly.yml:$job@$(job_runner_kind nightly.yml "$job")"
-    if [[ -n $scripts ]]; then kindnote="$kindnote (${scripts})"; fi
-    evaluate "nightly:$job" nightly "gate_${key}" "$kindnote"
-  done
-
-  for job in $(workflow_jobs ci.yml); do
-    key=$(gate_key "$job")
-    evaluate "ci:$job" per-commit "gate_ci_${key}" "ci.yml:$job@$(job_runner_kind ci.yml "$job")"
+  # Workflow jobs. A new workflow job without a trio is UNKNOWN rather than
+  # invisible. `ci.yml` retains its distinct per-commit prefix; all other
+  # workflow jobs use their own key directly.
+  local wf prefix kind
+  for wf in $(workflow_files); do
+    case "$wf" in
+      ci.yml) prefix=gate_ci_; kind=per-commit ;;
+      *)      prefix=gate_; kind=workflow ;;
+    esac
+    for job in $(workflow_jobs "$wf"); do
+      key=$(gate_key "$job")
+      local scripts kindnote
+      # `|| true`: a job that runs no script at all — the determinism soak's
+      # body is inline in the workflow — makes the `grep -o` pipeline exit 1.
+      scripts=$(job_real_scripts "$wf" "$job" | paste -sd, - || true)
+      kindnote="$wf:$job@$(job_runner_kind "$wf" "$job")"
+      if [[ -n $scripts ]]; then kindnote="$kindnote (${scripts})"; fi
+      evaluate "${wf%.yml}:$job" "$kind" "${prefix}${key}" "$kindnote"
+    done
   done
 }
 
@@ -1242,6 +1270,27 @@ self_test() {
   trap "rm -rf '$dir'" EXIT
 
   mkdir -p "$dir/scripts" "$dir/.github/workflows"
+
+  # The package workflow can only be proven structurally here. Mutate the
+  # guarded stamp stage in a synthetic checkout and run the reporter itself:
+  # the result must be FAILED, never a green row because no hosted build ran.
+  cp "$ROOT/.github/workflows/package-client.yml" "$dir/.github/workflows/package-client.yml"
+  sed -i 's/ORRERY_BUILD_REV:/ORRERY_BROKEN_REV:/' \
+    "$dir/.github/workflows/package-client.yml"
+  local package_mutation package_status
+  set +e
+  GATE_STATUS_ROOT="$dir" GATE_STATUS_OUT="$dir/package-out" "$0" --fast \
+    >"$dir/package-mutation-report" 2>&1
+  package_status=$?
+  set -e
+  package_mutation=$(cat "$dir/package-mutation-report")
+  [[ $package_status == 1 ]] \
+    || die "self-test: a broken package-client stamp stage exited $package_status rather than 1"
+  grep -qE '^  FAILED +package-client:package-client' <<<"$package_mutation" \
+    || die 'self-test: a broken package-client stamp stage did not report FAILED'
+  grep -qE '^  PASSED +package-client:package-client' <<<"$package_mutation" \
+    && die 'self-test: a broken package-client stamp stage also reported PASSED'
+  rm -f "$dir/.github/workflows/package-client.yml"
 
   # A static gate that passes, one self-test that passes, one that fails, and
   # a gate script invented for this test that this file has never heard of.
