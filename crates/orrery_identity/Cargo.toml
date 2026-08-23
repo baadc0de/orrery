@@ -40,6 +40,15 @@ clap = { workspace = true }
 sha2 = "0.10"
 rand = "0.9"
 tempfile = "3"
+# Portable issuer-key escrow uses the age file format's passphrase mode. This
+# deliberately delegates the KDF, authenticated encryption, and file framing
+# to a reviewed construction instead of assembling cryptographic primitives
+# here. Default features are empty; no SSH/plugin/CLI integrations are needed.
+age = { version = "0.12.1", default-features = false }
+# Interactive passphrases must not appear in argv, shell history, or `ps`.
+rpassword = "7.5.4"
+# Wipe temporary plaintext credential buffers when they leave scope.
+zeroize = "1.9"
 # FoundationDB 7.3.x (D11, D14). Optional: only built with `--features fdb`.
 foundationdb = { version = "0.11", default-features = false, features = [
     "fdb-7_3",

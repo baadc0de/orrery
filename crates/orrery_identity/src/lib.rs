@@ -72,6 +72,7 @@
 
 pub mod invite;
 pub mod issuer;
+pub mod issuer_key_lifecycle;
 pub mod mem;
 pub mod service;
 pub mod standing;
@@ -86,6 +87,10 @@ pub use invite::{
     InviteRedemptionError, MintedInvite, OsInviteCodeGenerator,
 };
 pub use issuer::{IssuerKeyring, IssuerSigningKey, RotationError};
+pub use issuer_key_lifecycle::{
+    escrow_issuer_key, generate_issuer_key, load_issuer_key, load_runtime_credential,
+    restore_issuer_key, write_runtime_credential, IssuerKeyLifecycleError,
+};
 pub use mem::MemAccountStore;
 pub use service::{
     IdentityService, IssuedSession, StandingSource, StaticStanding, SystemClock,
