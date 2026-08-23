@@ -859,7 +859,7 @@ platforms the criterion names.
 
 **Goal.** Close the durable-truth loop (D10.4, D11): witness-attested intents, strike pipeline live, cluster as sole writer of value. The Diablo II closed-realm lesson, mechanized: [server-side storage + validation is the effective anti-duping control](https://gist.github.com/amtal/bf941bde443eefc7d4626fd439d7f480), and [GTA Online's post-hoc correction](https://www.sportskeeda.com/gta/gta-online-money-generators-illegal-will-get-account-wiped-reset) is the cautionary tale for validating too late.
 
-**Crates.** `orrery_witness` (attestation co-signing), `orrery_coordinator` (witness-set seeding per cell-epoch — never self-chosen), `orrery_persistd` (attestation verification, quarantine-mode full validation, provisional commits, annulment), `orrery_identity` (accounts, NodeId binding, strike ledger with 14-day half-life, quarantine → cooldown → ban thresholds), `orrery_field_host` (witness-fallback mode only), `orrery_persist_client` (intent outcome prediction, offline queue).
+**Crates.** `orrery_witness` (attestation co-signing), `orrery_coordinator` (witness-set seeding per cell-epoch — never self-chosen), `orrery_persistd` (attestation verification, quarantine-mode full validation, provisional commits, annulment), `orrery_identity` (accounts, NodeId binding, strike ledger with 14-day half-life, quarantine → cooldown → ban thresholds), `orrery_persist_client` (intent outcome prediction, offline queue).
 
 **Deliverables.**
 - K-of-N co-signatures (default K=3 of N≥5) on `Ruleset`-classified critical operations; low-population fallbacks: field-host witness or provisional commit finalized by cluster-side spot replay.
@@ -882,6 +882,20 @@ platforms the criterion names.
 - Terrain pipeline: cell-aligned chunk deltas in the journal, compacted to ≤ 100 KB snapshot shards.
 - Event archive (Parquet on object storage) with retention config; griefing rollback via inverse-op replay by cell/actor/time-range. **The tailer is now load-bearing rather than additive**: [D20](adr/0020-journal-retention.md) made the journal bounded, so from here on a released record's history exists only where the tailer has put it. When it lands it contributes one more watermark to the same release floor — no second mechanism.
 - Chaos suite: netsplit (cluster unreachable → intents queue, sim continues), relay-region loss, FDB node loss, coordinator restart.
+- **The enforcement ramp's last control lands here, not in P5.** This follows
+  from two accepted records rather than from any new policy, and is stated
+  because it is otherwise only visible by composing three documents. D32
+  clause (g) defines "enforcement fully on" as C3 (write refusal/annulment on
+  guilty verdicts) reaching live, and requires the economy-wide invariant
+  auditor to be live before C3's promotion review may conclude — live meaning
+  "sweeping on its start cadence (daily full conservation sweep, hourly
+  incremental over hot ledgers)". A full-history conservation sweep needs
+  history; D20 bounded the journal, so a released record's history exists only
+  where the archive tailer above has put it. **Therefore C3's promotion review
+  cannot conclude before this tailer is live**, and the ramp cannot be driven
+  fully on within P5. C1, C2 and C5 do not wait for the auditor — D32 reasons
+  that C1 is pre-hoc, so gating it would delay the control that *prevents* the
+  GTA Online failure for no safety gained. See #245.
 - **Admission control at the front door — a login queue — and the herds it owns.** A queue between "a client wants in" and "the cluster starts serving it", so that arrivals reach the gateway at a rate the cluster chose rather than at the rate the world produced them. Named here because it is where the thundering-herd cases were **assigned**, not deferred: a region restart, a relay-region loss, or a patch-day open all deliver a synchronized population, and every periodic per-session chore that population then runs — lease renewal first among them — stays synchronized for as long as nothing spreads it. The persistence path deliberately does not shape itself around that shape of load ([08-persistence.md](08-persistence.md) §2.2.2): real player populations are diffuse in phase space, so `persistd` is measured against a diffuse one, and the synchronized case is this deliverable's, with the chaos suite above as the place it is reproduced. Two things it owes, both of which the P2 work has already made concrete: an entry rate the cluster sets and can lower under pressure, and de-synchronization on admission, so that a herd let in together does not stay a herd on every subsequent period. What it is **not** is a persistence-tier mitigation — no jitter, batching or shed inside the gateway's lease path is planned, and adding one would be optimizing the durable path for a workload this project has decided belongs upstream of it.
 
 **Demo criterion.** A scripted 128-player crowd event (R6 upper bound) in one region: the hot cell is promoted within the hysteresis window, per-peer bandwidth stays within the ≤ 1 Mbps uplink budget and field-host egress within the ≤ 35 Mbps hot-cell budget (D6; the modeled n=128 load is ~25.6+ Mbps, inside budget) throughout, and demotion follows dispersal cleanly. Then the rollback demo: a griefer bulldozes a player town; an operator restores it to a timestamp via archive inverse-op replay, with the ledger untouched. Multi-region: EU-based peers joining a US island get relay/gateway routing that keeps added latency within the measured relay penalty from P0.
@@ -1190,11 +1204,16 @@ No ADR numbers are claimed. In rough order of when they bite:
    armed-hours clause inherits whichever reading the owner fixes.
 2. **P6 entry:** accept or amend the two criterion legs in §B1, and the D16
    amendment for their dials (5 min / 30 s / 60 s / 2× / queue rate).
-3. **P6 exit:** where the field-host *witness* mode lands. The P5 crate list
-   carries `orrery_field_host` "(witness-fallback mode only)" while D29's
-   consequences place field-host substance — and the fix for the
-   empty-region two-party-trade refusal — in P6; the hole is player-visible
-   and currently owned by a parenthesis (finding, below).
+3. **P6 exit:** whether the empty-region two-party-trade refusal proves
+   intolerable enough to build the field-host witness fix. The *phase*
+   question is settled and no longer open: D29 places the fix in P6 and, in
+   its alternatives, rejects a P5 "cheap witness-only build" by name —
+   "a record that leaves the option nominally open buys P5 an unbuilt
+   dependency in exchange for nothing" (`adr/0029-low-population-path.md`,
+   §Alternatives considered). The P5 crate list has been corrected to match;
+   `orrery_field_host` appears under P6 only. What remains open is the
+   *product* judgement D29 conditions the fix on — "if it proves
+   intolerable" — which is the owner's, and #244 tracks it.
 4. **P7 entry:** the currency conversion of the cost clause, and whether
    72 h / 10k CCU is the accepted operating point or the owner scales it.
 5. **P8 entry:** auditor packaging (D15 crate vs standalone tool), its
