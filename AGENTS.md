@@ -282,6 +282,24 @@ in the core. A fourth clause, scoped to the two ruleset crates, refuses a live
 neighbour read: cross-entity effects travel as events, because the adjudicator
 installs exactly one entity and a neighbour read is always `None` at replay.
 
+**The Regolith client is deliberately not in that matrix** (#344; #327 tried it
+and both Linux legs died on `wayland-client`). The matrix asserts one thing:
+the headless spine producing identical bytes on four platforms, which is why
+its legs install no graphics dependencies. A render/input skin makes no
+determinism claim — #320's constraint 3 puts input source and rendering as the
+only deltas from the bot path — so it has nothing to assert there and would
+cost the matrix its headlessness. Its home is instead: Linux per commit in
+`scripts/check.sh`'s WORKSPACES table (role `test`, run by the `gates` lane),
+and Windows/macOS per commit in `ci.yml`'s `client-platforms` job, whose legs
+assert via `scripts/client-tests.sh` — an executed-test floor plus a check
+that the client's own unittest binary ran, because a compile-heavy Bevy job
+can otherwise pass with zero tests executed or with another workspace's suite
+standing in. The job carries no apt packages (those are Linux-only build
+inputs) and caches no `target/` (a Bevy-sized one per platform would evict the
+determinism legs' caches under the shared 10 GB Actions allowance). The job's
+legs go live when `clients/regolith/` exists on the checked-out tree, so its
+merge order relative to PR #342 does not matter.
+
 **All workflow jobs run on GitHub-hosted runners.** `ci.yml` and `nightly.yml`
 name `ubuntu-latest`, `windows-latest`, `macos-latest`, or a matrix value for
 one of those; neither names a self-hosted label. GitHub reports zero registered
