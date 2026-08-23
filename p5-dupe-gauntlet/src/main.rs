@@ -2008,7 +2008,7 @@ async fn run_ramp(args: RampArgs) -> Result<()> {
         None => Value::Null,
     };
     let report = json!({
-        "schema": "orrery.p5-ramp-shadow/1",
+        "schema": "orrery.p5-ramp-shadow/2",
         "result": if passed { "pass" } else { "fail" },
         "control": "attestation_quorum",
         "observation_surface": {
@@ -2045,12 +2045,18 @@ async fn run_ramp(args: RampArgs) -> Result<()> {
             },
             "shadow_observes": {
                 "passed": shadow_observes,
-                "intent_id": RAMP_SHADOW_OFFENDER_INTENT.to_string(),
-                "offender_observation": observed_json(&shadow_offender_seen),
-                "honest_observation": observed_json(&shadow_warmup_seen),
-                "verdict_matches_enforcing_cause":
-                    shadow_offender_seen.as_ref().map(|row| row.verdict.clone())
-                        == enforcing_refusals.get(&RAMP_ENFORCING_OFFENDER_INTENT).cloned()
+                // Everything below is explanatory evidence, not another gate
+                // predicate. Keep it structurally separate from `passed`: this
+                // cross-gateway comparison is useful when diagnosing a failure,
+                // but it must not be mistaken for the arm's verdict.
+                "diagnostics": {
+                    "intent_id": RAMP_SHADOW_OFFENDER_INTENT.to_string(),
+                    "offender_observation": observed_json(&shadow_offender_seen),
+                    "honest_observation": observed_json(&shadow_warmup_seen),
+                    "cross_gateway_verdict_matches_enforcing_audit_cause":
+                        shadow_offender_seen.as_ref().map(|row| row.verdict.clone())
+                            == enforcing_refusals.get(&RAMP_ENFORCING_OFFENDER_INTENT).cloned()
+                }
             },
             "shadow_does_not_act": {
                 "passed": shadow_does_not_act,
