@@ -236,6 +236,47 @@ if [[ ${1:-} == --self-test ]]; then
   has 'over the D16 journal_open_ms budget of 2000 ms' \
     || die 'self-test: journal-open budget has no threshold'
 
+  # The failure text is the only part of `--gate --json` that reaches the
+  # nightly log: stdout is the machine-readable artifact. A structural search
+  # cannot prove that a synthetic D16 miss exits non-zero *and* names its
+  # series, p99, target, and margin. Exercise the command path here, rather
+  # than reimplementing its renderer in this shell script. The two reports
+  # need neither FDB nor a release binary nor a device preflight.
+  repo_root=$(cd "$(dirname "$0")/.." && pwd -P)
+  verdict_selftest_dir=$(mktemp -d "${TMPDIR:-/tmp}/p2-kill9-verdict.XXXXXX")
+  trap 'rm -rf "$verdict_selftest_dir"' EXIT
+  printf '%s\n' \
+    '{"type":"sample_batch","series":"journal_commit_ms","value_us":100000,"count":100}' \
+    '{"type":"sample_batch","series":"bulk_ack_ms","value_us":100500,"count":100}' \
+    '{"type":"sample_batch","series":"intent_commit_ms","value_us":101000,"count":100}' \
+    '{"type":"sample_batch","series":"area_first_page_ms","value_us":3000,"count":100}' \
+    >"$verdict_selftest_dir/miss.jsonl"
+  if cargo run --manifest-path "$repo_root/p2-dashboard/Cargo.toml" --quiet -- \
+      --gate --json "$verdict_selftest_dir/miss.jsonl" \
+      >"$verdict_selftest_dir/miss-report.json" 2>"$verdict_selftest_dir/miss.stderr"; then
+    die 'self-test: synthetic D16 miss unexpectedly passed'
+  fi
+  for expected in \
+    'journal_commit_ms' \
+    'p99 100000 µs' \
+    'D16 target 2000 µs' \
+    'margin +98000 µs' \
+    'bulk_ack_ms' \
+    'intent_commit_ms'; do
+    grep -Fq -- "$expected" "$verdict_selftest_dir/miss.stderr" \
+      || die "self-test: synthetic D16 miss omitted $expected from its verdict"
+  done
+  printf '%s\n' \
+    '{"type":"sample_batch","series":"journal_commit_ms","value_us":1000,"count":100}' \
+    '{"type":"sample_batch","series":"bulk_ack_ms","value_us":3000,"count":100}' \
+    '{"type":"sample_batch","series":"intent_commit_ms","value_us":7000,"count":100}' \
+    '{"type":"sample_batch","series":"area_first_page_ms","value_us":30000,"count":100}' \
+    >"$verdict_selftest_dir/pass.jsonl"
+  cargo run --manifest-path "$repo_root/p2-dashboard/Cargo.toml" --quiet -- \
+    --gate --json "$verdict_selftest_dir/pass.jsonl" \
+    >"$verdict_selftest_dir/pass-report.json" 2>"$verdict_selftest_dir/pass.stderr" \
+    || die 'self-test: conforming synthetic report did not preserve a green gate'
+
   # Functional half of the device preflight. Both populations pass through the
   # live reducer above. The unqualified population is this box's recorded D23
   # shape; the qualified population is D19's reference shape. Keeping both in
