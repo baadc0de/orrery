@@ -258,6 +258,18 @@ struct Cli {
     #[arg(long, value_name = "MS")]
     checkpoint_interval_ms: Option<u64>,
 
+    /// Hot-ledger sweep cadence in milliseconds; 0 disables the sweep.
+    ///
+    /// D32 clause (g)'s start cadence for the incremental half of the
+    /// economy-wide invariant auditor is hourly over hot ledger rows. The
+    /// default implements that recorded starting point and is deliberately a
+    /// flag: calibrating the cadence from measured scan cost and
+    /// time-to-detection is #224's to settle, so an operator (or a gate leg)
+    /// can run it faster without a rebuild. Findings are reports, never
+    /// actions — C3 remains the control.
+    #[arg(long, value_name = "MS", default_value_t = 3_600_000)]
+    hot_ledger_sweep_interval_ms: u64,
+
     /// Append server-internal latency batches and gateway counter records to
     /// this JSONL file.
     ///
@@ -1229,6 +1241,13 @@ async fn main() -> anyhow::Result<()> {
             cli.authority_correction,
         )
     });
+    #[cfg(feature = "fdb")]
+    if let (Some(context), false) = (fdb_context.as_ref(), cli.hot_ledger_sweep_interval_ms == 0) {
+        spawn_hot_ledger_sweeper(
+            orrery_persistd::audit::HotLedgerSweeper::from_context(context),
+            Duration::from_millis(cli.hot_ledger_sweep_interval_ms),
+        );
+    }
     if let Some(monitor) = &fence_freshness_monitor {
         gateway_config.bulk_ack_admission = monitor.clone();
     }
@@ -2277,6 +2296,53 @@ fn authority_correction_mode(
     })
 }
 
+/// Run the hot-ledger incremental sweep on its cadence until shutdown.
+///
+/// One pass per tick; a failed pass logs and waits for the next tick rather
+/// than spinning or exiting, because the cursor advances only on success so
+/// the retry is the whole walk and loses nothing. Findings are emitted by the
+/// sweeper itself (`orrery_audit` target) — this loop owns only the cadence
+/// and the pass-level outcome line, which carries the population the findings
+/// are over.
+#[cfg(feature = "fdb")]
+fn spawn_hot_ledger_sweeper(
+    sweeper: orrery_persistd::audit::HotLedgerSweeper,
+    interval: Duration,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            ticker.tick().await;
+            let started = Instant::now();
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |since_epoch| since_epoch.as_millis() as u64);
+            match sweeper.run_pass(now_ms).await {
+                Ok(report) => {
+                    tracing::info!(
+                        target: "orrery_audit",
+                        balance_rows = report.population.balance_rows,
+                        item_claims = report.population.item_claims,
+                        new_receipts = report.population.new_receipts,
+                        findings = report.findings.len(),
+                        elapsed_ms = started.elapsed().as_millis() as u64,
+                        "hot-ledger sweep pass complete"
+                    );
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        target: "orrery_audit",
+                        %error,
+                        "hot-ledger sweep pass failed; the cursor did not advance \
+                         and the next pass retries from it"
+                    );
+                }
+            }
+        }
+    })
+}
+
 /// Build C1's wiring from the CLI, or refuse a mode that could never evaluate.
 ///
 /// `None` is `off`: no cache, no resolver, and the landed permissive validator
@@ -2813,6 +2879,7 @@ mod tests {
             authority_correction: AuthorityCorrectionEnforcement::Off,
             no_journal_retention: false,
             checkpoint_interval_ms: None,
+            hot_ledger_sweep_interval_ms: 3_600_000,
             dev_seed: None,
             secret_key: None,
             shard: Vec::new(),

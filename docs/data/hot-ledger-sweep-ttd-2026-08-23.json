@@ -1,0 +1,43 @@
+{
+  "measurement": {
+    "definition": "detected_at_ms − planted_at_ms, where planted_at_ms is when the violating row became readable and detection is the first sweep pass reporting it",
+    "missed_within_window": 0,
+    "raw_ttd_samples_ms": [
+      156,
+      119,
+      81,
+      44,
+      7,
+      120,
+      83,
+      46,
+      9,
+      122,
+      85,
+      54
+    ],
+    "samples": 12,
+    "sweep_interval_ms": 150,
+    "ttd_ms_max": 156,
+    "ttd_ms_median": 83,
+    "ttd_ms_min": 7,
+    "ttd_ms_p95": 156
+  },
+  "passes": {
+    "count": 12,
+    "duration_ms_max": 2,
+    "duration_ms_sum": 15
+  },
+  "population": {
+    "balance_rows": 73,
+    "item_claims": 186,
+    "note": "rows the sweep walks per pass; the population the findings are over",
+    "receipts_judged_final_pass": 0
+  },
+  "provenance": {
+    "note": "violations are planted duplicate ownership rows; detection is the first sweep pass reporting them. Cadence and any time-to-detection target remain #224's; this file supplies the measurement only.",
+    "source": "emit_time_to_detection on fortyninety (pid 141924)",
+    "traffic": "harness"
+  },
+  "schema": "orrery.audit.sweep/1"
+}
