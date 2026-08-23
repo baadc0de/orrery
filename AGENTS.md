@@ -135,7 +135,7 @@ workstation or a GitHub-hosted runner. Time a particular change where it will
 run, record the runner and cache state with the result, and do not turn an old
 cache experiment into a current expectation.
 
-### Eleven workspaces, and only one of them is "the" workspace
+### Twelve workspaces, and only one of them is "the" workspace
 
 `cargo test --workspace` reaches the root workspace. Each standalone tool
 declares its own `[workspace]` table, so it reaches none of *them* — three red
@@ -155,13 +155,14 @@ CIs in one week came from that blind spot. The inventory, which is also
 | `p3-siblings` | `cargo test` in `gates`; the two-gateway harness, asserted by the nightly sibling gate. The only tool that links `libfdb_c` besides `p2-load`: its double-spend race leg reads the ledger back out of FoundationDB |
 | `p5-dupe-gauntlet` | `cargo test`; the single-gateway replay, attestation-abuse and quarantine proof, asserted by the nightly P5 gate against FoundationDB. Its `ramp` subcommand carries D32's enforcement-ramp arms too, asserted by the nightly `ramp-shadow` gate, which runs a shadow and an enforcing gateway from this one binary at the same time. Its additive measurement tests pin #153's p99 population and stage-count guards |
 | `p2-journal-bench` | `cargo check --all-targets` — no tests |
+| `clients/regolith` | `cargo test` in `gates`; the Bevy 0.19 keyboard/rendering skin over the headless Regolith intent and replay pipeline |
 
-The seven tool test suites, and the three tools checked without tests, are the work
+The eight standalone test suites, and the three tools checked without tests, are the work
 that would go unrun if the `gates` lane stopped visiting them. Do not hand-copy
 test totals here: `./scripts/check.sh --list` is the executable inventory.
 
 `--self-test` compares that table against the filesystem — every directory
-whose `Cargo.toml` declares `[workspace]` must appear in it — so a ninth
+whose `Cargo.toml` declares `[workspace]` must appear in it — so a thirteenth
 workspace cannot be added and silently go unchecked. It is a two-source check
 by construction: the table cannot match itself.
 
@@ -325,7 +326,7 @@ per-commit, alongside every other self-test in `scripts/`.
 
 **The standalone tools are tested per-commit too.** Each declares its own
 `[workspace]`, so `cargo test --workspace` reaches none of them; the `gates`
-lane runs `cargo test` in its seven test workspaces and `cargo check --all-targets`
+lane runs `cargo test` in its eight test workspaces and `cargo check --all-targets`
 in its three check-only workspaces — see the inventory above, which is the table
 the lane iterates.
 `p2-load` takes `orrery_persistd` with `features = ["fdb"]`, which is why that

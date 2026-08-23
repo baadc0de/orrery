@@ -1,0 +1,19 @@
+[package]
+name = "orrery_regolith_client"
+version = "0.1.0"
+edition = "2021"
+description = "The Bevy 0.19 visual and keyboard skin for Orrery Regolith"
+license = "MIT OR Apache-2.0"
+
+[workspace]
+resolver = "2"
+
+[dependencies]
+bevy = "0.19"
+orrery_core = { path = "../../crates/orrery_core" }
+orrery_games = { path = "../../crates/orrery_games" }
+orrery_predict = { path = "../../crates/orrery_predict" }
+orrery_protocol = { path = "../../crates/orrery_protocol" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+

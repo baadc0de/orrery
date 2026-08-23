@@ -1,0 +1,17 @@
+# Regolith client
+
+The first rendered Orrery target: a Bevy 0.19 skin over the headless Regolith
+rules and executor.
+
+```sh
+cargo run -- --telemetry-jsonl target/regolith-client/session.jsonl
+```
+
+Controls are keyboard-only: Left/Right turn, Up thrusts, Space fires, and F3
+toggles the detailed overlay. The always-on strip and JSONL stream do not
+depend on F3.
+
+There are deliberately no required assets. If `assets/regolith/craft.glb` is
+present it is used as visual geometry; otherwise the client renders Bevy
+primitives. Visual geometry never reaches collision or any simulation input.
+
