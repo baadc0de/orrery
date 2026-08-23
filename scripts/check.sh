@@ -154,6 +154,42 @@ run_bounded_test() {
     return "$status"
 }
 
+# Build one package's library test binary and echo its path. The build is
+# deliberately *outside* any wall-clock bound, and that is the whole point of
+# the function.
+#
+# `cargo test -p <pkg> --lib` unifies features differently from the workspace
+# invocation `lane_test` runs before it, so cargo rebuilds the dependency graph
+# for it rather than reusing what the workspace build produced. On a
+# GitHub-hosted runner that rebuild is over a minute on its own, and the `test`
+# job caches no `target/`. So a bound wrapped around `cargo test` measures the
+# compiler and not the test — which is exactly what happened: both runs that
+# reported #292's guard firing spent the entire sixty seconds compiling (the
+# last line before each timeout was `Compiling prost v0.14.4`), never linked
+# the binary, and still printed a diagnostic naming a test that had not
+# started (#293).
+#
+# Handing `run_bounded_test` a path closes that by construction: there is no
+# build tool inside the bound left to measure.
+build_test_binary() {
+    local package="$1"
+    printf '%s: [%s] (root) $ cargo test -p %s --lib --no-run\n' \
+        "$NAME" "$LANE" "$package" >&2
+    if (( DRY_RUN )); then
+        printf '<%s library test binary>\n' "$package"
+        return 0
+    fi
+
+    local artifacts path
+    artifacts="$(cd "$ROOT" && cargo test -p "$package" --lib --no-run \
+        --message-format=json-render-diagnostics)" || return 1
+    # Every non-test artifact carries the unquoted `"executable":null`, which
+    # this pattern cannot match, so the only hit is the test binary itself.
+    path="$(grep -o '"executable":"[^"]*"' <<<"$artifacts" | tail -1 | cut -d'"' -f4)"
+    [[ -x $path ]] || return 1
+    printf '%s\n' "$path"
+}
+
 # `CARGO_TARGET_DIR` is deliberately never exported unconditionally, and the two
 # hazards are both real rather than theoretical.
 #
@@ -426,8 +462,19 @@ lane_test() {
     # as an outer backstop and give this known unbounded wait a local failure
     # that names it. Sixty seconds is more than 20x the two successful reruns'
     # complete persistd-library times (2.32 s and 2.89 s).
+    #
+    # Two things changed after #293. The test now bounds its own journal
+    # closes, so a wedged shutdown handshake fails there, named, in thirty
+    # seconds — this bound is the backstop for a wedge somewhere the test does
+    # not bound, not the first line of defence any more. And the binary is
+    # built *before* the bound rather than inside it: see `build_test_binary`
+    # for the two runs where the bound timed out on the compiler without the
+    # test ever starting.
+    local torn_tail_bin
+    torn_tail_bin="$(build_test_binary orrery_persistd)" \
+        || die 'test: could not build the orrery_persistd library test binary'
     run_bounded_test 60s "$torn_tail_test" \
-        cargo test -p orrery_persistd --lib "$torn_tail_test" -- --exact --nocapture
+        "$torn_tail_bin" "$torn_tail_test" --exact --nocapture
 
     # The workspace test above is D19's default indexed raw journal. Exercise
     # the retained Fjall implementation's unit tests as well; clippy compiles
@@ -598,6 +645,35 @@ self_test() {
     grep -Fq "test timed out after 0.01s: $mutation_name" <<<"$bound_output" \
         || die 'self-test: bounded-test guard did not name the timed-out test'
     note 'self-test: bounded-test guard fires with timeout status 124 and names the test'
+
+    # …and the bound has to measure the *test*, not the toolchain. Both runs
+    # that reported the guard firing (#293) had `cargo test` inside the bound:
+    # `-p orrery_persistd --lib` unifies features differently from the
+    # workspace build above, the `test` job caches no `target/`, so cargo
+    # rebuilt the whole graph inside the sixty seconds and the binary was never
+    # linked — yet the diagnostic still named a test that had not started.
+    #
+    # Functional, not structural: this reads the commands the lane would
+    # actually issue, and requires the build to be listed before the bound and
+    # nothing that builds to appear inside it.
+    local listed build_line bound_line bounded_cmd
+    listed="$(DRY_RUN=1 lane_test 2>&1)"
+    # `|| true` so a missing line reaches the diagnostics below instead of
+    # tripping `set -e` on grep's empty-match status with nothing said.
+    build_line="$(grep -nF -- '--lib --no-run' <<<"$listed" | head -1 | cut -d: -f1 || true)"
+    bound_line="$(grep -nF -- 'timeout --kill-after=5s 60s ' <<<"$listed" | head -1 | cut -d: -f1 || true)"
+    [[ -n $bound_line ]] \
+        || die 'self-test: the test lane no longer bounds the torn-tail proptest'
+    [[ -n $build_line ]] \
+        || die 'self-test: the test lane no longer builds the bounded test binary'
+    (( build_line < bound_line )) \
+        || die 'self-test: the bounded test binary is not built before the bound'
+    bounded_cmd="$(sed -n "${bound_line}p" <<<"$listed")"
+    bounded_cmd="${bounded_cmd#*timeout --kill-after=5s 60s }"
+    bounded_cmd="${bounded_cmd%% *}"
+    [[ $bounded_cmd != cargo && $bounded_cmd != */cargo ]] \
+        || die "self-test: the bounded test command builds inside the bound ($bounded_cmd)"
+    note 'self-test: the bounded test is a prebuilt binary, not a build command'
 
     # ── Coverage: every --self-test in scripts/ is invoked by a lane ──────────
     #
