@@ -107,6 +107,8 @@ self_test() {
     || die 'self-test: the human session identity is gone; same-seed human hours would collapse'
   has 'actor' \
     || die 'self-test: the bot|human dimension is gone; P4 cannot check its required mix'
+  has 'validate_session_record' \
+    || die 'self-test: campaign session rows are no longer validated before banking'
   has 'def platform' \
     || die 'self-test: the target-to-platform fold is gone; the criterion is counted per platform'
   has 'MISSING' \
@@ -213,6 +215,26 @@ self_test() {
     || die "self-test: the pipeline human-hour breakdown is wrong ('$view')"
   grep -q 'human mix: 64 / 160 distinct hours = 40% (requires ≥25%)' <<<"$view" \
     || die "self-test: the pipeline human mix arithmetic is wrong ('$view')"
+
+  # A campaign row rides this append path; it is not a parallel ledger. The
+  # malformed `afk_capped` value must refuse before a line is written.
+  st_report 10 '.player_hours = 1 | .seconds = 3600 | .peers = 1
+    | .session = {
+        session_id: "018f8f4e-5c90-7abc-8123-000000000010",
+        wall_start: "2026-08-23T12:00:00Z", wall_end: "2026-08-23T13:00:00Z",
+        distinct_play_minutes: 60, banked_minutes: 60,
+        platform_triple: "x86_64-unknown-linux-gnu", client_rev: "self-test",
+        ruleset_id: "52", ruleset_version: 2, pipeline_digest: "selftestpipeline",
+        actor: "human", configured_impairment_profile: {loss_pct: 3, jitter_p50_ms: 100, jitter_p99_ms: 100},
+        observed_loss_pct: 3, observed_jitter_p50_ms: 100, observed_jitter_p99_ms: 100,
+        afk_seconds: 0, afk_capped: false, impairment_mismatch: false
+      }
+    | .identity.human_session_id = "018f8f4e-5c90-7abc-8123-000000000010"' human '018f8f4e-5c90-7abc-8123-000000000010' >/dev/null
+  "$0" append "$dir/r.json" || die 'self-test: complete campaign session row was refused'
+  jq '.session.afk_capped = "false"' "$dir/r.json" > "$dir/bad-session.json"
+  if "$0" append "$dir/bad-session.json" >/dev/null 2>&1; then
+    die 'self-test: malformed campaign session row banked'
+  fi
 
   # Each of these is a run that must add no hours at all. The count is checked
   # as well as the exit status: a refusal that has already written the line is
@@ -376,6 +398,39 @@ pipeline_id() {
   printf '%s' "$hashes" | sha256_hex | cut -c1-16
 }
 
+# A campaign report has all the ordinary witnessing evidence plus one session
+# row. Keep it on this append path so every existing refusal still applies.
+validate_session_record() {
+  local report=$1 actor=$2 human_session_id=$3 target=$4
+  jq -e --arg actor "$actor" --arg session "$human_session_id" --arg target "$target" '
+    if .session? == null then true else
+      .session as $s
+      | ($s.session_id | type == "string" and length > 0)
+      and ($s.wall_start | type == "string" and length > 0)
+      and ($s.wall_end | type == "string" and length > 0)
+      and ($s.distinct_play_minutes | type == "number" and . >= 0)
+      and ($s.banked_minutes | type == "number" and . >= 0 and . <= $s.distinct_play_minutes)
+      and ($s.platform_triple == $target)
+      and ($s.client_rev | type == "string" and length > 0)
+      and ($s.ruleset_id | type == "string" and length > 0)
+      and ($s.ruleset_version | type == "number")
+      and ($s.pipeline_digest | type == "string" and length > 0)
+      and ($s.actor == $actor)
+      and ($s.configured_impairment_profile.loss_pct | type == "number")
+      and ($s.configured_impairment_profile.jitter_p50_ms | type == "number")
+      and ($s.configured_impairment_profile.jitter_p99_ms | type == "number")
+      and ($s.observed_loss_pct | type == "number")
+      and ($s.observed_jitter_p50_ms | type == "number")
+      and ($s.observed_jitter_p99_ms | type == "number")
+      and ($s.afk_seconds | type == "number" and . >= 0)
+      and ($s.afk_capped | type == "boolean")
+      and ($s.impairment_mismatch | type == "boolean")
+      and (if $actor == "human" then $s.session_id == $session else true end)
+    end
+  ' "$report" >/dev/null \
+    || die 'refusing to bank: incomplete or inconsistent campaign session row'
+}
+
 cmd_append() {
   local report=${1:-}
   [[ -n $report && -r $report ]] || die "append: unreadable report '${report:-<none>}'"
@@ -433,10 +488,15 @@ cmd_append() {
     [[ $human_session_id =~ ^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$ ]] \
       || die 'refusing to bank: a human hour needs a coordinator-issued UUIDv7 identity.human_session_id'
   fi
+  validate_session_record "$report" "$actor" "$human_session_id" "$target"
   # `run_key` is provenance for an individual run. It intentionally includes
   # commit, so an independently re-run report is retained for reproducibility.
   key=$(jq -cS '.identity' "$report" | sha256_hex | cut -c1-16)
   pipeline=$(pipeline_id "$commit")
+  if jq -e '.session? != null and .session.pipeline_digest != $pipeline' \
+    --arg pipeline "$pipeline" "$report" >/dev/null; then
+    die 'refusing to bank: session pipeline_digest does not name the pipeline this report ran'
+  fi
   # P4's denominator is measurements rather than runs. The digest is the
   # comparable-pipeline boundary; within it bot inputs choose a deterministic
   # simulated hour. A human session is deliberately an additional input: two
@@ -483,7 +543,7 @@ cmd_append() {
       false_positives: .total_false_positives,
       gaps_repaired: .total_gaps,
       shed: .total_shed
-    }' "$report" >> "$LEDGER"
+    } + (if .session? == null then {} else {session: .session} end)' "$report" >> "$LEDGER"
 
   note "banked $hours $actor player-hours: run_key $key, measurement_key $measurement_key, seed $seed, loss $loss, target $target, pipeline $pipeline"
 }
