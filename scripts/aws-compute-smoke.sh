@@ -1,0 +1,308 @@
+#!/usr/bin/env bash
+# #173's compute-credential proof: assume orrery-ci-compute, then show what
+# the credential may do — and, just as hard, what it must refuse.
+#
+# ── Why this script exists twice-over ────────────────────────────────────────
+#
+# The nightly job `compute-identity-smoke` runs it in Actions, right after
+# .github/actions/aws-compute-role assumes the role. scripts/gate-status.sh's
+# trio for that job delegates to this same script rather than restating its
+# logic inline — the determinism-soak lesson (AGENTS.md §gate-status): a gate
+# whose body lives in a workflow is one edit away from drifting out of its own
+# report.
+#
+# ── What it asserts ──────────────────────────────────────────────────────────
+#
+# Positive, each side-effect-free:
+#   P1  the session really is assumed-role/orrery-ci-compute/* (sts)
+#   P2  the #170 discovery query works (DescribeInstanceTypes), and returns a
+#       plausible number of local-NVMe candidates — dozens in eu-central-1,
+#       so a floor catches an empty result reading as success
+#   P3  base-image resolution works (DescribeImages)
+#
+# Negative, each of which MUST be refused by IAM, and every one of which is
+# side-effect-free *by construction*, not by good luck:
+#   N1  s3 ls on the cache bucket        -> AccessDenied   (no S3 grant at all)
+#   N2  iam list-roles                   -> AccessDenied   (no IAM grant)
+#   N3  run-instances --dry-run t3.micro -> UnauthorizedOperation
+#         The instance-type allow-list must refuse a family outside it.
+#         --dry-run makes EC2 evaluate authorisation without executing, so
+#         even a policy bug cannot launch anything here. The assertion is on
+#         the error string, not the exit code: DryRunOperation or a NotFound
+#         would mean the request was AUTHORISED, which is exactly the failure
+#         this probe exists to catch.
+#   N4  terminate-instances <untagged dummy id>
+#         No --dry-run needed: the tag guard denies before the id is ever
+#         looked up, so nothing can happen. If the aws:ResourceTag condition
+#         were missing, AWS would answer NotFound instead of denying — the
+#         runtime half of the mutation proof the self-test below does
+#         structurally.
+#   N5  create-tags outside a launch     -> UnauthorizedOperation
+#         The ec2:CreateAction=RunInstances guard must make the
+#         retag-then-terminate lateral move impossible.
+#
+# Every figure lands in $COMPUTE_SMOKE_OUT/result.json, and the PASSED marker
+# is written last — a run killed mid-way leaves no marker, and evidence
+# readers treat its absence as failure.
+#
+# ── --self-test ──────────────────────────────────────────────────────────────
+#
+# The structural half, runnable per-commit with no AWS anything: the Terraform
+# sources must still contain the clauses these probes assert at runtime, and
+# the workflow plumbing (composite action, nightly job, gate-status trio,
+# check.sh coverage) must still be wired to this script. Two rules from the
+# house style are load-bearing here:
+#
+#   * the haystacks are OTHER files — infra/*.tf, the composite action, the
+#     workflows, the two scripts — never this script's own body, so no clause
+#     can pass by matching its own check line;
+#   * Terraform is grepped with comment lines STRIPPED, because several
+#     arguments (why pull_request is excluded, why metal is denied) are made
+#     in prose, and a prose mention would satisfy a polarity-inverted check
+#     without the code carrying it.
+#
+# Structural passing does not prove AWS enforces anything; N3–N5 prove that,
+# nightly, against the real service. The two halves fail in different places
+# by design.
+set -euo pipefail
+
+readonly NAME=aws-compute-smoke
+die() { echo "$NAME: $*" >&2; exit 2; }
+
+REGION=${ORRERY_AWS_REGION:-eu-central-1}
+ROLE_NAME=${ORRERY_COMPUTE_ROLE_NAME:-orrery-ci-compute}
+KACHE_BUCKET=${ORRERY_KACHE_BUCKET:-orrery-kache}
+OUT=${COMPUTE_SMOKE_OUT:-target/compute-identity-smoke}
+
+ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# --self-test: structure, no cloud.
+# ─────────────────────────────────────────────────────────────────────────────
+
+self_test() {
+  local tf="$ROOT/infra/iam-compute-policy.tf"
+  local vars="$ROOT/infra/variables.tf"
+  local action="$ROOT/.github/actions/aws-compute-role/action.yml"
+  local nightly="$ROOT/.github/workflows/nightly.yml"
+
+  [[ -r $tf ]] || die "self-test: $tf is not readable"
+  [[ -r $vars ]] || die "self-test: $vars is not readable"
+  [[ -r $action ]] || die "self-test: $action is not readable"
+  [[ -r $nightly ]] || die "self-test: $nightly is not readable"
+
+  # Code only: the trust/policy ARGUMENTS live in comments, and a check on
+  # commented prose would pass whether or not the code carried the clause.
+  local code
+  code=$(grep -v '^[[:space:]]*#' "$tf")
+
+  has_code() { grep -Fq -- "$1" <<<"$code" || die "self-test: iam-compute-policy.tf no longer contains '$1' — $2"; }
+  # If/fi rather than `grep && die`: in the good case grep fails, and a bare
+  # &&-list makes this function RETURN 1 — which then kills self_test under
+  # set -e as a failed simple command, silently. Measured, on the first run.
+  lacks_code() {
+    if grep -Fq -- "$1" <<<"$code"; then
+      die "self-test: iam-compute-policy.tf contains '$1' — $2"
+    fi
+  }
+
+  # The trust policy still binds audience and subject.
+  has_code 'token.actions.githubusercontent.com:aud' \
+    'a token minted for any audience could be presented'
+  has_code '"sts.amazonaws.com"' \
+    'the audience pin is gone'
+  has_code 'local.allowed_compute_subjects' \
+    'the sub condition no longer comes from the rendered subject list'
+  has_code '${var.github_subject_prefix}' \
+    'the repository-pinning prefix is gone from the subject rendering'
+
+  # What must never be permitted to assume it.
+  lacks_code 'pull_request' \
+    'pull requests may assume the compute role; unreviewed code must not launch machines'
+  lacks_code 'refs/tags' \
+    'tag builds may assume the compute role'
+
+  # The tag chain: launch forces the tag, tagging stays inside launch,
+  # termination accepts only tagged objects. Remove any leg and the property
+  # "everything CI creates, CI can delete; nothing else is touchable" breaks.
+  has_code '"ec2:RunInstances"' \
+    'there is no launch grant'
+  has_code 'aws:RequestTag/' \
+    'launch no longer forces the ownership tag, so CI could create instances it cannot kill'
+  has_code 'ec2:CreateAction' \
+    'CreateTags is no longer confined to launch, so the retag-and-kill move is open'
+  has_code '"ec2:TerminateInstances"' \
+    'there is no termination grant'
+  has_code 'aws:ResourceTag/' \
+    'termination is no longer guarded by the ownership tag'
+
+  # Least privilege, negative space.
+  has_code '"*.metal"' \
+    'the metal-size deny is gone; the most expensive shapes match the family globs again'
+  has_code 'var.compute_instance_type_patterns' \
+    'the launch grant no longer consults the instance-type allow-list'
+  has_code 'aws:RequestedRegion' \
+    'the region bound is gone'
+  # These two are inline &&-lists rather than helpers on purpose: set -e
+  # spares a failed non-final member of an && list, so "grep finds nothing"
+  # falls through cleanly here — wrap them in a helper and the helper would
+  # return 1 instead, killing self_test as a failed simple command.
+  grep -Eq '"(s3|iam|ssm|kms):[A-Za-z]+"' <<<"$code" \
+    && die 'self-test: iam-compute-policy.tf grants outside EC2 — the compute credential is not compute-only any more'
+  grep -Eq '"ec2:(Start|Stop)Instances"' <<<"$code" \
+    && die 'self-test: iam-compute-policy.tf grants start/stop — an idle machine could accrue cost indefinitely'
+
+  # The allow-list variable itself. The subjects' DEFAULT list is sliced out
+  # of variables.tf rather than grepped whole, for two reasons: the variable's
+  # own description argues about pull_request in prose (a whole-file search
+  # could neither find absence nor tolerate presence), and widening the list
+  # happens exactly where this check looks — the trust policy renders FROM
+  # these values, so this slice is the guarded stage for "who may assume".
+  local subj
+  subj=$(sed -n '/^variable "compute_allowed_subject_suffixes"/,/^}/p' "$vars" \
+    | sed -n '/default = \[/,/^\]/p')
+  [[ -n $subj ]] \
+    || die 'self-test: could not locate the compute_allowed_subject_suffixes default in variables.tf'
+  grep -q '"ref:refs/heads/main"' <<<"$subj" \
+    || die 'self-test: variables.tf no longer defaults the compute subjects to ref:refs/heads/main'
+  if grep -Eq '"(pull_request|ref:refs/tags/\*)"' <<<"$subj"; then
+    die 'self-test: compute subjects widened to pull requests or tag builds — unreviewed code must not launch machines'
+  fi
+  grep -q 'compute_instance_type_patterns' "$vars" \
+    || die 'self-test: variables.tf no longer carries the instance-type allow-list'
+
+  # Workflow plumbing: the composite action, the nightly job, the reporter
+  # and the per-commit lane must all still reach each other.
+  grep -q 'configure-aws-credentials' "$action" \
+    || die 'self-test: the composite action no longer configures AWS credentials'
+  grep -q 'pull_request' "$action" \
+    || die 'self-test: the composite action no longer refuses pull_request events up front'
+  grep -q '^  compute-identity-smoke:' "$nightly" \
+    || die 'self-test: nightly.yml no longer declares the compute-identity-smoke job'
+  grep -q '\./\.github/actions/aws-compute-role' "$nightly" \
+    || die 'self-test: nightly.yml no longer routes the job through the composite action'
+  grep -q 'id-token: write' "$nightly" \
+    || die 'self-test: nightly.yml no longer grants id-token: write; no token can be minted'
+  grep -q 'gate_compute_identity_smoke_run' "$ROOT/scripts/gate-status.sh" \
+    || die 'self-test: gate-status.sh lost the compute-identity-smoke trio; the job would report UNKNOWN'
+  grep -q 'run scripts/aws-compute-smoke.sh --self-test' "$ROOT/scripts/check.sh" \
+    || die 'self-test: check.sh gates lane stopped running this self-test; a structural regression would go unnoticed'
+
+  echo "$NAME: self-test passed"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+
+case "${1:-}" in
+  --self-test) self_test; exit 0 ;;
+  "") ;;
+  *) die "usage: $NAME [--self-test]" ;;
+esac
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Live mode: prove the credential against the real service.
+# ─────────────────────────────────────────────────────────────────────────────
+
+mkdir -p "$OUT"
+RESULT="$OUT/result.json"
+: >"$RESULT"
+rm -f "$OUT/PASSED"
+
+principal='' account='' candidates=-1 images=-1
+positives=0 denials=0
+
+positive() { # label
+  echo "PASS  $1"
+  positives=$((positives + 1))
+}
+denied() { # label detail
+  echo "DENIED(as intended)  $1 ($2)"
+  denials=$((denials + 1))
+}
+
+# A negative probe: run cmd; it must FAIL and its output must contain want.
+expect_denied() { # label want cmd...
+  local label=$1 want=$2
+  shift 2
+  local out rc=0
+  out=$("$@" 2>&1) || rc=$?
+  if ((rc == 0)); then
+    die "negative probe '$label' SUCCEEDED; the policy is broader than this design claims. Output: $out"
+  fi
+  if ! grep -q "$want" <<<"$out"; then
+    die "negative probe '$label' failed, but not with '$want'; got: $out"
+  fi
+  denied "$label" "$want"
+}
+
+echo "== positive probes =="
+
+# P1 — who we are. The composite action already asserted this; re-derive it
+# here so gate-status runs of the bare script carry their own evidence.
+ident=$(aws sts get-caller-identity --output json)
+principal=$(jq -r .Arn <<<"$ident")
+account=$(jq -r .Account <<<"$ident")
+case "$principal" in
+  *"assumed-role/$ROLE_NAME/"*) ;;
+  *) die "session principal is $principal, not assumed-role/$ROLE_NAME/* — assume the role first" ;;
+esac
+positive "session principal is assumed-role/$ROLE_NAME/* (account $account)"
+
+# P2 — the discovery query #176's qualification procedure starts from.
+candidates=$(aws ec2 describe-instance-types --region "$REGION" \
+  --filters Name=instance-storage-supported,Values=true \
+  --query 'length(InstanceTypes)')
+((candidates >= 20)) || die "DescribeInstanceTypes returned $candidates candidates; expected the dozens #170 measured in $REGION"
+positive "discovery query returned $candidates local-storage instance types in $REGION"
+
+# P3 — base-image resolution.
+images=$(aws ec2 describe-images --region "$REGION" --owners amazon \
+  --filters Name=name,Values=al2023-ami-*-x86_64 \
+  --query 'length(Images)')
+((images >= 1)) || die "DescribeImages returned no Amazon Linux 2023 images in $REGION"
+positive "image resolution returned $images candidate base images"
+
+echo "== negative probes (each of these SHOULD be refused) =="
+
+# N1 — no S3 at all: the cache belongs to the other role.
+expect_denied "s3 ls $KACHE_BUCKET" "AccessDenied" \
+  aws s3 ls "s3://$KACHE_BUCKET" --region "$REGION"
+
+# N2 — no IAM.
+expect_denied "iam list-roles" "AccessDenied" \
+  aws iam list-roles --region "$REGION" --max-items 1
+
+# N3 — the type allow-list. t3.micro is deliberately outside it; --dry-run
+# means even a broken policy cannot launch anything during this probe.
+expect_denied "run-instances t3.micro (dry-run)" "UnauthorizedOperation" \
+  aws ec2 run-instances --region "$REGION" --dry-run \
+    --image-id ami-00000000000000000 --instance-type t3.micro \
+    --min-count 1 --max-count 1
+
+# N4 — the termination tag guard, against an untagged-looking dummy id.
+# Denied before existence is checked, so this cannot affect anything.
+expect_denied "terminate untagged instance" "UnauthorizedOperation" \
+  aws ec2 terminate-instances --region "$REGION" \
+    --instance-ids i-00000000000000000
+
+# N5 — retag-and-kill, step one: tagging outside a launch call.
+expect_denied "create-tags outside launch" "UnauthorizedOperation" \
+  aws ec2 create-tags --region "$REGION" \
+    --resources i-00000000000000000 \
+    --tags "Key=orrery-ci-ephemeral,Value=true" "Key=smoke-probe,Value=outside-launch"
+
+jq -n \
+  --arg principal "$principal" \
+  --arg account "$account" \
+  --arg region "$REGION" \
+  --argjson candidates "$candidates" \
+  --argjson images "$images" \
+  --argjson positives "$positives" \
+  --argjson denials "$denials" \
+  '{principal: $principal, account: $account, region: $region,
+    candidates_found: $candidates, images_found: $images,
+    positives_passed: $positives, denials_proved: $denials,
+    passed: true}' >"$RESULT"
+
+echo "$NAME: $positives positive probes passed, $denials least-privilege denials proved; report at $RESULT"
+touch "$OUT/PASSED"

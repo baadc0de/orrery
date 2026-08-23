@@ -713,6 +713,46 @@ gate_fdb_tests_evidence() {
   ev_none
 }
 
+# ── #173 compute-identity smoke ──────────────────────────────────────────────
+#
+# Nightly.yml's `compute-identity-smoke` assumes orrery-ci-compute from the
+# workflow's OIDC token and proves what the credential may and may not do.
+# Delegated to scripts/aws-compute-smoke.sh rather than restated here — the
+# determinism-soak lesson: a gate whose logic lives in a workflow drifts out
+# of its own report. Tier is full, not fast: it needs resolvable AWS
+# credentials and the network, neither of which a per-commit run may assume.
+# The script's structural half runs per-commit in check.sh's gates lane.
+
+gate_compute_identity_smoke_tier() { echo full; }
+gate_compute_identity_smoke_prereq() {
+  [[ ${MODE:-} == inspect ]] && return 0
+  command -v aws >/dev/null || { echo 'aws CLI is not on PATH'; return 1; }
+  # The probes are read-only or dry-run refusals, so a credential probe here
+  # is the same class of prerequisite check the FDB gates make of their
+  # cluster: cheap, honest, and the difference between SKIPPED-with-a-reason
+  # and a misleading failure.
+  timeout 30 aws sts get-caller-identity --output text --query Arn >/dev/null 2>&1 \
+    || { echo 'no resolvable AWS credentials (aws sts get-caller-identity failed)'; return 1; }
+  return 0
+}
+gate_compute_identity_smoke_run() {
+  COMPUTE_SMOKE_OUT="$OUT/compute-identity-smoke" \
+    "$ROOT/scripts/aws-compute-smoke.sh" >"$OUT/logs/compute-identity-smoke.log" 2>&1
+}
+gate_compute_identity_smoke_evidence() {
+  local dir="$OUT/compute-identity-smoke"
+  [[ -r $dir/result.json ]] || { ev_none; return 0; }
+  local status=FAILED
+  if [[ -e $dir/PASSED ]]; then status=PASSED; fi
+  local numbers='{}'
+  numbers=$(jq -c '{
+    principal, account, region,
+    candidates_found, images_found,
+    positives_passed, denials_proved
+  }' "$dir/result.json" 2>/dev/null) || numbers='{}'
+  ev "$status" "$dir" "$numbers"
+}
+
 # ── the determinism soak ─────────────────────────────────────────────────────
 #
 # The one nightly gate with no script of its own: its body is inline in
