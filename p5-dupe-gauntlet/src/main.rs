@@ -494,6 +494,7 @@ fn session_token(node: NodeId, standing: SessionStanding) -> Result<Vec<u8>> {
             SessionTokenTtlMs::new(60_000),
             standing,
             IssuerKeyId::new(1),
+            false,
         ),
         &identity_issuer(),
     )?

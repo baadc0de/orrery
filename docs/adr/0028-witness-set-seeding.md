@@ -382,7 +382,7 @@ column below follows from that one binding.
 |---|---|---|
 | account in good standing (no active quarantine) | **enforced** | `SessionTokenClaimsV1.standing == Good` (`identity.rs:63-69`, `:84-85`), signed by identity, already verified at `server.rs:529` |
 | strike score under the witness-eligibility threshold | **approximated** | `standing` is the only signed reputation bit on the wire, so the coarse `Quarantined` flag stands in for the continuous score. Misses every account whose score is nonzero but below identity's own quarantine threshold |
-| account age past probation (7 days) | **skipped** | Not a token field. Adding `account_age_bucket` (or a `probation: bool`) to `SessionTokenClaimsV1` is a one-field identity change and is the cheapest way to close this; until then, fresh accounts are witness-eligible and `docs/07:217`'s Sybil-cost argument is weaker than written |
+| account age past probation (7 days) | **enforced** *(was skipped; see erratum below)* | `SessionTokenClaimsV1.on_probation`, signed by identity, evaluated at mint from `AccountRow::created_ms` against D33 clause (d)'s configured window. As fresh as the token and no fresher: an account that crosses its window mid-session stays excluded until its next refresh |
 | present in the island ≥ 10 s | **enforced** | The coordinator times its own peer sessions (`server.rs:536-550` records a session at `Hello`); no new observation |
 | one witness slot per account | **enforced, within one coordinator** | Dedup on the retained `claims.account`. Misses a Sybil whose NodeIds are split across coordinator incarnations or regions — there is no cross-coordinator account view |
 | party exclusion on accounts **and every NodeId bound to them** | **approximated** | Exclusion covers the party's own NodeId and any other NodeId with a live session on this coordinator carrying the same signed `account`. Misses NodeIds bound to the account that are not currently connected, and misses collusion across *different* paid accounts entirely — which is what `id/{account_id}` (`docs/08:3234`) would answer and nothing writes it |
@@ -395,6 +395,24 @@ half. Its per-account dedup holds only against the coordinator that seeded the
 epoch. The multiplicative argument survives with the *placement* and *exposure*
 terms intact and the *identity* term reduced to "paid for, possibly minutes
 old".
+
+> *Erratum (2026-08-23, issue #214):* the probation half is now enforced, so the
+> paragraph above is superseded for that row only. D31 gave `da` a `created_ms`,
+> D33 clause (d) made the window deployment configuration with a 7-day default,
+> and identity now stamps the verdict — not the age — into a new signed
+> `on_probation` claim, which the coordinator's `eligible_pool` filters on. The
+> *identity* term of `docs/07:196` reads as written again: a colluding account
+> costs acquisition **and** probation time. Two of that paragraph's three
+> reservations still stand, unamended: the strike-score row remains
+> *approximated* (D33 clause (f) declines to widen the token for it), and
+> per-account dedup and party exclusion remain scoped to one coordinator.
+>
+> The field is a boolean verdict rather than `account_age_bucket` as this clause
+> suggested. The window is a deployment dial; sending an age would put a second
+> copy of that dial in every coordinator, where it could disagree with
+> identity's. The cost of sending the verdict instead is that the token answers
+> exactly one question about account age and a future filter wanting a different
+> granularity needs another claims version.
 
 ### (f) The durable `epoch/` record, and the read path that does not pay for it
 
@@ -601,11 +619,15 @@ submitted for this cell", not "pick seven neighbours".
   becomes a retained `(account, standing)`. That is the smallest change in
   this record and it is what four of the six eligibility rows in clause (e)
   rest on.
-- **Capability deferred: probation age is not enforced.** `docs/07:217`'s
-  "fresh accounts carry probation (no witness eligibility for 7 days)" is not
-  implementable in P5 without one new signed token field. Until it lands, a
-  freshly purchased account can witness immediately, and the Sybil cost is the
-  purchase price alone with no time component.
+- **~~Capability deferred: probation age is not enforced.~~ Closed
+  2026-08-23 (issue #214).** `docs/07:217`'s "fresh accounts carry probation
+  (no witness eligibility for 7 days)" needed exactly the one new signed token
+  field this bullet named, and it now has it: `SessionTokenClaimsV1` carries
+  `on_probation` at claims version 2. A freshly purchased account can play
+  immediately and cannot witness, so the Sybil cost is the purchase price plus
+  the window. What the field does not buy is finer age granularity — it answers
+  "past probation?" and nothing else — and the answer is only as fresh as the
+  token's one-hour TTL cap.
 - **Capability deferred: cross-account and offline-NodeId exclusion.** Party
   exclusion is only as good as the account↔NodeId map, which lives in `id/`
   and has no writer. A colluder attesting from a second NodeId of the same

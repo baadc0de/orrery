@@ -52,6 +52,7 @@ fn account_token(issuer: &iroh::SecretKey, bound: NodeId, account: u64) -> Vec<u
             SessionTokenTtlMs::new(60_000),
             SessionStanding::Good,
             IssuerKeyId::new(1),
+            false,
         ),
         issuer,
     )
@@ -69,6 +70,7 @@ fn token(issuer: &iroh::SecretKey, bound: NodeId, ttl_ms: u64) -> Vec<u8> {
             SessionTokenTtlMs::new(ttl_ms),
             SessionStanding::Good,
             IssuerKeyId::new(1),
+            false,
         ),
         issuer,
     )

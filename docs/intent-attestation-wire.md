@@ -1,6 +1,6 @@
 # Orrery intent, attestation, and witness-epoch wire specification
 
-**Status:** interoperability specification for `PROTOCOL_VERSION = 3`
+**Status:** interoperability specification for `PROTOCOL_VERSION = 4`
 
 **Normative decisions:** [D27](adr/0027-attestation-envelope.md),
 [D28](adr/0028-witness-set-seeding.md), and
@@ -263,17 +263,34 @@ Do not apply postcard's varints to the §2 or §3 signing preimages. Conversely,
 do not encode announcement claims as fixed-width integers: their signature is
 over postcard bytes.
 
-## 7. Protocol version 3
+## 7. Protocol version 4
 
-`PROTOCOL_VERSION` is `3`. A gateway accepts an offered version exactly when it
+`PROTOCOL_VERSION` is `4`. A gateway accepts an offered version exactly when it
 equals its own — D29 clause 5 closed the `{V, V−1}` rolling window for all
 traffic, so there is no predecessor to accept and no cluster-first deployment
 order to observe. Any other value must be refused.
 
-Version 3 adds the signed `candidate_accounts` vector to
+Version 3 added the signed `candidate_accounts` vector to
 `WitnessEpochClaimsV1`, parallel to `candidates` (D34). A version-2 decoder
 does not know that positional field, so this is a protocol break even though
 the surrounding `GatewayMsg::WitnessEpoch` discriminant remains unchanged.
+
+Version 4 appends the signed `on_probation` boolean to
+`SessionTokenClaimsV1`, which rides `GatewayMsg::VersionedHello` (D28 clause
+(e), D33 clause (d)). Same rule, same reason: a version-3 decoder reads seven
+claim fields where there are now eight, and postcard's body carries no names to
+skip past, so the eighth byte displaces the signature rather than trailing it.
+
+The *token* carries its own version byte as its first claim field, and a
+verifier accepts both `1` (the pre-probation body) and `2` (the current one).
+That is a different axis from this one and not a second `{V, V−1}` window: it
+exists because identity and the gateways are separate services with no
+handshake between them, so a fleet rollout has an interval in which one mints
+the old shape and the other reads the new one. A claims-version-1 token
+authenticates its session normally and is read as `on_probation = true` —
+unknown age, therefore not witness-eligible. Outside that fleet-internal
+window, a client offering protocol version 3 is refused at the handshake and
+never presents a token at all.
 
 The check binds every session, because `GatewayMsg::VersionedHello` is the only
 bootstrap a gateway admits. The older unversioned `GatewayMsg::Hello` is retired

@@ -301,6 +301,17 @@ for the standing machine. The 7-day probation remains an identity admission
 rule, not a new token field, until the D31/D28 account-age wire decision is
 made.
 
+> *Erratum (2026-08-23, issue #214):* that decision has since been made and it
+> went the other way, so the last sentence above is superseded. D31's resolved
+> question 5 chose the token: witness eligibility is decided by the coordinator,
+> which D31 clause (d) gives no FoundationDB, so an identity-side admission rule
+> could not reach the place that enforces it. `SessionTokenClaimsV1` gained a
+> signed `on_probation` boolean at claims version 2, stamped from the window
+> this clause's package configures. Nothing else in this record moves:
+> `SessionStanding` is still two-valued (clause (e)), probation is still not a
+> standing state, and the strike *score* is still not on the wire for exactly
+> the reason the paragraph above gives.
+
 ### (g) Proposed D16 amendment
 
 On acceptance, D16 gains these rows; it does not gain a second half-life:

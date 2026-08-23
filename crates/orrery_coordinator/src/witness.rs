@@ -34,7 +34,7 @@ use orrery_protocol::coord::{
 };
 use orrery_protocol::{
     witness_epoch_binding, AccountId, AccountStandings, CellId, GridId, IssuerKey, IssuerKeyId,
-    NodeId, SessionStanding, UnixMillis,
+    NodeId, SessionStanding, SessionTokenClaimsV1, UnixMillis,
 };
 
 use crate::registry::IslandRegistry;
@@ -184,6 +184,13 @@ impl Default for WitnessSeedConfig {
 struct SessionFacts {
     account: AccountId,
     standing: SessionStanding,
+    /// The token's signed `on_probation`, D28 clause (e)'s account-age row.
+    ///
+    /// Lifted from the same signature as `account` and `standing` and for the
+    /// same reason: the coordinator cannot read `da ‖ account` — D31 clause (d)
+    /// gives it no FoundationDB at all — so the only trustworthy answer to "is
+    /// this account past its probation window" is the one identity signed.
+    on_probation: bool,
     /// The `issued_at_ms` the session's token was signed with.
     ///
     /// Retained for exactly one purpose: it is the left-hand side of the
@@ -296,22 +303,17 @@ impl WitnessSeeder {
     ///
     /// Called once, when the token verifies — not per presence report, because
     /// `joined_ms` is what "present in the island ≥ 10 s" is measured from and
-    /// a peer that keeps talking must not keep resetting its own probation.
-    pub fn note_session(
-        &mut self,
-        node: NodeId,
-        account: AccountId,
-        standing: SessionStanding,
-        issued_at_ms: UnixMillis,
-        now_ms: u64,
-    ) {
-        self.sessions.entry(node).or_insert(SessionFacts {
-            account,
-            standing,
-            issued_at_ms,
-            joined_ms: now_ms,
-            graced: false,
-        });
+    /// a peer that keeps talking must not keep resetting its own presence
+    /// timer.
+    ///
+    /// The whole verified claims value rather than a field list, so that every
+    /// eligibility filter reads something the caller could only have obtained
+    /// from `SessionTokenVerifier::verify`. `node` stays a separate argument
+    /// because it is the *connected* remote — `server.rs` checks it against
+    /// `claims.node` before it gets here, and passing it separately keeps that
+    /// check somewhere a reader can see it.
+    pub fn note_session(&mut self, node: NodeId, claims: &SessionTokenClaimsV1, now_ms: u64) {
+        self.insert_session(node, claims, now_ms, false);
     }
 
     /// Record a session admitted on token grace (docs/09 §8) as ineligible.
@@ -329,20 +331,26 @@ impl WitnessSeeder {
     /// intents. The cost is a smaller pool during an outage, which D29's
     /// low-population path already covers and clause (g)'s floor already
     /// refuses to paper over with a short set.
-    pub fn note_grace_session(
+    pub fn note_grace_session(&mut self, node: NodeId, claims: &SessionTokenClaimsV1, now_ms: u64) {
+        self.insert_session(node, claims, now_ms, true);
+    }
+
+    /// The insert both note-calls share: first writer wins, every eligibility
+    /// field lifted from the same verified signature.
+    fn insert_session(
         &mut self,
         node: NodeId,
-        account: AccountId,
-        standing: SessionStanding,
-        issued_at_ms: UnixMillis,
+        claims: &SessionTokenClaimsV1,
         now_ms: u64,
+        graced: bool,
     ) {
         self.sessions.entry(node).or_insert(SessionFacts {
-            account,
-            standing,
-            issued_at_ms,
+            account: claims.account,
+            standing: claims.standing,
+            on_probation: claims.on_probation,
+            issued_at_ms: claims.issued_at_ms,
             joined_ms: now_ms,
-            graced: true,
+            graced,
         });
     }
 
@@ -364,8 +372,8 @@ impl WitnessSeeder {
     ///
     /// [`Self::note_session`] inserts and never updates, on purpose: `joined_ms`
     /// is what "present in the island ≥ 10 s" is measured from, and a peer that
-    /// keeps talking must not keep resetting its own probation. Widening it to
-    /// an upsert would hand a peer a probation reset for free — and a standing
+    /// keeps talking must not keep resetting its own presence timer. Widening
+    /// it to an upsert would hand a peer that reset for free — and a standing
     /// change is *account*-addressed, arriving from identity rather than from
     /// the peer, so it is not that call's shape at all. This updates one field
     /// of an existing row and creates none: an account with no session here is
@@ -435,6 +443,8 @@ impl WitnessSeeder {
     ///
     /// - **good standing** — the token's signed `standing`, so a quarantined
     ///   account cannot witness;
+    /// - **account age past probation** — the token's signed `on_probation`,
+    ///   so an account bought this morning cannot witness this afternoon;
     /// - **presence ≥ `min_presence_ms`** — timed against this coordinator's
     ///   own session;
     /// - **one slot per account** — dedup on the signed `account`, taking the
@@ -443,13 +453,19 @@ impl WitnessSeeder {
     /// - **not admitted on token grace** — an expired token's `standing` is
     ///   as stale as the outage is long ([`Self::note_grace_session`]).
     ///
-    /// And, said out loud because a silent no-op reads like enforcement:
-    /// **account age past probation is not enforced** (it is not a token
-    /// field), the strike-score threshold is **approximated** by the coarse
-    /// quarantine flag, and per-account exclusion holds only within this
-    /// coordinator — a NodeId bound to the same account but connected
-    /// elsewhere is not deduped, because nothing writes the `id/` rows that
-    /// would answer it. D28's Consequences carries the cost of each.
+    /// And, said out loud because a silent no-op reads like enforcement: the
+    /// strike-score threshold is still **approximated** by the coarse
+    /// quarantine flag (D33 clause (f) declines to widen the token for it), and
+    /// per-account exclusion holds only within this coordinator — a NodeId
+    /// bound to the same account but connected elsewhere is not deduped,
+    /// because nothing writes the `id/` rows that would answer it. D28's
+    /// Consequences carries the cost of each.
+    ///
+    /// Probation is enforced from the signed field and is therefore exactly as
+    /// fresh as the token: an account that crossed its window mid-session is
+    /// still excluded until it refreshes, at most one hour late
+    /// (`MAX_SESSION_TOKEN_TTL_MS`) and in practice half that. Late in the
+    /// direction that excludes.
     #[must_use]
     pub fn eligible_pool(
         &self,
@@ -463,6 +479,14 @@ impl WitnessSeeder {
                 continue;
             };
             if facts.standing != SessionStanding::Good || facts.graced {
+                continue;
+            }
+            // D28 clause (e)'s account-age row, and the identity half of
+            // `docs/07` §6's four-term collusion cost: a colluding pod has to
+            // wait out the probation window before any of its accounts can
+            // reach a witness slot, so the cost of a burned account is money
+            // *and* time rather than money alone.
+            if facts.on_probation {
                 continue;
             }
             if now_ms.saturating_sub(facts.joined_ms) < self.config.min_presence_ms {
@@ -627,6 +651,39 @@ mod tests {
         WitnessEpochIssuer::new(secret(9), IssuerKeyId::new(3), [master; 32], 1)
     }
 
+    /// The verified claims a `Hello` would have handed the seeder, past
+    /// probation. Stated rather than minted: the seeder consumes a value the
+    /// verifier already returned, and a fixture that signed one would be
+    /// testing `orrery_protocol`'s verifier a second time.
+    fn session_claims(
+        node: NodeId,
+        account: AccountId,
+        standing: SessionStanding,
+        issued_at_ms: UnixMillis,
+    ) -> SessionTokenClaimsV1 {
+        SessionTokenClaimsV1::new(
+            account,
+            node,
+            issued_at_ms,
+            orrery_protocol::SessionTokenTtlMs::new(orrery_protocol::MAX_SESSION_TOKEN_TTL_MS),
+            standing,
+            IssuerKeyId::new(3),
+            false,
+        )
+    }
+
+    /// The same, for an account still inside its probation window.
+    fn probationary_claims(
+        node: NodeId,
+        account: AccountId,
+        standing: SessionStanding,
+        issued_at_ms: UnixMillis,
+    ) -> SessionTokenClaimsV1 {
+        let mut claims = session_claims(node, account, standing, issued_at_ms);
+        claims.on_probation = true;
+        claims
+    }
+
     /// A registry and a seeder holding `count` peers, each on its own account,
     /// all covering `cell(0)` and all long enough present to be eligible.
     fn populated(count: u8) -> (IslandRegistry, WitnessSeeder) {
@@ -636,9 +693,12 @@ mod tests {
             registry.report_presence(node(index), vec![cell(0)]);
             seeder.note_session(
                 node(index),
-                AccountId::new(u64::from(index)),
-                SessionStanding::Good,
-                TOKEN_ISSUED,
+                &session_claims(
+                    node(index),
+                    AccountId::new(u64::from(index)),
+                    SessionStanding::Good,
+                    TOKEN_ISSUED,
+                ),
                 T0,
             );
         }
@@ -707,9 +767,12 @@ mod tests {
         registry.report_presence(node(1), vec![cell(0)]);
         seeder.note_session(
             node(1),
-            AccountId::new(1),
-            SessionStanding::Quarantined,
-            TOKEN_ISSUED,
+            &session_claims(
+                node(1),
+                AccountId::new(1),
+                SessionStanding::Quarantined,
+                TOKEN_ISSUED,
+            ),
             T0,
         );
         let now = T0 + 20_000;
@@ -741,9 +804,12 @@ mod tests {
         registry.report_presence(node(1), vec![cell(0)]);
         seeder.note_session(
             node(1),
-            AccountId::new(1),
-            SessionStanding::Quarantined,
-            TOKEN_ISSUED,
+            &session_claims(
+                node(1),
+                AccountId::new(1),
+                SessionStanding::Quarantined,
+                TOKEN_ISSUED,
+            ),
             T0,
         );
         // Exactly at the presence threshold: one millisecond of reset would
@@ -761,7 +827,7 @@ mod tests {
         assert_eq!(
             seeder.eligible_pool(&registry, cell(0), now),
             vec![node(1)],
-            "the peer's probation must be measured from its arrival, not from the update"
+            "the peer's presence must be measured from its arrival, not from the update"
         );
     }
 
@@ -774,9 +840,12 @@ mod tests {
         registry.report_presence(node(1), vec![cell(0)]);
         seeder.note_session(
             node(1),
-            AccountId::new(1),
-            SessionStanding::Good,
-            UnixMillis::new(TOKEN_ISSUED.0 + 10_000),
+            &session_claims(
+                node(1),
+                AccountId::new(1),
+                SessionStanding::Good,
+                UnixMillis::new(TOKEN_ISSUED.0 + 10_000),
+            ),
             T0,
         );
 
@@ -843,9 +912,12 @@ mod tests {
         registry.report_presence(node(1), vec![cell(0)]);
         seeder.note_grace_session(
             node(1),
-            AccountId::new(1),
-            SessionStanding::Quarantined,
-            TOKEN_ISSUED,
+            &session_claims(
+                node(1),
+                AccountId::new(1),
+                SessionStanding::Quarantined,
+                TOKEN_ISSUED,
+            ),
             T0,
         );
 
@@ -1055,9 +1127,12 @@ mod tests {
             registry.report_presence(node(index), vec![cell(0)]);
             seeder.note_session(
                 node(index),
-                AccountId::new(u64::from(index)),
-                SessionStanding::Good,
-                TOKEN_ISSUED,
+                &session_claims(
+                    node(index),
+                    AccountId::new(u64::from(index)),
+                    SessionStanding::Good,
+                    TOKEN_ISSUED,
+                ),
                 T0 + 10_000,
             );
         }
@@ -1093,9 +1168,12 @@ mod tests {
             registry.report_presence(node(index), vec![cell(0)]);
             seeder.note_session(
                 node(index),
-                AccountId::new(u64::from(index)),
-                SessionStanding::Good,
-                TOKEN_ISSUED,
+                &session_claims(
+                    node(index),
+                    AccountId::new(u64::from(index)),
+                    SessionStanding::Good,
+                    TOKEN_ISSUED,
+                ),
                 T0,
             );
         }
@@ -1111,17 +1189,23 @@ mod tests {
         for index in 1..=5u8 {
             graced.note_session(
                 node(index),
-                AccountId::new(u64::from(index)),
-                SessionStanding::Good,
-                TOKEN_ISSUED,
+                &session_claims(
+                    node(index),
+                    AccountId::new(u64::from(index)),
+                    SessionStanding::Good,
+                    TOKEN_ISSUED,
+                ),
                 T0,
             );
         }
         graced.note_grace_session(
             node(6),
-            AccountId::new(6),
-            SessionStanding::Good,
-            TOKEN_ISSUED,
+            &session_claims(
+                node(6),
+                AccountId::new(6),
+                SessionStanding::Good,
+                TOKEN_ISSUED,
+            ),
             T0,
         );
 
@@ -1147,38 +1231,53 @@ mod tests {
         for index in 1..=4u8 {
             seeder.note_session(
                 node(index),
-                AccountId::new(u64::from(index)),
-                SessionStanding::Good,
-                TOKEN_ISSUED,
+                &session_claims(
+                    node(index),
+                    AccountId::new(u64::from(index)),
+                    SessionStanding::Good,
+                    TOKEN_ISSUED,
+                ),
                 T0,
             );
         }
         seeder.note_session(
             node(5),
-            AccountId::new(5),
-            SessionStanding::Quarantined,
-            TOKEN_ISSUED,
+            &session_claims(
+                node(5),
+                AccountId::new(5),
+                SessionStanding::Quarantined,
+                TOKEN_ISSUED,
+            ),
             T0,
         );
         seeder.note_session(
             node(6),
-            AccountId::new(6),
-            SessionStanding::Good,
-            TOKEN_ISSUED,
+            &session_claims(
+                node(6),
+                AccountId::new(6),
+                SessionStanding::Good,
+                TOKEN_ISSUED,
+            ),
             T0 + 5_000,
         );
         seeder.note_session(
             node(7),
-            AccountId::new(1),
-            SessionStanding::Good,
-            TOKEN_ISSUED,
+            &session_claims(
+                node(7),
+                AccountId::new(1),
+                SessionStanding::Good,
+                TOKEN_ISSUED,
+            ),
             T0,
         );
         seeder.note_session(
             node(8),
-            AccountId::new(2),
-            SessionStanding::Good,
-            TOKEN_ISSUED,
+            &session_claims(
+                node(8),
+                AccountId::new(2),
+                SessionStanding::Good,
+                TOKEN_ISSUED,
+            ),
             T0,
         );
 
@@ -1186,7 +1285,7 @@ mod tests {
         assert_eq!(
             pool.len(),
             4,
-            "quarantine, probation and dedup each cost a slot"
+            "quarantine, presence and dedup each cost a slot"
         );
         assert!(
             !pool.contains(&node(5)),
@@ -1223,6 +1322,86 @@ mod tests {
     }
 
     #[test]
+    fn probation_closes_the_pool_to_a_fresh_account_and_opens_it_once_past() {
+        // D28 clause (e)'s account-age row, which that record graded *skipped*
+        // until the token carried it. Both directions are asserted from one
+        // fixture: the refusal alone would pass just as well against a filter
+        // that excluded everybody.
+        let (mut registry, mut seeder) = populated(12);
+        registry.report_presence(node(20), vec![cell(0)]);
+        registry.report_presence(node(21), vec![cell(0)]);
+        seeder.note_session(
+            node(20),
+            &probationary_claims(
+                node(20),
+                AccountId::new(20),
+                SessionStanding::Good,
+                TOKEN_ISSUED,
+            ),
+            T0,
+        );
+        seeder.note_session(
+            node(21),
+            &session_claims(
+                node(21),
+                AccountId::new(21),
+                SessionStanding::Good,
+                TOKEN_ISSUED,
+            ),
+            T0,
+        );
+
+        let pool = seeder.eligible_pool(&registry, cell(0), T0 + 10_000);
+
+        // Everything else about the two is identical — same cell, same arrival
+        // instant, same `Good` standing, neither on cooldown, neither graced,
+        // one account each — so the only thing that can separate them is the
+        // signed probation flag.
+        assert!(
+            !pool.contains(&node(20)),
+            "an account inside its probation window must not be witness-eligible"
+        );
+        assert!(
+            pool.contains(&node(21)),
+            "an account past its probation window must be witness-eligible"
+        );
+    }
+
+    #[test]
+    fn probation_is_read_from_the_signed_claim_and_not_from_time_on_the_socket() {
+        // The house rule that an authenticated value is never substituted by
+        // anything the peer supplies alongside it. A session first seen on
+        // probation stays out however long it stands there: waiting is not a
+        // way past the field, only a fresher token minted by identity is.
+        let (registry, _) = populated(12);
+        let mut seeder = WitnessSeeder::new(GridId::ROOT);
+        for index in 1..=12u8 {
+            seeder.note_session(
+                node(index),
+                &probationary_claims(
+                    node(index),
+                    AccountId::new(u64::from(index)),
+                    SessionStanding::Good,
+                    TOKEN_ISSUED,
+                ),
+                T0,
+            );
+        }
+
+        assert!(
+            seeder
+                .eligible_pool(&registry, cell(0), T0 + 10 * 60 * 1_000)
+                .is_empty(),
+            "ten minutes on the socket is not seven days of account age"
+        );
+        assert_eq!(
+            seeder.maybe_seed(&issuer(1), &registry, cell(0), T0 + 10 * 60 * 1_000),
+            SeedOutcome::BelowFloor { eligible: 0 },
+            "a cell of nothing but fresh accounts seeds no epoch at all"
+        );
+    }
+
+    #[test]
     fn a_bouncing_account_forfeits_draws_rather_than_buying_one() {
         // The anti-grind cooldown: leaving to force a redraw takes the leaver
         // out of the pool for six reseed intervals, so it is strictly losing.
@@ -1234,9 +1413,12 @@ mod tests {
         seeder.forget_session(node(3), T0 + 10_000);
         seeder.note_session(
             node(3),
-            AccountId::new(3),
-            SessionStanding::Good,
-            TOKEN_ISSUED,
+            &session_claims(
+                node(3),
+                AccountId::new(3),
+                SessionStanding::Good,
+                TOKEN_ISSUED,
+            ),
             T0 + 11_000,
         );
 
@@ -1321,9 +1503,12 @@ mod tests {
             registry.report_presence(node(index), vec![cell(0), cell(1)]);
             seeder.note_session(
                 node(index),
-                AccountId::new(u64::from(index)),
-                SessionStanding::Good,
-                TOKEN_ISSUED,
+                &session_claims(
+                    node(index),
+                    AccountId::new(u64::from(index)),
+                    SessionStanding::Good,
+                    TOKEN_ISSUED,
+                ),
                 T0,
             );
         }

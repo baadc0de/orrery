@@ -42,7 +42,7 @@
     "signing_preimage_len": 100,
     "signing_preimage_tag_ascii": "orrery/intent/v1"
   },
-  "protocol_version": 3,
+  "protocol_version": 4,
   "schema": "orrery.intent-attestation-wire-v1",
   "witness_epoch": {
     "accept_grace_ms": 30000,

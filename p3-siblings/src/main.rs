@@ -1973,6 +1973,7 @@ fn mint_token_for(issuer: &iroh::SecretKey, node: NodeId, account: u64) -> Resul
             SessionTokenTtlMs::new(3_600_000),
             SessionStanding::Good,
             IssuerKeyId::new(1),
+            false,
         ),
         issuer,
     )?

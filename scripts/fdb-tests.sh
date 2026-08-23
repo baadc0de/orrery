@@ -214,6 +214,18 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # library target went 334 -> 345, checkpoint_restore +1. The floor rises by
 # those twelve: 491 -> 503.
 #
+# Account probation in the session token (issue #214, D28 clause (e)) adds five
+# in `orrery_identity`, which this invocation carries alongside `orrery_persistd`
+# and `orrery_seed`. Four are in `tests/issuance.rs` — probation stamped from
+# `AccountRow::created_ms` and lifting at the window, the window as a deployment
+# dial rather than a constant, a backwards clock not buying a way out, and the
+# widened token still inside `MAX_SESSION_TOKEN_BYTES` — and the fifth is a
+# library test on the threshold boundary itself. None needs the cluster; all five
+# run in the same invocation and count the same. The change's other tests land in
+# `orrery_protocol` and `orrery_coordinator`, which this invocation does not
+# build, so they are deliberately not claimed. The floor rises by those five:
+# 503 -> 508.
+#
 # A full run measured 734 executed tests on 2026-08-22, two above the 732 this
 # arithmetic accounts for. Those two landed between the last recorded
 # measurement and this one and were never attributed, so — as with the two
@@ -227,7 +239,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # passes should have passed", which names neither the floor nor the fixture.
 # Raise the per-target count in the same commit, and leave real headroom rather
 # than the minimum that passes today.
-FLOOR="${ORRERY_FDB_TEST_FLOOR:-503}"
+FLOOR="${ORRERY_FDB_TEST_FLOOR:-508}"
 
 # Every test file whose contents only mean anything against a real cluster. If
 # one of these reports no executed tests, the tier is dark again whatever the
