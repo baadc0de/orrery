@@ -1,11 +1,14 @@
 //! Regolith-specific checks for weapon state and planar input discipline.
 
-use orrery_core::{evaluate, CoreCodec, Executor, InvariantKind, InvariantSample, QPos, QVel};
+use orrery_core::{
+    evaluate, tick_rng, CoreCodec, Executor, InvariantKind, InvariantSample, QPos, QVel,
+};
 use orrery_games::game::Game;
 use orrery_games::regolith::{
     archetype::Archetype,
     invariants::INVARIANTS,
     order::{ChildSpec, Order, Outcome},
+    pilot::{scenario_at, PilotScenario, PILOT_SCENARIOS, SCENARIO_TICKS},
     state::{BloomDirector, BloomMembership, Craft, Pickup, RegolithState, Rock, RockTier},
     weapon::WeaponKind,
     Regolith, BLOOM_CADENCE_TICKS, BLOOM_CENTRAL_RADIUS_MM, BLOOM_LIFETIME_TICKS, BLOOM_ROCK_COUNT,
@@ -33,8 +36,8 @@ fn sample<'a>(
 }
 
 #[test]
-fn v4_weapon_table_ruleset_identity_and_island_budget_are_pinned() {
-    assert_eq!(REGOLITH_RULESET.version, 4);
+fn v5_weapon_table_ruleset_identity_and_island_budget_are_pinned() {
+    assert_eq!(REGOLITH_RULESET.version, 5);
     assert_eq!(WeaponKind::Stock.weapon().damage_base, 10);
     assert_eq!(WeaponKind::Volley.weapon().rolls, 3);
     assert_eq!(WeaponKind::Heavy.weapon().reach_mm, 900_000);
@@ -44,6 +47,69 @@ fn v4_weapon_table_ruleset_identity_and_island_budget_are_pinned() {
     assert_eq!(ISLAND_DIRECTOR_BUDGET, 1);
     assert_eq!(ISLAND_WINDOW_BUDGET, 37);
     assert_eq!((KILL_SCORE_POINTS, PICKUP_SCORE_POINTS), (25, 5));
+}
+
+fn pilot_orders(seed: u8, entity: u64, slot: u64, tick: u64) -> Vec<Order> {
+    let seed = UniverseSeed([seed; 32]);
+    let entity = PersistId::new(entity);
+    let at = Tick::new(tick);
+    let peers = [PersistId::new(11), PersistId::new(12), PersistId::new(13)];
+    let mut rng = tick_rng(seed, entity, at);
+    let mut orders = Vec::new();
+    Regolith::honest().honest_inputs(entity, slot, at, &peers, &mut rng, &mut orders);
+    orders
+}
+
+#[test]
+fn pilot_scenario_table_covers_the_four_durable_surfaces() {
+    assert_eq!(
+        PILOT_SCENARIOS.map(PilotScenario::name),
+        ["combat", "mining", "contested-grab", "bloom-convergence"]
+    );
+    for (index, scenario) in PILOT_SCENARIOS.into_iter().enumerate() {
+        let tick = Tick::new(index as u64 * SCENARIO_TICKS);
+        assert_eq!(scenario_at(tick), scenario);
+        let orders = pilot_orders(0x61, 1, 0, tick.0);
+        assert_eq!(
+            orders
+                .iter()
+                .filter(|order| matches!(order, Order::Fire { .. }))
+                .count(),
+            1,
+            "{} must hold the trigger",
+            scenario.name()
+        );
+        assert!(matches!(
+            orders.first(),
+            Some(Order::Thrust { pitch_urad: 0, .. })
+        ));
+        for order in orders {
+            assert_eq!(Order::decode(&order.to_canonical()).unwrap(), order);
+        }
+    }
+}
+
+#[test]
+fn adjacent_slots_deliberately_contest_one_pickup() {
+    let tick = 2 * SCENARIO_TICKS;
+    let pickup = |slot| {
+        pilot_orders(0x61, slot + 1, slot, tick)
+            .into_iter()
+            .find_map(|order| match order {
+                Order::Grab { pickup } => Some(pickup),
+                _ => None,
+            })
+            .expect("the contested-grab row emits a grab")
+    };
+    assert_eq!(pickup(0), pickup(1));
+    assert_ne!(pickup(1), pickup(2));
+}
+
+#[test]
+fn pilot_is_pure_in_seed_entity_slot_and_tick() {
+    let first = pilot_orders(0x61, 7, 3, 4 * SCENARIO_TICKS + 17);
+    let second = pilot_orders(0x61, 7, 3, 4 * SCENARIO_TICKS + 17);
+    assert_eq!(first, second);
 }
 
 #[test]

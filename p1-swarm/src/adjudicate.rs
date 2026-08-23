@@ -26,7 +26,7 @@
 use std::collections::BTreeMap;
 
 use orrery_core::verify_bundle;
-use orrery_games::skirmish::{Skirmish, SKIRMISH_RULESET};
+use orrery_games::regolith::{Regolith, REGOLITH_RULESET};
 use orrery_protocol::{DiscrepancyReport, NodeId, UnadjudicableReason, UniverseSeed, Verdict};
 
 /// Re-runs filed reports under the shipping rules.
@@ -85,11 +85,11 @@ impl Adjudicator {
         if orrery_witness::verify_report(report).is_err() {
             return Verdict::Unadjudicable(UnadjudicableReason::Malformed);
         }
-        if report.bundle.ruleset != SKIRMISH_RULESET {
+        if report.bundle.ruleset != REGOLITH_RULESET {
             return Verdict::Unadjudicable(UnadjudicableReason::UnknownRuleset);
         }
         verify_bundle(
-            Skirmish::honest(),
+            Regolith::honest(),
             self.seed,
             report.subject,
             &report.bundle,

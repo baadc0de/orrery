@@ -28,12 +28,13 @@ use bevy_ecs::prelude::*;
 use bevy_math::Vec3;
 use bevy_time::{Real, Time};
 
-use orrery_core::{Executor, QPos};
+use orrery_core::{tick_rng, Executor, QPos};
 use orrery_games::game::Tamper;
-use orrery_games::skirmish::archetype::Archetype;
-use orrery_games::skirmish::order::Order;
-use orrery_games::skirmish::state::Craft;
-use orrery_games::skirmish::{Skirmish, SKIRMISH_RULESET};
+use orrery_games::regolith::archetype::Archetype;
+use orrery_games::regolith::order::Order;
+use orrery_games::regolith::state::{Craft, RegolithState};
+use orrery_games::regolith::weapon::WeaponKind;
+use orrery_games::regolith::{Regolith, REGOLITH_RULESET};
 use orrery_net::budget::{UploadBudget, UploadMeter};
 use orrery_net::peer_link::{
     forget_departed_links, receive_peer_packets, send_peer_packets, PeerLinkCounters, PeerPacket,
@@ -163,7 +164,7 @@ pub struct Bot {
     pub app: App,
     /// The core executor holding this bot's own craft, under whichever build
     /// this peer runs — tampered or not.
-    executor: Executor<Skirmish>,
+    executor: Executor<Regolith>,
     /// A second executor running the *shipping* rules over the same logged
     /// orders, for a bot the harness modified.
     ///
@@ -175,7 +176,7 @@ pub struct Bot {
     /// `Tamper::SpeedMultiplier` is on an interceptor slot, see
     /// [`BotSpec::cheat`] — would satisfy every conviction clause by producing
     /// byte-identical state and never being reported at all.
-    honest_shadow: Option<Executor<Skirmish>>,
+    honest_shadow: Option<Executor<Regolith>>,
     /// First tick at which the tampered build produced a different state hash
     /// than the shipping one would have from the same orders.
     first_tampered_tick: Option<u64>,
@@ -183,6 +184,10 @@ pub struct Bot {
     tamper: Option<Tamper>,
     /// The entity this bot authors.
     entity: PersistId,
+    /// Universe seed used by the shared pure pilot.
+    seed: UniverseSeed,
+    /// Scenario slot used by the shared pure pilot.
+    slot: u64,
     /// Heading change per tick, in micro-radians — its share of the circle.
     turn_urad: i32,
     /// Thrust magnitude in mm/s².
@@ -367,7 +372,7 @@ pub fn apply_replicas(
     tick: Res<SimTick>,
     mut counters: ResMut<ReplicaCounters>,
     existing: Query<(Entity, &Replica)>,
-    witness: Option<ResMut<WitnessState<Skirmish>>>,
+    witness: Option<ResMut<WitnessState<Regolith>>>,
 ) {
     let mut witness = witness;
     for packet in packets.read() {
@@ -393,7 +398,11 @@ pub fn apply_replicas(
             }
             continue;
         };
-        let Ok(craft) = <Craft as orrery_core::CoreCodec>::decode(&encoded) else {
+        let Ok(state) = <RegolithState as orrery_core::CoreCodec>::decode(&encoded) else {
+            counters.bad_body += 1;
+            continue;
+        };
+        let RegolithState::Craft(craft) = &state else {
             counters.bad_body += 1;
             continue;
         };
@@ -405,7 +414,7 @@ pub fn apply_replicas(
         if let Some(witness) = witness.as_mut() {
             witness.0.observe(orrery_witness::Observation {
                 entity,
-                state: &craft,
+                state: &state,
                 tick: orrery_protocol::Tick::new(at),
             });
         }
@@ -464,7 +473,7 @@ impl Bot {
         let start = QPos::from_metres(libm::cos(arc) * radius_m, 0.0, libm::sin(arc) * radius_m);
 
         // Tangent to the ring, so the bot travels around it. `Craft::spawned`
-        // takes the yaw back into `[0, TAU)`, which `skirmish/value-range`
+        // takes the yaw back into `[0, TAU)`, which `regolith/value-range`
         // requires of every sample.
         let yaw_urad = ((arc + core::f64::consts::FRAC_PI_2) * 1_000_000.0) as i32;
 
@@ -486,14 +495,23 @@ impl Bot {
         } else {
             Archetype::for_slot(index as u64)
         };
-        let craft = Craft::spawned(archetype, start, yaw_urad);
+        let mut craft = Craft::spawned(archetype, start, yaw_urad);
+        if cheat == Some(Tamper::DamageInflation) {
+            // The tamper-parity scenario starts after a logged pickup grant:
+            // both the modified authority and its honest shadow anchor from
+            // the same Volley state. One held trigger then exposes three
+            // independently inflated rolls, without coupling the pilot to hit
+            // resolution (the seam #352 will replace).
+            craft.weapon = WeaponKind::Volley;
+        }
+        let state = RegolithState::Craft(craft);
 
-        let rules = cheat.map_or_else(Skirmish::honest, Skirmish::cheating);
+        let rules = cheat.map_or_else(Regolith::honest, Regolith::cheating);
         let mut executor = Executor::new(rules, seed);
-        executor.insert(entity, craft.clone());
+        executor.insert(entity, state.clone());
         let honest_shadow = cheat.map(|_| {
-            let mut shadow = Executor::new(Skirmish::honest(), seed);
-            shadow.insert(entity, craft);
+            let mut shadow = Executor::new(Regolith::honest(), seed);
+            shadow.insert(entity, state);
             shadow
         });
 
@@ -528,8 +546,8 @@ impl Bot {
         if witnessing {
             // The witness adapter drains the same peer lane, so it slots in
             // beside the send path rather than replacing anything.
-            app.add_plugins(WitnessPlugin::<Skirmish>::new())
-                .insert_resource(WitnessState(Witness::<Skirmish>::new(
+            app.add_plugins(WitnessPlugin::<Regolith>::new())
+                .insert_resource(WitnessState(Witness::<Regolith>::new(
                     WitnessConfig {
                         shadow_mode: !enforcing,
                         ..WitnessConfig::default()
@@ -539,7 +557,7 @@ impl Bot {
                     // modified one — see `BotSpec::cheat`. A witness re-executes
                     // the rules an authority *claims* to be running, and the
                     // claim is what it is held to.
-                    Skirmish::honest,
+                    Regolith::honest,
                 )))
                 // Filing is opt-in and this is the opt-in: without an identity
                 // `escalate` counts `escalations_unidentified` and stops, which
@@ -566,13 +584,15 @@ impl Bot {
             first_tampered_tick: None,
             tamper: cheat,
             entity,
+            seed,
+            slot: index as u64,
             // ω = v/r, so the bot actually follows the orbit it started on.
             // Picking a turn rate independently of the speed makes it spiral
             // into whatever radius the two happen to imply — which is how the
             // first version ended up circling 200 m and visiting ten cells.
             //
             // `v` is `CRUISE_MPS` rather than a measured speed, and under
-            // Skirmish that is an approximation rather than an identity: these
+            // Regolith that is an approximation rather than an identity: these
             // rules apply drag, so a bot coasts *down* through the cutoff and
             // thrusts back over it instead of sitting at it exactly. The
             // sawtooth is one thrust tick's worth wide — under 1 m/s on a
@@ -590,12 +610,12 @@ impl Bot {
             proxy_pops: 0,
             profile: Profile::for_index(index, witnessing),
             // The *honest* ruleset id, even on a tampered build. That is the
-            // point of `Skirmish::id` reporting `SKIRMISH_RULESET` whatever the
+            // point of `Regolith::id` reporting `REGOLITH_RULESET` whatever the
             // tamper: a modified client claims to be running the rules, and the
             // claim is what a witness holds it to. A cheat that announced
             // itself would be routed to no adjudicable build and resolve as
             // `UnknownRuleset` — never a strike.
-            chain: witnessing.then(|| Chain::new(secret.clone(), entity, SKIRMISH_RULESET, 0)),
+            chain: witnessing.then(|| Chain::new(secret.clone(), entity, REGOLITH_RULESET, 0)),
             signals: SignalTally::default(),
             tampered_subjects: Vec::new(),
             last_high_rate: Vec::new(),
@@ -607,7 +627,10 @@ impl Bot {
     /// This bot's authored craft.
     #[must_use]
     pub fn craft(&self) -> &Craft {
-        self.executor.state(self.entity).expect("seeded")
+        let RegolithState::Craft(craft) = self.executor.state(self.entity).expect("seeded") else {
+            unreachable!("a swarm bot always authors a craft")
+        };
+        craft
     }
 
     /// The bot's current speed in metres per second.
@@ -629,31 +652,54 @@ impl Bot {
     /// the harness knows the first tick on which the cheat actually changed
     /// anything — see [`Bot::first_tampered_tick`].
     pub fn step_core(&mut self, tick: u64, cell_edge_m: f32) {
-        let accel_mmss =
-            self.profile
-                .accel_mmss(tick, self.speed_mps(), self.accel_mmss, CRUISE_MPS);
-        let order = Order::Thrust {
+        let at = Tick::new(tick);
+        let mut rng = tick_rng(self.seed, self.entity, at);
+        let mut orders = Vec::with_capacity(3);
+        orrery_games::regolith::pilot::honest_orders(
+            self.entity,
+            self.slot,
+            at,
+            &mut rng,
+            &mut orders,
+        );
+        let speed = self.speed_mps();
+        let profile = self.profile;
+        let turn_urad = self.turn_urad;
+        let full_accel = self.accel_mmss;
+        let speed_probe = self.tamper == Some(Tamper::SpeedMultiplier);
+        if let Some(Order::Thrust {
             accel_mmss,
-            yaw_urad: self.turn_urad,
-            // Level flight: the roam is a circle in the XZ plane, and a pitch
-            // term would make the orbit a helix the cell-visit numbers were
-            // never chosen against.
-            pitch_urad: 0,
-        };
+            yaw_urad,
+            pitch_urad,
+        }) = orders.first_mut()
+        {
+            // Input-source adaptation, parallel to the skin gating thrust and
+            // choosing a yaw sign. The pilot still owns the Order vocabulary,
+            // scenario direction, held trigger, targets and pitch lock.
+            *accel_mmss = if speed_probe {
+                // A modified cruiser must ask beyond its honest acceleration
+                // ceiling or a raised ceiling is inert at the 32 m/s roam.
+                full_accel
+            } else {
+                profile.accel_mmss(tick, speed, *accel_mmss, CRUISE_MPS)
+            };
+            *yaw_urad = yaw_urad.signum() * turn_urad.abs();
+            *pitch_urad = 0;
+        }
         // Log *before* executing, and log exactly what is about to be applied.
         // A log written from what happened rather than what was asked would
         // close the gap a cheat lives in by construction, and then the harness
         // could not tell an honest bot from a careful one.
         if let Some(chain) = &mut self.chain {
-            chain.log_input(tick, &order);
+            chain.log_inputs(tick, &orders);
         }
         let outcome = self
             .executor
-            .step_entity(self.entity, Tick::new(tick), core::slice::from_ref(&order))
+            .step_entity(self.entity, at, &orders)
             .expect("entity present");
         if let Some(shadow) = &mut self.honest_shadow {
             let honest = shadow
-                .step_entity(self.entity, Tick::new(tick), &[order])
+                .step_entity(self.entity, at, &orders)
                 .expect("entity present");
             if self.first_tampered_tick.is_none() && honest.state_hash != outcome.state_hash {
                 self.first_tampered_tick = Some(tick);
@@ -852,11 +898,17 @@ impl Bot {
     }
 
     /// Start watching `subject`'s `entity`, anchored at a signed claim.
-    pub fn watch(&mut self, entity: PersistId, subject: NodeId, anchor: StateClaim, state: Craft) {
+    pub fn watch(
+        &mut self,
+        entity: PersistId,
+        subject: NodeId,
+        anchor: StateClaim,
+        state: RegolithState,
+    ) {
         let Some(mut witness) = self
             .app
             .world_mut()
-            .get_resource_mut::<WitnessState<Skirmish>>()
+            .get_resource_mut::<WitnessState<Regolith>>()
         else {
             return;
         };
@@ -1044,7 +1096,7 @@ impl Bot {
 
     /// This bot's current core state, for seeding a watcher's anchor.
     #[must_use]
-    pub fn state(&self) -> Craft {
+    pub fn state(&self) -> RegolithState {
         self.executor.state(self.entity).expect("seeded").clone()
     }
 
@@ -1077,7 +1129,7 @@ impl Bot {
     pub fn witness_counters(&self) -> orrery_witness::WitnessCounters {
         self.app
             .world()
-            .get_resource::<WitnessState<Skirmish>>()
+            .get_resource::<WitnessState<Regolith>>()
             .map_or_else(Default::default, |state| state.0.counters())
     }
 
@@ -1145,12 +1197,16 @@ mod tests {
     use super::*;
 
     /// One tick of this harness's roam under `rules`, on `archetype`.
-    fn hash_after_a_thrust(rules: Skirmish, archetype: Archetype) -> [u8; 32] {
+    fn hash_after_a_thrust(rules: Regolith, archetype: Archetype) -> [u8; 32] {
         let entity = PersistId::new(1);
         let mut executor = Executor::new(rules, UniverseSeed([7; 32]));
         executor.insert(
             entity,
-            Craft::spawned(archetype, QPos::from_metres(1_000.0, 0.0, 0.0), 0),
+            RegolithState::Craft(Craft::spawned(
+                archetype,
+                QPos::from_metres(1_000.0, 0.0, 0.0),
+                0,
+            )),
         );
         executor
             .step_entity(
@@ -1183,16 +1239,16 @@ mod tests {
         // Neither *speed* ceiling binds at all — the bots cruise at 32 m/s
         // against 120 and 60 — so the acceleration clamp is the whole of this
         // cheat's effect at these parameters.
-        let cheating = Skirmish::cheating(Tamper::SpeedMultiplier);
+        let cheating = Regolith::cheating(Tamper::SpeedMultiplier);
         assert_eq!(
-            hash_after_a_thrust(Skirmish::honest(), Archetype::Interceptor),
+            hash_after_a_thrust(Regolith::honest(), Archetype::Interceptor),
             hash_after_a_thrust(cheating, Archetype::Interceptor),
             "the speed cheat is inert on an interceptor at this roam's requested \
              acceleration; if that ever stops being true, the archetype pin in `Bot::new` \
              is solving a problem that no longer exists and should go",
         );
         assert_ne!(
-            hash_after_a_thrust(Skirmish::honest(), Archetype::Cruiser),
+            hash_after_a_thrust(Regolith::honest(), Archetype::Cruiser),
             hash_after_a_thrust(cheating, Archetype::Cruiser),
             "the speed cheat must change a cruiser's state, or the conviction leg has \
              nothing to convict",
@@ -1230,5 +1286,46 @@ mod tests {
             "both builds start at rest, so the very first tick asks for full thrust and \
              the two clamps already disagree",
         );
+    }
+
+    #[test]
+    fn every_regolith_tamper_is_live_under_the_shared_pilot() {
+        let spec = BotSpec {
+            index: 0,
+            count: 8,
+            seed: UniverseSeed([3; 32]),
+            cell_edge_m: default_cell_edge_m(),
+            witnessing: true,
+            cheat: None,
+            enforcing: false,
+        };
+        for tamper in Tamper::ALL {
+            let mut modified = Bot::new(BotSpec {
+                cheat: Some(*tamper),
+                enforcing: true,
+                ..spec
+            });
+            for tick in 0..=orrery_protocol::MAX_ADJUDICATION_TICKS {
+                modified.step_core(tick, spec.cell_edge_m);
+                if modified.first_tampered_tick().is_some() {
+                    break;
+                }
+            }
+            assert!(
+                modified
+                    .first_tampered_tick()
+                    .is_some_and(|tick| tick <= orrery_protocol::MAX_ADJUDICATION_TICKS),
+                "{} is inert under the shared pilot for a whole adjudication window",
+                tamper.name()
+            );
+            if *tamper == Tamper::DamageInflation {
+                assert_eq!(modified.craft().weapon, WeaponKind::Volley);
+                assert_eq!(modified.craft().shots, 1);
+                assert!(
+                    modified.craft().damage_dealt >= 3,
+                    "Volley must leave all three inflated rolls in the own-state trace"
+                );
+            }
+        }
     }
 }

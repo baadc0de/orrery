@@ -7,6 +7,7 @@ use serde::Serialize;
 
 use orrery_core::CoreCodec;
 use orrery_games::game::Tamper;
+use orrery_games::regolith::{pilot::PILOT_SCENARIOS, REGOLITH_RULESET};
 use orrery_net::channels::{encode_replication, Channel};
 use orrery_net::peer_link::{SendPacket, StreamMode};
 use orrery_protocol::coord::PeerEntry;
@@ -255,6 +256,12 @@ pub struct RunIdentity {
 pub struct SwarmReport {
     /// What produced this run, and what it would take to produce it again.
     pub identity: RunIdentity,
+    /// Game whose hours this report banks.
+    pub game: &'static str,
+    /// Exact Regolith rules version executed and witnessed.
+    pub ruleset_version: u32,
+    /// Input-diversity surfaces exercised during the session.
+    pub scenarios: [&'static str; 4],
     /// Unix seconds at which the run started, when the caller asked for a
     /// stamp (`--stamp-wall-clock`).
     ///
@@ -639,7 +646,7 @@ impl Swarm {
             let bot = &mut self.bots[index];
             let cell = bot.cell().expect("committed");
             let entity = bot.entity();
-            let craft = bot.craft();
+            let state = bot.state();
             // The craft bytes plus the authority's *committed* cell. D2 makes
             // the commitment a single-writer value emitted by the holder: a
             // receiver that recomputed it from the position would get the raw
@@ -655,7 +662,7 @@ impl Swarm {
             (
                 bot.node,
                 cell,
-                encode_replication(&(craft.to_canonical(), cell, entity, tick + 1)),
+                encode_replication(&(state.to_canonical(), cell, entity, tick + 1)),
             )
         };
         let peers: Vec<NodeId> = self.bots[index]
@@ -1079,6 +1086,9 @@ impl Swarm {
                 target: env!("P1_SWARM_TARGET"),
                 commit: env!("P1_SWARM_COMMIT"),
             },
+            game: "regolith",
+            ruleset_version: REGOLITH_RULESET.version,
+            scenarios: PILOT_SCENARIOS.map(|scenario| scenario.name()),
             started_at_unix_secs: self.config.started_at_unix_secs,
             peers: self.bots.len(),
             seconds: self.config.seconds,
@@ -1575,6 +1585,9 @@ mod tests {
                 target: "test",
                 commit: "test",
             },
+            game: "regolith",
+            ruleset_version: REGOLITH_RULESET.version,
+            scenarios: PILOT_SCENARIOS.map(|scenario| scenario.name()),
             started_at_unix_secs: None,
             peers: 32,
             seconds: 3_600,

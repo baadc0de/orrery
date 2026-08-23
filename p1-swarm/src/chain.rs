@@ -13,8 +13,8 @@
 
 use orrery_core::log::{claim_hash, fold, sign_claim, sign_frame, HeadTransition};
 use orrery_core::{state_hash, CoreCodec};
-use orrery_games::skirmish::order::Order;
-use orrery_games::skirmish::state::Craft;
+use orrery_games::regolith::order::Order;
+use orrery_games::regolith::state::RegolithState;
 use orrery_protocol::{
     ChainHash, EntitySlice, InputRecord, LogFrame, PersistId, RecordSource, RulesetId, StateClaim,
     Tick,
@@ -118,32 +118,34 @@ impl Chain {
     ///
     /// A witness holds state for exactly one claim — the anchor — and is held to
     /// the subject's own signature for everything after it.
-    pub fn anchor(&mut self, tick: u64, state: &Craft) -> StateClaim {
+    pub fn anchor(&mut self, tick: u64, state: &RegolithState) -> StateClaim {
         let claim = self.sign_claim_at(tick, state);
         self.previous_claim = claim_hash(&claim);
         self.claimed_through = Some(tick);
         claim
     }
 
-    /// Log the input applied at `tick`, folding it into the chain.
+    /// Log the inputs applied at `tick`, folding them into the chain in order.
     ///
-    /// Called every tick, including ticks whose input is a zero thrust: a silent
-    /// tick still advances state and still draws from the RNG, so a log that
-    /// skipped it would put every witness on a different trajectory for reasons
-    /// that have nothing to do with cheating.
-    pub fn log_input(&mut self, tick: u64, command: &Order) {
+    /// Called every tick, including ticks whose thrust is zero: the held
+    /// trigger and scenario action still belong to that tick, and a log that
+    /// skipped any order would put every witness on a different trajectory for
+    /// reasons that have nothing to do with cheating.
+    pub fn log_inputs(&mut self, tick: u64, commands: &[Order]) {
         let offset = (tick - self.frame_start) as u16;
-        let record = InputRecord {
-            tick_off: offset,
-            seq: 0,
-            // The frame's own signer: no 32-byte key per record.
-            source: RecordSource::OwnPlayer {
-                input_seq: tick as u32,
-            },
-            payload: bytes::Bytes::from(command.to_canonical()),
-        };
-        self.head = fold(self.head, &record);
-        self.pending.push(record);
+        for (seq, command) in commands.iter().enumerate() {
+            let record = InputRecord {
+                tick_off: offset,
+                seq: u16::try_from(seq).unwrap_or(u16::MAX),
+                // The frame's own signer: no 32-byte key per record.
+                source: RecordSource::OwnPlayer {
+                    input_seq: (tick as u32).wrapping_mul(4).wrapping_add(seq as u32),
+                },
+                payload: bytes::Bytes::from(command.to_canonical()),
+            };
+            self.head = fold(self.head, &record);
+            self.pending.push(record);
+        }
     }
 
     /// Retain the state hash the tick just executed produced.
@@ -198,7 +200,7 @@ impl Chain {
 
     /// Cut a claim if one is due at `tick`, and if this tick has not been
     /// claimed already — see the `claimed_through` field.
-    pub fn cut_claim(&mut self, tick: u64, state: &Craft) -> Option<StateClaim> {
+    pub fn cut_claim(&mut self, tick: u64, state: &RegolithState) -> Option<StateClaim> {
         if !tick.is_multiple_of(CLAIM_EVERY) || self.claimed_through == Some(tick) {
             return None;
         }
@@ -208,7 +210,7 @@ impl Chain {
         Some(claim)
     }
 
-    fn sign_claim_at(&self, tick: u64, state: &Craft) -> StateClaim {
+    fn sign_claim_at(&self, tick: u64, state: &RegolithState) -> StateClaim {
         let mut claim = StateClaim {
             entity: self.entity,
             chain_epoch: 0,
@@ -228,10 +230,15 @@ impl Chain {
 mod tests {
     use super::*;
     use orrery_core::QPos;
-    use orrery_games::skirmish::archetype::Archetype;
+    use orrery_games::regolith::archetype::Archetype;
+    use orrery_games::regolith::state::Craft;
 
-    fn craft() -> Craft {
-        Craft::spawned(Archetype::Cruiser, QPos::from_metres(1_000.0, 0.0, 0.0), 0)
+    fn craft() -> RegolithState {
+        RegolithState::Craft(Craft::spawned(
+            Archetype::Cruiser,
+            QPos::from_metres(1_000.0, 0.0, 0.0),
+            0,
+        ))
     }
 
     #[test]
@@ -252,7 +259,7 @@ mod tests {
         let mut chain = Chain::new(
             key,
             PersistId::new(1),
-            orrery_games::skirmish::SKIRMISH_RULESET,
+            orrery_games::regolith::REGOLITH_RULESET,
             0,
         );
         let state = craft();
@@ -264,11 +271,11 @@ mod tests {
         );
 
         for tick in 1..CLAIM_EVERY {
-            chain.log_input(
+            chain.log_inputs(
                 tick,
-                &orrery_games::skirmish::order::Order::Fire {
+                &[orrery_games::regolith::order::Order::Fire {
                     target: PersistId::new(2),
-                },
+                }],
             );
         }
         let next = chain

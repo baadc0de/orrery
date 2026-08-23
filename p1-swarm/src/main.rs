@@ -14,7 +14,7 @@
 //!
 //! Real: `orrery_spatial`'s hysteresis, AOI and bounded interest selection;
 //! `orrery_net`'s send path, channel policy and upload meter with wire-byte
-//! accounting; `orrery_games`' Skirmish driving the motion. Every number the
+//! accounting; `orrery_games`' Regolith driving the motion. Every number the
 //! report prints is produced by shipping code.
 //!
 //! The ruleset used to be `orrery_conformance`'s reference kernel, and swapping
@@ -24,9 +24,9 @@
 //! accumulated ran stage 1 against an empty slice**. `SignalTally`'s
 //! `invariant_breaches` was a dead term in the false-positive sum, and "no
 //! false-positive discrepancy signal against an honest peer" was measuring
-//! log re-execution alone. Skirmish publishes five checks — speed cap,
-//! acceleration cap, teleport, fire rate, value range — and they run on every
-//! sample every peer receives. It also ships its own cheats, which is what
+//! log re-execution alone. Regolith publishes the movement, fire-rate,
+//! equipment and score checks, and they run on every sample every peer
+//! receives. It also ships its own cheats, which is what
 //! makes the conviction leg below possible at all.
 //!
 //! Not real: the socket. Peers are coupled by an in-process router. Transport
@@ -51,7 +51,7 @@
 //! That measures the false-positive rate and says nothing about whether the
 //! pipeline catches anybody, and the two are only evidence together: a witness
 //! tuned until it accuses nobody passes the honest legs perfectly. `--cheat`
-//! closes it. It hands N peers a tampered `Skirmish` build, arms every witness
+//! closes it. It hands N peers a tampered `Regolith` build, arms every witness
 //! (`--enforce`, implied), and re-runs each filed `DiscrepancyReport` through
 //! an in-process adjudicator built on `orrery_witness::verify_report` and
 //! `orrery_core::verify_bundle` — which believes nothing the reporter said.
@@ -85,7 +85,7 @@
 //! **Stage 1 never fires on it.** The cheat is worth 167 mm/s of velocity per
 //! *thrusting* tick, and a cruising bot thrusts about one tick in nineteen, so
 //! across a 20 Hz sample gap the change stays well inside
-//! `skirmish/acceleration-cap`'s per-tick allowance. It is caught by
+//! `regolith/acceleration-cap`'s per-tick allowance. It is caught by
 //! re-execution and only by re-execution — which is the argument for stage 1
 //! being a filter rather than a verdict, arriving from the direction the
 //! `DamageInflation` cheat was supposed to make it.
@@ -141,7 +141,7 @@
 //! | Observation coverage | 81.3% | **100.0%** |
 //! | False positives | 582 | **0** |
 //!
-//! That table was measured on `orrery_conformance`'s corpus kernel. Skirmish
+//! That table was measured on `orrery_conformance`'s corpus kernel. Regolith
 //! applies drag and a per-archetype speed clamp where the kernel applied
 //! neither, so every trajectory moved and the seeded figures moved with them:
 //! over the criterion's hour under the impairment profile the lane sits at
@@ -265,7 +265,7 @@ struct Args {
     /// when watches stopped dying on their first lost frame, which is more
     /// repair traffic and so more of the cheap lane shed to pay for it. 230 →
     /// 162 when the bots moved from `orrery_conformance`'s corpus kernel to
-    /// `orrery_games`' Skirmish: drag and a per-archetype speed clamp move every
+    /// `orrery_games`' Regolith: drag and a per-archetype speed clamp move every
     /// trajectory in the swarm, and with it the crowd density that decides how
     /// much any peer has to send. 172 at the 5% end of the band. Both are
     /// identical at five simulated minutes and at one hour.
@@ -300,16 +300,15 @@ struct Args {
     /// Field modified clients: `<tamper>[:count]`, e.g. `speed` or `speed:2`.
     ///
     /// P4's demo criterion, and the half `--witness` alone cannot reach. It
-    /// hands `count` peers a tampered `Skirmish` build and re-runs each filed
+    /// hands `count` peers a tampered `Regolith` build and re-runs each filed
     /// report through an in-process adjudicator that believes nothing the
     /// reporter said. Implies `--witness` and `--enforce`: without a witness
     /// there is nobody to detect anything, and in shadow mode nobody files.
     ///
-    /// The tampers are `orrery_games`' three. Only `speed` is expressible by
-    /// this roam — the bots never fire, so an inflated damage roll and an
-    /// ignored cooldown change nothing they do — and a cheat that turns out to
-    /// be inert fails the "actually diverges" clause rather than passing every
-    /// clause over byte-identical state.
+    /// The tampers are `orrery_games`' three. The shared Regolith pilot holds
+    /// the trigger, so damage inflation and cooldown bypass are live alongside
+    /// the speed-ceiling probe. A cheat that turns out to be inert fails the
+    /// "actually diverges" clause rather than passing over identical state.
     #[arg(long, value_name = "TAMPER[:COUNT]")]
     cheat: Option<String>,
 
@@ -445,7 +444,10 @@ fn main() -> Result<()> {
     // failed job, and a figure that cannot be traced to a seed and a commit is
     // not evidence.
     eprintln!(
-        "p1-swarm: seed {}, target {}, commit {}, witness {}",
+        "p1-swarm: {} v{}, scenarios {}, seed {}, target {}, commit {}, witness {}",
+        report.game,
+        report.ruleset_version,
+        report.scenarios.join(","),
         report.identity.seed,
         report.identity.target,
         report.identity.commit,
@@ -659,8 +661,17 @@ fn self_test() -> Result<()> {
     // assembles windows and files nothing, and a filed report nobody re-runs is
     // an accusation rather than a verdict. None of them turns a green run red
     // on its own, which is why they are asserted structurally.
-    if !bot.contains("Skirmish") {
+    if !bot.contains("Regolith") {
         bail!("self-test: the bots no longer play a ruleset that publishes stage-1 invariants");
+    }
+    if !bot.contains("regolith::pilot::honest_orders") {
+        bail!("self-test: the swarm bypasses the pilot shared with the human client");
+    }
+    let pilot = include_str!("../../crates/orrery_games/src/regolith/pilot.rs");
+    for scenario in ["Combat", "Mining", "ContestedGrab", "BloomConvergence"] {
+        if !pilot.contains(&format!("PilotScenario::{scenario}")) {
+            bail!("self-test: Regolith pilot scenario is absent: {scenario}");
+        }
     }
     if !bot.contains("WitnessIdentity") {
         bail!("self-test: no witness can sign a report; escalation stops at `unidentified`");

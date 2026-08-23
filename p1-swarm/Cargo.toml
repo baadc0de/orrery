@@ -32,11 +32,11 @@ orrery_net = { path = "../crates/orrery_net" }
 orrery_spatial = { path = "../crates/orrery_spatial" }
 orrery_core = { path = "../crates/orrery_core" }
 orrery_witness = { path = "../crates/orrery_witness" }
-# The rules the bots play: `orrery_games`' Skirmish, not `orrery_conformance`'s
+# The rules the bots play: `orrery_games`' Regolith, not `orrery_conformance`'s
 # corpus kernel. The difference is P4's second half. The corpus kernel publishes
 # no limits, so `Ruleset::invariants()` returns an empty slice and every
 # player-hour this harness ever accumulated ran stage 1 against nothing.
-# Skirmish publishes per-archetype ceilings, returns five stage-1 checks, and —
+# Regolith publishes movement, equipment and score checks, and —
 # because a game that can only be played honestly cannot prove the demo
 # criterion — ships its own cheats for the harness to field a modified client
 # with.

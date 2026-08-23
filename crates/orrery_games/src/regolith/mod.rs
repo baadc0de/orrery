@@ -66,9 +66,9 @@ pub const PICKUP_TTL_TICKS: u16 = 1_800;
 /// Maximum eligible grab distance, in millimetres.
 pub const GRAB_RADIUS_MM: i64 = 25_000;
 
-/// Regolith v4's rules identity. Blooms, respawn and scoring change the rules.
+/// Regolith v5's rules identity. The bankable pilot now covers every scenario.
 pub const REGOLITH_RULESET: RulesetId = RulesetId {
-    version: 4,
+    version: 5,
     digest: [0x52; 32],
 };
 
@@ -751,14 +751,14 @@ impl Game for Regolith {
     }
     fn honest_inputs(
         &self,
-        _entity: PersistId,
+        entity: PersistId,
         slot: u64,
         tick: Tick,
-        peers: &[PersistId],
+        _peers: &[PersistId],
         rng: &mut TickRng,
         out: &mut Vec<Order>,
     ) {
-        pilot::honest_orders(slot, tick, peers, rng, out);
+        pilot::honest_orders(entity, slot, tick, rng, out);
     }
     fn deliver(&self, event: &Outcome) -> Option<(PersistId, Order)> {
         match event {
