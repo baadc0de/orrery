@@ -149,6 +149,10 @@ including one deliberately UDP-blocked network (forced-relay case), per
 
 - The relay is the self-hosted Hetzner box `iroh-relay.distopik.com`
   (see [.agents/memory/hetzner-relay.md](../.agents/memory/hetzner-relay.md)).
+- Its checked-in host default lives in [`relay-host`](relay-host); both this
+  CLI and `p0-nat-lab/deploy-gw.sh` read it. Set `ORRERY_RELAY_HOST` to
+  override that host for either consumer. The CLI derives its HTTPS URL; the
+  lab resolves it before pinning the IP in its DNS-isolated peer namespaces.
 - iroh 1.0.3 API note: the endpoint must advertise the ALPN
   (`b"p0-nat-test"`) via `.alpns(...)`, and the dial must carry the relay URL
   as the addressing hint (the design's `relay_hint`) — without it the peer has

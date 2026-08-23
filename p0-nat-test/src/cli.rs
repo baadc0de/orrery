@@ -6,9 +6,24 @@ use std::time::Duration;
 use clap::Parser;
 use iroh::PublicKey;
 
-/// Default relay URL: the self-hosted iroh-relay on the Hetzner box
-/// (see .agents/memory/hetzner-relay.md). Friends can override with --relay.
-const DEFAULT_RELAY: &str = "https://iroh-relay.distopik.com";
+/// The one checked-in relay host default. `p0-nat-lab/deploy-gw.sh` reads this
+/// same file before resolving and pinning the host in each peer namespace.
+const DEFAULT_RELAY_HOST: &str = include_str!("../relay-host");
+
+/// Build the relay URL from its host. The NAT lab legitimately needs the host
+/// separately: it resolves it on the gateway and pins the resulting IP because
+/// the peer network namespaces cannot rely on DNS.
+fn relay_url(host: &str) -> String {
+    format!("https://{host}")
+}
+
+/// The relay URL used unless `--relay` is supplied. Set `ORRERY_RELAY_HOST` to
+/// override the shared host default for both this CLI and the NAT-lab deployer.
+fn default_relay() -> String {
+    let host =
+        std::env::var("ORRERY_RELAY_HOST").unwrap_or_else(|_| DEFAULT_RELAY_HOST.trim().to_owned());
+    relay_url(&host)
+}
 
 /// Default test window: the P0 demo criterion runs 30 minutes; the default
 /// here is a quick smoke test that still exercises punch + a few seconds of
@@ -25,7 +40,7 @@ const DEFAULT_DURATION_SECS: u64 = 30;
 #[command(name = "p0-nat-test", version, about)]
 pub struct Cli {
     /// The iroh relay URL used as the punch rendezvous and fallback path.
-    #[arg(long, global = true, default_value = DEFAULT_RELAY)]
+    #[arg(long, global = true, default_value_t = default_relay())]
     pub relay: String,
 
     /// The remote peer's NodeId to dial. Omit to act as the host (rendezvous).
@@ -85,5 +100,41 @@ impl Cli {
     /// The test window as a `Duration`.
     pub fn duration(&self) -> Duration {
         Duration::from_secs(self.duration_secs)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+    use std::path::Path;
+    use std::process::Command;
+
+    #[test]
+    fn nat_lab_and_cli_derive_the_same_default_relay() {
+        let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("../p0-nat-lab/deploy-gw.sh");
+        let output = Command::new("bash")
+            .arg(script)
+            .arg("--print-relay-host")
+            .output()
+            .expect("run NAT-lab relay-host query");
+        assert!(
+            output.status.success(),
+            "NAT-lab relay-host query failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let nat_lab_host = String::from_utf8(output.stdout)
+            .expect("NAT-lab relay host is UTF-8")
+            .trim()
+            .to_owned();
+
+        let cli = Cli::try_parse_from(["p0-nat-test"]).expect("CLI accepts its default relay");
+        // Spell the expected URL out rather than calling `relay_url` again. An
+        // assertion that re-derives through the function under test puts the
+        // mutation on both sides of the equality, where it cancels: changing
+        // the scheme to `http` would leave both halves equal and the test
+        // green. The relay is reached over HTTPS, so the scheme is part of what
+        // this guards, not incidental formatting.
+        assert_eq!(cli.relay, format!("https://{nat_lab_host}"));
     }
 }

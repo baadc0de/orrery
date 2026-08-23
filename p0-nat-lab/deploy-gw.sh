@@ -17,6 +17,25 @@
 #   e.g. sudo ./deploy-gw.sh fullcone p1 p2
 set -euo pipefail
 
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+RELAY_HOST_FILE="$SCRIPT_DIR/../p0-nat-test/relay-host"
+
+# Keep the relay's host in one checked-in file. Both the CLI and this deployer
+# honour ORRERY_RELAY_HOST, so a temporary relay can be selected without
+# editing it. The lab still pins an IP below: peer network namespaces cannot
+# rely on DNS once they are isolated behind the fake NAT.
+relay_host() {
+  local default_host
+  default_host=$(<"$RELAY_HOST_FILE")
+  printf '%s\n' "${ORRERY_RELAY_HOST:-$default_host}"
+}
+
+RELAY_HOST=$(relay_host)
+if [ "${1:-}" = "--print-relay-host" ]; then
+  printf '%s\n' "$RELAY_HOST"
+  exit 0
+fi
+
 NAT_TYPE="${1:?usage: deploy-gw.sh <nat-type> <peer...>}"
 shift
 PEERS=("$@")
@@ -25,6 +44,9 @@ PEERS=("$@")
 # The gateway's external NIC (the one with the public IP / default route).
 EXT_IF=$(ip -4 route show default | awk '{print $5; exit}')
 echo "gateway: ext_if=$EXT_IF nat_type=$NAT_TYPE peers=${PEERS[*]}"
+
+RELAY_IP=$(getent ahostsv4 "$RELAY_HOST" | awk 'NR == 1 { print $1 }')
+[ -n "$RELAY_IP" ] || { echo "could not resolve relay host: $RELAY_HOST" >&2; exit 1; }
 
 sysctl -w net.ipv4.ip_forward=1 >/dev/null
 
@@ -72,11 +94,13 @@ for p in "${PEERS[@]}"; do
   ip netns exec "$p" ip route add default via 10.200.0.1 dev eth0
 
   # Working resolver for the peer (systemd-resolved in the gateway ns is not
-  # reachable from the peer ns). iroh also uses its own async resolver, so pin
-  # the relay hostname in /etc/hosts to sidestep DNS-over-NAT entirely.
+  # reachable from the peer ns). Resolve the shared relay host before entering
+  # the namespace, then pin its IP: iroh's async resolver cannot rely on DNS
+  # through this fake NAT.
   ip netns exec "$p" bash -c 'echo "nameserver 8.8.8.8
 nameserver 1.1.1.1" > /etc/resolv.conf'
-  ip netns exec "$p" bash -c "echo '62.238.59.131 iroh-relay.distopik.com' >> /etc/hosts"
+  ip netns exec "$p" bash -c 'printf "%s %s\\n" "$1" "$2" >> /etc/hosts' \
+    relay-host-pin "$RELAY_IP" "$RELAY_HOST"
   echo "peer $p: ip=$peer_ip on bridge $BRIDGE (gw 10.200.0.1)"
 done
 
