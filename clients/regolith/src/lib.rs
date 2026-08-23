@@ -16,7 +16,7 @@ use bevy::prelude::*;
 use bevy::time::common_conditions::on_timer;
 use intent::{decode_packet, Controls, IntentPipeline};
 use orrery_core::Executor;
-use orrery_games::{regolith::order::Order, Game, Regolith};
+use orrery_games::{regolith::order::Order, regolith::state::RegolithState, Game, Regolith};
 use orrery_protocol::{PersistId, Tick, UniverseSeed};
 use telemetry::{JsonlTelemetry, OverlayMetrics};
 
@@ -218,12 +218,22 @@ fn sync_rendered_state(
     mut rendered: Query<(&CoreEntity, &mut Transform)>,
 ) {
     for (entity, mut transform) in &mut rendered {
-        let Some(craft) = session.executor.state(entity.0) else {
+        let Some(state) = session.executor.state(entity.0) else {
             continue;
         };
-        let (x, _, z) = craft.pos.to_metres();
+        // `RegolithState` became a sum when #323 added rocks: craft and rock
+        // windows share one ruleset. Both carry a lattice position; only a
+        // craft has a facing, so a rock keeps whatever rotation it was spawned
+        // with rather than being forced to zero every frame.
+        let (pos, yaw_urad) = match state {
+            RegolithState::Craft(craft) => (craft.pos, Some(craft.yaw_urad)),
+            RegolithState::Rock(rock) => (rock.pos, None),
+        };
+        let (x, _, z) = pos.to_metres();
         transform.translation = Vec3::new(x as f32, 0.0, z as f32);
-        transform.rotation = Quat::from_rotation_y(-(craft.yaw_urad as f32 / 1_000_000.0));
+        if let Some(yaw) = yaw_urad {
+            transform.rotation = Quat::from_rotation_y(-(yaw as f32 / 1_000_000.0));
+        }
     }
 }
 
