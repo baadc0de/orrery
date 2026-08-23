@@ -67,6 +67,12 @@ holds it. It is deliberately absent from the index above, which is the accepted
 set; it is non-normative until the owner accepts it, and the false hot-memory
 bound it exists to repair is corrected in the tree independently of it.
 
+D40 is **proposed, not accepted**:
+[ADR-0040](adr/0040-visibility-and-spatial-query-layering.md) holds it. It is
+deliberately absent from the index above, which is the accepted set; it is
+non-normative until the owner decides the visibility/spatial-query layering and
+the accepted-record tensions the proposal names.
+
 D18 is reserved only as a proposal in
 [ADR-0017](adr/0017-risks-and-open-questions.md); it is not accepted and has no
 ADR file. D19 deliberately follows that reserved gap.
