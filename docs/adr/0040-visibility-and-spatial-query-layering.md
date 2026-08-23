@@ -245,6 +245,62 @@ before redundancy and bursts. This is sizing arithmetic, not measured
 capacity. It makes the trust and operations price visible; it does not solve
 trustless witnessed-yet-hidden.
 
+### 5a. The two viable corners, as the owner frames them
+
+The trilemma forces the choice; it does not pick. Both surviving corners have
+been named by the owner and are recorded here as design options, not decisions.
+
+**Option A — full sharing under witnessing.** Spend *secrecy*; keep peer
+validation and real time. Every peer receives the state, so a compromised
+client can reveal the fog. Witnessing still makes the *consequences*
+adjudicable: a peer cannot circumvent detection, because full disclosure is
+exactly what the witness set replays. Looking is unpreventable; cheating is
+not. This is the posture every shipped MMO occupies, and it is why wallhacks
+are endemic in games where undetectable speed hacks are not.
+
+**Option B — the blind traversal realm.** Spend *real time*; keep secrecy and
+peer validation. A stealthed client leaves the shared realm for a
+terrain-only realm in which it sees no entities at all. Re-entry is a
+submission: the client hands over its during-stealth traversal path, which is
+timed and adjudicated for feasibility — speed, clipping, wall traversal —
+before it rejoins.
+
+Option B's soundness rests on one property, which is worth stating as the
+reason it works rather than as a side effect:
+
+```text
+blind client  =>  no entity state delivered  =>  nothing to leak
+```
+
+Secrecy is enforced by the *absence of data*, not by trusting the client. That
+is the same discipline the tree already applies when it holds unwitnessed
+state cluster-side. A second consequence follows: a blind traverser produces
+no cross-entity effects, so a *failed* adjudication is cheap to reject —
+there is no interaction history to unwind, only a path to refuse.
+
+Three costs belong on the record before either option is chosen:
+
+1. **Option B forecloses ambush.** A stealthed entity can neither attack nor
+   assist, so stealth becomes infiltration and repositioning rather than
+   strike-from-shadow. Re-entry adjudication latency lands precisely where
+   ambush timing would need it to be zero; making re-entry optimistic to
+   recover the timing reinstates the real-time trust the option was chosen to
+   avoid.
+2. **The boundary is itself the tell.** Entering stealth is a membership
+   event, and by §6 membership is an oracle independent of geometry. A peer
+   that observes an entity leave its interest set has detected the stealth,
+   whatever the entity state withholds.
+3. **Blindness cuts both ways.** A traverser told nothing about entities is
+   also told nothing about terrain those entities changed mid-traversal —
+   doors, destructibles, deformation. Feasibility is then adjudicated against
+   a snapshot that may have moved under the path, and the adjudicator must
+   decide whether that is the traverser's fault.
+
+Option A and Option B are not exclusive per game: a ruleset may take A for
+contested space and B for a designated infiltration phase, at the cost of
+implementing both authorities. Which corner Orrery offers, and whether it
+offers one or both, is reserved to the owner.
+
 ### 6. Metadata is a separate visibility frontier
 
 Withholding entity components does not withhold membership metadata. The
