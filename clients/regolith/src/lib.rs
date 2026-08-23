@@ -21,6 +21,16 @@ use orrery_games::{regolith::order::Order, regolith::state::RegolithState, Game,
 use orrery_protocol::{PersistId, Tick, UniverseSeed};
 use telemetry::{JsonlTelemetry, OverlayMetrics};
 
+/// Turns the primitive cone's +Y nose into the +X the ruleset treats as yaw
+/// zero. Baked here rather than into the mesh so a real craft scene, which is
+/// authored nose-forward, needs no correction.
+const NOSE_TO_PLUS_X: Quat = Quat::from_xyzw(
+    0.0,
+    0.0,
+    -core::f32::consts::FRAC_1_SQRT_2,
+    core::f32::consts::FRAC_1_SQRT_2,
+);
+
 const PLAYER: PersistId = PersistId::new(1);
 const OPPONENT: PersistId = PersistId::new(2);
 const SEED: UniverseSeed = UniverseSeed([0x61; 32]);
@@ -103,6 +113,9 @@ impl Plugin for RegolithSkinPlugin {
                 (
                     toggle_overlay,
                     sync_rendered_state,
+                    // After `sync_rendered_state`: it frames the positions
+                    // that system just wrote, not last frame's.
+                    frame_camera.after(sync_rendered_state),
                     refresh_strip,
                     refresh_f3_pane,
                 ),
@@ -123,6 +136,7 @@ fn setup_scene(
 ) {
     commands.spawn((
         Camera3d::default(),
+        ChaseCamera,
         Transform::from_xyz(0.0, 500.0, 0.0).looking_at(Vec3::ZERO, Vec3::NEG_Z),
     ));
     commands.spawn((
@@ -214,6 +228,49 @@ fn drive_core(
     session.tick = Tick::new(tick.0.saturating_add(1));
 }
 
+/// Marks the one camera the framing system drives.
+#[derive(Component)]
+struct ChaseCamera;
+
+/// Keeps every rendered body on screen.
+///
+/// The camera was fixed above the origin, so anything that drifted left the
+/// frame and never came back — a craft that thrusts away is simply gone, with
+/// no way to tell where. This frames the bodies that exist: centre on their
+/// midpoint, and raise the camera until the furthest one fits, with a floor so
+/// a duel at close quarters does not slam the view into the deck.
+///
+/// Framing only. It reads rendered `Transform`s, which are already a pure
+/// function of core state, and writes nothing back — constraint 3 forbids the
+/// skin deciding anything the ruleset should.
+fn frame_camera(
+    bodies: Query<&Transform, (With<CoreEntity>, Without<ChaseCamera>)>,
+    mut camera: Query<&mut Transform, With<ChaseCamera>>,
+) {
+    let Ok(mut view) = camera.single_mut() else {
+        return;
+    };
+    let mut count = 0.0f32;
+    let mut centre = Vec3::ZERO;
+    for body in &bodies {
+        centre += body.translation;
+        count += 1.0;
+    }
+    if count == 0.0 {
+        return;
+    }
+    centre /= count;
+    let mut spread: f32 = 0.0;
+    for body in &bodies {
+        spread = spread.max(body.translation.distance(centre));
+    }
+    // 2.6 is empirical headroom: enough that a body at the spread radius sits
+    // inside the frame rather than on its edge.
+    let height = (spread * 2.6).max(500.0);
+    view.translation = Vec3::new(centre.x, height, centre.z);
+    *view = view.looking_at(centre, Vec3::NEG_Z);
+}
+
 fn sync_rendered_state(
     session: Res<LocalSession>,
     mut rendered: Query<(&CoreEntity, &mut Transform)>,
@@ -246,7 +303,15 @@ fn sync_rendered_state(
         let (x, _, z) = pos.to_metres();
         transform.translation = Vec3::new(x as f32, 0.0, z as f32);
         if let Some(yaw) = yaw_urad {
-            transform.rotation = Quat::from_rotation_y(-(yaw as f32 / 1_000_000.0));
+            // The ruleset thrusts along `(cos yaw, 0, sin yaw)` — yaw zero is
+            // +X — so `from_rotation_y(-yaw)` is the correct world rotation
+            // *for a mesh whose nose already points +X*. The primitive is a
+            // `Cone`, which Bevy builds pointing +Y, i.e. straight at a
+            // top-down camera: rotating it about Y spins it on its own
+            // symmetry axis and nothing visibly changes. Compose the
+            // nose-to-+X correction first so heading is legible.
+            transform.rotation =
+                Quat::from_rotation_y(-(yaw as f32 / 1_000_000.0)) * NOSE_TO_PLUS_X;
         }
     }
 }
