@@ -1798,6 +1798,139 @@ pub struct ReceiptRow {
     pub ops: Vec<u16>,
 }
 
+/// Key for the hot-ledger sweep's resumable cursor:
+/// `ledger/audit-cursor` → postcard [`AuditCursorRow`].
+///
+/// **Auditor-owned state inside the ledger family, not a ledger row.** The
+/// sweep (#330) reads `ledger/bal`, `ledger/item` and `ledger/receipt`, and it
+/// needs one durable byte of its own to remember where the receipt walk
+/// stopped. D32 clause (g) consumes "live and sweeping", and a sweeper that
+/// forgets its position on restart re-reads receipts it has already judged —
+/// unbounded work over a family nothing ever sweeps, which is precisely the
+/// growth the cursor exists to bound.
+///
+/// **Sub-discriminated, not a new family.** The one-byte key-family budget is
+/// nearly exhausted (D35), so the cursor claims no fresh letter: it lives under
+/// the ledger's own `l` prefix at discriminator `a` — before `lb`, so the
+/// registered sub-kind table stays in discriminator order and every existing
+/// disjointness proof walks it unchanged. The sweep's family walk skips this
+/// sub-span explicitly: auditor bookkeeping is not an economy row, and a sweep
+/// that audited its own cursor would be one bug away from reporting on itself.
+///
+/// Written with the module's recognized literal form (`key[0]` then `key[1]`)
+/// so the pair-aware guard sees it and demands exactly what this entry does:
+/// registration beside the other four `(l, …)` pairs.
+#[must_use]
+pub fn ledger_audit_cursor_key() -> [u8; 2] {
+    let mut key = [0u8; 2];
+    key[0] = b'l';
+    key[1] = b'a';
+    key
+}
+
+/// Inclusive start of the sweep-cursor sub-span (`la`, one row today).
+#[must_use]
+pub fn ledger_audit_cursor_range_start() -> Vec<u8> {
+    ledger_audit_cursor_key().to_vec()
+}
+
+/// Exclusive end of the sweep-cursor sub-span (the first byte past `la`).
+///
+/// `[lb, lc)` begins at `ledger/bal`'s first possible key, so this bound and
+/// that one meet without overlapping whatever lands between — which is nothing,
+/// because the registered table proves it.
+#[must_use]
+pub fn ledger_audit_cursor_range_end() -> Vec<u8> {
+    vec![b'l', b'b']
+}
+
+/// The value stored at [`ledger_audit_cursor_key`]: where the incremental
+/// sweep's receipt walk stopped.
+///
+/// `last_receipt_key` is the **complete raw key** of the last receipt the sweep
+/// processed — all twelve bytes, versionstamp included — stored verbatim rather
+/// than decomposed into parts, so resuming needs no re-derivation and cannot
+/// invent a second ordering: the next pass begins at
+/// `last_receipt_key ‖ 0x00`, exclusive, which is every commit after the one
+/// already judged and nothing else. Receipt keys sort by commit versionstamp
+/// alone ([`ReceiptRow`]), so "after the cursor" *is* "after the pass's start
+/// time" by construction.
+///
+/// Postcard-encoded, like [`ItemRow`] and [`ReceiptRow`]: one small,
+/// versionless value written and read by this crate alone. It is unversioned on
+/// [`ItemRow`]'s recorded reason (D38 clause (d)(1)) — the shape is not
+/// changing here, and the next field added adds the trailer in the same
+/// commit.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct AuditCursorRow {
+    /// Raw bytes of the last receipt key the sweep processed; empty when the
+    /// sweep has never run, meaning the next pass starts at the family's head.
+    ///
+    /// A well-formed row always holds either zero or exactly twelve bytes
+    /// ([`ledger_receipt_key`]'s width); anything else decodes as corrupt and
+    /// the sweep restarts from the head rather than guessing.
+    pub last_receipt_key: Vec<u8>,
+    /// Unix milliseconds at which the sweep wrote the row. Diagnostic only —
+    /// the order comes from the receipt keys, never from this clock.
+    pub updated_at_ms: u64,
+}
+
+// Ledger sub-span bounds, for readers that walk one kind.
+//
+// These are *range bounds*, written in the `vec![b'x']` form the module's
+// scanner deliberately does not register as families — an exclusive end is one
+// past a span, not a span. The four economic spans are exactly the registered
+// `(l, …)` sub-kind pairs; the audit-cursor pair has its own bounds above.
+
+/// Inclusive start of the whole ledger family.
+#[must_use]
+pub fn ledger_range_start() -> Vec<u8> {
+    vec![b'l']
+}
+
+/// Exclusive end of the whole ledger family.
+#[must_use]
+pub fn ledger_range_end() -> Vec<u8> {
+    vec![b'm']
+}
+
+/// Inclusive start of the balance sub-span (`lb`).
+#[must_use]
+pub fn ledger_bal_range_start() -> Vec<u8> {
+    vec![b'l', b'b']
+}
+
+/// Exclusive end of the balance sub-span (`lc`).
+#[must_use]
+pub fn ledger_bal_range_end() -> Vec<u8> {
+    vec![b'l', b'c']
+}
+
+/// Inclusive start of the ownership sub-span (`li`).
+#[must_use]
+pub fn ledger_item_range_start() -> Vec<u8> {
+    vec![b'l', b'i']
+}
+
+/// Exclusive end of the ownership sub-span (`lj`).
+#[must_use]
+pub fn ledger_item_range_end() -> Vec<u8> {
+    vec![b'l', b'j']
+}
+
+/// Inclusive start of the receipt sub-span (`lr`).
+#[must_use]
+pub fn ledger_receipt_range_start() -> Vec<u8> {
+    vec![b'l', b'r']
+}
+
+/// Exclusive end of the receipt sub-span (`ls`) — the range both harness
+/// receipt scanners walk.
+#[must_use]
+pub fn ledger_receipt_range_end() -> Vec<u8> {
+    vec![b'l', b's']
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -2591,6 +2724,59 @@ mod tests {
     }
 
     #[test]
+    fn ledger_audit_cursor_subspan_sits_before_bal_and_outside_every_economic_row() {
+        let cursor = ledger_audit_cursor_key();
+        assert_eq!(cursor, [b'l', b'a'], "`la`, sub-discriminated under `l`");
+        assert_eq!(
+            ledger_audit_cursor_range_start(),
+            cursor.to_vec(),
+            "the one-row span starts at the key itself"
+        );
+
+        // The cursor sorts before every balance row and after nothing else in
+        // the family: `la` < `lb` is what lets the sweep's family walk skip
+        // auditor state with one range check instead of a key comparison.
+        let bal_first = ledger_bal_key(AccountId::new(u64::MIN), AssetId::new(u64::MIN));
+        assert!(cursor.as_slice() < bal_first.as_slice());
+        assert_eq!(
+            ledger_audit_cursor_range_end(),
+            bal_first[..2].to_vec(),
+            "the span ends where balances begin"
+        );
+        let bal_last = ledger_bal_key(AccountId::new(u64::MAX), AssetId::new(u64::MAX));
+        assert!(ledger_audit_cursor_range_end().as_slice() <= bal_last.as_slice());
+
+        // And it stays clear of the three economic sub-spans entirely.
+        let item = ledger_item_key(ItemUid::new(u64::MIN));
+        let receipt = ledger_receipt_key();
+        for row in [item.as_slice(), receipt.as_slice()] {
+            assert!(
+                row < ledger_audit_cursor_range_start().as_slice()
+                    || row >= ledger_audit_cursor_range_end().as_slice(),
+                "no economic ledger row may sort into the audit-cursor sub-span"
+            );
+        }
+
+        // The registered table carries the pair — asserted structurally by
+        // `every_discriminated_constructor_is_registered_with_its_pair`; this
+        // names the sample so the failure reads in this test's vocabulary.
+        let families = registered_families();
+        let ledger = families
+            .iter()
+            .find(|family| family.prefix == b'l')
+            .expect("ledger family registered");
+        let Kinds::SubKinds { table } = &ledger.kinds else {
+            panic!("the ledger family is discriminated");
+        };
+        let first = table.first().expect("the ledger family declares sub-kinds");
+        assert_eq!(
+            (first.discriminator, first.name),
+            (b'a', "ledger/audit sweep cursor"),
+            "the cursor is the ledger family's first sub-kind, in discriminator order"
+        );
+    }
+
+    #[test]
     fn new_families_do_not_collide_with_w_c_a_or_i() {
         // The brief's disjointness requirement: the ledger/player/pid
         // prefixes must not collide with world ('w'), ckpt ('c'), actor
@@ -3257,6 +3443,11 @@ mod tests {
                 name: "ledger",
                 kinds: Kinds::SubKinds {
                     table: vec![
+                        SubKind {
+                            discriminator: b'a',
+                            name: "ledger/audit sweep cursor",
+                            sample: ledger_audit_cursor_key().to_vec(),
+                        },
                         SubKind {
                             discriminator: b'b',
                             name: "ledger/bal balances",

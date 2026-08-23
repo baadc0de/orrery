@@ -26,6 +26,7 @@
 
 pub mod actor;
 pub mod adjudication;
+pub mod audit;
 pub mod checkpoint;
 pub mod cluster;
 mod crc;
