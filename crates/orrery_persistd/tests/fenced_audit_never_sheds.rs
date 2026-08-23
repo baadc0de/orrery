@@ -66,6 +66,16 @@ use orrery_protocol::{
 /// number is.
 const ROUTE_BUDGET_US: u64 = 10_000;
 
+/// A liveness ceiling expressed in the route budget under test. The served
+/// versus shed assertion is the reply ordering below; this merely prevents a
+/// permanently stalled test from holding a worker forever. Three thousand
+/// budgets is 30 seconds here, leaving substantial headroom over the reported
+/// 11.29-second loaded-runner delay without treating a scheduling timeout as
+/// evidence that the diagnostic shed a write.
+const ACK_LIVENESS_ROUTE_BUDGETS: u64 = 3_000;
+const ACK_LIVENESS_TIMEOUT: Duration =
+    Duration::from_micros(ROUTE_BUDGET_US * ACK_LIVENESS_ROUTE_BUDGETS);
+
 /// How long the audit's `LeaseStore::locate` takes once armed: six budgets.
 /// Any single sampled audit on the request path therefore overruns, with no
 /// dependence on scheduling luck.
@@ -299,28 +309,47 @@ async fn an_audit_slower_than_the_route_budget_neither_sheds_the_diff_nor_vanish
     }
 
     // -- claim 1: the write is served, not shed ---------------------------
+    // Let the route budget expire before looking at the valve. This is the
+    // ordering evidence: an inline audit sheds these writes before it can
+    // produce any reply, so fail on that invariant rather than later calling
+    // its silence a diagnostic failure.
+    tokio::time::sleep(Duration::from_micros(ROUTE_BUDGET_US * 4)).await;
+    let ingress = metrics.ingress.snapshot();
+    assert_eq!(
+        ingress.shed_slow_route, 0,
+        "nothing may be shed: the only slow thing here is a diagnostic that the \
+         route does not wait for: {ingress:?}"
+    );
+    assert_eq!(
+        (ingress.shed_stale, ingress.shed_saturated),
+        (0, 0),
+        "and neither ingress refusal is what this test is about: {ingress:?}"
+    );
+
     // The audit read is six route budgets long and one fires per accept. With
     // it awaited inside `apply_fenced` the gateway's `within_route_budget`
     // timeout cancels every one of these routes, so no acknowledgement ever
     // arrives and this loop times out on the first diff.
     let mut acked = 0;
     while acked < DIFFS {
-        match conn.next_reply(Duration::from_secs(10)).await {
+        match conn.next_reply(ACK_LIVENESS_TIMEOUT).await {
             Some(GatewayReply::BulkAck { .. }) => acked += 1,
             Some(GatewayReply::BulkNack { entity, tick, .. }) => {
                 panic!("a live fence at its own cell must be admitted: {entity:?} {tick:?}")
             }
             Some(other) => panic!("unexpected reply while awaiting acks: {other:?}"),
             None => panic!(
-                "only {acked} of {DIFFS} fenced diffs were acknowledged: a sampled \
-                 invariant-J audit is being run inside the route-admission budget, \
-                 so the diagnostic is shedding the write it was sampled from"
+                "timed out after {ACK_LIVENESS_ROUTE_BUDGETS} route budgets waiting for \
+                 reply {}/{}; this is a liveness failure, not evidence that the diagnostic \
+                 shed a fenced write",
+                acked + 1,
+                DIFFS,
             ),
         }
     }
 
-    // A full extra budget of quiet, so a late shed still lands inside the
-    // observation window rather than after the assertion.
+    // A second, post-ack observation catches a late shed rather than one that
+    // happened before an acknowledgement reached this client.
     tokio::time::sleep(Duration::from_micros(ROUTE_BUDGET_US * 4)).await;
     let ingress = metrics.ingress.snapshot();
     assert_eq!(
