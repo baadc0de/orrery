@@ -35,9 +35,7 @@
 # ── Where these run ──────────────────────────────────────────────────────────
 #
 # Nightly fires on a schedule and on workflow_dispatch, never on a pull
-# request, so the fork-PR problem that constrains ci.yml does not exist here.
-# That is why a self-hosted runner was safe to name in this file at all. As of
-# #180 no job here names one: every job runs on a GitHub-hosted runner.
+# request. Every job runs on a GitHub-hosted runner.
 #
 # #179 triaged every job in this file by what it actually *needs*, rather than
 # moving them as a block, because the three answers want three different
@@ -107,7 +105,7 @@
 # hosted runner and the drain leg #168 added did not, for a reason no timeout
 # addressed. #236 fixed that at the source — the leg now asserts an invariant
 # rather than a wall-clock bound — and #180 moved the job, which is what let
-# `orrery-hel1` be deregistered.
+# the final persistent runner registration be removed.
 #
 # The historical note that belongs with `p3-island` and is not a runner
 # question: it failed its first run *on the box*, and the move there was not
@@ -217,8 +215,8 @@ jobs:
     # ── Why this is a matrix ───────────────────────────────────────────────────
     #
     # The criterion is 500 hours **across all three platforms**, and until this
-    # change every runner that could execute the leg was Linux — the self-hosted
-    # box and `ubuntu-latest`. A Linux-only ledger cannot satisfy the criterion
+    # change every runner that could execute the leg was Linux. A Linux-only
+    # ledger cannot satisfy the criterion
     # however many hours it holds, which is why `p4-ledger.sh` records a `target`
     # per line and groups `total` on it: the shortfall was visible, and this is
     # what closes it.
@@ -622,7 +620,7 @@ jobs:
     #
     # ── Moved to a hosted runner by #180, once #236 made it portable ────────
     #
-    # This job was the last thing pinned to `orrery-hel1`, and the reason was
+    # This job was the final workload migrated to a hosted runner, and the reason was
     # the drain leg #168 added: it required every lease held at drain start to
     # be *parked* at one observation instant. On a 4-vCPU hosted runner peers
     # leave the island at different enough rates that 378 of 400 leases found a
@@ -819,8 +817,7 @@ jobs:
     # The gate writes fixed ledger ids and reads the receipt range back, so it
     # needs a throwaway cluster of its own — the one the composite action
     # provisions on this runner and discards with it — and must never be
-    # pointed at a shared development database such as the `fdbserver` on
-    # `orrery-hel1-1`.
+    # pointed at a shared development database.
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
