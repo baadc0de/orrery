@@ -281,6 +281,15 @@ lane_gates() {
     run scripts/p1-swarm-gate.sh --self-test
     run scripts/fdb-tests.sh --self-test
 
+    # #344's client wrapper. Its real runs happen wherever the Regolith skin's
+    # tests run — this lane's tool loop below for Linux, ci.yml's
+    # `client-platforms` job for Windows and macOS — and this self-test proves
+    # that job's floor assertions still assert on every platform's behalf:
+    # vacuous zero-executed passes, thin runs, red-with-passes, logs with no
+    # result line at all, and another workspace's healthy suite standing in.
+    # Needs no client checkout and no display stack; well under a second.
+    run scripts/client-tests.sh --self-test
+
     # The two P4 scripts, which until now ran their self-tests only in
     # nightly.yml. That is where the cost of an uncovered self-test was
     # actually paid: `p4-ledger.sh --self-test` counted ledger lines with `wc
