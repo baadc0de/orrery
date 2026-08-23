@@ -299,12 +299,20 @@ data "aws_iam_policy_document" "compute_access" {
     effect  = "Allow"
     actions = ["ec2:RunInstances"]
 
-    resources = [
-      "arn:aws:ec2:*:${var.expected_account_id}:instance/*",
-      "arn:aws:ec2:*:${var.expected_account_id}:volume/*",
-      "arn:aws:ec2:*:${var.expected_account_id}:network-interface/*",
-      "arn:aws:ec2:*:${var.expected_account_id}:spot-instances-request/*",
-    ]
+    # **instance/* only.** RunInstances authorises every resource it touches
+    # separately, and `ec2:InstanceType` exists in the request context only for
+    # the instance itself. A statement carrying that condition therefore cannot
+    # match `volume/*`, `network-interface/*` or `spot-instances-request/*` --
+    # the key is absent, StringLike cannot match, the statement does not apply,
+    # and the launch dies on an implicit deny with an empty matchedStatements.
+    #
+    # That is not hypothetical: it is how #176's first live run failed. All 47
+    # candidates errored, including every family inside the allow-list, and the
+    # decoded authorization message read
+    #   action RunInstances, resource network-interface/*, matchedStatements {}
+    # The allow-list was never the problem; this statement simply did not reach
+    # the supporting resources.
+    resources = ["arn:aws:ec2:*:${var.expected_account_id}:instance/*"]
 
     # The candidate set: local-NVMe families measured in eu-central-1, sizes
     # wildcarded. Provenance and the widening procedure are documented on the
@@ -317,6 +325,42 @@ data "aws_iam_policy_document" "compute_access" {
 
     # Tag at creation or do not create. Every created resource type in the
     # controller's TagSpecifications carries this tag.
+    condition {
+      test     = "StringEquals"
+      variable = "aws:RequestTag/${local.ephemeral_tag_key}"
+      values   = [local.ephemeral_tag_value]
+    }
+
+    condition {
+      test     = "StringEquals"
+      variable = "aws:RequestedRegion"
+      values   = [var.region]
+    }
+  }
+
+  # ---------------------------------------------------------------------------
+  # The supporting resources a launch creates alongside the instance: its root
+  # volume, its ENI, and the spot request that asked for it.
+  #
+  # Same ownership tag, same region, and deliberately **no** `ec2:InstanceType`
+  # condition -- see the statement above for why including it here denies the
+  # whole launch. The type allow-list is not weakened by its absence: the
+  # instance itself is still gated on it by `LaunchTaggedInstance`, and
+  # `NoMetalSizes` denies outright, so no instance of an unlisted type can be
+  # created no matter what these resources permit. A volume or ENI cannot exist
+  # without an instance to attach to.
+  # ---------------------------------------------------------------------------
+  statement {
+    sid     = "LaunchTaggedSupportingResources"
+    effect  = "Allow"
+    actions = ["ec2:RunInstances"]
+
+    resources = [
+      "arn:aws:ec2:*:${var.expected_account_id}:volume/*",
+      "arn:aws:ec2:*:${var.expected_account_id}:network-interface/*",
+      "arn:aws:ec2:*:${var.expected_account_id}:spot-instances-request/*",
+    ]
+
     condition {
       test     = "StringEquals"
       variable = "aws:RequestTag/${local.ephemeral_tag_key}"
