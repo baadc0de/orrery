@@ -634,7 +634,9 @@ gate_p2_kill9_evidence() {
     instance_market: (.provisioning.market // null),
     journal_filesystem: (.provisioning.journal.filesystem // null),
     evidence_filesystem: (.provisioning.evidence.filesystem // null),
-    foundationdb_backing: (.provisioning.foundationdb.backing // null)
+    foundationdb_backing: (.provisioning.foundationdb.backing // null),
+    disk_min_free_bytes: (.disk_telemetry.min_free_bytes // null),
+    disk_samples: (.disk_telemetry.samples // null)
   } | with_entries(select(.value != null))' "$dir/artifact.json" 2>/dev/null || echo '{}')
   ev "$status" "$dir" "$numbers"
 }
@@ -970,11 +972,18 @@ collect() {
 #
 #   * NOT `p2-kill9`: since #313 its gate runs on an ephemeral EC2 instance,
 #     not the runner. The old runner-side sampler measured a filesystem the
-#     gate no longer writes to — dropping it was right, and re-adding it here
-#     would mislabel the controller's disk as if it were comparable with the
-#     nine lanes where runner and workload share a machine. Measuring the
-#     instance's NVMe from inside its bootstrap is a different shape entirely
-#     and is deliberately not attempted in this file.
+#     gate no longer writes to, and dropping it was right. As of #318 the
+#     instance-side figure supersedes the runner-side pair rather than joining
+#     it: the gate itself (`scripts/p2-kill9-gate.sh`) samples the journal
+#     filesystem — `$P2_GATE_DATA_DIR`, the instance-store NVMe — every 2 s
+#     for the life of the run and folds the low-water figure into
+#     `artifact.json`'s `disk_telemetry` block beside the fio job A numbers,
+#     which `gate_p2_kill9_evidence` reads from there. This list remains about
+#     the runner-side step pair only, so the job stays off it; the reverse
+#     direction below still refuses the pair if anyone re-adds it, because a
+#     controller-side sampler would again mislabel its disk as comparable with
+#     these nine lanes. The figure's existence is held by
+#     `p2-kill9-gate.sh --self-test`, not by this inventory.
 #   * NOT `compute-identity-smoke`: STS probes and one small report; kilobytes
 #     on a 10-minute job. A sampler there would read the runner image's
 #     baseline rather than any workload.
@@ -1408,7 +1417,10 @@ EOF
         device_qualification: {
           qualified: false, candidate_count: 47, qualified_count: 0, selected: null
         }
-      }
+      },
+      # #318: the instance-side free-disk figure rides the artifact at the top
+      # level, beside proofs — a condition-of-run record, not a proof.
+      disk_telemetry: {kind: "p2_journal_disk_telemetry", samples: 42, min_free_bytes: 123456789}
     }' >"$dir/out/p2-kill9-unqualified/artifact.json"
 
   # Dynamic scope gives the real evaluator synthetic prerequisites and a
@@ -1434,6 +1446,13 @@ EOF
     || die 'self-test: the unqualified P2 report lost its candidate count'
   grep -q 'qualification_qualified=0' <<<"$p2_projection" \
     || die 'self-test: the unqualified P2 report lost its zero-qualified count'
+  # #318: the instance-side low-water figure is read out of the artifact's own
+  # disk_telemetry block and rendered with the rest of the row's numbers —
+  # never re-derived here, and silently absent from artifacts that predate it.
+  grep -q 'disk_min_free_bytes=123456789' <<<"$p2_projection" \
+    || die 'self-test: the P2 row did not read the low-water disk figure from the artifact'
+  grep -q 'disk_samples=42' <<<"$p2_projection" \
+    || die 'self-test: the P2 row lost the disk sample count'
 
   # Spot loss is environmental, not a retryable test failure and not a gate
   # pass. The controller exits cleanly after bounded retries so it can retain

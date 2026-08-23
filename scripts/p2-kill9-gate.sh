@@ -91,6 +91,48 @@ print()
 PY
 }
 
+# Reduce the free-disk sample series into the stable record-only report. One
+# function because `--self-test` feeds it both populations it must distinguish:
+# an unsorted series whose true minimum is not its first value, and an empty
+# one, which is reported as absent rather than fabricated as zero. Record-only
+# (#171/#305/#318): no threshold lives anywhere near this value.
+reduce_disk_telemetry() {
+  python3 - "$1" "${2:-}" <<'PY'
+import json, pathlib, sys
+
+samples = []
+for token in pathlib.Path(sys.argv[1]).read_text(encoding='utf-8').split():
+    try:
+        value = int(token)
+    except ValueError:
+        continue
+    if value >= 0:
+        samples.append(value)
+
+report = {
+    'kind': 'p2_journal_disk_telemetry',
+    'method': 'df -B1 --output=avail',
+    'data_path': sys.argv[2],
+}
+if not samples:
+    report.update({
+        'samples': 0,
+        'min_free_bytes': None,
+        'max_free_bytes': None,
+        'reason': 'no samples collected',
+    })
+else:
+    report.update({
+        'samples': len(samples),
+        'min_free_bytes': min(samples),
+        'max_free_bytes': max(samples),
+        'reason': None,
+    })
+json.dump(report, sys.stdout, indent=2)
+print()
+PY
+}
+
 # This gate consumes its cluster. `activate_shards` bumps `actor/{shard}` on
 # every activation and `start_primary` asserts `--chain-epoch 1` against the
 # epoch that bump produces. Keep this before `--self-test`: the functional
@@ -109,6 +151,12 @@ refuse_an_already_activated_cluster() {
 if [[ ${1:-} == --reduce-device-qualification ]]; then
   [[ $# -eq 2 ]] || die 'usage: --reduce-device-qualification FIO_JSON'
   reduce_device_qualification "$2"
+  exit 0
+fi
+
+if [[ ${1:-} == --reduce-disk-telemetry ]]; then
+  [[ $# -ge 2 ]] || die 'usage: --reduce-disk-telemetry SAMPLES_FILE [JOURNAL_PATH]'
+  reduce_disk_telemetry "$2" "${3:-}"
   exit 0
 fi
 
@@ -162,6 +210,18 @@ if [[ ${1:-} == --self-test ]]; then
   runs 'run_device_qualification' || die 'self-test: D19 device preflight absent'
   has '--device-qualification "$qualification_artifact"' \
     || die 'self-test: dashboard is not given the device qualification'
+  # #318's instance-side free-disk telemetry, in three clauses because it can
+  # go missing three ways: never started (the sampler stage), started and left
+  # running into teardown (no stop), sampled but never folded into the artifact
+  # (reduction or fold dropped). Matched with operands attached where a bare
+  # name would also match the definition; `runs` matches only bare call lines,
+  # so a defined-and-never-run stage still fails.
+  runs 'start_disk_sampler' || die 'self-test: journal-filesystem free-disk sampler absent'
+  runs 'stop_disk_sampler' || die 'self-test: the free-disk sampler is started but never stopped'
+  has 'reduce_disk_telemetry "$disk_samples" "$data"' \
+    || die 'self-test: the free-disk sample series is never reduced'
+  has "'disk_telemetry': disk," \
+    || die 'self-test: the reduced disk report is not folded into the artifact'
   has "l.get('gate') != 'unqualified'" \
     || die 'self-test: unqualified latency report is not accepted as a non-verdict'
   # `persistd` has refused to start without an identity issuer key since
@@ -325,6 +385,38 @@ if required.get('sync_max_ms_below') != 1.0:
     raise SystemExit('self-test: D19 maximum requirement moved')
 PY
 
+  # Functional half of the free-disk reduction, through the same live function
+  # the remote host reaches as `--reduce-disk-telemetry`. The unsorted fixture
+  # is what catches a first-value minimum (500) standing in for the true
+  # low-water mark (200); the empty fixture is what catches a fabricated zero.
+  printf '%s\n' 500 300 400 200 350 >"$verdict_selftest_dir/disk-samples.txt"
+  disk_report=$(reduce_disk_telemetry "$verdict_selftest_dir/disk-samples.txt" /fixture-journal)
+  python3 - "$disk_report" <<'PY'
+import json, sys
+d = json.loads(sys.argv[1])
+if d.get('kind') != 'p2_journal_disk_telemetry':
+    raise SystemExit('self-test: the disk report lost its kind')
+if d.get('samples') != 5 or d.get('min_free_bytes') != 200 or d.get('max_free_bytes') != 500:
+    raise SystemExit(
+        f"self-test: the disk minimum clause produced min={d.get('min_free_bytes')} "
+        f"max={d.get('max_free_bytes')} across {d.get('samples')} samples"
+    )
+if d.get('reason') is not None:
+    raise SystemExit('self-test: a populated disk series reported a reason')
+if d.get('data_path') != '/fixture-journal':
+    raise SystemExit('self-test: the disk report lost the filesystem it sampled')
+PY
+  : >"$verdict_selftest_dir/disk-empty.txt"
+  disk_report=$(reduce_disk_telemetry "$verdict_selftest_dir/disk-empty.txt" /fixture-journal)
+  python3 - "$disk_report" <<'PY'
+import json, sys
+d = json.loads(sys.argv[1])
+if d.get('samples') != 0 or d.get('min_free_bytes') is not None:
+    raise SystemExit('self-test: an empty disk series was fabricated instead of reported absent')
+if d.get('reason') != 'no samples collected':
+    raise SystemExit("self-test: an empty disk series did not say why it carries no number")
+PY
+
   # Functional fresh-cluster refusal, with no live database. The fake fdbcli
   # returns one activation row; the LIVE preflight above must reject it and
   # name the reason. This guards more than the structural `runs` clause.
@@ -394,6 +486,39 @@ data=${P2_GATE_DATA_DIR:-"$out"}
 [[ $data == "$out" ]] || mkdir -p "$data"
 mkdir -p "$out" "$data/primary-data" "$data/follower-data"
 qualification_artifact="$out/device-qualification.json"
+
+# The journal filesystem's own headroom, sampled for the life of the gate.
+#
+# #171's samplers ran on the GitHub runner and measured the filesystem CI
+# happened to write scratch on. Since #313 this gate's writes land on the
+# ephemeral instance-store NVMe, so the sampler moved inside the gate (#318)
+# and samples `$data` — wherever the journals actually live, on any host. It
+# starts before the device qualification (whose own writes are part of the
+# run's footprint) and stops before the artifact is assembled. Record-only,
+# per #171/#293: no threshold, no exit, no verdict; an empty series reports
+# `no samples collected` rather than a fabricated number. The reduced report
+# travels inside artifact.json beside the fio job A figures, and leaves the
+# instance by the console envelope they already ride — nothing new to carry it.
+disk_samples="$out/free-bytes.txt"
+disk_report="$out/disk-telemetry.json"
+disk_sampler_pid=''
+start_disk_sampler() {
+  : >"$disk_samples"
+  (
+    while :; do
+      df -B1 --output=avail "$data" 2>/dev/null | tail -1
+      sleep 2
+    done
+  ) >>"$disk_samples" &
+  disk_sampler_pid=$!
+}
+stop_disk_sampler() {
+  [[ -n $disk_sampler_pid ]] || return 0
+  kill "$disk_sampler_pid" 2>/dev/null || true
+  wait "$disk_sampler_pid" 2>/dev/null || true
+  disk_sampler_pid=''
+}
+start_disk_sampler
 
 # D19's exact job-A shape: two 8 KiB write+fdatasync writers, each offered 470
 # operations/s for 120 seconds. It runs on the filesystem that will carry the
@@ -553,6 +678,7 @@ zombie_pid=''
 # property of the scenario, not of this script.
 shard_flags=()
 cleanup() {
+  stop_disk_sampler
   for pid in "$zombie_pid" "$primary_pid" "$follower_pid"; do
     [[ -n $pid ]] && kill "$pid" 2>/dev/null || true
   done
@@ -940,12 +1066,32 @@ cat "$out/load-before.jsonl" "$out/primary-metrics.jsonl" "$out/promoted-metrics
   --device-qualification "$qualification_artifact" \
   "$out/telemetry.jsonl" >"$out/latency-report.json"
 
-python3 - "$out/artifact.json" "$out/recovery-verification.json" "$out/latency-report.json" "$recovery_cutoff" "$out/retention.json" "$qualification_artifact" <<'PY'
+# Every proof is in; stop the sampler and fold its series into the artifact
+# before it is assembled. The stderr line is the only place the figure is
+# announced — like every other number here, it asserts nothing.
+stop_disk_sampler
+reduce_disk_telemetry "$disk_samples" "$data" >"$disk_report"
+python3 - "$disk_report" >&2 <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+if d.get('samples'):
+    print(
+        "disk telemetry: min_free_bytes {} across {} samples on {}".format(
+            d['min_free_bytes'], d['samples'], d['data_path']
+        ),
+        file=sys.stderr,
+    )
+else:
+    print(f"disk telemetry: {d.get('reason')}", file=sys.stderr)
+PY
+
+python3 - "$out/artifact.json" "$out/recovery-verification.json" "$out/latency-report.json" "$recovery_cutoff" "$out/retention.json" "$qualification_artifact" "$disk_report" <<'PY'
 import datetime,json,os,pathlib,sys
 artifact = pathlib.Path(sys.argv[1]); verification = pathlib.Path(sys.argv[2]); latency = pathlib.Path(sys.argv[3]); cutoff = sys.argv[4]
 v=json.loads(verification.read_text()); l=json.loads(latency.read_text())
 retention=json.loads(pathlib.Path(sys.argv[5]).read_text())
 qualification=json.loads(pathlib.Path(sys.argv[6]).read_text())
+disk=json.loads(pathlib.Path(sys.argv[7]).read_text())
 provisioning_path=os.environ.get('P2_GATE_PROVISIONING_JSON')
 provisioning=json.loads(pathlib.Path(provisioning_path).read_text()) if provisioning_path else None
 if not v.get('pass', False): raise SystemExit('recovery verifier returned a non-pass report')
@@ -984,7 +1130,7 @@ artifact.write_text(json.dumps({
   'kind':'p2_two_process_kill9_gate',
   'created_at':datetime.datetime.now(datetime.timezone.utc).isoformat(),
   'result':result, 'recovery_cutoff':cutoff,
-  'provisioning': provisioning,
+  'provisioning': provisioning, 'disk_telemetry': disk,
   'proofs': {'recovery': v, 'latency': l, 'zombie_primary_fenced': True,
              'bumped_chain_epoch_refused': True, 'retention': retention,
              'device_qualification': qualification},
