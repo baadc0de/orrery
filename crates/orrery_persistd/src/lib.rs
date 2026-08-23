@@ -27,6 +27,7 @@
 pub mod actor;
 pub mod adjudication;
 pub mod audit;
+pub mod census;
 pub mod checkpoint;
 pub mod cluster;
 mod crc;
@@ -50,6 +51,9 @@ pub use actor::{
     Tombstone,
 };
 pub use adjudication::{AdjudicationExecutor, RETAINED_BUILDS};
+#[cfg(feature = "fdb")]
+pub use census::{scan_fdb as scan_world_census_fdb, DEFAULT_PAGE_ROWS};
+pub use census::{GridWorldCensus, WorldCensus};
 pub use checkpoint::{
     spawn_checkpoint_scheduler, spawn_checkpoint_scheduler_direct, CheckpointCause,
     CheckpointConfig, CheckpointData, CheckpointError, CheckpointScheduler, CheckpointStore,
