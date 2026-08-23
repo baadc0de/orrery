@@ -196,8 +196,8 @@ mod tests {
 
     #[test]
     fn paging_observes_every_range_before_advancing_the_cursor() {
-        let first = vec![(key(1, 1).to_vec(), framed_value(1))];
-        let second = vec![
+        let first = [(key(1, 1).to_vec(), framed_value(1))];
+        let second = [
             (key(1, 2).to_vec(), framed_value(2)),
             (key(2, 3).to_vec(), keyspace::encode_live_value(b"opaque")),
         ];
