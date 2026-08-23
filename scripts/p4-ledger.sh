@@ -12,12 +12,12 @@
 # ── What a line is evidence of ───────────────────────────────────────────────
 #
 # `RunIdentity` — seed, the full impairment profile, target triple, commit — is
-# what makes two runs the same run, and it is the dedup key verbatim. A re-run
-# of a night that already banked adds nothing; a run with a different seed, or
-# at a different point of the loss band, is a different line. The identity
-# carries no wall clock on purpose (`--stamp-wall-clock` puts that outside it),
-# which is exactly what makes the key stable across a re-dispatch of the same
-# nightly rather than making every dispatch look new.
+# provenance for one run. It is the append key, so restoring a shard or
+# re-dispatching the exact same run adds no second line. The criterion counts
+# measurements, however: pipeline digest + seed + impairment + target. A
+# re-measurement at a different commit of the same pipeline keeps its useful
+# provenance line but must not add a second hour of evidence. The identity
+# carries no wall clock on purpose (`--stamp-wall-clock` puts that outside it).
 #
 # Hours are only comparable within a pipeline version, so every line also
 # carries a `pipeline` digest: the git tree hashes of `orrery_witness`,
@@ -71,8 +71,8 @@ self_test() {
   body="$(sed -n '/^readonly ROOT=/,$p' "$0" | grep -v '^[[:space:]]*#')"
   has() { grep -Fq -- "$1" <<<"$body"; }
 
-  has '.identity' \
-    || die 'self-test: the dedup key is no longer the run identity'
+  has 'measurement_key' \
+    || die 'self-test: the measurement key is gone; a re-measurement could count as a second hour'
   has 'witnessing' \
     || die 'self-test: an unwitnessed run is no longer refused; it would bank hours no witness watched'
   has 'total_false_positives' \
@@ -90,7 +90,9 @@ self_test() {
   has 'flock' \
     || die 'self-test: the append is no longer serialized'
   has 'unique_by(.run_key)' \
-    || die 'self-test: total no longer dedups across shards; a restored shard would double its hours'
+    || die 'self-test: total no longer dedups provenance across shards; a restored shard would double its hours'
+  has 'unique_by(measurement)' \
+    || die 'self-test: total no longer counts distinct measurements; a re-measurement would double its hours'
   has 'def platform' \
     || die 'self-test: the target-to-platform fold is gone; the criterion is counted per platform'
   has 'MISSING' \
@@ -144,10 +146,25 @@ self_test() {
   st_bank 1 '' || die 'self-test: a duplicate was reported as a failure rather than skipped'
   [[ $(st_lines) == 1 ]] || die 'self-test: the same run identity banked twice'
 
-  # A different seed is a different run, and that is the whole point of the
-  # sweep in p4-accumulate.sh.
+  # A re-measurement at another commit is useful provenance but not another
+  # measured hour: the pipeline, seed, impairment and target have not changed.
+  st_bank 1 '.identity.commit = "1111111111111111111111111111111111111111"' \
+    || die 'self-test: a re-measurement on another commit was refused'
+  [[ $(st_lines) == 2 ]] || die 'self-test: a re-measurement did not keep its provenance line'
+
+  local total
+  total="$("$0" total | grep -F 'pipeline selftestpipeline  target x86_64-unknown-linux-gnu' | head -1)"
+  grep -q 'banked_runs 2.*measurements 1.*distinct_hours 32' <<<"$total" \
+    || die "self-test: one measurement at two commits did not count as 32 distinct hours ('$total')"
+
+  # A different seed is a different measurement, and that is the whole point of
+  # the sweep in p4-accumulate.sh. This guards the measurement-key call site:
+  # dropping seed from it makes this check fail even though both lines append.
   st_bank 2 '' || die 'self-test: a second seed was refused'
-  [[ $(st_lines) == 2 ]] || die 'self-test: a distinct seed did not append a distinct line'
+  [[ $(st_lines) == 3 ]] || die 'self-test: a distinct seed did not append a distinct line'
+  total="$("$0" total | grep -F 'pipeline selftestpipeline  target x86_64-unknown-linux-gnu' | head -1)"
+  grep -q 'banked_runs 3.*measurements 2.*distinct_hours 64' <<<"$total" \
+    || die "self-test: two distinct seeds did not count as 64 distinct hours ('$total')"
 
   # Each of these is a run that must add no hours at all. The count is checked
   # as well as the exit status: a refusal that has already written the line is
@@ -171,12 +188,6 @@ self_test() {
       || die "self-test: a refused run ('$refusal') still touched the ledger"
   done
 
-  # And the total is a sum of what was banked, scoped to its pipeline.
-  local total
-  total="$("$0" total | grep -F 'pipeline selftestpipeline' | head -1)"
-  grep -q 'hours 64' <<<"$total" \
-    || die "self-test: two banked 32-hour runs did not total 64 ('$total')"
-
   # ── The platform half of the criterion ────────────────────────────────────
   #
   # Two hours on one platform are not the criterion's hours however many there
@@ -195,9 +206,9 @@ self_test() {
   st_bank 5 '.identity.target = "aarch64-apple-darwin"' \
     || die 'self-test: a macOS-target run was refused'
   view="$("$0" total 2>&1)"
-  grep -q 'windows: 32 hours (x86_64-pc-windows-msvc)' <<<"$view" \
+  grep -q 'windows: 32 distinct hours (1 measurement(s), 32 banked; x86_64-pc-windows-msvc)' <<<"$view" \
     || die "self-test: hours on a Windows target were not attributed to the windows platform ('$view')"
-  grep -q 'macos: 32 hours (aarch64-apple-darwin)' <<<"$view" \
+  grep -q 'macos: 32 distinct hours (1 measurement(s), 32 banked; aarch64-apple-darwin)' <<<"$view" \
     || die "self-test: hours on aarch64-apple-darwin were not attributed to the macos platform ('$view')"
   grep -q 'all 3 platforms the criterion names have banked hours' <<<"$view" \
     || die "self-test: a ledger covering all three platforms did not say so ('$view')"
@@ -227,19 +238,14 @@ self_test() {
   diff <(echo "$view") <(echo "$doubled") >/dev/null \
     || die "self-test: concatenating a shard with itself changed the totals; run_key dedup is not applied"
 
-  # The dedup key is the *whole* run identity and not the seed inside it. This
-  # is the one clause the structural half genuinely cannot see: `has '.identity'`
-  # matches `.identity.seed` too, measured 2026-08-17 — narrowing the key that
-  # far left every case above green. It matters because the three platform legs
-  # deliberately run the same seed on the same night
-  # (scripts/p4-accumulate.sh), so a seed-only key would bank whichever runner
-  # finished first and silently drop the other two platforms' hours. Last,
+  # The measurement key includes its target, rather than collapsing the three
+  # platform legs that deliberately run the same seed on the same night. Last,
   # because it adds a line the shard comparison above is holding still.
   before=$(st_lines)
   st_bank 1 '.identity.target = "x86_64-pc-windows-msvc"' \
     || die 'self-test: the same seed run on a second platform was refused'
   (( $(st_lines) == before + 1 )) \
-    || die 'self-test: one seed on two targets banked once; the dedup key is not the run identity'
+    || die 'self-test: one seed on two targets banked once; the measurement key lost its target'
 
   rm -rf "$dir"
   trap - EXIT
@@ -365,14 +371,21 @@ cmd_append() {
   awk -v h="$hours" 'BEGIN { exit !(h > 0) }' \
     || die "refusing to bank: the run accumulated $hours player-hours"
 
-  local commit key pipeline seed target
+  local commit key measurement_key pipeline seed target
   commit=$(jq -r '.identity.commit // "unknown"' "$report")
   seed=$(jq -r '.identity.seed' "$report")
   target=$(jq -r '.identity.target' "$report")
-  # The identity verbatim, canonicalized so that key stability does not depend
-  # on the field order serde happens to emit.
+  # `run_key` is provenance for an individual run. It intentionally includes
+  # commit, so an independently re-run report is retained for reproducibility.
   key=$(jq -cS '.identity' "$report" | sha256_hex | cut -c1-16)
   pipeline=$(pipeline_id "$commit")
+  # P4's denominator is measurements rather than runs. The digest is the
+  # comparable-pipeline boundary; within it, these are the seeded inputs that
+  # choose a simulated hour. Canonicalize before hashing so JSON field order
+  # cannot alter the count.
+  measurement_key=$(jq -cS --arg pipeline "$pipeline" \
+    '{pipeline: $pipeline, seed: .identity.seed, impairment: .identity.impairment,
+      target: .identity.target}' "$report" | sha256_hex | cut -c1-16)
 
   mkdir -p "$(dirname "$LEDGER")"
   # One writer at a time. The nightly is a single job today, and a ledger whose
@@ -386,11 +399,13 @@ cmd_append() {
 
   jq -c \
     --arg key "$key" \
+    --arg measurement_key "$measurement_key" \
     --arg pipeline "$pipeline" \
     --arg banked_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
     '{
       schema: 1,
       run_key: $key,
+      measurement_key: $measurement_key,
       pipeline: $pipeline,
       banked_at: $banked_at,
       seed: .identity.seed,
@@ -407,7 +422,7 @@ cmd_append() {
       shed: .total_shed
     }' "$report" >> "$LEDGER"
 
-  note "banked $hours player-hours: run_key $key, seed $seed, loss $loss, target $target, pipeline $pipeline"
+  note "banked $hours player-hours: run_key $key, measurement_key $measurement_key, seed $seed, loss $loss, target $target, pipeline $pipeline"
 }
 
 # The criterion's figure, and the thing `total` is progress against.
@@ -415,18 +430,24 @@ readonly HOURS_GOAL=500
 
 # Shared between all three views below.
 #
-#   * `banked` — `append` refuses a duplicate within one ledger file and cannot
+#   * `banked` — `append` refuses a duplicate provenance run within one ledger file and cannot
 #     see across files. The nightly banks on three runners now, each keeping its
 #     own shard artifact, and `total` is run over the concatenation; without this
 #     a shard downloaded twice would double every hour it holds. `run_key` is the
-#     run identity verbatim, so the de-duplication here is the same one `append`
-#     performs and not a looser one.
+#     run identity verbatim, so this is the same de-duplication `append` performs.
+#   * `distinct` — the criterion's denominator. Multiple provenance runs can
+#     re-measure one deterministic hour; `measurement_key` collapses those on
+#     pipeline + seed + impairment + target. Old ledger lines predate that field,
+#     so their equivalent canonical tuple is used while they remain readable.
 #   * `platform` — the report stamps a target *triple*; the criterion speaks of
 #     *platforms*. aarch64 and x86_64 macOS are one platform and two triples. The
 #     per-triple lines keep the distinction visible; this fold is what the
 #     criterion is actually counted against.
 readonly JQ_PRELUDE='
   def banked: unique_by(.run_key);
+  def measurement:
+    (.measurement_key // ([.pipeline, .seed, .impairment, .target] | tojson));
+  def distinct: banked | unique_by(measurement);
   # serde emits 32.0 where the swarm accumulated exactly 32 hours, and jq keeps
   # the literal. A ledger read by a human should not print two spellings of the
   # same number next to each other.
@@ -444,28 +465,35 @@ cmd_total() {
 
   # Grouped by pipeline *and* target, and never summed across the first: hours
   # are only comparable within a pipeline version, and the criterion's "across
-  # all three platforms" is a statement about the second.
+  # all three platforms" is a statement about the second. Show provenance and
+  # measurement counts together so a re-measurement cannot masquerade as a new
+  # hour of evidence.
   jq -rs "$JQ_PRELUDE"'
     banked
     | group_by(.pipeline + " " + .target)
     | map({
         pipeline: .[0].pipeline,
         target: .[0].target,
-        runs: length,
-        hours: (map(.player_hours) | add | hrs),
+        banked_runs: length,
+        banked_hours: (map(.player_hours) | add | hrs),
+        measurements: (unique_by(measurement) | length),
+        distinct_hours: (unique_by(measurement) | map(.player_hours) | add | hrs),
         commits: (map(.commit[0:12]) | unique | length)
       })
     | sort_by(.pipeline, .target)[]
-    | "pipeline \(.pipeline)  target \(.target)  runs \(.runs)  commits \(.commits)  hours \(.hours)"
+    | "pipeline \(.pipeline)  target \(.target)  banked_runs \(.banked_runs)  commits \(.commits)  measurements \(.measurements)  distinct_hours \(.distinct_hours)  banked_hours \(.banked_hours)"
   ' "$LEDGER"
 
   jq -rs "$JQ_PRELUDE"'
-    banked
-    | "— " + (length | tostring) + " banked run(s), "
-    + (map(.player_hours) | add | hrs | tostring) + " player-hours in total; "
-    + (map(.target) | unique | length | tostring) + " target(s), "
-    + (map(.target | platform) | unique | length | tostring) + " platform(s), "
-    + (map(.pipeline) | unique | length | tostring) + " pipeline version(s)"
+    banked as $banked
+    | distinct as $distinct
+    | "— " + ($banked | length | tostring) + " banked provenance run(s), "
+    + ($banked | map(.player_hours) | add | hrs | tostring) + " banked player-hours; "
+    + ($distinct | length | tostring) + " distinct measurement(s), "
+    + ($distinct | map(.player_hours) | add | hrs | tostring) + " distinct player-hours across pipeline versions (not a figure against the 500); "
+    + ($banked | map(.target) | unique | length | tostring) + " target(s), "
+    + ($banked | map(.target | platform) | unique | length | tostring) + " platform(s), "
+    + ($banked | map(.pipeline) | unique | length | tostring) + " pipeline version(s)"
   ' "$LEDGER"
 
   # ── Progress, per platform, because that is the shape of the criterion ──────
@@ -482,23 +510,33 @@ cmd_total() {
   # 500 in total with every platform represented or 500 apiece; this prints both
   # halves and leaves the reading to the record rather than inventing a gate.
   jq -rs --argjson goal "$HOURS_GOAL" "$JQ_PRELUDE"'
-    banked
+    banked as $banked
+    | distinct
     | group_by(.pipeline)
-    | map({
+    | map(. as $measurements | {
         p: .[0].pipeline,
+        measurements: length,
         h: (map(.player_hours) | add | hrs),
+        terms: (map(.player_hours | tostring) | join(" + ")),
+        banked: ($banked | map(select(.pipeline == $measurements[0].pipeline))),
         by: (group_by(.target | platform)
-             | map({ k: (.[0].target | platform),
+             | map(. as $platform_measurements | {
+                     k: (.[0].target | platform),
                      h: (map(.player_hours) | add | hrs),
+                     measurements: length,
+                     banked_h: ($banked
+                                | map(select(.pipeline == $platform_measurements[0].pipeline
+                                             and ((.target | platform) == ($platform_measurements[0].target | platform))))
+                                | map(.player_hours) | add | hrs),
                      triples: (map(.target) | unique | join(", ")) }))
       })
     | sort_by(-.h)[]
     | . as $g
-    | "  pipeline \($g.p): \($g.h) of \($goal) hours (\(($g.h * 100 / $goal) | floor)%)",
+    | "  pipeline \($g.p): \($g.h) distinct hours = \($g.terms) (\($g.measurements) distinct measurement(s)); \($g.banked | length) provenance run(s) / \($g.banked | map(.player_hours) | add | hrs) banked hours; \($g.h) of \($goal) hours (\(($g.h * 100 / $goal) | floor)%)",
       ( ["linux", "windows", "macos"]
         | map(. as $want | { k: $want, hit: ($g.by | map(select(.k == $want)) | first) })
         | map(if .hit
-              then "    \(.k): \(.hit.h) hours (\(.hit.triples))"
+              then "    \(.k): \(.hit.h) distinct hours (\(.hit.measurements) measurement(s), \(.hit.banked_h) banked; \(.hit.triples))"
               else "    \(.k): 0 hours — MISSING, and the criterion names it"
               end)[] ),
       ( ($g.by | map(select(.k == "other")) | .[]
