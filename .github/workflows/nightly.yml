@@ -968,66 +968,39 @@ jobs:
   p2-kill9:
     name: P2 kill-9 gate (FoundationDB)
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    # The role credential lasts 60 minutes. Stop the job at 55 so the final
+    # tagged teardown still has a five-minute credential window.
+    timeout-minutes: 55
+    permissions:
+      contents: read
+      id-token: write
     steps:
       - uses: actions/checkout@v7
-      # #171's free-disk sampler, record-only — same loop as the other FDB
-      # jobs in this file; see the note on `p3-siblings`.
-      - name: Start the free-disk sampler
-        run: |
-          set -euo pipefail
-          nohup bash -c 'while :; do df -B1 --output=avail / | tail -1; sleep 2; done' \
-            > "$RUNNER_TEMP/avail.txt" 2>/dev/null &
-          echo "sampling free bytes on / every 2 s into $RUNNER_TEMP/avail.txt"
-      - name: Install the pinned toolchain
-        run: rustup show active-toolchain || rustup toolchain install
-      - uses: actions/cache@v6
-        with:
-          path: |
-            ~/.cargo/registry/index
-            ~/.cargo/registry/cache
-            ~/.cargo/git/db
-            target
-          key: nightly-p2-${{ hashFiles('Cargo.toml', 'crates/*/Cargo.toml', 'vendor/*/Cargo.toml', 'rust-toolchain.toml') }}
-          restore-keys: nightly-p2-
 
-      # FoundationDB 7.3.x per D11/D14: the client provides libfdb_c and the
-      # headers orrery_persistd links under the `fdb` feature, the server the
-      # single-node cluster the gate writes to.
-      - name: Install FoundationDB with a local cluster
-        uses: ./.github/actions/foundationdb
-        with:
-          server: "true"
+      # The one credential path #173 built. Its trust policy accepts only
+      # refs/heads/main, so this scheduled/manual-on-main job can launch while
+      # no pull_request job can ever acquire the credential.
+      - uses: ./.github/actions/aws-compute-role
 
-      # `orrery-seed` seeds the durable world the gate then writes to, and the
-      # gate's tool check requires the binary before it does anything at all —
-      # so it is built here, not left to the gate to discover missing. Its
-      # `fdb` feature is what compiles `apply`/`verify` (the `plan` verb needs
-      # no C client), and the feature is spelled `orrery_seed/fdb` because
-      # `-p` selects the package while `--features` resolves against the
-      # workspace root.
-      - name: Build the fdb-enabled binaries
-        run: |
-          set -euo pipefail
-          cargo build --release -p orrery_persistd --features fdb
-          cargo build --release -p orrery_seed --features orrery_seed/fdb
-
-      - name: Build the load rig and dashboard
-        run: |
-          set -euo pipefail
-          # p2-load and p2-dashboard carry their own [workspace] tables and are
-          # excluded from the root workspace, so each builds on its own.
-          (cd p2-load && cargo build --release)
-          (cd p2-dashboard && cargo build --release)
-
-      - name: Run the kill-9 gate
+      # Discovery is capability-first: every 8-vCPU type reporting required
+      # local NVMe is measured with D19's full 120-second fio job A. Losers and
+      # interruptions stay in candidate-qualification.{json,csv}. Only after
+      # that table exists does the controller select a measured x86_64 winner
+      # (the pinned FoundationDB package is amd64), then launch a DIFFERENT
+      # spot instance and qualify its actual device again before the gate.
+      - name: Discover, qualify, and run on an ephemeral instance
         env:
-          ORRERY_FDB_CLUSTER_FILE: /etc/foundationdb/fdb.cluster
-          PERSISTD_BIN: ${{ github.workspace }}/target/release/persistd
-          P2_LOAD_BIN: ${{ github.workspace }}/p2-load/target/release/p2-load
-          P2_DASHBOARD_BIN: ${{ github.workspace }}/p2-dashboard/target/release/p2-dashboard
-          ORRERY_SEED_BIN: ${{ github.workspace }}/target/release/orrery-seed
-        run: scripts/p2-kill9-gate.sh
+          P2_EPHEMERAL_INSTANCE_IDS: ${{ runner.temp }}/p2-ephemeral-instance-ids
+        run: python3 infra/p2-ephemeral.py run
+
+      # Belt and suspenders with the controller's signal trap/finally block.
+      # `always()` covers an ordinary failed stage and GitHub cancellation;
+      # the ownership-tag condition makes a stale/unrelated id non-destructive.
+      - name: Terminate every instance recorded by this run
+        if: always()
+        env:
+          P2_EPHEMERAL_INSTANCE_IDS: ${{ runner.temp }}/p2-ephemeral-instance-ids
+        run: python3 infra/p2-ephemeral.py teardown
 
       - name: Upload the gate's evidence
         if: always()
@@ -1037,23 +1010,6 @@ jobs:
           path: p2-kill9-*/
           retention-days: 14
           if-no-files-found: warn
-
-      - name: Disk report
-        if: always()
-        run: |
-          set -euo pipefail
-          {
-            echo '### Free disk at peak'
-            echo '```'
-            df -h /
-            if [[ -s "${RUNNER_TEMP:-}/avail.txt" ]]; then
-              echo "min_free_bytes     $(sort -n "${RUNNER_TEMP:-}/avail.txt" | head -1)"
-              echo "df_samples         $(wc -l < "${RUNNER_TEMP:-}/avail.txt")"
-            else
-              echo 'no samples collected'
-            fi
-            echo '```'
-          } | tee -a "$GITHUB_STEP_SUMMARY"
 
   compute-identity-smoke:
     name: cloud identity smoke (assume orrery-ci-compute via OIDC)

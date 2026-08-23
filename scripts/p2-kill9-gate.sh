@@ -36,6 +36,7 @@ required = {
     'reference_sync_p99_ms': 0.185,
     'reference_sync_max_ms': 0.509,
 }
+
 jobs = []
 for raw_job in raw.get('jobs', []):
     sync = raw_job.get('sync', {}).get('lat_ns', {})
@@ -89,6 +90,27 @@ json.dump({
 print()
 PY
 }
+
+# This gate consumes its cluster. `activate_shards` bumps `actor/{shard}` on
+# every activation and `start_primary` asserts `--chain-epoch 1` against the
+# epoch that bump produces. Keep this before `--self-test`: the functional
+# refusal fixture below exercises this exact live function.
+refuse_an_already_activated_cluster() {
+  command -v fdbcli >/dev/null 2>&1 || {
+    note 'fdbcli not on PATH; skipping the fresh-cluster pre-flight'
+    return 0
+  }
+  local rows
+  rows=$(timeout 30 fdbcli -C "$ORRERY_FDB_CLUSTER_FILE" --exec 'getrangekeys a b 1' 2>/dev/null \
+    | grep -c '^`') || true
+  [[ ${rows:-0} -eq 0 ]] || die "this cluster already carries an actor/ activation row from an earlier run, and the primary below asserts --chain-epoch 1 against a fence that only ever moves forward; point ORRERY_FDB_CLUSTER_FILE at a fresh cluster"
+}
+
+if [[ ${1:-} == --reduce-device-qualification ]]; then
+  [[ $# -eq 2 ]] || die 'usage: --reduce-device-qualification FIO_JSON'
+  reduce_device_qualification "$2"
+  exit 0
+fi
 
 if [[ ${1:-} == --self-test ]]; then
   # Offline guard: useful in CI images without FDB or release binaries.  Keep
@@ -302,6 +324,26 @@ if measured.get('worst_sync_max_ms') != 104.12:
 if required.get('sync_max_ms_below') != 1.0:
     raise SystemExit('self-test: D19 maximum requirement moved')
 PY
+
+  # Functional fresh-cluster refusal, with no live database. The fake fdbcli
+  # returns one activation row; the LIVE preflight above must reject it and
+  # name the reason. This guards more than the structural `runs` clause.
+  mkdir -p "$verdict_selftest_dir/bin"
+  printf '%s\n' '#!/usr/bin/env bash' "printf '\`actor/fixture\` is 1\\n'" \
+    >"$verdict_selftest_dir/bin/fdbcli"
+  chmod +x "$verdict_selftest_dir/bin/fdbcli"
+  : >"$verdict_selftest_dir/fdb.cluster"
+  if ( PATH="$verdict_selftest_dir/bin:$PATH" \
+      ORRERY_FDB_CLUSTER_FILE="$verdict_selftest_dir/fdb.cluster" \
+      refuse_an_already_activated_cluster ) 2>"$verdict_selftest_dir/fresh.stderr"; then
+    die 'self-test: already-activated cluster was not refused'
+  fi
+  grep -Fq 'already carries an actor/ activation row' "$verdict_selftest_dir/fresh.stderr" \
+    || die 'self-test: fresh-cluster refusal did not name the activation row'
+
+  # #176's cloud controller is reached through this already-per-commit
+  # self-test, so its guarded stages cannot become an unrun self-test.
+  python3 "$repo_root/infra/p2-ephemeral.py" self-test
   echo 'self-test: two-process proof stages present'
   exit 0
 fi
@@ -323,9 +365,7 @@ for tool in "$PERSISTD_BIN" "$P2_LOAD_BIN" "$P2_DASHBOARD_BIN" "$ORRERY_SEED_BIN
 done
 [[ -r $P2_SCENARIO ]] || die "seed scenario is not readable: $P2_SCENARIO"
 
-# This gate consumes its cluster. `activate_shards` bumps `actor/{shard}` on
-# every activation and `start_primary` asserts `--chain-epoch 1` against the
-# epoch that bump produces, so a second run against the same FDB cannot get
+# A second run against the same FDB cannot get
 # past startup — it dies with `--chain-epoch 1 is an assertion; FDB fence
 # activation would produce epoch 2`, or, if the promoted node still owns the
 # shard, `owned by node 2 at epoch 2`. Both are true statements about the
@@ -333,16 +373,6 @@ done
 # a full debugging pass on 2026-08-17. CI gets a fresh cluster per job and
 # never sees this. Advisory only: without `fdbcli` the run proceeds exactly as
 # it did before.
-refuse_an_already_activated_cluster() {
-  command -v fdbcli >/dev/null 2>&1 || {
-    note 'fdbcli not on PATH; skipping the fresh-cluster pre-flight'
-    return 0
-  }
-  local rows
-  rows=$(timeout 30 fdbcli -C "$ORRERY_FDB_CLUSTER_FILE" --exec 'getrangekeys a b 1' 2>/dev/null \
-    | grep -c '^`') || true
-  [[ ${rows:-0} -eq 0 ]] || die "this cluster already carries an actor/ activation row from an earlier run, and the primary below asserts --chain-epoch 1 against a fence that only ever moves forward; point ORRERY_FDB_CLUSTER_FILE at a fresh cluster"
-}
 refuse_an_already_activated_cluster
 
 out=${P2_GATE_OUT:-"$(pwd)/p2-kill9-$(date -u +%Y%m%dT%H%M%SZ)"}
@@ -911,11 +941,13 @@ cat "$out/load-before.jsonl" "$out/primary-metrics.jsonl" "$out/promoted-metrics
   "$out/telemetry.jsonl" >"$out/latency-report.json"
 
 python3 - "$out/artifact.json" "$out/recovery-verification.json" "$out/latency-report.json" "$recovery_cutoff" "$out/retention.json" "$qualification_artifact" <<'PY'
-import datetime,json,pathlib,sys
+import datetime,json,os,pathlib,sys
 artifact = pathlib.Path(sys.argv[1]); verification = pathlib.Path(sys.argv[2]); latency = pathlib.Path(sys.argv[3]); cutoff = sys.argv[4]
 v=json.loads(verification.read_text()); l=json.loads(latency.read_text())
 retention=json.loads(pathlib.Path(sys.argv[5]).read_text())
 qualification=json.loads(pathlib.Path(sys.argv[6]).read_text())
+provisioning_path=os.environ.get('P2_GATE_PROVISIONING_JSON')
+provisioning=json.loads(pathlib.Path(provisioning_path).read_text()) if provisioning_path else None
 if not v.get('pass', False): raise SystemExit('recovery verifier returned a non-pass report')
 if qualification.get('qualified'):
     if l.get('gate') != 'pass': raise SystemExit('latency dashboard returned a non-pass report on a qualified device')
@@ -952,6 +984,7 @@ artifact.write_text(json.dumps({
   'kind':'p2_two_process_kill9_gate',
   'created_at':datetime.datetime.now(datetime.timezone.utc).isoformat(),
   'result':result, 'recovery_cutoff':cutoff,
+  'provisioning': provisioning,
   'proofs': {'recovery': v, 'latency': l, 'zombie_primary_fenced': True,
              'bumped_chain_epoch_refused': True, 'retention': retention,
              'device_qualification': qualification},
