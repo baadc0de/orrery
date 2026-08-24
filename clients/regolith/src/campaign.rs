@@ -633,10 +633,8 @@ impl CampaignRuntime {
             // exactly that one tag. The exterior leg bypasses aeronet, so the
             // client frames here — mirroring what a bot's session.send holds,
             // which is what the runner drains and the host expects.
-            let framed = orrery_protocol::channels::tag(
-                orrery_protocol::channels::Channel::State,
-                &payload,
-            );
+            let framed =
+                orrery_protocol::channels::tag(orrery_protocol::channels::Channel::State, &payload);
             for recipient in 0..self.config.slot {
                 let datagram = UplinkDatagram {
                     sequence: self.uplink_sequence,
