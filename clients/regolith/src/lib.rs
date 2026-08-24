@@ -4,10 +4,12 @@
 #![warn(missing_docs)]
 
 pub mod assets;
+pub mod campaign;
 pub mod combat;
 pub mod craft;
 pub mod hud;
 pub mod intent;
+pub mod net;
 pub mod session;
 pub mod telemetry;
 
@@ -15,7 +17,7 @@ pub mod telemetry;
 pub const BUILD_REV: &str = env!("ORRERY_BUILD_REV");
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use assets::VisualAssetPaths;
@@ -23,14 +25,14 @@ use bevy::prelude::*;
 use bevy::time::common_conditions::on_timer;
 use combat::{CombatView, LockBreak, ProjectileTracks, ShotFeedback};
 use intent::{decode_packet, Controls, IntentPipeline};
-use orrery_core::Executor;
+use orrery_core::{Executor, TICK_NANOS};
 use orrery_games::{
     regolith::archetype::Archetype,
     regolith::order::{Order, Outcome},
     regolith::state::RegolithState,
     Game, Regolith,
 };
-use orrery_protocol::{PersistId, Tick, UniverseSeed};
+use orrery_protocol::{CellId, PersistId, Tick, UniverseSeed};
 use telemetry::{JsonlTelemetry, OverlayMetrics};
 
 const PLAYER: PersistId = PersistId::new(1);
@@ -60,9 +62,15 @@ struct MetricWindow {
 }
 
 /// A playable local authority using only the shared headless executor.
+///
+/// **Offline and smoke use only — never a campaign path.** Nothing this
+/// session runs produces campaign evidence: no join happened, so no link was
+/// measured, and a banked hour requires the joined-session state machine
+/// ([`campaign::CampaignRuntime`]) to have run.
 #[derive(Resource)]
-struct LocalSession {
-    executor: Executor<Regolith>,
+pub struct LocalSession {
+    /// The in-process executor holding both seats of the offline duel.
+    pub executor: Executor<Regolith>,
     human: IntentPipeline,
     bot: IntentPipeline,
     pending: BTreeMap<PersistId, Vec<Order>>,
@@ -85,16 +93,73 @@ impl Default for LocalSession {
     }
 }
 
+/// Which world the skin renders against.
+///
+/// Exactly one of these exists per run. [`ActiveSession::Local`] is the
+/// offline path; [`ActiveSession::Campaign`] is #386's joined path, whose
+/// orders flow through the same [`IntentPipeline::human_packet`] and whose
+/// replicated state arrives on slice 1's wire surface. Input source and
+/// rendering are the only deltas between them (#320 constraint 3), which is
+/// why both arms below call the same pipeline and step the same executor.
+#[derive(Resource)]
+pub enum ActiveSession {
+    /// Offline in-process executor; smoke tests and keyboard play.
+    Local(Box<LocalSession>),
+    /// Joined to an island host over iroh.
+    Campaign(Box<campaign::CampaignRuntime>),
+}
+
+impl ActiveSession {
+    /// The executor holding rendered state (local authority or replicated).
+    #[must_use]
+    pub fn executor(&self) -> &Executor<Regolith> {
+        match self {
+            Self::Local(local) => &local.executor,
+            Self::Campaign(runtime) => runtime.executor(),
+        }
+    }
+
+    /// The craft the keyboard drives.
+    #[must_use]
+    pub fn local_entity(&self) -> PersistId {
+        match self {
+            Self::Local(_) => PLAYER,
+            Self::Campaign(runtime) => runtime.entity(),
+        }
+    }
+
+    /// The remote craft the duel view follows, when one is known.
+    #[must_use]
+    pub fn focus_entity(&self) -> Option<PersistId> {
+        match self {
+            Self::Local(_) => Some(OPPONENT),
+            Self::Campaign(runtime) => runtime.focus(),
+        }
+    }
+}
+
 /// Installs the thin skin after Bevy's [`DefaultPlugins`].
 pub struct RegolithSkinPlugin {
     telemetry_path: PathBuf,
+    campaign: Option<campaign::CampaignConfig>,
 }
 
 impl RegolithSkinPlugin {
     /// Configure the append-only overlay stream.
     #[must_use]
     pub fn new(telemetry_path: PathBuf) -> Self {
-        Self { telemetry_path }
+        Self {
+            telemetry_path,
+            campaign: None,
+        }
+    }
+
+    /// Join an island host instead of running offline (#386). Without this,
+    /// the client stays on [`ActiveSession::Local`] and banks nothing.
+    #[must_use]
+    pub fn with_campaign(mut self, config: campaign::CampaignConfig) -> Self {
+        self.campaign = Some(config);
+        self
     }
 }
 
@@ -106,12 +171,27 @@ impl Plugin for RegolithSkinPlugin {
                 self.telemetry_path.display()
             )
         });
+        // The joined session starts its dial here, at plugin build, so the
+        // handshake overlaps window startup instead of serialising behind it.
+        let session = match &self.campaign {
+            Some(config) => ActiveSession::Campaign(Box::new(campaign::CampaignRuntime::launch(
+                config.clone(),
+                SEED,
+            ))),
+            None => ActiveSession::Local(Box::<LocalSession>::default()),
+        };
         app.insert_resource(OverlayMetrics::new(self.telemetry_path.clone()))
             .insert_resource(sink)
+            // The harness and the design run 60 Hz; Bevy's FixedUpdate
+            // default is 64. A campaign tick that drifts from TICK_HZ would
+            // misstate every per-second rate the overlay shows.
+            .insert_resource(Time::<Fixed>::from_duration(Duration::from_nanos(
+                TICK_NANOS,
+            )))
+            .insert_resource(session)
             .init_resource::<VisualAssetPaths>()
             .init_resource::<OverlayState>()
             .init_resource::<MetricWindow>()
-            .init_resource::<LocalSession>()
             .init_resource::<CombatView>()
             .init_resource::<ProjectileTracks>()
             .init_resource::<LockBreak>()
@@ -123,6 +203,7 @@ impl Plugin for RegolithSkinPlugin {
                 (
                     toggle_overlay,
                     sync_rendered_state,
+                    ensure_focus_body.after(sync_rendered_state),
                     // After `sync_rendered_state`: it frames the positions
                     // that system just wrote, not last frame's.
                     frame_camera.after(sync_rendered_state),
@@ -147,6 +228,7 @@ impl Plugin for RegolithSkinPlugin {
                     .chain()
                     .after(sync_rendered_state),
             )
+            .add_systems(Update, write_campaign_record_on_exit)
             .add_systems(
                 Update,
                 stream_metrics.run_if(on_timer(Duration::from_secs(1))),
@@ -158,7 +240,7 @@ fn setup_scene(
     mut commands: Commands,
     asset_server: Res<AssetServer>,
     paths: Res<VisualAssetPaths>,
-    session: Res<LocalSession>,
+    session: Res<ActiveSession>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
 ) {
@@ -171,47 +253,25 @@ fn setup_scene(
         DirectionalLight::default(),
         Transform::from_rotation(Quat::from_rotation_x(-0.8)),
     ));
-    for (entity, seat) in [(PLAYER, craft::Seat::Player), (OPPONENT, craft::Seat::Bot)] {
-        // The seat's plate tint is #383's allegiance cue; the accent still
-        // drives trim and glow per the design ("this one is mine" for the
-        // player, neutral ramp for everyone else).
-        let accent = match seat {
-            craft::Seat::Player => hud::ACCENT_BRIGHT,
-            craft::Seat::Bot => hud::MUTED,
-        };
-        let mut spawned = commands.spawn((
-            CoreEntity(entity),
-            Transform::from_scale(Vec3::splat(craft::CRAFT_DISPLAY_SCALE)),
-            Visibility::Inherited,
-        ));
-        if let Some(scene) = paths.craft_scene(&asset_server) {
-            // The optional glTF still wins when it is on disk: this work
-            // improves the fallback, it does not replace the asset path.
-            spawned.insert(WorldAssetRoot(scene));
-            continue;
-        }
-        // Otherwise the chassis is composed from Bevy primitives, per
-        // archetype, out of the craft's *own hashed state*. The skin reads the
-        // archetype; it never tells the ruleset what shape anything is.
-        let archetype = archetype_of(&session, entity).unwrap_or(Archetype::Interceptor);
-        spawned.with_children(|craft_root| {
-            for part in craft::parts(archetype) {
-                craft_root.spawn((
-                    Name::new(part.name),
-                    Mesh3d(meshes.add(craft::mesh_for(part.shape))),
-                    MeshMaterial3d(materials.add(craft::finish_material(
-                        part.finish,
-                        seat,
-                        accent,
-                    ))),
-                    Transform {
-                        translation: part.translation,
-                        rotation: part.rotation,
-                        scale: part.scale,
-                    },
-                ));
-            }
-        });
+    // The local seat always exists. In a joined session the remote seat may
+    // not be known yet (nothing has replicated); `ensure_focus_body` spawns
+    // it the moment the first remote craft lands.
+    let mut seats: Vec<(PersistId, craft::Seat)> =
+        vec![(session.local_entity(), craft::Seat::Player)];
+    if let Some(focus) = session.focus_entity() {
+        seats.push((focus, craft::Seat::Bot));
+    }
+    for (entity, seat) in seats {
+        spawn_craft_body(
+            &mut commands,
+            &asset_server,
+            &paths,
+            session.executor(),
+            entity,
+            seat,
+            &mut meshes,
+            &mut materials,
+        );
     }
     hud::spawn_hud(&mut commands);
     hud::spawn_world_overlay(&mut commands, &mut meshes, &mut materials);
@@ -238,6 +298,71 @@ fn setup_scene(
     ));
 }
 
+/// Spawns one rendered body for a core entity.
+///
+/// Extracted from `setup_scene` so [`ensure_focus_body`] can build the remote
+/// seat on demand with identical composition rules.
+#[allow(clippy::too_many_arguments)]
+fn spawn_craft_body(
+    commands: &mut Commands,
+    asset_server: &AssetServer,
+    paths: &VisualAssetPaths,
+    executor: &Executor<Regolith>,
+    entity: PersistId,
+    seat: craft::Seat,
+    meshes: &mut ResMut<Assets<Mesh>>,
+    materials: &mut ResMut<Assets<StandardMaterial>>,
+) {
+    // The seat's plate tint is #383's allegiance cue; the accent still
+    // drives trim and glow per the design ("this one is mine" for the
+    // player, neutral ramp for everyone else).
+    let accent = match seat {
+        craft::Seat::Player => hud::ACCENT_BRIGHT,
+        craft::Seat::Bot => hud::MUTED,
+    };
+    let mut spawned = commands.spawn((
+        CoreEntity(entity),
+        Transform::from_scale(Vec3::splat(craft::CRAFT_DISPLAY_SCALE)),
+        Visibility::Inherited,
+    ));
+    if let Some(scene) = paths.craft_scene(asset_server) {
+        // The optional glTF still wins when it is on disk: this work
+        // improves the fallback, it does not replace the asset path.
+        spawned.insert(WorldAssetRoot(scene));
+        return;
+    }
+    // Otherwise the chassis is composed from Bevy primitives, per
+    // archetype, out of the craft's *own hashed state*. The skin reads the
+    // archetype; it never tells the ruleset what shape anything is.
+    //
+    // A joined session may not hold this entity's state yet; the slot's own
+    // archetype derivation stands in until replication fills it in.
+    let archetype = archetype_of(executor, entity).unwrap_or_else(|| match seat {
+        craft::Seat::Player => Archetype::Interceptor,
+        craft::Seat::Bot => archetype_for_remote(entity),
+    });
+    spawned.with_children(|craft_root| {
+        for part in craft::parts(archetype) {
+            craft_root.spawn((
+                Name::new(part.name),
+                Mesh3d(meshes.add(craft::mesh_for(part.shape))),
+                MeshMaterial3d(materials.add(craft::finish_material(part.finish, seat, accent))),
+                Transform {
+                    translation: part.translation,
+                    rotation: part.rotation,
+                    scale: part.scale,
+                },
+            ));
+        }
+    });
+}
+
+/// The chassis a remote seat would have, derived the way the harness derives
+/// every bot's: from its slot alone (`Archetype::for_slot`).
+fn archetype_for_remote(entity: PersistId) -> Archetype {
+    Archetype::for_slot(entity.0.saturating_sub(1))
+}
+
 fn controls(keys: &ButtonInput<KeyCode>) -> Controls {
     Controls {
         left: keys.pressed(KeyCode::ArrowLeft),
@@ -249,70 +374,136 @@ fn controls(keys: &ButtonInput<KeyCode>) -> Controls {
 
 fn drive_core(
     keys: Res<ButtonInput<KeyCode>>,
-    mut session: ResMut<LocalSession>,
+    mut session: ResMut<ActiveSession>,
     mut window: ResMut<MetricWindow>,
     mut sink: ResMut<JsonlTelemetry>,
     mut tracks: ResMut<ProjectileTracks>,
     mut broken: ResMut<LockBreak>,
     mut shots: ResMut<ShotFeedback>,
 ) {
-    let tick = session.tick;
     let controls = controls(&keys);
-    let packet = session.human.human_packet(tick, controls);
-    let mut human = session.pending.remove(&PLAYER).unwrap_or_default();
-    human.extend(decode_packet(&packet).expect("the local codec produced valid orders"));
-    window.intents = window.intents.saturating_add(packet.orders.len() as u64);
-    if let Err(error) = sink.append_orders(&packet) {
-        error!("cannot append Regolith order packet: {error}");
-    }
-    if controls == Controls::default() {
-        window.idle_ticks = window.idle_ticks.saturating_add(1);
-    } else {
-        window.idle_ticks = 0;
-    }
-    let mut bot = session.pending.remove(&OPPONENT).unwrap_or_default();
-    bot.extend(session.bot.bot_orders(tick));
-    let mut delivered = BTreeMap::<PersistId, Vec<Order>>::new();
-    let mut emitted = Vec::<Outcome>::new();
-    for (entity, orders) in [(PLAYER, human), (OPPONENT, bot)] {
-        let outcome = session
-            .executor
-            .step_entity(entity, tick, &orders)
-            .expect("both craft installed");
-        for event in &outcome.events {
-            if let Some((target, input)) = session.executor.ruleset().deliver(event) {
-                delivered.entry(target).or_default().push(input);
+    match &mut *session {
+        ActiveSession::Local(local) => {
+            let tick = local.tick;
+            // One pipeline, one codec path: what the keyboard ships is what a
+            // bot's pilot would have produced with these gates applied
+            // (`human_full_controls_match_bot_order_bytes` pins it).
+            let packet = local.human.human_packet(tick, controls);
+            let mut human = local.pending.remove(&PLAYER).unwrap_or_default();
+            human.extend(decode_packet(&packet).expect("the local codec produced valid orders"));
+            window.intents = window.intents.saturating_add(packet.orders.len() as u64);
+            if let Err(error) = sink.append_orders(&packet) {
+                error!("cannot append Regolith order packet: {error}");
+            }
+            if controls == Controls::default() {
+                window.idle_ticks = window.idle_ticks.saturating_add(1);
+            } else {
+                window.idle_ticks = 0;
+            }
+            let mut bot = local.pending.remove(&OPPONENT).unwrap_or_default();
+            bot.extend(local.bot.bot_orders(tick));
+            let mut delivered = BTreeMap::<PersistId, Vec<Order>>::new();
+            let mut emitted = Vec::<Outcome>::new();
+            for (entity, orders) in [(PLAYER, human), (OPPONENT, bot)] {
+                let outcome = local
+                    .executor
+                    .step_entity(entity, tick, &orders)
+                    .expect("both craft installed");
+                for event in &outcome.events {
+                    if let Some((target, input)) = local.executor.ruleset().deliver(event) {
+                        delivered.entry(target).or_default().push(input);
+                    }
+                }
+                emitted.extend(outcome.events.iter().cloned());
+            }
+            local.pending = delivered;
+            local.tick = Tick::new(tick.0.saturating_add(1));
+            observe_skin_effects(&emitted, PLAYER, &mut tracks, &mut broken, &mut shots);
+        }
+        ActiveSession::Campaign(runtime) => {
+            // The joined tick: same pipeline inside `advance`, plus the
+            // wire leg, replicated-state application, link measurement and
+            // the accumulator feed.
+            let report = runtime.advance(controls, &mut sink);
+            window.intents = window.intents.saturating_add(report.intents as u64);
+            if !report.events.is_empty() {
+                observe_skin_effects(
+                    &report.events,
+                    runtime.entity(),
+                    &mut tracks,
+                    &mut broken,
+                    &mut shots,
+                );
             }
         }
-        emitted.extend(outcome.events.iter().cloned());
     }
-    session.pending = delivered;
-    session.tick = Tick::new(tick.0.saturating_add(1));
+}
+
+/// The skin's per-tick event consumption, shared by both session kinds:
+/// tracers, lock breakage and shot feedback read exactly what the ruleset
+/// raised this tick.
+fn observe_skin_effects(
+    emitted: &[Outcome],
+    observer: PersistId,
+    tracks: &mut ProjectileTracks,
+    broken: &mut LockBreak,
+    shots: &mut ShotFeedback,
+) {
     // The skin's only source of truth for a shot in the air. `observe` is a
     // copy, not a simulation: it keeps the events this tick produced and
     // discards everything else, so a resolved shot loses its tracer on the
     // same tick the ruleset resolves it.
-    tracks.observe(&emitted);
+    tracks.observe(emitted);
     broken.age();
-    broken.observe(&emitted, PLAYER);
+    broken.observe(emitted, observer);
     // #383's two feedback layers, in event order: the provisional arrival
     // armed off this tick's last flight leg, then the target's authoritative
     // verdict — which arrives one delivery later and overrides the guess.
     shots.age();
-    shots.arm_provisional(&tracks, PLAYER);
-    shots.observe(&emitted, PLAYER);
+    shots.arm_provisional(tracks, observer);
+    shots.observe(emitted, observer);
 }
 
 /// Copies this tick's combat state out of the executor for the overlay.
-fn read_combat_state(session: Res<LocalSession>, mut view: ResMut<CombatView>) {
-    *view = CombatView::read(&session.executor, PLAYER);
+fn read_combat_state(session: Res<ActiveSession>, mut view: ResMut<CombatView>) {
+    *view = CombatView::read(session.executor(), session.local_entity());
 }
 
-fn archetype_of(session: &LocalSession, entity: PersistId) -> Option<Archetype> {
-    match session.executor.state(entity)? {
+fn archetype_of(executor: &Executor<Regolith>, entity: PersistId) -> Option<Archetype> {
+    match executor.state(entity)? {
         RegolithState::Craft(craft) => Some(craft.archetype),
         _ => None,
     }
+}
+
+/// Spawns the remote duel body the moment a joined session learns which
+/// craft to follow. Local sessions always know both seats at startup and
+/// never trigger this.
+fn ensure_focus_body(
+    session: Res<ActiveSession>,
+    asset_server: Res<AssetServer>,
+    paths: Res<VisualAssetPaths>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    bodies: Query<(Entity, &CoreEntity)>,
+    mut commands: Commands,
+) {
+    let Some(focus) = session.focus_entity() else {
+        return;
+    };
+    if bodies.iter().any(|(_, core)| core.0 == focus) {
+        return;
+    }
+    spawn_craft_body(
+        &mut commands,
+        &asset_server,
+        &paths,
+        session.executor(),
+        focus,
+        craft::Seat::Bot,
+        &mut meshes,
+        &mut materials,
+    );
 }
 
 /// Marks the one camera the framing system drives.
@@ -359,11 +550,11 @@ fn frame_camera(
 }
 
 fn sync_rendered_state(
-    session: Res<LocalSession>,
+    session: Res<ActiveSession>,
     mut rendered: Query<(&CoreEntity, &mut Transform)>,
 ) {
     for (entity, mut transform) in &mut rendered {
-        let Some(state) = session.executor.state(entity.0) else {
+        let Some(state) = session.executor().state(entity.0) else {
             continue;
         };
         // `RegolithState` became a sum when #323 added rocks: craft and rock
@@ -433,6 +624,7 @@ fn refresh_f3_pane(
     view: Res<CombatView>,
     broken: Res<LockBreak>,
     tracks: Res<ProjectileTracks>,
+    session: Res<ActiveSession>,
     mut pane: Query<(&mut Text, &mut Node), With<F3Pane>>,
 ) {
     if let Ok((mut text, mut node)) = pane.single_mut() {
@@ -457,6 +649,21 @@ fn refresh_f3_pane(
             tracks.tracks().len(),
             hud::target_relation(&view, &tracks)
         ));
+        // The joined-session line: state machine position and the counters
+        // behind every measured number above.
+        if let ActiveSession::Campaign(runtime) = &*session {
+            let accumulator = runtime.accumulator();
+            text.push_str(&format!(
+                "\n{} | session {}\nuplink shed {} | downlink undecodable {} | afk capped {}",
+                runtime.summary_line(),
+                accumulator.session_id(),
+                runtime.uplink_shed(),
+                runtime.undecodable(),
+                accumulator.progress().afk_capped,
+            ));
+        } else {
+            text.push_str("\noffline local session — not a campaign path, banks nothing");
+        }
     }
 }
 
@@ -464,11 +671,83 @@ fn stream_metrics(
     mut metrics: ResMut<OverlayMetrics>,
     mut window: ResMut<MetricWindow>,
     mut sink: ResMut<JsonlTelemetry>,
+    session: Res<ActiveSession>,
 ) {
     metrics.intents_per_second = std::mem::take(&mut window.intents);
-    metrics.idle_minutes = window.idle_ticks as f64 / (orrery_core::TICK_HZ as f64 * 60.0);
+    match &*session {
+        ActiveSession::Local(_) => {
+            metrics.idle_minutes = window.idle_ticks as f64 / (orrery_core::TICK_HZ as f64 * 60.0);
+        }
+        ActiveSession::Campaign(runtime) => {
+            // Every number below is a measurement of the live link or the
+            // live accumulator — never a configuration echo. Loss comes from
+            // Dropped uplink acks (#393) plus downlink replication-tick gaps;
+            // jitter from arrival-interval deviations; banked/idle minutes
+            // from the same ticks `observe_tick` accounted.
+            metrics.observed_loss_pct = runtime.observed_loss_pct();
+            metrics.observed_jitter_p50_ms = runtime.observed_jitter_p50_ms();
+            metrics.observed_jitter_p99_ms = runtime.observed_jitter_p99_ms();
+            metrics.cell_id = runtime.latest_cell().map(CellId::to_bits);
+            let progress = runtime.accumulator().progress();
+            metrics.banked_minutes = progress.banked_minutes;
+            metrics.idle_minutes = progress.idle_minutes;
+            let configured = &runtime.config().configured;
+            metrics.configured_loss_pct = configured.loss_pct;
+            metrics.configured_jitter_ms = configured.jitter_p50_ms;
+        }
+    }
     if let Err(error) = sink.append(&metrics) {
         error!("cannot append Regolith telemetry: {error}");
+    }
+}
+
+/// Writes the finished banking row once, on app exit.
+///
+/// The row is produced by the joined-session accumulator only; an offline
+/// [`ActiveSession::Local`] writes nothing because it measured nothing.
+fn write_campaign_record_on_exit(
+    mut exited: MessageReader<AppExit>,
+    mut session: ResMut<ActiveSession>,
+    metrics: Res<OverlayMetrics>,
+) {
+    for exit in exited.read() {
+        let ActiveSession::Campaign(runtime) = &mut *session else {
+            return;
+        };
+        let Some(record) = runtime.shutdown() else {
+            return;
+        };
+        let path: &Path = metrics.session_record_path.as_path();
+        let record_path = path
+            .parent()
+            .unwrap_or(Path::new("."))
+            .join("campaign-records.jsonl");
+        let write = || -> std::io::Result<()> {
+            if let Some(parent) = record_path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&record_path)?;
+            let mut writer = std::io::BufWriter::new(file);
+            crate::session::CampaignSession::write_record(&mut writer, &record)?;
+            use std::io::Write as _;
+            writer.flush()
+        };
+        match write() {
+            Ok(()) => info!(
+                "campaign session {} recorded to {} ({} banked min)",
+                record.session_id,
+                record_path.display(),
+                record.banked_minutes
+            ),
+            Err(error) => error!(
+                "cannot write campaign record {}: {error}",
+                record_path.display()
+            ),
+        }
+        let _ = exit;
     }
 }
 

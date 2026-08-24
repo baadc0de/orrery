@@ -17,3 +17,9 @@ orrery_protocol = { path = "../../crates/orrery_protocol" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 hex = "0.4"
+# Transport pins mirror p1-swarm's exactly (D14): the client is the second
+# process on that harness's exterior wire and must not drift versions.
+iroh = "1.0.3"
+iroh-base = { version = "1.0.3", default-features = false, features = ["key"] }
+bytes = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "io-util"] }

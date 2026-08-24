@@ -49,6 +49,36 @@ impl ImpairmentMeasurement {
         self.jitter_ms.push(jitter_ms);
     }
 
+    /// Record one downlink arrival that closed a gap of `missing` broadcasts.
+    ///
+    /// The accounting this encodes: since the previous arrival, `missing + 1`
+    /// broadcasts were due from this sender and exactly one landed, so the
+    /// denominator grows by `missing + 1` and the dropped count by `missing`.
+    /// Jitter is sampled once per *arrival* — the deviation of its inter-
+    /// arrival interval — not once per expected packet; a lost packet produces
+    /// no arrival and therefore no interval to deviate. The very first
+    /// arrival from a sender has no baseline and carries `None`, contributing
+    /// loss accounting only.
+    pub fn observe_arrival(&mut self, missing: u64, deviation_ms: Option<u64>) {
+        let arrivals = missing.saturating_add(1);
+        self.sent = self.sent.saturating_add(arrivals);
+        self.dropped = self.dropped.saturating_add(missing);
+        if let Some(deviation_ms) = deviation_ms {
+            self.jitter_ms.push(deviation_ms);
+        }
+    }
+
+    /// Record one application-level uplink ack (#393's contract).
+    ///
+    /// Acks carry no timing information — they are queued when the router
+    /// decides, at whatever cadence the downlink is carrying them — so they
+    /// move loss only. Mixing a synthetic zero into the jitter samples here
+    /// would drag the percentiles towards zero precisely when loss is high.
+    pub fn observe_ack(&mut self, dropped: bool) {
+        self.sent = self.sent.saturating_add(1);
+        self.dropped = self.dropped.saturating_add(u64::from(dropped));
+    }
+
     fn loss_pct(&self) -> f64 {
         if self.sent == 0 {
             0.0
@@ -109,6 +139,23 @@ pub struct SessionRecord {
     /// Observations disagree with the requested profile; retained in-row and
     /// therefore cannot be silently treated as verified impairment.
     pub impairment_mismatch: bool,
+}
+
+/// Where the accumulator stands mid-session, for the overlay and the strip.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LiveProgress {
+    /// Connected minutes before any AFK cap is applied.
+    pub connected_minutes: f64,
+    /// Minutes currently eligible to bank.
+    pub banked_minutes: f64,
+    /// Minutes with no local input.
+    pub idle_minutes: f64,
+    /// Whether the 600-second idle banking allowance is exhausted.
+    pub afk_capped: bool,
+    /// Always true on a live [`CampaignSession`]: this struct only exists for
+    /// sessions whose joined state machine ran. `LocalSession` never produces
+    /// one — an offline hour is not a campaign path and banks nothing.
+    pub joined_session_ran: bool,
 }
 
 /// Pure session accumulator used by both bot and human front ends.
@@ -175,6 +222,60 @@ impl CampaignSession {
     /// Record a packet outcome observed by the session transport.
     pub fn observe_transport(&mut self, dropped: bool, jitter_ms: u64) {
         self.measurement.observe(dropped, jitter_ms);
+    }
+
+    /// Account for one downlink arrival that closed a gap of `missing`
+    /// broadcasts (see [`ImpairmentMeasurement::observe_arrival`] for the
+    /// accounting). A first-arrival has no baseline and carries `None`.
+    pub fn observe_arrival(&mut self, missing: u64, jitter_ms: Option<u64>) {
+        self.measurement.observe_arrival(missing, jitter_ms);
+    }
+
+    /// Account for one application-level uplink ack (#393's contract).
+    pub fn observe_uplink_ack(&mut self, dropped: bool) {
+        self.measurement.observe_ack(dropped);
+    }
+
+    /// Loss as measured so far, from this client's own packet outcomes.
+    ///
+    /// Reading a live value is deliberate: the F3 pane and the JSONL stream
+    /// must show what the link has done *so far*, not only at `finish`.
+    #[must_use]
+    pub fn observed_loss_pct(&self) -> f64 {
+        self.measurement.loss_pct()
+    }
+
+    /// Measured jitter median so far.
+    #[must_use]
+    pub fn observed_jitter_p50_ms(&self) -> u64 {
+        self.measurement.percentile(50)
+    }
+
+    /// Measured jitter p99 so far.
+    #[must_use]
+    pub fn observed_jitter_p99_ms(&self) -> u64 {
+        self.measurement.percentile(99)
+    }
+
+    /// Where the accumulator stands right now, for the overlay.
+    ///
+    /// A campaign hour is banked by *this* machine having run; the overlay
+    /// shows that accumulation live rather than only in the finished row.
+    #[must_use]
+    pub fn progress(&self) -> LiveProgress {
+        LiveProgress {
+            connected_minutes: self.connected_ticks as f64 / (TICK_HZ as f64 * 60.0),
+            banked_minutes: self.banked_ticks as f64 / (TICK_HZ as f64 * 60.0),
+            idle_minutes: self.idle_ticks as f64 / u64::from(TICK_HZ) as f64 / 60.0,
+            afk_capped: self.afk_capped,
+            joined_session_ran: true,
+        }
+    }
+
+    /// The coordinator-issued session identity.
+    #[must_use]
+    pub fn session_id(&self) -> &str {
+        &self.session_id
     }
 
     /// Finish a row. The caller supplies coordinator-pinned build provenance.
@@ -262,6 +363,91 @@ mod tests {
             "2% observed loss must not echo configured 3%"
         );
         assert_eq!(record.observed_loss_pct, 2.0);
+    }
+
+    /// The two live entry points must land in the same accumulator the row is
+    /// built from: uplink loss from Dropped acks (#393), downlink loss from
+    /// gap-closing arrivals, jitter only from arrival intervals.
+    #[test]
+    fn live_ack_and_arrival_outcomes_reach_the_banking_row() {
+        let mut session = session();
+        // Uplink: 10 datagrams sequenced, the router settles 3 as Dropped.
+        for outcome in [
+            false, true, false, true, false, false, true, false, false, false,
+        ] {
+            session.observe_uplink_ack(outcome);
+        }
+        // Downlink: three arrivals closing gaps of 1, 0 and 4 broadcasts.
+        session.observe_arrival(1, Some(40));
+        session.observe_arrival(0, Some(5));
+        session.observe_arrival(4, Some(90));
+        // 10 acked + (2 + 1 + 5) expected arrivals = 18 outcomes;
+        // dropped = 3 Dropped acks + 5 gap-closed broadcasts = 8.
+        let expected_loss = 8.0 * 100.0 / 18.0;
+        assert_eq!(session.observed_loss_pct(), expected_loss);
+        assert_eq!(
+            (
+                session.observed_jitter_p50_ms(),
+                session.observed_jitter_p99_ms()
+            ),
+            (40, 90),
+            "jitter percentiles come from arrival intervals alone"
+        );
+        let record = session.finish(
+            "end".into(),
+            "linux".into(),
+            "rev".into(),
+            "pipeline".into(),
+        );
+        assert_eq!(record.observed_loss_pct, expected_loss);
+        assert!(
+            record.impairment_mismatch,
+            "{expected_loss}% is not the configured 3%"
+        );
+    }
+
+    /// A zero-loss link measures zero — the accumulator cannot be fed by
+    /// configuration, so an unimpaired hour reads as one and is flagged as
+    /// outside the criterion band rather than silently banking.
+    #[test]
+    fn a_clean_link_measures_clean() {
+        let mut session = session();
+        for _ in 0..20 {
+            session.observe_uplink_ack(false);
+        }
+        session.observe_arrival(0, Some(0));
+        assert_eq!(session.observed_loss_pct(), 0.0);
+        let record = session.finish(
+            "end".into(),
+            "linux".into(),
+            "rev".into(),
+            "pipeline".into(),
+        );
+        assert_eq!(record.observed_loss_pct, 0.0);
+        assert!(record.impairment_mismatch);
+    }
+
+    /// The overlay reads live progress off the same accumulator that banks.
+    #[test]
+    fn progress_reports_the_accumulator_live() {
+        let mut active = session();
+        let idle = u64::from(orrery_core::TICK_HZ) * 60;
+        for _ in 0..idle {
+            active.observe_tick(1);
+        }
+        let progress = active.progress();
+        assert_eq!(progress.banked_minutes, 1.0);
+        assert_eq!(progress.idle_minutes, 0.0);
+        assert!(!progress.afk_capped);
+        assert!(progress.joined_session_ran);
+
+        let mut idle_run = session();
+        for _ in 0..idle * 11 {
+            idle_run.observe_tick(0);
+        }
+        let capped = idle_run.progress();
+        assert!(capped.afk_capped, "600 s cap then overflow trips the flag");
+        assert_eq!(capped.banked_minutes, 10.0);
     }
 
     #[test]
