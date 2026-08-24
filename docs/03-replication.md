@@ -299,7 +299,7 @@ Witness-stream compute is bounded by the same dial as its bandwidth: a sender pr
 
 ### Measured, at the criterion population
 
-`p1-swarm --peers 32 --seconds 300 --witness` (32 peers, 5 simulated minutes, clean link, mixed cruise/idle/burst/stall profiles), before and after the lane got a share and a derived cadence:
+`gates/p1-swarm --peers 32 --seconds 300 --witness` (32 peers, 5 simulated minutes, clean link, mixed cruise/idle/burst/stall profiles), before and after the lane got a share and a derived cadence:
 
 | | Frames at 20 Hz (one per send) | Frames at 6 Hz (derived from the share) |
 |---|---|---|

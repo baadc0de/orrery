@@ -133,7 +133,7 @@ the ruleset. State this again wherever assets get loaded, not only here.
 
 The flip side is genuinely useful: rendering touches none of the four
 pipeline-digest trees (`crates/orrery_witness`, `crates/orrery_core`,
-`crates/orrery_games`, `p1-swarm`), and `assets/` and this document sit
+`crates/orrery_games`, `gates/p1-swarm`), and `assets/` and this document sit
 outside all four. Art work can land during the freeze window without resetting
 the banked-hours count, provided those trees stay untouched.
 

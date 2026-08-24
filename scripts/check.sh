@@ -30,9 +30,9 @@
 # `fmt` lane, which in CI reached only the root workspace — `cargo fmt --all`
 # stops at the workspace boundary, and the seven standalone tools each declare
 # their own `[workspace]`, so 27 first-party `.rs` files — every one under
-# p0-nat-test, p0-dashboard, p1-swarm, p2-dashboard, p2-load, p3-island and
-# p4-streams-bench — had never been rustfmt-checked by anything. Exactly one
-# of the seven was dirty when the lane was widened (p0-nat-test).
+# gates/p0-nat-test, gates/p0-dashboard, gates/p1-swarm, gates/p2-dashboard, gates/p2-load, gates/p3-island and
+# gates/p4-streams-bench — had never been rustfmt-checked by anything. Exactly one
+# of the seven was dirty when the lane was widened (gates/p0-nat-test).
 set -euo pipefail
 
 readonly NAME=check
@@ -56,11 +56,11 @@ note() { echo "$NAME: $*" >&2; }
 #          of, which is the whole reason this loop exists. Deliberately not a
 #          count: the previous wording said "four of them, carrying 87 tests"
 #          and there were five before #129 added a sixth, so the sentence was
-#          wrong in a way nothing could catch. `p4-streams-bench` is a measurement
+#          wrong in a way nothing could catch. `gates/p4-streams-bench` is a measurement
 #          rather than a gate — its figures are in its README and the
 #          channel-policy decision they justify is in docs/02-networking.md §7 —
 #          so what CI owes it is that it still builds and still self-tests.
-#          `p2-journal-bench` is `check` for a second reason worth stating: its
+#          `gates/p2-journal-bench` is `check` for a second reason worth stating: its
 #          RocksDB arm is behind a non-default feature because `librocksdb-sys`
 #          compiles RocksDB from C++ source, minutes per cold build. The lane
 #          checks the default (fjall) build only, so adding this comparison
@@ -71,7 +71,7 @@ note() { echo "$NAME: $*" >&2; }
 #          which reads as coverage that does not exist. The two p0 tools are
 #          asserted by the NAT lab they were written for.
 #
-#          `p3-island` sat here until #129, on the stated grounds that the
+#          `gates/p3-island` sat here until #129, on the stated grounds that the
 #          nightly island gate asserts its behaviour instead. The gate does
 #          assert the *harness*; what it cannot assert is the harness's own
 #          unit tests, and by then there were two of them — including the one
@@ -89,16 +89,16 @@ note() { echo "$NAME: $*" >&2; }
 # That is the status quo, not something this table introduced.
 readonly WORKSPACES=(
     '.               root'
-    'p0-nat-test     check'
-    'p0-dashboard    check'
-    'p1-swarm        test'
-    'p2-dashboard    test'
-    'p2-load         test'
-    'p3-island       test'
-    'p3-siblings     test'
-    'p5-dupe-gauntlet test'
-    'p4-streams-bench test'
-    'p2-journal-bench check'
+    'gates/p0-nat-test     check'
+    'gates/p0-dashboard    check'
+    'gates/p1-swarm        test'
+    'gates/p2-dashboard    test'
+    'gates/p2-load         test'
+    'gates/p3-island       test'
+    'gates/p3-siblings     test'
+    'gates/p5-dupe-gauntlet test'
+    'gates/p4-streams-bench test'
+    'gates/p2-journal-bench check'
     'clients/regolith test'
 )
 

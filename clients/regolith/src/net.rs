@@ -1,16 +1,16 @@
 //! The client half of the exterior wire (#386): the frame grammar, join
 //! handshake, and iroh pumps that slice 1 (#385/#388) settled on the host
-//! side of `p1-swarm`.
+//! side of `gates/p1-swarm`.
 //!
 //! # Why this is a mirror and not a dependency
 //!
-//! `p1-swarm` ships no library target, and this client is deliberately its
+//! `gates/p1-swarm` ships no library target, and this client is deliberately its
 //! own `[workspace]`; so the client carries its own copy of the *client* half
 //! of the grammar. Everything here is pinned against slice 1's settled bytes
 //! by unit tests (`join_request_bytes_match_slice_1`,
 //! `frame_layout_matches_the_harness_wire`,
 //! `ack_decode_matches_the_p1_contract`, `slot_keys_match_the_harness`), which
-//! is the drift alarm for both sides. If `p1-swarm/src/exterior.rs` ever
+//! is the drift alarm for both sides. If `gates/p1-swarm/src/exterior.rs` ever
 //! changes a byte, those tests must be updated in the same commit — that is
 //! the point of pinning constants rather than re-deriving them.
 //!
@@ -32,7 +32,7 @@ use std::time::Duration;
 
 use bytes::{BufMut, Bytes, BytesMut};
 
-/// The connection's application protocol. Must match `p1-swarm`'s
+/// The connection's application protocol. Must match `gates/p1-swarm`'s
 /// `bridge::EXTERIOR_ALPN`; a grammar change bumps it there and here together.
 pub const EXTERIOR_ALPN: &[u8] = b"orrery/exterior/2";
 
@@ -771,7 +771,7 @@ mod tests {
     use super::*;
 
     /// The exact bytes slice 1's host reads. `exterior::JoinRequest` v2 is
-    /// `[ORRX][02 00][rev len][rev]`; if this vector and `p1-swarm` ever
+    /// `[ORRX][02 00][rev len][rev]`; if this vector and `gates/p1-swarm` ever
     /// disagree, one side changed the grammar and both must move together.
     #[test]
     fn join_request_bytes_match_slice_1() {
@@ -958,7 +958,7 @@ mod tests {
 
     /// The client's slot keys are byte-for-byte the harness's `bot_key`
     /// derivation. These hex constants were produced by running that
-    /// derivation (`p1-swarm/src/bot.rs`) under iroh-base 1.0.3; if either
+    /// derivation (`gates/p1-swarm/src/bot.rs`) under iroh-base 1.0.3; if either
     /// side changes its recipe, the host will refuse every dial with "slot N
     /// belongs to <other id>".
     #[test]

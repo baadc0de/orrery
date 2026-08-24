@@ -294,8 +294,8 @@ export PATH="$HOME/.cargo/bin:/usr/sbin:$PATH"
 rustup toolchain install 1.96.0 --profile minimal >>/var/log/orrery-rustup.log 2>&1
 cargo build --release -p orrery_persistd --features fdb >/var/log/orrery-build.log 2>&1
 cargo build --release -p orrery_seed --features orrery_seed/fdb >>/var/log/orrery-build.log 2>&1
-(cd p2-load && cargo build --release) >>/var/log/orrery-build.log 2>&1
-(cd p2-dashboard && cargo build --release) >>/var/log/orrery-build.log 2>&1
+(cd gates/p2-load && cargo build --release) >>/var/log/orrery-build.log 2>&1
+(cd gates/p2-dashboard && cargo build --release) >>/var/log/orrery-build.log 2>&1
 
 mkdir -p /mnt/orrery-evidence
 mount -t tmpfs -o size=4G,nosuid,nodev tmpfs /mnt/orrery-evidence
@@ -315,8 +315,8 @@ PY
 set +e
 ORRERY_FDB_CLUSTER_FILE=/etc/foundationdb/fdb.cluster \
 PERSISTD_BIN=/opt/orrery/target/release/persistd \
-P2_LOAD_BIN=/opt/orrery/p2-load/target/release/p2-load \
-P2_DASHBOARD_BIN=/opt/orrery/p2-dashboard/target/release/p2-dashboard \
+P2_LOAD_BIN=/opt/orrery/gates/p2-load/target/release/p2-load \
+P2_DASHBOARD_BIN=/opt/orrery/gates/p2-dashboard/target/release/p2-dashboard \
 ORRERY_SEED_BIN=/opt/orrery/target/release/orrery-seed \
 P2_GATE_OUT="$run_out" P2_GATE_DATA_DIR="$data_dir" \
 P2_GATE_PROVISIONING_JSON=/tmp/provisioning.json \

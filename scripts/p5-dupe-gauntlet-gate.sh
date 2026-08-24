@@ -68,7 +68,7 @@ if [[ ${1:-} == --self-test ]]; then
 fi
 
 : "${ORRERY_FDB_CLUSTER_FILE:?set ORRERY_FDB_CLUSTER_FILE to a fresh throwaway FoundationDB cluster}"
-: "${P5_DUPE_BIN:?set P5_DUPE_BIN to the p5-dupe-gauntlet binary}"
+: "${P5_DUPE_BIN:?set P5_DUPE_BIN to the gates/p5-dupe-gauntlet binary}"
 [[ ${P5_DUPE_CLUSTER_IS_THROWAWAY:-0} == 1 ]] \
   || die 'set P5_DUPE_CLUSTER_IS_THROWAWAY=1 to assert this cluster may receive fixed gauntlet rows'
 [[ -r $ORRERY_FDB_CLUSTER_FILE ]] \

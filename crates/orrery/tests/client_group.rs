@@ -4,7 +4,7 @@
 //! crate. The first is facade drift (docs/10-crates.md §"Edge cases"): a member
 //! plugin gains a resource, or the group's order stops matching the dependency
 //! order, and nothing notices because no app in the tree composes all six
-//! client plugins — `p1-swarm` is spatial+witness, the persist-client's live
+//! client plugins — `gates/p1-swarm` is spatial+witness, the persist-client's live
 //! test is net+authority+persist_client, and `orrery_predict` is added beside
 //! the others nowhere at all. The second is the island wire: `IslandBinding`
 //! was written by nothing outside unit tests, so `EphemeralRegistry::spawn`

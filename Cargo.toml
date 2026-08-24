@@ -24,8 +24,8 @@ members = [
     "crates/orrery",
 ]
 
-# The P2 latency rig and gate are standalone tools (the p0-nat-test /
-# p0-dashboard precedent): each carries its own `[workspace]` table so it
+# The P2 latency rig and gate are standalone tools (the gates/p0-nat-test /
+# gates/p0-dashboard precedent): each carries its own `[workspace]` table so it
 # builds against its own lockfile and does not inherit this workspace's
 # members, while still path-depending on `orrery_protocol` and
 # `orrery_persist_client`. Excluded here so a workspace-level command does
@@ -33,7 +33,7 @@ members = [
 #
 # This list is documentation, not mechanism. `members` above is explicit —
 # no globs — and each tool declares its own `[workspace]`, either of which is
-# already enough to keep cargo from adopting it. `p4-streams-bench` went four
+# already enough to keep cargo from adopting it. `gates/p4-streams-bench` went four
 # months absent from this list with no consequence at all, which is the proof:
 # its omission was cosmetic, not a bug. It is listed now so that the seven
 # standalone tools read the same here as they do in `scripts/check.sh`'s lane
@@ -41,13 +41,13 @@ members = [
 # `--self-test` holds itself against the filesystem rather than against this
 # file.
 exclude = [
-    "p0-nat-test",
-    "p0-dashboard",
-    "p2-load",
-    "p2-dashboard",
-    "p3-island",
-    "p1-swarm",
-    "p4-streams-bench",
+    "gates/p0-nat-test",
+    "gates/p0-dashboard",
+    "gates/p2-load",
+    "gates/p2-dashboard",
+    "gates/p3-island",
+    "gates/p1-swarm",
+    "gates/p4-streams-bench",
 ]
 
 # Pinned versions per D14 (docs/adr/0014-pinned-versions.md), ecosystem as of Aug 2026.

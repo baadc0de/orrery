@@ -2,7 +2,7 @@
 # P4's append-only player-hour ledger (docs/11-roadmap.md §P4).
 #
 # The phase does not exit until ≥ 500 honest player-hours under injected
-# impairment produce zero false-positive reports. `p1-swarm --witness` produces
+# impairment produce zero false-positive reports. `gates/p1-swarm --witness` produces
 # the hours; nothing until now added them up, and a nightly that re-ran one
 # identical hour every night would have accumulated 32 hours forever. This
 # script is the other half of `scripts/p4-accumulate.sh`: one JSONL line per
@@ -31,7 +31,7 @@
 #
 # Hours are only comparable within a pipeline version, so every line also
 # carries a `pipeline` digest: the git tree hashes of `orrery_witness`,
-# `orrery_core`, `orrery_games` and `p1-swarm` at the run's own commit, hashed
+# `orrery_core`, `orrery_games` and `gates/p1-swarm` at the run's own commit, hashed
 # together. That is the subtree the false-positive rate is a property of, and it
 # makes one boundary auditable that a commit sha alone does not — hours banked
 # before `orrery_games` became the swarm's ruleset ran stage 1 against an empty
@@ -40,7 +40,7 @@
 #
 # ── Banking clauses ─────────────────────────────────────────────────────────
 #
-# `p1-swarm` already exits non-zero unless every clause holds, so a failed run
+# `gates/p1-swarm` already exits non-zero unless every clause holds, so a failed run
 # never reaches this script through `p4-accumulate.sh`. The clauses are checked
 # again here anyway, against the report rather than against an exit code: the
 # ledger is the evidence, `--report-only` exists and exits zero on a failed run,
@@ -54,7 +54,7 @@ note() { echo "$NAME: $*" >&2; }
 
 usage() {
   cat >&2 <<'USAGE'
-usage: p4-ledger.sh append <report.json>   bank one p1-swarm report
+usage: p4-ledger.sh append <report.json>   bank one gates/p1-swarm report
        p4-ledger.sh total                  running totals, grouped by pipeline
        p4-ledger.sh --self-test            structural + functional self-check
 
@@ -63,7 +63,7 @@ usage: p4-ledger.sh append <report.json>   bank one p1-swarm report
 USAGE
 }
 
-# The floor `p1-swarm` itself judges coverage against; restated because a report
+# The floor `gates/p1-swarm` itself judges coverage against; restated because a report
 # is banked on what it says, not on who handed it over.
 readonly MIN_COVERAGE=0.95
 # The criterion's injected impairment: 3–5% packet loss, 100 ms jitter spikes.
@@ -410,7 +410,7 @@ readonly PIPELINE_TREES=(
   crates/orrery_witness
   crates/orrery_core
   crates/orrery_games
-  p1-swarm
+  gates/p1-swarm
 )
 
 pipeline_id() {

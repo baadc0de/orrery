@@ -157,9 +157,9 @@ state, and assembles a disputed window into a self-verifying
 ### Workspace
 
 14 crates under [`crates/`](crates/), plus eleven standalone tools that each
-declare their own workspace — `p0-nat-lab`, `p0-nat-test`, `p0-dashboard`,
-`p1-swarm`, `p2-load`, `p2-dashboard`, `p2-journal-bench`, `p3-island`,
-`p3-siblings`, `p4-streams-bench`, `p5-dupe-gauntlet`.
+declare their own workspace — `gates/p0-nat-lab`, `gates/p0-nat-test`, `gates/p0-dashboard`,
+`gates/p1-swarm`, `gates/p2-load`, `gates/p2-dashboard`, `gates/p2-journal-bench`, `gates/p3-island`,
+`gates/p3-siblings`, `gates/p4-streams-bench`, `gates/p5-dupe-gauntlet`.
 `./scripts/check.sh` runs CI's four lanes locally; `./scripts/gate-status.sh`
 reports where every gate stands.
 

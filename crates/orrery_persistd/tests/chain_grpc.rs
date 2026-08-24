@@ -326,7 +326,7 @@ async fn a_bumped_epoch_is_refused_even_when_the_mirror_received_nothing() {
     // fired once a record had actually crossed. That made the strongest proof
     // in `scripts/p2-kill9-gate.sh` — `prove_epoch_fork_refused` — conditional
     // on the load ahead of it having produced durable writes, and in the
-    // 2026-08-17 run it had not: every `p2-load` diff arrives with
+    // 2026-08-17 run it had not: every `gates/p2-load` diff arrives with
     // `lease_id: None` and the gateway's strict-authority path refused all
     // 541,408 of them, so the follower mirrored zero records and then opened
     // happily at the bumped epoch. The gate reported the follower defect it

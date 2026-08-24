@@ -33,7 +33,7 @@ if [[ ${1:-} == --self-test ]]; then
   # A stage is asserted against *its own invocation*, not against the body at
   # large, because a pattern free-floating in the body proves nothing about the
   # process it is supposed to configure. Two clauses were vacuous exactly this
-  # way until 2026-08-17: `orrery-coordinator` and `p3-island` were matched
+  # way until 2026-08-17: `orrery-coordinator` and `gates/p3-island` were matched
   # anywhere in the body, and both appear in the `: "${VAR:?...}"` usage
   # messages at the top — so deleting the coordinator launch, or the harness
   # invocation, left the self-test reporting both stages present. The launches
@@ -78,7 +78,7 @@ if [[ ${1:-} == --self-test ]]; then
   runs COORDINATOR_BIN '--interest-secret "$COORDINATOR_SECRET"' || die 'self-test: live coordinator absent'
   runs COORDINATOR_BIN '--issuer-key "1@$ISSUER_PUBLIC"' || die 'self-test: coordinator identity issuer key absent'
 
-  # The harness. The SIGKILL itself is issued inside the p3-island binary, not
+  # The harness. The SIGKILL itself is issued inside the gates/p3-island binary, not
   # here, so this script cannot assert it structurally — what it can assert is
   # that it drives the criterion's shape. The old check looked for the literal
   # `kill -9`, which appears in this file only in prose.
@@ -110,7 +110,7 @@ if [[ ${1:-} == --self-test ]]; then
 fi
 
 : "${PERSISTD_BIN:?set PERSISTD_BIN to a persistd binary}"
-: "${P3_ISLAND_BIN:?set P3_ISLAND_BIN to the p3-island binary}"
+: "${P3_ISLAND_BIN:?set P3_ISLAND_BIN to the gates/p3-island binary}"
 : "${COORDINATOR_BIN:?set COORDINATOR_BIN to the orrery-coordinator binary}"
 for tool in "$PERSISTD_BIN" "$P3_ISLAND_BIN" "$COORDINATOR_BIN"; do
   [[ -x $tool ]] || die "not an executable: $tool"
@@ -129,7 +129,7 @@ DURATION_SECS=${P3_DURATION_SECS:-30}
 # weak leg is the one anybody sees, and until #129 it was also the only reason
 # the strong leg's defect survived: its parked rows were reported lost, the leg
 # could not pass, and nothing ran it to say so. Both legs now run in
-# `nightly.yml`'s `p3-island` job and in `scripts/gate-status.sh --full`, as
+# `nightly.yml`'s `gates/p3-island` job and in `scripts/gate-status.sh --full`, as
 # two invocations of this script with the variable set either way. This script
 # still runs exactly one leg per invocation — the choice belongs to whoever
 # drives it — but "the default was never changed" is not a reason for a leg to

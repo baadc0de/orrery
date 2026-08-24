@@ -90,7 +90,7 @@ usage: p4-accumulate.sh [--index N] [--seconds S] [--dry-run]
                 to $P4_ACCUM_OUT/probe-<target>.json; banks nothing
 
   P4_LEDGER_FILE  ledger path, passed through to scripts/p4-ledger.sh
-  P1_SWARM_BIN    prebuilt harness; built from p1-swarm/ when unset
+  P1_SWARM_BIN    prebuilt harness; built from gates/p1-swarm/ when unset
   P4_ACCUM_OUT    evidence directory (default: target/p4-accumulate)
 USAGE
 }
@@ -152,9 +152,9 @@ self_test() {
     || die 'self-test: the shed allowance is gone; the budget backstop would go unjudged'
   has 'BAND=' \
     || die 'self-test: the loss band is gone'
-  # Off-Linux, both of these: cargo emits `p1-swarm.exe` on a Windows runner,
+  # Off-Linux, both of these: cargo emits `gates/p1-swarm.exe` on a Windows runner,
   # and a leg that only knows the unsuffixed name dies before it runs a tick.
-  has 'p1-swarm.exe' \
+  has 'gates/p1-swarm.exe' \
     || die 'self-test: the Windows binary name is gone; the leg cannot find its harness on a Windows runner'
   has 'PROBE_SEED' \
     || die 'self-test: the comparability probe is gone; hours would be banked per platform with nothing saying the platforms agree'
@@ -236,7 +236,7 @@ sweep_point() {
 # Where the release harness lands, built if it is not already there.
 #
 # `.exe` is not a detail: on a `windows-latest` runner these scripts run under
-# Git Bash and cargo emits `p1-swarm.exe`, so the unsuffixed path this used to
+# Git Bash and cargo emits `gates/p1-swarm.exe`, so the unsuffixed path this used to
 # hard-code does not exist and the leg would die at "harness binary missing"
 # before it ran a tick. Both spellings are tried rather than switching on
 # `$OSTYPE` — the question is which file cargo produced, and the filesystem
@@ -249,13 +249,13 @@ ensure_bin() {
     return
   fi
   note 'building the harness (release: a simulated hour is not a debug workload)'
-  cargo build --release -q --manifest-path "$ROOT/p1-swarm/Cargo.toml" 1>&2
+  cargo build --release -q --manifest-path "$ROOT/gates/p1-swarm/Cargo.toml" 1>&2
   local candidate
-  for candidate in "$ROOT/p1-swarm/target/release/p1-swarm" \
-                   "$ROOT/p1-swarm/target/release/p1-swarm.exe"; do
+  for candidate in "$ROOT/gates/p1-swarm/target/release/p1-swarm" \
+                   "$ROOT/gates/p1-swarm/target/release/p1-swarm.exe"; do
     if [[ -x $candidate ]]; then echo "$candidate"; return; fi
   done
-  die "harness binary missing at $ROOT/p1-swarm/target/release/p1-swarm[.exe]"
+  die "harness binary missing at $ROOT/gates/p1-swarm/target/release/p1-swarm[.exe]"
 }
 
 # ── The comparability probe ──────────────────────────────────────────────────

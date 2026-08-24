@@ -41,7 +41,7 @@ server process and RAM are all still idle at that point.
 | Disk | root on `md2`, RAID1 of two consumer QLC NVMe (Solidigm P41 Plus), no power-loss protection |
 | Under test | one `persistd` primary (128 shards, `--fdb-cluster-file`) + one passive chain follower, both on this host, both journaling to `md2` |
 | FDB | one `fdbserver` 7.3.63 in a throwaway container, `configure single memory` |
-| Rig | `p2-load` on the same box, driving a 10 000-entity seeded world (`p2demo`, profile `demo`) |
+| Rig | `gates/p2-load` on the same box, driving a 10 000-entity seeded world (`p2demo`, profile `demo`) |
 
 Each point is a 30 s run against a freshly cleared and re-seeded cluster.
 Configurations were interleaved rather than run in blocks, and every one was
@@ -78,7 +78,7 @@ scheduler caps and which re-counts a shed diff when the client re-offers it.
 > **Correction (2026-08-18): a nominal offered load is not a delivered one,
 > and every table below is labelled with the nominal.** The reasoning above is
 > half right — `diffs_sent` does re-count re-offers — but reporting only the
-> nominal number hid something worse. `p2-load`'s fan-out assert
+> nominal number hid something worse. `gates/p2-load`'s fan-out assert
 > (`check_fan_out`) allows `sessions × 160` diffs/s, so a point provisioned at
 > exactly `entities × diff_hz == sessions × 160` has **zero** margin, and the
 > rig silently drops what does not fit: `UplinkScheduler::queue` is
@@ -117,7 +117,7 @@ scheduler caps and which re-counts a shed diff when the client re-offers it.
 ## 3. The sweep
 
 10 000 entities, 128 shards, 30 s, `--intent-mix trade=0.02,craft=0.01`
-throughout. `p2-load`'s fan-out assert requires
+throughout. `gates/p2-load`'s fan-out assert requires
 `sessions × 160 ≥ entities × diff_hz`, so the rate leg has to raise sessions
 with rate; the concurrency leg holds the rate at 2 Hz and raises sessions
 alone, and the two legs share their session counts so the effects separate.
@@ -198,12 +198,12 @@ not, because heartbeats ride their own lane.
 
 ## 4. CPU, attributed per process
 
-`p2-load` runs on the same 16 threads as the thing it measures, which a real
+`gates/p2-load` runs on the same 16 threads as the thing it measures, which a real
 deployment would not, so it is measured separately (`pidstat -u -h -p` on all
 four PIDs, one sample/s, first 5 s dropped for the lease-claim phase). Cores =
 `%CPU / 100`.
 
-| point | persistd primary | chain follower | fdbserver | **subtotal (the deployment)** | p2-load (the rig) | box total |
+| point | persistd primary | chain follower | fdbserver | **subtotal (the deployment)** | gates/p2-load (the rig) | box total |
 |---|---|---|---|---|---|---|
 | baseline, 20 k offered | 1.31–1.36 | 0.22–0.24 | 0.15–0.16 | **1.68–1.76** | 0.53–0.54 | 2.2–2.3 of 16 |
 | knee, 40 k offered | 2.15–2.28 | 0.31–0.34 | 0.21–0.22 | **2.67–2.84** | 0.89–0.95 | 3.6–3.8 of 16 |
@@ -320,7 +320,7 @@ Ranked by when they run out: **FDB client thread (100 %) ≫ persistd CPU (26 %)
 ## 6. Converting to game units
 
 Two different quantities, converted separately. **The rig's 125 sessions × 80
-entities is not a player:entity ratio** — a `p2-load` session is a flush-budget
+entities is not a player:entity ratio** — a `gates/p2-load` session is a flush-budget
 slot (1024 B / 20 Hz), not a player. A real player owns ~1 avatar entity (plus
 1–2 authored core entities) and *observes* ~24 (D16's bounded high-rate
 interest set).
@@ -455,7 +455,7 @@ actor's own in-memory lease index (it already tracks the cell) and re-measure.
 > **Superseded again (2026-08-19), on the rig rather than on the run: the
 > renewals are phased now.** Everything below this line, and everything in
 > §11.7, measures a rig that renewed every session's whole entity set in one
-> pass of its drive loop. That default is gone: `p2-load` phases each session's
+> pass of its drive loop. That default is gone: `gates/p2-load` phases each session's
 > renewal across the period, and `P2_LOAD_HEARTBEAT_PHASED=0` is now what
 > reproduces the burst. The decision behind the flip is the workload's shape,
 > not the measurement's — real player populations are diffuse in phase space,
@@ -471,7 +471,7 @@ actor's own in-memory lease index (it already tracks the cell) and re-measure.
 > **Superseded (2026-08-19): the table above measures the first second of each
 > run, and is left visible because the reason it is wrong is worth keeping.**
 > "The intent rate was a fixed 1024 per run throughout" is the tell. It was
-> fixed at 1024 because `p2-load` never called `IntentQueue::retire`, so the
+> fixed at 1024 because `gates/p2-load` never called `IntentQueue::retire`, so the
 > 1024-entry queue filled — in under two seconds at a 3 % mix and 18 000
 > diffs/s — and `submit` returned `None` for the rest of the run. Every one of
 > those 1024 samples comes from the opening burst, while sessions are still
@@ -497,16 +497,16 @@ Operator-checkable, in the order they trip:
 > ~1 000 intents/s and 94 % at ~1 300, where intent p50 becomes 750 ms. The
 > bulk numbers in check 1's cell ("at 40 % you are at the knee") describe the
 > pre-#86 binary. Check 4's threshold is unchanged and is now measurable:
-> `p2-load` no longer stops submitting intents after 1 024 of them.
+> `gates/p2-load` no longer stops submitting intents after 1 024 of them.
 
 | # | Check | Threshold | Where |
 |---|---|---|---|
 | 1 | FDB client thread utilisation | **> 60 % of one core** | `pidstat -t -p $(pgrep -f 'persistd.*--fdb-cluster-file')`, or `top -H`: the busiest thread, named `persistd`, that is not the main thread. Absent on a node with no `--fdb-cluster-file`. At 40 % you are at the knee; at 75 % you are at peak throughput and shedding 10 %; at 95 % you are collapsing. |
 | 2 | Bulk shed rate | **> 1 %** of admitted | `shed_slow_route / admitted` in the `gateway_ingress` records of `ORRERY_GATEWAY_BOUNDARY_JSONL`, or the `gateway: shedding bulk diffs at ingress` warning, which is always logged. **On a binary between #86 and 2026-08-19 this check reads the sampled invariant-J audit rather than route slowness — see §11.2** — so a JSONL captured in that window needs `shed_slow_route` compared against the audit counters before it means anything. Fixed since. |
-| 3 | Durable ack rate vs offered | ack rate **stops rising** when you add load | `durable_acks / duration` from `p2-load`'s `run complete` line against `entities × diff_hz`. |
-| 4 | `intent_commit_ms` p99 | **> 100 ms** | `p2-dashboard --gate`. The alarm level is calibrated on the unphased rig (§2, §8); on the phased default it fires much later, and [08-persistence.md](08-persistence.md) §2.2.2 carries the current gate baseline. |
+| 3 | Durable ack rate vs offered | ack rate **stops rising** when you add load | `durable_acks / duration` from `gates/p2-load`'s `run complete` line against `entities × diff_hz`. |
+| 4 | `intent_commit_ms` p99 | **> 100 ms** | `gates/p2-dashboard --gate`. The alarm level is calibrated on the unphased rig (§2, §8); on the phased default it fires much later, and [08-persistence.md](08-persistence.md) §2.2.2 carries the current gate baseline. |
 | 5 | `persistd` RSS | **> 1 GB** for a ~10 k-entity world | backlog, not state. |
-| 6 | Registrar withdrawals | **any** `leases_lost > 0` | `p2-load` fails the run. Not seen anywhere in this sweep — if you see it, something other than this envelope is wrong. |
+| 6 | Registrar withdrawals | **any** `leases_lost > 0` | `gates/p2-load` fails the run. Not seen anywhere in this sweep — if you see it, something other than this envelope is wrong. |
 
 Rules of thumb for sizing a demo on this hardware:
 
@@ -534,10 +534,10 @@ fdbcli -C /some/fdb.cluster --exec 'configure new single memory'
 
 cargo build --release -p orrery_persistd --features fdb \
   -p orrery_seed --features orrery_seed/fdb
-(cd p2-load && cargo build --release)
+(cd gates/p2-load && cargo build --release)
 
 export ORRERY_FDB_CLUSTER_FILE=/some/fdb.cluster P2_CAP_OUT=$PWD/sweep
-export PERSISTD_BIN=target/release/persistd P2_LOAD_BIN=p2-load/target/release/p2-load
+export PERSISTD_BIN=target/release/persistd P2_LOAD_BIN=gates/p2-load/target/release/p2-load
 export ORRERY_SEED_BIN=target/release/orrery-seed
 export FDB_PID=$(docker top my-fdb | awk '/fdbserver/{print $2}')
 
@@ -721,7 +721,7 @@ this box, whatever the session count". There is a ceiling, but that is not the
 mechanism, and the mechanism decides which operating points are reachable at
 all.
 
-`p2-load` generates an entity's diffs on a **whole number of 50 ms flush
+`gates/p2-load` generates an entity's diffs on a **whole number of 50 ms flush
 frames**: `registration_phase_slots` is `ceil(FLUSH_HZ / diff_hz)`,
 `FLUSH_HZ = 20`, and an entity emits once per that many frames. The effective
 per-entity rate is `20 / ceil(20 / diff_hz)`:
@@ -802,7 +802,7 @@ which is nearly everywhere:
 
 | candidate | at ~140 k delivered | binding? |
 |---|---|---|
-| the load generator | `p2-load` at 3.0–3.3 cores, its **single drive-loop thread at 74–76 % mean, 79–80 % peak** of one core, delivering 63–71 % of nominal | **yes — the ceiling that was reached** |
+| the load generator | `gates/p2-load` at 3.0–3.3 cores, its **single drive-loop thread at 74–76 % mean, 79–80 % peak** of one core, delivering 63–71 % of nominal | **yes — the ceiling that was reached** |
 | `persistd` CPU total | 4.79–4.85 cores of 16 (30 % of the box), spread evenly over 16 tokio workers at ~20 % each | no |
 | journal group-commit thread | 66–67 % of wall inside `sync_data`, 133–154 flushes/s, ~1 000 records per flush against an 8 192 cap | no — closest server-side resource |
 | the NVMe array | 38–41 % `%util`, aqu-sz 3.8–4.6, 73–79 MB/s written, ~220 flush ops/s per member | no |
@@ -815,7 +815,7 @@ which is nearly everywhere:
 Three deserve their evidence spelled out.
 
 **The rig is the ceiling, and it is a frame-deadline ceiling rather than a
-starved one.** `p2-load` runs one drive loop that must visit 2 500 sessions
+starved one.** `gates/p2-load` runs one drive loop that must visit 2 500 sessions
 twenty times a second; per-thread sampling — which the harness does for
 `persistd` but not for the rig — puts that loop thread at **74.4 % mean, 79 %
 peak** of one core while the process as a whole uses 3.19 cores and delivers
@@ -884,7 +884,7 @@ already there.
 
 **The measurement was broken first, in a way that made the engine question
 unanswerable.** `IntentQueue` keeps a settled intent until the client calls
-`retire()`; `p2-load` never did. The queue holds 1024, so after 1024
+`retire()`; `gates/p2-load` never did. The queue holds 1024, so after 1024
 submissions `submit` returns `None` for the rest of the run — which is why
 every run in this project reports exactly `intents=1024` whatever its duration,
 rate or `--intent-mix`. At a 3 % mix and 18 000 diffs/s the cap is hit in under
@@ -936,7 +936,7 @@ the whole run. What that buys:
 > The "150 ms" in the `ia*` rows is **a load-generator artifact stacked on the
 > device**, not an intent-path cost. `IntentStageMetrics` splits the intent
 > span into `ingress / admit / spawn_wait / {alloc, grv, idem_read, fence,
-> commit, backoff} / reply` plus two explicit residuals. `p2-load` renewed
+> commit, backoff} / reply` plus two explicit residuals. `gates/p2-load` renewed
 > every session's whole entity set in one pass of its drive loop, so 10 000
 > lease renewals reached the gateway inside a few milliseconds every
 > `LEASE_HEARTBEAT` (3 s); inside a caught intent that time lands on **GRV**,
@@ -1270,10 +1270,10 @@ for arm in ssd memory; do
 done
 
 cargo build --release -p orrery_persistd --features fdb -p orrery_seed --features orrery_seed/fdb
-(cd p2-load && cargo build --release)
+(cd gates/p2-load && cargo build --release)
 
 export P2_CAP_OUT=$PWD/sweep PERSISTD_BIN=target/release/persistd
-export ORRERY_SEED_BIN=target/release/orrery-seed P2_LOAD_BIN=p2-load/target/release/p2-load
+export ORRERY_SEED_BIN=target/release/orrery-seed P2_LOAD_BIN=gates/p2-load/target/release/p2-load
 export SSD_CLUSTER_FILE=/some/ssd.cluster MEM_CLUSTER_FILE=/some/memory.cluster
 export SSD_FDB_CONTAINER=orrery-fdb-ssd MEM_FDB_CONTAINER=orrery-fdb-memory
 
@@ -1298,7 +1298,7 @@ defect §11.2 describes — so a JSONL captured on a binary between #86 and
 2026-08-19 cannot be read as bulk shed again.
 
 **Instrumentation used here that the harness does not do for you:** the
-per-thread `pidstat` for `p2-load` (the harness samples `persistd`'s threads
+per-thread `pidstat` for `gates/p2-load` (the harness samples `persistd`'s threads
 only), and `fdbcli --exec 'status json'` sampled every 2 s for FDB's own commit
 and read latency, conflict rate and write volume. Both are two-line additions
 around a run; §11.5 through §11.8 rest on them.
@@ -1316,7 +1316,7 @@ scripts/fdb-status-window.py logs/ckpt-fdb-status.jsonl sweep/ k40k --skip-secs 
 ```
 
 **One warning if you re-run the rate leg on a current rig.** Its numbers were
-taken with the pre-fix `p2-load`, whose intent queue capped a run at 1 024
+taken with the pre-fix `gates/p2-load`, whose intent queue capped a run at 1 024
 intents; the intent load in those rows is therefore negligible. On the fixed
 rig the same 3 % default mix at 140 k diffs/s asks for ~4 000 intents/s, which
 is three times the intent path's saturation point (§11.7) and turns a bulk

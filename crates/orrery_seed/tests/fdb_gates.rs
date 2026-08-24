@@ -564,11 +564,11 @@ async fn cold_area_load_returns_seeded_entities() {
     // of the suite is green on an idle laptop and red on a busy CI box: it
     // passes standalone in ~3 s and fails in the full four-package run. The
     // target is enforced where it can be measured under controlled load, by
-    // `p2-dashboard`, which gates `area_first_page_ms` at 50_000 µs against the
+    // `gates/p2-dashboard`, which gates `area_first_page_ms` at 50_000 µs against the
     // rig's telemetry. Report the elapsed time so a pathological regression is
     // still visible in the log.
     eprintln!(
-        "cold 27-cell area load: {:?} (D16 target < 50 ms, gated by p2-dashboard)",
+        "cold 27-cell area load: {:?} (D16 target < 50 ms, gated by gates/p2-dashboard)",
         started.elapsed()
     );
 }

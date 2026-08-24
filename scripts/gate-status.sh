@@ -51,7 +51,7 @@
 #
 # ── Numbers ──────────────────────────────────────────────────────────────────
 #
-# Read out of the reports the gates already emit — `target/p1-swarm/*.json`,
+# Read out of the reports the gates already emit — `target/gates/p1-swarm/*.json`,
 # `p3-island-*/report.json`, `p2-kill9-*/artifact.json`, the P4 ledger,
 # `target/fdb-tests.log` — never re-derived. A figure this script computed
 # itself would be a second implementation of the gate, and the two would
@@ -224,14 +224,14 @@ gate_selftest_evidence() { ev_none; }
 gate_p1_swarm_tier() { echo full; }
 gate_p1_swarm_prereq() { have_cargo || { echo 'cargo is not on PATH'; return 1; }; }
 gate_p1_swarm_run() {
-  P1_SWARM_OUT="$OUT/p1-swarm" "$ROOT/scripts/p1-swarm-gate.sh" \
+  P1_SWARM_OUT="$OUT/gates/p1-swarm" "$ROOT/scripts/p1-swarm-gate.sh" \
     >"$OUT/logs/p1-swarm.log" 2>&1
 }
 # Five legs, and the report distinguishes them: `PASSED` is written only after
 # all five, so its absence beside a full set of reports means a leg failed.
 gate_p1_swarm_evidence() {
   local dir
-  for dir in "$OUT/p1-swarm" "$ROOT/target/p1-swarm"; do
+  for dir in "$OUT/gates/p1-swarm" "$ROOT/target/gates/p1-swarm"; do
     [[ -r $dir/clean.json ]] || continue
     local numbers
     numbers=$(jq -s -c '
@@ -278,12 +278,12 @@ gate_p3_island_run() {
   {
     cargo build --release --manifest-path "$ROOT/Cargo.toml" \
       -p orrery_persistd -p orrery_coordinator
-    (cd "$ROOT/p3-island" && cargo build --release)
+    (cd "$ROOT/gates/p3-island" && cargo build --release)
     local leg
     for leg in weak strong; do
       PERSISTD_BIN="$ROOT/target/release/persistd" \
       COORDINATOR_BIN="$ROOT/target/release/orrery-coordinator" \
-      P3_ISLAND_BIN="$ROOT/p3-island/target/release/p3-island" \
+      P3_ISLAND_BIN="$ROOT/gates/p3-island/target/release/p3-island" \
       P3_VICTIM_CLAIM_KIND="$leg" \
       P3_GATE_OUT="$OUT/p3-island-$leg-$(date -u +%Y%m%dT%H%M%SZ)" \
         "$ROOT/scripts/p3-island-gate.sh" || return 1
@@ -384,11 +384,11 @@ gate_p3_siblings_run() {
     cargo build --release --manifest-path "$ROOT/Cargo.toml" -p orrery_persistd --features fdb
     cargo build --release --manifest-path "$ROOT/Cargo.toml" -p orrery_seed --features orrery_seed/fdb
     cargo build --release --manifest-path "$ROOT/Cargo.toml" -p orrery_coordinator
-    (cd "$ROOT/p3-siblings" && cargo build --release)
+    (cd "$ROOT/gates/p3-siblings" && cargo build --release)
     PERSISTD_BIN="$ROOT/target/release/persistd" \
     COORDINATOR_BIN="$ROOT/target/release/orrery-coordinator" \
     ORRERY_SEED_BIN="$ROOT/target/release/orrery-seed" \
-    P3_SIBLINGS_BIN="$ROOT/p3-siblings/target/release/p3-siblings" \
+    P3_SIBLINGS_BIN="$ROOT/gates/p3-siblings/target/release/p3-siblings" \
     P3_SIBLINGS_GATE_OUT="$OUT/p3-siblings-$(date -u +%Y%m%dT%H%M%SZ)" \
       "$ROOT/scripts/p3-siblings-gate.sh"
   } >"$OUT/logs/p3-siblings.log" 2>&1
@@ -467,8 +467,8 @@ gate_p5_dupe_gauntlet_prereq() {
 }
 gate_p5_dupe_gauntlet_run() {
   {
-    (cd "$ROOT/p5-dupe-gauntlet" && cargo build --release)
-    P5_DUPE_BIN="$ROOT/p5-dupe-gauntlet/target/release/p5-dupe-gauntlet" \
+    (cd "$ROOT/gates/p5-dupe-gauntlet" && cargo build --release)
+    P5_DUPE_BIN="$ROOT/gates/p5-dupe-gauntlet/target/release/p5-dupe-gauntlet" \
     P5_DUPE_GATE_OUT="$OUT/p5-dupe-gauntlet-$(date -u +%Y%m%dT%H%M%SZ)" \
       "$ROOT/scripts/p5-dupe-gauntlet-gate.sh"
   } >"$OUT/logs/p5-dupe-gauntlet.log" 2>&1
@@ -525,8 +525,8 @@ gate_ramp_shadow_prereq() {
 }
 gate_ramp_shadow_run() {
   {
-    (cd "$ROOT/p5-dupe-gauntlet" && cargo build --release)
-    P5_DUPE_BIN="$ROOT/p5-dupe-gauntlet/target/release/p5-dupe-gauntlet" \
+    (cd "$ROOT/gates/p5-dupe-gauntlet" && cargo build --release)
+    P5_DUPE_BIN="$ROOT/gates/p5-dupe-gauntlet/target/release/p5-dupe-gauntlet" \
     RAMP_SHADOW_GATE_OUT="$OUT/ramp-shadow-$(date -u +%Y%m%dT%H%M%SZ)" \
       "$ROOT/scripts/ramp-shadow-gate.sh"
   } >"$OUT/logs/ramp-shadow.log" 2>&1
@@ -592,11 +592,11 @@ gate_p2_kill9_run() {
   {
     cargo build --release --manifest-path "$ROOT/Cargo.toml" -p orrery_persistd --features fdb
     cargo build --release --manifest-path "$ROOT/Cargo.toml" -p orrery_seed --features orrery_seed/fdb
-    (cd "$ROOT/p2-load" && cargo build --release)
-    (cd "$ROOT/p2-dashboard" && cargo build --release)
+    (cd "$ROOT/gates/p2-load" && cargo build --release)
+    (cd "$ROOT/gates/p2-dashboard" && cargo build --release)
     PERSISTD_BIN="$ROOT/target/release/persistd" \
-    P2_LOAD_BIN="$ROOT/p2-load/target/release/p2-load" \
-    P2_DASHBOARD_BIN="$ROOT/p2-dashboard/target/release/p2-dashboard" \
+    P2_LOAD_BIN="$ROOT/gates/p2-load/target/release/p2-load" \
+    P2_DASHBOARD_BIN="$ROOT/gates/p2-dashboard/target/release/p2-dashboard" \
     ORRERY_SEED_BIN="$ROOT/target/release/orrery-seed" \
     P2_GATE_OUT="$OUT/p2-kill9-$(date -u +%Y%m%dT%H%M%SZ)" \
       "$ROOT/scripts/p2-kill9-gate.sh"
@@ -1421,15 +1421,15 @@ EOF
 
   # 9. Numbers come out of the evidence file rather than from a run. A
   #    fabricated P1 report in the synthetic tree must be read back verbatim.
-  mkdir -p "$dir/out/p1-swarm"
+  mkdir -p "$dir/out/gates/p1-swarm"
   local leg
   for leg in clean impaired witnessed conviction control; do
     jq -n '{peers: 32, seconds: 3600, total_boundary_flips: 0, total_proxy_pops: 0,
             min_cells_visited: 71, worst_p99_upload_bits: 123456, total_shed: 162,
             total_undecodable: 0, player_hours: 32.0, total_false_positives: 0,
-            observation_coverage: 0.97}' >"$dir/out/p1-swarm/$leg.json"
+            observation_coverage: 0.97}' >"$dir/out/gates/p1-swarm/$leg.json"
   done
-  touch "$dir/out/p1-swarm/PASSED"
+  touch "$dir/out/gates/p1-swarm/PASSED"
   cat >>"$dir/.github/workflows/nightly.yml" <<'EOF'
   p1-swarm:
     runs-on: ubuntu-latest
@@ -1442,7 +1442,7 @@ EOF
     || die 'self-test: a number in the gate report was not read back into the status report'
   grep -qE '^  PASSED +nightly:p1-swarm' <<<"$with_numbers" \
     || die "self-test: a gate's own success artifact was not read as a pass"
-  rm -f "$dir/out/p1-swarm/PASSED"
+  rm -f "$dir/out/gates/p1-swarm/PASSED"
   local without_marker
   st_run --inspect; without_marker=$(cat "$dir/report")
   grep -qE '^  FAILED +nightly:p1-swarm' <<<"$without_marker" \

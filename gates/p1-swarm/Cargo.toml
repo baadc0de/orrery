@@ -1,0 +1,65 @@
+[package]
+name = "p1-swarm"
+version = "0.1.0"
+edition = "2021"
+description = "P1 replication harness: N headless peers roaming a cell grid, proving the upload budget, interest churn, hysteresis and late-join scope the phase gate requires"
+license = "MIT"
+
+# Standalone tool, following the `gates/p2-load` / `gates/p3-island` precedent: its own
+# `[workspace]` so it builds against its own lockfile.
+#
+# Unlike `gates/p3-island`, which deliberately avoided the Bevy stack because the
+# property under test was registrar-side, this harness *is* the Bevy stack —
+# `orrery_spatial`'s AOI and interest selection, `orrery_net`'s send path and
+# upload meter, `orrery_witness`'s log stream. Every decision under test is made
+# by the shipping plugins.
+#
+# What it does not use is a real socket. Peers are coupled by an in-process
+# router that moves bytes between their session buffers, for two reasons: the
+# criterion's assertions are all about what a peer *decides* to send and how it
+# reacts to what it receives, and P4's follow-on criterion demands injected
+# impairment (3–5% loss, 100 ms jitter) which is a parameter here and a netem
+# setup over a real link. Transport itself is P0's criterion, already met.
+[workspace]
+
+[[bin]]
+name = "p1-swarm"
+path = "src/main.rs"
+
+[dependencies]
+orrery_protocol = { path = "../../crates/orrery_protocol" }
+orrery_net = { path = "../../crates/orrery_net" }
+orrery_spatial = { path = "../../crates/orrery_spatial" }
+orrery_core = { path = "../../crates/orrery_core" }
+orrery_witness = { path = "../../crates/orrery_witness" }
+# The rules the bots play: `orrery_games`' Regolith, not `orrery_conformance`'s
+# corpus kernel. The difference is P4's second half. The corpus kernel publishes
+# no limits, so `Ruleset::invariants()` returns an empty slice and every
+# player-hour this harness ever accumulated ran stage 1 against nothing.
+# Regolith publishes movement, equipment and score checks, and —
+# because a game that can only be played honestly cannot prove the demo
+# criterion — ships its own cheats for the harness to field a modified client
+# with.
+orrery_games = { path = "../../crates/orrery_games" }
+
+# Versions mirror the root workspace's D14 pins exactly (a standalone
+# `[workspace]` cannot inherit `workspace.dependencies`).
+bevy_app = { version = "0.19", default-features = false }
+bevy_ecs = { version = "0.19", default-features = false }
+bevy_math = { version = "0.19", default-features = false }
+bevy_time = { version = "0.19", default-features = false, features = ["std"] }
+aeronet_io = "0.21.0"
+aeronet_iroh = { path = "../../vendor/aeronet_iroh" }
+bevy_platform = { version = "0.19", default-features = false, features = ["std"] }
+iroh = "1.0.3"
+iroh-base = { version = "1.0.3", default-features = false, features = ["key"] }
+bytes = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
+glam = { version = "0.32", features = ["serde"] }
+libm = "0.2"
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+rand = "0.9"
+rand_chacha = "0.9"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

@@ -3,7 +3,7 @@
 #
 # The owner decision on #375 (2026-08-24) puts the human client on the network
 # as an ordinary island member and puts **report assembly on the host**: the
-# hosting harness (`p1-swarm --external-peer --witness --impaired`) produces
+# hosting harness (`gates/p1-swarm --external-peer --witness --impaired`) produces
 # every report-level field around the run exactly as it does for pure-bot
 # runs, and the external participant contributes only its own `SessionRecord`.
 # This script is the assembly seam between the two: it takes the host's raw
@@ -56,7 +56,7 @@
 #   orrery-invite session-token --issuer-credential issuer.cred \
 #     --account N --node <slot key>                          → session_token=…
 # The session (two processes; peers=8, seconds as desired):
-#   p1-swarm --external-peer --peers 8 --seconds 3600 --min-cells 1 \
+#   gates/p1-swarm --external-peer --peers 8 --seconds 3600 --min-cells 1 \
 #     --impaired --witness --stamp-wall-clock --json raw.json \
 #     --listening-file listening.txt \
 #     --require-client-rev <pinned rev> --require-session <session_id> \
@@ -102,7 +102,7 @@ readonly PIPELINE_TREES=(
   crates/orrery_witness
   crates/orrery_core
   crates/orrery_games
-  p1-swarm
+  gates/p1-swarm
 )
 
 pipeline_id() {

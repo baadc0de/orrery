@@ -63,7 +63,7 @@ The deployed binary hardcodes the permissive validator:
 with no CLI flag reaching it). `BaselineIntentValidator::enforcing`
 (`crates/orrery_persistd/src/intent/mod.rs:784-793`) has **no caller in the
 binary** — the only non-test callers in the workspace are library tests and
-`p5-dupe-gauntlet/src/main.rs:209`, a separate harness workspace. The
+`gates/p5-dupe-gauntlet/src/main.rs:209`, a separate harness workspace. The
 executor side is equally dark: `FdbIntentExecutor::recording_epochs`
 (`crates/orrery_persistd/src/intent/fdb.rs:234-241`) is never called by the
 binary, so the deployed executor holds no witness-epoch authority and writes

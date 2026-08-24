@@ -95,7 +95,7 @@ PY
 [[ $FDB_PORT != 4500 ]] || die 'port 4500 is the shared development cluster'
 FDB_DIR="$out/fdb"
 FDB_CLUSTER="$FDB_DIR/fdb.cluster"
-P5_MEASURE_BIN=${P5_MEASURE_BIN:-"$ROOT/p5-dupe-gauntlet/target/release/p5-dupe-gauntlet"}
+P5_MEASURE_BIN=${P5_MEASURE_BIN:-"$ROOT/gates/p5-dupe-gauntlet/target/release/p5-dupe-gauntlet"}
 
 CONTROL_PID=''
 ATTESTED_PID=''
@@ -118,7 +118,7 @@ trap cleanup EXIT
 
 if [[ ! -x $P5_MEASURE_BIN ]]; then
   note 'building the P5 harness in release mode'
-  (cd "$ROOT/p5-dupe-gauntlet" && cargo build --release)
+  (cd "$ROOT/gates/p5-dupe-gauntlet" && cargo build --release)
 fi
 
 note "starting a private FoundationDB instance on 127.0.0.1:$FDB_PORT"

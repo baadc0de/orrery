@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # One point of the P2 capacity sweep: seed a world, run persistd (primary +
 # passive follower, the p2-kill9 topology minus the crash legs), drive it with
-# p2-load at a given (--sessions, --diff-hz), and record per-process CPU for
+# gates/p2-load at a given (--sessions, --diff-hz), and record per-process CPU for
 # persistd, the fdbserver container and the rig separately.
 #
 # This is a measurement harness, not a gate: nothing here asserts. It exists

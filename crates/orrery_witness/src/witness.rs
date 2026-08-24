@@ -1210,7 +1210,7 @@ impl<R: Ruleset> Witness<R> {
     /// [`Self::repair_check`] passes the *subject's* tick, taken off the frame
     /// that failed to chain; [`Self::sweep`] passes the caller's *local* tick.
     /// They are compared against the same `catchup.since`, which was written by
-    /// whichever path opened the hole. In `p1-swarm` both are one global
+    /// whichever path opened the hole. In `gates/p1-swarm` both are one global
     /// simulated tick and the difference cannot show, which is exactly why it
     /// is written down: against a real peer whose tick base is its own, an
     /// offset between the two makes the timeout fire early or never, and the
@@ -1445,7 +1445,7 @@ impl<R: Ruleset> Witness<R> {
     /// catchup is open. The subject was therefore never judged again, silently
     /// and for as long as the process lived.
     ///
-    /// Measured in `p1-swarm --witness`, every watch reached that state within
+    /// Measured in `gates/p1-swarm --witness`, every watch reached that state within
     /// about twenty-five simulated seconds, after which the witness counters
     /// did not move again: identical gap, stall and overflow totals at 30 s and
     /// at 120 s of an eight-peer run. The escalation the design relies on to

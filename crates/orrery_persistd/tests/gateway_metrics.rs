@@ -8,7 +8,7 @@
 //!    D16 does not gate.** `gateway_intent_server_ms` and
 //!    `gateway_area_first_page_server_ms` measure receipt-through-send inside
 //!    the process; `intent_commit_ms` and `area_first_page_ms` measure client
-//!    round trips and carry the D16 targets. `p2-dashboard` folds by series
+//!    round trips and carry the D16 targets. `gates/p2-dashboard` folds by series
 //!    name into one histogram per name with no source field, and
 //!    `scripts/p2-kill9-gate.sh` concatenates the client rig's JSONL with
 //!    persistd's into that fold — so a server span written under a gated name

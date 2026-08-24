@@ -32,7 +32,7 @@
 //! window and calls `raise` when a [`WitnessSignal::ClaimMismatch`] comes back,
 //! but only if the host inserted a [`WitnessIdentity`] to sign with — and even
 //! then, shadow mode files nothing. A host that inserts no identity gets
-//! stages 1a and 1c and the counters, which is what the `p1-swarm` harness
+//! stages 1a and 1c and the counters, which is what the `gates/p1-swarm` harness
 //! does, deliberately. A host with no Bevy at all drives `audit_window` and
 //! `raise` itself, as `orrery_persistd`'s tests do.
 //!

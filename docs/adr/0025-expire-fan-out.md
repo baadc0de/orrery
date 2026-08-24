@@ -365,8 +365,8 @@ later reader knows which parts rest on measurement that has not been taken.
   `InterestAuthority::allows` predicate, the message, the client rule, or the
   bound's shape. The seam holds as designed; no amendment is owed here when the
   directory lands.
-- **The `p3-island` observability consequence is a leg, not a blanket.**
-  Retiring `p3-island/src/main.rs:32-36`'s "parking is not observable from any
+- **The `gates/p3-island` observability consequence is a leg, not a blanket.**
+  Retiring `gates/p3-island/src/main.rs:32-36`'s "parking is not observable from any
   peer" is reachable on the **strong-claim leg**
   (`P3_VICTIM_CLAIM_KIND=strong`), where `STRONG_HELD` parks before candidates
   are computed (`gateway.rs:3041-3050`) and the survivors are a live audience.

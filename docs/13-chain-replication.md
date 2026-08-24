@@ -436,7 +436,7 @@ receives **zero** acknowledgements, durable or provisional, and zero committed
 intents. Both halves are refusals, and neither is in this design:
 
 - Every `DiffUplink` the rig sends carries `lease_id: None`
-  (`p2-load/src/main.rs:1401`, deliberately — the rig measures gateway latency,
+  (`gates/p2-load/src/main.rs:1401`, deliberately — the rig measures gateway latency,
   not authority arbitration), while `route_session_diff` sets
   `strict_authority: true` unconditionally
   (`crates/orrery_persistd/src/gateway.rs:3930`). `route_diff` substitutes the

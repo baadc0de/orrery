@@ -1753,7 +1753,7 @@ pub fn ledger_receipt_versionstamped_key() -> [u8; 16] {
 /// v0 — so adopting it is a two-line change at each of this row's writers.
 /// What buys the wait is that the row's shape is *not* changing in this work
 /// item, and adopting the trailer now would rewrite six harness call sites
-/// (`p5-dupe-gauntlet`, `p3-siblings` and the intent-commit tests all encode
+/// (`gates/p5-dupe-gauntlet`, `gates/p3-siblings` and the intent-commit tests all encode
 /// this row by hand) for no byte that is not already decidable. The deadline
 /// is real and it is a shape change, not a date: **the next field added here
 /// adds the trailer in the same commit.**

@@ -10,7 +10,7 @@
 # baseline that was missing.
 #
 # The criterion, in the same clause structure as `scripts/p3-island-gate.sh`
-# and enforced in `p3-siblings/src/main.rs` rather than here:
+# and enforced in `gates/p3-siblings/src/main.rs` rather than here:
 #
 #   1. two persistd + one coordinator, disjoint `--shard` subtrees of one grid,
 #      one FoundationDB cluster carrying one fence and one lease tier;

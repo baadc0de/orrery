@@ -207,7 +207,7 @@ mod tests {
     }
 
     /// The P2 load rig's manifest decoder, transcribed from
-    /// `p2-load/src/main.rs`. That file belongs to another change in flight,
+    /// `gates/p2-load/src/main.rs`. That file belongs to another change in flight,
     /// so this is a *copy* of its shape rather than a call into it: if the
     /// rig's decoder is edited, this fixture has to be re-checked against it.
     /// It exists because the rig is the manifest's only in-tree consumer and
@@ -235,7 +235,7 @@ mod tests {
 
     #[test]
     fn the_p2_rig_decoder_reads_what_the_seeder_writes() {
-        // The gate's chain is: `verify --emit-manifest` → `p2-load
+        // The gate's chain is: `verify --emit-manifest` → `gates/p2-load
         // --manifest` → a lease claim per entity at the cell the seeder
         // committed it to. A format change that the rig cannot read breaks
         // the P2 kill-9 gate, so the decode is exercised here rather than

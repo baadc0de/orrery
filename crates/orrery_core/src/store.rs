@@ -44,7 +44,7 @@ const MAX_CLAIMS_PER_TICK: usize = 2;
 /// What retaining a claim did — see [`AuthorityLog::record_claim`].
 ///
 /// Returned rather than silently absorbed because a store that quietly
-/// resolves a duplicate is a store that hides a producer bug. p1-swarm signed
+/// resolves a duplicate is a store that hides a producer bug. gates/p1-swarm signed
 /// tick 0 twice for the whole of P4 and it was found by accident; the fix
 /// there was in the producer, and a producer that repeats the mistake should
 /// hear about it from the first component that can see it.
@@ -214,7 +214,7 @@ impl EntityHistory {
     /// conviction: `verify_bundle` reads the break as the authority having
     /// equivocated about its own history. So when a tick holds two claims, the
     /// choice of which one opens the window decides a verdict — and taking the
-    /// first retained one convicted p1-swarm's honest bots, because the anchor
+    /// first retained one convicted gates/p1-swarm's honest bots, because the anchor
     /// was retained first while every later claim chained from the run loop's
     /// duplicate.
     ///
@@ -760,7 +760,7 @@ mod tests {
     #[test]
     fn a_tick_claimed_twice_is_reported_rather_than_silently_resolved() {
         // A store that quietly picks one of two claims hides a producer bug:
-        // p1-swarm signed tick 0 twice for the whole of P4 and it surfaced by
+        // gates/p1-swarm signed tick 0 twice for the whole of P4 and it surfaced by
         // accident. Recording the same claim again is not a fault; recording a
         // different one at the same tick is.
         let mut log = AuthorityLog::default();

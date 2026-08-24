@@ -538,7 +538,7 @@ fn write_gateway_bulk_latency(
 /// The name is a parameter and the two callers pass
 /// `gateway_intent_server_ms` and `gateway_area_first_page_server_ms` — never
 /// `intent_commit_ms` or `area_first_page_ms`. Those are client round trips
-/// gated by D16, and `p2-dashboard` folds by series name into one histogram
+/// gated by D16, and `gates/p2-dashboard` folds by series name into one histogram
 /// with no source field: a server span written under a gated name would lower
 /// that p99 and pass a gate it never measured.
 fn write_gateway_server_latency(
@@ -2993,9 +2993,9 @@ mod tests {
             22,
             "twenty-one counters plus the type tag: {object:?}"
         );
-        // p3-island's reader takes `duplicate_authority` and ignores every
+        // gates/p3-island's reader takes `duplicate_authority` and ignores every
         // other key, so widening the record is safe for the one parser there
-        // is (`p3-island/src/main.rs`).
+        // is (`gates/p3-island/src/main.rs`).
         assert_eq!(record["duplicate_authority"], 0);
     }
 
