@@ -83,8 +83,8 @@ pub mod window;
 pub mod fdb;
 
 pub use invite::{
-    mint_invite, redeem_invite, InviteCodeGenerator, InviteError, InviteLedger,
-    InviteRedemptionError, MintedInvite, OsInviteCodeGenerator,
+    is_uuid_v7, mint_invite, redeem_invite, uuid_v7, InviteCodeGenerator, InviteError,
+    InviteLedger, InviteRedemptionError, MintedInvite, OsInviteCodeGenerator,
 };
 pub use issuer::{IssuerKeyring, IssuerSigningKey, RotationError};
 pub use issuer_key_lifecycle::{

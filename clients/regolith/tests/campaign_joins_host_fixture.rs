@@ -124,6 +124,7 @@ impl HostFixture {
             host_direct: Some(self.direct.clone()),
             slot: CLIENT_SLOT,
             session_id: session_id.to_owned(),
+            session_token_hex: None,
             wall_start_utc: "2026-08-24T00:00:00Z".to_owned(),
             configured: configured(),
         }
@@ -243,12 +244,17 @@ async fn pump(
                     continue;
                 }
                 let encoded = state.to_canonical();
-                let payload = encode_replication(&(
-                    encoded,
-                    cell,
-                    bot_entity,
-                    broadcast_index * STRIDE, // the sender's absolute tick
-                ));
+                // The harness wire is double-tagged: `send_peer_packets`
+                // wraps `encode_replication`'s output in its own channel tag.
+                let payload = orrery_protocol::channels::tag(
+                    orrery_protocol::channels::Channel::State,
+                    &encode_replication(&(
+                        encoded,
+                        cell,
+                        bot_entity,
+                        broadcast_index * STRIDE, // the sender's absolute tick
+                    )),
+                );
                 let frame = net::Frame {
                     peer: 0, // the sender's slot, per the downlink rule
                     lane: net::Lane::Datagram,

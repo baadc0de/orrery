@@ -19,6 +19,20 @@ fn has_flag(args: &[std::ffi::OsString], flag: &str) -> bool {
 
 fn main() {
     let args: Vec<_> = std::env::args_os().collect();
+    // Print the deterministic transport key for a slot and exit: this is the
+    // NodeId an operator binds a session token to (`orrery-invite
+    // session-token --node …`), printed by the client because the client is
+    // what will dial with it.
+    if let Some(slot) = flag_value(&args, "--print-slot-key") {
+        match slot.parse::<usize>() {
+            Ok(slot) => println!(
+                "{}",
+                orrery_regolith_client::net::slot_secret(slot).public()
+            ),
+            Err(_) => eprintln!("--print-slot-key needs a slot number, got {slot:?}"),
+        }
+        return;
+    }
     let smoke_test = has_flag(&args, "--smoke-test");
     let campaign = has_flag(&args, "--campaign") || args.iter().any(|arg| arg == "--host-node");
     let consented = has_flag(&args, "--campaign-consent");
@@ -67,7 +81,14 @@ fn main() {
             jitter_p50_ms: flag_value(&args, "--expect-jitter-ms")
                 .and_then(|value| value.parse::<u64>().ok())
                 .unwrap_or(0),
-            jitter_p99_ms: 0,
+            // The p99 expectation defaults to the p50 one: an operator who
+            // declared one jitter figure declared it for the profile, and a
+            // hardcoded zero here made the p99 half of the mismatch flag
+            // unfalsifiable (observed 0 == configured 0 on an idle link).
+            jitter_p99_ms: flag_value(&args, "--expect-jitter-p99-ms")
+                .or_else(|| flag_value(&args, "--expect-jitter-ms"))
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(0),
         };
         let session_id = flag_value(&args, "--session-id")
             .unwrap_or_else(|| format!("local-{}", orrery_regolith_client::BUILD_REV));
@@ -76,6 +97,7 @@ fn main() {
             host_direct: flag_value(&args, "--host-direct"),
             slot,
             session_id,
+            session_token_hex: flag_value(&args, "--session-token"),
             wall_start_utc: orrery_regolith_client::campaign::utc_now_iso8601(),
             configured,
         });

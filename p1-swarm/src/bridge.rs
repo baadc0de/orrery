@@ -260,6 +260,7 @@ pub async fn host_accept(
     expected: NodeId,
     index: usize,
     wants_anchor: bool,
+    admission: &crate::exterior::Admission,
 ) -> Result<(HostLink, Option<AnchorFrame>)> {
     let incoming = endpoint
         .accept()
@@ -281,8 +282,28 @@ pub async fn host_accept(
         .await
         .context("no handshake stream arrived")?;
     let request_bytes = read_message(&mut recv).await?;
-    let _request =
+    let request =
         JoinRequest::decode(&request_bytes).map_err(|reason| anyhow::anyhow!("{reason}"))?;
+
+    // #345 §8: version pinning and invite-bound session identity are judged
+    // *here*, before Accept — a stale or uninvited client is told why at join
+    // rather than playing an hour that cannot bank.
+    if let Err(reason) = admission.judge(&request, &remote) {
+        write_message(
+            &mut send,
+            &JoinReply::Reject {
+                reason: reason.clone(),
+            }
+            .encode(),
+        )
+        .await?;
+        // Flush before bailing: dropping the stream with the reply still in
+        // flight resets it, and the dialler would read a dead connection
+        // instead of the reason it is owed.
+        let _ = send.finish();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        bail!("join refused: {reason}");
+    }
 
     write_message(&mut send, &JoinReply::Accept { index }.encode()).await?;
 
@@ -295,10 +316,21 @@ pub async fn host_accept(
         // orphan state bytes starved every reader for an afternoon).
         let claim = read_message(&mut recv).await?;
         let state = read_message(&mut recv).await?;
-        Some(AnchorFrame {
-            claim_json: claim,
-            state,
-        })
+        // An empty claim is the joiner saying, explicitly, that it authors no
+        // witness log (#387: the rendered client — witnessing authoring
+        // stayed out of #386's scope). The slot is seated unanchored, the
+        // already-supported `with_external(…, None, …)` path; the run's
+        // witnessed clauses then cover the bot cohort, and the report shows
+        // nothing was shown or judged for this subject rather than
+        // pretending it was.
+        if claim.is_empty() {
+            None
+        } else {
+            Some(AnchorFrame {
+                claim_json: claim,
+                state,
+            })
+        }
     } else {
         None
     };
@@ -587,7 +619,14 @@ mod tests {
         let host_task = {
             let host_ep = host_ep.clone();
             tokio::spawn(async move {
-                let link_and_anchor = host_accept(&host_ep, expected, slot, true).await;
+                let link_and_anchor = host_accept(
+                    &host_ep,
+                    expected,
+                    slot,
+                    true,
+                    &crate::exterior::Admission::open(),
+                )
+                .await;
                 (host_ep, link_and_anchor)
             })
         };
@@ -603,9 +642,7 @@ mod tests {
                 direct: vec![socket],
             }
             .to_addr(Some(socket)),
-            &JoinRequest {
-                client_rev: "test".into(),
-            },
+            &JoinRequest::plain("test".into()),
             slot,
             Some(anchor_frame),
         )
@@ -681,6 +718,63 @@ mod tests {
         assert!(
             matches!(&up1, f if f.lane == Lane::Datagram && f.peer == 0),
             "first uplink frame routed: {up1:?}"
+        );
+    }
+
+    /// The admission verdict is wired to the accept, not merely computable:
+    /// a host pinning a client rev sends `Reject` (the dialler reads the
+    /// reason) and errors out instead of seating the slot (#345 §8).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_pinned_host_rejects_a_stale_client_at_join() {
+        let slot = 3usize;
+        let expected = bot_key(slot).public();
+        let host_ep = bind(host_key()).await.expect("host endpoint");
+        let remote_ep = bind(bot_key(slot)).await.expect("remote endpoint");
+        let socket = host_ep.bound_sockets()[0];
+
+        let host_task = {
+            let host_ep = host_ep.clone();
+            tokio::spawn(async move {
+                host_accept(
+                    &host_ep,
+                    expected,
+                    slot,
+                    false,
+                    &crate::exterior::Admission {
+                        require_client_rev: Some("pinned-rev".to_owned()),
+                        require_session: None,
+                        issuer: None,
+                    },
+                )
+                .await
+            })
+        };
+        let address = HostAddress {
+            node: host_ep.id(),
+            direct: vec![socket],
+        };
+        let refused = remote_join(
+            &remote_ep,
+            address.to_addr(Some(socket)),
+            &JoinRequest::plain("stale-rev".into()),
+            slot,
+            None,
+        )
+        .await;
+        let reason = refused
+            .expect_err("a stale client must not join")
+            .to_string();
+        assert!(
+            reason.contains("download the current build"),
+            "the dialler reads the remedy, got: {reason}"
+        );
+        let host_side = host_task.await.expect("host task");
+        let host_error = host_side
+            .expect_err("the host must not seat the slot")
+            .to_string();
+        assert!(
+            host_error.contains("join refused"),
+            "the host names the refusal, got: {host_error}"
         );
     }
 }

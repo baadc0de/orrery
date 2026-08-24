@@ -267,6 +267,10 @@ pub struct ExteriorReport {
     /// Downlink frames refused because the queue was full. Zero at criterion
     /// rates; non-zero means the pump fell behind the swarm's clock.
     pub downlink_dropped: u64,
+    /// Whether the peer shipped a tick-zero witness anchor at join. `false`
+    /// for a rendered client (#387): its slot is seated unwitnessed, and the
+    /// witnessed clauses of this report cover the bot cohort only.
+    pub witness_anchored: bool,
 }
 
 /// The whole run.
@@ -534,8 +538,11 @@ pub struct ExteriorSlot {
     cell: CellId,
     /// The tick-zero claim the peer shipped after joining, with the state it
     /// commits to — what watchers arm against instead of reading a local
-    /// `Chain`. Present exactly when witnessing is on.
+    /// `Chain`. Present when witnessing is on and the peer authors a witness
+    /// log (the headless runner does; a rendered client does not, #387).
     pub anchor: Option<(orrery_protocol::StateClaim, RegolithState)>,
+    /// Whether an anchor was shipped at all, kept after `anchor` is taken.
+    pub witness_anchored: bool,
     /// Queues to and from the connection pump.
     pub link: crate::exterior::HostLink,
     /// Frames forwarded up, for the report.
@@ -781,12 +788,14 @@ impl Swarm {
         let entity = PersistId::new(index as u64 + 1);
         self.index_of.insert(node, index);
         let goodbye_flag = link.goodbye.clone();
+        let witness_anchored = anchor.is_some();
         self.exterior = Some(ExteriorSlot {
             index,
             node,
             entity,
             cell,
             anchor,
+            witness_anchored,
             link,
             uplink_frames: 0,
             downlink_frames: 0,
@@ -1173,7 +1182,19 @@ impl Swarm {
             let node = exterior.node;
             match exterior.anchor.take() {
                 Some((claim, state)) => anchors.push((entity, node, claim, state)),
-                None => panic!("witnessing runs need the external peer's tick-zero anchor"),
+                None => {
+                    // A rendered client (#387) authors no witness log and
+                    // says so with an empty anchor at join. The slot seats
+                    // unanchored: no watcher is armed against it, nothing of
+                    // it is shown or judged, and the report carries
+                    // `witness_anchored: false` so a human hour cannot be
+                    // mistaken for an independently witnessed one. The
+                    // headless runner still ships a real anchor and keeps
+                    // the armed path.
+                    eprintln!(
+                        "p1-swarm: exterior slot {index} joined without a witness anchor;                          its own input stream is not independently witnessed this run"
+                    );
+                }
             }
             debug_assert_eq!(index, count - 1, "the exterior takes the last ring slot");
         }
@@ -1389,6 +1410,7 @@ impl Swarm {
                 downlink_frames: exterior.downlink_frames,
                 downlink_dropped: exterior.downlink_dropped,
                 said_goodbye: exterior.goodbye.load(std::sync::atomic::Ordering::Relaxed),
+                witness_anchored: exterior.witness_anchored,
             }),
             player_hours: self.total_peers() as f64 * self.config.seconds as f64 / 3_600.0,
             total_gaps: per_peer.iter().map(|p| p.gaps).sum(),
