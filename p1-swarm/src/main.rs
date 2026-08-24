@@ -186,15 +186,22 @@
 
 mod adjudicate;
 mod bot;
+mod bridge;
 mod chain;
+mod exterior;
+mod peer_runner;
 mod profile;
 mod router;
 mod swarm;
 
 use anyhow::{bail, Context, Result};
 use clap::Parser;
+use orrery_core::CoreCodec as _;
+use std::str::FromStr;
 
 use orrery_games::game::Tamper;
+use orrery_games::regolith::state::RegolithState;
+use orrery_protocol::NodeId;
 use router::Impairment;
 use swarm::{CheatSpec, Criterion, Swarm, SwarmConfig};
 
@@ -336,6 +343,45 @@ struct Args {
     /// Structural self-check for CI images with no time to run a swarm.
     #[arg(long)]
     self_test: bool,
+
+    /// Host an external peer slot (#385): bind a real iroh endpoint, wait for
+    /// the dial, and run the swarm with the remote as an island member.
+    ///
+    /// The external slot's identity is derived from the seed exactly like the
+    /// bots' (`bot_key(peers)`), so a dialler claiming the wrong key is
+    /// refused at accept time. The run paces itself in real time — see the
+    /// runner — so `--seconds` here measures wall-clock seconds.
+    #[arg(long)]
+    external_peer: bool,
+
+    /// Seconds to wait for the external peer's dial before giving up
+    /// (`--external-peer` only).
+    #[arg(long, default_value_t = 60)]
+    join_timeout_secs: u64,
+
+    /// Write the exterior listening address to this file, one line:
+    /// `<node id hex> <ip:port>` (`--external-peer` only). Lets a launcher or
+    /// test hand the runner its dial target without parsing streams.
+    #[arg(long)]
+    listening_file: Option<String>,
+
+    // ── The external runner's own mode ──────────────────────────────────────
+    /// Run as the external peer process instead of hosting a swarm (#385).
+    ///
+    /// Takes the same `--peers/--seconds/--seed/--witness` values the host was
+    /// given: both sides must derive the same island. Impairment is not set
+    /// here — it lives in the *host's* router, where every other packet goes.
+    #[arg(long)]
+    external: bool,
+
+    /// Host node id (hex), required with `--external`.
+    #[arg(long)]
+    host_node: Option<String>,
+
+    /// Host direct socket address, for proofs without a relay. Optional; the
+    /// first bound socket is used when omitted.
+    #[arg(long)]
+    host_direct: Option<String>,
 }
 
 /// Parse `--cheat <tamper>[:count]`.
@@ -438,7 +484,96 @@ fn main() -> Result<()> {
         }
     );
 
-    let report = Swarm::new(config).run();
+    // The external runner replaces everything below the config build: it is
+    // one Bot against a socket, not a swarm host.
+    if args.external {
+        let host_node = args
+            .host_node
+            .as_deref()
+            .context("--external needs --host-node")?;
+        let node = NodeId::from_str(host_node).context("host node id is not hex")?;
+        let direct = match &args.host_direct {
+            Some(socket) => Some(
+                socket
+                    .parse()
+                    .context("host direct address is not ip:port")?,
+            ),
+            None => None,
+        };
+        let run = peer_runner::ExternalRun {
+            peers: config.peers,
+            seconds: config.seconds,
+            seed: config.seed,
+            witnessing: config.witnessing,
+            host: bridge::HostAddress {
+                node,
+                direct: Vec::new(),
+            },
+            direct,
+        };
+        return peer_runner::run(&run);
+    }
+
+    let mut swarm = Swarm::new(config);
+    let _endpoint_guard;
+    let _runtime_guard;
+    if args.external_peer {
+        // The host endpoint's identity is the hosting process's, not the
+        // slot's: the slot key belongs to the dialler and is what accept()
+        // verifies against.
+        let secret = bot::host_key();
+        let expected = bot::bot_key(config.peers).public();
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .context("tokio runtime")?;
+        let (endpoint, link, anchor_bytes) = rt.block_on(async {
+            let endpoint = bridge::bind(secret).await?;
+            eprintln!(
+                "p1-swarm: exterior slot {} listening, node {}, direct {:?}",
+                config.peers,
+                endpoint.id(),
+                endpoint.bound_sockets(),
+            );
+            if let Some(path) = &args.listening_file {
+                let line = format!(
+                    "{} {}\n",
+                    endpoint.id(),
+                    endpoint
+                        .bound_sockets()
+                        .first()
+                        .map(|s| s.to_string())
+                        .unwrap_or_default()
+                );
+                std::fs::write(path, line).context("cannot write the exterior listening file")?;
+            }
+            let joined = tokio::time::timeout(
+                std::time::Duration::from_secs(args.join_timeout_secs),
+                bridge::host_accept(&endpoint, expected, config.peers, config.witnessing),
+            )
+            .await
+            .context("the external peer never dialled in time")??;
+            anyhow::Ok((endpoint, joined.0, joined.1))
+        })?;
+        // Held for their lifetime: dropping the endpoint closes the
+        // connection, and dropping the runtime waits on the pump tasks.
+        _endpoint_guard = endpoint;
+        _runtime_guard = rt;
+
+        let anchor = match anchor_bytes {
+            Some(bytes) => {
+                let claim: orrery_protocol::StateClaim = serde_json::from_slice(&bytes.claim_json)
+                    .context("external anchor claim did not decode")?;
+                let state = RegolithState::decode(&bytes.state)
+                    .context("external anchor state did not decode")?;
+                Some((claim, state))
+            }
+            None => None,
+        };
+        swarm = swarm.with_external(expected, anchor, link);
+    }
+
+    let report = swarm.run();
 
     // Printed as well as serialized: a nightly log is often all that survives a
     // failed job, and a figure that cannot be traced to a seed and a commit is
