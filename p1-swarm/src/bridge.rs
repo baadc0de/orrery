@@ -316,10 +316,21 @@ pub async fn host_accept(
         // orphan state bytes starved every reader for an afternoon).
         let claim = read_message(&mut recv).await?;
         let state = read_message(&mut recv).await?;
-        Some(AnchorFrame {
-            claim_json: claim,
-            state,
-        })
+        // An empty claim is the joiner saying, explicitly, that it authors no
+        // witness log (#387: the rendered client — witnessing authoring
+        // stayed out of #386's scope). The slot is seated unanchored, the
+        // already-supported `with_external(…, None, …)` path; the run's
+        // witnessed clauses then cover the bot cohort, and the report shows
+        // nothing was shown or judged for this subject rather than
+        // pretending it was.
+        if claim.is_empty() {
+            None
+        } else {
+            Some(AnchorFrame {
+                claim_json: claim,
+                state,
+            })
+        }
     } else {
         None
     };

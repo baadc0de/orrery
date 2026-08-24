@@ -576,6 +576,19 @@ pub async fn remote_join(
         Err(reason) => return Err(format!("the host's reply did not decode: {reason}")),
     }
 
+    // The empty anchor pair (#387). A witnessing host reads a tick-zero
+    // anchor — claim, then state — after its Accept, because the headless
+    // runner authors a witness chain and ships one. This client authors no
+    // witness log (#386 kept witnessing authoring out of the client), so it
+    // says so explicitly: two zero-length messages, which the host reads as
+    // "this slot joins unanchored". A host that is not witnessing never
+    // reads them, and the handshake stream is dropped right after on both
+    // sides, so the bytes are harmless there; the sends are best-effort for
+    // exactly that case.
+    step("empty anchor pair");
+    let _ = write_message(&mut send, &[]).await;
+    let _ = write_message(&mut send, &[]).await;
+
     // Data path mirrors the host's (#385): uplink on a uni stream this side
     // opens and announces, downlink on the uni stream the host opened and
     // announced. Both sides open before they accept, so neither accept can

@@ -681,7 +681,19 @@ impl CampaignRuntime {
                 }
                 Lane::Datagram => {
                     let now_ms = self.started_at.elapsed().as_secs_f64() * 1_000.0;
-                    match decode_replication::<(Vec<u8>, CellId, PersistId, u64)>(&frame.payload) {
+                    // Strip the outer channel tag first (the harness wire is
+                    // double-tagged; see `encode_state_broadcast`), then read
+                    // the replication envelope from what remains.
+                    let inner = orrery_protocol::channels::untag(&frame.payload)
+                        .filter(|(channel, _)| {
+                            *channel == orrery_protocol::channels::Channel::State
+                        })
+                        .map(|(_, rest)| rest.to_vec());
+                    let Some(inner) = inner else {
+                        self.undecodable += 1;
+                        continue;
+                    };
+                    match decode_replication::<(Vec<u8>, CellId, PersistId, u64)>(&inner) {
                         Some((encoded, _cell, entity, at)) => {
                             match <RegolithState as CoreCodec>::decode(&encoded) {
                                 Ok(state) => {
@@ -823,11 +835,19 @@ fn encode_state_broadcast(
         Some(state) => state.to_canonical(),
         None => Vec::new(),
     };
-    // Same envelope the harness's broadcast_state writes: postcard tuple of
-    // (canonical state, committed cell, entity, tick), tagged replication.
-    Bytes::from(orrery_protocol::channels::encode_replication(&(
-        encoded, cell, entity, at,
-    )))
+    // The harness's exact wire bytes. `broadcast_state` builds
+    // `encode_replication(...)` — `[State][TAG_REPLICATION][postcard]` — and
+    // `send_peer_packets` then tags the whole payload again with its channel
+    // (`tag(Channel::State, …)`), so what a bot's receive path unwraps is
+    // `[State][State][TAG_REPLICATION][postcard]`: one channel tag stripped
+    // by `receive_peer_packets`, the second by `decode_replication`. #386
+    // sent the single-tagged form and every one of its broadcasts was
+    // counted undecodable by every bot on the island (found by the first
+    // real two-process run, #387); the fixture now pins the double tag.
+    Bytes::from(orrery_protocol::channels::tag(
+        orrery_protocol::channels::Channel::State,
+        &orrery_protocol::channels::encode_replication(&(encoded, cell, entity, at)),
+    ))
 }
 
 /// Decode lowercase/uppercase hex into bytes, with a reason on refusal.
