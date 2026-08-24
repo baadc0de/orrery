@@ -23,9 +23,9 @@
 //! - the **datagram** lane (`aeronet_io::Session` packets — lossy, unordered),
 //! - the **stream** lane (`aeronet_iroh::stream` messages, `Shared` or `Bulk`),
 //! - the **meta** lane, which exists only on this leg: one connection stands in
-//!   for a whole island membership, so facts a real peer would learn from many
-//!   sources — its current interest cell, once per simulated second — travel
-//!   beside the combat traffic rather than inside it.
+//!   for a whole island membership, so connection facts travel beside combat
+//!   traffic. The remote sends its interest cell once per simulated second;
+//!   the host returns settled uplink-datagram acknowledgments.
 //!
 //! Every frame names a **swarm index** — but which end of the hop it names
 //! depends on the direction, because each side routes by the only index it
@@ -42,6 +42,12 @@
 //! [`MAX_FRAME_BYTES`] are refused rather than read — a length field is only
 //! trustworthy until the first desync, and a bounded refusal turns a desync
 //! into a disconnect instead of an allocation.
+//!
+//! An uplink datagram's payload has one more application envelope:
+//! `[sequence u64][datagram bytes]`. After the host's impaired router decides
+//! its fate, the host returns one [`UplinkAck`] on the Meta lane. This is
+//! deliberately above QUIC: the reliable bridge accepting the write is not
+//! evidence that the later impairment decision kept the logical datagram.
 
 // The host-side bridge and the external-peer mode that consume this wire land
 // in the following commits of #385; until they exist only the tests read it.
@@ -72,8 +78,8 @@ pub enum Lane {
     StreamShared,
     /// The stream lane's per-message bulk streams: reliable, unordered.
     StreamBulk,
-    /// Out-of-band facts about the connection itself. Currently one: the
-    /// external peer's interest cell, once per simulated second.
+    /// Out-of-band facts about the connection: remote interest-cell reports
+    /// and host acknowledgments of impaired uplink datagrams.
     Meta,
 }
 
@@ -108,6 +114,100 @@ pub struct Frame {
     pub lane: Lane,
     /// The payload.
     pub payload: Bytes,
+}
+
+/// One sequenced datagram sent from an external peer into the host router.
+///
+/// The sequence belongs to the connection, not to a recipient: one exterior
+/// connection carries datagrams for every island-mate, so a single monotonic
+/// series lets the remote settle every write without per-peer state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UplinkDatagram {
+    /// Connection-local identifier copied into the corresponding [`UplinkAck`].
+    pub sequence: u64,
+    /// The datagram bytes the addressed bot receives when impairment keeps it.
+    pub payload: Bytes,
+}
+
+impl UplinkDatagram {
+    /// Encodes `[sequence u64][datagram bytes]` for a Datagram-lane [`Frame`].
+    #[must_use]
+    pub fn encode(&self) -> Bytes {
+        let mut out = BytesMut::with_capacity(8 + self.payload.len());
+        out.put_u64_le(self.sequence);
+        out.put_slice(&self.payload);
+        out.freeze()
+    }
+
+    /// Decodes a Datagram-lane payload, refusing an absent sequence envelope.
+    #[must_use]
+    pub fn decode(payload: Bytes) -> Option<Self> {
+        if payload.len() < 8 {
+            return None;
+        }
+        let sequence = u64::from_le_bytes(payload[..8].try_into().expect("eight bytes read"));
+        Some(Self {
+            sequence,
+            payload: payload.slice(8..),
+        })
+    }
+}
+
+/// The impaired router's settled decision for one uplink datagram.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UplinkOutcome {
+    /// The router retained the datagram for immediate or delayed delivery.
+    Delivered,
+    /// The router's impairment decision discarded the datagram.
+    Dropped,
+}
+
+/// Application-level evidence for one sequenced uplink datagram.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UplinkAck {
+    /// The connection-local sequence copied from [`UplinkDatagram`].
+    pub sequence: u64,
+    /// What the impaired router decided, after making that decision.
+    pub outcome: UplinkOutcome,
+}
+
+impl UplinkAck {
+    /// Meta payload discriminator. Cell reports are exactly eight bytes,
+    /// announce frames are empty, and goodbye is the single byte `0xff`.
+    const TAG: u8 = 0xa1;
+
+    /// Encodes `[ack tag][outcome][sequence u64]` for a Meta-lane [`Frame`].
+    #[must_use]
+    pub fn encode(self) -> Bytes {
+        let mut out = BytesMut::with_capacity(10);
+        out.put_u8(Self::TAG);
+        out.put_u8(match self.outcome {
+            UplinkOutcome::Delivered => 0,
+            UplinkOutcome::Dropped => 1,
+        });
+        out.put_u64_le(self.sequence);
+        out.freeze()
+    }
+
+    /// Decodes only the ACK member of the Meta lane grammar.
+    #[must_use]
+    pub fn decode(payload: &[u8]) -> Option<Self> {
+        let [tag, outcome, sequence @ ..] = payload else {
+            return None;
+        };
+        if *tag != Self::TAG || sequence.len() != 8 {
+            return None;
+        }
+        let outcome = match outcome {
+            0 => UplinkOutcome::Delivered,
+            1 => UplinkOutcome::Dropped,
+            _ => return None,
+        };
+        Some(Self {
+            sequence: u64::from_le_bytes(sequence.try_into().expect("eight bytes checked")),
+            outcome,
+        })
+    }
 }
 
 /// Wire error: the byte stream can no longer be trusted to resync.
@@ -249,7 +349,7 @@ pub struct JoinRequest {
 
 impl JoinRequest {
     const MAGIC: [u8; 4] = *b"ORRX";
-    const VERSION: u16 = 1;
+    const VERSION: u16 = 2;
 
     /// Encodes the request onto the wire.
     #[must_use]
@@ -435,6 +535,25 @@ mod tests {
             );
             assert!(buf.is_empty(), "exactly one frame consumed");
         }
+    }
+
+    #[test]
+    fn uplink_datagrams_and_meta_acks_round_trip_their_sequence() {
+        let datagram = UplinkDatagram {
+            sequence: 0x0123_4567_89ab_cdef,
+            payload: Bytes::from_static(b"logical datagram"),
+        };
+        assert_eq!(UplinkDatagram::decode(datagram.encode()), Some(datagram));
+
+        for outcome in [UplinkOutcome::Delivered, UplinkOutcome::Dropped] {
+            let ack = UplinkAck {
+                sequence: 0xfeed_face_cafe_beef,
+                outcome,
+            };
+            assert_eq!(UplinkAck::decode(&ack.encode()), Some(ack));
+        }
+        assert_eq!(UplinkAck::decode(&7u64.to_le_bytes()), None, "not a cell");
+        assert_eq!(UplinkAck::decode(&[0xff]), None, "not goodbye");
     }
 
     #[test]
