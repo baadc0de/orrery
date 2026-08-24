@@ -567,15 +567,6 @@ mod tests {
     /// This is the seam #385's two-process proof rides on; if frames can lose
     /// here they can lose anywhere.
     ///
-    /// **Currently ignored, and that is a finding, not a skip.** Post-handshake
-    /// frames vanish in both directions while both writers report success and
-    /// both connections stay open — reproduced with three datagrams or pure
-    /// stream frames, never in the raw-iroh equivalent (`tests/iroh_smoke.rs`,
-    /// passing), so the defect is in this module's wiring, not the transport.
-    /// The two fixes already landed here (anchor as separate length-prefixed
-    /// messages; wildcard dial addresses rewritten to loopback) each removed
-    /// one starvation cause; what remains is tracked on #385.
-    #[ignore = "post-handshake frame starvation, see #385 progress notes"]
     #[tokio::test(flavor = "multi_thread")]
     async fn the_bridge_carries_frames_both_ways() {
         let slot = 2usize;
