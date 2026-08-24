@@ -728,10 +728,20 @@ mod tests {
         // Codes [1] and [3] differ; session entropy is [2] both times, so the
         // second mint would repeat the first session id at the same instant.
         let mut codes = FixedCodes(vec![[1; 32], [2; 32], [3; 32], [2; 32]]);
-        mint_invite(&mut ledger, "Ada".to_owned(), &mut codes, UnixMillis::new(T0))
-            .expect("first mint");
+        mint_invite(
+            &mut ledger,
+            "Ada".to_owned(),
+            &mut codes,
+            UnixMillis::new(T0),
+        )
+        .expect("first mint");
         assert!(matches!(
-            mint_invite(&mut ledger, "Bryn".to_owned(), &mut codes, UnixMillis::new(T0)),
+            mint_invite(
+                &mut ledger,
+                "Bryn".to_owned(),
+                &mut codes,
+                UnixMillis::new(T0)
+            ),
             Err(InviteError::DuplicateCode)
         ));
     }
