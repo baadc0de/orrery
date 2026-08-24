@@ -48,13 +48,11 @@
 #![allow(dead_code)]
 
 use bytes::{BufMut, Bytes, BytesMut};
+use std::sync::atomic::AtomicBool;
+use std::sync::{Arc, mpsc as std_mpsc};
 
 /// `std::sync::mpsc`, named so call sites read as deliberately std rather than
 /// accidentally unqualified.
-pub(crate) mod std_mpsc {
-    pub use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
-}
-
 /// Longest frame the wire will carry or accept.
 ///
 /// Bots link at MTU 1_200 (`Bot::link`), but witness log frames and repair
@@ -89,7 +87,7 @@ impl Lane {
         }
     }
 
-    const fn from_tag(tag: u8) -> Option<Self> {
+    pub(crate) fn from_tag(tag: u8) -> Option<Self> {
         match tag {
             0 => Some(Self::Datagram),
             1 => Some(Self::StreamShared),
@@ -179,26 +177,22 @@ pub struct HostLink {
     /// Cell updates carried on the meta lane, oldest first.
     pub meta: std_mpsc::Receiver<u64>,
     /// False for as long as the pump believes the connection is alive.
-    pub connected: arc_swap::Arc<std::sync::atomic::AtomicBool>,
+    pub connected: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// The remote-side mirror of [`HostLink`]: same queues, opposite directions.
+///
+/// The remote reports its own interest cell by pushing a `Meta`-lane frame
+/// onto [`RemoteLink::uplink`] like any other traffic; there is no separate
+/// meta channel on this side.
 #[derive(Debug)]
 pub struct RemoteLink {
     /// Frames arriving from the host.
     pub downlink: std_mpsc::Receiver<Frame>,
-    /// Frames queued for transmission to the host.
+    /// Frames queued for transmission to the host, meta included.
     pub uplink: std_mpsc::SyncSender<Frame>,
-    /// Cell updates this side should send, once per simulated second.
-    pub meta_tx: std_mpsc::SyncSender<u64>,
     /// False for as long as the pump believes the connection is alive.
-    pub connected: arc_swap::Arc<std::sync::atomic::AtomicBool>,
-}
-
-/// Alias so both link types can name the shared liveness flag without
-/// depending on an atomic-swap crate that is not otherwise used here.
-mod arc_swap {
-    pub type Arc<T> = std::sync::Arc<T>;
+    pub connected: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// A bounded queue pair's depth, chosen so a stalled pump is visible within a
@@ -214,19 +208,20 @@ pub const LINK_QUEUE_DEPTH: usize = 4_096;
 pub fn link_pair() -> (HostLink, RemoteLink) {
     let (uplink_tx, uplink_rx) = std_mpsc::sync_channel(LINK_QUEUE_DEPTH);
     let (downlink_tx, downlink_rx) = std_mpsc::sync_channel(LINK_QUEUE_DEPTH);
-    let (meta_tx, meta_rx) = std_mpsc::sync_channel(LINK_QUEUE_DEPTH);
-    let connected = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let (_, meta_rx) = std::sync::mpsc::sync_channel(LINK_QUEUE_DEPTH);
+    let connected = Arc::new(AtomicBool::new(true));
     (
         HostLink {
             uplink: uplink_rx,
             downlink: downlink_tx,
             meta: meta_rx,
-            connected: std::sync::Arc::clone(&connected),
+            connected: Arc::clone(&connected),
         },
         RemoteLink {
             downlink: downlink_rx,
             uplink: uplink_tx,
-            meta_tx,
+            // The remote's own cell reports ride its uplink as Meta frames;
+            // this channel would only exist for a symmetry nobody uses.
             connected,
         },
     )

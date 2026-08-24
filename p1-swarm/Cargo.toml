@@ -47,12 +47,14 @@ orrery_games = { path = "../crates/orrery_games" }
 bevy_app = { version = "0.19", default-features = false }
 bevy_ecs = { version = "0.19", default-features = false }
 bevy_math = { version = "0.19", default-features = false }
-bevy_time = { version = "0.19", default-features = false }
+bevy_time = { version = "0.19", default-features = false, features = ["std"] }
 aeronet_io = "0.21.0"
 aeronet_iroh = { path = "../vendor/aeronet_iroh" }
 bevy_platform = { version = "0.19", default-features = false, features = ["std"] }
+iroh = "1.0.3"
 iroh-base = { version = "1.0.3", default-features = false, features = ["key"] }
 bytes = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
 glam = { version = "0.32", features = ["serde"] }
 libm = "0.2"
 clap = { version = "4", features = ["derive"] }

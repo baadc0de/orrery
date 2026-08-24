@@ -30,7 +30,7 @@ use bevy_math::Vec3;
 use bevy_time::{Real, Time};
 use bytes::Bytes;
 
-use orrery_core::{tick_rng, Executor, QPos};
+use orrery_core::{tick_rng, CoreCodec, Executor, QPos};
 use orrery_games::game::Tamper;
 use orrery_games::regolith::archetype::Archetype;
 use orrery_games::regolith::order::Order;
@@ -38,6 +38,7 @@ use orrery_games::regolith::state::{Craft, RegolithState};
 use orrery_games::regolith::weapon::WeaponKind;
 use orrery_games::regolith::{Regolith, REGOLITH_RULESET};
 use orrery_net::budget::{UploadBudget, UploadMeter};
+use orrery_net::channels::{encode_replication, Channel};
 use orrery_net::peer_link::{
     forget_departed_links, receive_peer_packets, send_peer_packets, PeerLinkCounters, PeerPacket,
     SendPacket,
@@ -900,6 +901,56 @@ impl Bot {
         };
     }
 
+    /// Broadcasts this bot's own state to the island-mates whose interest
+    /// cells contain this bot's committed cell.
+    ///
+    /// Shared by the swarm loop and the external-peer runner (#385): both must
+    /// replicate from the same function or the human path would send bytes no
+    /// witness had reasoned about.
+    ///
+    /// The craft bytes plus the authority's *committed* cell. D2 makes the
+    /// commitment a single-writer value emitted by the holder: a receiver that
+    /// recomputed it from the position would get the raw geometric cell with
+    /// no hysteresis, so a peer sitting on a boundary would flip cells on
+    /// every packet and flap in and out of the receiver's AOI for reasons that
+    /// have nothing to do with where it is. The entity and the tick travel
+    /// with the state — prediction needs the tick and interest needs the
+    /// identity — and without them a receiver holds bytes it cannot attribute
+    /// to a subject or line up against a claim.
+    pub fn broadcast_state(&mut self, tick: u64) {
+        let (node, cell, payload) = {
+            let cell = self.cell().expect("committed");
+            let entity = self.entity();
+            let state = self.state();
+                (
+                    self.node,
+                    cell,
+                    encode_replication(&(state.to_canonical(), cell, entity, tick + 1)),
+                )
+        };
+        let peers: Vec<NodeId> = self
+            .app
+            .world()
+            .resource::<orrery_net::IslandMembership>()
+            .peers
+            .iter()
+            .filter(|entry| entry.node != node && entry.cells.contains(&cell))
+            .map(|entry| entry.node)
+            .collect();
+        let mut messages = self
+            .app
+            .world_mut()
+            .resource_mut::<bevy_ecs::message::Messages<SendPacket>>();
+        for peer in peers {
+            messages.write(SendPacket {
+                to: peer,
+                channel: Channel::State,
+                payload: Bytes::from(payload.clone()),
+                mode: StreamMode::Shared,
+            });
+        }
+    }
+
     /// Attach a session for `peer`, so the send path has somewhere to write.
     pub fn link(&mut self, peer: NodeId, mtu: usize) {
         self.app.world_mut().spawn((
@@ -1264,6 +1315,20 @@ pub fn bot_key(index: usize) -> iroh_base::SecretKey {
     let mut seed = [0u8; 32];
     seed[0..8].copy_from_slice(&(index as u64 + 1).to_le_bytes());
     seed[31] = 0xB0;
+    iroh_base::SecretKey::from_bytes(&seed)
+}
+
+/// The exterior *host's* transport key.
+///
+/// Distinct namespace from [`bot_key`] on purpose: the host endpoint's node id
+/// names the hosting process, not any island slot, and the two must never
+/// collide — a dialler handed the host's id while holding the slot's key would
+/// otherwise find itself connecting to itself (#385 found this live).
+#[must_use]
+pub fn host_key() -> iroh_base::SecretKey {
+    let mut seed = [0u8; 32];
+    seed[0..8].copy_from_slice(&u64::MAX.to_le_bytes());
+    seed[31] = 0xB1;
     iroh_base::SecretKey::from_bytes(&seed)
 }
 

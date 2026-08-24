@@ -6,12 +6,10 @@ use std::sync::mpsc as std_mpsc;
 use bytes::Bytes;
 use serde::Serialize;
 
-use orrery_core::CoreCodec;
 use orrery_games::game::Tamper;
 use orrery_games::regolith::state::RegolithState;
 use orrery_games::regolith::{pilot::PILOT_SCENARIOS, REGOLITH_RULESET};
-use orrery_net::channels::{encode_replication, Channel};
-use orrery_net::peer_link::{SendPacket, StreamMode};
+use orrery_net::peer_link::StreamMode;
 use orrery_protocol::coord::PeerEntry;
 use orrery_protocol::{CellId, NodeId, PersistId, UniverseSeed, MAX_ADJUDICATION_TICKS};
 
@@ -579,7 +577,11 @@ impl ExteriorSlot {
     /// `router.accept` at the swarm's own tick, never around it, which is the
     /// whole point of the bridge (#385's module docs).
     fn pump_uplink(&mut self, tick: u64, router: &mut Router) {
+        let debug = std::env::var_os("P1_SWARM_BRIDGE_DEBUG").is_some();
         while let Ok(frame) = self.link.uplink.try_recv() {
+            if debug && self.uplink_frames == 0 {
+                eprintln!("bridge[host]: first uplink frame routed into the router");
+            }
             match frame.lane {
                 Lane::Meta => {
                     // One u64: the sender's current interest cell, raw bits.
@@ -849,51 +851,7 @@ impl Swarm {
     /// The payload is the ruleset's own canonical encoding, so the wire cost is
     /// the size the real thing would be rather than a guess.
     fn broadcast(&mut self, index: usize, tick: u64) {
-        let (node, cell, payload) = {
-            let bot = &mut self.bots[index];
-            let cell = bot.cell().expect("committed");
-            let entity = bot.entity();
-            let state = bot.state();
-            // The craft bytes plus the authority's *committed* cell. D2 makes
-            // the commitment a single-writer value emitted by the holder: a
-            // receiver that recomputed it from the position would get the raw
-            // geometric cell with no hysteresis, so a peer sitting on a
-            // boundary would flip cells on every packet and flap in and out of
-            // the receiver's AOI for reasons that have nothing to do with where
-            // it is.
-            // The entity and the tick travel with the state. Both are things
-            // real replication carries anyway — prediction needs the tick and
-            // interest needs the identity — and without them a receiver holds
-            // bytes it cannot attribute to a subject or line up against a
-            // claim.
-            (
-                bot.node,
-                cell,
-                encode_replication(&(state.to_canonical(), cell, entity, tick + 1)),
-            )
-        };
-        let peers: Vec<NodeId> = self.bots[index]
-            .app
-            .world()
-            .resource::<orrery_net::IslandMembership>()
-            .peers
-            .iter()
-            .filter(|entry| entry.node != node && entry.cells.contains(&cell))
-            .map(|entry| entry.node)
-            .collect();
-        let bot = &mut self.bots[index];
-        let mut messages = bot
-            .app
-            .world_mut()
-            .resource_mut::<bevy_ecs::message::Messages<SendPacket>>();
-        for peer in peers {
-            messages.write(SendPacket {
-                to: peer,
-                channel: Channel::State,
-                payload: Bytes::from(payload.clone()),
-                mode: StreamMode::Shared,
-            });
-        }
+        self.bots[index].broadcast_state(tick);
     }
 
     /// Drain what each bot's send path handed the IO layer into the router.
@@ -2348,9 +2306,18 @@ mod tests {
             crate::bot::default_cell_edge_m(),
         ));
         remote_link
-            .meta_tx
-            .send(moved.to_bits())
-            .expect("meta queue accepts");
+            .uplink
+            .send(crate::exterior::Frame {
+                peer: u32::MAX,
+                lane: Lane::Meta,
+                payload: bytes::Bytes::from(moved.to_bits().to_le_bytes().to_vec()),
+            })
+            .expect("the uplink queue accepts meta frames");
+        // The uplink pump is what turns meta frames into roster cells; drain
+        // it the way collect_sends would.
+        if let Some(exterior) = &mut swarm.exterior {
+            exterior.pump_uplink(0, &mut swarm.router);
+        }
         if let Some(exterior) = &mut swarm.exterior {
             while let Ok(raw) = exterior.link.meta.try_recv() {
                 exterior.set_cell_from_bits(raw);
