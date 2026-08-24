@@ -846,25 +846,6 @@ gate_ci_determinism_verdict_prereq() {
 gate_ci_determinism_verdict_run() { return 0; }
 gate_ci_determinism_verdict_evidence() { ev_none; }
 
-# ── the Regolith client's Windows/macOS legs (#344) ──────────────────────────
-#
-# ci.yml's `client-platforms` job. Like the determinism matrix it needs
-# runners this box does not have — and unlike that matrix nothing here could
-# stand in for even one leg, because its whole claim is about two platforms
-# this machine is not. The Linux half of the same suite already runs per
-# commit as part of the gates lane (scripts/check.sh's WORKSPACES table);
-# these two legs exist because a Bevy client can break on Windows or macOS in
-# ways no Linux build sees, which #327 demonstrated by breaking the matrix the
-# other way. The executed-count floor the job asserts lives in
-# scripts/client-tests.sh, whose --self-test rides the gates lane.
-gate_ci_client_platforms_tier() { echo full; }
-gate_ci_client_platforms_prereq() {
-  echo 'needs windows-latest and macos-latest runners; only they can produce these legs'
-  return 1
-}
-gate_ci_client_platforms_run() { return 0; }
-gate_ci_client_platforms_evidence() { ev_none; }
-
 # ── release packaging for the Regolith client (#373) ─────────────────────────
 #
 # GitHub-hosted runners perform the actual package builds. The local gate is a
