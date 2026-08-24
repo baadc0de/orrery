@@ -112,6 +112,8 @@ self_test() {
     || die 'self-test: campaign session rows are no longer validated before banking'
   has '$s.observed_loss_pct != $s.configured_impairment_profile.loss_pct' \
     || die "self-test: the mismatch flag is no longer cross-checked against the row's own numbers; forged verified impairment would bank"
+  has '($imploss * 100)' \
+    || die 'self-test: the declared profile is no longer tied to the recorded impairment; a row could claim different impairment than the run injected'
   has 'def platform' \
     || die 'self-test: the target-to-platform fold is gone; the criterion is counted per platform'
   has 'MISSING' \
@@ -252,6 +254,12 @@ self_test() {
     die "self-test: a row flagging a mismatch its own numbers deny banked"
   fi
   [[ $(st_lines) == "$before" ]] || die 'self-test: the false-alarm refusal still touched the ledger'
+  # A row declaring a different profile than the run recorded is refused even
+  # when internally consistent: the report is the record of what was injected.
+  if st_bank 10 '.session.configured_impairment_profile.loss_pct = 4.5'; then
+    die "self-test: a row claiming a different impairment than the run injected banked"
+  fi
+  [[ $(st_lines) == "$before" ]] || die 'self-test: the profile-mismatch refusal still touched the ledger'
 
   # Each of these is a run that must add no hours at all. The count is checked
   # as well as the exit status: a refusal that has already written the line is
@@ -419,7 +427,16 @@ pipeline_id() {
 # row. Keep it on this append path so every existing refusal still applies.
 validate_session_record() {
   local report=$1 actor=$2 human_session_id=$3 target=$4
-  jq -e --arg actor "$actor" --arg session "$human_session_id" --arg target "$target" '
+  # The run's own configured loss, in fraction form. The row declares the same
+  # profile in percent (`loss_pct`); the two must agree, so a row cannot claim
+  # a different impairment than the report records was injected. Jitter is not
+  # cross-checked: the report names ticks at the sim rate, the row names
+  # milliseconds, and the conversion belongs to no single side of this check.
+  local imploss
+  imploss=$(jq -r '.identity.impairment.loss // empty' "$report")
+  [[ -n $imploss ]] || die 'refusing to bank: report carries no identity.impairment.loss'
+  jq -e --arg actor "$actor" --arg session "$human_session_id" --arg target "$target" \
+    --argjson imploss "$imploss" '
     if .session? == null then true else
       .session as $s
       | ($s.session_id | type == "string" and length > 0)
@@ -442,6 +459,12 @@ validate_session_record() {
       and ($s.afk_seconds | type == "number" and . >= 0)
       and ($s.afk_capped | type == "boolean")
       and ($s.impairment_mismatch | type == "boolean")
+      # The declared profile must be the run profile: the row may not claim a
+      # different impairment than the report records was injected. Percent vs
+      # fraction differs by exactly 100; the tolerance only absorbs binary
+      # representation noise around that product.
+      and ((($s.configured_impairment_profile.loss_pct - ($imploss * 100))
+            | if . < 0 then - . else . end) < 1e-6)
       # The flag must agree with the numbers in the row itself, recomputed
       # here: observation may disagree with configuration (that is what the
       # flag is for), but a row claiming verified impairment its measurements

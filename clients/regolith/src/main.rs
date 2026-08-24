@@ -60,14 +60,20 @@ fn main() {
         // Operator-declared impairment. Shown beside the measurement in the
         // F3 pane and compared against it by the banking row; never
         // substituted for what the link actually did.
+        let expect_jitter_ms = flag_value(&args, "--expect-jitter-ms")
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(0);
         let configured = ConfiguredImpairment {
             loss_pct: flag_value(&args, "--expect-loss")
                 .and_then(|value| value.parse::<f64>().ok())
                 .unwrap_or(0.0),
-            jitter_p50_ms: flag_value(&args, "--expect-jitter-ms")
+            jitter_p50_ms: expect_jitter_ms,
+            // The criterion's profile declares one spike magnitude, so an
+            // unset p99 inherits the p50 declaration rather than claiming a
+            // zero the operator never stated.
+            jitter_p99_ms: flag_value(&args, "--expect-jitter-p99-ms")
                 .and_then(|value| value.parse::<u64>().ok())
-                .unwrap_or(0),
-            jitter_p99_ms: 0,
+                .unwrap_or(expect_jitter_ms),
         };
         let session_id = flag_value(&args, "--session-id")
             .unwrap_or_else(|| format!("local-{}", orrery_regolith_client::BUILD_REV));
