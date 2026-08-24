@@ -359,6 +359,12 @@ struct Args {
     #[arg(long, default_value_t = 60)]
     join_timeout_secs: u64,
 
+    /// Write the exterior listening address to this file, one line:
+    /// `<node id hex> <ip:port>` (`--external-peer` only). Lets a launcher or
+    /// test hand the runner its dial target without parsing streams.
+    #[arg(long)]
+    listening_file: Option<String>,
+
     // ── The external runner's own mode ──────────────────────────────────────
     /// Run as the external peer process instead of hosting a swarm (#385).
     ///
@@ -529,6 +535,18 @@ fn main() -> Result<()> {
                 endpoint.id(),
                 endpoint.bound_sockets(),
             );
+            if let Some(path) = &args.listening_file {
+                let line = format!(
+                    "{} {}\n",
+                    endpoint.id(),
+                    endpoint
+                        .bound_sockets()
+                        .first()
+                        .map(|s| s.to_string())
+                        .unwrap_or_default()
+                );
+                std::fs::write(path, line).context("cannot write the exterior listening file")?;
+            }
             let joined = tokio::time::timeout(
                 std::time::Duration::from_secs(args.join_timeout_secs),
                 bridge::host_accept(&endpoint, expected, config.peers, config.witnessing),

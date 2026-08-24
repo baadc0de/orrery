@@ -42,6 +42,7 @@ async fn handshake_then_frames_on_one_stream() {
         ))],
     );
 
+    eprintln!("B1: endpoints bound");
     let remote_for_dial = remote_ep.clone();
     let dialer = tokio::spawn(async move { remote_for_dial.connect(addr, b"x/1").await.unwrap() });
     let incoming = host_ep.accept().await.unwrap();

@@ -118,6 +118,20 @@ fn mark_dead(connected: &Arc<AtomicBool>) {
     connected.store(false, Ordering::Relaxed);
 }
 
+/// Announces a freshly opened uni stream: the peer's `accept_uni` only sees a
+/// stream once a frame arrives on it, and every pump starts by waiting for a
+/// header - so an unannounced stream is a stream nobody will ever accept. A
+/// zero-length Meta frame is the perfect beacon: parseable, routable, and
+/// dropped by the receiver's meta routing as too short to be a cell report.
+async fn announce(stream: &mut SendStream) -> Result<()> {
+    let frame = Frame {
+        peer: u32::MAX,
+        lane: Lane::Meta,
+        payload: Bytes::new(),
+    };
+    write_stream_frame(stream, &frame).await
+}
+
 /// Length-prefix read of one handshake message.
 async fn read_message(recv: &mut RecvStream) -> Result<Vec<u8>> {
     let mut header = [0u8; 4];
@@ -153,8 +167,24 @@ async fn read_stream_frame(recv: &mut RecvStream) -> Result<Option<Frame>> {
     // A short read here is a clean end or a dead link; either way this pump's
     // work is done and the flag says so.
     let mut header = [0u8; 9];
+    let debug = std::env::var_os("P1_SWARM_BRIDGE_DEBUG").is_some();
+    if debug {
+        eprintln!("bridge[{}]: awaiting header", std::process::id());
+    }
     if recv.read_exact(&mut header).await.is_err() {
+        if debug {
+            eprintln!("bridge[{}]: header read ended", std::process::id());
+        }
         return Ok(None);
+    }
+    if debug {
+        eprintln!(
+            "bridge[{}]: header lane {} peer {} len {}",
+            std::process::id(),
+            header[0],
+            u32::from_le_bytes(header[1..5].try_into().unwrap()),
+            u32::from_le_bytes(header[5..9].try_into().unwrap()),
+        );
     }
     let Some(lane) = Lane::from_tag(header[0]) else {
         bail!("unknown lane byte on the exterior stream");
@@ -259,12 +289,38 @@ pub async fn host_accept(
     };
 
     // The same stream now carries the shared/meta lane in both directions.
+    // Data path: frames ride two uni streams opened after the handshake, one
+    // per direction - NOT the handshake stream, which went silently deaf when
+    // reused in every test that exercised it (#385). The host opens its
+    // downlink stream before accepting the runner's uplink stream: both sides
+    // opening first makes both accepts resolve immediately, where
+    // accept-first on both ends deadlocks each against the other's open.
+    drop(send);
+    drop(recv);
+    let mut downlink_send = connection
+        .open_uni()
+        .await
+        .context("could not open downlink stream")?;
+    announce(&mut downlink_send)
+        .await
+        .context("downlink announce failed")?;
+    let uplink_recv = connection
+        .accept_uni()
+        .await
+        .context("uplink stream never arrived")?;
+
     let connected = Arc::new(AtomicBool::new(true));
     let (uplink_tx, uplink_rx) = std_mpsc::sync_channel::<Frame>(LINK_QUEUE_DEPTH);
     let (downlink_tx, downlink_rx) = std_mpsc::sync_channel::<Frame>(LINK_QUEUE_DEPTH);
     let (meta_tx, meta_rx) = std_mpsc::sync_channel::<u64>(LINK_QUEUE_DEPTH);
-    pump_ordered_reader_to(Arc::clone(&connected), recv, uplink_tx, Some(meta_tx));
-    pump_writer(Arc::clone(&connected), send, downlink_rx);
+
+    pump_ordered_reader_to(
+        Arc::clone(&connected),
+        uplink_recv,
+        uplink_tx,
+        Some(meta_tx),
+    );
+    pump_writer(Arc::clone(&connected), downlink_send, downlink_rx);
 
     // A freshly spawned task has not necessarily reached its first await, and
     // an unpolled datagram reader drops what arrives in that window. Yielding
@@ -322,14 +378,27 @@ pub async fn remote_join(
         write_message(&mut send, &anchor.state).await?;
     }
 
+    // Data path mirrors the host's: uplink on a uni stream this side opens,
+    // downlink on the uni stream the host opened. See host_accept's note.
+    drop(send);
+    drop(recv);
+    let downlink_recv = connection
+        .accept_uni()
+        .await
+        .context("downlink stream never arrived")?;
+    let uplink_send = connection
+        .open_uni()
+        .await
+        .context("could not open uplink stream")?;
+
     let connected = Arc::new(AtomicBool::new(true));
     let (outbound_tx, outbound_rx) = std_mpsc::sync_channel::<Frame>(LINK_QUEUE_DEPTH);
     let (inbound_tx, inbound_rx) = std_mpsc::sync_channel::<Frame>(LINK_QUEUE_DEPTH);
 
     // Everything arriving is this peer's inbound traffic; nothing arrives on
     // the meta lane because the host never sends it.
-    pump_ordered_reader_to(Arc::clone(&connected), recv, inbound_tx, None);
-    pump_writer(Arc::clone(&connected), send, outbound_rx);
+    pump_ordered_reader_to(Arc::clone(&connected), downlink_recv, inbound_tx, None);
+    pump_writer(Arc::clone(&connected), uplink_send, outbound_rx);
 
     Ok(RemoteLink {
         downlink: inbound_rx,
@@ -390,8 +459,21 @@ fn pump_writer(
                     pid, frame.lane, frame.peer
                 );
             }
-            if write_stream_frame(&mut shared_send, &frame).await.is_err() {
-                break;
+            match write_stream_frame(&mut shared_send, &frame).await {
+                Ok(()) => {
+                    if debug {
+                        eprintln!(
+                            "bridge[{}]: wrote lane {:?} peer {}",
+                            pid, frame.lane, frame.peer
+                        );
+                    }
+                }
+                Err(error) => {
+                    if debug {
+                        eprintln!("bridge[{}]: WRITE FAILED: {error}", pid);
+                    }
+                    break;
+                }
             }
         }
         mark_dead(&connected);

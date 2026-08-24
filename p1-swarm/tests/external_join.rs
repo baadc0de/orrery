@@ -14,7 +14,6 @@
 #![allow(missing_docs)]
 
 use std::process::{Command, Stdio};
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 /// Long enough for two Bevy apps to boot and one 8-second real-time run to
@@ -33,9 +32,12 @@ fn an_external_peer_joins_witnesses_and_moves_frames() {
     let report_path = dir.join("report.json");
 
     // The host: impaired and witnessed like every other P4 leg, plus the
-    // external slot. This leg proves joining, witnessing and frame flow, not
-    // roaming distance — eight wall-clock seconds cannot visit an hour's
-    // cells, so `--min-cells` is scoped to match.
+    // external slot. Its stderr is inherited (evidence lands in the test
+    // log for free); the dial target comes from a listening file, which is
+    // deterministic where stream parsing was not.
+    let host_err = dir.join("host.err");
+    let host_err = host_err.as_os_str().to_str().unwrap().to_owned();
+    let listening_path = dir.join("listening.txt");
     let mut host = Command::new(bin())
         .args([
             "--peers",
@@ -54,62 +56,30 @@ fn an_external_peer_joins_witnesses_and_moves_frames() {
             "--json",
         ])
         .arg(&report_path)
+        .arg("--listening-file")
+        .arg(&listening_path)
         .stdout(Stdio::null())
-        .stderr(Stdio::piped())
+        .stderr(std::process::Stdio::from(
+            std::fs::File::create(&host_err).expect("host err file"),
+        ))
         .spawn()
         .expect("host process starts");
 
-    // Drained to EOF by a thread: a pipe nobody reads fills, and then the
-    // host blocks writing its own telemetry and hangs for a reason that looks
-    // exactly like a bridge defect. The transcript doubles as evidence when an
-    // assertion fails.
-    let stderr = host.stderr.take().expect("host stderr piped");
-    type ListeningSlot = Arc<Mutex<Option<(String, Option<String>)>>>;
-    let listening: ListeningSlot = Arc::new(Mutex::new(None));
-    let transcript: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-    {
-        let listening = Arc::clone(&listening);
-        let transcript = Arc::clone(&transcript);
-        std::thread::spawn(move || {
-            use std::io::BufRead;
-            for line in std::io::BufReader::new(stderr).lines() {
-                let Ok(line) = line else { break };
-                if let Some(rest) = line.strip_prefix("p1-swarm: exterior slot ") {
-                    let node = rest.find("node ").and_then(|at| {
-                        let tail = &rest[at + "node ".len()..];
-                        tail.find(',').map(|end| tail[..end].to_owned())
-                    });
-                    let direct = rest.find("direct ").and_then(|at| {
-                        let tail = &rest[at + "direct ".len()..];
-                        let open = tail.find('[')?;
-                        let close = tail.find(']')?;
-                        let body = &tail[open + 1..close];
-                        body.split(',')
-                            .next()
-                            .map(|s| s.trim().trim_end_matches('/').to_owned())
-                            .filter(|s| !s.is_empty())
-                    });
-                    if let Some(node) = node {
-                        *listening.lock().unwrap() = Some((node, direct));
-                    }
-                }
-                transcript.lock().unwrap().push(line);
-            }
-        });
-    }
-
-    // Wait for the listening line, then dial.
-    let deadline = std::time::Instant::now() + PROCESS_TIMEOUT;
-    let address = loop {
-        if let Some(address) = listening.lock().unwrap().clone() {
-            break address;
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let line = loop {
+        match std::fs::read_to_string(&listening_path) {
+            Ok(line) if !line.trim().is_empty() => break line,
+            _ => {}
         }
         assert!(
             std::time::Instant::now() < deadline,
-            "the host never printed a complete listening line"
+            "the host never wrote its listening file"
         );
         std::thread::sleep(Duration::from_millis(100));
     };
+    let mut parts = line.split_whitespace();
+    let node_hex = parts.next().expect("node id").to_owned();
+    let direct = parts.next().map(|d| d.replace("0.0.0.0", "127.0.0.1"));
 
     // The runner: same peers/seconds/seed/witness so both sides derive the
     // same island from the seed alone.
@@ -124,11 +94,10 @@ fn an_external_peer_joins_witnesses_and_moves_frames() {
             "7",
             "--witness",
             "--host-node",
-            &address.0,
+            &node_hex,
         ])
         .args(
-            address
-                .1
+            direct
                 .iter()
                 .flat_map(|d| ["--host-direct".into(), d.clone()]),
         )
@@ -151,18 +120,17 @@ fn an_external_peer_joins_witnesses_and_moves_frames() {
         std::thread::sleep(Duration::from_millis(200));
     }
 
-    let dump_transcript = |what: &str| {
-        eprintln!("--- {what} stderr (tail) ---");
-        for line in transcript.lock().unwrap().iter().rev().take(40).rev() {
-            eprintln!("{line}");
-        }
-    };
-
     let host_status = host.wait().expect("host wait");
     let remote_status = remote.wait().expect("runner wait");
     if !host_status.success() || !remote_status.success() {
         // Before any assertion: the dying words are the evidence.
-        dump_transcript("host");
+        eprintln!("--- host stderr (tail) ---");
+        if let Ok(lines) = std::fs::read_to_string(&host_err) {
+            let collected: Vec<&str> = lines.lines().collect();
+            for line in collected.iter().rev().take(40).rev() {
+                eprintln!("{line}");
+            }
+        }
     }
     assert!(
         remote_status.success(),
