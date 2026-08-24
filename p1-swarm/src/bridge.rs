@@ -293,11 +293,6 @@ pub async fn host_accept(
         // orphan state bytes starved every reader for an afternoon).
         let claim = read_message(&mut recv).await?;
         let state = read_message(&mut recv).await?;
-        let extra = read_message(&mut recv).await;
-        if std::env::var_os("P1_SWARM_BRIDGE_DEBUG").is_some() {
-            eprintln!("bridge[{}]: extra msg {:?}", std::process::id(), extra.as_deref().map(|b| String::from_utf8_lossy(b)));
-        }
-        let _ = extra;
         Some(AnchorFrame {
             claim_json: claim,
             state,
@@ -333,13 +328,20 @@ pub async fn host_accept(
     let (meta_tx, meta_rx) = std_mpsc::sync_channel::<u64>(LINK_QUEUE_DEPTH);
 
     pump_ordered_reader_to(
+        "host",
         Arc::clone(&connected),
         connection.clone(),
         uplink_recv,
         uplink_tx,
         Some(meta_tx),
     );
-    pump_writer(Arc::clone(&connected), connection, downlink_send, downlink_rx);
+    pump_writer(
+        "host",
+        Arc::clone(&connected),
+        connection,
+        downlink_send,
+        downlink_rx,
+    );
 
     // A freshly spawned task has not necessarily reached its first await, and
     // an unpolled datagram reader drops what arrives in that window. Yielding
@@ -396,9 +398,6 @@ pub async fn remote_join(
         write_message(&mut send, &anchor.claim_json).await?;
         write_message(&mut send, &anchor.state).await?;
     }
-    // TEMP probe (#385): does a SECOND write on this half cross where the
-    // first did?
-    write_message(&mut send, b"second").await?;
 
     // Data path mirrors the host's: uplink on a uni stream this side opens
     // and announces, downlink on the uni stream the host opened and
@@ -410,10 +409,17 @@ pub async fn remote_join(
         .open_uni()
         .await
         .context("could not open uplink stream")?;
+    if std::env::var_os("P1_SWARM_BRIDGE_DEBUG").is_some() {
+        eprintln!(
+            "bridge[{}]: opened uplink uni {:?}",
+            std::process::id(),
+            uplink_send.id()
+        );
+    }
     announce(&mut uplink_send)
         .await
         .context("uplink announce failed")?;
-    let mut downlink_recv = connection
+    let downlink_recv = connection
         .accept_uni()
         .await
         .context("downlink stream never arrived")?;
@@ -425,13 +431,20 @@ pub async fn remote_join(
     // Everything arriving is this peer's inbound traffic; nothing arrives on
     // the meta lane because the host never sends it.
     pump_ordered_reader_to(
+        "remote",
         Arc::clone(&connected),
         connection.clone(),
         downlink_recv,
         inbound_tx,
         None,
     );
-    pump_writer(Arc::clone(&connected), connection, uplink_send, outbound_rx);
+    pump_writer(
+        "remote",
+        Arc::clone(&connected),
+        connection,
+        uplink_send,
+        outbound_rx,
+    );
 
     Ok(RemoteLink {
         downlink: inbound_rx,
@@ -444,6 +457,7 @@ pub async fn remote_join(
 /// lane. A mid-frame end or a bad length ends the connection — after a desync
 /// there are no frame boundaries left to find.
 fn pump_ordered_reader_to(
+    side: &'static str,
     connected: Arc<AtomicBool>,
     connection: Connection,
     mut recv: RecvStream,
@@ -460,7 +474,7 @@ fn pump_ordered_reader_to(
         let _keep_alive = connection;
         if debug {
             eprintln!(
-                "bridge[{}]: ordered reader armed on stream {:?}",
+                "bridge[{side}][{}]: reader armed on stream {:?}",
                 pid,
                 recv.id()
             );
@@ -481,6 +495,7 @@ fn pump_ordered_reader_to(
 /// The writer every side runs: takes its outbound queue and writes each frame
 /// onto the stream in whatever order the queue holds.
 fn pump_writer(
+    side: &'static str,
     connected: Arc<AtomicBool>,
     connection: Connection,
     mut shared_send: SendStream,
@@ -491,7 +506,11 @@ fn pump_writer(
     tokio::spawn(async move {
         let _keep_alive = connection;
         if debug {
-            eprintln!("bridge[{}]: writer armed", pid);
+            eprintln!(
+                "bridge[{side}][{}]: writer armed on stream {:?}",
+                pid,
+                shared_send.id()
+            );
         }
         loop {
             let frame = match outbound_rx.recv() {
@@ -500,7 +519,7 @@ fn pump_writer(
             };
             if debug {
                 eprintln!(
-                    "bridge[{}]: writing lane {:?} peer {}",
+                    "bridge[{side}][{}]: writing lane {:?} peer {}",
                     pid, frame.lane, frame.peer
                 );
             }
@@ -508,7 +527,7 @@ fn pump_writer(
                 Ok(()) => {
                     if debug {
                         eprintln!(
-                            "bridge[{}]: wrote lane {:?} peer {}",
+                            "bridge[{side}][{}]: wrote lane {:?} peer {}",
                             pid, frame.lane, frame.peer
                         );
                     }
