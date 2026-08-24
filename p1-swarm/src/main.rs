@@ -187,6 +187,7 @@
 mod adjudicate;
 mod bot;
 mod chain;
+mod exterior;
 mod profile;
 mod router;
 mod swarm;
