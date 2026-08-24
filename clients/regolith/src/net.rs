@@ -188,19 +188,36 @@ impl UplinkAck {
 }
 
 /// The handshake a dialling peer sends before any combat traffic
-/// (`exterior::JoinRequest`, version 2). Invite-bound session identity and
-/// version pinning are slice 3's extension (#345 §8); until then this is the
-/// whole wire representation, which is why dialling needs the host NodeId
-/// alone.
+/// (`exterior::JoinRequest`, version 2, with #387's identity tail).
+///
+/// The tail carries the invite-bound session identity and the operator-signed
+/// session token the host verifies at join (#345 §8). It rides after the
+/// revision at the same wire version, because the version-2 decoder always
+/// stopped reading at the revision: an old host ignores the tail, and a
+/// tail-less request decodes here with both fields `None`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JoinRequest {
     /// Build revision of the joining process, for the report and for pinning.
     pub client_rev: String,
+    /// Pre-minted campaign session id from the invite (UUIDv7).
+    pub session_id: Option<String>,
+    /// Encoded `SessionTokenV1` authorizing this client's transport identity.
+    pub token: Option<Vec<u8>>,
 }
 
 impl JoinRequest {
     const MAGIC: [u8; 4] = *b"ORRX";
     const VERSION: u16 = 2;
+
+    /// A plain, identity-less join.
+    #[must_use]
+    pub fn plain(client_rev: String) -> Self {
+        Self {
+            client_rev,
+            session_id: None,
+            token: None,
+        }
+    }
 
     /// Encodes the request onto the wire.
     #[must_use]
@@ -211,6 +228,15 @@ impl JoinRequest {
         let rev = self.client_rev.as_bytes();
         out.push(u8::try_from(rev.len()).unwrap_or(u8::MAX));
         out.extend_from_slice(&rev[..rev.len().min(u8::MAX.into())]);
+        if self.session_id.is_some() || self.token.is_some() {
+            let session = self.session_id.as_deref().unwrap_or("").as_bytes();
+            out.push(u8::try_from(session.len()).unwrap_or(u8::MAX));
+            out.extend_from_slice(&session[..session.len().min(u8::MAX.into())]);
+            let token = self.token.as_deref().unwrap_or(&[]);
+            let token_len = u16::try_from(token.len()).unwrap_or(u16::MAX);
+            out.extend_from_slice(&token_len.to_le_bytes());
+            out.extend_from_slice(&token[..token.len().min(u16::MAX.into())]);
+        }
         out
     }
 
@@ -239,8 +265,37 @@ impl JoinRequest {
         if rest.len() < rev_len {
             return Err("join truncated inside revision");
         }
+        let client_rev = String::from_utf8_lossy(&rest[..rev_len]).into_owned();
+        let rest = &rest[rev_len..];
+        if rest.is_empty() {
+            return Ok(Self::plain(client_rev));
+        }
+        let session_len = rest[0] as usize;
+        let rest = &rest[1..];
+        if rest.len() < session_len {
+            return Err("join truncated inside session id");
+        }
+        let session_id = match &rest[..session_len] {
+            [] => None,
+            bytes => Some(String::from_utf8_lossy(bytes).into_owned()),
+        };
+        let rest = &rest[session_len..];
+        if rest.len() < 2 {
+            return Err("join truncated before token length");
+        }
+        let token_len = u16::from_le_bytes(rest[0..2].try_into().expect("two bytes read")) as usize;
+        let rest = &rest[2..];
+        if rest.len() < token_len {
+            return Err("join truncated inside token");
+        }
+        let token = match &rest[..token_len] {
+            [] => None,
+            bytes => Some(bytes.to_vec()),
+        };
         Ok(Self {
-            client_rev: String::from_utf8_lossy(&rest[..rev_len]).into_owned(),
+            client_rev,
+            session_id,
+            token,
         })
     }
 }
@@ -707,9 +762,7 @@ mod tests {
     /// disagree, one side changed the grammar and both must move together.
     #[test]
     fn join_request_bytes_match_slice_1() {
-        let request = JoinRequest {
-            client_rev: "abc1234".to_owned(),
-        };
+        let request = JoinRequest::plain("abc1234".to_owned());
         assert_eq!(
             request.encode(),
             vec![
@@ -725,10 +778,7 @@ mod tests {
             JoinRequest::decode(b"NOPE\x01\x00"),
             Err("not an orrery exterior join")
         );
-        let mut wrong_version = JoinRequest {
-            client_rev: "x".into(),
-        }
-        .encode();
+        let mut wrong_version = JoinRequest::plain("x".into()).encode();
         wrong_version[4] = 0xFF;
         assert_eq!(
             JoinRequest::decode(&wrong_version),
@@ -736,23 +786,44 @@ mod tests {
         );
         assert_eq!(
             // Magic + version only: the length byte has not arrived.
-            JoinRequest::decode(
-                &JoinRequest {
-                    client_rev: "x".into()
-                }
-                .encode()[..6]
-            ),
+            JoinRequest::decode(&JoinRequest::plain("x".into()).encode()[..6]),
             Err("join truncated before revision")
         );
         assert_eq!(
             // Length byte present, payload cut short.
-            JoinRequest::decode(
-                &JoinRequest {
-                    client_rev: "x".into()
-                }
-                .encode()[..7]
-            ),
+            JoinRequest::decode(&JoinRequest::plain("x".into()).encode()[..7]),
             Err("join truncated inside revision")
+        );
+    }
+
+    /// #387's identity tail: `[session len u8][session][token len u16 LE]
+    /// [token]` after the revision, byte-identical to `exterior::JoinRequest`.
+    /// A tail-less request still decodes (both fields `None`), which is what
+    /// keeps this client able to join a pre-#387 host and vice versa.
+    #[test]
+    fn join_request_identity_tail_matches_slice_3() {
+        let request = JoinRequest {
+            client_rev: "ab".to_owned(),
+            session_id: Some("cd".to_owned()),
+            token: Some(vec![0xEE, 0xFF]),
+        };
+        assert_eq!(
+            request.encode(),
+            vec![
+                b'O', b'R', b'R', b'X', // magic
+                0x02, 0x00, // version 2, LE
+                2, b'a', b'b', // revision
+                2, b'c', b'd', // session id
+                0x02, 0x00, // token length, LE
+                0xEE, 0xFF, // token bytes
+            ]
+        );
+        assert_eq!(JoinRequest::decode(&request.encode()), Ok(request.clone()));
+        let mut truncated = request.encode();
+        truncated.truncate(truncated.len() - 1);
+        assert_eq!(
+            JoinRequest::decode(&truncated),
+            Err("join truncated inside token")
         );
     }
 

@@ -124,6 +124,7 @@ impl HostFixture {
             host_direct: Some(self.direct.clone()),
             slot: CLIENT_SLOT,
             session_id: session_id.to_owned(),
+            session_token_hex: None,
             wall_start_utc: "2026-08-24T00:00:00Z".to_owned(),
             configured: configured(),
         }

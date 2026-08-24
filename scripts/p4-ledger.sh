@@ -109,6 +109,8 @@ self_test() {
     || die 'self-test: the bot|human dimension is gone; P4 cannot check its required mix'
   has 'validate_session_record' \
     || die 'self-test: campaign session rows are no longer validated before banking'
+  has 'impairment_mismatch ==' \
+    || die 'self-test: the mismatch flag is no longer checked against the row'\''s own numbers; a post-hoc edit of the measured impairment would bank'
   has 'def platform' \
     || die 'self-test: the target-to-platform fold is gone; the criterion is counted per platform'
   has 'MISSING' \
@@ -235,6 +237,35 @@ self_test() {
   if "$0" append "$dir/bad-session.json" >/dev/null 2>&1; then
     die 'self-test: malformed campaign session row banked'
   fi
+  # Tamper-evidence for the measured impairment (#387): editing the observed
+  # figure after the fact leaves the mismatch flag contradicting the numbers,
+  # and flipping the flag on an agreeing row is the same lie the other way.
+  # Both must refuse. The refusal must be the arithmetic check, not the
+  # field-shape one, so each row is otherwise well-formed.
+  jq '.session.observed_loss_pct = 0' "$dir/r.json" > "$dir/tampered-observed.json"
+  if "$0" append "$dir/tampered-observed.json" >/dev/null 2>&1; then
+    die 'self-test: a row whose observed impairment was edited post-hoc banked'
+  fi
+  jq '.session.impairment_mismatch = true' "$dir/r.json" > "$dir/tampered-flag.json"
+  if "$0" append "$dir/tampered-flag.json" >/dev/null 2>&1; then
+    die 'self-test: a row claiming a mismatch its own numbers refute banked'
+  fi
+  # And the honest direction still banks: a genuinely mismatching row that
+  # says so is flagged evidence, not a refusal.
+  st_report 11 '.player_hours = 1 | .seconds = 3600 | .peers = 1
+    | .session = {
+        session_id: "018f8f4e-5c90-7abc-8123-000000000011",
+        wall_start: "2026-08-23T12:00:00Z", wall_end: "2026-08-23T13:00:00Z",
+        distinct_play_minutes: 60, banked_minutes: 60,
+        platform_triple: "x86_64-unknown-linux-gnu", client_rev: "self-test",
+        ruleset_id: "52", ruleset_version: 2, pipeline_digest: "selftestpipeline",
+        actor: "human", configured_impairment_profile: {loss_pct: 3, jitter_p50_ms: 100, jitter_p99_ms: 100},
+        observed_loss_pct: 3.4, observed_jitter_p50_ms: 96, observed_jitter_p99_ms: 210,
+        afk_seconds: 0, afk_capped: false, impairment_mismatch: true
+      }
+    | .identity.human_session_id = "018f8f4e-5c90-7abc-8123-000000000011"' human '018f8f4e-5c90-7abc-8123-000000000011' >/dev/null
+  "$0" append "$dir/r.json" >/dev/null 2>&1 \
+    || die 'self-test: an honestly flagged mismatching row was refused'
 
   # Each of these is a run that must add no hours at all. The count is checked
   # as well as the exit status: a refusal that has already written the line is
@@ -429,6 +460,22 @@ validate_session_record() {
     end
   ' "$report" >/dev/null \
     || die 'refusing to bank: incomplete or inconsistent campaign session row'
+  # The mismatch flag is recomputable from the row's own numbers, and #387
+  # requires that it *fired* whenever observation disagrees with
+  # configuration. Checking the arithmetic here is what makes the flag
+  # tamper-evident: a post-hoc edit of observed_loss_pct (to hide a mismatch,
+  # or to fake one) leaves the flag contradicting the numbers next to it, and
+  # a row whose own fields disagree with each other is not evidence.
+  jq -e '
+    if .session? == null then true else
+      .session as $s
+      | ($s.impairment_mismatch ==
+          (($s.observed_loss_pct != $s.configured_impairment_profile.loss_pct)
+           or ($s.observed_jitter_p50_ms != $s.configured_impairment_profile.jitter_p50_ms)
+           or ($s.observed_jitter_p99_ms != $s.configured_impairment_profile.jitter_p99_ms)))
+    end
+  ' "$report" >/dev/null \
+    || die 'refusing to bank: session impairment_mismatch contradicts the row'\''s own observed/configured impairment'
 }
 
 cmd_append() {

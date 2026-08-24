@@ -365,6 +365,25 @@ struct Args {
     #[arg(long)]
     listening_file: Option<String>,
 
+    /// Refuse a join whose client build is not exactly this revision
+    /// (#345 §8's version pinning; `--external-peer` only). The refusal
+    /// reason tells the volunteer to download the current build.
+    #[arg(long)]
+    require_client_rev: Option<String>,
+
+    /// Refuse a join that does not present exactly this pre-minted invite
+    /// session id (UUIDv7, minted by `orrery-invite mint`;
+    /// `--external-peer` only).
+    #[arg(long)]
+    require_session: Option<String>,
+
+    /// Trusted issuer key as `<key_id>:<public key hex>`, from
+    /// `orrery-invite session-token`'s output (`--external-peer` only).
+    /// When set, a join must carry a session token that verifies under this
+    /// key for the dialler's own transport identity.
+    #[arg(long, value_name = "KEYID:PUBKEY")]
+    issuer_key: Option<String>,
+
     // ── The external runner's own mode ──────────────────────────────────────
     /// Run as the external peer process instead of hosting a swarm (#385).
     ///
@@ -417,6 +436,21 @@ fn parse_cheat(spec: &str) -> Result<CheatSpec> {
         bail!("a cheat count of zero fields no modified client at all");
     }
     Ok(CheatSpec { tamper, count })
+}
+
+/// Parse `--issuer-key <key_id>:<public key hex>` into a trusted issuer entry.
+fn parse_issuer_key(spec: &str) -> Result<orrery_protocol::IssuerKey> {
+    let (key_id, public) = spec
+        .split_once(':')
+        .context("expected <key_id>:<public key hex>")?;
+    let key_id = key_id
+        .parse::<u32>()
+        .with_context(|| format!("{key_id:?} is not an issuer key id"))?;
+    let public = NodeId::from_str(public).context("issuer public key is not hex")?;
+    Ok(orrery_protocol::IssuerKey::new(
+        orrery_protocol::IssuerKeyId::new(key_id),
+        public,
+    ))
 }
 
 fn main() -> Result<()> {
@@ -523,6 +557,16 @@ fn main() -> Result<()> {
         // verifies against.
         let secret = bot::host_key();
         let expected = bot::bot_key(config.peers).public();
+        let admission = exterior::Admission {
+            require_client_rev: args.require_client_rev.clone(),
+            require_session: args.require_session.clone(),
+            issuer: args
+                .issuer_key
+                .as_deref()
+                .map(parse_issuer_key)
+                .transpose()
+                .context("--issuer-key")?,
+        };
         let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
@@ -549,7 +593,13 @@ fn main() -> Result<()> {
             }
             let joined = tokio::time::timeout(
                 std::time::Duration::from_secs(args.join_timeout_secs),
-                bridge::host_accept(&endpoint, expected, config.peers, config.witnessing),
+                bridge::host_accept(
+                    &endpoint,
+                    expected,
+                    config.peers,
+                    config.witnessing,
+                    &admission,
+                ),
             )
             .await
             .context("the external peer never dialled in time")??;

@@ -69,7 +69,12 @@ fn ledger_path() -> TemporaryLedger {
 
 fn mint(path: &Path, byte: u8) -> orrery_identity::MintedInvite {
     InviteLedger::update_locked(path, |ledger| {
-        mint_invite(ledger, "Ada".to_owned(), &mut FixedCode([byte; 32]))
+        mint_invite(
+            ledger,
+            "Ada".to_owned(),
+            &mut FixedCode([byte; 32]),
+            UnixMillis::new(T0),
+        )
     })
     .expect("mint an offline invite")
 }

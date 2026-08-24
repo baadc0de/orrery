@@ -6,6 +6,28 @@
 //! dependencies as arguments, so an eventual HTTP handler only needs to parse
 //! its request and call [`redeem_invite`]; no protocol type or verification
 //! path is duplicated here.
+//!
+//! # Where invites are minted (#387 — the identity convention, no service)
+//!
+//! Invites are minted **on the operator's own machine, offline**, by the
+//! `orrery-invite` binary in this crate — there is no minting service, no
+//! webpage, and nothing listening on a socket. The mint allocates three
+//! things into the operator's local hash-only ledger:
+//!
+//!   * the invite code (never stored; only its hash is),
+//!   * the [`AccountId`], and
+//!   * a **pre-minted campaign session id** — a UUIDv7 satisfying
+//!     `scripts/p4-ledger.sh`'s `identity.human_session_id` constraint. The
+//!     ledger enforces the coordinator's uniqueness constraint offline: it
+//!     refuses to mint or parse a duplicate session id, so the same id cannot
+//!     be issued twice and two volunteers cannot share one.
+//!
+//! What is deliberately *not* pre-minted here is the session **token**:
+//! [`orrery_protocol::MAX_SESSION_TOKEN_TTL_MS`] is one hour, so a token
+//! signed at invite time would be expired before the session it was minted
+//! for. The operator signs the token (`orrery-invite session-token`, still
+//! offline, against the D41 issuer credential) shortly before hosting, and
+//! the host verifies it at join (#345 §8).
 
 use crate::service::{IdentityService, IssuedSession, StandingSource};
 use crate::store::{AccountStore, IdentityError};
@@ -19,7 +41,7 @@ use std::path::{Path, PathBuf};
 use tempfile::NamedTempFile;
 
 const LEDGER_HEADER: &str =
-    "# orrery invite ledger v2: code_hash_sha256\taccount_id\tvolunteer_label\tstate\tconsumed_node\tconsumed_at_ms";
+    "# orrery invite ledger v3: code_hash_sha256\taccount_id\tvolunteer_label\tsession_id\tstate\tconsumed_node\tconsumed_at_ms";
 const CODE_PREFIX: &str = "orrery-invite-v1-";
 
 /// A source of new invite-code bytes.
@@ -44,6 +66,10 @@ pub struct InviteLedgerEntry {
     code_hash: [u8; 32],
     account: AccountId,
     label: String,
+    /// Pre-minted campaign session id (UUIDv7). `None` on rows minted before
+    /// the v3 ledger format existed; those invites predate campaign banking
+    /// and cannot bank a human hour without a re-mint.
+    session: Option<String>,
     state: InviteState,
 }
 
@@ -65,6 +91,12 @@ impl InviteLedgerEntry {
     #[must_use]
     pub fn label(&self) -> &str {
         &self.label
+    }
+
+    /// The pre-minted campaign session id, absent on pre-v3 rows.
+    #[must_use]
+    pub fn session_id(&self) -> Option<&str> {
+        self.session.as_deref()
     }
 }
 
@@ -147,6 +179,8 @@ impl InviteLedger {
             output.push('\t');
             output.push_str(&entry.label);
             output.push('\t');
+            output.push_str(entry.session.as_deref().unwrap_or(""));
+            output.push('\t');
             match entry.state {
                 InviteState::Issued => output.push_str("issued\t\t\n"),
                 InviteState::Consumed { node, at_ms } => {
@@ -194,10 +228,28 @@ impl InviteLedger {
             let Some(label) = fields.next() else {
                 return Err(InviteError::MalformedLedger { line: index + 1 });
             };
-            let state = match (fields.next(), fields.next(), fields.next(), fields.next()) {
-                (None, None, None, None) => InviteState::Issued,
-                (Some("issued"), Some(""), Some(""), None) => InviteState::Issued,
-                (Some("consumed"), Some(node), Some(at_ms), None) => InviteState::Consumed {
+            // Rows have carried three shapes: v1 (three fields, always
+            // issued), v2 (state directly after the label), and v3 (the
+            // pre-minted session id between label and state). The session
+            // column is recognised positionally by the total field count, so
+            // a v2 row keeps reading exactly as it always did.
+            let tail: Vec<&str> = fields.collect();
+            let (session, state_fields): (Option<String>, &[&str]) = match tail.len() {
+                0 | 3 => (None, tail.as_slice()),
+                4 => {
+                    let session = match tail[0] {
+                        "" => None,
+                        session if is_uuid_v7(session) => Some(session.to_owned()),
+                        _ => return Err(InviteError::MalformedLedger { line: index + 1 }),
+                    };
+                    (session, &tail[1..])
+                }
+                _ => return Err(InviteError::MalformedLedger { line: index + 1 }),
+            };
+            let state = match state_fields {
+                [] => InviteState::Issued,
+                ["issued", "", ""] => InviteState::Issued,
+                ["consumed", node, at_ms] => InviteState::Consumed {
                     node: decode_hash(node)
                         .ok_or(InviteError::MalformedLedger { line: index + 1 })?,
                     at_ms: at_ms
@@ -215,16 +267,17 @@ impl InviteLedger {
                 .parse::<u64>()
                 .map(AccountId)
                 .map_err(|_| InviteError::MalformedLedger { line: index + 1 })?;
-            if entries
-                .iter()
-                .any(|entry: &InviteLedgerEntry| entry.code_hash == code_hash)
-            {
+            if entries.iter().any(|entry: &InviteLedgerEntry| {
+                entry.code_hash == code_hash
+                    || (entry.session.is_some() && entry.session == session)
+            }) {
                 return Err(InviteError::MalformedLedger { line: index + 1 });
             }
             entries.push(InviteLedgerEntry {
                 code_hash,
                 account,
                 label: label.to_owned(),
+                session,
                 state,
             });
         }
@@ -289,17 +342,87 @@ pub struct MintedInvite {
     pub code: String,
     /// The account allocated to the code.
     pub account: AccountId,
+    /// The pre-minted campaign session id: a UUIDv7 allocated once, here,
+    /// under this ledger's uniqueness constraint. It is what a banked human
+    /// hour carries as `identity.human_session_id`.
+    pub session: String,
 }
 
-/// Mint one code into `ledger` for `label`.
+/// Render one RFC 9562 UUIDv7 from a Unix-millisecond timestamp and 74 bits
+/// of caller-supplied entropy (the top 6 bits of `entropy[0]` are discarded).
+///
+/// Layout: 48-bit big-endian milliseconds, then the version nibble `7` over
+/// 12 bits of entropy, then the `10` variant bits over the remaining 62.
+/// This is exactly the shape `scripts/p4-ledger.sh` insists on for
+/// `identity.human_session_id`:
+/// `^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`.
+#[must_use]
+pub fn uuid_v7(now_ms: u64, entropy: [u8; 10]) -> String {
+    let mut bytes = [0u8; 16];
+    bytes[..6].copy_from_slice(&now_ms.to_be_bytes()[2..8]);
+    bytes[6] = 0x70 | (entropy[0] & 0x0f);
+    bytes[7] = entropy[1];
+    bytes[8] = 0x80 | (entropy[2] & 0x3f);
+    bytes[9] = entropy[3];
+    bytes[10..16].copy_from_slice(&entropy[4..10]);
+    let hex = hex(&bytes);
+    format!(
+        "{}-{}-{}-{}-{}",
+        &hex[0..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..32]
+    )
+}
+
+/// Whether `candidate` is a well-formed lowercase UUIDv7 — the same predicate
+/// `scripts/p4-ledger.sh` applies to `identity.human_session_id`.
+#[must_use]
+pub fn is_uuid_v7(candidate: &str) -> bool {
+    let bytes = candidate.as_bytes();
+    if bytes.len() != 36 {
+        return false;
+    }
+    for (index, byte) in bytes.iter().enumerate() {
+        match index {
+            8 | 13 | 18 | 23 => {
+                if *byte != b'-' {
+                    return false;
+                }
+            }
+            14 => {
+                if *byte != b'7' {
+                    return false;
+                }
+            }
+            19 => {
+                if !matches!(byte, b'8' | b'9' | b'a' | b'b') {
+                    return false;
+                }
+            }
+            _ => {
+                if !byte.is_ascii_hexdigit() || byte.is_ascii_uppercase() {
+                    return false;
+                }
+            }
+        }
+    }
+    true
+}
+
+/// Mint one code into `ledger` for `label`, pre-minting the campaign session
+/// id at `now_ms` (#387's identity convention).
 ///
 /// # Errors
 ///
-/// Refuses labels that cannot be represented safely in the flat-file format.
+/// Refuses labels that cannot be represented safely in the flat-file format,
+/// and a generator that repeats an existing code or session id.
 pub fn mint_invite(
     ledger: &mut InviteLedger,
     label: String,
     generator: &mut impl InviteCodeGenerator,
+    now_ms: UnixMillis,
 ) -> Result<MintedInvite, InviteError> {
     if label.is_empty() || label.contains(['\r', '\n', '\t']) {
         return Err(InviteError::InvalidLabel);
@@ -307,20 +430,30 @@ pub fn mint_invite(
     let account = ledger.next_account()?;
     let code = format!("{CODE_PREFIX}{}", hex(&generator.generate_code_bytes()));
     let code_hash = code_hash(&code);
-    if ledger
-        .entries
-        .iter()
-        .any(|entry| entry.code_hash == code_hash)
-    {
+    // Fresh entropy for the session id, drawn separately from the code bytes:
+    // the code is a secret and the session id is not, so deriving one from
+    // the other would leak code bits into every banked row.
+    let session_entropy: [u8; 10] = generator.generate_code_bytes()[..10]
+        .try_into()
+        .expect("ten of thirty-two bytes");
+    let session = uuid_v7(now_ms.0, session_entropy);
+    if ledger.entries.iter().any(|entry| {
+        entry.code_hash == code_hash || entry.session.as_deref() == Some(session.as_str())
+    }) {
         return Err(InviteError::DuplicateCode);
     }
     ledger.entries.push(InviteLedgerEntry {
         code_hash,
         account,
         label,
+        session: Some(session.clone()),
         state: InviteState::Issued,
     });
-    Ok(MintedInvite { code, account })
+    Ok(MintedInvite {
+        code,
+        account,
+        session,
+    })
 }
 
 /// Redeem one invite: verify its code, create and bind its account, then mint.
@@ -517,14 +650,29 @@ mod tests {
         }
     }
 
+    const T0: u64 = 1_756_000_000_000;
+
     #[test]
     fn mint_allocates_accounts_and_persists_hashes_not_codes() {
         let mut ledger = InviteLedger::default();
-        let mut codes = FixedCodes(vec![[3; 32], [4; 32]]);
-        let first = mint_invite(&mut ledger, "Ada".to_owned(), &mut codes).expect("mint first");
-        let second = mint_invite(&mut ledger, "Bryn".to_owned(), &mut codes).expect("mint second");
+        let mut codes = FixedCodes(vec![[3; 32], [13; 32], [4; 32], [14; 32]]);
+        let first = mint_invite(
+            &mut ledger,
+            "Ada".to_owned(),
+            &mut codes,
+            UnixMillis::new(T0),
+        )
+        .expect("mint first");
+        let second = mint_invite(
+            &mut ledger,
+            "Bryn".to_owned(),
+            &mut codes,
+            UnixMillis::new(T0),
+        )
+        .expect("mint second");
         assert_eq!(first.account, AccountId(1));
         assert_eq!(second.account, AccountId(2));
+        assert_ne!(first.session, second.session);
 
         let saved = {
             let mut text = String::from(LEDGER_HEADER);
@@ -535,11 +683,83 @@ mod tests {
                 text.push_str(&entry.account.0.to_string());
                 text.push('\t');
                 text.push_str(&entry.label);
-                text.push('\n');
+                text.push('\t');
+                text.push_str(entry.session.as_deref().unwrap_or(""));
+                text.push_str("\tissued\t\t\n");
             }
             text
         };
         assert!(!saved.contains(&first.code));
         assert_eq!(InviteLedger::parse(&saved).expect("parse"), ledger);
+    }
+
+    /// A pre-v3 row (no session column) still parses, carrying no session id.
+    #[test]
+    fn legacy_rows_without_a_session_column_still_parse() {
+        let text = format!("{}\t1\tAda\n", hex(&[9u8; 32]));
+        let ledger = InviteLedger::parse(&text).expect("v1 row parses");
+        assert_eq!(ledger.entries[0].session_id(), None);
+        let v2 = format!("{}\t2\tBryn\tissued\t\t\n", hex(&[8u8; 32]));
+        let ledger = InviteLedger::parse(&v2).expect("v2 row parses");
+        assert_eq!(ledger.entries[0].session_id(), None);
+    }
+
+    /// The ledger is the offline stand-in for the coordinator's unique
+    /// session-id constraint: a duplicated id must refuse to parse.
+    #[test]
+    fn duplicate_session_ids_refuse_to_parse() {
+        let session = uuid_v7(T0, [7; 10]);
+        let text = format!(
+            "{}\t1\tAda\t{session}\tissued\t\t\n{}\t2\tBryn\t{session}\tissued\t\t\n",
+            hex(&[1u8; 32]),
+            hex(&[2u8; 32]),
+        );
+        assert!(matches!(
+            InviteLedger::parse(&text),
+            Err(InviteError::MalformedLedger { line: 2 })
+        ));
+    }
+
+    /// The mint refuses to allocate one session id twice: the ledger is the
+    /// offline stand-in for the coordinator's unique session-id constraint.
+    #[test]
+    fn a_repeated_session_entropy_refuses_to_mint() {
+        let mut ledger = InviteLedger::default();
+        // Codes [1] and [3] differ; session entropy is [2] both times, so the
+        // second mint would repeat the first session id at the same instant.
+        let mut codes = FixedCodes(vec![[1; 32], [2; 32], [3; 32], [2; 32]]);
+        mint_invite(&mut ledger, "Ada".to_owned(), &mut codes, UnixMillis::new(T0))
+            .expect("first mint");
+        assert!(matches!(
+            mint_invite(&mut ledger, "Bryn".to_owned(), &mut codes, UnixMillis::new(T0)),
+            Err(InviteError::DuplicateCode)
+        ));
+    }
+
+    /// The minted id satisfies exactly the ledger script's regex shape.
+    #[test]
+    fn minted_session_ids_are_uuid_v7() {
+        let mut ledger = InviteLedger::default();
+        let mut codes = FixedCodes(vec![[5; 32], [0xff; 32]]);
+        let minted = mint_invite(
+            &mut ledger,
+            "Ada".to_owned(),
+            &mut codes,
+            UnixMillis::new(T0),
+        )
+        .expect("mint");
+        assert!(is_uuid_v7(&minted.session), "got {}", minted.session);
+        // Version and variant nibbles are forced even from all-ones entropy.
+        let forced = uuid_v7(T0, [0xff; 10]);
+        assert!(is_uuid_v7(&forced), "got {forced}");
+        assert_eq!(&forced[14..15], "7");
+        assert_eq!(&forced[19..20], "b");
+        // The timestamp occupies the first 48 bits, big-endian.
+        assert!(forced.starts_with("0198d9c1-9800"), "got {forced}");
+        // And the checker refuses near-misses.
+        assert!(!is_uuid_v7(&forced.to_uppercase()));
+        assert!(!is_uuid_v7(&forced.replace('-', "")));
+        let v4 = format!("{}4{}", &forced[..14], &forced[15..]);
+        assert!(!is_uuid_v7(&v4), "version nibble must be 7");
     }
 }

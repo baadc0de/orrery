@@ -114,9 +114,7 @@ pub fn run(run: &ExternalRun) -> Result<()> {
         .context("tokio runtime")?;
     let endpoint = rt.block_on(bridge::bind(secret))?;
 
-    let request = crate::exterior::JoinRequest {
-        client_rev: env!("P1_SWARM_COMMIT").to_owned(),
-    };
+    let request = crate::exterior::JoinRequest::plain(env!("P1_SWARM_COMMIT").to_owned());
     let remote_link = rt.block_on(bridge::remote_join(
         &endpoint,
         run.host.to_addr(run.direct),

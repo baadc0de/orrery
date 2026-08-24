@@ -72,11 +72,10 @@ const JOIN_DEADLINE_SECS: u64 = 30;
 
 /// Launch material for a joined campaign session.
 ///
-/// Deliberately the host NodeId alone plus the slot this process occupies:
-/// the wire has no invite representation yet (`exterior.rs` defers invite-
-/// bound session identity to slice 3 / #387), so there is nothing else to
-/// carry. Everything else derives from the slot exactly as it does on the
-/// harness side.
+/// The host NodeId, the slot this process occupies, and the invite material
+/// (#387): the pre-minted session UUIDv7 and, when the host demands one, the
+/// operator-signed session token. Everything else derives from the slot
+/// exactly as it does on the harness side.
 #[derive(Debug, Clone)]
 pub struct CampaignConfig {
     /// Hex node id of the hosting process, from its listening line.
@@ -86,8 +85,13 @@ pub struct CampaignConfig {
     /// The swarm slot this client occupies. Derives its transport key and
     /// entity id; the host refuses a mismatched identity at accept time.
     pub slot: usize,
-    /// Coordinator-issued session identity for the banking row.
+    /// Coordinator-issued session identity for the banking row, presented to
+    /// the host at join (#345 §8). For a campaign session this is the
+    /// pre-minted UUIDv7 the invite carries.
     pub session_id: String,
+    /// Hex-encoded `SessionTokenV1` from the invite material, presented to
+    /// the host at join. `None` joins hosts that do not require one.
+    pub session_token_hex: Option<String>,
     /// UTC start stamp for the banking row.
     pub wall_start_utc: String,
     /// The impairment the operator says the host injects. Compared against
@@ -335,6 +339,14 @@ impl CampaignRuntime {
                 .and_then(|socket| socket.parse().ok());
             let slot = config.slot;
             let client_rev = crate::BUILD_REV.to_owned();
+            let session_id = config.session_id.clone();
+            // A malformed token hex is a named join failure, not a silently
+            // tokenless join the host would refuse with a confusing reason.
+            let token = match config.session_token_hex.as_deref().map(decode_hex) {
+                None => Ok(None),
+                Some(Ok(bytes)) => Ok(Some(bytes)),
+                Some(Err(reason)) => Err(reason),
+            };
             let address = address.clone();
             let _handle = std::thread::Builder::new()
                 .name("regolith-campaign-dial".to_owned())
@@ -342,7 +354,11 @@ impl CampaignRuntime {
                     let joined = thread_runtime.block_on(async move {
                         let endpoint = net::bind(net::slot_secret(slot)).await?;
                         let addr = address.to_addr(prefer);
-                        let request = JoinRequest { client_rev };
+                        let request = JoinRequest {
+                            client_rev,
+                            session_id: Some(session_id),
+                            token: token?,
+                        };
                         let deadline = std::time::Duration::from_secs(JOIN_DEADLINE_SECS);
                         let link = tokio::time::timeout(
                             deadline,
@@ -814,6 +830,20 @@ fn encode_state_broadcast(
     )))
 }
 
+/// Decode lowercase/uppercase hex into bytes, with a reason on refusal.
+fn decode_hex(hex: &str) -> Result<Vec<u8>, String> {
+    if !hex.len().is_multiple_of(2) {
+        return Err("session token hex has an odd number of digits".to_owned());
+    }
+    (0..hex.len())
+        .step_by(2)
+        .map(|index| {
+            u8::from_str_radix(&hex[index..index + 2], 16)
+                .map_err(|_| "session token is not hex".to_owned())
+        })
+        .collect()
+}
+
 /// Wall clock, RFC3339-ish UTC. Telemetry provenance, not ruleset input.
 #[must_use]
 pub fn utc_now_iso8601() -> String {
@@ -847,8 +877,14 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
     ((if m <= 2 { y + 1 } else { y }), m as u32, d as u32)
 }
 
+/// The Rust target triple this client was compiled for, stamped by build.rs.
+///
+/// The banking row's `platform_triple` is validated against the host report's
+/// `identity.target` by `p4-ledger.sh`; both must therefore spell the same
+/// triple. The previous `{os}-{arch}` spelling ("linux-x86_64") failed that
+/// check on every row it ever produced.
 fn platform_triple() -> String {
-    format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH)
+    env!("ORRERY_PLATFORM_TRIPLE").to_owned()
 }
 
 #[cfg(test)]
@@ -941,6 +977,7 @@ mod tests {
             host_direct: None,
             slot: 4,
             session_id: "s-1".to_owned(),
+            session_token_hex: None,
             wall_start_utc: "2026-08-24T00:00:00Z".to_owned(),
             configured: ConfiguredImpairment {
                 loss_pct: 3.0,
@@ -949,6 +986,35 @@ mod tests {
             },
         };
         assert_eq!(config.actor(), Actor::Human);
+    }
+
+    /// The banking row's platform must be the Rust *target triple*, because
+    /// `p4-ledger.sh` refuses a row whose `platform_triple` differs from the
+    /// host report's `identity.target`. The old `{os}-{arch}` spelling
+    /// ("linux-x86_64") put the architecture last and the OS first; a triple
+    /// leads with the architecture and names its vendor.
+    #[test]
+    fn platform_triple_is_a_rust_target_triple() {
+        let triple = platform_triple();
+        let parts: Vec<&str> = triple.split('-').collect();
+        assert!(parts.len() >= 3, "not a triple: {triple}");
+        assert!(
+            ["x86_64", "aarch64", "i686", "arm64ec"].contains(&parts[0]),
+            "a triple leads with its architecture: {triple}"
+        );
+        assert!(
+            ["unknown", "pc", "apple"].contains(&parts[1]),
+            "a triple's second component is its vendor: {triple}"
+        );
+    }
+
+    /// A malformed session token is a named launch failure, not a silent
+    /// tokenless join.
+    #[test]
+    fn token_hex_decodes_or_names_its_refusal() {
+        assert_eq!(decode_hex("00ff10"), Ok(vec![0x00, 0xff, 0x10]));
+        assert!(decode_hex("0f0").is_err(), "odd digits refused");
+        assert!(decode_hex("zz").is_err(), "non-hex refused");
     }
 
     /// UTC stamps render as RFC3339 second precision.

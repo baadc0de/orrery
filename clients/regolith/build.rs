@@ -35,4 +35,13 @@ fn main() {
         .or_else(|| git(&["rev-parse", "--verify", "HEAD"]))
         .unwrap_or_else(|| "unknown".to_owned());
     println!("cargo:rustc-env=ORRERY_BUILD_REV={revision}");
+
+    // The banking row's `platform_triple` must equal the harness report's
+    // `identity.target` — a Rust target triple — or `p4-ledger.sh`'s
+    // `validate_session_record` refuses the row. Cargo hands every build
+    // script the triple in TARGET; `std::env::consts` cannot reconstruct it
+    // at runtime ("linux-x86_64" is not a triple, and that spelling is what
+    // this replaced).
+    let target = env::var("TARGET").expect("cargo always sets TARGET for build scripts");
+    println!("cargo:rustc-env=ORRERY_PLATFORM_TRIPLE={target}");
 }

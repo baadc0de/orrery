@@ -301,6 +301,9 @@ lane_gates() {
     # binaries and no network — there was never a reason for them to be nightly.
     run scripts/p4-accumulate.sh --self-test
     run scripts/p4-ledger.sh --self-test
+    # #387's host-side assembly seam for human sessions: same cost profile as
+    # the two above (jq only, sub-second), so it runs per commit with them.
+    run scripts/p4-campaign-session.sh --self-test
 
     # #173's compute-role smoke. Its real run needs AWS credentials and
     # happens nightly (nightly.yml `compute-identity-smoke`); this structural

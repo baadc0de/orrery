@@ -337,19 +337,41 @@ pub fn link_pair() -> (HostLink, RemoteLink) {
 /// The handshake a dialling peer sends before any combat traffic.
 ///
 /// iroh authenticates the dialler's `NodeId` at the transport layer, so the
-/// handshake carries no key material — what it establishes is protocol fit and
-/// build provenance. Slice 3 extends this with invite-bound session identity
-/// and version pinning (#345 §8); the fields reserved now keep that extension
-/// from becoming a grammar change.
+/// handshake carries no key material of its own — what it establishes is
+/// protocol fit, build provenance and, since #387, the invite-bound session
+/// identity (#345 §8): the pre-minted session UUIDv7 the invite carries and
+/// the operator-signed `SessionTokenV1` authorizing this transport identity.
+///
+/// The identity fields ride as an optional tail after the revision, still at
+/// version 2: the version-2 decoder always stopped reading at the revision,
+/// so a request with the tail is readable by an old host (which ignores it)
+/// and a request without it is readable here (both fields decode to `None`).
+/// A host *requiring* them refuses their absence at admission, not at parse.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JoinRequest {
     /// Build revision of the joining process, for the report and for pinning.
     pub client_rev: String,
+    /// Pre-minted campaign session id from the invite (UUIDv7), when joining
+    /// as a campaign participant.
+    pub session_id: Option<String>,
+    /// Encoded `orrery_protocol::SessionTokenV1` authorizing the dialler's
+    /// transport identity, when joining as a campaign participant.
+    pub token: Option<Vec<u8>>,
 }
 
 impl JoinRequest {
     const MAGIC: [u8; 4] = *b"ORRX";
     const VERSION: u16 = 2;
+
+    /// A plain, identity-less join — what the headless bot runner sends.
+    #[must_use]
+    pub fn plain(client_rev: String) -> Self {
+        Self {
+            client_rev,
+            session_id: None,
+            token: None,
+        }
+    }
 
     /// Encodes the request onto the wire.
     #[must_use]
@@ -360,6 +382,15 @@ impl JoinRequest {
         let rev = self.client_rev.as_bytes();
         out.push(u8::try_from(rev.len()).unwrap_or(u8::MAX));
         out.extend_from_slice(&rev[..rev.len().min(u8::MAX.into())]);
+        if self.session_id.is_some() || self.token.is_some() {
+            let session = self.session_id.as_deref().unwrap_or("").as_bytes();
+            out.push(u8::try_from(session.len()).unwrap_or(u8::MAX));
+            out.extend_from_slice(&session[..session.len().min(u8::MAX.into())]);
+            let token = self.token.as_deref().unwrap_or(&[]);
+            let token_len = u16::try_from(token.len()).unwrap_or(u16::MAX);
+            out.extend_from_slice(&token_len.to_le_bytes());
+            out.extend_from_slice(&token[..token.len().min(u16::MAX.into())]);
+        }
         out
     }
 
@@ -386,9 +417,134 @@ impl JoinRequest {
         if rest.len() < rev_len {
             return Err("join truncated inside revision");
         }
+        let client_rev = String::from_utf8_lossy(&rest[..rev_len]).into_owned();
+        let rest = &rest[rev_len..];
+        if rest.is_empty() {
+            // A pre-#387 request: no identity tail was sent.
+            return Ok(Self {
+                client_rev,
+                session_id: None,
+                token: None,
+            });
+        }
+        let session_len = rest[0] as usize;
+        let rest = &rest[1..];
+        if rest.len() < session_len {
+            return Err("join truncated inside session id");
+        }
+        let session_id = match &rest[..session_len] {
+            [] => None,
+            bytes => Some(String::from_utf8_lossy(bytes).into_owned()),
+        };
+        let rest = &rest[session_len..];
+        if rest.len() < 2 {
+            return Err("join truncated before token length");
+        }
+        let token_len = u16::from_le_bytes(rest[0..2].try_into().expect("two bytes read")) as usize;
+        let rest = &rest[2..];
+        if rest.len() < token_len {
+            return Err("join truncated inside token");
+        }
+        let token = match &rest[..token_len] {
+            [] => None,
+            bytes => Some(bytes.to_vec()),
+        };
         Ok(Self {
-            client_rev: String::from_utf8_lossy(&rest[..rev_len]).into_owned(),
+            client_rev,
+            session_id,
+            token,
         })
+    }
+}
+
+/// What the host demands of a [`JoinRequest`] before it answers Accept
+/// (#345 §8, wired by #387).
+///
+/// Every field is opt-in so the pure-bot legs and the headless runner keep
+/// joining exactly as before; a campaign host configures all three. The
+/// judgement is a pure function of the request, the dialler's authenticated
+/// transport identity, and a clock — so it is testable without a socket, and
+/// `bridge::host_accept` only has to deliver its verdict.
+#[derive(Debug, Default)]
+pub struct Admission {
+    /// Exact build revision the host pins (#345 §8's version pinning). A
+    /// mismatching or absent revision is refused with a remedy in the reason.
+    pub require_client_rev: Option<String>,
+    /// The pre-minted invite session id this slot was reserved for. The
+    /// request must present exactly this UUIDv7.
+    pub require_session: Option<String>,
+    /// Trusted issuer key. When set, the request must carry a
+    /// `SessionTokenV1` that verifies under it *for the dialler's transport
+    /// identity* — a token minted for any other node is refused.
+    pub issuer: Option<orrery_protocol::IssuerKey>,
+}
+
+impl Admission {
+    /// An open door: what every pre-#387 call site had.
+    #[must_use]
+    pub fn open() -> Self {
+        Self::default()
+    }
+
+    /// Judge one request from `remote` against this policy, at the wall clock.
+    ///
+    /// # Errors
+    /// The refusal reason, worded for the volunteer who will read it.
+    pub fn judge(
+        &self,
+        request: &JoinRequest,
+        remote: &orrery_protocol::NodeId,
+    ) -> Result<(), String> {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |since| {
+                u64::try_from(since.as_millis()).unwrap_or(u64::MAX)
+            });
+        self.judge_at(request, remote, now_ms)
+    }
+
+    /// [`Self::judge`] with an injected clock, for tests.
+    ///
+    /// # Errors
+    /// The refusal reason, worded for the volunteer who will read it.
+    pub fn judge_at(
+        &self,
+        request: &JoinRequest,
+        remote: &orrery_protocol::NodeId,
+        now_ms: u64,
+    ) -> Result<(), String> {
+        if let Some(pinned) = &self.require_client_rev {
+            if &request.client_rev != pinned {
+                return Err(format!(
+                    "client build {} is not the pinned build {pinned}; download the current build",
+                    request.client_rev
+                ));
+            }
+        }
+        if let Some(expected) = &self.require_session {
+            match request.session_id.as_deref() {
+                Some(session) if session == expected => {}
+                Some(session) => {
+                    return Err(format!(
+                        "invite session {session} does not match the session this host is running"
+                    ));
+                }
+                None => return Err("no invite session id was presented".to_owned()),
+            }
+        }
+        if let Some(issuer) = &self.issuer {
+            let Some(token) = request.token.as_deref() else {
+                return Err("no session token was presented".to_owned());
+            };
+            let verifier = orrery_protocol::SessionTokenVerifier::new(
+                orrery_protocol::FixedTokenClock::new(orrery_protocol::UnixMillis::new(now_ms)),
+                [issuer.clone()],
+            );
+            verifier
+                .verify(token, remote)
+                .map_err(|error| format!("session token refused: {error:?}"))?;
+        }
+        Ok(())
     }
 }
 
@@ -616,9 +772,7 @@ mod tests {
 
     #[test]
     fn join_requests_round_trip_and_reject_wrong_versions() {
-        let request = JoinRequest {
-            client_rev: "0ce6b28b".to_owned(),
-        };
+        let request = JoinRequest::plain("0ce6b28b".to_owned());
         let decoded = JoinRequest::decode(&request.encode()).expect("well formed");
         assert_eq!(decoded, request);
 
@@ -631,6 +785,132 @@ mod tests {
             "magic checked"
         );
         assert!(JoinRequest::decode(b"ORRX").is_err(), "truncation checked");
+    }
+
+    /// The #387 identity tail round-trips, and its absence decodes to `None`
+    /// on both fields — a pre-#387 runner's request still parses.
+    #[test]
+    fn join_request_identity_tail_round_trips_and_stays_optional() {
+        let full = JoinRequest {
+            client_rev: "abc123".to_owned(),
+            session_id: Some("018f8f4e-5c90-7abc-8123-000000000001".to_owned()),
+            token: Some(vec![1, 2, 3, 4]),
+        };
+        assert_eq!(JoinRequest::decode(&full.encode()), Ok(full.clone()));
+
+        let plain = JoinRequest::plain("abc123".to_owned());
+        assert_eq!(JoinRequest::decode(&plain.encode()), Ok(plain));
+
+        let mut truncated = full.encode();
+        truncated.truncate(truncated.len() - 1);
+        assert!(
+            JoinRequest::decode(&truncated).is_err(),
+            "a partial token is a refusal, not a shorter token"
+        );
+    }
+
+    fn signed_token(
+        issuer_secret: &iroh_base::SecretKey,
+        key_id: u32,
+        node: orrery_protocol::NodeId,
+        issued_at_ms: u64,
+    ) -> Vec<u8> {
+        let claims = orrery_protocol::SessionTokenClaimsV1::new(
+            orrery_protocol::AccountId(7),
+            node,
+            orrery_protocol::UnixMillis::new(issued_at_ms),
+            orrery_protocol::SessionTokenTtlMs(3_600_000),
+            orrery_protocol::SessionStanding::Good,
+            orrery_protocol::IssuerKeyId::new(key_id),
+            true,
+        );
+        orrery_protocol::SessionTokenV1::sign(claims, issuer_secret)
+            .expect("sign")
+            .encode()
+            .expect("encode")
+    }
+
+    /// #345 §8 at the only admission point: a stale build, a wrong or absent
+    /// invite session, and a token minted for a different transport identity
+    /// are each refused with their own reason; the invited request passes.
+    #[test]
+    fn admission_judges_rev_session_and_token() {
+        const NOW_MS: u64 = 1_756_000_000_000;
+        let issuer_secret = iroh_base::SecretKey::from_bytes(&[0x51; 32]);
+        let dialler = iroh_base::SecretKey::from_bytes(&[0x52; 32]).public();
+        let other = iroh_base::SecretKey::from_bytes(&[0x53; 32]).public();
+        let session = "018f8f4e-5c90-7abc-8123-000000000042";
+        let admission = Admission {
+            require_client_rev: Some("pinned-rev".to_owned()),
+            require_session: Some(session.to_owned()),
+            issuer: Some(orrery_protocol::IssuerKey::new(
+                orrery_protocol::IssuerKeyId::new(41),
+                issuer_secret.public(),
+            )),
+        };
+        let invited = JoinRequest {
+            client_rev: "pinned-rev".to_owned(),
+            session_id: Some(session.to_owned()),
+            token: Some(signed_token(&issuer_secret, 41, dialler, NOW_MS - 1_000)),
+        };
+        assert_eq!(admission.judge_at(&invited, &dialler, NOW_MS), Ok(()));
+
+        // Stale build: refused with the download remedy (#345 §8).
+        let stale = JoinRequest {
+            client_rev: "older-rev".to_owned(),
+            ..invited.clone()
+        };
+        let reason = admission.judge_at(&stale, &dialler, NOW_MS).unwrap_err();
+        assert!(
+            reason.contains("download the current build"),
+            "got: {reason}"
+        );
+
+        // Absent and mismatching session ids are distinct refusals.
+        let mut no_session = invited.clone();
+        no_session.session_id = None;
+        assert!(admission
+            .judge_at(&no_session, &dialler, NOW_MS)
+            .unwrap_err()
+            .contains("no invite session id"));
+        let mut wrong_session = invited.clone();
+        wrong_session.session_id = Some("018f8f4e-5c90-7abc-8123-00000000dead".to_owned());
+        assert!(admission
+            .judge_at(&wrong_session, &dialler, NOW_MS)
+            .unwrap_err()
+            .contains("does not match"));
+
+        // A verifying token minted for a *different* node is refused: the
+        // judgement binds the token to the authenticated transport identity.
+        let reason = admission.judge_at(&invited, &other, NOW_MS).unwrap_err();
+        assert!(reason.contains("session token refused"), "got: {reason}");
+
+        // An expired token is refused even from the right node.
+        let mut expired = invited.clone();
+        expired.token = Some(signed_token(
+            &issuer_secret,
+            41,
+            dialler,
+            NOW_MS - 3_600_001,
+        ));
+        assert!(admission
+            .judge_at(&expired, &dialler, NOW_MS)
+            .unwrap_err()
+            .contains("session token refused"));
+
+        // No token at all, while an issuer is configured, is its own refusal.
+        let mut tokenless = invited.clone();
+        tokenless.token = None;
+        assert!(admission
+            .judge_at(&tokenless, &dialler, NOW_MS)
+            .unwrap_err()
+            .contains("no session token"));
+
+        // And the open door still admits a plain pre-#387 request.
+        assert_eq!(
+            Admission::open().judge_at(&JoinRequest::plain("any".into()), &dialler, NOW_MS),
+            Ok(())
+        );
     }
 
     #[test]
