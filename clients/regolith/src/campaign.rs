@@ -1008,6 +1008,35 @@ mod tests {
         assert_eq!(config.actor(), Actor::Human);
     }
 
+    /// The client's broadcast must be the exact bytes a bot's receive path
+    /// unwraps: outer channel tag (what `receive_peer_packets` strips), then
+    /// the replication envelope (what `decode_replication` reads). #386 sent
+    /// the single-tagged form and every bot on the island counted every one
+    /// of this client's broadcasts undecodable.
+    #[test]
+    fn state_broadcasts_speak_the_harness_double_tagged_wire() {
+        let game = Regolith::honest();
+        let mut executor = Executor::new(game, UniverseSeed([9u8; 32]));
+        let entity = PersistId::new(5);
+        executor.insert(entity, game.spawn(entity, 4));
+        let cell = CellId::from_coords(IVec3::ONE, orrery_protocol::INTEREST_LEVEL)
+            .expect("representable cell");
+        let bytes = encode_state_broadcast(&executor, entity, cell, 42);
+        // Step 1: the bot-side channel untag.
+        let (channel, inner) =
+            orrery_protocol::channels::untag(&bytes).expect("outer channel tag present");
+        assert_eq!(channel, orrery_protocol::channels::Channel::State);
+        // Step 2: the bot-side replication decode of what remains.
+        let (encoded, got_cell, got_entity, at) =
+            decode_replication::<(Vec<u8>, CellId, PersistId, u64)>(inner)
+                .expect("inner replication envelope decodes exactly as a bot's");
+        assert_eq!((got_cell, got_entity, at), (cell, entity, 42));
+        assert!(
+            <RegolithState as CoreCodec>::decode(&encoded).is_ok(),
+            "the canonical state body round-trips"
+        );
+    }
+
     /// The banking row's platform must be the Rust *target triple*, because
     /// `p4-ledger.sh` refuses a row whose `platform_triple` differs from the
     /// host report's `identity.target`. The old `{os}-{arch}` spelling

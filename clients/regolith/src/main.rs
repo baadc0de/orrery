@@ -81,7 +81,14 @@ fn main() {
             jitter_p50_ms: flag_value(&args, "--expect-jitter-ms")
                 .and_then(|value| value.parse::<u64>().ok())
                 .unwrap_or(0),
-            jitter_p99_ms: 0,
+            // The p99 expectation defaults to the p50 one: an operator who
+            // declared one jitter figure declared it for the profile, and a
+            // hardcoded zero here made the p99 half of the mismatch flag
+            // unfalsifiable (observed 0 == configured 0 on an idle link).
+            jitter_p99_ms: flag_value(&args, "--expect-jitter-p99-ms")
+                .or_else(|| flag_value(&args, "--expect-jitter-ms"))
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(0),
         };
         let session_id = flag_value(&args, "--session-id")
             .unwrap_or_else(|| format!("local-{}", orrery_regolith_client::BUILD_REV));
