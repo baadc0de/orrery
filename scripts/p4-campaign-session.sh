@@ -45,6 +45,32 @@
 #     same four trees `p4-ledger.sh` hashes, and stamped into the row, so the
 #     ledger's cross-check has something true to hold.
 #
+# ── Hosting a localhost session, end to end (the shakedown runbook) ────────
+#
+# Ahead of time (offline, operator's machine):
+#   orrery-issuer-key generate --key-id 41 --output <outside-repo>/issuer.cred
+#   orrery-invite mint --ledger invites.tsv --label "<volunteer>"
+#     → account=N  invite_code=…  session_id=<UUIDv7>
+# Minutes before the session (tokens live one hour):
+#   orrery_regolith_client --print-slot-key <peers>          → <slot key>
+#   orrery-invite session-token --issuer-credential issuer.cred \
+#     --account N --node <slot key>                          → session_token=…
+# The session (two processes; peers=8, seconds as desired):
+#   p1-swarm --external-peer --peers 8 --seconds 3600 --min-cells 1 \
+#     --impaired --witness --stamp-wall-clock --json raw.json \
+#     --listening-file listening.txt \
+#     --require-client-rev <pinned rev> --require-session <session_id> \
+#     --issuer-key 41:<issuer public key>
+#   orrery_regolith_client --campaign --campaign-consent \
+#     --host-node <node> --host-direct <ip:port> --slot 8 \
+#     --session-id <session_id> --session-token <token> \
+#     --expect-loss 3 --expect-jitter-ms 100 \
+#     --telemetry-jsonl out/session.jsonl
+# Afterwards (the manual return path):
+#   p4-campaign-session.sh assemble raw.json out/campaign-records.jsonl \
+#     <session_id> r.json
+#   p4-ledger.sh append r.json
+#
 # usage:
 #   p4-campaign-session.sh assemble <raw-report.json> <campaign-records.jsonl> \
 #       <session-uuid> <out.json>
