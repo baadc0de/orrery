@@ -12,7 +12,7 @@ pub mod weapon;
 
 use crate::game::{Game, GameMeta, Tamper};
 use archetype::Archetype;
-use order::{ChildSpec, LockBreakReason, Order, Outcome};
+use order::{ChildSpec, LockBreakReason, Order, Outcome, ShotResult};
 use orrery_core::{
     ComponentTypeId, CoreClass, EntityMaterialization, Invariant, OrderedInputs, QPos, QVel,
     Ruleset, StateView, StepOutput, TickRng, TICK_HZ,
@@ -70,10 +70,9 @@ pub const LOCK_ACQUISITION_TICKS: u16 = 30;
 const REFERENCE_SIGNATURE_RADIUS_MM: u128 = 3_000;
 const CHANCE_SCALE: u128 = 1_000_000;
 
-/// Regolith v7's rules identity: target-side tracking, flight time and
-/// switchable locks.
+/// Regolith v8's rules identity: authoritative shot-resolution feedback.
 pub const REGOLITH_RULESET: RulesetId = RulesetId {
-    version: 7,
+    version: 8,
     digest: [0x63; 32],
 };
 
@@ -351,7 +350,14 @@ impl Regolith {
                             });
                             continue;
                         }
-                        ProjectileResolution::Miss => continue,
+                        ProjectileResolution::Miss => {
+                            events.push(Outcome::ShotResolved {
+                                attacker: *from,
+                                target: me,
+                                result: ShotResult::Miss,
+                            });
+                            continue;
+                        }
                         ProjectileResolution::Break(reason) => {
                             events.push(Outcome::LockBroken {
                                 locker: *from,
@@ -360,7 +366,13 @@ impl Regolith {
                             });
                             continue;
                         }
-                        ProjectileResolution::Hit => {}
+                        ProjectileResolution::Hit => {
+                            events.push(Outcome::ShotResolved {
+                                attacker: *from,
+                                target: me,
+                                result: ShotResult::Hit,
+                            });
+                        }
                     }
                     let incoming = (*amount).max(0);
                     let absorbed = incoming.min(shield.max(0));
@@ -407,7 +419,9 @@ impl Regolith {
                         lock_progress = 0;
                     }
                 }
-                Order::GrabAttempt { .. } | Order::BloomPopulationChanged { .. } => {}
+                Order::GrabAttempt { .. }
+                | Order::BloomPopulationChanged { .. }
+                | Order::ShotResolved { .. } => {}
             }
         }
         let speed = libm::sqrt(vx * vx + vy * vy + vz * vz);
@@ -513,6 +527,11 @@ impl Regolith {
                             });
                         }
                         ProjectileResolution::Hit => {
+                            events.push(Outcome::ShotResolved {
+                                attacker: *from,
+                                target: me,
+                                result: ShotResult::Hit,
+                            });
                             rock.hull = (rock.hull - (*amount).max(0)).max(0);
                             if rock.hull == 0 {
                                 killer = Some(*from);
@@ -525,7 +544,13 @@ impl Regolith {
                                 reason,
                             });
                         }
-                        ProjectileResolution::Miss => {}
+                        ProjectileResolution::Miss => {
+                            events.push(Outcome::ShotResolved {
+                                attacker: *from,
+                                target: me,
+                                result: ShotResult::Miss,
+                            });
+                        }
                     }
                 }
             }
@@ -1104,6 +1129,17 @@ impl Game for Regolith {
                 Order::LockBroken {
                     target: *target,
                     reason: *reason,
+                },
+            )),
+            Outcome::ShotResolved {
+                attacker,
+                target,
+                result,
+            } => Some((
+                *attacker,
+                Order::ShotResolved {
+                    target: *target,
+                    result: *result,
                 },
             )),
             Outcome::Split { .. }

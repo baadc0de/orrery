@@ -32,6 +32,32 @@ impl LockBreakReason {
     }
 }
 
+/// The authoritative result of a projectile that reached resolution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShotResult {
+    /// The projectile hit and applied its rolled damage.
+    Hit,
+    /// The projectile missed and applied no damage.
+    Miss,
+}
+
+impl ShotResult {
+    const fn tag(self) -> u8 {
+        match self {
+            Self::Hit => 0,
+            Self::Miss => 1,
+        }
+    }
+
+    const fn from_tag(tag: u8) -> Result<Self, CodecError> {
+        match tag {
+            0 => Ok(Self::Hit),
+            1 => Ok(Self::Miss),
+            _ => Err(CodecError("regolith: unknown shot result")),
+        }
+    }
+}
+
 fn encode_pos(pos: QPos, out: &mut Vec<u8>) {
     for value in [pos.x, pos.y, pos.z] {
         out.extend_from_slice(&value.to_le_bytes());
@@ -147,6 +173,13 @@ pub enum Order {
         /// Resolver-owned reason.
         reason: LockBreakReason,
     },
+    /// A target's authoritative shot result delivered back to the shooter.
+    ShotResolved {
+        /// Target that resolved the projectile.
+        target: PersistId,
+        /// Whether the projectile hit or missed.
+        result: ShotResult,
+    },
 }
 
 impl CoreCodec for Order {
@@ -213,6 +246,11 @@ impl CoreCodec for Order {
                 out.extend_from_slice(&target.0.to_le_bytes());
                 out.push(reason.tag());
             }
+            Self::ShotResolved { target, result } => {
+                out.push(11);
+                out.extend_from_slice(&target.0.to_le_bytes());
+                out.push(result.tag());
+            }
         }
     }
     fn decode(bytes: &[u8]) -> Result<Self, CodecError> {
@@ -257,6 +295,10 @@ impl CoreCodec for Order {
             (10, 9) => Ok(Self::LockBroken {
                 target: PersistId::new(u64::from_le_bytes(rest[0..8].try_into().unwrap())),
                 reason: LockBreakReason::from_tag(rest[8])?,
+            }),
+            (11, 9) => Ok(Self::ShotResolved {
+                target: PersistId::new(u64::from_le_bytes(rest[0..8].try_into().unwrap())),
+                result: ShotResult::from_tag(rest[8])?,
             }),
             _ => Err(CodecError("regolith order: bad tag or length")),
         }
@@ -371,6 +413,15 @@ pub enum Outcome {
         target: PersistId,
         /// Resolver-owned reason.
         reason: LockBreakReason,
+    },
+    /// A target's authoritative projectile result for delivery to the shooter.
+    ShotResolved {
+        /// Shooter receiving the result.
+        attacker: PersistId,
+        /// Target that resolved the projectile.
+        target: PersistId,
+        /// Whether the projectile hit or missed.
+        result: ShotResult,
     },
 }
 
@@ -533,6 +584,16 @@ impl CoreCodec for Outcome {
                 out.extend_from_slice(&target.0.to_le_bytes());
                 out.push(reason.tag());
             }
+            Self::ShotResolved {
+                attacker,
+                target,
+                result,
+            } => {
+                out.push(12);
+                out.extend_from_slice(&attacker.0.to_le_bytes());
+                out.extend_from_slice(&target.0.to_le_bytes());
+                out.push(result.tag());
+            }
         }
     }
     fn decode(bytes: &[u8]) -> Result<Self, CodecError> {
@@ -610,6 +671,11 @@ impl CoreCodec for Outcome {
                 locker: PersistId::new(u64::from_le_bytes(rest[0..8].try_into().unwrap())),
                 target: PersistId::new(u64::from_le_bytes(rest[8..16].try_into().unwrap())),
                 reason: LockBreakReason::from_tag(rest[16])?,
+            }),
+            (12, 17) => Ok(Self::ShotResolved {
+                attacker: PersistId::new(u64::from_le_bytes(rest[0..8].try_into().unwrap())),
+                target: PersistId::new(u64::from_le_bytes(rest[8..16].try_into().unwrap())),
+                result: ShotResult::from_tag(rest[16])?,
             }),
             _ => Err(CodecError("regolith outcome: bad tag or length")),
         }

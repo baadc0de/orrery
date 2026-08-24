@@ -41,7 +41,7 @@
 //! cargo fmt -p orrery_games
 //! ```
 
-/// Regolith, by scenario name. Generated with the command above at ruleset v7.
+/// Regolith, by scenario name. Generated with the command above at ruleset v8.
 pub const REGOLITH: [(&str, [u8; 32]); 4] = [
     (
         "solo",

@@ -666,16 +666,63 @@ pub fn mesh_for(shape: Shape) -> Mesh {
     }
 }
 
+/// Which seat a drawn craft flies from.
+///
+/// This is a presentation fact and nothing more: the skin knows which entity
+/// it flies, and the ruleset does not care what colour anything is. In the
+/// demo session the second seat is always the bot, hence the variant names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Seat {
+    /// The craft this client flies — the player.
+    Player,
+    /// Every other craft — in this demo, the bot.
+    Bot,
+}
+
+impl Seat {
+    /// The hull-plate tint this seat wears.
+    ///
+    /// #383 asks for the grey of the ships to become colour that discerns
+    /// player from bot. The **plate** is the material that carries it, and
+    /// that choice is deliberate:
+    ///
+    /// * The plate is the one finish with enough area to read at all. The
+    ///   camera frames the duel from ~500 m up (`frame_camera`'s floor), where
+    ///   a trim stripe is a few pixels and the dark panel and canopy glass are
+    ///   near-black; only the light hull plate shows hue across a whole ship.
+    /// * Panel, glass, trim and glow keep the design's roles untouched. Trim
+    ///   and glow stay on the shared accent scheme ("this one is mine"), so
+    ///   the per-archetype silhouettes remain the primary read and the accent
+    ///   scheme is not reverted to an old cyan-vs-orange allegiance paint.
+    /// * Both tints hold the neutral ramp's lightness (their channels sum to
+    ///   ~1.75, as the old grey's did) and separate along the blue–yellow
+    ///   axis — cool violet towards the design's accent family for the
+    ///   player, warm amber for the bot — which survives the common
+    ///   red–green colour-vision deficiencies far better than a red/green or
+    ///   cyan/orange pair would.
+    #[must_use]
+    pub const fn plate(self) -> Color {
+        match self {
+            Self::Player => Color::srgb(0.550, 0.520, 0.680),
+            Self::Bot => Color::srgb(0.680, 0.600, 0.470),
+        }
+    }
+}
+
 /// The design's shared material for one finish.
 ///
 /// `accent` is the "this one is mine" hue: the design gives it to the player's
 /// own craft and leaves every other craft on the neutral ramp, so the picture
 /// still separates for a pilot who cannot tell the two hues apart.
+///
+/// `seat` feeds exactly one finish, the plate (#383): every other finish
+/// renders identically for both seats, so the allegiance cue lives where the
+/// owner asked for it and nowhere else.
 #[must_use]
-pub fn finish_material(finish: Finish, accent: Color) -> StandardMaterial {
+pub fn finish_material(finish: Finish, seat: Seat, accent: Color) -> StandardMaterial {
     match finish {
         Finish::Plate => StandardMaterial {
-            base_color: Color::srgb(0.545, 0.565, 0.639),
+            base_color: seat.plate(),
             perceptual_roughness: 0.55,
             metallic: 0.35,
             ..Default::default()
@@ -711,6 +758,10 @@ pub fn finish_material(finish: Finish, accent: Color) -> StandardMaterial {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Any accent does for material tests: trim and glow pass it through,
+    /// and the finishes under test ignore it by design.
+    const ACCENT_STAND_IN: Color = Color::srgb(0.5, 0.5, 0.5);
 
     fn inside(outline: &[Vec2], point: Vec2) -> bool {
         let mut inside = false;
@@ -844,6 +895,67 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    /// #383's colour tell: the two seats must not render the same hull.
+    ///
+    /// This reads `finish_material` — what actually reaches the GPU — not the
+    /// constants behind it, so a mutation that makes the seats share a plate
+    /// fails here rather than in a test of its own inputs. The rest of the
+    /// finishes must stay seat-blind: the allegiance cue lives on the plate
+    /// alone, and the design's other materials are not allegiance paint.
+    #[test]
+    fn the_plate_carries_the_allegiance_tint_and_nothing_else_does() {
+        let player = Seat::Player;
+        let bot = Seat::Bot;
+        let base = |finish, seat| finish_material(finish, seat, ACCENT_STAND_IN).base_color;
+        assert_ne!(
+            base(Finish::Plate, player),
+            base(Finish::Plate, bot),
+            "player and bot plates are identical: no at-a-glance allegiance cue"
+        );
+        for shared in [Finish::Panel, Finish::Glass] {
+            assert_eq!(
+                base(shared, player),
+                base(shared, bot),
+                "{shared:?} must not carry the allegiance tint"
+            );
+        }
+        // Trim and glow stay on the accent scheme, whatever the seat.
+        assert_eq!(
+            base(Finish::Trim, player),
+            base(Finish::Trim, bot),
+            "trim follows the accent, not the seat"
+        );
+        // And both plates must still be recognisably the light structural
+        // plate: neither may collapse toward the dark panel ramp.
+        for seat in [player, bot] {
+            let plate = base(Finish::Plate, seat).to_srgba();
+            let panel = base(Finish::Panel, seat).to_srgba();
+            let channel_sum = |c: bevy::color::Srgba| c.red + c.green + c.blue;
+            assert!(
+                channel_sum(plate) > channel_sum(panel),
+                "{seat:?}: a plate darker than the panel is no longer the plate"
+            );
+        }
+    }
+
+    /// Both chassis must wear the tint on their plated surfaces: every plate
+    /// part of every model maps to the seat's plate material through the one
+    /// shared `finish_material`, so a model that hardcoded its own grey would
+    /// be caught here.
+    #[test]
+    fn every_hull_part_of_every_chassis_is_a_plated_part() {
+        for archetype in Archetype::ALL {
+            let plated = parts(*archetype)
+                .iter()
+                .filter(|part| part.finish == Finish::Plate)
+                .count();
+            assert!(
+                plated > 0,
+                "{archetype:?}: no plate means no allegiance surface to tint"
+            );
         }
     }
 }
