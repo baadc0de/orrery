@@ -21,7 +21,7 @@ use std::time::Duration;
 use assets::VisualAssetPaths;
 use bevy::prelude::*;
 use bevy::time::common_conditions::on_timer;
-use combat::{CombatView, LockBreak, ProjectileTracks};
+use combat::{CombatView, LockBreak, ProjectileTracks, ShotFeedback};
 use intent::{decode_packet, Controls, IntentPipeline};
 use orrery_core::Executor;
 use orrery_games::{
@@ -115,6 +115,7 @@ impl Plugin for RegolithSkinPlugin {
             .init_resource::<CombatView>()
             .init_resource::<ProjectileTracks>()
             .init_resource::<LockBreak>()
+            .init_resource::<ShotFeedback>()
             .add_systems(Startup, setup_scene)
             .add_systems(FixedUpdate, drive_core)
             .add_systems(
@@ -139,6 +140,7 @@ impl Plugin for RegolithSkinPlugin {
                     hud::sync_lock_reticle,
                     hud::sync_range_rings,
                     hud::sync_tracers,
+                    hud::sync_impact_flash,
                     hud::sync_gauges,
                     hud::refresh_combat_hud,
                 )
@@ -169,7 +171,14 @@ fn setup_scene(
         DirectionalLight::default(),
         Transform::from_rotation(Quat::from_rotation_x(-0.8)),
     ));
-    for (entity, accent) in [(PLAYER, hud::ACCENT_BRIGHT), (OPPONENT, hud::MUTED)] {
+    for (entity, seat) in [(PLAYER, craft::Seat::Player), (OPPONENT, craft::Seat::Bot)] {
+        // The seat's plate tint is #383's allegiance cue; the accent still
+        // drives trim and glow per the design ("this one is mine" for the
+        // player, neutral ramp for everyone else).
+        let accent = match seat {
+            craft::Seat::Player => hud::ACCENT_BRIGHT,
+            craft::Seat::Bot => hud::MUTED,
+        };
         let mut spawned = commands.spawn((
             CoreEntity(entity),
             Transform::from_scale(Vec3::splat(craft::CRAFT_DISPLAY_SCALE)),
@@ -190,7 +199,11 @@ fn setup_scene(
                 craft_root.spawn((
                     Name::new(part.name),
                     Mesh3d(meshes.add(craft::mesh_for(part.shape))),
-                    MeshMaterial3d(materials.add(craft::finish_material(part.finish, accent))),
+                    MeshMaterial3d(materials.add(craft::finish_material(
+                        part.finish,
+                        seat,
+                        accent,
+                    ))),
                     Transform {
                         translation: part.translation,
                         rotation: part.rotation,
@@ -241,6 +254,7 @@ fn drive_core(
     mut sink: ResMut<JsonlTelemetry>,
     mut tracks: ResMut<ProjectileTracks>,
     mut broken: ResMut<LockBreak>,
+    mut shots: ResMut<ShotFeedback>,
 ) {
     let tick = session.tick;
     let controls = controls(&keys);
@@ -281,6 +295,12 @@ fn drive_core(
     tracks.observe(&emitted);
     broken.age();
     broken.observe(&emitted, PLAYER);
+    // #383's two feedback layers, in event order: the provisional arrival
+    // armed off this tick's last flight leg, then the target's authoritative
+    // verdict — which arrives one delivery later and overrides the guess.
+    shots.age();
+    shots.arm_provisional(&tracks, PLAYER);
+    shots.observe(&emitted, PLAYER);
 }
 
 /// Copies this tick's combat state out of the executor for the overlay.

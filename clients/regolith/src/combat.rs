@@ -10,7 +10,7 @@
 use bevy::prelude::Resource;
 use orrery_core::Executor;
 use orrery_games::regolith::archetype::Archetype;
-use orrery_games::regolith::order::{LockBreakReason, Outcome};
+use orrery_games::regolith::order::{LockBreakReason, Outcome, ShotResult};
 use orrery_games::regolith::state::{Craft, RegolithState};
 use orrery_games::regolith::weapon::{Weapon, WeaponKind};
 use orrery_games::regolith::LOCK_ACQUISITION_TICKS;
@@ -26,6 +26,9 @@ pub const TRACER_POOL: usize = 24;
 
 /// Ticks a lock-break banner stays up after the ruleset reports the break.
 pub const BREAK_BANNER_TICKS: u16 = 90;
+
+/// Ticks the shot-result cue stays up after the event that raised it.
+pub const SHOT_CUE_TICKS: u16 = 45;
 
 /// The three states the design draws for a lock.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -268,6 +271,138 @@ impl LockBreak {
             None => String::new(),
             Some(LockBreakReason::RangeExceeded) => "LOCK BROKEN · RANGE EXCEEDED".to_owned(),
             Some(LockBreakReason::TargetDestroyed) => "LOCK BROKEN · TARGET DESTROYED".to_owned(),
+        }
+    }
+}
+
+/// How far the skin has got with one of the player's own shots.
+///
+/// Two layers, per the #383 owner decision: an immediate provisional cue the
+/// skin raises on the shot's last in-flight tick, and the target's
+/// authoritative verdict which arrives one delivery later and corrects it.
+/// The skin never decides whether damage landed — `ShotResult` is copied out
+/// of [`Outcome::ShotResolved`] verbatim, and a provisional cue that a later
+/// authoritative event contradicts is explicitly accepted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShotCue {
+    /// The final in-flight tick was observed; the target's step adjudicates
+    /// the shot next tick. Provisional only.
+    Arrival {
+        /// Target the shot was flying towards.
+        target: PersistId,
+    },
+    /// The target's authoritative verdict.
+    Resolved {
+        /// Target that adjudicated the shot.
+        target: PersistId,
+        /// Hit or miss, as the ruleset rolled it.
+        result: ShotResult,
+    },
+}
+
+/// The player's most recent shot feedback, held on screen long enough to read.
+#[derive(Debug, Default, Resource)]
+pub struct ShotFeedback {
+    /// The live cue, if any.
+    pub cue: Option<ShotCue>,
+    /// Ticks the cue still has to run.
+    pub ticks_left: u16,
+}
+
+impl ShotFeedback {
+    /// Arms the provisional arrival cue off the player's final in-flight tick.
+    ///
+    /// The last `DamageDealt` a shot ever carries has `flight_ticks == 1`;
+    /// the target resolves on the following tick. Seeing that event is a fact
+    /// about timing, not about the outcome — this claims nothing more than
+    /// "an adjudication is due", which is all the skin may claim.
+    pub fn arm_provisional(&mut self, tracks: &ProjectileTracks, shooter: PersistId) {
+        if let Some(track) = tracks.own_shot(shooter) {
+            if track.remaining == 1 {
+                self.cue = Some(ShotCue::Arrival {
+                    target: track.target,
+                });
+                self.ticks_left = SHOT_CUE_TICKS;
+            }
+        }
+    }
+
+    /// Reads this tick's events for the shooter's resolution — or for a lock
+    /// break, which cancels a still-unconfirmed provisional cue.
+    ///
+    /// A shot can fail to be adjudicated at all: the range check runs before
+    /// flight every tick, so `LockBroken` can retire a shot that never rolls.
+    /// An authoritative verdict always wins over a break seen the same tick,
+    /// because a hit that kills its target emits both.
+    pub fn observe(&mut self, events: &[Outcome], shooter: PersistId) {
+        let mut resolved = None;
+        let mut broke = false;
+        for event in events {
+            match event {
+                Outcome::ShotResolved {
+                    attacker,
+                    target,
+                    result,
+                } if *attacker == shooter => {
+                    resolved = Some(ShotCue::Resolved {
+                        target: *target,
+                        result: *result,
+                    });
+                }
+                Outcome::LockBroken { locker, .. } if *locker == shooter => broke = true,
+                _ => {}
+            }
+        }
+        match resolved {
+            Some(cue) => {
+                self.cue = Some(cue);
+                self.ticks_left = SHOT_CUE_TICKS;
+            }
+            None if broke && matches!(self.cue, Some(ShotCue::Arrival { .. })) => {
+                self.cue = None;
+                self.ticks_left = 0;
+            }
+            None => {}
+        }
+    }
+
+    /// Ages the cue by one tick.
+    pub fn age(&mut self) {
+        self.ticks_left = self.ticks_left.saturating_sub(1);
+        if self.ticks_left == 0 {
+            self.cue = None;
+        }
+    }
+
+    /// The target the world-space impact flash anchors on, while one should
+    /// draw: a provisional arrival, or an authoritative hit. A miss draws no
+    /// flash — that is exactly the correction the verdict makes.
+    #[must_use]
+    pub fn flash_target(&self) -> Option<PersistId> {
+        match self.cue {
+            Some(ShotCue::Arrival { target }) => Some(target),
+            Some(ShotCue::Resolved {
+                target,
+                result: ShotResult::Hit,
+            }) => Some(target),
+            _ => None,
+        }
+    }
+
+    /// The HUD line, empty when nothing is live.
+    #[must_use]
+    pub fn banner(&self) -> String {
+        match self.cue {
+            None => String::new(),
+            Some(ShotCue::Arrival { .. }) => "IMPACT…".to_owned(),
+            Some(ShotCue::Resolved {
+                result: ShotResult::Hit,
+                ..
+            }) => "HIT CONFIRMED".to_owned(),
+            Some(ShotCue::Resolved {
+                result: ShotResult::Miss,
+                ..
+            }) => "MISS".to_owned(),
         }
     }
 }
@@ -599,6 +734,233 @@ mod tests {
             PersistId::new(1),
         );
         assert!(banner.banner().is_empty());
+    }
+
+    fn resolved(attacker: u64, result: ShotResult) -> Outcome {
+        Outcome::ShotResolved {
+            attacker: PersistId::new(attacker),
+            target: PersistId::new(2),
+            result,
+        }
+    }
+
+    /// The two layers of #383's owner decision, in order: a provisional cue
+    /// armed off the shot's own final flight tick, then the authoritative
+    /// verdict that replaces it.
+    #[test]
+    fn provisional_arrival_is_armed_then_corrected_by_the_verdict() {
+        let me = PersistId::new(1);
+        let mut tracks = ProjectileTracks::default();
+        let mut feedback = ShotFeedback::default();
+
+        // Mid-flight: nothing armed yet — the skin claims no arrival early.
+        tracks.observe(&[shot(1, 2, Some(3))]);
+        feedback.arm_provisional(&tracks, me);
+        assert!(feedback.cue.is_none());
+
+        // The last leg: an arrival is due next tick. That is all it says.
+        tracks.observe(&[shot(1, 2, Some(2))]);
+        tracks.observe(&[shot(1, 2, Some(1))]);
+        feedback.arm_provisional(&tracks, me);
+        assert_eq!(
+            feedback.cue,
+            Some(ShotCue::Arrival {
+                target: PersistId::new(2)
+            })
+        );
+        assert_eq!(
+            feedback.flash_target(),
+            Some(PersistId::new(2)),
+            "the provisional flash draws on the target"
+        );
+        assert_eq!(feedback.banner(), "IMPACT…");
+
+        // The target's verdict corrects it; a miss withdraws the flash.
+        feedback.observe(&[resolved(1, ShotResult::Miss)], me);
+        assert_eq!(
+            feedback.cue,
+            Some(ShotCue::Resolved {
+                target: PersistId::new(2),
+                result: ShotResult::Miss,
+            })
+        );
+        assert_eq!(feedback.banner(), "MISS");
+        assert_eq!(
+            feedback.flash_target(),
+            None,
+            "a miss must retract the provisional flash"
+        );
+
+        // And expiry takes the whole cue with it.
+        for _ in 0..SHOT_CUE_TICKS {
+            feedback.age();
+        }
+        assert!(feedback.cue.is_none());
+        assert!(feedback.banner().is_empty());
+    }
+
+    #[test]
+    fn a_hit_verdict_confirms_the_flash_and_expires() {
+        let mut feedback = ShotFeedback::default();
+        feedback.observe(&[resolved(1, ShotResult::Hit)], PersistId::new(1));
+        assert_eq!(feedback.banner(), "HIT CONFIRMED");
+        assert_eq!(
+            feedback.flash_target(),
+            Some(PersistId::new(2)),
+            "an authoritative hit keeps the flash up"
+        );
+        feedback.age();
+        assert!(feedback.cue.is_some(), "one tick is not SHOT_CUE_TICKS");
+    }
+
+    #[test]
+    fn someone_elses_shot_never_fires_my_cue() {
+        let mut feedback = ShotFeedback::default();
+        feedback.observe(&[resolved(9, ShotResult::Hit)], PersistId::new(1));
+        assert!(feedback.cue.is_none(), "resolution names its shooter");
+
+        let mut tracks = ProjectileTracks::default();
+        tracks.observe(&[shot(9, 2, Some(1))]);
+        feedback.arm_provisional(&tracks, PersistId::new(1));
+        assert!(
+            feedback.cue.is_none(),
+            "another shooter's final leg arms nobody"
+        );
+    }
+
+    /// A shot can die unadjudicated — the range check runs before flight —
+    /// so a break must cancel a pending provisional cue. A verdict already in
+    /// hand survives: a killing hit emits both events in one tick.
+    #[test]
+    fn a_lock_break_cancels_a_provisional_but_never_a_verdict() {
+        let me = PersistId::new(1);
+        let break_event = |reason| Outcome::LockBroken {
+            locker: me,
+            target: PersistId::new(2),
+            reason,
+        };
+
+        let mut feedback = ShotFeedback {
+            cue: Some(ShotCue::Arrival {
+                target: PersistId::new(2),
+            }),
+            ticks_left: SHOT_CUE_TICKS,
+        };
+        feedback.observe(&[break_event(LockBreakReason::RangeExceeded)], me);
+        assert!(
+            feedback.cue.is_none(),
+            "an unadjudicated shot must take its provisional flash back"
+        );
+        assert!(feedback.banner().is_empty());
+
+        let mut feedback = ShotFeedback::default();
+        feedback.observe(&[resolved(1, ShotResult::Hit)], me);
+        feedback.observe(&[break_event(LockBreakReason::TargetDestroyed)], me);
+        assert_eq!(
+            feedback.cue,
+            Some(ShotCue::Resolved {
+                target: PersistId::new(2),
+                result: ShotResult::Hit,
+            }),
+            "the verdict outlives the kill-shot's lock break"
+        );
+    }
+
+    /// End to end against the real rules: hold the trigger, watch the
+    /// provisional cue arm on a genuine final leg, then confirm every
+    /// verdict the skin shows came verbatim from a `ShotResolved` the
+    /// target's step emitted. This is #383's owner decision made executable:
+    /// feedback always arrives, the skin never invents its outcome.
+    #[test]
+    fn live_fire_arms_a_provisional_and_confirms_it_from_the_ruleset() {
+        use orrery_games::{Game, Regolith as Ruleset};
+        use orrery_protocol::{Tick, UniverseSeed};
+
+        let seed = UniverseSeed([0x61; 32]);
+        let game = Ruleset::honest();
+        let mut executor = Executor::new(game, seed);
+        let me = PersistId::new(1);
+        let them = PersistId::new(2);
+        executor.insert(me, game.spawn(me, 0));
+        executor.insert(them, game.spawn(them, 1));
+        let my_pipeline = crate::intent::IntentPipeline::new(seed, me, 0, vec![them]);
+        let their_pipeline = crate::intent::IntentPipeline::new(seed, them, 1, vec![me]);
+
+        let held = crate::intent::Controls {
+            fire: true,
+            thrust: true,
+            ..crate::intent::Controls::default()
+        };
+        use orrery_games::regolith::order::Order;
+        let mut pending = std::collections::BTreeMap::<PersistId, Vec<Order>>::new();
+        let mut tracks = ProjectileTracks::default();
+        let mut feedback = ShotFeedback::default();
+        let mut arrivals_armed = 0usize;
+        let mut verdicts = Vec::new();
+
+        for raw in 0..150u64 {
+            let tick = Tick::new(raw);
+            let mut delivered = std::collections::BTreeMap::<PersistId, Vec<Order>>::new();
+            let mut emitted = Vec::new();
+            for (entity, mut orders) in [
+                (me, my_pipeline.human_orders(tick, held)),
+                (them, their_pipeline.bot_orders(tick)),
+            ] {
+                let mut inbox = pending.remove(&entity).unwrap_or_default();
+                inbox.append(&mut orders);
+                let outcome = executor
+                    .step_entity(entity, tick, &inbox)
+                    .expect("both craft installed");
+                for event in &outcome.events {
+                    if let Some((target, input)) = executor.ruleset().deliver(event) {
+                        delivered.entry(target).or_default().push(input);
+                    }
+                }
+                emitted.extend(outcome.events.iter().cloned());
+            }
+            pending = delivered;
+
+            tracks.observe(&emitted);
+            feedback.age();
+            feedback.arm_provisional(&tracks, me);
+            if matches!(feedback.cue, Some(ShotCue::Arrival { .. })) {
+                arrivals_armed += 1;
+            }
+            let before = feedback.cue;
+            feedback.observe(&emitted, me);
+
+            // The cue stays up for SHOT_CUE_TICKS after its event, so the
+            // cross-check belongs to the tick the verdict was raised.
+            if let (Some(ShotCue::Resolved { target, result }), before_cue) = (feedback.cue, before)
+            {
+                if before_cue != feedback.cue {
+                    let source = emitted.iter().any(|event| {
+                        matches!(
+                            event,
+                            Outcome::ShotResolved {
+                                attacker,
+                                target: who,
+                                result: rolled,
+                            } if *attacker == me && *who == target && *rolled == result
+                        )
+                    });
+                    assert!(
+                        source,
+                        "tick {raw}: the skin showed {result:?} with no authoritative event behind it"
+                    );
+                    verdicts.push(result);
+                }
+            }
+        }
+
+        assert!(
+            arrivals_armed >= 1,
+            "held trigger over 150 ticks must arm at least one provisional arrival"
+        );
+        assert!(
+            !verdicts.is_empty(),
+            "and at least one authoritative verdict must land"
+        );
     }
 
     #[test]

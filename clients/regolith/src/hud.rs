@@ -36,9 +36,11 @@ type GlowQuery<'w, 's> = Query<
     (With<LockGlow>, Without<LockReticle>, Without<LockBrackets>),
 >;
 
+use orrery_games::regolith::order::ShotResult;
+
 use crate::combat::{
-    CombatView, CraftView, LockBreak, LockPhase, ProjectileTracks, RangeBand, LOCK_RING_SEGMENTS,
-    TRACER_POOL,
+    CombatView, CraftView, LockBreak, LockPhase, ProjectileTracks, RangeBand, ShotCue,
+    ShotFeedback, LOCK_RING_SEGMENTS, TRACER_POOL,
 };
 
 /// Accent: "this one is mine". The design gives the accent hue to the player's
@@ -63,6 +65,79 @@ pub const GAUGE_TRACK: Color = Color::srgb(0.161, 0.169, 0.192);
 pub const PANEL: Color = Color::srgba(0.086, 0.094, 0.149, 0.86);
 /// Tracer white.
 pub const TRACER: Color = Color::srgb(0.961, 0.957, 1.0);
+
+/// The pool cuboid's length along its nose axis at scale one, in metres.
+pub const TRACER_MESH_LENGTH_M: f32 = 18.0;
+
+/// How many ruleset ticks of flight the tracer's persistence trail covers.
+///
+/// #383: "the tracers look good but are actually a bit too fast." The fix is
+/// *apparent* duration, never actual duration — `flight_ticks` derives from
+/// the weapon table's `projectile_speed_mms`, and touching that is a balance
+/// change wearing a legibility fix's clothes. Instead each tracer is drawn as
+/// a streak spanning where the shot was over the most recent
+/// [`TRACER_PERSISTENCE_TICKS`] ticks — a motion-blur window of
+/// `12 / TICK_HZ = 0.2 s`, roughly how long the eye integrates a moving
+/// light. A stock round covers 60 m in that window, a Heavy round 36 m:
+/// every weapon's streak then reads as "this far per blink", which is exactly
+/// the speed cue the owner asked to slow down.
+///
+/// The trail is history, not ballistics: it renders points on the same
+/// muzzle→target line the event already defines, so the skin adds no physics
+/// the ruleset does not state.
+pub const TRACER_PERSISTENCE_TICKS: u16 = 12;
+
+/// Floor on a tracer streak's drawn length, in metres.
+///
+/// The instant a shot leaves the muzzle its flown path is shorter than any
+/// persistence window, which would scale the mesh to zero (and Bevy warns on
+/// singular scales). The streak keeps this minimum and grows *backwards* from
+/// the head, so the extra length can only ever cover ground the shot has
+/// already crossed or empty corridor behind it — never lead the position the
+/// ruleset reports.
+pub const TRACER_MIN_SPAN_M: f32 = 8.0;
+
+/// Head and tail of a tracer streak, as fractions of the muzzle→target line.
+///
+/// `flown` ticks have run of a `total`-tick flight. The head sits at the
+/// ruleset's own flown fraction; the tail lags [`TRACER_PERSISTENCE_TICKS`]
+/// behind it, clamped at the muzzle — early in a flight the whole flown path
+/// is lit, and once the flight outlasts the window the streak holds a fixed
+/// length while travelling. Both outputs are in `0.0..=1.0` with
+/// `tail <= head`.
+#[must_use]
+pub fn streak_fractions(flown: u16, total: u16) -> (f32, f32) {
+    if total == 0 {
+        return (1.0, 1.0);
+    }
+    let head = flown.min(total);
+    let tail = flown.saturating_sub(TRACER_PERSISTENCE_TICKS).min(total);
+    (
+        f32::from(head) / f32::from(total),
+        f32::from(tail) / f32::from(total),
+    )
+}
+
+/// Placement of one tracer streak this frame.
+///
+/// Returns the entity translation and the streak's length in metres. The
+/// leading edge lands exactly on the ruleset's head point — the streak is
+/// centred half a length back along the line — so flooring the length at
+/// [`TRACER_MIN_SPAN_M`] can stretch the trail but never push the visible
+/// front past where the event says the shot is.
+#[must_use]
+pub fn tracer_streak(
+    muzzle: Vec3,
+    destination: Vec3,
+    head_fraction: f32,
+    tail_fraction: f32,
+) -> (Vec3, f32) {
+    let along = destination - muzzle;
+    let direction = along.normalize_or_zero();
+    let span = (along.length() * (head_fraction - tail_fraction)).max(TRACER_MIN_SPAN_M);
+    let centre = muzzle + along * head_fraction - direction * (span / 2.0);
+    (centre, span)
+}
 
 /// Reticle ring radius in world metres.
 ///
@@ -99,6 +174,10 @@ pub struct RangeRing {
 /// One slot in the tracer pool.
 #[derive(Component)]
 pub struct Tracer(pub usize);
+
+/// The world-space burst drawn on a shot's target while an arrival cue lives.
+#[derive(Component)]
+pub struct ImpactFlash;
 
 /// A gauge's filled bar. The system sets its width.
 #[derive(Component, Clone, Copy, PartialEq, Eq, Debug)]
@@ -148,6 +227,8 @@ pub enum Readout {
     TargetRelation,
     /// The lock-break banner.
     BreakBanner,
+    /// The shot-result cue line: provisional impact, then hit or miss.
+    ShotResult,
 }
 
 fn label(text: &str) -> impl Bundle {
@@ -280,6 +361,7 @@ pub fn spawn_hud(commands: &mut Commands) {
                 gauge_row("SHIELD", Gauge::TargetShield, Readout::TargetShield),
                 value(Readout::TargetRelation, 11.0, MUTED),
                 value(Readout::BreakBanner, 12.0, Color::srgb(0.95, 0.62, 0.45)),
+                value(Readout::ShotResult, 13.0, MUTED),
             ]
         )],
     ));
@@ -340,7 +422,16 @@ pub fn spawn_world_overlay(
         major_radius: 1.0,
         minor_radius: 0.0035,
     });
-    let tracer_mesh = meshes.add(Cuboid::new(18.0, 0.5, 0.5));
+    let tracer_mesh = meshes.add(Cuboid::new(TRACER_MESH_LENGTH_M, 0.5, 0.5));
+    let flash_mesh = meshes.add(Sphere {
+        radius: RETICLE_RADIUS_M * 0.12,
+    });
+    let flash_material = materials.add(StandardMaterial {
+        base_color: TRACER,
+        emissive: LinearRgba::WHITE * 8.0,
+        unlit: true,
+        ..Default::default()
+    });
 
     commands
         .spawn((LockReticle, Transform::default(), Visibility::Hidden))
@@ -408,6 +499,14 @@ pub fn spawn_world_overlay(
             Visibility::Hidden,
         ));
     }
+
+    commands.spawn((
+        ImpactFlash,
+        Mesh3d(flash_mesh),
+        MeshMaterial3d(flash_material),
+        Transform::default(),
+        Visibility::Hidden,
+    ));
 }
 
 /// Lights one acquisition mark per tick of `lock_progress` and parks the
@@ -494,13 +593,18 @@ pub fn sync_range_rings(
     }
 }
 
-/// Places one tracer per shot the ruleset says is still in the air.
+/// Places one tracer streak per shot the ruleset says is still in the air.
 ///
-/// The position is `lerp(muzzle, target, travelled)` where every input comes
-/// from the event: `attacker_pos` is the muzzle the ruleset stamped, and
-/// `travelled` is the ruleset's own `flight_ticks` countdown. There is no
-/// skin-side velocity integration, so a tracer cannot be somewhere the ruleset
-/// does not put it, and it cannot outlive the shot.
+/// Every input comes from the event: `attacker_pos` is the muzzle the
+/// ruleset stamped, and the head fraction is the ruleset's own `flight_ticks`
+/// countdown. There is no skin-side velocity integration, so a tracer cannot
+/// be somewhere the ruleset does not put it, and it cannot outlive the shot.
+///
+/// Since #383 the tracer is a *streak*: [`tracer_streak`] stretches it back
+/// over [`TRACER_PERSISTENCE_TICKS`] of the same flight so its apparent speed
+/// reads slower, while the leading edge stays pinned to the ruleset's own
+/// travelled position. The projectile's true speed is untouched — that lives
+/// in the weapon table and changing it would be a balance change.
 pub fn sync_tracers(
     tracks: Res<ProjectileTracks>,
     bodies: Query<(&crate::CoreEntity, &GlobalTransform)>,
@@ -523,8 +627,14 @@ pub fn sync_tracers(
             *visibility = Visibility::Hidden;
             continue;
         }
-        transform.translation = muzzle + along * track.travelled();
+        let (head, tail) =
+            streak_fractions(track.total.saturating_sub(track.remaining), track.total);
+        let (centre, span) = tracer_streak(muzzle, destination, head, tail);
+        transform.translation = centre;
         transform.rotation = Quat::from_rotation_y((-along.z).atan2(along.x));
+        // The pool's cuboid is TRACER_MESH_LENGTH_M long at scale one; only
+        // the streak's run varies, its cross-section does not.
+        transform.scale = Vec3::new(span / TRACER_MESH_LENGTH_M, 1.0, 1.0);
         *visibility = Visibility::Inherited;
     }
 }
@@ -536,6 +646,30 @@ fn world_position(
     bodies
         .iter()
         .find_map(|(core, transform)| (core.0 == entity).then(|| transform.translation()))
+}
+
+/// Draws the impact flash on the shot's target while a cue says one is live.
+///
+/// A provisional arrival and an authoritative hit both draw; a verdict of
+/// miss retracts it — [`ShotFeedback::flash_target`] encodes that choice, so
+/// this system stays a pure placement: anchor on the target's body or hide.
+pub fn sync_impact_flash(
+    feedback: Res<ShotFeedback>,
+    bodies: Query<(&crate::CoreEntity, &GlobalTransform)>,
+    mut flashes: Query<(&mut Transform, &mut Visibility), With<ImpactFlash>>,
+) {
+    let anchor = feedback
+        .flash_target()
+        .and_then(|target| world_position(&bodies, target));
+    if let Ok((mut transform, mut visibility)) = flashes.single_mut() {
+        match anchor {
+            Some(position) => {
+                transform.translation = position;
+                *visibility = Visibility::Inherited;
+            }
+            None => *visibility = Visibility::Hidden,
+        }
+    }
 }
 
 /// Sets every gauge's fill width from the ruleset's own numbers.
@@ -575,6 +709,7 @@ pub fn refresh_combat_hud(
     view: Res<CombatView>,
     tracks: Res<ProjectileTracks>,
     broken: Res<LockBreak>,
+    feedback: Res<ShotFeedback>,
     mut lines: Query<(&Readout, &mut Text, &mut TextColor)>,
 ) {
     let phase = view.lock.phase();
@@ -670,6 +805,21 @@ pub fn refresh_combat_hud(
             ),
             Readout::TargetRelation => (target_relation(&view, &tracks), MUTED),
             Readout::BreakBanner => (broken.banner(), Color::srgb(0.95, 0.62, 0.45)),
+            Readout::ShotResult => {
+                let tint = match feedback.cue {
+                    Some(ShotCue::Arrival { .. }) => MUTED,
+                    Some(ShotCue::Resolved {
+                        result: ShotResult::Hit,
+                        ..
+                    }) => ACCENT_BRIGHT,
+                    Some(ShotCue::Resolved {
+                        result: ShotResult::Miss,
+                        ..
+                    })
+                    | None => DIM,
+                };
+                (feedback.banner(), tint)
+            }
         };
         **text = body;
         colour.0 = tint;
@@ -766,7 +916,7 @@ pub fn chassis_of(view: Option<CraftView>) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::combat::{LockView, Track};
+    use crate::combat::{LockView, Track, SHOT_CUE_TICKS};
     use crate::CoreEntity;
     use orrery_core::{Executor, QPos, QVel};
     use orrery_games::regolith::archetype::Archetype;
@@ -792,11 +942,13 @@ mod tests {
         let mut app = App::new();
         app.init_resource::<CombatView>()
             .init_resource::<ProjectileTracks>()
-            .init_resource::<LockBreak>();
+            .init_resource::<LockBreak>()
+            .init_resource::<ShotFeedback>();
         let world = app.world_mut();
         world.spawn((LockReticle, Transform::default(), Visibility::Hidden));
         world.spawn((LockBrackets, Transform::default(), Visibility::Inherited));
         world.spawn((LockGlow, Transform::default(), Visibility::Hidden));
+        world.spawn((ImpactFlash, Transform::default(), Visibility::Hidden));
         for index in 0..LOCK_RING_SEGMENTS {
             world.spawn((LockSegment(index), Transform::default(), Visibility::Hidden));
         }
@@ -822,13 +974,22 @@ mod tests {
             .count()
     }
 
-    fn tracer_transform(app: &mut App, index: usize) -> Option<Vec3> {
+    /// A live tracer's placement: entity translation and drawn length.
+    ///
+    /// The pool cuboid runs along local `+X`, so with the axis-aligned test
+    /// corridors here the leading edge is `translation + span/2 · X`.
+    fn tracer_geometry(app: &mut App, index: usize) -> Option<(Vec3, f32)> {
         app.world_mut()
             .query::<(&Tracer, &Transform, &Visibility)>()
             .iter(app.world())
             .find(|(tracer, _, _)| tracer.0 == index)
             .filter(|(_, _, visibility)| **visibility != Visibility::Hidden)
-            .map(|(_, transform, _)| transform.translation)
+            .map(|(_, transform, _)| {
+                (
+                    transform.translation,
+                    transform.scale.x * TRACER_MESH_LENGTH_M,
+                )
+            })
     }
 
     /// The lock ring must be a *display of `lock_progress`*, one mark per tick.
@@ -928,7 +1089,9 @@ mod tests {
     /// If the tracer stops reading the event — pinned to the muzzle, teleported
     /// to the target, or advanced by a skin-side clock — the time of flight
     /// that #363 introduced stops being visible, which is the second half of
-    /// what #378 reports.
+    /// what #378 reports. Since #383 the drawing is a streak whose *leading
+    /// edge* is that picture: this walks the head through the same five-tick
+    /// flight and demands it sit where the ruleset says, tick for tick.
     #[test]
     fn a_tracer_walks_the_shot_the_ruleset_reports() {
         let mut app = overlay_app();
@@ -941,18 +1104,26 @@ mod tests {
             .resource_mut::<ProjectileTracks>()
             .observe(&[shot(None)]);
         app.update();
-        assert!(tracer_transform(&mut app, 0).is_none());
+        assert!(tracer_geometry(&mut app, 0).is_none());
 
-        // Five ticks of flight, walked one event at a time.
-        for (remaining, expected_x) in [(4u16, 20.0f32), (3, 40.0), (2, 60.0), (1, 80.0)] {
+        // Five ticks of flight, walked one event at a time. The whole flown
+        // path fits inside one persistence window, so the tail rests on the
+        // muzzle and the leading edge is exactly the travelled point.
+        for (remaining, expected_head_x) in [(4u16, 20.0f32), (3, 40.0), (2, 60.0), (1, 80.0)] {
             app.world_mut()
                 .resource_mut::<ProjectileTracks>()
                 .observe(&[in_flight(remaining)]);
             app.update();
-            let position = tracer_transform(&mut app, 0).expect("a shot in the air is drawn");
+            let (centre, span) = tracer_geometry(&mut app, 0).expect("a shot in the air is drawn");
+            let head_x = centre.x + span / 2.0;
+            let tail_x = centre.x - span / 2.0;
             assert!(
-                (position.x - expected_x).abs() < 0.01,
-                "with {remaining} ticks left the tracer belongs at x={expected_x}, not {position}"
+                (head_x - expected_head_x).abs() < 0.01,
+                "with {remaining} ticks left the shot's front belongs at x={expected_head_x}, not {head_x}"
+            );
+            assert!(
+                tail_x.abs() < 0.01,
+                "a short flight's trail must reach the muzzle, not {tail_x}"
             );
         }
 
@@ -962,8 +1133,146 @@ mod tests {
             .observe(&[]);
         app.update();
         assert!(
-            tracer_transform(&mut app, 0).is_none(),
+            tracer_geometry(&mut app, 0).is_none(),
             "a resolved shot must stop being drawn"
+        );
+    }
+
+    /// The persistence window, not the whole corridor: on a long flight the
+    /// trail must detach from the muzzle and hold `TRACER_PERSISTENCE_TICKS`
+    /// worth of path behind a head still driven by the event.
+    ///
+    /// This is the guard that makes #383's fix track the flight — pin the
+    /// trail to anything constant and either its length or its head position
+    /// drifts off the ruleset's numbers below.
+    #[test]
+    fn the_streak_lags_by_the_persistence_window_on_a_long_flight() {
+        let mut app = overlay_app();
+        body(&mut app, ME, 0.0, 0.0);
+        body(&mut app, THEM, 600.0, 0.0);
+        app.add_systems(Update, sync_tracers);
+
+        // A 30-tick flight over a 600 m corridor, walked tick by tick because
+        // `observe` stitches totals from consecutive events. Stop with 17
+        // ticks flown — five past the persistence window.
+        {
+            let mut tracks = app.world_mut().resource_mut::<ProjectileTracks>();
+            tracks.observe(&[in_flight(29)]);
+            for remaining in (13..=28u16).rev() {
+                tracks.observe(&[in_flight(remaining)]);
+            }
+        }
+        app.update();
+        let (centre, span) = tracer_geometry(&mut app, 0).expect("the mid-flight streak");
+        let head = centre.x + span / 2.0;
+        let tail = centre.x - span / 2.0;
+        assert!(
+            (head - 340.0).abs() < 0.01,
+            "the head must ride the event's flown fraction (17/30 of 600 m), not {head}"
+        );
+        assert!(
+            (span - 600.0 * (TRACER_PERSISTENCE_TICKS as f32 / 30.0)).abs() < 0.01,
+            "the trail must be {} ticks of a 600 m corridor, not {span} m",
+            TRACER_PERSISTENCE_TICKS
+        );
+        assert!(
+            tail > 99.0,
+            "on a long flight the trail detaches from the muzzle (tail {tail})"
+        );
+
+        // Near arrival the front rides the head and the window holds: no
+        // growth past what the ruleset's own countdown covers.
+        {
+            let mut tracks = app.world_mut().resource_mut::<ProjectileTracks>();
+            for remaining in (1..=12u16).rev() {
+                tracks.observe(&[in_flight(remaining)]);
+            }
+        }
+        app.update();
+        let (centre, span) = tracer_geometry(&mut app, 0).expect("the arriving streak");
+        let head = centre.x + span / 2.0;
+        assert!(
+            (head - 580.0).abs() < 0.01,
+            "front rides the event's 29/30 point: {head}"
+        );
+        assert!(
+            (span - 600.0 * (TRACER_PERSISTENCE_TICKS as f32 / 30.0)).abs() < 0.01,
+            "the window holds all the way in: {span} m"
+        );
+        assert!(
+            head <= 600.0,
+            "the streak may never lead the shot past its target"
+        );
+    }
+
+    /// The window arithmetic in isolation: growth while flown is under the
+    /// window, then a fixed-length streak travelling with the head.
+    #[test]
+    fn streak_fractions_grow_then_hold_the_persistence_window() {
+        // Early: everything flown is lit, tail on the muzzle.
+        assert_eq!(streak_fractions(5, 30), (5.0 / 30.0, 0.0));
+        // Exactly one window in.
+        assert_eq!(
+            streak_fractions(TRACER_PERSISTENCE_TICKS, 30),
+            (12.0 / 30.0, 0.0)
+        );
+        // Past it: the span holds at one window while the head advances.
+        let (head_a, tail_a) = streak_fractions(15, 30);
+        let (head_b, tail_b) = streak_fractions(25, 30);
+        assert!((head_a - 0.5) < 1e-6 && head_a > 0.49);
+        assert!(head_b > head_a, "the head must advance with flown ticks");
+        assert!(
+            ((head_a - tail_a) - (head_b - tail_b)).abs() < 1e-6,
+            "past the window the streak length must hold, not keep growing"
+        );
+        assert!(
+            (head_a - tail_a - TRACER_PERSISTENCE_TICKS as f32 / 30.0).abs() < 1e-6,
+            "that held length is exactly {} ticks",
+            TRACER_PERSISTENCE_TICKS
+        );
+        // Arrival: front on the target, window still trailing.
+        assert_eq!(
+            streak_fractions(30, 30),
+            (1.0, (30 - TRACER_PERSISTENCE_TICKS) as f32 / 30.0)
+        );
+        // Degenerate totals cannot divide.
+        assert_eq!(streak_fractions(3, 0), (1.0, 1.0));
+    }
+
+    /// Geometry: the leading edge sits on the head point and extra floor
+    /// length grows backwards, never forwards past the ruleset's position.
+    #[test]
+    fn tracer_streak_pins_its_front_to_the_head_point() {
+        let muzzle = Vec3::ZERO;
+        let destination = Vec3::new(400.0, 0.0, 0.0);
+
+        // Unfloored: centre is the midpoint of [tail, head].
+        let (centre, span) = tracer_streak(muzzle, destination, 0.5, 0.3);
+        assert!((span - 80.0).abs() < 1e-4);
+        assert!((centre.x - 160.0).abs() < 1e-4);
+        let front = centre + Vec3::X * span / 2.0;
+        let back = centre - Vec3::X * span / 2.0;
+        assert!((front.x - 200.0).abs() < 1e-4, "front == head point");
+        assert!((back.x - 120.0).abs() < 1e-4, "back == tail point");
+
+        // Floored: a short early flight still shows TRACER_MIN_SPAN_M, and
+        // every metre of the floor goes behind the head.
+        let (centre, span) = tracer_streak(muzzle, destination, 0.02, 0.0);
+        assert_eq!(span, TRACER_MIN_SPAN_M);
+        let front = centre + Vec3::X * span / 2.0;
+        assert!(
+            (front.x - 400.0 * 0.02).abs() < 1e-4,
+            "the floored streak must not lead the shot: front {front}"
+        );
+
+        // Off-axis corridors get the same treatment along their own line.
+        let destination = Vec3::new(300.0, 0.0, -400.0);
+        let (centre, span) = tracer_streak(muzzle, destination, 1.0, 0.75);
+        assert!((span - 125.0).abs() < 1e-3);
+        let front = centre + (destination - muzzle).normalize() * span / 2.0;
+        assert!(
+            front.distance(destination) < 1e-3,
+            "at arrival the front touches the target: {front}"
         );
     }
 
@@ -977,9 +1286,70 @@ mod tests {
             .resource_mut::<ProjectileTracks>()
             .observe(&[in_flight(9), in_flight(4)]);
         app.update();
-        assert!(tracer_transform(&mut app, 0).is_some());
-        assert!(tracer_transform(&mut app, 1).is_some());
-        assert!(tracer_transform(&mut app, 2).is_none());
+        assert!(tracer_geometry(&mut app, 0).is_some());
+        assert!(tracer_geometry(&mut app, 1).is_some());
+        assert!(tracer_geometry(&mut app, 2).is_none());
+    }
+
+    /// The flash is a picture of the cue and nothing else: provisional or
+    /// confirmed-hit draws anchored on the target's body, a miss retracts it,
+    /// expiry hides it. Pinning it to a constant — always on, or drawn on the
+    /// shooter instead of the target — is the failure this catches.
+    #[test]
+    fn the_impact_flash_follows_the_shot_cue() {
+        let mut app = overlay_app();
+        body(&mut app, ME, 0.0, 0.0);
+        body(&mut app, THEM, 100.0, -40.0);
+        app.add_systems(Update, sync_impact_flash);
+
+        let flash_state = |app: &mut App| {
+            app.world_mut()
+                .query::<(&ImpactFlash, &Transform, &Visibility)>()
+                .iter(app.world())
+                .map(|(_, transform, visibility)| {
+                    (*visibility != Visibility::Hidden, transform.translation)
+                })
+                .next()
+                .expect("the flash exists")
+        };
+
+        // Nothing live: hidden.
+        app.update();
+        let (visible, _) = flash_state(&mut app);
+        assert!(!visible);
+
+        // Provisional arrival: drawn on the target's own body.
+        *app.world_mut().resource_mut::<ShotFeedback>() = ShotFeedback {
+            cue: Some(ShotCue::Arrival { target: THEM }),
+            ticks_left: SHOT_CUE_TICKS,
+        };
+        app.update();
+        let (visible, at) = flash_state(&mut app);
+        assert!(visible);
+        assert_eq!(at, Vec3::new(100.0, 0.0, -40.0));
+        // A miss verdict withdraws what the provisional layer put up.
+        *app.world_mut().resource_mut::<ShotFeedback>() = ShotFeedback {
+            cue: Some(ShotCue::Resolved {
+                target: THEM,
+                result: ShotResult::Miss,
+            }),
+            ticks_left: SHOT_CUE_TICKS,
+        };
+        app.update();
+        let (visible, _) = flash_state(&mut app);
+        assert!(!visible, "a miss must retract the flash");
+
+        // A hit keeps it up.
+        *app.world_mut().resource_mut::<ShotFeedback>() = ShotFeedback {
+            cue: Some(ShotCue::Resolved {
+                target: THEM,
+                result: ShotResult::Hit,
+            }),
+            ticks_left: SHOT_CUE_TICKS,
+        };
+        app.update();
+        let (visible, _) = flash_state(&mut app);
+        assert!(visible);
     }
 
     #[test]

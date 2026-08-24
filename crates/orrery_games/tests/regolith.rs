@@ -7,7 +7,7 @@ use orrery_games::game::Game;
 use orrery_games::regolith::{
     archetype::Archetype,
     invariants::INVARIANTS,
-    order::{ChildSpec, LockBreakReason, Order, Outcome},
+    order::{ChildSpec, LockBreakReason, Order, Outcome, ShotResult},
     pilot::{scenario_at, PilotScenario, PILOT_SCENARIOS, SCENARIO_TICKS},
     state::{BloomDirector, BloomMembership, Craft, Pickup, RegolithState, Rock, RockTier},
     weapon::WeaponKind,
@@ -36,8 +36,8 @@ fn sample<'a>(
 }
 
 #[test]
-fn v7_weapon_table_ruleset_identity_and_island_budget_are_pinned() {
-    assert_eq!(REGOLITH_RULESET.version, 7);
+fn v8_weapon_table_ruleset_identity_and_island_budget_are_pinned() {
+    assert_eq!(REGOLITH_RULESET.version, 8);
     assert_eq!(WeaponKind::Stock.weapon().damage_base, 10);
     assert_eq!(WeaponKind::Volley.weapon().rolls, 3);
     assert_eq!(WeaponKind::Stock.weapon().optimal_mm, 300_000);
@@ -382,6 +382,7 @@ fn rock_credit_is_log_delivered_with_resolver_owned_points() {
     let credit = destroyed
         .events
         .iter()
+        .filter(|event| matches!(event, Outcome::RockDestroyed { .. }))
         .find_map(|event| game.deliver(event))
         .expect("RockDestroyed is delivered");
     assert_eq!(credit, (killer, Order::RockCredit { points: 1 }));
@@ -576,7 +577,11 @@ fn large_split_is_slot_ordered_materialized_and_traced() {
         parent: emitted_parent,
         generation,
         children,
-    } = &output.events[0]
+    } = output
+        .events
+        .iter()
+        .find(|event| matches!(event, Outcome::Split { .. }))
+        .expect("lethal large rock damage emits a split")
     else {
         panic!("lethal large rock damage must split")
     };
@@ -792,7 +797,7 @@ fn signature_radius_and_accuracy_falloff_are_live_inputs() {
     assert!(edge_of_falloff < optimal && edge_of_falloff > 4_500);
 }
 
-fn fly_one_stock_shot(seed_byte: u8, evade: bool) -> (u64, bool) {
+fn fly_one_stock_shot(seed_byte: u8, evade: bool) -> (u64, bool, Outcome) {
     let target = PersistId::new(2);
     let game = Regolith::honest();
     let mut craft = craft_at(300_000);
@@ -831,7 +836,13 @@ fn fly_one_stock_shot(seed_byte: u8, evade: bool) -> (u64, bool) {
                 executor.state(target),
                 Some(RegolithState::Craft(Craft { shield, .. })) if *shield < full_shield
             );
-            return (tick, hit);
+            let resolution = output
+                .events
+                .iter()
+                .find(|event| matches!(event, Outcome::ShotResolved { .. }))
+                .cloned()
+                .expect("resolved shot emits its authoritative result");
+            return (tick, hit, resolution);
         }
     }
     panic!("projectile did not resolve within its bounded flight time")
@@ -842,8 +853,38 @@ fn course_change_after_fire_avoids_a_fixed_seed_projectile() {
     let stationary = fly_one_stock_shot(0x6A, false);
     let evasive = fly_one_stock_shot(0x6A, true);
     println!("fixed seed 0x6a time-of-flight: stationary={stationary:?}, evasive={evasive:?}");
-    assert_eq!(stationary, (60, true));
-    assert_eq!(evasive, (60, false));
+    assert_eq!((stationary.0, stationary.1), (60, true));
+    assert_eq!((evasive.0, evasive.1), (60, false));
+}
+
+#[test]
+fn shot_resolution_is_emitted_for_hit_and_miss_and_delivered_to_attacker() {
+    let game = Regolith::honest();
+    let attacker = PersistId::new(1);
+    let target = PersistId::new(2);
+    for (evade, expected) in [(false, ShotResult::Hit), (true, ShotResult::Miss)] {
+        let (_, hit, resolution) = fly_one_stock_shot(0x6A, evade);
+        assert_eq!(hit, expected == ShotResult::Hit);
+        assert_eq!(
+            resolution,
+            Outcome::ShotResolved {
+                attacker,
+                target,
+                result: expected,
+            }
+        );
+        assert_eq!(
+            game.deliver(&resolution),
+            Some((
+                attacker,
+                Order::ShotResolved {
+                    target,
+                    result: expected,
+                },
+            )),
+            "the target's result must be routed back to the attacker"
+        );
+    }
 }
 
 #[test]
@@ -1261,14 +1302,18 @@ fn small_drop_is_derived_materialized_and_traced() {
         pos,
         kind,
         expires_at,
-    } = outcome.events[0]
+    } = outcome
+        .events
+        .iter()
+        .find(|event| matches!(event, Outcome::SpawnPickup { .. }))
+        .expect("Small death emits its materialized drop")
     else {
         panic!("Small death must fully describe its drop")
     };
-    assert_eq!(pos, QPos::default());
+    assert_eq!(*pos, QPos::default());
     assert!(matches!(kind, WeaponKind::Volley | WeaponKind::Heavy));
-    assert_eq!(expires_at, PICKUP_TTL_TICKS);
-    assert_eq!(outcome.materialized, vec![id]);
+    assert_eq!(*expires_at, PICKUP_TTL_TICKS);
+    assert_eq!(outcome.materialized, vec![*id]);
     assert!(matches!(
         executor.state(rock_id),
         Some(RegolithState::Rock(Rock {
@@ -1278,7 +1323,7 @@ fn small_drop_is_derived_materialized_and_traced() {
         }))
     ));
     assert!(matches!(
-        executor.state(id),
+        executor.state(*id),
         Some(RegolithState::Pickup(Pickup {
             ttl_remaining: PICKUP_TTL_TICKS,
             ..
@@ -1332,6 +1377,10 @@ fn pickup_state_and_grammar_are_canonical() {
             target: pickup,
             reason: LockBreakReason::RangeExceeded,
         },
+        Order::ShotResolved {
+            target: pickup,
+            result: ShotResult::Miss,
+        },
     ];
     for order in orders {
         assert_eq!(Order::decode(&order.to_canonical()).unwrap(), order);
@@ -1376,6 +1425,11 @@ fn pickup_state_and_grammar_are_canonical() {
             locker: ship,
             target: pickup,
             reason: LockBreakReason::TargetDestroyed,
+        },
+        Outcome::ShotResolved {
+            attacker: ship,
+            target: pickup,
+            result: ShotResult::Hit,
         },
     ];
     for outcome in outcomes {
