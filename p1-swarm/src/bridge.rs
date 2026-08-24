@@ -55,7 +55,7 @@ use crate::exterior::{
 
 /// The connection's application protocol. A grammar change bumps this as well
 /// as `JoinRequest::VERSION`; both sides must refuse what they do not speak.
-pub const EXTERIOR_ALPN: &[u8] = b"orrery/exterior/1";
+pub const EXTERIOR_ALPN: &[u8] = b"orrery/exterior/2";
 
 /// How long any single handshake read may take before the attempt is refused.
 const HANDSHAKE_READ_TIMEOUT: Duration = Duration::from_secs(10);
@@ -433,8 +433,9 @@ pub async fn remote_join(
     let (outbound_tx, outbound_rx) = tokio::sync::mpsc::channel(LINK_QUEUE_DEPTH);
     let (inbound_tx, inbound_rx) = tokio::sync::mpsc::channel(LINK_QUEUE_DEPTH);
 
-    // Everything arriving is this peer's inbound traffic; nothing arrives on
-    // the meta lane because the host never sends it.
+    // Host traffic and application-level uplink ACKs share this inbound
+    // queue. ACKs stay Meta frames so the remote can settle router outcomes
+    // without confusing them with replicated state.
     let goodbye = Arc::new(AtomicBool::new(false));
     pump_ordered_reader_to(
         "remote",

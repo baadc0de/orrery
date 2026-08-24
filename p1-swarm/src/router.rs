@@ -263,10 +263,19 @@ impl Router {
     }
 
     /// Accept a datagram from `from` addressed to peer index `to`.
-    pub fn accept(&mut self, tick: u64, from: NodeId, to: usize, payload: Bytes) {
+    pub fn accept(
+        &mut self,
+        tick: u64,
+        from: NodeId,
+        to: usize,
+        payload: Bytes,
+    ) -> DatagramDisposition {
         self.counters.bytes += payload.len() as u64 + DATAGRAM_OVERHEAD;
         match self.schedule(tick) {
-            Fate::Dropped => self.counters.dropped += 1,
+            Fate::Dropped => {
+                self.counters.dropped += 1;
+                DatagramDisposition::Dropped
+            }
             Fate::Delayed(due) => {
                 self.counters.delayed += 1;
                 self.in_flight.push_back(InFlight {
@@ -276,14 +285,18 @@ impl Router {
                     due,
                     stream: None,
                 });
+                DatagramDisposition::Delivered
             }
-            Fate::Now(due) => self.in_flight.push_back(InFlight {
-                to,
-                from,
-                payload,
-                due,
-                stream: None,
-            }),
+            Fate::Now(due) => {
+                self.in_flight.push_back(InFlight {
+                    to,
+                    from,
+                    payload,
+                    due,
+                    stream: None,
+                });
+                DatagramDisposition::Delivered
+            }
         }
     }
 
@@ -355,6 +368,15 @@ enum Fate {
     Dropped,
     Delayed(u64),
     Now(u64),
+}
+
+/// The application-visible result of the datagram impairment decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DatagramDisposition {
+    /// The datagram was retained for immediate or delayed delivery.
+    Delivered,
+    /// The datagram was discarded by the configured loss model.
+    Dropped,
 }
 
 #[cfg(test)]

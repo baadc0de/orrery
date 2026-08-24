@@ -15,7 +15,7 @@ use orrery_protocol::{CellId, NodeId, PersistId, UniverseSeed, MAX_ADJUDICATION_
 
 use crate::adjudicate::{Adjudicator, Docket};
 use crate::bot::{Bot, BotSpec, TICK_HZ};
-use crate::exterior::{Frame, Lane};
+use crate::exterior::{Frame, Lane, UplinkAck, UplinkDatagram, UplinkOutcome};
 
 use crate::router::{Impairment, Router, RouterCounters};
 
@@ -550,6 +550,35 @@ pub struct ExteriorSlot {
 }
 
 impl ExteriorSlot {
+    /// Queues one frame on the established synchronous side of the bridge.
+    /// `try_send` performs the send immediately; unlike `Sender::send`, it
+    /// creates no future that could be dropped without being polled.
+    fn queue_downlink(&mut self, frame: Frame) {
+        match self.link.downlink.try_send(frame) {
+            Ok(()) => self.downlink_frames += 1,
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                self.downlink_dropped += 1;
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                self.link
+                    .connected
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// Queues one settled router decision on the existing host→remote Meta
+    /// lane. A full queue is visible as the same backpressure failure as any
+    /// other downlink frame; at criterion rates this must remain zero.
+    fn acknowledge_uplink(&mut self, ack: UplinkAck) {
+        let frame = Frame {
+            peer: u32::MAX,
+            lane: Lane::Meta,
+            payload: ack.encode(),
+        };
+        self.queue_downlink(frame);
+    }
+
     /// Queues one router delivery for the remote, naming its sender's slot.
     fn deliver_from(&mut self, from: usize, stream: Option<StreamMode>, payload: Bytes) {
         let lane = match stream {
@@ -564,17 +593,7 @@ impl ExteriorSlot {
             lane,
             payload,
         };
-        match self.link.downlink.try_send(frame) {
-            Ok(()) => self.downlink_frames += 1,
-            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                self.downlink_dropped += 1;
-            }
-            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                self.link
-                    .connected
-                    .store(false, std::sync::atomic::Ordering::Relaxed);
-            }
-        }
+        self.queue_downlink(frame);
     }
 
     /// Forwards every queued uplink frame into the router, and meta frames
@@ -613,12 +632,30 @@ impl ExteriorSlot {
                     }
                     continue;
                 }
-                Lane::Datagram => router.accept(
-                    tick,
-                    self.node,
-                    usize::try_from(frame.peer).unwrap_or(usize::MAX),
-                    frame.payload,
-                ),
+                Lane::Datagram => {
+                    let Some(datagram) = UplinkDatagram::decode(frame.payload) else {
+                        continue;
+                    };
+                    // This call is the load-bearing ordering boundary: only
+                    // the router can say whether impairment retained or
+                    // discarded the logical packet. The Meta ACK is queued
+                    // strictly after that decision has been returned.
+                    let disposition = router.accept(
+                        tick,
+                        self.node,
+                        usize::try_from(frame.peer).unwrap_or(usize::MAX),
+                        datagram.payload,
+                    );
+                    self.acknowledge_uplink(UplinkAck {
+                        sequence: datagram.sequence,
+                        outcome: match disposition {
+                            crate::router::DatagramDisposition::Delivered => {
+                                UplinkOutcome::Delivered
+                            }
+                            crate::router::DatagramDisposition::Dropped => UplinkOutcome::Dropped,
+                        },
+                    });
+                }
                 Lane::StreamShared => router.accept_stream(
                     tick,
                     self.node,
@@ -908,7 +945,9 @@ impl Swarm {
                 };
                 match stream {
                     Some(mode) => self.router.accept_stream(tick, node, target, mode, payload),
-                    None => self.router.accept(tick, node, target, payload),
+                    None => {
+                        self.router.accept(tick, node, target, payload);
+                    }
                 }
             }
         }
@@ -2260,6 +2299,122 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_dropped_uplink_is_acknowledged_only_after_the_router_decides() {
+        use crate::bot::bot_key;
+        use crate::exterior::{link_pair, UplinkAck};
+
+        let mut swarm = Swarm::new(SwarmConfig {
+            peers: 1,
+            impairment: Impairment {
+                loss: 1.0,
+                ..Impairment::default()
+            },
+            ..SwarmConfig::default()
+        });
+        let (host_link, remote_link) = link_pair();
+        swarm = swarm.with_external(bot_key(1).public(), None, host_link);
+        remote_link
+            .uplink
+            .try_send(Frame {
+                peer: 0,
+                lane: Lane::Datagram,
+                payload: UplinkDatagram {
+                    sequence: 41,
+                    payload: Bytes::from_static(b"must be dropped"),
+                }
+                .encode(),
+            })
+            .expect("uplink queue accepts the datagram");
+
+        swarm
+            .exterior
+            .as_mut()
+            .expect("external slot")
+            .pump_uplink(7, &mut swarm.router);
+
+        assert_eq!(swarm.router.counters.dropped, 1, "the router dropped it");
+        let frame = remote_link
+            .downlink
+            .lock()
+            .expect("downlink lock")
+            .try_recv()
+            .expect("one settled ACK");
+        assert_eq!(frame.lane, Lane::Meta);
+        assert_eq!(
+            UplinkAck::decode(&frame.payload),
+            Some(UplinkAck {
+                sequence: 41,
+                outcome: UplinkOutcome::Dropped,
+            }),
+            "a pre-decision success ACK would lie about the discarded frame"
+        );
+    }
+
+    #[test]
+    fn client_side_ack_loss_tracks_the_router_actual_drops() {
+        use crate::bot::bot_key;
+        use crate::exterior::{link_pair, UplinkAck};
+
+        const SENT: usize = 1_000;
+        let mut swarm = Swarm::new(SwarmConfig {
+            peers: 1,
+            impairment: Impairment {
+                loss: 0.30,
+                ..Impairment::default()
+            },
+            seed: 7,
+            ..SwarmConfig::default()
+        });
+        let (host_link, remote_link) = link_pair();
+        swarm = swarm.with_external(bot_key(1).public(), None, host_link);
+        for sequence in 0..SENT as u64 {
+            remote_link
+                .uplink
+                .try_send(Frame {
+                    peer: 0,
+                    lane: Lane::Datagram,
+                    payload: UplinkDatagram {
+                        sequence,
+                        payload: Bytes::from_static(b"measured datagram"),
+                    }
+                    .encode(),
+                })
+                .expect("criterion-rate uplink fits the queue");
+        }
+
+        swarm
+            .exterior
+            .as_mut()
+            .expect("external slot")
+            .pump_uplink(11, &mut swarm.router);
+
+        let mut acknowledged = 0usize;
+        let mut client_dropped = 0u64;
+        let mut seen = vec![false; SENT];
+        while let Ok(frame) = remote_link
+            .downlink
+            .lock()
+            .expect("downlink lock")
+            .try_recv()
+        {
+            let ack = UplinkAck::decode(&frame.payload).expect("Meta frame is an uplink ACK");
+            let index = usize::try_from(ack.sequence).expect("test sequence fits");
+            assert!(index < SENT, "ACK identifies a sent datagram");
+            assert!(!seen[index], "each datagram is acknowledged once");
+            seen[index] = true;
+            acknowledged += 1;
+            client_dropped += u64::from(ack.outcome == UplinkOutcome::Dropped);
+        }
+
+        assert_eq!(acknowledged, SENT, "every decision produced one ACK");
+        assert!(seen.into_iter().all(|settled| settled));
+        assert_eq!(
+            client_dropped, swarm.router.counters.dropped,
+            "the remote's ACK-derived loss figure must equal actual router drops"
+        );
+    }
+
     /// The bridge is only worth its name if an exterior slot behaves like a
     /// bot slot: uplink frames enter the impaired router attributed to the
     /// external node, downlink frames carry the sender's index, and meta
@@ -2298,7 +2453,11 @@ mod tests {
             .try_send(Frame {
                 peer: 0,
                 lane: Lane::Datagram,
-                payload: bytes::Bytes::from_static(b"not a canonical craft"),
+                payload: UplinkDatagram {
+                    sequence: 0,
+                    payload: bytes::Bytes::from_static(b"not a canonical craft"),
+                }
+                .encode(),
             })
             .expect("the host queue accepts");
         let mut phase = [0u128; 6];
@@ -2312,6 +2471,19 @@ mod tests {
         assert!(
             untagged >= 1,
             "the uplink frame never reached its addressed bot"
+        );
+        let ack_frame = remote_link
+            .downlink
+            .lock()
+            .expect("downlink lock")
+            .try_recv()
+            .expect("the clean router decision was acknowledged");
+        assert_eq!(
+            UplinkAck::decode(&ack_frame.payload),
+            Some(UplinkAck {
+                sequence: 0,
+                outcome: UplinkOutcome::Delivered,
+            })
         );
 
         // Down: a bot's packet routed to the exterior slot lands on the

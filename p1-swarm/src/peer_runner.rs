@@ -137,6 +137,7 @@ pub fn run(run: &ExternalRun) -> Result<()> {
     let tick_duration = Duration::from_nanos(1_000_000_000 / TICK_HZ);
 
     let mut inbound_total = 0usize;
+    let mut uplink_sequence = 0u64;
     rt.block_on(async move {
         for tick in 0..ticks {
             let tick_start = Instant::now();
@@ -167,6 +168,16 @@ pub fn run(run: &ExternalRun) -> Result<()> {
                     Some(aeronet_iroh::stream::StreamMode::Bulk) => {
                         crate::exterior::Lane::StreamBulk
                     }
+                };
+                let payload = if lane == crate::exterior::Lane::Datagram {
+                    let sequenced = crate::exterior::UplinkDatagram {
+                        sequence: uplink_sequence,
+                        payload,
+                    };
+                    uplink_sequence = uplink_sequence.wrapping_add(1);
+                    sequenced.encode()
+                } else {
+                    payload
                 };
                 let frame = crate::exterior::Frame {
                     peer: slot_of(&index_of, to),
