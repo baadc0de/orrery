@@ -64,7 +64,20 @@ use orrery_protocol::{
 /// so the test does not sleep through it, and the assertion below is about
 /// *which side of the budget the audit runs on*, not about how long either
 /// number is.
-const ROUTE_BUDGET_US: u64 = 10_000;
+/// The downstream route-admission budget this test runs the gateway under.
+///
+/// Deliberately generous — 200 ms, not the 10 ms it used to be. The value is
+/// not a fidelity claim about production; it is headroom. Claim 1 below
+/// asserts that a *healthy* router sheds nothing, which is only true while the
+/// router actually beats this budget. At 10 ms a contended CI runner made a
+/// healthy gateway shed for real, and the assertion then fired with
+/// `shed_slow_route: 6` and a message accusing the code of a correctness bug —
+/// the #370 species again, one line further down than where #368 found it.
+///
+/// Raising it costs wall clock (the two observation sleeps below are four
+/// budgets each) and buys an assertion that means what it says. `SLOW_LOCATE`
+/// is derived from it, so the audit stays six budgets slow at any value.
+const ROUTE_BUDGET_US: u64 = 200_000;
 
 /// A liveness ceiling expressed in the route budget under test. The served
 /// versus shed assertion is the reply ordering below; this merely prevents a
@@ -79,7 +92,25 @@ const ACK_LIVENESS_TIMEOUT: Duration =
 /// How long the audit's `LeaseStore::locate` takes once armed: six budgets.
 /// Any single sampled audit on the request path therefore overruns, with no
 /// dependence on scheduling luck.
-const SLOW_LOCATE: Duration = Duration::from_millis(60);
+///
+/// Derived from the budget rather than written as a literal. It was
+/// `from_millis(60)` — six times the then-10 ms budget by arithmetic the
+/// compiler could not see, so raising the budget would have silently made the
+/// "slow" audit fast and the test would have proven nothing while staying
+/// green.
+const SLOW_LOCATE_US: u64 = ROUTE_BUDGET_US * 6;
+const SLOW_LOCATE: Duration = Duration::from_micros(SLOW_LOCATE_US);
+
+// The test's whole premise is that this audit *overruns* the route budget. If
+// it ever stopped doing so the test would keep passing and prove nothing: a
+// fast audit sheds nothing, which is exactly the outcome claim 1 asserts. That
+// is not hypothetical — pinning SLOW_LOCATE back to its old `from_millis(60)`
+// literal while the budget is 200 ms leaves the suite green. Make the premise
+// a compile error instead of a comment.
+const _: () = assert!(
+    SLOW_LOCATE_US > ROUTE_BUDGET_US,
+    "the armed audit must outlast the route budget or this test asserts nothing"
+);
 
 /// Diffs written under the fence. At one-in-one sampling every one of them is
 /// audited, so with the audit on the request path every one of them is shed.
