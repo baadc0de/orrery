@@ -777,7 +777,10 @@ fn main() -> Result<()> {
     }
 
     for failure in &failures {
-        eprintln!("gates/p1-swarm: FAILED [{}] — {}", failure.clause, failure.detail);
+        eprintln!(
+            "gates/p1-swarm: FAILED [{}] — {}",
+            failure.clause, failure.detail
+        );
     }
     if args.report_only {
         eprintln!("gates/p1-swarm: --report-only, exiting zero anyway");
@@ -881,6 +884,8 @@ fn self_test() -> Result<()> {
                speed cheat is inert on the other one"
         );
     }
-    eprintln!("gates/p1-swarm: self-test passed — every criterion clause present, real stack wired");
+    eprintln!(
+        "gates/p1-swarm: self-test passed — every criterion clause present, real stack wired"
+    );
     Ok(())
 }

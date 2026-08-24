@@ -1048,7 +1048,10 @@ impl Swarm {
                 "deliver",
             ];
             for (name, nanos) in names.iter().zip(phase) {
-                eprintln!("gates/p1-swarm: phase {name:>11}: {:>8.2}s", nanos as f64 / 1e9);
+                eprintln!(
+                    "gates/p1-swarm: phase {name:>11}: {:>8.2}s",
+                    nanos as f64 / 1e9
+                );
             }
         }
         let _ = self.deliver_due_all(ticks + u64::from(self.config.impairment.jitter_ticks) + 1);

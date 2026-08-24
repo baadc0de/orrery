@@ -152,9 +152,9 @@ self_test() {
     || die 'self-test: the shed allowance is gone; the budget backstop would go unjudged'
   has 'BAND=' \
     || die 'self-test: the loss band is gone'
-  # Off-Linux, both of these: cargo emits `gates/p1-swarm.exe` on a Windows runner,
+  # Off-Linux, both of these: cargo emits `p1-swarm.exe` on a Windows runner,
   # and a leg that only knows the unsuffixed name dies before it runs a tick.
-  has 'gates/p1-swarm.exe' \
+  has 'p1-swarm.exe' \
     || die 'self-test: the Windows binary name is gone; the leg cannot find its harness on a Windows runner'
   has 'PROBE_SEED' \
     || die 'self-test: the comparability probe is gone; hours would be banked per platform with nothing saying the platforms agree'
@@ -236,7 +236,7 @@ sweep_point() {
 # Where the release harness lands, built if it is not already there.
 #
 # `.exe` is not a detail: on a `windows-latest` runner these scripts run under
-# Git Bash and cargo emits `gates/p1-swarm.exe`, so the unsuffixed path this used to
+# Git Bash and cargo emits `p1-swarm.exe`, so the unsuffixed path this used to
 # hard-code does not exist and the leg would die at "harness binary missing"
 # before it ran a tick. Both spellings are tried rather than switching on
 # `$OSTYPE` — the question is which file cargo produced, and the filesystem
