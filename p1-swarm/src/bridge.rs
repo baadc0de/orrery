@@ -44,7 +44,7 @@ use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use bytes::Bytes;
-use iroh::endpoint::{RecvStream, SendStream};
+use iroh::endpoint::{Connection, RecvStream, SendStream};
 use iroh::{Endpoint, EndpointAddr, RelayMode};
 use orrery_protocol::NodeId;
 
@@ -211,6 +211,10 @@ async fn write_stream_frame(send: &mut SendStream, frame: &Frame) -> Result<()> 
         bail!("frame exceeds the wire bound");
     }
     send.write_all(&wire).await?;
+    // noq buffers written bytes per-stream; without an explicit flush the
+    // first small frame sat unsent while every later one did too (#385).
+    use tokio::io::AsyncWriteExt as _;
+    send.flush().await?;
     Ok(())
 }
 
@@ -222,6 +226,15 @@ fn route_inbound(
     uplink_tx: &std_mpsc::SyncSender<Frame>,
     meta_tx: Option<&std_mpsc::SyncSender<u64>>,
 ) {
+    if std::env::var_os("P1_SWARM_BRIDGE_DEBUG").is_some() {
+        eprintln!(
+            "bridge[{}]: routed lane {:?} peer {} payload {}",
+            std::process::id(),
+            frame.lane,
+            frame.peer,
+            frame.payload.len()
+        );
+    }
     match frame.lane {
         Lane::Meta => {
             if let (Some(meta_tx), Ok(raw)) = (meta_tx, <[u8; 8]>::try_from(frame.payload.as_ref()))
@@ -280,6 +293,11 @@ pub async fn host_accept(
         // orphan state bytes starved every reader for an afternoon).
         let claim = read_message(&mut recv).await?;
         let state = read_message(&mut recv).await?;
+        let extra = read_message(&mut recv).await;
+        if std::env::var_os("P1_SWARM_BRIDGE_DEBUG").is_some() {
+            eprintln!("bridge[{}]: extra msg {:?}", std::process::id(), extra.as_deref().map(|b| String::from_utf8_lossy(b)));
+        }
+        let _ = extra;
         Some(AnchorFrame {
             claim_json: claim,
             state,
@@ -316,11 +334,12 @@ pub async fn host_accept(
 
     pump_ordered_reader_to(
         Arc::clone(&connected),
+        connection.clone(),
         uplink_recv,
         uplink_tx,
         Some(meta_tx),
     );
-    pump_writer(Arc::clone(&connected), downlink_send, downlink_rx);
+    pump_writer(Arc::clone(&connected), connection, downlink_send, downlink_rx);
 
     // A freshly spawned task has not necessarily reached its first await, and
     // an unpolled datagram reader drops what arrives in that window. Yielding
@@ -377,19 +396,27 @@ pub async fn remote_join(
         write_message(&mut send, &anchor.claim_json).await?;
         write_message(&mut send, &anchor.state).await?;
     }
+    // TEMP probe (#385): does a SECOND write on this half cross where the
+    // first did?
+    write_message(&mut send, b"second").await?;
 
-    // Data path mirrors the host's: uplink on a uni stream this side opens,
-    // downlink on the uni stream the host opened. See host_accept's note.
+    // Data path mirrors the host's: uplink on a uni stream this side opens
+    // and announces, downlink on the uni stream the host opened and
+    // announced. Both sides open before they accept, so neither accept can
+    // wait on an open the other side has not made yet (#385).
     drop(send);
     drop(recv);
-    let downlink_recv = connection
-        .accept_uni()
-        .await
-        .context("downlink stream never arrived")?;
-    let uplink_send = connection
+    let mut uplink_send = connection
         .open_uni()
         .await
         .context("could not open uplink stream")?;
+    announce(&mut uplink_send)
+        .await
+        .context("uplink announce failed")?;
+    let mut downlink_recv = connection
+        .accept_uni()
+        .await
+        .context("downlink stream never arrived")?;
 
     let connected = Arc::new(AtomicBool::new(true));
     let (outbound_tx, outbound_rx) = std_mpsc::sync_channel::<Frame>(LINK_QUEUE_DEPTH);
@@ -397,8 +424,14 @@ pub async fn remote_join(
 
     // Everything arriving is this peer's inbound traffic; nothing arrives on
     // the meta lane because the host never sends it.
-    pump_ordered_reader_to(Arc::clone(&connected), downlink_recv, inbound_tx, None);
-    pump_writer(Arc::clone(&connected), uplink_send, outbound_rx);
+    pump_ordered_reader_to(
+        Arc::clone(&connected),
+        connection.clone(),
+        downlink_recv,
+        inbound_tx,
+        None,
+    );
+    pump_writer(Arc::clone(&connected), connection, uplink_send, outbound_rx);
 
     Ok(RemoteLink {
         downlink: inbound_rx,
@@ -412,6 +445,7 @@ pub async fn remote_join(
 /// there are no frame boundaries left to find.
 fn pump_ordered_reader_to(
     connected: Arc<AtomicBool>,
+    connection: Connection,
     mut recv: RecvStream,
     uplink_tx: std_mpsc::SyncSender<Frame>,
     meta_tx: Option<std_mpsc::SyncSender<u64>>,
@@ -419,8 +453,17 @@ fn pump_ordered_reader_to(
     let debug = std::env::var_os("P1_SWARM_BRIDGE_DEBUG").is_some();
     let pid = std::process::id();
     tokio::spawn(async move {
+        // The stream halves do NOT keep the connection alive: once the last
+        // `Connection` handle drops, the transport closes and every later
+        // write succeeds into the void while reads starve (#385's
+        // joined-but-deaf slot). The pumps hold one for their whole life.
+        let _keep_alive = connection;
         if debug {
-            eprintln!("bridge[{}]: ordered reader armed", pid);
+            eprintln!(
+                "bridge[{}]: ordered reader armed on stream {:?}",
+                pid,
+                recv.id()
+            );
         }
         while let Ok(Some(frame)) = read_stream_frame(&mut recv).await {
             if debug {
@@ -439,12 +482,14 @@ fn pump_ordered_reader_to(
 /// onto the stream in whatever order the queue holds.
 fn pump_writer(
     connected: Arc<AtomicBool>,
+    connection: Connection,
     mut shared_send: SendStream,
     outbound_rx: std::sync::mpsc::Receiver<Frame>,
 ) {
     let debug = std::env::var_os("P1_SWARM_BRIDGE_DEBUG").is_some();
     let pid = std::process::id();
     tokio::spawn(async move {
+        let _keep_alive = connection;
         if debug {
             eprintln!("bridge[{}]: writer armed", pid);
         }
