@@ -48,7 +48,7 @@ use orrery_core::{CoreCodec, Executor};
 use orrery_games::regolith::order::Outcome;
 use orrery_games::regolith::state::RegolithState;
 use orrery_games::{Game, Regolith};
-use orrery_protocol::channels::decode_replication;
+use orrery_protocol::channels::{decode_replication, untag};
 use orrery_protocol::UniverseSeed;
 use orrery_protocol::{cell_id_from_metres, CellId, PersistId, Tick, DEFAULT_CELL_EDGE_M};
 
@@ -627,10 +627,20 @@ impl CampaignRuntime {
             let cell = self.committed_cell();
             self.latest_cell = Some(cell);
             let payload = encode_state_broadcast(&self.executor, self.entity, cell, tick.0 + 1);
+            // The router carries *channel-tagged* packets: in-process, a bot's
+            // send path frames the payload once more after the game layer's
+            // own sub-tag (`send_peer_packets`), and the receiving side strips
+            // exactly that one tag. The exterior leg bypasses aeronet, so the
+            // client frames here — mirroring what a bot's session.send holds,
+            // which is what the runner drains and the host expects.
+            let framed = orrery_protocol::channels::tag(
+                orrery_protocol::channels::Channel::State,
+                &payload,
+            );
             for recipient in 0..self.config.slot {
                 let datagram = UplinkDatagram {
                     sequence: self.uplink_sequence,
-                    payload: Bytes::clone(&payload),
+                    payload: Bytes::copy_from_slice(&framed),
                 };
                 self.uplink_sequence = self.uplink_sequence.wrapping_add(1);
                 self.uplink_sent += 1;
@@ -676,7 +686,15 @@ impl CampaignRuntime {
                 }
                 Lane::Datagram => {
                     let now_ms = self.started_at.elapsed().as_secs_f64() * 1_000.0;
-                    match decode_replication::<(Vec<u8>, CellId, PersistId, u64)>(&frame.payload) {
+                    // Downlink frames are router-level packets: channel-tagged,
+                    // exactly as a bot's traffic arrives at its own session.
+                    // Strip the one tag the in-process receive path strips
+                    // before reading the sub-tagged body.
+                    let Some((_channel, payload)) = untag(&frame.payload) else {
+                        self.undecodable += 1;
+                        continue;
+                    };
+                    match decode_replication::<(Vec<u8>, CellId, PersistId, u64)>(payload) {
                         Some((encoded, _cell, entity, at)) => {
                             match <RegolithState as CoreCodec>::decode(&encoded) {
                                 Ok(state) => {

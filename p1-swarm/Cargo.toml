@@ -66,3 +66,6 @@ serde_json = "1"
 # The pipeline digest for report assembly (#387): sha256 over the four hashed
 # trees' git ids, the exact recipe scripts/p4-ledger.sh runs.
 sha2 = "0.10"
+
+[dev-dependencies]
+postcard = "1.1.3"

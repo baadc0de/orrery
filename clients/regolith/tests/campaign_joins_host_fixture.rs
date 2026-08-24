@@ -260,12 +260,15 @@ async fn pump(
                     continue;
                 }
                 let encoded = state.to_canonical();
-                let payload = encode_replication(&(
-                    encoded,
-                    cell,
-                    bot_entity,
-                    broadcast_index * STRIDE, // the sender's absolute tick
-                ));
+                // Router-level form: the same channel tag an in-process peer's
+                // send path adds (`send_peer_packets`), which is what arrives
+                // on the exterior wire.
+                let replication =
+                    encode_replication(&(encoded, cell, bot_entity, broadcast_index * STRIDE));
+                let payload = orrery_protocol::channels::tag(
+                    orrery_protocol::channels::Channel::State,
+                    &replication,
+                );
                 let frame = net::Frame {
                     peer: 0, // the sender's slot, per the downlink rule
                     lane: net::Lane::Datagram,
