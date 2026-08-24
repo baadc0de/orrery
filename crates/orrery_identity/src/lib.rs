@@ -71,6 +71,7 @@
 #![warn(missing_docs)]
 
 pub mod invite;
+pub mod session_id;
 pub mod issuer;
 pub mod issuer_key_lifecycle;
 pub mod mem;
@@ -96,6 +97,7 @@ pub use service::{
     IdentityService, IssuedSession, StandingSource, StaticStanding, SystemClock,
     UnavailableStanding, DEFAULT_SESSION_TOKEN_TTL_MS,
 };
+pub use session_id::{is_uuid_v7, session_uuid_v7};
 pub use standing::{
     score_rows, ComputedStanding, StandingLevel, StandingScores, StandingThresholdError,
     StandingThresholds, StaticStrikeRows, DEFAULT_STANDING_THRESHOLDS,

@@ -56,3 +56,7 @@ foundationdb = { version = "0.11", default-features = false, features = [
 
 [dev-dependencies]
 tokio = { workspace = true }
+# The session-id tests cross-check `is_uuid_v7` against the ledger's own
+# acceptance pattern, restated literally; a regex keeps that copy independent.
+regex = "1"
+rand_chacha = "0.9"

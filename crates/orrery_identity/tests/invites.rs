@@ -6,6 +6,7 @@ use orrery_identity::{
     InviteRedemptionError, IssuerKeyring, IssuerSigningKey, MemAccountStore, StaticStanding,
 };
 use orrery_protocol::{FixedTokenClock, IssuerKeyId, NodeId, SessionTokenVerifier, UnixMillis};
+use rand::SeedableRng as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -69,7 +70,16 @@ fn ledger_path() -> TemporaryLedger {
 
 fn mint(path: &Path, byte: u8) -> orrery_identity::MintedInvite {
     InviteLedger::update_locked(path, |ledger| {
-        mint_invite(ledger, "Ada".to_owned(), &mut FixedCode([byte; 32]))
+        // A fixed session seed keeps the test deterministic; the assertion
+        // under test is allocation bookkeeping, not randomness.
+        let mut sessions = rand_chacha::ChaCha8Rng::seed_from_u64(u64::from(byte));
+        mint_invite(
+            ledger,
+            "Ada".to_owned(),
+            &mut FixedCode([byte; 32]),
+            UnixMillis(1_756_000_000_000),
+            &mut sessions,
+        )
     })
     .expect("mint an offline invite")
 }
