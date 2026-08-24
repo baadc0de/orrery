@@ -35,9 +35,7 @@ pub fn session_uuid_v7(now_ms: UnixMillis, rng: &mut impl Rng) -> String {
 
 /// Render the canonical hyphenated lowercase form.
 fn format_uuid(bytes: &[u8; 16]) -> String {
-    let hex = |slice: &[u8]| -> String {
-        slice.iter().map(|byte| format!("{byte:02x}")).collect()
-    };
+    let hex = |slice: &[u8]| -> String { slice.iter().map(|byte| format!("{byte:02x}")).collect() };
     format!(
         "{}-{}-{}-{}-{}",
         hex(&bytes[..4]),
@@ -56,9 +54,14 @@ fn format_uuid(bytes: &[u8; 16]) -> String {
 pub fn is_uuid_v7(text: &str) -> bool {
     let parts: Vec<&str> = text.split('-').collect();
     let lengths = [8usize, 4, 4, 4, 12];
-    if parts.len() != 5 || !parts.iter().zip(lengths).all(|(part, len)| {
-        part.len() == len && part.bytes().all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
-    }) {
+    if parts.len() != 5
+        || !parts.iter().zip(lengths).all(|(part, len)| {
+            part.len() == len
+                && part
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        })
+    {
         return false;
     }
     let version = parts[2].as_bytes()[0];

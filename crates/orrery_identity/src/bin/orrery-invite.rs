@@ -5,8 +5,8 @@
 //! harness and the client, the account id to the operator's records.
 
 use clap::Parser;
-use orrery_protocol::UnixMillis;
 use orrery_identity::{mint_invite, InviteLedger, OsInviteCodeGenerator};
+use orrery_protocol::UnixMillis;
 use std::path::PathBuf;
 
 /// Mint one operator-issued invite code into a local hash-only ledger.

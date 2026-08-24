@@ -335,6 +335,9 @@ impl CampaignRuntime {
                 .and_then(|socket| socket.parse().ok());
             let slot = config.slot;
             let client_rev = crate::BUILD_REV.to_owned();
+            // The invite-bound identity rides the join (#387): the host
+            // admits this dialler against it before any traffic moves.
+            let session_id = config.session_id.clone();
             let address = address.clone();
             let _handle = std::thread::Builder::new()
                 .name("regolith-campaign-dial".to_owned())
@@ -342,7 +345,15 @@ impl CampaignRuntime {
                     let joined = thread_runtime.block_on(async move {
                         let endpoint = net::bind(net::slot_secret(slot)).await?;
                         let addr = address.to_addr(prefer);
-                        let request = JoinRequest { client_rev };
+                        let request = JoinRequest {
+                            client_rev,
+                            session_id,
+                            // Witnessing authoring has not landed on the
+                            // client; declaring so lets a witnessing host
+                            // run its judges over the bot population and
+                            // arm nobody against this slot's absent log.
+                            ships_anchor: false,
+                        };
                         let deadline = std::time::Duration::from_secs(JOIN_DEADLINE_SECS);
                         let link = tokio::time::timeout(
                             deadline,
@@ -847,8 +858,15 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
     ((if m <= 2 { y + 1 } else { y }), m as u32, d as u32)
 }
 
-fn platform_triple() -> String {
-    format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH)
+/// The target triple this binary was built for, stamped at build time.
+///
+/// The ledger folds hours per platform by comparing the row's
+/// `platform_triple` against the *host's* build triple, so the two must be
+/// the same string: `std::env::consts` cannot produce a triple, which is why
+/// `build.rs` stamps it.
+#[must_use]
+pub fn platform_triple() -> String {
+    crate::BUILD_TARGET.to_owned()
 }
 
 #[cfg(test)]

@@ -55,7 +55,7 @@ use crate::exterior::{
 
 /// The connection's application protocol. A grammar change bumps this as well
 /// as `JoinRequest::VERSION`; both sides must refuse what they do not speak.
-pub const EXTERIOR_ALPN: &[u8] = b"orrery/exterior/2";
+pub const EXTERIOR_ALPN: &[u8] = b"orrery/exterior/3";
 
 /// How long any single handshake read may take before the attempt is refused.
 const HANDSHAKE_READ_TIMEOUT: Duration = Duration::from_secs(10);
@@ -252,15 +252,25 @@ async fn route_inbound(
 
 /// Host side: accepts the exterior peer's connection and runs the handshake.
 ///
+/// The dialler is admitted against three checks, in order: its transport
+/// identity must be the slot's (`expected`), its session identity must match
+/// `expected_session_id` when the operator set one (#387's invite convention),
+/// and its build revision must match `pinned_client_rev` when one is pinned
+/// (#345 §8). A failed application check answers with a named `Reject` before
+/// the connection dies, so the client shows why instead of timing out.
+///
 /// Returns the live host queues plus the anchor the peer shipped (`None` on
-/// runs without witnessing). Pumps are spawned here, so the caller gets a
-/// working link or an error — never a half-wired slot.
+/// runs without witnessing, or when the peer declared it ships none). Pumps
+/// are spawned here, so the caller gets a working link or an error — never a
+/// half-wired slot.
 pub async fn host_accept(
     endpoint: &Endpoint,
     expected: NodeId,
     index: usize,
     wants_anchor: bool,
-) -> Result<(HostLink, Option<AnchorFrame>)> {
+    expected_session_id: Option<&str>,
+    pinned_client_rev: Option<&str>,
+) -> Result<(HostLink, Option<AnchorFrame>, bool)> {
     let incoming = endpoint
         .accept()
         .await
@@ -281,12 +291,34 @@ pub async fn host_accept(
         .await
         .context("no handshake stream arrived")?;
     let request_bytes = read_message(&mut recv).await?;
-    let _request =
+    let request =
         JoinRequest::decode(&request_bytes).map_err(|reason| anyhow::anyhow!("{reason}"))?;
+
+    // Admission: identity and provenance, answered on the wire either way.
+    if let Err(reason) =
+        crate::exterior::validate_join(&request, expected_session_id, pinned_client_rev)
+    {
+        // Hold the connection briefly after the reply so it is delivered
+        // before the reset, as the fixture's rejection path learned.
+        let _ = write_message(
+            &mut send,
+            &JoinReply::Reject {
+                reason: reason.clone(),
+            }
+            .encode(),
+        )
+        .await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        bail!("the join was refused: {reason}");
+    }
 
     write_message(&mut send, &JoinReply::Accept { index }.encode()).await?;
 
-    let anchor = if wants_anchor {
+    // The anchor arrives only from peers that declared one. A rendered client
+    // declares none yet; witnessing then runs over the bot population and
+    // nobody arms against this slot's absent log.
+    let ships_anchor = request.ships_anchor;
+    let anchor = if wants_anchor && ships_anchor {
         // Two messages, each length-prefixed: the claim, then the canonical
         // state it commits to. Reading them separately is what keeps the
         // frame stream aligned afterwards — a combined encoding whose inner
@@ -362,6 +394,7 @@ pub async fn host_accept(
             goodbye,
         },
         anchor,
+        ships_anchor,
     ))
 }
 
@@ -587,8 +620,8 @@ mod tests {
         let host_task = {
             let host_ep = host_ep.clone();
             tokio::spawn(async move {
-                let link_and_anchor = host_accept(&host_ep, expected, slot, true).await;
-                (host_ep, link_and_anchor)
+                let joined = host_accept(&host_ep, expected, slot, true, None, None).await;
+                (host_ep, joined)
             })
         };
         let anchor_frame = AnchorFrame {
@@ -605,6 +638,8 @@ mod tests {
             .to_addr(Some(socket)),
             &JoinRequest {
                 client_rev: "test".into(),
+                session_id: String::new(),
+                ships_anchor: true,
             },
             slot,
             Some(anchor_frame),
@@ -613,7 +648,8 @@ mod tests {
         .expect("remote join completes");
         let _keep_endpoint = remote_ep_keep;
         let (_host_ep_back, joined) = host_task.await.expect("host task");
-        let (host_link, anchor) = joined.expect("join ok");
+        let (host_link, anchor, ships_anchor) = joined.expect("join ok");
+        assert!(ships_anchor, "the declaration round-trips");
         assert!(anchor.is_some(), "witnessing runs ship their anchor");
 
         // Uplink: two combat frames and one meta report.
@@ -681,6 +717,66 @@ mod tests {
         assert!(
             matches!(&up1, f if f.lane == Lane::Datagram && f.peer == 0),
             "first uplink frame routed: {up1:?}"
+        );
+    }
+
+    /// A dialler presenting an invite identity the host does not expect is
+    /// refused *on the wire*, with the reason carried back: the client shows
+    /// why it could not join instead of timing out against a dead stream.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_wrong_session_identity_is_refused_by_name() {
+        let slot = 3usize;
+        let expected = bot_key(slot).public();
+
+        let host_ep = bind(host_key()).await.expect("host endpoint");
+        let remote_ep = bind(bot_key(slot)).await.expect("remote endpoint");
+        let socket = host_ep.bound_sockets()[0];
+
+        let host_task = {
+            let host_ep = host_ep.clone();
+            tokio::spawn(async move {
+                // The operator expects one invite's identity; anything else
+                // must refuse before any traffic moves.
+                host_accept(
+                    &host_ep,
+                    expected,
+                    slot,
+                    false,
+                    Some("018f8f4e-5c90-7abc-8123-00000000abcd"),
+                    None,
+                )
+                .await
+            })
+        };
+        let error = format!(
+            "{:#}",
+            remote_join(
+                &remote_ep,
+                HostAddress {
+                    node: host_ep.id(),
+                    direct: vec![socket],
+                }
+                .to_addr(Some(socket)),
+                &JoinRequest {
+                    client_rev: "test".into(),
+                    session_id: "018f8f4e-5c90-7abc-8123-00000000ffff".to_owned(),
+                    ships_anchor: false,
+                },
+                slot,
+                None,
+            )
+            .await
+            .expect_err("a wrong session identity cannot join")
+        );
+        assert!(
+            error.contains("session identity mismatch") && error.contains("00000000abcd"),
+            "the wire refusal names the expectation: {error}"
+        );
+        let host_result = host_task.await.expect("host task");
+        let failure = format!("{:#}", host_result.expect_err("the host refuses too"));
+        assert!(
+            failure.contains("session identity mismatch"),
+            "the host's own error names it as well: {failure}"
         );
     }
 }

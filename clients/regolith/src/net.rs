@@ -34,7 +34,7 @@ use bytes::{BufMut, Bytes, BytesMut};
 
 /// The connection's application protocol. Must match `p1-swarm`'s
 /// `bridge::EXTERIOR_ALPN`; a grammar change bumps it there and here together.
-pub const EXTERIOR_ALPN: &[u8] = b"orrery/exterior/2";
+pub const EXTERIOR_ALPN: &[u8] = b"orrery/exterior/3";
 
 /// Longest frame the wire will carry or accept (`exterior::MAX_FRAME_BYTES`).
 pub const MAX_FRAME_BYTES: u32 = 64 * 1_024;
@@ -188,37 +188,62 @@ impl UplinkAck {
 }
 
 /// The handshake a dialling peer sends before any combat traffic
-/// (`exterior::JoinRequest`, version 2). Invite-bound session identity and
-/// version pinning are slice 3's extension (#345 §8); until then this is the
-/// whole wire representation, which is why dialling needs the host NodeId
-/// alone.
+/// (`exterior::JoinRequest`, version 3).
+///
+/// #387's extension: the request carries the invite-bound session identity —
+/// the pre-minted UUIDv7 this client banks under, which the host checks
+/// against the operator's expectation before any traffic moves — and declares
+/// whether a witness anchor follows. The rendered client authors no witness
+/// logs yet, so it declares `ships_anchor: false` and joins hosts whose
+/// witnesses judge the bot population.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JoinRequest {
-    /// Build revision of the joining process, for the report and for pinning.
+    /// Build revision of the joining process, for the report and for pinning
+    /// (#345 §8: a stale client is refused at join).
     pub client_rev: String,
+    /// The pre-minted session identity this client banks under (#387). Empty
+    /// only on transport proofs that carry no campaign identity.
+    pub session_id: String,
+    /// Whether a tick-zero witness anchor follows the accept reply. Always
+    /// false in this client until witnessing authoring lands here.
+    pub ships_anchor: bool,
 }
 
 impl JoinRequest {
     const MAGIC: [u8; 4] = *b"ORRX";
-    const VERSION: u16 = 2;
+    const VERSION: u16 = 3;
 
-    /// Encodes the request onto the wire.
+    /// Encodes the request onto the wire:
+    /// `[ORRX][03 00][rev len][rev][session len][session][anchor byte]`.
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(Self::MAGIC.len() + 2 + 1 + self.client_rev.len());
+        let mut out = Vec::with_capacity(
+            Self::MAGIC.len() + 2 + 1 + self.client_rev.len() + 1 + self.session_id.len() + 1,
+        );
         out.extend_from_slice(&Self::MAGIC);
         out.extend_from_slice(&Self::VERSION.to_le_bytes());
-        let rev = self.client_rev.as_bytes();
-        out.push(u8::try_from(rev.len()).unwrap_or(u8::MAX));
-        out.extend_from_slice(&rev[..rev.len().min(u8::MAX.into())]);
+        for field in [&self.client_rev, &self.session_id] {
+            let bytes = field.as_bytes();
+            out.push(u8::try_from(bytes.len()).unwrap_or(u8::MAX));
+            out.extend_from_slice(&bytes[..bytes.len().min(u8::MAX.into())]);
+        }
+        out.push(u8::from(self.ships_anchor));
         out
     }
 
     /// Decodes a request. Wrong magic or version is a refusal, not a guess.
     ///
     /// # Errors
-    /// Wrong magic, unsupported version, or any truncation.
+    /// Wrong magic, unsupported version, or any truncation or trailing bytes.
     pub fn decode(bytes: &[u8]) -> Result<Self, &'static str> {
+        fn read_string(rest: &[u8]) -> Result<(&[u8], &[u8]), &'static str> {
+            let (&len, tail) = rest.split_first().ok_or("join truncated before length")?;
+            let len = len as usize;
+            if tail.len() < len {
+                return Err("join truncated inside string field");
+            }
+            Ok((&tail[..len], &tail[len..]))
+        }
         if bytes.len() < Self::MAGIC.len() || bytes[..Self::MAGIC.len()] != Self::MAGIC {
             return Err("not an orrery exterior join");
         }
@@ -231,16 +256,18 @@ impl JoinRequest {
             return Err("unsupported exterior protocol version");
         }
         let rest = &rest[2..];
-        if rest.is_empty() {
-            return Err("join truncated before revision");
-        }
-        let rev_len = rest[0] as usize;
-        let rest = &rest[1..];
-        if rest.len() < rev_len {
-            return Err("join truncated inside revision");
+        let (rev_bytes, tail) = read_string(rest)?;
+        let (session_bytes, tail) = read_string(tail)?;
+        let (&anchor_byte, tail) = tail
+            .split_first()
+            .ok_or("join truncated before anchor flag")?;
+        if !tail.is_empty() {
+            return Err("join carries trailing bytes");
         }
         Ok(Self {
-            client_rev: String::from_utf8_lossy(&rest[..rev_len]).into_owned(),
+            client_rev: String::from_utf8_lossy(rev_bytes).into_owned(),
+            session_id: String::from_utf8_lossy(session_bytes).into_owned(),
+            ships_anchor: anchor_byte != 0,
         })
     }
 }
@@ -702,24 +729,37 @@ fn spawn_writer(
 mod tests {
     use super::*;
 
-    /// The exact bytes slice 1's host reads. `exterior::JoinRequest` v2 is
-    /// `[ORRX][02 00][rev len][rev]`; if this vector and `p1-swarm` ever
-    /// disagree, one side changed the grammar and both must move together.
+    /// The exact bytes slice 1's host reads, extended by #387: `exterior::
+    /// JoinRequest` v3 is `[ORRX][03 00][rev len][rev][session len]
+    /// [session][anchor byte]`; if this vector and `p1-swarm` ever disagree,
+    /// one side changed the grammar and both must move together.
     #[test]
     fn join_request_bytes_match_slice_1() {
         let request = JoinRequest {
             client_rev: "abc1234".to_owned(),
+            session_id: "018f8f4e-5c90-7abc-8123-000000000001".to_owned(),
+            ships_anchor: false,
         };
-        assert_eq!(
-            request.encode(),
-            vec![
-                b'O', b'R', b'R', b'X', // magic
-                0x02, 0x00, // version 2, LE
-                7,    // revision length
-                b'a', b'b', b'c', b'1', b'2', b'3', b'4',
-            ]
-        );
-        assert_eq!(JoinRequest::decode(&request.encode()), Ok(request));
+        let mut expected = vec![
+            b'O', b'R', b'R', b'X', // magic
+            0x03, 0x00, // version 3, LE
+            7,    // revision length
+            b'a', b'b', b'c', b'1', b'2', b'3', b'4',
+            36, // session id length (a UUIDv7 string)
+        ];
+        expected.extend_from_slice(b"018f8f4e-5c90-7abc-8123-000000000001");
+        expected.push(0); // ships_anchor = false
+        assert_eq!(request.encode(), expected);
+        assert_eq!(JoinRequest::decode(&request.encode()), Ok(request.clone()));
+
+        // An anchorless, identity-less transport proof encodes faithfully too.
+        let bare = JoinRequest {
+            client_rev: "x".into(),
+            session_id: String::new(),
+            ships_anchor: false,
+        };
+        assert_eq!(JoinRequest::decode(&bare.encode()), Ok(bare));
+
         // And the refusal arms: wrong magic, wrong version, truncation.
         assert_eq!(
             JoinRequest::decode(b"NOPE\x01\x00"),
@@ -727,6 +767,8 @@ mod tests {
         );
         let mut wrong_version = JoinRequest {
             client_rev: "x".into(),
+            session_id: String::new(),
+            ships_anchor: false,
         }
         .encode();
         wrong_version[4] = 0xFF;
@@ -734,25 +776,20 @@ mod tests {
             JoinRequest::decode(&wrong_version),
             Err("unsupported exterior protocol version")
         );
+        // Every truncation point after the version is refused.
+        let full = request.encode();
+        for cut in [6usize, 10, 14, full.len() - 1] {
+            assert!(
+                JoinRequest::decode(&full[..cut]).is_err(),
+                "cut at {cut} must not decode"
+            );
+        }
+        // Trailing junk is refused rather than ignored.
+        let mut trailing = full.clone();
+        trailing.push(9);
         assert_eq!(
-            // Magic + version only: the length byte has not arrived.
-            JoinRequest::decode(
-                &JoinRequest {
-                    client_rev: "x".into()
-                }
-                .encode()[..6]
-            ),
-            Err("join truncated before revision")
-        );
-        assert_eq!(
-            // Length byte present, payload cut short.
-            JoinRequest::decode(
-                &JoinRequest {
-                    client_rev: "x".into()
-                }
-                .encode()[..7]
-            ),
-            Err("join truncated inside revision")
+            JoinRequest::decode(&trailing),
+            Err("join carries trailing bytes")
         );
     }
 

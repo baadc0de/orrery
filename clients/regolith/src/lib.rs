@@ -16,6 +16,12 @@ pub mod telemetry;
 /// Commit revision embedded in this client binary at build time.
 pub const BUILD_REV: &str = env!("ORRERY_BUILD_REV");
 
+/// Target triple embedded at build time (`build.rs`). The banking row's
+/// `platform_triple` is this exact string, and the ledger compares it against
+/// the host's own stamp — the two binaries must agree on how they name a
+/// platform.
+pub const BUILD_TARGET: &str = env!("ORRERY_BUILD_TARGET");
+
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;

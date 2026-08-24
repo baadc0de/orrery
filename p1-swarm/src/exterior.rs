@@ -337,29 +337,45 @@ pub fn link_pair() -> (HostLink, RemoteLink) {
 /// The handshake a dialling peer sends before any combat traffic.
 ///
 /// iroh authenticates the dialler's `NodeId` at the transport layer, so the
-/// handshake carries no key material — what it establishes is protocol fit and
-/// build provenance. Slice 3 extends this with invite-bound session identity
-/// and version pinning (#345 §8); the fields reserved now keep that extension
-/// from becoming a grammar change.
+/// handshake carries no key material — what it establishes is protocol fit,
+/// build provenance, and the invite-bound session identity (#387): the
+/// pre-minted UUIDv7 this dialler banks under, which the host checks against
+/// the operator's expectation before any traffic moves. A rendered client
+/// declares `ships_anchor: false` until witnessing authoring lands on the
+/// client side; the host then runs its witnesses over the bot population
+/// without arming anyone on this slot's absent log.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JoinRequest {
     /// Build revision of the joining process, for the report and for pinning.
     pub client_rev: String,
+    /// The pre-minted session identity this peer banks under (#387). Empty on
+    /// transport proofs that carry no campaign identity at all.
+    pub session_id: String,
+    /// Whether this peer ships a tick-zero witness anchor after the accept.
+    /// The host reads one exactly when it is witnessing *and* this is true;
+    /// a declared false is honoured rather than timed out on.
+    pub ships_anchor: bool,
 }
 
 impl JoinRequest {
     const MAGIC: [u8; 4] = *b"ORRX";
-    const VERSION: u16 = 2;
+    const VERSION: u16 = 3;
 
-    /// Encodes the request onto the wire.
+    /// Encodes the request onto the wire:
+    /// `[ORRX][03 00][rev len][rev][session len][session][anchor byte]`.
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(Self::MAGIC.len() + 2 + 1 + self.client_rev.len());
+        let mut out = Vec::with_capacity(
+            Self::MAGIC.len() + 2 + 1 + self.client_rev.len() + 1 + self.session_id.len() + 1,
+        );
         out.extend_from_slice(&Self::MAGIC);
         out.extend_from_slice(&Self::VERSION.to_le_bytes());
-        let rev = self.client_rev.as_bytes();
-        out.push(u8::try_from(rev.len()).unwrap_or(u8::MAX));
-        out.extend_from_slice(&rev[..rev.len().min(u8::MAX.into())]);
+        for field in [&self.client_rev, &self.session_id] {
+            let bytes = field.as_bytes();
+            out.push(u8::try_from(bytes.len()).unwrap_or(u8::MAX));
+            out.extend_from_slice(&bytes[..bytes.len().min(u8::MAX.into())]);
+        }
+        out.push(u8::from(self.ships_anchor));
         out
     }
 
@@ -377,19 +393,87 @@ impl JoinRequest {
         if version != Self::VERSION {
             return Err("unsupported exterior protocol version");
         }
+        // Two length-prefixed strings, then the anchor declaration byte.
         let rest = &rest[2..];
-        if rest.is_empty() {
-            return Err("join truncated before revision");
+        fn read_string<'a>(rest: &'a [u8]) -> Result<(&'a [u8], &'a [u8]), &'static str> {
+            let (&len, tail) = rest.split_first().ok_or("join truncated before length")?;
+            let len = len as usize;
+            if tail.len() < len {
+                return Err("join truncated inside string field");
+            }
+            Ok((&tail[..len], &tail[len..]))
         }
-        let rev_len = rest[0] as usize;
-        let rest = &rest[1..];
-        if rest.len() < rev_len {
-            return Err("join truncated inside revision");
+        let (rev_bytes, tail) = read_string(rest)?;
+        let (session_bytes, tail) = read_string(tail)?;
+        let (&anchor_byte, tail) = tail
+            .split_first()
+            .ok_or("join truncated before anchor flag")?;
+        if !tail.is_empty() {
+            return Err("join carries trailing bytes");
         }
         Ok(Self {
-            client_rev: String::from_utf8_lossy(&rest[..rev_len]).into_owned(),
+            client_rev: String::from_utf8_lossy(rev_bytes).into_owned(),
+            session_id: String::from_utf8_lossy(session_bytes).into_owned(),
+            ships_anchor: anchor_byte != 0,
         })
     }
+}
+
+/// Whether `text` has the exact shape the P4 ledger demands of
+/// `identity.human_session_id`: lowercase hexadecimal in the 8-4-4-4-12
+/// groups, version nibble 7, RFC 4122 variant. Character-for-character the
+/// ledger's own pattern; the end-to-end append is what proves the two agree.
+#[must_use]
+pub fn is_uuid_v7(text: &str) -> bool {
+    let parts: Vec<&str> = text.split('-').collect();
+    let lengths = [8usize, 4, 4, 4, 12];
+    if parts.len() != 5
+        || !parts
+            .iter()
+            .zip(lengths)
+            .all(|(part, len)| part.len() == len && hex_lowercase(part))
+    {
+        return false;
+    }
+    parts[2].as_bytes()[0] == b'7' && matches!(parts[3].as_bytes()[0], b'8' | b'9' | b'a' | b'b')
+}
+
+fn hex_lowercase(text: &str) -> bool {
+    text.bytes()
+        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+/// Validates a decoded [`JoinRequest`] against what this host expects.
+///
+/// Deliberately a pure function: the refusal rules are unit-testable without
+/// a socket, and `host_accept` only wires them to the wire.
+///
+/// # Errors
+///
+/// A named reason for the `Reject` reply when either check fails.
+pub fn validate_join(
+    request: &JoinRequest,
+    expected_session_id: Option<&str>,
+    pinned_client_rev: Option<&str>,
+) -> Result<(), String> {
+    if let Some(expected) = expected_session_id {
+        if request.session_id != expected {
+            return Err(format!(
+                "session identity mismatch: the invite expects {expected}, the dialler \
+                 presented '{}'",
+                request.session_id
+            ));
+        }
+    }
+    if let Some(pinned) = pinned_client_rev {
+        if request.client_rev != pinned {
+            return Err(format!(
+                "client rev {pinned} is required (version pinning); the dialler runs {}",
+                request.client_rev
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// The host's answer to a [`JoinRequest`].
@@ -618,9 +702,39 @@ mod tests {
     fn join_requests_round_trip_and_reject_wrong_versions() {
         let request = JoinRequest {
             client_rev: "0ce6b28b".to_owned(),
+            session_id: "018f8f4e-5c90-7abc-8123-00000000abcd".to_owned(),
+            ships_anchor: true,
         };
         let decoded = JoinRequest::decode(&request.encode()).expect("well formed");
         assert_eq!(decoded, request);
+
+        // An anchorless transport proof with no session identity encodes to
+        // the same grammar and decodes faithfully.
+        let anchorless = JoinRequest {
+            client_rev: "abc1234".to_owned(),
+            session_id: String::new(),
+            ships_anchor: false,
+        };
+        assert_eq!(JoinRequest::decode(&anchorless.encode()), Ok(anchorless));
+
+        // The exact v3 byte layout, pinned: magic, version LE, two
+        // length-prefixed strings, one anchor byte.
+        let pinned = JoinRequest {
+            client_rev: "rev".to_owned(),
+            session_id: "sid".to_owned(),
+            ships_anchor: false,
+        }
+        .encode();
+        assert_eq!(
+            pinned,
+            vec![
+                b'O', b'R', b'R', b'X', //
+                0x03, 0x00, // version 3, LE
+                3, b'r', b'e', b'v', // rev length + bytes
+                3, b's', b'i', b'd', // session length + bytes
+                0,    // ships_anchor = false
+            ]
+        );
 
         let mut wrong_version = request.encode();
         wrong_version[4] = 0xFF;
@@ -631,6 +745,62 @@ mod tests {
             "magic checked"
         );
         assert!(JoinRequest::decode(b"ORRX").is_err(), "truncation checked");
+        // Every truncation point after the version is refused.
+        let full = request.encode();
+        for cut in [6usize, 10, 14, full.len() - 1] {
+            assert!(
+                JoinRequest::decode(&full[..cut]).is_err(),
+                "cut at {cut} must not decode"
+            );
+        }
+        // Trailing junk is refused rather than ignored.
+        let mut trailing = full;
+        trailing.push(0);
+        assert!(JoinRequest::decode(&trailing).is_err());
+    }
+
+    /// The admission rules are pure: an unexpected session identity is a named
+    /// refusal, a stale build is refused against its pin, and both checks off
+    /// accept everything (the pure transport proofs keep working).
+    #[test]
+    fn join_validation_refuses_the_wrong_identity_or_rev() {
+        let joined = JoinRequest {
+            client_rev: "aaaa".to_owned(),
+            session_id: "018f8f4e-5c90-7abc-8123-00000000abcd".to_owned(),
+            ships_anchor: false,
+        };
+
+        // Nothing expected: anything decodes, accepts.
+        assert_eq!(
+            validate_join(&joined, None, None),
+            Ok(()),
+            "an unconfigured host admits any dialler"
+        );
+        // Matching expectations pass.
+        assert_eq!(
+            validate_join(&joined, Some(&joined.session_id), Some("aaaa")),
+            Ok(())
+        );
+        // A dialler presenting another invite's session identity names both.
+        let mismatch = validate_join(&joined, Some("018f8f4e-5c90-7abc-8123-00000000ffff"), None)
+            .expect_err("wrong session must refuse");
+        assert!(
+            mismatch.contains("session identity mismatch") && mismatch.contains(&joined.session_id),
+            "the refusal names the expectation and what arrived: {mismatch}"
+        );
+        // An empty presentation against a real expectation is the same refusal.
+        let anonymous = JoinRequest {
+            client_rev: "aaaa".to_owned(),
+            session_id: String::new(),
+            ships_anchor: false,
+        };
+        assert!(validate_join(&anonymous, Some(&joined.session_id), None).is_err());
+        // A stale build names both revisions.
+        let stale = validate_join(&joined, None, Some("bbbb")).expect_err("stale rev");
+        assert!(
+            stale.contains("bbbb") && stale.contains("aaaa"),
+            "the refusal names pin and reality: {stale}"
+        );
     }
 
     #[test]

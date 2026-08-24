@@ -534,8 +534,13 @@ pub struct ExteriorSlot {
     cell: CellId,
     /// The tick-zero claim the peer shipped after joining, with the state it
     /// commits to — what watchers arm against instead of reading a local
-    /// `Chain`. Present exactly when witnessing is on.
+    /// `Chain`. Present exactly when witnessing is on *and* the peer declared
+    /// it ships one (#387: a rendered client does not, yet).
     pub anchor: Option<(orrery_protocol::StateClaim, RegolithState)>,
+    /// Whether the join handshake declared a witness anchor. A peer that did
+    /// is required to have shipped one; one that did not is tolerated with
+    /// none, and its slot simply has no watchers armed against it.
+    pub ships_anchor: bool,
     /// Queues to and from the connection pump.
     pub link: crate::exterior::HostLink,
     /// Frames forwarded up, for the report.
@@ -773,6 +778,7 @@ impl Swarm {
         node: NodeId,
         anchor: Option<(orrery_protocol::StateClaim, RegolithState)>,
         link: crate::exterior::HostLink,
+        ships_anchor: bool,
     ) -> Self {
         let index = self.bots.len();
         let (pos, _) = crate::bot::spawn_pose(index, index + 1);
@@ -787,6 +793,7 @@ impl Swarm {
             entity,
             cell,
             anchor,
+            ships_anchor,
             link,
             uplink_frames: 0,
             downlink_frames: 0,
@@ -1171,11 +1178,17 @@ impl Swarm {
             let index = exterior.index;
             let entity = exterior.entity;
             let node = exterior.node;
+            debug_assert_eq!(index, count - 1, "the exterior takes the last ring slot");
             match exterior.anchor.take() {
                 Some((claim, state)) => anchors.push((entity, node, claim, state)),
+                // A rendered client (#387) declares at join that it ships no
+                // anchor — witnessing authoring has not landed client-side —
+                // so its slot runs with no watchers armed against it. A peer
+                // that *declared* an anchor and did not ship one is a broken
+                // handshake, and stays a panic.
+                None if !exterior.ships_anchor => {}
                 None => panic!("witnessing runs need the external peer's tick-zero anchor"),
             }
-            debug_assert_eq!(index, count - 1, "the exterior takes the last ring slot");
         }
 
         for (index, witnesses) in sets.iter().enumerate() {
@@ -2313,7 +2326,7 @@ mod tests {
             ..SwarmConfig::default()
         });
         let (host_link, remote_link) = link_pair();
-        swarm = swarm.with_external(bot_key(1).public(), None, host_link);
+        swarm = swarm.with_external(bot_key(1).public(), None, host_link, true);
         remote_link
             .uplink
             .try_send(Frame {
@@ -2367,7 +2380,7 @@ mod tests {
             ..SwarmConfig::default()
         });
         let (host_link, remote_link) = link_pair();
-        swarm = swarm.with_external(bot_key(1).public(), None, host_link);
+        swarm = swarm.with_external(bot_key(1).public(), None, host_link, true);
         for sequence in 0..SENT as u64 {
             remote_link
                 .uplink
@@ -2438,7 +2451,7 @@ mod tests {
         let ext_index = peers;
         let ext_node = bot_key(ext_index).public();
         let (host_link, remote_link) = link_pair();
-        swarm = swarm.with_external(ext_node, None, host_link);
+        swarm = swarm.with_external(ext_node, None, host_link, true);
         swarm.form_island();
 
         // Up: the remote sends a datagram addressed to bot 0. The bridge must

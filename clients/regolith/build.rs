@@ -14,6 +14,12 @@ fn git(args: &[&str]) -> Option<String> {
 }
 
 fn main() {
+    // The target triple the banking row names as its platform. The ledger
+    // folds hours per platform by comparing this against the host's own
+    // stamp (`P1_SWARM_TARGET`), so both are captured from cargo's TARGET.
+    let target = env::var("TARGET").unwrap_or_else(|_| "unknown".into());
+    println!("cargo:rustc-env=ORRERY_BUILD_TARGET={target}");
+
     println!("cargo:rerun-if-env-changed=ORRERY_BUILD_REV");
     println!("cargo:rerun-if-env-changed=GITHUB_SHA");
     if let Some(head) = git(&["rev-parse", "--git-path", "HEAD"]) {

@@ -71,11 +71,11 @@
 #![warn(missing_docs)]
 
 pub mod invite;
-pub mod session_id;
 pub mod issuer;
 pub mod issuer_key_lifecycle;
 pub mod mem;
 pub mod service;
+pub mod session_id;
 pub mod standing;
 pub mod store;
 pub mod window;

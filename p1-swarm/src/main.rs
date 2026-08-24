@@ -187,6 +187,7 @@
 mod adjudicate;
 mod bot;
 mod bridge;
+mod campaign_report;
 mod chain;
 mod exterior;
 mod peer_runner;
@@ -365,6 +366,36 @@ struct Args {
     #[arg(long)]
     listening_file: Option<String>,
 
+    // ── Campaign hosting (#387): the human slot's identity and its row ──────
+    /// The invite-bound session identity the external peer must present at
+    /// join (#387). Pre-minted by `orrery-invite`; a dialler presenting any
+    /// other identity is refused before traffic. Stamped into the report as
+    /// `identity.human_session_id`, which is what makes the hour bankable.
+    #[arg(long)]
+    expected_session_id: Option<String>,
+
+    /// Refuse diallers whose build revision differs from this (#345 §8).
+    /// Without it, any rev may join and the report simply records what ran.
+    #[arg(long)]
+    pin_client_rev: Option<String>,
+
+    /// Assemble the external participant's finished session row into the run
+    /// report once the run ends, waiting up to 60 s for the client's JSONL to
+    /// land. Produces exactly the file `p4-ledger.sh append` banks — with
+    /// every refusal intact, including the ones this assembly adds (identity,
+    /// platform, telemetry honesty).
+    #[arg(long)]
+    campaign_record: Option<String>,
+
+    // ── Post-hoc assembly mode ──────────────────────────────────────────────
+    /// Merge an already-finished run report and an already-collected session
+    /// record into a bankable r.json (`--assemble-campaign-report RUN_JSON
+    /// RECORD_JSONL`). This is the manual return path for cohort sessions:
+    /// the record file travels by hand, and the same validation runs here as
+    /// during a hosted run. Needs `--expected-session-id`.
+    #[arg(long, num_args = 2, value_names = ["RUN_JSON", "RECORD_JSONL"])]
+    assemble_campaign_report: Option<Vec<String>>,
+
     // ── The external runner's own mode ──────────────────────────────────────
     /// Run as the external peer process instead of hosting a swarm (#385).
     ///
@@ -424,6 +455,10 @@ fn main() -> Result<()> {
 
     if args.self_test {
         return self_test();
+    }
+
+    if let Some(paths) = &args.assemble_campaign_report {
+        return assemble_from_files(&args, paths);
     }
 
     let cheats = args
@@ -518,6 +553,18 @@ fn main() -> Result<()> {
     let _endpoint_guard;
     let _runtime_guard;
     if args.external_peer {
+        // A campaign host names the invite-bound identity its slot must
+        // present (#387); a malformed one would silently disable admission,
+        // so the shape is checked before anything binds.
+        if let Some(session_id) = &args.expected_session_id {
+            campaign_report::checked_session_id(session_id)?;
+        } else if args.campaign_record.is_some() {
+            bail!(
+                "--campaign-record needs --expected-session-id: without the invite \
+                   bound identity there is nothing to admit at join or stamp into \
+                   the report"
+            );
+        }
         // The host endpoint's identity is the hosting process's, not the
         // slot's: the slot key belongs to the dialler and is what accept()
         // verifies against.
@@ -527,7 +574,7 @@ fn main() -> Result<()> {
             .enable_all()
             .build()
             .context("tokio runtime")?;
-        let (endpoint, link, anchor_bytes) = rt.block_on(async {
+        let (endpoint, link, anchor_bytes, ships_anchor) = rt.block_on(async {
             let endpoint = bridge::bind(secret).await?;
             eprintln!(
                 "p1-swarm: exterior slot {} listening, node {}, direct {:?}",
@@ -549,11 +596,18 @@ fn main() -> Result<()> {
             }
             let joined = tokio::time::timeout(
                 std::time::Duration::from_secs(args.join_timeout_secs),
-                bridge::host_accept(&endpoint, expected, config.peers, config.witnessing),
+                bridge::host_accept(
+                    &endpoint,
+                    expected,
+                    config.peers,
+                    config.witnessing,
+                    args.expected_session_id.as_deref(),
+                    args.pin_client_rev.as_deref(),
+                ),
             )
             .await
             .context("the external peer never dialled in time")??;
-            anyhow::Ok((endpoint, joined.0, joined.1))
+            anyhow::Ok((endpoint, joined.0, joined.1, joined.2))
         })?;
         // Held for their lifetime: dropping the endpoint closes the
         // connection, and dropping the runtime waits on the pump tasks.
@@ -570,7 +624,7 @@ fn main() -> Result<()> {
             }
             None => None,
         };
-        swarm = swarm.with_external(expected, anchor, link);
+        swarm = swarm.with_external(expected, anchor, link, ships_anchor);
     }
 
     let report = swarm.run();
@@ -710,7 +764,39 @@ fn main() -> Result<()> {
     }
 
     if let Some(path) = &args.json {
-        std::fs::write(path, serde_json::to_vec_pretty(&report)?)?;
+        // A hosted campaign run writes the *assembled* report here: the run
+        // evidence plus the participant's row plus the identity stamp, which
+        // is the artifact `p4-ledger.sh append` banks. The wait covers the
+        // client writing its row after its goodbye marker crossed.
+        let mut report_value = serde_json::to_value(&report)?;
+        if let Some(record_path) = &args.campaign_record {
+            if !args.external_peer {
+                bail!("--campaign-record hosts an external peer; there is nothing to attach");
+            }
+            let session_id = args
+                .expected_session_id
+                .as_deref()
+                .context("--campaign-record needs --expected-session-id")?;
+            let record = campaign_report::await_record(std::path::Path::new(record_path), 60)?;
+            let digest = campaign_report::compute_pipeline_digest(
+                report.identity.commit,
+                &campaign_report::repo_root(),
+            )
+            .context("computing this run's pipeline digest for the row")?;
+            campaign_report::assemble(
+                &mut report_value,
+                &record,
+                session_id,
+                report.identity.target,
+                &digest,
+            )?;
+            eprintln!(
+                "p1-swarm: assembled campaign row {} into the report (pipeline {})",
+                record.session_id()?,
+                digest,
+            );
+        }
+        std::fs::write(path, serde_json::to_vec_pretty(&report_value)?)?;
         eprintln!("p1-swarm: report written to {path}");
     }
 
@@ -737,6 +823,54 @@ fn main() -> Result<()> {
         "{} clause(s) of the P1 criterion did not hold",
         failures.len()
     );
+}
+
+/// Post-hoc assembly: merge an already-finished run report with an
+/// already-collected session record (#387's manual return path).
+///
+/// The same validation runs as during a hosted run, because it is the same
+/// function; the only difference is where the two halves came from.
+fn assemble_from_files(args: &Args, paths: &[String]) -> Result<()> {
+    let session_id = args
+        .expected_session_id
+        .as_deref()
+        .context("--assemble-campaign-report needs --expected-session-id")?;
+    campaign_report::checked_session_id(session_id)?;
+
+    let run_json = std::fs::read_to_string(&paths[0])
+        .with_context(|| format!("reading the run report {}", paths[0]))?;
+    let mut report: serde_json::Value =
+        serde_json::from_str(&run_json).with_context(|| format!("parsing {}", paths[0]))?;
+    let target = report["identity"]["target"]
+        .as_str()
+        .context("run report has no identity.target")?
+        .to_owned();
+    let commit = report["identity"]["commit"]
+        .as_str()
+        .context("run report has no identity.commit")?
+        .to_owned();
+
+    let record = campaign_report::ParticipantRecord::read_latest(std::path::Path::new(&paths[1]))?
+        .with_context(|| format!("no session record found in {}", paths[1]))?;
+    let digest = campaign_report::compute_pipeline_digest(&commit, &campaign_report::repo_root())
+        .context("computing the pipeline digest for the row")?;
+    campaign_report::assemble(&mut report, &record, session_id, &target, &digest)?;
+
+    let out_path = assembled_path(&paths[0]);
+    std::fs::write(&out_path, serde_json::to_vec_pretty(&report)?)?;
+    eprintln!(
+        "p1-swarm: assembled campaign row {} into {out_path} (pipeline {digest})",
+        record.session_id()?,
+    );
+    Ok(())
+}
+
+/// `run.json` → `run.assembled.json`, beside what it came from.
+fn assembled_path(run_json: &str) -> String {
+    match run_json.rsplit_once('.') {
+        Some((stem, extension)) if !stem.is_empty() => format!("{stem}.assembled.{extension}"),
+        _ => format!("{run_json}.assembled.json"),
+    }
 }
 
 /// Structural self-check: the harness still proves what it claims to.

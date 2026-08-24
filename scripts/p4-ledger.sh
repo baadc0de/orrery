@@ -56,6 +56,7 @@ usage() {
   cat >&2 <<'USAGE'
 usage: p4-ledger.sh append <report.json>   bank one p1-swarm report
        p4-ledger.sh total                  running totals, grouped by pipeline
+       p4-ledger.sh pipeline-id <commit>   print the pipeline digest at a commit
        p4-ledger.sh --self-test            structural + functional self-check
 
   P4_LEDGER_FILE   ledger path (default: target/p4-ledger/hours.jsonl)
@@ -109,6 +110,8 @@ self_test() {
     || die 'self-test: the bot|human dimension is gone; P4 cannot check its required mix'
   has 'validate_session_record' \
     || die 'self-test: campaign session rows are no longer validated before banking'
+  has '$s.observed_loss_pct != $s.configured_impairment_profile.loss_pct' \
+    || die "self-test: the mismatch flag is no longer cross-checked against the row's own numbers; forged verified impairment would bank"
   has 'def platform' \
     || die 'self-test: the target-to-platform fold is gone; the criterion is counted per platform'
   has 'MISSING' \
@@ -235,6 +238,20 @@ self_test() {
   if "$0" append "$dir/bad-session.json" >/dev/null 2>&1; then
     die 'self-test: malformed campaign session row banked'
   fi
+
+  # A tampered measurement refuses for the right reason: the observed figure
+  # moved without the flag following it, which is exactly what a post-hoc
+  # "verified impairment" forgery looks like. And the opposite tamper — equal
+  # numbers flagged as mismatching — refuses too, so the check cuts both ways.
+  before=$(st_lines)
+  if st_bank 10 '.session.observed_loss_pct = 0.5'; then
+    die "self-test: a row claiming verified impairment its own measurement contradicts banked"
+  fi
+  [[ $(st_lines) == "$before" ]] || die 'self-test: the forged-impairment refusal still touched the ledger'
+  if st_bank 10 '.session.observed_loss_pct = 3 | .session.observed_jitter_p50_ms = 100 | .session.observed_jitter_p99_ms = 100 | .session.impairment_mismatch = true'; then
+    die "self-test: a row flagging a mismatch its own numbers deny banked"
+  fi
+  [[ $(st_lines) == "$before" ]] || die 'self-test: the false-alarm refusal still touched the ledger'
 
   # Each of these is a run that must add no hours at all. The count is checked
   # as well as the exit status: a refusal that has already written the line is
@@ -425,6 +442,17 @@ validate_session_record() {
       and ($s.afk_seconds | type == "number" and . >= 0)
       and ($s.afk_capped | type == "boolean")
       and ($s.impairment_mismatch | type == "boolean")
+      # The flag must agree with the numbers in the row itself, recomputed
+      # here: observation may disagree with configuration (that is what the
+      # flag is for), but a row claiming verified impairment its measurements
+      # contradict — or flagging a mismatch they deny — cannot bank. Exact
+      # inequality mirrors the client f64 EPSILON comparison: these figures
+      # are either bit-equal or macroscopically different, so no value can
+      # fall between the two rules.
+      and (((($s.observed_loss_pct != $s.configured_impairment_profile.loss_pct)
+             or ($s.observed_jitter_p50_ms != $s.configured_impairment_profile.jitter_p50_ms)
+             or ($s.observed_jitter_p99_ms != $s.configured_impairment_profile.jitter_p99_ms))
+            == $s.impairment_mismatch))
       and (if $actor == "human" then $s.session_id == $session else true end)
     end
   ' "$report" >/dev/null \
@@ -550,6 +578,17 @@ cmd_append() {
 
 # The criterion's figure, and the thing `total` is progress against.
 readonly HOURS_GOAL=500
+
+# Print the pipeline digest at a commit. A read-only query, not a bypass:
+# `append` recomputes the digest itself for every report it banks, so this
+# exists for whoever assembles a campaign report (#387) to fill
+# `session.pipeline_digest` from the same source the ledger will check it
+# against — one recipe, two callers.
+cmd_pipeline_id() {
+  local commit=${1:-}
+  [[ -n $commit ]] || die 'pipeline-id: a commit is required'
+  pipeline_id "$commit"
+}
 
 # Shared between all three views below.
 #
@@ -694,6 +733,7 @@ case ${1:-} in
   --self-test) self_test ;;
   append) shift; cmd_append "$@" ;;
   total) shift; cmd_total "$@" ;;
+  pipeline-id) shift; cmd_pipeline_id "$@" ;;
   -h | --help) usage ;;
   *) usage; die "unknown command '${1:-<none>}'" ;;
 esac

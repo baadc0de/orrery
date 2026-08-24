@@ -619,7 +619,7 @@ fn hex_digit(byte: u8) -> Option<u8> {
 mod tests {
     use super::*;
     use orrery_protocol::UnixMillis;
-    use rand::{SeedableRng};
+    use rand::SeedableRng;
     use rand_chacha::ChaCha8Rng;
 
     #[derive(Debug)]
@@ -641,11 +641,22 @@ mod tests {
     fn mint_allocates_accounts_sessions_and_persists_hashes_not_codes() {
         let mut ledger = InviteLedger::default();
         let mut codes = FixedCodes(vec![[3; 32], [4; 32]]);
-        let first = mint_invite(&mut ledger, "Ada".to_owned(), &mut codes, NOW_MS, &mut mint_rng(1))
-            .expect("mint first");
-        let second =
-            mint_invite(&mut ledger, "Bryn".to_owned(), &mut codes, NOW_MS, &mut mint_rng(2))
-                .expect("mint second");
+        let first = mint_invite(
+            &mut ledger,
+            "Ada".to_owned(),
+            &mut codes,
+            NOW_MS,
+            &mut mint_rng(1),
+        )
+        .expect("mint first");
+        let second = mint_invite(
+            &mut ledger,
+            "Bryn".to_owned(),
+            &mut codes,
+            NOW_MS,
+            &mut mint_rng(2),
+        )
+        .expect("mint second");
         assert_eq!(first.account, AccountId(1));
         assert_eq!(second.account, AccountId(2));
         // Distinct pre-minted identities, valid in the ledger's own shape.
@@ -744,7 +755,10 @@ mod tests {
     /// tolerated: a weak value must not quietly become the banking identity.
     #[test]
     fn a_v3_record_with_a_non_v7_session_field_is_malformed() {
-        let bad_session = format!("{LEDGER_HEADER}\n{}\t1\tX\tnot-a-uuid\tissued\t\t\n", hex(&[7u8; 32]));
+        let bad_session = format!(
+            "{LEDGER_HEADER}\n{}\t1\tX\tnot-a-uuid\tissued\t\t\n",
+            hex(&[7u8; 32])
+        );
         assert!(InviteLedger::parse(&bad_session).is_err());
     }
 
@@ -776,7 +790,16 @@ mod tests {
         );
         // The identical code bytes collide with the first entry.
         assert!(
-            matches!(mint_invite(&mut ledger, "Two".to_owned(), &mut codes, NOW_MS, &mut mint_rng(12)), Err(InviteError::DuplicateCode)),
+            matches!(
+                mint_invite(
+                    &mut ledger,
+                    "Two".to_owned(),
+                    &mut codes,
+                    NOW_MS,
+                    &mut mint_rng(12)
+                ),
+                Err(InviteError::DuplicateCode)
+            ),
             "the code collision must still be caught"
         );
         assert!(first.is_ok());

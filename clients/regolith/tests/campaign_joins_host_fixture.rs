@@ -78,7 +78,7 @@ struct HostFixture {
 impl HostFixture {
     /// Bind and start pumping. `reject` refuses the handshake; `wrong_slot`
     /// accepts with a different index than the client derived.
-    fn spawn(mode: Mode) -> Self {
+    fn spawn(mode: Mode, session_id: &str) -> Self {
         let runtime = Arc::new(
             tokio::runtime::Builder::new_multi_thread()
                 .worker_threads(2)
@@ -103,9 +103,17 @@ impl HostFixture {
         let endpoint_for_task = endpoint.clone();
         let pump_truth = Arc::clone(&truth);
         let pump_runtime = Arc::clone(&runtime);
+        let expected_session = session_id.to_owned();
         let _pump_thread = std::thread::spawn(move || {
             pump_runtime.block_on(async move {
-                let _ = pump(endpoint_for_task, expected_client, mode, pump_truth).await;
+                let _ = pump(
+                    endpoint_for_task,
+                    expected_client,
+                    mode,
+                    &expected_session,
+                    pump_truth,
+                )
+                .await;
             });
         });
 
@@ -151,6 +159,7 @@ async fn pump(
     endpoint: iroh::Endpoint,
     expected_client: NodeId,
     mode: Mode,
+    expected_session_id: &str,
     truth: Arc<std::sync::Mutex<GroundTruth>>,
 ) -> Result<(), String> {
     let incoming = endpoint
@@ -174,10 +183,18 @@ async fn pump(
     // notes: accept_bi here, not open_bi.
     let (mut send, mut recv) = connection.accept_bi().await.map_err(|e| e.to_string())?;
     let request_bytes = read_message(&mut recv).await?;
-    let request = net::JoinRequest::decode(&request_bytes).expect("client spoke v2");
+    let request = net::JoinRequest::decode(&request_bytes).expect("client spoke v3");
     assert!(
         !request.client_rev.is_empty(),
         "the client names its build revision"
+    );
+    assert!(
+        !request.ships_anchor,
+        "the rendered client declares it ships no witness anchor yet (#387)"
+    );
+    assert_eq!(
+        request.session_id, expected_session_id,
+        "the client presents the session identity it was launched with"
     );
 
     if matches!(mode, Mode::Reject) {
@@ -404,7 +421,7 @@ fn drive_until_joined(runtime: &mut CampaignRuntime, sink: &mut JsonlTelemetry, 
 
 #[test]
 fn a_client_joins_measures_and_applies_replicated_state() {
-    let fixture = HostFixture::spawn(Mode::Join);
+    let fixture = HostFixture::spawn(Mode::Join, "it-session");
     let mut sink = sink_for("regolith-campaign-it");
     let mut runtime = CampaignRuntime::launch(fixture.config("it-session"), crate_seed());
 
@@ -468,7 +485,7 @@ fn a_client_joins_measures_and_applies_replicated_state() {
 
 #[test]
 fn a_refused_join_never_proceeds_as_if_local() {
-    let fixture = HostFixture::spawn(Mode::Reject);
+    let fixture = HostFixture::spawn(Mode::Reject, "refused");
     let mut sink = sink_for("regolith-campaign-reject");
     let mut runtime = CampaignRuntime::launch(fixture.config("refused"), crate_seed());
 
@@ -502,7 +519,7 @@ fn a_refused_join_never_proceeds_as_if_local() {
 
 #[test]
 fn a_slot_mismatch_is_a_named_failure() {
-    let fixture = HostFixture::spawn(Mode::WrongSlot);
+    let fixture = HostFixture::spawn(Mode::WrongSlot, "slotless");
     let sink = sink_for("regolith-campaign-slot");
     let mut runtime = CampaignRuntime::launch(fixture.config("slotless"), crate_seed());
 

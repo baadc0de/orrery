@@ -116,6 +116,11 @@ pub fn run(run: &ExternalRun) -> Result<()> {
 
     let request = crate::exterior::JoinRequest {
         client_rev: env!("P1_SWARM_COMMIT").to_owned(),
+        // The headless runner carries no campaign identity and always ships
+        // its anchor when the host is witnessing; the rendered client is the
+        // peer that declares otherwise (#387).
+        session_id: String::new(),
+        ships_anchor: true,
     };
     let remote_link = rt.block_on(bridge::remote_join(
         &endpoint,
