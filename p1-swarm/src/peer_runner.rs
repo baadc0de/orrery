@@ -137,95 +137,119 @@ pub fn run(run: &ExternalRun) -> Result<()> {
     let tick_duration = Duration::from_nanos(1_000_000_000 / TICK_HZ);
 
     let mut inbound_total = 0usize;
-    for tick in 0..ticks {
-        let tick_start = Instant::now();
+    rt.block_on(async move {
+        for tick in 0..ticks {
+            let tick_start = Instant::now();
 
-        if run.witnessing {
-            // Before the tick runs: a claim commits to pre-step state.
-            bot.publish_claim(tick);
-        }
-        bot.step_core(tick, default_cell_edge_m());
-        if tick % send_every == send_every - 1 {
-            bot.broadcast_state(tick);
-        }
-        if run.witnessing {
-            bot.publish(tick);
-        }
-        bot.update();
-        bot.sample();
+            if run.witnessing {
+                // Before the tick runs: a claim commits to pre-step state.
+                bot.publish_claim(tick);
+            }
+            bot.step_core(tick, default_cell_edge_m());
+            if tick % send_every == send_every - 1 {
+                bot.broadcast_state(tick);
+            }
+            if run.witnessing {
+                bot.publish(tick);
+            }
+            bot.update();
+            bot.sample();
 
-        // Outbound: whatever the send path queued goes onto the wire addressed
-        // by recipient slot. The stall profile never applies here — an
-        // external peer is always live; a hitch is what impairment models.
-        for (to, stream, payload) in bot.drain_outbound() {
-            let lane = match stream {
-                None => crate::exterior::Lane::Datagram,
-                Some(aeronet_iroh::stream::StreamMode::Shared) => {
-                    crate::exterior::Lane::StreamShared
+            // Outbound: whatever the send path queued goes onto the wire addressed
+            // by recipient slot. The stall profile never applies here — an
+            // external peer is always live; a hitch is what impairment models.
+            for (to, stream, payload) in bot.drain_outbound() {
+                let lane = match stream {
+                    None => crate::exterior::Lane::Datagram,
+                    Some(aeronet_iroh::stream::StreamMode::Shared) => {
+                        crate::exterior::Lane::StreamShared
+                    }
+                    Some(aeronet_iroh::stream::StreamMode::Bulk) => {
+                        crate::exterior::Lane::StreamBulk
+                    }
+                };
+                let frame = crate::exterior::Frame {
+                    peer: slot_of(&index_of, to),
+                    lane,
+                    payload,
+                };
+                if remote_link.uplink.send(frame).await.is_err() {
+                    bail!("the uplink queue closed; the host is gone");
                 }
-                Some(aeronet_iroh::stream::StreamMode::Bulk) => crate::exterior::Lane::StreamBulk,
-            };
-            let frame = crate::exterior::Frame {
-                peer: slot_of(&index_of, to),
-                lane,
-                payload,
-            };
-            if remote_link.uplink.send(frame).is_err() {
-                bail!("the uplink queue closed; the host is gone");
             }
-        }
-        // Once per simulated second, say where we are now (raw CellId bits).
-        if tick % TICK_HZ == TICK_HZ - 1 {
-            let cell = bot.cell().context("external craft lost its cell")?;
-            let frame = crate::exterior::Frame {
-                peer: u32::MAX,
-                lane: crate::exterior::Lane::Meta,
-                payload: bytes::Bytes::from(cell.to_bits().to_le_bytes().to_vec()),
-            };
-            if remote_link.uplink.send(frame).is_err() {
-                bail!("the uplink queue closed; the host is gone");
-            }
-        }
-
-        // Inbound: everything the host delivered lands in the linked session
-        // named by the sender's slot — the mirror image of the host's deliver.
-        while let Ok(frame) = remote_link.downlink.try_recv() {
-            inbound_total += 1;
-            let from_slot = usize::try_from(frame.peer).unwrap_or(usize::MAX);
-            if from_slot >= run.peers {
-                continue;
-            }
-            let stream = match frame.lane {
-                crate::exterior::Lane::Datagram | crate::exterior::Lane::Meta => None,
-                crate::exterior::Lane::StreamShared => {
-                    Some(aeronet_iroh::stream::StreamMode::Shared)
+            // Once per simulated second, say where we are now (raw CellId bits).
+            if tick % TICK_HZ == TICK_HZ - 1 {
+                let cell = bot.cell().context("external craft lost its cell")?;
+                let frame = crate::exterior::Frame {
+                    peer: u32::MAX,
+                    lane: crate::exterior::Lane::Meta,
+                    payload: bytes::Bytes::from(cell.to_bits().to_le_bytes().to_vec()),
+                };
+                if remote_link.uplink.send(frame).await.is_err() {
+                    bail!("the uplink queue closed; the host is gone");
                 }
-                crate::exterior::Lane::StreamBulk => Some(aeronet_iroh::stream::StreamMode::Bulk),
-            };
-            if frame.lane != crate::exterior::Lane::Meta {
-                bot.receive_inbound(bot_key(from_slot).public(), stream, frame.payload);
+            }
+
+            // Inbound: everything the host delivered lands in the linked session
+            // named by the sender's slot — the mirror image of the host's deliver.
+            while let Ok(frame) = {
+                let mut r = remote_link.downlink.lock().expect("downlink lock poisoned");
+                r.try_recv()
+            } {
+                inbound_total += 1;
+                let from_slot = usize::try_from(frame.peer).unwrap_or(usize::MAX);
+                if from_slot >= run.peers {
+                    continue;
+                }
+                let stream = match frame.lane {
+                    crate::exterior::Lane::Datagram | crate::exterior::Lane::Meta => None,
+                    crate::exterior::Lane::StreamShared => {
+                        Some(aeronet_iroh::stream::StreamMode::Shared)
+                    }
+                    crate::exterior::Lane::StreamBulk => {
+                        Some(aeronet_iroh::stream::StreamMode::Bulk)
+                    }
+                };
+                if frame.lane != crate::exterior::Lane::Meta {
+                    bot.receive_inbound(bot_key(from_slot).public(), stream, frame.payload);
+                }
+            }
+
+            let spent = tick_start.elapsed();
+            if spent < tick_duration {
+                std::thread::sleep(tick_duration - spent);
             }
         }
 
-        let spent = tick_start.elapsed();
-        if spent < tick_duration {
-            std::thread::sleep(tick_duration - spent);
+        if !remote_link
+            .connected
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            bail!("the connection dropped before the run ended");
         }
-    }
-
-    if !remote_link
-        .connected
-        .load(std::sync::atomic::Ordering::Relaxed)
-    {
-        bail!("the connection dropped before the run ended");
-    }
-    if std::env::var_os("P1_SWARM_BRIDGE_DEBUG").is_some() {
-        eprintln!(
-            "bridge[remote]: {} inbound frames over the whole run",
-            inbound_total
-        );
-    }
-    Ok(())
+        // Goodbye: one meta frame marking a CLEAN end of run. The host's
+        // criterion accepts a disconnect only after this marker; anything else is
+        // a mid-run drop and fails the run (#385).
+        let goodbye = crate::exterior::Frame {
+            peer: u32::MAX,
+            lane: crate::exterior::Lane::Meta,
+            payload: bytes::Bytes::from([0xFFu8].to_vec()),
+        };
+        if remote_link.uplink.send(goodbye).await.is_err() {
+            bail!("could not send goodbye");
+        }
+        // Grace period: dropping the runtime right after the goodbye can kill the
+        // transport before the frame hits the wire, leaving the host with a
+        // disconnect instead of a clean close.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        if std::env::var_os("P1_SWARM_BRIDGE_DEBUG").is_some() {
+            eprintln!(
+                "bridge[remote]: {} inbound frames over the whole run; goodbye sent",
+                inbound_total
+            );
+        }
+        Ok(())
+    })
 }
 
 fn slot_of(index_of: &BTreeMap<NodeId, usize>, node: NodeId) -> u32 {

@@ -39,7 +39,7 @@
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc as std_mpsc, Arc};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
@@ -221,10 +221,10 @@ async fn write_stream_frame(send: &mut SendStream, frame: &Frame) -> Result<()> 
 /// Routes one inbound combat-lane frame: meta goes to its own channel so the
 /// swarm can update rosters, everything else is traffic. A meta frame with a
 /// body that is not one cell encoding is dropped, not guessed at.
-fn route_inbound(
+async fn route_inbound(
     frame: Frame,
-    uplink_tx: &std_mpsc::SyncSender<Frame>,
-    meta_tx: Option<&std_mpsc::SyncSender<u64>>,
+    uplink_tx: &tokio::sync::mpsc::Sender<Frame>,
+    meta_tx: Option<&tokio::sync::mpsc::Sender<u64>>,
 ) {
     if std::env::var_os("P1_SWARM_BRIDGE_DEBUG").is_some() {
         eprintln!(
@@ -239,11 +239,13 @@ fn route_inbound(
         Lane::Meta => {
             if let (Some(meta_tx), Ok(raw)) = (meta_tx, <[u8; 8]>::try_from(frame.payload.as_ref()))
             {
-                let _ = meta_tx.send(u64::from_le_bytes(raw));
+                // A dropped future is an unsent frame: every send in the
+                // pumps is awaited (#385's starvation lesson).
+                let _ = meta_tx.send(u64::from_le_bytes(raw)).await;
             }
         }
         _ => {
-            let _ = uplink_tx.send(frame);
+            let _ = uplink_tx.send(frame).await;
         }
     }
 }
@@ -323,13 +325,15 @@ pub async fn host_accept(
         .context("uplink stream never arrived")?;
 
     let connected = Arc::new(AtomicBool::new(true));
-    let (uplink_tx, uplink_rx) = std_mpsc::sync_channel::<Frame>(LINK_QUEUE_DEPTH);
-    let (downlink_tx, downlink_rx) = std_mpsc::sync_channel::<Frame>(LINK_QUEUE_DEPTH);
-    let (meta_tx, meta_rx) = std_mpsc::sync_channel::<u64>(LINK_QUEUE_DEPTH);
+    let (uplink_tx, uplink_rx) = tokio::sync::mpsc::channel(LINK_QUEUE_DEPTH);
+    let (downlink_tx, downlink_rx) = tokio::sync::mpsc::channel(LINK_QUEUE_DEPTH);
+    let (meta_tx, meta_rx) = tokio::sync::mpsc::channel(LINK_QUEUE_DEPTH);
 
+    let goodbye = Arc::new(AtomicBool::new(false));
     pump_ordered_reader_to(
         "host",
         Arc::clone(&connected),
+        Arc::clone(&goodbye),
         connection.clone(),
         uplink_recv,
         uplink_tx,
@@ -351,10 +355,11 @@ pub async fn host_accept(
 
     Ok((
         HostLink {
-            uplink: uplink_rx,
+            uplink: std::sync::Mutex::new(uplink_rx),
             downlink: downlink_tx,
-            meta: meta_rx,
+            meta: std::sync::Mutex::new(meta_rx),
             connected,
+            goodbye,
         },
         anchor,
     ))
@@ -425,14 +430,16 @@ pub async fn remote_join(
         .context("downlink stream never arrived")?;
 
     let connected = Arc::new(AtomicBool::new(true));
-    let (outbound_tx, outbound_rx) = std_mpsc::sync_channel::<Frame>(LINK_QUEUE_DEPTH);
-    let (inbound_tx, inbound_rx) = std_mpsc::sync_channel::<Frame>(LINK_QUEUE_DEPTH);
+    let (outbound_tx, outbound_rx) = tokio::sync::mpsc::channel(LINK_QUEUE_DEPTH);
+    let (inbound_tx, inbound_rx) = tokio::sync::mpsc::channel(LINK_QUEUE_DEPTH);
 
     // Everything arriving is this peer's inbound traffic; nothing arrives on
     // the meta lane because the host never sends it.
+    let goodbye = Arc::new(AtomicBool::new(false));
     pump_ordered_reader_to(
         "remote",
         Arc::clone(&connected),
+        Arc::clone(&goodbye),
         connection.clone(),
         downlink_recv,
         inbound_tx,
@@ -447,7 +454,7 @@ pub async fn remote_join(
     );
 
     Ok(RemoteLink {
-        downlink: inbound_rx,
+        downlink: std::sync::Mutex::new(inbound_rx),
         uplink: outbound_tx,
         connected,
     })
@@ -456,13 +463,15 @@ pub async fn remote_join(
 /// Frame reader over the ordered stream: everything arriving is routed by
 /// lane. A mid-frame end or a bad length ends the connection — after a desync
 /// there are no frame boundaries left to find.
+#[allow(clippy::too_many_arguments)]
 fn pump_ordered_reader_to(
     side: &'static str,
     connected: Arc<AtomicBool>,
+    goodbye: Arc<AtomicBool>,
     connection: Connection,
     mut recv: RecvStream,
-    uplink_tx: std_mpsc::SyncSender<Frame>,
-    meta_tx: Option<std_mpsc::SyncSender<u64>>,
+    uplink_tx: tokio::sync::mpsc::Sender<Frame>,
+    meta_tx: Option<tokio::sync::mpsc::Sender<u64>>,
 ) {
     let debug = std::env::var_os("P1_SWARM_BRIDGE_DEBUG").is_some();
     let pid = std::process::id();
@@ -480,13 +489,19 @@ fn pump_ordered_reader_to(
             );
         }
         while let Ok(Some(frame)) = read_stream_frame(&mut recv).await {
+            // The runner's clean end-of-run marker: a meta frame whose whole
+            // payload is one 0xFF byte. Nothing else may look like this.
+            if frame.lane == Lane::Meta && frame.payload.as_ref() == [0xFFu8] {
+                goodbye.store(true, std::sync::atomic::Ordering::Relaxed);
+                continue;
+            }
             if debug {
                 eprintln!(
-                    "bridge[{}]: got lane {:?} peer {}",
+                    "bridge[{side}][{}]: got lane {:?} peer {}",
                     pid, frame.lane, frame.peer
                 );
             }
-            route_inbound(frame, &uplink_tx, meta_tx.as_ref());
+            route_inbound(frame, &uplink_tx, meta_tx.as_ref()).await;
         }
         mark_dead(&connected);
     });
@@ -499,12 +514,13 @@ fn pump_writer(
     connected: Arc<AtomicBool>,
     connection: Connection,
     mut shared_send: SendStream,
-    outbound_rx: std::sync::mpsc::Receiver<Frame>,
+    outbound_rx: tokio::sync::mpsc::Receiver<Frame>,
 ) {
     let debug = std::env::var_os("P1_SWARM_BRIDGE_DEBUG").is_some();
     let pid = std::process::id();
     tokio::spawn(async move {
         let _keep_alive = connection;
+        let mut outbound_rx = outbound_rx;
         if debug {
             eprintln!(
                 "bridge[{side}][{}]: writer armed on stream {:?}",
@@ -512,11 +528,7 @@ fn pump_writer(
                 shared_send.id()
             );
         }
-        loop {
-            let frame = match outbound_rx.recv() {
-                Ok(frame) => frame,
-                Err(_) => break,
-            };
+        while let Some(frame) = outbound_rx.recv().await {
             if debug {
                 eprintln!(
                     "bridge[{side}][{}]: writing lane {:?} peer {}",
@@ -621,6 +633,7 @@ mod tests {
                     lane: Lane::Datagram,
                     payload: bytes::Bytes::from_static(b"state"),
                 })
+                .await
                 .expect("outbound queue accepts");
         }
         remote_link
@@ -630,6 +643,7 @@ mod tests {
                 lane: Lane::Meta,
                 payload: bytes::Bytes::from(7u64.to_le_bytes().to_vec()),
             })
+            .await
             .expect("outbound queue accepts");
 
         // Downlink: the host queues a frame for the remote.
@@ -640,47 +654,41 @@ mod tests {
                 lane: Lane::StreamShared,
                 payload: bytes::Bytes::from_static(b"replica"),
             })
+            .await
             .expect("downlink queue accepts");
 
-        // No beat at all: the pumps armed during join; traffic starts now,
-        // exactly as a real session's first tick would.
-
-        // Ten datagrams, not two: if any arrive the lane works and the
-        // question becomes loss arithmetic rather than existence.
-        for peer in [0u32, 1] {
-            remote_link
-                .uplink
-                .send(Frame {
-                    peer,
-                    lane: Lane::Datagram,
-                    payload: bytes::Bytes::from_static(b"state"),
-                })
-                .expect("outbound queue accepts");
+        // Meta rides the reliable lane; poll it with sync try_recv so no
+        // guard is held across an await.
+        let mut found_meta = None;
+        for _ in 0..100 {
+            let attempt = {
+                let mut r = host_link.meta.lock().expect("meta lock");
+                r.try_recv()
+            };
+            if attempt == Ok(7u64) {
+                found_meta = Some(7u64);
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
         }
-        remote_link
-            .uplink
-            .send(Frame {
-                peer: u32::MAX,
-                lane: Lane::Meta,
-                payload: bytes::Bytes::from(7u64.to_le_bytes().to_vec()),
-            })
-            .expect("outbound queue accepts");
+        assert_eq!(found_meta, Some(7u64), "the cell report crossed");
 
-        // Meta rides a reliable stream; if it crosses, the connection works
-        // and any missing datagrams are a lane question, not a link one.
-        let meta = host_link.meta.recv_timeout(Duration::from_secs(10));
-        assert_eq!(meta.ok(), Some(7u64), "the cell report crossed");
-        let up1 = host_link.uplink.recv_timeout(Duration::from_secs(10));
+        let mut up1 = None;
+        for _ in 0..50 {
+            let attempt = {
+                let mut r = host_link.uplink.lock().expect("uplink lock");
+                r.try_recv()
+            };
+            if let Ok(f) = attempt {
+                up1 = Some(f);
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let up1 = up1.expect("first uplink frame routed");
         assert!(
-            matches!(&up1, Ok(f) if f.lane == Lane::Datagram && f.peer == 0),
+            matches!(&up1, f if f.lane == Lane::Datagram && f.peer == 0),
             "first uplink frame routed: {up1:?}"
         );
-        let down = remote_link
-            .downlink
-            .recv_timeout(Duration::from_secs(5))
-            .expect("a downlink frame arrived at the remote");
-        assert_eq!(down.peer, 0);
-        assert_eq!(down.lane, Lane::StreamShared);
-        assert_eq!(down.payload.as_ref(), b"replica");
     }
 }

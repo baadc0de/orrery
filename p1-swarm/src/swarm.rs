@@ -1,7 +1,7 @@
 //! The swarm: N bots, a router between them, and the criterion they must meet.
 
 use std::collections::BTreeMap;
-use std::sync::mpsc as std_mpsc;
+use std::sync::Arc;
 
 use bytes::Bytes;
 use serde::Serialize;
@@ -256,6 +256,8 @@ pub struct RunIdentity {
 pub struct ExteriorReport {
     /// The swarm slot the external peer occupied.
     pub index: usize,
+    /// Whether the runner's clean end-of-run marker arrived.
+    pub said_goodbye: bool,
     /// Whether the bridge believed the connection was alive at report time.
     pub connected: bool,
     /// Frames forwarded from the remote into the router.
@@ -542,6 +544,9 @@ pub struct ExteriorSlot {
     downlink_frames: u64,
     /// Downlink frames refused on a full queue.
     downlink_dropped: u64,
+    /// True once the runner's clean end-of-run marker arrived. Shared with
+    /// the bridge's reader task, which is what sees the marker first.
+    pub goodbye: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl ExteriorSlot {
@@ -561,8 +566,10 @@ impl ExteriorSlot {
         };
         match self.link.downlink.try_send(frame) {
             Ok(()) => self.downlink_frames += 1,
-            Err(std_mpsc::TrySendError::Full(_)) => self.downlink_dropped += 1,
-            Err(std_mpsc::TrySendError::Disconnected(_)) => {
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                self.downlink_dropped += 1;
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
                 self.link
                     .connected
                     .store(false, std::sync::atomic::Ordering::Relaxed);
@@ -578,9 +585,25 @@ impl ExteriorSlot {
     /// whole point of the bridge (#385's module docs).
     fn pump_uplink(&mut self, tick: u64, router: &mut Router) {
         let debug = std::env::var_os("P1_SWARM_BRIDGE_DEBUG").is_some();
-        while let Ok(frame) = self.link.uplink.try_recv() {
+        if debug && tick.is_multiple_of(60) {
+            eprintln!(
+                "bridge[host][{}]: pump_uplink tick {}",
+                std::process::id(),
+                tick
+            );
+        }
+        while let Ok(frame) = {
+            let mut r = self.link.uplink.lock().expect("uplink lock");
+            r.try_recv()
+        } {
             if debug && self.uplink_frames == 0 {
                 eprintln!("bridge[host]: first uplink frame routed into the router");
+            }
+            // GOODBYE sentinel: the runner's clean end-of-run marker.
+            if frame.payload.as_ref() == [0xFFu8] {
+                self.goodbye
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                continue;
             }
             match frame.lane {
                 Lane::Meta => {
@@ -720,6 +743,7 @@ impl Swarm {
         let cell = crate::bot::cell_of(start_grid);
         let entity = PersistId::new(index as u64 + 1);
         self.index_of.insert(node, index);
+        let goodbye_flag = link.goodbye.clone();
         self.exterior = Some(ExteriorSlot {
             index,
             node,
@@ -730,6 +754,7 @@ impl Swarm {
             uplink_frames: 0,
             downlink_frames: 0,
             downlink_dropped: 0,
+            goodbye: goodbye_flag,
         });
         // One more sample bucket than bots; the exterior's own upload is not
         // measured host-side (slice 3's problem), so it stays empty and is
@@ -812,7 +837,10 @@ impl Swarm {
         // Pump the exterior's meta frames first, so today's roster carries the
         // cell it just reported rather than yesterday's.
         if let Some(exterior) = &mut self.exterior {
-            while let Ok(raw) = exterior.link.meta.try_recv() {
+            while let Ok(raw) = {
+                let mut r = exterior.link.meta.lock().expect("meta lock");
+                r.try_recv()
+            } {
                 exterior.set_cell_from_bits(raw);
             }
         }
@@ -1321,6 +1349,7 @@ impl Swarm {
                 uplink_frames: exterior.uplink_frames,
                 downlink_frames: exterior.downlink_frames,
                 downlink_dropped: exterior.downlink_dropped,
+                said_goodbye: exterior.goodbye.load(std::sync::atomic::Ordering::Relaxed),
             }),
             player_hours: self.total_peers() as f64 * self.config.seconds as f64 / 3_600.0,
             total_gaps: per_peer.iter().map(|p| p.gaps).sum(),
@@ -1610,7 +1639,8 @@ impl SwarmReport {
         // would otherwise bank its player-hour while measuring nothing — the
         // exact shape #375 exists to refuse.
         if let Some(external) = &self.external {
-            if !external.connected {
+            let clean_close = external.connected || external.said_goodbye;
+            if !clean_close {
                 failures.push(CriterionFailure {
                     clause: "the external peer stays connected",
                     detail: format!(
@@ -2265,7 +2295,7 @@ mod tests {
         // and stopped where a malformed packet should.
         remote_link
             .uplink
-            .send(Frame {
+            .try_send(Frame {
                 peer: 0,
                 lane: Lane::Datagram,
                 payload: bytes::Bytes::from_static(b"not a canonical craft"),
@@ -2293,10 +2323,19 @@ mod tests {
             bytes::Bytes::from_static(b"state for you"),
         );
         swarm.deliver(9);
-        let downlink = remote_link
-            .downlink
-            .recv_timeout(std::time::Duration::from_secs(1))
-            .expect("a routed packet landed on the downlink");
+        let mut downlink = None;
+        for _ in 0..50 {
+            let attempt = {
+                let mut r = remote_link.downlink.lock().expect("downlink lock");
+                r.try_recv()
+            };
+            if let Ok(frame) = attempt {
+                downlink = Some(frame);
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let downlink = downlink.expect("a routed packet landed on the downlink");
         assert_eq!(downlink.peer, 0, "downlink frames name the sender's slot");
         assert_eq!(downlink.lane, Lane::Datagram);
 
@@ -2307,7 +2346,7 @@ mod tests {
         ));
         remote_link
             .uplink
-            .send(crate::exterior::Frame {
+            .try_send(crate::exterior::Frame {
                 peer: u32::MAX,
                 lane: Lane::Meta,
                 payload: bytes::Bytes::from(moved.to_bits().to_le_bytes().to_vec()),
@@ -2319,7 +2358,10 @@ mod tests {
             exterior.pump_uplink(0, &mut swarm.router);
         }
         if let Some(exterior) = &mut swarm.exterior {
-            while let Ok(raw) = exterior.link.meta.try_recv() {
+            while let Ok(raw) = {
+                let mut r = exterior.link.meta.lock().expect("meta lock");
+                r.try_recv()
+            } {
                 exterior.set_cell_from_bits(raw);
             }
             assert_eq!(exterior.cell(), moved, "meta updated the roster cell");

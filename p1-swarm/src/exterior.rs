@@ -49,7 +49,7 @@
 
 use bytes::{BufMut, Bytes, BytesMut};
 use std::sync::atomic::AtomicBool;
-use std::sync::{mpsc as std_mpsc, Arc};
+use std::sync::Arc;
 
 /// `std::sync::mpsc`, named so call sites read as deliberately std rather than
 /// accidentally unqualified.
@@ -168,16 +168,21 @@ pub fn decode_frame(buf: &mut BytesMut) -> Result<Option<Frame>, FrameError> {
 /// [`PeerLink::connected`]. Bounded queues mean backpressure is visible — a
 /// full downlink queue is counted as drops by the host rather than silently
 /// buffering unbounded.
+/// The channels are tokio's: the pumps are async tasks, and a blocking
+/// `std` recv inside one parks a worker thread instead of yielding - the
+/// exact bug class that made spawned pump writes vanish (#385).
 #[derive(Debug)]
 pub struct HostLink {
     /// Frames arriving from the remote peer.
-    pub uplink: std_mpsc::Receiver<Frame>,
+    pub uplink: std::sync::Mutex<tokio::sync::mpsc::Receiver<Frame>>,
     /// Frames queued for delivery to the remote peer.
-    pub downlink: std_mpsc::SyncSender<Frame>,
+    pub downlink: tokio::sync::mpsc::Sender<Frame>,
     /// Cell updates carried on the meta lane, oldest first.
-    pub meta: std_mpsc::Receiver<u64>,
+    pub meta: std::sync::Mutex<tokio::sync::mpsc::Receiver<u64>>,
     /// False for as long as the pump believes the connection is alive.
     pub connected: Arc<std::sync::atomic::AtomicBool>,
+    /// Set by the reader when the runner's clean end-of-run marker arrived.
+    pub goodbye: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// The remote-side mirror of [`HostLink`]: same queues, opposite directions.
@@ -188,9 +193,9 @@ pub struct HostLink {
 #[derive(Debug)]
 pub struct RemoteLink {
     /// Frames arriving from the host.
-    pub downlink: std_mpsc::Receiver<Frame>,
+    pub downlink: std::sync::Mutex<tokio::sync::mpsc::Receiver<Frame>>,
     /// Frames queued for transmission to the host, meta included.
-    pub uplink: std_mpsc::SyncSender<Frame>,
+    pub uplink: tokio::sync::mpsc::Sender<Frame>,
     /// False for as long as the pump believes the connection is alive.
     pub connected: Arc<std::sync::atomic::AtomicBool>,
 }
@@ -206,19 +211,21 @@ pub const LINK_QUEUE_DEPTH: usize = 4_096;
 /// pumps in the binaries are the only code that needs tokio.
 #[must_use]
 pub fn link_pair() -> (HostLink, RemoteLink) {
-    let (uplink_tx, uplink_rx) = std_mpsc::sync_channel(LINK_QUEUE_DEPTH);
-    let (downlink_tx, downlink_rx) = std_mpsc::sync_channel(LINK_QUEUE_DEPTH);
-    let (_, meta_rx) = std::sync::mpsc::sync_channel(LINK_QUEUE_DEPTH);
+    let (uplink_tx, uplink_rx) = tokio::sync::mpsc::channel(LINK_QUEUE_DEPTH);
+    let (downlink_tx, downlink_rx) = tokio::sync::mpsc::channel(LINK_QUEUE_DEPTH);
+    let (_, meta_rx) = tokio::sync::mpsc::channel(LINK_QUEUE_DEPTH);
     let connected = Arc::new(AtomicBool::new(true));
+    let goodbye = Arc::new(AtomicBool::new(false));
     (
         HostLink {
-            uplink: uplink_rx,
+            uplink: std::sync::Mutex::new(uplink_rx),
             downlink: downlink_tx,
-            meta: meta_rx,
+            meta: std::sync::Mutex::new(meta_rx),
             connected: Arc::clone(&connected),
+            goodbye: Arc::clone(&goodbye),
         },
         RemoteLink {
-            downlink: downlink_rx,
+            downlink: std::sync::Mutex::new(downlink_rx),
             uplink: uplink_tx,
             // The remote's own cell reports ride its uplink as Meta frames;
             // this channel would only exist for a symmetry nobody uses.
