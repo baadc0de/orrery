@@ -1,12 +1,14 @@
 //! The swarm: N bots, a router between them, and the criterion they must meet.
 
 use std::collections::BTreeMap;
+use std::sync::mpsc as std_mpsc;
 
 use bytes::Bytes;
 use serde::Serialize;
 
 use orrery_core::CoreCodec;
 use orrery_games::game::Tamper;
+use orrery_games::regolith::state::RegolithState;
 use orrery_games::regolith::{pilot::PILOT_SCENARIOS, REGOLITH_RULESET};
 use orrery_net::channels::{encode_replication, Channel};
 use orrery_net::peer_link::{SendPacket, StreamMode};
@@ -15,7 +17,7 @@ use orrery_protocol::{CellId, NodeId, PersistId, UniverseSeed, MAX_ADJUDICATION_
 
 use crate::adjudicate::{Adjudicator, Docket};
 use crate::bot::{Bot, BotSpec, TICK_HZ};
-use aeronet_iroh::stream::{IrohStreamIo, RecvMessage};
+use crate::exterior::{Frame, Lane};
 
 use crate::router::{Impairment, Router, RouterCounters};
 
@@ -251,6 +253,22 @@ pub struct RunIdentity {
     pub commit: &'static str,
 }
 
+/// What the host observed about the external peer over one run (#385).
+#[derive(Debug, Clone, Serialize)]
+pub struct ExteriorReport {
+    /// The swarm slot the external peer occupied.
+    pub index: usize,
+    /// Whether the bridge believed the connection was alive at report time.
+    pub connected: bool,
+    /// Frames forwarded from the remote into the router.
+    pub uplink_frames: u64,
+    /// Frames queued for the remote out of router deliveries.
+    pub downlink_frames: u64,
+    /// Downlink frames refused because the queue was full. Zero at criterion
+    /// rates; non-zero means the pump fell behind the swarm's clock.
+    pub downlink_dropped: u64,
+}
+
 /// The whole run.
 #[derive(Debug, Clone, Serialize)]
 pub struct SwarmReport {
@@ -298,6 +316,8 @@ pub struct SwarmReport {
     pub total_replicas: usize,
     /// Whether the witness pipeline ran.
     pub witnessing: bool,
+    /// What the external peer did, when one joined (#385).
+    pub external: Option<ExteriorReport>,
     /// Player-hours accumulated: peers times simulated seconds.
     pub player_hours: f64,
     /// Chain gaps detected across the swarm — expected under loss.
@@ -487,10 +507,125 @@ pub struct Swarm {
     samples: Vec<Vec<u64>>,
     /// NodeId → swarm index, for routing.
     index_of: BTreeMap<NodeId, usize>,
+    /// The connected external peer, when the run has one (#385).
+    exterior: Option<ExteriorSlot>,
     /// The in-process cluster that re-runs filed reports.
     adjudicator: Adjudicator,
     /// Every verdict it reached.
     docket: Docket,
+}
+
+/// One joined external peer, as far as the host ever knows it.
+///
+/// Deliberately less than a [`Bot`]: no executor, no Bevy app, no pilot. The
+/// remote process owns all of that; the host holds only what routing and
+/// witnessing require — where to send its traffic, what it committed to at
+/// tick zero, and which cell it last said it was in.
+pub struct ExteriorSlot {
+    /// The swarm slot this peer occupies: always `bots.len()`.
+    pub index: usize,
+    /// Transport identity, verified against the dial at join time.
+    pub node: NodeId,
+    /// The entity id derived from the slot, exactly as a bot's is.
+    pub entity: PersistId,
+    /// The interest cell from the slot's deterministic spawn pose. Updated by
+    /// meta frames as the peer moves; starts honest by construction because
+    /// both sides derive the pose from the slot alone (`bot::spawn_pose`).
+    cell: CellId,
+    /// The tick-zero claim the peer shipped after joining, with the state it
+    /// commits to — what watchers arm against instead of reading a local
+    /// `Chain`. Present exactly when witnessing is on.
+    pub anchor: Option<(orrery_protocol::StateClaim, RegolithState)>,
+    /// Queues to and from the connection pump.
+    pub link: crate::exterior::HostLink,
+    /// Frames forwarded up, for the report.
+    uplink_frames: u64,
+    /// Frames queued down, for the report.
+    downlink_frames: u64,
+    /// Downlink frames refused on a full queue.
+    downlink_dropped: u64,
+}
+
+impl ExteriorSlot {
+    /// Queues one router delivery for the remote, naming its sender's slot.
+    fn deliver_from(&mut self, from: usize, stream: Option<StreamMode>, payload: Bytes) {
+        let lane = match stream {
+            None => Lane::Datagram,
+            Some(StreamMode::Shared) => Lane::StreamShared,
+            Some(StreamMode::Bulk) => Lane::StreamBulk,
+        };
+        // Downlink frames name their sender: that is the index the remote
+        // needs to pick the right linked session (see `exterior`'s docs).
+        let frame = Frame {
+            peer: u32::try_from(from).unwrap_or(u32::MAX),
+            lane,
+            payload,
+        };
+        match self.link.downlink.try_send(frame) {
+            Ok(()) => self.downlink_frames += 1,
+            Err(std_mpsc::TrySendError::Full(_)) => self.downlink_dropped += 1,
+            Err(std_mpsc::TrySendError::Disconnected(_)) => {
+                self.link
+                    .connected
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// Forwards every queued uplink frame into the router, and meta frames
+    /// into this slot's own cell.
+    ///
+    /// Uplink traffic is *impaired like any other*: frames enter through
+    /// `router.accept` at the swarm's own tick, never around it, which is the
+    /// whole point of the bridge (#385's module docs).
+    fn pump_uplink(&mut self, tick: u64, router: &mut Router) {
+        while let Ok(frame) = self.link.uplink.try_recv() {
+            match frame.lane {
+                Lane::Meta => {
+                    // One u64: the sender's current interest cell, raw bits.
+                    if let Ok(raw) = <[u8; 8]>::try_from(frame.payload.as_ref()) {
+                        self.set_cell_from_bits(u64::from_le_bytes(raw));
+                    }
+                    continue;
+                }
+                Lane::Datagram => router.accept(
+                    tick,
+                    self.node,
+                    usize::try_from(frame.peer).unwrap_or(usize::MAX),
+                    frame.payload,
+                ),
+                Lane::StreamShared => router.accept_stream(
+                    tick,
+                    self.node,
+                    usize::try_from(frame.peer).unwrap_or(usize::MAX),
+                    StreamMode::Shared,
+                    frame.payload,
+                ),
+                Lane::StreamBulk => router.accept_stream(
+                    tick,
+                    self.node,
+                    usize::try_from(frame.peer).unwrap_or(usize::MAX),
+                    StreamMode::Bulk,
+                    frame.payload,
+                ),
+            }
+            self.uplink_frames += 1;
+        }
+    }
+
+    /// The cell this peer last reported, for roster broadcasts.
+    fn cell(&self) -> CellId {
+        self.cell
+    }
+
+    /// Records a meta-lane cell report.
+    /// Records a raw meta-lane cell report, refusing encodings that are not
+    /// cells rather than storing them.
+    fn set_cell_from_bits(&mut self, raw: u64) {
+        if let Some(cell) = CellId::from_bits(raw) {
+            self.cell = cell;
+        }
+    }
 }
 
 /// Which swarm indices run the modified build.
@@ -556,7 +691,63 @@ impl Swarm {
             index_of,
             adjudicator: Adjudicator::new(seed),
             docket: Docket::default(),
+            exterior: None,
         }
+    }
+
+    /// Attaches an external peer to this swarm, occupying the next slot.
+    ///
+    /// Must be called before [`Self::run`]: the slot joins at island
+    /// formation, its anchor arms the witnesses, and a run with a peer
+    /// attached paces itself in real time — see `run`.
+    ///
+    /// The non-test caller is the host CLI mode, which lands with the tokio
+    /// bridge in the next commit of #385; until then only the routing test
+    /// drives this.
+    #[allow(dead_code)]
+    #[must_use]
+    pub fn with_external(
+        mut self,
+        node: NodeId,
+        anchor: Option<(orrery_protocol::StateClaim, RegolithState)>,
+        link: crate::exterior::HostLink,
+    ) -> Self {
+        let index = self.bots.len();
+        let (pos, _) = crate::bot::spawn_pose(index, index + 1);
+        let start_grid = crate::bot::grid_of(&pos, self.config.cell_edge_m);
+        let cell = crate::bot::cell_of(start_grid);
+        let entity = PersistId::new(index as u64 + 1);
+        self.index_of.insert(node, index);
+        self.exterior = Some(ExteriorSlot {
+            index,
+            node,
+            entity,
+            cell,
+            anchor,
+            link,
+            uplink_frames: 0,
+            downlink_frames: 0,
+            downlink_dropped: 0,
+        });
+        // One more sample bucket than bots; the exterior's own upload is not
+        // measured host-side (slice 3's problem), so it stays empty and is
+        // never read.
+        self.samples.push(Vec::new());
+        self
+    }
+
+    /// A slot index's transport identity, bots and external alike.
+    fn node_of(&self, index: usize) -> NodeId {
+        match &self.exterior {
+            Some(exterior) if exterior.index == index => exterior.node,
+            _ => self.bots[index].node,
+        }
+    }
+
+    /// Total participants, external peer included: the number the report
+    /// counts as peers and hours.
+    fn total_peers(&self) -> usize {
+        self.bots.len() + usize::from(self.exterior.is_some())
     }
 
     /// Tell every peer which of its island-mates the harness modified.
@@ -582,11 +773,17 @@ impl Swarm {
 
     /// Wire every bot to every other: the mesh regime the criterion runs in.
     fn form_island(&mut self) {
-        let roster: Vec<(NodeId, CellId)> = self
+        let mut roster: Vec<(NodeId, CellId)> = self
             .bots
             .iter_mut()
             .map(|bot| (bot.node, bot.cell().expect("seeded")))
             .collect();
+        // The external peer is an island-mate like any other: it takes the
+        // slot's deterministic spawn pose (`with_external`), so the host knows
+        // its starting cell without asking.
+        if let Some(exterior) = &self.exterior {
+            roster.push((exterior.node, exterior.cell()));
+        }
 
         for bot in &mut self.bots {
             let others: Vec<PeerEntry> = roster
@@ -610,11 +807,21 @@ impl Swarm {
     /// Without it a bot's view of its island-mates' cells freezes at tick zero
     /// and the visibility gate stops reflecting the world.
     fn refresh_rosters(&mut self) {
-        let roster: Vec<(NodeId, CellId)> = self
+        // Pump the exterior's meta frames first, so today's roster carries the
+        // cell it just reported rather than yesterday's.
+        if let Some(exterior) = &mut self.exterior {
+            while let Ok(raw) = exterior.link.meta.try_recv() {
+                exterior.set_cell_from_bits(raw);
+            }
+        }
+        let mut roster: Vec<(NodeId, CellId)> = self
             .bots
             .iter_mut()
             .map(|bot| (bot.node, bot.cell().expect("committed")))
             .collect();
+        if let Some(exterior) = &self.exterior {
+            roster.push((exterior.node, exterior.cell()));
+        }
         for bot in &mut self.bots {
             let others: Vec<PeerEntry> = roster
                 .iter()
@@ -691,6 +898,13 @@ impl Swarm {
 
     /// Drain what each bot's send path handed the IO layer into the router.
     fn collect_sends(&mut self, tick: u64) {
+        // Disjoint field borrows: the exterior pumps into the router directly,
+        // at this same tick, so its traffic is impaired like a bot's.
+        let exterior = self.exterior.as_mut();
+        let router = &mut self.router;
+        if let Some(exterior) = exterior {
+            exterior.pump_uplink(tick, router);
+        }
         for index in 0..self.bots.len() {
             let node = self.bots[index].node;
             if !self.bots[index].profile.is_sending(tick) {
@@ -698,39 +912,10 @@ impl Swarm {
                 // leave — which is what a client stall actually is, and it
                 // leaves the peer's own log intact so it can still answer for
                 // itself when its witnesses come asking.
-                // Both lanes: a client hitch is the socket going unserviced,
-                // and a stalling peer does not get to keep its reliable lane
-                // flowing while its datagrams stop.
-                let world = self.bots[index].app.world_mut();
-                let mut query = world.query::<(
-                    &orrery_net::plugin::Peer,
-                    &mut aeronet_io::Session,
-                    &mut IrohStreamIo,
-                )>();
-                for (_, mut session, mut streams) in query.iter_mut(world) {
-                    session.send.clear();
-                    streams.send.clear();
-                }
+                self.bots[index].stall();
                 continue;
             }
-            let mut outbound: Vec<(NodeId, Option<StreamMode>, Bytes)> = Vec::new();
-            {
-                let world = self.bots[index].app.world_mut();
-                let mut query = world.query::<(
-                    &orrery_net::plugin::Peer,
-                    &mut aeronet_io::Session,
-                    &mut IrohStreamIo,
-                )>();
-                for (peer, mut session, mut streams) in query.iter_mut(world) {
-                    for packet in session.send.drain(..) {
-                        outbound.push((peer.id, None, packet));
-                    }
-                    for message in streams.send.drain(..) {
-                        outbound.push((peer.id, Some(message.mode), message.payload));
-                    }
-                }
-            }
-            for (to, stream, payload) in outbound {
+            for (to, stream, payload) in self.bots[index].drain_outbound() {
                 let Some(target) = self.index_of.get(&to).copied() else {
                     self.router.counters.misaddressed += 1;
                     continue;
@@ -746,29 +931,23 @@ impl Swarm {
     /// Hand every due packet to its recipient's buffer, on the lane it came in on.
     fn deliver(&mut self, tick: u64) {
         for delivery in self.router.deliver_due(tick) {
-            let world = self.bots[delivery.to].app.world_mut();
-            let mut query = world.query::<(
-                &orrery_net::plugin::Peer,
-                &mut aeronet_io::Session,
-                &mut IrohStreamIo,
-            )>();
-            for (peer, mut session, mut streams) in query.iter_mut(world) {
-                if peer.id != delivery.from {
+            if let Some(exterior) = &mut self.exterior {
+                if delivery.to == exterior.index {
+                    let from = self
+                        .index_of
+                        .get(&delivery.from)
+                        .copied()
+                        .unwrap_or(usize::MAX);
+                    exterior.deliver_from(from, delivery.stream, delivery.payload);
                     continue;
                 }
-                if delivery.stream.is_some() {
-                    streams.recv.push(RecvMessage {
-                        payload: delivery.payload,
-                        recv_at: bevy_platform::time::Instant::now(),
-                    });
-                } else {
-                    session.recv.push(aeronet_io::packet::RecvPacket {
-                        payload: delivery.payload,
-                        recv_at: bevy_platform::time::Instant::now(),
-                    });
-                }
-                break;
             }
+            // The router already carries the sender's identity verbatim.
+            self.bots[delivery.to].receive_inbound(
+                delivery.from,
+                delivery.stream,
+                delivery.payload,
+            );
         }
     }
 
@@ -784,74 +963,18 @@ impl Swarm {
         let send_every = (TICK_HZ / self.config.send_hz.max(1)).max(1);
         let mut late_join = None;
 
+        // A run with a connected external peer paces itself in **real time**:
+        // the remote process steps at wall clock — a human plays in real time,
+        // and bankable hours need real connected time — so the host may not
+        // outrun it. Pure-bot runs keep their faster-than-real-time pacing and
+        // every nightly number that depends on it (#385).
+        let real_time = self.exterior.is_some();
+        let tick_duration = std::time::Duration::from_nanos(1_000_000_000 / TICK_HZ);
+
         let mut phase = [0u128; 6];
         for tick in 0..ticks {
-            let mut mark = std::time::Instant::now();
-            if self.config.witnessing {
-                // Before the tick runs: a claim commits to pre-step state.
-                for bot in &mut self.bots {
-                    bot.publish_claim(tick);
-                }
-            }
-            for index in 0..self.bots.len() {
-                self.bots[index].step_core(tick, self.config.cell_edge_m);
-            }
-            phase[0] += mark.elapsed().as_nanos();
-            mark = std::time::Instant::now();
-            // The last tick of each send window, not the first. Broadcasting
-            // at `t` ships the state *after* `t` stepped, which is the state a
-            // claim at `t + 1` commits to — so sending on the window's last
-            // tick is what makes the replicated state and the signed claim the
-            // same object. On the window's first tick the two are one tick
-            // apart forever, and no receiver can check a claim against a state
-            // it was actually sent, which is the corroboration stage 1 and
-            // re-anchoring both rest on. Same cadence and same number of
-            // sends; only the phase moves.
-            if tick % send_every == send_every - 1 {
-                for index in 0..self.bots.len() {
-                    self.broadcast(index, tick);
-                }
-            }
-            if self.config.witnessing {
-                for bot in &mut self.bots {
-                    bot.publish(tick);
-                }
-            }
-            phase[1] += mark.elapsed().as_nanos();
-            mark = std::time::Instant::now();
-            for bot in &mut self.bots {
-                bot.update();
-            }
-            phase[2] += mark.elapsed().as_nanos();
-            mark = std::time::Instant::now();
-            for bot in &mut self.bots {
-                bot.sample();
-                bot.drain_signals();
-            }
-            // Stage 4, in the same tick the report was filed. The cluster is
-            // in-process and believes nothing the reporter said: it checks the
-            // reporter's signature, then re-runs the bundle under the shipping
-            // rules. Adjudicating here rather than at the end of the run is
-            // what makes the *tick* meaningful — the criterion bounds how long
-            // a deviation survives, and a verdict reached in a batch after the
-            // hour would have no time in it at all.
-            //
-            // Unconditional, not gated on `--cheat`: a leg that files nothing
-            // costs nothing here, and gating it would make "an unmodified
-            // swarm files nothing" a clause the harness could not have
-            // observed being broken.
-            for index in 0..self.bots.len() {
-                for report in self.bots[index].drain_reports() {
-                    self.docket.record(&self.adjudicator, &report, tick);
-                }
-            }
-            phase[3] += mark.elapsed().as_nanos();
-            mark = std::time::Instant::now();
-            self.collect_sends(tick);
-            phase[4] += mark.elapsed().as_nanos();
-            mark = std::time::Instant::now();
-            self.deliver(tick);
-            phase[5] += mark.elapsed().as_nanos();
+            let tick_start = std::time::Instant::now();
+            self.tick_once(tick, send_every, &mut phase);
 
             // Once a simulated second, sample each peer's rate and re-publish
             // the roster — the coordinator's manifest cadence.
@@ -865,6 +988,15 @@ impl Swarm {
 
             if self.config.late_join_tick == Some(tick) {
                 late_join = Some(self.check_late_join());
+            }
+
+            // The external run's metronome: hold each tick to its wall-clock
+            // slice so the remote process can keep step. See `real_time` above.
+            if real_time {
+                let spent = tick_start.elapsed();
+                if spent < tick_duration {
+                    std::thread::sleep(tick_duration - spent);
+                }
             }
         }
 
@@ -889,6 +1021,80 @@ impl Swarm {
         self.report(ticks, late_join)
     }
 
+    /// One tick of the swarm, in run order: claims, steps, broadcasts,
+    /// publishes, app updates, samples, adjudication, then the send/deliver
+    /// cycle that carries it all — including the exterior's uplink and
+    /// downlink, when a peer is attached.
+    ///
+    /// Split from [`Self::run`] so tests can drive single ticks against a
+    /// live bridge without committing to a whole simulated hour.
+    fn tick_once(&mut self, tick: u64, send_every: u64, phase: &mut [u128; 6]) {
+        if self.config.witnessing {
+            // Before the tick runs: a claim commits to pre-step state.
+            for bot in &mut self.bots {
+                bot.publish_claim(tick);
+            }
+        }
+        for index in 0..self.bots.len() {
+            self.bots[index].step_core(tick, self.config.cell_edge_m);
+        }
+        let mut mark = std::time::Instant::now();
+        phase[0] += mark.elapsed().as_nanos();
+        // The last tick of each send window, not the first. Broadcasting at
+        // `t` ships the state *after* `t` stepped, which is the state a claim
+        // at `t + 1` commits to — so sending on the window's last tick is what
+        // makes the replicated state and the signed claim the same object. On
+        // the window's first tick the two are one tick apart forever, and no
+        // receiver can check a claim against a state it was actually sent,
+        // which is the corroboration stage 1 and re-anchoring both rest on.
+        // Same cadence and same number of sends; only the phase moves.
+        if tick % send_every == send_every - 1 {
+            for index in 0..self.bots.len() {
+                self.broadcast(index, tick);
+            }
+        }
+        if self.config.witnessing {
+            for bot in &mut self.bots {
+                bot.publish(tick);
+            }
+        }
+        phase[1] += mark.elapsed().as_nanos();
+        mark = std::time::Instant::now();
+        for bot in &mut self.bots {
+            bot.update();
+        }
+        phase[2] += mark.elapsed().as_nanos();
+        mark = std::time::Instant::now();
+        for bot in &mut self.bots {
+            bot.sample();
+            bot.drain_signals();
+        }
+        // Stage 4, in the same tick the report was filed. The cluster is
+        // in-process and believes nothing the reporter said: it checks the
+        // reporter's signature, then re-runs the bundle under the shipping
+        // rules. Adjudicating here rather than at the end of the run is what
+        // makes the *tick* meaningful — the criterion bounds how long a
+        // deviation survives, and a verdict reached in a batch after the hour
+        // would have no time in it at all.
+        //
+        // Unconditional, not gated on `--cheat`: a leg that files nothing
+        // costs nothing here, and gating it would make "an unmodified swarm
+        // files nothing" a clause the harness could not have observed being
+        // broken.
+        for index in 0..self.bots.len() {
+            for report in self.bots[index].drain_reports() {
+                self.docket.record(&self.adjudicator, &report, tick);
+            }
+        }
+        phase[3] += mark.elapsed().as_nanos();
+        mark = std::time::Instant::now();
+        self.collect_sends(tick);
+        phase[4] += mark.elapsed().as_nanos();
+        mark = std::time::Instant::now();
+        self.deliver(tick);
+        phase[5] += mark.elapsed().as_nanos();
+    }
+
     /// Seed every peer's witness set and start it watching.
     ///
     /// Each bot streams its log to at most seven island-mates and watches
@@ -899,7 +1105,11 @@ impl Swarm {
     fn seed_witnesses(&mut self) {
         use orrery_witness::plugin::MAX_WITNESS_LINKS;
 
-        let count = self.bots.len();
+        // The external peer is witnessed exactly like a bot: it holds a slot
+        // in the ring and shipped its tick-zero anchor at join. What nobody
+        // host-side can do is watch *through* it — its own observations live in
+        // its process, and coverage counts what this run's watchers saw.
+        let count = self.bots.len() + usize::from(self.exterior.is_some());
         // Ring assignment: peer i is witnessed by the next `MAX_WITNESS_LINKS`
         // peers around the ring. Deterministic, uniform, and it gives every peer
         // both a witness set and a watch list without a central chooser.
@@ -911,9 +1121,15 @@ impl Swarm {
             })
             .collect();
 
+        let exterior_index = self.exterior.as_ref().map(|exterior| exterior.index);
         // Anchors first: a watcher needs the subject's signed claim and the
         // state it commits to, and both have to be taken before anyone steps.
-        let anchors: Vec<(PersistId, NodeId, orrery_protocol::StateClaim, _)> = (0..count)
+        let mut anchors: Vec<(
+            PersistId,
+            NodeId,
+            orrery_protocol::StateClaim,
+            RegolithState,
+        )> = (0..self.bots.len())
             .map(|index| {
                 let state = self.bots[index].state();
                 let entity = self.bots[index].entity();
@@ -926,13 +1142,39 @@ impl Swarm {
                 (entity, node, anchor, state)
             })
             .collect();
+        if let Some(exterior) = &mut self.exterior {
+            let index = exterior.index;
+            let entity = exterior.entity;
+            let node = exterior.node;
+            match exterior.anchor.take() {
+                Some((claim, state)) => anchors.push((entity, node, claim, state)),
+                None => panic!("witnessing runs need the external peer's tick-zero anchor"),
+            }
+            debug_assert_eq!(index, count - 1, "the exterior takes the last ring slot");
+        }
 
         for (index, witnesses) in sets.iter().enumerate() {
-            let members: Vec<NodeId> = witnesses.iter().map(|w| self.bots[*w].node).collect();
+            let members: Vec<NodeId> = witnesses
+                .iter()
+                .map(|watcher| self.node_of(*watcher))
+                .collect();
+            if Some(index) == exterior_index {
+                // The external peer's witness set travels with it: nothing to
+                // configure host-side. Its authored frames reach these same
+                // watchers through the bridge.
+                continue;
+            }
             self.bots[index].set_witness_set(members);
             // Each of those peers watches this one.
             let (entity, node, anchor, state) = anchors[index].clone();
             for watcher in witnesses {
+                if Some(*watcher) == exterior_index {
+                    // A bot cannot be armed by a remote subject's anchor here —
+                    // but the external peer is not watching anyone either in
+                    // slice 1; both directions of that asymmetry close when the
+                    // rendered client lands (#386).
+                    continue;
+                }
                 self.bots[*watcher].watch(entity, node, anchor.clone(), state.clone());
             }
         }
@@ -1090,7 +1332,7 @@ impl Swarm {
             ruleset_version: REGOLITH_RULESET.version,
             scenarios: PILOT_SCENARIOS.map(|scenario| scenario.name()),
             started_at_unix_secs: self.config.started_at_unix_secs,
-            peers: self.bots.len(),
+            peers: self.total_peers(),
             seconds: self.config.seconds,
             ticks,
             worst_peak_upload_bits: per_peer
@@ -1112,7 +1354,17 @@ impl Swarm {
             total_undecodable: per_peer.iter().map(|p| p.undecodable).sum(),
             total_replicas: per_peer.iter().map(|p| p.replicas).sum(),
             witnessing: self.config.witnessing,
-            player_hours: self.config.peers as f64 * self.config.seconds as f64 / 3_600.0,
+            external: self.exterior.as_ref().map(|exterior| ExteriorReport {
+                index: exterior.index,
+                connected: exterior
+                    .link
+                    .connected
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                uplink_frames: exterior.uplink_frames,
+                downlink_frames: exterior.downlink_frames,
+                downlink_dropped: exterior.downlink_dropped,
+            }),
+            player_hours: self.total_peers() as f64 * self.config.seconds as f64 / 3_600.0,
             total_gaps: per_peer.iter().map(|p| p.gaps).sum(),
             total_false_positives: per_peer.iter().map(|p| p.false_positives).sum(),
             conviction: self.config.cheats.map(|cheats| ConvictionReport {
@@ -1202,7 +1454,7 @@ impl Swarm {
             control_bytes: lanes.control_bytes,
             witness_lane_share: lanes.witness_share(),
             witness_lane_bits_per_sec: {
-                let peer_seconds = self.config.peers as u64 * self.config.seconds.max(1);
+                let peer_seconds = self.total_peers() as u64 * self.config.seconds.max(1);
                 lanes.witness_bytes * 8 / peer_seconds.max(1)
             },
             link: self.router.counters.into(),
@@ -1394,6 +1646,42 @@ impl SwarmReport {
                     MIN_COVERAGE * 100.0,
                 ),
             });
+        }
+        // A run that attached an external peer is only evidence if the peer
+        // stayed joined and traffic actually flowed both ways. A silent slot
+        // would otherwise bank its player-hour while measuring nothing — the
+        // exact shape #375 exists to refuse.
+        if let Some(external) = &self.external {
+            if !external.connected {
+                failures.push(CriterionFailure {
+                    clause: "the external peer stays connected",
+                    detail: format!(
+                        "the bridge reported a disconnect; {} uplink / {} downlink frames \
+                         before it dropped, {} downlink refused on a full queue",
+                        external.uplink_frames, external.downlink_frames, external.downlink_dropped,
+                    ),
+                });
+            }
+            if external.uplink_frames == 0 || external.downlink_frames == 0 {
+                failures.push(CriterionFailure {
+                    clause: "the external peer participates",
+                    detail: format!(
+                        "{} uplink / {} downlink frames moved; an island member that sends \
+                         or receives nothing measures nothing",
+                        external.uplink_frames, external.downlink_frames,
+                    ),
+                });
+            }
+            if external.downlink_dropped > 0 {
+                failures.push(CriterionFailure {
+                    clause: "the host keeps up with its own clock",
+                    detail: format!(
+                        "{} downlink frames were refused on a full queue; the pump fell \
+                         behind the real-time tick",
+                        external.downlink_dropped,
+                    ),
+                });
+            }
         }
         if self.witnessing && self.total_gaps == 0 && self.link.dropped > 0 {
             failures.push(CriterionFailure {
@@ -1604,6 +1892,7 @@ mod tests {
             total_undecodable: 0,
             total_replicas: 992,
             witnessing: true,
+            external: None,
             player_hours: 32.0,
             total_gaps: 13_009,
             total_false_positives: 0,
@@ -1981,5 +2270,94 @@ mod tests {
             serde_json::to_string(&stamped.identity).unwrap(),
             serde_json::to_string(&passing().identity).unwrap()
         );
+    }
+
+    /// The bridge is only worth its name if an exterior slot behaves like a
+    /// bot slot: uplink frames enter the impaired router attributed to the
+    /// external node, downlink frames carry the sender's index, and meta
+    /// updates move the roster cell. Driven through `link_pair` — no sockets,
+    /// no runtime.
+    #[test]
+    fn an_external_slot_routes_like_a_bot_slot() {
+        use crate::bot::{bot_key, grid_of};
+        use crate::exterior::{link_pair, Frame, Lane};
+
+        let peers = 2usize;
+        let mut swarm = Swarm::new(SwarmConfig {
+            peers,
+            seconds: 1,
+            witnessing: false,
+            ..SwarmConfig::default()
+        });
+        // Attach before formation: an island-mate that joins gets a slot in
+        // the roster and a link from every bot, exactly as run() would order
+        // it. Formed first, the bots would have no session to receive on.
+        let ext_index = peers;
+        let ext_node = bot_key(ext_index).public();
+        let (host_link, remote_link) = link_pair();
+        swarm = swarm.with_external(ext_node, None, host_link);
+        swarm.form_island();
+
+        // Up: the remote sends a datagram addressed to bot 0. The bridge must
+        // feed it into the *router* — not around it — so it arrives at bot 0
+        // attributed to the external node, exactly like any peer's traffic.
+        // The payload is deliberately raw bytes with no channel tag: the link
+        // layer counts exactly that as `untagged`, which makes it the cleanest
+        // observable that the frame crossed router → session → receive drain
+        // and stopped where a malformed packet should.
+        remote_link
+            .uplink
+            .send(Frame {
+                peer: 0,
+                lane: Lane::Datagram,
+                payload: bytes::Bytes::from_static(b"not a canonical craft"),
+            })
+            .expect("the host queue accepts");
+        let mut phase = [0u128; 6];
+        swarm.tick_once(7, 20, &mut phase);
+        swarm.tick_once(8, 20, &mut phase);
+        let untagged = swarm.bots[0]
+            .app
+            .world()
+            .resource::<orrery_net::peer_link::PeerLinkCounters>()
+            .untagged;
+        assert!(
+            untagged >= 1,
+            "the uplink frame never reached its addressed bot"
+        );
+
+        // Down: a bot's packet routed to the exterior slot lands on the
+        // downlink queue naming the sender's slot.
+        swarm.router.accept(
+            9,
+            swarm.bots[0].node,
+            ext_index,
+            bytes::Bytes::from_static(b"state for you"),
+        );
+        swarm.deliver(9);
+        let downlink = remote_link
+            .downlink
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("a routed packet landed on the downlink");
+        assert_eq!(downlink.peer, 0, "downlink frames name the sender's slot");
+        assert_eq!(downlink.lane, Lane::Datagram);
+
+        // Meta: the remote reports a new cell; the roster view follows.
+        let moved = crate::bot::cell_of(grid_of(
+            &orrery_core::QPos::from_metres(900_000.0, 0.0, -900_000.0),
+            crate::bot::default_cell_edge_m(),
+        ));
+        remote_link
+            .meta_tx
+            .send(moved.to_bits())
+            .expect("meta queue accepts");
+        if let Some(exterior) = &mut swarm.exterior {
+            while let Ok(raw) = exterior.link.meta.try_recv() {
+                exterior.set_cell_from_bits(raw);
+            }
+            assert_eq!(exterior.cell(), moved, "meta updated the roster cell");
+        } else {
+            panic!("the exterior slot was attached");
+        }
     }
 }

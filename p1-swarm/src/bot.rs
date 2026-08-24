@@ -23,10 +23,12 @@
 
 use core::time::Duration;
 
+use aeronet_iroh::stream::{IrohStreamIo, RecvMessage, StreamMode};
 use bevy_app::prelude::*;
 use bevy_ecs::prelude::*;
 use bevy_math::Vec3;
 use bevy_time::{Real, Time};
+use bytes::Bytes;
 
 use orrery_core::{tick_rng, Executor, QPos};
 use orrery_games::game::Tamper;
@@ -445,6 +447,41 @@ pub fn apply_replicas(
     }
 }
 
+/// The deterministic crowd pose for swarm slot `index` of `count`.
+///
+/// Extracted from `Bot::new` so the host can know where an external peer will
+/// spawn — and therefore which cell to put in every bot's roster — without
+/// building a `Bot` to find out. Both sides of the #385 join derive this from
+/// the slot number alone; neither tells the other.
+///
+/// The swarm is a *crowd*, not a scatter: every bot rides the same large
+/// circle, spread over a short arc of it. Spacing that keeps neighbours one or
+/// two cells apart is what makes interest sets overlap, churn as the crowd
+/// moves, and actually hit the 24-entity cap with 32 peers. A scatter would
+/// put every bot alone in its neighbourhood, and every clause about interest
+/// would pass by being vacuous.
+///
+/// Returns the start position and a yaw tangent to the ring, so the bot
+/// travels around it. `Craft::spawned` takes the yaw back into `[0, TAU)`,
+/// which `regolith/value-range` requires of every sample.
+#[must_use]
+pub fn spawn_pose(index: usize, count: usize) -> (QPos, i32) {
+    let share = index as f64 / count.max(1) as f64;
+    let radius_m = ORBIT_RADIUS_M * (1.0 + RADIAL_SPREAD * (share - 0.5));
+    let arc = CROWD_ARC_RAD * share;
+    let start = QPos::from_metres(libm::cos(arc) * radius_m, 0.0, libm::sin(arc) * radius_m);
+    let yaw_urad = ((arc + core::f64::consts::FRAC_PI_2) * 1_000_000.0) as i32;
+    (start, yaw_urad)
+}
+
+/// The orbit radius `spawn_pose`'s slot rides, for the turn-rate that keeps a
+/// bot on it.
+#[must_use]
+pub fn orbit_radius_m(index: usize, count: usize) -> f64 {
+    let share = index as f64 / count.max(1) as f64;
+    ORBIT_RADIUS_M * (1.0 + RADIAL_SPREAD * (share - 0.5))
+}
+
 impl Bot {
     /// Build a bot from `spec`, spread around a ring with its swarm.
     pub fn new(spec: BotSpec) -> Self {
@@ -460,22 +497,9 @@ impl Bot {
         let secret = bot_key(index);
         let node = secret.public();
         let entity = PersistId::new(index as u64 + 1);
-
-        // The swarm is a *crowd*, not a scatter: every bot rides the same large
-        // circle, spread over a short arc of it. Spacing that keeps neighbours
-        // one or two cells apart is what makes interest sets overlap, churn as
-        // the crowd moves, and actually hit the 24-entity cap with 32 peers. A
-        // scatter would put every bot alone in its neighbourhood, and every
-        // clause about interest would pass by being vacuous.
-        let share = index as f64 / count.max(1) as f64;
-        let radius_m = ORBIT_RADIUS_M * (1.0 + RADIAL_SPREAD * (share - 0.5));
-        let arc = CROWD_ARC_RAD * share;
-        let start = QPos::from_metres(libm::cos(arc) * radius_m, 0.0, libm::sin(arc) * radius_m);
-
-        // Tangent to the ring, so the bot travels around it. `Craft::spawned`
-        // takes the yaw back into `[0, TAU)`, which `regolith/value-range`
-        // requires of every sample.
-        let yaw_urad = ((arc + core::f64::consts::FRAC_PI_2) * 1_000_000.0) as i32;
+        // The crowd pose is slot-derived and shared with the host's view of an
+        // external peer; see `spawn_pose`.
+        let (start, yaw_urad) = spawn_pose(index, count);
 
         // **The cheat is inert on an interceptor, and that is the whole reason
         // this is not `Archetype::for_slot`.** `Tamper::SpeedMultiplier` raises
@@ -599,7 +623,8 @@ impl Bot {
             // cruiser — so the orbit it actually follows is within a few
             // percent of the one it started on, which is what this needs to be
             // right about.
-            turn_urad: ((CRUISE_MPS / radius_m) / TICK_HZ as f64 * 1_000_000.0) as i32,
+            turn_urad: ((CRUISE_MPS / orbit_radius_m(index, count)) / TICK_HZ as f64 * 1_000_000.0)
+                as i32,
             accel_mmss: 60_000,
             visited: vec![cell_of(start_grid)],
             crossings: 0,
@@ -887,6 +912,83 @@ impl Bot {
             // without this has nowhere to put a gap repair at all.
             aeronet_iroh::stream::IrohStreamIo::detached(),
         ));
+    }
+
+    /// Drops everything this bot has queued to send, on both lanes.
+    ///
+    /// The harness's stand-in for a client stall: the packets were built and
+    /// then never left, which is what an unserviced socket is. The peer's own
+    /// log stays intact, so it can still answer for itself when its witnesses
+    /// come asking. A stalling peer does not get to keep its reliable lane
+    /// flowing while its datagrams stop.
+    pub fn stall(&mut self) {
+        let world = self.app.world_mut();
+        let mut query = world.query::<(
+            &orrery_net::plugin::Peer,
+            &mut aeronet_io::Session,
+            &mut IrohStreamIo,
+        )>();
+        for (_, mut session, mut streams) in query.iter_mut(world) {
+            session.send.clear();
+            streams.send.clear();
+        }
+    }
+
+    /// Drains everything queued to send into `(recipient, lane, payload)`
+    /// triples, in queue order.
+    ///
+    /// Shared with the external-peer path (#385): whatever drains here goes
+    /// into the router for an in-process bot and onto the wire for the remote
+    /// one, from this one function, so the two paths cannot diverge.
+    pub fn drain_outbound(&mut self) -> Vec<(NodeId, Option<StreamMode>, Bytes)> {
+        let mut outbound = Vec::new();
+        let world = self.app.world_mut();
+        let mut query = world.query::<(
+            &orrery_net::plugin::Peer,
+            &mut aeronet_io::Session,
+            &mut IrohStreamIo,
+        )>();
+        for (peer, mut session, mut streams) in query.iter_mut(world) {
+            for packet in session.send.drain(..) {
+                outbound.push((peer.id, None, packet));
+            }
+            for message in streams.send.drain(..) {
+                outbound.push((peer.id, Some(message.mode), message.payload));
+            }
+        }
+        outbound
+    }
+
+    /// Hands one delivered message from `from` to this bot's receive buffers.
+    ///
+    /// The inverse of [`Self::drain_outbound`], shared for the same reason:
+    /// the host's `deliver` and the external peer's receive pump must inject
+    /// bytes identically or the witness lanes see different worlds.
+    pub fn receive_inbound(&mut self, from: NodeId, stream: Option<StreamMode>, payload: Bytes) {
+        let world = self.app.world_mut();
+        let mut query = world.query::<(
+            &orrery_net::plugin::Peer,
+            &mut aeronet_io::Session,
+            &mut IrohStreamIo,
+        )>();
+        for (peer, mut session, mut streams) in query.iter_mut(world) {
+            // One session per linked peer; find the sender's.
+            if peer.id != from {
+                continue;
+            }
+            if stream.is_some() {
+                streams.recv.push(RecvMessage {
+                    payload,
+                    recv_at: bevy_platform::time::Instant::now(),
+                });
+            } else {
+                session.recv.push(aeronet_io::packet::RecvPacket {
+                    payload,
+                    recv_at: bevy_platform::time::Instant::now(),
+                });
+            }
+            return;
+        }
     }
 
     /// This bot's committed cell.
