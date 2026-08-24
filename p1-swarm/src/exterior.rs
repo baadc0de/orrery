@@ -49,7 +49,7 @@
 
 use bytes::{BufMut, Bytes, BytesMut};
 use std::sync::atomic::AtomicBool;
-use std::sync::{Arc, mpsc as std_mpsc};
+use std::sync::{mpsc as std_mpsc, Arc};
 
 /// `std::sync::mpsc`, named so call sites read as deliberately std rather than
 /// accidentally unqualified.

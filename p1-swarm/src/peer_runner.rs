@@ -14,7 +14,9 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, Context, Result};
 use orrery_protocol::{coord::PeerEntry, NodeId, UniverseSeed};
 
-use crate::bot::{bot_key, cell_of, grid_of, spawn_pose, default_cell_edge_m, Bot, BotSpec, TICK_HZ};
+use crate::bot::{
+    bot_key, cell_of, default_cell_edge_m, grid_of, spawn_pose, Bot, BotSpec, TICK_HZ,
+};
 use crate::bridge::{self, HostAddress};
 
 /// Everything the runner needs: which slot is its (derived), where the host
@@ -161,9 +163,7 @@ pub fn run(run: &ExternalRun) -> Result<()> {
                 Some(aeronet_iroh::stream::StreamMode::Shared) => {
                     crate::exterior::Lane::StreamShared
                 }
-                Some(aeronet_iroh::stream::StreamMode::Bulk) => {
-                    crate::exterior::Lane::StreamBulk
-                }
+                Some(aeronet_iroh::stream::StreamMode::Bulk) => crate::exterior::Lane::StreamBulk,
             };
             let frame = crate::exterior::Frame {
                 peer: slot_of(&index_of, to),
@@ -200,9 +200,7 @@ pub fn run(run: &ExternalRun) -> Result<()> {
                 crate::exterior::Lane::StreamShared => {
                     Some(aeronet_iroh::stream::StreamMode::Shared)
                 }
-                crate::exterior::Lane::StreamBulk => {
-                    Some(aeronet_iroh::stream::StreamMode::Bulk)
-                }
+                crate::exterior::Lane::StreamBulk => Some(aeronet_iroh::stream::StreamMode::Bulk),
             };
             if frame.lane != crate::exterior::Lane::Meta {
                 bot.receive_inbound(bot_key(from_slot).public(), stream, frame.payload);

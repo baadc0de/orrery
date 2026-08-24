@@ -28,8 +28,7 @@ fn bin() -> &'static str {
 #[test]
 #[ignore = "two real processes at wall clock; run via scripts/p1-swarm-gate.sh or --ignored"]
 fn an_external_peer_joins_witnesses_and_moves_frames() {
-    let dir =
-        std::env::temp_dir().join(format!("p1-external-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("p1-external-{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("temp dir");
     let report_path = dir.join("report.json");
 
@@ -65,8 +64,8 @@ fn an_external_peer_joins_witnesses_and_moves_frames() {
     // exactly like a bridge defect. The transcript doubles as evidence when an
     // assertion fails.
     let stderr = host.stderr.take().expect("host stderr piped");
-    let listening: Arc<Mutex<Option<(String, Option<String>)>>> =
-        Arc::new(Mutex::new(None));
+    type ListeningSlot = Arc<Mutex<Option<(String, Option<String>)>>>;
+    let listening: ListeningSlot = Arc::new(Mutex::new(None));
     let transcript: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     {
         let listening = Arc::clone(&listening);
@@ -76,12 +75,10 @@ fn an_external_peer_joins_witnesses_and_moves_frames() {
             for line in std::io::BufReader::new(stderr).lines() {
                 let Ok(line) = line else { break };
                 if let Some(rest) = line.strip_prefix("p1-swarm: exterior slot ") {
-                    let node = rest
-                        .find("node ")
-                        .and_then(|at| {
-                            let tail = &rest[at + "node ".len()..];
-                            tail.find(',').map(|end| tail[..end].to_owned())
-                        });
+                    let node = rest.find("node ").and_then(|at| {
+                        let tail = &rest[at + "node ".len()..];
+                        tail.find(',').map(|end| tail[..end].to_owned())
+                    });
                     let direct = rest.find("direct ").and_then(|at| {
                         let tail = &rest[at + "direct ".len()..];
                         let open = tail.find('[')?;
@@ -129,7 +126,12 @@ fn an_external_peer_joins_witnesses_and_moves_frames() {
             "--host-node",
             &address.0,
         ])
-        .args(address.1.iter().flat_map(|d| ["--host-direct".into(), d.clone()]))
+        .args(
+            address
+                .1
+                .iter()
+                .flat_map(|d| ["--host-direct".into(), d.clone()]),
+        )
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
@@ -173,8 +175,7 @@ fn an_external_peer_joins_witnesses_and_moves_frames() {
 
     let raw = std::fs::read_to_string(&report_path)
         .unwrap_or_else(|error| panic!("report written: {error}"));
-    let report: serde_json::Value =
-        serde_json::from_str(&raw).expect("report parses");
+    let report: serde_json::Value = serde_json::from_str(&raw).expect("report parses");
 
     let external = report
         .get("external")

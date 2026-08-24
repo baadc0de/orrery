@@ -922,11 +922,11 @@ impl Bot {
             let cell = self.cell().expect("committed");
             let entity = self.entity();
             let state = self.state();
-                (
-                    self.node,
-                    cell,
-                    encode_replication(&(state.to_canonical(), cell, entity, tick + 1)),
-                )
+            (
+                self.node,
+                cell,
+                encode_replication(&(state.to_canonical(), cell, entity, tick + 1)),
+            )
         };
         let peers: Vec<NodeId> = self
             .app

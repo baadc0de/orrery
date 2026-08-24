@@ -195,8 +195,8 @@ mod router;
 mod swarm;
 
 use anyhow::{bail, Context, Result};
-use orrery_core::CoreCodec as _;
 use clap::Parser;
+use orrery_core::CoreCodec as _;
 use std::str::FromStr;
 
 use orrery_games::game::Tamper;
@@ -481,7 +481,10 @@ fn main() -> Result<()> {
     // The external runner replaces everything below the config build: it is
     // one Bot against a socket, not a swarm host.
     if args.external {
-        let host_node = args.host_node.as_deref().context("--external needs --host-node")?;
+        let host_node = args
+            .host_node
+            .as_deref()
+            .context("--external needs --host-node")?;
         let node = NodeId::from_str(host_node).context("host node id is not hex")?;
         let direct = match &args.host_direct {
             Some(socket) => Some(
@@ -543,8 +546,8 @@ fn main() -> Result<()> {
             Some(bytes) => {
                 let claim: orrery_protocol::StateClaim = serde_json::from_slice(&bytes.claim_json)
                     .context("external anchor claim did not decode")?;
-                let state =
-                    RegolithState::decode(&bytes.state).context("external anchor state did not decode")?;
+                let state = RegolithState::decode(&bytes.state)
+                    .context("external anchor state did not decode")?;
                 Some((claim, state))
             }
             None => None,
