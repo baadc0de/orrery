@@ -21,6 +21,7 @@ pub mod coord;
 mod gateway;
 mod grid;
 mod identity;
+pub mod join;
 pub mod metrics;
 mod persist;
 mod protocol;
@@ -71,6 +72,7 @@ pub use identity::{
     MAX_SESSION_TOKEN_TTL_MS, SESSION_TOKEN_V1_DOMAIN, SESSION_TOKEN_V1_VERSION,
     SESSION_TOKEN_V2_VERSION,
 };
+pub use join::{CampaignJoinFileV1, CampaignJoinFileVersionError, CAMPAIGN_JOIN_FILE_V1_FORMAT};
 pub use persist::{
     eligible_witnesses, required_witnesses, AccountId, AssetId, Attestation, CellEpoch, Checkpoint,
     EntityRekey, Epoch, Intent, IntentOp, IntentOutcome, ItemUid, JournalRecord, Lsn, PersistId,
