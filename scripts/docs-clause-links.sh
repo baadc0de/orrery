@@ -88,7 +88,7 @@ check_tree() {
   }
 }
 
-if [[ ${1:-} == '--self-test' ]]; then
+if [[ "${1:-}" == "--self-test" ]]; then
   # Functional, not structural: run the same scanner the live invocation runs,
   # against three fixture forests — one where every planted defect must fire
   # by name, one where nothing may fire, and one holding the fence toggle
