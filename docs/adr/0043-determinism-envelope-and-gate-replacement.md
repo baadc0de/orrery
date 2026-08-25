@@ -491,3 +491,10 @@ line actually reads `bevy_ecs = { version = "0.19", default-features =
 false }` — the exact `0.19.1` lives in `Cargo.lock:1224-1225`, which A4 also
 cites correctly. Claim intact, manifest half imprecise; recorded here rather
 than silently repeated.
+
+[D9]: 0009-verifiable-core.md
+[D14]: 0014-pinned-versions.md
+[D15]: 0015-crate-set.md
+[D16]: 0016-parameter-reference.md
+[D38]: 0038-at-rest-schema-versioning.md
+[D42]: 0042-canonical-simulation-architecture.md
