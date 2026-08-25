@@ -1,5 +1,39 @@
 # Collision under own-state discipline (#441 design)
 
+## 2026-08-25 re-derivation on `feat/441-collisions`
+
+The historical analysis below is retained as evidence, but its central replay
+premise is superseded by #457. The current executor emits canonical neighbour
+state together with the tick actually observed
+(`crates/orrery_core/src/executor.rs:158-169`); replay decodes those frames,
+installs them for exactly the reader's step, checks the performed read sequence,
+and removes them again (`crates/orrery_core/src/replay.rs:227-307`). The
+independent log cross-check first refuses future or over-stale observations,
+then verifies the neighbour authority's claim and the frame hash
+(`crates/orrery_core/src/log.rs:83-116`). Finally, D43(d) and
+`scripts/core-gates.sh:126-149` now admit exactly one audited Regolith read
+expression and pin its count at one.
+
+Therefore the old conclusion that a collision predicate cannot branch on
+neighbour state without convicting honest replay is no longer true. A ship can
+submit an untrusted broad-phase candidate, and the existing audited predicate
+can verify overlap and approach against a recorded frame before own state
+changes. The other body's result still travels as a next-tick event under D46;
+the target applies only its own bounded state change. No second neighbour-read
+site or live-world replay is required.
+
+The narrower warning about a globally exact persistent constraint solver still
+stands: separately authoritative bodies may observe different neighbour ticks,
+and single-entity adjudication proves each own-state transition rather than one
+atomic pair transition. Recorded frames make sustained contact *replayable*;
+they do not create a shared snapshot or atomic multi-entity commitment. #441's
+impulsive rock–ship and ship–ship resolution does not require either.
+
+The motion finding also narrowed against the current tree: rock velocity
+integration and boundary reflection already exist and are pinned by
+`rock_position_integrates_velocity_on_all_axes_each_tick`; only bloom spawn
+velocity remained zero.
+
 **Verdict: yes, under conditions.** Two-party physical interaction is expressible
 under the own-state discipline, cleanly, with the machinery the tree already
 has — provided three conditions are accepted. (1) **The impulse is computed
