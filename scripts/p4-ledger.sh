@@ -378,11 +378,23 @@ self_test() {
   shakedown="$(P4_LEDGER_FILE="$dir/shakedown.jsonl" "$0" shakedown 2>&1 || true)"
   grep -q 'impairment verified applied in every sampled session: PASS' <<<"$shakedown" \
     || die "self-test: agreeing observed impairment did not pass ('$shakedown')"
-  jq 'if .target | test("windows") then .session.shakedown.client_launch_pass = false else . end' "$dir/shakedown.jsonl" > "$dir/shakedown.next.jsonl"
-  mv "$dir/shakedown.next.jsonl" "$dir/shakedown.jsonl"
-  shakedown="$(P4_LEDGER_FILE="$dir/shakedown.jsonl" "$0" shakedown 2>&1 || true)"
-  grep -q 'client launches on all three platforms: FAIL' <<<"$shakedown" \
-    || die "self-test: an explicit failed client launch did not report FAIL ('$shakedown')"
+  cp "$dir/shakedown.jsonl" "$dir/shakedown.good.jsonl"
+  st_shakedown_fail() {
+    jq "$1" "$dir/shakedown.good.jsonl" > "$dir/shakedown.jsonl"
+    shakedown="$(P4_LEDGER_FILE="$dir/shakedown.jsonl" "$0" shakedown 2>&1 || true)"
+    grep -q "$2: FAIL" <<<"$shakedown" \
+      || die "self-test: mutation '$1' did not fail named criterion '$2' ('$shakedown')"
+  }
+  st_shakedown_fail '.session.shakedown.golden_pass = false' \
+    'goldens green on all three platforms'
+  st_shakedown_fail 'if .target | test("windows") then .session.shakedown.client_launch_pass = false else . end' \
+    'client launches on all three platforms'
+  st_shakedown_fail '.session.shakedown.triaged_real_reports = 1' \
+    'zero discrepancy reports triaged real over those hours'
+  st_shakedown_fail 'if .target | test("windows") then .session.shakedown.tolerance_band_digest = "bands-v2" else . end' \
+    'no tolerance band moved during them'
+  st_shakedown_fail '.session.impairment_mismatch = true' \
+    'impairment verified applied in every sampled session'
 
   # Mutation proof for the guarded freeze condition.  The second commit changes
   # a real PIPELINE_TREE, so matching the two endpoint digests would be a
