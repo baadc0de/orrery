@@ -191,22 +191,15 @@ impl Ruleset for Regolith {
             craft.last_cover_occluded = *occluded;
         }
         if let Some(collision) = claims.collision {
-            match &mut state {
-                RegolithState::Craft(craft) => {
-                    craft.vel = collision.own_velocity;
-                    craft.collisions = craft.collisions.saturating_add(1);
-                }
-                RegolithState::Rock(_)
-                | RegolithState::Pickup(_)
-                | RegolithState::BloomDirector(_) => {
-                    unreachable!("only a craft may submit a collision claim")
-                }
+            if let RegolithState::Craft(craft) = &mut state {
+                craft.vel = collision.own_velocity;
+                craft.collisions = craft.collisions.saturating_add(1);
+                events.push(Outcome::Collision {
+                    collider: me,
+                    target: collision.other,
+                    target_velocity: collision.target_velocity,
+                });
             }
-            events.push(Outcome::Collision {
-                collider: me,
-                target: collision.other,
-                target_velocity: collision.target_velocity,
-            });
         }
         if claims.arithmetic_overflowed {
             match &mut state {
