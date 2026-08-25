@@ -30,8 +30,9 @@ cargo build --release
 # binary: target/release/p0-nat-test
 ```
 
-Distribute that one binary (plus the relay URL, which is baked in as the
-default). It's a normal Rust binary — no install, no runtime, no Bevy.
+Distribute that one binary (the checked-in [`relay-host`](relay-host) is baked
+into its default HTTPS URL). It's a normal Rust binary — no install, no
+runtime, no Bevy.
 
 ## Usage
 
@@ -98,7 +99,7 @@ Get each node's NodeId with `--print-id` to build the roster:
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--relay <URL>` | `https://iroh-relay.distopik.com` | The self-hosted iroh relay: punch rendezvous + fallback path |
+| `--relay <URL>` | `https://<relay-host>` | The self-hosted iroh relay: punch rendezvous + fallback path; see [`relay-host`](relay-host) for the checked-in host |
 | `--peer <NodeId>` | *(host mode)* | Remote NodeId to dial |
 | `--peers <N>` | `1` | Host mode: accept N simultaneous connections (local mesh test) |
 | `--tick-hz <N>` | `60` | State datagram send rate (P0 stress) |
@@ -147,9 +148,8 @@ including one deliberately UDP-blocked network (forced-relay case), per
 
 ## Notes
 
-- The relay is the self-hosted Hetzner box `iroh-relay.distopik.com`
-  (see [.agents/memory/hetzner-relay.md](../../.agents/memory/hetzner-relay.md)).
-- Its checked-in host default lives in [`relay-host`](relay-host); both this
+- The relay is self-hosted on Hetzner. Its checked-in host default lives in
+  [`relay-host`](relay-host); both this
   CLI and `gates/p0-nat-lab/deploy-gw.sh` read it. Set `ORRERY_RELAY_HOST` to
   override that host for either consumer. The CLI derives its HTTPS URL; the
   lab resolves it before pinning the IP in its DNS-isolated peer namespaces.
