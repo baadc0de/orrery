@@ -210,3 +210,97 @@ R6's rollback-unit membership; **W** feeds witness attention — which
 components get executors and claims versus invariants only; **N** feeds
 replication registration and interest; **A** feeds admission — which write
 path will accept a mutation (lease-fenced diff, island claim, intent op).
+
+### (d) Named valid profiles — the diagonal, plus the points the enum could not express
+
+| Profile | P | R | W | N | A | In-tree example |
+|---|---|---|---|---|---|---|
+| **Core** (verifiable) | P1/P2 | per R6 | W2 | N1 | A1 | `RegolithState` via `components::STATE` (`crates/orrery_games/src/regolith/mod.rs:79-84`, classified Core at `:129-135`) |
+| **Bulk** | P1 | R0 | W1 | N1 | A1 | docs/06 §2's bulk class; terrain deltas |
+| **Cosmetic-local** | P0 | R0 | W0 | N0 | A0 | UI/selection state; anything undeclared (the default) |
+| **Ephemeral-shared** | P0 | R0 | W0 | N1 | A2 | Projectiles/VFX under `EphemeralId` (D44's transient class) |
+| **Critical/ledger** | P2 | R0 | W0* | N0 | A3 | Balances, item ownership; *audited by receipts and the single-ownership row, not by replay |
+
+The last two rows are the demonstration that clause (f) is necessary rather
+than tidy: `CoreClass` files an ephemeral projectile and a local UI
+component under the same value, and gives a ledger row no value at all.
+
+### (e) The eight invalid combinations, each with its mechanism
+
+A combination is listed here only when a mechanism makes it *incoherent*,
+not merely unusual. A prohibition without its mechanism is unreviewable;
+each row carries its reason.
+
+| # | Combination | Why it is invalid — the mechanism |
+|---|---|---|
+| IV-1 | `W2` without `A1` (single fenced writer) | Replay adjudication verifies a **subject-signed** claim chain (`crates/orrery_core/src/replay.rs:287`, `verify_claim`; `StateClaim` at `crates/orrery_protocol/src/verifiable.rs:189`). Island-weak (`A2`) entities have no fence and no chain — contested writes have no single subject to hold to; cluster-written (`A3`) rows have no step to re-execute. No signer, no verdict |
+| IV-2 | `W2` without a deterministic canonical encoding (`CoreCodec` + quantization, VC-1..8) | The claim commits to a hash of canonical quantized bytes. A nondeterministic or unstable encoding makes every honest re-execution a false deviation — the witness convicts everyone, which is worse than watching no one (`ruleset.rs:23-27`) |
+| IV-3 | `P2` with any writer but `A3` | The FDB transaction is "the sole authority" for critical rows (`intent/mod.rs:152-154`); the single-ownership row *is* the anti-dupe invariant (`crates/orrery_protocol/src/persist.rs:185-186`). A lease-holder journaling a balance bypasses read-check-write: **duplication by construction** |
+| IV-4 | `P1`/`P2` on an `EphemeralId` entity | Transient identity (D44) has no durable row to write. Mechanically enforced today at both ends: the uplink keys off `LocallyAuthoritative`, ephemerals carry `IslandAuthoritative` — a marker kept distinct precisely so this cannot happen (`ephemeral.rs:346-352`), and the uplink-side guard is now pinned by a named test (Verification appendix row MV-1; the coverage gap A5 recorded as X2 was closed by #427, commit `9aae34f9`) |
+| IV-5 | `R1` with `P2` | Rolling back transaction-final state re-plays committed durable effects — a rewound-then-recommitted credit is **a dupe machine**. Corrections to critical state are compensating transactions through the same envelope, never rewind. (The converse, `R1 ∧ P1`, is R6's to shape, not invalid) |
+| IV-6 | `N1` with `A0` | Replicating state nobody holds authority to write breaks single-writer: receivers have no rule for whose value wins. Everything replicated today is owner-written (the uplink feed persists only `LocallyAuthoritative` entities, `feed.rs:64-67`; replicon uplink is owner-side by construction) |
+| IV-7 | Any capability above the zeros for a schema embedding an engine handle (`Entity`, `ComponentId`, `FnsId`, archetype/row indices) | Engine handles are allocator-local and generation-dependent; their bytes mean nothing to another world, a restart, or a replay. **The rule is accepted; its enforcement mechanism is not chosen** (Open questions, item 1) and no mechanism exists today — Context §4's mutation passed everything. **Until a mechanism lands, IV-7 is enforced by review**, and this record must not be read as claiming otherwise |
+| IV-8 | Any capability above the zeros without a declared `(ComponentTypeId, SchemaVersion)` | "No declaration, no capability" (clause (c)). Existing behaviour at both ends: default-Cosmetic (`ruleset.rs:293-297`), fail-closed migration (`migration.rs:80-85`, mutation-proven, appendix row MV-2) |
+
+**Inert-but-legal**, named so nobody "fixes" them into the table above:
+`W1` with an empty invariant slice (the trait's own default — "correct but
+slower to notice", `ruleset.rs:302-310`); all-zeros on a *declared*
+component (declaration without capability is a no-op, not an error);
+`W2 ∧ N0` (Context §3 — the witness channel is not replication).
+
+### (f) `classify_component` is replaced, not wired; removal sequenced last
+
+The capability policy does not give `classify_component` a consumer. It
+replaces it. The hook's *shape* — game-declared, kernel-consumed, keyed by
+`ComponentTypeId` — is confirmed and kept; the hook's *form* — a method on
+`Ruleset` returning one three-valued enum — is retired, for three reasons:
+
+1. **One value cannot carry five independent dimensions** (clause (d)).
+   Wiring consumers to the enum would encode the diagonal as law at the
+   moment this record establishes the space is wider than the diagonal.
+2. **Code where data belongs.** A capability declaration must reach the
+   compatibility manifest (R8) and the at-rest reader (persistd), and most
+   rows must be readable *without* linking a `Ruleset`. The registration
+   idiom already in the tree carries declarations as data at composition
+   time; a trait method requires calling into the build to learn a static
+   fact.
+3. **Retirement is cheap now and expensive later.** Zero call sites means
+   no consumer migrates; three first-party overrides
+   (`regolith/mod.rs:129`, `skirmish/mod.rs:186`,
+   `conformance/ruleset.rs:242`) are deleted with it — a compile-visible,
+   first-party-only change.
+
+**Sequencing rider: the removal is last, not first.** The defaulted method
+stays until the declaration registry exists and the three implementations'
+facts are restated as declarations, so at no point does the tree hold less
+classification information than it does today. Removing a *defaulted* trait
+method is not [D38]'s "required method" branch, but it is still
+trait-surface change on `orrery_core`/`orrery_games` — both P4 digest crates
+— and it **lands at the owner's pleasure, post-P4-digest**, proposed as its
+own change, never smuggled inside registry or manifest work.
+
+### (g) `CoreClass` survives as derived vocabulary only
+
+"Core", "Bulk" and "Cosmetic" remain the names of clause (d)'s load-bearing
+macro-profiles, and the documentation set keeps speaking them ([D9], [D10],
+[D11], docs/06 §2). But the enum ceases to be a source of truth: **nothing
+authors, persists, hashes, or routes on `CoreClass`**. A validator may
+*compute* a profile name from a declaration's five values — and may refuse
+declarations matching no known profile unless explicitly marked novel, a
+cheap tripwire for typo'd policies — and prose may say "core-class state".
+The value is derived output, never input.
+
+### (h) The tier predicate is `W2`, not `CoreClass::Core`
+
+Where an accepted design keys behaviour to "core-class state" — most
+concretely A3's H1 routing wall, scored there "on an unwired hook" with the
+explicit caveat that a per-dimension policy would force re-derivation
+(`docs/plans/a3-simulation-host-comparison.md:574-577`) — the predicate is
+re-derived as: **state with `W2` (replay-adjudicated) lives in the
+per-entity executor with every structural guarantee; everything else is
+eligible for whatever storage the host seam chooses.** This is the
+re-derivation A3 §11.3 anticipated, performed. It is also *stronger* than
+the enum it replaces: `W2` is the one dimension that actually forces the
+executor's structure (isolated single-entity replay), whereas a component
+could have been marked `Core` for persistence-priority reasons without
+needing replay semantics at all.
