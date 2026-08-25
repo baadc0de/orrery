@@ -339,3 +339,129 @@ of why identity allocation can never be kernel-*provided at runtime*: the
 moment ids depend on world population, isolated replay — the entire
 adjudication model — stops working.
 
+---
+
+## 5. Are explicit integration modules warranted?
+
+The brief asks whether cross-module behaviour should live in dedicated
+integration artifacts (`ShipCargoDamageIntegration`, …), in systems registered
+by a higher-level game crate, or in another construct. Evaluation of both
+sides, from this tree's evidence; **no preference is taken** — the construct
+choice belongs to A3/A8. What §2 does fix regardless: every cross-module
+coupling must have a *named owner* somewhere; what may stay open is whether
+that owner is a distinct artifact.
+
+### 5.1 The case for
+
+1. **Couplings that hide are couplings that rot.** The brief's motivation
+   section lists "corner cases accumulating in central dispatch functions" and
+   "hidden coupling through callbacks" as failure modes. A named integration
+   artifact makes each coupling visible, ordered, testable, and — under an
+   eventual module manifest (A8) — pinnable in the compatibility hash.
+2. **This tree already agrees at the entity level.** Cross-entity effects
+   travel as typed, ordered events consumed next tick (`ruleset.rs:196-201`);
+   CC-1 showed a four-owner interaction held together by exactly one join
+   point. An integration module is the same discipline one level up: the
+   damage×inventory join gets a home instead of living inside whichever of
+   damage or inventory was edited last.
+3. **Testability has a concrete shape here.** `orrery_games`' scenario harness
+   runs games against scripted pilots with golden chains (`scenario.rs:172`,
+   `golden.rs`). An integration artifact gives interactions their own
+   scenarios — today an interaction test must be written *inside* one parent
+   module's tests, which misstates ownership.
+4. **Adjudication pressure points the same way.** Because replay holds one
+   entity, interaction logic that reads several entities' live state cannot be
+   adjudicated as written (the neighbour-read ban exists precisely because no
+   `NeighborFrame` producer exists, `core-gates.sh:126-139`). Logic composed
+   through events *can* be adjudicated emitter-side. A rule of thumb falls out
+   on its own: integration logic must compose via the event/input channel, not
+   via multi-entity queries — and an explicit artifact makes that constraint
+   checkable per-coupling rather than per-statement.
+
+### 5.2 The case against
+
+1. **No observed pain at this scale.** The tree has two reference games, one
+   small; A1 §4.4 found generic-propagation fears unsupported by current
+   evidence, and the same caution applies here: there is no in-tree incident
+   of a cross-module corner case landing badly, because there is essentially
+   one production game. The argument for integration modules is currently
+   architectural, not empirical.
+2. **A universal module interface risks becoming another god abstraction** —
+   the brief itself names this ("Overgeneralized module API") and prescribes
+   ordinary Rust crates and functions as the primary composition mechanism.
+   The tree's existing seams (`Game` supertrait + static visitor because
+   `dyn` is unavailable, `game.rs:171-174`; boxed factories) suggest
+   composition-time wiring is already idiomatic here without new constructs.
+3. **Counting cost.** Each integration artifact adds registration surface,
+   version identity, and manifest entries (A8 scope). For N modules there are
+   O(N²) potential pairwise integrations; without evidence about which pairs
+   actually interact, mandating artifacts for all of them is speculative
+   structure.
+4. **The kernel-side joins already exist without them.** CC-1's durable leg
+   lands in the transaction envelope; CC-3's lands in authority/rollback.
+   Those are kernel responsibilities regardless of module system. What
+   integration modules would add is only the *game-side* joins — a narrower
+   problem than the brief's framing implies.
+
+### 5.3 What both sides agree on (and therefore what A2 asserts)
+
+Whichever construct wins:
+
+- Cross-module coupling must be **visible** (a reader can enumerate a game's
+  couplings without reading every module's body),
+- **ordered** (deterministic placement relative to producers/consumers —
+  A4's scheduling model will formalize this),
+- **owned** (§2's table requires an owner row for every responsibility;
+  "shared" is not an owner), and
+- **composed via declared channels** (events/policies, not live multi-entity
+  reads), or it forfeits adjudication.
+
+Whether visibility is achieved by dedicated artifacts, by a composition-root
+convention, or by lint/test structure is deferred to A3 (#399)/A8 (#404).
+
+---
+
+## 6. `classify_component`: the unused ownership hook
+
+**What it is and was for.** A defaulted trait method mapping a game-assigned
+`ComponentTypeId(u32)` to `CoreClass::{Core, Bulk, Cosmetic}`
+(`ruleset.rs:293-301`). docs/06 states the intent twice: the classification
+"makes this machine-checked, not aspirational. The classification also drives
+persistence write classes (§D11) and witness attention (§D10)"
+(`docs/06-verifiable-core.md:60`), and names its consumers:
+"`orrery_persist_client` uses it to route bulk diffs vs. intents,
+`orrery_witness` uses it to decide what to watch" (`docs/06-verifiable-core.md:210`).
+
+**What exists.** Three implementations — `Skirmish`
+(`skirmish/mod.rs:186`), `Regolith` (`regolith/mod.rs:129-135`),
+`Reference` (`ruleset.rs:242`) — and **zero call sites**, re-verified on this
+tree today (`rg classify_component crates gates clients`: definition + three
+impls, nothing else). The conservative default means an unclassified component
+is never persisted rather than silently admitted (`ruleset.rs:295-297`).
+Note also: with no consumer, `Bulk` and `Cosmetic` are currently
+indistinguishable in behaviour — the distinction lives entirely in prose until
+something routes on it. That is *exists-but-inert*, distinct from *working*.
+
+**Does §2's table give it a consumer?** Yes — three, all kernel-side readers
+of a game-authored declaration, which is exactly the policy-consumer shape of
+§1:
+
+| Intended consumer | Table row | Reading |
+|---|---|---|
+| Persistence write-class routing | Row 6 | Kernel routes writes; class declaration is game's |
+| Witness attention policy | Row 8 | Kernel decides *how much* to watch what; game declares verifiability |
+| Replication relevance (docs/06's third consumer family) | §2.1 replication row | Kernel transports; game declares relevance |
+
+So the table does not retire the hook; it confirms the hook is the right
+*shape* — game-declared, kernel-consumed — while leaving two questions open
+where they belong:
+
+1. Whether the signature (`ComponentTypeId → CoreClass`) survives contact with
+   A5's fuller per-component capability policy (persistence, rollback,
+   witness, replication, authority, privacy, size limits — the brief lists
+   eight dimensions where `CoreClass` carries one bit of three-way state).
+   That comparison is A5's (#401), not ours.
+2. Who governs `ComponentTypeId` values themselves — Regolith hard-codes
+   `ComponentTypeId(1)` (`regolith/mod.rs:80-84`) with no registry. Schema-id
+   allocation is governance, flagged to A8 (#404).
+
