@@ -559,6 +559,25 @@ Open question 1.
   take a slot. The real residual is *across incarnations* — a failover whose
   successor rebuilds sessions — and it is bounded by the reseed cooldown
   already in D28 clause (g).
+
+  > *Erratum (2026-08-25, measured):* the cooldown does not bound the
+  > cross-incarnation residual, because it is process-local state:
+  > `WitnessSeeder.cooldowns` (`crates/orrery_coordinator/src/witness.rs:278`)
+  > is initialised empty (`:297`) and never persisted, so a failover
+  > successor starts with no cooldown record of its predecessor's bounces.
+  > Measured directly: a successor rebuilt from the same live sessions
+  > seated an account 35 s inside the predecessor's 60 s cooldown window —
+  > in the candidate pool *and* the drawn set. What actually bounds the
+  > residual is the successor's `min_presence_ms` (10 s), timed from its
+  > own `note_session`; the per-cell `reseed_min_ms` floor adds nothing to
+  > the first post-failover epoch, since `maybe_seed`'s `Cooling` branch
+  > requires prior per-cell state (`witness.rs:548-553`) and a fresh seeder
+  > has none. The residual is therefore real but short — one grind
+  > opportunity per leader failover, at `min_presence_ms` after the
+  > successor's sessions rebuild — and winning the lease is the price of
+  > manufacturing one. The identity of the correct bound, not the size of
+  > the residual, is what this corrects; nothing else in this bullet
+  > changes.
 - **Capability deferred: nothing here builds `orrery_identity`.** This record
   decides bytes, directions and semantics. The writer is still absent, and
   until it exists every `d` row is empty, every tier-2 lookup misses, and (f)
