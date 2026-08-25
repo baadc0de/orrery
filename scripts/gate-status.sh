@@ -866,8 +866,8 @@ gate_ci_determinism_verdict_evidence() { ev_none; }
 #
 # GitHub-hosted runners perform the actual package builds. The local gate is a
 # manifest guard: it proves the release workflow retains its isolated trigger
-# surface, standalone release build, commit stamp, checksum, and upload, but
-# cannot claim a runner produced a binary.
+# surface, three standalone release builds, commit stamp, packaged checksums,
+# and release upload, but cannot claim a runner produced a binary.
 gate_package_client_tier() { echo fast; }
 gate_package_client_prereq() { [[ -r "$ROOT/.github/workflows/package-client.yml" ]]; }
 gate_package_client_run() {
@@ -882,10 +882,30 @@ gate_package_client_run() {
     && grep -Fq 'working-directory: clients/regolith' <<<"$source" \
     && grep -Fq 'cargo build --release' <<<"$source" \
     && grep -Fq 'ORRERY_BUILD_REV: ${{ github.sha }}' <<<"$source" \
+    && grep -Fq 'tar -C stage -czf' <<<"$source" \
+    && grep -Fq '7z a -tzip' <<<"$source" \
     && grep -Fq 'sha256sum' <<<"$source" \
-    && grep -Fq 'actions/upload-artifact@v7' <<<"$source"
+    && grep -Fq 'actions/upload-artifact@v7' <<<"$source" \
+    && grep -Fq 'actions/download-artifact@v8' <<<"$source" \
+    && grep -Fq 'gh release create' <<<"$source"
 }
 gate_package_client_evidence() { ev_none; }
+
+# `publish-client` is a distinct workflow job, so it needs its own trio. Its
+# guarded stage is the release handoff after all three matrix archives arrive.
+gate_publish_client_tier() { echo fast; }
+gate_publish_client_prereq() { [[ -r "$ROOT/.github/workflows/package-client.yml" ]]; }
+gate_publish_client_run() {
+  local wf="${1:-$ROOT/.github/workflows/package-client.yml}" source
+  source=$(sed '/^[[:space:]]*#/d' "$wf")
+  grep -Fq 'needs: package-client' <<<"$source" \
+    && grep -Fq 'RELEASE_TAG: ${{ github.event_name == '\''push'\'' && github.ref_name || inputs.release_tag }}' <<<"$source" \
+    && grep -Fq 'actions/download-artifact@v8' <<<"$source" \
+    && grep -Fq 'pattern: regolith-*' <<<"$source" \
+    && grep -Fq 'gh release create' <<<"$source" \
+    && grep -Fq 'gh release upload "$RELEASE_TAG" dist/* --clobber' <<<"$source"
+}
+gate_publish_client_evidence() { ev_none; }
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Reporting
@@ -1287,6 +1307,49 @@ self_test() {
     || die 'self-test: a broken package-client stamp stage did not report FAILED'
   grep -qE '^  PASSED +package-client:package-client' <<<"$package_mutation" \
     && die 'self-test: a broken package-client stamp stage also reported PASSED'
+  rm -f "$dir/.github/workflows/package-client.yml"
+
+  # The release handoff has its own job and trio. Mutate that guarded command,
+  # rather than this self-test's assertion, and require only that job to die:
+  # the build/package guard must remain green because its stage still exists.
+  cp "$ROOT/.github/workflows/package-client.yml" "$dir/.github/workflows/package-client.yml"
+  sed -i 's/gh release upload /gh release broken-upload /' \
+    "$dir/.github/workflows/package-client.yml"
+  local publish_mutation publish_status
+  set +e
+  GATE_STATUS_ROOT="$dir" GATE_STATUS_OUT="$dir/publish-out" "$0" --fast \
+    >"$dir/publish-mutation-report" 2>&1
+  publish_status=$?
+  set -e
+  publish_mutation=$(cat "$dir/publish-mutation-report")
+  [[ $publish_status == 1 ]] \
+    || die "self-test: a broken release upload exited $publish_status rather than 1"
+  grep -qE '^  FAILED +package-client:publish-client' <<<"$publish_mutation" \
+    || die 'self-test: a broken release upload did not report FAILED for publish-client'
+  grep -qE '^  PASSED +package-client:package-client' <<<"$publish_mutation" \
+    || die 'self-test: a broken release upload also broke the package-client guard'
+  grep -qE '^  PASSED +package-client:publish-client' <<<"$publish_mutation" \
+    && die 'self-test: a broken release upload also reported PASSED for publish-client'
+  rm -f "$dir/.github/workflows/package-client.yml"
+
+  # The trigger guard must fail closed too. Adding the forbidden PR event is a
+  # workflow mutation, so this proves the absence check above is not merely a
+  # comment about an on-demand workflow.
+  cp "$ROOT/.github/workflows/package-client.yml" "$dir/.github/workflows/package-client.yml"
+  sed -i '/^on:$/a\  pull_request:' "$dir/.github/workflows/package-client.yml"
+  local trigger_mutation trigger_status
+  set +e
+  GATE_STATUS_ROOT="$dir" GATE_STATUS_OUT="$dir/trigger-out" "$0" --fast \
+    >"$dir/trigger-mutation-report" 2>&1
+  trigger_status=$?
+  set -e
+  trigger_mutation=$(cat "$dir/trigger-mutation-report")
+  [[ $trigger_status == 1 ]] \
+    || die "self-test: a package workflow with a pull_request trigger exited $trigger_status rather than 1"
+  grep -qE '^  FAILED +package-client:package-client' <<<"$trigger_mutation" \
+    || die 'self-test: a package workflow with a pull_request trigger did not report FAILED'
+  grep -qE '^  PASSED +package-client:package-client' <<<"$trigger_mutation" \
+    && die 'self-test: a package workflow with a pull_request trigger also reported PASSED'
   rm -f "$dir/.github/workflows/package-client.yml"
 
   # A static gate that passes, one self-test that passes, one that fails, and
