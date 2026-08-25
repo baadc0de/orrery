@@ -1,7 +1,7 @@
 //! Regolith-specific checks for weapon state and planar input discipline.
 
 use orrery_core::{
-    evaluate, tick_rng, CoreCodec, Executor, InvariantKind, InvariantSample, QPos, QVel,
+    evaluate, tick_rng, CoreCodec, Executor, InvariantKind, InvariantSample, QPos, QVel, TICK_HZ,
 };
 use orrery_games::game::Game;
 use orrery_games::regolith::{
@@ -22,6 +22,52 @@ use rand_chacha::rand_core::SeedableRng;
 fn craft_at(x: i64) -> Craft {
     Craft::spawned(Archetype::Interceptor, QPos { x, y: 0, z: 0 }, 0)
 }
+
+#[test]
+fn rock_position_integrates_velocity_on_all_axes_each_tick() {
+    let rock_id = PersistId::new(448);
+    let initial_pos = QPos {
+        x: 1_000,
+        y: -2_000,
+        z: 3_000,
+    };
+    let velocity = QVel {
+        x: 6_000,
+        y: -12_000,
+        z: 18_000,
+    };
+    let per_tick = QPos {
+        x: velocity.x / i64::from(TICK_HZ),
+        y: velocity.y / i64::from(TICK_HZ),
+        z: velocity.z / i64::from(TICK_HZ),
+    };
+    let mut executor = Executor::new(Regolith::honest(), UniverseSeed([0x48; 32]));
+    executor.insert(
+        rock_id,
+        RegolithState::Rock(Rock::spawned(RockTier::Small, 0, initial_pos, velocity)),
+    );
+
+    for tick in 1_u32..=3 {
+        executor
+            .step_entity(rock_id, Tick::new(u64::from(tick)), &[])
+            .expect("rock exists");
+        assert_eq!(
+            executor.state(rock_id),
+            Some(&RegolithState::Rock(Rock::spawned(
+                RockTier::Small,
+                0,
+                QPos {
+                    x: initial_pos.x + i64::from(tick) * per_tick.x,
+                    y: initial_pos.y + i64::from(tick) * per_tick.y,
+                    z: initial_pos.z + i64::from(tick) * per_tick.z,
+                },
+                velocity,
+            ))),
+            "rock motion at tick {tick}",
+        );
+    }
+}
+
 fn sample<'a>(
     previous: Option<&'a RegolithState>,
     current: &'a RegolithState,
