@@ -151,5 +151,195 @@ the classes an ECS-hosted future adds or sharpens.
 | **T13** | **Worker-count / executor interleaving** | Parallel execution of independent systems reordering shared-resource touches that ambiguity detection failed to flag, or completion-order-sensitive aggregation. Becomes reachable only when a multithreaded executor enters canonical execution. Probe evidence: ordered schedule produced one hash across 1-worker single-threaded and 2-/4-task multithreaded executors (§9 E-2). |
 | **T14** | **Canonical/presentation leakage** | Cosmetic or presentation state entering claim bytes, persistence rows, or event payloads — the mixed-world hazard A3 used to reject V2, still present in weaker form if projections are written casually. The witness hash must see exactly what replication and persistence see (VC-7 rationale, quantize.rs:7-9). |
 
-<!-- a4-section-3 -->
+---
+
+## 3. The required determinism envelope
+
+### 3.1 Envelope (what "deterministic" promises, and to whom)
+
+Three rings, matching D9's scoping and docs/06 §5:
+
+1. **In-process (one binary, one machine): bit-exact.** Same inputs → same
+   state bytes, same event sequence, same hashes — across runs, worker
+   counts, executor kinds, insertion orders. No tolerance anywhere in this
+   ring; it is what double-run tests and the soak assert.
+2. **Across the supported platform matrix: discrete bit-exact, continuous
+   within bands.** Four targets (x86_64 Linux/Windows, aarch64 Linux/macOS —
+   x86_64-macos deliberately unsupported, ci.yml ~:843-848 comment), pinned
+   toolchain and deps (D14). Discrete (VC-5) compares `==`; continuous
+   (VC-6/VC-7) is libm-routed, lattice-snapped each tick, then compared under
+   D16 bands (ε_pos 1 cm, ε_vel 1 cm/s) by the §5 comparator.
+3. **Explicitly outside the envelope:** differing compiler versions outside
+   the pin, modified or third-party rules builds claiming an honest id (the
+   tamper model keeps the honest `RulesetId` on purpose — that is what
+   witnessing adjudicates, not a determinism failure), fast-math/codegen-flag
+   variance, and any platform outside the four.
+
+A future ECS host inherits this envelope unchanged. It does not get to narrow
+ring 1 ("stable enough per process") because ring 1 is what makes ring 2's
+corpus comparable at all, and it does not get to widen ring 2 into "all
+platforms" because that promise is exactly the one rapier scopes and avian
+declines (docs/06:268).
+
+### 3.2 Canonical stages
+
+Derived from what `Executor::step_entity` does today (§1.3), not invented:
+a canonical tick is a fixed pipeline over a frozen input set. In an
+ECS-hosted future the same pipeline becomes explicit schedule structure:
+
+```text
+S0 SealInputs     freeze this tick's input log in VC-2 order; nothing may
+                  append after S0 begins (late arrivals join t+1)
+S1 Deliver        apply external commands + last tick's events as inputs,
+                  per entity, in log order
+S2 Step           per-entity pure step: own state + ordered inputs + TickRng;
+                  entity processing order = PersistId ascending; steps are
+                  independent (snapshot isolation), so S2 may parallelize
+S3 Record         collect neighbour reads for the log (first-read order)
+S4 Quantize       snap every continuous field (VC-7) — before any hashing
+S5 Claim          compute per-entity state_hash; assemble claims
+S6 Materialize    install structural changes: emission/description order,
+                  first-writer-wins (executor.rs:144-157 semantics)
+S7 Emit           enqueue emitted events as t+1 inputs (delivery strictly
+                  next tick)
+```
+
+Two properties are non-negotiable because adjudication consumes them: **S4
+precedes S5** (quantize-before-hash, executor.rs:126-127) and **S6 applies no
+input visible to any S2 of the same tick** (materialized children cannot
+change a step that already ran; corpus.rs:95-102 asserts shared-vs-isolated
+chain equality, which pins this).
+
+### 3.3 System ordering
+
+Within a stage, systems form a total order established at composition time:
+
+- **S2** parallelizes freely *across entities* (independent own-state writes)
+  but never across systems with overlapping access without an explicit edge.
+- Every pair of systems with conflicting data access carries an explicit
+  `.before()`/`.after()`/`.ignore_ambiguity()`-free edge — ambiguity is
+  rejected, never ignored (mechanism E-M2, §4).
+- Ordering edges are declared between *systems*, not left to registration
+  luck; registration order is code order and stable only under pinned source,
+  so the schedule digest (§3.10) exists to notice drift.
+
+### 3.4 Deferred structural changes
+
+All spawn/despawn/component-insert in canonical execution goes through
+deferred commands flushed at **S6 only**. Flush application order = queue
+order = (system order within stage) × (emission order within system); both
+are deterministic by §3.3. Identifier collisions resolve first-writer-wins by
+`PersistId` (today's rule verbatim). Direct `World::spawn`/`despawn` calls
+inside S0–S5 are prohibited; the host exposes command queues, not world
+mutation, to canonical systems. Enforcement honesty: the flush-point rule is
+API-shaped (host design) plus review; its *symptom* is caught by the
+isolated-replay corpus axis if it ever breaks ordering.
+
+### 3.5 Event ordering
+
+Emission order within a producer; producer total order across producers;
+delivery at S1 of t+1 and never earlier; observers/hooks do not exist in the
+canonical path (immediate cascades are T7). Message buffers are drained in
+system order at the delivering stage. Deduplication, replay behaviour,
+idempotency keys, and volume bounds are **A6's (#402) territory** — this
+document fixes ordering and delivery timing only, and defers the rest rather
+than deciding it in passing.
+
+### 3.6 Query-order constraints
+
+Query iteration order must never be observable in anything that leaves the
+canonical context: claim bytes, persistence rows, event payloads, presentation
+frames that peers might diff. Concretely:
+
+- Any projection producing canonical output iterates rows **sorted by
+  `PersistId`** through one host-projection API; raw query iteration is
+  permitted for presentation-local work only (mirroring, HUD).
+- This is enforced mechanically where possible (projection differential
+  harness, §4 E-M3) and honestly *not* lintable beyond that: a grep cannot
+  tell an observable iteration from an unobservable one. A3's second opinion
+  said the same (its V3 note: "a lint cannot ban observable iteration order
+  the way grep bans HashMap").
+
+### 3.7 Random-stream ownership
+
+Unchanged from VC-3, restated as ownership rules: the RNG is a per-entity,
+per-tick value derived by `tick_rng` (rng.rs:31), passed `&mut` into the step;
+draws are code order; there is deliberately no reseed path mid-tick. An ECS
+host adds two prohibitions: no RNG resource in canonical stages (`Res<TickRng>`
+or similar global streams are T6), and no draw whose count depends on
+data-dependent branches across entities (each entity's stream must be
+reproducible from `(seed, entity, tick)` alone).
+
+### 3.8 Floating-point policy
+
+VC-5/VC-6/VC-7 verbatim: integer math for discrete outcomes; libm routing for
+continuous math with std transcendentals banned in both spellings
+(core-gates.sh:117-123); exact IEEE ops (`round/floor/ceil/trunc/abs/
+mul_add`) allowed and load-bearing for the lattice; quantize-before-hash; D16
+bands for cross-platform comparison. Nothing here changes with storage; the
+policy attaches to *code roles*, which is why §5's replacement gate scans
+roles, not crates-that-exist-today.
+
+### 3.9 Async prohibitions
+
+Canonical execution is synchronous end-to-end within a tick: no async runtime
+in the canonical graph (true today by Cargo.toml comment, kept as a gate
+clause in §5); no task spawned during S0–S7 that outlives the schedule run;
+no I/O inside canonical stages — the outside world enters as sealed inputs
+(S0) and leaves as events/frames (S7+). Presentation worlds and network
+pumps live entirely outside the host seam.
+
+### 3.10 Schedule compatibility hashing
+
+The brief asks how schedule topology enters the compatibility hash (brief
+line ~592). Proposal: the composition root computes a **schedule digest** =
+blake3 over a canonical serialization of: ordered stage list; per-stage
+ordered system names; all declared ordering edges sorted lexicographically;
+the ambiguity-detection setting; the executor policy. Uses:
+
+- pinned into the game manifest (format owned by **A8**, #404);
+- asserted equal between peers at session setup alongside `RulesetId`
+  (wire placement owned by A11/owner — proposed, not decided here);
+- asserted by a unit test against the current value, so an accidental system
+  reorder fails CI the way a golden does.
+
+This catches T11 for scheduler-level drift that source goldens cannot see
+(goldens hash states, not graphs). Note honestly what it cannot do: it pins
+*topology*, not the semantics bevy_ecs attaches to a topology — that half
+stays with D14 pins + upgrade conformance runs.
+
+---
+
+## 4. Enforcement mechanisms, each tied to its threat
+
+"Proposed" mechanisms are specced here and prototyped where marked; they are
+**not implemented** in this tree, and their landing is implementation work
+sequenced by A11 after the P4 window (digest constraint, A1 §7.3).
+
+| # | Mechanism | Threats | Status | Named check that enforces it |
+|---|---|---|---|---|
+| E-M1 | **Role-keyed static gate** — §5's replacement: full clause battery (bevy-free for verifiable-tier crates, VC-4/6/8, neighbour ban) applied to a *discovered* crate set | T1 T2-spelling T4 T10 | exists (clauses) + proposed (discovery; prototype live) | `scripts/core-gates.sh` clauses 1–5 + new discovery cross-check |
+| E-M2 | **Ambiguity rejection at Error + canary mutation test**: every canonical schedule builds with `ScheduleBuildSettings { ambiguity_detection: LogLevel::Error }`; CI carries a test that asserts the real schedule initializes Ok *and* that a deliberately un-ordered mutant initializes Err | T3 | proposed; prototype proven both directions (§9 E-1) | host crate's `canonical_schedule_rejects_ambiguity` test |
+| E-M3 | **Projection differential harness**: per commit, run the canonical world twice from one state with permuted insertion orders; assert naive query-order fold differs or not is *not* asserted — assert the sorted-by-PersistId projection hashes agree across both runs and match the executor-computed hash chain | T2 T13 T14 | proposed; prototype pattern proven (§9 E-2/E-3) | conformance case `projection-order-permuted` (A10 lands it) |
+| E-M4 | **Double-run symptom tests**: identical tick twice in one process, compare hashes | T1 T4 T6 symptoms | exists | `executor.rs:489 the_same_tick_run_twice_produces_the_same_state` (+ games/conformance equivalents) |
+| E-M5 | **Committed golden corpus over every-tick chains**, checked per platform inside ordinary tests | T5 T11 T12-partially | exists | `orrery_conformance --test conformance :: this_platform_matches_the_committed_golden` (mutation-proven A1 M7) |
+| E-M6 | **Cross-platform matrix + partial-refusal verdict** | T5 | exists | ci.yml determinism + verdict jobs (≥3 non-baseline reports or fail) |
+| E-M7 | **Nightly soak** — ten corpus repeats in one process | per-process nondeterminism (T1/T4/T9 symptoms) | exists | nightly.yml `determinism-soak` (:1187+) |
+| E-M8 | **Profile-parity leg + overflow policy**: release-profile corpus run compared against debug digest; canonical crates adopt an explicit overflow policy (`overflow-checks = true` in *all* profiles recommended, so wrap-vs-panic can never split two hosts) | T12 | proposed; hazard demonstrated on this tree (§9 P-OV) | new matrix leg `profile-release`; policy lands as `[profile]` override |
+| E-M9 | **Worker-count leg**: corpus emitted under single-threaded and multithreaded executors, digests compared | T13 | proposed; prototype shows stability only under ordering (E-2), never trusted alone | conformance `--workers w1/w4` labels compared by verdict job |
+| E-M10 | **Stage-pinned structural flush + FWW install**, isolated-replay equality axis | T8 | spec'd here (§3.4); isolation axis already mechanical today | corpus `combat-isolated == combat-island` chain-equality test |
+| E-M11 | **Next-tick event delivery, observer-free canonical path** | T7 | spec'd here (§3.5); detailed command/event semantics owned by A6 | review + E-M4/E-M5 symptoms |
+| E-M12 | **Dependency pins + upgrade conformance** (D14 pins, Cargo.lock, vendored forks) + **schedule digest** (§3.10) | T11 | pins exist; digest proposed | goldens (existing) + manifest assertion (A8 format) |
+| E-M13 | **Witnessing itself** — re-execution against subject-signed logs, bands comparator, shadow-mode reports | all of the above, post-hoc, cross-machine | exists, shipped (D10 pipeline) | `witness detection.rs` suite (25 tests; mutation-proven A1 M8) |
+
+The pattern worth stating: spelling gates (E-M1) catch classes cheaply at
+commit time; symptom tests (E-M4/E-M5) catch what spellings miss; harnesses
+(E-M6/E-M7/E-M9) separate platform from process from worker effects;
+witnessing (E-M13) is the runtime backstop when everything upstream failed or
+was lied about. No single layer is trusted alone — that is the existing
+philosophy (core-gates.sh:22-25) carried forward.
+
+<!-- a4-section-5 -->
+
+
 
