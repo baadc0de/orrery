@@ -298,3 +298,79 @@ untested against production pressure unless and until an ECS host is
 admitted. That posture is deliberate (specify the door before anyone needs to
 walk through it), but it is a fact about how much of this record is currently
 exercised, and it belongs in the record rather than in a plan's appendix.
+
+### (f) Integer overflow — a flag in witnessed state, one behaviour everywhere
+
+A4 §11.4 offered two postures — `overflow-checks = true` in all profiles
+(panic) or explicit `wrapping_*` — and reserved the choice. **The owner has
+chosen: a flag, not a loud failure.** The clause, and the consequence that
+makes it more than a preference:
+
+1. **No panic.** Canonical crates must not resolve overflow by aborting the
+   tick. An overflowing operation produces its defined result (sub-clause
+   (f)(4)) and execution continues.
+2. **One behaviour across all profiles.** The demonstrated hazard (Context
+   §3, re-verified: dev panics, release wraps to `-2147482649`) is the
+   *profile-dependence*, regardless of posture. Therefore: canonical integer
+   arithmetic that can overflow uses the explicit-semantics operations that
+   carry the chosen posture and set the flag; and the canonical crates' build
+   pins `overflow-checks = false` uniformly across profiles, so that any
+   stray plain operation the review missed behaves *identically* on every
+   host and profile (it wraps) instead of splitting dev from release.
+   `overflow-checks = true` is unavailable under this clause — it means
+   panic, which (f)(1) bars. A stray plain operation is still a bug (it
+   bypasses the flag and, if saturating is chosen, the posture); the pin
+   turns it from a divergence into an ordinary defect.
+3. **Occurrence reaches witnessed state, or the flag is theater.** This is
+   the part that needs care. A flag is only evidence if it is part of the
+   hashed projection: if overflow set a bit that hashing never sees, two
+   hosts could diverge — one flagged, one not — while `hash(e, t)` still
+   matches, and the flag would prove nothing precisely when it matters.
+   Therefore the flag is a **per-entity discrete field of canonical state**:
+   a saturating overflow counter (or bitset — implementation's choice of
+   width, not of location), set during S2 at the point of occurrence, carried
+   in the entity's state exactly like any other discrete field. Under R7's
+   projection rules (a7-persistence-rollback-witnessing.md §5) it is then
+   inside `bytes(e,t) = CoreCodec::encode(quantize(state(e,t)))` and hence
+   inside `hash(e,t) = blake3(bytes(e,t))` — the value a `StateClaim` commits
+   to (WP-1). It is an integer, so S4 quantization is the identity on it and
+   ring-2 comparison is `==` (VC-5, discrete axis — no band ever applies to
+   it). Persistence and replication see the same bytes by construction
+   (WP-3's one-sentence property), so a flagged entity is flagged in the
+   at-rest row, the replicated state, and the witness's re-execution alike;
+   a host that disagrees about occurrence produces a differing hash and the
+   ordinary deviation pipeline adjudicates it. Setting the flag is itself
+   deterministic — occurrence is a function of (state, inputs, TickRng), all
+   sealed — so honest hosts agree on the flag the way they agree on any
+   state bit.
+4. **Wrapping vs saturating — reserved to the owner, undecided.** The owner
+   has fixed the posture (flag, no panic, profile-uniform) but has not chosen
+   the defined result of an overflowing operation, and this record does not
+   choose it. The two candidates differ in what a game's arithmetic *means*
+   at the boundary, not merely in mechanism — see Alternatives. Until the
+   owner records the choice, no canonical arithmetic may be written that
+   depends on which one wins; implementation of this clause blocks on that
+   answer.
+
+The flag's *placement* here is spec-level: "a discrete field of canonical
+state, inside the claimed bytes". Which struct field, its width, and the
+`SchemaVersion` bump it implies are implementation work after acceptance, and
+the projection format it rides inside remains R7's.
+
+### (g) The schedule digest — existence and content; storage is R8's
+
+The composition root computes a **schedule digest**: blake3 over a canonical
+serialization of the ordered stage list; the per-stage ordered system names;
+all declared ordering edges, sorted lexicographically; the
+ambiguity-detection setting; and the executor policy. It exists to catch
+scheduler-topology drift that state goldens cannot see — goldens hash states,
+not graphs (T11).
+
+Uses, with ownership kept exactly as A4 §3.10 and A8 drew it: the digest is
+pinned into the game manifest, whose **format and storage are R8's** (A8);
+it is asserted by a unit test against the current value, so an accidental
+system reorder fails CI the way a golden does. Whether it also joins the
+session-setup equality check on the wire is a protocol question this record
+does not decide (see Open questions). Stated honestly: the digest pins
+*topology*, not the semantics the ECS library attaches to a topology — that
+half stays with [D14]'s pins and upgrade conformance runs.
