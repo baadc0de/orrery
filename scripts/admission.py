@@ -114,6 +114,7 @@ class Admission:
         campaigns, _ = self.campaigns()
         if not CAMPAIGN_ID.fullmatch(ident) or ident not in campaigns: raise Refusal(404, "unknown_campaign", "That campaign has ended — refresh the list.")
         c = campaigns[ident]
+        if c.client_rev and request.get("client_rev") != c.client_rev: raise Refusal(403, "client_rev_mismatch", f"This campaign needs build {c.client_rev} — download the current build.")
         if not c.open: raise Refusal(403, "campaign_closed", "This campaign is closed; pick another.")
         free = self.free_bytes()
         if free < MINT_FLOOR_BYTES:
@@ -122,7 +123,6 @@ class Admission:
         nickname, node = request.get("nickname"), request.get("node")
         if not isinstance(nickname, str) or not re.fullmatch(r"[^\t\r\n]{1,32}", nickname): raise Refusal(422, "bad_nickname", "Nicknames are 1–32 characters, no tabs or newlines.")
         if not isinstance(node, str) or not NODE.fullmatch(node): raise Refusal(422, "bad_node", "This build sent a bad transport key — reinstall the client.")
-        if c.client_rev and request.get("client_rev") != c.client_rev: raise Refusal(403, "client_rev_mismatch", f"This campaign needs build {c.client_rev} — download the current build.")
         directory = self.state / c.ident; directory.mkdir(parents=True, exist_ok=True)
         lock = (directory / "lock").open("a+")
         try:
