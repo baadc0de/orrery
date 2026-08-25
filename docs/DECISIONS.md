@@ -59,6 +59,7 @@ their linked dependencies.
 | D45 | [ADR-0045](adr/0045-per-component-capability-policy.md) | Five independent capability dimensions with fail-closed zeros and eight invalid combinations; `classify_component` replaced; IV-7's engine-handle rule accepted, its enforcement mechanism open |
 | D46 | [ADR-0046](adr/0046-message-class-semantics.md) | Six message classes with internal commands collapsed onto domain events; delivered-first composition ratified as law; emission cap binds and flags rather than failing the tick |
 | D47 | [ADR-47](adr/0047-rollback-unit.md) | Only prediction rewinds: canonical is correction-only, durable recovery-only, critical compensation-only; the unit is the per-entity predicted set with all-or-nothing restore |
+| D48 | [ADR-0048](adr/0048-canonical-witness-projection.md) | The canonical witness projection WP-1..WP-6; `projection_version` becomes a third orthogonal version axis, widening D38 clause (d)(3) |
 
 ## Status and supersession
 
