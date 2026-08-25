@@ -1,5 +1,7 @@
 //! Regolith-specific checks for weapon state and planar input discipline.
 
+use std::collections::BTreeMap;
+
 use orrery_core::{
     evaluate, tick_rng, CoreCodec, Executor, InvariantKind, InvariantSample, QPos, QVel, TICK_HZ,
 };
@@ -9,7 +11,9 @@ use orrery_games::regolith::{
     invariants::INVARIANTS,
     order::{ChildSpec, LockBreakReason, Order, Outcome, ShotResult},
     pilot::{scenario_at, PilotScenario, PILOT_SCENARIOS, SCENARIO_TICKS},
-    state::{BloomDirector, BloomMembership, Craft, Pickup, RegolithState, Rock, RockTier},
+    state::{
+        BloomDirector, BloomMembership, Craft, LockClass, Pickup, RegolithState, Rock, RockTier,
+    },
     weapon::WeaponKind,
     Regolith, BLOOM_CADENCE_TICKS, BLOOM_CENTRAL_RADIUS_MM, BLOOM_LIFETIME_TICKS, BLOOM_ROCK_COUNT,
     ISLAND_CRAFT_BUDGET, ISLAND_DIRECTOR_BUDGET, ISLAND_PICKUP_BUDGET, ISLAND_ROCK_BUDGET,
@@ -215,8 +219,8 @@ fn sample<'a>(
 }
 
 #[test]
-fn v12_collision_ruleset_identity_and_island_budget_are_pinned() {
-    assert_eq!(REGOLITH_RULESET.version, 12);
+fn v13_lock_class_ruleset_identity_and_island_budget_are_pinned() {
+    assert_eq!(REGOLITH_RULESET.version, 13);
     assert_eq!(WeaponKind::Stock.weapon().damage_base, 10);
     assert_eq!(WeaponKind::Volley.weapon().rolls, 3);
     assert_eq!(WeaponKind::Stock.weapon().optimal_mm, 300_000);
@@ -390,6 +394,7 @@ fn kill_credit_is_log_delivered_and_replays_from_the_killers_input() {
     let victim = PersistId::new(2);
     let mut killer_start = craft_at(0);
     killer_start.lock_target = Some(victim);
+    killer_start.lock_class = Some(LockClass::Ship);
     killer_start.lock_progress = LOCK_ACQUISITION_TICKS;
     killer_start.locks_acquired = 1;
     let mut victim_state = craft_at(0);
@@ -708,6 +713,7 @@ fn volley_is_three_left_slot_first_rolls_and_uses_its_own_cooldown() {
     let mut shooter = craft_at(0);
     shooter.weapon = WeaponKind::Volley;
     shooter.lock_target = Some(PersistId::new(2));
+    shooter.lock_class = Some(LockClass::Ship);
     shooter.lock_progress = LOCK_ACQUISITION_TICKS;
     shooter.locks_acquired = 1;
     let mut executor = Executor::new(Regolith::honest(), UniverseSeed([9; 32]));
@@ -1087,6 +1093,7 @@ fn fire_through_executor(archetype: Archetype, target_pos: QPos) -> (Craft, Craf
     let target = PersistId::new(2);
     let mut shooter = Craft::spawned(archetype, QPos::default(), 0);
     shooter.lock_target = Some(target);
+    shooter.lock_class = Some(orrery_games::regolith::state::LockClass::Ship);
     shooter.lock_progress = LOCK_ACQUISITION_TICKS;
     shooter.locks_acquired = 1;
     let victim = Craft::spawned(Archetype::Interceptor, target_pos, 0);
@@ -1227,8 +1234,11 @@ fn holding_lock_without_fire_produces_no_damage_over_many_ticks() {
                 .expect("locker exists");
             assert!(output.neighbor_reads.is_empty());
             assert!(
-                output.events.is_empty(),
-                "lock alone produced an outcome at tick {tick}"
+                output
+                    .events
+                    .iter()
+                    .all(|event| matches!(event, Outcome::LockRequested { .. })),
+                "lock alone produced a combat outcome at tick {tick}"
             );
             hashes.push(output.state_hash);
         }
@@ -1246,7 +1256,8 @@ fn holding_lock_without_fire_produces_no_damage_over_many_ticks() {
         RegolithState::Craft(Craft {
             lock_target: Some(locked),
             lock_progress: LOCK_ACQUISITION_TICKS,
-            locks_acquired: 1,
+            lock_class: None,
+            locks_acquired: 0,
             ..
         }) if locked == target
     ));
@@ -1260,9 +1271,242 @@ fn holding_lock_without_fire_produces_no_damage_over_many_ticks() {
 fn locked_craft(target: PersistId) -> Craft {
     let mut craft = craft_at(0);
     craft.lock_target = Some(target);
+    craft.lock_class = Some(orrery_games::regolith::state::LockClass::Ship);
     craft.lock_progress = LOCK_ACQUISITION_TICKS;
     craft.locks_acquired = 1;
     craft
+}
+
+fn run_lock_round_trip(
+    target_state: Option<RegolithState>,
+    ticks: u64,
+) -> (Executor<Regolith>, Vec<Outcome>) {
+    let game = Regolith::honest();
+    let locker = PersistId::new(1);
+    let target = PersistId::new(2);
+    let mut executor = Executor::new(game, UniverseSeed([0x42; 32]));
+    executor.insert(locker, RegolithState::Craft(craft_at(0)));
+    if let Some(state) = target_state {
+        executor.insert(target, state);
+    }
+    let mut pending = BTreeMap::<PersistId, Vec<Order>>::new();
+    let mut observed = Vec::new();
+    for raw in 1..=ticks {
+        let mut next = BTreeMap::<PersistId, Vec<Order>>::new();
+        for entity in [locker, target] {
+            if executor.state(entity).is_none() {
+                continue;
+            }
+            let mut inputs = pending.remove(&entity).unwrap_or_default();
+            if entity == locker {
+                inputs.push(Order::Lock { target });
+            }
+            let output = executor
+                .step_entity(entity, Tick::new(raw), &inputs)
+                .expect("handshake entity exists");
+            for event in output.events {
+                if let Some((recipient, order)) = game.deliver(&event) {
+                    next.entry(recipient).or_default().push(order);
+                }
+                observed.push(event);
+            }
+        }
+        pending = next;
+    }
+    (executor, observed)
+}
+
+#[test]
+fn a_rock_confirms_a_lock_and_the_reticle_class_is_rock() {
+    let rock = Rock::spawned(
+        RockTier::Large,
+        0,
+        QPos {
+            x: 100_000,
+            y: 0,
+            z: 0,
+        },
+        QVel::default(),
+    );
+    let (executor, _) = run_lock_round_trip(
+        Some(RegolithState::Rock(rock)),
+        u64::from(LOCK_ACQUISITION_TICKS),
+    );
+    assert!(matches!(
+        executor.state(PersistId::new(1)),
+        Some(RegolithState::Craft(Craft {
+            lock_target: Some(target),
+            lock_class: Some(LockClass::Rock),
+            lock_progress: LOCK_ACQUISITION_TICKS,
+            locks_acquired: 1,
+            ..
+        })) if *target == PersistId::new(2)
+    ));
+}
+
+#[test]
+fn a_pickup_refuses_a_lock_and_the_locker_clears_it() {
+    let pickup = Pickup::spawned(QPos::default(), WeaponKind::Heavy, 90);
+    let (executor, events) = run_lock_round_trip(Some(RegolithState::Pickup(pickup)), 3);
+    assert!(events
+        .iter()
+        .any(|event| matches!(event, Outcome::LockRefused { .. })));
+    assert!(matches!(
+        executor.state(PersistId::new(1)),
+        Some(RegolithState::Craft(Craft {
+            lock_target: None,
+            lock_class: None,
+            lock_progress: 0,
+            ..
+        }))
+    ));
+}
+
+#[test]
+fn a_lock_on_a_missing_id_never_matures() {
+    let (mut executor, _) = run_lock_round_trip(None, u64::from(LOCK_ACQUISITION_TICKS));
+    let locker = PersistId::new(1);
+    let output = executor
+        .step_entity(locker, Tick::new(31), &[Order::Fire])
+        .expect("locker exists");
+    assert_eq!(
+        output.events,
+        [Outcome::ShotRefused {
+            attacker: locker,
+            result: ShotResult::NoLock,
+        }]
+    );
+    assert!(matches!(
+        executor.state(locker),
+        Some(RegolithState::Craft(Craft {
+            lock_target: Some(target),
+            lock_class: None,
+            lock_progress: LOCK_ACQUISITION_TICKS,
+            locks_acquired: 0,
+            ..
+        })) if *target == PersistId::new(2)
+    ));
+}
+
+#[test]
+fn switching_between_classes_restarts_acquisition_and_reconfirms() {
+    let rock = Rock::spawned(
+        RockTier::Large,
+        0,
+        QPos {
+            x: 100_000,
+            y: 0,
+            z: 0,
+        },
+        QVel::default(),
+    );
+    let (mut executor, _) = run_lock_round_trip(
+        Some(RegolithState::Rock(rock)),
+        u64::from(LOCK_ACQUISITION_TICKS),
+    );
+    let locker = PersistId::new(1);
+    let ship = PersistId::new(3);
+    executor.insert(ship, RegolithState::Craft(craft_at(200_000)));
+    let switched = executor
+        .step_entity(
+            locker,
+            Tick::new(31),
+            &[
+                Order::LockConfirmed {
+                    target: PersistId::new(2),
+                    class: LockClass::Rock,
+                },
+                Order::Lock { target: ship },
+            ],
+        )
+        .expect("locker exists");
+    assert!(matches!(
+        switched.events.as_slice(),
+        [Outcome::LockRequested { locker: who, target }]
+            if *who == locker && *target == ship
+    ));
+    assert!(matches!(
+        executor.state(locker),
+        Some(RegolithState::Craft(Craft {
+            lock_target: Some(target),
+            lock_class: None,
+            lock_progress: 1,
+            ..
+        })) if *target == ship
+    ));
+    executor
+        .step_entity(
+            locker,
+            Tick::new(32),
+            &[
+                Order::Lock { target: ship },
+                Order::LockConfirmed {
+                    target: ship,
+                    class: LockClass::Ship,
+                },
+            ],
+        )
+        .expect("locker exists");
+    assert!(matches!(
+        executor.state(locker),
+        Some(RegolithState::Craft(Craft {
+            lock_target: Some(target),
+            lock_class: Some(LockClass::Ship),
+            lock_progress: 2,
+            ..
+        })) if *target == ship
+    ));
+}
+
+#[test]
+fn rock_locks_do_not_yet_decay_behind_cover() {
+    let target = PersistId::new(2);
+    let locker = PersistId::new(1);
+    let cover = PersistId::new(3);
+    let mut executor = Executor::new(Regolith::honest(), UniverseSeed([0x43; 32]));
+    executor.insert_observed(
+        target,
+        RegolithState::Rock(Rock::spawned(
+            RockTier::Large,
+            0,
+            QPos {
+                x: 100_000,
+                y: 0,
+                z: 0,
+            },
+            QVel::default(),
+        )),
+        Tick::new(10),
+    );
+    let mut held = locked_craft(target);
+    held.lock_class = Some(LockClass::Rock);
+    executor.insert_observed(locker, RegolithState::Craft(held), Tick::new(10));
+    executor.insert_observed(
+        cover,
+        RegolithState::Rock(Rock::spawned(
+            RockTier::Small,
+            0,
+            QPos {
+                x: 50_000,
+                y: 0,
+                z: 0,
+            },
+            QVel::default(),
+        )),
+        Tick::new(10),
+    );
+    let output = executor
+        .step_entity(
+            target,
+            Tick::new(11),
+            &[Order::ClaimCover {
+                locker,
+                rock: cover,
+            }],
+        )
+        .expect("rock target exists");
+    assert!(output.events.is_empty());
+    assert!(output.neighbor_reads.is_empty());
 }
 
 #[test]
@@ -1343,14 +1587,16 @@ fn lock_switch_and_fire_are_applied_in_input_order() {
         },
         Order::Fire,
     ]);
-    assert_eq!(
-        switch_then_fire_events,
-        [Outcome::ShotRefused {
-            attacker: shooter,
-            result: ShotResult::NoLock,
-        }],
-        "the preceding switch wins, so its fresh lock is not mature"
-    );
+    assert!(matches!(
+        switch_then_fire_events.as_slice(),
+        [
+            Outcome::LockRequested { locker, target },
+            Outcome::ShotRefused {
+                attacker,
+                result: ShotResult::NoLock,
+            }
+        ] if *locker == shooter && *target == second_target && *attacker == shooter
+    ));
     assert!(matches!(
         switch_then_fire,
         RegolithState::Craft(Craft {
@@ -1369,7 +1615,10 @@ fn lock_switch_and_fire_are_applied_in_input_order() {
     ]);
     assert!(matches!(
         fire_then_switch_events.as_slice(),
-        [Outcome::DamageDealt { target, .. }] if *target == first_target
+        [
+            Outcome::DamageDealt { target: fired_at, .. },
+            Outcome::LockRequested { locker, target }
+        ] if *fired_at == first_target && *locker == shooter && *target == second_target
     ));
     assert!(matches!(
         fire_then_switch,
@@ -1405,10 +1654,11 @@ fn lock_on_a_different_target_switches_and_restarts_acquisition() {
             }],
         )
         .expect("locker exists");
-    assert!(
-        switched.events.is_empty(),
-        "a switched lock must not fire on its switch tick"
-    );
+    assert!(matches!(
+        switched.events.as_slice(),
+        [Outcome::LockRequested { locker: who, target }]
+            if *who == locker && *target == second_target
+    ));
     assert!(matches!(
         executor.state(locker),
         Some(RegolithState::Craft(Craft {
@@ -1454,7 +1704,8 @@ fn lock_on_a_different_target_switches_and_restarts_acquisition() {
         Some(RegolithState::Craft(Craft {
             lock_target: Some(locked),
             lock_progress: LOCK_ACQUISITION_TICKS,
-            locks_acquired: 1,
+            lock_class: None,
+            locks_acquired: 0,
             ..
         })) if *locked == second_target
     ));

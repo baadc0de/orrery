@@ -21,8 +21,8 @@ use orrery_core::{
 use orrery_protocol::{PersistId, RulesetId, Tick};
 use rand_core::RngCore;
 use state::{
-    BloomDirector, BloomMembership, Craft, Pickup, RegolithState, Rock, RockTier, PITCH_LIMIT_URAD,
-    TAU_URAD,
+    BloomDirector, BloomMembership, Craft, LockClass, Pickup, RegolithState, Rock, RockTier,
+    PITCH_LIMIT_URAD, TAU_URAD,
 };
 
 const DT: f64 = 1.0 / TICK_HZ as f64;
@@ -87,9 +87,9 @@ pub const OCCLUSION_MARGIN_MM: i64 = 20;
 const REFERENCE_SIGNATURE_RADIUS_MM: u128 = 3_000;
 const CHANCE_SCALE: u128 = 1_000_000;
 
-/// Regolith v12's rules identity: recorded-frame collisions and drifting blooms.
+/// Regolith v13's rules identity: target-owned lock-class confirmation.
 pub const REGOLITH_RULESET: RulesetId = RulesetId {
-    version: 12,
+    version: 13,
     digest: [0x66; 32],
 };
 
@@ -290,15 +290,21 @@ impl Regolith {
             (own.grabs_attempted, own.pickups_won, own.grabs_lost);
         let (mut respawn_in, mut score_rock_points, mut kills) =
             (own.respawn_in, own.score_rock_points, own.kills);
-        let (mut lock_target, mut lock_progress, mut locks_acquired) =
-            (own.lock_target, own.lock_progress, own.locks_acquired);
+        let (mut lock_target, mut lock_class, mut lock_progress, mut locks_acquired) = (
+            own.lock_target,
+            own.lock_class,
+            own.lock_progress,
+            own.locks_acquired,
+        );
         let mut collisions = own.collisions;
+        let mut lock_reply = None;
         let mut lock_decay_progress = own.lock_decay_progress;
         let mut cover_claim_cooldown = own.cover_claim_cooldown.saturating_sub(1);
         if lock_decay_progress > 0 {
             lock_decay_progress = lock_decay_progress.saturating_add(LOCK_DECAY_PER_TICK);
             if lock_decay_progress >= LOCK_ACQUISITION_TICKS {
                 lock_target = None;
+                lock_class = None;
                 lock_progress = 0;
                 lock_decay_progress = 0;
             }
@@ -333,13 +339,18 @@ impl Regolith {
                     match lock_target {
                         None => {
                             lock_target = Some(*target);
+                            lock_class = None;
                             lock_progress = 1;
                             lock_decay_progress = 0;
+                            events.push(Outcome::LockRequested {
+                                locker: me,
+                                target: *target,
+                            });
                         }
                         Some(current) if current == *target => {
                             if lock_progress < LOCK_ACQUISITION_TICKS {
                                 lock_progress = lock_progress.saturating_add(1);
-                                if lock_progress == LOCK_ACQUISITION_TICKS {
+                                if lock_progress == LOCK_ACQUISITION_TICKS && lock_class.is_some() {
                                     locks_acquired = locks_acquired.saturating_add(1);
                                 }
                             }
@@ -349,18 +360,29 @@ impl Regolith {
                         // free to make but never cheaper than a fresh lock.
                         Some(_) => {
                             lock_target = Some(*target);
+                            lock_class = None;
                             lock_progress = 1;
                             lock_decay_progress = 0;
+                            events.push(Outcome::LockRequested {
+                                locker: me,
+                                target: *target,
+                            });
                         }
                     }
+                }
+                Order::LockConfirmed { target, class } => {
+                    lock_reply = Some((*target, Some(*class)));
+                }
+                Order::LockRefused { target } => {
+                    lock_reply = Some((*target, None));
                 }
                 Order::Fire => {
                     // Orders are applied in their sealed order. A preceding Lock
                     // therefore switches first, while a preceding Fire consumes
                     // the lock that existed before a later switch.
-                    let Some(target) =
-                        lock_target.filter(|_| lock_progress >= LOCK_ACQUISITION_TICKS)
-                    else {
+                    let Some(target) = lock_target.filter(|_| {
+                        lock_progress >= LOCK_ACQUISITION_TICKS && lock_class.is_some()
+                    }) else {
                         events.push(Outcome::ShotRefused {
                             attacker: me,
                             result: ShotResult::NoLock,
@@ -393,6 +415,20 @@ impl Regolith {
                     }
                     shots = shots.saturating_add(1);
                     cooldown = weapon.cooldown_ticks;
+                }
+                Order::LockRequested { locker } => {
+                    if hull > 0 {
+                        events.push(Outcome::LockConfirmed {
+                            locker: *locker,
+                            target: me,
+                            class: LockClass::Ship,
+                        });
+                    } else {
+                        events.push(Outcome::LockRefused {
+                            locker: *locker,
+                            target: me,
+                        });
+                    }
                 }
                 Order::Damage {
                     amount,
@@ -505,6 +541,7 @@ impl Regolith {
                 Order::LockBroken { target, reason: _ } => {
                     if lock_target == Some(*target) {
                         lock_target = None;
+                        lock_class = None;
                         lock_progress = 0;
                         lock_decay_progress = 0;
                     }
@@ -540,6 +577,25 @@ impl Regolith {
                 | Order::Collide { .. } => {}
             }
         }
+        if let Some((target, class)) = lock_reply {
+            if lock_target == Some(target) {
+                match class {
+                    Some(class) if lock_class.is_none() => {
+                        lock_class = Some(class);
+                        if lock_progress == LOCK_ACQUISITION_TICKS {
+                            locks_acquired = locks_acquired.saturating_add(1);
+                        }
+                    }
+                    Some(_) => {}
+                    None => {
+                        lock_target = None;
+                        lock_class = None;
+                        lock_progress = 0;
+                        lock_decay_progress = 0;
+                    }
+                }
+            }
+        }
         let speed = libm::sqrt(vx * vx + vy * vy + vz * vz);
         let ceiling = self.movement_cap(limits.max_speed_mms) as f64 / 1_000.0;
         if speed > ceiling && speed > 0.0 {
@@ -572,6 +628,7 @@ impl Regolith {
                 cooldown = 0;
                 equipped = weapon::WeaponKind::Stock;
                 lock_target = None;
+                lock_class = None;
                 lock_progress = 0;
                 lock_decay_progress = 0;
                 cover_claim_cooldown = 0;
@@ -595,6 +652,7 @@ impl Regolith {
             score_rock_points,
             kills,
             lock_target,
+            lock_class,
             lock_progress,
             locks_acquired,
             lock_decay_progress,
@@ -617,6 +675,13 @@ impl Regolith {
         if rock.hull > 0 {
             for order in inputs.iter() {
                 match order {
+                    Order::LockRequested { locker } => {
+                        events.push(Outcome::LockConfirmed {
+                            locker: *locker,
+                            target: me,
+                            class: LockClass::Rock,
+                        });
+                    }
                     Order::Damage {
                         amount,
                         from,
@@ -748,12 +813,17 @@ impl Regolith {
             }
         } else {
             for order in inputs.iter() {
-                if let Order::Damage { from, .. } = order {
-                    events.push(Outcome::LockBroken {
+                match order {
+                    Order::Damage { from, .. } => events.push(Outcome::LockBroken {
                         locker: *from,
                         target: me,
                         reason: LockBreakReason::TargetDestroyed,
-                    });
+                    }),
+                    Order::LockRequested { locker } => events.push(Outcome::LockRefused {
+                        locker: *locker,
+                        target: me,
+                    }),
+                    _ => {}
                 }
             }
         }
@@ -800,21 +870,28 @@ impl Regolith {
             }
         }
         for order in inputs.iter() {
-            let Order::GrabAttempt { ship, ship_pos } = order else {
-                continue;
-            };
-            let eligible = pickup.claimed_by.is_none()
-                && !pickup.expired
-                && pickup.pos.distance_squared(*ship_pos) <= reach_sq(GRAB_RADIUS_MM);
-            if eligible {
-                pickup.claimed_by = Some(*ship);
-                pickup.claimed_at = Some(pickup.expires_at.saturating_sub(pickup.ttl_remaining));
-                events.push(Outcome::Granted {
-                    ship: *ship,
-                    kind: pickup.kind,
-                });
-            } else {
-                events.push(Outcome::Denied { ship: *ship });
+            match order {
+                Order::GrabAttempt { ship, ship_pos } => {
+                    let eligible = pickup.claimed_by.is_none()
+                        && !pickup.expired
+                        && pickup.pos.distance_squared(*ship_pos) <= reach_sq(GRAB_RADIUS_MM);
+                    if eligible {
+                        pickup.claimed_by = Some(*ship);
+                        pickup.claimed_at =
+                            Some(pickup.expires_at.saturating_sub(pickup.ttl_remaining));
+                        events.push(Outcome::Granted {
+                            ship: *ship,
+                            kind: pickup.kind,
+                        });
+                    } else {
+                        events.push(Outcome::Denied { ship: *ship });
+                    }
+                }
+                Order::LockRequested { locker } => events.push(Outcome::LockRefused {
+                    locker: *locker,
+                    target: me,
+                }),
+                _ => {}
             }
         }
         (pickup, events)
@@ -826,7 +903,15 @@ impl Regolith {
         inputs: &OrderedInputs<'_, Order>,
         rng: &mut TickRng,
     ) -> (BloomDirector, Vec<Outcome>) {
+        let mut events = Vec::new();
         for input in inputs {
+            if let Order::LockRequested { locker } = input {
+                events.push(Outcome::LockRefused {
+                    locker: *locker,
+                    target: me,
+                });
+                continue;
+            }
             let Order::BloomPopulationChanged { bloom_index, delta } = input else {
                 continue;
             };
@@ -860,7 +945,6 @@ impl Regolith {
             director.site_rocks_alive = 0;
         }
 
-        let mut events = Vec::new();
         if director.clock_tick >= director.next_bloom_tick {
             let bloom_index = director.blooms_seeded;
             let site_pos = draw_bloom_site(rng);
@@ -1413,6 +1497,23 @@ impl Game for Regolith {
                     reason: *reason,
                 },
             )),
+            Outcome::LockRequested { locker, target } => {
+                Some((*target, Order::LockRequested { locker: *locker }))
+            }
+            Outcome::LockConfirmed {
+                locker,
+                target,
+                class,
+            } => Some((
+                *locker,
+                Order::LockConfirmed {
+                    target: *target,
+                    class: *class,
+                },
+            )),
+            Outcome::LockRefused { locker, target } => {
+                Some((*locker, Order::LockRefused { target: *target }))
+            }
             Outcome::ShotResolved {
                 attacker,
                 target,

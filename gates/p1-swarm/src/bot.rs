@@ -31,7 +31,7 @@ use bevy_time::{Real, Time};
 use bytes::Bytes;
 
 use orrery_core::{tick_rng, CoreCodec, Executor, QPos};
-use orrery_games::game::Tamper;
+use orrery_games::game::{Game, Tamper};
 use orrery_games::regolith::archetype::Archetype;
 use orrery_games::regolith::order::Order;
 use orrery_games::regolith::state::{Craft, RegolithState};
@@ -180,6 +180,14 @@ pub struct Bot {
     /// [`BotSpec::cheat`] — would satisfy every conviction clause by producing
     /// byte-identical state and never being reported at all.
     honest_shadow: Option<Executor<Regolith>>,
+    /// Honest target-side fixture that answers the adjacent craft's lock handshake.
+    lock_resolver: Executor<Regolith>,
+    /// Requests delivered to the target on the following tick.
+    target_lock_inbox: Vec<Order>,
+    /// Target replies delivered to this authored craft on the following tick.
+    locker_lock_inbox: Vec<Order>,
+    /// Adjacent craft installed in `lock_resolver`.
+    lock_target: PersistId,
     /// First tick at which the tampered build produced a different state hash
     /// than the shipping one would have from the same orders.
     first_tampered_tick: Option<u64>,
@@ -539,6 +547,22 @@ impl Bot {
             shadow.insert(entity, state);
             shadow
         });
+        let lock_target = if entity.0.is_multiple_of(2) {
+            PersistId::new(entity.0.saturating_sub(1))
+        } else {
+            PersistId::new(entity.0.saturating_add(1))
+        };
+        let target_slot = lock_target.0.saturating_sub(1);
+        let (target_pos, target_yaw) = spawn_pose(target_slot as usize, count);
+        let mut lock_resolver = Executor::new(Regolith::honest(), seed);
+        lock_resolver.insert(
+            lock_target,
+            RegolithState::Craft(Craft::spawned(
+                Archetype::for_slot(target_slot),
+                target_pos,
+                target_yaw,
+            )),
+        );
 
         let mut app = App::new();
         app.add_plugins(OrrerySpatialPlugin {
@@ -606,6 +630,10 @@ impl Bot {
             app,
             executor,
             honest_shadow,
+            lock_resolver,
+            target_lock_inbox: Vec::new(),
+            locker_lock_inbox: Vec::new(),
+            lock_target,
             first_tampered_tick: None,
             tamper: cheat,
             entity,
@@ -679,8 +707,24 @@ impl Bot {
     /// anything — see [`Bot::first_tampered_tick`].
     pub fn step_core(&mut self, tick: u64, cell_edge_m: f32) {
         let at = Tick::new(tick);
+        let mut delivered_to_locker = core::mem::take(&mut self.locker_lock_inbox);
+        if !self.target_lock_inbox.is_empty() {
+            let target_inputs = core::mem::take(&mut self.target_lock_inbox);
+            let target_output = self
+                .lock_resolver
+                .step_entity(self.lock_target, at, &target_inputs)
+                .expect("lock target fixture remains installed");
+            for event in &target_output.events {
+                if let Some((recipient, order)) = self.lock_resolver.ruleset().deliver(event) {
+                    if recipient == self.entity {
+                        self.locker_lock_inbox.push(order);
+                    }
+                }
+            }
+        }
         let mut rng = tick_rng(self.seed, self.entity, at);
         let mut orders = Vec::with_capacity(3);
+        orders.append(&mut delivered_to_locker);
         orrery_games::regolith::pilot::honest_orders(
             self.entity,
             self.slot,
@@ -723,6 +767,13 @@ impl Bot {
             .executor
             .step_entity(self.entity, at, &orders)
             .expect("entity present");
+        for event in &outcome.events {
+            if let Some((recipient, order)) = self.executor.ruleset().deliver(event) {
+                if recipient == self.lock_target && matches!(order, Order::LockRequested { .. }) {
+                    self.target_lock_inbox.push(order);
+                }
+            }
+        }
         if let Some(shadow) = &mut self.honest_shadow {
             let honest = shadow
                 .step_entity(self.entity, at, &orders)
