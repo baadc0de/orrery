@@ -57,6 +57,7 @@ their linked dependencies.
 | D42 | [ADR-0042](adr/0042-canonical-simulation-architecture.md) | Canonical state stays in the engine-neutral executor; composition root and `SimulationHost` seam land now; shared app world rejected; dedicated ECS world trigger-gated |
 | D43 | [ADR-0043](adr/0043-determinism-envelope-and-gate-replacement.md) | The three-ring determinism envelope, canonical stages S0–S7, and role-discovery replacing the typed gate list; overflow flags inside witnessed state |
 | D45 | [ADR-0045](adr/0045-per-component-capability-policy.md) | Five independent capability dimensions with fail-closed zeros and eight invalid combinations; `classify_component` replaced; IV-7's engine-handle rule accepted, its enforcement mechanism open |
+| D46 | [ADR-0046](adr/0046-message-class-semantics.md) | Six message classes with internal commands collapsed onto domain events; delivered-first composition ratified as law; emission cap binds and flags rather than failing the tick |
 
 ## Status and supersession
 
