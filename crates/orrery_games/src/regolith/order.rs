@@ -44,6 +44,8 @@ pub enum ShotResult {
     Miss,
     /// The target was outside every firing arc when the shot was emitted.
     OutOfArc,
+    /// The fire action arrived without a mature lock to consume.
+    NoLock,
 }
 
 impl ShotResult {
@@ -52,6 +54,7 @@ impl ShotResult {
             Self::Hit => 0,
             Self::Miss => 1,
             Self::OutOfArc => 2,
+            Self::NoLock => 3,
         }
     }
 
@@ -60,6 +63,7 @@ impl ShotResult {
             0 => Ok(Self::Hit),
             1 => Ok(Self::Miss),
             2 => Ok(Self::OutOfArc),
+            3 => Ok(Self::NoLock),
             _ => Err(CodecError("regolith: unknown shot result")),
         }
     }
@@ -120,11 +124,13 @@ pub enum Order {
         /// Pitch delta (honest input is zero).
         pitch_urad: i32,
     },
-    /// Fire the equipped weapon at a target.
-    Fire {
+    /// Acquire or sustain a lock on one target without firing.
+    Lock {
         /// Target id.
         target: PersistId,
     },
+    /// Fire the equipped weapon at the mature lock held in own state.
+    Fire,
     /// Damage delivered from a prior tick.
     Damage {
         /// Rolled amount.
@@ -220,8 +226,9 @@ impl CoreCodec for Order {
                 out.extend_from_slice(&yaw_urad.to_le_bytes());
                 out.extend_from_slice(&pitch_urad.to_le_bytes());
             }
-            Self::Fire { target } => {
-                out.push(1);
+            Self::Fire => out.push(1),
+            Self::Lock { target } => {
+                out.push(14);
                 out.extend_from_slice(&target.0.to_le_bytes());
             }
             Self::Damage {
@@ -302,7 +309,8 @@ impl CoreCodec for Order {
                 yaw_urad: i32::from_le_bytes(rest[4..8].try_into().unwrap()),
                 pitch_urad: i32::from_le_bytes(rest[8..12].try_into().unwrap()),
             }),
-            (1, 8) => Ok(Self::Fire {
+            (1, 0) => Ok(Self::Fire),
+            (14, 8) => Ok(Self::Lock {
                 target: PersistId::new(u64::from_le_bytes(rest.try_into().unwrap())),
             }),
             (2, 69) if rest[66] <= 1 => Ok(Self::Damage {
@@ -474,6 +482,13 @@ pub enum Outcome {
         /// Target that resolved the projectile.
         target: PersistId,
         /// Whether the shot hit, missed, or was refused by the firing arc.
+        result: ShotResult,
+    },
+    /// A fire action was refused before any projectile existed.
+    ShotRefused {
+        /// Shooter receiving the immediate, own-state refusal.
+        attacker: PersistId,
+        /// Named refusal suitable for presentation.
         result: ShotResult,
     },
     /// A target verified a named cover transition for delivery to its locker.
@@ -660,6 +675,11 @@ impl CoreCodec for Outcome {
                 out.extend_from_slice(&target.0.to_le_bytes());
                 out.push(result.tag());
             }
+            Self::ShotRefused { attacker, result } => {
+                out.push(14);
+                out.extend_from_slice(&attacker.0.to_le_bytes());
+                out.push(result.tag());
+            }
             Self::LockVisibility {
                 locker,
                 target,
@@ -759,6 +779,10 @@ impl CoreCodec for Outcome {
                 locker: PersistId::new(u64::from_le_bytes(rest[0..8].try_into().unwrap())),
                 target: PersistId::new(u64::from_le_bytes(rest[8..16].try_into().unwrap())),
                 occluded: rest[16] == 1,
+            }),
+            (14, 9) => Ok(Self::ShotRefused {
+                attacker: PersistId::new(u64::from_le_bytes(rest[0..8].try_into().unwrap())),
+                result: ShotResult::from_tag(rest[8])?,
             }),
             _ => Err(CodecError("regolith outcome: bad tag or length")),
         }

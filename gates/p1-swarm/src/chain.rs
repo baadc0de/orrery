@@ -271,12 +271,7 @@ mod tests {
         );
 
         for tick in 1..CLAIM_EVERY {
-            chain.log_inputs(
-                tick,
-                &[orrery_games::regolith::order::Order::Fire {
-                    target: PersistId::new(2),
-                }],
-            );
+            chain.log_inputs(tick, &[orrery_games::regolith::order::Order::Fire]);
         }
         let next = chain
             .cut_claim(CLAIM_EVERY, &state)

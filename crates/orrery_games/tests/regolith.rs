@@ -82,8 +82,8 @@ fn sample<'a>(
 }
 
 #[test]
-fn v10_weapon_table_ruleset_identity_and_island_budget_are_pinned() {
-    assert_eq!(REGOLITH_RULESET.version, 10);
+fn v11_weapon_table_ruleset_identity_and_island_budget_are_pinned() {
+    assert_eq!(REGOLITH_RULESET.version, 11);
     assert_eq!(WeaponKind::Stock.weapon().damage_base, 10);
     assert_eq!(WeaponKind::Volley.weapon().rolls, 3);
     assert_eq!(WeaponKind::Stock.weapon().optimal_mm, 300_000);
@@ -129,7 +129,7 @@ fn pilot_scenario_table_covers_the_four_durable_surfaces() {
         assert_eq!(
             orders
                 .iter()
-                .filter(|order| matches!(order, Order::Fire { .. }))
+                .filter(|order| matches!(order, Order::Fire))
                 .count(),
             1,
             "{} must hold the trigger",
@@ -258,7 +258,7 @@ fn kill_credit_is_log_delivered_and_replays_from_the_killers_input() {
     live.insert(victim, RegolithState::Craft(victim_state));
 
     let fired = live
-        .step_entity(killer, Tick::new(1), &[Order::Fire { target: victim }])
+        .step_entity(killer, Tick::new(1), &[Order::Fire])
         .expect("killer exists");
     let damage = game
         .deliver(&fired.events[0])
@@ -286,7 +286,7 @@ fn kill_credit_is_log_delivered_and_replays_from_the_killers_input() {
     let mut replay = Executor::new(game, UniverseSeed([0xC1; 32]));
     replay.insert(killer, RegolithState::Craft(killer_start.clone()));
     replay
-        .step_entity(killer, Tick::new(1), &[Order::Fire { target: victim }])
+        .step_entity(killer, Tick::new(1), &[Order::Fire])
         .expect("isolated killer exists");
     replay
         .step_entity(killer, Tick::new(2), &[])
@@ -299,7 +299,7 @@ fn kill_credit_is_log_delivered_and_replays_from_the_killers_input() {
     let mut replay_without_delivery = Executor::new(game, UniverseSeed([0xC1; 32]));
     replay_without_delivery.insert(killer, RegolithState::Craft(killer_start));
     replay_without_delivery
-        .step_entity(killer, Tick::new(1), &[Order::Fire { target: victim }])
+        .step_entity(killer, Tick::new(1), &[Order::Fire])
         .expect("isolated killer exists");
     replay_without_delivery
         .step_entity(killer, Tick::new(2), &[])
@@ -572,13 +572,7 @@ fn volley_is_three_left_slot_first_rolls_and_uses_its_own_cooldown() {
     executor.insert(PersistId::new(1), RegolithState::Craft(shooter));
     executor.insert(PersistId::new(2), RegolithState::Craft(craft_at(1)));
     let output = executor
-        .step_entity(
-            PersistId::new(1),
-            Tick::new(1),
-            &[Order::Fire {
-                target: PersistId::new(2),
-            }],
-        )
+        .step_entity(PersistId::new(1), Tick::new(1), &[Order::Fire])
         .unwrap();
     assert_eq!(output.events.len(), 3);
     assert!(output.events.iter().all(|event| matches!(
@@ -959,7 +953,7 @@ fn fire_through_executor(archetype: Archetype, target_pos: QPos) -> (Craft, Craf
     executor.insert(target, RegolithState::Craft(victim));
 
     let fired = executor
-        .step_entity(attacker, Tick::new(1), &[Order::Fire { target }])
+        .step_entity(attacker, Tick::new(1), &[Order::Fire])
         .expect("the locked shooter exists");
     let damage = fired
         .events
@@ -1078,23 +1072,22 @@ fn each_hulls_in_arc_shot_resolves_as_before() {
 }
 
 #[test]
-fn lock_acquisition_replays_from_the_locker_alone() {
+fn holding_lock_without_fire_produces_no_damage_over_many_ticks() {
     let locker = PersistId::new(1);
     let target = PersistId::new(2);
     let run = || {
         let mut executor = Executor::new(Regolith::honest(), UniverseSeed([0xAC; 32]));
         executor.insert(locker, RegolithState::Craft(craft_at(0)));
         let mut hashes = Vec::new();
-        for tick in 1..=u64::from(LOCK_ACQUISITION_TICKS) {
+        for tick in 1..=u64::from(LOCK_ACQUISITION_TICKS) * 4 {
             let output = executor
-                .step_entity(locker, Tick::new(tick), &[Order::Fire { target }])
+                .step_entity(locker, Tick::new(tick), &[Order::Lock { target }])
                 .expect("locker exists");
             assert!(output.neighbor_reads.is_empty());
-            if tick < u64::from(LOCK_ACQUISITION_TICKS) {
-                assert!(output.events.is_empty(), "lock fired early at tick {tick}");
-            } else {
-                assert!(!output.events.is_empty(), "acquired lock did not fire");
-            }
+            assert!(
+                output.events.is_empty(),
+                "lock alone produced an outcome at tick {tick}"
+            );
             hashes.push(output.state_hash);
         }
         (
@@ -1115,6 +1108,11 @@ fn lock_acquisition_replays_from_the_locker_alone() {
             ..
         }) if locked == target
     ));
+    let RegolithState::Craft(live) = live else {
+        panic!("locker remains a craft")
+    };
+    assert_eq!(live.shots, 0, "lock alone must never spend a shot");
+    assert_eq!(live.damage_dealt, 0, "lock alone must never roll damage");
 }
 
 fn locked_craft(target: PersistId) -> Craft {
@@ -1126,7 +1124,124 @@ fn locked_craft(target: PersistId) -> Craft {
 }
 
 #[test]
-fn fire_on_a_different_target_switches_the_lock_and_restarts_acquisition() {
+fn fire_without_a_mature_lock_is_a_named_refusal() {
+    let shooter = PersistId::new(1);
+    let mut executor = Executor::new(Regolith::honest(), UniverseSeed([0xF1; 32]));
+    executor.insert(shooter, RegolithState::Craft(craft_at(0)));
+
+    let output = executor
+        .step_entity(shooter, Tick::new(1), &[Order::Fire])
+        .expect("shooter exists");
+
+    assert_eq!(
+        output.events,
+        [Outcome::ShotRefused {
+            attacker: shooter,
+            result: ShotResult::NoLock,
+        }]
+    );
+    assert!(matches!(
+        executor.state(shooter),
+        Some(RegolithState::Craft(Craft {
+            shots: 0,
+            damage_dealt: 0,
+            ..
+        }))
+    ));
+}
+
+#[test]
+fn fire_action_with_a_mature_lock_emits_the_existing_damage_path() {
+    let shooter = PersistId::new(1);
+    let target = PersistId::new(2);
+    let mut executor = Executor::new(Regolith::honest(), UniverseSeed([0xF2; 32]));
+    executor.insert(shooter, RegolithState::Craft(locked_craft(target)));
+
+    let output = executor
+        .step_entity(shooter, Tick::new(1), &[Order::Fire])
+        .expect("shooter exists");
+
+    assert!(matches!(
+        output.events.as_slice(),
+        [Outcome::DamageDealt {
+            attacker,
+            target: fired_at,
+            amount: 10..=13,
+            ..
+        }] if *attacker == shooter && *fired_at == target
+    ));
+    assert!(matches!(
+        executor.state(shooter),
+        Some(RegolithState::Craft(Craft {
+            shots: 1,
+            cooldown: 20,
+            ..
+        }))
+    ));
+}
+
+#[test]
+fn lock_switch_and_fire_are_applied_in_input_order() {
+    let shooter = PersistId::new(1);
+    let first_target = PersistId::new(2);
+    let second_target = PersistId::new(3);
+    let run = |orders: &[Order]| {
+        let mut executor = Executor::new(Regolith::honest(), UniverseSeed([0xF3; 32]));
+        executor.insert(shooter, RegolithState::Craft(locked_craft(first_target)));
+        let output = executor
+            .step_entity(shooter, Tick::new(1), orders)
+            .expect("shooter exists");
+        let state = executor.state(shooter).expect("shooter remains").clone();
+        (state, output.events)
+    };
+
+    let (switch_then_fire, switch_then_fire_events) = run(&[
+        Order::Lock {
+            target: second_target,
+        },
+        Order::Fire,
+    ]);
+    assert_eq!(
+        switch_then_fire_events,
+        [Outcome::ShotRefused {
+            attacker: shooter,
+            result: ShotResult::NoLock,
+        }],
+        "the preceding switch wins, so its fresh lock is not mature"
+    );
+    assert!(matches!(
+        switch_then_fire,
+        RegolithState::Craft(Craft {
+            lock_target: Some(target),
+            lock_progress: 1,
+            shots: 0,
+            ..
+        }) if target == second_target
+    ));
+
+    let (fire_then_switch, fire_then_switch_events) = run(&[
+        Order::Fire,
+        Order::Lock {
+            target: second_target,
+        },
+    ]);
+    assert!(matches!(
+        fire_then_switch_events.as_slice(),
+        [Outcome::DamageDealt { target, .. }] if *target == first_target
+    ));
+    assert!(matches!(
+        fire_then_switch,
+        RegolithState::Craft(Craft {
+            lock_target: Some(target),
+            lock_progress: 1,
+            shots: 1,
+            ..
+        }) if target == second_target
+    ));
+}
+
+#[test]
+fn lock_on_a_different_target_switches_and_restarts_acquisition() {
     let locker = PersistId::new(1);
     let first_target = PersistId::new(2);
     let second_target = PersistId::new(3);
@@ -1143,7 +1258,7 @@ fn fire_on_a_different_target_switches_the_lock_and_restarts_acquisition() {
         .step_entity(
             locker,
             Tick::new(1),
-            &[Order::Fire {
+            &[Order::Lock {
                 target: second_target,
             }],
         )
@@ -1169,7 +1284,7 @@ fn fire_on_a_different_target_switches_the_lock_and_restarts_acquisition() {
             .step_entity(
                 locker,
                 Tick::new(tick),
-                &[Order::Fire {
+                &[Order::Lock {
                     target: second_target,
                 }],
             )
@@ -1183,12 +1298,15 @@ fn fire_on_a_different_target_switches_the_lock_and_restarts_acquisition() {
         .step_entity(
             locker,
             Tick::new(u64::from(LOCK_ACQUISITION_TICKS)),
-            &[Order::Fire {
+            &[Order::Lock {
                 target: second_target,
             }],
         )
         .expect("locker exists");
-    assert!(!acquired.events.is_empty(), "re-acquired lock did not fire");
+    assert!(
+        acquired.events.is_empty(),
+        "re-acquired lock must not fire without an action"
+    );
     assert!(matches!(
         executor.state(locker),
         Some(RegolithState::Craft(Craft {
@@ -1201,7 +1319,7 @@ fn fire_on_a_different_target_switches_the_lock_and_restarts_acquisition() {
 }
 
 #[test]
-fn fire_on_the_locked_target_keeps_banked_acquisition() {
+fn lock_on_the_same_target_keeps_banked_acquisition() {
     let locker = PersistId::new(1);
     let target = PersistId::new(2);
     let mut executor = Executor::new(Regolith::honest(), UniverseSeed([0x58; 32]));
@@ -1210,7 +1328,7 @@ fn fire_on_the_locked_target_keeps_banked_acquisition() {
     start.lock_progress = LOCK_ACQUISITION_TICKS / 2;
     executor.insert(locker, RegolithState::Craft(start));
     executor
-        .step_entity(locker, Tick::new(1), &[Order::Fire { target }])
+        .step_entity(locker, Tick::new(1), &[Order::Lock { target }])
         .expect("locker exists");
     assert!(matches!(
         executor.state(locker),
@@ -1374,7 +1492,7 @@ fn range_exceeded_and_target_destroyed_break_logged_locks() {
         executor.insert(locker, RegolithState::Craft(locked_craft(target)));
         executor.insert(target, RegolithState::Craft(target_state));
         let fired = executor
-            .step_entity(locker, Tick::new(1), &[Order::Fire { target }])
+            .step_entity(locker, Tick::new(1), &[Order::Fire])
             .expect("locker fires");
         let projectile = game
             .deliver(
@@ -1675,6 +1793,8 @@ fn pickup_state_and_grammar_are_canonical() {
         assert_eq!(RegolithState::decode(&state.to_canonical()).unwrap(), state);
     }
     let orders = [
+        Order::Lock { target: pickup },
+        Order::Fire,
         Order::Grab { pickup },
         Order::GrabAttempt {
             ship,
@@ -1781,6 +1901,10 @@ fn pickup_state_and_grammar_are_canonical() {
             attacker: ship,
             target: pickup,
             result: ShotResult::OutOfArc,
+        },
+        Outcome::ShotRefused {
+            attacker: ship,
+            result: ShotResult::NoLock,
         },
     ];
     for outcome in outcomes {

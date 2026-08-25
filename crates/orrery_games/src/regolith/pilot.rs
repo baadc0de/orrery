@@ -86,16 +86,20 @@ pub fn honest_orders(
         pitch_urad: 0,
     });
 
-    // Held trigger: exactly one Fire order is emitted every tick. Only this
-    // target selector is combat-shaped, so tracking/time-of-flight can replace
-    // hit resolution without reopening the table or the non-combat ports.
+    // A held lock is sustained every tick without producing an outcome. Only
+    // this target selector is combat-shaped, so tracking/time-of-flight can
+    // replace hit resolution without reopening the table or non-combat ports.
     let target = match scenario {
         PilotScenario::Combat => combat_target(entity),
         PilotScenario::Mining => mining_target(slot, tick),
         PilotScenario::ContestedGrab => mining_target(slot / 2, tick),
         PilotScenario::BloomConvergence => bloom_target(tick),
     };
-    out.push(Order::Fire { target });
+    out.push(Order::Lock { target });
+
+    // The headless pilot holds its trigger. Human input filters this discrete
+    // action while retaining the lock order above.
+    out.push(Order::Fire);
 
     if scenario == PilotScenario::ContestedGrab {
         out.push(Order::Grab {

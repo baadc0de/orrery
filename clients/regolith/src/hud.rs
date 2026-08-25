@@ -435,7 +435,7 @@ pub fn spawn_world_overlay(
         ..Default::default()
     });
 
-    // The acquisition ring: one tick mark per tick of held trigger the ruleset
+    // The acquisition ring: one tick mark per tick of held lock the ruleset
     // demands, so a full ring is `LOCK_ACQUISITION_TICKS` and nothing has to
     // rescale when that constant moves.
     let segment = meshes.add(Cuboid::new(
@@ -862,6 +862,11 @@ pub fn refresh_combat_hud(
                         result: ShotResult::OutOfArc,
                         ..
                     })
+                    | Some(ShotCue::Resolved {
+                        result: ShotResult::NoLock,
+                        ..
+                    })
+                    | Some(ShotCue::Refused { .. })
                     | None => DIM,
                 };
                 (feedback.banner(), tint)
