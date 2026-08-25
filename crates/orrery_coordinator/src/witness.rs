@@ -456,10 +456,27 @@ impl WitnessSeeder {
     /// And, said out loud because a silent no-op reads like enforcement: the
     /// strike-score threshold is still **approximated** by the coarse
     /// quarantine flag (D33 clause (f) declines to widen the token for it), and
-    /// per-account exclusion holds only within this coordinator — a NodeId
-    /// bound to the same account but connected elsewhere is not deduped,
-    /// because nothing writes the `id/` rows that would answer it. D28's
-    /// Consequences carries the cost of each.
+    /// per-account exclusion holds only **within this coordinator**. The `id/`
+    /// rows that map an account to every NodeId bound to it now exist and are
+    /// written (`orrery_identity`, D31 clause (a)), but D31 clause (d) bars
+    /// this process from reading them — "the coordinator reads nothing: every
+    /// candidate it seeds from has a live token-verified session, so its
+    /// account is already in hand" — and D31's Consequences say the durable
+    /// index would not close the gap anyway: a NodeId connected to a
+    /// *different* coordinator is absent from this pool entirely, so no lookup
+    /// over this pool can exclude it.
+    ///
+    /// So the residual, exactly: a Sybil whose same-account NodeIds hold
+    /// sessions on **concurrently seeding coordinators** (separate regions or
+    /// incarnations) can hold one witness slot per coordinator, and party
+    /// exclusion over an account's *unconnected* NodeIds is not evaluated here
+    /// — the gateway's admission-time check (D31 clauses (e)/(f), #211) is the
+    /// half that reads the durable map. Collusion across *different* paid
+    /// accounts is a separate miss no binding table answers. `docs/09` §3's
+    /// reference topology runs one coordinator (a warm standby does not seed,
+    /// and scaled production stays "logically one per universe"), which is why
+    /// the per-coordinator boundary is where the accepted records drew the
+    /// line; D28 clause (e)'s table grades each row accordingly.
     ///
     /// Probation is enforced from the signed field and is therefore exactly as
     /// fresh as the token: an account that crossed its window mid-session is
@@ -1434,6 +1451,200 @@ mod tests {
         assert!(seeder
             .eligible_pool(&registry, cell(0), T0 + 71_000)
             .contains(&node(3)));
+    }
+
+    /// D28 clause (e)'s one-slot-per-account row, with the dedup as the
+    /// **only** refuser. Every other filter passes for the doubled NodeId —
+    /// proven by a control peer treated identically except for the shared
+    /// account, which *is* seated — so deleting the dedup admits both and
+    /// this test alone catches it, rather than some other clause refusing
+    /// the fixture for its own reasons.
+    #[test]
+    fn one_account_on_two_live_sessions_holds_one_slot_and_dedup_is_the_only_refuser() {
+        let (mut registry, mut seeder) = populated(8);
+        // node(40) presents a verified token for account 3 — already held by
+        // node(3) — and node(41) an identical token for a fresh account. The
+        // two differ in nothing but the account their signed claims carry.
+        for (peer, account) in [(node(40), 3u64), (node(41), 41u64)] {
+            registry.report_presence(peer, vec![cell(0)]);
+            seeder.note_session(
+                peer,
+                &session_claims(
+                    peer,
+                    AccountId::new(account),
+                    SessionStanding::Good,
+                    TOKEN_ISSUED,
+                ),
+                T0,
+            );
+        }
+
+        let pool = seeder.eligible_pool(&registry, cell(0), T0 + 10_000);
+        assert!(
+            pool.contains(&node(41)),
+            "the control peer proves every other filter passes for this shape"
+        );
+        let doubled = [node(3), node(40)];
+        assert_eq!(
+            usize::from(pool.contains(&doubled[0])) + usize::from(pool.contains(&doubled[1])),
+            1,
+            "one account on two live sessions took two witness slots"
+        );
+        // And the survivor is the deterministic one: the lowest NodeId.
+        let lower = *doubled.iter().min_by_key(|n| *n.as_bytes()).unwrap();
+        assert!(
+            pool.contains(&lower),
+            "the dedup kept the higher NodeId; the tiebreak is not deterministic"
+        );
+    }
+
+    /// The reconnect trick the cooldown map's doc names: a Sybil cannot dodge
+    /// its own cooldown by reconnecting under a second NodeId, because the
+    /// cooldown is keyed by the token's signed account and the fresh NodeId's
+    /// token carries the same account. A control peer in the identical
+    /// position on a fresh account is seated, so the cooldown is the only
+    /// refuser here.
+    #[test]
+    fn a_cooldown_bars_a_fresh_nodeid_carrying_the_cooled_accounts_token() {
+        let (mut registry, mut seeder) = populated(12);
+        // Account 3 bounces: its session drops, putting the *account* on
+        // cooldown until T0 + 70_000.
+        seeder.forget_session(node(3), T0 + 10_000);
+        // It returns under a NodeId this coordinator has never seen a `Hello`
+        // from — but the token still names account 3, because identity signed
+        // it. node(51) is the control: same arrival, fresh account.
+        for (peer, account) in [(node(50), 3u64), (node(51), 51u64)] {
+            registry.report_presence(peer, vec![cell(0)]);
+            seeder.note_session(
+                peer,
+                &session_claims(
+                    peer,
+                    AccountId::new(account),
+                    SessionStanding::Good,
+                    TOKEN_ISSUED,
+                ),
+                T0 + 11_000,
+            );
+        }
+
+        // Presence is satisfied for both; only the cooldown separates them.
+        let pool = seeder.eligible_pool(&registry, cell(0), T0 + 25_000);
+        assert!(pool.contains(&node(51)), "the control peer must be seated");
+        assert!(
+            !pool.contains(&node(50)),
+            "a second NodeId dodged its account's cooldown by reconnecting"
+        );
+        // Once the account's cooldown lapses, the new NodeId is eligible on
+        // the same terms as anyone — the exclusion is a cooldown, not a ban.
+        assert!(seeder
+            .eligible_pool(&registry, cell(0), T0 + 71_000)
+            .contains(&node(50)));
+    }
+
+    /// D31 clause (f)'s direction, applied at the seeder: a candidate whose
+    /// account binding this coordinator cannot establish — no token-verified
+    /// session, which per D31 clause (d) is the only binding source the
+    /// coordinator has — is excluded, never admitted. The same peer is seated
+    /// the moment a verified session supplies the binding, so the missing
+    /// binding is the only refuser.
+    #[test]
+    fn an_unresolvable_binding_excludes_and_never_admits() {
+        let (mut registry, mut seeder) = populated(8);
+        // node(60) covers the cell — presence says it is there — but it has
+        // never presented a session token, so no signed fact binds it to any
+        // account.
+        registry.report_presence(node(60), vec![cell(0)]);
+        assert!(
+            !seeder
+                .eligible_pool(&registry, cell(0), T0 + 10_000)
+                .contains(&node(60)),
+            "a candidate with no verified account binding was admitted"
+        );
+        // Supplying the binding — and nothing else — seats it.
+        seeder.note_session(
+            node(60),
+            &session_claims(
+                node(60),
+                AccountId::new(60),
+                SessionStanding::Good,
+                TOKEN_ISSUED,
+            ),
+            T0,
+        );
+        assert!(seeder
+            .eligible_pool(&registry, cell(0), T0 + 10_000)
+            .contains(&node(60)));
+    }
+
+    /// The pool is a pure function of its inputs (the design commitment on
+    /// [`WitnessSeeder`]): the same facts produce byte-for-byte the same
+    /// vector regardless of insertion order and across repeated calls, with
+    /// the same-account tiebreak landing on the same NodeId both ways. D28
+    /// clause (c)'s audit replays the draw from the announced pool, so a pool
+    /// that depended on iteration order would unmake the audit.
+    #[test]
+    fn the_pool_is_deterministic_across_insertion_orders_and_repeated_calls() {
+        // Six accounts, one of them (account 2) on two NodeIds.
+        let facts: Vec<(NodeId, u64)> = vec![
+            (node(1), 1),
+            (node(2), 2),
+            (node(3), 3),
+            (node(4), 4),
+            (node(5), 5),
+            (node(6), 6),
+            (node(20), 2),
+        ];
+        let build = |order: &[(NodeId, u64)]| {
+            let mut registry = IslandRegistry::new();
+            let mut seeder = WitnessSeeder::new(GridId::ROOT);
+            for (peer, account) in order {
+                registry.report_presence(*peer, vec![cell(0)]);
+                seeder.note_session(
+                    *peer,
+                    &session_claims(
+                        *peer,
+                        AccountId::new(*account),
+                        SessionStanding::Good,
+                        TOKEN_ISSUED,
+                    ),
+                    T0,
+                );
+            }
+            seeder.eligible_pool(&registry, cell(0), T0 + 10_000)
+        };
+        let ascending = build(&facts);
+        let reversed: Vec<_> = facts.iter().rev().copied().collect();
+        let descending = build(&reversed);
+        assert_eq!(
+            ascending, descending,
+            "the pool depends on session insertion order"
+        );
+        assert_eq!(ascending, build(&facts), "repeated calls disagree");
+        let mut sorted = ascending.clone();
+        sorted.sort_by_key(|n| *n.as_bytes());
+        assert_eq!(
+            ascending, sorted,
+            "the pool is not in ascending NodeId order"
+        );
+        // The tiebreak survivor is the byte-lower of the doubled pair.
+        let lower = *[node(2), node(20)]
+            .iter()
+            .min_by_key(|n| *n.as_bytes())
+            .unwrap();
+        assert_eq!(ascending.len(), 6);
+        assert!(ascending.contains(&lower));
+    }
+
+    /// The ordinary case is provably unperturbed: every candidate on its own
+    /// account, all connected here, all past every filter — the pool is
+    /// exactly the candidates, in ascending NodeId order, nobody deduped.
+    #[test]
+    fn an_all_distinct_connected_pool_seats_every_candidate() {
+        let (registry, seeder) = populated(12);
+        let pool = seeder.eligible_pool(&registry, cell(0), T0 + 10_000);
+        let mut expected: Vec<NodeId> = (1..=12u8).map(node).collect();
+        expected.sort_by_key(|n| *n.as_bytes());
+        assert_eq!(pool, expected);
     }
 
     #[test]
