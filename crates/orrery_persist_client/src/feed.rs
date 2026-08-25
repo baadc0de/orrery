@@ -170,4 +170,58 @@ mod tests {
         let scheduler = app.world().resource::<UplinkScheduler>();
         assert!(!scheduler.has_pending(orrery_protocol::PersistId::new(2)));
     }
+
+    /// An entity in the uplink-passing state — `PersistId`, `Cell`,
+    /// `Authority`, `AuthorityPhase::LocalGranted` — that nevertheless lacks
+    /// [`LocallyAuthoritative`] must not be uplinked. The marker clause is the
+    /// only thing refusing this fixture: every other clause would let it
+    /// through, which is why deleting the `With<LocallyAuthoritative>` filter
+    /// fails this test by name while the rest of the suite stays green.
+    ///
+    /// Reachability caveat (#417): I could not establish that this state
+    /// occurs in a live race. Every current writer of
+    /// `AuthorityPhase::LocalGranted` in `orrery_authority` either bundles the
+    /// marker into the same insert (`src/lib.rs:531`) or re-stamps the phase
+    /// onto an entity already holding a local lease (`src/lib.rs:599`,
+    /// `src/lib.rs:791`), and every marker removal co-occurs with the phase
+    /// leaving `LocalGranted` (`src/lib.rs:449`, `:606`, `:777`). But
+    /// `AuthorityPhase` is a public component enum, so nothing type-enforces
+    /// the pairing: this test pins the invariant the guard enforces, as
+    /// defense against future edits to those sites and against third-party
+    /// code stamping phases directly — not a demonstrated race.
+    #[test]
+    fn local_granted_without_marker_is_not_uplinked() {
+        let mut app = app();
+        let entity = app
+            .world_mut()
+            .spawn((
+                PersistId::new(3),
+                Cell(CellId::ROOT),
+                Authority {
+                    holder: None,
+                    seq: Default::default(),
+                },
+                AuthorityPhase::LocalGranted {
+                    lease_id: orrery_protocol::LeaseId(3),
+                    expires_at_ms: 10_000,
+                },
+                // Deliberately no LocallyAuthoritative.
+            ))
+            .id();
+
+        app.world_mut()
+            .resource_mut::<Messages<ComponentDiff>>()
+            .write(ComponentDiff {
+                entity,
+                fns_id: FnsId::new(0),
+                payload: bytes::Bytes::from_static(b"hp=50"),
+            });
+
+        app.update();
+
+        let scheduler = app.world().resource::<UplinkScheduler>();
+        assert!(!scheduler.has_pending(orrery_protocol::PersistId::new(3)));
+        let seq = app.world().resource::<UplinkSeq>();
+        assert_eq!(seq.next.get(&entity), None);
+    }
 }

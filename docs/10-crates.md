@@ -1,21 +1,20 @@
 # Crate architecture
 
-This document expands [ADR-0015](adr/0015-crate-set.md) into a concrete Cargo workspace: the layout tree, the dependency spine and its layering rules, a per-crate reference (purpose, public API sketch, dependencies, feature flags, Bevy status) for all thirteen `orrery_*` crates, the games-bring-rules linking pattern, client app composition, the lockstep versioning/release policy, and the upstreaming plan plus the replicon-direct plan B. All code below is **sketch-grade**: signatures are indicative of shape and naming, not guaranteed to compile.
+This document expands [ADR-0015](adr/0015-crate-set.md) into a concrete Cargo workspace: the layout tree, the dependency spine and its layering rules, a per-crate reference (purpose, public API sketch, dependencies, feature flags, Bevy status) for every first-party `orrery_*` crate (fifteen at present), the games-bring-rules linking pattern, client app composition, the lockstep versioning/release policy, and the upstreaming plan plus the replicon-direct plan B. All code below is **sketch-grade**: signatures are indicative of shape and naming, not guaranteed to compile.
 
 Normative source: [ADR-0015](adr/0015-crate-set.md), drawing on [D4](adr/0004-bevy-netcode-stack.md), [D12](adr/0012-backend-services.md), [D14](adr/0014-pinned-versions.md), and [D17](adr/0017-risks-and-open-questions.md).
 
 ## Workspace layout
 
-One workspace, one version number, one lockfile — with the standalone tools (`p0-*`, `gates/p1-swarm`, `gates/p2-load`, `gates/p2-dashboard`, `gates/p3-island`, `gates/p4-streams-bench`) excluded from it, each declaring its own `[workspace]` and carrying its own committed lockfile, so a harness cannot drag a dependency into the shipped graph. Server crates and client crates live together so protocol changes are atomic across both sides.
+One workspace, one version number, one lockfile — with the standalone tools under `gates/` and the client under `clients/regolith` excluded from it, each declaring its own `[workspace]` and carrying its own committed lockfile, so a harness cannot drag a dependency into the shipped graph. Server crates and client crates live together so protocol changes are atomic across both sides.
 
 ```
 orrery/
 ├── Cargo.toml                  # [workspace] + [workspace.dependencies] pin table (D14)
 ├── rust-toolchain.toml
-├── crates/
+├── crates/                     # first-party members
 │   ├── orrery_protocol/        # lib · engine-agnostic · wire & data types
 │   ├── orrery_core/            # lib · engine-agnostic · verifiable core / Ruleset
-│   ├── orrery_aeronet_iroh/    # lib · aeronet IO layer over iroh (upstream candidate)
 │   ├── orrery_net/             # Bevy plugin · sessions, coordinator client, channels
 │   ├── orrery_spatial/         # Bevy plugin · CellId math, AOI, visibility mapping
 │   ├── orrery_authority/       # Bevy plugin · claims, leases, handoff
@@ -24,32 +23,39 @@ orrery/
 │   ├── orrery_persist_client/  # Bevy plugin · area load, diff uplink, intents
 │   ├── orrery/                 # lib · facade: OrreryClientPlugins + prelude
 │   ├── orrery_persistd/        # lib + reference bin · persistence cluster harness
+│   ├── orrery_seed/            # lib + bin · world seeder: TOML scenario runner (12-world-seeding.md)
+│   ├── orrery_games/           # lib · reference Rulesets + tampered variants (P4's measurement)
+│   ├── orrery_conformance/     # lib + bin · determinism-matrix reference ruleset + golden corpus
 │   ├── orrery_coordinator/     # bin · presence, islands, promotion
-│   ├── orrery_identity/        # bin · accounts, tokens, strikes
-│   └── orrery_field_host/      # bin + lib target · headless Bevy authority host
+│   └── orrery_identity/        # bin · accounts, tokens, strikes
+├── vendor/                     # vendored upstreams — root workspace members, not first-party
+│   ├── aeronet_iroh/           # lib · aeronet IO layer over iroh (upstream candidate; §3)
+│   ├── aeronet_tokio_runtime/  # tokio runtime adapter for aeronet
+│   └── bevy_replicon/          # pinned replication stack
 ├── examples/
 │   └── mygame/
 │       ├── mygame_rules/       # Ruleset impl — no Bevy dependency
 │       ├── mygame_client/      # Bevy app composing OrreryClientPlugins
-│       ├── mygame_persistd/    # MyRules linked into the persistd harness
-│       └── mygame_field_host/  # MyRules + gameplay plugins on FieldHostPlugins
+│       └── mygame_persistd/    # MyRules linked into the persistd harness
 └── deploy/                     # iroh-relay config, FDB manifests, otel collector
 ```
 
-The `orrery` facade is a fourteenth, purely compositional workspace member: it defines the `OrreryClientPlugins` plugin group named in D15 and a `prelude`. It contains no logic; a `PluginGroup` must live in a crate that depends on every member plugin, and none of the thirteen functional crates can do that without inverting the spine.
+The `orrery` facade is a fifteenth, purely compositional workspace member: it defines the `OrreryClientPlugins` plugin group named in D15 and a `prelude`. It contains no logic; a `PluginGroup` must live in a crate that depends on every member plugin, and none of the fourteen functional crates can do that without inverting the spine.
 
 ## Dependency spine
 
-Arrows read "depends on". Transitive edges are elided; **every crate except `orrery_aeronet_iroh` depends on `orrery_protocol`** (the IO layer stays orrery-free so it can be upstreamed verbatim, see [Upstreaming](#upstreaming-plan)).
+Arrows read "depends on". Transitive edges are elided; **every first-party crate depends on `orrery_protocol`**. The exception is structural, not accidental: the three vendored crates under `vendor/` depend on no orrery crate — the IO layer stays orrery-free so it can be upstreamed verbatim, see [Upstreaming](#upstreaming-plan).
 
 ```mermaid
 graph BT
     subgraph agnostic["Engine-agnostic — no Bevy (D15)"]
         protocol["orrery_protocol"]
         core["orrery_core"]
+        games["orrery_games"]
+        conf["orrery_conformance"]
     end
     subgraph client["Client plugin stack — Bevy 0.19"]
-        iroh_io["orrery_aeronet_iroh"]
+        iroh_io["aeronet_iroh (vendored)"]
         net["orrery_net"]
         spatial["orrery_spatial"]
         authority["orrery_authority"]
@@ -58,12 +64,15 @@ graph BT
         pclient["orrery_persist_client"]
         facade["orrery — facade: OrreryClientPlugins"]
     end
-    subgraph services["Services — Bevy-free except field_host"]
+    subgraph services["Services — Bevy-free"]
         persistd["orrery_persistd"]
         coord["orrery_coordinator"]
         identity["orrery_identity"]
-        fhost["orrery_field_host"]
+        seed["orrery_seed"]
+        fhost["orrery_field_host — planned P6, not built"]
     end
+    classDef planned stroke-dasharray: 5 5;
+    class fhost planned;
     game["game crates: rules, client, binaries"]
 
     core --> protocol
@@ -78,6 +87,12 @@ graph BT
     facade --> predict
     facade --> witness
     facade --> pclient
+    games --> core
+    games --> protocol
+    conf --> core
+    conf --> protocol
+    seed --> persistd
+    seed --> protocol
     persistd --> core
     coord --> protocol
     identity --> protocol
@@ -86,17 +101,16 @@ graph BT
     game --> facade
     game --> core
     game --> persistd
-    game --> fhost
 ```
 
 Layering rules (the first two are normative from D15; the rest are containment rules this doc establishes):
 
 1. `orrery_protocol` ← everything. Wire types are defined once, engine-free.
-2. `orrery_core` ← {`orrery_witness`, `orrery_persistd`, `orrery_field_host`, game}. The same `Ruleset` executes on peers, field hosts, and the cluster (D9).
+2. `orrery_core` ← {`orrery_witness`, `orrery_persistd`, game}. The same `Ruleset` executes on peers and the cluster today (D9); the field host is the designed third execution site and is **planned, not built** — no such crate exists anywhere in the tree ([D29](adr/0029-low-population-path.md) holds it in P6). See §14.
 3. **lightyear types appear only inside `orrery_predict`.** No other crate names a lightyear type in its public API. This is the plan-B blast radius (see below).
-4. **replicon types appear only in `orrery_spatial`** (visibility mapping) **and `orrery_persist_client`** (change-detection uplink). **aeronet types appear only in `orrery_aeronet_iroh` and `orrery_net`.**
+4. **replicon types appear only in `orrery_spatial`** (visibility mapping) **and `orrery_persist_client`** (change-detection uplink). **aeronet types appear only in `vendor/aeronet_iroh` and `orrery_net`.**
 5. `orrery_witness` and `orrery_persist_client` do not depend on each other: the witness emits `orrery_protocol` event types (`EvidenceBundle`, `AttestationGrant`) as Bevy messages; the persist client drains and transmits them.
-6. Bevy-free services speak iroh directly (tokio-native endpoints); `orrery_aeronet_iroh` exists only for Bevy processes, because [`aeronet_io`](https://github.com/aecsocket/aeronet) is `bevy_ecs`-based. Both sides interoperate because framing lives in `orrery_protocol`, not in the IO layer. `orrery-coordinator` and `persistd` are both this shape, and deliberately share one session pattern — an admission uni-stream, then tagged datagrams — so a peer needs one client for both.
+6. Bevy-free services speak iroh directly (tokio-native endpoints); `vendor/aeronet_iroh` exists only for Bevy processes, because [`aeronet_io`](https://github.com/aecsocket/aeronet) is `bevy_ecs`-based. Both sides interoperate because framing lives in `orrery_protocol`, not in the IO layer. `orrery-coordinator` and `persistd` are both this shape, and deliberately share one session pattern — an admission uni-stream, then tagged datagrams — so a peer needs one client for both.
 
 ## Crate reference
 
@@ -104,7 +118,7 @@ Layering rules (the first two are normative from D15; the rest are containment r
 |---|---|---|---|
 | `orrery_protocol` | lib | none | postcard/bitcode, serde, glam, iroh-base, lindel (opt) |
 | `orrery_core` | lib | none | rand_chacha 0.9, libm, blake3, ed25519 (iroh-base) |
-| `orrery_aeronet_iroh` | lib | via `aeronet_io` | aeronet 0.21, iroh 1.0.x, tokio |
+| `aeronet_iroh` (vendored) | lib | via `aeronet_io` | aeronet 0.21, iroh 1.0.x, tokio |
 | `orrery_net` | plugin | yes | aeronet 0.21, iroh 1.0.x, tokio |
 | `orrery_spatial` | plugin | yes | big_space 0.12 (0.19 port), bevy_replicon 0.42, kiddo 6.x |
 | `orrery_authority` | plugin | yes | — |
@@ -115,9 +129,9 @@ Layering rules (the first two are normative from D15; the rest are containment r
 | `orrery_persistd` | lib+bin | **none** | foundationdb-rs 0.11, wal-db 1.0.0 (default), fjall 3.x (fallback), iroh, tokio, tonic |
 | `orrery_seed` | lib+bin | **none** | toml, serde, blake3, rand_chacha 0.9, postcard, foundationdb-rs 0.11 (opt, `fdb` feature) |
 | `orrery_games` | lib | **none** | libm, rand_chacha 0.9, blake3 |
+| `orrery_conformance` | lib+bin | **none** | libm, rand_chacha 0.9, serde |
 | `orrery_coordinator` | bin | **none** | iroh, tokio, tonic |
 | `orrery_identity` | bin | **none** | iroh, tokio, foundationdb-rs 0.11, argon2 |
-| `orrery_field_host` | bin+lib | **headless** (MinimalPlugins) | bevy 0.19 (no render/winit) |
 
 ### 1. `orrery_protocol` — wire and data types
 
@@ -193,7 +207,7 @@ pub const PROTOCOL_VERSION: u16 = 3;     // services accept this version only
 
 ### 2. `orrery_core` — verifiable core
 
-The engine-agnostic deterministic kernel (D9): the `Ruleset` trait games implement, the fixed-tick executor, seeded RNG, quantization and tolerance comparators, signed hash-chained input logs, and the headless replay harness. Linked identically by peers (witness re-execution), field hosts (parked-cell catch-up), and `persistd` (adjudication). No Bevy, no tokio, no float nondeterminism: `libm`-backed math with tolerance bands for continuous state, integer/fixed-point for discrete outcomes.
+The engine-agnostic deterministic kernel (D9): the `Ruleset` trait games implement, the fixed-tick executor, seeded RNG, quantization and tolerance comparators, signed hash-chained input logs, and the headless replay harness. Linked identically by peers (witness re-execution) and `persistd` (adjudication) today; field hosts (parked-cell catch-up) are the planned third linker (§14, P6). No Bevy, no tokio, no float nondeterminism: `libm`-backed math with tolerance bands for continuous state, integer/fixed-point for discrete outcomes.
 
 **Features:** `fixed-point` (helper types for discrete-outcome math), `replay-cli` (dev tool for offline log replay).
 
@@ -239,9 +253,9 @@ pub enum ReplayVerdict { Match, Deviation { first_bad_tick: Tick, computed: Hash
 
 Full treatment: [06-verifiable-core.md](06-verifiable-core.md).
 
-### 3. `orrery_aeronet_iroh` — iroh IO layer
+### 3. `aeronet_iroh` (vendored) — iroh IO layer
 
-The missing ecosystem piece (verified [absent from crates.io as of Aug 2026](https://crates.io/crates/aeronet)): an [`aeronet_io`](https://github.com/aecsocket/aeronet) implementation over [iroh 1.0](https://github.com/n0-computer/iroh) — QUIC dialed by `NodeId`, [~90% direct hole-punch success](https://www.iroh.computer/docs/protocols/net/holepunching), relay fallback, relay→direct path migration via QUIC multipath (D3). One implementation serves the entire upper stack: lightyear sits on aeronet, and raw replicon consumes it via [`aeronet_replicon`](https://crates.io/crates/aeronet_replicon). Deliberately depends on **no other orrery crate** so it can be published upstream as `aeronet_iroh` unchanged; an unpublished in-repo prototype in the aeronet repo is the structure to mirror (D4).
+This crate is not first-party: it lives at `vendor/aeronet_iroh` as a root workspace member, kept out of `crates/` because it ships upstream unchanged. The missing ecosystem piece (verified [absent from crates.io as of Aug 2026](https://crates.io/crates/aeronet)): an [`aeronet_io`](https://github.com/aecsocket/aeronet) implementation over [iroh 1.0](https://github.com/n0-computer/iroh) — QUIC dialed by `NodeId`, [~90% direct hole-punch success](https://www.iroh.computer/docs/protocols/net/holepunching), relay fallback, relay→direct path migration via QUIC multipath (D3). One implementation serves the entire upper stack: lightyear sits on aeronet, and raw replicon consumes it via [`aeronet_replicon`](https://crates.io/crates/aeronet_replicon). Deliberately depends on **no other orrery crate** so it can be published upstream as `aeronet_iroh` unchanged; an unpublished in-repo prototype in the aeronet repo is the structure to mirror (D4).
 
 **Features:** `metrics` (per-session path/RTT counters).
 
@@ -549,9 +563,11 @@ pub enum IdentityMsg {
 pub enum Enforcement { Clear, Quarantined, Cooldown(UnixMillis), Banned }
 ```
 
-### 14. `orrery_field_host` — headless authority host
+### 14. `orrery_field_host` — headless authority host (planned, not built)
 
-The only Bevy-dependent service (D15): a headless Bevy app (`MinimalPlugins`, no render/winit/audio) that assumes cell-entity authority for promoted cells, acts as low-population witness fallback, and executes parked-cell catch-up via the `Ruleset` (D7). Architecturally it is *just another authority peer* (D6): it composes the same `OrreryClientPlugins` in headless mode, claims leases through the same registrar, and uplinks bulk state through the same persist client. The crate ships a lib target (`FieldHostPlugins<R>`) plus a reference binary that runs core-rules-only simulation; games whose hosted cells need full gameplay systems build `mygame_field_host` adding their plugins — the same bring-your-rules pattern as `persistd`.
+**No such crate exists.** There has never been a `crates/orrery_field_host/` directory anywhere in this repository's history, and [D29](adr/0029-low-population-path.md) holds the crate in P6: nothing in this workspace builds, stubs, or reserves it. It stays in this document because it is still an accepted part of the architecture — D6's promoted regime, D9's third `Ruleset` execution site, and [D15](adr/0015-crate-set.md)'s crate table all call for it — so read this section as the design shape to build in P6, **not** as a member of today's graph.
+
+The design, when built — the only Bevy-dependent service (D15): a headless Bevy app (`MinimalPlugins`, no render/winit/audio) that assumes cell-entity authority for promoted cells, acts as low-population witness fallback, and executes parked-cell catch-up via the `Ruleset` (D7). Architecturally it is *just another authority peer* (D6): it composes the same `OrreryClientPlugins` in headless mode, claims leases through the same registrar, and uplinks bulk state through the same persist client. The planned crate ships a lib target (`FieldHostPlugins<R>`) plus a reference binary that runs core-rules-only simulation; games whose hosted cells need full gameplay systems build `mygame_field_host` adding their plugins — the same bring-your-rules pattern as `persistd`.
 
 ```rust
 pub struct FieldHostPlugins<R: Ruleset> { pub config: FieldHostConfig, pub rules: R }
@@ -587,7 +603,7 @@ fn main() -> anyhow::Result<()> {
 }
 ```
 
-The same `MyRules` value is linked into three other places: the client (witness re-execution inside `OrreryClientPlugins::<MyRules>`), the game's field host, and offline tooling (`ReplayHarness` CLI). `Ruleset::RULES_DIGEST` is exchanged at every gateway and coordinator handshake; a digest mismatch refuses the session — adjudication is meaningless across differing rules builds.
+The same `MyRules` value is linked into two other places today — the client (witness re-execution inside `OrreryClientPlugins::<MyRules>`) and offline tooling (`ReplayHarness` CLI) — plus the game's field host once P6 builds it (§14). `Ruleset::RULES_DIGEST` is exchanged at every gateway and coordinator handshake; a digest mismatch refuses the session — adjudication is meaningless across differing rules builds.
 
 ### The reference games in-tree
 
@@ -627,7 +643,7 @@ fn main() {
 
 ## Versioning and release policy
 
-- **Lockstep versions.** All `orrery_*` crates (facade included) share one version and are released together, Bevy-style; pre-1.0, a minor bump is the breaking-change unit. All fourteen currently sit at `0.1.0`. The release automation that would enforce it — an `xtask release` that bumps the workspace atomically and runs a wire-corpus test — is designed and unbuilt: there is no `xtask/` in the tree and no wire-corpus tests, so the invariant is held by hand today.
+- **Lockstep versions.** All `orrery_*` crates (facade included) share one version and are released together, Bevy-style; pre-1.0, a minor bump is the breaking-change unit. All fifteen currently sit at `0.1.0`. The release automation that would enforce it — an `xtask release` that bumps the workspace atomically and runs a wire-corpus test — is designed and unbuilt: there is no `xtask/` in the tree and no wire-corpus tests, so the invariant is held by hand today.
 - **Pinned upstreams per release.** `[workspace.dependencies]` carries the D14 pin table; the churn-prone trio is pinned exactly — `lightyear = "=0.29.0"`, `bevy_replicon = "=0.42.1"`, `aeronet = "=0.21.0"` — because [lightyear shipped four breaking releases in ten months](https://github.com/cBournhonesque/lightyear/releases) (0.25→0.29: Predicted/Confirmed entity merge, timeline refactor, tick `u16`→`u32`). [iroh is semver-stable since 1.0](https://crates.io/crates/iroh) and gets a caret req. Upstream upgrades land only at Orrery minor releases, each with a migration note.
 - **Wire compatibility is decoupled from crate versions.** `orrery_protocol::PROTOCOL_VERSION` governs interop; services accept **that version only** — D29 clause 5 closed the N/N−1 rolling window for all traffic — enforced by `GatewayMsg::protocol_accepted` against the version a client names in `GatewayMsg::VersionedHello`. That is the only live bootstrap: the unversioned `GatewayMsg::Hello` is retired and a gateway refuses it with `GatewayReply::HelloRefused`, never a silent drop, so enforcement is universal rather than opt-in. The variant stays on the wire only so the refusal can be legible — postcard keys variants positionally, and deleting it would renumber every later arm. A byte-golden corpus of encoded messages guarding decode compatibility across releases is designed and unbuilt, deferred until the wire format settles.
 - **`RULES_DIGEST` is exact-match**, versioned by the game, orthogonal to both of the above.
@@ -639,7 +655,7 @@ Contributions upstream are the mitigation for single-maintainer bus factor (D17.
 
 | What | Target | Precondition / status |
 |---|---|---|
-| `orrery_aeronet_iroh` → `aeronet_iroh` | [aeronet](https://github.com/aecsocket/aeronet) | No `aeronet_iroh` exists on crates.io (verified 2026-08-11); an unpublished in-repo prototype exists to mirror (D4). Crate already has zero orrery dependencies; publish once soak-tested against the relay fleet. |
+| `vendor/aeronet_iroh` → `aeronet_iroh` | [aeronet](https://github.com/aecsocket/aeronet) | No `aeronet_iroh` exists on crates.io (verified 2026-08-11); an unpublished in-repo prototype exists to mirror (D4). Crate already has zero orrery dependencies; publish once soak-tested against the relay fleet. |
 | big_space 0.19 port | [big_space](https://github.com/aevyrie/big_space) | 0.12 targets Bevy 0.18 (D5 risk); small port, PR upstream, carry a git pin until merged. |
 | Authority-model hardening | [lightyear](https://github.com/cBournhonesque/lightyear) | Authority transfer is self-described as ["somewhat in flux"; the `distributed_authority` example is outdated](https://github.com/cBournhonesque/lightyear/releases). Contribute: lease-backed authority transfer hooks, divestiture acks, multi-writer conflict tests from our D7 suite. Maintainer is highly responsive (weekly releases). |
 
@@ -656,4 +672,4 @@ Contributions upstream are the mitigation for single-maintainer bus factor (D17.
 
 ## See also
 
-[00-overview.md](00-overview.md) for the system tour; [02-networking.md](02-networking.md) (iroh, channels, budgets); [03-replication.md](03-replication.md) (replicon/lightyear stack); [04-authority.md](04-authority.md) (leases in depth); [06-verifiable-core.md](06-verifiable-core.md) (`Ruleset` contract); [08-persistence.md](08-persistence.md) (cell actors, journal, FDB schema); [09-services-and-ops.md](09-services-and-ops.md) (deployment of the four services); [11-roadmap.md](11-roadmap.md) (build order and D17 risks).
+[00-overview.md](00-overview.md) for the system tour; [02-networking.md](02-networking.md) (iroh, channels, budgets); [03-replication.md](03-replication.md) (replicon/lightyear stack); [04-authority.md](04-authority.md) (leases in depth); [06-verifiable-core.md](06-verifiable-core.md) (`Ruleset` contract); [08-persistence.md](08-persistence.md) (cell actors, journal, FDB schema); [09-services-and-ops.md](09-services-and-ops.md) (deployment of the five services); [11-roadmap.md](11-roadmap.md) (build order and D17 risks).
