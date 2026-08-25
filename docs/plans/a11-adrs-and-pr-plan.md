@@ -180,3 +180,168 @@ plan. Numbered OD-21+ so the traceability table can cite them.
 | OD-30 | **The three unused `bevy_reflect` Cargo entries** (`orrery_spatial`, `orrery_net`, `orrery_persist_client`) — needed for vendored-replicon feature unification, or dead weight? | A5 §5.1/§11.4; A9 E-8 | One `cargo tree`/build experiment answers it; not attempted on docs-only branches | Non-blocking |
 | OD-31 | **#417's closure shape**: pin the shadowed `LocallyAuthoritative` clause with the F-7 fixture, or collapse the redundancy if `LocalGranted`-without-marker proves unreachable | #417; A5 X2; A10 §13.2 | The fixture PR carries the reachability determination | Non-blocking; window-safe |
 | OD-32 | **A10 threshold numbers** (§8.4) and baseline placement (in-repo vs release artifact) | A10 §13.1/§13.6 | Ratios proposed from the frame budget; revise at first capture | Blocks phase-exit evaluation semantics only |
+
+---
+
+## 4. The open findings, classified
+
+Every live finding the tree carries, sorted into **prerequisite of the
+plan** (something in §5 cannot ship until it closes), **owner-first**
+(nothing can be scheduled until the owner disposes of it), and
+**independent** (real, tracked, closable on its own cadence). A plan that
+quietly absorbed any of these would be worse than one that lists them; none
+is absorbed.
+
+| Finding | Status on this tree | Class | Disposition in this plan |
+|---|---|---|---|
+| **#414 + A9 D-2/D-3** — `docs/10-crates.md` census wrong three ways: names `orrery_field_host` (does not exist, `:29`, `:95`), places `orrery_aeronet_iroh` under `crates/` (`:18`; it lives in `vendor/`), says "thirteen crates" (`:3`; fifteen exist, `orrery_conformance` omitted from the reference table) | All three re-verified today; #414 open | **Independent** | DA-1 / PR-0 — needs no ADR, no acceptance gate, lands any time |
+| **#417** — `feed_uplink`'s `LocallyAuthoritative` guard unpinned: deleting it leaves all 95 tests green (the fixture entity is refused by a different clause first) | Open; reproduced by A10 R-4 | **Independent**, window-safe | PR-3 (F-7 fixture) carries OD-31's reachability call inside the PR |
+| **A5 G-1 / A9 M3** — no mechanical guard against engine handles in replicated payloads; `entity.to_bits()` rides a `DiffUplink` into the journal past every gate and 100 tests | Demonstrated twice (A9 M3, A10 R-3) | **Prerequisite** for the capability registry and any ECS pilot; **owner-first** on mechanism (OD-26) | PR-8 after the owner picks; F-9 pins it; until then the gap stays open and listed — no byte-scanning theatre |
+| **A5 G-2** — derived and cluster-minted ids share an unpartitioned u64 space; a persisted materialized entity could silently collide with a minted row | Latent (materialized entities are not persisted today) | **Owner-first** (OD-25 / N-3) | Blocks persisting materialized entities (phase-5-class); nothing in tranches 0–2 touches it |
+| **A5 G-3** — the bulk uplink makes no schema statement; diff-overwritten bags reset floors to v0; the framed `ComponentBag` has no production writer | Re-verified by A8 I8 | **Prerequisite** for wiring the P capability dimension | The framed-bag producer package rides the Phase-2+ implementation epic; the manifest (R8) refuses to assume it (A8 §9.3) |
+| **A7 F-1** — `DiffUplink.tick` documented as universe tick; production writer stamps a client-local sequence from 0; the bulk journal cannot be tick-aligned with claim windows | Re-verified today (`feed.rs:81-92`) | **Owner-first** (OD-21) | PR-7 lands the chosen half; no design in this plan assumes tick-addressed journals |
+| **A7 X-C** — quantize-before-hash unpinned: swapping the two lines at `executor.rs:126-127` survives all 21 suites (every in-tree state is already lattice-integer; the snap is a live no-op) | Reproduced by A10 R-2 | **Prerequisite** for trusting the parity harness's witness leg | **Closed by the first PR** (PR-1 / F-3, §7) |
+| **A8 X-1** — `RulesetId.digest` is a placeholder constant (`[0x63; 32]` Regolith, `[0x5C; 32]` Skirmish; the Skirmish comment says nothing computes one); two builds could ship identical ids | Re-verified today (`regolith/mod.rs:73-77`, `skirmish/mod.rs:94-104`) | **Owner-first** on mechanism (OD-22); prerequisite for the manifest's identity claims | R8 carries the obligation; the differential harness treats digest equality as carrying no information until the mechanism lands (A10 §4.3) |
+| **A6 M-A6-4a** — the witness coverage denominator's re-delivery immunity is documented (`witness.rs:117-127`) and pinned by no check | Reproduced by A10 R-5 | **Independent**, P4-blocked (`orrery_witness` is a digest crate) | PR-10 (F-8), first post-window batch |
+| **A9 D-1** — hand-off wording called the lightyear source "vendored"; it resolves from the registry (`vendor/` holds aeronet_iroh, aeronet_tokio_runtime, bevy_replicon only) | Wording drift only | **Independent** (no repo change needed; recorded so it stops propagating) | Noted here; nothing to schedule |
+| **A10 N-1** — A7's "the scenario harness already holds every `TickOutcome`" is imprecise: the loop sees each outcome but retains only `{entity, inputs, hash, state}` + an event *count*; the outcome-chain fold must happen in-loop | Verified by A10 against `scenario.rs:119-129`, `:231-245` | **Independent** spec precision, already folded into F-2's spec | PR-9 implements the in-loop fold |
+| **A10 N-3** — the empty suite A9 observed under M3 is the doc-test target, not a hollow integration binary | Closed by A10 | Closed | — |
+| **A6 findings 1–2** — delivery-target routing and `OrderedInputs` log-order fidelity are golden-pinned, not unit-pinned | Recorded in A6 §10 | **Independent**, cheap unit tests | Folded into PR-9's scope (games crate, same window) |
+
+---
+
+## 5. The phased migration plan
+
+### 5.1 The two sequencing constraints, verified
+
+- **The P4 pipeline digest.** `PIPELINE_TREES=(crates/orrery_witness
+  crates/orrery_core crates/orrery_games gates/p1-swarm)` —
+  `scripts/p4-ledger.sh:409-414`, read today (the descriptive comment at
+  `:33-35` names the same four; predecessors cited the comment, the array is
+  the mechanism). Touching any of the four resets banked hours while the
+  #329 shakedown window runs. This is temporal, not architectural: it
+  orders tranches, it forbids nothing. **Outside the digest** and therefore
+  window-safe: `orrery_conformance`, `orrery_persist_client`,
+  `orrery_predict`, `orrery_persistd`, `orrery_protocol`, `scripts/`, new
+  `gates/*` workspaces, `docs/` (A10 N-2, re-verified).
+- **The ADR gate.** Implementation issues are created only after the owner
+  accepts the relevant records (#395). Tranche 0 needs no acceptance;
+  tranche 1 needs only the programme acceptance (fixtures pin *existing*
+  behaviour); tranches 2+ need the named records.
+
+### 5.2 The tranches
+
+**Tranche 0 — corrections; no ADR gate; land any time.**
+
+| PR | Scope | Non-goals | Depends on | Acceptance |
+|---|---|---|---|---|
+| PR-0 | DA-1 (docs/10 census: field_host, aeronet_iroh, thirteen→fifteen, add `orrery_conformance` row), DA-2 (D21 footnote), `persist.rs:41-44` tense fix (block grants are designed, unbuilt) | No behaviour, no ADR text, no F-1 disposition (that is OD-21's) | nothing | Doc-only diff; closes #414; every corrected claim carries a `path:line` cite |
+
+**Tranche 1 — fixture hardening; window-safe; needs the programme
+acceptance only.** All homes outside the digest; every fixture ships with
+its kill demonstrated (the A10 rule: a fixture that has not died is not
+coverage).
+
+| PR | Scope | Non-goals | Depends on | Acceptance |
+|---|---|---|---|---|
+| **PR-1** | **F-3 off-lattice quantize pin** — full spec in §7 | see §7 | programme acceptance | see §7 |
+| PR-2 | `projection-order-permuted` + `swarm-large` (256-entity) corpus cases in `orrery_conformance` | No naive-fold assertions (luck must not be enshrined); no executor change | PR-1 pattern | Permuted spawn order yields chain equal to forward twin; matrix runtime measured — if `swarm-large` is too slow for per-commit it moves to nightly (A10 §13.5, decided not discovered) |
+| PR-3 | F-7: #417 closure fixture (`an_entity_without_the_local_marker_never_feeds_the_uplink` — an entity with `Authority`+`AuthorityPhase::LocalGranted` and no marker, so the marker clause alone refuses it), handoff-adjacent-to-rollback scenario, creation/destruction-in-window scenario (`orrery_persist_client`, `orrery_predict`) | No `feed_uplink` behaviour change; OD-31's reachability call documented in the PR either way | programme acceptance | Deleting the `With<LocallyAuthoritative>` filter kills the new test by name (today: 95 green, rustc warns `unused variable: authorities`); handoff fixture asserts ring re-anchor + exactly-one-feeder |
+| PR-4 | F-6 migration round-trip goldens: committed old-format bag bytes → migrate → re-encode → compare; per-slot future-version refusal; module-removal refusal fixture (`orrery_persistd`) | No new migration steps; no quarantine tool (OD-29) | programme acceptance | `v{N}_bytes_migrate_reencode_and_match_the_committed_golden` green; committed *input* bytes, never encode-decode-encode self-checks |
+| PR-5 | F-12: new `gates/migration-bench` workspace (role `check` in `scripts/check.sh`'s `WORKSPACES` table — the `p2-journal-bench` precedent) + first baseline capture `docs/plans/baselines/a10-baseline-<date>.json` (B-1..B-7 minus the F-2 leg) | No thresholds asserted in CI (doctrine: benches observe); no digest crate touched by the *code* (the baseline *run* reads them, which resets nothing) | programme acceptance | Workspace compiles in CI; baseline JSON committed with environment manifest; the differential harness's no-baseline-no-run refusal is testable against it |
+| PR-6 | R2's Tier V discovery clause in `scripts/core-gates.sh`: role-keyed membership (impl/trait scan, cfg(test)-stripped, qualified paths), two-way cross-check against the declared list | No Tier H clauses (conditional, unarmed); no crate-list removal — declared ∪ discovered | **R2 accepted** | On this tree discovery reproduces exactly `{orrery_core, orrery_games, orrery_conformance}` (A4 E-D1); a synthetic impl-bearing crate fails the gate (E-D2 both directions re-run in CI self-test) |
+| PR-7 | OD-21's chosen half: either `feed_uplink` stamps real ticks or `gateway.rs:377-378`/`persist.rs:200-205` docs rename the semantic | The other half | **OD-21 decided** | If code: a test pinning `DiffUplink.tick == simulation tick`; if docs: cites match behaviour |
+| PR-8 | OD-26's chosen G-1 mechanism (+ F-9 trybuild compile-refusal suite with committed `.stderr`, plus the positive twin) | No byte scanning; no vendored-replicon fork unless the spike (below) forces it | **R4 accepted + OD-26 decided**; a short spike first — A9 §9 could not confirm replicon's registration API admits the extra bound without forking | Re-applying M3's payload append fails to compile at the registration site; deleting the bound flips the trybuild fixture to a named CI failure |
+
+**Tranche 2 — first post-window batch (digest crates; after #329 / P4
+exit).**
+
+| PR | Scope | Non-goals | Depends on | Acceptance |
+|---|---|---|---|---|
+| PR-9 | F-2 outcome-chain goldens in `orrery_games`: in-loop fold (A10 N-1) of events ‖ materialized ids ‖ delivery pairs, WP-2-ordered; committed `REGOLITH_OUTCOMES`/`SKIRMISH_OUTCOMES`; plus the two cheap unit pins from A6 findings 1–2 (delivery-target, log-order fidelity) | No wire change, no evidence change — chains are fixtures (A7 §6's boundary); no golden regeneration of state chains | P4 exit; programme acceptance | Re-applying A7 X-A kills `outcome_chains_match_the_committed_golden` on tick 1 of every scenario while state chains stay green; a `deliver`-arm flip to `None` moves the chain on the emission tick |
+| PR-10 | F-8 witness re-delivery coverage pin in `orrery_witness` (three-legged: deliver, re-deliver unchanged, extend advances exactly) | No fold change | P4 exit | M-A6-4a's mutation kills leg 2; the inverse (advance=0) kills leg 3 |
+
+**Ordering rule (hard): PR-9 merges before any tranche-3 composition PR.**
+Outcome goldens generated after composition changes would commit the
+candidate's behaviour as "legacy" (A10 §8.3). P4 exit precedes Phase 2 in
+every plan variant, so the rule costs nothing.
+
+**Tranche 3 — Phase 2: composition behind the existing contract.** Needs
+**R1** (and R8 for the manifest struct's shape); touches `orrery_games` +
+one new crate; post-window.
+
+| PR | Scope | Non-goals | Depends on | Acceptance |
+|---|---|---|---|---|
+| PR-11 | Composition-root skeleton: the plain struct-of-tables manifest (A8 §3.1), composition-time validation (duplicate ids, missing/cyclic deps — the F-10 battery's refusing spine), X-5 registry file for Regolith | No behaviour change; no ECS; no dynamic anything (D21) | R1, R8; PR-9 | State **and** outcome chains byte-identical; validation battery kills each refusal by construction (F-10 named tests); `core-gates.sh` green |
+| PR-12 | First two Regolith domains split into delegated modules behind the one assembled `Ruleset` (phase-2 exit: "at least two existing behaviours owned by separate modules") | No trait change; no schedule; no storage change | PR-11 | All goldens + outcome chains unchanged; the module boundary visible in the manifest tables; A2 §5.3's four properties (visible, ordered, owned, event-composed) demonstrable per coupling |
+| PR-13 | X-2 manifest keyspace family in `orrery_persistd` (additive door of D21) + schedule-digest/`projection_version` fields carried (values: current topology, 1) | No handshake change (OD-24 open) | R8; PR-11 | Registering a build writes its manifest once; retained permanently; readable without linking the game |
+| PR-14 | X-1 digest computation per OD-22's mechanism; placeholders replaced in both games | No verification-at-admission (a later, separate door) | OD-22; R8 | Two builds differing in any determinism-relevant source produce different digests; the id round-trips through claims/bundles unchanged in shape |
+
+**Tranche 4 — Phase 3: the `SimulationHost` seam.** Needs **R1**;
+post-window (touches `orrery_core` adjacency and, when hosts converge,
+`gates/p1-swarm`).
+
+| PR | Scope | Non-goals | Depends on | Acceptance |
+|---|---|---|---|---|
+| PR-15 | Host crate: tick advance, stable-id lookup (N-2's single index), command-in/event-out, output collection; existing `Ruleset` hosted through an adapter; headless tests drive the same API the client will | No state moves; no ECS; storage stays the executor behind the seam | R1; PR-11 | Bevy client test-double and headless tests invoke one API; host lifetime and fixed-step semantics explicit (phase-3 exit criteria verbatim); goldens unchanged |
+| PR-16 | Converge the three tick drivers: regolith client, then p1-swarm bots, onto the host; promote the bots' harness-side frame/claim assembly (`bot.rs:1103-1137`) into the host's output path | No witness pipeline change; one driver per PR, revertable separately | PR-15; P4 exit (bots are digest territory) | p1-swarm gate criteria unchanged; per-driver diff shows deletion of a hand-rolled loop, not a behaviour edit |
+
+**Tranche 5 — conditional; scheduled only when its trigger fires; each
+item's precondition is pre-registered.**
+
+| Item | Trigger / condition | What it is |
+|---|---|---|
+| Tier H gate battery + E-M2 canary + E-M3 projection differential + worker/profile matrix legs | An R1 trigger (T1–T3) fires **and** OD-23 decided (the profile leg must land with the overflow policy) | A4 §5.2/§6; A10 F-5 |
+| ECS pilot vertical slice (brief Phase 4) | Tier H landed and demonstrated ≥ today's clauses; A5 registry live; G-3 four-class differential harness live; capacity-scale mirror numbers replacing P4/P-1's indicative bounds | A3 §7.4's precondition list, unchanged |
+| Per-module domain migration (brief Phase 5) | Pilot promoted on its pre-registered criteria | A10 §4's per-module differential recipe; legacy path removed only after four-class parity |
+| Presentation-frame schema + AOI extraction + F-11 (brief Phase 6) | First consumer (Unreal sidecar or a client refactor) — nothing exists to fixture today (A10 V16) | A9 §2.4's contract |
+| Generic/compat cleanup incl. `classify_component` removal (brief Phase 7) | Registry restates the three impls' facts first (A5's sequencing rider: the method goes last) | R4's tail |
+| Unreal observer proof (brief Phase 8) | Owner supplies the Unreal requirement (OD closes decision 17); host seam exists | A9 §5's three components and four falsifiable checks (P-1..P-4) |
+
+### 5.3 Compatibility adapters
+
+The no-flag-day machinery, named per seam:
+
+1. **The assembled ruleset is the adapter.** Under PR-11/12 the game still
+   presents one `Ruleset` to the executor, witness, persistd and goldens —
+   composition is invisible below the trait. No consumer changes.
+2. **The host adapter.** PR-15 hosts the *existing* `Ruleset` through an
+   adapter (brief phase 3's own design); hosts migrate one at a time
+   (PR-16), each revertable alone.
+3. **`classify_component` stays until the registry restates its facts** —
+   at no point does the tree hold less classification information than
+   today (A5 §6.1's rider).
+4. **Dual-chain pinning is the parity instrument.** State chains (exist) +
+   outcome chains (PR-9) bracket every subsequent move; the four-class
+   differential harness (F-4) extends it across implementations when a
+   candidate exists.
+5. **No wire change anywhere in tranches 0–4.** `protocol_accepted` stays
+   exact equality (mutation-pinned, A8 M-A8-1); the manifest lives in the
+   keyspace, not the handshake, until OD-24 says otherwise.
+
+### 5.4 Rollback strategy for the migration itself
+
+- **Every PR is additive and git-revertable without residue.** No PR in
+  tranches 0–4 changes wire bytes, persisted formats, or golden values
+  (PR-14 changes digest *values* inside an unchanged shape; its revert
+  restores the placeholders — safe because nothing verifies digests until
+  the later admission door). A revert therefore needs no data migration
+  and no protocol step.
+- **Behaviour is pinned before it moves.** The F-2-before-Phase-2 rule
+  means any tranche-3+ revert is *verifiable*: chains must return to their
+  committed values, and a revert that doesn't is itself a finding.
+- **Static composition is the feature flag.** There are no runtime flags
+  to strand: a module not assembled is a module not present, and the
+  manifest diff in the PR is the flag flip — reviewable, bisectable,
+  revertable.
+- **Digest-aware reverts.** Tranche-1 reverts touch no digest crate and
+  cost no banked hours; tranche-2+ reverts happen post-window where the
+  digest no longer taxes them.
+- **Phase exits are checkpoints with named fallbacks.** If the seam is
+  judged speculative structure, V1 (composition only) is the recorded
+  fallback and nothing else changes (second opinion §6); if composition
+  fails at scale, the pivot is H1, pre-registered (§1); if Tier H cannot
+  demonstrate strength ≥ today's clauses, the pilot stays closed
+  regardless of other merits (A3 §7's own standard).
+- **The X-2 manifest family is append-only**, so no rollback orphans rows:
+  a reverted build's manifest record simply stops being referenced.
