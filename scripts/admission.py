@@ -303,6 +303,19 @@ class AdmissionTests(unittest.TestCase):
         sid = self.service.join("test", self.request())["join"]["session_id"]; one = json.dumps({"records": [{"session_id": sid}], "telemetry_jsonl": "one"}).encode(); self.service.upload(sid, one)
         with self.assertRaises(Refusal) as x: self.service.upload(sid, json.dumps({"records": [{"session_id": sid}], "telemetry_jsonl": "two"}).encode())
         self.assertEqual(x.exception.status, 409); self.assertEqual((self.state / "sessions" / sid / "telemetry.jsonl").read_text(), "one")
+    def test_a_row_naming_another_session_refuses_422_at_the_service(self) -> None:
+        # The `wrong_session` guard was unpinned: removing it left all twelve
+        # tests green, because the only cross-session coverage exercised
+        # `assemble` downstream. Assembly refusing is not a substitute for the
+        # service refusing — a row filed under the wrong session is evidence
+        # sitting in the wrong directory, and nothing upstream would say so.
+        sid = self.service.join("test", self.request())["join"]["session_id"]
+        other = "018f8f4e-5c90-7abc-8123-0000000000ab"
+        self.assertNotEqual(sid, other)
+        body = json.dumps({"records": [{"session_id": other}], "telemetry_jsonl": "x"}).encode()
+        with self.assertRaises(Refusal) as x: self.service.upload(sid, body)
+        self.assertEqual(x.exception.error, "wrong_session")
+        self.assertFalse((self.state / "sessions" / sid / "telemetry.jsonl").exists())
     def test_the_mint_floor_refuses_new_admissions_below_10gb(self) -> None:
         self.service.statvfs = lambda _: type("V", (), {"f_bavail": MINT_FLOOR_BYTES - 1, "f_frsize": 1})()
         with self.assertRaises(Refusal) as x: self.service.join("test", self.request())
