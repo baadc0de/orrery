@@ -115,6 +115,8 @@ self_test() {
     || die 'self-test: campaign session rows are no longer validated before banking'
   has 'impairment_mismatch ==' \
     || die 'self-test: the mismatch flag is no longer checked against the row'\''s own numbers; a post-hoc edit of the measured impairment would bank'
+  has 'verify-campaign-measurement.py' \
+    || die 'self-test: the client measurement signature is no longer verified before banking'
   has 'def platform' \
     || die 'self-test: the target-to-platform fold is gone; the criterion is counted per platform'
   has 'MISSING' \
@@ -153,10 +155,21 @@ self_test() {
       started_at_unix_secs: 1750000000,
       peers: 32, seconds: 3600, player_hours: 32.0,
       witnessing: true, total_false_positives: 0, observation_coverage: 1.0,
-      deferral_ledger_balances: true, total_gaps: 164022, total_shed: 162
+      deferral_ledger_balances: true, total_gaps: 164022, total_shed: 162,
+      external: null
     } | if $session == "" then . else .identity.human_session_id = $session end' > "$dir/r.json"
     if [[ -n $2 ]]; then
       jq "$2" "$dir/r.json" > "$dir/r.next.json"
+      mv "$dir/r.next.json" "$dir/r.json"
+    fi
+    if jq -e '.session? != null' "$dir/r.json" >/dev/null; then
+      jq -c '.session' "$dir/r.json" \
+        | python3 "$ROOT/scripts/sign-campaign-measurement-fixture.py" > "$dir/session.json"
+      local fixture_node
+      fixture_node=$(jq -r .measurement_node "$dir/session.json")
+      jq --slurpfile session "$dir/session.json" --arg node "$fixture_node" \
+        '.session = $session[0] | .external = {node: $node}' \
+        "$dir/r.json" > "$dir/r.next.json"
       mv "$dir/r.next.json" "$dir/r.json"
     fi
     echo "$dir/r.json"
@@ -540,10 +553,21 @@ validate_session_record() {
       and ($s.afk_seconds | type == "number" and . >= 0)
       and ($s.afk_capped | type == "boolean")
       and ($s.impairment_mismatch | type == "boolean")
+      and ($s.measurement_node | type == "string" and length == 64)
+      and ($s.measurement_payload | type == "string" and length > 0)
+      and ($s.measurement_signature | type == "string" and length == 128)
       and (if $actor == "human" then $s.session_id == $session else true end)
     end
   ' "$report" >/dev/null \
     || die 'refusing to bank: incomplete or inconsistent campaign session row'
+  if jq -e '.session? != null' "$report" >/dev/null; then
+    local measurement_node
+    measurement_node=$(jq -er '.external.node | select(type == "string" and length > 0)' "$report") \
+      || die 'refusing to bank: host report does not name the authenticated external node'
+    jq -c '.session' "$report" \
+      | python3 "$ROOT/scripts/verify-campaign-measurement.py" "$measurement_node" >/dev/null \
+      || die 'refusing to bank: client measurement signature did not verify for the admitted node'
+  fi
   # The mismatch flag is recomputable from the row's own numbers, and #387
   # requires that it *fired* whenever observation disagrees with
   # configuration. Checking the arithmetic here is what makes the flag

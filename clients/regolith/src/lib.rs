@@ -9,6 +9,7 @@ pub mod campaign;
 pub mod combat;
 pub mod craft;
 pub mod hud;
+pub mod identity;
 pub mod intent;
 pub mod join;
 pub mod net;

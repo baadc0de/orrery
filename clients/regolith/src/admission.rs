@@ -138,6 +138,7 @@ pub enum JoinGate {
 struct AdmissionSettings {
     origin: String,
     telemetry_path: PathBuf,
+    transport_secret: iroh_base::SecretKey,
 }
 
 #[derive(Resource, Default)]
@@ -185,15 +186,21 @@ struct DismissDialog;
 pub struct AdmissionPlugin {
     origin: String,
     telemetry_path: PathBuf,
+    transport_secret: iroh_base::SecretKey,
 }
 
 impl AdmissionPlugin {
     /// Configure the admission origin and the session telemetry path.
     #[must_use]
-    pub fn new(origin: String, telemetry_path: PathBuf) -> Self {
+    pub fn new(
+        origin: String,
+        telemetry_path: PathBuf,
+        transport_secret: iroh_base::SecretKey,
+    ) -> Self {
         Self {
             origin,
             telemetry_path,
+            transport_secret,
         }
     }
 }
@@ -203,6 +210,7 @@ impl Plugin for AdmissionPlugin {
         app.insert_resource(AdmissionSettings {
             origin: self.origin.clone(),
             telemetry_path: self.telemetry_path.clone(),
+            transport_secret: self.transport_secret.clone(),
         })
         .insert_resource(JoinGate::FetchingCampaigns)
         .insert_resource(AdmissionTask::default())
@@ -233,10 +241,16 @@ fn start_fetch(origin: &str, task: &AdmissionTask) {
     *task.0.lock().expect("admission task lock") = Some(receiver);
 }
 
-fn start_join(origin: &str, campaign: &CampaignListing, nickname: &str, task: &AdmissionTask) {
+fn start_join(
+    origin: &str,
+    campaign: &CampaignListing,
+    nickname: &str,
+    transport_secret: &iroh_base::SecretKey,
+    task: &AdmissionTask,
+) {
     let (sender, receiver) = mpsc::channel();
     let url = format!("{origin}/v1/campaigns/{}/join", campaign.id);
-    let node = crate::net::slot_secret(campaign.peers).public().to_string();
+    let node = transport_secret.public().to_string();
     let nickname = nickname.to_owned();
     std::thread::spawn(move || {
         let answer = post_join(&url, &nickname, &node);
@@ -369,6 +383,7 @@ fn poll_worker(
                     jitter_p50_ms: answer.configured.jitter_p50_ms,
                     jitter_p99_ms: answer.configured.jitter_p99_ms,
                 },
+                transport_secret: settings.transport_secret.clone(),
             };
             *session =
                 ActiveSession::Campaign(Box::new(CampaignRuntime::launch(config, crate::SEED)));
@@ -483,7 +498,13 @@ fn submit_join(
     }
     let campaign = campaign.clone();
     let nickname = nickname.clone();
-    start_join(&settings.origin, &campaign, &nickname, &task);
+    start_join(
+        &settings.origin,
+        &campaign,
+        &nickname,
+        &settings.transport_secret,
+        &task,
+    );
     *gate = JoinGate::Admitting { campaign, nickname };
     dirty.0 = true;
 }

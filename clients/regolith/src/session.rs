@@ -9,6 +9,10 @@ use orrery_core::TICK_HZ;
 use orrery_games::regolith::REGOLITH_RULESET;
 use serde::Serialize;
 
+/// Domain separating a client-owned campaign measurement from every other
+/// signature made with the same transport identity.
+pub const CAMPAIGN_MEASUREMENT_V1_DOMAIN: &[u8] = b"orrery/campaign-measurement/v1\0";
+
 /// The notice displayed before a campaign client is allowed to join.
 pub const CONSENT_NOTICE: &str = "**This build records your play.** Inputs, world-state hashes and network\nmeasurements are logged for replay-adjudication research. Recording is\nshadow-mode: reports never affect your account or your access. Playing a\ncampaign build means you consent to recording; if you do not consent, do not\nplay campaign builds.";
 
@@ -139,6 +143,36 @@ pub struct SessionRecord {
     /// Observations disagree with the requested profile; retained in-row and
     /// therefore cannot be silently treated as verified impairment.
     pub impairment_mismatch: bool,
+    /// Transport NodeId admitted by the host for this session.
+    pub measurement_node: String,
+    /// Exact lowercase-hex JSON bytes signed by [`Self::measurement_signature`].
+    /// The payload contains every client-owned row field except
+    /// `pipeline_digest`, which the assembler supplies from the host report.
+    pub measurement_payload: String,
+    /// Ed25519 signature over [`CAMPAIGN_MEASUREMENT_V1_DOMAIN`] followed by
+    /// the decoded [`Self::measurement_payload`] bytes.
+    pub measurement_signature: String,
+}
+
+impl SessionRecord {
+    /// Bind every client-owned field in this row to the admitted transport key.
+    pub fn sign(&mut self, key: &iroh_base::SecretKey) -> Result<(), serde_json::Error> {
+        self.measurement_node = key.public().to_string();
+        let mut value = serde_json::to_value(&*self)?;
+        let object = value
+            .as_object_mut()
+            .expect("SessionRecord serializes as an object");
+        object.remove("pipeline_digest");
+        object.remove("measurement_payload");
+        object.remove("measurement_signature");
+        let payload = serde_json::to_vec(&value)?;
+        let mut signed = Vec::with_capacity(CAMPAIGN_MEASUREMENT_V1_DOMAIN.len() + payload.len());
+        signed.extend_from_slice(CAMPAIGN_MEASUREMENT_V1_DOMAIN);
+        signed.extend_from_slice(&payload);
+        self.measurement_payload = hex::encode(&payload);
+        self.measurement_signature = hex::encode(key.sign(&signed).to_bytes());
+        Ok(())
+    }
 }
 
 /// Where the accumulator stands mid-session, for the overlay and the strip.
@@ -312,6 +346,9 @@ impl CampaignSession {
             afk_seconds: self.idle_ticks / u64::from(TICK_HZ),
             afk_capped: self.afk_capped,
             impairment_mismatch: mismatch,
+            measurement_node: String::new(),
+            measurement_payload: String::new(),
+            measurement_signature: String::new(),
         }
     }
 
@@ -517,8 +554,40 @@ mod tests {
             "afk_seconds",
             "afk_capped",
             "impairment_mismatch",
+            "measurement_node",
+            "measurement_payload",
+            "measurement_signature",
         ] {
             assert!(value.get(field).is_some(), "missing {field}");
         }
+    }
+
+    #[test]
+    fn signature_binds_the_observed_fields_and_excludes_only_the_host_digest() {
+        let key = iroh_base::SecretKey::from_bytes(&[0x49; 32]);
+        let mut record = session().finish(
+            "end".into(),
+            "linux".into(),
+            "rev".into(),
+            "unavailable-client-side".into(),
+        );
+        record.sign(&key).expect("sign row");
+        let payload = hex::decode(&record.measurement_payload).expect("payload hex");
+        let payload: serde_json::Value = serde_json::from_slice(&payload).expect("payload JSON");
+        assert_eq!(payload["observed_loss_pct"], record.observed_loss_pct);
+        assert_eq!(payload["measurement_node"], key.public().to_string());
+        assert!(payload.get("pipeline_digest").is_none());
+        assert!(payload.get("measurement_signature").is_none());
+        let signature: [u8; 64] = hex::decode(&record.measurement_signature)
+            .expect("signature hex")
+            .try_into()
+            .expect("64-byte signature");
+        let mut signed = CAMPAIGN_MEASUREMENT_V1_DOMAIN.to_vec();
+        signed.extend_from_slice(
+            &hex::decode(&record.measurement_payload).expect("measurement payload hex"),
+        );
+        key.public()
+            .verify(&signed, &iroh_base::Signature::from_bytes(&signature))
+            .expect("client signature verifies");
     }
 }

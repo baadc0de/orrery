@@ -347,10 +347,10 @@ struct Args {
     /// Host an external peer slot (#385): bind a real iroh endpoint, wait for
     /// the dial, and run the swarm with the remote as an island member.
     ///
-    /// The external slot's identity is derived from the seed exactly like the
-    /// bots' (`bot_key(peers)`), so a dialler claiming the wrong key is
-    /// refused at accept time. The run paces itself in real time — see the
-    /// runner — so `--seconds` here measures wall-clock seconds.
+    /// Without token admission the external slot keeps the deterministic test
+    /// identity. With `--issuer-key`, the signed transport identity is used.
+    /// The run paces itself in real time — see the runner — so `--seconds`
+    /// here measures wall-clock seconds.
     #[arg(long)]
     external_peer: bool,
 
@@ -571,7 +571,7 @@ fn main() -> Result<()> {
             .enable_all()
             .build()
             .context("tokio runtime")?;
-        let (endpoint, link, anchor_bytes) = rt.block_on(async {
+        let (endpoint, link, anchor_bytes, joined_node) = rt.block_on(async {
             let endpoint = bridge::bind(secret).await?;
             eprintln!(
                 "gates/p1-swarm: exterior slot {} listening, node {}, direct {:?}",
@@ -603,7 +603,7 @@ fn main() -> Result<()> {
             )
             .await
             .context("the external peer never dialled in time")??;
-            anyhow::Ok((endpoint, joined.0, joined.1))
+            anyhow::Ok((endpoint, joined.0, joined.1, joined.2))
         })?;
         // Held for their lifetime: dropping the endpoint closes the
         // connection, and dropping the runtime waits on the pump tasks.
@@ -620,7 +620,7 @@ fn main() -> Result<()> {
             }
             None => None,
         };
-        swarm = swarm.with_external(expected, anchor, link);
+        swarm = swarm.with_external(joined_node, anchor, link);
     }
 
     let report = swarm.run();

@@ -36,6 +36,8 @@
 #
 #   * the host report actually hosted an external participant, witnessed;
 #   * the client row names exactly the pre-minted session id;
+#   * the row signature verifies under the QUIC-authenticated NodeId the host
+#     recorded, binding every client-owned field to the admitted key;
 #   * the row's `impairment_mismatch` flag agrees with the row's own
 #     observed/configured numbers (telemetry honesty: the flag must have
 #     *fired* when observation disagreed with configuration — an assembled
@@ -52,7 +54,7 @@
 #   orrery-invite mint --ledger invites.tsv --label "<volunteer>"
 #     → account=N  invite_code=…  session_id=<UUIDv7>
 # Minutes before the session (tokens live one hour):
-#   orrery_regolith_client --print-slot-key <peers>          → <slot key>
+#   orrery_regolith_client --print-slot-key <peers>          → <persistent client key>
 #   orrery-invite session-token --issuer-credential issuer.cred \
 #     --account N --node <slot key>                          → session_token=…
 # Or, preferred for a volunteer handoff (the existing argv form below remains
@@ -132,6 +134,7 @@ cmd_assemble() {
   [[ -n $session ]] || die 'assemble: no session id given'
   [[ -n $out ]] || die 'assemble: no output path given'
   need jq
+  need openssl
 
   [[ $session =~ ^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$ ]] \
     || die "assemble: session id '$session' is not a UUIDv7; mint one with orrery-invite"
@@ -151,6 +154,16 @@ cmd_assemble() {
   [[ $matches == 1 ]] \
     || die "assemble: expected exactly one client row for session $session, found $matches"
   row=$(jq -c --arg session "$session" 'select(.session_id == $session)' "$records")
+
+  # Authenticity, not arithmetic: the host records the remote identity that
+  # completed QUIC authentication and whose admission token it verified. The
+  # client signs every client-owned row field with that same persistent key.
+  local measurement_node
+  measurement_node=$(jq -er '.external.node | select(type == "string" and length > 0)' "$raw") \
+    || die 'assemble: the host report does not name the authenticated external node'
+  printf '%s\n' "$row" \
+    | python3 "$ROOT/scripts/verify-campaign-measurement.py" "$measurement_node" >/dev/null \
+    || die 'assemble: the client measurement signature did not verify for the admitted node'
 
   # Telemetry honesty, asserted in the assembled row (#387): the mismatch
   # flag must equal what the row's own numbers say. This is the client's
@@ -191,6 +204,7 @@ cmd_assemble() {
 
 self_test() {
   need jq
+  need openssl
   # The digest arithmetic must be `p4-ledger.sh`'s, tree for tree, in order.
   local ours theirs
   ours=$(printf '%s\n' "${PIPELINE_TREES[@]}")
@@ -217,7 +231,7 @@ self_test() {
     peers: 5, seconds: 60, player_hours: 0.083,
     witnessing: true, total_false_positives: 0, observation_coverage: 1.0,
     deferral_ledger_balances: true, total_gaps: 12, total_shed: 0,
-    external: { index: 4, said_goodbye: true, connected: false,
+    external: { index: 4, node: "fixture", said_goodbye: true, connected: false,
                 uplink_frames: 100, downlink_frames: 400, downlink_dropped: 0 }
   }' > "$dir/raw.json"
   st_row() {
@@ -231,9 +245,13 @@ self_test() {
       configured_impairment_profile: {loss_pct: 3, jitter_p50_ms: 100, jitter_p99_ms: 100},
       observed_loss_pct: $observed, observed_jitter_p50_ms: 100, observed_jitter_p99_ms: 100,
       afk_seconds: 0, afk_capped: false, impairment_mismatch: $mismatch
-    }'
+    }' | python3 "$ROOT/scripts/sign-campaign-measurement-fixture.py"
   }
   st_row "$session" true 3.4 > "$dir/records.jsonl"
+  local fixture_node
+  fixture_node=$(jq -r .measurement_node "$dir/records.jsonl")
+  jq --arg node "$fixture_node" '.external.node = $node' "$dir/raw.json" > "$dir/raw.next.json"
+  mv "$dir/raw.next.json" "$dir/raw.json"
 
   "$0" assemble "$dir/raw.json" "$dir/records.jsonl" "$session" "$dir/r.json" 2>/dev/null \
     || die 'self-test: an honest external session refused to assemble'
@@ -256,6 +274,29 @@ self_test() {
   if "$0" assemble "$dir/raw.json" "$dir/records.jsonl" "$session" "$dir/r2.json" 2>/dev/null; then
     die 'self-test: a row whose mismatch flag failed to fire assembled anyway'
   fi
+
+  # #409's exact careful forgery: rewrite every observation to configuration
+  # and clear the mismatch flag. The row is internally consistent, but the
+  # admitted client's signature no longer covers it, so the real assembler
+  # must name and refuse the signature stage.
+  st_row "$session" true 3.4 \
+    | jq '.observed_loss_pct = .configured_impairment_profile.loss_pct
+          | .observed_jitter_p50_ms = .configured_impairment_profile.jitter_p50_ms
+          | .observed_jitter_p99_ms = .configured_impairment_profile.jitter_p99_ms
+          | .impairment_mismatch = false' \
+    | python3 -c 'import json,sys
+row=json.load(sys.stdin)
+unsigned=dict(row)
+for field in ("pipeline_digest", "measurement_payload", "measurement_signature"):
+    unsigned.pop(field, None)
+row["measurement_payload"]=json.dumps(unsigned,sort_keys=True,separators=(",",":")).encode().hex()
+json.dump(row,sys.stdout,separators=(",",":")); print()' > "$dir/forged-agree.jsonl"
+  local forged_error
+  if forged_error=$("$0" assemble "$dir/raw.json" "$dir/forged-agree.jsonl" "$session" "$dir/forged.json" 2>&1); then
+    die 'self-test: a self-consistent forged campaign row assembled'
+  fi
+  grep -q 'client measurement signature' <<<"$forged_error" \
+    || die "self-test: forged-agree row was not refused by the signature check ('$forged_error')"
 
   # A row for some other session must refuse: the invite id is the identity.
   st_row 018f8f4e-5c90-7abc-8123-0000000000bb true 3.4 > "$dir/records.jsonl"

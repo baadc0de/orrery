@@ -3,6 +3,7 @@ use orrery_predict::OrreryPredictPlugin;
 use orrery_regolith_client::{
     admission::{resolve_admission_url, retry_pending_uploads, AdmissionPlugin},
     campaign::CampaignConfig,
+    identity::{load_or_create, resolve_identity_path},
     session::{require_campaign_consent, ConfiguredImpairment, CONSENT_NOTICE},
     RegolithSkinPlugin,
 };
@@ -20,16 +21,19 @@ fn has_flag(args: &[std::ffi::OsString], flag: &str) -> bool {
 
 fn main() {
     let args: Vec<_> = std::env::args_os().collect();
-    // Print the deterministic transport key for a slot and exit: this is the
-    // NodeId an operator binds a session token to (`orrery-invite
-    // session-token --node …`), printed by the client because the client is
-    // what will dial with it.
+    let identity_path = resolve_identity_path(&args, std::env::var_os("ORRERY_IDENTITY_FILE"));
+    // Compatibility spelling retained for the operator runbook: the slot is
+    // validated, but the printed NodeId now comes from the persistent client
+    // key rather than from public slot arithmetic.
     if let Some(slot) = flag_value(&args, "--print-slot-key") {
         match slot.parse::<usize>() {
-            Ok(slot) => println!(
-                "{}",
-                orrery_regolith_client::net::slot_secret(slot).public()
-            ),
+            Ok(_) => match load_or_create(&identity_path) {
+                Ok(key) => println!("{}", key.public()),
+                Err(error) => eprintln!(
+                    "cannot load persistent identity {}: {error}",
+                    identity_path.display()
+                ),
+            },
             Err(_) => eprintln!("--print-slot-key needs a slot number, got {slot:?}"),
         }
         return;
@@ -58,6 +62,16 @@ fn main() {
         run_smoke_test();
         return;
     }
+    let transport_secret = match load_or_create(&identity_path) {
+        Ok(key) => key,
+        Err(error) => {
+            eprintln!(
+                "cannot load persistent identity {}: {error}",
+                identity_path.display()
+            );
+            return;
+        }
+    };
     let telemetry_path = flag_value(&args, "--telemetry-jsonl")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("target/regolith-client/session.jsonl"));
@@ -108,12 +122,17 @@ fn main() {
             session_token_hex: input.session_token,
             wall_start_utc: orrery_regolith_client::campaign::utc_now_iso8601(),
             configured,
+            transport_secret: transport_secret.clone(),
         });
     }
     app.add_plugins(skin);
 
     if boot_ui {
-        app.add_plugins(AdmissionPlugin::new(admission_url, telemetry_path));
+        app.add_plugins(AdmissionPlugin::new(
+            admission_url,
+            telemetry_path,
+            transport_secret,
+        ));
     }
 
     if let Some(ticks) = smoke_ticks {

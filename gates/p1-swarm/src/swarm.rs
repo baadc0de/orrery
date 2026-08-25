@@ -256,6 +256,8 @@ pub struct RunIdentity {
 pub struct ExteriorReport {
     /// The swarm slot the external peer occupied.
     pub index: usize,
+    /// QUIC-authenticated transport identity admitted for this slot.
+    pub node: NodeId,
     /// Whether the runner's clean end-of-run marker arrived.
     pub said_goodbye: bool,
     /// Whether the bridge believed the connection was alive at report time.
@@ -1405,6 +1407,7 @@ impl Swarm {
             witnessing: self.config.witnessing,
             external: self.exterior.as_ref().map(|exterior| ExteriorReport {
                 index: exterior.index,
+                node: exterior.node,
                 connected: exterior
                     .link
                     .connected
