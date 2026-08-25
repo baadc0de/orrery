@@ -503,3 +503,89 @@ cannot demonstrate strength equal to the current clauses, V3/H1 stay closed
 regardless of other merits — that is the task's own standard applied to the
 recommendation itself.
 
+## 8. Disputed-claims ledger
+
+Every claim in play that a reasonable reviewer could dispute, with its
+evidence status. **Evidenced** = source citation or prototype output above;
+**Unevidenced** = no in-tree or prototype support found, flagged wherever the
+claim is used.
+
+| # | Claim | Verdict | Evidence |
+|---|---|---|---|
+| C1 | "Generic `R: Ruleset` infects the crate graph" (brief motivation) | **Refuted at current scale** | G1; A1 §4.4. Four crates; stops at one boxed closure. Whether it would hold under many-module growth is untested — that is E-1's job |
+| C2 | "`bevy_ecs` cannot run a deterministic headless simulation without the engine" | **Refuted** | P1: bare `World` + `Schedule`, 600 ticks, identical hashes across runs and insertion orders |
+| C3 | "Archetype/insertion/allocation order would reach witness hashes under ECS storage" | **Confirmed for naive projections; mitigated trivially** | P2: query-order hash differs across insertion orders; sort-by-stable-id projection agrees. Today's hash cannot be reached by order because nothing iterates a world into it (G5) |
+| C4 | "Ambiguous Bevy schedules execute nondeterministically" | **Unevidenced here — and the usable finding is the opposite** | P3: 200/200 stable under both executors on this box. Recorded as: observed stability proves nothing; unspecified order must be excluded mechanically (P5), not trusted |
+| C5 | "Two-world mirroring would be slow" | **Unevidenced as a blocker; bounded above at toy scale** | P4: ~9.16 µs/frame at 10k rows, synthetic. No capacity-scale number exists; dimension 8 weighted accordingly |
+| C6 | "Lightyear cannot target a dedicated world" | **Partially confirmed** | Replication is app-world-component-centric (G13); a mirror hop is required. "Cannot" refuted by that hop's feasibility; its cost at scale unevidenced |
+| C7 | "Raw `World` clone/rollback unacceptable" (brief) | **Unevidenced — and not mine to decide** | Rollback unit reserved to A7 (#403) per A2 §7.1; this document scores rollback *fit* only via the adjudication path |
+| C8 | "An ECS-hosting variant silently escapes the core-gates Bevy ban" | **Confirmed** | G9: witness already carries bevy while the gate passes; gate coverage equals its crate list. Any new host crate passes unchanged — hence §7's requirement that A4's replacement bundle be proven stronger, not merely present |
+| C9 | "Monomorphization/compile blowup from the current generics" | **Unevidenced** | A1 §11.2: no benchmark exists. Carries weight 4 total for that reason |
+| C10 | "Goldens suffice to prove migration parity" | **Refuted by the tree itself** | G7 (`golden.rs:20-28`); drives §7's differential-harness precondition |
+
+---
+
+## 9. Evidence and mutation log (this document)
+
+A1/A2's eleven mutations carry over re-based (tree delta `46c9301a..ce5e34a7`
+is docs-only). What is new here:
+
+| # | Claim demonstrated | Method | Both directions? |
+|---|---|---|---|
+| E-1 | Dedicated-world determinism + projection immunity (P1/P2) | Prototype: two insertion orders, naive vs sorted-projection hash; two runs each | Yes: naive DIFFERS / canonical AGREES, reproducible across invocations |
+| E-2 | Empirical stability of ambiguous schedules (P3) | Prototype: 200 fresh worlds × three configurations | Three-way comparison recorded; negative result kept rather than discarded |
+| E-3 | Mechanical ambiguity rejection works (P5) | Prototype: `ambiguity_detection=Error`; ambiguous schedule → Err, chained → Ok | Yes: guard fires on bad stage, passes good stage |
+| E-4 | Gate coverage equals crate list (G9/C8) | Existing steady state, no mutation needed: `cargo tree -p orrery_witness` = 530 bevy refs, `core-gates.sh` exit 0 | Structural fact, not a breakable stage |
+| E-5 | persistd bevy-freeness (G10) | `cargo tree -p orrery_persistd` grep count = 0 today | Steady-state check |
+| E-6 | A1/A2 logs valid here | `git diff --stat 46c9301a ce5e34a7 -- crates gates clients scripts` empty | Re-base, not re-run |
+
+Probe sources were scratch-only; **no repository file was mutated during this
+task.**
+
+---
+
+## 10. Stale citations found while verifying
+
+| Record | Citation | Current truth |
+|---|---|---|
+| This task's briefing text | `gates/p1-swarm/src/bot.rs:1104`, `:1132` | One-line drift: producers are at `bot.rs:1105`, `bot.rs:1133`. Finding unaffected |
+| Inherited stale (A1/A2, still true today): ADR-0038's `ruleset.rs:211`; D21's `validate_intent` parenthetical; docs/06 §2's present-tense `classify_component` consumers; docs/10-crates.md's `orrery_field_host` row; brief's `p{N}-*` paths | — | All re-checked where leaned on; all still stale exactly as predecessor documents recorded them |
+
+No new drift beyond the line-number shift above was found in anything this
+document cites.
+
+---
+
+## 11. Unsure
+
+Stated as unsure rather than smoothed over:
+
+1. **P3's stability may not generalize.** One box, tiny systems, one build.
+   The conclusion drawn is deliberately the conservative one — do not trust
+   empirical stability either way — so the recommendation survives even if
+   another platform flips orders freely. But the specific "200/200 stable"
+   number should not be quoted as a property of bevy_ecs generally.
+2. **P4's extraction figure is a floor-shaped bound, not an estimate.** Real
+   mirrors filter by change detection, survive archetype churn and fragment
+   allocation. It bounds the fear from above at small scale; it does not
+   measure the thing capacity planning needs.
+3. **H1 rests partly on an unwired hook.** If A5 replaces `CoreClass` with a
+   per-dimension policy registry, H1's routing wall needs re-derivation. The
+   matrix cell marked ✱ covers this; the pilot ordering (policy registry
+   before any state moves) is chosen to expose it cheaply.
+4. **Modularity scoring leans on projection.** No second production game
+   exists to measure against (G12 context; A1 §11.4). E-1 exists because of
+   this sentence.
+5. **Whether the composition root can ever serve dynamically loaded modules**
+   is out of scope by D21 (link-time distribution for 1.0) and was not
+   revisited.
+
+Deliberately not done:
+
+- **No implementation.** Probes lived in `/tmp/opencode`; no Rust file,
+  manifest or script in the repo changed. The only files this branch adds are
+  this document and its commits.
+- **No decision that belongs to another node:** rollback unit (A7), component
+  policy shape (A5), module manifests (A8), determinism-envelope design and
+  gate-bundle authorship (A4), conformance programme (A10). Where this
+  document depends on those, §7 names the owner instead of deciding.
