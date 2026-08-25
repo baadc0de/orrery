@@ -430,3 +430,133 @@ adjudication replay tests are its per-entity sharp edge
 not_deviation`, X-B-proven). The candidate inherits all of it unchanged —
 the differential harness (§4) is what extends replay *across*
 implementations rather than across runs.
+
+---
+
+## 6. Persistence migration, rollback, and authority handoff
+
+### 6.1 Persistent-data migration (F-6)
+
+The refusal half is **live and mutation-proven** — unknown component,
+future version, missing step, stale rekey all refuse
+(`UnregisteredComponent`/`FutureVersion`/`MissingStep`; A5 X3/X4; A7 X-D
+killed `persistence_rekey_decoder_rejects_untrusted_or_stale_shapes` by
+name). What does not exist is the *positive* half A7 M-3 specified:
+
+- **Round-trip goldens:** committed old-format bag bytes (per
+  `(ComponentTypeId, SchemaVersion)` slot, the `orrery_persistd/src/
+  schema.rs:48-66` framing) → migrate via the registered `ComponentMigrator`
+  chain → re-encode → compare against committed new-format bytes. Named
+  test per step: `v{N}_bytes_migrate_reencode_and_match_the_committed_
+  golden`. The committed *input* bytes are what makes this a fixture rather
+  than a self-check: encode-decode-encode of current structs proves only
+  that today's code agrees with itself; committed bytes from the old build
+  are the other implementation in the room.
+- **Downgrade/refusal symmetry:** for each supported migration, a committed
+  *future*-version byte string asserted to refuse (`FutureVersion`) — so
+  the fail-closed direction is pinned per-slot, not only at the machinery
+  level.
+- **Module-removal fixture** (brief: "module removal with persisted data
+  present"): a store containing slots for a component no module declares →
+  load refuses naming the component (M-2's rule). Whether an operator
+  quarantine override exists is A8 manifest policy; the fixture pins the
+  *default*, which is refusal.
+- **Cross-version differential leg:** every schema bump gets one §4 run
+  with the bump classified per §4.3 — the migration axis of the parity
+  argument, distinct from the byte round-trip.
+
+### 6.2 Rollback and authority handoff (F-7)
+
+What exists and is proven: the budget-ladder tests
+(`budget::tests::overlong_replay_evicts_enough_to_fit`,
+`pathological_cost_snaps_the_own_player` — X-E killed both by name), the
+adjudication replay suite (X-B), and A7's R-1 decision that the rollback
+unit is the per-entity predicted set. The programme adds:
+
+- **The #417 closure fixture**, exactly as the issue specifies: an entity
+  with `Authority`/`AuthorityPhase::LocalGranted` (so every *other* clause
+  in `feed_uplink` passes) but **without** `LocallyAuthoritative` — making
+  the marker clause the only thing refusing it. Named test:
+  `an_entity_without_the_local_marker_never_feeds_the_uplink`. Acceptance
+  mutation: delete the `With<LocallyAuthoritative>` filter (reproduced
+  today, §11 R-4: currently all 95 tests stay green, with the compiler's
+  `unused variable: authorities` warning confirming the guard is truly
+  gone) → the new test must die by name; revert → green. #417's own
+  caveat carries over unreduced: whether `LocalGranted`-without-marker is
+  reachable in a real race is **unsure** (§13.2); if it proves unreachable,
+  the right closure is collapsing the redundant clause, not pinning an
+  unreachable state — that determination belongs with the fixture PR.
+- **Handoff-adjacent-to-rollback scenario** (brief: "authority handoff
+  inside or adjacent to rollback"): a two-peer harness scenario in which
+  authority over one entity transfers mid-window while the receiving peer
+  holds ring snapshots for it — asserting (a) the ring is invalidated or
+  re-anchored at the handoff tick, never replayed across it, and (b) the
+  uplink guard flips exactly once (no tick where both or neither peer
+  feeds). The single-writer invariant already has a two-gateway proof
+  harness (`gates/p3-siblings`, commit a34839ef); this fixture is its
+  prediction-tier sibling. Home: `orrery_predict`/`orrery_persist_client`
+  integration (outside the P4 digest, N-2).
+- **Entity creation/destruction inside the window** (brief): a scenario
+  materializing and despawning an entity within the 9-tick window,
+  asserting rollback of a neighbour neither resurrects the despawned
+  entity nor loses the materialized one — pinning R-1's "restore is
+  all-or-nothing at the entity" against the structural-change edge.
+
+### 6.3 What is deliberately not fixtured
+
+Canonical-state rewind: none exists anywhere in the system (A7 §2:
+authorities never rewind; corrections apply forward; recovery reconstructs).
+A fixture asserting "world rollback restores tick T" would pin behaviour
+the architecture rejects. The rollback fixtures above test the *predictive*
+mechanism and its boundaries, because that is the only rewind that is real.
+
+---
+
+## 7. Module validation, witness fixtures, presentation extraction
+
+### 7.1 Module dependency validation (F-10)
+
+Phase-gated: these checks exist the day the composition root exists
+(brief Phase 2), and their defining property is that **every one refuses at
+composition time** — build or startup, never mid-tick:
+
+- `missing_dependency_refuses_composition` / `cyclic_dependency_refuses_
+  composition`: a module set with an absent or circular requirement fails
+  assembly with the offender named. Compile-time where composition is
+  static (A8 ratified static composition), startup-refusal otherwise.
+- `duplicate_schema_id_refuses_composition`: two modules declaring one
+  `ComponentTypeId` refuse per A5 N-5's single-declarer rule.
+- `canonical_schedule_rejects_ambiguity` (A4 E-M2, Tier H only): the real
+  schedule initializes `Ok` **and** a deliberately un-ordered canary mutant
+  initializes `Err`. The canary half is what keeps this from the #417
+  failure mode — a passing "no ambiguity" assertion proves nothing if
+  ambiguity detection was accidentally set to `Ignore`; the mutant proves
+  the rejector is awake. A4 §9 E-1 prototyped both directions.
+- `schedule_digest_matches_the_committed_value` (A4 §3.10): an accidental
+  system reorder fails CI the way a golden does. Observes, deliberately —
+  its committed expectation is exactly the thing that must not drift.
+- Illegal stage registration (brief): a module registering a system into a
+  stage its capabilities do not admit (e.g. a W0 module touching S5 Claim)
+  refuses at registration — pinned per capability dimension the day the
+  A5 registry lands.
+
+### 7.2 Witness fixtures and presentation extraction (F-8, F-11)
+
+Witness: F-8 (§2.4) plus what exists — detection (25), escalation,
+lane-budget, multi-entity, streaming suites, and the A6-proven fold
+dedup (M-A6-4b's kill at `multi_entity.rs:453`). The differential harness's
+D-4 leg reuses the pipeline wholesale (§4.1). One addition beyond F-8:
+**witness fixtures for the candidate must include a deliberately-lying
+candidate** — a tampered candidate build re-executed under the existing
+battery's tamper harness (battery.rs already runs cheat rulesets through
+`adjudicate_isolated`, battery.rs:210-218) — so the programme demonstrates
+the witness convicting the new implementation, not only agreeing with it.
+A candidate that can only be agreed with has not been witnessed.
+
+Presentation extraction: **nothing exists to fixture** (V16) — no
+presentation-frame schema, no extraction path. The fixture and bench are
+specified now so Phase 6 lands them with the feature, not after:
+`extraction_consumes_only_the_public_frame_contract` (the mirror world is
+built solely from emitted frames — a compile-visible property if frames are
+the only export, per A9's boundary), plus the B-5 extraction benchmark
+(§8.2). Recorded as phase-gated, not silently deferred.
