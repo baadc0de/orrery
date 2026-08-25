@@ -56,6 +56,7 @@ their linked dependencies.
 | D41 | [ADR-0041](adr/0041-offline-identity-issuer-custody-and-lifecycle.md) | Offline invites are single-use capabilities, account allocation is singular, issuer keys are portable escrowed secrets |
 | D42 | [ADR-0042](adr/0042-canonical-simulation-architecture.md) | Canonical state stays in the engine-neutral executor; composition root and `SimulationHost` seam land now; shared app world rejected; dedicated ECS world trigger-gated |
 | D43 | [ADR-0043](adr/0043-determinism-envelope-and-gate-replacement.md) | The three-ring determinism envelope, canonical stages S0–S7, and role-discovery replacing the typed gate list; overflow flags inside witnessed state |
+| D45 | [ADR-0045](adr/0045-per-component-capability-policy.md) | Five independent capability dimensions with fail-closed zeros and eight invalid combinations; `classify_component` replaced; IV-7's engine-handle rule accepted, its enforcement mechanism open |
 
 ## Status and supersession
 
