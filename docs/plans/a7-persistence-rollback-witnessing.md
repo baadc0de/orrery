@@ -94,3 +94,217 @@ outcome.events.is_empty()` and friends). So the tree is not blind to events;
 it is blind to events **in every instrument that would carry a migration
 parity argument** (goldens, corpus, witness pipeline). The differential
 harness has to inherit the unit tests' visibility, not the goldens' (§6).
+
+---
+
+## 2. What "rollback" is in this tree — three mechanisms, not one
+
+The brief's question "what is the rollback unit?" presumes one rollback.
+The tree operates three distinct mechanisms that only share a word, and the
+unit answer differs per mechanism — conflating them is how a wrong unit gets
+chosen. Inventory first; the decision is §3.
+
+| Mechanism | Where | What rewinds | What never rewinds | Evidence |
+|---|---|---|---|---|
+| **Predictive resimulation** (client-side, presentation tier) | lightyear ring + `orrery_predict` budget/monitor | The mispredicting entity's predicted components, restored from the 16-tick ring at the authoritative tick, then re-stepped | Cosmetic state (never snapshotted, D13); anything outside the predicted set; the world | I11; `budget.rs:191-260` (ladder), X-E |
+| **Authoritative correction** (canonical tier) | Adjudication verdict → `AdjudicatedState` → `AuthorityCorrectionInbox` | Nothing, in the rewind sense: the *corrected canonical state* is re-derived by isolated replay of the signed log and applied **forward** as an authoritative overwrite | The authority's own log — straight-line by construction (I10); committed durable effects | I13; docs/06:521 |
+| **Durable recovery** (storage tier) | Checkpoint base + journal tail replay (`lsn > watermark`) | Nothing observable: recovery reconstructs the latest durable state; it never serves an older state to a live client | Critical (P2) rows: FDB RPO 0; corrections to them are compensating transactions, never rewinds (A5 IV-5) | I9; checkpoint/mod.rs:1-11 |
+
+Two structural facts follow and are load-bearing for everything below:
+
+1. **Canonical state is never rolled back anywhere in this system.** The
+   phrase "rollback of canonical rules state" already got its honest gloss in
+   A1 (§9 assumption 7 rider): it is a replay/correction story. The unit
+   question is therefore a question about the *predictive* mechanism plus a
+   question about what a triggered ECS host would need — not a question about
+   rewinding the executor, the journal, or FDB.
+2. **The cost model is already decided by shipped arithmetic.** The budget
+   guard exists because worst-case resim is `window × step_cost` and the
+   ladder (amortize → evict → snap) is what keeps a frame affordable
+   (docs/05 §3; SnapNet's spiral-of-death arithmetic quoted there). Any unit
+   larger than the predicted set re-imports the cost that ladder exists to
+   cap.
+
+---
+
+## 3. Decision: the rollback unit
+
+**Proposed (R-1): the rollback unit is the per-entity predicted set — grain
+`(entity × its R1 components)`, scope the local predicted set, window the
+9-tick ring, budget the existing ladder. World, island, and cell are rejected
+as units. Canonical state stays correction-only; durable state stays
+recovery-only; critical (P2) state stays compensation-only.**
+
+Spelled out per candidate, each with the argument that beats it:
+
+- **Entire simulation world — rejected.** The tree already rejected it in
+  prose and practice: "Snapshotting only the predicted subset — never the
+  world — is the point: this is what makes cost scale with interest size
+  instead of world size, the exact failure of whole-world rollback"
+  (docs/05:66). A world unit also rewinds entities whose authorities never
+  mispredicted anything — under per-entity authority there is no single
+  timeline to rewind *to*: entity A's authoritative update at tick T says
+  nothing about entity B's. And under A3's adopted position there is no
+  world-shaped canonical store to snapshot in the first place (I1). The
+  brief's own worry ("Raw cloning or serialization of the complete `World` is
+  unlikely to be acceptable") is thus answered structurally, not by
+  benchmark: the design has no consumer for a world snapshot.
+- **Authority island — rejected.** No island-wide history exists anywhere;
+  corrections and residuals are keyed `(NodeId, PersistId)`
+  (`monitor.rs:45-52` per A5 §2.3). An island unit would mean one entity's
+  mispredict forces resimulation of every island co-member — cost scaling
+  with island population, which is exactly the interest-vs-world failure
+  again, one level down. Islands are an *authority* scope, not a *history*
+  scope.
+- **Spatial cell — rejected.** Cells are storage and interest keys
+  (`world/` key carries the cell; A5 §2.7); nothing simulates per cell, and
+  an entity's cell changes mid-window (rekey). A unit that migrates while
+  the window is open is not a unit.
+- **Entity set (the predicted set) — adopted as the scope.** It is what
+  ships (I11), its cost is bounded by construction (the ladder demotes
+  members until the replay fits, X-E-proven), and it composes with per-entity
+  authority: each predicted entity reconciles against *its* authority's
+  claims independently. Replay isolation makes this correct, not merely
+  cheap: steps read neighbours only from snapshots and cross-entity effects
+  travel as next-tick events (`executor.rs:106-142`), so re-stepping one
+  entity does not require re-stepping its neighbours — the same property
+  that makes single-entity adjudication valid (I13) makes per-entity
+  rollback valid.
+- **Component subset — adopted as the grain, inside the entity.** A5's R
+  dimension is per-component and this document keeps it that way: within a
+  rolled-back entity, `R1` components restore from the ring; `R0` components
+  (ledger-backed P2 rows per IV-5, cosmetic per D13) are untouched. What the
+  grain must **not** do is split the witnessed unit: the claim commitment is
+  `state_hash` over the entity's whole `CoreState` (I2), so for
+  verifiable-core entities the ring snapshots the quantized core state and
+  RNG cursor as one block (docs/05 §3 already specifies exactly this) and
+  restore is all-or-nothing at the entity. A partially restored core state
+  would hash to a value no authority ever claimed — manufacturing the false
+  deviation IV-2 exists to prevent.
+
+**Under a triggered ECS host (A3 T1–T3), the unit does not change.** The
+brief asks this node to compare component journals, archetype snapshots,
+copy-on-write and lightyear's history as *mechanisms*; the comparison is in
+§4.4, and its outcome is: the pilot's rollback substrate is a per-entity
+`R1`-component ring keyed by `PersistId` — the shape lightyear's ring
+already has — never a world snapshot, archetype clone, or COW world fork,
+because the unit those mechanisms serve (the world) is the unit rejected
+above. R-1 is storage-agnostic on purpose: it binds the executor store today
+and any world-hosted store later.
+
+**What R-1 changes in practice: nothing, today.** It is the current
+behaviour, stated as policy so that the migration cannot drift away from it.
+That is deliberate and is the same shape as A5's N-2: the value is in
+binding the pilot, not in moving the tree.
+
+---
+
+## 4. The persistence strategy comparison
+
+The brief demands a comparison: complete snapshots · component-level changes
+· domain events · transaction journals · hybrid. The tree's first answer is
+an inventory finding: **Orrery already runs a deliberate hybrid, with a
+different strategy per tier, and each tier's choice is load-bearing.**
+
+### 4.1 What exists, classified in the brief's vocabulary
+
+| Tier | Strategy in the brief's terms | Mechanism | Evidence |
+|---|---|---|---|
+| Durable bulk | **Snapshot + journal hybrid** | Checkpoint base (copy-on-update, 20 s jittered, to FDB) + append-only journal delta; restore = base + tail replay | I9 |
+| Durable critical | **Transaction journal** (the real one) | FDB serializable commits inside the intent envelope; RPO 0; receipts; anti-dupe single-ownership rows | docs/08 §2.2; `intent/mod.rs:152-155` |
+| Evidence / witness | **Command journal + state commitments** | Signed per-entity input log (frames) + per-tick `state_hash` claims chained from `input_head`; replay re-executes the log | I2, I13; docs/06 §6 |
+| Prediction | **Component snapshot ring** | 16-tick per-entity ring of predicted components (+ RNG cursor and quantized core state for verifiable entities) | I11 |
+| Goldens/corpus | **State-hash chain fixtures** | blake3 chain over every per-tick state hash, committed | I4 |
+
+The evidence tier deserves its name said plainly: it is **command sourcing
+with state checkpoints** — the log stores *inputs* (cheap, canonical order
+fixed by VC-2), and per-tick hashes commit the *result* without storing it.
+That factorization is what makes adjudication both possible and cheap:
+storage cost scales with input volume, verification cost with window length,
+and neither with state size.
+
+### 4.2 Complete canonical snapshots (as the primary strategy) — rejected
+
+Snapshot-only persistence (serialize everything each interval) loses the
+between-snapshot window (RPO = cadence), which the journal exists to close;
+snapshot-only *rollback* was rejected in §3. Snapshots remain what they are
+today: the base of the durable hybrid and the `t0` anchor of every evidence
+bundle (`load_claimed_snapshot`, hash-verified before load — X-B). Nothing
+about the migration changes this.
+
+### 4.3 Component-level change journals (as the canonical/rollback substrate) — rejected for now, with the two named preconditions
+
+The bulk journal is a component-diff journal already (`RecordKind::
+ComponentDiff`). Could it double as the rollback/replay substrate — rewind by
+reading the journal backward, replay by reading it forward? Not today, for
+two mechanical reasons, both recorded rather than assumed:
+
+1. **It is not tick-addressed.** F-1: the production writer stamps
+   uplink-sequence numbers into the `tick` field, so journal positions
+   cannot be joined to claim windows or ring ticks. Until the writer stamps
+   real ticks, "journal-as-history" is unimplementable as specified.
+2. **It makes no schema statement.** A5 G-3: `DiffUplink.payload` carries no
+   `(ComponentTypeId, SchemaVersion)`; the actor resets overwritten bags'
+   floors to v0 with a documented apology (`actor.rs:1300-1308`). A history
+   you cannot version is a history you cannot migrate.
+
+Both closures are already owned (G-3 by the A8/A11 framed-bag producer
+package; F-1 flagged in §1.1), and once both close, journal-as-history
+becomes *possible* — but §3 removes the need: the predicted-set unit is
+served by the ring at strictly lower cost (16 ticks in memory vs a
+disk-format read-modify path), and the canonical tier corrects by replay of
+the *input* log, which is cheaper to store and already signed. Verdict:
+keep the component journal as what it is — the durability delta — and do
+not promote it to a history substrate.
+
+### 4.4 Archetype snapshots and copy-on-write worlds (the ECS-pilot question) — rejected as mechanisms for a unit that was rejected
+
+For a triggered dedicated world, the brief lists archetype snapshots and COW
+as rollback candidates. Both are world-grain mechanisms: an archetype
+snapshot clones column storage whose layout is world-history-dependent (I3 —
+the same allocation-order dependence three probes reproduced), and a COW
+fork preserves *the world's* past, not an entity's. Since the unit is the
+per-entity predicted set (R-1), the pilot needs neither: it needs a
+per-entity ring of `R1` components keyed by `PersistId`, which lightyear
+already maintains for the presentation world and which a canonical host
+would implement as a small `BTreeMap<PersistId, Ring<Snapshot>>` — the
+executor's own storage discipline applied to history. Anything world-shaped
+is not just unnecessary; it would re-import archetype layout into restored
+bytes, which IV-7/WP-3 (§5) forbid from ever reaching an encoded artifact.
+
+### 4.5 Domain-event journals (as canonical truth) — rejected; adopted as fixtures
+
+Storing emitted `CoreEvent`s as the durable record of what happened is the
+event-sourcing move. Against this tree it fails twice:
+
+- **Events are derived, not primary.** The doctrine is written where the API
+  lives: "an event-only effect is invisible to state-hash goldens and
+  adjudication. A game whose materialization matters to adjudication must
+  also record an own-state trace" (`ruleset.rs:280-284`). Adjudication
+  verifies *state* commitments against *input* logs; an event journal would
+  be a second, unverified account of the same history — and A2 CC-4 shows
+  the tree already routes durable consequences of events through state
+  counters and the intent envelope instead.
+- **Event semantics are A6's, being decided right now.** Ordering, replay,
+  dedup and idempotency of commands/events belong to #402 (sibling lane);
+  a persistence strategy built on their semantics would decide another
+  node's questions by fiat.
+
+What survives is the narrow, valuable piece: **committed event-trace
+fixtures as test instruments** (§6) — journals of events for *comparison*,
+never for *authority*. That distinction keeps the single-source-of-truth
+property: canon is state commitments + input logs; events remain derived.
+
+### 4.6 Verdict
+
+**Proposed (P-1): the migration introduces no new persistence strategy.**
+The four-tier hybrid stands as inventoried in §4.1. What the #395 programme
+changes is only *who produces the bytes* (modules declaring capabilities
+per A5's P/R/W dimensions instead of one impl body) and *what additional
+fixtures exist* (§6). Each tier's strategy maps onto the brief's module
+model as: modules declare `(ComponentTypeId, SchemaVersion)` codecs and
+P/R/W/N/A capabilities (A5 N-5/N-7); the kernel routes P1 through the
+journal+checkpoint hybrid, P2 through the intent envelope, R1 through the
+ring, W2 through frames/claims — and "the module system must not let modules
+bypass transactional persistence invariants" (brief) is exactly A5's IV-3
+plus A2 row 4's envelope ownership, already argued there.
