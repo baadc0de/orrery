@@ -376,8 +376,17 @@ self_test() {
   jq '.session.shakedown = {phase: "unbanked", golden_pass: true, client_launch_pass: true, discrepancy_reports: 0, untriaged_discrepancy_reports: 0, triaged_real_reports: 0, tolerance_band_digest: "bands-v1"}' "$dir/shakedown.jsonl" > "$dir/shakedown.next.jsonl"
   mv "$dir/shakedown.next.jsonl" "$dir/shakedown.jsonl"
   shakedown="$(P4_LEDGER_FILE="$dir/shakedown.jsonl" "$0" shakedown 2>&1 || true)"
-  grep -q 'impairment verified applied in every sampled session: PASS' <<<"$shakedown" \
-    || die "self-test: agreeing observed impairment did not pass ('$shakedown')"
+  local criterion
+  for criterion in \
+    'goldens green on all three platforms' \
+    'client launches on all three platforms' \
+    'zero discrepancy reports triaged real over those hours' \
+    'no tolerance band moved during them' \
+    'impairment verified applied in every sampled session'
+  do
+    grep -q "$criterion: PASS" <<<"$shakedown" \
+      || die "self-test: passing shakedown fixture did not pass '$criterion' ('$shakedown')"
+  done
   cp "$dir/shakedown.jsonl" "$dir/shakedown.good.jsonl"
   st_shakedown_fail() {
     jq "$1" "$dir/shakedown.good.jsonl" > "$dir/shakedown.jsonl"
