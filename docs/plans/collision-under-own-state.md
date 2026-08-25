@@ -319,3 +319,234 @@ the stage-two cross-check (price 2); with declared-tick frames it is closed.
 **Verdict:** right long-term substrate, already approved and en route via #444
 — but it is a *detection upgrade* to 4.A, not a different resolution model, and
 collision should not block on it.
+
+## 5. Recommendation
+
+**Adopt 4.A — event-carried claim-and-verify with a single-computation impulse
+echo — for #441 now, and let 4.D (already approved as #390/#444) upgrade its
+detection when the `NeighborFrame` producer lands.** The two are not rivals:
+4.A's round trip *is* the resolution model in both worlds; 4.D swaps the
+carried-assertion inputs for recorded, cross-checkable neighbour reads without
+touching the event shape.
+
+### 5.1 Why this and not the others
+
+- It is the only approach that ships #441 with **zero new false-deviation
+  surface** (§6 table) and **zero new core/protocol machinery**: no
+  `NeighborFrame` producer dependency, no protocol bump against the
+  exact-equality handshake (`gateway.rs:182`), no gate change, no replay-harness
+  change. Everything lands inside `crates/orrery_games` — one digest tree, one
+  `REGOLITH_RULESET.version` bump, one golden regeneration, exactly as #441
+  budgeted.
+- It is the pattern the tree has already proven end-to-end: `Order::Damage` is
+  a carried-kinematics, target-adjudicated, integer-exact cross-entity effect
+  with goldens and adjudication tests holding it (§8, M2 kills two named
+  tests). Collision extends the vocabulary; it does not invent one.
+- The impulse echo is what makes it *physics* rather than two uncorrelated
+  bounces: one `J`, integer, applied with opposite signs — conservation exact
+  in the exchanged quantities, on both sides' logs, at replay, forever.
+
+### 5.2 What it costs
+
+- **Latency:** contact→verifier bounce 1 tick, contact→initiator bounce 2
+  ticks (17/33 ms). Presentation covers it: the client predicts the bounce
+  cosmetically and reconciles, exactly as 05-prediction-rollback already
+  handles misprediction.
+- **Trust:** carried kinematics are believed at step time; the counterparty's
+  echoed `J` is bounds-checked, not recomputed from verified inputs. This is
+  the *existing* `Order::Damage` trust level (§2 caveat) — collision does not
+  widen it, but anyone who thought damage was fully cross-verified today should
+  read D46 clause (e)(4) first.
+- **Consistency, not adjudication, guarantees the pair agrees.** A dropped or
+  suppressed second leg leaves one body bounced and the other not — visible as
+  ordinary replication divergence, never as a deviation verdict. §6 works
+  the incentives.
+
+### 5.3 What it forecloses — reported against the recommendation's interest
+
+- **Persistent contact.** Impulsive events cannot express resting contact,
+  stacking, pushing matches, or a body sliding along another. Each of those is
+  a *sustained mutual constraint*, which under own-state discipline would need
+  a per-tick claim/echo exchange — an event storm bounded only by the D46(e)
+  emission cap, with per-pair latency making the constraint spongy. **This is
+  the honest architectural limit the owner asked about: Orrery's discipline
+  admits impulse-exchange physics cleanly; it does not admit constraint-solver
+  physics between separately-authoritative bodies, and nothing in D42–D48
+  currently sketches a way it could.** Games needing that must either co-house
+  the interacting set under one authority (the D42 island/cell shape — a
+  contact *group* migrating to one holder, where a future shared-world
+  executor could solve contacts locally and log them as one closed input set)
+  or keep such physics in the Bulk/Cosmetic tiers (§2's table: "contested
+  physics objects … under weak authority" are already classified Bulk,
+  invariant-checked, not adjudicated). For Regolith — bounces, not piles —
+  the limit costs nothing.
+- **Rock–rock collision** stays out until either host-submitted claims (a new
+  input class) or 4.D detection exists. Rocks passing through each other is
+  the accepted, and current, behaviour.
+- **Exact global momentum accounting** is per-contact, not per-world: a leg
+  lost to the §6 suppression case leaks momentum. No invariant should claim
+  otherwise, and none is proposed.
+
+### 5.4 Decision hygiene
+
+Nothing here amends an ADR. D46's event discipline, D43's overflow posture and
+D48's quantize-before-hash law are complied with, not changed. One item rises
+to the owner if made load-bearing: **if collision damage (hull loss on impact)
+is wanted, the impulse-to-damage map is a rules constant set the owner should
+own** (R8 registry material, like `MAX_EVENTS_PER_STEP` in D46 clause (e)(5)).
+The mechanism below works with or without it.
+
+## 6. Failure modes, per approach — who can make honest peers disagree
+
+| Approach | Can two honest peers produce a deviation verdict against each other? | Dishonest-party leverage | Detection of the dishonesty |
+|---|---|---|---|
+| 4.A event round trip | **No.** All inputs logged; replay closed; both honest replays reproduce bit-for-bit (discrete) / in-band (continuous) | Fabricated carried kinematics in `Bump`; suppressed reply leg; never-claiming initiator | Fabricated payload diverges the *emitter's* own replay (event is a function of own state). Suppression is not adjudicable today (§2 caveat) — it is visible as replication divergence and, for a ship, self-harming: the non-claimer's hull never takes rock damage on its own screen but its opponents' invariant checks see it fly through what their replicas say is occupied space — currently unpunished, honestly stated |
+| 4.B arbiter | **No** (event-carried variant) | Arbiter shoves the counterparty within bounds | Same as 4.A, concentrated in one role — strictly worse scepticism geometry |
+| 4.C static ambient | **No.** Build-pinned input | None (nothing to assert) | n/a |
+| 4.D NeighborFrame reads | **None at replay** (recorded frame is the input). **One real hazard at stage-two cross-check:** if frames are compared against the neighbour's claim at the *reader's* tick, honest replication lag reads as fabrication — a false-accusation generator. Closed by declared-tick frames + staleness cap (§4.D price 2); open if #444 skips it | Recording fabricated frames | Cross-check against the neighbour's signed claims — the check that *defines* this approach |
+
+The table is the argument: 4.A and 4.C cannot manufacture false deviations at
+all; 4.D can only via an avoidable cross-check design error; and the genuinely
+unclosed hole — cross-log delivery suppression — is **pre-existing, shared with
+`Order::Damage`, and orthogonal to which approach is chosen**. It is
+witness-side future work (D46 clause (e)(4) names it), not a reason to prefer
+any approach here.
+
+## 7. What this means for #441, concretely
+
+Findings first, because two of them reshape the work:
+
+- **F1 — asteroid motion is currently dead code.** The integration and boundary
+  reflection exist (`mod.rs:620-632`) but every rock in the tree moves at zero:
+  bloom rocks spawn with `QVel::default()` (`bloom_spec`, `mod.rs:990`), and
+  split children scale the parent's velocity by 1.4 (`child_spec`,
+  `mod.rs:934-935`) — 1.4 × 0 = 0. Proven by mutation M3 (§8): deleting the
+  x-axis integration entirely **passes the whole `orrery_games` suite,
+  goldens included**. Item 2 of #441 is therefore genuinely new behaviour, and
+  the current goldens pin none of it.
+- **F2 — the overflow posture is already half-adopted.** Rock integration uses
+  `saturating_add`/`saturating_neg`; but no Regolith state field records that
+  saturation occurred, which D43 clause (f)(3) requires once the value can
+  actually saturate. With `ISLAND_BOUNDARY_MM = 1_000_000` and tier speed caps,
+  positions cannot approach `i64` saturation honestly — the flag matters for
+  *adjudicating a dishonest claim*, not for honest play. Add the discrete
+  overflow flag field when touching the state schema anyway (it is a
+  `CoreCodec` layout change = version bump, which #441 pays regardless).
+
+The Monday-morning sequence:
+
+1. **Give rocks velocity (item 2).** Seed nonzero `vel` in `bloom_spec` from
+   the director's `TickRng` (direction uniform via the existing
+   `uniform_jitter` shape, speed bounded by `tier.limits().max_speed_mms`), and
+   in `Rock::spawned` call sites for scenario seeds. Integration already
+   exists; do not rewrite it. **Write the named test first** (F1 means nothing
+   currently fails when motion breaks): a scenario with a moving rock whose
+   golden chain changes when integration is mutated — name it e.g.
+   `rocks_integrate_velocity_and_reflect_at_the_boundary`, and make it kill
+   M3's exact mutation.
+2. **Add the vocabulary.** `Order::Bump { from, from_pos, from_vel, from_radius,
+   from_mass }`, `Order::BumpResolved { from, impulse }`, `Outcome::Contact {…}`
+   and `Outcome::ContactResolved {…}` with `deliver()` arms (`mod.rs:1074`),
+   plus `Order`/`Outcome` codec arms — the codec is hand-rolled positional
+   (`order.rs`), so new variants extend, never reorder, existing tags (D21
+   additivity; the round-trip is covered by
+   `states_round_trip_through_the_canonical_codec`).
+3. **Masses.** Add `mass` to `archetype::Limits` and `RockTier::limits()`
+   (integer, e.g. milligrams-scale units chosen so `J / m` divisions keep
+   mm/s precision; document the unit). Restitution `e` as a `/1024` fixed-point
+   rules constant.
+4. **The verifier arm.** In `step_rock` and `step_craft`: on `Order::Bump`,
+   the overlap predicate (i128 mm², the `nonnegative_distance_squared` shape),
+   the approach check `(v_rel · n) < 0`, the per-pair `contact_cooldown`, then
+   integer impulse (§4.A formula, i128 intermediates, saturating narrowing with
+   the F2 flag), own-velocity update, `Outcome::ContactResolved` emission.
+   Ship–rock: ship initiates (client/pilot submits `Bump` naming the rock;
+   for tests and the current host-driven pilots, `pilot::honest_orders` does
+   it from the peer list it already receives — `mod.rs:1063-1072`). Ship–ship:
+   lower `PersistId` initiates (§4.A.1).
+5. **The initiator arm.** On `Order::BumpResolved`: bounds-check `|J|` against
+   the archetype envelope, apply `v_own −= J/m_own` (craft velocity math is
+   f64 internally — apply J in integer mm/s to the post-step quantized
+   velocity, or convert once; keep the applied quantity exactly the carried
+   integer so both logs agree on it), count a dropped-impulse flag on bound
+   failure.
+6. **Books.** Bump `REGOLITH_RULESET.version` 8 → 9 (`mod.rs:74-77`),
+   regenerate goldens (`emit_goldens`, `tests/battery.rs:258-260`), run
+   `./scripts/check.sh gates` and `./scripts/core-gates.sh`.
+7. **Mutations #441's acceptance demands**, each with the named test that must
+   die: (a) M3's integration deletion → the new motion test; (b) overlap
+   predicate always-true → a `bump_beyond_contact_range_is_rejected` test (the
+   §8 M2 shape: today `range_exceeded_and_target_destroyed_break_logged_locks`
+   plays this role for shots); (c) impulse sign flip → conservation test
+   asserting the two applied deltas sum to zero across the pair's logs in a
+   two-entity scenario; (d) cooldown removal → no-double-bounce test.
+8. **Out of scope, explicitly:** rock–rock contact; any `view.neighbor()` use
+   (the gate stays untouched and must pass unexempted, as #444 also requires);
+   collision damage to hull unless the owner sets the impulse-to-damage
+   constants (§5.4).
+
+Interaction with the rest of #439: item 7 (#444) will land the NeighborFrame
+producer for LoS. When it does, `Bump` verification can graduate from carried
+kinematics to a recorded neighbour read inside the same audited predicate
+module #444 creates — same events, same resolution, better-verified detection.
+Nothing in the #441 shape has to be undone; that is deliberate.
+
+## 8. Mutation log (break the guarded stage → named check dies → revert → green)
+
+| # | Mutation (the stage, not the check) | Result | Revert |
+|---|---|---|---|
+| M1 | Inserted `let _ = view.neighbor(me);` into `Regolith::step` (`mod.rs:146`) | `./scripts/core-gates.sh` died: `core-gates: live neighbour read in a Ruleset — cross-entity effects travel as events (docs/06 §3)`, naming the exact file:line; exit 1 | Reverted; `core-gates: verifiable-core static gates pass` |
+| M2 | Disabled the target-side range clause of `projectile_resolution` (`if range_sq > square_i64(reach)` → `if false && …`, `mod.rs:765`) | Two named tests died: `chains_match_the_committed_golden` (battery: `test result: FAILED. 10 passed; 1 failed`) and `range_exceeded_and_target_destroyed_break_logged_locks` (regolith: `27 passed; 1 failed`) | Reverted; full `cargo test -p orrery_games` green (`11 passed`, `28 passed`, `15 passed`, `1 passed`) |
+| M3 | Deleted the rock x-axis velocity integration (`mod.rs:621`) | **Survived.** Entire `orrery_games` suite green under the mutation — no test moves a rock (every spawn site passes `QVel::default()` or inherits a zero parent velocity). Reported against the "asteroids already move" assumption; drives §7 F1 and step 1 | Reverted; suite green; `git status` clean |
+
+M3 compiled and ran (result lines present, `1 file changed` confirmed before
+revert) — it is a true surviving mutation, not a filtered-out or non-compiling
+one.
+
+## 9. Stale citations and unevidenced claims
+
+Checked and **correct as briefed**: `scripts/p4-ledger.sh:409-414`
+(`PIPELINE_TREES` = witness, core, games, p1-swarm);
+`crates/orrery_protocol/src/gateway.rs:182` (`protocol_accepted` exact
+equality); `verifiable.rs:116` (`NeighborFrame` id-only);
+`replay.rs:116-130` (single-entity install); `ruleset.rs:139-144`
+(`recorded_reads` → "The executor turns these into `NeighborFrame` records" —
+#390 cited it as `ruleset.rs:141`, still within the span).
+
+Corrections and drift found:
+
+- The witness isolation comment the docs point at ("Core steps should not read
+  neighbours", `crates/orrery_witness/src/witness.rs` "~line 346"): at line 346
+  today sits the `DeferredKey` doc comment; the per-entity-executor isolation
+  rationale is the `Watched` struct doc (`witness.rs:353-357`) and the
+  `Witness` type doc above it. Same conclusion, drifted line.
+- This brief's line-number pointer for the gate comment ("read the comment
+  there in full") resolves to `core-gates.sh:127-135`, scan at `137-139`.
+
+Marked **unevidenced / conjecture**, deliberately:
+
+- The claim that a per-tick claim/echo exchange for persistent contact would be
+  unacceptably spongy (§5.3) is reasoned from the 1-tick delivery law and the
+  D46(e) emission cap, not measured. No prototype was built.
+- The suppression incentive analysis (§6, "self-harming") assumes opponents'
+  stage-1 invariant checks would notice a ship overlapping their replica's
+  rocks; no such invariant exists in Regolith today (`invariants.rs` covers
+  speed/accel/teleport shapes). It is an argument about what *could* be
+  checked, not what is.
+- Latency imperceptibility at 33 ms (§5.2) is asserted from the 250 ms sustain
+  window and ordinary prediction practice, not playtested.
+
+## 10. Unsure
+
+- Whether #444's NeighborFrame design will pin frames to a declared neighbour
+  tick (§4.D price 2). #390's clauses do not say it explicitly; if it lands
+  without it, the stage-two cross-check inherits a false-accusation hazard that
+  this document flags but cannot close from here.
+- Whether the owner wants impact to cost hull. The mechanism is
+  damage-agnostic; the constants are the owner's (§5.4).
+- Whether craft internal f64 velocity math (`step_craft`) applying an integer
+  `J` stays exactly consistent with the rock side's pure-integer application
+  across platforms. The quantize-at-tick-boundary law (VC-7, D48 WP-4) bounds
+  the divergence to the lattice, and the carried `J` itself is discrete on both
+  logs — but the crossing of the f64/integer seam inside one step deserves a
+  run-twice test when implemented, and is flagged rather than assumed safe.
