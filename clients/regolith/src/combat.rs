@@ -1624,72 +1624,95 @@ mod ruleset_agreement {
         }
     }
 
-    /// The interior of the range, measured rather than sampled.
+    /// The ruleset's own draw for one `(seed, tick)` stream.
     ///
-    /// For one fixed rng stream the draw `d` is a constant, so the ruleset
-    /// hits exactly when its own chance exceeds `d`. Bisecting the transverse
-    /// speed finds where the ruleset flips, and the skin's chance either side
-    /// of that flip brackets `d`. If the transcription were wrong by more
-    /// than the bracket width, the flip would land somewhere else.
-    ///
-    /// Four hundred streams put four hundred independent brackets across the
-    /// range, which is also what makes the two claims after the sweep
-    /// affordable.
-    #[test]
-    fn the_rulesets_flip_lands_where_the_skins_chance_says_it_will() {
-        let mut brackets = Vec::new();
-        for seed in 0..=255u8 {
-            for round in 0..2u64 {
-                let tick = 3 + u64::from(seed) * 97 + round * 1_000_003;
-                let mut hits = 0i64;
-                let mut misses = 1_000_000_000i64;
-                assert_eq!(
-                    verdict(seed, tick, target_at(hits)),
-                    Some(ShotResult::Hit),
-                    "seed {seed}: the ceiling missed, which another test already forbids"
-                );
-                assert_eq!(
-                    verdict(seed, tick, target_at(misses)),
-                    Some(ShotResult::Miss)
-                );
-                while misses - hits > 1 {
-                    let middle = hits + (misses - hits) / 2;
-                    match verdict(seed, tick, target_at(middle)) {
-                        Some(ShotResult::Hit) => hits = middle,
-                        Some(ShotResult::Miss) => misses = middle,
-                        other => panic!("seed {seed}: no verdict at {middle}: {other:?}"),
-                    }
-                }
-                let above = client_chance(&target_at(hits));
-                let below = client_chance(&target_at(misses));
-                assert!(
-                    above >= below,
-                    "seed {seed}: the skin's chance is not monotone in transverse speed"
-                );
-                // The ruleset's draw `d` sits in `below..=above`: it hit at
-                // `above` and missed at `below`, one millimetre per second of
-                // transverse speed apart.
-                let width = above - below;
-                assert!(
-                    width <= 20_000,
-                    "seed {seed}: the flip is pinned only to {width} ppm — \
-                     either the transcription drifted or the sweep is too coarse"
-                );
-                brackets.push((below, above));
+    /// `Executor::step_entity` seeds with `tick_rng(seed, entity, tick)` and
+    /// nothing else (`orrery_core/src/executor.rs`), and `tick_rng` is
+    /// public, so the stream is reproducible from outside the ruleset. The
+    /// rejection loop is `uniform_below`'s, which is private — but a wrong
+    /// reproduction cannot pass quietly: the biconditional below would break
+    /// on the first stream, not silently agree.
+    fn draw_for(seed_byte: u8, tick: u64) -> u32 {
+        use rand_core::RngCore;
+        let mut rng = orrery_core::tick_rng(UniverseSeed([seed_byte; 32]), TARGET, Tick::new(tick));
+        let limit = u32::MAX - u32::MAX % CHANCE_SCALE;
+        loop {
+            let draw = rng.next_u32();
+            if draw < limit {
+                return draw % CHANCE_SCALE;
             }
         }
+    }
 
-        // The brackets must not all sit in one corner, or a transcription
-        // that agreed near the ceiling and nowhere else would pass.
-        let lowest = brackets.iter().map(|(low, _)| *low).min().expect("a sweep");
-        let highest = brackets
-            .iter()
-            .map(|(_, high)| *high)
-            .max()
-            .expect("a sweep");
+    /// Transverse speeds chosen to put the skin's chance across the whole
+    /// range, from just under the ceiling to nothing at all.
+    const SWEEP_MMS: [i64; 8] = [
+        3_828, 18_000, 35_351, 54_000, 82_486, 162_000, 378_000, 1_706_800,
+    ];
+
+    /// The measurement this whole issue turns on: **the ruleset's own hit
+    /// chance, read off the ruleset, is the number the band is built from.**
+    ///
+    /// The ruleset hits exactly when `draw < chance`, so across many streams
+    /// at one fixed geometry its chance is pinned to the interval between the
+    /// largest draw that hit and the smallest draw that missed. That is a
+    /// *measurement of `orrery_games`'s private `hit_chance_ppm`* through its
+    /// verdicts, not a restatement of the transcription. With 16_384 streams
+    /// the interval is around a hundred ppm wide, and the skin's number has
+    /// to sit inside it at every geometry.
+    #[test]
+    fn the_rulesets_own_chance_is_measured_and_it_is_the_skins_number() {
+        const STREAMS: u32 = 16_384;
+        let streams: Vec<(u8, u64)> = (0..STREAMS)
+            .map(|index| ((index % 256) as u8, 5 + u64::from(index / 256) * 1_000_003))
+            .collect();
+
+        let mut widest = 0u32;
+        let mut chances = Vec::new();
+        let mut near_certain_miss = None;
+        for transverse in SWEEP_MMS {
+            let chance = client_chance(&target_at(transverse));
+            chances.push(chance);
+            let mut highest_hit: Option<u32> = None;
+            let mut lowest_miss: Option<u32> = None;
+            for &(seed, tick) in &streams {
+                let draw = draw_for(seed, tick);
+                match verdict(seed, tick, target_at(transverse)) {
+                    Some(ShotResult::Hit) => {
+                        highest_hit = Some(highest_hit.map_or(draw, |best| best.max(draw)));
+                    }
+                    Some(ShotResult::Miss) => {
+                        lowest_miss = Some(lowest_miss.map_or(draw, |best| best.min(draw)));
+                        if chance >= 990_000 {
+                            near_certain_miss = Some((chance, draw));
+                        }
+                    }
+                    other => panic!("no verdict at {transverse} mm/s: {other:?}"),
+                }
+            }
+            // Hit means `draw < ruleset_chance`; miss means `draw >= it`.
+            let low = highest_hit.map_or(0, |draw| draw + 1);
+            let high = lowest_miss.unwrap_or(CHANCE_SCALE);
+            assert!(
+                low <= high,
+                "{transverse} mm/s: the verdicts are not a threshold at all"
+            );
+            assert!(
+                (low..=high).contains(&chance),
+                "{transverse} mm/s: the ruleset's own chance is in {low}..={high} ppm, \
+                 the skin says {chance} ppm"
+            );
+            widest = widest.max(high - low);
+        }
+
         assert!(
-            lowest < CHANCE_SCALE / 4 && highest > CHANCE_SCALE * 3 / 4,
-            "the measured thresholds only span {lowest}..{highest} ppm"
+            widest <= 5_000,
+            "the measurement is only good to {widest} ppm; raise STREAMS"
+        );
+        assert!(
+            chances.iter().any(|chance| *chance > 990_000)
+                && chances.iter().any(|chance| *chance < 10_000),
+            "the sweep did not span the range: {chances:?}"
         );
 
         // The upper boundary, earning its place. `PERFECT` is reserved for
@@ -1698,16 +1721,45 @@ mod ruleset_agreement {
         // `draw ∈ 0..CHANCE_SCALE`. Here is the ruleset missing a shot the
         // skin rates at better than 99%: a band that rounded that up to
         // PERFECT would have been caught by this miss.
-        let dearest_miss = brackets.iter().map(|(low, _)| *low).max().expect("a sweep");
+        let (chance, draw) = near_certain_miss
+            .expect("no stream drew high enough to show a near-certain shot missing");
         assert!(
-            dearest_miss >= 990_000,
-            "no stream drew high enough to show a near-certain shot missing; \
-             the best was {dearest_miss} ppm"
+            draw >= chance && chance >= 990_000,
+            "draw {draw} against chance {chance}"
         );
+    }
+
+    /// The same verdicts, one at a time rather than in aggregate: every
+    /// single resolution the ruleset produced is exactly the one
+    /// `draw < skin_chance` predicts. A transcription that agreed on average
+    /// and disagreed in detail fails here.
+    #[test]
+    fn every_single_verdict_is_the_one_the_skins_number_predicts() {
+        let mut hits = 0u32;
+        let mut misses = 0u32;
+        for seed in 0..=255u8 {
+            let tick = 11 + u64::from(seed) * 4_099;
+            let draw = draw_for(seed, tick);
+            for transverse in SWEEP_MMS {
+                let chance = client_chance(&target_at(transverse));
+                let expected = if draw < chance {
+                    hits += 1;
+                    ShotResult::Hit
+                } else {
+                    misses += 1;
+                    ShotResult::Miss
+                };
+                assert_eq!(
+                    verdict(seed, tick, target_at(transverse)),
+                    Some(expected),
+                    "seed {seed} tick {tick}: draw {draw} against {chance} ppm \
+                     at {transverse} mm/s"
+                );
+            }
+        }
         assert!(
-            dearest_miss < CHANCE_SCALE,
-            "a stream missed at the ceiling, which contradicts \
-             perfect_never_misses_in_the_ruleset"
+            hits > 100 && misses > 100,
+            "the sweep must exercise both verdicts: {hits} hits, {misses} misses"
         );
     }
 
