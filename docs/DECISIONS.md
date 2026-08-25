@@ -58,6 +58,7 @@ their linked dependencies.
 | D43 | [ADR-0043](adr/0043-determinism-envelope-and-gate-replacement.md) | The three-ring determinism envelope, canonical stages S0–S7, and role-discovery replacing the typed gate list; overflow flags inside witnessed state |
 | D45 | [ADR-0045](adr/0045-per-component-capability-policy.md) | Five independent capability dimensions with fail-closed zeros and eight invalid combinations; `classify_component` replaced; IV-7's engine-handle rule accepted, its enforcement mechanism open |
 | D46 | [ADR-0046](adr/0046-message-class-semantics.md) | Six message classes with internal commands collapsed onto domain events; delivered-first composition ratified as law; emission cap binds and flags rather than failing the tick |
+| D47 | [ADR-47](adr/0047-rollback-unit.md) | Only prediction rewinds: canonical is correction-only, durable recovery-only, critical compensation-only; the unit is the per-entity predicted set with all-or-nothing restore |
 
 ## Status and supersession
 
