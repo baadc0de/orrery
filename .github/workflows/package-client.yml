@@ -37,6 +37,19 @@ jobs:
         working-directory: clients/regolith
     env:
       ORRERY_BUILD_REV: ${{ github.sha }}
+      # `.cargo/config.toml` routes rustc through `kache` so agent worktrees
+      # share one object cache. A hosted runner has no kache on PATH, and cargo
+      # treats a missing wrapper as a hard error, not a fallback:
+      #
+      #   error: could not execute process `kache .../rustc` (os error 2)
+      #
+      # `ci.yml` already carries this opt-out at workflow scope; this workflow
+      # did not, which is why every matrix leg failed on its first ever run.
+      # Unlike `ci.yml` there is no kache-installing job here to put it back.
+      RUSTC_WRAPPER: ""
+      # A fresh runner has no incremental artifacts to reuse, so they cost
+      # build time and buy nothing.
+      CARGO_INCREMENTAL: 0
     steps:
       - uses: actions/checkout@v7
 
