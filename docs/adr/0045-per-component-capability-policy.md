@@ -49,3 +49,84 @@ and `gates/p1-swarm` (`scripts/p4-ledger.sh:409-414`, verified on this tree),
 and this record's only code-touching consequence — clause (f)'s eventual
 removal of a trait method from `orrery_core`/`orrery_games` — is explicitly
 sequenced last, at the owner's pleasure, post-P4-digest.
+
+## Context
+
+### 1. One enum, five questions — the hook this record retires never answered any of them
+
+`Ruleset::classify_component` returns one three-valued `CoreClass` —
+Core / Bulk / Cosmetic (`crates/orrery_core/src/ruleset.rs:61-71`) — with a
+deliberately conservative default: "an unclassified component is `Cosmetic`,
+so a game that forgets to classify gets a component that is never persisted
+rather than one silently admitted to adjudication" (`ruleset.rs:293-297`).
+The default's instinct is right and clause (c) keeps it. The enum's shape is
+wrong, and the tree proves it: the kernel asks at least five *independent*
+questions about a component — is it persisted, is it rolled back, is it
+witnessed, is it replicated, who may write it — and the in-tree answers do
+not lie on one axis (Context §3). Meanwhile the one hook that was supposed
+to answer them has zero call sites (re-verified at acceptance, and
+independently by two prior nodes: A3's inventory row G3,
+[a3-simulation-host-comparison.md](../plans/a3-simulation-host-comparison.md):45,
+and A5 §6.1). Nothing routes on the enum today; the only cost of replacing
+it is deleting three first-party overrides.
+
+### 2. Reflection defines no encoding today — census, not assumption
+
+Re-run at acceptance on this tree: `rg "Reflect"` over `crates/*/src`
+matches **zero** first-party source lines. `bevy_reflect` appears as a
+listed direct dependency of exactly three crates —
+`crates/orrery_spatial/Cargo.toml:27`, `crates/orrery_net/Cargo.toml:24`,
+`crates/orrery_persist_client/Cargo.toml:33` — with no use in their sources;
+whether those entries are needed for feature unification with the vendored
+replicon or are dead weight is recorded as an open question, not a finding
+(A5 §5.1, unchanged). Every encoding that reaches a wire or a store is a
+*declared* codec: hand-written `CoreCodec` for canonical state, where
+"canonical is the whole requirement" because divergent encodings of equal
+state produce false deviations (`crates/orrery_core/src/ruleset.rs:23-27`);
+the framed component bag carrying `(component, schema_version, payload)` per
+slot (`crates/orrery_persistd/src/schema.rs:48-59`); and replicon uplink
+payloads produced by **registered per-component serialize functions, not
+reflection** (`vendor/bevy_replicon/src/server/uplink.rs`). Clause (b)
+ratifies this state; under it, nothing changes today.
+
+### 3. The five dimensions' independence is in the tree, not in the argument
+
+Four capability combinations that a single flag cannot express already ship:
+
+- **Witnessed but not replicated.** Core state reaches witnesses as signed
+  frames and claims over the witness link, run by every interested peer
+  "regardless of witness-set membership"
+  (`crates/orrery_witness/src/witness.rs:655-663`); a watched entity outside
+  a peer's replication interest is still checked. W2 ∧ N0 is coherent.
+- **Replicated but never persisted.** Projectiles replicate in-island under
+  `IslandAuthoritative`, a marker kept distinct from `LocallyAuthoritative`
+  on purpose so that "an ephemeral entity carrying this one can never be
+  persisted no matter what game code does with it"
+  (`crates/orrery_authority/src/ephemeral.rs:346-352`). N1 ∧ P0.
+- **Persisted but not adjudicated.** `CoreClass::Bulk`'s own definition:
+  "Persisted but not adjudicated: quantized replication, bulk writes,
+  invariant validators only" (`crates/orrery_core/src/ruleset.rs:66-68`).
+  P1 ∧ W1 ∧ ¬W2.
+- **Persisted but not rolled back.** Ledger rows are transaction-final; the
+  FDB intent transaction "remains the sole authority"
+  (`crates/orrery_persistd/src/intent/mod.rs:152-154`), and a committed
+  credit is never rewound — corrections are compensating transactions.
+  P2 ∧ R0.
+
+This is why clause (c) declares five dimensions rather than one flag: the
+combinations above are facts of the shipped tree, and any single-axis policy
+would either forbid one of them or misfile it.
+
+### 4. The one row nothing enforces — G-1, confirmed live at acceptance
+
+A9's mutation M3 showed that an engine handle appended to a replicated,
+journal-bound payload passes everything. Re-run at acceptance on this tree
+(post-#427): `entity.to_bits().to_le_bytes()` appended to the `DiffUplink`
+payload in `crates/orrery_persist_client/src/feed.rs` — `cargo test -p
+orrery_persist_client` fully green (`96 passed`, `2 passed`, `2 passed`,
+`1 passed`, all `0 failed`; one suite `0 passed; 0 filtered out`, an empty
+suite read and not counted as coverage), `./scripts/core-gates.sh` exit 0,
+**no named check exists**. The mutation was reverted and the tree
+re-verified clean. Gap G-1 is live: clause (e)'s row IV-7 states the rule,
+and no mechanism enforces it today. The record says so plainly rather than
+implying otherwise (Open questions, item 1).
