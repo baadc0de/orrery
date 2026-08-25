@@ -95,7 +95,7 @@ impl IntentPipeline {
                         pitch_urad,
                     })
                 }
-                Order::Fire { .. } if !controls.fire => None,
+                Order::Fire if !controls.fire => None,
                 other => Some(other),
             })
             .collect()
@@ -182,7 +182,7 @@ mod tests {
             assert_eq!(
                 orders
                     .iter()
-                    .filter(|order| matches!(order, Order::Fire { .. }))
+                    .filter(|order| matches!(order, Order::Fire))
                     .count(),
                 1
             );

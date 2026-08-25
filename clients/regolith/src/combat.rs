@@ -281,8 +281,9 @@ impl LockBreak {
 /// skin raises on the shot's last in-flight tick, and the target's
 /// authoritative verdict which arrives one delivery later and corrects it.
 /// The skin never decides whether damage landed — `ShotResult` is copied out
-/// of [`Outcome::ShotResolved`] verbatim, and a provisional cue that a later
-/// authoritative event contradicts is explicitly accepted.
+/// of [`Outcome::ShotResolved`] or [`Outcome::ShotRefused`] verbatim, and a
+/// provisional cue that a later authoritative event contradicts is explicitly
+/// accepted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShotCue {
     /// The final in-flight tick was observed; the target's step adjudicates
@@ -296,6 +297,11 @@ pub enum ShotCue {
         /// Target that adjudicated the shot.
         target: PersistId,
         /// The hit, miss, or named refusal reported by the ruleset.
+        result: ShotResult,
+    },
+    /// The shooter's own step refused the action before a projectile existed.
+    Refused {
+        /// The named refusal copied from the ruleset.
         result: ShotResult,
     },
 }
@@ -336,6 +342,7 @@ impl ShotFeedback {
     /// because a hit that kills its target emits both.
     pub fn observe(&mut self, events: &[Outcome], shooter: PersistId) {
         let mut resolved = None;
+        let mut refused = None;
         let mut broke = false;
         for event in events {
             match event {
@@ -349,6 +356,9 @@ impl ShotFeedback {
                         result: *result,
                     });
                 }
+                Outcome::ShotRefused { attacker, result } if *attacker == shooter => {
+                    refused = Some(ShotCue::Refused { result: *result });
+                }
                 Outcome::LockBroken { locker, .. } if *locker == shooter => broke = true,
                 _ => {}
             }
@@ -356,6 +366,10 @@ impl ShotFeedback {
         match resolved {
             Some(cue) => {
                 self.cue = Some(cue);
+                self.ticks_left = SHOT_CUE_TICKS;
+            }
+            None if refused.is_some() => {
+                self.cue = refused;
                 self.ticks_left = SHOT_CUE_TICKS;
             }
             None if broke && matches!(self.cue, Some(ShotCue::Arrival { .. })) => {
@@ -395,18 +409,12 @@ impl ShotFeedback {
         match self.cue {
             None => String::new(),
             Some(ShotCue::Arrival { .. }) => "IMPACT…".to_owned(),
-            Some(ShotCue::Resolved {
-                result: ShotResult::Hit,
-                ..
-            }) => "HIT CONFIRMED".to_owned(),
-            Some(ShotCue::Resolved {
-                result: ShotResult::Miss,
-                ..
-            }) => "MISS".to_owned(),
-            Some(ShotCue::Resolved {
-                result: ShotResult::OutOfArc,
-                ..
-            }) => "SHOT REFUSED · OUT OF ARC".to_owned(),
+            Some(ShotCue::Resolved { result, .. } | ShotCue::Refused { result }) => match result {
+                ShotResult::Hit => "HIT CONFIRMED".to_owned(),
+                ShotResult::Miss => "MISS".to_owned(),
+                ShotResult::OutOfArc => "SHOT REFUSED · OUT OF ARC".to_owned(),
+                ShotResult::NoLock => "SHOT REFUSED · NO LOCK".to_owned(),
+            },
         }
     }
 }
@@ -1027,6 +1035,28 @@ mod tests {
             target: PersistId::new(2),
             result,
         }
+    }
+
+    #[test]
+    fn no_lock_refusal_is_named_and_visible() {
+        let me = PersistId::new(1);
+        let mut feedback = ShotFeedback::default();
+        feedback.observe(
+            &[Outcome::ShotRefused {
+                attacker: me,
+                result: ShotResult::NoLock,
+            }],
+            me,
+        );
+
+        assert_eq!(
+            feedback.cue,
+            Some(ShotCue::Refused {
+                result: ShotResult::NoLock,
+            })
+        );
+        assert_eq!(feedback.banner(), "SHOT REFUSED · NO LOCK");
+        assert_eq!(feedback.flash_target(), None);
     }
 
     /// The two layers of #383's owner decision, in order: a provisional cue

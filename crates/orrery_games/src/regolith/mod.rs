@@ -66,7 +66,7 @@ const JITTER_MAX_URAD: u32 = 1_308_997;
 pub const PICKUP_TTL_TICKS: u16 = 1_800;
 /// Maximum eligible grab distance, in millimetres.
 pub const GRAB_RADIUS_MM: i64 = 25_000;
-/// Held-fire ticks required to acquire a target lock.
+/// Held-lock ticks required to acquire a target lock.
 pub const LOCK_ACQUISITION_TICKS: u16 = 30;
 /// A held lock takes the same half-second premise to break as to acquire.
 pub const LOCK_BREAK_TICKS: u16 = LOCK_ACQUISITION_TICKS;
@@ -87,10 +87,10 @@ pub const OCCLUSION_MARGIN_MM: i64 = 20;
 const REFERENCE_SIGNATURE_RADIUS_MM: u128 = 3_000;
 const CHANCE_SCALE: u128 = 1_000_000;
 
-/// Regolith v10's rules identity: replayable lock decay and authoritative firing arcs.
+/// Regolith v11's rules identity: locking is sustained state and firing is an action.
 pub const REGOLITH_RULESET: RulesetId = RulesetId {
-    version: 10,
-    digest: [0x64; 32],
+    version: 11,
+    digest: [0x65; 32],
 };
 
 /// Component classifications.
@@ -289,7 +289,8 @@ impl Regolith {
         let mut disabled = !was_alive;
         for order in inputs.iter() {
             match order {
-                Order::Thrust { .. } | Order::Fire { .. } | Order::Grab { .. } if disabled => {}
+                Order::Thrust { .. } | Order::Lock { .. } | Order::Fire | Order::Grab { .. }
+                    if disabled => {}
                 Order::Thrust {
                     accel_mmss,
                     yaw_urad,
@@ -310,7 +311,7 @@ impl Regolith {
                         .saturating_add(*pitch_urad)
                         .clamp(-PITCH_LIMIT_URAD, PITCH_LIMIT_URAD);
                 }
-                Order::Fire { target } => {
+                Order::Lock { target } => {
                     match lock_target {
                         None => {
                             lock_target = Some(*target);
@@ -325,7 +326,7 @@ impl Regolith {
                                 }
                             }
                         }
-                        // A Fire naming a different target switches the lock,
+                        // A Lock naming a different target switches the lock,
                         // paying acquisition again from scratch: the switch is
                         // free to make but never cheaper than a fresh lock.
                         Some(_) => {
@@ -334,9 +335,20 @@ impl Regolith {
                             lock_decay_progress = 0;
                         }
                     }
-                    if lock_progress < LOCK_ACQUISITION_TICKS {
+                }
+                Order::Fire => {
+                    // Orders are applied in their sealed order. A preceding Lock
+                    // therefore switches first, while a preceding Fire consumes
+                    // the lock that existed before a later switch.
+                    let Some(target) =
+                        lock_target.filter(|_| lock_progress >= LOCK_ACQUISITION_TICKS)
+                    else {
+                        events.push(Outcome::ShotRefused {
+                            attacker: me,
+                            result: ShotResult::NoLock,
+                        });
                         continue;
-                    }
+                    };
                     let weapon = equipped.weapon();
                     if cooldown > 0 && self.honours_cooldown() {
                         continue;
@@ -351,7 +363,7 @@ impl Regolith {
                             damage_dealt.saturating_add(u64::from(amount.unsigned_abs()));
                         events.push(Outcome::DamageDealt {
                             attacker: me,
-                            target: *target,
+                            target,
                             amount,
                             attacker_pos: origin,
                             attacker_vel: firing_vel,
@@ -1314,6 +1326,7 @@ impl Game for Regolith {
                     result: *result,
                 },
             )),
+            Outcome::ShotRefused { .. } => None,
             Outcome::LockVisibility {
                 locker,
                 target,
