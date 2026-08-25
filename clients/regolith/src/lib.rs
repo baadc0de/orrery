@@ -52,6 +52,17 @@ pub struct FiringArcFan(
     pub PersistId,
 );
 
+/// The archetype and seat used for a craft body's current visual composition.
+///
+/// This is presentation state only. It lets the skin recognise an early
+/// slot-derived body that must be replaced when replication supplies the
+/// craft's authoritative archetype.
+#[derive(Component, Debug, Clone, Copy)]
+struct CraftBodyComposition {
+    archetype: Archetype,
+    seat: craft::Seat,
+}
+
 #[derive(Component)]
 struct AlwaysOnStrip;
 #[derive(Component)]
@@ -210,7 +221,8 @@ impl Plugin for RegolithSkinPlugin {
                 (
                     toggle_overlay,
                     sync_rendered_state,
-                    ensure_focus_body.after(sync_rendered_state),
+                    recompose_craft_bodies.after(sync_rendered_state),
+                    ensure_focus_body.after(recompose_craft_bodies),
                     // After `sync_rendered_state`: it frames the positions
                     // that system just wrote, not last frame's.
                     frame_camera.after(sync_rendered_state),
@@ -276,6 +288,7 @@ fn setup_scene(
             session.executor(),
             entity,
             seat,
+            Transform::from_scale(Vec3::splat(craft::CRAFT_DISPLAY_SCALE)),
             &mut meshes,
             &mut materials,
         );
@@ -317,6 +330,7 @@ fn spawn_craft_body(
     executor: &Executor<Regolith>,
     entity: PersistId,
     seat: craft::Seat,
+    transform: Transform,
     meshes: &mut ResMut<Assets<Mesh>>,
     materials: &mut ResMut<Assets<StandardMaterial>>,
 ) {
@@ -327,11 +341,6 @@ fn spawn_craft_body(
         craft::Seat::Player => hud::ACCENT_BRIGHT,
         craft::Seat::Bot => hud::MUTED,
     };
-    let mut spawned = commands.spawn((
-        CoreEntity(entity),
-        Transform::from_scale(Vec3::splat(craft::CRAFT_DISPLAY_SCALE)),
-        Visibility::Inherited,
-    ));
     // The arcs are children of the craft root, which is the whole point:
     // `sync_rendered_state` already puts `heading_rotation(yaw)` on that
     // root, so an arc authored in the ruleset's own `(cos θ, 0, sin θ)`
@@ -346,12 +355,18 @@ fn spawn_craft_body(
     // the archetype; it never tells the ruleset what shape anything is. A
     // joined session may not hold this entity's state yet, so the slot's own
     // archetype derivation stands in until replication fills it in — the
-    // same stand-in the hull below has always used, and with the same
-    // consequence: the body is composed once, at spawn.
+    // same stand-in the hull below has always used. If replication later
+    // contradicts it, `recompose_craft_bodies` replaces this whole body.
     let archetype = archetype_of(executor, entity).unwrap_or_else(|| match seat {
         craft::Seat::Player => Archetype::Interceptor,
         craft::Seat::Bot => archetype_for_remote(entity),
     });
+    let mut spawned = commands.spawn((
+        CoreEntity(entity),
+        CraftBodyComposition { archetype, seat },
+        transform,
+        Visibility::Inherited,
+    ));
     let arc_radius = craft::hull_length(archetype) * craft::ARC_RADIUS_HULL_LENGTHS;
     let arc_material = materials.add(hud::firing_arc_material(seat, accent));
     spawned.with_children(|craft_root| {
@@ -535,9 +550,51 @@ fn ensure_focus_body(
         session.executor(),
         focus,
         craft::Seat::Bot,
+        Transform::from_scale(Vec3::splat(craft::CRAFT_DISPLAY_SCALE)),
         &mut meshes,
         &mut materials,
     );
+}
+
+/// Rebuilds a speculative craft body once replicated state names a different
+/// archetype.
+///
+/// A joined session can create the focus body before that craft's state has
+/// arrived, so initial composition has to use `Archetype::for_slot`.  We keep
+/// that immediate visual feedback, accepting possible visual flicker during
+/// replacement when the authoritative state disagrees. Replacing the whole root
+/// deliberately rebuilds every archetype-derived child together: hull, firing
+/// arcs, and any future visual keyed on the same reading.
+#[allow(clippy::too_many_arguments)]
+fn recompose_craft_bodies(
+    session: Res<ActiveSession>,
+    asset_server: Res<AssetServer>,
+    paths: Res<VisualAssetPaths>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    bodies: Query<(Entity, &CoreEntity, &CraftBodyComposition, &Transform)>,
+    mut commands: Commands,
+) {
+    for (body, core, composition, transform) in &bodies {
+        let Some(archetype) = archetype_of(session.executor(), core.0) else {
+            continue;
+        };
+        if archetype == composition.archetype {
+            continue;
+        }
+        commands.entity(body).despawn();
+        spawn_craft_body(
+            &mut commands,
+            &asset_server,
+            &paths,
+            session.executor(),
+            core.0,
+            composition.seat,
+            *transform,
+            &mut meshes,
+            &mut materials,
+        );
+    }
 }
 
 /// Marks the one camera the framing system drives.
@@ -788,6 +845,7 @@ fn write_campaign_record_on_exit(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bevy::asset::AssetPlugin;
     use orrery_core::state_hash;
     use orrery_games::scenario::{Entry, Play, Scenario, TickRecord};
 
@@ -911,6 +969,69 @@ mod tests {
             craft::parts(chassis[0]),
             craft::parts(chassis[1]),
             "the two seats must not draw the same model"
+        );
+    }
+
+    /// Replication can fill a remote state only after its body was made from
+    /// the slot fallback.  Seed the already-composed body explicitly instead
+    /// of relying on today's slot table: this remains a regression test even
+    /// if a future table happens to guess this fixture's slot correctly.
+    ///
+    /// Deleting `recompose_craft_bodies` leaves the cruiser marker and its two
+    /// side arcs in place, so this named test fails rather than passing on a
+    /// convenient slot-number coincidence.
+    #[test]
+    fn authoritative_archetype_recomposes_a_speculative_remote_body() {
+        let remote = PersistId::new(99);
+        let game = Regolith::honest();
+        let mut local = LocalSession::default();
+        let RegolithState::Craft(mut craft) = game.spawn(remote, 0) else {
+            panic!("the remote state is a craft");
+        };
+        craft.archetype = Archetype::Interceptor;
+        local.executor.insert(remote, RegolithState::Craft(craft));
+
+        let mut app = App::new();
+        app.add_plugins(AssetPlugin::default())
+            .init_resource::<VisualAssetPaths>()
+            .init_resource::<Assets<Mesh>>()
+            .init_resource::<Assets<StandardMaterial>>()
+            .insert_resource(ActiveSession::Local(Box::new(local)))
+            .add_systems(Update, recompose_craft_bodies);
+        let speculative_body = app
+            .world_mut()
+            .spawn((
+                CoreEntity(remote),
+                CraftBodyComposition {
+                    archetype: Archetype::Cruiser,
+                    seat: craft::Seat::Bot,
+                },
+                Transform::from_scale(Vec3::splat(craft::CRAFT_DISPLAY_SCALE)),
+                Visibility::Inherited,
+            ))
+            .id();
+        for _ in 0..2 {
+            app.world_mut()
+                .spawn((FiringArcFan(remote), ChildOf(speculative_body)));
+        }
+
+        app.update();
+
+        let mut bodies = app
+            .world_mut()
+            .query::<(&CoreEntity, &CraftBodyComposition)>();
+        let compositions: Vec<_> = bodies
+            .iter(app.world())
+            .filter(|(core, _)| core.0 == remote)
+            .map(|(_, composition)| composition.archetype)
+            .collect();
+        assert_eq!(compositions, vec![Archetype::Interceptor]);
+
+        let mut arcs = app.world_mut().query::<&FiringArcFan>();
+        assert_eq!(
+            arcs.iter(app.world()).filter(|arc| arc.0 == remote).count(),
+            1,
+            "the interceptor's one front arc must replace the cruiser's two side arcs"
         );
     }
 
