@@ -30,7 +30,7 @@ stages, and gate replacement ([D43] — decided; not restated); identity
 classes and the `PersistId` mapping ([D44], drafted concurrently);
 per-component capabilities ([D45], drafted concurrently); the rollback unit
 (R6) and the canonical witness projection **format** (R7) — clause (e)
-*places a field inside* whatever format R7 fixes, exactly as [D43](f) placed
+*places a field inside* whatever format R7 fixes, exactly as [D43] clause (f) placed
 its overflow flag, and decides nothing about the format itself; manifests,
 schedule-digest storage, and the constant registry where C-2's numbers will
 live (R8); and all implementation scheduling — nothing here starts work in
@@ -96,7 +96,7 @@ exactly one thing: "an entity this executor does not hold"
 (`crates/orrery_core/src/executor.rs:108-115`). There is no error variant, no
 canonical failure path, no way for a rule step to abort a tick. A6 §12.2
 posed C-2's posture question as fail-loud versus flag precisely because
-fail-loud would *create* this tree's first canonical error path. [D43](f)
+fail-loud would *create* this tree's first canonical error path. [D43] clause (f)
 faced the same shape of question for arithmetic overflow and the owner chose
 the flag there; the owner has now made the same choice here, and clause
 (e)(3) names what that preserves.
@@ -221,7 +221,7 @@ something:
    invisible" — *silent* truncation is the failure. Flagged truncation is
    truncation the evidence pipeline can see.
 2. **The flag reaches witnessed state, or it proves nothing.** The reasoning
-   is [D43](f)(3)'s, applied unchanged: a flag outside the hashed projection
+   is [D43] clause (f)(3)'s, applied unchanged: a flag outside the hashed projection
    lets two hosts diverge — one flagged, one not — while `hash(e, t)` still
    matches, and the flag proves nothing precisely when it matters. Therefore
    the overflow record is a **per-entity discrete field of canonical
@@ -237,7 +237,7 @@ something:
    replicated state, and every witness re-execution.
 
    **This is not [D43]'s arithmetic-overflow field, and the two must stay
-   distinguishable.** [D43](f)(3) established a per-entity discrete field
+   distinguishable.** [D43] clause (f)(3) established a per-entity discrete field
    for *arithmetic* overflow, set by the rule's own operations during S2.
    Emission overflow is a different occurrence class with a different
    author: it is detected by the **kernel** at S2's closing edge, after the
@@ -375,7 +375,7 @@ flag (Consequences below).
   sides of every comparison truncate identically, so no hash, golden, or
   witness ever notices the rule that lost half its emissions.
 - **A flag outside the hashed projection** (log line, metric, side table).
-  Rejected for [D43](f)(3)'s reason, unchanged: divergence with matching
+  Rejected for [D43] clause (f)(3)'s reason, unchanged: divergence with matching
   hashes is invisible, so the flag proves nothing exactly when it matters.
 - **No cap (status quo).** Rejected: deterministic runaway is still
   runaway — memory and delivery queues grow identically on authority and
@@ -392,7 +392,7 @@ flag (Consequences below).
 1. **The constants** (a11 OD-28): `MAX_EVENTS_PER_STEP`'s value (default 64
    proposed) and the derived delivery-queue bound. Owner tightens or
    loosens; storage lands with R8's registry; implementation of clause (e)
-   blocks on the value the way [D43](f) blocks on (f)(4).
+   blocks on the value the way [D43] clause (f) blocks on (f)(4).
 2. **Internal-command syntax** (A6 §12.1): whether a future module system
    adds a type-level command/report wrapper at the source. Mechanically
    free; reopening costs one enum wrapper, not this record.
