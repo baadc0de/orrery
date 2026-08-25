@@ -416,3 +416,136 @@ projections are never encoded). Events are excluded from *claims* today and
 this document does not move them onto the wire — the event fixture chain
 (§6) is a test instrument; putting event commitments into `StateClaim` would
 be a protocol change and is flagged to the owner, not proposed.
+
+---
+
+## 6. Closing the goldens gap: observable event/outcome fixtures
+
+The gap, measured rather than described: under mutation X-A every golden and
+every conformance, core and witness suite stayed green while the event
+stream visibly changed (§1.1 F-2). A differential harness comparing legacy
+vs migrated implementations *by goldens alone* would certify parity between
+implementations that disagree about what happened. What closes it:
+
+**Proposed (G-1): a second committed chain per game scenario — the event
+chain — alongside the state chain, produced by the same instrument.** The
+raw material already exists: `CoreEvent: CoreCodec` is a trait bound
+(`ruleset.rs:243-244`), so every event has canonical bytes today. Plain
+math, WP-2-ordered:
+
+```text
+tick_events(t) = concat( for id in sort_ascending(stepped ids):
+                     id ‖ count(events(id,t)) ‖ concat(encode(ev) for ev in events(id,t)) )
+event_chain(t) = blake3( event_chain(t-1) ‖ tick_events(t) )    # emission order within an entity
+```
+
+Under X-A's mutation this chain moves on the first tick while the state
+chain does not — that is the whole point, and it is cheap: the scenario
+harness already holds every `TickOutcome` (`scenario.rs` `TickRecord`, A1
+§3.3); the fixture adds a fold and a committed table beside
+`golden.rs`'s.
+
+**Proposed (G-2): outcome fixtures for the two other state-invisible
+channels.** Materialization: the per-tick list of installed ids
+(`TickOutcome::materialized` — first-writer-wins order is deterministic,
+`executor.rs:144-157`) folds into the event chain's tick block. Delivery:
+the `deliver`-mapped `(target, order)` pairs likewise — X-A's injected
+event was deliver-`None`, and a fixture that stopped at emitted events
+would have caught it while still missing a mutation that flipped a
+`deliver` arm to `None`. Three channels, one chain.
+
+**Proposed (G-3): the differential parity harness compares four artifact
+classes, per the brief's own list**: canonical state projections (state
+chain), events (G-1/G-2 chain), persistence output (the encoded bag/journal
+bytes a run produces), and witness hashes (claim values). Implementation is
+A10's (#406); the *format* — what is folded, in what order — is fixed here
+so A10 builds fixtures, not semantics. Expected-difference classification
+(brief: "explicitly classify expected differences") keys off
+`projection_version` (WP-6) and `RulesetId.version`: a difference under
+equal versions is a failure, under bumped versions a migration fixture.
+
+**What G-1 does not repeal.** The doctrine that adjudication sees only
+state (`ruleset.rs:280-284`) stands: event chains are committed test
+fixtures, not evidence, not wire, not store. Games whose outcomes must be
+*adjudicable* still write own-state traces (A2 CC-4's monotone counters).
+The fixture closes the *parity-proof* gap; the *adjudication* gap for
+event-only outcomes is a game-design rule, already documented, and moving
+event commitments into claims is a protocol change reserved to the owner
+(§5.3).
+
+---
+
+## 7. Migration behaviour and manifest interaction
+
+### 7.1 At-rest migration — mapped, not invented
+
+The machinery is live and fail-closed (I14; A5 §7 proved liveness by
+mutation, and X-D here re-proves the rekey refusal fresh:
+`persistence_rekey_decoder_rejects_untrusted_or_stale_shapes` dies by name
+when the version check is removed). The module model maps onto it without
+new mechanism: a module's schema surface is its declared
+`(ComponentTypeId, SchemaVersion)` pairs plus `ComponentMigrator` steps
+keyed `(component, from_version)` (`orrery_core/src/migration.rs:18-19`;
+registry `orrery_persistd/src/migration.rs:27-114`). The rules this node
+adds are riders, all of them existing behaviour promoted to policy:
+
+- **M-1: migrations are pure, adjacent, monotone functions on payload
+  bytes** — never on live worlds. A migration that needed a neighbour or a
+  query would be unreplayable for exactly VC-8's reasons.
+- **M-2: unknown ⇒ refuse; future ⇒ refuse; missing step ⇒ refuse**
+  (existing: `UnregisteredComponent`/`FutureVersion`/`MissingStep`).
+  Module removal with persisted data present is the same rule wearing a
+  different hat: rows referencing an undeclared component refuse to load.
+  Whether an operator read-and-quarantine override exists is A8 manifest
+  policy (A5 §7 flagged it; unchanged).
+- **M-3: migration fixtures are round-trip goldens** — old-format bytes
+  committed, migrated, re-encoded, compared — plus a G-3 differential run
+  across the version bump. Owned by A10; named here so the goldens
+  supplement covers the migration axis, not only the parity axis.
+- **M-4: the witness projection version (WP-6) and schema versions move
+  independently.** D38(d)(3) keeps schema orthogonal to `RulesetId`; WP-6
+  adds a third orthogonal axis. A projection bump with no schema change
+  (e.g. WP-3 framing) must not force component migrations, and vice versa.
+
+### 7.2 Manifest storage — A8's construct, A7's contents
+
+The manifest format, storage and governance are A8's (#404). What this node
+contributes is the list the brief asked the manifest to identify, now
+concrete: witnessed schemas and versions = the declared `(ComponentTypeId,
+SchemaVersion)` pairs with `W1`/`W2` capability; canonical entity ordering =
+WP-2; canonical component ordering and byte encoding = WP-3 + the declared
+codecs; tick and authority context = `(PersistId, Tick)` addressing plus
+`RulesetId`; excluded data = §5.3's list, by capability zeros rather than by
+enumeration; plus `projection_version` (WP-6) and A4's schedule digest.
+Persisted universes record their producing manifest so replays select the
+right build — that is D21's three-retained-builds discipline
+(`RETAINED_BUILDS`, routing by `RulesetId`) extended by A8 to the manifest;
+nothing here changes it.
+
+### 7.3 Interaction with the existing Lightyear history
+
+The division of labour, stated so the migration cannot blur it (the brief's
+"duplication with Lightyear" risk):
+
+- **lightyear owns the mechanics of predicted-set resimulation**: the
+  16-tick ring, rollback detection against replicated confirmed state, and
+  re-stepping (docs/05 §3). Orrery does not rebuild any of it, under any
+  A3 variant — under the adopted position the canonical store is not even
+  visible to lightyear (second opinion E-4: it replicates mirror
+  components).
+- **Orrery owns membership, bounds, attribution and evidence**: which
+  components ring-buffer (A5's R dimension feeding the prediction registry),
+  how much resim a frame may spend (`RollbackBudget`, X-E), which
+  `(NodeId, PersistId)` a residual attributes to (`PredictedBy`,
+  `wiring.rs:79-93`), and the promotion of residuals into witness signal
+  (the monitor). lightyear cannot own these: it has no per-entity authority
+  and no rollback signal (I12) — the gaps are structural in 0.29, quoted
+  from its own source.
+- **The boundary rule (proposed, L-1): lightyear history is presentation-
+  tier state.** It is never hashed, never persisted, never consulted by
+  canonical rules, and its contents appear in no encoded artifact (it is a
+  §5.3 exclusion). Corrections cross the boundary in exactly one direction
+  through one door: `AuthorityCorrectionInbox`, carrying `AdjudicatedState`
+  derived from replay (I13). If lightyear is ever replaced (the plan-B seam,
+  `predict/lib.rs:3-8`), R-1 and L-1 are unchanged — they name no lightyear
+  type.
