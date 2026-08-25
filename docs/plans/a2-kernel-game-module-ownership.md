@@ -115,3 +115,85 @@ them, so they are assigned rather than left implicit:
 | Replication/relevance policy | **Kernel** transports (replicon/AOI); **game** declares relevance per component — declaration channel unwired (see §7) | docs/06 names the intended consumers (`docs/06-verifiable-core.md:210`); none exist yet |
 | Version identity & compatibility surface | **Kernel** pins `RulesetId` into frames, claims, bundles, strike rows and persisted records; **game** supplies the value | `verifiable.rs:59` + pinning sites (A1 §5.4 list); D21 freezes persistd's exports; D38(c): additive trait change is free, a *required* method names D21 |
 
+---
+
+## 3. Dependency direction
+
+The arrows, as they exist today and as the table requires:
+
+```text
+                    ┌────────────────────────────────────────────┐
+                    │            orrery_protocol                 │
+                    │   (wire vocabulary; engine-free by rule)   │
+                    └───────────────▲────────────────────────────┘
+                                    │ every crate depends on it
+        ┌───────────────────────────┼───────────────────────────┐
+        │ kernel machinery          │                           │
+        │  core ◀ witness(engine)   │   games: Regolith,        │
+        │  core ◀ persistd(coord.)  │   Skirmish, future        │
+        │  core ◀ conformance       │   modules                 │
+        │  net spatial authority    │                           │
+        │  predict persist_client   │                           │
+        └───────▲───────────────────┴──────────▲────────────────┘
+                │                              │
+        presentation skins              game modules depend on
+   (clients/regolith, harnesses)        any kernel crate; kernel
+        depend on both                  never depends on a game
+```
+
+Normative layering already in force (not invented here): protocol ← everything
+and `orrery_core` ← {witness, persistd, field-host-to-be, game} are D15's first
+two layering rules ([docs/10-crates.md](../10-crates.md):92-94); lightyear only
+inside `orrery_predict`, replicon only inside `orrery_spatial`/`persist_client`
+(rules 3-4, `:95`). `orrery_persistd` takes the witness engine with
+`default-features = false` (`orrery_persistd/Cargo.toml:36`) — the backend
+links no Bevy at all.
+
+### 3.1 The three legal crossings
+
+Everything a game module and the kernel exchange must cross one of these:
+
+1. **Ordinary dependency, game → kernel.** A module imports machinery
+   (`orrery_games` depends on `orrery_core` + `orrery_protocol`,
+   `orrery_games/Cargo.toml:13-14`).
+2. **Policy handover at a registration seam.** The game hands the kernel inert
+   declarations — an `invariants()` slice, a `classify_component` fn, `CoreCodec`
+   impls, an `IntentValidator` impl, a boxed build factory
+   (`adjudication.rs:350-360`). The kernel *invokes* these; it never inspects
+   their semantics. This crossing is what makes rows 4, 6, 8 two-sided without
+   either side owning the other.
+3. **Opaque bytes through wire and store.** Canonical encodings (`CoreCodec`),
+   intent op args, component bags. The cluster hashes them, routes them, and
+   persists them without understanding them.
+
+### 3.2 What must never point back, and the rule each reversal violates
+
+| Forbidden arrow | Rule it violates | Consequence if drawn | Enforcement today |
+|---|---|---|---|
+| Kernel crate → game-module crate (dependency or type naming) | D15's crate-set neutrality: infrastructure serves any game | Every other game transitively links this game's rules; "the same build links into peers, field hosts and persistd" (D9, `ruleset.rs:3-6`) becomes "the same build links into *these* games"; adjudication loses its footing because the cluster would ship one universe's content as if it were law | **Structural for `orrery_core ↔ orrery_games`**: the reversal is a cargo cycle and the resolver refuses it (§9 M-A). **Nothing mechanical for any other pair** — e.g. `orrery_spatial` gaining a dependency on `orrery_games` compiles and no check fires. Honest finding: this direction is convention plus review everywhere except that one structurally locked edge |
+| Engine/Bevy → verifiable core | D9/D15: core is headless and engine-agnostic so peers, field hosts and the cluster can link it | The cluster cannot link the rules to adjudicate; three runtimes disagree about the same log | Gate-enforced: `core-gates.sh:71-75` fails on any bevy in `cargo tree`, dev-deps included (§9 M-B) |
+| Presentation/engine state → canonical state | The brief's own boundary: presentation events have "no authority over canonical state" | Rollback rewinds audio and UI; witnesses hash renderer output; determinism dies quietly | Partially structural: canonical state lives in `Executor` maps, not ECS components, so a Bevy system cannot reach it today. Under an ECS-hosting A3 variant this arrow needs its own enforcement (A4/A7 territory) |
+| Persistence/wire formats ← engine types (archetype order, entity bits, reflection names) | Protocol leakage (brief §Primary risks); D38(d)(3) keeps schema versions orthogonal to `RulesetId` | Every stored byte pins a Bevy version; migration across engine upgrades becomes impossible | Structural: formats are defined in `orrery_protocol`, which no engine reaches |
+
+The single sentence version of the rule:
+
+> **Games may depend on all of the kernel; the kernel may depend on games only
+> through the three crossings of §3.1 — and a kernel artifact that names a
+> game's types has already absorbed gameplay, wherever it sits in the tree.**
+
+### 3.3 Where enforcement is missing (findings, not proposals)
+
+Recorded because the table's authority claims should not overstate what is
+mechanically held today:
+
+1. Only one kernel↔game edge (`core`/`games`) is protected by structure. The
+   other kernel crates could grow game dependencies silently.
+2. `classify_component`'s consumers do not exist, so row 6's write-class
+   routing and row 8's attention policy are currently *unowned in practice*
+   even though ownership is assignable in principle (§7).
+3. The neighbour-read ban is scoped to `RULES_CRATES = (orrery_games
+   orrery_conformance)` (`core-gates.sh:42`). If game logic migrated into a
+   kernel crate, the gate would stop watching it — the gate watches *crates*,
+   and §2's table assigns by *role*. A future gate keyed on role rather than
+   crate list is A4/A10 material; noted here so the gap is visible now.
+
