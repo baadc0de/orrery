@@ -473,3 +473,102 @@ explicit deferral" means all of them:
 | Suggested agent prompt (:975-979) | Consumed — it is the epic's own working method; no decision content |
 | Initial recommendation (:983-1000) | Points 1–2, 5–10 adopted; points 3–4 (ECS substrate, dedicated world *now*) amended to trigger-gated (R1) — the one place the plan diverges from the brief's initial preference, with two independent matrices as the reason |
 | Reference material (:1004-1010) | Checked where load-bearing (docs/10 census wrong three ways → DA-1; ADR-0004 exists; Bevy 0.19 pinned) |
+
+---
+
+## 9. Stale citations found while verifying
+
+| Record | Citation / phrasing | Current truth |
+|---|---|---|
+| A7 §9.5, A10 V10 (and this node's own briefing) | "`p4-ledger.sh:33-35` hashes core/games/witness/p1-swarm" vs the briefing's "`scripts/p4-ledger.sh:409-413`" | Both point at real text, neither precisely: `:33-35` is the *comment* naming the four trees; the mechanism is `readonly PIPELINE_TREES=(…)` at **`:409-414`** (the briefing's `:413` stops one line short of the closing paren). Contents verified identical either way; findings unaffected |
+| This node's briefing | "A10's N-2 … `PIPELINE_TREES` is `crates/orrery_witness`, `crates/orrery_core`, `crates/orrery_games`, `gates/p1-swarm`" | Verified verbatim today (`p4-ledger.sh:409-414`); the window-safe set (`orrery_conformance`, `orrery_persist_client`, `orrery_predict`) confirmed outside it |
+| A8 I5 / this node's briefing | Placeholder digests at `regolith/mod.rs:74-77` / `:76` and `skirmish/mod.rs:94-104` / `:102` | Re-read today: Regolith `[0x63; 32]` at `:73-76`, Skirmish `[0x5C; 32]` at `:100-103` with the nothing-computes-one comment at `:94-99` — ±1–2-line drift, claims exact |
+| A9 D-2/D-3, #414 | docs/10-crates.md census | Re-verified all three ways today: "thirteen" at `:3`, `orrery_aeronet_iroh` under `crates/` at `:18`, `orrery_field_host` at `:29` and in layering rule 2 at `:95`; `crates/` holds fifteen `orrery_*` members including `orrery_conformance` |
+| Inherited stale set (A1–A10 records): ADR-0038 `ruleset.rs:211` drift; D21 `validate_intent` parenthetical; docs/06 `:60`/`:210` present-tense `classify_component` consumers; `persist.rs:41-44` block-grant tense; A7 "DiffUplick" typo; A9 M3's non-compiling literal description; bot.rs producer-line drift | — | Not re-litigated; where this document leans on the same ground (D21 freeze text `:61-64`, `:85-90`; D38 (c) `:161-169`, (d)(3) `:198-205`; `feed.rs:62-92`; `golden.rs:22-28`; `gateway.rs:164-184`; `battery.rs:222`) the lines were re-opened today and held |
+
+No citation this document relies on from AGENTS.md proved wrong during
+this task.
+
+---
+
+## 10. Verification and mutation log
+
+**Tree identity (the re-basing fact):** this branch is docs-only over
+`main` at `2b542c4d` — `git diff --stat 2b542c4d HEAD -- crates gates
+scripts vendor` is empty. Every predecessor mutation therefore ran against
+byte-identical code, and their logs (twelve documents' worth, §"Method")
+carry at full strength; A10's log additionally ran against this same base
+commit.
+
+**First-hand verifications (steady-state, no mutation needed):**
+`PIPELINE_TREES` (`p4-ledger.sh:409-414`); `GATED_CRATES`
+(`core-gates.sh:37`) and `RULES_CRATES` (`:42`); placeholder digests (both
+games, with Skirmish's admission comment); `feed_uplink`'s guard order and
+seq-as-tick stamping (`feed.rs:62-92`); the goldens blind-spot doc
+(`golden.rs:22-28`); `protocol_accepted` exact equality with the D29
+clause-5 closure comment (`gateway.rs:164-184`); `game_test!` generating
+`chains_match_the_committed_golden` (`battery.rs:222` — a grep for
+`fn chains_match` finds nothing, per the macro-name rule); docs/10 census
+(all three errors); D21/D38 quoted clauses; fifteen `orrery_*` crates on
+disk; issues #414 and #417 OPEN, #418 (A4) MERGED, PR #423 (A10) OPEN.
+
+**Mutation (break stage → named check dies → revert → passes):**
+
+| # | Guarded stage broken | Named check | Observed | Reverted |
+|---|---|---|---|---|
+| M-A11-1 | `[dev-dependencies] bevy_ecs = "0.19"` appended to `crates/orrery_conformance/Cargo.toml` — an engine entering a gated crate's graph through the weakest insertion point, on the exact crate PR-1 targets | `./scripts/core-gates.sh` clause 1 | Baseline first: all four clause notes print, `verifiable-core static gates pass`, exit 0. Mutated: `core-gates: orrery_conformance has Bevy in its dependency graph`, exit **1** | `git checkout` of the manifest; gate exit **0**; `git status` clean |
+
+One mutation, chosen deliberately: it proves live, on this exact tree, the
+one enforcement claim this document adds weight to (tranche 1 keeps every
+gate green, and PR-1's home crate is watched by the clause that matters).
+Everything else this document asserts as enforced is asserted on a
+predecessor's mutation over byte-identical code, cited by its log entry
+rather than re-run — re-running all thirty-plus would add heat, not light.
+
+---
+
+## 11. Unsure
+
+Stated as unsure rather than smoothed over:
+
+1. **A10 is consumed from an open PR.** #423 is unmerged; this document
+   cites the branch head. If review changes A10's fixture formats or
+   sequencing (particularly N-2's window-safe set or the F-2 fold), §5's
+   tranche 1–2 contents follow A10's merged text, not this snapshot.
+2. **The eight-record partition is a judgement call.** The substance is
+   the nodes'; the grouping is mine. An owner who prefers fewer, larger
+   records (e.g. R6+R7 as one A7 record, or R3+R4 as one identity record)
+   loses nothing but review granularity; the map in §2 makes re-cutting
+   cheap. The one partition I would defend hard is keeping R7 separate:
+   it is the only proposal that amends an accepted record's normative
+   text (D38's axis law).
+3. **PR-16's promotion of harness-side frame assembly into the host** is
+   the least-specified PR in the plan: A3's second opinion (§11.3) already
+   doubted how much of the seam can be extracted without deep p1-swarm
+   surgery, and no node prototyped it. Its scope may split further at
+   implementation-issue time; the acceptance criterion (gate criteria
+   unchanged, hand-rolled loop deleted not edited) is the stable part.
+4. **Whether tranche 1 truly needs no ADR** rests on my reading that
+   fixtures pinning existing, documented behaviour are programme work, not
+   normative change. PR-6 (the discovery clause) is the borderline case —
+   I gated it on R2 acceptance precisely because it edits a gate, even
+   though it removes nothing.
+5. **Decision 17's condition ("owner supplies the Unreal requirement") has
+   no owner-visible artifact named.** I could not find a template or issue
+   for it; if the owner wants Phase 8 to open, the first step is a short
+   requirement note (embedded vs sidecar first, latency budget, prediction
+   scope) that A9 §9 already itemized.
+6. **Counts.** "Twelve documents' worth" of mutation logs and the
+   disposition tally (9/2/7/2) were counted by hand from the sources cited;
+   a recount is cheap and the tables are the authority if I miscounted.
+
+Deliberately not done:
+
+- **No ADR text was drafted.** §2 specifies each record's scope, sources
+  and amendments; drafting the records is the natural next task *after*
+  the owner indicates which to take up, and drafting all eight before that
+  signal would front-load text the owner may re-cut (§11.2).
+- **No implementation, no issue creation.** The PR plan is a plan;
+  implementation issues follow acceptance, per the epic's header.
+- **No decision was made that any node or the owner reserved.** Every
+  reserved item appears in §3 with its owner named.
