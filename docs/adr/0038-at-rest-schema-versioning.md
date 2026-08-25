@@ -201,8 +201,25 @@ journal half before P6's tailer makes archive history long-lived.
    within a type. They are **orthogonal to `RulesetId.version`**: a rules
    hotfix bumps no schema, a schema bump may ship without a rules change, and
    `RETAINED_BUILDS` bounds adjudication evidence, not schemas
-   (`adjudication.rs:34`). The bag's version fields and the build's digest
-   answer different questions and must never be derived from each other.
+   (`adjudication.rs:34`). They are likewise **orthogonal to
+   `projection_version`**, the witness-projection axis D48 defines: a
+   projection framing change (reordering slots, same payloads) alters
+   commitment bytes without changing any schema or any rule, so without the
+   third axis two hosts running identical rules over identical schemas could
+   hash differently with nothing recording why — the same conflation failure
+   this clause exists to prevent, one level up. A projection bump forces no
+   component migration, and no schema or rules bump forces a projection
+   bump. The bag's version fields, the build's digest, and the projection
+   version answer different questions and none of the three may ever be
+   derived from another.
+
+   > *Amended by D48 (docs/adr/0048-canonical-witness-projection.md,
+   > 2026-08-25, accepted by the owner through the #395 planning tree): this
+   > clause originally pinned two axes — component-schema versions ⊥
+   > `RulesetId.version` — and was widened in place to three when D48
+   > defined `projection_version`. Every original obligation stands
+   > unchanged; the amendment adds the third axis and extends the
+   > derivation ban to it.*
 4. **"≥ 2 adjacent versions" is pinned to its testable content:** the registry
    holds a v→v+1 step for every adjacent pair since the oldest readable era —
    a gapless chain, no skipped versions — and a retired step leaves only after
