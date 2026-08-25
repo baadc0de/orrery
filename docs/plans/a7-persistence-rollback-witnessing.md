@@ -549,3 +549,140 @@ The division of labour, stated so the migration cannot blur it (the brief's
   derived from replay (I13). If lightyear is ever replaced (the plan-B seam,
   `predict/lib.rs:3-8`), R-1 and L-1 are unchanged — they name no lightyear
   type.
+
+---
+
+## 8. Existing invariants mapped onto the proposal
+
+The acceptance bar: every existing witness and persistence invariant either
+preserved, changed with justification, or flagged as needing an ADR (the
+owner's to accept, never this node's). "Now" = the adopted A3 position
+(composition root + host seam, executor store). "Pilot" = a triggered
+dedicated `bevy_ecs::World` behind the seam.
+
+| # | Invariant (source) | Now | Pilot | Verdict |
+|---|---|---|---|---|
+| 1 | VC-1 fixed tick, absolute universe ticks (docs/06:246) | untouched | inherited via A4's envelope ring 1 | **Preserved** |
+| 2 | VC-2 total input order, log is normative (docs/06:247) | untouched | S0 SealInputs pins it (A4 §3.2) | **Preserved** |
+| 3 | VC-3 per-`(seed, entity, tick)` RNG (docs/06:248) | untouched | Tier H bans RNG construction outside `tick_rng` | **Preserved** |
+| 4 | VC-4 no unordered iteration (docs/06:249) | untouched | extended: ECS adds hazard T2 (storage order); answered by WP-2 + E-M3, a *new* mechanical check where today none is needed | **Preserved, coverage extended** |
+| 5 | VC-5/VC-6 integer-discrete, libm-continuous (docs/06:250-251) | untouched | untouched (policy attaches to code roles, A4 §3.8) | **Preserved** |
+| 6 | VC-7 quantize-before-hash (docs/06:252; `executor.rs:125-127`) | kept as WP-4 — but **currently unpinned**: mutation X-C survived every suite because all in-tree states are already lattice-integer (`conformance/ruleset.rs:77`: "Idempotent: `step` already wrote lattice points") | WP-4 binds S4 ≺ S5 | **Preserved; missing test named to A10** (off-lattice test ruleset through `step_entity`, assert hash of quantized ≠ hash of raw) |
+| 7 | VC-8 no ambient inputs (docs/06:253) | untouched | Tier H adds async/RNG clauses | **Preserved** |
+| 8 | Per-entity claim commitment; single-entity replay isolation (`replay.rs:106-130`; `witness.rs:406-421`) | untouched; WP-1 makes it the projection's unit | Tier H requires single-entity step exposure — A4 §5.2 already makes it non-renegotiable | **Preserved; pilot obligation restated** |
+| 9 | Snapshot hash verified before load (`replay.rs:121-123`) | untouched; **live** — X-B kills `a_snapshot_that_does_not_match_its_claim_is_forgery_not_deviation` by name | same code path (bundles are store-agnostic) | **Preserved, liveness proven** |
+| 10 | Verdicts rest on subject-signed claims, never reporter hashes (`replay.rs:325-339`) | untouched | untouched | **Preserved** |
+| 11 | D16 bands comparator; discrete bit-exact (docs/06 §5) | untouched | untouched | **Preserved** |
+| 12 | Shadow-mode default; gaps are repair requests, not accusations (D10; `witness.rs:56`) | untouched | untouched | **Preserved** |
+| 13 | Journal idempotency `(entity, tick)` under lease/epoch fencing (`persist.rs:200-227`) | mechanism preserved — but F-1: the `tick` half of the key is uplink-seq in practice, contradicting the wire doc | a world-hosted producer must stamp real ticks if journal/claim alignment is ever wanted (§4.3 precondition 1) | **Preserved as behaving; doc-vs-behaviour divergence flagged to owner** (fix `feed_uplink` or fix the doc — either is small; silence is the only wrong option) |
+| 14 | Checkpoint base + journal tail, zero-loss recovery (checkpoint/mod.rs:1-11) | untouched | untouched (durable tier never sees the host) | **Preserved** |
+| 15 | Critical path: FDB transaction sole authority, RPO 0, anti-dupe single-ownership row (docs/08 §2.2; `intent/mod.rs:152-155`) | untouched; A5 IV-3/IV-5 already forbid the bypasses | untouched | **Preserved** |
+| 16 | Tombstone/live discrimination; rekey v2 refuses v1 (`keyspace.rs:109-146`; `actor.rs:264-266`) | untouched; X-D re-proves the refusal live | untouched | **Preserved, liveness re-proven** |
+| 17 | D38 fail-closed schema versioning, floor, orthogonal axes | untouched; M-1..M-3 restate | WP-6 adds a third orthogonal version (projection) | **Changed (extended): needs ADR** — WP-6 is new normative surface; A11 carries it, owner accepts |
+| 18 | Straight-line authority log; authorities never rewind (docs/06:521) | promoted into R-1 as its constraint | R-1 binds the pilot's ring design | **Preserved and promoted: R-1 needs an ADR** (the rollback-unit decision itself) |
+| 19 | No engine handle in any encoded artifact (A5 N-1/IV-7) | untouched | WP-5 + E-M3 are its projection-side enforcement | **Preserved; enforcement named** |
+| 20 | Unclassified ⇒ Cosmetic ⇒ never persisted; zeros fail closed (`ruleset.rs:293-297`; A5 N-7) | untouched | capability registry carries it | **Preserved** |
+| 21 | Goldens: per-scenario state chains, version-bump-on-rules-change (`golden.rs`) | **changed with justification**: supplemented by the event/outcome chain (G-1/G-2) because X-A proves state chains alone cannot carry a parity argument | differential harness (G-3) is a pilot precondition (A3 §7.4 item 2, now given its format) | **Changed: needs owner acceptance via A10/A11** (test infrastructure; ADR-light unless the owner wants event commitments on the wire, which is a separate, larger door) |
+
+ADRs this node proposes (all owner-accepted or not at all, via A11): the
+**rollback-unit record** (R-1 + L-1, amending/annexing D8's documentation),
+the **canonical-projection record** (WP-1..WP-6, amending docs/06 §2/§5
+prose and D38 with the projection-version axis), and the **F-1
+disposition** (code fix or doc amendment). G-1..G-3 land as A10 programme
+items unless the owner elevates them.
+
+---
+
+## 9. Reported rather than forced
+
+1. **Command/event semantics are A6's (#402), in flight now.** §4.5 and §6
+   deliberately fix only what fixtures *fold* (emission order within an
+   entity, WP-2 across entities — both already pinned by executor
+   semantics); delivery guarantees, dedup, idempotency keys and replay
+   behaviour of events are cited as A6's to define, and G-1's chain will
+   consume A6's ordering rules, not define them.
+2. **Manifest construct and governance are A8's** (§7.2 lists only the
+   contents this node owes it).
+3. **Harness construction is A10's** (G-3, M-3, the X-C-closing test, and
+   A4's E-M3/E-M8/E-M9 legs — specified, not built).
+4. **Whether event commitments ever enter `StateClaim`** is a protocol
+   change and the owner's door (§5.3, §6).
+5. **F-1's disposition** (fix the writer vs fix the doc) is the owner's:
+   the fix touches `orrery_persist_client` (not a P4 digest crate —
+   `p4-ledger.sh:33-35` hashes core/games/witness/p1-swarm only), but it
+   changes journaled bytes' meaning, which deserves an explicit decision.
+6. **Nothing here implements.** No registry, no fixture, no gate clause,
+   no trait edit; mutations lived one command run each (§10).
+
+---
+
+## 10. Mutation log (break the stage → named check dies → revert → passes)
+
+Baselines were recorded before each mutation; failing runs produced real
+result lines; no mutation landed on both sides of an equality *except where
+that is the finding* (X-C, reported as surviving, with the cause traced);
+every revert re-ran the check and passed.
+
+| # | Guarded stage broken | Named check | Observed | Reverted |
+|---|---|---|---|---|
+| X-A | Regolith `step` made to append `Outcome::Expired { id: me }` every tick — an event-only outcome with no state trace (`regolith/mod.rs:164-166`) | `cargo test -p orrery_games` (all suites) | **Goldens survived by design**: battery `11 passed; 0 failed` including `chains_match_the_committed_golden`; materialization `1 passed`. The kill arrived only from per-game unit tests: `tests/regolith.rs` `22 passed; 6 failed` — `bloom_site_expires_after_5400_director_ticks`, `lock_acquisition_replays_from_the_locker_alone`, `ttl_expiry_replays_and_denies_a_late_grab`, `volley_is_three_left_slot_first_rolls_and_uses_its_own_cooldown`, `fire_on_a_different_target_switches_the_lock_and_restarts_acquisition`, `contested_grab_replay_is_ordered_and_each_party_hashes_its_own_side` (`assertion failed: outcome.events.is_empty()`) | all suites green (`11`/`1`/`28`/`15` passed) |
+| X-B | `load_claimed_snapshot`'s hash check removed — snapshot accepted without verification (`replay.rs:121-123`) | `cargo test -p orrery_core --test adjudication` | `a_snapshot_that_does_not_match_its_claim_is_forgery_not_deviation` FAILED; `14 passed; 1 failed` | `15 passed; 0 failed` |
+| X-C | `step_entity` made to hash **before** quantizing (`executor.rs:125-127` order swapped) — the claim no longer commits to what replication and persistence saw | conformance (13), `orrery_core` lib+integration (73/15/11), all `orrery_games` suites, all `orrery_witness` suites (7/25/5/5/5/12) | **Every suite passed — the mutation survived.** Cause, traced to source: every in-tree `CoreState` stores continuous fields as lattice integers and every step writes lattice points (`conformance/ruleset.rs:53-84`: "Continuous fields are held *on the lattice*… Idempotent: `step` already wrote lattice points. Re-snapping is cheap insurance against a future rule that forgets to"), so the executor's snap is currently a no-op and the committed goldens cannot see the reorder. The ordering exists purely for future rulesets whose steps leave the lattice — and no test pins it. A test ruleset writing a deliberately off-lattice value through `step_entity`, asserting the outcome hash equals the quantized encoding's hash, would pin it cheaply; named to A10. Recorded as a coverage gap, not banked as proof | all suites green before and after; source restored byte-identical |
+| X-D | `decode_entity_rekey`'s version refusal removed — any stated `EntityRekey.version` accepted (`actor.rs:264-266`) | `cargo test -p orrery_persistd --test actor_runtime` | `persistence_rekey_decoder_rejects_untrusted_or_stale_shapes` FAILED; `49 passed; 1 failed` | `50 passed; 0 failed` |
+| X-E | `RollbackBudget::plan`'s ladder collapsed — every over-frame replay amortized, eviction and floor unreachable (`budget.rs:214` guard forced true) | `cargo test -p orrery_predict --lib` | 2 named failures: `budget::tests::overlong_replay_evicts_enough_to_fit`, `budget::tests::pathological_cost_snaps_the_own_player`; `41 passed; 2 failed` | `43 passed; 0 failed` |
+
+Re-verified steady-state (no mutation needed): `cargo tree -p
+orrery_witness | grep -ci bevy` → 530 with `./scripts/core-gates.sh` → exit
+0 (I5, confirming A4's figures first-hand). Predecessor mutations (A1
+M1–M8, A2 M-A/M-B, A3 F-1/F-2 + probes, A5 X1–X5) are relied on as
+recorded; the crates they ran against are byte-identical on this branch
+(docs-only tree over `3195583d`).
+
+---
+
+## 11. Stale citations found while verifying
+
+| Record | Citation / phrasing | Current truth |
+|---|---|---|
+| `orrery_protocol/src/gateway.rs:378` (wire doc) + `persist.rs:200-202` (journal doc) | `DiffUplink.tick` is "The universe tick at append (D8)"; journal records "keyed by `(entity, tick)`" | **F-1**: the only production writer fills `tick` with a client-local per-entity sequence starting at 0 (`feed.rs:81-92`), and the gateway journals it as received. The idempotency *mechanism* is intact (the counter is monotone); the *semantics* the docs state are not what is written. New finding, flagged to the owner (§9.5) |
+| This node's briefing text | "A5 reserved the rollback dimension's unit in its capability matrix" | Verified true and precise (A5 §5.2 R row: "Unit and mechanism are **A7's**"; §8.1). Likewise A2 §7.1 and A4 §8 — all three reservations confirmed as stated, none over- or under-compressed |
+| Epic #395 constraint block | "Witness hashing already has a canonical projection" | Confirmed in the per-entity sense (I2); this document names what was *not* yet canonical — multi-entity and per-component ordering (WP-2/WP-3), which existed as executor structure but not as stated policy |
+| Inherited stale set (A1/A2/A3/A5 records): ADR-0038 line drift; D21 `validate_intent` parenthetical; docs/06:210 present-tense `classify_component` consumers; docs/10 `orrery_field_host` rows; `persist.rs:41-44` block-grant present tense | — | Not re-litigated; where this document touches the same ground (D38 clause text, goldens doc, journal docs) the quotes were re-opened at source and held. golden.rs's passage cited by A3 as `:20-28` sits at `:20-29` today — sub-line drift, claim unchanged |
+
+---
+
+## 12. Unsure
+
+Stated as unsure rather than smoothed over:
+
+1. **Whether F-1 is a bug or an undocumented decision.** Nothing found
+   consumes `JournalRecord.tick` as simulation time today (recovery orders
+   by `lsn`; idempotent resend needs only monotonicity), which is consistent
+   with either reading. The divergence is real either way; its disposition
+   was not forced (§9.5).
+2. **X-C's blast radius.** The unpinned quantize-before-hash ordering is
+   harmless for every ruleset that exists and load-bearing for any future
+   one that computes in floats and relies on the executor's snap. Whether
+   such a ruleset is ever planned was not decidable from the tree; the
+   pinning test is cheap either way.
+3. **Whether the event chain (G-1) should ever graduate to a wire
+   commitment.** Fixtures close the parity gap; only claims close the
+   *adjudication* gap for event-only outcomes, and that trade (protocol
+   change, claim size, A6 interplay) was deliberately not priced here.
+4. **WP-3's bag-shaped framing** assumes A8 keeps the at-rest slot shape
+   `(ComponentTypeId, SchemaVersion, payload)`. If A8's manifest work
+   reshapes the slot, WP-3 should follow the bag, not fight it — the rule's
+   substance is "witness framing ≡ persistence framing", not the tuple.
+5. **Ring memory at scale.** R-1 keeps the predicted-set unit partly on
+   cost grounds; the 16-tick ring's per-entity memory at capacity-scale
+   predicted sets has no in-tree measurement (same evidence class as A3's
+   P4 caveat). The budget ladder bounds *time*, not *memory*; if memory
+   ever binds, the eviction rung is the existing lever.
+
+Deliberately not done:
+
+- **No implementation.** The only file this branch adds is this document;
+  all five mutations were reverted with passing results re-confirmed (§10).
+- **No ADR text, no protocol change, no trait edit.** R-1, L-1, WP-1..WP-6,
+  P-1, G-1..G-3, M-1..M-4 are proposals for A11 to carry into ADR form and
+  for the owner to accept, amend, or refuse.
