@@ -132,6 +132,7 @@ fn run_smoke_test() {
         .add_plugins(RegolithSkinPlugin::new(PathBuf::from(
             "target/regolith-client/smoke.jsonl",
         )));
+    app.finish();
 
     // Keep this assertion beside the command's success message: it makes a
     // missing skin installation a named client failure rather than a green
