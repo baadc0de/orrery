@@ -593,6 +593,15 @@ fn checked_sum_squares(values: [i128; 3]) -> Option<u128> {
 /// `saturating_sub` on `range_mm - optimal` is *not* one of those cases — on
 /// `u128` it is a deliberate floor at zero ("no range penalty inside
 /// optimal"), not an overflow guard, so it is transcribed verbatim.
+///
+/// One honest caveat about the guards. A cross-product term can only
+/// overflow `i128` when the separation itself is around `9.2e18` mm, and at
+/// that separation `range_ratio²` has already overflowed `u128`, so the
+/// range term refuses first. The checked arithmetic on the cross product is
+/// therefore defence in depth: replacing it with `saturating_mul` changes
+/// no answer this function can be asked for. It is kept because "the
+/// dominating guard happens to fire first" is a property of the current
+/// weapon table, not of the expression.
 #[must_use]
 pub fn hit_chance_ppm(
     target_pos: orrery_core::QPos,
@@ -1436,6 +1445,45 @@ mod band_boundaries {
             ),
             None,
             "the ruleset would have saturated here and still returned a number"
+        );
+
+        // A separation small enough for `range_sq` to be computable, with
+        // both terms of one cross component overflowing `i128` and then
+        // cancelling to zero — the quietest possible way to be wrong, since
+        // it reports a target tearing across the sky as having no angular
+        // rate at all. The refusal here comes from the *range* term, which
+        // overflows first at any separation big enough to overflow a cross
+        // product; see `hit_chance_ppm`'s note on why the cross guard is
+        // defence in depth rather than an independently reachable one.
+        const NEAR: i64 = 13_000_000_000_000_000_000_u64 as i64;
+        assert_eq!(
+            hit_chance_ppm(
+                QPos {
+                    x: 0,
+                    y: i64::MIN.wrapping_add(NEAR),
+                    z: i64::MIN.wrapping_add(NEAR),
+                },
+                QVel {
+                    x: 0,
+                    y: i64::MAX - 1,
+                    z: i64::MAX,
+                },
+                3_000,
+                QPos {
+                    x: 0,
+                    y: i64::MIN,
+                    z: i64::MIN,
+                },
+                QVel {
+                    x: 0,
+                    y: i64::MIN,
+                    z: i64::MIN,
+                },
+                weapon,
+            ),
+            None,
+            "a cross product that only saturates after cancellation is the \
+             quietest way to be wrong here"
         );
 
         let mut me = Craft::spawned(Archetype::Interceptor, QPos { x: 0, y: 0, z: 0 }, 0);
