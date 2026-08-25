@@ -106,3 +106,107 @@ acceptance: re-applying X-C's exact swap (`executor.rs:125-127`) now fails
 that test by name (Verification appendix, M1). This matters to clause (e):
 the all-or-nothing argument rests on the claim hash committing to the whole
 quantized state, and that commitment is now mutation-pinned, not assumed.
+
+## Decision
+
+### (a) Only prediction rolls back — the per-tier law
+
+Normative, per tier:
+
+1. **Canonical state is correction-only.** No component of this system may
+   rewind an authority's canonical entity state. Corrections are derived by
+   isolated replay of the signed input log ([D9], [D10]) and applied forward
+   as authoritative overwrites at the current tick. The authority's log is
+   straight-line: late remote inputs are applied and logged at their arrival
+   tick, never back-dated (docs/06:521, promoted here from documentation to
+   decision).
+2. **Durable state is recovery-only.** The durable tier reconstructs the
+   latest state (checkpoint base + journal tail replay); it never rewinds to
+   an older state and never serves one to a live client
+   (`checkpoint/mod.rs:1-11`; docs/08 §1).
+3. **Critical (P2) state is compensation-only.** Rows with economic value
+   are corrected by compensating FDB transactions inside the intent
+   envelope, never by rewind or overwrite outside it (docs/08 §2.2; A5
+   IV-3/IV-5).
+4. **Predictive resimulation is the only rewind**, and it is
+   presentation-tier: it exists on the predicting side, for the local
+   predicted set, and its output never feeds canon (docs/05:52; clause (d)).
+
+A proposal that rewinds any of tiers 1–3 is refused by this record, not
+argued case-by-case.
+
+### (b) The unit
+
+**The rollback unit is the per-entity predicted set.**
+
+- **Grain:** `(entity × its R1 components)`. Within a rolled-back entity,
+  R1 components restore from the ring; R0 components — ledger-backed P2 rows
+  and cosmetic state — are untouched. The R dimension's meaning is D45's;
+  this record fixes only which grain rolls back, subject to clause (e)'s
+  restore rule.
+- **Scope:** the local predicted set, entity by entity — never the world,
+  never an island, never a cell (clause (c)). Each predicted entity
+  reconciles against *its* authority's claims independently. Replay
+  isolation is what makes this correct rather than merely cheap: steps read
+  neighbours only from snapshots and cross-entity effects travel as
+  next-tick events (`crates/orrery_core/src/executor.rs:106-142`), so
+  re-stepping one entity never requires re-stepping its neighbours — the
+  same property that makes single-entity adjudication valid makes per-entity
+  rollback valid.
+- **Window:** the existing 9-tick (150 ms) window over the 16-tick ring
+  (docs/05:17, :68). This record adds no window.
+- **Budget:** the existing [D8] degradation ladder
+  Immediate → Amortize → Evict → SnapOwnPlayer (`budget.rs:191-265`,
+  liveness M2). Any unit larger than the predicted set re-imports the cost
+  the ladder exists to cap.
+
+**The unit does not change under a triggered ECS host.** If a [D42] trigger
+ever admits a dedicated world, its rollback substrate is a per-entity ring
+of R1 components keyed by `PersistId` — the shape the presentation ring
+already has — never a world snapshot, archetype clone, or copy-on-write
+world fork, because those are mechanisms for the unit clause (c) rejects
+(A7 §4.4). The unit binds the executor store today and any world-hosted
+store later; it names no engine type.
+
+### (c) World, island, and cell — rejected as units
+
+- **Entire simulation world — rejected.** The tree rejects it in print:
+  cost must scale with interest size, not world size — "the exact failure of
+  whole-world rollback" (docs/05:66). Under [D42] there is no world-shaped
+  canonical store to snapshot: canonical state is a per-entity
+  `BTreeMap<PersistId, CoreState>` in the executor
+  (`executor.rs:48-51`). And under per-entity authority ([D7]) there is no
+  single timeline to rewind *to* — entity A's authoritative update at tick T
+  says nothing about entity B's. The migration brief's worry about cloning a
+  complete `World` is answered structurally, not by benchmark: the design
+  has no consumer for a world snapshot.
+- **Authority island — rejected.** No island-wide history exists anywhere;
+  residuals and corrections are keyed by authority and entity —
+  `TrackKey { authority: NodeId, entity: PersistId }`
+  (`crates/orrery_predict/src/monitor.rs:47-52`). An island unit would make
+  one entity's mispredict force resimulation of every island co-member —
+  cost scaling with island population, the interest-vs-world failure one
+  level down. Islands are an *authority* scope, not a *history* scope.
+- **Spatial cell — rejected.** Cells are storage and interest keys, and an
+  entity's committed cell changes mid-window: committed rekeys move an
+  entity and its rows between cells (docs/08:60-63; the v2 `EntityRekey`
+  record, `crates/orrery_protocol/src/persist.rs:279-304`). A unit that
+  rekeys while the window is open is not a unit. Nothing simulates per cell.
+
+### (d) L-1 — lightyear history is presentation-tier, and corrections use one door
+
+The lightyear prediction history (its ring, its rollback machinery) is
+**presentation-tier state**: never hashed, never persisted, never consulted
+by canonical rules, and its contents appear in no encoded artifact.
+Authoritative corrections cross into the presentation tier in exactly one
+direction through exactly one door: `AuthorityCorrectionInbox`
+(`crates/orrery_predict/src/correction.rs:48`), carrying `AdjudicatedState`
+derived from hash-verified replay
+(`crates/orrery_persistd/src/adjudication.rs:283-297`, `:573`; the
+snapshot-hash-before-load gate is live — M3 kills
+`a_snapshot_that_does_not_match_its_claim_is_forgery_not_deviation` by
+name). Orrery owns membership, bounds, attribution, and evidence; lightyear
+supplies mechanics only — it has no per-entity authority and no rollback
+signal in 0.29 (`crates/orrery_predict/src/wiring.rs:36-56`). If lightyear
+is ever replaced, this clause and clause (b) are unchanged: they name no
+lightyear type.
