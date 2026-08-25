@@ -1,0 +1,690 @@
+# A7 — Persistence, rollback unit and canonical witness projection (#403)
+
+**Status:** decision proposal for the #395 planning tree · **Date:** 2026-08-25 ·
+**Tree:** `docs/403-a7` (based on `main` at `3195583d`) · **Parents:**
+[#403](https://github.com/baadc0de/orrery/issues/403) ←
+[#395](https://github.com/baadc0de/orrery/issues/395) · **Builds on:**
+[A1](a1-ruleset-architecture-map.md), [A2](a2-kernel-game-module-ownership.md),
+[A3](a3-simulation-host-comparison.md) (+ the preserved
+[second opinion](a3-simulation-host-second-opinion.md)),
+[A5](a5-identity-and-capabilities.md), and [A4](a4-deterministic-execution.md)
+(landed on `main` as `01fd6213` mid-task; §11 records the timing) ·
+**Source brief:**
+[docs/plans/ruleset-ecs-migration-brief.md](ruleset-ecs-migration-brief.md)
+§Persistence, rollback, and witnessing
+
+Three decisions were reserved to this node by name: the **rollback unit**
+(A2 §7.1; A5 §8.1 — the R dimension "records membership only"), the
+**canonical witness projection** (A4 §8; A5 §8.1), and the persistence
+**strategy comparison** the brief demands (snapshots · component journals ·
+domain-event journals · the existing transaction journal · hybrids). All
+three are settled below — as proposals. Accepting or amending anything here
+is the owner's (#395: propose, do not decide); ADR text belongs to A11 (#407).
+
+Method, as in the predecessors:
+
+- Every claim cites a file and line opened on this tree today. Where this
+  document asserts a property is *enforced*, the **guarded stage** was broken
+  (not the check line), the named check that died recorded with its real
+  result line, the change reverted, the pass re-confirmed (§10). Two runs
+  produced results against this document's own convenience and are reported
+  as such: one mutation **survived** every suite it faced (§10 X-C), and one
+  mutation was *designed* to survive the goldens and did — while killing six
+  event-assertion tests the goldens story never mentions (§10 X-A).
+- What **exists**, what is **designed but unwired**, and what is **proposed
+  here** never share a sentence.
+- Where a decision belongs to another node — command/event semantics (A6,
+  #402, being written in a sibling lane right now), manifest format (A8,
+  #404), test-programme construction (A10, #406) — it is named, not decided
+  in passing (§9).
+
+---
+
+## 1. Ground truth inherited and re-verified
+
+Each finding this document leans on was re-checked on this tree before use.
+
+| # | Finding | Re-verification |
+|---|---|---|
+| I1 | Canonical rules state lives in `Executor`'s `BTreeMap<PersistId, R::CoreState>`; the map choice is VC-4-motivated | `crates/orrery_core/src/executor.rs:48-51`, comment at `:60-63` |
+| I2 | The witness hash is per-entity: `state_hash = blake3(CoreCodec(quantized state))`; **no container is iterated into it** | `ruleset.rs:319-326` ("blake3 over the canonical encoding of the **quantized** state (VC-7), so a claim commits to exactly what replication and persistence saw"); `executor.rs:125-127` |
+| I3 | Query iteration order over a `bevy_ecs` world is allocation/archetype-dependent; a sorted-by-stable-id projection agrees across orders. Reproduced **three times independently**: A3 P1/P2, second opinion P-2, A4 E-3 (`f6a3…` vs `d243…`) | Relied on as recorded (prototype evidence; no repo delta since A3's runs). Not re-run — the three independent reproductions are the point |
+| I4 | Goldens are chains over per-tick state hashes **only**; the source says so itself and names the blind spot: "adding attribution to `Outcome::DamageDealt` did not shift a single chain" | `crates/orrery_games/src/golden.rs:20-29`. Re-proven live by mutation X-A (§10): an injected event-only outcome leaves all 11 battery tests green |
+| I5 | `cargo tree -p orrery_witness \| grep -ci bevy` = **530** while `./scripts/core-gates.sh` exits **0**; `GATED_CRATES=(orrery_core orrery_games orrery_conformance)` is a typed list | Both halves re-run on this tree today: 530, exit 0. `scripts/core-gates.sh:37` |
+| I6 | A3's adopted position (both lanes): canonical verifiable state stays in the engine-neutral per-entity executor; shared Bevy app world **rejected**; a dedicated `bevy_ecs::World` admitted only behind the host seam on named triggers (T1–T3) | a3-simulation-host-comparison.md §7; second opinion §3 V5 |
+| I7 | A5's model: three closed identity classes; `bevy_ecs::Entity` may appear in no encoded artifact outliving its world (IV-7); any enumeration for hashing sorts by `PersistId` (N-2.3); five capability dimensions P/R/W/N/A with zeros failing closed; the R dimension records rollback membership and defers unit + mechanism here | a5-identity-and-capabilities.md §2, §5; IV rows re-read |
+| I8 | A4 (PR #418): 14 nondeterminism entry paths → 13 mechanisms, each with a named check; canonical stage model S0–S7 with S4 (Quantize) before S5 (Claim) non-negotiable; Tier V role-discovery gate + conditional Tier H (arms only if an ECS host is admitted) carrying `ambiguity_detection=Error`, a projection differential harness (E-M3), and single-entity step exposure | `docs/plans/a4-deterministic-execution.md` §2–§5. Read from PR #418 during this task; #418 merged to `main` (`01fd6213`) before this document finished, and the merged file is byte-identical to the version read (`git diff pr418 origin/main -- docs/plans/a4-deterministic-execution.md` empty). Its two headline figures re-verified first-hand (I5) |
+| I9 | The durable tier is **already a snapshot+journal hybrid**: "the checkpoint is the base, the journal is the delta, so recovery is zero-loss by construction"; checkpoints reach FDB on a 20 s jittered cadence; journal records are idempotent, "keyed by `(entity, tick)` with last-writer-wins per component within an entity's single-writer stream" | `crates/orrery_persistd/src/checkpoint/mod.rs:1-11`; docs/08-persistence.md §1 diagram + §2 table (`:79`); `orrery_protocol/src/persist.rs:200-205` |
+| I10 | Authorities never rewind authoritative core entities — "the log is straight-line by construction"; late remote inputs are applied and logged at their arrival tick, never back-dated | docs/06-verifiable-core.md:521; docs/05-prediction-rollback.md:52 |
+| I11 | Client-side rollback exists and is bounded: per predicted entity, per fixed tick, a 16-tick component ring; window 9 ticks (150 ms); budget guard ladder Immediate → Amortize → Evict → SnapOwnPlayer; cosmetic state never snapshotted, never rolled back; "Snapshotting only the predicted subset — never the world — is the point" | docs/05-prediction-rollback.md:17, :60-68; ladder live-proven by mutation X-E (§10): breaking the eviction rung kills two named tests |
+| I12 | lightyear 0.29 supplies prediction mechanics only: no per-entity authority (its own doc: "Authority is currently not working…", quoted at `orrery_predict/src/wiring.rs:37-41`) and **no rollback signal** — the per-entity residual arrives as `VisualCorrection<D>` after `RollbackSystems::EndRollback` | `wiring.rs:36-56`; `predict/lib.rs:1-30` |
+| I13 | Adjudication replays exactly one entity from a hash-verified snapshot; corrections flow back as `AdjudicatedState` through `AuthorityCorrectionInbox` | `replay.rs:106-130` (hash check before load — live-proven by mutation X-B); `adjudication.rs:283-297`, `:573`; `correction.rs:48` |
+| I14 | The at-rest schema machinery is live and fail-closed: per-`(ComponentTypeId, SchemaVersion)` slots, envelope floor, undeclared component ⇒ refuse, future version ⇒ refuse, `EntityRekey` v2 refuses v1 | A5 §7 (mutation-proven X3/X4 there); the rekey refusal re-proven fresh here by mutation X-D (§10) |
+
+### 1.1 New findings made while verifying (not in any predecessor)
+
+**F-1 — the bulk uplink's `tick` field is not the universe tick.** The wire
+doc says "The universe tick at append (D8)"
+(`orrery_protocol/src/gateway.rs:378-379`), and the journal's idempotency
+story is "keyed by `(entity, tick)`" (`persist.rs:200-202`). But the only
+production writer fills it from a **client-local per-entity sequence counter
+starting at zero**: `feed_uplink` does `let seq_num =
+seq.next.entry(entity).or_insert(0); let tick = *seq_num;` and then
+`tick: Tick::new(tick), … seq: tick`
+(`orrery_persist_client/src/feed.rs:81-92`) — the same number is sent as both
+`tick` and `seq`. The gateway journals it as received (`gateway.rs:8305+`
+echoes `diff.tick` in nacks; nothing re-stamps it). Consequences for this
+node: **today's bulk journal cannot be aligned with claim windows, replay
+windows, or checkpoints by simulation tick** — its "(entity, tick)" key is
+really "(entity, uplink-seq)". Idempotent resend still works (the counter is
+monotone per entity), so nothing is corrupt; but any A7-adjacent design that
+assumed the journal is tick-addressed (e.g. journal-as-rollback-substrate,
+§4.3) would be building on a field that does not contain what its type says.
+Same drift class as the `PersistId` block-grant doc comment A5 recorded:
+present-tense wire documentation of an unbuilt behaviour. Flagged to A11 as
+either a `feed_uplink` fix (stamp the real tick when the client has one) or a
+doc correction (rename the semantic); which, is the owner's call.
+
+**F-2 — event coverage exists, but only in per-game unit tests.** Mutation
+X-A (§10) shows the precise shape of the goldens gap: an injected event-only
+outcome sails through `chains_match_the_committed_golden` and the whole
+battery (11 passed), through all of `orrery_core`, `orrery_conformance` and
+`orrery_witness` — and dies against six hand-written assertions in
+`orrery_games/tests/regolith.rs` (`assertion failed:
+outcome.events.is_empty()` and friends). So the tree is not blind to events;
+it is blind to events **in every instrument that would carry a migration
+parity argument** (goldens, corpus, witness pipeline). The differential
+harness has to inherit the unit tests' visibility, not the goldens' (§6).
+
+---
+
+## 2. What "rollback" is in this tree — three mechanisms, not one
+
+The brief's question "what is the rollback unit?" presumes one rollback.
+The tree operates three distinct mechanisms that only share a word, and the
+unit answer differs per mechanism — conflating them is how a wrong unit gets
+chosen. Inventory first; the decision is §3.
+
+| Mechanism | Where | What rewinds | What never rewinds | Evidence |
+|---|---|---|---|---|
+| **Predictive resimulation** (client-side, presentation tier) | lightyear ring + `orrery_predict` budget/monitor | The mispredicting entity's predicted components, restored from the 16-tick ring at the authoritative tick, then re-stepped | Cosmetic state (never snapshotted, D13); anything outside the predicted set; the world | I11; `budget.rs:191-260` (ladder), X-E |
+| **Authoritative correction** (canonical tier) | Adjudication verdict → `AdjudicatedState` → `AuthorityCorrectionInbox` | Nothing, in the rewind sense: the *corrected canonical state* is re-derived by isolated replay of the signed log and applied **forward** as an authoritative overwrite | The authority's own log — straight-line by construction (I10); committed durable effects | I13; docs/06:521 |
+| **Durable recovery** (storage tier) | Checkpoint base + journal tail replay (`lsn > watermark`) | Nothing observable: recovery reconstructs the latest durable state; it never serves an older state to a live client | Critical (P2) rows: FDB RPO 0; corrections to them are compensating transactions, never rewinds (A5 IV-5) | I9; checkpoint/mod.rs:1-11 |
+
+Two structural facts follow and are load-bearing for everything below:
+
+1. **Canonical state is never rolled back anywhere in this system.** The
+   phrase "rollback of canonical rules state" already got its honest gloss in
+   A1 (§9 assumption 7 rider): it is a replay/correction story. The unit
+   question is therefore a question about the *predictive* mechanism plus a
+   question about what a triggered ECS host would need — not a question about
+   rewinding the executor, the journal, or FDB.
+2. **The cost model is already decided by shipped arithmetic.** The budget
+   guard exists because worst-case resim is `window × step_cost` and the
+   ladder (amortize → evict → snap) is what keeps a frame affordable
+   (docs/05 §3; SnapNet's spiral-of-death arithmetic quoted there). Any unit
+   larger than the predicted set re-imports the cost that ladder exists to
+   cap.
+
+---
+
+## 3. Decision: the rollback unit
+
+**Proposed (R-1): the rollback unit is the per-entity predicted set — grain
+`(entity × its R1 components)`, scope the local predicted set, window the
+9-tick ring, budget the existing ladder. World, island, and cell are rejected
+as units. Canonical state stays correction-only; durable state stays
+recovery-only; critical (P2) state stays compensation-only.**
+
+Spelled out per candidate, each with the argument that beats it:
+
+- **Entire simulation world — rejected.** The tree already rejected it in
+  prose and practice: "Snapshotting only the predicted subset — never the
+  world — is the point: this is what makes cost scale with interest size
+  instead of world size, the exact failure of whole-world rollback"
+  (docs/05:66). A world unit also rewinds entities whose authorities never
+  mispredicted anything — under per-entity authority there is no single
+  timeline to rewind *to*: entity A's authoritative update at tick T says
+  nothing about entity B's. And under A3's adopted position there is no
+  world-shaped canonical store to snapshot in the first place (I1). The
+  brief's own worry ("Raw cloning or serialization of the complete `World` is
+  unlikely to be acceptable") is thus answered structurally, not by
+  benchmark: the design has no consumer for a world snapshot.
+- **Authority island — rejected.** No island-wide history exists anywhere;
+  corrections and residuals are keyed `(NodeId, PersistId)`
+  (`monitor.rs:45-52` per A5 §2.3). An island unit would mean one entity's
+  mispredict forces resimulation of every island co-member — cost scaling
+  with island population, which is exactly the interest-vs-world failure
+  again, one level down. Islands are an *authority* scope, not a *history*
+  scope.
+- **Spatial cell — rejected.** Cells are storage and interest keys
+  (`world/` key carries the cell; A5 §2.7); nothing simulates per cell, and
+  an entity's cell changes mid-window (rekey). A unit that migrates while
+  the window is open is not a unit.
+- **Entity set (the predicted set) — adopted as the scope.** It is what
+  ships (I11), its cost is bounded by construction (the ladder demotes
+  members until the replay fits, X-E-proven), and it composes with per-entity
+  authority: each predicted entity reconciles against *its* authority's
+  claims independently. Replay isolation makes this correct, not merely
+  cheap: steps read neighbours only from snapshots and cross-entity effects
+  travel as next-tick events (`executor.rs:106-142`), so re-stepping one
+  entity does not require re-stepping its neighbours — the same property
+  that makes single-entity adjudication valid (I13) makes per-entity
+  rollback valid.
+- **Component subset — adopted as the grain, inside the entity.** A5's R
+  dimension is per-component and this document keeps it that way: within a
+  rolled-back entity, `R1` components restore from the ring; `R0` components
+  (ledger-backed P2 rows per IV-5, cosmetic per D13) are untouched. What the
+  grain must **not** do is split the witnessed unit: the claim commitment is
+  `state_hash` over the entity's whole `CoreState` (I2), so for
+  verifiable-core entities the ring snapshots the quantized core state and
+  RNG cursor as one block (docs/05 §3 already specifies exactly this) and
+  restore is all-or-nothing at the entity. A partially restored core state
+  would hash to a value no authority ever claimed — manufacturing the false
+  deviation IV-2 exists to prevent.
+
+**Under a triggered ECS host (A3 T1–T3), the unit does not change.** The
+brief asks this node to compare component journals, archetype snapshots,
+copy-on-write and lightyear's history as *mechanisms*; the comparison is in
+§4.4, and its outcome is: the pilot's rollback substrate is a per-entity
+`R1`-component ring keyed by `PersistId` — the shape lightyear's ring
+already has — never a world snapshot, archetype clone, or COW world fork,
+because the unit those mechanisms serve (the world) is the unit rejected
+above. R-1 is storage-agnostic on purpose: it binds the executor store today
+and any world-hosted store later.
+
+**What R-1 changes in practice: nothing, today.** It is the current
+behaviour, stated as policy so that the migration cannot drift away from it.
+That is deliberate and is the same shape as A5's N-2: the value is in
+binding the pilot, not in moving the tree.
+
+---
+
+## 4. The persistence strategy comparison
+
+The brief demands a comparison: complete snapshots · component-level changes
+· domain events · transaction journals · hybrid. The tree's first answer is
+an inventory finding: **Orrery already runs a deliberate hybrid, with a
+different strategy per tier, and each tier's choice is load-bearing.**
+
+### 4.1 What exists, classified in the brief's vocabulary
+
+| Tier | Strategy in the brief's terms | Mechanism | Evidence |
+|---|---|---|---|
+| Durable bulk | **Snapshot + journal hybrid** | Checkpoint base (copy-on-update, 20 s jittered, to FDB) + append-only journal delta; restore = base + tail replay | I9 |
+| Durable critical | **Transaction journal** (the real one) | FDB serializable commits inside the intent envelope; RPO 0; receipts; anti-dupe single-ownership rows | docs/08 §2.2; `intent/mod.rs:152-155` |
+| Evidence / witness | **Command journal + state commitments** | Signed per-entity input log (frames) + per-tick `state_hash` claims chained from `input_head`; replay re-executes the log | I2, I13; docs/06 §6 |
+| Prediction | **Component snapshot ring** | 16-tick per-entity ring of predicted components (+ RNG cursor and quantized core state for verifiable entities) | I11 |
+| Goldens/corpus | **State-hash chain fixtures** | blake3 chain over every per-tick state hash, committed | I4 |
+
+The evidence tier deserves its name said plainly: it is **command sourcing
+with state checkpoints** — the log stores *inputs* (cheap, canonical order
+fixed by VC-2), and per-tick hashes commit the *result* without storing it.
+That factorization is what makes adjudication both possible and cheap:
+storage cost scales with input volume, verification cost with window length,
+and neither with state size.
+
+### 4.2 Complete canonical snapshots (as the primary strategy) — rejected
+
+Snapshot-only persistence (serialize everything each interval) loses the
+between-snapshot window (RPO = cadence), which the journal exists to close;
+snapshot-only *rollback* was rejected in §3. Snapshots remain what they are
+today: the base of the durable hybrid and the `t0` anchor of every evidence
+bundle (`load_claimed_snapshot`, hash-verified before load — X-B). Nothing
+about the migration changes this.
+
+### 4.3 Component-level change journals (as the canonical/rollback substrate) — rejected for now, with the two named preconditions
+
+The bulk journal is a component-diff journal already (`RecordKind::
+ComponentDiff`). Could it double as the rollback/replay substrate — rewind by
+reading the journal backward, replay by reading it forward? Not today, for
+two mechanical reasons, both recorded rather than assumed:
+
+1. **It is not tick-addressed.** F-1: the production writer stamps
+   uplink-sequence numbers into the `tick` field, so journal positions
+   cannot be joined to claim windows or ring ticks. Until the writer stamps
+   real ticks, "journal-as-history" is unimplementable as specified.
+2. **It makes no schema statement.** A5 G-3: `DiffUplink.payload` carries no
+   `(ComponentTypeId, SchemaVersion)`; the actor resets overwritten bags'
+   floors to v0 with a documented apology (`actor.rs:1300-1308`). A history
+   you cannot version is a history you cannot migrate.
+
+Both closures are already owned (G-3 by the A8/A11 framed-bag producer
+package; F-1 flagged in §1.1), and once both close, journal-as-history
+becomes *possible* — but §3 removes the need: the predicted-set unit is
+served by the ring at strictly lower cost (16 ticks in memory vs a
+disk-format read-modify path), and the canonical tier corrects by replay of
+the *input* log, which is cheaper to store and already signed. Verdict:
+keep the component journal as what it is — the durability delta — and do
+not promote it to a history substrate.
+
+### 4.4 Archetype snapshots and copy-on-write worlds (the ECS-pilot question) — rejected as mechanisms for a unit that was rejected
+
+For a triggered dedicated world, the brief lists archetype snapshots and COW
+as rollback candidates. Both are world-grain mechanisms: an archetype
+snapshot clones column storage whose layout is world-history-dependent (I3 —
+the same allocation-order dependence three probes reproduced), and a COW
+fork preserves *the world's* past, not an entity's. Since the unit is the
+per-entity predicted set (R-1), the pilot needs neither: it needs a
+per-entity ring of `R1` components keyed by `PersistId`, which lightyear
+already maintains for the presentation world and which a canonical host
+would implement as a small `BTreeMap<PersistId, Ring<Snapshot>>` — the
+executor's own storage discipline applied to history. Anything world-shaped
+is not just unnecessary; it would re-import archetype layout into restored
+bytes, which IV-7/WP-3 (§5) forbid from ever reaching an encoded artifact.
+
+### 4.5 Domain-event journals (as canonical truth) — rejected; adopted as fixtures
+
+Storing emitted `CoreEvent`s as the durable record of what happened is the
+event-sourcing move. Against this tree it fails twice:
+
+- **Events are derived, not primary.** The doctrine is written where the API
+  lives: "an event-only effect is invisible to state-hash goldens and
+  adjudication. A game whose materialization matters to adjudication must
+  also record an own-state trace" (`ruleset.rs:280-284`). Adjudication
+  verifies *state* commitments against *input* logs; an event journal would
+  be a second, unverified account of the same history — and A2 CC-4 shows
+  the tree already routes durable consequences of events through state
+  counters and the intent envelope instead.
+- **Event semantics are A6's, being decided right now.** Ordering, replay,
+  dedup and idempotency of commands/events belong to #402 (sibling lane);
+  a persistence strategy built on their semantics would decide another
+  node's questions by fiat.
+
+What survives is the narrow, valuable piece: **committed event-trace
+fixtures as test instruments** (§6) — journals of events for *comparison*,
+never for *authority*. That distinction keeps the single-source-of-truth
+property: canon is state commitments + input logs; events remain derived.
+
+### 4.6 Verdict
+
+**Proposed (P-1): the migration introduces no new persistence strategy.**
+The four-tier hybrid stands as inventoried in §4.1. What the #395 programme
+changes is only *who produces the bytes* (modules declaring capabilities
+per A5's P/R/W dimensions instead of one impl body) and *what additional
+fixtures exist* (§6). Each tier's strategy maps onto the brief's module
+model as: modules declare `(ComponentTypeId, SchemaVersion)` codecs and
+P/R/W/N/A capabilities (A5 N-5/N-7); the kernel routes P1 through the
+journal+checkpoint hybrid, P2 through the intent envelope, R1 through the
+ring, W2 through frames/claims — and "the module system must not let modules
+bypass transactional persistence invariants" (brief) is exactly A5's IV-3
+plus A2 row 4's envelope ownership, already argued there.
+
+---
+
+## 5. Decision: the canonical witness projection
+
+A4 and A5 both reserved "the canonical witness projection format" here. The
+format below is written to be *already true* of the current tree (so
+adopting it costs nothing today) and *binding* on any future host (so the
+pilot cannot drift). Plain math first, rules after.
+
+The projection of one entity `e` at tick `t`:
+
+```text
+bytes(e, t)  = CoreCodec::encode( quantize( state(e, t) ) )     # declared codec, fixed field order
+hash(e, t)   = blake3( bytes(e, t) )                            # the value a StateClaim commits to
+```
+
+The chain a claim window folds (what `input_head` anchors, docs/06 §6):
+per-entity, per-tick, over the entity's logged inputs — state hashes are
+committed by claims, inputs by the chain; the two meet at `verify_bundle`.
+
+Multi-entity aggregates, wherever one is ever needed (corpus chains, a
+checkpoint digest, any future world digest):
+
+```text
+world_digest(t) = blake3( concat( for id in sort_ascending(ids):  id ‖ bytes(id, t) ) )
+```
+
+### 5.1 The rules (proposed as normative)
+
+- **WP-1 — the unit of witness commitment is one entity-tick.** Claims,
+  frames, bundles and replay all address `(PersistId, Tick)`; nothing
+  commits to a multi-entity hash on the wire. This is today's shape (I2,
+  I13) kept deliberately: it is what makes single-entity adjudication, the
+  witness's one-executor-per-watched-entity model
+  (`witness.rs:406-421` per A1 §5.3), and R-1's per-entity restore all
+  consistent with each other.
+- **WP-2 — entity order is `PersistId` ascending; cross-grid,
+  `(GridId, PersistId)` ascending.** Any enumeration of entities that feeds
+  bytes into a hash, a golden, a fixture or an emitted artifact sorts first.
+  This is A5 N-2.3 restated as the projection's ordering clause, and it is
+  the exact mitigation all three iteration-order probes validated (I3).
+  Today's executor satisfies it structurally (`BTreeMap` keys; `entities()`
+  documents "in `PersistId` order", `executor.rs:97-100`).
+- **WP-3 — component order is `ComponentTypeId` ascending, each slot framed
+  `(ComponentTypeId, SchemaVersion, payload)`.** Today a `CoreState` is one
+  declared codec and this clause is vacuous for it; it binds the day state
+  becomes per-component (A3 T1 is precisely that trigger). The framing is
+  the at-rest bag's shape (`orrery_persistd/src/schema.rs:48-66`) so the
+  witness projection and the persistence encoding cannot diverge — "a claim
+  commits to exactly what replication and persistence saw" stays one
+  sentence with one meaning.
+- **WP-4 — quantize before hash, always** (VC-7; A4 stage rule S4 ≺ S5).
+  Note honestly: mutation X-C (§10) shows this ordering is currently
+  **unpinned by any test** — it survives because every in-tree state stores
+  continuous fields as lattice integers already. The clause stays; the
+  missing test is named in §10.
+- **WP-5 — no engine artifact may reach the projection.** No `Entity` bits,
+  `ComponentId`s, `FnsId`s, archetype or row indices, reflection names, and
+  no bytes produced by iterating any world container (A5 IV-7/N-6). For the
+  executor store this is structural (the defining crates are gate-held
+  Bevy-free, A5 §2.2); for a world-hosted store it is exactly what A4's
+  E-M3 differential harness must prove per commit.
+- **WP-6 — the projection is versioned.** A `projection_version` integer,
+  bumped on any change to WP-2/WP-3 framing, carried in the manifest (format
+  A8's) beside `RulesetId` and the schedule digest. Today's value is 1 and
+  describes the shape above. Without this, a projection change would
+  present as mass deviation — the false-conviction failure IV-2 names.
+
+### 5.2 Why this is shown order-immune rather than assumed
+
+The acceptance bar was: no reliance on raw ECS world serialization without
+evidence that archetype order, component insertion order, entity allocation
+order and hash-map iteration cannot reach the hash. The evidence, by store:
+
+- **Current store — immunity is structural.** Nothing iterates a container
+  into `hash(e,t)`: the input is one entity's own state (I2), and the one
+  map in the path is keyed `BTreeMap` whose order is `PersistId` by type
+  (I1). Hash-map iteration cannot reach gated sources at all (VC-4 clause,
+  mutation-proven A1 M3).
+- **World-hosted store — immunity is a per-commit proof obligation, with
+  the hazard demonstrated and the mitigation demonstrated.** Three
+  independent probes reproduced insertion-order-dependent query iteration on
+  the pinned `bevy_ecs 0.19` (I3); the same three showed the WP-2 sorted
+  projection agreeing across permutations (A3 P1/P2 "canonical AGREES |
+  naive DIFFERS"; A4 E-2 one hash across six executor/order cells). The
+  named check is A4's E-M3 (`projection-order-permuted` corpus case):
+  permuted insertion orders must produce equal sorted-projection hashes
+  *and* match the executor-computed chain. Per A4 Tier H, that harness is a
+  precondition of admitting the host, not a follow-up.
+- **The stability trap is refused.** Observed agreement of a *naive*
+  projection across runs proves nothing (A3 P3: 200/200 stable and still
+  unspecified); E-M3 therefore deliberately asserts nothing about naive
+  folds. This document inherits that discipline: WP-2 is the rule because
+  sortedness is provable; stability is not.
+
+### 5.3 What the projection excludes, said once
+
+Excluded from witness bytes, each with its class: presentation and cosmetic
+state (P0/W0 by default — A5's zeros fail closed); `EphemeralId` entities
+(structurally unpersistable, A5 IV-4/X1); materialization descriptions
+(`ruleset.rs:280-284` — own-state traces carry what matters); lightyear ring
+contents and `VisualCorrection` residuals (presentation tier, I12);
+`UplinkSeq` counters and every other in-memory index (A5 N-2.2: rebuildable
+projections are never encoded). Events are excluded from *claims* today and
+this document does not move them onto the wire — the event fixture chain
+(§6) is a test instrument; putting event commitments into `StateClaim` would
+be a protocol change and is flagged to the owner, not proposed.
+
+---
+
+## 6. Closing the goldens gap: observable event/outcome fixtures
+
+The gap, measured rather than described: under mutation X-A every golden and
+every conformance, core and witness suite stayed green while the event
+stream visibly changed (§1.1 F-2). A differential harness comparing legacy
+vs migrated implementations *by goldens alone* would certify parity between
+implementations that disagree about what happened. What closes it:
+
+**Proposed (G-1): a second committed chain per game scenario — the event
+chain — alongside the state chain, produced by the same instrument.** The
+raw material already exists: `CoreEvent: CoreCodec` is a trait bound
+(`ruleset.rs:243-244`), so every event has canonical bytes today. Plain
+math, WP-2-ordered:
+
+```text
+tick_events(t) = concat( for id in sort_ascending(stepped ids):
+                     id ‖ count(events(id,t)) ‖ concat(encode(ev) for ev in events(id,t)) )
+event_chain(t) = blake3( event_chain(t-1) ‖ tick_events(t) )    # emission order within an entity
+```
+
+Under X-A's mutation this chain moves on the first tick while the state
+chain does not — that is the whole point, and it is cheap: the scenario
+harness already holds every `TickOutcome` (`scenario.rs` `TickRecord`, A1
+§3.3); the fixture adds a fold and a committed table beside
+`golden.rs`'s.
+
+**Proposed (G-2): outcome fixtures for the two other state-invisible
+channels.** Materialization: the per-tick list of installed ids
+(`TickOutcome::materialized` — first-writer-wins order is deterministic,
+`executor.rs:144-157`) folds into the event chain's tick block. Delivery:
+the `deliver`-mapped `(target, order)` pairs likewise — X-A's injected
+event was deliver-`None`, and a fixture that stopped at emitted events
+would have caught it while still missing a mutation that flipped a
+`deliver` arm to `None`. Three channels, one chain.
+
+**Proposed (G-3): the differential parity harness compares four artifact
+classes, per the brief's own list**: canonical state projections (state
+chain), events (G-1/G-2 chain), persistence output (the encoded bag/journal
+bytes a run produces), and witness hashes (claim values). Implementation is
+A10's (#406); the *format* — what is folded, in what order — is fixed here
+so A10 builds fixtures, not semantics. Expected-difference classification
+(brief: "explicitly classify expected differences") keys off
+`projection_version` (WP-6) and `RulesetId.version`: a difference under
+equal versions is a failure, under bumped versions a migration fixture.
+
+**What G-1 does not repeal.** The doctrine that adjudication sees only
+state (`ruleset.rs:280-284`) stands: event chains are committed test
+fixtures, not evidence, not wire, not store. Games whose outcomes must be
+*adjudicable* still write own-state traces (A2 CC-4's monotone counters).
+The fixture closes the *parity-proof* gap; the *adjudication* gap for
+event-only outcomes is a game-design rule, already documented, and moving
+event commitments into claims is a protocol change reserved to the owner
+(§5.3).
+
+---
+
+## 7. Migration behaviour and manifest interaction
+
+### 7.1 At-rest migration — mapped, not invented
+
+The machinery is live and fail-closed (I14; A5 §7 proved liveness by
+mutation, and X-D here re-proves the rekey refusal fresh:
+`persistence_rekey_decoder_rejects_untrusted_or_stale_shapes` dies by name
+when the version check is removed). The module model maps onto it without
+new mechanism: a module's schema surface is its declared
+`(ComponentTypeId, SchemaVersion)` pairs plus `ComponentMigrator` steps
+keyed `(component, from_version)` (`orrery_core/src/migration.rs:18-19`;
+registry `orrery_persistd/src/migration.rs:27-114`). The rules this node
+adds are riders, all of them existing behaviour promoted to policy:
+
+- **M-1: migrations are pure, adjacent, monotone functions on payload
+  bytes** — never on live worlds. A migration that needed a neighbour or a
+  query would be unreplayable for exactly VC-8's reasons.
+- **M-2: unknown ⇒ refuse; future ⇒ refuse; missing step ⇒ refuse**
+  (existing: `UnregisteredComponent`/`FutureVersion`/`MissingStep`).
+  Module removal with persisted data present is the same rule wearing a
+  different hat: rows referencing an undeclared component refuse to load.
+  Whether an operator read-and-quarantine override exists is A8 manifest
+  policy (A5 §7 flagged it; unchanged).
+- **M-3: migration fixtures are round-trip goldens** — old-format bytes
+  committed, migrated, re-encoded, compared — plus a G-3 differential run
+  across the version bump. Owned by A10; named here so the goldens
+  supplement covers the migration axis, not only the parity axis.
+- **M-4: the witness projection version (WP-6) and schema versions move
+  independently.** D38(d)(3) keeps schema orthogonal to `RulesetId`; WP-6
+  adds a third orthogonal axis. A projection bump with no schema change
+  (e.g. WP-3 framing) must not force component migrations, and vice versa.
+
+### 7.2 Manifest storage — A8's construct, A7's contents
+
+The manifest format, storage and governance are A8's (#404). What this node
+contributes is the list the brief asked the manifest to identify, now
+concrete: witnessed schemas and versions = the declared `(ComponentTypeId,
+SchemaVersion)` pairs with `W1`/`W2` capability; canonical entity ordering =
+WP-2; canonical component ordering and byte encoding = WP-3 + the declared
+codecs; tick and authority context = `(PersistId, Tick)` addressing plus
+`RulesetId`; excluded data = §5.3's list, by capability zeros rather than by
+enumeration; plus `projection_version` (WP-6) and A4's schedule digest.
+Persisted universes record their producing manifest so replays select the
+right build — that is D21's three-retained-builds discipline
+(`RETAINED_BUILDS`, routing by `RulesetId`) extended by A8 to the manifest;
+nothing here changes it.
+
+### 7.3 Interaction with the existing Lightyear history
+
+The division of labour, stated so the migration cannot blur it (the brief's
+"duplication with Lightyear" risk):
+
+- **lightyear owns the mechanics of predicted-set resimulation**: the
+  16-tick ring, rollback detection against replicated confirmed state, and
+  re-stepping (docs/05 §3). Orrery does not rebuild any of it, under any
+  A3 variant — under the adopted position the canonical store is not even
+  visible to lightyear (second opinion E-4: it replicates mirror
+  components).
+- **Orrery owns membership, bounds, attribution and evidence**: which
+  components ring-buffer (A5's R dimension feeding the prediction registry),
+  how much resim a frame may spend (`RollbackBudget`, X-E), which
+  `(NodeId, PersistId)` a residual attributes to (`PredictedBy`,
+  `wiring.rs:79-93`), and the promotion of residuals into witness signal
+  (the monitor). lightyear cannot own these: it has no per-entity authority
+  and no rollback signal (I12) — the gaps are structural in 0.29, quoted
+  from its own source.
+- **The boundary rule (proposed, L-1): lightyear history is presentation-
+  tier state.** It is never hashed, never persisted, never consulted by
+  canonical rules, and its contents appear in no encoded artifact (it is a
+  §5.3 exclusion). Corrections cross the boundary in exactly one direction
+  through one door: `AuthorityCorrectionInbox`, carrying `AdjudicatedState`
+  derived from replay (I13). If lightyear is ever replaced (the plan-B seam,
+  `predict/lib.rs:3-8`), R-1 and L-1 are unchanged — they name no lightyear
+  type.
+
+---
+
+## 8. Existing invariants mapped onto the proposal
+
+The acceptance bar: every existing witness and persistence invariant either
+preserved, changed with justification, or flagged as needing an ADR (the
+owner's to accept, never this node's). "Now" = the adopted A3 position
+(composition root + host seam, executor store). "Pilot" = a triggered
+dedicated `bevy_ecs::World` behind the seam.
+
+| # | Invariant (source) | Now | Pilot | Verdict |
+|---|---|---|---|---|
+| 1 | VC-1 fixed tick, absolute universe ticks (docs/06:246) | untouched | inherited via A4's envelope ring 1 | **Preserved** |
+| 2 | VC-2 total input order, log is normative (docs/06:247) | untouched | S0 SealInputs pins it (A4 §3.2) | **Preserved** |
+| 3 | VC-3 per-`(seed, entity, tick)` RNG (docs/06:248) | untouched | Tier H bans RNG construction outside `tick_rng` | **Preserved** |
+| 4 | VC-4 no unordered iteration (docs/06:249) | untouched | extended: ECS adds hazard T2 (storage order); answered by WP-2 + E-M3, a *new* mechanical check where today none is needed | **Preserved, coverage extended** |
+| 5 | VC-5/VC-6 integer-discrete, libm-continuous (docs/06:250-251) | untouched | untouched (policy attaches to code roles, A4 §3.8) | **Preserved** |
+| 6 | VC-7 quantize-before-hash (docs/06:252; `executor.rs:125-127`) | kept as WP-4 — but **currently unpinned**: mutation X-C survived every suite because all in-tree states are already lattice-integer (`conformance/ruleset.rs:77`: "Idempotent: `step` already wrote lattice points") | WP-4 binds S4 ≺ S5 | **Preserved; missing test named to A10** (off-lattice test ruleset through `step_entity`, assert hash of quantized ≠ hash of raw) |
+| 7 | VC-8 no ambient inputs (docs/06:253) | untouched | Tier H adds async/RNG clauses | **Preserved** |
+| 8 | Per-entity claim commitment; single-entity replay isolation (`replay.rs:106-130`; `witness.rs:406-421`) | untouched; WP-1 makes it the projection's unit | Tier H requires single-entity step exposure — A4 §5.2 already makes it non-renegotiable | **Preserved; pilot obligation restated** |
+| 9 | Snapshot hash verified before load (`replay.rs:121-123`) | untouched; **live** — X-B kills `a_snapshot_that_does_not_match_its_claim_is_forgery_not_deviation` by name | same code path (bundles are store-agnostic) | **Preserved, liveness proven** |
+| 10 | Verdicts rest on subject-signed claims, never reporter hashes (`replay.rs:325-339`) | untouched | untouched | **Preserved** |
+| 11 | D16 bands comparator; discrete bit-exact (docs/06 §5) | untouched | untouched | **Preserved** |
+| 12 | Shadow-mode default; gaps are repair requests, not accusations (D10; `witness.rs:56`) | untouched | untouched | **Preserved** |
+| 13 | Journal idempotency `(entity, tick)` under lease/epoch fencing (`persist.rs:200-227`) | mechanism preserved — but F-1: the `tick` half of the key is uplink-seq in practice, contradicting the wire doc | a world-hosted producer must stamp real ticks if journal/claim alignment is ever wanted (§4.3 precondition 1) | **Preserved as behaving; doc-vs-behaviour divergence flagged to owner** (fix `feed_uplink` or fix the doc — either is small; silence is the only wrong option) |
+| 14 | Checkpoint base + journal tail, zero-loss recovery (checkpoint/mod.rs:1-11) | untouched | untouched (durable tier never sees the host) | **Preserved** |
+| 15 | Critical path: FDB transaction sole authority, RPO 0, anti-dupe single-ownership row (docs/08 §2.2; `intent/mod.rs:152-155`) | untouched; A5 IV-3/IV-5 already forbid the bypasses | untouched | **Preserved** |
+| 16 | Tombstone/live discrimination; rekey v2 refuses v1 (`keyspace.rs:109-146`; `actor.rs:264-266`) | untouched; X-D re-proves the refusal live | untouched | **Preserved, liveness re-proven** |
+| 17 | D38 fail-closed schema versioning, floor, orthogonal axes | untouched; M-1..M-3 restate | WP-6 adds a third orthogonal version (projection) | **Changed (extended): needs ADR** — WP-6 is new normative surface; A11 carries it, owner accepts |
+| 18 | Straight-line authority log; authorities never rewind (docs/06:521) | promoted into R-1 as its constraint | R-1 binds the pilot's ring design | **Preserved and promoted: R-1 needs an ADR** (the rollback-unit decision itself) |
+| 19 | No engine handle in any encoded artifact (A5 N-1/IV-7) | untouched | WP-5 + E-M3 are its projection-side enforcement | **Preserved; enforcement named** |
+| 20 | Unclassified ⇒ Cosmetic ⇒ never persisted; zeros fail closed (`ruleset.rs:293-297`; A5 N-7) | untouched | capability registry carries it | **Preserved** |
+| 21 | Goldens: per-scenario state chains, version-bump-on-rules-change (`golden.rs`) | **changed with justification**: supplemented by the event/outcome chain (G-1/G-2) because X-A proves state chains alone cannot carry a parity argument | differential harness (G-3) is a pilot precondition (A3 §7.4 item 2, now given its format) | **Changed: needs owner acceptance via A10/A11** (test infrastructure; ADR-light unless the owner wants event commitments on the wire, which is a separate, larger door) |
+
+ADRs this node proposes (all owner-accepted or not at all, via A11): the
+**rollback-unit record** (R-1 + L-1, amending/annexing D8's documentation),
+the **canonical-projection record** (WP-1..WP-6, amending docs/06 §2/§5
+prose and D38 with the projection-version axis), and the **F-1
+disposition** (code fix or doc amendment). G-1..G-3 land as A10 programme
+items unless the owner elevates them.
+
+---
+
+## 9. Reported rather than forced
+
+1. **Command/event semantics are A6's (#402), in flight now.** §4.5 and §6
+   deliberately fix only what fixtures *fold* (emission order within an
+   entity, WP-2 across entities — both already pinned by executor
+   semantics); delivery guarantees, dedup, idempotency keys and replay
+   behaviour of events are cited as A6's to define, and G-1's chain will
+   consume A6's ordering rules, not define them.
+2. **Manifest construct and governance are A8's** (§7.2 lists only the
+   contents this node owes it).
+3. **Harness construction is A10's** (G-3, M-3, the X-C-closing test, and
+   A4's E-M3/E-M8/E-M9 legs — specified, not built).
+4. **Whether event commitments ever enter `StateClaim`** is a protocol
+   change and the owner's door (§5.3, §6).
+5. **F-1's disposition** (fix the writer vs fix the doc) is the owner's:
+   the fix touches `orrery_persist_client` (not a P4 digest crate —
+   `p4-ledger.sh:33-35` hashes core/games/witness/p1-swarm only), but it
+   changes journaled bytes' meaning, which deserves an explicit decision.
+6. **Nothing here implements.** No registry, no fixture, no gate clause,
+   no trait edit; mutations lived one command run each (§10).
+
+---
+
+## 10. Mutation log (break the stage → named check dies → revert → passes)
+
+Baselines were recorded before each mutation; failing runs produced real
+result lines; no mutation landed on both sides of an equality *except where
+that is the finding* (X-C, reported as surviving, with the cause traced);
+every revert re-ran the check and passed.
+
+| # | Guarded stage broken | Named check | Observed | Reverted |
+|---|---|---|---|---|
+| X-A | Regolith `step` made to append `Outcome::Expired { id: me }` every tick — an event-only outcome with no state trace (`regolith/mod.rs:164-166`) | `cargo test -p orrery_games` (all suites) | **Goldens survived by design**: battery `11 passed; 0 failed` including `chains_match_the_committed_golden`; materialization `1 passed`. The kill arrived only from per-game unit tests: `tests/regolith.rs` `22 passed; 6 failed` — `bloom_site_expires_after_5400_director_ticks`, `lock_acquisition_replays_from_the_locker_alone`, `ttl_expiry_replays_and_denies_a_late_grab`, `volley_is_three_left_slot_first_rolls_and_uses_its_own_cooldown`, `fire_on_a_different_target_switches_the_lock_and_restarts_acquisition`, `contested_grab_replay_is_ordered_and_each_party_hashes_its_own_side` (`assertion failed: outcome.events.is_empty()`) | all suites green (`11`/`1`/`28`/`15` passed) |
+| X-B | `load_claimed_snapshot`'s hash check removed — snapshot accepted without verification (`replay.rs:121-123`) | `cargo test -p orrery_core --test adjudication` | `a_snapshot_that_does_not_match_its_claim_is_forgery_not_deviation` FAILED; `14 passed; 1 failed` | `15 passed; 0 failed` |
+| X-C | `step_entity` made to hash **before** quantizing (`executor.rs:125-127` order swapped) — the claim no longer commits to what replication and persistence saw | conformance (13), `orrery_core` lib+integration (73/15/11), all `orrery_games` suites, all `orrery_witness` suites (7/25/5/5/5/12) | **Every suite passed — the mutation survived.** Cause, traced to source: every in-tree `CoreState` stores continuous fields as lattice integers and every step writes lattice points (`conformance/ruleset.rs:53-84`: "Continuous fields are held *on the lattice*… Idempotent: `step` already wrote lattice points. Re-snapping is cheap insurance against a future rule that forgets to"), so the executor's snap is currently a no-op and the committed goldens cannot see the reorder. The ordering exists purely for future rulesets whose steps leave the lattice — and no test pins it. A test ruleset writing a deliberately off-lattice value through `step_entity`, asserting the outcome hash equals the quantized encoding's hash, would pin it cheaply; named to A10. Recorded as a coverage gap, not banked as proof | all suites green before and after; source restored byte-identical |
+| X-D | `decode_entity_rekey`'s version refusal removed — any stated `EntityRekey.version` accepted (`actor.rs:264-266`) | `cargo test -p orrery_persistd --test actor_runtime` | `persistence_rekey_decoder_rejects_untrusted_or_stale_shapes` FAILED; `49 passed; 1 failed` | `50 passed; 0 failed` |
+| X-E | `RollbackBudget::plan`'s ladder collapsed — every over-frame replay amortized, eviction and floor unreachable (`budget.rs:214` guard forced true) | `cargo test -p orrery_predict --lib` | 2 named failures: `budget::tests::overlong_replay_evicts_enough_to_fit`, `budget::tests::pathological_cost_snaps_the_own_player`; `41 passed; 2 failed` | `43 passed; 0 failed` |
+
+Re-verified steady-state (no mutation needed): `cargo tree -p
+orrery_witness | grep -ci bevy` → 530 with `./scripts/core-gates.sh` → exit
+0 (I5, confirming A4's figures first-hand). Predecessor mutations (A1
+M1–M8, A2 M-A/M-B, A3 F-1/F-2 + probes, A5 X1–X5) are relied on as
+recorded; the crates they ran against are byte-identical on this branch
+(docs-only tree over `3195583d`).
+
+---
+
+## 11. Stale citations found while verifying
+
+| Record | Citation / phrasing | Current truth |
+|---|---|---|
+| `orrery_protocol/src/gateway.rs:378` (wire doc) + `persist.rs:200-202` (journal doc) | `DiffUplink.tick` is "The universe tick at append (D8)"; journal records "keyed by `(entity, tick)`" | **F-1**: the only production writer fills `tick` with a client-local per-entity sequence starting at 0 (`feed.rs:81-92`), and the gateway journals it as received. The idempotency *mechanism* is intact (the counter is monotone); the *semantics* the docs state are not what is written. New finding, flagged to the owner (§9.5) |
+| This node's briefing text | "A5 reserved the rollback dimension's unit in its capability matrix" | Verified true and precise (A5 §5.2 R row: "Unit and mechanism are **A7's**"; §8.1). Likewise A2 §7.1 and A4 §8 — all three reservations confirmed as stated, none over- or under-compressed |
+| This node's briefing text | "A4 is in flight at PR #418, not yet on `main`" | True when issued; #418 merged to `main` (`01fd6213`) while this task ran. The version read (fetched as `pr418`) and the merged file are byte-identical, so every A4 citation here holds against `main` |
+| Epic #395 constraint block | "Witness hashing already has a canonical projection" | Confirmed in the per-entity sense (I2); this document names what was *not* yet canonical — multi-entity and per-component ordering (WP-2/WP-3), which existed as executor structure but not as stated policy |
+| Inherited stale set (A1/A2/A3/A5 records): ADR-0038 line drift; D21 `validate_intent` parenthetical; docs/06:210 present-tense `classify_component` consumers; docs/10 `orrery_field_host` rows; `persist.rs:41-44` block-grant present tense | — | Not re-litigated; where this document touches the same ground (D38 clause text, goldens doc, journal docs) the quotes were re-opened at source and held. golden.rs's passage cited by A3 as `:20-28` sits at `:20-29` today — sub-line drift, claim unchanged |
+
+---
+
+## 12. Unsure
+
+Stated as unsure rather than smoothed over:
+
+1. **Whether F-1 is a bug or an undocumented decision.** Nothing found
+   consumes `JournalRecord.tick` as simulation time today (recovery orders
+   by `lsn`; idempotent resend needs only monotonicity), which is consistent
+   with either reading. The divergence is real either way; its disposition
+   was not forced (§9.5).
+2. **X-C's blast radius.** The unpinned quantize-before-hash ordering is
+   harmless for every ruleset that exists and load-bearing for any future
+   one that computes in floats and relies on the executor's snap. Whether
+   such a ruleset is ever planned was not decidable from the tree; the
+   pinning test is cheap either way.
+3. **Whether the event chain (G-1) should ever graduate to a wire
+   commitment.** Fixtures close the parity gap; only claims close the
+   *adjudication* gap for event-only outcomes, and that trade (protocol
+   change, claim size, A6 interplay) was deliberately not priced here.
+4. **WP-3's bag-shaped framing** assumes A8 keeps the at-rest slot shape
+   `(ComponentTypeId, SchemaVersion, payload)`. If A8's manifest work
+   reshapes the slot, WP-3 should follow the bag, not fight it — the rule's
+   substance is "witness framing ≡ persistence framing", not the tuple.
+5. **Ring memory at scale.** R-1 keeps the predicted-set unit partly on
+   cost grounds; the 16-tick ring's per-entity memory at capacity-scale
+   predicted sets has no in-tree measurement (same evidence class as A3's
+   P4 caveat). The budget ladder bounds *time*, not *memory*; if memory
+   ever binds, the eviction rung is the existing lever.
+
+Deliberately not done:
+
+- **No implementation.** The only file this branch adds is this document;
+  all five mutations were reverted with passing results re-confirmed (§10).
+- **No ADR text, no protocol change, no trait edit.** R-1, L-1, WP-1..WP-6,
+  P-1, G-1..G-3, M-1..M-4 are proposals for A11 to carry into ADR form and
+  for the owner to accept, amend, or refuse.
