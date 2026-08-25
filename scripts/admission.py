@@ -14,6 +14,7 @@ import json
 import logging
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -278,7 +279,9 @@ class AdmissionTests(unittest.TestCase):
         for _ in range(20):
             if args.exists() and "--require-session" in args.read_text(): break
             time.sleep(0.01)
-        self.assertIn("--require-session " + sid, args.read_text())
+        harness = next(line for line in args.read_text().splitlines() if "--require-session" in line)
+        fields = shlex.split(harness)
+        self.assertEqual(fields[fields.index("--require-session") + 1], sid)
     def test_the_token_binds_the_presented_node_not_the_slot(self) -> None:
         token = self.service.join("test", self.request())["join"]["session_token"]
         self.assertGreater(len(token), 100, "the real signer returned a SessionTokenV1")
