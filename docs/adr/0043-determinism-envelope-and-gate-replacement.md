@@ -240,6 +240,35 @@ neighbour ban — is kept **unchanged**. What changes is who it applies to:
 > bar forbids; this one is not that. Admitting a further site is an amendment
 > to this clause, not a configuration change.*
 
+> *Further amended by the owner on 2026-08-25 (through #441/#468): **the
+> exactly-one count is withdrawn** and replaced by a declared list of audited
+> **predicates**, each named as `path::function` in
+> `AUDITED_NEIGHBOR_PREDICATES` in `scripts/core-gates.sh`. A read outside a
+> declared predicate fails, naming the offending function; a declared predicate
+> that no longer exists fails as stale.*
+>
+> *The count is withdrawn because it measured text rather than behaviour, and
+> the amendment above overstated what it bought. The quantities that matter are
+> enforced at the replay layer and always were: `max_neighbor_reads` caps how
+> many frames a tick may pull in, `max_neighbor_staleness_ticks` bounds how old
+> one may be, and `cross_check_neighbor_record` verifies each frame against the
+> neighbour authority's signed claim. A site count bounds none of those — one
+> expression can read a hundred neighbours, and a hundred expressions reading
+> one each are identically safe. #441 demonstrated the gap directly: folding
+> three lookups into one expression widened the audited predicate to a third
+> entity while "exactly one site" still passed. A check satisfiable by
+> reformatting is not an invariant.*
+>
+> *What survives is the property the count was standing in for: **no code reads
+> a neighbour without a human seeing it**. Adding a predicate is a one-line diff
+> to a declared list, which is a stronger review trigger than a number, and it
+> avoids forcing every future neighbour-reading feature into one god-predicate —
+> several small named predicates review better than one that does everything.
+> The acceptance bar still binds: this is not a weaker gate that passes, it is
+> the same tripwire stated in terms of what it actually checks. Adding a
+> predicate to the list remains an ordinary reviewed change; removing the
+> declaration requirement would be a further amendment.*
+
 1. **Discovery scan.** Walk workspace crates; strip `#[cfg(test)]` modules;
    flag any crate whose library sources define `trait Ruleset` or contain an
    `impl … Ruleset for` site, qualified paths included. Crates so flagged are

@@ -131,21 +131,79 @@ note 'VC-6/VC-8: no ambient inputs, no std transcendentals'
 # against the declared tick; a stale frame is refused, never turned into a
 # deviation against an honest lagged reader.
 #
-# Policy remains narrow. The only rules-side read is Regolith's audited O(1)
-# claim verifier. Keep scanning every rules crate and reject every other hit;
-# this is not a crate exemption.
+# What is bounded, and where. The quantities that matter are enforced at the
+# replay layer, not here: `max_neighbor_reads` caps how many frames a tick may
+# pull in and `max_neighbor_staleness_ticks` bounds how old one may be (both in
+# orrery_core/src/replay.rs), and `log::cross_check_neighbor_record` verifies
+# each frame against the neighbour authority's signed claim. This gate restates
+# none of that.
+#
+# What this gate buys is the tripwire: no code starts reading neighbours without
+# a human seeing it. So it checks *where* reads live, by name, against a declared
+# list. It deliberately does NOT count occurrences. A count measures text, not
+# behaviour — one expression can read a hundred neighbours, and a hundred
+# expressions reading one each are identically safe — and a count is satisfied by
+# reformatting, which is exactly how #441 widened the audited predicate to a
+# third entity while the "exactly one site" check still passed. Counting also
+# pushes every future neighbour-reading feature into a single god-predicate,
+# which is harder to review than several small named ones, not easier.
+#
+# Adding a predicate here is a one-line diff a reviewer cannot miss. That is the
+# whole mechanism, and it is honest about being a review trigger rather than a
+# safety property.
+
+# Comment lines are not reads. Matched on the receiver rather than a bare
+# `.neighbor(`: `CellId::neighbor` is an unrelated method on the spatial type,
+# and `view` is the binding every gated `Ruleset::step` gives its `StateView`.
 neighbor_hits=$(grep -nE '\bview\.neighbor\s*\(' "${RULES_SOURCES[@]}" \
   | grep -vE '^\s*[^:]+:[0-9]+:\s*(//|//!|/\*|\*)' \
   || true)
-unexpected_neighbor_hits=$(printf '%s\n' "$neighbor_hits" \
-  | grep -vE '/orrery_games/src/regolith/visibility\.rs:[0-9]+:' \
-  || true)
-if [[ -n $unexpected_neighbor_hits ]]; then
-  echo "$unexpected_neighbor_hits" >&2
-  die 'neighbour read outside the audited Regolith claim predicate (docs/06 §3)'
+
+readonly AUDITED_NEIGHBOR_PREDICATES=(
+  'crates/orrery_games/src/regolith/visibility.rs::verify_claims'
+)
+
+# Staleness first: a declared predicate that no longer exists must report as a
+# stale declaration, not as an undeclared read somewhere else. Renaming the
+# function otherwise produces a message pointing at the wrong problem.
+for allowed in "${AUDITED_NEIGHBOR_PREDICATES[@]}"; do
+  allowed_file=${allowed%%::*}
+  allowed_fn=${allowed##*::}
+  grep -qE "fn ${allowed_fn}\b" "$ROOT/$allowed_file" 2>/dev/null \
+    || die "declared audited predicate '$allowed' does not exist — remove it from AUDITED_NEIGHBOR_PREDICATES or fix the name"
+done
+
+neighbor_violations=()
+while IFS= read -r hit; do
+  [[ -n $hit ]] || continue
+  hit_file=${hit%%:*}
+  hit_rest=${hit#*:}
+  hit_line=${hit_rest%%:*}
+  rel_file=${hit_file#"$ROOT"/}
+  # The enclosing item is the nearest `fn <name>` at or above the hit.
+  enclosing=$(awk -v n="$hit_line" '
+    NR<=n && match($0, /fn [a-z_][a-z0-9_]*/) {
+      name=substr($0, RSTART+3, RLENGTH-3)
+    }
+    END { print name }
+  ' "$hit_file")
+  if [[ -z $enclosing ]]; then
+    neighbor_violations+=("$rel_file:$hit_line: neighbour read outside any function")
+    continue
+  fi
+  declared=no
+  for allowed in "${AUDITED_NEIGHBOR_PREDICATES[@]}"; do
+    [[ "$rel_file::$enclosing" == "$allowed" ]] && declared=yes && break
+  done
+  [[ $declared == yes ]] \
+    || neighbor_violations+=("$rel_file:$hit_line: in undeclared predicate '$enclosing'")
+done <<<"$neighbor_hits"
+
+if (( ${#neighbor_violations[@]} > 0 )); then
+  printf '%s\n' "${neighbor_violations[@]}" >&2
+  die 'neighbour read outside a declared audited predicate — add it to AUDITED_NEIGHBOR_PREDICATES in this file, and say in review why the read is adjudicable (docs/06 §3)'
 fi
-[[ $(printf '%s\n' "$neighbor_hits" | grep -c .) == 1 ]] \
-  || die 'audited Regolith claim predicate must contain exactly one recorded neighbour-read site'
-note 'recorded neighbour reads confined to audited Regolith claim predicate'
+
+note "recorded neighbour reads confined to ${#AUDITED_NEIGHBOR_PREDICATES[@]} declared audited predicate(s)"
 
 echo "$NAME: verifiable-core static gates pass"
