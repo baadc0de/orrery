@@ -266,3 +266,116 @@ consumers, deciding architecture around it is building on an unwired hook
 (G3). H1 is scored as the best *destination candidate*, conditional on the
 pilot and on A5 — not as something to start building Monday.
 
+## 4. Prototype evidence (P1–P5)
+
+Scratch crate at `/tmp/opencode/ecs-probe`, `bevy_ecs = { version = "0.19",
+features = ["multi_threaded"] }` + `blake3`; release profile; x86_64 Linux
+(this workstation). Sources condensed below; full files were disposable and no
+repo code was touched. Version note: bare `bevy_ecs` default features do **not**
+include `multi_threaded`
+(`bevy_ecs-0.19.1/Cargo.toml` `[features] default = ["std", "bevy_reflect",
+"async_executor", "backtrace"]`) — a bare-ECS host is single-threaded unless it
+opts in; full `bevy` turns the feature on via `default_platform`
+(`bevy_internal-0.19.1/Cargo.toml:323-329`). Both configurations were probed.
+
+**P1/P2 — dedicated world runs headless and deterministically; iteration order
+reaches naive hashes; canonical projection neutralizes it.** A `World` plus two
+`Schedule`s (integrate; hash), 2000 entities with `PersistId/Pos/Vel/Hull`,
+600 fixed ticks, integer integration, fresh world per run. Two insertion
+orders of the same semantic population (Fisher–Yates shuffled ids):
+
+```
+P1 order-A: naive=80c75b22.. canonical=d8eb8313..
+P1 order-B: naive=8916fefa.. canonical=d8eb8313..
+P1 verdict: canonical AGREES | naive DIFFERS
+```
+
+Findings: (a) no `App` is needed — `Schedule::run(&mut World)` suffices,
+refuting any "ECS cannot run headless without the engine" claim; (b) hashing
+rows in query-iteration order produces **different hashes for identical
+worlds**, confirming the brief's projection worry concretely; (c) collecting,
+sorting by stable id, then encoding agrees across orders — the mitigation is
+one sort. This is exactly today's witness discipline (G5: per-entity codec
+hash, BTreeMap order) restated for ECS storage.
+
+**P3 — ambiguous schedules: empirical stability proves nothing here.** Two
+systems with conflicting access (`ResMut<Counter>` + `ResMut<Log>`),
+non-commuting ops, 200 fresh worlds per configuration:
+
+```
+P3 ambiguous/single_threaded_executor:      distinct outcomes over 200 runs = 1   (counter=1 log="ba")
+P3 ambiguous/default(multi_threaded):       distinct outcomes over 200 runs = 1   (counter=1 log="ba")
+P3 chained(total-order)/multi_threaded:     distinct outcomes over 200 runs = 1   (counter=3 log="ab")
+```
+
+The honest negative result: on this box, bevy_ecs 0.19.1 executed ambiguous
+systems in the same order every run under both executors. The claim "ambiguous
+schedules flip nondeterministically" is therefore **unevidenced here** — and
+the finding cuts the other way, harder: if repeat testing cannot distinguish
+an ordered schedule from an ambiguous one, *observed stability is not
+evidence of determinism*, and mechanical ordering checks are the only defensible
+basis. That is precisely this repository's existing philosophy (the VC gates
+fail on spelling because symptom-testing misses silent classes of failure;
+`core-gates.sh:4-25`). Bevy itself treats ambiguity as unspecified order, not
+as safe-by-stability.
+
+**P5 — bevy_ecs can mechanically reject ambiguous schedules at build time.**
+Same systems, `ScheduleBuildSettings { ambiguity_detection:
+LogLevel::Error, .. }` (source-verified to exist and default to Ignore,
+`bevy_ecs-0.19.1/src/schedule/schedule.rs:1583-1595`; enforced during
+initialize, `:1253-1261`):
+
+```
+P5 ambiguous schedule: initialize = Err(Elevated(Ambiguity(AmbiguousSystemConflictsWarning(
+                           ConflictingSystems([(SystemKey(2v1), SystemKey(1v1), …)])))))
+P5 chained schedule:   initialize = Ok (builds)
+```
+
+Both directions demonstrated: the guard fires on the bad stage and passes the
+good one. This matters because "what replaces the Bevy gate" (task constraint)
+has a candidate answer that is *mechanical, in-crate, and per-commit* rather
+than aspirational. Whether the bundle — ambiguity detection + projection
+differential test (P2's pattern) + a neighbour-query lint equivalent — equals
+today's structural isolation is A4's (#400) judgement call; this document only
+establishes that the raw material exists and works.
+
+**P4 — extraction/mirror cost, indicative only.** Copying 10k entities'
+`(PersistId, Pos)` rows into a plain Vec each frame, 2000 frames after warmup:
+
+```
+P4 extraction of 10k entities x 2000 frames: 18.32ms total, 9.16 us/frame, 10000 rows/frame
+```
+
+Labelled indicative everywhere it is used: synthetic workload (no archetype
+churn, no fragmentation, no change-detection filtering), one workstation,
+release build. It bounds the two-world overhead question from above at current
+scale — copying is microseconds, not milliseconds — but makes no claim about
+capacity-scale populations or real AOI churn. Per §5's weighting rule, the
+performance dimension carries low weight *because* this is its best current
+evidence.
+
+---
+
+## 5. Weights, justified before anything is scored
+
+Unjustified weights are where predetermined conclusions hide. Each dimension's
+weight is set by three questions: how close is the dimension to the verifiable-
+core value proposition (D9/D10)? How irreversible is getting it wrong? And how
+good is the available evidence? Weights sum to 100; scores are integers 0–5.
+A dimension whose evidence base is weak carries low weight **by rule**, so an
+unevidenced fear cannot vote a variant down and an unevidenced hope cannot
+vote one up.
+
+| # | Dimension | Weight | Why this weight |
+|---|---|---|---|
+| 1 | Witness & adjudication fit | **20** | The strike pipeline is the product differentiator (D9/D10): shipped, nightly-measured, and the reason peers can distrust authorities. Getting it wrong is the least reversible failure on the board — wrongful strikes end sessions; missed cheats end trust. It also has the strongest evidence base (G5/G6 + A1 M6/M8). Highest weight, highest confidence |
+| 2 | Determinism enforceability | **16** | The four-platform matrix and golden corpus are permanent regression harnesses; the repo's stated philosophy prefers mechanical enforcement over empirical stability (§4 P3 is fresh proof of why). Second-highest because violations surface late and far from their cause |
+| 3 | Migration risk & continuity | **14** | No-flag-day is a brief principle (`ruleset-ecs-migration-brief.md:614`); P0–P4 gates are permanent harnesses; G15 banks hours over four crates until #329 exits; and G7 limits what goldens can prove about parity, raising migration verification cost. High but below 1–2 because the temporal blocker expires by construction |
+| 4 | Modularity & growth headroom | **12** | The brief's actual motivation. Weighted mid-high because the epic exists to prepare for growth — but capped, because the growth itself is speculative: one production game, a catalogue of two (G12 context; A1 §4.4). A score here leans on projection more than measurement |
+| 5 | Client-stack integration (lightyear/replicon/aeronet) | **10** | Real shipped stack (G13); friction converts directly into PRs and risk. Mid weight: differences between variants are one mirror hop or none, and P4 suggests the hop is cheap at scale |
+| 6 | Services & backend neutrality | **8** | persistd's zero-bevy property is valuable and currently free (G10). Low-ish weight because *every* variant can preserve it — variance between variants is small, so the decision barely moves on it |
+| 7 | Unreal sidecar & embedding optionality | **6** | Irreversible-if-wrong argues for weight; absence of any consumer argues against: the requirement is imported and unverifiable in-tree (A1 §9 #10). Mid-low, held at 6 rather than lower purely because retrofitting an output contract later is the expensive direction |
+| 8 | Performance & copy/mirror cost | **6** | Weighted by the evidence rule: the best available number is an indicative microbench (P4). An unevidenced slowness claim must not sink V2/V3/H1, and an unevidenced speed claim must not crown them |
+| 9 | Compile-time & build complexity | **4** | bevy_ecs is already in the workspace graph; kache mitigates rebuild cost; A1 found zero timing evidence either way (§11.2). Low weight, low confidence |
+| 10 | Testability & contributor ergonomics | **4** | Real but soft; folded-in residual dimension with modest expected variance |
+
