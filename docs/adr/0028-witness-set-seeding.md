@@ -632,6 +632,21 @@ submitted for this cell", not "pick seven neighbours".
   exclusion is only as good as the account↔NodeId map, which lives in `id/`
   and has no writer. A colluder attesting from a second NodeId of the same
   account that is *not* connected to this coordinator is not excluded.
+
+  > *Erratum (2026-08-25, #210/#234):* "has no writer" is stale. The writer
+  > exists: `FdbAccountStore::bind`
+  > (`crates/orrery_identity/src/fdb.rs:353`, landed by #210) writes the
+  > `id/da` account row, the `id/db` reverse binding, the versionstamped
+  > `id/dh` history event and the `id/dw` rate window in one FoundationDB
+  > transaction, over the keys #234 landed in `orrery_persistd::keyspace`.
+  > What the map still lacks is a live **caller**: the only non-test call
+  > path is `redeem_invite` (`crates/orrery_identity/src/invite.rs:497`), a
+  > library function no deployed binary or endpoint invokes — the
+  > `orrery-invite` binary mints offline against a local ledger and never
+  > binds. In a running cluster the subspace is therefore still empty, and
+  > the rest of this bullet stands unchanged: a colluder attesting from a
+  > second NodeId of the same account not connected to this coordinator is
+  > still not excluded.
 - **Capability lost relative to `docs/07:156`: tick alignment is not
   verifiable at the gateway.** Epoch boundaries may still be tick-aligned
   coordinator-side, but the gateway judges the window on its own monotonic
