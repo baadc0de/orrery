@@ -201,3 +201,110 @@ scenario is currently sensitive to it — the Regolith goldens pass under the
 reversed order. The golden holds the clause; a composition-specific unit
 check would pin it directly and is left as a suggestion, this being a
 docs-only record.
+
+### (e) C-2 — a per-entity emission cap whose overflow is a flag in witnessed state, not a failure
+
+A6 §9 proposed the cap and offered two postures: fail the tick loudly
+through a new canonical error path, or treat overflow as a
+stage-1-style flag on an otherwise-completed tick. **The owner has chosen
+the flag.** The clause, and the consequences that make the choice mean
+something:
+
+1. **The cap binds; flag posture is not unbounded emission.** A per-entity
+   per-tick emission cap, kernel-checked at the close of S2 where the step's
+   `StepOutput.events` is in hand: the first `MAX_EVENTS_PER_STEP` events in
+   emission order are kept, and the suffix beyond the cap is **dropped,
+   deterministically, and the drop is recorded** per sub-clause (2).
+   Emission order is deterministic (`ruleset.rs:196`), so "the first N" is
+   the same N on every honest host. A6's own warning is the thing this
+   sub-clause defends against: "truncation is deterministic and therefore
+   invisible" — *silent* truncation is the failure. Flagged truncation is
+   truncation the evidence pipeline can see.
+2. **The flag reaches witnessed state, or it proves nothing.** The reasoning
+   is [D43](f)(3)'s, applied unchanged: a flag outside the hashed projection
+   lets two hosts diverge — one flagged, one not — while `hash(e, t)` still
+   matches, and the flag proves nothing precisely when it matters. Therefore
+   the overflow record is a **per-entity discrete field of canonical
+   state** — a saturating dropped-event counter (or occurrence bit;
+   implementation's choice of width, not of location or distinctness) —
+   written before S4, so that under R7's projection rules
+   (`docs/plans/a7-persistence-rollback-witnessing.md` §5) it sits inside
+   `bytes(e,t) = CoreCodec::encode(quantize(state(e,t)))` and hence inside
+   `hash(e,t)` — the value a `StateClaim` commits to (WP-1). It is an
+   integer, so S4 quantization is the identity on it and ring-2 comparison
+   is exact (discrete axis; no band applies). By WP-3's one-sentence
+   property, a flagged entity is flagged identically in the at-rest row, the
+   replicated state, and every witness re-execution.
+
+   **This is not [D43]'s arithmetic-overflow field, and the two must stay
+   distinguishable.** [D43](f)(3) established a per-entity discrete field
+   for *arithmetic* overflow, set by the rule's own operations during S2.
+   Emission overflow is a different occurrence class with a different
+   author: it is detected by the **kernel** at S2's closing edge, after the
+   rule has returned, and it attributes a different defect (a rule emitting
+   past its budget, not an arithmetic boundary). Collapsing both into one
+   undifferentiated bit would make "why is this entity flagged"
+   unadjudicable without re-execution archaeology. The two fields follow the
+   same placement law (discrete, canonical, inside the claimed bytes) and
+   may share a container word; they may not share a meaning. One
+   consequence is acknowledged rather than hidden: the kernel writing a
+   canonical state field at the close of S2 is a deliberate, narrow
+   extension of A6 R4 ("own-state writes are the only immediate writes") —
+   the cap is kernel law exactly as the intent admission caps are, and the
+   write is an own-state write performed on the entity's behalf at its own
+   step boundary, visible to no other entity that tick. No new stage
+   boundary is created (clause (c)).
+3. **Steps still cannot fail, and this clause is why they still cannot.**
+   Choosing the flag preserves an existing structural property: there is no
+   canonical error path today (Context §4), and this record **declines to
+   create one**. That is a named benefit, not an accident — a fail-loud
+   overflow would have handed any rule (or any attacker who can provoke a
+   rule into emitting) a way to abort a tick, and [D43]'s alternatives
+   record rejected the panic posture for arithmetic on the same ground: a
+   loud failure in S2 takes the entity, and under a shared schedule the
+   tick, down with it. The flag keeps the simulation running and the
+   occurrence adjudicable. Arithmetic overflow and emission overflow are
+   different questions — one is about what a value means at a type boundary,
+   the other about volume — but the *flag-must-reach-witnessed-state*
+   reasoning and the *no-canonical-abort* reasoning are genuinely common to
+   both, and this record aligns with [D43] on exactly those two points and
+   no further.
+4. **Both honest parties flag identically on the same log, so adjudication
+   is unaffected.** A6 argued this for fail-loud ("both honest parties fail
+   identically on the same log"); it holds at least as well under the flag.
+   The emission list is a pure function of `(own state, sealed inputs,
+   TickRng)` — all committed before the step runs — so every honest
+   re-execution produces the same events in the same order, truncates the
+   same suffix, writes the same flag value, and computes the same hash. A
+   *dishonest* authority that skips the cap diverges at its own emitter-side
+   hash: not truncating means not setting the flag field, and the flag is
+   inside the claimed bytes, so its claim disagrees with every honest
+   re-execution of the same log and the ordinary deviation pipeline
+   adjudicates it. Stated honestly rather than assumed: this catches the
+   *emitter*. Whether an over-cap emitter's excess *deliveries* are
+   independently caught at the target is a routing-verification question,
+   and A6's mutation log shows routing correctness is currently
+   golden-pinned only (M-A6-3) with the witness shown-ticks re-delivery
+   immunity pinned by no named check at all (M-A6-4a) — this record relies
+   on the emitter-side hash, which the flag placement makes sufficient, and
+   does not claim target-side coverage that the evidence says is not there.
+5. **The constants are the owner's, and they live in R8's registry.**
+   `MAX_EVENTS_PER_STEP` **default 64**, mirroring `MAX_OPS_PER_INTENT = 64`
+   (`crates/orrery_persistd/src/intent/mod.rs:189`, re-verified), is
+   recorded as a **proposal the owner tightens or loosens** (a11 OD-28) —
+   not a settled number; no shipped ruleset is within an order of magnitude
+   of it. The constant is canonical law (changing it changes which logs
+   flag, so it rides the same versioning discipline as any rules change) and
+   its storage belongs to R8's manifest/registry work, as A6 §12 assigned.
+   Two companions, adopted with the same status: a **delivery-queue bound**
+   derived from the emission cap times the island's entity population —
+   overflow of the *host's* queue is a host bug, asserts in debug builds,
+   and is never canonical state; and the existing envelope bounds stand
+   (diagnostics stay uncapped but sampled; persistence is already bounded at
+   the FDB envelope, `intent/mod.rs:184-188`).
+
+Nothing in sub-clauses (1)–(2) exists in code today; unlike clauses (a)–(d),
+**C-2 is the genuinely new surface of this record** and is
+normative-forward: implementation is post-P4 work, it widens canonical
+state, and it lands under the same cost accounting [D43] recorded for its
+flag (Consequences below).
