@@ -385,3 +385,42 @@ needing replay semantics at all.
    attempted on this docs-only branch; unevidenced either way.
 3. **When clause (f)'s removal lands.** Post-P4-digest and post-registry by
    this record; the date is the owner's.
+
+## Verification appendix — what was re-run at acceptance
+
+All on this tree (branch `docs/adr-0045-r4`, based on `1c725704`),
+2026-08-25. Mutations lived for one run each; every revert re-ran the check
+and passed; the working tree was verified clean after each.
+
+| Check | Result |
+|---|---|
+| `rg classify_component` over crates and gates | Defaulted method `ruleset.rs:298` + three overrides (`regolith/mod.rs:129`, `skirmish/mod.rs:186`, `conformance/ruleset.rs:242`); **zero call sites** |
+| `rg "Reflect"` over `crates/*/src` | zero matches |
+| `bevy_reflect` Cargo entries | exactly three: `orrery_spatial/Cargo.toml:27`, `orrery_net/Cargo.toml:24`, `orrery_persist_client/Cargo.toml:33` |
+| MV-1 (IV-4's uplink guard): `feed_uplink`'s `LocallyAuthoritative` clause (`feed.rs:66-68`) neutralized | Named check died: `feed::tests::local_granted_without_marker_is_not_uplinked` FAILED, `95 passed; 1 failed`. Revert: `96 passed; 0 failed`. The #427 fix (commit `9aae34f9`) holds; A5's X2 gap is closed |
+| MV-2 (IV-8's fail-closed migration): `migrate_bag` made to `continue` past undeclared components (`crates/orrery_persistd/src/migration.rs:80-85`) | Named check died: `migration::tests::missing_registration_refuses_stale_checkpoint` FAILED, `5 passed; 1 failed`. Revert: `6 passed; 0 failed` |
+| MV-3 (IV-7 / G-1, A9's M3 re-run): `entity.to_bits().to_le_bytes()` appended to the `DiffUplink` payload in `feed.rs` | **Survived**: `cargo test -p orrery_persist_client` all green (`96/2/2/1 passed, 0 failed`; one empty suite `0 passed; 0 filtered out`, read and not counted), `./scripts/core-gates.sh` exit 0, no named check exists. Reverted; clean check; tree clean. G-1 confirmed live post-#427 |
+| P4 pipeline trees | `scripts/p4-ledger.sh:409-414`: `crates/orrery_witness`, `crates/orrery_core`, `crates/orrery_games`, `gates/p1-swarm`. No mutation above touched any of the four |
+| docs/06 stale consumer prose | `docs/06-verifiable-core.md:210` and `:60`, verbatim as characterized |
+| `(entity, tick)` last-writer-wins under lease fencing | `crates/orrery_protocol/src/gateway.rs:367-369`; `lease_id` at `:388-389`, filled at `feed.rs:93` |
+
+Citation drift found while verifying (recorded here rather than silently
+repeated): A5 §5 cites the uplink feed's guard at `feed.rs:66-69` and the
+`DiffUplink` construction at `feed.rs:82-97`; after #427 those sit at
+`feed.rs:66-68` and `:85-96`. A5 cites `DiffUplink.lease_id` context at
+`gateway.rs:386-392` in persistd; the struct (and its `lease_id` field)
+actually live in `crates/orrery_protocol/src/gateway.rs:371-393`, and the
+persistd-side lease checks have drifted to `gateway.rs:3239`/`:3324`. A5
+cites the anti-dupe row at `persist.rs:190-198`; the sentence is at
+`persist.rs:185-186`. A5 cites `replay.rs` and `adjudication.rs` without
+crates; they are `crates/orrery_core/src/replay.rs` and
+`crates/orrery_persistd/src/adjudication.rs` (not `orrery_witness`). Every
+claim survived its drift; only the coordinates moved.
+
+[D7]: 0007-authority-and-leases.md
+[D9]: 0009-verifiable-core.md
+[D10]: 0010-witnessing.md
+[D11]: 0011-persistence.md
+[D38]: 0038-at-rest-schema-versioning.md
+[D42]: 0042-canonical-simulation-architecture.md
+[D43]: 0043-determinism-envelope-and-gate-replacement.md
