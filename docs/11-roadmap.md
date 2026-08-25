@@ -1240,8 +1240,11 @@ No ADR numbers are claimed. In rough order of when they bite:
 the roadmap's open-questions row requires the economy auditor "live before
 enforcement is fully on" with a P5-exit decision date, but D20's bounded
 journal means the *full-history* sweep cannot exist before P6's archive
-tailer — only the hot-ledger incremental can meet the P5 date, and the row
-does not say so; P6's criterion as written exercises neither the chaos suite
+tailer — only the hot-ledger incremental can meet the P5 date; the row now
+records that split (#245), and what stays open with the owner is whether
+D32 (g)'s "start cadence" parenthetical binds both halves or is satisfied by
+the incremental alone — moot unless C3 is pulled forward of P6; P6's
+criterion as written exercises neither the chaos suite
 nor admission control (addressed in §B1); and the P5/D29 placement of the
 field-host witness mode is contradictory as described in item 3.
 
@@ -1276,7 +1279,7 @@ Expands D17. Likelihood/impact: L/M/H. "Trigger" = the early-warning signal that
 |---|---|---|
 | **Cross-island consistency for fast travelers** — island merge latency when a player outruns coordinator merge/drain | Instrument island merge/drain latency from the P1 coordinator stub; prototype *corridor pre-merge* in P3: coordinator predicts trajectory from coarse presence and pre-warms destination-island connections (dial-ahead) before arrival, so the traveler joins an already-connected set; fall back to a brief interpolation-only window (no interaction) on arrival if pre-merge missed | P3 exit |
 | **Parked-cell catch-up semantics** — lazy (on next load) vs. scheduled background simulation | Ship lazy catch-up as the P2/P3 default (matches D7's "optional lazy catch-up on next load"); measure catch-up wall-time distribution vs. parked duration from archive data; if p99 catch-up threatens the < 50 ms first-page-in budget, add scheduled catch-up on `orrery_field_host` (it already links the `Ruleset`, D15) for cells parked > threshold | P6 entry |
-| **Economy-wide invariant auditing cadence** — how often to sweep for conservation violations the per-intent checks can't see | Build the auditor as a journal-archive consumer (the event source already exists, D11); start with a daily full conservation sweep + hourly incremental over hot ledgers; calibrate cadence from measured archive scan cost and time-to-detection targets. Must be live before enforcement is fully on — post-hoc-only correction is the documented GTA Online failure | P5 exit |
+| **Economy-wide invariant auditing cadence** — how often to sweep for conservation violations the per-intent checks can't see | Build the auditor as a journal-archive consumer (the event source already exists, D11); calibrate cadence from measured archive scan cost and time-to-detection targets ([#224]). Its two halves have different prerequisites, and P5 exit requires only the first: the **hourly incremental over hot ledgers** reads current ledger state and needs no archive (shipped: #330); the **daily full conservation sweep** needs history beyond the release floor of the [D20](adr/0020-journal-retention.md)-bounded journal, which exists only where P6's archive tailer has put it. "Must be live before enforcement is fully on" — post-hoc-only correction is the documented GTA Online failure — is made checkable by [D32](adr/0032-enforcement-ramp.md) clause (g): the auditor gates C3's promotion review alone, and C3 lands in P6 beside the tailer (see the P6 deliverables), so full liveness is a P6 obligation, not a P5-exit one | P5 exit |
 | **`Ruleset` distribution to cluster** — games recompile `persistd`: acceptable? | **Resolved at P2 exit by [D21](adr/0021-ruleset-distribution.md).** Link-time composition is the answer for 1.0 and the harness API is frozen: a breaking change to `orrery_persistd`'s composition seams now needs an ADR. WASM sandboxing is rejected on determinism and adjudication cost for a modding scenario no launch title needs, and D21 names the three concrete demands that would reopen it | ~~P2 exit~~ **closed** |
 
 ## Cross-references
