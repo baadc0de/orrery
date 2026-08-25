@@ -1,7 +1,7 @@
 use bevy::prelude::*;
 use orrery_predict::OrreryPredictPlugin;
 use orrery_regolith_client::{
-    admission::{resolve_admission_url, AdmissionPlugin},
+    admission::{resolve_admission_url, retry_pending_uploads, AdmissionPlugin},
     campaign::CampaignConfig,
     session::{require_campaign_consent, ConfiguredImpairment, CONSENT_NOTICE},
     RegolithSkinPlugin,
@@ -61,6 +61,7 @@ fn main() {
     let telemetry_path = flag_value(&args, "--telemetry-jsonl")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("target/regolith-client/session.jsonl"));
+    retry_pending_uploads(&telemetry_path);
     let admission_url = resolve_admission_url(&args, std::env::var("ORRERY_ADMISSION_URL").ok());
 
     let smoke_ticks =

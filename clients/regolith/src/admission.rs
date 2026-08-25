@@ -200,8 +200,6 @@ impl AdmissionPlugin {
 
 impl Plugin for AdmissionPlugin {
     fn build(&self, app: &mut App) {
-        let upload_state_path = upload_state_path(&self.telemetry_path);
-        retry_pending_uploads(upload_state_path);
         app.insert_resource(AdmissionSettings {
             origin: self.origin.clone(),
             telemetry_path: self.telemetry_path.clone(),
@@ -925,7 +923,9 @@ fn post_upload(origin: &str, session_id: &str, body: &[u8]) -> Result<(), String
     }
 }
 
-fn retry_pending_uploads(state_path: PathBuf) {
+/// Retry exact, unacknowledged upload bodies from earlier runs in the background.
+pub fn retry_pending_uploads(telemetry_path: &Path) {
+    let state_path = upload_state_path(telemetry_path);
     std::thread::spawn(move || {
         let mut state = read_upload_state(&state_path);
         let pending: Vec<_> = state
