@@ -32,7 +32,7 @@ policy), and cites all three rather than restating them.
 Out of scope, each with its owner: the rollback unit, grain, window and
 budget (D47); capability classes and their fail-closed defaults ([D45]);
 identity classes and allocation (D44); message semantics — delivery, dedup,
-idempotency, replay of events (D46); the determinism envelope and gate
+idempotency, replay of events ([D46]); the determinism envelope and gate
 membership ([D43]); manifests, and **where `projection_version` is stored**
 — this record defines the axis, R8 (A8/#404) stores it in the manifest beside
 `RulesetId` and the schedule digest. Nothing here schedules work inside the
@@ -290,7 +290,7 @@ between bag fields and build digest — survives in the amended text.
    [D45] Open questions item 1, owner's call there. Until one lands, WP-5
    is review-held at the projection boundary.
 2. **Whether event commitments enter `StateClaim`** (OD-27) — a protocol
-   change with claim-size and D46 interplay, the owner's door.
+   change with claim-size and [D46] interplay, the owner's door.
 3. **Where `projection_version` lives on the wire and at rest** — R8's
    manifest work; this record deliberately fixes only the axis and the
    bump rule.
@@ -319,3 +319,4 @@ passed; the working tree was verified clean after.
 [D42]: 0042-canonical-simulation-architecture.md
 [D43]: 0043-determinism-envelope-and-gate-replacement.md
 [D45]: 0045-per-component-capability-policy.md
+[D46]: 0046-message-class-semantics.md
