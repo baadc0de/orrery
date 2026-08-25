@@ -308,3 +308,111 @@ journal+checkpoint hybrid, P2 through the intent envelope, R1 through the
 ring, W2 through frames/claims — and "the module system must not let modules
 bypass transactional persistence invariants" (brief) is exactly A5's IV-3
 plus A2 row 4's envelope ownership, already argued there.
+
+---
+
+## 5. Decision: the canonical witness projection
+
+A4 and A5 both reserved "the canonical witness projection format" here. The
+format below is written to be *already true* of the current tree (so
+adopting it costs nothing today) and *binding* on any future host (so the
+pilot cannot drift). Plain math first, rules after.
+
+The projection of one entity `e` at tick `t`:
+
+```text
+bytes(e, t)  = CoreCodec::encode( quantize( state(e, t) ) )     # declared codec, fixed field order
+hash(e, t)   = blake3( bytes(e, t) )                            # the value a StateClaim commits to
+```
+
+The chain a claim window folds (what `input_head` anchors, docs/06 §6):
+per-entity, per-tick, over the entity's logged inputs — state hashes are
+committed by claims, inputs by the chain; the two meet at `verify_bundle`.
+
+Multi-entity aggregates, wherever one is ever needed (corpus chains, a
+checkpoint digest, any future world digest):
+
+```text
+world_digest(t) = blake3( concat( for id in sort_ascending(ids):  id ‖ bytes(id, t) ) )
+```
+
+### 5.1 The rules (proposed as normative)
+
+- **WP-1 — the unit of witness commitment is one entity-tick.** Claims,
+  frames, bundles and replay all address `(PersistId, Tick)`; nothing
+  commits to a multi-entity hash on the wire. This is today's shape (I2,
+  I13) kept deliberately: it is what makes single-entity adjudication, the
+  witness's one-executor-per-watched-entity model
+  (`witness.rs:406-421` per A1 §5.3), and R-1's per-entity restore all
+  consistent with each other.
+- **WP-2 — entity order is `PersistId` ascending; cross-grid,
+  `(GridId, PersistId)` ascending.** Any enumeration of entities that feeds
+  bytes into a hash, a golden, a fixture or an emitted artifact sorts first.
+  This is A5 N-2.3 restated as the projection's ordering clause, and it is
+  the exact mitigation all three iteration-order probes validated (I3).
+  Today's executor satisfies it structurally (`BTreeMap` keys; `entities()`
+  documents "in `PersistId` order", `executor.rs:97-100`).
+- **WP-3 — component order is `ComponentTypeId` ascending, each slot framed
+  `(ComponentTypeId, SchemaVersion, payload)`.** Today a `CoreState` is one
+  declared codec and this clause is vacuous for it; it binds the day state
+  becomes per-component (A3 T1 is precisely that trigger). The framing is
+  the at-rest bag's shape (`orrery_persistd/src/schema.rs:48-66`) so the
+  witness projection and the persistence encoding cannot diverge — "a claim
+  commits to exactly what replication and persistence saw" stays one
+  sentence with one meaning.
+- **WP-4 — quantize before hash, always** (VC-7; A4 stage rule S4 ≺ S5).
+  Note honestly: mutation X-C (§10) shows this ordering is currently
+  **unpinned by any test** — it survives because every in-tree state stores
+  continuous fields as lattice integers already. The clause stays; the
+  missing test is named in §10.
+- **WP-5 — no engine artifact may reach the projection.** No `Entity` bits,
+  `ComponentId`s, `FnsId`s, archetype or row indices, reflection names, and
+  no bytes produced by iterating any world container (A5 IV-7/N-6). For the
+  executor store this is structural (the defining crates are gate-held
+  Bevy-free, A5 §2.2); for a world-hosted store it is exactly what A4's
+  E-M3 differential harness must prove per commit.
+- **WP-6 — the projection is versioned.** A `projection_version` integer,
+  bumped on any change to WP-2/WP-3 framing, carried in the manifest (format
+  A8's) beside `RulesetId` and the schedule digest. Today's value is 1 and
+  describes the shape above. Without this, a projection change would
+  present as mass deviation — the false-conviction failure IV-2 names.
+
+### 5.2 Why this is shown order-immune rather than assumed
+
+The acceptance bar was: no reliance on raw ECS world serialization without
+evidence that archetype order, component insertion order, entity allocation
+order and hash-map iteration cannot reach the hash. The evidence, by store:
+
+- **Current store — immunity is structural.** Nothing iterates a container
+  into `hash(e,t)`: the input is one entity's own state (I2), and the one
+  map in the path is keyed `BTreeMap` whose order is `PersistId` by type
+  (I1). Hash-map iteration cannot reach gated sources at all (VC-4 clause,
+  mutation-proven A1 M3).
+- **World-hosted store — immunity is a per-commit proof obligation, with
+  the hazard demonstrated and the mitigation demonstrated.** Three
+  independent probes reproduced insertion-order-dependent query iteration on
+  the pinned `bevy_ecs 0.19` (I3); the same three showed the WP-2 sorted
+  projection agreeing across permutations (A3 P1/P2 "canonical AGREES |
+  naive DIFFERS"; A4 E-2 one hash across six executor/order cells). The
+  named check is A4's E-M3 (`projection-order-permuted` corpus case):
+  permuted insertion orders must produce equal sorted-projection hashes
+  *and* match the executor-computed chain. Per A4 Tier H, that harness is a
+  precondition of admitting the host, not a follow-up.
+- **The stability trap is refused.** Observed agreement of a *naive*
+  projection across runs proves nothing (A3 P3: 200/200 stable and still
+  unspecified); E-M3 therefore deliberately asserts nothing about naive
+  folds. This document inherits that discipline: WP-2 is the rule because
+  sortedness is provable; stability is not.
+
+### 5.3 What the projection excludes, said once
+
+Excluded from witness bytes, each with its class: presentation and cosmetic
+state (P0/W0 by default — A5's zeros fail closed); `EphemeralId` entities
+(structurally unpersistable, A5 IV-4/X1); materialization descriptions
+(`ruleset.rs:280-284` — own-state traces carry what matters); lightyear ring
+contents and `VisualCorrection` residuals (presentation tier, I12);
+`UplinkSeq` counters and every other in-memory index (A5 N-2.2: rebuildable
+projections are never encoded). Events are excluded from *claims* today and
+this document does not move them onto the wire — the event fixture chain
+(§6) is a test instrument; putting event commitments into `StateClaim` would
+be a protocol change and is flagged to the owner, not proposed.
