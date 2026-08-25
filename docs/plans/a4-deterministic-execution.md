@@ -1,6 +1,6 @@
 # A4 — Deterministic ECS execution and the Bevy-gate replacement (#400)
 
-**Status:** decision node for the #395 planning tree · **Date:** 2026-08-26 ·
+**Status:** decision node for the #395 planning tree · **Date:** 2026-08-25 ·
 **Tree:** `docs/400-a4` at `a7fc7f2d` · **Parents:**
 [#400](https://github.com/baadc0de/orrery/issues/400) ←
 [#395](https://github.com/baadc0de/orrery/issues/395) · **Builds on:**
@@ -136,7 +136,7 @@ the classes an ECS-hosted future adds or sharpens.
 
 | # | Threat | Mechanism of divergence |
 |---|---|---|
-| **T1** | **Unordered container iteration** | A `HashMap`/`HashSet`'s per-process randomized iteration order reaches observable behaviour — event emission order, a fold feeding state bytes, an input queue — so two runs of one binary disagree. The reason VC-4 exists (core-gates.sh:8-11). |
+| **T1** | **Unordered container iteration** | A `HashMap`/`HashSet`'s per-process randomized iteration order reaches observable behaviour — event emission order, a fold feeding state bytes, an input queue — so two runs of one binary disagree. The reason VC-4 exists (core-gates.sh:9-11). |
 | **T2** | **Storage-order dependence (ECS class)** | Query iteration order in `bevy_ecs` follows archetype/table layout, hence insertion and structural-mutation history. Any projection that hashes or emits rows in query order produces world-history-dependent output from world-identical states. Demonstrated by both A3 prototypes and reproduced here (§9 E-3: naive forward `f6a3…` vs scrambled `d243…`). |
 | **T3** | **Ambiguous system ordering** | Two systems with conflicting data access and no explicit ordering edge have *unspecified* relative order. Bevy's own build diagnostics treat this as ambiguity, not safety. The dangerous part is epistemic: ambiguous schedules can execute identically hundreds of runs in a row (A3 P3: 200/200 stable on its box), so observed stability is not evidence — only mechanical rejection is. |
 | **T4** | **Ambient inputs** | Wall clock, monotonic clock, entropy sources, environment variables, filesystem reads, address/pointer hashing, allocation-order-derived identity — anything whose value differs across processes or machines entering a step. VC-8's list (core-gates.sh:103-105); identity clause separately pinned at ruleset.rs:272-278. |
@@ -144,7 +144,7 @@ the classes an ECS-hosted future adds or sharpens.
 | **T6** | **RNG misuse** | A stream shared across entities (draw order becomes semantics), a stream seeded from anything but `(universe_seed, entity, tick)`, reseeding mid-tick, or draw-count dependence on data-dependent branches making replay draw differently. VC-3's ownership rules exist for all four. |
 | **T7** | **Event and observer ordering** | Multiple producers emitting into one buffer without a total producer order; immediate observer/hook cascades whose recursion depth and interleaving are unspecified; dedup/idempotency applied in unspecified order. Emission order is determinism (ruleset.rs:196-201), so any delivery path that can reorder emissions breaks it. |
 | **T8** | **Deferred structural-change application order** | Spawn/despawn/component-insert commands deferred to a sync point apply in whatever order they were queued — which is deterministic only if the queuing order is. Colliding inserts need a stated winner rule. Today's executor answers both: description order = emission order, first writer wins (executor.rs:144-157). An ECS host must pin the same two things. |
-| **T9** | **Async work escaping the tick** | Tasks spawned inside canonical execution that complete during or after later ticks; I/O performed mid-schedule; futures holding `&mut World` across await points. Completion order of concurrent tasks is scheduling-dependent. Today structurally impossible (no async runtime in `orrery_core`; Cargo.toml:9-12 "no Bevy, no tokio"). |
+| **T9** | **Async work escaping the tick** | Tasks spawned inside canonical execution that complete during or after later ticks; I/O performed mid-schedule; futures holding `&mut World` across await points. Completion order of concurrent tasks is scheduling-dependent. Today structurally impossible (no async runtime in `orrery_core`; orrery_core/Cargo.toml:8). |
 | **T10** | **Cross-entity same-tick reads** | Reading another entity's current-tick state makes results depend on processing order. Banned today by snapshot isolation plus the neighbour gate; under ECS storage, join-style queries make the same hazard expressible silently. |
 | **T11** | **Engine and dependency drift** | A dependency upgrade changes scheduler internals, entity allocation strategy, message-buffer semantics, or float library behaviour without any source change. D14 pins versions; the missing half is detecting *semantic* drift that survives identical source — answered by goldens + schedule digest (§3.10). |
 | **T12** | **Build-profile divergence** | Identical source, different profiles, different outcomes. Concrete on this tree today: `i32::MAX + 1000` panics under dev (`overflow-checks = true`, cargo default) and wraps to `-2147482649` under release (§9 P-OV). Any canonical integer arithmetic that can overflow diverges by profile unless the policy is explicit. Float contraction differences add the same risk to continuous math. |
@@ -283,8 +283,8 @@ roles, not crates-that-exist-today.
 ### 3.9 Async prohibitions
 
 Canonical execution is synchronous end-to-end within a tick: no async runtime
-in the canonical graph (true today by Cargo.toml comment, kept as a gate
-clause in §5); no task spawned during S0–S7 that outlives the schedule run;
+in the canonical graph (true today: orrery_core/Cargo.toml:8, kept as a
+gate clause in §5); no task spawned during S0–S7 that outlives the schedule run;
 no I/O inside canonical stages — the outside world enters as sealed inputs
 (S0) and leaves as events/frames (S7+). Presentation worlds and network
 pumps live entirely outside the host seam.
@@ -339,7 +339,281 @@ witnessing (E-M13) is the runtime backstop when everything upstream failed or
 was lied about. No single layer is trusted alone — that is the existing
 philosophy (core-gates.sh:22-25) carried forward.
 
-<!-- a4-section-5 -->
+---
+
+## 5. The replacement for the Bevy-in-dependency-graph gate
+
+### 5.1 What clause 1 actually enforces today
+
+The property is real: *no engine in the graph of a crate whose code the
+adjudicator re-executes*, because "the same build links into peers, field
+hosts and persistd" (ruleset.rs:3-6) is what makes verdicts portable. The
+mechanism is `cargo tree -p $crate | grep -qi bevy` over three typed names
+(core-gates.sh:37, :71-75).
+
+The mechanism's coverage, however, is exactly its list. §1.2 verified the
+witness-shaped escape (530 bevy refs, gate green), and the same shape applies
+to every future crate: an `orrery_sim_host` carrying bevy_ecs tomorrow passes
+today's gate exactly as orrery_witness does today. **A weaker gate that
+passes is worse than this one** (epic constraint) — but so is an equally
+strong gate that watches less than it appears to.
+
+### 5.2 The proposed replacement: two tiers, role-keyed membership
+
+**Tier V — verifiable core.** Crates whose sources define or implement
+canonical rules execution get the full existing battery unchanged: bevy-free
+graph, VC-4, VC-6, VC-8, neighbour ban. What changes is membership:
+
+- *Discovery scan:* walk workspace crates; strip whole `#[cfg(test)]`
+  modules by brace counting; flag any crate containing `trait Ruleset` or an
+  `impl … Ruleset for` site (qualified paths included). Discovered set ∪
+  declared set = scanned set.
+- *Cross-check both ways, two-source by construction:* an impl-bearing crate
+  that was not scanned fails ("undiscovered ruleset crate — add it to the
+  gate or justify"); a declared crate with no impl site fails as stale.
+  Neither side can pass by agreeing with itself, the same property
+  check.sh --self-test relies on for the workspace table.
+
+Prototype evidence (§9 E-D1/E-D2): on this tree the discovery reproduces
+exactly `{orrery_core, orrery_games, orrery_conformance}` — including
+excluding persistd's test-only macro impl (src/adjudication.rs:771, inside
+`#[cfg(test)] mod tests` at :748) and core's own cfg-test executor impls —
+while catching a synthetic new `impl Ruleset` crate that the typed list
+misses.
+
+Known implementation wrinkles found while prototyping, stated rather than
+hidden: (a) item-level `#[cfg(test)]` annotations (vs module-level) need the
+stripper extended — fail-loud-and-fix-the-scanner is the right response to a
+false positive, never narrowing the pattern; (b) qualified-path impls must be
+matched (my first prototype missed them; §9 E-D1 records the fix); (c) the
+scanner greps text, so a crate could evade by constructing the trait name
+dynamically — accepted residual risk, identical in kind to every grep gate
+here, backstopped by symptom tests.
+
+**Tier H — host machinery (exists only if A3's trigger T3 ever fires).** A
+crate hosting canonical state in a `bevy_ecs::World`:
+
+- must appear on an explicit, review-required host allowlist (no discovery
+  here: hosting ECS is always a decision);
+- may depend on `bevy_ecs` only — `bevy_app`, `bevy_internal`, `bevy_time`,
+  full `bevy` remain hard failures (keeps SubApp-style app coupling out per
+  second-opinion E-9);
+- inherits the full Tier V source battery over its canonical modules;
+  additionally bans tokio/async-std (T9) and any RNG construction outside
+  `tick_rng` (T6);
+- must carry E-M2's canary test and E-M3's projection differential harness,
+  wired into CI like the corpus;
+- must expose single-entity step semantics to witnesses/adjudication — the
+  per-entity replay contract (A3 E-8 / second-opinion E-8) is not renegotiable
+  at this node; the rollback unit itself stays A7's.
+
+Until a trigger fires, Tier H is empty and the tree is exactly Tier V plus
+the unchanged witness adapter situation.
+
+### 5.3 Strength accounting against today's gate
+
+| Property | Today (clause 1 et al.) | Replacement | Verdict |
+|---|---|---|---|
+| No engine in the verifiable core's graph | enforced on 3 typed crates | enforced identically on discovered+declared set | **equal in kind, stronger in coverage** |
+| New ruleset-hosting crate escapes silently | escapes (G9-shape) | caught by discovery (E-D2) | **strictly stronger** |
+| Witness adapter carrying bevy | unwatched | still legal (engine calls core, never the reverse — dependency direction preserved), now *visible* as a named exception rather than an accident of the list | equal behaviour, honest accounting |
+| Ambiguous schedules | nothing (class doesn't exist in today's architecture) | mechanically rejected + canary-tested (Tier H) | **new enforcement where today there is none** |
+| Storage-order dependence | nothing | projection differential harness (Tier H) | **new enforcement** |
+| Ambient inputs, unordered collections, transcendentals, live neighbour reads | enforced | unchanged | equal |
+| Async runtime in canonical graph | structural only (no tokio dep) | dependency-scan clause | stronger |
+
+**Verdict: the replacement is stronger than today's gate**, in exactly the
+sense the epic demands — and one honest caveat belongs next to that word.
+In *kind*, Tier H admits `bevy_ecs` somewhere clause 1 admitted zero bevy
+crates; if the baseline were "the gate as documented," admitting anything is
+weaker. But the operative baseline is the gate as *behaving*: §1.2 shows the
+enforced property already excludes whatever isn't typed into the list, so the
+escape hatch exists today and is simply unwatched. The replacement converts
+that silent hole into (a) a closed hole for rules code (discovery) and (b) a
+watched, constrained door for machinery (Tier H). Weaker nowhere that today's
+gate actually bites; strictly stronger at the edges; new mechanical coverage
+of two hazard classes today's architecture doesn't even contain. That is the
+claim, with its evidence, and A3's precondition is met by it *conditionally*:
+if the owner rejects role-discovery (e.g. prefers a manifest marker over
+scanning), the fallback — declared-list-only with a stale-entry check — is
+merely equal-in-kind-plus-new-Tier-H-checks, which still satisfies "at least
+as strong" but should then be recorded as such, not as stronger.
+
+### 5.4 Sequencing
+
+`scripts/core-gates.sh` is outside the P4 digest (p4-ledger.sh hashes
+`orrery_witness`, `orrery_core`, `orrery_games`, `gates/p1-swarm`; scripts/
+is not hashed — p4-ledger.sh:33-35). The discovery clause can land whenever
+review allows; Tier H lands only with, and gated behind, an actual ECS-host
+trigger. Neither touches a hashed crate.
+
+---
+
+## 6. Repeatability test matrix
+
+The acceptance criterion asks for worker counts and build profiles
+explicitly. Today's harnesses cover platform and repeat axes thoroughly and
+the other two not at all — which is honest today (canonical execution is
+single-threaded and profile-uniform by construction) and insufficient the day
+an ECS host lands. The proposed matrix; implementation owned by **A10**
+(#406), specified here:
+
+| Axis | Values | Mechanism | Status |
+|---|---|---|---|
+| Platform | x86_64-linux, aarch64-linux, x86_64-windows, aarch64-macos | ci.yml determinism matrix + digest compare + partial refusal | **exists** |
+| Process repeats | 10 in-process repeats | nightly soak (:1187+) | **exists** |
+| In-run repeats | identical tick ×2 in tests; 200-world probes for schedule classes | double-run tests; probe-style CI test if Tier H lands | exists / conditional |
+| **Workers** | single-threaded executor; multi-threaded at 2 and ≥4 tasks | corpus `emit --workers {s,w2,w4}` labels compared by the verdict job; requires a multithreaded-capable canonical host, i.e. only meaningful under Tier H | **proposed** (E-M9) |
+| **Build profile** | dev; release (with overflow-checks policy applied to canonical crates) | release-profile corpus leg; digests must equal dev's bit-for-bit on discrete axes and within bands on continuous ones | **proposed** (E-M8); hazard demonstrated §9 P-OV |
+| Insertion order | forward vs fixed permutation of spawn sequence | new corpus case `projection-order-permuted` asserting chain equality with its forward twin (E-M3 pattern at corpus scale) | **proposed** |
+
+Design rule carried from A3 P3: every axis pair that *agrees* is recorded,
+but no agreement is ever load-bearing by itself — the mechanical checks
+(E-M1/E-M2/E-M3) carry the proof, the matrix catches what they cannot see.
+A partial matrix must refuse to pass (existing verdict-job behaviour extended
+to new axes).
+
+---
+
+## 7. Why witnessing remains canonical (and ECS ordering cannot replace it)
+
+Even with every mechanism above landed, witnessing stays the arbiter. Five
+reasons, each independent of the others:
+
+1. **Determinism ≠ honesty.** Schedule guarantees constrain how *given*
+   inputs execute; they say nothing about whether inputs were fabricated or
+   state mutated off-log. A cheating authority runs a perfectly deterministic
+   simulation of its lies. The strike pipeline exists precisely for that
+   case: claims are subject-signed commitments (state_hash over quantized
+   bytes), and a witness re-executes the signed log and compares
+   (witness.rs stage pipeline; verify_bundle semantics, docs/06:499). No
+   ordering property produces a verdict.
+2. **Observed stability proves nothing** — this task's own inherited
+   negative result, re-demonstrated here: ambiguous schedules ran 200/200
+   identically on A3's box, and my E-3 probe initially "passed" twice due to
+   two different probe bugs before showing the real divergence. Symptom-free
+   operation is not evidence anywhere in this domain; adjudication is the
+   layer that doesn't need to trust anyone's stability.
+3. **Isolation is the contract, and no schedule reproduces it.** The
+   adjudicator replays exactly one entity against an empty neighbour map
+   (replay.rs:106-130); the corpus asserts shared-vs-isolated chain equality
+   as a property of the rules, not of the scheduler. An ECS schedule's
+   guarantees are about *its* world; the verdict must hold in a world of one.
+   That is why Tier H must expose per-entity steps (§5.2) rather than offer
+   "the schedule was deterministic" as a substitute.
+4. **Continuous state needs bands, not orders.** Cross-platform, raw float
+   trajectories cannot promise bit-equality (docs/06:268); the comparator's
+   ε-bands + sustain windows are what keep honest players unstruck while
+   catching drift farming. Ordering has no answer to "how different is too
+   different."
+5. **Witnesses run where trust doesn't.** A witness peer holds its own
+   executors fed by signed frames — it never imports the authority's
+   scheduler, world, or module set. ECS execution happens *inside* someone's
+   process; witnessing works *across* processes that distrust each other.
+   The second is strictly more than the first.
+
+So: ECS-ordering machinery (E-M1..E-M12) makes re-execution *reproducible*;
+witnessing (E-M13) makes it *meaningful*. The first is infrastructure for the
+second, never a replacement.
+
+---
+
+## 8. What this document deliberately does not decide
+
+- **Identity**: `PersistId` ↔ ECS entity mapping ownership, allocation
+  classes, tombstone semantics — **A5 (#401)**.
+- **Per-component capability/policy shape**, including whether `CoreClass`
+  survives as the Tier-H routing hook — **A5 (#401)**.
+- **Rollback unit** (world/island/cell/entity/component subset) and the
+  canonical witness projection format — **A7 (#403)**. This document pinned
+  only that S4-before-S5 and next-tick delivery are non-negotiable because
+  adjudication consumes them.
+- **Command/event detailed semantics** — replay, dedup, idempotency keys,
+  volume bounds beyond ordering/delivery timing fixed in §3.5 — **A6 (#402)**.
+- **Manifest format** carrying the schedule digest (§3.10) — **A8 (#404)**.
+- **Conformance/matrix implementation** (E-M3, E-M8, E-M9 legs) — **A10
+  (#406)**.
+- **ADR acceptance**, including whether the §5 replacement amends the D9/D15
+  record set — reserved to the owner.
+
+---
+
+## 9. Mutation and probe log
+
+### 9.1 Re-based predecessor mutations
+
+`git diff ce5e34a7..HEAD -- crates gates clients` is empty (post-A3 commits
+touched only `scripts/check.sh`, `scripts/ci-changed-code.sh`,
+`scripts/gate-status.sh`, and docs). A1 M1–M8, A2 M-A/M-B/M-A′ and A3 E-1–E-6
+/F-1/F-2 therefore carry over at full strength, including their reverts.
+`core-gates.sh` itself is byte-identical since `ce5e34a7`.
+
+### 9.2 This document's own runs
+
+| # | Claim demonstrated | Method | Result |
+|---|---|---|---|
+| **M-G1** | Clause 1 live on this tree, dev-deps included | `[dev-dependencies] bevy_ecs = { workspace = true }` appended to `crates/orrery_games/Cargo.toml`; ran `./scripts/core-gates.sh` | mutated: `core-gates: orrery_games has Bevy in its dependency graph`, exit 1 · reverted: exit 0 |
+| **E-D1** | Role-discovery reproduces the gated set from the tree, cfg(test)-aware | prototype scanner `/tmp/opencode/gate-proto/ruleset-impl-crates.sh` over this workspace | exactly `orrery_conformance orrery_core orrery_games` (persistd's test-only impl at src/adjudication.rs:771 correctly excluded; core included via the trait definition at ruleset.rs:233). First version missed qualified-path impls (`impl foo::Ruleset for`) — pattern widened, recorded as a wrinkle in §5.2 |
+| **E-D2** | Discovery catches a crate the typed list misses (the G9-shaped escape) — both directions | synthetic workspace with new `orrery_host` carrying `impl orrery_host_rules::Ruleset for Host` in `src/` | typed-list scan would see only `orrery_core`; discovery reports `orrery_core orrery_host`. Impl removed → discovery drops it; restored → returns. Both directions shown |
+| **E-1** | `ambiguity_detection = Error` mechanically rejects an ambiguous schedule and accepts a totally-ordered one | scratch crate `/tmp/opencode/gate-proto/amb-probe` (`bevy_ecs = "=0.19.1"`, multi_threaded): two systems with conflicting access + order-sensitive effects, built once without edges, once chained | guard live: ambiguous → `initialize = Err (rejected)`, ordered → `Ok`. Mutation direction: rebuilt with `LogLevel::Ignore` → ambiguous builds Ok and the assertion `expected rejection after breaking the guard — this line is the mutation check` panicked, exit 101. Both directions recorded |
+| **E-2** | Ordered canonical schedule: one hash across executor configs and insertion orders | same probe: 500 entities, forward vs fixed-permutation spawn order × {single-threaded, multi-threaded×2 configs} | `canonical=f6a3…` identical in all six cells. Recorded as repeatability evidence, *never* as proof of determinism by stability |
+| **E-3** | Query iteration order reaches naive hashes; sorted projection neutralizes | same probe: blake3 fold of `(id,pos)` rows in raw query order across the two insertion sequences | forward `f6a3…` vs permuted `d243…` — differ. (Probe honesty note: my first two scramble implementations accidentally produced id-sorted or id-changed populations and E-3 "passed"/failed for wrong reasons; both were caught because the probe asserts its own expectations — recorded because it is §7's point made about my own tooling.) A3's P1/P2 found the same at larger scale |
+| **P-OV** | Build-profile divergence is real on cargo defaults | `/tmp/opencode/gate-proto/ovf-probe`: `black_box(i32::MAX) + 1000` under dev vs release | dev: panic `attempt to add with overflow`; release: prints `healed=-2147482649`. Root workspace sets no `[profile]`, so both behaviours are what canonical integer math would do today if it could overflow |
+
+No repository file was modified by any probe; all lived in
+`/tmp/opencode/gate-proto/`. The single repo mutation (M-G1) lived for one
+command run and was reverted with its passing result re-run.
+
+---
+
+## 10. Stale citations found while verifying
+
+| Record | Citation / claim | Current truth |
+|---|---|---|
+| A3 primary doc | `ci.yml:673-735` for the determinism matrix | Job moved to `ci.yml:726+` by bf22ee3a (doc-only-CI commit added ~53 lines above it); claim unchanged, line drifted |
+| Issue #400 text | "core-gates.sh declares GATED_CRATES=(orrery_core orrery_games orrery_conformance)" — hardcoded | Verified true verbatim (core-gates.sh:37), including that witness's bevy rides past it |
+| Epic #395 constraint block | "bans `view.neighbor(` in the rules crates" | True (:137-139), scoped by RULES_CRATES :42 |
+| Inherited-stale set (A1/A2/A3 records): ADR-0038 `ruleset.rs:211` drift; D21's `validate_intent` parenthetical; docs/06:210 present-tense classify_component consumers; docs/10-crates.md `orrery_field_host` rows; brief's `p{N}-*` paths; bot.rs producer line drift | — | Not re-litigated; nothing this document relies on touches them beyond what predecessors recorded |
+
+No stale citation was found in AGENTS.md relevant to this node.
+
+---
+
+## 11. Unsure
+
+Stated as unsure rather than smoothed over:
+
+1. **The discovery scanner's cfg(test) handling is a prototype.** Brace-count
+   stripping handles module-level annotations (the tree's only shape today);
+   item-level `#[cfg(test)]` functions containing impls would false-positive.
+   Fail-loud is acceptable, but the implementation must treat scanner
+   false positives as scanner bugs, not add exclusions.
+2. **E-2's stability is one box, one build, tiny systems** — exactly the
+   class of evidence P3 warned about. It justifies the worker axis' design;
+   it proves nothing beyond it.
+3. **Schedule digest placement in the wire/manifest** is proposed, not
+   decided: whether it joins `protocol_accepted` equality or rides the
+   manifest alone is A8/owner territory, and I did not want §3.10 to quietly
+   become a protocol change.
+4. **Overflow policy choice.** I recommend `overflow-checks = true` in all
+   profiles for canonical crates; a game needing wrapping semantics could
+   instead pin `wrapping_*` explicitly. Either works; silence does not. The
+   owner should pick.
+5. **Tier H remains entirely conditional.** If no trigger ever fires, every
+   Tier-H clause here is unused specification. That is deliberate (A3 V5's
+   posture), but it means most of this document's *new* enforcement is
+   untested against production pressure until/unless ECS is admitted.
+
+Deliberately not done:
+
+- **No implementation.** No clause of core-gates.sh changed; no corpus case,
+  CI leg, or host API exists yet — those belong to A10/A11 after acceptance.
+- **No decision owned elsewhere** (§8).
+
+<!-- end -->
+
+
+
 
 
 
