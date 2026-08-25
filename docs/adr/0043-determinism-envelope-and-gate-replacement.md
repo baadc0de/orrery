@@ -374,3 +374,120 @@ session-setup equality check on the wire is a protocol question this record
 does not decide (see Open questions). Stated honestly: the digest pins
 *topology*, not the semantics the ECS library attaches to a topology — that
 half stays with [D14]'s pins and upgrade conformance runs.
+
+## Consequences
+
+- The Bevy-free property of the verifiable core stops being a per-commit
+  decision (remember to type the crate name) and becomes a property of the
+  tree (an impl-bearing crate cannot exist unscanned). The witness adapter's
+  530-reference ride past the gate ends as an accident and continues as a
+  named, watched exception.
+- **The gate gains a scanner, and the scanner is now load-bearing.** A
+  scanner bug is a gate hole; the cross-check's two-source construction and
+  the fail-loud rule are the mitigations, but maintaining a textual Rust
+  scanner in bash is a real ongoing cost the typed list never had.
+- **Most of the new enforcement is dormant until an ECS trigger fires**
+  (clause (e), stated there). If no trigger ever fires, this record's lasting
+  deltas are discovery, the async clause, the overflow clause, and the
+  digest — the Tier H battery stays paper.
+- Every canonical integer operation that can overflow must be written with
+  explicit semantics and flag-setting; that is a coding-discipline cost paid
+  on every rules crate forever, and it **blocks on the owner's (f)(4)
+  answer** before any of it can be implemented.
+- The overflow flag widens canonical state: a schema change
+  (`SchemaVersion` bump under [D38]'s versioning), a projection change
+  (`projection_version` bump under R7's WP-6 if the framing moves), and one
+  more discrete field every claim commits to — the cost of making the flag
+  mean something.
+- A flagged entity is *not* a determinism failure: two honest hosts both
+  flag it and both hash identically. The flag is telemetry-with-teeth — it
+  makes overflow *visible and attributable* in witnessed state; deciding what
+  standing or gameplay consequence follows is rules-design work outside this
+  record.
+- The schedule digest turns an innocent system reorder into a CI failure and
+  a manifest change. That is its purpose; it is also a new way for a
+  refactor to be louder than its author expected.
+- Acceptance arms a11's PR-6 (the discovery clause in `core-gates.sh`),
+  which was explicitly gated on this record because it edits a live gate.
+
+## Alternatives considered
+
+- **Keep the typed list, add a stale-entry check.** The recorded fallback if
+  role-discovery were rejected: equal in kind plus the new Tier-H checks,
+  which still meets "at least as strong" — but it leaves the G9-shaped
+  escape open (a new impl-bearing crate passes silently) and would have to
+  be recorded as *equal*, not stronger. Rejected in favour of discovery.
+- **A manifest marker instead of scanning** (crates self-declare "I am
+  rules"). Rejected: self-declaration is the typed list with extra steps —
+  the crate that forgets to declare is exactly the crate the gate exists to
+  catch. Discovery keys on what the code *is*, not on what it says it is.
+- **`overflow-checks = true` in all profiles (panic posture).** A4's own
+  recommendation; honest, loud, profile-uniform — and **rejected by the
+  owner**: canonical crates must not resolve overflow by aborting the tick.
+  A panic in S2 takes the entity (and under a shared schedule, the tick)
+  down with it; the flag posture keeps the simulation running and the
+  occurrence adjudicable.
+- **A flag outside the hashed projection** (log line, metric, side table).
+  Rejected for the reason worked through in clause (f)(3): divergence with
+  matching hashes is invisible, so the flag would prove nothing exactly when
+  it mattered.
+- **Wrapping semantics for the defined result** — presented, not decided
+  ((f)(4)). `wrapping_*`: the result is the two's-complement wrap.
+  *For:* it is what the hardware does, what `overflow-checks = false` plain
+  ops already do (so a stray op matches the posture), zero-cost, and
+  bit-exact trivially. *Against:* the wrapped value is semantically garbage
+  for almost every game quantity — a resource count of `i32::MIN + 999` is
+  not a boundary value, it is nonsense with a flag next to it, and every
+  consumer downstream must treat flagged state as suspect.
+- **Saturating semantics for the defined result** — presented, not decided
+  ((f)(4)). `saturating_*`: the result clamps to the type's bound.
+  *For:* the value stays meaningful ("as much as fits"), which is usually
+  what game arithmetic wants at a boundary; flagged state remains usable.
+  *Against:* saturation destroys information (x + 1 − 1 ≠ x at the bound)
+  and silently changes arithmetic identities, a stray plain op now *differs*
+  from the posture (it wraps), and clamp-then-continue can mask a rules bug
+  that wrap-plus-flag would have made grotesque and therefore noticed.
+  These differ in what arithmetic *means* at the boundary; the owner picks.
+- **Widen ring 2 to bit-exact floats everywhere.** Rejected: three OSes ×
+  two architectures cannot promise raw-float bit-equality; that is the
+  promise the physics ecosystem itself scopes away, and [D16]'s bands exist
+  because of it.
+- **Let ECS ordering guarantees stand in for witnessing.** Rejected (A4 §7,
+  incorporated): determinism is not honesty; a cheating authority runs a
+  perfectly deterministic simulation of its lies. Everything in this record
+  makes re-execution *reproducible*; witnessing makes it *meaningful*.
+
+## Open questions reserved to the owner
+
+1. **(f)(4): wrapping or saturating** as the defined result of an
+   overflowing canonical operation. Undecided; implementation of clause (f)
+   blocks on it.
+2. **Schedule-digest wire placement**: whether the digest joins the
+   session-setup equality assertion alongside `RulesetId`, or rides the
+   manifest alone. A protocol question, flagged in A4 §11.3 and left with
+   A8/the owner.
+
+## Verification appendix — what was re-run at acceptance
+
+All on this tree (branch `docs/adr-0043-r2` at `2c31b4aa`), 2026-08-25:
+
+| Check | Result |
+|---|---|
+| `cargo tree -p orrery_witness \| grep -ci bevy` | **530** |
+| `./scripts/core-gates.sh` (unmodified tree) | exit **0**, all five clauses green |
+| Mutation: `[dev-dependencies] bevy_ecs` appended to `crates/orrery_games/Cargo.toml` | named check died: `core-gates: orrery_games has Bevy in its dependency graph`, exit **1** |
+| Revert of the mutation | exit **0**; working tree clean |
+| Overflow probe (scratch crate, cargo defaults): `black_box(i32::MAX) + 1000` | dev: panic `attempt to add with overflow` · release: `healed=-2147482649` |
+| Workspace `[profile]` override | none exists in root `Cargo.toml` |
+| `GATED_CRATES` / `RULES_CRATES` | `core-gates.sh:37` / `:42`, verbatim as quoted |
+| Quantize-before-hash | `crates/orrery_core/src/executor.rs:126-127` |
+| FWW materialization | `crates/orrery_core/src/executor.rs:144-157` (`Entry::Vacant` install) |
+| `tick_rng` derivation | `crates/orrery_core/src/rng.rs:31-43` |
+| P4 pipeline trees | `scripts/p4-ledger.sh:409-414`: `crates/orrery_witness`, `crates/orrery_core`, `crates/orrery_games`, `gates/p1-swarm`; `scripts/` not hashed |
+
+One citation drift found while verifying: A4's method note says the prototype
+pinned `bevy_ecs = "=0.19.1"` "matching root `Cargo.toml:60`"; the manifest
+line actually reads `bevy_ecs = { version = "0.19", default-features =
+false }` — the exact `0.19.1` lives in `Cargo.lock:1224-1225`, which A4 also
+cites correctly. Claim intact, manifest half imprecise; recorded here rather
+than silently repeated.
