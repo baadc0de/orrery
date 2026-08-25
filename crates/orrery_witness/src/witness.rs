@@ -215,6 +215,8 @@ pub enum WitnessError {
     FrameRejected,
     /// The claim's signature does not verify.
     ClaimRejected,
+    /// The supplied anchor state does not match the state hash in the signed claim.
+    AnchorStateHashMismatch,
     /// A logged input payload is not a valid `CoreInput`.
     InputMalformed,
     /// Recorded neighbour state was stale, over budget, malformed, or did not
@@ -235,6 +237,9 @@ impl core::fmt::Display for WitnessError {
             Self::NotTheSubject => f.write_str("frame is not from the watched authority"),
             Self::FrameRejected => f.write_str("frame failed verification"),
             Self::ClaimRejected => f.write_str("claim signature does not verify"),
+            Self::AnchorStateHashMismatch => {
+                f.write_str("anchor state does not match the signed claim's state hash")
+            }
             Self::InputMalformed => f.write_str("logged input is not a valid CoreInput"),
             Self::NeighborFrameRefused => f.write_str("recorded neighbour frame was refused"),
             Self::WindowUnservable => f.write_str("window cannot be assembled from what is held"),
@@ -601,9 +606,13 @@ impl<R: Ruleset> Witness<R> {
     /// # Errors
     ///
     /// [`WitnessError::ClaimRejected`] if the anchor is not signed by the
-    /// subject.
+    /// subject, or [`WitnessError::AnchorStateHashMismatch`] if its supplied
+    /// state differs from the state committed by the signed anchor.
     pub fn watch(&mut self, watch: Watch<R::CoreState>) -> Result<(), WitnessError> {
         verify_claim(&watch.anchor, watch.subject).map_err(|_| WitnessError::ClaimRejected)?;
+        if orrery_core::state_hash(&watch.anchor_state) != watch.anchor.state_hash {
+            return Err(WitnessError::AnchorStateHashMismatch);
+        }
         // Retain the anchor with its snapshot: a bundle has to start from
         // committed state, and this is the one snapshot a witness is handed
         // rather than having to compute.

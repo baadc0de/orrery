@@ -22,7 +22,7 @@ use orrery_protocol::{
     ChainHash, EntitySlice, InputRecord, LogFrame, PersistId, RecordSource, RulesetId, StateClaim,
     Tick, UniverseSeed, Verdict,
 };
-use orrery_witness::{Observation, Watch, Witness, WitnessConfig, WitnessSignal};
+use orrery_witness::{Observation, Watch, Witness, WitnessConfig, WitnessError, WitnessSignal};
 use rand_chacha::rand_core::RngCore;
 
 // ── A ruleset with a speed cap it can be caught violating ────────────────
@@ -646,6 +646,27 @@ fn an_anchor_the_subject_did_not_sign_is_refused() {
             anchor_state,
         })
         .is_err());
+}
+
+#[test]
+fn a_signed_anchor_with_a_mismatched_state_is_refused() {
+    let mut authority = Authority::new(1);
+    let (anchor, mut anchor_state) = authority.anchor();
+    // `Authority::anchor` signs this claim. Change only the separately supplied
+    // state, leaving the signed claim valid but no longer committed to it.
+    anchor_state.entropy = anchor_state.entropy.wrapping_add(1);
+    assert_ne!(state_hash(&anchor_state), anchor.state_hash);
+
+    let mut witness = Witness::new(WitnessConfig::default(), SEED, || Kinematic);
+    assert_eq!(
+        witness.watch(Watch {
+            entity: ENTITY,
+            subject: subject_key().public(),
+            anchor,
+            anchor_state,
+        }),
+        Err(WitnessError::AnchorStateHashMismatch)
+    );
 }
 
 #[test]
