@@ -82,8 +82,8 @@ fn sample<'a>(
 }
 
 #[test]
-fn v9_weapon_table_ruleset_identity_and_island_budget_are_pinned() {
-    assert_eq!(REGOLITH_RULESET.version, 9);
+fn v10_weapon_table_ruleset_identity_and_island_budget_are_pinned() {
+    assert_eq!(REGOLITH_RULESET.version, 10);
     assert_eq!(WeaponKind::Stock.weapon().damage_base, 10);
     assert_eq!(WeaponKind::Volley.weapon().rolls, 3);
     assert_eq!(WeaponKind::Stock.weapon().optimal_mm, 300_000);
