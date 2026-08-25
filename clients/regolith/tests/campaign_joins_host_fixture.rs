@@ -58,6 +58,10 @@ struct GroundTruth {
     uplink_dropped: u64,
     downlink_broadcasts: u64,
     downlink_skipped: u64,
+    downlink_last_generated: u64,
+    downlink_last_queued: u64,
+    downlink_last_written: u64,
+    downlink_skipped_indices: Vec<u64>,
 }
 
 impl GroundTruth {
@@ -73,6 +77,22 @@ struct HostFixture {
     node_hex: String,
     direct: String,
     truth: Arc<std::sync::Mutex<GroundTruth>>,
+    quiesce: tokio::sync::mpsc::UnboundedSender<QuiesceRequest>,
+}
+
+struct QuiesceRequest {
+    flushed: std::sync::mpsc::SyncSender<u64>,
+}
+
+enum FeedItem {
+    Frame {
+        broadcast_index: Option<u64>,
+        frame: net::Frame,
+    },
+    Barrier {
+        terminal_index: u64,
+        flushed: std::sync::mpsc::SyncSender<u64>,
+    },
 }
 
 impl HostFixture {
@@ -95,6 +115,7 @@ impl HostFixture {
         let expected_client = net::slot_secret(CLIENT_SLOT).public();
 
         let truth: Arc<std::sync::Mutex<GroundTruth>> = Default::default();
+        let (quiesce, quiesce_rx) = tokio::sync::mpsc::unbounded_channel();
 
         let endpoint = runtime.block_on(async { net::bind(secret).await.expect("bind") });
         let socket = endpoint.bound_sockets()[0];
@@ -105,7 +126,14 @@ impl HostFixture {
         let pump_runtime = Arc::clone(&runtime);
         let _pump_thread = std::thread::spawn(move || {
             pump_runtime.block_on(async move {
-                let _ = pump(endpoint_for_task, expected_client, mode, pump_truth).await;
+                let _ = pump(
+                    endpoint_for_task,
+                    expected_client,
+                    mode,
+                    pump_truth,
+                    quiesce_rx,
+                )
+                .await;
             });
         });
 
@@ -115,6 +143,7 @@ impl HostFixture {
             node_hex,
             direct: socket.to_string(),
             truth,
+            quiesce,
         }
     }
 
@@ -132,6 +161,18 @@ impl HostFixture {
 
     fn truth(&self) -> GroundTruth {
         self.truth.lock().expect("truth lock").clone()
+    }
+
+    /// Stop broadcast production at a delivered frame and wait until the
+    /// fixture's ordered stream writer has flushed that terminal frame.
+    fn quiesce(&self) -> u64 {
+        let (flushed, receiver) = std::sync::mpsc::sync_channel(0);
+        self.quiesce
+            .send(QuiesceRequest { flushed })
+            .expect("the fixture broadcaster is live");
+        receiver
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the fixture flushed its terminal broadcast")
     }
 }
 
@@ -153,6 +194,7 @@ async fn pump(
     expected_client: NodeId,
     mode: Mode,
     truth: Arc<std::sync::Mutex<GroundTruth>>,
+    mut quiesce: tokio::sync::mpsc::UnboundedReceiver<QuiesceRequest>,
 ) -> Result<(), String> {
     let incoming = endpoint
         .accept()
@@ -214,11 +256,31 @@ async fn pump(
     write_frame(&mut downlink_send, &announce).await?;
     let mut uplink_recv = connection.accept_uni().await.map_err(|e| e.to_string())?;
 
-    let (feed_tx, mut feed_rx) = tokio::sync::mpsc::unbounded_channel::<net::Frame>();
+    let (feed_tx, mut feed_rx) = tokio::sync::mpsc::unbounded_channel::<FeedItem>();
+    let writer_truth = Arc::clone(&truth);
     tokio::spawn(async move {
-        while let Some(frame) = feed_rx.recv().await {
-            if write_frame(&mut downlink_send, &frame).await.is_err() {
-                break;
+        while let Some(item) = feed_rx.recv().await {
+            match item {
+                FeedItem::Frame {
+                    broadcast_index,
+                    frame,
+                } => {
+                    if write_frame(&mut downlink_send, &frame).await.is_err() {
+                        break;
+                    }
+                    if let Some(index) = broadcast_index {
+                        writer_truth
+                            .lock()
+                            .expect("truth lock")
+                            .downlink_last_written = index;
+                    }
+                }
+                FeedItem::Barrier {
+                    terminal_index,
+                    flushed,
+                } => {
+                    let _ = flushed.send(terminal_index);
+                }
             }
         }
     });
@@ -237,33 +299,64 @@ async fn pump(
             let mut broadcast_index = 0u64;
             let mut interval = tokio::time::interval(Duration::from_millis(15));
             loop {
-                interval.tick().await;
-                broadcast_index += 1;
-                if broadcast_index.is_multiple_of(DOWNLINK_SKIP_EVERY) {
-                    truth_cloned.lock().expect("truth lock").downlink_skipped += 1;
-                    continue;
-                }
-                let encoded = state.to_canonical();
-                // The harness wire is double-tagged: `send_peer_packets`
-                // wraps `encode_replication`'s output in its own channel tag.
-                let payload = orrery_protocol::channels::tag(
-                    orrery_protocol::channels::Channel::State,
-                    &encode_replication(&(
-                        encoded,
-                        cell,
-                        bot_entity,
-                        broadcast_index * STRIDE, // the sender's absolute tick
-                    )),
-                );
-                let frame = net::Frame {
-                    peer: 0, // the sender's slot, per the downlink rule
-                    lane: net::Lane::Datagram,
-                    payload: Bytes::from(payload),
+                let request = tokio::select! {
+                    biased;
+                    request = quiesce.recv() => request,
+                    _ = interval.tick() => None,
                 };
-                if feed.send(frame).is_err() {
-                    break; // the writer is gone: client left
+
+                // A quiescent cut must end in a delivered broadcast: a trailing
+                // intentional skip is only measurable when a later arrival
+                // closes its tick gap.
+                loop {
+                    broadcast_index += 1;
+                    {
+                        let mut truth = truth_cloned.lock().expect("truth lock");
+                        truth.downlink_last_generated = broadcast_index;
+                        if broadcast_index.is_multiple_of(DOWNLINK_SKIP_EVERY) {
+                            truth.downlink_skipped += 1;
+                            truth.downlink_skipped_indices.push(broadcast_index);
+                            if request.is_none() {
+                                break;
+                            }
+                            continue;
+                        }
+                    }
+
+                    let encoded = state.to_canonical();
+                    // The harness wire is double-tagged: `send_peer_packets`
+                    // wraps `encode_replication`'s output in its own channel tag.
+                    let payload = orrery_protocol::channels::tag(
+                        orrery_protocol::channels::Channel::State,
+                        &encode_replication(&(encoded, cell, bot_entity, broadcast_index * STRIDE)),
+                    );
+                    let frame = net::Frame {
+                        peer: 0,
+                        lane: net::Lane::Datagram,
+                        payload: Bytes::from(payload),
+                    };
+                    if feed
+                        .send(FeedItem::Frame {
+                            broadcast_index: Some(broadcast_index),
+                            frame,
+                        })
+                        .is_err()
+                    {
+                        return;
+                    }
+                    let mut truth = truth_cloned.lock().expect("truth lock");
+                    truth.downlink_broadcasts += 1;
+                    truth.downlink_last_queued = broadcast_index;
+                    break;
                 }
-                truth_cloned.lock().expect("truth lock").downlink_broadcasts += 1;
+
+                if let Some(request) = request {
+                    let _ = feed.send(FeedItem::Barrier {
+                        terminal_index: broadcast_index,
+                        flushed: request.flushed,
+                    });
+                    break;
+                }
             }
         });
     }
@@ -298,7 +391,13 @@ async fn pump(
                     lane: net::Lane::Meta,
                     payload: Bytes::from(payload),
                 };
-                if feed_tx.send(ack).is_err() {
+                if feed_tx
+                    .send(FeedItem::Frame {
+                        broadcast_index: None,
+                        frame: ack,
+                    })
+                    .is_err()
+                {
                     break;
                 }
             }
@@ -422,7 +521,33 @@ fn a_client_joins_measures_and_applies_replicated_state() {
         let _ = runtime.advance(Controls::default(), &mut sink);
         std::thread::sleep(Duration::from_millis(2));
     }
+    let terminal_broadcast = fixture.quiesce();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while runtime.downlink_last_tick(0) != Some(terminal_broadcast * STRIDE)
+        && Instant::now() < deadline
+    {
+        let _ = runtime.advance(Controls::default(), &mut sink);
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    // Driving the client to the terminal downlink can produce another uplink;
+    // settle that traffic too before taking the fixture's final ledger cut.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while runtime.uplink_acks().0 < runtime.uplink_sent() && Instant::now() < deadline {
+        let _ = runtime.advance(Controls::default(), &mut sink);
+        std::thread::sleep(Duration::from_millis(2));
+    }
     let truth = fixture.truth();
+    assert_eq!(
+        runtime.downlink_last_tick(0),
+        Some(terminal_broadcast * STRIDE),
+        "downlink quiescence failed: terminal broadcast #{terminal_broadcast} was generated, \
+         queued, and stream-flushed; client observed through broadcast #{:?}; sender stages: \
+         generated through #{}, queued through #{}, stream-flushed through #{}",
+        runtime.downlink_last_tick(0).map(|tick| tick / STRIDE),
+        truth.downlink_last_generated,
+        truth.downlink_last_queued,
+        truth.downlink_last_written,
+    );
     assert!(truth.uplink_total() > 10, "the fixture saw real traffic");
     assert_eq!(
         runtime.uplink_sent(),
@@ -439,15 +564,18 @@ fn a_client_joins_measures_and_applies_replicated_state() {
 
     // Downlink: arrivals plus gaps reconcile against the sender's ledger.
     let (arrivals, missing) = runtime.downlink_accounting();
+    let first_unaccounted_skip = truth
+        .downlink_skipped_indices
+        .get(missing as usize)
+        .map_or_else(|| "none".to_owned(), u64::to_string);
     assert!(arrivals > 10, "replication arrived");
-    assert!(
-        missing > 0,
-        "the deterministic skip pattern must register as gaps"
-    );
     assert_eq!(
         arrivals + missing,
         truth.downlink_broadcasts + truth.downlink_skipped,
-        "gap accounting reconciles with what the sender actually sent"
+        "downlink conservation failed after broadcast #{terminal_broadcast} reached the client: \
+         arrivals={arrivals}, accounted missing={missing}, sender-skipped broadcasts={:?}; \
+         first unaccounted stage: sender-skipped broadcast #{first_unaccounted_skip}",
+        truth.downlink_skipped_indices,
     );
 
     // The replicated view holds the virtual bot, and the accumulator ran.
