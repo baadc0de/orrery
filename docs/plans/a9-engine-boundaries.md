@@ -328,3 +328,114 @@ today, and what cannot:
   a *checkable acceptance criterion of the observer proof* (§5), not a
   current fact. Asserting it today would be asserting a property of code
   that does not exist. This document declines to.
+
+---
+
+## 5. The minimal Unreal observer proof — **[SPEC — specified, not implemented]**
+
+The smallest artifact that would turn §4 from specification into evidence.
+Scope: an *observer* — it renders canonical state and submits commands; it
+holds no authority, predicts nothing, persists nothing. (Brief phase 8,
+`ruleset-ecs-migration-brief.md:762-771`, narrowed.)
+
+**Components (three, no more):**
+
+1. **Sidecar binary**: the `SimulationHost` seam (must exist first — E-15)
+   hosting `Regolith` via the existing `Ruleset` adapter, plus an IPC adapter
+   speaking length-prefixed postcard frames over a local transport (the
+   persistd/coordinator session pattern — §4.3). Links no render, no winit,
+   no Unreal anything.
+2. **IPC schema crate**: depends on `orrery_protocol` only; defines the
+   command-in/frame-out messages of §4.1/§4.2 and both version numbers of
+   §4.4. Added by name to the Bevy-free scan.
+3. **Unreal plugin (C++)**: connects, subscribes an interest volume, maps
+   `PersistId → AActor*` in a `TMap`, applies transform frames, spawns and
+   despawns on batch messages, submits movement commands. No Actor
+   replication, no Iris, no savegame — the map is the entire state.
+
+**Acceptance checks (each falsifiable, each named):**
+
+- **P-1 (same rules)**: the sidecar replays a committed conformance golden
+  chain end-to-end while the observer is attached; the replayed chain hash
+  equals the committed golden. This is the "demonstrated, not asserted"
+  criterion made mechanical: the bytes that reach Unreal are derived from
+  the same hashes the golden battery pins. (Caveat inherited from A7 X-A:
+  goldens cover state hashes only — an event-only outcome is invisible to
+  them, so P-1 proves state equivalence, not event-surface equivalence.)
+- **P-2 (no engine type crosses)**: `cargo tree` on the IPC schema crate
+  shows zero bevy; a grep for `bevy_ecs` in the plugin's generated bindings
+  matches nothing. Named in CI, not assumed.
+- **P-3 (correction discipline)**: inject an authority correction mid-replay;
+  the observer receives regenerated frames and converges by overwrite —
+  verified by asserting the plugin holds no history buffer to un-wind
+  (code-shape check) and the final displayed transform equals the corrected
+  canonical one.
+- **P-4 (observer inertness)**: kill the observer mid-run; the sidecar's
+  chain hash is unchanged versus an unobserved run. Presentation has no
+  canonical authority (E-10) — now demonstrated across an engine boundary.
+
+**Not in scope**: prediction on the Unreal side, embedded variant, authority
+hosting, persistence, any manifest content (A8's).
+
+---
+
+## 6. Mutation log (break the guarded stage → named check dies → revert → passes)
+
+Constraint honored: the P4 pipeline digest hashes `orrery_witness`,
+`orrery_core`, `orrery_games` and `p1-swarm`; no mutation touched any of the
+four. `orrery_conformance` is gated by core-gates but not digest-hashed, and
+`orrery_persist_client` is neither.
+
+| # | Mutation (guarded stage) | Result | Named check | Reverted |
+|---|---|---|---|---|
+| M1 | Added `bevy_ecs = { workspace = true }` to `crates/orrery_conformance/Cargo.toml` — breaking the Bevy-free property of a gated crate | `./scripts/core-gates.sh` → `core-gates: orrery_conformance has Bevy in its dependency graph`, exit 1 | `core-gates.sh` clause 1 ("Bevy-free") | yes; gate exits 0 again |
+| M2 | Added `pub fn leak_handle() -> bevy_ecs::entity::Entity` to `crates/orrery_conformance/src/lib.rs` — an engine handle named inside a rules crate | `cargo check -p orrery_conformance` → **E0433** (`bevy_ecs` unresolvable): the guard is the dependency graph itself; no gate ever runs because the code cannot exist | rustc E0433 (structural), backed by M1's gate against re-adding the dep | yes; clean check |
+| M3 | In `crates/orrery_persist_client/src/feed.rs`, appended `entity.to_bits().to_le_bytes()` to the `DiffUplink` payload — an engine handle inside a replicated, journal-bound payload (the exact G-1 corridor) | **Survived by design**: `cargo check` clean; `./scripts/core-gates.sh` exit 0; `cargo test -p orrery_persist_client` → `95 passed`, `2 passed`, `2 passed`, `1 passed`, all `0 failed` (one suite `0 passed; 0 filtered out` — an empty suite, read and noted, not counted as coverage) | **none** — that is the finding. A5's G-1 confirmed live at this boundary; §3 proposes the closure | yes; clean check, tree clean |
+
+M3 is reported against interest deliberately: this document's Bevy-boundary
+claim would read stronger without it. It stays because a surviving mutation
+is a finding, and because §3's proposal is only justified by it.
+
+---
+
+## 7. Stale citations and discrepancies found while verifying
+
+| # | What was claimed | What the tree says |
+|---|---|---|
+| D-1 | This task's own brief called the lightyear quote "vendored `lightyear_replication-0.29.0`" | The quote is real and at the cited lines (`src/lib.rs:67-68`), but the crate is **not vendored** — it resolves from the cargo registry. `vendor/` contains `aeronet_iroh`, `aeronet_tokio_runtime`, `bevy_replicon` only. The A3 documents themselves cite it without the "vendored" label; the drift is in the hand-off wording, recorded so it stops propagating |
+| D-2 | `docs/10-crates.md` workspace layout lists `orrery_aeronet_iroh` under `crates/` | No such workspace crate exists; the aeronet-iroh code lives at `vendor/aeronet_iroh`. Same document, same class of drift as #414 (`orrery_field_host`, confirmed still open and still absent); #414's text covers the field host only, so this is an additional instance, not a duplicate |
+| D-3 | `docs/10-crates.md` says "all thirteen `orrery_*` crates" | `crates/` holds fifteen `orrery_*` members today, and the document's reference table omits `orrery_conformance` entirely while listing two crates that do not exist (D-2, #414). The doc is sketch-grade by its own header, but its crate census is now wrong in both directions |
+
+None of the substantive handed-down claims failed verification: E-1 through
+E-15 all held as cited.
+
+---
+
+## 8. Deferred to owners
+
+- **A8 (#404)**: manifest content, version axes, `(ComponentTypeId,
+  SchemaVersion)` namespace governance, and the registry that would make §3
+  proposal 2 real. Cited as owner throughout; nothing about manifests is
+  specified here.
+- **Owner**: acceptance of B-1 and the §4.4 no-engine-type-crosses rule as
+  ADR content; adoption of the `EngineHandleFree` registration bound (§3.1);
+  resolution of the three unused `bevy_reflect` entries (E-8, A5's open
+  question); whether the observer proof (§5) becomes an implementation issue
+  after the #395 ADRs land.
+- **A4's owner artifacts**: the Tier-H gate bundle remains conditional on
+  A3's triggers; nothing here arms it.
+
+## 9. Unsure
+
+- Whether lightyear's `ClientPlugins` remaining the *setter* of `Time<Fixed>`
+  (E-7) is acceptable long-term for a sidecar that must run the same 60 Hz
+  tick without lightyear present. The sidecar spec assumes the host seam owns
+  tick cadence; today the client's cadence is lightyear-owned. This is a real
+  asymmetry between §2.5 and §4.3 and I could not resolve it from the tree.
+- Whether the empty test suite observed under M3 (`0 passed; 0 filtered out`)
+  is a feature-gated integration file or genuinely empty; it was not counted
+  as evidence either way.
+- The `EngineHandleFree` sealed-trait design (§3.1) is sketched from replicon's
+  registration shape as it exists in `vendor/bevy_replicon`; whether replicon's
+  registration API actually admits the extra bound without forking the vendored
+  copy was not prototyped.
