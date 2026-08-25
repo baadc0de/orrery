@@ -651,3 +651,154 @@ ratios, write the comparison beside the baseline JSON. It is deliberately
 not a per-commit CI assert (§8.1) — but the *presence and freshness* of the
 baseline is CI-checkable and refusing (§4.4), and that is the half a
 machine can hold honestly.
+
+---
+
+## 9. The refuse-versus-observe ledger
+
+Every check in the programme, with what has to break for it to fail. An
+"observes" row is honest only because its committed expectation was shown
+sensitive to the failure class (by this node's or a predecessor's mutation);
+where sensitivity is *not* yet demonstrated, the row says so.
+
+| Check | Class | What must break for it to fail |
+|---|---|---|
+| core-gates clauses 1–5 (E-M1) | refuses | a banned spelling or dependency enters a **listed** crate's sources/graph (M-G1-proven). Coverage is the list (V13) — the discovery cross-check A4 §5.2 proposes is what would make unlisted escapes fail too |
+| F-1 state goldens | observes | any committed per-tick state hash changes — and only that (X-A: event-only outcomes cannot fail it; that insensitivity is measured, which is why F-2 exists) |
+| F-2 outcome goldens | observes | any emitted event's bytes, order, or count; any materialized id or install order; any delivery pair — X-A's mutation is the demonstrated kill |
+| F-3 off-lattice pin | observes | `step_entity` hashing raw instead of quantized state (X-C's swap is the demonstrated kill); the internal `quantized ≠ raw` assertion makes vacuous passage self-failing |
+| F-4 differential harness | observes + refuses | any of D-1..D-4 diverging under equal versions fails; missing baseline, partial artifacts, or unclassifiable skew **refuse to produce a verdict** at all |
+| F-5 matrix legs | observes | any digest differing across platform/repeat/worker/profile/insertion cells; a missing cell refuses (verdict-job partial refusal) |
+| F-6 migration round-trips | observes | migrated re-encoding differing from committed new-format bytes; refusal fixtures fail if fail-closed decoding weakens (X-D-proven for rekey; A5 X3/X4 for slots) |
+| F-7 #417 closure | observes | the `With<LocallyAuthoritative>` filter alone being removed — by construction the only clause refusing that fixture's entity (pending the reachability check, §13.2) |
+| F-8 re-delivery pin | observes | span double-counting (leg 2) or counting stopping entirely (leg 3) — M-A6-4a and its inverse are the two demonstrated kills |
+| F-9 trybuild fixture | refuses | the `EngineHandleFree` bound (or successor mechanism) disappearing or gaining an `Entity` impl — compile succeeds where the committed expectation is failure |
+| F-10 composition battery | refuses | a missing/cyclic/duplicate declaration assembling anyway; the E-M2 canary fails if ambiguity rejection is silently downgraded (the canary is the sensitivity proof) |
+| Schedule digest test | observes | any reorder of stages, systems, or edges — the committed digest is definitionally sensitive to exactly that |
+| F-11 extraction contract | refuses (compile-visible) | the mirror world acquiring any input other than emitted frames |
+| F-12 baseline freshness | refuses | differential/benchmark comparison attempted without a committed, commit-pinned baseline manifest |
+| Benchmarks B-1..B-7 | observe | thresholds (§8.4) exceeded at a phase-exit evaluation — never a per-commit assert |
+
+Note what the table admits: most of the *new* conformance surface observes.
+That is correct — parity is a comparison, and comparisons observe. The
+programme's refusing spine is the composition/registration layer (F-9,
+F-10, gates) plus the harness's own refusals (F-4, F-12): the places where
+a bad state can be made unbuildable are all taken, and everywhere else the
+committed expectation has a demonstrated kill.
+
+---
+
+## 10. Sequencing against the P4 digest and the workspace table
+
+The P4 digest boundary (V10) splits the programme into what can land during
+the #329 shakedown window and what must wait; the `WORKSPACES` table (V9)
+determines where anything new actually executes. Neither constraint is
+architectural; both are absolute while they stand.
+
+| Item | Touches | Window-safe? |
+|---|---|---|
+| F-3 off-lattice pin | `orrery_conformance` | **yes** (outside digest; inside root workspace, runs in existing CI) |
+| F-7 #417 closure + handoff scenarios | `orrery_persist_client`, `orrery_predict` | **yes** |
+| F-12 bench workspace + baseline capture (except F-2 leg) | new `gates/migration-bench` + `scripts/check.sh` table row (role check) | **yes** (scripts/ and gates/migration-bench unhashed) |
+| F-6 round-trip goldens | `orrery_persistd` | **yes** |
+| `projection-order-permuted` corpus case | `orrery_conformance` | **yes** |
+| F-2 outcome goldens | `orrery_games` | **no — digest reset**; first post-window PR |
+| F-8 re-delivery pin | `orrery_witness` | **no — digest reset**; first post-window PR |
+| `swarm-large` corpus case | `orrery_conformance` | yes |
+| F-4 harness, F-5 worker/profile legs, F-9, F-10, F-11 | phase-gated on Phase 2+/Tier H/mechanism landing | n/a (post-window by construction) |
+
+Ordering rule the sequencing must keep (A11 owns the PR plan; this is the
+constraint handed to it): **F-2 lands before any Phase 2 composition PR
+merges** — the outcome chains must commit legacy behaviour (§8.3), and the
+window exit precedes Phase 2 in every plan variant, so the constraint is
+satisfiable without touching the digest early.
+
+---
+
+## 11. Mutation and reproduction log
+
+Every run today, with real result lines; baselines recorded before each
+mutation; every revert re-run and green; final tree state clean
+(`git status` empty of crate changes; the only addition is this document).
+
+| # | Mutation (guarded stage broken) | Suites run | Observed | Reverted |
+|---|---|---|---|---|
+| R-1 (= A7 X-A) | Regolith `step` appends `Outcome::Expired { id: me }` every tick (event-only, deliver-None, no materialization) | all `orrery_games`, `orrery_conformance`, all `orrery_witness` | battery `11 passed; 0 failed` (`chains_match_the_committed_golden` green); materialization `1 passed`; conformance `13 passed`; witness 7/25/5/5/5/12 passed. Kills only in `tests/regolith.rs`: `22 passed; 6 failed` — the same six named event assertions A7 recorded | all green (11/1/28/15) |
+| R-2 (= A7 X-C) | `executor.rs:126-127` swapped: hash before quantize | `orrery_core`, `orrery_conformance`, `orrery_games`, `orrery_witness` | **21 `test result: ok` lines, zero failures — survived everything**, confirming the snap is a live no-op for every in-tree state and the ordering is unpinned | core 73/15/11 green |
+| R-3 (= A9 M3) | `entity.to_bits().to_le_bytes()` appended to the `DiffUplink` payload in `feed_uplink` | `./scripts/core-gates.sh`; all `orrery_persist_client` | gates exit 0; `95 passed`, `2`, `2`, `1`, doc-tests `0` — **survived; no named check exists**. Honesty note: the first mutation attempt used `extend_from_slice` on `bytes::Bytes` and did not compile — no result line was emitted, and per the brief's rule a non-compiling mutation proves nothing; rewritten via `to_vec()`/`Bytes::from` and re-run to the survival above | tests green |
+| R-4 (= #417) | The `if authorities.get(diff.entity).is_err() { continue; }` guard deleted from `feed_uplink` | all `orrery_persist_client` | `95 passed; 0 failed` (+2/2/1) — survived, with rustc's `warning: unused variable: authorities` confirming the guard was genuinely gone rather than moved | tests green |
+| R-5 (= A6 M-A6-4a) | `witness.rs:868-870` advance changed to full frame span (re-delivered ranges counted twice) | all `orrery_witness` | 7/25/5/5/5/12 passed, 0 failed — **survived; the documented immunity has no check** | witness + persist_client all green (final combined run) |
+
+Steady-state re-verifications (no mutation): `cargo tree -p orrery_witness
+| grep -ci bevy` → **530** with `./scripts/core-gates.sh` → exit 0 (V13,
+matching A4/A7's figures); baseline `cargo test -p orrery_games` green
+before R-1 began.
+
+**Surviving mutations are findings, and all five reproductions were
+survivals by design** — R-1's partial kill (six unit tests) is the measured
+shape of the goldens gap, not coverage of it. None were "fixed" here;
+each is closed by a named fixture in §2/§6 whose acceptance criterion is
+the same mutation re-run.
+
+---
+
+## 12. Stale citations found while verifying
+
+| Record | Citation / phrasing | Current truth |
+|---|---|---|
+| A7 §6 (G-1) | "the scenario harness already holds every `TickOutcome` (`scenario.rs` `TickRecord`, A1 §3.3); the fixture adds a fold and a committed table" | Imprecise in a way that changes the implementation: the harness *sees* each `TickOutcome` in the loop (`scenario.rs:231-245`) but **retains none of its event content** — `Entry` keeps `{entity, inputs, hash, state}` (`:119-129`) and `Play` keeps only `events: u64` (`:150`). The fold is still cheap, but it must happen in-loop; nothing can be computed from the retained log (N-1) |
+| A9 §6 (M3) | "appended `entity.to_bits().to_le_bytes()` to the `DiffUplink` payload" | The payload is `bytes::Bytes`, which has no append; the mutation as literally described does not compile (R-3's first attempt emitted no result line). A9's *result* is accurate — reproduced via an equivalent construction — but anyone re-running the mutation from the text alone gets a compile error, not a survival |
+| A9 §6 / §8 | one `persist_client` suite at `0 passed; 0 filtered out` flagged as possibly an empty compile target, "read and noted, not counted as coverage" | Identified today with `Running` lines captured: it is `Doc-tests orrery_persist_client` — no doc-tests, not a hollow integration binary (N-3). The caution can be retired |
+| Issue #406 text | "`scripts/check.sh` carries a `WORKSPACES` table … only has its tests executed if it is listed there with role `test`" | Verified verbatim (`check.sh:90-101`, `:471-476`), and sharpened: `gates/p2-journal-bench` sits at role `check` today, so the tree already contains a bench workspace CI compiles but never runs — precedent this programme adopts deliberately (§8.2) |
+| This node's briefing text | "A8 is in flight at PR #422" | True when issued; #422 merged to `main` (`2b542c4d`) before this task began writing, and this tree fast-forwarded onto it. All A8 citations here are against the merged file |
+| This node's briefing text | "six hand-written event assertions in `tests/regolith.rs`" / battery/executor/feed line cites | All re-verified exact today: six named failing tests under R-1; `battery.rs:222`; `executor.rs:124-127`; `feed.rs:62`, `:81-92`; `regolith/mod.rs:76`; `skirmish/mod.rs:102`; `witness.rs:117-127` |
+| Inherited stale set (A1–A8 records) | ADR-0038 drift, D21 parenthetical, docs/06:210 present tense, docs/10 `orrery_field_host` rows, `persist.rs:41-44` block-grant tense, A5 `actor.rs` ±1-line drift, A7 "DiffUplick" typo | Not re-litigated; nothing this document relies on touches them beyond what predecessors recorded |
+
+---
+
+## 13. Unsure
+
+Stated as unsure rather than smoothed over:
+
+1. **The threshold numbers in §8.4 are proposals without measurement
+   behind them.** 1.10×/1.20×/8 ms are defensible starting points argued
+   from the frame budget and the brief's risk register, not derived from a
+   baseline that does not exist yet. The procedure is the deliverable; the
+   owner should expect to revise the numbers at first capture.
+2. **#417's reachability caveat is inherited intact:** whether
+   `LocalGranted`-without-`LocallyAuthoritative` occurs in a real race was
+   not determinable here either. The F-7 fixture is specified to force the
+   marker clause to be load-bearing *in the fixture*; if the state is
+   unreachable in production, the correct closure may be removing the
+   redundancy instead, and that call belongs to the fixture PR with the
+   authority-lifecycle evidence in hand.
+3. **F-2's delivery-pair leg encodes `deliver()`'s output today**; A6 owns
+   command/event semantics, and if its accepted design changes delivery
+   addressing (e.g. multi-target events), the fold's pair encoding follows
+   A6, not this spec. The chain's *existence* and its emission-order leg
+   are insensitive to that outcome.
+4. **The worker-count and profile legs cannot be demonstrated against
+   today's tree** — no parallel canonical executor exists, and no
+   `[profile]` policy is decided. Both legs are specified with their
+   arming conditions; until then they are unexercised specification, the
+   same posture A4 §11.5 took for Tier H, with the same honesty
+   obligation when they first arm.
+5. **The `swarm-large` (256-entity) corpus case's runtime cost** in the
+   four-platform matrix is unmeasured; if it proves too slow for
+   per-commit CI it should ride the nightly soak instead — placement is an
+   implementation-time decision, flagged so it is decided rather than
+   discovered.
+6. **Whether the baseline JSON belongs in-repo or as a release artifact**
+   is left open; in-repo is proposed (reviewability, the refusal check
+   reads it cheaply), but a large benchmark payload may argue otherwise.
+
+Deliberately not done:
+
+- **No implementation.** No fixture, corpus case, bench workspace, table
+  row, or gate clause was added; the five mutations lived one command run
+  each and every revert was re-confirmed (§11).
+- **No ADR text and no PR plan** — A11's (#407). The proposals here that
+  need owner acceptance through it: the threshold table (§8.4), the
+  baseline-refusal rule (§4.4/§8.3), the F-9 mechanism choice (A9's
+  options), the overflow-policy coupling of the profile leg (§5), and the
+  F-2-before-Phase-2 ordering constraint (§10).
