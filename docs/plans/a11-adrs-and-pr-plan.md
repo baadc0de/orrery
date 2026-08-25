@@ -345,3 +345,131 @@ The no-flag-day machinery, named per seam:
   regardless of other merits (A3 §7's own standard).
 - **The X-2 manifest family is append-only**, so no rollback orphans rows:
   a reverted build's manifest record simply stops being referenced.
+
+---
+
+## 6. The brief's phases 0–8, mapped
+
+The brief calls its sequence "intentionally provisional" and asks for it to
+be reordered or rejected on evidence. Verdict per phase:
+
+| Phase (brief) | Verdict | Where it lands |
+|---|---|---|
+| 0 — archaeology and dependency map | **Done**, exceeded | A1 (map + ten assumptions verdicts), A2 (ownership), A3 §1 (ground truth). Outstanding sliver: the build-time/binary-size baseline the brief lists — B-7, captured by PR-5 |
+| 1 — behavioural conformance fixtures | **Programmed** | A10's fixture set; tranches 1–2 (PR-1..PR-5, PR-9, PR-10). The brief's own exit criterion ("existing behaviour comparable mechanically with a replacement") is *not yet met by goldens alone* — X-A proved it — which is why F-2 is mandatory before Phase 2 |
+| 2 — composition without ECS | **Scheduled** | Tranche 3 (PR-11, PR-12), gated on R1/R8 acceptance and PR-9. Purpose kept verbatim: separate the module-model decision from the ECS-storage decision |
+| 3 — canonical simulation host | **Scheduled** | Tranche 4 (PR-15, PR-16). Reordered *after* Phase 2 lands its skeleton, matching both A3 lanes; the brief's own exit criteria adopted unchanged |
+| 4 — `bevy_ecs` behind the host | **Conditional — not scheduled** | Trigger-gated (T1–T3) with the pre-registered precondition package (tranche 5). The digest forbids nothing here; the *evidence* does: every immediate benefit currently lacks a consumer (A3/second opinion E-7) |
+| 5 — incremental domain migration | **Conditional** | Follows a promoted pilot; A10 §4's per-module differential recipe is the mechanism; the brief's seven-step per-module list survives intact |
+| 6 — canonical/presentation isolation | **Largely already true; remainder gated** | The isolation the phase wants *ships* (dedicated store, mirrors, A9 §2). The un-built remainder — presentation-frame schema, AOI extraction contract, F-11 — waits for its first consumer (A10 V16: nothing exists to fixture) |
+| 7 — generic and compatibility cleanup | **Tail, partially reordered** | `classify_component` removal sequenced last (A5 rider); `R:` propagation is already narrow (A1 §4.4) so the phase's "reduce workspace-wide propagation" has little to do; adapter removal follows parity per module |
+| 8 — Unreal-facing proof | **Deferred, specified** | A9 §5's observer proof with falsifiable checks P-1..P-4; opens when the owner supplies the Unreal requirement (decision 17) and the host seam exists |
+
+**No flag-day migration** holds by construction: at every tranche boundary
+the tree is releasable, all gates green, no dual implementation past its
+parity proof, and the wire untouched.
+
+---
+
+## 7. The exact first PR
+
+**PR-1 — pin quantize-before-hash (fixture F-3).** The first
+implementation PR of the programme (PR-0, the docs census fix, can precede
+it independently and needs no acceptance at all).
+
+**Why this one first:** it closes a live, twice-reproduced coverage hole
+(A7 X-C; A10 R-2: hashing before quantizing survives all 21 suites today);
+it is the smallest possible change — one test-only ruleset, one named
+test; it touches only `orrery_conformance` (outside the P4 digest, inside
+the root workspace, so it runs in existing CI with no `check.sh` table
+edit); it changes zero behaviour; and every later parity argument leans on
+the property it pins ("a claim commits to exactly what replication and
+persistence saw", `ruleset.rs:319-326`).
+
+**Scope (files):**
+
+- `crates/orrery_conformance/tests/quantize_pin.rs` (new): a minimal
+  test-only `Ruleset` whose `CoreState` holds a continuous field in raw
+  micrometres and whose `step` writes a deliberately off-lattice value
+  (e.g. `pos += 1_499` µm against the 1 mm lattice); `quantize()` snaps
+  half-away-from-zero per `quantize.rs`. One named test:
+  `the_claimed_hash_is_of_the_quantized_state_not_the_raw_one` — drive one
+  entity one tick through `Executor::step_entity`; compute
+  `state_hash(quantized_expected)` and `state_hash(raw_expected)`
+  independently in the test; assert the outcome's hash **equals the
+  former and differs from the latter**.
+- Nothing else. No source file of any other crate.
+
+**Acceptance criteria (each testable):**
+
+1. The named test passes on an unmodified tree.
+2. **Mutation kill demonstrated in the PR description:** re-applying X-C's
+   two-line swap at `executor.rs:126-127` makes the named test fail;
+   reverting makes it pass. (This converts X-C from "survived everything"
+   to "killed by one named check".)
+3. **Vacuity self-check:** the in-test assertion `hash(quantized) ≠
+   hash(raw)` means an accidentally on-lattice fixture fails itself rather
+   than silently pinning nothing — the #417 lesson applied to the
+   fixture's own construction.
+4. `./scripts/core-gates.sh` exits 0 (the test ruleset obeys VC-4/6/8 —
+   `orrery_conformance` is a gated crate, which is deliberate: the fixture
+   lives under the same discipline as the code it pins).
+5. The P4 pipeline digest is byte-identical before and after
+   (`p4-ledger.sh`'s four trees untouched) — stated and checked, so the
+   PR is provably window-safe.
+
+**Non-goals (explicit):** no change to `Executor` or `quantize.rs`; no new
+corpus case (PR-2's job); no golden regeneration; no fix of any other
+finding; no ADR text.
+
+**Dependencies:** the programme acceptance (§2's last block). Nothing
+else — no R-record is needed to pin behaviour that docs/06 VC-7 already
+states and the executor already implements.
+
+---
+
+## 8. Traceability
+
+### 8.1 The #395 table, filled
+
+| Brief section | Lands in | Outcome |
+|---|---|---|
+| Assignment (10 points) | A1–A11 | 1→A1 (surface + call sites); 2→A1 §4.4 + A3 disputed-claims ledgers (real-vs-speculative separated claim by claim); 3→A3 (five variants, two independent lanes); 4→A3 §7 / second opinion §6 (recommendation with what it beat); 5→A11 §5 (phased PRs); 6→A11 §5.3–5.4 + §6 (gates preserved, no flag-day); 7→A11 §3 (twenty + twelve surfaced); 8→A11 §2 (eight records, three amendments); 9→A10 (fixtures/benchmarks before implementation); 10→conflicts called out: V2 vs the strike economy (A3), the gate's coverage-vs-name gap (A4 §1.2), rolling upgrade vs D29 (A8 §6), event-sourcing vs state-commitment doctrine (A7 §4.5) |
+| Current-state assumptions (10) | A1 §9 | 8 confirmed, 1 corrected (#5: lightyear coupling is configuration-layer; rules-execution Bevy coupling lives in witness plugin + clients), 1 unverifiable (#10: no Unreal evidence exists in-tree; treated as an imported requirement) |
+| Architecture variants (4) | A3 + second opinion | Five scored (brief's four + a tree-suggested hybrid), two independent weighted matrices; shared world rejected in both by unbridgeable margins; convergent action adopted (§1); V3 preserved as the trigger-gated future, V4's substance kept without its foreclosure |
+| Decision matrix | A3 §5–§6; second opinion §4–§5 | Weights justified before scoring in both lanes; sensitivity passes recorded (V1's lead survives hostile reweighting; V5-over-V1 named as inside method noise with V1 the fallback); unevidenced claims excluded from arithmetic by rule |
+| Phases 0–8 | A11 §6 | 0 done · 1 programmed · 2–3 scheduled · 4–5 conditional (trigger-gated) · 6 partially shipped, remainder consumer-gated · 7 tail · 8 deferred-specified |
+| Owner decisions (20) | A11 §3.1 | All twenty dispositioned: 9 answered, 2 settled by accepted records, 7 proposed (each naming its record), 2 deferred (each naming its condition), 0 withdrawn — plus 12 surfaced decisions (OD-21..OD-32) in §3.2 |
+| Expected deliverable (9 sections) | A1–A11 | 1 Repository evidence→A1(+A2 §3); 2 Problem validation→A1 §4.4/A3 §8/second opinion §7; 3 Variants→A3 both lanes; 4 Recommendation→A3 §7 (component model: per-entity executor + capability registry; scheduling: A4 S0–S7; composition: A8 §3.1 struct-of-tables; persistence/rollback/witness: A7 P-1/R-1/WP-1..6; boundaries: A9); 5 Migration plan→A11 §5; 6 Verification plan→A10; 7 ADR plan→A11 §2; 8 Open decisions→A11 §3; 9 First PR→A11 §7 |
+
+### 8.2 Every remaining brief section, mapped
+
+The epic's table rows cover the load-bearing sections; the brief has
+further headings, and "every section maps to a decision, a task, or an
+explicit deferral" means all of them:
+
+| Brief section (line) | Maps to |
+|---|---|
+| Executive summary / working hypothesis (:42-59) | Critiqued and partially adopted: composition root yes, ECS substrate no-for-now (R1). The hypothesis's own caveat ("ECS does not deliver determinism…") is what A4–A8 built above the storage question |
+| Motivation: what is good / what becomes dangerous (:63-105) | Validated as narrow-real + scale-speculative (A1 §4.4, A3 C1); the god-trait failure list is the pre-registered E-1 experiment's checklist, not a present fact |
+| Proposed conceptual model: kernel (:130-146) | A2 §2 rows 1–8 (ownership decided); the "may use bevy_ecs internally" clause is R1's trigger-gated door |
+| Rules modules (:148-175) | A2 (ownership) + A8 (module table, versioning) + tranche 3 (tasks). Illustrative names not adopted (brief's own instruction) |
+| Integration modules (:177-195) | Evaluated both ways in A2 §5; construct deferred to the composition root's evidence (A2 §5.3's four properties are the binding requirement); decision explicitly *not* forced |
+| Game definition / assembled ruleset (:197-231) | A8 §3.1 decided the construct (struct-of-tables, not the illustrative trait); PR-11 |
+| Dedicated canonical world + costs/benefits (:236-272) | Decided (R1): dedicated permanently — it already ships; costs measured (mirror µs-scale), benefits inventoried; single-world comparison done twice |
+| Stable identity (:274-294) | R3 (all seven bullet questions answered in A5 §2: creation/allocation, lookup ownership, despawn/tombstones, rollback of maps, cross-island/cell, staleness, predicted identity class) |
+| Deterministic scheduling model + 10 questions (:297-341) | R2; A4 §3 answers all ten (envelope; parallelism = S2 across entities; event ordering = producer-total-order; deferred commands = S6 only; structural order = emission/FWW; query order never observable; float policy = VC-5/6/7; RNG partition = VC-3; topology hash = schedule digest; violation detection = E-M1..13) |
+| Component policy registry (:346-380) | R4 (five dimensions, not one object — the brief's own overgeneralization warning honoured); reflection clause adopted verbatim as N-6 |
+| Commands, events, and queries (:384-407) | R5; every listed item (ordering, delivery, replay, rollback, dedup, volume, stored-vs-derived, cyclic subscription) has a rule row in A6 §3 |
+| Persistence / rollback / witnessing (:410-449) | P-1 (no new strategy — the tier hybrid stands), R6 (unit), R7 (projection; the manifest-identifies list is A7 §7.2); strategy comparison in A7 §4 covers all five candidates incl. the brief's world-clone skepticism, answered structurally |
+| Bevy integration variants A/B (:453-470) | Decided: A (dedicated) permanently, B rejected; SubApp vs manual `World` answered — manual, `SubApp` drags `bevy_app` (second opinion E-9/C-8) |
+| Unreal integration implications (:474-511) | A9 §4 [SPEC] + §5 observer proof; boundary rules adopted; deferred behind decision 17 |
+| Variants to compare + matrix criteria (:515-577) | A3 both lanes; every suggested criterion appears in one or both weight tables |
+| Compatibility and versioning (:581-608) | R8; all eight "plan must determine" bullets answered in A8 §§4-8; static recommendation ratified |
+| Migration principles (:612-623) | All ten adopted; #9 (compatibility adapter) is §5.3; #10 is the tranche structure itself |
+| Candidate phased migration (:627-771) | §6's per-phase verdicts (reordered/gated exactly where evidence demanded) |
+| Testing strategy (:775-829) | A10 wholesale: determinism §5, differential §4, persistence §6.1, rollback/prediction §6.2, modularity §7.1, performance §8 |
+| Primary risks (:832-895) | Each risk has an owner: Bevy churn→R8 pins + D14 + narrow facade (and no bevy_ecs adoption yet); false determinism confidence→refuse-over-observe doctrine; Lightyear duplication→R6/L-1 ownership split; two-world overhead→measured, bounded, AOI-scoped; overgeneralized module API→five registries not one object, struct-of-tables; premature dynamic→D21 ratified; protocol leakage→IV-7/WP-5/G-1 closure (OD-26) |
+| Suggested agent prompt (:975-979) | Consumed — it is the epic's own working method; no decision content |
+| Initial recommendation (:983-1000) | Points 1–2, 5–10 adopted; points 3–4 (ECS substrate, dedicated world *now*) amended to trigger-gated (R1) — the one place the plan diverges from the brief's initial preference, with two independent matrices as the reason |
+| Reference material (:1004-1010) | Checked where load-bearing (docs/10 census wrong three ways → DA-1; ADR-0004 exists; Bevy 0.19 pinned) |
