@@ -204,7 +204,7 @@ commits to.
   but the full gate bundle (ambiguity detection, projection differential test,
   neighbour-query lint equivalent) is undesigned work owned by A4, and until it
   exists the property is conventional. [P + S; delivery [U] until A4 lands]
-- **Unreal sidecar/embedding:** strongest with V4 — the host is a library with
+- **Unreal sidecar/embedding:** tied-best with V4 — the host is a library with
   a command-in/frames-out contract; bevy_ecs types need never cross the ABI
   (the brief's own boundary, `ruleset-ecs-migration-brief.md:495-505`). [S +
   P1's headless demonstration]
@@ -424,10 +424,12 @@ where it scores maxima.** To flip the ranking, a skeptic must show one of:
 3. Evidence that H1's tier boundary collapses (A5's policy registry replacing
    `CoreClass` entirely), which would demote H1 toward V3's row.
 
-Conversely, the ranking survives plausible swings elsewhere: even granting
-V3 perfect scores on dimensions 8–10 and V1 floor scores there, V1 leads by
-more than 70 points; the matrix's verdict lives where the evidence is, not
-where taste is.
+Conversely, the ranking survives plausible swings on the soft dimensions:
+even simultaneously flooring V1 and perfecting V3 on dimensions 8–10 — the
+three lowest-confidence rows — V1 still leads, 394 to 374. An overturn must
+reach the top-weight rows, which is why the three flip conditions above are
+all about witness fit, determinism enforceability, or demonstrated modularity
+failure, and none about cost or ergonomics.
 
 ---
 
