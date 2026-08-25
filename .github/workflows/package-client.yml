@@ -56,6 +56,24 @@ jobs:
       - name: Install the pinned toolchain
         run: rustup show active-toolchain || rustup toolchain install
 
+      # The client takes `bevy` with default features, which pulls bevy_winit
+      # and its display/audio stack, so alsa-sys, libudev-sys and wayland-sys
+      # probe pkg-config at build-script time. A developer machine usually has
+      # these; a hosted runner does not — which is why this workflow built
+      # locally and failed on `ubuntu-latest`. `ci.yml` installs the same set
+      # for its clippy, test and gates lanes; this workflow needs it for the
+      # same reason and did not have it.
+      #
+      # Linux only: the macOS and Windows runners ship their own display and
+      # audio SDKs, and `apt-get` does not exist there.
+      - name: Install Bevy's Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            g++ pkg-config libx11-dev libasound2-dev libudev-dev \
+            libwayland-dev libxkbcommon-dev
+
       - name: Build the standalone Regolith workspace
         run: cargo build --release
 
