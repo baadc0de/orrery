@@ -284,18 +284,12 @@ impl Ruleset for Reference {
                     let roll = rng.next_u32();
                     roll_fold = roll_fold.rotate_left(7) ^ u64::from(roll);
                     let amount = (*power as i32).saturating_add((roll % 8) as i32);
-                    // The attacker does not look at the target. `StateView`
-                    // records a neighbour read, but nothing replays one: no
-                    // `NeighborFrame` producer exists yet (docs/06 §3), and
-                    // `ReplayHarness::load_claimed_snapshot` installs exactly
-                    // one entity, so at replay every neighbour read is `None`.
-                    // A rule that branched on the target's liveness would
-                    // therefore adjudicate differently than it executed — and
-                    // invisibly, because the roll above is folded into
-                    // `roll_fold` *before* any such branch, leaving the
-                    // attacker's own state hash identical either way while the
-                    // emitted event differs. Liveness is the target's own
-                    // business, decided in its `Damage` arm below.
+                    // The attacker does not look at the target. Recorded
+                    // neighbour replay exists for narrowly audited spatial
+                    // claims, but liveness is still the target's own business
+                    // and is decided in its `Damage` arm below. Keeping this
+                    // effect event-carried also keeps the conformance corpus's
+                    // isolated per-entity replay shape deliberately small.
                     events.push(Outcome::DamageApplied {
                         target: *target,
                         amount,

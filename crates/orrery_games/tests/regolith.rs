@@ -13,8 +13,8 @@ use orrery_games::regolith::{
     weapon::WeaponKind,
     Regolith, BLOOM_CADENCE_TICKS, BLOOM_CENTRAL_RADIUS_MM, BLOOM_LIFETIME_TICKS, BLOOM_ROCK_COUNT,
     ISLAND_CRAFT_BUDGET, ISLAND_DIRECTOR_BUDGET, ISLAND_PICKUP_BUDGET, ISLAND_ROCK_BUDGET,
-    ISLAND_WINDOW_BUDGET, KILL_SCORE_POINTS, LOCK_ACQUISITION_TICKS, PICKUP_SCORE_POINTS,
-    PICKUP_TTL_TICKS, REGOLITH_RULESET, RESPAWN_TICKS,
+    ISLAND_WINDOW_BUDGET, KILL_SCORE_POINTS, LOCK_ACQUISITION_TICKS, LOCK_BREAK_TICKS,
+    LOCK_DECAY_PER_TICK, PICKUP_SCORE_POINTS, PICKUP_TTL_TICKS, REGOLITH_RULESET, RESPAWN_TICKS,
 };
 use orrery_protocol::{PersistId, Tick, UniverseSeed};
 use rand_chacha::rand_core::SeedableRng;
@@ -82,8 +82,8 @@ fn sample<'a>(
 }
 
 #[test]
-fn v8_weapon_table_ruleset_identity_and_island_budget_are_pinned() {
-    assert_eq!(REGOLITH_RULESET.version, 8);
+fn v9_weapon_table_ruleset_identity_and_island_budget_are_pinned() {
+    assert_eq!(REGOLITH_RULESET.version, 9);
     assert_eq!(WeaponKind::Stock.weapon().damage_base, 10);
     assert_eq!(WeaponKind::Volley.weapon().rolls, 3);
     assert_eq!(WeaponKind::Stock.weapon().optimal_mm, 300_000);
@@ -1079,6 +1079,139 @@ fn fire_on_the_locked_target_keeps_banked_acquisition() {
 }
 
 #[test]
+fn claimed_cover_behind_empty_space_is_rejected() {
+    let target = PersistId::new(1);
+    let locker = PersistId::new(2);
+    let rock = PersistId::new(3);
+    let mut target_state = craft_at(100_000);
+    target_state.pos.y = 0;
+    let mut locker_state = locked_craft(target);
+    locker_state.pos = QPos::default();
+    let mut off_axis = Rock::spawned(
+        RockTier::Small,
+        0,
+        QPos {
+            x: 50_000,
+            y: 50_000,
+            z: 0,
+        },
+        QVel::default(),
+    );
+    off_axis.hull = off_axis.tier.limits().max_hull;
+
+    let mut executor = Executor::new(Regolith::honest(), UniverseSeed([0x44; 32]));
+    executor.insert_observed(target, RegolithState::Craft(target_state), Tick::new(100));
+    executor.insert_observed(locker, RegolithState::Craft(locker_state), Tick::new(99));
+    executor.insert_observed(rock, RegolithState::Rock(off_axis), Tick::new(98));
+    let outcome = executor
+        .step_entity(
+            target,
+            Tick::new(100),
+            &[Order::ClaimCover { locker, rock }],
+        )
+        .expect("target exists");
+
+    assert_eq!(outcome.neighbor_reads, vec![locker, rock]);
+    assert_eq!(outcome.neighbor_frames[0].observed_tick, Tick::new(99));
+    assert_eq!(outcome.neighbor_frames[1].observed_tick, Tick::new(98));
+    assert!(outcome.events.contains(&Outcome::LockVisibility {
+        locker,
+        target,
+        occluded: false,
+    }));
+    assert!(matches!(
+        executor.state(target),
+        Some(RegolithState::Craft(Craft {
+            last_cover_occluded: false,
+            ..
+        }))
+    ));
+}
+
+#[test]
+fn occluded_lock_decays_over_time_and_visibility_restores_it() {
+    let locker = PersistId::new(1);
+    let target = PersistId::new(2);
+    let mut executor = Executor::new(Regolith::honest(), UniverseSeed([0x45; 32]));
+    executor.insert(locker, RegolithState::Craft(locked_craft(target)));
+
+    executor
+        .step_entity(
+            locker,
+            Tick::new(1),
+            &[Order::LockVisibility {
+                target,
+                occluded: true,
+            }],
+        )
+        .expect("locker exists");
+    assert!(
+        matches!(
+            executor.state(locker),
+            Some(RegolithState::Craft(Craft {
+                lock_target: Some(found),
+                lock_decay_progress: LOCK_DECAY_PER_TICK,
+                ..
+            })) if *found == target
+        ),
+        "one occluded tick must start decay, not drop the lock"
+    );
+
+    for tick in 2..u64::from(LOCK_BREAK_TICKS / 2) {
+        executor
+            .step_entity(locker, Tick::new(tick), &[])
+            .expect("locker exists");
+    }
+    executor
+        .step_entity(
+            locker,
+            Tick::new(u64::from(LOCK_BREAK_TICKS / 2)),
+            &[Order::LockVisibility {
+                target,
+                occluded: false,
+            }],
+        )
+        .expect("locker exists");
+    assert!(
+        matches!(
+            executor.state(locker),
+            Some(RegolithState::Craft(Craft {
+                lock_target: Some(found),
+                lock_progress: LOCK_ACQUISITION_TICKS,
+                lock_decay_progress: 0,
+                ..
+            })) if *found == target
+        ),
+        "restored visibility must restore the held lock before decay completes"
+    );
+
+    executor
+        .step_entity(
+            locker,
+            Tick::new(100),
+            &[Order::LockVisibility {
+                target,
+                occluded: true,
+            }],
+        )
+        .expect("locker exists");
+    for tick in 101..100 + u64::from(LOCK_BREAK_TICKS) {
+        executor
+            .step_entity(locker, Tick::new(tick), &[])
+            .expect("locker exists");
+    }
+    assert!(matches!(
+        executor.state(locker),
+        Some(RegolithState::Craft(Craft {
+            lock_target: None,
+            lock_progress: 0,
+            lock_decay_progress: 0,
+            ..
+        }))
+    ));
+}
+
+#[test]
 fn range_exceeded_and_target_destroyed_break_logged_locks() {
     let game = Regolith::honest();
     let locker = PersistId::new(1);
@@ -1427,6 +1560,14 @@ fn pickup_state_and_grammar_are_canonical() {
             target: pickup,
             result: ShotResult::Miss,
         },
+        Order::ClaimCover {
+            locker: ship,
+            rock: pickup,
+        },
+        Order::LockVisibility {
+            target: ship,
+            occluded: true,
+        },
     ];
     for order in orders {
         assert_eq!(Order::decode(&order.to_canonical()).unwrap(), order);
@@ -1476,6 +1617,11 @@ fn pickup_state_and_grammar_are_canonical() {
             attacker: ship,
             target: pickup,
             result: ShotResult::Hit,
+        },
+        Outcome::LockVisibility {
+            locker: ship,
+            target: pickup,
+            occluded: true,
         },
     ];
     for outcome in outcomes {

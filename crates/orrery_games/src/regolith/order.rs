@@ -180,6 +180,20 @@ pub enum Order {
         /// Whether the projectile hit or missed.
         result: ShotResult,
     },
+    /// Claim that one named rock changed visibility between this target and a locker.
+    ClaimCover {
+        /// Craft whose lock is being challenged.
+        locker: PersistId,
+        /// Rock the target's client found in the line segment.
+        rock: PersistId,
+    },
+    /// A verified visibility transition delivered to the locker.
+    LockVisibility {
+        /// Target whose visibility changed.
+        target: PersistId,
+        /// Whether the named rock currently occludes the segment.
+        occluded: bool,
+    },
 }
 
 impl CoreCodec for Order {
@@ -251,6 +265,16 @@ impl CoreCodec for Order {
                 out.extend_from_slice(&target.0.to_le_bytes());
                 out.push(result.tag());
             }
+            Self::ClaimCover { locker, rock } => {
+                out.push(12);
+                out.extend_from_slice(&locker.0.to_le_bytes());
+                out.extend_from_slice(&rock.0.to_le_bytes());
+            }
+            Self::LockVisibility { target, occluded } => {
+                out.push(13);
+                out.extend_from_slice(&target.0.to_le_bytes());
+                out.push(u8::from(*occluded));
+            }
         }
     }
     fn decode(bytes: &[u8]) -> Result<Self, CodecError> {
@@ -299,6 +323,14 @@ impl CoreCodec for Order {
             (11, 9) => Ok(Self::ShotResolved {
                 target: PersistId::new(u64::from_le_bytes(rest[0..8].try_into().unwrap())),
                 result: ShotResult::from_tag(rest[8])?,
+            }),
+            (12, 16) => Ok(Self::ClaimCover {
+                locker: PersistId::new(u64::from_le_bytes(rest[0..8].try_into().unwrap())),
+                rock: PersistId::new(u64::from_le_bytes(rest[8..16].try_into().unwrap())),
+            }),
+            (13, 9) if rest[8] <= 1 => Ok(Self::LockVisibility {
+                target: PersistId::new(u64::from_le_bytes(rest[0..8].try_into().unwrap())),
+                occluded: rest[8] == 1,
             }),
             _ => Err(CodecError("regolith order: bad tag or length")),
         }
@@ -422,6 +454,15 @@ pub enum Outcome {
         target: PersistId,
         /// Whether the projectile hit or missed.
         result: ShotResult,
+    },
+    /// A target verified a named cover transition for delivery to its locker.
+    LockVisibility {
+        /// Locker receiving the transition.
+        locker: PersistId,
+        /// Target whose visibility changed.
+        target: PersistId,
+        /// Whether the named rock currently occludes the segment.
+        occluded: bool,
     },
 }
 
@@ -594,6 +635,16 @@ impl CoreCodec for Outcome {
                 out.extend_from_slice(&target.0.to_le_bytes());
                 out.push(result.tag());
             }
+            Self::LockVisibility {
+                locker,
+                target,
+                occluded,
+            } => {
+                out.push(13);
+                out.extend_from_slice(&locker.0.to_le_bytes());
+                out.extend_from_slice(&target.0.to_le_bytes());
+                out.push(u8::from(*occluded));
+            }
         }
     }
     fn decode(bytes: &[u8]) -> Result<Self, CodecError> {
@@ -676,6 +727,11 @@ impl CoreCodec for Outcome {
                 attacker: PersistId::new(u64::from_le_bytes(rest[0..8].try_into().unwrap())),
                 target: PersistId::new(u64::from_le_bytes(rest[8..16].try_into().unwrap())),
                 result: ShotResult::from_tag(rest[16])?,
+            }),
+            (13, 17) if rest[16] <= 1 => Ok(Self::LockVisibility {
+                locker: PersistId::new(u64::from_le_bytes(rest[0..8].try_into().unwrap())),
+                target: PersistId::new(u64::from_le_bytes(rest[8..16].try_into().unwrap())),
+                occluded: rest[16] == 1,
             }),
             _ => Err(CodecError("regolith outcome: bad tag or length")),
         }

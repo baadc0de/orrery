@@ -14,9 +14,11 @@
 //! evidence.
 
 use orrery_protocol::{
-    ChainHash, EntitySlice, InputRecord, LogFrame, NodeId, PersistId, RollingHead, RulesetId,
-    Signature, StateClaim, Tick,
+    ChainHash, EntitySlice, InputRecord, LogFrame, NodeId, PersistId, RecordSource, RollingHead,
+    RulesetId, Signature, StateClaim, Tick,
 };
+
+use crate::executor::NeighborFrame;
 
 /// Domain separator for frame signatures, so a frame preimage can never be
 /// mistaken for a claim preimage under the same key.
@@ -41,6 +43,77 @@ pub fn fold(previous: ChainHash, record: &InputRecord) -> ChainHash {
 #[must_use]
 pub fn fold_all(previous: ChainHash, records: &[InputRecord]) -> ChainHash {
     records.iter().fold(previous, fold)
+}
+
+/// Encode one executor-produced neighbour observation into the entity log.
+#[must_use]
+pub fn neighbor_record(tick_off: u16, seq: u16, frame: &NeighborFrame) -> InputRecord {
+    InputRecord {
+        tick_off,
+        seq,
+        source: orrery_protocol::RecordSource::NeighborFrame {
+            neighbor: frame.neighbor,
+            present: frame.state.is_some(),
+            observed_tick: frame.observed_tick,
+        },
+        payload: bytes::Bytes::copy_from_slice(frame.state.as_deref().unwrap_or_default()),
+    }
+}
+
+/// Why a recorded neighbour observation could not be cross-checked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NeighborCrossCheckError {
+    /// The record is not a neighbour observation.
+    WrongRecordKind,
+    /// The declared observation is from the future or beyond the staleness cap.
+    Stale,
+    /// The supplied signed claim is for another entity or tick.
+    ClaimMismatch,
+    /// The neighbour authority did not sign the supplied claim.
+    ClaimSignatureInvalid,
+    /// The frame bytes do not hash to the signed state claim.
+    StateHashMismatch,
+}
+
+/// Cross-check a neighbour frame against the claim from the tick it declares.
+///
+/// Every error means "refuse this cross-check", never "convict the reader".
+/// In particular, staleness is tested before state hashes so ordinary
+/// replication lag cannot be transformed into a deviation verdict.
+pub fn cross_check_neighbor_record(
+    record: &InputRecord,
+    reader_tick: Tick,
+    staleness_cap: u64,
+    claim: &StateClaim,
+    neighbor_authority: NodeId,
+) -> Result<(), NeighborCrossCheckError> {
+    let RecordSource::NeighborFrame {
+        neighbor,
+        present,
+        observed_tick,
+    } = record.source
+    else {
+        return Err(NeighborCrossCheckError::WrongRecordKind);
+    };
+    if reader_tick
+        .0
+        .checked_sub(observed_tick.0)
+        .is_none_or(|age| age > staleness_cap)
+    {
+        return Err(NeighborCrossCheckError::Stale);
+    }
+    if claim.entity != neighbor || claim.tick != observed_tick {
+        return Err(NeighborCrossCheckError::ClaimMismatch);
+    }
+    if !present {
+        return Err(NeighborCrossCheckError::StateHashMismatch);
+    }
+    verify_claim(claim, neighbor_authority)
+        .map_err(|_| NeighborCrossCheckError::ClaimSignatureInvalid)?;
+    if *blake3::hash(&record.payload).as_bytes() != claim.state_hash {
+        return Err(NeighborCrossCheckError::StateHashMismatch);
+    }
+    Ok(())
 }
 
 /// One entity's live chain, as the authority maintains it.
@@ -526,5 +599,41 @@ mod tests {
         let preimage = frame_preimage(ruleset, Tick::new(0), 1, &[]);
         assert!(preimage.starts_with(FRAME_DOMAIN));
         assert!(!preimage.starts_with(CLAIM_DOMAIN));
+    }
+
+    #[test]
+    fn neighbor_cross_check_uses_declared_tick_and_refuses_stale_frames() {
+        let authority = key(4);
+        let state = b"canonical neighbor state";
+        let mut claim = StateClaim {
+            entity: PersistId::new(9),
+            chain_epoch: 0,
+            tick: Tick::new(95),
+            input_head: ChainHash::EMPTY,
+            state_hash: *blake3::hash(state).as_bytes(),
+            prev_claim: [0; 32],
+            ruleset: ruleset(),
+            sig: authority.sign(b"unsigned"),
+        };
+        sign_claim(&authority, &mut claim);
+        let record = InputRecord {
+            tick_off: 0,
+            seq: 0,
+            source: RecordSource::NeighborFrame {
+                neighbor: PersistId::new(9),
+                present: true,
+                observed_tick: Tick::new(95),
+            },
+            payload: bytes::Bytes::from_static(state),
+        };
+
+        assert_eq!(
+            cross_check_neighbor_record(&record, Tick::new(100), 5, &claim, authority.public()),
+            Ok(())
+        );
+        assert_eq!(
+            cross_check_neighbor_record(&record, Tick::new(101), 5, &claim, authority.public()),
+            Err(NeighborCrossCheckError::Stale)
+        );
     }
 }

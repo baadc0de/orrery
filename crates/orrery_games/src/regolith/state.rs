@@ -54,6 +54,12 @@ pub struct Craft {
     pub lock_progress: u16,
     /// Locks acquired, ever. Monotone and state-hashed.
     pub locks_acquired: u32,
+    /// Accumulated occluded progress; zero means the held lock is not decaying.
+    pub lock_decay_progress: u16,
+    /// Ticks until another two-neighbour visibility claim may be checked.
+    pub cover_claim_cooldown: u16,
+    /// Result of the last verified cover claim, retained in hashed own state.
+    pub last_cover_occluded: bool,
 }
 
 /// A rock's published tier. Its limits are derived from this hashed value,
@@ -225,7 +231,7 @@ pub enum RegolithState {
     BloomDirector(BloomDirector),
 }
 
-const CRAFT_ENCODED_LEN: usize = 121;
+const CRAFT_ENCODED_LEN: usize = 126;
 
 impl Quantized for Craft {
     fn quantize(&mut self) {
@@ -302,9 +308,12 @@ impl CoreCodec for Craft {
         }
         out.extend_from_slice(&self.lock_progress.to_le_bytes());
         out.extend_from_slice(&self.locks_acquired.to_le_bytes());
+        out.extend_from_slice(&self.lock_decay_progress.to_le_bytes());
+        out.extend_from_slice(&self.cover_claim_cooldown.to_le_bytes());
+        out.push(u8::from(self.last_cover_occluded));
     }
     fn decode(bytes: &[u8]) -> Result<Self, CodecError> {
-        if bytes.len() != CRAFT_ENCODED_LEN || bytes[106] > 1 {
+        if bytes.len() != CRAFT_ENCODED_LEN || bytes[106] > 1 || bytes[125] > 1 {
             return Err(CodecError("regolith craft: wrong length"));
         }
         let i64_at = |o| i64::from_le_bytes(bytes[o..o + 8].try_into().unwrap());
@@ -342,6 +351,9 @@ impl CoreCodec for Craft {
             }),
             lock_progress: u16::from_le_bytes(bytes[115..117].try_into().unwrap()),
             locks_acquired: u32::from_le_bytes(bytes[117..121].try_into().unwrap()),
+            lock_decay_progress: u16::from_le_bytes(bytes[121..123].try_into().unwrap()),
+            cover_claim_cooldown: u16::from_le_bytes(bytes[123..125].try_into().unwrap()),
+            last_cover_occluded: bytes[125] == 1,
         })
     }
 }
@@ -558,6 +570,9 @@ impl Craft {
             lock_target: None,
             lock_progress: 0,
             locks_acquired: 0,
+            lock_decay_progress: 0,
+            cover_claim_cooldown: 0,
+            last_cover_occluded: false,
         }
     }
     /// Whether this craft is active.

@@ -130,7 +130,7 @@ impl<'a, S> StateView<'a, S> {
     /// windows that cannot be replayed.
     pub fn neighbor(&mut self, id: PersistId) -> Option<&S> {
         let found = self.neighbors.get(&id);
-        if found.is_some() && !self.reads.contains(&id) {
+        if !self.reads.contains(&id) {
             self.reads.push(id);
         }
         found
@@ -246,6 +246,23 @@ pub trait Ruleset: Send + Sync + 'static {
     /// This build's version identity, pinned into every frame, claim and
     /// bundle.
     fn id(&self) -> RulesetId;
+
+    /// Maximum recorded neighbour reads one entity may perform in one tick.
+    ///
+    /// Zero is fail-closed for rulesets that do not use spatial claims. A
+    /// replay carrying more frames than this is malformed rather than merely
+    /// expensive.
+    fn max_neighbor_reads(&self) -> usize {
+        0
+    }
+
+    /// Oldest neighbour observation this ruleset will consume, in ticks.
+    ///
+    /// Zero admits only observations stamped with the reader's tick. Games
+    /// that accept replication lag must pin a finite non-zero bound.
+    fn max_neighbor_staleness_ticks(&self) -> u64 {
+        0
+    }
 
     /// Advance one 60 Hz tick for one entity.
     ///
@@ -364,14 +381,14 @@ mod tests {
     }
 
     #[test]
-    fn a_missing_neighbour_is_not_recorded() {
+    fn a_missing_neighbour_attempt_is_recorded() {
         // Recording a read that returned nothing would make replay demand a
         // neighbour frame the authority never actually consulted.
         let mut own = Bag(1);
         let neighbors = BTreeMap::new();
         let mut view = StateView::new(PersistId::new(1), &mut own, &neighbors);
         assert!(view.neighbor(PersistId::new(9)).is_none());
-        assert!(view.recorded_reads().is_empty());
+        assert_eq!(view.recorded_reads(), &[PersistId::new(9)]);
     }
 
     #[test]

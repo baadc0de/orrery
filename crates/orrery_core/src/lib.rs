@@ -82,7 +82,8 @@ pub mod ruleset;
 pub mod store;
 pub mod tolerance;
 
-pub use executor::{Executor, TickOutcome, TICK_HZ, TICK_NANOS};
+pub use executor::{Executor, NeighborFrame, TickOutcome, TICK_HZ, TICK_NANOS};
+pub mod geometry;
 pub use invariants::{evaluate, Invariant, InvariantKind, InvariantSample, InvariantViolation};
 pub use migration::ComponentMigrator;
 pub use quantize::{QPos, QVel, Quantized};
