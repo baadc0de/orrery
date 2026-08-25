@@ -217,7 +217,7 @@ Within a stage, systems form a total order established at composition time:
 - **S2** parallelizes freely *across entities* (independent own-state writes)
   but never across systems with overlapping access without an explicit edge.
 - Every pair of systems with conflicting data access carries an explicit
-  `.before()`/`.after()`/`.ignore_ambiguity()`-free edge — ambiguity is
+  `.before()`/`.after()` edge — never an `.ignore_ambiguity()`. Ambiguity is
   rejected, never ignored (mechanism E-M2, §4).
 - Ordering edges are declared between *systems*, not left to registration
   luck; registration order is code order and stable only under pinned source,
@@ -320,7 +320,7 @@ sequenced by A11 after the P4 window (digest constraint, A1 §7.3).
 |---|---|---|---|---|
 | E-M1 | **Role-keyed static gate** — §5's replacement: full clause battery (bevy-free for verifiable-tier crates, VC-4/6/8, neighbour ban) applied to a *discovered* crate set | T1 T2-spelling T4 T10 | exists (clauses) + proposed (discovery; prototype live) | `scripts/core-gates.sh` clauses 1–5 + new discovery cross-check |
 | E-M2 | **Ambiguity rejection at Error + canary mutation test**: every canonical schedule builds with `ScheduleBuildSettings { ambiguity_detection: LogLevel::Error }`; CI carries a test that asserts the real schedule initializes Ok *and* that a deliberately un-ordered mutant initializes Err | T3 | proposed; prototype proven both directions (§9 E-1) | host crate's `canonical_schedule_rejects_ambiguity` test |
-| E-M3 | **Projection differential harness**: per commit, run the canonical world twice from one state with permuted insertion orders; assert naive query-order fold differs or not is *not* asserted — assert the sorted-by-PersistId projection hashes agree across both runs and match the executor-computed hash chain | T2 T13 T14 | proposed; prototype pattern proven (§9 E-2/E-3) | conformance case `projection-order-permuted` (A10 lands it) |
+| E-M3 | **Projection differential harness**: per commit, run the canonical world twice from one state with permuted insertion orders and assert only what must hold: the sorted-by-`PersistId` projection hash agrees across both runs *and* matches the executor-computed chain. Whether naive query-order folds agree is deliberately not asserted — their agreement would be luck (P3's lesson), not a property | T2 T13 T14 | proposed; prototype pattern proven (§9 E-2/E-3) | conformance case `projection-order-permuted` (A10 lands it) |
 | E-M4 | **Double-run symptom tests**: identical tick twice in one process, compare hashes | T1 T4 T6 symptoms | exists | `executor.rs:489 the_same_tick_run_twice_produces_the_same_state` (+ games/conformance equivalents) |
 | E-M5 | **Committed golden corpus over every-tick chains**, checked per platform inside ordinary tests | T5 T11 T12-partially | exists | `orrery_conformance --test conformance :: this_platform_matches_the_committed_golden` (mutation-proven A1 M7) |
 | E-M6 | **Cross-platform matrix + partial-refusal verdict** | T5 | exists | ci.yml determinism + verdict jobs (≥3 non-baseline reports or fail) |
@@ -544,8 +544,9 @@ second, never a replacement.
 
 `git diff ce5e34a7..HEAD -- crates gates clients` is empty (post-A3 commits
 touched only `scripts/check.sh`, `scripts/ci-changed-code.sh`,
-`scripts/gate-status.sh`, and docs). A1 M1–M8, A2 M-A/M-B/M-A′ and A3 E-1–E-6
-/F-1/F-2 therefore carry over at full strength, including their reverts.
+`scripts/gate-status.sh`, and docs). A1 M1–M8, A2 M-A/M-B/M-A′ and A3 F-1/F-2
+therefore carry over (A3's prototype entries E-1–E-6 are evidence records,
+reproduced here only where load-bearing) at full strength, including their reverts.
 `core-gates.sh` itself is byte-identical since `ce5e34a7`.
 
 ### 9.2 This document's own runs
@@ -609,11 +610,3 @@ Deliberately not done:
 - **No implementation.** No clause of core-gates.sh changed; no corpus case,
   CI leg, or host API exists yet — those belong to A10/A11 after acceptance.
 - **No decision owned elsewhere** (§8).
-
-<!-- end -->
-
-
-
-
-
-
