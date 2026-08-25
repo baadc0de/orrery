@@ -130,3 +130,83 @@ suite read and not counted as coverage), `./scripts/core-gates.sh` exit 0,
 re-verified clean. Gap G-1 is live: clause (e)'s row IV-7 states the rule,
 and no mechanism enforces it today. The record says so plainly rather than
 implying otherwise (Open questions, item 1).
+
+## Decision
+
+### (a) The schema id of record is `(ComponentTypeId, SchemaVersion)` — N-5
+
+Every capability declaration, at-rest slot, and manifest entry names a
+component by the pair `(ComponentTypeId, SchemaVersion)`, declared at
+composition time. The pair is **independent of Rust type names, `TypeId`,
+reflection registration, replicon `FnsId`, and archetype layout** — every
+item on that list is build- or registration-order-dependent, and the pair is
+the only component naming that survives a recompile. `SchemaVersion` is
+game-allocated per component type, monotone, never reused or gapped, and
+orthogonal to `RulesetId::version`: "a rules hotfix bumps no schema, a
+schema bump ships without a rules change, and neither number is ever derived
+from the other" (`crates/orrery_protocol/src/atrest.rs:23-27`; [D38]
+clause (d)(3)).
+
+This clause ratifies what the durable layer already does: the framed bag
+stores the pair per slot (`crates/orrery_persistd/src/schema.rs:48-59`), and
+the uplink feed already drops the registration-order-dependent `FnsId`
+before anything durable is built
+(`crates/orrery_persist_client/src/feed.rs:85-96` — `DiffUplink` carries no
+`FnsId` field, `crates/orrery_protocol/src/gateway.rs:371-393`). What is new
+is the extension: the pair keys *capability declarations* (clause (c)), not
+only at-rest slots. Who allocates `ComponentTypeId` values across modules,
+collision detection, and how the pair enters the compatibility manifest are
+R8's (A8) — this clause fixes the namespace's shape so R8 has exactly one
+namespace to govern.
+
+### (b) Reflection never defines an encoding — N-6
+
+Reflection may serve tooling — inspectors, debug dumps — but may never
+*define* an encoding. Any reflect-assisted path that produces bytes for wire
+or store must go through an explicit mapping to a declared
+`(ComponentTypeId, SchemaVersion)` codec. Under Context §2's census this
+clause changes nothing today — zero first-party reflection uses exist, and
+replicon payloads are registered serde functions
+(`vendor/bevy_replicon/src/server/uplink.rs:5-6`), not reflection. The
+clause exists to bind the future: it makes "derive the persistence format
+from `Reflect`" a rejected shortcut rather than an available one, whichever
+engine adapter or tooling later grows a reflection habit.
+
+### (c) Five independent capability dimensions; zeros fail closed — N-7
+
+Every component type a module declares carries five independent capability
+dimensions, declared **as data at composition time** — the registration
+idiom [D38] clause (c) pins, like `MigrationRegistry::declare`
+(`crates/orrery_persistd/src/migration.rs:53-55`) and
+`AdjudicationExecutor::register` (`crates/orrery_persistd/src/adjudication.rs:350`)
+— keyed by clause (a)'s pair. The dimension names are this record's; the
+registry construct (one registry vs several, its storage) is R8's.
+
+| Dim | Values | Meaning · today's consumer |
+|---|---|---|
+| **P** persistence | `P0` none · `P1` bulk · `P2` critical | `P1`: journal/checkpoint path, last-writer-wins per `(entity, tick)` under lease fencing (`gateway.rs:367-369`, `:388-389` in `orrery_protocol`). `P2`: mutated only inside attested intent transactions (`intent/mod.rs:152-154`). `P0`: never leaves the world |
+| **R** rollback | `R0` excluded · `R1` included | Whether prediction resimulation and post-adjudication correction restore it. Unit and mechanism are R6's (A7); this dimension records membership only |
+| **W** witness | `W0` unwatched · `W1` invariant-checked · `W2` replay-adjudicated | `W1`: stage-1 `Invariant` predicates on received samples (`crates/orrery_core/src/invariants.rs:114-118`) — "the only validation most bulk-class state ever gets" (`ruleset.rs:304-310`). `W2`: logged inputs, signed claims, isolated re-execution (`crates/orrery_core/src/replay.rs:106-116`) |
+| **N** replication | `N0` none · `N1` interest-replicated | `N1`: replicon under AOI/interest, owner-written (single-writer). The witness frame/claim channel is **not** this dimension — evidence flows to witness peers regardless of interest membership, which is what makes W and N independent (Context §3) |
+| **A** write authority | `A0` local · `A2` island-weak · `A1` lease-holder · `A3` cluster-transaction | Who may mutate: nobody but this process (`A0`); the in-island total order with no fence (`A2`, `crates/orrery_authority/src/ephemeral.rs:82-90`); the fenced lease holder (`A1`, [D7]); only an FDB intent transaction (`A3`) |
+
+**Defaults are the zeros, and the zeros fail closed: no declaration, no
+capability.** This generalizes two behaviours the tree already has and this
+record keeps — the unclassified-defaults-to-Cosmetic rule
+(`ruleset.rs:293-297`) and the migration registry's refusal to load a bag
+slot whose component no build declares
+(`crates/orrery_persistd/src/migration.rs:22-25`, `:80-85`; mutation-proven,
+Verification appendix row MV-2).
+
+Privacy/visibility filtering and maximum encoded size are real per-component
+concerns but are *attributes of N and P respectively*, not independent axes;
+migration is already a per-`(ComponentTypeId, from_version)` registration
+and needs no new dimension. Recorded so R8 can revisit if an independent
+consumer appears (A5 §5.2).
+
+Consumers, per dimension (game-authored, kernel-consumed): **P** routes the
+uplink and write classes (persist-client scheduler and gateway); **R** feeds
+R6's rollback-unit membership; **W** feeds witness attention — which
+components get executors and claims versus invariants only; **N** feeds
+replication registration and interest; **A** feeds admission — which write
+path will accept a mutation (lease-fenced diff, island claim, intent op).
