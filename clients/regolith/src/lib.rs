@@ -341,14 +341,21 @@ fn spawn_craft_body(
     //
     // They are spawned before the glTF branch below so the marking survives
     // whichever hull the run draws.
-    let arc_archetype = archetype_of(executor, entity).unwrap_or_else(|| match seat {
+    //
+    // The chassis comes from the craft's *own hashed state*. The skin reads
+    // the archetype; it never tells the ruleset what shape anything is. A
+    // joined session may not hold this entity's state yet, so the slot's own
+    // archetype derivation stands in until replication fills it in — the
+    // same stand-in the hull below has always used, and with the same
+    // consequence: the body is composed once, at spawn.
+    let archetype = archetype_of(executor, entity).unwrap_or_else(|| match seat {
         craft::Seat::Player => Archetype::Interceptor,
         craft::Seat::Bot => archetype_for_remote(entity),
     });
-    let arc_radius = craft::hull_length(arc_archetype) * craft::ARC_RADIUS_HULL_LENGTHS;
+    let arc_radius = craft::hull_length(archetype) * craft::ARC_RADIUS_HULL_LENGTHS;
     let arc_material = materials.add(hud::firing_arc_material(seat, accent));
     spawned.with_children(|craft_root| {
-        for arc in craft::firing_arcs(arc_archetype) {
+        for arc in craft::firing_arcs(archetype) {
             craft_root.spawn((
                 Name::new(arc.name),
                 FiringArcFan(entity),
@@ -366,13 +373,8 @@ fn spawn_craft_body(
         spawned.insert(WorldAssetRoot(scene));
         return;
     }
-    // Otherwise the chassis is composed from Bevy primitives, per
-    // archetype, out of the craft's *own hashed state*. The skin reads the
-    // archetype; it never tells the ruleset what shape anything is.
-    //
-    // A joined session may not hold this entity's state yet; the slot's own
-    // archetype derivation stands in until replication fills it in.
-    let archetype = arc_archetype;
+    // Otherwise the chassis is composed from Bevy primitives, per archetype,
+    // from the same reading the arcs above took.
     spawned.with_children(|craft_root| {
         for part in craft::parts(archetype) {
             craft_root.spawn((
