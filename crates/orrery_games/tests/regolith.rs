@@ -82,8 +82,8 @@ fn sample<'a>(
 }
 
 #[test]
-fn v9_weapon_table_ruleset_identity_and_island_budget_are_pinned() {
-    assert_eq!(REGOLITH_RULESET.version, 9);
+fn v10_weapon_table_ruleset_identity_and_island_budget_are_pinned() {
+    assert_eq!(REGOLITH_RULESET.version, 10);
     assert_eq!(WeaponKind::Stock.weapon().damage_base, 10);
     assert_eq!(WeaponKind::Volley.weapon().rolls, 3);
     assert_eq!(WeaponKind::Stock.weapon().optimal_mm, 300_000);
@@ -349,6 +349,8 @@ fn wreck_respawns_after_120_own_ticks_with_stock_and_score_intact() {
                 },
                 from_weapon: WeaponKind::Stock,
                 from_vel: QVel::default(),
+                from_yaw_urad: 0,
+                from_archetype: Archetype::Interceptor,
                 flight_ticks: Some(1),
             }],
         )
@@ -421,6 +423,8 @@ fn rock_credit_is_log_delivered_with_resolver_owned_points() {
                 from_pos: QPos::default(),
                 from_weapon: WeaponKind::Stock,
                 from_vel: QVel::default(),
+                from_yaw_urad: 0,
+                from_archetype: Archetype::Interceptor,
                 flight_ticks: Some(1),
             }],
         )
@@ -615,6 +619,8 @@ fn large_split_is_slot_ordered_materialized_and_traced() {
                 from_pos: QPos::default(),
                 from_weapon: WeaponKind::Stock,
                 from_vel: QVel::default(),
+                from_yaw_urad: 0,
+                from_archetype: Archetype::Interceptor,
                 flight_ticks: Some(1),
             }],
         )
@@ -677,6 +683,8 @@ fn split_replay_uses_derived_ids_not_creation_order() {
                     from_pos: QPos::default(),
                     from_weapon: WeaponKind::Stock,
                     from_vel: QVel::default(),
+                    from_yaw_urad: 0,
+                    from_archetype: Archetype::Interceptor,
                     flight_ticks: Some(1),
                 }],
             )
@@ -753,6 +761,8 @@ fn resolved_hits(
                         from: PersistId::new(1),
                         from_pos: QPos::default(),
                         from_vel: QVel::default(),
+                        from_yaw_urad: 0,
+                        from_archetype: Archetype::Interceptor,
                         from_weapon: weapon,
                         flight_ticks: Some(1),
                     }],
@@ -856,6 +866,8 @@ fn fly_one_stock_shot(seed_byte: u8, evade: bool) -> (u64, bool, Outcome) {
         from: PersistId::new(1),
         from_pos: QPos::default(),
         from_vel: QVel::default(),
+        from_yaw_urad: 0,
+        from_archetype: Archetype::Interceptor,
         from_weapon: WeaponKind::Stock,
         flight_ticks: None,
     });
@@ -929,6 +941,138 @@ fn shot_resolution_is_emitted_for_hit_and_miss_and_delivered_to_attacker() {
                 },
             )),
             "the target's result must be routed back to the attacker"
+        );
+    }
+}
+
+fn fire_through_executor(archetype: Archetype, target_pos: QPos) -> (Craft, Craft, Outcome) {
+    let game = Regolith::honest();
+    let attacker = PersistId::new(1);
+    let target = PersistId::new(2);
+    let mut shooter = Craft::spawned(archetype, QPos::default(), 0);
+    shooter.lock_target = Some(target);
+    shooter.lock_progress = LOCK_ACQUISITION_TICKS;
+    shooter.locks_acquired = 1;
+    let victim = Craft::spawned(Archetype::Interceptor, target_pos, 0);
+    let mut executor = Executor::new(game, UniverseSeed([0xA4; 32]));
+    executor.insert(attacker, RegolithState::Craft(shooter));
+    executor.insert(target, RegolithState::Craft(victim));
+
+    let fired = executor
+        .step_entity(attacker, Tick::new(1), &[Order::Fire { target }])
+        .expect("the locked shooter exists");
+    let damage = fired
+        .events
+        .iter()
+        .find_map(|event| game.deliver(event))
+        .map(|(_, order)| order)
+        .expect("a locked, cooled-down shooter emits its shot");
+    let resolved = executor
+        .step_entity(target, Tick::new(2), &[damage])
+        .expect("the target resolves the delivered shot");
+    let resolution = resolved
+        .events
+        .iter()
+        .find(|event| matches!(event, Outcome::ShotResolved { .. }))
+        .cloned()
+        .expect("every non-breaking shot has a visible named resolution");
+    let RegolithState::Craft(shooter) = executor.state(attacker).expect("shooter remains") else {
+        panic!("shooter remains a craft")
+    };
+    let RegolithState::Craft(victim) = executor.state(target).expect("target remains") else {
+        panic!("target remains a craft")
+    };
+    (shooter.clone(), victim.clone(), resolution)
+}
+
+#[test]
+fn interceptor_cannot_fire_abeam_through_real_executor() {
+    let target = PersistId::new(2);
+    let (shooter, victim, resolution) = fire_through_executor(
+        Archetype::Interceptor,
+        QPos {
+            x: 0,
+            y: 0,
+            z: 10_000,
+        },
+    );
+    assert_eq!(
+        resolution,
+        Outcome::ShotResolved {
+            attacker: PersistId::new(1),
+            target,
+            result: ShotResult::OutOfArc,
+        }
+    );
+    assert_eq!(shooter.shots, 1, "the refused attempt wastes the shot");
+    assert!(shooter.cooldown > 0, "the refused attempt pays cooldown");
+    assert_eq!(
+        shooter.lock_target,
+        Some(target),
+        "refusal preserves the lock"
+    );
+    assert_eq!(victim.shield, victim.archetype.limits().max_shield);
+}
+
+#[test]
+fn cruiser_cannot_fire_forward_through_real_executor() {
+    let target = PersistId::new(2);
+    let (shooter, victim, resolution) = fire_through_executor(
+        Archetype::Cruiser,
+        QPos {
+            x: 10_000,
+            y: 0,
+            z: 0,
+        },
+    );
+    assert_eq!(
+        resolution,
+        Outcome::ShotResolved {
+            attacker: PersistId::new(1),
+            target,
+            result: ShotResult::OutOfArc,
+        }
+    );
+    assert_eq!(shooter.shots, 1, "the refused attempt wastes the shot");
+    assert!(shooter.cooldown > 0, "the refused attempt pays cooldown");
+    assert_eq!(
+        shooter.lock_target,
+        Some(target),
+        "refusal preserves the lock"
+    );
+    assert_eq!(victim.shield, victim.archetype.limits().max_shield);
+}
+
+#[test]
+fn each_hulls_in_arc_shot_resolves_as_before() {
+    for (archetype, target_pos) in [
+        (
+            Archetype::Interceptor,
+            QPos {
+                x: 1_000,
+                y: 0,
+                z: 0,
+            },
+        ),
+        (
+            Archetype::Cruiser,
+            QPos {
+                x: 0,
+                y: 0,
+                z: 1_000,
+            },
+        ),
+    ] {
+        let (_, _, resolution) = fire_through_executor(archetype, target_pos);
+        assert!(
+            matches!(
+                resolution,
+                Outcome::ShotResolved {
+                    result: ShotResult::Hit,
+                    ..
+                }
+            ),
+            "{archetype:?}'s in-arc shot did not resolve through the existing hit path"
         );
     }
 }
@@ -1466,6 +1610,8 @@ fn small_drop_is_derived_materialized_and_traced() {
                     from_pos: QPos::default(),
                     from_weapon: WeaponKind::Stock,
                     from_vel: QVel::default(),
+                    from_yaw_urad: 0,
+                    from_archetype: Archetype::Interceptor,
                     flight_ticks: Some(1),
                 }],
             )
@@ -1549,6 +1695,8 @@ fn pickup_state_and_grammar_are_canonical() {
             from: ship,
             from_pos: pos,
             from_vel: QVel { x: 1, y: 2, z: 3 },
+            from_yaw_urad: 4,
+            from_archetype: Archetype::Cruiser,
             from_weapon: WeaponKind::Stock,
             flight_ticks: Some(12),
         },
@@ -1567,6 +1715,10 @@ fn pickup_state_and_grammar_are_canonical() {
         Order::LockVisibility {
             target: ship,
             occluded: true,
+        },
+        Order::ShotResolved {
+            target: pickup,
+            result: ShotResult::OutOfArc,
         },
     ];
     for order in orders {
@@ -1605,6 +1757,8 @@ fn pickup_state_and_grammar_are_canonical() {
             amount: 7,
             attacker_pos: pos,
             attacker_vel: QVel { x: 1, y: 2, z: 3 },
+            attacker_yaw_urad: 4,
+            attacker_archetype: Archetype::Cruiser,
             attacker_weapon: WeaponKind::Stock,
             flight_ticks: Some(12),
         },
@@ -1622,6 +1776,11 @@ fn pickup_state_and_grammar_are_canonical() {
             locker: ship,
             target: pickup,
             occluded: true,
+        },
+        Outcome::ShotResolved {
+            attacker: ship,
+            target: pickup,
+            result: ShotResult::OutOfArc,
         },
     ];
     for outcome in outcomes {

@@ -87,10 +87,10 @@ pub const OCCLUSION_MARGIN_MM: i64 = 20;
 const REFERENCE_SIGNATURE_RADIUS_MM: u128 = 3_000;
 const CHANCE_SCALE: u128 = 1_000_000;
 
-/// Regolith v9's rules identity: recorded visibility claims and gradual lock decay.
+/// Regolith v10's rules identity: replayable lock decay and authoritative firing arcs.
 pub const REGOLITH_RULESET: RulesetId = RulesetId {
-    version: 9,
-    digest: [0x63; 32],
+    version: 10,
+    digest: [0x64; 32],
 };
 
 /// Component classifications.
@@ -355,6 +355,8 @@ impl Regolith {
                             amount,
                             attacker_pos: origin,
                             attacker_vel: firing_vel,
+                            attacker_yaw_urad: yaw,
+                            attacker_archetype: own.archetype,
                             attacker_weapon: equipped,
                             flight_ticks: None,
                         });
@@ -367,6 +369,8 @@ impl Regolith {
                     from,
                     from_pos,
                     from_vel,
+                    from_yaw_urad,
+                    from_archetype,
                     from_weapon,
                     flight_ticks,
                 } => {
@@ -377,6 +381,8 @@ impl Regolith {
                         was_alive && !disabled,
                         *from_pos,
                         *from_vel,
+                        *from_yaw_urad,
+                        *from_archetype,
                         *from_weapon,
                         *flight_ticks,
                         rng,
@@ -388,6 +394,8 @@ impl Regolith {
                                 amount: *amount,
                                 attacker_pos: *from_pos,
                                 attacker_vel: *from_vel,
+                                attacker_yaw_urad: *from_yaw_urad,
+                                attacker_archetype: *from_archetype,
                                 attacker_weapon: *from_weapon,
                                 flight_ticks: Some(ticks),
                             });
@@ -398,6 +406,14 @@ impl Regolith {
                                 attacker: *from,
                                 target: me,
                                 result: ShotResult::Miss,
+                            });
+                            continue;
+                        }
+                        ProjectileResolution::OutOfArc => {
+                            events.push(Outcome::ShotResolved {
+                                attacker: *from,
+                                target: me,
+                                result: ShotResult::OutOfArc,
                             });
                             continue;
                         }
@@ -565,6 +581,8 @@ impl Regolith {
                     from,
                     from_pos,
                     from_vel,
+                    from_yaw_urad,
+                    from_archetype,
                     from_weapon,
                     flight_ticks,
                 } = order
@@ -576,6 +594,8 @@ impl Regolith {
                         rock.hull > 0,
                         *from_pos,
                         *from_vel,
+                        *from_yaw_urad,
+                        *from_archetype,
                         *from_weapon,
                         *flight_ticks,
                         rng,
@@ -587,6 +607,8 @@ impl Regolith {
                                 amount: *amount,
                                 attacker_pos: *from_pos,
                                 attacker_vel: *from_vel,
+                                attacker_yaw_urad: *from_yaw_urad,
+                                attacker_archetype: *from_archetype,
                                 attacker_weapon: *from_weapon,
                                 flight_ticks: Some(ticks),
                             });
@@ -601,6 +623,13 @@ impl Regolith {
                             if rock.hull == 0 {
                                 killer = Some(*from);
                             }
+                        }
+                        ProjectileResolution::OutOfArc => {
+                            events.push(Outcome::ShotResolved {
+                                attacker: *from,
+                                target: me,
+                                result: ShotResult::OutOfArc,
+                            });
                         }
                         ProjectileResolution::Break(reason) => {
                             events.push(Outcome::LockBroken {
@@ -803,6 +832,7 @@ enum ProjectileResolution {
     InFlight(u16),
     Hit,
     Miss,
+    OutOfArc,
     Break(LockBreakReason),
 }
 
@@ -814,12 +844,22 @@ fn projectile_resolution(
     target_alive: bool,
     attacker_pos: QPos,
     attacker_vel: QVel,
+    attacker_yaw_urad: i32,
+    attacker_archetype: Archetype,
     weapon_kind: weapon::WeaponKind,
     flight_ticks: Option<u16>,
     rng: &mut TickRng,
 ) -> ProjectileResolution {
     if !target_alive {
         return ProjectileResolution::Break(LockBreakReason::TargetDestroyed);
+    }
+    if !in_firing_arc(
+        attacker_archetype,
+        attacker_yaw_urad,
+        attacker_pos,
+        target_pos,
+    ) {
+        return ProjectileResolution::OutOfArc;
     }
     let weapon = weapon_kind.weapon();
     let range_sq = nonnegative_distance_squared(target_pos, attacker_pos);
@@ -855,6 +895,69 @@ fn projectile_resolution(
     } else {
         ProjectileResolution::Miss
     }
+}
+
+/// Whether `target_pos` lies in one of the shooter's chassis firing arcs.
+///
+/// The relative bearing is obtained with integer CORDIC vectoring. That keeps
+/// this persistent-value decision bit-exact without a platform float result.
+#[must_use]
+pub fn in_firing_arc(
+    attacker_archetype: Archetype,
+    attacker_yaw_urad: i32,
+    attacker_pos: QPos,
+    target_pos: QPos,
+) -> bool {
+    let dx = i128::from(target_pos.x) - i128::from(attacker_pos.x);
+    let dz = i128::from(target_pos.z) - i128::from(attacker_pos.z);
+    let Some(world_bearing) = integer_bearing_urad(dx, dz) else {
+        return true;
+    };
+    let relative = world_bearing
+        .saturating_sub(attacker_yaw_urad)
+        .rem_euclid(TAU_URAD);
+    attacker_archetype
+        .firing_arcs()
+        .iter()
+        .any(|arc| arc.contains(relative))
+}
+
+fn integer_bearing_urad(mut x: i128, mut y: i128) -> Option<i32> {
+    const ATAN_URAD: [i32; 21] = [
+        785_398, 463_648, 244_979, 124_355, 62_419, 31_240, 15_624, 7_812, 3_906, 1_953, 977, 488,
+        244, 122, 61, 31, 15, 8, 4, 2, 1,
+    ];
+    if x == 0 && y == 0 {
+        return None;
+    }
+    let mut angle = 0_i32;
+    if x < 0 {
+        x = -x;
+        y = -y;
+        angle = if y <= 0 {
+            TAU_URAD / 2
+        } else {
+            -(TAU_URAD / 2)
+        };
+    }
+    x <<= 32;
+    y <<= 32;
+    for (shift, turn) in ATAN_URAD.into_iter().enumerate() {
+        if y == 0 {
+            break;
+        }
+        let (old_x, old_y) = (x, y);
+        if old_y > 0 {
+            x = old_x.saturating_add(old_y >> shift);
+            y = old_y.saturating_sub(old_x >> shift);
+            angle = angle.saturating_add(turn);
+        } else {
+            x = old_x.saturating_sub(old_y >> shift);
+            y = old_y.saturating_add(old_x >> shift);
+            angle = angle.saturating_sub(turn);
+        }
+    }
+    Some(angle)
 }
 
 fn hit_chance_ppm(
@@ -1144,6 +1247,8 @@ impl Game for Regolith {
                 amount,
                 attacker_pos,
                 attacker_vel,
+                attacker_yaw_urad,
+                attacker_archetype,
                 attacker_weapon,
                 flight_ticks,
             } => Some((
@@ -1153,6 +1258,8 @@ impl Game for Regolith {
                     from: *attacker,
                     from_pos: *attacker_pos,
                     from_vel: *attacker_vel,
+                    from_yaw_urad: *attacker_yaw_urad,
+                    from_archetype: *attacker_archetype,
                     from_weapon: *attacker_weapon,
                     flight_ticks: *flight_ticks,
                 },

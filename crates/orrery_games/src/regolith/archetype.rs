@@ -2,6 +2,51 @@
 
 use orrery_core::CodecError;
 
+use super::state::TAU_URAD;
+
+/// One chassis weapon arc in craft-local micro-radians.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FiringArc {
+    /// Stable presentation name for the arc.
+    pub name: &'static str,
+    /// Centre bearing from the craft's nose.
+    pub centre_urad: i32,
+    /// Half of the arc's total width.
+    pub half_width_urad: i32,
+}
+
+impl FiringArc {
+    /// Whether a craft-local bearing falls inside this arc, including its edges.
+    #[must_use]
+    pub fn contains(self, bearing_urad: i32) -> bool {
+        let mut delta = bearing_urad
+            .saturating_sub(self.centre_urad)
+            .rem_euclid(TAU_URAD);
+        if delta > TAU_URAD / 2 {
+            delta -= TAU_URAD;
+        }
+        delta.abs() <= self.half_width_urad
+    }
+}
+
+const INTERCEPTOR_ARCS: [FiringArc; 1] = [FiringArc {
+    name: "arc_front",
+    centre_urad: 0,
+    half_width_urad: 785_398,
+}];
+const CRUISER_ARCS: [FiringArc; 2] = [
+    FiringArc {
+        name: "arc_starboard",
+        centre_urad: 1_570_796,
+        half_width_urad: 392_699,
+    },
+    FiringArc {
+        name: "arc_port",
+        centre_urad: -1_570_796,
+        half_width_urad: 392_699,
+    },
+];
+
 /// The two chassis Regolith fields.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Archetype {
@@ -29,6 +74,15 @@ pub struct Limits {
 impl Archetype {
     /// Every archetype, in encoding order.
     pub const ALL: &'static [Self] = &[Self::Interceptor, Self::Cruiser];
+
+    /// Weapon arcs adjudicated for this chassis.
+    #[must_use]
+    pub const fn firing_arcs(self) -> &'static [FiringArc] {
+        match self {
+            Self::Interceptor => &INTERCEPTOR_ARCS,
+            Self::Cruiser => &CRUISER_ARCS,
+        }
+    }
 
     /// This chassis's limits.
     #[must_use]
