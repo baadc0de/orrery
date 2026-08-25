@@ -560,3 +560,94 @@ specified now so Phase 6 lands them with the feature, not after:
 built solely from emitted frames — a compile-visible property if frames are
 the only export, per A9's boundary), plus the B-5 extraction benchmark
 (§8.2). Recorded as phase-gated, not silently deferred.
+
+---
+
+## 8. The benchmark programme and the baseline (F-12)
+
+### 8.1 The doctrine, inherited
+
+The tree already has a measured position on benchmarks (V12): CI machines
+vary, so numbers asserted in CI are flaky theatre; benches are **measure-
+only** in ordinary runs, and *assertions* about performance happen against a
+controlled environment (persistd's `journal_latency` header; the D16 rig).
+This programme keeps that doctrine and sharpens it: benchmarks **observe**;
+what **refuses** is the harness rule that a differential run without a
+committed baseline is not a run (§4.4). Thresholds are evaluated in the
+baseline's own environment (same host class, same pinned toolchain), as
+ratios against the committed baseline — never absolute wall-clock in CI.
+
+### 8.2 The suite
+
+All driven from the existing instruments (corpus cases V7, scenario battery
+V8), so the benchmark population is the conformance population — a number
+measured on a workload no fixture covers would be a number about nothing.
+
+| # | Benchmark | Instrument | Metric |
+|---|---|---|---|
+| B-1 | Tick cost | corpus cases ×(1, 16, and a new 256-entity `swarm-large` case) + scenario battery, per implementation | per-tick p50/p99 µs; µs per entity-tick |
+| B-2 | Structural-change cost | a materialization-heavy scenario (Regolith `Split` storms) | per-tick cost with N installs vs 0 |
+| B-3 | Memory per canonical entity | RSS delta across corpus populations; ring memory per predicted entity (A7 §13.5 names this unmeasured) | bytes/entity; bytes/predicted-entity |
+| B-4 | Snapshot/journal cost | checkpoint encode of a corpus-final state; `feed_uplink`-shaped diff production; existing persistd benches for the store side | µs per snapshot; µs per diff; (store side: D16 targets stand, V11) |
+| B-5 | Witness construction + presentation extraction | claim assembly per entity-tick (the `quantize+encode+blake3` path); extraction µs/frame once Phase 6 exists | µs per claim; µs per extracted frame |
+| B-6 | Startup and module registration | composition-root assembly time (Phase 2+) | ms cold assemble |
+| B-7 | Compile time and binary size | `cargo build --timings` clean + incremental (touch one rules file) for the workspace and for `orrery_core`/`orrery_games`; stripped binary sizes of the shipped artifacts | s clean; s incremental; bytes |
+
+Home: a standalone `gates/migration-bench` workspace, listed in
+`scripts/check.sh`'s `WORKSPACES` table with role **check** — the
+`p2-journal-bench` precedent (V9): CI compiles it (so it cannot rot) and
+never executes it (so it cannot flake); execution is the §8.3 procedure.
+The table edit is mandatory and named here because V9's rule is absolute:
+an unlisted workspace's targets run nowhere, and a bench that silently
+stopped compiling is the gate-list lesson (V13) again.
+
+### 8.3 The baseline: captured before, or it is not a baseline
+
+**A baseline measured after migration begins is not a baseline.** The
+epic's phase model puts fixtures at Phase 1 and the first behaviour move at
+Phase 2; the programme makes that mechanical:
+
+- **What already exists as a behavioural baseline, today, committed:** the
+  golden chains (F-1) and corpus digests are legacy-behaviour commitments
+  captured on `main` before any migration code exists. F-2's outcome chains
+  extend that commitment to the state-invisible channels — which is why F-2
+  must land **before Phase 2**, while the only implementation the chains
+  can describe is the legacy one. An outcome golden first generated after
+  composition changes would commit the candidate's behaviour as "legacy".
+- **The performance baseline does not exist and is the first deliverable:**
+  one run of B-1..B-7 (B-5's extraction and B-6 recorded "absent") on a
+  named reference host, producing `docs/plans/baselines/a10-baseline-
+  <date>.json`: every metric, plus the environment manifest — commit sha,
+  `Cargo.lock` blake3, rustc version, host CPU/RAM/OS, profile flags, and
+  the golden-table versions in force. Committed to the repository; the
+  differential harness refuses to run without it (§4.4), which is the
+  mechanism that makes "capture the baseline first" an ordering the
+  programme *enforces* rather than remembers.
+- **Sequencing honesty:** B-1/B-2 drive `orrery_games` scenarios but a
+  baseline *run* touches no crate — only the F-2 fixture and the
+  `swarm-large` corpus case are code, and their homes are split by the P4
+  digest boundary (§10). The baseline can therefore be captured during the
+  #329 window except for the F-2 leg, which waits with its crate.
+
+### 8.4 Thresholds
+
+Proposed values — measurable, and each a proposal for the owner to tighten
+or loosen with the ADR set, not a decision:
+
+| Quantity | Threshold | Rationale |
+|---|---|---|
+| Candidate tick cost (B-1), per case | p50 ≤ 1.10× baseline; p99 ≤ 1.25× baseline | the brief's Phase 4 exit is "performance regression is understood and accepted"; 10% median is the proposed definition of "needs no explanation", anything above it needs the written acceptance the phase demands |
+| Tick budget ceiling (absolute, reference host) | p99 tick ≤ 8 ms at `swarm-large` (256 entities) | `TICK_HZ = 60` is a constant (executor.rs:25-28) → 16.6 ms frame; canonical stepping may spend at most half, leaving half for delivery, persistence feed and witness assembly — the split is proposed, the 16.6 ms is not |
+| Memory per canonical entity (B-3) | ≤ 1.20× baseline | ECS archetype storage trades layout for locality; 20% is the proposed cost of admission, above it the two-world overhead risk (brief) is live and must be argued |
+| Snapshot/claim path (B-4/B-5) | ≤ 1.10× baseline µs/entity | this path runs per entity per tick under witness load; it compounds |
+| Store-side latency | D16 verbatim: journal < 2 ms internal, ack p99 < 5 ms, FDB < 10 ms p99 (V11) | existing accepted targets; the migration does not touch the durable tier (A7 P-1) so these must simply not move |
+| Clean build (B-7) | ≤ +15% over baseline | the brief names compile time an explicit cost axis of `bevy_ecs` adoption |
+| Incremental rules-crate rebuild (B-7) | ≤ +20% over baseline | the developer-loop cost the monolith complaint is partly about; regressing it while modularizing would be paying twice |
+| Binary size (B-7) | ≤ +10% per shipped artifact | bevy_ecs is code the wire never sees; peers download builds under D21's three-build retention |
+
+Threshold evaluation is a **gate on phase exit** (the Phase 4/5 acceptance
+step), executed as: re-run the suite on the same host class, compare
+ratios, write the comparison beside the baseline JSON. It is deliberately
+not a per-commit CI assert (§8.1) — but the *presence and freshness* of the
+baseline is CI-checkable and refusing (§4.4), and that is the half a
+machine can hold honestly.
