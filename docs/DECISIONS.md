@@ -54,6 +54,7 @@ their linked dependencies.
 | D37 | [ADR-0037](adr/0037-unavailable-witness-epoch.md) | Unavailable witness epochs refuse with a bounded cure; corrects D27/D28 |
 | D38 | [ADR-0038](adr/0038-at-rest-schema-versioning.md) | At-rest schema versioning as three work items: formats before machinery, migrations fit D21's freeze additively |
 | D41 | [ADR-0041](adr/0041-offline-identity-issuer-custody-and-lifecycle.md) | Offline invites are single-use capabilities, account allocation is singular, issuer keys are portable escrowed secrets |
+| D42 | [ADR-0042](adr/0042-canonical-simulation-architecture.md) | Canonical state stays in the engine-neutral executor; composition root and `SimulationHost` seam land now; shared app world rejected; dedicated ECS world trigger-gated |
 
 ## Status and supersession
 
