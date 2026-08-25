@@ -16,13 +16,14 @@ pub mod telemetry;
 /// Commit revision embedded in this client binary at build time.
 pub const BUILD_REV: &str = env!("ORRERY_BUILD_REV");
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use assets::VisualAssetPaths;
 use bevy::prelude::*;
 use bevy::time::common_conditions::on_timer;
+use bevy::window::PrimaryWindow;
 use combat::{CombatView, LockBreak, ProjectileTracks, ShotFeedback};
 use intent::{decode_packet, Controls, IntentPipeline};
 use orrery_core::{Executor, TICK_NANOS};
@@ -61,6 +62,14 @@ pub struct FiringArcFan(
 struct CraftBodyComposition {
     archetype: Archetype,
     seat: craft::Seat,
+}
+
+#[derive(Component)]
+struct RockBody;
+
+#[derive(Debug, Default, Resource)]
+struct SelectedLock {
+    target: Option<PersistId>,
 }
 
 #[derive(Component)]
@@ -210,6 +219,7 @@ impl Plugin for RegolithSkinPlugin {
             .init_resource::<VisualAssetPaths>()
             .init_resource::<OverlayState>()
             .init_resource::<MetricWindow>()
+            .init_resource::<SelectedLock>()
             .init_resource::<CombatView>()
             .init_resource::<ProjectileTracks>()
             .init_resource::<LockBreak>()
@@ -221,8 +231,10 @@ impl Plugin for RegolithSkinPlugin {
                 (
                     toggle_overlay,
                     sync_rendered_state,
+                    select_clicked_body.before(sync_rendered_state),
                     recompose_craft_bodies.after(sync_rendered_state),
                     ensure_focus_body.after(recompose_craft_bodies),
+                    ensure_rock_bodies.after(sync_rendered_state),
                     // After `sync_rendered_state`: it frames the positions
                     // that system just wrote, not last frame's.
                     frame_camera.after(sync_rendered_state),
@@ -412,15 +424,17 @@ fn archetype_for_remote(entity: PersistId) -> Archetype {
     Archetype::for_slot(entity.0.saturating_sub(1))
 }
 
-fn controls(keys: &ButtonInput<KeyCode>) -> Controls {
+fn controls(keys: &ButtonInput<KeyCode>, selected: Option<PersistId>) -> Controls {
     Controls {
         left: keys.pressed(KeyCode::ArrowLeft),
         right: keys.pressed(KeyCode::ArrowRight),
         thrust: keys.pressed(KeyCode::ArrowUp),
         fire: keys.pressed(KeyCode::Space),
+        lock_target: selected,
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn drive_core(
     keys: Res<ButtonInput<KeyCode>>,
     mut session: ResMut<ActiveSession>,
@@ -429,8 +443,9 @@ fn drive_core(
     mut tracks: ResMut<ProjectileTracks>,
     mut broken: ResMut<LockBreak>,
     mut shots: ResMut<ShotFeedback>,
+    mut selected: ResMut<SelectedLock>,
 ) {
-    let controls = controls(&keys);
+    let controls = controls(&keys, selected.target);
     match &mut *session {
         ActiveSession::Local(local) => {
             let tick = local.tick;
@@ -468,6 +483,7 @@ fn drive_core(
             local.pending = delivered;
             local.tick = Tick::new(tick.0.saturating_add(1));
             observe_skin_effects(&emitted, PLAYER, &mut tracks, &mut broken, &mut shots);
+            clear_refused_selection(&emitted, PLAYER, &mut selected);
         }
         ActiveSession::Campaign(runtime) => {
             // The joined tick: same pipeline inside `advance`, plus the
@@ -483,8 +499,21 @@ fn drive_core(
                     &mut broken,
                     &mut shots,
                 );
+                clear_refused_selection(&report.events, runtime.entity(), &mut selected);
             }
         }
+    }
+}
+
+fn clear_refused_selection(events: &[Outcome], locker: PersistId, selected: &mut SelectedLock) {
+    if events.iter().any(|event| {
+        matches!(
+            event,
+            Outcome::LockRefused { locker: who, target }
+                if *who == locker && Some(*target) == selected.target
+        )
+    }) {
+        selected.target = None;
     }
 }
 
@@ -522,6 +551,98 @@ fn archetype_of(executor: &Executor<Regolith>, entity: PersistId) -> Option<Arch
     match executor.state(entity)? {
         RegolithState::Craft(craft) => Some(craft.archetype),
         _ => None,
+    }
+}
+
+fn select_clicked_body(
+    buttons: Res<ButtonInput<MouseButton>>,
+    windows: Query<&Window, With<PrimaryWindow>>,
+    camera: Query<(&Camera, &GlobalTransform), With<ChaseCamera>>,
+    bodies: Query<(&CoreEntity, &GlobalTransform)>,
+    session: Res<ActiveSession>,
+    mut selected: ResMut<SelectedLock>,
+) {
+    if !buttons.just_pressed(MouseButton::Left) {
+        return;
+    }
+    let Ok(window) = windows.single() else {
+        return;
+    };
+    let Some(cursor) = window.cursor_position() else {
+        return;
+    };
+    let Ok((camera, camera_transform)) = camera.single() else {
+        return;
+    };
+    let candidates = bodies.iter().filter_map(|(entity, transform)| {
+        let lockable = match session.executor().state(entity.0)? {
+            RegolithState::Craft(craft) => craft.hull > 0,
+            RegolithState::Rock(rock) => rock.hull > 0,
+            RegolithState::Pickup(_) | RegolithState::BloomDirector(_) => false,
+        };
+        if !lockable || entity.0 == session.local_entity() {
+            return None;
+        }
+        camera
+            .world_to_viewport(camera_transform, transform.translation())
+            .ok()
+            .map(|screen| (entity.0, screen))
+    });
+    selected.target = nearest_clicked(cursor, candidates);
+}
+
+fn nearest_clicked(
+    cursor: Vec2,
+    candidates: impl Iterator<Item = (PersistId, Vec2)>,
+) -> Option<PersistId> {
+    const CLICK_RADIUS_PX: f32 = 32.0;
+    candidates
+        .filter_map(|(entity, screen)| {
+            let distance = cursor.distance_squared(screen);
+            (distance <= CLICK_RADIUS_PX * CLICK_RADIUS_PX).then_some((entity, distance))
+        })
+        .min_by(|left, right| left.1.total_cmp(&right.1))
+        .map(|(entity, _)| entity)
+}
+
+fn ensure_rock_bodies(
+    session: Res<ActiveSession>,
+    existing: Query<(Entity, &CoreEntity), With<RockBody>>,
+    mut commands: Commands,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+) {
+    let mut rendered = BTreeSet::new();
+    for (body, entity) in &existing {
+        if matches!(
+            session.executor().state(entity.0),
+            Some(RegolithState::Rock(rock)) if rock.hull > 0
+        ) {
+            rendered.insert(entity.0);
+        } else {
+            commands.entity(body).despawn();
+        }
+    }
+    for entity in session.executor().entities().copied() {
+        let Some(RegolithState::Rock(rock)) = session.executor().state(entity) else {
+            continue;
+        };
+        if rock.hull <= 0 || rendered.contains(&entity) {
+            continue;
+        }
+        let radius_m = rock.tier.limits().radius_mm as f32 / 1_000.0;
+        commands.spawn((
+            CoreEntity(entity),
+            RockBody,
+            Mesh3d(meshes.add(Sphere::new(radius_m))),
+            MeshMaterial3d(materials.add(StandardMaterial {
+                base_color: hud::MINING_AMBER.with_alpha(0.72),
+                metallic: 0.18,
+                perceptual_roughness: 0.92,
+                ..Default::default()
+            })),
+            Transform::default(),
+        ));
     }
 }
 
@@ -1045,6 +1166,7 @@ mod tests {
                 panic!("a seat holds a craft");
             };
             craft.lock_target = Some(OPPONENT);
+            craft.lock_class = Some(orrery_games::regolith::state::LockClass::Ship);
             craft.lock_progress = progress;
             craft.locks_acquired = 4;
             executor.insert(PLAYER, RegolithState::Craft(craft));
@@ -1052,6 +1174,10 @@ mod tests {
             let view = CombatView::read(&executor, PLAYER);
             assert_eq!(view.lock.progress, progress);
             assert_eq!(view.lock.target, Some(OPPONENT));
+            assert_eq!(
+                view.lock.class,
+                Some(orrery_games::regolith::state::LockClass::Ship)
+            );
             assert_eq!(view.lock.acquired, 4);
             assert_eq!(
                 view.target.map(|target| target.archetype),
@@ -1111,6 +1237,27 @@ mod tests {
         assert!(
             orrery_games::adjudicate(Regolith::honest(), &scenario, &play).is_none(),
             "the shared adjudicator rejected a human recording"
+        );
+    }
+
+    #[test]
+    fn clicking_selects_the_nearest_lockable_body_inside_the_pick_radius() {
+        let chosen = nearest_clicked(
+            Vec2::new(100.0, 100.0),
+            [
+                (PersistId::new(2), Vec2::new(125.0, 100.0)),
+                (PersistId::new(3), Vec2::new(104.0, 103.0)),
+                (PersistId::new(4), Vec2::new(200.0, 200.0)),
+            ]
+            .into_iter(),
+        );
+        assert_eq!(chosen, Some(PersistId::new(3)));
+        assert_eq!(
+            nearest_clicked(
+                Vec2::ZERO,
+                [(PersistId::new(2), Vec2::splat(40.0))].into_iter()
+            ),
+            None
         );
     }
 }
