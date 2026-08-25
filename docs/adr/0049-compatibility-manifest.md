@@ -21,8 +21,8 @@ reopening it (clause (h)) and **ratifies** [D21]'s static-composition ruling
 without relitigating it (clause (i)). Its relationship to [D38]'s
 version-domain law is stated in clause (g) and is *generalization in this
 record's own text*, not amendment of that record's. Within the #395 set, R7
-(D48, in flight at this writing) is the only proposal that amends an accepted
-record; this record is deliberately not the second. A8's own framing of the
+([D48]) is the only proposal that amends an accepted record; this record is
+deliberately not the second. A8's own framing of the
 vehicle is kept verbatim: "one new ADR … amending neither record's accepted
 text" ([a8-compatibility-manifests.md](../plans/a8-compatibility-manifests.md)
 §10 item 1).
@@ -34,10 +34,10 @@ format and storage are R8's" — this record takes the storage and only the
 storage); capability dimensions and their invalid combinations ([D45]);
 message classes and C-2's **semantics** ([D46](e) — its constants' storage
 lands here, clause (e)(3), their meaning does not); the rollback unit ([D47]);
-identity classes and allocation (D44, in flight — cited by decision id, not by
-file); the witness projection and `projection_version`'s **content and bump
-rule** (D48, in flight — this record stores the axis, clause (c), and defines
-none of it). Any manifest field that would *widen* peer admission is a
+identity classes and allocation (D44, in flight at acceptance — cited by
+decision id, not by file); the witness projection and `projection_version`'s
+**content and bump rule** ([D48](f) — this record stores the axis, clause (c),
+and defines none of it). Any manifest field that would *widen* peer admission is a
 protocol decision and therefore the owner's, never this record's:
 `GatewayMsg::protocol_accepted` is exact equality (`offered == current`,
 `crates/orrery_protocol/src/gateway.rs:182-184`, verified and mutation-pinned,
@@ -214,10 +214,13 @@ owned elsewhere and not redefined here:
    R8's manifest/registry work", and they live in the clause (e) registry
    file beside the schema table. Changing one is a rules change and rides
    the same versioning discipline; the number's meaning stays [D46]'s.
-3. **`projection_version`** — the axis is D48's (in flight): its value, bump
-   rule, and framing semantics are defined there, not here. This record
-   reserves its manifest slot and its comparability rule (clause (f) R-3),
-   and stores whatever D48 defines.
+3. **`projection_version`** — the axis is [D48](f)'s: value 1 today, bumped
+   only on WP-2/WP-3 framing change, never for a payload-schema or rules
+   change, and "carried nowhere in the tree today" — [D48](f)'s own words,
+   which also assign this slot: "stored in the manifest beside `RulesetId`
+   and the schedule digest — the manifest construct, storage and governance
+   are R8's". This record supplies exactly that: the manifest slot and the
+   comparability rule (clause (f) R-3), no semantics.
 
 ### (d) X-3 / X-4 — removal is diagnosed precisely and never silently absorbed
 
@@ -307,7 +310,7 @@ another.**
 | `RulesetId.version` (u32) | game | which rules semantics produced this evidence |
 | `RulesetId.digest` (32 B, clause (b)) | content-derived | which exact build |
 | `(ComponentTypeId, SchemaVersion)` per component | game, via clause (e) | what shape these payload bytes are |
-| `projection_version` (D48, in flight) | per D48 | how witness bytes were framed |
+| `projection_version` ([D48](f); value 1 today) | per [D48](f)'s bump rule | how witness bytes were framed |
 | `schedule_digest` ([D43](g)) | composition root | what execution topology ran |
 | `profile_id` (clause (a)) | workspace | which determinism envelope this build claims |
 
@@ -320,16 +323,17 @@ automatic**: adding a component typically bumps the schema table, may bump
 states its own reason in its own review, and none is computed from another.
 
 Relationship to [D38], as that record stands on this tree: clause (d)(3)
-pinned the first orthogonality for two axes — "The bag's version fields and
-the build's digest answer different questions and must never be derived from
-each other" (docs/adr/0038:198-205; restated at atrest.rs:23-26 as "neither
-number is ever derived from the other"). D48, in flight, amends that clause
-to a third axis — the one amendment in the #395 set. **This record does not
-edit D38's text.** It generalizes the same sentence to the full set of seven
-in its own normative text, above; if D48 lands, this clause extends D48's
-three-axis form of the sentence, and if D48 does not, it extends the
-original two-axis form — the law here is identical either way, which is why
-no amendment is needed.
+originally pinned the orthogonality for two axes, and [D48](g) — the one
+amendment in the #395 set — has already widened it to three: on this branch
+(d)(3) now closes "The bag's version fields, the build's digest, and the
+projection version answer different questions and none of the three may ever
+be derived from another" (docs/adr/0038:198-215, closing sentence at
+:212-215; the two-axis restatement survives at atrest.rs:23-26 as "neither
+number is ever derived from the other"). **This record does not edit D38's
+text.** It generalizes [D48]'s widened form of the same sentence from three
+axes to seven in its own normative text, above — the same relationship to
+(d)(3) that [D48] had, minus the amendment, because a law stated over a
+superset needs no edit to the subset's record.
 
 ### (h) Rolling upgrade — there is no general story, and the absence is reaffirmed, not left open
 
@@ -395,7 +399,7 @@ through the front door. [D21]'s reopen conditions stand unchanged.
   behaves *worse* than today while the debt stands, and clause (f)'s digest
   rows become fully meaningful only when it is paid.
 - **Three sibling records gain a home without gaining a landlord**: [D43]'s
-  schedule digest, [D46]'s C-2 constants, and D48's `projection_version` get
+  schedule digest, [D46]'s C-2 constants, and [D48]'s `projection_version` get
   storage here with semantics untouched there. A reader asking "what does
   this field mean" is always sent to the owning record.
 - **The strike economy is protected by refusal asymmetry** (clause (f) R-3,
@@ -496,9 +500,12 @@ line; no mutation landed on both sides of an equality):
 | M3 | `AdjudicationExecutor::register`'s eviction loop deleted (adjudication.rs:357-359) — builds accumulate past `RETAINED_BUILDS` | `cargo test -p orrery_persistd --lib adjudication` | `only_three_builds_stay_adjudicable` and `a_report_for_a_retired_build_is_undecidable_not_a_strike` FAILED; `11 passed; 2 failed` | `13 passed; 0 failed` |
 
 All three sources restored byte-identical (`git status` clean); this record
-is the branch's only change. D44 and D48 had no files under `docs/adr/` on
-this branch at acceptance time, so both are cited above as plain decision
-ids rather than links.
+is the branch's only change. At the first acceptance pass neither D44 nor
+D48 had a file under `docs/adr/`; the rebase onto `origin/main` immediately
+before the final commit brought in `0048-canonical-witness-projection.md`
+(and with it D38's amended three-axis (d)(3)), and this record was updated
+to link [D48] and cite the amended D38 text. D44 still had no file at the
+final commit and remains cited as a plain decision id.
 
 [D9]: 0009-verifiable-core.md
 [D14]: 0014-pinned-versions.md
@@ -511,4 +518,5 @@ ids rather than links.
 [D45]: 0045-per-component-capability-policy.md
 [D46]: 0046-message-class-semantics.md
 [D47]: 0047-rollback-unit.md
+[D48]: 0048-canonical-witness-projection.md
 [A8]: ../plans/a8-compatibility-manifests.md
