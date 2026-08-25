@@ -157,6 +157,10 @@ struct SenderTrack {
 }
 
 impl DownlinkTracker {
+    fn last_tick(&self, sender: u32) -> Option<u64> {
+        self.senders.get(&sender).and_then(|track| track.last_tick)
+    }
+
     /// Account for one replication packet from `sender` carrying tick `at`,
     /// arriving `now_ms` milliseconds after session start.
     ///
@@ -561,6 +565,16 @@ impl CampaignRuntime {
     #[must_use]
     pub fn downlink_accounting(&self) -> (u64, u64) {
         (self.downlink_arrivals, self.downlink.total_missing())
+    }
+
+    /// Newest replication tick accounted for from `sender`, if one arrived.
+    ///
+    /// This is the receiver-side progress marker fixtures use to establish a
+    /// quiescent cut through an ordered downlink stream before reconciling the
+    /// sender's ledger.
+    #[must_use]
+    pub fn downlink_last_tick(&self, sender: u32) -> Option<u64> {
+        self.downlink.last_tick(sender)
     }
 
     /// Replication packets that decoded to nothing this session recognises.
