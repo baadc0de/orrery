@@ -3,6 +3,7 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod admission;
 pub mod assets;
 pub mod campaign;
 pub mod combat;
@@ -16,6 +17,9 @@ pub mod telemetry;
 
 /// Commit revision embedded in this client binary at build time.
 pub const BUILD_REV: &str = env!("ORRERY_BUILD_REV");
+
+/// Public campaign-admission origin used by a no-argument volunteer launch.
+pub const DEFAULT_ADMISSION_URL: &str = "https://campaigns.distopik.com";
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -922,6 +926,7 @@ fn write_campaign_record_on_exit(
     mut exited: MessageReader<AppExit>,
     mut session: ResMut<ActiveSession>,
     metrics: Res<OverlayMetrics>,
+    upload: Option<Res<admission::UploadManager>>,
 ) {
     for exit in exited.read() {
         let ActiveSession::Campaign(runtime) = &mut *session else {
@@ -946,17 +951,28 @@ fn write_campaign_record_on_exit(
             let mut writer = std::io::BufWriter::new(file);
             crate::session::CampaignSession::write_record(&mut writer, &record)?;
             use std::io::Write as _;
-            writer.flush()
+            writer.flush()?;
+            writer.get_ref().sync_all()
         };
         match write() {
-            Ok(()) => info!(
-                "campaign session {} recorded to {} ({} banked min)",
-                record.session_id,
-                record_path.display(),
-                record.banked_minutes
-            ),
+            Ok(()) => {
+                info!(
+                    "campaign session {} recorded to {} ({} banked min)",
+                    record.session_id,
+                    record_path.display(),
+                    record.banked_minutes
+                );
+                if let Some(upload) = &upload {
+                    admission::upload_finished_session(
+                        upload,
+                        &record,
+                        &record_path,
+                        &metrics.session_record_path,
+                    );
+                }
+            }
             Err(error) => error!(
-                "cannot write campaign record {}: {error}",
+                "cannot write campaign record {}: {error}; upload not attempted so local evidence remains authoritative",
                 record_path.display()
             ),
         }
