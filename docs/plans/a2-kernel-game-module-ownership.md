@@ -1,0 +1,564 @@
+# A2 — Kernel versus game-module ownership (#398)
+
+**Status:** evidence for the #395 planning tree · **Date:** 2026-08-25 ·
+**Tree:** `docs/398-a2` at `46c9301a` · **Parents:** [#398](https://github.com/baadc0de/orrery/issues/398) ←
+[#395](https://github.com/baadc0de/orrery/issues/395) · **Builds on:**
+[A1](a1-ruleset-architecture-map.md) · **Source brief:**
+[docs/plans/ruleset-ecs-migration-brief.md](ruleset-ecs-migration-brief.md) §Proposed
+conceptual model
+
+This document decides **who owns each responsibility**: the Orrery kernel —
+infrastructure that must serve any game — or a game module — Regolith-specific
+rules. It is the constraint that stops Orrery infrastructure from quietly
+becoming gameplay-specific.
+
+It is **not an architecture recommendation**. Every row below is stated so it
+holds whether A3 (#399) keeps `Ruleset`, adopts a canonical `bevy_ecs::World`,
+builds an engine-neutral core, or lands a hybrid: "owner" names *who decides
+semantics and who may change what*, never *which storage or trait expresses it*.
+Where a row's full answer depends on a decision another tree item owns
+(rollback unit → A7; per-component policy shape → A5; module manifests → A8),
+the row assigns what is decidable now and names the deferred decision instead of
+inventing one.
+
+Method, as in A1:
+
+- Every claim cites a file and line opened on this tree today. Where this
+  document asserts an enforcement property for a gate or a structural rule,
+  the **guarded stage was broken**, the named check that died recorded, the
+  change reverted and the pass re-confirmed (§8).
+- What **exists today**, what is **designed but unwired**, and what is
+  **speculative** never share a sentence.
+- A1's load-bearing findings were re-verified against this tree before being
+  relied on; deltas found are in §9.
+
+---
+
+## 1. Definitions
+
+**Kernel** — code whose specification can be written without naming any game's
+semantics. Operational test: could this code be written, tested, and shipped
+against two hypothetical games that share nothing but the wire? The kernel's
+correctness story (determinism, identity, authority, atomicity, evidence) must
+not reference Regolith, Skirmish, or any future game.
+
+**Game module** — code whose meaning is given by a game's design: damage,
+inventory, docking, bloom cadence, respawn timers. Another universe replaces it
+ wholesale without the kernel noticing.
+
+A third category exists because the tree already has it, and pretending it is
+one of the other two is how boundaries rot:
+
+**Game-authored policy consumed by kernel machinery** — declarations *about*
+game content that kernel code interprets: `Ruleset::invariants()` predicates,
+`classify_component` classifications, `CoreCodec` encodings,
+`IntentValidator` implementations. For these, ownership is always two-sided:
+the **game authors** the declaration, the **kernel consumes and enforces** it.
+Neither side owns it alone, and the seam between them is where most of §2's
+rows land.
+
+### 1.1 What exists today (the three strata)
+
+The current tree already separates along these lines, by crate:
+
+| Stratum | Crates | Evidence |
+|---|---|---|
+| Wire vocabulary | `orrery_protocol` | Engine-agnostic by gate-enforced rule; every serialized type crosses here ([docs/10-crates.md](../10-crates.md):92, D15 layering 1) |
+| Kernel machinery | `orrery_core`, `orrery_net`, `orrery_spatial`, `orrery_authority`, `orrery_predict`, `orrery_persist_client`, `orrery_witness` engine half, `orrery_persistd` coordination | None of them names `Ruleset` except core (definition), witness (engine + adapter), persistd (two registration-edge functions), facade (pass-through) — A1 §3; re-verified on this tree (`rg 'R: Ruleset'` hits exactly those files). Net/spatial/authority/predict/persist-client never name the trait at all (A1 §3.7, re-run) |
+| Games | `orrery_games` (Regolith v8, Skirmish v2), `clients/regolith`, harness-side assembly in `gates/p1-swarm` | A1 §2, §3.6 |
+
+Two observations sharpen the picture before the table:
+
+1. **"Kernel" is not a crate; it is a role.** `bevy_ecs`, lightyear and
+   replicon appear *inside* kernel crates (spatial, predict, persist-client)
+   as implementation substrates, while `orrery_core` is Bevy-free. Both are
+   kernel under the definition above: neither names game semantics. The
+   question A3 will answer — which substrate hosts canonical state — is
+   therefore orthogonal to every row below.
+2. **The games/harness boundary is already blurry in exactly one place.**
+   `gates/p1-swarm` drives `Executor<Regolith>` directly and assembles signed
+   frames harness-side (`bot.rs:680` step loop, `bot.rs:1094-1138`
+   claim/frame publication). That is harness code standing in for the field
+   host that does not exist yet (A1 §5.5), not a precedent about ownership.
+
+---
+
+## 2. The ownership table
+
+One row per responsibility. **Owner** uses three values: *Kernel* (any game's
+kernel may change it; games must not), *Game module* (each game owns it;
+kernel must not name it), *Split* (one seam, named, with each side listed).
+
+| # | Responsibility | Owner | Where it lives today (evidence) | Reason |
+|---|---|---|---|---|
+| 1 | **Time and tick progression** — what tick `T` is, the fixed rate, epoch anchoring | **Split.** Kernel owns tick *semantics*: `Tick(u64)`, universe-global, anchored to a coordinator-issued epoch (`orrery_protocol/src/persist.rs:24-28`), fixed 60 Hz as a constant "never a measurement" (`executor.rs:25-28`). Hosts own *driving*: today three hosts advance ticks themselves — p1-swarm bots (`bot.rs:680`), the regolith client's local session (`clients/regolith/src/lib.rs:71,91`), and lightyear's session clock bridged per-tick (`orrery_predict/src/tick.rs`). Games may *read* the tick (Regolith derives bloom cadence from it, `regolith/mod.rs:34-36`) | Adjudication re-runs tick `T` on a different machine months later; if a game could define its own rate or advance shared time, "the same tick" stops meaning one thing and every witness verdict becomes unproducible. VC-1 exists precisely here | A game module defining its own tick rate, introducing a `dt`, or advancing canonical time. The ambient-input ban (VC-8) already fails rules that read wall-clock (`core-gates.sh:103-105`; A1 mutation M4) |
+| 2 | **Identity** — durable vs ephemeral ids, allocation rules | **Split.** Kernel owns identity *classes* and their discipline: `PersistId(u64)` (`persist.rs:46`), `RulesetId` (`verifiable.rs:59`), `UniverseSeed` (`verifiable.rs:71`), cluster-side minting of persistent rows (`intent/mod.rs:184-186`: "Every op costs a minted `PersistId`"), the ephemeral registry mapping bevy `Entity ↔ EphemeralId` (`orrery_authority/src/ephemeral.rs:160`). Games own *derivation inside their step*: materialized identifiers must come from replayable inputs — "`executor` deliberately has no allocator … identifiers are derived by the emitting step from its own replayable inputs; they are never allocated from executor population or creation order" (`ruleset.rs:210-215`, `:272-278`) | Identity must survive replay on a machine that holds only the disputed entity. Allocation-order identity would make an isolated replay disagree about which entity was created — the exact property the adjudicator's single-entity model depends on | An id minted from population/creation order, or an engine entity handle crossing the wire/persistence boundary (D15 layering 1 keeps wire types engine-free) |
+| 3 | **Authority** — claims, leases, handoff, divestiture | **Kernel**, entirely. Claims/leases/phases/handoff live in `orrery_authority` (`lib.rs:44-464`); D7/D26/D30 govern semantics. The structural proof of ownership is negative: `step`'s signature carries no lease or authority input (`ruleset.rs:257-262` — state, inputs, rng only), so outcomes cannot depend on who executed them | A rule that branched on lease internals would adjudicate differently than it executed whenever replay ran on a holder without the same lease table — the same failure mode the neighbour-read ban closes (`core-gates.sh:126-139`), one level up | A game module implementing or mutating lease logic; conversely the kernel interpreting what a game's *contact graph means* — hosts supply `ContactObservations`, the kernel plans from them (facade doc `crates/orrery/src/lib.rs:434-438`) |
+| 4 | **Transactions** — atomic admission, durable effects, anti-dupe | **Split at a named seam.** Kernel owns the envelope: gateway pre-checks (`IntentValidator`, `intent/mod.rs:156-161`), volume bounds (`MAX_OPS_PER_INTENT = 64`, arg caps `:189-195`, attestation cap `:202`), the FDB transaction as sole authority (`:152-155`), idempotency/minting, and op-id reservation discipline (`:243-254`). Game owns op *semantics*: "Every other op id is `Ruleset`-opaque" (`:208-209`). Exactly two ops are cluster-interpreted — ledger credit (`LEDGER_CREDIT_OP = 0`, `:210`) and item transfer (`LEDGER_ITEM_TRANSFER_OP = 2`, `:257`), the second added because the anti-dupe invariant needed a real read-check-write producer (`:218-227`) | Atomicity is infrastructure: any game's trades must commit-or-not identically. But *what* a trade means cannot live in the cluster — the cluster serves every game and links none necessarily ("registering a build means linking a `Ruleset`", `bin/persistd.rs:1261-1263`) | A module writing durable state outside the transactional envelope (the brief states this too). Flagged tension: the two interpreted ops are game-flavoured semantics living kernel-side — §4 CC-1 works through why they are reservations, not precedent |
+| 5 | **Spatial state** — grid, cells, AOI, hysteresis, interest | **Split.** Kernel owns geometry and attention: `Cell(CellId)` components, AOI subscription, interest selection, hysteresis (`orrery_spatial/src/plugin.rs:40`, `hysteresis.rs:32`, `interest.rs:45`); `CellId` encoding is protocol-level (D5). Games own movement integration and what position *means*, encoded on the kernel lattice — quantized positions/velocities (`QPos`/`QVel`, `quantize.rs:33,44`; VC-7 snap each tick) | Every game lives in cells and needs interest management; no two games agree on how a craft steers. The lattice is the meeting point: kernel-defined encoding, game-filled content — the same shape as row 8's codec split | The kernel choosing a bounce/wrap/despawn response for entities reaching an island edge (game behaviour — see §4 CC-2), or a game computing its own cell membership (interest management would then diverge from authority) |
+| 6 | **Persistence coordination** — journaling, checkpoints, uplink, write classes | **Split.** Kernel owns coordination: cell actors store opaque component bytes — "Components are stored as postcard bytes so the actor never needs the game's component types" (`orrery_persistd/src/actor.rs:117-121`); journal/checkpoint machinery, retention, recovery (D19/D20/D23); client-side uplink/session/area loader (`orrery_persist_client`). Games own codecs for their state (`CoreCodec` impls) and — designed but unwired — the classification that routes write classes: docs/06 says the classification "drives persistence write classes (§D11) and witness attention (§D10)" (`docs/06-verifiable-core.md:60`) | The cluster never interprets game state (A1 §5.4), so it can persist any game; the game must make its state canonically encodable or nothing downstream can hash, replicate, or restore it | Persistence code naming a component type, archetype order, or reflection metadata; a module bypassing the bag to write its own rows |
+| 7 | **Rollback** — prediction resimulation, correction after adjudication | **Kernel** owns mechanism, window and budget; the rollback *unit* is explicitly reserved to A7 (#403) and not assigned here. Today two mechanisms exist: lightyear-side resimulation under a budget guard (`orrery_predict/src/budget.rs:97,191`), and canonical correction by re-execution — confirmed verdicts queue authoritative state back through `AuthorityCorrectionInbox` (`orrery_predict/src/correction.rs:48`; facade queues at `crates/orrery/src/lib.rs:338`). Note this honestly: *rollback of canonical rules state is currently a replay/correction story, not a world rewind* (A1 §9 assumption 7 rider) | Re-execution-based correction works only because steps are pure — the game's purity obligation (row 9) is what makes the kernel's rollback substrate valid. Mechanism and obligation are separable from storage, which is why this row survives every A3 variant | A game module keeping hidden state outside `CoreState` — an effect invisible to the hash is invisible to correction too (`ruleset.rs:280-284` states this trap verbatim) |
+| 8 | **Witnessing** — stages, evidence, escalation, strikes | **Split.** Kernel owns the pipeline: ingest → stage 1a invariant checks → stage 1c per-entity re-execution → audit window → self-verifying report, shadow-mode by default (`witness/src/lib.rs:13+`, A1 §5.3), plus strike accounting and adjudication registration (`AdjudicationExecutor::register<R>`, `adjudication.rs:350`). Game supplies the two things the pipeline cannot invent: stage-1 predicates (`invariants()`, consumed at `witness.rs:668` via `evaluate`, `invariants.rs:118`) and the canonical codec whose blake3 encoding *is* the claim commitment (`state_hash`, `ruleset.rs:324-326`) | A witness that had to understand damage would need a new release per game; a witness fed arbitrary predicates needs only the declarations. This is the policy-consumer category working as designed — unlike `classify_component` (§7), `invariants()` has real call sites | Witness code branching on game events semantically; a game declaring invariants the kernel must *interpret* rather than merely evaluate |
+| 9 | **Gameplay components and systems** — combat, movement meaning, spawns, AI | **Game module**, entirely. `RegolithState` variants, `Order` inputs, `Outcome` events and all stepping live in `orrery_games` (`regolith/mod.rs:122-166`, `state.rs`, `weapon.rs`, `pilot.rs`); Skirmish likewise; presentation skins consume frames (`clients/regolith`, p1-swarm mirroring `bot.rs:669-734`). Verified negatively: no kernel crate source names any game type — `rg "Regolith\|Skirmish\|BloomDirector\|HullIntegrity"` over the nine kernel crates' `src/` returns zero files (run on this tree) | This is the definition of the category. Everything here is replaceable per-universe; anything the kernel needs from it must cross as one of the declared seams (codec bytes, predicate slices, event vocabulary carried opaquely) | Kernel code special-casing a state variant, an event kind, or a tuning constant. Regolith's `ISLAND_CRAFT_BUDGET = 8` (`regolith/mod.rs:45-55`) is population policy — game-owned — even though the *window budget mechanism* it feeds is spatial-kernel |
+| 10 | **Invariants — cross-game vs game-specific** | **Split by scope.** Cross-game invariants — VC-1..VC-8, chain integrity, first-writer-wins materialization, input ordering, transaction bounds — are **kernel**: authored in core/persistd, mechanically enforced where possible (`core-gates.sh` clauses; executor guarantees like quantize-before-hash, `executor.rs:126-127`). Game-specific invariants — speed ceilings, cooldown honouring, lock timing, acceleration bounds — are **game**, authored as `Invariant<CoreState>` predicates (`regolith/invariants.rs`, consumed exactly like row 8's stage 1a) | The container/enforcement-point split: the kernel owns *where* checks run and *what happens* on violation; the game owns *what* is checked. Neither can fake the other's half — a kernel-authored speed limit would be wrong for the next game; a game-authored chain-integrity check would be redundant and unauditable | A game invariant enforced anywhere other than a declared predicate or its own step; conversely, kernel machinery special-casing a named game invariant |
+
+### 2.1 Supplementary rows (emerged while assigning the ten)
+
+These were not listed in #398 but the corner cases of §5 cannot land without
+them, so they are assigned rather than left implicit:
+
+| # | Responsibility | Owner | Evidence and reason |
+|---|---|---|---|
+| 11 | Deterministic RNG partitioning | **Kernel** | `tick_rng(seed, entity, tick)` (`rng.rs:31`), supplied by the executor (`executor.rs:120`). Games draw; they never seed from anywhere else (VC-3). A game-supplied RNG source would break replay portability |
+| 12 | Input admission and ordering | **Kernel** fixes the total order before execution; **game** interprets meanings | `OrderedInputs` iterates log order and is never sorted (`ruleset.rs:149-157`, VC-2). Volume caps are kernel (`intent/mod.rs:189-202`) |
+| 13 | Cross-entity effect transport | **Kernel** carries emission-ordered events as next-tick inputs; **game** defines vocabulary and consumption | `StepOutput.events` is a `Vec`, "never a set" (`ruleset.rs:195-201`); live neighbour reads are banned until a `NeighborFrame` producer exists (`core-gates.sh:126-139`) |
+| 14 | Replication/relevance policy | **Kernel** transports (replicon/AOI); **game** declares relevance per component — declaration channel unwired (see §6) | docs/06 names the intended consumers (`docs/06-verifiable-core.md:210`); none exist yet |
+| 15 | Version identity & compatibility surface | **Kernel** pins `RulesetId` into frames, claims, bundles, strike rows and persisted records; **game** supplies the value | `verifiable.rs:59` + pinning sites (A1 §5.4 list); D21 freezes persistd's exports; D38(c): additive trait change is free, a *required* method names D21 |
+
+---
+
+## 3. Dependency direction
+
+The arrows, as they exist today and as the table requires:
+
+```text
+                    ┌────────────────────────────────────────────┐
+                    │            orrery_protocol                 │
+                    │   (wire vocabulary; engine-free by rule)   │
+                    └───────────────▲────────────────────────────┘
+                                    │ every crate depends on it
+        ┌───────────────────────────┼───────────────────────────┐
+        │ kernel machinery          │                           │
+        │  core ◀ witness(engine)   │   games: Regolith,        │
+        │  core ◀ persistd(coord.)  │   Skirmish, future        │
+        │  core ◀ conformance       │   modules                 │
+        │  net spatial authority    │                           │
+        │  predict persist_client   │                           │
+        └───────▲───────────────────┴──────────▲────────────────┘
+                │                              │
+        presentation skins              game modules depend on
+   (clients/regolith, harnesses)        any kernel crate; kernel
+        depend on both                  never depends on a game
+```
+
+Normative layering already in force (not invented here): protocol ← everything
+and `orrery_core` ← {witness, persistd, field-host-to-be, game} are D15's first
+two layering rules ([docs/10-crates.md](../10-crates.md):92-94); lightyear only
+inside `orrery_predict`, replicon only inside `orrery_spatial`/`persist_client`
+(rules 3-4, `:95`). `orrery_persistd` takes the witness engine with
+`default-features = false` (`orrery_persistd/Cargo.toml:36`) — the backend
+links no Bevy at all.
+
+### 3.1 The three legal crossings
+
+Everything a game module and the kernel exchange must cross one of these:
+
+1. **Ordinary dependency, game → kernel.** A module imports machinery
+   (`orrery_games` depends on `orrery_core` + `orrery_protocol`,
+   `orrery_games/Cargo.toml:13-14`).
+2. **Policy handover at a registration seam.** The game hands the kernel inert
+   declarations — an `invariants()` slice, a `classify_component` fn, `CoreCodec`
+   impls, an `IntentValidator` impl, a boxed build factory
+   (`adjudication.rs:350-360`). The kernel *invokes* these; it never inspects
+   their semantics. This crossing is what makes rows 4, 6, 8 two-sided without
+   either side owning the other.
+3. **Opaque bytes through wire and store.** Canonical encodings (`CoreCodec`),
+   intent op args, component bags. The cluster hashes them, routes them, and
+   persists them without understanding them.
+
+### 3.2 What must never point back, and the rule each reversal violates
+
+| Forbidden arrow | Rule it violates | Consequence if drawn | Enforcement today |
+|---|---|---|---|
+| Kernel crate → game-module crate (dependency or type naming) | D15's crate-set neutrality: infrastructure serves any game | Every other game transitively links this game's rules; "the same build links into peers, field hosts and persistd" (D9, `ruleset.rs:3-6`) becomes "the same build links into *these* games"; adjudication loses its footing because the cluster would ship one universe's content as if it were law | **Structural for `orrery_core ↔ orrery_games`**: the reversal is a cargo cycle and the resolver refuses it (§9 M-A). **Nothing mechanical for any other pair** — e.g. `orrery_spatial` gaining a dependency on `orrery_games` compiles and no check fires. Honest finding: this direction is convention plus review everywhere except that one structurally locked edge |
+| Engine/Bevy → verifiable core | D9/D15: core is headless and engine-agnostic so peers, field hosts and the cluster can link it | The cluster cannot link the rules to adjudicate; three runtimes disagree about the same log | Gate-enforced: `core-gates.sh:71-75` fails on any bevy in `cargo tree`, dev-deps included (§9 M-B) |
+| Presentation/engine state → canonical state | The brief's own boundary: presentation events have "no authority over canonical state" | Rollback rewinds audio and UI; witnesses hash renderer output; determinism dies quietly | Partially structural: canonical state lives in `Executor` maps, not ECS components, so a Bevy system cannot reach it today. Under an ECS-hosting A3 variant this arrow needs its own enforcement (A4/A7 territory) |
+| Persistence/wire formats ← engine types (archetype order, entity bits, reflection names) | Protocol leakage (brief §Primary risks); D38(d)(3) keeps schema versions orthogonal to `RulesetId` | Every stored byte pins a Bevy version; migration across engine upgrades becomes impossible | Structural: formats are defined in `orrery_protocol`, which no engine reaches |
+
+The single sentence version of the rule:
+
+> **Games may depend on all of the kernel; the kernel may depend on games only
+> through the three crossings of §3.1 — and a kernel artifact that names a
+> game's types has already absorbed gameplay, wherever it sits in the tree.**
+
+### 3.3 Where enforcement is missing (findings, not proposals)
+
+Recorded because the table's authority claims should not overstate what is
+mechanically held today:
+
+1. Only one kernel↔game edge (`core`/`games`) is protected by structure. The
+   other kernel crates could grow game dependencies silently.
+2. `classify_component`'s consumers do not exist, so row 6's write-class
+   routing and row 8's attention policy are currently *unowned in practice*
+   even though ownership is assignable in principle (§7).
+3. The neighbour-read ban is scoped to `RULES_CRATES = (orrery_games
+   orrery_conformance)` (`core-gates.sh:42`). If game logic migrated into a
+   kernel crate, the gate would stop watching it — the gate watches *crates*,
+   and §2's table assigns by *role*. A future gate keyed on role rather than
+   crate list is A4/A10 material; noted here so the gap is visible now.
+
+---
+
+## 4. Cross-module corner cases, worked through
+
+Each case names the interaction, walks it through the current tree's mechanics,
+and lands it on §2's rows. These are chosen so that every owner value
+(Kernel / Game / Split-with-seam) gets exercised at least once.
+
+### CC-1 — Damage × inventory × docking (the brief's example)
+
+**The interaction.** A craft's hull crosses zero; its cargo should spill or
+burn; the ship was docked to a station, so someone else arguably owned the
+hull; and a ledger row somewhere must move exactly once.
+
+**How today's tree carries each leg:**
+
+- *Damage.* The shooter's `step` emits an event; the target consumes it as an
+  input **next tick** (`ruleset.rs:196-201`: "an attacker's step emits
+  `DamageApplied(target)`; the target consumes it as an input at the next
+  tick"). Death itself is a state transition inside the victim's own step —
+  Regolith's wreck countdown is ordinary state (`RESPAWN_TICKS`,
+  `regolith/mod.rs:44`). No kernel code interprets "damage"; the kernel
+  guarantees only emission order and delivery.
+- *Inventory.* Items are not in `CoreState` at all — they are ledger rows.
+  Moving one is an intent whose op args are opaque to the cluster unless the
+  op is one of the two reserved ids (`intent/mod.rs:208-210,257`). The
+  atomicity of "cargo destroyed + ownership row released" is the FDB
+  transaction envelope (row 4), not game code.
+- *Docking.* Docking changes who may mutate the docked craft's state — an
+  authority fact (row 3), carried by claims/leases in `orrery_authority`, not
+  by any rule. The rule sees at most a reflected input ("my thrusters are
+  slaved") because `step` has no lease input (`ruleset.rs:257-262`).
+
+**Where it lands.** Three owners meet, and the join point is precisely the
+policy-consumer seam:
+
+1. The *fact* "craft X was destroyed at tick T by emitter E" is a **game**
+   event — vocabulary and meaning are module-owned (row 9).
+2. Its transport, ordering, and replayability are **kernel** (row 13 of §2.1,
+   events-as-next-tick-inputs).
+3. The durable consequence — releasing item rows — must enter through the
+   transaction envelope (**kernel**, row 4) carrying **game**-meaningful args;
+   the anti-dupe read-check-write stays cluster-interpreted so that no module
+   can bypass single-ownership.
+4. Whether the docking relationship changes who *may* submit intents for the
+   docked entity is **kernel** authority policy (row 3), informed by a
+   **game-declared** capability statement (the unwired per-component authority
+   policy; A5 territory).
+
+**Why this proves the split matters:** neither extreme works. If one damage
+module owned the whole chain end-to-end, it would have to implement FDB
+transaction semantics — duplicating the envelope and losing atomicity
+guarantees for everyone else. If the kernel interpreted destruction, the next
+game's death semantics (no wrecks, instant respawn, no cargo) would need
+kernel surgery. The table forces both halves to stay home and gives their
+meeting points names.
+
+### CC-2 — Island boundary × spatial grid × movement
+
+**The interaction.** A rock reaches the island edge. Does it bounce (Regolith:
+`ISLAND_BOUNDARY_MM = 1_000_000`, integer velocity negation,
+`regolith/mod.rs:60-61`), wrap, despawn, or keep going into the next cell?
+
+**Working through.** The *existence* and coordinates of the boundary are
+spatial-kernel facts: cell geometry, AOI and interest all derive from the grid
+(row 5). But the *response* to reaching it is gameplay: another universe wraps
+instead of bouncing, and Regolith's own choice is deliberately naive — reflect
+with exact integer negation so the invariant check can verify it
+(`regolith/invariants.rs` bounds acceleration/velocity against these same
+constants). Note what happens if either side swallows the other's half:
+
+- If the kernel bounced entities, every game inherits Regolith's physics
+  flavour, and the kernel would now contain a tuned constant — gameplay
+  content — inside gated infrastructure.
+- If the game computed its own cell membership from position, interest
+  management (`orrery_spatial`) and authority scoping would disagree with the
+  simulation about which island an entity is in — two sources of truth for
+  the same question.
+
+**Where it lands.** Boundary existence/coordinates: **kernel** (row 5).
+Response on contact: **game** (row 9). The quantized coordinate lattice is the
+interface — the kernel guarantees positions are comparable and hashable
+(VC-7); the game decides what they do. This case also shows why row 9's
+"population budgets are game-owned" matters: `ISLAND_ROCK_BUDGET = 24`
+(`regolith/mod.rs:48`) is Regolith's density choice, while the window-budget
+mechanism it feeds belongs to spatial infrastructure.
+
+### CC-3 — Authority handoff × rollback × an open witness window
+
+**The interaction.** A craft's lease transfers mid-flight (drain or handover).
+Meanwhile: a predicting client simulated nine ticks ahead; a witness holds
+signed claims up to T−1; the disputed window spans the transfer.
+
+**Working through.** Because outcomes are independent of the executor — same
+`(universe_seed, entity, tick)` RNG, no lease input, pure step — the new
+authority continues the same log without a seam: re-execution of ticks before
+the handoff produces identical hashes whether run by old holder, new holder,
+witness, or adjudicator. That is not luck; it is three kernel decisions
+interlocking: RNG anchored to absolute tick (§2.1 row 11), authority kept out of
+step inputs (row 3), and claims verified against subject-signed history rather
+than reporter-supplied hashes (`replay.rs:325-339`, via A1 §5.2). The
+prediction client reconciles against whichever authority currently answers,
+through the correction inbox (row 7).
+
+**Where it lands.** Handoff mechanics, claim continuity, correction routing:
+**kernel** (rows 3, 7, 8). The game's obligation is only purity — which is
+row 9's fine print. Had the table put any part of lease semantics in the game,
+re-execution could not be delegated to a third party, and D10's whole
+economy — a witness that watches "an authority it does not trust"
+(`witness/src/lib.rs:3-5`) — collapses.
+
+### CC-4 — Materialization collision × population budget × replay isolation
+
+**The interaction.** Two bloom directors materialize pickups in the same tick;
+Regolith wants at most four outstanding pickup windows island-wide
+(`ISLAND_PICKUP_BUDGET`, `regolith/mod.rs:50`); meanwhile the adjudicator will
+replay the emitting entity *alone*, holding none of the world
+(`replay.rs:106-130`).
+
+**Working through.** Identifiers come from the event — `(director, bloom_index,
+slot)` style derivation from the emitter's own replayable inputs — so an
+isolated replay reproduces the same descriptions even though it holds no other
+entities (`ruleset.rs:272-278`). Collisions resolve first-writer-wins in
+description order at install time (`executor.rs:144-157`) — a **kernel**
+arbitration rule, deterministic because description order is emission order.
+The budget cannot be enforced by asking "how many pickups exist?" — that
+question is unanswerable in an isolated replay and depends on allocation order.
+So Regolith encodes it as monotone counters in the director's *own state*
+(bloom bookkeeping fields on `BloomDirector`), which travel with the entity
+into replay. And the trap is documented where the API lives: "Materialization
+descriptions are not part of `state_hash`. A game whose materialization
+matters to adjudication must also record an own-state trace … an event-only
+effect is invisible to state-hash goldens and adjudication"
+(`ruleset.rs:280-284`).
+
+**Where it lands.** Identity derivation discipline + collision arbitration +
+hash-invisibility caveat: **kernel** (rows 2, 13). Budget semantics + the
+counter encoding: **game** (row 9). This case is the cleanest demonstration
+of why identity allocation can never be kernel-*provided at runtime*: the
+moment ids depend on world population, isolated replay — the entire
+adjudication model — stops working.
+
+---
+
+## 5. Are explicit integration modules warranted?
+
+The brief asks whether cross-module behaviour should live in dedicated
+integration artifacts (`ShipCargoDamageIntegration`, …), in systems registered
+by a higher-level game crate, or in another construct. Evaluation of both
+sides, from this tree's evidence; **no preference is taken** — the construct
+choice belongs to A3/A8. What §2 does fix regardless: every cross-module
+coupling must have a *named owner* somewhere; what may stay open is whether
+that owner is a distinct artifact.
+
+### 5.1 The case for
+
+1. **Couplings that hide are couplings that rot.** The brief's motivation
+   section lists "corner cases accumulating in central dispatch functions" and
+   "hidden coupling through callbacks" as failure modes. A named integration
+   artifact makes each coupling visible, ordered, testable, and — under an
+   eventual module manifest (A8) — pinnable in the compatibility hash.
+2. **This tree already agrees at the entity level.** Cross-entity effects
+   travel as typed, ordered events consumed next tick (`ruleset.rs:196-201`);
+   CC-1 showed a four-owner interaction held together by exactly one join
+   point. An integration module is the same discipline one level up: the
+   damage×inventory join gets a home instead of living inside whichever of
+   damage or inventory was edited last.
+3. **Testability has a concrete shape here.** `orrery_games`' scenario harness
+   runs games against scripted pilots with golden chains (`scenario.rs:172`,
+   `golden.rs`). An integration artifact gives interactions their own
+   scenarios — today an interaction test must be written *inside* one parent
+   module's tests, which misstates ownership.
+4. **Adjudication pressure points the same way.** Because replay holds one
+   entity, interaction logic that reads several entities' live state cannot be
+   adjudicated as written (the neighbour-read ban exists precisely because no
+   `NeighborFrame` producer exists, `core-gates.sh:126-139`). Logic composed
+   through events *can* be adjudicated emitter-side. A rule of thumb falls out
+   on its own: integration logic must compose via the event/input channel, not
+   via multi-entity queries — and an explicit artifact makes that constraint
+   checkable per-coupling rather than per-statement.
+
+### 5.2 The case against
+
+1. **No observed pain at this scale.** The tree has two reference games, one
+   small; A1 §4.4 found generic-propagation fears unsupported by current
+   evidence, and the same caution applies here: there is no in-tree incident
+   of a cross-module corner case landing badly, because there is essentially
+   one production game. The argument for integration modules is currently
+   architectural, not empirical.
+2. **A universal module interface risks becoming another god abstraction** —
+   the brief itself names this ("Overgeneralized module API") and prescribes
+   ordinary Rust crates and functions as the primary composition mechanism.
+   The tree's existing seams (`Game` supertrait + static visitor because
+   `dyn` is unavailable, `game.rs:171-174`; boxed factories) suggest
+   composition-time wiring is already idiomatic here without new constructs.
+3. **Counting cost.** Each integration artifact adds registration surface,
+   version identity, and manifest entries (A8 scope). For N modules there are
+   O(N²) potential pairwise integrations; without evidence about which pairs
+   actually interact, mandating artifacts for all of them is speculative
+   structure.
+4. **The kernel-side joins already exist without them.** CC-1's durable leg
+   lands in the transaction envelope; CC-3's lands in authority/rollback.
+   Those are kernel responsibilities regardless of module system. What
+   integration modules would add is only the *game-side* joins — a narrower
+   problem than the brief's framing implies.
+
+### 5.3 What both sides agree on (and therefore what A2 asserts)
+
+Whichever construct wins:
+
+- Cross-module coupling must be **visible** (a reader can enumerate a game's
+  couplings without reading every module's body),
+- **ordered** (deterministic placement relative to producers/consumers —
+  A4's scheduling model will formalize this),
+- **owned** (§2's table requires an owner row for every responsibility;
+  "shared" is not an owner), and
+- **composed via declared channels** (events/policies, not live multi-entity
+  reads), or it forfeits adjudication.
+
+Whether visibility is achieved by dedicated artifacts, by a composition-root
+convention, or by lint/test structure is deferred to A3 (#399)/A8 (#404).
+
+---
+
+## 6. `classify_component`: the unused ownership hook
+
+**What it is and was for.** A defaulted trait method mapping a game-assigned
+`ComponentTypeId(u32)` to `CoreClass::{Core, Bulk, Cosmetic}`
+(`ruleset.rs:293-301`). docs/06 states the intent twice: the classification
+"makes this machine-checked, not aspirational. The classification also drives
+persistence write classes (§D11) and witness attention (§D10)"
+(`docs/06-verifiable-core.md:60`), and names its consumers:
+"`orrery_persist_client` uses it to route bulk diffs vs. intents,
+`orrery_witness` uses it to decide what to watch" (`docs/06-verifiable-core.md:210`).
+
+**What exists.** Three implementations — `Skirmish`
+(`skirmish/mod.rs:186`), `Regolith` (`regolith/mod.rs:129-135`),
+`Reference` (`ruleset.rs:242`) — and **zero call sites**, re-verified on this
+tree today (`rg classify_component crates gates clients`: definition + three
+impls, nothing else). The conservative default means an unclassified component
+is never persisted rather than silently admitted (`ruleset.rs:295-297`).
+Note also: with no consumer, `Bulk` and `Cosmetic` are currently
+indistinguishable in behaviour — the distinction lives entirely in prose until
+something routes on it. That is *exists-but-inert*, distinct from *working*.
+
+**Does §2's table give it a consumer?** Yes — three, all kernel-side readers
+of a game-authored declaration, which is exactly the policy-consumer shape of
+§1:
+
+| Intended consumer | Table row | Reading |
+|---|---|---|
+| Persistence write-class routing | Row 6 | Kernel routes writes; class declaration is game's |
+| Witness attention policy | Row 8 | Kernel decides *how much* to watch what; game declares verifiability |
+| Replication relevance (docs/06's third consumer family) | §2.1 replication row | Kernel transports; game declares relevance |
+
+So the table does not retire the hook; it confirms the hook is the right
+*shape* — game-declared, kernel-consumed — while leaving two questions open
+where they belong:
+
+1. Whether the signature (`ComponentTypeId → CoreClass`) survives contact with
+   A5's fuller per-component capability policy (persistence, rollback,
+   witness, replication, authority, privacy, size limits — the brief lists
+   eight dimensions where `CoreClass` carries one bit of three-way state).
+   That comparison is A5's (#401), not ours.
+2. Who governs `ComponentTypeId` values themselves — Regolith hard-codes
+   `ComponentTypeId(1)` (`regolith/mod.rs:80-84`) with no registry. Schema-id
+   allocation is governance, flagged to A8 (#404).
+
+---
+
+## 7. Reported rather than forced: decisions this table does not make
+
+Each is named because §2 would otherwise look complete when it is not:
+
+1. **The rollback unit.** Row 7 assigns mechanism ownership only. Whole-world
+   vs island vs cell vs entity-set vs component-subset is A7's (#403) question;
+   answering it here would preempt a comparison A2 does not own.
+2. **Whether game validation merges into the `Ruleset` trait**
+   (`validate_intent` behind `IntentValidator`). D21 freezes persistd's
+   exports, not the trait, and D38(c) pins that a *required* trait method
+   "names D21 and pays its ADR" (`docs/adr/0038-at-rest-schema-versioning.md:164-168`).
+   Reopening is the owner's call; until then the table treats `IntentValidator`
+   and `Ruleset` as parallel policy seams (rows 4 and 8), which they factually are.
+3. **The two cluster-interpreted ops' long-term home.** `LEDGER_ITEM_TRANSFER_OP`
+   is game-flavoured semantics living kernel-side (`intent/mod.rs:215-257`),
+   justified as a cross-game economic invariant made real by a producer. The
+   table admits it as a *reservation*, not precedent: the test for reserving
+   op id N should stay "does this op enforce an invariant every game needs the
+   cluster to hold?" — but who applies that test, and whether the existing two
+   pass it forever, is owner judgement.
+4. **Schema-id governance** (who allocates `ComponentTypeId`/schema versions).
+   Flagged to A5/A8 in §6.
+5. **Whether the three tick drivers converge into one kernel-provided driver**
+   (row 1 observes client/bot/lightyear each drive their own loop). The table
+   holds under any answer — host-driven is a property of today's hosts, not a
+   requirement of ownership — so convergence is an A3/A4 design question.
+
+---
+
+## 8. Mutation log
+
+Both enforcement claims this document makes were mutation-tested on this tree:
+the guarded stage was broken, the named check died with its real output line,
+the stage was restored, and the pass was re-confirmed. One false start is
+recorded because it is instructive.
+
+| # | Guarded stage broken | Named check that died | Observed | Reverted |
+|---|---|---|---|---|
+| M-A | Added `orrery_games = { path = "../orrery_games" }` to `[dependencies]` of `crates/orrery_core/Cargo.toml` (kernel depending on a game module) | `cargo tree -p orrery_core` | `error: cyclic package dependency: package orrery_core … depends on itself`, exit 101 | exit 0 |
+| M-B | Added `bevy_ecs = { version = "0.19", default-features = false }` to `[dev-dependencies]` of `orrery_core` (engine entering the core's graph without touching a line of code) | `./scripts/core-gates.sh` clause 1 | `core-gates: orrery_core has Bevy in its dependency graph`, exit 1 | all four clauses print, `verifiable-core static gates pass`, exit 0 |
+| M-A′ (false start) | Same games-dependency appended at end of file, which landed inside `[dev-dependencies]` | none — check *passed* | Dev-cycles are legal in cargo; the mutation proved nothing about normal dependencies and was discarded before being cited anywhere | n/a |
+
+M-A′ is why §3.2's enforcement column says what it says: the structural
+protection covers ordinary dependencies between those two crates, nothing
+else. Both mutations lived for one command run; no Rust source was modified.
+
+---
+
+## 9. Stale citations found while verifying
+
+| Record | Citation / phrasing | Current truth |
+|---|---|---|
+| #398 briefing text | "`PublishFrame`/`PublishClaim` have no producer outside witness tests" | Over-compressed. Precise statement (A1 §5.6 had it right): no producer in any production crate; `gates/p1-swarm/src/bot.rs:1102-1137` writes both harness-side, cut from executor outcomes via `chain.rs`. The compressed form drops the qualifier that keeps it true |
+| docs/06-verifiable-core.md:210 | Names live consumers of `classify_component`: "`orrery_persist_client` uses it to route bulk diffs vs. intents, `orrery_witness` uses it to decide what to watch" | Neither consumer exists (zero call sites tree-wide). Design intent written as present-tense description; flagged rather than silently relied on |
+| docs/10-crates.md:120 (also :29) | Crate table lists `orrery_field_host` bin | No such crate exists (A1 §5.5). The doc self-describes as sketch-grade, so this is drift-with-disclaimer, recorded for completeness |
+| D21 context | "`Ruleset::validate_intent` behind `intent::IntentValidator`" (`docs/adr/0021-ruleset-distribution.md:20-21`) | Still stale exactly as A1 §6 recorded: `validate_intent` was never implemented; the freeze itself is unaffected |
+| A1 map (re-checked, not stale) | All load-bearing claims re-verified on this tree: trait surface/lines, four-crate generic reach, zero `classify_component` call sites, `NeighborFrame` produced only as test evidence (`adjudication.rs:526`), D21/D38 texts, prediction's config-layer-only lightyear coupling (`predict/src/lib.rs:3-6`) | All held at `46c9301a` |
+
+No citation this document relies on from AGENTS.md proved wrong during this task.
+
+---
+
+## 10. Unsure
+
+Stated as unsure rather than smoothed over:
+
+1. **Whether row 4's two interpreted ops are the right kernel/game line.** I
+   assigned them to the kernel side with a stated admission test (§7.3), but a
+   reasonable owner could place them in a shipped reference module instead.
+   The table does not depend on which way this falls; the anti-dupe
+   invariant's enforcement point arguably does.
+2. **Whether `Bulk` deserves existence before its consumers land.** With zero
+   routing consumers, `Bulk` vs `Cosmetic` is currently a documentation
+   distinction. If A5 keeps the classification, fine; if A5 replaces it with
+   per-dimension policies, `CoreClass` may be deleted rather than wired. This
+   document deliberately assigns ownership of the *hook's role* (§6) without
+   predicting the hook's survival.
+3. **Regolith-vs-Skirmish divergence** — carried over from A1 §11.4: two
+   reference games exist, both carry goldens, and why P4 standardized on
+   Regolith v8 I did not fully trace. It bounds how much "cross-game"
+   evidence the tree can actually provide: every generalization above rests
+   on one production ruleset plus one measurement twin.
+4. **How far "policy handover" can stretch before it becomes the god
+   abstraction the brief fears.** §3.1's second crossing is load-bearing for
+   rows 4, 6, 8; whether eight policy dimensions per component (A5's list)
+   still fits a handover-shaped seam, or needs registries, is genuinely open
+   and owned elsewhere.
+
+Deliberately not done:
+
+- **No architecture recommendation.** Nothing above prefers ECS-hosted,
+  `Ruleset`-hosted, or bespoke-hosted canonical state; every row was written
+  to survive A3's comparison set unchanged.
+- **No Rust changes.** Mutations touched `Cargo.toml` for one command each
+  and were reverted with passing results re-confirmed (§8).
