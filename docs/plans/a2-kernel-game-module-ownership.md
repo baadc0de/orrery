@@ -197,3 +197,145 @@ mechanically held today:
    and §2's table assigns by *role*. A future gate keyed on role rather than
    crate list is A4/A10 material; noted here so the gap is visible now.
 
+---
+
+## 4. Cross-module corner cases, worked through
+
+Each case names the interaction, walks it through the current tree's mechanics,
+and lands it on §2's rows. These are chosen so that every owner value
+(Kernel / Game / Split-with-seam) gets exercised at least once.
+
+### CC-1 — Damage × inventory × docking (the brief's example)
+
+**The interaction.** A craft's hull crosses zero; its cargo should spill or
+burn; the ship was docked to a station, so someone else arguably owned the
+hull; and a ledger row somewhere must move exactly once.
+
+**How today's tree carries each leg:**
+
+- *Damage.* The shooter's `step` emits an event; the target consumes it as an
+  input **next tick** (`ruleset.rs:196-201`: "an attacker's step emits
+  `DamageApplied(target)`; the target consumes it as an input at the next
+  tick"). Death itself is a state transition inside the victim's own step —
+  Regolith's wreck countdown is ordinary state (`RESPAWN_TICKS`,
+  `regolith/mod.rs:44`). No kernel code interprets "damage"; the kernel
+  guarantees only emission order and delivery.
+- *Inventory.* Items are not in `CoreState` at all — they are ledger rows.
+  Moving one is an intent whose op args are opaque to the cluster unless the
+  op is one of the two reserved ids (`intent/mod.rs:208-210,257`). The
+  atomicity of "cargo destroyed + ownership row released" is the FDB
+  transaction envelope (row 4), not game code.
+- *Docking.* Docking changes who may mutate the docked craft's state — an
+  authority fact (row 3), carried by claims/leases in `orrery_authority`, not
+  by any rule. The rule sees at most a reflected input ("my thrusters are
+  slaved") because `step` has no lease input (`ruleset.rs:257-262`).
+
+**Where it lands.** Three owners meet, and the join point is precisely the
+policy-consumer seam:
+
+1. The *fact* "craft X was destroyed at tick T by emitter E" is a **game**
+   event — vocabulary and meaning are module-owned (row 9).
+2. Its transport, ordering, and replayability are **kernel** (row 13 of §2.1,
+   events-as-next-tick-inputs).
+3. The durable consequence — releasing item rows — must enter through the
+   transaction envelope (**kernel**, row 4) carrying **game**-meaningful args;
+   the anti-dupe read-check-write stays cluster-interpreted so that no module
+   can bypass single-ownership.
+4. Whether the docking relationship changes who *may* submit intents for the
+   docked entity is **kernel** authority policy (row 3), informed by a
+   **game-declared** capability statement (the unwired per-component authority
+   policy; A5 territory).
+
+**Why this proves the split matters:** neither extreme works. If one damage
+module owned the whole chain end-to-end, it would have to implement FDB
+transaction semantics — duplicating the envelope and losing atomicity
+guarantees for everyone else. If the kernel interpreted destruction, the next
+game's death semantics (no wrecks, instant respawn, no cargo) would need
+kernel surgery. The table forces both halves to stay home and gives their
+meeting points names.
+
+### CC-2 — Island boundary × spatial grid × movement
+
+**The interaction.** A rock reaches the island edge. Does it bounce (Regolith:
+`ISLAND_BOUNDARY_MM = 1_000_000`, integer velocity negation,
+`regolith/mod.rs:60-61`), wrap, despawn, or keep going into the next cell?
+
+**Working through.** The *existence* and coordinates of the boundary are
+spatial-kernel facts: cell geometry, AOI and interest all derive from the grid
+(row 5). But the *response* to reaching it is gameplay: another universe wraps
+instead of bouncing, and Regolith's own choice is deliberately naive — reflect
+with exact integer negation so the invariant check can verify it
+(`regolith/invariants.rs` bounds acceleration/velocity against these same
+constants). Note what happens if either side swallows the other's half:
+
+- If the kernel bounced entities, every game inherits Regolith's physics
+  flavour, and the kernel would now contain a tuned constant — gameplay
+  content — inside gated infrastructure.
+- If the game computed its own cell membership from position, interest
+  management (`orrery_spatial`) and authority scoping would disagree with the
+  simulation about which island an entity is in — two sources of truth for
+  the same question.
+
+**Where it lands.** Boundary existence/coordinates: **kernel** (row 5).
+Response on contact: **game** (row 9). The quantized coordinate lattice is the
+interface — the kernel guarantees positions are comparable and hashable
+(VC-7); the game decides what they do. This case also shows why row 9's
+"population budgets are game-owned" matters: `ISLAND_ROCK_BUDGET = 24`
+(`regolith/mod.rs:48`) is Regolith's density choice, while the window-budget
+mechanism it feeds belongs to spatial infrastructure.
+
+### CC-3 — Authority handoff × rollback × an open witness window
+
+**The interaction.** A craft's lease transfers mid-flight (drain or handover).
+Meanwhile: a predicting client simulated nine ticks ahead; a witness holds
+signed claims up to T−1; the disputed window spans the transfer.
+
+**Working through.** Because outcomes are independent of the executor — same
+`(universe_seed, entity, tick)` RNG, no lease input, pure step — the new
+authority continues the same log without a seam: re-execution of ticks before
+the handoff produces identical hashes whether run by old holder, new holder,
+witness, or adjudicator. That is not luck; it is three kernel decisions
+interlocking: RNG anchored to absolute tick (row 11), authority kept out of
+step inputs (row 3), and claims verified against subject-signed history rather
+than reporter-supplied hashes (`replay.rs:325-339`, via A1 §5.2). The
+prediction client reconciles against whichever authority currently answers,
+through the correction inbox (row 7).
+
+**Where it lands.** Handoff mechanics, claim continuity, correction routing:
+**kernel** (rows 3, 7, 8). The game's obligation is only purity — which is
+row 9's fine print. Had the table put any part of lease semantics in the game,
+re-execution could not be delegated to a third party, and D10's whole
+economy — witnesses that hold no trust in the authority they watch
+(`witness/src/lib.rs:3-6`) — collapses.
+
+### CC-4 — Materialization collision × population budget × replay isolation
+
+**The interaction.** Two bloom directors materialize pickups in the same tick;
+Regolith wants at most four outstanding pickup windows island-wide
+(`ISLAND_PICKUP_BUDGET`, `regolith/mod.rs:50`); meanwhile the adjudicator will
+replay the emitting entity *alone*, holding none of the world
+(`replay.rs:106-130`).
+
+**Working through.** Identifiers come from the event — `(director, bloom_index,
+slot)` style derivation from the emitter's own replayable inputs — so an
+isolated replay reproduces the same descriptions even though it holds no other
+entities (`ruleset.rs:272-278`). Collisions resolve first-writer-wins in
+description order at install time (`executor.rs:144-157`) — a **kernel**
+arbitration rule, deterministic because description order is emission order.
+The budget cannot be enforced by asking "how many pickups exist?" — that
+question is unanswerable in an isolated replay and depends on allocation order.
+So Regolith encodes it as monotone counters in the director's *own state*
+(bloom bookkeeping fields on `BloomDirector`), which travel with the entity
+into replay. And the trap is documented where the API lives: "Materialization
+descriptions are not part of `state_hash`. A game whose materialization
+matters to adjudication must also record an own-state trace … an event-only
+effect is invisible to state-hash goldens and adjudication"
+(`ruleset.rs:280-284`).
+
+**Where it lands.** Identity derivation discipline + collision arbitration +
+hash-invisibility caveat: **kernel** (rows 2, 13). Budget semantics + the
+counter encoding: **game** (row 9). This case is the cleanest demonstration
+of why identity allocation can never be kernel-*provided at runtime*: the
+moment ids depend on world population, isolated replay — the entire
+adjudication model — stops working.
+
