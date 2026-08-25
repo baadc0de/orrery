@@ -1028,7 +1028,7 @@ mod tests {
         // positional layout, and D33's probation field changes
         // `SessionTokenClaimsV1`'s, so pin the externally visible version as a
         // literal.
-        assert_eq!(crate::PROTOCOL_VERSION, 5);
+        assert_eq!(crate::PROTOCOL_VERSION, 6);
     }
 
     #[test]

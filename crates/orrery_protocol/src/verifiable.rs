@@ -116,6 +116,17 @@ pub enum RecordSource {
     NeighborFrame {
         /// The neighbour whose fields were read.
         neighbor: PersistId,
+        /// Whether the lookup returned state.
+        ///
+        /// An absent lookup is still part of the replay closure: omitting it
+        /// would let a dropped frame masquerade as an honest `None` result.
+        present: bool,
+        /// The neighbour-state tick the reader actually observed.
+        ///
+        /// This is deliberately not the reader's tick: replication lag is
+        /// ordinary, and cross-checking the payload against a claim from a
+        /// newer tick would manufacture evidence against an honest peer.
+        observed_tick: Tick,
     },
     /// Chain-epoch boundary on authority handoff, binding the new chain to the
     /// old head and the registrar's lease sequence (docs/06 §9).

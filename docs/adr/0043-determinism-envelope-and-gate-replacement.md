@@ -217,6 +217,29 @@ acceptance bar: a weaker gate that passes is worse than the current one.**
 The full existing clause battery — Bevy-free graph, VC-4, VC-6, VC-8,
 neighbour ban — is kept **unchanged**. What changes is who it applies to:
 
+> *Amended by the owner on 2026-08-25 (through #444/#457, executing #390's
+> approved design): the neighbour ban is narrowed from a categorical refusal
+> of `view.neighbor(` in every Tier V crate to a refusal of every **unrecorded
+> or unadjudicable** neighbour read. The ban's stated rationale was that a
+> neighbour read could not be adjudicated — no `NeighborFrame` producer
+> existed and `ReplayHarness::load_claimed_snapshot` installs exactly one
+> entity, so a rule that branched on a neighbour resolved differently under
+> replay than under play, convicting an honest peer. That premise no longer
+> holds: `Executor` emits the neighbour tick actually observed, the replay
+> harness serves those frames without installing a live world, and
+> `cross_check_neighbor_record` verifies each frame against the claim signed
+> by the neighbour's own authority for the tick the reader declares. Staleness
+> is tested before state hashes, so ordinary replication lag is refused as
+> uncheckable rather than turned into a deviation verdict.*
+>
+> *The acceptance bar above is unchanged and binds the narrowed form: the gate
+> stays two-sided. It scans every Tier V crate, refuses every read outside the
+> audited site, and **pins the permitted count at exactly one**, so a second
+> site fails whether it is added at the audited path or anywhere else. A path
+> allowlist that merely tolerated additional hits would be the weaker gate this
+> bar forbids; this one is not that. Admitting a further site is an amendment
+> to this clause, not a configuration change.*
+
 1. **Discovery scan.** Walk workspace crates; strip `#[cfg(test)]` modules;
    flag any crate whose library sources define `trait Ruleset` or contain an
    `impl … Ruleset for` site, qualified paths included. Crates so flagged are

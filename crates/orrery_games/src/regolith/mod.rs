@@ -8,6 +8,7 @@ pub mod invariants;
 pub mod order;
 pub mod pilot;
 pub mod state;
+mod visibility;
 pub mod weapon;
 
 use crate::game::{Game, GameMeta, Tamper};
@@ -67,12 +68,28 @@ pub const PICKUP_TTL_TICKS: u16 = 1_800;
 pub const GRAB_RADIUS_MM: i64 = 25_000;
 /// Held-fire ticks required to acquire a target lock.
 pub const LOCK_ACQUISITION_TICKS: u16 = 30;
+/// A held lock takes the same half-second premise to break as to acquire.
+pub const LOCK_BREAK_TICKS: u16 = LOCK_ACQUISITION_TICKS;
+/// Progress removed per occluded tick, derived from the acquisition and break windows.
+pub const LOCK_DECAY_PER_TICK: u16 = LOCK_ACQUISITION_TICKS.div_ceil(LOCK_BREAK_TICKS);
+const _: () = assert!(
+    LOCK_BREAK_TICKS > 1,
+    "lock breaking must span ticks or the decay acceptance test asserts nothing"
+);
+/// Visibility-transition claims are capped at four per second.
+pub const COVER_CLAIM_INTERVAL_TICKS: u16 = (TICK_HZ / 4) as u16;
+/// Two reads per claim, with headroom for transversal variants approved by #390.
+pub const MAX_NEIGHBOR_READS: usize = 4;
+/// Claims arrive at 2 Hz; one missed claim is tolerated before refusing a frame.
+pub const MAX_NEIGHBOR_STALENESS_TICKS: u64 = TICK_HZ as u64;
+/// Two-centimetre inward margin: twice VC-7's one-centimetre position epsilon.
+pub const OCCLUSION_MARGIN_MM: i64 = 20;
 const REFERENCE_SIGNATURE_RADIUS_MM: u128 = 3_000;
 const CHANCE_SCALE: u128 = 1_000_000;
 
-/// Regolith v8's rules identity: authoritative shot-resolution feedback.
+/// Regolith v9's rules identity: recorded visibility claims and gradual lock decay.
 pub const REGOLITH_RULESET: RulesetId = RulesetId {
-    version: 8,
+    version: 9,
     digest: [0x63; 32],
 };
 
@@ -126,6 +143,12 @@ impl Ruleset for Regolith {
     fn id(&self) -> RulesetId {
         REGOLITH_RULESET
     }
+    fn max_neighbor_reads(&self) -> usize {
+        MAX_NEIGHBOR_READS
+    }
+    fn max_neighbor_staleness_ticks(&self) -> u64 {
+        MAX_NEIGHBOR_STALENESS_TICKS
+    }
     fn classify_component(&self, component: ComponentTypeId) -> CoreClass {
         if component == components::STATE {
             CoreClass::Core
@@ -143,7 +166,8 @@ impl Ruleset for Regolith {
         rng: &mut TickRng,
     ) -> StepOutput<Outcome> {
         let me = view.entity();
-        let (state, events) = match view.own().clone() {
+        let visibility = visibility::verify_claim(view, inputs);
+        let (mut state, events) = match view.own().clone() {
             RegolithState::Craft(craft) => {
                 let (craft, events) = self.step_craft(me, craft, inputs, rng);
                 (RegolithState::Craft(craft), events)
@@ -161,7 +185,14 @@ impl Ruleset for Regolith {
                 (RegolithState::BloomDirector(director), events)
             }
         };
+        if let (Some(Outcome::LockVisibility { occluded, .. }), RegolithState::Craft(craft)) =
+            (&visibility, &mut state)
+        {
+            craft.last_cover_occluded = *occluded;
+        }
         *view.own_mut() = state;
+        let mut events = events;
+        events.extend(visibility);
         StepOutput { events }
     }
     fn materialize(&self, event: &Outcome, out: &mut Vec<EntityMaterialization<RegolithState>>) {
@@ -244,6 +275,16 @@ impl Regolith {
             (own.respawn_in, own.score_rock_points, own.kills);
         let (mut lock_target, mut lock_progress, mut locks_acquired) =
             (own.lock_target, own.lock_progress, own.locks_acquired);
+        let mut lock_decay_progress = own.lock_decay_progress;
+        let mut cover_claim_cooldown = own.cover_claim_cooldown.saturating_sub(1);
+        if lock_decay_progress > 0 {
+            lock_decay_progress = lock_decay_progress.saturating_add(LOCK_DECAY_PER_TICK);
+            if lock_decay_progress >= LOCK_ACQUISITION_TICKS {
+                lock_target = None;
+                lock_progress = 0;
+                lock_decay_progress = 0;
+            }
+        }
         let was_alive = own.alive();
         let mut disabled = !was_alive;
         for order in inputs.iter() {
@@ -274,6 +315,7 @@ impl Regolith {
                         None => {
                             lock_target = Some(*target);
                             lock_progress = 1;
+                            lock_decay_progress = 0;
                         }
                         Some(current) if current == *target => {
                             if lock_progress < LOCK_ACQUISITION_TICKS {
@@ -289,6 +331,7 @@ impl Regolith {
                         Some(_) => {
                             lock_target = Some(*target);
                             lock_progress = 1;
+                            lock_decay_progress = 0;
                         }
                     }
                     if lock_progress < LOCK_ACQUISITION_TICKS {
@@ -417,6 +460,24 @@ impl Regolith {
                     if lock_target == Some(*target) {
                         lock_target = None;
                         lock_progress = 0;
+                        lock_decay_progress = 0;
+                    }
+                }
+                Order::LockVisibility { target, occluded } => {
+                    if lock_target == Some(*target) && lock_progress == LOCK_ACQUISITION_TICKS {
+                        if *occluded {
+                            if lock_decay_progress == 0 {
+                                lock_decay_progress = LOCK_DECAY_PER_TICK;
+                            }
+                        } else {
+                            lock_decay_progress = 0;
+                            lock_progress = LOCK_ACQUISITION_TICKS;
+                        }
+                    }
+                }
+                Order::ClaimCover { .. } => {
+                    if cover_claim_cooldown == 0 {
+                        cover_claim_cooldown = COVER_CLAIM_INTERVAL_TICKS;
                     }
                 }
                 Order::GrabAttempt { .. }
@@ -457,6 +518,8 @@ impl Regolith {
                 equipped = weapon::WeaponKind::Stock;
                 lock_target = None;
                 lock_progress = 0;
+                lock_decay_progress = 0;
+                cover_claim_cooldown = 0;
             }
         }
         let next = Craft {
@@ -479,6 +542,8 @@ impl Regolith {
             lock_target,
             lock_progress,
             locks_acquired,
+            lock_decay_progress,
+            cover_claim_cooldown,
             ..own
         };
         (next, events)
@@ -1140,6 +1205,17 @@ impl Game for Regolith {
                 Order::ShotResolved {
                     target: *target,
                     result: *result,
+                },
+            )),
+            Outcome::LockVisibility {
+                locker,
+                target,
+                occluded,
+            } => Some((
+                *locker,
+                Order::LockVisibility {
+                    target: *target,
+                    occluded: *occluded,
                 },
             )),
             Outcome::Split { .. }

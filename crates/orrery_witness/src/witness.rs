@@ -25,7 +25,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use orrery_core::log::{fold_all, verify_claim};
+use orrery_core::log::{cross_check_neighbor_record, fold_all, verify_claim};
 use orrery_core::replay::ReplayHarness;
 use orrery_core::store::AuthorityLog;
 use orrery_core::{evaluate, Executor, InvariantSample, InvariantViolation, Ruleset, TickOutcome};
@@ -217,6 +217,9 @@ pub enum WitnessError {
     ClaimRejected,
     /// A logged input payload is not a valid `CoreInput`.
     InputMalformed,
+    /// Recorded neighbour state was stale, over budget, malformed, or did not
+    /// match the reads performed during replay. Refused, never accused.
+    NeighborFrameRefused,
     /// The window cannot be assembled from what this witness holds.
     ///
     /// Distinct from shadow mode, and deliberately so: "we chose not to file"
@@ -233,6 +236,7 @@ impl core::fmt::Display for WitnessError {
             Self::FrameRejected => f.write_str("frame failed verification"),
             Self::ClaimRejected => f.write_str("claim signature does not verify"),
             Self::InputMalformed => f.write_str("logged input is not a valid CoreInput"),
+            Self::NeighborFrameRefused => f.write_str("recorded neighbour frame was refused"),
             Self::WindowUnservable => f.write_str("window cannot be assembled from what is held"),
         }
     }
@@ -350,6 +354,9 @@ type DeferredKey = ([u8; 32], u64);
 /// verification for a reason that has nothing to do with the frame.
 type DeferredFrame = (LogFrame, Vec<(ChainHash, ChainHash)>);
 
+/// One recorded present-or-absent neighbour observation used for isolated replay.
+type RecordedNeighbor<S> = (PersistId, Tick, Option<S>);
+
 /// One watched entity's running state.
 ///
 /// The executor is **per entity**, not shared across the witness. See
@@ -409,16 +416,11 @@ struct Watched<R: Ruleset> {
 /// the same executor as a neighbour snapshot, and a witness advances each
 /// entity as that entity's frames arrive — so a shared executor would present
 /// neighbours sitting at whatever ticks they happened to have reached, which is
-/// not the coherent set the authority stepped. Worse, the adjudicator that
-/// decides the verdict loads exactly one entity
-/// (`ReplayHarness::load_claimed_snapshot`), so its neighbour map is empty.
-/// Isolating each entity here is what makes the witness compute the same
-/// trajectory the adjudicator will.
-///
-/// The residual, stated because it cannot be fixed from this crate: a ruleset
-/// whose `step` reads neighbours is outside what witnessing can adjudicate at
-/// all, because the authority's live execution *does* see them and no replay
-/// reproduces that. Core steps should not read neighbours.
+/// not the coherent set the authority stepped. The adjudicator also starts
+/// with exactly one entity. Recorded `NeighborFrame`s are installed into that
+/// isolated executor for their one declared reader tick and removed
+/// immediately afterward, so neither path consults a live or independently
+/// advancing neighbour world.
 pub struct Witness<R: Ruleset> {
     config: WitnessConfig,
     seed: orrery_protocol::UniverseSeed,
@@ -940,6 +942,10 @@ impl<R: Ruleset> Witness<R> {
                 self.count_rejection(&entities);
                 WitnessError::FrameRejected
             })?;
+        if self.cross_check_known_neighbors(frame, &entities).is_err() {
+            self.count_rejection(&entities);
+            return Err(WitnessError::NeighborFrameRefused);
+        }
         self.counters.frames_accepted += 1;
 
         for entity in &entities {
@@ -986,6 +992,52 @@ impl<R: Ruleset> Witness<R> {
         // how one hole becomes a queue of them.
         signals.extend(self.drain_deferred(subject));
         Ok(signals)
+    }
+
+    /// Cross-check recorded neighbour bytes whenever this witness also holds
+    /// the neighbour authority's signed claim for the declared tick.
+    ///
+    /// This is deliberately opportunistic: witnessing a reader does not imply
+    /// witnessing every neighbour it observed. Missing claims leave the
+    /// observation replayable but unsampled; a present claim must match
+    /// exactly. Every failure is a refusal, not a deviation finding against
+    /// the reader.
+    fn cross_check_known_neighbors(
+        &self,
+        frame: &LogFrame,
+        readers: &[PersistId],
+    ) -> Result<(), WitnessError> {
+        for slice in &frame.entities {
+            if !readers.contains(&slice.entity) {
+                continue;
+            }
+            for record in &slice.records {
+                let RecordSource::NeighborFrame {
+                    neighbor,
+                    present: _,
+                    observed_tick,
+                } = record.source
+                else {
+                    continue;
+                };
+                let Some(watched_neighbor) = self.watched.get(&neighbor) else {
+                    continue;
+                };
+                let Some(claim) = watched_neighbor.claims.get(&observed_tick.0) else {
+                    continue;
+                };
+                let reader_tick = Tick::new(frame.first_tick.0 + u64::from(record.tick_off));
+                cross_check_neighbor_record(
+                    record,
+                    reader_tick,
+                    self.ruleset.max_neighbor_staleness_ticks(),
+                    claim,
+                    watched_neighbor.subject,
+                )
+                .map_err(|_| WitnessError::NeighborFrameRefused)?;
+            }
+        }
+        Ok(())
     }
 
     /// Count a refused frame, and separately when it was refused by a watch
@@ -1105,11 +1157,46 @@ impl<R: Ruleset> Witness<R> {
     /// the authority for reasons that have nothing to do with cheating.
     fn replay_entity(&mut self, entity: PersistId, frame: &LogFrame) -> Result<(), WitnessError> {
         let mut per_tick: BTreeMap<u64, Vec<R::CoreInput>> = BTreeMap::new();
+        let mut neighbors_per_tick: BTreeMap<u64, Vec<RecordedNeighbor<R::CoreState>>> =
+            BTreeMap::new();
         for slice in &frame.entities {
             if slice.entity != entity {
                 continue;
             }
             for record in &slice.records {
+                if let RecordSource::NeighborFrame {
+                    neighbor,
+                    present,
+                    observed_tick,
+                } = record.source
+                {
+                    let reader_tick = frame.first_tick.0 + u64::from(record.tick_off);
+                    if reader_tick
+                        .checked_sub(observed_tick.0)
+                        .is_none_or(|age| age > self.ruleset.max_neighbor_staleness_ticks())
+                    {
+                        return Err(WitnessError::NeighborFrameRefused);
+                    }
+                    let state = if present {
+                        Some(
+                            <R::CoreState as orrery_core::CoreCodec>::decode(&record.payload)
+                                .map_err(|_| WitnessError::NeighborFrameRefused)?,
+                        )
+                    } else {
+                        if !record.payload.is_empty() {
+                            return Err(WitnessError::NeighborFrameRefused);
+                        }
+                        None
+                    };
+                    let frames = neighbors_per_tick.entry(reader_tick).or_default();
+                    if frames.len() >= self.ruleset.max_neighbor_reads()
+                        || frames.iter().any(|(found, _, _)| found == &neighbor)
+                    {
+                        return Err(WitnessError::NeighborFrameRefused);
+                    }
+                    frames.push((neighbor, observed_tick, state));
+                    continue;
+                }
                 if !matches!(
                     record.source,
                     RecordSource::OwnPlayer { .. }
@@ -1134,13 +1221,42 @@ impl<R: Ruleset> Witness<R> {
         let mut recorded = Vec::with_capacity(usize::from(frame.tick_count));
         for tick in frame.first_tick.0..frame.first_tick.0 + u64::from(frame.tick_count) {
             let inputs = per_tick.remove(&tick).unwrap_or_default();
-            let Some(TickOutcome { state_hash, .. }) =
-                watched
-                    .executor
-                    .step_entity(entity, Tick::new(tick), &inputs)
+            let neighbor_frames = neighbors_per_tick.remove(&tick).unwrap_or_default();
+            for (neighbor, observed_tick, state) in &neighbor_frames {
+                if *neighbor == entity {
+                    if state.is_some() {
+                        return Err(WitnessError::NeighborFrameRefused);
+                    }
+                    continue;
+                }
+                if let Some(state) = state {
+                    watched
+                        .executor
+                        .insert_observed(*neighbor, state.clone(), *observed_tick);
+                }
+            }
+            let Some(TickOutcome {
+                state_hash,
+                neighbor_reads,
+                ..
+            }) = watched
+                .executor
+                .step_entity(entity, Tick::new(tick), &inputs)
             else {
                 return Err(WitnessError::NotWatched);
             };
+            let expected_reads: Vec<_> = neighbor_frames
+                .iter()
+                .map(|(neighbor, _, _)| *neighbor)
+                .collect();
+            if neighbor_reads != expected_reads {
+                return Err(WitnessError::NeighborFrameRefused);
+            }
+            for (neighbor, _, state) in &neighbor_frames {
+                if state.is_some() {
+                    watched.executor.take_state(*neighbor);
+                }
+            }
             watched.computed.insert(tick, state_hash);
             if let Some(state) = watched.executor.state(entity) {
                 watched

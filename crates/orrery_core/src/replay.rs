@@ -24,6 +24,8 @@ use crate::executor::Executor;
 use crate::log::{claim_hash, verify_claim, verify_frame, LogError};
 use crate::ruleset::{CoreCodec, Ruleset};
 
+type RecordedNeighbor<S> = (PersistId, Tick, Option<S>);
+
 /// Why a replay could not run.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReplayError {
@@ -39,6 +41,9 @@ pub enum ReplayError {
     NonContiguousFrames,
     /// The window is empty or longer than [`MAX_ADJUDICATION_TICKS`].
     WindowOutOfRange,
+    /// Recorded neighbour inputs exceed the ruleset cap, are stale, malformed,
+    /// or do not match the reads the replay performed.
+    NeighborFramesMalformed,
 }
 
 impl core::fmt::Display for ReplayError {
@@ -50,6 +55,7 @@ impl core::fmt::Display for ReplayError {
             Self::InputMalformed => f.write_str("logged input is not a valid CoreInput"),
             Self::NonContiguousFrames => f.write_str("frames do not cover the window contiguously"),
             Self::WindowOutOfRange => f.write_str("window is empty or too long"),
+            Self::NeighborFramesMalformed => f.write_str("recorded neighbour frames are malformed"),
         }
     }
 }
@@ -172,6 +178,8 @@ impl<R: Ruleset> ReplayHarness<R> {
         // Collect this entity's inputs per absolute tick, verifying each frame
         // as it is consumed. Ordering inside a tick is the log's, never ours.
         let mut per_tick: BTreeMap<u64, Vec<R::CoreInput>> = BTreeMap::new();
+        let mut neighbors_per_tick: BTreeMap<u64, Vec<RecordedNeighbor<R::CoreState>>> =
+            BTreeMap::new();
         // Start from the chain head the claim commits to, not from the empty
         // head: a window opened at a later claim is mid-chain, and folding from
         // zero would compare against a chain nobody has.
@@ -216,6 +224,39 @@ impl<R: Ruleset> ReplayHarness<R> {
                     continue;
                 }
                 for record in &slice.records {
+                    if let RecordSource::NeighborFrame {
+                        neighbor,
+                        present,
+                        observed_tick,
+                    } = record.source
+                    {
+                        let reader_tick = frame.first_tick.0 + u64::from(record.tick_off);
+                        let age = reader_tick.checked_sub(observed_tick.0);
+                        if age.is_none_or(|age| {
+                            age > self.executor.ruleset().max_neighbor_staleness_ticks()
+                        }) {
+                            return Err(ReplayError::NeighborFramesMalformed);
+                        }
+                        let state = if present {
+                            Some(
+                                R::CoreState::decode(&record.payload)
+                                    .map_err(|_| ReplayError::NeighborFramesMalformed)?,
+                            )
+                        } else {
+                            if !record.payload.is_empty() {
+                                return Err(ReplayError::NeighborFramesMalformed);
+                            }
+                            None
+                        };
+                        let frames = neighbors_per_tick.entry(reader_tick).or_default();
+                        if frames.len() >= self.executor.ruleset().max_neighbor_reads()
+                            || frames.iter().any(|(found, _, _)| found == &neighbor)
+                        {
+                            return Err(ReplayError::NeighborFramesMalformed);
+                        }
+                        frames.push((neighbor, observed_tick, state));
+                        continue;
+                    }
                     // `NeighborFrame` and `AuthorityChange` records close the
                     // input set and mark epoch boundaries; they are not
                     // themselves `CoreInput`s to feed the step.
@@ -238,9 +279,34 @@ impl<R: Ruleset> ReplayHarness<R> {
         let mut trace = ReplayTrace::default();
         for tick in start.0..end.0 {
             let inputs = per_tick.remove(&tick).unwrap_or_default();
+            let neighbor_frames = neighbors_per_tick.remove(&tick).unwrap_or_default();
+            for (neighbor, observed_tick, state) in &neighbor_frames {
+                if *neighbor == entity {
+                    if state.is_some() {
+                        return Err(ReplayError::NeighborFramesMalformed);
+                    }
+                    continue;
+                }
+                if let Some(state) = state {
+                    self.executor
+                        .insert_observed(*neighbor, state.clone(), *observed_tick);
+                }
+            }
             let Some(outcome) = self.executor.step_entity(entity, Tick::new(tick), &inputs) else {
                 return Err(ReplayError::SnapshotMalformed);
             };
+            let expected_reads: Vec<_> = neighbor_frames
+                .iter()
+                .map(|(neighbor, _, _)| *neighbor)
+                .collect();
+            if outcome.neighbor_reads != expected_reads {
+                return Err(ReplayError::NeighborFramesMalformed);
+            }
+            for (neighbor, _, state) in &neighbor_frames {
+                if state.is_some() {
+                    self.executor.take_state(*neighbor);
+                }
+            }
             // The adjudicator replays exactly one entity. Its emitted child
             // descriptions are reproduced by `step_entity`, but retaining
             // those children here would make them neighbours on the next tick

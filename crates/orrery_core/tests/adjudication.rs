@@ -92,6 +92,8 @@ impl CoreCodec for Nothing {
 
 struct Kinematic;
 
+struct Peeking;
+
 const RULESET: RulesetId = RulesetId {
     version: 1,
     digest: [0xAB; 32],
@@ -120,6 +122,37 @@ impl Ruleset for Kinematic {
         state.vel.x += applied;
         state.pos.x += state.vel.x;
         state.entropy = state.entropy.wrapping_add(rng.next_u32());
+        StepOutput::default()
+    }
+}
+
+impl Ruleset for Peeking {
+    type CoreState = Body;
+    type CoreInput = Thrust;
+    type CoreEvent = Nothing;
+
+    fn id(&self) -> RulesetId {
+        RULESET
+    }
+
+    fn max_neighbor_reads(&self) -> usize {
+        1
+    }
+
+    fn max_neighbor_staleness_ticks(&self) -> u64 {
+        5
+    }
+
+    fn step(
+        &self,
+        view: &mut StateView<'_, Body>,
+        _inputs: &OrderedInputs<'_, Thrust>,
+        _rng: &mut TickRng,
+    ) -> StepOutput<Nothing> {
+        if let Some(neighbor) = view.neighbor(PersistId::new(78)) {
+            let entropy = neighbor.entropy;
+            view.own_mut().entropy = entropy;
+        }
         StepOutput::default()
     }
 }
@@ -511,22 +544,22 @@ fn two_independent_executions_of_the_same_window_agree_exactly() {
 }
 
 #[test]
-fn a_neighbour_read_is_logged_and_does_not_feed_the_step_as_an_input() {
-    // NeighborFrame records close the input set; they are evidence, not
-    // commands. Replay must skip them rather than try to decode one as a
-    // CoreInput — which would fail, and would fail *differently* depending on
-    // payload, making verdicts payload-dependent.
+fn a_recorded_neighbour_frame_replays_without_a_live_world() {
     let mut executor = Executor::new(Kinematic, SEED);
     executor.insert(ENTITY, body());
     executor.insert(PersistId::new(78), body());
 
+    let mut neighbor = body();
+    neighbor.entropy = 42;
     let record = InputRecord {
         tick_off: 0,
         seq: 0,
         source: RecordSource::NeighborFrame {
             neighbor: PersistId::new(78),
+            present: true,
+            observed_tick: Tick::new(T0),
         },
-        payload: bytes::Bytes::from_static(b"not a thrust"),
+        payload: bytes::Bytes::from(neighbor.to_canonical()),
     };
     let head = fold_all(ChainHash::EMPTY, std::slice::from_ref(&record));
     let authority = key(1);
@@ -562,8 +595,9 @@ fn a_neighbour_read_is_logged_and_does_not_feed_the_step_as_an_input() {
     };
     sign_claim(&authority, &mut t0_claim);
 
-    let mut reference = Executor::new(Kinematic, SEED);
+    let mut reference = Executor::new(Peeking, SEED);
     reference.insert(ENTITY, body());
+    reference.insert_observed(PersistId::new(78), neighbor, Tick::new(T0));
     let expected = reference
         .step_entity(ENTITY, Tick::new(T0), &[])
         .expect("entity present")
@@ -584,7 +618,7 @@ fn a_neighbour_read_is_logged_and_does_not_feed_the_step_as_an_input() {
     sign_claim(&authority, &mut end_claim);
 
     let verdict = verify_bundle(
-        Kinematic,
+        Peeking,
         SEED,
         authority.public(),
         &EvidenceBundle {

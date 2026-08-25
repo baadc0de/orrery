@@ -210,34 +210,24 @@ Commentary on the load-bearing choices:
 - **`classify_component`** is the single source of truth for §2's table; `orrery_persist_client` uses it to route bulk diffs vs. intents, `orrery_witness` uses it to decide what to watch.
 - **`invariants()`** supplies the stage-1 witness checks. Every interested peer runs them on received state regardless of witness-set membership, and cell actors run them on inbound bulk diffs — mandatory in cells with fewer than N witness candidates, sampled elsewhere (§D11). They are the only validation most bulk-class state ever gets, which is why they live on the `Ruleset` rather than in `orrery_witness`.
 
-> **Implementation status of the neighbour-read path.** The recording half of
-> that bullet is not built. `RecordSource::NeighborFrame`
-> (`orrery_protocol/src/verifiable.rs`) carries `neighbor: PersistId` and
-> nothing else — not the quantized fields this section says it does — and no
-> production code path constructs one; `Executor::step_entity` collects
-> `TickOutcome::neighbor_reads` and no logger consumes it. Until a producer
-> exists, **a neighbour read is unadjudicable**, not merely unrecorded: the
-> adjudicator installs exactly one entity
-> (`ReplayHarness::load_claimed_snapshot`), so its neighbour map is empty and a
-> rule that consulted a neighbour resolves differently under replay than it did
-> under play — a mismatch against an *honest* peer. `orrery_witness` states the
-> same conclusion from the other end and isolates each entity for it; see the
-> `Witness` type documentation in `crates/orrery_witness/src/witness.rs`
-> ("Core steps should not read neighbours", ~line 346). Reference-game rules are
-> written to that restriction: `orrery_games`' Skirmish splits a shot across the
-> attacker's and the target's own steps rather than reading the target, and
-> `orrery_games::scenario::adjudicate_isolated` is the harness clause that holds
-> it there. The conformance corpus's reference ruleset was *not* so written
-> until 2026-08-17 — its `Attack` rule branched on `view.neighbor(target)`, and
-> the branch was invisible in the attacker's own state hash because the roll is
-> folded into `roll_fold` before it, so `verify_bundle` would have exonerated a
-> window whose emitted event was wrong. The check now lives in the target's own
-> step; `scripts/core-gates.sh` §5 rejects the pattern statically in every gated
-> ruleset, and the corpus's `combat-isolated` case runs one executor per entity
-> so the same divergence would also change a golden chain. This is a gap in the
-> implementation, not a narrowing of the decision
-> above: neighbour reads remain permitted by §3 and by D9, and become
-> adjudicable when `NeighborFrame` gains a producer that records the fields.
+> **Implementation status of the neighbour-read path.** The closure landed for
+> Regolith visibility claims. `Executor::step_entity` emits each successful
+> read as canonical quantized state plus the tick attached to the replica the
+> reader actually observed; `log::neighbor_record` seals that payload into the
+> entity chain. `ReplayHarness` decodes and installs those frames for that tick
+> only, checks the ruleset's per-tick read cap and staleness bound, and requires
+> the replay's read set to equal the recorded set. It never installs a live
+> neighbour world. Stage-two sampling uses
+> `log::cross_check_neighbor_record` against the neighbour's signed claim at
+> the **declared neighbour tick**, not at the reader's tick. Future or over-age
+> observations are refused as unadjudicable; they do not become deviations.
+> This distinction is load-bearing because ordinary replication lag otherwise
+> manufactures accusations against honest authorities. `scripts/core-gates.sh`
+> §5 still scans every rules crate and admits exactly one audited read site:
+> Regolith's O(1) claim predicate. Skirmish and the conformance rules remain on
+> the delivered-event discipline; adding another read site fails the gate.
+> [D43](adr/0043-determinism-envelope-and-gate-replacement.md) clause (d)'s neighbour ban was narrowed to this form by the owner on
+> 2026-08-25; that record, not this section, is normative on the gate's shape.
 
 ## 4. Determinism rules (hard requirements on core code)
 
@@ -288,7 +278,7 @@ pub enum RecordSource {
     /// A CoreEvent emitted by another entity's step at tick-1 (§3).
     InboundEvent { from: PersistId },
     /// Quantized neighbor fields read by StateView this tick (§3).
-    NeighborFrame { neighbor: PersistId },
+    NeighborFrame { neighbor: PersistId, present: bool, observed_tick: Tick },
     /// Geometry sections consulted via StateView::geometry() this tick (§3):
     /// quantized section keys + the content hashes actually read.
     GeometryFrame { sections: Vec<(SectionKey, [u8; 32])> },

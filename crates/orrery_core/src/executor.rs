@@ -19,7 +19,9 @@ use orrery_protocol::{PersistId, Tick, UniverseSeed};
 
 use crate::quantize::Quantized;
 use crate::rng::tick_rng;
-use crate::ruleset::{state_hash, EntityMaterialization, OrderedInputs, Ruleset, StateView};
+use crate::ruleset::{
+    state_hash, CoreCodec, EntityMaterialization, OrderedInputs, Ruleset, StateView,
+};
 
 /// The fixed simulation rate (VC-1, D8).
 pub const TICK_HZ: u32 = 60;
@@ -38,10 +40,26 @@ pub struct TickOutcome<E> {
     /// Neighbours the step actually read, in first-read order. These become
     /// `NeighborFrame` records.
     pub neighbor_reads: Vec<PersistId>,
+    /// Canonical state and declared tick for every neighbour read.
+    ///
+    /// Log producers encode these as `RecordSource::NeighborFrame` records;
+    /// retaining the tick closes the honest-replication-lag ambiguity.
+    pub neighbor_frames: Vec<NeighborFrame>,
     /// blake3 over the canonical encoding of the quantized state, after the
     /// step — the value a [`StateClaim`](orrery_protocol::StateClaim) commits
     /// to.
     pub state_hash: [u8; 32],
+}
+
+/// One replayable neighbour observation produced by a live step.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NeighborFrame {
+    /// Neighbour whose state was read.
+    pub neighbor: PersistId,
+    /// Tick attached to the replicated state the reader actually held.
+    pub observed_tick: Tick,
+    /// Canonical quantized `CoreState` bytes, or `None` for an absent lookup.
+    pub state: Option<Vec<u8>>,
 }
 
 /// Drives a `Ruleset` over entities at the fixed tick.
@@ -49,6 +67,7 @@ pub struct Executor<R: Ruleset> {
     ruleset: R,
     seed: UniverseSeed,
     states: BTreeMap<PersistId, R::CoreState>,
+    state_ticks: BTreeMap<PersistId, Tick>,
 }
 
 impl<R: Ruleset> Executor<R> {
@@ -61,6 +80,7 @@ impl<R: Ruleset> Executor<R> {
             // through neighbour snapshots, and std hash iteration order is
             // randomized per process.
             states: BTreeMap::new(),
+            state_ticks: BTreeMap::new(),
         }
     }
 
@@ -75,9 +95,24 @@ impl<R: Ruleset> Executor<R> {
     /// an evidence bundle or a checkpoint must sit on the lattice before the
     /// first tick reads it, or that tick starts from a point the authority
     /// never occupied.
-    pub fn insert(&mut self, entity: PersistId, mut state: R::CoreState) {
+    pub fn insert(&mut self, entity: PersistId, state: R::CoreState) {
+        self.insert_observed(entity, state, Tick::new(0));
+    }
+
+    /// Install or replace state carrying the tick at which it was observed.
+    ///
+    /// Replication consumers use this form. The ordinary [`Self::insert`]
+    /// remains useful for tick-zero spawns and starts the observation clock at
+    /// zero.
+    pub fn insert_observed(
+        &mut self,
+        entity: PersistId,
+        mut state: R::CoreState,
+        observed_tick: Tick,
+    ) {
         state.quantize();
         self.states.insert(entity, state);
+        self.state_ticks.insert(entity, observed_tick);
     }
 
     /// Read an entity's current state.
@@ -91,6 +126,7 @@ impl<R: Ruleset> Executor<R> {
     /// one-entity executor. A live world normally keeps materializations in
     /// this executor and has no reason to call it.
     pub fn take_state(&mut self, entity: PersistId) -> Option<R::CoreState> {
+        self.state_ticks.remove(&entity);
         self.states.remove(&entity)
     }
 
@@ -121,22 +157,38 @@ impl<R: Ruleset> Executor<R> {
 
         let output = self.ruleset.step(&mut view, &ordered, &mut rng);
         let neighbor_reads = view.recorded_reads().to_vec();
+        let neighbor_frames = neighbor_reads
+            .iter()
+            .map(|neighbor| {
+                let state = neighbors.get(neighbor);
+                NeighborFrame {
+                    neighbor: *neighbor,
+                    observed_tick: self.state_ticks.get(neighbor).copied().unwrap_or(tick),
+                    state: state.map(CoreCodec::to_canonical),
+                }
+            })
+            .collect();
 
         // VC-7: snap before anything hashes or replicates it.
         own.quantize();
         let hash = state_hash(&own);
         self.states.insert(entity, own);
+        // A claim at T commits to the state before T executes. The state just
+        // produced by tick T is therefore the state whose claim tick is T+1.
+        self.state_ticks
+            .insert(entity, Tick::new(tick.0.saturating_add(1)));
 
         let mut descriptions = Vec::new();
         for event in &output.events {
             self.ruleset.materialize(event, &mut descriptions);
         }
-        let materialized = self.install_materializations(descriptions);
+        let materialized = self.install_materializations(descriptions, tick);
 
         Some(TickOutcome {
             events: output.events,
             materialized,
             neighbor_reads,
+            neighbor_frames,
             state_hash: hash,
         })
     }
@@ -144,12 +196,15 @@ impl<R: Ruleset> Executor<R> {
     fn install_materializations(
         &mut self,
         descriptions: Vec<EntityMaterialization<R::CoreState>>,
+        tick: Tick,
     ) -> Vec<PersistId> {
         let mut materialized = Vec::with_capacity(descriptions.len());
         for EntityMaterialization { entity, mut state } in descriptions {
             if let Entry::Vacant(slot) = self.states.entry(entity) {
                 state.quantize();
                 slot.insert(state);
+                self.state_ticks
+                    .insert(entity, Tick::new(tick.0.saturating_add(1)));
                 materialized.push(entity);
             }
         }
@@ -474,11 +529,14 @@ mod tests {
                 ..body()
             },
         );
-        let accepted = executor.install_materializations(vec![
-            EntityMaterialization::new(occupied, Body { rolls: 1, ..body() }),
-            EntityMaterialization::new(new, Body { rolls: 2, ..body() }),
-            EntityMaterialization::new(new, Body { rolls: 3, ..body() }),
-        ]);
+        let accepted = executor.install_materializations(
+            vec![
+                EntityMaterialization::new(occupied, Body { rolls: 1, ..body() }),
+                EntityMaterialization::new(new, Body { rolls: 2, ..body() }),
+                EntityMaterialization::new(new, Body { rolls: 3, ..body() }),
+            ],
+            Tick::new(0),
+        );
 
         assert_eq!(accepted, vec![new]);
         assert_eq!(executor.state(occupied).expect("kept").pos.x, 7);
@@ -604,10 +662,10 @@ mod tests {
         let outcome = exec
             .step_entity(PersistId::new(1), Tick::new(900), &[])
             .expect("entity present");
+        assert_eq!(outcome.neighbor_reads, vec![PersistId::new(1)]);
         assert!(
-            outcome.neighbor_reads.is_empty(),
-            "a miss is not a read, and logging one would put a neighbour in \
-             the log that the rules never saw"
+            outcome.neighbor_frames[0].state.is_none(),
+            "an attempted absent/self read is an explicit absent frame"
         );
     }
 
@@ -642,6 +700,10 @@ mod tests {
             .step_entity(PersistId::new(1), Tick::new(1), &[])
             .expect("entity present");
         assert_eq!(outcome.neighbor_reads, vec![PersistId::new(2)]);
+        assert_eq!(outcome.neighbor_frames.len(), 1);
+        assert_eq!(outcome.neighbor_frames[0].neighbor, PersistId::new(2));
+        assert_eq!(outcome.neighbor_frames[0].observed_tick, Tick::new(0));
+        assert!(outcome.neighbor_frames[0].state.is_some());
     }
 
     #[test]

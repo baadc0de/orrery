@@ -188,6 +188,11 @@ fn value_range(sample: &InvariantSample<'_, RegolithState>) -> Result<(), Invari
                 || craft.pitch_urad != 0
                 || craft.respawn_in > RESPAWN_TICKS
                 || craft.lock_progress > LOCK_ACQUISITION_TICKS
+                || craft.lock_decay_progress >= LOCK_ACQUISITION_TICKS
+                || craft.cover_claim_cooldown > super::COVER_CLAIM_INTERVAL_TICKS
+                || (craft.lock_decay_progress > 0
+                    && (craft.lock_target.is_none()
+                        || craft.lock_progress != LOCK_ACQUISITION_TICKS))
                 || (craft.lock_target.is_none() != (craft.lock_progress == 0))
                 || (craft.hull > 0 && craft.respawn_in != 0)
                 || (craft.hull == 0 && craft.respawn_in == 0)

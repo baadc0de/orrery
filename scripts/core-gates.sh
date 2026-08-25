@@ -124,19 +124,28 @@ scan "\\.($TRANSCENDENTALS)\\(" \
 note 'VC-6/VC-8: no ambient inputs, no std transcendentals'
 
 # ── 5. Neighbour reads inside a Ruleset ─────────────────────────────────
-# `StateView::neighbor` records the read, but nothing yet *replays* it: a
-# `NeighborFrame` producer does not exist (docs/06 §3, implementation status),
-# and `ReplayHarness::load_claimed_snapshot` installs exactly one entity — so at
-# replay every neighbour read returns `None` and a rule that branched on one
-# adjudicates differently than it executed. Rules keep cross-entity effects in
-# events until that gap closes.
+# The recorded-input closure is now complete: Executor emits canonical state
+# plus the neighbour tick actually observed, ReplayHarness serves those frames
+# without installing a live world, enforces the ruleset's read/staleness caps,
+# and compares the replay's reads with the signed frame set. Cross-checking is
+# against the declared tick; a stale frame is refused, never turned into a
+# deviation against an honest lagged reader.
 #
-# Matched on the receiver rather than as a bare `.neighbor(`: `CellId::neighbor`
-# is an unrelated method on the spatial type, and `view` is the binding every
-# gated `Ruleset::step` gives its `StateView`.
-scan '\bview\.neighbor\s*\(' \
-  'live neighbour read in a Ruleset — cross-entity effects travel as events (docs/06 §3)' \
-  "${RULES_SOURCES[@]}"
-note "no live neighbour reads: ${RULES_CRATES[*]}"
+# Policy remains narrow. The only rules-side read is Regolith's audited O(1)
+# claim verifier. Keep scanning every rules crate and reject every other hit;
+# this is not a crate exemption.
+neighbor_hits=$(grep -nE '\bview\.neighbor\s*\(' "${RULES_SOURCES[@]}" \
+  | grep -vE '^\s*[^:]+:[0-9]+:\s*(//|//!|/\*|\*)' \
+  || true)
+unexpected_neighbor_hits=$(printf '%s\n' "$neighbor_hits" \
+  | grep -vE '/orrery_games/src/regolith/visibility\.rs:[0-9]+:' \
+  || true)
+if [[ -n $unexpected_neighbor_hits ]]; then
+  echo "$unexpected_neighbor_hits" >&2
+  die 'neighbour read outside the audited Regolith claim predicate (docs/06 §3)'
+fi
+[[ $(printf '%s\n' "$neighbor_hits" | grep -c .) == 1 ]] \
+  || die 'audited Regolith claim predicate must contain exactly one recorded neighbour-read site'
+note 'recorded neighbour reads confined to audited Regolith claim predicate'
 
 echo "$NAME: verifiable-core static gates pass"

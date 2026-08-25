@@ -65,4 +65,4 @@
 /// window is for a fleet mid-rollout, where identity and the gateways are
 /// separate services with no handshake between them. It is not a second
 /// client-facing window: this one is exact equality and D29 clause 5 closed it.
-pub const PROTOCOL_VERSION: u16 = 5;
+pub const PROTOCOL_VERSION: u16 = 6;
