@@ -4,7 +4,10 @@ use super::weapon::WeaponKind;
 use orrery_core::{CodecError, CoreCodec, QPos, QVel};
 use orrery_protocol::PersistId;
 
-use super::state::{BloomMembership, RockTier};
+use super::{
+    archetype::Archetype,
+    state::{BloomMembership, RockTier},
+};
 
 /// A target-side fact that clears a lock without a live neighbour read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -39,6 +42,8 @@ pub enum ShotResult {
     Hit,
     /// The projectile missed and applied no damage.
     Miss,
+    /// The target was outside every firing arc when the shot was emitted.
+    OutOfArc,
 }
 
 impl ShotResult {
@@ -46,6 +51,7 @@ impl ShotResult {
         match self {
             Self::Hit => 0,
             Self::Miss => 1,
+            Self::OutOfArc => 2,
         }
     }
 
@@ -53,6 +59,7 @@ impl ShotResult {
         match tag {
             0 => Ok(Self::Hit),
             1 => Ok(Self::Miss),
+            2 => Ok(Self::OutOfArc),
             _ => Err(CodecError("regolith: unknown shot result")),
         }
     }
@@ -128,6 +135,10 @@ pub enum Order {
         from_pos: QPos,
         /// Shooter velocity at firing.
         from_vel: QVel,
+        /// Shooter heading when the shot was emitted.
+        from_yaw_urad: i32,
+        /// Shooter chassis whose firing arcs govern the shot.
+        from_archetype: Archetype,
         /// Weapon from the shooter's hashed state.
         from_weapon: WeaponKind,
         /// Remaining target-owned flight ticks; `None` marks first arrival.
@@ -177,7 +188,7 @@ pub enum Order {
     ShotResolved {
         /// Target that resolved the projectile.
         target: PersistId,
-        /// Whether the projectile hit or missed.
+        /// Whether the shot hit, missed, or was refused by the firing arc.
         result: ShotResult,
     },
     /// Claim that one named rock changed visibility between this target and a locker.
@@ -218,6 +229,8 @@ impl CoreCodec for Order {
                 from,
                 from_pos,
                 from_vel,
+                from_yaw_urad,
+                from_archetype,
                 from_weapon,
                 flight_ticks,
             } => {
@@ -226,6 +239,8 @@ impl CoreCodec for Order {
                 out.extend_from_slice(&from.0.to_le_bytes());
                 encode_pos(*from_pos, out);
                 encode_vel(*from_vel, out);
+                out.extend_from_slice(&from_yaw_urad.to_le_bytes());
+                out.push(from_archetype.tag());
                 out.push(from_weapon.tag());
                 match flight_ticks {
                     Some(ticks) => {
@@ -290,14 +305,16 @@ impl CoreCodec for Order {
             (1, 8) => Ok(Self::Fire {
                 target: PersistId::new(u64::from_le_bytes(rest.try_into().unwrap())),
             }),
-            (2, 64) if rest[61] <= 1 => Ok(Self::Damage {
+            (2, 69) if rest[66] <= 1 => Ok(Self::Damage {
                 amount: i32::from_le_bytes(rest[0..4].try_into().unwrap()),
                 from: PersistId::new(u64::from_le_bytes(rest[4..12].try_into().unwrap())),
                 from_pos: decode_pos(&rest[12..36]),
                 from_vel: decode_vel(&rest[36..60]),
-                from_weapon: WeaponKind::from_tag(rest[60])?,
-                flight_ticks: (rest[61] == 1)
-                    .then(|| u16::from_le_bytes(rest[62..64].try_into().unwrap())),
+                from_yaw_urad: i32::from_le_bytes(rest[60..64].try_into().unwrap()),
+                from_archetype: Archetype::from_tag(rest[64])?,
+                from_weapon: WeaponKind::from_tag(rest[65])?,
+                flight_ticks: (rest[66] == 1)
+                    .then(|| u16::from_le_bytes(rest[67..69].try_into().unwrap())),
             }),
             (3, 8) => Ok(Self::Grab {
                 pickup: PersistId::new(u64::from_le_bytes(rest.try_into().unwrap())),
@@ -352,6 +369,10 @@ pub enum Outcome {
         attacker_pos: QPos,
         /// Firing velocity.
         attacker_vel: QVel,
+        /// Shooter heading when the shot was emitted.
+        attacker_yaw_urad: i32,
+        /// Shooter chassis whose firing arcs govern the shot.
+        attacker_archetype: Archetype,
         /// Equipped firing weapon.
         attacker_weapon: WeaponKind,
         /// Remaining target-owned flight ticks; `None` marks first arrival.
@@ -452,7 +473,7 @@ pub enum Outcome {
         attacker: PersistId,
         /// Target that resolved the projectile.
         target: PersistId,
-        /// Whether the projectile hit or missed.
+        /// Whether the shot hit, missed, or was refused by the firing arc.
         result: ShotResult,
     },
     /// A target verified a named cover transition for delivery to its locker.
@@ -515,6 +536,8 @@ impl CoreCodec for Outcome {
                 amount,
                 attacker_pos,
                 attacker_vel,
+                attacker_yaw_urad,
+                attacker_archetype,
                 attacker_weapon,
                 flight_ticks,
             } => {
@@ -524,6 +547,8 @@ impl CoreCodec for Outcome {
                 out.extend_from_slice(&amount.to_le_bytes());
                 encode_pos(*attacker_pos, out);
                 encode_vel(*attacker_vel, out);
+                out.extend_from_slice(&attacker_yaw_urad.to_le_bytes());
+                out.push(attacker_archetype.tag());
                 out.push(attacker_weapon.tag());
                 match flight_ticks {
                     Some(ticks) => {
@@ -652,15 +677,17 @@ impl CoreCodec for Outcome {
             .split_first()
             .ok_or(CodecError("regolith outcome: empty"))?;
         match (tag, rest.len()) {
-            (0, 72) if rest[69] <= 1 => Ok(Self::DamageDealt {
+            (0, 77) if rest[74] <= 1 => Ok(Self::DamageDealt {
                 attacker: PersistId::new(u64::from_le_bytes(rest[0..8].try_into().unwrap())),
                 target: PersistId::new(u64::from_le_bytes(rest[8..16].try_into().unwrap())),
                 amount: i32::from_le_bytes(rest[16..20].try_into().unwrap()),
                 attacker_pos: decode_pos(&rest[20..44]),
                 attacker_vel: decode_vel(&rest[44..68]),
-                attacker_weapon: WeaponKind::from_tag(rest[68])?,
-                flight_ticks: (rest[69] == 1)
-                    .then(|| u16::from_le_bytes(rest[70..72].try_into().unwrap())),
+                attacker_yaw_urad: i32::from_le_bytes(rest[68..72].try_into().unwrap()),
+                attacker_archetype: Archetype::from_tag(rest[72])?,
+                attacker_weapon: WeaponKind::from_tag(rest[73])?,
+                flight_ticks: (rest[74] == 1)
+                    .then(|| u16::from_le_bytes(rest[75..77].try_into().unwrap())),
             }),
             (1, 8) => Ok(Self::Destroyed {
                 by: PersistId::new(u64::from_le_bytes(rest.try_into().unwrap())),

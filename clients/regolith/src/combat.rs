@@ -13,7 +13,7 @@ use orrery_games::regolith::archetype::Archetype;
 use orrery_games::regolith::order::{LockBreakReason, Outcome, ShotResult};
 use orrery_games::regolith::state::{Craft, RegolithState};
 use orrery_games::regolith::weapon::{Weapon, WeaponKind};
-use orrery_games::regolith::LOCK_ACQUISITION_TICKS;
+use orrery_games::regolith::{in_firing_arc, LOCK_ACQUISITION_TICKS};
 use orrery_games::Regolith;
 use orrery_protocol::PersistId;
 
@@ -295,7 +295,7 @@ pub enum ShotCue {
     Resolved {
         /// Target that adjudicated the shot.
         target: PersistId,
-        /// Hit or miss, as the ruleset rolled it.
+        /// The hit, miss, or named refusal reported by the ruleset.
         result: ShotResult,
     },
 }
@@ -403,6 +403,10 @@ impl ShotFeedback {
                 result: ShotResult::Miss,
                 ..
             }) => "MISS".to_owned(),
+            Some(ShotCue::Resolved {
+                result: ShotResult::OutOfArc,
+                ..
+            }) => "SHOT REFUSED · OUT OF ARC".to_owned(),
         }
     }
 }
@@ -428,6 +432,8 @@ pub struct CraftView {
     pub shots: u32,
     /// Lattice position, for the range readout.
     pub pos: orrery_core::QPos,
+    /// Craft heading used by authoritative firing-arc adjudication.
+    pub yaw_urad: i32,
     /// Lattice velocity, for the speed readout.
     pub vel: orrery_core::QVel,
     /// `Craft::score`, already derived by the ruleset.
@@ -448,6 +454,7 @@ impl CraftView {
             respawn_in: craft.respawn_in,
             shots: craft.shots,
             pos: craft.pos,
+            yaw_urad: craft.yaw_urad,
             vel: craft.vel,
             score: craft.score(),
         }
@@ -826,6 +833,9 @@ impl CombatView {
         let target = self.target?;
         let weapon = own.weapon_table();
         let radius = target.archetype.limits().radius_mm;
+        if !in_firing_arc(own.archetype, own.yaw_urad, own.pos, target.pos) {
+            return Some(HitBand::NoChance);
+        }
         let separation = separation_mm(own.pos, target.pos);
         if separation > reach_mm(weapon, radius).max(0) as u128 {
             return Some(HitBand::NoChance);
@@ -890,6 +900,8 @@ mod tests {
             amount: 11,
             attacker_pos: QPos::from_metres(10.0, 0.0, 20.0),
             attacker_vel: QVel::default(),
+            attacker_yaw_urad: 0,
+            attacker_archetype: Archetype::Interceptor,
             attacker_weapon: WeaponKind::Stock,
             flight_ticks: remaining,
         }
@@ -1064,6 +1076,10 @@ mod tests {
             "a miss must retract the provisional flash"
         );
 
+        feedback.observe(&[resolved(1, ShotResult::OutOfArc)], me);
+        assert_eq!(feedback.banner(), "SHOT REFUSED · OUT OF ARC");
+        assert_eq!(feedback.flash_target(), None);
+
         // And expiry takes the whole cue with it.
         for _ in 0..SHOT_CUE_TICKS {
             feedback.age();
@@ -1139,13 +1155,12 @@ mod tests {
         );
     }
 
-    /// End to end against the real rules: hold the trigger, watch the
-    /// provisional cue arm on a genuine final leg, then confirm every
-    /// verdict the skin shows came verbatim from a `ShotResolved` the
-    /// target's step emitted. This is #383's owner decision made executable:
-    /// feedback always arrives, the skin never invents its outcome.
+    /// End to end against the real rules: hold the trigger and confirm every
+    /// verdict the skin shows came verbatim from a `ShotResolved` the target's
+    /// step emitted. In-arc projectiles may arm the provisional arrival cue;
+    /// an out-of-arc refusal resolves before flight and deliberately does not.
     #[test]
-    fn live_fire_arms_a_provisional_and_confirms_it_from_the_ruleset() {
+    fn live_fire_reports_authoritative_verdicts_including_arc_refusals() {
         use orrery_games::{Game, Regolith as Ruleset};
         use orrery_protocol::{Tick, UniverseSeed};
 
@@ -1227,12 +1242,12 @@ mod tests {
         }
 
         assert!(
-            arrivals_armed >= 1,
-            "held trigger over 150 ticks must arm at least one provisional arrival"
+            !verdicts.is_empty(),
+            "held trigger over 150 ticks must receive an authoritative verdict"
         );
         assert!(
-            !verdicts.is_empty(),
-            "and at least one authoritative verdict must land"
+            arrivals_armed >= 1 || verdicts.contains(&ShotResult::OutOfArc),
+            "every shot must either enter flight or name the firing-arc refusal"
         );
     }
 
@@ -1387,18 +1402,10 @@ mod band_boundaries {
         );
     }
 
-    /// The arcs are livery; the band is arithmetic. Neither may leak into the
-    /// other.
-    ///
-    /// `projectile_resolution` and `hit_chance_ppm` never read the shooter's
-    /// `yaw_urad`, and `Order::Fire` is accepted at any bearing — the ruleset
-    /// does not gate a shot on facing at all. So the band must be identical
-    /// for a target dead ahead and the same target dead astern. A band that
-    /// dimmed to NO CHANCE outside the drawn arc would look like the most
-    /// natural thing in the world and would disagree with every shot the
-    /// adjudicator lands.
+    /// The forecast reads the same authoritative firing-arc predicate as the
+    /// resolver: an out-of-arc target is visibly `NO CHANCE` before firing.
     #[test]
-    fn the_band_does_not_read_the_firing_arc() {
+    fn the_band_reads_the_rulesets_firing_arc() {
         let optimal = WeaponKind::Stock.weapon().optimal_mm;
         let ahead = view(0, optimal, 30_000);
         let mut astern = ahead;
@@ -1407,11 +1414,8 @@ mod band_boundaries {
         me.lock_target = Some(PersistId::new(2));
         me.lock_progress = LOCK_ACQUISITION_TICKS;
         astern.own = Some(CraftView::of(PersistId::new(1), &me));
-        assert_eq!(
-            ahead.hit_forecast(),
-            astern.hit_forecast(),
-            "the band moved when only the shooter's facing changed"
-        );
+        assert_ne!(ahead.hit_forecast(), Some(HitBand::NoChance));
+        assert_eq!(astern.hit_forecast(), Some(HitBand::NoChance));
         assert_eq!(ahead.hit_chance_ppm(), astern.hit_chance_ppm());
     }
 
@@ -1602,6 +1606,8 @@ mod ruleset_agreement {
             from: SHOOTER,
             from_pos: QPos { x: 0, y: 0, z: 0 },
             from_vel: QVel { x: 0, y: 0, z: 0 },
+            from_yaw_urad: 0,
+            from_archetype: Archetype::Interceptor,
             from_weapon: WEAPON,
             flight_ticks: Some(1),
         };
@@ -1734,6 +1740,9 @@ mod ruleset_agreement {
                         if chance >= 990_000 {
                             near_certain_miss = Some((chance, draw));
                         }
+                    }
+                    Some(ShotResult::OutOfArc) => {
+                        panic!("in-arc agreement sweep was refused at {transverse} mm/s")
                     }
                     other => panic!("no verdict at {transverse} mm/s: {other:?}"),
                 }

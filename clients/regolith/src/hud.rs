@@ -153,8 +153,8 @@ pub const RETICLE_RADIUS_M: f32 = 48.0;
 /// out of the plane the duel happens in.
 pub const FIRING_ARC_LIFT_M: f32 = 0.02;
 
-/// How much of the accent a firing-arc fan keeps. The arc is livery, not a
-/// readout: it has to be legible without competing with the reticle, the
+/// How much of the accent a firing-arc fan keeps. The arc is a persistent hull
+/// marking, not a transient readout: it has to be legible without competing with the reticle, the
 /// range rings or a tracer.
 pub const FIRING_ARC_ALPHA: f32 = 0.14;
 
@@ -257,7 +257,7 @@ pub enum Readout {
     HitBandLine,
     /// The lock-break banner.
     BreakBanner,
-    /// The shot-result cue line: provisional impact, then hit or miss.
+    /// The shot-result cue line: provisional impact, then hit, miss, or refusal.
     ShotResult,
 }
 
@@ -858,6 +858,10 @@ pub fn refresh_combat_hud(
                         result: ShotResult::Miss,
                         ..
                     })
+                    | Some(ShotCue::Resolved {
+                        result: ShotResult::OutOfArc,
+                        ..
+                    })
                     | None => DIM,
                 };
                 (feedback.banner(), tint)
@@ -1133,6 +1137,8 @@ mod tests {
             amount: 11,
             attacker_pos: QPos::from_metres(0.0, 0.0, 0.0),
             attacker_vel: QVel::default(),
+            attacker_yaw_urad: 0,
+            attacker_archetype: Archetype::Interceptor,
             attacker_weapon: WeaponKind::Stock,
             flight_ticks,
         }

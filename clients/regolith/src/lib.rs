@@ -359,7 +359,7 @@ fn spawn_craft_body(
             craft_root.spawn((
                 Name::new(arc.name),
                 FiringArcFan(entity),
-                Mesh3d(meshes.add(craft::arc_mesh(arc, arc_radius))),
+                Mesh3d(meshes.add(craft::arc_mesh(*arc, arc_radius))),
                 MeshMaterial3d(arc_material.clone()),
                 // Just off the deck, so the fan reads over the plan view
                 // instead of z-fighting the hull plate it sits under.
@@ -857,7 +857,7 @@ mod tests {
             for arc in craft::firing_arcs(craft.archetype) {
                 let bearing = (yaw_urad as f64 + f64::from(arc.centre_urad)) / 1_000_000.0;
                 let expected = Vec3::new(bearing.cos() as f32, 0.0, bearing.sin() as f32);
-                let drawn = rotation * arc.centre_direction();
+                let drawn = rotation * craft::arc_centre_direction(*arc);
                 assert!(
                     drawn.distance(expected) < 1e-5,
                     "{} on {:?} at yaw {yaw_urad}: the arc points {drawn}, \
@@ -867,7 +867,7 @@ mod tests {
                 );
 
                 // And the fan itself, once rotated into the world.
-                let mesh = craft::arc_mesh(arc, 30.0);
+                let mesh = craft::arc_mesh(*arc, 30.0);
                 let VertexAttributeValues::Float32x3(points) = mesh
                     .attribute(Mesh::ATTRIBUTE_POSITION)
                     .expect("the fan has positions")
