@@ -465,3 +465,100 @@ where they belong:
    `ComponentTypeId(1)` (`regolith/mod.rs:80-84`) with no registry. Schema-id
    allocation is governance, flagged to A8 (#404).
 
+---
+
+## 7. Reported rather than forced: decisions this table does not make
+
+Each is named because §2 would otherwise look complete when it is not:
+
+1. **The rollback unit.** Row 7 assigns mechanism ownership only. Whole-world
+   vs island vs cell vs entity-set vs component-subset is A7's (#403) question;
+   answering it here would preempt a comparison A2 does not own.
+2. **Whether game validation merges into the `Ruleset` trait**
+   (`validate_intent` behind `IntentValidator`). D21 freezes persistd's
+   exports, not the trait, and D38(c) pins that a *required* trait method
+   "names D21 and pays its ADR" (`docs/adr/0038-at-rest-schema-versioning.md:164-168`).
+   Reopening is the owner's call; until then the table treats `IntentValidator`
+   and `Ruleset` as parallel policy seams (rows 4 and 8), which they factually are.
+3. **The two cluster-interpreted ops' long-term home.** `LEDGER_ITEM_TRANSFER_OP`
+   is game-flavoured semantics living kernel-side (`intent/mod.rs:215-257`),
+   justified as a cross-game economic invariant made real by a producer. The
+   table admits it as a *reservation*, not precedent: the test for reserving
+   op id N should stay "does this op enforce an invariant every game needs the
+   cluster to hold?" — but who applies that test, and whether the existing two
+   pass it forever, is owner judgement.
+4. **Schema-id governance** (who allocates `ComponentTypeId`/schema versions).
+   Flagged to A5/A8 in §6.
+5. **Whether the three tick drivers converge into one kernel-provided driver**
+   (row 1 observes client/bot/lightyear each drive their own loop). The table
+   holds under any answer — host-driven is a property of today's hosts, not a
+   requirement of ownership — so convergence is an A3/A4 design question.
+
+---
+
+## 8. Mutation log
+
+Both enforcement claims this document makes were mutation-tested on this tree:
+the guarded stage was broken, the named check died with its real output line,
+the stage was restored, and the pass was re-confirmed. One false start is
+recorded because it is instructive.
+
+| # | Guarded stage broken | Named check that died | Observed | Reverted |
+|---|---|---|---|---|
+| M-A | Added `orrery_games = { path = "../orrery_games" }` to `[dependencies]` of `crates/orrery_core/Cargo.toml` (kernel depending on a game module) | `cargo tree -p orrery_core` | `error: cyclic package dependency: package orrery_core … depends on itself`, exit 101 | exit 0 |
+| M-B | Added `bevy_ecs = { version = "0.19", default-features = false }` to `[dev-dependencies]` of `orrery_core` (engine entering the core's graph without touching a line of code) | `./scripts/core-gates.sh` clause 1 | `core-gates: orrery_core has Bevy in its dependency graph`, exit 1 | all four clauses print, `verifiable-core static gates pass`, exit 0 |
+| M-A′ (false start) | Same games-dependency appended at end of file, which landed inside `[dev-dependencies]` | none — check *passed* | Dev-cycles are legal in cargo; the mutation proved nothing about normal dependencies and was discarded before being cited anywhere | n/a |
+
+M-A′ is why §3.2's enforcement column says what it says: the structural
+protection covers ordinary dependencies between those two crates, nothing
+else. Both mutations lived for one command run; no Rust source was modified.
+
+---
+
+## 9. Stale citations found while verifying
+
+| Record | Citation / phrasing | Current truth |
+|---|---|---|
+| #398 briefing text | "`PublishFrame`/`PublishClaim` have no producer outside witness tests" | Over-compressed. Precise statement (A1 §5.6 had it right): no producer in any production crate; `gates/p1-swarm/src/bot.rs:1102-1137` writes both harness-side, cut from executor outcomes via `chain.rs`. The compressed form drops the qualifier that keeps it true |
+| docs/06-verifiable-core.md:210 | Names live consumers of `classify_component`: "`orrery_persist_client` uses it to route bulk diffs vs. intents, `orrery_witness` uses it to decide what to watch" | Neither consumer exists (zero call sites tree-wide). Design intent written as present-tense description; flagged rather than silently relied on |
+| docs/10-crates.md:127 | Crate table lists `orrery_field_host` bin | No such crate exists (A1 §5.5). The doc self-describes as sketch-grade, so this is drift-with-disclaimer, recorded for completeness |
+| D21 context | "`Ruleset::validate_intent` behind `intent::IntentValidator`" (`docs/adr/0021-ruleset-distribution.md:20-21`) | Still stale exactly as A1 §6 recorded: `validate_intent` was never implemented; the freeze itself is unaffected |
+| A1 map (re-checked, not stale) | All load-bearing claims re-verified on this tree: trait surface/lines, four-crate generic reach, zero `classify_component` call sites, `NeighborFrame` produced only as test evidence (`adjudication.rs:526`), D21/D38 texts, prediction's config-layer-only lightyear coupling (`predict/src/lib.rs:3-6`) | All held at `46c9301a` |
+
+No citation this document relies on from AGENTS.md proved wrong during this task.
+
+---
+
+## 10. Unsure
+
+Stated as unsure rather than smoothed over:
+
+1. **Whether row 4's two interpreted ops are the right kernel/game line.** I
+   assigned them to the kernel side with a stated admission test (§7.3), but a
+   reasonable owner could place them in a shipped reference module instead.
+   The table does not depend on which way this falls; the anti-dupe
+   invariant's enforcement point arguably does.
+2. **Whether `Bulk` deserves existence before its consumers land.** With zero
+   routing consumers, `Bulk` vs `Cosmetic` is currently a documentation
+   distinction. If A5 keeps the classification, fine; if A5 replaces it with
+   per-dimension policies, `CoreClass` may be deleted rather than wired. This
+   document deliberately assigns ownership of the *hook's role* (§6) without
+   predicting the hook's survival.
+3. **Regolith-vs-Skirmish divergence** — carried over from A1 §11.4: two
+   reference games exist, both carry goldens, and why P4 standardized on
+   Regolith v8 I did not fully trace. It bounds how much "cross-game"
+   evidence the tree can actually provide: every generalization above rests
+   on one production ruleset plus one measurement twin.
+4. **How far "policy handover" can stretch before it becomes the god
+   abstraction the brief fears.** §3.1's second crossing is load-bearing for
+   rows 4, 6, 8; whether eight policy dimensions per component (A5's list)
+   still fits a handover-shaped seam, or needs registries, is genuinely open
+   and owned elsewhere.
+
+Deliberately not done:
+
+- **No architecture recommendation.** Nothing above prefers ECS-hosted,
+  `Ruleset`-hosted, or bespoke-hosted canonical state; every row was written
+  to survive A3's comparison set unchanged.
+- **No Rust changes.** Mutations touched `Cargo.toml` for one command each
+  and were reverted with passing results re-confirmed (§8).
