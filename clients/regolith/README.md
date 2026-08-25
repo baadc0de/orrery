@@ -20,3 +20,9 @@ depend on F3.
 There are deliberately no required assets. If `assets/regolith/craft.glb` is
 present it is used as visual geometry; otherwise the client renders Bevy
 primitives. Visual geometry never reaches collision or any simulation input.
+
+`--smoke-test` validates that the client plugins and schedules assemble, then
+exits without creating a window, GPU adapter, or pipeline. It is deliberately
+not a rendering check: a successful line says `graphics were intentionally not
+initialized`, while a composition error remains a client failure. Run the
+ordinary client to exercise graphics-device capability.

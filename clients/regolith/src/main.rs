@@ -34,6 +34,10 @@ fn main() {
         return;
     }
     let smoke_test = has_flag(&args, "--smoke-test");
+    if smoke_test {
+        run_smoke_test();
+        return;
+    }
     let campaign = has_flag(&args, "--campaign") || args.iter().any(|arg| arg == "--host-node");
     let consented = has_flag(&args, "--campaign-consent");
     if campaign {
@@ -54,7 +58,7 @@ fn main() {
         primary_window: Some(Window {
             title: "Orrery: Regolith".into(),
             // Headless proofs (`--smoke-ticks`) pop no window either.
-            visible: !smoke_test && smoke_ticks.is_none(),
+            visible: smoke_ticks.is_none(),
             ..Default::default()
         }),
         ..Default::default()
@@ -104,29 +108,47 @@ fn main() {
     }
     app.add_plugins(skin);
 
-    if smoke_test {
-        app.add_systems(Update, exit_smoke_after_frames);
-    }
     if let Some(ticks) = smoke_ticks {
         // Headless campaign proof: join, run N joined ticks, record, exit.
-        // Independent of --smoke-test (whose three-frame exitter would race
-        // the join); a plain --smoke-test stays three local frames.
         app.insert_resource(SmokeTicks(ticks));
         app.add_systems(Update, exit_smoke_after_joined_ticks);
     }
     app.run();
 }
 
+/// Build the client's non-graphics composition and report its outcome.
+///
+/// This deliberately does not construct a window, adapter, or render pipeline.
+/// It proves that the client plugins and their schedules can be assembled; a
+/// rendered run remains the coverage for graphics-device capability.
+fn run_smoke_test() {
+    let mut app = App::new();
+    app.add_plugins(MinimalPlugins)
+        // `OrreryPredictPlugin` installs lightyear's state-backed resources;
+        // unlike `DefaultPlugins`, `MinimalPlugins` does not provide this
+        // schedule.
+        .add_plugins(bevy::state::app::StatesPlugin)
+        .add_plugins(OrreryPredictPlugin::default())
+        .add_plugins(RegolithSkinPlugin::new(PathBuf::from(
+            "target/regolith-client/smoke.jsonl",
+        )));
+
+    // Keep this assertion beside the command's success message: it makes a
+    // missing skin installation a named client failure rather than a green
+    // process that only initialized Bevy's minimal runtime.
+    assert!(
+        app.world()
+            .contains_resource::<orrery_regolith_client::ActiveSession>(),
+        "smoke: client composition failed — RegolithSkinPlugin did not install ActiveSession"
+    );
+    eprintln!(
+        "smoke: client composition passed; graphics were intentionally not initialized (no GPU pipeline coverage)"
+    );
+}
+
 /// Tick budget for the headless campaign proof (`--smoke-ticks`).
 #[derive(Resource)]
 struct SmokeTicks(u64);
-
-fn exit_smoke_after_frames(mut frames: Local<u8>, mut exit: MessageWriter<AppExit>) {
-    *frames = frames.saturating_add(1);
-    if *frames >= 3 {
-        exit.write(AppExit::Success);
-    }
-}
 
 fn exit_smoke_after_joined_ticks(
     budget: Res<SmokeTicks>,
@@ -156,5 +178,15 @@ fn exit_smoke_after_joined_ticks(
                 std::num::NonZeroU8::new(1).expect("one is non-zero"),
             ));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::run_smoke_test;
+
+    #[test]
+    fn smoke_test_assembles_the_regolith_skin() {
+        run_smoke_test();
     }
 }
