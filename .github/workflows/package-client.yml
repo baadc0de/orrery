@@ -2,12 +2,19 @@ name: Package Regolith client
 
 on:
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Tag to create or update with these client assets"
+        required: true
+        type: string
   push:
     tags:
       - "playtest-*"
 
 permissions:
-  contents: read
+  # This workflow is never triggered by a pull request. The publish job needs
+  # this narrow write grant to create a tag-backed release and upload its assets.
+  contents: write
 
 # This workflow is deliberately release-shaped. Do not add a PR trigger: it
 # will eventually hold the private-assets credential, and PR code must never
@@ -22,7 +29,7 @@ jobs:
         include:
           - { os: ubuntu-latest, label: x86_64-linux, binary: orrery_regolith_client }
           - { os: windows-latest, label: x86_64-windows, binary: orrery_regolith_client.exe }
-          - { os: macos-latest, label: macos, binary: orrery_regolith_client }
+          - { os: macos-latest, label: aarch64-macos, binary: orrery_regolith_client }
     runs-on: ${{ matrix.os }}
     defaults:
       run:
@@ -42,19 +49,61 @@ jobs:
       - name: Stage binary and its SHA-256
         working-directory: .
         run: |
-          mkdir -p "dist/${{ matrix.label }}"
-          artifact="dist/${{ matrix.label }}/orrery-regolith-${{ matrix.label }}"
-          cp "clients/regolith/target/release/${{ matrix.binary }}" "$artifact"
-          if command -v sha256sum >/dev/null; then
-            sha256sum "$artifact" > "$artifact.sha256"
-          else
-            shasum -a 256 "$artifact" > "$artifact.sha256"
-          fi
+          mkdir -p stage dist
+          artifact="orrery-regolith-${{ matrix.label }}"
+          cp "clients/regolith/target/release/${{ matrix.binary }}" "stage/$artifact"
+          (
+            cd stage
+            if command -v sha256sum >/dev/null; then
+              sha256sum "$artifact" > "$artifact.sha256"
+            else
+              shasum -a 256 "$artifact" > "$artifact.sha256"
+            fi
+          )
 
-      - name: Upload binary and SHA-256
+      - name: Package Unix client
+        if: runner.os != 'Windows'
+        working-directory: .
+        run: |
+          asset="orrery-regolith-${{ matrix.label }}"
+          tar -C stage -czf "dist/$asset.tar.gz" "$asset" "$asset.sha256"
+
+      - name: Package Windows client
+        if: runner.os == 'Windows'
+        working-directory: .
+        run: |
+          asset="orrery-regolith-${{ matrix.label }}"
+          7z a -tzip "dist/$asset.zip" "stage/$asset" "stage/$asset.sha256"
+
+      - name: Upload release assets for publication
         uses: actions/upload-artifact@v7
         with:
-          name: regolith-${{ matrix.label }}-${{ github.sha }}
-          path: dist/${{ matrix.label }}
+          name: regolith-${{ matrix.label }}
+          path: dist
           if-no-files-found: error
           retention-days: 30
+
+  publish-client:
+    name: publish Regolith release assets
+    needs: package-client
+    runs-on: ubuntu-latest
+    env:
+      RELEASE_TAG: ${{ github.event_name == 'push' && github.ref_name || inputs.release_tag }}
+    steps:
+      - name: Download the three platform archives
+        uses: actions/download-artifact@v8
+        with:
+          pattern: regolith-*
+          path: dist
+          merge-multiple: true
+
+      - name: Create the release if needed and upload its assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if ! gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release create "$RELEASE_TAG" --target "$GITHUB_SHA" \
+              --title "$RELEASE_TAG" --generate-notes
+          fi
+          gh release upload "$RELEASE_TAG" dist/* --clobber
