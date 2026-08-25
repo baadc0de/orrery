@@ -128,13 +128,23 @@ jobs:
           path: dist
           merge-multiple: true
 
+      # This job deliberately does not check out the repository — it only needs
+      # the three archives the matrix uploaded. But `gh` resolves the target
+      # repo from the git remote by default, so without a checkout every
+      # command died with:
+      #
+      #   failed to run git: fatal: not a git repository
+      #
+      # `--repo` names it explicitly, which is cheaper than adding a checkout
+      # for the sole purpose of telling `gh` where it already is.
       - name: Create the release if needed and upload its assets
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
-          if ! gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
-            gh release create "$RELEASE_TAG" --target "$GITHUB_SHA" \
-              --title "$RELEASE_TAG" --generate-notes
+          if ! gh release view "$RELEASE_TAG" --repo "$GH_REPO" >/dev/null 2>&1; then
+            gh release create "$RELEASE_TAG" --repo "$GH_REPO" \
+              --target "$GITHUB_SHA" --title "$RELEASE_TAG" --generate-notes
           fi
-          gh release upload "$RELEASE_TAG" dist/* --clobber
+          gh release upload "$RELEASE_TAG" dist/* --repo "$GH_REPO" --clobber
