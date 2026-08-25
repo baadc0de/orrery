@@ -1,0 +1,19 @@
+[Unit]
+Description=Orrery campaign admission service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=orrery-admission
+Group=orrery-admission
+ExecStart=/usr/bin/python3 /opt/orrery/admission.py
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/orrery-admission
+
+[Install]
+WantedBy=multi-user.target
