@@ -439,5 +439,5 @@ is worsened by this record; all are inherited and named.
 [D38]: 0038-at-rest-schema-versioning.md
 [D42]: 0042-canonical-simulation-architecture.md
 [D43]: 0043-determinism-envelope-and-gate-replacement.md
-[D44]: ../DECISIONS.md
-[D45]: ../DECISIONS.md
+[D44]: 0044-identity-classes-and-allocation.md
+[D45]: 0045-per-component-capability-policy.md
