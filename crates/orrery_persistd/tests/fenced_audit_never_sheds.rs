@@ -330,9 +330,10 @@ async fn an_audit_slower_than_the_route_budget_neither_sheds_the_diff_nor_vanish
             Some(GatewayReply::Lease { message }) => panic!("claim was not granted: {message:?}"),
             Some(_) => continue,
             None => panic!(
-                "timed out after {} s waiting for an answer to the lease claim; \
-                 this is a liveness failure, not evidence that the lease path \
-                 dropped the claim",
+                "timed out after {} s with no answer to the lease claim. A \
+                 denial would have arrived as a Lease reply, so this is not \
+                 evidence the claim was denied; a dropped claim and a loaded \
+                 runner are both silence and this cannot separate them",
                 ACK_LIVENESS_TIMEOUT.as_secs(),
             ),
         }
@@ -390,9 +391,10 @@ async fn an_audit_slower_than_the_route_budget_neither_sheds_the_diff_nor_vanish
             }
             Some(other) => panic!("unexpected reply while awaiting acks: {other:?}"),
             None => panic!(
-                "timed out after {} s waiting for reply {}/{}; this is a \
-                 liveness failure, not evidence that the diagnostic shed a \
-                 fenced write",
+                "timed out after {} s waiting for reply {}/{}. The no-shed \
+                 invariant is the `shed_slow_route == 0` assertion above, not \
+                 this wait — a shed would already have failed there — so this \
+                 arm reports silence, which a loaded runner produces too",
                 ACK_LIVENESS_TIMEOUT.as_secs(),
                 acked + 1,
                 DIFFS,

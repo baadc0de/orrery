@@ -250,9 +250,11 @@ async fn a_saturated_bulk_lane_sheds_the_excess_and_keeps_serving_the_connection
             panic!("unexpected reply while awaiting the probe's acknowledgement: {other:?}")
         }
         None => panic!(
-            "timed out after {} s waiting for the rekey probe's BulkNack on the \
-             saturated connection; this is a liveness failure, not evidence \
-             that the receive loop stopped draining its queue",
+            "timed out after {} s with no reply to the rekey probe on the \
+             saturated connection. A receive loop parked on the excess diffs \
+             and a runner that never scheduled this task look identical from \
+             here, so this says only that nothing arrived — but every reply \
+             the loop could have sent instead is ruled out, because none did",
             PROBE_LIVENESS_TIMEOUT.as_secs(),
         ),
     }
@@ -336,9 +338,10 @@ async fn a_router_that_will_not_answer_is_shed_downstream_and_counted_separately
             panic!("unexpected reply while awaiting the probe's acknowledgement: {other:?}")
         }
         None => panic!(
-            "timed out after {} s waiting for the rekey probe's BulkNack past \
-             the downstream refusals; this is a liveness failure, not evidence \
-             that the connection stopped being served",
+            "timed out after {} s with no reply to the rekey probe past the \
+             downstream refusals. A connection that stopped being served and a \
+             runner that never scheduled this task look identical from here, \
+             so this says only that nothing arrived",
             PROBE_LIVENESS_TIMEOUT.as_secs(),
         ),
     }
@@ -385,8 +388,10 @@ async fn a_gateway_that_is_keeping_up_sheds_nothing_downstream() {
             Some(other) => panic!("unexpected reply while awaiting acknowledgements: {other:?}"),
             None => panic!(
                 "timed out after {ACK_LIVENESS_ROUTE_BUDGETS} route budgets waiting for \
-                 acknowledgement {}/64; this is a liveness failure, not evidence that \
-                 the gateway shed a healthy route",
+                 acknowledgement {}/64. The shed invariant is the ingress snapshot \
+                 asserted above, not this wait, so a shed would already have failed \
+                 there; what this arm reports is silence, which a loaded runner \
+                 produces too",
                 acked + 1,
             ),
         }

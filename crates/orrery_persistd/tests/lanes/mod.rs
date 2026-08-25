@@ -167,6 +167,22 @@ const _: () = assert!(
      #358 and #370 exist to remove"
 );
 
+/// What a timeout may and may not deny.
+///
+/// A `None` from [`GatewayLanes::next_reply`] means *nothing arrived in time*,
+/// and that is all it means. It can rule out every failure that would have
+/// arrived **as a reply** — a refusal, a nack, the right reply carrying the
+/// wrong field — because those are bytes on the wire and bytes on the wire are
+/// what did not appear. It can rule out nothing that also looks like silence:
+/// a shed write, a dropped subscribe, a stalled receive loop and a runner that
+/// simply did not get scheduled are the same observation from here.
+///
+/// So a timeout arm may say "this is not evidence that the session was
+/// refused" and be right, and may not say "this is not evidence that the hello
+/// was dropped" — that one would talk a reader out of a bug that is live. Each
+/// message below is written to that line, and it is the reason they are not
+/// interchangeable.
+///
 /// Wait out a gateway handshake, keeping a refusal and a silence apart.
 ///
 /// The idiom this replaces — `assert!(matches!(conn.next_reply(d).await,
@@ -182,9 +198,11 @@ pub async fn expect_hello_ack(conn: &GatewayLanes) {
             panic!("the gateway did not admit the handshake; it answered {other:?}")
         }
         None => panic!(
-            "timed out after {} s waiting for the handshake's HelloAck; this is \
-             a liveness failure, not evidence that the gateway refused the \
-             session or dropped the hello",
+            "timed out after {} s with no reply to the hello at all. A refusal \
+             would have arrived as a HelloRefused, so this is not evidence \
+             that the session was refused; it is a loaded runner or a gateway \
+             that never answered, and nothing observable here separates those \
+             two",
             LIVENESS_CEILING.as_secs(),
         ),
     }

@@ -270,9 +270,10 @@ async fn a_cooldown_or_ban_refusal_arrives_as_hello_refused_standing_not_silence
         }) => {}
         Some(other) => panic!("expected a standing refusal, got {other:?}"),
         None => panic!(
-            "timed out after {} s waiting for the hello's answer; this is a \
-             liveness failure, not evidence that the gateway admitted an \
-             account it should have refused",
+            "timed out after {} s with no reply to the hello at all. An \
+             admission would have arrived as a HelloAck, so this is not \
+             evidence that the gateway admitted an account it should have \
+             refused; it is silence, which a loaded runner also produces",
             HELLO_LIVENESS_TIMEOUT.as_secs(),
         ),
     }
@@ -300,9 +301,10 @@ async fn an_invalidation_published_mid_session_terminates_the_open_session() {
         Some(GatewayReply::HelloAck { .. }) => {}
         Some(other) => panic!("the session must establish before it can be terminated: {other:?}"),
         None => panic!(
-            "timed out after {} s waiting for the opening HelloAck; this is a \
-             liveness failure, not evidence that the gateway refused a session \
-             it had no reason to refuse",
+            "timed out after {} s with no reply to the hello at all. A refusal \
+             would have arrived as a HelloRefused, so this is not evidence \
+             that the gateway refused a session it had no reason to refuse; \
+             it is silence, which a loaded runner also produces",
             HELLO_LIVENESS_TIMEOUT.as_secs(),
         ),
     }
@@ -325,9 +327,10 @@ async fn an_invalidation_published_mid_session_terminates_the_open_session() {
         }) => {}
         Some(other) => panic!("expected a standing refusal, got {other:?}"),
         None => panic!(
-            "timed out after {} s waiting for the hello's answer; this is a \
-             liveness failure, not evidence that the gateway admitted an \
-             account it should have refused",
+            "timed out after {} s with no reply to the hello at all. An \
+             admission would have arrived as a HelloAck, so this is not \
+             evidence that the gateway admitted an account it should have \
+             refused; it is silence, which a loaded runner also produces",
             HELLO_LIVENESS_TIMEOUT.as_secs(),
         ),
     }
@@ -360,9 +363,10 @@ async fn grace_does_not_admit_an_account_identity_has_invalidated() {
             panic!("established normally before any of this started, got {other:?}")
         }
         None => panic!(
-            "timed out after {} s waiting for the opening HelloAck; this is a \
-             liveness failure, not evidence that the gateway refused a session \
-             it had no reason to refuse",
+            "timed out after {} s with no reply to the hello at all. A refusal \
+             would have arrived as a HelloRefused, so this is not evidence \
+             that the gateway refused a session it had no reason to refuse; \
+             it is silence, which a loaded runner also produces",
             HELLO_LIVENESS_TIMEOUT.as_secs(),
         ),
     }
@@ -383,9 +387,10 @@ async fn grace_does_not_admit_an_account_identity_has_invalidated() {
         }) => {}
         Some(other) => panic!("expected a standing refusal, got {other:?}"),
         None => panic!(
-            "timed out after {} s waiting for the hello's answer; this is a \
-             liveness failure, not evidence that the gateway admitted an \
-             account it should have refused",
+            "timed out after {} s with no reply to the hello at all. An \
+             admission would have arrived as a HelloAck, so this is not \
+             evidence that the gateway admitted an account it should have \
+             refused; it is silence, which a loaded runner also produces",
             HELLO_LIVENESS_TIMEOUT.as_secs(),
         ),
     }
@@ -417,9 +422,10 @@ async fn in_shadow_the_invalidated_account_is_still_admitted_and_counted() {
         Some(GatewayReply::HelloAck { .. }) => {}
         Some(other) => panic!("shadow mode did not admit the invalidated account: {other:?}"),
         None => panic!(
-            "timed out after {} s waiting for the shadow-mode HelloAck; this is \
-             a liveness failure, not evidence that shadow enforcement refused \
-             the account",
+            "timed out after {} s with no reply to the hello at all. A refusal \
+             would have arrived as a HelloRefused, so this is not evidence \
+             that shadow enforcement refused the account; it is silence, which \
+             a loaded runner also produces",
             HELLO_LIVENESS_TIMEOUT.as_secs(),
         ),
     }

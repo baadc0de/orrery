@@ -357,9 +357,10 @@ async fn file(
             // Some other reply overtook the verdict on the wire; keep draining.
             Some(_) => continue,
             None => panic!(
-                "timed out after {} s waiting for the report's verdict; this is \
-                 a liveness failure, not evidence that the gateway answered the \
-                 report with something other than a verdict",
+                "timed out after {} s with no reply to the report at all. Any \
+                 wrong answer would have arrived as a reply, so this is not \
+                 evidence the report was answered wrongly; it is silence, \
+                 which a loaded runner also produces",
                 lanes::LIVENESS_CEILING.as_secs(),
             ),
         }

@@ -158,9 +158,10 @@ async fn present(conn: &lanes::GatewayLanes, bytes: Vec<u8>) -> (Option<u32>, u8
             // Some other reply overtook the ack on the wire; keep draining.
             Some(_) => continue,
             None => panic!(
-                "timed out after {} s waiting for the announcement's \
-                 WitnessEpochAck; this is a liveness failure, not evidence that \
-                 the gateway answered the announcement with something else",
+                "timed out after {} s with no reply to the announcement at \
+                 all. Any wrong answer would have arrived as a reply, so this \
+                 is not evidence the announcement was answered wrongly; it is \
+                 silence, which a loaded runner also produces",
                 lanes::LIVENESS_CEILING.as_secs(),
             ),
         }

@@ -238,9 +238,10 @@ async fn file(
             // Some other reply overtook the verdict on the wire; keep draining.
             Some(_) => continue,
             None => panic!(
-                "timed out after {} s waiting for the report's verdict; this is \
-                 a liveness failure, not evidence that the gateway answered the \
-                 report with something other than a verdict",
+                "timed out after {} s with no reply to the report at all. Any \
+                 wrong answer would have arrived as a reply, so this is not \
+                 evidence the report was answered wrongly; it is silence, \
+                 which a loaded runner also produces",
                 REPLY_LIVENESS_TIMEOUT.as_secs(),
             ),
         }
@@ -371,9 +372,10 @@ async fn a_gateway_with_no_metrics_sink_still_accumulates_every_counter() {
             Some(GatewayReply::Lease { message }) => panic!("claim was not granted: {message:?}"),
             Some(_) => continue,
             None => panic!(
-                "timed out after {} s waiting for an answer to the lease claim; \
-                 this is a liveness failure, not evidence that the lease path \
-                 dropped the claim",
+                "timed out after {} s with no answer to the lease claim. A \
+                 denial would have arrived as a Lease reply, so this is not \
+                 evidence the claim was denied; a dropped claim and a loaded \
+                 runner are both silence and this cannot separate them",
                 REPLY_LIVENESS_TIMEOUT.as_secs(),
             ),
         }
@@ -397,8 +399,10 @@ async fn a_gateway_with_no_metrics_sink_still_accumulates_every_counter() {
             panic!("unexpected reply while awaiting the fenced write's acknowledgement: {other:?}")
         }
         None => panic!(
-            "timed out after {} s waiting for the fenced write's BulkAck; this \
-             is a liveness failure, not evidence that the gateway shed the write",
+            "timed out after {} s with no reply to the fenced write. A nack \
+             would have arrived as a BulkNack, so this is not evidence the \
+             write was refused; a shed write and a loaded runner are both \
+             silence and this cannot tell them apart",
             REPLY_LIVENESS_TIMEOUT.as_secs(),
         ),
     }
@@ -417,8 +421,9 @@ async fn a_gateway_with_no_metrics_sink_still_accumulates_every_counter() {
             panic!("unexpected reply while awaiting the subscribed cell's page: {other:?}")
         }
         None => panic!(
-            "timed out after {} s waiting for the subscribed cell's AreaPage; \
-             this is a liveness failure, not evidence that the subscribe was dropped",
+            "timed out after {} s with no reply to the subscribe. A dropped \
+             subscribe and a loaded runner are both silence, so this reports \
+             only that nothing arrived — it does not establish either",
             REPLY_LIVENESS_TIMEOUT.as_secs(),
         ),
     }
@@ -455,9 +460,10 @@ async fn a_gateway_with_no_metrics_sink_still_accumulates_every_counter() {
              with REASON_NO_EXECUTOR, and was answered {other:?} instead"
         ),
         None => panic!(
-            "timed out after {} s waiting for the intent's ack; this is a \
-             liveness failure, not evidence that the intent went unanswered or \
-             was answered with the wrong outcome",
+            "timed out after {} s with no ack for the intent. A wrong outcome \
+             would have arrived as an IntentAck, so this is not evidence the \
+             intent was answered with the wrong outcome; it is silence, which \
+             a loaded runner also produces",
             REPLY_LIVENESS_TIMEOUT.as_secs(),
         ),
     }
@@ -619,8 +625,9 @@ async fn a_persistd_run_emits_the_two_server_spans_and_never_a_gated_name() {
         Some(GatewayReply::AreaPage { .. }) => {}
         Some(other) => panic!("unexpected reply while awaiting the first page: {other:?}"),
         None => panic!(
-            "timed out after {} s waiting for the hosted root cell's AreaPage; \
-             this is a liveness failure, not evidence that the subscribe was dropped",
+            "timed out after {} s with no reply to the subscribe on the hosted \
+             root cell. A dropped subscribe and a loaded runner are both \
+             silence, so this reports only that nothing arrived",
             REPLY_LIVENESS_TIMEOUT.as_secs(),
         ),
     }
