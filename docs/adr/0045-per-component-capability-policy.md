@@ -304,3 +304,84 @@ the enum it replaces: `W2` is the one dimension that actually forces the
 executor's structure (isolated single-entity replay), whereas a component
 could have been marked `Core` for persistence-priority reasons without
 needing replay semantics at all.
+
+## Consequences
+
+- **What this record actually adds is smaller than its title.** Clause (a)
+  ratifies how the durable layer already names components; clause (b)
+  forbids a practice with zero current instances; clause (c)'s fail-closed
+  zeros generalize two shipped behaviours; four of clause (e)'s rows
+  (IV-3, IV-4, IV-6, IV-8) describe mechanisms that already refuse the
+  combination. The record's real new commitments are the five-dimension
+  declaration shape itself, the IV table as acceptance criteria for R8's
+  registry, clause (f)'s replacement-and-removal sequence, and clause (h)'s
+  predicate change. A reader weighing its cost should weigh those four.
+- **IV-7 is a stated rule with no mechanism.** Until the owner picks one
+  (Open questions, item 1) and it lands, the only thing between an engine
+  handle and the journal is review — demonstrated, not feared (Context §4).
+  The record chooses to say this rather than let the IV table imply
+  enforcement that does not exist.
+- **docs/06 §2 is corrected, not preserved.** The consumer sentence at
+  `docs/06-verifiable-core.md:210` (and the machine-checked claim at `:60`)
+  described wiring that never existed; the rewrite replaces it with clause
+  (c)'s consumer list and clause (f)'s disposition. This is a documentation
+  overwrite, not an amendment to any accepted record's normative text.
+- **R8 inherits a defined admission bar.** The registry's acceptance
+  criteria — refuse undeclared capability (IV-8), refuse invalid
+  combinations (IV-1..IV-6), refuse engine-handle schemas if the owner
+  picks registry-time enforcement (IV-7 option 2) — are fixed here, so
+  manifest formatting cannot silently weaken them.
+- **Three `Ruleset` implementations eventually shrink** by one method each,
+  and the kernel's `CoreClass` enum stops being API input. That is the whole
+  first-party blast radius of clause (f), and it is deferred behind the
+  registry existing and the P4 digest closing.
+
+## Alternatives considered
+
+- **Wire `classify_component` to the promised consumers** (make docs/06 §2
+  true instead of correcting it). Rejected: the enum cannot express the
+  shipped combinations (Context §3, clause (d)), so wiring it would encode
+  the diagonal as law and every off-diagonal component would be misfiled at
+  the moment of wiring.
+- **One flag, or fewer dimensions.** Rejected by the tree, not by taste:
+  four off-diagonal combinations ship today (Context §3). Folding privacy
+  and size caps in as sixth and seventh axes was likewise rejected — no
+  independent consumer exists; they are attributes of N and P until one
+  does (clause (c)).
+- **Byte-scanning payloads for engine handles** as IV-7's enforcement.
+  Rejected as theater: entity bits are indistinguishable from any other
+  `u64` in a payload, so a scanner would alarm on nothing or on everything.
+  The guard must live where the type is still a type — which is exactly why
+  the surviving options are a compile-time bound or registry-time schema
+  refusal (Open questions, item 1; A9 §3).
+- **Keep `CoreClass` as the authored datum and bolt dimensions beside it.**
+  Rejected: two sources of truth for one fact, with the enum's three values
+  guaranteed to drift from the five-dimension rows they summarize. Derived
+  vocabulary (clause (g)) keeps the names and deletes the drift.
+
+## Open questions reserved to the owner
+
+1. **IV-7's enforcement mechanism.** The rule is accepted; the mechanism is
+   deliberately not chosen. Two options, priced:
+   - **Compile-time `EngineHandleFree` bound at replicon registration.**
+     A sealed marker trait implemented for primitives, protocol types, and
+     containers of same — and *not* for `Entity`, `ComponentId`, or any
+     `bevy_ecs` type — required by the payload-registration path, so a
+     component embedding a handle fails at the registration call site at
+     compile time. A9 §3's reasoning is load-bearing: **byte scanning
+     cannot distinguish entity bits from any other `u64`**, so compile time
+     is the only workable enforcement point on the wire path. Whether
+     replicon's registration API admits the bound without forking the
+     vendored copy is **not prototyped — unevidenced either way**.
+   - **Registry-time schema refusal.** The declaration granting P/N/W must
+     declare a schema, and a schema containing engine-handle types is
+     refused at declaration. Depends on R8's registry existing; reaches
+     every capability grant, not only the replicated path.
+   The options are not exclusive. **Until at least one lands, IV-7 is
+   review-held** — and Context §4 shows the review is currently the only
+   thing there.
+2. **The three unused `bevy_reflect` Cargo entries** (Context §2): remove,
+   or keep for vendored-replicon feature unification. Removal was not
+   attempted on this docs-only branch; unevidenced either way.
+3. **When clause (f)'s removal lands.** Post-P4-digest and post-registry by
+   this record; the date is the owner's.
