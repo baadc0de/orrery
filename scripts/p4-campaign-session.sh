@@ -55,6 +55,10 @@
 #   orrery_regolith_client --print-slot-key <peers>          → <slot key>
 #   orrery-invite session-token --issuer-credential issuer.cred \
 #     --account N --node <slot key>                          → session_token=…
+# Or, preferred for a volunteer handoff (the existing argv form below remains
+# compatible with campaign automation): add --join-file volunteer.join.json
+# --host-node <node> --slot 8 --session-id <session_id>, then launch the client
+# with --join volunteer.join.json (and --host-direct when discovery is absent).
 # The session (two processes; peers=8, seconds as desired):
 #   gates/p1-swarm --external-peer --peers 8 --seconds 3600 --min-cells 1 \
 #     --impaired --witness --stamp-wall-clock --json raw.json \

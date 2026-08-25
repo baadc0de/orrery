@@ -34,11 +34,10 @@ fn main() {
         return;
     }
     let smoke_test = has_flag(&args, "--smoke-test");
-    if smoke_test {
-        run_smoke_test();
-        return;
-    }
-    let campaign = has_flag(&args, "--campaign") || args.iter().any(|arg| arg == "--host-node");
+    let campaign = has_flag(&args, "--campaign")
+        || args
+            .iter()
+            .any(|arg| arg == "--host-node" || arg == "--join");
     let consented = has_flag(&args, "--campaign-consent");
     if campaign {
         eprintln!("{CONSENT_NOTICE}");
@@ -46,6 +45,17 @@ fn main() {
             eprintln!("{reason}");
             return;
         }
+    }
+    let campaign_input = match orrery_regolith_client::join::resolve_process_campaign_input(&args) {
+        Ok(input) => input,
+        Err(error) => {
+            eprintln!("{error}");
+            return;
+        }
+    };
+    if smoke_test {
+        run_smoke_test();
+        return;
     }
     let telemetry_path = flag_value(&args, "--telemetry-jsonl")
         .map(PathBuf::from)
@@ -66,15 +76,7 @@ fn main() {
     .add_plugins(OrreryPredictPlugin::default());
 
     let mut skin = RegolithSkinPlugin::new(telemetry_path.clone());
-    if let Some(host_node) = flag_value(&args, "--host-node") {
-        // Joining needs the slot this process occupies: the host derives the
-        // slot's transport key from it and refuses a mismatched dialler, so
-        // there is no safe default to guess.
-        let Some(slot) = flag_value(&args, "--slot").and_then(|value| value.parse::<usize>().ok())
-        else {
-            eprintln!("--host-node needs --slot <n>: the slot derives your transport identity");
-            return;
-        };
+    if let Some(input) = campaign_input {
         // Operator-declared impairment. Shown beside the measurement in the
         // F3 pane and compared against it by the banking row; never
         // substituted for what the link actually did.
@@ -94,14 +96,12 @@ fn main() {
                 .and_then(|value| value.parse::<u64>().ok())
                 .unwrap_or(0),
         };
-        let session_id = flag_value(&args, "--session-id")
-            .unwrap_or_else(|| format!("local-{}", orrery_regolith_client::BUILD_REV));
         skin = skin.with_campaign(CampaignConfig {
-            host_node_hex: host_node,
+            host_node_hex: input.host_node,
             host_direct: flag_value(&args, "--host-direct"),
-            slot,
-            session_id,
-            session_token_hex: flag_value(&args, "--session-token"),
+            slot: input.slot,
+            session_id: input.session_id,
+            session_token_hex: input.session_token,
             wall_start_utc: orrery_regolith_client::campaign::utc_now_iso8601(),
             configured,
         });

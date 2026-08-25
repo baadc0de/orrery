@@ -30,3 +30,4 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"
 # `u32` out of one needs `RngCore` in scope. Already in this client's lock as
 # a transitive dependency of `orrery_core`.
 rand_core = "0.9"
+tempfile = "3"

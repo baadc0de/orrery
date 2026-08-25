@@ -2502,6 +2502,7 @@ dependencies = [
  "postcard",
  "rand_chacha",
  "serde",
+ "serde_json",
  "sha2 0.10.9",
 ]
 
