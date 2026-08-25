@@ -832,8 +832,8 @@ pub fn upload_finished_session(
             return;
         }
     };
-    let body = match build_upload_body(&record.session_id, vec![row], telemetry) {
-        Ok(body) => body,
+    let upload = match build_upload_body(vec![row], telemetry) {
+        Ok(upload) => upload,
         Err(error) => {
             error!("campaign upload not attempted: {error}");
             return;
@@ -843,8 +843,8 @@ pub fn upload_finished_session(
         .state_path
         .parent()
         .unwrap_or_else(|| Path::new("."));
-    let body_path = directory.join(format!("upload-{}.json", record.session_id));
-    if let Err(error) = durable_write(&body_path, &body) {
+    let body_path = directory.join(format!("upload-{}.json", upload.session_id));
+    if let Err(error) = durable_write(&body_path, &upload.body) {
         error!(
             "campaign upload not attempted: cannot preserve {}: {error}; records remain at {}",
             body_path.display(),
@@ -854,7 +854,7 @@ pub fn upload_finished_session(
     }
     let mut state = read_upload_state(&manager.state_path);
     state.sessions.insert(
-        record.session_id.clone(),
+        upload.session_id.clone(),
         UploadEntry {
             origin: manager.origin.clone(),
             body_path: body_path.clone(),
@@ -868,15 +868,15 @@ pub fn upload_finished_session(
         );
         return;
     }
-    match post_upload(&manager.origin, &record.session_id, &body) {
+    match post_upload(&manager.origin, &upload.session_id, &upload.body) {
         Ok(()) => {
-            if let Some(entry) = state.sessions.get_mut(&record.session_id) {
+            if let Some(entry) = state.sessions.get_mut(&upload.session_id) {
                 entry.acknowledged = true;
             }
             if let Err(error) = write_upload_state(&manager.state_path, &state) {
                 error!("upload succeeded but acknowledgement state could not be saved: {error}");
             } else {
-                info!("campaign session {} uploaded", record.session_id);
+                info!("campaign session {} uploaded", upload.session_id);
             }
         }
         Err(error) => error!(
@@ -886,22 +886,36 @@ pub fn upload_finished_session(
     }
 }
 
+struct UploadBody {
+    session_id: String,
+    body: Vec<u8>,
+}
+
 fn build_upload_body(
-    session_id: &str,
     rows: Vec<serde_json::Value>,
     telemetry_jsonl: String,
-) -> Result<Vec<u8>, String> {
+) -> Result<UploadBody, String> {
+    let session_id = rows
+        .first()
+        .and_then(|row| row.get("session_id"))
+        .and_then(serde_json::Value::as_str)
+        .filter(|session_id| !session_id.is_empty())
+        .ok_or_else(|| "an upload must contain a row with a non-empty session id".to_owned())?;
     if rows
         .iter()
         .any(|row| row.get("session_id").and_then(serde_json::Value::as_str) != Some(session_id))
     {
         return Err("every upload row must name its own session id".to_owned());
     }
-    serde_json::to_vec(&serde_json::json!({
+    let body = serde_json::to_vec(&serde_json::json!({
         "records": rows,
         "telemetry_jsonl": telemetry_jsonl,
     }))
-    .map_err(|error| error.to_string())
+    .map_err(|error| error.to_string())?;
+    Ok(UploadBody {
+        session_id: session_id.to_owned(),
+        body,
+    })
 }
 
 fn post_upload(origin: &str, session_id: &str, body: &[u8]) -> Result<(), String> {
@@ -1044,22 +1058,28 @@ mod tests {
     }
 
     #[test]
-    fn upload_body_names_only_its_own_session() {
+    fn upload_body_derives_a_single_non_empty_session_id_from_its_rows() {
         let own = "01917f0e-2b9a-7c4d-8f21-6a0b3c9d1e2f";
-        let body = build_upload_body(
-            own,
+        let upload = build_upload_body(
             vec![serde_json::json!({"session_id": own, "actor": "human"})],
             "telemetry\n".to_owned(),
         )
         .expect("matching row builds");
-        let decoded: serde_json::Value = serde_json::from_slice(&body).expect("upload JSON");
+        assert_eq!(upload.session_id, own);
+        let decoded: serde_json::Value = serde_json::from_slice(&upload.body).expect("upload JSON");
         assert_eq!(decoded["records"][0]["session_id"], own);
         assert!(build_upload_body(
-            own,
-            vec![serde_json::json!({"session_id": "another-session"})],
+            vec![
+                serde_json::json!({"session_id": own}),
+                serde_json::json!({"session_id": "another-session"}),
+            ],
             String::new(),
         )
         .is_err());
+        assert!(build_upload_body(Vec::new(), String::new()).is_err());
+        assert!(
+            build_upload_body(vec![serde_json::json!({"session_id": ""})], String::new(),).is_err()
+        );
     }
 
     #[test]
