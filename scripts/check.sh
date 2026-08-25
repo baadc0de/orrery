@@ -269,6 +269,17 @@ lane_gates() {
     # docs/06-verifiable-core.md §8's static gates.
     run scripts/core-gates.sh
 
+    # The clause-link shape check, both halves. ADR-0046 shipped six
+    # `[D43](f)`s — a reference-style id with the clause letter glued into
+    # what Markdown parses as an inline link destination — after twenty of
+    # the same shape had been repaired out of ADR-0049 before merge. The bare
+    # invocation scans `docs/` (milliseconds; grep over ~85 files); its
+    # self-test runs the same scanner against fixture forests where eight
+    # planted defects must fire by name and a good forest — repaired forms,
+    # real paths, anchors, refdefs, code spans, fences — must stay clean.
+    run scripts/docs-clause-links.sh
+    run scripts/docs-clause-links.sh --self-test
+
     # The phase harnesses need FoundationDB and/or multiple real processes, so
     # the real runs are nightly. Their `--self-test` modes are the per-commit
     # half: they assert the scripts still contain the stages that make them
