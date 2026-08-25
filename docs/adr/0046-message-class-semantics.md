@@ -308,3 +308,95 @@ Nothing in sub-clauses (1)–(2) exists in code today; unlike clauses (a)–(d),
 normative-forward: implementation is post-P4 work, it widens canonical
 state, and it lands under the same cost accounting [D43] recorded for its
 flag (Consequences below).
+
+## Consequences
+
+- **What this record actually adds is smaller than its title**, in the house
+  manner of [D42]'s consequences. Clauses (a)–(d) ratify semantics the tree
+  already exhibits — one channel, position-keyed identity, seam-side dedup,
+  delivered-first composition — and change no code; their value is the
+  change of status from accident to law. Clause (e) is the only genuinely
+  new surface, and even it is dormant until implemented: nothing enforces a
+  cap today, and no shipped ruleset approaches one.
+- **Delivered-first is now expensive to change, on purpose.** Reordering the
+  input composition is a rules change: `RulesetId.version` bump, regenerated
+  goldens, and a compatibility break with every log recorded under the old
+  order. The golden's failure text already prescribes this
+  (`battery.rs:239`); the clause makes the prescription law.
+- **The emission-overflow field widens canonical state** when implemented:
+  a `SchemaVersion` bump under [D38]'s versioning, a `projection_version`
+  bump under R7's WP-6 if the framing moves, and one more discrete field
+  every claim commits to — the same three-line bill [D43] recorded for the
+  arithmetic flag, paid a second time because the field is deliberately not
+  shared (clause (e)(2)).
+- **A flagged entity is not a determinism failure.** Two honest hosts both
+  flag it and both hash identically; the flag is overflow made visible and
+  attributable in witnessed state. What standing or gameplay consequence
+  follows a flagged tick is rules-design work outside this record — as it
+  is for [D43]'s flag.
+- **No canonical error path exists, still.** Future proposals that want a
+  step to fail must now argue against a record, not merely against an
+  absence.
+- **The one-tick latency of the collapse is permanent law**, not an
+  implementation detail a module system may later optimize away with an
+  immediate channel; clause (a) forecloses that door deliberately, and
+  reopening it means reopening this record.
+- **Coverage debts are inherited, named, and unpaid.** The clauses of this
+  record are held by: goldens for composition order and routing targets
+  (M-R5-1 here; A6 M-A6-3), goldens-only for log-order fidelity (A6
+  M-A6-2), and **no named check** for the witness shown-ticks re-delivery
+  immunity (A6 M-A6-4a, the #417-class inventory). A reader auditing
+  enforcement should read those mutation entries, not assume unit coverage.
+
+## Alternatives considered
+
+- **A distinct internal-command channel** (immediate, or separately logged).
+  Rejected in clause (a): the immediate form is A4's banned T7 cascade; the
+  deferred form is three new bit-identical artifacts for a distinction
+  nothing consumes. A6 §12.1 keeps the door ajar only for *syntax* — a
+  type-level command/report wrapper at the source module, one enum, no
+  mechanical change — and that is not a channel.
+- **Content-based dedup of commands or events.** Rejected in clause (b):
+  it silently breaks rules that legally repeat, and under collisions it is
+  nondeterministic. Position-keyed identity costs nothing and survives
+  replay by construction.
+- **Player-first (or interleaved) input composition.** Any fixed order
+  satisfies VC-2; delivered-first is ratified because it ships and one
+  committed golden already depends on it (M-R5-1). Choosing differently now
+  would itself cost the `RulesetId` bump the clause warns about, for no
+  benefit.
+- **C-2 fail-loud: a canonical error path for emission overflow.** A6's
+  other posture; deterministic, honest, and **rejected by the owner**. It
+  would create the tree's first way for a step to fail, hand volume-provoked
+  aborts to attackers, and — the [D43] parallel — take the tick down to
+  report a condition the flag reports while the simulation keeps running.
+- **Silent deterministic truncation (cap without flag).** Rejected: A6 §9's
+  own warning — truncation is deterministic and therefore invisible; both
+  sides of every comparison truncate identically, so no hash, golden, or
+  witness ever notices the rule that lost half its emissions.
+- **A flag outside the hashed projection** (log line, metric, side table).
+  Rejected for [D43](f)(3)'s reason, unchanged: divergence with matching
+  hashes is invisible, so the flag proves nothing exactly when it matters.
+- **No cap (status quo).** Rejected: deterministic runaway is still
+  runaway — memory and delivery queues grow identically on authority and
+  replayer, so the failure mode is resource exhaustion with a clean audit
+  trail. The external seam already refuses this shape at admission
+  (`MAX_OPS_PER_INTENT`); the internal seam gets the mirror.
+- **Sharing [D43]'s arithmetic-overflow field.** Rejected in clause (e)(2):
+  same placement law, different occurrence class and author; one
+  undifferentiated bit makes flags unattributable. Sharing a container word
+  remains implementation's choice.
+
+## Open questions reserved to the owner
+
+1. **The constants** (a11 OD-28): `MAX_EVENTS_PER_STEP`'s value (default 64
+   proposed) and the derived delivery-queue bound. Owner tightens or
+   loosens; storage lands with R8's registry; implementation of clause (e)
+   blocks on the value the way [D43](f) blocks on (f)(4).
+2. **Internal-command syntax** (A6 §12.1): whether a future module system
+   adds a type-level command/report wrapper at the source. Mechanically
+   free; reopening costs one enum wrapper, not this record.
+3. **Flag width** — dropped-event saturating counter versus occurrence bit —
+   is implementation's choice within clause (e)(2)'s location-and-
+   distinctness law, flagged here only so nobody mistakes it for a decided
+   detail.
