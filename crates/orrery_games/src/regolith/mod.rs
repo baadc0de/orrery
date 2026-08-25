@@ -78,7 +78,7 @@ const _: () = assert!(
 );
 /// Visibility-transition claims are capped at four per second.
 pub const COVER_CLAIM_INTERVAL_TICKS: u16 = (TICK_HZ / 4) as u16;
-/// Two reads per claim, with headroom for transversal variants approved by #390.
+/// Visibility plus collision can read at most three distinct recorded frames.
 pub const MAX_NEIGHBOR_READS: usize = 4;
 /// Claims arrive at 2 Hz; one missed claim is tolerated before refusing a frame.
 pub const MAX_NEIGHBOR_STALENESS_TICKS: u64 = TICK_HZ as u64;
@@ -87,10 +87,10 @@ pub const OCCLUSION_MARGIN_MM: i64 = 20;
 const REFERENCE_SIGNATURE_RADIUS_MM: u128 = 3_000;
 const CHANCE_SCALE: u128 = 1_000_000;
 
-/// Regolith v11's rules identity: locking is sustained state and firing is an action.
+/// Regolith v12's rules identity: recorded-frame collisions and drifting blooms.
 pub const REGOLITH_RULESET: RulesetId = RulesetId {
-    version: 11,
-    digest: [0x65; 32],
+    version: 12,
+    digest: [0x66; 32],
 };
 
 /// Component classifications.
@@ -166,8 +166,8 @@ impl Ruleset for Regolith {
         rng: &mut TickRng,
     ) -> StepOutput<Outcome> {
         let me = view.entity();
-        let visibility = visibility::verify_claim(view, inputs);
-        let (mut state, events) = match view.own().clone() {
+        let claims = visibility::verify_claims(view, inputs);
+        let (mut state, mut events) = match view.own().clone() {
             RegolithState::Craft(craft) => {
                 let (craft, events) = self.step_craft(me, craft, inputs, rng);
                 (RegolithState::Craft(craft), events)
@@ -186,13 +186,37 @@ impl Ruleset for Regolith {
             }
         };
         if let (Some(Outcome::LockVisibility { occluded, .. }), RegolithState::Craft(craft)) =
-            (&visibility, &mut state)
+            (&claims.visibility, &mut state)
         {
             craft.last_cover_occluded = *occluded;
         }
+        if let Some(collision) = claims.collision {
+            match &mut state {
+                RegolithState::Craft(craft) => {
+                    craft.vel = collision.own_velocity;
+                    craft.collisions = craft.collisions.saturating_add(1);
+                }
+                RegolithState::Rock(_)
+                | RegolithState::Pickup(_)
+                | RegolithState::BloomDirector(_) => {
+                    unreachable!("only a craft may submit a collision claim")
+                }
+            }
+            events.push(Outcome::Collision {
+                collider: me,
+                target: collision.other,
+                target_velocity: collision.target_velocity,
+            });
+        }
+        if claims.arithmetic_overflowed {
+            match &mut state {
+                RegolithState::Craft(craft) => craft.arithmetic_overflowed = true,
+                RegolithState::Rock(rock) => rock.arithmetic_overflowed = true,
+                RegolithState::Pickup(_) | RegolithState::BloomDirector(_) => {}
+            }
+        }
         *view.own_mut() = state;
-        let mut events = events;
-        events.extend(visibility);
+        events.extend(claims.visibility);
         StepOutput { events }
     }
     fn materialize(&self, event: &Outcome, out: &mut Vec<EntityMaterialization<RegolithState>>) {
@@ -275,6 +299,7 @@ impl Regolith {
             (own.respawn_in, own.score_rock_points, own.kills);
         let (mut lock_target, mut lock_progress, mut locks_acquired) =
             (own.lock_target, own.lock_progress, own.locks_acquired);
+        let mut collisions = own.collisions;
         let mut lock_decay_progress = own.lock_decay_progress;
         let mut cover_claim_cooldown = own.cover_claim_cooldown.saturating_sub(1);
         if lock_decay_progress > 0 {
@@ -503,6 +528,14 @@ impl Regolith {
                         }
                     }
                 }
+                Order::CollisionResolved { from: _, velocity } => {
+                    if velocity_within_limit(*velocity, limits.max_speed_mms) {
+                        vx = velocity.x as f64 / 1_000.0;
+                        vy = velocity.y as f64 / 1_000.0;
+                        vz = velocity.z as f64 / 1_000.0;
+                        collisions = collisions.saturating_add(1);
+                    }
+                }
                 Order::ClaimCover { .. } => {
                     if cover_claim_cooldown == 0 {
                         cover_claim_cooldown = COVER_CLAIM_INTERVAL_TICKS;
@@ -510,7 +543,8 @@ impl Regolith {
                 }
                 Order::GrabAttempt { .. }
                 | Order::BloomPopulationChanged { .. }
-                | Order::ShotResolved { .. } => {}
+                | Order::ShotResolved { .. }
+                | Order::Collide { .. } => {}
             }
         }
         let speed = libm::sqrt(vx * vx + vy * vy + vz * vz);
@@ -572,6 +606,7 @@ impl Regolith {
             locks_acquired,
             lock_decay_progress,
             cover_claim_cooldown,
+            collisions,
             ..own
         };
         (next, events)
@@ -588,18 +623,17 @@ impl Regolith {
         let mut killer = None;
         if rock.hull > 0 {
             for order in inputs.iter() {
-                if let Order::Damage {
-                    amount,
-                    from,
-                    from_pos,
-                    from_vel,
-                    from_yaw_urad,
-                    from_archetype,
-                    from_weapon,
-                    flight_ticks,
-                } = order
-                {
-                    match projectile_resolution(
+                match order {
+                    Order::Damage {
+                        amount,
+                        from,
+                        from_pos,
+                        from_vel,
+                        from_yaw_urad,
+                        from_archetype,
+                        from_weapon,
+                        flight_ticks,
+                    } => match projectile_resolution(
                         origin,
                         rock.vel,
                         rock.tier.limits().radius_mm,
@@ -657,7 +691,14 @@ impl Regolith {
                                 result: ShotResult::Miss,
                             });
                         }
+                    },
+                    Order::CollisionResolved { from: _, velocity }
+                        if velocity_within_limit(*velocity, rock.tier.limits().max_speed_mms) =>
+                    {
+                        rock.vel = *velocity;
+                        rock.collisions = rock.collisions.saturating_add(1);
                     }
+                    _ => {}
                 }
             }
             if rock.hull == 0 {
@@ -724,17 +765,29 @@ impl Regolith {
             }
         }
         if rock.hull > 0 {
-            rock.pos.x = rock.pos.x.saturating_add(rock.vel.x / i64::from(TICK_HZ));
-            rock.pos.y = rock.pos.y.saturating_add(rock.vel.y / i64::from(TICK_HZ));
-            rock.pos.z = rock.pos.z.saturating_add(rock.vel.z / i64::from(TICK_HZ));
-            if rock.pos.x.abs() > ISLAND_BOUNDARY_MM {
-                rock.vel.x = rock.vel.x.saturating_neg();
+            rock.pos.x = flagged_add(
+                rock.pos.x,
+                rock.vel.x / i64::from(TICK_HZ),
+                &mut rock.arithmetic_overflowed,
+            );
+            rock.pos.y = flagged_add(
+                rock.pos.y,
+                rock.vel.y / i64::from(TICK_HZ),
+                &mut rock.arithmetic_overflowed,
+            );
+            rock.pos.z = flagged_add(
+                rock.pos.z,
+                rock.vel.z / i64::from(TICK_HZ),
+                &mut rock.arithmetic_overflowed,
+            );
+            if rock.pos.x.unsigned_abs() > ISLAND_BOUNDARY_MM as u64 {
+                rock.vel.x = flagged_neg(rock.vel.x, &mut rock.arithmetic_overflowed);
             }
-            if rock.pos.y.abs() > ISLAND_BOUNDARY_MM {
-                rock.vel.y = rock.vel.y.saturating_neg();
+            if rock.pos.y.unsigned_abs() > ISLAND_BOUNDARY_MM as u64 {
+                rock.vel.y = flagged_neg(rock.vel.y, &mut rock.arithmetic_overflowed);
             }
-            if rock.pos.z.abs() > ISLAND_BOUNDARY_MM {
-                rock.vel.z = rock.vel.z.saturating_neg();
+            if rock.pos.z.unsigned_abs() > ISLAND_BOUNDARY_MM as u64 {
+                rock.vel.z = flagged_neg(rock.vel.z, &mut rock.arithmetic_overflowed);
             }
         }
         (rock, events)
@@ -820,7 +873,7 @@ impl Regolith {
             let site_pos = draw_bloom_site(rng);
             let active_until = director.clock_tick.saturating_add(BLOOM_LIFETIME_TICKS);
             let rocks = Box::new(core::array::from_fn(|slot| {
-                bloom_spec(me, bloom_index, slot, site_pos)
+                bloom_spec(me, bloom_index, slot, site_pos, rng)
             }));
             events.push(Outcome::BloomSeeded {
                 director: me,
@@ -1052,7 +1105,15 @@ fn sum_squares(values: [i128; 3]) -> u128 {
     })
 }
 
-fn integer_sqrt(value: u128) -> u128 {
+fn velocity_within_limit(velocity: QVel, max_speed_mms: i64) -> bool {
+    let speed_sq = [velocity.x, velocity.y, velocity.z]
+        .into_iter()
+        .map(|value| i128::from(value).unsigned_abs().pow(2))
+        .sum::<u128>();
+    speed_sq <= square_i64(max_speed_mms)
+}
+
+pub(crate) fn integer_sqrt(value: u128) -> u128 {
     if value < 2 {
         return value;
     }
@@ -1156,7 +1217,13 @@ fn child_spec(
         bloom: rock.bloom,
     }
 }
-fn bloom_spec(director: PersistId, bloom_index: u32, slot: usize, site_pos: QPos) -> ChildSpec {
+fn bloom_spec(
+    director: PersistId,
+    bloom_index: u32,
+    slot: usize,
+    site_pos: QPos,
+    rng: &mut TickRng,
+) -> ChildSpec {
     let tier = match slot {
         0..=1 => RockTier::Large,
         2..=4 => RockTier::Medium,
@@ -1167,12 +1234,50 @@ fn bloom_spec(director: PersistId, bloom_index: u32, slot: usize, site_pos: QPos
         id: bloom_rock_id(director, bloom_index, slot),
         tier,
         pos: site_pos,
-        vel: QVel::default(),
+        vel: bloom_velocity(tier, rng),
         bloom: Some(BloomMembership {
             director,
             bloom_index,
         }),
     }
+}
+fn bloom_velocity(tier: RockTier, rng: &mut TickRng) -> QVel {
+    // Eight planar directions in fixed-point /1024. The diagonal coefficient
+    // is round(1024 / sqrt(2)); no float enters the rules predicate or state.
+    const DIRECTIONS: [(i64, i64); 8] = [
+        (1_024, 0),
+        (724, 724),
+        (0, 1_024),
+        (-724, 724),
+        (-1_024, 0),
+        (-724, -724),
+        (0, -1_024),
+        (724, -724),
+    ];
+    let limits = tier.limits();
+    let floor = limits.max_speed_mms / 4;
+    let width = u32::try_from(limits.max_speed_mms / 4).unwrap_or(1).max(1);
+    let speed = floor.saturating_add(i64::from(uniform_below(rng, width)));
+    let direction = DIRECTIONS[uniform_below(rng, DIRECTIONS.len() as u32) as usize];
+    QVel {
+        x: speed.saturating_mul(direction.0) / 1_024,
+        y: 0,
+        z: speed.saturating_mul(direction.1) / 1_024,
+    }
+}
+
+fn flagged_add(left: i64, right: i64, overflowed: &mut bool) -> i64 {
+    left.checked_add(right).unwrap_or_else(|| {
+        *overflowed = true;
+        left.saturating_add(right)
+    })
+}
+
+fn flagged_neg(value: i64, overflowed: &mut bool) -> i64 {
+    value.checked_neg().unwrap_or_else(|| {
+        *overflowed = true;
+        value.saturating_neg()
+    })
 }
 fn bloom_rock_id(director: PersistId, bloom_index: u32, slot: u8) -> PersistId {
     let mut hasher = blake3::Hasher::new();
@@ -1336,6 +1441,17 @@ impl Game for Regolith {
                 Order::LockVisibility {
                     target: *target,
                     occluded: *occluded,
+                },
+            )),
+            Outcome::Collision {
+                collider,
+                target,
+                target_velocity,
+            } => Some((
+                *target,
+                Order::CollisionResolved {
+                    from: *collider,
+                    velocity: *target_velocity,
                 },
             )),
             Outcome::Split { .. }

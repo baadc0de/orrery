@@ -68,6 +68,139 @@ fn rock_position_integrates_velocity_on_all_axes_each_tick() {
     }
 }
 
+#[test]
+fn ship_striking_a_rock_produces_a_recorded_adjudicated_collision() {
+    let ship_id = PersistId::new(1);
+    let rock_id = PersistId::new(2);
+    let mut ship = craft_at(0);
+    ship.vel = QVel {
+        x: 60_000,
+        y: 0,
+        z: 0,
+    };
+    let rock = Rock::spawned(
+        RockTier::Small,
+        0,
+        QPos {
+            x: 10_000,
+            y: 0,
+            z: 0,
+        },
+        QVel::default(),
+    );
+    let game = Regolith::honest();
+    let mut executor = Executor::new(game, UniverseSeed([0xC4; 32]));
+    executor.insert(ship_id, RegolithState::Craft(ship));
+    executor.insert(rock_id, RegolithState::Rock(rock));
+
+    let resolved = executor
+        .step_entity(ship_id, Tick::new(1), &[Order::Collide { other: rock_id }])
+        .expect("ship exists");
+    assert_eq!(resolved.neighbor_reads, [rock_id]);
+    let collision = resolved
+        .events
+        .iter()
+        .find(|event| matches!(event, Outcome::Collision { .. }))
+        .expect("overlapping approaching bodies resolve");
+    assert_eq!(
+        Outcome::decode(&collision.to_canonical()).unwrap(),
+        *collision
+    );
+    let (target, delivered) = game.deliver(collision).expect("collision routes to rock");
+    assert_eq!(target, rock_id);
+    assert_eq!(Order::decode(&delivered.to_canonical()).unwrap(), delivered);
+    executor
+        .step_entity(rock_id, Tick::new(2), &[delivered])
+        .expect("rock applies its own collision result");
+
+    assert!(matches!(
+        executor.state(ship_id),
+        Some(RegolithState::Craft(Craft { collisions: 1, .. }))
+    ));
+    assert!(matches!(
+        executor.state(rock_id),
+        Some(RegolithState::Rock(Rock { collisions: 1, .. }))
+    ));
+}
+
+#[test]
+fn two_ships_striking_each_other_resolve_once_by_stable_id() {
+    let lower = PersistId::new(10);
+    let higher = PersistId::new(11);
+    let mut left = craft_at(0);
+    left.vel.x = 60_000;
+    let mut right = craft_at(5_000);
+    right.vel.x = -60_000;
+    let game = Regolith::honest();
+    let mut executor = Executor::new(game, UniverseSeed([0xC5; 32]));
+    executor.insert(lower, RegolithState::Craft(left));
+    executor.insert(higher, RegolithState::Craft(right));
+
+    let duplicate = executor
+        .step_entity(higher, Tick::new(1), &[Order::Collide { other: lower }])
+        .expect("higher-id ship exists");
+    assert!(
+        duplicate.events.is_empty(),
+        "higher id cannot resolve the pair"
+    );
+
+    let resolved = executor
+        .step_entity(lower, Tick::new(1), &[Order::Collide { other: higher }])
+        .expect("lower-id ship exists");
+    let collision = resolved
+        .events
+        .iter()
+        .find(|event| matches!(event, Outcome::Collision { .. }))
+        .expect("lower id resolves the pair");
+    let (_, delivered) = game.deliver(collision).expect("collision routes");
+    executor
+        .step_entity(higher, Tick::new(2), &[delivered])
+        .expect("higher-id ship applies its own result");
+
+    assert!(matches!(
+        executor.state(lower),
+        Some(RegolithState::Craft(Craft { collisions: 1, .. }))
+    ));
+    assert!(matches!(
+        executor.state(higher),
+        Some(RegolithState::Craft(Craft { collisions: 1, .. }))
+    ));
+}
+
+#[test]
+fn collision_beyond_contact_range_is_rejected() {
+    let ship_id = PersistId::new(20);
+    let rock_id = PersistId::new(21);
+    let mut ship = craft_at(0);
+    ship.vel.x = 60_000;
+    let rock = Rock::spawned(
+        RockTier::Small,
+        0,
+        QPos {
+            x: 20_000,
+            y: 0,
+            z: 0,
+        },
+        QVel::default(),
+    );
+    let mut executor = Executor::new(Regolith::honest(), UniverseSeed([0xC6; 32]));
+    executor.insert(ship_id, RegolithState::Craft(ship));
+    executor.insert(rock_id, RegolithState::Rock(rock));
+
+    let rejected = executor
+        .step_entity(ship_id, Tick::new(1), &[Order::Collide { other: rock_id }])
+        .expect("ship exists");
+    assert_eq!(rejected.neighbor_reads, [rock_id]);
+    assert!(
+        rejected.events.is_empty(),
+        "the overlap predicate must reject separated bodies"
+    );
+    assert!(matches!(
+        executor.state(ship_id),
+        Some(RegolithState::Craft(Craft { collisions: 0, .. }))
+    ));
+}
+
 fn sample<'a>(
     previous: Option<&'a RegolithState>,
     current: &'a RegolithState,
@@ -82,8 +215,8 @@ fn sample<'a>(
 }
 
 #[test]
-fn v11_weapon_table_ruleset_identity_and_island_budget_are_pinned() {
-    assert_eq!(REGOLITH_RULESET.version, 11);
+fn v12_collision_ruleset_identity_and_island_budget_are_pinned() {
+    assert_eq!(REGOLITH_RULESET.version, 12);
     assert_eq!(WeaponKind::Stock.weapon().damage_base, 10);
     assert_eq!(WeaponKind::Volley.weapon().rolls, 3);
     assert_eq!(WeaponKind::Stock.weapon().optimal_mm, 300_000);
@@ -230,6 +363,15 @@ fn bloom_director_replays_in_isolation_without_neighbor_reads() {
         ]
     );
     for rock in rocks.iter() {
+        assert_ne!(rock.vel, QVel::default(), "bloom rocks must visibly drift");
+        let speed_sq = [rock.vel.x, rock.vel.y, rock.vel.z]
+            .into_iter()
+            .map(|value| i128::from(value).pow(2))
+            .sum::<i128>();
+        assert!(
+            speed_sq <= i128::from(rock.tier.limits().max_speed_mms).pow(2),
+            "bloom velocity stays inside its tier ceiling"
+        );
         assert!(matches!(
             populated_executor.state(rock.id),
             Some(RegolithState::Rock(Rock {

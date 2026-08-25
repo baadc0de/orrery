@@ -211,6 +211,18 @@ pub enum Order {
         /// Whether the named rock currently occludes the segment.
         occluded: bool,
     },
+    /// Ask this ship to verify contact with one recorded neighbour.
+    Collide {
+        /// Candidate rock or ship.
+        other: PersistId,
+    },
+    /// A verified collision's target velocity, delivered on the next tick.
+    CollisionResolved {
+        /// Ship that verified and resolved the pair.
+        from: PersistId,
+        /// Resolver-computed velocity for this body.
+        velocity: QVel,
+    },
 }
 
 impl CoreCodec for Order {
@@ -297,6 +309,15 @@ impl CoreCodec for Order {
                 out.extend_from_slice(&target.0.to_le_bytes());
                 out.push(u8::from(*occluded));
             }
+            Self::Collide { other } => {
+                out.push(15);
+                out.extend_from_slice(&other.0.to_le_bytes());
+            }
+            Self::CollisionResolved { from, velocity } => {
+                out.push(16);
+                out.extend_from_slice(&from.0.to_le_bytes());
+                encode_vel(*velocity, out);
+            }
         }
     }
     fn decode(bytes: &[u8]) -> Result<Self, CodecError> {
@@ -356,6 +377,13 @@ impl CoreCodec for Order {
             (13, 9) if rest[8] <= 1 => Ok(Self::LockVisibility {
                 target: PersistId::new(u64::from_le_bytes(rest[0..8].try_into().unwrap())),
                 occluded: rest[8] == 1,
+            }),
+            (15, 8) => Ok(Self::Collide {
+                other: PersistId::new(u64::from_le_bytes(rest.try_into().unwrap())),
+            }),
+            (16, 32) => Ok(Self::CollisionResolved {
+                from: PersistId::new(u64::from_le_bytes(rest[0..8].try_into().unwrap())),
+                velocity: decode_vel(&rest[8..32]),
             }),
             _ => Err(CodecError("regolith order: bad tag or length")),
         }
@@ -499,6 +527,15 @@ pub enum Outcome {
         target: PersistId,
         /// Whether the named rock currently occludes the segment.
         occluded: bool,
+    },
+    /// A ship verified contact and computed the pair's post-collision velocities.
+    Collision {
+        /// Resolving ship.
+        collider: PersistId,
+        /// Other body receiving the delayed half of the resolution.
+        target: PersistId,
+        /// Resolver-computed target velocity.
+        target_velocity: QVel,
     },
 }
 
@@ -690,6 +727,16 @@ impl CoreCodec for Outcome {
                 out.extend_from_slice(&target.0.to_le_bytes());
                 out.push(u8::from(*occluded));
             }
+            Self::Collision {
+                collider,
+                target,
+                target_velocity,
+            } => {
+                out.push(15);
+                out.extend_from_slice(&collider.0.to_le_bytes());
+                out.extend_from_slice(&target.0.to_le_bytes());
+                encode_vel(*target_velocity, out);
+            }
         }
     }
     fn decode(bytes: &[u8]) -> Result<Self, CodecError> {
@@ -779,6 +826,11 @@ impl CoreCodec for Outcome {
                 locker: PersistId::new(u64::from_le_bytes(rest[0..8].try_into().unwrap())),
                 target: PersistId::new(u64::from_le_bytes(rest[8..16].try_into().unwrap())),
                 occluded: rest[16] == 1,
+            }),
+            (15, 40) => Ok(Self::Collision {
+                collider: PersistId::new(u64::from_le_bytes(rest[0..8].try_into().unwrap())),
+                target: PersistId::new(u64::from_le_bytes(rest[8..16].try_into().unwrap())),
+                target_velocity: decode_vel(&rest[16..40]),
             }),
             (14, 9) => Ok(Self::ShotRefused {
                 attacker: PersistId::new(u64::from_le_bytes(rest[0..8].try_into().unwrap())),

@@ -69,6 +69,8 @@ pub struct Limits {
     pub max_shield: i32,
     /// Collision radius, millimetres, for the later rock resolver.
     pub radius_mm: i64,
+    /// Relative collision mass. Only ratios between bodies are meaningful.
+    pub mass_units: i64,
 }
 
 impl Archetype {
@@ -94,6 +96,7 @@ impl Archetype {
                 max_hull: 100,
                 max_shield: 50,
                 radius_mm: 3_000,
+                mass_units: 1,
             },
             Self::Cruiser => Limits {
                 max_speed_mms: 60_000,
@@ -101,6 +104,7 @@ impl Archetype {
                 max_hull: 300,
                 max_shield: 150,
                 radius_mm: 6_000,
+                mass_units: 4,
             },
         }
     }

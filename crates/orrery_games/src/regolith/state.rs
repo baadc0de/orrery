@@ -60,6 +60,10 @@ pub struct Craft {
     pub cover_claim_cooldown: u16,
     /// Result of the last verified cover claim, retained in hashed own state.
     pub last_cover_occluded: bool,
+    /// Verified collisions applied to this craft, ever.
+    pub collisions: u32,
+    /// Canonical arithmetic overflow has occurred in this entity's rules.
+    pub arithmetic_overflowed: bool,
 }
 
 /// A rock's published tier. Its limits are derived from this hashed value,
@@ -85,6 +89,8 @@ pub struct RockLimits {
     pub points: u8,
     /// Velocity ceiling, in millimetres per second.
     pub max_speed_mms: i64,
+    /// Relative collision mass. Only ratios between bodies are meaningful.
+    pub mass_units: i64,
 }
 
 impl RockTier {
@@ -97,18 +103,21 @@ impl RockTier {
                 max_hull: 40,
                 points: 4,
                 max_speed_mms: 40_000,
+                mass_units: 16,
             },
             Self::Medium => RockLimits {
                 radius_mm: 20_000,
                 max_hull: 15,
                 points: 2,
                 max_speed_mms: 56_000,
+                mass_units: 8,
             },
             Self::Small => RockLimits {
                 radius_mm: 8_000,
                 max_hull: 5,
                 points: 1,
                 max_speed_mms: 78_400,
+                mass_units: 2,
             },
         }
     }
@@ -171,6 +180,10 @@ pub struct Rock {
     pub pickups_dropped: u32,
     /// Bloom lineage, propagated through splits so site liveness is log-routed.
     pub bloom: Option<BloomMembership>,
+    /// Verified collisions applied to this rock, ever.
+    pub collisions: u32,
+    /// Canonical arithmetic overflow has occurred in this entity's rules.
+    pub arithmetic_overflowed: bool,
 }
 
 /// The director and bloom generation that own a seeded rock lineage.
@@ -231,7 +244,7 @@ pub enum RegolithState {
     BloomDirector(BloomDirector),
 }
 
-const CRAFT_ENCODED_LEN: usize = 126;
+const CRAFT_ENCODED_LEN: usize = 131;
 
 impl Quantized for Craft {
     fn quantize(&mut self) {
@@ -311,9 +324,11 @@ impl CoreCodec for Craft {
         out.extend_from_slice(&self.lock_decay_progress.to_le_bytes());
         out.extend_from_slice(&self.cover_claim_cooldown.to_le_bytes());
         out.push(u8::from(self.last_cover_occluded));
+        out.extend_from_slice(&self.collisions.to_le_bytes());
+        out.push(u8::from(self.arithmetic_overflowed));
     }
     fn decode(bytes: &[u8]) -> Result<Self, CodecError> {
-        if bytes.len() != CRAFT_ENCODED_LEN || bytes[106] > 1 || bytes[125] > 1 {
+        if bytes.len() != CRAFT_ENCODED_LEN || bytes[106] > 1 || bytes[125] > 1 || bytes[130] > 1 {
             return Err(CodecError("regolith craft: wrong length"));
         }
         let i64_at = |o| i64::from_le_bytes(bytes[o..o + 8].try_into().unwrap());
@@ -354,6 +369,8 @@ impl CoreCodec for Craft {
             lock_decay_progress: u16::from_le_bytes(bytes[121..123].try_into().unwrap()),
             cover_claim_cooldown: u16::from_le_bytes(bytes[123..125].try_into().unwrap()),
             last_cover_occluded: bytes[125] == 1,
+            collisions: u32::from_le_bytes(bytes[126..130].try_into().unwrap()),
+            arithmetic_overflowed: bytes[130] == 1,
         })
     }
 }
@@ -379,9 +396,11 @@ impl CoreCodec for Rock {
             }
             None => out.extend_from_slice(&[0; 13]),
         }
+        out.extend_from_slice(&self.collisions.to_le_bytes());
+        out.push(u8::from(self.arithmetic_overflowed));
     }
     fn decode(bytes: &[u8]) -> Result<Self, CodecError> {
-        if bytes.len() != 79 || bytes[61] > 1 || bytes[66] > 1 {
+        if bytes.len() != 84 || bytes[61] > 1 || bytes[66] > 1 || bytes[83] > 1 {
             return Err(CodecError("regolith rock: wrong length"));
         }
         let i64_at = |o| i64::from_le_bytes(bytes[o..o + 8].try_into().unwrap());
@@ -408,6 +427,8 @@ impl CoreCodec for Rock {
                 )),
                 bloom_index: u32::from_le_bytes(bytes[75..79].try_into().unwrap()),
             }),
+            collisions: u32::from_le_bytes(bytes[79..83].try_into().unwrap()),
+            arithmetic_overflowed: bytes[83] == 1,
         })
     }
 }
@@ -573,6 +594,8 @@ impl Craft {
             lock_decay_progress: 0,
             cover_claim_cooldown: 0,
             last_cover_occluded: false,
+            collisions: 0,
+            arithmetic_overflowed: false,
         }
     }
     /// Whether this craft is active.
@@ -604,6 +627,8 @@ impl Rock {
             born_in_bloom: false,
             pickups_dropped: 0,
             bloom: None,
+            collisions: 0,
+            arithmetic_overflowed: false,
         }
     }
 
